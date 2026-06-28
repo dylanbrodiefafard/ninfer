@@ -1,6 +1,6 @@
 # Quality Rules and Test Governance Design
 
-> Status: pending user review. Date: 2026-06-28.
+> Status: implemented. Date: 2026-06-28.
 > Scope: persistent repository rules for compatibility and testing, plus the phased strategy for
 > later test-suite cleanup. The first implementation step creates `AGENTS.md`; cleanup work follows
 > in a separate implementation plan.
