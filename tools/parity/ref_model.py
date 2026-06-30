@@ -72,7 +72,7 @@ def gdn_idx(layer: int) -> int:
 
 
 def bf16(x: torch.Tensor) -> torch.Tensor:
-    return x.to(torch.bfloat16).to(torch.float32)
+    return x.to(torch.bfloat16)
 
 
 def prod(xs: Iterable[int]) -> int:
@@ -83,7 +83,7 @@ def prod(xs: Iterable[int]) -> int:
 
 
 def linear(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    return bf16(x.float() @ w.float().t())
+    return bf16(x.to(torch.bfloat16) @ w.to(torch.bfloat16).t())
 
 
 def rmsnorm(
@@ -371,8 +371,47 @@ class Q5090File:
         self._gpu[block.name] = tensor
         return tensor
 
-    def tensor(self, name: str, device: torch.device | str) -> torch.Tensor:
+    def tensor(
+        self,
+        name: str,
+        device: torch.device | str,
+        *,
+        output_dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
         view = self.views[name]
+        return self._decode_view(view, device, output_dtype=output_dtype)
+
+    def block_tensor(
+        self,
+        name: str,
+        device: torch.device | str,
+        *,
+        output_dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
+        e = self.entries[name]
+        resident = self._resident_payload(e)
+        payload = (
+            resident
+            if resident is not None
+            else self._mm[e.payload_offset : e.payload_offset + e.payload_bytes]
+        )
+        return decode_tensor(
+            payload,
+            e.qtype,
+            e.layout,
+            e.shape,
+            e.padded_shape,
+            device=device,
+            output_dtype=output_dtype,
+        )
+
+    def _decode_view(
+        self,
+        view: WeightView,
+        device: torch.device | str,
+        *,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
         e = view.block
         resident = self._resident_payload(e)
         payload = (
@@ -383,7 +422,14 @@ class Q5090File:
         if e.layout == qt.LAYOUT_ROW_SPLIT:
             _, k = e.shape
             _, kp = e.padded_shape
-            payload = self._row_split_slice_payload(e, resident, view.row_begin, view.row_count)
+            if view.row_begin == 0 and view.row_count == e.shape[0]:
+                payload = (
+                    resident
+                    if resident is not None
+                    else self._mm[e.payload_offset : e.payload_offset + e.payload_bytes]
+                )
+            else:
+                payload = self._row_split_slice_payload(e, resident, view.row_begin, view.row_count)
             return decode_tensor(
                 payload,
                 e.qtype,
@@ -391,12 +437,19 @@ class Q5090File:
                 [view.row_count, k],
                 [view.row_count, kp],
                 device=device,
-            ).float()
+                output_dtype=output_dtype,
+            )
         if view.row_begin != 0 or view.row_count != e.shape[0]:
-            raise ValueError(f"{name}: cannot slice CONTIGUOUS segment from {e.name}")
+            raise ValueError(f"{view.name}: cannot slice CONTIGUOUS segment from {e.name}")
         return decode_tensor(
-            payload, e.qtype, e.layout, e.shape, e.padded_shape, device=device
-        ).float()
+            payload,
+            e.qtype,
+            e.layout,
+            e.shape,
+            e.padded_shape,
+            device=device,
+            output_dtype=output_dtype,
+        )
 
     def _row_split_geometry(self, e: Entry):
         if e.layout != qt.LAYOUT_ROW_SPLIT:
@@ -473,7 +526,12 @@ class Q5090File:
         return nibble + (b"\x00" * nibble_pad_bytes) + high + (b"\x00" * high_pad_bytes) + scale
 
     def row_split_rows(
-        self, name: str, rows: torch.Tensor, device: torch.device | str
+        self,
+        name: str,
+        rows: torch.Tensor,
+        device: torch.device | str,
+        *,
+        output_dtype: torch.dtype = torch.float32,
     ) -> torch.Tensor:
         view = self.views[name]
         e = view.block
@@ -484,14 +542,26 @@ class Q5090File:
             if row < 0 or row >= view.row_count:
                 raise IndexError(f"{name} row out of range: {row}")
             payload = self._row_split_slice_payload(e, resident, view.row_begin + row, 1)
-            out.append(decode_tensor(payload, e.qtype, e.layout, [1, k], [1, kp], device=device))
-        return torch.cat(out, dim=0).float()
+            out.append(
+                decode_tensor(
+                    payload,
+                    e.qtype,
+                    e.layout,
+                    [1, k],
+                    [1, kp],
+                    device=device,
+                    output_dtype=output_dtype,
+                )
+            )
+        return torch.cat(out, dim=0)
 
     def row_split_row_chunks(
         self,
         name: str,
         device: torch.device | str,
         rows_per_chunk: int = 8192,
+        *,
+        output_dtype: torch.dtype = torch.float32,
     ):
         view = self.views[name]
         e = view.block
@@ -508,7 +578,8 @@ class Q5090File:
                 [row_count, k],
                 [row_count, kp],
                 device=device,
-            ).float()
+                output_dtype=output_dtype,
+            )
             yield row0, row1, chunk
 
     def _raw_payload(self, e: Entry):
@@ -637,7 +708,6 @@ class RefModel:
         self,
         weights: str | Path,
         device: str = "cuda",
-        cache_globals: bool = False,
         resident: str = "auto",
     ):
         if device == "cuda" and not torch.cuda.is_available():
@@ -658,19 +728,13 @@ class RefModel:
         else:
             resident_device = None
         self.q5090 = Q5090File(weights, resident_device=resident_device)
-        self.cache_globals = cache_globals
-        self._globals: Dict[str, torch.Tensor] = {}
         self.reset_state()
 
     def weight(self, name: str) -> torch.Tensor:
-        if self.cache_globals and (
-            name.startswith("model.language_model.embed_tokens")
-            or name in {"lm_head.weight", "model.language_model.norm.weight"}
-        ):
-            if name not in self._globals:
-                self._globals[name] = self.q5090.tensor(name, self.device)
-            return self._globals[name]
-        return self.q5090.tensor(name, self.device)
+        return self.q5090.tensor(name, self.device, output_dtype=torch.bfloat16)
+
+    def block_weight(self, name: str) -> torch.Tensor:
+        return self.q5090.block_tensor(name, self.device, output_dtype=torch.bfloat16)
 
     def reset_state(self) -> None:
         self.kv: Dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -685,13 +749,14 @@ class RefModel:
 
     def embed(self, ids: Iterable[int]) -> torch.Tensor:
         idx = torch.tensor(list(ids), device=self.device, dtype=torch.long)
-        if not self.cache_globals:
-            return bf16(
-                self.q5090.row_split_rows(
-                    "model.language_model.embed_tokens.weight", idx, self.device
-                )
+        return bf16(
+            self.q5090.row_split_rows(
+                "model.language_model.embed_tokens.weight",
+                idx,
+                self.device,
+                output_dtype=torch.bfloat16,
             )
-        return bf16(self.weight("model.language_model.embed_tokens.weight").index_select(0, idx))
+        )
 
     def gqa_attention(
         self,
@@ -757,10 +822,12 @@ class RefModel:
     ) -> torch.Tensor:
         p = f"layers.{layer}."
         h = rmsnorm(x, self.weight(p + "input_layernorm.weight"), unit_offset=True)
-        q = linear(h, self.weight(p + "self_attn.q_proj.q")).reshape(-1, H_Q, DH)
-        gate = linear(h, self.weight(p + "self_attn.q_proj.gate")).reshape(-1, H_Q, DH)
-        k = linear(h, self.weight(p + "self_attn.k_proj.weight")).reshape(-1, H_KV, DH)
-        v = linear(h, self.weight(p + "self_attn.v_proj.weight")).reshape(-1, H_KV, DH)
+        qk = linear(h, self.block_weight(p + "attn_in.q4"))
+        gatev = linear(h, self.block_weight(p + "attn_in.q5"))
+        q = qk[:, :Q_SIZE].reshape(-1, H_Q, DH)
+        k = qk[:, Q_SIZE:].reshape(-1, H_KV, DH)
+        gate = gatev[:, :Q_SIZE].reshape(-1, H_Q, DH)
+        v = gatev[:, Q_SIZE:].reshape(-1, H_KV, DH)
         qn = rmsnorm(q, self.weight(p + "self_attn.q_norm.weight"), unit_offset=True)
         kn = rmsnorm(k, self.weight(p + "self_attn.k_norm.weight"), unit_offset=True)
         qn, kn = apply_rope(qn, kn, positions)
@@ -773,9 +840,10 @@ class RefModel:
         p = f"layers.{layer}."
         gidx = gdn_idx(layer)
         h = rmsnorm(x, self.weight(p + "input_layernorm.weight"), unit_offset=True)
-        q = linear(h, self.weight(p + "linear_attn.in_proj_qkv.q"))
-        k = linear(h, self.weight(p + "linear_attn.in_proj_qkv.k"))
-        v = linear(h, self.weight(p + "linear_attn.in_proj_qkv.v"))
+        qk = linear(h, self.block_weight(p + "gdn_in.q4"))
+        q = qk[:, :GDN_KEY]
+        k = qk[:, GDN_KEY:]
+        v = linear(h, self.block_weight(p + "gdn_in.q5"))
         qkv = torch.cat([q, k, v], dim=-1)
         a = linear(h, self.weight(p + "linear_attn.in_proj_a.weight"))
         b = linear(h, self.weight(p + "linear_attn.in_proj_b.weight"))
@@ -797,8 +865,8 @@ class RefModel:
     def mlp_tail(self, layer: int, x: torch.Tensor) -> torch.Tensor:
         p = f"layers.{layer}."
         h = rmsnorm(x, self.weight(p + "post_attention_layernorm.weight"), unit_offset=True)
-        gate = linear(h, self.weight(p + "mlp.gate_proj.weight"))
-        up = linear(h, self.weight(p + "mlp.up_proj.weight"))
+        gate_up = linear(h, self.block_weight(p + "mlp.gateup"))
+        gate, up = gate_up.split(I, dim=-1)
         a = silu_and_mul(gate, up)
         d = linear(a, self.weight(p + "mlp.down_proj.weight"))
         return residual_add(x, d)
@@ -827,15 +895,16 @@ class RefModel:
 
     def logits_last(self, x: torch.Tensor) -> torch.Tensor:
         xf = rmsnorm(x, self.weight("model.language_model.norm.weight"), unit_offset=True)
-        if self.cache_globals:
-            return linear(xf[-1:, :], self.weight("lm_head.weight"))[0]
-
-        xlast = xf[-1:, :].float()
-        logits = torch.empty(V, device=self.device, dtype=torch.float32)
-        for row0, row1, weight in self.q5090.row_split_row_chunks("lm_head.weight", self.device):
-            logits[row0:row1] = (xlast @ weight.float().t())[0]
+        xlast = xf[-1:, :].to(torch.bfloat16)
+        logits = torch.empty(V, device=self.device, dtype=torch.bfloat16)
+        for row0, row1, weight in self.q5090.row_split_row_chunks(
+            "lm_head.weight",
+            self.device,
+            output_dtype=torch.bfloat16,
+        ):
+            logits[row0:row1] = (xlast @ weight.to(torch.bfloat16).t())[0]
             del weight
-        return bf16(logits)
+        return logits
 
     def forward(
         self,
@@ -968,8 +1037,6 @@ def main() -> None:
     ap.add_argument("--show-rendered-prompt", action="store_true")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dump", default=None, help="write v3 structural dump JSON")
-    ap.add_argument("--no-cache-globals", action="store_true")
-    ap.add_argument("--cache-globals", action="store_true")
     ap.add_argument(
         "--resident",
         default="auto",
@@ -981,7 +1048,6 @@ def main() -> None:
     model = RefModel(
         args.weights,
         device=args.device,
-        cache_globals=args.cache_globals and not args.no_cache_globals,
         resident=args.resident,
     )
     if args.dump:
