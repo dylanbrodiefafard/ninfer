@@ -1,11 +1,11 @@
-"""Verify a q5090_w4g64_mixed_v3 file with L0 structure checks and L1 value checks.
+"""Verify a q5090_w4g64_mixed_v4 file with L0 structure checks and L1 value checks.
 
 Usage:
-  python -m tools.q5090_convert.verify out/qwen3_6_27b.q5090_w4g64_mixed_v3.qus
+  python -m tools.q5090_convert.verify out/qwen3_6_27b.q5090_w4g64_mixed_v4.qus
 
 L0 validates the binary ABI and plan conformance. L1 recovers ROW_SPLIT scales/codes from the
 file and compares them bit-identically to tools.q5090_convert.quantize over the same block rows.
-The verifier writes a deterministic structural dump to out/conv_dump.v3.json by default.
+The verifier writes a deterministic structural dump to out/conv_dump.v4.json by default.
 """
 
 from __future__ import annotations
@@ -15,11 +15,12 @@ import json
 import os
 import time
 from collections import defaultdict
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
 
+from . import draft_head as dh
 from . import format as fmt
 from . import qtypes as qt
 from . import tensor_plan as tp
@@ -35,6 +36,7 @@ from .packing import row_split_plane_sizes
 from .quantize import pick_device, quantize_core
 
 DEFAULT_MODEL = "/path/to/home/models/llm/qwen/Qwen3.6-27B/base-hf-bf16"
+# Base full-artifact counts (no draft head); the draft head adds 2 blocks / 2 segments.
 FULL_ARTIFACT_BLOCKS = 1164
 FULL_ARTIFACT_SEGMENTS = 1312
 FULL_ARTIFACT_FUSIONS = 130
@@ -66,6 +68,8 @@ _TEXT_SOURCE_KINDS = {
     qt.SK_FINAL_NORM,
     qt.SK_INPUT_LAYERNORM,
     qt.SK_POST_ATTN_LAYERNORM,
+    qt.SK_LM_HEAD_DRAFT,
+    qt.SK_LM_HEAD_DRAFT_IDMAP,
     qt.SK_GDN_A_LOG,
     qt.SK_GDN_DT_BIAS,
     qt.SK_GDN_CONV1D,
@@ -267,7 +271,7 @@ def _make_dump(path: str, hdr, modules, entries, segments, fusions) -> dict:
         )
 
     return {
-        "format": "q5090_w4g64_mixed_v3",
+        "format": "q5090_w4g64_mixed_v4",
         "file": path,
         "header": _header_dump(hdr),
         "modules": modules,
@@ -319,7 +323,7 @@ def _check_entry_planes(e: dict) -> List[str]:
                 f"{name}: payload_bytes {e['payload_bytes']} != ROW_SPLIT size {payload}"
             )
     elif e["layout"] == qt.LAYOUT_CONTIGUOUS:
-        if e["qtype"] not in (qt.QT_BF16, qt.QT_FP32):
+        if e["qtype"] not in (qt.QT_BF16, qt.QT_FP32, qt.QT_I32):
             problems.append(f"{name}: CONTIGUOUS with non-control qtype {e['qtype']}")
         if e["padded_shape"] != e["shape"]:
             problems.append(
@@ -557,17 +561,30 @@ def _l0_checks(path: str, hdr, modules, entries, segments, fusions, plan) -> Lis
         problems.append(f"format_minor {hdr['format_minor']} != {fmt.FORMAT_MINOR}")
     if hdr["flags"] & fmt.FLAG_RESERVED_MASK:
         problems.append(f"reserved header flags set: {hdr['flags']:#x}")
-    if hdr["flags"] != fmt.FLAG_MODULE_PRESENT_MASK:
+
+    draft_w = [
+        e
+        for e in entries
+        if e["module_kind"] == qt.MODULE_TEXT and e["source_kind"] == qt.SK_LM_HEAD_DRAFT
+    ]
+    draft_id = [
+        e
+        for e in entries
+        if e["module_kind"] == qt.MODULE_TEXT and e["source_kind"] == qt.SK_LM_HEAD_DRAFT_IDMAP
+    ]
+    draft_present = len(draft_w) > 0
+    expected_flags = fmt.FLAG_MODULE_PRESENT_MASK
+    if draft_present:
+        expected_flags |= fmt.FLAG_DRAFT_HEAD_PRESENT
+    if hdr["flags"] != expected_flags:
+        problems.append(f"flags {hdr['flags']:#x} != expected {expected_flags:#x}")
+    exp_blocks = FULL_ARTIFACT_BLOCKS + (2 if draft_present else 0)
+    exp_segments = FULL_ARTIFACT_SEGMENTS + (2 if draft_present else 0)
+    if hdr["tensor_count"] != exp_blocks:
+        problems.append(f"tensor_count {hdr['tensor_count']} != full artifact count {exp_blocks}")
+    if hdr["segment_count"] != exp_segments:
         problems.append(
-            f"flags {hdr['flags']:#x} != full module flags {fmt.FLAG_MODULE_PRESENT_MASK:#x}"
-        )
-    if hdr["tensor_count"] != FULL_ARTIFACT_BLOCKS:
-        problems.append(
-            f"tensor_count {hdr['tensor_count']} != full artifact count {FULL_ARTIFACT_BLOCKS}"
-        )
-    if hdr["segment_count"] != FULL_ARTIFACT_SEGMENTS:
-        problems.append(
-            f"segment_count {hdr['segment_count']} != full artifact count {FULL_ARTIFACT_SEGMENTS}"
+            f"segment_count {hdr['segment_count']} != full artifact count {exp_segments}"
         )
     if hdr["fusion_group_count"] != FULL_ARTIFACT_FUSIONS:
         problems.append(
@@ -593,6 +610,31 @@ def _l0_checks(path: str, hdr, modules, entries, segments, fusions, plan) -> Lis
         )
     if not (hdr["flags"] & fmt.FLAG_TEXT_PRESENT):
         problems.append("TEXT_PRESENT flag is not set")
+
+    # Draft-head structural coupling (§14): DRAFT_HEAD_PRESENT <-> exactly one
+    # LM_HEAD_DRAFT block and exactly one I32_CTRL CONTIGUOUS LM_HEAD_DRAFT_IDMAP
+    # block with matching N. Any other combination is rejected.
+    flag_draft = bool(hdr["flags"] & fmt.FLAG_DRAFT_HEAD_PRESENT)
+    if flag_draft != draft_present:
+        problems.append(
+            f"DRAFT_HEAD_PRESENT flag {flag_draft} != LM_HEAD_DRAFT block present {draft_present}"
+        )
+    if len(draft_w) > 1:
+        problems.append(f"more than one LM_HEAD_DRAFT block ({len(draft_w)})")
+    if len(draft_id) > 1:
+        problems.append(f"more than one LM_HEAD_DRAFT_IDMAP block ({len(draft_id)})")
+    if draft_present != (len(draft_id) > 0):
+        problems.append("LM_HEAD_DRAFT and LM_HEAD_DRAFT_IDMAP must be present together")
+    if draft_w and draft_id:
+        idm = draft_id[0]
+        if idm["qtype"] != qt.QT_I32:
+            problems.append(f"id-map qtype {idm['qtype']} != I32_CTRL")
+        if idm["layout"] != qt.LAYOUT_CONTIGUOUS:
+            problems.append(f"id-map layout {idm['layout']} != CONTIGUOUS")
+        if idm["shape"] and draft_w[0]["shape"] and idm["shape"][0] != draft_w[0]["shape"][0]:
+            problems.append(f"id-map N {idm['shape'][0]} != draft-head N {draft_w[0]['shape'][0]}")
+        if draft_w[0]["qtype"] != qt.QT_Q4G64:
+            problems.append(f"draft-head qtype {draft_w[0]['qtype']} != Q4G64")
 
     expected_offsets = [
         ("module_index_offset", fmt.HEADER_SIZE),
@@ -936,15 +978,16 @@ def _manifest_checks(path: str, hdr, modules, entries, segments, fusions) -> Lis
         if any(e["layout"] == layout for e in entries)
     ]
 
-    expect("format", "q5090_w4g64_mixed_v3")
+    expect("format", "q5090_w4g64_mixed_v4")
     expect("format_version", fmt.VERSION)
     expect("format_minor", fmt.FORMAT_MINOR)
-    expect("binary_spec", "docs/q5090_packed_file_format_v3.md")
-    expect("tensor_plan", "docs/q5090_packed_file_format_v3.md")
+    expect("binary_spec", "docs/q5090_packed_file_format_v4.md")
+    expect("tensor_plan", "docs/q5090_packed_file_format_v4.md")
     expect("weights_file", os.path.basename(path))
     expect("file_bytes", os.path.getsize(path))
     expect("sha256_safetensors_index", hdr["sha256_safetensors_index"].hex())
     expect("calibrated", bool(hdr["flags"] & fmt.FLAG_CALIBRATED))
+    expect("draft_head_present", bool(hdr["flags"] & fmt.FLAG_DRAFT_HEAD_PRESENT))
     expect("layouts", present_layouts)
     expect("code_planes", ["nibble", "high", "scale"])
     expect("qtypes", present_qtypes)
@@ -969,8 +1012,8 @@ def _manifest_checks(path: str, hdr, modules, entries, segments, fusions) -> Lis
     return problems
 
 
-def _expected_quantized(reader, block, entry, device):
-    w = materialize_block(reader, block).to(device=device, dtype=torch.float32)
+def _expected_quantized(reader, block, entry, device, draft=None):
+    w = materialize_block(reader, block, draft).to(device=device, dtype=torch.float32)
     n, k = w.shape
     pn, pk = entry["padded_shape"]
     if int(n) != entry["shape"][0] or int(k) != entry["shape"][1]:
@@ -1018,7 +1061,7 @@ def _contiguous_probes(payload: bytes, entry: dict, device) -> List[dict]:
 
 
 def _l1_checks(
-    path: str, entries, plan, reader, device, dump: dict
+    path: str, entries, plan, reader, device, dump: dict, draft=None
 ) -> Tuple[List[str], Dict[int, dict]]:
     fails: List[str] = []
     agg = defaultdict(lambda: {"n": 0, "scale_bad": 0, "code_bad": 0, "control_bad": 0})
@@ -1035,7 +1078,7 @@ def _l1_checks(
                     got_scale, got_codes = decode_row_split_quantized(
                         payload, entry["padded_shape"], entry["qtype"], device
                     )
-                    exp_scale, exp_codes = _expected_quantized(reader, block, entry, device)
+                    exp_scale, exp_codes = _expected_quantized(reader, block, entry, device, draft)
                     if not torch.equal(
                         got_scale.contiguous().view(torch.int16),
                         exp_scale.contiguous().view(torch.int16),
@@ -1059,7 +1102,7 @@ def _l1_checks(
                     )
                     del got_scale, got_codes, exp_scale, exp_codes
                 else:
-                    src = materialize_block(reader, block)
+                    src = materialize_block(reader, block, draft)
                     exp_payload, logical, padded, _, _, _, _, _ = encode_tensor(
                         src, entry["qtype"], entry["layout"], device
                     )
@@ -1093,20 +1136,41 @@ def _write_dump(path: str, dump: dict) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="verify q5090_w4g64_mixed_v3 packed file")
-    ap.add_argument("file", help="v3 .qus file")
+    ap = argparse.ArgumentParser(description="verify q5090_w4g64_mixed_v4 packed file")
+    ap.add_argument("file", help="v4 .qus file")
     ap.add_argument("--model", default=DEFAULT_MODEL, help="HF bf16 source model for L1")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--quick", action="store_true", help="L0 + CRC only; skip L1")
-    ap.add_argument("--dump", default=os.path.join("out", "conv_dump.v3.json"))
+    ap.add_argument(
+        "--ranking",
+        default=dh.DEFAULT_RANKING,
+        help="frequency ranking (.counts.i64) to re-derive the draft-head shortlist for L1",
+    )
+    ap.add_argument(
+        "--tokenizer",
+        default=None,
+        help="HF dir with tokenizer_config.json for force-include specials (default: --model)",
+    )
+    ap.add_argument("--dump", default=os.path.join("out", "conv_dump.v4.json"))
     args = ap.parse_args()
 
     t0 = time.time()
     cfg = load_config(args.model)
     assert_config(cfg, force=False)
+    tc = cfg.get("text_config", cfg)
 
     hdr, modules, entries, segments, fusions, read_problems = _read_file(args.file)
-    plan = build_conversion_plan(cfg)
+    draft_n = next(
+        (
+            int(e["shape"][0])
+            for e in entries
+            if e["module_kind"] == qt.MODULE_TEXT
+            and e["source_kind"] == qt.SK_LM_HEAD_DRAFT
+            and e["shape"]
+        ),
+        None,
+    )
+    plan = build_conversion_plan(cfg, draft_head_n=draft_n)
     dump = _make_dump(args.file, hdr, modules, entries, segments, fusions)
 
     print(f"file: {args.file}")
@@ -1144,7 +1208,13 @@ def main() -> None:
         if missing:
             l1.append("missing source tensors:\n  " + "\n  ".join(missing))
         else:
-            l1, agg = _l1_checks(args.file, entries, plan, reader, device, dump)
+            draft_ctx = None
+            if draft_n is not None:
+                tokenizer_dir = args.tokenizer or args.model
+                draft_ctx = dh.compute_shortlist(
+                    args.ranking, tokenizer_dir, draft_n, tc["vocab_size"]
+                )
+            l1, agg = _l1_checks(args.file, entries, plan, reader, device, dump, draft_ctx)
             print("L1 value checks done; problems=" + str(len(l1)), flush=True)
     elif args.quick:
         print("L1 skipped (--quick)", flush=True)
