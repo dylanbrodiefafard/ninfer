@@ -10,12 +10,9 @@ Canonical invocation::
 from __future__ import annotations
 
 import argparse
-from collections import Counter
 from dataclasses import dataclass
 import json
 from pathlib import Path
-import platform
-import subprocess
 import time
 from typing import Mapping, Sequence
 
@@ -24,16 +21,10 @@ import torch
 from tools.artifact.container import (
     ArtifactObject,
     ArtifactWriter,
-    ObjectSpec,
-    ResourceObject,
-    ResourceSpec as ArtifactResourceSpec,
-    TensorObject,
-    TensorSpec as ArtifactTensorSpec,
-    plan_objects,
 )
-from tools.artifact.layouts import encode_direct
-from tools.convert.common.quantize import pick_device, quantize_and_encode
+from tools.convert.common.quantize import pick_device
 from tools.convert.common.safetensors import ShardReader
+from tools.convert.qwen3_6.common import conversion as family_conversion
 
 from . import draft_head, inventory, recipe
 
@@ -90,21 +81,8 @@ _VISION_CONFIG = {
 }
 
 
-@dataclass(frozen=True, slots=True)
-class ResourcePayload:
-    name: str
-    data: bytes
-
-
-@dataclass(frozen=True, slots=True)
-class ObjectPlan:
-    specs: tuple[ObjectSpec, ...]
-    objects: tuple[ArtifactObject, ...]
-
-    @property
-    def payload_span_bytes(self) -> int:
-        last = self.objects[-1]
-        return last.offset + last.bytes
+ResourcePayload = family_conversion.ResourcePayload
+ObjectPlan = family_conversion.ObjectPlan
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,8 +100,7 @@ def _repo_root() -> Path:
 
 
 def _load_config(model_dir: Path) -> dict[str, object]:
-    with (model_dir / "config.json").open(encoding="utf-8") as handle:
-        return json.load(handle)
+    return family_conversion.load_json(model_dir / "config.json")
 
 
 def _check_members(
@@ -131,13 +108,7 @@ def _check_members(
     actual: Mapping[str, object],
     expected: Mapping[str, object],
 ) -> None:
-    mismatches = [
-        f"{scope}.{name}: expected {value!r}, got {actual.get(name)!r}"
-        for name, value in expected.items()
-        if actual.get(name) != value
-    ]
-    if mismatches:
-        raise ValueError("checkpoint config mismatch:\n  " + "\n  ".join(mismatches))
+    family_conversion.check_members(scope, actual, expected)
 
 
 def validate_config(config: Mapping[str, object]) -> dict[str, object]:
@@ -207,36 +178,14 @@ def preflight_inventory() -> None:
 
 
 def load_resources(model_dir: str | Path) -> tuple[ResourcePayload, ...]:
-    root = Path(model_dir)
-    resources = []
-    for spec in inventory.RESOURCE_SPECS:
-        filename = spec.name.removeprefix("frontend/")
-        data = (root / filename).read_bytes()
-        if not data:
-            raise ValueError(f"frontend resource {filename} is empty")
-        resources.append(ResourcePayload(spec.name, data))
-    return tuple(resources)
+    return family_conversion.load_resources(model_dir, inventory.RESOURCE_SPECS)
 
 
 def build_object_plan(resources: Mapping[str, bytes]) -> ObjectPlan:
     """Compute every payload-relative object offset for the full inventory."""
 
     preflight_inventory()
-    expected_resources = tuple(spec.name for spec in inventory.RESOURCE_SPECS)
-    if tuple(resources) != expected_resources:
-        raise ValueError("resource mapping does not match canonical inventory order")
-    specs: list[ObjectSpec] = []
-    for spec in inventory.OBJECT_SPECS:
-        if isinstance(spec, inventory.ResourceSpec):
-            specs.append(
-                ArtifactResourceSpec(spec.name, spec.encoding, len(resources[spec.name]))
-            )
-        else:
-            specs.append(
-                ArtifactTensorSpec(spec.name, spec.shape, spec.format, spec.layout)
-            )
-    frozen_specs = tuple(specs)
-    return ObjectPlan(frozen_specs, plan_objects(frozen_specs))
+    return family_conversion.build_object_plan(inventory.OBJECT_SPECS, resources)
 
 
 def preflight_conversion(model_dir: str | Path) -> ConversionPreflight:
@@ -295,56 +244,7 @@ def encode_tensor_payload(
 ) -> bytes:
     """Encode one materialized tensor according to its registered signature."""
 
-    if spec.format in inventory.DIRECT_FORMATS:
-        return encode_direct(tensor, spec.format)
-    return quantize_and_encode(tensor, spec.format, device=device)
-
-
-def _object_statistics(objects: Sequence[ArtifactObject]) -> dict[str, object]:
-    tensors = [obj for obj in objects if isinstance(obj, TensorObject)]
-    resources = [obj for obj in objects if isinstance(obj, ResourceObject)]
-    object_bytes = sum(obj.bytes for obj in objects)
-    payload_span = objects[-1].offset + objects[-1].bytes
-    return {
-        "count": len(objects),
-        "tensors": len(tensors),
-        "resources": len(resources),
-        "formats": dict(sorted(Counter(obj.format for obj in tensors).items())),
-        "layouts": dict(sorted(Counter(obj.layout for obj in tensors).items())),
-        "encodings": dict(
-            sorted(Counter(obj.encoding for obj in resources).items())
-        ),
-        "tensor_bytes": sum(obj.bytes for obj in tensors),
-        "resource_bytes": sum(obj.bytes for obj in resources),
-        "object_bytes": object_bytes,
-        "payload_span_bytes": payload_span,
-        "alignment_bytes": payload_span - object_bytes,
-    }
-
-
-def _converter_revision() -> str | None:
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=_repo_root(),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return result.stdout.strip() or None
-
-
-def _environment(device: torch.device) -> dict[str, object]:
-    gpu = None
-    if device.type == "cuda":
-        gpu = torch.cuda.get_device_name(device)
-    return {
-        "python": platform.python_version(),
-        "platform": platform.platform(),
-        "torch": torch.__version__,
-        "torch_cuda": torch.version.cuda,
-        "resolved_device": str(device),
-        "gpu": gpu,
-    }
+    return family_conversion.encode_tensor_payload(tensor, spec, device)
 
 
 def build_conversion_report(
@@ -364,33 +264,24 @@ def build_conversion_report(
 ) -> dict[str, object]:
     """Build the external descriptive conversion report."""
 
-    return {
-        "model_id": inventory.MODEL_ID,
-        "target_key": inventory.TARGET_KEY,
-        "recipe_id": RECIPE_ID,
-        "source": {
-            "model_path": str(Path(model_dir).resolve()),
-            "ranking_path": str(Path(ranking_path).resolve()),
-        },
-        "arguments": dict(arguments),
-        "config_summary": dict(config_summary),
-        "source_preflight": {
-            "recipes": source_preflight.recipe_count,
-            "tensors": source_preflight.source_tensor_count,
-            "shards": source_preflight.source_shard_count,
-            "dtypes": dict(source_preflight.source_dtype_counts),
-        },
-        "converter": {
-            "revision": _converter_revision() if revision is None else revision,
-            "environment": dict(_environment(device) if environment is None else environment),
-        },
-        "objects": _object_statistics(objects),
-        "elapsed_seconds": elapsed_seconds,
-        "artifact": {
-            "path": str(Path(out_path)),
-            "bytes": final_bytes,
-        },
-    }
+    return family_conversion.build_conversion_report(
+        model_id=inventory.MODEL_ID,
+        target_key=inventory.TARGET_KEY,
+        recipe_id=RECIPE_ID,
+        repo_root=_repo_root(),
+        model_dir=model_dir,
+        out_path=out_path,
+        arguments=arguments,
+        config_summary=config_summary,
+        source_preflight=source_preflight,
+        objects=objects,
+        elapsed_seconds=elapsed_seconds,
+        final_bytes=final_bytes,
+        device=device,
+        ranking_path=ranking_path,
+        revision=revision,
+        environment_summary=environment,
+    )
 
 
 def convert(
