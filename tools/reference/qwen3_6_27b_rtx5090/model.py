@@ -8,14 +8,15 @@ from typing import Callable, Iterable
 
 import torch
 
+from tools.reference.qwen3_6.common.multimodal import MultimodalBatch
+from tools.reference.qwen3_6.common.sampling import Sampler
+from tools.reference.qwen3_6.common.tap import NullTap
+
 from . import mtp as mtp_schedule
 from .bindings import ArtifactBinding, WeightObject
 from .config import CFG
-from .multimodal import MultimodalBatch
 from .ops import attention, linear, rmsnorm
-from .sampling import Sampler
 from .state import ModelState, StateSnapshot
-from .tap import NullTap
 from .text import run as run_text
 from .vision import VisionEncoder, VisionOutput, VisionStats
 from .weights import WeightStore

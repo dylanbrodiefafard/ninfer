@@ -8,10 +8,7 @@ from typing import Callable
 
 import torch
 
-from .bindings import ArtifactBinding, PhysicalBlock
-from .config import VISION_CFG
-from .ops import linear, residual_add
-from .vision_ops import (
+from tools.reference.qwen3_6.common.vision_ops import (
     add_bias,
     apply_vision_rope,
     gelu,
@@ -21,6 +18,10 @@ from .vision_ops import (
     vision_cu_seqlens,
     vision_position_ids,
 )
+
+from .bindings import ArtifactBinding, PhysicalBlock
+from .config import VISION_CFG
+from .ops import linear, residual_add
 from .weights import WeightStore
 
 
