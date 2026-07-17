@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
+
 import torch
+from tools.convert.qwen3_6_27b_rtx5090 import convert, inventory, recipe
 
 from tools.artifact.container import (
     Artifact,
@@ -10,7 +15,18 @@ from tools.artifact.container import (
     plan_objects,
 )
 from tools.artifact.layouts import decode_direct, dequantize_row_split, encoded_size
-from tools.convert.qwen3_6_27b_rtx5090 import convert, inventory, recipe
+
+OFFICIAL_MODEL = Path(os.environ.get("NINFER_QWEN3_6_27B_HF_DIR", "/models/qwen3.6-27b-hf"))
+
+
+def test_official_config_uses_only_nested_mtp_field():
+    config = json.loads((OFFICIAL_MODEL / "config.json").read_text())
+
+    assert "mtp_num_hidden_layers" not in config
+    summary = convert.validate_config(config)
+    assert summary["mtp_num_hidden_layers"] == 1
+    assert summary["text"]["mtp_num_hidden_layers"] == 1
+    assert convert.RECIPE_ID == "qwen3_6_27b_rtx5090-v2"
 
 
 def test_complete_inventory_has_one_preplanned_object_directory():
@@ -31,9 +47,7 @@ def test_synthetic_encode_seam_and_descriptive_report(tmp_path):
         "mini/quant", (2, 65), inventory.Q4, inventory.ROW_SPLIT_LAYOUT
     )
     direct = torch.tensor([1.0, -0.0, 3.5], dtype=torch.bfloat16)
-    quant = torch.linspace(-2, 2, 130, dtype=torch.float32).reshape(2, 65).to(
-        torch.bfloat16
-    )
+    quant = torch.linspace(-2, 2, 130, dtype=torch.float32).reshape(2, 65).to(torch.bfloat16)
     direct_payload = convert.encode_tensor_payload(direct, direct_target, "cpu")
     quant_payload = convert.encode_tensor_payload(quant, quant_target, "cpu")
     assert len(direct_payload) == encoded_size(
@@ -80,9 +94,7 @@ def test_synthetic_encode_seam_and_descriptive_report(tmp_path):
             dtype=torch.float32,
         )
         assert decoded_quant.shape == quant.shape
-        torch.testing.assert_close(
-            decoded_quant, quant.float(), atol=0.2, rtol=0.0
-        )
+        torch.testing.assert_close(decoded_quant, quant.float(), atol=0.2, rtol=0.0)
 
     source = recipe.SourcePreflight(
         recipe_count=2,
