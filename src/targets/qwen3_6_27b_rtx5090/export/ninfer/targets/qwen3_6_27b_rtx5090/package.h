@@ -4,6 +4,7 @@
 #include "runtime/contract/types.h"
 #include "runtime/contract/transient_region.h"
 #include <ninfer/targets/qwen3_6/frontend.h>
+#include <ninfer/targets/qwen3_6/runtime.h>
 
 #include <cstdint>
 #include <memory>
@@ -25,7 +26,7 @@ struct Package;
 
 namespace detail {
 
-class ActivationDumpAccess;
+struct Variant;
 
 using Frontend       = qwen3_6::Frontend;
 using PreparedPrompt = qwen3_6::PreparedPrompt;
@@ -65,97 +66,22 @@ private:
     std::unique_ptr<Impl> impl_;
 
     friend struct qwen3_6_27b_rtx5090::Package;
-    friend class Program;
-};
-
-class SequencePlan {
-public:
-    struct Impl;
-
-    SequencePlan(SequencePlan&&) noexcept;
-    SequencePlan& operator=(SequencePlan&&) noexcept;
-    ~SequencePlan();
-
-    SequencePlan(const SequencePlan&)            = delete;
-    SequencePlan& operator=(const SequencePlan&) = delete;
-
-    [[nodiscard]] std::uint32_t capacity() const noexcept;
-
-private:
-    explicit SequencePlan(std::unique_ptr<Impl> impl) noexcept;
-    std::unique_ptr<Impl> impl_;
-
-    friend struct qwen3_6_27b_rtx5090::Package;
-    friend class Program;
-};
-
-class RequestPlan {
-public:
-    RequestPlan(RequestPlan&&) noexcept;
-    RequestPlan& operator=(RequestPlan&&) noexcept;
-    ~RequestPlan();
-
-    RequestPlan(const RequestPlan&)            = delete;
-    RequestPlan& operator=(const RequestPlan&) = delete;
-
-    [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
-
-private:
-    struct Impl;
-    explicit RequestPlan(std::unique_ptr<Impl> impl) noexcept;
-    std::unique_ptr<Impl> impl_;
-
-    friend class Program;
-};
-
-class Program {
-public:
-    ~Program() noexcept;
-
-    Program(const Program&)            = delete;
-    Program& operator=(const Program&) = delete;
-    Program(Program&&)                 = delete;
-    Program& operator=(Program&&)      = delete;
-
-    [[nodiscard]] RequestPlan plan_request(const PreparedPrompt& prompt,
-                                           const ExecutionOptions& options) const;
-    [[nodiscard]] runtime::BeginResult begin(PreparedPrompt&& prompt, RequestPlan&& plan,
-                                             runtime::TransientRegion transient);
-    [[nodiscard]] runtime::GeneratedRound decode_round(runtime::RoundBudget budget);
-
-    void resolve_pending(std::uint32_t accepted_tokens, bool terminal);
-    void finish_active();
-    void abort_request() noexcept;
-
-    [[nodiscard]] std::uint32_t materialized_tokens() const noexcept;
-    [[nodiscard]] MemorySummary memory_summary() const noexcept;
-    [[nodiscard]] SpeculativeStats speculative_stats() const;
-    [[nodiscard]] GenerationTimings generation_timings() const noexcept;
-    void reset_memory_peaks() noexcept;
-
-private:
-    class Impl;
-    explicit Program(std::unique_ptr<Impl> impl) noexcept;
-
-    std::unique_ptr<Impl> impl_;
-
-    friend struct qwen3_6_27b_rtx5090::Package;
-    friend class ActivationDumpAccess;
 };
 
 } // namespace detail
 
 struct Package {
-    static constexpr std::string_view model_id = "qwen3.6-27b";
+    static constexpr std::string_view model_id   = "qwen3.6-27b";
+    static constexpr std::string_view target_key = "qwen3_6_27b_rtx5090";
 
     using LoadPlan       = detail::LoadPlan;
     using LoadedModel    = detail::LoadedModel;
     using Frontend       = detail::Frontend;
     using PreparedPrompt = detail::PreparedPrompt;
     using OutputSession  = detail::OutputSession;
-    using SequencePlan   = detail::SequencePlan;
-    using RequestPlan    = detail::RequestPlan;
-    using Program        = detail::Program;
+    using SequencePlan   = qwen3_6::SequencePlan<detail::Variant>;
+    using RequestPlan    = qwen3_6::RequestPlan<detail::Variant>;
+    using Program        = qwen3_6::Program<detail::Variant>;
 
     // Cheap target-owned option/device validation. The registry calls this after matching
     // model_id and before any weight materialization.

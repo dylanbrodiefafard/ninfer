@@ -2,6 +2,7 @@
 
 #include <ninfer/targets/qwen3_6_27b_rtx5090/package.h>
 #include <ninfer/targets/qwen3_6/frontend_resources.h>
+#include <ninfer/targets/qwen3_6/model_view.h>
 #include <ninfer/targets/qwen3_6/vision.h>
 
 #include "artifact/binder.h"
@@ -92,71 +93,41 @@ struct ArtifactLoadPlan {
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder);
 
-struct MlpWeights {
+struct DensePostMixerPayload {
     Weight gate_up;
-    Weight gate;
-    Weight up;
     Weight down;
 };
 
-struct FullAttentionWeights {
-    Tensor input_norm;
+struct FullAttentionProjectionPayload {
     Weight query_key;
-    Weight query;
-    Weight key;
     Weight gate_value;
-    Weight output_gate;
-    Weight value;
-    Tensor query_norm;
-    Tensor key_norm;
-    Weight output;
-    Tensor post_attention_norm;
-    MlpWeights mlp;
 };
 
-struct GdnWeights {
-    Tensor input_norm;
+struct GdnProjectionPayload {
     Tensor a_log;
     Tensor dt_bias;
-    Tensor convolution_storage;
-    Tensor convolution;
     Weight a_projection;
     Weight b_projection;
     Weight query_key;
-    Weight query;
-    Weight key;
-    Weight value_z;
     Weight value;
-    Tensor norm;
     Weight z;
-    Weight output;
-    Tensor post_attention_norm;
-    MlpWeights mlp;
 };
 
-struct MtpWeights {
-    Weight input_projection;
-    Tensor embedding_norm;
-    Tensor hidden_norm;
-    Tensor input_norm;
-    Weight query_key_gate_value;
+struct MtpAttentionPayload {
+    Weight packed;
     Weight query;
     Weight key;
     Weight output_gate;
     Weight value;
-    Tensor query_norm;
-    Tensor key_norm;
-    Weight output;
-    Tensor post_attention_norm;
-    MlpWeights mlp;
-    Tensor final_norm;
 };
 
-struct VisionWeights {
-    qwen3_6::VisionCommonWeights common;
-    Weight merger_fc2;
-    Tensor merger_fc2_bias;
-};
+using RuntimeModelView =
+    qwen3_6::ModelView<FullAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
+                       MtpAttentionPayload, DensePostMixerPayload, kFullAttentionLayers,
+                       kGdnLayers>;
+using FullAttentionWeights = RuntimeModelView::FullLayer;
+using GdnWeights           = RuntimeModelView::GdnLayer;
+using MtpWeights           = RuntimeModelView::MtpLayer;
 
 class LoadedModelData {
 public:
@@ -169,15 +140,7 @@ public:
 
     artifact::MaterializedArtifact backing;
     qwen3_6::FrontendResources frontend;
-    Weight token_embedding;
-    std::array<FullAttentionWeights, kFullAttentionLayers> full_layers;
-    std::array<GdnWeights, kGdnLayers> gdn_layers;
-    Tensor final_norm;
-    Weight output_head;
-    Weight draft_head;
-    Tensor draft_head_token_ids;
-    MtpWeights mtp;
-    VisionWeights vision;
+    RuntimeModelView runtime;
 };
 
 class LoadedModel::Impl {

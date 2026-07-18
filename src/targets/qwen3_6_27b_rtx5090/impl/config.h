@@ -73,8 +73,8 @@ struct VisionConfig : qwen3_6::VisionBackboneConfig {
 inline constexpr float kAttentionScale                = 0.0625F;
 inline constexpr float kGdnScale                      = 0.08838834764831845F;
 inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
-inline constexpr std::uint32_t kDefaultPrefillChunk   = 1024;
 inline constexpr std::uint32_t kMaximumMtpDraftTokens = 5;
+inline constexpr std::uint32_t kNativeContext         = 262144;
 inline constexpr std::int32_t kStepStatsCounters      = 9;
 
 } // namespace ninfer::targets::qwen3_6_27b_rtx5090::detail
