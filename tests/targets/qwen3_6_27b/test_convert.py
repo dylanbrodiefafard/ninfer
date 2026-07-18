@@ -5,7 +5,6 @@ import os
 from pathlib import Path
 
 import torch
-from tools.convert.qwen3_6_27b_rtx5090 import convert, inventory, recipe
 
 from tools.artifact.container import (
     Artifact,
@@ -15,6 +14,7 @@ from tools.artifact.container import (
     plan_objects,
 )
 from tools.artifact.layouts import decode_direct, dequantize_row_split, encoded_size
+from tools.convert.qwen3_6_27b import convert, inventory, recipe
 
 OFFICIAL_MODEL = Path(os.environ.get("NINFER_QWEN3_6_27B_HF_DIR", "/models/qwen3.6-27b-hf"))
 
@@ -26,7 +26,7 @@ def test_official_config_uses_only_nested_mtp_field():
     summary = convert.validate_config(config)
     assert summary["mtp_num_hidden_layers"] == 1
     assert summary["text"]["mtp_num_hidden_layers"] == 1
-    assert convert.RECIPE_ID == "qwen3_6_27b_rtx5090-v2"
+    assert convert.RECIPE_ID == "qwen3_6_27b-v2"
 
 
 def test_complete_inventory_has_one_preplanned_object_directory():
