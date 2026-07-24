@@ -5,7 +5,8 @@ Tested Git revisions:
 - Qwen3.6-35B-A3B MTP3: `b1a220f028aa750f75bceb3522ac00bbaab7e42d`;
 - Qwen3.6-35B-A3B DFlash block=8 (`k=7`):
   `0dc94097e8ec5c5bcf59b9e13e9d1852f504eb61`;
-- Qwen3.6-35B-A3B MTP0 and all Qwen3.6-27B results:
+- Qwen3.6-27B MTP3: `5ea3242a206cdb0c4c1beaeb9d8a3048e6248423`;
+- Qwen3.6-35B-A3B MTP0 and Qwen3.6-27B MTP0:
   `0795169393cab0f2c16246d4bac20dee735dc2a4`.
 
 These measurements characterize the two registered NInfer targets independently on one NVIDIA
@@ -62,7 +63,7 @@ stress sample, but is not presented as a successfully completed task.
 
 ## Reproduction
 
-Build `ninfer-serve` and prepare the registered `.ninfer` artifacts. The refreshed 35B-A3B MTP3
+Build `ninfer-serve` and prepare the registered `.ninfer` artifacts. The refreshed per-target MTP3
 tables use:
 
 ```bash
@@ -71,6 +72,12 @@ python3 tools/bench/run_serve_corpus.py \
   --artifact qwen3_6_35b_a3b=out/qwen3_6_35b_a3b.ninfer \
   --mode mtp3 \
   --output profiles/bench/serve_corpus_35b_mtp3_20260724
+
+python3 tools/bench/run_serve_corpus.py \
+  --serve build/apps/ninfer-serve \
+  --artifact qwen3_6_27b=out/qwen3_6_27b.ninfer \
+  --mode mtp3 \
+  --output profiles/bench/serve_corpus_27b_mtp3_20260724
 ```
 
 Use `--mode dflash7` for the corresponding DFlash block=8 campaign; add `--sampling greedy` for
@@ -269,9 +276,9 @@ repetition loop is present.
 
 | Fixture | Samples | Completion tokens | Decode tok/s | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|---:|---:|
-| `long_decode_aime26_01` | 5 | 11,009.4 ± 419.1 | 174.2 ± 3.3 | 79.9% ± 2.0% | 3.40 ± 0.06 |
-| `long_decode_aime26_15` | 5 | 62,652.6 ± 3,000.4 | 158.7 ± 5.2 | 73.3% ± 3.4% | 3.20 ± 0.10 |
-| `long_decode_aime26_30` | 5 | 47,837.8 ± 5,882.7 | 169.0 ± 2.7 | 79.3% ± 2.0% | 3.38 ± 0.06 |
+| `long_decode_aime26_01` | 5 | 10,686.2 ± 553.8 | 175.4 ± 1.0 | 77.9% ± 0.9% | 3.34 ± 0.03 |
+| `long_decode_aime26_15` | 5 | 61,604.2 ± 5,677.9 | 161.9 ± 2.8 | 73.4% ± 1.7% | 3.20 ± 0.05 |
+| `long_decode_aime26_30` | 5 | 47,339.8 ± 9,162.2 | 172.2 ± 0.9 | 78.8% ± 0.8% | 3.36 ± 0.02 |
 
 ### MTP3 cross-scenario decode
 
@@ -279,10 +286,10 @@ Each category contains three fixtures and five seeds per fixture, for 15 samples
 
 | Category | Samples | Decode tok/s | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|---:|
-| Code | 15 | 163.9 ± 6.2 | 72.5% ± 3.9% | 3.18 ± 0.12 |
-| Story | 15 | 110.4 ± 9.2 | 37.9% ± 6.0% | 2.14 ± 0.18 |
-| Translation | 15 | 153.6 ± 11.7 | 65.7% ± 7.5% | 2.97 ± 0.23 |
-| Structured | 15 | 189.1 ± 15.7 | 88.9% ± 10.2% | 3.67 ± 0.31 |
+| Code | 15 | 167.0 ± 5.4 | 72.3% ± 3.5% | 3.17 ± 0.11 |
+| Story | 15 | 112.6 ± 9.4 | 37.8% ± 5.9% | 2.13 ± 0.18 |
+| Translation | 15 | 161.5 ± 11.3 | 68.3% ± 7.2% | 3.05 ± 0.22 |
+| Structured | 15 | 193.0 ± 18.8 | 88.7% ± 11.7% | 3.66 ± 0.35 |
 
 The baseline and speculative-decode suites intentionally measure different supported workloads.
 No per-scenario baseline/speculative speedup is reported.

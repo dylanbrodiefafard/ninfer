@@ -151,9 +151,9 @@ Thinking was enabled and the output limit was 65,536 tokens.
 
 | AIME 2026 fixture | Completion tokens | Decode tok/s | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|---:|
-| Problem 1 | 11,009.4 ± 419.1 | 174.2 ± 3.3 | 79.9% ± 2.0% | 3.40 ± 0.06 |
-| Problem 15 | 62,652.6 ± 3,000.4 | 158.7 ± 5.2 | 73.3% ± 3.4% | 3.20 ± 0.10 |
-| Problem 30 | 47,837.8 ± 5,882.7 | 169.0 ± 2.7 | 79.3% ± 2.0% | 3.38 ± 0.06 |
+| Problem 1 | 10,686.2 ± 553.8 | 175.4 ± 1.0 | 77.9% ± 0.9% | 3.34 ± 0.03 |
+| Problem 15 | 61,604.2 ± 5,677.9 | 161.9 ± 2.8 | 73.4% ± 1.7% | 3.20 ± 0.05 |
+| Problem 30 | 47,339.8 ± 9,162.2 | 172.2 ± 0.9 | 78.8% ± 0.8% | 3.36 ± 0.02 |
 
 ### MTP=3 cross-scenario decode
 
@@ -162,10 +162,10 @@ disabled and the output limit was 4,096 tokens.
 
 | Category | Decode tok/s | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|
-| Code | 163.9 ± 6.2 | 72.5% ± 3.9% | 3.18 ± 0.12 |
-| Story | 110.4 ± 9.2 | 37.9% ± 6.0% | 2.14 ± 0.18 |
-| Translation | 153.6 ± 11.7 | 65.7% ± 7.5% | 2.97 ± 0.23 |
-| Structured output | 189.1 ± 15.7 | 88.9% ± 10.2% | 3.67 ± 0.31 |
+| Code | 167.0 ± 5.4 | 72.3% ± 3.5% | 3.17 ± 0.11 |
+| Story | 112.6 ± 9.4 | 37.8% ± 5.9% | 2.13 ± 0.18 |
+| Translation | 161.5 ± 11.3 | 68.3% ± 7.2% | 3.05 ± 0.22 |
+| Structured output | 193.0 ± 18.8 | 88.7% ± 11.7% | 3.66 ± 0.35 |
 
 See the
 [full methodology and results](https://github.com/Neroued/ninfer/blob/master/docs/performance.md),
