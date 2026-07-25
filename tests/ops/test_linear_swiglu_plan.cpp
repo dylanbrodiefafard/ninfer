@@ -13,7 +13,6 @@ namespace {
 using ninfer::ops::detail::Q4LinearSwiGluPlan;
 using ninfer::ops::detail::Q4LinearSwiGluProblem;
 using ninfer::ops::detail::Q4LinearSwiGluScheduleId;
-using ninfer::ops::detail::Q4ScheduleId;
 
 using S = Q4LinearSwiGluScheduleId;
 
@@ -36,12 +35,6 @@ S expected_schedule(std::int32_t cols) {
     return S::MmaSplitHalfPairR32C128;
 }
 
-Q4ScheduleId expected_materialized_schedule(std::int32_t cols) {
-    if (cols <= 4) { return Q4ScheduleId::SimtR8C4; }
-    if (cols <= 16) { return Q4ScheduleId::SimtR8C8; }
-    return Q4ScheduleId::MmaR64C128;
-}
-
 void route_tests() {
     constexpr std::array<std::int32_t, 18> boundaries{
         1, 2, 4, 5, 16, 17, 128, 129, 256, 257, 384, 385, 512, 513, 640, 641, 1024, 1025,
@@ -59,14 +52,8 @@ void route_tests() {
             ++failures;
         }
         const bool materialized = plan.schedule == S::Materialized;
-        if (plan.materialized_projection.has_value() != materialized ||
-            (plan.workspace_bytes != 0) != materialized) {
-            std::cerr << "wrong Q4 LinearSwiGLU subplan/workspace C=" << cols << '\n';
-            ++failures;
-        }
-        if (materialized &&
-            plan.materialized_projection->schedule != expected_materialized_schedule(cols)) {
-            std::cerr << "wrong materialized Q4 schedule C=" << cols << '\n';
+        if ((plan.workspace_bytes != 0) != materialized) {
+            std::cerr << "wrong Q4 LinearSwiGLU workspace C=" << cols << '\n';
             ++failures;
         }
     }

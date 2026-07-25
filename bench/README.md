@@ -83,8 +83,9 @@ through their production dispatch at the default `T=1024` prefill extent:
   --shape Out5120x6144 --qtype Q5 --linear-add --t-sweep 1024
 ```
 
-The benchmark records the selected physical route, kernel variant, cold-cache timing, measured
-tensor-core ceiling, and useful/executed throughput.
+The benchmark records the selected physical route, any variant exposed by a diagnostic candidate
+mode, cold-cache timing, measured tensor-core ceiling, and useful/executed throughput. Q4
+Full/Predicated selection is launcher-private and is therefore not reported as a benchmark variant.
 
 ## W8 context K/V LinearPair Op benchmark
 

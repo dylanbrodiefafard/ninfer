@@ -34,13 +34,13 @@ void launch_q4_gemv(const Tensor& x, const Weight& weight, Tensor& q, Tensor& ke
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <class Schedule, Q4KernelVariant Variant>
+template <class Schedule, bool Full>
 void launch_q4_simt(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
                     cudaStream_t stream) {
     const std::int32_t cols = x.ne[1];
     const dim3 grid(static_cast<unsigned>(div_up(kParentRows, Schedule::kRowsPerCta)),
                     static_cast<unsigned>(div_up(cols, Schedule::kColsPerTile)), 1u);
-    q4_rowsplit_gemm_simt_kernel<Schedule, Variant, true, kSplitRow>
+    q4_rowsplit_gemm_simt_kernel<Schedule, Full, true, kSplitRow>
         <<<grid, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
@@ -51,31 +51,44 @@ void launch_q4_simt(const Tensor& x, const Weight& weight, Tensor& q, Tensor& ke
 }
 
 template <class Schedule>
-void launch_q4_simt_variant(Q4KernelVariant variant, const Tensor& x, const Weight& weight,
-                            Tensor& q, Tensor& key, cudaStream_t stream) {
-    if (variant == Q4KernelVariant::Full) {
-        launch_q4_simt<Schedule, Q4KernelVariant::Full>(x, weight, q, key, stream);
-    } else if (variant == Q4KernelVariant::Predicated) {
-        launch_q4_simt<Schedule, Q4KernelVariant::Predicated>(x, weight, q, key, stream);
+void launch_q4_simt_route(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
+                          cudaStream_t stream) {
+    const bool full = (kParentRows % Schedule::kRowsPerCta) == 0 &&
+                      ((kHidden / Q4RowSplitStorage::kGroupK) % Schedule::kGroupsPerStage) == 0 &&
+                      (x.ne[1] % Schedule::kColsPerTile) == 0;
+    if (full) {
+        launch_q4_simt<Schedule, true>(x, weight, q, key, stream);
     } else {
-        throw std::invalid_argument("attention Q4 split-output SIMT requires a tiled variant");
+        launch_q4_simt<Schedule, false>(x, weight, q, key, stream);
     }
 }
 
-void launch_q4(Q4Plan plan, const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
-               cudaStream_t stream) {
-    switch (plan.schedule) {
-    case Q4ScheduleId::GemvR1W8Direct:
+void launch_q4(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key, cudaStream_t stream) {
+    switch (x.ne[1]) {
+    case 1:
         launch_q4_gemv(x, weight, q, key, stream);
         return;
-    case Q4ScheduleId::SimtR8C4:
-        launch_q4_simt_variant<Q4AttnSimtR8C4Schedule>(plan.variant, x, weight, q, key, stream);
+    case 2:
+    case 3:
+    case 4:
+    case 5:
+    case 6:
+    case 7:
+    case 9:
+    case 10:
+    case 11:
+    case 12:
+    case 13:
+    case 14:
+    case 15:
+        launch_q4_simt_route<Q4AttnSimtR8C4Schedule>(x, weight, q, key, stream);
         return;
-    case Q4ScheduleId::SimtR8C8:
-        launch_q4_simt_variant<Q4AttnSimtR8C8Schedule>(plan.variant, x, weight, q, key, stream);
+    case 8:
+    case 16:
+        launch_q4_simt_route<Q4AttnSimtR8C8Schedule>(x, weight, q, key, stream);
         return;
     default:
-        throw std::invalid_argument("attention Q4 split-output schedule is not admitted");
+        throw std::invalid_argument("attention Q4 split-output requires T in [1,16]");
     }
 }
 
@@ -177,11 +190,11 @@ void launch_q5(Q5Plan plan, const Tensor& x, const Weight& weight, Tensor& gate,
 
 } // namespace
 
-void q4_q5_attn_input_small_t_launch(Q4Plan q4_plan, Q5Plan q5_plan, const Tensor& x,
+void q4_q5_attn_input_small_t_launch(Q5Plan q5_plan, const Tensor& x,
                                      const Weight& query_key_weight,
                                      const Weight& gate_value_weight, Tensor& q, Tensor& gate,
                                      Tensor& k, Tensor& v, cudaStream_t stream) {
-    launch_q4(q4_plan, x, query_key_weight, q, k, stream);
+    launch_q4(x, query_key_weight, q, k, stream);
     launch_q5(q5_plan, x, gate_value_weight, gate, v, stream);
 }
 

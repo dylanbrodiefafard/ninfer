@@ -34,8 +34,9 @@ The files under [`maintainer/`](maintainer/) record the current artifact formats
 artifact contracts, and Op-development rules used for ongoing project maintenance. They are not
 additional user workflows or installed API documentation.
 
-Active implementation design:
+Active implementation references:
 
+- [Linear Q4 direct-route architecture](maintainer/linear-type-dispatch-memo.md)
 - [Qwen3.6-27B Prisma NVFP4 hybrid weights](maintainer/qwen3.6-27b-prisma-nvfp4-integration.md)
 - [Qwen3.6-35B-A3B DFlash Op checklist](maintainer/qwen3.6-35b-a3b-dflash-op-checklist.md)
 - [Qwen3.6-35B-A3B DFlash Engine integration](maintainer/qwen3.6-35b-a3b-dflash-engine-integration.md)

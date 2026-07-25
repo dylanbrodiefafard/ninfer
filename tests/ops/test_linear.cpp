@@ -7,7 +7,7 @@
 #include "ninfer/ops/linear_swiglu.h"
 #include "ops/op_tester.h"
 #include "ops/linear/bf16/bf16_contiguous_plan.h"
-#include "ops/linear/q4/q4_rowsplit_plan.h"
+#include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q5/q5_rowsplit_plan.h"
 #include "ops/linear/q6/q6_rowsplit_plan.h"
 #include "ops/linear/w8/w8_rowsplit_plan.h"
@@ -225,7 +225,8 @@ void cpu_linear_dequant(const std::vector<float>& x, const std::vector<float>& w
 
 int one_quant_shape(QType qtype, std::int32_t n, std::int32_t k,
                     const std::vector<std::int32_t>& ts, std::uint32_t seed, float x_abs = 8.0f,
-                    float weight_abs = 0.125f, const char* case_name = nullptr) {
+                    float weight_abs = 0.125f, const char* case_name = nullptr,
+                    ops::LinearPolicy policy = ops::LinearPolicy::A16Only) {
     const std::int32_t max_t = *std::max_element(ts.begin(), ts.end());
     std::vector<float> source_weight(static_cast<std::size_t>(n) * k);
     fill_uniform(source_weight, seed + 2000u, -weight_abs, weight_abs);
@@ -244,20 +245,45 @@ int one_quant_shape(QType qtype, std::int32_t n, std::int32_t k,
     DBuf dweight(packed.payload.size());
     cudaMemcpy(dweight.p, packed.payload.data(), packed.payload.size(), cudaMemcpyHostToDevice);
     WorkspaceArena ws(64ULL << 20);
+    const bool preserve_q4_inputs =
+        qtype == QType::Q4G64_F16S && n == 1024 && k == 5120 && max_t >= 4;
+    const std::vector<std::uint16_t> input_before =
+        preserve_q4_inputs ? from_device_bf16_bits(dx.p, static_cast<std::size_t>(k) * max_t)
+                           : std::vector<std::uint16_t>{};
 
     int failures = 0;
     for (std::int32_t t : ts) {
-        DBuf dout(static_cast<std::size_t>(n) * t * 2u);
+        GuardedBf16Output dout(static_cast<std::size_t>(n) * t);
         Tensor tx(dx.p, DType::BF16, {k, t});
-        Tensor tout(dout.p, DType::BF16, {n, t});
+        Tensor tout(dout.data(), DType::BF16, {n, t});
         try {
-            ops::linear(tx, packed.device_weight(dweight.p), tout, ws, nullptr);
+            ops::linear(tx, packed.device_weight(dweight.p), tout, policy, ws, nullptr);
             cudaDeviceSynchronize();
+            if (qtype == QType::Q4G64_F16S && n == 1024 && k == 5120 && t == 4) {
+                capture_and_replay([&](cudaStream_t stream) {
+                    ops::linear(tx, packed.device_weight(dweight.p), tout, policy, ws, stream);
+                });
+            }
         } catch (const std::exception& e) {
             std::cerr << "linear " << qtype_name(qtype) << " [" << n << "," << k << "] T=" << t
                       << " seed=" << seed << ": unexpected exception: " << e.what() << '\n';
             ++failures;
             continue;
+        }
+
+        failures += dout.verify_guards("linear public output guards");
+        failures += dout.verify_initialized("linear public output initialization");
+        if (preserve_q4_inputs && t == 4) {
+            if (from_device_bf16_bits(dx.p, static_cast<std::size_t>(k) * max_t) != input_before) {
+                std::cerr << "linear Q4 modified its input activation\n";
+                ++failures;
+            }
+            std::vector<std::uint8_t> weight_after(packed.payload.size());
+            cudaMemcpy(weight_after.data(), dweight.p, weight_after.size(), cudaMemcpyDeviceToHost);
+            if (weight_after != packed.payload) {
+                std::cerr << "linear Q4 modified its persistent weight\n";
+                ++failures;
+            }
         }
 
         const std::vector<double> ref(ref_max_t.begin(),
@@ -268,10 +294,10 @@ int one_quant_shape(QType qtype, std::int32_t n, std::int32_t k,
                                   "] T=" + std::to_string(t) + " seed=" + std::to_string(seed);
         Tolerance tol = t > 16 ? Tolerance::linear_tc() : Tolerance::linear_bf16();
         if (qtype == QType::Q4G64_F16S) {
-            const ops::detail::Q4Plan plan =
-                ops::detail::q4_rowsplit_resolve_plan({n, k, packed.weight.padded_shape[1], t});
-            tol = ops::detail::q4_schedule_uses_mma(plan.schedule) ? Tolerance::linear_tc()
-                                                                   : Tolerance::linear_bf16();
+            const ops::detail::Q4Launch launch = ops::detail::select_q4_a16_launch(n, k, t);
+            const bool mma                     = launch == ops::detail::launch_q4_mma_r64_c64 ||
+                             launch == ops::detail::launch_q4_mma_r64_c128;
+            tol = mma ? Tolerance::linear_tc() : Tolerance::linear_bf16();
         } else if (qtype == QType::Q5G64_F16S) {
             const ops::detail::Q5Plan plan =
                 ops::detail::q5_rowsplit_resolve_plan({n, k, packed.weight.padded_shape[1], t});
@@ -288,8 +314,9 @@ int one_quant_shape(QType qtype, std::int32_t n, std::int32_t k,
             tol = ops::detail::w8_schedule_uses_mma(plan.schedule) ? Tolerance::linear_tc()
                                                                    : Tolerance::linear_bf16();
         }
-        failures += verify(label.c_str(), from_device_bf16(dout, static_cast<std::size_t>(n) * t),
-                           ref, tol);
+        failures +=
+            verify(label.c_str(),
+                   from_device_bf16_ptr(dout.data(), static_cast<std::size_t>(n) * t), ref, tol);
     }
     return failures;
 }
@@ -402,10 +429,10 @@ int one_patterned_quant_shape_sampled(QType qtype, std::int32_t n, std::int32_t 
 
     Tolerance tolerance = Tolerance::linear_bf16();
     if (qtype == QType::Q4G64_F16S) {
-        const auto plan =
-            ops::detail::q4_rowsplit_resolve_plan({n, k, packed.weight.padded_shape[1], t});
-        tolerance = ops::detail::q4_schedule_uses_mma(plan.schedule) ? Tolerance::linear_tc()
-                                                                     : Tolerance::linear_bf16();
+        const ops::detail::Q4Launch launch = ops::detail::select_q4_a16_launch(n, k, t);
+        const bool mma                     = launch == ops::detail::launch_q4_mma_r64_c64 ||
+                         launch == ops::detail::launch_q4_mma_r64_c128;
+        tolerance = mma ? Tolerance::linear_tc() : Tolerance::linear_bf16();
     } else if (qtype == QType::Q5G64_F16S) {
         const auto plan =
             ops::detail::q5_rowsplit_resolve_plan({n, k, packed.weight.padded_shape[1], t});
@@ -1957,6 +1984,45 @@ int bf16_placeholder_contract() {
     return f;
 }
 
+int linear_common_validation() {
+    int f = 0;
+    DBuf x_storage(64);
+    DBuf out_storage(64);
+    WorkspaceArena ws(256);
+
+    Weight weight{};
+    weight.qtype = QType::Q4G64_F16S;
+    weight.n     = 1024;
+    weight.k     = 5120;
+
+    const Tensor aligned_x(x_storage.p, DType::BF16, {weight.k, 1});
+    const Tensor aligned_out(out_storage.p, DType::BF16, {weight.n, 1});
+    const auto expect_invalid = [&](const char* label, const Tensor& x, const Tensor& out,
+                                    ops::LinearPolicy policy = ops::LinearPolicy::A16Only) {
+        try {
+            Tensor mutable_out = out;
+            ops::linear(x, weight, mutable_out, policy, ws, nullptr);
+            std::cerr << label << ": expected invalid_argument\n";
+            ++f;
+        } catch (const std::invalid_argument&) {}
+    };
+
+    expect_invalid("linear misaligned x",
+                   Tensor(static_cast<std::uint8_t*>(x_storage.p) + 2, DType::BF16, {weight.k, 1}),
+                   aligned_out);
+    expect_invalid(
+        "linear misaligned out", aligned_x,
+        Tensor(static_cast<std::uint8_t*>(out_storage.p) + 2, DType::BF16, {weight.n, 1}));
+    Tensor empty_x   = aligned_x;
+    Tensor empty_out = aligned_out;
+    empty_x.ne[1]    = 0;
+    empty_out.ne[1]  = 0;
+    expect_invalid("linear T=0", empty_x, empty_out);
+    expect_invalid("linear invalid policy", aligned_x, aligned_out,
+                   static_cast<ops::LinearPolicy>(255));
+    return f;
+}
+
 int lowbit_metadata_validation(QType qtype) {
     int f                    = 0;
     constexpr std::int32_t n = 64;
@@ -2034,16 +2100,12 @@ int lowbit_metadata_validation(QType qtype) {
     try {
         Tensor empty_tx  = tx;
         Tensor empty_out = tout;
-        empty_tx.data    = nullptr;
-        empty_out.data   = nullptr;
         empty_tx.ne[1]   = 0;
         empty_out.ne[1]  = 0;
         ops::linear(empty_tx, packed.device_weight(dx.p), empty_out, ws, nullptr);
-    } catch (const std::exception& e) {
-        std::cerr << "linear " << qtype_name(qtype) << " empty T: expected no throw, got "
-                  << e.what() << '\n';
+        std::cerr << "linear " << qtype_name(qtype) << " empty T: expected invalid_argument\n";
         ++f;
-    }
+    } catch (const std::invalid_argument&) {}
 
     return f;
 }
@@ -2122,7 +2184,7 @@ int main() {
     int f = 0;
     f += prefill_fusion_correctness();
     f += bf16_placeholder_contract();
-    f += lowbit_metadata_validation(QType::Q4G64_F16S);
+    f += linear_common_validation();
     f += lowbit_metadata_validation(QType::Q5G64_F16S);
     f += lowbit_metadata_validation(QType::Q6G64_F16S);
     f += lowbit_metadata_validation(QType::W8G32_F16S);
@@ -2146,16 +2208,17 @@ int main() {
     f += one_patterned_quant_shape_sampled(QType::W8G32_F16S, 2048, 4096, 1025, 141u);
     f += w8_conditioning_linear_correctness();
     f += w8_dflash_context_kv_pair_correctness();
-    // Q4 public correctness is exact-admission only. The dedicated Q4 plan/dispatch tests cover
-    // every route seam and compare public auto against the fixed entry word-for-word; these
-    // oracle points cover both registered head K values and the split-K/SIMT numerical boundary
-    // at real product geometries.
-    f += one_quant_shape(QType::Q4G64_F16S, 1024, 5120, {1, 2, 15, 16}, 23u);
+    // The host-only selector test covers the full Q4 registry. These public calls qualify all six
+    // retained host launchers and both tiled boundary instances at real production geometries.
+    f += one_quant_shape(QType::Q4G64_F16S, 1024, 5120, {1, 2, 4, 15, 16}, 23u, 8.0f, 0.125f,
+                         "allow-a8", ops::LinearPolicy::AllowA8);
     f += one_quant_shape(QType::Q4G64_F16S, 4096, 5120, {1}, 25u);
     f += one_quant_shape(QType::Q4G64_F16S, 131072, 2048, {1}, 26u);
-    f += one_quant_shape(QType::Q4G64_F16S, 3456, 1152, {4, 40}, 27u);
+    f += one_quant_shape(QType::Q4G64_F16S, 3456, 1152, {4, 40, 64}, 27u);
+    f += one_quant_shape(QType::Q4G64_F16S, 4304, 1152, {8, 64}, 29u);
     f += one_patterned_quant_shape_sampled(QType::Q4G64_F16S, 34816, 5120, 1, 28u);
     f += one_patterned_quant_shape_sampled(QType::Q4G64_F16S, 34816, 5120, 17, 28u);
+    f += one_patterned_quant_shape_sampled(QType::Q4G64_F16S, 34816, 5120, 128, 30u);
     // Q5 public correctness is exact-admission only. Fused input projections own their
     // large-column parent operations; linear_add owns the residual epilogue for every T.
     f += one_quant_shape(QType::Q5G64_F16S, 1024, 5120, {1, 4, 5, 16}, 29u);

@@ -1,7 +1,6 @@
 #pragma once
 
 #include "core/arena.h"
-#include "ops/linear/q4/q4_rowsplit_plan.h"
 #include "ops/linear/q5/q5_rowsplit_plan.h"
 
 #include <cuda_runtime.h>
@@ -26,15 +25,9 @@ struct Q4Q5GdnInputProblem {
     std::int32_t cols;
 };
 
-struct Q4Q5GdnInputSubplans {
-    Q4Plan qk;
-    Q5Plan value;
-};
-
 struct Q4Q5GdnInputPlan {
     Q4Q5GdnInputScheduleId schedule;
-    Q4KernelVariant grouped_variant;
-    std::optional<Q4Q5GdnInputSubplans> independent;
+    std::optional<Q5Plan> independent_value;
     std::size_t workspace_bytes;
 };
 

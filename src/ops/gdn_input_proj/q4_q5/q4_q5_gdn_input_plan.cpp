@@ -1,7 +1,5 @@
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
 
-#include "core/device.h"
-#include "ops/common/token_slices.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
 
 #include <array>
@@ -44,19 +42,14 @@ bool supported_shape(const Q4Q5GdnInputProblem& problem) noexcept {
            problem.output_rows == 10240 && problem.padded_k == 5120;
 }
 
-bool same_q4_plan(Q4Plan lhs, Q4Plan rhs) {
-    return lhs.schedule == rhs.schedule && lhs.variant == rhs.variant;
-}
-
 bool same_q5_plan(Q5Plan lhs, Q5Plan rhs) {
     return lhs.schedule == rhs.schedule && lhs.variant == rhs.variant;
 }
 
-bool same_subplans(const std::optional<Q4Q5GdnInputSubplans>& lhs,
-                   const std::optional<Q4Q5GdnInputSubplans>& rhs) {
+bool same_q5_plan(const std::optional<Q5Plan>& lhs, const std::optional<Q5Plan>& rhs) {
     if (lhs.has_value() != rhs.has_value()) { return false; }
     if (!lhs.has_value()) { return true; }
-    return same_q4_plan(lhs->qk, rhs->qk) && same_q5_plan(lhs->value, rhs->value);
+    return same_q5_plan(*lhs, *rhs);
 }
 
 } // namespace
@@ -85,20 +78,12 @@ Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem
         if (!route.cols.contains(problem.cols)) { continue; }
         Q4Q5GdnInputPlan plan{
             route.schedule,
-            Q4KernelVariant::None,
             std::nullopt,
             0,
         };
         if (route.schedule == Q4Q5GdnInputScheduleId::IndependentDirectFixed) {
-            plan.independent = Q4Q5GdnInputSubplans{
-                q4_rowsplit_resolve_plan(
-                    {problem.qk_rows, problem.input_rows, problem.padded_k, problem.cols}),
-                q5_rowsplit_resolve_plan(
-                    {problem.value_rows, problem.input_rows, problem.padded_k, problem.cols}),
-            };
-        } else {
-            plan.grouped_variant =
-                (problem.cols % 128) == 0 ? Q4KernelVariant::Full : Q4KernelVariant::Predicated;
+            plan.independent_value = q5_rowsplit_resolve_plan(
+                {problem.value_rows, problem.input_rows, problem.padded_k, problem.cols});
         }
         return plan;
     }
@@ -119,8 +104,8 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
     const Q4Q5GdnInputProblem problem{
         x.ne[0], qk_weight.n, v_weight.n, qkv.ne[0], qk_weight.padded_shape[1], x.ne[1]};
     const Q4Q5GdnInputPlan resolved = q4_q5_gdn_input_resolve_plan(problem);
-    if (resolved.schedule != plan.schedule || resolved.grouped_variant != plan.grouped_variant ||
-        !same_subplans(resolved.independent, plan.independent) ||
+    if (resolved.schedule != plan.schedule ||
+        !same_q5_plan(resolved.independent_value, plan.independent_value) ||
         resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument("Q4/Q5 GDN input: plan does not match exact problem");
     }
@@ -130,17 +115,12 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
         (void)ws;
         Tensor qk    = qkv.slice(0, 0, problem.qk_rows);
         Tensor value = qkv.slice(0, problem.qk_rows, problem.value_rows);
-        q4_rowsplit_launch_fixed_pitched(plan.independent->qk, x, qk_weight, qk, stream);
-        q5_rowsplit_launch_fixed_pitched(plan.independent->value, x, v_weight, value, stream);
+        q4_q5_gdn_input_independent_launch(*plan.independent_value, x, qk_weight, v_weight, qk,
+                                           value, stream);
         return;
     }
     case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128:
-        for_each_token_slice(problem.cols, 128, [&](std::int32_t offset, std::int32_t count) {
-            const Tensor x_slice = x.slice(1, offset, count);
-            Tensor qkv_slice     = qkv.slice(1, offset, count);
-            q4_q5_gdn_input_grouped_mma_launch(plan.grouped_variant, x_slice, qk_weight, v_weight,
-                                               qkv_slice, stream);
-        });
+        q4_q5_gdn_input_grouped_mma_launch(x, qk_weight, v_weight, qkv, stream);
         return;
     }
     throw std::logic_error("Q4/Q5 GDN input: unknown schedule");

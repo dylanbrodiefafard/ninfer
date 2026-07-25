@@ -14,7 +14,6 @@
 // statically compiled boundary variant outside the kernel.
 
 #include "ops/common/mma.cuh"
-#include "ops/linear/q4/q4_rowsplit_launch.h"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
 
 #include <cuda_bf16.h>
@@ -91,7 +90,7 @@ __device__ __forceinline__ int q4_mma_swizzle_k64(int row, int col) {
 }
 
 // clang-format off
-template <class Schedule_, Q4KernelVariant Variant>
+template <class Schedule_, bool Full>
 __global__ __launch_bounds__(Schedule_::kThreads, Schedule_::kLaunchBoundsMinBlocks)
 void q4_rowsplit_gemm_mma_kernel(
     const __nv_bfloat16* __restrict__ x,
@@ -103,11 +102,8 @@ void q4_rowsplit_gemm_mma_kernel(
     std::int32_t cols,
     std::int32_t padded_k) {
     // clang-format on
-    using Schedule = Schedule_;
-    static_assert(Variant == Q4KernelVariant::Full || Variant == Q4KernelVariant::Predicated,
-                  "Q4 MMA requires a tiled kernel variant");
-
-    constexpr bool kFull = Variant == Q4KernelVariant::Full;
+    using Schedule       = Schedule_;
+    constexpr bool kFull = Full;
     constexpr int BM     = Schedule::kBlockRows;
     constexpr int BN     = Schedule::kBlockCols;
     constexpr int BK     = Schedule::kBlockK;

@@ -1,13 +1,11 @@
 #pragma once
 
 #include "core/arena.h"
-#include "ops/linear/q4/q4_rowsplit_plan.h"
 
 #include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
-#include <optional>
 
 namespace ninfer::ops::detail {
 
@@ -27,8 +25,6 @@ struct Q4LinearSwiGluProblem {
 
 struct Q4LinearSwiGluPlan {
     Q4LinearSwiGluScheduleId schedule;
-    Q4KernelVariant variant;
-    std::optional<Q4Plan> materialized_projection;
     std::size_t workspace_bytes;
 };
 

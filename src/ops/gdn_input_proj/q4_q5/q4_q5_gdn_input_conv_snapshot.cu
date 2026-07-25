@@ -126,8 +126,7 @@ void launch_small_t_schedule(const Tensor& x, const Weight& qk_weight, const Wei
                              const GdnConvSnapshotEpilogue& value_epilogue, Tensor& query,
                              Tensor& value, cudaStream_t stream) {
     const dim3 q4_grid(kQkRows / Q4Schedule::kRowsPerCta, 1u, 1u);
-    q4_rowsplit_gemm_simt_kernel<Q4Schedule, Q4KernelVariant::Predicated, false, 0,
-                                 Q4GdnSmallTEpilogue<Tokens>>
+    q4_rowsplit_gemm_simt_kernel<Q4Schedule, false, false, 0, Q4GdnSmallTEpilogue<Tokens>>
         <<<q4_grid, Q4Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(qk_weight.qdata),

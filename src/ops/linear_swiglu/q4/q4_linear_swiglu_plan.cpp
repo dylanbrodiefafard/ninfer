@@ -1,7 +1,7 @@
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/silu_mul.h"
-#include "ops/common/token_slices.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_kernels.h"
 
 #include <algorithm>
@@ -71,33 +71,6 @@ std::size_t checked_matrix_bytes(std::int32_t rows, std::int32_t cols) {
     return elements * sizeof(std::uint16_t);
 }
 
-Q4KernelVariant tiled_variant(Q4ScheduleId schedule, const Q4Problem& problem) {
-    if (q4_candidate_is_legal(schedule, Q4KernelVariant::Full, problem)) {
-        return Q4KernelVariant::Full;
-    }
-    if (q4_candidate_is_legal(schedule, Q4KernelVariant::Predicated, problem)) {
-        return Q4KernelVariant::Predicated;
-    }
-    throw std::logic_error("q4 linear_swiglu: fixed materialized route is not physically legal");
-}
-
-Q4Plan materialized_plan(const Q4LinearSwiGluProblem& problem) {
-    Q4ScheduleId schedule = Q4ScheduleId::MmaR64C128;
-    if (problem.cols <= 4) {
-        schedule = Q4ScheduleId::SimtR8C4;
-    } else if (problem.cols <= 16) {
-        schedule = Q4ScheduleId::SimtR8C8;
-    }
-    const Q4Problem base{problem.gate_up_rows, problem.k, problem.padded_k, problem.cols};
-    return {schedule, tiled_variant(schedule, base)};
-}
-
-bool same_q4_plan(const std::optional<Q4Plan>& lhs, const std::optional<Q4Plan>& rhs) {
-    if (lhs.has_value() != rhs.has_value()) { return false; }
-    if (!lhs.has_value()) { return true; }
-    return lhs->schedule == rhs->schedule && lhs->variant == rhs->variant;
-}
-
 } // namespace
 
 const char* q4_linear_swiglu_schedule_name(Q4LinearSwiGluScheduleId schedule) noexcept {
@@ -126,20 +99,15 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
         if (!route.cols.contains(problem.cols)) { continue; }
         Q4LinearSwiGluPlan plan{
             route.schedule,
-            Q4KernelVariant::None,
-            std::nullopt,
             0,
         };
         switch (route.schedule) {
         case Q4LinearSwiGluScheduleId::GemvPair:
             return plan;
         case Q4LinearSwiGluScheduleId::Materialized:
-            plan.materialized_projection = materialized_plan(problem);
-            plan.workspace_bytes         = checked_matrix_bytes(problem.gate_up_rows, problem.cols);
+            plan.workspace_bytes = checked_matrix_bytes(problem.gate_up_rows, problem.cols);
             return plan;
         case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128:
-            plan.variant =
-                (problem.cols % 128) == 0 ? Q4KernelVariant::Full : Q4KernelVariant::Predicated;
             return plan;
         }
     }
@@ -167,9 +135,7 @@ void q4_linear_swiglu_execute_plan(const Q4LinearSwiGluPlan& plan, const Tensor&
                                    Tensor& out, WorkspaceArena& ws, cudaStream_t stream) {
     const Q4LinearSwiGluProblem problem{w.n, out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
     const Q4LinearSwiGluPlan resolved = q4_linear_swiglu_resolve_plan(problem);
-    if (resolved.schedule != plan.schedule || resolved.variant != plan.variant ||
-        !same_q4_plan(resolved.materialized_projection, plan.materialized_projection) ||
-        resolved.workspace_bytes != plan.workspace_bytes) {
+    if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument("q4 linear_swiglu: plan does not match the exact problem");
     }
 
@@ -180,18 +146,13 @@ void q4_linear_swiglu_execute_plan(const Q4LinearSwiGluPlan& plan, const Tensor&
     case Q4LinearSwiGluScheduleId::Materialized: {
         auto scratch_scope = ws.scope();
         Tensor gate_up     = ws.alloc(DType::BF16, {problem.gate_up_rows, problem.cols});
-        q4_rowsplit_execute_plan(*plan.materialized_projection, x, w, gate_up, stream);
+        linear(x, w, gate_up, ws, stream);
         silu_mul(gate_up.slice(0, 0, problem.output_rows),
                  gate_up.slice(0, problem.output_rows, problem.output_rows), out, stream);
         return;
     }
     case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128:
-        for_each_token_slice(problem.cols, 128, [&](std::int32_t offset, std::int32_t count) {
-            const Tensor x_slice = x.slice(1, offset, count);
-            Tensor out_slice     = out.slice(1, offset, count);
-            q4_linear_swiglu_mma_split_half_pair_r32_c128_launch(plan.variant, x_slice, w,
-                                                                 out_slice, stream);
-        });
+        q4_linear_swiglu_mma_split_half_pair_r32_c128_launch(x, w, out, stream);
         return;
     }
     throw std::logic_error("q4 linear_swiglu: unknown schedule");

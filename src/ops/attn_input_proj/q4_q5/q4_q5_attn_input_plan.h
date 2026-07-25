@@ -1,6 +1,5 @@
 #pragma once
 
-#include "ops/linear/q4/q4_rowsplit_plan.h"
 #include "ops/linear/q5/q5_rowsplit_plan.h"
 
 #include <cuda_runtime.h>
@@ -24,15 +23,9 @@ struct Q4Q5AttnInputProblem {
     std::int32_t cols;
 };
 
-struct Q4Q5AttnInputSubplans {
-    Q4Plan query_key;
-    Q5Plan gate_value;
-};
-
 struct Q4Q5AttnInputPlan {
     Q4Q5AttnInputScheduleId schedule;
-    Q4KernelVariant grouped_variant;
-    std::optional<Q4Q5AttnInputSubplans> parent_split;
+    std::optional<Q5Plan> parent_gate_value;
     std::size_t workspace_bytes;
 };
 

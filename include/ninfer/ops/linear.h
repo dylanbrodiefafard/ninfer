@@ -12,8 +12,9 @@ namespace ninfer::ops {
 /**
  * @brief Permitted private activation-compute profiles for a linear projection.
  *
- * The policy constrains plan selection; it does not select a kernel or prescribe a particular MMA
- * instruction. The public activation and output tensors remain BF16 for every policy.
+ * The policy constrains private route selection; it does not select a kernel or prescribe a
+ * particular MMA instruction. The public activation and output tensors remain BF16 for every
+ * policy.
  */
 enum class LinearPolicy : std::uint8_t {
     A16Only, ///< Admit only A16 compute profiles.
@@ -34,9 +35,10 @@ enum class LinearPolicy : std::uint8_t {
  * @f]
  *
  * @par Logical tensors and layout
- * `x` is contiguous BF16 `[K,T]`, `w` has logical shape `[N,K]`, and `out` is contiguous BF16
- * `[N,T]`. Dimension zero is stored fastest. The Op has no bias, activation, residual addition, or
- * transpose mode.
+ * `x` is contiguous, non-null, 16-byte-aligned BF16 `[K,T]`, `w` has logical shape `[N,K]`, and
+ * `out` is contiguous, non-null, 16-byte-aligned BF16 `[N,T]`. Every logical extent is positive;
+ * in particular, `T=0` is invalid rather than a no-op. Dimension zero is stored fastest. The Op has
+ * no bias, activation, residual addition, or transpose mode.
  *
  * @par Supported execution domain
  * Registered execution uses RowSplit Q4G64_F16S, Q5G64_F16S, Q6G64_F16S, or W8G32_F16S weights
@@ -60,10 +62,10 @@ enum class LinearPolicy : std::uint8_t {
  * LinearPolicy::A16Only and LinearPolicy::AllowA8. No currently registered weight format admits
  * LinearPolicy::AllowA4.
  *
- * @param[in] x Contiguous BF16 input matrix `[K,T]`.
+ * @param[in] x Contiguous, non-null, 16-byte-aligned BF16 input matrix `[K,T]`.
  * @param[in] w Logical weight matrix `[N,K]` in a registered persistent format and layout.
- * @param[out] out Contiguous BF16 output matrix `[N,T]`. It must not overlap `x` or any weight
- * plane.
+ * @param[out] out Contiguous, non-null, 16-byte-aligned BF16 output matrix `[N,T]`. It must not
+ * overlap `x` or any weight plane.
  * @param[in] policy Permitted private activation-compute profiles.
  * @param[in,out] ws Caller-owned transient storage. It carries no semantic state beyond the call.
  * @param[in] stream CUDA stream on which execution is enqueued.

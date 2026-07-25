@@ -1,7 +1,7 @@
 // Cold-cache per-Op measurement rig for native row-split low-bit Linear,
 // LinearAdd, LinearPair, and LinearSwiGLU contracts. Production modes dispatch
 // through their semantic ninfer::ops entry points; fixed-candidate modes remain
-// implementation diagnostics for the base Linear/W8 LinearAdd routes.
+// implementation diagnostics for Q5/Q6/W8 base Linear and W8 LinearAdd routes.
 //
 // Examples:
 //   ./build/bench/ninfer_linear_op_bench --all-targets --csv-out profiles/ncu/linear-baseline.csv
@@ -15,8 +15,7 @@
 #include "ninfer/ops/linear_swiglu.h"
 #include "core/device.h"
 #include "ninfer_bench_common.h"
-#include "ops/linear/q4/q4_rowsplit_launch.h"
-#include "ops/linear/q4/q4_rowsplit_plan.h"
+#include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q5/q5_rowsplit_launch.h"
 #include "ops/linear/q5/q5_rowsplit_plan.h"
 #include "ops/linear/q6/q6_rowsplit_launch.h"
@@ -91,7 +90,6 @@ struct TargetSpec {
 
 enum class CandidateKind {
     Auto,
-    Q4Fixed,
     Q5Fixed,
     Q6Fixed,
     W8Fixed,
@@ -168,9 +166,6 @@ struct Options {
     std::int32_t rows                              = 0;
     std::int32_t k                                 = 0;
     CandidateKind candidate                        = CandidateKind::Auto;
-    ops::detail::Q4ScheduleId q4_schedule          = ops::detail::Q4ScheduleId::SimtR8C4;
-    ops::detail::Q4KernelVariant q4_variant        = ops::detail::Q4KernelVariant::Predicated;
-    bool q4_variant_auto                           = true;
     ops::detail::Q5ScheduleId q5_schedule          = ops::detail::Q5ScheduleId::SimtR8C4;
     ops::detail::Q5KernelVariant q5_variant        = ops::detail::Q5KernelVariant::Predicated;
     bool q5_variant_auto                           = true;
@@ -407,9 +402,22 @@ QType parse_qtype(std::string_view raw) {
     throw std::invalid_argument("unknown qtype: " + std::string(raw));
 }
 
-ops::detail::Q4Plan resolve_auto_q4_plan(const ShapeSpec& shape, std::int32_t t) {
-    const auto padded_k = static_cast<std::int32_t>(align_up_u64(shape.k, 128));
-    return ops::detail::q4_rowsplit_resolve_plan({shape.n, shape.k, padded_k, t});
+ops::detail::Q4Launch resolve_auto_q4_launch(const ShapeSpec& shape, std::int32_t t) {
+    return ops::detail::select_q4_a16_launch(shape.n, shape.k, t);
+}
+
+const char* q4_launch_name(ops::detail::Q4Launch launch) {
+    if (launch == ops::detail::launch_q4_gemv_r4_w1_direct) {
+        return "linear.q4.gemv.r4_w1_direct";
+    }
+    if (launch == ops::detail::launch_q4_gemv_r1_w8_direct) {
+        return "linear.q4.gemv.r1_w8_direct";
+    }
+    if (launch == ops::detail::launch_q4_simt_r8_c4) { return "linear.q4.simt.r8_c4"; }
+    if (launch == ops::detail::launch_q4_simt_r8_c8) { return "linear.q4.simt.r8_c8"; }
+    if (launch == ops::detail::launch_q4_mma_r64_c64) { return "linear.q4.mma.r64_c64"; }
+    if (launch == ops::detail::launch_q4_mma_r64_c128) { return "linear.q4.mma.r64_c128"; }
+    throw std::invalid_argument("unknown Q4 host launcher");
 }
 
 ops::detail::Q5Plan resolve_auto_q5_plan(const ShapeSpec& shape, std::int32_t t) {
@@ -454,7 +462,7 @@ std::string candidate_name(const Options& opt, QType qtype, const ShapeSpec& sha
                 return ops::detail::q4_linear_swiglu_schedule_name(
                     resolve_auto_q4_linear_swiglu_plan(shape, t).schedule);
             }
-            return ops::detail::q4_schedule_name(resolve_auto_q4_plan(shape, t).schedule);
+            return q4_launch_name(resolve_auto_q4_launch(shape, t));
         }
         if (qtype == QType::Q5G64_F16S) {
             if (opt.linear_add) {
@@ -478,8 +486,6 @@ std::string candidate_name(const Options& opt, QType qtype, const ShapeSpec& sha
                         : "");
         }
         return "unsupported";
-    case CandidateKind::Q4Fixed:
-        return ops::detail::q4_schedule_name(opt.q4_schedule);
     case CandidateKind::Q5Fixed:
         return ops::detail::q5_schedule_name(opt.q5_schedule);
     case CandidateKind::Q6Fixed:
@@ -500,20 +506,7 @@ void parse_candidate(Options& opt, std::string_view raw) {
         opt.candidate = CandidateKind::Auto;
         return;
     }
-    opt.candidate = CandidateKind::Q4Fixed;
-    if (candidate == "q4-gemv-r4w1-direct") {
-        opt.q4_schedule = ops::detail::Q4ScheduleId::GemvR4W1Direct;
-    } else if (candidate == "q4-gemv-r1w8-direct") {
-        opt.q4_schedule = ops::detail::Q4ScheduleId::GemvR1W8Direct;
-    } else if (candidate == "q4-simt-r8c4") {
-        opt.q4_schedule = ops::detail::Q4ScheduleId::SimtR8C4;
-    } else if (candidate == "q4-simt-r8c8") {
-        opt.q4_schedule = ops::detail::Q4ScheduleId::SimtR8C8;
-    } else if (candidate == "q4-mma-r64c64") {
-        opt.q4_schedule = ops::detail::Q4ScheduleId::MmaR64C64;
-    } else if (candidate == "q4-mma-r64c128") {
-        opt.q4_schedule = ops::detail::Q4ScheduleId::MmaR64C128;
-    } else if (candidate == "q5-gemv-r16s2x") {
+    if (candidate == "q5-gemv-r16s2x") {
         opt.candidate   = CandidateKind::Q5Fixed;
         opt.q5_schedule = ops::detail::Q5ScheduleId::GemvR16S2X;
     } else if (candidate == "q5-simt-r8c4") {
@@ -785,19 +778,6 @@ void parse_candidate(Options& opt, std::string_view raw) {
     }
 }
 
-ops::detail::Q4KernelVariant parse_q4_variant(std::string_view raw, bool& is_auto) {
-    const std::string variant = lower(raw);
-    if (variant == "auto") {
-        is_auto = true;
-        return ops::detail::Q4KernelVariant::Predicated;
-    }
-    is_auto = false;
-    if (variant == "none") { return ops::detail::Q4KernelVariant::None; }
-    if (variant == "full") { return ops::detail::Q4KernelVariant::Full; }
-    if (variant == "predicated") { return ops::detail::Q4KernelVariant::Predicated; }
-    throw std::invalid_argument("unknown Q4 kernel variant: " + std::string(raw));
-}
-
 ops::detail::Q5KernelVariant parse_q5_variant(std::string_view raw, bool& is_auto) {
     const std::string variant = lower(raw);
     if (variant == "auto") {
@@ -835,18 +815,6 @@ ops::detail::W8KernelVariant parse_w8_variant(std::string_view raw, bool& is_aut
     if (variant == "full") { return ops::detail::W8KernelVariant::Full; }
     if (variant == "predicated") { return ops::detail::W8KernelVariant::Predicated; }
     throw std::invalid_argument("unknown W8 kernel variant: " + std::string(raw));
-}
-
-ops::detail::Q4KernelVariant resolve_q4_variant(ops::detail::Q4ScheduleId schedule,
-                                                std::int32_t rows, std::int32_t k,
-                                                std::int32_t padded_k, std::int32_t cols) {
-    const ops::detail::Q4Problem problem{rows, k, padded_k, cols};
-    using V = ops::detail::Q4KernelVariant;
-    for (const V variant : {V::None, V::Full, V::Predicated}) {
-        if (ops::detail::q4_candidate_is_legal(schedule, variant, problem)) { return variant; }
-    }
-    throw std::invalid_argument(std::string("no legal variant for ") +
-                                ops::detail::q4_schedule_name(schedule));
 }
 
 ops::detail::Q5KernelVariant resolve_q5_variant(ops::detail::Q5ScheduleId schedule,
@@ -956,10 +924,8 @@ void usage(const char* argv0) {
         "  --shape NAME               One ShapeFamily string, e.g. MlpGateUp34816x5120.\n"
         "  --rows N --k K             Numeric matrix geometry for fixed-candidate work.\n"
         "  --qtype Q4|Q5|Q6|W8G32     Low-bit ROW_SPLIT qtype for --shape.\n"
-        "  --candidate NAME           auto, q4-gemv-r4w1-direct,\n"
-        "                             q4-gemv-r1w8-direct, q4-simt-r8c4, q4-simt-r8c8,\n"
-        "                             q4-mma-r64c64, q4-mma-r64c128,\n"
-        "                             q5-gemv-r16s2x, q5-simt-r8c4, q5-simt-r8c8,\n"
+        "  --candidate NAME           auto, q5-gemv-r16s2x,\n"
+        "                             q5-simt-r8c4, q5-simt-r8c8,\n"
         "                             q5-simt-split2-exact, q5-simt-split4-exact,\n"
         "                             q5-mma-r64c64, q5-mma-r64c128,\n"
         "                             q6-simt-r8c4, q6-simt-r8c8,\n"
@@ -1023,7 +989,6 @@ Options parse_args(int argc, char** argv) {
             opt.all_targets = false;
         } else if (arg == "--variant") {
             const std::string_view raw = next("variant");
-            opt.q4_variant             = parse_q4_variant(raw, opt.q4_variant_auto);
             opt.q5_variant             = parse_q5_variant(raw, opt.q5_variant_auto);
             opt.q6_variant             = parse_q6_variant(raw, opt.q6_variant_auto);
             opt.w8_variant             = parse_w8_variant(raw, opt.w8_variant_auto);
@@ -1092,12 +1057,6 @@ Options parse_args(int argc, char** argv) {
     }
     if (!opt.paired_kv && opt.candidate == CandidateKind::W8PairFixed) {
         throw std::invalid_argument("W8 pair candidates require --paired-kv");
-    }
-    if (opt.candidate == CandidateKind::Q4Fixed && !numeric_shape && !opt.have_shape) {
-        throw std::invalid_argument("Q4 fixed candidate requires one shape");
-    }
-    if (opt.candidate == CandidateKind::Q4Fixed && opt.qtype != QType::Q4G64_F16S) {
-        throw std::invalid_argument("Q4 fixed candidate requires Q4");
     }
     if (opt.candidate == CandidateKind::Q5Fixed && !numeric_shape && !opt.have_shape) {
         throw std::invalid_argument("Q5 fixed candidate requires one shape");
@@ -1181,12 +1140,6 @@ std::vector<int> default_t_sweep(const TargetSpec& target, const Options& opt) {
     if (opt.linear_swiglu) { return {1, 16, 128, 129, 256, 384, 512, 640, 1024}; }
     if (opt.linear_add && target.qtype == QType::Q5G64_F16S) {
         return {1, 24, 25, 64, 128, 129, 512, 1024};
-    }
-    if (opt.candidate == CandidateKind::Q4Fixed) {
-        const bool gemv = opt.q4_schedule == ops::detail::Q4ScheduleId::GemvR4W1Direct ||
-                          opt.q4_schedule == ops::detail::Q4ScheduleId::GemvR1W8Direct;
-        return gemv ? std::vector<int>{1}
-                    : std::vector<int>{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048};
     }
     if (opt.candidate == CandidateKind::Q5Fixed) {
         if (opt.q5_schedule == ops::detail::Q5ScheduleId::GemvR16S2X) { return {1}; }
@@ -1488,14 +1441,6 @@ Weight make_w8_row_view(const Weight& parent, std::int32_t row_begin, std::int32
     return view;
 }
 
-ops::detail::Q4KernelVariant selected_q4_variant(const Options& opt, const ShapeSpec& shape,
-                                                 std::int32_t t) {
-    if (opt.candidate != CandidateKind::Q4Fixed) { return ops::detail::Q4KernelVariant::None; }
-    const auto padded_k = static_cast<std::int32_t>(align_up_u64(shape.k, 128));
-    return opt.q4_variant_auto ? resolve_q4_variant(opt.q4_schedule, shape.n, shape.k, padded_k, t)
-                               : opt.q4_variant;
-}
-
 ops::detail::Q5KernelVariant selected_q5_variant(const Options& opt, const ShapeSpec& shape,
                                                  std::int32_t t) {
     if (opt.candidate != CandidateKind::Q5Fixed) { return ops::detail::Q5KernelVariant::None; }
@@ -1543,11 +1488,6 @@ void launch_candidate(const Options& opt, const ShapeSpec& shape, const Tensor& 
     case CandidateKind::Auto:
         ops::linear(x, w, out, ws, stream);
         return;
-    case CandidateKind::Q4Fixed: {
-        const auto variant = selected_q4_variant(opt, shape, x.ne[1]);
-        ops::detail::q4_rowsplit_launch_candidate(opt.q4_schedule, variant, x, w, out, stream);
-        return;
-    }
     case CandidateKind::Q5Fixed: {
         const auto variant = selected_q5_variant(opt, shape, x.ne[1]);
         ops::detail::q5_rowsplit_launch_candidate(opt.q5_schedule, variant, x, w, out, stream);
@@ -1571,20 +1511,16 @@ void launch_candidate(const Options& opt, const ShapeSpec& shape, const Tensor& 
     throw std::invalid_argument("unknown Linear benchmark candidate");
 }
 
-int schedule_col_tile(ops::detail::Q4ScheduleId schedule) {
-    using S = ops::detail::Q4ScheduleId;
-    switch (schedule) {
-    case S::GemvR4W1Direct:
-    case S::GemvR1W8Direct:
+int q4_launch_col_tile(ops::detail::Q4Launch launch) {
+    if (launch == ops::detail::launch_q4_gemv_r4_w1_direct ||
+        launch == ops::detail::launch_q4_gemv_r1_w8_direct) {
         return 1;
-    case S::SimtR8C4:
-        return 4;
-    case S::MmaR64C64:
-        return 64;
-    case S::MmaR64C128:
-        return 128;
     }
-    throw std::invalid_argument("unknown Q4 schedule tile");
+    if (launch == ops::detail::launch_q4_simt_r8_c4) { return 4; }
+    if (launch == ops::detail::launch_q4_simt_r8_c8) { return 8; }
+    if (launch == ops::detail::launch_q4_mma_r64_c64) { return 64; }
+    if (launch == ops::detail::launch_q4_mma_r64_c128) { return 128; }
+    throw std::invalid_argument("unknown Q4 host launcher tile");
 }
 
 int schedule_col_tile(ops::detail::Q6ScheduleId schedule) {
@@ -1685,13 +1621,14 @@ int schedule_col_tile(ops::detail::W8ScheduleId schedule, std::int32_t t) {
     throw std::invalid_argument("unknown W8 schedule tile");
 }
 
-int linear_swiglu_col_tile(const ops::detail::Q4LinearSwiGluPlan& plan) {
+int linear_swiglu_col_tile(const ops::detail::Q4LinearSwiGluPlan& plan, const ShapeSpec& shape,
+                           std::int32_t t) {
     using S = ops::detail::Q4LinearSwiGluScheduleId;
     switch (plan.schedule) {
     case S::GemvPair:
         return 1;
     case S::Materialized:
-        return schedule_col_tile(plan.materialized_projection->schedule);
+        return q4_launch_col_tile(resolve_auto_q4_launch(shape, t));
     case S::MmaSplitHalfPairR32C128:
         return 128;
     }
@@ -1750,9 +1687,10 @@ int candidate_col_tile(const Options& opt, QType qtype, const ShapeSpec& shape, 
     case CandidateKind::Auto:
         if (qtype == QType::Q4G64_F16S) {
             if (opt.linear_swiglu) {
-                return linear_swiglu_col_tile(resolve_auto_q4_linear_swiglu_plan(shape, t));
+                return linear_swiglu_col_tile(resolve_auto_q4_linear_swiglu_plan(shape, t), shape,
+                                              t);
             }
-            return schedule_col_tile(resolve_auto_q4_plan(shape, t).schedule);
+            return q4_launch_col_tile(resolve_auto_q4_launch(shape, t));
         }
         if (qtype == QType::Q5G64_F16S) {
             if (opt.linear_add) {
@@ -1770,8 +1708,6 @@ int candidate_col_tile(const Options& opt, QType qtype, const ShapeSpec& shape, 
             return schedule_col_tile(resolve_auto_w8_plan(shape, t).schedule, t);
         }
         throw std::invalid_argument("unsupported qtype for auto candidate tile");
-    case CandidateKind::Q4Fixed:
-        return schedule_col_tile(opt.q4_schedule);
     case CandidateKind::Q5Fixed:
         return schedule_col_tile(opt.q5_schedule, t);
     case CandidateKind::Q6Fixed:
@@ -1803,9 +1739,6 @@ std::uint64_t candidate_weight_passes(const Options& opt, QType qtype, const Sha
 }
 
 bool candidate_uses_mma(const Options& opt, QType qtype, const ShapeSpec& shape, std::int32_t t) {
-    if (opt.candidate == CandidateKind::Q4Fixed) {
-        return ops::detail::q4_schedule_uses_mma(opt.q4_schedule);
-    }
     if (opt.candidate == CandidateKind::Q5Fixed) {
         return ops::detail::q5_schedule_uses_mma(opt.q5_schedule);
     }
@@ -1822,9 +1755,12 @@ bool candidate_uses_mma(const Options& opt, QType qtype, const ShapeSpec& shape,
             using S         = ops::detail::Q4LinearSwiGluScheduleId;
             return plan.schedule == S::MmaSplitHalfPairR32C128 ||
                    (plan.schedule == S::Materialized &&
-                    ops::detail::q4_schedule_uses_mma(plan.materialized_projection->schedule));
+                    (resolve_auto_q4_launch(shape, t) == ops::detail::launch_q4_mma_r64_c64 ||
+                     resolve_auto_q4_launch(shape, t) == ops::detail::launch_q4_mma_r64_c128));
         }
-        return ops::detail::q4_schedule_uses_mma(resolve_auto_q4_plan(shape, t).schedule);
+        const ops::detail::Q4Launch launch = resolve_auto_q4_launch(shape, t);
+        return launch == ops::detail::launch_q4_mma_r64_c64 ||
+               launch == ops::detail::launch_q4_mma_r64_c128;
     }
     if (qtype == QType::Q5G64_F16S) {
         if (opt.linear_add) {
@@ -2005,9 +1941,7 @@ RunResult run_target(const TargetSpec& target, const Options& opt, double stream
     r.shape_name     = shape.name;
     r.qtype_name     = qtype_name(target.qtype);
     r.candidate_name = candidate_name(opt, target.qtype, shape, t);
-    if (opt.candidate == CandidateKind::Q4Fixed) {
-        r.kernel_variant = ops::detail::q4_kernel_variant_name(selected_q4_variant(opt, shape, t));
-    } else if (opt.candidate == CandidateKind::Q5Fixed) {
+    if (opt.candidate == CandidateKind::Q5Fixed) {
         r.kernel_variant = ops::detail::q5_kernel_variant_name(selected_q5_variant(opt, shape, t));
     } else if (opt.candidate == CandidateKind::Q6Fixed) {
         r.kernel_variant = ops::detail::q6_kernel_variant_name(selected_q6_variant(opt, shape, t));
@@ -2016,11 +1950,6 @@ RunResult run_target(const TargetSpec& target, const Options& opt, double stream
             candidate_uses_conditioning_exact_tail(opt, target.qtype, shape, t)
                 ? "exact_tail"
                 : ops::detail::w8_kernel_variant_name(selected_w8_variant(opt, shape, t));
-    } else if (opt.candidate == CandidateKind::Auto && target.qtype == QType::Q4G64_F16S) {
-        const auto variant = opt.linear_swiglu
-                                 ? resolve_auto_q4_linear_swiglu_plan(shape, t).variant
-                                 : resolve_auto_q4_plan(shape, t).variant;
-        r.kernel_variant   = ops::detail::q4_kernel_variant_name(variant);
     } else if (opt.candidate == CandidateKind::Auto && target.qtype == QType::Q5G64_F16S) {
         const auto variant = opt.linear_add ? resolve_auto_q5_linear_add_plan(shape, t).variant
                                             : resolve_auto_q5_plan(shape, t).variant;

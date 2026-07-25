@@ -12,12 +12,10 @@
 
 namespace {
 
-using ninfer::ops::detail::Q4KernelVariant;
 using ninfer::ops::detail::Q4Q5AttnInputProblem;
 using ninfer::ops::detail::Q4Q5AttnInputScheduleId;
 using ninfer::ops::detail::Q4Q5GdnInputProblem;
 using ninfer::ops::detail::Q4Q5GdnInputScheduleId;
-using ninfer::ops::detail::Q4ScheduleId;
 using ninfer::ops::detail::Q5ScheduleId;
 using ninfer::ops::detail::W8AttnInputProblem;
 using ninfer::ops::detail::W8AttnInputScheduleId;
@@ -48,34 +46,21 @@ void attn_route_tests() {
         const auto expected     = parent_split
                                       ? Q4Q5AttnInputScheduleId::ParentSplitFixed
                                       : Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR64C128;
-        if (plan.schedule != expected || plan.parent_split.has_value() != parent_split ||
+        if (plan.schedule != expected || plan.parent_gate_value.has_value() != parent_split ||
             plan.workspace_bytes != 0) {
             std::cerr << "wrong attention input route C=" << cols << '\n';
-            ++failures;
-        }
-        const Q4KernelVariant expected_variant =
-            parent_split
-                ? Q4KernelVariant::None
-                : ((cols % 128) == 0 ? Q4KernelVariant::Full : Q4KernelVariant::Predicated);
-        if (plan.grouped_variant != expected_variant) {
-            std::cerr << "wrong attention input variant C=" << cols << '\n';
             ++failures;
         }
     }
     for (std::int32_t cols = 1; cols <= 16; ++cols) {
         const auto plan =
             ninfer::ops::detail::q4_q5_attn_input_resolve_plan({5120, 6144, 1024, 5120, cols});
-        const Q4ScheduleId expected_q4 =
-            cols == 1 ? Q4ScheduleId::GemvR1W8Direct
-                      : ((cols <= 7 || (cols >= 9 && cols <= 15)) ? Q4ScheduleId::SimtR8C4
-                                                                  : Q4ScheduleId::SimtR8C8);
         const Q5ScheduleId expected_q5 =
             cols == 1 ? Q5ScheduleId::GemvR16S2X
                       : (cols <= 6 ? Q5ScheduleId::SimtSplit4Exact : Q5ScheduleId::SimtR8C4);
-        if (!plan.parent_split.has_value() ||
-            plan.parent_split->query_key.schedule != expected_q4 ||
-            plan.parent_split->gate_value.schedule != expected_q5) {
-            std::cerr << "wrong Attention parent subplans C=" << cols << '\n';
+        if (!plan.parent_gate_value.has_value() ||
+            plan.parent_gate_value->schedule != expected_q5) {
+            std::cerr << "wrong Attention parent Q5 route C=" << cols << '\n';
             ++failures;
         }
     }
@@ -97,17 +82,19 @@ void gdn_route_tests() {
         const bool independent = cols <= 16;
         const auto expected    = independent ? Q4Q5GdnInputScheduleId::IndependentDirectFixed
                                              : Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128;
-        if (plan.schedule != expected || plan.independent.has_value() != independent ||
+        if (plan.schedule != expected || plan.independent_value.has_value() != independent ||
             plan.workspace_bytes != 0) {
             std::cerr << "wrong GDN input route C=" << cols << '\n';
             ++failures;
         }
-        const Q4KernelVariant expected_variant =
-            independent ? Q4KernelVariant::None
-                        : ((cols % 128) == 0 ? Q4KernelVariant::Full : Q4KernelVariant::Predicated);
-        if (plan.grouped_variant != expected_variant) {
-            std::cerr << "wrong GDN input variant C=" << cols << '\n';
-            ++failures;
+        if (independent) {
+            const Q5ScheduleId expected_q5 =
+                cols == 1 ? Q5ScheduleId::GemvR16S2X
+                          : (cols <= 6 ? Q5ScheduleId::SimtSplit4Exact : Q5ScheduleId::SimtR8C8);
+            if (plan.independent_value->schedule != expected_q5) {
+                std::cerr << "wrong GDN independent Q5 route C=" << cols << '\n';
+                ++failures;
+            }
         }
     }
     expect_invalid("GDN C0", [] {

@@ -15,7 +15,6 @@
 
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
-#include "ops/linear/q4/q4_rowsplit_launch.h"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
 
 #include <cuda_bf16.h>
@@ -183,7 +182,7 @@ struct Q4SimtStoreEpilogue {
     }
 };
 
-template <class Schedule, Q4KernelVariant Variant, bool SplitOutput = false, int SplitRow = 0,
+template <class Schedule, bool Full, bool SplitOutput = false, int SplitRow = 0,
           class Epilogue = Q4SimtStoreEpilogue>
 __global__ __launch_bounds__(
     Schedule::kThreads,
@@ -201,12 +200,10 @@ __global__ __launch_bounds__(
                                                                   std::int32_t cols,
                                                                   std::int32_t padded_k,
                                                                   Epilogue epilogue = {}) {
-    static_assert(Variant == Q4KernelVariant::Full || Variant == Q4KernelVariant::Predicated,
-                  "Q4 SIMT GEMM requires a tiled kernel variant");
     static_assert(!SplitOutput || SplitRow > 0,
                   "split-output Q4 SIMT requires a positive compile-time seam");
 
-    constexpr bool kFull              = Variant == Q4KernelVariant::Full;
+    constexpr bool kFull              = Full;
     constexpr int kRowsPerCta         = Schedule::kRowsPerCta;
     constexpr int kColsPerTile        = Schedule::kColsPerTile;
     constexpr int kGroupsPerStage     = Schedule::kGroupsPerStage;
