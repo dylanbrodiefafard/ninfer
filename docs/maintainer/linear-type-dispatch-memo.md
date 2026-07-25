@@ -559,9 +559,12 @@ custom-epilogue 实例由它自己的 route 负责，不计入 pure Linear regis
 Section 4.4.1 的映射是既有测量结果；selector 是该映射的 executable authority，public
 数值测试只证明通过该入口可达的实现满足统一 Linear 数值合同。
 
-`bench/ops/linear_op_bench.cu` 已移除 Q4 fixed-candidate/forcing options、解析、调用和
-旧 header include；通过 public `linear()` 的普通 Q4 benchmark mode 保留。benchmark
-source 必须可构建，但 route 重构不以重新测量性能为验收条件。
+`bench/ops/linear_bench.cu` 只通过 public `linear()` 测量 production route。它不 include
+private dispatch/launcher/plan header，不提供 fixed candidate 或 forcing，也不复制
+launcher tile、tail、weight replay 或 executed-FLOP 信息。单点、连续 T sweep 和
+27B/35B suite 共用同一执行路径；NCU profile mode 只捕获一次 public Linear 调用。
+吞吐参照固定使用 RTX 5090 的 `1792 GB/s` DRAM 和 `209.5 TFLOP/s` dense BF16 Tensor
+Core 规格，不运行同进程 copy 或 Tensor Core peak probe。
 
 ## 7. 当前文件组织
 
@@ -1098,4 +1101,5 @@ grid、slicing 和 exact/composite 行为，然后由 selector 直接返回 func
 - common 中 Q4/Q5/Q6/W8 显式 weight generators、唯一 CPU FP64 GEMM 和集中容差；
 - Q5 LinearAdd、Q4/Q5/W8 Attention/GDN、W8 LinearAdd/LinearSwiGLU/LinearPair 等
   fused 路径保持独立所有权，不由 pure Linear suite 代替；
-- benchmark targets 的编译兼容，但没有 fixed schedule/variant forcing。
+- pure Linear benchmark 的单点、连续 sweep、27B/35B suite 和单次 NCU capture 均通过
+  public `linear()`，且没有 fixed schedule/variant forcing。

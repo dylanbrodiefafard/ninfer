@@ -69,50 +69,58 @@ and `-r 1`, synchronizes after warmup, and brackets only the measured repetition
 `cudaProfilerStart/Stop`. Use it with an Nsight Systems `cudaProfilerApi` capture range so artifact
 load, graph construction, and warmup do not enter topology counts.
 
-## Text linear Op benchmarks
+## Linear Op benchmark
 
-`ninfer_linear_op_bench` exposes the registered 27B fused LinearSwiGLU and Q5 LinearAdd contracts
-through their production dispatch at the default `T=1024` prefill extent:
+`ninfer_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,
+and W8 packed weights with the current A16 activation-compute policy. LinearAdd, LinearSwiGLU,
+LinearPair, Attention/GDN projections, and sparse MoE remain separate semantic Ops and are not
+benchmark modes here.
 
-```bash
-./build/bench/ninfer_linear_op_bench \
-  --shape MlpGateUp34816x5120 --qtype Q4 --linear-swiglu --t-sweep 1024
-./build/bench/ninfer_linear_op_bench \
-  --shape MlpDown5120x17408 --qtype Q5 --linear-add --t-sweep 1024
-./build/bench/ninfer_linear_op_bench \
-  --shape Out5120x6144 --qtype Q5 --linear-add --t-sweep 1024
-```
-
-The benchmark records the selected production route, cold-cache timing, measured tensor-core
-ceiling, and useful/executed throughput. Full/Predicated selection is launcher-private and is not
-exposed as a benchmark control.
-
-## W8 context K/V LinearPair Op benchmark
-
-`ninfer_linear_op_bench` with `--paired-kv` and numeric shape `[1024,2048]` measures the two
-adjacent K/V row views of one W8 `[6144,2048]` parent. Production dispatch includes the direct
-one-pass decode kernel, exact- and medium-T split-K Tensor Core kernels, concatenated K/V Tensor
-Core schedules, and exact residual-T routes. `--pair-composed` retains two ordinary public
-`linear` calls as the semantic and performance control. The benchmark no longer exposes private
-schedule or variant forcing.
+Build the benchmark and measure one exact production point:
 
 ```bash
-cmake --build build --parallel --target ninfer_linear_op_bench
-./build/bench/ninfer_linear_op_bench \
-  --rows 1024 --k 2048 --qtype W8G32 --paired-kv \
-  --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,32,33,48,49,64,65,80,81,88,89,96,97,104,105,112,113,128,129,160,161,192,193,384,385,640,641,672,673,896,897,960,961,976,977,1024,1280,1440,1441,1680,1920,2048,2208,2209,2270,2271,2304 \
-  --warmup 10 --repeat 50 \
-  --csv-out profiles/bench/w8_context_kv_pair.csv
-./build/bench/ninfer_linear_op_bench \
-  --rows 1024 --k 2048 --qtype W8G32 --paired-kv \
-  --t-sweep "$(seq -s, 1 2305)" --warmup 3 --repeat 20 \
-  --csv-out profiles/bench/w8_context_kv_pair_all_t.csv
-./build/bench/ninfer_linear_op_bench \
-  --rows 1024 --k 2048 --qtype W8G32 --paired-kv --pair-composed \
-  --t-sweep 1,16,32,64,128,129,1024,1280,2048,2208 \
-  --warmup 10 --repeat 50 \
-  --csv-out profiles/bench/w8_context_kv_pair_composed.csv
+cmake --build build --parallel --target ninfer_linear_bench
+./build/bench/ninfer_linear_bench \
+  --qtype q4 --policy a16 --n 4096 --k 5120 --t 8
 ```
+
+A continuous small-T sweep reuses one packed weight and one maximum-T activation/output
+allocation:
+
+```bash
+./build/bench/ninfer_linear_bench \
+  --qtype q4 --policy a16 --n 4096 --k 5120 \
+  --sweep 1:32:1 --csv-out profiles/bench/q4_4096x5120_t1_32.csv
+./build/bench/ninfer_linear_bench \
+  --qtype q4 --policy a16 --n 3456 --k 1152 \
+  --sweep 4:512:4 --csv-out profiles/bench/q4_vision_qkv.csv
+```
+
+The registered suites run representative public Linear shapes for one or both exact products.
+They are compact performance surveys, not copies of the production selector or numerical test
+matrix:
+
+```bash
+./build/bench/ninfer_linear_bench --suite qwen3_6_27b
+./build/bench/ninfer_linear_bench --suite qwen3_6_35b_a3b
+./build/bench/ninfer_linear_bench --suite all
+```
+
+For NCU, `--profile` performs setup, warmup, and the L2 flush before enabling the profiler, then
+captures exactly one public Linear call:
+
+```bash
+ncu --profile-from-start off --set full \
+  ./build/bench/ninfer_linear_bench \
+  --qtype q4 --policy a16 --n 4096 --k 5120 --t 8 --profile
+```
+
+Every ordinary sample is cold-cache: a 256 MiB L2 eviction write completes before the timed
+interval. Reported effective bandwidth uses the encoded weight planes once, one BF16 activation
+read, and one BF16 output write. Reported FLOPs are the mathematical `2*N*K*T`; neither metric
+copies route-private tile, replay, padding, split, schedule, host-launcher, or kernel-instance
+behavior. The fixed RTX 5090 references are `1792 GB/s` DRAM bandwidth and `209.5 TFLOP/s` dense
+BF16 Tensor Core throughput. Physical traffic and instruction utilization require NCU.
 
 ## GDN control-projection Op benchmark
 
@@ -299,28 +307,6 @@ cmake --build build --parallel --target ninfer_w8_linear_add_bench
   --warmup 3 --repeat 15 --csv-out profiles/bench/w8_linear_add_all_t.csv
 ./build/bench/ninfer_w8_linear_add_bench \
   --profile --production-only --t-sweep 1024
-```
-
-## W8 conditioning Linear Op benchmark
-
-`ninfer_linear_op_bench` with numeric W8 shape `[2048,16384]` measures the 35B-A3B
-target-feature conditioning projection without introducing a target or Engine route. Production
-dispatch uses a direct decode kernel, exact and medium split-K Tensor Core kernels, and tuned tiled
-Tensor Core schedules. The benchmark follows the production selector and does not expose private
-schedule, variant, or exact-tail forcing. Every cold-cache sample follows a 256 MiB L2 flush; the
-row also reports the same-process BF16 Tensor Core ceiling and useful/executed throughput.
-
-```bash
-cmake --build build --parallel --target ninfer_linear_op_bench
-./build/bench/ninfer_linear_op_bench \
-  --rows 2048 --k 16384 --qtype W8G32 \
-  --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,32,33,64,65,96,128,129,256,480,481,640,641,704,705,896,897,960,961,1024,1120,1280,1344,1345,1440,1680,1792,1920,2016,2048,2112 \
-  --warmup 10 --repeat 50 \
-  --csv-out profiles/bench/w8_conditioning_linear.csv
-./build/bench/ninfer_linear_op_bench \
-  --rows 2048 --k 16384 --qtype W8G32 \
-  --t-sweep "$(seq -s, 1 2112)" --warmup 3 --repeat 10 \
-  --csv-out profiles/bench/w8_conditioning_linear_all_t.csv
 ```
 
 ## 35B W8 input-projection Op benchmark
