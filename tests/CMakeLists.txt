@@ -183,6 +183,9 @@ ninfer_add_test(ninfer_speculative_round_test
   SOURCES ops/test_speculative_round.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_linear_test(ninfer_linear_q4_a16_test ops/linear/test_q4_a16.cpp)
+ninfer_add_linear_test(ninfer_linear_q5_a16_test ops/linear/test_q5_a16.cpp)
+ninfer_add_linear_test(ninfer_linear_q6_a16_test ops/linear/test_q6_a16.cpp)
+ninfer_add_linear_test(ninfer_linear_w8_a16_test ops/linear/test_w8_a16.cpp)
 ninfer_add_test(ninfer_gdn_input_proj_conv_snapshot_test
   SOURCES ops/test_gdn_input_proj_conv_snapshot.cpp
   LIBRARIES ninfer_ops)

@@ -34,7 +34,7 @@ enum class LinearPolicy : std::uint8_t {
  * @f]
  *
  * `out` stores a BF16 approximation of this ideal result under the named numerical criterion for
- * the selected private compute profile.
+ * the selected private activation-compute path.
  *
  * @par Logical tensors and layout
  * `x` is contiguous, non-null, 16-byte-aligned BF16 `[K,T]`, `w` has logical shape `[N,K]`, and
@@ -57,8 +57,9 @@ enum class LinearPolicy : std::uint8_t {
  * evaluates every complete dot product with naive FP64 accumulation, and retains the FP64 result.
  * The BF16 output is promoted and compared against that result. Output representation,
  * accumulator precision, activation quantization, staging, reduction order, and kernel schedule
- * are private implementation effects covered by the named tolerance for the selected profile;
- * none is copied into the oracle.
+ * are private implementation effects covered by the named tolerance for the selected
+ * activation-compute path; none is copied into the oracle. Kernel, schedule, template instance,
+ * host launcher, and T region do not create separate criteria inside one path.
  *
  * @par Compute policy
  * `policy` specifies the permitted private activation-compute set. A permission does not require a

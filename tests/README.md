@@ -53,8 +53,10 @@ ctest --test-dir build -R ninfer_sampling_test --output-on-failure
 Linear tests are independently runnable by weight and activation-compute profile:
 
 ```bash
-cmake --build build --parallel --target ninfer_linear_q4_a16_test
-ctest --test-dir build -R '^ninfer_linear_q4_a16_test$' --output-on-failure
+cmake --build build --parallel --target \
+  ninfer_linear_q4_a16_test ninfer_linear_q5_a16_test \
+  ninfer_linear_q6_a16_test ninfer_linear_w8_a16_test
+ctest --test-dir build -R '^ninfer_linear_(q4|q5|q6|w8)_a16_test$' --output-on-failure
 ```
 
 All Linear files use `ops/linear/linear_test_common.{h,cpp}`. Its explicit Q4/Q5/Q6/W8 generators

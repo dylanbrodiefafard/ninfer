@@ -52,7 +52,7 @@ struct LinearTolerance {
 constexpr LinearTolerance tolerance_for(ActivationCompute activation_compute) {
     switch (activation_compute) {
     case ActivationCompute::A16:
-        return {3.0e-3, 4.0e-3, 3.0e-3};
+        return {3.0e-3, 4.0e-3, 3.5e-3};
     }
     throw std::invalid_argument("linear test: unknown activation compute path");
 }

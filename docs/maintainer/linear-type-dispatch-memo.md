@@ -759,8 +759,8 @@ variant 字段。它的 function identity 已经完整确定执行 leaf。
   reduction tree 或 BF16 output rounding；
 - 可合理执行的尺寸检查完整 output、guards、输入/weight preservation；大 N/T case
   检查完整 output 写入和 guards，再把确定性采样行列交给同一个 GEMM；
-- `AllowA8` 当前与 A16 selector 相同，因此只需一个 public `AllowA8` 数值 case 证明
-  policy 透传；不把相同数值测试按 policy 重复一遍；
+- A16 suites 只使用 `A16Only`；未来实际接入 A8 route 时，由独立 A8 suite 使用
+  `AllowA8` 和 A8 criterion，不让同一测试在 route 演进后静默改变 compute path；
 - malformed Q4 group/layout/padding/weight-plane alignment 由 artifact/binder tests 保护，
   不再作为 `linear()` 的 runtime-validation test。
 
@@ -772,14 +772,16 @@ variant 字段。它的 function identity 已经完整确定执行 leaf。
 - packed payload 与被选 oracle rows 的 logical float materialization；
 - `cpu_linear_gemm_fp64()`；
 - output poison、完整写入、guards、确定性采样和 public call mechanics；
-- `NumericalProfile -> LinearTolerance` 集中映射和比较逻辑。
+- `ActivationCompute -> LinearTolerance` 集中映射和比较逻辑。
 
 CPU GEMM 可以按输出行多线程并对 T 小块化以复用 weight load，但每个输出始终由一个
 线程按 `k=0..K-1` 顺序 double 累加。它不使用 BLAS、production decoder、production
 kernel、K 维树形归约或 fast-math。
 
-weight/profile test 只能选择命名 numerical profile。不同 profile 可以有不同容差，但
-不得定义第二个 oracle 或 per-case tolerance literal。
+每个 weight/activation suite 只能为整个 suite 选择一次命名 activation compute path。
+A16 与未来 A8/A4 可以有不同容差，但同一路径内的 T、kernel、schedule、模板实例和
+host launcher 不得改变容差；任何 suite 都不得定义第二个 oracle 或 per-case tolerance
+literal。
 
 ### 11.3 Conformance matrix
 
@@ -806,8 +808,8 @@ Q4_A16 test 只 include public `linear()` contract 和上述 common：
    不再保留 pure Linear plan/execute/candidate 层；
 5. 让 Attention input、GDN input、GDN conv snapshot 和 LinearSwiGLU 只保留
    fused-local route，不依赖 pure Q4 plan/enum/fixed-pitched launch；
-6. 用 public `linear()` 和统一 CPU FP64 GEMM oracle 的 Q4_A16 conformance matrix
-   替换旧 Q4 candidate/plan/dispatch/selector tests；
+6. 用 public `linear()` 和统一 CPU FP64 GEMM oracle 的 Q4/Q5/Q6/W8 A16 conformance
+   matrices 替换旧 pure Linear candidate/plan/dispatch/selector tests；
 7. 从 CMake、benchmark source 和 production source 删除 Q4/Q5/Q6/W8 旧
    plan/launch/candidate files、symbols 和 forcing options，并删除 BF16 空占位。
 
@@ -826,8 +828,8 @@ Q4 范例只有在以下条件全部满足时完成：
 - pure Q4 仍只有三个 `__global__` kernel 定义；
 - Full/Predicated 使用 Section 4.5 的精确谓词，且和 grid slicing 一样对 selector 不可见；
 - fused Ops 不依赖 pure Linear plan/enum/variant；
-- Q4_A16 public 数值 cases 覆盖所有 registered geometries、policies、route boundaries
-  和六个 retained launchers；
+- Q4_A16 public 数值 cases 覆盖所有 registered geometries、A16 route boundaries 和六个
+  retained launchers；
 - 完整/采样 cases 全部使用 common 中唯一的 float-input/double-accumulation GEMM；
 - pure Linear suite 不替代任何 fused Op 的独立数值资格；
 - 旧文件和旧 CMake/test entries 已删除；
@@ -885,7 +887,7 @@ Q5 注册以下 exact shape：
 
 exact T-to-launcher 边界直接写在
 `src/ops/linear/q5/q5_dispatch.cpp::select_q5_a16_launch()`。它是唯一 executable
-registry；后续 Q5_A16 test 通过 public Linear 和 common CPU FP64 GEMM 覆盖所有
+registry；Q5_A16 test 通过 public Linear 和 common CPU FP64 GEMM 覆盖所有
 registered geometries、routes 及边界，不复制 selector 或建立第二份 support/admission
 table。
 
@@ -922,7 +924,7 @@ Q6 注册：
 - `launch_q6_mma_r64_c64`、`launch_q6_mma_r64_c128`。
 
 exact 边界位于
-`src/ops/linear/q6/q6_dispatch.cpp::select_q6_a16_launch()`。后续 Q6_A16 test 通过 public
+`src/ops/linear/q6/q6_dispatch.cpp::select_q6_a16_launch()`。Q6_A16 test 通过 public
 Linear 和 common CPU FP64 GEMM 覆盖其 routes 与边界，不复制 selector。SIMT 只有
 kernel-private Predicated 实例；MMA 的 Full 判定与 Q5 相同，只把 `TileCols` 取为 64
 或 128。
@@ -960,7 +962,7 @@ DFlash conditioning projection 注册：
 ```
 
 前三类 shape 的 exact T-to-launcher seam 直接位于
-`src/ops/linear/w8/w8_dispatch.cpp::select_w8_a16_launch()`。后续 W8_A16 test 通过 public
+`src/ops/linear/w8/w8_dispatch.cpp::select_w8_a16_launch()`。W8_A16 test 通过 public
 Linear 和 common CPU FP64 GEMM 覆盖其 routes 与边界，不复制 selector。W8 不存在独立
 runtime schedule enum；route 的结果就是 `W8Launch`。
 
@@ -1092,11 +1094,8 @@ grid、slicing 和 exact/composite 行为，然后由 selector 直接返回 func
 该重构只以 build 和 tests 验收，不运行 benchmark，也不重新选择 route winner。当前
 保护包括：
 
-- Q4_A16 public Linear 数值 conformance matrix；
+- Q4_A16、Q5_A16、Q6_A16 和 W8_A16 public Linear 数值 conformance matrices；
 - common 中 Q4/Q5/Q6/W8 显式 weight generators、唯一 CPU FP64 GEMM 和集中容差；
 - Q5 LinearAdd、Q4/Q5/W8 Attention/GDN、W8 LinearAdd/LinearSwiGLU/LinearPair 等
   fused 路径保持独立所有权，不由 pure Linear suite 代替；
 - benchmark targets 的编译兼容，但没有 fixed schedule/variant forcing。
-
-Q5_A16、Q6_A16 和 W8_A16 将按 Q4 范例各自增加 public conformance file；在这些文件
-落地前不保留旧 selector-only 测试作为替代资格。

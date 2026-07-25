@@ -37,7 +37,6 @@ additional user workflows or installed API documentation.
 Active implementation references:
 
 - [Linear direct-route architecture and registration rules](maintainer/linear-type-dispatch-memo.md)
-- [Linear numerical test refactor plan](maintainer/linear-test-refactor-plan.md)
 - [Qwen3.6-27B Prisma NVFP4 hybrid weights](maintainer/qwen3.6-27b-prisma-nvfp4-integration.md)
 - [Qwen3.6-35B-A3B DFlash Op checklist](maintainer/qwen3.6-35b-a3b-dflash-op-checklist.md)
 - [Qwen3.6-35B-A3B DFlash Engine integration](maintainer/qwen3.6-35b-a3b-dflash-engine-integration.md)
