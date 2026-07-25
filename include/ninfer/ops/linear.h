@@ -9,47 +9,80 @@
 
 namespace ninfer::ops {
 
+/**
+ * @brief Permitted private activation-compute profiles for a linear projection.
+ *
+ * The policy constrains plan selection; it does not select a kernel or prescribe a particular MMA
+ * instruction. The public activation and output tensors remain BF16 for every policy.
+ */
 enum class LinearPolicy : std::uint8_t {
-    A16Only,
-    AllowA8,
-    AllowA4,
+    A16Only, ///< Admit only A16 compute profiles.
+    AllowA8, ///< Admit either A16 or A8 compute profiles.
+    AllowA4, ///< Admit either A16 or A4 compute profiles.
 };
 
 /**
- * Matrix projection, independently for every token column:
+ * @brief Applies a bias-free matrix projection independently to every input column.
  *
- *   out[n,t] = BF16(sum_{k=0..K-1} dequantize(w)[n,k] * x[k,t]).
+ * @details The mathematical contract is
  *
- * `x` is contiguous BF16 [K,T], `w` has logical shape [N,K], and `out` is contiguous BF16
- * [N,T], with the first index stored fastest. Registered execution uses RowSplit Q4G64_F16S,
- * Q5G64_F16S, Q6G64_F16S, or W8G32_F16S weights with FP16 scales. Each format owns a finite
- * registry of exact physical weight problems and selects its kernel internally; the encoding and
- * alignment contract alone do not imply arbitrary N/K support. Text/MTP problems accept every
- * positive token extent T. Registered Vision problems instead accept raw-patch
- * P in {4,8,...,131072} or merged-token V in [1,32768]; a matrix column is not automatically token
- * T. BF16_CTRL has a reserved
- * format-local boundary but currently admits no pure Linear problem. FP32_CTRL is unsupported by
- * this Op. The oracle exact-decodes the weight and evaluates each dot product naively in FP64
- * before converting the observable output to BF16. Production accumulator, staging, and reduction
- * choices are route-private.
+ * @f[
+ *   \mathrm{out}_{n,t} =
+ *   \mathrm{BF16}\left(
+ *     \sum_{k=0}^{K-1} \mathrm{decode}(w)_{n,k}\,x_{k,t}
+ *   \right).
+ * @f]
  *
- * `policy` controls the permitted private activation-compute set. `A16Only` permits only A16
- * profiles; `AllowA8` permits A16 or A8 profiles; and `AllowA4` permits A16 or A4 profiles. A
- * permission does not require the corresponding low-precision route: the resolved implementation
- * may remain A16 when that is the qualified plan. The represented input and output tensors remain
- * BF16 for every policy, and the policy does not prescribe a particular MMA instruction.
+ * @par Logical tensors and layout
+ * `x` is contiguous BF16 `[K,T]`, `w` has logical shape `[N,K]`, and `out` is contiguous BF16
+ * `[N,T]`. Dimension zero is stored fastest. The Op has no bias, activation, residual addition, or
+ * transpose mode.
  *
- * BF16_CTRL admits only `A16Only`. The registered Q4/Q5/Q6/W8 formats admit `A16Only` and
- * `AllowA8`. No currently registered weight format admits `AllowA4`.
+ * @par Supported execution domain
+ * Registered execution uses RowSplit Q4G64_F16S, Q5G64_F16S, Q6G64_F16S, or W8G32_F16S weights
+ * with FP16 scales. Each format owns a finite registry of exact physical weight problems and
+ * selects its kernel internally; a valid encoding and alignment do not imply arbitrary N/K
+ * support. Text and MTP problems accept every positive column extent T. Registered Vision problems
+ * accept raw-patch P in `{4,8,...,131072}` or merged-token V in `[1,32768]`; a matrix column does
+ * not inherently represent a text token. BF16_CTRL has a reserved format-local boundary but
+ * currently admits no pure Linear problem. FP32_CTRL is unsupported.
  *
- * `out` must not overlap x or any weight plane. `ws` is caller-owned transient storage and carries
- * no semantic state beyond the call.
+ * @par Numerical contract
+ * The oracle exactly decodes the persistent weight, evaluates each complete dot product naively in
+ * FP64, and converts the observable result to BF16. Accumulator precision, activation
+ * quantization, staging, reduction order, and kernel schedule are private implementation choices
+ * qualified against that oracle.
+ *
+ * @par Compute policy
+ * `policy` specifies the permitted private activation-compute set. A permission does not require a
+ * corresponding low-precision route: the resolved plan may remain A16 when that is the qualified
+ * choice. BF16_CTRL admits only LinearPolicy::A16Only. Registered Q4/Q5/Q6/W8 formats admit
+ * LinearPolicy::A16Only and LinearPolicy::AllowA8. No currently registered weight format admits
+ * LinearPolicy::AllowA4.
+ *
+ * @param[in] x Contiguous BF16 input matrix `[K,T]`.
+ * @param[in] w Logical weight matrix `[N,K]` in a registered persistent format and layout.
+ * @param[out] out Contiguous BF16 output matrix `[N,T]`. It must not overlap `x` or any weight
+ * plane.
+ * @param[in] policy Permitted private activation-compute profiles.
+ * @param[in,out] ws Caller-owned transient storage. It carries no semantic state beyond the call.
+ * @param[in] stream CUDA stream on which execution is enqueued.
  */
 void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy, WorkspaceArena& ws,
             cudaStream_t stream);
 
 /**
- * Equivalent to linear(x, w, out, LinearPolicy::A16Only, ws, stream).
+ * @brief Applies the A16-only form of the bias-free matrix projection.
+ *
+ * @details This overload is exactly equivalent to
+ * `linear(x, w, out, LinearPolicy::A16Only, ws, stream)`. All tensor, weight, aliasing, workspace,
+ * and execution-domain requirements of the policy-bearing overload apply.
+ *
+ * @param[in] x Contiguous BF16 input matrix `[K,T]`.
+ * @param[in] w Logical weight matrix `[N,K]` in a registered persistent format and layout.
+ * @param[out] out Contiguous BF16 output matrix `[N,T]`.
+ * @param[in,out] ws Caller-owned transient storage.
+ * @param[in] stream CUDA stream on which execution is enqueued.
  */
 void linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws, cudaStream_t stream);
 
