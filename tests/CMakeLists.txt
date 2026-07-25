@@ -28,6 +28,18 @@ function(ninfer_add_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+function(ninfer_add_linear_test name source)
+  ninfer_add_test(${name}
+    SOURCES ${source}
+            ops/linear/linear_test_common.cpp
+    LIBRARIES ninfer_ops)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(${name} PRIVATE
+      $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math>
+      $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
+  endif()
+endfunction()
+
 # Artifact framing and model-independent runtime contracts.
 ninfer_add_test(ninfer_artifact_reader_test
   SOURCES test_ninfer_artifact_reader.cpp
@@ -170,17 +182,9 @@ ninfer_add_test(ninfer_mtp_round_test
 ninfer_add_test(ninfer_speculative_round_test
   SOURCES ops/test_speculative_round.cpp
   LIBRARIES ninfer_ops)
-ninfer_add_test(ninfer_linear_test
-  SOURCES ops/test_linear.cpp
-  LIBRARIES ninfer_ops)
+ninfer_add_linear_test(ninfer_linear_q4_a16_test ops/linear/test_q4_a16.cpp)
 ninfer_add_test(ninfer_gdn_input_proj_conv_snapshot_test
   SOURCES ops/test_gdn_input_proj_conv_snapshot.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_test(ninfer_q4_linear_selector_test
-  SOURCES ops/test_q4_linear_selector.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_test(ninfer_q5_linear_selector_test
-  SOURCES ops/test_q5_linear_selector.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_test(ninfer_linear_add_plan_test
   SOURCES ops/test_linear_add_plan.cpp
@@ -190,12 +194,6 @@ ninfer_add_test(ninfer_linear_swiglu_plan_test
   LIBRARIES ninfer_ops)
 ninfer_add_test(ninfer_input_proj_plan_test
   SOURCES ops/test_input_proj_plan.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_test(ninfer_q6_linear_selector_test
-  SOURCES ops/test_q6_linear_selector.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_test(ninfer_w8_linear_selector_test
-  SOURCES ops/test_w8_linear_selector.cpp
   LIBRARIES ninfer_ops)
 
 ninfer_add_test(ninfer_qwen3_6_27b_visual_scatter_test

@@ -83,11 +83,14 @@ implementation detail when it is only one step beneath a complete host-callable 
 
 #### Oracle precision and implementation freedom
 
-Every floating-point Op has one independent naive FP32/FP64 mathematical oracle. The oracle starts
-from the values represented by the public inputs, evaluates the complete logical formula without
-production tiling or staging, and applies the declared observable output/state formats. For packed
-weights it decodes each signed code with the exact stored scale before evaluating the formula.
-Exact transforms and codecs use one independent exact oracle instead.
+Every floating-point Op has one independent naive FP32/FP64 mathematical oracle. A test fixture
+first materializes the logical values represented by every public input. For a packed weight this
+means independently forming its specified logical FP32 values from the generated signed codes and
+stored scales. The Op oracle then receives only those logical values, evaluates the complete formula
+at high precision without production tiling or staging, and retains the high-precision result for
+comparison. Lower-precision public output storage is promoted for comparison and its representation
+error belongs to the named acceptance criterion; it is not reproduced inside the oracle. Exact
+transforms and codecs use one independent exact oracle instead.
 
 The oracle defines correctness; it does not freeze the arithmetic path of a kernel. Private
 accumulators, instruction operand types, staging casts, reduction association, workspace dtypes,
@@ -465,13 +468,13 @@ the contract promises that result.
 
 Every floating-point Op uses the one naive FP32/FP64 oracle defined in Section 1.2. Give each
 implementation profile an explicit named tolerance when its rounding or quantization error differs.
-Do not copy query quantization, staging casts, reduction trees, or another implementation's output
-into the oracle merely to make parity pass. Conversely, do not turn the oracle's evaluation
-precision into a required kernel evaluation order. State the qualification domain honestly: a
-tolerance established for registered shapes, tested token extents, the conformance matrix, and
-target-representative activations is not a universal error theorem for arbitrary unbounded or
-adversarial tensors. Each semantically complete entry point is checked directly against the oracle;
-pairwise implementation parity is supplementary evidence.
+Do not copy query quantization, output rounding, staging casts, reduction trees, or another
+implementation's output into the oracle merely to make parity pass. Conversely, do not turn the
+oracle's evaluation precision into a required kernel evaluation order. State the qualification
+domain honestly: a tolerance established for registered shapes, tested token extents, the
+conformance matrix, and target-representative activations is not a universal error theorem for
+arbitrary unbounded or adversarial tensors. Each semantically complete entry point is checked
+directly against the oracle; pairwise implementation parity is supplementary evidence.
 
 GQA applies this rule concretely. BF16 and INT8-G64 A1/A3 share an FP64 ideal attention oracle over
 BF16 Q and logical cache values (BF16 or FP32-decoded INT8-G64). The target's INT8 Q8-G64 compute
@@ -488,9 +491,10 @@ risks, but they do not replace public Op qualification against the independent o
 
 #### Oracle
 
-- A floating-point Op uses one test-owned, naive FP64 oracle. It starts from the values represented
-  by the public inputs, exact-decodes packed weights from their stored signed codes and scales, and
-  applies only the observable output or state casts declared by the contract.
+- A floating-point Op uses one test-owned, naive FP64 oracle over logical input values. Independent
+  fixture code materializes packed inputs into their specified logical FP32 values before calling
+  the oracle. The oracle neither reads the packed representation nor applies production input,
+  intermediate, reduction, or output rounding.
 - An exact transform, codec, copy, or index mapping uses an independent bit- or byte-exact oracle.
 - A fused Op oracle evaluates the complete fused formula rather than calling the production Ops that
   could be composed to approximate it. A stateful Op oracle computes both the output and new state.
@@ -531,6 +535,9 @@ full-output write, guard, or analytic invariant; sampling alone does not qualify
 - Different routes use different criteria only when their real arithmetic or quantization profiles
   differ. Widening a criterion requires a numerical reason and requalification of the complete
   affected matrix; a failing implementation alone is not such a reason.
+- For Linear, A16, A8, and A4 activation compute paths are separate criterion domains. GEMV, SIMT,
+  MMA, schedules, template instances, host launchers, and T regions selected inside one such path
+  share that path's single criterion.
 
 An Op is qualified only when every public entry, finite semantic variant, registered geometry, and
 reachable production route maps to a direct oracle case, and every observable output and effect is

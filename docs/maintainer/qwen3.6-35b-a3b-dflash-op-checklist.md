@@ -669,10 +669,10 @@ two ordinary `linear` calls as the composed control.
 **Op evidence (RTX 5090, CUDA 13.1, `sm_120a`)**
 
 - The public Op admits the exact adjacent W8 parent row views and rejects shifted, detached, or
-  overlapping operands. `ninfer_linear_test` compares both complete outputs with independently
-  decoded FP64 projections at every `T=1..16`; it also checks every production seam through
-  `T=2271`, row-view and group-scale offsets, distinct poisoned outputs and guards, preserved
-  inputs and packed weights, composed controls, and CUDA Graph replay.
+  overlapping operands. Its former numerical coverage lived in the deleted monolithic
+  `ninfer_linear_test`; it is not part of the new pure Linear suite. A dedicated `linear_pair`
+  public numerical target must re-establish the stated output, row-view, effects, seam, and Graph
+  coverage against that Op's own high-precision oracle.
 - The retained benchmark exposes direct decode, exact- and medium-T split-K, dual-MMA,
   concatenated K/V MMA, exact-tail candidates, and two public `linear` calls. A cold-cache
   `T=1..2305` sweep selected the measured winner at every seam. Every production-route
@@ -762,10 +762,10 @@ this contract; that composition requires a fused semantic Op.
 **Op evidence (RTX 5090, CUDA 13.1, `sm_120a`)**
 
 - The public three-output overload admits exactly W8 `[6144,2048]`, BF16 `x [2048,T]`, Q
-  `[4096,T]`, and distinct K/V `[1024,T]` allocations. `ninfer_linear_test` checks every
-  `T=1..16`, all output row seams, W8 group seams, guards and full writes, preserved input and
-  packed weight, Graph replay at `T=2/16`, sampled FP64 exact-decode projections throughout, and
-  one complete FP64 exact-decode comparison of every Q/K/V element.
+  `[4096,T]`, and distinct K/V `[1024,T]` allocations. Its former numerical coverage lived in the
+  deleted monolithic `ninfer_linear_test`; it is not part of the new pure Linear suite. A dedicated
+  companion-attention input projection target must re-establish the stated multi-output, effects,
+  seam, and Graph coverage against that fused Op's own high-precision oracle.
 - `ninfer_w8_input_proj_bench --op companion-attention` retains production dispatch and the
   fused-local decode, exact/medium split-K, SIMT, and eight MMA tile launchers. Unsupported parent
   Linear and parent-plus-three-extract controls were removed after route selection rather than
@@ -812,12 +812,10 @@ saturation, full writes, Graph replay, and fused-versus-composed timing inside a
 **Op evidence (RTX 5090, CUDA 13.1, `sm_120a`)**
 
 - The public Op admits exactly W8 `[12288,2048]`, BF16 `x [2048,T]`, and BF16
-  `out [6144,T]`, with zero workspace. `ninfer_linear_test` compares every output element at every
-  `T=1..16` against a complete independent FP64 exact-decode oracle, then samples the same oracle
-  at every production dispatch seam through `T=1024`. Coverage includes K/group boundaries, the
-  gate/up row seam, negative, near-zero, and saturated gates, guards and full finite writes,
-  preserved input/weight storage, and CUDA Graph replay of exact-T, warp-local, cross-warp, and
-  large prefill routes.
+  `out [6144,T]`, with zero workspace. Its former numerical coverage lived in the deleted
+  monolithic `ninfer_linear_test`; it is not part of the new pure Linear suite. A dedicated
+  `linear_swiglu` public numerical target must re-establish the stated fused formula, effects,
+  seam, and Graph coverage against that Op's own high-precision oracle.
 - `ninfer_w8_linear_swiglu_bench` retains the parent-Linear-plus-`silu_mul` control, three decode
   CTA-row candidates, exact `T=2..32` split-K, and C32/C48/C64/C80/C96/C128 Tensor Core tile
   candidates. The selected route is R16 paired decode at `T=1`, exact-T Tensor Core at `T=2..32`,
@@ -858,11 +856,10 @@ in-place output, Graph replay, and dense-layer timing against `linear` plus an a
 **Op evidence (RTX 5090, CUDA 13.1, `sm_120a`)**
 
 - The public Op admits W8 `[2048,6144]`, BF16 `x [6144,T]`, and in-place BF16
-  `residual [2048,T]`, with zero workspace. `ninfer_linear_test` checks every output element at
-  every `T=1..16` against an independent FP64 exact-W8-decode oracle with K/group-boundary probes,
-  positive, negative, and cancellation residuals. Dense sampled-oracle checks cover every
-  production dispatch seam through `T=1024`, with guards, full finite writes, preserved
-  input/weight storage, and CUDA Graph replay at exact-T, composite, and prefill routes.
+  `residual [2048,T]`, with zero workspace. Its former numerical coverage lived in the deleted
+  monolithic `ninfer_linear_test`; it is not part of the new pure Linear suite. A dedicated
+  `linear_add` public numerical target must re-establish the stated fused formula, residual
+  cancellation, effects, seam, and Graph coverage against that Op's own high-precision oracle.
 - `ninfer_w8_linear_add_bench` retains the composed parent-Linear-plus-`residual_add` control and
   all direct-decode, exact-T, composite exact-T, and C32/C48/C64/C80/C96/C112/C128 Tensor Core
   candidates. A cold-cache sweep of every `T=1..2048` selects R16 direct decode at `T=1`,

@@ -25,14 +25,16 @@ enum class LinearPolicy : std::uint8_t {
 /**
  * @brief Applies a bias-free matrix projection independently to every input column.
  *
- * @details The mathematical contract is
+ * @details The ideal mathematical result is
  *
  * @f[
- *   \mathrm{out}_{n,t} =
- *   \mathrm{BF16}\left(
- *     \sum_{k=0}^{K-1} \mathrm{decode}(w)_{n,k}\,x_{k,t}
- *   \right).
+ *   \mathrm{ideal}_{n,t} =
+ *   \sum_{k=0}^{K-1}
+ *     \mathrm{FP32Dequant}(w)_{n,k}\,\mathrm{FP32}(x_{k,t}).
  * @f]
+ *
+ * `out` stores a BF16 approximation of this ideal result under the named numerical criterion for
+ * the selected private compute profile.
  *
  * @par Logical tensors and layout
  * `x` is contiguous, non-null, 16-byte-aligned BF16 `[K,T]`, `w` has logical shape `[N,K]`, and
@@ -50,10 +52,13 @@ enum class LinearPolicy : std::uint8_t {
  * currently admits no pure Linear problem. FP32_CTRL is unsupported.
  *
  * @par Numerical contract
- * The oracle exactly decodes the persistent weight, evaluates each complete dot product naively in
- * FP64, and converts the observable result to BF16. Accumulator precision, activation
- * quantization, staging, reduction order, and kernel schedule are private implementation choices
- * qualified against that oracle.
+ * Test fixture code materializes the persistent weight as its logical FP32 dequantized matrix.
+ * The one Linear oracle accepts that matrix and the FP32 values represented by the BF16 activation,
+ * evaluates every complete dot product with naive FP64 accumulation, and retains the FP64 result.
+ * The BF16 output is promoted and compared against that result. Output representation,
+ * accumulator precision, activation quantization, staging, reduction order, and kernel schedule
+ * are private implementation effects covered by the named tolerance for the selected profile;
+ * none is copied into the oracle.
  *
  * @par Compute policy
  * `policy` specifies the permitted private activation-compute set. A permission does not require a

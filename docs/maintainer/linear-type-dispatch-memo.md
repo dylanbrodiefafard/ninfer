@@ -556,7 +556,8 @@ launcher、schedule alias、模板实例和 dispatch 辅助代码直接删除。
 custom-epilogue 实例由它自己的 route 负责，不计入 pure Linear registry。
 
 本架构落地时没有重新运行 benchmark、重新测量边界或重新选择 winner。Section 5 和
-Section 4.4.1 的映射是既有测量结果；测试证明当前实现执行这份映射并满足数值合同。
+Section 4.4.1 的映射是既有测量结果；selector 是该映射的 executable authority，public
+数值测试只证明通过该入口可达的实现满足统一 Linear 数值合同。
 
 `bench/ops/linear_op_bench.cu` 已移除 Q4 fixed-candidate/forcing options、解析、调用和
 旧 header include；通过 public `linear()` 的普通 Q4 benchmark mode 保留。benchmark
@@ -712,9 +713,10 @@ route 不变。
 3. 在 `select_q4_a16_launch()` 对应 `K` case 下增加一个 exact `N` case，直接写入已经
    决定的 T-to-launcher 映射。
 4. 若映射引用新的 route，先按 Section 10 增加完整 host launcher。
-5. 为每个 route boundary `b` 覆盖 `b-1/b/b+1`；对 step domain 只覆盖合法相邻点，并
-   覆盖该 shape 的列轴上下界和非法点。
-6. 每个实际返回的 launcher 都直接通过公共 FP64 Linear oracle test。
+5. 通过 public `linear()` 为每个 route boundary `b` 数值覆盖 `b-1/b/b+1`；对 step
+   domain 只覆盖合法相邻点，并覆盖该 shape 的列轴上下界。
+6. 每个实际返回的 launcher 都由相应 public case 直接对同一个 CPU FP64 GEMM oracle
+   资格化；测试不复制 selector 或断言 function pointer。
 7. 更新本文 Section 5 的 active registry；不存在第二份 support table。
 
 新增 shape 不需要：
@@ -733,7 +735,8 @@ route 不变。
 1. 明确实际 activation compute（A16 或 A8）和 kernel schedule；
 2. 把 Full/Predicated、grid slicing 和 launch geometry 全部封装进 launcher；
 3. 在对应 compute selector 的 exact shape/T case 中直接返回该 launcher；
-4. 为该 launcher 增加公共 FP64 oracle test，并增加 selector function-pointer test；
+4. 为该 launcher 增加通过 public `linear()` 执行的统一 CPU FP64 GEMM oracle case；
+   若它建立新 route boundary，同时覆盖 `b-1/b/b+1`；
 5. 删除不再被任何 route 引用的旧 launcher、schedule aliases 和模板实例。
 
 一个新 route 不给 `Q4Launch` 增加 `actual_compute`、schedule、workspace bytes、name 或
@@ -747,41 +750,48 @@ variant 字段。它的 function identity 已经完整确定执行 leaf。
 ### 11.1 语义
 
 - policy-bearing 和 A16 convenience overload 都至少有一个 public Op 数值 case；
-- 六个 retained host launchers 各有至少一个真实 production point 直接对独立 FP64
-  oracle；
-- 可合理执行的尺寸检查完整 output、guards、输入/weight preservation；
-- 大 N/T case 使用 deterministic sampled-output FP64 oracle 和 guards，不为测试分配
-  超出产品机器实际能力的大矩阵；
+- 六个 retained host launchers 各有至少一个真实 production point 通过 public
+  `linear()` 对同一个 CPU FP64 GEMM oracle；
+- Q4 test fixture 从同一组 signed codes 和 stored FP16 scales 同时构造完整 GPU packed
+  payload 与 CPU 使用的 logical float weight；
+- oracle 只接收 float weight、BF16 activation 所表示的 float 值和 `(N,K,T)`，每个 dot
+  使用 naive double accumulation；它不读取 Q4 payload，也不模拟 BF16/MMA、staging、
+  reduction tree 或 BF16 output rounding；
+- 可合理执行的尺寸检查完整 output、guards、输入/weight preservation；大 N/T case
+  检查完整 output 写入和 guards，再把确定性采样行列交给同一个 GEMM；
 - `AllowA8` 当前与 A16 selector 相同，因此只需一个 public `AllowA8` 数值 case 证明
   policy 透传；不把相同数值测试按 policy 重复一遍；
-- misaligned `x.data` 或 `out.data` 在 L1 失败；
-- `T=0` 按新合同失败，不再保留旧 empty-call no-op；
 - malformed Q4 group/layout/padding/weight-plane alignment 由 artifact/binder tests 保护，
   不再作为 `linear()` 的 runtime-validation test。
 
-### 11.2 Route registry
+### 11.2 公共脚手架与数值判据
 
-private selector test 不分配 device tensor，只保护真实 production registry：
+`tests/ops/linear/linear_test_common.{h,cpp}` 唯一拥有：
 
-- 每个注册 shape/T/policy 返回预期 launcher；
-- unsupported shape、T 和 policy 直接失败；
-- 所有 Section 5 ranges 精确覆盖且无洞；
-- Text/MTP 覆盖每个 seam、普通 prefill 点和大于默认 chunk 的代表点；
-- Vision 覆盖 `P=4`、`P=131072`、4-step 约束、所有 seams 及相邻非法点；
-- 每个保留 launcher 至少被一个 production point 引用。
+- Q4/Q5/Q6/W8 显式模拟权重生成器；
+- packed payload 与被选 oracle rows 的 logical float materialization；
+- `cpu_linear_gemm_fp64()`；
+- output poison、完整写入、guards、确定性采样和 public call mechanics；
+- `NumericalProfile -> LinearTolerance` 集中映射和比较逻辑。
 
-它不恢复 candidate legality matrix，也不把 selector test 当作数值资格替代品。
+CPU GEMM 可以按输出行多线程并对 T 小块化以复用 weight load，但每个输出始终由一个
+线程按 `k=0..K-1` 顺序 double 累加。它不使用 BLAS、production decoder、production
+kernel、K 维树形归约或 fast-math。
 
-### 11.3 路径与集成测试
+weight/profile test 只能选择命名 numerical profile。不同 profile 可以有不同容差，但
+不得定义第二个 oracle 或 per-case tolerance literal。
 
-- 用 launcher function pointer 断言代表点实际进入 Section 4.4.1 指定的 route；
-- 为两个 GEMV、两个 SIMT、两个 MMA launchers 各覆盖至少一个数值 case；
-- SIMT 和 MMA 各用可执行的 production points 覆盖 Full 与 Predicated；特别覆盖
-  `K=1152` SIMT 必须 Predicated，以及 `N=4304` MMA 必须 Predicated；
-- 不构造无法装入 RTX 5090 的真实大矩阵来触发 CUDA grid limit；单独对
-  `for_each_token_slice()` 做纯 host 边界测试，覆盖 limit、limit+1 和多 slice；
-- 运行受影响的 fused Op tests，证明它们已切断旧 `Q4Plan` 接口且结果正确；
-- 在一个有代表性的 public Q4 route 上运行 CUDA Graph replay test。
+### 11.3 Conformance matrix
+
+Q4_A16 test 只 include public `linear()` contract 和上述 common：
+
+- 覆盖 Section 5 的每个 registered geometry、每个可达 production route、Text/MTP
+  `T=1` 和各 route boundary 的 `b-1/b/b+1`，以及 Vision 有限轴上下界和合法相邻点；
+- 为两个 GEMV、两个 SIMT、两个 MMA launchers 各提供 public 数值 case，并通过真实
+  production points 执行其 Full/Predicated mechanics；
+- 至少各调用一次 policy-bearing 与 A16 convenience overload；
+- 不 include private dispatch/launcher header，不调用 selector，不断言 launcher、
+  schedule、kernel template instance 或 Full/Predicated identity。
 
 ## 12. 已落实的迁移边界
 
@@ -796,8 +806,8 @@ private selector test 不分配 device tensor，只保护真实 production regis
    不再保留 pure Linear plan/execute/candidate 层；
 5. 让 Attention input、GDN input、GDN conv snapshot 和 LinearSwiGLU 只保留
    fused-local route，不依赖 pure Q4 plan/enum/fixed-pitched launch；
-6. 用 selector registry、public FP64 oracle、alignment、token-slice、CUDA Graph 和 fused
-   Op tests 替换旧 Q4 candidate/plan/dispatch tests；
+6. 用 public `linear()` 和统一 CPU FP64 GEMM oracle 的 Q4_A16 conformance matrix
+   替换旧 Q4 candidate/plan/dispatch/selector tests；
 7. 从 CMake、benchmark source 和 production source 删除 Q4/Q5/Q6/W8 旧
    plan/launch/candidate files、symbols 和 forcing options，并删除 BF16 空占位。
 
@@ -816,9 +826,10 @@ Q4 范例只有在以下条件全部满足时完成：
 - pure Q4 仍只有三个 `__global__` kernel 定义；
 - Full/Predicated 使用 Section 4.5 的精确谓词，且和 grid slicing 一样对 selector 不可见；
 - fused Ops 不依赖 pure Linear plan/enum/variant；
-- selector tests 覆盖所有 registered shapes、policies 和 route boundaries；
-- 可执行的完整/采样 oracle cases 覆盖六个 retained launchers 及 Full/Predicated；
-- 相关 route、数值、fused Op 和 Graph replay tests 通过；
+- Q4_A16 public 数值 cases 覆盖所有 registered geometries、policies、route boundaries
+  和六个 retained launchers；
+- 完整/采样 cases 全部使用 common 中唯一的 float-input/double-accumulation GEMM；
+- pure Linear suite 不替代任何 fused Op 的独立数值资格；
 - 旧文件和旧 CMake/test entries 已删除；
 - 可选 benchmark source 不再引用已删除的 Q4 fixed-candidate API，且本次没有运行
   benchmark。
@@ -873,9 +884,10 @@ Q5 注册以下 exact shape：
 - `launch_q5_mma_r64_c64`、`launch_q5_mma_r64_c128`。
 
 exact T-to-launcher 边界直接写在
-`src/ops/linear/q5/q5_dispatch.cpp::select_q5_a16_launch()`；对应 selector test 逐个保护
-所有 route seams、Vision step domain 和 policy。新增边界只修改这一处 executable
-registry 及其测试，不再建立第二份 support/admission table。
+`src/ops/linear/q5/q5_dispatch.cpp::select_q5_a16_launch()`。它是唯一 executable
+registry；后续 Q5_A16 test 通过 public Linear 和 common CPU FP64 GEMM 覆盖所有
+registered geometries、routes 及边界，不复制 selector 或建立第二份 support/admission
+table。
 
 Q5 MMA launcher 在切片前按完整问题选择一次边界实例：
 
@@ -910,9 +922,10 @@ Q6 注册：
 - `launch_q6_mma_r64_c64`、`launch_q6_mma_r64_c128`。
 
 exact 边界位于
-`src/ops/linear/q6/q6_dispatch.cpp::select_q6_a16_launch()`，selector test 是它的边界
-保护。SIMT 只有 kernel-private Predicated 实例；MMA 的 Full 判定与 Q5 相同，只把
-`TileCols` 取为 64 或 128。
+`src/ops/linear/q6/q6_dispatch.cpp::select_q6_a16_launch()`。后续 Q6_A16 test 通过 public
+Linear 和 common CPU FP64 GEMM 覆盖其 routes 与边界，不复制 selector。SIMT 只有
+kernel-private Predicated 实例；MMA 的 Full 判定与 Q5 相同，只把 `TileCols` 取为 64
+或 128。
 
 Q6 pure Linear 只有两个 `__global__` kernel definition：
 
@@ -947,9 +960,9 @@ DFlash conditioning projection 注册：
 ```
 
 前三类 shape 的 exact T-to-launcher seam 直接位于
-`src/ops/linear/w8/w8_dispatch.cpp::select_w8_a16_launch()`，并由
-`test_w8_linear_selector.cpp` 保护。W8 不存在独立 runtime schedule enum；route 的
-结果就是 `W8Launch`。
+`src/ops/linear/w8/w8_dispatch.cpp::select_w8_a16_launch()`。后续 W8_A16 test 通过 public
+Linear 和 common CPU FP64 GEMM 覆盖其 routes 与边界，不复制 selector。W8 不存在独立
+runtime schedule enum；route 的结果就是 `W8Launch`。
 
 W8 DFlash conditioning route 保留以下 launcher families：
 
@@ -1015,8 +1028,7 @@ W8 output kernel header 中，不属于 route API。
 
 - `linear()` 对 `BF16_CTRL` 返回统一 unsupported error；
 - 不存在 `Bf16Problem`、`bf16_contiguous_admits()`、空 plan 或必然抛错的 private
-  dispatcher；
-- 测试从 public `linear()` 验证一个受支持语义形状的 BF16 weight 仍被拒绝。
+  dispatcher。
 
 以后只有在同时具备 exact registered shape、已选 host launcher、真实 kernel 和数值
 测试时，才增加 `select_bf16_launch(N,K,T,policy) -> Bf16Launch`。
@@ -1067,8 +1079,8 @@ Q5、Q6、W8 pure Linear 均不再拥有：
 2. 确认它使用该 type 已有固定 storage format；
 3. 在 `select_<type>_a16_launch()` 的 exact `(K,N)` case 中写入已决定的
    T-to-launcher 映射；
-4. 为每个 seam、step-domain 非法点和 policy 增加 selector test；
-5. 为实际 launcher 增加可执行的独立 FP64 oracle point。
+4. 按 `op-development.md` Section 8.1，通过 public Linear 为新增 geometry、route 和
+   `b-1/b/b+1` 边界增加 common CPU FP64 GEMM case，不复制 selector 映射。
 
 注册新 route 的最小单位是完整 host launcher。它必须封装 schedule、Full/Predicated、
 grid、slicing 和 exact/composite 行为，然后由 selector 直接返回 function pointer。
@@ -1080,11 +1092,11 @@ grid、slicing 和 exact/composite 行为，然后由 selector 直接返回 func
 该重构只以 build 和 tests 验收，不运行 benchmark，也不重新选择 route winner。当前
 保护包括：
 
-- Q4/Q5/Q6/W8 host-only selector registry tests；
-- public Linear 独立数值 oracle、alignment、policy 和 unsupported BF16；
+- Q4_A16 public Linear 数值 conformance matrix；
+- common 中 Q4/Q5/Q6/W8 显式 weight generators、唯一 CPU FP64 GEMM 和集中容差；
 - Q5 LinearAdd、Q4/Q5/W8 Attention/GDN、W8 LinearAdd/LinearSwiGLU/LinearPair 等
-  fused 路径；
+  fused 路径保持独立所有权，不由 pure Linear suite 代替；
 - benchmark targets 的编译兼容，但没有 fixed schedule/variant forcing。
 
-不可实际分配的最大 Vision case 只验证 selector domain；不伪造无法执行的 CUDA 数值
-场景。
+Q5_A16、Q6_A16 和 W8_A16 将按 Q4 范例各自增加 public conformance file；在这些文件
+落地前不保留旧 selector-only 测试作为替代资格。

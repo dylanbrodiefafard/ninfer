@@ -10,6 +10,8 @@ benchmark-report, and external protocol behavior. Repository verification princi
 - `artifact/` — Python container, registered layout, quantization, and resource behavior;
 - `ops/` — independent numerical and state-transition checks at real supported shapes, plus the
   shared row-split packing helper;
+- `ops/linear/` — weight/activation-profile-specific public Linear conformance tests plus their
+  one shared input generator, FP64 GEMM oracle, tolerance registry, and output/effects mechanics;
 - `targets/qwen3_6/` — shared tokenizer/template, multimodal preprocessing, MRoPE, prepared-prompt,
   stop/output decoding, hybrid topology, decoder/GDN and round-state layouts/views, shifted-MTP
   alignment, Vision control, and family runtime mechanisms;
@@ -47,6 +49,22 @@ Run a focused target for a localized change:
 cmake --build build --parallel --target ninfer_sampling_test
 ctest --test-dir build -R ninfer_sampling_test --output-on-failure
 ```
+
+Linear tests are independently runnable by weight and activation-compute profile:
+
+```bash
+cmake --build build --parallel --target ninfer_linear_q4_a16_test
+ctest --test-dir build -R '^ninfer_linear_q4_a16_test$' --output-on-failure
+```
+
+All Linear files use `ops/linear/linear_test_common.{h,cpp}`. Its explicit Q4/Q5/Q6/W8 generators
+produce both the complete packed GPU payload and the logical float rows used by the one
+`cpu_linear_gemm_fp64()` reference. The reference performs naive double accumulation and never
+reproduces a production route's activation quantization, staging, reduction tree, or BF16 output
+rounding. Each activation compute path selects one centrally defined comparison tolerance for its
+whole suite; private kernel, schedule, launcher, and T selection do not change it. Individual test
+files call public `linear()` and contain no private selector, launcher, schedule, or kernel
+assertions.
 
 Run the native Python suites with the project Python environment:
 
