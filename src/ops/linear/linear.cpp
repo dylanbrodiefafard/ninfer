@@ -156,6 +156,23 @@ void require_row_split_lowbit_metadata(const Weight& w, const char* label, std::
 
 bool is_empty_T(const Tensor& x, const Tensor& out) { return x.ne[1] == 0 || out.ne[1] == 0; }
 
+void require_linear_policy(QType qtype, LinearPolicy policy) {
+    switch (policy) {
+    case LinearPolicy::A16Only:
+        return;
+    case LinearPolicy::AllowA8:
+        if (qtype == QType::Q4G64_F16S || qtype == QType::Q5G64_F16S ||
+            qtype == QType::Q6G64_F16S || qtype == QType::W8G32_F16S) {
+            return;
+        }
+        throw std::invalid_argument("linear: AllowA8 is unsupported for the weight format");
+    case LinearPolicy::AllowA4:
+        throw std::invalid_argument("linear: AllowA4 is unsupported for the weight format");
+    default:
+        throw std::invalid_argument("linear: invalid compute policy");
+    }
+}
+
 bool is_contiguous_allow_zero(const Tensor& t) {
     std::int64_t expected = static_cast<std::int64_t>(dtype_size(t.dtype));
     for (int i = 0; i < 4; ++i) {
@@ -221,13 +238,14 @@ void require_q5_alignment(const Tensor& x, const Weight& w, const Tensor& out) {
 
 } // namespace
 
-void linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy, WorkspaceArena& ws,
             cudaStream_t stream) {
     if (x.dtype != DType::BF16 || out.dtype != DType::BF16) {
         throw std::invalid_argument("linear: x/out must be BF16");
     }
     (void)numel_allow_zero(x, "x");
     (void)numel_allow_zero(out, "out");
+    require_linear_policy(w.qtype, policy);
 
     switch (w.qtype) {
     case QType::BF16_CTRL:
@@ -286,6 +304,11 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
         detail::w8_rowsplit_dispatch(x, w, out, stream);
         return;
     }
+}
+
+void linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+            cudaStream_t stream) {
+    linear(x, w, out, LinearPolicy::A16Only, ws, stream);
 }
 
 } // namespace ninfer::ops
