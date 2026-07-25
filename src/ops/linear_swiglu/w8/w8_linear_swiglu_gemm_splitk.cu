@@ -74,9 +74,9 @@ constexpr auto kLaunchers =
 
 } // namespace
 
-void w8_linear_swiglu_splitk_exact_t_launch(W8KernelVariant variant, const Tensor& x,
-                                            const Weight& w, Tensor& out, cudaStream_t stream) {
-    if (variant != W8KernelVariant::None || x.ne[1] < kFirstExactT || x.ne[1] > kLastExactT) {
+void w8_linear_swiglu_splitk_exact_t_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                            cudaStream_t stream) {
+    if (x.ne[1] < kFirstExactT || x.ne[1] > kLastExactT) {
         throw std::invalid_argument("W8 LinearSwiGLU exact split-K requires T=2..32");
     }
     kLaunchers[x.ne[1] - kFirstExactT](x, w, out, stream);

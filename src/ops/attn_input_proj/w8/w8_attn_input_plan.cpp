@@ -63,28 +63,6 @@ bool supported_shape(const W8AttnInputProblem& problem) noexcept {
            (target_qkgv || is_companion_shape(problem));
 }
 
-W8KernelVariant variant_for(W8AttnInputScheduleId schedule, std::int32_t cols) {
-    switch (schedule) {
-    case W8AttnInputScheduleId::DecodeR8Direct:
-    case W8AttnInputScheduleId::SplitKMmaDirect:
-        return W8KernelVariant::None;
-    case W8AttnInputScheduleId::SimtR8C4:
-        return (cols % 4) == 0 ? W8KernelVariant::Full : W8KernelVariant::Predicated;
-    case W8AttnInputScheduleId::MmaR32C64:
-    case W8AttnInputScheduleId::MmaR64C64:
-    case W8AttnInputScheduleId::MmaR128C64:
-        return (cols % 64) == 0 ? W8KernelVariant::Full : W8KernelVariant::Predicated;
-    case W8AttnInputScheduleId::MmaR64C96:
-        return (cols % 96) == 0 ? W8KernelVariant::Full : W8KernelVariant::Predicated;
-    case W8AttnInputScheduleId::MmaR128C80:
-        return (cols % 80) == 0 ? W8KernelVariant::Full : W8KernelVariant::Predicated;
-    case W8AttnInputScheduleId::MmaR32C128:
-    case W8AttnInputScheduleId::MmaR64C128:
-        return (cols % 128) == 0 ? W8KernelVariant::Full : W8KernelVariant::Predicated;
-    }
-    throw std::logic_error("W8 attention input: unknown schedule");
-}
-
 } // namespace
 
 const char* w8_attn_input_schedule_name(W8AttnInputScheduleId schedule) noexcept {
@@ -125,7 +103,7 @@ W8AttnInputPlan w8_attn_input_resolve_plan(const W8AttnInputProblem& problem) {
     const auto resolve_from = [&](const auto& routes) -> W8AttnInputPlan {
         for (const RouteSpec& route : routes) {
             if (problem.cols >= route.first && problem.cols <= route.last) {
-                return {route.schedule, variant_for(route.schedule, problem.cols), 0};
+                return {route.schedule, 0};
             }
         }
         throw std::logic_error("W8 attention input: admitted problem has no covering route");
@@ -141,8 +119,7 @@ void w8_attn_input_execute_plan(const W8AttnInputPlan& plan, const Tensor& x, co
                                      x.ne[1]};
     const W8AttnInputPlan resolved = w8_attn_input_resolve_plan(problem);
     if (problem.parent_rows != 9216 || problem.kv_rows != 512 ||
-        resolved.schedule != plan.schedule || resolved.variant != plan.variant ||
-        resolved.workspace_bytes != plan.workspace_bytes) {
+        resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument(
             "W8 attention input: plan does not match exact four-output problem");
     }
@@ -151,16 +128,16 @@ void w8_attn_input_execute_plan(const W8AttnInputPlan& plan, const Tensor& x, co
         w8_attn_input_decode_launch(x, weight, q, gate, k, v, stream);
         return;
     case W8AttnInputScheduleId::SplitKMmaDirect:
-        w8_attn_input_splitk_mma_launch(plan.variant, x, weight, q, gate, k, v, stream);
+        w8_attn_input_splitk_mma_launch(x, weight, q, gate, k, v, stream);
         return;
     case W8AttnInputScheduleId::SimtR8C4:
-        w8_attn_input_simt_r8_c4_launch(plan.variant, x, weight, q, gate, k, v, stream);
+        w8_attn_input_simt_r8_c4_launch(x, weight, q, gate, k, v, stream);
         return;
     case W8AttnInputScheduleId::MmaR32C128:
-        w8_attn_input_mma_r32_c128_launch(plan.variant, x, weight, q, gate, k, v, stream);
+        w8_attn_input_mma_r32_c128_launch(x, weight, q, gate, k, v, stream);
         return;
     case W8AttnInputScheduleId::MmaR64C128:
-        w8_attn_input_mma_r64_c128_launch(plan.variant, x, weight, q, gate, k, v, stream);
+        w8_attn_input_mma_r64_c128_launch(x, weight, q, gate, k, v, stream);
         return;
     case W8AttnInputScheduleId::MmaR32C64:
     case W8AttnInputScheduleId::MmaR64C64:
@@ -186,8 +163,7 @@ void w8_attn_input_execute_plan(const W8AttnInputPlan& plan, const Tensor& x, co
                                      x.ne[1]};
     const W8AttnInputPlan resolved = w8_attn_input_resolve_plan(problem);
     if (problem.parent_rows != 6144 || problem.kv_rows != 1024 ||
-        resolved.schedule != plan.schedule || resolved.variant != plan.variant ||
-        resolved.workspace_bytes != plan.workspace_bytes) {
+        resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument(
             "W8 attention input: plan does not match exact three-output problem");
     }
@@ -196,31 +172,31 @@ void w8_attn_input_execute_plan(const W8AttnInputPlan& plan, const Tensor& x, co
         w8_attn_input_decode_launch(x, weight, q, k, v, stream);
         return;
     case W8AttnInputScheduleId::SplitKMmaDirect:
-        w8_attn_input_splitk_mma_launch(plan.variant, x, weight, q, k, v, stream);
+        w8_attn_input_splitk_mma_launch(x, weight, q, k, v, stream);
         return;
     case W8AttnInputScheduleId::SimtR8C4:
-        w8_attn_input_simt_r8_c4_launch(plan.variant, x, weight, q, k, v, stream);
+        w8_attn_input_simt_r8_c4_launch(x, weight, q, k, v, stream);
         return;
     case W8AttnInputScheduleId::MmaR32C128:
-        w8_attn_input_mma_r32_c128_launch(plan.variant, x, weight, q, k, v, stream);
+        w8_attn_input_mma_r32_c128_launch(x, weight, q, k, v, stream);
         return;
     case W8AttnInputScheduleId::MmaR32C64:
-        w8_companion_attn_input_mma_r32_c64_launch(plan.variant, x, weight, q, k, v, stream);
+        w8_companion_attn_input_mma_r32_c64_launch(x, weight, q, k, v, stream);
         return;
     case W8AttnInputScheduleId::MmaR64C64:
-        w8_companion_attn_input_mma_r64_c64_launch(plan.variant, x, weight, q, k, v, stream);
+        w8_companion_attn_input_mma_r64_c64_launch(x, weight, q, k, v, stream);
         return;
     case W8AttnInputScheduleId::MmaR64C96:
-        w8_companion_attn_input_mma_r64_c96_launch(plan.variant, x, weight, q, k, v, stream);
+        w8_companion_attn_input_mma_r64_c96_launch(x, weight, q, k, v, stream);
         return;
     case W8AttnInputScheduleId::MmaR128C64:
-        w8_companion_attn_input_mma_r128_c64_launch(plan.variant, x, weight, q, k, v, stream);
+        w8_companion_attn_input_mma_r128_c64_launch(x, weight, q, k, v, stream);
         return;
     case W8AttnInputScheduleId::MmaR128C80:
-        w8_companion_attn_input_mma_r128_c80_launch(plan.variant, x, weight, q, k, v, stream);
+        w8_companion_attn_input_mma_r128_c80_launch(x, weight, q, k, v, stream);
         return;
     case W8AttnInputScheduleId::MmaR64C128:
-        w8_attn_input_mma_r64_c128_launch(plan.variant, x, weight, q, k, v, stream);
+        w8_attn_input_mma_r64_c128_launch(x, weight, q, k, v, stream);
         return;
     }
     throw std::logic_error("W8 attention input: unknown schedule");

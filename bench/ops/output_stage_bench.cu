@@ -1,7 +1,6 @@
 // Captured Qwen3.6-35B-A3B target-verification output-stage benchmark.
 //
-// The timed graph is final RMSNorm -> Q6 full-vocabulary head -> argmax. The
-// production route is compared with the route table that preceded DV-06.
+// The timed graph is final RMSNorm -> Q6 full-vocabulary head -> argmax.
 
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/linear.h"
@@ -10,7 +9,7 @@
 #include "core/device.h"
 #include "ninfer_bench_common.h"
 #include "ops/launcher/argmax.h"
-#include "ops/linear/q6/q6_rowsplit_plan.h"
+#include "ops/linear/q6/q6_dispatch.h"
 
 #include <cuda_runtime.h>
 
@@ -34,14 +33,8 @@ constexpr std::int32_t kMaxTokens       = 16;
 constexpr std::size_t kDefaultFlushSize = 256ULL << 20;
 constexpr float kRmsEps                 = 1.0e-6F;
 
-enum class Route {
-    Production,
-    Dv06Control,
-};
-
 struct Options {
     std::vector<std::int32_t> t_sweep{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
-    Route route            = Route::Production;
     int argmax_block       = 0;
     int warmup             = 5;
     int repeat             = 50;
@@ -145,15 +138,6 @@ Options parse_options(int argc, char** argv) {
         };
         if (arg == "--t-sweep") {
             options.t_sweep = parse_t_sweep(next("--t-sweep value"));
-        } else if (arg == "--route") {
-            const std::string_view route = next("--route value");
-            if (route == "production") {
-                options.route = Route::Production;
-            } else if (route == "dv06-control") {
-                options.route = Route::Dv06Control;
-            } else {
-                throw std::invalid_argument("--route must be production or dv06-control");
-            }
         } else if (arg == "--warmup") {
             options.warmup = std::stoi(std::string(next("--warmup value")));
         } else if (arg == "--repeat") {
@@ -167,7 +151,7 @@ Options parse_options(int argc, char** argv) {
             options.flush_size = static_cast<std::size_t>(mib) << 20;
         } else if (arg == "--help" || arg == "-h") {
             std::printf("Usage: %s [--t-sweep 1,2,...,16] "
-                        "[--route production|dv06-control] [--warmup N] [--repeat N] "
+                        "[--warmup N] [--repeat N] "
                         "[--argmax-block auto|128|256|384|512] [--flush-mib N]\n",
                         argv[0]);
             std::exit(0);
@@ -263,16 +247,12 @@ Timing measure_cold(const TimedGraph& graph, bench::DBuf& flush, cudaStream_t st
     return {percentile(0.50), samples.front(), percentile(0.95)};
 }
 
-ops::detail::Q6Plan dv06_control_plan(std::int32_t tokens) {
-    using S = ops::detail::Q6ScheduleId;
-    using V = ops::detail::Q6KernelVariant;
-    if (tokens <= 4) { return {S::SimtR8C4, V::None}; }
-    if (tokens <= 6) { return {S::SimtR8C8, V::None}; }
-    return {S::MmaR64C128, V::Predicated};
-}
-
-const char* route_name(Route route) {
-    return route == Route::Production ? "production" : "dv06_control";
+const char* q6_launch_name(ops::detail::Q6Launch launch) {
+    if (launch == ops::detail::launch_q6_simt_r8_c4) { return "q6.simt.r8_c4"; }
+    if (launch == ops::detail::launch_q6_simt_r8_c8) { return "q6.simt.r8_c8"; }
+    if (launch == ops::detail::launch_q6_mma_r64_c64) { return "q6.mma.r64_c64"; }
+    if (launch == ops::detail::launch_q6_mma_r64_c128) { return "q6.mma.r64_c128"; }
+    throw std::invalid_argument("output-stage benchmark received an unknown Q6 launcher");
 }
 
 int run(const Options& options) {
@@ -292,8 +272,8 @@ int run(const Options& options) {
 
     std::printf("# gpu=RTX_5090 cuda=13.1 sm=120a flush_mib=%zu warmup=%d repeat=%d\n",
                 options.flush_size >> 20, options.warmup, options.repeat);
-    std::printf("%4s %-14s %5s %10s %10s %10s %-52s %s\n", "T", "control", "nodes", "median_us",
-                "min_us", "p95_us", "head_route", "argmax_route");
+    std::printf("%4s %5s %10s %10s %10s %-24s %s\n", "T", "nodes", "median_us", "min_us", "p95_us",
+                "head_route", "argmax_route");
 
     for (const std::int32_t t : options.t_sweep) {
         Tensor x(residual.p, DType::BF16, {kHidden, t});
@@ -301,19 +281,12 @@ int run(const Options& options) {
         Tensor normalized(hidden.p, DType::BF16, {kHidden, t});
         Tensor output(logits.p, DType::BF16, {kVocab, t});
         Tensor selected(tokens.p, DType::I32, {t});
-        const ops::detail::Q6Plan production =
-            ops::detail::q6_rowsplit_resolve_plan({kVocab, kHidden, kHidden, t});
-        const ops::detail::Q6Plan head_plan =
-            options.route == Route::Production ? production : dv06_control_plan(t);
+        const ops::detail::Q6Launch head_launch =
+            ops::detail::select_q6_a16_launch(kVocab, kHidden, t);
 
         const auto body = [&](cudaStream_t body_stream) {
             ops::rmsnorm(x, norm_weight, kRmsEps, true, normalized, body_stream);
-            if (options.route == Route::Production) {
-                ops::linear(normalized, head.weight, output, workspace, body_stream);
-            } else {
-                ops::detail::q6_rowsplit_execute_plan(head_plan, normalized, head.weight, output,
-                                                      body_stream);
-            }
+            ops::linear(normalized, head.weight, output, workspace, body_stream);
             if (options.argmax_block == 0) {
                 ops::argmax(output, selected, kValidVocab, body_stream);
             } else {
@@ -330,9 +303,9 @@ int run(const Options& options) {
         const std::string argmax_route = options.argmax_block == 0
                                              ? "production-b512"
                                              : "candidate-b" + std::to_string(options.argmax_block);
-        std::printf("%4d %-14s %5zu %10.3f %10.3f %10.3f %-52s %s\n", t, route_name(options.route),
-                    graph.nodes(), timing.median_us, timing.min_us, timing.p95_us,
-                    ops::detail::q6_schedule_name(head_plan.schedule), argmax_route.c_str());
+        std::printf("%4d %5zu %10.3f %10.3f %10.3f %-24s %s\n", t, graph.nodes(), timing.median_us,
+                    timing.min_us, timing.p95_us, q6_launch_name(head_launch),
+                    argmax_route.c_str());
     }
 
     CUDA_CHECK(cudaStreamDestroy(stream));

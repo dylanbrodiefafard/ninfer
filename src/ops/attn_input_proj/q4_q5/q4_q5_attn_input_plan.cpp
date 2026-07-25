@@ -41,16 +41,6 @@ bool supported_shape(const Q4Q5AttnInputProblem& problem) noexcept {
            problem.padded_k == 5120;
 }
 
-bool same_q5_plan(Q5Plan lhs, Q5Plan rhs) {
-    return lhs.schedule == rhs.schedule && lhs.variant == rhs.variant;
-}
-
-bool same_q5_plan(const std::optional<Q5Plan>& lhs, const std::optional<Q5Plan>& rhs) {
-    if (lhs.has_value() != rhs.has_value()) { return false; }
-    if (!lhs.has_value()) { return true; }
-    return same_q5_plan(*lhs, *rhs);
-}
-
 } // namespace
 
 const char* q4_q5_attn_input_schedule_name(Q4Q5AttnInputScheduleId schedule) noexcept {
@@ -77,14 +67,8 @@ Q4Q5AttnInputPlan q4_q5_attn_input_resolve_plan(const Q4Q5AttnInputProblem& prob
         if (!route.cols.contains(problem.cols)) { continue; }
         Q4Q5AttnInputPlan plan{
             route.schedule,
-            std::nullopt,
             0,
         };
-        if (route.schedule == Q4Q5AttnInputScheduleId::ParentSplitFixed) {
-            const std::int32_t parent_rows = problem.query_rows + problem.kv_rows;
-            plan.parent_gate_value         = q5_rowsplit_resolve_plan(
-                {parent_rows, problem.input_rows, problem.padded_k, problem.cols});
-        }
         return plan;
     }
     throw std::logic_error("Q4/Q5 attention input: admitted problem has no covering route");
@@ -97,16 +81,14 @@ void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& 
     const Q4Q5AttnInputProblem problem{x.ne[0], q.ne[0], k.ne[0], query_key_weight.padded_shape[1],
                                        x.ne[1]};
     const Q4Q5AttnInputPlan resolved = q4_q5_attn_input_resolve_plan(problem);
-    if (resolved.schedule != plan.schedule ||
-        !same_q5_plan(resolved.parent_gate_value, plan.parent_gate_value) ||
-        resolved.workspace_bytes != plan.workspace_bytes) {
+    if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument("Q4/Q5 attention input: plan does not match exact problem");
     }
 
     switch (plan.schedule) {
     case Q4Q5AttnInputScheduleId::ParentSplitFixed:
-        q4_q5_attn_input_small_t_launch(*plan.parent_gate_value, x, query_key_weight,
-                                        gate_value_weight, q, gate, k, v, stream);
+        q4_q5_attn_input_small_t_launch(x, query_key_weight, gate_value_weight, q, gate, k, v,
+                                        stream);
         return;
     case Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR64C128:
         q4_q5_attn_input_grouped_mma_launch(x, query_key_weight, gate_value_weight, q, gate, k, v,

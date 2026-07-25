@@ -558,13 +558,10 @@ struct Geometry35 {
             ops::detail::w8_attn_input_decode_launch(hidden_tensor, input0.weight, query, gate, key,
                                                      value, stream);
         } else if (tokens <= 12) {
-            const auto variant = tokens % 4 == 0 ? ops::detail::W8KernelVariant::Full
-                                                 : ops::detail::W8KernelVariant::Predicated;
-            ops::detail::w8_attn_input_simt_r8_c4_launch(variant, hidden_tensor, input0.weight,
-                                                         query, gate, key, value, stream);
+            ops::detail::w8_attn_input_simt_r8_c4_launch(hidden_tensor, input0.weight, query, gate,
+                                                         key, value, stream);
         } else {
-            ops::detail::w8_attn_input_mma_r32_c128_launch(ops::detail::W8KernelVariant::Predicated,
-                                                           hidden_tensor, input0.weight, query,
+            ops::detail::w8_attn_input_mma_r32_c128_launch(hidden_tensor, input0.weight, query,
                                                            gate, key, value, stream);
         }
     }

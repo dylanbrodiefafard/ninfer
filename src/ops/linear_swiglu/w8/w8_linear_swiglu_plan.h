@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ops/linear/w8/w8_rowsplit_launch.h"
+#include "core/tensor.h"
 
 #include <cuda_runtime.h>
 
@@ -33,7 +33,6 @@ struct W8LinearSwiGluProblem {
 
 struct W8LinearSwiGluPlan {
     W8LinearSwiGluScheduleId schedule;
-    W8KernelVariant variant;
     std::size_t workspace_bytes;
 };
 

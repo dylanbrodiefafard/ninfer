@@ -110,16 +110,9 @@ std::int32_t schedule_rows(W8LinearAddScheduleId schedule) {
 
 std::int32_t schedule_cols(W8LinearAddScheduleId schedule);
 
-W8KernelVariant resolve_variant(W8LinearAddScheduleId schedule, const W8Problem& problem) {
-    if (schedule == W8LinearAddScheduleId::DecodeR16 ||
-        schedule == W8LinearAddScheduleId::SplitKMmaExactT ||
-        schedule == W8LinearAddScheduleId::SplitKMma32PlusTail) {
-        return W8KernelVariant::None;
-    }
+bool use_full(W8LinearAddScheduleId schedule, const W8LinearAddProblem& problem) {
     return problem.rows % schedule_rows(schedule) == 0 &&
-                   problem.cols % schedule_cols(schedule) == 0
-               ? W8KernelVariant::Full
-               : W8KernelVariant::Predicated;
+           problem.cols % schedule_cols(schedule) == 0;
 }
 
 std::int32_t schedule_cols(W8LinearAddScheduleId schedule) {
@@ -200,19 +193,19 @@ bool w8_linear_add_schedule_uses_mma(W8LinearAddScheduleId schedule) noexcept {
            schedule != W8LinearAddScheduleId::SimtR8C4;
 }
 
-bool w8_linear_add_admits(const W8Problem& problem) noexcept {
+bool w8_linear_add_admits(const W8LinearAddProblem& problem) noexcept {
     return problem.rows == 2048 && (problem.k == 4096 || problem.k == 6144) &&
            problem.padded_k == problem.k && problem.cols >= 1;
 }
 
-W8LinearAddPlan w8_linear_add_resolve_plan(const W8Problem& problem) {
+W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem) {
     if (!w8_linear_add_admits(problem)) {
         throw std::invalid_argument("w8 linear_add: exact problem or column count is not admitted");
     }
     const auto resolve_from = [&](const auto& routes) -> W8LinearAddPlan {
         for (const RouteSpec& route : routes) {
             if (problem.cols >= route.first && problem.cols <= route.last) {
-                return {route.schedule, resolve_variant(route.schedule, problem)};
+                return {route.schedule};
             }
         }
         throw std::logic_error("w8 linear_add: admitted problem has no covering route");
@@ -220,34 +213,11 @@ W8LinearAddPlan w8_linear_add_resolve_plan(const W8Problem& problem) {
     return problem.k == 6144 ? resolve_from(kK6144Routes) : resolve_from(kK4096Routes);
 }
 
-void w8_linear_add_launch_candidate(W8ScheduleId schedule, W8KernelVariant variant, const Tensor& x,
-                                    const Weight& w, Tensor& residual_out, cudaStream_t stream) {
-    const W8Problem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
-    if (!w8_linear_add_admits(problem) || !w8_candidate_is_legal(schedule, variant, problem)) {
-        throw std::invalid_argument("w8 linear_add: illegal fixed candidate");
-    }
-    switch (schedule) {
-    case W8ScheduleId::SimtR8C4:
-        w8_linear_add_simt_r8_c4_launch(variant, x, w, residual_out, stream);
-        return;
-    case W8ScheduleId::SimtR8C8:
-        w8_linear_add_simt_r8_c8_launch(variant, x, w, residual_out, stream);
-        return;
-    case W8ScheduleId::MmaR32C128:
-        w8_linear_add_mma_r32_c128_launch(variant, x, w, residual_out, stream);
-        return;
-    case W8ScheduleId::MmaR64C128:
-        w8_linear_add_mma_r64_c128_launch(variant, x, w, residual_out, stream);
-        return;
-    }
-    throw std::logic_error("w8 linear_add: unknown schedule");
-}
-
 void w8_linear_add_execute_plan(const W8LinearAddPlan& plan, const Tensor& x, const Weight& w,
                                 Tensor& residual_out, cudaStream_t stream) {
-    const W8Problem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
+    const W8LinearAddProblem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
     const W8LinearAddPlan resolved = w8_linear_add_resolve_plan(problem);
-    if (resolved.schedule != plan.schedule || resolved.variant != plan.variant) {
+    if (resolved.schedule != plan.schedule) {
         throw std::invalid_argument("w8 linear_add: plan does not match the exact problem");
     }
     if (plan.schedule == W8LinearAddScheduleId::DecodeR16) {
@@ -255,13 +225,14 @@ void w8_linear_add_execute_plan(const W8LinearAddPlan& plan, const Tensor& x, co
         return;
     }
     if (plan.schedule == W8LinearAddScheduleId::SplitKMmaExactT) {
-        w8_linear_add_splitk_mma_launch(plan.variant, x, w, residual_out, stream);
+        w8_linear_add_splitk_mma_launch(x, w, residual_out, stream);
         return;
     }
     if (plan.schedule == W8LinearAddScheduleId::SplitKMma32PlusTail) {
         w8_linear_add_splitk_mma_composite_launch(x, w, residual_out, stream);
         return;
     }
+    const bool full = use_full(plan.schedule, problem);
     for_each_token_slice(
         x.ne[1], schedule_cols(plan.schedule), [&](std::int32_t offset, std::int32_t count) {
             const Tensor x_slice  = x.slice(1, offset, count);
@@ -271,46 +242,46 @@ void w8_linear_add_execute_plan(const W8LinearAddPlan& plan, const Tensor& x, co
             case W8LinearAddScheduleId::SplitKMma32PlusTail:
                 break;
             case W8LinearAddScheduleId::SimtR8C4:
-                w8_linear_add_simt_r8_c4_launch(plan.variant, x_slice, w, residual_slice, stream);
+                w8_linear_add_simt_r8_c4_launch(full, x_slice, w, residual_slice, stream);
                 return;
             case W8LinearAddScheduleId::MmaR32C64:
-                w8_linear_add_mma_r32_c64_launch(plan.variant, x_slice, w, residual_slice, stream);
+                w8_linear_add_mma_r32_c64_launch(full, x_slice, w, residual_slice, stream);
                 return;
             case W8LinearAddScheduleId::MmaR32C80:
-                w8_linear_add_mma_r32_c80_launch(plan.variant, x_slice, w, residual_slice, stream);
+                w8_linear_add_mma_r32_c80_launch(full, x_slice, w, residual_slice, stream);
                 return;
             case W8LinearAddScheduleId::MmaR32C96:
-                w8_linear_add_mma_r32_c96_launch(plan.variant, x_slice, w, residual_slice, stream);
+                w8_linear_add_mma_r32_c96_launch(full, x_slice, w, residual_slice, stream);
                 return;
             case W8LinearAddScheduleId::MmaR32C128:
-                w8_linear_add_mma_r32_c128_launch(plan.variant, x_slice, w, residual_slice, stream);
+                w8_linear_add_mma_r32_c128_launch(full, x_slice, w, residual_slice, stream);
                 return;
             case W8LinearAddScheduleId::MmaR48C64:
-                w8_linear_add_mma_r48_c64_launch(plan.variant, x_slice, w, residual_slice, stream);
+                w8_linear_add_mma_r48_c64_launch(full, x_slice, w, residual_slice, stream);
                 return;
             case W8LinearAddScheduleId::MmaR48C96:
-                w8_linear_add_mma_r48_c96_launch(plan.variant, x_slice, w, residual_slice, stream);
+                w8_linear_add_mma_r48_c96_launch(full, x_slice, w, residual_slice, stream);
                 return;
             case W8LinearAddScheduleId::MmaR48C112:
-                w8_linear_add_mma_r48_c112_launch(plan.variant, x_slice, w, residual_slice, stream);
+                w8_linear_add_mma_r48_c112_launch(full, x_slice, w, residual_slice, stream);
                 return;
             case W8LinearAddScheduleId::MmaR48C128:
-                w8_linear_add_mma_r48_c128_launch(plan.variant, x_slice, w, residual_slice, stream);
+                w8_linear_add_mma_r48_c128_launch(full, x_slice, w, residual_slice, stream);
                 return;
             case W8LinearAddScheduleId::MmaR64C96:
-                w8_linear_add_mma_r64_c96_launch(plan.variant, x_slice, w, residual_slice, stream);
+                w8_linear_add_mma_r64_c96_launch(full, x_slice, w, residual_slice, stream);
                 return;
             case W8LinearAddScheduleId::MmaR64C112:
-                w8_linear_add_mma_r64_c112_launch(plan.variant, x_slice, w, residual_slice, stream);
+                w8_linear_add_mma_r64_c112_launch(full, x_slice, w, residual_slice, stream);
                 return;
             case W8LinearAddScheduleId::MmaR64C128:
-                w8_linear_add_mma_r64_c128_launch(plan.variant, x_slice, w, residual_slice, stream);
+                w8_linear_add_mma_r64_c128_launch(full, x_slice, w, residual_slice, stream);
                 return;
             case W8LinearAddScheduleId::MmaR128C64:
-                w8_linear_add_mma_r128_c64_launch(plan.variant, x_slice, w, residual_slice, stream);
+                w8_linear_add_mma_r128_c64_launch(full, x_slice, w, residual_slice, stream);
                 return;
             case W8LinearAddScheduleId::MmaR128C80:
-                w8_linear_add_mma_r128_c80_launch(plan.variant, x_slice, w, residual_slice, stream);
+                w8_linear_add_mma_r128_c80_launch(full, x_slice, w, residual_slice, stream);
                 return;
             case W8LinearAddScheduleId::SplitKMmaExactT:
                 break;
@@ -321,7 +292,7 @@ void w8_linear_add_execute_plan(const W8LinearAddPlan& plan, const Tensor& x, co
 
 void w8_linear_add_dispatch(const Tensor& x, const Weight& w, Tensor& residual_out,
                             cudaStream_t stream) {
-    const W8Problem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
+    const W8LinearAddProblem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
     w8_linear_add_execute_plan(w8_linear_add_resolve_plan(problem), x, w, residual_out, stream);
 }
 

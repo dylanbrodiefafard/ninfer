@@ -5,7 +5,6 @@
 
 #include "core/device.h"
 #include "ninfer_bench_common.h"
-#include "ops/linear/w8/w8_rowsplit_launch.h"
 #include "ops/linear_add/w8/w8_linear_add_kernels.h"
 #include "ops/linear_add/w8/w8_linear_add_plan.h"
 
@@ -239,31 +238,8 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     }
 }
 
-ops::detail::W8KernelVariant variant_for(std::int32_t t, std::int32_t tile_cols,
-                                         std::int32_t tile_rows = 32) {
-    return (t % tile_cols) == 0 && (kRows % tile_rows) == 0
-               ? ops::detail::W8KernelVariant::Full
-               : ops::detail::W8KernelVariant::Predicated;
-}
-
-void launch_composed_control(const Tensor& x, const Weight& weight, Tensor& projected,
-                             Tensor& residual, cudaStream_t stream) {
-    using S = ops::detail::W8ScheduleId;
-    S schedule;
-    int tile_cols;
-    if (x.ne[1] <= 32) {
-        schedule  = S::SimtR8C4;
-        tile_cols = 4;
-    } else if (x.ne[1] <= 640) {
-        schedule  = S::MmaR32C128;
-        tile_cols = 128;
-    } else {
-        schedule  = S::MmaR64C128;
-        tile_cols = 128;
-    }
-    ops::detail::w8_rowsplit_launch_candidate(schedule, variant_for(x.ne[1], tile_cols), x, weight,
-                                              projected, stream);
-    ops::residual_add(projected, residual, stream);
+bool full_for(std::int32_t t, std::int32_t tile_cols, std::int32_t tile_rows = 32) {
+    return (t % tile_cols) == 0 && (kRows % tile_rows) == 0;
 }
 
 } // namespace
@@ -277,9 +253,8 @@ int main(int argc, char** argv) {
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         bench::DBuf flush(kFlushBytes);
-        bench::DBuf input    = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t);
-        bench::DBuf residual = bench::make_bf16(static_cast<std::size_t>(kRows) * max_t);
-        bench::DBuf projected(static_cast<std::size_t>(kRows) * max_t * 2);
+        bench::DBuf input         = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t);
+        bench::DBuf residual      = bench::make_bf16(static_cast<std::size_t>(kRows) * max_t);
         DevicePackedWeight packed = make_w8_weight();
         WorkspaceArena workspace(1);
         std::vector<Result> results;
@@ -287,7 +262,6 @@ int main(int argc, char** argv) {
         for (const std::int32_t t : options.t_sweep) {
             Tensor x(input.p, DType::BF16, {kHidden, t});
             Tensor out(residual.p, DType::BF16, {kRows, t});
-            Tensor parent(projected.p, DType::BF16, {kRows, t});
             const auto plan = ops::detail::w8_linear_add_resolve_plan({kRows, kHidden, kHidden, t});
 
             if (options.profile) {
@@ -307,9 +281,6 @@ int main(int argc, char** argv) {
                 [&](cudaStream_t candidate_stream) {
                     ops::linear_add(x, packed.weight, out, workspace, candidate_stream);
                 });
-            run("composed.projection+residual_add", [&](cudaStream_t candidate_stream) {
-                launch_composed_control(x, packed.weight, parent, out, candidate_stream);
-            });
             if (options.production_only) { continue; }
 
             if (t == 1) {
@@ -327,17 +298,16 @@ int main(int argc, char** argv) {
                 });
             }
             run("simt_r8_c4", [&](cudaStream_t candidate_stream) {
-                ops::detail::w8_linear_add_simt_r8_c4_launch(variant_for(t, 4), x, packed.weight,
-                                                             out, candidate_stream);
+                ops::detail::w8_linear_add_simt_r8_c4_launch(full_for(t, 4), x, packed.weight, out,
+                                                             candidate_stream);
             });
             run("simt_r8_c8", [&](cudaStream_t candidate_stream) {
-                ops::detail::w8_linear_add_simt_r8_c8_launch(variant_for(t, 8), x, packed.weight,
-                                                             out, candidate_stream);
+                ops::detail::w8_linear_add_simt_r8_c8_launch(full_for(t, 8), x, packed.weight, out,
+                                                             candidate_stream);
             });
             if (t >= 2 && t <= 32) {
                 run("splitk_mma_exact_t", [&](cudaStream_t candidate_stream) {
-                    ops::detail::w8_linear_add_splitk_mma_launch(ops::detail::W8KernelVariant::None,
-                                                                 x, packed.weight, out,
+                    ops::detail::w8_linear_add_splitk_mma_launch(x, packed.weight, out,
                                                                  candidate_stream);
                 });
             }
@@ -349,7 +319,7 @@ int main(int argc, char** argv) {
             }
 #define RUN_MMA(NAME, TILE_ROWS, TILE_COLS)                                                        \
     run(#NAME, [&](cudaStream_t candidate_stream) {                                                \
-        ops::detail::w8_linear_add_##NAME##_launch(variant_for(t, TILE_COLS, TILE_ROWS), x,        \
+        ops::detail::w8_linear_add_##NAME##_launch(full_for(t, TILE_COLS, TILE_ROWS), x,           \
                                                    packed.weight, out, candidate_stream);          \
     })
             RUN_MMA(mma_r32_c32, 32, 32);

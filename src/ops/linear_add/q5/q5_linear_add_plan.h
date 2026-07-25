@@ -1,13 +1,11 @@
 #pragma once
 
 #include "core/arena.h"
-#include "ops/linear/q5/q5_rowsplit_plan.h"
 
 #include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
-#include <optional>
 
 namespace ninfer::ops::detail {
 
@@ -27,8 +25,6 @@ struct Q5LinearAddProblem {
 
 struct Q5LinearAddPlan {
     Q5LinearAddScheduleId schedule;
-    Q5KernelVariant variant;
-    std::optional<Q5Plan> materialized_projection;
     std::size_t workspace_bytes;
 };
 

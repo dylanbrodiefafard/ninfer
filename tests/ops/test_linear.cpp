@@ -6,11 +6,10 @@
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ops/op_tester.h"
-#include "ops/linear/bf16/bf16_contiguous_plan.h"
 #include "ops/linear/q4/q4_dispatch.h"
-#include "ops/linear/q5/q5_rowsplit_plan.h"
-#include "ops/linear/q6/q6_rowsplit_plan.h"
-#include "ops/linear/w8/w8_rowsplit_plan.h"
+#include "ops/linear/q5/q5_dispatch.h"
+#include "ops/linear/q6/q6_dispatch.h"
+#include "ops/linear/w8/w8_dispatch.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 #include "ops/linear_add/w8/w8_linear_add_plan.h"
 #include "ops/attn_input_proj/w8/w8_attn_input_plan.h"
@@ -48,6 +47,25 @@ const char* qtype_name(QType qtype) {
     default:
         return "unsupported";
     }
+}
+
+bool q6_launch_uses_mma(std::int32_t n, std::int32_t k, std::int32_t t) {
+    const ops::detail::Q6Launch launch = ops::detail::select_q6_a16_launch(n, k, t);
+    return launch == ops::detail::launch_q6_mma_r64_c64 ||
+           launch == ops::detail::launch_q6_mma_r64_c128;
+}
+
+bool q5_launch_uses_mma(std::int32_t n, std::int32_t k, std::int32_t t) {
+    const ops::detail::Q5Launch launch = ops::detail::select_q5_a16_launch(n, k, t);
+    return launch == ops::detail::launch_q5_mma_r64_c64 ||
+           launch == ops::detail::launch_q5_mma_r64_c128;
+}
+
+bool w8_launch_uses_mma(std::int32_t n, std::int32_t k, std::int32_t t) {
+    const ops::detail::W8Launch launch = ops::detail::select_w8_a16_launch(n, k, t);
+    return launch != ops::detail::launch_w8_decode_r4 &&
+           launch != ops::detail::launch_w8_simt_r8_c4 &&
+           launch != ops::detail::launch_w8_simt_r8_c8;
 }
 
 std::vector<std::int32_t> sampled_indices(std::int32_t limit) {
@@ -299,20 +317,11 @@ int one_quant_shape(QType qtype, std::int32_t n, std::int32_t k,
                              launch == ops::detail::launch_q4_mma_r64_c128;
             tol = mma ? Tolerance::linear_tc() : Tolerance::linear_bf16();
         } else if (qtype == QType::Q5G64_F16S) {
-            const ops::detail::Q5Plan plan =
-                ops::detail::q5_rowsplit_resolve_plan({n, k, packed.weight.padded_shape[1], t});
-            tol = ops::detail::q5_schedule_uses_mma(plan.schedule) ? Tolerance::linear_tc()
-                                                                   : Tolerance::linear_bf16();
+            tol = q5_launch_uses_mma(n, k, t) ? Tolerance::linear_tc() : Tolerance::linear_bf16();
         } else if (qtype == QType::Q6G64_F16S) {
-            const ops::detail::Q6Plan plan =
-                ops::detail::q6_rowsplit_resolve_plan({n, k, packed.weight.padded_shape[1], t});
-            tol = ops::detail::q6_schedule_uses_mma(plan.schedule) ? Tolerance::linear_tc()
-                                                                   : Tolerance::linear_bf16();
+            tol = q6_launch_uses_mma(n, k, t) ? Tolerance::linear_tc() : Tolerance::linear_bf16();
         } else if (qtype == QType::W8G32_F16S) {
-            const ops::detail::W8Plan plan =
-                ops::detail::w8_rowsplit_resolve_plan({n, k, packed.weight.padded_shape[1], t});
-            tol = ops::detail::w8_schedule_uses_mma(plan.schedule) ? Tolerance::linear_tc()
-                                                                   : Tolerance::linear_bf16();
+            tol = w8_launch_uses_mma(n, k, t) ? Tolerance::linear_tc() : Tolerance::linear_bf16();
         }
         failures +=
             verify(label.c_str(),
@@ -385,15 +394,9 @@ int one_quant_shape_sampled(QType qtype, std::int32_t n, std::int32_t k, std::in
 
     Tolerance tolerance = Tolerance::linear_bf16();
     if (qtype == QType::Q6G64_F16S) {
-        const ops::detail::Q6Plan plan =
-            ops::detail::q6_rowsplit_resolve_plan({n, k, packed.weight.padded_shape[1], t});
-        tolerance = ops::detail::q6_schedule_uses_mma(plan.schedule) ? Tolerance::linear_tc()
-                                                                     : Tolerance::linear_bf16();
+        tolerance = q6_launch_uses_mma(n, k, t) ? Tolerance::linear_tc() : Tolerance::linear_bf16();
     } else if (qtype == QType::W8G32_F16S) {
-        const ops::detail::W8Plan plan =
-            ops::detail::w8_rowsplit_resolve_plan({n, k, packed.weight.padded_shape[1], t});
-        tolerance = ops::detail::w8_schedule_uses_mma(plan.schedule) ? Tolerance::linear_tc()
-                                                                     : Tolerance::linear_bf16();
+        tolerance = w8_launch_uses_mma(n, k, t) ? Tolerance::linear_tc() : Tolerance::linear_bf16();
     } else {
         throw std::invalid_argument("sampled Linear oracle supports only Q6 and W8");
     }
@@ -434,20 +437,11 @@ int one_patterned_quant_shape_sampled(QType qtype, std::int32_t n, std::int32_t 
                          launch == ops::detail::launch_q4_mma_r64_c128;
         tolerance = mma ? Tolerance::linear_tc() : Tolerance::linear_bf16();
     } else if (qtype == QType::Q5G64_F16S) {
-        const auto plan =
-            ops::detail::q5_rowsplit_resolve_plan({n, k, packed.weight.padded_shape[1], t});
-        tolerance = ops::detail::q5_schedule_uses_mma(plan.schedule) ? Tolerance::linear_tc()
-                                                                     : Tolerance::linear_bf16();
+        tolerance = q5_launch_uses_mma(n, k, t) ? Tolerance::linear_tc() : Tolerance::linear_bf16();
     } else if (qtype == QType::Q6G64_F16S) {
-        const auto plan =
-            ops::detail::q6_rowsplit_resolve_plan({n, k, packed.weight.padded_shape[1], t});
-        tolerance = ops::detail::q6_schedule_uses_mma(plan.schedule) ? Tolerance::linear_tc()
-                                                                     : Tolerance::linear_bf16();
+        tolerance = q6_launch_uses_mma(n, k, t) ? Tolerance::linear_tc() : Tolerance::linear_bf16();
     } else if (qtype == QType::W8G32_F16S) {
-        const auto plan =
-            ops::detail::w8_rowsplit_resolve_plan({n, k, packed.weight.padded_shape[1], t});
-        tolerance = ops::detail::w8_schedule_uses_mma(plan.schedule) ? Tolerance::linear_tc()
-                                                                     : Tolerance::linear_bf16();
+        tolerance = w8_launch_uses_mma(n, k, t) ? Tolerance::linear_tc() : Tolerance::linear_bf16();
     } else {
         throw std::invalid_argument("patterned sampled Linear oracle received an unsupported type");
     }
@@ -522,10 +516,8 @@ int q6_output_head_dflash_oracle() {
                 reference.push_back(row_split::dot_row_split_lowbit_fp64(packed, row, xcol, k));
             }
         }
-        const auto plan           = ops::detail::q6_rowsplit_resolve_plan({n, k, k, t});
-        const Tolerance tolerance = ops::detail::q6_schedule_uses_mma(plan.schedule)
-                                        ? Tolerance::linear_tc()
-                                        : Tolerance::linear_bf16();
+        const Tolerance tolerance =
+            q6_launch_uses_mma(n, k, t) ? Tolerance::linear_tc() : Tolerance::linear_bf16();
         failures += verify(label.c_str(), actual, reference, tolerance);
     }
     return failures;
@@ -1631,10 +1623,8 @@ int w8_conditioning_linear_correctness() {
         const std::vector<double> actual = from_device_bf16_ptr(got.data(), count);
         const std::vector<double> reference(sparse_reference.begin(),
                                             sparse_reference.begin() + count);
-        const auto plan           = ops::detail::w8_rowsplit_resolve_plan({kRows, kK, kK, t});
-        const Tolerance tolerance = ops::detail::w8_schedule_uses_mma(plan.schedule)
-                                        ? Tolerance::linear_tc()
-                                        : Tolerance::linear_bf16();
+        const Tolerance tolerance =
+            w8_launch_uses_mma(kRows, kK, t) ? Tolerance::linear_tc() : Tolerance::linear_bf16();
         const std::string label =
             "linear W8 [2048,16384] complete FP64 exact-decode oracle T=" + std::to_string(t);
         failures += verify(label.c_str(), actual, reference, tolerance);
@@ -1677,10 +1667,8 @@ int w8_conditioning_linear_correctness() {
         }
 
         const std::vector<double> full = from_device_bf16_ptr(got.data(), count);
-        const auto plan                = ops::detail::w8_rowsplit_resolve_plan({kRows, kK, kK, t});
-        const Tolerance tolerance      = ops::detail::w8_schedule_uses_mma(plan.schedule)
-                                             ? Tolerance::linear_tc()
-                                             : Tolerance::linear_bf16();
+        const Tolerance tolerance =
+            w8_launch_uses_mma(kRows, kK, t) ? Tolerance::linear_tc() : Tolerance::linear_bf16();
         const std::string label =
             "linear W8 [2048,16384] dense sampled FP64 oracle T=" + std::to_string(t);
         failures +=
@@ -1956,10 +1944,6 @@ int bf16_placeholder_contract() {
         return w;
     };
 
-    if (ops::detail::bf16_contiguous_admits({n, k, 1})) {
-        std::cerr << "linear BF16 placeholder unexpectedly admits a problem\n";
-        ++f;
-    }
     try {
         ops::linear(tx, weight(dw_bf16.p, QType::BF16_CTRL), tout, ws, nullptr);
         std::cerr << "linear BF16 placeholder unexpectedly executed\n";
@@ -2228,13 +2212,14 @@ int main() {
     f += one_quant_shape(QType::Q5G64_F16S, 1152, 1152, {4, 56, 60, 128}, 43u);
     f += one_quant_shape(QType::Q5G64_F16S, 1152, 4304, {4, 84, 88, 128}, 47u);
     f += one_patterned_quant_shape_sampled(QType::Q5G64_F16S, 6144, 5120, 1025, 49u);
-    // Q6 public correctness is exact-admission only. The dedicated Q6 plan/dispatch tests cover
-    // every route seam and compare public auto against the fixed entry word-for-word. These
-    // independent fp64-oracle points cover the real head and Vision geometries.
-    f += one_quant_shape(QType::Q6G64_F16S, 248320, 5120, {1}, 211u);
+    // The host-only selector test covers every Q6 route seam. These public calls qualify all four
+    // retained launchers, both MMA boundary instances, and AllowA8's A16 fallback.
+    f += one_quant_shape(QType::Q6G64_F16S, 248320, 5120, {1}, 211u, 8.0f, 0.125f, "allow-a8",
+                         ops::LinearPolicy::AllowA8);
     f += one_patterned_quant_shape_sampled(QType::Q6G64_F16S, 248320, 5120, 7, 212u);
     f += q6_output_head_dflash_oracle();
     f += one_quant_shape(QType::Q6G64_F16S, 1152, 1536, {4, 40, 128}, 227u);
+    f += one_patterned_quant_shape_sampled(QType::Q6G64_F16S, 1152, 1536, 768, 229u);
 
     std::cout << (f ? "FAIL" : "OK") << " linear correctness\n";
     return f ? 1 : 0;

@@ -93,7 +93,6 @@ add_library(ninfer_ops STATIC
   ops/gdn_input_proj/w8/w8_gdn_input_plan.cpp
   ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
   ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp
-  ops/linear/bf16/bf16_contiguous_plan.cpp
   ops/linear/q4/q4_rowsplit_gemm_mma.cu
   ops/linear/q4/q4_rowsplit_gemm_simt.cu
   ops/linear/q4/q4_rowsplit_gemv.cu
@@ -102,8 +101,6 @@ add_library(ninfer_ops STATIC
   ops/linear/q5/q5_rowsplit_gemm_mma.cu
   ops/linear/q5/q5_rowsplit_gemm_simt.cu
   ops/linear/q5/q5_rowsplit_gemv.cu
-  ops/linear/q5/q5_rowsplit_launch.cpp
-  ops/linear/q5/q5_rowsplit_plan.cpp
   ops/linear_add/q5/q5_linear_add_gemm_mma.cu
   ops/linear_add/q5/q5_linear_add_gemv.cu
   ops/linear_add/q5/q5_linear_add_plan.cpp
@@ -119,17 +116,13 @@ add_library(ninfer_ops STATIC
   ops/linear_swiglu/w8/w8_linear_swiglu_gemm_splitk.cu
   ops/linear_swiglu/w8/w8_linear_swiglu_plan.cpp
   ops/linear/q6/q6_dispatch.cpp
-  ops/linear/q6/q6_rowsplit_launch.cpp
   ops/linear/q6/q6_rowsplit_gemm_mma.cu
   ops/linear/q6/q6_rowsplit_gemm_simt.cu
-  ops/linear/q6/q6_rowsplit_plan.cpp
   ops/linear/w8/w8_rowsplit_gemm_mma.cu
   ops/linear/w8/w8_rowsplit_gemm_simt.cu
   ops/linear/w8/w8_rowsplit_gemm_decode.cu
   ops/linear/w8/w8_rowsplit_gemm_splitk.cu
   ops/linear/w8/w8_dispatch.cpp
-  ops/linear/w8/w8_rowsplit_launch.cpp
-  ops/linear/w8/w8_rowsplit_plan.cpp
   ops/linear_pair/w8/w8_pair_decode.cu
   ops/linear_pair/w8/w8_pair_gemm_concat.cu
   ops/linear_pair/w8/w8_pair_gemm_mma.cu

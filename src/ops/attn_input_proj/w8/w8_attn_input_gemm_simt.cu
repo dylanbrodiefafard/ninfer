@@ -4,8 +4,6 @@
 #include "ops/common/math.h"
 #include "ops/linear/w8/w8_rowsplit_gemm_simt.cuh"
 
-#include <stdexcept>
-
 namespace ninfer::ops::detail {
 namespace {
 
@@ -18,10 +16,10 @@ constexpr int kCols          = 4;
 using TargetOutput           = W8SplitOutput4<4096, 512, 4096, 512>;
 using CompanionOutput        = W8SplitOutput3<4096, 1024, 1024>;
 
-template <W8KernelVariant Variant, int Rows, class Output>
+template <bool Full, int Rows, class Output>
 void launch_variant(const Tensor& x, const Weight& weight, Output output, cudaStream_t stream) {
     const dim3 grid(Rows / kRowsPerCta, static_cast<unsigned>(div_up(x.ne[1], kCols)), 1u);
-    w8_rowsplit_gemm_simt_kernel<W8RowSplitSimtSchedule, kCols, kRowsPerCta, kStages, Variant,
+    w8_rowsplit_gemm_simt_kernel<W8RowSplitSimtSchedule, kCols, kRowsPerCta, kStages, Full,
                                  W8Epilogue::Store, Output><<<grid, kRowsPerCta * 32, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), output, Rows, kHidden, x.ne[1], kHidden,
@@ -29,37 +27,33 @@ void launch_variant(const Tensor& x, const Weight& weight, Output output, cudaSt
 }
 
 template <int Rows, class Output>
-void dispatch_variant(W8KernelVariant variant, const Tensor& x, const Weight& weight, Output output,
-                      cudaStream_t stream) {
-    if (variant == W8KernelVariant::Full) {
-        launch_variant<W8KernelVariant::Full, Rows>(x, weight, output, stream);
-    } else if (variant == W8KernelVariant::Predicated) {
-        launch_variant<W8KernelVariant::Predicated, Rows>(x, weight, output, stream);
+void launch_route(const Tensor& x, const Weight& weight, Output output, cudaStream_t stream) {
+    if ((x.ne[1] % kCols) == 0) {
+        launch_variant<true, Rows>(x, weight, output, stream);
     } else {
-        throw std::invalid_argument("W8 attention input SIMT requires a tiled variant");
+        launch_variant<false, Rows>(x, weight, output, stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace
 
-void w8_attn_input_simt_r8_c4_launch(W8KernelVariant variant, const Tensor& x, const Weight& weight,
-                                     Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
-                                     cudaStream_t stream) {
+void w8_attn_input_simt_r8_c4_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                                     Tensor& k, Tensor& v, cudaStream_t stream) {
     static_assert((4096 % kRowsPerCta) == 0 && (512 % kRowsPerCta) == 0);
     const TargetOutput output{
         static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
         static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
-    dispatch_variant<kTargetRows>(variant, x, weight, output, stream);
+    launch_route<kTargetRows>(x, weight, output, stream);
 }
 
-void w8_attn_input_simt_r8_c4_launch(W8KernelVariant variant, const Tensor& x, const Weight& weight,
-                                     Tensor& q, Tensor& k, Tensor& v, cudaStream_t stream) {
+void w8_attn_input_simt_r8_c4_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
+                                     Tensor& v, cudaStream_t stream) {
     static_assert((4096 % kRowsPerCta) == 0 && (1024 % kRowsPerCta) == 0);
     const CompanionOutput output{static_cast<__nv_bfloat16*>(q.data),
                                  static_cast<__nv_bfloat16*>(k.data),
                                  static_cast<__nv_bfloat16*>(v.data)};
-    dispatch_variant<kCompanionRows>(variant, x, weight, output, stream);
+    launch_route<kCompanionRows>(x, weight, output, stream);
 }
 
 } // namespace ninfer::ops::detail

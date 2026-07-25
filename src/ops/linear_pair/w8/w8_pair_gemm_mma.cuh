@@ -4,14 +4,13 @@
 // shared memory and contracts it against independent K and V weight tiles.
 
 #include "ops/linear/w8/w8_rowsplit_gemm_mma.cuh"
-#include "ops/linear/w8/w8_rowsplit_launch.h"
 
 namespace ninfer::ops::detail {
 
 template <int TileCols>
 inline constexpr int kW8PairMmaMinBlocks = TileCols <= 64 ? 3 : 2;
 
-template <int TileCols, W8KernelVariant Variant>
+template <int TileCols, bool Full>
 __global__
 __launch_bounds__((TileCols / 16) * 32, kW8PairMmaMinBlocks<TileCols>) void w8_pair_gemm_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ k_codes,
@@ -19,8 +18,6 @@ __launch_bounds__((TileCols / 16) * 32, kW8PairMmaMinBlocks<TileCols>) void w8_p
     const std::uint8_t* __restrict__ v_scales, __nv_bfloat16* __restrict__ k_out,
     __nv_bfloat16* __restrict__ v_out, std::int32_t m, std::int32_t k, std::int32_t n,
     std::int32_t padded_k) {
-    static_assert(Variant == W8KernelVariant::Full || Variant == W8KernelVariant::Predicated);
-    constexpr bool FullTiles        = Variant == W8KernelVariant::Full;
     constexpr int BM                = 32;
     constexpr int BN                = TileCols;
     constexpr int BK                = 64;
@@ -80,7 +77,7 @@ __launch_bounds__((TileCols / 16) * 32, kW8PairMmaMinBlocks<TileCols>) void w8_p
             const int kk = k0 + k8 * 8;
             const int nn = n0 + nl;
             auto* dst    = &Bs[stage][nl * BK + w8g32_swz64(nl, k8 * 8)];
-            if constexpr (FullTiles) {
+            if constexpr (Full) {
                 cp_async<16, Cache::cg>(dst, &x[static_cast<std::int64_t>(nn) * k + kk]);
             } else {
                 const int valid = (nn < n && kk < k) ? min(8, k - kk) * 2 : 0;
@@ -100,7 +97,7 @@ __launch_bounds__((TileCols / 16) * 32, kW8PairMmaMinBlocks<TileCols>) void w8_p
             const int chunk = item - row * (BK / 16);
             const int grow  = m0 + row;
             auto* dst       = &Cr[p][row * BK + chunk * 16];
-            if constexpr (FullTiles) {
+            if constexpr (Full) {
                 const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g0;
                 cp_async<16, Cache::cg>(dst, &codes[gi * 32 + chunk * 16]);
             } else {
@@ -118,7 +115,7 @@ __launch_bounds__((TileCols / 16) * 32, kW8PairMmaMinBlocks<TileCols>) void w8_p
             for (int row = tid; row < BM; row += THREADS) {
                 const int grow = m0 + row;
                 auto* dst      = &Sr[p][row * SCALE_CACHE_BYTES];
-                if constexpr (FullTiles) {
+                if constexpr (Full) {
                     const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g0;
                     if (g0 + 8 <= kg) {
                         cp_async<16, Cache::cg>(dst, &scales[gi * 2]);
@@ -253,7 +250,7 @@ __launch_bounds__((TileCols / 16) * 32, kW8PairMmaMinBlocks<TileCols>) void w8_p
                 const int c0   = n0 + wn * WN + ni * 8 + 2 * lid;
                 const int c1   = c0 + 1;
                 const float* a = p == 0 ? acc_k[mi][ni] : acc_v[mi][ni];
-                if constexpr (FullTiles) {
+                if constexpr (Full) {
                     out[static_cast<std::int64_t>(c0) * m + r0] = __float2bfloat16_rn(a[0]);
                     out[static_cast<std::int64_t>(c1) * m + r0] = __float2bfloat16_rn(a[1]);
                     out[static_cast<std::int64_t>(c0) * m + r1] = __float2bfloat16_rn(a[2]);

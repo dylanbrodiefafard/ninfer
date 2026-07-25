@@ -1,20 +1,21 @@
-# Linear Q4 直接路由重构设计
+# Linear 直接路由架构与注册规则
 
 ## 状态与范围
 
-本文是 `linear` 顶层 type dispatch 和 Q4 production 路径的当前实现权威。Q4 是后续
-Q5、Q6、W8 可以遵循的完整范例。本文定义当前架构、一次 `linear` 调用的
-流水线、每层唯一职责、当前保留的 Q4 routes、文件所有权、注册新 shape/route 的方式，
-以及已删除旧路径的边界。
+本文是 `linear` 顶层 type dispatch 以及 Q4、Q5、Q6、W8 production 路径的当前实现
+权威。本文定义当前架构、一次 `linear` 调用的流水线、每层唯一职责、各格式 direct
+selector 与 host launcher 的所有权、注册新 shape/route 的方式，以及已删除旧路径的
+边界。
 
-本次范围只改变：
+当前实现已经统一：
 
 - `linear()` 的公共语义校验和按 `w.qtype` 的直接转发边界；
-- pure Q4 Linear 的 route selection、host launcher 和 kernel 组织；
-- 其他 Op 对旧 Q4 plan/launch 私有接口的耦合。
+- pure Q4/Q5/Q6/W8 Linear 的 route selection、host launcher 和 kernel 组织；
+- fused Ops 对旧 pure Linear plan/launch/candidate 私有接口的耦合；
+- BF16 未实现状态的表达。
 
-Q5、Q6 和 W8 的内部 route/plan 重构不在本次范围。它们可以暂时保留现有 type-private
-实现，但不得继续要求 `linear.cpp` 拥有它们的格式细节。NVFP4 也不在本次实现范围。
+`BF16_CTRL` 当前没有 pure Linear kernel 或注册 shape，因此公共 `linear()` 明确拒绝；
+不保留空 selector、admission 或 plan 占位。NVFP4 不在当前实现范围。
 
 ## 1. 冻结目标
 
@@ -231,7 +232,8 @@ default:
 ```
 
 `linear.cpp` 不 include 各格式的 plan header，不读取各格式 layout metadata，也不选择
-schedule。Q5/Q6/W8 可以在各自 dispatcher 后暂时适配旧实现；这不改变顶层所有权。
+schedule。Q4/Q5/Q6/W8 各自的 dispatcher 都直接调用 type-private selector，随后调用
+返回的完整 host launcher。
 
 ### 4.4 L3：Q4 direct selector
 
@@ -790,16 +792,16 @@ private selector test 不分配 device tensor，只保护真实 production regis
 2. 以 `Q4Launch`、六个完整 host launchers 和 direct selector 取代 pure Q4
    problem/admission/legality/plan/execute/candidate 层；
 3. 把 Full/Predicated 和 grid slicing 收入各自 host launcher；
-4. 让 Q5/Q6/W8 通过 type-private dispatcher adapter 接收 policy 和 workspace，同时保留
-   它们当前各自的内部实现；
+4. 让 Q5/Q6/W8 与 Q4 一样通过 type-private direct selector 返回完整 host launcher，
+   不再保留 pure Linear plan/execute/candidate 层；
 5. 让 Attention input、GDN input、GDN conv snapshot 和 LinearSwiGLU 只保留
    fused-local route，不依赖 pure Q4 plan/enum/fixed-pitched launch；
 6. 用 selector registry、public FP64 oracle、alignment、token-slice、CUDA Graph 和 fused
    Op tests 替换旧 Q4 candidate/plan/dispatch tests；
-7. 从 CMake、benchmark source 和 production source 删除旧 Q4 plan/launch/candidate
-   files、symbols 和 forcing options。
+7. 从 CMake、benchmark source 和 production source 删除 Q4/Q5/Q6/W8 旧
+   plan/launch/candidate files、symbols 和 forcing options，并删除 BF16 空占位。
 
-不保留旧接口 alias、compatibility wrapper 或两套并行 Q4 路径。
+不保留旧接口 alias、compatibility wrapper 或任一格式的两套并行路径。
 
 ## 13. 完成条件
 
@@ -821,6 +823,268 @@ Q4 范例只有在以下条件全部满足时完成：
 - 可选 benchmark source 不再引用已删除的 Q4 fixed-candidate API，且本次没有运行
   benchmark。
 
-完成后，Q5、Q6 和 W8 可以分别采用相同的“公共语义校验 → type dispatcher → direct
-selector → 完整 host launcher → kernel”所有权模型，但不得通过为它们建立一个通用
-backend framework 来复用本范例。
+Q5、Q6 和 W8 已分别采用同一所有权模型；相似性止于层次和职责，不通过通用 backend
+framework 共享 selector、route registry 或 runtime plan。
+
+## 14. Q5/Q6/W8/BF16 的当前实现
+
+### 14.1 统一调用形态
+
+Q5、Q6、W8 分别定义自己的 function-pointer type：
+
+```cpp
+using Q5Launch = void (*)(const Tensor&, const Weight&, Tensor&,
+                          WorkspaceArena&, cudaStream_t);
+using Q6Launch = void (*)(const Tensor&, const Weight&, Tensor&,
+                          WorkspaceArena&, cudaStream_t);
+using W8Launch = void (*)(const Tensor&, const Weight&, Tensor&,
+                          WorkspaceArena&, cudaStream_t);
+```
+
+三个 dispatcher 都只有以下行为：
+
+```text
+select_<type>_launch(w.n, w.k, x.ne[1], policy)
+    -> 返回完整 host launcher
+    -> launcher(x, w, out, ws, stream)
+```
+
+`A16Only` 与 `AllowA8` 当前都查询同一 A16 registry；`AllowA8` 是许可 A8，不是要求
+A8。`AllowA4` 对这三种格式均失败。selector 只读取 `(N,K,T,policy)`，不读取 layout、
+payload、padded K、device capability 或 workspace。
+
+`WorkspaceArena&` 即使当前 route 不分配 scratch 也继续保留在 launcher 合同中。
+Full/Predicated、CUDA grid 切分、exact-T switch 和复合 launch 都是选中 launcher 的
+内部实现。
+
+### 14.2 Q5 registry 与物理闭包
+
+Q5 注册以下 exact shape：
+
+- Text/MTP：`(1024,5120)`、`(6144,5120)`、`(7168,5120)`、
+  `(5120,6144)`、`(5120,17408)`，接受每个正整数 T；
+- Vision：`(1152,1152)`、`(1152,4304)`，只接受 `4..131072` 内 4 的倍数。
+
+保留的七个完整 host launcher 是：
+
+- `launch_q5_gemv_r16_s2_x`；
+- `launch_q5_simt_r8_c4`、`launch_q5_simt_r8_c8`；
+- `launch_q5_simt_split2_exact`、`launch_q5_simt_split4_exact`；
+- `launch_q5_mma_r64_c64`、`launch_q5_mma_r64_c128`。
+
+exact T-to-launcher 边界直接写在
+`src/ops/linear/q5/q5_dispatch.cpp::select_q5_a16_launch()`；对应 selector test 逐个保护
+所有 route seams、Vision step domain 和 policy。新增边界只修改这一处 executable
+registry 及其测试，不再建立第二份 support/admission table。
+
+Q5 MMA launcher 在切片前按完整问题选择一次边界实例：
+
+```cpp
+Full = (w.n % 64) == 0 &&
+       (T % TileCols) == 0 &&
+       w.k == w.padded_shape[1] &&
+       (w.k % 64) == 0;
+```
+
+Q5 pure Linear 保留五个 `__global__` kernel definition：
+
+1. `q5_rowsplit_gemv_kernel`；
+2. `q5_rowsplit_gemm_simt_split2_kernel`；
+3. `q5_rowsplit_gemm_simt_split4_kernel`；
+4. `q5_rowsplit_gemm_simt_kernel`；
+5. `q5_rowsplit_gemm_mma_kernel`。
+
+七种 schedule、exact-T 和 Full/Predicated 模板实例不是新增 kernel。
+
+### 14.3 Q6 registry 与物理闭包
+
+Q6 注册：
+
+- `(248320,5120)`：每个正整数 T；
+- `(248320,2048)`：每个正整数 T；
+- `(1152,1536)`：`4..131072` 内 4 的倍数。
+
+保留四个 host launchers：
+
+- `launch_q6_simt_r8_c4`、`launch_q6_simt_r8_c8`；
+- `launch_q6_mma_r64_c64`、`launch_q6_mma_r64_c128`。
+
+exact 边界位于
+`src/ops/linear/q6/q6_dispatch.cpp::select_q6_a16_launch()`，selector test 是它的边界
+保护。SIMT 只有 kernel-private Predicated 实例；MMA 的 Full 判定与 Q5 相同，只把
+`TileCols` 取为 64 或 128。
+
+Q6 pure Linear 只有两个 `__global__` kernel definition：
+
+1. `q6_rowsplit_gemm_simt_kernel`；
+2. `q6_rowsplit_gemm_mma_kernel`。
+
+Q6 没有独立 GEMV kernel；small-T 由 SIMT schedule 执行。
+
+### 14.4 W8 registry
+
+W8 Text/MTP 注册以下 exact shape，均接受每个正整数 T：
+
+```text
+(5120,10240)
+(1024,5120)  (6144,5120)  (14336,5120)  (34816,5120)
+(5120,6144)  (5120,17408)
+(2048,4096)
+(1024,2048)  (9216,2048)  (12288,2048)
+```
+
+Vision 注册：
+
+```text
+(2048,4608)  (4608,4608)  (5120,4608)
+T = 1..32768
+```
+
+DFlash conditioning projection 注册：
+
+```text
+(N,K) = (2048,16384), T >= 1
+```
+
+前三类 shape 的 exact T-to-launcher seam 直接位于
+`src/ops/linear/w8/w8_dispatch.cpp::select_w8_a16_launch()`，并由
+`test_w8_linear_selector.cpp` 保护。W8 不存在独立 runtime schedule enum；route 的
+结果就是 `W8Launch`。
+
+W8 DFlash conditioning route 保留以下 launcher families：
+
+- `T=1`：`launch_w8_decode_r4`；
+- `T=2..32`：`launch_w8_exact_t_splitk`；
+- `T=33..88`：`launch_w8_exact_t_composite`；
+- `T=89..96/97..128/129..144`：medium split-K C96/C128/C144；
+- 其余区间：13 个实际入选的 MMA schedules；
+- 需要消除 MMA padding tail 的区间：八个独立
+  `launch_w8_exact_mma_<R>_<C>` function identities。
+
+八个 exact-MMA launchers 不是 `(schedule, tail_policy)` 组合值。其固定行为是：
+
+1. `full_cols = floor(T / C) * C`；
+2. prefix 使用对应 MMA schedule，并仅依据 `(N,K,full_cols)` 选择自己的
+   Full/Predicated；
+3. `tail=1` 使用 `DecodeR4`；
+4. `tail=2..32` 使用 exact-T split-K；
+5. `tail=33..65` 使用 exact-T composite。
+
+当前 selector 中 exact route 只产生 `tail=1..65`。`launch_w8_exact_t_composite()` 按
+32 列 exact chunks 执行；remainder 1 使用 composite-private `DecodeR16`，remainder
+2..31 使用相应 exact-T 实例。`DecodeR8` 不在 pure Linear 闭包中。
+
+W8 SIMT 边界条件为：
+
+```cpp
+Full = (w.n % 8) == 0 && (T % TileCols) == 0;
+```
+
+W8 MMA 边界条件为：
+
+```cpp
+Full = (w.n % TileRows) == 0 &&
+       (T % TileCols) == 0 &&
+       w.k == w.padded_shape[1] &&
+       (w.k % 64) == 0;
+```
+
+homogeneous launcher 在任何 token slicing 之前只选择一次该实例。exact-tail 的 prefix
+与 tail 是两个有意独立的物理阶段。
+
+W8 pure Linear 保留五个 `__global__` kernel definition：
+
+1. `w8_rowsplit_k16384_decode_kernel`；
+2. `w8_rowsplit_exact_t_splitk_kernel`；
+3. `w8_rowsplit_medium_t_splitk_kernel`；
+4. `w8_rowsplit_gemm_simt_kernel`；
+5. `w8_rowsplit_gemm_mma_kernel`。
+
+pure W8 的物理闭包是 21 种 schedule：DecodeR4、composite-private DecodeR16、
+exact-T split-K、medium split-K C96/C128/C144、SIMT R8C4/R8C8 和 13 种 MMA
+schedule。`SplitKMma32PlusTail` 是 host composition 行为，不是第 22 个 schedule。
+八个 exact-tail launchers 是 host function identities，不是新 schedule 或 kernel。
+
+`w8_k2048_decode_kernel` 由 Attention/GDN 等 fused Ops 复用，不是 pure W8 Linear
+production kernel。`W8Epilogue` 是 kernel-private compile-time epilogue 选择，定义在
+W8 output kernel header 中，不属于 route API。
+
+### 14.5 BF16
+
+当前没有 pure BF16 Linear kernel、host launcher 或注册 shape：
+
+- `linear()` 对 `BF16_CTRL` 返回统一 unsupported error；
+- 不存在 `Bf16Problem`、`bf16_contiguous_admits()`、空 plan 或必然抛错的 private
+  dispatcher；
+- 测试从 public `linear()` 验证一个受支持语义形状的 BF16 weight 仍被拒绝。
+
+以后只有在同时具备 exact registered shape、已选 host launcher、真实 kernel 和数值
+测试时，才增加 `select_bf16_launch(N,K,T,policy) -> Bf16Launch`。
+
+### 14.6 Fused Op 所有权
+
+fused Op 可以复用同一格式的 kernel templates 和 schedule types，但拥有自己的语义
+route、output topology、epilogue、workspace 与 composite launch。它们不嵌入或调用
+pure Linear 的 plan、schedule enum、variant、candidate legality 或 selector。
+
+当前具体边界是：
+
+- Q5 LinearAdd 的 Materialized route 直接调用 public `linear()` 后执行
+  `residual_add()`；两个 fused MMA launchers 自己选择 Full；
+- Q4/Q5 Attention input 的 small-T fused launcher 内部直接选择 Q5 GEMV、
+  Split4Exact 或 R8C4；
+- Q4/Q5 GDN input 的 pitched-output launcher内部直接选择 Q5 GEMV、Split4Exact 或
+  R8C8；pitched `out_ld` 不反向进入 pure Q5 API；
+- Q4/Q5 GDN conv snapshot 直接实例化所需的 Q5 GEMV/SIMT templates；
+- W8 Attention、GDN、LinearAdd 和 LinearSwiGLU 的 plan 只保留各自 schedule/workspace，
+  Full/Predicated 在其 host launcher 内选择；
+- W8 LinearPair 的 TwoSimt launcher 由 LinearPair 自己实例化 SIMT template，不能改成
+  public `linear()`，因为 Pair 与 pure Linear 在部分 T 区间有不同 winner；
+- LinearPair 的 homogeneous 与 exact routes 是不同 fused-local schedule identities；
+  exact prefix 与 tail 分别决定物理边界实例。
+
+benchmark-only、且其 parent/materialized shape 不在 pure W8 registry 的 control 已删除，
+没有通过扩大 pure registry 来保留诊断入口。
+
+### 14.7 已删除的层与文件
+
+Q5、Q6、W8 pure Linear 均不再拥有：
+
+- `<Type>Problem`、独立 admission 和 support/route spec；
+- runtime `<Type>ScheduleId`、`<Type>KernelVariant` 和 `W8TailPolicy`；
+- `<Type>Plan`、resolve-plan、execute-plan；
+- fixed/candidate launch、candidate legality 和字符串 schedule API。
+
+对应 `*_rowsplit_plan.{h,cpp}`、`*_rowsplit_launch.{h,cpp}`、
+`*_rowsplit_kernels.h` 已从源码和 CMake 删除。BF16 的
+`bf16_contiguous_plan.{h,cpp}` 同样删除。
+
+### 14.8 注册新 shape 或 route
+
+注册新 shape：
+
+1. 在 exact target 中确认真实 `(N,K)`、T domain 和调用 policy；
+2. 确认它使用该 type 已有固定 storage format；
+3. 在 `select_<type>_a16_launch()` 的 exact `(K,N)` case 中写入已决定的
+   T-to-launcher 映射；
+4. 为每个 seam、step-domain 非法点和 policy 增加 selector test；
+5. 为实际 launcher 增加可执行的独立 FP64 oracle point。
+
+注册新 route 的最小单位是完整 host launcher。它必须封装 schedule、Full/Predicated、
+grid、slicing 和 exact/composite 行为，然后由 selector 直接返回 function pointer。
+不得给 launch result 增加 schedule、variant、tail-policy、workspace bytes、name 或
+`actual_compute` 字段。
+
+### 14.9 验收边界
+
+该重构只以 build 和 tests 验收，不运行 benchmark，也不重新选择 route winner。当前
+保护包括：
+
+- Q4/Q5/Q6/W8 host-only selector registry tests；
+- public Linear 独立数值 oracle、alignment、policy 和 unsupported BF16；
+- Q5 LinearAdd、Q4/Q5/W8 Attention/GDN、W8 LinearAdd/LinearSwiGLU/LinearPair 等
+  fused 路径；
+- benchmark targets 的编译兼容，但没有 fixed schedule/variant forcing。
+
+不可实际分配的最大 Vision case 只验证 selector domain；不伪造无法执行的 CUDA 数值
+场景。

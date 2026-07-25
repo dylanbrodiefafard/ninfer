@@ -79,7 +79,7 @@ void launch_decode(const Tensor& x, const Weight& w, Tensor& residual_out, cudaS
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <int ColsPerTile, W8KernelVariant Variant>
+template <int ColsPerTile, bool Full>
 void launch_tt(const __nv_bfloat16* x, const std::uint8_t* codes, const std::uint8_t* scales,
                __nv_bfloat16* residual_out, std::int32_t rows, std::int32_t k, std::int32_t cols,
                std::int32_t padded_k, std::int32_t full_slabs, cudaStream_t stream) {
@@ -87,13 +87,13 @@ void launch_tt(const __nv_bfloat16* x, const std::uint8_t* codes, const std::uin
     const dim3 grid(static_cast<unsigned>(div_up(rows, kRowsPerBlock)),
                     static_cast<unsigned>(div_up(cols, ColsPerTile)), 1u);
     const W8ContiguousOutput output{residual_out, rows};
-    w8_rowsplit_gemm_simt_kernel<W8RowSplitSimtSchedule, ColsPerTile, kRowsPerBlock, kStages,
-                                 Variant, W8Epilogue::Residual><<<grid, kThreads, 0, stream>>>(
+    w8_rowsplit_gemm_simt_kernel<W8RowSplitSimtSchedule, ColsPerTile, kRowsPerBlock, kStages, Full,
+                                 W8Epilogue::Residual><<<grid, kThreads, 0, stream>>>(
         x, codes, scales, output, rows, k, cols, padded_k, full_slabs);
 }
 
 template <int ColsPerTile>
-void launch_variant(W8KernelVariant variant, const Tensor& x, const Weight& w, Tensor& residual_out,
+void launch_variant(bool full, const Tensor& x, const Weight& w, Tensor& residual_out,
                     cudaStream_t stream) {
     const auto* xp       = static_cast<const __nv_bfloat16*>(x.data);
     const bool aligned_x = (x.ne[0] % 8) == 0 && (reinterpret_cast<std::uintptr_t>(xp) & 0xfu) == 0;
@@ -102,19 +102,12 @@ void launch_variant(W8KernelVariant variant, const Tensor& x, const Weight& w, T
     const auto* scales            = static_cast<const std::uint8_t*>(w.scales);
     auto* out                     = static_cast<__nv_bfloat16*>(residual_out.data);
 
-    switch (variant) {
-    case W8KernelVariant::Full:
-        launch_tt<ColsPerTile, W8KernelVariant::Full>(xp, codes, scales, out, residual_out.ne[0],
-                                                      x.ne[0], x.ne[1], w.padded_shape[1],
-                                                      full_slabs, stream);
-        break;
-    case W8KernelVariant::Predicated:
-        launch_tt<ColsPerTile, W8KernelVariant::Predicated>(xp, codes, scales, out,
-                                                            residual_out.ne[0], x.ne[0], x.ne[1],
-                                                            w.padded_shape[1], full_slabs, stream);
-        break;
-    case W8KernelVariant::None:
-        throw std::invalid_argument("w8 linear_add SIMT requires Full or Predicated variant");
+    if (full) {
+        launch_tt<ColsPerTile, true>(xp, codes, scales, out, residual_out.ne[0], x.ne[0], x.ne[1],
+                                     w.padded_shape[1], full_slabs, stream);
+    } else {
+        launch_tt<ColsPerTile, false>(xp, codes, scales, out, residual_out.ne[0], x.ne[0], x.ne[1],
+                                      w.padded_shape[1], full_slabs, stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -136,14 +129,14 @@ void w8_linear_add_decode_r16_launch(const Tensor& x, const Weight& w, Tensor& r
     launch_decode<16>(x, w, residual_out, stream);
 }
 
-void w8_linear_add_simt_r8_c4_launch(W8KernelVariant variant, const Tensor& x, const Weight& w,
+void w8_linear_add_simt_r8_c4_launch(bool full, const Tensor& x, const Weight& w,
                                      Tensor& residual_out, cudaStream_t stream) {
-    launch_variant<4>(variant, x, w, residual_out, stream);
+    launch_variant<4>(full, x, w, residual_out, stream);
 }
 
-void w8_linear_add_simt_r8_c8_launch(W8KernelVariant variant, const Tensor& x, const Weight& w,
+void w8_linear_add_simt_r8_c8_launch(bool full, const Tensor& x, const Weight& w,
                                      Tensor& residual_out, cudaStream_t stream) {
-    launch_variant<8>(variant, x, w, residual_out, stream);
+    launch_variant<8>(full, x, w, residual_out, stream);
 }
 
 } // namespace ninfer::ops::detail

@@ -766,9 +766,11 @@ this contract; that composition requires a fused semantic Op.
   `T=1..16`, all output row seams, W8 group seams, guards and full writes, preserved input and
   packed weight, Graph replay at `T=2/16`, sampled FP64 exact-decode projections throughout, and
   one complete FP64 exact-decode comparison of every Q/K/V element.
-- `ninfer_w8_input_proj_bench --op companion-attention` retains decode, exact/medium split-K,
-  SIMT, eight MMA tile candidates, parent Linear, and parent-plus-three-extract controls. The
-  production sweep covers every `T=1..16` and every dispatch seam through prefill `T=1024`.
+- `ninfer_w8_input_proj_bench --op companion-attention` retains production dispatch and the
+  fused-local decode, exact/medium split-K, SIMT, and eight MMA tile launchers. Unsupported parent
+  Linear and parent-plus-three-extract controls were removed after route selection rather than
+  expanding the pure W8 registry. The production sweep covers every `T=1..16` and every dispatch
+  seam through prefill `T=1024`.
   Selected direct routes are decode at `T=1`, exact or medium split-K Tensor Core at `T=2..96`,
   and measured Tensor Core MMA tile schedules above 96. The critical small-T transition is
   15.14/17.70 us at `T=16/17`, replacing the former 14.3/42.2 us cliff.

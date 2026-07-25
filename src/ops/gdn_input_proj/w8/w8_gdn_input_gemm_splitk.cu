@@ -354,11 +354,8 @@ constexpr auto kSnapshotLaunchers = make_snapshot_launchers(
 
 } // namespace
 
-void w8_gdn_input_splitk_mma_launch(W8KernelVariant variant, const Tensor& x, const Weight& weight,
-                                    Tensor& qkv, Tensor& z, cudaStream_t stream) {
-    if (variant != W8KernelVariant::None) {
-        throw std::invalid_argument("W8 GDN split-K MMA requires the exact direct variant");
-    }
+void w8_gdn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                    cudaStream_t stream) {
     const std::int32_t cols = x.ne[1];
     if (cols < kFirstExactCols || cols > 96) {
         throw std::invalid_argument("W8 GDN split-K MMA requires T=2..96");

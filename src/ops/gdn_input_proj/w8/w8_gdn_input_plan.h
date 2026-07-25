@@ -1,7 +1,6 @@
 #pragma once
 
 #include "core/tensor.h"
-#include "ops/linear/w8/w8_rowsplit_launch.h"
 
 #include <cuda_runtime.h>
 
@@ -33,7 +32,6 @@ struct W8GdnInputProblem {
 
 struct W8GdnInputPlan {
     W8GdnInputScheduleId schedule;
-    W8KernelVariant variant;
     std::size_t workspace_bytes;
 };
 

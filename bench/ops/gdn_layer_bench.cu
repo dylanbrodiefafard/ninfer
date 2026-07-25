@@ -73,7 +73,6 @@ struct Options {
     std::string qk_norm      = "fused";
     std::string norm_control = "fused";
     std::string gated_rms    = "auto";
-    std::string output_route = "auto";
     std::string csv_out;
 };
 
@@ -248,17 +247,11 @@ Options parse_options(int argc, char** argv) {
             if (options.gated_rms != "auto" && options.gated_rms != "dv10-b1024") {
                 throw std::invalid_argument("--gated-rms-route must be auto or dv10-b1024");
             }
-        } else if (arg == "--output-route") {
-            options.output_route = next("--output-route value");
-            if (options.output_route != "auto" && options.output_route != "dv08-control") {
-                throw std::invalid_argument("--output-route must be auto or dv08-control");
-            }
         } else if (arg == "--help" || arg == "-h") {
             std::printf("Usage: %s [--t-sweep 1,2,...,16] [--warmup N] [--repeat N] "
                         "[--flush-mib N] [--route fused|composed] "
                         "[--qk-norm fused|composed] [--norm-control fused|composed] "
                         "[--gated-rms-route auto|dv10-b1024] "
-                        "[--output-route auto|dv08-control] "
                         "[--csv-out PATH]\n",
                         argv[0]);
             std::exit(0);
@@ -509,16 +502,8 @@ Result run_case(Resources& resources, bench::DBuf& flush, cudaStream_t stream,
                                kEps, gated_out, s);
         }
         const Tensor output_input = gated_out.view({kValueRows, tokens});
-        if (options.output_route == "dv08-control") {
-            const auto variant = tokens % 4 == 0 ? ops::detail::W8KernelVariant::Full
-                                                 : ops::detail::W8KernelVariant::Predicated;
-            ops::detail::w8_linear_add_launch_candidate(
-                ops::detail::W8ScheduleId::SimtR8C4, variant, output_input,
-                resources.output_weight.weight, residual, s);
-        } else {
-            ops::linear_add(output_input, resources.output_weight.weight, residual,
-                            resources.workspace, s);
-        }
+        ops::linear_add(output_input, resources.output_weight.weight, residual, resources.workspace,
+                        s);
     };
 
     // Resolve lazy function attributes and validate the complete production route before capture.
@@ -556,10 +541,7 @@ Result run_case(Resources& resources, bench::DBuf& flush, cudaStream_t stream,
                 : ops::detail::bf16_gdn_gating_schedule_name(control_plan.schedule),
             options.gated_rms == "dv10-b1024" ? "gated_rms.candidate.warp_bf16x2_b1024"
                                               : "gated_rms.production",
-            options.output_route == "dv08-control"
-                ? std::string("dv08_control.") +
-                      ops::detail::w8_schedule_name(ops::detail::W8ScheduleId::SimtR8C4)
-                : ops::detail::w8_linear_add_schedule_name(output_plan.schedule),
+            ops::detail::w8_linear_add_schedule_name(output_plan.schedule),
             timing};
 }
 

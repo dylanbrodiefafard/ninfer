@@ -1,12 +1,11 @@
 #pragma once
 
-#include "ops/linear/q5/q5_rowsplit_plan.h"
+#include "core/tensor.h"
 
 #include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
-#include <optional>
 
 namespace ninfer::ops::detail {
 
@@ -25,7 +24,6 @@ struct Q4Q5AttnInputProblem {
 
 struct Q4Q5AttnInputPlan {
     Q4Q5AttnInputScheduleId schedule;
-    std::optional<Q5Plan> parent_gate_value;
     std::size_t workspace_bytes;
 };
 

@@ -1,7 +1,7 @@
-#include "ops/linear/q5/q5_rowsplit_kernels.h"
-
 #include "core/device.h"
 #include "ops/common/math.h"
+#include "ops/common/token_slices.h"
+#include "ops/linear/q5/q5_launch.h"
 #include "ops/linear/q5/q5_rowsplit_gemm_simt.cuh"
 
 #include <cuda_bf16.h>
@@ -35,6 +35,15 @@ void launch_simt(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t str
                                         static_cast<__nv_bfloat16*>(out.data), nullptr, rows,
                                         out_ld, k, cols, padded_k, full_slabs);
     CUDA_CHECK(cudaGetLastError());
+}
+
+template <int ColsPerTile>
+void launch_simt_route(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    for_each_token_slice(x.ne[1], ColsPerTile, [&](std::int32_t offset, std::int32_t count) {
+        const Tensor x_slice = x.slice(1, offset, count);
+        Tensor out_slice     = out.slice(1, offset, count);
+        launch_simt<ColsPerTile>(x_slice, w, out_slice, stream);
+    });
 }
 
 template <int Cols, int FullSlabs, int Stride>
@@ -98,25 +107,29 @@ void dispatch_exact_cols(std::int32_t cols, Launch&& launch) {
 
 } // namespace
 
-void q5_rowsplit_simt_r8_c4_launch(const Tensor& x, const Weight& w, Tensor& out,
-                                   cudaStream_t stream) {
-    launch_simt<4>(x, w, out, stream);
+void launch_q5_simt_r8_c4(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+                          cudaStream_t stream) {
+    (void)ws;
+    launch_simt_route<4>(x, w, out, stream);
 }
 
-void q5_rowsplit_simt_r8_c8_launch(const Tensor& x, const Weight& w, Tensor& out,
-                                   cudaStream_t stream) {
-    launch_simt<8>(x, w, out, stream);
+void launch_q5_simt_r8_c8(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+                          cudaStream_t stream) {
+    (void)ws;
+    launch_simt_route<8>(x, w, out, stream);
 }
 
-void q5_rowsplit_simt_split2_exact_launch(const Tensor& x, const Weight& w, Tensor& out,
-                                          cudaStream_t stream) {
+void launch_q5_simt_split2_exact(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+                                 cudaStream_t stream) {
+    (void)ws;
     dispatch_exact_cols(x.ne[1],
                         [&]<int Cols>() { dispatch_split2_cols<Cols>(x, w, out, stream); });
     CUDA_CHECK(cudaGetLastError());
 }
 
-void q5_rowsplit_simt_split4_exact_launch(const Tensor& x, const Weight& w, Tensor& out,
-                                          cudaStream_t stream) {
+void launch_q5_simt_split4_exact(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+                                 cudaStream_t stream) {
+    (void)ws;
     dispatch_exact_cols(x.ne[1], [&]<int Cols>() { launch_split4<Cols>(x, w, out, stream); });
     CUDA_CHECK(cudaGetLastError());
 }

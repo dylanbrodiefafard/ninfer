@@ -16,13 +16,11 @@ using ninfer::ops::detail::Q4Q5AttnInputProblem;
 using ninfer::ops::detail::Q4Q5AttnInputScheduleId;
 using ninfer::ops::detail::Q4Q5GdnInputProblem;
 using ninfer::ops::detail::Q4Q5GdnInputScheduleId;
-using ninfer::ops::detail::Q5ScheduleId;
 using ninfer::ops::detail::W8AttnInputProblem;
 using ninfer::ops::detail::W8AttnInputScheduleId;
 using ninfer::ops::detail::W8GdnInputProblem;
 using ninfer::ops::detail::W8GdnInputScheduleId;
 using ninfer::ops::detail::W8GdnInputSnapshotScheduleId;
-using ninfer::ops::detail::W8KernelVariant;
 
 int failures = 0;
 
@@ -46,21 +44,8 @@ void attn_route_tests() {
         const auto expected     = parent_split
                                       ? Q4Q5AttnInputScheduleId::ParentSplitFixed
                                       : Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR64C128;
-        if (plan.schedule != expected || plan.parent_gate_value.has_value() != parent_split ||
-            plan.workspace_bytes != 0) {
+        if (plan.schedule != expected || plan.workspace_bytes != 0) {
             std::cerr << "wrong attention input route C=" << cols << '\n';
-            ++failures;
-        }
-    }
-    for (std::int32_t cols = 1; cols <= 16; ++cols) {
-        const auto plan =
-            ninfer::ops::detail::q4_q5_attn_input_resolve_plan({5120, 6144, 1024, 5120, cols});
-        const Q5ScheduleId expected_q5 =
-            cols == 1 ? Q5ScheduleId::GemvR16S2X
-                      : (cols <= 6 ? Q5ScheduleId::SimtSplit4Exact : Q5ScheduleId::SimtR8C4);
-        if (!plan.parent_gate_value.has_value() ||
-            plan.parent_gate_value->schedule != expected_q5) {
-            std::cerr << "wrong Attention parent Q5 route C=" << cols << '\n';
             ++failures;
         }
     }
@@ -82,19 +67,9 @@ void gdn_route_tests() {
         const bool independent = cols <= 16;
         const auto expected    = independent ? Q4Q5GdnInputScheduleId::IndependentDirectFixed
                                              : Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128;
-        if (plan.schedule != expected || plan.independent_value.has_value() != independent ||
-            plan.workspace_bytes != 0) {
+        if (plan.schedule != expected || plan.workspace_bytes != 0) {
             std::cerr << "wrong GDN input route C=" << cols << '\n';
             ++failures;
-        }
-        if (independent) {
-            const Q5ScheduleId expected_q5 =
-                cols == 1 ? Q5ScheduleId::GemvR16S2X
-                          : (cols <= 6 ? Q5ScheduleId::SimtSplit4Exact : Q5ScheduleId::SimtR8C8);
-            if (plan.independent_value->schedule != expected_q5) {
-                std::cerr << "wrong GDN independent Q5 route C=" << cols << '\n';
-                ++failures;
-            }
         }
     }
     expect_invalid("GDN C0", [] {
@@ -109,65 +84,63 @@ void w8_attn_route_tests() {
     struct Case {
         std::int32_t cols;
         W8AttnInputScheduleId schedule;
-        W8KernelVariant variant;
     };
 
     constexpr std::array<Case, 23> target_cases{{
-        {1, W8AttnInputScheduleId::DecodeR8Direct, W8KernelVariant::None},
-        {2, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {3, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {4, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {5, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {6, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {7, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {8, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {9, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {10, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {11, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {12, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {13, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {14, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {15, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {16, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {17, W8AttnInputScheduleId::MmaR32C128, W8KernelVariant::Predicated},
-        {127, W8AttnInputScheduleId::MmaR32C128, W8KernelVariant::Predicated},
-        {128, W8AttnInputScheduleId::MmaR32C128, W8KernelVariant::Full},
-        {129, W8AttnInputScheduleId::MmaR64C128, W8KernelVariant::Predicated},
-        {256, W8AttnInputScheduleId::MmaR64C128, W8KernelVariant::Full},
-        {1024, W8AttnInputScheduleId::MmaR64C128, W8KernelVariant::Full},
-        {2048, W8AttnInputScheduleId::MmaR64C128, W8KernelVariant::Full},
+        {1, W8AttnInputScheduleId::DecodeR8Direct},
+        {2, W8AttnInputScheduleId::SplitKMmaDirect},
+        {3, W8AttnInputScheduleId::SplitKMmaDirect},
+        {4, W8AttnInputScheduleId::SplitKMmaDirect},
+        {5, W8AttnInputScheduleId::SplitKMmaDirect},
+        {6, W8AttnInputScheduleId::SplitKMmaDirect},
+        {7, W8AttnInputScheduleId::SplitKMmaDirect},
+        {8, W8AttnInputScheduleId::SplitKMmaDirect},
+        {9, W8AttnInputScheduleId::SplitKMmaDirect},
+        {10, W8AttnInputScheduleId::SplitKMmaDirect},
+        {11, W8AttnInputScheduleId::SplitKMmaDirect},
+        {12, W8AttnInputScheduleId::SplitKMmaDirect},
+        {13, W8AttnInputScheduleId::SplitKMmaDirect},
+        {14, W8AttnInputScheduleId::SplitKMmaDirect},
+        {15, W8AttnInputScheduleId::SplitKMmaDirect},
+        {16, W8AttnInputScheduleId::SplitKMmaDirect},
+        {17, W8AttnInputScheduleId::MmaR32C128},
+        {127, W8AttnInputScheduleId::MmaR32C128},
+        {128, W8AttnInputScheduleId::MmaR32C128},
+        {129, W8AttnInputScheduleId::MmaR64C128},
+        {256, W8AttnInputScheduleId::MmaR64C128},
+        {1024, W8AttnInputScheduleId::MmaR64C128},
+        {2048, W8AttnInputScheduleId::MmaR64C128},
     }};
     constexpr std::array<Case, 23> companion_cases{{
-        {1, W8AttnInputScheduleId::DecodeR8Direct, W8KernelVariant::None},
-        {2, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {16, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {32, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {96, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {97, W8AttnInputScheduleId::MmaR32C64, W8KernelVariant::Predicated},
-        {192, W8AttnInputScheduleId::MmaR32C64, W8KernelVariant::Full},
-        {193, W8AttnInputScheduleId::MmaR64C96, W8KernelVariant::Predicated},
-        {288, W8AttnInputScheduleId::MmaR64C96, W8KernelVariant::Full},
-        {289, W8AttnInputScheduleId::MmaR64C64, W8KernelVariant::Predicated},
-        {320, W8AttnInputScheduleId::MmaR64C64, W8KernelVariant::Full},
-        {321, W8AttnInputScheduleId::MmaR64C128, W8KernelVariant::Predicated},
-        {384, W8AttnInputScheduleId::MmaR64C128, W8KernelVariant::Full},
-        {385, W8AttnInputScheduleId::MmaR128C64, W8KernelVariant::Predicated},
-        {448, W8AttnInputScheduleId::MmaR128C64, W8KernelVariant::Full},
-        {449, W8AttnInputScheduleId::MmaR128C80, W8KernelVariant::Predicated},
-        {480, W8AttnInputScheduleId::MmaR128C80, W8KernelVariant::Full},
-        {481, W8AttnInputScheduleId::MmaR128C80, W8KernelVariant::Predicated},
-        {512, W8AttnInputScheduleId::MmaR128C80, W8KernelVariant::Predicated},
-        {560, W8AttnInputScheduleId::MmaR128C80, W8KernelVariant::Full},
-        {561, W8AttnInputScheduleId::MmaR64C128, W8KernelVariant::Predicated},
-        {1024, W8AttnInputScheduleId::MmaR64C128, W8KernelVariant::Full},
-        {2048, W8AttnInputScheduleId::MmaR64C128, W8KernelVariant::Full},
+        {1, W8AttnInputScheduleId::DecodeR8Direct},
+        {2, W8AttnInputScheduleId::SplitKMmaDirect},
+        {16, W8AttnInputScheduleId::SplitKMmaDirect},
+        {32, W8AttnInputScheduleId::SplitKMmaDirect},
+        {96, W8AttnInputScheduleId::SplitKMmaDirect},
+        {97, W8AttnInputScheduleId::MmaR32C64},
+        {192, W8AttnInputScheduleId::MmaR32C64},
+        {193, W8AttnInputScheduleId::MmaR64C96},
+        {288, W8AttnInputScheduleId::MmaR64C96},
+        {289, W8AttnInputScheduleId::MmaR64C64},
+        {320, W8AttnInputScheduleId::MmaR64C64},
+        {321, W8AttnInputScheduleId::MmaR64C128},
+        {384, W8AttnInputScheduleId::MmaR64C128},
+        {385, W8AttnInputScheduleId::MmaR128C64},
+        {448, W8AttnInputScheduleId::MmaR128C64},
+        {449, W8AttnInputScheduleId::MmaR128C80},
+        {480, W8AttnInputScheduleId::MmaR128C80},
+        {481, W8AttnInputScheduleId::MmaR128C80},
+        {512, W8AttnInputScheduleId::MmaR128C80},
+        {560, W8AttnInputScheduleId::MmaR128C80},
+        {561, W8AttnInputScheduleId::MmaR64C128},
+        {1024, W8AttnInputScheduleId::MmaR64C128},
+        {2048, W8AttnInputScheduleId::MmaR64C128},
     }};
     const auto check_cases = [&](const auto& cases, W8AttnInputProblem problem) {
         for (const Case test : cases) {
             problem.cols    = test.cols;
             const auto plan = ninfer::ops::detail::w8_attn_input_resolve_plan(problem);
-            if (plan.schedule != test.schedule || plan.variant != test.variant ||
-                plan.workspace_bytes != 0) {
+            if (plan.schedule != test.schedule || plan.workspace_bytes != 0) {
                 std::cerr << "wrong W8 attention input route rows=" << problem.parent_rows
                           << " C=" << test.cols << '\n';
                 ++failures;
@@ -191,33 +164,31 @@ void w8_gdn_route_tests() {
     struct Case {
         std::int32_t cols;
         W8GdnInputScheduleId schedule;
-        W8KernelVariant variant;
     };
 
     constexpr std::array<Case, 17> cases{{
-        {1, W8GdnInputScheduleId::DecodeR8Direct, W8KernelVariant::None},
-        {2, W8GdnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {4, W8GdnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {16, W8GdnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {17, W8GdnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {32, W8GdnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {33, W8GdnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {48, W8GdnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {49, W8GdnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {64, W8GdnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {65, W8GdnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {96, W8GdnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
-        {97, W8GdnInputScheduleId::MmaR64C128, W8KernelVariant::Predicated},
-        {127, W8GdnInputScheduleId::MmaR64C128, W8KernelVariant::Predicated},
-        {128, W8GdnInputScheduleId::MmaR64C128, W8KernelVariant::Full},
-        {129, W8GdnInputScheduleId::MmaR64C128, W8KernelVariant::Predicated},
-        {1024, W8GdnInputScheduleId::MmaR64C128, W8KernelVariant::Full},
+        {1, W8GdnInputScheduleId::DecodeR8Direct},
+        {2, W8GdnInputScheduleId::SplitKMmaDirect},
+        {4, W8GdnInputScheduleId::SplitKMmaDirect},
+        {16, W8GdnInputScheduleId::SplitKMmaDirect},
+        {17, W8GdnInputScheduleId::SplitKMmaDirect},
+        {32, W8GdnInputScheduleId::SplitKMmaDirect},
+        {33, W8GdnInputScheduleId::SplitKMmaDirect},
+        {48, W8GdnInputScheduleId::SplitKMmaDirect},
+        {49, W8GdnInputScheduleId::SplitKMmaDirect},
+        {64, W8GdnInputScheduleId::SplitKMmaDirect},
+        {65, W8GdnInputScheduleId::SplitKMmaDirect},
+        {96, W8GdnInputScheduleId::SplitKMmaDirect},
+        {97, W8GdnInputScheduleId::MmaR64C128},
+        {127, W8GdnInputScheduleId::MmaR64C128},
+        {128, W8GdnInputScheduleId::MmaR64C128},
+        {129, W8GdnInputScheduleId::MmaR64C128},
+        {1024, W8GdnInputScheduleId::MmaR64C128},
     }};
     for (const Case test : cases) {
         const W8GdnInputProblem problem{2048, 8192, 4096, 12288, 2048, test.cols};
         const auto plan = ninfer::ops::detail::w8_gdn_input_resolve_plan(problem);
-        if (plan.schedule != test.schedule || plan.variant != test.variant ||
-            plan.workspace_bytes != 0) {
+        if (plan.schedule != test.schedule || plan.workspace_bytes != 0) {
             std::cerr << "wrong W8 GDN input route C=" << test.cols << '\n';
             ++failures;
         }

@@ -1,7 +1,6 @@
 // Cold-cache per-Op measurement rig for native row-split low-bit Linear,
 // LinearAdd, LinearPair, and LinearSwiGLU contracts. Production modes dispatch
-// through their semantic ninfer::ops entry points; fixed-candidate modes remain
-// implementation diagnostics for Q5/Q6/W8 base Linear and W8 LinearAdd routes.
+// through their semantic ninfer::ops entry points.
 //
 // Examples:
 //   ./build/bench/ninfer_linear_op_bench --all-targets --csv-out profiles/ncu/linear-baseline.csv
@@ -16,12 +15,9 @@
 #include "core/device.h"
 #include "ninfer_bench_common.h"
 #include "ops/linear/q4/q4_dispatch.h"
-#include "ops/linear/q5/q5_rowsplit_launch.h"
-#include "ops/linear/q5/q5_rowsplit_plan.h"
-#include "ops/linear/q6/q6_rowsplit_launch.h"
-#include "ops/linear/q6/q6_rowsplit_plan.h"
-#include "ops/linear/w8/w8_rowsplit_launch.h"
-#include "ops/linear/w8/w8_rowsplit_plan.h"
+#include "ops/linear/q5/q5_dispatch.h"
+#include "ops/linear/q6/q6_dispatch.h"
+#include "ops/linear/w8/w8_dispatch.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 #include "ops/linear_add/w8/w8_linear_add_plan.h"
 #include "ops/linear_pair/w8/w8_pair_plan.h"
@@ -88,14 +84,6 @@ struct TargetSpec {
     QType qtype;
 };
 
-enum class CandidateKind {
-    Auto,
-    Q5Fixed,
-    Q6Fixed,
-    W8Fixed,
-    W8PairFixed,
-};
-
 constexpr ShapeSpec kShapes[] = {
     {"MtpFc5120x10240", 5120, 10240},
     {"MtpKV1024x5120", 1024, 5120},
@@ -152,38 +140,25 @@ constexpr TargetSpec kTask2Targets[] = {
 };
 
 struct Options {
-    bool all_targets                               = true;
-    bool have_shape                                = false;
-    bool have_qtype                                = false;
-    bool paired_kv                                 = false;
-    bool paired_composed                           = false;
-    bool linear_add                                = false;
-    bool linear_swiglu                             = false;
-    bool have_rows                                 = false;
-    bool have_k                                    = false;
-    ShapeSpec shape                                = kTask2Targets[0].shape;
-    QType qtype                                    = kTask2Targets[0].qtype;
-    std::int32_t rows                              = 0;
-    std::int32_t k                                 = 0;
-    CandidateKind candidate                        = CandidateKind::Auto;
-    ops::detail::Q5ScheduleId q5_schedule          = ops::detail::Q5ScheduleId::SimtR8C4;
-    ops::detail::Q5KernelVariant q5_variant        = ops::detail::Q5KernelVariant::Predicated;
-    bool q5_variant_auto                           = true;
-    ops::detail::Q6ScheduleId q6_schedule          = ops::detail::Q6ScheduleId::SimtR8C4;
-    ops::detail::Q6KernelVariant q6_variant        = ops::detail::Q6KernelVariant::Predicated;
-    bool q6_variant_auto                           = true;
-    ops::detail::W8ScheduleId w8_schedule          = ops::detail::W8ScheduleId::SimtR8C4;
-    ops::detail::W8PairScheduleId w8_pair_schedule = ops::detail::W8PairScheduleId::DualMmaR32C128;
-    ops::detail::W8KernelVariant w8_variant        = ops::detail::W8KernelVariant::Predicated;
-    bool w8_variant_auto                           = true;
-    bool w8_conditioning_exact_tail                = false;
-    bool w8_pair_exact_tail                        = false;
-    int warmup                                     = kDefaultWarmup;
-    int repeat                                     = kDefaultRepeat;
-    int copy_repeat                                = kDefaultCopyRepeat;
-    std::uint64_t flush_bytes                      = kDefaultFlushBytes;
-    std::uint64_t copy_bytes                       = kDefaultCopyBytes;
-    double stream_ceiling_gbs                      = 0.0;
+    bool all_targets          = true;
+    bool have_shape           = false;
+    bool have_qtype           = false;
+    bool paired_kv            = false;
+    bool paired_composed      = false;
+    bool linear_add           = false;
+    bool linear_swiglu        = false;
+    bool have_rows            = false;
+    bool have_k               = false;
+    ShapeSpec shape           = kTask2Targets[0].shape;
+    QType qtype               = kTask2Targets[0].qtype;
+    std::int32_t rows         = 0;
+    std::int32_t k            = 0;
+    int warmup                = kDefaultWarmup;
+    int repeat                = kDefaultRepeat;
+    int copy_repeat           = kDefaultCopyRepeat;
+    std::uint64_t flush_bytes = kDefaultFlushBytes;
+    std::uint64_t copy_bytes  = kDefaultCopyBytes;
+    double stream_ceiling_gbs = 0.0;
     std::vector<int> t_sweep; // activation columns to sweep; empty => default set
     std::string csv_out;
 };
@@ -420,19 +395,75 @@ const char* q4_launch_name(ops::detail::Q4Launch launch) {
     throw std::invalid_argument("unknown Q4 host launcher");
 }
 
-ops::detail::Q5Plan resolve_auto_q5_plan(const ShapeSpec& shape, std::int32_t t) {
-    const auto padded_k = static_cast<std::int32_t>(align_up_u64(shape.k, 128));
-    return ops::detail::q5_rowsplit_resolve_plan({shape.n, shape.k, padded_k, t});
+ops::detail::Q5Launch resolve_auto_q5_launch(const ShapeSpec& shape, std::int32_t t) {
+    return ops::detail::select_q5_a16_launch(shape.n, shape.k, t);
 }
 
-ops::detail::Q6Plan resolve_auto_q6_plan(const ShapeSpec& shape, std::int32_t t) {
-    const auto padded_k = static_cast<std::int32_t>(align_up_u64(shape.k, 128));
-    return ops::detail::q6_rowsplit_resolve_plan({shape.n, shape.k, padded_k, t});
+const char* q5_launch_name(ops::detail::Q5Launch launch) {
+    if (launch == ops::detail::launch_q5_gemv_r16_s2_x) { return "linear.q5.gemv.r16_s2_x"; }
+    if (launch == ops::detail::launch_q5_simt_r8_c4) { return "linear.q5.simt.r8_c4"; }
+    if (launch == ops::detail::launch_q5_simt_r8_c8) { return "linear.q5.simt.r8_c8"; }
+    if (launch == ops::detail::launch_q5_simt_split2_exact) {
+        return "linear.q5.simt.split2_exact";
+    }
+    if (launch == ops::detail::launch_q5_simt_split4_exact) {
+        return "linear.q5.simt.split4_exact";
+    }
+    if (launch == ops::detail::launch_q5_mma_r64_c64) { return "linear.q5.mma.r64_c64"; }
+    if (launch == ops::detail::launch_q5_mma_r64_c128) { return "linear.q5.mma.r64_c128"; }
+    throw std::invalid_argument("unknown Q5 host launcher");
 }
 
-ops::detail::W8Plan resolve_auto_w8_plan(const ShapeSpec& shape, std::int32_t t) {
-    const auto padded_k = static_cast<std::int32_t>(align_up_u64(shape.k, 128));
-    return ops::detail::w8_rowsplit_resolve_plan({shape.n, shape.k, padded_k, t});
+ops::detail::Q6Launch resolve_auto_q6_launch(const ShapeSpec& shape, std::int32_t t) {
+    return ops::detail::select_q6_a16_launch(shape.n, shape.k, t);
+}
+
+const char* q6_launch_name(ops::detail::Q6Launch launch) {
+    if (launch == ops::detail::launch_q6_simt_r8_c4) { return "linear.q6.simt.r8_c4"; }
+    if (launch == ops::detail::launch_q6_simt_r8_c8) { return "linear.q6.simt.r8_c8"; }
+    if (launch == ops::detail::launch_q6_mma_r64_c64) { return "linear.q6.mma.r64_c64"; }
+    if (launch == ops::detail::launch_q6_mma_r64_c128) { return "linear.q6.mma.r64_c128"; }
+    throw std::invalid_argument("unknown Q6 host launcher");
+}
+
+ops::detail::W8Launch resolve_auto_w8_launch(const ShapeSpec& shape, std::int32_t t) {
+    return ops::detail::select_w8_a16_launch(shape.n, shape.k, t);
+}
+
+const char* w8_launch_name(ops::detail::W8Launch launch) {
+#define W8_NAME(LAUNCH, NAME)                                                                      \
+    if (launch == ops::detail::LAUNCH) { return NAME; }
+    W8_NAME(launch_w8_decode_r4, "linear.w8.decode.r4")
+    W8_NAME(launch_w8_exact_t_splitk, "linear.w8.splitk.exact_t")
+    W8_NAME(launch_w8_exact_t_composite, "linear.w8.splitk.composite")
+    W8_NAME(launch_w8_medium_splitk_c96, "linear.w8.splitk.c96")
+    W8_NAME(launch_w8_medium_splitk_c128, "linear.w8.splitk.c128")
+    W8_NAME(launch_w8_medium_splitk_c144, "linear.w8.splitk.c144")
+    W8_NAME(launch_w8_simt_r8_c4, "linear.w8.simt.r8.c4")
+    W8_NAME(launch_w8_simt_r8_c8, "linear.w8.simt.r8.c8")
+    W8_NAME(launch_w8_mma_r32_c64, "linear.w8.mma.r32.c64")
+    W8_NAME(launch_w8_mma_r32_c96, "linear.w8.mma.r32.c96")
+    W8_NAME(launch_w8_mma_r32_c128, "linear.w8.mma.r32.c128")
+    W8_NAME(launch_w8_mma_r48_c64, "linear.w8.mma.r48.c64")
+    W8_NAME(launch_w8_mma_r48_c96, "linear.w8.mma.r48.c96")
+    W8_NAME(launch_w8_mma_r48_c112, "linear.w8.mma.r48.c112")
+    W8_NAME(launch_w8_mma_r48_c128, "linear.w8.mma.r48.c128")
+    W8_NAME(launch_w8_mma_r64_c96, "linear.w8.mma.r64.c96")
+    W8_NAME(launch_w8_mma_r64_c112, "linear.w8.mma.r64.c112")
+    W8_NAME(launch_w8_mma_r64_c128, "linear.w8.mma.r64.c128")
+    W8_NAME(launch_w8_mma_r96_c96, "linear.w8.mma.r96.c96")
+    W8_NAME(launch_w8_mma_r128_c64, "linear.w8.mma.r128.c64")
+    W8_NAME(launch_w8_mma_r128_c80, "linear.w8.mma.r128.c80")
+    W8_NAME(launch_w8_exact_mma_r32_c96, "linear.w8.exact.mma.r32.c96")
+    W8_NAME(launch_w8_exact_mma_r32_c128, "linear.w8.exact.mma.r32.c128")
+    W8_NAME(launch_w8_exact_mma_r48_c96, "linear.w8.exact.mma.r48.c96")
+    W8_NAME(launch_w8_exact_mma_r48_c128, "linear.w8.exact.mma.r48.c128")
+    W8_NAME(launch_w8_exact_mma_r64_c96, "linear.w8.exact.mma.r64.c96")
+    W8_NAME(launch_w8_exact_mma_r64_c128, "linear.w8.exact.mma.r64.c128")
+    W8_NAME(launch_w8_exact_mma_r96_c96, "linear.w8.exact.mma.r96.c96")
+    W8_NAME(launch_w8_exact_mma_r128_c80, "linear.w8.exact.mma.r128.c80")
+#undef W8_NAME
+    throw std::invalid_argument("unknown W8 host launcher");
 }
 
 ops::detail::W8LinearAddPlan resolve_auto_w8_linear_add_plan(const ShapeSpec& shape,
@@ -455,402 +486,29 @@ ops::detail::Q4LinearSwiGluPlan resolve_auto_q4_linear_swiglu_plan(const ShapeSp
 
 std::string candidate_name(const Options& opt, QType qtype, const ShapeSpec& shape,
                            std::int32_t t) {
-    switch (opt.candidate) {
-    case CandidateKind::Auto:
-        if (qtype == QType::Q4G64_F16S) {
-            if (opt.linear_swiglu) {
-                return ops::detail::q4_linear_swiglu_schedule_name(
-                    resolve_auto_q4_linear_swiglu_plan(shape, t).schedule);
-            }
-            return q4_launch_name(resolve_auto_q4_launch(shape, t));
+    if (qtype == QType::Q4G64_F16S) {
+        if (opt.linear_swiglu) {
+            return ops::detail::q4_linear_swiglu_schedule_name(
+                resolve_auto_q4_linear_swiglu_plan(shape, t).schedule);
         }
-        if (qtype == QType::Q5G64_F16S) {
-            if (opt.linear_add) {
-                return ops::detail::q5_linear_add_schedule_name(
-                    resolve_auto_q5_linear_add_plan(shape, t).schedule);
-            }
-            return ops::detail::q5_schedule_name(resolve_auto_q5_plan(shape, t).schedule);
+        return q4_launch_name(resolve_auto_q4_launch(shape, t));
+    }
+    if (qtype == QType::Q5G64_F16S) {
+        if (opt.linear_add) {
+            return ops::detail::q5_linear_add_schedule_name(
+                resolve_auto_q5_linear_add_plan(shape, t).schedule);
         }
-        if (qtype == QType::Q6G64_F16S) {
-            return ops::detail::q6_schedule_name(resolve_auto_q6_plan(shape, t).schedule);
+        return q5_launch_name(resolve_auto_q5_launch(shape, t));
+    }
+    if (qtype == QType::Q6G64_F16S) { return q6_launch_name(resolve_auto_q6_launch(shape, t)); }
+    if (qtype == QType::W8G32_F16S) {
+        if (opt.linear_add) {
+            return ops::detail::w8_linear_add_schedule_name(
+                resolve_auto_w8_linear_add_plan(shape, t).schedule);
         }
-        if (qtype == QType::W8G32_F16S) {
-            if (opt.linear_add) {
-                return ops::detail::w8_linear_add_schedule_name(
-                    resolve_auto_w8_linear_add_plan(shape, t).schedule);
-            }
-            const auto plan = resolve_auto_w8_plan(shape, t);
-            return std::string(ops::detail::w8_schedule_name(plan.schedule)) +
-                   (plan.tail_policy == ops::detail::W8TailPolicy::ConditioningExact
-                        ? ".conditioning_exact_tail"
-                        : "");
-        }
-        return "unsupported";
-    case CandidateKind::Q5Fixed:
-        return ops::detail::q5_schedule_name(opt.q5_schedule);
-    case CandidateKind::Q6Fixed:
-        return ops::detail::q6_schedule_name(opt.q6_schedule);
-    case CandidateKind::W8Fixed:
-        return std::string(opt.linear_add ? "linear_add." : "") +
-               ops::detail::w8_schedule_name(opt.w8_schedule) +
-               (opt.w8_conditioning_exact_tail ? ".conditioning_exact_tail" : "");
-    case CandidateKind::W8PairFixed:
-        return ops::detail::w8_pair_schedule_name(opt.w8_pair_schedule);
+        return w8_launch_name(resolve_auto_w8_launch(shape, t));
     }
-    return "unknown";
-}
-
-void parse_candidate(Options& opt, std::string_view raw) {
-    const std::string candidate = lower(raw);
-    if (candidate == "auto") {
-        opt.candidate = CandidateKind::Auto;
-        return;
-    }
-    if (candidate == "q5-gemv-r16s2x") {
-        opt.candidate   = CandidateKind::Q5Fixed;
-        opt.q5_schedule = ops::detail::Q5ScheduleId::GemvR16S2X;
-    } else if (candidate == "q5-simt-r8c4") {
-        opt.candidate   = CandidateKind::Q5Fixed;
-        opt.q5_schedule = ops::detail::Q5ScheduleId::SimtR8C4;
-    } else if (candidate == "q5-simt-r8c8") {
-        opt.candidate   = CandidateKind::Q5Fixed;
-        opt.q5_schedule = ops::detail::Q5ScheduleId::SimtR8C8;
-    } else if (candidate == "q5-simt-split2-exact") {
-        opt.candidate   = CandidateKind::Q5Fixed;
-        opt.q5_schedule = ops::detail::Q5ScheduleId::SimtSplit2Exact;
-    } else if (candidate == "q5-simt-split4-exact") {
-        opt.candidate   = CandidateKind::Q5Fixed;
-        opt.q5_schedule = ops::detail::Q5ScheduleId::SimtSplit4Exact;
-    } else if (candidate == "q5-mma-r64c64") {
-        opt.candidate   = CandidateKind::Q5Fixed;
-        opt.q5_schedule = ops::detail::Q5ScheduleId::MmaR64C64;
-    } else if (candidate == "q5-mma-r64c128") {
-        opt.candidate   = CandidateKind::Q5Fixed;
-        opt.q5_schedule = ops::detail::Q5ScheduleId::MmaR64C128;
-    } else if (candidate == "q6-simt-r8c4") {
-        opt.candidate   = CandidateKind::Q6Fixed;
-        opt.q6_schedule = ops::detail::Q6ScheduleId::SimtR8C4;
-    } else if (candidate == "q6-simt-r8c8") {
-        opt.candidate   = CandidateKind::Q6Fixed;
-        opt.q6_schedule = ops::detail::Q6ScheduleId::SimtR8C8;
-    } else if (candidate == "q6-mma-r64c64") {
-        opt.candidate   = CandidateKind::Q6Fixed;
-        opt.q6_schedule = ops::detail::Q6ScheduleId::MmaR64C64;
-    } else if (candidate == "q6-mma-r64c128") {
-        opt.candidate   = CandidateKind::Q6Fixed;
-        opt.q6_schedule = ops::detail::Q6ScheduleId::MmaR64C128;
-    } else if (candidate == "w8-simt-r8c4") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::SimtR8C4;
-    } else if (candidate == "w8-simt-r8c8") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::SimtR8C8;
-    } else if (candidate == "w8-decode-r4") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::DecodeR4;
-    } else if (candidate == "w8-decode-r8") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::DecodeR8;
-    } else if (candidate == "w8-decode-r16") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::DecodeR16;
-    } else if (candidate == "w8-splitk-exact-t") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::SplitKMmaExactT;
-    } else if (candidate == "w8-splitk32-tail") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::SplitKMma32PlusTail;
-    } else if (candidate == "w8-splitk-medium-c48") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::SplitKMediumC48;
-    } else if (candidate == "w8-splitk-medium-c64") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::SplitKMediumC64;
-    } else if (candidate == "w8-splitk-medium-c96") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::SplitKMediumC96;
-    } else if (candidate == "w8-splitk-medium-c128") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::SplitKMediumC128;
-    } else if (candidate == "w8-splitk-medium-c144") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::SplitKMediumC144;
-    } else if (candidate == "w8-splitk-medium-c160") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::SplitKMediumC160;
-    } else if (candidate == "w8-mma-r32c32") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR32C32;
-    } else if (candidate == "w8-mma-r32c48") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR32C48;
-    } else if (candidate == "w8-mma-r32c64") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR32C64;
-    } else if (candidate == "w8-mma-r32c80") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR32C80;
-    } else if (candidate == "w8-mma-r32c96") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR32C96;
-    } else if (candidate == "w8-mma-r32c112") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR32C112;
-    } else if (candidate == "w8-mma-r32c128") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR32C128;
-    } else if (candidate == "w8-mma-r48c64") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR48C64;
-    } else if (candidate == "w8-mma-r48c80") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR48C80;
-    } else if (candidate == "w8-mma-r48c96") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR48C96;
-    } else if (candidate == "w8-mma-r48c112") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR48C112;
-    } else if (candidate == "w8-mma-r48c128") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR48C128;
-    } else if (candidate == "w8-mma-r64c32") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR64C32;
-    } else if (candidate == "w8-mma-r64c48") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR64C48;
-    } else if (candidate == "w8-mma-r64c64") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR64C64;
-    } else if (candidate == "w8-mma-r64c80") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR64C80;
-    } else if (candidate == "w8-mma-r64c96") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR64C96;
-    } else if (candidate == "w8-mma-r64c112") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR64C112;
-    } else if (candidate == "w8-mma-r64c128") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR64C128;
-    } else if (candidate == "w8-mma-r96c64") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR96C64;
-    } else if (candidate == "w8-mma-r96c80") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR96C80;
-    } else if (candidate == "w8-mma-r96c96") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR96C96;
-    } else if (candidate == "w8-mma-r96c112") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR96C112;
-    } else if (candidate == "w8-mma-r128c64") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR128C64;
-    } else if (candidate == "w8-mma-r128c80") {
-        opt.candidate   = CandidateKind::W8Fixed;
-        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR128C80;
-    } else if (candidate == "w8-pair-decode-r4") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualDecodeR4;
-    } else if (candidate == "w8-pair-decode-r8") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualDecodeR8;
-    } else if (candidate == "w8-pair-decode-r16") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualDecodeR16;
-    } else if (candidate == "w8-pair-splitk-exact-t") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualSplitKMmaExactT;
-    } else if (candidate == "w8-pair-splitk-medium-c48") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualSplitKMediumC48;
-    } else if (candidate == "w8-pair-splitk-medium-c64") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualSplitKMediumC64;
-    } else if (candidate == "w8-pair-splitk-medium-c80") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualSplitKMediumC80;
-    } else if (candidate == "w8-pair-splitk-medium-c88") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualSplitKMediumC88;
-    } else if (candidate == "w8-pair-splitk-medium-c96") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualSplitKMediumC96;
-    } else if (candidate == "w8-pair-splitk-medium-c104") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualSplitKMediumC104;
-    } else if (candidate == "w8-pair-splitk-medium-c112") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualSplitKMediumC112;
-    } else if (candidate == "w8-pair-splitk-medium-c128") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualSplitKMediumC128;
-    } else if (candidate == "w8-pair-splitk-medium-c160") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualSplitKMediumC160;
-    } else if (candidate == "w8-pair-splitk-medium-c192") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualSplitKMediumC192;
-    } else if (candidate == "w8-pair-splitk-medium-c224") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualSplitKMediumC224;
-    } else if (candidate == "w8-pair-splitk-medium-c256") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualSplitKMediumC256;
-    } else if (candidate == "w8-pair-dual-r32c64") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualMmaR32C64;
-    } else if (candidate == "w8-pair-dual-r32c80") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualMmaR32C80;
-    } else if (candidate == "w8-pair-dual-r32c96") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualMmaR32C96;
-    } else if (candidate == "w8-pair-dual-r32c112") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualMmaR32C112;
-    } else if (candidate == "w8-pair-dual-r32c128") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualMmaR32C128;
-    } else if (candidate == "w8-pair-concat-r32c64") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR32C64;
-    } else if (candidate == "w8-pair-concat-r32c80") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR32C80;
-    } else if (candidate == "w8-pair-concat-r32c96") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR32C96;
-    } else if (candidate == "w8-pair-concat-r32c112") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR32C112;
-    } else if (candidate == "w8-pair-concat-r32c128") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR32C128;
-    } else if (candidate == "w8-pair-concat-r48c64") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR48C64;
-    } else if (candidate == "w8-pair-concat-r48c96") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR48C96;
-    } else if (candidate == "w8-pair-concat-r48c112") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR48C112;
-    } else if (candidate == "w8-pair-concat-r48c128") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR48C128;
-    } else if (candidate == "w8-pair-concat-r64c64") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR64C64;
-    } else if (candidate == "w8-pair-concat-r64c80") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR64C80;
-    } else if (candidate == "w8-pair-concat-r64c96") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR64C96;
-    } else if (candidate == "w8-pair-concat-r64c128") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR64C128;
-    } else if (candidate == "w8-pair-concat-r96c64") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR96C64;
-    } else if (candidate == "w8-pair-concat-r96c80") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR96C80;
-    } else if (candidate == "w8-pair-concat-r96c96") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR96C96;
-    } else if (candidate == "w8-pair-concat-r96c112") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR96C112;
-    } else if (candidate == "w8-pair-concat-r128c64") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR128C64;
-    } else if (candidate == "w8-pair-concat-r128c80") {
-        opt.candidate        = CandidateKind::W8PairFixed;
-        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR128C80;
-    } else {
-        throw std::invalid_argument("unknown candidate: " + std::string(raw));
-    }
-}
-
-ops::detail::Q5KernelVariant parse_q5_variant(std::string_view raw, bool& is_auto) {
-    const std::string variant = lower(raw);
-    if (variant == "auto") {
-        is_auto = true;
-        return ops::detail::Q5KernelVariant::Predicated;
-    }
-    is_auto = false;
-    if (variant == "none") { return ops::detail::Q5KernelVariant::None; }
-    if (variant == "full") { return ops::detail::Q5KernelVariant::Full; }
-    if (variant == "predicated") { return ops::detail::Q5KernelVariant::Predicated; }
-    throw std::invalid_argument("unknown Q5 kernel variant: " + std::string(raw));
-}
-
-ops::detail::Q6KernelVariant parse_q6_variant(std::string_view raw, bool& is_auto) {
-    const std::string variant = lower(raw);
-    if (variant == "auto") {
-        is_auto = true;
-        return ops::detail::Q6KernelVariant::Predicated;
-    }
-    is_auto = false;
-    if (variant == "none") { return ops::detail::Q6KernelVariant::None; }
-    if (variant == "full") { return ops::detail::Q6KernelVariant::Full; }
-    if (variant == "predicated") { return ops::detail::Q6KernelVariant::Predicated; }
-    throw std::invalid_argument("unknown Q6 kernel variant: " + std::string(raw));
-}
-
-ops::detail::W8KernelVariant parse_w8_variant(std::string_view raw, bool& is_auto) {
-    const std::string variant = lower(raw);
-    if (variant == "auto") {
-        is_auto = true;
-        return ops::detail::W8KernelVariant::Predicated;
-    }
-    is_auto = false;
-    if (variant == "none") { return ops::detail::W8KernelVariant::None; }
-    if (variant == "full") { return ops::detail::W8KernelVariant::Full; }
-    if (variant == "predicated") { return ops::detail::W8KernelVariant::Predicated; }
-    throw std::invalid_argument("unknown W8 kernel variant: " + std::string(raw));
-}
-
-ops::detail::Q5KernelVariant resolve_q5_variant(ops::detail::Q5ScheduleId schedule,
-                                                std::int32_t rows, std::int32_t k,
-                                                std::int32_t padded_k, std::int32_t cols) {
-    const ops::detail::Q5Problem problem{rows, k, padded_k, cols};
-    using V = ops::detail::Q5KernelVariant;
-    for (const V variant : {V::None, V::Full, V::Predicated}) {
-        if (ops::detail::q5_candidate_is_legal(schedule, variant, problem)) { return variant; }
-    }
-    throw std::invalid_argument(std::string("no legal variant for ") +
-                                ops::detail::q5_schedule_name(schedule));
-}
-
-ops::detail::Q6KernelVariant resolve_q6_variant(ops::detail::Q6ScheduleId schedule,
-                                                std::int32_t rows, std::int32_t k,
-                                                std::int32_t padded_k, std::int32_t cols) {
-    const ops::detail::Q6Problem problem{rows, k, padded_k, cols};
-    using V = ops::detail::Q6KernelVariant;
-    for (const V variant : {V::None, V::Full, V::Predicated}) {
-        if (ops::detail::q6_candidate_is_legal(schedule, variant, problem)) { return variant; }
-    }
-    throw std::invalid_argument(std::string("no legal variant for ") +
-                                ops::detail::q6_schedule_name(schedule));
-}
-
-ops::detail::W8KernelVariant resolve_w8_variant(ops::detail::W8ScheduleId schedule,
-                                                std::int32_t rows, std::int32_t k,
-                                                std::int32_t padded_k, std::int32_t cols) {
-    const ops::detail::W8Problem problem{rows, k, padded_k, cols};
-    using V = ops::detail::W8KernelVariant;
-    for (const V variant : {V::None, V::Full, V::Predicated}) {
-        if (ops::detail::w8_candidate_is_legal(schedule, variant, problem)) { return variant; }
-    }
-    throw std::invalid_argument(std::string("no legal variant for ") +
-                                ops::detail::w8_schedule_name(schedule));
+    return "unsupported";
 }
 
 ShapeSpec parse_shape(std::string_view raw) {
@@ -917,28 +575,12 @@ void usage(const char* argv0) {
         "Usage:\n"
         "  %s --all-targets [--warmup N] [--repeat N] [--copy-repeat N]\n"
         "  %s --shape ShapeFamily --qtype Q4|Q5|Q6|W8G32 [--repeat N]\n"
-        "  %s --rows N --k K --qtype Q4|Q5|Q6|W8G32 --candidate NAME "
-        "[--variant auto|none|full|predicated]\n\n"
+        "  %s --rows N --k K --qtype Q4|Q5|Q6|W8G32\n\n"
         "Options:\n"
         "  --all-targets              Run the registered target shape/qtype rows (default).\n"
         "  --shape NAME               One ShapeFamily string, e.g. MlpGateUp34816x5120.\n"
-        "  --rows N --k K             Numeric matrix geometry for fixed-candidate work.\n"
+        "  --rows N --k K             Numeric matrix geometry for a registered route.\n"
         "  --qtype Q4|Q5|Q6|W8G32     Low-bit ROW_SPLIT qtype for --shape.\n"
-        "  --candidate NAME           auto, q5-gemv-r16s2x,\n"
-        "                             q5-simt-r8c4, q5-simt-r8c8,\n"
-        "                             q5-simt-split2-exact, q5-simt-split4-exact,\n"
-        "                             q5-mma-r64c64, q5-mma-r64c128,\n"
-        "                             q6-simt-r8c4, q6-simt-r8c8,\n"
-        "                             q6-mma-r64c64, q6-mma-r64c128,\n"
-        "                             w8-simt-r8c4, w8-simt-r8c8,\n"
-        "                             w8-mma-r32c128, w8-mma-r64c128,\n"
-        "                             w8-pair-decode-r4, w8-pair-splitk-exact-t,\n"
-        "                             w8-pair-splitk-medium-c104,\n"
-        "                             w8-pair-dual-r32c128, or w8-pair-concat-r64c128.\n"
-        "  --variant NAME             Fixed kernel variant; auto is the default.\n"
-        "  --w8-conditioning-exact-tail\n"
-        "                             Use the conditioning MMA core plus exact residual-T path.\n"
-        "  --w8-pair-exact-tail       Use a pair MMA core plus an exact residual-T path.\n"
         "  --paired-kv                Benchmark paired W8 K/V: registered [1024,5120]\n"
         "                             or numeric context row views [1024,2048].\n"
         "  --pair-composed            With --paired-kv, run two public Linear calls.\n"
@@ -984,21 +626,6 @@ Options parse_args(int argc, char** argv) {
             opt.qtype       = parse_qtype(next("qtype"));
             opt.have_qtype  = true;
             opt.all_targets = false;
-        } else if (arg == "--candidate") {
-            parse_candidate(opt, next("candidate"));
-            opt.all_targets = false;
-        } else if (arg == "--variant") {
-            const std::string_view raw = next("variant");
-            opt.q5_variant             = parse_q5_variant(raw, opt.q5_variant_auto);
-            opt.q6_variant             = parse_q6_variant(raw, opt.q6_variant_auto);
-            opt.w8_variant             = parse_w8_variant(raw, opt.w8_variant_auto);
-            opt.all_targets            = false;
-        } else if (arg == "--w8-conditioning-exact-tail") {
-            opt.w8_conditioning_exact_tail = true;
-            opt.all_targets                = false;
-        } else if (arg == "--w8-pair-exact-tail") {
-            opt.w8_pair_exact_tail = true;
-            opt.all_targets        = false;
         } else if (arg == "--paired-kv") {
             opt.paired_kv   = true;
             opt.all_targets = false;
@@ -1048,38 +675,6 @@ Options parse_args(int argc, char** argv) {
     if (!opt.all_targets && numeric_shape && !opt.have_qtype) {
         throw std::invalid_argument("--rows/--k require --qtype");
     }
-    if (opt.candidate != CandidateKind::Auto && opt.all_targets) {
-        throw std::invalid_argument("fixed candidates require one shape");
-    }
-    if (opt.paired_kv && opt.candidate != CandidateKind::Auto &&
-        opt.candidate != CandidateKind::W8PairFixed) {
-        throw std::invalid_argument("--paired-kv requires auto or a W8 pair candidate");
-    }
-    if (!opt.paired_kv && opt.candidate == CandidateKind::W8PairFixed) {
-        throw std::invalid_argument("W8 pair candidates require --paired-kv");
-    }
-    if (opt.candidate == CandidateKind::Q5Fixed && !numeric_shape && !opt.have_shape) {
-        throw std::invalid_argument("Q5 fixed candidate requires one shape");
-    }
-    if (opt.candidate == CandidateKind::Q5Fixed && opt.qtype != QType::Q5G64_F16S) {
-        throw std::invalid_argument("Q5 fixed candidate requires Q5");
-    }
-    if (opt.candidate == CandidateKind::Q6Fixed && !numeric_shape && !opt.have_shape) {
-        throw std::invalid_argument("Q6 fixed candidate requires one shape");
-    }
-    if (opt.candidate == CandidateKind::Q6Fixed && opt.qtype != QType::Q6G64_F16S) {
-        throw std::invalid_argument("Q6 fixed candidate requires Q6");
-    }
-    if (opt.candidate == CandidateKind::W8Fixed && !numeric_shape && !opt.have_shape) {
-        throw std::invalid_argument("W8 fixed candidate requires one shape");
-    }
-    if (opt.candidate == CandidateKind::W8Fixed && opt.qtype != QType::W8G32_F16S) {
-        throw std::invalid_argument("W8 fixed candidate requires W8G32");
-    }
-    if (opt.candidate == CandidateKind::W8PairFixed &&
-        (opt.qtype != QType::W8G32_F16S || opt.paired_composed)) {
-        throw std::invalid_argument("W8 pair candidates require production --paired-kv W8G32");
-    }
     if (opt.paired_kv) {
         const ShapeSpec pair_shape =
             numeric_shape ? ShapeSpec{"Numeric", opt.rows, opt.k} : opt.shape;
@@ -1097,22 +692,18 @@ Options parse_args(int argc, char** argv) {
     if (opt.linear_add) {
         const ShapeSpec shape = numeric_shape ? ShapeSpec{"Numeric", opt.rows, opt.k} : opt.shape;
         const bool q5         = opt.qtype == QType::Q5G64_F16S && shape.n == 5120 &&
-                        (shape.k == 6144 || shape.k == 17408) &&
-                        opt.candidate == CandidateKind::Auto;
-        const bool w8 =
-            opt.qtype == QType::W8G32_F16S && shape.n == 2048 &&
-            (shape.k == 4096 || shape.k == 6144) &&
-            (opt.candidate == CandidateKind::Auto || opt.candidate == CandidateKind::W8Fixed);
+                        (shape.k == 6144 || shape.k == 17408);
+        const bool w8 = opt.qtype == QType::W8G32_F16S && shape.n == 2048 &&
+                        (shape.k == 4096 || shape.k == 6144);
         if (opt.paired_kv || opt.all_targets || (!q5 && !w8)) {
-            throw std::invalid_argument(
-                "--linear-add requires Q5 [5120,6144]/[5120,17408] with auto selection, "
-                "or W8G32 [2048,4096]/[2048,6144] with an auto/W8 candidate");
+            throw std::invalid_argument("--linear-add requires Q5 [5120,6144]/[5120,17408] or "
+                                        "W8G32 [2048,4096]/[2048,6144]");
         }
     }
     if (opt.linear_swiglu) {
         const ShapeSpec shape = numeric_shape ? ShapeSpec{"Numeric", opt.rows, opt.k} : opt.shape;
         if (opt.paired_kv || opt.all_targets || opt.qtype != QType::Q4G64_F16S ||
-            shape.n != 34816 || shape.k != 5120 || opt.candidate != CandidateKind::Auto) {
+            shape.n != 34816 || shape.k != 5120) {
             throw std::invalid_argument(
                 "--linear-swiglu requires Q4 [34816,5120] with auto selection");
         }
@@ -1140,20 +731,6 @@ std::vector<int> default_t_sweep(const TargetSpec& target, const Options& opt) {
     if (opt.linear_swiglu) { return {1, 16, 128, 129, 256, 384, 512, 640, 1024}; }
     if (opt.linear_add && target.qtype == QType::Q5G64_F16S) {
         return {1, 24, 25, 64, 128, 129, 512, 1024};
-    }
-    if (opt.candidate == CandidateKind::Q5Fixed) {
-        if (opt.q5_schedule == ops::detail::Q5ScheduleId::GemvR16S2X) { return {1}; }
-        if (opt.q5_schedule == ops::detail::Q5ScheduleId::SimtSplit2Exact ||
-            opt.q5_schedule == ops::detail::Q5ScheduleId::SimtSplit4Exact) {
-            return {2, 3, 4, 5, 6};
-        }
-        return {1, 2, 4, 8, 16, 24, 25, 32, 64, 128, 256, 512, 1024, 2048};
-    }
-    if (opt.candidate == CandidateKind::Q6Fixed) {
-        return {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048};
-    }
-    if (opt.candidate == CandidateKind::W8Fixed) {
-        return {1, 2, 4, 5, 8, 9, 16, 17, 32, 56, 57, 64, 128, 256, 512, 1024, 2048};
     }
     if (target.qtype == QType::Q4G64_F16S) {
         if (target.shape.n == 131072 && target.shape.k == 5120) { return {1}; }
@@ -1441,74 +1018,15 @@ Weight make_w8_row_view(const Weight& parent, std::int32_t row_begin, std::int32
     return view;
 }
 
-ops::detail::Q5KernelVariant selected_q5_variant(const Options& opt, const ShapeSpec& shape,
-                                                 std::int32_t t) {
-    if (opt.candidate != CandidateKind::Q5Fixed) { return ops::detail::Q5KernelVariant::None; }
-    const auto padded_k = static_cast<std::int32_t>(align_up_u64(shape.k, 128));
-    return opt.q5_variant_auto ? resolve_q5_variant(opt.q5_schedule, shape.n, shape.k, padded_k, t)
-                               : opt.q5_variant;
-}
-
-ops::detail::Q6KernelVariant selected_q6_variant(const Options& opt, const ShapeSpec& shape,
-                                                 std::int32_t t) {
-    if (opt.candidate != CandidateKind::Q6Fixed) { return ops::detail::Q6KernelVariant::None; }
-    const auto padded_k = static_cast<std::int32_t>(align_up_u64(shape.k, 128));
-    return opt.q6_variant_auto ? resolve_q6_variant(opt.q6_schedule, shape.n, shape.k, padded_k, t)
-                               : opt.q6_variant;
-}
-
-ops::detail::W8KernelVariant selected_w8_variant(const Options& opt, const ShapeSpec& shape,
-                                                 std::int32_t t) {
-    if (opt.candidate != CandidateKind::W8Fixed) { return ops::detail::W8KernelVariant::None; }
-    const auto padded_k = static_cast<std::int32_t>(align_up_u64(shape.k, 128));
-    return opt.w8_variant_auto ? resolve_w8_variant(opt.w8_schedule, shape.n, shape.k, padded_k, t)
-                               : opt.w8_variant;
-}
-
-void launch_candidate(const Options& opt, const ShapeSpec& shape, const Tensor& x, const Weight& w,
+void launch_candidate(const Options& opt, const ShapeSpec&, const Tensor& x, const Weight& w,
                       Tensor& out, WorkspaceArena& ws, cudaStream_t stream) {
     if (opt.linear_swiglu) {
         ops::linear_swiglu(x, w, out, ws, stream);
-        return;
-    }
-    if (opt.linear_add) {
-        if (opt.candidate == CandidateKind::Auto) {
-            ops::linear_add(x, w, out, ws, stream);
-            return;
-        }
-        if (opt.candidate == CandidateKind::W8Fixed) {
-            const auto variant = selected_w8_variant(opt, shape, x.ne[1]);
-            ops::detail::w8_linear_add_launch_candidate(opt.w8_schedule, variant, x, w, out,
-                                                        stream);
-            return;
-        }
-        throw std::invalid_argument("LinearAdd benchmark requires an auto or W8 candidate");
-    }
-    switch (opt.candidate) {
-    case CandidateKind::Auto:
+    } else if (opt.linear_add) {
+        ops::linear_add(x, w, out, ws, stream);
+    } else {
         ops::linear(x, w, out, ws, stream);
-        return;
-    case CandidateKind::Q5Fixed: {
-        const auto variant = selected_q5_variant(opt, shape, x.ne[1]);
-        ops::detail::q5_rowsplit_launch_candidate(opt.q5_schedule, variant, x, w, out, stream);
-        return;
     }
-    case CandidateKind::Q6Fixed: {
-        const auto variant = selected_q6_variant(opt, shape, x.ne[1]);
-        ops::detail::q6_rowsplit_launch_candidate(opt.q6_schedule, variant, x, w, out, stream);
-        return;
-    }
-    case CandidateKind::W8Fixed: {
-        const auto variant     = selected_w8_variant(opt, shape, x.ne[1]);
-        const auto tail_policy = opt.w8_conditioning_exact_tail
-                                     ? ops::detail::W8TailPolicy::ConditioningExact
-                                     : ops::detail::W8TailPolicy::Homogeneous;
-        ops::detail::w8_rowsplit_launch_candidate(opt.w8_schedule, variant, x, w, out, stream,
-                                                  tail_policy);
-        return;
-    }
-    }
-    throw std::invalid_argument("unknown Linear benchmark candidate");
 }
 
 int q4_launch_col_tile(ops::detail::Q4Launch launch) {
@@ -1523,131 +1041,78 @@ int q4_launch_col_tile(ops::detail::Q4Launch launch) {
     throw std::invalid_argument("unknown Q4 host launcher tile");
 }
 
-int schedule_col_tile(ops::detail::Q6ScheduleId schedule) {
-    using S = ops::detail::Q6ScheduleId;
-    switch (schedule) {
-    case S::SimtR8C4:
-        return 4;
-    case S::SimtR8C8:
-        return 8;
-    case S::MmaR64C64:
-        return 64;
-    case S::MmaR64C128:
-        return 128;
-    }
-    throw std::invalid_argument("unknown Q6 schedule tile");
-}
-
-int schedule_col_tile(ops::detail::Q5ScheduleId schedule, std::int32_t exact_cols) {
-    using S = ops::detail::Q5ScheduleId;
-    switch (schedule) {
-    case S::GemvR16S2X:
-        return 1;
-    case S::SimtR8C4:
-        return 4;
-    case S::SimtR8C8:
-        return 8;
-    case S::SimtSplit2Exact:
-    case S::SimtSplit4Exact:
+int q5_launch_col_tile(ops::detail::Q5Launch launch, std::int32_t exact_cols) {
+    if (launch == ops::detail::launch_q5_gemv_r16_s2_x) { return 1; }
+    if (launch == ops::detail::launch_q5_simt_r8_c4) { return 4; }
+    if (launch == ops::detail::launch_q5_simt_r8_c8) { return 8; }
+    if (launch == ops::detail::launch_q5_simt_split2_exact ||
+        launch == ops::detail::launch_q5_simt_split4_exact) {
         return exact_cols;
-    case S::MmaR64C64:
-        return 64;
-    case S::MmaR64C128:
-        return 128;
     }
-    throw std::invalid_argument("unknown Q5 schedule tile");
+    if (launch == ops::detail::launch_q5_mma_r64_c64) { return 64; }
+    if (launch == ops::detail::launch_q5_mma_r64_c128) { return 128; }
+    throw std::invalid_argument("unknown Q5 host launcher tile");
 }
 
-int schedule_col_tile(ops::detail::W8ScheduleId schedule, std::int32_t t) {
-    using S = ops::detail::W8ScheduleId;
-    switch (schedule) {
-    case S::DecodeR4:
-    case S::DecodeR8:
-    case S::DecodeR16:
-        return 1;
-    case S::SplitKMmaExactT:
-        return t;
-    case S::SplitKMma32PlusTail:
-        return t;
-    case S::SplitKMediumC48:
-        return 48;
-    case S::SplitKMediumC64:
-        return 64;
-    case S::SplitKMediumC96:
-        return 96;
-    case S::SplitKMediumC128:
-        return 128;
-    case S::SplitKMediumC144:
-        return 144;
-    case S::SplitKMediumC160:
-        return 160;
-    case S::SimtR8C4:
-        return 4;
-    case S::SimtR8C8:
-        return 8;
-    case S::MmaR32C32:
-    case S::MmaR64C32:
-        return 32;
-    case S::MmaR32C48:
-    case S::MmaR64C48:
-        return 48;
-    case S::MmaR32C64:
-    case S::MmaR48C64:
-    case S::MmaR64C64:
-    case S::MmaR96C64:
-    case S::MmaR128C64:
-        return 64;
-    case S::MmaR32C80:
-    case S::MmaR48C80:
-    case S::MmaR64C80:
-    case S::MmaR96C80:
-    case S::MmaR128C80:
-        return 80;
-    case S::MmaR32C96:
-    case S::MmaR48C96:
-    case S::MmaR64C96:
-    case S::MmaR96C96:
-        return 96;
-    case S::MmaR32C112:
-    case S::MmaR48C112:
-    case S::MmaR64C112:
-    case S::MmaR96C112:
-        return 112;
-    case S::MmaR32C128:
-    case S::MmaR48C128:
-    case S::MmaR64C128:
-        return 128;
-    }
-    throw std::invalid_argument("unknown W8 schedule tile");
+int q6_launch_col_tile(ops::detail::Q6Launch launch) {
+    if (launch == ops::detail::launch_q6_simt_r8_c4) { return 4; }
+    if (launch == ops::detail::launch_q6_simt_r8_c8) { return 8; }
+    if (launch == ops::detail::launch_q6_mma_r64_c64) { return 64; }
+    if (launch == ops::detail::launch_q6_mma_r64_c128) { return 128; }
+    throw std::invalid_argument("unknown Q6 host launcher tile");
+}
+
+int w8_launch_col_tile(ops::detail::W8Launch launch, std::int32_t exact_cols) {
+    if (launch == ops::detail::launch_w8_decode_r4) { return 1; }
+    if (launch == ops::detail::launch_w8_exact_t_splitk) { return exact_cols; }
+    if (launch == ops::detail::launch_w8_exact_t_composite) { return 32; }
+    if (launch == ops::detail::launch_w8_medium_splitk_c96) { return 96; }
+    if (launch == ops::detail::launch_w8_medium_splitk_c128) { return 128; }
+    if (launch == ops::detail::launch_w8_medium_splitk_c144) { return 144; }
+    if (launch == ops::detail::launch_w8_simt_r8_c4) { return 4; }
+    if (launch == ops::detail::launch_w8_simt_r8_c8) { return 8; }
+#define W8_COL(LAUNCH, COLS)                                                                       \
+    if (launch == ops::detail::LAUNCH) { return COLS; }
+    W8_COL(launch_w8_mma_r32_c64, 64)
+    W8_COL(launch_w8_mma_r32_c96, 96)
+    W8_COL(launch_w8_mma_r32_c128, 128)
+    W8_COL(launch_w8_mma_r48_c64, 64)
+    W8_COL(launch_w8_mma_r48_c96, 96)
+    W8_COL(launch_w8_mma_r48_c112, 112)
+    W8_COL(launch_w8_mma_r48_c128, 128)
+    W8_COL(launch_w8_mma_r64_c96, 96)
+    W8_COL(launch_w8_mma_r64_c112, 112)
+    W8_COL(launch_w8_mma_r64_c128, 128)
+    W8_COL(launch_w8_mma_r96_c96, 96)
+    W8_COL(launch_w8_mma_r128_c64, 64)
+    W8_COL(launch_w8_mma_r128_c80, 80)
+    W8_COL(launch_w8_exact_mma_r32_c96, 96)
+    W8_COL(launch_w8_exact_mma_r32_c128, 128)
+    W8_COL(launch_w8_exact_mma_r48_c96, 96)
+    W8_COL(launch_w8_exact_mma_r48_c128, 128)
+    W8_COL(launch_w8_exact_mma_r64_c96, 96)
+    W8_COL(launch_w8_exact_mma_r64_c128, 128)
+    W8_COL(launch_w8_exact_mma_r96_c96, 96)
+    W8_COL(launch_w8_exact_mma_r128_c80, 80)
+#undef W8_COL
+    throw std::invalid_argument("unknown W8 host launcher tile");
 }
 
 int linear_swiglu_col_tile(const ops::detail::Q4LinearSwiGluPlan& plan, const ShapeSpec& shape,
                            std::int32_t t) {
     using S = ops::detail::Q4LinearSwiGluScheduleId;
-    switch (plan.schedule) {
-    case S::GemvPair:
-        return 1;
-    case S::Materialized:
+    if (plan.schedule == S::GemvPair) { return 1; }
+    if (plan.schedule == S::Materialized) {
         return q4_launch_col_tile(resolve_auto_q4_launch(shape, t));
-    case S::MmaSplitHalfPairR32C128:
-        return 128;
     }
-    throw std::invalid_argument("unknown LinearSwiGLU schedule tile");
+    return 128;
 }
 
 int linear_add_col_tile(const ops::detail::Q5LinearAddPlan& plan, std::int32_t t) {
     using S = ops::detail::Q5LinearAddScheduleId;
-    switch (plan.schedule) {
-    case S::GemvResidual:
-        return 1;
-    case S::Materialized:
-        return schedule_col_tile(plan.materialized_projection->schedule, t);
-    case S::MmaResidualR64C64:
-        return 64;
-    case S::MmaResidualR64C128:
-        return 128;
-    }
-    throw std::invalid_argument("unknown Q5 LinearAdd schedule tile");
+    if (plan.schedule == S::GemvResidual) { return 1; }
+    if (plan.schedule == S::Materialized) { return t <= 6 ? t : 8; }
+    return plan.schedule == S::MmaResidualR64C64 ? 64 : 128;
 }
 
 int linear_add_col_tile(const ops::detail::W8LinearAddPlan& plan, std::int32_t t) {
@@ -1683,72 +1148,49 @@ int linear_add_col_tile(const ops::detail::W8LinearAddPlan& plan, std::int32_t t
 }
 
 int candidate_col_tile(const Options& opt, QType qtype, const ShapeSpec& shape, std::int32_t t) {
-    switch (opt.candidate) {
-    case CandidateKind::Auto:
-        if (qtype == QType::Q4G64_F16S) {
-            if (opt.linear_swiglu) {
-                return linear_swiglu_col_tile(resolve_auto_q4_linear_swiglu_plan(shape, t), shape,
-                                              t);
-            }
-            return q4_launch_col_tile(resolve_auto_q4_launch(shape, t));
-        }
-        if (qtype == QType::Q5G64_F16S) {
-            if (opt.linear_add) {
-                return linear_add_col_tile(resolve_auto_q5_linear_add_plan(shape, t), t);
-            }
-            return schedule_col_tile(resolve_auto_q5_plan(shape, t).schedule, t);
-        }
-        if (qtype == QType::Q6G64_F16S) {
-            return schedule_col_tile(resolve_auto_q6_plan(shape, t).schedule);
-        }
-        if (qtype == QType::W8G32_F16S) {
-            if (opt.linear_add) {
-                return linear_add_col_tile(resolve_auto_w8_linear_add_plan(shape, t), t);
-            }
-            return schedule_col_tile(resolve_auto_w8_plan(shape, t).schedule, t);
-        }
-        throw std::invalid_argument("unsupported qtype for auto candidate tile");
-    case CandidateKind::Q5Fixed:
-        return schedule_col_tile(opt.q5_schedule, t);
-    case CandidateKind::Q6Fixed:
-        return schedule_col_tile(opt.q6_schedule);
-    case CandidateKind::W8Fixed:
-        return schedule_col_tile(opt.w8_schedule, t);
+    if (qtype == QType::Q4G64_F16S) {
+        return opt.linear_swiglu
+                   ? linear_swiglu_col_tile(resolve_auto_q4_linear_swiglu_plan(shape, t), shape, t)
+                   : q4_launch_col_tile(resolve_auto_q4_launch(shape, t));
     }
-    throw std::invalid_argument("unknown Linear benchmark candidate tile");
+    if (qtype == QType::Q5G64_F16S) {
+        return opt.linear_add ? linear_add_col_tile(resolve_auto_q5_linear_add_plan(shape, t), t)
+                              : q5_launch_col_tile(resolve_auto_q5_launch(shape, t), t);
+    }
+    if (qtype == QType::Q6G64_F16S) { return q6_launch_col_tile(resolve_auto_q6_launch(shape, t)); }
+    if (qtype == QType::W8G32_F16S) {
+        return opt.linear_add ? linear_add_col_tile(resolve_auto_w8_linear_add_plan(shape, t), t)
+                              : w8_launch_col_tile(resolve_auto_w8_launch(shape, t), t);
+    }
+    throw std::invalid_argument("unsupported qtype for route tile");
 }
 
-bool candidate_uses_conditioning_exact_tail(const Options& opt, QType qtype, const ShapeSpec& shape,
-                                            std::int32_t t) {
-    if (qtype != QType::W8G32_F16S || opt.linear_add) { return false; }
-    if (opt.candidate == CandidateKind::W8Fixed) { return opt.w8_conditioning_exact_tail; }
-    return opt.candidate == CandidateKind::Auto && resolve_auto_w8_plan(shape, t).tail_policy ==
-                                                       ops::detail::W8TailPolicy::ConditioningExact;
+bool w8_launch_has_exact_tail(ops::detail::W8Launch launch) {
+    return launch == ops::detail::launch_w8_exact_t_composite ||
+           launch == ops::detail::launch_w8_exact_mma_r32_c96 ||
+           launch == ops::detail::launch_w8_exact_mma_r32_c128 ||
+           launch == ops::detail::launch_w8_exact_mma_r48_c96 ||
+           launch == ops::detail::launch_w8_exact_mma_r48_c128 ||
+           launch == ops::detail::launch_w8_exact_mma_r64_c96 ||
+           launch == ops::detail::launch_w8_exact_mma_r64_c128 ||
+           launch == ops::detail::launch_w8_exact_mma_r96_c96 ||
+           launch == ops::detail::launch_w8_exact_mma_r128_c80;
 }
 
 std::uint64_t candidate_weight_passes(const Options& opt, QType qtype, const ShapeSpec& shape,
                                       std::int32_t t, int col_tile) {
-    if (!candidate_uses_conditioning_exact_tail(opt, qtype, shape, t)) {
-        return static_cast<std::uint64_t>((t + col_tile - 1) / col_tile);
+    if (qtype == QType::W8G32_F16S && !opt.linear_add) {
+        const auto launch = resolve_auto_w8_launch(shape, t);
+        if (w8_launch_has_exact_tail(launch)) {
+            const int full = t / col_tile;
+            const int tail = t % col_tile;
+            return static_cast<std::uint64_t>(full + (tail == 0 ? 0 : (tail + 31) / 32));
+        }
     }
-    const int full_passes = t / col_tile;
-    const int tail        = t % col_tile;
-    if (tail == 0) { return static_cast<std::uint64_t>(full_passes); }
-    const int tail_passes = tail <= 32 ? 1 : (tail <= 88 ? (tail + 31) / 32 : 1);
-    return static_cast<std::uint64_t>(full_passes + tail_passes);
+    return static_cast<std::uint64_t>((t + col_tile - 1) / col_tile);
 }
 
 bool candidate_uses_mma(const Options& opt, QType qtype, const ShapeSpec& shape, std::int32_t t) {
-    if (opt.candidate == CandidateKind::Q5Fixed) {
-        return ops::detail::q5_schedule_uses_mma(opt.q5_schedule);
-    }
-    if (opt.candidate == CandidateKind::Q6Fixed) {
-        return ops::detail::q6_schedule_uses_mma(opt.q6_schedule);
-    }
-    if (opt.candidate == CandidateKind::W8Fixed) {
-        return ops::detail::w8_schedule_uses_mma(opt.w8_schedule);
-    }
-    if (opt.candidate != CandidateKind::Auto) { return false; }
     if (qtype == QType::Q4G64_F16S) {
         if (opt.linear_swiglu) {
             const auto plan = resolve_auto_q4_linear_swiglu_plan(shape, t);
@@ -1758,121 +1200,100 @@ bool candidate_uses_mma(const Options& opt, QType qtype, const ShapeSpec& shape,
                     (resolve_auto_q4_launch(shape, t) == ops::detail::launch_q4_mma_r64_c64 ||
                      resolve_auto_q4_launch(shape, t) == ops::detail::launch_q4_mma_r64_c128));
         }
-        const ops::detail::Q4Launch launch = resolve_auto_q4_launch(shape, t);
+        const auto launch = resolve_auto_q4_launch(shape, t);
         return launch == ops::detail::launch_q4_mma_r64_c64 ||
                launch == ops::detail::launch_q4_mma_r64_c128;
     }
     if (qtype == QType::Q5G64_F16S) {
         if (opt.linear_add) {
-            const auto plan = resolve_auto_q5_linear_add_plan(shape, t);
-            using S         = ops::detail::Q5LinearAddScheduleId;
-            return plan.schedule == S::MmaResidualR64C64 ||
-                   plan.schedule == S::MmaResidualR64C128 ||
-                   (plan.schedule == S::Materialized &&
-                    ops::detail::q5_schedule_uses_mma(plan.materialized_projection->schedule));
+            const auto schedule = resolve_auto_q5_linear_add_plan(shape, t).schedule;
+            using S             = ops::detail::Q5LinearAddScheduleId;
+            return schedule == S::MmaResidualR64C64 || schedule == S::MmaResidualR64C128;
         }
-        return ops::detail::q5_schedule_uses_mma(resolve_auto_q5_plan(shape, t).schedule);
+        const auto launch = resolve_auto_q5_launch(shape, t);
+        return launch == ops::detail::launch_q5_mma_r64_c64 ||
+               launch == ops::detail::launch_q5_mma_r64_c128;
     }
     if (qtype == QType::Q6G64_F16S) {
-        return ops::detail::q6_schedule_uses_mma(resolve_auto_q6_plan(shape, t).schedule);
+        const auto launch = resolve_auto_q6_launch(shape, t);
+        return launch == ops::detail::launch_q6_mma_r64_c64 ||
+               launch == ops::detail::launch_q6_mma_r64_c128;
     }
     if (qtype != QType::W8G32_F16S) { return false; }
     if (opt.linear_add) {
         return ops::detail::w8_linear_add_schedule_uses_mma(
             resolve_auto_w8_linear_add_plan(shape, t).schedule);
     }
-    return ops::detail::w8_schedule_uses_mma(resolve_auto_w8_plan(shape, t).schedule);
+    const auto launch = resolve_auto_w8_launch(shape, t);
+    return launch != ops::detail::launch_w8_decode_r4 &&
+           launch != ops::detail::launch_w8_simt_r8_c4 &&
+           launch != ops::detail::launch_w8_simt_r8_c8;
 }
 
 int candidate_mma_row_tile(const Options& opt, QType qtype, const ShapeSpec& shape,
                            std::int32_t t) {
-    ops::detail::W8ScheduleId schedule{};
-    if (opt.candidate == CandidateKind::W8Fixed) {
-        schedule = opt.w8_schedule;
-    } else if (opt.candidate == CandidateKind::Auto && qtype == QType::W8G32_F16S) {
-        if (opt.linear_add) {
-            using S                        = ops::detail::W8LinearAddScheduleId;
-            const auto linear_add_schedule = resolve_auto_w8_linear_add_plan(shape, t).schedule;
-            switch (linear_add_schedule) {
-            case S::DecodeR16:
-                throw std::logic_error("decode W8 LinearAdd schedule has no MMA row tile");
-            case S::SplitKMmaExactT:
-            case S::SplitKMma32PlusTail:
-                return 16;
-            case S::MmaR32C64:
-            case S::MmaR32C80:
-            case S::MmaR32C96:
-            case S::MmaR32C128:
-                return 32;
-            case S::MmaR48C64:
-            case S::MmaR48C96:
-            case S::MmaR48C112:
-            case S::MmaR48C128:
-                return 48;
-            case S::MmaR64C96:
-            case S::MmaR64C112:
-            case S::MmaR64C128:
-                return 64;
-            case S::MmaR128C64:
-            case S::MmaR128C80:
-                return 128;
-            case S::SimtR8C4:
-                throw std::logic_error("SIMT W8 LinearAdd schedule has no MMA row tile");
-            }
-            throw std::logic_error("unknown W8 LinearAdd schedule row tile");
+    if (qtype != QType::W8G32_F16S) { return 64; }
+    if (opt.linear_add) {
+        using S             = ops::detail::W8LinearAddScheduleId;
+        const auto schedule = resolve_auto_w8_linear_add_plan(shape, t).schedule;
+        switch (schedule) {
+        case S::SplitKMmaExactT:
+        case S::SplitKMma32PlusTail:
+            return 16;
+        case S::MmaR32C64:
+        case S::MmaR32C80:
+        case S::MmaR32C96:
+        case S::MmaR32C128:
+            return 32;
+        case S::MmaR48C64:
+        case S::MmaR48C96:
+        case S::MmaR48C112:
+        case S::MmaR48C128:
+            return 48;
+        case S::MmaR64C96:
+        case S::MmaR64C112:
+        case S::MmaR64C128:
+            return 64;
+        case S::MmaR128C64:
+        case S::MmaR128C80:
+            return 128;
+        default:
+            throw std::logic_error("non-MMA W8 LinearAdd route has no MMA row tile");
         }
-        schedule = resolve_auto_w8_plan(shape, t).schedule;
-    } else {
-        return 64;
     }
-    switch (schedule) {
-    case ops::detail::W8ScheduleId::SplitKMmaExactT:
-    case ops::detail::W8ScheduleId::SplitKMma32PlusTail:
-    case ops::detail::W8ScheduleId::SplitKMediumC48:
-    case ops::detail::W8ScheduleId::SplitKMediumC64:
-    case ops::detail::W8ScheduleId::SplitKMediumC96:
-    case ops::detail::W8ScheduleId::SplitKMediumC128:
-    case ops::detail::W8ScheduleId::SplitKMediumC144:
-    case ops::detail::W8ScheduleId::SplitKMediumC160:
+    const auto launch = resolve_auto_w8_launch(shape, t);
+    if (launch == ops::detail::launch_w8_exact_t_splitk ||
+        launch == ops::detail::launch_w8_exact_t_composite ||
+        launch == ops::detail::launch_w8_medium_splitk_c96 ||
+        launch == ops::detail::launch_w8_medium_splitk_c128 ||
+        launch == ops::detail::launch_w8_medium_splitk_c144) {
         return 16;
-    case ops::detail::W8ScheduleId::MmaR32C32:
-    case ops::detail::W8ScheduleId::MmaR32C48:
-    case ops::detail::W8ScheduleId::MmaR32C64:
-    case ops::detail::W8ScheduleId::MmaR32C80:
-    case ops::detail::W8ScheduleId::MmaR32C96:
-    case ops::detail::W8ScheduleId::MmaR32C112:
-    case ops::detail::W8ScheduleId::MmaR32C128:
-        return 32;
-    case ops::detail::W8ScheduleId::MmaR48C64:
-    case ops::detail::W8ScheduleId::MmaR48C80:
-    case ops::detail::W8ScheduleId::MmaR48C96:
-    case ops::detail::W8ScheduleId::MmaR48C112:
-    case ops::detail::W8ScheduleId::MmaR48C128:
-        return 48;
-    case ops::detail::W8ScheduleId::MmaR64C32:
-    case ops::detail::W8ScheduleId::MmaR64C48:
-    case ops::detail::W8ScheduleId::MmaR64C64:
-    case ops::detail::W8ScheduleId::MmaR64C80:
-    case ops::detail::W8ScheduleId::MmaR64C96:
-    case ops::detail::W8ScheduleId::MmaR64C112:
-    case ops::detail::W8ScheduleId::MmaR64C128:
-        return 64;
-    case ops::detail::W8ScheduleId::MmaR96C64:
-    case ops::detail::W8ScheduleId::MmaR96C80:
-    case ops::detail::W8ScheduleId::MmaR96C96:
-    case ops::detail::W8ScheduleId::MmaR96C112:
-        return 96;
-    case ops::detail::W8ScheduleId::MmaR128C64:
-    case ops::detail::W8ScheduleId::MmaR128C80:
-        return 128;
-    case ops::detail::W8ScheduleId::DecodeR4:
-    case ops::detail::W8ScheduleId::DecodeR8:
-    case ops::detail::W8ScheduleId::DecodeR16:
-    case ops::detail::W8ScheduleId::SimtR8C4:
-    case ops::detail::W8ScheduleId::SimtR8C8:
-        throw std::logic_error("SIMT W8 schedule has no MMA row tile");
     }
-    throw std::logic_error("unknown W8 schedule row tile");
+#define W8_ROW(LAUNCH, ROWS)                                                                       \
+    if (launch == ops::detail::LAUNCH) { return ROWS; }
+    W8_ROW(launch_w8_mma_r32_c64, 32)
+    W8_ROW(launch_w8_mma_r32_c96, 32)
+    W8_ROW(launch_w8_mma_r32_c128, 32)
+    W8_ROW(launch_w8_exact_mma_r32_c96, 32)
+    W8_ROW(launch_w8_exact_mma_r32_c128, 32)
+    W8_ROW(launch_w8_mma_r48_c64, 48)
+    W8_ROW(launch_w8_mma_r48_c96, 48)
+    W8_ROW(launch_w8_mma_r48_c112, 48)
+    W8_ROW(launch_w8_mma_r48_c128, 48)
+    W8_ROW(launch_w8_exact_mma_r48_c96, 48)
+    W8_ROW(launch_w8_exact_mma_r48_c128, 48)
+    W8_ROW(launch_w8_mma_r64_c96, 64)
+    W8_ROW(launch_w8_mma_r64_c112, 64)
+    W8_ROW(launch_w8_mma_r64_c128, 64)
+    W8_ROW(launch_w8_exact_mma_r64_c96, 64)
+    W8_ROW(launch_w8_exact_mma_r64_c128, 64)
+    W8_ROW(launch_w8_mma_r96_c96, 96)
+    W8_ROW(launch_w8_exact_mma_r96_c96, 96)
+    W8_ROW(launch_w8_mma_r128_c64, 128)
+    W8_ROW(launch_w8_mma_r128_c80, 128)
+    W8_ROW(launch_w8_exact_mma_r128_c80, 128)
+#undef W8_ROW
+    throw std::logic_error("unknown W8 MMA launcher row tile");
 }
 
 RunResult run_target(const TargetSpec& target, const Options& opt, double stream_ceiling_gbs,
@@ -1920,11 +1341,10 @@ RunResult run_target(const TargetSpec& target, const Options& opt, double stream
     if (candidate_uses_mma(opt, target.qtype, shape, t)) {
         const std::int64_t executed_rows =
             align_up_u64(shape.n, candidate_mma_row_tile(opt, target.qtype, shape, t));
-        const std::int64_t executed_cols =
-            candidate_uses_conditioning_exact_tail(opt, target.qtype, shape, t)
-                ? t
-                : align_up_u64(t, col_tile);
-        const double executed_flops = 2.0 * static_cast<double>(executed_rows) *
+        const bool exact_tail = target.qtype == QType::W8G32_F16S && !opt.linear_add &&
+                                w8_launch_has_exact_tail(resolve_auto_w8_launch(shape, t));
+        const std::int64_t executed_cols = exact_tail ? t : align_up_u64(t, col_tile);
+        const double executed_flops      = 2.0 * static_cast<double>(executed_rows) *
                                       static_cast<double>(shape.k) *
                                       static_cast<double>(executed_cols);
         executed_tflops = sec > 0.0 ? executed_flops / sec / 1e12 : 0.0;
@@ -1938,37 +1358,13 @@ RunResult run_target(const TargetSpec& target, const Options& opt, double stream
             : 0.0;
 
     RunResult r;
-    r.shape_name     = shape.name;
-    r.qtype_name     = qtype_name(target.qtype);
-    r.candidate_name = candidate_name(opt, target.qtype, shape, t);
-    if (opt.candidate == CandidateKind::Q5Fixed) {
-        r.kernel_variant = ops::detail::q5_kernel_variant_name(selected_q5_variant(opt, shape, t));
-    } else if (opt.candidate == CandidateKind::Q6Fixed) {
-        r.kernel_variant = ops::detail::q6_kernel_variant_name(selected_q6_variant(opt, shape, t));
-    } else if (opt.candidate == CandidateKind::W8Fixed) {
-        r.kernel_variant =
-            candidate_uses_conditioning_exact_tail(opt, target.qtype, shape, t)
-                ? "exact_tail"
-                : ops::detail::w8_kernel_variant_name(selected_w8_variant(opt, shape, t));
-    } else if (opt.candidate == CandidateKind::Auto && target.qtype == QType::Q5G64_F16S) {
-        const auto variant = opt.linear_add ? resolve_auto_q5_linear_add_plan(shape, t).variant
-                                            : resolve_auto_q5_plan(shape, t).variant;
-        r.kernel_variant   = ops::detail::q5_kernel_variant_name(variant);
-    } else if (opt.candidate == CandidateKind::Auto && target.qtype == QType::Q6G64_F16S) {
-        r.kernel_variant =
-            ops::detail::q6_kernel_variant_name(resolve_auto_q6_plan(shape, t).variant);
-    } else if (opt.candidate == CandidateKind::Auto && target.qtype == QType::W8G32_F16S) {
-        if (!opt.linear_add &&
-            candidate_uses_conditioning_exact_tail(opt, target.qtype, shape, t)) {
-            r.kernel_variant = "exact_tail";
-        } else {
-            const auto variant = opt.linear_add ? resolve_auto_w8_linear_add_plan(shape, t).variant
-                                                : resolve_auto_w8_plan(shape, t).variant;
-            r.kernel_variant   = ops::detail::w8_kernel_variant_name(variant);
-        }
-    } else {
-        r.kernel_variant = "n/a";
-    }
+    r.shape_name                      = shape.name;
+    r.qtype_name                      = qtype_name(target.qtype);
+    r.candidate_name                  = candidate_name(opt, target.qtype, shape, t);
+    r.kernel_variant                  = target.qtype == QType::W8G32_F16S && !opt.linear_add &&
+                               w8_launch_has_exact_tail(resolve_auto_w8_launch(shape, t))
+                                            ? "exact_tail"
+                                            : "launcher_internal";
     r.n                               = shape.n;
     r.k                               = shape.k;
     r.t                               = t;
@@ -2022,42 +1418,13 @@ RunResult run_paired_kv(const TargetSpec& target, const Options& opt, double str
     Weight wv                    = make_w8_row_view(parent, first_row + shape.n, shape.n);
     WorkspaceArena ws(64ULL << 20);
 
-    const ops::detail::W8PairProblem pair_problem{shape.n, shape.k, shape.k, t};
-    const auto resolve_pair_plan = [&]() {
-        if (opt.candidate != CandidateKind::W8PairFixed) {
-            return ops::detail::w8_pair_resolve_plan(pair_problem);
-        }
-        if (!opt.w8_variant_auto) {
-            const ops::detail::W8PairPlan candidate{
-                opt.w8_pair_schedule, opt.w8_variant, 0,
-                opt.w8_pair_exact_tail ? ops::detail::W8PairTailPolicy::Exact
-                                       : ops::detail::W8PairTailPolicy::Homogeneous};
-            if (!ops::detail::w8_pair_candidate_is_legal(candidate, pair_problem)) {
-                throw std::invalid_argument("selected W8 pair candidate/variant is illegal");
-            }
-            return candidate;
-        }
-        for (const ops::detail::W8KernelVariant variant :
-             {ops::detail::W8KernelVariant::None, ops::detail::W8KernelVariant::Full,
-              ops::detail::W8KernelVariant::Predicated}) {
-            const ops::detail::W8PairPlan candidate{
-                opt.w8_pair_schedule, variant, 0,
-                opt.w8_pair_exact_tail ? ops::detail::W8PairTailPolicy::Exact
-                                       : ops::detail::W8PairTailPolicy::Homogeneous};
-            if (ops::detail::w8_pair_candidate_is_legal(candidate, pair_problem)) {
-                return candidate;
-            }
-        }
-        throw std::invalid_argument("selected W8 pair candidate is illegal");
-    };
-    const ops::detail::W8PairPlan pair_plan = resolve_pair_plan();
+    const ops::detail::W8PairPlan pair_plan =
+        ops::detail::w8_pair_resolve_plan({shape.n, shape.k, shape.k, t});
 
     const auto launch = [&](cudaStream_t s) {
         if (opt.paired_composed) {
             ops::linear(tx, wk, tk, ws, s);
             ops::linear(tx, wv, tv, ws, s);
-        } else if (opt.candidate == CandidateKind::W8PairFixed) {
-            ops::detail::w8_pair_execute_candidate(pair_plan, tx, wk, wv, tk, tv, s);
         } else {
             ops::linear_pair(tx, wk, wv, tk, tv, ws, s);
         }
@@ -2075,9 +1442,8 @@ RunResult run_paired_kv(const TargetSpec& target, const Options& opt, double str
     const double sec                 = cold.median_us * 1e-6;
     const double flops =
         4.0 * static_cast<double>(shape.n) * static_cast<double>(shape.k) * static_cast<double>(t);
-    const ops::detail::W8Plan linear_plan =
-        ops::detail::w8_rowsplit_resolve_plan({shape.n, shape.k, shape.k, t});
-    const auto pair_col_tile = [](ops::detail::W8PairScheduleId schedule,
+    const ops::detail::W8Launch linear_launch = resolve_auto_w8_launch(shape, t);
+    const auto pair_col_tile                  = [](ops::detail::W8PairScheduleId schedule,
                                   std::int32_t active_cols) {
         using PairSchedule = ops::detail::W8PairScheduleId;
         switch (schedule) {
@@ -2122,6 +1488,7 @@ RunResult run_paired_kv(const TargetSpec& target, const Options& opt, double str
         case PairSchedule::ConcatMmaR64C80:
         case PairSchedule::ConcatMmaR96C80:
         case PairSchedule::ConcatMmaR128C80:
+        case PairSchedule::ExactConcatMmaR128C80:
             return 80;
         case PairSchedule::DualMmaR32C96:
             return 96;
@@ -2142,37 +1509,37 @@ RunResult run_paired_kv(const TargetSpec& target, const Options& opt, double str
         case PairSchedule::ConcatMmaR48C96:
         case PairSchedule::ConcatMmaR64C96:
         case PairSchedule::ConcatMmaR96C96:
+        case PairSchedule::ExactConcatMmaR32C96:
+        case PairSchedule::ExactConcatMmaR64C96:
+        case PairSchedule::ExactConcatMmaR96C96:
             return 96;
         case PairSchedule::ConcatMmaR32C128:
         case PairSchedule::ConcatMmaR48C128:
         case PairSchedule::ConcatMmaR64C128:
+        case PairSchedule::ExactConcatMmaR32C128:
+        case PairSchedule::ExactConcatMmaR64C128:
             return 128;
+        case PairSchedule::ExactConcatMmaR128C64:
+            return 64;
         }
         throw std::logic_error("unknown W8 pair schedule");
     };
-    const int col_tile                = opt.paired_composed
-                                            ? (linear_plan.schedule == ops::detail::W8ScheduleId::SimtR8C4 ? 4
-                                               : linear_plan.schedule == ops::detail::W8ScheduleId::SimtR8C8 ? 8
-                                                                                                             : 128)
-                                            : pair_col_tile(pair_plan.schedule, t);
+    const int col_tile                = opt.paired_composed ? w8_launch_col_tile(linear_launch, t)
+                                                            : pair_col_tile(pair_plan.schedule, t);
     const std::uint64_t weight_passes = static_cast<std::uint64_t>((t + col_tile - 1) / col_tile);
     const std::uint64_t weight_replay_lower_bound_bytes =
         weight_bytes * weight_passes + x_bytes + out_bytes;
 
     RunResult r;
-    r.shape_name = shape.name;
-    r.qtype_name = "W8G32x2";
-    r.candidate_name =
-        opt.paired_composed
-            ? std::string("w8_pair.composed.") + ops::detail::w8_schedule_name(linear_plan.schedule)
-            : std::string(ops::detail::w8_pair_schedule_name(pair_plan.schedule)) +
-                  (pair_plan.tail_policy == ops::detail::W8PairTailPolicy::Exact ? ".exact_tail"
-                                                                                 : "");
-    r.kernel_variant = ops::detail::w8_kernel_variant_name(opt.paired_composed ? linear_plan.variant
-                                                                               : pair_plan.variant);
-    r.n              = shape.n * 2;
-    r.k              = shape.k;
-    r.t              = t;
+    r.shape_name                      = shape.name;
+    r.qtype_name                      = "W8G32x2";
+    r.candidate_name                  = opt.paired_composed
+                                            ? std::string("w8_pair.composed.") + w8_launch_name(linear_launch)
+                                            : ops::detail::w8_pair_schedule_name(pair_plan.schedule);
+    r.kernel_variant                  = "launcher_internal";
+    r.n                               = shape.n * 2;
+    r.k                               = shape.k;
+    r.t                               = t;
     r.weight_payload_bytes            = weight_bytes;
     r.x_bytes                         = x_bytes;
     r.out_bytes                       = out_bytes;
@@ -2187,47 +1554,18 @@ RunResult run_paired_kv(const TargetSpec& target, const Options& opt, double str
         sec > 0.0 ? static_cast<double>(weight_replay_lower_bound_bytes) / sec / 1e9 : 0.0;
     r.useful_copy_ceiling_pct =
         stream_ceiling_gbs > 0.0 ? r.useful_gbs / stream_ceiling_gbs * 100.0 : 0.0;
-    r.useful_tflops = sec > 0.0 ? flops / sec / 1e12 : 0.0;
-    const bool tensor_core =
-        opt.paired_composed
-            ? ops::detail::w8_schedule_uses_mma(linear_plan.schedule)
-            : pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMmaExactT ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMediumC48 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMediumC64 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMediumC80 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMediumC88 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMediumC96 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMediumC104 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMediumC112 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMediumC128 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMediumC160 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMediumC192 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMediumC224 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMediumC256 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualMmaR32C64 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualMmaR32C80 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualMmaR32C96 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualMmaR32C112 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualMmaR32C128 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR32C64 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR32C80 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR32C96 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR32C112 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR32C128 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR48C64 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR48C96 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR48C112 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR48C128 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR64C64 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR64C80 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR64C96 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR64C128 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR96C64 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR96C80 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR96C96 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR96C112 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR128C64 ||
-                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR128C80;
+    r.useful_tflops          = sec > 0.0 ? flops / sec / 1e12 : 0.0;
+    const auto pair_schedule = pair_plan.schedule;
+    const bool pair_uses_mma = pair_schedule != ops::detail::W8PairScheduleId::TwoSimtR8C4 &&
+                               pair_schedule != ops::detail::W8PairScheduleId::TwoSimtR8C8 &&
+                               pair_schedule != ops::detail::W8PairScheduleId::DualDecodeR4 &&
+                               pair_schedule != ops::detail::W8PairScheduleId::DualDecodeR8 &&
+                               pair_schedule != ops::detail::W8PairScheduleId::DualDecodeR16;
+    const bool tensor_core = opt.paired_composed
+                                 ? linear_launch != ops::detail::launch_w8_decode_r4 &&
+                                       linear_launch != ops::detail::launch_w8_simt_r8_c4 &&
+                                       linear_launch != ops::detail::launch_w8_simt_r8_c8
+                                 : pair_uses_mma;
     if (tensor_core) {
         std::uint64_t row_tile = 32;
         if (!opt.paired_composed) {
@@ -2243,29 +1581,41 @@ RunResult run_paired_kv(const TargetSpec& target, const Options& opt, double str
             case PairSchedule::ConcatMmaR64C80:
             case PairSchedule::ConcatMmaR64C96:
             case PairSchedule::ConcatMmaR64C128:
+            case PairSchedule::ExactConcatMmaR64C96:
+            case PairSchedule::ExactConcatMmaR64C128:
                 row_tile = 64;
                 break;
             case PairSchedule::ConcatMmaR96C64:
             case PairSchedule::ConcatMmaR96C80:
             case PairSchedule::ConcatMmaR96C96:
             case PairSchedule::ConcatMmaR96C112:
+            case PairSchedule::ExactConcatMmaR96C96:
                 row_tile = 96;
                 break;
             case PairSchedule::ConcatMmaR128C64:
             case PairSchedule::ConcatMmaR128C80:
+            case PairSchedule::ExactConcatMmaR128C64:
+            case PairSchedule::ExactConcatMmaR128C80:
                 row_tile = 128;
                 break;
             default:
                 break;
             }
         }
+        const bool exact_pair_tail =
+            pair_schedule == ops::detail::W8PairScheduleId::ExactConcatMmaR32C96 ||
+            pair_schedule == ops::detail::W8PairScheduleId::ExactConcatMmaR32C128 ||
+            pair_schedule == ops::detail::W8PairScheduleId::ExactConcatMmaR64C96 ||
+            pair_schedule == ops::detail::W8PairScheduleId::ExactConcatMmaR64C128 ||
+            pair_schedule == ops::detail::W8PairScheduleId::ExactConcatMmaR96C96 ||
+            pair_schedule == ops::detail::W8PairScheduleId::ExactConcatMmaR128C64 ||
+            pair_schedule == ops::detail::W8PairScheduleId::ExactConcatMmaR128C80;
         const auto executed_rows    = align_up_u64(shape.n, row_tile);
         std::uint64_t executed_cols = align_up_u64(t, static_cast<std::uint64_t>(col_tile));
         if (!opt.paired_composed &&
             pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMmaExactT) {
             executed_cols = static_cast<std::uint64_t>(t);
-        } else if (!opt.paired_composed &&
-                   pair_plan.tail_policy == ops::detail::W8PairTailPolicy::Exact) {
+        } else if (!opt.paired_composed && exact_pair_tail) {
             const std::uint64_t full_cols = (static_cast<std::uint64_t>(t) / col_tile) * col_tile;
             const std::uint64_t tail      = static_cast<std::uint64_t>(t) - full_cols;
             const std::uint64_t executed_tail = tail <= 32   ? tail

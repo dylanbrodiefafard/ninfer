@@ -83,9 +83,9 @@ through their production dispatch at the default `T=1024` prefill extent:
   --shape Out5120x6144 --qtype Q5 --linear-add --t-sweep 1024
 ```
 
-The benchmark records the selected physical route, any variant exposed by a diagnostic candidate
-mode, cold-cache timing, measured tensor-core ceiling, and useful/executed throughput. Q4
-Full/Predicated selection is launcher-private and is therefore not reported as a benchmark variant.
+The benchmark records the selected production route, cold-cache timing, measured tensor-core
+ceiling, and useful/executed throughput. Full/Predicated selection is launcher-private and is not
+exposed as a benchmark control.
 
 ## W8 context K/V LinearPair Op benchmark
 
@@ -93,18 +93,18 @@ Full/Predicated selection is launcher-private and is therefore not reported as a
 adjacent K/V row views of one W8 `[6144,2048]` parent. Production dispatch includes the direct
 one-pass decode kernel, exact- and medium-T split-K Tensor Core kernels, concatenated K/V Tensor
 Core schedules, and exact residual-T routes. `--pair-composed` retains two ordinary public
-`linear` calls as the semantic and performance control. Fixed `w8-pair-*` candidates expose the
-schedule families used to tune every production seam.
+`linear` calls as the semantic and performance control. The benchmark no longer exposes private
+schedule or variant forcing.
 
 ```bash
 cmake --build build --parallel --target ninfer_linear_op_bench
 ./build/bench/ninfer_linear_op_bench \
-  --rows 1024 --k 2048 --qtype W8G32 --paired-kv --candidate auto \
+  --rows 1024 --k 2048 --qtype W8G32 --paired-kv \
   --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,32,33,48,49,64,65,80,81,88,89,96,97,104,105,112,113,128,129,160,161,192,193,384,385,640,641,672,673,896,897,960,961,976,977,1024,1280,1440,1441,1680,1920,2048,2208,2209,2270,2271,2304 \
   --warmup 10 --repeat 50 \
   --csv-out profiles/bench/w8_context_kv_pair.csv
 ./build/bench/ninfer_linear_op_bench \
-  --rows 1024 --k 2048 --qtype W8G32 --paired-kv --candidate auto \
+  --rows 1024 --k 2048 --qtype W8G32 --paired-kv \
   --t-sweep "$(seq -s, 1 2305)" --warmup 3 --repeat 20 \
   --csv-out profiles/bench/w8_context_kv_pair_all_t.csv
 ./build/bench/ninfer_linear_op_bench \
@@ -306,20 +306,19 @@ cmake --build build --parallel --target ninfer_w8_linear_add_bench
 `ninfer_linear_op_bench` with numeric W8 shape `[2048,16384]` measures the 35B-A3B
 target-feature conditioning projection without introducing a target or Engine route. Production
 dispatch uses a direct decode kernel, exact and medium split-K Tensor Core kernels, and tuned tiled
-Tensor Core schedules. The retained fixed candidates and
-`--w8-conditioning-exact-tail` expose the alternatives used to tune every production seam.
-Every cold-cache sample follows a 256 MiB L2 flush; the row also reports the same-process BF16
-Tensor Core ceiling and useful/executed throughput.
+Tensor Core schedules. The benchmark follows the production selector and does not expose private
+schedule, variant, or exact-tail forcing. Every cold-cache sample follows a 256 MiB L2 flush; the
+row also reports the same-process BF16 Tensor Core ceiling and useful/executed throughput.
 
 ```bash
 cmake --build build --parallel --target ninfer_linear_op_bench
 ./build/bench/ninfer_linear_op_bench \
-  --rows 2048 --k 16384 --qtype W8G32 --candidate auto \
+  --rows 2048 --k 16384 --qtype W8G32 \
   --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,32,33,64,65,96,128,129,256,480,481,640,641,704,705,896,897,960,961,1024,1120,1280,1344,1345,1440,1680,1792,1920,2016,2048,2112 \
   --warmup 10 --repeat 50 \
   --csv-out profiles/bench/w8_conditioning_linear.csv
 ./build/bench/ninfer_linear_op_bench \
-  --rows 2048 --k 16384 --qtype W8G32 --candidate auto \
+  --rows 2048 --k 16384 --qtype W8G32 \
   --t-sweep "$(seq -s, 1 2112)" --warmup 3 --repeat 10 \
   --csv-out profiles/bench/w8_conditioning_linear_all_t.csv
 ```
@@ -329,9 +328,9 @@ cmake --build build --parallel --target ninfer_linear_op_bench
 `ninfer_w8_input_proj_bench` measures the registered 35B-A3B target's W8 Attention
 `[9216,2048]`, the companion Q/K/V Attention `[6144,2048]`, and GDN `[12288,2048]`
 multi-output Ops. Production writes independent contiguous consumer allocations directly. The
-controls expose each compiled SIMT/MMA candidate plus the semantically equivalent parent Linear
-alone and parent Linear followed by four, three, or two column extracts. Each timed sample is
-preceded by a 256 MiB L2 flush.
+non-production sweep exposes only the fused Op's compiled local launchers. Unsupported parent
+Linear and parent-plus-extract controls were removed instead of expanding the pure W8 registry.
+Each timed sample is preceded by a 256 MiB L2 flush.
 
 `--op companion-attention` covers the exact `T=1..16` proposal domain and the tuned prefill
 dispatch. `--production-only` suppresses candidates for a compact boundary sweep; `--profile`

@@ -16,7 +16,6 @@
 
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
-#include "ops/linear/q6/q6_rowsplit_launch.h"
 #include "ops/linear/q6/q6_rowsplit_storage.cuh"
 
 #include <cuda_bf16.h>
@@ -182,7 +181,7 @@ q6_simt_consume_stage(const __nv_bfloat16* __restrict__ x, std::int32_t k, int c
     }
 }
 
-template <class Schedule, Q6KernelVariant Variant>
+template <class Schedule>
 __global__ __launch_bounds__(
     Schedule::kThreads,
     Schedule::
@@ -197,10 +196,6 @@ __global__ __launch_bounds__(
                                                                   std::int32_t rows, std::int32_t k,
                                                                   std::int32_t cols,
                                                                   std::int32_t padded_k) {
-    static_assert(Variant == Q6KernelVariant::Full || Variant == Q6KernelVariant::Predicated,
-                  "Q6 SIMT GEMM requires a tiled kernel variant");
-
-    constexpr bool kFull              = Variant == Q6KernelVariant::Full;
     constexpr int kRowsPerCta         = Schedule::kRowsPerCta;
     constexpr int kColsPerTile        = Schedule::kColsPerTile;
     constexpr int kGroupsPerStage     = Schedule::kGroupsPerStage;
@@ -218,17 +213,14 @@ __global__ __launch_bounds__(
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp = static_cast<int>(threadIdx.x) >> 5;
     const int row  = static_cast<int>(blockIdx.x) * kRowsPerCta + warp;
-    if constexpr (!kFull) {
-        if (row >= rows) { return; }
-    }
+    if (row >= rows) { return; }
 
     const int col0        = static_cast<int>(blockIdx.y) * kColsPerTile;
-    const int active_cols = kFull ? kColsPerTile : min(kColsPerTile, cols - col0);
+    const int active_cols = min(kColsPerTile, cols - col0);
 
     const int padded_groups = padded_k / Q6RowSplitStorage::kGroupK;
     const int groups        = k / Q6RowSplitStorage::kGroupK;
-    const int stages =
-        kFull ? groups / kGroupsPerStage : (groups + kGroupsPerStage - 1) / kGroupsPerStage;
+    const int stages        = (groups + kGroupsPerStage - 1) / kGroupsPerStage;
 
     const std::uint8_t* code_row = codes + static_cast<std::int64_t>(row) * padded_groups *
                                                Q6RowSplitStorage::kCodeBytesPerGroup;
@@ -244,9 +236,8 @@ __global__ __launch_bounds__(
 #pragma unroll
     for (int prefetch = 0; prefetch < kPipelinePrefetch; ++prefetch) {
         if (prefetch < stages) {
-            const int active_groups =
-                kFull ? kGroupsPerStage : min(kGroupsPerStage, groups - prefetch * kGroupsPerStage);
-            q6_simt_issue_stage<Schedule, kFull>(shared_codes[warp][prefetch],
+            const int active_groups = min(kGroupsPerStage, groups - prefetch * kGroupsPerStage);
+            q6_simt_issue_stage<Schedule, false>(shared_codes[warp][prefetch],
                                                  shared_high[warp][prefetch],
                                                  shared_scales[warp][prefetch], code_row, high_row,
                                                  scale_row, prefetch, active_groups, lane);
@@ -259,10 +250,9 @@ __global__ __launch_bounds__(
     for (int stage = 0; stage < stages; ++stage) {
         const int fetch = stage + kPipelinePrefetch;
         if (fetch < stages) {
-            const int active_groups =
-                kFull ? kGroupsPerStage : min(kGroupsPerStage, groups - fetch * kGroupsPerStage);
-            const int buffer = fetch % kPipelineStages;
-            q6_simt_issue_stage<Schedule, kFull>(
+            const int active_groups = min(kGroupsPerStage, groups - fetch * kGroupsPerStage);
+            const int buffer        = fetch % kPipelineStages;
+            q6_simt_issue_stage<Schedule, false>(
                 shared_codes[warp][buffer], shared_high[warp][buffer], shared_scales[warp][buffer],
                 code_row, high_row, scale_row, fetch, active_groups, lane);
         } else {
@@ -272,10 +262,9 @@ __global__ __launch_bounds__(
         cp_wait<kPipelinePrefetch>();
         __syncwarp();
 
-        const int active_groups =
-            kFull ? kGroupsPerStage : min(kGroupsPerStage, groups - stage * kGroupsPerStage);
-        const int buffer = stage % kPipelineStages;
-        q6_simt_consume_stage<Schedule, kFull, kFull>(
+        const int active_groups = min(kGroupsPerStage, groups - stage * kGroupsPerStage);
+        const int buffer        = stage % kPipelineStages;
+        q6_simt_consume_stage<Schedule, false, false>(
             x, k, col0, active_cols, stage, active_groups, shared_codes[warp][buffer],
             shared_high[warp][buffer], shared_scales[warp][buffer], lane, acc);
         __syncwarp();
@@ -283,7 +272,7 @@ __global__ __launch_bounds__(
 
 #pragma unroll
     for (int col = 0; col < kColsPerTile; ++col) {
-        if (kFull || col < active_cols) {
+        if (col < active_cols) {
             const float sum = warp_reduce_sum(acc[col]);
             if (lane == 0) {
                 out[static_cast<std::int64_t>(col0 + col) * rows + row] = __float2bfloat16(sum);

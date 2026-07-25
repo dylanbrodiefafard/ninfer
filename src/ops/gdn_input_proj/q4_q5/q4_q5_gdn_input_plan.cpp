@@ -42,16 +42,6 @@ bool supported_shape(const Q4Q5GdnInputProblem& problem) noexcept {
            problem.output_rows == 10240 && problem.padded_k == 5120;
 }
 
-bool same_q5_plan(Q5Plan lhs, Q5Plan rhs) {
-    return lhs.schedule == rhs.schedule && lhs.variant == rhs.variant;
-}
-
-bool same_q5_plan(const std::optional<Q5Plan>& lhs, const std::optional<Q5Plan>& rhs) {
-    if (lhs.has_value() != rhs.has_value()) { return false; }
-    if (!lhs.has_value()) { return true; }
-    return same_q5_plan(*lhs, *rhs);
-}
-
 } // namespace
 
 const char* q4_q5_gdn_input_schedule_name(Q4Q5GdnInputScheduleId schedule) noexcept {
@@ -78,13 +68,8 @@ Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem
         if (!route.cols.contains(problem.cols)) { continue; }
         Q4Q5GdnInputPlan plan{
             route.schedule,
-            std::nullopt,
             0,
         };
-        if (route.schedule == Q4Q5GdnInputScheduleId::IndependentDirectFixed) {
-            plan.independent_value = q5_rowsplit_resolve_plan(
-                {problem.value_rows, problem.input_rows, problem.padded_k, problem.cols});
-        }
         return plan;
     }
     throw std::logic_error("Q4/Q5 GDN input: admitted problem has no covering route");
@@ -104,9 +89,7 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
     const Q4Q5GdnInputProblem problem{
         x.ne[0], qk_weight.n, v_weight.n, qkv.ne[0], qk_weight.padded_shape[1], x.ne[1]};
     const Q4Q5GdnInputPlan resolved = q4_q5_gdn_input_resolve_plan(problem);
-    if (resolved.schedule != plan.schedule ||
-        !same_q5_plan(resolved.independent_value, plan.independent_value) ||
-        resolved.workspace_bytes != plan.workspace_bytes) {
+    if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument("Q4/Q5 GDN input: plan does not match exact problem");
     }
 
@@ -115,8 +98,7 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
         (void)ws;
         Tensor qk    = qkv.slice(0, 0, problem.qk_rows);
         Tensor value = qkv.slice(0, problem.qk_rows, problem.value_rows);
-        q4_q5_gdn_input_independent_launch(*plan.independent_value, x, qk_weight, v_weight, qk,
-                                           value, stream);
+        q4_q5_gdn_input_independent_launch(x, qk_weight, v_weight, qk, value, stream);
         return;
     }
     case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128:

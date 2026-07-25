@@ -1,4 +1,4 @@
-#include "ops/linear/w8/w8_rowsplit_kernels.h"
+#include "ops/linear/w8/w8_launch.h"
 
 #include "core/device.h"
 #include "ops/common/math.cuh"
@@ -89,14 +89,10 @@ void launch_decode(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t s
 
 } // namespace
 
-void w8_rowsplit_decode_r4_launch(const Tensor& x, const Weight& w, Tensor& out,
-                                  cudaStream_t stream) {
+void launch_w8_decode_r4(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+                         cudaStream_t stream) {
+    (void)ws;
     launch_decode<4>(x, w, out, stream);
-}
-
-void w8_rowsplit_decode_r8_launch(const Tensor& x, const Weight& w, Tensor& out,
-                                  cudaStream_t stream) {
-    launch_decode<8>(x, w, out, stream);
 }
 
 void w8_rowsplit_decode_r16_launch(const Tensor& x, const Weight& w, Tensor& out,

@@ -179,11 +179,8 @@ ninfer_add_test(ninfer_gdn_input_proj_conv_snapshot_test
 ninfer_add_test(ninfer_q4_linear_selector_test
   SOURCES ops/test_q4_linear_selector.cpp
   LIBRARIES ninfer_ops)
-ninfer_add_test(ninfer_q5_linear_candidate_test
-  SOURCES ops/test_q5_linear_candidates.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_test(ninfer_q5_linear_plan_test
-  SOURCES ops/test_q5_linear_plan.cpp
+ninfer_add_test(ninfer_q5_linear_selector_test
+  SOURCES ops/test_q5_linear_selector.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_test(ninfer_linear_add_plan_test
   SOURCES ops/test_linear_add_plan.cpp
@@ -194,20 +191,11 @@ ninfer_add_test(ninfer_linear_swiglu_plan_test
 ninfer_add_test(ninfer_input_proj_plan_test
   SOURCES ops/test_input_proj_plan.cpp
   LIBRARIES ninfer_ops)
-ninfer_add_test(ninfer_q6_linear_candidate_test
-  SOURCES ops/test_q6_linear_candidates.cpp
+ninfer_add_test(ninfer_q6_linear_selector_test
+  SOURCES ops/test_q6_linear_selector.cpp
   LIBRARIES ninfer_ops)
-ninfer_add_test(ninfer_q6_linear_plan_test
-  SOURCES ops/test_q6_linear_plan.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_test(ninfer_q6_linear_dispatch_test
-  SOURCES ops/test_q6_linear_dispatch.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_test(ninfer_w8_linear_plan_test
-  SOURCES ops/test_w8_linear_plan.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_test(ninfer_w8_linear_dispatch_test
-  SOURCES ops/test_w8_linear_dispatch.cpp
+ninfer_add_test(ninfer_w8_linear_selector_test
+  SOURCES ops/test_w8_linear_selector.cpp
   LIBRARIES ninfer_ops)
 
 ninfer_add_test(ninfer_qwen3_6_27b_visual_scatter_test

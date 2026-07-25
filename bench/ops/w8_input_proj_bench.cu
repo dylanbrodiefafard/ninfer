@@ -12,7 +12,6 @@
 #include "ops/attn_input_proj/w8/w8_attn_input_plan.h"
 #include "ops/gdn_input_proj/w8/w8_gdn_input_kernels.h"
 #include "ops/gdn_input_proj/w8/w8_gdn_input_plan.h"
-#include "ops/linear/w8/w8_rowsplit_launch.h"
 
 #include <cuda_runtime.h>
 
@@ -260,31 +259,6 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     }
 }
 
-ops::detail::W8KernelVariant simt_variant(std::int32_t t) {
-    return (t % 4) == 0 ? ops::detail::W8KernelVariant::Full
-                        : ops::detail::W8KernelVariant::Predicated;
-}
-
-ops::detail::W8KernelVariant mma_variant(std::int32_t t) {
-    return (t % 128) == 0 ? ops::detail::W8KernelVariant::Full
-                          : ops::detail::W8KernelVariant::Predicated;
-}
-
-ops::detail::W8KernelVariant mma_c64_variant(std::int32_t t) {
-    return (t % 64) == 0 ? ops::detail::W8KernelVariant::Full
-                         : ops::detail::W8KernelVariant::Predicated;
-}
-
-ops::detail::W8KernelVariant mma_c96_variant(std::int32_t t) {
-    return (t % 96) == 0 ? ops::detail::W8KernelVariant::Full
-                         : ops::detail::W8KernelVariant::Predicated;
-}
-
-ops::detail::W8KernelVariant mma_c80_variant(std::int32_t t) {
-    return (t % 80) == 0 ? ops::detail::W8KernelVariant::Full
-                         : ops::detail::W8KernelVariant::Predicated;
-}
-
 bench::DBuf make_i32(std::int32_t value) {
     bench::DBuf device(sizeof(value));
     CUDA_CHECK(cudaMemcpy(device.p, &value, sizeof(value), cudaMemcpyHostToDevice));
@@ -307,13 +281,11 @@ int main(int argc, char** argv) {
 
         if (options.op == OpSelection::All || options.op == OpSelection::CompanionAttention) {
             DevicePackedWeight packed = make_w8_weight(kCompanionAttnRows);
-            bench::DBuf parent(static_cast<std::size_t>(kCompanionAttnRows) * max_t * 2);
             bench::DBuf q(static_cast<std::size_t>(kCompanionAttnQRows) * max_t * 2);
             bench::DBuf k(static_cast<std::size_t>(kCompanionAttnKvRows) * max_t * 2);
             bench::DBuf v(static_cast<std::size_t>(kCompanionAttnKvRows) * max_t * 2);
             for (const std::int32_t t : options.t_sweep) {
                 Tensor x(input.p, DType::BF16, {kHidden, t});
-                Tensor out_parent(parent.p, DType::BF16, {kCompanionAttnRows, t});
                 Tensor tq(q.p, DType::BF16, {kCompanionAttnQRows, t});
                 Tensor tk(k.p, DType::BF16, {kCompanionAttnKvRows, t});
                 Tensor tv(v.p, DType::BF16, {kCompanionAttnKvRows, t});
@@ -327,17 +299,6 @@ int main(int argc, char** argv) {
                                 ops::detail::w8_attn_input_schedule_name(plan.schedule));
                     continue;
                 }
-                const auto parent_launch = [&](cudaStream_t s) {
-                    const ops::detail::W8ScheduleId schedule =
-                        t <= 16    ? ops::detail::W8ScheduleId::SimtR8C4
-                        : t <= 128 ? ops::detail::W8ScheduleId::MmaR32C128
-                                   : ops::detail::W8ScheduleId::MmaR64C128;
-                    const ops::detail::W8KernelVariant variant =
-                        schedule == ops::detail::W8ScheduleId::SimtR8C4 ? simt_variant(t)
-                                                                        : mma_variant(t);
-                    ops::detail::w8_rowsplit_launch_candidate(schedule, variant, x, packed.weight,
-                                                              out_parent, s);
-                };
                 const auto run = [&](const char* path, auto&& launch) {
                     append(results, "comp_attn", path, t,
                            measure_cold(launch, flush, stream, options.warmup, options.repeat),
@@ -361,68 +322,55 @@ int main(int argc, char** argv) {
                     });
                 }
                 run("simt_r8_c4", [&](cudaStream_t s) {
-                    ops::detail::w8_attn_input_simt_r8_c4_launch(simt_variant(t), x, packed.weight,
-                                                                 tq, tk, tv, s);
+                    ops::detail::w8_attn_input_simt_r8_c4_launch(x, packed.weight, tq, tk, tv, s);
                 });
                 if (t >= 2 && t <= 96) {
                     run("splitk_mma_direct", [&](cudaStream_t s) {
-                        ops::detail::w8_attn_input_splitk_mma_launch(
-                            ops::detail::W8KernelVariant::None, x, packed.weight, tq, tk, tv, s);
+                        ops::detail::w8_attn_input_splitk_mma_launch(x, packed.weight, tq, tk, tv,
+                                                                     s);
                     });
                 }
                 run("mma_r32_c128", [&](cudaStream_t s) {
-                    ops::detail::w8_attn_input_mma_r32_c128_launch(mma_variant(t), x, packed.weight,
-                                                                   tq, tk, tv, s);
+                    ops::detail::w8_attn_input_mma_r32_c128_launch(x, packed.weight, tq, tk, tv, s);
                 });
                 run("mma_r64_c128", [&](cudaStream_t s) {
-                    ops::detail::w8_attn_input_mma_r64_c128_launch(mma_variant(t), x, packed.weight,
-                                                                   tq, tk, tv, s);
+                    ops::detail::w8_attn_input_mma_r64_c128_launch(x, packed.weight, tq, tk, tv, s);
                 });
                 run("mma_r32_c64", [&](cudaStream_t s) {
-                    ops::detail::w8_companion_attn_input_mma_r32_c64_launch(
-                        mma_c64_variant(t), x, packed.weight, tq, tk, tv, s);
+                    ops::detail::w8_companion_attn_input_mma_r32_c64_launch(x, packed.weight, tq,
+                                                                            tk, tv, s);
                 });
                 run("mma_r64_c64", [&](cudaStream_t s) {
-                    ops::detail::w8_companion_attn_input_mma_r64_c64_launch(
-                        mma_c64_variant(t), x, packed.weight, tq, tk, tv, s);
+                    ops::detail::w8_companion_attn_input_mma_r64_c64_launch(x, packed.weight, tq,
+                                                                            tk, tv, s);
                 });
                 run("mma_r32_c96", [&](cudaStream_t s) {
-                    ops::detail::w8_companion_attn_input_mma_r32_c96_launch(
-                        mma_c96_variant(t), x, packed.weight, tq, tk, tv, s);
+                    ops::detail::w8_companion_attn_input_mma_r32_c96_launch(x, packed.weight, tq,
+                                                                            tk, tv, s);
                 });
                 run("mma_r64_c96", [&](cudaStream_t s) {
-                    ops::detail::w8_companion_attn_input_mma_r64_c96_launch(
-                        mma_c96_variant(t), x, packed.weight, tq, tk, tv, s);
+                    ops::detail::w8_companion_attn_input_mma_r64_c96_launch(x, packed.weight, tq,
+                                                                            tk, tv, s);
                 });
                 run("mma_r128_c64", [&](cudaStream_t s) {
-                    ops::detail::w8_companion_attn_input_mma_r128_c64_launch(
-                        mma_c64_variant(t), x, packed.weight, tq, tk, tv, s);
+                    ops::detail::w8_companion_attn_input_mma_r128_c64_launch(x, packed.weight, tq,
+                                                                             tk, tv, s);
                 });
                 run("mma_r128_c80", [&](cudaStream_t s) {
-                    ops::detail::w8_companion_attn_input_mma_r128_c80_launch(
-                        mma_c80_variant(t), x, packed.weight, tq, tk, tv, s);
-                });
-                run("parent_candidate", parent_launch);
-                run("parent_plus_extract", [&](cudaStream_t s) {
-                    parent_launch(s);
-                    ops::extract_bf16_columns(out_parent, 0, tq, s);
-                    ops::extract_bf16_columns(out_parent, kCompanionAttnQRows, tk, s);
-                    ops::extract_bf16_columns(out_parent,
-                                              kCompanionAttnQRows + kCompanionAttnKvRows, tv, s);
+                    ops::detail::w8_companion_attn_input_mma_r128_c80_launch(x, packed.weight, tq,
+                                                                             tk, tv, s);
                 });
             }
         }
 
         if (options.op == OpSelection::All || options.op == OpSelection::Attention) {
             DevicePackedWeight packed = make_w8_weight(kAttnRows);
-            bench::DBuf parent(static_cast<std::size_t>(kAttnRows) * max_t * 2);
             bench::DBuf q(static_cast<std::size_t>(kAttnQRows) * max_t * 2);
             bench::DBuf gate(static_cast<std::size_t>(kAttnQRows) * max_t * 2);
             bench::DBuf k(static_cast<std::size_t>(kAttnKvRows) * max_t * 2);
             bench::DBuf v(static_cast<std::size_t>(kAttnKvRows) * max_t * 2);
             for (const std::int32_t t : options.t_sweep) {
                 Tensor x(input.p, DType::BF16, {kHidden, t});
-                Tensor out_parent(parent.p, DType::BF16, {kAttnRows, t});
                 Tensor tq(q.p, DType::BF16, {kAttnQRows, t});
                 Tensor tg(gate.p, DType::BF16, {kAttnQRows, t});
                 Tensor tk(k.p, DType::BF16, {kAttnKvRows, t});
@@ -442,45 +390,32 @@ int main(int argc, char** argv) {
                     });
                 }
                 run("simt_r8_c4", [&](cudaStream_t s) {
-                    ops::detail::w8_attn_input_simt_r8_c4_launch(simt_variant(t), x, packed.weight,
-                                                                 tq, tg, tk, tv, s);
+                    ops::detail::w8_attn_input_simt_r8_c4_launch(x, packed.weight, tq, tg, tk, tv,
+                                                                 s);
                 });
                 if (t >= 2 && t <= 16) {
                     run("splitk_mma_exact_t", [&](cudaStream_t s) {
-                        ops::detail::w8_attn_input_splitk_mma_launch(
-                            ops::detail::W8KernelVariant::None, x, packed.weight, tq, tg, tk, tv,
-                            s);
+                        ops::detail::w8_attn_input_splitk_mma_launch(x, packed.weight, tq, tg, tk,
+                                                                     tv, s);
                     });
                 }
                 run("mma_r32_c128", [&](cudaStream_t s) {
-                    ops::detail::w8_attn_input_mma_r32_c128_launch(mma_variant(t), x, packed.weight,
-                                                                   tq, tg, tk, tv, s);
+                    ops::detail::w8_attn_input_mma_r32_c128_launch(x, packed.weight, tq, tg, tk, tv,
+                                                                   s);
                 });
                 run("mma_r64_c128", [&](cudaStream_t s) {
-                    ops::detail::w8_attn_input_mma_r64_c128_launch(mma_variant(t), x, packed.weight,
-                                                                   tq, tg, tk, tv, s);
-                });
-                run("parent_linear", [&](cudaStream_t s) {
-                    ops::linear(x, packed.weight, out_parent, workspace, s);
-                });
-                run("parent_plus_extract", [&](cudaStream_t s) {
-                    ops::linear(x, packed.weight, out_parent, workspace, s);
-                    ops::extract_bf16_columns(out_parent, 0, tq, s);
-                    ops::extract_bf16_columns(out_parent, 4096, tk, s);
-                    ops::extract_bf16_columns(out_parent, 4608, tg, s);
-                    ops::extract_bf16_columns(out_parent, 8704, tv, s);
+                    ops::detail::w8_attn_input_mma_r64_c128_launch(x, packed.weight, tq, tg, tk, tv,
+                                                                   s);
                 });
             }
         }
 
         if (options.op == OpSelection::All || options.op == OpSelection::Gdn) {
             DevicePackedWeight packed = make_w8_weight(kGdnRows);
-            bench::DBuf parent(static_cast<std::size_t>(kGdnRows) * max_t * 2);
             bench::DBuf qkv(static_cast<std::size_t>(kGdnQkvRows) * max_t * 2);
             bench::DBuf z(static_cast<std::size_t>(kGdnZRows) * max_t * 2);
             for (const std::int32_t t : options.t_sweep) {
                 Tensor x(input.p, DType::BF16, {kHidden, t});
-                Tensor out_parent(parent.p, DType::BF16, {kGdnRows, t});
                 Tensor tqkv(qkv.p, DType::BF16, {kGdnQkvRows, t});
                 Tensor tz(z.p, DType::BF16, {kGdnZRows, t});
                 const auto run = [&](const char* path, auto&& launch) {
@@ -498,21 +433,11 @@ int main(int argc, char** argv) {
                 }
                 if (t >= 2 && t <= 96) {
                     run("small_t_splitk_mma", [&](cudaStream_t s) {
-                        ops::detail::w8_gdn_input_splitk_mma_launch(
-                            ops::detail::W8KernelVariant::None, x, packed.weight, tqkv, tz, s);
+                        ops::detail::w8_gdn_input_splitk_mma_launch(x, packed.weight, tqkv, tz, s);
                     });
                 }
                 run("mma_r64_c128", [&](cudaStream_t s) {
-                    ops::detail::w8_gdn_input_mma_r64_c128_launch(mma_variant(t), x, packed.weight,
-                                                                  tqkv, tz, s);
-                });
-                run("parent_linear", [&](cudaStream_t s) {
-                    ops::linear(x, packed.weight, out_parent, workspace, s);
-                });
-                run("parent_plus_extract", [&](cudaStream_t s) {
-                    ops::linear(x, packed.weight, out_parent, workspace, s);
-                    ops::extract_bf16_columns(out_parent, 0, tqkv, s);
-                    ops::extract_bf16_columns(out_parent, 8192, tz, s);
+                    ops::detail::w8_gdn_input_mma_r64_c128_launch(x, packed.weight, tqkv, tz, s);
                 });
             }
         }

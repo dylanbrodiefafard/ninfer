@@ -1,13 +1,12 @@
 #pragma once
 
 #include "core/tensor.h"
-#include "ops/linear/q5/q5_rowsplit_launch.h"
 
 #include <cuda_runtime.h>
 
 namespace ninfer::ops::detail {
 
-void q4_q5_gdn_input_independent_launch(Q5Plan value_plan, const Tensor& x, const Weight& qk_weight,
+void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight,
                                         const Weight& v_weight, Tensor& qk, Tensor& value,
                                         cudaStream_t stream);
 

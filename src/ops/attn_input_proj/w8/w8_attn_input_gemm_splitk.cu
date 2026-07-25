@@ -90,20 +90,18 @@ void launch_companion_medium_cols(const Tensor& x, const Weight& weight, Tensor&
 
 } // namespace
 
-void w8_attn_input_splitk_mma_launch(W8KernelVariant variant, const Tensor& x, const Weight& weight,
-                                     Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
-                                     cudaStream_t stream) {
-    if (variant != W8KernelVariant::None || x.ne[1] < kFirstExactCols ||
-        x.ne[1] > kLastTargetExactCols) {
+void w8_attn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                                     Tensor& k, Tensor& v, cudaStream_t stream) {
+    if (x.ne[1] < kFirstExactCols || x.ne[1] > kLastTargetExactCols) {
         throw std::invalid_argument("W8 attention input split-K MMA requires exact T=2..16");
     }
     kTargetLaunchers[x.ne[1] - kFirstExactCols](x, weight, q, gate, k, v, stream);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void w8_attn_input_splitk_mma_launch(W8KernelVariant variant, const Tensor& x, const Weight& weight,
-                                     Tensor& q, Tensor& k, Tensor& v, cudaStream_t stream) {
-    if (variant != W8KernelVariant::None || x.ne[1] < kFirstExactCols || x.ne[1] > 96) {
+void w8_attn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
+                                     Tensor& v, cudaStream_t stream) {
+    if (x.ne[1] < kFirstExactCols || x.ne[1] > 96) {
         throw std::invalid_argument("W8 companion attention input split-K MMA requires T=2..96");
     }
     if (x.ne[1] <= kLastCompanionExactCols) {

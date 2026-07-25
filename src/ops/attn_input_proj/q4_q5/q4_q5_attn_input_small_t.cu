@@ -165,37 +165,30 @@ void launch_q5_simt(const Tensor& x, const Weight& weight, Tensor& gate, Tensor&
     CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_q5(Q5Plan plan, const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
+void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
                cudaStream_t stream) {
-    if (plan.variant != Q5KernelVariant::None) {
-        throw std::invalid_argument("attention Q5 split-output route requires the SIMT variant");
-    }
-    switch (plan.schedule) {
-    case Q5ScheduleId::GemvR16S2X:
+    if (x.ne[1] == 1) {
         launch_q5_gemv(x, weight, gate, value, stream);
         return;
-    case Q5ScheduleId::SimtSplit4Exact:
+    }
+    if (x.ne[1] <= 6) {
         launch_q5_split4_exact(x, weight, gate, value, stream);
         return;
-    case Q5ScheduleId::SimtR8C4:
+    }
+    if (x.ne[1] <= 16) {
         launch_q5_simt<4>(x, weight, gate, value, stream);
         return;
-    case Q5ScheduleId::SimtR8C8:
-        launch_q5_simt<8>(x, weight, gate, value, stream);
-        return;
-    default:
-        throw std::invalid_argument("attention Q5 split-output schedule is not admitted");
     }
+    throw std::invalid_argument("attention Q5 split-output requires T in [1,16]");
 }
 
 } // namespace
 
-void q4_q5_attn_input_small_t_launch(Q5Plan q5_plan, const Tensor& x,
-                                     const Weight& query_key_weight,
+void q4_q5_attn_input_small_t_launch(const Tensor& x, const Weight& query_key_weight,
                                      const Weight& gate_value_weight, Tensor& q, Tensor& gate,
                                      Tensor& k, Tensor& v, cudaStream_t stream) {
     launch_q4(x, query_key_weight, q, k, stream);
-    launch_q5(q5_plan, x, gate_value_weight, gate, v, stream);
+    launch_q5(x, gate_value_weight, gate, v, stream);
 }
 
 } // namespace ninfer::ops::detail

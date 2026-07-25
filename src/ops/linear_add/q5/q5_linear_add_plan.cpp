@@ -1,7 +1,7 @@
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/residual_add.h"
-#include "ops/common/token_slices.h"
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 
 #include <algorithm>
@@ -81,23 +81,6 @@ std::size_t checked_matrix_bytes(std::int32_t rows, std::int32_t cols) {
     return elements * sizeof(std::uint16_t);
 }
 
-Q5KernelVariant resolve_mma_variant(Q5ScheduleId schedule, const Q5LinearAddProblem& problem) {
-    const Q5Problem base{problem.rows, problem.k, problem.padded_k, problem.cols};
-    if (q5_candidate_is_legal(schedule, Q5KernelVariant::Full, base)) {
-        return Q5KernelVariant::Full;
-    }
-    if (q5_candidate_is_legal(schedule, Q5KernelVariant::Predicated, base)) {
-        return Q5KernelVariant::Predicated;
-    }
-    throw std::logic_error("q5 linear_add: admitted MMA route is not physically legal");
-}
-
-bool same_q5_plan(const std::optional<Q5Plan>& lhs, const std::optional<Q5Plan>& rhs) {
-    if (lhs.has_value() != rhs.has_value()) { return false; }
-    if (!lhs.has_value()) { return true; }
-    return lhs->schedule == rhs->schedule && lhs->variant == rhs->variant;
-}
-
 } // namespace
 
 const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept {
@@ -127,24 +110,17 @@ Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem) {
         if (!route.cols.contains(problem.cols)) { continue; }
         Q5LinearAddPlan plan{
             route.schedule,
-            Q5KernelVariant::None,
-            std::nullopt,
             0,
         };
         switch (route.schedule) {
         case Q5LinearAddScheduleId::GemvResidual:
             return plan;
         case Q5LinearAddScheduleId::Materialized: {
-            const Q5Problem base{problem.rows, problem.k, problem.padded_k, problem.cols};
-            plan.materialized_projection = q5_rowsplit_resolve_plan(base);
-            plan.workspace_bytes         = checked_matrix_bytes(problem.rows, problem.cols);
+            plan.workspace_bytes = checked_matrix_bytes(problem.rows, problem.cols);
             return plan;
         }
         case Q5LinearAddScheduleId::MmaResidualR64C64:
-            plan.variant = resolve_mma_variant(Q5ScheduleId::MmaR64C64, problem);
-            return plan;
         case Q5LinearAddScheduleId::MmaResidualR64C128:
-            plan.variant = resolve_mma_variant(Q5ScheduleId::MmaR64C128, problem);
             return plan;
         }
     }
@@ -170,9 +146,7 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
                                 Tensor& residual_out, WorkspaceArena& ws, cudaStream_t stream) {
     const Q5LinearAddProblem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
     const Q5LinearAddPlan resolved = q5_linear_add_resolve_plan(problem);
-    if (resolved.schedule != plan.schedule || resolved.variant != plan.variant ||
-        !same_q5_plan(resolved.materialized_projection, plan.materialized_projection) ||
-        resolved.workspace_bytes != plan.workspace_bytes) {
+    if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument("q5 linear_add: plan does not match the exact problem");
     }
 
@@ -183,23 +157,15 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
     case Q5LinearAddScheduleId::Materialized: {
         auto scratch_scope = ws.scope();
         Tensor projected   = ws.alloc(DType::BF16, {problem.rows, problem.cols});
-        q5_rowsplit_execute_plan(*plan.materialized_projection, x, w, projected, stream);
+        linear(x, w, projected, ws, stream);
         residual_add(projected, residual_out, stream);
         return;
     }
     case Q5LinearAddScheduleId::MmaResidualR64C64:
-        for_each_token_slice(problem.cols, 64, [&](std::int32_t offset, std::int32_t count) {
-            const Tensor x_slice  = x.slice(1, offset, count);
-            Tensor residual_slice = residual_out.slice(1, offset, count);
-            q5_linear_add_mma_r64_c64_launch(plan.variant, x_slice, w, residual_slice, stream);
-        });
+        q5_linear_add_mma_r64_c64_launch(x, w, residual_out, stream);
         return;
     case Q5LinearAddScheduleId::MmaResidualR64C128:
-        for_each_token_slice(problem.cols, 128, [&](std::int32_t offset, std::int32_t count) {
-            const Tensor x_slice  = x.slice(1, offset, count);
-            Tensor residual_slice = residual_out.slice(1, offset, count);
-            q5_linear_add_mma_r64_c128_launch(plan.variant, x_slice, w, residual_slice, stream);
-        });
+        q5_linear_add_mma_r64_c128_launch(x, w, residual_out, stream);
         return;
     }
     throw std::logic_error("q5 linear_add: unknown schedule");

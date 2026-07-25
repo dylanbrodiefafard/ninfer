@@ -19,7 +19,6 @@ struct W8PairRouteSpec {
     std::int32_t first;
     std::int32_t last;
     W8PairScheduleId schedule;
-    W8PairTailPolicy tail_policy = W8PairTailPolicy::Homogeneous;
 };
 
 constexpr std::array<W8PairRouteSpec, 3> kK5120Routes{{
@@ -44,27 +43,27 @@ constexpr std::array<W8PairRouteSpec, 37> kK2048Routes{{
     {193, 384, W8PairScheduleId::ConcatMmaR32C64},
     {385, 480, W8PairScheduleId::ConcatMmaR32C96},
     {481, 640, W8PairScheduleId::ConcatMmaR32C128},
-    {641, 641, W8PairScheduleId::ConcatMmaR32C128, W8PairTailPolicy::Exact},
+    {641, 641, W8PairScheduleId::ExactConcatMmaR32C128},
     {642, 672, W8PairScheduleId::ConcatMmaR48C96},
-    {673, 680, W8PairScheduleId::ConcatMmaR32C96, W8PairTailPolicy::Exact},
+    {673, 680, W8PairScheduleId::ExactConcatMmaR32C96},
     {681, 784, W8PairScheduleId::ConcatMmaR48C112},
     {785, 896, W8PairScheduleId::ConcatMmaR48C128},
     {897, 960, W8PairScheduleId::ConcatMmaR96C64},
-    {961, 976, W8PairScheduleId::ConcatMmaR64C96, W8PairTailPolicy::Exact},
+    {961, 976, W8PairScheduleId::ExactConcatMmaR64C96},
     {977, 1280, W8PairScheduleId::ConcatMmaR64C128},
-    {1281, 1316, W8PairScheduleId::ConcatMmaR64C128, W8PairTailPolicy::Exact},
+    {1281, 1316, W8PairScheduleId::ExactConcatMmaR64C128},
     {1317, 1344, W8PairScheduleId::ConcatMmaR128C64},
-    {1345, 1345, W8PairScheduleId::ConcatMmaR128C64, W8PairTailPolicy::Exact},
+    {1345, 1345, W8PairScheduleId::ExactConcatMmaR128C64},
     {1346, 1440, W8PairScheduleId::ConcatMmaR96C96},
-    {1441, 1466, W8PairScheduleId::ConcatMmaR96C96, W8PairTailPolicy::Exact},
+    {1441, 1466, W8PairScheduleId::ExactConcatMmaR96C96},
     {1467, 1680, W8PairScheduleId::ConcatMmaR128C80},
-    {1681, 1708, W8PairScheduleId::ConcatMmaR128C80, W8PairTailPolicy::Exact},
+    {1681, 1708, W8PairScheduleId::ExactConcatMmaR128C80},
     {1709, 1920, W8PairScheduleId::ConcatMmaR48C128},
-    {1921, 1922, W8PairScheduleId::ConcatMmaR64C128, W8PairTailPolicy::Exact},
+    {1921, 1922, W8PairScheduleId::ExactConcatMmaR64C128},
     {1923, 2016, W8PairScheduleId::ConcatMmaR64C96},
-    {2017, 2018, W8PairScheduleId::ConcatMmaR64C96, W8PairTailPolicy::Exact},
+    {2017, 2018, W8PairScheduleId::ExactConcatMmaR64C96},
     {2019, 2208, W8PairScheduleId::ConcatMmaR96C96},
-    {2209, 2270, W8PairScheduleId::ConcatMmaR96C96, W8PairTailPolicy::Exact},
+    {2209, 2270, W8PairScheduleId::ExactConcatMmaR96C96},
     {2271, kAnyCols, W8PairScheduleId::ConcatMmaR64C128},
 }};
 
@@ -81,165 +80,44 @@ constexpr bool routes_are_closed(const std::array<W8PairRouteSpec, N>& routes) n
 static_assert(routes_are_closed(kK5120Routes) && routes_are_closed(kK2048Routes),
               "W8 pair routes must be exact, contiguous, and closed");
 
-W8ScheduleId base_schedule(W8PairScheduleId schedule) {
+bool is_exact_tail_schedule(W8PairScheduleId schedule) noexcept {
     switch (schedule) {
-    case W8PairScheduleId::TwoSimtR8C4:
-        return W8ScheduleId::SimtR8C4;
-    case W8PairScheduleId::TwoSimtR8C8:
-        return W8ScheduleId::SimtR8C8;
-    case W8PairScheduleId::DualMmaR32C64:
-        return W8ScheduleId::MmaR32C64;
-    case W8PairScheduleId::DualMmaR32C80:
-        return W8ScheduleId::MmaR32C80;
-    case W8PairScheduleId::DualMmaR32C96:
-        return W8ScheduleId::MmaR32C96;
-    case W8PairScheduleId::DualMmaR32C112:
-        return W8ScheduleId::MmaR32C112;
-    case W8PairScheduleId::DualMmaR32C128:
-        return W8ScheduleId::MmaR32C128;
-    case W8PairScheduleId::ConcatMmaR32C64:
-        return W8ScheduleId::MmaR32C64;
-    case W8PairScheduleId::ConcatMmaR32C80:
-        return W8ScheduleId::MmaR32C80;
-    case W8PairScheduleId::ConcatMmaR32C96:
-        return W8ScheduleId::MmaR32C96;
-    case W8PairScheduleId::ConcatMmaR32C112:
-        return W8ScheduleId::MmaR32C112;
-    case W8PairScheduleId::ConcatMmaR32C128:
-        return W8ScheduleId::MmaR32C128;
-    case W8PairScheduleId::ConcatMmaR48C64:
-        return W8ScheduleId::MmaR48C64;
-    case W8PairScheduleId::ConcatMmaR48C96:
-        return W8ScheduleId::MmaR48C96;
-    case W8PairScheduleId::ConcatMmaR48C112:
-        return W8ScheduleId::MmaR48C112;
-    case W8PairScheduleId::ConcatMmaR48C128:
-        return W8ScheduleId::MmaR48C128;
-    case W8PairScheduleId::ConcatMmaR64C64:
-        return W8ScheduleId::MmaR64C64;
-    case W8PairScheduleId::ConcatMmaR64C80:
-        return W8ScheduleId::MmaR64C80;
-    case W8PairScheduleId::ConcatMmaR64C96:
-        return W8ScheduleId::MmaR64C96;
-    case W8PairScheduleId::ConcatMmaR64C128:
-        return W8ScheduleId::MmaR64C128;
-    case W8PairScheduleId::ConcatMmaR96C64:
-        return W8ScheduleId::MmaR96C64;
-    case W8PairScheduleId::ConcatMmaR96C80:
-        return W8ScheduleId::MmaR96C80;
-    case W8PairScheduleId::ConcatMmaR96C96:
-        return W8ScheduleId::MmaR96C96;
-    case W8PairScheduleId::ConcatMmaR96C112:
-        return W8ScheduleId::MmaR96C112;
-    case W8PairScheduleId::ConcatMmaR128C64:
-        return W8ScheduleId::MmaR128C64;
-    case W8PairScheduleId::ConcatMmaR128C80:
-        return W8ScheduleId::MmaR128C80;
-    case W8PairScheduleId::DualDecodeR4:
-    case W8PairScheduleId::DualDecodeR8:
-    case W8PairScheduleId::DualDecodeR16:
-    case W8PairScheduleId::DualSplitKMmaExactT:
-    case W8PairScheduleId::DualSplitKMediumC48:
-    case W8PairScheduleId::DualSplitKMediumC64:
-    case W8PairScheduleId::DualSplitKMediumC80:
-    case W8PairScheduleId::DualSplitKMediumC88:
-    case W8PairScheduleId::DualSplitKMediumC96:
-    case W8PairScheduleId::DualSplitKMediumC104:
-    case W8PairScheduleId::DualSplitKMediumC112:
-    case W8PairScheduleId::DualSplitKMediumC128:
-    case W8PairScheduleId::DualSplitKMediumC160:
-    case W8PairScheduleId::DualSplitKMediumC192:
-    case W8PairScheduleId::DualSplitKMediumC224:
-    case W8PairScheduleId::DualSplitKMediumC256:
-        throw std::logic_error("w8 pair: exact schedule has no parent Linear schedule");
-    }
-    throw std::logic_error("w8 pair: unknown schedule");
-}
-
-W8KernelVariant resolve_variant(W8PairScheduleId schedule, const W8PairProblem& problem) {
-    switch (schedule) {
-    case W8PairScheduleId::DualDecodeR4:
-    case W8PairScheduleId::DualDecodeR8:
-    case W8PairScheduleId::DualDecodeR16:
-    case W8PairScheduleId::DualSplitKMmaExactT:
-    case W8PairScheduleId::DualSplitKMediumC48:
-    case W8PairScheduleId::DualSplitKMediumC64:
-    case W8PairScheduleId::DualSplitKMediumC80:
-    case W8PairScheduleId::DualSplitKMediumC88:
-    case W8PairScheduleId::DualSplitKMediumC96:
-    case W8PairScheduleId::DualSplitKMediumC104:
-    case W8PairScheduleId::DualSplitKMediumC112:
-    case W8PairScheduleId::DualSplitKMediumC128:
-    case W8PairScheduleId::DualSplitKMediumC160:
-    case W8PairScheduleId::DualSplitKMediumC192:
-    case W8PairScheduleId::DualSplitKMediumC224:
-    case W8PairScheduleId::DualSplitKMediumC256:
-        return W8KernelVariant::None;
-    case W8PairScheduleId::TwoSimtR8C4:
-    case W8PairScheduleId::TwoSimtR8C8:
-    case W8PairScheduleId::DualMmaR32C64:
-    case W8PairScheduleId::DualMmaR32C80:
-    case W8PairScheduleId::DualMmaR32C96:
-    case W8PairScheduleId::DualMmaR32C112:
-    case W8PairScheduleId::DualMmaR32C128:
-    case W8PairScheduleId::ConcatMmaR32C64:
-    case W8PairScheduleId::ConcatMmaR32C80:
-    case W8PairScheduleId::ConcatMmaR32C96:
-    case W8PairScheduleId::ConcatMmaR32C112:
-    case W8PairScheduleId::ConcatMmaR32C128:
-    case W8PairScheduleId::ConcatMmaR48C64:
-    case W8PairScheduleId::ConcatMmaR48C96:
-    case W8PairScheduleId::ConcatMmaR48C112:
-    case W8PairScheduleId::ConcatMmaR48C128:
-    case W8PairScheduleId::ConcatMmaR64C64:
-    case W8PairScheduleId::ConcatMmaR64C80:
-    case W8PairScheduleId::ConcatMmaR64C96:
-    case W8PairScheduleId::ConcatMmaR64C128:
-    case W8PairScheduleId::ConcatMmaR96C64:
-    case W8PairScheduleId::ConcatMmaR96C80:
-    case W8PairScheduleId::ConcatMmaR96C96:
-    case W8PairScheduleId::ConcatMmaR96C112:
-    case W8PairScheduleId::ConcatMmaR128C64:
-    case W8PairScheduleId::ConcatMmaR128C80:
-        break;
-    }
-    const W8Problem base{problem.rows, problem.k, problem.padded_k, problem.cols};
-    const W8ScheduleId candidate = base_schedule(schedule);
-    if (w8_candidate_is_legal(candidate, W8KernelVariant::Full, base)) {
-        return W8KernelVariant::Full;
-    }
-    if (w8_candidate_is_legal(candidate, W8KernelVariant::Predicated, base)) {
-        return W8KernelVariant::Predicated;
-    }
-    throw std::logic_error("w8 pair: admitted route is not physically legal");
-}
-
-bool is_exact_schedule(W8PairScheduleId schedule) noexcept {
-    switch (schedule) {
-    case W8PairScheduleId::DualDecodeR4:
-    case W8PairScheduleId::DualDecodeR8:
-    case W8PairScheduleId::DualDecodeR16:
-    case W8PairScheduleId::DualSplitKMmaExactT:
-    case W8PairScheduleId::DualSplitKMediumC48:
-    case W8PairScheduleId::DualSplitKMediumC64:
-    case W8PairScheduleId::DualSplitKMediumC80:
-    case W8PairScheduleId::DualSplitKMediumC88:
-    case W8PairScheduleId::DualSplitKMediumC96:
-    case W8PairScheduleId::DualSplitKMediumC104:
-    case W8PairScheduleId::DualSplitKMediumC112:
-    case W8PairScheduleId::DualSplitKMediumC128:
-    case W8PairScheduleId::DualSplitKMediumC160:
-    case W8PairScheduleId::DualSplitKMediumC192:
-    case W8PairScheduleId::DualSplitKMediumC224:
-    case W8PairScheduleId::DualSplitKMediumC256:
+    case W8PairScheduleId::ExactConcatMmaR32C96:
+    case W8PairScheduleId::ExactConcatMmaR32C128:
+    case W8PairScheduleId::ExactConcatMmaR64C96:
+    case W8PairScheduleId::ExactConcatMmaR64C128:
+    case W8PairScheduleId::ExactConcatMmaR96C96:
+    case W8PairScheduleId::ExactConcatMmaR128C64:
+    case W8PairScheduleId::ExactConcatMmaR128C80:
         return true;
     default:
         return false;
     }
 }
 
-bool is_concat_schedule(W8PairScheduleId schedule) noexcept {
+W8PairScheduleId homogeneous_schedule(W8PairScheduleId schedule) {
     switch (schedule) {
+    case W8PairScheduleId::ExactConcatMmaR32C96:
+        return W8PairScheduleId::ConcatMmaR32C96;
+    case W8PairScheduleId::ExactConcatMmaR32C128:
+        return W8PairScheduleId::ConcatMmaR32C128;
+    case W8PairScheduleId::ExactConcatMmaR64C96:
+        return W8PairScheduleId::ConcatMmaR64C96;
+    case W8PairScheduleId::ExactConcatMmaR64C128:
+        return W8PairScheduleId::ConcatMmaR64C128;
+    case W8PairScheduleId::ExactConcatMmaR96C96:
+        return W8PairScheduleId::ConcatMmaR96C96;
+    case W8PairScheduleId::ExactConcatMmaR128C64:
+        return W8PairScheduleId::ConcatMmaR128C64;
+    case W8PairScheduleId::ExactConcatMmaR128C80:
+        return W8PairScheduleId::ConcatMmaR128C80;
+    default:
+        return schedule;
+    }
+}
+
+bool is_concat_schedule(W8PairScheduleId schedule) noexcept {
+    switch (homogeneous_schedule(schedule)) {
     case W8PairScheduleId::ConcatMmaR32C64:
     case W8PairScheduleId::ConcatMmaR32C80:
     case W8PairScheduleId::ConcatMmaR32C96:
@@ -272,12 +150,47 @@ bool uses_mma(W8PairScheduleId schedule) noexcept {
            schedule != W8PairScheduleId::DualDecodeR16;
 }
 
-bool uses_tiled_mma(W8PairScheduleId schedule) noexcept {
-    return uses_mma(schedule) && !is_exact_schedule(schedule);
+std::int32_t schedule_rows(W8PairScheduleId schedule) {
+    switch (homogeneous_schedule(schedule)) {
+    case W8PairScheduleId::TwoSimtR8C4:
+    case W8PairScheduleId::TwoSimtR8C8:
+        return 8;
+    case W8PairScheduleId::DualMmaR32C64:
+    case W8PairScheduleId::DualMmaR32C80:
+    case W8PairScheduleId::DualMmaR32C96:
+    case W8PairScheduleId::DualMmaR32C112:
+    case W8PairScheduleId::DualMmaR32C128:
+    case W8PairScheduleId::ConcatMmaR32C64:
+    case W8PairScheduleId::ConcatMmaR32C80:
+    case W8PairScheduleId::ConcatMmaR32C96:
+    case W8PairScheduleId::ConcatMmaR32C112:
+    case W8PairScheduleId::ConcatMmaR32C128:
+        return 32;
+    case W8PairScheduleId::ConcatMmaR48C64:
+    case W8PairScheduleId::ConcatMmaR48C96:
+    case W8PairScheduleId::ConcatMmaR48C112:
+    case W8PairScheduleId::ConcatMmaR48C128:
+        return 48;
+    case W8PairScheduleId::ConcatMmaR64C64:
+    case W8PairScheduleId::ConcatMmaR64C80:
+    case W8PairScheduleId::ConcatMmaR64C96:
+    case W8PairScheduleId::ConcatMmaR64C128:
+        return 64;
+    case W8PairScheduleId::ConcatMmaR96C64:
+    case W8PairScheduleId::ConcatMmaR96C80:
+    case W8PairScheduleId::ConcatMmaR96C96:
+    case W8PairScheduleId::ConcatMmaR96C112:
+        return 96;
+    case W8PairScheduleId::ConcatMmaR128C64:
+    case W8PairScheduleId::ConcatMmaR128C80:
+        return 128;
+    default:
+        throw std::logic_error("w8 pair: exact schedule has no row tile");
+    }
 }
 
 std::int32_t schedule_cols(W8PairScheduleId schedule) {
-    switch (schedule) {
+    switch (homogeneous_schedule(schedule)) {
     case W8PairScheduleId::TwoSimtR8C4:
         return 4;
     case W8PairScheduleId::TwoSimtR8C8:
@@ -491,6 +404,20 @@ const char* w8_pair_schedule_name(W8PairScheduleId schedule) {
         return "w8_pair.concat_mma.r128.c64";
     case W8PairScheduleId::ConcatMmaR128C80:
         return "w8_pair.concat_mma.r128.c80";
+    case W8PairScheduleId::ExactConcatMmaR32C96:
+        return "w8_pair.exact.concat_mma.r32.c96";
+    case W8PairScheduleId::ExactConcatMmaR32C128:
+        return "w8_pair.exact.concat_mma.r32.c128";
+    case W8PairScheduleId::ExactConcatMmaR64C96:
+        return "w8_pair.exact.concat_mma.r64.c96";
+    case W8PairScheduleId::ExactConcatMmaR64C128:
+        return "w8_pair.exact.concat_mma.r64.c128";
+    case W8PairScheduleId::ExactConcatMmaR96C96:
+        return "w8_pair.exact.concat_mma.r96.c96";
+    case W8PairScheduleId::ExactConcatMmaR128C64:
+        return "w8_pair.exact.concat_mma.r128.c64";
+    case W8PairScheduleId::ExactConcatMmaR128C80:
+        return "w8_pair.exact.concat_mma.r128.c80";
     }
     return "w8_pair.unknown";
 }
@@ -512,8 +439,7 @@ W8PairPlan w8_pair_resolve_plan(const W8PairProblem& problem) {
     const auto resolve_from = [&](const auto& routes) -> W8PairPlan {
         for (const W8PairRouteSpec& route : routes) {
             if (problem.cols >= route.first && problem.cols <= route.last) {
-                return {route.schedule, resolve_variant(route.schedule, problem), 0,
-                        route.tail_policy};
+                return {route.schedule, 0};
             }
         }
         throw std::logic_error("w8 pair: admitted problem has no covering route");
@@ -521,127 +447,124 @@ W8PairPlan w8_pair_resolve_plan(const W8PairProblem& problem) {
     return problem.k == 2048 ? resolve_from(kK2048Routes) : resolve_from(kK5120Routes);
 }
 
-bool w8_pair_candidate_is_legal(W8PairPlan plan, const W8PairProblem& problem) noexcept {
-    if (!w8_pair_admits(problem) || plan.workspace_bytes != 0) { return false; }
-    if (plan.tail_policy == W8PairTailPolicy::Exact &&
-        (problem.k != 2048 || !uses_tiled_mma(plan.schedule) ||
-         plan.variant == W8KernelVariant::None)) {
-        return false;
+namespace {
+
+bool tiled_use_full(W8PairScheduleId schedule, const W8PairProblem& problem) {
+    const bool tile_aligned = (problem.rows % schedule_rows(schedule)) == 0 &&
+                              (problem.cols % schedule_cols(schedule)) == 0;
+    if (schedule == W8PairScheduleId::TwoSimtR8C4 || schedule == W8PairScheduleId::TwoSimtR8C8) {
+        return tile_aligned;
     }
-    switch (plan.schedule) {
-    case W8PairScheduleId::DualDecodeR4:
-    case W8PairScheduleId::DualDecodeR8:
-    case W8PairScheduleId::DualDecodeR16:
-        return problem.k == 2048 && problem.cols == 1 && plan.variant == W8KernelVariant::None;
-    case W8PairScheduleId::DualSplitKMmaExactT:
-        return problem.k == 2048 && problem.cols >= 2 && problem.cols <= 32 &&
-               plan.variant == W8KernelVariant::None;
-    case W8PairScheduleId::DualSplitKMediumC48:
-    case W8PairScheduleId::DualSplitKMediumC64:
-    case W8PairScheduleId::DualSplitKMediumC80:
-    case W8PairScheduleId::DualSplitKMediumC88:
-    case W8PairScheduleId::DualSplitKMediumC96:
-    case W8PairScheduleId::DualSplitKMediumC104:
-    case W8PairScheduleId::DualSplitKMediumC112:
-    case W8PairScheduleId::DualSplitKMediumC128:
-    case W8PairScheduleId::DualSplitKMediumC160:
-    case W8PairScheduleId::DualSplitKMediumC192:
-    case W8PairScheduleId::DualSplitKMediumC224:
-    case W8PairScheduleId::DualSplitKMediumC256:
-        return problem.k == 2048 && problem.cols >= 33 &&
-               problem.cols <= schedule_cols(plan.schedule) &&
-               plan.variant == W8KernelVariant::None;
-    default:
-        break;
-    }
-    if (is_concat_schedule(plan.schedule) && problem.k != 2048) { return false; }
-    try {
-        return w8_candidate_is_legal(base_schedule(plan.schedule), plan.variant,
-                                     {problem.rows, problem.k, problem.padded_k, problem.cols});
-    } catch (...) { return false; }
+    return tile_aligned && problem.k == problem.padded_k && (problem.k % 64) == 0;
 }
+
+void launch_tiled(W8PairScheduleId schedule, bool full, const Tensor& x, const Weight& first_weight,
+                  const Weight& second_weight, Tensor& first_out, Tensor& second_out,
+                  cudaStream_t stream) {
+    const std::int32_t tile_cols = schedule_cols(schedule);
+    for_each_token_slice(x.ne[1], tile_cols, [&](std::int32_t offset, std::int32_t count) {
+        const Tensor x_slice = x.slice(1, offset, count);
+        Tensor first_slice   = first_out.slice(1, offset, count);
+        Tensor second_slice  = second_out.slice(1, offset, count);
+        switch (schedule) {
+        case W8PairScheduleId::TwoSimtR8C4:
+            w8_pair_simt_r8_c4_launch(full, x_slice, first_weight, second_weight, first_slice,
+                                      second_slice, stream);
+            return;
+        case W8PairScheduleId::TwoSimtR8C8:
+            w8_pair_simt_r8_c8_launch(full, x_slice, first_weight, second_weight, first_slice,
+                                      second_slice, stream);
+            return;
+        case W8PairScheduleId::DualMmaR32C64:
+            w8_pair_gemm_mma_r32_c64_launch(full, x_slice, first_weight, second_weight, first_slice,
+                                            second_slice, stream);
+            return;
+        case W8PairScheduleId::DualMmaR32C80:
+            w8_pair_gemm_mma_r32_c80_launch(full, x_slice, first_weight, second_weight, first_slice,
+                                            second_slice, stream);
+            return;
+        case W8PairScheduleId::DualMmaR32C96:
+            w8_pair_gemm_mma_r32_c96_launch(full, x_slice, first_weight, second_weight, first_slice,
+                                            second_slice, stream);
+            return;
+        case W8PairScheduleId::DualMmaR32C112:
+            w8_pair_gemm_mma_r32_c112_launch(full, x_slice, first_weight, second_weight,
+                                             first_slice, second_slice, stream);
+            return;
+        case W8PairScheduleId::DualMmaR32C128:
+            w8_pair_gemm_mma_launch(full, x_slice, first_weight, second_weight, first_slice,
+                                    second_slice, stream);
+            return;
+        default:
+            if (is_concat_schedule(schedule)) {
+                w8_pair_concat_mma_launch(schedule, full, x_slice, first_weight, second_weight,
+                                          first_slice, second_slice, stream);
+                return;
+            }
+            throw std::logic_error("w8 pair: non-tiled route reached tiled launch");
+        }
+    });
+}
+
+void launch_exact_tail(W8PairScheduleId exact_schedule, const W8PairProblem& problem,
+                       const Tensor& x, const Weight& first_weight, const Weight& second_weight,
+                       Tensor& first_out, Tensor& second_out, cudaStream_t stream) {
+    const W8PairScheduleId prefix_schedule = homogeneous_schedule(exact_schedule);
+    const std::int32_t tile_cols           = schedule_cols(prefix_schedule);
+    const std::int32_t full_cols           = (problem.cols / tile_cols) * tile_cols;
+    if (full_cols <= 0) { throw std::logic_error("w8 pair: exact-tail route has no MMA prefix"); }
+
+    const Tensor x_prefix = x.slice(1, 0, full_cols);
+    Tensor first_prefix   = first_out.slice(1, 0, full_cols);
+    Tensor second_prefix  = second_out.slice(1, 0, full_cols);
+    const W8PairProblem prefix_problem{problem.rows, problem.k, problem.padded_k, full_cols};
+    launch_tiled(prefix_schedule, tiled_use_full(prefix_schedule, prefix_problem), x_prefix,
+                 first_weight, second_weight, first_prefix, second_prefix, stream);
+
+    const std::int32_t tail = problem.cols - full_cols;
+    if (tail < 1 || tail > 62) {
+        throw std::logic_error("w8 pair: registered exact-tail route requires tail=1..62");
+    }
+    const Tensor x_tail = x.slice(1, full_cols, tail);
+    Tensor first_tail   = first_out.slice(1, full_cols, tail);
+    Tensor second_tail  = second_out.slice(1, full_cols, tail);
+    if (tail == 1) {
+        w8_pair_decode_r4_launch(x_tail, first_weight, second_weight, first_tail, second_tail,
+                                 stream);
+    } else if (tail <= 32) {
+        w8_pair_splitk_exact_t_launch(x_tail, first_weight, second_weight, first_tail, second_tail,
+                                      stream);
+    } else {
+        const W8PairScheduleId tail_schedule = tail <= 48 ? W8PairScheduleId::DualSplitKMediumC48
+                                                          : W8PairScheduleId::DualSplitKMediumC64;
+        w8_pair_splitk_medium_launch(tail_schedule, x_tail, first_weight, second_weight, first_tail,
+                                     second_tail, stream);
+    }
+}
+
+} // namespace
 
 void w8_pair_execute_plan(W8PairPlan plan, const Tensor& x, const Weight& first_weight,
                           const Weight& second_weight, Tensor& first_out, Tensor& second_out,
                           cudaStream_t stream) {
     const W8PairProblem problem = w8_pair_problem(x, first_weight, first_out);
     const W8PairPlan resolved   = w8_pair_resolve_plan(problem);
-    if (resolved.schedule != plan.schedule || resolved.variant != plan.variant ||
-        resolved.workspace_bytes != plan.workspace_bytes ||
-        resolved.tail_policy != plan.tail_policy) {
+    if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument("w8 pair: plan does not match the exact problem");
     }
-    w8_pair_execute_candidate(plan, x, first_weight, second_weight, first_out, second_out, stream);
-}
 
-void w8_pair_execute_candidate(W8PairPlan plan, const Tensor& x, const Weight& first_weight,
-                               const Weight& second_weight, Tensor& first_out, Tensor& second_out,
-                               cudaStream_t stream) {
     require_pair_weights(first_weight, second_weight, x.ne[0]);
-    const W8PairProblem problem = w8_pair_problem(x, first_weight, first_out);
     if (problem.k == 2048) { require_dflash_row_views(first_weight, second_weight); }
-    if (!w8_pair_candidate_is_legal(plan, problem)) {
-        throw std::invalid_argument(std::string("w8 pair fixed launch: illegal ") +
-                                    w8_pair_schedule_name(plan.schedule) + "." +
-                                    w8_kernel_variant_name(plan.variant));
-    }
-    const W8ScheduleId base_schedule_id =
-        is_exact_schedule(plan.schedule) ? W8ScheduleId::SimtR8C4 : base_schedule(plan.schedule);
-    const W8Plan base_plan{base_schedule_id, plan.variant};
     require_pair_operands(x, first_weight, second_weight, first_out, second_out,
                           uses_mma(plan.schedule));
 
-    if (plan.tail_policy == W8PairTailPolicy::Exact) {
-        const std::int32_t tile_cols = schedule_cols(plan.schedule);
-        const std::int32_t full_cols = (problem.cols / tile_cols) * tile_cols;
-        if (full_cols > 0) {
-            const Tensor x_prefix = x.slice(1, 0, full_cols);
-            Tensor first_prefix   = first_out.slice(1, 0, full_cols);
-            Tensor second_prefix  = second_out.slice(1, 0, full_cols);
-            const W8PairProblem prefix_problem{problem.rows, problem.k, problem.padded_k,
-                                               full_cols};
-            const W8KernelVariant prefix_variant =
-                w8_pair_candidate_is_legal(
-                    {plan.schedule, W8KernelVariant::Full, 0, W8PairTailPolicy::Homogeneous},
-                    prefix_problem)
-                    ? W8KernelVariant::Full
-                    : W8KernelVariant::Predicated;
-            w8_pair_execute_candidate(
-                {plan.schedule, prefix_variant, 0, W8PairTailPolicy::Homogeneous}, x_prefix,
-                first_weight, second_weight, first_prefix, second_prefix, stream);
-        }
-
-        const std::int32_t tail = problem.cols - full_cols;
-        if (tail == 0) { return; }
-        const Tensor x_tail = x.slice(1, full_cols, tail);
-        Tensor first_tail   = first_out.slice(1, full_cols, tail);
-        Tensor second_tail  = second_out.slice(1, full_cols, tail);
-        if (tail == 1) {
-            w8_pair_decode_r4_launch(x_tail, first_weight, second_weight, first_tail, second_tail,
-                                     stream);
-        } else if (tail <= 32) {
-            w8_pair_splitk_exact_t_launch(x_tail, first_weight, second_weight, first_tail,
-                                          second_tail, stream);
-        } else {
-            const W8PairScheduleId tail_schedule =
-                tail <= 48    ? W8PairScheduleId::DualSplitKMediumC48
-                : tail <= 64  ? W8PairScheduleId::DualSplitKMediumC64
-                : tail <= 96  ? W8PairScheduleId::DualSplitKMediumC96
-                : tail <= 104 ? W8PairScheduleId::DualSplitKMediumC104
-                : tail <= 112 ? W8PairScheduleId::DualSplitKMediumC112
-                              : W8PairScheduleId::DualSplitKMediumC128;
-            w8_pair_splitk_medium_launch(tail_schedule, x_tail, first_weight, second_weight,
-                                         first_tail, second_tail, stream);
-        }
+    if (is_exact_tail_schedule(plan.schedule)) {
+        launch_exact_tail(plan.schedule, problem, x, first_weight, second_weight, first_out,
+                          second_out, stream);
         return;
     }
 
     switch (plan.schedule) {
-    case W8PairScheduleId::TwoSimtR8C4:
-    case W8PairScheduleId::TwoSimtR8C8:
-        w8_rowsplit_launch_fixed(base_plan, x, first_weight, first_out, stream);
-        w8_rowsplit_launch_fixed(base_plan, x, second_weight, second_out, stream);
-        return;
     case W8PairScheduleId::DualDecodeR4:
         w8_pair_decode_r4_launch(x, first_weight, second_weight, first_out, second_out, stream);
         return;
@@ -670,74 +593,11 @@ void w8_pair_execute_candidate(W8PairPlan plan, const Tensor& x, const Weight& f
         w8_pair_splitk_medium_launch(plan.schedule, x, first_weight, second_weight, first_out,
                                      second_out, stream);
         return;
-    case W8PairScheduleId::DualMmaR32C64:
-    case W8PairScheduleId::DualMmaR32C80:
-    case W8PairScheduleId::DualMmaR32C96:
-    case W8PairScheduleId::DualMmaR32C112:
-    case W8PairScheduleId::DualMmaR32C128: {
-        const std::int32_t tile_cols = schedule_cols(plan.schedule);
-        for_each_token_slice(problem.cols, tile_cols, [&](std::int32_t offset, std::int32_t count) {
-            const Tensor x_slice = x.slice(1, offset, count);
-            Tensor first_slice   = first_out.slice(1, offset, count);
-            Tensor second_slice  = second_out.slice(1, offset, count);
-            switch (plan.schedule) {
-            case W8PairScheduleId::DualMmaR32C64:
-                w8_pair_gemm_mma_r32_c64_launch(plan.variant, x_slice, first_weight, second_weight,
-                                                first_slice, second_slice, stream);
-                return;
-            case W8PairScheduleId::DualMmaR32C80:
-                w8_pair_gemm_mma_r32_c80_launch(plan.variant, x_slice, first_weight, second_weight,
-                                                first_slice, second_slice, stream);
-                return;
-            case W8PairScheduleId::DualMmaR32C96:
-                w8_pair_gemm_mma_r32_c96_launch(plan.variant, x_slice, first_weight, second_weight,
-                                                first_slice, second_slice, stream);
-                return;
-            case W8PairScheduleId::DualMmaR32C112:
-                w8_pair_gemm_mma_r32_c112_launch(plan.variant, x_slice, first_weight, second_weight,
-                                                 first_slice, second_slice, stream);
-                return;
-            case W8PairScheduleId::DualMmaR32C128:
-                w8_pair_gemm_mma_launch(plan.variant, x_slice, first_weight, second_weight,
-                                        first_slice, second_slice, stream);
-                return;
-            default:
-                throw std::logic_error("w8 pair: non-MMA route reached MMA launch");
-            }
-        });
+    default:
+        launch_tiled(plan.schedule, tiled_use_full(plan.schedule, problem), x, first_weight,
+                     second_weight, first_out, second_out, stream);
         return;
     }
-    case W8PairScheduleId::ConcatMmaR32C64:
-    case W8PairScheduleId::ConcatMmaR32C80:
-    case W8PairScheduleId::ConcatMmaR32C96:
-    case W8PairScheduleId::ConcatMmaR32C112:
-    case W8PairScheduleId::ConcatMmaR32C128:
-    case W8PairScheduleId::ConcatMmaR48C64:
-    case W8PairScheduleId::ConcatMmaR48C96:
-    case W8PairScheduleId::ConcatMmaR48C112:
-    case W8PairScheduleId::ConcatMmaR48C128:
-    case W8PairScheduleId::ConcatMmaR64C64:
-    case W8PairScheduleId::ConcatMmaR64C80:
-    case W8PairScheduleId::ConcatMmaR64C96:
-    case W8PairScheduleId::ConcatMmaR64C128:
-    case W8PairScheduleId::ConcatMmaR96C64:
-    case W8PairScheduleId::ConcatMmaR96C80:
-    case W8PairScheduleId::ConcatMmaR96C96:
-    case W8PairScheduleId::ConcatMmaR96C112:
-    case W8PairScheduleId::ConcatMmaR128C64:
-    case W8PairScheduleId::ConcatMmaR128C80: {
-        const std::int32_t tile_cols = schedule_cols(plan.schedule);
-        for_each_token_slice(problem.cols, tile_cols, [&](std::int32_t offset, std::int32_t count) {
-            const Tensor x_slice = x.slice(1, offset, count);
-            Tensor first_slice   = first_out.slice(1, offset, count);
-            Tensor second_slice  = second_out.slice(1, offset, count);
-            w8_pair_concat_mma_launch(plan.schedule, plan.variant, x_slice, first_weight,
-                                      second_weight, first_slice, second_slice, stream);
-        });
-        return;
-    }
-    }
-    throw std::logic_error("w8 pair fixed launch: unknown schedule");
 }
 
 void w8_pair_dispatch(const Tensor& x, const Weight& first_weight, const Weight& second_weight,

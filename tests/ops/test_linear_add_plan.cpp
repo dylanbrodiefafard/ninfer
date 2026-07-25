@@ -54,10 +54,8 @@ void route_tests() {
                 ++failures;
             }
             const bool materialized = plan.schedule == S::Materialized;
-            if (plan.materialized_projection.has_value() != materialized ||
-                (plan.workspace_bytes != 0) != materialized) {
-                std::cerr << "wrong Q5 LinearAdd subplan/workspace K=" << k << " C=" << cols
-                          << '\n';
+            if ((plan.workspace_bytes != 0) != materialized) {
+                std::cerr << "wrong Q5 LinearAdd workspace K=" << k << " C=" << cols << '\n';
                 ++failures;
             }
         }
@@ -104,14 +102,13 @@ void workspace_tests() {
 }
 
 void w8_route_tests() {
-    using ninfer::ops::detail::W8KernelVariant;
     using ninfer::ops::detail::W8LinearAddScheduleId;
     constexpr std::array<std::int32_t, 25> boundaries{
         1,  2,  3,  4,  5,  6,  7,   8,   9,    10,   11,   12, 13,
         14, 15, 16, 17, 52, 53, 640, 641, 1024, 1025, 2048, 0,
     };
     for (const std::int32_t cols : boundaries) {
-        const ninfer::ops::detail::W8Problem problem{2048, 4096, 4096, cols};
+        const ninfer::ops::detail::W8LinearAddProblem problem{2048, 4096, 4096, cols};
         const bool admitted = cols >= 1;
         if (ninfer::ops::detail::w8_linear_add_admits(problem) != admitted) {
             std::cerr << "wrong W8 LinearAdd admission C=" << cols << '\n';
@@ -125,13 +122,7 @@ void w8_route_tests() {
                                                : cols <= 52 ? W8LinearAddScheduleId::SimtR8C4
                                                : cols <= 640 ? W8LinearAddScheduleId::MmaR32C128
                                                              : W8LinearAddScheduleId::MmaR64C128;
-        const W8KernelVariant expected_variant =
-            expected == W8LinearAddScheduleId::SplitKMmaExactT
-                ? W8KernelVariant::None
-                : (cols % (expected == W8LinearAddScheduleId::SimtR8C4 ? 4 : 128) == 0
-                       ? W8KernelVariant::Full
-                       : W8KernelVariant::Predicated);
-        if (plan.schedule != expected || plan.variant != expected_variant) {
+        if (plan.schedule != expected) {
             std::cerr << "wrong W8 LinearAdd route C=" << cols << '\n';
             ++failures;
         }
@@ -188,15 +179,7 @@ void w8_route_tests() {
         for (const std::int32_t cols : {route.first, route.last}) {
             const auto plan =
                 ninfer::ops::detail::w8_linear_add_resolve_plan({2048, 6144, 6144, cols});
-            const W8KernelVariant expected_variant =
-                route.schedule == W8LinearAddScheduleId::DecodeR16 ||
-                        route.schedule == W8LinearAddScheduleId::SplitKMmaExactT ||
-                        route.schedule == W8LinearAddScheduleId::SplitKMma32PlusTail
-                    ? W8KernelVariant::None
-                    : (2048 % route.tile_rows == 0 && cols % route.tile_cols == 0
-                           ? W8KernelVariant::Full
-                           : W8KernelVariant::Predicated);
-            if (plan.schedule != route.schedule || plan.variant != expected_variant) {
+            if (plan.schedule != route.schedule) {
                 std::cerr << "wrong W8 [2048,6144] LinearAdd route C=" << cols << '\n';
                 ++failures;
             }

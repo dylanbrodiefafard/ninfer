@@ -10,7 +10,6 @@
 
 #include "ops/common/mma.cuh"
 #include "ops/common/math.cuh"
-#include "ops/linear/w8/w8_rowsplit_launch.h"
 #include "ops/linear/w8/w8_rowsplit_output.cuh"
 
 #include <cuda_bf16.h>
@@ -58,14 +57,12 @@ __device__ __forceinline__ int w8g32_swz64(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
 }
 
-template <class Cfg, W8KernelVariant Variant, W8Epilogue Epilogue = W8Epilogue::Store,
+template <class Cfg, bool Full, W8Epilogue Epilogue = W8Epilogue::Store,
           class Output = W8ContiguousOutput>
 __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gemm_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, Output output, std::int32_t m, std::int32_t k,
     std::int32_t n, std::int32_t padded_k) {
-    static_assert(Variant == W8KernelVariant::Full || Variant == W8KernelVariant::Predicated);
-    constexpr bool FullTiles        = Variant == W8KernelVariant::Full;
     constexpr int BM                = Cfg::BM;
     constexpr int BN                = Cfg::BN;
     constexpr int BK                = Cfg::BK;
@@ -126,7 +123,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
             const int kk = k0 + k8 * 8;
             const int nn = n0 + nl;
             auto* dst    = &Bs[stage][nl * BK + w8g32_swz64(nl, k8 * 8)];
-            if constexpr (FullTiles) {
+            if constexpr (Full) {
                 cp_async<16, Cache::cg>(dst, &x[static_cast<std::int64_t>(nn) * k + kk]);
             } else {
                 const int valid = (nn < n && kk < k) ? min(8, k - kk) * 2 : 0;
@@ -148,7 +145,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
             const int grow =
                 kSwiGlu ? m0 + (row % (BM / 2)) + (row >= BM / 2 ? m / 2 : 0) : m0 + row;
             auto* dst = &Cr[row * BK + chunk * 16];
-            if constexpr (FullTiles) {
+            if constexpr (Full) {
                 const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g0;
                 cp_async<16, Cache::cg>(dst, &codes[gi * 32 + chunk * 16]);
             } else {
@@ -163,7 +160,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
                 const int grow =
                     kSwiGlu ? m0 + (row % (BM / 2)) + (row >= BM / 2 ? m / 2 : 0) : m0 + row;
                 auto* dst = &Sr[row * Cfg::SCALE_CACHE_BYTES];
-                if constexpr (FullTiles) {
+                if constexpr (Full) {
                     const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g0;
                     cp_async<16, Cache::cg>(dst, &scales[gi * 2]);
                 } else {
@@ -285,7 +282,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
                     const int c1          = c0 + 1;
                     const float* gate_acc = acc[mi][ni];
                     const float* up_acc   = acc[mi + kGateMt][ni];
-                    if constexpr (FullTiles) {
+                    if constexpr (Full) {
                         *output_tile.at(r0, c0) =
                             __float2bfloat16_rn(silu(gate_acc[0]) * up_acc[0]);
                         *output_tile.at(r0, c1) =
@@ -354,7 +351,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
                         const float up01      = up_shared[local_r0 * BN + local_c1];
                         const float up10      = up_shared[local_r1 * BN + local_c0];
                         const float up11      = up_shared[local_r1 * BN + local_c1];
-                        if constexpr (FullTiles) {
+                        if constexpr (Full) {
                             *output_tile.at(r0, c0) = __float2bfloat16_rn(silu(gate_acc[0]) * up00);
                             *output_tile.at(r0, c1) = __float2bfloat16_rn(silu(gate_acc[1]) * up01);
                             *output_tile.at(r1, c0) = __float2bfloat16_rn(silu(gate_acc[2]) * up10);
@@ -412,7 +409,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
             const int local_row = row_pack * kRowsPerPack;
             const int col       = n0 + local_col;
             const int row       = m0 + local_row;
-            if constexpr (FullTiles) {
+            if constexpr (Full) {
                 W8Bf16x8Bits projected;
                 projected.raw = load_vec<uint4>(&projected_shared[local_col * BM + local_row]);
                 W8Bf16x8Bits residual;
@@ -460,7 +457,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
                 const int c0   = n0 + wn * WN + ni * 8 + 2 * lid;
                 const int c1   = c0 + 1;
                 const float* a = acc[mi][ni];
-                if constexpr (FullTiles) {
+                if constexpr (Full) {
                     *output_tile.at(r0, c0) = __float2bfloat16_rn(a[0]);
                     *output_tile.at(r0, c1) = __float2bfloat16_rn(a[1]);
                     *output_tile.at(r1, c0) = __float2bfloat16_rn(a[2]);

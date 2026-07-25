@@ -39,18 +39,6 @@ bool supported_shape(const W8GdnInputProblem& problem) noexcept {
            problem.parent_rows == 12288 && problem.padded_k == 2048;
 }
 
-W8KernelVariant variant_for(W8GdnInputScheduleId schedule, std::int32_t cols) {
-    switch (schedule) {
-    case W8GdnInputScheduleId::DecodeR8Direct:
-        return W8KernelVariant::None;
-    case W8GdnInputScheduleId::SplitKMmaDirect:
-        return W8KernelVariant::None;
-    case W8GdnInputScheduleId::MmaR64C128:
-        return (cols % 128) == 0 ? W8KernelVariant::Full : W8KernelVariant::Predicated;
-    }
-    throw std::logic_error("W8 GDN input: unknown schedule");
-}
-
 } // namespace
 
 const char* w8_gdn_input_schedule_name(W8GdnInputScheduleId schedule) noexcept {
@@ -87,7 +75,7 @@ W8GdnInputPlan w8_gdn_input_resolve_plan(const W8GdnInputProblem& problem) {
     }
     for (const RouteSpec& route : kRoutes) {
         if (problem.cols >= route.first && problem.cols <= route.last) {
-            return {route.schedule, variant_for(route.schedule, problem.cols), 0};
+            return {route.schedule, 0};
         }
     }
     throw std::logic_error("W8 GDN input: admitted problem has no covering route");
@@ -119,10 +107,10 @@ void w8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, T
         w8_gdn_input_decode_launch(x, weight, qkv, z, stream);
         return;
     case W8GdnInputScheduleId::SplitKMmaDirect:
-        w8_gdn_input_splitk_mma_launch(plan.variant, x, weight, qkv, z, stream);
+        w8_gdn_input_splitk_mma_launch(x, weight, qkv, z, stream);
         return;
     case W8GdnInputScheduleId::MmaR64C128:
-        w8_gdn_input_mma_r64_c128_launch(plan.variant, x, weight, qkv, z, stream);
+        w8_gdn_input_mma_r64_c128_launch(x, weight, qkv, z, stream);
         return;
     }
     throw std::logic_error("W8 GDN input: unknown schedule");

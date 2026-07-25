@@ -1,7 +1,6 @@
 #pragma once
 
 #include "core/tensor.h"
-#include "ops/linear/w8/w8_rowsplit_launch.h"
 
 #include <cuda_runtime.h>
 
@@ -53,11 +52,13 @@ enum class W8PairScheduleId {
     ConcatMmaR96C112,
     ConcatMmaR128C64,
     ConcatMmaR128C80,
-};
-
-enum class W8PairTailPolicy {
-    Homogeneous,
-    Exact,
+    ExactConcatMmaR32C96,
+    ExactConcatMmaR32C128,
+    ExactConcatMmaR64C96,
+    ExactConcatMmaR64C128,
+    ExactConcatMmaR96C96,
+    ExactConcatMmaR128C64,
+    ExactConcatMmaR128C80,
 };
 
 struct W8PairProblem {
@@ -69,9 +70,7 @@ struct W8PairProblem {
 
 struct W8PairPlan {
     W8PairScheduleId schedule;
-    W8KernelVariant variant;
     std::size_t workspace_bytes;
-    W8PairTailPolicy tail_policy = W8PairTailPolicy::Homogeneous;
 };
 
 const char* w8_pair_schedule_name(W8PairScheduleId schedule);
@@ -80,14 +79,10 @@ W8PairProblem w8_pair_problem(const Tensor& x, const Weight& first_weight,
                               const Tensor& first_out) noexcept;
 bool w8_pair_admits(const W8PairProblem& problem) noexcept;
 W8PairPlan w8_pair_resolve_plan(const W8PairProblem& problem);
-bool w8_pair_candidate_is_legal(W8PairPlan plan, const W8PairProblem& problem) noexcept;
 
 void w8_pair_execute_plan(W8PairPlan plan, const Tensor& x, const Weight& first_weight,
                           const Weight& second_weight, Tensor& first_out, Tensor& second_out,
                           cudaStream_t stream);
-void w8_pair_execute_candidate(W8PairPlan plan, const Tensor& x, const Weight& first_weight,
-                               const Weight& second_weight, Tensor& first_out, Tensor& second_out,
-                               cudaStream_t stream);
 void w8_pair_dispatch(const Tensor& x, const Weight& first_weight, const Weight& second_weight,
                       Tensor& first_out, Tensor& second_out, cudaStream_t stream);
 

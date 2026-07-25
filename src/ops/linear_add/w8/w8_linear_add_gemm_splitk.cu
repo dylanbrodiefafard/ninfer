@@ -63,10 +63,10 @@ constexpr auto kK6144ProjectionLaunchers = make_projection_launchers<6144>(
 
 } // namespace
 
-void w8_linear_add_splitk_mma_launch(W8KernelVariant variant, const Tensor& x, const Weight& weight,
-                                     Tensor& residual_out, cudaStream_t stream) {
+void w8_linear_add_splitk_mma_launch(const Tensor& x, const Weight& weight, Tensor& residual_out,
+                                     cudaStream_t stream) {
     const std::int32_t last_exact = weight.k == 6144 ? kLastExactCols : kLegacyLastExactCols;
-    if (variant != W8KernelVariant::None || x.ne[1] < kFirstExactCols || x.ne[1] > last_exact) {
+    if (x.ne[1] < kFirstExactCols || x.ne[1] > last_exact) {
         throw std::invalid_argument("W8 linear_add split-K MMA requires exact T=2..32");
     }
     if (weight.k == 6144) {
@@ -87,8 +87,7 @@ void w8_linear_add_splitk_mma_composite_launch(const Tensor& x, const Weight& we
     while (x.ne[1] - offset >= 32) {
         const Tensor x_slice  = x.slice(1, offset, 32);
         Tensor residual_slice = residual_out.slice(1, offset, 32);
-        w8_linear_add_splitk_mma_launch(W8KernelVariant::None, x_slice, weight, residual_slice,
-                                        stream);
+        w8_linear_add_splitk_mma_launch(x_slice, weight, residual_slice, stream);
         offset += 32;
     }
     const std::int32_t tail = x.ne[1] - offset;
@@ -99,8 +98,7 @@ void w8_linear_add_splitk_mma_composite_launch(const Tensor& x, const Weight& we
     } else if (tail >= 2) {
         const Tensor x_slice  = x.slice(1, offset, tail);
         Tensor residual_slice = residual_out.slice(1, offset, tail);
-        w8_linear_add_splitk_mma_launch(W8KernelVariant::None, x_slice, weight, residual_slice,
-                                        stream);
+        w8_linear_add_splitk_mma_launch(x_slice, weight, residual_slice, stream);
     }
 }
 

@@ -32,7 +32,6 @@
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
-#include "ops/linear/w8/w8_rowsplit_launch.h"
 #include "ops/linear/w8/w8_rowsplit_output.cuh"
 #include "ops/linear/w8/w8_rowsplit_storage.cuh"
 
@@ -145,17 +144,14 @@ w8_simt_consume_slab(const __nv_bfloat16* __restrict__ x0, std::int64_t xslab, s
 
 // full_slabs is computed on the host: k/1024 when k % 8 == 0 and x is 16-byte
 // aligned, else 0 (everything runs through the scalar tail).
-template <class Schedule, int ColsPerTile, int RowsPerCta, int PipelineStages,
-          W8KernelVariant Variant, W8Epilogue Epilogue = W8Epilogue::Store,
-          class Output = W8ContiguousOutput>
+template <class Schedule, int ColsPerTile, int RowsPerCta, int PipelineStages, bool Full,
+          W8Epilogue Epilogue = W8Epilogue::Store, class Output = W8ContiguousOutput>
 __global__ void w8_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x,
                                              const std::uint8_t* __restrict__ codes,
                                              const std::uint8_t* __restrict__ scales, Output output,
                                              std::int32_t rows, std::int32_t k, std::int32_t cols,
                                              std::int32_t padded_k, std::int32_t full_slabs) {
-    static_assert(Variant == W8KernelVariant::Full || Variant == W8KernelVariant::Predicated);
     using Codec                = typename Schedule::Codec;
-    constexpr bool kFull       = Variant == W8KernelVariant::Full;
     constexpr int kPrefetch    = PipelineStages - 1;
     constexpr int kHighU4Alloc = Schedule::kHighU4 > 0 ? Schedule::kHighU4 : 1;
 
@@ -167,12 +163,12 @@ __global__ void w8_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x
     const int warp     = static_cast<int>(threadIdx.x) >> 5;
     const int cta_row0 = static_cast<int>(blockIdx.x) * RowsPerCta;
     const int row      = cta_row0 + warp;
-    if constexpr (!kFull) {
+    if constexpr (!Full) {
         if (row >= rows) { return; }
     }
     const W8OutputTile output_tile = output.tile(cta_row0);
     const int col0                 = static_cast<int>(blockIdx.y) * ColsPerTile;
-    const int ncols                = kFull ? ColsPerTile : min(ColsPerTile, cols - col0);
+    const int ncols                = Full ? ColsPerTile : min(ColsPerTile, cols - col0);
 
     const int kg_padded           = padded_k / Codec::kGroupK;
     const std::uint8_t* code_row  = codes + static_cast<std::int64_t>(row) * kg_padded * 32;

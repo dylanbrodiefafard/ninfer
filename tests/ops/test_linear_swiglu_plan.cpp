@@ -119,45 +119,44 @@ void w8_route_tests() {
     struct Case {
         std::int32_t cols;
         WS schedule;
-        ninfer::ops::detail::W8KernelVariant variant;
     };
 
     constexpr std::array<Case, 35> cases{{
-        {1, WS::DecodePairR16, ninfer::ops::detail::W8KernelVariant::None},
-        {2, WS::SplitKMmaExactT, ninfer::ops::detail::W8KernelVariant::None},
-        {32, WS::SplitKMmaExactT, ninfer::ops::detail::W8KernelVariant::None},
-        {33, WS::MmaR32C64, ninfer::ops::detail::W8KernelVariant::Predicated},
-        {64, WS::MmaR32C64, ninfer::ops::detail::W8KernelVariant::Full},
-        {65, WS::MmaR32C80, ninfer::ops::detail::W8KernelVariant::Predicated},
-        {80, WS::MmaR32C80, ninfer::ops::detail::W8KernelVariant::Full},
-        {81, WS::MmaR32C96, ninfer::ops::detail::W8KernelVariant::Predicated},
-        {96, WS::MmaR32C96, ninfer::ops::detail::W8KernelVariant::Full},
-        {97, WS::MmaR64C64, ninfer::ops::detail::W8KernelVariant::Predicated},
-        {128, WS::MmaR64C64, ninfer::ops::detail::W8KernelVariant::Full},
-        {129, WS::MmaR32C64, ninfer::ops::detail::W8KernelVariant::Predicated},
-        {192, WS::MmaR32C64, ninfer::ops::detail::W8KernelVariant::Full},
-        {193, WS::MmaR128C80, ninfer::ops::detail::W8KernelVariant::Predicated},
-        {240, WS::MmaR128C80, ninfer::ops::detail::W8KernelVariant::Full},
-        {241, WS::MmaR32C128, ninfer::ops::detail::W8KernelVariant::Predicated},
-        {255, WS::MmaR32C128, ninfer::ops::detail::W8KernelVariant::Predicated},
-        {256, WS::MmaR64C128, ninfer::ops::detail::W8KernelVariant::Full},
-        {257, WS::MmaR64C64, ninfer::ops::detail::W8KernelVariant::Predicated},
-        {264, WS::MmaR64C64, ninfer::ops::detail::W8KernelVariant::Predicated},
-        {265, WS::MmaR64C96, ninfer::ops::detail::W8KernelVariant::Predicated},
-        {288, WS::MmaR64C96, ninfer::ops::detail::W8KernelVariant::Full},
-        {289, WS::MmaR64C64, ninfer::ops::detail::W8KernelVariant::Predicated},
-        {320, WS::MmaR64C64, ninfer::ops::detail::W8KernelVariant::Full},
-        {321, WS::MmaR64C128, ninfer::ops::detail::W8KernelVariant::Predicated},
-        {384, WS::MmaR64C128, ninfer::ops::detail::W8KernelVariant::Full},
-        {385, WS::MmaR128C64, ninfer::ops::detail::W8KernelVariant::Predicated},
-        {448, WS::MmaR128C64, ninfer::ops::detail::W8KernelVariant::Full},
-        {449, WS::MmaR64C128, ninfer::ops::detail::W8KernelVariant::Predicated},
-        {512, WS::MmaR64C128, ninfer::ops::detail::W8KernelVariant::Full},
-        {513, WS::MmaR128C80, ninfer::ops::detail::W8KernelVariant::Predicated},
-        {560, WS::MmaR128C80, ninfer::ops::detail::W8KernelVariant::Full},
-        {561, WS::MmaR64C128, ninfer::ops::detail::W8KernelVariant::Predicated},
-        {1024, WS::MmaR64C128, ninfer::ops::detail::W8KernelVariant::Full},
-        {2048, WS::MmaR64C128, ninfer::ops::detail::W8KernelVariant::Full},
+        {1, WS::DecodePairR16},
+        {2, WS::SplitKMmaExactT},
+        {32, WS::SplitKMmaExactT},
+        {33, WS::MmaR32C64},
+        {64, WS::MmaR32C64},
+        {65, WS::MmaR32C80},
+        {80, WS::MmaR32C80},
+        {81, WS::MmaR32C96},
+        {96, WS::MmaR32C96},
+        {97, WS::MmaR64C64},
+        {128, WS::MmaR64C64},
+        {129, WS::MmaR32C64},
+        {192, WS::MmaR32C64},
+        {193, WS::MmaR128C80},
+        {240, WS::MmaR128C80},
+        {241, WS::MmaR32C128},
+        {255, WS::MmaR32C128},
+        {256, WS::MmaR64C128},
+        {257, WS::MmaR64C64},
+        {264, WS::MmaR64C64},
+        {265, WS::MmaR64C96},
+        {288, WS::MmaR64C96},
+        {289, WS::MmaR64C64},
+        {320, WS::MmaR64C64},
+        {321, WS::MmaR64C128},
+        {384, WS::MmaR64C128},
+        {385, WS::MmaR128C64},
+        {448, WS::MmaR128C64},
+        {449, WS::MmaR64C128},
+        {512, WS::MmaR64C128},
+        {513, WS::MmaR128C80},
+        {560, WS::MmaR128C80},
+        {561, WS::MmaR64C128},
+        {1024, WS::MmaR64C128},
+        {2048, WS::MmaR64C128},
     }};
     for (const Case test : cases) {
         const ninfer::ops::detail::W8LinearSwiGluProblem problem{12288, 6144, 2048, 2048,
@@ -168,8 +167,7 @@ void w8_route_tests() {
             continue;
         }
         const auto plan = ninfer::ops::detail::w8_linear_swiglu_resolve_plan(problem);
-        if (plan.schedule != test.schedule || plan.variant != test.variant ||
-            plan.workspace_bytes != 0) {
+        if (plan.schedule != test.schedule || plan.workspace_bytes != 0) {
             std::cerr << "wrong W8 LinearSwiGLU route C=" << test.cols << '\n';
             ++failures;
         }

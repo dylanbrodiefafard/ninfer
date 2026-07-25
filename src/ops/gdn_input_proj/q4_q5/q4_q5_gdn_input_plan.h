@@ -1,13 +1,11 @@
 #pragma once
 
 #include "core/arena.h"
-#include "ops/linear/q5/q5_rowsplit_plan.h"
 
 #include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
-#include <optional>
 
 namespace ninfer::ops::detail {
 
@@ -27,7 +25,6 @@ struct Q4Q5GdnInputProblem {
 
 struct Q4Q5GdnInputPlan {
     Q4Q5GdnInputScheduleId schedule;
-    std::optional<Q5Plan> independent_value;
     std::size_t workspace_bytes;
 };
 

@@ -6,6 +6,12 @@
 
 namespace ninfer::ops::detail {
 
+enum class W8Epilogue {
+    Store,
+    Residual,
+    SwiGluSplitHalf,
+};
+
 struct W8OutputTile {
     __nv_bfloat16* data;
     std::int32_t leading_dim;

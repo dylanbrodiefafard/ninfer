@@ -1,6 +1,5 @@
-#include "ops/linear/q5/q5_rowsplit_kernels.h"
-
 #include "core/device.h"
+#include "ops/linear/q5/q5_launch.h"
 #include "ops/linear/q5/q5_rowsplit_gemv.cuh"
 
 #include <cuda_bf16.h>
@@ -10,8 +9,9 @@
 
 namespace ninfer::ops::detail {
 
-void q5_rowsplit_gemv_r16_s2_x_launch(const Tensor& x, const Weight& w, Tensor& out,
-                                      cudaStream_t stream) {
+void launch_q5_gemv_r16_s2_x(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+                             cudaStream_t stream) {
+    (void)ws;
     constexpr int kK = 5120;
     if (w.n == 6144) {
         q5_rowsplit_gemv_launch_kernel<6144, kK, 16, 2, true>(

@@ -16,7 +16,6 @@
 
 #include "ops/common/mma.cuh"
 #include "ops/common/bf16_vector.cuh"
-#include "ops/linear/q5/q5_rowsplit_launch.h"
 #include "ops/linear/q5/q5_rowsplit_storage.cuh"
 
 #include <cuda_bf16.h>
@@ -107,8 +106,7 @@ __device__ __forceinline__ int q5_mma_swizzle_k64(int row, int col) {
 }
 
 // clang-format off
-template <class Schedule_, Q5KernelVariant Variant,
-          Q5MmaEpilogue Epilogue = Q5MmaEpilogue::Store>
+template <class Schedule_, bool Full, Q5MmaEpilogue Epilogue = Q5MmaEpilogue::Store>
 __global__ __launch_bounds__(Schedule_::kThreads, Schedule_::kLaunchBoundsMinBlocks)
 void q5_rowsplit_gemm_mma_kernel(
     const __nv_bfloat16* __restrict__ x,
@@ -123,13 +121,11 @@ void q5_rowsplit_gemm_mma_kernel(
     std::int32_t padded_k) {
     // clang-format on
     using Schedule = Schedule_;
-    static_assert(Variant == Q5KernelVariant::Full || Variant == Q5KernelVariant::Predicated,
-                  "Q5 MMA requires a tiled kernel variant");
     static_assert(Epilogue == Q5MmaEpilogue::Store || Epilogue == Q5MmaEpilogue::AddResidual ||
                       Epilogue == Q5MmaEpilogue::CtaCollectiveResidual,
                   "Q5 MMA requires a supported epilogue");
 
-    constexpr bool kFull = Variant == Q5KernelVariant::Full;
+    constexpr bool kFull = Full;
     constexpr int BM     = Schedule::kBlockRows;
     constexpr int BN     = Schedule::kBlockCols;
     constexpr int BK     = Schedule::kBlockK;

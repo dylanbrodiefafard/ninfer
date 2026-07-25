@@ -1,7 +1,6 @@
 #pragma once
 
 #include "core/tensor.h"
-#include "ops/linear/w8/w8_rowsplit_launch.h"
 
 #include <cuda_runtime.h>
 
@@ -14,15 +13,14 @@ void w8_gdn_input_decode_conv_snapshot_launch(const Tensor& x, const Weight& wei
                                               const Tensor& initial_slot, Tensor& query,
                                               Tensor& key, Tensor& value, Tensor& z,
                                               cudaStream_t stream);
-void w8_gdn_input_splitk_mma_launch(W8KernelVariant variant, const Tensor& x, const Weight& weight,
-                                    Tensor& qkv, Tensor& z, cudaStream_t stream);
+void w8_gdn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                    cudaStream_t stream);
 void w8_gdn_input_splitk_conv_snapshot_launch(const Tensor& x, const Weight& weight,
                                               const Tensor& conv_weight, Tensor& conv_states,
                                               const Tensor& initial_slot, Tensor& query,
                                               Tensor& key, Tensor& value, Tensor& z,
                                               cudaStream_t stream);
-void w8_gdn_input_mma_r64_c128_launch(W8KernelVariant variant, const Tensor& x,
-                                      const Weight& weight, Tensor& qkv, Tensor& z,
+void w8_gdn_input_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                       cudaStream_t stream);
 
 } // namespace ninfer::ops::detail
