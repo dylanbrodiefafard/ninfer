@@ -12,7 +12,7 @@ using namespace ninfer::test;
 namespace {
 
 constexpr PointwiseCriterion sigmoid_mul_bf16_criterion() {
-    return {/*absolute*/ 2.0e-5, /*relative*/ 4.1e-3};
+    return {/*absolute*/ 2.0e-5, /*relative*/ 4.05e-3};
 }
 
 std::vector<std::uint16_t> encode_bf16(const std::vector<float>& values) {

@@ -22,9 +22,9 @@ constexpr int kDim   = 72;
 constexpr int kHeads = 16;
 
 constexpr ReductionCriterion kVisionAttentionBf16Criterion{
-    .relative_l2                     = 2.8e-3,
+    .relative_l2                     = 2.5e-3,
     .gross_absolute                  = 1e-3,
-    .gross_relative_to_max_reference = 3e-3,
+    .gross_relative_to_max_reference = 2.8e-3,
 };
 
 std::size_t index_of(int token, int head, int d) {

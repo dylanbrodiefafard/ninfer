@@ -25,7 +25,7 @@ constexpr std::size_t kOutputScanWords = 1U << 20;
 
 // One criterion for the complete A16 fused Op. It is not selected by T, route, or kernel.
 constexpr ReductionCriterion kLinearAddA16Tolerance{
-    4.0e-3,
+    2.7e-3,
     4.0e-3,
     5.5e-3,
 };
@@ -478,24 +478,7 @@ OutputRead read_output(const void* device, std::int32_t n, std::int32_t t,
 
 int compare_output(std::string_view label, std::span<const double> actual,
                    std::span<const double> reference) {
-    if (actual.empty() || actual.size() != reference.size()) {
-        std::cerr << label << ": invalid comparison sizes\n";
-        return 1;
-    }
-
-    const ReductionStats stats = compute_reduction_stats(actual.data(), reference.data(),
-                                                         static_cast<std::int64_t>(actual.size()));
-    const double gross_limit   = gross_error_limit(stats, kLinearAddA16Tolerance);
-    if (reduction_passes(stats, static_cast<std::int64_t>(actual.size()), kLinearAddA16Tolerance)) {
-        return 0;
-    }
-
-    std::cerr << label << ": numerical mismatch rel_l2=" << stats.relative_l2
-              << " limit=" << kLinearAddA16Tolerance.relative_l2
-              << " max_abs=" << stats.maximum_absolute_error << " gross_limit=" << gross_limit
-              << " index=" << stats.maximum_error_index << " actual=" << stats.actual_at_maximum
-              << " reference=" << stats.reference_at_maximum << '\n';
-    return 1;
+    return verify_reduction(label, actual, reference, kLinearAddA16Tolerance);
 }
 
 int verify_preserved(const test::GuardedDeviceBuffer& device,

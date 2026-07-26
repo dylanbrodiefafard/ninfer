@@ -25,9 +25,9 @@ constexpr int kGroup   = 4;
 constexpr float kScale = 0.08838834764831844055f;
 
 constexpr ReductionCriterion kBidirectionalGqaBf16Criterion{
-    .relative_l2                     = 3.3e-3,
+    .relative_l2                     = 2.95e-3,
     .gross_absolute                  = 3e-4,
-    .gross_relative_to_max_reference = 6e-3,
+    .gross_relative_to_max_reference = 5.7e-3,
 };
 
 std::size_t q_index(int d, int q_head, int token) {

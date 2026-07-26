@@ -23,12 +23,12 @@ constexpr int kHeadDim = 128;
 constexpr int kQkHeads = 16;
 
 constexpr ReductionCriterion gated_delta_rule_output_bf16_criterion() {
-    return {/*relative_l2=*/4.2e-3, /*gross_absolute=*/5.0e-6,
+    return {/*relative_l2=*/4.1e-3, /*gross_absolute=*/5.0e-6,
             /*gross_relative_to_max_reference=*/4.7e-3};
 }
 
 constexpr ReductionCriterion gated_delta_rule_state_fp32_criterion() {
-    return {/*relative_l2=*/2.8e-3, /*gross_absolute=*/1.0e-5,
+    return {/*relative_l2=*/2.7e-3, /*gross_absolute=*/1.0e-5,
             /*gross_relative_to_max_reference=*/3.0e-3};
 }
 

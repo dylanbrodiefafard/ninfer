@@ -29,9 +29,9 @@ constexpr std::int32_t kDFlashSecondRow  = 5120;
 // Both observable projections use the same A16 arithmetic profile. T and the selected pair
 // launcher never select another correctness criterion.
 constexpr ReductionCriterion kLinearPairA16Tolerance{
-    3.0e-3,
+    2.9e-3,
     4.0e-3,
-    4.0e-3,
+    3.8e-3,
 };
 
 struct LogicalWeight {
@@ -353,25 +353,7 @@ OutputRead read_output(const void* device, std::int32_t t, std::span<const std::
 
 int compare_output(std::string_view label, std::span<const double> actual,
                    std::span<const double> reference) {
-    if (actual.empty() || actual.size() != reference.size()) {
-        std::cerr << label << ": invalid comparison sizes\n";
-        return 1;
-    }
-
-    const ReductionStats stats = compute_reduction_stats(actual.data(), reference.data(),
-                                                         static_cast<std::int64_t>(actual.size()));
-    const double gross_limit   = gross_error_limit(stats, kLinearPairA16Tolerance);
-    if (reduction_passes(stats, static_cast<std::int64_t>(actual.size()),
-                         kLinearPairA16Tolerance)) {
-        return 0;
-    }
-
-    std::cerr << label << ": numerical mismatch rel_l2=" << stats.relative_l2
-              << " limit=" << kLinearPairA16Tolerance.relative_l2
-              << " max_abs=" << stats.maximum_absolute_error << " gross_limit=" << gross_limit
-              << " index=" << stats.maximum_error_index << " actual=" << stats.actual_at_maximum
-              << " reference=" << stats.reference_at_maximum << '\n';
-    return 1;
+    return verify_reduction(label, actual, reference, kLinearPairA16Tolerance);
 }
 
 int verify_preserved(const test::GuardedDeviceBuffer& device,

@@ -56,6 +56,17 @@ cmake --build build --parallel --target ninfer_sampling_test
 ctest --test-dir build -R ninfer_sampling_test --output-on-failure
 ```
 
+Enable uniform floating-point error records when establishing or reviewing an Op criterion:
+
+```bash
+NINFER_OP_REPORT_STATS=1 \
+  ctest --test-dir build -V -R '^ninfer_(rmsnorm|gqa_attention)_test$'
+```
+
+Every participating comparison emits one `OP_ERROR_STATS` record containing the stable case label,
+actual error, active limit, and error-to-limit ratio. The switch changes reporting only; the same
+statistics still drive the normal verdict. Passing tests remain quiet without it.
+
 Linear tests are independently runnable by weight and activation-compute profile:
 
 ```bash

@@ -124,46 +124,22 @@ int verify_input(const char* label, const GuardedDeviceBuffer& ids,
     return failures;
 }
 
-struct QuantizedDiff {
-    double max_abs         = 0.0;
-    double max_rel         = 0.0;
-    std::size_t argmax_rel = 0;
-    std::size_t violations = 0;
-    std::size_t nonfinite  = 0;
-};
-
 // There is no reduction in quantized embedding. Compare every finite BF16 output directly with
 // signed_code * exact_FP16_scale. One criterion covers Q6/W8, all shapes, T values, and routes.
 // The complete matrix below measures 3.76381e-3 worst-case relative error.
-constexpr double kQuantizedOutputRtol = 3.8e-3;
+constexpr PointwiseCriterion kQuantizedOutputTolerance{
+    /*absolute=*/0.0,
+    /*relative=*/3.8e-3,
+};
 
 int verify_quantized(const char* label, const GuardedDeviceBuffer& output,
                      const std::vector<double>& expected) {
     const std::vector<std::uint16_t> bits = guarded_to_host<std::uint16_t>(output, expected.size());
-    QuantizedDiff stats;
+    std::vector<double> actual(bits.size());
     for (std::size_t i = 0; i < expected.size(); ++i) {
-        const double got = static_cast<double>(bf16_to_f32(bits[i]));
-        const double ref = expected[i];
-        if (!std::isfinite(got) || !std::isfinite(ref)) {
-            ++stats.nonfinite;
-            continue;
-        }
-        const double abs = std::abs(got - ref);
-        stats.max_abs    = std::max(stats.max_abs, abs);
-        const double rel = ref == 0.0 ? (abs == 0.0 ? 0.0 : std::numeric_limits<double>::infinity())
-                                      : abs / std::abs(ref);
-        if (rel > stats.max_rel) {
-            stats.max_rel    = rel;
-            stats.argmax_rel = i;
-        }
-        if (rel > kQuantizedOutputRtol) ++stats.violations;
+        actual[i] = static_cast<double>(bf16_to_f32(bits[i]));
     }
-    std::cout << "    " << label << " max_abs=" << stats.max_abs << " max_rel=" << stats.max_rel
-              << " at=" << stats.argmax_rel << '\n';
-    if (stats.nonfinite == 0 && stats.violations == 0) return 0;
-    std::cerr << label << ": nonfinite=" << stats.nonfinite
-              << " pointwise_violations=" << stats.violations << '\n';
-    return 1;
+    return verify_pointwise(label, actual, expected, kQuantizedOutputTolerance);
 }
 
 struct Q6Row {

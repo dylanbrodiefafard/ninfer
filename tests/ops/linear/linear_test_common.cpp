@@ -47,35 +47,9 @@ constexpr FormatSpec kW8Spec{QType::W8G32_F16S, 8, 32, 32, 0};
 constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute) {
     switch (activation_compute) {
     case ActivationCompute::A16:
-        return {3.0e-3, 4.0e-3, 3.5e-3};
+        return {2.9e-3, 4.0e-3, 3.4e-3};
     }
     throw std::invalid_argument("linear test: unknown activation compute path");
-}
-
-constexpr const char* activation_compute_name(ActivationCompute activation_compute) {
-    switch (activation_compute) {
-    case ActivationCompute::A16:
-        return "A16";
-    }
-    throw std::invalid_argument("linear test: unknown activation compute path");
-}
-
-constexpr const char* comparison_name(Comparison comparison) {
-    switch (comparison) {
-    case Comparison::Full:
-        return "full";
-    case Comparison::Sampled:
-        return "sampled";
-    }
-    throw std::invalid_argument("linear test: unknown comparison mode");
-}
-
-bool report_statistics() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("NINFER_LINEAR_REPORT_STATS");
-        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
-    }();
-    return enabled;
 }
 
 std::size_t checked_elements(std::int32_t first, std::int32_t second, const char* label) {
@@ -490,45 +464,8 @@ OutputRead read_output(const void* device, std::int32_t n, std::int32_t t,
 }
 
 int compare_output(std::string_view label, std::span<const double> actual,
-                   std::span<const double> reference, ActivationCompute activation_compute,
-                   Comparison comparison) {
-    if (actual.empty() || actual.size() != reference.size()) {
-        std::cerr << label << ": invalid comparison sizes\n";
-        return 1;
-    }
-
-    const ReductionCriterion tolerance = tolerance_for(activation_compute);
-    const ReductionStats stats         = compute_reduction_stats(actual.data(), reference.data(),
-                                                                 static_cast<std::int64_t>(actual.size()));
-    if (stats.first_non_finite >= 0) {
-        std::cerr << label << ": comparison contains a non-finite value at index "
-                  << stats.first_non_finite << '\n';
-        return 1;
-    }
-
-    const double gross_limit = gross_error_limit(stats, tolerance);
-    if (report_statistics()) {
-        const double peak_relative =
-            stats.maximum_absolute_error / std::max(stats.maximum_absolute_reference, 1.0e-30);
-        const double relative_l2_ratio = stats.relative_l2 / tolerance.relative_l2;
-        const double gross_ratio       = stats.maximum_absolute_error / gross_limit;
-        std::printf(
-            "LINEAR_STATS activation_compute=%s comparison=%s count=%zu rel_l2=%.17g rmse=%.17g "
-            "reference_rms=%.17g max_abs=%.17g max_reference=%.17g peak_relative=%.17g "
-            "relative_l2_limit_ratio=%.17g gross_limit_ratio=%.17g case=%.*s\n",
-            activation_compute_name(activation_compute), comparison_name(comparison), actual.size(),
-            stats.relative_l2, stats.root_mean_squared_error, stats.reference_root_mean_square,
-            stats.maximum_absolute_error, stats.maximum_absolute_reference, peak_relative,
-            relative_l2_ratio, gross_ratio, static_cast<int>(label.size()), label.data());
-    }
-    if (reduction_passes(stats, static_cast<std::int64_t>(actual.size()), tolerance)) { return 0; }
-
-    std::cerr << label << ": numerical mismatch" << " rel_l2=" << stats.relative_l2
-              << " limit=" << tolerance.relative_l2 << " max_abs=" << stats.maximum_absolute_error
-              << " gross_limit=" << gross_limit << " index=" << stats.maximum_error_index
-              << " actual=" << stats.actual_at_maximum
-              << " reference=" << stats.reference_at_maximum << '\n';
-    return 1;
+                   std::span<const double> reference, ActivationCompute activation_compute) {
+    return verify_reduction(label, actual, reference, tolerance_for(activation_compute));
 }
 
 } // namespace
@@ -694,7 +631,7 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
                                std::span<const double>(
                                    full_reference.data(),
                                    checked_elements(shape.n, invocation.t, "reference prefix")),
-                               activation_compute, shape.comparison);
+                               activation_compute);
         } else {
             const std::vector<float> activation =
                 materialize_activation(activation_bits, shape.k, columns);
@@ -704,8 +641,7 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
             cpu_linear_gemm_fp64(host_weight.oracle_weight.data(), activation.data(),
                                  reference.data(), static_cast<std::int32_t>(oracle_rows.size()),
                                  shape.k, static_cast<std::int32_t>(columns.size()));
-            failures += compare_output(case_label, actual.selected, reference, activation_compute,
-                                       shape.comparison);
+            failures += compare_output(case_label, actual.selected, reference, activation_compute);
         }
     }
 

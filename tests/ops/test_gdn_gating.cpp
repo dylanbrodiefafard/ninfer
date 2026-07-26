@@ -17,7 +17,7 @@ namespace {
 
 constexpr std::int32_t kHeads = 48;
 
-constexpr PointwiseCriterion kGdnGatingFp32{/*absolute=*/1.0e-7, /*relative=*/2.5e-7};
+constexpr PointwiseCriterion kGdnGatingFp32{/*absolute=*/1.0e-7, /*relative=*/2.2e-7};
 
 double softplus(double value) {
     return std::max(value, 0.0) + std::log1p(std::exp(-std::abs(value)));

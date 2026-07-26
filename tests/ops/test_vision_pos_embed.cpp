@@ -21,7 +21,7 @@ namespace {
 // tail or normwise escape path.
 constexpr PointwiseCriterion kVisionPositionEmbeddingTolerance{
     /*absolute=*/1.0e-5,
-    /*relative=*/4.0e-3,
+    /*relative=*/3.95e-3,
 };
 
 std::vector<std::uint16_t> as_bf16_bits(const std::vector<float>& values) {

@@ -26,9 +26,9 @@ constexpr int kWindow  = 4096;
 constexpr float kScale = 0.08838834764831844055f;
 
 constexpr ReductionCriterion kSwaBf16Criterion{
-    .relative_l2                     = 4.4e-3,
+    .relative_l2                     = 3.95e-3,
     .gross_absolute                  = 3e-4,
-    .gross_relative_to_max_reference = 3.5e-3,
+    .gross_relative_to_max_reference = 3.0e-3,
 };
 
 std::size_t q_index(int d, int q_head, int token) {

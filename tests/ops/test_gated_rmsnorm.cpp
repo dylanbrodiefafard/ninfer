@@ -14,8 +14,8 @@ using namespace ninfer::test::norm;
 namespace {
 
 constexpr ReductionCriterion gated_rmsnorm_bf16_criterion() {
-    return {/*relative_l2*/ 2.2e-3, /*gross_absolute*/ 5.0e-5,
-            /*gross_relative_to_max_reference*/ 3.0e-3};
+    return {/*relative_l2*/ 1.85e-3, /*gross_absolute*/ 4.5e-5,
+            /*gross_relative_to_max_reference*/ 2.8e-3};
 }
 
 std::vector<double> gated_rmsnorm_oracle(const std::vector<float>& input,

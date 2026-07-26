@@ -11,7 +11,7 @@ using namespace ninfer::test;
 namespace {
 
 constexpr PointwiseCriterion residual_add_bf16_criterion() {
-    return {/*absolute*/ 0.0, /*relative*/ 4.0e-3};
+    return {/*absolute*/ 0.0, /*relative*/ 3.95e-3};
 }
 
 std::vector<std::uint16_t> encode_bf16(const std::vector<float>& values) {

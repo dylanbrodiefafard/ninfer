@@ -30,7 +30,7 @@ namespace {
 constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute) {
     switch (activation_compute) {
     case ActivationCompute::A16:
-        return {3.5e-3, 5.0e-3, 6.5e-3};
+        return {3.3e-3, 5.0e-3, 6.3e-3};
     }
     throw std::invalid_argument("linear_swiglu test: unknown activation compute profile");
 }
@@ -218,11 +218,6 @@ std::vector<double> read_bf16_output(const test::GuardedDeviceBuffer& output,
     return values;
 }
 
-bool report_statistics() {
-    const char* value = std::getenv("NINFER_LINEAR_SWIGLU_REPORT_STATS");
-    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
-}
-
 int compare_output(std::string_view label, const std::vector<double>& actual,
                    const double* reference, ActivationCompute activation_compute) {
     if (actual.empty() || reference == nullptr) {
@@ -230,24 +225,8 @@ int compare_output(std::string_view label, const std::vector<double>& actual,
         return 1;
     }
 
-    const ReductionCriterion tolerance = tolerance_for(activation_compute);
-    const ReductionStats stats =
-        compute_reduction_stats(actual.data(), reference, static_cast<std::int64_t>(actual.size()));
-    const double gross_limit = gross_error_limit(stats, tolerance);
-    if (report_statistics()) {
-        std::printf("LINEAR_SWIGLU_STATS count=%zu rel_l2=%.17g max_abs=%.17g max_reference=%.17g "
-                    "case=%.*s\n",
-                    actual.size(), stats.relative_l2, stats.maximum_absolute_error,
-                    stats.maximum_absolute_reference, static_cast<int>(label.size()), label.data());
-    }
-    if (reduction_passes(stats, static_cast<std::int64_t>(actual.size()), tolerance)) return 0;
-
-    std::cerr << label << ": numerical mismatch rel_l2=" << stats.relative_l2
-              << " limit=" << tolerance.relative_l2 << " max_abs=" << stats.maximum_absolute_error
-              << " gross_limit=" << gross_limit << " index=" << stats.maximum_error_index
-              << " actual=" << stats.actual_at_maximum
-              << " reference=" << stats.reference_at_maximum << '\n';
-    return 1;
+    return verify_reduction(label, actual, std::span<const double>(reference, actual.size()),
+                            tolerance_for(activation_compute));
 }
 
 int verify_unchanged(std::string_view label, const test::GuardedDeviceBuffer& device,

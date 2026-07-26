@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 
 namespace ninfer::test {
 
@@ -18,7 +19,9 @@ struct PointwiseCriterion {
 struct PointwiseStats {
     double maximum_absolute_error    = 0.0;
     double maximum_relative_error    = 0.0;
+    double maximum_criterion_ratio   = 0.0;
     std::int64_t maximum_error_index = -1;
+    std::int64_t maximum_ratio_index = -1;
     double actual_at_maximum         = 0.0;
     double reference_at_maximum      = 0.0;
     std::int64_t first_violation     = -1;
@@ -50,6 +53,13 @@ inline PointwiseStats compute_pointwise_stats(const double* actual, const double
         stats.maximum_relative_error = std::max(stats.maximum_relative_error, relative_error);
 
         const double limit = criterion.absolute + criterion.relative * std::abs(expected);
+        const double criterion_ratio =
+            limit == 0.0 ? (absolute_error == 0.0 ? 0.0 : std::numeric_limits<double>::infinity())
+                         : absolute_error / limit;
+        if (criterion_ratio > stats.maximum_criterion_ratio) {
+            stats.maximum_criterion_ratio = criterion_ratio;
+            stats.maximum_ratio_index     = index;
+        }
         if (absolute_error > limit && stats.first_violation < 0) { stats.first_violation = index; }
     }
     return stats;

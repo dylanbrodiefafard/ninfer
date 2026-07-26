@@ -20,7 +20,7 @@ using namespace ninfer::test::input_projection;
 namespace {
 
 // This criterion belongs to the complete A16 fused projection/conv/snapshot Op.
-constexpr ReductionCriterion kGdnInputProjConvSnapshotA16Tolerance{3.2e-3, 4.0e-3, 3.5e-3};
+constexpr ReductionCriterion kGdnInputProjConvSnapshotA16Tolerance{3.15e-3, 4.0e-3, 3.2e-3};
 
 constexpr std::int32_t kQueryRows = 2048;
 constexpr std::int32_t kKeyRows   = 2048;

@@ -19,9 +19,9 @@ namespace {
 // CausalConv1dSiLU has one A16 convolution-reduction profile. Decode, small-T, sequence, prefill,
 // snapshot, and state-alias choices all qualify against this single normwise criterion.
 constexpr ReductionCriterion kCausalConvA16Criterion{
-    /*relative_l2*/ 2.0e-3,
+    /*relative_l2*/ 1.85e-3,
     /*gross_absolute*/ 1.0e-3,
-    /*gross_relative_to_max_reference*/ 4.0e-3,
+    /*gross_relative_to_max_reference*/ 3.7e-3,
 };
 
 constexpr std::uint8_t kOutputPoison = 0xff;

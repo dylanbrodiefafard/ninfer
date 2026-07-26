@@ -22,7 +22,7 @@ constexpr float kVisionTheta = 10'000.0F;
 // Either member of a rotated pair can approach zero through cancellation. The scale-invariant
 // RoPE BF16 profile therefore bounds each output by the FP64 norm of its public input pair rather
 // than by the cancelled output value.
-constexpr double kRopePointwisePairRtol = 7.0e-3;
+constexpr double kRopePointwisePairRtol = 6.9e-3;
 
 struct Geometry {
     const char* label;
@@ -32,15 +32,6 @@ struct Geometry {
     int tokens;
     float theta;
 };
-
-struct ProfileMeasurement {
-    double max_abs            = 0.0;
-    double required_pair_rtol = 0.0;
-    std::string label;
-    std::size_t index = 0;
-};
-
-ProfileMeasurement g_profile_measurement;
 
 std::size_t dense_elements(int head_dim, int heads, int tokens) {
     return static_cast<std::size_t>(head_dim) * static_cast<std::size_t>(heads) *
@@ -156,7 +147,6 @@ int verify_rope_profile(const std::string& label, const std::vector<double>& got
 
     double case_max_abs            = 0.0;
     double case_required_pair_rtol = 0.0;
-    std::size_t case_worst_index   = 0;
     int violations                 = 0;
     const int half                 = geometry.rotary_dim / 2;
     for (int token = 0; token < geometry.tokens; ++token) {
@@ -180,7 +170,6 @@ int verify_rope_profile(const std::string& label, const std::vector<double>& got
                         : abs_error / pair_norm;
                 if (required_pair_rtol > case_required_pair_rtol) {
                     case_required_pair_rtol = required_pair_rtol;
-                    case_worst_index        = index;
                 }
                 case_max_abs = std::max(case_max_abs, abs_error);
                 if (abs_error > kRopePointwisePairRtol * pair_norm) {
@@ -195,14 +184,9 @@ int verify_rope_profile(const std::string& label, const std::vector<double>& got
         }
     }
 
-    std::cout << "    " << label << " max_abs=" << case_max_abs
-              << " required_pair_rtol=" << case_required_pair_rtol << '\n';
-    g_profile_measurement.max_abs = std::max(g_profile_measurement.max_abs, case_max_abs);
-    if (case_required_pair_rtol > g_profile_measurement.required_pair_rtol) {
-        g_profile_measurement.required_pair_rtol = case_required_pair_rtol;
-        g_profile_measurement.label              = label;
-        g_profile_measurement.index              = case_worst_index;
-    }
+    report_scaled_pointwise_stats(
+        label, static_cast<std::int64_t>(geometry.tokens) * heads * geometry.rotary_dim,
+        case_max_abs, case_required_pair_rtol, kRopePointwisePairRtol);
     if (violations != 0) {
         std::cerr << label << ": " << violations << " values exceed the unified RoPE profile\n";
         return 1;
@@ -454,10 +438,6 @@ int main() {
     failures +=
         run_single_case({"35b dflash context k", 128, 128, 1, 128, kTextTheta}, 8, 131'072, 16);
 
-    std::cout << "    rope profile worst max_abs=" << g_profile_measurement.max_abs
-              << " required_pair_rtol=" << g_profile_measurement.required_pair_rtol << " at "
-              << g_profile_measurement.label << " index=" << g_profile_measurement.index
-              << " | unified pair_rtol=" << kRopePointwisePairRtol << '\n';
     std::cout << (failures == 0 ? "OK" : "FAIL") << " rope correctness\n";
     return failures == 0 ? 0 : 1;
 }

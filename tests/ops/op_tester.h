@@ -23,10 +23,14 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <random>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -160,6 +164,64 @@ inline std::vector<int> from_device_i32(const DeviceBuffer& d, std::size_t n) {
 }
 
 // --- verdict ----------------------------------------------------------------
+inline bool error_stats_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_OP_REPORT_STATS");
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+inline double error_limit_ratio(double error, double limit) {
+    if (limit != 0.0) return error / limit;
+    return error == 0.0 ? 0.0 : std::numeric_limits<double>::infinity();
+}
+
+inline void report_pointwise_stats(std::string_view label, std::int64_t count,
+                                   const PointwiseStats& stats,
+                                   const PointwiseCriterion& criterion) {
+    if (!error_stats_enabled()) return;
+    std::printf("OP_ERROR_STATS kind=pointwise count=%lld max_abs=%.17g max_rel=%.17g "
+                "max_limit_ratio=%.17g abs_limit=%.17g rel_limit=%.17g non_finite=%lld case=%.*s\n",
+                static_cast<long long>(count), stats.maximum_absolute_error,
+                stats.maximum_relative_error, stats.maximum_criterion_ratio, criterion.absolute,
+                criterion.relative, static_cast<long long>(stats.non_finite_count),
+                static_cast<int>(label.size()), label.data());
+}
+
+inline void report_reduction_stats(std::string_view label, std::int64_t count,
+                                   const ReductionStats& stats,
+                                   const ReductionCriterion& criterion) {
+    if (!error_stats_enabled()) return;
+    const double gross_limit = gross_error_limit(stats, criterion);
+    std::printf("OP_ERROR_STATS kind=reduction count=%lld rel_l2=%.17g rel_l2_limit=%.17g "
+                "rel_l2_ratio=%.17g rmse=%.17g reference_rms=%.17g max_abs=%.17g "
+                "max_reference=%.17g gross_limit=%.17g gross_abs_limit=%.17g "
+                "gross_rel_limit=%.17g gross_ratio=%.17g non_finite=%lld case=%.*s\n",
+                static_cast<long long>(count), stats.relative_l2, criterion.relative_l2,
+                error_limit_ratio(stats.relative_l2, criterion.relative_l2),
+                stats.root_mean_squared_error, stats.reference_root_mean_square,
+                stats.maximum_absolute_error, stats.maximum_absolute_reference, gross_limit,
+                criterion.gross_absolute, criterion.gross_relative_to_max_reference,
+                error_limit_ratio(stats.maximum_absolute_error, gross_limit),
+                static_cast<long long>(stats.first_non_finite >= 0), static_cast<int>(label.size()),
+                label.data());
+}
+
+inline void report_scaled_pointwise_stats(std::string_view label, std::int64_t count,
+                                          double maximum_absolute_error,
+                                          double required_scaled_relative,
+                                          double scaled_relative_limit) {
+    if (!error_stats_enabled()) return;
+    std::printf("OP_ERROR_STATS kind=scaled_pointwise count=%lld max_abs=%.17g "
+                "required_scaled_relative=%.17g scaled_relative_limit=%.17g "
+                "scaled_relative_ratio=%.17g case=%.*s\n",
+                static_cast<long long>(count), maximum_absolute_error, required_scaled_relative,
+                scaled_relative_limit,
+                error_limit_ratio(required_scaled_relative, scaled_relative_limit),
+                static_cast<int>(label.size()), label.data());
+}
+
 // Exact transforms, codecs, integer outputs, and state metadata use this path.
 template <typename T>
 inline int verify_exact(const char* label, const std::vector<T>& got,
@@ -254,14 +316,15 @@ private:
 };
 
 // Returns 0 (pass) / 1 (fail). Concrete criteria are supplied by the semantic Op suite.
-inline int verify_pointwise(const char* label, const std::vector<double>& got,
-                            const std::vector<double>& ref, const PointwiseCriterion& criterion) {
+inline int verify_pointwise(std::string_view label, std::span<const double> got,
+                            std::span<const double> ref, const PointwiseCriterion& criterion) {
     if (got.size() != ref.size()) {
         std::cerr << label << ": size mismatch got=" << got.size() << " ref=" << ref.size() << '\n';
         return 1;
     }
     const PointwiseStats stats = compute_pointwise_stats(
         got.data(), ref.data(), static_cast<std::int64_t>(got.size()), criterion);
+    report_pointwise_stats(label, static_cast<std::int64_t>(got.size()), stats, criterion);
     if (pointwise_passes(stats, static_cast<std::int64_t>(got.size()))) return 0;
 
     std::cerr << label << ": pointwise mismatch" << " max_abs=" << stats.maximum_absolute_error
@@ -273,8 +336,8 @@ inline int verify_pointwise(const char* label, const std::vector<double>& got,
     return 1;
 }
 
-inline int verify_reduction(const char* label, const std::vector<double>& got,
-                            const std::vector<double>& ref, const ReductionCriterion& criterion) {
+inline int verify_reduction(std::string_view label, std::span<const double> got,
+                            std::span<const double> ref, const ReductionCriterion& criterion) {
     if (got.empty() || got.size() != ref.size()) {
         std::cerr << label << ": invalid comparison sizes got=" << got.size()
                   << " ref=" << ref.size() << '\n';
@@ -282,10 +345,7 @@ inline int verify_reduction(const char* label, const std::vector<double>& got,
     }
     const ReductionStats stats =
         compute_reduction_stats(got.data(), ref.data(), static_cast<std::int64_t>(got.size()));
-    const double gross_limit = gross_error_limit(stats, criterion);
-    std::cout << "    " << label << " rel_l2=" << stats.relative_l2
-              << " max_abs=" << stats.maximum_absolute_error << " gross_limit=" << gross_limit
-              << '\n';
+    report_reduction_stats(label, static_cast<std::int64_t>(got.size()), stats, criterion);
     if (reduction_passes(stats, static_cast<std::int64_t>(got.size()), criterion)) return 0;
 
     if (stats.first_non_finite >= 0) {

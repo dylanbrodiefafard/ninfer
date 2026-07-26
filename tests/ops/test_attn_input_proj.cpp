@@ -16,7 +16,7 @@ using namespace ninfer::test::input_projection;
 namespace {
 
 // This criterion belongs to the complete A16 attention-input-projection Op.
-constexpr ReductionCriterion kAttnInputProjA16Tolerance{3.0e-3, 4.0e-3, 4.5e-3};
+constexpr ReductionCriterion kAttnInputProjA16Tolerance{2.9e-3, 4.0e-3, 4.5e-3};
 
 int verify_output(std::string_view label, const GuardedBf16Tensor& output,
                   const row_split::PackedWeight& weight, std::int32_t weight_row_offset,

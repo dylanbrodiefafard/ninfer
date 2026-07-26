@@ -540,6 +540,29 @@ full-output write, guard, or analytic invariant; sampling alone does not qualify
   MMA, schedules, template instances, host launchers, and T regions selected inside one such path
   share that path's single criterion.
 
+#### Error observation and criterion changes
+
+All floating-point Op comparisons use the common reporting switch:
+
+```bash
+NINFER_OP_REPORT_STATS=1 ctest --test-dir build -V -R '<op-test-regex>'
+```
+
+Each comparison emits one `OP_ERROR_STATS` line with its stable case label, comparison kind,
+measured error, active limit, and error-to-limit ratio. Pointwise reports include maximum absolute,
+relative, and combined-limit ratios; reduction reports include relative L2, RMSE, reference RMS,
+maximum absolute error, and the gross-limit ratio. RoPE's pair-norm-scaled pointwise criterion uses
+the same switch and record prefix. Without the switch, passing tests do not print numerical
+statistics.
+
+This reporting path observes the same statistics used for the verdict; it does not run a second
+comparison, change a criterion, or override one at runtime. To change a criterion, measure the
+complete affected criterion domain on the supported hardware/toolchain, take the maximum for each
+independent bound, retain explicit modest headroom for repeatability, update the one suite-owned
+criterion, and rerun the complete domain. Do not derive a per-case, T, route, kernel, or weight-codec
+criterion from the report. A bound already close to the measured or numerical-format limit should
+remain unchanged rather than be tightened cosmetically.
+
 An Op is qualified only when every public entry, finite semantic variant, registered geometry, and
 reachable production route maps to a direct oracle case, and every observable output and effect is
 checked. Unsupported models, devices, formats, and hypothetical failure modes do not enlarge this

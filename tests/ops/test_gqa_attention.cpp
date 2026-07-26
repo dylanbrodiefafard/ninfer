@@ -28,15 +28,15 @@ constexpr std::uint16_t kOutputCanary = 0x7fc1u;
 // The Op has two registered compute profiles. A1 and A3 use the same criterion for a given
 // profile; token count, geometry, execution envelope, and private launch route do not select it.
 constexpr ReductionCriterion kAttentionBf16Criterion{
-    /*relative_l2*/ 3.0e-3,
+    /*relative_l2*/ 2.8e-3,
     /*gross_absolute*/ 1.0e-3,
-    /*gross_relative_to_max_reference*/ 3.0e-3,
+    /*gross_relative_to_max_reference*/ 2.7e-3,
 };
 
 constexpr ReductionCriterion kAttentionInt8Criterion{
-    /*relative_l2*/ 3.3e-3,
+    /*relative_l2*/ 3.15e-3,
     /*gross_absolute*/ 1.1e-3,
-    /*gross_relative_to_max_reference*/ 2.5e-3,
+    /*gross_relative_to_max_reference*/ 2.2e-3,
 };
 
 struct Geometry {

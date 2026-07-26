@@ -43,8 +43,8 @@ constexpr std::int32_t kSharedGateRows = 2 * kIntermediate;
 // The limits retain modest headroom over the measured maxima from the complete case matrix:
 // rel-L2 1.117e-2 and pointwise 3.687e-3.
 constexpr ReductionCriterion kSparseMoeA16Tolerance{
-    /*relative_l2*/ 1.3e-2,
-    /*gross_absolute*/ 4.3e-3,
+    /*relative_l2*/ 1.2e-2,
+    /*gross_absolute*/ 4.0e-3,
     /*gross_relative_to_max_reference*/ 0.0,
 };
 
@@ -80,33 +80,9 @@ std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
     return bits;
 }
 
-bool report_statistics() {
-    const char* value = std::getenv("NINFER_SPARSE_MOE_REPORT_STATS");
-    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
-}
-
 int compare_output(const std::string& label, const std::vector<double>& actual,
                    const std::vector<double>& reference) {
-    if (actual.empty() || actual.size() != reference.size()) {
-        std::cerr << label << ": invalid comparison sizes\n";
-        return 1;
-    }
-    const ReductionStats stats = compute_reduction_stats(actual.data(), reference.data(),
-                                                         static_cast<std::int64_t>(actual.size()));
-    if (report_statistics()) {
-        std::cout << "SPARSE_MOE_STATS rel_l2=" << stats.relative_l2
-                  << " max_abs=" << stats.maximum_absolute_error << " case=" << label << '\n';
-    }
-    if (reduction_passes(stats, static_cast<std::int64_t>(actual.size()), kSparseMoeA16Tolerance)) {
-        return 0;
-    }
-    std::cerr << label << ": numerical mismatch rel_l2=" << stats.relative_l2
-              << " limit=" << kSparseMoeA16Tolerance.relative_l2
-              << " max_abs=" << stats.maximum_absolute_error
-              << " gross_limit=" << kSparseMoeA16Tolerance.gross_absolute
-              << " index=" << stats.maximum_error_index << " actual=" << stats.actual_at_maximum
-              << " reference=" << stats.reference_at_maximum << '\n';
-    return 1;
+    return verify_reduction(label, actual, reference, kSparseMoeA16Tolerance);
 }
 
 class GuardedBf16Output {

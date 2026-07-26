@@ -14,8 +14,8 @@ using namespace ninfer::test::norm;
 namespace {
 
 constexpr ReductionCriterion rmsnorm_bf16_criterion() {
-    return {/*relative_l2*/ 2.2e-3, /*gross_absolute*/ 1.0e-5,
-            /*gross_relative_to_max_reference*/ 3.5e-3};
+    return {/*relative_l2*/ 1.85e-3, /*gross_absolute*/ 1.0e-5,
+            /*gross_relative_to_max_reference*/ 3.4e-3};
 }
 
 std::vector<double> rmsnorm_oracle(const std::vector<float>& input,
