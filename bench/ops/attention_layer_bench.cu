@@ -24,6 +24,7 @@
 #include "core/device.h"
 #include "core/kv_cache.h"
 #include "ninfer_bench_common.h"
+#include "quantized_weight.cuh"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/attn_input_proj/w8/w8_attn_input_kernels.h"
 #include "ops/attn_input_proj/w8/w8_attn_input_plan.h"
@@ -85,12 +86,6 @@ struct Options {
     std::string csv_out;
 };
 
-struct Timing {
-    double median_us = 0.0;
-    double min_us    = 0.0;
-    double p95_us    = 0.0;
-};
-
 struct Result {
     std::string geometry;
     std::string kv_dtype;
@@ -103,133 +98,20 @@ struct Result {
     std::string sigmoid_route;
     std::string attention_route;
     std::string output_route;
-    Timing timing;
+    bench::ColdTiming timing;
 };
 
-struct DevicePackedWeight {
-    explicit DevicePackedWeight(std::size_t bytes) : storage(bytes) {}
-
-    bench::DBuf storage;
-    Weight weight{};
-};
-
-__global__ void fill_fp16_one(std::uint8_t* scales, std::uint64_t groups) {
-    const std::uint64_t begin = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::uint64_t step  = static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
-    for (std::uint64_t group = begin; group < groups; group += step) {
-        scales[2 * group]     = 0x00U;
-        scales[2 * group + 1] = 0x3cU;
-    }
-}
-
-std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
-    return ((value + alignment - 1) / alignment) * alignment;
-}
-
-DevicePackedWeight make_w8_weight(std::int32_t rows, std::int32_t cols, std::uint8_t code_byte) {
-    constexpr std::int32_t group = 32;
-    if (rows <= 0 || cols <= 0 || cols % group != 0) {
-        throw std::invalid_argument("benchmark W8 shape is invalid");
-    }
-    const std::uint64_t groups =
-        static_cast<std::uint64_t>(rows) * static_cast<std::uint64_t>(cols / group);
-    const std::uint64_t code_bytes   = groups * group;
-    const std::uint64_t scale_offset = align_up(code_bytes, 256);
-    const std::uint64_t scale_bytes  = groups * 2;
-    DevicePackedWeight packed(static_cast<std::size_t>(scale_offset + scale_bytes));
-    CUDA_CHECK(cudaMemset(packed.storage.p, 0, packed.storage.bytes));
-    CUDA_CHECK(cudaMemset(packed.storage.p, code_byte, code_bytes));
-
-    constexpr int block = 256;
-    const int grid      = static_cast<int>(
-        std::min<std::uint64_t>(65535, std::max<std::uint64_t>(1, (groups + block - 1) / block)));
-    fill_fp16_one<<<grid, block>>>(static_cast<std::uint8_t*>(packed.storage.p) + scale_offset,
-                                   groups);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    Weight& weight          = packed.weight;
-    weight.payload          = packed.storage.p;
-    weight.payload_bytes    = packed.storage.bytes;
-    weight.high_plane_bytes = 0;
-    weight.qtype            = QType::W8G32_F16S;
-    weight.layout           = QuantLayout::RowSplit;
-    weight.group_size       = group;
-    weight.qdata            = packed.storage.p;
-    weight.qhigh            = nullptr;
-    weight.scales           = static_cast<std::uint8_t*>(packed.storage.p) + scale_offset;
-    weight.n                = rows;
-    weight.k                = cols;
-    weight.group            = group;
-    weight.scale_dtype      = DType::FP16;
-    weight.ndim             = 2;
-    weight.shape[0]         = rows;
-    weight.shape[1]         = cols;
-    weight.padded_shape[0]  = rows;
-    weight.padded_shape[1]  = cols;
-    return packed;
-}
-
-DevicePackedWeight make_qx_weight(QType qtype, std::int32_t rows, std::int32_t cols,
-                                  std::uint8_t code_byte) {
-    constexpr std::int32_t group = 64;
-    if ((qtype != QType::Q4G64_F16S && qtype != QType::Q5G64_F16S) || rows <= 0 || cols <= 0 ||
-        cols % group != 0) {
-        throw std::invalid_argument("benchmark Q4/Q5 shape is invalid");
-    }
-    const std::uint64_t groups =
-        static_cast<std::uint64_t>(rows) * static_cast<std::uint64_t>(cols / group);
-    const std::uint64_t low_bytes    = groups * 32;
-    const std::uint64_t high_bytes   = qtype == QType::Q5G64_F16S ? groups * 8 : 0;
-    const std::uint64_t high_offset  = align_up(low_bytes, 256);
-    const std::uint64_t scale_offset = high_offset + align_up(high_bytes, 256);
-    const std::uint64_t scale_bytes  = groups * 2;
-    DevicePackedWeight packed(static_cast<std::size_t>(scale_offset + scale_bytes));
-    CUDA_CHECK(cudaMemset(packed.storage.p, 0, packed.storage.bytes));
-    CUDA_CHECK(cudaMemset(packed.storage.p, code_byte, low_bytes));
-
-    constexpr int block = 256;
-    const int grid      = static_cast<int>(
-        std::min<std::uint64_t>(65535, std::max<std::uint64_t>(1, (groups + block - 1) / block)));
-    fill_fp16_one<<<grid, block>>>(static_cast<std::uint8_t*>(packed.storage.p) + scale_offset,
-                                   groups);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    Weight& weight          = packed.weight;
-    weight.payload          = packed.storage.p;
-    weight.payload_bytes    = packed.storage.bytes;
-    weight.high_plane_bytes = high_bytes;
-    weight.qtype            = qtype;
-    weight.layout           = QuantLayout::RowSplit;
-    weight.group_size       = group;
-    weight.qdata            = packed.storage.p;
-    weight.qhigh =
-        high_bytes == 0 ? nullptr : static_cast<std::uint8_t*>(packed.storage.p) + high_offset;
-    weight.scales          = static_cast<std::uint8_t*>(packed.storage.p) + scale_offset;
-    weight.n               = rows;
-    weight.k               = cols;
-    weight.group           = group;
-    weight.scale_dtype     = DType::FP16;
-    weight.ndim            = 2;
-    weight.shape[0]        = rows;
-    weight.shape[1]        = cols;
-    weight.padded_shape[0] = rows;
-    weight.padded_shape[1] = cols;
-    return packed;
-}
-
-bench::DBuf make_constant_bf16(std::size_t elements, float value) {
+ninfer::DeviceBuffer make_constant_bf16(std::size_t elements, float value) {
     std::vector<std::uint16_t> host(elements, bench::f32_to_bf16(value));
-    bench::DBuf device(elements * sizeof(std::uint16_t));
+    ninfer::DeviceBuffer device(elements * sizeof(std::uint16_t));
     CUDA_CHECK(cudaMemcpy(device.p, host.data(), device.bytes, cudaMemcpyHostToDevice));
     return device;
 }
 
-bench::DBuf make_i32_sequence(std::int32_t start, std::int32_t count) {
+ninfer::DeviceBuffer make_i32_sequence(std::int32_t start, std::int32_t count) {
     std::vector<std::int32_t> host(static_cast<std::size_t>(count));
     for (std::int32_t i = 0; i < count; ++i) { host[static_cast<std::size_t>(i)] = start + i; }
-    bench::DBuf device(host.size() * sizeof(std::int32_t));
+    ninfer::DeviceBuffer device(host.size() * sizeof(std::int32_t));
     CUDA_CHECK(cudaMemcpy(device.p, host.data(), device.bytes, cudaMemcpyHostToDevice));
     return device;
 }
@@ -386,90 +268,6 @@ Options parse_options(int argc, char** argv) {
 
 const char* kv_dtype_name(DType dtype) { return dtype == DType::I8 ? "int8" : "bf16"; }
 
-class TimedGraph {
-public:
-    TimedGraph() {
-        CUDA_CHECK(cudaEventCreate(&start_));
-        CUDA_CHECK(cudaEventCreate(&stop_));
-    }
-
-    ~TimedGraph() {
-        if (exec_ != nullptr) cudaGraphExecDestroy(exec_);
-        if (graph_ != nullptr) cudaGraphDestroy(graph_);
-        if (start_ != nullptr) cudaEventDestroy(start_);
-        if (stop_ != nullptr) cudaEventDestroy(stop_);
-    }
-
-    TimedGraph(const TimedGraph&)            = delete;
-    TimedGraph& operator=(const TimedGraph&) = delete;
-
-    template <class Body>
-    void capture(cudaStream_t stream, Body&& body) {
-        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-        try {
-            body(stream);
-        } catch (...) {
-            cudaGraph_t discard = nullptr;
-            cudaStreamEndCapture(stream, &discard);
-            if (discard != nullptr) cudaGraphDestroy(discard);
-            throw;
-        }
-        CUDA_CHECK(cudaStreamEndCapture(stream, &graph_));
-        CUDA_CHECK(cudaGraphInstantiate(&exec_, graph_, 0));
-        CUDA_CHECK(cudaGraphGetNodes(graph_, nullptr, &body_nodes_));
-        if (body_nodes_ == 0) { throw std::runtime_error("captured attention graph is empty"); }
-    }
-
-    void launch(cudaStream_t stream) const { CUDA_CHECK(cudaGraphLaunch(exec_, stream)); }
-
-    void launch_timed(cudaStream_t stream) const {
-        CUDA_CHECK(cudaEventRecord(start_, stream));
-        launch(stream);
-        CUDA_CHECK(cudaEventRecord(stop_, stream));
-    }
-
-    double elapsed_us() const {
-        CUDA_CHECK(cudaEventSynchronize(stop_));
-        float milliseconds = 0.0F;
-        CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start_, stop_));
-        return static_cast<double>(milliseconds) * 1000.0;
-    }
-
-    [[nodiscard]] std::size_t body_nodes() const noexcept { return body_nodes_; }
-
-private:
-    cudaGraph_t graph_      = nullptr;
-    cudaGraphExec_t exec_   = nullptr;
-    cudaEvent_t start_      = nullptr;
-    cudaEvent_t stop_       = nullptr;
-    std::size_t body_nodes_ = 0;
-};
-
-Timing measure_cold(const TimedGraph& graph, bench::DBuf& flush, cudaStream_t stream, int warmup,
-                    int repeat) {
-    for (int i = 0; i < warmup; ++i) {
-        CUDA_CHECK(cudaMemsetAsync(flush.p, 0xa5, flush.bytes, stream));
-        graph.launch(stream);
-    }
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    std::vector<double> samples;
-    samples.reserve(static_cast<std::size_t>(repeat));
-    for (int i = 0; i < repeat; ++i) {
-        CUDA_CHECK(cudaMemsetAsync(flush.p, 0xa5, flush.bytes, stream));
-        graph.launch_timed(stream);
-        samples.push_back(graph.elapsed_us());
-    }
-    std::sort(samples.begin(), samples.end());
-    const auto percentile = [&](double q) {
-        const std::size_t index =
-            std::min(samples.size() - 1,
-                     static_cast<std::size_t>(q * static_cast<double>(samples.size() - 1)));
-        return samples[index];
-    };
-    return {percentile(0.50), samples.front(), percentile(0.95)};
-}
-
 struct Geometry27 {
     static constexpr const char* name         = "27b";
     static constexpr std::int32_t hidden      = 5120;
@@ -480,21 +278,25 @@ struct Geometry27 {
     static constexpr std::int32_t parent_rows = query_rows + kv_rows;
     static constexpr DType default_kv_dtype   = DType::I8;
 
-    static DevicePackedWeight make_input0() {
-        return make_qx_weight(QType::Q4G64_F16S, parent_rows, hidden, 0x11U);
+    static bench::PackedQuantizedWeight make_input0() {
+        return bench::make_row_split_weight(QType::Q4G64_F16S, parent_rows, hidden, hidden,
+                                            {0x11, 0x00, 0x3c00});
     }
 
-    static std::optional<DevicePackedWeight> make_input1() {
-        return make_qx_weight(QType::Q5G64_F16S, parent_rows, hidden, 0x11U);
+    static std::optional<bench::PackedQuantizedWeight> make_input1() {
+        return bench::make_row_split_weight(QType::Q5G64_F16S, parent_rows, hidden, hidden,
+                                            {0x11, 0x00, 0x3c00});
     }
 
-    static DevicePackedWeight make_output() {
-        return make_qx_weight(QType::Q5G64_F16S, hidden, query_rows, 0x00U);
+    static bench::PackedQuantizedWeight make_output() {
+        return bench::make_row_split_weight(QType::Q5G64_F16S, hidden, query_rows, query_rows,
+                                            {0x00, 0x00, 0x3c00});
     }
 
-    static void input_projection(const Tensor& hidden_tensor, const DevicePackedWeight& input0,
-                                 const std::optional<DevicePackedWeight>& input1, Tensor& query,
-                                 Tensor& gate, Tensor& key, Tensor& value,
+    static void input_projection(const Tensor& hidden_tensor,
+                                 const bench::PackedQuantizedWeight& input0,
+                                 const std::optional<bench::PackedQuantizedWeight>& input1,
+                                 Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
                                  WorkspaceArena& workspace, cudaStream_t stream) {
         if (!input1.has_value()) { throw std::logic_error("27B gate/value weight is missing"); }
         ops::attn_input_proj(hidden_tensor, input0.weight, input1->weight, query, gate, key, value,
@@ -502,8 +304,8 @@ struct Geometry27 {
     }
 
     static void input_projection_control(const Tensor& hidden_tensor,
-                                         const DevicePackedWeight& input0,
-                                         const std::optional<DevicePackedWeight>& input1,
+                                         const bench::PackedQuantizedWeight& input0,
+                                         const std::optional<bench::PackedQuantizedWeight>& input1,
                                          Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
                                          WorkspaceArena& workspace, cudaStream_t stream) {
         input_projection(hidden_tensor, input0, input1, query, gate, key, value, workspace, stream);
@@ -534,14 +336,21 @@ struct Geometry35 {
     static constexpr std::int32_t parent_rows = 2 * query_rows + 2 * kv_rows;
     static constexpr DType default_kv_dtype   = DType::BF16;
 
-    static DevicePackedWeight make_input0() { return make_w8_weight(parent_rows, hidden, 0x01U); }
+    static bench::PackedQuantizedWeight make_input0() {
+        return bench::make_row_split_weight(QType::W8G32_F16S, parent_rows, hidden, hidden,
+                                            {0x01, 0x00, 0x3c00});
+    }
 
-    static std::optional<DevicePackedWeight> make_input1() { return std::nullopt; }
+    static std::optional<bench::PackedQuantizedWeight> make_input1() { return std::nullopt; }
 
-    static DevicePackedWeight make_output() { return make_w8_weight(hidden, query_rows, 0x00U); }
+    static bench::PackedQuantizedWeight make_output() {
+        return bench::make_row_split_weight(QType::W8G32_F16S, hidden, query_rows, query_rows,
+                                            {0x00, 0x00, 0x3c00});
+    }
 
-    static void input_projection(const Tensor& hidden_tensor, const DevicePackedWeight& input0,
-                                 const std::optional<DevicePackedWeight>&, Tensor& query,
+    static void input_projection(const Tensor& hidden_tensor,
+                                 const bench::PackedQuantizedWeight& input0,
+                                 const std::optional<bench::PackedQuantizedWeight>&, Tensor& query,
                                  Tensor& gate, Tensor& key, Tensor& value,
                                  WorkspaceArena& workspace, cudaStream_t stream) {
         ops::attn_input_proj(hidden_tensor, input0.weight, query, gate, key, value, workspace,
@@ -549,10 +358,10 @@ struct Geometry35 {
     }
 
     static void input_projection_control(const Tensor& hidden_tensor,
-                                         const DevicePackedWeight& input0,
-                                         const std::optional<DevicePackedWeight>&, Tensor& query,
-                                         Tensor& gate, Tensor& key, Tensor& value, WorkspaceArena&,
-                                         cudaStream_t stream) {
+                                         const bench::PackedQuantizedWeight& input0,
+                                         const std::optional<bench::PackedQuantizedWeight>&,
+                                         Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
+                                         WorkspaceArena&, cudaStream_t stream) {
         const std::int32_t tokens = hidden_tensor.ne[1];
         if (tokens == 1) {
             ops::detail::w8_attn_input_decode_launch(hidden_tensor, input0.weight, query, gate, key,
@@ -608,21 +417,21 @@ struct Resources {
                     sizeof(std::uint16_t)),
           workspace(std::max<std::size_t>(1, workspace_bytes)) {}
 
-    DevicePackedWeight input0;
-    std::optional<DevicePackedWeight> input1;
-    DevicePackedWeight output;
-    bench::DBuf input_norm;
-    bench::DBuf query_norm;
-    bench::DBuf key_norm;
-    bench::DBuf residual;
-    bench::DBuf hidden;
-    bench::DBuf query;
-    bench::DBuf gate;
-    bench::DBuf key;
-    bench::DBuf value;
-    bench::DBuf query_transformed;
-    bench::DBuf key_transformed;
-    bench::DBuf attention;
+    bench::PackedQuantizedWeight input0;
+    std::optional<bench::PackedQuantizedWeight> input1;
+    bench::PackedQuantizedWeight output;
+    ninfer::DeviceBuffer input_norm;
+    ninfer::DeviceBuffer query_norm;
+    ninfer::DeviceBuffer key_norm;
+    ninfer::DeviceBuffer residual;
+    ninfer::DeviceBuffer hidden;
+    ninfer::DeviceBuffer query;
+    ninfer::DeviceBuffer gate;
+    ninfer::DeviceBuffer key;
+    ninfer::DeviceBuffer value;
+    ninfer::DeviceBuffer query_transformed;
+    ninfer::DeviceBuffer key_transformed;
+    ninfer::DeviceBuffer attention;
     WorkspaceArena workspace;
 };
 
@@ -639,10 +448,10 @@ DType select_kv_dtype(KvSelection selection, DType target_default) {
 }
 
 template <class Geometry>
-Result run_case(Resources<Geometry>& resources, KVCache& cache, bench::DBuf& flush,
+Result run_case(Resources<Geometry>& resources, KVCache& cache, ninfer::DeviceBuffer& flush,
                 cudaStream_t stream, const Options& options, std::int32_t context,
                 std::int32_t tokens) {
-    bench::DBuf position_storage = make_i32_sequence(context, tokens);
+    ninfer::DeviceBuffer position_storage = make_i32_sequence(context, tokens);
 
     Tensor residual(resources.residual.p, DType::BF16, {Geometry::hidden, tokens});
     Tensor hidden(resources.hidden.p, DType::BF16, {Geometry::hidden, tokens});
@@ -720,9 +529,10 @@ Result run_case(Resources<Geometry>& resources, KVCache& cache, bench::DBuf& flu
     layer(stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    TimedGraph graph;
+    bench::TimedGraph graph;
     graph.capture(stream, layer);
-    const Timing timing = measure_cold(graph, flush, stream, options.warmup, options.repeat);
+    const bench::ColdTiming timing =
+        bench::measure_cold_graph(graph, flush, stream, options.warmup, options.repeat);
     const std::uint32_t visible = static_cast<std::uint32_t>(context + tokens);
     const auto selected_route =
         ops::detail::gqa_attention_resolve_route(Geometry::query_heads, tokens, {visible, visible});
@@ -747,7 +557,7 @@ Result run_case(Resources<Geometry>& resources, KVCache& cache, bench::DBuf& flu
             kv_dtype_name(cache.dtype),
             context,
             tokens,
-            graph.body_nodes(),
+            graph.nodes(),
             input_route,
             rms_route,
             rope_route,
@@ -758,7 +568,7 @@ Result run_case(Resources<Geometry>& resources, KVCache& cache, bench::DBuf& flu
 }
 
 template <class Geometry>
-void run_geometry(const Options& options, cudaStream_t stream, bench::DBuf& flush,
+void run_geometry(const Options& options, cudaStream_t stream, ninfer::DeviceBuffer& flush,
                   std::vector<Result>& results) {
     const std::int32_t max_tokens =
         *std::max_element(options.token_sweep.begin(), options.token_sweep.end());
@@ -844,7 +654,7 @@ int main(int argc, char** argv) {
         const Options options = parse_options(argc, argv);
         cudaStream_t stream   = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        bench::DBuf flush(options.flush_bytes);
+        ninfer::DeviceBuffer flush(options.flush_bytes);
         std::vector<Result> results;
         results.reserve(options.contexts.size() * options.token_sweep.size() * 2);
 

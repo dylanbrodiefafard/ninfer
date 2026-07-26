@@ -88,8 +88,8 @@ vision_pos_embed_payload_control_cta(const std::uint32_t* table, const std::int3
 
 void run(std::int32_t patches, bool control, bool profile_once) {
     const std::size_t n = static_cast<std::size_t>(kD) * patches;
-    DBuf table          = make_bf16(static_cast<std::size_t>(kD) * kRows);
-    DBuf x              = make_bf16(n);
+    DeviceBuffer table  = make_bf16(static_cast<std::size_t>(kD) * kRows);
+    DeviceBuffer x      = make_bf16(n);
     std::vector<int> indices(static_cast<std::size_t>(patches) * 4);
     std::vector<float> weights(static_cast<std::size_t>(patches) * 4, 0.25f);
     for (int patch = 0; patch < patches; ++patch) {
@@ -98,8 +98,8 @@ void run(std::int32_t patches, bool control, bool profile_once) {
                 (patch * 17 + corner * 49) % kRows;
         }
     }
-    DBuf di(indices.size() * sizeof(std::int32_t));
-    DBuf dw(weights.size() * sizeof(float));
+    DeviceBuffer di(indices.size() * sizeof(std::int32_t));
+    DeviceBuffer dw(weights.size() * sizeof(float));
     cudaMemcpy(di.p, indices.data(), di.bytes, cudaMemcpyHostToDevice);
     cudaMemcpy(dw.p, weights.data(), dw.bytes, cudaMemcpyHostToDevice);
     Tensor ttable(table.p, DType::BF16, {kD, kRows});

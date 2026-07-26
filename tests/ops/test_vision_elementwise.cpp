@@ -24,8 +24,8 @@ int test_add_bias(std::int32_t d, std::int32_t tokens, std::uint32_t seed) {
     for (std::size_t i = 0; i < n; ++i) {
         reference[i] = static_cast<double>(x[i]) + bias[i % static_cast<std::size_t>(d)];
     }
-    DBuf dx = to_device_bf16(x);
-    DBuf db = to_device_bf16(bias);
+    DeviceBuffer dx = to_device_bf16(x);
+    DeviceBuffer db = to_device_bf16(bias);
     Tensor tx(dx.p, DType::BF16, {d, tokens});
     Tensor tb(db.p, DType::BF16, {d});
     ops::add_bias(tb, tx, nullptr);
@@ -51,8 +51,8 @@ int test_add_bias_unaligned() {
     std::vector<std::uint16_t> packed_x(n + 1), packed_bias(d + 1);
     for (std::size_t i = 0; i < n; ++i) packed_x[i + 1] = f32_to_bf16(x[i]);
     for (std::size_t i = 0; i < bias.size(); ++i) packed_bias[i + 1] = f32_to_bf16(bias[i]);
-    DBuf dx(packed_x.size() * sizeof(std::uint16_t));
-    DBuf db(packed_bias.size() * sizeof(std::uint16_t));
+    DeviceBuffer dx(packed_x.size() * sizeof(std::uint16_t));
+    DeviceBuffer db(packed_bias.size() * sizeof(std::uint16_t));
     cudaMemcpy(dx.p, packed_x.data(), dx.bytes, cudaMemcpyHostToDevice);
     cudaMemcpy(db.p, packed_bias.data(), db.bytes, cudaMemcpyHostToDevice);
     auto* xptr = static_cast<unsigned char*>(dx.p) + sizeof(std::uint16_t);
@@ -62,7 +62,7 @@ int test_add_bias_unaligned() {
     ops::add_bias(tb, tx, nullptr);
     cudaDeviceSynchronize();
 
-    DBuf out(n * sizeof(std::uint16_t));
+    DeviceBuffer out(n * sizeof(std::uint16_t));
     cudaMemcpy(out.p, xptr, out.bytes, cudaMemcpyDeviceToDevice);
     return verify("vision add_bias unaligned", from_device_bf16(out, n), reference,
                   Tolerance::bf16_elementwise());
@@ -83,7 +83,7 @@ int test_gelu(ops::GeluMode mode, std::int32_t d, std::int32_t tokens, std::uint
     round_to_bf16(x);
     std::vector<double> reference(n);
     for (std::size_t i = 0; i < n; ++i) reference[i] = gelu_reference(x[i], mode);
-    DBuf dx = to_device_bf16(x);
+    DeviceBuffer dx = to_device_bf16(x);
     Tensor tx(dx.p, DType::BF16, {d, tokens});
     ops::gelu(tx, mode, nullptr);
     cudaDeviceSynchronize();
@@ -110,9 +110,9 @@ int test_scatter(std::uint32_t seed) {
                 src[static_cast<std::size_t>(col) * d + row];
         }
     }
-    DBuf dsrc = to_device_bf16(src);
-    DBuf ddst = to_device_bf16(dst);
-    DBuf didx = to_device_i32(indices);
+    DeviceBuffer dsrc = to_device_bf16(src);
+    DeviceBuffer ddst = to_device_bf16(dst);
+    DeviceBuffer didx = to_device_i32(indices);
     Tensor tsrc(dsrc.p, DType::BF16, {d, v});
     Tensor tdst(ddst.p, DType::BF16, {d, t});
     Tensor tidx(didx.p, DType::I32, {v});

@@ -237,16 +237,16 @@ double estimate_snapshot_user_bytes(const Options& opt, int T) {
            static_cast<double>(sizeof(std::int32_t));
 }
 
-DBuf make_f32(const std::vector<float>& h) {
-    DBuf d(h.size() * sizeof(float));
+DeviceBuffer make_f32(const std::vector<float>& h) {
+    DeviceBuffer d(h.size() * sizeof(float));
     cudaMemcpy(d.p, h.data(), h.size() * sizeof(float), cudaMemcpyHostToDevice);
     return d;
 }
 
-DBuf make_bf16_from_f32(const std::vector<float>& h) {
+DeviceBuffer make_bf16_from_f32(const std::vector<float>& h) {
     std::vector<std::uint16_t> bf16(h.size());
     for (std::size_t i = 0; i < h.size(); ++i) { bf16[i] = f32_to_bf16(h[i]); }
-    DBuf d(bf16.size() * sizeof(std::uint16_t));
+    DeviceBuffer d(bf16.size() * sizeof(std::uint16_t));
     cudaMemcpy(d.p, bf16.data(), bf16.size() * sizeof(std::uint16_t), cudaMemcpyHostToDevice);
     return d;
 }
@@ -304,7 +304,7 @@ Result graph_cold_loop(const launch_fn& launch, double bytes_moved, int warmup, 
     require(cudaGraphInstantiate(&exec, graph, 0), "instantiate graph");
     require(cudaEventCreate(&start), "create start event");
     require(cudaEventCreate(&stop), "create stop event");
-    DBuf flush(FlushBytes);
+    DeviceBuffer flush(FlushBytes);
 
     for (int i = 0; i < warmup; ++i) {
         require(cudaMemsetAsync(flush.p, 0xa5, flush.bytes, stream), "flush L2");
@@ -359,14 +359,14 @@ BenchRow run_small_t_snapshot(const Options& opt, int T) {
     const std::size_t gb_n    = static_cast<std::size_t>(opt.H_v) * T;
     const std::size_t state_n = static_cast<std::size_t>(opt.S) * opt.S * opt.H_v;
 
-    DBuf q = make_bf16(qk_n), k = make_bf16(qk_n), v = make_bf16(v_n);
-    DBuf q_norm = make_zeros(qk_n * sizeof(std::uint16_t));
-    DBuf k_norm = make_zeros(qk_n * sizeof(std::uint16_t));
-    DBuf g      = make_f32(std::vector<float>(gb_n, -1.0f));
-    DBuf beta   = make_f32(std::vector<float>(gb_n, 0.5f));
-    DBuf states = make_zeros(state_n * Slots * sizeof(float));
-    DBuf out    = make_zeros(v_n * sizeof(std::uint16_t));
-    DBuf initial(sizeof(std::int32_t));
+    DeviceBuffer q = make_bf16(qk_n), k = make_bf16(qk_n), v = make_bf16(v_n);
+    DeviceBuffer q_norm = make_zeros(qk_n * sizeof(std::uint16_t));
+    DeviceBuffer k_norm = make_zeros(qk_n * sizeof(std::uint16_t));
+    DeviceBuffer g      = make_f32(std::vector<float>(gb_n, -1.0f));
+    DeviceBuffer beta   = make_f32(std::vector<float>(gb_n, 0.5f));
+    DeviceBuffer states = make_zeros(state_n * Slots * sizeof(float));
+    DeviceBuffer out    = make_zeros(v_n * sizeof(std::uint16_t));
+    DeviceBuffer initial(sizeof(std::int32_t));
     cudaMemcpy(initial.p, &InitialSlot, sizeof(InitialSlot), cudaMemcpyHostToDevice);
 
     Tensor tq(q.p, DType::BF16, {opt.S, opt.H_qk, T});
@@ -412,13 +412,13 @@ BenchRow run_decode_public(const Options& opt) {
     const std::size_t gb_n    = static_cast<std::size_t>(opt.H_v) * T;
     const std::size_t state_n = static_cast<std::size_t>(opt.S) * opt.S * opt.H_v;
 
-    DBuf q     = make_bf16(qk_n);
-    DBuf k     = make_bf16(qk_n);
-    DBuf v     = make_bf16(v_n);
-    DBuf g     = make_f32(std::vector<float>(gb_n, -1.0f));
-    DBuf beta  = make_f32(std::vector<float>(gb_n, 0.5f));
-    DBuf state = make_zeros(state_n * sizeof(float));
-    DBuf out   = make_zeros(v_n * sizeof(std::uint16_t));
+    DeviceBuffer q     = make_bf16(qk_n);
+    DeviceBuffer k     = make_bf16(qk_n);
+    DeviceBuffer v     = make_bf16(v_n);
+    DeviceBuffer g     = make_f32(std::vector<float>(gb_n, -1.0f));
+    DeviceBuffer beta  = make_f32(std::vector<float>(gb_n, 0.5f));
+    DeviceBuffer state = make_zeros(state_n * sizeof(float));
+    DeviceBuffer out   = make_zeros(v_n * sizeof(std::uint16_t));
 
     Tensor tq(q.p, DType::BF16, {opt.S, opt.H_qk, T});
     Tensor tk(k.p, DType::BF16, {opt.S, opt.H_qk, T});
@@ -446,15 +446,15 @@ BenchRow run_decode_kernel_only(const Options& opt) {
     const std::size_t gb_n    = static_cast<std::size_t>(opt.H_v) * T;
     const std::size_t state_n = static_cast<std::size_t>(opt.S) * opt.S * opt.H_v;
 
-    DBuf q =
+    DeviceBuffer q =
         make_f32(make_normalized_qk(static_cast<std::size_t>(opt.H_qk) * T, opt.S, 0x12345678u));
-    DBuf k =
+    DeviceBuffer k =
         make_f32(make_normalized_qk(static_cast<std::size_t>(opt.H_qk) * T, opt.S, 0x87654321u));
-    DBuf v     = make_f32(make_ramp(v_n, 0.5f));
-    DBuf g     = make_f32(std::vector<float>(gb_n, -1.0f));
-    DBuf beta  = make_f32(std::vector<float>(gb_n, 0.5f));
-    DBuf state = make_zeros(state_n * sizeof(float));
-    DBuf out   = make_zeros(v_n * sizeof(float));
+    DeviceBuffer v     = make_f32(make_ramp(v_n, 0.5f));
+    DeviceBuffer g     = make_f32(std::vector<float>(gb_n, -1.0f));
+    DeviceBuffer beta  = make_f32(std::vector<float>(gb_n, 0.5f));
+    DeviceBuffer state = make_zeros(state_n * sizeof(float));
+    DeviceBuffer out   = make_zeros(v_n * sizeof(float));
 
     Tensor tq(q.p, DType::FP32, {opt.S, opt.H_qk, T});
     Tensor tk(k.p, DType::FP32, {opt.S, opt.H_qk, T});
@@ -479,15 +479,15 @@ BenchRow run_prefill_public(const Options& opt, int T) {
     const std::size_t gb_n    = static_cast<std::size_t>(opt.H_v) * T;
     const std::size_t state_n = static_cast<std::size_t>(opt.S) * opt.S * opt.H_v;
 
-    DBuf q = make_bf16_from_f32(
+    DeviceBuffer q = make_bf16_from_f32(
         make_normalized_qk(static_cast<std::size_t>(opt.H_qk) * T, opt.S, 0x12345678u));
-    DBuf k = make_bf16_from_f32(
+    DeviceBuffer k = make_bf16_from_f32(
         make_normalized_qk(static_cast<std::size_t>(opt.H_qk) * T, opt.S, 0x87654321u));
-    DBuf v                     = make_bf16_from_f32(make_ramp(v_n, 0.5f));
-    DBuf g                     = make_f32(std::vector<float>(gb_n, -1.0f));
-    DBuf beta                  = make_f32(std::vector<float>(gb_n, 0.5f));
-    DBuf state                 = make_zeros(state_n * sizeof(float));
-    DBuf out                   = make_zeros(v_n * sizeof(std::uint16_t));
+    DeviceBuffer v             = make_bf16_from_f32(make_ramp(v_n, 0.5f));
+    DeviceBuffer g             = make_f32(std::vector<float>(gb_n, -1.0f));
+    DeviceBuffer beta          = make_f32(std::vector<float>(gb_n, 0.5f));
+    DeviceBuffer state         = make_zeros(state_n * sizeof(float));
+    DeviceBuffer out           = make_zeros(v_n * sizeof(std::uint16_t));
     const std::size_t ws_bytes = wrapper_workspace_bytes(opt, T);
     WorkspaceArena ws(ws_bytes);
 
@@ -520,16 +520,16 @@ BenchRow run_prefill_kernel_only(const Options& opt, int T) {
     const std::size_t ws_bytes =
         ops::detail::gdn_chunked_workspace_bytes(opt.S, opt.H_qk, opt.H_v, T);
 
-    DBuf q = make_bf16_from_f32(
+    DeviceBuffer q = make_bf16_from_f32(
         make_normalized_qk(static_cast<std::size_t>(opt.H_qk) * T, opt.S, 0x12345678u));
-    DBuf k = make_bf16_from_f32(
+    DeviceBuffer k = make_bf16_from_f32(
         make_normalized_qk(static_cast<std::size_t>(opt.H_qk) * T, opt.S, 0x87654321u));
-    DBuf v         = make_bf16_from_f32(make_ramp(v_n, 0.5f));
-    DBuf g         = make_f32(std::vector<float>(gb_n, -1.0f));
-    DBuf beta      = make_f32(std::vector<float>(gb_n, 0.5f));
-    DBuf state     = make_zeros(state_n * sizeof(float));
-    DBuf out       = make_zeros(v_n * sizeof(std::uint16_t));
-    DBuf workspace = make_zeros(ws_bytes);
+    DeviceBuffer v         = make_bf16_from_f32(make_ramp(v_n, 0.5f));
+    DeviceBuffer g         = make_f32(std::vector<float>(gb_n, -1.0f));
+    DeviceBuffer beta      = make_f32(std::vector<float>(gb_n, 0.5f));
+    DeviceBuffer state     = make_zeros(state_n * sizeof(float));
+    DeviceBuffer out       = make_zeros(v_n * sizeof(std::uint16_t));
+    DeviceBuffer workspace = make_zeros(ws_bytes);
 
     Tensor tq(q.p, DType::BF16, {opt.S, opt.H_qk, T});
     Tensor tk(k.p, DType::BF16, {opt.S, opt.H_qk, T});

@@ -483,11 +483,11 @@ int one_int8_prefill_case(std::int32_t tokens, std::uint32_t seed, std::int32_t 
     cpu_gqa_prefill(q, k_roundtrip, v_roundtrip, ref_cache_k, ref_cache_v, tokens, base,
                     padded_context, ignored_k, ignored_v, ref);
 
-    DBuf dq   = to_device_bf16(q);
-    DBuf dk   = to_device_bf16(k);
-    DBuf dv   = to_device_bf16(v);
-    DBuf dpos = to_device_i32(positions);
-    DBuf dout(qn * sizeof(std::uint16_t));
+    DeviceBuffer dq   = to_device_bf16(q);
+    DeviceBuffer dk   = to_device_bf16(k);
+    DeviceBuffer dv   = to_device_bf16(v);
+    DeviceBuffer dpos = to_device_i32(positions);
+    DeviceBuffer dout(qn * sizeof(std::uint16_t));
     WorkspaceArena ws(kGqaWorkspaceBytes);
 
     const std::size_t arena_bytes =
@@ -608,11 +608,11 @@ int one_int8_decode_case(std::int32_t base, std::int32_t tokens, std::uint32_t s
     cpu_gqa_prefill(q, k_deq_new, v_deq_new, ref_cache_k, ref_cache_v, tokens, base, padded_context,
                     ignored_k, ignored_v, ref);
 
-    DBuf dq   = to_device_bf16(q);
-    DBuf dk   = to_device_bf16(k_new);
-    DBuf dv   = to_device_bf16(v_new);
-    DBuf dpos = to_device_i32(new_positions);
-    DBuf dout(qn * sizeof(std::uint16_t));
+    DeviceBuffer dq   = to_device_bf16(q);
+    DeviceBuffer dk   = to_device_bf16(k_new);
+    DeviceBuffer dv   = to_device_bf16(v_new);
+    DeviceBuffer dpos = to_device_i32(new_positions);
+    DeviceBuffer dout(qn * sizeof(std::uint16_t));
     WorkspaceArena ws(kGqaWorkspaceBytes);
 
     const std::size_t arena_bytes =
@@ -709,12 +709,12 @@ int one_int8_query_quantization_envelope_case() {
         return 1;
     }
 
-    DBuf dq         = to_device_bf16(q);
-    DBuf dk         = to_device_bf16(k_new);
-    DBuf dv         = to_device_bf16(v_new);
-    DBuf dpos       = to_device_i32(std::vector<int>{base});
-    DBuf dout_full  = DBuf(qn * sizeof(std::uint16_t));
-    DBuf dout_split = DBuf(qn * sizeof(std::uint16_t));
+    DeviceBuffer dq         = to_device_bf16(q);
+    DeviceBuffer dk         = to_device_bf16(k_new);
+    DeviceBuffer dv         = to_device_bf16(v_new);
+    DeviceBuffer dpos       = to_device_i32(std::vector<int>{base});
+    DeviceBuffer dout_full  = DeviceBuffer(qn * sizeof(std::uint16_t));
+    DeviceBuffer dout_split = DeviceBuffer(qn * sizeof(std::uint16_t));
     WorkspaceArena ws(kGqaWorkspaceBytes);
 
     const std::size_t arena_bytes =
@@ -804,11 +804,11 @@ int one_decode_case(std::int32_t pos, std::uint32_t seed,
     std::vector<double> ref;
     cpu_gqa_decode(q, expected_cache_k, expected_cache_v, pos, padded_context, ref);
 
-    DBuf dq   = to_device_bf16(q);
-    DBuf dk   = to_device_bf16(k_new);
-    DBuf dv   = to_device_bf16(v_new);
-    DBuf dpos = to_device_i32(std::vector<int>{pos});
-    DBuf dout(qn * sizeof(std::uint16_t));
+    DeviceBuffer dq   = to_device_bf16(q);
+    DeviceBuffer dk   = to_device_bf16(k_new);
+    DeviceBuffer dv   = to_device_bf16(v_new);
+    DeviceBuffer dpos = to_device_i32(std::vector<int>{pos});
+    DeviceBuffer dout(qn * sizeof(std::uint16_t));
     WorkspaceArena ws(kGqaWorkspaceBytes);
 
     const std::size_t layer_bytes = cache_n * sizeof(std::uint16_t);
@@ -870,15 +870,15 @@ int one_prefill_case(std::int32_t tokens, std::uint32_t seed, std::int32_t cache
     cpu_gqa_prefill(q, k, v, cache_k, cache_v, tokens, cache_offset, padded_context,
                     expected_cache_k, expected_cache_v, ref);
 
-    DBuf dq = to_device_bf16(q);
-    DBuf dk = to_device_bf16(k);
-    DBuf dv = to_device_bf16(v);
+    DeviceBuffer dq = to_device_bf16(q);
+    DeviceBuffer dk = to_device_bf16(k);
+    DeviceBuffer dv = to_device_bf16(v);
     std::vector<int> positions(static_cast<std::size_t>(tokens));
     for (std::int32_t t = 0; t < tokens; ++t) {
         positions[static_cast<std::size_t>(t)] = cache_offset + t;
     }
-    DBuf dpos = to_device_i32(positions);
-    DBuf dout = DBuf(qn * sizeof(std::uint16_t));
+    DeviceBuffer dpos = to_device_i32(positions);
+    DeviceBuffer dout = DeviceBuffer(qn * sizeof(std::uint16_t));
     WorkspaceArena ws(kGqaWorkspaceBytes);
 
     const std::size_t layer_bytes = cache_n * sizeof(std::uint16_t);
@@ -973,12 +973,12 @@ int split_api_parity_case(DType cache_dtype, std::int32_t tokens, std::int32_t b
     cpu_gqa_cached(oracle_q, logical_cache_k, logical_cache_v, oracle_positions, padded_context,
                    oracle);
 
-    DBuf dq                          = to_device_bf16(q);
-    DBuf dk                          = to_device_bf16(k);
-    DBuf dv                          = to_device_bf16(v);
-    DBuf dpos                        = to_device_i32(positions);
-    DBuf dout_full                   = DBuf(qn * sizeof(std::uint16_t));
-    DBuf dout_split                  = DBuf(qn * sizeof(std::uint16_t));
+    DeviceBuffer dq                  = to_device_bf16(q);
+    DeviceBuffer dk                  = to_device_bf16(k);
+    DeviceBuffer dv                  = to_device_bf16(v);
+    DeviceBuffer dpos                = to_device_i32(positions);
+    DeviceBuffer dout_full           = DeviceBuffer(qn * sizeof(std::uint16_t));
+    DeviceBuffer dout_split          = DeviceBuffer(qn * sizeof(std::uint16_t));
     const std::int32_t cached_tokens = final_row_only ? 1 : tokens;
     const std::size_t workspace_bytes =
         std::max(ops::gqa_attention_workspace_bytes(kQHeads, tokens),
@@ -1164,20 +1164,20 @@ int one_prefill_decode_consistency_case(std::int32_t tokens, std::uint32_t seed)
     std::vector<double> ref;
     cpu_gqa_decode(q_decode, expected_cache_k, expected_cache_v, tokens, padded_context, ref);
 
-    DBuf dq_prefill   = to_device_bf16(q_prefill);
-    DBuf dk_prefill   = to_device_bf16(k_prefill);
-    DBuf dv_prefill   = to_device_bf16(v_prefill);
-    DBuf dout_prefill = DBuf(q_prefill_n * sizeof(std::uint16_t));
-    DBuf dq_decode    = to_device_bf16(q_decode);
-    DBuf dk_decode    = to_device_bf16(k_decode);
-    DBuf dv_decode    = to_device_bf16(v_decode);
+    DeviceBuffer dq_prefill   = to_device_bf16(q_prefill);
+    DeviceBuffer dk_prefill   = to_device_bf16(k_prefill);
+    DeviceBuffer dv_prefill   = to_device_bf16(v_prefill);
+    DeviceBuffer dout_prefill = DeviceBuffer(q_prefill_n * sizeof(std::uint16_t));
+    DeviceBuffer dq_decode    = to_device_bf16(q_decode);
+    DeviceBuffer dk_decode    = to_device_bf16(k_decode);
+    DeviceBuffer dv_decode    = to_device_bf16(v_decode);
     std::vector<int> prefill_positions(static_cast<std::size_t>(tokens));
     for (std::int32_t t = 0; t < tokens; ++t) {
         prefill_positions[static_cast<std::size_t>(t)] = t;
     }
-    DBuf dpos_prefill = to_device_i32(prefill_positions);
-    DBuf dpos         = to_device_i32(std::vector<int>{tokens});
-    DBuf dout_decode  = DBuf(q_decode_n * sizeof(std::uint16_t));
+    DeviceBuffer dpos_prefill = to_device_i32(prefill_positions);
+    DeviceBuffer dpos         = to_device_i32(std::vector<int>{tokens});
+    DeviceBuffer dout_decode  = DeviceBuffer(q_decode_n * sizeof(std::uint16_t));
     WorkspaceArena ws(kGqaWorkspaceBytes);
 
     const std::size_t layer_bytes = cache_n * sizeof(std::uint16_t);
@@ -1273,11 +1273,11 @@ int one_future_token_isolation_case() {
     for (std::int32_t t = 0; t < tokens; ++t) { positions[static_cast<std::size_t>(t)] = base + t; }
 
     auto run = [&](const std::vector<float>& k, const std::vector<float>& v) {
-        DBuf dq   = to_device_bf16(q);
-        DBuf dk   = to_device_bf16(k);
-        DBuf dv   = to_device_bf16(v);
-        DBuf dpos = to_device_i32(positions);
-        DBuf dout(qn * sizeof(std::uint16_t));
+        DeviceBuffer dq   = to_device_bf16(q);
+        DeviceBuffer dk   = to_device_bf16(k);
+        DeviceBuffer dv   = to_device_bf16(v);
+        DeviceBuffer dpos = to_device_i32(positions);
+        DeviceBuffer dout(qn * sizeof(std::uint16_t));
         WorkspaceArena ws(kGqaWorkspaceBytes);
 
         const std::size_t layer_bytes = cache_n * sizeof(std::uint16_t);
@@ -1330,11 +1330,11 @@ int one_graph_relaunch_positions_case() {
     round_to_bf16(cache_k);
     round_to_bf16(cache_v);
 
-    DBuf dq   = to_device_bf16(q);
-    DBuf dk   = to_device_bf16(k);
-    DBuf dv   = to_device_bf16(v);
-    DBuf dpos = to_device_i32(std::vector<int>{base0, base0 + 1});
-    DBuf dout(qn * sizeof(std::uint16_t));
+    DeviceBuffer dq   = to_device_bf16(q);
+    DeviceBuffer dk   = to_device_bf16(k);
+    DeviceBuffer dv   = to_device_bf16(v);
+    DeviceBuffer dpos = to_device_i32(std::vector<int>{base0, base0 + 1});
+    DeviceBuffer dout(qn * sizeof(std::uint16_t));
     WorkspaceArena ws(kGqaWorkspaceBytes);
 
     const std::size_t layer_bytes = cache_n * sizeof(std::uint16_t);
@@ -1452,11 +1452,11 @@ int validation_checks() {
     constexpr std::int32_t pos = 1;
     const std::size_t qn       = static_cast<std::size_t>(kHeadDim) * kQHeads;
     const std::size_t kvn      = static_cast<std::size_t>(kHeadDim) * kKVHeads;
-    DBuf dq(qn * sizeof(std::uint16_t));
-    DBuf dk(kvn * sizeof(std::uint16_t));
-    DBuf dv(kvn * sizeof(std::uint16_t));
-    DBuf dpos = to_device_i32(std::vector<int>{pos});
-    DBuf dout(qn * sizeof(std::uint16_t));
+    DeviceBuffer dq(qn * sizeof(std::uint16_t));
+    DeviceBuffer dk(kvn * sizeof(std::uint16_t));
+    DeviceBuffer dv(kvn * sizeof(std::uint16_t));
+    DeviceBuffer dpos = to_device_i32(std::vector<int>{pos});
+    DeviceBuffer dout(qn * sizeof(std::uint16_t));
     WorkspaceArena ws(kGqaWorkspaceBytes);
     const std::int32_t padded_context = align_up_128(pos + 1);
     const std::size_t layer_bytes     = cache_elements(padded_context) * sizeof(std::uint16_t);

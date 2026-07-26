@@ -12,9 +12,9 @@ using namespace ninfer;
 using namespace ninfer::bench;
 
 static void run(int n, const char* tag) {
-    DBuf g   = make_bf16(static_cast<std::size_t>(n));
-    DBuf u   = make_bf16(static_cast<std::size_t>(n));
-    DBuf out = make_zeros(static_cast<std::size_t>(n) * 2);
+    DeviceBuffer g   = make_bf16(static_cast<std::size_t>(n));
+    DeviceBuffer u   = make_bf16(static_cast<std::size_t>(n));
+    DeviceBuffer out = make_zeros(static_cast<std::size_t>(n) * 2);
     Tensor tg(g.p, DType::BF16, {n}), tu(u.p, DType::BF16, {n}), tout(out.p, DType::BF16, {n});
 
     const double bytes = 3.0 * static_cast<double>(n) * 2.0; // read gate + read up + write out

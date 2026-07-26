@@ -105,7 +105,7 @@ void fp64_oracle(const std::vector<float>& q, const std::vector<float>& query_k,
     }
 }
 
-CyclicKVCacheLayerView make_context_view(DBuf& dk, DBuf& dv) {
+CyclicKVCacheLayerView make_context_view(DeviceBuffer& dk, DeviceBuffer& dv) {
     return {
         .k               = Tensor(dk.p, DType::BF16, {kD, kWindow, kKVHeads}),
         .v               = Tensor(dv.p, DType::BF16, {kD, kWindow, kKVHeads}),
@@ -192,12 +192,12 @@ int run_case(int tokens, int context_length, bool capture_graph, bool check_immu
     std::vector<int> positions(static_cast<std::size_t>(tokens));
     for (int i = 0; i < tokens; ++i) positions[static_cast<std::size_t>(i)] = context_length + i;
 
-    DBuf dq         = to_device_bf16(q);
-    DBuf dqk        = to_device_bf16(query_k);
-    DBuf dqv        = to_device_bf16(query_v);
-    DBuf dck        = to_device_bf16(context_k);
-    DBuf dcv        = to_device_bf16(context_v);
-    DBuf dpositions = to_device_i32(positions);
+    DeviceBuffer dq         = to_device_bf16(q);
+    DeviceBuffer dqk        = to_device_bf16(query_k);
+    DeviceBuffer dqv        = to_device_bf16(query_v);
+    DeviceBuffer dck        = to_device_bf16(context_k);
+    DeviceBuffer dcv        = to_device_bf16(context_v);
+    DeviceBuffer dpositions = to_device_i32(positions);
     GuardedDBuf dout(qn * sizeof(std::uint16_t));
     dout.fill(0x7f);
 
@@ -306,7 +306,7 @@ int invalid_scale_case() {
     const std::size_t qn      = static_cast<std::size_t>(kD) * kQHeads;
     const std::size_t qkvn    = static_cast<std::size_t>(kD) * kKVHeads;
     const std::size_t cache_n = static_cast<std::size_t>(kD) * kWindow * kKVHeads;
-    DBuf dq(qn * sizeof(std::uint16_t)), dqk(qkvn * sizeof(std::uint16_t)),
+    DeviceBuffer dq(qn * sizeof(std::uint16_t)), dqk(qkvn * sizeof(std::uint16_t)),
         dqv(qkvn * sizeof(std::uint16_t)), dck(cache_n * sizeof(std::uint16_t)),
         dcv(cache_n * sizeof(std::uint16_t)), dpositions(sizeof(std::int32_t)),
         dout(qn * sizeof(std::uint16_t));
@@ -344,12 +344,12 @@ int equal_logit_boundary_case(int tokens, int context_length, int marked_positio
     }
     std::vector<int> positions(static_cast<std::size_t>(tokens));
     for (int i = 0; i < tokens; ++i) positions[static_cast<std::size_t>(i)] = context_length + i;
-    DBuf dq         = to_device_bf16(q);
-    DBuf dqk        = to_device_bf16(query_k);
-    DBuf dqv        = to_device_bf16(query_v);
-    DBuf dck        = to_device_bf16(context_k);
-    DBuf dcv        = to_device_bf16(context_v);
-    DBuf dpositions = to_device_i32(positions);
+    DeviceBuffer dq         = to_device_bf16(q);
+    DeviceBuffer dqk        = to_device_bf16(query_k);
+    DeviceBuffer dqv        = to_device_bf16(query_v);
+    DeviceBuffer dck        = to_device_bf16(context_k);
+    DeviceBuffer dcv        = to_device_bf16(context_v);
+    DeviceBuffer dpositions = to_device_i32(positions);
     GuardedDBuf dout(qn * sizeof(std::uint16_t));
     dout.fill(0x55);
     Tensor tq(dq.p, DType::BF16, {kD, kQHeads, tokens});
@@ -390,11 +390,12 @@ int all_query_rows_visible_case() {
     for (int kv_head = 0; kv_head < kKVHeads; ++kv_head) {
         for (int d = 0; d < kD; ++d) { query_v[query_kv_index(d, kv_head, tokens - 1)] = 1.0f; }
     }
-    DBuf dq = to_device_bf16(q), dqk = to_device_bf16(query_k), dqv = to_device_bf16(query_v),
-         dck = to_device_bf16(context), dcv = to_device_bf16(context),
-         dpositions =
-             to_device_i32(std::vector<int>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15});
-    DBuf dout(qn * sizeof(std::uint16_t));
+    DeviceBuffer dq = to_device_bf16(q), dqk = to_device_bf16(query_k),
+                 dqv = to_device_bf16(query_v), dck = to_device_bf16(context),
+                 dcv        = to_device_bf16(context),
+                 dpositions = to_device_i32(
+                     std::vector<int>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15});
+    DeviceBuffer dout(qn * sizeof(std::uint16_t));
     Tensor tq(dq.p, DType::BF16, {kD, kQHeads, tokens});
     Tensor tqk(dqk.p, DType::BF16, {kD, kKVHeads, tokens});
     Tensor tqv(dqv.p, DType::BF16, {kD, kKVHeads, tokens});

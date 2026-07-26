@@ -166,8 +166,8 @@ Graph capture_graph(Launch&& launch, cudaStream_t stream) {
     return result;
 }
 
-Result bench_cold_graph(cudaGraphExec_t graph, DBuf& flush, cudaStream_t stream, double bytes,
-                        int warmup, int repeat) {
+Result bench_cold_graph(cudaGraphExec_t graph, DeviceBuffer& flush, cudaStream_t stream,
+                        double bytes, int warmup, int repeat) {
     cudaEvent_t begin = nullptr;
     cudaEvent_t end   = nullptr;
     CUDA_CHECK(cudaEventCreate(&begin));
@@ -207,12 +207,12 @@ Result bench_cold_graph(cudaGraphExec_t graph, DBuf& flush, cudaStream_t stream,
 struct Case {
     int tokens;
     bool cyclic;
-    DBuf k;
-    DBuf v;
-    DBuf positions;
-    DBuf count;
-    DBuf cache_k;
-    DBuf cache_v;
+    DeviceBuffer k;
+    DeviceBuffer v;
+    DeviceBuffer positions;
+    DeviceBuffer count;
+    DeviceBuffer cache_k;
+    DeviceBuffer cache_v;
     Tensor tk;
     Tensor tv;
     Tensor tp;
@@ -297,8 +297,8 @@ int route_grid(const ops::detail::KVCacheAppendPrefixPlan& plan) {
     return 0;
 }
 
-void run_route(Case& data, int committed, RouteChoice choice, const Options& options, DBuf& flush,
-               cudaStream_t stream) {
+void run_route(Case& data, int committed, RouteChoice choice, const Options& options,
+               DeviceBuffer& flush, cudaStream_t stream) {
     const ops::KVCacheAppendPrefixExecutionEnvelope envelope{
         0,
         static_cast<std::uint32_t>(data.tokens),
@@ -355,7 +355,7 @@ int main(int argc, char** argv) {
     const Options options = parse_options(argc, argv);
     cudaStream_t stream   = nullptr;
     CUDA_CHECK(cudaStreamCreate(&stream));
-    DBuf flush(kFlush);
+    DeviceBuffer flush(kFlush);
     std::printf("# RTX 5090 sm_120a; graph replay; exact BF16 D128/KV8 prefix append; cache=%s\n",
                 options.cold ? "cold" : "hot");
 

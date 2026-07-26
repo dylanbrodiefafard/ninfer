@@ -428,7 +428,7 @@ static int full_vocab_w8_shape() {
                                   65535,  12345,          42,    200000, 99999,  42,
                                   131071, kFullVocab - 1, 7,     0};
 
-    DBuf dtable(static_cast<std::size_t>(payload_bytes));
+    DeviceBuffer dtable(static_cast<std::size_t>(payload_bytes));
     cudaMemset(dtable.p, 0, dtable.bytes);
     std::vector<std::int8_t> codes(d);
     std::vector<std::uint8_t> scales(static_cast<std::size_t>(kg) * 2);
@@ -464,8 +464,8 @@ static int full_vocab_w8_shape() {
         }
     }
 
-    DBuf dids = to_device_i32(ids);
-    DBuf dout(static_cast<std::size_t>(d) * ids.size() * 2u);
+    DeviceBuffer dids = to_device_i32(ids);
+    DeviceBuffer dout(static_cast<std::size_t>(d) * ids.size() * 2u);
     cudaMemset(dout.p, 0x7d, dout.bytes);
     Tensor tids(dids.p, DType::I32, {static_cast<std::int32_t>(ids.size())});
     Tensor tout(dout.p, DType::BF16, {d, static_cast<std::int32_t>(ids.size())});
@@ -485,9 +485,9 @@ static int one_dense_shape(std::int32_t T, std::int32_t d) {
     std::vector<double> ref;
     cpu_gather(src, ids, d, ref);
 
-    DBuf dtable = to_device_bf16(src);
-    DBuf dids   = to_device_i32(ids);
-    DBuf dout(static_cast<std::size_t>(d) * T * 2u);
+    DeviceBuffer dtable = to_device_bf16(src);
+    DeviceBuffer dids   = to_device_i32(ids);
+    DeviceBuffer dout(static_cast<std::size_t>(d) * T * 2u);
     cudaMemset(dout.p, 0x7d, dout.bytes);
     Tensor tids(dids.p, DType::I32, {T});
     Tensor tout(dout.p, DType::BF16, {d, T});
@@ -508,10 +508,10 @@ static int one_q6_shape(std::int32_t T, std::int32_t d) {
     std::vector<double> ref;
     cpu_gather_q6_payload(payload, ids, d, ref);
 
-    DBuf dtable(payload.size());
+    DeviceBuffer dtable(payload.size());
     cudaMemcpy(dtable.p, payload.data(), payload.size(), cudaMemcpyHostToDevice);
-    DBuf dids = to_device_i32(ids);
-    DBuf dout(static_cast<std::size_t>(d) * T * 2u);
+    DeviceBuffer dids = to_device_i32(ids);
+    DeviceBuffer dout(static_cast<std::size_t>(d) * T * 2u);
     cudaMemset(dout.p, 0x7d, dout.bytes);
     Tensor tids(dids.p, DType::I32, {T});
     Tensor tout(dout.p, DType::BF16, {d, T});
@@ -532,10 +532,10 @@ static int one_w8_shape(std::int32_t T, std::int32_t d) {
     std::vector<double> ref;
     cpu_gather_w8_payload(payload, ids, d, ref);
 
-    DBuf dtable(payload.size());
+    DeviceBuffer dtable(payload.size());
     cudaMemcpy(dtable.p, payload.data(), payload.size(), cudaMemcpyHostToDevice);
-    DBuf dids = to_device_i32(ids);
-    DBuf dout(static_cast<std::size_t>(d) * T * 2u);
+    DeviceBuffer dids = to_device_i32(ids);
+    DeviceBuffer dout(static_cast<std::size_t>(d) * T * 2u);
     cudaMemset(dout.p, 0x7d, dout.bytes);
     Tensor tids(dids.p, DType::I32, {T});
     Tensor tout(dout.p, DType::BF16, {d, T});

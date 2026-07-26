@@ -81,7 +81,7 @@ struct GuardedBf16Output {
         return 1;
     }
 
-    DBuf storage;
+    DeviceBuffer storage;
     std::size_t words;
 };
 
@@ -113,7 +113,8 @@ public:
           codes_(static_cast<std::size_t>(rows) * code_row_bytes_),
           scales_(static_cast<std::size_t>(rows) * scale_row_bytes_) {
         if (high_row_bytes_ != 0) {
-            high_ = std::make_unique<DBuf>(static_cast<std::size_t>(rows) * high_row_bytes_);
+            high_ =
+                std::make_unique<DeviceBuffer>(static_cast<std::size_t>(rows) * high_row_bytes_);
         }
         cudaMemset(codes_.p, 0, codes_.bytes);
         if (high_) { cudaMemset(high_->p, 0, high_->bytes); }
@@ -176,9 +177,9 @@ private:
     std::size_t code_row_bytes_;
     std::size_t high_row_bytes_;
     std::size_t scale_row_bytes_;
-    DBuf codes_;
-    std::unique_ptr<DBuf> high_;
-    DBuf scales_;
+    DeviceBuffer codes_;
+    std::unique_ptr<DeviceBuffer> high_;
+    DeviceBuffer scales_;
 };
 
 Weight dense_bf16_weight(void* data, std::int32_t rows, std::int32_t columns) {
@@ -474,10 +475,10 @@ int run_case(const CodecProfile& profile, const RouteCase& route, const char* ca
     }
     const std::vector<float> router = make_router_pattern(selected_columns, tie_excluded_columns);
 
-    DBuf device_input         = to_device_bf16(input);
-    DBuf device_residual_seed = to_device_bf16(residual);
+    DeviceBuffer device_input         = to_device_bf16(input);
+    DeviceBuffer device_residual_seed = to_device_bf16(residual);
     GuardedBf16Output device_destination(residual.size());
-    DBuf device_router = to_device_bf16(router);
+    DeviceBuffer device_router = to_device_bf16(router);
     cudaMemcpy(device_destination.data(), device_residual_seed.p,
                residual.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToDevice);
 

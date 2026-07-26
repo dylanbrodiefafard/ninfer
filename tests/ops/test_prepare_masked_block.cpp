@@ -30,8 +30,8 @@ int verify_case(int block_size, std::int32_t length_value,
                 ops::detail::PrepareMaskedBlockRoute route, bool force_route) {
     const std::vector<std::int32_t> host_anchor{9173 + block_size};
     const std::vector<std::int32_t> host_length{length_value};
-    DBuf anchor = to_device(host_anchor);
-    DBuf length = to_device(host_length);
+    DeviceBuffer anchor = to_device(host_anchor);
+    DeviceBuffer length = to_device(host_length);
     GuardedDBuf ids(static_cast<std::size_t>(block_size) * sizeof(std::int32_t));
     GuardedDBuf positions(static_cast<std::size_t>(block_size) * sizeof(std::int32_t));
     ids.fill(0xcd);
@@ -79,8 +79,8 @@ int verify_case(int block_size, std::int32_t length_value,
 int graph_case(int block_size) {
     std::vector<std::int32_t> host_anchor{0};
     std::vector<std::int32_t> host_length{0};
-    DBuf anchor = to_device(host_anchor);
-    DBuf length = to_device(host_length);
+    DeviceBuffer anchor = to_device(host_anchor);
+    DeviceBuffer length = to_device(host_length);
     GuardedDBuf ids(static_cast<std::size_t>(block_size) * sizeof(std::int32_t));
     GuardedDBuf positions(static_cast<std::size_t>(block_size) * sizeof(std::int32_t));
     Tensor anchor_tensor(anchor.p, DType::I32, {1});
@@ -153,10 +153,10 @@ int expect_invalid_argument(const char* label, Call&& call) {
 
 int validation_cases() {
     constexpr int block_size = 4;
-    DBuf anchor              = to_device<std::int32_t>({13});
-    DBuf length              = to_device<std::int32_t>({29});
-    DBuf shared(static_cast<std::size_t>(block_size) * sizeof(std::int32_t));
-    DBuf output(static_cast<std::size_t>(block_size) * sizeof(std::int32_t));
+    DeviceBuffer anchor      = to_device<std::int32_t>({13});
+    DeviceBuffer length      = to_device<std::int32_t>({29});
+    DeviceBuffer shared(static_cast<std::size_t>(block_size) * sizeof(std::int32_t));
+    DeviceBuffer output(static_cast<std::size_t>(block_size) * sizeof(std::int32_t));
     Tensor anchor_tensor(anchor.p, DType::I32, {1});
     Tensor length_tensor(length.p, DType::I32, {1});
     Tensor shared_tensor(shared.p, DType::I32, {block_size});

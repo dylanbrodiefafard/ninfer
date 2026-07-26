@@ -21,19 +21,19 @@ constexpr int kStatsCountersForK5 = 9;
 
 namespace {
 
-DBuf to_device_i64(const std::vector<std::int64_t>& h) {
-    DBuf d(h.size() * sizeof(std::int64_t));
+DeviceBuffer to_device_i64(const std::vector<std::int64_t>& h) {
+    DeviceBuffer d(h.size() * sizeof(std::int64_t));
     cudaMemcpy(d.p, h.data(), h.size() * sizeof(std::int64_t), cudaMemcpyHostToDevice);
     return d;
 }
 
-DBuf to_device_config(const ops::SamplingConfig& cfg) {
-    DBuf d(sizeof(ops::SamplingConfig));
+DeviceBuffer to_device_config(const ops::SamplingConfig& cfg) {
+    DeviceBuffer d(sizeof(ops::SamplingConfig));
     cudaMemcpy(d.p, &cfg, sizeof(cfg), cudaMemcpyHostToDevice);
     return d;
 }
 
-const ops::SamplingConfig* config_ptr(const DBuf& d) {
+const ops::SamplingConfig* config_ptr(const DeviceBuffer& d) {
     return static_cast<const ops::SamplingConfig*>(d.p);
 }
 
@@ -45,23 +45,23 @@ WorkspaceArena& test_sampling_workspace() {
 
 // Zero logits buffer [vocab, cols]; unused by the greedy accept branch but
 // required by the wrapper's shape validation.
-DBuf zero_logits(int vocab, int cols) {
+DeviceBuffer zero_logits(int vocab, int cols) {
     return to_device_bf16(std::vector<float>(static_cast<std::size_t>(vocab) * cols, 0.0f));
 }
 
-DBuf to_device_u16(const std::vector<std::uint16_t>& h) {
-    DBuf d(h.size() * sizeof(std::uint16_t));
+DeviceBuffer to_device_u16(const std::vector<std::uint16_t>& h) {
+    DeviceBuffer d(h.size() * sizeof(std::uint16_t));
     cudaMemcpy(d.p, h.data(), h.size() * sizeof(std::uint16_t), cudaMemcpyHostToDevice);
     return d;
 }
 
-std::vector<std::int64_t> from_device_i64(const DBuf& d, std::size_t n) {
+std::vector<std::int64_t> from_device_i64(const DeviceBuffer& d, std::size_t n) {
     std::vector<std::int64_t> out(n);
     cudaMemcpy(out.data(), d.p, n * sizeof(std::int64_t), cudaMemcpyDeviceToHost);
     return out;
 }
 
-std::vector<std::uint16_t> from_device_u16(const DBuf& d, std::size_t n) {
+std::vector<std::uint16_t> from_device_u16(const DeviceBuffer& d, std::size_t n) {
     std::vector<std::uint16_t> out(n);
     cudaMemcpy(out.data(), d.p, n * sizeof(std::uint16_t), cudaMemcpyDeviceToHost);
     return out;
@@ -89,8 +89,8 @@ int prepare_verify_case() {
     auto d_token    = to_device_i32({42});
     auto d_drafts   = to_device_i32({101, 102, 103, 104, 105});
     auto d_length   = to_device_i32({11});
-    DBuf d_verify((k + 1) * sizeof(std::int32_t));
-    DBuf d_positions((k + 1) * sizeof(std::int32_t));
+    DeviceBuffer d_verify((k + 1) * sizeof(std::int32_t));
+    DeviceBuffer d_positions((k + 1) * sizeof(std::int32_t));
 
     Tensor token(d_token.p, DType::I32, {1});
     Tensor drafts(d_drafts.p, DType::I32, {k});
@@ -115,13 +115,13 @@ int accept_partial_case() {
     auto d_drafts   = to_device_i32({7, 8, 99, 10, 11});
     auto d_length   = to_device_i32({20});
     auto d_token    = to_device_i32({-1});
-    DBuf d_sampled((k + 1) * sizeof(std::int32_t));
-    DBuf d_num(sizeof(std::int32_t));
-    DBuf d_accepted(sizeof(std::int32_t));
+    DeviceBuffer d_sampled((k + 1) * sizeof(std::int32_t));
+    DeviceBuffer d_num(sizeof(std::int32_t));
+    DeviceBuffer d_accepted(sizeof(std::int32_t));
     auto d_stats = to_device_i64({5, 7, 3, 4, 100, 200, 300, 400, 500});
 
-    DBuf d_logits = zero_logits(16, k + 1);
-    DBuf d_cfg    = to_device_config(ops::SamplingConfig{}); // greedy
+    DeviceBuffer d_logits = zero_logits(16, k + 1);
+    DeviceBuffer d_cfg    = to_device_config(ops::SamplingConfig{}); // greedy
     Tensor targets(d_targets.p, DType::I32, {k + 1});
     Tensor logits(d_logits.p, DType::BF16, {16, k + 1});
     Tensor drafts(d_drafts.p, DType::I32, {k});
@@ -154,13 +154,13 @@ int accept_all_reject_case() {
     auto d_drafts   = to_device_i32({99, 8, 9, 10, 11});
     auto d_length   = to_device_i32({20});
     auto d_token    = to_device_i32({-1});
-    DBuf d_sampled((k + 1) * sizeof(std::int32_t));
-    DBuf d_num(sizeof(std::int32_t));
-    DBuf d_accepted(sizeof(std::int32_t));
+    DeviceBuffer d_sampled((k + 1) * sizeof(std::int32_t));
+    DeviceBuffer d_num(sizeof(std::int32_t));
+    DeviceBuffer d_accepted(sizeof(std::int32_t));
     auto d_stats = to_device_i64(std::vector<std::int64_t>(kStatsCountersForK5, 0));
 
-    DBuf d_logits = zero_logits(16, k + 1);
-    DBuf d_cfg    = to_device_config(ops::SamplingConfig{}); // greedy
+    DeviceBuffer d_logits = zero_logits(16, k + 1);
+    DeviceBuffer d_cfg    = to_device_config(ops::SamplingConfig{}); // greedy
     Tensor targets(d_targets.p, DType::I32, {k + 1});
     Tensor logits(d_logits.p, DType::BF16, {16, k + 1});
     Tensor drafts(d_drafts.p, DType::I32, {k});
@@ -193,13 +193,13 @@ int accept_all_case() {
     auto d_drafts   = to_device_i32({1, 2, 3});
     auto d_length   = to_device_i32({4});
     auto d_token    = to_device_i32({-1});
-    DBuf d_sampled((k + 1) * sizeof(std::int32_t));
-    DBuf d_num(sizeof(std::int32_t));
-    DBuf d_accepted(sizeof(std::int32_t));
+    DeviceBuffer d_sampled((k + 1) * sizeof(std::int32_t));
+    DeviceBuffer d_num(sizeof(std::int32_t));
+    DeviceBuffer d_accepted(sizeof(std::int32_t));
     auto d_stats = to_device_i64(std::vector<std::int64_t>(kStatsCountersForK5, 0));
 
-    DBuf d_logits = zero_logits(16, k + 1);
-    DBuf d_cfg    = to_device_config(ops::SamplingConfig{}); // greedy
+    DeviceBuffer d_logits = zero_logits(16, k + 1);
+    DeviceBuffer d_cfg    = to_device_config(ops::SamplingConfig{}); // greedy
     Tensor targets(d_targets.p, DType::I32, {k + 1});
     Tensor logits(d_logits.p, DType::BF16, {16, k + 1});
     Tensor drafts(d_drafts.p, DType::I32, {k});
@@ -235,16 +235,16 @@ int k15_common_contract_case() {
         if (i < k) { drafts[static_cast<std::size_t>(i)] = i; }
     }
 
-    auto d_targets = to_device_i32(targets);
-    auto d_drafts  = to_device_i32(drafts);
-    auto d_length  = to_device_i32({100});
-    auto d_token   = to_device_i32({-1});
-    DBuf d_logits  = zero_logits(vocab, k + 1);
-    DBuf d_sampled((k + 1) * sizeof(std::int32_t));
-    DBuf d_num(sizeof(std::int32_t));
-    DBuf d_accepted(sizeof(std::int32_t));
-    auto d_stats = to_device_i64(std::vector<std::int64_t>(4 + k, 0));
-    DBuf d_cfg   = to_device_config(ops::SamplingConfig{});
+    auto d_targets        = to_device_i32(targets);
+    auto d_drafts         = to_device_i32(drafts);
+    auto d_length         = to_device_i32({100});
+    auto d_token          = to_device_i32({-1});
+    DeviceBuffer d_logits = zero_logits(vocab, k + 1);
+    DeviceBuffer d_sampled((k + 1) * sizeof(std::int32_t));
+    DeviceBuffer d_num(sizeof(std::int32_t));
+    DeviceBuffer d_accepted(sizeof(std::int32_t));
+    auto d_stats       = to_device_i64(std::vector<std::int64_t>(4 + k, 0));
+    DeviceBuffer d_cfg = to_device_config(ops::SamplingConfig{});
 
     Tensor target_tensor(d_targets.p, DType::I32, {k + 1});
     Tensor logits(d_logits.p, DType::BF16, {vocab, k + 1});
@@ -288,7 +288,7 @@ int gather_case(int rows) {
     }
     auto d_hidden   = to_device_u16(hidden);
     auto d_accepted = to_device_i32({3});
-    DBuf d_out(static_cast<std::size_t>(rows) * sizeof(std::uint16_t));
+    DeviceBuffer d_out(static_cast<std::size_t>(rows) * sizeof(std::uint16_t));
 
     Tensor hidden_tensor(d_hidden.p, DType::BF16, {rows, cols});
     Tensor accepted(d_accepted.p, DType::I32, {1});
@@ -362,9 +362,9 @@ int accepted_state_resume_case() {
 
     std::vector<int> targets(k + 1);
     for (int i = 0; i <= k; ++i) { targets[static_cast<std::size_t>(i)] = i + 1; }
-    DBuf d_targets = to_device_i32(targets);
-    DBuf d_logits  = zero_logits(vocab, k + 1);
-    DBuf d_cfg     = to_device_config(ops::SamplingConfig{});
+    DeviceBuffer d_targets = to_device_i32(targets);
+    DeviceBuffer d_logits  = zero_logits(vocab, k + 1);
+    DeviceBuffer d_cfg     = to_device_config(ops::SamplingConfig{});
     Tensor target_tensor(d_targets.p, DType::I32, {k + 1});
     Tensor logits(d_logits.p, DType::BF16, {vocab, k + 1});
 
@@ -409,9 +409,9 @@ int accepted_state_resume_case() {
         auto d_token  = to_device_i32({-1});
         auto d_stats  = to_device_i64(std::vector<std::int64_t>(4 + k, 0));
         auto d_slot   = to_device_i32({-1});
-        DBuf d_sampled((k + 1) * sizeof(std::int32_t));
-        DBuf d_num(sizeof(std::int32_t));
-        DBuf d_accepted(sizeof(std::int32_t));
+        DeviceBuffer d_sampled((k + 1) * sizeof(std::int32_t));
+        DeviceBuffer d_num(sizeof(std::int32_t));
+        DeviceBuffer d_accepted(sizeof(std::int32_t));
         Tensor draft_tensor(d_drafts.p, DType::I32, {k});
         Tensor length(d_length.p, DType::I32, {1});
         Tensor token(d_token.p, DType::I32, {1});
@@ -436,8 +436,8 @@ int accepted_state_resume_case() {
         auto d_conv_ref    = to_device_bf16(conv_reference_host);
         auto d_conv_x      = to_device_bf16(conv_x_host);
         auto d_conv_weight = to_device_bf16(conv_weight_host);
-        DBuf d_conv_out(sizeof(std::uint16_t));
-        DBuf d_conv_ref_out(sizeof(std::uint16_t));
+        DeviceBuffer d_conv_out(sizeof(std::uint16_t));
+        DeviceBuffer d_conv_ref_out(sizeof(std::uint16_t));
         Tensor conv_states(d_conv_states.p, DType::BF16, {1, 3, slots});
         Tensor conv_ref(d_conv_ref.p, DType::BF16, {1, 3});
         Tensor conv_x(d_conv_x.p, DType::BF16, {1, 1});
@@ -458,8 +458,8 @@ int accepted_state_resume_case() {
         auto d_v          = to_device_bf16(v_host);
         auto d_g          = to_device_f32(g_host);
         auto d_beta       = to_device_f32(beta_host);
-        DBuf d_ssm_out(head * sizeof(std::uint16_t));
-        DBuf d_ssm_ref_out(head * sizeof(std::uint16_t));
+        DeviceBuffer d_ssm_out(head * sizeof(std::uint16_t));
+        DeviceBuffer d_ssm_ref_out(head * sizeof(std::uint16_t));
         Tensor ssm_states(d_ssm_states.p, DType::FP32, {head, head, 1, slots});
         Tensor ssm_ref(d_ssm_ref.p, DType::FP32, {head, head, 1});
         Tensor q(d_q.p, DType::BF16, {head, 1, 1});
@@ -508,7 +508,7 @@ int reject_sampling_distribution_case() {
         logits_h[v]         = base[v]; // column 0 -> p0
         logits_h[vocab + v] = base[v]; // column 1 (bonus, not checked here)
     }
-    DBuf d_logits = to_device_bf16(logits_h);
+    DeviceBuffer d_logits = to_device_bf16(logits_h);
 
     double mmax = base[0];
     for (float x : base) { mmax = std::max(mmax, static_cast<double>(x)); }
@@ -522,23 +522,23 @@ int reject_sampling_distribution_case() {
 
     const int d0 = 5; // a mid-probability draft exercises accept and reject
     ops::SamplingConfig cfg;
-    cfg.temperature = 1.0f;
-    cfg.seed        = 99u;
-    DBuf d_cfg      = to_device_config(cfg);
+    cfg.temperature    = 1.0f;
+    cfg.seed           = 99u;
+    DeviceBuffer d_cfg = to_device_config(cfg);
 
     const int N = 40000;
     std::vector<int> lengths(static_cast<std::size_t>(N));
     for (int i = 0; i < N; ++i) { lengths[static_cast<std::size_t>(i)] = i; }
-    DBuf d_lengths = to_device_i32(lengths);
-    DBuf d_scratch(sizeof(std::int32_t));
-    DBuf d_collect(static_cast<std::size_t>(N) * sizeof(std::int32_t));
+    DeviceBuffer d_lengths = to_device_i32(lengths);
+    DeviceBuffer d_scratch(sizeof(std::int32_t));
+    DeviceBuffer d_collect(static_cast<std::size_t>(N) * sizeof(std::int32_t));
 
     auto d_targets = to_device_i32({0, 0});
     auto d_drafts  = to_device_i32({d0});
     auto d_token   = to_device_i32({-1});
-    DBuf d_sampled((k + 1) * sizeof(std::int32_t));
-    DBuf d_num(sizeof(std::int32_t));
-    DBuf d_accepted(sizeof(std::int32_t));
+    DeviceBuffer d_sampled((k + 1) * sizeof(std::int32_t));
+    DeviceBuffer d_num(sizeof(std::int32_t));
+    DeviceBuffer d_accepted(sizeof(std::int32_t));
     auto d_stats = to_device_i64(std::vector<std::int64_t>(kStatsCountersForK5, 0));
 
     Tensor targets(d_targets.p, DType::I32, {k + 1});
@@ -592,20 +592,20 @@ int reject_sampling_reproducible_case() {
     std::vector<float> logits_h(static_cast<std::size_t>(vocab) * (k + 1));
     fill_uniform(logits_h, 7u, -3.0f, 3.0f);
     round_to_bf16(logits_h);
-    DBuf d_logits = to_device_bf16(logits_h);
+    DeviceBuffer d_logits = to_device_bf16(logits_h);
 
     ops::SamplingConfig cfg;
-    cfg.temperature = 0.8f;
-    cfg.top_p       = 0.95f;
-    cfg.seed        = 2026u;
-    DBuf d_cfg      = to_device_config(cfg);
+    cfg.temperature    = 0.8f;
+    cfg.top_p          = 0.95f;
+    cfg.seed           = 2026u;
+    DeviceBuffer d_cfg = to_device_config(cfg);
 
     auto d_targets = to_device_i32({0, 0, 0, 0});
     auto d_drafts  = to_device_i32({3, 9, 17});
     auto d_token   = to_device_i32({-1});
-    DBuf d_sampled((k + 1) * sizeof(std::int32_t));
-    DBuf d_num(sizeof(std::int32_t));
-    DBuf d_accepted(sizeof(std::int32_t));
+    DeviceBuffer d_sampled((k + 1) * sizeof(std::int32_t));
+    DeviceBuffer d_num(sizeof(std::int32_t));
+    DeviceBuffer d_accepted(sizeof(std::int32_t));
     auto d_stats = to_device_i64(std::vector<std::int64_t>(kStatsCountersForK5, 0));
 
     Tensor targets(d_targets.p, DType::I32, {k + 1});
@@ -652,7 +652,7 @@ int reject_sampling_real_shape_distribution_case() {
         }
     }
     round_to_bf16(logits_h);
-    DBuf d_logits = to_device_bf16(logits_h);
+    DeviceBuffer d_logits = to_device_bf16(logits_h);
 
     std::vector<double> p0(4);
     double mmax = vals[0];
@@ -664,24 +664,24 @@ int reject_sampling_real_shape_distribution_case() {
     for (double& x : p0) { x /= sum; }
 
     ops::SamplingConfig cfg;
-    cfg.temperature = 1.0f;
-    cfg.top_k       = 4;
-    cfg.seed        = 7001u;
-    DBuf d_cfg      = to_device_config(cfg);
+    cfg.temperature    = 1.0f;
+    cfg.top_k          = 4;
+    cfg.seed           = 7001u;
+    DeviceBuffer d_cfg = to_device_config(cfg);
 
     const int N = 2048;
     std::vector<int> lengths(static_cast<std::size_t>(N));
     for (int i = 0; i < N; ++i) { lengths[static_cast<std::size_t>(i)] = i + 100; }
-    DBuf d_lengths = to_device_i32(lengths);
-    DBuf d_scratch(sizeof(std::int32_t));
-    DBuf d_collect(static_cast<std::size_t>(N) * sizeof(std::int32_t));
+    DeviceBuffer d_lengths = to_device_i32(lengths);
+    DeviceBuffer d_scratch(sizeof(std::int32_t));
+    DeviceBuffer d_collect(static_cast<std::size_t>(N) * sizeof(std::int32_t));
 
     auto d_targets = to_device_i32({0, 0});
     auto d_drafts  = to_device_i32({ids[1]});
     auto d_token   = to_device_i32({-1});
-    DBuf d_sampled((k + 1) * sizeof(std::int32_t));
-    DBuf d_num(sizeof(std::int32_t));
-    DBuf d_accepted(sizeof(std::int32_t));
+    DeviceBuffer d_sampled((k + 1) * sizeof(std::int32_t));
+    DeviceBuffer d_num(sizeof(std::int32_t));
+    DeviceBuffer d_accepted(sizeof(std::int32_t));
     auto d_stats = to_device_i64(std::vector<std::int64_t>(kStatsCountersForK5, 0));
 
     Tensor targets(d_targets.p, DType::I32, {k + 1});
@@ -742,21 +742,21 @@ std::vector<int> run_real_shape_speculative_sequence(const std::vector<float>& l
     constexpr int vocab        = 248320;
     constexpr int token_domain = 248077;
     const int k                = static_cast<int>(drafts_h.size());
-    DBuf d_logits              = to_device_bf16(logits_h);
-    DBuf d_counts(static_cast<std::size_t>(token_domain) * sizeof(std::int32_t));
+    DeviceBuffer d_logits      = to_device_bf16(logits_h);
+    DeviceBuffer d_counts(static_cast<std::size_t>(token_domain) * sizeof(std::int32_t));
     cudaMemset(d_counts.p, 0, d_counts.bytes);
-    cfg.token_counts = static_cast<std::int32_t*>(d_counts.p);
-    DBuf d_cfg       = to_device_config(cfg);
+    cfg.token_counts   = static_cast<std::int32_t*>(d_counts.p);
+    DeviceBuffer d_cfg = to_device_config(cfg);
 
     auto d_targets = to_device_i32(std::vector<int>(static_cast<std::size_t>(k + 1), 0));
     auto d_drafts  = to_device_i32(drafts_h);
     auto d_token   = to_device_i32({-1});
-    DBuf d_length(sizeof(std::int32_t));
-    DBuf d_sampled(static_cast<std::size_t>(k + 1) * sizeof(std::int32_t));
-    DBuf d_num(sizeof(std::int32_t));
-    DBuf d_accepted(sizeof(std::int32_t));
+    DeviceBuffer d_length(sizeof(std::int32_t));
+    DeviceBuffer d_sampled(static_cast<std::size_t>(k + 1) * sizeof(std::int32_t));
+    DeviceBuffer d_num(sizeof(std::int32_t));
+    DeviceBuffer d_accepted(sizeof(std::int32_t));
     auto d_stats = to_device_i64(std::vector<std::int64_t>(kStatsCountersForK5, 0));
-    DBuf d_collect(static_cast<std::size_t>(rounds) * (k + 2) * sizeof(std::int32_t));
+    DeviceBuffer d_collect(static_cast<std::size_t>(rounds) * (k + 2) * sizeof(std::int32_t));
 
     Tensor targets(d_targets.p, DType::I32, {k + 1});
     Tensor logits(d_logits.p, DType::BF16, {vocab, k + 1});
@@ -826,7 +826,7 @@ int reject_sampling_real_shape_reproducible_case() {
 
 int validation_case() {
     try {
-        DBuf d(4);
+        DeviceBuffer d(4);
         Tensor scalar(d.p, DType::BF16, {1});
         ops::increment_i32_scalar(scalar, nullptr);
     } catch (const std::invalid_argument&) { return 0; }
@@ -845,11 +845,11 @@ std::vector<int> run_one_speculative_round(const std::vector<float>& logits_h, i
                                            const std::vector<int>& target_tokens_h = {},
                                            bool with_counts                        = true) {
     if (token_domain < 0) { token_domain = vocab; }
-    DBuf d_logits = to_device_bf16(logits_h);
-    DBuf d_counts(static_cast<std::size_t>(token_domain) * sizeof(std::int32_t));
+    DeviceBuffer d_logits = to_device_bf16(logits_h);
+    DeviceBuffer d_counts(static_cast<std::size_t>(token_domain) * sizeof(std::int32_t));
     cudaMemset(d_counts.p, 0, d_counts.bytes);
-    cfg.token_counts = with_counts ? static_cast<std::int32_t*>(d_counts.p) : nullptr;
-    DBuf d_cfg       = to_device_config(cfg);
+    cfg.token_counts   = with_counts ? static_cast<std::int32_t*>(d_counts.p) : nullptr;
+    DeviceBuffer d_cfg = to_device_config(cfg);
 
     const std::vector<int> targets_h = target_tokens_h.empty()
                                            ? std::vector<int>(static_cast<std::size_t>(k + 1), 0)
@@ -858,9 +858,9 @@ std::vector<int> run_one_speculative_round(const std::vector<float>& logits_h, i
     auto d_drafts                    = to_device_i32(drafts_h);
     auto d_token                     = to_device_i32({-1});
     auto d_length                    = to_device_i32({length});
-    DBuf d_sampled(static_cast<std::size_t>(k + 1) * sizeof(std::int32_t));
-    DBuf d_num(sizeof(std::int32_t));
-    DBuf d_accepted(sizeof(std::int32_t));
+    DeviceBuffer d_sampled(static_cast<std::size_t>(k + 1) * sizeof(std::int32_t));
+    DeviceBuffer d_num(sizeof(std::int32_t));
+    DeviceBuffer d_accepted(sizeof(std::int32_t));
     auto d_stats = to_device_i64(std::vector<std::int64_t>(4 + k, 0));
 
     Tensor targets(d_targets.p, DType::I32, {k + 1});

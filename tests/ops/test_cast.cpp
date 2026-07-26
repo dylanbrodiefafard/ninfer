@@ -32,8 +32,8 @@ int cast_case(std::int32_t d, std::int32_t columns, std::size_t source_offset = 
               std::size_t destination_offset = 0) {
     const std::size_t count         = static_cast<std::size_t>(d) * columns;
     const std::vector<float> source = make_values(count);
-    DBuf device_source(source_offset + count * sizeof(float));
-    DBuf device_destination(destination_offset + count * sizeof(std::uint16_t));
+    DeviceBuffer device_source(source_offset + count * sizeof(float));
+    DeviceBuffer device_destination(destination_offset + count * sizeof(std::uint16_t));
     auto* source_ptr      = static_cast<std::byte*>(device_source.p) + source_offset;
     auto* destination_ptr = static_cast<std::byte*>(device_destination.p) + destination_offset;
     cudaMemcpy(source_ptr, source.data(), count * sizeof(float), cudaMemcpyHostToDevice);

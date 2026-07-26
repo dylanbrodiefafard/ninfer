@@ -10,6 +10,8 @@
 #include "ninfer/ops/linear.h"
 
 #include "core/device.h"
+#include "ninfer_bench_common.h"
+#include "quantized_weight.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_profiler_api.h>
@@ -41,30 +43,6 @@ constexpr std::uint64_t kDefaultFlushBytes = 256ULL << 20;
 constexpr std::uint64_t kWorkspaceBytes    = 64ULL << 20;
 constexpr int kDefaultWarmup               = 3;
 constexpr int kDefaultRepeat               = 20;
-
-struct DeviceBuffer {
-    void* data          = nullptr;
-    std::uint64_t bytes = 0;
-
-    DeviceBuffer() = default;
-
-    explicit DeviceBuffer(std::uint64_t size) : bytes(size) {
-        if (bytes != 0) { CUDA_CHECK(cudaMalloc(&data, bytes)); }
-    }
-
-    ~DeviceBuffer() {
-        if (data != nullptr) { cudaFree(data); }
-    }
-
-    DeviceBuffer(DeviceBuffer&& other) noexcept : data(other.data), bytes(other.bytes) {
-        other.data  = nullptr;
-        other.bytes = 0;
-    }
-
-    DeviceBuffer(const DeviceBuffer&)            = delete;
-    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
-    DeviceBuffer& operator=(DeviceBuffer&&)      = delete;
-};
 
 enum class TClass : std::uint8_t {
     Continuous,
@@ -155,27 +133,6 @@ struct PointGroup {
     std::vector<BenchPoint> points;
 };
 
-struct TimingStats {
-    double median_us = 0.0;
-    double min_us    = 0.0;
-    double p95_us    = 0.0;
-};
-
-struct Payload {
-    DeviceBuffer storage;
-    std::uint64_t low_bytes    = 0;
-    std::uint64_t high_offset  = 0;
-    std::uint64_t high_bytes   = 0;
-    std::uint64_t scale_offset = 0;
-    std::uint64_t scale_bytes  = 0;
-
-    [[nodiscard]] std::uint64_t model_weight_bytes() const {
-        return low_bytes + high_bytes + scale_bytes;
-    }
-
-    [[nodiscard]] std::uint64_t payload_bytes() const { return scale_offset + scale_bytes; }
-};
-
 struct Result {
     std::string labels;
     const char* qtype_name     = "";
@@ -205,12 +162,6 @@ struct Result {
     int repeat                 = 0;
     std::uint64_t flush_bytes  = 0;
 };
-
-__global__ void fill_scales_kernel(std::uint16_t* scales, std::uint64_t count) {
-    const std::uint64_t begin  = blockIdx.x * static_cast<std::uint64_t>(blockDim.x) + threadIdx.x;
-    const std::uint64_t stride = gridDim.x * static_cast<std::uint64_t>(blockDim.x);
-    for (std::uint64_t i = begin; i < count; i += stride) { scales[i] = 0x3c00u; }
-}
 
 __global__ void fill_bf16_kernel(__nv_bfloat16* values, std::uint64_t count) {
     const std::uint64_t begin  = blockIdx.x * static_cast<std::uint64_t>(blockDim.x) + threadIdx.x;
@@ -518,135 +469,19 @@ std::vector<PointGroup> group_points(const std::vector<BenchPoint>& points) {
     return groups;
 }
 
-std::int32_t group_size(QType qtype) {
-    if (qtype == QType::W8G32_F16S) { return 32; }
-    if (qtype == QType::Q4G64_F16S || qtype == QType::Q5G64_F16S || qtype == QType::Q6G64_F16S) {
-        return 64;
-    }
-    throw std::invalid_argument("unsupported Linear benchmark qtype");
-}
-
-std::int32_t high_bytes_per_group(QType qtype) {
-    switch (qtype) {
-    case QType::Q4G64_F16S:
-    case QType::W8G32_F16S:
-        return 0;
-    case QType::Q5G64_F16S:
-        return 8;
-    case QType::Q6G64_F16S:
-        return 16;
-    default:
-        break;
-    }
-    throw std::invalid_argument("unsupported Linear benchmark qtype");
-}
-
-Payload make_payload(QType qtype, std::int32_t n, std::int32_t k, cudaStream_t stream) {
+bench::PackedQuantizedWeight make_weight(QType qtype, std::int32_t n, std::int32_t k) {
     const std::uint64_t padded_k_u64 = align_up(static_cast<std::uint64_t>(k), 128);
     if (padded_k_u64 > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("padded K does not fit int32");
     }
-    const std::uint64_t groups =
-        checked_mul(static_cast<std::uint64_t>(n),
-                    padded_k_u64 / static_cast<std::uint64_t>(group_size(qtype)), "weight groups");
-    const std::uint64_t low_bytes  = checked_mul(groups, 32, "low plane bytes");
-    const std::uint64_t high_bytes = checked_mul(
-        groups, static_cast<std::uint64_t>(high_bytes_per_group(qtype)), "high plane bytes");
-    const std::uint64_t scale_bytes = checked_mul(groups, 2, "scale plane bytes");
-    const std::uint64_t high_offset = align_up(low_bytes, 256);
-    const std::uint64_t scale_offset =
-        checked_add(high_offset, align_up(high_bytes, 256), "scale plane offset");
-    const std::uint64_t payload_bytes = checked_add(scale_offset, scale_bytes, "payload bytes");
-
-    Payload payload{
-        DeviceBuffer(payload_bytes), low_bytes, high_offset, high_bytes, scale_offset, scale_bytes};
-    CUDA_CHECK(cudaMemsetAsync(payload.storage.data, 0x31, low_bytes, stream));
-    if (high_bytes != 0) {
-        CUDA_CHECK(cudaMemsetAsync(static_cast<std::uint8_t*>(payload.storage.data) + high_offset,
-                                   0xa5, high_bytes, stream));
-    }
-    fill_scales_kernel<<<launch_grid(groups), 256, 0, stream>>>(
-        reinterpret_cast<std::uint16_t*>(static_cast<std::uint8_t*>(payload.storage.data) +
-                                         scale_offset),
-        groups);
-    CUDA_CHECK(cudaGetLastError());
-    return payload;
-}
-
-Weight make_weight(const Payload& payload, QType qtype, std::int32_t n, std::int32_t k) {
-    const std::int32_t padded_k = static_cast<std::int32_t>(align_up(k, 128));
-    Weight weight{};
-    weight.payload          = payload.storage.data;
-    weight.payload_bytes    = payload.payload_bytes();
-    weight.high_plane_bytes = payload.high_bytes;
-    weight.qtype            = qtype;
-    weight.group_size       = static_cast<std::uint32_t>(group_size(qtype));
-    weight.shape[0]         = n;
-    weight.shape[1]         = k;
-    weight.padded_shape[0]  = n;
-    weight.padded_shape[1]  = padded_k;
-    weight.ndim             = 2;
-    weight.qdata            = payload.storage.data;
-    weight.qhigh =
-        payload.high_bytes == 0
-            ? nullptr
-            : static_cast<const std::uint8_t*>(payload.storage.data) + payload.high_offset;
-    weight.scales = static_cast<const std::uint8_t*>(payload.storage.data) + payload.scale_offset;
-    weight.n      = n;
-    weight.k      = k;
-    weight.group  = group_size(qtype);
-    weight.layout = QuantLayout::RowSplit;
-    weight.scale_dtype = DType::FP16;
-    return weight;
+    return bench::make_row_split_weight(qtype, n, k, static_cast<std::int32_t>(padded_k_u64),
+                                        bench::QuantizedWeightFill{0x31, 0xa5, 0x3c00});
 }
 
 void fill_activation(DeviceBuffer& buffer, std::uint64_t elements, cudaStream_t stream) {
     fill_bf16_kernel<<<launch_grid(elements), 256, 0, stream>>>(
-        static_cast<__nv_bfloat16*>(buffer.data), elements);
+        static_cast<__nv_bfloat16*>(buffer.p), elements);
     CUDA_CHECK(cudaGetLastError());
-}
-
-void flush_l2(DeviceBuffer& flush, cudaStream_t stream) {
-    CUDA_CHECK(cudaMemsetAsync(flush.data, 0xa5, flush.bytes, stream));
-}
-
-template <class Launch>
-TimingStats measure_cold(Launch&& launch, DeviceBuffer& flush, cudaStream_t stream, int warmup,
-                         int repeat) {
-    cudaEvent_t start = nullptr;
-    cudaEvent_t stop  = nullptr;
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
-
-    for (int i = 0; i < warmup; ++i) {
-        flush_l2(flush, stream);
-        launch(stream);
-    }
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    std::vector<double> samples;
-    samples.reserve(static_cast<std::size_t>(repeat));
-    for (int i = 0; i < repeat; ++i) {
-        flush_l2(flush, stream);
-        CUDA_CHECK(cudaEventRecord(start, stream));
-        launch(stream);
-        CUDA_CHECK(cudaEventRecord(stop, stream));
-        CUDA_CHECK(cudaEventSynchronize(stop));
-        float milliseconds = 0.0F;
-        CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
-        samples.push_back(static_cast<double>(milliseconds) * 1000.0);
-    }
-
-    CUDA_CHECK(cudaEventDestroy(start));
-    CUDA_CHECK(cudaEventDestroy(stop));
-
-    std::sort(samples.begin(), samples.end());
-    TimingStats result;
-    result.min_us    = samples.front();
-    result.median_us = samples[samples.size() / 2];
-    result.p95_us    = samples[std::min(
-        samples.size() - 1, static_cast<std::size_t>(0.95 * static_cast<double>(samples.size())))];
-    return result;
 }
 
 std::string join_labels(const std::vector<std::string>& labels) {
@@ -658,17 +493,16 @@ std::string join_labels(const std::vector<std::string>& labels) {
     return out;
 }
 
-Result make_result(const BenchPoint& point, const Payload& payload, const TimingStats& timing,
-                   const Options& opt) {
+Result make_result(const BenchPoint& point, const bench::PackedQuantizedWeight& weight,
+                   const bench::ColdTiming& timing, const Options& opt) {
     const std::uint64_t x_elements =
         checked_mul(static_cast<std::uint64_t>(point.k), point.t, "activation elements");
     const std::uint64_t out_elements =
         checked_mul(static_cast<std::uint64_t>(point.n), point.t, "output elements");
-    const std::uint64_t x_bytes   = checked_mul(x_elements, 2, "activation bytes");
-    const std::uint64_t out_bytes = checked_mul(out_elements, 2, "output bytes");
-    const std::uint64_t model_bytes =
-        checked_add(checked_add(payload.model_weight_bytes(), x_bytes, "model bytes"), out_bytes,
-                    "model bytes");
+    const std::uint64_t x_bytes     = checked_mul(x_elements, 2, "activation bytes");
+    const std::uint64_t out_bytes   = checked_mul(out_elements, 2, "output bytes");
+    const std::uint64_t model_bytes = checked_add(
+        checked_add(weight.model_weight_bytes(), x_bytes, "model bytes"), out_bytes, "model bytes");
     const double useful_flops = 2.0 * static_cast<double>(point.n) * static_cast<double>(point.k) *
                                 static_cast<double>(point.t);
     const double seconds = timing.median_us * 1.0e-6;
@@ -684,7 +518,7 @@ Result make_result(const BenchPoint& point, const Payload& payload, const Timing
     result.n                 = point.n;
     result.k                 = point.k;
     result.t                 = point.t;
-    result.weight_bytes      = payload.model_weight_bytes();
+    result.weight_bytes      = weight.model_weight_bytes();
     result.x_bytes           = x_bytes;
     result.out_bytes         = out_bytes;
     result.model_bytes       = model_bytes;
@@ -718,28 +552,28 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
     const std::uint64_t out_elements =
         checked_mul(static_cast<std::uint64_t>(group.n), max_t, "output allocation");
 
-    Payload payload = make_payload(group.qtype, group.n, group.k, stream);
+    bench::PackedQuantizedWeight weight = make_weight(group.qtype, group.n, group.k);
     DeviceBuffer x(checked_mul(x_elements, 2, "activation allocation bytes"));
     DeviceBuffer out(checked_mul(out_elements, 2, "output allocation bytes"));
     fill_activation(x, x_elements, stream);
-    CUDA_CHECK(cudaMemsetAsync(out.data, 0, out.bytes, stream));
+    CUDA_CHECK(cudaMemsetAsync(out.p, 0, out.bytes, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    const Weight weight = make_weight(payload, group.qtype, group.n, group.k);
     WorkspaceArena workspace(kWorkspaceBytes);
     std::vector<Result> results;
     results.reserve(group.points.size());
     double previous_median = std::numeric_limits<double>::quiet_NaN();
 
     for (const BenchPoint& point : group.points) {
-        Tensor activation(x.data, DType::BF16, {group.k, point.t});
-        Tensor output(out.data, DType::BF16, {group.n, point.t});
+        Tensor activation(x.p, DType::BF16, {group.k, point.t});
+        Tensor output(out.p, DType::BF16, {group.n, point.t});
         const auto launch = [&](cudaStream_t launch_stream) {
             workspace.reset();
-            ops::linear(activation, weight, output, group.policy, workspace, launch_stream);
+            ops::linear(activation, weight.weight, output, group.policy, workspace, launch_stream);
         };
-        const TimingStats timing = measure_cold(launch, flush, stream, opt.warmup, opt.repeat);
-        Result result            = make_result(point, payload, timing, opt);
+        const bench::ColdTiming timing =
+            bench::measure_cold_launch(launch, flush, stream, opt.warmup, opt.repeat);
+        Result result = make_result(point, weight, timing, opt);
         if (point.sweep_point && std::isfinite(previous_median)) {
             result.delta_pct = (result.median_us / previous_median - 1.0) * 100.0;
         }
@@ -755,34 +589,32 @@ void run_profile(const BenchPoint& point, const Options& opt, DeviceBuffer& flus
         checked_mul(static_cast<std::uint64_t>(point.k), point.t, "activation allocation");
     const std::uint64_t out_elements =
         checked_mul(static_cast<std::uint64_t>(point.n), point.t, "output allocation");
-    Payload payload = make_payload(point.qtype, point.n, point.k, stream);
+    bench::PackedQuantizedWeight weight = make_weight(point.qtype, point.n, point.k);
     DeviceBuffer x(checked_mul(x_elements, 2, "activation allocation bytes"));
     DeviceBuffer out(checked_mul(out_elements, 2, "output allocation bytes"));
     fill_activation(x, x_elements, stream);
-    CUDA_CHECK(cudaMemsetAsync(out.data, 0, out.bytes, stream));
+    CUDA_CHECK(cudaMemsetAsync(out.p, 0, out.bytes, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    const Weight weight = make_weight(payload, point.qtype, point.n, point.k);
     WorkspaceArena workspace(kWorkspaceBytes);
-    Tensor activation(x.data, DType::BF16, {point.k, point.t});
-    Tensor output(out.data, DType::BF16, {point.n, point.t});
+    Tensor activation(x.p, DType::BF16, {point.k, point.t});
+    Tensor output(out.p, DType::BF16, {point.n, point.t});
     const auto launch = [&]() {
         workspace.reset();
-        ops::linear(activation, weight, output, point.policy, workspace, stream);
+        ops::linear(activation, weight.weight, output, point.policy, workspace, stream);
     };
     for (int i = 0; i < opt.warmup; ++i) {
-        flush_l2(flush, stream);
+        bench::flush_l2(flush, stream);
         launch();
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    flush_l2(flush, stream);
+    bench::flush_l2(flush, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    const std::uint64_t x_bytes   = checked_mul(x_elements, 2, "activation bytes");
-    const std::uint64_t out_bytes = checked_mul(out_elements, 2, "output bytes");
-    const std::uint64_t model_bytes =
-        checked_add(checked_add(payload.model_weight_bytes(), x_bytes, "model bytes"), out_bytes,
-                    "model bytes");
+    const std::uint64_t x_bytes     = checked_mul(x_elements, 2, "activation bytes");
+    const std::uint64_t out_bytes   = checked_mul(out_elements, 2, "output bytes");
+    const std::uint64_t model_bytes = checked_add(
+        checked_add(weight.model_weight_bytes(), x_bytes, "model bytes"), out_bytes, "model bytes");
     const double useful_flops = 2.0 * static_cast<double>(point.n) * static_cast<double>(point.k) *
                                 static_cast<double>(point.t);
     std::printf("PROFILE linear qtype=%s policy=%s N=%d K=%d T=%d model_bytes=%llu "

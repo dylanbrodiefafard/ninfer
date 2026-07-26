@@ -47,10 +47,10 @@ int one_shape(const char* route, int d, int rows, int patches, std::uint32_t see
                 static_cast<double>(x[static_cast<std::size_t>(patch) * d + row]) + position;
         }
     }
-    DBuf dtable = to_device_bf16(table);
-    DBuf dx     = to_device_bf16(x);
-    DBuf di     = to_device_i32(indices);
-    DBuf dw     = to_device_f32(weights);
+    DeviceBuffer dtable = to_device_bf16(table);
+    DeviceBuffer dx     = to_device_bf16(x);
+    DeviceBuffer di     = to_device_i32(indices);
+    DeviceBuffer dw     = to_device_f32(weights);
     Tensor ttable(dtable.p, DType::BF16, {d, rows});
     Tensor tx(dx.p, DType::BF16, {d, patches});
     Tensor ti(di.p, DType::I32, {4, patches});

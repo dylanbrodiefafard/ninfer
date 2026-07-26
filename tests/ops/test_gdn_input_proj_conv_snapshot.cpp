@@ -30,19 +30,19 @@ std::vector<std::int32_t> sampled_rows(std::int32_t rows) {
     return result;
 }
 
-DBuf to_device_bits(const std::vector<std::uint16_t>& bits) {
-    DBuf device(bits.size() * sizeof(std::uint16_t));
+DeviceBuffer to_device_bits(const std::vector<std::uint16_t>& bits) {
+    DeviceBuffer device(bits.size() * sizeof(std::uint16_t));
     cudaMemcpy(device.p, bits.data(), device.bytes, cudaMemcpyHostToDevice);
     return device;
 }
 
-std::vector<std::uint16_t> from_device_bits(const DBuf& device, std::size_t count) {
+std::vector<std::uint16_t> from_device_bits(const DeviceBuffer& device, std::size_t count) {
     std::vector<std::uint16_t> bits(count);
     cudaMemcpy(bits.data(), device.p, bits.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost);
     return bits;
 }
 
-std::vector<double> from_device_values(const DBuf& device, std::size_t count) {
+std::vector<double> from_device_values(const DeviceBuffer& device, std::size_t count) {
     const auto bits = from_device_bits(device, count);
     std::vector<double> values(count);
     for (std::size_t i = 0; i < count; ++i) values[i] = bf16_to_f32(bits[i]);
@@ -158,9 +158,9 @@ int verify_written_slots(const char* label, const std::vector<std::uint16_t>& st
     return 0;
 }
 
-void poison_bf16(DBuf& buffer) { cudaMemset(buffer.p, 0xff, buffer.bytes); }
+void poison_bf16(DeviceBuffer& buffer) { cudaMemset(buffer.p, 0xff, buffer.bytes); }
 
-int verify_fully_written(const char* label, const DBuf& output, std::size_t elements) {
+int verify_fully_written(const char* label, const DeviceBuffer& output, std::size_t elements) {
     const auto bits = from_device_bits(output, elements);
     for (std::size_t i = 0; i < bits.size(); ++i) {
         if (!std::isfinite(bf16_to_f32(bits[i]))) {
@@ -197,10 +197,11 @@ int one_w8(std::int32_t tokens, std::int32_t initial_slot) {
     round_to_bf16(conv_weight);
     const auto states = make_states(kChannels, initial_slot);
 
-    DBuf dx = to_device_bf16(x), dp(packed.payload.size()), dw = to_device_bf16(conv_weight),
-         ds = to_device_bits(states), di = to_device_i32({initial_slot});
+    DeviceBuffer dx = to_device_bf16(x), dp(packed.payload.size()),
+                 dw = to_device_bf16(conv_weight), ds = to_device_bits(states),
+                 di = to_device_i32({initial_slot});
     cudaMemcpy(dp.p, packed.payload.data(), packed.payload.size(), cudaMemcpyHostToDevice);
-    DBuf dq(static_cast<std::size_t>(kQueryRows) * tokens * 2),
+    DeviceBuffer dq(static_cast<std::size_t>(kQueryRows) * tokens * 2),
         dk(static_cast<std::size_t>(kKeyRows) * tokens * 2),
         dv(static_cast<std::size_t>(kValueRows) * tokens * 2),
         dz(static_cast<std::size_t>(kValueRows) * tokens * 2);
@@ -294,12 +295,12 @@ int one_q4_q5(std::int32_t tokens, std::int32_t initial_slot) {
     round_to_bf16(conv_weight);
     const auto states = make_states(kChannels, initial_slot);
 
-    DBuf dx = to_device_bf16(x), dqk(qk.payload.size()), dvv(vv.payload.size()),
-         dw = to_device_bf16(conv_weight), ds = to_device_bits(states),
-         di = to_device_i32({initial_slot});
+    DeviceBuffer dx = to_device_bf16(x), dqk(qk.payload.size()), dvv(vv.payload.size()),
+                 dw = to_device_bf16(conv_weight), ds = to_device_bits(states),
+                 di = to_device_i32({initial_slot});
     cudaMemcpy(dqk.p, qk.payload.data(), qk.payload.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(dvv.p, vv.payload.data(), vv.payload.size(), cudaMemcpyHostToDevice);
-    DBuf dq(static_cast<std::size_t>(kQueryRows) * tokens * 2),
+    DeviceBuffer dq(static_cast<std::size_t>(kQueryRows) * tokens * 2),
         dk(static_cast<std::size_t>(kKeyRows) * tokens * 2),
         dv(static_cast<std::size_t>(kValueRows) * tokens * 2);
     poison_bf16(dq);

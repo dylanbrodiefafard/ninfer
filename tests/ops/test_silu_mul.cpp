@@ -34,7 +34,8 @@ static int one_shape(const char* tag, int n, std::uint32_t seed, float lo, float
     std::vector<double> ref(n);
     cpu_silu_and_mul(g, u, ref);
 
-    DBuf dg = to_device_bf16(g), du = to_device_bf16(u), dout(static_cast<std::size_t>(n) * 2);
+    DeviceBuffer dg = to_device_bf16(g), du = to_device_bf16(u),
+                 dout(static_cast<std::size_t>(n) * 2);
     Tensor tg(dg.p, DType::BF16, {n}), tu(du.p, DType::BF16, {n}), tout(dout.p, DType::BF16, {n});
     ops::silu_mul(tg, tu, tout, nullptr);
     cudaDeviceSynchronize();
@@ -42,11 +43,11 @@ static int one_shape(const char* tag, int n, std::uint32_t seed, float lo, float
     return verify(tag, from_device_bf16(dout, n), ref, Tolerance::bf16_elementwise());
 }
 
-static DBuf to_device_bf16_unaligned(const std::vector<float>& h) {
+static DeviceBuffer to_device_bf16_unaligned(const std::vector<float>& h) {
     std::vector<std::uint16_t> b(h.size() + 1);
     b[0] = 0;
     for (std::size_t i = 0; i < h.size(); ++i) b[i + 1] = f32_to_bf16(h[i]);
-    DBuf d(b.size() * 2);
+    DeviceBuffer d(b.size() * 2);
     cudaMemcpy(d.p, b.data(), b.size() * 2, cudaMemcpyHostToDevice);
     return d;
 }
@@ -62,8 +63,8 @@ static int unaligned_data_case() {
     std::vector<double> ref(n);
     cpu_silu_and_mul(g, u, ref);
 
-    DBuf dg = to_device_bf16_unaligned(g), du = to_device_bf16_unaligned(u),
-         dout(static_cast<std::size_t>(n + 1) * 2);
+    DeviceBuffer dg = to_device_bf16_unaligned(g), du = to_device_bf16_unaligned(u),
+                 dout(static_cast<std::size_t>(n + 1) * 2);
     auto* gptr = static_cast<unsigned char*>(dg.p) + 2;
     auto* uptr = static_cast<unsigned char*>(du.p) + 2;
     auto* optr = static_cast<unsigned char*>(dout.p) + 2;
@@ -71,7 +72,7 @@ static int unaligned_data_case() {
     ops::silu_mul(tg, tu, tout, nullptr);
     cudaDeviceSynchronize();
 
-    DBuf packed(static_cast<std::size_t>(n) * 2);
+    DeviceBuffer packed(static_cast<std::size_t>(n) * 2);
     cudaMemcpy(packed.p, optr, static_cast<std::size_t>(n) * 2, cudaMemcpyDeviceToDevice);
     return verify("silu unaligned data", from_device_bf16(packed, n), ref,
                   Tolerance::bf16_elementwise());
@@ -99,7 +100,7 @@ static int strided_gate_up_view_case() {
     std::vector<double> ref(n);
     cpu_silu_and_mul(g, u, ref);
 
-    DBuf dfused = to_device_bf16(fused), dout(static_cast<std::size_t>(n) * 2);
+    DeviceBuffer dfused = to_device_bf16(fused), dout(static_cast<std::size_t>(n) * 2);
     Tensor tfused(dfused.p, DType::BF16, {2 * intermediate, T});
     Tensor tg = tfused.slice(0, 0, intermediate);
     Tensor tu = tfused.slice(0, intermediate, intermediate);

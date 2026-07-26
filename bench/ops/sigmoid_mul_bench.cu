@@ -52,8 +52,8 @@ std::vector<int> parse_tokens(const char* raw) {
 void run(int tokens, bool control, int candidate_block) {
     constexpr int d     = 4096;
     const std::size_t n = static_cast<std::size_t>(d) * static_cast<std::size_t>(tokens);
-    DBuf gate           = make_bf16(n);
-    DBuf x              = make_bf16(n);
+    DeviceBuffer gate   = make_bf16(n);
+    DeviceBuffer x      = make_bf16(n);
     Tensor tgate(gate.p, DType::BF16, {256, 16, tokens});
     Tensor tx(x.p, DType::BF16, {256, 16, tokens});
 

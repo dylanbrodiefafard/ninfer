@@ -31,9 +31,9 @@ int scatter_case(std::int32_t d, const std::vector<int>& indices, std::int32_t d
         }
     }
 
-    DBuf device_source(source.size() * sizeof(std::uint16_t));
-    DBuf device_destination(destination.size() * sizeof(std::uint16_t));
-    DBuf device_indices = to_device_i32(indices);
+    DeviceBuffer device_source(source.size() * sizeof(std::uint16_t));
+    DeviceBuffer device_destination(destination.size() * sizeof(std::uint16_t));
+    DeviceBuffer device_indices = to_device_i32(indices);
     cudaMemcpy(device_source.p, source.data(), device_source.bytes, cudaMemcpyHostToDevice);
     cudaMemcpy(device_destination.p, destination.data(), device_destination.bytes,
                cudaMemcpyHostToDevice);
@@ -73,8 +73,8 @@ int extract_case(std::int32_t source_rows, std::int32_t columns, std::int32_t de
         }
     }
 
-    DBuf device_source(source.size() * sizeof(std::uint16_t));
-    DBuf device_destination(reference.size() * sizeof(std::uint16_t));
+    DeviceBuffer device_source(source.size() * sizeof(std::uint16_t));
+    DeviceBuffer device_destination(reference.size() * sizeof(std::uint16_t));
     cudaMemcpy(device_source.p, source.data(), device_source.bytes, cudaMemcpyHostToDevice);
     cudaMemset(device_destination.p, 0xa5, device_destination.bytes);
     Tensor source_tensor(device_source.p, DType::BF16, {source_rows, columns});

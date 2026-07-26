@@ -36,7 +36,7 @@ static int one_shape(const char* tag, std::int32_t d0, std::int32_t d1, std::uin
     std::vector<double> ref(n);
     cpu_sigmoid_gate_mul(gate, x, ref);
 
-    DBuf dgate = to_device_bf16(gate), dx = to_device_bf16(x);
+    DeviceBuffer dgate = to_device_bf16(gate), dx = to_device_bf16(x);
     Tensor tgate(dgate.p, DType::BF16, {d0, d1}), tx(dx.p, DType::BF16, {d0, d1});
     ops::sigmoid_mul(tgate, tx, nullptr);
     cudaDeviceSynchronize();
@@ -54,7 +54,7 @@ static int one_shape_1d(const char* tag, std::int32_t n, std::uint32_t seed, flo
     std::vector<double> ref(n);
     cpu_sigmoid_gate_mul(gate, x, ref);
 
-    DBuf dgate = to_device_bf16(gate), dx = to_device_bf16(x);
+    DeviceBuffer dgate = to_device_bf16(gate), dx = to_device_bf16(x);
     Tensor tgate(dgate.p, DType::BF16, {n}), tx(dx.p, DType::BF16, {n});
     ops::sigmoid_mul(tgate, tx, nullptr);
     cudaDeviceSynchronize();
@@ -62,11 +62,11 @@ static int one_shape_1d(const char* tag, std::int32_t n, std::uint32_t seed, flo
     return verify(tag, from_device_bf16(dx, n), ref, Tolerance::bf16_elementwise());
 }
 
-static DBuf to_device_bf16_unaligned(const std::vector<float>& h) {
+static DeviceBuffer to_device_bf16_unaligned(const std::vector<float>& h) {
     std::vector<std::uint16_t> b(h.size() + 1);
     b[0] = 0;
     for (std::size_t i = 0; i < h.size(); ++i) b[i + 1] = f32_to_bf16(h[i]);
-    DBuf d(b.size() * 2);
+    DeviceBuffer d(b.size() * 2);
     cudaMemcpy(d.p, b.data(), b.size() * 2, cudaMemcpyHostToDevice);
     return d;
 }
@@ -82,14 +82,14 @@ static int unaligned_data_case() {
     std::vector<double> ref(n);
     cpu_sigmoid_gate_mul(gate, x, ref);
 
-    DBuf dgate = to_device_bf16_unaligned(gate), dx = to_device_bf16_unaligned(x);
+    DeviceBuffer dgate = to_device_bf16_unaligned(gate), dx = to_device_bf16_unaligned(x);
     auto* gptr = static_cast<unsigned char*>(dgate.p) + 2;
     auto* xptr = static_cast<unsigned char*>(dx.p) + 2;
     Tensor tgate(gptr, DType::BF16, {n}), tx(xptr, DType::BF16, {n});
     ops::sigmoid_mul(tgate, tx, nullptr);
     cudaDeviceSynchronize();
 
-    DBuf packed(static_cast<std::size_t>(n) * 2);
+    DeviceBuffer packed(static_cast<std::size_t>(n) * 2);
     cudaMemcpy(packed.p, xptr, static_cast<std::size_t>(n) * 2, cudaMemcpyDeviceToDevice);
     return verify("sigmoid_mul unaligned data", from_device_bf16(packed, n), ref,
                   Tolerance::bf16_elementwise());

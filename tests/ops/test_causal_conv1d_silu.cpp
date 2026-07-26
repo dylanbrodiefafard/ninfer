@@ -107,8 +107,8 @@ static int one_prefill_shape(const char* tag, std::int32_t C, std::int32_t T, st
     std::vector<double> ref_out(n), ref_state(state_n);
     cpu_prefill_ref(x, weight, state, C, T, ref_out, ref_state);
 
-    DBuf dx = to_device_bf16(x), dw = to_device_bf16(weight), dstate = to_device_bf16(state),
-         dout(n * 2);
+    DeviceBuffer dx = to_device_bf16(x), dw = to_device_bf16(weight),
+                 dstate = to_device_bf16(state), dout(n * 2);
     Tensor tx(dx.p, DType::BF16, {C, T});
     Tensor tw(dw.p, DType::BF16, {C, 4});
     Tensor ts(dstate.p, DType::BF16, {C, 3});
@@ -140,8 +140,8 @@ static int one_decode_shape(const char* tag, std::int32_t C, std::uint32_t seed,
     std::vector<double> ref_out(C), ref_state(state_n);
     cpu_decode_ref(x, weight, state, C, ref_out, ref_state);
 
-    DBuf dx = to_device_bf16(x), dw = to_device_bf16(weight), dstate = to_device_bf16(state),
-         dout(static_cast<std::size_t>(C) * 2u);
+    DeviceBuffer dx = to_device_bf16(x), dw = to_device_bf16(weight),
+                 dstate = to_device_bf16(state), dout(static_cast<std::size_t>(C) * 2u);
     Tensor tx(dx.p, DType::BF16, {C, 1});
     Tensor tw(dw.p, DType::BF16, {C, 4});
     Tensor ts(dstate.p, DType::BF16, {C, 3});
@@ -172,8 +172,8 @@ static int decode_chain_equivalence(std::uint32_t seed) {
     round_to_bf16(weight);
     round_to_bf16(state);
 
-    DBuf dx_prefill = to_device_bf16(x), dw_prefill = to_device_bf16(weight),
-         dstate_prefill = to_device_bf16(state), dout_prefill(n * 2);
+    DeviceBuffer dx_prefill = to_device_bf16(x), dw_prefill = to_device_bf16(weight),
+                 dstate_prefill = to_device_bf16(state), dout_prefill(n * 2);
     Tensor tx_prefill(dx_prefill.p, DType::BF16, {C, T});
     Tensor tw_prefill(dw_prefill.p, DType::BF16, {C, 4});
     Tensor ts_prefill(dstate_prefill.p, DType::BF16, {C, 3});
@@ -181,8 +181,8 @@ static int decode_chain_equivalence(std::uint32_t seed) {
     ops::causal_conv1d_silu(tx_prefill, tw_prefill, ts_prefill, tout_prefill, nullptr);
     cudaDeviceSynchronize();
 
-    DBuf dx_decode = to_device_bf16(x), dw_decode = to_device_bf16(weight),
-         dstate_decode = to_device_bf16(state), dout_decode(n * 2);
+    DeviceBuffer dx_decode = to_device_bf16(x), dw_decode = to_device_bf16(weight),
+                 dstate_decode = to_device_bf16(state), dout_decode(n * 2);
     Tensor tw_decode(dw_decode.p, DType::BF16, {C, 4});
     Tensor ts_decode(dstate_decode.p, DType::BF16, {C, 3});
     for (std::int32_t t = 0; t < T; ++t) {
@@ -238,9 +238,9 @@ static int snapshot_oracle_case(std::uint32_t seed, std::int32_t T, float lo = -
         }
     }
 
-    DBuf dx_snapshot = to_device_bf16(x), dw_snapshot = to_device_bf16(weight),
-         dstates_snapshot = to_device_bf16(snapshot_state), dout_snapshot(n * 2),
-         dinitial_slot    = to_device_i32({0});
+    DeviceBuffer dx_snapshot = to_device_bf16(x), dw_snapshot = to_device_bf16(weight),
+                 dstates_snapshot = to_device_bf16(snapshot_state), dout_snapshot(n * 2),
+                 dinitial_slot    = to_device_i32({0});
     Tensor tx_snapshot(dx_snapshot.p, DType::BF16, {C, T});
     Tensor tw_snapshot(dw_snapshot.p, DType::BF16, {C, 4});
     Tensor ts_snapshot(dstates_snapshot.p, DType::BF16, {C, 3, T});
@@ -300,9 +300,9 @@ static int selected_slot_snapshot_oracle(std::uint32_t seed, std::int32_t C, std
         }
     }
 
-    DBuf dx_snapshot = to_device_bf16(x), dw_snapshot = to_device_bf16(weight),
-         dstates_snapshot = to_device_bf16(snapshot_state), dout_snapshot(n * 2),
-         dinitial_slot    = to_device_i32({initial_slot});
+    DeviceBuffer dx_snapshot = to_device_bf16(x), dw_snapshot = to_device_bf16(weight),
+                 dstates_snapshot = to_device_bf16(snapshot_state), dout_snapshot(n * 2),
+                 dinitial_slot    = to_device_i32({initial_slot});
     Tensor tx_snapshot(dx_snapshot.p, DType::BF16, {C, T});
     Tensor tw_snapshot(dw_snapshot.p, DType::BF16, {C, 4});
     Tensor ts_snapshot(dstates_snapshot.p, DType::BF16, {C, 3, slots});
@@ -337,8 +337,8 @@ static int prefill_state_carry_equivalence(std::uint32_t seed, std::int32_t C, s
     round_to_bf16(weight);
     round_to_bf16(state);
 
-    DBuf dx_whole = to_device_bf16(x), dw_whole = to_device_bf16(weight),
-         dstate_whole = to_device_bf16(state), dout_whole(n * 2);
+    DeviceBuffer dx_whole = to_device_bf16(x), dw_whole = to_device_bf16(weight),
+                 dstate_whole = to_device_bf16(state), dout_whole(n * 2);
     Tensor tx_whole(dx_whole.p, DType::BF16, {C, T});
     Tensor tw_whole(dw_whole.p, DType::BF16, {C, 4});
     Tensor ts_whole(dstate_whole.p, DType::BF16, {C, 3});
@@ -346,8 +346,8 @@ static int prefill_state_carry_equivalence(std::uint32_t seed, std::int32_t C, s
     ops::causal_conv1d_silu(tx_whole, tw_whole, ts_whole, tout_whole, nullptr);
     cudaDeviceSynchronize();
 
-    DBuf dx_split = to_device_bf16(x), dw_split = to_device_bf16(weight),
-         dstate_split = to_device_bf16(state), dout_split(n * 2);
+    DeviceBuffer dx_split = to_device_bf16(x), dw_split = to_device_bf16(weight),
+                 dstate_split = to_device_bf16(state), dout_split(n * 2);
     Tensor tx_split(dx_split.p, DType::BF16, {C, T});
     Tensor tw_split(dw_split.p, DType::BF16, {C, 4});
     Tensor ts_split(dstate_split.p, DType::BF16, {C, 3});
@@ -395,8 +395,8 @@ static int prefill_from_slot_oracle(std::uint32_t seed, std::int32_t C, std::int
         ref_state_bits[i] = f32_to_bf16(static_cast<float>(ref_state[i]));
     }
 
-    DBuf fx = to_device_bf16(x), fw = to_device_bf16(weight), fout(n * 2);
-    DBuf fstates(state_n * static_cast<std::size_t>(slots) * 2u);
+    DeviceBuffer fx = to_device_bf16(x), fw = to_device_bf16(weight), fout(n * 2);
+    DeviceBuffer fstates(state_n * static_cast<std::size_t>(slots) * 2u);
     cudaMemset(fstates.p, 0, fstates.bytes);
     std::vector<std::uint16_t> state_bits(state_n);
     for (std::size_t i = 0; i < state_n; ++i) { state_bits[i] = f32_to_bf16(state[i]); }
@@ -461,8 +461,8 @@ static int validation_checks() {
     round_to_bf16(x_h);
     round_to_bf16(w_h);
     round_to_bf16(s_h);
-    DBuf dx = to_device_bf16(x_h), dw = to_device_bf16(w_h), dstate = to_device_bf16(s_h),
-         dout(n * 2);
+    DeviceBuffer dx = to_device_bf16(x_h), dw = to_device_bf16(w_h), dstate = to_device_bf16(s_h),
+                 dout(n * 2);
     Tensor x(dx.p, DType::BF16, {C, T});
     Tensor weight(dw.p, DType::BF16, {C, 4});
     Tensor state(dstate.p, DType::BF16, {C, 3});
@@ -515,13 +515,13 @@ static int validation_checks() {
     });
     f += expect_invalid("causal_conv1d validation snapshot T exceeds slots", [&] {
         Tensor bad_state(dstate.p, DType::BF16, {C, 3, T - 1});
-        DBuf d_initial_slot = to_device_i32({0});
+        DeviceBuffer d_initial_slot = to_device_i32({0});
         Tensor initial_slot(d_initial_slot.p, DType::I32, {1});
         ops::causal_conv1d_silu_snapshot(x, weight, bad_state, initial_slot, out, nullptr);
     });
     f += expect_invalid("causal_conv1d validation snapshot initial_slot dtype", [&] {
         Tensor snapshot_state(dstate.p, DType::BF16, {C, 3, T});
-        DBuf d_initial_slot(sizeof(std::int32_t));
+        DeviceBuffer d_initial_slot(sizeof(std::int32_t));
         Tensor initial_slot(d_initial_slot.p, DType::FP32, {1});
         ops::causal_conv1d_silu_snapshot(x, weight, snapshot_state, initial_slot, out, nullptr);
     });

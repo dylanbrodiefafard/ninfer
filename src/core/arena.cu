@@ -53,6 +53,72 @@ void free_pinned(void*& ptr) noexcept {
 
 } // namespace
 
+DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
+    if (bytes == 0) { return; }
+
+    void* ptr             = nullptr;
+    const cudaError_t err = cudaMalloc(&ptr, bytes);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
+    }
+    p = ptr;
+}
+
+DeviceBuffer::~DeviceBuffer() { free_device(p); }
+
+DeviceBuffer::DeviceBuffer(DeviceBuffer&& other) noexcept : p(other.p), bytes(other.bytes) {
+    other.p     = nullptr;
+    other.bytes = 0;
+}
+
+DeviceBuffer& DeviceBuffer::operator=(DeviceBuffer&& other) noexcept {
+    if (this == &other) { return *this; }
+
+    free_device(p);
+    p     = other.p;
+    bytes = other.bytes;
+
+    other.p     = nullptr;
+    other.bytes = 0;
+    return *this;
+}
+
+void DeviceBuffer::fill(int byte_value) {
+    if (bytes == 0) { return; }
+    const cudaError_t err = cudaMemset(p, byte_value, bytes);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaMemset failed", err));
+    }
+}
+
+void DeviceBuffer::copy_from_host(const void* source, std::size_t count, std::size_t byte_offset) {
+    require_range(byte_offset, count, "host-to-device copy");
+    if (count == 0) { return; }
+    void* destination     = static_cast<std::uint8_t*>(p) + byte_offset;
+    const cudaError_t err = cudaMemcpy(destination, source, count, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaMemcpy host-to-device failed", err));
+    }
+}
+
+void DeviceBuffer::copy_to_host(void* destination, std::size_t count,
+                                std::size_t byte_offset) const {
+    require_range(byte_offset, count, "device-to-host copy");
+    if (count == 0) { return; }
+    const void* source    = static_cast<const std::uint8_t*>(p) + byte_offset;
+    const cudaError_t err = cudaMemcpy(destination, source, count, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaMemcpy device-to-host failed", err));
+    }
+}
+
+void DeviceBuffer::require_range(std::size_t byte_offset, std::size_t count,
+                                 const char* operation) const {
+    if (byte_offset > bytes || count > bytes - byte_offset) {
+        throw std::out_of_range(std::string(operation) + " exceeds device buffer");
+    }
+}
+
 DeviceArena::Scope::Scope(DeviceArena& arena) noexcept
     : arena_(&arena), saved_offset_(arena.off_) {}
 

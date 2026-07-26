@@ -31,13 +31,13 @@ int main() {
     }
     round_to_bf16(token_embeddings);
     round_to_bf16(visual_embeddings);
-    DBuf dvisual = to_device_bf16(visual_embeddings);
+    DeviceBuffer dvisual = to_device_bf16(visual_embeddings);
     Tensor visual(dvisual.p, DType::BF16, {d, v});
     const std::vector<std::int32_t> scatter_indices{2, 4, 7};
     WorkspaceArena work(1ULL << 20);
 
     auto run = [&](std::int32_t prompt_tokens, const char* label) {
-        DBuf dinput = to_device_bf16(token_embeddings);
+        DeviceBuffer dinput = to_device_bf16(token_embeddings);
         Tensor input(dinput.p, DType::BF16, {d, t});
         work.reset();
         const auto window = targets::qwen3_6::plan_mtp_alignment_window(

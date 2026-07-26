@@ -37,10 +37,10 @@ __global__ void layer_norm_payload_control(const __nv_bfloat162* x, const __nv_b
 void run(int patches, bool control) {
     constexpr int d     = 1152;
     const std::size_t n = static_cast<std::size_t>(d) * static_cast<std::size_t>(patches);
-    DBuf x              = make_bf16(n);
-    DBuf weight         = make_bf16(d);
-    DBuf bias           = make_bf16(d);
-    DBuf out            = make_zeros(n * 2);
+    DeviceBuffer x      = make_bf16(n);
+    DeviceBuffer weight = make_bf16(d);
+    DeviceBuffer bias   = make_bf16(d);
+    DeviceBuffer out    = make_zeros(n * 2);
     Tensor tx(x.p, DType::BF16, {d, patches});
     Tensor tw(weight.p, DType::BF16, {d});
     Tensor tb(bias.p, DType::BF16, {d});

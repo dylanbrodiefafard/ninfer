@@ -40,12 +40,12 @@ constexpr std::uint64_t kScalePlaneBytes =
     static_cast<std::uint64_t>(kVocab) * static_cast<std::uint64_t>(kKg) * 2ULL;
 constexpr std::uint64_t kPayloadBytes = kScalePlaneOffset + kScalePlaneBytes;
 
-DBuf make_ids(std::int32_t t) {
+DeviceBuffer make_ids(std::int32_t t) {
     std::vector<std::int32_t> h(static_cast<std::size_t>(t));
     for (std::int32_t i = 0; i < t; ++i) {
         h[static_cast<std::size_t>(i)] = (i * 9973 + 12345) % kVocab;
     }
-    DBuf d(h.size() * sizeof(std::int32_t));
+    DeviceBuffer d(h.size() * sizeof(std::int32_t));
     cudaMemcpy(d.p, h.data(), d.bytes, cudaMemcpyHostToDevice);
     return d;
 }
@@ -93,9 +93,9 @@ Weight q6_weight(void* payload) {
 void run(std::int32_t t, const char* tag) {
     const std::size_t out_elems = static_cast<std::size_t>(kQ6D) * static_cast<std::size_t>(t);
 
-    DBuf payload(kPayloadBytes);
-    DBuf ids = make_ids(t);
-    DBuf out = make_zeros(out_elems * sizeof(std::uint16_t));
+    DeviceBuffer payload(kPayloadBytes);
+    DeviceBuffer ids = make_ids(t);
+    DeviceBuffer out = make_zeros(out_elems * sizeof(std::uint16_t));
 
     // Deterministic nonzero ROW_SPLIT bytes. Correctness values do not
     // matter for this bandwidth bench; tests cover signed LSB-first semantics.
@@ -188,7 +188,7 @@ Weight w8_weight(void* payload) {
     return w;
 }
 
-Result bench_cold_graph(const launch_fn& launch, double bytes, DBuf& flush, int warmup,
+Result bench_cold_graph(const launch_fn& launch, double bytes, DeviceBuffer& flush, int warmup,
                         int repeat) {
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -241,12 +241,12 @@ Result bench_cold_graph(const launch_fn& launch, double bytes, DBuf& flush, int 
     return result;
 }
 
-void run_w8(std::int32_t t, bool control, ops::detail::W8EmbedRoute route, DBuf* flush, int warmup,
-            int repeat) {
+void run_w8(std::int32_t t, bool control, ops::detail::W8EmbedRoute route, DeviceBuffer* flush,
+            int warmup, int repeat) {
     const std::size_t out_elems = static_cast<std::size_t>(kW8D) * static_cast<std::size_t>(t);
-    DBuf payload(kW8PayloadBytes);
-    DBuf ids = make_ids(t);
-    DBuf out = make_zeros(out_elems * sizeof(std::uint16_t));
+    DeviceBuffer payload(kW8PayloadBytes);
+    DeviceBuffer ids = make_ids(t);
+    DeviceBuffer out = make_zeros(out_elems * sizeof(std::uint16_t));
     CUDA_CHECK(cudaMemset(payload.p, 0x3c, payload.bytes));
 
     Weight table = w8_weight(payload.p);
@@ -343,8 +343,8 @@ int main(int argc, char** argv) {
     if (q6 && cold_graph) {
         throw std::invalid_argument("--cold-graph qualification is available for --w8");
     }
-    DBuf flush(cold_graph ? 256ULL << 20 : 1);
-    DBuf* flush_ptr = cold_graph ? &flush : nullptr;
+    DeviceBuffer flush(cold_graph ? 256ULL << 20 : 1);
+    DeviceBuffer* flush_ptr = cold_graph ? &flush : nullptr;
 
     if (q6 && decode) run(1, "embedding q6 [248320,5120] T=1");
     if (q6 && prefill) run(64, "embedding q6 [248320,5120] T=64");

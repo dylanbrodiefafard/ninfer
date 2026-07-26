@@ -36,7 +36,7 @@ std::vector<int> parse_tokens(const char* raw) {
     return values;
 }
 
-Result bench_cold_graph(const launch_fn& launch, double bytes, DBuf& flush, int warmup,
+Result bench_cold_graph(const launch_fn& launch, double bytes, DeviceBuffer& flush, int warmup,
                         int repeat) {
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -89,12 +89,12 @@ Result bench_cold_graph(const launch_fn& launch, double bytes, DBuf& flush, int 
     return result;
 }
 
-void run(int tokens, int candidate_block, DBuf* flush, int warmup, int repeat) {
+void run(int tokens, int candidate_block, DeviceBuffer* flush, int warmup, int repeat) {
     std::vector<std::int32_t> host(static_cast<std::size_t>(tokens));
     for (int i = 0; i < tokens; ++i) { host[static_cast<std::size_t>(i)] = 262144 - tokens + i; }
-    DBuf source(host.size() * sizeof(std::int32_t));
-    DBuf delta(sizeof(std::int32_t));
-    DBuf destination(host.size() * sizeof(std::int32_t));
+    DeviceBuffer source(host.size() * sizeof(std::int32_t));
+    DeviceBuffer delta(sizeof(std::int32_t));
+    DeviceBuffer destination(host.size() * sizeof(std::int32_t));
     const std::int32_t delta_value = -17;
     cudaMemcpy(source.p, host.data(), source.bytes, cudaMemcpyHostToDevice);
     cudaMemcpy(delta.p, &delta_value, sizeof(delta_value), cudaMemcpyHostToDevice);
@@ -159,8 +159,8 @@ int main(int argc, char** argv) {
     if (warmup < 0 || repeat <= 0) {
         throw std::invalid_argument("--warmup must be nonnegative and --repeat positive");
     }
-    DBuf flush(cold_graph ? 256ULL << 20 : 1);
-    DBuf* flush_ptr = cold_graph ? &flush : nullptr;
+    DeviceBuffer flush(cold_graph ? 256ULL << 20 : 1);
+    DeviceBuffer* flush_ptr = cold_graph ? &flush : nullptr;
     for (const int value : tokens) { run(value, candidate_block, flush_ptr, warmup, repeat); }
     return 0;
 }

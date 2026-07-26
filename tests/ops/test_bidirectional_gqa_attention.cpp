@@ -100,7 +100,8 @@ void fp64_oracle(const std::vector<float>& q, const std::vector<float>& query_k,
     }
 }
 
-KVCacheLayerView make_context_view(DBuf& dk, DBuf& dv, int max_context, int padded_context) {
+KVCacheLayerView make_context_view(DeviceBuffer& dk, DeviceBuffer& dv, int max_context,
+                                   int padded_context) {
     return {
         .k              = Tensor(dk.p, DType::BF16, {kD, padded_context, kKVHeads}),
         .v              = Tensor(dv.p, DType::BF16, {kD, padded_context, kKVHeads}),
@@ -145,12 +146,12 @@ int run_case(int tokens, int context_length, bool capture_graph, bool check_immu
     fp64_oracle(q, query_k, query_v, context_k, context_v, tokens, context_length, padded_context,
                 reference);
 
-    DBuf dq      = to_device_bf16(q);
-    DBuf dqk     = to_device_bf16(query_k);
-    DBuf dqv     = to_device_bf16(query_v);
-    DBuf dck     = to_device_bf16(context_k);
-    DBuf dcv     = to_device_bf16(context_v);
-    DBuf dlength = to_device_i32(std::vector<int>{context_length});
+    DeviceBuffer dq      = to_device_bf16(q);
+    DeviceBuffer dqk     = to_device_bf16(query_k);
+    DeviceBuffer dqv     = to_device_bf16(query_v);
+    DeviceBuffer dck     = to_device_bf16(context_k);
+    DeviceBuffer dcv     = to_device_bf16(context_v);
+    DeviceBuffer dlength = to_device_i32(std::vector<int>{context_length});
     GuardedDBuf dout(qn * sizeof(std::uint16_t));
     dout.fill(0x7f);
 
@@ -263,13 +264,13 @@ int all_query_rows_visible_case() {
         for (int d = 0; d < kD; ++d) { query_v[query_kv_index(d, kv_head, tokens - 1)] = 1.0f; }
     }
 
-    DBuf dq      = to_device_bf16(q);
-    DBuf dqk     = to_device_bf16(query_k);
-    DBuf dqv     = to_device_bf16(query_v);
-    DBuf dck     = to_device_bf16(context_k);
-    DBuf dcv     = to_device_bf16(context_v);
-    DBuf dlength = to_device_i32(std::vector<int>{context_length});
-    DBuf dout(qn * sizeof(std::uint16_t));
+    DeviceBuffer dq      = to_device_bf16(q);
+    DeviceBuffer dqk     = to_device_bf16(query_k);
+    DeviceBuffer dqv     = to_device_bf16(query_v);
+    DeviceBuffer dck     = to_device_bf16(context_k);
+    DeviceBuffer dcv     = to_device_bf16(context_v);
+    DeviceBuffer dlength = to_device_i32(std::vector<int>{context_length});
+    DeviceBuffer dout(qn * sizeof(std::uint16_t));
     dout.fill(0x55);
     Tensor tq(dq.p, DType::BF16, {kD, kQHeads, tokens});
     Tensor tqk(dqk.p, DType::BF16, {kD, kKVHeads, tokens});
@@ -302,14 +303,14 @@ int maximum_envelope_case(int tokens) {
     std::vector<float> q(qn, 0.0f);
     std::vector<float> query_k(qkvn, 0.0f);
     std::vector<float> query_v(qkvn, 1.0f);
-    DBuf dq  = to_device_bf16(q);
-    DBuf dqk = to_device_bf16(query_k);
-    DBuf dqv = to_device_bf16(query_v);
-    DBuf dck(cache_n * sizeof(std::uint16_t));
-    DBuf dcv(cache_n * sizeof(std::uint16_t));
+    DeviceBuffer dq  = to_device_bf16(q);
+    DeviceBuffer dqk = to_device_bf16(query_k);
+    DeviceBuffer dqv = to_device_bf16(query_v);
+    DeviceBuffer dck(cache_n * sizeof(std::uint16_t));
+    DeviceBuffer dcv(cache_n * sizeof(std::uint16_t));
     dck.fill();
     dcv.fill();
-    DBuf dlength = to_device_i32(std::vector<int>{context_length});
+    DeviceBuffer dlength = to_device_i32(std::vector<int>{context_length});
     GuardedDBuf dout(qn * sizeof(std::uint16_t));
     dout.fill(0x5a);
 

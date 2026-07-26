@@ -420,16 +420,16 @@ std::size_t cache_arena_bytes(std::uint32_t layers, std::int32_t max_context, DT
     return static_cast<std::size_t>(layers) * 2u * (layer_bytes + 255u) + 4096u;
 }
 
-DBuf make_i32(std::int32_t value) {
-    DBuf d(sizeof(std::int32_t));
+DeviceBuffer make_i32(std::int32_t value) {
+    DeviceBuffer d(sizeof(std::int32_t));
     cudaMemcpy(d.p, &value, sizeof(std::int32_t), cudaMemcpyHostToDevice);
     return d;
 }
 
-DBuf make_i32_sequence(std::int32_t start, std::int32_t count) {
+DeviceBuffer make_i32_sequence(std::int32_t start, std::int32_t count) {
     std::vector<std::int32_t> values(static_cast<std::size_t>(count));
     for (std::int32_t i = 0; i < count; ++i) { values[static_cast<std::size_t>(i)] = start + i; }
-    DBuf d(values.size() * sizeof(std::int32_t));
+    DeviceBuffer d(values.size() * sizeof(std::int32_t));
     cudaMemcpy(d.p, values.data(), d.bytes, cudaMemcpyHostToDevice);
     return d;
 }
@@ -472,7 +472,7 @@ __global__ void bench_kv_append_i8_payload_control_kernel(
     }
 }
 
-void touch_cold_cache(DBuf& buf, cudaStream_t stream) {
+void touch_cold_cache(DeviceBuffer& buf, cudaStream_t stream) {
     constexpr int kBlock    = 256;
     const std::size_t words = buf.bytes / sizeof(std::uint32_t);
     if (words == 0) { return; }
@@ -482,7 +482,7 @@ void touch_cold_cache(DBuf& buf, cudaStream_t stream) {
     CUDA_CHECK(cudaGetLastError());
 }
 
-Result bench_cold_cache_loop(const launch_fn& launch, DBuf& cold_cache, double bytes_moved,
+Result bench_cold_cache_loop(const launch_fn& launch, DeviceBuffer& cold_cache, double bytes_moved,
                              int warmup = 5, int repeat = 100) {
     cudaStream_t stream = nullptr;
     cudaEvent_t a, b;
@@ -766,7 +766,7 @@ void print_append_prompt_result(const char* tag, const AppendPromptMetrics& m) {
 
 void run_decode(KVCache& kv, WorkspaceArena& ws, const Tensor& q, const Tensor& k, const Tensor& v,
                 Tensor& out, std::int32_t pos_value, std::uint32_t round_robin_layers) {
-    DBuf pos_buf = make_i32(pos_value);
+    DeviceBuffer pos_buf = make_i32(pos_value);
     Tensor pos(pos_buf.p, DType::I32, {1});
 
     const DecodeBytes bytes  = decode_bytes(pos_value, kv.dtype);
@@ -790,8 +790,9 @@ void run_decode(KVCache& kv, WorkspaceArena& ws, const Tensor& q, const Tensor& 
 }
 
 void run_profile_once(KVCache& kv, WorkspaceArena& ws, const Tensor& q, const Tensor& k,
-                      const Tensor& v, Tensor& out, std::int32_t pos_value, DBuf* cold_cache) {
-    DBuf pos_buf = make_i32(pos_value);
+                      const Tensor& v, Tensor& out, std::int32_t pos_value,
+                      DeviceBuffer* cold_cache) {
+    DeviceBuffer pos_buf = make_i32(pos_value);
     Tensor pos(pos_buf.p, DType::I32, {1});
     const DecodeBytes bytes = decode_bytes(pos_value, kv.dtype);
 
@@ -832,11 +833,11 @@ void run_append_small_t(KVCache& kv, std::int32_t tokens, std::int32_t context) 
                            static_cast<std::size_t>(tokens);
     const std::size_t kvn = static_cast<std::size_t>(kHeadDim) *
                             static_cast<std::size_t>(kKVHeads) * static_cast<std::size_t>(tokens);
-    DBuf q   = make_bf16(qn);
-    DBuf k   = make_bf16(kvn);
-    DBuf v   = make_bf16(kvn);
-    DBuf pos = make_i32_sequence(context, tokens);
-    DBuf out = make_zeros(qn * sizeof(std::uint16_t));
+    DeviceBuffer q   = make_bf16(qn);
+    DeviceBuffer k   = make_bf16(kvn);
+    DeviceBuffer v   = make_bf16(kvn);
+    DeviceBuffer pos = make_i32_sequence(context, tokens);
+    DeviceBuffer out = make_zeros(qn * sizeof(std::uint16_t));
     WorkspaceArena ws(small_t_workspace_bytes(tokens));
 
     Tensor tq(q.p, DType::BF16, {kHeadDim, kQHeads, tokens});
@@ -860,16 +861,16 @@ void run_append_small_t(KVCache& kv, std::int32_t tokens, std::int32_t context) 
 }
 
 void run_append_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int32_t context,
-                                     DBuf* cold_cache) {
+                                     DeviceBuffer* cold_cache) {
     const std::size_t qn = static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(kQHeads) *
                            static_cast<std::size_t>(tokens);
     const std::size_t kvn = static_cast<std::size_t>(kHeadDim) *
                             static_cast<std::size_t>(kKVHeads) * static_cast<std::size_t>(tokens);
-    DBuf q   = make_bf16(qn);
-    DBuf k   = make_bf16(kvn);
-    DBuf v   = make_bf16(kvn);
-    DBuf pos = make_i32_sequence(context, tokens);
-    DBuf out = make_zeros(qn * sizeof(std::uint16_t));
+    DeviceBuffer q   = make_bf16(qn);
+    DeviceBuffer k   = make_bf16(kvn);
+    DeviceBuffer v   = make_bf16(kvn);
+    DeviceBuffer pos = make_i32_sequence(context, tokens);
+    DeviceBuffer out = make_zeros(qn * sizeof(std::uint16_t));
     WorkspaceArena ws(small_t_workspace_bytes(tokens));
 
     Tensor tq(q.p, DType::BF16, {kHeadDim, kQHeads, tokens});
@@ -930,9 +931,9 @@ void run_append_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int3
 void run_cached_small_t(KVCache& kv, std::int32_t tokens, std::int32_t context) {
     const std::size_t qn = static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(kQHeads) *
                            static_cast<std::size_t>(tokens);
-    DBuf q   = make_bf16(qn);
-    DBuf pos = make_i32_sequence(context, tokens);
-    DBuf out = make_zeros(qn * sizeof(std::uint16_t));
+    DeviceBuffer q   = make_bf16(qn);
+    DeviceBuffer pos = make_i32_sequence(context, tokens);
+    DeviceBuffer out = make_zeros(qn * sizeof(std::uint16_t));
     WorkspaceArena ws(small_t_workspace_bytes(tokens));
 
     Tensor tq(q.p, DType::BF16, {kHeadDim, kQHeads, tokens});
@@ -954,12 +955,12 @@ void run_cached_small_t(KVCache& kv, std::int32_t tokens, std::int32_t context) 
 }
 
 void run_cached_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int32_t context,
-                                     DBuf* cold_cache) {
+                                     DeviceBuffer* cold_cache) {
     const std::size_t qn = static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(kQHeads) *
                            static_cast<std::size_t>(tokens);
-    DBuf q   = make_bf16(qn);
-    DBuf pos = make_i32_sequence(context, tokens);
-    DBuf out = make_zeros(qn * sizeof(std::uint16_t));
+    DeviceBuffer q   = make_bf16(qn);
+    DeviceBuffer pos = make_i32_sequence(context, tokens);
+    DeviceBuffer out = make_zeros(qn * sizeof(std::uint16_t));
     WorkspaceArena ws(small_t_workspace_bytes(tokens));
 
     Tensor tq(q.p, DType::BF16, {kHeadDim, kQHeads, tokens});
@@ -1002,8 +1003,9 @@ void run_cached_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int3
                 verify_route_ncu_kernel_regex(route, kv.dtype));
 }
 
-void launch_kv_append_control(DType kv_dtype, const DBuf& k, const DBuf& v, DBuf& control_k,
-                              DBuf& control_v, std::int32_t tokens, cudaStream_t stream) {
+void launch_kv_append_control(DType kv_dtype, const DeviceBuffer& k, const DeviceBuffer& v,
+                              DeviceBuffer& control_k, DeviceBuffer& control_v, std::int32_t tokens,
+                              cudaStream_t stream) {
     constexpr int kBlock = 256;
     const int grid       = kv_append_ctas(tokens, kv_dtype);
     if (kv_dtype == DType::I8) {
@@ -1029,13 +1031,13 @@ KvAppendMetrics run_kv_append(KVCache& kv, std::int32_t tokens, std::int32_t con
                               const PrefillTimingOptions& timing) {
     const std::size_t kvn = static_cast<std::size_t>(kHeadDim) *
                             static_cast<std::size_t>(kKVHeads) * static_cast<std::size_t>(tokens);
-    DBuf k   = make_bf16(kvn);
-    DBuf v   = make_bf16(kvn);
-    DBuf pos = make_i32_sequence(context, tokens);
+    DeviceBuffer k   = make_bf16(kvn);
+    DeviceBuffer v   = make_bf16(kvn);
+    DeviceBuffer pos = make_i32_sequence(context, tokens);
     const std::size_t control_bytes =
         kv.dtype == DType::I8 ? kv_append_bytes(tokens, kv.dtype).cache_write / 2u : k.bytes;
-    DBuf control_k = make_zeros(control_bytes);
-    DBuf control_v = make_zeros(control_bytes);
+    DeviceBuffer control_k = make_zeros(control_bytes);
+    DeviceBuffer control_v = make_zeros(control_bytes);
     Tensor tk(k.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
     Tensor tv(v.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
     Tensor tpos(pos.p, DType::I32, {tokens});
@@ -1058,16 +1060,16 @@ KvAppendMetrics run_kv_append(KVCache& kv, std::int32_t tokens, std::int32_t con
 }
 
 void run_kv_append_profile_once(KVCache& kv, std::int32_t tokens, std::int32_t context,
-                                DBuf* cold_cache) {
+                                DeviceBuffer* cold_cache) {
     const std::size_t kvn = static_cast<std::size_t>(kHeadDim) *
                             static_cast<std::size_t>(kKVHeads) * static_cast<std::size_t>(tokens);
-    DBuf k   = make_bf16(kvn);
-    DBuf v   = make_bf16(kvn);
-    DBuf pos = make_i32_sequence(context, tokens);
+    DeviceBuffer k   = make_bf16(kvn);
+    DeviceBuffer v   = make_bf16(kvn);
+    DeviceBuffer pos = make_i32_sequence(context, tokens);
     const std::size_t control_bytes =
         kv.dtype == DType::I8 ? kv_append_bytes(tokens, kv.dtype).cache_write / 2u : k.bytes;
-    DBuf control_k = make_zeros(control_bytes);
-    DBuf control_v = make_zeros(control_bytes);
+    DeviceBuffer control_k = make_zeros(control_bytes);
+    DeviceBuffer control_v = make_zeros(control_bytes);
     Tensor tk(k.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
     Tensor tv(v.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
     Tensor tpos(pos.p, DType::I32, {tokens});
@@ -1102,9 +1104,9 @@ void run_kv_append_profile_once(KVCache& kv, std::int32_t tokens, std::int32_t c
 
 void run_copy_ceiling(std::int32_t tokens, std::int32_t context, DType kv_dtype) {
     const DecodeBytes bytes = append_small_t_bytes(tokens, context, kv_dtype);
-    DBuf src                = make_zeros(bytes.useful_kv);
-    DBuf dst                = make_zeros(bytes.useful_kv);
-    DBuf cold_cache         = make_zeros(kColdCacheBytes);
+    DeviceBuffer src        = make_zeros(bytes.useful_kv);
+    DeviceBuffer dst        = make_zeros(bytes.useful_kv);
+    DeviceBuffer cold_cache = make_zeros(kColdCacheBytes);
 
     const std::size_t words = bytes.useful_kv / sizeof(uint4);
     constexpr int kBlock    = 256;
@@ -1137,11 +1139,11 @@ AppendPromptMetrics run_append_prompt_baseline(KVCache& kv, std::int32_t tokens,
                            static_cast<std::size_t>(tokens);
     const std::size_t kvn = static_cast<std::size_t>(kHeadDim) *
                             static_cast<std::size_t>(kKVHeads) * static_cast<std::size_t>(tokens);
-    DBuf q   = make_bf16(qn);
-    DBuf k   = make_bf16(kvn);
-    DBuf v   = make_bf16(kvn);
-    DBuf pos = make_i32_sequence(context, tokens);
-    DBuf out = make_zeros(qn * sizeof(std::uint16_t));
+    DeviceBuffer q   = make_bf16(qn);
+    DeviceBuffer k   = make_bf16(kvn);
+    DeviceBuffer v   = make_bf16(kvn);
+    DeviceBuffer pos = make_i32_sequence(context, tokens);
+    DeviceBuffer out = make_zeros(qn * sizeof(std::uint16_t));
 
     Tensor tq(q.p, DType::BF16, {kHeadDim, kQHeads, tokens});
     Tensor tk(k.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
@@ -1169,11 +1171,11 @@ AppendPromptMetrics run_append_prompt_attention_only(KVCache& kv, std::int32_t t
                            static_cast<std::size_t>(tokens);
     const std::size_t kvn = static_cast<std::size_t>(kHeadDim) *
                             static_cast<std::size_t>(kKVHeads) * static_cast<std::size_t>(tokens);
-    DBuf q   = make_bf16(qn);
-    DBuf k   = make_bf16(kvn);
-    DBuf v   = make_bf16(kvn);
-    DBuf pos = make_i32_sequence(context, tokens);
-    DBuf out = make_zeros(qn * sizeof(std::uint16_t));
+    DeviceBuffer q   = make_bf16(qn);
+    DeviceBuffer k   = make_bf16(kvn);
+    DeviceBuffer v   = make_bf16(kvn);
+    DeviceBuffer pos = make_i32_sequence(context, tokens);
+    DeviceBuffer out = make_zeros(qn * sizeof(std::uint16_t));
 
     Tensor tq(q.p, DType::BF16, {kHeadDim, kQHeads, tokens});
     Tensor tk(k.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
@@ -1280,11 +1282,11 @@ PrefillMetrics run_prefill(KVCache& kv, std::int32_t tokens, const PrefillTiming
                            static_cast<std::size_t>(tokens);
     const std::size_t kvn = static_cast<std::size_t>(kHeadDim) *
                             static_cast<std::size_t>(kKVHeads) * static_cast<std::size_t>(tokens);
-    DBuf q   = make_bf16(qn);
-    DBuf k   = make_bf16(kvn);
-    DBuf v   = make_bf16(kvn);
-    DBuf pos = make_i32_sequence(0, tokens);
-    DBuf out = make_zeros(qn * sizeof(std::uint16_t));
+    DeviceBuffer q   = make_bf16(qn);
+    DeviceBuffer k   = make_bf16(kvn);
+    DeviceBuffer v   = make_bf16(kvn);
+    DeviceBuffer pos = make_i32_sequence(0, tokens);
+    DeviceBuffer out = make_zeros(qn * sizeof(std::uint16_t));
     WorkspaceArena ws(tokens <= 6 ? small_t_workspace_bytes(tokens) : 1u);
 
     Tensor tq(q.p, DType::BF16, {kHeadDim, kQHeads, tokens});
@@ -1311,11 +1313,11 @@ void run_prefill_profile_once(KVCache& kv, std::int32_t tokens) {
                            static_cast<std::size_t>(tokens);
     const std::size_t kvn = static_cast<std::size_t>(kHeadDim) *
                             static_cast<std::size_t>(kKVHeads) * static_cast<std::size_t>(tokens);
-    DBuf q   = make_bf16(qn);
-    DBuf k   = make_bf16(kvn);
-    DBuf v   = make_bf16(kvn);
-    DBuf pos = make_i32_sequence(0, tokens);
-    DBuf out = make_zeros(qn * sizeof(std::uint16_t));
+    DeviceBuffer q   = make_bf16(qn);
+    DeviceBuffer k   = make_bf16(kvn);
+    DeviceBuffer v   = make_bf16(kvn);
+    DeviceBuffer pos = make_i32_sequence(0, tokens);
+    DeviceBuffer out = make_zeros(qn * sizeof(std::uint16_t));
     WorkspaceArena ws(tokens <= 6 ? small_t_workspace_bytes(tokens) : 1u);
 
     Tensor tq(q.p, DType::BF16, {kHeadDim, kQHeads, tokens});
@@ -1955,10 +1957,10 @@ int main(int argc, char** argv) {
 
     const std::size_t qn  = static_cast<std::size_t>(kHeadDim) * kQHeads;
     const std::size_t kvn = static_cast<std::size_t>(kHeadDim) * kKVHeads;
-    DBuf q                = make_bf16(qn);
-    DBuf k                = make_bf16(kvn);
-    DBuf v                = make_bf16(kvn);
-    DBuf out              = make_zeros(qn * sizeof(std::uint16_t));
+    DeviceBuffer q        = make_bf16(qn);
+    DeviceBuffer k        = make_bf16(kvn);
+    DeviceBuffer v        = make_bf16(kvn);
+    DeviceBuffer out      = make_zeros(qn * sizeof(std::uint16_t));
 
     Tensor tq(q.p, DType::BF16, {kHeadDim, kQHeads, 1});
     Tensor tk(k.p, DType::BF16, {kHeadDim, kKVHeads, 1});
@@ -1967,7 +1969,7 @@ int main(int argc, char** argv) {
 
     if (opt.decode) {
         if (opt.profile_once) {
-            DBuf cold_cache = make_zeros(opt.cold_cache ? kColdCacheBytes : 1u);
+            DeviceBuffer cold_cache = make_zeros(opt.cold_cache ? kColdCacheBytes : 1u);
             run_profile_once(kv, work_arena, tq, tk, tv, tout, opt.decode_pos,
                              opt.cold_cache ? &cold_cache : nullptr);
         } else {
@@ -1978,7 +1980,7 @@ int main(int argc, char** argv) {
     }
     if (opt.append_small_t) {
         if (opt.profile_once) {
-            DBuf cold_cache = make_zeros(opt.cold_cache ? kColdCacheBytes : 1u);
+            DeviceBuffer cold_cache = make_zeros(opt.cold_cache ? kColdCacheBytes : 1u);
             run_append_small_t_profile_once(kv, opt.tokens[0], opt.context,
                                             opt.cold_cache ? &cold_cache : nullptr);
         } else {
@@ -1991,7 +1993,7 @@ int main(int argc, char** argv) {
     }
     if (opt.cached_small_t) {
         if (opt.profile_once) {
-            DBuf cold_cache = make_zeros(opt.cold_cache ? kColdCacheBytes : 1u);
+            DeviceBuffer cold_cache = make_zeros(opt.cold_cache ? kColdCacheBytes : 1u);
             run_cached_small_t_profile_once(kv, opt.tokens[0], opt.context,
                                             opt.cold_cache ? &cold_cache : nullptr);
         } else {
@@ -2004,7 +2006,7 @@ int main(int argc, char** argv) {
     }
     if (opt.kv_append) {
         if (opt.profile_once) {
-            DBuf cold_cache = make_zeros(opt.cold_cache ? kColdCacheBytes : 1u);
+            DeviceBuffer cold_cache = make_zeros(opt.cold_cache ? kColdCacheBytes : 1u);
             run_kv_append_profile_once(kv, opt.tokens[0], opt.context,
                                        opt.cold_cache ? &cold_cache : nullptr);
         } else {

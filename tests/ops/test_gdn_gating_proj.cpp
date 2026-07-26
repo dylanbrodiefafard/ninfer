@@ -154,10 +154,11 @@ int one_shape(std::int32_t T, std::uint32_t seed, std::vector<std::int32_t> samp
     std::vector<double> ref_g, ref_beta;
     cpu_gdn_gating_proj(x, aw, bw, A_log, dt_bias, sample_tokens, kHeads, kHidden, ref_g, ref_beta);
 
-    DBuf dx = to_device_bf16(x), daw = to_device_bf16(aw), dbw = to_device_bf16(bw);
-    DBuf dA_log = to_device_f32(A_log), ddt_bias = to_device_f32(dt_bias);
-    DBuf dg(static_cast<std::size_t>(kHeads) * static_cast<std::size_t>(T) * sizeof(float));
-    DBuf dbeta(static_cast<std::size_t>(kHeads) * static_cast<std::size_t>(T) * sizeof(float));
+    DeviceBuffer dx = to_device_bf16(x), daw = to_device_bf16(aw), dbw = to_device_bf16(bw);
+    DeviceBuffer dA_log = to_device_f32(A_log), ddt_bias = to_device_f32(dt_bias);
+    DeviceBuffer dg(static_cast<std::size_t>(kHeads) * static_cast<std::size_t>(T) * sizeof(float));
+    DeviceBuffer dbeta(static_cast<std::size_t>(kHeads) * static_cast<std::size_t>(T) *
+                       sizeof(float));
 
     Tensor tx(dx.p, DType::BF16, {kHidden, T});
     Tensor tA_log(dA_log.p, DType::FP32, {kHeads});
@@ -235,10 +236,10 @@ int one_shape35(std::int32_t T, std::uint32_t seed, std::vector<std::int32_t> sa
     ab.reserve(aw.size() + bw.size());
     ab.insert(ab.end(), aw.begin(), aw.end());
     ab.insert(ab.end(), bw.begin(), bw.end());
-    DBuf dx = to_device_bf16(x), dab = to_device_bf16(ab);
-    DBuf dA_log = to_device_f32(A_log), ddt_bias = to_device_f32(dt_bias);
-    DBuf dg(static_cast<std::size_t>(k35Heads) * T * sizeof(float));
-    DBuf dbeta(static_cast<std::size_t>(k35Heads) * T * sizeof(float));
+    DeviceBuffer dx = to_device_bf16(x), dab = to_device_bf16(ab);
+    DeviceBuffer dA_log = to_device_f32(A_log), ddt_bias = to_device_f32(dt_bias);
+    DeviceBuffer dg(static_cast<std::size_t>(k35Heads) * T * sizeof(float));
+    DeviceBuffer dbeta(static_cast<std::size_t>(k35Heads) * T * sizeof(float));
 
     Tensor tx(dx.p, DType::BF16, {k35Hidden, T});
     Tensor tA_log(dA_log.p, DType::FP32, {k35Heads});
@@ -313,12 +314,12 @@ int one_norm_shape(std::int32_t hidden, std::int32_t heads, std::int32_t T, std:
                          ref_beta);
     std::vector<double> ref_h_double(ref_h.begin(), ref_h.end());
 
-    DBuf dx = to_device_bf16(x), dnorm = to_device_bf16(norm_weight);
-    DBuf daw = to_device_bf16(aw), dbw = to_device_bf16(bw);
-    DBuf dA_log = to_device_f32(A_log), ddt_bias = to_device_f32(dt_bias);
-    DBuf dh(static_cast<std::size_t>(hidden) * T * sizeof(std::uint16_t));
-    DBuf dg(static_cast<std::size_t>(heads) * T * sizeof(float));
-    DBuf dbeta(static_cast<std::size_t>(heads) * T * sizeof(float));
+    DeviceBuffer dx = to_device_bf16(x), dnorm = to_device_bf16(norm_weight);
+    DeviceBuffer daw = to_device_bf16(aw), dbw = to_device_bf16(bw);
+    DeviceBuffer dA_log = to_device_f32(A_log), ddt_bias = to_device_f32(dt_bias);
+    DeviceBuffer dh(static_cast<std::size_t>(hidden) * T * sizeof(std::uint16_t));
+    DeviceBuffer dg(static_cast<std::size_t>(heads) * T * sizeof(float));
+    DeviceBuffer dbeta(static_cast<std::size_t>(heads) * T * sizeof(float));
     cudaMemset(dh.p, 0xff, dh.bytes);
     cudaMemset(dg.p, 0xff, dg.bytes);
     cudaMemset(dbeta.p, 0xff, dbeta.bytes);
@@ -337,8 +338,8 @@ int one_norm_shape(std::int32_t hidden, std::int32_t heads, std::int32_t T, std:
         ab.reserve(aw.size() + bw.size());
         ab.insert(ab.end(), aw.begin(), aw.end());
         ab.insert(ab.end(), bw.begin(), bw.end());
-        DBuf dab      = to_device_bf16(ab);
-        Weight parent = bf16_weight(dab.p, 2 * heads, hidden);
+        DeviceBuffer dab = to_device_bf16(ab);
+        Weight parent    = bf16_weight(dab.p, 2 * heads, hidden);
         ops::gdn_norm_gating_proj(tx, tnorm, eps, parent, tA_log, tdt_bias, ws, th, tg, tbeta,
                                   nullptr);
         cudaDeviceSynchronize();

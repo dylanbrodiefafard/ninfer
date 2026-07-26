@@ -46,7 +46,7 @@ std::vector<std::uint16_t> bf16_bits(const std::vector<float>& h) {
     return b;
 }
 
-std::vector<std::uint16_t> from_device_bf16_bits(const DBuf& d, std::size_t n) {
+std::vector<std::uint16_t> from_device_bf16_bits(const DeviceBuffer& d, std::size_t n) {
     std::vector<std::uint16_t> b(n);
     cudaMemcpy(b.data(), d.p, n * sizeof(std::uint16_t), cudaMemcpyDeviceToHost);
     return b;
@@ -65,10 +65,10 @@ std::vector<double> from_device_bf16_ptr(const void* p, std::size_t n) {
     return o;
 }
 
-DBuf to_device_bf16_unaligned(const std::vector<float>& h) {
+DeviceBuffer to_device_bf16_unaligned(const std::vector<float>& h) {
     std::vector<std::uint16_t> b(h.size() + 1);
     for (std::size_t i = 0; i < h.size(); ++i) b[i + 1] = f32_to_bf16(h[i]);
-    DBuf d(b.size() * sizeof(std::uint16_t));
+    DeviceBuffer d(b.size() * sizeof(std::uint16_t));
     cudaMemcpy(d.p, b.data(), d.bytes, cudaMemcpyHostToDevice);
     return d;
 }
@@ -149,8 +149,8 @@ int one_shape(const char* tag, std::int32_t T, std::uint32_t seed) {
     cpu_rope_one(q, positions, kQHeads, T, kRotaryDim, kTheta, q_ref);
     cpu_rope_one(k, positions, kKHeads, T, kRotaryDim, kTheta, k_ref);
 
-    DBuf dpos = to_device_i32(positions);
-    DBuf dq = to_device_bf16(q), dk = to_device_bf16(k);
+    DeviceBuffer dpos = to_device_i32(positions);
+    DeviceBuffer dq = to_device_bf16(q), dk = to_device_bf16(k);
     Tensor tpos(dpos.p, DType::I32, {T});
     Tensor tq(dq.p, DType::BF16, {kHeadDim, kQHeads, T});
     Tensor tk(dk.p, DType::BF16, {kHeadDim, kKHeads, T});
@@ -189,8 +189,8 @@ int unaligned_data_case() {
     cpu_rope_one(q, positions, kQHeads, T, kRotaryDim, kTheta, q_ref);
     cpu_rope_one(k, positions, kKHeads, T, kRotaryDim, kTheta, k_ref);
 
-    DBuf dpos = to_device_i32(positions);
-    DBuf dq = to_device_bf16_unaligned(q), dk = to_device_bf16_unaligned(k);
+    DeviceBuffer dpos = to_device_i32(positions);
+    DeviceBuffer dq = to_device_bf16_unaligned(q), dk = to_device_bf16_unaligned(k);
     auto* qptr = static_cast<std::uint16_t*>(dq.p) + 1;
     auto* kptr = static_cast<std::uint16_t*>(dk.p) + 1;
     Tensor tpos(dpos.p, DType::I32, {T});
@@ -225,8 +225,8 @@ int identity_positions_zero_case() {
     const std::vector<std::uint16_t> q_before = bf16_bits(q);
     const std::vector<std::uint16_t> k_before = bf16_bits(k);
 
-    DBuf dpos = to_device_i32(positions);
-    DBuf dq = to_device_bf16(q), dk = to_device_bf16(k);
+    DeviceBuffer dpos = to_device_i32(positions);
+    DeviceBuffer dq = to_device_bf16(q), dk = to_device_bf16(k);
     Tensor tpos(dpos.p, DType::I32, {T});
     Tensor tq(dq.p, DType::BF16, {kHeadDim, kQHeads, T});
     Tensor tk(dk.p, DType::BF16, {kHeadDim, kKHeads, T});
@@ -256,9 +256,9 @@ int split_api_parity_case(std::int32_t T, std::uint32_t seed) {
     cpu_rope_one(q, positions, kQHeads, T, kRotaryDim, kTheta, q_ref);
     cpu_rope_one(k, positions, kKHeads, T, kRotaryDim, kTheta, k_ref);
 
-    DBuf dpos     = to_device_i32(positions);
-    DBuf dq_fused = to_device_bf16(q), dk_fused = to_device_bf16(k);
-    DBuf dq_split = to_device_bf16(q), dk_split = to_device_bf16(k);
+    DeviceBuffer dpos     = to_device_i32(positions);
+    DeviceBuffer dq_fused = to_device_bf16(q), dk_fused = to_device_bf16(k);
+    DeviceBuffer dq_split = to_device_bf16(q), dk_split = to_device_bf16(k);
     Tensor tpos(dpos.p, DType::I32, {T});
     Tensor tq_fused(dq_fused.p, DType::BF16, {kHeadDim, kQHeads, T});
     Tensor tk_fused(dk_fused.p, DType::BF16, {kHeadDim, kKHeads, T});
@@ -332,9 +332,9 @@ int text_mrope_case() {
     std::vector<double> k_ref;
     cpu_rope_nd(q, positions, 3, kHeadDim, kQHeads, tokens, kRotaryDim, kTheta, q_ref);
     cpu_rope_nd(k, positions, 3, kHeadDim, kKHeads, tokens, kRotaryDim, kTheta, k_ref);
-    DBuf dpos = to_device_i32(positions);
-    DBuf dq = to_device_bf16(q), dk = to_device_bf16(k);
-    DBuf dq_single = to_device_bf16(q), dk_single = to_device_bf16(k);
+    DeviceBuffer dpos = to_device_i32(positions);
+    DeviceBuffer dq = to_device_bf16(q), dk = to_device_bf16(k);
+    DeviceBuffer dq_single = to_device_bf16(q), dk_single = to_device_bf16(k);
     Tensor tpos(dpos.p, DType::I32, {tokens, 3});
     Tensor tq(dq.p, DType::BF16, {kHeadDim, kQHeads, tokens});
     Tensor tk(dk.p, DType::BF16, {kHeadDim, kKHeads, tokens});
@@ -377,11 +377,11 @@ int text_35b_case(int tokens, int axes) {
     cpu_rope_nd(q, positions, axes, kHeadDim, q_heads, tokens, kRotaryDim, kTheta, q_ref);
     cpu_rope_nd(k, positions, axes, kHeadDim, k_heads, tokens, kRotaryDim, kTheta, k_ref);
 
-    DBuf dpos    = to_device_i32(positions);
-    DBuf dq_pair = to_device_bf16(q);
-    DBuf dk_pair = to_device_bf16(k);
-    DBuf dq_one  = to_device_bf16(q);
-    DBuf dk_one  = to_device_bf16(k);
+    DeviceBuffer dpos    = to_device_i32(positions);
+    DeviceBuffer dq_pair = to_device_bf16(q);
+    DeviceBuffer dk_pair = to_device_bf16(k);
+    DeviceBuffer dq_one  = to_device_bf16(q);
+    DeviceBuffer dk_one  = to_device_bf16(k);
     Tensor tpos(dpos.p, DType::I32, {tokens, axes});
     Tensor tq_pair(dq_pair.p, DType::BF16, {kHeadDim, q_heads, tokens});
     Tensor tk_pair(dk_pair.p, DType::BF16, {kHeadDim, k_heads, tokens});
@@ -442,9 +442,9 @@ int vision_rope_packed_case() {
     std::vector<double> k_ref;
     cpu_rope_nd(q, positions, 2, head_dim, heads, tokens, head_dim, 10000.0f, q_ref);
     cpu_rope_nd(k, positions, 2, head_dim, heads, tokens, head_dim, 10000.0f, k_ref);
-    DBuf dpacked_pair   = to_device_bf16(packed);
-    DBuf dpacked_single = to_device_bf16(packed);
-    DBuf dpos           = to_device_i32(positions);
+    DeviceBuffer dpacked_pair   = to_device_bf16(packed);
+    DeviceBuffer dpacked_single = to_device_bf16(packed);
+    DeviceBuffer dpos           = to_device_i32(positions);
     Tensor tq(dpacked_pair.p, DType::BF16, {head_dim, heads, tokens});
     tq.nb[2]  = qkv * 2;
     Tensor tk = tq;
@@ -535,13 +535,13 @@ int dflash_case(const char* label, int tokens, int first_position, bool graph = 
     cpu_rope_nd(k, positions, 1, kDflashHeadDim, kDflashKHeads, tokens, kDflashRotaryDim, kTheta,
                 k_ref);
 
-    DBuf dpos = to_device_i32(positions);
+    DeviceBuffer dpos = to_device_i32(positions);
     GuardedDBuf dq(qn * sizeof(std::uint16_t));
     GuardedDBuf dk(kn * sizeof(std::uint16_t));
     dq.copy_from_host(q_before.data(), qn * sizeof(std::uint16_t));
     dk.copy_from_host(k_before.data(), kn * sizeof(std::uint16_t));
-    DBuf dq_single = to_device_bf16(q);
-    DBuf dk_single = to_device_bf16(k);
+    DeviceBuffer dq_single = to_device_bf16(q);
+    DeviceBuffer dk_single = to_device_bf16(k);
     Tensor tpos(dpos.p, DType::I32, {tokens});
     Tensor tq(dq.data(), DType::BF16, {kDflashHeadDim, kDflashQHeads, tokens});
     Tensor tk(dk.data(), DType::BF16, {kDflashHeadDim, kDflashKHeads, tokens});
@@ -640,7 +640,7 @@ int dflash_padded_stride_case() {
     GuardedDBuf dk(k_storage.size() * sizeof(std::uint16_t));
     dq.copy_from_host(q_storage.data(), dq.bytes());
     dk.copy_from_host(k_storage.data(), dk.bytes());
-    DBuf dpos = to_device_i32(positions);
+    DeviceBuffer dpos = to_device_i32(positions);
     Tensor tpos(dpos.p, DType::I32, {tokens});
     Tensor tq(dq.data(), DType::BF16, {kDflashHeadDim, kDflashQHeads, tokens});
     Tensor tk(dk.data(), DType::BF16, {kDflashHeadDim, kDflashKHeads, tokens});
@@ -703,11 +703,11 @@ int dflash_unaligned_large_phase_case() {
                 q_ref);
     cpu_rope_nd(k, positions, 1, kDflashHeadDim, kDflashKHeads, tokens, kDflashRotaryDim, kTheta,
                 k_ref);
-    DBuf dpos  = to_device_i32(positions);
-    DBuf dq    = to_device_bf16_unaligned(q);
-    DBuf dk    = to_device_bf16_unaligned(k);
-    auto* qptr = static_cast<std::uint16_t*>(dq.p) + 1;
-    auto* kptr = static_cast<std::uint16_t*>(dk.p) + 1;
+    DeviceBuffer dpos = to_device_i32(positions);
+    DeviceBuffer dq   = to_device_bf16_unaligned(q);
+    DeviceBuffer dk   = to_device_bf16_unaligned(k);
+    auto* qptr        = static_cast<std::uint16_t*>(dq.p) + 1;
+    auto* kptr        = static_cast<std::uint16_t*>(dk.p) + 1;
     Tensor tpos(dpos.p, DType::I32, {tokens});
     Tensor tq(qptr, DType::BF16, {kDflashHeadDim, kDflashQHeads, tokens});
     Tensor tk(kptr, DType::BF16, {kDflashHeadDim, kDflashKHeads, tokens});

@@ -79,9 +79,9 @@ static int fused_projection_matches_oracle() {
         ref_beta[h]     = 1.0 / (1.0 + std::exp(-acc_b));
     }
 
-    DBuf dx = to_device_bf16(x), daw = to_device_bf16(aw), dbw = to_device_bf16(bw);
-    DBuf dA_log = to_device_f32(A_log), ddt_bias = to_device_f32(dt_bias);
-    DBuf dg(48 * 4), dbeta(48 * 4);
+    DeviceBuffer dx = to_device_bf16(x), daw = to_device_bf16(aw), dbw = to_device_bf16(bw);
+    DeviceBuffer dA_log = to_device_f32(A_log), ddt_bias = to_device_f32(dt_bias);
+    DeviceBuffer dg(48 * 4), dbeta(48 * 4);
 
     Tensor tx(dx.p, DType::BF16, {5120, 1});
     Tensor tA_log(dA_log.p, DType::FP32, {48});
@@ -117,9 +117,9 @@ static int one_shape(const char* tag, std::int32_t T, std::uint32_t seed, float 
     std::vector<double> ref_g(n), ref_beta(n);
     cpu_gdn_gating(a, b, A_log, dt_bias, T, ref_g, ref_beta);
 
-    DBuf da = to_device_bf16(a), db = to_device_bf16(b);
-    DBuf dA_log = to_device_f32(A_log), ddt_bias = to_device_f32(dt_bias);
-    DBuf dg(n * sizeof(float)), dbeta(n * sizeof(float));
+    DeviceBuffer da = to_device_bf16(a), db = to_device_bf16(b);
+    DeviceBuffer dA_log = to_device_f32(A_log), ddt_bias = to_device_f32(dt_bias);
+    DeviceBuffer dg(n * sizeof(float)), dbeta(n * sizeof(float));
     Tensor ta(da.p, DType::BF16, {48, T});
     Tensor tb(db.p, DType::BF16, {48, T});
     Tensor tA_log(dA_log.p, DType::FP32, {48});

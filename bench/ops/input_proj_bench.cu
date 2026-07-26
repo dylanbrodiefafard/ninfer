@@ -10,6 +10,7 @@
 
 #include "core/device.h"
 #include "ninfer_bench_common.h"
+#include "quantized_weight.cuh"
 
 #include <cuda_runtime.h>
 
@@ -53,103 +54,12 @@ struct Options {
     std::string csv_out;
 };
 
-struct Stats {
-    double median_us = 0.0;
-    double min_us    = 0.0;
-    double p95_us    = 0.0;
-};
-
 struct Result {
     std::string op;
     std::string path;
     std::int32_t t = 0;
-    Stats timing;
+    bench::ColdTiming timing;
 };
-
-struct DevicePackedWeight {
-    explicit DevicePackedWeight(std::size_t bytes) : storage(bytes) {}
-
-    bench::DBuf storage;
-    Weight weight{};
-};
-
-__global__ void fill_scales(std::uint8_t* scales, std::uint64_t groups) {
-    const std::uint64_t start  = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::uint64_t stride = static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
-    for (std::uint64_t group = start; group < groups; group += stride) {
-        scales[group * 2]     = 0x00u;
-        scales[group * 2 + 1] = 0x3cu;
-    }
-}
-
-std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
-    return ((value + alignment - 1) / alignment) * alignment;
-}
-
-DevicePackedWeight make_weight(QType qtype, std::int32_t rows) {
-    const std::int32_t groups_per_row = kHidden / 64;
-    const std::uint64_t groups =
-        static_cast<std::uint64_t>(rows) * static_cast<std::uint64_t>(groups_per_row);
-    const std::uint64_t low_bytes    = groups * 32;
-    const std::uint64_t high_bytes   = qtype == QType::Q5G64_F16S ? groups * 8 : 0;
-    const std::uint64_t high_offset  = align_up(low_bytes, 256);
-    const std::uint64_t scale_offset = high_offset + align_up(high_bytes, 256);
-    const std::uint64_t scale_bytes  = groups * 2;
-    DevicePackedWeight packed(static_cast<std::size_t>(scale_offset + scale_bytes));
-
-    CUDA_CHECK(cudaMemset(packed.storage.p, 0x53, packed.storage.bytes));
-    constexpr int block = 256;
-    const int grid      = static_cast<int>(
-        std::min<std::uint64_t>(65535, std::max<std::uint64_t>(1, (groups + block - 1) / block)));
-    fill_scales<<<grid, block>>>(static_cast<std::uint8_t*>(packed.storage.p) + scale_offset,
-                                 groups);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    Weight& weight          = packed.weight;
-    weight.payload          = packed.storage.p;
-    weight.payload_bytes    = packed.storage.bytes;
-    weight.high_plane_bytes = high_bytes;
-    weight.qtype            = qtype;
-    weight.layout           = QuantLayout::RowSplit;
-    weight.group_size       = 64;
-    weight.qdata            = packed.storage.p;
-    weight.qhigh =
-        high_bytes == 0 ? nullptr : static_cast<std::uint8_t*>(packed.storage.p) + high_offset;
-    weight.scales          = static_cast<std::uint8_t*>(packed.storage.p) + scale_offset;
-    weight.n               = rows;
-    weight.k               = kHidden;
-    weight.group           = 64;
-    weight.scale_dtype     = DType::FP16;
-    weight.ndim            = 2;
-    weight.shape[0]        = rows;
-    weight.shape[1]        = kHidden;
-    weight.padded_shape[0] = rows;
-    weight.padded_shape[1] = kHidden;
-    return packed;
-}
-
-Weight row_view(const Weight& parent, std::int32_t row_begin, std::int32_t rows) {
-    if (row_begin < 0 || rows <= 0 || row_begin + rows > parent.n) {
-        throw std::invalid_argument("benchmark row view is out of range");
-    }
-    const std::uint64_t groups_per_row = parent.padded_shape[1] / parent.group;
-    const std::uint64_t low_row_bytes  = groups_per_row * 32;
-    const std::uint64_t high_row_bytes = parent.qtype == QType::Q5G64_F16S ? groups_per_row * 8 : 0;
-    const std::uint64_t scale_row_bytes = groups_per_row * 2;
-    Weight view                         = parent;
-    view.qdata                          = static_cast<const std::uint8_t*>(parent.qdata) +
-                 static_cast<std::uint64_t>(row_begin) * low_row_bytes;
-    view.qhigh  = high_row_bytes == 0 ? nullptr
-                                      : static_cast<const std::uint8_t*>(parent.qhigh) +
-                                           static_cast<std::uint64_t>(row_begin) * high_row_bytes;
-    view.scales = static_cast<const std::uint8_t*>(parent.scales) +
-                  static_cast<std::uint64_t>(row_begin) * scale_row_bytes;
-    view.n               = rows;
-    view.shape[0]        = rows;
-    view.padded_shape[0] = rows;
-    return view;
-}
 
 std::vector<std::int32_t> parse_t_sweep(std::string_view raw) {
     std::vector<std::int32_t> result;
@@ -213,40 +123,8 @@ Options parse_options(int argc, char** argv) {
     return options;
 }
 
-template <class Launch>
-Stats measure_cold(Launch&& launch, bench::DBuf& flush, cudaStream_t stream, int warmup,
-                   int repeat) {
-    cudaEvent_t start = nullptr;
-    cudaEvent_t stop  = nullptr;
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
-    for (int i = 0; i < warmup; ++i) {
-        CUDA_CHECK(cudaMemsetAsync(flush.p, 0xa5, flush.bytes, stream));
-        launch(stream);
-    }
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    std::vector<double> samples;
-    samples.reserve(static_cast<std::size_t>(repeat));
-    for (int i = 0; i < repeat; ++i) {
-        CUDA_CHECK(cudaMemsetAsync(flush.p, 0xa5, flush.bytes, stream));
-        CUDA_CHECK(cudaEventRecord(start, stream));
-        launch(stream);
-        CUDA_CHECK(cudaEventRecord(stop, stream));
-        CUDA_CHECK(cudaEventSynchronize(stop));
-        float milliseconds = 0.0f;
-        CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
-        samples.push_back(static_cast<double>(milliseconds) * 1000.0);
-    }
-    CUDA_CHECK(cudaEventDestroy(start));
-    CUDA_CHECK(cudaEventDestroy(stop));
-    std::sort(samples.begin(), samples.end());
-    return {samples[samples.size() / 2], samples.front(),
-            samples[std::min(samples.size() - 1, static_cast<std::size_t>(0.95 * samples.size()))]};
-}
-
 void append_result(std::vector<Result>& results, std::string op, std::string path, std::int32_t t,
-                   Stats timing) {
+                   bench::ColdTiming timing) {
     std::printf("%-9s T=%-3d %-31s median=%8.3f us min=%8.3f us p95=%8.3f us\n", op.c_str(), t,
                 path.c_str(), timing.median_us, timing.min_us, timing.p95_us);
     results.push_back({std::move(op), std::move(path), t, timing});
@@ -294,8 +172,8 @@ int main(int argc, char** argv) {
 
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        bench::DBuf flush(kFlushBytes);
-        bench::DBuf input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t);
+        ninfer::DeviceBuffer flush(kFlushBytes);
+        ninfer::DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t);
         const std::size_t workspace_bytes =
             options.op == OpSelection::Attention
                 ? 1
@@ -305,16 +183,18 @@ int main(int argc, char** argv) {
         std::vector<Result> results;
 
         if (options.op != OpSelection::Gdn) {
-            DevicePackedWeight query_key  = make_weight(QType::Q4G64_F16S, kParentRows);
-            DevicePackedWeight gate_value = make_weight(QType::Q5G64_F16S, kParentRows);
-            const Weight query            = row_view(query_key.weight, 0, kQueryRows);
-            const Weight key              = row_view(query_key.weight, kQueryRows, kKvRows);
-            const Weight gate             = row_view(gate_value.weight, 0, kQueryRows);
-            const Weight value            = row_view(gate_value.weight, kQueryRows, kKvRows);
-            bench::DBuf q(static_cast<std::size_t>(kQueryRows) * max_t * 2);
-            bench::DBuf g(static_cast<std::size_t>(kQueryRows) * max_t * 2);
-            bench::DBuf k(static_cast<std::size_t>(kKvRows) * max_t * 2);
-            bench::DBuf v(static_cast<std::size_t>(kKvRows) * max_t * 2);
+            bench::PackedQuantizedWeight query_key = bench::make_row_split_weight(
+                QType::Q4G64_F16S, kParentRows, kHidden, kHidden, {0x53, 0x53, 0x3c00});
+            bench::PackedQuantizedWeight gate_value = bench::make_row_split_weight(
+                QType::Q5G64_F16S, kParentRows, kHidden, kHidden, {0x53, 0x53, 0x3c00});
+            const Weight query = bench::row_view(query_key.weight, 0, kQueryRows);
+            const Weight key   = bench::row_view(query_key.weight, kQueryRows, kKvRows);
+            const Weight gate  = bench::row_view(gate_value.weight, 0, kQueryRows);
+            const Weight value = bench::row_view(gate_value.weight, kQueryRows, kKvRows);
+            ninfer::DeviceBuffer q(static_cast<std::size_t>(kQueryRows) * max_t * 2);
+            ninfer::DeviceBuffer g(static_cast<std::size_t>(kQueryRows) * max_t * 2);
+            ninfer::DeviceBuffer k(static_cast<std::size_t>(kKvRows) * max_t * 2);
+            ninfer::DeviceBuffer v(static_cast<std::size_t>(kKvRows) * max_t * 2);
 
             for (const std::int32_t t : options.t_sweep) {
                 Tensor x(input.p, DType::BF16, {kHidden, t});
@@ -326,9 +206,9 @@ int main(int argc, char** argv) {
                     ops::attn_input_proj(x, query_key.weight, gate_value.weight, tq, tg, tk, tv,
                                          workspace, launch_stream);
                 };
-                append_result(
-                    results, "attention", "production_parent_split", t,
-                    measure_cold(production, flush, stream, options.warmup, options.repeat));
+                append_result(results, "attention", "production_parent_split", t,
+                              bench::measure_cold_launch(production, flush, stream, options.warmup,
+                                                         options.repeat));
                 if (t <= 16) {
                     const auto control = [&](cudaStream_t launch_stream) {
                         ops::linear(x, query, tq, workspace, launch_stream);
@@ -336,27 +216,30 @@ int main(int argc, char** argv) {
                         ops::linear(x, key, tk, workspace, launch_stream);
                         ops::linear(x, value, tv, workspace, launch_stream);
                     };
-                    append_result(
-                        results, "attention", "control_four_projection", t,
-                        measure_cold(control, flush, stream, options.warmup, options.repeat));
+                    append_result(results, "attention", "control_four_projection", t,
+                                  bench::measure_cold_launch(control, flush, stream, options.warmup,
+                                                             options.repeat));
                 }
             }
         }
 
         if (options.op != OpSelection::Attention) {
-            DevicePackedWeight qk_weight    = make_weight(QType::Q4G64_F16S, kGdnQkRows);
-            DevicePackedWeight value_weight = make_weight(QType::Q5G64_F16S, kGdnValueRows);
-            bench::DBuf qkv(static_cast<std::size_t>(kGdnRows) * max_t * 2);
-            bench::DBuf qkv_conv(static_cast<std::size_t>(kGdnRows) * max_t * 2);
-            bench::DBuf qk_tmp(static_cast<std::size_t>(kGdnQkRows) * max_t * 2);
-            bench::DBuf value_tmp(static_cast<std::size_t>(kGdnValueRows) * max_t * 2);
-            bench::DBuf query(static_cast<std::size_t>(kGdnKeyRows) * max_t * 2);
-            bench::DBuf key(static_cast<std::size_t>(kGdnKeyRows) * max_t * 2);
-            bench::DBuf value_out(static_cast<std::size_t>(kGdnValueRows) * max_t * 2);
-            bench::DBuf conv_weight = bench::make_bf16(static_cast<std::size_t>(kGdnRows) * 4);
-            bench::DBuf conv_states =
+            bench::PackedQuantizedWeight qk_weight = bench::make_row_split_weight(
+                QType::Q4G64_F16S, kGdnQkRows, kHidden, kHidden, {0x53, 0x53, 0x3c00});
+            bench::PackedQuantizedWeight value_weight = bench::make_row_split_weight(
+                QType::Q5G64_F16S, kGdnValueRows, kHidden, kHidden, {0x53, 0x53, 0x3c00});
+            ninfer::DeviceBuffer qkv(static_cast<std::size_t>(kGdnRows) * max_t * 2);
+            ninfer::DeviceBuffer qkv_conv(static_cast<std::size_t>(kGdnRows) * max_t * 2);
+            ninfer::DeviceBuffer qk_tmp(static_cast<std::size_t>(kGdnQkRows) * max_t * 2);
+            ninfer::DeviceBuffer value_tmp(static_cast<std::size_t>(kGdnValueRows) * max_t * 2);
+            ninfer::DeviceBuffer query(static_cast<std::size_t>(kGdnKeyRows) * max_t * 2);
+            ninfer::DeviceBuffer key(static_cast<std::size_t>(kGdnKeyRows) * max_t * 2);
+            ninfer::DeviceBuffer value_out(static_cast<std::size_t>(kGdnValueRows) * max_t * 2);
+            ninfer::DeviceBuffer conv_weight =
+                bench::make_bf16(static_cast<std::size_t>(kGdnRows) * 4);
+            ninfer::DeviceBuffer conv_states =
                 bench::make_zeros(static_cast<std::size_t>(kGdnRows) * 3 * kGdnSlots * 2);
-            bench::DBuf initial_slot(sizeof(std::int32_t));
+            ninfer::DeviceBuffer initial_slot(sizeof(std::int32_t));
             constexpr std::int32_t kInitialSlot = 6;
             CUDA_CHECK(cudaMemcpy(initial_slot.p, &kInitialSlot, sizeof(kInitialSlot),
                                   cudaMemcpyHostToDevice));
@@ -377,9 +260,9 @@ int main(int argc, char** argv) {
                     ops::gdn_input_proj(x, qk_weight.weight, value_weight.weight, out, workspace,
                                         launch_stream);
                 };
-                append_result(
-                    results, "gdn", "production_direct", t,
-                    measure_cold(production, flush, stream, options.warmup, options.repeat));
+                append_result(results, "gdn", "production_direct", t,
+                              bench::measure_cold_launch(production, flush, stream, options.warmup,
+                                                         options.repeat));
                 if (t <= 6) {
                     const auto fused_snapshot = [&](cudaStream_t launch_stream) {
                         ops::gdn_input_proj_conv_snapshot(x, qk_weight.weight, value_weight.weight,
@@ -387,8 +270,8 @@ int main(int argc, char** argv) {
                                                           workspace, launch_stream);
                     };
                     append_result(results, "gdn", "fused_projection_conv_snapshot", t,
-                                  measure_cold(fused_snapshot, flush, stream, options.warmup,
-                                               options.repeat));
+                                  bench::measure_cold_launch(fused_snapshot, flush, stream,
+                                                             options.warmup, options.repeat));
                     const auto composed_snapshot = [&](cudaStream_t launch_stream) {
                         ops::gdn_input_proj(x, qk_weight.weight, value_weight.weight, out,
                                             workspace, launch_stream);
@@ -399,17 +282,17 @@ int main(int argc, char** argv) {
                         ops::extract_bf16_columns(convolved, 2 * kGdnKeyRows, tv, launch_stream);
                     };
                     append_result(results, "gdn", "composed_projection_conv_snapshot", t,
-                                  measure_cold(composed_snapshot, flush, stream, options.warmup,
-                                               options.repeat));
+                                  bench::measure_cold_launch(composed_snapshot, flush, stream,
+                                                             options.warmup, options.repeat));
                 }
                 if (t <= 16) {
                     const auto projections = [&](cudaStream_t launch_stream) {
                         ops::linear(x, qk_weight.weight, qk, workspace, launch_stream);
                         ops::linear(x, value_weight.weight, value, workspace, launch_stream);
                     };
-                    append_result(
-                        results, "gdn", "control_projection_only", t,
-                        measure_cold(projections, flush, stream, options.warmup, options.repeat));
+                    append_result(results, "gdn", "control_projection_only", t,
+                                  bench::measure_cold_launch(projections, flush, stream,
+                                                             options.warmup, options.repeat));
                     const auto materialize_copy = [&](cudaStream_t launch_stream) {
                         projections(launch_stream);
                         CUDA_CHECK(cudaMemcpy2DAsync(out.data, out.nb[1], qk.data, qk.nb[1],
@@ -422,8 +305,8 @@ int main(int argc, char** argv) {
                                                      cudaMemcpyDeviceToDevice, launch_stream));
                     };
                     append_result(results, "gdn", "control_materialize_copy", t,
-                                  measure_cold(materialize_copy, flush, stream, options.warmup,
-                                               options.repeat));
+                                  bench::measure_cold_launch(materialize_copy, flush, stream,
+                                                             options.warmup, options.repeat));
                 }
             }
         }

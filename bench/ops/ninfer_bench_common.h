@@ -11,6 +11,9 @@
 // a same-topology payload control, and only the profiler evidence needed for the
 // concrete kernel question.
 
+#include "core/arena.h"
+#include "core/device.h"
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -19,41 +22,12 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <stdexcept>
 #include <vector>
 
 namespace ninfer::bench {
 
 constexpr double kRooflineGBs = 1792.0; // RTX 5090 GDDR7 bandwidth roofline.
-
-struct DBuf {
-    void* p           = nullptr;
-    std::size_t bytes = 0;
-
-    explicit DBuf(std::size_t b) : bytes(b) { cudaMalloc(&p, b); }
-
-    ~DBuf() {
-        if (p) cudaFree(p);
-    }
-
-    DBuf(DBuf&& o) noexcept : p(o.p), bytes(o.bytes) {
-        o.p     = nullptr;
-        o.bytes = 0;
-    }
-
-    DBuf& operator=(DBuf&& o) noexcept {
-        if (this != &o) {
-            if (p) cudaFree(p);
-            p       = o.p;
-            bytes   = o.bytes;
-            o.p     = nullptr;
-            o.bytes = 0;
-        }
-        return *this;
-    }
-
-    DBuf(const DBuf&)            = delete;
-    DBuf& operator=(const DBuf&) = delete;
-};
 
 inline std::uint16_t f32_to_bf16(float f) {
     std::uint32_t u;
@@ -64,18 +38,18 @@ inline std::uint16_t f32_to_bf16(float f) {
 }
 
 // Device bf16 buffer filled with a small varied ramp (avoids all-zero special
-// paths; exact values are irrelevant to bandwidth). Returns an owning DBuf.
-inline DBuf make_bf16(std::size_t n) {
+// paths; exact values are irrelevant to bandwidth). Returns an owning DeviceBuffer.
+inline DeviceBuffer make_bf16(std::size_t n) {
     std::vector<std::uint16_t> h(n);
     for (std::size_t i = 0; i < n; ++i) h[i] = f32_to_bf16(0.5f - float(i % 251) / 250.0f);
-    DBuf d(n * 2);
-    cudaMemcpy(d.p, h.data(), n * 2, cudaMemcpyHostToDevice);
+    DeviceBuffer d(n * 2);
+    d.copy_from_host(h.data(), d.bytes);
     return d;
 }
 
-inline DBuf make_zeros(std::size_t bytes) {
-    DBuf d(bytes);
-    cudaMemset(d.p, 0, bytes);
+inline DeviceBuffer make_zeros(std::size_t bytes) {
+    DeviceBuffer d(bytes);
+    d.fill();
     return d;
 }
 
@@ -83,6 +57,146 @@ inline DBuf make_zeros(std::size_t bytes) {
 // GB/s is informational anyway (ncu is the acceptance gate), so report against
 // the known RTX 5090 roofline constant.
 inline double device_peak_bw_gbs(int /*dev*/ = 0) { return kRooflineGBs; }
+
+struct ColdTiming {
+    double median_us = 0.0;
+    double min_us    = 0.0;
+    double p95_us    = 0.0;
+};
+
+class TimedGraph {
+public:
+    TimedGraph() {
+        CUDA_CHECK(cudaEventCreate(&start_));
+        CUDA_CHECK(cudaEventCreate(&stop_));
+    }
+
+    ~TimedGraph() {
+        if (exec_ != nullptr) { cudaGraphExecDestroy(exec_); }
+        if (graph_ != nullptr) { cudaGraphDestroy(graph_); }
+        if (start_ != nullptr) { cudaEventDestroy(start_); }
+        if (stop_ != nullptr) { cudaEventDestroy(stop_); }
+    }
+
+    TimedGraph(const TimedGraph&)            = delete;
+    TimedGraph& operator=(const TimedGraph&) = delete;
+
+    template <class Body>
+    void capture(cudaStream_t stream, Body&& body) {
+        if (graph_ != nullptr || exec_ != nullptr) {
+            throw std::logic_error("benchmark graph is already captured");
+        }
+        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        try {
+            body(stream);
+        } catch (...) {
+            cudaGraph_t discard = nullptr;
+            cudaStreamEndCapture(stream, &discard);
+            if (discard != nullptr) { cudaGraphDestroy(discard); }
+            throw;
+        }
+        CUDA_CHECK(cudaStreamEndCapture(stream, &graph_));
+        CUDA_CHECK(cudaGraphInstantiate(&exec_, graph_, 0));
+        CUDA_CHECK(cudaGraphGetNodes(graph_, nullptr, &nodes_));
+        if (nodes_ == 0) { throw std::runtime_error("captured benchmark graph is empty"); }
+    }
+
+    void launch(cudaStream_t stream) const { CUDA_CHECK(cudaGraphLaunch(exec_, stream)); }
+
+    double launch_timed(cudaStream_t stream) const {
+        CUDA_CHECK(cudaEventRecord(start_, stream));
+        launch(stream);
+        CUDA_CHECK(cudaEventRecord(stop_, stream));
+        CUDA_CHECK(cudaEventSynchronize(stop_));
+        float milliseconds = 0.0F;
+        CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start_, stop_));
+        return static_cast<double>(milliseconds) * 1000.0;
+    }
+
+    [[nodiscard]] std::size_t nodes() const noexcept { return nodes_; }
+
+private:
+    cudaGraph_t graph_    = nullptr;
+    cudaGraphExec_t exec_ = nullptr;
+    cudaEvent_t start_    = nullptr;
+    cudaEvent_t stop_     = nullptr;
+    std::size_t nodes_    = 0;
+};
+
+inline void flush_l2(DeviceBuffer& flush, cudaStream_t stream) {
+    CUDA_CHECK(cudaMemsetAsync(flush.p, 0xa5, flush.bytes, stream));
+}
+
+template <class Launch>
+ColdTiming measure_cold_launch(Launch&& launch, DeviceBuffer& flush, cudaStream_t stream,
+                               int warmup, int repeat) {
+    if (warmup < 0 || repeat <= 0) {
+        throw std::invalid_argument(
+            "cold benchmark requires nonnegative warmup and positive repeat");
+    }
+
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop  = nullptr;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    for (int index = 0; index < warmup; ++index) {
+        flush_l2(flush, stream);
+        launch(stream);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<double> samples;
+    samples.reserve(static_cast<std::size_t>(repeat));
+    for (int index = 0; index < repeat; ++index) {
+        flush_l2(flush, stream);
+        CUDA_CHECK(cudaEventRecord(start, stream));
+        launch(stream);
+        CUDA_CHECK(cudaEventRecord(stop, stream));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float milliseconds = 0.0F;
+        CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
+        samples.push_back(static_cast<double>(milliseconds) * 1000.0);
+    }
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    std::sort(samples.begin(), samples.end());
+    return {
+        samples[samples.size() / 2],
+        samples.front(),
+        samples[std::min(samples.size() - 1,
+                         static_cast<std::size_t>(0.95 * static_cast<double>(samples.size())))],
+    };
+}
+
+inline ColdTiming measure_cold_graph(const TimedGraph& graph, DeviceBuffer& flush,
+                                     cudaStream_t stream, int warmup, int repeat) {
+    if (warmup < 0 || repeat <= 0) {
+        throw std::invalid_argument(
+            "cold benchmark requires nonnegative warmup and positive repeat");
+    }
+    for (int index = 0; index < warmup; ++index) {
+        flush_l2(flush, stream);
+        graph.launch(stream);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<double> samples;
+    samples.reserve(static_cast<std::size_t>(repeat));
+    for (int index = 0; index < repeat; ++index) {
+        flush_l2(flush, stream);
+        samples.push_back(graph.launch_timed(stream));
+    }
+    std::sort(samples.begin(), samples.end());
+    const auto percentile = [&](double fraction) {
+        const std::size_t index =
+            std::min(samples.size() - 1,
+                     static_cast<std::size_t>(fraction * static_cast<double>(samples.size() - 1)));
+        return samples[index];
+    };
+    return {percentile(0.50), samples.front(), percentile(0.95)};
+}
 
 struct Result {
     int n_runs       = 0;

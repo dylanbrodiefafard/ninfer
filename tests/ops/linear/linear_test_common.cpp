@@ -372,50 +372,6 @@ SimulatedLinearWeight make_weight(const FormatSpec& spec, std::int32_t n, std::i
     return result;
 }
 
-class DeviceBuffer {
-public:
-    explicit DeviceBuffer(std::size_t bytes) : bytes_(bytes) {
-        if (bytes_ != 0) { cuda_check(cudaMalloc(&data_, bytes_), "cudaMalloc"); }
-    }
-
-    ~DeviceBuffer() {
-        if (data_ != nullptr) { cudaFree(data_); }
-    }
-
-    DeviceBuffer(const DeviceBuffer&)            = delete;
-    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
-
-    void* data() const { return data_; }
-
-    std::size_t bytes() const { return bytes_; }
-
-    void copy_from(const void* source, std::size_t bytes, std::size_t offset = 0) {
-        if (offset > bytes_ || bytes > bytes_ - offset) {
-            throw std::out_of_range("linear test: device upload exceeds buffer");
-        }
-        if (bytes != 0) {
-            cuda_check(cudaMemcpy(static_cast<std::uint8_t*>(data_) + offset, source, bytes,
-                                  cudaMemcpyHostToDevice),
-                       "cudaMemcpy host to device");
-        }
-    }
-
-    void copy_to(void* destination, std::size_t bytes, std::size_t offset = 0) const {
-        if (offset > bytes_ || bytes > bytes_ - offset) {
-            throw std::out_of_range("linear test: device download exceeds buffer");
-        }
-        if (bytes != 0) {
-            cuda_check(cudaMemcpy(destination, static_cast<const std::uint8_t*>(data_) + offset,
-                                  bytes, cudaMemcpyDeviceToHost),
-                       "cudaMemcpy device to host");
-        }
-    }
-
-private:
-    void* data_        = nullptr;
-    std::size_t bytes_ = 0;
-};
-
 class GuardedOutput {
 public:
     explicit GuardedOutput(std::size_t words)
@@ -423,10 +379,10 @@ public:
         poison();
     }
 
-    void* data() const { return static_cast<std::uint8_t*>(storage_.data()) + kOutputGuardBytes; }
+    void* data() const { return static_cast<std::uint8_t*>(storage_.p) + kOutputGuardBytes; }
 
     void poison() {
-        cuda_check(cudaMemset(storage_.data(), kOutputGuardByte, storage_.bytes()),
+        cuda_check(cudaMemset(storage_.p, kOutputGuardByte, storage_.bytes),
                    "poison output guards");
         cuda_check(cudaMemset(data(), kOutputPoisonByte, words_ * sizeof(std::uint16_t)),
                    "poison linear output");
@@ -435,9 +391,9 @@ public:
     int verify_guards(std::string_view label) const {
         std::array<std::uint8_t, kOutputGuardBytes> prefix{};
         std::array<std::uint8_t, kOutputGuardBytes> suffix{};
-        storage_.copy_to(prefix.data(), prefix.size());
-        storage_.copy_to(suffix.data(), suffix.size(),
-                         kOutputGuardBytes + words_ * sizeof(std::uint16_t));
+        storage_.copy_to_host(prefix.data(), prefix.size());
+        storage_.copy_to_host(suffix.data(), suffix.size(),
+                              kOutputGuardBytes + words_ * sizeof(std::uint16_t));
         const auto intact = [](const auto& bytes) {
             return std::all_of(bytes.begin(), bytes.end(),
                                [](std::uint8_t value) { return value == kOutputGuardByte; });
@@ -739,10 +695,10 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
         make_activation(shape.k, maximum->t, shape.seed + 1U);
 
     DeviceBuffer device_activation(activation_bits.size() * sizeof(std::uint16_t));
-    device_activation.copy_from(activation_bits.data(), device_activation.bytes());
+    device_activation.copy_from_host(activation_bits.data(), device_activation.bytes);
     DeviceBuffer device_weight(host_weight.packed_payload.size());
-    device_weight.copy_from(host_weight.packed_payload.data(), device_weight.bytes());
-    const Weight weight = host_weight.device_weight(device_weight.data());
+    device_weight.copy_from_host(host_weight.packed_payload.data(), device_weight.bytes);
+    const Weight weight = host_weight.device_weight(device_weight.p);
     WorkspaceArena workspace(64U << 20);
 
     std::vector<double> full_reference;
@@ -761,7 +717,7 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
                                        std::to_string(shape.k) +
                                        "] T=" + std::to_string(invocation.t);
         GuardedOutput output(checked_elements(shape.n, invocation.t, "guarded output"));
-        Tensor input(device_activation.data(), DType::BF16, {shape.k, invocation.t});
+        Tensor input(device_activation.p, DType::BF16, {shape.k, invocation.t});
         Tensor destination(output.data(), DType::BF16, {shape.n, invocation.t});
         workspace.reset();
         try {
@@ -808,13 +764,13 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
 
     if (shape.verify_input_preservation) {
         std::vector<std::uint16_t> activation_after(activation_bits.size());
-        device_activation.copy_to(activation_after.data(), device_activation.bytes());
+        device_activation.copy_to_host(activation_after.data(), device_activation.bytes);
         if (activation_after != activation_bits) {
             std::cerr << label << ": linear modified its activation input\n";
             ++failures;
         }
         std::vector<std::uint8_t> weight_after(host_weight.packed_payload.size());
-        device_weight.copy_to(weight_after.data(), device_weight.bytes());
+        device_weight.copy_to_host(weight_after.data(), device_weight.bytes);
         if (weight_after != host_weight.packed_payload) {
             std::cerr << label << ": linear modified its persistent weight\n";
             ++failures;

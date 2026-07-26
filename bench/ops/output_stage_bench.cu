@@ -8,6 +8,7 @@
 
 #include "core/device.h"
 #include "ninfer_bench_common.h"
+#include "quantized_weight.cuh"
 #include "ops/launcher/argmax.h"
 #include "ops/linear/q6/q6_dispatch.h"
 
@@ -40,75 +41,6 @@ struct Options {
     int repeat             = 50;
     std::size_t flush_size = kDefaultFlushSize;
 };
-
-struct Timing {
-    double median_us = 0.0;
-    double min_us    = 0.0;
-    double p95_us    = 0.0;
-};
-
-struct Q6Weight {
-    bench::DBuf storage;
-    Weight weight{};
-};
-
-std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
-    return ((value + alignment - 1) / alignment) * alignment;
-}
-
-__global__ void fill_q6_scales(std::uint16_t* scales, std::uint64_t groups) {
-    const std::uint64_t begin = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::uint64_t step  = static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
-    for (std::uint64_t group = begin; group < groups; group += step) {
-        scales[group] = 0x3c00u; // FP16 1.0
-    }
-}
-
-Q6Weight make_q6_weight() {
-    constexpr std::int32_t group = 64;
-    const std::uint64_t groups =
-        static_cast<std::uint64_t>(kVocab) * static_cast<std::uint64_t>(kHidden / group);
-    const std::uint64_t code_bytes   = groups * 32;
-    const std::uint64_t high_offset  = align_up(code_bytes, 256);
-    const std::uint64_t high_bytes   = groups * 16;
-    const std::uint64_t scale_offset = high_offset + align_up(high_bytes, 256);
-    const std::uint64_t scale_bytes  = groups * sizeof(std::uint16_t);
-
-    Q6Weight result{bench::DBuf(static_cast<std::size_t>(scale_offset + scale_bytes)), {}};
-    CUDA_CHECK(cudaMemset(result.storage.p, 0x35, code_bytes));
-    CUDA_CHECK(
-        cudaMemset(static_cast<std::uint8_t*>(result.storage.p) + high_offset, 0x12, high_bytes));
-    constexpr int block = 256;
-    const int grid      = static_cast<int>(
-        std::min<std::uint64_t>(65535, std::max<std::uint64_t>(1, (groups + block - 1) / block)));
-    fill_q6_scales<<<grid, block>>>(
-        reinterpret_cast<std::uint16_t*>(static_cast<std::uint8_t*>(result.storage.p) +
-                                         scale_offset),
-        groups);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    Weight& weight          = result.weight;
-    weight.payload          = result.storage.p;
-    weight.payload_bytes    = result.storage.bytes;
-    weight.high_plane_bytes = high_bytes;
-    weight.qtype            = QType::Q6G64_F16S;
-    weight.layout           = QuantLayout::RowSplit;
-    weight.scale_dtype      = DType::FP16;
-    weight.group_size       = group;
-    weight.shape[0]         = kVocab;
-    weight.shape[1]         = kHidden;
-    weight.padded_shape[0]  = kVocab;
-    weight.padded_shape[1]  = kHidden;
-    weight.ndim             = 2;
-    weight.qdata            = result.storage.p;
-    weight.qhigh            = static_cast<std::uint8_t*>(result.storage.p) + high_offset;
-    weight.scales           = static_cast<std::uint8_t*>(result.storage.p) + scale_offset;
-    weight.n                = kVocab;
-    weight.k                = kHidden;
-    weight.group            = group;
-    return result;
-}
 
 std::vector<std::int32_t> parse_t_sweep(std::string_view raw) {
     std::vector<std::int32_t> result;
@@ -170,83 +102,6 @@ Options parse_options(int argc, char** argv) {
     return options;
 }
 
-class TimedGraph {
-public:
-    TimedGraph() {
-        CUDA_CHECK(cudaEventCreate(&start_));
-        CUDA_CHECK(cudaEventCreate(&stop_));
-    }
-
-    ~TimedGraph() {
-        if (exec_ != nullptr) cudaGraphExecDestroy(exec_);
-        if (graph_ != nullptr) cudaGraphDestroy(graph_);
-        if (start_ != nullptr) cudaEventDestroy(start_);
-        if (stop_ != nullptr) cudaEventDestroy(stop_);
-    }
-
-    template <class Body>
-    void capture(cudaStream_t stream, Body&& body) {
-        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-        try {
-            body(stream);
-        } catch (...) {
-            cudaGraph_t discard = nullptr;
-            cudaStreamEndCapture(stream, &discard);
-            if (discard != nullptr) cudaGraphDestroy(discard);
-            throw;
-        }
-        CUDA_CHECK(cudaStreamEndCapture(stream, &graph_));
-        CUDA_CHECK(cudaGraphInstantiate(&exec_, graph_, 0));
-        CUDA_CHECK(cudaGraphGetNodes(graph_, nullptr, &nodes_));
-        if (nodes_ == 0) { throw std::runtime_error("captured output-stage graph is empty"); }
-    }
-
-    void launch(cudaStream_t stream) const { CUDA_CHECK(cudaGraphLaunch(exec_, stream)); }
-
-    double launch_timed(cudaStream_t stream) const {
-        CUDA_CHECK(cudaEventRecord(start_, stream));
-        launch(stream);
-        CUDA_CHECK(cudaEventRecord(stop_, stream));
-        CUDA_CHECK(cudaEventSynchronize(stop_));
-        float milliseconds = 0.0F;
-        CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start_, stop_));
-        return static_cast<double>(milliseconds) * 1000.0;
-    }
-
-    std::size_t nodes() const noexcept { return nodes_; }
-
-private:
-    cudaGraph_t graph_    = nullptr;
-    cudaGraphExec_t exec_ = nullptr;
-    cudaEvent_t start_    = nullptr;
-    cudaEvent_t stop_     = nullptr;
-    std::size_t nodes_    = 0;
-};
-
-Timing measure_cold(const TimedGraph& graph, bench::DBuf& flush, cudaStream_t stream, int warmup,
-                    int repeat) {
-    for (int i = 0; i < warmup; ++i) {
-        CUDA_CHECK(cudaMemsetAsync(flush.p, 0xa5, flush.bytes, stream));
-        graph.launch(stream);
-    }
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    std::vector<double> samples;
-    samples.reserve(static_cast<std::size_t>(repeat));
-    for (int i = 0; i < repeat; ++i) {
-        CUDA_CHECK(cudaMemsetAsync(flush.p, 0xa5, flush.bytes, stream));
-        samples.push_back(graph.launch_timed(stream));
-    }
-    std::sort(samples.begin(), samples.end());
-    const auto percentile = [&](double q) {
-        const std::size_t index =
-            std::min(samples.size() - 1,
-                     static_cast<std::size_t>(q * static_cast<double>(samples.size() - 1)));
-        return samples[index];
-    };
-    return {percentile(0.50), samples.front(), percentile(0.95)};
-}
-
 const char* q6_launch_name(ops::detail::Q6Launch launch) {
     if (launch == ops::detail::launch_q6_simt_r8_c4) { return "q6.simt.r8_c4"; }
     if (launch == ops::detail::launch_q6_simt_r8_c8) { return "q6.simt.r8_c8"; }
@@ -259,15 +114,19 @@ int run(const Options& options) {
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
-    Q6Weight head        = make_q6_weight();
-    bench::DBuf residual = bench::make_bf16(static_cast<std::size_t>(kHidden) * kMaxTokens);
+    bench::PackedQuantizedWeight head = bench::make_row_split_weight(
+        QType::Q6G64_F16S, kVocab, kHidden, kHidden, {0x35, 0x12, 0x3c00});
+    ninfer::DeviceBuffer residual =
+        bench::make_bf16(static_cast<std::size_t>(kHidden) * kMaxTokens);
     std::vector<std::uint16_t> norm_host(kHidden, bench::f32_to_bf16(0.0F));
-    bench::DBuf norm(norm_host.size() * sizeof(std::uint16_t));
+    ninfer::DeviceBuffer norm(norm_host.size() * sizeof(std::uint16_t));
     CUDA_CHECK(cudaMemcpy(norm.p, norm_host.data(), norm.bytes, cudaMemcpyHostToDevice));
-    bench::DBuf hidden(static_cast<std::size_t>(kHidden) * kMaxTokens * sizeof(std::uint16_t));
-    bench::DBuf logits(static_cast<std::size_t>(kVocab) * kMaxTokens * sizeof(std::uint16_t));
-    bench::DBuf tokens(static_cast<std::size_t>(kMaxTokens) * sizeof(std::int32_t));
-    bench::DBuf flush(options.flush_size);
+    ninfer::DeviceBuffer hidden(static_cast<std::size_t>(kHidden) * kMaxTokens *
+                                sizeof(std::uint16_t));
+    ninfer::DeviceBuffer logits(static_cast<std::size_t>(kVocab) * kMaxTokens *
+                                sizeof(std::uint16_t));
+    ninfer::DeviceBuffer tokens(static_cast<std::size_t>(kMaxTokens) * sizeof(std::int32_t));
+    ninfer::DeviceBuffer flush(options.flush_size);
     WorkspaceArena workspace(1);
 
     std::printf("# gpu=RTX_5090 cuda=13.1 sm=120a flush_mib=%zu warmup=%d repeat=%d\n",
@@ -297,9 +156,10 @@ int run(const Options& options) {
 
         body(stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        TimedGraph graph;
+        bench::TimedGraph graph;
         graph.capture(stream, body);
-        const Timing timing = measure_cold(graph, flush, stream, options.warmup, options.repeat);
+        const bench::ColdTiming timing =
+            bench::measure_cold_graph(graph, flush, stream, options.warmup, options.repeat);
         const std::string argmax_route = options.argmax_block == 0
                                              ? "production-b512"
                                              : "candidate-b" + std::to_string(options.argmax_block);

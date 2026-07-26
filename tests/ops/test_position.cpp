@@ -12,7 +12,7 @@ using namespace ninfer::test;
 namespace {
 
 int position_case(int count, int start, int delta_value, bool in_place) {
-    DBuf filled(static_cast<std::size_t>(count) * sizeof(int));
+    DeviceBuffer filled(static_cast<std::size_t>(count) * sizeof(int));
     Tensor filled_tensor(filled.p, DType::I32, {count});
     ops::fill_i32_positions(filled_tensor, start, nullptr);
     cudaDeviceSynchronize();
@@ -24,8 +24,8 @@ int position_case(int count, int start, int delta_value, bool in_place) {
         return 1;
     }
 
-    DBuf delta = to_device_i32({delta_value});
-    DBuf offset(static_cast<std::size_t>(count) * sizeof(int));
+    DeviceBuffer delta = to_device_i32({delta_value});
+    DeviceBuffer offset(static_cast<std::size_t>(count) * sizeof(int));
     Tensor delta_tensor(delta.p, DType::I32, {1});
     Tensor offset_tensor(offset.p, DType::I32, {count});
     Tensor& destination = in_place ? filled_tensor : offset_tensor;

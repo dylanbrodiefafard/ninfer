@@ -81,8 +81,8 @@ static int one_shape(const char* tag, int vocab, int t_count, std::uint32_t seed
     std::vector<int> ref(static_cast<std::size_t>(t_count));
     cpu_argmax(logits, vocab, t_count, ref);
 
-    DBuf dlogits = to_device_bf16(logits);
-    DBuf dout    = to_device_i32(std::vector<int>(static_cast<std::size_t>(t_count), -777));
+    DeviceBuffer dlogits = to_device_bf16(logits);
+    DeviceBuffer dout    = to_device_i32(std::vector<int>(static_cast<std::size_t>(t_count), -777));
     Tensor tlogits(dlogits.p, DType::BF16, {vocab, t_count});
     Tensor tout(dout.p, DType::I32, {t_count});
 
@@ -110,8 +110,8 @@ static int physical_stride_and_valid_rows(int cols) {
     }
     round_to_bf16(logits);
 
-    DBuf dlogits = to_device_bf16(logits);
-    DBuf dout    = to_device_i32(std::vector<int>(cols, -1));
+    DeviceBuffer dlogits = to_device_bf16(logits);
+    DeviceBuffer dout    = to_device_i32(std::vector<int>(cols, -1));
     Tensor tlogits(dlogits.p, DType::BF16, {physical_rows, cols});
     Tensor tout(dout.p, DType::I32, {cols});
     ops::argmax(tlogits, tout, valid_rows, nullptr);
@@ -128,8 +128,8 @@ static int shortlist_shape() {
     logits[rows - 1]       = 20.0f;
     round_to_bf16(logits);
 
-    DBuf dlogits = to_device_bf16(logits);
-    DBuf dout    = to_device_i32({-1});
+    DeviceBuffer dlogits = to_device_bf16(logits);
+    DeviceBuffer dout    = to_device_i32({-1});
     Tensor tlogits(dlogits.p, DType::BF16, {rows, 1});
     Tensor tout(dout.p, DType::I32, {1});
     ops::argmax(tlogits, tout, rows, nullptr);
@@ -166,8 +166,8 @@ static int validation_checks() {
 
     std::vector<float> logits_h(4, -1.0f);
     round_to_bf16(logits_h);
-    DBuf dlogits = to_device_bf16(logits_h);
-    DBuf dout    = to_device_i32(std::vector<int>(2, -1));
+    DeviceBuffer dlogits = to_device_bf16(logits_h);
+    DeviceBuffer dout    = to_device_i32(std::vector<int>(2, -1));
     Tensor logits(dlogits.p, DType::BF16, {2, 2});
     Tensor out(dout.p, DType::I32, {2});
 

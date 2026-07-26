@@ -111,7 +111,7 @@ Options parse_args(int argc, char** argv) {
     return options;
 }
 
-DBuf make_logits(int cols) {
+DeviceBuffer make_logits(int cols) {
     std::vector<std::uint16_t> host(static_cast<std::size_t>(kPhysicalRows) * cols);
     for (int col = 0; col < cols; ++col) {
         const int hot = (17 + col * 7919) % kTokenDomain;
@@ -122,24 +122,24 @@ DBuf make_logits(int cols) {
             host[static_cast<std::size_t>(col) * kPhysicalRows + row] = f32_to_bf16(value);
         }
     }
-    DBuf device(host.size() * sizeof(std::uint16_t));
+    DeviceBuffer device(host.size() * sizeof(std::uint16_t));
     CUDA_CHECK(cudaMemcpy(device.p, host.data(), device.bytes, cudaMemcpyHostToDevice));
     return device;
 }
 
-DBuf make_i32(const std::vector<std::int32_t>& host) {
-    DBuf device(host.size() * sizeof(std::int32_t));
+DeviceBuffer make_i32(const std::vector<std::int32_t>& host) {
+    DeviceBuffer device(host.size() * sizeof(std::int32_t));
     CUDA_CHECK(cudaMemcpy(device.p, host.data(), device.bytes, cudaMemcpyHostToDevice));
     return device;
 }
 
-DBuf make_i64_zero(std::size_t count) {
-    DBuf device(count * sizeof(std::int64_t));
+DeviceBuffer make_i64_zero(std::size_t count) {
+    DeviceBuffer device(count * sizeof(std::int64_t));
     CUDA_CHECK(cudaMemset(device.p, 0, device.bytes));
     return device;
 }
 
-DBuf make_config(DBuf& counts, Mode mode, bool counts_active, int top_k) {
+DeviceBuffer make_config(DeviceBuffer& counts, Mode mode, bool counts_active, int top_k) {
     ops::SamplingConfig config;
     config.temperature      = mode == Mode::Greedy ? 0.0f : 0.6f;
     config.top_k            = top_k;
@@ -149,7 +149,7 @@ DBuf make_config(DBuf& counts, Mode mode, bool counts_active, int top_k) {
     config.token_counts =
         mode == Mode::Stochastic && counts_active ? static_cast<std::int32_t*>(counts.p) : nullptr;
 
-    DBuf device(sizeof(ops::SamplingConfig));
+    DeviceBuffer device(sizeof(ops::SamplingConfig));
     CUDA_CHECK(cudaMemcpy(device.p, &config, sizeof(config), cudaMemcpyHostToDevice));
     return device;
 }
@@ -160,11 +160,12 @@ double stochastic_payload_bytes(int cols, bool counts_active) {
     return per_col * static_cast<double>(cols);
 }
 
-void run_sample(DBuf& logits, DBuf& counts, Mode mode, bool counts_active, int top_k) {
+void run_sample(DeviceBuffer& logits, DeviceBuffer& counts, Mode mode, bool counts_active,
+                int top_k) {
     CUDA_CHECK(cudaMemset(counts.p, 0, counts.bytes));
-    DBuf config = make_config(counts, mode, counts_active, top_k);
-    DBuf out(sizeof(std::int32_t));
-    DBuf pos(sizeof(std::int32_t));
+    DeviceBuffer config = make_config(counts, mode, counts_active, top_k);
+    DeviceBuffer out(sizeof(std::int32_t));
+    DeviceBuffer pos(sizeof(std::int32_t));
     CUDA_CHECK(cudaMemset(pos.p, 0, pos.bytes));
     Tensor tlogits(logits.p, DType::BF16, {kPhysicalRows, 1});
     Tensor tout(out.p, DType::I32, {1});
@@ -187,9 +188,10 @@ void run_sample(DBuf& logits, DBuf& counts, Mode mode, bool counts_active, int t
     print_result(label.c_str(), result);
 }
 
-void run_mtp(DBuf& logits, DBuf& counts, int k, Mode mode, bool counts_active, int top_k) {
+void run_mtp(DeviceBuffer& logits, DeviceBuffer& counts, int k, Mode mode, bool counts_active,
+             int top_k) {
     CUDA_CHECK(cudaMemset(counts.p, 0, counts.bytes));
-    DBuf config = make_config(counts, mode, counts_active, top_k);
+    DeviceBuffer config = make_config(counts, mode, counts_active, top_k);
     std::vector<std::int32_t> target_host(static_cast<std::size_t>(k + 1));
     std::vector<std::int32_t> draft_host(static_cast<std::size_t>(k));
     for (int col = 0; col <= k; ++col) {
@@ -198,14 +200,14 @@ void run_mtp(DBuf& logits, DBuf& counts, int k, Mode mode, bool counts_active, i
             draft_host[static_cast<std::size_t>(col)] = target_host[static_cast<std::size_t>(col)];
         }
     }
-    DBuf targets = make_i32(target_host);
-    DBuf drafts  = make_i32(draft_host);
-    DBuf length  = make_i32({128});
-    DBuf token   = make_i32({-1});
-    DBuf sampled(static_cast<std::size_t>(k + 1) * sizeof(std::int32_t));
-    DBuf num(sizeof(std::int32_t));
-    DBuf accepted(sizeof(std::int32_t));
-    DBuf stats = make_i64_zero(kStats);
+    DeviceBuffer targets = make_i32(target_host);
+    DeviceBuffer drafts  = make_i32(draft_host);
+    DeviceBuffer length  = make_i32({128});
+    DeviceBuffer token   = make_i32({-1});
+    DeviceBuffer sampled(static_cast<std::size_t>(k + 1) * sizeof(std::int32_t));
+    DeviceBuffer num(sizeof(std::int32_t));
+    DeviceBuffer accepted(sizeof(std::int32_t));
+    DeviceBuffer stats = make_i64_zero(kStats);
 
     Tensor ttargets(targets.p, DType::I32, {k + 1});
     Tensor tlogits(logits.p, DType::BF16, {kPhysicalRows, k + 1});
@@ -247,8 +249,8 @@ int main(int argc, char** argv) {
     try {
         const Options options = parse_args(argc, argv);
         const int max_cols    = options.matrix ? 6 : (options.mtp ? options.mtp_k + 1 : 1);
-        DBuf logits           = make_logits(max_cols);
-        DBuf counts(static_cast<std::size_t>(kTokenDomain) * sizeof(std::int32_t));
+        DeviceBuffer logits   = make_logits(max_cols);
+        DeviceBuffer counts(static_cast<std::size_t>(kTokenDomain) * sizeof(std::int32_t));
         CUDA_CHECK(cudaMemset(counts.p, 0, counts.bytes));
 
         std::printf("payload: physical_rows=%d token_domain=%d logits=%.3f MiB/col "

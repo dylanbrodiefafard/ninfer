@@ -128,9 +128,9 @@ __global__ void argmax_payload_control_kernel(const std::uint16_t* logits, std::
 
 void run_shape(std::int32_t physical_rows, std::int32_t valid_rows, int cols, bool control,
                int candidate_block, const char* shape) {
-    DBuf logits       = make_bf16(static_cast<std::size_t>(physical_rows) * kLogitSlots);
-    DBuf out          = make_zeros(static_cast<std::size_t>(cols) * sizeof(std::int32_t));
-    auto* logits_base = static_cast<std::uint16_t*>(logits.p);
+    DeviceBuffer logits = make_bf16(static_cast<std::size_t>(physical_rows) * kLogitSlots);
+    DeviceBuffer out    = make_zeros(static_cast<std::size_t>(cols) * sizeof(std::int32_t));
+    auto* logits_base   = static_cast<std::uint16_t*>(logits.p);
     Tensor tout(out.p, DType::I32, {cols});
 
     const double bytes     = static_cast<double>(valid_rows) * 2.0 * static_cast<double>(cols);

@@ -73,15 +73,15 @@ int one_case(const std::vector<int>& cu, std::uint32_t seed, bool packed, int un
     std::vector<double> reference(plane);
     reference_attention(q, k, v, cu, reference);
 
-    DBuf dcu = to_device_i32(cu);
-    DBuf dout(plane * 2);
+    DeviceBuffer dcu = to_device_i32(cu);
+    DeviceBuffer dout(plane * 2);
     Tensor tq;
     Tensor tk;
     Tensor tv;
-    DBuf storage(packed ? plane * 3 * 2 : 1);
-    DBuf dq(packed ? 1 : plane * 2);
-    DBuf dk(packed ? 1 : plane * 2);
-    DBuf dv(packed ? 1 : plane * 2);
+    DeviceBuffer storage(packed ? plane * 3 * 2 : 1);
+    DeviceBuffer dq(packed ? 1 : plane * 2);
+    DeviceBuffer dk(packed ? 1 : plane * 2);
+    DeviceBuffer dv(packed ? 1 : plane * 2);
     if (packed) {
         std::vector<float> qkv(plane * 3);
         const std::size_t token_plane = static_cast<std::size_t>(kHeads) * kDim;
@@ -120,7 +120,8 @@ int one_case(const std::vector<int>& cu, std::uint32_t seed, bool packed, int un
     WorkspaceArena workspace(256);
     const int scratch_count =
         raw_scratch ? ops::vision_attention_scratch_tiles(patches, int(cu.size()) - 1) : 0;
-    DBuf dscratch(std::max<std::size_t>(1, static_cast<std::size_t>(scratch_count) * 4 * 4));
+    DeviceBuffer dscratch(
+        std::max<std::size_t>(1, static_cast<std::size_t>(scratch_count) * 4 * 4));
     if (uniform_tile > 0) {
         ops::detail::vision_attention_uniform_launch_with_tile(tq, tk, tv, cu[1] - cu[0],
                                                                uniform_tile, tout, nullptr);

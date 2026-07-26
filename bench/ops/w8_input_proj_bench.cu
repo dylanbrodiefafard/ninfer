@@ -8,6 +8,7 @@
 
 #include "core/device.h"
 #include "ninfer_bench_common.h"
+#include "quantized_weight.cuh"
 #include "ops/attn_input_proj/w8/w8_attn_input_kernels.h"
 #include "ops/attn_input_proj/w8/w8_attn_input_plan.h"
 #include "ops/gdn_input_proj/w8/w8_gdn_input_kernels.h"
@@ -56,77 +57,12 @@ struct Options {
     bool production_only = false;
 };
 
-struct Stats {
-    double median_us;
-    double min_us;
-    double p95_us;
-};
-
 struct Result {
     std::string op;
     std::string path;
     std::int32_t t;
-    Stats timing;
+    bench::ColdTiming timing;
 };
-
-struct DevicePackedWeight {
-    explicit DevicePackedWeight(std::size_t bytes) : storage(bytes) {}
-
-    bench::DBuf storage;
-    Weight weight{};
-};
-
-__global__ void fill_w8_scales(std::uint8_t* scales, std::uint64_t groups) {
-    const std::uint64_t begin = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::uint64_t step  = static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
-    for (std::uint64_t group = begin; group < groups; group += step) {
-        scales[group * 2]     = 0x00u;
-        scales[group * 2 + 1] = 0x3cu;
-    }
-}
-
-std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
-    return ((value + alignment - 1) / alignment) * alignment;
-}
-
-DevicePackedWeight make_w8_weight(std::int32_t rows) {
-    constexpr std::int32_t group = 32;
-    const std::uint64_t groups =
-        static_cast<std::uint64_t>(rows) * static_cast<std::uint64_t>(kHidden / group);
-    const std::uint64_t code_bytes   = groups * group;
-    const std::uint64_t scale_offset = align_up(code_bytes, 256);
-    const std::uint64_t scale_bytes  = groups * 2;
-    DevicePackedWeight packed(static_cast<std::size_t>(scale_offset + scale_bytes));
-    CUDA_CHECK(cudaMemset(packed.storage.p, 0x03, code_bytes));
-    constexpr int block = 256;
-    const int grid      = static_cast<int>(
-        std::min<std::uint64_t>(65535, std::max<std::uint64_t>(1, (groups + block - 1) / block)));
-    fill_w8_scales<<<grid, block>>>(static_cast<std::uint8_t*>(packed.storage.p) + scale_offset,
-                                    groups);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    Weight& weight          = packed.weight;
-    weight.payload          = packed.storage.p;
-    weight.payload_bytes    = packed.storage.bytes;
-    weight.high_plane_bytes = 0;
-    weight.qtype            = QType::W8G32_F16S;
-    weight.layout           = QuantLayout::RowSplit;
-    weight.group_size       = group;
-    weight.qdata            = packed.storage.p;
-    weight.qhigh            = nullptr;
-    weight.scales           = static_cast<std::uint8_t*>(packed.storage.p) + scale_offset;
-    weight.n                = rows;
-    weight.k                = kHidden;
-    weight.group            = group;
-    weight.scale_dtype      = DType::FP16;
-    weight.ndim             = 2;
-    weight.shape[0]         = rows;
-    weight.shape[1]         = kHidden;
-    weight.padded_shape[0]  = rows;
-    weight.padded_shape[1]  = kHidden;
-    return packed;
-}
 
 std::vector<std::int32_t> parse_t_sweep(std::string_view raw) {
     std::vector<std::int32_t> result;
@@ -207,39 +143,8 @@ Options parse_options(int argc, char** argv) {
     return options;
 }
 
-template <class Launch>
-Stats measure_cold(Launch&& launch, bench::DBuf& flush, cudaStream_t stream, int warmup,
-                   int repeat) {
-    cudaEvent_t start = nullptr;
-    cudaEvent_t stop  = nullptr;
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
-    for (int i = 0; i < warmup; ++i) {
-        CUDA_CHECK(cudaMemsetAsync(flush.p, 0xa5, flush.bytes, stream));
-        launch(stream);
-    }
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    std::vector<double> samples;
-    samples.reserve(static_cast<std::size_t>(repeat));
-    for (int i = 0; i < repeat; ++i) {
-        CUDA_CHECK(cudaMemsetAsync(flush.p, 0xa5, flush.bytes, stream));
-        CUDA_CHECK(cudaEventRecord(start, stream));
-        launch(stream);
-        CUDA_CHECK(cudaEventRecord(stop, stream));
-        CUDA_CHECK(cudaEventSynchronize(stop));
-        float milliseconds = 0.0f;
-        CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
-        samples.push_back(static_cast<double>(milliseconds) * 1000.0);
-    }
-    CUDA_CHECK(cudaEventDestroy(start));
-    CUDA_CHECK(cudaEventDestroy(stop));
-    std::sort(samples.begin(), samples.end());
-    return {samples[samples.size() / 2], samples.front(),
-            samples[std::min(samples.size() - 1, static_cast<std::size_t>(0.95 * samples.size()))]};
-}
-
 void append(std::vector<Result>& results, const char* op, const char* path, std::int32_t t,
-            Stats timing, std::int32_t rows) {
+            bench::ColdTiming timing, std::int32_t rows) {
     const double tflops = 2.0 * rows * kHidden * static_cast<double>(t) / timing.median_us / 1.0e6;
     std::printf("%-9s T=%-4d %-26s median=%8.3f us  useful=%7.2f TFLOP/s\n", op, t, path,
                 timing.median_us, tflops);
@@ -259,8 +164,8 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     }
 }
 
-bench::DBuf make_i32(std::int32_t value) {
-    bench::DBuf device(sizeof(value));
+ninfer::DeviceBuffer make_i32(std::int32_t value) {
+    ninfer::DeviceBuffer device(sizeof(value));
     CUDA_CHECK(cudaMemcpy(device.p, &value, sizeof(value), cudaMemcpyHostToDevice));
     return device;
 }
@@ -274,16 +179,17 @@ int main(int argc, char** argv) {
             *std::max_element(options.t_sweep.begin(), options.t_sweep.end());
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        bench::DBuf flush(kFlushBytes);
-        bench::DBuf input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t);
+        ninfer::DeviceBuffer flush(kFlushBytes);
+        ninfer::DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t);
         WorkspaceArena workspace(1);
         std::vector<Result> results;
 
         if (options.op == OpSelection::All || options.op == OpSelection::CompanionAttention) {
-            DevicePackedWeight packed = make_w8_weight(kCompanionAttnRows);
-            bench::DBuf q(static_cast<std::size_t>(kCompanionAttnQRows) * max_t * 2);
-            bench::DBuf k(static_cast<std::size_t>(kCompanionAttnKvRows) * max_t * 2);
-            bench::DBuf v(static_cast<std::size_t>(kCompanionAttnKvRows) * max_t * 2);
+            bench::PackedQuantizedWeight packed = bench::make_row_split_weight(
+                QType::W8G32_F16S, kCompanionAttnRows, kHidden, kHidden, {0x03, 0x00, 0x3c00});
+            ninfer::DeviceBuffer q(static_cast<std::size_t>(kCompanionAttnQRows) * max_t * 2);
+            ninfer::DeviceBuffer k(static_cast<std::size_t>(kCompanionAttnKvRows) * max_t * 2);
+            ninfer::DeviceBuffer v(static_cast<std::size_t>(kCompanionAttnKvRows) * max_t * 2);
             for (const std::int32_t t : options.t_sweep) {
                 Tensor x(input.p, DType::BF16, {kHidden, t});
                 Tensor tq(q.p, DType::BF16, {kCompanionAttnQRows, t});
@@ -301,7 +207,8 @@ int main(int argc, char** argv) {
                 }
                 const auto run = [&](const char* path, auto&& launch) {
                     append(results, "comp_attn", path, t,
-                           measure_cold(launch, flush, stream, options.warmup, options.repeat),
+                           bench::measure_cold_launch(launch, flush, stream, options.warmup,
+                                                      options.repeat),
                            kCompanionAttnRows);
                 };
                 run("production", [&](cudaStream_t s) {
@@ -364,11 +271,12 @@ int main(int argc, char** argv) {
         }
 
         if (options.op == OpSelection::All || options.op == OpSelection::Attention) {
-            DevicePackedWeight packed = make_w8_weight(kAttnRows);
-            bench::DBuf q(static_cast<std::size_t>(kAttnQRows) * max_t * 2);
-            bench::DBuf gate(static_cast<std::size_t>(kAttnQRows) * max_t * 2);
-            bench::DBuf k(static_cast<std::size_t>(kAttnKvRows) * max_t * 2);
-            bench::DBuf v(static_cast<std::size_t>(kAttnKvRows) * max_t * 2);
+            bench::PackedQuantizedWeight packed = bench::make_row_split_weight(
+                QType::W8G32_F16S, kAttnRows, kHidden, kHidden, {0x03, 0x00, 0x3c00});
+            ninfer::DeviceBuffer q(static_cast<std::size_t>(kAttnQRows) * max_t * 2);
+            ninfer::DeviceBuffer gate(static_cast<std::size_t>(kAttnQRows) * max_t * 2);
+            ninfer::DeviceBuffer k(static_cast<std::size_t>(kAttnKvRows) * max_t * 2);
+            ninfer::DeviceBuffer v(static_cast<std::size_t>(kAttnKvRows) * max_t * 2);
             for (const std::int32_t t : options.t_sweep) {
                 Tensor x(input.p, DType::BF16, {kHidden, t});
                 Tensor tq(q.p, DType::BF16, {kAttnQRows, t});
@@ -377,7 +285,8 @@ int main(int argc, char** argv) {
                 Tensor tv(v.p, DType::BF16, {kAttnKvRows, t});
                 const auto run = [&](const char* path, auto&& launch) {
                     append(results, "attention", path, t,
-                           measure_cold(launch, flush, stream, options.warmup, options.repeat),
+                           bench::measure_cold_launch(launch, flush, stream, options.warmup,
+                                                      options.repeat),
                            kAttnRows);
                 };
                 run("production", [&](cudaStream_t s) {
@@ -411,16 +320,18 @@ int main(int argc, char** argv) {
         }
 
         if (options.op == OpSelection::All || options.op == OpSelection::Gdn) {
-            DevicePackedWeight packed = make_w8_weight(kGdnRows);
-            bench::DBuf qkv(static_cast<std::size_t>(kGdnQkvRows) * max_t * 2);
-            bench::DBuf z(static_cast<std::size_t>(kGdnZRows) * max_t * 2);
+            bench::PackedQuantizedWeight packed = bench::make_row_split_weight(
+                QType::W8G32_F16S, kGdnRows, kHidden, kHidden, {0x03, 0x00, 0x3c00});
+            ninfer::DeviceBuffer qkv(static_cast<std::size_t>(kGdnQkvRows) * max_t * 2);
+            ninfer::DeviceBuffer z(static_cast<std::size_t>(kGdnZRows) * max_t * 2);
             for (const std::int32_t t : options.t_sweep) {
                 Tensor x(input.p, DType::BF16, {kHidden, t});
                 Tensor tqkv(qkv.p, DType::BF16, {kGdnQkvRows, t});
                 Tensor tz(z.p, DType::BF16, {kGdnZRows, t});
                 const auto run = [&](const char* path, auto&& launch) {
                     append(results, "gdn", path, t,
-                           measure_cold(launch, flush, stream, options.warmup, options.repeat),
+                           bench::measure_cold_launch(launch, flush, stream, options.warmup,
+                                                      options.repeat),
                            kGdnRows);
                 };
                 run("production", [&](cudaStream_t s) {
@@ -443,22 +354,24 @@ int main(int argc, char** argv) {
         }
 
         if (options.op == OpSelection::All || options.op == OpSelection::GdnSnapshot) {
-            constexpr std::int32_t kQueryRows = 2048;
-            constexpr std::int32_t kKeyRows   = 2048;
-            constexpr std::int32_t kValueRows = 4096;
-            constexpr std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
-            const std::int32_t slots          = max_t + 1;
-            DevicePackedWeight packed         = make_w8_weight(kGdnRows);
-            bench::DBuf conv_weight = bench::make_bf16(static_cast<std::size_t>(kChannels) * 4);
-            bench::DBuf conv_states =
+            constexpr std::int32_t kQueryRows   = 2048;
+            constexpr std::int32_t kKeyRows     = 2048;
+            constexpr std::int32_t kValueRows   = 4096;
+            constexpr std::int32_t kChannels    = kQueryRows + kKeyRows + kValueRows;
+            const std::int32_t slots            = max_t + 1;
+            bench::PackedQuantizedWeight packed = bench::make_row_split_weight(
+                QType::W8G32_F16S, kGdnRows, kHidden, kHidden, {0x03, 0x00, 0x3c00});
+            ninfer::DeviceBuffer conv_weight =
+                bench::make_bf16(static_cast<std::size_t>(kChannels) * 4);
+            ninfer::DeviceBuffer conv_states =
                 bench::make_bf16(static_cast<std::size_t>(kChannels) * 3 * slots);
-            bench::DBuf initial_slot = make_i32(max_t);
-            bench::DBuf q(static_cast<std::size_t>(kQueryRows) * max_t * 2);
-            bench::DBuf k(static_cast<std::size_t>(kKeyRows) * max_t * 2);
-            bench::DBuf v(static_cast<std::size_t>(kValueRows) * max_t * 2);
-            bench::DBuf z(static_cast<std::size_t>(kValueRows) * max_t * 2);
-            bench::DBuf qkv(static_cast<std::size_t>(kChannels) * max_t * 2);
-            bench::DBuf convolved(static_cast<std::size_t>(kChannels) * max_t * 2);
+            ninfer::DeviceBuffer initial_slot = make_i32(max_t);
+            ninfer::DeviceBuffer q(static_cast<std::size_t>(kQueryRows) * max_t * 2);
+            ninfer::DeviceBuffer k(static_cast<std::size_t>(kKeyRows) * max_t * 2);
+            ninfer::DeviceBuffer v(static_cast<std::size_t>(kValueRows) * max_t * 2);
+            ninfer::DeviceBuffer z(static_cast<std::size_t>(kValueRows) * max_t * 2);
+            ninfer::DeviceBuffer qkv(static_cast<std::size_t>(kChannels) * max_t * 2);
+            ninfer::DeviceBuffer convolved(static_cast<std::size_t>(kChannels) * max_t * 2);
             WorkspaceArena snapshot_workspace(
                 std::max<std::size_t>(1, ops::gdn_input_proj_conv_snapshot_workspace_bytes(
                                              kQueryRows, kKeyRows, kValueRows, max_t)));
@@ -476,7 +389,8 @@ int main(int argc, char** argv) {
                 Tensor tconvolved(convolved.p, DType::BF16, {kChannels, t});
                 const auto run = [&](const char* path, auto&& launch) {
                     append(results, "gdn_snap", path, t,
-                           measure_cold(launch, flush, stream, options.warmup, options.repeat),
+                           bench::measure_cold_launch(launch, flush, stream, options.warmup,
+                                                      options.repeat),
                            kGdnRows);
                 };
 

@@ -44,13 +44,13 @@ std::vector<std::uint16_t> pattern(std::size_t n, std::uint32_t seed) {
     return out;
 }
 
-DBuf to_device_bits(const std::vector<std::uint16_t>& h) {
-    DBuf d(h.size() * sizeof(std::uint16_t));
+DeviceBuffer to_device_bits(const std::vector<std::uint16_t>& h) {
+    DeviceBuffer d(h.size() * sizeof(std::uint16_t));
     cudaMemcpy(d.p, h.data(), h.size() * sizeof(std::uint16_t), cudaMemcpyHostToDevice);
     return d;
 }
 
-std::vector<std::uint16_t> from_device_bits(const DBuf& d, std::size_t n) {
+std::vector<std::uint16_t> from_device_bits(const DeviceBuffer& d, std::size_t n) {
     std::vector<std::uint16_t> out(n);
     cudaMemcpy(out.data(), d.p, n * sizeof(std::uint16_t), cudaMemcpyDeviceToHost);
     return out;
@@ -89,9 +89,9 @@ int one_pack_case(int hidden, int T) {
         }
     }
 
-    DBuf demb = to_device_bits(emb);
-    DBuf dhid = to_device_bits(hid);
-    DBuf dout(out_n * sizeof(std::uint16_t));
+    DeviceBuffer demb = to_device_bits(emb);
+    DeviceBuffer dhid = to_device_bits(hid);
+    DeviceBuffer dout(out_n * sizeof(std::uint16_t));
     Tensor temb(demb.p, DType::BF16, {hidden, T});
     Tensor thid(dhid.p, DType::BF16, {hidden, T});
     Tensor tout(dout.p, DType::BF16, {out_rows, T});
@@ -125,11 +125,11 @@ int one_split_case(int T) {
         }
     }
 
-    DBuf dattn = to_device_bits(attn);
-    DBuf dq(expected_q.size() * sizeof(std::uint16_t));
-    DBuf dk(expected_k.size() * sizeof(std::uint16_t));
-    DBuf dgate(expected_gate.size() * sizeof(std::uint16_t));
-    DBuf dv(expected_v.size() * sizeof(std::uint16_t));
+    DeviceBuffer dattn = to_device_bits(attn);
+    DeviceBuffer dq(expected_q.size() * sizeof(std::uint16_t));
+    DeviceBuffer dk(expected_k.size() * sizeof(std::uint16_t));
+    DeviceBuffer dgate(expected_gate.size() * sizeof(std::uint16_t));
+    DeviceBuffer dv(expected_v.size() * sizeof(std::uint16_t));
     Tensor tattn(dattn.p, DType::BF16, {attn_rows, T});
     Tensor tq(dq.p, DType::BF16, {256, 24, T});
     Tensor tk(dk.p, DType::BF16, {256, 4, T});
@@ -152,7 +152,7 @@ int one_split_case(int T) {
 
 int validation_case() {
     try {
-        DBuf d(2);
+        DeviceBuffer d(2);
         Tensor x(d.p, DType::BF16, {1});
         ops::mtp_pack_fc_input(x, x, x, nullptr);
     } catch (const std::invalid_argument&) { return 0; }

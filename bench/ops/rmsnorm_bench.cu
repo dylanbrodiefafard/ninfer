@@ -103,7 +103,7 @@ __global__ void rmsnorm_cta_payload_control(const __nv_bfloat162* x, const __nv_
     }
 }
 
-DBuf make_varied_bf16(std::size_t n, std::uint32_t seed) {
+DeviceBuffer make_varied_bf16(std::size_t n, std::uint32_t seed) {
     std::vector<std::uint16_t> host(n);
     std::uint32_t state = seed;
     for (std::size_t i = 0; i < n; ++i) {
@@ -111,7 +111,7 @@ DBuf make_varied_bf16(std::size_t n, std::uint32_t seed) {
         const float u = static_cast<float>((state >> 8) & 0x00ffffffu) * (1.0f / 16777216.0f);
         host[i]       = f32_to_bf16(2.0f * u - 1.0f);
     }
-    DBuf device(n * 2);
+    DeviceBuffer device(n * 2);
     cudaMemcpy(device.p, host.data(), n * 2, cudaMemcpyHostToDevice);
     return device;
 }
@@ -175,12 +175,12 @@ void launch_plain_candidate(const Shape& shape, const void* x, const void* weigh
 }
 
 void run(const Shape& shape, int tokens, Route route, bool profile) {
-    const int rows = shape.rows_per_token * tokens;
-    const auto n   = static_cast<std::size_t>(shape.d) * static_cast<std::size_t>(rows);
-    DBuf x         = make_varied_bf16(n, 0x1234abcdU);
-    DBuf weight    = make_varied_bf16(static_cast<std::size_t>(shape.d), 0x9876fedcU);
-    DBuf z         = make_varied_bf16(n, 0x31415926U);
-    DBuf out       = make_zeros(n * 2);
+    const int rows      = shape.rows_per_token * tokens;
+    const auto n        = static_cast<std::size_t>(shape.d) * static_cast<std::size_t>(rows);
+    DeviceBuffer x      = make_varied_bf16(n, 0x1234abcdU);
+    DeviceBuffer weight = make_varied_bf16(static_cast<std::size_t>(shape.d), 0x9876fedcU);
+    DeviceBuffer z      = make_varied_bf16(n, 0x31415926U);
+    DeviceBuffer out    = make_zeros(n * 2);
 
     Tensor tx(x.p, DType::BF16, {shape.d, rows});
     Tensor tw(weight.p, DType::BF16, {shape.d});

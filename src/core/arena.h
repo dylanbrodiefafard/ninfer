@@ -14,6 +14,31 @@ struct DeviceSpan {
     std::size_t bytes = 0;
 };
 
+// Owning device allocation for long-lived buffers. DeviceArena remains the
+// suballocation primitive for workspaces; this type owns exactly one cudaMalloc.
+class DeviceBuffer {
+public:
+    DeviceBuffer() noexcept = default;
+    explicit DeviceBuffer(std::size_t size_bytes);
+    ~DeviceBuffer();
+
+    DeviceBuffer(const DeviceBuffer&)            = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+    DeviceBuffer(DeviceBuffer&& other) noexcept;
+    DeviceBuffer& operator=(DeviceBuffer&& other) noexcept;
+
+    void fill(int byte_value = 0);
+    void copy_from_host(const void* source, std::size_t count, std::size_t byte_offset = 0);
+    void copy_to_host(void* destination, std::size_t count, std::size_t byte_offset = 0) const;
+
+    // Raw access is intentional: Tensor and Weight are non-owning views.
+    void* p           = nullptr;
+    std::size_t bytes = 0;
+
+private:
+    void require_range(std::size_t byte_offset, std::size_t count, const char* operation) const;
+};
+
 class DeviceArena {
 public:
     class Scope {

@@ -47,9 +47,9 @@ static int one_shape(const char* tag, std::int32_t d0, std::int32_t d1, std::int
     std::vector<double> ref(n);
     cpu_l2norm(x, 1e-6f, d0, rows, ref);
 
-    DBuf dx     = to_device_bf16(x), dout(n * 2);
-    Tensor tx   = tensor_for_shape(dx.p, d0, d1, d2, rank3);
-    Tensor tout = tensor_for_shape(dout.p, d0, d1, d2, rank3);
+    DeviceBuffer dx = to_device_bf16(x), dout(n * 2);
+    Tensor tx       = tensor_for_shape(dx.p, d0, d1, d2, rank3);
+    Tensor tout     = tensor_for_shape(dout.p, d0, d1, d2, rank3);
     ops::l2norm(tx, 1e-6f, tout, nullptr);
     cudaDeviceSynchronize();
 
@@ -71,7 +71,7 @@ static int near_zero_row_case() {
     std::vector<double> ref(n);
     cpu_l2norm(x, 1e-6f, d0, rows, ref);
 
-    DBuf dx = to_device_bf16(x), dout(n * 2);
+    DeviceBuffer dx = to_device_bf16(x), dout(n * 2);
     Tensor tx(dx.p, DType::BF16, {d0, d1, d2});
     Tensor tout(dout.p, DType::BF16, {d0, d1, d2});
     ops::l2norm(tx, 1e-6f, tout, nullptr);
@@ -81,11 +81,11 @@ static int near_zero_row_case() {
                   Tolerance::bf16_reduction());
 }
 
-static DBuf to_device_bf16_unaligned(const std::vector<float>& h) {
+static DeviceBuffer to_device_bf16_unaligned(const std::vector<float>& h) {
     std::vector<std::uint16_t> b(h.size() + 1);
     b[0] = 0;
     for (std::size_t i = 0; i < h.size(); ++i) b[i + 1] = f32_to_bf16(h[i]);
-    DBuf d(b.size() * 2);
+    DeviceBuffer d(b.size() * 2);
     cudaMemcpy(d.p, b.data(), b.size() * 2, cudaMemcpyHostToDevice);
     return d;
 }
@@ -102,15 +102,15 @@ static int unaligned_data_case() {
     std::vector<double> ref(n);
     cpu_l2norm(x, 1e-6f, d0, rows, ref);
 
-    DBuf dx    = to_device_bf16_unaligned(x), dout((n + 1) * 2);
-    auto* xptr = static_cast<unsigned char*>(dx.p) + 2;
-    auto* optr = static_cast<unsigned char*>(dout.p) + 2;
+    DeviceBuffer dx = to_device_bf16_unaligned(x), dout((n + 1) * 2);
+    auto* xptr      = static_cast<unsigned char*>(dx.p) + 2;
+    auto* optr      = static_cast<unsigned char*>(dout.p) + 2;
     Tensor tx(xptr, DType::BF16, {d0, d1});
     Tensor tout(optr, DType::BF16, {d0, d1});
     ops::l2norm(tx, 1e-6f, tout, nullptr);
     cudaDeviceSynchronize();
 
-    DBuf packed(n * 2);
+    DeviceBuffer packed(n * 2);
     cudaMemcpy(packed.p, optr, n * 2, cudaMemcpyDeviceToDevice);
     return verify("l2norm unaligned data [127,5]", from_device_bf16(packed, n), ref,
                   Tolerance::bf16_reduction());

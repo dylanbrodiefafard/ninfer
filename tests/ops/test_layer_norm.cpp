@@ -39,10 +39,10 @@ int one_shape(std::int32_t tokens, std::uint32_t seed) {
                 (static_cast<double>(x[base + row]) - mean) * inv * weight[row] + bias[row];
         }
     }
-    DBuf dx = to_device_bf16(x);
-    DBuf dw = to_device_bf16(weight);
-    DBuf db = to_device_bf16(bias);
-    DBuf dout(n * 2);
+    DeviceBuffer dx = to_device_bf16(x);
+    DeviceBuffer dw = to_device_bf16(weight);
+    DeviceBuffer db = to_device_bf16(bias);
+    DeviceBuffer dout(n * 2);
     Tensor tx(dx.p, DType::BF16, {d, tokens});
     Tensor tw(dw.p, DType::BF16, {d});
     Tensor tb(db.p, DType::BF16, {d});

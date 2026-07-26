@@ -3,6 +3,7 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -62,6 +63,27 @@ int main() {
 
     int failures = 0;
     CUDA_CHECK(cudaSetDevice(0));
+
+    ninfer::DeviceBuffer empty;
+    failures += expect_ptr(empty.p, nullptr, "empty device buffer pointer");
+    failures += expect_size(empty.bytes, 0, "empty device buffer size");
+
+    const std::array<std::uint8_t, 8> host_source{0, 1, 2, 3, 4, 5, 6, 7};
+    std::array<std::uint8_t, 8> host_destination{};
+    ninfer::DeviceBuffer buffer(host_source.size());
+    buffer.copy_from_host(host_source.data(), host_source.size());
+    buffer.copy_to_host(host_destination.data(), host_destination.size());
+    if (host_destination != host_source) {
+        ++failures;
+        std::cerr << "device buffer round trip changed payload\n";
+    }
+    failures += expect_throws<std::out_of_range>(
+        [&] { buffer.copy_from_host(host_source.data(), 2, buffer.bytes - 1); },
+        "device buffer upload range");
+    ninfer::DeviceBuffer moved_buffer(std::move(buffer));
+    failures += expect_ptr(buffer.p, nullptr, "moved-from device buffer pointer");
+    failures += expect_size(buffer.bytes, 0, "moved-from device buffer size");
+    failures += expect_size(moved_buffer.bytes, host_source.size(), "moved device buffer size");
 
     ninfer::DeviceArena arena(1024);
     failures += expect_size(arena.capacity(), 1024, "arena.capacity");

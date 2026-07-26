@@ -43,8 +43,8 @@ int cast_grid(std::int64_t vectors) {
 void run(std::int32_t patches, bool control, bool profile_once) {
     const std::int64_t count   = static_cast<std::int64_t>(kD) * patches;
     const std::int64_t vectors = count / 4;
-    DBuf source(static_cast<std::size_t>(count) * sizeof(float));
-    DBuf destination(static_cast<std::size_t>(count) * sizeof(std::uint16_t));
+    DeviceBuffer source(static_cast<std::size_t>(count) * sizeof(float));
+    DeviceBuffer destination(static_cast<std::size_t>(count) * sizeof(std::uint16_t));
     CUDA_CHECK(cudaMemset(source.p, 0x3c, source.bytes));
     CUDA_CHECK(cudaMemset(destination.p, 0, destination.bytes));
     Tensor source_tensor(source.p, DType::FP32, {kD, patches});

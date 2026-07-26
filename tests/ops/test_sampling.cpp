@@ -18,7 +18,7 @@ using namespace ninfer::test;
 namespace {
 
 struct DeviceConfig {
-    DBuf buf;
+    DeviceBuffer buf;
 
     explicit DeviceConfig(const ops::SamplingConfig& cfg) : buf(sizeof(ops::SamplingConfig)) {
         cudaMemcpy(buf.p, &cfg, sizeof(cfg), cudaMemcpyHostToDevice);
@@ -29,8 +29,8 @@ struct DeviceConfig {
     }
 };
 
-DBuf device_pos(int value) {
-    DBuf d(sizeof(std::int32_t));
+DeviceBuffer device_pos(int value) {
+    DeviceBuffer d(sizeof(std::int32_t));
     cudaMemcpy(d.p, &value, sizeof(value), cudaMemcpyHostToDevice);
     return d;
 }
@@ -62,9 +62,9 @@ std::vector<int> sample_many(const std::vector<float>& base, int cols,
                              const ops::SamplingConfig& cfg, std::int32_t purpose, int pos_start) {
     const int vocab             = static_cast<int>(base.size());
     std::vector<float> logits_h = broadcast_columns(base, cols);
-    DBuf dlogits                = to_device_bf16(logits_h);
-    DBuf dout = to_device_i32(std::vector<int>(static_cast<std::size_t>(cols), -1));
-    DBuf dpos = device_pos(pos_start);
+    DeviceBuffer dlogits        = to_device_bf16(logits_h);
+    DeviceBuffer dout = to_device_i32(std::vector<int>(static_cast<std::size_t>(cols), -1));
+    DeviceBuffer dpos = device_pos(pos_start);
     DeviceConfig dcfg(cfg);
     Tensor tlogits(dlogits.p, DType::BF16, {vocab, cols});
     Tensor tout(dout.p, DType::I32, {cols});
@@ -82,11 +82,11 @@ std::vector<int> sample_many_batched(const std::vector<float>& base, int total, 
     const int vocab = static_cast<int>(base.size());
     if (token_domain == 0) { token_domain = vocab; }
     std::vector<float> logits_h = broadcast_columns(base, cols);
-    DBuf dlogits                = to_device_bf16(logits_h);
-    DBuf dout = to_device_i32(std::vector<int>(static_cast<std::size_t>(cols), -1));
-    DBuf dpos = device_pos(pos_start);
-    DBuf dcollect(static_cast<std::size_t>(total) * sizeof(std::int32_t));
-    DBuf dcounts(static_cast<std::size_t>(token_domain) * sizeof(std::int32_t));
+    DeviceBuffer dlogits        = to_device_bf16(logits_h);
+    DeviceBuffer dout = to_device_i32(std::vector<int>(static_cast<std::size_t>(cols), -1));
+    DeviceBuffer dpos = device_pos(pos_start);
+    DeviceBuffer dcollect(static_cast<std::size_t>(total) * sizeof(std::int32_t));
+    DeviceBuffer dcounts(static_cast<std::size_t>(token_domain) * sizeof(std::int32_t));
     cudaMemset(dcounts.p, 0, dcounts.bytes);
     if (counts_active) { cfg.token_counts = static_cast<std::int32_t*>(dcounts.p); }
     DeviceConfig dcfg(cfg);
@@ -141,9 +141,9 @@ int greedy_matches_argmax(const char* tag, int vocab, int cols, std::uint32_t se
         ref[t] = best;
     }
 
-    DBuf dlogits = to_device_bf16(logits);
-    DBuf dout    = to_device_i32(std::vector<int>(static_cast<std::size_t>(cols), -1));
-    DBuf dpos    = device_pos(0);
+    DeviceBuffer dlogits = to_device_bf16(logits);
+    DeviceBuffer dout    = to_device_i32(std::vector<int>(static_cast<std::size_t>(cols), -1));
+    DeviceBuffer dpos    = device_pos(0);
     ops::SamplingConfig cfg; // temperature 0 => greedy
     DeviceConfig dcfg(cfg);
     Tensor tlogits(dlogits.p, DType::BF16, {vocab, cols});
@@ -181,9 +181,9 @@ int physical_stride_and_token_domain(int cols, bool stochastic) {
     }
     round_to_bf16(logits);
 
-    DBuf dlogits = to_device_bf16(logits);
-    DBuf dout    = to_device_i32(std::vector<int>(static_cast<std::size_t>(cols), -1));
-    DBuf dpos    = device_pos(0);
+    DeviceBuffer dlogits = to_device_bf16(logits);
+    DeviceBuffer dout    = to_device_i32(std::vector<int>(static_cast<std::size_t>(cols), -1));
+    DeviceBuffer dpos    = device_pos(0);
     ops::SamplingConfig cfg;
     cfg.temperature = stochastic ? 1.0f : 0.0f;
     cfg.top_k       = 1;
@@ -213,9 +213,9 @@ int signed_zero_tie_cross_partial() {
     logits[expected] = -0.0f;
     logits[800]      = 0.0f;
 
-    DBuf dlogits = to_device_bf16(logits);
-    DBuf dout    = to_device_i32({-1});
-    DBuf dpos    = device_pos(0);
+    DeviceBuffer dlogits = to_device_bf16(logits);
+    DeviceBuffer dout    = to_device_i32({-1});
+    DeviceBuffer dpos    = device_pos(0);
     ops::SamplingConfig cfg;
     cfg.temperature = 1.0f;
     cfg.top_k       = 1;

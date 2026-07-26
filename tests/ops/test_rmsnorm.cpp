@@ -61,12 +61,12 @@ static int one_shape(const char* tag, std::int32_t d0, std::int32_t d1, std::int
     std::vector<double> ref(n);
     cpu_rmsnorm(x, weight, 1e-6f, unit_offset, gated ? &z : nullptr, d0, rows, ref);
 
-    DBuf dx = to_device_bf16(x), dw = to_device_bf16(weight);
-    DBuf dout((n + 2 * kGuardElements) * sizeof(std::uint16_t));
+    DeviceBuffer dx = to_device_bf16(x), dw = to_device_bf16(weight);
+    DeviceBuffer dout((n + 2 * kGuardElements) * sizeof(std::uint16_t));
     dout.fill(0xa5);
-    auto* out_data = static_cast<std::uint16_t*>(dout.p) + kGuardElements;
-    DBuf dz        = gated ? to_device_bf16(z) : DBuf(0);
-    Tensor tx      = tensor_for_shape(dx.p, d0, d1, d2);
+    auto* out_data  = static_cast<std::uint16_t*>(dout.p) + kGuardElements;
+    DeviceBuffer dz = gated ? to_device_bf16(z) : DeviceBuffer(0);
+    Tensor tx       = tensor_for_shape(dx.p, d0, d1, d2);
     Tensor tw(dw.p, DType::BF16, {d0});
     Tensor tout = tensor_for_shape(out_data, d0, d1, d2);
     Tensor tz;
@@ -124,11 +124,11 @@ static int one_shape(const char* tag, std::int32_t d0, std::int32_t d1, std::int
     return failures;
 }
 
-static DBuf to_device_bf16_unaligned(const std::vector<float>& h) {
+static DeviceBuffer to_device_bf16_unaligned(const std::vector<float>& h) {
     std::vector<std::uint16_t> b(h.size() + 1);
     b[0] = 0;
     for (std::size_t i = 0; i < h.size(); ++i) b[i + 1] = f32_to_bf16(h[i]);
-    DBuf d(b.size() * 2);
+    DeviceBuffer d(b.size() * 2);
     cudaMemcpy(d.p, b.data(), b.size() * 2, cudaMemcpyHostToDevice);
     return d;
 }
@@ -147,7 +147,8 @@ static int unaligned_data_case() {
     std::vector<double> ref(n);
     cpu_rmsnorm(x, weight, 1e-6f, true, nullptr, d0, rows, ref);
 
-    DBuf dx = to_device_bf16_unaligned(x), dw = to_device_bf16_unaligned(weight), dout((n + 1) * 2);
+    DeviceBuffer dx = to_device_bf16_unaligned(x), dw = to_device_bf16_unaligned(weight),
+                 dout((n + 1) * 2);
     auto* xptr = static_cast<unsigned char*>(dx.p) + 2;
     auto* wptr = static_cast<unsigned char*>(dw.p) + 2;
     auto* optr = static_cast<unsigned char*>(dout.p) + 2;
@@ -157,7 +158,7 @@ static int unaligned_data_case() {
     ops::rmsnorm(tx, tw, 1e-6f, true, tout, nullptr);
     cudaDeviceSynchronize();
 
-    DBuf packed(n * 2);
+    DeviceBuffer packed(n * 2);
     cudaMemcpy(packed.p, optr, n * 2, cudaMemcpyDeviceToDevice);
     return verify("rmsnorm unaligned data [260,3]", from_device_bf16(packed, n), ref,
                   Tolerance::bf16_reduction());

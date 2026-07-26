@@ -55,13 +55,13 @@ std::vector<int> parse_csv(const char* value) {
     return values;
 }
 
-DBuf copy_positions(const std::vector<std::int32_t>& host) {
-    DBuf device(host.size() * sizeof(std::int32_t));
+DeviceBuffer copy_positions(const std::vector<std::int32_t>& host) {
+    DeviceBuffer device(host.size() * sizeof(std::int32_t));
     cudaMemcpy(device.p, host.data(), device.bytes, cudaMemcpyHostToDevice);
     return device;
 }
 
-DBuf make_text_positions(int tokens, int axes) {
+DeviceBuffer make_text_positions(int tokens, int axes) {
     std::vector<std::int32_t> host(static_cast<std::size_t>(tokens) * axes);
     for (int axis = 0; axis < axes; ++axis) {
         for (int token = 0; token < tokens; ++token) {
@@ -94,7 +94,7 @@ VisionGrid canonical_vision_grid(int patches) {
     }
 }
 
-DBuf make_vision_positions(int patches) {
+DeviceBuffer make_vision_positions(int patches) {
     const VisionGrid grid = canonical_vision_grid(patches);
     std::vector<std::int32_t> host(static_cast<std::size_t>(patches) * 2);
     int token = 0;
@@ -366,8 +366,8 @@ void launch_dflash_split_candidate(const Tensor& positions, Tensor& q, Tensor& k
 template <int Heads>
 void run_text_single(int tokens, int axes, bool control, const char* geometry, const char* role) {
     const std::size_t elements = static_cast<std::size_t>(kTextHeadDim) * Heads * tokens;
-    DBuf positions             = make_text_positions(tokens, axes);
-    DBuf x                     = make_bf16(elements);
+    DeviceBuffer positions     = make_text_positions(tokens, axes);
+    DeviceBuffer x             = make_bf16(elements);
     Tensor tpos(positions.p, DType::I32, {tokens, axes});
     Tensor tx(x.p, DType::BF16, {kTextHeadDim, Heads, tokens});
     const double bytes =
@@ -403,9 +403,9 @@ template <int QHeads, int KHeads>
 void run_text(int tokens, int axes, bool control, int candidate_block, const char* geometry) {
     const std::size_t q_elements = static_cast<std::size_t>(kTextHeadDim) * QHeads * tokens;
     const std::size_t k_elements = static_cast<std::size_t>(kTextHeadDim) * KHeads * tokens;
-    DBuf positions               = make_text_positions(tokens, axes);
-    DBuf q                       = make_bf16(q_elements);
-    DBuf k                       = make_bf16(k_elements);
+    DeviceBuffer positions       = make_text_positions(tokens, axes);
+    DeviceBuffer q               = make_bf16(q_elements);
+    DeviceBuffer k               = make_bf16(k_elements);
     Tensor tpos(positions.p, DType::I32, {tokens, axes});
     Tensor tq(q.p, DType::BF16, {kTextHeadDim, QHeads, tokens});
     Tensor tk(k.p, DType::BF16, {kTextHeadDim, KHeads, tokens});
@@ -438,9 +438,9 @@ void run_dflash(int tokens, bool control, int candidate_block, int candidate_hea
         static_cast<std::size_t>(kDflashHeadDim) * kDflashQHeads * tokens;
     const std::size_t k_elements =
         static_cast<std::size_t>(kDflashHeadDim) * kDflashKHeads * tokens;
-    DBuf positions = make_text_positions(tokens, 1);
-    DBuf q         = make_bf16(q_elements);
-    DBuf k         = make_bf16(k_elements);
+    DeviceBuffer positions = make_text_positions(tokens, 1);
+    DeviceBuffer q         = make_bf16(q_elements);
+    DeviceBuffer k         = make_bf16(k_elements);
     Tensor tpos(positions.p, DType::I32, {tokens});
     Tensor tq(q.p, DType::BF16, {kDflashHeadDim, kDflashQHeads, tokens});
     Tensor tk(k.p, DType::BF16, {kDflashHeadDim, kDflashKHeads, tokens});
@@ -485,10 +485,10 @@ void run_dflash(int tokens, bool control, int candidate_block, int candidate_hea
 }
 
 void run_vision(int patches, bool control) {
-    constexpr int hidden = kVisionHeadDim * kVisionHeads;
-    constexpr int qkv    = hidden * 3;
-    DBuf positions       = make_vision_positions(patches);
-    DBuf packed          = make_zeros(static_cast<std::size_t>(qkv) * patches * 2);
+    constexpr int hidden   = kVisionHeadDim * kVisionHeads;
+    constexpr int qkv      = hidden * 3;
+    DeviceBuffer positions = make_vision_positions(patches);
+    DeviceBuffer packed    = make_zeros(static_cast<std::size_t>(qkv) * patches * 2);
     Tensor tq(packed.p, DType::BF16, {kVisionHeadDim, kVisionHeads, patches});
     tq.nb[2]  = qkv * 2;
     Tensor tk = tq;

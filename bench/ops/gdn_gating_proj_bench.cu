@@ -41,13 +41,7 @@ struct Options {
     std::size_t flush_bytes = kDefaultFlushBytes;
 };
 
-struct Timing {
-    double median_us = 0.0;
-    double min_us    = 0.0;
-    double p95_us    = 0.0;
-};
-
-DBuf make_f32(std::size_t n, std::uint32_t seed) {
+DeviceBuffer make_f32(std::size_t n, std::uint32_t seed) {
     std::vector<float> h(n);
     std::uint32_t state = seed;
     for (std::size_t i = 0; i < n; ++i) {
@@ -55,7 +49,7 @@ DBuf make_f32(std::size_t n, std::uint32_t seed) {
         const float u = static_cast<float>((state >> 8) & 0x00ffffffu) * (1.0f / 16777216.0f);
         h[i]          = 2.0f * u - 1.0f;
     }
-    DBuf d(n * sizeof(float));
+    DeviceBuffer d(n * sizeof(float));
     cudaMemcpy(d.p, h.data(), d.bytes, cudaMemcpyHostToDevice);
     return d;
 }
@@ -176,41 +170,7 @@ Options parse_args(int argc, char** argv) {
     return opt;
 }
 
-template <class Launch>
-Timing measure_cold(Launch&& launch, DBuf& flush, int warmup, int repeat) {
-    cudaStream_t stream = nullptr;
-    cudaEvent_t begin   = nullptr;
-    cudaEvent_t end     = nullptr;
-    cudaEventCreate(&begin);
-    cudaEventCreate(&end);
-
-    for (int i = 0; i < warmup; ++i) {
-        cudaMemsetAsync(flush.p, 0xa5, flush.bytes, stream);
-        launch(stream);
-    }
-    cudaStreamSynchronize(stream);
-
-    std::vector<double> samples;
-    samples.reserve(static_cast<std::size_t>(repeat));
-    for (int i = 0; i < repeat; ++i) {
-        cudaMemsetAsync(flush.p, 0xa5, flush.bytes, stream);
-        cudaEventRecord(begin, stream);
-        launch(stream);
-        cudaEventRecord(end, stream);
-        cudaEventSynchronize(end);
-        float ms = 0.0f;
-        cudaEventElapsedTime(&ms, begin, end);
-        samples.push_back(static_cast<double>(ms) * 1000.0);
-    }
-    cudaEventDestroy(begin);
-    cudaEventDestroy(end);
-
-    std::sort(samples.begin(), samples.end());
-    return {samples[samples.size() / 2], samples.front(),
-            samples[std::min(samples.size() - 1, static_cast<std::size_t>(0.95 * samples.size()))]};
-}
-
-void run(const Options& opt, std::int32_t tokens, DBuf& flush) {
+void run(const Options& opt, std::int32_t tokens, DeviceBuffer& flush) {
     const std::int32_t heads  = opt.geometry35 ? 32 : 48;
     const std::int32_t hidden = opt.geometry35 ? 2048 : 5120;
     const std::size_t x_elems = static_cast<std::size_t>(hidden) * tokens;
@@ -218,14 +178,14 @@ void run(const Options& opt, std::int32_t tokens, DBuf& flush) {
         static_cast<std::size_t>(2 * heads) * static_cast<std::size_t>(hidden);
     const std::size_t out_elems = static_cast<std::size_t>(heads) * tokens;
 
-    DBuf x           = make_bf16(x_elems);
-    DBuf weights     = make_bf16(weight_elems);
-    DBuf norm_weight = make_bf16(hidden);
-    DBuf A_log       = make_f32(heads, 0x1234abcdU);
-    DBuf dt_bias     = make_f32(heads, 0x9876fedcU);
-    DBuf h           = make_zeros(x_elems * sizeof(std::uint16_t));
-    DBuf g           = make_zeros(out_elems * sizeof(float));
-    DBuf beta        = make_zeros(out_elems * sizeof(float));
+    DeviceBuffer x           = make_bf16(x_elems);
+    DeviceBuffer weights     = make_bf16(weight_elems);
+    DeviceBuffer norm_weight = make_bf16(hidden);
+    DeviceBuffer A_log       = make_f32(heads, 0x1234abcdU);
+    DeviceBuffer dt_bias     = make_f32(heads, 0x9876fedcU);
+    DeviceBuffer h           = make_zeros(x_elems * sizeof(std::uint16_t));
+    DeviceBuffer g           = make_zeros(out_elems * sizeof(float));
+    DeviceBuffer beta        = make_zeros(out_elems * sizeof(float));
 
     Tensor tx(x.p, DType::BF16, {hidden, tokens});
     Tensor tnorm_weight(norm_weight.p, DType::BF16, {hidden});
@@ -266,8 +226,9 @@ void run(const Options& opt, std::int32_t tokens, DBuf& flush) {
                                                            tdt_bias, ws, tg, tbeta, stream);
         }
     };
-    const Timing timing = measure_cold(launch, flush, opt.warmup, opt.repeat);
-    const double sec    = timing.median_us * 1e-6;
+    const bench::ColdTiming timing =
+        bench::measure_cold_launch(launch, flush, nullptr, opt.warmup, opt.repeat);
+    const double sec = timing.median_us * 1e-6;
     const double useful_flops =
         2.0 * 2.0 * static_cast<double>(heads) * hidden * static_cast<double>(tokens);
     const bool mma = plan.token_variant != ops::detail::Bf16GdnGatingTokenVariant::None;
@@ -307,7 +268,7 @@ int main(int argc, char** argv) {
     }
     try {
         const Options opt = parse_args(argc, argv);
-        DBuf flush(opt.flush_bytes);
+        DeviceBuffer flush(opt.flush_bytes);
         std::printf("geometry,operation,T,route,median_us,min_us,p95_us,useful_tflops,"
                     "executed_tflops,useful_gbps,workspace_bytes\n");
         for (const std::int32_t tokens : opt.tokens) { run(opt, tokens, flush); }

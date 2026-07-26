@@ -31,8 +31,8 @@ __global__ void residual_add_payload_control(const uint4* y, uint4* x, std::int6
 void run(int patches, bool control) {
     constexpr int d     = 1152;
     const std::size_t n = static_cast<std::size_t>(d) * static_cast<std::size_t>(patches);
-    DBuf y              = make_bf16(n);
-    DBuf x              = make_bf16(n);
+    DeviceBuffer y      = make_bf16(n);
+    DeviceBuffer x      = make_bf16(n);
     Tensor ty(y.p, DType::BF16, {d, patches});
     Tensor tx(x.p, DType::BF16, {d, patches});
 

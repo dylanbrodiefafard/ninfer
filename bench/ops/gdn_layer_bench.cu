@@ -26,6 +26,7 @@
 
 #include "core/device.h"
 #include "ninfer_bench_common.h"
+#include "quantized_weight.cuh"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 #include "ops/gdn_input_proj/w8/w8_gdn_input_plan.h"
 #include "ops/kernel/rmsnorm.cuh"
@@ -76,12 +77,6 @@ struct Options {
     std::string csv_out;
 };
 
-struct Timing {
-    double median_us = 0.0;
-    double min_us    = 0.0;
-    double p95_us    = 0.0;
-};
-
 struct Result {
     std::int32_t tokens     = 0;
     std::size_t graph_nodes = 0;
@@ -89,70 +84,10 @@ struct Result {
     std::string control_route;
     std::string gated_rms_route;
     std::string output_route;
-    Timing timing;
+    bench::ColdTiming timing;
 };
 
-struct DevicePackedWeight {
-    explicit DevicePackedWeight(std::size_t bytes) : storage(bytes) {}
-
-    bench::DBuf storage;
-    Weight weight{};
-};
-
-__global__ void fill_w8_scales(std::uint8_t* scales, std::uint64_t groups) {
-    const std::uint64_t begin = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::uint64_t step  = static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
-    for (std::uint64_t group = begin; group < groups; group += step) {
-        scales[group * 2]     = 0x00u;
-        scales[group * 2 + 1] = 0x3cu; // FP16 1.0
-    }
-}
-
-std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
-    return ((value + alignment - 1) / alignment) * alignment;
-}
-
-DevicePackedWeight make_w8_weight(std::int32_t rows, std::int32_t cols, std::uint8_t code_byte) {
-    constexpr std::int32_t group = 32;
-    if (cols % group != 0) { throw std::invalid_argument("W8 K must be divisible by 32"); }
-    const std::uint64_t groups =
-        static_cast<std::uint64_t>(rows) * static_cast<std::uint64_t>(cols / group);
-    const std::uint64_t code_bytes   = groups * group;
-    const std::uint64_t scale_offset = align_up(code_bytes, 256);
-    const std::uint64_t scale_bytes  = groups * 2;
-    DevicePackedWeight packed(static_cast<std::size_t>(scale_offset + scale_bytes));
-    CUDA_CHECK(cudaMemset(packed.storage.p, code_byte, code_bytes));
-    constexpr int block = 256;
-    const int grid      = static_cast<int>(
-        std::min<std::uint64_t>(65535, std::max<std::uint64_t>(1, (groups + block - 1) / block)));
-    fill_w8_scales<<<grid, block>>>(static_cast<std::uint8_t*>(packed.storage.p) + scale_offset,
-                                    groups);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    Weight& weight          = packed.weight;
-    weight.payload          = packed.storage.p;
-    weight.payload_bytes    = packed.storage.bytes;
-    weight.high_plane_bytes = 0;
-    weight.qtype            = QType::W8G32_F16S;
-    weight.layout           = QuantLayout::RowSplit;
-    weight.group_size       = group;
-    weight.qdata            = packed.storage.p;
-    weight.qhigh            = nullptr;
-    weight.scales           = static_cast<std::uint8_t*>(packed.storage.p) + scale_offset;
-    weight.n                = rows;
-    weight.k                = cols;
-    weight.group            = group;
-    weight.scale_dtype      = DType::FP16;
-    weight.ndim             = 2;
-    weight.shape[0]         = rows;
-    weight.shape[1]         = cols;
-    weight.padded_shape[0]  = rows;
-    weight.padded_shape[1]  = cols;
-    return packed;
-}
-
-Weight make_bf16_weight(const bench::DBuf& storage, std::int32_t rows, std::int32_t cols) {
+Weight make_bf16_weight(const ninfer::DeviceBuffer& storage, std::int32_t rows, std::int32_t cols) {
     Weight weight{};
     weight.payload          = storage.p;
     weight.payload_bytes    = static_cast<std::uint64_t>(rows) * cols * sizeof(std::uint16_t);
@@ -174,16 +109,16 @@ Weight make_bf16_weight(const bench::DBuf& storage, std::int32_t rows, std::int3
     return weight;
 }
 
-bench::DBuf make_constant_bf16(std::size_t elements, float value) {
+ninfer::DeviceBuffer make_constant_bf16(std::size_t elements, float value) {
     std::vector<std::uint16_t> host(elements, bench::f32_to_bf16(value));
-    bench::DBuf device(elements * sizeof(std::uint16_t));
+    ninfer::DeviceBuffer device(elements * sizeof(std::uint16_t));
     CUDA_CHECK(cudaMemcpy(device.p, host.data(), device.bytes, cudaMemcpyHostToDevice));
     return device;
 }
 
-bench::DBuf make_constant_f32(std::size_t elements, float value) {
+ninfer::DeviceBuffer make_constant_f32(std::size_t elements, float value) {
     std::vector<float> host(elements, value);
-    bench::DBuf device(elements * sizeof(float));
+    ninfer::DeviceBuffer device(elements * sizeof(float));
     CUDA_CHECK(cudaMemcpy(device.p, host.data(), device.bytes, cudaMemcpyHostToDevice));
     return device;
 }
@@ -265,96 +200,12 @@ Options parse_options(int argc, char** argv) {
     return options;
 }
 
-class TimedGraph {
-public:
-    TimedGraph() {
-        CUDA_CHECK(cudaEventCreate(&start_));
-        CUDA_CHECK(cudaEventCreate(&stop_));
-    }
-
-    ~TimedGraph() {
-        if (exec_ != nullptr) cudaGraphExecDestroy(exec_);
-        if (graph_ != nullptr) cudaGraphDestroy(graph_);
-        if (start_ != nullptr) cudaEventDestroy(start_);
-        if (stop_ != nullptr) cudaEventDestroy(stop_);
-    }
-
-    TimedGraph(const TimedGraph&)            = delete;
-    TimedGraph& operator=(const TimedGraph&) = delete;
-
-    template <class Body>
-    void capture(cudaStream_t stream, Body&& body) {
-        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-        try {
-            body(stream);
-        } catch (...) {
-            cudaGraph_t discard = nullptr;
-            cudaStreamEndCapture(stream, &discard);
-            if (discard != nullptr) cudaGraphDestroy(discard);
-            throw;
-        }
-        CUDA_CHECK(cudaStreamEndCapture(stream, &graph_));
-        CUDA_CHECK(cudaGraphInstantiate(&exec_, graph_, 0));
-        std::size_t all_nodes = 0;
-        CUDA_CHECK(cudaGraphGetNodes(graph_, nullptr, &all_nodes));
-        if (all_nodes == 0) { throw std::runtime_error("captured layer graph is empty"); }
-        body_nodes_ = all_nodes;
-    }
-
-    void launch(cudaStream_t stream) const { CUDA_CHECK(cudaGraphLaunch(exec_, stream)); }
-
-    void launch_timed(cudaStream_t stream) const {
-        CUDA_CHECK(cudaEventRecord(start_, stream));
-        launch(stream);
-        CUDA_CHECK(cudaEventRecord(stop_, stream));
-    }
-
-    double elapsed_us() const {
-        CUDA_CHECK(cudaEventSynchronize(stop_));
-        float milliseconds = 0.0F;
-        CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start_, stop_));
-        return static_cast<double>(milliseconds) * 1000.0;
-    }
-
-    [[nodiscard]] std::size_t body_nodes() const noexcept { return body_nodes_; }
-
-private:
-    cudaGraph_t graph_      = nullptr;
-    cudaGraphExec_t exec_   = nullptr;
-    cudaEvent_t start_      = nullptr;
-    cudaEvent_t stop_       = nullptr;
-    std::size_t body_nodes_ = 0;
-};
-
-Timing measure_cold(const TimedGraph& graph, bench::DBuf& flush, cudaStream_t stream, int warmup,
-                    int repeat) {
-    for (int i = 0; i < warmup; ++i) {
-        CUDA_CHECK(cudaMemsetAsync(flush.p, 0xa5, flush.bytes, stream));
-        graph.launch(stream);
-    }
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    std::vector<double> samples;
-    samples.reserve(static_cast<std::size_t>(repeat));
-    for (int i = 0; i < repeat; ++i) {
-        CUDA_CHECK(cudaMemsetAsync(flush.p, 0xa5, flush.bytes, stream));
-        graph.launch_timed(stream);
-        samples.push_back(graph.elapsed_us());
-    }
-    std::sort(samples.begin(), samples.end());
-    const auto percentile = [&](double q) {
-        const std::size_t index =
-            std::min(samples.size() - 1,
-                     static_cast<std::size_t>(q * static_cast<double>(samples.size() - 1)));
-        return samples[index];
-    };
-    return {percentile(0.50), samples.front(), percentile(0.95)};
-}
-
 struct Resources {
     explicit Resources(std::int32_t max_tokens)
-        : input_weight(make_w8_weight(kInputRows, kHidden, 0x03u)),
-          output_weight(make_w8_weight(kHidden, kValueRows, 0x00u)),
+        : input_weight(bench::make_row_split_weight(QType::W8G32_F16S, kInputRows, kHidden, kHidden,
+                                                    {0x03, 0x00, 0x3c00})),
+          output_weight(bench::make_row_split_weight(QType::W8G32_F16S, kHidden, kValueRows,
+                                                     kValueRows, {0x00, 0x00, 0x3c00})),
           control_storage(bench::make_bf16(static_cast<std::size_t>(2 * kValueHeads) * kHidden)),
           control_weight(make_bf16_weight(control_storage, 2 * kValueHeads, kHidden)),
           input_norm(make_constant_bf16(kHidden, 0.0F)),
@@ -386,43 +237,43 @@ struct Resources {
                                   kKeyRows, kKeyRows, kValueRows, max_tokens),
                               ops::linear_add_workspace_bytes(kHidden, kValueRows, max_tokens)})) {}
 
-    static bench::DBuf make_constant_i32(std::int32_t value) {
-        bench::DBuf device(sizeof(value));
+    static ninfer::DeviceBuffer make_constant_i32(std::int32_t value) {
+        ninfer::DeviceBuffer device(sizeof(value));
         CUDA_CHECK(cudaMemcpy(device.p, &value, sizeof(value), cudaMemcpyHostToDevice));
         return device;
     }
 
-    DevicePackedWeight input_weight;
-    DevicePackedWeight output_weight;
-    bench::DBuf control_storage;
+    bench::PackedQuantizedWeight input_weight;
+    bench::PackedQuantizedWeight output_weight;
+    ninfer::DeviceBuffer control_storage;
     Weight control_weight;
-    bench::DBuf input_norm;
-    bench::DBuf gdn_norm;
-    bench::DBuf conv_weight;
-    bench::DBuf a_log;
-    bench::DBuf dt_bias;
-    bench::DBuf initial_slot;
+    ninfer::DeviceBuffer input_norm;
+    ninfer::DeviceBuffer gdn_norm;
+    ninfer::DeviceBuffer conv_weight;
+    ninfer::DeviceBuffer a_log;
+    ninfer::DeviceBuffer dt_bias;
+    ninfer::DeviceBuffer initial_slot;
 
-    bench::DBuf residual;
-    bench::DBuf hidden;
-    bench::DBuf qkv;
-    bench::DBuf z;
-    bench::DBuf qkv_conv;
-    bench::DBuf g;
-    bench::DBuf beta;
-    bench::DBuf q;
-    bench::DBuf k;
-    bench::DBuf v;
-    bench::DBuf q_norm;
-    bench::DBuf k_norm;
-    bench::DBuf recurrent_out;
-    bench::DBuf gated_out;
-    bench::DBuf conv_states;
-    bench::DBuf ssm_states;
+    ninfer::DeviceBuffer residual;
+    ninfer::DeviceBuffer hidden;
+    ninfer::DeviceBuffer qkv;
+    ninfer::DeviceBuffer z;
+    ninfer::DeviceBuffer qkv_conv;
+    ninfer::DeviceBuffer g;
+    ninfer::DeviceBuffer beta;
+    ninfer::DeviceBuffer q;
+    ninfer::DeviceBuffer k;
+    ninfer::DeviceBuffer v;
+    ninfer::DeviceBuffer q_norm;
+    ninfer::DeviceBuffer k_norm;
+    ninfer::DeviceBuffer recurrent_out;
+    ninfer::DeviceBuffer gated_out;
+    ninfer::DeviceBuffer conv_states;
+    ninfer::DeviceBuffer ssm_states;
     WorkspaceArena workspace;
 };
 
-Result run_case(Resources& resources, bench::DBuf& flush, cudaStream_t stream,
+Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t stream,
                 const Options& options, std::int32_t tokens) {
     Tensor residual(resources.residual.p, DType::BF16, {kHidden, tokens});
     Tensor hidden(resources.hidden.p, DType::BF16, {kHidden, tokens});
@@ -510,9 +361,10 @@ Result run_case(Resources& resources, bench::DBuf& flush, cudaStream_t stream,
     layer(stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    TimedGraph graph;
+    bench::TimedGraph graph;
     graph.capture(stream, layer);
-    const Timing timing = measure_cold(graph, flush, stream, options.warmup, options.repeat);
+    const bench::ColdTiming timing =
+        bench::measure_cold_graph(graph, flush, stream, options.warmup, options.repeat);
 
     const auto input_plan = ops::detail::w8_gdn_input_resolve_plan(
         {kHidden, kConvRows, kValueRows, kInputRows, kHidden, tokens});
@@ -526,7 +378,7 @@ Result run_case(Resources& resources, bench::DBuf& flush, cudaStream_t stream,
         ops::detail::w8_linear_add_resolve_plan({kHidden, kValueRows, kValueRows, tokens});
 
     return {tokens,
-            graph.body_nodes(),
+            graph.nodes(),
             options.route == "fused"
                 ? std::string(
                       ops::detail::w8_gdn_input_snapshot_schedule_name(snapshot_plan.schedule)) +
@@ -662,7 +514,7 @@ int main(int argc, char** argv) {
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         Resources resources(max_tokens);
-        bench::DBuf flush(options.flush_bytes);
+        ninfer::DeviceBuffer flush(options.flush_bytes);
         std::vector<Result> results;
         results.reserve(options.t_sweep.size());
 

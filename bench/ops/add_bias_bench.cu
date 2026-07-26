@@ -54,8 +54,8 @@ __global__ void add_bias_pair_payload_control(const unsigned int* bias, unsigned
 
 void run(int d, int columns, bool control) {
     const std::size_t n = static_cast<std::size_t>(d) * static_cast<std::size_t>(columns);
-    DBuf x              = make_bf16(n);
-    DBuf bias           = make_bf16(d);
+    DeviceBuffer x      = make_bf16(n);
+    DeviceBuffer bias   = make_bf16(d);
     Tensor tx(x.p, DType::BF16, {d, columns});
     Tensor tb(bias.p, DType::BF16, {d});
 

@@ -150,8 +150,8 @@ Graph capture_graph(Launch&& launch, cudaStream_t stream) {
     return result;
 }
 
-Result bench_graph(cudaGraphExec_t graph, DBuf& flush, bool cold, cudaStream_t stream, double bytes,
-                   int warmup, int repeat) {
+Result bench_graph(cudaGraphExec_t graph, DeviceBuffer& flush, bool cold, cudaStream_t stream,
+                   double bytes, int warmup, int repeat) {
     cudaEvent_t begin = nullptr;
     cudaEvent_t end   = nullptr;
     CUDA_CHECK(cudaEventCreate(&begin));
@@ -208,10 +208,10 @@ ops::detail::PrepareMaskedBlockRoute route_value(RouteChoice route) {
 
 struct Case {
     int block_size;
-    DBuf anchor{sizeof(std::int32_t)};
-    DBuf length{sizeof(std::int32_t)};
-    DBuf ids;
-    DBuf positions;
+    DeviceBuffer anchor{sizeof(std::int32_t)};
+    DeviceBuffer length{sizeof(std::int32_t)};
+    DeviceBuffer ids;
+    DeviceBuffer positions;
     Tensor anchor_tensor;
     Tensor length_tensor;
     Tensor ids_tensor;
@@ -231,7 +231,7 @@ struct Case {
     }
 };
 
-void run_route(Case& data, RouteChoice choice, const Options& options, DBuf& flush,
+void run_route(Case& data, RouteChoice choice, const Options& options, DeviceBuffer& flush,
                cudaStream_t stream) {
     auto plan = ops::detail::prepare_masked_block_resolve_plan(data.block_size);
     if (choice != RouteChoice::Production) plan.route = route_value(choice);
@@ -272,7 +272,7 @@ int main(int argc, char** argv) {
     const Options options = parse_options(argc, argv);
     cudaStream_t stream   = nullptr;
     CUDA_CHECK(cudaStreamCreate(&stream));
-    DBuf flush(kFlush);
+    DeviceBuffer flush(kFlush);
     std::printf("# RTX 5090 sm_120a; graph replay; exact I32 anchor/mask block; cache=%s\n",
                 options.cold ? "cold" : "hot");
 

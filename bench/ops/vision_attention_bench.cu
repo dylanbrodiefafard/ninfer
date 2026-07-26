@@ -149,7 +149,7 @@ __launch_bounds__(Tile * 2, 128 / Tile) __global__
 }
 
 void launch_control(const Tensor& q, const Tensor& k, const Tensor& v, std::int32_t segment_length,
-                    std::int32_t tile, Tensor& out, DBuf& sink, cudaStream_t stream) {
+                    std::int32_t tile, Tensor& out, DeviceBuffer& sink, cudaStream_t stream) {
     const std::int32_t segments = q.ne[2] / segment_length;
     const std::int32_t q_tiles  = segments * ((segment_length + tile - 1) / tile);
     const dim3 grid(static_cast<unsigned>(q_tiles), kHeads, 1u);
@@ -190,8 +190,8 @@ int main(int argc, char** argv) {
     const std::size_t token_elems = static_cast<std::size_t>(kDim) * kHeads;
     const std::size_t plane_elems = token_elems * static_cast<std::size_t>(patches);
 
-    DBuf qkv = make_bf16(plane_elems * 3u);
-    DBuf out = make_zeros(plane_elems * sizeof(std::uint16_t));
+    DeviceBuffer qkv = make_bf16(plane_elems * 3u);
+    DeviceBuffer out = make_zeros(plane_elems * sizeof(std::uint16_t));
     Tensor q(qkv.p, DType::BF16, {kDim, kHeads, patches});
     q.nb[2]  = static_cast<std::int64_t>(token_elems * 3u * sizeof(std::uint16_t));
     Tensor k = q;
@@ -204,7 +204,7 @@ int main(int argc, char** argv) {
     for (std::int32_t segment = 0; segment <= opt.segments; ++segment) {
         cu[static_cast<std::size_t>(segment)] = segment * opt.length;
     }
-    DBuf device_cu(cu.size() * sizeof(std::int32_t));
+    DeviceBuffer device_cu(cu.size() * sizeof(std::int32_t));
     CUDA_CHECK(cudaMemcpy(device_cu.p, cu.data(), device_cu.bytes, cudaMemcpyHostToDevice));
     Tensor cu_seqlens(device_cu.p, DType::I32, {static_cast<std::int32_t>(cu.size())});
 
@@ -225,7 +225,7 @@ int main(int argc, char** argv) {
         static_cast<std::int64_t>(opt.segments) * q_tiles_per_segment * kHeads;
     const std::size_t control_sink_bytes =
         static_cast<std::size_t>(active_ctas) * (tile * 2 / 32) * sizeof(uint4);
-    DBuf control_sink(std::max<std::size_t>(control_sink_bytes, 1u));
+    DeviceBuffer control_sink(std::max<std::size_t>(control_sink_bytes, 1u));
     auto launch = [&](cudaStream_t stream) {
         if (opt.control) {
             launch_control(q, k, v, opt.length, tile, output, control_sink, stream);

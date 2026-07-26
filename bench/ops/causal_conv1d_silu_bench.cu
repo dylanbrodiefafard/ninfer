@@ -40,7 +40,7 @@ __global__ void copy_u128_kernel(const uint4* src, uint4* dst, std::size_t n4) {
     for (std::size_t i = start; i < n4; i += stride) { dst[i] = src[i]; }
 }
 
-DBuf make_varied_bf16(std::size_t n, std::uint32_t seed) {
+DeviceBuffer make_varied_bf16(std::size_t n, std::uint32_t seed) {
     std::vector<std::uint16_t> h(n);
     std::uint32_t state = seed;
     for (std::size_t i = 0; i < n; ++i) {
@@ -48,12 +48,13 @@ DBuf make_varied_bf16(std::size_t n, std::uint32_t seed) {
         const float u = static_cast<float>((state >> 8) & 0x00ffffffu) * (1.0f / 16777216.0f);
         h[i]          = f32_to_bf16(2.0f * u - 1.0f);
     }
-    DBuf d(n * 2u);
+    DeviceBuffer d(n * 2u);
     cudaMemcpy(d.p, h.data(), n * 2u, cudaMemcpyHostToDevice);
     return d;
 }
 
-void copy_bytes_launch(const DBuf& src, DBuf& dst, std::size_t copy_bytes, cudaStream_t stream) {
+void copy_bytes_launch(const DeviceBuffer& src, DeviceBuffer& dst, std::size_t copy_bytes,
+                       cudaStream_t stream) {
     constexpr int kBlock            = 256;
     constexpr std::size_t kVecBytes = sizeof(uint4);
     const std::size_t n4            = (copy_bytes + kVecBytes - 1u) / kVecBytes;
@@ -66,8 +67,8 @@ void copy_bytes_launch(const DBuf& src, DBuf& dst, std::size_t copy_bytes, cudaS
 void run_copy_baseline(double bytes, const char* tag) {
     const auto copy_bytes   = static_cast<std::size_t>(bytes / 2.0);
     const auto padded_bytes = (copy_bytes + sizeof(uint4) - 1u) & ~(sizeof(uint4) - 1u);
-    DBuf src                = make_varied_bf16(padded_bytes / 2u, 0xc001c0deU);
-    DBuf dst                = make_zeros(padded_bytes);
+    DeviceBuffer src        = make_varied_bf16(padded_bytes / 2u, 0xc001c0deU);
+    DeviceBuffer dst        = make_zeros(padded_bytes);
 
     const Result r =
         bench_loop([&](cudaStream_t s) { copy_bytes_launch(src, dst, copy_bytes, s); }, bytes);
@@ -83,11 +84,12 @@ void run_prefill(const Options& options, bool distinct) {
     const std::size_t n       = static_cast<std::size_t>(options.channels) * options.tokens;
     const std::size_t state_n = static_cast<std::size_t>(options.channels) * 3u;
 
-    DBuf x         = make_varied_bf16(n, 0x12345678U);
-    DBuf weight    = make_varied_bf16(static_cast<std::size_t>(options.channels) * 4u, 0x87654321U);
-    DBuf state_in  = make_varied_bf16(state_n, 0x31415926U);
-    DBuf state_out = make_zeros(state_n * 2u);
-    DBuf out       = make_zeros(n * 2u);
+    DeviceBuffer x = make_varied_bf16(n, 0x12345678U);
+    DeviceBuffer weight =
+        make_varied_bf16(static_cast<std::size_t>(options.channels) * 4u, 0x87654321U);
+    DeviceBuffer state_in  = make_varied_bf16(state_n, 0x31415926U);
+    DeviceBuffer state_out = make_zeros(state_n * 2u);
+    DeviceBuffer out       = make_zeros(n * 2u);
 
     Tensor tx(x.p, DType::BF16, {options.channels, options.tokens});
     Tensor tw(weight.p, DType::BF16, {options.channels, 4});
@@ -115,10 +117,10 @@ void run_prefill(const Options& options, bool distinct) {
 void run_decode(const Options& options) {
     const std::size_t channels = static_cast<std::size_t>(options.channels);
 
-    DBuf x      = make_varied_bf16(channels, 0x12345678U);
-    DBuf weight = make_varied_bf16(channels * 4u, 0x87654321U);
-    DBuf state  = make_varied_bf16(channels * 3u, 0x31415926U);
-    DBuf out    = make_zeros(channels * 2u);
+    DeviceBuffer x      = make_varied_bf16(channels, 0x12345678U);
+    DeviceBuffer weight = make_varied_bf16(channels * 4u, 0x87654321U);
+    DeviceBuffer state  = make_varied_bf16(channels * 3u, 0x31415926U);
+    DeviceBuffer out    = make_zeros(channels * 2u);
 
     Tensor tx(x.p, DType::BF16, {options.channels, 1});
     Tensor tw(weight.p, DType::BF16, {options.channels, 4});
@@ -137,11 +139,12 @@ void run_snapshot(const Options& options) {
     const std::size_t n       = static_cast<std::size_t>(options.channels) * options.tokens;
     const std::size_t state_n = static_cast<std::size_t>(options.channels) * 3u * options.slots;
 
-    DBuf x      = make_varied_bf16(n, 0x12345678U);
-    DBuf weight = make_varied_bf16(static_cast<std::size_t>(options.channels) * 4u, 0x87654321U);
-    DBuf states = make_varied_bf16(state_n, 0x31415926U);
-    DBuf initial_slot = make_zeros(sizeof(std::int32_t));
-    DBuf out          = make_zeros(n * 2u);
+    DeviceBuffer x = make_varied_bf16(n, 0x12345678U);
+    DeviceBuffer weight =
+        make_varied_bf16(static_cast<std::size_t>(options.channels) * 4u, 0x87654321U);
+    DeviceBuffer states       = make_varied_bf16(state_n, 0x31415926U);
+    DeviceBuffer initial_slot = make_zeros(sizeof(std::int32_t));
+    DeviceBuffer out          = make_zeros(n * 2u);
     CUDA_CHECK(cudaMemcpy(initial_slot.p, &options.initial_slot, sizeof(options.initial_slot),
                           cudaMemcpyHostToDevice));
 

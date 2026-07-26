@@ -140,7 +140,7 @@ Options parse_options(int argc, char** argv) {
     return options;
 }
 
-CyclicKVCacheLayerView make_context(DBuf& k, DBuf& v) {
+CyclicKVCacheLayerView make_context(DeviceBuffer& k, DeviceBuffer& v) {
     return {
         .k               = Tensor(k.p, DType::BF16, {kD, kWindow, kKVHeads}),
         .v               = Tensor(v.p, DType::BF16, {kD, kWindow, kKVHeads}),
@@ -175,8 +175,8 @@ Graph capture_graph(Launch&& launch, cudaStream_t stream) {
     return result;
 }
 
-Result bench_cold_graph(cudaGraphExec_t graph, DBuf& flush, cudaStream_t stream, double bytes,
-                        int warmup, int repeat) {
+Result bench_cold_graph(cudaGraphExec_t graph, DeviceBuffer& flush, cudaStream_t stream,
+                        double bytes, int warmup, int repeat) {
     cudaEvent_t begin = nullptr;
     cudaEvent_t end   = nullptr;
     CUDA_CHECK(cudaEventCreate(&begin));
@@ -224,16 +224,16 @@ Result bench_cold_graph(cudaGraphExec_t graph, DBuf& flush, cudaStream_t stream,
 struct Case {
     int tokens;
     int context_length;
-    DBuf q;
-    DBuf query_k;
-    DBuf query_v;
-    DBuf context_k;
-    DBuf context_v;
-    DBuf positions;
-    DBuf out;
-    DBuf partial_acc;
-    DBuf partial_m;
-    DBuf partial_l;
+    DeviceBuffer q;
+    DeviceBuffer query_k;
+    DeviceBuffer query_v;
+    DeviceBuffer context_k;
+    DeviceBuffer context_v;
+    DeviceBuffer positions;
+    DeviceBuffer out;
+    DeviceBuffer partial_acc;
+    DeviceBuffer partial_m;
+    DeviceBuffer partial_l;
     Tensor tq;
     Tensor tk;
     Tensor tv;
@@ -319,8 +319,8 @@ void report(const char* route, const ops::detail::SwaPlan& plan, int context, co
                 result.median_us > 0.0 ? 100.0 * roof_floor / result.median_us : 0.0);
 }
 
-void run_route(Case& data, const ops::detail::SwaPlan& plan, const Options& options, DBuf& flush,
-               cudaStream_t stream) {
+void run_route(Case& data, const ops::detail::SwaPlan& plan, const Options& options,
+               DeviceBuffer& flush, cudaStream_t stream) {
     const auto launch = [&](cudaStream_t launch_stream) {
         ops::detail::swa_launch(data.tq, data.tk, data.tv, data.tp, kScale, data.context, plan,
                                 data.tpartial_acc, data.tpartial_m, data.tpartial_l, data.tout,
@@ -362,7 +362,7 @@ int main(int argc, char** argv) {
     const Options options = parse_options(argc, argv);
     cudaStream_t stream   = nullptr;
     CUDA_CHECK(cudaStreamCreate(&stream));
-    DBuf flush(kFlush);
+    DeviceBuffer flush(kFlush);
 
     std::printf("# RTX 5090 sm_120a; graph replay; symmetric SWA W=4096 BF16 "
                 "D=128 Hq=32 Hkv=8; DRAM=1792 GB/s TC=209.5 TF/s; cache=%s\n",

@@ -39,29 +39,6 @@ constexpr int kIntermediate       = 512;
 constexpr int kRouterRows         = kExperts + 1;
 constexpr std::size_t kFlushBytes = 256ULL << 20;
 
-struct DeviceBuffer {
-    void* data        = nullptr;
-    std::size_t bytes = 0;
-
-    DeviceBuffer() = default;
-
-    explicit DeviceBuffer(std::size_t size) : bytes(size) {
-        if (bytes != 0) { CUDA_CHECK(cudaMalloc(&data, bytes)); }
-    }
-
-    ~DeviceBuffer() {
-        if (data != nullptr) { cudaFree(data); }
-    }
-
-    DeviceBuffer(DeviceBuffer&& other) noexcept : data(other.data), bytes(other.bytes) {
-        other.data  = nullptr;
-        other.bytes = 0;
-    }
-
-    DeviceBuffer(const DeviceBuffer&)            = delete;
-    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
-};
-
 struct QuantGeometry {
     int group;
     int code_bytes_per_group;
@@ -301,26 +278,26 @@ public:
           scales_(scale_bytes_) {
         const auto launch_payload = [](DeviceBuffer& buffer, std::uint32_t payload_seed) {
             fill_payload_kernel<<<std::min<std::size_t>(4096, (buffer.bytes + 255) / 256), 256>>>(
-                static_cast<std::uint8_t*>(buffer.data), buffer.bytes, payload_seed);
+                static_cast<std::uint8_t*>(buffer.p), buffer.bytes, payload_seed);
         };
         launch_payload(codes_, seed ^ 0x243f6a88u);
         if (high_) { launch_payload(*high_, seed ^ 0x85a308d3u); }
         const std::size_t count = scale_bytes_ / 2;
         fill_scale_kernel<<<std::min<std::size_t>(4096, (count + 255) / 256), 256>>>(
-            static_cast<std::uint16_t*>(scales_.data), count, seed ^ 0x13198a2eu);
+            static_cast<std::uint16_t*>(scales_.p), count, seed ^ 0x13198a2eu);
         CUDA_CHECK(cudaGetLastError());
     }
 
     Weight weight() const {
         Weight out{};
-        out.payload          = codes_.data;
+        out.payload          = codes_.p;
         out.payload_bytes    = code_bytes_ + high_bytes_ + scale_bytes_;
         out.high_plane_bytes = high_bytes_;
         out.qtype            = qtype_;
         out.group_size       = geometry_.group;
-        out.qdata            = codes_.data;
-        out.qhigh            = high_ ? high_->data : nullptr;
-        out.scales           = scales_.data;
+        out.qdata            = codes_.p;
+        out.qhigh            = high_ ? high_->p : nullptr;
+        out.scales           = scales_.p;
         out.n                = rows_;
         out.k                = columns_;
         out.group            = geometry_.group;
@@ -740,10 +717,10 @@ public:
                     bench::f32_to_bf16(1.0f);
             }
         }
-        CUDA_CHECK(cudaMemcpy(input_.data, input.data(), input_.bytes, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(residual_seed_.data, residual.data(), residual_seed_.bytes,
+        CUDA_CHECK(cudaMemcpy(input_.p, input.data(), input_.bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(residual_seed_.p, residual.data(), residual_seed_.bytes,
                               cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(destination_.data, residual_seed_.data, destination_.bytes,
+        CUDA_CHECK(cudaMemcpy(destination_.p, residual_seed_.p, destination_.bytes,
                               cudaMemcpyDeviceToDevice));
         std::vector<float> router_values(static_cast<std::size_t>(kRouterRows) * kHidden, 0.0f);
         if (basis_router) {
@@ -770,18 +747,18 @@ public:
             router_bits[index] = bench::f32_to_bf16(router_values[index]);
         }
         CUDA_CHECK(
-            cudaMemcpy(router_.data, router_bits.data(), router_.bytes, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemset(flush_.data, 0xa5, flush_.bytes));
+            cudaMemcpy(router_.p, router_bits.data(), router_.bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemset(flush_.p, 0xa5, flush_.bytes));
 
         weights_ = {
-            dense_weight(router_.data, kRouterRows, kHidden),
+            dense_weight(router_.p, kRouterRows, kHidden),
             routed_gate_.weight(),
             routed_down_.weight(),
             shared_gate_.weight(),
             shared_down_.weight(),
         };
-        x_                  = Tensor(input_.data, DType::BF16, {kHidden, tokens});
-        destination_tensor_ = Tensor(destination_.data, DType::BF16, {kHidden, tokens});
+        x_                  = Tensor(input_.p, DType::BF16, {kHidden, tokens});
+        destination_tensor_ = Tensor(destination_.p, DType::BF16, {kHidden, tokens});
         if (tokens == 1 || tokens > ops::detail::kSparseMoeSmallTMax) {
             workspace_ = ops::detail::allocate_sparse_moe_decode_workspace(private_arena_);
         } else {
@@ -795,12 +772,12 @@ public:
     [[nodiscard]] const RoutePattern& route_pattern() const noexcept { return route_pattern_; }
 
     void reset_destination(cudaStream_t stream) {
-        CUDA_CHECK(cudaMemcpyAsync(destination_.data, residual_seed_.data, destination_.bytes,
+        CUDA_CHECK(cudaMemcpyAsync(destination_.p, residual_seed_.p, destination_.bytes,
                                    cudaMemcpyDeviceToDevice, stream));
     }
 
     void flush(cudaStream_t stream) {
-        CUDA_CHECK(cudaMemsetAsync(flush_.data, 0xa5, flush_.bytes, stream));
+        CUDA_CHECK(cudaMemsetAsync(flush_.p, 0xa5, flush_.bytes, stream));
     }
 
     void prepare(const Candidate& candidate, bool cold, cudaStream_t stream) {

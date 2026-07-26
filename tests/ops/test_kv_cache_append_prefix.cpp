@@ -115,8 +115,8 @@ int run_exact_case(
     std::vector<std::int32_t> host_positions(static_cast<std::size_t>(tokens));
     for (int i = 0; i < tokens; ++i) host_positions[static_cast<std::size_t>(i)] = position + i;
     std::vector<std::int32_t> host_count{count};
-    DBuf dk = to_device(host_k), dv = to_device(host_v), dpos = to_device(host_positions),
-         dcount = to_device(host_count);
+    DeviceBuffer dk = to_device(host_k), dv = to_device(host_v), dpos = to_device(host_positions),
+                 dcount = to_device(host_count);
     GuardedDBuf cache_k(cache_count * sizeof(std::uint16_t));
     GuardedDBuf cache_v(cache_count * sizeof(std::uint16_t));
     cache_k.copy_from_host(seeded_k.data(), cache_k.bytes());
@@ -192,10 +192,10 @@ int graph_and_resume_case() {
     for (int i = 0; i < tokens; ++i) first_positions[static_cast<std::size_t>(i)] = position + i;
     std::vector<std::int32_t> count{0};
 
-    DBuf dfirst_k = to_device(first_k), dfirst_v = to_device(first_v),
-         dfirst_pos = to_device(first_positions), dnext_k = to_device(next_k),
-         dnext_v = to_device(next_v), dnext_pos(resume_tokens * sizeof(std::int32_t)),
-         dcount  = to_device(count);
+    DeviceBuffer dfirst_k = to_device(first_k), dfirst_v = to_device(first_v),
+                 dfirst_pos = to_device(first_positions), dnext_k = to_device(next_k),
+                 dnext_v = to_device(next_v), dnext_pos(resume_tokens * sizeof(std::int32_t)),
+                 dcount  = to_device(count);
     GuardedDBuf cache_k(cache_count * sizeof(std::uint16_t));
     GuardedDBuf cache_v(cache_count * sizeof(std::uint16_t));
     Tensor tk(dfirst_k.p, DType::BF16, {kD, kKVHeads, tokens});
