@@ -55,8 +55,7 @@ int main() {
                     visual_embeddings[static_cast<std::size_t>(d) + row];
             }
         }
-        return verify(label, from_device_bf16(dinput, reference.size()), reference,
-                      Tolerance::bf16_elementwise());
+        return verify_exact(label, from_device_bf16(dinput, reference.size()), reference);
     };
 
     int failures = 0;

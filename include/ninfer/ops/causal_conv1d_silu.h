@@ -10,14 +10,15 @@ namespace ninfer::ops {
  * Depthwise causal width-4 convolution followed by SiLU. Let u[c,-3..-1] be the three values in
  * the input state and u[c,t]=x[c,t] for t>=0. Then
  *
- *   out[c,t] = BF16(SiLU(sum_{j=0..3} weight[c,j] * u[c,t-3+j])).
+ *   ideal[c,t] = SiLU(sum_{j=0..3} weight[c,j] * u[c,t-3+j]).
  *
  * `x` and `out` are contiguous BF16 [C,T], `weight` is contiguous BF16 [C,4], and a state is
- * contiguous BF16 [C,3] ordered oldest to newest. The oracle evaluates the convolution and SiLU
- * naively in FP64 before converting the observable output to BF16. Kernel accumulator and staging
- * precision are implementation choices. Input, weight, output, and state storage do not overlap
- * except for the explicitly allowed exact alias between state input and state output. No caller
- * workspace is used. T may be any positive value.
+ * contiguous BF16 [C,3] ordered oldest to newest. The oracle evaluates `ideal` naively in FP64 from
+ * the represented inputs. The BF16 output is promoted and compared directly with that result;
+ * output storage rounding belongs to the Op's numerical criterion, not the oracle. Kernel
+ * accumulator and staging precision are implementation choices. Input, weight, output, and state
+ * storage do not overlap except for the explicitly allowed exact alias between state input and
+ * state output. No caller workspace is used. T may be any positive value.
  */
 
 // Reads conv_state as the initial window and replaces it with the final three values after x.

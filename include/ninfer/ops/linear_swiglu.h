@@ -25,7 +25,7 @@ namespace ninfer::ops {
  *
  * Math / indexing:
  *   gate_up = Linear(x, gate_up_weight); M=gate_up_rows/2;
- *   out[i,t] = BF16(SiLU(gate_up[i,t]) * gate_up[M+i,t]).
+ *   ideal[i,t] = SiLU(gate_up[i,t]) * gate_up[M+i,t].
  *
  * Logical shapes / supported domain:
  *   T may be any positive value. The registered RowSplit profiles are:
@@ -34,10 +34,11 @@ namespace ninfer::ops {
  *   Inputs and output are contiguous BF16; packed scales are FP16.
  *
  * Numeric:
- *   The oracle exact-decodes the registered weight and evaluates the complete expression naively
- *   in FP64 before converting the observable result to BF16. Production routes may fuse or
- *   materialize gate/up and may choose their natural accumulator, staging, and workspace precision;
- *   those private choices are qualified directly against the same oracle.
+ *   The oracle exact-decodes the registered weight and evaluates `ideal` naively in FP64 from the
+ *   represented inputs. The BF16 output is promoted and compared directly with that result; output
+ *   storage rounding belongs to LinearSwiGLU's named A16 criterion, not the oracle. Production
+ *   routes may fuse or materialize gate/up and may choose their natural accumulator, staging, and
+ *   workspace precision; those private choices are not semantic rounding boundaries.
  *
  * Effects:
  *   Writes the full output; x/weight and output must not alias.

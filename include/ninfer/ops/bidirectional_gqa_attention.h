@@ -30,16 +30,18 @@ struct GqaContextExecutionEnvelope {
  *   keys   = context K rows [0,L) followed logically by every query K row [0,T)
  *   score  = scale * dot(q[:,h,i], key[:,kvh,j])
  *   prob   = softmax over the complete logical key set
- *   out[:,h,i] = BF16(sum_j prob[j] * value[:,kvh,j])
+ *   ideal[:,h,i] = sum_j prob[j] * value[:,kvh,j]
  *
  * q/out are contiguous BF16 [128,32,T]. query_k/query_v are contiguous BF16 [128,8,T].
  * context_length is a contiguous device I32 scalar L. context is a read-only linear BF16 cache
  * with logical shape [128,capacity,8], of which [0,L) is populated. scale is 1/sqrt(128).
  *
  * There is no causal triangle: every query row attends every other query K/V row. Context and
- * query K/V remain separate physical segments and every input/cache byte is unchanged. out is the
- * only observable mutation and is completely overwritten. The current optimized implementation
- * domain is T=1..16 on sm_120a.
+ * query K/V remain separate physical segments and every input/cache byte is unchanged. The oracle
+ * evaluates `ideal` naively in FP64 from the represented inputs. The BF16 out is promoted and
+ * compared directly with that result; output storage rounding belongs to the Op's numerical
+ * criterion, not the oracle. out is the only observable mutation and is completely overwritten.
+ * The current optimized implementation domain is T=1..16 on sm_120a.
  *
  * The caller guarantees min_context <= L <= max_context and L <= context.max_context. The
  * execution envelope may affect finite launch selection and workspace capacity, never the

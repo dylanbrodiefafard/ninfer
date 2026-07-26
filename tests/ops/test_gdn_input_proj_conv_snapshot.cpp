@@ -1,61 +1,58 @@
 #include "ninfer/ops/gdn_input_proj.h"
 
-#include "ops/op_tester.h"
-#include "ops/row_split_pack.h"
+#include "ops/input_projection_test_common.h"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <span>
 #include <string>
 #include <vector>
 
 using namespace ninfer;
 using namespace ninfer::test;
+using namespace ninfer::test::input_projection;
 
 namespace {
 
-constexpr int kQueryRows = 2048;
-constexpr int kKeyRows   = 2048;
-constexpr int kSlots     = 17;
-constexpr int kInitial   = 16;
+// This criterion belongs to the complete A16 fused projection/conv/snapshot Op.
+constexpr ReductionCriterion kGdnInputProjConvSnapshotA16Tolerance{3.2e-3, 4.0e-3, 3.5e-3};
 
-std::vector<std::int32_t> sampled_rows(std::int32_t rows) {
-    std::vector<std::int32_t> result;
-    for (const int row : {0, 1, rows / 3, rows / 2, rows - 2, rows - 1}) {
-        if (std::find(result.begin(), result.end(), row) == result.end()) result.push_back(row);
+constexpr std::int32_t kQueryRows = 2048;
+constexpr std::int32_t kKeyRows   = 2048;
+
+double silu_fp64(double value) {
+    if (value >= 0.0) { return value / (1.0 + std::exp(-value)); }
+    const double exponential = std::exp(value);
+    return value * exponential / (1.0 + exponential);
+}
+
+std::vector<float> make_conv_weight(std::int32_t channels, std::uint32_t seed) {
+    std::vector<float> weight(static_cast<std::size_t>(channels) * 4);
+    fill_uniform(weight, seed, -0.02F, 0.02F);
+    round_to_bf16(weight);
+    return weight;
+}
+
+std::vector<std::uint16_t> make_state(std::int32_t channels, std::int32_t slots,
+                                      std::int32_t initial_slot, std::uint32_t seed) {
+    const std::size_t slot_stride = static_cast<std::size_t>(channels) * 3;
+    std::vector<std::uint16_t> state(slot_stride * slots, 0xffffU);
+    std::vector<float> initial(slot_stride);
+    fill_uniform(initial, seed, -0.05F, 0.05F);
+    round_to_bf16(initial);
+    const std::size_t initial_base = static_cast<std::size_t>(initial_slot) * slot_stride;
+    for (std::size_t index = 0; index < initial.size(); ++index) {
+        state[initial_base + index] = f32_to_bf16(initial[index]);
     }
-    return result;
+    return state;
 }
 
-DeviceBuffer to_device_bits(const std::vector<std::uint16_t>& bits) {
-    DeviceBuffer device(bits.size() * sizeof(std::uint16_t));
-    cudaMemcpy(device.p, bits.data(), device.bytes, cudaMemcpyHostToDevice);
-    return device;
-}
-
-std::vector<std::uint16_t> from_device_bits(const DeviceBuffer& device, std::size_t count) {
-    std::vector<std::uint16_t> bits(count);
-    cudaMemcpy(bits.data(), device.p, bits.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost);
-    return bits;
-}
-
-std::vector<double> from_device_values(const DeviceBuffer& device, std::size_t count) {
-    const auto bits = from_device_bits(device, count);
-    std::vector<double> values(count);
-    for (std::size_t i = 0; i < count; ++i) values[i] = bf16_to_f32(bits[i]);
-    return values;
-}
-
-double silu(double x) {
-    if (x >= 0.0) return x / (1.0 + std::exp(-x));
-    const double e = std::exp(x);
-    return x * e / (1.0 + e);
-}
-
-struct OracleViews {
+struct SnapshotOracle {
     std::vector<double> query;
     std::vector<double> key;
     std::vector<double> value;
@@ -63,82 +60,87 @@ struct OracleViews {
 };
 
 template <class Projection>
-OracleViews make_oracle(std::int32_t tokens, std::int32_t value_rows,
-                        const std::vector<float>& conv_weight,
-                        const std::vector<std::uint16_t>& initial_state, Projection&& projection) {
-    const int channels = kQueryRows + kKeyRows + value_rows;
-    OracleViews result;
-    const auto q_rows = sampled_rows(kQueryRows);
-    const auto k_rows = sampled_rows(kKeyRows);
-    const auto v_rows = sampled_rows(value_rows);
-    result.query.reserve(q_rows.size() * tokens);
-    result.key.reserve(k_rows.size() * tokens);
-    result.value.reserve(v_rows.size() * tokens);
-    result.state.reserve((q_rows.size() + k_rows.size() + v_rows.size()) * 3 * tokens);
+SnapshotOracle
+snapshot_oracle(std::int32_t value_rows, std::int32_t tokens, const std::vector<float>& conv_weight,
+                std::span<const std::uint16_t> initial_state, Projection&& projection) {
+    const std::int32_t channels = kQueryRows + kKeyRows + value_rows;
+    SnapshotOracle oracle;
+    const std::vector<std::int32_t> query_rows     = sampled_rows(kQueryRows);
+    const std::vector<std::int32_t> key_rows       = sampled_rows(kKeyRows);
+    const std::vector<std::int32_t> value_selected = sampled_rows(value_rows);
+    const std::size_t sampled_channel_count =
+        query_rows.size() + key_rows.size() + value_selected.size();
+    oracle.query.reserve(query_rows.size() * static_cast<std::size_t>(tokens));
+    oracle.key.reserve(key_rows.size() * static_cast<std::size_t>(tokens));
+    oracle.value.reserve(value_selected.size() * static_cast<std::size_t>(tokens));
+    oracle.state.reserve(sampled_channel_count * 3 * static_cast<std::size_t>(tokens));
 
-    const auto evaluate = [&](int global_row, std::vector<double>& output) {
-        double s0       = bf16_to_f32(initial_state[global_row]);
-        double s1       = bf16_to_f32(initial_state[channels + global_row]);
-        double s2       = bf16_to_f32(initial_state[2 * channels + global_row]);
-        const double w0 = conv_weight[global_row];
-        const double w1 = conv_weight[channels + global_row];
-        const double w2 = conv_weight[2 * channels + global_row];
-        const double w3 = conv_weight[3 * channels + global_row];
-        for (int token = 0; token < tokens; ++token) {
-            const double p = projection(global_row, token);
-            const double y = silu(w0 * s0 + w1 * s1 + w2 * s2 + w3 * p);
-            output.push_back(y);
-            result.state.push_back(s1);
-            result.state.push_back(s2);
-            result.state.push_back(p);
-            s0 = s1;
-            s1 = s2;
-            s2 = p;
+    const auto evaluate = [&](std::int32_t global_row, std::vector<double>& output) {
+        double state0        = bf16_to_f32(initial_state[global_row]);
+        double state1        = bf16_to_f32(initial_state[channels + global_row]);
+        double state2        = bf16_to_f32(initial_state[2 * channels + global_row]);
+        const double weight0 = conv_weight[global_row];
+        const double weight1 = conv_weight[channels + global_row];
+        const double weight2 = conv_weight[2 * channels + global_row];
+        const double weight3 = conv_weight[3 * channels + global_row];
+        for (std::int32_t token = 0; token < tokens; ++token) {
+            const double projected = projection(global_row, token);
+            const double convolved =
+                weight0 * state0 + weight1 * state1 + weight2 * state2 + weight3 * projected;
+            output.push_back(silu_fp64(convolved));
+            oracle.state.push_back(state1);
+            oracle.state.push_back(state2);
+            oracle.state.push_back(projected);
+            state0 = state1;
+            state1 = state2;
+            state2 = projected;
         }
     };
 
-    for (const int row : q_rows) evaluate(row, result.query);
-    for (const int row : k_rows) evaluate(kQueryRows + row, result.key);
-    for (const int row : v_rows) evaluate(kQueryRows + kKeyRows + row, result.value);
-    return result;
-}
-
-std::vector<double> gather_outputs(const std::vector<double>& full, std::int32_t rows,
-                                   std::int32_t tokens) {
-    std::vector<double> gathered;
-    for (const int row : sampled_rows(rows)) {
-        for (int token = 0; token < tokens; ++token) {
-            gathered.push_back(full[static_cast<std::size_t>(token) * rows + row]);
-        }
+    for (const std::int32_t row : query_rows) { evaluate(row, oracle.query); }
+    for (const std::int32_t row : key_rows) { evaluate(kQueryRows + row, oracle.key); }
+    for (const std::int32_t row : value_selected) {
+        evaluate(kQueryRows + kKeyRows + row, oracle.value);
     }
-    return gathered;
+    return oracle;
 }
 
-std::vector<double> gather_states(const std::vector<std::uint16_t>& full, std::int32_t channels,
-                                  std::int32_t value_rows, std::int32_t tokens) {
+std::vector<double> gather_state(const std::vector<std::uint16_t>& full, std::int32_t channels,
+                                 std::int32_t value_rows, std::int32_t tokens) {
     std::vector<double> gathered;
-    const auto append = [&](int global_row) {
-        for (int token = 0; token < tokens; ++token) {
-            const std::size_t base = static_cast<std::size_t>(token) * 3 * channels;
-            for (int history = 0; history < 3; ++history) {
-                gathered.push_back(bf16_to_f32(full[base + history * channels + global_row]));
+    const auto append = [&](std::int32_t global_row) {
+        for (std::int32_t token = 0; token < tokens; ++token) {
+            const std::size_t token_base = static_cast<std::size_t>(token) * 3 * channels;
+            for (std::int32_t history = 0; history < 3; ++history) {
+                gathered.push_back(bf16_to_f32(
+                    full[token_base + static_cast<std::size_t>(history) * channels + global_row]));
             }
         }
     };
-    for (const int row : sampled_rows(kQueryRows)) append(row);
-    for (const int row : sampled_rows(kKeyRows)) append(kQueryRows + row);
-    for (const int row : sampled_rows(value_rows)) append(kQueryRows + kKeyRows + row);
+    for (const std::int32_t row : sampled_rows(kQueryRows)) { append(row); }
+    for (const std::int32_t row : sampled_rows(kKeyRows)) { append(kQueryRows + row); }
+    for (const std::int32_t row : sampled_rows(value_rows)) { append(kQueryRows + kKeyRows + row); }
     return gathered;
 }
 
-int verify_untouched_slots(const char* label, const std::vector<std::uint16_t>& before,
-                           const std::vector<std::uint16_t>& after, std::int32_t channels,
-                           std::int32_t tokens) {
-    const std::size_t stride = static_cast<std::size_t>(channels) * 3;
-    for (int slot = tokens; slot < kSlots; ++slot) {
-        const auto begin = static_cast<std::size_t>(slot) * stride;
-        if (!std::equal(before.begin() + begin, before.begin() + begin + stride,
-                        after.begin() + begin)) {
+int verify_state_effects(std::string_view label, const std::vector<std::uint16_t>& before,
+                         const std::vector<std::uint16_t>& after, std::int32_t channels,
+                         std::int32_t tokens, std::int32_t slots) {
+    const std::size_t slot_stride = static_cast<std::size_t>(channels) * 3;
+    for (std::int32_t slot = 0; slot < tokens; ++slot) {
+        const std::size_t base = static_cast<std::size_t>(slot) * slot_stride;
+        for (std::size_t index = 0; index < slot_stride; ++index) {
+            if (!std::isfinite(bf16_to_f32(after[base + index]))) {
+                std::cerr << label << ": state slot " << slot << " was not fully written\n";
+                return 1;
+            }
+        }
+    }
+    for (std::int32_t slot = tokens; slot < slots; ++slot) {
+        const std::size_t base = static_cast<std::size_t>(slot) * slot_stride;
+        if (!std::equal(before.begin() + static_cast<std::ptrdiff_t>(base),
+                        before.begin() + static_cast<std::ptrdiff_t>(base + slot_stride),
+                        after.begin() + static_cast<std::ptrdiff_t>(base))) {
             std::cerr << label << ": state slot " << slot << " was modified\n";
             return 1;
         }
@@ -146,221 +148,196 @@ int verify_untouched_slots(const char* label, const std::vector<std::uint16_t>& 
     return 0;
 }
 
-int verify_written_slots(const char* label, const std::vector<std::uint16_t>& state,
-                         std::int32_t channels, std::int32_t tokens) {
-    const std::size_t elements = static_cast<std::size_t>(channels) * 3 * tokens;
-    for (std::size_t i = 0; i < elements; ++i) {
-        if (!std::isfinite(bf16_to_f32(state[i]))) {
-            std::cerr << label << ": state element " << i << " was not written\n";
-            return 1;
-        }
-    }
-    return 0;
-}
-
-void poison_bf16(DeviceBuffer& buffer) { cudaMemset(buffer.p, 0xff, buffer.bytes); }
-
-int verify_fully_written(const char* label, const DeviceBuffer& output, std::size_t elements) {
-    const auto bits = from_device_bits(output, elements);
-    for (std::size_t i = 0; i < bits.size(); ++i) {
-        if (!std::isfinite(bf16_to_f32(bits[i]))) {
-            std::cerr << label << ": output element " << i << " was not written\n";
-            return 1;
-        }
-    }
-    return 0;
-}
-
-std::vector<std::uint16_t> make_states(std::int32_t channels, std::int32_t initial_slot) {
-    const std::size_t stride = static_cast<std::size_t>(channels) * 3;
-    std::vector<std::uint16_t> bits(stride * kSlots, 0xffffu);
-    std::vector<float> initial(stride);
-    fill_uniform(initial, 9001u + channels, -0.05F, 0.05F);
-    round_to_bf16(initial);
-    for (std::size_t i = 0; i < stride; ++i) {
-        bits[static_cast<std::size_t>(initial_slot) * stride + i] = f32_to_bf16(initial[i]);
-    }
-    return bits;
-}
-
-int one_w8(std::int32_t tokens, std::int32_t initial_slot) {
-    constexpr int kHidden    = 2048;
-    constexpr int kValueRows = 4096;
-    constexpr int kChannels  = 8192;
-    constexpr int kParent    = 12288;
-    std::vector<float> x(static_cast<std::size_t>(kHidden) * tokens);
-    fill_uniform(x, 101u + tokens, -0.01F, 0.01F);
-    round_to_bf16(x);
-    auto packed = row_split::make_patterned_weight(QType::W8G32_F16S, kParent, kHidden, 103u);
-    std::vector<float> conv_weight(static_cast<std::size_t>(kChannels) * 4);
-    fill_uniform(conv_weight, 107u, -0.02F, 0.02F);
-    round_to_bf16(conv_weight);
-    const auto states = make_states(kChannels, initial_slot);
-
-    DeviceBuffer dx = to_device_bf16(x), dp(packed.payload.size()),
-                 dw = to_device_bf16(conv_weight), ds = to_device_bits(states),
-                 di = to_device_i32({initial_slot});
-    cudaMemcpy(dp.p, packed.payload.data(), packed.payload.size(), cudaMemcpyHostToDevice);
-    DeviceBuffer dq(static_cast<std::size_t>(kQueryRows) * tokens * 2),
-        dk(static_cast<std::size_t>(kKeyRows) * tokens * 2),
-        dv(static_cast<std::size_t>(kValueRows) * tokens * 2),
-        dz(static_cast<std::size_t>(kValueRows) * tokens * 2);
-    poison_bf16(dq);
-    poison_bf16(dk);
-    poison_bf16(dv);
-    poison_bf16(dz);
-    Tensor tx(dx.p, DType::BF16, {kHidden, tokens});
-    Tensor tw(dw.p, DType::BF16, {kChannels, 4});
-    Tensor ts(ds.p, DType::BF16, {kChannels, 3, kSlots});
-    Tensor ti(di.p, DType::I32, {1});
-    Tensor tq(dq.p, DType::BF16, {kQueryRows, tokens});
-    Tensor tk(dk.p, DType::BF16, {kKeyRows, tokens});
-    Tensor tv(dv.p, DType::BF16, {kValueRows, tokens});
-    Tensor tz(dz.p, DType::BF16, {kValueRows, tokens});
-    WorkspaceArena workspace(
-        std::max<std::size_t>(1, ops::gdn_input_proj_conv_snapshot_workspace_bytes(
-                                     kQueryRows, kKeyRows, kValueRows, tokens)));
-    ops::gdn_input_proj_conv_snapshot(tx, packed.device_weight(dp.p), tw, ts, ti, tq, tk, tv, tz,
-                                      workspace, nullptr);
-    cudaDeviceSynchronize();
-
-    const std::size_t initial_base = static_cast<std::size_t>(initial_slot) * 3 * kChannels;
-    std::vector<std::uint16_t> initial_state(states.begin() + initial_base,
-                                             states.begin() + initial_base + 3 * kChannels);
-    const auto oracle =
-        make_oracle(tokens, kValueRows, conv_weight, initial_state, [&](int row, int token) {
-            return row_split::dot_row_split_lowbit_fp64(
-                packed, row, x.data() + static_cast<std::size_t>(token) * kHidden, kHidden);
-        });
-    const auto got_states = from_device_bits(ds, states.size());
-    const std::string suffix =
-        " W8 T=" + std::to_string(tokens) + " initial=" + std::to_string(initial_slot);
+int verify_snapshot_outputs(std::string_view suffix, const GuardedBf16Tensor& query,
+                            const GuardedBf16Tensor& key, const GuardedBf16Tensor& value,
+                            std::int32_t value_rows, std::int32_t tokens,
+                            const SnapshotOracle& oracle) {
     int failures = 0;
-    failures +=
-        verify(("snapshot q" + suffix).c_str(),
-               gather_outputs(from_device_values(dq, static_cast<std::size_t>(kQueryRows) * tokens),
-                              kQueryRows, tokens),
-               oracle.query, Tolerance::bf16_reduction());
-    failures +=
-        verify(("snapshot k" + suffix).c_str(),
-               gather_outputs(from_device_values(dk, static_cast<std::size_t>(kKeyRows) * tokens),
-                              kKeyRows, tokens),
-               oracle.key, Tolerance::bf16_reduction());
-    failures +=
-        verify(("snapshot v" + suffix).c_str(),
-               gather_outputs(from_device_values(dv, static_cast<std::size_t>(kValueRows) * tokens),
-                              kValueRows, tokens),
-               oracle.value, Tolerance::bf16_reduction());
-    failures += verify(("snapshot state" + suffix).c_str(),
-                       gather_states(got_states, kChannels, kValueRows, tokens), oracle.state,
-                       Tolerance::linear_bf16());
-    failures += verify_untouched_slots(("snapshot" + suffix).c_str(), states, got_states, kChannels,
-                                       tokens);
-    failures += verify_written_slots(("snapshot" + suffix).c_str(), got_states, kChannels, tokens);
-    failures += verify_fully_written(("snapshot q" + suffix).c_str(), dq,
-                                     static_cast<std::size_t>(kQueryRows) * tokens);
-    failures += verify_fully_written(("snapshot k" + suffix).c_str(), dk,
-                                     static_cast<std::size_t>(kKeyRows) * tokens);
-    failures += verify_fully_written(("snapshot v" + suffix).c_str(), dv,
-                                     static_cast<std::size_t>(kValueRows) * tokens);
-    failures += verify_fully_written(("snapshot z" + suffix).c_str(), dz,
-                                     static_cast<std::size_t>(kValueRows) * tokens);
-
-    std::vector<double> z_ref;
-    std::vector<double> z_got =
-        from_device_values(dz, static_cast<std::size_t>(kValueRows) * tokens);
-    for (const int row : sampled_rows(kValueRows)) {
-        for (int token = 0; token < tokens; ++token) {
-            z_ref.push_back(row_split::dot_row_split_lowbit_fp64(
-                packed, kChannels + row, x.data() + static_cast<std::size_t>(token) * kHidden,
-                kHidden));
-        }
-    }
-    failures += verify(("snapshot z" + suffix).c_str(), gather_outputs(z_got, kValueRows, tokens),
-                       z_ref, Tolerance::linear_bf16());
+    failures += query.verify_guards("snapshot query" + std::string(suffix));
+    failures += key.verify_guards("snapshot key" + std::string(suffix));
+    failures += value.verify_guards("snapshot value" + std::string(suffix));
+    failures += query.verify_fully_written("snapshot query" + std::string(suffix));
+    failures += key.verify_fully_written("snapshot key" + std::string(suffix));
+    failures += value.verify_fully_written("snapshot value" + std::string(suffix));
+    failures += compare("snapshot query" + std::string(suffix),
+                        gather_rows(query.values(), kQueryRows, 0, kQueryRows, tokens),
+                        oracle.query, kGdnInputProjConvSnapshotA16Tolerance);
+    failures += compare("snapshot key" + std::string(suffix),
+                        gather_rows(key.values(), kKeyRows, 0, kKeyRows, tokens), oracle.key,
+                        kGdnInputProjConvSnapshotA16Tolerance);
+    failures += compare("snapshot value" + std::string(suffix),
+                        gather_rows(value.values(), value_rows, 0, value_rows, tokens),
+                        oracle.value, kGdnInputProjConvSnapshotA16Tolerance);
     return failures;
 }
 
-int one_q4_q5(std::int32_t tokens, std::int32_t initial_slot) {
-    constexpr int kHidden    = 5120;
-    constexpr int kValueRows = 6144;
-    constexpr int kChannels  = 10240;
-    std::vector<float> x(static_cast<std::size_t>(kHidden) * tokens);
-    fill_uniform(x, 201u + tokens, -0.01F, 0.01F);
-    round_to_bf16(x);
-    auto qk = row_split::make_patterned_weight(QType::Q4G64_F16S, 4096, kHidden, 203u);
-    auto vv = row_split::make_patterned_weight(QType::Q5G64_F16S, kValueRows, kHidden, 211u);
-    std::vector<float> conv_weight(static_cast<std::size_t>(kChannels) * 4);
-    fill_uniform(conv_weight, 223u, -0.02F, 0.02F);
-    round_to_bf16(conv_weight);
-    const auto states = make_states(kChannels, initial_slot);
+int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_weight,
+                   std::int32_t tokens, std::int32_t initial_slot) {
+    constexpr std::int32_t kHidden      = 5120;
+    constexpr std::int32_t kValueRows   = 6144;
+    constexpr std::int32_t kChannels    = 10240;
+    const std::int32_t slots            = std::max(tokens + 2, initial_slot + 1);
+    const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 601U + tokens);
+    const std::vector<std::uint16_t> activation_bits  = bf16_bits(activation);
+    const std::vector<float> conv_weight              = make_conv_weight(kChannels, 607U);
+    const std::vector<std::uint16_t> conv_weight_bits = bf16_bits(conv_weight);
+    const std::vector<std::uint16_t> state_before =
+        make_state(kChannels, slots, initial_slot, 613U + tokens);
+    const std::vector<std::int32_t> initial_value{initial_slot};
 
-    DeviceBuffer dx = to_device_bf16(x), dqk(qk.payload.size()), dvv(vv.payload.size()),
-                 dw = to_device_bf16(conv_weight), ds = to_device_bits(states),
-                 di = to_device_i32({initial_slot});
-    cudaMemcpy(dqk.p, qk.payload.data(), qk.payload.size(), cudaMemcpyHostToDevice);
-    cudaMemcpy(dvv.p, vv.payload.data(), vv.payload.size(), cudaMemcpyHostToDevice);
-    DeviceBuffer dq(static_cast<std::size_t>(kQueryRows) * tokens * 2),
-        dk(static_cast<std::size_t>(kKeyRows) * tokens * 2),
-        dv(static_cast<std::size_t>(kValueRows) * tokens * 2);
-    poison_bf16(dq);
-    poison_bf16(dk);
-    poison_bf16(dv);
-    Tensor tx(dx.p, DType::BF16, {kHidden, tokens});
-    Tensor tw(dw.p, DType::BF16, {kChannels, 4});
-    Tensor ts(ds.p, DType::BF16, {kChannels, 3, kSlots});
-    Tensor ti(di.p, DType::I32, {1});
-    Tensor tq(dq.p, DType::BF16, {kQueryRows, tokens});
-    Tensor tk(dk.p, DType::BF16, {kKeyRows, tokens});
-    Tensor tv(dv.p, DType::BF16, {kValueRows, tokens});
+    DeviceBuffer device_activation  = to_device(activation_bits);
+    DeviceBuffer device_conv_weight = to_device(conv_weight_bits);
+    DeviceBuffer device_initial     = to_device(initial_value);
+    GuardedBf16Tensor state(kChannels * 3, slots);
+    state.copy_from_bits(state_before);
+    GuardedBf16Tensor query(kQueryRows, tokens);
+    GuardedBf16Tensor key(kKeyRows, tokens);
+    GuardedBf16Tensor value(kValueRows, tokens);
+    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor conv(device_conv_weight.p, DType::BF16, {kChannels, 4});
+    Tensor conv_state(state.data(), DType::BF16, {kChannels, 3, slots});
+    Tensor initial(device_initial.p, DType::I32, {1});
+    Tensor q = query.tensor();
+    Tensor k = key.tensor();
+    Tensor v = value.tensor();
     WorkspaceArena workspace(
         std::max<std::size_t>(1, ops::gdn_input_proj_conv_snapshot_workspace_bytes(
                                      kQueryRows, kKeyRows, kValueRows, tokens)));
-    ops::gdn_input_proj_conv_snapshot(tx, qk.device_weight(dqk.p), vv.device_weight(dvv.p), tw, ts,
-                                      ti, tq, tk, tv, workspace, nullptr);
-    cudaDeviceSynchronize();
+
+    ops::gdn_input_proj_conv_snapshot(x, query_key.view(), value_weight.view(), conv, conv_state,
+                                      initial, q, k, v, workspace, nullptr);
+    cuda_synchronize();
 
     const std::size_t initial_base = static_cast<std::size_t>(initial_slot) * 3 * kChannels;
-    std::vector<std::uint16_t> initial_state(states.begin() + initial_base,
-                                             states.begin() + initial_base + 3 * kChannels);
-    const auto oracle =
-        make_oracle(tokens, kValueRows, conv_weight, initial_state, [&](int row, int token) {
-            const float* input = x.data() + static_cast<std::size_t>(token) * kHidden;
-            return row < 4096
-                       ? row_split::dot_row_split_lowbit_fp64(qk, row, input, kHidden)
-                       : row_split::dot_row_split_lowbit_fp64(vv, row - 4096, input, kHidden);
+    const std::span<const std::uint16_t> initial_state(state_before.data() + initial_base,
+                                                       3 * kChannels);
+    const SnapshotOracle oracle = snapshot_oracle(
+        kValueRows, tokens, conv_weight, initial_state, [&](std::int32_t row, std::int32_t token) {
+            const float* token_activation =
+                activation.data() + static_cast<std::size_t>(token) * kHidden;
+            if (row < kQueryRows + kKeyRows) {
+                return row_split::dot_row_split_lowbit_fp64(query_key.host, row, token_activation,
+                                                            kHidden);
+            }
+            return row_split::dot_row_split_lowbit_fp64(
+                value_weight.host, row - kQueryRows - kKeyRows, token_activation, kHidden);
         });
-    const auto got_states = from_device_bits(ds, states.size());
+    const std::vector<std::uint16_t> state_after = state.bits();
     const std::string suffix =
-        " Q4/Q5 T=" + std::to_string(tokens) + " initial=" + std::to_string(initial_slot);
+        " Q4/Q5 A16 T=" + std::to_string(tokens) + " initial=" + std::to_string(initial_slot);
+    int failures = verify_snapshot_outputs(suffix, query, key, value, kValueRows, tokens, oracle);
+    failures +=
+        compare("snapshot state" + suffix, gather_state(state_after, kChannels, kValueRows, tokens),
+                oracle.state, kGdnInputProjConvSnapshotA16Tolerance);
+    failures += state.verify_guards("snapshot state" + suffix);
+    failures += verify_state_effects("snapshot state" + suffix, state_before, state_after,
+                                     kChannels, tokens, slots);
+    failures += verify_preserved("snapshot x" + suffix, device_activation, activation_bits);
+    failures +=
+        verify_preserved("snapshot conv weight" + suffix, device_conv_weight, conv_weight_bits);
+    failures += verify_preserved("snapshot initial slot" + suffix, device_initial, initial_value);
+    failures += query_key.verify_preserved("snapshot query/key weight" + suffix);
+    failures += value_weight.verify_preserved("snapshot value weight" + suffix);
+    return failures;
+}
+
+int run_q4_q5() {
+    constexpr std::int32_t kHidden = 5120;
+    DevicePackedWeight query_key(
+        row_split::make_patterned_weight(QType::Q4G64_F16S, 4096, kHidden, 617U));
+    DevicePackedWeight value_weight(
+        row_split::make_patterned_weight(QType::Q5G64_F16S, 6144, kHidden, 619U));
     int failures = 0;
+    // Representative registered T values around every current execution boundary.
+    for (const std::int32_t tokens : {1, 4, 5, 7}) {
+        const std::int32_t initial_slot = tokens == 5 ? 0 : tokens + 1;
+        failures += run_q4_q5_case(query_key, value_weight, tokens, initial_slot);
+    }
+    return failures;
+}
+
+int run_w8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t initial_slot) {
+    constexpr std::int32_t kHidden      = 2048;
+    constexpr std::int32_t kValueRows   = 4096;
+    constexpr std::int32_t kZRows       = 4096;
+    constexpr std::int32_t kChannels    = 8192;
+    const std::int32_t slots            = std::max(tokens + 2, initial_slot + 1);
+    const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 701U + tokens);
+    const std::vector<std::uint16_t> activation_bits  = bf16_bits(activation);
+    const std::vector<float> conv_weight              = make_conv_weight(kChannels, 709U);
+    const std::vector<std::uint16_t> conv_weight_bits = bf16_bits(conv_weight);
+    const std::vector<std::uint16_t> state_before =
+        make_state(kChannels, slots, initial_slot, 719U + tokens);
+    const std::vector<std::int32_t> initial_value{initial_slot};
+
+    DeviceBuffer device_activation  = to_device(activation_bits);
+    DeviceBuffer device_conv_weight = to_device(conv_weight_bits);
+    DeviceBuffer device_initial     = to_device(initial_value);
+    GuardedBf16Tensor state(kChannels * 3, slots);
+    state.copy_from_bits(state_before);
+    GuardedBf16Tensor query(kQueryRows, tokens);
+    GuardedBf16Tensor key(kKeyRows, tokens);
+    GuardedBf16Tensor value(kValueRows, tokens);
+    GuardedBf16Tensor z(kZRows, tokens);
+    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor conv(device_conv_weight.p, DType::BF16, {kChannels, 4});
+    Tensor conv_state(state.data(), DType::BF16, {kChannels, 3, slots});
+    Tensor initial(device_initial.p, DType::I32, {1});
+    Tensor q        = query.tensor();
+    Tensor k        = key.tensor();
+    Tensor v        = value.tensor();
+    Tensor z_output = z.tensor();
+    WorkspaceArena workspace(
+        std::max<std::size_t>(1, ops::gdn_input_proj_conv_snapshot_workspace_bytes(
+                                     kQueryRows, kKeyRows, kValueRows, tokens)));
+
+    ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, conv_state, initial, q, k, v,
+                                      z_output, workspace, nullptr);
+    cuda_synchronize();
+
+    const std::size_t initial_base = static_cast<std::size_t>(initial_slot) * 3 * kChannels;
+    const std::span<const std::uint16_t> initial_state(state_before.data() + initial_base,
+                                                       3 * kChannels);
+    const SnapshotOracle oracle = snapshot_oracle(
+        kValueRows, tokens, conv_weight, initial_state, [&](std::int32_t row, std::int32_t token) {
+            return row_split::dot_row_split_lowbit_fp64(
+                parent.host, row, activation.data() + static_cast<std::size_t>(token) * kHidden,
+                kHidden);
+        });
+    const std::vector<std::uint16_t> state_after = state.bits();
+    const std::string suffix =
+        " W8 A16 T=" + std::to_string(tokens) + " initial=" + std::to_string(initial_slot);
+    int failures = verify_snapshot_outputs(suffix, query, key, value, kValueRows, tokens, oracle);
     failures +=
-        verify(("snapshot q" + suffix).c_str(),
-               gather_outputs(from_device_values(dq, static_cast<std::size_t>(kQueryRows) * tokens),
-                              kQueryRows, tokens),
-               oracle.query, Tolerance::bf16_reduction());
+        compare("snapshot state" + suffix, gather_state(state_after, kChannels, kValueRows, tokens),
+                oracle.state, kGdnInputProjConvSnapshotA16Tolerance);
+    failures += state.verify_guards("snapshot state" + suffix);
+    failures += verify_state_effects("snapshot state" + suffix, state_before, state_after,
+                                     kChannels, tokens, slots);
+    failures += z.verify_guards("snapshot z" + suffix);
+    failures += z.verify_fully_written("snapshot z" + suffix);
     failures +=
-        verify(("snapshot k" + suffix).c_str(),
-               gather_outputs(from_device_values(dk, static_cast<std::size_t>(kKeyRows) * tokens),
-                              kKeyRows, tokens),
-               oracle.key, Tolerance::bf16_reduction());
+        compare("snapshot z" + suffix, gather_rows(z.values(), kZRows, 0, kZRows, tokens),
+                projection_oracle(parent.host, kChannels, kZRows, activation, kHidden, tokens),
+                kGdnInputProjConvSnapshotA16Tolerance);
+    failures += verify_preserved("snapshot x" + suffix, device_activation, activation_bits);
     failures +=
-        verify(("snapshot v" + suffix).c_str(),
-               gather_outputs(from_device_values(dv, static_cast<std::size_t>(kValueRows) * tokens),
-                              kValueRows, tokens),
-               oracle.value, Tolerance::bf16_reduction());
-    failures += verify(("snapshot state" + suffix).c_str(),
-                       gather_states(got_states, kChannels, kValueRows, tokens), oracle.state,
-                       Tolerance::linear_bf16());
-    failures += verify_untouched_slots(("snapshot" + suffix).c_str(), states, got_states, kChannels,
-                                       tokens);
-    failures += verify_written_slots(("snapshot" + suffix).c_str(), got_states, kChannels, tokens);
-    failures += verify_fully_written(("snapshot q" + suffix).c_str(), dq,
-                                     static_cast<std::size_t>(kQueryRows) * tokens);
-    failures += verify_fully_written(("snapshot k" + suffix).c_str(), dk,
-                                     static_cast<std::size_t>(kKeyRows) * tokens);
-    failures += verify_fully_written(("snapshot v" + suffix).c_str(), dv,
-                                     static_cast<std::size_t>(kValueRows) * tokens);
+        verify_preserved("snapshot conv weight" + suffix, device_conv_weight, conv_weight_bits);
+    failures += verify_preserved("snapshot initial slot" + suffix, device_initial, initial_value);
+    failures += parent.verify_preserved("snapshot parent weight" + suffix);
+    return failures;
+}
+
+int run_w8() {
+    constexpr std::int32_t kHidden = 2048;
+    DevicePackedWeight parent(
+        row_split::make_patterned_weight(QType::W8G32_F16S, 12288, kHidden, 727U));
+    int failures = 0;
+    // Representative registered T values around every current execution boundary.
+    for (const std::int32_t tokens : {1, 2, 17}) {
+        const std::int32_t initial_slot = tokens == 2 ? 0 : tokens + 1;
+        failures += run_w8_case(parent, tokens, initial_slot);
+    }
     return failures;
 }
 
@@ -371,14 +348,10 @@ int main() {
         std::cout << "SKIP: no usable CUDA device\n";
         return 0;
     }
+
     int failures = 0;
-    for (int tokens = 1; tokens <= 16; ++tokens) {
-        failures += one_w8(tokens, kInitial);
-        failures += one_q4_q5(tokens, kInitial);
-    }
-    for (int initial_slot = 0; initial_slot < kSlots; ++initial_slot) {
-        if (initial_slot != kInitial) { failures += one_w8(16, initial_slot); }
-    }
-    std::cout << (failures ? "FAIL" : "OK") << " GDN input projection/snapshot\n";
+    failures += run_q4_q5();
+    failures += run_w8();
+    std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_snapshot\n";
     return failures == 0 ? 0 : 1;
 }

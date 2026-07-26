@@ -28,15 +28,18 @@ namespace ninfer::ops {
  *   alpha       = exp(g[h,t])
  *   delta       = beta[h,t] * (v[:,h,t] - alpha * S_h * k[:,qh,t])
  *   S_h         = alpha * S_h + outer(delta, k[:,qh,t])
- *   out[:,h,t]  = BF16(scale * S_h * q[:,qh,t]).
+ *   ideal[:,h,t] = scale * S_h * q[:,qh,t].
  *
  * Shapes/dtypes are contiguous q/k BF16 [S,Hqk,T], v/out BF16 [S,Hv,T], g/beta FP32 [Hv,T], and
  * state FP32 [S,S,Hv], where S is one of {16,32,64,128}, Hqk>=1, Hv>=Hqk, and Hv%Hqk==0. `scale`
  * is 1/sqrt(S). When `normalize_qk` is true, the recurrent implementation consumes raw q/k and
  * applies x / sqrt(sum(x^2) + 1e-6) independently to every [S] row before using it. When false,
- * q/k are consumed as supplied. Recurrent implementations may apply the normalization directly;
- * chunked implementations may use private normalized staging. The corresponding private storage
- * is included by gated_delta_rule_workspace_bytes when `normalize_qk` is true.
+ * q/k are consumed as supplied. The oracle evaluates the complete recurrence and `ideal` naively
+ * in FP64 from the represented inputs and FP32 initial state. The BF16 out is promoted and compared
+ * directly with that result; output storage rounding belongs to the Op's numerical criterion, not
+ * the oracle. Recurrent implementations may apply the normalization directly; chunked
+ * implementations may use private normalized staging. The corresponding private storage is
+ * included by gated_delta_rule_workspace_bytes when `normalize_qk` is true.
  * Inputs and out do not overlap state or one another. `ws` supplies transient storage reported by
  * gated_delta_rule_workspace_bytes; scratch is scoped to the call. T may be any positive value.
  *

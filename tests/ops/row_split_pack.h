@@ -227,7 +227,7 @@ struct PackedWeight {
 };
 
 // Builds a full-shape deterministic RowSplit payload without allocating a source or dequantized
-// matrix. This is useful for exact product-shape route tests that verify only sampled FP64 rows.
+// matrix. Large registered-shape conformance tests can then verify deterministic FP64 row samples.
 inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int32_t k,
                                           std::uint32_t seed) {
     if (n <= 0 || k <= 0) {

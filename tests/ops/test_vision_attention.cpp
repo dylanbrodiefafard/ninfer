@@ -1,5 +1,6 @@
 #include "ninfer/ops/vision_attention.h"
-#include "ops/launcher/vision_attention.h"
+
+#include "core/arena.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -7,6 +8,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <limits>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 using namespace ninfer;
@@ -17,150 +21,259 @@ namespace {
 constexpr int kDim   = 72;
 constexpr int kHeads = 16;
 
+constexpr ReductionCriterion kVisionAttentionBf16Criterion{
+    .relative_l2                     = 2.8e-3,
+    .gross_absolute                  = 1e-3,
+    .gross_relative_to_max_reference = 3e-3,
+};
+
 std::size_t index_of(int token, int head, int d) {
-    return (static_cast<std::size_t>(token) * kHeads + head) * kDim + d;
+    return (static_cast<std::size_t>(token) * kHeads + static_cast<std::size_t>(head)) * kDim +
+           static_cast<std::size_t>(d);
 }
 
-void reference_attention(const std::vector<float>& q, const std::vector<float>& k,
-                         const std::vector<float>& v, const std::vector<int>& cu,
-                         std::vector<double>& out) {
+std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
+    std::vector<std::uint16_t> bits(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) bits[i] = f32_to_bf16(values[i]);
+    return bits;
+}
+
+void vision_attention_oracle(const std::vector<float>& q, const std::vector<float>& k,
+                             const std::vector<float>& v, const std::vector<int>& cu_seqlens,
+                             std::vector<double>& out) {
     constexpr double scale = 1.0 / std::sqrt(72.0);
-    for (std::size_t segment = 0; segment + 1 < cu.size(); ++segment) {
-        const int begin = cu[segment];
-        const int end   = cu[segment + 1];
+    out.assign(q.size(), 0.0);
+
+    for (std::size_t segment = 0; segment + 1 < cu_seqlens.size(); ++segment) {
+        const int begin = cu_seqlens[segment];
+        const int end   = cu_seqlens[segment + 1];
+        std::vector<double> scores(static_cast<std::size_t>(end - begin));
         for (int query = begin; query < end; ++query) {
             for (int head = 0; head < kHeads; ++head) {
-                std::vector<double> scores(static_cast<std::size_t>(end - begin));
-                double maximum = -INFINITY;
+                double max_score = -std::numeric_limits<double>::infinity();
                 for (int key = begin; key < end; ++key) {
                     double dot = 0.0;
                     for (int d = 0; d < kDim; ++d) {
                         dot += static_cast<double>(q[index_of(query, head, d)]) *
-                               k[index_of(key, head, d)];
+                               static_cast<double>(k[index_of(key, head, d)]);
                     }
-                    scores[static_cast<std::size_t>(key - begin)] = dot * scale;
-                    maximum                                       = std::max(maximum, dot * scale);
+                    const double score                            = dot * scale;
+                    scores[static_cast<std::size_t>(key - begin)] = score;
+                    max_score                                     = std::max(max_score, score);
                 }
-                double sum = 0.0;
+
+                double denominator = 0.0;
                 for (double& score : scores) {
-                    score = std::exp(score - maximum);
-                    sum += score;
+                    score = std::exp(score - max_score);
+                    denominator += score;
                 }
                 for (int d = 0; d < kDim; ++d) {
-                    double value = 0.0;
+                    double numerator = 0.0;
                     for (int key = begin; key < end; ++key) {
-                        value += scores[static_cast<std::size_t>(key - begin)] / sum *
-                                 v[index_of(key, head, d)];
+                        numerator += scores[static_cast<std::size_t>(key - begin)] *
+                                     static_cast<double>(v[index_of(key, head, d)]);
                     }
-                    out[index_of(query, head, d)] = value;
+                    out[index_of(query, head, d)] = numerator / denominator;
                 }
             }
         }
     }
 }
 
-int one_case(const std::vector<int>& cu, std::uint32_t seed, bool packed, int uniform_tile = 0,
-             bool raw_scratch = false) {
-    const int patches       = cu.back();
-    const std::size_t plane = static_cast<std::size_t>(patches) * kHeads * kDim;
-    std::vector<float> q(plane), k(plane), v(plane);
+enum class StorageProfile {
+    Contiguous,
+    InterleavedQkv,
+};
+
+enum class PublicEntry {
+    CuSeqlensArena,
+    CuSeqlensScratch,
+    UniformSegments,
+};
+
+enum class InputProfile {
+    Random,
+    SegmentIsolation,
+};
+
+const char* storage_name(StorageProfile profile) {
+    return profile == StorageProfile::Contiguous ? "contiguous" : "interleaved-qkv";
+}
+
+const char* entry_name(PublicEntry entry) {
+    switch (entry) {
+    case PublicEntry::CuSeqlensArena:
+        return "cu-arena";
+    case PublicEntry::CuSeqlensScratch:
+        return "cu-scratch";
+    case PublicEntry::UniformSegments:
+        return "uniform";
+    }
+    return "unknown";
+}
+
+int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProfile storage_profile,
+             PublicEntry entry, InputProfile input_profile = InputProfile::Random) {
+    const int patches             = cu_seqlens.back();
+    const std::size_t token_plane = static_cast<std::size_t>(kHeads) * kDim;
+    const std::size_t value_count = static_cast<std::size_t>(patches) * token_plane;
+    std::vector<float> q(value_count);
+    std::vector<float> k(value_count);
+    std::vector<float> v(value_count);
     fill_uniform(q, seed, -1.0f, 1.0f);
     fill_uniform(k, seed + 1, -1.0f, 1.0f);
     fill_uniform(v, seed + 2, -2.0f, 2.0f);
+    if (input_profile == InputProfile::SegmentIsolation) {
+        std::fill(q.begin(), q.end(), 0.0f);
+        std::fill(k.begin(), k.end(), 0.0f);
+        for (std::size_t segment = 0; segment + 1 < cu_seqlens.size(); ++segment) {
+            const float segment_value = (segment & 1u) == 0 ? 4.0f : -3.0f;
+            for (int token = cu_seqlens[segment]; token < cu_seqlens[segment + 1]; ++token) {
+                std::fill_n(v.data() + static_cast<std::size_t>(token) * token_plane, token_plane,
+                            segment_value);
+            }
+        }
+    }
     round_to_bf16(q);
     round_to_bf16(k);
     round_to_bf16(v);
-    std::vector<double> reference(plane);
-    reference_attention(q, k, v, cu, reference);
 
-    DeviceBuffer dcu = to_device_i32(cu);
-    DeviceBuffer dout(plane * 2);
-    Tensor tq;
-    Tensor tk;
-    Tensor tv;
-    DeviceBuffer storage(packed ? plane * 3 * 2 : 1);
-    DeviceBuffer dq(packed ? 1 : plane * 2);
-    DeviceBuffer dk(packed ? 1 : plane * 2);
-    DeviceBuffer dv(packed ? 1 : plane * 2);
-    if (packed) {
-        std::vector<float> qkv(plane * 3);
-        const std::size_t token_plane = static_cast<std::size_t>(kHeads) * kDim;
+    std::vector<double> reference;
+    vision_attention_oracle(q, k, v, cu_seqlens, reference);
+
+    const auto q_expected = bf16_bits(q);
+    const auto k_expected = bf16_bits(k);
+    const auto v_expected = bf16_bits(v);
+
+    DeviceBuffer q_storage;
+    DeviceBuffer k_storage;
+    DeviceBuffer v_storage;
+    DeviceBuffer interleaved_storage;
+    Tensor q_tensor;
+    Tensor k_tensor;
+    Tensor v_tensor;
+    std::vector<std::uint16_t> interleaved_expected;
+
+    if (storage_profile == StorageProfile::Contiguous) {
+        q_storage = to_device(q_expected);
+        k_storage = to_device(k_expected);
+        v_storage = to_device(v_expected);
+        q_tensor  = Tensor(q_storage.p, DType::BF16, {kDim, kHeads, patches});
+        k_tensor  = Tensor(k_storage.p, DType::BF16, {kDim, kHeads, patches});
+        v_tensor  = Tensor(v_storage.p, DType::BF16, {kDim, kHeads, patches});
+    } else {
+        interleaved_expected.resize(value_count * 3);
         for (int token = 0; token < patches; ++token) {
-            const std::size_t src = static_cast<std::size_t>(token) * token_plane;
-            const std::size_t dst = static_cast<std::size_t>(token) * token_plane * 3;
-            std::copy_n(q.data() + src, token_plane, qkv.data() + dst);
-            std::copy_n(k.data() + src, token_plane, qkv.data() + dst + token_plane);
-            std::copy_n(v.data() + src, token_plane, qkv.data() + dst + token_plane * 2);
+            const std::size_t source = static_cast<std::size_t>(token) * token_plane;
+            const std::size_t target = static_cast<std::size_t>(token) * token_plane * 3;
+            std::copy_n(q_expected.data() + source, token_plane,
+                        interleaved_expected.data() + target);
+            std::copy_n(k_expected.data() + source, token_plane,
+                        interleaved_expected.data() + target + token_plane);
+            std::copy_n(v_expected.data() + source, token_plane,
+                        interleaved_expected.data() + target + token_plane * 2);
         }
-        std::vector<std::uint16_t> bits(qkv.size());
-        for (std::size_t i = 0; i < qkv.size(); ++i) bits[i] = f32_to_bf16(qkv[i]);
-        cudaMemcpy(storage.p, bits.data(), bits.size() * 2, cudaMemcpyHostToDevice);
-        tq       = Tensor(storage.p, DType::BF16, {kDim, kHeads, patches});
-        tq.nb[2] = static_cast<std::int64_t>(token_plane * 3 * 2);
-        tk       = tq;
-        tv       = tq;
-        tk.data  = static_cast<unsigned char*>(storage.p) + token_plane * 2;
-        tv.data  = static_cast<unsigned char*>(storage.p) + token_plane * 4;
-    } else {
-        std::vector<std::uint16_t> qb(q.size()), kb(k.size()), vb(v.size());
-        for (std::size_t i = 0; i < q.size(); ++i) {
-            qb[i] = f32_to_bf16(q[i]);
-            kb[i] = f32_to_bf16(k[i]);
-            vb[i] = f32_to_bf16(v[i]);
+        interleaved_storage = to_device(interleaved_expected);
+        q_tensor            = Tensor(interleaved_storage.p, DType::BF16, {kDim, kHeads, patches});
+        q_tensor.nb[2]      = static_cast<std::int64_t>(token_plane * 3 * sizeof(std::uint16_t));
+        k_tensor            = q_tensor;
+        v_tensor            = q_tensor;
+        k_tensor.data =
+            static_cast<std::uint8_t*>(interleaved_storage.p) + token_plane * sizeof(std::uint16_t);
+        v_tensor.data = static_cast<std::uint8_t*>(interleaved_storage.p) +
+                        token_plane * 2 * sizeof(std::uint16_t);
+    }
+
+    DeviceBuffer d_cu_seqlens = to_device_i32(cu_seqlens);
+    Tensor cu_tensor(d_cu_seqlens.p, DType::I32, {static_cast<std::int32_t>(cu_seqlens.size())});
+    GuardedDeviceBuffer d_out(value_count * sizeof(std::uint16_t));
+    d_out.fill(0x7f);
+    Tensor out_tensor(d_out.data(), DType::BF16, {kDim, kHeads, patches});
+
+    const int scratch_tiles = ops::vision_attention_scratch_tiles(
+        patches, static_cast<std::int32_t>(cu_seqlens.size()) - 1);
+    DeviceArena workspace(std::max<std::size_t>(256, static_cast<std::size_t>(scratch_tiles) * 4 *
+                                                         sizeof(std::int32_t)));
+    GuardedDeviceBuffer d_scratch(std::max<std::size_t>(
+        sizeof(std::int32_t), static_cast<std::size_t>(scratch_tiles) * 4 * sizeof(std::int32_t)));
+
+    if (entry == PublicEntry::CuSeqlensArena) {
+        ops::vision_attention(q_tensor, k_tensor, v_tensor, cu_tensor, workspace, out_tensor,
+                              nullptr);
+    } else if (entry == PublicEntry::CuSeqlensScratch) {
+        if (scratch_tiles == 0) {
+            throw std::logic_error("raw scratch case requires multiple segments");
         }
-        cudaMemcpy(dq.p, qb.data(), qb.size() * 2, cudaMemcpyHostToDevice);
-        cudaMemcpy(dk.p, kb.data(), kb.size() * 2, cudaMemcpyHostToDevice);
-        cudaMemcpy(dv.p, vb.data(), vb.size() * 2, cudaMemcpyHostToDevice);
-        tq = Tensor(dq.p, DType::BF16, {kDim, kHeads, patches});
-        tk = Tensor(dk.p, DType::BF16, {kDim, kHeads, patches});
-        tv = Tensor(dv.p, DType::BF16, {kDim, kHeads, patches});
-    }
-    Tensor tcu(dcu.p, DType::I32, {static_cast<int>(cu.size())});
-    Tensor tout(dout.p, DType::BF16, {kDim, kHeads, patches});
-    WorkspaceArena workspace(256);
-    const int scratch_count =
-        raw_scratch ? ops::vision_attention_scratch_tiles(patches, int(cu.size()) - 1) : 0;
-    DeviceBuffer dscratch(
-        std::max<std::size_t>(1, static_cast<std::size_t>(scratch_count) * 4 * 4));
-    if (uniform_tile > 0) {
-        ops::detail::vision_attention_uniform_launch_with_tile(tq, tk, tv, cu[1] - cu[0],
-                                                               uniform_tile, tout, nullptr);
-    } else if (uniform_tile < 0) {
-        ops::vision_attention(tq, tk, tv, cu[1] - cu[0], tout, nullptr);
-    } else if (raw_scratch) {
-        Tensor tscratch(dscratch.p, DType::I32, {4, scratch_count});
-        ops::vision_attention(tq, tk, tv, tcu, &tscratch, tout, nullptr);
+        d_scratch.fill(0x7f);
+        Tensor scratch_tensor(d_scratch.data(), DType::I32, {4, scratch_tiles});
+        ops::vision_attention(q_tensor, k_tensor, v_tensor, cu_tensor, &scratch_tensor, out_tensor,
+                              nullptr);
     } else {
-        ops::vision_attention(tq, tk, tv, tcu, workspace, tout, nullptr);
+        const int segment_length = cu_seqlens[1] - cu_seqlens[0];
+        for (std::size_t segment = 1; segment + 1 < cu_seqlens.size(); ++segment) {
+            if (cu_seqlens[segment + 1] - cu_seqlens[segment] != segment_length) {
+                throw std::logic_error("uniform case requires equal segments");
+            }
+        }
+        ops::vision_attention(q_tensor, k_tensor, v_tensor, segment_length, out_tensor, nullptr);
     }
-    cudaDeviceSynchronize();
-    const std::string label = uniform_tile > 0
-                                  ? "vision attention uniform tile " + std::to_string(uniform_tile)
-                              : uniform_tile < 0 ? "vision attention uniform auto"
-                              : raw_scratch      ? "vision attention raw tensor scratch"
-                              : packed           ? "vision attention packed qkv"
-                                                 : "vision attention contiguous";
-    return verify(label.c_str(), from_device_bf16(dout, plane), reference,
-                  Tolerance::attention_bf16());
+    cuda_synchronize();
+
+    const std::string label = "vision_attention P=" + std::to_string(patches) +
+                              " S=" + std::to_string(cu_seqlens.size() - 1) + " " +
+                              storage_name(storage_profile) + " " + entry_name(entry);
+    const std::string qualified_label =
+        input_profile == InputProfile::SegmentIsolation ? label + " segment-isolation" : label;
+    int failures =
+        verify_reduction(qualified_label.c_str(), from_device_bf16(d_out.data(), value_count),
+                         reference, kVisionAttentionBf16Criterion);
+    failures += d_out.verify_guards((qualified_label + " output guards").c_str());
+    if (entry == PublicEntry::CuSeqlensScratch) {
+        failures += d_scratch.verify_guards((qualified_label + " scratch guards").c_str());
+    }
+    if (storage_profile == StorageProfile::Contiguous) {
+        failures += verify_exact((qualified_label + " q unchanged").c_str(),
+                                 from_device<std::uint16_t>(q_storage, value_count), q_expected);
+        failures += verify_exact((qualified_label + " k unchanged").c_str(),
+                                 from_device<std::uint16_t>(k_storage, value_count), k_expected);
+        failures += verify_exact((qualified_label + " v unchanged").c_str(),
+                                 from_device<std::uint16_t>(v_storage, value_count), v_expected);
+    } else {
+        failures += verify_exact(
+            (qualified_label + " qkv storage unchanged").c_str(),
+            from_device<std::uint16_t>(interleaved_storage, interleaved_expected.size()),
+            interleaved_expected);
+    }
+    if (entry != PublicEntry::UniformSegments) {
+        failures += verify_exact((qualified_label + " cu_seqlens unchanged").c_str(),
+                                 from_device<int>(d_cu_seqlens, cu_seqlens.size()), cu_seqlens);
+    }
+    return failures;
 }
 
 } // namespace
 
 int main() {
     if (cuda_unavailable()) {
-        std::cout << "SKIP: no usable CUDA device\n";
+        std::cout << "SKIP: CUDA device unavailable\n";
         return 0;
     }
+
     int failures = 0;
-    failures += one_case({0, 4, 11}, 1u, false);
-    failures += one_case({0, 4, 11}, 7u, true);
-    failures += one_case({0, 4, 11}, 17u, true, 0, true);
-    failures += one_case({0, 65, 194}, 31u, true);
-    failures += one_case({0, 16}, 99u, true);
-    failures += one_case({0, 256}, 2026u, true);
-    failures += one_case({0, 4, 8, 12}, 3001u, true, 16);
-    failures += one_case({0, 20, 40, 60}, 3002u, true, -1);
-    failures += one_case({0, 68, 136}, 3003u, true, 64);
-    std::cout << (failures ? "FAIL" : "OK") << " vision_attention correctness\n";
-    return failures ? 1 : 0;
+    failures += run_case({0, 4}, 1u, StorageProfile::Contiguous, PublicEntry::CuSeqlensArena);
+    failures += run_case({0, 4, 11}, 7u, StorageProfile::InterleavedQkv,
+                         PublicEntry::CuSeqlensArena, InputProfile::SegmentIsolation);
+    failures +=
+        run_case({0, 65, 194}, 31u, StorageProfile::InterleavedQkv, PublicEntry::CuSeqlensScratch);
+    failures +=
+        run_case({0, 68, 136}, 101u, StorageProfile::InterleavedQkv, PublicEntry::UniformSegments);
+    failures +=
+        run_case({0, 256}, 2026u, StorageProfile::InterleavedQkv, PublicEntry::CuSeqlensArena);
+
+    if (failures != 0) {
+        std::cerr << "vision_attention failures=" << failures << '\n';
+        return 1;
+    }
+    std::cout << "vision_attention: PASS\n";
+    return 0;
 }

@@ -1,205 +1,128 @@
 #pragma once
-//
-// op_check.h — numerical comparison primitives for Op tests.
-//
-// Adapted from ~/chunked_gdn/tests/test_utils.h. Comparison is done in fp64:
-// the per-op test computes its reference in `double` from bf16-rounded inputs,
-// upcasts the kernel output to `double`, and calls compute_diff/diff_passes.
-//
-// THE RULE (docs/maintainer/op-development.md §8): if a test fails, fix the kernel,
-// not the tolerance. Presets are `static constexpr` and there is no per-op or
-// CLI override. A test selects a preset BY NAME (e.g. Tolerance::bf16_elementwise()).
-//
-// Pass criterion (composite, anti-gaming): a non-finite value is always fatal;
-// otherwise PASS iff strict allclose (no element violates
-// atol + rtol*|ref|) OR the tail
-// channel holds, which requires ALL THREE of: a violating-fraction cap, a
-// worst-violation-magnitude cap, and a relative-L2-residual cap.
+
+// Shared pointwise comparison mechanics for Op tests. Each semantic Op owns the
+// concrete criterion used by its suite; this file deliberately defines no
+// cross-Op tolerance presets.
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
 
 namespace ninfer::test {
 
-struct Tolerance {
-    double atol;            // additive floor of the per-element bound
-    double rtol;            // multiplicative slope on |ref|
-    double tail_frac;       // max fraction of elements allowed to violate
-    double worst_ratio_max; // max |a-b| / (atol + rtol*|b|) among violators
-    double rel_l2_tol;      // max ||a-b||_2 / ||b||_2
-
-    // ---- frozen presets (see docs/maintainer/op-development.md §8) --
-    static constexpr Tolerance bf16_elementwise() {
-        return {/*atol*/ 1e-3, /*rtol*/ 8e-3, /*tail_frac*/ 1e-3,
-                /*worst_ratio_max*/ 4.0, /*rel_l2_tol*/ 4e-3};
-    }
-
-    static constexpr Tolerance bf16_reduction() {
-        return {/*atol*/ 2e-3, /*rtol*/ 1.6e-2, /*tail_frac*/ 2e-3,
-                /*worst_ratio_max*/ 5.0, /*rel_l2_tol*/ 8e-3};
-    }
-
-    static constexpr Tolerance fp32_transcendental() {
-        return {/*atol*/ 1e-6, /*rtol*/ 1e-5, /*tail_frac*/ 1e-4,
-                /*worst_ratio_max*/ 2.0, /*rel_l2_tol*/ 1e-5};
-    }
-
-    static constexpr Tolerance linear_bf16() { return {2e-3, 1.6e-2, 2e-3, 5.0, 8e-3}; }
-
-    // Tensor-core (low-precision-compute) linear: the mma rounds operands to
-    // bf16/tf32, so near-zero cancellation outputs get large *relative* per-element
-    // error even though the matmul is correct. The correct correctness metric for a
-    // GEMM is the normwise relative residual (rel_l2), which stays ~2e-3 (same as the
-    // fp32 path). This preset gates on rel_l2 only (tightened, a strong bug net since
-    // any layout/index bug spikes it) with NaN/inf still fatal; the per-element
-    // worst/frequency caps are neutralized (they mis-fire on cancellation). See
-    // docs/maintainer/op-development.md §8.
-    static constexpr Tolerance linear_tc() { return {2e-3, 1.6e-2, 1.0, 1e30, 4e-3}; }
-
-    static constexpr Tolerance attention_bf16() { return {2e-3, 1.6e-2, 2e-3, 5.0, 8e-3}; }
-
-    // INT8-G64 attention is measured against the same ideal fp64 attention
-    // oracle as the BF16 route. Its Q8-G64 query quantization is the native
-    // INT8 compute profile. The 4e-3 absolute floor is fixed by the group-tail/
-    // cancellation regression in test_gqa_attention; the relative, tail,
-    // worst-ratio, and rel-L2 gates remain the BF16 values.
-    static constexpr Tolerance attention_int8() { return {4e-3, 1.6e-2, 2e-3, 5.0, 8e-3}; }
-
-    // GDN control projections expose FP32 g/beta. This qualifies current route profiles against
-    // the high-precision oracle without prescribing their private projection staging.
-    static constexpr Tolerance gdn_control_fp32() {
-        return {/*atol*/ 1e-6, /*rtol*/ 1e-5, /*tail_frac*/ 1e-4,
-                /*worst_ratio_max*/ 2.0, /*rel_l2_tol*/ 1e-5};
-    }
-
-    // Fused pre-norm/control keeps the FP32 outputs but naturally stages the normalized affine
-    // operand for BF16 tensor cores instead of reproducing a standalone BF16 h materialization.
-    // It remains qualified against the complete FP64 formula; the normwise bound covers operand
-    // rounding and cancellation without weakening layout/index error detection.
-    static constexpr Tolerance gdn_norm_control_fp32() {
-        return {/*atol*/ 1e-4, /*rtol*/ 4e-3, /*tail_frac*/ 1.0,
-                /*worst_ratio_max*/ 1e30, /*rel_l2_tol*/ 2e-3};
-    }
-
-    static constexpr Tolerance gdn_output_bf16() { return {1e-3, 1.0e-2, 2e-3, 5.0, 8e-3}; }
-
-    static constexpr Tolerance gdn_state_fp32() { return {5e-4, 5.0e-3, 2e-2, 5.0, 5e-3}; }
-
-    // Registered SparseMoe profiles expose only the final BF16 destination. Each profile is
-    // checked against the same complete FP64 formula; separate names keep codec qualification
-    // explicit without encoding any private D1-D4 staging choice in the tolerance.
-    static constexpr Tolerance sparse_moe_q4_q5() { return {2e-3, 1.6e-2, 2e-3, 5.0, 8e-3}; }
-
-    static constexpr Tolerance sparse_moe_q4_q6() { return {2e-3, 1.6e-2, 2e-3, 5.0, 8e-3}; }
-
-    static constexpr Tolerance sparse_moe_w8_w8() { return {2e-3, 1.6e-2, 2e-3, 5.0, 8e-3}; }
+struct PointwiseCriterion {
+    double absolute;
+    double relative;
 };
 
-struct DiffStats {
-    double max_abs                = 0.0;
-    double max_rel                = 0.0;
-    double mean_abs               = 0.0;
-    double rel_l2                 = 0.0; // ||a-b||_2 / ||b||_2 (NaN-skipped)
-    long long n                   = 0;
-    long long argmax              = -1; // index of the max-abs element
-    double a_at_argmax            = 0.0;
-    double b_at_argmax            = 0.0;
-    long long n_violating         = 0;
-    double worst_violation_ratio  = 0.0;
-    long long worst_violation_idx = -1;
-    long long n_nan_a             = 0;
-    long long n_nan_b             = 0;
-    long long n_inf_a             = 0;
-    long long n_inf_b             = 0;
+struct PointwiseStats {
+    double maximum_absolute_error    = 0.0;
+    double maximum_relative_error    = 0.0;
+    std::int64_t maximum_error_index = -1;
+    double actual_at_maximum         = 0.0;
+    double reference_at_maximum      = 0.0;
+    std::int64_t first_violation     = -1;
+    std::int64_t non_finite_count    = 0;
 };
 
-// a = kernel output (upcast to double); b = fp64 reference.
-inline DiffStats compute_diff(const double* a, const double* b, long long n, const Tolerance& tol) {
-    DiffStats s;
-    s.n            = n;
-    double sum_abs = 0.0, sum_sq_diff = 0.0, sum_sq_b = 0.0;
-    long long n_finite = 0;
-    for (long long i = 0; i < n; ++i) {
-        const double ad  = a[i];
-        const double bd  = b[i];
-        const bool a_nan = std::isnan(ad);
-        const bool b_nan = std::isnan(bd);
-        const bool a_inf = std::isinf(ad);
-        const bool b_inf = std::isinf(bd);
-        if (a_nan) ++s.n_nan_a;
-        if (b_nan) ++s.n_nan_b;
-        if (a_inf) ++s.n_inf_a;
-        if (b_inf) ++s.n_inf_b;
-        if (a_nan || b_nan || a_inf || b_inf) continue;
+inline PointwiseStats compute_pointwise_stats(const double* actual, const double* reference,
+                                              std::int64_t count,
+                                              const PointwiseCriterion& criterion) {
+    PointwiseStats stats;
+    for (std::int64_t index = 0; index < count; ++index) {
+        const double got      = actual[index];
+        const double expected = reference[index];
+        if (!std::isfinite(got) || !std::isfinite(expected)) {
+            ++stats.non_finite_count;
+            if (stats.first_violation < 0) stats.first_violation = index;
+            continue;
+        }
 
-        const double diff = ad - bd;
-        const double da   = std::abs(diff);
-        sum_abs += da;
-        sum_sq_diff += diff * diff;
-        sum_sq_b += bd * bd;
-        ++n_finite;
-        if (da > s.max_abs) {
-            s.max_abs     = da;
-            s.argmax      = i;
-            s.a_at_argmax = ad;
-            s.b_at_argmax = bd;
+        const double absolute_error = std::abs(got - expected);
+        const double scale          = std::max(std::abs(got), std::abs(expected));
+        const double relative_error = scale == 0.0 ? 0.0 : absolute_error / scale;
+        if (absolute_error > stats.maximum_absolute_error) {
+            stats.maximum_absolute_error = absolute_error;
+            stats.maximum_error_index    = index;
+            stats.actual_at_maximum      = got;
+            stats.reference_at_maximum   = expected;
         }
-        const double denom = std::max(std::abs(ad), std::abs(bd));
-        if (denom > 0.0) {
-            const double dr = da / denom;
-            if (dr > s.max_rel) s.max_rel = dr;
-        }
-        const double bound = tol.atol + tol.rtol * std::abs(bd);
-        if (da > bound) {
-            ++s.n_violating;
-            const double ratio = (bound > 0.0) ? (da / bound) : 0.0;
-            if (ratio > s.worst_violation_ratio) {
-                s.worst_violation_ratio = ratio;
-                s.worst_violation_idx   = i;
-            }
-        }
+        stats.maximum_relative_error = std::max(stats.maximum_relative_error, relative_error);
+
+        const double limit = criterion.absolute + criterion.relative * std::abs(expected);
+        if (absolute_error > limit && stats.first_violation < 0) { stats.first_violation = index; }
     }
-    s.mean_abs                  = (n_finite > 0) ? sum_abs / (double)n_finite : 0.0;
-    constexpr double rel_l2_eps = 1e-30;
-    s.rel_l2 = std::sqrt(sum_sq_diff) / std::max(std::sqrt(sum_sq_b), rel_l2_eps);
-    return s;
+    return stats;
 }
 
-// PASS iff: the compared range is non-empty, every value is finite, and
-// (strict allclose OR all three tail caps hold).
-inline bool diff_passes(const DiffStats& s, const Tolerance& tol) {
-    if (s.n <= 0) return false;
-    if (s.n_nan_a != 0 || s.n_nan_b != 0 || s.n_inf_a != 0 || s.n_inf_b != 0) return false;
-    if (s.n_violating == 0) return true;
-    const double frac = (double)s.n_violating / (double)s.n;
-    return frac <= tol.tail_frac && s.worst_violation_ratio <= tol.worst_ratio_max &&
-           s.rel_l2 <= tol.rel_l2_tol;
+inline bool pointwise_passes(const PointwiseStats& stats, std::int64_t count) {
+    return count > 0 && stats.non_finite_count == 0 && stats.first_violation < 0;
 }
 
-inline void print_diff(const char* label, const DiffStats& s, const Tolerance& tol) {
-    std::printf("    %-28s max_abs=%.3e max_rel=%.3e mean_abs=%.3e rel_l2=%.3e", label, s.max_abs,
-                s.max_rel, s.mean_abs, s.rel_l2);
-    if (s.argmax >= 0 && s.max_abs > 0.0) {
-        std::printf(" (at %lld: %.6g vs %.6g)", (long long)s.argmax, s.a_at_argmax, s.b_at_argmax);
-    }
-    if (s.n_violating > 0) {
-        const double frac = (s.n > 0) ? (double)s.n_violating / (double)s.n : 0.0;
-        std::printf(" | viol=%lld (%.2e) worst=%.2fx", (long long)s.n_violating, frac,
-                    s.worst_violation_ratio);
-        if (diff_passes(s, tol)) {
-            std::printf(" [tail-allowed: frac<=%.0e worst<=%.0fx rel_l2<=%.0e]", tol.tail_frac,
-                        tol.worst_ratio_max, tol.rel_l2_tol);
+struct ReductionCriterion {
+    double relative_l2;
+    double gross_absolute;
+    double gross_relative_to_max_reference;
+};
+
+struct ReductionStats {
+    double relative_l2                = 0.0;
+    double root_mean_squared_error    = 0.0;
+    double reference_root_mean_square = 0.0;
+    double maximum_absolute_error     = 0.0;
+    double maximum_absolute_reference = 0.0;
+    std::int64_t maximum_error_index  = -1;
+    std::int64_t first_non_finite     = -1;
+    double actual_at_maximum          = 0.0;
+    double reference_at_maximum       = 0.0;
+};
+
+inline ReductionStats compute_reduction_stats(const double* actual, const double* reference,
+                                              std::int64_t count) {
+    ReductionStats stats;
+    long double squared_error     = 0.0L;
+    long double squared_reference = 0.0L;
+    for (std::int64_t index = 0; index < count; ++index) {
+        const double got      = actual[index];
+        const double expected = reference[index];
+        if (!std::isfinite(got) || !std::isfinite(expected)) {
+            if (stats.first_non_finite < 0) stats.first_non_finite = index;
+            continue;
+        }
+
+        const double error          = got - expected;
+        const double absolute_error = std::abs(error);
+        squared_error += static_cast<long double>(error) * error;
+        squared_reference += static_cast<long double>(expected) * expected;
+        stats.maximum_absolute_reference =
+            std::max(stats.maximum_absolute_reference, std::abs(expected));
+        if (absolute_error > stats.maximum_absolute_error) {
+            stats.maximum_absolute_error = absolute_error;
+            stats.maximum_error_index    = index;
+            stats.actual_at_maximum      = got;
+            stats.reference_at_maximum   = expected;
         }
     }
-    if (s.n_nan_a > 0 || s.n_nan_b > 0) {
-        std::printf(" | NaN a=%lld b=%lld", (long long)s.n_nan_a, (long long)s.n_nan_b);
+    stats.relative_l2 = std::sqrt(static_cast<double>(squared_error)) /
+                        std::max(std::sqrt(static_cast<double>(squared_reference)), 1.0e-30);
+    if (count > 0) {
+        stats.root_mean_squared_error =
+            std::sqrt(static_cast<double>(squared_error / static_cast<long double>(count)));
+        stats.reference_root_mean_square =
+            std::sqrt(static_cast<double>(squared_reference / static_cast<long double>(count)));
     }
-    if (s.n_inf_a > 0 || s.n_inf_b > 0) {
-        std::printf(" | Inf a=%lld b=%lld", (long long)s.n_inf_a, (long long)s.n_inf_b);
-    }
-    std::printf("\n");
+    return stats;
+}
+
+inline double gross_error_limit(const ReductionStats& stats, const ReductionCriterion& criterion) {
+    return criterion.gross_absolute +
+           criterion.gross_relative_to_max_reference * stats.maximum_absolute_reference;
+}
+
+inline bool reduction_passes(const ReductionStats& stats, std::int64_t count,
+                             const ReductionCriterion& criterion) {
+    return count > 0 && stats.first_non_finite < 0 && stats.relative_l2 <= criterion.relative_l2 &&
+           stats.maximum_absolute_error <= gross_error_limit(stats, criterion);
 }
 
 } // namespace ninfer::test

@@ -35,10 +35,11 @@ namespace ninfer::ops {
  *   v_weight is Q5G64_F16S RowSplit [6144,5120], both with FP16 scales.
  *
  * Numeric:
- *   The oracle exact-decodes both weights and evaluates both projections naively in FP64 before
- *   converting the observable concatenated output to BF16. Production routes may choose their
- *   private precision independently; every registered route writes the final qkv allocation
- *   directly.
+ *   The oracle exact-decodes both weights and evaluates both projections naively in FP64 from the
+ *   represented input. The BF16 qkv output is promoted and compared directly with those ideal
+ *   values; final output storage rounding belongs to GdnInputProj's named A16 criterion, not the
+ *   oracle. Production routes may choose their private precision independently; every registered
+ *   route writes the final qkv allocation directly.
  *
  * Effects:
  *   Writes the full qkv output; inputs and output must not alias.
@@ -86,10 +87,12 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  *   [0,Slots).
  *
  * Numeric:
- *   The oracle exact-decodes packed weights, evaluates projection, convolution, and SiLU naively
- *   in FP64 from represented inputs, then converts query/key/value and snapshots to BF16. Former
- *   unfused qkv tensors are not observable cast boundaries; production routes use their natural
- *   private accumulator and staging precision. Activation values are not quantized.
+ *   The oracle exact-decodes packed weights and evaluates projection, convolution, SiLU, and every
+ *   snapshot value naively in FP64 from represented inputs. BF16 query/key/value and snapshots are
+ *   promoted and compared directly with those ideal values; their final storage rounding belongs
+ *   to the Op's named A16 criterion, not the oracle. Former unfused qkv tensors are not observable
+ *   cast boundaries; production routes use their natural private accumulator and staging
+ *   precision. Activation values are not quantized.
  *
  * Effects:
  *   Writes query/key/value and state slots [0,T); other slots are unchanged. Newly projected

@@ -8,10 +8,13 @@ benchmark-report, and external protocol behavior. Repository verification princi
 ## Organization
 
 - `artifact/` — Python container, registered layout, quantization, and resource behavior;
-- `ops/` — independent numerical and state-transition checks at real supported shapes, plus the
-  shared row-split packing helper;
+- `ops/` — one identifiable qualification suite per semantic Op or closely related overload group,
+  using independent numerical/state-transition oracles at real supported shapes;
 - `ops/linear/` — weight/activation-profile-specific public Linear conformance tests plus their
   one shared input generator, FP64 GEMM oracle, tolerance registry, and output/effects mechanics;
+- `ops/linear_add/`, `ops/linear_pair/`, `ops/linear_swiglu/` — fused-Op suites split by registered
+  weight/activation profile, each evaluating its complete formula rather than composing production
+  Ops;
 - `targets/qwen3_6/` — shared tokenizer/template, multimodal preprocessing, MRoPE, prepared-prompt,
   stop/output decoding, hybrid topology, decoder/GDN and round-state layouts/views, shifted-MTP
   alignment, Vision control, and family runtime mechanisms;
@@ -34,6 +37,9 @@ benchmark-report, and external protocol behavior. Repository verification princi
   cover mathematical state transitions at their own boundary.
 
 Tests are grouped by observable risk, not by mirroring every source file or class.
+`ops/op_tester.h` and `ops/op_check.h` own only reusable device/guard and comparison mechanics.
+Concrete numerical criteria remain named by the semantic Op suite; there are no cross-Op tolerance
+presets.
 
 ## Build and run
 

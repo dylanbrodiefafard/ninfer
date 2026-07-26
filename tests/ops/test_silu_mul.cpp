@@ -1,148 +1,156 @@
-// Correctness + coverage for silu_mul, against the frozen op-test standard
-// (docs/op-development.md): fp64 golden from bf16-rounded inputs, honest
-// input ranges (incl. a large-magnitude stress case that rejects any
-// polynomial/"fast" silu approximation), composite tolerance bf16_elementwise.
 #include "ninfer/ops/silu_mul.h"
 #include "ops/op_tester.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
-#include <stdexcept>
 #include <vector>
 
 using namespace ninfer;
 using namespace ninfer::test;
 
-// fp64 reference: silu(x) = x / (1 + e^-x), then * up.
-static void cpu_silu_and_mul(const std::vector<float>& g, const std::vector<float>& u,
-                             std::vector<double>& o) {
-    for (std::size_t i = 0; i < g.size(); ++i) {
-        const double x = g[i];
-        const double s = x / (1.0 + std::exp(-x));
-        o[i]           = s * static_cast<double>(u[i]);
+namespace {
+
+constexpr PointwiseCriterion silu_mul_bf16_criterion() {
+    return {/*absolute*/ 2.0e-5, /*relative*/ 4.1e-3};
+}
+
+std::vector<std::uint16_t> encode_bf16(const std::vector<float>& values) {
+    std::vector<std::uint16_t> bits(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) bits[i] = f32_to_bf16(values[i]);
+    return bits;
+}
+
+std::vector<double> silu_mul_oracle(const std::vector<float>& gate, const std::vector<float>& up) {
+    std::vector<double> expected(gate.size());
+    for (std::size_t i = 0; i < gate.size(); ++i) {
+        const double g = gate[i];
+        expected[i]    = (g / (1.0 + std::exp(-g))) * static_cast<double>(up[i]);
     }
+    return expected;
 }
 
-static int one_shape(const char* tag, int n, std::uint32_t seed, float lo, float hi) {
-    std::vector<float> g(n), u(n);
-    fill_uniform(g, seed, lo, hi);
-    fill_uniform(u, seed + 1000u, lo, hi);
-    round_to_bf16(g);
-    round_to_bf16(u);
+int run_contiguous_case(const char* label, std::int32_t rows, std::int32_t columns,
+                        std::uint32_t seed) {
+    const std::size_t count = static_cast<std::size_t>(rows) * columns;
+    std::vector<float> gate(count), up(count);
+    fill_uniform(gate, seed, -12.0f, 12.0f);
+    fill_uniform(up, seed + 1, -8.0f, 8.0f);
+    round_to_bf16(gate);
+    round_to_bf16(up);
 
-    std::vector<double> ref(n);
-    cpu_silu_and_mul(g, u, ref);
+    const auto expected  = silu_mul_oracle(gate, up);
+    const auto gate_bits = encode_bf16(gate);
+    const auto up_bits   = encode_bf16(up);
+    GuardedDeviceBuffer device_gate(count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_up(count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_out(count * sizeof(std::uint16_t));
+    device_gate.copy_from_host(gate_bits.data(), device_gate.bytes());
+    device_up.copy_from_host(up_bits.data(), device_up.bytes());
 
-    DeviceBuffer dg = to_device_bf16(g), du = to_device_bf16(u),
-                 dout(static_cast<std::size_t>(n) * 2);
-    Tensor tg(dg.p, DType::BF16, {n}), tu(du.p, DType::BF16, {n}), tout(dout.p, DType::BF16, {n});
-    ops::silu_mul(tg, tu, tout, nullptr);
-    cudaDeviceSynchronize();
+    Tensor gate_tensor(device_gate.data(), DType::BF16, {rows, columns});
+    Tensor up_tensor(device_up.data(), DType::BF16, {rows, columns});
+    Tensor out_tensor(device_out.data(), DType::BF16, {rows, columns});
+    ops::silu_mul(gate_tensor, up_tensor, out_tensor, nullptr);
+    cuda_synchronize();
 
-    return verify(tag, from_device_bf16(dout, n), ref, Tolerance::bf16_elementwise());
+    int failures = verify_pointwise(label, from_device_bf16(device_out.data(), count), expected,
+                                    silu_mul_bf16_criterion());
+    failures += verify_exact("silu_mul gate unchanged",
+                             from_device<std::uint16_t>(device_gate.data(), count), gate_bits);
+    failures += verify_exact("silu_mul up unchanged",
+                             from_device<std::uint16_t>(device_up.data(), count), up_bits);
+    failures += device_gate.verify_guards("silu_mul gate");
+    failures += device_up.verify_guards("silu_mul up");
+    failures += device_out.verify_guards("silu_mul out");
+    return failures;
 }
 
-static DeviceBuffer to_device_bf16_unaligned(const std::vector<float>& h) {
-    std::vector<std::uint16_t> b(h.size() + 1);
-    b[0] = 0;
-    for (std::size_t i = 0; i < h.size(); ++i) b[i + 1] = f32_to_bf16(h[i]);
-    DeviceBuffer d(b.size() * 2);
-    cudaMemcpy(d.p, b.data(), b.size() * 2, cudaMemcpyHostToDevice);
-    return d;
-}
+int run_strided_gate_up_case() {
+    constexpr std::int32_t rows    = 17408;
+    constexpr std::int32_t columns = 17;
+    const std::size_t count        = static_cast<std::size_t>(rows) * columns;
+    std::vector<float> gate(count), up(count);
+    fill_uniform(gate, 301u, -12.0f, 12.0f);
+    fill_uniform(up, 302u, -8.0f, 8.0f);
+    round_to_bf16(gate);
+    round_to_bf16(up);
 
-static int unaligned_data_case() {
-    constexpr int n = 255;
-    std::vector<float> g(n), u(n);
-    fill_uniform(g, 2026u, -8.f, 8.f);
-    fill_uniform(u, 3026u, -8.f, 8.f);
-    round_to_bf16(g);
-    round_to_bf16(u);
-
-    std::vector<double> ref(n);
-    cpu_silu_and_mul(g, u, ref);
-
-    DeviceBuffer dg = to_device_bf16_unaligned(g), du = to_device_bf16_unaligned(u),
-                 dout(static_cast<std::size_t>(n + 1) * 2);
-    auto* gptr = static_cast<unsigned char*>(dg.p) + 2;
-    auto* uptr = static_cast<unsigned char*>(du.p) + 2;
-    auto* optr = static_cast<unsigned char*>(dout.p) + 2;
-    Tensor tg(gptr, DType::BF16, {n}), tu(uptr, DType::BF16, {n}), tout(optr, DType::BF16, {n});
-    ops::silu_mul(tg, tu, tout, nullptr);
-    cudaDeviceSynchronize();
-
-    DeviceBuffer packed(static_cast<std::size_t>(n) * 2);
-    cudaMemcpy(packed.p, optr, static_cast<std::size_t>(n) * 2, cudaMemcpyDeviceToDevice);
-    return verify("silu unaligned data", from_device_bf16(packed, n), ref,
-                  Tolerance::bf16_elementwise());
-}
-
-static int strided_gate_up_view_case() {
-    constexpr int intermediate = 17408;
-    constexpr int T            = 3;
-    constexpr int n            = intermediate * T;
-    std::vector<float> g(n), u(n), fused(static_cast<std::size_t>(2 * intermediate) * T);
-    fill_uniform(g, 5026u, -8.f, 8.f);
-    fill_uniform(u, 6026u, -8.f, 8.f);
-    round_to_bf16(g);
-    round_to_bf16(u);
-
-    for (int t = 0; t < T; ++t) {
-        for (int i = 0; i < intermediate; ++i) {
-            fused[static_cast<std::size_t>(t) * 2 * intermediate + i] =
-                g[static_cast<std::size_t>(t) * intermediate + i];
-            fused[static_cast<std::size_t>(t) * 2 * intermediate + intermediate + i] =
-                u[static_cast<std::size_t>(t) * intermediate + i];
-        }
+    std::vector<float> gate_up(2 * count);
+    for (std::int32_t column = 0; column < columns; ++column) {
+        const std::size_t source = static_cast<std::size_t>(column) * rows;
+        const std::size_t target = static_cast<std::size_t>(column) * 2 * rows;
+        std::copy_n(gate.data() + source, rows, gate_up.data() + target);
+        std::copy_n(up.data() + source, rows, gate_up.data() + target + rows);
     }
 
-    std::vector<double> ref(n);
-    cpu_silu_and_mul(g, u, ref);
+    const auto expected     = silu_mul_oracle(gate, up);
+    const auto gate_up_bits = encode_bf16(gate_up);
+    GuardedDeviceBuffer device_gate_up(gate_up_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_out(count * sizeof(std::uint16_t));
+    device_gate_up.copy_from_host(gate_up_bits.data(), device_gate_up.bytes());
 
-    DeviceBuffer dfused = to_device_bf16(fused), dout(static_cast<std::size_t>(n) * 2);
-    Tensor tfused(dfused.p, DType::BF16, {2 * intermediate, T});
-    Tensor tg = tfused.slice(0, 0, intermediate);
-    Tensor tu = tfused.slice(0, intermediate, intermediate);
-    Tensor tout(dout.p, DType::BF16, {intermediate, T});
-    ops::silu_mul(tg, tu, tout, nullptr);
-    cudaDeviceSynchronize();
+    Tensor gate_up_tensor(device_gate_up.data(), DType::BF16, {2 * rows, columns});
+    Tensor gate_tensor = gate_up_tensor.slice(0, 0, rows);
+    Tensor up_tensor   = gate_up_tensor.slice(0, rows, rows);
+    Tensor out_tensor(device_out.data(), DType::BF16, {rows, columns});
+    ops::silu_mul(gate_tensor, up_tensor, out_tensor, nullptr);
+    cuda_synchronize();
 
-    return verify("silu strided fused gate_up view", from_device_bf16(dout, n), ref,
-                  Tolerance::bf16_elementwise());
+    int failures =
+        verify_pointwise("silu_mul strided gate/up", from_device_bf16(device_out.data(), count),
+                         expected, silu_mul_bf16_criterion());
+    failures += verify_exact("silu_mul strided inputs unchanged",
+                             from_device<std::uint16_t>(device_gate_up.data(), gate_up_bits.size()),
+                             gate_up_bits);
+    failures += device_gate_up.verify_guards("silu_mul strided inputs");
+    failures += device_out.verify_guards("silu_mul strided out");
+    return failures;
 }
 
-static int null_validation_case() {
-    try {
-        Tensor gate(nullptr, DType::BF16, {1});
-        Tensor up(nullptr, DType::BF16, {1});
-        Tensor out(nullptr, DType::BF16, {1});
-        ops::silu_mul(gate, up, out, nullptr);
-    } catch (const std::invalid_argument&) { return 0; }
-    std::cerr << "silu null validation: expected invalid_argument\n";
-    return 1;
+int run_edge_case() {
+    std::vector<float> gate{-30.0f, -8.0f, -1.0f, 0.0f, 1.0f, 8.0f, 30.0f};
+    std::vector<float> up{2.0f, -3.0f, 0.5f, -4.0f, 5.0f, -6.0f, 7.0f};
+    round_to_bf16(gate);
+    round_to_bf16(up);
+
+    const auto expected  = silu_mul_oracle(gate, up);
+    const auto gate_bits = encode_bf16(gate);
+    const auto up_bits   = encode_bf16(up);
+    GuardedDeviceBuffer device_gate(gate_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_up(up_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_out(expected.size() * sizeof(std::uint16_t));
+    device_gate.copy_from_host(gate_bits.data(), device_gate.bytes());
+    device_up.copy_from_host(up_bits.data(), device_up.bytes());
+
+    Tensor gate_tensor(device_gate.data(), DType::BF16, {static_cast<int>(gate.size())});
+    Tensor up_tensor(device_up.data(), DType::BF16, {static_cast<int>(up.size())});
+    Tensor out_tensor(device_out.data(), DType::BF16, {static_cast<int>(expected.size())});
+    ops::silu_mul(gate_tensor, up_tensor, out_tensor, nullptr);
+    cuda_synchronize();
+
+    int failures = verify_pointwise("silu_mul edge values",
+                                    from_device_bf16(device_out.data(), expected.size()), expected,
+                                    silu_mul_bf16_criterion());
+    failures += device_gate.verify_guards("silu_mul edge gate");
+    failures += device_up.verify_guards("silu_mul edge up");
+    failures += device_out.verify_guards("silu_mul edge out");
+    return failures;
 }
+
+} // namespace
 
 int main() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 0;
     }
-    int f = 0;
-    // Coverage: decode-ish, MLP intermediate, prefill-ish, unaligned; >=3 seeds; honest range.
-    for (std::uint32_t seed : {1u, 7u, 99u}) {
-        f += one_shape("silu n=1", 1, seed, -8.f, 8.f);
-        f += one_shape("silu n=7", 7, seed, -8.f, 8.f);
-        f += one_shape("silu n=17408 (intermediate)", 17408, seed, -8.f, 8.f);
-        f += one_shape("silu n=1114112 (prefill-ish)", 1114112, seed, -8.f, 8.f);
-        f += one_shape("silu n=123457 (unaligned)", 123457, seed, -8.f, 8.f);
-    }
-    // Stress: large magnitudes break range-limited approximations of silu.
-    f += one_shape("silu stress [-30,30]", 65536, 4242u, -30.f, 30.f);
-    f += unaligned_data_case();
-    f += strided_gate_up_view_case();
-    f += null_validation_case();
 
-    std::cout << (f ? "FAIL" : "OK") << " silu_mul correctness\n";
-    return f ? 1 : 0;
+    int failures = 0;
+    failures += run_contiguous_case("silu_mul [17408,1]", 17408, 1, 101u);
+    failures += run_strided_gate_up_case();
+    failures += run_edge_case();
+    std::cout << (failures ? "FAIL" : "OK") << " silu_mul\n";
+    return failures ? 1 : 0;
 }

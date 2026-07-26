@@ -25,7 +25,7 @@ namespace ninfer::ops {
  * Op: linear_add
  *
  * Math / indexing:
- *   residual[:,t]' = BF16(residual[:,t] + Linear(x,w)[:,t]).
+ *   ideal[:,t] = residual[:,t] + Linear(x,w)[:,t].
  *
  * Logical shapes:
  *   Contiguous BF16 x [K,T] and residual [N,T]. Weight is either Q5G64_F16S RowSplit with
@@ -34,11 +34,12 @@ namespace ninfer::ops {
  *   T may be any positive value.
  *
  * Numeric:
- *   The oracle exact-decodes the registered weight and evaluates the complete expression naively
- *   in FP64 before converting the observable result to BF16. Production routes may fuse or
- *   materialize the projection and may choose their natural accumulator, staging, and workspace
- *   precision; those private choices are not semantic rounding boundaries and are qualified against
- *   the same oracle with the route-appropriate tolerance.
+ *   The oracle exact-decodes the registered weight and evaluates `ideal` naively in FP64 from the
+ *   represented inputs. The updated BF16 residual is promoted and compared directly with that
+ *   result; output storage rounding belongs to LinearAdd's named A16 criterion, not the oracle.
+ *   Production routes may fuse or materialize the projection and may choose their natural
+ *   accumulator, staging, and workspace precision; those private choices are not semantic
+ *   rounding boundaries.
  *
  * Effects:
  *   Updates the full residual tensor in place; x/weight must not alias residual.

@@ -1,15 +1,13 @@
-// Correctness + coverage for rope, against the frozen op-test standard
-// (docs/op-development.md): fp64 golden from bf16-rounded q/k,
-// positions read from device, composite tolerance bf16_elementwise.
 #include "ninfer/ops/rope.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <iostream>
 #include <limits>
-#include <stdexcept>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -18,99 +16,212 @@ using namespace ninfer::test;
 
 namespace {
 
-constexpr std::int32_t kHeadDim       = 256;
-constexpr std::int32_t kQHeads        = 24;
-constexpr std::int32_t kKHeads        = 4;
-constexpr int kRotaryDim              = 64;
-constexpr float kTheta                = 1.0e7f;
-constexpr std::int32_t kDflashHeadDim = 128;
-constexpr std::int32_t kDflashQHeads  = 32;
-constexpr std::int32_t kDflashKHeads  = 8;
-constexpr int kDflashRotaryDim        = 128;
+constexpr float kTextTheta   = 1.0e7F;
+constexpr float kVisionTheta = 10'000.0F;
 
-std::size_t tensor_size(std::int32_t heads, std::int32_t T) {
-    return static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(heads) *
-           static_cast<std::size_t>(T);
+// Either member of a rotated pair can approach zero through cancellation. The scale-invariant
+// RoPE BF16 profile therefore bounds each output by the FP64 norm of its public input pair rather
+// than by the cancelled output value.
+constexpr double kRopePointwisePairRtol = 7.0e-3;
+
+struct Geometry {
+    const char* label;
+    int head_dim;
+    int rotary_dim;
+    int axes;
+    int tokens;
+    float theta;
+};
+
+struct ProfileMeasurement {
+    double max_abs            = 0.0;
+    double required_pair_rtol = 0.0;
+    std::string label;
+    std::size_t index = 0;
+};
+
+ProfileMeasurement g_profile_measurement;
+
+std::size_t dense_elements(int head_dim, int heads, int tokens) {
+    return static_cast<std::size_t>(head_dim) * static_cast<std::size_t>(heads) *
+           static_cast<std::size_t>(tokens);
 }
 
-std::size_t index_of(std::int32_t heads, std::int32_t t, std::int32_t h, std::int32_t d) {
-    return (static_cast<std::size_t>(t) * static_cast<std::size_t>(heads) +
-            static_cast<std::size_t>(h)) *
-               static_cast<std::size_t>(kHeadDim) +
-           static_cast<std::size_t>(d);
+std::size_t dense_index(int head_dim, int heads, int token, int head, int dim) {
+    return (static_cast<std::size_t>(token) * static_cast<std::size_t>(heads) +
+            static_cast<std::size_t>(head)) *
+               static_cast<std::size_t>(head_dim) +
+           static_cast<std::size_t>(dim);
 }
 
-std::vector<std::uint16_t> bf16_bits(const std::vector<float>& h) {
-    std::vector<std::uint16_t> b(h.size());
-    for (std::size_t i = 0; i < h.size(); ++i) b[i] = f32_to_bf16(h[i]);
-    return b;
+std::vector<float> make_bf16_input(std::size_t elements, std::uint32_t seed) {
+    std::vector<float> input(elements);
+    std::mt19937 generator(seed);
+    std::uniform_real_distribution<float> distribution(-4.0F, 4.0F);
+    for (float& value : input) { value = bf16_to_f32(f32_to_bf16(distribution(generator))); }
+    return input;
 }
 
-std::vector<std::uint16_t> from_device_bf16_bits(const DeviceBuffer& d, std::size_t n) {
-    std::vector<std::uint16_t> b(n);
-    cudaMemcpy(b.data(), d.p, n * sizeof(std::uint16_t), cudaMemcpyDeviceToHost);
-    return b;
+std::vector<std::uint16_t> to_bf16_bits(const std::vector<float>& values) {
+    std::vector<std::uint16_t> bits(values.size());
+    std::transform(values.begin(), values.end(), bits.begin(),
+                   [](float value) { return f32_to_bf16(value); });
+    return bits;
 }
 
-std::vector<std::uint16_t> from_device_bf16_bits_ptr(const void* p, std::size_t n) {
-    std::vector<std::uint16_t> b(n);
-    cudaMemcpy(b.data(), p, n * sizeof(std::uint16_t), cudaMemcpyDeviceToHost);
-    return b;
+std::vector<int> make_positions(int axes, int tokens, int first_position) {
+    std::vector<int> positions(static_cast<std::size_t>(axes) * tokens);
+    for (int axis = 0; axis < axes; ++axis) {
+        for (int token = 0; token < tokens; ++token) {
+            const int step = 2 * axis + 1;
+            positions[static_cast<std::size_t>(axis) * tokens + token] =
+                first_position + 97 * axis + step * token;
+        }
+    }
+    return positions;
 }
 
-std::vector<double> from_device_bf16_ptr(const void* p, std::size_t n) {
-    const std::vector<std::uint16_t> b = from_device_bf16_bits_ptr(p, n);
-    std::vector<double> o(n);
-    for (std::size_t i = 0; i < n; ++i) o[i] = double(bf16_to_f32(b[i]));
-    return o;
-}
-
-DeviceBuffer to_device_bf16_unaligned(const std::vector<float>& h) {
-    std::vector<std::uint16_t> b(h.size() + 1);
-    for (std::size_t i = 0; i < h.size(); ++i) b[i + 1] = f32_to_bf16(h[i]);
-    DeviceBuffer d(b.size() * sizeof(std::uint16_t));
-    cudaMemcpy(d.p, b.data(), d.bytes, cudaMemcpyHostToDevice);
-    return d;
-}
-
-void cpu_rope_one(const std::vector<float>& in, const std::vector<int>& positions,
-                  std::int32_t heads, std::int32_t T, int rotary_dim, float theta,
-                  std::vector<double>& out) {
-    out.resize(in.size());
-    for (std::size_t i = 0; i < in.size(); ++i) out[i] = static_cast<double>(in[i]);
-
-    const int half = rotary_dim / 2;
-    for (std::int32_t t = 0; t < T; ++t) {
-        for (std::int32_t h = 0; h < heads; ++h) {
-            for (int i = 0; i < half; ++i) {
-                const double freq =
-                    std::pow(static_cast<double>(theta),
-                             -2.0 * static_cast<double>(i) / static_cast<double>(rotary_dim));
-                const double ang       = static_cast<double>(positions[t]) * freq;
-                const double c         = std::cos(ang);
-                const double s         = std::sin(ang);
-                const std::size_t idx1 = index_of(heads, t, h, i);
-                const std::size_t idx2 = index_of(heads, t, h, i + half);
-                const double x1        = static_cast<double>(in[idx1]);
-                const double x2        = static_cast<double>(in[idx2]);
-                out[idx1]              = x1 * c - x2 * s;
-                out[idx2]              = x2 * c + x1 * s;
+// This is the sole RoPE oracle. It consumes the exact logical BF16 values represented by the
+// public input and evaluates the documented split-half rotation naively in FP64. It does not
+// reproduce output storage rounding, production staging, coefficient tables, range reduction,
+// kernel split, or reduction order.
+std::vector<double> rope_oracle(const std::vector<float>& input, const std::vector<int>& positions,
+                                const Geometry& geometry, int heads) {
+    std::vector<double> output(input.begin(), input.end());
+    const int half = geometry.rotary_dim / 2;
+    for (int token = 0; token < geometry.tokens; ++token) {
+        for (int head = 0; head < heads; ++head) {
+            for (int pair = 0; pair < half; ++pair) {
+                int axis        = 0;
+                double exponent = 0.0;
+                if (geometry.axes == 2) {
+                    axis     = pair / 18;
+                    exponent = -2.0 * static_cast<double>(pair % 18) / 36.0;
+                } else {
+                    axis     = geometry.axes == 3 ? pair % 3 : 0;
+                    exponent = -2.0 * static_cast<double>(pair) / geometry.rotary_dim;
+                }
+                const double frequency = std::pow(static_cast<double>(geometry.theta), exponent);
+                const double phase =
+                    static_cast<double>(
+                        positions[static_cast<std::size_t>(axis) * geometry.tokens + token]) *
+                    frequency;
+                const double cosine  = std::cos(phase);
+                const double sine    = std::sin(phase);
+                const std::size_t lo = dense_index(geometry.head_dim, heads, token, head, pair);
+                const std::size_t hi =
+                    dense_index(geometry.head_dim, heads, token, head, pair + half);
+                const double first  = static_cast<double>(input[lo]);
+                const double second = static_cast<double>(input[hi]);
+                output[lo]          = first * cosine - second * sine;
+                output[hi]          = second * cosine + first * sine;
             }
         }
     }
+    return output;
 }
 
-int check_passthrough_bits(const char* tag, const std::vector<std::uint16_t>& got,
-                           const std::vector<std::uint16_t>& before, std::int32_t heads,
-                           std::int32_t T, int rotary_dim) {
-    for (std::int32_t t = 0; t < T; ++t) {
-        for (std::int32_t h = 0; h < heads; ++h) {
-            for (std::int32_t d = rotary_dim; d < kHeadDim; ++d) {
-                const std::size_t idx = index_of(heads, t, h, d);
-                if (got[idx] != before[idx]) {
-                    std::cerr << tag << ": pass-through dim changed at t=" << t << " h=" << h
-                              << " d=" << d << " got_bits=0x" << std::hex << got[idx]
-                              << " before_bits=0x" << before[idx] << std::dec << '\n';
+std::vector<std::uint16_t> make_strided_storage(const std::vector<std::uint16_t>& dense,
+                                                int dense_token_elements, int token_stride,
+                                                int tokens, std::uint16_t padding) {
+    std::vector<std::uint16_t> storage(static_cast<std::size_t>(token_stride) * tokens, padding);
+    for (int token = 0; token < tokens; ++token) {
+        std::copy_n(dense.data() + static_cast<std::size_t>(token) * dense_token_elements,
+                    dense_token_elements,
+                    storage.data() + static_cast<std::size_t>(token) * token_stride);
+    }
+    return storage;
+}
+
+std::vector<double> gather_dense(const std::vector<std::uint16_t>& storage,
+                                 int dense_token_elements, int token_stride, int tokens) {
+    std::vector<double> dense(static_cast<std::size_t>(dense_token_elements) * tokens);
+    for (int token = 0; token < tokens; ++token) {
+        for (int element = 0; element < dense_token_elements; ++element) {
+            dense[static_cast<std::size_t>(token) * dense_token_elements + element] =
+                static_cast<double>(
+                    bf16_to_f32(storage[static_cast<std::size_t>(token) * token_stride + element]));
+        }
+    }
+    return dense;
+}
+
+int verify_rope_profile(const std::string& label, const std::vector<double>& got,
+                        const std::vector<double>& expected, const std::vector<float>& input,
+                        const Geometry& geometry, int heads) {
+    if (got.size() != expected.size() || got.size() != input.size()) {
+        std::cerr << label << ": profile input size mismatch\n";
+        return 1;
+    }
+
+    double case_max_abs            = 0.0;
+    double case_required_pair_rtol = 0.0;
+    std::size_t case_worst_index   = 0;
+    int violations                 = 0;
+    const int half                 = geometry.rotary_dim / 2;
+    for (int token = 0; token < geometry.tokens; ++token) {
+        for (int head = 0; head < heads; ++head) {
+            for (int dim = 0; dim < geometry.rotary_dim; ++dim) {
+                const int pair          = dim < half ? dim : dim - half;
+                const std::size_t index = dense_index(geometry.head_dim, heads, token, head, dim);
+                const std::size_t lo    = dense_index(geometry.head_dim, heads, token, head, pair);
+                const std::size_t hi =
+                    dense_index(geometry.head_dim, heads, token, head, pair + half);
+                if (!std::isfinite(got[index]) || !std::isfinite(expected[index])) {
+                    std::cerr << label << ": non-finite output at index=" << index << '\n';
+                    return 1;
+                }
+                const double abs_error = std::abs(got[index] - expected[index]);
+                const double pair_norm =
+                    std::hypot(static_cast<double>(input[lo]), static_cast<double>(input[hi]));
+                const double required_pair_rtol =
+                    pair_norm == 0.0
+                        ? (abs_error == 0.0 ? 0.0 : std::numeric_limits<double>::infinity())
+                        : abs_error / pair_norm;
+                if (required_pair_rtol > case_required_pair_rtol) {
+                    case_required_pair_rtol = required_pair_rtol;
+                    case_worst_index        = index;
+                }
+                case_max_abs = std::max(case_max_abs, abs_error);
+                if (abs_error > kRopePointwisePairRtol * pair_norm) {
+                    ++violations;
+                    if (violations == 1) {
+                        std::cerr << label << ": pointwise BF16 profile mismatch at index=" << index
+                                  << " abs_error=" << abs_error << " pair_norm=" << pair_norm
+                                  << '\n';
+                    }
+                }
+            }
+        }
+    }
+
+    std::cout << "    " << label << " max_abs=" << case_max_abs
+              << " required_pair_rtol=" << case_required_pair_rtol << '\n';
+    g_profile_measurement.max_abs = std::max(g_profile_measurement.max_abs, case_max_abs);
+    if (case_required_pair_rtol > g_profile_measurement.required_pair_rtol) {
+        g_profile_measurement.required_pair_rtol = case_required_pair_rtol;
+        g_profile_measurement.label              = label;
+        g_profile_measurement.index              = case_worst_index;
+    }
+    if (violations != 0) {
+        std::cerr << label << ": " << violations << " values exceed the unified RoPE profile\n";
+        return 1;
+    }
+    return 0;
+}
+
+int verify_passthrough(const std::string& label, const std::vector<std::uint16_t>& got_storage,
+                       const std::vector<std::uint16_t>& before_dense, int head_dim, int heads,
+                       int tokens, int rotary_dim, int token_stride) {
+    for (int token = 0; token < tokens; ++token) {
+        for (int head = 0; head < heads; ++head) {
+            for (int dim = rotary_dim; dim < head_dim; ++dim) {
+                const std::size_t dense  = dense_index(head_dim, heads, token, head, dim);
+                const std::size_t stored = static_cast<std::size_t>(token) * token_stride +
+                                           static_cast<std::size_t>(head) * head_dim + dim;
+                if (got_storage[stored] != before_dense[dense]) {
+                    std::cerr << label << ": non-rotary dimension changed at token=" << token
+                              << " head=" << head << " dim=" << dim << '\n';
                     return 1;
                 }
             }
@@ -119,739 +230,200 @@ int check_passthrough_bits(const char* tag, const std::vector<std::uint16_t>& go
     return 0;
 }
 
-int check_all_bits_same(const char* tag, const std::vector<std::uint16_t>& got,
-                        const std::vector<std::uint16_t>& before) {
-    for (std::size_t i = 0; i < got.size(); ++i) {
-        if (got[i] != before[i]) {
-            std::cerr << tag << ": identity changed index " << i << " got_bits=0x" << std::hex
-                      << got[i] << " before_bits=0x" << before[i] << std::dec << '\n';
-            return 1;
+int verify_padding(const std::string& label, const std::vector<std::uint16_t>& storage,
+                   int dense_token_elements, int token_stride, int tokens, std::uint16_t padding) {
+    for (int token = 0; token < tokens; ++token) {
+        for (int element = dense_token_elements; element < token_stride; ++element) {
+            if (storage[static_cast<std::size_t>(token) * token_stride + element] != padding) {
+                std::cerr << label << ": token padding changed at token=" << token
+                          << " element=" << element << '\n';
+                return 1;
+            }
         }
     }
     return 0;
 }
 
-int one_shape(const char* tag, std::int32_t T, std::uint32_t seed) {
-    const std::size_t qn = tensor_size(kQHeads, T);
-    const std::size_t kn = tensor_size(kKHeads, T);
-    std::vector<float> q(qn), k(kn);
-    std::vector<int> positions(static_cast<std::size_t>(T));
-    fill_uniform(q, seed, -8.f, 8.f);
-    fill_uniform(k, seed + 1000u, -8.f, 8.f);
-    fill_iota_i32(positions, 0);
-    round_to_bf16(q);
-    round_to_bf16(k);
+int run_pair_case(const Geometry& geometry, int q_heads, int k_heads, int first_position,
+                  int q_padding = 0, int k_padding = 0) {
+    constexpr std::uint16_t kPadding = 0x3f81U;
+    const int q_dense_per_token      = geometry.head_dim * q_heads;
+    const int k_dense_per_token      = geometry.head_dim * k_heads;
+    const int q_stride               = q_dense_per_token + q_padding;
+    const int k_stride               = k_dense_per_token + k_padding;
 
-    const std::vector<std::uint16_t> q_before = bf16_bits(q);
-    const std::vector<std::uint16_t> k_before = bf16_bits(k);
+    const auto q =
+        make_bf16_input(dense_elements(geometry.head_dim, q_heads, geometry.tokens), 0x1001U);
+    const auto k =
+        make_bf16_input(dense_elements(geometry.head_dim, k_heads, geometry.tokens), 0x2001U);
+    const auto q_before = to_bf16_bits(q);
+    const auto k_before = to_bf16_bits(k);
+    const auto q_storage =
+        make_strided_storage(q_before, q_dense_per_token, q_stride, geometry.tokens, kPadding);
+    const auto k_storage =
+        make_strided_storage(k_before, k_dense_per_token, k_stride, geometry.tokens, kPadding);
+    const auto positions  = make_positions(geometry.axes, geometry.tokens, first_position);
+    const auto q_expected = rope_oracle(q, positions, geometry, q_heads);
+    const auto k_expected = rope_oracle(k, positions, geometry, k_heads);
 
-    std::vector<double> q_ref, k_ref;
-    cpu_rope_one(q, positions, kQHeads, T, kRotaryDim, kTheta, q_ref);
-    cpu_rope_one(k, positions, kKHeads, T, kRotaryDim, kTheta, k_ref);
+    GuardedDeviceBuffer q_device(q_storage.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer k_device(k_storage.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer position_device(positions.size() * sizeof(int));
+    q_device.copy_from_host(q_storage.data(), q_device.bytes());
+    k_device.copy_from_host(k_storage.data(), k_device.bytes());
+    position_device.copy_from_host(positions.data(), position_device.bytes());
 
-    DeviceBuffer dpos = to_device_i32(positions);
-    DeviceBuffer dq = to_device_bf16(q), dk = to_device_bf16(k);
-    Tensor tpos(dpos.p, DType::I32, {T});
-    Tensor tq(dq.p, DType::BF16, {kHeadDim, kQHeads, T});
-    Tensor tk(dk.p, DType::BF16, {kHeadDim, kKHeads, T});
+    Tensor position_tensor(position_device.data(), DType::I32, {geometry.tokens, geometry.axes});
+    Tensor q_tensor(q_device.data(), DType::BF16, {geometry.head_dim, q_heads, geometry.tokens});
+    Tensor k_tensor(k_device.data(), DType::BF16, {geometry.head_dim, k_heads, geometry.tokens});
+    q_tensor.nb[2] = static_cast<std::int64_t>(q_stride) * sizeof(std::uint16_t);
+    k_tensor.nb[2] = static_cast<std::int64_t>(k_stride) * sizeof(std::uint16_t);
 
-    ops::rope(tpos, kRotaryDim, kTheta, tq, tk, nullptr);
-    cudaDeviceSynchronize();
-
-    int f = 0;
-    f += verify((std::string(tag) + " q").c_str(), from_device_bf16(dq, qn), q_ref,
-                Tolerance::bf16_elementwise());
-    f += verify((std::string(tag) + " k").c_str(), from_device_bf16(dk, kn), k_ref,
-                Tolerance::bf16_elementwise());
-    f += check_passthrough_bits((std::string(tag) + " q").c_str(), from_device_bf16_bits(dq, qn),
-                                q_before, kQHeads, T, kRotaryDim);
-    f += check_passthrough_bits((std::string(tag) + " k").c_str(), from_device_bf16_bits(dk, kn),
-                                k_before, kKHeads, T, kRotaryDim);
-    return f;
-}
-
-int unaligned_data_case() {
-    constexpr std::int32_t T = 7;
-    const std::size_t qn     = tensor_size(kQHeads, T);
-    const std::size_t kn     = tensor_size(kKHeads, T);
-    std::vector<float> q(qn), k(kn);
-    std::vector<int> positions(static_cast<std::size_t>(T));
-    fill_uniform(q, 1234u, -8.f, 8.f);
-    fill_uniform(k, 4321u, -8.f, 8.f);
-    fill_iota_i32(positions, 0);
-    round_to_bf16(q);
-    round_to_bf16(k);
-
-    const std::vector<std::uint16_t> q_before = bf16_bits(q);
-    const std::vector<std::uint16_t> k_before = bf16_bits(k);
-
-    std::vector<double> q_ref, k_ref;
-    cpu_rope_one(q, positions, kQHeads, T, kRotaryDim, kTheta, q_ref);
-    cpu_rope_one(k, positions, kKHeads, T, kRotaryDim, kTheta, k_ref);
-
-    DeviceBuffer dpos = to_device_i32(positions);
-    DeviceBuffer dq = to_device_bf16_unaligned(q), dk = to_device_bf16_unaligned(k);
-    auto* qptr = static_cast<std::uint16_t*>(dq.p) + 1;
-    auto* kptr = static_cast<std::uint16_t*>(dk.p) + 1;
-    Tensor tpos(dpos.p, DType::I32, {T});
-    Tensor tq(qptr, DType::BF16, {kHeadDim, kQHeads, T});
-    Tensor tk(kptr, DType::BF16, {kHeadDim, kKHeads, T});
-
-    ops::rope(tpos, kRotaryDim, kTheta, tq, tk, nullptr);
-    cudaDeviceSynchronize();
-
-    int f = 0;
-    f += verify("rope unaligned q", from_device_bf16_ptr(qptr, qn), q_ref,
-                Tolerance::bf16_elementwise());
-    f += verify("rope unaligned k", from_device_bf16_ptr(kptr, kn), k_ref,
-                Tolerance::bf16_elementwise());
-    f += check_passthrough_bits("rope unaligned q", from_device_bf16_bits_ptr(qptr, qn), q_before,
-                                kQHeads, T, kRotaryDim);
-    f += check_passthrough_bits("rope unaligned k", from_device_bf16_bits_ptr(kptr, kn), k_before,
-                                kKHeads, T, kRotaryDim);
-    return f;
-}
-
-int identity_positions_zero_case() {
-    constexpr std::int32_t T = 7;
-    const std::size_t qn     = tensor_size(kQHeads, T);
-    const std::size_t kn     = tensor_size(kKHeads, T);
-    std::vector<float> q(qn), k(kn);
-    std::vector<int> positions(static_cast<std::size_t>(T), 0);
-    fill_uniform(q, 2026u, -8.f, 8.f);
-    fill_uniform(k, 3026u, -8.f, 8.f);
-    round_to_bf16(q);
-    round_to_bf16(k);
-    const std::vector<std::uint16_t> q_before = bf16_bits(q);
-    const std::vector<std::uint16_t> k_before = bf16_bits(k);
-
-    DeviceBuffer dpos = to_device_i32(positions);
-    DeviceBuffer dq = to_device_bf16(q), dk = to_device_bf16(k);
-    Tensor tpos(dpos.p, DType::I32, {T});
-    Tensor tq(dq.p, DType::BF16, {kHeadDim, kQHeads, T});
-    Tensor tk(dk.p, DType::BF16, {kHeadDim, kKHeads, T});
-    ops::rope(tpos, kRotaryDim, kTheta, tq, tk, nullptr);
-    cudaDeviceSynchronize();
-
-    int f = 0;
-    f +=
-        check_all_bits_same("rope positions=0 identity q", from_device_bf16_bits(dq, qn), q_before);
-    f +=
-        check_all_bits_same("rope positions=0 identity k", from_device_bf16_bits(dk, kn), k_before);
-    return f;
-}
-
-int split_api_parity_case(std::int32_t T, std::uint32_t seed) {
-    const std::size_t qn = tensor_size(kQHeads, T);
-    const std::size_t kn = tensor_size(kKHeads, T);
-    std::vector<float> q(qn), k(kn);
-    std::vector<int> positions(static_cast<std::size_t>(T));
-    fill_uniform(q, seed, -8.f, 8.f);
-    fill_uniform(k, seed + 1000u, -8.f, 8.f);
-    fill_iota_i32(positions, 17);
-    round_to_bf16(q);
-    round_to_bf16(k);
-
-    std::vector<double> q_ref, k_ref;
-    cpu_rope_one(q, positions, kQHeads, T, kRotaryDim, kTheta, q_ref);
-    cpu_rope_one(k, positions, kKHeads, T, kRotaryDim, kTheta, k_ref);
-
-    DeviceBuffer dpos     = to_device_i32(positions);
-    DeviceBuffer dq_fused = to_device_bf16(q), dk_fused = to_device_bf16(k);
-    DeviceBuffer dq_split = to_device_bf16(q), dk_split = to_device_bf16(k);
-    Tensor tpos(dpos.p, DType::I32, {T});
-    Tensor tq_fused(dq_fused.p, DType::BF16, {kHeadDim, kQHeads, T});
-    Tensor tk_fused(dk_fused.p, DType::BF16, {kHeadDim, kKHeads, T});
-    Tensor tq_split(dq_split.p, DType::BF16, {kHeadDim, kQHeads, T});
-    Tensor tk_split(dk_split.p, DType::BF16, {kHeadDim, kKHeads, T});
-
-    ops::rope(tpos, kRotaryDim, kTheta, tq_fused, tk_fused, nullptr);
-    ops::rope(tpos, kRotaryDim, kTheta, tq_split, nullptr);
-    ops::rope(tpos, kRotaryDim, kTheta, tk_split, nullptr);
-    cudaDeviceSynchronize();
-
-    const std::string label = "rope split API T=" + std::to_string(T);
-    int f                   = 0;
-    f += verify((label + " q vs FP64").c_str(), from_device_bf16(dq_split, qn), q_ref,
-                Tolerance::bf16_elementwise());
-    f += verify((label + " k vs FP64").c_str(), from_device_bf16(dk_split, kn), k_ref,
-                Tolerance::bf16_elementwise());
-    f += check_all_bits_same((label + " q").c_str(), from_device_bf16_bits(dq_split, qn),
-                             from_device_bf16_bits(dq_fused, qn));
-    f += check_all_bits_same((label + " k").c_str(), from_device_bf16_bits(dk_split, kn),
-                             from_device_bf16_bits(dk_fused, kn));
-    return f;
-}
-
-void cpu_rope_nd(const std::vector<float>& input, const std::vector<int>& positions, int axes,
-                 int head_dim, int heads, int tokens, int rotary_dim, float theta,
-                 std::vector<double>& output) {
-    output.assign(input.begin(), input.end());
-    const int half = rotary_dim / 2;
-    for (int token = 0; token < tokens; ++token) {
-        for (int head = 0; head < heads; ++head) {
-            for (int pair = 0; pair < half; ++pair) {
-                int axis;
-                double exponent;
-                if (axes == 2) {
-                    axis     = pair / 18;
-                    exponent = -2.0 * static_cast<double>(pair % 18) / 36.0;
-                } else {
-                    axis     = axes == 3 ? pair % 3 : 0;
-                    exponent = -2.0 * static_cast<double>(pair) / rotary_dim;
-                }
-                const double frequency = std::pow(static_cast<double>(theta), exponent);
-                const double angle =
-                    static_cast<double>(positions[axis * tokens + token]) * frequency;
-                const std::size_t base =
-                    (static_cast<std::size_t>(token) * heads + head) * head_dim;
-                const double first         = input[base + pair];
-                const double second        = input[base + pair + half];
-                output[base + pair]        = first * std::cos(angle) - second * std::sin(angle);
-                output[base + pair + half] = second * std::cos(angle) + first * std::sin(angle);
-            }
-        }
-    }
-}
-
-int text_mrope_case() {
-    constexpr int tokens = 7;
-    std::vector<float> q(tensor_size(kQHeads, tokens));
-    std::vector<float> k(tensor_size(kKHeads, tokens));
-    std::vector<int> positions(3 * tokens);
-    fill_uniform(q, 3001u, -8.0f, 8.0f);
-    fill_uniform(k, 3002u, -8.0f, 8.0f);
-    round_to_bf16(q);
-    round_to_bf16(k);
-    for (int token = 0; token < tokens; ++token) {
-        positions[token]              = 10 + token;
-        positions[tokens + token]     = 20 + token * 2;
-        positions[2 * tokens + token] = 30 + token * 3;
-    }
-    std::vector<double> q_ref;
-    std::vector<double> k_ref;
-    cpu_rope_nd(q, positions, 3, kHeadDim, kQHeads, tokens, kRotaryDim, kTheta, q_ref);
-    cpu_rope_nd(k, positions, 3, kHeadDim, kKHeads, tokens, kRotaryDim, kTheta, k_ref);
-    DeviceBuffer dpos = to_device_i32(positions);
-    DeviceBuffer dq = to_device_bf16(q), dk = to_device_bf16(k);
-    DeviceBuffer dq_single = to_device_bf16(q), dk_single = to_device_bf16(k);
-    Tensor tpos(dpos.p, DType::I32, {tokens, 3});
-    Tensor tq(dq.p, DType::BF16, {kHeadDim, kQHeads, tokens});
-    Tensor tk(dk.p, DType::BF16, {kHeadDim, kKHeads, tokens});
-    Tensor tq_single(dq_single.p, DType::BF16, {kHeadDim, kQHeads, tokens});
-    Tensor tk_single(dk_single.p, DType::BF16, {kHeadDim, kKHeads, tokens});
-    ops::rope(tpos, kRotaryDim, kTheta, tq, tk, nullptr);
-    ops::rope(tpos, kRotaryDim, kTheta, tq_single, nullptr);
-    ops::rope(tpos, kRotaryDim, kTheta, tk_single, nullptr);
-    cudaDeviceSynchronize();
-    int failures = 0;
-    failures += verify("text MRoPE q", from_device_bf16(dq, q.size()), q_ref,
-                       Tolerance::bf16_elementwise());
-    failures += verify("text MRoPE k", from_device_bf16(dk, k.size()), k_ref,
-                       Tolerance::bf16_elementwise());
-    failures += verify("text MRoPE q single", from_device_bf16(dq_single, q.size()), q_ref,
-                       Tolerance::bf16_elementwise());
-    failures += verify("text MRoPE k single", from_device_bf16(dk_single, k.size()), k_ref,
-                       Tolerance::bf16_elementwise());
-    return failures;
-}
-
-int text_35b_case(int tokens, int axes) {
-    constexpr int q_heads = 16;
-    constexpr int k_heads = 2;
-    std::vector<float> q(tensor_size(q_heads, tokens));
-    std::vector<float> k(tensor_size(k_heads, tokens));
-    std::vector<int> positions(static_cast<std::size_t>(axes) * tokens);
-    fill_uniform(q, 3501u + static_cast<std::uint32_t>(tokens), -8.0F, 8.0F);
-    fill_uniform(k, 3502u + static_cast<std::uint32_t>(tokens), -8.0F, 8.0F);
-    round_to_bf16(q);
-    round_to_bf16(k);
-    for (int axis = 0; axis < axes; ++axis) {
-        for (int token = 0; token < tokens; ++token) {
-            positions[static_cast<std::size_t>(axis) * tokens + token] = 100 * axis + token;
-        }
-    }
-
-    std::vector<double> q_ref;
-    std::vector<double> k_ref;
-    cpu_rope_nd(q, positions, axes, kHeadDim, q_heads, tokens, kRotaryDim, kTheta, q_ref);
-    cpu_rope_nd(k, positions, axes, kHeadDim, k_heads, tokens, kRotaryDim, kTheta, k_ref);
-
-    DeviceBuffer dpos    = to_device_i32(positions);
-    DeviceBuffer dq_pair = to_device_bf16(q);
-    DeviceBuffer dk_pair = to_device_bf16(k);
-    DeviceBuffer dq_one  = to_device_bf16(q);
-    DeviceBuffer dk_one  = to_device_bf16(k);
-    Tensor tpos(dpos.p, DType::I32, {tokens, axes});
-    Tensor tq_pair(dq_pair.p, DType::BF16, {kHeadDim, q_heads, tokens});
-    Tensor tk_pair(dk_pair.p, DType::BF16, {kHeadDim, k_heads, tokens});
-    Tensor tq_one(dq_one.p, DType::BF16, {kHeadDim, q_heads, tokens});
-    Tensor tk_one(dk_one.p, DType::BF16, {kHeadDim, k_heads, tokens});
-    ops::rope(tpos, kRotaryDim, kTheta, tq_pair, tk_pair, nullptr);
-    ops::rope(tpos, kRotaryDim, kTheta, tq_one, nullptr);
-    ops::rope(tpos, kRotaryDim, kTheta, tk_one, nullptr);
-    cudaDeviceSynchronize();
-
-    const std::string label =
-        "text 35B axes=" + std::to_string(axes) + " T=" + std::to_string(tokens);
-    const auto q_pair_bits = from_device_bf16_bits(dq_pair, q.size());
-    const auto k_pair_bits = from_device_bf16_bits(dk_pair, k.size());
-    int failures           = 0;
-    failures += verify((label + " q").c_str(), from_device_bf16(dq_pair, q.size()), q_ref,
-                       Tolerance::bf16_elementwise());
-    failures += verify((label + " k").c_str(), from_device_bf16(dk_pair, k.size()), k_ref,
-                       Tolerance::bf16_elementwise());
-    failures += check_passthrough_bits((label + " q passthrough").c_str(), q_pair_bits,
-                                       bf16_bits(q), q_heads, tokens, kRotaryDim);
-    failures += check_passthrough_bits((label + " k passthrough").c_str(), k_pair_bits,
-                                       bf16_bits(k), k_heads, tokens, kRotaryDim);
-    failures += verify((label + " q single vs FP64").c_str(), from_device_bf16(dq_one, q.size()),
-                       q_ref, Tolerance::bf16_elementwise());
-    failures += verify((label + " k single vs FP64").c_str(), from_device_bf16(dk_one, k.size()),
-                       k_ref, Tolerance::bf16_elementwise());
-    failures += check_all_bits_same((label + " q single parity").c_str(),
-                                    from_device_bf16_bits(dq_one, q.size()), q_pair_bits);
-    failures += check_all_bits_same((label + " k single parity").c_str(),
-                                    from_device_bf16_bits(dk_one, k.size()), k_pair_bits);
-    return failures;
-}
-
-int vision_rope_packed_case() {
-    constexpr int head_dim = 72;
-    constexpr int heads    = 16;
-    constexpr int tokens   = 11;
-    constexpr int hidden   = head_dim * heads;
-    constexpr int qkv      = hidden * 3;
-    std::vector<float> q(static_cast<std::size_t>(tokens) * hidden);
-    std::vector<float> k(static_cast<std::size_t>(tokens) * hidden);
-    std::vector<float> packed(static_cast<std::size_t>(tokens) * qkv, 0.0f);
-    std::vector<int> positions(2 * tokens);
-    fill_uniform(q, 4001u, -8.0f, 8.0f);
-    fill_uniform(k, 4002u, -8.0f, 8.0f);
-    round_to_bf16(q);
-    round_to_bf16(k);
-    for (int token = 0; token < tokens; ++token) {
-        positions[token]          = token / 4;
-        positions[tokens + token] = token % 4;
-        std::copy_n(q.data() + static_cast<std::size_t>(token) * hidden, hidden,
-                    packed.data() + static_cast<std::size_t>(token) * qkv);
-        std::copy_n(k.data() + static_cast<std::size_t>(token) * hidden, hidden,
-                    packed.data() + static_cast<std::size_t>(token) * qkv + hidden);
-    }
-    std::vector<double> q_ref;
-    std::vector<double> k_ref;
-    cpu_rope_nd(q, positions, 2, head_dim, heads, tokens, head_dim, 10000.0f, q_ref);
-    cpu_rope_nd(k, positions, 2, head_dim, heads, tokens, head_dim, 10000.0f, k_ref);
-    DeviceBuffer dpacked_pair   = to_device_bf16(packed);
-    DeviceBuffer dpacked_single = to_device_bf16(packed);
-    DeviceBuffer dpos           = to_device_i32(positions);
-    Tensor tq(dpacked_pair.p, DType::BF16, {head_dim, heads, tokens});
-    tq.nb[2]  = qkv * 2;
-    Tensor tk = tq;
-    tk.data   = static_cast<unsigned char*>(dpacked_pair.p) + hidden * 2;
-    Tensor tq_one(dpacked_single.p, DType::BF16, {head_dim, heads, tokens});
-    tq_one.nb[2]  = qkv * 2;
-    Tensor tk_one = tq_one;
-    tk_one.data   = static_cast<unsigned char*>(dpacked_single.p) + hidden * 2;
-    Tensor tpos(dpos.p, DType::I32, {tokens, 2});
-    ops::rope(tpos, head_dim, 10000.0f, tq, tk, nullptr);
-    ops::rope(tpos, head_dim, 10000.0f, tq_one, nullptr);
-    ops::rope(tpos, head_dim, 10000.0f, tk_one, nullptr);
-    cudaDeviceSynchronize();
-    const std::vector<std::uint16_t> pair_bits = from_device_bf16_bits(dpacked_pair, packed.size());
-    const std::vector<std::uint16_t> single_bits =
-        from_device_bf16_bits(dpacked_single, packed.size());
-    std::vector<double> q_got(q.size()), k_got(k.size());
-    std::vector<double> q_single_got(q.size()), k_single_got(k.size());
-    for (int token = 0; token < tokens; ++token) {
-        for (int i = 0; i < hidden; ++i) {
-            q_got[static_cast<std::size_t>(token) * hidden + i] =
-                bf16_to_f32(pair_bits[static_cast<std::size_t>(token) * qkv + i]);
-            k_got[static_cast<std::size_t>(token) * hidden + i] =
-                bf16_to_f32(pair_bits[static_cast<std::size_t>(token) * qkv + hidden + i]);
-            q_single_got[static_cast<std::size_t>(token) * hidden + i] =
-                bf16_to_f32(single_bits[static_cast<std::size_t>(token) * qkv + i]);
-            k_single_got[static_cast<std::size_t>(token) * hidden + i] =
-                bf16_to_f32(single_bits[static_cast<std::size_t>(token) * qkv + hidden + i]);
-        }
-    }
-    int failures = 0;
-    failures += verify("vision RoPE packed q", q_got, q_ref, Tolerance::bf16_elementwise());
-    failures += verify("vision RoPE packed k", k_got, k_ref, Tolerance::bf16_elementwise());
-    failures +=
-        verify("vision RoPE packed q single", q_single_got, q_ref, Tolerance::bf16_elementwise());
-    failures +=
-        verify("vision RoPE packed k single", k_single_got, k_ref, Tolerance::bf16_elementwise());
-    return failures;
-}
-
-std::size_t dflash_tensor_size(std::int32_t heads, std::int32_t tokens) {
-    return static_cast<std::size_t>(kDflashHeadDim) * heads * tokens;
-}
-
-int check_all_dflash_dims_mutated(const char* label, const std::vector<std::uint16_t>& got,
-                                  const std::vector<std::uint16_t>& before, std::int32_t heads,
-                                  std::int32_t tokens) {
-    for (int dim = 0; dim < kDflashHeadDim; ++dim) {
-        bool changed = false;
-        for (int token = 0; token < tokens && !changed; ++token) {
-            for (int head = 0; head < heads; ++head) {
-                const std::size_t index =
-                    (static_cast<std::size_t>(token) * heads + head) * kDflashHeadDim + dim;
-                if (got[index] != before[index]) {
-                    changed = true;
-                    break;
-                }
-            }
-        }
-        if (!changed) {
-            std::cerr << label << ": dimension " << dim << " was not observably mutated\n";
-            return 1;
-        }
-    }
-    return 0;
-}
-
-int dflash_case(const char* label, int tokens, int first_position, bool graph = false,
-                bool single_parity = false, bool require_identity = false,
-                bool require_full_mutation = false) {
-    const std::size_t qn = dflash_tensor_size(kDflashQHeads, tokens);
-    const std::size_t kn = dflash_tensor_size(kDflashKHeads, tokens);
-    std::vector<float> q(qn);
-    std::vector<float> k(kn);
-    std::vector<int> positions(static_cast<std::size_t>(tokens));
-    fill_uniform(q, 5101u + static_cast<std::uint32_t>(tokens), -8.0F, 8.0F);
-    fill_uniform(k, 5201u + static_cast<std::uint32_t>(tokens), -8.0F, 8.0F);
-    fill_iota_i32(positions, first_position);
-    round_to_bf16(q);
-    round_to_bf16(k);
-    const auto q_before = bf16_bits(q);
-    const auto k_before = bf16_bits(k);
-
-    std::vector<double> q_ref;
-    std::vector<double> k_ref;
-    cpu_rope_nd(q, positions, 1, kDflashHeadDim, kDflashQHeads, tokens, kDflashRotaryDim, kTheta,
-                q_ref);
-    cpu_rope_nd(k, positions, 1, kDflashHeadDim, kDflashKHeads, tokens, kDflashRotaryDim, kTheta,
-                k_ref);
-
-    DeviceBuffer dpos = to_device_i32(positions);
-    GuardedDBuf dq(qn * sizeof(std::uint16_t));
-    GuardedDBuf dk(kn * sizeof(std::uint16_t));
-    dq.copy_from_host(q_before.data(), qn * sizeof(std::uint16_t));
-    dk.copy_from_host(k_before.data(), kn * sizeof(std::uint16_t));
-    DeviceBuffer dq_single = to_device_bf16(q);
-    DeviceBuffer dk_single = to_device_bf16(k);
-    Tensor tpos(dpos.p, DType::I32, {tokens});
-    Tensor tq(dq.data(), DType::BF16, {kDflashHeadDim, kDflashQHeads, tokens});
-    Tensor tk(dk.data(), DType::BF16, {kDflashHeadDim, kDflashKHeads, tokens});
-    Tensor tq_single(dq_single.p, DType::BF16, {kDflashHeadDim, kDflashQHeads, tokens});
-    Tensor tk_single(dk_single.p, DType::BF16, {kDflashHeadDim, kDflashKHeads, tokens});
-
-    if (graph) {
-        cudaStream_t stream        = nullptr;
-        cudaGraph_t captured       = nullptr;
-        cudaGraphExec_t executable = nullptr;
-        cuda_check(cudaStreamCreate(&stream), "cudaStreamCreate");
-        cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
-                   "cudaStreamBeginCapture");
-        ops::rope(tpos, kDflashRotaryDim, kTheta, tq, tk, stream);
-        cuda_check(cudaStreamEndCapture(stream, &captured), "cudaStreamEndCapture");
-        cuda_check(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0),
-                   "cudaGraphInstantiate");
-        cuda_check(cudaGraphLaunch(executable, stream), "cudaGraphLaunch");
-        cuda_synchronize(stream);
-        cudaGraphExecDestroy(executable);
-        cudaGraphDestroy(captured);
-        cudaStreamDestroy(stream);
-    } else {
-        ops::rope(tpos, kDflashRotaryDim, kTheta, tq, tk, nullptr);
-        cuda_synchronize();
-    }
-
-    const auto q_got_bits = from_device<std::uint16_t>(dq.data(), qn);
-    const auto k_got_bits = from_device<std::uint16_t>(dk.data(), kn);
-    int failures          = 0;
-    failures += verify((std::string(label) + " q").c_str(), from_device_bf16(dq.data(), qn), q_ref,
-                       Tolerance::bf16_elementwise());
-    failures += verify((std::string(label) + " k").c_str(), from_device_bf16(dk.data(), kn), k_ref,
-                       Tolerance::bf16_elementwise());
-    failures += verify_exact((std::string(label) + " positions").c_str(),
-                             from_device_i32(dpos, tokens), positions);
-    failures += dq.verify_guards((std::string(label) + " q guards").c_str());
-    failures += dk.verify_guards((std::string(label) + " k guards").c_str());
-    if (require_identity) {
-        failures +=
-            verify_exact((std::string(label) + " q identity").c_str(), q_got_bits, q_before);
-        failures +=
-            verify_exact((std::string(label) + " k identity").c_str(), k_got_bits, k_before);
-    }
-    if (require_full_mutation) {
-        failures += check_all_dflash_dims_mutated((std::string(label) + " q").c_str(), q_got_bits,
-                                                  q_before, kDflashQHeads, tokens);
-        failures += check_all_dflash_dims_mutated((std::string(label) + " k").c_str(), k_got_bits,
-                                                  k_before, kDflashKHeads, tokens);
-    }
-    if (single_parity) {
-        ops::rope(tpos, kDflashRotaryDim, kTheta, tq_single, nullptr);
-        ops::rope(tpos, kDflashRotaryDim, kTheta, tk_single, nullptr);
-        cuda_synchronize();
-        failures += verify_exact((std::string(label) + " q single parity").c_str(),
-                                 from_device_bf16_bits(dq_single, qn), q_got_bits);
-        failures += verify_exact((std::string(label) + " k single parity").c_str(),
-                                 from_device_bf16_bits(dk_single, kn), k_got_bits);
-    }
-    return failures;
-}
-
-int dflash_padded_stride_case() {
-    constexpr int tokens        = 16;
-    constexpr int q_dense       = kDflashHeadDim * kDflashQHeads;
-    constexpr int k_dense       = kDflashHeadDim * kDflashKHeads;
-    constexpr int q_stride      = q_dense + 16;
-    constexpr int k_stride      = k_dense + 32;
-    constexpr std::uint16_t pad = 0x3f81U;
-    std::vector<float> q(static_cast<std::size_t>(q_dense) * tokens);
-    std::vector<float> k(static_cast<std::size_t>(k_dense) * tokens);
-    fill_uniform(q, 5301u, -8.0F, 8.0F);
-    fill_uniform(k, 5302u, -8.0F, 8.0F);
-    round_to_bf16(q);
-    round_to_bf16(k);
-    std::vector<std::uint16_t> q_storage(static_cast<std::size_t>(q_stride) * tokens, pad);
-    std::vector<std::uint16_t> k_storage(static_cast<std::size_t>(k_stride) * tokens, pad);
-    const auto q_bits = bf16_bits(q);
-    const auto k_bits = bf16_bits(k);
-    for (int token = 0; token < tokens; ++token) {
-        std::copy_n(q_bits.data() + static_cast<std::size_t>(token) * q_dense, q_dense,
-                    q_storage.data() + static_cast<std::size_t>(token) * q_stride);
-        std::copy_n(k_bits.data() + static_cast<std::size_t>(token) * k_dense, k_dense,
-                    k_storage.data() + static_cast<std::size_t>(token) * k_stride);
-    }
-    std::vector<int> positions(tokens);
-    fill_iota_i32(positions, 262144 - tokens);
-    std::vector<double> q_ref;
-    std::vector<double> k_ref;
-    cpu_rope_nd(q, positions, 1, kDflashHeadDim, kDflashQHeads, tokens, kDflashRotaryDim, kTheta,
-                q_ref);
-    cpu_rope_nd(k, positions, 1, kDflashHeadDim, kDflashKHeads, tokens, kDflashRotaryDim, kTheta,
-                k_ref);
-
-    GuardedDBuf dq(q_storage.size() * sizeof(std::uint16_t));
-    GuardedDBuf dk(k_storage.size() * sizeof(std::uint16_t));
-    dq.copy_from_host(q_storage.data(), dq.bytes());
-    dk.copy_from_host(k_storage.data(), dk.bytes());
-    DeviceBuffer dpos = to_device_i32(positions);
-    Tensor tpos(dpos.p, DType::I32, {tokens});
-    Tensor tq(dq.data(), DType::BF16, {kDflashHeadDim, kDflashQHeads, tokens});
-    Tensor tk(dk.data(), DType::BF16, {kDflashHeadDim, kDflashKHeads, tokens});
-    tq.nb[2] = q_stride * sizeof(std::uint16_t);
-    tk.nb[2] = k_stride * sizeof(std::uint16_t);
-    ops::rope(tpos, kDflashRotaryDim, kTheta, tq, tk, nullptr);
+    ops::rope(position_tensor, geometry.rotary_dim, geometry.theta, q_tensor, k_tensor, nullptr);
     cuda_synchronize();
 
-    const auto q_got_storage = from_device<std::uint16_t>(dq.data(), q_storage.size());
-    const auto k_got_storage = from_device<std::uint16_t>(dk.data(), k_storage.size());
-    std::vector<double> q_got(q.size());
-    std::vector<double> k_got(k.size());
-    int failures = 0;
-    for (int token = 0; token < tokens; ++token) {
-        for (int index = 0; index < q_dense; ++index) {
-            q_got[static_cast<std::size_t>(token) * q_dense + index] =
-                bf16_to_f32(q_got_storage[static_cast<std::size_t>(token) * q_stride + index]);
-        }
-        for (int index = 0; index < k_dense; ++index) {
-            k_got[static_cast<std::size_t>(token) * k_dense + index] =
-                bf16_to_f32(k_got_storage[static_cast<std::size_t>(token) * k_stride + index]);
-        }
-        for (int index = q_dense; index < q_stride; ++index) {
-            if (q_got_storage[static_cast<std::size_t>(token) * q_stride + index] != pad) {
-                std::cerr << "dflash padded q token padding changed\n";
-                ++failures;
-                break;
-            }
-        }
-        for (int index = k_dense; index < k_stride; ++index) {
-            if (k_got_storage[static_cast<std::size_t>(token) * k_stride + index] != pad) {
-                std::cerr << "dflash padded k token padding changed\n";
-                ++failures;
-                break;
-            }
-        }
-    }
-    failures += verify("dflash padded q", q_got, q_ref, Tolerance::bf16_elementwise());
-    failures += verify("dflash padded k", k_got, k_ref, Tolerance::bf16_elementwise());
-    failures += verify_exact("dflash padded positions", from_device_i32(dpos, tokens), positions);
-    failures += dq.verify_guards("dflash padded q guards");
-    failures += dk.verify_guards("dflash padded k guards");
-    return failures;
-}
-
-int dflash_unaligned_large_phase_case() {
-    constexpr int tokens = 2;
-    const std::size_t qn = dflash_tensor_size(kDflashQHeads, tokens);
-    const std::size_t kn = dflash_tensor_size(kDflashKHeads, tokens);
-    std::vector<float> q(qn);
-    std::vector<float> k(kn);
-    std::vector<int> positions{262142, 262143};
-    fill_uniform(q, 5401u, -8.0F, 8.0F);
-    fill_uniform(k, 5402u, -8.0F, 8.0F);
-    round_to_bf16(q);
-    round_to_bf16(k);
-    std::vector<double> q_ref;
-    std::vector<double> k_ref;
-    cpu_rope_nd(q, positions, 1, kDflashHeadDim, kDflashQHeads, tokens, kDflashRotaryDim, kTheta,
-                q_ref);
-    cpu_rope_nd(k, positions, 1, kDflashHeadDim, kDflashKHeads, tokens, kDflashRotaryDim, kTheta,
-                k_ref);
-    DeviceBuffer dpos = to_device_i32(positions);
-    DeviceBuffer dq   = to_device_bf16_unaligned(q);
-    DeviceBuffer dk   = to_device_bf16_unaligned(k);
-    auto* qptr        = static_cast<std::uint16_t*>(dq.p) + 1;
-    auto* kptr        = static_cast<std::uint16_t*>(dk.p) + 1;
-    Tensor tpos(dpos.p, DType::I32, {tokens});
-    Tensor tq(qptr, DType::BF16, {kDflashHeadDim, kDflashQHeads, tokens});
-    Tensor tk(kptr, DType::BF16, {kDflashHeadDim, kDflashKHeads, tokens});
-    ops::rope(tpos, kDflashRotaryDim, kTheta, tq, tk, nullptr);
-    cuda_synchronize();
-    int failures = 0;
-    failures += verify("dflash unaligned q", from_device_bf16_ptr(qptr, qn), q_ref,
-                       Tolerance::bf16_elementwise());
-    failures += verify("dflash unaligned k", from_device_bf16_ptr(kptr, kn), k_ref,
-                       Tolerance::bf16_elementwise());
+    const auto q_got        = from_device<std::uint16_t>(q_device.data(), q_storage.size());
+    const auto k_got        = from_device<std::uint16_t>(k_device.data(), k_storage.size());
+    const std::string label = geometry.label;
+    int failures            = 0;
+    failures += verify_rope_profile(
+        label + " q", gather_dense(q_got, q_dense_per_token, q_stride, geometry.tokens), q_expected,
+        q, geometry, q_heads);
+    failures += verify_rope_profile(
+        label + " k", gather_dense(k_got, k_dense_per_token, k_stride, geometry.tokens), k_expected,
+        k, geometry, k_heads);
+    failures += verify_passthrough(label + " q", q_got, q_before, geometry.head_dim, q_heads,
+                                   geometry.tokens, geometry.rotary_dim, q_stride);
+    failures += verify_passthrough(label + " k", k_got, k_before, geometry.head_dim, k_heads,
+                                   geometry.tokens, geometry.rotary_dim, k_stride);
     failures +=
-        verify_exact("dflash unaligned positions", from_device_i32(dpos, tokens), positions);
+        verify_padding(label + " q", q_got, q_dense_per_token, q_stride, geometry.tokens, kPadding);
+    failures +=
+        verify_padding(label + " k", k_got, k_dense_per_token, k_stride, geometry.tokens, kPadding);
+    failures += verify_exact((label + " positions").c_str(),
+                             from_device<int>(position_device.data(), positions.size()), positions);
+    failures += q_device.verify_guards((label + " q guards").c_str());
+    failures += k_device.verify_guards((label + " k guards").c_str());
+    failures += position_device.verify_guards((label + " position guards").c_str());
     return failures;
 }
 
-template <typename Fn>
-int expect_invalid(const char* label, Fn&& fn) {
-    try {
-        fn();
-    } catch (const std::invalid_argument&) { return 0; }
-    std::cerr << label << ": expected invalid_argument\n";
-    return 1;
+int run_single_case(const Geometry& geometry, int heads, int first_position, int padding = 0) {
+    constexpr std::uint16_t kPadding = 0x3f81U;
+    const int dense_per_token        = geometry.head_dim * heads;
+    const int token_stride           = dense_per_token + padding;
+    const auto input =
+        make_bf16_input(dense_elements(geometry.head_dim, heads, geometry.tokens), 0x3001U);
+    const auto before = to_bf16_bits(input);
+    const auto storage =
+        make_strided_storage(before, dense_per_token, token_stride, geometry.tokens, kPadding);
+    const auto positions = make_positions(geometry.axes, geometry.tokens, first_position);
+    const auto expected  = rope_oracle(input, positions, geometry, heads);
+
+    GuardedDeviceBuffer device(storage.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer position_device(positions.size() * sizeof(int));
+    device.copy_from_host(storage.data(), device.bytes());
+    position_device.copy_from_host(positions.data(), position_device.bytes());
+
+    Tensor position_tensor(position_device.data(), DType::I32, {geometry.tokens, geometry.axes});
+    Tensor tensor(device.data(), DType::BF16, {geometry.head_dim, heads, geometry.tokens});
+    tensor.nb[2] = static_cast<std::int64_t>(token_stride) * sizeof(std::uint16_t);
+    ops::rope(position_tensor, geometry.rotary_dim, geometry.theta, tensor, nullptr);
+    cuda_synchronize();
+
+    const auto got          = from_device<std::uint16_t>(device.data(), storage.size());
+    const std::string label = std::string(geometry.label) + " single";
+    int failures            = 0;
+    failures += verify_rope_profile(
+        label, gather_dense(got, dense_per_token, token_stride, geometry.tokens), expected, input,
+        geometry, heads);
+    failures += verify_passthrough(label, got, before, geometry.head_dim, heads, geometry.tokens,
+                                   geometry.rotary_dim, token_stride);
+    failures +=
+        verify_padding(label, got, dense_per_token, token_stride, geometry.tokens, kPadding);
+    failures += verify_exact((label + " positions").c_str(),
+                             from_device<int>(position_device.data(), positions.size()), positions);
+    failures += device.verify_guards((label + " guards").c_str());
+    failures += position_device.verify_guards((label + " position guards").c_str());
+    return failures;
 }
 
-template <typename Fn>
-int expect_overflow(const char* label, Fn&& fn) {
-    try {
-        fn();
-    } catch (const std::overflow_error&) { return 0; } catch (const std::invalid_argument& e) {
-        std::cerr << label << ": expected overflow_error, got invalid_argument: " << e.what()
-                  << '\n';
-        return 1;
+int run_vision_packed_case() {
+    constexpr int kHeadDim = 72;
+    constexpr int kHeads   = 16;
+    constexpr int kTokens  = 11;
+    constexpr int kPlane   = kHeadDim * kHeads;
+    constexpr int kStride  = 3 * kPlane;
+    constexpr Geometry geometry{"vision packed qkv", kHeadDim, kHeadDim, 2, kTokens, kVisionTheta};
+
+    const auto q      = make_bf16_input(dense_elements(kHeadDim, kHeads, kTokens), 0x4001U);
+    const auto k      = make_bf16_input(dense_elements(kHeadDim, kHeads, kTokens), 0x4002U);
+    const auto v      = make_bf16_input(dense_elements(kHeadDim, kHeads, kTokens), 0x4003U);
+    const auto q_bits = to_bf16_bits(q);
+    const auto k_bits = to_bf16_bits(k);
+    const auto v_bits = to_bf16_bits(v);
+    std::vector<std::uint16_t> packed(static_cast<std::size_t>(kStride) * kTokens);
+    for (int token = 0; token < kTokens; ++token) {
+        const std::size_t dense_base  = static_cast<std::size_t>(token) * kPlane;
+        const std::size_t packed_base = static_cast<std::size_t>(token) * kStride;
+        std::copy_n(q_bits.data() + dense_base, kPlane, packed.data() + packed_base);
+        std::copy_n(k_bits.data() + dense_base, kPlane, packed.data() + packed_base + kPlane);
+        std::copy_n(v_bits.data() + dense_base, kPlane, packed.data() + packed_base + 2 * kPlane);
     }
-    std::cerr << label << ": expected overflow_error\n";
-    return 1;
-}
+    std::vector<int> positions(2 * kTokens);
+    for (int token = 0; token < kTokens; ++token) {
+        positions[token]           = token / 4;
+        positions[kTokens + token] = token % 4;
+    }
+    const auto q_expected = rope_oracle(q, positions, geometry, kHeads);
+    const auto k_expected = rope_oracle(k, positions, geometry, kHeads);
 
-int validation_checks() {
-    int f = 0;
-    Tensor pos(nullptr, DType::I32, {7});
-    Tensor q(nullptr, DType::BF16, {kHeadDim, kQHeads, 7});
-    Tensor k(nullptr, DType::BF16, {kHeadDim, kKHeads, 7});
+    GuardedDeviceBuffer packed_device(packed.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer position_device(positions.size() * sizeof(int));
+    packed_device.copy_from_host(packed.data(), packed_device.bytes());
+    position_device.copy_from_host(positions.data(), position_device.bytes());
 
-    try {
-        Tensor empty_pos(nullptr, DType::I32, {1});
-        Tensor empty_q(nullptr, DType::BF16, {kHeadDim, kQHeads, 1});
-        Tensor empty_k(nullptr, DType::BF16, {kHeadDim, kKHeads, 1});
-        empty_pos.ne[0] = 0;
-        empty_q.ne[2]   = 0;
-        empty_k.ne[2]   = 0;
-        ops::rope(empty_pos, kRotaryDim, kTheta, empty_q, empty_k, nullptr);
-    } catch (const std::exception& e) {
-        std::cerr << "validation empty T: expected no throw, got " << e.what() << '\n';
-        ++f;
+    auto* packed_data = static_cast<std::uint16_t*>(packed_device.data());
+    Tensor position_tensor(position_device.data(), DType::I32, {kTokens, 2});
+    Tensor q_tensor(packed_data, DType::BF16, {kHeadDim, kHeads, kTokens});
+    Tensor k_tensor(packed_data + kPlane, DType::BF16, {kHeadDim, kHeads, kTokens});
+    q_tensor.nb[2] = static_cast<std::int64_t>(kStride) * sizeof(std::uint16_t);
+    k_tensor.nb[2] = static_cast<std::int64_t>(kStride) * sizeof(std::uint16_t);
+    ops::rope(position_tensor, kHeadDim, kVisionTheta, q_tensor, k_tensor, nullptr);
+    cuda_synchronize();
+
+    const auto got = from_device<std::uint16_t>(packed_device.data(), packed.size());
+    std::vector<std::uint16_t> q_storage(static_cast<std::size_t>(kStride) * kTokens);
+    std::vector<std::uint16_t> k_storage(static_cast<std::size_t>(kStride) * kTokens);
+    for (int token = 0; token < kTokens; ++token) {
+        const std::size_t packed_base = static_cast<std::size_t>(token) * kStride;
+        std::copy_n(got.data() + packed_base, kPlane, q_storage.data() + packed_base);
+        std::copy_n(got.data() + packed_base + kPlane, kPlane, k_storage.data() + packed_base);
     }
 
-    f += expect_invalid("validation q dtype", [&] {
-        Tensor bad = q;
-        bad.dtype  = DType::FP32;
-        ops::rope(pos, kRotaryDim, kTheta, bad, k, nullptr);
-    });
-    f += expect_invalid("validation k dtype", [&] {
-        Tensor bad = k;
-        bad.dtype  = DType::FP32;
-        ops::rope(pos, kRotaryDim, kTheta, q, bad, nullptr);
-    });
-    f += expect_invalid("validation positions dtype", [&] {
-        Tensor bad = pos;
-        bad.dtype  = DType::BF16;
-        ops::rope(bad, kRotaryDim, kTheta, q, k, nullptr);
-    });
-    f += expect_invalid("validation q head dim", [&] {
-        Tensor bad = q;
-        bad.ne[0]  = 255;
-        ops::rope(pos, kRotaryDim, kTheta, bad, k, nullptr);
-    });
-    f += expect_invalid("validation k head dim", [&] {
-        Tensor bad = k;
-        bad.ne[0]  = 255;
-        ops::rope(pos, kRotaryDim, kTheta, q, bad, nullptr);
-    });
-    f += expect_invalid("validation q T mismatch", [&] {
-        Tensor bad = q;
-        bad.ne[2]  = 8;
-        ops::rope(pos, kRotaryDim, kTheta, bad, k, nullptr);
-    });
-    f += expect_invalid("validation k T mismatch", [&] {
-        Tensor bad = k;
-        bad.ne[2]  = 8;
-        ops::rope(pos, kRotaryDim, kTheta, q, bad, nullptr);
-    });
-    f += expect_invalid("validation positions shape rank", [&] {
-        Tensor bad = pos;
-        bad.ne[1]  = 2;
-        ops::rope(bad, kRotaryDim, kTheta, q, k, nullptr);
-    });
-    f += expect_invalid("validation positions length", [&] {
-        Tensor bad = pos;
-        bad.ne[0]  = 8;
-        ops::rope(bad, kRotaryDim, kTheta, q, k, nullptr);
-    });
-    f += expect_invalid("validation q non-contiguous", [&] {
-        Tensor bad = q;
-        bad.nb[0]  = 4;
-        ops::rope(pos, kRotaryDim, kTheta, bad, k, nullptr);
-    });
-    f += expect_invalid("validation k non-contiguous", [&] {
-        Tensor bad = k;
-        bad.nb[0]  = 4;
-        ops::rope(pos, kRotaryDim, kTheta, q, bad, nullptr);
-    });
-    f += expect_invalid("validation positions non-contiguous", [&] {
-        Tensor bad = pos;
-        bad.nb[0]  = 8;
-        ops::rope(bad, kRotaryDim, kTheta, q, k, nullptr);
-    });
-    f += expect_invalid("validation null data",
-                        [&] { ops::rope(pos, kRotaryDim, kTheta, q, k, nullptr); });
-    f += expect_invalid("validation negative dim", [&] {
-        Tensor bad = q;
-        bad.ne[2]  = -1;
-        ops::rope(pos, kRotaryDim, kTheta, bad, k, nullptr);
-    });
-    f +=
-        expect_invalid("validation rotary <= 0", [&] { ops::rope(pos, 0, kTheta, q, k, nullptr); });
-    f += expect_invalid("validation rotary > head dim",
-                        [&] { ops::rope(pos, 258, kTheta, q, k, nullptr); });
-    f +=
-        expect_invalid("validation rotary odd", [&] { ops::rope(pos, 63, kTheta, q, k, nullptr); });
-    f += expect_invalid("validation theta finite positive",
-                        [&] { ops::rope(pos, kRotaryDim, -1.0f, q, k, nullptr); });
-    f += expect_overflow("validation overflow dims", [&] {
-        Tensor huge_pos = pos;
-        Tensor huge_q   = q;
-        Tensor huge_k   = k;
-        for (int d = 0; d < 4; ++d) {
-            huge_pos.ne[d] = std::numeric_limits<std::int32_t>::max();
-            huge_q.ne[d]   = std::numeric_limits<std::int32_t>::max();
-            huge_k.ne[d]   = std::numeric_limits<std::int32_t>::max();
+    int failures = 0;
+    failures +=
+        verify_rope_profile("vision packed q", gather_dense(q_storage, kPlane, kStride, kTokens),
+                            q_expected, q, geometry, kHeads);
+    failures +=
+        verify_rope_profile("vision packed k", gather_dense(k_storage, kPlane, kStride, kTokens),
+                            k_expected, k, geometry, kHeads);
+    for (int token = 0; token < kTokens; ++token) {
+        const std::size_t dense_base  = static_cast<std::size_t>(token) * kPlane;
+        const std::size_t packed_base = static_cast<std::size_t>(token) * kStride;
+        if (!std::equal(v_bits.begin() + static_cast<std::ptrdiff_t>(dense_base),
+                        v_bits.begin() + static_cast<std::ptrdiff_t>(dense_base + kPlane),
+                        got.begin() + static_cast<std::ptrdiff_t>(packed_base + 2 * kPlane))) {
+            std::cerr << "vision packed qkv: V plane changed at token=" << token << '\n';
+            ++failures;
+            break;
         }
-        ops::rope(huge_pos, kRotaryDim, kTheta, huge_q, huge_k, nullptr);
-    });
-
-    return f;
+    }
+    failures += verify_exact("vision packed positions",
+                             from_device<int>(position_device.data(), positions.size()), positions);
+    failures += packed_device.verify_guards("vision packed qkv guards");
+    failures += position_device.verify_guards("vision packed position guards");
+    return failures;
 }
 
 } // namespace
@@ -862,42 +434,30 @@ int main() {
         return 0;
     }
 
-    int f = 0;
-    f += validation_checks();
-    for (std::uint32_t seed : {1u, 7u, 99u}) {
-        f += one_shape("rope T=1", 1, seed);
-        f += one_shape("rope T=7", 7, seed);
-        f += one_shape("rope T=4096", 4096, seed);
-    }
-    f += identity_positions_zero_case();
-    f += unaligned_data_case();
-    f += split_api_parity_case(1, 2001u);
-    f += split_api_parity_case(7, 2007u);
-    f += split_api_parity_case(1024, 2024u);
-    f += text_mrope_case();
-    for (int tokens = 1; tokens <= 16; ++tokens) {
-        f += text_35b_case(tokens, 1);
-        f += text_35b_case(tokens, 3);
-    }
-    f += text_35b_case(1024, 3);
-    f += vision_rope_packed_case();
-    for (int tokens = 1; tokens <= 16; ++tokens) {
-        f += dflash_case(("dflash T=" + std::to_string(tokens)).c_str(), tokens, 31);
-    }
-    f += dflash_case("dflash split boundary T=17", 17, 2048);
-    f += dflash_case("dflash fixed boundary T=399", 399, 32768);
-    f += dflash_case("dflash fixed boundary T=400", 400, 32768);
-    f += dflash_case("dflash fixed boundary T=401", 401, 32768);
-    f += dflash_case("dflash prefill T=128", 128, 4096);
-    f += dflash_case("dflash prefill T=1024", 1024, 131072);
-    f += dflash_case("dflash position zero", 1, 0, false, false, true);
-    f += dflash_case("dflash large phase", 16, 262144 - 16, false, true, false, true);
-    f += dflash_padded_stride_case();
-    f += dflash_unaligned_large_phase_case();
-    f += dflash_case("dflash graph B=2", 2, 8192, true);
-    f += dflash_case("dflash graph B=16", 16, 16384, true);
-    f += dflash_case("dflash graph prefill", 1024, 65536, true);
+    int failures = 0;
 
-    std::cout << (f ? "FAIL" : "OK") << " rope correctness\n";
-    return f ? 1 : 0;
+    // Text pair form: both registered checkpoint geometries, decode/prefill, and 1-D/MRoPE.
+    failures += run_pair_case({"27b text decode", 256, 64, 1, 1, kTextTheta}, 24, 4, 31);
+    failures += run_pair_case({"27b text mrope prefill", 256, 64, 3, 128, kTextTheta}, 24, 4, 4096);
+    failures +=
+        run_pair_case({"35b text native-context tail", 256, 64, 1, 7, kTextTheta}, 16, 2, 262'137);
+    failures += run_pair_case({"35b text mrope", 256, 64, 3, 7, kTextTheta}, 16, 2, 2048, 16, 8);
+
+    // MTP bulk K append uses the single-tensor form; proposal tail uses the pair form above.
+    failures += run_single_case({"27b mtp k mrope", 256, 64, 3, 128, kTextTheta}, 4, 8192);
+    failures += run_single_case({"35b mtp k text", 256, 64, 1, 5, kTextTheta}, 2, 16384, 8);
+
+    failures += run_vision_packed_case();
+
+    // DFlash proposal consumes 2..16 tokens; context append uses the single-K form.
+    failures += run_pair_case({"35b dflash proposal", 128, 128, 1, 16, kTextTheta}, 32, 8, 262'128);
+    failures +=
+        run_single_case({"35b dflash context k", 128, 128, 1, 128, kTextTheta}, 8, 131'072, 16);
+
+    std::cout << "    rope profile worst max_abs=" << g_profile_measurement.max_abs
+              << " required_pair_rtol=" << g_profile_measurement.required_pair_rtol << " at "
+              << g_profile_measurement.label << " index=" << g_profile_measurement.index
+              << " | unified pair_rtol=" << kRopePointwisePairRtol << '\n';
+    std::cout << (failures == 0 ? "OK" : "FAIL") << " rope correctness\n";
+    return failures == 0 ? 0 : 1;
 }

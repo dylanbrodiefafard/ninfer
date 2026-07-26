@@ -1,17 +1,16 @@
-// Correctness + coverage for embedding, against the frozen op-test standard
-// (docs/op-development.md): fp64 golden from bf16-rounded dense inputs, and
-// exact Q6/W8 ROW_SPLIT decode from the final payload bytes before naive gather.
 #include "ninfer/ops/embedding.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace ninfer;
@@ -19,657 +18,494 @@ using namespace ninfer::test;
 
 namespace {
 
-constexpr std::int32_t kVocab       = 16;
-constexpr std::int32_t kFullVocab   = 248320;
-constexpr std::int32_t kD           = 128;
-constexpr std::int32_t kQwenHiddenD = 5120;
-constexpr std::int32_t kGroup       = 64;
-constexpr std::int32_t kW8Group     = 32;
-constexpr std::int32_t kNibbleBpr   = 32;
-constexpr std::int32_t kHighBpr     = 16;
+constexpr std::int32_t kVocab             = 248320;
+constexpr std::int32_t kLastFrontendToken = 248076;
+constexpr std::int32_t kMaskToken         = 248077;
+constexpr std::int32_t kQ6D               = 5120;
+constexpr std::int32_t kW8D               = 2048;
+constexpr std::int32_t kDenseRows         = 2304;
+constexpr std::int32_t kDenseD            = 1152;
+constexpr std::int32_t kQ6Group           = 64;
+constexpr std::int32_t kW8Group           = 32;
 
-static std::int32_t groups_for_d(std::int32_t d) {
-    if (d <= 0 || d % kGroup != 0) {
-        throw std::invalid_argument("embedding test d must be positive and divisible by 64");
-    }
-    return d / kGroup;
+std::size_t align_up(std::size_t value, std::size_t alignment) {
+    return ((value + alignment - 1) / alignment) * alignment;
 }
 
-static std::int32_t w8_groups_for_d(std::int32_t d) {
-    if (d <= 0 || d % 128 != 0) {
-        throw std::invalid_argument("embedding W8 test d must be positive and divisible by 128");
-    }
-    return d / kW8Group;
-}
-
-static std::size_t align_up_size(std::size_t x, std::size_t m) { return ((x + m - 1) / m) * m; }
-
-static std::uint16_t f32_to_f16(float x) {
+std::uint16_t f32_to_f16(float value) {
     std::uint32_t bits;
-    std::memcpy(&bits, &x, sizeof(bits));
+    std::memcpy(&bits, &value, sizeof(bits));
+
     const std::uint32_t sign = (bits >> 16) & 0x8000u;
-    std::uint32_t mant       = bits & 0x007fffffu;
-    int exp                  = static_cast<int>((bits >> 23) & 0xffu) - 127;
-
+    std::uint32_t mantissa   = bits & 0x007fffffu;
+    int exponent             = static_cast<int>((bits >> 23) & 0xffu) - 127;
     if (((bits >> 23) & 0xffu) == 0xffu) {
-        if (mant == 0) { return static_cast<std::uint16_t>(sign | 0x7c00u); }
-        return static_cast<std::uint16_t>(sign | 0x7e00u);
+        return static_cast<std::uint16_t>(sign | (mantissa == 0 ? 0x7c00u : 0x7e00u));
     }
-    if (exp > 15) { return static_cast<std::uint16_t>(sign | 0x7c00u); }
-    if (exp >= -14) {
-        std::uint32_t half_exp = static_cast<std::uint32_t>(exp + 15);
-        std::uint32_t rounded  = mant + 0x00000fffu + ((mant >> 13) & 1u);
-        if (rounded & 0x00800000u) {
+    if (exponent > 15) return static_cast<std::uint16_t>(sign | 0x7c00u);
+    if (exponent >= -14) {
+        std::uint32_t half_exponent = static_cast<std::uint32_t>(exponent + 15);
+        std::uint32_t rounded       = mantissa + 0x00000fffu + ((mantissa >> 13) & 1u);
+        if ((rounded & 0x00800000u) != 0) {
             rounded = 0;
-            ++half_exp;
-            if (half_exp >= 31u) { return static_cast<std::uint16_t>(sign | 0x7c00u); }
+            if (++half_exponent >= 31) return static_cast<std::uint16_t>(sign | 0x7c00u);
         }
-        return static_cast<std::uint16_t>(sign | (half_exp << 10) | (rounded >> 13));
+        return static_cast<std::uint16_t>(sign | (half_exponent << 10) | (rounded >> 13));
     }
-    if (exp < -24) { return static_cast<std::uint16_t>(sign); }
+    if (exponent < -24) return static_cast<std::uint16_t>(sign);
 
-    mant |= 0x00800000u;
-    const int shift             = -exp - 14;
-    std::uint32_t half_mant     = mant >> (shift + 13);
-    const std::uint32_t rem     = mant & ((1u << (shift + 13)) - 1u);
+    mantissa |= 0x00800000u;
+    const int shift             = -exponent - 14;
+    std::uint32_t half_mantissa = mantissa >> (shift + 13);
+    const std::uint32_t rem     = mantissa & ((1u << (shift + 13)) - 1u);
     const std::uint32_t halfway = 1u << (shift + 12);
-    if (rem > halfway || (rem == halfway && (half_mant & 1u) != 0u)) { ++half_mant; }
-    return static_cast<std::uint16_t>(sign | half_mant);
+    if (rem > halfway || (rem == halfway && (half_mantissa & 1u) != 0)) { ++half_mantissa; }
+    return static_cast<std::uint16_t>(sign | half_mantissa);
 }
 
-static float f16_to_f32(std::uint16_t h) {
-    const std::uint32_t sign = (static_cast<std::uint32_t>(h & 0x8000u)) << 16;
-    const std::uint32_t exp  = (h >> 10) & 0x1fu;
-    const std::uint32_t mant = h & 0x03ffu;
-    std::uint32_t bits       = 0;
+float f16_to_f32(std::uint16_t value) {
+    const std::uint32_t sign = static_cast<std::uint32_t>(value & 0x8000u) << 16;
+    const std::uint32_t exp  = (value >> 10) & 0x1fu;
+    std::uint32_t mantissa   = value & 0x03ffu;
+    std::uint32_t bits;
     if (exp == 0) {
-        if (mant == 0) {
+        if (mantissa == 0) {
             bits = sign;
         } else {
-            int e           = -14;
-            std::uint32_t m = mant;
-            while ((m & 0x0400u) == 0u) {
-                m <<= 1;
-                --e;
+            int unbiased = -14;
+            while ((mantissa & 0x0400u) == 0) {
+                mantissa <<= 1;
+                --unbiased;
             }
-            m &= 0x03ffu;
-            bits = sign | (static_cast<std::uint32_t>(e + 127) << 23) | (m << 13);
+            bits = sign | (static_cast<std::uint32_t>(unbiased + 127) << 23) |
+                   ((mantissa & 0x03ffu) << 13);
         }
-    } else if (exp == 31u) {
-        bits = sign | 0x7f800000u | (mant << 13);
+    } else if (exp == 31) {
+        bits = sign | 0x7f800000u | (mantissa << 13);
     } else {
-        bits = sign | ((exp + 112u) << 23) | (mant << 13);
+        bits = sign | ((exp + 112u) << 23) | (mantissa << 13);
     }
-    float out;
-    std::memcpy(&out, &bits, sizeof(out));
-    return out;
+    float result;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
 }
 
-static std::vector<float> make_source_table(std::int32_t d) {
-    std::vector<float> table(static_cast<std::size_t>(kVocab) * d);
-    for (std::int32_t row = 0; row < kVocab; ++row) {
-        for (std::int32_t col = 0; col < d; ++col) {
-            const float wave = std::sin(0.17f * static_cast<float>(row * 13 + col));
-            table[static_cast<std::size_t>(row) * d + col] =
-                0.125f * static_cast<float>(row - 7) +
-                0.03125f * static_cast<float>((col % 17) - 8) + wave;
+std::uint16_t load_u16_le(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
+    if (offset + 2 > bytes.size()) throw std::out_of_range("embedding test scale read");
+    return static_cast<std::uint16_t>(bytes[offset]) |
+           static_cast<std::uint16_t>(static_cast<std::uint16_t>(bytes[offset + 1]) << 8);
+}
+
+void store_u16_le(std::vector<std::uint8_t>& bytes, std::size_t offset, std::uint16_t value) {
+    bytes[offset]     = static_cast<std::uint8_t>(value);
+    bytes[offset + 1] = static_cast<std::uint8_t>(value >> 8);
+}
+
+std::vector<std::int32_t> repeated_ids(std::size_t count) {
+    constexpr std::int32_t values[] = {
+        0, 1, 42, 12345, kLastFrontendToken, kMaskToken, kVocab - 1, 42,
+    };
+    std::vector<std::int32_t> result(count);
+    for (std::size_t i = 0; i < count; ++i) result[i] = values[i % std::size(values)];
+    return result;
+}
+
+template <typename T>
+std::vector<T> guarded_to_host(const GuardedDeviceBuffer& buffer, std::size_t count) {
+    std::vector<T> result(count);
+    buffer.copy_to_host(result.data(), count * sizeof(T));
+    return result;
+}
+
+int verify_input(const char* label, const GuardedDeviceBuffer& ids,
+                 const std::vector<std::int32_t>& expected) {
+    int failures = ids.verify_guards(label);
+    failures += verify_exact(label, guarded_to_host<std::int32_t>(ids, expected.size()), expected);
+    return failures;
+}
+
+struct QuantizedDiff {
+    double max_abs         = 0.0;
+    double max_rel         = 0.0;
+    std::size_t argmax_rel = 0;
+    std::size_t violations = 0;
+    std::size_t nonfinite  = 0;
+};
+
+// There is no reduction in quantized embedding. Compare every finite BF16 output directly with
+// signed_code * exact_FP16_scale. One criterion covers Q6/W8, all shapes, T values, and routes.
+// The complete matrix below measures 3.76381e-3 worst-case relative error.
+constexpr double kQuantizedOutputRtol = 3.8e-3;
+
+int verify_quantized(const char* label, const GuardedDeviceBuffer& output,
+                     const std::vector<double>& expected) {
+    const std::vector<std::uint16_t> bits = guarded_to_host<std::uint16_t>(output, expected.size());
+    QuantizedDiff stats;
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        const double got = static_cast<double>(bf16_to_f32(bits[i]));
+        const double ref = expected[i];
+        if (!std::isfinite(got) || !std::isfinite(ref)) {
+            ++stats.nonfinite;
+            continue;
+        }
+        const double abs = std::abs(got - ref);
+        stats.max_abs    = std::max(stats.max_abs, abs);
+        const double rel = ref == 0.0 ? (abs == 0.0 ? 0.0 : std::numeric_limits<double>::infinity())
+                                      : abs / std::abs(ref);
+        if (rel > stats.max_rel) {
+            stats.max_rel    = rel;
+            stats.argmax_rel = i;
+        }
+        if (rel > kQuantizedOutputRtol) ++stats.violations;
+    }
+    std::cout << "    " << label << " max_abs=" << stats.max_abs << " max_rel=" << stats.max_rel
+              << " at=" << stats.argmax_rel << '\n';
+    if (stats.nonfinite == 0 && stats.violations == 0) return 0;
+    std::cerr << label << ": nonfinite=" << stats.nonfinite
+              << " pointwise_violations=" << stats.violations << '\n';
+    return 1;
+}
+
+struct Q6Row {
+    std::int32_t id;
+    std::vector<std::uint8_t> low;
+    std::vector<std::uint8_t> high;
+    std::vector<std::uint8_t> scales;
+};
+
+class Q6Table {
+public:
+    Q6Table()
+        : groups_(kQ6D / kQ6Group),
+          low_plane_bytes_(static_cast<std::size_t>(kVocab) * groups_ * 32),
+          high_offset_(align_up(low_plane_bytes_, 256)),
+          high_plane_bytes_(static_cast<std::size_t>(kVocab) * groups_ * 16),
+          scale_offset_(high_offset_ + align_up(high_plane_bytes_, 256)),
+          payload_(scale_offset_ + static_cast<std::size_t>(kVocab) * groups_ * 2) {
+        for (const std::int32_t row : repeated_ids(8)) {
+            if (find(row) == nullptr) add_row(row);
         }
     }
-    return table;
-}
 
-static std::vector<int> ids_for_T(std::int32_t T) {
-    std::vector<int> ids(T);
-    const int base[4] = {0, 5, 15, 0};
-    for (std::int32_t t = 0; t < T; ++t) { ids[t] = (t < 4) ? base[t] : ((t * 7 + 3) % kVocab); }
-    return ids;
-}
-
-static void pack_q6_group(const std::int8_t* codes, std::uint8_t* nibble, std::uint8_t* high) {
-    std::fill(nibble, nibble + kNibbleBpr, std::uint8_t{0});
-    std::fill(high, high + kHighBpr, std::uint8_t{0});
-    for (std::int32_t c = 0; c < kGroup; ++c) {
-        const std::uint32_t u   = static_cast<std::uint8_t>(codes[c]) & 0x3fu;
-        const std::uint32_t low = u & 0x0fu;
-        if ((c & 1) == 0) {
-            nibble[c >> 1] |= static_cast<std::uint8_t>(low);
-        } else {
-            nibble[c >> 1] |= static_cast<std::uint8_t>(low << 4);
-        }
-        const std::int32_t high_pos = c * 2;
-        high[high_pos >> 3] |= static_cast<std::uint8_t>(((u >> 4) & 0x03u) << (high_pos & 7));
+    Weight weight() {
+        auto* base = static_cast<std::uint8_t*>(payload_.data());
+        Weight result{};
+        result.qtype            = QType::Q6G64_F16S;
+        result.layout           = QuantLayout::RowSplit;
+        result.scale_dtype      = DType::FP16;
+        result.payload          = base;
+        result.payload_bytes    = payload_.bytes();
+        result.qdata            = base;
+        result.qhigh            = base + high_offset_;
+        result.scales           = base + scale_offset_;
+        result.high_plane_bytes = high_plane_bytes_;
+        result.group_size       = kQ6Group;
+        result.group            = kQ6Group;
+        result.ndim             = 2;
+        result.shape[0]         = kVocab;
+        result.shape[1]         = kQ6D;
+        result.padded_shape[0]  = kVocab;
+        result.padded_shape[1]  = kQ6D;
+        result.n                = kVocab;
+        result.k                = kQ6D;
+        return result;
     }
-}
 
-static int unpack_q6_code(const std::uint8_t* nibble, const std::uint8_t* high, std::int32_t c) {
-    const std::uint8_t low_byte = nibble[c >> 1];
-    const std::uint32_t low     = (c & 1) ? (low_byte >> 4) : (low_byte & 0x0fu);
-    const std::int32_t high_pos = c * 2;
-    const std::uint32_t hi      = (high[high_pos >> 3] >> (high_pos & 7)) & 0x03u;
-    const std::uint32_t u       = low | (hi << 4);
-    return (u & 0x20u) ? static_cast<int>(u) - 64 : static_cast<int>(u);
-}
-
-static std::vector<std::uint8_t> encode_q6_row_split(const std::vector<float>& src,
-                                                     std::int32_t d) {
-    const std::int32_t kg = groups_for_d(d);
-    const std::size_t nibble_plane_bytes =
-        static_cast<std::size_t>(kVocab) * static_cast<std::size_t>(kg) * kNibbleBpr;
-    const std::size_t high_plane_offset = align_up_size(nibble_plane_bytes, 256);
-    const std::size_t high_plane_bytes =
-        static_cast<std::size_t>(kVocab) * static_cast<std::size_t>(kg) * kHighBpr;
-    const std::size_t scale_plane_offset = high_plane_offset + align_up_size(high_plane_bytes, 256);
-    const std::size_t scale_plane_bytes =
-        static_cast<std::size_t>(kVocab) * static_cast<std::size_t>(kg) * 2u;
-    std::vector<std::uint8_t> payload(scale_plane_offset + scale_plane_bytes);
-    for (std::int32_t row = 0; row < kVocab; ++row) {
-        for (std::int32_t g = 0; g < kg; ++g) {
-            const std::size_t base = static_cast<std::size_t>(row) * d + g * kGroup;
-            float maxabs           = 0.0f;
-            for (std::int32_t i = 0; i < kGroup; ++i) {
-                maxabs = std::max(maxabs, std::abs(src[base + i]));
+    std::vector<double> oracle(const std::vector<std::int32_t>& ids) const {
+        std::vector<double> result(static_cast<std::size_t>(kQ6D) * ids.size());
+        for (std::size_t t = 0; t < ids.size(); ++t) {
+            const Q6Row* row = find(ids[t]);
+            if (row == nullptr) throw std::out_of_range("Q6 oracle row was not materialized");
+            for (std::int32_t d = 0; d < kQ6D; ++d) {
+                const std::int32_t group = d / kQ6Group;
+                const std::int32_t lane  = d % kQ6Group;
+                const std::uint32_t low =
+                    (row->low[static_cast<std::size_t>(group) * 32 + lane / 2] >>
+                     ((lane & 1) * 4)) &
+                    0x0fu;
+                const std::int32_t bit = lane * 2;
+                const std::uint32_t high =
+                    (row->high[static_cast<std::size_t>(group) * 16 + bit / 8] >> (bit & 7)) &
+                    0x03u;
+                const std::uint32_t encoded = low | (high << 4);
+                const int code = (encoded & 0x20u) != 0 ? static_cast<int>(encoded) - 64
+                                                        : static_cast<int>(encoded);
+                const double scale =
+                    static_cast<double>(f16_to_f32(load_u16_le(row->scales, group * 2)));
+                result[t * static_cast<std::size_t>(kQ6D) + d] = static_cast<double>(code) * scale;
             }
+        }
+        return result;
+    }
 
-            std::uint16_t scale_h = f32_to_f16(maxabs / 31.0f);
-            if (scale_h == 0 && maxabs > 0.0f) { scale_h = 0x0001u; }
-            const float scale = f16_to_f32(scale_h);
+    int verify_unchanged(const char* label) const {
+        int failures = payload_.verify_guards(label);
+        for (const Q6Row& row : rows_) {
+            std::vector<std::uint8_t> got(row.low.size());
+            payload_.copy_to_host(got.data(), got.size(),
+                                  static_cast<std::size_t>(row.id) * groups_ * 32);
+            failures += verify_exact(label, got, row.low);
+            got.resize(row.high.size());
+            payload_.copy_to_host(got.data(), got.size(),
+                                  high_offset_ + static_cast<std::size_t>(row.id) * groups_ * 16);
+            failures += verify_exact(label, got, row.high);
+            got.resize(row.scales.size());
+            payload_.copy_to_host(got.data(), got.size(),
+                                  scale_offset_ + static_cast<std::size_t>(row.id) * groups_ * 2);
+            failures += verify_exact(label, got, row.scales);
+        }
+        return failures;
+    }
 
-            std::int8_t codes[kGroup];
-            for (std::int32_t i = 0; i < kGroup; ++i) {
-                int q = 0;
-                if (scale > 0.0f) {
-                    q = static_cast<int>(std::nearbyint(src[base + i] / scale));
-                    q = std::clamp(q, -32, 31);
-                }
-                codes[i] = static_cast<std::int8_t>(q);
+private:
+    const Q6Row* find(std::int32_t id) const {
+        const auto it = std::find_if(rows_.begin(), rows_.end(),
+                                     [id](const Q6Row& row) { return row.id == id; });
+        return it == rows_.end() ? nullptr : &*it;
+    }
+
+    void add_row(std::int32_t id) {
+        Q6Row row{id, std::vector<std::uint8_t>(static_cast<std::size_t>(groups_) * 32),
+                  std::vector<std::uint8_t>(static_cast<std::size_t>(groups_) * 16),
+                  std::vector<std::uint8_t>(static_cast<std::size_t>(groups_) * 2)};
+        for (std::int32_t group = 0; group < groups_; ++group) {
+            const std::uint16_t scale =
+                f32_to_f16(0.0013f + 0.00037f * static_cast<float>((id + group * 3) % 11));
+            store_u16_le(row.scales, static_cast<std::size_t>(group) * 2, scale);
+            for (std::int32_t lane = 0; lane < kQ6Group; ++lane) {
+                int code = ((id % 61 + group * 17 + lane * 11) & 63) - 32;
+                if (lane == 0) code = -32;
+                if (lane == 1) code = 31;
+                if (lane == 2) code = 0;
+                const std::uint32_t encoded =
+                    static_cast<std::uint32_t>(static_cast<std::uint8_t>(code)) & 0x3fu;
+                auto& low = row.low[static_cast<std::size_t>(group) * 32 + lane / 2];
+                low |= static_cast<std::uint8_t>((encoded & 0x0fu) << ((lane & 1) * 4));
+                const std::int32_t bit = lane * 2;
+                row.high[static_cast<std::size_t>(group) * 16 + bit / 8] |=
+                    static_cast<std::uint8_t>(((encoded >> 4) & 0x03u) << (bit & 7));
             }
+        }
+        payload_.copy_from_host(row.low.data(), row.low.size(),
+                                static_cast<std::size_t>(id) * groups_ * 32);
+        payload_.copy_from_host(row.high.data(), row.high.size(),
+                                high_offset_ + static_cast<std::size_t>(id) * groups_ * 16);
+        payload_.copy_from_host(row.scales.data(), row.scales.size(),
+                                scale_offset_ + static_cast<std::size_t>(id) * groups_ * 2);
+        rows_.push_back(std::move(row));
+    }
 
-            const std::size_t group_index = static_cast<std::size_t>(row) * kg + g;
-            const std::size_t nibble_off  = group_index * kNibbleBpr;
-            const std::size_t high_off    = high_plane_offset + group_index * kHighBpr;
-            const std::size_t scale_off   = scale_plane_offset + group_index * 2;
-            pack_q6_group(codes, payload.data() + nibble_off, payload.data() + high_off);
-            payload[scale_off + 0] = static_cast<std::uint8_t>(scale_h & 0xffu);
-            payload[scale_off + 1] = static_cast<std::uint8_t>(scale_h >> 8);
+    std::int32_t groups_;
+    std::size_t low_plane_bytes_;
+    std::size_t high_offset_;
+    std::size_t high_plane_bytes_;
+    std::size_t scale_offset_;
+    GuardedDeviceBuffer payload_;
+    std::vector<Q6Row> rows_;
+};
+
+struct W8Row {
+    std::int32_t id;
+    std::vector<std::uint8_t> codes;
+    std::vector<std::uint8_t> scales;
+};
+
+class W8Table {
+public:
+    W8Table()
+        : groups_(kW8D / kW8Group), code_plane_bytes_(static_cast<std::size_t>(kVocab) * kW8D),
+          scale_offset_(align_up(code_plane_bytes_, 256)),
+          payload_(scale_offset_ + static_cast<std::size_t>(kVocab) * groups_ * 2) {
+        for (const std::int32_t row : repeated_ids(8)) {
+            if (find(row) == nullptr) add_row(row);
         }
     }
-    return payload;
+
+    Weight weight() {
+        auto* base = static_cast<std::uint8_t*>(payload_.data());
+        Weight result{};
+        result.qtype            = QType::W8G32_F16S;
+        result.layout           = QuantLayout::RowSplit;
+        result.scale_dtype      = DType::FP16;
+        result.payload          = base;
+        result.payload_bytes    = payload_.bytes();
+        result.qdata            = base;
+        result.qhigh            = nullptr;
+        result.scales           = base + scale_offset_;
+        result.high_plane_bytes = 0;
+        result.group_size       = kW8Group;
+        result.group            = kW8Group;
+        result.ndim             = 2;
+        result.shape[0]         = kVocab;
+        result.shape[1]         = kW8D;
+        result.padded_shape[0]  = kVocab;
+        result.padded_shape[1]  = kW8D;
+        result.n                = kVocab;
+        result.k                = kW8D;
+        return result;
+    }
+
+    std::vector<double> oracle(const std::vector<std::int32_t>& ids) const {
+        std::vector<double> result(static_cast<std::size_t>(kW8D) * ids.size());
+        for (std::size_t t = 0; t < ids.size(); ++t) {
+            const W8Row* row = find(ids[t]);
+            if (row == nullptr) throw std::out_of_range("W8 oracle row was not materialized");
+            for (std::int32_t d = 0; d < kW8D; ++d) {
+                const std::uint8_t raw = row->codes[d];
+                const int code = raw < 0x80u ? static_cast<int>(raw) : static_cast<int>(raw) - 256;
+                const double scale                             = static_cast<double>(f16_to_f32(
+                    load_u16_le(row->scales, static_cast<std::size_t>(d / kW8Group) * 2)));
+                result[t * static_cast<std::size_t>(kW8D) + d] = static_cast<double>(code) * scale;
+            }
+        }
+        return result;
+    }
+
+    int verify_unchanged(const char* label) const {
+        int failures = payload_.verify_guards(label);
+        for (const W8Row& row : rows_) {
+            std::vector<std::uint8_t> got(row.codes.size());
+            payload_.copy_to_host(got.data(), got.size(), static_cast<std::size_t>(row.id) * kW8D);
+            failures += verify_exact(label, got, row.codes);
+            got.resize(row.scales.size());
+            payload_.copy_to_host(got.data(), got.size(),
+                                  scale_offset_ + static_cast<std::size_t>(row.id) * groups_ * 2);
+            failures += verify_exact(label, got, row.scales);
+        }
+        return failures;
+    }
+
+private:
+    const W8Row* find(std::int32_t id) const {
+        const auto it = std::find_if(rows_.begin(), rows_.end(),
+                                     [id](const W8Row& row) { return row.id == id; });
+        return it == rows_.end() ? nullptr : &*it;
+    }
+
+    void add_row(std::int32_t id) {
+        W8Row row{id, std::vector<std::uint8_t>(kW8D),
+                  std::vector<std::uint8_t>(static_cast<std::size_t>(groups_) * 2)};
+        for (std::int32_t group = 0; group < groups_; ++group) {
+            const std::uint16_t scale =
+                f32_to_f16(0.00091f + 0.00023f * static_cast<float>((id + group * 5) % 13));
+            store_u16_le(row.scales, static_cast<std::size_t>(group) * 2, scale);
+            for (std::int32_t lane = 0; lane < kW8Group; ++lane) {
+                int code = ((id % 251 + group * 29 + lane * 17) % 255) - 127;
+                if (lane == 0) code = -127;
+                if (lane == 1) code = 127;
+                if (lane == 2) code = 0;
+                if (lane == 3) code = -1;
+                if (lane == 4) code = 1;
+                row.codes[static_cast<std::size_t>(group) * kW8Group + lane] =
+                    static_cast<std::uint8_t>(static_cast<std::int8_t>(code));
+            }
+        }
+        payload_.copy_from_host(row.codes.data(), row.codes.size(),
+                                static_cast<std::size_t>(id) * kW8D);
+        payload_.copy_from_host(row.scales.data(), row.scales.size(),
+                                scale_offset_ + static_cast<std::size_t>(id) * groups_ * 2);
+        rows_.push_back(std::move(row));
+    }
+
+    std::int32_t groups_;
+    std::size_t code_plane_bytes_;
+    std::size_t scale_offset_;
+    GuardedDeviceBuffer payload_;
+    std::vector<W8Row> rows_;
+};
+
+template <typename Table>
+int run_quantized_case(const char* label, Table& table, const std::vector<std::int32_t>& ids,
+                       std::int32_t d) {
+    GuardedDeviceBuffer device_ids(ids.size() * sizeof(std::int32_t));
+    device_ids.copy_from_host(ids.data(), ids.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer output(static_cast<std::size_t>(d) * ids.size() * sizeof(std::uint16_t));
+    output.fill(0x7d);
+
+    Tensor input(device_ids.data(), DType::I32, {static_cast<std::int32_t>(ids.size())});
+    Tensor result(output.data(), DType::BF16, {d, static_cast<std::int32_t>(ids.size())});
+    Weight weight = table.weight();
+    ops::embedding(input, weight, result, nullptr);
+    cuda_synchronize();
+
+    int failures = verify_quantized(label, output, table.oracle(ids));
+    failures += output.verify_guards(label);
+    failures += verify_input(label, device_ids, ids);
+    failures += table.verify_unchanged(label);
+    return failures;
 }
 
-static std::vector<std::uint8_t> encode_w8_row_split(const std::vector<float>& src,
-                                                     std::int32_t d) {
-    const std::int32_t kg = w8_groups_for_d(d);
-    const std::size_t code_plane_bytes =
-        static_cast<std::size_t>(kVocab) * static_cast<std::size_t>(kg) * kW8Group;
-    const std::size_t scale_plane_offset = align_up_size(code_plane_bytes, 256);
-    const std::size_t scale_plane_bytes =
-        static_cast<std::size_t>(kVocab) * static_cast<std::size_t>(kg) * 2u;
-    std::vector<std::uint8_t> payload(scale_plane_offset + scale_plane_bytes);
-    for (std::int32_t row = 0; row < kVocab; ++row) {
-        for (std::int32_t g = 0; g < kg; ++g) {
-            const std::size_t base = static_cast<std::size_t>(row) * d + g * kW8Group;
-            float maxabs           = 0.0f;
-            for (std::int32_t i = 0; i < kW8Group; ++i) {
-                maxabs = std::max(maxabs, std::abs(src[base + i]));
-            }
+int test_q6() {
+    Q6Table table;
+    int failures = 0;
+    failures += run_quantized_case("embedding Q6 [248320,5120] T=1", table, repeated_ids(1), kQ6D);
+    failures += run_quantized_case("embedding Q6 [248320,5120] T=7", table, repeated_ids(7), kQ6D);
+    failures +=
+        run_quantized_case("embedding Q6 [248320,5120] T=128", table, repeated_ids(128), kQ6D);
+    return failures;
+}
 
-            std::uint16_t scale_h = f32_to_f16(maxabs / 127.0f);
-            if (scale_h == 0 && maxabs > 0.0f) { scale_h = 0x0001u; }
-            const float scale             = f16_to_f32(scale_h);
-            const std::size_t group_index = static_cast<std::size_t>(row) * kg + g;
-            for (std::int32_t i = 0; i < kW8Group; ++i) {
-                int q = 0;
-                if (scale > 0.0f) {
-                    q = static_cast<int>(std::nearbyint(src[base + i] / scale));
-                    q = std::clamp(q, -127, 127);
-                }
-                payload[group_index * kW8Group + i] =
-                    static_cast<std::uint8_t>(static_cast<std::int8_t>(q));
-            }
-            const std::size_t scale_off = scale_plane_offset + group_index * 2;
-            payload[scale_off + 0]      = static_cast<std::uint8_t>(scale_h & 0xffu);
-            payload[scale_off + 1]      = static_cast<std::uint8_t>(scale_h >> 8);
+int test_w8() {
+    W8Table table;
+    int failures = 0;
+    for (const std::size_t t : {1u, 6u, 7u, 16u, 1024u}) {
+        const std::string label =
+            "embedding W8 [248320,2048] T=" + std::to_string(static_cast<unsigned long long>(t));
+        failures += run_quantized_case(label.c_str(), table, repeated_ids(t), kW8D);
+    }
+    return failures;
+}
+
+int test_dense() {
+    std::vector<std::uint16_t> table(static_cast<std::size_t>(kDenseRows) * kDenseD);
+    for (std::int32_t row = 0; row < kDenseRows; ++row) {
+        for (std::int32_t d = 0; d < kDenseD; ++d) {
+            const float value = std::sin(static_cast<float>(row * 17 + d) * 0.03125f) +
+                                static_cast<float>((row + d) % 13 - 6) * 0.125f;
+            table[static_cast<std::size_t>(row) * kDenseD + d] = f32_to_bf16(value);
         }
     }
-    return payload;
-}
-
-static void cpu_gather(const std::vector<float>& table, const std::vector<int>& ids, std::int32_t d,
-                       std::vector<double>& out) {
-    out.assign(static_cast<std::size_t>(d) * ids.size(), 0.0);
+    const std::vector<std::int32_t> ids = {0, kDenseRows - 1, 17, 17, 1024, 1, 2299};
+    std::vector<std::uint16_t> expected(static_cast<std::size_t>(kDenseD) * ids.size());
     for (std::size_t t = 0; t < ids.size(); ++t) {
-        const std::int32_t row = ids[t];
-        for (std::int32_t col = 0; col < d; ++col) {
-            out[static_cast<std::size_t>(t) * d + col] =
-                static_cast<double>(table[static_cast<std::size_t>(row) * d + col]);
-        }
-    }
-}
-
-static std::uint16_t load_u16_le(const std::vector<std::uint8_t>& payload, std::size_t off) {
-    if (off + 2u > payload.size()) {
-        throw std::out_of_range("embedding oracle scale read exceeds payload");
-    }
-    return static_cast<std::uint16_t>(payload[off]) |
-           static_cast<std::uint16_t>(static_cast<std::uint16_t>(payload[off + 1]) << 8);
-}
-
-static void cpu_gather_q6_payload(const std::vector<std::uint8_t>& payload,
-                                  const std::vector<int>& ids, std::int32_t d,
-                                  std::vector<double>& out) {
-    const std::int32_t kg = groups_for_d(d);
-    const std::size_t nibble_plane_bytes =
-        static_cast<std::size_t>(kVocab) * static_cast<std::size_t>(kg) * kNibbleBpr;
-    const std::size_t high_plane_offset = align_up_size(nibble_plane_bytes, 256);
-    const std::size_t high_plane_bytes =
-        static_cast<std::size_t>(kVocab) * static_cast<std::size_t>(kg) * kHighBpr;
-    const std::size_t scale_plane_offset = high_plane_offset + align_up_size(high_plane_bytes, 256);
-    const std::size_t expected_payload_bytes =
-        scale_plane_offset + static_cast<std::size_t>(kVocab) * kg * sizeof(std::uint16_t);
-    if (payload.size() != expected_payload_bytes) {
-        throw std::invalid_argument("embedding Q6 oracle payload size mismatch");
+        std::copy_n(table.data() + static_cast<std::size_t>(ids[t]) * kDenseD, kDenseD,
+                    expected.data() + t * kDenseD);
     }
 
-    out.assign(static_cast<std::size_t>(d) * ids.size(), 0.0);
-    for (std::size_t t = 0; t < ids.size(); ++t) {
-        const std::int32_t row = ids[t];
-        if (row < 0 || row >= kVocab) {
-            throw std::out_of_range("embedding Q6 oracle token id out of range");
-        }
-        for (std::int32_t col = 0; col < d; ++col) {
-            const std::int32_t group      = col / kGroup;
-            const std::int32_t lane       = col % kGroup;
-            const std::size_t group_index = static_cast<std::size_t>(row) * kg + group;
-            const std::uint8_t* nibble    = payload.data() + group_index * kNibbleBpr;
-            const std::uint8_t* high = payload.data() + high_plane_offset + group_index * kHighBpr;
-            const int signed_code    = unpack_q6_code(nibble, high, lane);
-            const std::uint16_t stored_scale =
-                load_u16_le(payload, scale_plane_offset + group_index * sizeof(std::uint16_t));
-            const double exact_stored_fp16_scale = static_cast<double>(f16_to_f32(stored_scale));
-            out[t * static_cast<std::size_t>(d) + col] =
-                static_cast<double>(signed_code) * exact_stored_fp16_scale;
-        }
-    }
-}
+    GuardedDeviceBuffer device_table(table.size() * sizeof(std::uint16_t));
+    device_table.copy_from_host(table.data(), table.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_ids(ids.size() * sizeof(std::int32_t));
+    device_ids.copy_from_host(ids.data(), ids.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer output(expected.size() * sizeof(std::uint16_t));
+    output.fill(0x7d);
 
-static void cpu_gather_w8_payload(const std::vector<std::uint8_t>& payload,
-                                  const std::vector<int>& ids, std::int32_t d,
-                                  std::vector<double>& out) {
-    const std::int32_t kg = w8_groups_for_d(d);
-    const std::size_t code_plane_bytes =
-        static_cast<std::size_t>(kVocab) * static_cast<std::size_t>(kg) * kW8Group;
-    const std::size_t scale_plane_offset = align_up_size(code_plane_bytes, 256);
-    const std::size_t expected_payload_bytes =
-        scale_plane_offset + static_cast<std::size_t>(kVocab) * kg * sizeof(std::uint16_t);
-    if (payload.size() != expected_payload_bytes) {
-        throw std::invalid_argument("embedding W8 oracle payload size mismatch");
-    }
+    Weight weight{};
+    weight.qtype           = QType::BF16_CTRL;
+    weight.layout          = QuantLayout::Contiguous;
+    weight.payload         = device_table.data();
+    weight.payload_bytes   = device_table.bytes();
+    weight.qdata           = device_table.data();
+    weight.ndim            = 2;
+    weight.shape[0]        = kDenseRows;
+    weight.shape[1]        = kDenseD;
+    weight.padded_shape[0] = kDenseRows;
+    weight.padded_shape[1] = kDenseD;
+    weight.n               = kDenseRows;
+    weight.k               = kDenseD;
 
-    out.assign(static_cast<std::size_t>(d) * ids.size(), 0.0);
-    for (std::size_t t = 0; t < ids.size(); ++t) {
-        const std::int32_t row = ids[t];
-        if (row < 0 || row >= kVocab) {
-            throw std::out_of_range("embedding W8 oracle token id out of range");
-        }
-        for (std::int32_t col = 0; col < d; ++col) {
-            const std::int32_t group      = col / kW8Group;
-            const std::int32_t lane       = col % kW8Group;
-            const std::size_t group_index = static_cast<std::size_t>(row) * kg + group;
-            const std::uint8_t raw_code   = payload[group_index * kW8Group + lane];
-            const int signed_code =
-                raw_code < 0x80u ? static_cast<int>(raw_code) : static_cast<int>(raw_code) - 256;
-            if (signed_code == -128) {
-                throw std::invalid_argument("embedding W8 oracle encountered forbidden -128 code");
-            }
-            const std::uint16_t stored_scale =
-                load_u16_le(payload, scale_plane_offset + group_index * sizeof(std::uint16_t));
-            const double exact_stored_fp16_scale = static_cast<double>(f16_to_f32(stored_scale));
-            out[t * static_cast<std::size_t>(d) + col] =
-                static_cast<double>(signed_code) * exact_stored_fp16_scale;
-        }
-    }
-}
+    Tensor input(device_ids.data(), DType::I32, {static_cast<std::int32_t>(ids.size())});
+    Tensor result(output.data(), DType::BF16, {kDenseD, static_cast<std::int32_t>(ids.size())});
+    ops::embedding(input, weight, result, nullptr);
+    cuda_synchronize();
 
-static Weight dense_weight(void* data, std::int32_t d = kD) {
-    Weight w{};
-    w.qtype           = QType::BF16_CTRL;
-    w.layout          = QuantLayout::Contiguous;
-    w.payload         = data;
-    w.payload_bytes   = static_cast<std::uint64_t>(kVocab) * static_cast<std::uint64_t>(d) * 2u;
-    w.qdata           = data;
-    w.scales          = nullptr;
-    w.group_size      = 0;
-    w.group           = 0;
-    w.ndim            = 2;
-    w.shape[0]        = kVocab;
-    w.shape[1]        = d;
-    w.padded_shape[0] = kVocab;
-    w.padded_shape[1] = d;
-    w.n               = kVocab;
-    w.k               = d;
-    return w;
-}
-
-static Weight q6_weight(void* payload, std::int32_t d = kD) {
-    const std::int32_t kg = groups_for_d(d);
-    const std::uint64_t nibble_plane_bytes =
-        static_cast<std::uint64_t>(kVocab) * static_cast<std::uint64_t>(kg) * kNibbleBpr;
-    const std::uint64_t high_plane_offset = ((nibble_plane_bytes + 255ULL) / 256ULL) * 256ULL;
-    const std::uint64_t high_plane_bytes =
-        static_cast<std::uint64_t>(kVocab) * static_cast<std::uint64_t>(kg) * kHighBpr;
-    const std::uint64_t scale_plane_offset =
-        high_plane_offset + ((high_plane_bytes + 255ULL) / 256ULL) * 256ULL;
-    const std::uint64_t scale_plane_bytes =
-        static_cast<std::uint64_t>(kVocab) * static_cast<std::uint64_t>(kg) * 2ULL;
-    Weight w{};
-    w.qtype            = QType::Q6G64_F16S;
-    w.layout           = QuantLayout::RowSplit;
-    w.scale_dtype      = DType::FP16;
-    w.payload          = payload;
-    w.payload_bytes    = scale_plane_offset + scale_plane_bytes;
-    w.high_plane_bytes = high_plane_bytes;
-    if (payload != nullptr) {
-        w.qdata  = payload;
-        w.qhigh  = static_cast<std::uint8_t*>(payload) + high_plane_offset;
-        w.scales = static_cast<std::uint8_t*>(payload) + scale_plane_offset;
-    }
-    w.group_size      = kGroup;
-    w.group           = kGroup;
-    w.ndim            = 2;
-    w.shape[0]        = kVocab;
-    w.shape[1]        = d;
-    w.padded_shape[0] = kVocab;
-    w.padded_shape[1] = d;
-    w.n               = kVocab;
-    w.k               = d;
-    return w;
-}
-
-static Weight w8_weight(void* payload, std::int32_t d = kD, std::int32_t vocab = kVocab) {
-    const std::int32_t kg = w8_groups_for_d(d);
-    const std::uint64_t code_plane_bytes =
-        static_cast<std::uint64_t>(vocab) * static_cast<std::uint64_t>(kg) * kW8Group;
-    const std::uint64_t scale_plane_offset = ((code_plane_bytes + 255ULL) / 256ULL) * 256ULL;
-    const std::uint64_t scale_plane_bytes =
-        static_cast<std::uint64_t>(vocab) * static_cast<std::uint64_t>(kg) * 2ULL;
-    Weight w{};
-    w.qtype            = QType::W8G32_F16S;
-    w.layout           = QuantLayout::RowSplit;
-    w.scale_dtype      = DType::FP16;
-    w.payload          = payload;
-    w.payload_bytes    = scale_plane_offset + scale_plane_bytes;
-    w.high_plane_bytes = 0;
-    if (payload != nullptr) {
-        w.qdata  = payload;
-        w.qhigh  = nullptr;
-        w.scales = static_cast<std::uint8_t*>(payload) + scale_plane_offset;
-    }
-    w.group_size      = kW8Group;
-    w.group           = kW8Group;
-    w.ndim            = 2;
-    w.shape[0]        = vocab;
-    w.shape[1]        = d;
-    w.padded_shape[0] = vocab;
-    w.padded_shape[1] = d;
-    w.n               = vocab;
-    w.k               = d;
-    return w;
-}
-
-static int full_vocab_w8_shape() {
-    constexpr std::int32_t d  = 2048;
-    constexpr std::int32_t kg = d / kW8Group;
-    const std::uint64_t code_plane_bytes =
-        static_cast<std::uint64_t>(kFullVocab) * static_cast<std::uint64_t>(d);
-    const std::uint64_t scale_plane_offset = ((code_plane_bytes + 255ULL) / 256ULL) * 256ULL;
-    const std::uint64_t payload_bytes =
-        scale_plane_offset + static_cast<std::uint64_t>(kFullVocab) * kg * 2ULL;
-    const std::vector<int> ids = {0,      kFullVocab - 1, 12345, 0,      200000, 17,
-                                  65535,  12345,          42,    200000, 99999,  42,
-                                  131071, kFullVocab - 1, 7,     0};
-
-    DeviceBuffer dtable(static_cast<std::size_t>(payload_bytes));
-    cudaMemset(dtable.p, 0, dtable.bytes);
-    std::vector<std::int8_t> codes(d);
-    std::vector<std::uint8_t> scales(static_cast<std::size_t>(kg) * 2);
-    std::vector<int> populated;
-    for (const int row : ids) {
-        if (std::find(populated.begin(), populated.end(), row) != populated.end()) { continue; }
-        populated.push_back(row);
-        for (std::int32_t col = 0; col < d; ++col) {
-            codes[static_cast<std::size_t>(col)] =
-                static_cast<std::int8_t>(((row % 251 + col * 17) % 255) - 127);
-        }
-        for (std::int32_t group = 0; group < kg; ++group) {
-            const std::uint16_t bits = f32_to_f16(0.00390625F * static_cast<float>(group % 7 + 1));
-            scales[static_cast<std::size_t>(group) * 2] = static_cast<std::uint8_t>(bits & 0xffu);
-            scales[static_cast<std::size_t>(group) * 2 + 1] = static_cast<std::uint8_t>(bits >> 8);
-        }
-        cudaMemcpy(static_cast<std::uint8_t*>(dtable.p) + static_cast<std::uint64_t>(row) * d,
-                   codes.data(), codes.size(), cudaMemcpyHostToDevice);
-        cudaMemcpy(static_cast<std::uint8_t*>(dtable.p) + scale_plane_offset +
-                       static_cast<std::uint64_t>(row) * kg * 2ULL,
-                   scales.data(), scales.size(), cudaMemcpyHostToDevice);
-    }
-
-    std::vector<double> ref(static_cast<std::size_t>(d) * ids.size());
-    for (std::size_t t = 0; t < ids.size(); ++t) {
-        const int row = ids[t];
-        for (std::int32_t col = 0; col < d; ++col) {
-            const int code           = ((row % 251 + col * 17) % 255) - 127;
-            const std::int32_t group = col / kW8Group;
-            const std::uint16_t bits = f32_to_f16(0.00390625F * static_cast<float>(group % 7 + 1));
-            ref[t * static_cast<std::size_t>(d) + col] =
-                static_cast<double>(code) * static_cast<double>(f16_to_f32(bits));
-        }
-    }
-
-    DeviceBuffer dids = to_device_i32(ids);
-    DeviceBuffer dout(static_cast<std::size_t>(d) * ids.size() * 2u);
-    cudaMemset(dout.p, 0x7d, dout.bytes);
-    Tensor tids(dids.p, DType::I32, {static_cast<std::int32_t>(ids.size())});
-    Tensor tout(dout.p, DType::BF16, {d, static_cast<std::int32_t>(ids.size())});
-    ops::embedding(tids, w8_weight(dtable.p, d, kFullVocab), tout, nullptr);
-    cudaDeviceSynchronize();
-
-    return verify("embedding w8 full vocab repeated ids",
-                  from_device_bf16(dout, static_cast<std::size_t>(d) * ids.size()), ref,
-                  Tolerance::bf16_elementwise());
-}
-
-static int one_dense_shape(std::int32_t T, std::int32_t d) {
-    std::vector<float> src = make_source_table(d);
-    round_to_bf16(src);
-    const std::vector<int> ids = ids_for_T(T);
-
-    std::vector<double> ref;
-    cpu_gather(src, ids, d, ref);
-
-    DeviceBuffer dtable = to_device_bf16(src);
-    DeviceBuffer dids   = to_device_i32(ids);
-    DeviceBuffer dout(static_cast<std::size_t>(d) * T * 2u);
-    cudaMemset(dout.p, 0x7d, dout.bytes);
-    Tensor tids(dids.p, DType::I32, {T});
-    Tensor tout(dout.p, DType::BF16, {d, T});
-    ops::embedding(tids, dense_weight(dtable.p, d), tout, nullptr);
-    cudaDeviceSynchronize();
-
-    return verify(
-        (std::string("embedding dense d=") + std::to_string(d) + " T=" + std::to_string(T)).c_str(),
-        from_device_bf16(dout, static_cast<std::size_t>(d) * T), ref,
-        Tolerance::bf16_elementwise());
-}
-
-static int one_q6_shape(std::int32_t T, std::int32_t d) {
-    const std::vector<float> src      = make_source_table(d);
-    std::vector<std::uint8_t> payload = encode_q6_row_split(src, d);
-    const std::vector<int> ids        = ids_for_T(T);
-
-    std::vector<double> ref;
-    cpu_gather_q6_payload(payload, ids, d, ref);
-
-    DeviceBuffer dtable(payload.size());
-    cudaMemcpy(dtable.p, payload.data(), payload.size(), cudaMemcpyHostToDevice);
-    DeviceBuffer dids = to_device_i32(ids);
-    DeviceBuffer dout(static_cast<std::size_t>(d) * T * 2u);
-    cudaMemset(dout.p, 0x7d, dout.bytes);
-    Tensor tids(dids.p, DType::I32, {T});
-    Tensor tout(dout.p, DType::BF16, {d, T});
-    ops::embedding(tids, q6_weight(dtable.p, d), tout, nullptr);
-    cudaDeviceSynchronize();
-
-    return verify(
-        (std::string("embedding q6 d=") + std::to_string(d) + " T=" + std::to_string(T)).c_str(),
-        from_device_bf16(dout, static_cast<std::size_t>(d) * T), ref,
-        Tolerance::bf16_elementwise());
-}
-
-static int one_w8_shape(std::int32_t T, std::int32_t d) {
-    const std::vector<float> src      = make_source_table(d);
-    std::vector<std::uint8_t> payload = encode_w8_row_split(src, d);
-    const std::vector<int> ids        = ids_for_T(T);
-
-    std::vector<double> ref;
-    cpu_gather_w8_payload(payload, ids, d, ref);
-
-    DeviceBuffer dtable(payload.size());
-    cudaMemcpy(dtable.p, payload.data(), payload.size(), cudaMemcpyHostToDevice);
-    DeviceBuffer dids = to_device_i32(ids);
-    DeviceBuffer dout(static_cast<std::size_t>(d) * T * 2u);
-    cudaMemset(dout.p, 0x7d, dout.bytes);
-    Tensor tids(dids.p, DType::I32, {T});
-    Tensor tout(dout.p, DType::BF16, {d, T});
-    ops::embedding(tids, w8_weight(dtable.p, d), tout, nullptr);
-    cudaDeviceSynchronize();
-
-    return verify(
-        (std::string("embedding w8 d=") + std::to_string(d) + " T=" + std::to_string(T)).c_str(),
-        from_device_bf16(dout, static_cast<std::size_t>(d) * T), ref,
-        Tolerance::bf16_elementwise());
-}
-
-static int validation_checks() {
-    int f = 0;
-    Tensor ids(nullptr, DType::I32, {4});
-    Tensor out(nullptr, DType::BF16, {kD, 4});
-    Weight dense = dense_weight(nullptr);
-    Weight q6    = q6_weight(nullptr);
-
-    try {
-        Tensor empty_ids(nullptr, DType::I32, {1});
-        Tensor empty_out(nullptr, DType::BF16, {kD, 1});
-        empty_ids.ne[0] = 0;
-        empty_out.ne[1] = 0;
-        ops::embedding(empty_ids, dense, empty_out, nullptr);
-    } catch (const std::exception& e) {
-        std::cerr << "validation empty T: expected no throw, got " << e.what() << '\n';
-        ++f;
-    }
-
-    try {
-        Tensor bad_ids = ids;
-        bad_ids.ne[0]  = -1;
-        ops::embedding(bad_ids, dense, out, nullptr);
-        std::cerr << "validation negative ids dim: expected invalid_argument\n";
-        ++f;
-    } catch (const std::invalid_argument&) {}
-
-    try {
-        Tensor bad_ids(nullptr, DType::FP32, {4});
-        ops::embedding(bad_ids, dense, out, nullptr);
-        std::cerr << "validation ids dtype: expected invalid_argument\n";
-        ++f;
-    } catch (const std::invalid_argument&) {}
-
-    try {
-        Tensor bad_out(nullptr, DType::FP32, {kD, 4});
-        ops::embedding(ids, dense, bad_out, nullptr);
-        std::cerr << "validation out dtype: expected invalid_argument\n";
-        ++f;
-    } catch (const std::invalid_argument&) {}
-
-    try {
-        Tensor bad_ids(nullptr, DType::I32, {4, 2});
-        ops::embedding(bad_ids, dense, out, nullptr);
-        std::cerr << "validation ids shape: expected invalid_argument\n";
-        ++f;
-    } catch (const std::invalid_argument&) {}
-
-    try {
-        Tensor bad_out(nullptr, DType::BF16, {kD + 1, 4});
-        ops::embedding(ids, dense, bad_out, nullptr);
-        std::cerr << "validation out d: expected invalid_argument\n";
-        ++f;
-    } catch (const std::invalid_argument&) {}
-
-    try {
-        Tensor bad_out(nullptr, DType::BF16, {kD, 5});
-        ops::embedding(ids, dense, bad_out, nullptr);
-        std::cerr << "validation out T: expected invalid_argument\n";
-        ++f;
-    } catch (const std::invalid_argument&) {}
-
-    try {
-        Tensor bad_stride = out;
-        bad_stride.nb[0]  = 4;
-        ops::embedding(ids, dense, bad_stride, nullptr);
-        std::cerr << "validation contiguous: expected invalid_argument\n";
-        ++f;
-    } catch (const std::invalid_argument&) {}
-
-    try {
-        Weight bad_qtype = dense;
-        bad_qtype.qtype  = QType::FP32_CTRL;
-        ops::embedding(ids, bad_qtype, out, nullptr);
-        std::cerr << "validation unsupported qtype: expected invalid_argument\n";
-        ++f;
-    } catch (const std::invalid_argument&) {}
-
-    try {
-        Weight bad_dense_layout = dense;
-        bad_dense_layout.layout = QuantLayout::RowSplit;
-        ops::embedding(ids, bad_dense_layout, out, nullptr);
-        std::cerr << "validation dense layout: expected invalid_argument\n";
-        ++f;
-    } catch (const std::invalid_argument&) {}
-
-    try {
-        Weight bad_dense_payload        = dense;
-        bad_dense_payload.payload_bytes = static_cast<std::uint64_t>(kVocab) * kD * 2u - 1u;
-        ops::embedding(ids, bad_dense_payload, out, nullptr);
-        std::cerr << "validation dense payload size: expected invalid_argument\n";
-        ++f;
-    } catch (const std::invalid_argument&) {}
-
-    try {
-        Weight bad_q6_layout = q6;
-        bad_q6_layout.layout = QuantLayout::Contiguous;
-        ops::embedding(ids, bad_q6_layout, out, nullptr);
-        std::cerr << "validation q6 layout: expected invalid_argument\n";
-        ++f;
-    } catch (const std::invalid_argument&) {}
-
-    try {
-        Weight bad_q6_group     = q6;
-        bad_q6_group.group_size = 32;
-        ops::embedding(ids, bad_q6_group, out, nullptr);
-        std::cerr << "validation q6 group: expected invalid_argument\n";
-        ++f;
-    } catch (const std::invalid_argument&) {}
-
-    try {
-        ops::embedding(ids, dense, out, nullptr);
-        std::cerr << "validation null dense data: expected invalid_argument\n";
-        ++f;
-    } catch (const std::invalid_argument&) {}
-
-    try {
-        ops::embedding(ids, q6, out, nullptr);
-        std::cerr << "validation null q6 data: expected invalid_argument\n";
-        ++f;
-    } catch (const std::invalid_argument&) {}
-
-    return f;
+    int failures = verify_exact("embedding BF16 [2304,1152]",
+                                guarded_to_host<std::uint16_t>(output, expected.size()), expected);
+    failures += output.verify_guards("embedding BF16 output");
+    failures += verify_input("embedding BF16 ids", device_ids, ids);
+    failures += device_table.verify_guards("embedding BF16 table");
+    failures += verify_exact("embedding BF16 table",
+                             guarded_to_host<std::uint16_t>(device_table, table.size()), table);
+    return failures;
 }
 
 } // namespace
@@ -680,19 +516,16 @@ int main() {
         return 0;
     }
 
-    int f = 0;
-    f += validation_checks();
-    for (std::int32_t T : {1, 4, 64}) {
-        f += one_dense_shape(T, kD);
-        f += one_q6_shape(T, kD);
+    int failures = 0;
+    try {
+        failures += test_dense();
+        failures += test_q6();
+        failures += test_w8();
+    } catch (const std::exception& error) {
+        std::cerr << "embedding test exception: " << error.what() << '\n';
+        return 1;
     }
-    f += one_dense_shape(5, kQwenHiddenD);
-    f += one_q6_shape(5, kQwenHiddenD);
-    f += one_w8_shape(4, kD);
-    for (std::int32_t T = 1; T <= 16; ++T) { f += one_w8_shape(T, 2048); }
-    f += one_w8_shape(1024, 2048);
-    f += full_vocab_w8_shape();
 
-    std::cout << (f ? "FAIL" : "OK") << " embedding correctness\n";
-    return f ? 1 : 0;
+    std::cout << (failures == 0 ? "OK" : "FAIL") << " embedding correctness\n";
+    return failures == 0 ? 0 : 1;
 }

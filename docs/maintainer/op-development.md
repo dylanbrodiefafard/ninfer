@@ -476,18 +476,19 @@ conformance matrix, and target-representative activations is not a universal err
 arbitrary unbounded or adversarial tensors. Each semantically complete entry point is checked
 directly against the oracle; pairwise implementation parity is supplementary evidence.
 
-GQA applies this rule concretely. BF16 and INT8-G64 A1/A3 share an FP64 ideal attention oracle over
-BF16 Q and logical cache values (BF16 or FP32-decoded INT8-G64). The target's INT8 Q8-G64 compute
-profile remains an intentional optimized implementation and uses the named
-`Tolerance::attention_int8()` rather than `Tolerance::attention_bf16()`; it is not folded into a
-second reference. Exact INT8 cache code and scale validation remains a separate codec check.
+GQA applies this rule concretely. BF16-cache and INT8-G64-cache A1/A3 share an FP64 ideal attention
+oracle over BF16 Q and logical cache values (BF16 or FP32-decoded INT8-G64). The target's INT8
+Q8-G64 query compute profile remains an intentional optimized implementation; the GQA suite gives
+the BF16-cache and INT8-cache compute profiles separate named criteria without folding either into
+a second reference. Exact INT8 cache code and scale validation remains a separate codec check.
 
 ### 8.1 Op qualification standard
 
 One semantic Op, or one closely related overload group, owns one identifiable qualification suite.
-The suite calls every semantically complete public entry directly. Tests of a private candidate,
-plan, dispatch decision, CUDA Graph replay, or pairwise implementation parity may protect their own
-risks, but they do not replace public Op qualification against the independent oracle.
+The suite calls every semantically complete public entry directly. Private candidates, plans,
+dispatch decisions, and pairwise implementation parity are not qualification-test subjects. When
+CUDA Graph compatibility is part of the public contract, capture and replay the public Op and
+verify its observable outputs and effects against the same oracle.
 
 #### Oracle
 

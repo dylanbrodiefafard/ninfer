@@ -276,7 +276,8 @@ For query head `h`, `kvh=floor(h/4)`, using the exact `allowed_swa` predicate fr
 ```text
 score(i,j,h) = scale * dot(q[:,h,i], key[:,kvh,j])
 probability  = softmax over every admitted context or query key j
-out[:,h,i]   = BF16(sum_j probability(i,j,h) * value[:,kvh,j])
+ideal_out[:,h,i] = sum_j probability(i,j,h) * value[:,kvh,j]
+out[:,h,i]       = BF16 storage approximation of ideal_out[:,h,i]
 ```
 
 Context keys and temporary query keys are two logical sequence segments. The implementation must
@@ -371,7 +372,8 @@ temporary query rows:
 ```text
 score(i,j,h) = scale * dot(q[:,h,i], key[:,floor(h/4),j])
 probability  = softmax over j in {context, complete query block}
-out[:,h,i]   = BF16(sum_j probability(i,j,h) * value[:,floor(h/4),j])
+ideal_out[:,h,i] = sum_j probability(i,j,h) * value[:,floor(h/4),j]
+out[:,h,i]       = BF16 storage approximation of ideal_out[:,h,i]
 ```
 
 There is no causal triangle and no cache mutation.
@@ -549,7 +551,8 @@ agreement for `A=0..15` and on the following round.
 The ordinary `linear` contract computes:
 
 ```text
-projected[:,t] = BF16(W_fc @ concat(r1,r6,r11,r16,r22,r27,r32,r37)[:,t])
+ideal_projected[:,t] = W_fc @ concat(r1,r6,r11,r16,r22,r27,r32,r37)[:,t]
+projected[:,t]       = BF16 storage approximation of ideal_projected[:,t]
 ```
 
 The W8 weight is `[2048,16384]`; input and output are contiguous BF16 `[16384,T]` and `[2048,T]`.
@@ -610,7 +613,8 @@ phase.
 The existing formula is already correct with `unit_offset=false`:
 
 ```text
-out[d,r] = BF16(x[d,r] * rsqrt(mean_d(x[d,r]^2) + 1e-6) * weight[d])
+ideal_out[d,r] = x[d,r] * rsqrt(mean_d(x[d,r]^2) + 1e-6) * weight[d]
+out[d,r]       = BF16 storage approximation of ideal_out[d,r]
 ```
 
 Required real shapes are:
@@ -652,8 +656,10 @@ For context feature `c [2048,T]`, create zero-copy row views of one stored QKV p
 ```text
 W_k = parent rows [4096,5120)     # [1024,2048]
 W_v = parent rows [5120,6144)     # [1024,2048]
-k_raw = BF16(W_k @ c)             # [1024,T] == [128,8,T]
-v     = BF16(W_v @ c)             # [1024,T] == [128,8,T]
+ideal_k_raw = W_k @ c             # [1024,T] == [128,8,T]
+ideal_v     = W_v @ c             # [1024,T] == [128,8,T]
+k_raw = BF16 storage approximation of ideal_k_raw
+v     = BF16 storage approximation of ideal_v
 ```
 
 The current `linear_pair` admits only paired `[1024,5120]` weights. Extend it to the
@@ -741,9 +747,10 @@ This is one-dimensional RoPE. Target three-axis MRoPE and its `rope_delta` are n
 Add a Q/K/V overload to the existing attention-input projection family:
 
 ```text
-q[:,t] = BF16(W[0:4096,:]    @ x[:,t])    # [4096,B] == [128,32,B]
-k[:,t] = BF16(W[4096:5120,:] @ x[:,t])    # [1024,B] == [128,8,B]
-v[:,t] = BF16(W[5120:6144,:] @ x[:,t])    # [1024,B] == [128,8,B]
+ideal_q[:,t] = W[0:4096,:]    @ x[:,t]    # [4096,B] == [128,32,B]
+ideal_k[:,t] = W[4096:5120,:] @ x[:,t]    # [1024,B] == [128,8,B]
+ideal_v[:,t] = W[5120:6144,:] @ x[:,t]    # [1024,B] == [128,8,B]
+q, k, v are BF16 storage approximations of ideal_q, ideal_k, ideal_v
 ```
 
 The stored parent is W8 `[6144,2048]`; `x [2048,B]` and all three outputs are BF16. Outputs must
@@ -792,9 +799,10 @@ this contract; that composition requires a fused semantic Op.
 Extend `linear_swiglu` from its current Q4 geometry to:
 
 ```text
-gate = W[0:6144,:] @ x
-up   = W[6144:12288,:] @ x
-out  = BF16(SiLU(gate) * up)
+ideal_gate = W[0:6144,:] @ x
+ideal_up   = W[6144:12288,:] @ x
+ideal_out  = SiLU(ideal_gate) * ideal_up
+out        = BF16 storage approximation of ideal_out
 
 x   [2048,B] BF16
 W   [12288,2048] W8G32_F16S
@@ -841,7 +849,8 @@ saturation, full writes, Graph replay, and fused-versus-composed timing inside a
 Extend the existing fused residual Op:
 
 ```text
-residual[:,t]' = BF16(residual[:,t] + W_down @ x[:,t])
+ideal_residual[:,t]' = residual[:,t] + W_down @ x[:,t]
+residual[:,t]'       = BF16 storage approximation of ideal_residual[:,t]'
 
 x        [6144,B] BF16
 W_down   [2048,6144] W8G32_F16S
@@ -1179,10 +1188,14 @@ Every row is closed only after:
 - **E — enclosing evidence:** the chosen implementation improves or at least does not materially
   regress its containing layer, context-update stage, or complete speculative round.
 
-Exact Ops compare every observable bit. Floating-point Ops use named route-appropriate criteria,
-reject unexpected non-finite outputs, and combine a normwise bound with a finite gross pointwise
-cap where reductions are involved. Graph capture/replay is required wherever the production route
-is captured.
+Exact Ops compare every observable bit. Floating-point Ops use the semantic Op's named criterion
+for the active implementation or compute profile, reject unexpected non-finite outputs, and
+combine a normwise bound with a finite gross pointwise cap where reductions are involved. The
+floating-point oracle retains the ideal FP32/FP64 result; `BF16` annotations in formulas describe
+observable output storage, not oracle rounding. An explicitly documented semantic intermediate
+cast remains in the logical formula, including the BF16 logits of `linear_argmax` and the BF16
+residual boundary of `linear_add_rmsnorm`. Graph capture/replay is required wherever the production
+route is captured and is verified by replaying the public Op and checking its observable results.
 
 ### 8.2 Ordered implementation checklist
 

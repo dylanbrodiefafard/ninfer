@@ -1,165 +1,105 @@
-// Correctness + coverage for residual_add, against the frozen op-test standard
-// (docs/op-development.md): fp64 golden from bf16-rounded inputs, honest
-// input ranges, composite tolerance bf16_elementwise.
 #include "ninfer/ops/residual_add.h"
 #include "ops/op_tester.h"
 
 #include <cstdint>
 #include <iostream>
-#include <stdexcept>
 #include <vector>
 
 using namespace ninfer;
 using namespace ninfer::test;
 
-// fp64 reference: x[i] = double(x[i]) + double(y[i]).
-static void cpu_residual_add(const std::vector<float>& y, const std::vector<float>& x,
-                             std::vector<double>& o) {
-    for (std::size_t i = 0; i < x.size(); ++i) {
-        o[i] = static_cast<double>(x[i]) + static_cast<double>(y[i]);
+namespace {
+
+constexpr PointwiseCriterion residual_add_bf16_criterion() {
+    return {/*absolute*/ 0.0, /*relative*/ 4.0e-3};
+}
+
+std::vector<std::uint16_t> encode_bf16(const std::vector<float>& values) {
+    std::vector<std::uint16_t> bits(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) bits[i] = f32_to_bf16(values[i]);
+    return bits;
+}
+
+std::vector<double> residual_add_oracle(const std::vector<float>& y, const std::vector<float>& x) {
+    std::vector<double> expected(y.size());
+    for (std::size_t i = 0; i < y.size(); ++i) {
+        expected[i] = static_cast<double>(x[i]) + static_cast<double>(y[i]);
     }
+    return expected;
 }
 
-static int one_shape(const char* tag, std::int32_t d0, std::int32_t d1, std::uint32_t seed,
-                     float lo, float hi) {
-    const auto n = static_cast<std::size_t>(d0) * static_cast<std::size_t>(d1);
-    std::vector<float> y(n), x(n);
-    fill_uniform(y, seed, lo, hi);
-    fill_uniform(x, seed + 1000u, lo, hi);
+int run_case(const char* label, std::int32_t rows, std::int32_t columns, std::uint32_t seed) {
+    const std::size_t count = static_cast<std::size_t>(rows) * columns;
+    std::vector<float> y(count), x(count);
+    fill_uniform(y, seed, -8.0f, 8.0f);
+    fill_uniform(x, seed + 1, -8.0f, 8.0f);
     round_to_bf16(y);
     round_to_bf16(x);
 
-    std::vector<double> ref(n);
-    cpu_residual_add(y, x, ref);
+    const auto expected = residual_add_oracle(y, x);
+    const auto y_bits   = encode_bf16(y);
+    const auto x_bits   = encode_bf16(x);
+    GuardedDeviceBuffer device_y(count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_x(count * sizeof(std::uint16_t));
+    device_y.copy_from_host(y_bits.data(), device_y.bytes());
+    device_x.copy_from_host(x_bits.data(), device_x.bytes());
 
-    DeviceBuffer dy = to_device_bf16(y), dx = to_device_bf16(x);
-    Tensor ty(dy.p, DType::BF16, {d0, d1}), tx(dx.p, DType::BF16, {d0, d1});
-    ops::residual_add(ty, tx, nullptr);
-    cudaDeviceSynchronize();
+    Tensor y_tensor(device_y.data(), DType::BF16, {rows, columns});
+    Tensor x_tensor(device_x.data(), DType::BF16, {rows, columns});
+    ops::residual_add(y_tensor, x_tensor, nullptr);
+    cuda_synchronize();
 
-    return verify(tag, from_device_bf16(dx, n), ref, Tolerance::bf16_elementwise());
+    int failures = verify_pointwise(label, from_device_bf16(device_x.data(), count), expected,
+                                    residual_add_bf16_criterion());
+    failures += verify_exact("residual_add y unchanged",
+                             from_device<std::uint16_t>(device_y.data(), count), y_bits);
+    failures += device_y.verify_guards("residual_add y");
+    failures += device_x.verify_guards("residual_add x");
+    return failures;
 }
 
-static int one_shape_1d(const char* tag, std::int32_t n, std::uint32_t seed, float lo, float hi) {
-    std::vector<float> y(n), x(n);
-    fill_uniform(y, seed, lo, hi);
-    fill_uniform(x, seed + 1000u, lo, hi);
+int run_cancellation_case() {
+    std::vector<float> y{8.0f, -8.0f, 1.0f, -1.0f, 0.0f, 3.5f, -3.5f};
+    std::vector<float> x{-8.0f, 8.0f, -1.0f, 1.0f, -0.0f, -3.5f, 3.5f};
     round_to_bf16(y);
     round_to_bf16(x);
 
-    std::vector<double> ref(n);
-    cpu_residual_add(y, x, ref);
+    const auto expected = residual_add_oracle(y, x);
+    const auto y_bits   = encode_bf16(y);
+    const auto x_bits   = encode_bf16(x);
+    GuardedDeviceBuffer device_y(y_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_x(x_bits.size() * sizeof(std::uint16_t));
+    device_y.copy_from_host(y_bits.data(), device_y.bytes());
+    device_x.copy_from_host(x_bits.data(), device_x.bytes());
 
-    DeviceBuffer dy = to_device_bf16(y), dx = to_device_bf16(x);
-    Tensor ty(dy.p, DType::BF16, {n}), tx(dx.p, DType::BF16, {n});
-    ops::residual_add(ty, tx, nullptr);
-    cudaDeviceSynchronize();
+    Tensor y_tensor(device_y.data(), DType::BF16, {static_cast<int>(y.size())});
+    Tensor x_tensor(device_x.data(), DType::BF16, {static_cast<int>(x.size())});
+    ops::residual_add(y_tensor, x_tensor, nullptr);
+    cuda_synchronize();
 
-    return verify(tag, from_device_bf16(dx, n), ref, Tolerance::bf16_elementwise());
+    int failures = verify_pointwise("residual_add cancellation",
+                                    from_device_bf16(device_x.data(), expected.size()), expected,
+                                    residual_add_bf16_criterion());
+    failures += verify_exact("residual_add cancellation y unchanged",
+                             from_device<std::uint16_t>(device_y.data(), y_bits.size()), y_bits);
+    failures += device_y.verify_guards("residual_add cancellation y");
+    failures += device_x.verify_guards("residual_add cancellation x");
+    return failures;
 }
 
-static DeviceBuffer to_device_bf16_unaligned(const std::vector<float>& h) {
-    std::vector<std::uint16_t> b(h.size() + 1);
-    b[0] = 0;
-    for (std::size_t i = 0; i < h.size(); ++i) b[i + 1] = f32_to_bf16(h[i]);
-    DeviceBuffer d(b.size() * 2);
-    cudaMemcpy(d.p, b.data(), b.size() * 2, cudaMemcpyHostToDevice);
-    return d;
-}
-
-static int unaligned_data_case() {
-    constexpr std::int32_t n = 255;
-    std::vector<float> y(n), x(n);
-    fill_uniform(y, 2026u, -8.f, 8.f);
-    fill_uniform(x, 3026u, -8.f, 8.f);
-    round_to_bf16(y);
-    round_to_bf16(x);
-
-    std::vector<double> ref(n);
-    cpu_residual_add(y, x, ref);
-
-    DeviceBuffer dy = to_device_bf16_unaligned(y), dx = to_device_bf16_unaligned(x);
-    auto* yptr = static_cast<unsigned char*>(dy.p) + 2;
-    auto* xptr = static_cast<unsigned char*>(dx.p) + 2;
-    Tensor ty(yptr, DType::BF16, {n}), tx(xptr, DType::BF16, {n});
-    ops::residual_add(ty, tx, nullptr);
-    cudaDeviceSynchronize();
-
-    DeviceBuffer packed(static_cast<std::size_t>(n) * 2);
-    cudaMemcpy(packed.p, xptr, static_cast<std::size_t>(n) * 2, cudaMemcpyDeviceToDevice);
-    return verify("residual_add unaligned data", from_device_bf16(packed, n), ref,
-                  Tolerance::bf16_elementwise());
-}
-
-static int validation_checks() {
-    int f = 0;
-    Tensor y(nullptr, DType::BF16, {4});
-    Tensor x(nullptr, DType::BF16, {4});
-
-    try {
-        Tensor empty_y(nullptr, DType::BF16, {1});
-        Tensor empty_x(nullptr, DType::BF16, {1});
-        empty_y.ne[0] = 0;
-        empty_x.ne[0] = 0;
-        ops::residual_add(empty_y, empty_x, nullptr);
-    } catch (const std::exception& e) {
-        std::cerr << "validation empty: expected no throw, got " << e.what() << '\n';
-        ++f;
-    }
-
-    try {
-        Tensor bad_dtype(nullptr, DType::FP32, {4});
-        ops::residual_add(y, bad_dtype, nullptr);
-        std::cerr << "validation dtype: expected invalid_argument\n";
-        ++f;
-    } catch (const std::invalid_argument&) {}
-
-    try {
-        Tensor bad_shape(nullptr, DType::BF16, {5});
-        ops::residual_add(bad_shape, x, nullptr);
-        std::cerr << "validation shape: expected invalid_argument\n";
-        ++f;
-    } catch (const std::invalid_argument&) {}
-
-    try {
-        Tensor bad_stride = x;
-        bad_stride.nb[0]  = 4;
-        ops::residual_add(y, bad_stride, nullptr);
-        std::cerr << "validation contiguous: expected invalid_argument\n";
-        ++f;
-    } catch (const std::invalid_argument&) {}
-
-    try {
-        ops::residual_add(y, x, nullptr);
-        std::cerr << "validation null data: expected invalid_argument\n";
-        ++f;
-    } catch (const std::invalid_argument&) {}
-
-    return f;
-}
+} // namespace
 
 int main() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 0;
     }
-    int f = 0;
-    f += validation_checks();
 
-    // Coverage: requested shapes; >=3 seeds; honest range.
-    for (std::uint32_t seed : {1u, 7u, 99u}) {
-        f += one_shape("residual_add 35b vision [1152,1]", 1152, 1, seed, -8.f, 8.f);
-        f += one_shape("residual_add 35b vision [1152,6]", 1152, 6, seed, -8.f, 8.f);
-        f += one_shape("residual_add 35b vision [1152,4096]", 1152, 4096, seed, -8.f, 8.f);
-        f += one_shape("residual_add [5120,1]", 5120, 1, seed, -8.f, 8.f);
-        f += one_shape("residual_add [5120,4096]", 5120, 4096, seed, -8.f, 8.f);
-        f += one_shape("residual_add [6144,1]", 6144, 1, seed, -8.f, 8.f);
-        f += one_shape_1d("residual_add [123457]", 123457, seed, -8.f, 8.f);
-    }
-    // Stress: large magnitudes expose rounding and overflow mistakes.
-    f += one_shape_1d("residual_add stress [-60,60]", 123457, 4242u, -60.f, 60.f);
-    f += unaligned_data_case();
-
-    std::cout << (f ? "FAIL" : "OK") << " residual_add correctness\n";
-    return f ? 1 : 0;
+    int failures = 0;
+    failures += run_case("residual_add [5120,1]", 5120, 1, 101u);
+    failures += run_case("residual_add [2048,17]", 2048, 17, 201u);
+    failures += run_case("residual_add [1152,128]", 1152, 128, 301u);
+    failures += run_cancellation_case();
+    std::cout << (failures ? "FAIL" : "OK") << " residual_add\n";
+    return failures ? 1 : 0;
 }

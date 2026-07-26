@@ -1,9 +1,10 @@
 #include "ninfer/ops/position.h"
 #include "ops/op_tester.h"
 
-#include <cuda_runtime.h>
-
+#include <cstddef>
+#include <cstdint>
 #include <iostream>
+#include <string>
 #include <vector>
 
 using namespace ninfer;
@@ -11,37 +12,65 @@ using namespace ninfer::test;
 
 namespace {
 
-int position_case(int count, int start, int delta_value, bool in_place) {
-    DeviceBuffer filled(static_cast<std::size_t>(count) * sizeof(int));
-    Tensor filled_tensor(filled.p, DType::I32, {count});
-    ops::fill_i32_positions(filled_tensor, start, nullptr);
-    cudaDeviceSynchronize();
+int fill_case(std::int32_t count, std::int32_t start) {
+    std::vector<std::int32_t> expected(static_cast<std::size_t>(count));
+    for (std::int32_t i = 0; i < count; ++i) { expected[static_cast<std::size_t>(i)] = start + i; }
 
-    std::vector<int> expected_filled(count);
-    for (int i = 0; i < count; ++i) { expected_filled[static_cast<std::size_t>(i)] = start + i; }
-    if (from_device_i32(filled, count) != expected_filled) {
-        std::cerr << "position fill mismatch count=" << count << '\n';
-        return 1;
-    }
+    GuardedDeviceBuffer output(static_cast<std::size_t>(count) * sizeof(std::int32_t));
+    output.fill(0xcd);
+    Tensor output_tensor(output.data(), DType::I32, {count});
+    ops::fill_i32_positions(output_tensor, start, nullptr);
+    cuda_synchronize();
 
-    DeviceBuffer delta = to_device_i32({delta_value});
-    DeviceBuffer offset(static_cast<std::size_t>(count) * sizeof(int));
-    Tensor delta_tensor(delta.p, DType::I32, {1});
-    Tensor offset_tensor(offset.p, DType::I32, {count});
-    Tensor& destination = in_place ? filled_tensor : offset_tensor;
-    ops::offset_i32_positions(filled_tensor, delta_tensor, destination, nullptr);
-    cudaDeviceSynchronize();
+    const std::string label =
+        "fill_i32_positions T=" + std::to_string(count) + " start=" + std::to_string(start);
+    int failures = verify_exact(
+        label.c_str(), from_device<std::int32_t>(output.data(), expected.size()), expected);
+    failures += output.verify_guards(label.c_str());
+    return failures;
+}
 
-    std::vector<int> expected_offset(count);
-    for (int i = 0; i < count; ++i) {
-        expected_offset[static_cast<std::size_t>(i)] = start + delta_value + i;
+int offset_case(std::int32_t count, std::int32_t delta_value, bool in_place) {
+    std::vector<std::int32_t> source(static_cast<std::size_t>(count));
+    std::vector<std::int32_t> expected(static_cast<std::size_t>(count));
+    for (std::int32_t i = 0; i < count; ++i) {
+        source[static_cast<std::size_t>(i)]   = 131072 + 3 * i + (i % 5);
+        expected[static_cast<std::size_t>(i)] = source[static_cast<std::size_t>(i)] + delta_value;
     }
-    const auto got = from_device_i32(in_place ? filled : offset, count);
-    if (got != expected_offset) {
-        std::cerr << "position offset mismatch count=" << count << " in_place=" << in_place << '\n';
-        return 1;
+    const std::vector<std::int32_t> delta{delta_value};
+
+    GuardedDeviceBuffer device_source(source.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_delta(sizeof(std::int32_t));
+    GuardedDeviceBuffer device_output(source.size() * sizeof(std::int32_t));
+    device_source.copy_from_host(source.data(), source.size() * sizeof(std::int32_t));
+    device_delta.copy_from_host(delta.data(), sizeof(std::int32_t));
+    device_output.fill(0xcd);
+
+    Tensor source_tensor(device_source.data(), DType::I32, {count});
+    Tensor delta_tensor(device_delta.data(), DType::I32, {1});
+    Tensor output_tensor(device_output.data(), DType::I32, {count});
+    Tensor& destination = in_place ? source_tensor : output_tensor;
+    ops::offset_i32_positions(source_tensor, delta_tensor, destination, nullptr);
+    cuda_synchronize();
+
+    const std::string label = "offset_i32_positions T=" + std::to_string(count) +
+                              (in_place ? " in-place" : " out-of-place");
+    int failures =
+        verify_exact(label.c_str(),
+                     from_device<std::int32_t>(
+                         in_place ? device_source.data() : device_output.data(), expected.size()),
+                     expected);
+    if (!in_place) {
+        failures +=
+            verify_exact((label + " preserves source").c_str(),
+                         from_device<std::int32_t>(device_source.data(), source.size()), source);
     }
-    return 0;
+    failures += verify_exact((label + " preserves delta").c_str(),
+                             from_device<std::int32_t>(device_delta.data(), delta.size()), delta);
+    failures += device_source.verify_guards((label + " source").c_str());
+    failures += device_delta.verify_guards((label + " delta").c_str());
+    if (!in_place) { failures += device_output.verify_guards((label + " destination").c_str()); }
+    return failures;
 }
 
 } // namespace
@@ -53,11 +82,12 @@ int main() {
     }
 
     int failures = 0;
-    for (int count = 1; count <= 16; ++count) {
-        failures += position_case(count, 262144 - count, -17, false);
-        failures += position_case(count, 262144 - 2 * count, count, true);
-    }
-    failures += position_case(1024, 131072, -17, false);
-    std::cout << (failures ? "FAIL" : "OK") << " position Ops\n";
+    failures += fill_case(1, 0);
+    failures += fill_case(6, 262144);
+    failures += fill_case(1024, 131072);
+    failures += offset_case(1, -17, false);
+    failures += offset_case(6, 31, true);
+    failures += offset_case(1024, -257, false);
+    std::cout << (failures ? "FAIL" : "OK") << " position\n";
     return failures ? 1 : 0;
 }

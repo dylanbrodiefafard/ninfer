@@ -36,9 +36,9 @@ struct GqaExecutionEnvelope {
  *
  * The registered INT8 implementation defines Q8-G64, paired with INT8-G64 K, as its native query
  * compute profile. Its profile-defined query quantization and any narrower staging do not replace
- * BF16 Q in the ideal oracle. BF16 and INT8 implementations therefore use the separate named
- * `attention_bf16` and `attention_int8` numerical qualification tolerances. Those envelopes apply
- * to the registered geometries, tested token extents, conformance matrix, and target-representative
+ * BF16 Q in the ideal oracle. BF16-cache and INT8-cache compute profiles therefore have separate
+ * named numerical criteria owned by the GQA conformance test. Those envelopes apply to the
+ * registered geometries, tested token extents, conformance matrix, and target-representative
  * activation range; they are not a universal error bound for arbitrary adversarial BF16 tensors.
  * A1 and A3 are each qualified directly against the ideal oracle. A1-versus-A3 parity is only an
  * additional consistency check.
@@ -55,7 +55,7 @@ struct GqaExecutionEnvelope {
  *
  *   score[j]    = scale * dot(q[:,h,t], K_cache[:,j,kvh]), 0 <= j <= p
  *   probability = softmax_j(score)
- *   out[:,h,t]  = BF16(sum_j probability[j] * V_cache[:,j,kvh]).
+ *   ideal[:,h,t] = sum_j probability[j] * V_cache[:,j,kvh].
  *
  * The registered geometries are `[256,24|4,T]` group 6 and `[256,16|2,T]` group 8. q/k/v/out
  * are contiguous BF16, positions is contiguous sequential I32 [T], and scale is 1/sqrt(256).

@@ -19,11 +19,12 @@ namespace ninfer::ops {
  * T may be any positive value.
  * The two parent weights are RowSplit [7168,5120] with FP16 scales and group size 64:
  * query_key is Q4G64_F16S and gate_value is Q5G64_F16S. The oracle exact-decodes each row and
- * evaluates every projection naively in FP64 before converting the observable outputs to BF16.
- * Production routes choose their private accumulator and staging precision. Inputs and the four
- * outputs must be mutually non-overlapping. Current registered routes require no transient
- * allocation; `ws` remains the Op-owned workspace boundary. The Op has no persistent state side
- * effect.
+ * evaluates every projection naively in FP64 from the represented inputs. The BF16 outputs are
+ * promoted and compared directly with those ideal values; final output storage rounding belongs
+ * to AttnInputProj's named A16 criterion, not the oracle. Production routes choose their private
+ * accumulator and staging precision. Inputs and the four outputs must be mutually non-overlapping.
+ * Current registered routes require no transient allocation; `ws` remains the Op-owned workspace
+ * boundary. The Op has no persistent state side effect.
  */
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
@@ -35,7 +36,7 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
  * [2048,T], q/gate are contiguous BF16 [4096,T], and k/v are contiguous BF16 [512,T]. Every
  * route writes the four independent final allocations directly; no parent output or transient
  * workspace is materialized. T may be any positive value. The observable outputs use the same
- * independent exact-decode oracle and BF16 boundary described above.
+ * independent exact-decode oracle and A16 criterion described above.
  */
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,
                      Tensor& gate, Tensor& k, Tensor& v, WorkspaceArena& ws, cudaStream_t stream);

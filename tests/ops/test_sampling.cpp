@@ -1,15 +1,19 @@
-// Correctness for sample: greedy (temperature<=0) must equal argmax
-// exactly (bf16-rounded logits, lowest-index tie-break), and the sampling path
-// must respect top-k/top-p/min-p truncation, be reproducible under a fixed
-// seed, and match the softmax distribution it claims to draw from.
+// Public-contract qualification for sample().
+//
+// The deterministic branch is checked exactly against an independent CPU
+// argmax.  The stochastic branch is checked against one FP64 mathematical
+// distribution oracle built from the BF16 values represented at the public
+// input.  The test never reproduces the device RNG algorithm or uses another
+// production path as a golden.
 #include "ninfer/ops/sampling.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <iostream>
-#include <numeric>
+#include <memory>
 #include <vector>
 
 using namespace ninfer;
@@ -17,593 +21,451 @@ using namespace ninfer::test;
 
 namespace {
 
-struct DeviceConfig {
-    DeviceBuffer buf;
-
-    explicit DeviceConfig(const ops::SamplingConfig& cfg) : buf(sizeof(ops::SamplingConfig)) {
-        cudaMemcpy(buf.p, &cfg, sizeof(cfg), cudaMemcpyHostToDevice);
-    }
-
-    const ops::SamplingConfig* ptr() const {
-        return static_cast<const ops::SamplingConfig*>(buf.p);
-    }
+struct Candidate {
+    double adjusted = 0.0;
+    int token       = 0;
 };
 
-DeviceBuffer device_pos(int value) {
-    DeviceBuffer d(sizeof(std::int32_t));
-    cudaMemcpy(d.p, &value, sizeof(value), cudaMemcpyHostToDevice);
-    return d;
+struct Distribution {
+    std::vector<int> tokens;
+    std::vector<double> probabilities;
+};
+
+struct RunResult {
+    std::vector<int> tokens;
+    std::vector<int> counts;
+    int integrity_failures = 0;
+};
+
+bool same_config(const ops::SamplingConfig& a, const ops::SamplingConfig& b) {
+    return a.temperature == b.temperature && a.top_k == b.top_k && a.top_p == b.top_p &&
+           a.min_p == b.min_p && a.presence_penalty == b.presence_penalty &&
+           a.frequency_penalty == b.frequency_penalty && a.seed == b.seed &&
+           a.token_counts == b.token_counts;
 }
 
-// Column-major [vocab, cols] with every column equal to `base`.
-std::vector<float> broadcast_columns(const std::vector<float>& base, int cols) {
-    const int vocab = static_cast<int>(base.size());
-    std::vector<float> out(static_cast<std::size_t>(vocab) * cols);
-    for (int t = 0; t < cols; ++t) {
-        for (int v = 0; v < vocab; ++v) { out[static_cast<std::size_t>(t) * vocab + v] = base[v]; }
+std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
+    std::vector<std::uint16_t> bits(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) { bits[i] = f32_to_bf16(values[i]); }
+    return bits;
+}
+
+std::vector<float> repeat_column(const std::vector<float>& column, int columns) {
+    std::vector<float> logits(column.size() * static_cast<std::size_t>(columns));
+    for (int t = 0; t < columns; ++t) {
+        std::copy(column.begin(), column.end(),
+                  logits.begin() + static_cast<std::ptrdiff_t>(t) * column.size());
+    }
+    return logits;
+}
+
+std::vector<int> greedy_oracle(const std::vector<float>& logits, int physical_rows,
+                               int token_domain, int columns) {
+    std::vector<int> expected(static_cast<std::size_t>(columns));
+    for (int t = 0; t < columns; ++t) {
+        const std::size_t base = static_cast<std::size_t>(t) * physical_rows;
+        int best               = 0;
+        for (int token = 1; token < token_domain; ++token) {
+            if (logits[base + token] > logits[base + best]) { best = token; }
+        }
+        expected[static_cast<std::size_t>(t)] = best;
+    }
+    return expected;
+}
+
+Distribution distribution_oracle(const std::vector<float>& column, int token_domain,
+                                 const ops::SamplingConfig& config,
+                                 const std::vector<int>* counts = nullptr) {
+    std::vector<Candidate> candidates(static_cast<std::size_t>(token_domain));
+    for (int token = 0; token < token_domain; ++token) {
+        const int count = counts == nullptr ? 0 : (*counts)[static_cast<std::size_t>(token)];
+        double adjusted = static_cast<double>(column[static_cast<std::size_t>(token)]);
+        if (count > 0) { adjusted -= static_cast<double>(config.presence_penalty); }
+        adjusted -= static_cast<double>(config.frequency_penalty) * static_cast<double>(count);
+        candidates[static_cast<std::size_t>(token)] = {adjusted, token};
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+        if (a.adjusted != b.adjusted) { return a.adjusted > b.adjusted; }
+        return a.token < b.token;
+    });
+
+    int cap = 20;
+    if (config.top_k > 0 && config.top_k < 20) { cap = config.top_k; }
+    cap = std::min(cap, token_domain);
+    candidates.resize(static_cast<std::size_t>(cap));
+
+    std::vector<double> weights(static_cast<std::size_t>(cap));
+    const double max_scaled = candidates.front().adjusted / config.temperature;
+    double total_weight     = 0.0;
+    for (int rank = 0; rank < cap; ++rank) {
+        const double weight = std::exp(
+            candidates[static_cast<std::size_t>(rank)].adjusted / config.temperature - max_scaled);
+        weights[static_cast<std::size_t>(rank)] = weight;
+        total_weight += weight;
+    }
+
+    const bool use_min_p     = config.min_p > 0.0f;
+    const bool use_top_p     = config.top_p < 1.0f;
+    const double min_weight  = static_cast<double>(config.min_p) * weights.front();
+    const double top_p_limit = static_cast<double>(config.top_p) * total_weight;
+    double cumulative        = 0.0;
+    int support              = 0;
+    for (int rank = 0; rank < cap; ++rank) {
+        if (use_min_p && weights[static_cast<std::size_t>(rank)] < min_weight) { break; }
+        cumulative += weights[static_cast<std::size_t>(rank)];
+        support = rank + 1;
+        if (use_top_p && cumulative >= top_p_limit) { break; }
+    }
+    support = std::max(support, 1);
+
+    Distribution out;
+    out.tokens.reserve(static_cast<std::size_t>(support));
+    out.probabilities.reserve(static_cast<std::size_t>(support));
+    double kept_weight = 0.0;
+    for (int rank = 0; rank < support; ++rank) {
+        kept_weight += weights[static_cast<std::size_t>(rank)];
+    }
+    for (int rank = 0; rank < support; ++rank) {
+        out.tokens.push_back(candidates[static_cast<std::size_t>(rank)].token);
+        out.probabilities.push_back(weights[static_cast<std::size_t>(rank)] / kept_weight);
     }
     return out;
 }
 
-std::vector<double> softmax(const std::vector<float>& logits) {
-    double m = logits[0];
-    for (float x : logits) { m = std::max(m, static_cast<double>(x)); }
-    std::vector<double> e(logits.size());
-    double sum = 0.0;
-    for (std::size_t i = 0; i < logits.size(); ++i) {
-        e[i] = std::exp(static_cast<double>(logits[i]) - m);
-        sum += e[i];
-    }
-    for (double& x : e) { x /= sum; }
-    return e;
-}
+RunResult run_once(const std::vector<float>& logits, int physical_rows, int token_domain,
+                   int columns, ops::SamplingConfig config, int position, int purpose,
+                   const std::vector<int>* initial_counts = nullptr) {
+    const std::vector<std::uint16_t> input_bits = bf16_bits(logits);
+    DeviceBuffer device_logits                  = to_device(input_bits);
+    GuardedDeviceBuffer device_out(static_cast<std::size_t>(columns) * sizeof(std::int32_t));
+    const std::vector<int> output_sentinel(static_cast<std::size_t>(columns), -777777);
+    device_out.copy_from_host(output_sentinel.data(),
+                              output_sentinel.size() * sizeof(std::int32_t));
 
-std::vector<int> sample_many(const std::vector<float>& base, int cols,
-                             const ops::SamplingConfig& cfg, std::int32_t purpose, int pos_start) {
-    const int vocab             = static_cast<int>(base.size());
-    std::vector<float> logits_h = broadcast_columns(base, cols);
-    DeviceBuffer dlogits        = to_device_bf16(logits_h);
-    DeviceBuffer dout = to_device_i32(std::vector<int>(static_cast<std::size_t>(cols), -1));
-    DeviceBuffer dpos = device_pos(pos_start);
-    DeviceConfig dcfg(cfg);
-    Tensor tlogits(dlogits.p, DType::BF16, {vocab, cols});
-    Tensor tout(dout.p, DType::I32, {cols});
+    std::unique_ptr<GuardedDeviceBuffer> device_counts;
+    if (initial_counts != nullptr) {
+        device_counts =
+            std::make_unique<GuardedDeviceBuffer>(initial_counts->size() * sizeof(std::int32_t));
+        device_counts->copy_from_host(initial_counts->data(),
+                                      initial_counts->size() * sizeof(std::int32_t));
+        config.token_counts = static_cast<std::int32_t*>(device_counts->data());
+    }
+    const ops::SamplingConfig expected_config = config;
+    DeviceBuffer device_config                = to_device(std::vector<ops::SamplingConfig>{config});
+    DeviceBuffer device_pos                   = to_device(std::vector<std::int32_t>{position});
+
+    Tensor logits_tensor(device_logits.p, DType::BF16, {physical_rows, columns});
+    Tensor out_tensor(device_out.data(), DType::I32, {columns});
     WorkspaceArena workspace(
-        std::max<std::size_t>(256, ops::sampling_workspace_bytes(vocab, cols)));
-    ops::sample(tlogits, tout, vocab, dcfg.ptr(), static_cast<const std::int32_t*>(dpos.p), purpose,
-                workspace, nullptr);
-    cudaDeviceSynchronize();
-    return from_device_i32(dout, static_cast<std::size_t>(cols));
-}
+        std::max<std::size_t>(256, ops::sampling_workspace_bytes(token_domain, columns)));
+    ops::sample(logits_tensor, out_tensor, token_domain,
+                static_cast<const ops::SamplingConfig*>(device_config.p),
+                static_cast<const std::int32_t*>(device_pos.p), purpose, workspace, nullptr);
+    cuda_synchronize();
 
-std::vector<int> sample_many_batched(const std::vector<float>& base, int total, int cols,
-                                     ops::SamplingConfig cfg, std::int32_t purpose, int pos_start,
-                                     bool counts_active, int token_domain = 0) {
-    const int vocab = static_cast<int>(base.size());
-    if (token_domain == 0) { token_domain = vocab; }
-    std::vector<float> logits_h = broadcast_columns(base, cols);
-    DeviceBuffer dlogits        = to_device_bf16(logits_h);
-    DeviceBuffer dout = to_device_i32(std::vector<int>(static_cast<std::size_t>(cols), -1));
-    DeviceBuffer dpos = device_pos(pos_start);
-    DeviceBuffer dcollect(static_cast<std::size_t>(total) * sizeof(std::int32_t));
-    DeviceBuffer dcounts(static_cast<std::size_t>(token_domain) * sizeof(std::int32_t));
-    cudaMemset(dcounts.p, 0, dcounts.bytes);
-    if (counts_active) { cfg.token_counts = static_cast<std::int32_t*>(dcounts.p); }
-    DeviceConfig dcfg(cfg);
-    Tensor tlogits(dlogits.p, DType::BF16, {vocab, cols});
-    Tensor tout(dout.p, DType::I32, {cols});
-    WorkspaceArena workspace(
-        std::max<std::size_t>(256, ops::sampling_workspace_bytes(token_domain, cols)));
+    RunResult result;
+    result.tokens = from_device<int>(device_out.data(), static_cast<std::size_t>(columns));
+    result.integrity_failures += device_out.verify_guards("sample output");
+    result.integrity_failures +=
+        verify_exact("sample read-only logits",
+                     from_device<std::uint16_t>(device_logits, input_bits.size()), input_bits);
 
-    int produced = 0;
-    while (produced < total) {
-        const int batch = std::min(cols, total - produced);
-        const int pos   = pos_start + produced;
-        cudaMemcpy(dpos.p, &pos, sizeof(pos), cudaMemcpyHostToDevice);
-        ops::sample(tlogits, tout, token_domain, dcfg.ptr(),
-                    static_cast<const std::int32_t*>(dpos.p), purpose, workspace, nullptr);
-        cudaMemcpyAsync(static_cast<std::int32_t*>(dcollect.p) + produced, dout.p,
-                        static_cast<std::size_t>(batch) * sizeof(std::int32_t),
-                        cudaMemcpyDeviceToDevice, nullptr);
-        produced += batch;
+    const ops::SamplingConfig actual_config =
+        from_device<ops::SamplingConfig>(device_config, 1).front();
+    if (!same_config(actual_config, expected_config)) {
+        std::cerr << "sample modified SamplingConfig\n";
+        ++result.integrity_failures;
     }
-    cudaDeviceSynchronize();
-    return from_device_i32(dcollect, static_cast<std::size_t>(total));
-}
-
-// --- greedy == argmax --------------------------------------------------------
-int greedy_matches_argmax(const char* tag, int vocab, int cols, std::uint32_t seed) {
-    const auto n = static_cast<std::size_t>(vocab) * cols;
-    std::vector<float> logits(n);
-    fill_uniform(logits, seed, -9.0f, 9.0f);
-    // Force ties so the lowest-index tie-break is exercised.
-    for (int t = 0; t < cols && vocab > 1; ++t) {
-        const int b = t * vocab;
-        const int a = (5 + t * 97) % vocab;
-        int bb      = vocab - 1 - ((11 + t * 131) % vocab);
-        if (bb == a) { bb = (a + 1) % vocab; }
-        logits[b + a]  = 24.0f + static_cast<float>(t);
-        logits[b + bb] = 24.0f + static_cast<float>(t);
-    }
-    round_to_bf16(logits);
-
-    std::vector<int> ref(static_cast<std::size_t>(cols));
-    for (int t = 0; t < cols; ++t) {
-        const int b    = t * vocab;
-        int best       = 0;
-        float best_val = logits[b];
-        for (int v = 1; v < vocab; ++v) {
-            if (logits[b + v] > best_val) {
-                best_val = logits[b + v];
-                best     = v;
-            }
-        }
-        ref[t] = best;
-    }
-
-    DeviceBuffer dlogits = to_device_bf16(logits);
-    DeviceBuffer dout    = to_device_i32(std::vector<int>(static_cast<std::size_t>(cols), -1));
-    DeviceBuffer dpos    = device_pos(0);
-    ops::SamplingConfig cfg; // temperature 0 => greedy
-    DeviceConfig dcfg(cfg);
-    Tensor tlogits(dlogits.p, DType::BF16, {vocab, cols});
-    Tensor tout(dout.p, DType::I32, {cols});
-    WorkspaceArena workspace(
-        std::max<std::size_t>(256, ops::sampling_workspace_bytes(vocab, cols)));
-    ops::sample(tlogits, tout, vocab, dcfg.ptr(), static_cast<const std::int32_t*>(dpos.p),
-                ops::kSamplePurposeDecode, workspace, nullptr);
-    cudaDeviceSynchronize();
-    std::vector<int> got = from_device_i32(dout, static_cast<std::size_t>(cols));
-
-    for (int t = 0; t < cols; ++t) {
-        if (got[t] != ref[t]) {
-            std::cerr << tag << ": greedy mismatch at col " << t << " got=" << got[t]
-                      << " ref=" << ref[t] << '\n';
-            return 1;
-        }
-    }
-    std::cout << "    " << tag << " greedy==argmax\n";
-    return 0;
-}
-
-int physical_stride_and_token_domain(int cols, bool stochastic) {
-    constexpr int physical_rows = 248320;
-    constexpr int token_domain  = 248077;
-    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * cols, -20.0f);
-    std::vector<int> expected(static_cast<std::size_t>(cols));
-    for (int col = 0; col < cols; ++col) {
-        const int best                          = (17 + col * 7919) % token_domain;
-        const std::size_t base                  = static_cast<std::size_t>(col) * physical_rows;
-        expected[static_cast<std::size_t>(col)] = best;
-        logits[base + best]                     = 20.0f + col;
-        logits[base + token_domain]             = 100.0f + col;
-        logits[base + physical_rows - 1]        = 200.0f + col;
-    }
-    round_to_bf16(logits);
-
-    DeviceBuffer dlogits = to_device_bf16(logits);
-    DeviceBuffer dout    = to_device_i32(std::vector<int>(static_cast<std::size_t>(cols), -1));
-    DeviceBuffer dpos    = device_pos(0);
-    ops::SamplingConfig cfg;
-    cfg.temperature = stochastic ? 1.0f : 0.0f;
-    cfg.top_k       = 1;
-    DeviceConfig dcfg(cfg);
-    Tensor tlogits(dlogits.p, DType::BF16, {physical_rows, cols});
-    Tensor tout(dout.p, DType::I32, {cols});
-    WorkspaceArena workspace(
-        std::max<std::size_t>(256, ops::sampling_workspace_bytes(token_domain, cols)));
-    ops::sample(tlogits, tout, token_domain, dcfg.ptr(), static_cast<const std::int32_t*>(dpos.p),
-                ops::kSamplePurposeDecode, workspace, nullptr);
-    cudaDeviceSynchronize();
-    const std::vector<int> got = from_device_i32(dout, static_cast<std::size_t>(cols));
-    if (got != expected) {
-        std::cerr << "physical_stride_and_token_domain: " << (stochastic ? "top-k" : "greedy")
-                  << " mismatch for cols=" << cols << '\n';
-        return 1;
-    }
-    std::cout << "    sample physical stride + token domain cols=" << cols << ' '
-              << (stochastic ? "top-k" : "greedy") << " ok\n";
-    return 0;
-}
-
-int signed_zero_tie_cross_partial() {
-    constexpr int vocab    = 1536;
-    constexpr int expected = 17;
-    std::vector<float> logits(vocab, -1.0f);
-    logits[expected] = -0.0f;
-    logits[800]      = 0.0f;
-
-    DeviceBuffer dlogits = to_device_bf16(logits);
-    DeviceBuffer dout    = to_device_i32({-1});
-    DeviceBuffer dpos    = device_pos(0);
-    ops::SamplingConfig cfg;
-    cfg.temperature = 1.0f;
-    cfg.top_k       = 1;
-    DeviceConfig dcfg(cfg);
-    Tensor tlogits(dlogits.p, DType::BF16, {vocab, 1});
-    Tensor tout(dout.p, DType::I32, {1});
-    WorkspaceArena workspace(ops::sampling_workspace_bytes(vocab, 1));
-    ops::sample(tlogits, tout, vocab, dcfg.ptr(), static_cast<const std::int32_t*>(dpos.p),
-                ops::kSamplePurposeDecode, workspace, nullptr);
-    cudaDeviceSynchronize();
-
-    const int got = from_device_i32(dout, 1)[0];
-    if (got != expected) {
-        std::cerr << "signed_zero_tie_cross_partial: got=" << got << " expected=" << expected
+    const int actual_position = from_device<std::int32_t>(device_pos, 1).front();
+    if (actual_position != position) {
+        std::cerr << "sample modified pos_base: got=" << actual_position << " expected=" << position
                   << '\n';
-        return 1;
+        ++result.integrity_failures;
     }
-    std::cout << "    signed-zero cross-partial tie ok\n";
-    return 0;
+
+    if (device_counts != nullptr) {
+        result.counts =
+            from_device<int>(device_counts->data(), static_cast<std::size_t>(token_domain));
+        result.integrity_failures += device_counts->verify_guards("sample token_counts");
+    }
+    return result;
 }
 
-// --- top-k subset ------------------------------------------------------------
-int top_k_subset() {
-    const int vocab = 32;
-    std::vector<float> base(vocab);
-    fill_uniform(base, 123u, -2.0f, 2.0f);
-    // Make a clean top-4 well above the rest so the boundary is unambiguous.
-    for (int i = 0; i < 4; ++i) { base[(i * 7 + 3) % vocab] = 8.0f + static_cast<float>(i); }
-    round_to_bf16(base);
+RunResult run_repeated(const std::vector<float>& column, int token_domain, int total,
+                       int batch_columns, ops::SamplingConfig config, int position, int purpose) {
+    const int physical_rows                     = static_cast<int>(column.size());
+    const std::vector<float> logits             = repeat_column(column, batch_columns);
+    const std::vector<std::uint16_t> input_bits = bf16_bits(logits);
+    DeviceBuffer device_logits                  = to_device(input_bits);
+    GuardedDeviceBuffer device_out(static_cast<std::size_t>(batch_columns) * sizeof(std::int32_t));
+    DeviceBuffer collected(static_cast<std::size_t>(total) * sizeof(std::int32_t));
+    DeviceBuffer device_config                = to_device(std::vector<ops::SamplingConfig>{config});
+    DeviceBuffer device_pos                   = to_device(std::vector<std::int32_t>{position});
+    const ops::SamplingConfig expected_config = config;
 
-    std::vector<int> order(vocab);
-    std::iota(order.begin(), order.end(), 0);
-    std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return base[a] > base[b]; });
-    std::vector<char> allowed(vocab, 0);
-    for (int i = 0; i < 4; ++i) { allowed[order[i]] = 1; }
+    Tensor logits_tensor(device_logits.p, DType::BF16, {physical_rows, batch_columns});
+    Tensor out_tensor(device_out.data(), DType::I32, {batch_columns});
+    WorkspaceArena workspace(
+        std::max<std::size_t>(256, ops::sampling_workspace_bytes(token_domain, batch_columns)));
 
-    ops::SamplingConfig cfg;
-    cfg.temperature      = 1.0f;
-    cfg.top_k            = 4;
-    cfg.seed             = 7u;
-    std::vector<int> got = sample_many(base, 4000, cfg, ops::kSamplePurposeDecode, 0);
-    for (int tok : got) {
-        if (tok < 0 || tok >= vocab || !allowed[tok]) {
-            std::cerr << "top_k_subset: sampled out-of-set token " << tok << '\n';
+    int final_position = position;
+    for (int produced = 0; produced < total; produced += batch_columns) {
+        final_position = position + produced;
+        device_pos.copy_from_host(&final_position, sizeof(final_position));
+        ops::sample(logits_tensor, out_tensor, token_domain,
+                    static_cast<const ops::SamplingConfig*>(device_config.p),
+                    static_cast<const std::int32_t*>(device_pos.p), purpose, workspace, nullptr);
+        cuda_check(cudaMemcpy(static_cast<std::int32_t*>(collected.p) + produced, device_out.data(),
+                              static_cast<std::size_t>(batch_columns) * sizeof(std::int32_t),
+                              cudaMemcpyDeviceToDevice),
+                   "cudaMemcpy sampled batch");
+    }
+    cuda_synchronize();
+
+    RunResult result;
+    result.tokens = from_device_i32(collected, static_cast<std::size_t>(total));
+    result.integrity_failures += device_out.verify_guards("sample repeated output");
+    result.integrity_failures +=
+        verify_exact("sample repeated read-only logits",
+                     from_device<std::uint16_t>(device_logits, input_bits.size()), input_bits);
+    const ops::SamplingConfig actual_config =
+        from_device<ops::SamplingConfig>(device_config, 1).front();
+    if (!same_config(actual_config, expected_config)) {
+        std::cerr << "sample repeated modified SamplingConfig\n";
+        ++result.integrity_failures;
+    }
+    if (from_device<std::int32_t>(device_pos, 1).front() != final_position) {
+        std::cerr << "sample repeated modified pos_base\n";
+        ++result.integrity_failures;
+    }
+    return result;
+}
+
+int verify_distribution(const char* label, const std::vector<int>& samples,
+                        const Distribution& expected) {
+    std::vector<int> observed(expected.tokens.size(), 0);
+    for (int token : samples) {
+        const auto it = std::find(expected.tokens.begin(), expected.tokens.end(), token);
+        if (it == expected.tokens.end()) {
+            std::cerr << label << ": sampled token " << token << " outside oracle support\n";
             return 1;
         }
-    }
-    std::cout << "    top_k subset ok\n";
-    return 0;
-}
-
-// --- top-p nucleus subset ----------------------------------------------------
-int top_p_subset() {
-    const int vocab = 32;
-    std::vector<float> base(vocab);
-    fill_uniform(base, 321u, -3.0f, 3.0f);
-    round_to_bf16(base);
-
-    const std::vector<double> p = softmax(base);
-    std::vector<int> order(vocab);
-    std::iota(order.begin(), order.end(), 0);
-    std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return p[a] > p[b]; });
-
-    const double top_p = 0.9;
-    std::vector<char> allowed(vocab, 0);
-    double cum = 0.0;
-    for (int i = 0; i < vocab; ++i) {
-        allowed[order[i]] = 1;
-        cum += p[order[i]];
-        if (cum >= top_p) { break; }
+        ++observed[static_cast<std::size_t>(it - expected.tokens.begin())];
     }
 
-    ops::SamplingConfig cfg;
-    cfg.temperature      = 1.0f;
-    cfg.top_p            = static_cast<float>(top_p);
-    cfg.seed             = 11u;
-    std::vector<int> got = sample_many(base, 4000, cfg, ops::kSamplePurposeDecode, 0);
-    for (int tok : got) {
-        if (tok < 0 || tok >= vocab || !allowed[tok]) {
-            std::cerr << "top_p_subset: sampled out-of-nucleus token " << tok << '\n';
+    const double n              = static_cast<double>(samples.size());
+    double max_standardized_gap = 0.0;
+    for (std::size_t i = 0; i < expected.tokens.size(); ++i) {
+        const double probability = expected.probabilities[i];
+        const double frequency   = static_cast<double>(observed[i]) / n;
+        const double sigma       = std::sqrt(probability * (1.0 - probability) / n);
+        const double limit       = 7.0 * sigma + 2.0 / n;
+        const double gap         = std::abs(frequency - probability);
+        if (gap > limit) {
+            std::cerr << label << ": token=" << expected.tokens[i] << " frequency=" << frequency
+                      << " oracle=" << probability << " gap=" << gap << " limit=" << limit << '\n';
             return 1;
         }
+        if (sigma > 0.0) { max_standardized_gap = std::max(max_standardized_gap, gap / sigma); }
     }
-    std::cout << "    top_p nucleus subset ok\n";
+    std::cout << "    " << label << " FP64 distribution match (max z=" << max_standardized_gap
+              << ")\n";
     return 0;
 }
 
-// --- min-p subset ------------------------------------------------------------
-int min_p_subset() {
-    const int vocab = 32;
-    std::vector<float> base(vocab);
-    fill_uniform(base, 555u, -3.0f, 3.0f);
-    round_to_bf16(base);
-
-    const std::vector<double> p = softmax(base);
-    const double pmax           = *std::max_element(p.begin(), p.end());
-    const double min_p          = 0.3;
-    std::vector<char> allowed(vocab, 0);
-    for (int v = 0; v < vocab; ++v) {
-        if (p[v] >= min_p * pmax) { allowed[v] = 1; }
-    }
-
-    ops::SamplingConfig cfg;
-    cfg.temperature      = 1.0f;
-    cfg.min_p            = static_cast<float>(min_p);
-    cfg.seed             = 13u;
-    std::vector<int> got = sample_many(base, 4000, cfg, ops::kSamplePurposeDecode, 0);
-    for (int tok : got) {
-        if (tok < 0 || tok >= vocab || !allowed[tok]) {
-            std::cerr << "min_p_subset: sampled out-of-set token " << tok << '\n';
-            return 1;
-        }
-    }
-    std::cout << "    min_p subset ok\n";
-    return 0;
-}
-
-// --- reproducibility ---------------------------------------------------------
-int reproducible() {
-    const int vocab = 16;
-    std::vector<float> base(vocab);
-    fill_uniform(base, 202u, -3.0f, 3.0f);
-    round_to_bf16(base);
-
-    ops::SamplingConfig cfg;
-    cfg.temperature    = 0.8f;
-    cfg.seed           = 42u;
-    std::vector<int> a = sample_many(base, 2000, cfg, ops::kSamplePurposeDecode, 0);
-    std::vector<int> b = sample_many(base, 2000, cfg, ops::kSamplePurposeDecode, 0);
-    if (a != b) {
-        std::cerr << "reproducible: identical seed/pos produced different tokens\n";
-        return 1;
-    }
-
-    ops::SamplingConfig cfg2 = cfg;
-    cfg2.seed                = 43u;
-    std::vector<int> c       = sample_many(base, 2000, cfg2, ops::kSamplePurposeDecode, 0);
-    if (a == c) {
-        std::cerr << "reproducible: different seed produced identical stream\n";
-        return 1;
-    }
-    std::cout << "    reproducibility ok\n";
-    return 0;
-}
-
-// --- distribution match ------------------------------------------------------
-int distribution_match() {
-    const int vocab = 8;
-    std::vector<float> base(vocab);
-    fill_uniform(base, 909u, -2.0f, 2.0f);
-    round_to_bf16(base);
-    const std::vector<double> p = softmax(base);
-
-    ops::SamplingConfig cfg;
-    cfg.temperature      = 1.0f; // full distribution: no truncation
-    cfg.seed             = 2024u;
-    const int N          = 60000;
-    std::vector<int> got = sample_many(base, N, cfg, ops::kSamplePurposeDecode, 0);
-
-    std::vector<double> freq(vocab, 0.0);
-    for (int tok : got) {
-        if (tok < 0 || tok >= vocab) {
-            std::cerr << "distribution_match: token out of range " << tok << '\n';
-            return 1;
-        }
-        freq[tok] += 1.0;
-    }
-    for (double& f : freq) { f /= static_cast<double>(N); }
-
-    double max_abs = 0.0;
-    for (int v = 0; v < vocab; ++v) { max_abs = std::max(max_abs, std::abs(freq[v] - p[v])); }
-    if (max_abs > 0.02) {
-        std::cerr << "distribution_match: empirical/target gap " << max_abs << " too large\n";
-        for (int v = 0; v < vocab; ++v) {
-            std::cerr << "      v=" << v << " freq=" << freq[v] << " p=" << p[v] << '\n';
-        }
-        return 1;
-    }
-    std::cout << "    distribution match ok (max abs diff " << max_abs << ")\n";
-    return 0;
-}
-
-int real_shape_distribution_match() {
+int greedy_contract() {
     constexpr int physical_rows = 248320;
     constexpr int token_domain  = 248077;
-    std::vector<float> base(physical_rows, -20.0f);
-    const int ids[]    = {17, 7919, 65537, 200003};
-    const float vals[] = {3.0f, 2.0f, 1.0f, 0.0f};
-    for (int i = 0; i < 4; ++i) { base[ids[i]] = vals[i]; }
-    round_to_bf16(base);
-
-    std::vector<float> support(vals, vals + 4);
-    const std::vector<double> p = softmax(support);
-
-    ops::SamplingConfig cfg;
-    cfg.temperature = 1.0f;
-    cfg.top_k       = 4;
-    cfg.seed        = 20260706u;
-    const int N     = 4096;
-    std::vector<int> got =
-        sample_many_batched(base, N, 8, cfg, ops::kSamplePurposeDecode, 1000, false, token_domain);
-
-    std::vector<double> freq(4, 0.0);
-    for (int tok : got) {
-        int slot = -1;
-        for (int i = 0; i < 4; ++i) {
-            if (tok == ids[i]) {
-                slot = i;
-                break;
-            }
-        }
-        if (slot < 0) {
-            std::cerr << "real_shape_distribution: token out of support " << tok << '\n';
-            return 1;
-        }
-        freq[slot] += 1.0;
+    constexpr int columns       = 3;
+    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * columns, -9.0f);
+    for (int column = 0; column < columns; ++column) {
+        const std::size_t base = static_cast<std::size_t>(column) * physical_rows;
+        int first              = (17 + 7919 * column) % token_domain;
+        int second             = token_domain - 1 - ((31 + 65537 * column) % token_domain);
+        if (second == first) { second = (first + 1) % token_domain; }
+        if (second < first) { std::swap(first, second); }
+        logits[base + first]             = column == 0 ? -0.0f : 16.0f + column;
+        logits[base + second]            = column == 0 ? 0.0f : 16.0f + column;
+        logits[base + token_domain]      = 100.0f;
+        logits[base + physical_rows - 1] = 200.0f;
     }
-    for (double& f : freq) { f /= static_cast<double>(N); }
+    round_to_bf16(logits);
 
-    double max_abs = 0.0;
-    for (int i = 0; i < 4; ++i) { max_abs = std::max(max_abs, std::abs(freq[i] - p[i])); }
-    if (max_abs > 0.04) {
-        std::cerr << "real_shape_distribution: empirical/target gap " << max_abs << " too large\n";
-        for (int i = 0; i < 4; ++i) {
-            std::cerr << "      token=" << ids[i] << " freq=" << freq[i] << " p=" << p[i] << '\n';
-        }
-        return 1;
-    }
-    std::cout << "    real-shape distribution match ok (max abs diff " << max_abs << ")\n";
-    return 0;
+    std::vector<int> counts(static_cast<std::size_t>(token_domain), 0);
+    counts[17] = 9;
+    ops::SamplingConfig config;
+    config.temperature       = 0.0f;
+    config.top_k             = 1;
+    config.top_p             = 0.01f;
+    config.min_p             = 0.99f;
+    config.presence_penalty  = 100.0f;
+    config.frequency_penalty = 100.0f;
+    config.seed              = 12345;
+
+    const RunResult result = run_once(logits, physical_rows, token_domain, columns, config, 77,
+                                      ops::kSamplePurposeDecode, &counts);
+    int failures           = result.integrity_failures;
+    failures += verify_exact("sample greedy mathematical result", result.tokens,
+                             greedy_oracle(logits, physical_rows, token_domain, columns));
+    failures += verify_exact("sample greedy skips token_counts updates", result.counts, counts);
+    return failures;
 }
 
-int real_shape_reproducible_counts_active() {
-    constexpr int physical_rows = 248320;
-    constexpr int token_domain  = 248077;
-    std::vector<float> base(physical_rows, -18.0f);
-    for (int i = 0; i < 20; ++i) {
-        base[(17 + i * 7919) % token_domain] = 4.0f - 0.08f * static_cast<float>(i);
-    }
-    round_to_bf16(base);
+int deterministic_stochastic_contract() {
+    std::vector<float> column = {5.0f, 4.5f, 4.0f, 3.0f, -1.0f};
+    round_to_bf16(column);
+    int failures = 0;
 
-    ops::SamplingConfig cfg;
-    cfg.temperature      = 0.6f;
-    cfg.top_k            = 20;
-    cfg.top_p            = 0.95f;
-    cfg.presence_penalty = 1.0f;
-    cfg.seed             = 123456u;
-    const int N          = 1024;
-    std::vector<int> a =
-        sample_many_batched(base, N, 8, cfg, ops::kSamplePurposeDecode, 2000, true, token_domain);
-    std::vector<int> b =
-        sample_many_batched(base, N, 8, cfg, ops::kSamplePurposeDecode, 2000, true, token_domain);
-    if (a != b) {
-        std::cerr << "real_shape_reproducible: identical seed/count path diverged\n";
-        return 1;
+    struct Case {
+        const char* label;
+        float presence;
+        float frequency;
+        std::vector<int> counts;
+    };
+
+    const Case cases[] = {
+        {"sample positive-temperature presence penalty", 1.0f, 0.0f, {1, 0, 0, 0, 0}},
+        {"sample positive-temperature frequency penalty", 0.0f, 0.5f, {2, 0, 0, 0, 0}},
+        {"sample adjusted-logit tie break", 0.5f, 0.0f, {1, 0, 0, 0, 0}},
+    };
+    for (const Case& test_case : cases) {
+        ops::SamplingConfig config;
+        config.temperature       = 0.8f;
+        config.top_k             = 1;
+        config.presence_penalty  = test_case.presence;
+        config.frequency_penalty = test_case.frequency;
+        config.seed              = 9981;
+        const Distribution oracle =
+            distribution_oracle(column, static_cast<int>(column.size()), config, &test_case.counts);
+        RunResult result =
+            run_once(column, static_cast<int>(column.size()), static_cast<int>(column.size()), 1,
+                     config, 11, ops::kSamplePurposeDecode, &test_case.counts);
+
+        std::vector<int> expected_counts = test_case.counts;
+        ++expected_counts[static_cast<std::size_t>(oracle.tokens.front())];
+        failures += result.integrity_failures;
+        failures += verify_exact(test_case.label, result.tokens, {oracle.tokens.front()});
+        failures +=
+            verify_exact("sample increments only selected token", result.counts, expected_counts);
     }
-    ops::SamplingConfig cfg2 = cfg;
-    cfg2.seed                = 123457u;
-    std::vector<int> c =
-        sample_many_batched(base, N, 8, cfg2, ops::kSamplePurposeDecode, 2000, true, token_domain);
-    if (a == c) {
-        std::cerr << "real_shape_reproducible: different seed produced identical stream\n";
-        return 1;
-    }
-    std::cout << "    real-shape reproducibility with counts ok\n";
-    return 0;
+    return failures;
 }
 
-// cols==1 stochastic decode path at real vocab. This is the single-column path
-// (formerly the fused kernel, now the shared two-launch partial+group merge) that
-// no earlier test exercised, which is how F1 slipped through.
-int real_shape_col1_distribution_match() {
-    constexpr int physical_rows = 248320;
-    constexpr int token_domain  = 248077;
-    std::vector<float> base(physical_rows, -20.0f);
-    const int ids[]    = {17, 7919, 65537, 200003};
-    const float vals[] = {3.0f, 2.0f, 1.0f, 0.0f};
-    for (int i = 0; i < 4; ++i) { base[ids[i]] = vals[i]; }
-    round_to_bf16(base);
+int filtered_distribution_contract() {
+    std::vector<float> column = {3.0f, 2.7f,  2.7f,  2.1f,  1.5f,  0.7f,
+                                 0.1f, -0.4f, -1.0f, -2.0f, -3.0f, -4.0f};
+    round_to_bf16(column);
+    ops::SamplingConfig config;
+    config.temperature = 0.75f;
+    config.top_k       = 6;
+    config.top_p       = 0.86f;
+    config.min_p       = 0.12f;
+    config.seed        = 20260726;
 
-    std::vector<float> support(vals, vals + 4);
-    const std::vector<double> p = softmax(support);
-
-    ops::SamplingConfig cfg;
-    cfg.temperature = 1.0f;
-    cfg.top_k       = 20;
-    cfg.seed        = 20260707u;
-    const int N     = 4096;
-    std::vector<int> got =
-        sample_many_batched(base, N, 1, cfg, ops::kSamplePurposeDecode, 1000, false, token_domain);
-
-    std::vector<double> freq(4, 0.0);
-    for (int tok : got) {
-        int slot = -1;
-        for (int i = 0; i < 4; ++i) {
-            if (tok == ids[i]) {
-                slot = i;
-                break;
-            }
-        }
-        if (slot < 0) {
-            std::cerr << "real_shape_col1_distribution: token out of support " << tok << '\n';
-            return 1;
-        }
-        freq[slot] += 1.0;
-    }
-    for (double& f : freq) { f /= static_cast<double>(N); }
-
-    double max_abs = 0.0;
-    for (int i = 0; i < 4; ++i) { max_abs = std::max(max_abs, std::abs(freq[i] - p[i])); }
-    if (max_abs > 0.04) {
-        std::cerr << "real_shape_col1_distribution: empirical/target gap " << max_abs
-                  << " too large\n";
-        for (int i = 0; i < 4; ++i) {
-            std::cerr << "      token=" << ids[i] << " freq=" << freq[i] << " p=" << p[i] << '\n';
-        }
+    const Distribution oracle =
+        distribution_oracle(column, static_cast<int>(column.size()), config);
+    if (oracle.tokens.size() < 2 || oracle.tokens.size() >= 6) {
+        std::cerr << "filtered distribution fixture did not exercise both filters\n";
         return 1;
     }
-    std::cout << "    real-shape cols=1 distribution match ok (max abs diff " << max_abs << ")\n";
-    return 0;
+
+    constexpr int samples           = 16384;
+    const std::vector<float> logits = repeat_column(column, samples);
+    const RunResult result =
+        run_once(logits, static_cast<int>(column.size()), static_cast<int>(column.size()), samples,
+                 config, 400, ops::kSamplePurposeDecode);
+    return result.integrity_failures +
+           verify_distribution("sample top-k/top-p/min-p", result.tokens, oracle);
 }
 
-// F1 regression: top_k above the internal cap (or <= 0) must clamp to 20 and
-// yield the identical, correct distribution rather than collapsing onto one
-// token. Before the fix, top_k=64/0 overflowed the merge tile at real vocab and
-// the cols==1 path collapsed entirely onto id 17.
-int topk_clamp_equivalence() {
+int capped_distribution_contract() {
+    std::vector<float> column(24, 0.0f);
+    for (int token = 0; token < 24; ++token) {
+        column[static_cast<std::size_t>(token)] = 2.0f - 0.1f * token;
+    }
+    round_to_bf16(column);
+    ops::SamplingConfig config;
+    config.temperature = 1.1f;
+    config.top_k       = 64;
+    config.seed        = 884422;
+
+    const Distribution oracle =
+        distribution_oracle(column, static_cast<int>(column.size()), config);
+    if (oracle.tokens.size() != 20) {
+        std::cerr << "top-k cap oracle fixture has unexpected support\n";
+        return 1;
+    }
+
+    constexpr int samples = 16384;
+    const RunResult result =
+        run_once(repeat_column(column, samples), static_cast<int>(column.size()),
+                 static_cast<int>(column.size()), samples, config, 900, ops::kSamplePurposePrefill);
+    return result.integrity_failures +
+           verify_distribution("sample top-k public cap", result.tokens, oracle);
+}
+
+int real_shape_distribution_contract() {
     constexpr int physical_rows = 248320;
     constexpr int token_domain  = 248077;
-    std::vector<float> base(physical_rows, -20.0f);
-    const int ids[]    = {17, 7919, 65537, 200003};
-    const float vals[] = {3.0f, 2.0f, 1.0f, 0.0f};
-    for (int i = 0; i < 4; ++i) { base[ids[i]] = vals[i]; }
-    round_to_bf16(base);
+    std::vector<float> column(physical_rows, -20.0f);
+    const int ids[]      = {17, 7919, 65537, 200003};
+    const float logits[] = {3.0f, 2.0f, 1.0f, 0.0f};
+    for (int i = 0; i < 4; ++i) { column[ids[i]] = logits[i]; }
+    column[token_domain]      = 100.0f;
+    column[physical_rows - 1] = 200.0f;
+    round_to_bf16(column);
 
-    std::vector<float> support(vals, vals + 4);
-    const std::vector<double> p = softmax(support);
+    ops::SamplingConfig config;
+    config.temperature        = 1.0f;
+    config.top_k              = 4;
+    config.seed               = 7654321;
+    const Distribution oracle = distribution_oracle(column, token_domain, config);
 
-    const int N       = 4096;
-    const int topks[] = {20, 64, 0};
-    std::vector<std::vector<int>> streams;
-    for (int topk : topks) {
-        ops::SamplingConfig cfg;
-        cfg.temperature = 1.0f;
-        cfg.top_k       = topk;
-        cfg.seed        = 424242u;
-        streams.push_back(sample_many_batched(base, N, 1, cfg, ops::kSamplePurposeDecode, 500,
-                                              false, token_domain));
-    }
+    constexpr int samples = 4096;
+    RunResult result =
+        run_repeated(column, token_domain, samples, 1, config, 2000, ops::kSamplePurposeDecode);
+    return result.integrity_failures +
+           verify_distribution("sample real token-domain T=1", result.tokens, oracle);
+}
 
-    for (std::size_t s = 1; s < streams.size(); ++s) {
-        if (streams[s] != streams[0]) {
-            std::cerr << "topk_clamp_equivalence: top_k=" << topks[s]
-                      << " stream differs from top_k=20 (clamp not applied)\n";
-            return 1;
-        }
-    }
+int rng_key_contract() {
+    std::vector<float> column = {0.0f, 0.0f};
+    round_to_bf16(column);
+    ops::SamplingConfig config;
+    config.temperature = 1.0f;
+    config.top_k       = 2;
+    config.seed        = 424242;
 
-    std::vector<double> freq(4, 0.0);
-    for (int tok : streams[0]) {
-        int slot = -1;
-        for (int i = 0; i < 4; ++i) {
-            if (tok == ids[i]) {
-                slot = i;
-                break;
-            }
-        }
-        if (slot < 0) {
-            std::cerr << "topk_clamp_equivalence: token out of support " << tok << '\n';
-            return 1;
-        }
-        freq[slot] += 1.0;
-    }
-    for (double& f : freq) { f /= static_cast<double>(N); }
+    constexpr int columns    = 128;
+    const RunResult baseline = run_once(repeat_column(column, columns), 2, 2, columns, config, 100,
+                                        ops::kSamplePurposeDecode);
+    const RunResult repeat   = run_once(repeat_column(column, columns), 2, 2, columns, config, 100,
+                                        ops::kSamplePurposeDecode);
+    const RunResult shifted  = run_once(repeat_column(column, columns - 1), 2, 2, columns - 1,
+                                        config, 101, ops::kSamplePurposeDecode);
+    const RunResult other_purpose = run_once(repeat_column(column, columns), 2, 2, columns, config,
+                                             100, ops::kSamplePurposePrefill);
+    ops::SamplingConfig other_seed_config = config;
+    ++other_seed_config.seed;
+    const RunResult other_seed = run_once(repeat_column(column, columns), 2, 2, columns,
+                                          other_seed_config, 100, ops::kSamplePurposeDecode);
 
-    if (freq[0] > 0.95) {
-        std::cerr << "topk_clamp_equivalence: distribution collapsed onto token " << ids[0]
-                  << " (freq=" << freq[0] << ")\n";
-        return 1;
+    int failures = baseline.integrity_failures + repeat.integrity_failures +
+                   shifted.integrity_failures + other_purpose.integrity_failures +
+                   other_seed.integrity_failures;
+    failures += verify_exact("sample identical counter key is reproducible", repeat.tokens,
+                             baseline.tokens);
+    failures += verify_exact("sample position selects the corresponding counter", shifted.tokens,
+                             std::vector<int>(baseline.tokens.begin() + 1, baseline.tokens.end()));
+    if (other_purpose.tokens == baseline.tokens) {
+        std::cerr << "sample purpose did not separate the counter stream\n";
+        ++failures;
     }
-    double max_abs = 0.0;
-    for (int i = 0; i < 4; ++i) { max_abs = std::max(max_abs, std::abs(freq[i] - p[i])); }
-    if (max_abs > 0.04) {
-        std::cerr << "topk_clamp_equivalence: empirical/target gap " << max_abs << " too large\n";
-        return 1;
+    if (other_seed.tokens == baseline.tokens) {
+        std::cerr << "sample seed did not separate the counter stream\n";
+        ++failures;
     }
-    std::cout << "    top_k clamp equivalence ok (max abs diff " << max_abs << ")\n";
-    return 0;
+    return failures;
 }
 
 } // namespace
@@ -614,27 +476,14 @@ int main() {
         return 0;
     }
 
-    int f = 0;
-    for (std::uint32_t seed : {1u, 7u, 99u}) {
-        f += greedy_matches_argmax("sample [257,1]", 257, 1, seed);
-        f += greedy_matches_argmax("sample [257,3]", 257, 3, seed);
-        f += greedy_matches_argmax("sample [248320,1]", 248320, 1, seed);
-    }
-    f += physical_stride_and_token_domain(1, false);
-    f += physical_stride_and_token_domain(1, true);
-    f += physical_stride_and_token_domain(3, false);
-    f += physical_stride_and_token_domain(3, true);
-    f += signed_zero_tie_cross_partial();
-    f += top_k_subset();
-    f += top_p_subset();
-    f += min_p_subset();
-    f += reproducible();
-    f += distribution_match();
-    f += real_shape_distribution_match();
-    f += real_shape_col1_distribution_match();
-    f += topk_clamp_equivalence();
-    f += real_shape_reproducible_counts_active();
+    int failures = 0;
+    failures += greedy_contract();
+    failures += deterministic_stochastic_contract();
+    failures += filtered_distribution_contract();
+    failures += capped_distribution_contract();
+    failures += real_shape_distribution_contract();
+    failures += rng_key_contract();
 
-    std::cout << (f ? "FAIL" : "OK") << " sample correctness\n";
-    return f ? 1 : 0;
+    std::cout << (failures == 0 ? "OK" : "FAIL") << " sample public contract\n";
+    return failures == 0 ? 0 : 1;
 }

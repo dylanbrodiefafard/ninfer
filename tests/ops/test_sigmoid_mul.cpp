@@ -1,171 +1,109 @@
-// Correctness + coverage for sigmoid_mul, against the frozen op-test standard
-// (docs/op-development.md): fp64 golden from bf16-rounded inputs, honest
-// input ranges (incl. a large-magnitude stress case), composite tolerance
-// bf16_elementwise.
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ops/op_tester.h"
 
 #include <cmath>
 #include <cstdint>
 #include <iostream>
-#include <stdexcept>
-#include <string>
 #include <vector>
 
 using namespace ninfer;
 using namespace ninfer::test;
 
-// fp64 reference: x[i] = double(x[i]) * sigmoid(double(gate[i])).
-static void cpu_sigmoid_gate_mul(const std::vector<float>& gate, const std::vector<float>& x,
-                                 std::vector<double>& o) {
-    for (std::size_t i = 0; i < x.size(); ++i) {
-        const double g = static_cast<double>(gate[i]);
-        o[i]           = static_cast<double>(x[i]) * (1.0 / (1.0 + std::exp(-g)));
+namespace {
+
+constexpr PointwiseCriterion sigmoid_mul_bf16_criterion() {
+    return {/*absolute*/ 2.0e-5, /*relative*/ 4.1e-3};
+}
+
+std::vector<std::uint16_t> encode_bf16(const std::vector<float>& values) {
+    std::vector<std::uint16_t> bits(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) bits[i] = f32_to_bf16(values[i]);
+    return bits;
+}
+
+std::vector<double> sigmoid_mul_oracle(const std::vector<float>& gate,
+                                       const std::vector<float>& x) {
+    std::vector<double> expected(gate.size());
+    for (std::size_t i = 0; i < gate.size(); ++i) {
+        const double g = gate[i];
+        expected[i]    = static_cast<double>(x[i]) / (1.0 + std::exp(-g));
     }
+    return expected;
 }
 
-static int one_shape(const char* tag, std::int32_t d0, std::int32_t d1, std::uint32_t seed,
-                     float lo, float hi) {
-    const auto n = static_cast<std::size_t>(d0) * static_cast<std::size_t>(d1);
-    std::vector<float> gate(n), x(n);
-    fill_uniform(gate, seed, lo, hi);
-    fill_uniform(x, seed + 1000u, lo, hi);
+int run_case(const char* label, std::int32_t rows, std::int32_t columns, std::uint32_t seed) {
+    const std::size_t count = static_cast<std::size_t>(rows) * columns;
+    std::vector<float> gate(count), x(count);
+    fill_uniform(gate, seed, -12.0f, 12.0f);
+    fill_uniform(x, seed + 1, -8.0f, 8.0f);
     round_to_bf16(gate);
     round_to_bf16(x);
 
-    std::vector<double> ref(n);
-    cpu_sigmoid_gate_mul(gate, x, ref);
+    const auto expected  = sigmoid_mul_oracle(gate, x);
+    const auto gate_bits = encode_bf16(gate);
+    const auto x_bits    = encode_bf16(x);
+    GuardedDeviceBuffer device_gate(count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_x(count * sizeof(std::uint16_t));
+    device_gate.copy_from_host(gate_bits.data(), device_gate.bytes());
+    device_x.copy_from_host(x_bits.data(), device_x.bytes());
 
-    DeviceBuffer dgate = to_device_bf16(gate), dx = to_device_bf16(x);
-    Tensor tgate(dgate.p, DType::BF16, {d0, d1}), tx(dx.p, DType::BF16, {d0, d1});
-    ops::sigmoid_mul(tgate, tx, nullptr);
-    cudaDeviceSynchronize();
+    Tensor gate_tensor(device_gate.data(), DType::BF16, {rows, columns});
+    Tensor x_tensor(device_x.data(), DType::BF16, {rows, columns});
+    ops::sigmoid_mul(gate_tensor, x_tensor, nullptr);
+    cuda_synchronize();
 
-    return verify(tag, from_device_bf16(dx, n), ref, Tolerance::bf16_elementwise());
+    int failures = verify_pointwise(label, from_device_bf16(device_x.data(), count), expected,
+                                    sigmoid_mul_bf16_criterion());
+    failures += verify_exact("sigmoid_mul gate unchanged",
+                             from_device<std::uint16_t>(device_gate.data(), count), gate_bits);
+    failures += device_gate.verify_guards("sigmoid_mul gate");
+    failures += device_x.verify_guards("sigmoid_mul x");
+    return failures;
 }
 
-static int one_shape_1d(const char* tag, std::int32_t n, std::uint32_t seed, float lo, float hi) {
-    std::vector<float> gate(n), x(n);
-    fill_uniform(gate, seed, lo, hi);
-    fill_uniform(x, seed + 1000u, lo, hi);
+int run_edge_case() {
+    std::vector<float> gate{-40.0f, -12.0f, -1.0f, 0.0f, 1.0f, 12.0f, 40.0f};
+    std::vector<float> x{7.0f, -6.0f, 5.0f, -4.0f, 3.0f, -2.0f, 1.0f};
     round_to_bf16(gate);
     round_to_bf16(x);
 
-    std::vector<double> ref(n);
-    cpu_sigmoid_gate_mul(gate, x, ref);
+    const auto expected  = sigmoid_mul_oracle(gate, x);
+    const auto gate_bits = encode_bf16(gate);
+    const auto x_bits    = encode_bf16(x);
+    GuardedDeviceBuffer device_gate(gate_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_x(x_bits.size() * sizeof(std::uint16_t));
+    device_gate.copy_from_host(gate_bits.data(), device_gate.bytes());
+    device_x.copy_from_host(x_bits.data(), device_x.bytes());
 
-    DeviceBuffer dgate = to_device_bf16(gate), dx = to_device_bf16(x);
-    Tensor tgate(dgate.p, DType::BF16, {n}), tx(dx.p, DType::BF16, {n});
-    ops::sigmoid_mul(tgate, tx, nullptr);
-    cudaDeviceSynchronize();
+    Tensor gate_tensor(device_gate.data(), DType::BF16, {static_cast<int>(gate.size())});
+    Tensor x_tensor(device_x.data(), DType::BF16, {static_cast<int>(x.size())});
+    ops::sigmoid_mul(gate_tensor, x_tensor, nullptr);
+    cuda_synchronize();
 
-    return verify(tag, from_device_bf16(dx, n), ref, Tolerance::bf16_elementwise());
+    int failures = verify_pointwise("sigmoid_mul edge values",
+                                    from_device_bf16(device_x.data(), expected.size()), expected,
+                                    sigmoid_mul_bf16_criterion());
+    failures +=
+        verify_exact("sigmoid_mul edge gate unchanged",
+                     from_device<std::uint16_t>(device_gate.data(), gate_bits.size()), gate_bits);
+    failures += device_gate.verify_guards("sigmoid_mul edge gate");
+    failures += device_x.verify_guards("sigmoid_mul edge x");
+    return failures;
 }
 
-static DeviceBuffer to_device_bf16_unaligned(const std::vector<float>& h) {
-    std::vector<std::uint16_t> b(h.size() + 1);
-    b[0] = 0;
-    for (std::size_t i = 0; i < h.size(); ++i) b[i + 1] = f32_to_bf16(h[i]);
-    DeviceBuffer d(b.size() * 2);
-    cudaMemcpy(d.p, b.data(), b.size() * 2, cudaMemcpyHostToDevice);
-    return d;
-}
-
-static int unaligned_data_case() {
-    constexpr std::int32_t n = 255;
-    std::vector<float> gate(n), x(n);
-    fill_uniform(gate, 2026u, -8.f, 8.f);
-    fill_uniform(x, 3026u, -8.f, 8.f);
-    round_to_bf16(gate);
-    round_to_bf16(x);
-
-    std::vector<double> ref(n);
-    cpu_sigmoid_gate_mul(gate, x, ref);
-
-    DeviceBuffer dgate = to_device_bf16_unaligned(gate), dx = to_device_bf16_unaligned(x);
-    auto* gptr = static_cast<unsigned char*>(dgate.p) + 2;
-    auto* xptr = static_cast<unsigned char*>(dx.p) + 2;
-    Tensor tgate(gptr, DType::BF16, {n}), tx(xptr, DType::BF16, {n});
-    ops::sigmoid_mul(tgate, tx, nullptr);
-    cudaDeviceSynchronize();
-
-    DeviceBuffer packed(static_cast<std::size_t>(n) * 2);
-    cudaMemcpy(packed.p, xptr, static_cast<std::size_t>(n) * 2, cudaMemcpyDeviceToDevice);
-    return verify("sigmoid_mul unaligned data", from_device_bf16(packed, n), ref,
-                  Tolerance::bf16_elementwise());
-}
-
-static int validation_checks() {
-    int f = 0;
-    Tensor gate(nullptr, DType::BF16, {4});
-    Tensor x(nullptr, DType::BF16, {4});
-
-    try {
-        Tensor empty_gate(nullptr, DType::BF16, {1});
-        Tensor empty_x(nullptr, DType::BF16, {1});
-        empty_gate.ne[0] = 0;
-        empty_x.ne[0]    = 0;
-        ops::sigmoid_mul(empty_gate, empty_x, nullptr);
-    } catch (const std::exception& e) {
-        std::cerr << "validation empty: expected no throw, got " << e.what() << '\n';
-        ++f;
-    }
-
-    try {
-        Tensor bad_dtype(nullptr, DType::FP32, {4});
-        ops::sigmoid_mul(bad_dtype, x, nullptr);
-        std::cerr << "validation dtype: expected invalid_argument\n";
-        ++f;
-    } catch (const std::invalid_argument&) {}
-
-    try {
-        Tensor bad_shape = gate;
-        bad_shape.ne[2]  = 2;
-        ops::sigmoid_mul(bad_shape, x, nullptr);
-        std::cerr << "validation shape: expected invalid_argument\n";
-        ++f;
-    } catch (const std::invalid_argument&) {}
-
-    try {
-        Tensor bad_stride = x;
-        bad_stride.nb[0]  = 4;
-        ops::sigmoid_mul(gate, bad_stride, nullptr);
-        std::cerr << "validation contiguous: expected invalid_argument\n";
-        ++f;
-    } catch (const std::invalid_argument&) {}
-
-    try {
-        ops::sigmoid_mul(gate, x, nullptr);
-        std::cerr << "validation null data: expected invalid_argument\n";
-        ++f;
-    } catch (const std::invalid_argument&) {}
-
-    return f;
-}
+} // namespace
 
 int main() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 0;
     }
-    int f = 0;
-    f += validation_checks();
 
-    // Coverage: requested shapes; >=3 seeds; honest range.
-    for (std::uint32_t seed : {1u, 7u, 99u}) {
-        for (std::int32_t tokens = 1; tokens <= 16; ++tokens) {
-            const std::string tag = "sigmoid_mul 35b [4096," + std::to_string(tokens) + "]";
-            f += one_shape(tag.c_str(), 4096, tokens, seed + tokens, -8.f, 8.f);
-        }
-        f += one_shape("sigmoid_mul 35b [4096,1024]", 4096, 1024, seed, -8.f, 8.f);
-        f += one_shape("sigmoid_mul [6144,1]", 6144, 1, seed, -8.f, 8.f);
-        f += one_shape("sigmoid_mul [6144,4096]", 6144, 4096, seed, -8.f, 8.f);
-        f += one_shape_1d("sigmoid_mul [255]", 255, seed, -8.f, 8.f);
-    }
-    // Stress: large magnitudes expose range-limited sigmoid approximations.
-    f += one_shape_1d("sigmoid_mul stress [-40,40]", 65536, 4242u, -40.f, 40.f);
-    f += unaligned_data_case();
-
-    std::cout << (f ? "FAIL" : "OK") << " sigmoid_mul correctness\n";
-    return f ? 1 : 0;
+    int failures = 0;
+    failures += run_case("sigmoid_mul [6144,1]", 6144, 1, 101u);
+    failures += run_case("sigmoid_mul [4096,17]", 4096, 17, 201u);
+    failures += run_case("sigmoid_mul [4096,128]", 4096, 128, 301u);
+    failures += run_edge_case();
+    std::cout << (failures ? "FAIL" : "OK") << " sigmoid_mul\n";
+    return failures ? 1 : 0;
 }

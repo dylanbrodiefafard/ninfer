@@ -368,22 +368,21 @@ remain consistent.
   decode;
 - the target's INT8 attention path intentionally quantizes Q to Q8-G64 for production computation;
   this native compute profile does not replace BF16 Q in the common ideal oracle, and its delta is
-  accepted through the separate named INT8 tolerance rather than the BF16 tolerance;
+  accepted through the separate named INT8-cache compute-profile criterion;
 - the full target `lm_head` is used for prefill, verification, and ordinary decode regardless of
   draft-head mode.
 
 These points define public representations and mathematical oracles, not a mandatory kernel
 operation order. Private accumulator precision, Tensor Core operand staging, intermediate
 materialization, workspace dtype, and reduction association are selected by each implementation
-route and accepted against the corresponding oracle tolerance.
+route and accepted against the Op's criterion for that implementation profile.
 
 GQA numerical qualification covers both registered geometries, supported prompt and small-T
 regimes, the maintained conformance matrix, and target-representative activation ranges. Its
-`Tolerance::attention_bf16()` and `Tolerance::attention_int8()` acceptance envelopes are explicit
-named standards in `tests/ops/op_check.h`; they are not claimed as pointwise bounds for every
-arbitrary or adversarial BF16 tensor. A1 append-and-attend and A3 cached-only attention are each
-checked directly against the common ideal oracle. Equality between those different numerical paths
-is not a contract or acceptance test.
+BF16-cache and INT8-cache compute-profile criteria are explicitly named in the GQA conformance
+suite; they are not claimed as pointwise bounds for every arbitrary or adversarial BF16 tensor. A1
+append-and-attend and A3 cached-only attention are each checked directly against the common ideal
+oracle. Equality between those different numerical paths is not a contract or acceptance test.
 
 ## 13. State inventory
 

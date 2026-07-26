@@ -165,8 +165,12 @@ x   [K,T] BF16
 w   [N,K] registered persistent weight
 out [N,T] BF16
 
-out[n,t] = BF16(sum_k decode(w[n,k]) * BF16(x[k,t]))
+ideal[n,t] = sum_k decode(w[n,k]) * represented_bf16(x[k,t])
+out         = BF16 storage approximation of ideal
 ```
+
+统一 CPU oracle 保留 `ideal` 的 double 累加结果；测试将 GPU 的 BF16 输出提升后直接与其比较。
+最终输出存储舍入属于 A16/A8 compute profile 的验收判据，不在 oracle 内复刻。
 
 `LinearPolicy` 是许可，不是 kernel 选择命令。无 policy overload 精确等价于
 `LinearPolicy::A16Only`。
@@ -775,7 +779,7 @@ variant 字段。它的 function identity 已经完整确定执行 leaf。
 - packed payload 与被选 oracle rows 的 logical float materialization；
 - `cpu_linear_gemm_fp64()`；
 - output poison、完整写入、guards、确定性采样和 public call mechanics；
-- `ActivationCompute -> LinearTolerance` 集中映射和比较逻辑。
+- `ActivationCompute -> ReductionCriterion` 集中映射，并复用公共 reduction 比较逻辑。
 
 CPU GEMM 可以按输出行多线程并对 T 小块化以复用 weight load，但每个输出始终由一个
 线程按 `k=0..K-1` 顺序 double 累加。它不使用 BLAS、production decoder、production

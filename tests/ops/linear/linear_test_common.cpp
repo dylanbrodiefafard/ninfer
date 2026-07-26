@@ -1,6 +1,7 @@
 #include "ops/linear/linear_test_common.h"
 
 #include "core/arena.h"
+#include "ops/op_tester.h"
 
 #include <cuda_runtime.h>
 
@@ -41,15 +42,9 @@ constexpr FormatSpec kQ5Spec{QType::Q5G64_F16S, 5, 64, 32, 8};
 constexpr FormatSpec kQ6Spec{QType::Q6G64_F16S, 6, 64, 32, 16};
 constexpr FormatSpec kW8Spec{QType::W8G32_F16S, 8, 32, 32, 0};
 
-struct LinearTolerance {
-    double relative_l2;
-    double gross_absolute;
-    double gross_relative_to_max_reference;
-};
-
 // The criterion belongs to the activation compute path, not to a private kernel, schedule, or
 // launcher selected inside that path.
-constexpr LinearTolerance tolerance_for(ActivationCompute activation_compute) {
+constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute) {
     switch (activation_compute) {
     case ActivationCompute::A16:
         return {3.0e-3, 4.0e-3, 3.5e-3};
@@ -81,11 +76,6 @@ bool report_statistics() {
         return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
     }();
     return enabled;
-}
-
-void cuda_check(cudaError_t status, const char* operation) {
-    if (status == cudaSuccess) { return; }
-    throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
 }
 
 std::size_t checked_elements(std::int32_t first, std::int32_t second, const char* label) {
@@ -375,37 +365,20 @@ SimulatedLinearWeight make_weight(const FormatSpec& spec, std::int32_t n, std::i
 class GuardedOutput {
 public:
     explicit GuardedOutput(std::size_t words)
-        : words_(words), storage_(words * sizeof(std::uint16_t) + 2 * kOutputGuardBytes) {
+        : storage_(words * sizeof(std::uint16_t), kOutputGuardBytes, kOutputGuardByte) {
         poison();
     }
 
-    void* data() const { return static_cast<std::uint8_t*>(storage_.p) + kOutputGuardBytes; }
+    void* data() { return storage_.data(); }
 
-    void poison() {
-        cuda_check(cudaMemset(storage_.p, kOutputGuardByte, storage_.bytes),
-                   "poison output guards");
-        cuda_check(cudaMemset(data(), kOutputPoisonByte, words_ * sizeof(std::uint16_t)),
-                   "poison linear output");
-    }
+    const void* data() const { return storage_.data(); }
 
-    int verify_guards(std::string_view label) const {
-        std::array<std::uint8_t, kOutputGuardBytes> prefix{};
-        std::array<std::uint8_t, kOutputGuardBytes> suffix{};
-        storage_.copy_to_host(prefix.data(), prefix.size());
-        storage_.copy_to_host(suffix.data(), suffix.size(),
-                              kOutputGuardBytes + words_ * sizeof(std::uint16_t));
-        const auto intact = [](const auto& bytes) {
-            return std::all_of(bytes.begin(), bytes.end(),
-                               [](std::uint8_t value) { return value == kOutputGuardByte; });
-        };
-        if (intact(prefix) && intact(suffix)) { return 0; }
-        std::cerr << label << ": output guard was overwritten\n";
-        return 1;
-    }
+    void poison() { storage_.fill(kOutputPoisonByte); }
+
+    int verify_guards(std::string_view label) const { return storage_.verify_guards(label); }
 
 private:
-    std::size_t words_;
-    DeviceBuffer storage_;
+    GuardedDeviceBuffer storage_;
 };
 
 std::vector<std::int32_t> all_indices(std::int32_t extent) {
@@ -524,59 +497,37 @@ int compare_output(std::string_view label, std::span<const double> actual,
         return 1;
     }
 
-    long double squared_error         = 0.0L;
-    long double squared_reference     = 0.0L;
-    double maximum_absolute_error     = 0.0;
-    double maximum_absolute_reference = 0.0;
-    std::size_t maximum_error_index   = 0;
-    for (std::size_t index = 0; index < actual.size(); ++index) {
-        if (!std::isfinite(actual[index]) || !std::isfinite(reference[index])) {
-            std::cerr << label << ": comparison contains a non-finite value\n";
-            return 1;
-        }
-        const double error          = actual[index] - reference[index];
-        const double absolute_error = std::abs(error);
-        squared_error += static_cast<long double>(error) * error;
-        squared_reference += static_cast<long double>(reference[index]) * reference[index];
-        maximum_absolute_reference =
-            std::max(maximum_absolute_reference, std::abs(reference[index]));
-        if (absolute_error > maximum_absolute_error) {
-            maximum_absolute_error = absolute_error;
-            maximum_error_index    = index;
-        }
+    const ReductionCriterion tolerance = tolerance_for(activation_compute);
+    const ReductionStats stats         = compute_reduction_stats(actual.data(), reference.data(),
+                                                                 static_cast<std::int64_t>(actual.size()));
+    if (stats.first_non_finite >= 0) {
+        std::cerr << label << ": comparison contains a non-finite value at index "
+                  << stats.first_non_finite << '\n';
+        return 1;
     }
 
-    const LinearTolerance tolerance = tolerance_for(activation_compute);
-    const double relative_l2        = std::sqrt(static_cast<double>(squared_error)) /
-                               std::max(std::sqrt(static_cast<double>(squared_reference)), 1.0e-30);
-    const double gross_limit =
-        tolerance.gross_absolute +
-        tolerance.gross_relative_to_max_reference * maximum_absolute_reference;
+    const double gross_limit = gross_error_limit(stats, tolerance);
     if (report_statistics()) {
-        const double rmse =
-            std::sqrt(static_cast<double>(squared_error) / static_cast<double>(actual.size()));
-        const double reference_rms =
-            std::sqrt(static_cast<double>(squared_reference) / static_cast<double>(actual.size()));
         const double peak_relative =
-            maximum_absolute_error / std::max(maximum_absolute_reference, 1.0e-30);
-        const double relative_l2_ratio = relative_l2 / tolerance.relative_l2;
-        const double gross_ratio       = maximum_absolute_error / gross_limit;
+            stats.maximum_absolute_error / std::max(stats.maximum_absolute_reference, 1.0e-30);
+        const double relative_l2_ratio = stats.relative_l2 / tolerance.relative_l2;
+        const double gross_ratio       = stats.maximum_absolute_error / gross_limit;
         std::printf(
             "LINEAR_STATS activation_compute=%s comparison=%s count=%zu rel_l2=%.17g rmse=%.17g "
             "reference_rms=%.17g max_abs=%.17g max_reference=%.17g peak_relative=%.17g "
             "relative_l2_limit_ratio=%.17g gross_limit_ratio=%.17g case=%.*s\n",
             activation_compute_name(activation_compute), comparison_name(comparison), actual.size(),
-            relative_l2, rmse, reference_rms, maximum_absolute_error, maximum_absolute_reference,
-            peak_relative, relative_l2_ratio, gross_ratio, static_cast<int>(label.size()),
-            label.data());
+            stats.relative_l2, stats.root_mean_squared_error, stats.reference_root_mean_square,
+            stats.maximum_absolute_error, stats.maximum_absolute_reference, peak_relative,
+            relative_l2_ratio, gross_ratio, static_cast<int>(label.size()), label.data());
     }
-    if (relative_l2 <= tolerance.relative_l2 && maximum_absolute_error <= gross_limit) { return 0; }
+    if (reduction_passes(stats, static_cast<std::int64_t>(actual.size()), tolerance)) { return 0; }
 
-    std::cerr << label << ": numerical mismatch" << " rel_l2=" << relative_l2
-              << " limit=" << tolerance.relative_l2 << " max_abs=" << maximum_absolute_error
-              << " gross_limit=" << gross_limit << " index=" << maximum_error_index
-              << " actual=" << actual[maximum_error_index]
-              << " reference=" << reference[maximum_error_index] << '\n';
+    std::cerr << label << ": numerical mismatch" << " rel_l2=" << stats.relative_l2
+              << " limit=" << tolerance.relative_l2 << " max_abs=" << stats.maximum_absolute_error
+              << " gross_limit=" << gross_limit << " index=" << stats.maximum_error_index
+              << " actual=" << stats.actual_at_maximum
+              << " reference=" << stats.reference_at_maximum << '\n';
     return 1;
 }
 
@@ -670,11 +621,7 @@ void cpu_linear_gemm_fp64(const float* weight, const float* activation, double* 
     for (std::thread& worker : workers) { worker.join(); }
 }
 
-bool cuda_available() {
-    int count                = 0;
-    const cudaError_t status = cudaGetDeviceCount(&count);
-    return status == cudaSuccess && count > 0;
-}
+bool cuda_available() { return !test::cuda_unavailable(); }
 
 int run_shape(std::string_view label, ActivationCompute activation_compute,
               WeightGenerator generator, const ShapeCase& shape) {

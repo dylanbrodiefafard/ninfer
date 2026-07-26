@@ -382,15 +382,15 @@ w_hat[p,k] = binary32(s32 * binary32(q[p, k]))
 This binary32 expression is the mathematical conformance oracle. Every legal signed code is exactly
 representable in binary32, every binary16 value expands exactly to binary32, and their product is
 the scheme's represented value. A kernel need not materialize that product or use binary32 at every
-stage; its operator-level result is qualified against this oracle with the tolerance appropriate to
-the route.
+stage; its operator-level result is qualified against this oracle with the Op's named criterion for
+that implementation profile.
 
 The formula `code / scale` is wrong: the stored scale is a multiplier. An independent scheme decoder
 or exact oracle that introduces a zero point, recenters the code interval, or converts the scale
 through BF16 implements a different numerical contract. A production kernel may use lower-precision
 internal staging, different accumulator precision, or another reduction association; these are
-implementation choices, and the observable operator result must pass that route's tolerance against
-the same oracle.
+implementation choices, and the observable operator result must pass the Op's named criterion
+against the same oracle.
 
 ### 6.3 Logical storage cost
 
@@ -574,8 +574,9 @@ codec and operator tests independently protect the representation and numerical 
 A consuming kernel or model component must interpret direct logical words according to Section 3 or
 quantized codes and scales according to Sections 5 and 6. It may choose its private fusion,
 reduction, staging, and intermediate precision; the observable Op result is qualified against the
-independent oracle with the route's tolerance. Kernel implementation details do not alter the
-persistent format and must not be needed to decode an artifact independently.
+independent oracle with the Op's named criterion for that implementation profile. Kernel
+implementation details do not alter the persistent format and must not be needed to decode an
+artifact independently.
 
 There is no mandatory generic unpack-to-dense fallback. If NInfer has not implemented the exact
 combination required by a selected target, conversion or loading fails explicitly rather than

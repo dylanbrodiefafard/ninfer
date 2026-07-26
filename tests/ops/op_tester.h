@@ -11,8 +11,8 @@
 //   ... cpu_ref(x, ref) ...
 //   DeviceBuffer dx = to_device_bf16(x), dout(n*2);
 //   ... launch kernel on dx -> dout ...
-//   failures += verify("op n=...", from_device_bf16(dout, n), ref,
-//                      Tolerance::bf16_elementwise());
+//   failures += verify_pointwise("op n=...", from_device_bf16(dout, n), ref,
+//                                op_bf16_criterion());
 
 #include "core/arena.h"
 #include "core/tensor.h" // ninfer::DType, ninfer::Tensor (for op call sites)
@@ -29,6 +29,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
@@ -88,19 +89,6 @@ inline void fill_uniform(std::vector<float>& v, std::uint32_t seed, float lo, fl
 
 inline void fill_iota_i32(std::vector<int>& v, int start = 0) {
     for (std::size_t i = 0; i < v.size(); ++i) v[i] = start + static_cast<int>(i);
-}
-
-// L2-normalize each contiguous `d`-element row (matches RMSNorm/F.normalize
-// upstream of GDN q/k; keeps recurrence test inputs from overflowing).
-inline void l2_normalize_rows(std::vector<float>& v, int d, long long rows) {
-    constexpr double eps = 1e-12;
-    for (long long r = 0; r < rows; ++r) {
-        float* row   = v.data() + r * d;
-        double sumsq = 0.0;
-        for (int i = 0; i < d; ++i) sumsq += double(row[i]) * double(row[i]);
-        const float inv = float(1.0 / std::sqrt(sumsq + eps));
-        for (int i = 0; i < d; ++i) row[i] *= inv;
-    }
 }
 
 // --- host <-> device --------------------------------------------------------
@@ -192,10 +180,10 @@ inline int verify_exact(const char* label, const std::vector<T>& got,
 
 // A payload surrounded by byte canaries. Use data() as the Op output and
 // verify_guards() after synchronization to detect prefix/suffix overwrites.
-class GuardedDBuf {
+class GuardedDeviceBuffer {
 public:
-    explicit GuardedDBuf(std::size_t payload_bytes, std::size_t guard_bytes = 256,
-                         std::uint8_t guard_byte = 0xa5)
+    explicit GuardedDeviceBuffer(std::size_t payload_bytes, std::size_t guard_bytes = 256,
+                                 std::uint8_t guard_byte = 0xa5)
         : storage_(allocation_bytes(payload_bytes, guard_bytes)), payload_bytes_(payload_bytes),
           guard_bytes_(guard_bytes), guard_byte_(guard_byte) {
         storage_.fill(guard_byte_);
@@ -232,7 +220,7 @@ public:
                    "cudaMemcpy guarded-device-to-host");
     }
 
-    int verify_guards(const char* label) const {
+    int verify_guards(std::string_view label) const {
         const auto prefix         = from_device<std::uint8_t>(storage_, guard_bytes_);
         const auto* suffix_device = static_cast<const std::uint8_t*>(data()) + payload_bytes_;
         const auto suffix         = from_device<std::uint8_t>(suffix_device, guard_bytes_);
@@ -247,7 +235,9 @@ public:
 
 private:
     static std::size_t allocation_bytes(std::size_t payload_bytes, std::size_t guard_bytes) {
-        if (guard_bytes == 0) throw std::invalid_argument("GuardedDBuf requires a non-empty guard");
+        if (guard_bytes == 0) {
+            throw std::invalid_argument("GuardedDeviceBuffer requires a non-empty guard");
+        }
         return payload_bytes + 2 * guard_bytes;
     }
 
@@ -263,18 +253,49 @@ private:
     std::uint8_t guard_byte_;
 };
 
-// Returns 0 (pass) / 1 (fail). Prints the diff line with the chosen preset.
-inline int verify(const char* label, const std::vector<double>& got, const std::vector<double>& ref,
-                  const Tolerance& tol) {
+// Returns 0 (pass) / 1 (fail). Concrete criteria are supplied by the semantic Op suite.
+inline int verify_pointwise(const char* label, const std::vector<double>& got,
+                            const std::vector<double>& ref, const PointwiseCriterion& criterion) {
     if (got.size() != ref.size()) {
         std::cerr << label << ": size mismatch got=" << got.size() << " ref=" << ref.size() << '\n';
         return 1;
     }
-    const DiffStats s = compute_diff(got.data(), ref.data(), (long long)got.size(), tol);
-    print_diff(label, s, tol);
-    const bool ok = diff_passes(s, tol);
-    if (!ok) std::cerr << label << ": FAIL (see diff above)\n";
-    return ok ? 0 : 1;
+    const PointwiseStats stats = compute_pointwise_stats(
+        got.data(), ref.data(), static_cast<std::int64_t>(got.size()), criterion);
+    if (pointwise_passes(stats, static_cast<std::int64_t>(got.size()))) return 0;
+
+    std::cerr << label << ": pointwise mismatch" << " max_abs=" << stats.maximum_absolute_error
+              << " max_rel=" << stats.maximum_relative_error
+              << " max_index=" << stats.maximum_error_index << " actual=" << stats.actual_at_maximum
+              << " reference=" << stats.reference_at_maximum
+              << " first_violation=" << stats.first_violation
+              << " non_finite=" << stats.non_finite_count << '\n';
+    return 1;
+}
+
+inline int verify_reduction(const char* label, const std::vector<double>& got,
+                            const std::vector<double>& ref, const ReductionCriterion& criterion) {
+    if (got.empty() || got.size() != ref.size()) {
+        std::cerr << label << ": invalid comparison sizes got=" << got.size()
+                  << " ref=" << ref.size() << '\n';
+        return 1;
+    }
+    const ReductionStats stats =
+        compute_reduction_stats(got.data(), ref.data(), static_cast<std::int64_t>(got.size()));
+    const double gross_limit = gross_error_limit(stats, criterion);
+    std::cout << "    " << label << " rel_l2=" << stats.relative_l2
+              << " max_abs=" << stats.maximum_absolute_error << " gross_limit=" << gross_limit
+              << '\n';
+    if (reduction_passes(stats, static_cast<std::int64_t>(got.size()), criterion)) return 0;
+
+    if (stats.first_non_finite >= 0) {
+        std::cerr << label << ": non-finite value at index " << stats.first_non_finite << '\n';
+        return 1;
+    }
+    std::cerr << label << ": reduction criterion failed at index " << stats.maximum_error_index
+              << " actual=" << stats.actual_at_maximum
+              << " reference=" << stats.reference_at_maximum << '\n';
+    return 1;
 }
 
 } // namespace ninfer::test

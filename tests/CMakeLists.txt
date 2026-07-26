@@ -28,16 +28,26 @@ function(ninfer_add_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
-function(ninfer_add_linear_test name source)
-  ninfer_add_test(${name}
-    SOURCES ${source}
-            ops/linear/linear_test_common.cpp
-    LIBRARIES ninfer_ops)
+function(ninfer_add_op_test name)
+  ninfer_add_test(${name} ${ARGN})
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(${name} PRIVATE
       $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math>
       $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
   endif()
+endfunction()
+
+function(ninfer_add_linear_test name source)
+  ninfer_add_op_test(${name}
+    SOURCES ${source}
+            ops/linear/linear_test_common.cpp
+    LIBRARIES ninfer_ops)
+endfunction()
+
+function(ninfer_add_fused_linear_test name source common)
+  ninfer_add_op_test(${name}
+    SOURCES ${source} ${common}
+    LIBRARIES ninfer_ops)
 endfunction()
 
 # Artifact framing and model-independent runtime contracts.
@@ -124,10 +134,13 @@ target_include_directories(ninfer_bench_support_test PRIVATE ${PROJECT_SOURCE_DI
 
 # Shared Op numerical tests. Target-composed schedule tests are registered separately below.
 set(ninfer_op_tests
+  add_bias
+  gelu
   silu_mul
   residual_add
   sigmoid_mul
   rmsnorm
+  gated_rmsnorm
   l2norm
   gated_delta_rule
   causal_conv1d_silu
@@ -140,64 +153,78 @@ set(ninfer_op_tests
   vision_pos_embed
   vision_attention
   sampling
+  scalar
   cast
   scatter
-  position
-  vision_elementwise)
+  position)
 foreach(op IN LISTS ninfer_op_tests)
-  ninfer_add_test(ninfer_${op}_test
+  ninfer_add_op_test(ninfer_${op}_test
     SOURCES ops/test_${op}.cpp
     LIBRARIES ninfer_ops)
 endforeach()
-ninfer_add_test(ninfer_gdn_gating_proj_plan_test
-  SOURCES ops/test_gdn_gating_proj_plan.cpp
-  LIBRARIES ninfer_ops)
 
 # Stateful, fused, and exact-shape Ops remain central even when the current implementation domain
 # is one checkpoint/device.
-ninfer_add_test(ninfer_gqa_attention_test
+ninfer_add_op_test(ninfer_gqa_attention_test
   SOURCES ops/test_gqa_attention.cpp
   LIBRARIES ninfer_ops)
-ninfer_add_test(ninfer_bidirectional_gqa_attention_test
+ninfer_add_op_test(ninfer_bidirectional_gqa_attention_test
   SOURCES ops/test_bidirectional_gqa_attention.cpp
   LIBRARIES ninfer_ops)
-ninfer_add_test(ninfer_swa_test
+ninfer_add_op_test(ninfer_swa_test
   SOURCES ops/test_swa.cpp
   LIBRARIES ninfer_ops)
-ninfer_add_test(ninfer_kv_cache_append_prefix_test
+ninfer_add_op_test(ninfer_kv_cache_append_prefix_test
   SOURCES ops/test_kv_cache_append_prefix.cpp
   LIBRARIES ninfer_ops)
-ninfer_add_test(ninfer_prepare_masked_block_test
+ninfer_add_op_test(ninfer_prepare_masked_block_test
   SOURCES ops/test_prepare_masked_block.cpp
   LIBRARIES ninfer_ops)
-ninfer_add_test(ninfer_sparse_moe_test
+ninfer_add_op_test(ninfer_sparse_moe_test
   SOURCES ops/test_sparse_moe.cpp
   LIBRARIES ninfer_ops)
-ninfer_add_test(ninfer_mtp_pack_test
+ninfer_add_op_test(ninfer_mtp_pack_test
   SOURCES ops/test_mtp_pack.cpp
   LIBRARIES ninfer_ops)
-ninfer_add_test(ninfer_mtp_round_test
+ninfer_add_op_test(ninfer_mtp_round_test
   SOURCES ops/test_mtp_round.cpp
   LIBRARIES ninfer_ops)
-ninfer_add_test(ninfer_speculative_round_test
+ninfer_add_op_test(ninfer_speculative_round_test
   SOURCES ops/test_speculative_round.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_linear_test(ninfer_linear_q4_a16_test ops/linear/test_q4_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_q5_a16_test ops/linear/test_q5_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_q6_a16_test ops/linear/test_q6_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_w8_a16_test ops/linear/test_w8_a16.cpp)
-ninfer_add_test(ninfer_gdn_input_proj_conv_snapshot_test
+ninfer_add_op_test(ninfer_attn_input_proj_test
+  SOURCES ops/test_attn_input_proj.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_gdn_input_proj_test
+  SOURCES ops/test_gdn_input_proj.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_gdn_input_proj_conv_snapshot_test
   SOURCES ops/test_gdn_input_proj_conv_snapshot.cpp
   LIBRARIES ninfer_ops)
-ninfer_add_test(ninfer_linear_add_plan_test
-  SOURCES ops/test_linear_add_plan.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_test(ninfer_linear_swiglu_plan_test
-  SOURCES ops/test_linear_swiglu_plan.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_test(ninfer_input_proj_plan_test
-  SOURCES ops/test_input_proj_plan.cpp
-  LIBRARIES ninfer_ops)
+ninfer_add_fused_linear_test(
+  ninfer_linear_add_q5_a16_test
+  ops/linear_add/test_q5_a16.cpp
+  ops/linear_add/linear_add_test_common.cpp)
+ninfer_add_fused_linear_test(
+  ninfer_linear_add_w8_a16_test
+  ops/linear_add/test_w8_a16.cpp
+  ops/linear_add/linear_add_test_common.cpp)
+ninfer_add_fused_linear_test(
+  ninfer_linear_pair_w8_a16_test
+  ops/linear_pair/test_w8_a16.cpp
+  ops/linear_pair/linear_pair_test_common.cpp)
+ninfer_add_fused_linear_test(
+  ninfer_linear_swiglu_q4_a16_test
+  ops/linear_swiglu/test_q4_a16.cpp
+  ops/linear_swiglu/linear_swiglu_test_common.cpp)
+ninfer_add_fused_linear_test(
+  ninfer_linear_swiglu_w8_a16_test
+  ops/linear_swiglu/test_w8_a16.cpp
+  ops/linear_swiglu/linear_swiglu_test_common.cpp)
 
 ninfer_add_test(ninfer_qwen3_6_27b_visual_scatter_test
   SOURCES targets/qwen3_6_27b/test_visual_scatter.cpp

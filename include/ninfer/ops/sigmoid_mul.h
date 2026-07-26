@@ -9,11 +9,12 @@ namespace ninfer::ops {
 /**
  * Elementwise sigmoid gate:
  *
- *   x'[i] = BF16(x[i] * (1 / (1 + exp(-gate[i])))).
+ *   ideal[i] = x[i] * (1 / (1 + exp(-gate[i]))).
  *
- * `gate` and `x` are non-overlapping, same-shaped contiguous BF16 tensors. The oracle evaluates the
- * expression in FP64 before converting the observable result to BF16; private kernel arithmetic is
- * implementation-defined. The Op updates all of x in place and uses no workspace or other
+ * `gate` and `x` are non-overlapping, same-shaped contiguous BF16 tensors. The oracle evaluates
+ * `ideal` in FP64 from the represented inputs. The updated BF16 x is promoted and compared directly
+ * with that result; output storage rounding belongs to the Op's numerical criterion, not the
+ * oracle. Private kernel arithmetic is implementation-defined. The Op uses no workspace or other
  * persistent state.
  */
 void sigmoid_mul(const Tensor& gate, Tensor& x, cudaStream_t stream);
