@@ -190,6 +190,7 @@ Both registered artifacts support:
 
 ## Documentation
 
+- [Contributing](CONTRIBUTING.md)
 - [Documentation index](docs/README.md)
 - [CLI](docs/cli.md)
 - [HTTP serving](docs/serving.md)
