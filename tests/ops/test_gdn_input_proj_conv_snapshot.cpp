@@ -216,11 +216,10 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_weig
             const float* token_activation =
                 activation.data() + static_cast<std::size_t>(token) * kHidden;
             if (row < kQueryRows + kKeyRows) {
-                return row_split::dot_row_split_lowbit_fp64(query_key.host, row, token_activation,
-                                                            kHidden);
+                return quantized_weight::dot_fp64(query_key.host, row, token_activation, kHidden);
             }
-            return row_split::dot_row_split_lowbit_fp64(
-                value_weight.host, row - kQueryRows - kKeyRows, token_activation, kHidden);
+            return quantized_weight::dot_fp64(value_weight.host, row - kQueryRows - kKeyRows,
+                                              token_activation, kHidden);
         });
     const std::vector<std::uint16_t> state_after = state.bits();
     const std::string suffix =
@@ -244,9 +243,9 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_weig
 int run_q4_q5() {
     constexpr std::int32_t kHidden = 5120;
     DevicePackedWeight query_key(
-        row_split::make_patterned_weight(QType::Q4G64_F16S, 4096, kHidden, 617U));
+        quantized_weight::make_patterned_weight(QType::Q4G64_F16S, 4096, kHidden, 617U));
     DevicePackedWeight value_weight(
-        row_split::make_patterned_weight(QType::Q5G64_F16S, 6144, kHidden, 619U));
+        quantized_weight::make_patterned_weight(QType::Q5G64_F16S, 6144, kHidden, 619U));
     int failures = 0;
     // Representative registered T values around every current execution boundary.
     for (const std::int32_t tokens : {1, 4, 5, 7}) {
@@ -300,7 +299,7 @@ int run_w8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t in
                                                        3 * kChannels);
     const SnapshotOracle oracle = snapshot_oracle(
         kValueRows, tokens, conv_weight, initial_state, [&](std::int32_t row, std::int32_t token) {
-            return row_split::dot_row_split_lowbit_fp64(
+            return quantized_weight::dot_fp64(
                 parent.host, row, activation.data() + static_cast<std::size_t>(token) * kHidden,
                 kHidden);
         });
@@ -331,7 +330,7 @@ int run_w8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t in
 int run_w8() {
     constexpr std::int32_t kHidden = 2048;
     DevicePackedWeight parent(
-        row_split::make_patterned_weight(QType::W8G32_F16S, 12288, kHidden, 727U));
+        quantized_weight::make_patterned_weight(QType::W8G32_F16S, 12288, kHidden, 727U));
     int failures = 0;
     // Representative registered T values around every current execution boundary.
     for (const std::int32_t tokens : {1, 2, 17}) {

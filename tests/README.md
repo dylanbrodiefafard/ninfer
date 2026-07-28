@@ -41,6 +41,11 @@ Tests are grouped by observable risk, not by mirroring every source file or clas
 Concrete numerical criteria remain named by the semantic Op suite; there are no cross-Op tolerance
 presets.
 
+`ops/quantized_weight.h` is the common packed-weight fixture for Q4/Q5/Q6/W8 and NVFP4 Op tests. It
+owns deterministic payload generation, device `Weight` views, row views, and independent logical
+weight decoding. The existing `ninfer_row_split_pack_golden_test` compares the grouped-integer
+source-matrix packer with the Python converter.
+
 ## Build and run
 
 ```bash
@@ -76,8 +81,9 @@ cmake --build build --parallel --target \
 ctest --test-dir build -R '^ninfer_linear_(q4|q5|q6|w8)_a16_test$' --output-on-failure
 ```
 
-All Linear files use `ops/linear/linear_test_common.{h,cpp}`. Its explicit Q4/Q5/Q6/W8 generators
-produce both the complete packed GPU payload and the logical float rows used by the one
+All Linear files use `ops/linear/linear_test_common.{h,cpp}` and the same
+`ops/quantized_weight.h` fixture as the fused projection tests. The fixture produces the complete
+packed GPU payload and exact-decodes the logical float rows used by the one
 `cpu_linear_gemm_fp64()` reference. The reference performs naive double accumulation and never
 reproduces a production route's activation quantization, staging, reduction tree, or BF16 output
 rounding. Each activation compute path selects one centrally defined comparison tolerance for its

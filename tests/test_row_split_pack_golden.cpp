@@ -1,4 +1,4 @@
-#include "ops/row_split_pack.h"
+#include "ops/quantized_weight.h"
 
 #include <algorithm>
 #include <chrono>
@@ -122,8 +122,9 @@ int main() {
                 const std::filesystem::path payload_path =
                     output_dir / (std::string(test_case.python_name) + ".bin");
                 const std::vector<std::uint8_t> expected = read_bytes(payload_path);
-                const ninfer::test::row_split::PackedWeight actual =
-                    ninfer::test::row_split::pack_row_split_lowbit(source, kN, kK, test_case.qtype);
+                const ninfer::test::quantized_weight::PackedWeight actual =
+                    ninfer::test::quantized_weight::pack_row_split_lowbit(source, kN, kK,
+                                                                          test_case.qtype);
                 failures += compare_payload(test_case.label, actual.payload, expected);
             }
         }

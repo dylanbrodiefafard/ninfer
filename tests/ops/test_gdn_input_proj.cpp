@@ -20,7 +20,7 @@ constexpr ReductionCriterion kGdnInputProjA16Tolerance{3.0e-3, 4.0e-3, 3.5e-3};
 
 int verify_output_range(std::string_view label, const GuardedBf16Tensor& output,
                         std::int32_t full_rows, std::int32_t output_row_offset,
-                        std::int32_t output_rows, const row_split::PackedWeight& weight,
+                        std::int32_t output_rows, const quantized_weight::PackedWeight& weight,
                         std::int32_t weight_row_offset, const std::vector<float>& activation,
                         std::int32_t hidden, std::int32_t tokens) {
     const std::vector<double> actual =
@@ -64,9 +64,9 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_weig
 int run_q4_q5() {
     constexpr std::int32_t kHidden = 5120;
     DevicePackedWeight query_key(
-        row_split::make_patterned_weight(QType::Q4G64_F16S, 4096, kHidden, 409U));
+        quantized_weight::make_patterned_weight(QType::Q4G64_F16S, 4096, kHidden, 409U));
     DevicePackedWeight value_weight(
-        row_split::make_patterned_weight(QType::Q5G64_F16S, 6144, kHidden, 419U));
+        quantized_weight::make_patterned_weight(QType::Q5G64_F16S, 6144, kHidden, 419U));
     int failures = 0;
     for (const std::int32_t tokens : {1, 2, 16, 17}) {
         failures += run_q4_q5_case(query_key, value_weight, tokens);
@@ -109,7 +109,7 @@ int run_w8_case(DevicePackedWeight& parent, std::int32_t tokens) {
 int run_w8() {
     constexpr std::int32_t kHidden = 2048;
     DevicePackedWeight parent(
-        row_split::make_patterned_weight(QType::W8G32_F16S, 12288, kHidden, 503U));
+        quantized_weight::make_patterned_weight(QType::W8G32_F16S, 12288, kHidden, 503U));
     int failures = 0;
     for (const std::int32_t tokens : {1, 2, 97}) { failures += run_w8_case(parent, tokens); }
     return failures;

@@ -19,7 +19,7 @@ namespace {
 constexpr ReductionCriterion kAttnInputProjA16Tolerance{2.9e-3, 4.0e-3, 4.5e-3};
 
 int verify_output(std::string_view label, const GuardedBf16Tensor& output,
-                  const row_split::PackedWeight& weight, std::int32_t weight_row_offset,
+                  const quantized_weight::PackedWeight& weight, std::int32_t weight_row_offset,
                   std::int32_t output_rows, const std::vector<float>& activation,
                   std::int32_t hidden, std::int32_t tokens) {
     int failures = output.verify_guards(label);
@@ -75,9 +75,9 @@ int run_q4_q5() {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kParent = 7168;
     DevicePackedWeight query_key(
-        row_split::make_patterned_weight(QType::Q4G64_F16S, kParent, kHidden, 103U));
+        quantized_weight::make_patterned_weight(QType::Q4G64_F16S, kParent, kHidden, 103U));
     DevicePackedWeight gate_value(
-        row_split::make_patterned_weight(QType::Q5G64_F16S, kParent, kHidden, 107U));
+        quantized_weight::make_patterned_weight(QType::Q5G64_F16S, kParent, kHidden, 107U));
 
     int failures = 0;
     for (const std::int32_t tokens : {1, 2, 16, 17}) {
@@ -126,7 +126,7 @@ int run_w8_target_case(DevicePackedWeight& parent, std::int32_t tokens) {
 int run_w8_target() {
     constexpr std::int32_t kHidden = 2048;
     DevicePackedWeight parent(
-        row_split::make_patterned_weight(QType::W8G32_F16S, 9216, kHidden, 211U));
+        quantized_weight::make_patterned_weight(QType::W8G32_F16S, 9216, kHidden, 211U));
     int failures = 0;
     for (const std::int32_t tokens : {1, 2, 17, 129}) {
         failures += run_w8_target_case(parent, tokens);
@@ -170,7 +170,7 @@ int run_w8_companion_case(DevicePackedWeight& parent, std::int32_t tokens) {
 int run_w8_companion() {
     constexpr std::int32_t kHidden = 2048;
     DevicePackedWeight parent(
-        row_split::make_patterned_weight(QType::W8G32_F16S, 6144, kHidden, 307U));
+        quantized_weight::make_patterned_weight(QType::W8G32_F16S, 6144, kHidden, 307U));
     int failures = 0;
     // One public numerical case from every registered companion A16 T region.
     for (const std::int32_t tokens : {1, 2, 97, 193, 289, 321, 385, 449}) {

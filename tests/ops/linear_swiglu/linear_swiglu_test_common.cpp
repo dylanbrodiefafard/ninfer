@@ -3,7 +3,7 @@
 #include "core/arena.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ops/op_tester.h"
-#include "ops/row_split_pack.h"
+#include "ops/quantized_weight.h"
 
 #include <cuda_runtime.h>
 
@@ -71,7 +71,7 @@ std::vector<std::uint16_t> make_activation(const Profile& profile, std::int32_t 
         int numerator             = static_cast<int>((mixed >> 48) % 63U) - 31;
         if (numerator == 0) { numerator = (column & 1) == 0 ? 1 : -1; }
         const float value                            = static_cast<float>(numerator) * dense_scale;
-        activation[static_cast<std::size_t>(column)] = row_split::detail::f32_to_bf16(value);
+        activation[static_cast<std::size_t>(column)] = test::f32_to_bf16(value);
     }
 
     constexpr std::int32_t kNonzerosPerSparseToken = 4;
@@ -87,50 +87,11 @@ std::vector<std::uint16_t> make_activation(const Profile& profile, std::int32_t 
             if (numerator == 0) { numerator = (lane & 1) == 0 ? 1 : -1; }
             const float value = static_cast<float>(numerator) * sparse_scale;
             activation[static_cast<std::size_t>(token) * profile.input_rows + column] =
-                row_split::detail::f32_to_bf16(value);
+                test::f32_to_bf16(value);
         }
     }
     return activation;
 }
-
-class ExactWeightDecoder {
-public:
-    explicit ExactWeightDecoder(const row_split::PackedWeight& packed)
-        : packed_(packed), group_size_(packed.weight.group_size),
-          groups_per_row_(packed.weight.padded_shape[1] / packed.weight.group_size) {
-        if (packed.weight.qtype != QType::Q4G64_F16S && packed.weight.qtype != QType::W8G32_F16S) {
-            throw std::invalid_argument("linear_swiglu test: unsupported oracle weight format");
-        }
-    }
-
-    double value(std::int32_t row, std::int32_t column) const noexcept {
-        const std::int32_t group       = column / group_size_;
-        const std::int32_t lane        = column - group * group_size_;
-        const std::size_t group_index  = static_cast<std::size_t>(row) * groups_per_row_ + group;
-        const std::uint16_t scale_bits = row_split::detail::load_u16_le(
-            packed_.payload, packed_.scale_plane_offset + group_index * sizeof(std::uint16_t));
-        const double scale = static_cast<double>(row_split::detail::f16_to_f32(scale_bits));
-
-        if (packed_.weight.qtype == QType::W8G32_F16S) {
-            const auto code = static_cast<std::int8_t>(
-                packed_.payload[group_index * static_cast<std::size_t>(group_size_) + lane]);
-            return static_cast<double>(code) * scale;
-        }
-
-        const std::uint8_t byte =
-            packed_.payload[group_index * static_cast<std::size_t>(group_size_ / 2) +
-                            static_cast<std::size_t>(lane / 2)];
-        const std::uint32_t nibble = (lane & 1) == 0 ? (byte & 0x0fU) : (byte >> 4);
-        const int code =
-            (nibble & 0x8U) != 0U ? static_cast<int>(nibble) - 16 : static_cast<int>(nibble);
-        return static_cast<double>(code) * scale;
-    }
-
-private:
-    const row_split::PackedWeight& packed_;
-    std::int32_t group_size_;
-    std::int32_t groups_per_row_;
-};
 
 struct ActiveValue {
     std::int32_t token;
@@ -147,7 +108,7 @@ index_nonzero_activations(const std::vector<std::uint16_t>& activation, std::int
                 activation[static_cast<std::size_t>(token) * input_rows + column];
             if ((bits & 0x7fffU) == 0U) { continue; }
             by_column[static_cast<std::size_t>(column)].push_back(
-                {token, static_cast<double>(row_split::detail::bf16_to_f32(bits))});
+                {token, static_cast<double>(test::bf16_to_f32(bits))});
         }
     }
     return by_column;
@@ -160,10 +121,9 @@ double silu_fp64(double value) {
 }
 
 std::vector<double> linear_swiglu_oracle_fp64(const Profile& profile,
-                                              const row_split::PackedWeight& weight,
+                                              const quantized_weight::PackedWeight& weight,
                                               const std::vector<std::uint16_t>& activation,
                                               std::int32_t tokens) {
-    const ExactWeightDecoder decode(weight);
     const auto active_by_column = index_nonzero_activations(activation, profile.input_rows, tokens);
     std::vector<double> output(checked_elements(profile.output_rows, tokens, "oracle output size"));
 
@@ -185,8 +145,10 @@ std::vector<double> linear_swiglu_oracle_fp64(const Profile& profile,
                 std::fill(up.begin(), up.end(), 0.0);
                 const std::int32_t up_row = profile.output_rows + row;
                 for (std::int32_t column = 0; column < profile.input_rows; ++column) {
-                    const double gate_weight = decode.value(row, column);
-                    const double up_weight   = decode.value(up_row, column);
+                    const double gate_weight =
+                        quantized_weight::logical_weight_fp64(weight, row, column);
+                    const double up_weight =
+                        quantized_weight::logical_weight_fp64(weight, up_row, column);
                     for (const ActiveValue active :
                          active_by_column[static_cast<std::size_t>(column)]) {
                         gate[static_cast<std::size_t>(active.token)] += gate_weight * active.value;
@@ -213,7 +175,7 @@ std::vector<double> read_bf16_output(const test::GuardedDeviceBuffer& output,
                "copy LinearSwiGLU output");
     std::vector<double> values(elements);
     for (std::size_t index = 0; index < elements; ++index) {
-        values[index] = static_cast<double>(row_split::detail::bf16_to_f32(bits[index]));
+        values[index] = static_cast<double>(test::bf16_to_f32(bits[index]));
     }
     return values;
 }
@@ -272,7 +234,7 @@ int run_profile(std::string_view label, const Profile& profile,
     }
     const std::int32_t maximum_tokens = token_cases.back();
 
-    row_split::PackedWeight host_weight = row_split::make_patterned_weight(
+    quantized_weight::PackedWeight host_weight = quantized_weight::make_patterned_weight(
         profile.qtype, profile.gate_up_rows, profile.input_rows, profile.seed);
     const std::vector<std::uint16_t> host_activation = make_activation(profile, maximum_tokens);
     const std::vector<double> reference =

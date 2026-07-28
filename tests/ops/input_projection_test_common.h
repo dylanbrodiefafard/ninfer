@@ -1,7 +1,7 @@
 #pragma once
 
 #include "ops/op_tester.h"
-#include "ops/row_split_pack.h"
+#include "ops/quantized_weight.h"
 
 #include <algorithm>
 #include <cmath>
@@ -35,7 +35,7 @@ inline std::vector<float> make_bf16_activation(std::int32_t rows, std::int32_t t
 
 class DevicePackedWeight {
 public:
-    explicit DevicePackedWeight(row_split::PackedWeight packed)
+    explicit DevicePackedWeight(quantized_weight::PackedWeight packed)
         : host(std::move(packed)), device(host.payload.size()) {
         device.copy_from_host(host.payload.data(), host.payload.size());
     }
@@ -50,7 +50,7 @@ public:
         return 1;
     }
 
-    row_split::PackedWeight host;
+    quantized_weight::PackedWeight host;
     DeviceBuffer device;
 };
 
@@ -133,7 +133,7 @@ inline std::vector<double> gather_rows(const std::vector<double>& full, std::int
     return gathered;
 }
 
-inline std::vector<double> projection_oracle(const row_split::PackedWeight& weight,
+inline std::vector<double> projection_oracle(const quantized_weight::PackedWeight& weight,
                                              std::int32_t weight_row_offset,
                                              std::int32_t output_rows,
                                              const std::vector<float>& activation,
@@ -143,7 +143,7 @@ inline std::vector<double> projection_oracle(const row_split::PackedWeight& weig
     expected.reserve(selected.size() * static_cast<std::size_t>(tokens));
     for (const std::int32_t local_row : selected) {
         for (std::int32_t token = 0; token < tokens; ++token) {
-            expected.push_back(row_split::dot_row_split_lowbit_fp64(
+            expected.push_back(quantized_weight::dot_fp64(
                 weight, weight_row_offset + local_row,
                 activation.data() + static_cast<std::size_t>(token) * hidden, hidden));
         }

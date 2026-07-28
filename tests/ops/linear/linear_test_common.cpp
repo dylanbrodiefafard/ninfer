@@ -29,19 +29,6 @@ constexpr std::uint8_t kOutputPoisonByte = 0xff;
 constexpr std::size_t kOutputScanWords   = 1U << 20;
 constexpr int kOracleTBlock              = 8;
 
-struct FormatSpec {
-    QType qtype;
-    std::int32_t bits;
-    std::int32_t group_size;
-    std::int32_t base_bytes_per_group;
-    std::int32_t high_bytes_per_group;
-};
-
-constexpr FormatSpec kQ4Spec{QType::Q4G64_F16S, 4, 64, 32, 0};
-constexpr FormatSpec kQ5Spec{QType::Q5G64_F16S, 5, 64, 32, 8};
-constexpr FormatSpec kQ6Spec{QType::Q6G64_F16S, 6, 64, 32, 16};
-constexpr FormatSpec kW8Spec{QType::W8G32_F16S, 8, 32, 32, 0};
-
 // The criterion belongs to the activation compute path, not to a private kernel, schedule, or
 // launcher selected inside that path.
 constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute) {
@@ -62,278 +49,6 @@ std::size_t checked_elements(std::int32_t first, std::int32_t second, const char
         throw std::overflow_error(std::string("linear test: ") + label + " size overflow");
     }
     return a * b;
-}
-
-std::size_t align_up(std::size_t value, std::size_t alignment) {
-    if (value > std::numeric_limits<std::size_t>::max() - (alignment - 1)) {
-        throw std::overflow_error("linear test: alignment overflow");
-    }
-    return ((value + alignment - 1) / alignment) * alignment;
-}
-
-std::uint64_t mix64(std::uint64_t value) {
-    value += 0x9e3779b97f4a7c15ULL;
-    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
-    return value ^ (value >> 31);
-}
-
-float bits_to_float(std::uint32_t bits) {
-    float value = 0.0F;
-    std::memcpy(&value, &bits, sizeof(value));
-    return value;
-}
-
-std::uint32_t float_to_bits(float value) {
-    std::uint32_t bits = 0;
-    std::memcpy(&bits, &value, sizeof(bits));
-    return bits;
-}
-
-float bf16_to_float(std::uint16_t bits) {
-    return bits_to_float(static_cast<std::uint32_t>(bits) << 16);
-}
-
-std::uint16_t float_to_bf16(float value) {
-    std::uint32_t bits = float_to_bits(value);
-    if ((bits & 0x7fffffffU) > 0x7f800000U) {
-        return static_cast<std::uint16_t>((bits >> 16) | 0x0040U);
-    }
-    bits += 0x7fffU + ((bits >> 16) & 1U);
-    return static_cast<std::uint16_t>(bits >> 16);
-}
-
-float fp16_to_float(std::uint16_t bits) {
-    const std::uint32_t sign = (static_cast<std::uint32_t>(bits) & 0x8000U) << 16;
-    std::uint32_t exponent   = (static_cast<std::uint32_t>(bits) >> 10) & 0x1fU;
-    std::uint32_t fraction   = static_cast<std::uint32_t>(bits) & 0x03ffU;
-
-    if (exponent == 0) {
-        if (fraction == 0) { return bits_to_float(sign); }
-        int unbiased = -14;
-        while ((fraction & 0x0400U) == 0) {
-            fraction <<= 1;
-            --unbiased;
-        }
-        fraction &= 0x03ffU;
-        return bits_to_float(sign | (static_cast<std::uint32_t>(unbiased + 127) << 23) |
-                             (fraction << 13));
-    }
-    if (exponent == 31) { return bits_to_float(sign | 0x7f800000U | (fraction << 13)); }
-    exponent = exponent - 15 + 127;
-    return bits_to_float(sign | (exponent << 23) | (fraction << 13));
-}
-
-void store_u16_le(std::vector<std::uint8_t>& bytes, std::size_t offset, std::uint16_t value) {
-    bytes[offset]     = static_cast<std::uint8_t>(value & 0xffU);
-    bytes[offset + 1] = static_cast<std::uint8_t>(value >> 8);
-}
-
-std::uint16_t load_u16_le(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
-    return static_cast<std::uint16_t>(bytes[offset]) |
-           static_cast<std::uint16_t>(static_cast<std::uint16_t>(bytes[offset + 1]) << 8);
-}
-
-int sign_extend(std::uint32_t value, int bits) {
-    const std::uint32_t sign  = 1U << (bits - 1);
-    const std::uint32_t range = 1U << bits;
-    return (value & sign) != 0U ? static_cast<int>(value) - static_cast<int>(range)
-                                : static_cast<int>(value);
-}
-
-void store_code(std::vector<std::uint8_t>& payload, const FormatSpec& spec,
-                std::uint64_t high_plane_offset, std::size_t group_index, int lane, int code) {
-    if (spec.bits == 8) {
-        payload[group_index * static_cast<std::size_t>(spec.base_bytes_per_group) +
-                static_cast<std::size_t>(lane)] =
-            static_cast<std::uint8_t>(static_cast<std::int8_t>(code));
-        return;
-    }
-
-    const std::uint32_t word = static_cast<std::uint32_t>(code) & ((1U << spec.bits) - 1U);
-    const std::size_t base_offset =
-        group_index * static_cast<std::size_t>(spec.base_bytes_per_group) +
-        static_cast<std::size_t>(lane / 2);
-    const std::uint8_t nibble = static_cast<std::uint8_t>(word & 0x0fU);
-    if ((lane & 1) == 0) {
-        payload[base_offset] = static_cast<std::uint8_t>((payload[base_offset] & 0xf0U) | nibble);
-    } else {
-        payload[base_offset] =
-            static_cast<std::uint8_t>((payload[base_offset] & 0x0fU) | (nibble << 4));
-    }
-
-    const int high_bits = spec.bits - 4;
-    for (int bit = 0; bit < high_bits; ++bit) {
-        const int stream_bit = lane * high_bits + bit;
-        const std::size_t byte_offset =
-            static_cast<std::size_t>(high_plane_offset) +
-            group_index * static_cast<std::size_t>(spec.high_bytes_per_group) +
-            static_cast<std::size_t>(stream_bit / 8);
-        payload[byte_offset] |=
-            static_cast<std::uint8_t>(((word >> (4 + bit)) & 1U) << (stream_bit & 7));
-    }
-}
-
-int load_code(const SimulatedLinearWeight& weight, const FormatSpec& spec, std::int32_t row,
-              std::int32_t column) {
-    const std::int32_t groups_per_row = weight.padded_k / spec.group_size;
-    const std::int32_t group          = column / spec.group_size;
-    const int lane                    = column % spec.group_size;
-    const std::size_t group_index =
-        static_cast<std::size_t>(row) * static_cast<std::size_t>(groups_per_row) +
-        static_cast<std::size_t>(group);
-
-    if (spec.bits == 8) {
-        const std::uint8_t word =
-            weight
-                .packed_payload[group_index * static_cast<std::size_t>(spec.base_bytes_per_group) +
-                                static_cast<std::size_t>(lane)];
-        return static_cast<int>(static_cast<std::int8_t>(word));
-    }
-
-    const std::uint8_t base =
-        weight.packed_payload[group_index * static_cast<std::size_t>(spec.base_bytes_per_group) +
-                              static_cast<std::size_t>(lane / 2)];
-    std::uint32_t word  = (lane & 1) == 0 ? (base & 0x0fU) : (base >> 4);
-    const int high_bits = spec.bits - 4;
-    for (int bit = 0; bit < high_bits; ++bit) {
-        const int stream_bit = lane * high_bits + bit;
-        const std::size_t byte_offset =
-            static_cast<std::size_t>(weight.high_plane_offset) +
-            group_index * static_cast<std::size_t>(spec.high_bytes_per_group) +
-            static_cast<std::size_t>(stream_bit / 8);
-        word |= static_cast<std::uint32_t>(
-                    (weight.packed_payload[byte_offset] >> (stream_bit & 7)) & 1U)
-                << (4 + bit);
-    }
-    return sign_extend(word, spec.bits);
-}
-
-std::vector<std::int32_t> checked_oracle_rows(std::int32_t n, std::span<const std::int32_t> rows) {
-    std::vector<std::int32_t> result(rows.begin(), rows.end());
-    if (result.empty()) { throw std::invalid_argument("linear test: oracle row set is empty"); }
-    for (const std::int32_t row : result) {
-        if (row < 0 || row >= n) {
-            throw std::invalid_argument("linear test: oracle row is outside the weight");
-        }
-    }
-    std::sort(result.begin(), result.end());
-    if (std::adjacent_find(result.begin(), result.end()) != result.end()) {
-        throw std::invalid_argument("linear test: duplicate oracle row");
-    }
-    return result;
-}
-
-SimulatedLinearWeight make_weight(const FormatSpec& spec, std::int32_t n, std::int32_t k,
-                                  std::uint32_t seed, std::span<const std::int32_t> oracle_rows) {
-    if (n <= 0 || k <= 0) {
-        throw std::invalid_argument("linear test: weight shape must be positive");
-    }
-
-    SimulatedLinearWeight result;
-    result.qtype       = spec.qtype;
-    result.n           = n;
-    result.k           = k;
-    result.padded_k    = static_cast<std::int32_t>(align_up(static_cast<std::size_t>(k), 128));
-    result.group_size  = spec.group_size;
-    result.oracle_rows = checked_oracle_rows(n, oracle_rows);
-
-    const std::int32_t groups_per_row = result.padded_k / spec.group_size;
-    const std::size_t group_count     = checked_elements(n, groups_per_row, "weight groups");
-    const std::size_t base_bytes =
-        group_count * static_cast<std::size_t>(spec.base_bytes_per_group);
-    result.high_plane_offset  = align_up(base_bytes, 256);
-    result.high_plane_bytes   = group_count * static_cast<std::size_t>(spec.high_bytes_per_group);
-    result.scale_plane_offset = result.high_plane_offset + align_up(result.high_plane_bytes, 256);
-    const std::size_t scale_bytes = group_count * sizeof(std::uint16_t);
-    result.packed_payload.assign(static_cast<std::size_t>(result.scale_plane_offset) + scale_bytes,
-                                 0);
-
-    std::array<std::array<std::uint8_t, 32>, 256> base_patterns{};
-    std::array<std::array<std::uint8_t, 16>, 256> high_patterns{};
-    for (std::size_t pattern = 0; pattern < base_patterns.size(); ++pattern) {
-        std::uint64_t state = mix64(static_cast<std::uint64_t>(seed) << 32 | pattern);
-        for (std::size_t byte = 0; byte < base_patterns[pattern].size(); ++byte) {
-            state              = mix64(state + byte);
-            std::uint8_t value = static_cast<std::uint8_t>(state >> 56);
-            if (spec.bits == 8 && value == 0x80U) { value = 0x81U; }
-            base_patterns[pattern][byte] = value;
-        }
-        for (std::size_t byte = 0; byte < high_patterns[pattern].size(); ++byte) {
-            state                        = mix64(state + 0x100U + byte);
-            high_patterns[pattern][byte] = static_cast<std::uint8_t>(state >> 56);
-        }
-    }
-
-    constexpr std::array<std::uint16_t, 4> kScaleBits{
-        0x2000U, // 0.0078125
-        0x2400U, // 0.015625
-        0x2800U, // 0.03125
-        0x2c00U, // 0.0625
-    };
-    for (std::size_t group_index = 0; group_index < group_count; ++group_index) {
-        const std::int32_t group_in_row =
-            static_cast<std::int32_t>(group_index % static_cast<std::size_t>(groups_per_row));
-        const std::int32_t first_column = group_in_row * spec.group_size;
-        const std::int32_t valid_lanes  = std::clamp(k - first_column, 0, spec.group_size);
-        const std::uint64_t mixed = mix64(group_index ^ (static_cast<std::uint64_t>(seed) << 17));
-        const std::size_t pattern = static_cast<std::size_t>(mixed & 0xffU);
-
-        if (valid_lanes == spec.group_size) {
-            std::memcpy(result.packed_payload.data() +
-                            group_index * static_cast<std::size_t>(spec.base_bytes_per_group),
-                        base_patterns[pattern].data(),
-                        static_cast<std::size_t>(spec.base_bytes_per_group));
-            if (spec.high_bytes_per_group != 0) {
-                std::memcpy(result.packed_payload.data() +
-                                static_cast<std::size_t>(result.high_plane_offset) +
-                                group_index * static_cast<std::size_t>(spec.high_bytes_per_group),
-                            high_patterns[pattern].data(),
-                            static_cast<std::size_t>(spec.high_bytes_per_group));
-            }
-        } else if (valid_lanes != 0) {
-            for (int lane = 0; lane < valid_lanes; ++lane) {
-                const std::uint64_t lane_bits = mix64(mixed + static_cast<std::uint64_t>(lane));
-                int code                      = 0;
-                if (spec.bits == 8) {
-                    code = static_cast<int>(lane_bits % 255U) - 127;
-                } else {
-                    code = sign_extend(static_cast<std::uint32_t>(lane_bits) &
-                                           ((1U << spec.bits) - 1U),
-                                       spec.bits);
-                }
-                store_code(result.packed_payload, spec, result.high_plane_offset, group_index, lane,
-                           code);
-            }
-        }
-
-        const std::uint16_t scale =
-            valid_lanes == 0 ? 0U : kScaleBits[static_cast<std::size_t>((mixed >> 8) & 3U)];
-        store_u16_le(result.packed_payload,
-                     static_cast<std::size_t>(result.scale_plane_offset) +
-                         group_index * sizeof(std::uint16_t),
-                     scale);
-    }
-
-    result.oracle_weight.resize(
-        checked_elements(static_cast<std::int32_t>(result.oracle_rows.size()), k, "oracle weight"));
-    for (std::size_t oracle_row = 0; oracle_row < result.oracle_rows.size(); ++oracle_row) {
-        const std::int32_t physical_row = result.oracle_rows[oracle_row];
-        for (std::int32_t column = 0; column < k; ++column) {
-            const std::int32_t group = column / spec.group_size;
-            const std::size_t group_index =
-                static_cast<std::size_t>(physical_row) * static_cast<std::size_t>(groups_per_row) +
-                static_cast<std::size_t>(group);
-            const std::uint16_t scale_bits = load_u16_le(
-                result.packed_payload, static_cast<std::size_t>(result.scale_plane_offset) +
-                                           group_index * sizeof(std::uint16_t));
-            const float scale = fp16_to_float(scale_bits);
-            result.oracle_weight[oracle_row * static_cast<std::size_t>(k) +
-                                 static_cast<std::size_t>(column)] =
-                static_cast<float>(load_code(result, spec, physical_row, column)) * scale;
-        }
-    }
-    return result;
 }
 
 class GuardedOutput {
@@ -383,7 +98,7 @@ std::vector<std::uint16_t> make_activation(std::int32_t k, std::int32_t t, std::
         for (std::int32_t column = 0; column < k; ++column) {
             const int raw     = (column * 17 + offset) & 0xff;
             const float value = static_cast<float>(raw - 128) * (1.0F / 256.0F);
-            patterns[static_cast<std::size_t>(offset) * k + column] = float_to_bf16(value);
+            patterns[static_cast<std::size_t>(offset) * k + column] = test::f32_to_bf16(value);
         }
     }
     for (std::int32_t token = 0; token < t; ++token) {
@@ -405,7 +120,7 @@ std::vector<float> materialize_activation(const std::vector<std::uint16_t>& bits
             bits.data() + static_cast<std::size_t>(columns[oracle_column]) * k;
         float* destination = result.data() + oracle_column * static_cast<std::size_t>(k);
         for (std::int32_t column = 0; column < k; ++column) {
-            destination[column] = bf16_to_float(source[column]);
+            destination[column] = test::bf16_to_f32(source[column]);
         }
     }
     return result;
@@ -448,7 +163,7 @@ OutputRead read_output(const void* device, std::int32_t n, std::int32_t t,
         }
         while (wanted_index < wanted.size() && wanted[wanted_index] < begin + count) {
             result.selected[wanted_index] =
-                static_cast<double>(bf16_to_float(chunk[wanted[wanted_index] - begin]));
+                static_cast<double>(test::bf16_to_f32(chunk[wanted[wanted_index] - begin]));
             ++wanted_index;
         }
     }
@@ -470,49 +185,32 @@ int compare_output(std::string_view label, std::span<const double> actual,
 
 } // namespace
 
-Weight SimulatedLinearWeight::device_weight(void* device_payload) const {
-    Weight weight{};
-    weight.payload          = device_payload;
-    weight.payload_bytes    = packed_payload.size();
-    weight.high_plane_bytes = high_plane_bytes;
-    weight.qtype            = qtype;
-    weight.group_size       = static_cast<std::uint32_t>(group_size);
-    weight.qdata            = device_payload;
-    weight.qhigh            = high_plane_bytes == 0
-                                  ? nullptr
-                                  : static_cast<std::uint8_t*>(device_payload) + high_plane_offset;
-    weight.scales           = static_cast<std::uint8_t*>(device_payload) + scale_plane_offset;
-    weight.n                = n;
-    weight.k                = k;
-    weight.group            = group_size;
-    weight.layout           = QuantLayout::RowSplit;
-    weight.scale_dtype      = DType::FP16;
-    weight.ndim             = 2;
-    weight.shape[0]         = n;
-    weight.shape[1]         = k;
-    weight.padded_shape[0]  = n;
-    weight.padded_shape[1]  = padded_k;
-    return weight;
+quantized_weight::PackedWeight make_q4g64_f16s_weight(std::int32_t n, std::int32_t k,
+                                                      std::uint32_t seed) {
+    return quantized_weight::make_patterned_weight(QType::Q4G64_F16S, n, k, seed,
+                                                   {quantized_weight::RowSplitScalePattern::Small,
+                                                    quantized_weight::RowSplitCodePattern::Hashed});
 }
 
-SimulatedLinearWeight make_q4g64_f16s_weight(std::int32_t n, std::int32_t k, std::uint32_t seed,
-                                             std::span<const std::int32_t> oracle_rows) {
-    return make_weight(kQ4Spec, n, k, seed, oracle_rows);
+quantized_weight::PackedWeight make_q5g64_f16s_weight(std::int32_t n, std::int32_t k,
+                                                      std::uint32_t seed) {
+    return quantized_weight::make_patterned_weight(QType::Q5G64_F16S, n, k, seed,
+                                                   {quantized_weight::RowSplitScalePattern::Small,
+                                                    quantized_weight::RowSplitCodePattern::Hashed});
 }
 
-SimulatedLinearWeight make_q5g64_f16s_weight(std::int32_t n, std::int32_t k, std::uint32_t seed,
-                                             std::span<const std::int32_t> oracle_rows) {
-    return make_weight(kQ5Spec, n, k, seed, oracle_rows);
+quantized_weight::PackedWeight make_q6g64_f16s_weight(std::int32_t n, std::int32_t k,
+                                                      std::uint32_t seed) {
+    return quantized_weight::make_patterned_weight(QType::Q6G64_F16S, n, k, seed,
+                                                   {quantized_weight::RowSplitScalePattern::Small,
+                                                    quantized_weight::RowSplitCodePattern::Hashed});
 }
 
-SimulatedLinearWeight make_q6g64_f16s_weight(std::int32_t n, std::int32_t k, std::uint32_t seed,
-                                             std::span<const std::int32_t> oracle_rows) {
-    return make_weight(kQ6Spec, n, k, seed, oracle_rows);
-}
-
-SimulatedLinearWeight make_w8g32_f16s_weight(std::int32_t n, std::int32_t k, std::uint32_t seed,
-                                             std::span<const std::int32_t> oracle_rows) {
-    return make_weight(kW8Spec, n, k, seed, oracle_rows);
+quantized_weight::PackedWeight make_w8g32_f16s_weight(std::int32_t n, std::int32_t k,
+                                                      std::uint32_t seed) {
+    return quantized_weight::make_patterned_weight(QType::W8G32_F16S, n, k, seed,
+                                                   {quantized_weight::RowSplitScalePattern::Small,
+                                                    quantized_weight::RowSplitCodePattern::Hashed});
 }
 
 void cpu_linear_gemm_fp64(const float* weight, const float* activation, double* output,
@@ -574,14 +272,16 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
 
     const std::vector<std::int32_t> oracle_rows =
         shape.comparison == Comparison::Full ? all_indices(shape.n) : sampled_indices(shape.n);
-    SimulatedLinearWeight host_weight = generator(shape.n, shape.k, shape.seed, oracle_rows);
+    quantized_weight::PackedWeight host_weight = generator(shape.n, shape.k, shape.seed);
+    const std::vector<float> oracle_weight =
+        quantized_weight::materialize_rows_fp32(host_weight, oracle_rows);
     const std::vector<std::uint16_t> activation_bits =
         make_activation(shape.k, maximum->t, shape.seed + 1U);
 
     DeviceBuffer device_activation(activation_bits.size() * sizeof(std::uint16_t));
     device_activation.copy_from_host(activation_bits.data(), device_activation.bytes);
-    DeviceBuffer device_weight(host_weight.packed_payload.size());
-    device_weight.copy_from_host(host_weight.packed_payload.data(), device_weight.bytes);
+    DeviceBuffer device_weight(host_weight.payload.size());
+    device_weight.copy_from_host(host_weight.payload.data(), device_weight.bytes);
     const Weight weight = host_weight.device_weight(device_weight.p);
     WorkspaceArena workspace(64U << 20);
 
@@ -591,8 +291,8 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
         const std::vector<float> activation =
             materialize_activation(activation_bits, shape.k, columns);
         full_reference.resize(checked_elements(shape.n, maximum->t, "full reference"));
-        cpu_linear_gemm_fp64(host_weight.oracle_weight.data(), activation.data(),
-                             full_reference.data(), shape.n, shape.k, maximum->t);
+        cpu_linear_gemm_fp64(oracle_weight.data(), activation.data(), full_reference.data(),
+                             shape.n, shape.k, maximum->t);
     }
 
     int failures = 0;
@@ -638,9 +338,9 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
             std::vector<double> reference(
                 checked_elements(static_cast<std::int32_t>(oracle_rows.size()),
                                  static_cast<std::int32_t>(columns.size()), "sampled reference"));
-            cpu_linear_gemm_fp64(host_weight.oracle_weight.data(), activation.data(),
-                                 reference.data(), static_cast<std::int32_t>(oracle_rows.size()),
-                                 shape.k, static_cast<std::int32_t>(columns.size()));
+            cpu_linear_gemm_fp64(oracle_weight.data(), activation.data(), reference.data(),
+                                 static_cast<std::int32_t>(oracle_rows.size()), shape.k,
+                                 static_cast<std::int32_t>(columns.size()));
             failures += compare_output(case_label, actual.selected, reference, activation_compute);
         }
     }
@@ -652,9 +352,9 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
             std::cerr << label << ": linear modified its activation input\n";
             ++failures;
         }
-        std::vector<std::uint8_t> weight_after(host_weight.packed_payload.size());
+        std::vector<std::uint8_t> weight_after(host_weight.payload.size());
         device_weight.copy_to_host(weight_after.data(), device_weight.bytes);
-        if (weight_after != host_weight.packed_payload) {
+        if (weight_after != host_weight.payload) {
             std::cerr << label << ": linear modified its persistent weight\n";
             ++failures;
         }

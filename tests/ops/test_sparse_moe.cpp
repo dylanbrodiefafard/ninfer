@@ -1,7 +1,7 @@
 #include "ninfer/ops/sparse_moe.h"
 
 #include "ops/op_tester.h"
-#include "ops/row_split_pack.h"
+#include "ops/quantized_weight.h"
 
 #include <cuda_runtime.h>
 
@@ -125,7 +125,7 @@ public:
         }
     }
 
-    void copy_rows(const row_split::PackedWeight& source, std::int32_t destination_row) {
+    void copy_rows(const quantized_weight::PackedWeight& source, std::int32_t destination_row) {
         const std::int32_t source_rows = source.weight.n;
         if (source.weight.qtype != qtype_ || source.weight.k != columns_ || source_rows < 1 ||
             destination_row < 0 || destination_row > rows_ - source_rows) {
@@ -167,7 +167,7 @@ public:
         return result;
     }
 
-    int verify_rows(const std::string& label, const row_split::PackedWeight& source,
+    int verify_rows(const std::string& label, const quantized_weight::PackedWeight& source,
                     std::int32_t destination_row) const {
         const std::int32_t source_rows = source.weight.n;
         int failures                   = 0;
@@ -355,8 +355,8 @@ std::vector<float> make_down(std::int32_t rows, std::int32_t columns, std::uint3
 
 struct HostExpert {
     int id;
-    row_split::PackedWeight gate_up;
-    row_split::PackedWeight down;
+    quantized_weight::PackedWeight gate_up;
+    quantized_weight::PackedWeight down;
 };
 
 const HostExpert& find_expert(const std::vector<HostExpert>& experts, int id) {
@@ -399,11 +399,13 @@ double dot_fp64(const std::vector<float>& matrix, std::int32_t row, std::int32_t
 // The one SparseMoe oracle. It directly evaluates the complete public formula from represented
 // BF16 values and independently decoded logical weights, with FP64 accumulation throughout.
 // It has no production route, staging cast, workspace dtype, reduction tree, or output rounding.
-std::vector<double>
-sparse_moe_oracle(const std::vector<float>& input, const std::vector<float>& residual,
-                  const std::vector<float>& router, const std::vector<HostExpert>& experts,
-                  const row_split::PackedWeight& shared_gate_up,
-                  const row_split::PackedWeight& shared_down, const RoutePattern& intended_route) {
+std::vector<double> sparse_moe_oracle(const std::vector<float>& input,
+                                      const std::vector<float>& residual,
+                                      const std::vector<float>& router,
+                                      const std::vector<HostExpert>& experts,
+                                      const quantized_weight::PackedWeight& shared_gate_up,
+                                      const quantized_weight::PackedWeight& shared_down,
+                                      const RoutePattern& intended_route) {
     const std::vector<double> x(input.begin(), input.end());
     std::vector<double> scores(kExperts + 1);
     parallel_rows(kExperts + 1,
@@ -495,11 +497,11 @@ public:
         std::sort(expert_ids.begin(), expert_ids.end());
         for (int expert : expert_ids) {
             const float factor = 0.8f + static_cast<float>((expert * 3) % 11) * 0.045f;
-            auto gate_up       = row_split::pack_row_split_lowbit(
+            auto gate_up       = quantized_weight::pack_row_split_lowbit(
                 make_gate_up(kExpertGateRows, kHidden, 100U + static_cast<std::uint32_t>(expert),
                                    factor),
                 kExpertGateRows, kHidden, profile.routed_gate_up);
-            auto down = row_split::pack_row_split_lowbit(
+            auto down = quantized_weight::pack_row_split_lowbit(
                 make_down(kHidden, kIntermediate, 300U + static_cast<std::uint32_t>(expert),
                           factor),
                 kHidden, kIntermediate, profile.routed_down);
@@ -508,9 +510,9 @@ public:
             experts_.push_back({expert, std::move(gate_up), std::move(down)});
         }
 
-        shared_gate_host_ = row_split::pack_w8g32_row_split(
+        shared_gate_host_ = quantized_weight::pack_w8g32_row_split(
             make_gate_up(kSharedGateRows, kHidden, 0x512U, 0.93f), kSharedGateRows, kHidden);
-        shared_down_host_ = row_split::pack_w8g32_row_split(
+        shared_down_host_ = quantized_weight::pack_w8g32_row_split(
             make_down(kHidden, kIntermediate, 0x731U, 0.87f), kHidden, kIntermediate);
         shared_gate_.copy_rows(shared_gate_host_, 0);
         shared_down_device_.copy_rows(shared_down_host_, 0);
@@ -631,8 +633,8 @@ private:
     std::vector<std::vector<float>> inputs_;
     std::vector<std::vector<float>> residuals_;
     std::vector<HostExpert> experts_;
-    row_split::PackedWeight shared_gate_host_;
-    row_split::PackedWeight shared_down_host_;
+    quantized_weight::PackedWeight shared_gate_host_;
+    quantized_weight::PackedWeight shared_down_host_;
     std::vector<std::vector<double>> references_;
 };
 
