@@ -11,7 +11,6 @@ public:
     [[nodiscard]] static Frontend create_component(const FrontendResources& resources,
                                                    bool vision_enabled = true);
     [[nodiscard]] static const PreparedPromptData& inspect(const PreparedPrompt& prompt);
-    [[nodiscard]] static PreparedPromptData& inspect(PreparedPrompt& prompt);
 };
 
 } // namespace ninfer::targets::qwen3_6

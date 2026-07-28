@@ -121,6 +121,12 @@ int exercise_partial_terminal(ninfer::Engine& engine, const std::vector<ninfer::
         const ninfer::GenerationResult stopped =
             engine.generate(engine.prepare_tokens(prompt), options);
         if (stopped.finish_reason != ninfer::FinishReason::StopToken) { continue; }
+        if (stopped.generated_token_ids.size() != stop_index + 1 ||
+            !std::equal(stopped.generated_token_ids.begin(), stopped.generated_token_ids.end(),
+                        baseline.begin())) {
+            std::cerr << "partial DFlash terminal diverged from the target baseline prefix\n";
+            return 1;
+        }
 
         const std::uint64_t fully_licensed = 1 + stopped.speculative.rounds +
                                              stopped.speculative.accepted_tokens +

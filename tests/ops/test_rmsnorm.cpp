@@ -75,7 +75,7 @@ int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint3
 int main() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
-        return 0;
+        return 77;
     }
 
     int failures = 0;

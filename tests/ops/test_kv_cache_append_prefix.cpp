@@ -236,7 +236,7 @@ int graph_replay_case() {
 int main() {
     if (cuda_unavailable()) {
         std::cout << "kv_cache_append_prefix: SKIP (CUDA unavailable)\n";
-        return 0;
+        return 77;
     }
 
     int failures = 0;

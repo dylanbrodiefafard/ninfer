@@ -116,7 +116,7 @@ int run_case(std::int32_t patches, std::uint32_t seed) {
 int main() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
-        return 0;
+        return 77;
     }
 
     int failures = 0;

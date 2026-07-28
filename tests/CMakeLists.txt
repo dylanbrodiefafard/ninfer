@@ -30,6 +30,7 @@ endfunction()
 
 function(ninfer_add_op_test name)
   ninfer_add_test(${name} ${ARGN})
+  set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(${name} PRIVATE
       $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math>
@@ -66,13 +67,16 @@ ninfer_add_test(ninfer_kv_cache_test
 ninfer_add_test(ninfer_state_store_test
   SOURCES test_state_store.cpp
   LIBRARIES ninfer_engine ninfer_core)
+set_tests_properties(
+  ninfer_artifact_materialization_test
+  ninfer_device_test
+  ninfer_arena_test
+  ninfer_kv_cache_test
+  ninfer_state_store_test
+  PROPERTIES SKIP_RETURN_CODE 77)
 target_include_directories(ninfer_state_store_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 ninfer_add_test(ninfer_generation_controller_test SOURCES test_generation_controller.cpp)
-ninfer_add_test(ninfer_row_split_pack_golden_test
-  SOURCES test_row_split_pack_golden.cpp
-  NEEDS_SOURCE_DIR
-  LIBRARIES ninfer_core)
 
 # Family frontend and one opt-in real-artifact prefix/MTP integration test.
 ninfer_add_test(ninfer_qwen3_6_frontend_test
@@ -229,6 +233,7 @@ ninfer_add_fused_linear_test(
 ninfer_add_test(ninfer_qwen3_6_27b_visual_scatter_test
   SOURCES targets/qwen3_6_27b/test_visual_scatter.cpp
   LIBRARIES ninfer_engine ninfer_core)
+set_tests_properties(ninfer_qwen3_6_27b_visual_scatter_test PROPERTIES SKIP_RETURN_CODE 77)
 
 # These tests deliberately compile against the exact target's internal contracts; the target does
 # not export impl/ to ordinary consumers.

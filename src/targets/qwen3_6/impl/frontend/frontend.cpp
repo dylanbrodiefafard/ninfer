@@ -797,11 +797,6 @@ const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prom
     return PreparedPromptAccess::view(prompt);
 }
 
-PreparedPromptData& FrontendTestAccess::inspect(PreparedPrompt& prompt) {
-    if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
-    return *prompt.data_;
-}
-
 PreparedPrompt Frontend::prepare(PromptInput input) const {
     const auto start                      = Clock::now();
     const PromptOptions options           = input.options;

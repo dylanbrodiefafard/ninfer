@@ -97,7 +97,7 @@ int increment_i64_contract(cudaStream_t stream) {
 int main() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
-        return 0;
+        return 77;
     }
 
     cudaStream_t stream = nullptr;

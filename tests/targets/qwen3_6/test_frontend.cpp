@@ -487,9 +487,16 @@ int test_terminal_flush(const Frontend& frontend) {
 }
 
 int test_reasoning_split(const Frontend& frontend) {
-    auto prompt                                          = frontend.prepare_tokens({0});
-    FrontendFactory::inspect(prompt).starts_in_reasoning = true;
-    auto session                                         = frontend.make_output_session(prompt, {});
+    ninfer::ChatMessage message;
+    message.role = "user";
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.add_generation_prompt = true;
+    input.options.enable_thinking       = true;
+    auto prompt                         = frontend.prepare(std::move(input));
+    auto session                        = frontend.make_output_session(prompt, {});
     const std::array<ninfer::TokenId, 2> tokens{3, 4};
     const auto decision = session.preview(tokens, 2, ninfer::FinishReason::OutputLimit);
     int failures        = check(decision.accepted_tokens == 2 &&

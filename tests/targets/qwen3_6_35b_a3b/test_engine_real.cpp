@@ -115,7 +115,9 @@ int exercise_text_mtp_and_prefix(ninfer::Engine& engine) {
     const ninfer::GenerationResult stopped =
         engine.generate(engine.prepare_tokens(prompt), stop_options);
     if (stopped.finish_reason != ninfer::FinishReason::StopToken ||
-        stopped.generated_token_ids.size() != 2) {
+        stopped.generated_token_ids.size() != 2 ||
+        stopped.generated_token_ids[0] != first.generated_token_ids[0] ||
+        stopped.generated_token_ids[1] != first.generated_token_ids[1]) {
         std::cerr << "35B custom stop did not terminate inside an MTP round\n";
         return 1;
     }
@@ -196,7 +198,7 @@ int exercise_maximum_configuration(const char* artifact) {
     const ninfer::GenerationResult probe =
         engine.generate(engine.prepare_tokens(prompt), greedy_options(1, false));
     if (probe.generated_token_ids.size() != 1) {
-        std::cerr << "35B Program mutated while rejecting an over-capacity request\n";
+        std::cerr << "35B Engine was unusable after rejecting an over-capacity request\n";
         return 1;
     }
     return 0;

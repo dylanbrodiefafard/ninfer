@@ -357,7 +357,7 @@ int remap_case(int token_count) {
 int main() {
     if (cuda_unavailable()) {
         std::cout << "speculative_round: SKIP (CUDA unavailable)\n";
-        return 0;
+        return 77;
     }
 
     int failures = 0;

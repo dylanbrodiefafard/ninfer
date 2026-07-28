@@ -46,11 +46,11 @@ struct EventLog {
         return result;
     }
 
-    [[nodiscard]] std::size_t position(Event event, std::size_t occurrence = 0) const noexcept {
+    [[nodiscard]] std::size_t position(Event event, std::size_t occurrence = 0) const {
         for (std::size_t i = 0; i < size; ++i) {
             if (events[i] == event && occurrence-- == 0) { return i; }
         }
-        return events.size();
+        throw std::logic_error("required event is absent from the test log");
     }
 
     std::array<Event, 64> events{};
@@ -240,7 +240,7 @@ int test_continue_then_partial_terminal_round() {
     FakeProgram program{
         .log                     = &log,
         .rounds                  = {{10, 11}, {20, 21, 22}},
-        .effective_output_tokens = 4,
+        .effective_output_tokens = 5,
         .effective_limit_reason  = FinishReason::ContextCapacity,
     };
     FakeOutputState output_state{
@@ -248,9 +248,9 @@ int test_continue_then_partial_terminal_round() {
             {
                 PreviewStep{
                     OutputDecision{.accepted_tokens = 2, .finish_reason = FinishReason::None}, "A"},
-                PreviewStep{OutputDecision{.accepted_tokens = 2,
-                                           .finish_reason   = FinishReason::ContextCapacity},
-                            "B"},
+                PreviewStep{
+                    OutputDecision{.accepted_tokens = 2, .finish_reason = FinishReason::StopToken},
+                    "B"},
             },
         .log = &log,
     };
@@ -273,9 +273,9 @@ int test_continue_then_partial_terminal_round() {
     }
     failures += check(result.generated_token_ids == std::vector<TokenId>({10, 11, 20, 21}),
                       "controller returned tokens outside the committed prefixes");
-    failures += check(result.summary.finish_reason == FinishReason::ContextCapacity,
+    failures += check(result.summary.finish_reason == FinishReason::StopToken,
                       "controller returned the wrong terminal reason");
-    failures += check(output_state.observed_budgets == std::vector<std::uint32_t>({4, 2}) &&
+    failures += check(output_state.observed_budgets == std::vector<std::uint32_t>({5, 3}) &&
                           output_state.observed_limit_reasons ==
                               std::vector<FinishReason>(
                                   {FinishReason::ContextCapacity, FinishReason::ContextCapacity}),
@@ -333,6 +333,8 @@ int test_cancellation_between_rounds_finishes_active_sequence() {
     failures += check(output_state.terminal_preview_calls == 1 &&
                           output_state.terminal_reason == FinishReason::Cancelled,
                       "decoder was not terminally committed as cancelled");
+    failures +=
+        check(output_state.commit_calls == 2, "cancelled decoder state was not committed twice");
     failures += check(log.position(Event::PreviewTerminal) < log.position(Event::FinishActive) &&
                           log.position(Event::FinishActive) < log.position(Event::CommitPreview, 1),
                       "cancellation did not resolve model state before decoder commit");

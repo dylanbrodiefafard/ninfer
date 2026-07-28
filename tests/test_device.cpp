@@ -53,7 +53,7 @@ int main() {
     const cudaError_t count_err = cudaGetDeviceCount(&count);
     if (cuda_unavailable(count_err)) {
         std::cout << "SKIP: no usable CUDA device\n";
-        return 0;
+        return 77;
     }
     if (count_err != cudaSuccess) {
         std::cerr << "cudaGetDeviceCount failed: " << cudaGetErrorString(count_err) << '\n';
@@ -61,7 +61,7 @@ int main() {
     }
     if (count == 0) {
         std::cout << "SKIP: no CUDA devices\n";
-        return 0;
+        return 77;
     }
 
     int failures = 0;
@@ -72,7 +72,6 @@ int main() {
         std::cerr << "ctx.device expected 0, got " << ctx.device << '\n';
     }
     failures += check_context(ctx, "ctx");
-    CUDA_CHECK(cudaSuccess);
     ctx.synchronize();
 
     const cudaStream_t original_stream = ctx.stream;

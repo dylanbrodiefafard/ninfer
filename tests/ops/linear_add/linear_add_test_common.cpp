@@ -23,12 +23,13 @@ namespace ninfer::test::linear_add {
 namespace {
 
 constexpr std::size_t kOutputScanWords = 1U << 20;
+constexpr double kBf16UnitRoundoff     = 1.0 / 256.0;
 
 // One criterion for the complete A16 fused Op. It is not selected by T, route, or kernel.
 constexpr ReductionCriterion kLinearAddA16Tolerance{
-    2.7e-3,
-    4.0e-3,
-    5.5e-3,
+    kBf16UnitRoundoff,
+    kBf16UnitRoundoff,
+    2.0 * kBf16UnitRoundoff,
 };
 
 std::size_t checked_elements(std::int32_t first, std::int32_t second, const char* label) {
@@ -87,20 +88,17 @@ std::vector<std::int32_t> conformance_tokens(const ShapeCase& shape) {
 
 std::vector<std::uint16_t> make_activation(std::int32_t k, std::int32_t t, std::uint32_t seed) {
     std::vector<std::uint16_t> result(checked_elements(k, t, "activation"));
-    std::vector<std::uint16_t> patterns(static_cast<std::size_t>(256) * k);
-    for (int offset = 0; offset < 256; ++offset) {
+    for (std::int32_t token = 0; token < t; ++token) {
         for (std::int32_t column = 0; column < k; ++column) {
-            const int raw = 32 + ((column * 17 + offset) & 0x5f);
-            patterns[static_cast<std::size_t>(offset) * k + column] =
+            const std::uint64_t token_block = static_cast<std::uint64_t>(token / 256);
+            const std::uint64_t coordinate =
+                static_cast<std::uint64_t>(column) * 17U + static_cast<std::uint64_t>(token) * 31U +
+                static_cast<std::uint64_t>(seed) * 13U +
+                token_block * (static_cast<std::uint64_t>(column / 256) * 13U + 47U);
+            const int raw = 32 + static_cast<int>(coordinate & 0x5fU);
+            result[static_cast<std::size_t>(token) * k + column] =
                 test::f32_to_bf16(static_cast<float>(raw) * (1.0F / 256.0F));
         }
-    }
-    for (std::int32_t token = 0; token < t; ++token) {
-        const int offset =
-            static_cast<int>((static_cast<std::uint64_t>(token) * 31U + seed * 13U) & 0xffU);
-        std::memcpy(result.data() + static_cast<std::size_t>(token) * k,
-                    patterns.data() + static_cast<std::size_t>(offset) * k,
-                    static_cast<std::size_t>(k) * sizeof(std::uint16_t));
     }
     return result;
 }
@@ -109,11 +107,14 @@ std::vector<std::uint16_t> make_residual(std::int32_t n, std::int32_t t, std::ui
     std::vector<std::uint16_t> result(checked_elements(n, t, "residual"));
     for (std::int32_t token = 0; token < t; ++token) {
         for (std::int32_t row = 0; row < n; ++row) {
-            const int raw = static_cast<int>((static_cast<std::uint64_t>(row) * 23U +
-                                              static_cast<std::uint64_t>(token) * 41U + seed * 7U) &
-                                             0xffU);
+            const std::uint64_t token_block = static_cast<std::uint64_t>(token / 256);
+            const std::uint64_t coordinate =
+                static_cast<std::uint64_t>(row) * 23U + static_cast<std::uint64_t>(token) * 41U +
+                static_cast<std::uint64_t>(seed) * 7U +
+                token_block * (static_cast<std::uint64_t>(row / 256) * 17U + 29U);
+            const int raw = static_cast<int>(coordinate & 0xffU);
             result[static_cast<std::size_t>(token) * n + row] =
-                test::f32_to_bf16(static_cast<float>(raw - 128) * (1.0F / 512.0F));
+                test::f32_to_bf16(static_cast<float>(raw - 128) * (1.0F / 128.0F));
         }
     }
     return result;

@@ -58,7 +58,9 @@ inline void cuda_synchronize(cudaStream_t stream) {
 inline bool cuda_unavailable() {
     int n               = 0;
     const cudaError_t e = cudaGetDeviceCount(&n);
-    return e == cudaErrorNoDevice || e == cudaErrorInsufficientDriver || e != cudaSuccess || n == 0;
+    if (e == cudaSuccess) { return n == 0; }
+    if (e == cudaErrorNoDevice || e == cudaErrorInsufficientDriver) { return true; }
+    throw std::runtime_error(std::string("cudaGetDeviceCount: ") + cudaGetErrorString(e));
 }
 
 // --- bf16 <-> f32 (round-to-nearest-even) -----------------------------------

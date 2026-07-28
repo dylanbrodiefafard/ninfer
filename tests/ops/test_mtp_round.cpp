@@ -64,7 +64,7 @@ int run_case(int k, std::int32_t accepted) {
 int main() {
     if (cuda_unavailable()) {
         std::cout << "mtp_round: SKIP (CUDA unavailable)\n";
-        return 0;
+        return 77;
     }
 
     int failures = 0;

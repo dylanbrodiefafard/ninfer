@@ -222,7 +222,7 @@ int run_profile(std::string_view label, const Profile& profile,
     if (token_cases.empty()) { throw std::invalid_argument("linear_swiglu test: no token cases"); }
     if (!cuda_available()) {
         std::cout << "SKIP: no usable CUDA device\n";
-        return 0;
+        return 77;
     }
 
     for (std::size_t index = 0; index < token_cases.size(); ++index) {

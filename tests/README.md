@@ -43,8 +43,7 @@ presets.
 
 `ops/quantized_weight.h` is the common packed-weight fixture for Q4/Q5/Q6/W8 and NVFP4 Op tests. It
 owns deterministic payload generation, device `Weight` views, row views, and independent logical
-weight decoding. The existing `ninfer_row_split_pack_golden_test` compares the grouped-integer
-source-matrix packer with the Python converter.
+weight decoding.
 
 ## Build and run
 

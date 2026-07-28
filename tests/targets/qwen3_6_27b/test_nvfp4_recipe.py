@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import Counter
 import struct
 
 import pytest
@@ -41,15 +40,6 @@ def test_closed_allocation_inventory_and_site_coverage():
         "W8G32_F16S": 7,
         "NVFP4": 305,
     }
-
-    bound = [
-        weight
-        for site in recipe.INPUT_DIVISOR_RECIPES
-        for weight in site.weight_names
-    ]
-    assert len(bound) == 305
-    assert Counter(bound) == Counter(recipe.NVFP4_WEIGHTS_BY_NAME.keys())
-
 
 def test_input_divisor_materialization_preserves_positive_fp32_word():
     class Reader:

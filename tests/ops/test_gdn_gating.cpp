@@ -123,7 +123,7 @@ int run_case(std::int32_t tokens, std::uint32_t seed, bool stress_transcendental
 int main() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
-        return 0;
+        return 77;
     }
 
     int failures = 0;

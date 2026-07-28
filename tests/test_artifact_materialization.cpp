@@ -97,11 +97,15 @@ int main() {
 
         int device_count              = 0;
         const cudaError_t count_error = cudaGetDeviceCount(&device_count);
-        if (cuda_unavailable(count_error) || device_count == 0) {
+        if (cuda_unavailable(count_error)) {
             std::cout << "SKIP: no usable CUDA device\n";
-            return 0;
+            return 77;
         }
         CUDA_CHECK(count_error);
+        if (device_count == 0) {
+            std::cout << "SKIP: no CUDA devices\n";
+            return 77;
+        }
 
         ninfer::artifact::Binder binder(reader);
 
@@ -148,7 +152,9 @@ int main() {
         require(stats.tensor_count == 2 && stats.resource_count == 1 &&
                     stats.h2d_bytes == kTensor.size() + kSecondTensor.size() &&
                     stats.retained_resource_bytes == kResource.size() &&
-                    stats.file_bytes >= stats.h2d_bytes && stats.file_bytes < reader.file_bytes(),
+                    stats.file_bytes == kResource.size() +
+                                            ninfer::artifact::Reader::direct_io_alignment +
+                                            kSecondTensor.size(),
                 "materialization statistics are incomplete");
         require(materialized.device_arena().capacity() == plan.device_capacity_bytes &&
                     materialized.device_arena().used() == plan.device_capacity_bytes,

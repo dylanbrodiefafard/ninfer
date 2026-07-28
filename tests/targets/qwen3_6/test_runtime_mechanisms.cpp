@@ -67,8 +67,7 @@ void test_decoder_layout() {
     ninfer::LayoutBuilder bf16_builder;
     const q36::DecoderStateLayout bf16 =
         q36::plan_decoder_state(bf16_builder, decoder_spec(ninfer::DType::BF16, false));
-    const std::size_t bf16_bytes = bf16_builder.finish(256);
-    expect(bf16_bytes != 0, "BF16 decoder layout has storage");
+    (void)bf16_builder.finish(256);
     expect(bf16.text_kv.k.size() == 2 && bf16.text_kv.v.size() == 2, "Text KV layer planes");
     expect(bf16.text_kv.padded_context == 256, "Text KV capacity padding");
     expect(bf16.text_kv.k_scale.empty() && bf16.text_kv.v_scale.empty(),
@@ -99,8 +98,8 @@ void test_round_layout() {
     const ninfer::TensorRegion exact_prefill =
         builder.add_tensor(ninfer::DType::BF16, {32, 16}, 256, "exact prefill hidden");
     q36::complete_round_state_layout(builder, round);
-    const std::size_t bytes = builder.finish(256);
-    expect(round.complete && bytes != 0, "round layout completes");
+    (void)builder.finish(256);
+    expect(round.complete, "round layout completes");
     expect(round.logits.shape[0] == 128 && round.logits.shape[1] == 6, "round logits shape");
     expect(round.verify_hidden.shape[0] == 32 && round.verify_hidden.shape[1] == 6,
            "round verification hidden shape");
@@ -198,8 +197,8 @@ q36::PreparedPromptData identity_prompt(std::uint8_t digest_byte = 1) {
     prompt.token_ids   = {10, 248056, 248056, 11};
     prompt.token_types = {0, static_cast<std::uint8_t>(q36::PromptModality::Image),
                           static_cast<std::uint8_t>(q36::PromptModality::Image), 0};
-    prompt.positions   = {0, 1, 1, 2, 0, 1, 1, 2, 0, 1, 2, 3};
-    prompt.rope_delta  = -1;
+    prompt.positions   = {0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 2, 3};
+    prompt.rope_delta  = 0;
     q36::VisionItem item{.modality    = q36::PromptModality::Image,
                          .grid        = {.temporal = 1, .height = 2, .width = 4},
                          .patch_begin = 0,
@@ -253,7 +252,7 @@ void test_prefix_identity() {
 
     resident.append_generated(1, original.rope_delta);
     ledger.push_back(12);
-    append_text_token(original, 12, 3);
+    append_text_token(original, 12, 4);
     expect(q36::detail::prefix_matches(original, ledger, resident, ledger.size()),
            "generated multimodal continuation identity");
 

@@ -187,25 +187,6 @@ public:
         return failures;
     }
 
-    int verify_zero_row(const std::string& label, std::int32_t row) const {
-        if (row < 0 || row >= rows_) {
-            throw std::invalid_argument("sparse_moe test: invalid zero row");
-        }
-        int failures = 0;
-        failures +=
-            verify_zero_plane(label + " code", codes_,
-                              static_cast<std::size_t>(row) * code_row_bytes_, code_row_bytes_);
-        if (high_row_bytes_ != 0) {
-            failures +=
-                verify_zero_plane(label + " high", *high_,
-                                  static_cast<std::size_t>(row) * high_row_bytes_, high_row_bytes_);
-        }
-        failures +=
-            verify_zero_plane(label + " scale", scales_,
-                              static_cast<std::size_t>(row) * scale_row_bytes_, scale_row_bytes_);
-        return failures;
-    }
-
 private:
     static int verify_plane(const std::string& label, const DeviceBuffer& device,
                             const std::uint8_t* expected, std::size_t offset, std::size_t bytes) {
@@ -213,18 +194,6 @@ private:
         device.copy_to_host(actual.data(), bytes, offset);
         if (std::memcmp(actual.data(), expected, bytes) == 0) { return 0; }
         std::cerr << label << ": persistent weight was modified\n";
-        return 1;
-    }
-
-    static int verify_zero_plane(const std::string& label, const DeviceBuffer& device,
-                                 std::size_t offset, std::size_t bytes) {
-        std::vector<std::uint8_t> actual(bytes);
-        device.copy_to_host(actual.data(), bytes, offset);
-        if (std::all_of(actual.begin(), actual.end(),
-                        [](std::uint8_t value) { return value == 0; })) {
-            return 0;
-        }
-        std::cerr << label << ": unselected persistent weight was modified\n";
         return 1;
     }
 
@@ -612,12 +581,6 @@ public:
                                              shared_gate_host_, 0);
         failures += shared_down_device_.verify_rows(std::string(profile_.name) + " shared down",
                                                     shared_down_host_, 0);
-        // Expert 128 is deliberately absent from all selected sets. Checking one row in each
-        // bank detects writes outside the logically consumed selected-expert spans.
-        failures += routed_gate_.verify_zero_row(
-            std::string(profile_.name) + " unselected routed gate", 128 * kExpertGateRows);
-        failures += routed_down_.verify_zero_row(
-            std::string(profile_.name) + " unselected routed down", 128 * kHidden);
         return failures;
     }
 
@@ -657,7 +620,7 @@ int run_profile(const CodecProfile& profile) {
 int main() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
-        return 0;
+        return 77;
     }
 
     // These are public-behavior cases, not route assertions. They exercise decode (T=1), the

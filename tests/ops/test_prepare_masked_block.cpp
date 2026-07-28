@@ -71,7 +71,7 @@ int run_case(int block_size, std::int32_t anchor_value, std::int32_t length_valu
 int main() {
     if (cuda_unavailable()) {
         std::cout << "prepare_masked_block: SKIP (CUDA unavailable)\n";
-        return 0;
+        return 77;
     }
 
     int failures = 0;

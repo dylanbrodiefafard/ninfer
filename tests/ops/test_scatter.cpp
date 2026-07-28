@@ -110,7 +110,7 @@ int extract_case(std::int32_t source_rows, std::int32_t destination_rows,
 int main() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
-        return 0;
+        return 77;
     }
 
     int failures = 0;

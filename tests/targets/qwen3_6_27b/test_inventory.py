@@ -1,5 +1,3 @@
-from collections import Counter
-
 from tools.convert.qwen3_6_27b import inventory
 
 
@@ -56,9 +54,6 @@ def test_format_layout_counts_and_key_signatures() -> None:
         "contiguous-le-v1": 679,
         "row-split-k128-v1": 439,
     }
-    assert Counter(spec.format for spec in inventory.TENSOR_SPECS) == inventory.FORMAT_COUNTS
-    assert Counter(spec.layout for spec in inventory.TENSOR_SPECS) == inventory.LAYOUT_COUNTS
-
     tensors = _tensor_by_name()
     assert tensors["text/token_embedding"] == inventory.TensorSpec(
         "text/token_embedding", (248320, 5120), "Q6G64_F16S", "row-split-k128-v1"

@@ -78,7 +78,7 @@ int offset_case(std::int32_t count, std::int32_t delta_value, bool in_place) {
 int main() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
-        return 0;
+        return 77;
     }
 
     int failures = 0;

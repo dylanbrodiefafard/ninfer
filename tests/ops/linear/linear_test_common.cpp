@@ -28,13 +28,15 @@ constexpr std::uint8_t kOutputGuardByte  = 0xa5;
 constexpr std::uint8_t kOutputPoisonByte = 0xff;
 constexpr std::size_t kOutputScanWords   = 1U << 20;
 constexpr int kOracleTBlock              = 8;
+constexpr double kBf16UnitRoundoff       = 1.0 / 256.0;
 
 // The criterion belongs to the activation compute path, not to a private kernel, schedule, or
-// launcher selected inside that path.
+// launcher selected inside that path. The relative-L2 allowance is one BF16 unit roundoff; the
+// gross allowance covers final BF16 storage plus accumulation/reduction rounding.
 constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute) {
     switch (activation_compute) {
     case ActivationCompute::A16:
-        return {2.9e-3, 4.0e-3, 3.4e-3};
+        return {kBf16UnitRoundoff, kBf16UnitRoundoff, 2.0 * kBf16UnitRoundoff};
     }
     throw std::invalid_argument("linear test: unknown activation compute path");
 }
@@ -92,21 +94,17 @@ std::vector<std::int32_t> sampled_indices(std::int32_t extent) {
 std::vector<std::uint16_t> make_activation(std::int32_t k, std::int32_t t, std::uint32_t seed) {
     const std::size_t elements = checked_elements(k, t, "activation");
     std::vector<std::uint16_t> result(elements);
-    std::vector<std::uint16_t> patterns(static_cast<std::size_t>(256) *
-                                        static_cast<std::size_t>(k));
-    for (int offset = 0; offset < 256; ++offset) {
-        for (std::int32_t column = 0; column < k; ++column) {
-            const int raw     = (column * 17 + offset) & 0xff;
-            const float value = static_cast<float>(raw - 128) * (1.0F / 256.0F);
-            patterns[static_cast<std::size_t>(offset) * k + column] = test::f32_to_bf16(value);
-        }
-    }
     for (std::int32_t token = 0; token < t; ++token) {
-        const int offset =
-            static_cast<int>((static_cast<std::uint64_t>(token) * 31U + seed * 13U) & 0xffU);
-        std::memcpy(result.data() + static_cast<std::size_t>(token) * k,
-                    patterns.data() + static_cast<std::size_t>(offset) * k,
-                    static_cast<std::size_t>(k) * sizeof(std::uint16_t));
+        for (std::int32_t column = 0; column < k; ++column) {
+            const std::uint64_t token_block = static_cast<std::uint64_t>(token / 256);
+            const std::uint64_t coordinate =
+                static_cast<std::uint64_t>(column) * 17U + static_cast<std::uint64_t>(token) * 31U +
+                static_cast<std::uint64_t>(seed) * 13U +
+                token_block * (static_cast<std::uint64_t>(column / 256) * 13U + 47U);
+            const int raw     = static_cast<int>(coordinate & 0xffU);
+            const float value = static_cast<float>(raw - 128) * (1.0F / 256.0F);
+            result[static_cast<std::size_t>(token) * k + column] = test::f32_to_bf16(value);
+        }
     }
     return result;
 }

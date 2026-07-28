@@ -256,7 +256,7 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
 int main() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: CUDA device unavailable\n";
-        return 0;
+        return 77;
     }
 
     int failures = 0;

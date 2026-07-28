@@ -127,20 +127,17 @@ std::vector<std::int32_t> physical_rows(std::span<const std::int32_t> logical_ro
 
 std::vector<std::uint16_t> make_activation(std::int32_t k, std::int32_t t, std::uint32_t seed) {
     std::vector<std::uint16_t> result(checked_elements(k, t, "activation"));
-    std::vector<std::uint16_t> patterns(static_cast<std::size_t>(256) * k);
-    for (int offset = 0; offset < 256; ++offset) {
+    for (std::int32_t token = 0; token < t; ++token) {
         for (std::int32_t column = 0; column < k; ++column) {
-            const int raw = (column * 17 + offset) & 0xff;
-            patterns[static_cast<std::size_t>(offset) * k + column] =
+            const std::uint64_t token_block = static_cast<std::uint64_t>(token / 256);
+            const std::uint64_t coordinate =
+                static_cast<std::uint64_t>(column) * 17U + static_cast<std::uint64_t>(token) * 31U +
+                static_cast<std::uint64_t>(seed) * 13U +
+                token_block * (static_cast<std::uint64_t>(column / 256) * 13U + 47U);
+            const int raw = static_cast<int>(coordinate & 0xffU);
+            result[static_cast<std::size_t>(token) * k + column] =
                 test::f32_to_bf16(static_cast<float>(raw - 128) * (1.0F / 256.0F));
         }
-    }
-    for (std::int32_t token = 0; token < t; ++token) {
-        const int offset =
-            static_cast<int>((static_cast<std::uint64_t>(token) * 31U + seed * 13U) & 0xffU);
-        std::memcpy(result.data() + static_cast<std::size_t>(token) * k,
-                    patterns.data() + static_cast<std::size_t>(offset) * k,
-                    static_cast<std::size_t>(k) * sizeof(std::uint16_t));
     }
     return result;
 }

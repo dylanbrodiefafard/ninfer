@@ -514,8 +514,8 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
         }
     }
     constexpr std::uint16_t kUnitScales[]  = {0x3800u, 0x3a00u, 0x3c00u, 0x3d00u};
-    constexpr std::uint16_t kSmallScales[] = {0x2000u, 0x2400u, 0x2800u, 0x2c00u};
-    constexpr std::uint16_t kTinyScales[]  = {0x1800u, 0x1c00u, 0x2000u, 0x2400u};
+    constexpr std::uint16_t kSmallScales[] = {0x2040u, 0x2440u, 0x2840u, 0x2c40u};
+    constexpr std::uint16_t kTinyScales[]  = {0x1840u, 0x1c40u, 0x2040u, 0x2440u};
     const std::uint16_t* scales            = nullptr;
     switch (options.row_split_scale) {
     case RowSplitScalePattern::Unit:

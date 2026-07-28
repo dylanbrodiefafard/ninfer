@@ -238,7 +238,7 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
 int main() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: CUDA device unavailable\n";
-        return 0;
+        return 77;
     }
 
     int failures = 0;

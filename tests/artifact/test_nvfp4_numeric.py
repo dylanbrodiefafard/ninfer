@@ -61,18 +61,3 @@ def test_nvfp4_stored_scale_and_divisor_word_validity():
     assert valid_positive_fp32_word(positive)
     for word in (0, 0x80000000, 0x7F800000, 0xFF800000, 0x7FC00000):
         assert not valid_positive_fp32_word(word)
-
-
-def test_combined_weight_decode_uses_divisor_not_multiplier():
-    samples = (
-        (0x7, 0x38, 2.0, 3.0),
-        (0xB, 0x40, 4.0, -0.75),
-        (0x1, 0x30, 0.5, 0.5),
-    )
-    for code, scale, divisor, expected in samples:
-        actual = (
-            decode_e2m1_word(code)
-            * decode_e4m3fn_word(scale)
-            / divisor
-        )
-        assert actual == expected

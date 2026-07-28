@@ -79,7 +79,9 @@ int exercise_partial_mtp_terminal(ninfer::Engine& engine,
     const ninfer::GenerationResult stopped =
         engine.generate(engine.prepare_tokens(prompt), options);
     if (stopped.finish_reason != ninfer::FinishReason::StopToken ||
-        stopped.generated_token_ids.size() != 2 || stopped.generated_token_ids[1] != stop) {
+        stopped.generated_token_ids.size() != 2 ||
+        stopped.generated_token_ids[0] != baseline.generated_token_ids[0] ||
+        stopped.generated_token_ids[1] != baseline.generated_token_ids[1]) {
         std::cerr << "custom stop did not terminate inside the first MTP round\n";
         return 1;
     }
@@ -146,7 +148,9 @@ int exercise_zero_suffix_gdn(ninfer::Engine& engine, const std::vector<ninfer::T
                   << exact_frontier.size() << '\n';
         return 1;
     }
-    if (reused.generated_token_ids.size() != 2 || reused.speculative.fallback_steps != 1) {
+    if (reused.generated_token_ids.size() != 2 ||
+        reused.generated_token_ids[0] != baseline.generated_token_ids.back() ||
+        reused.speculative.fallback_steps != 1) {
         std::cerr << "zero-suffix reuse did not resume and take one ordinary target step\n";
         return 1;
     }
@@ -324,7 +328,9 @@ int exercise_vision(ninfer::Engine& engine) {
     const ninfer::GenerationResult stopped =
         engine.generate(engine.prepare(first_input(image_bytes)), stop_options);
     if (stopped.finish_reason != ninfer::FinishReason::StopToken ||
-        stopped.generated_token_ids.size() != 2) {
+        stopped.generated_token_ids.size() != 2 ||
+        stopped.generated_token_ids[0] != mtp_baseline.generated_token_ids[0] ||
+        stopped.generated_token_ids[1] != mtp_baseline.generated_token_ids[1]) {
         std::cerr << "multimodal custom stop did not terminate inside an MTP round\n";
         return 1;
     }

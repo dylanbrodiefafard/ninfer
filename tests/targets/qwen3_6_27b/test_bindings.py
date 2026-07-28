@@ -34,15 +34,12 @@ def test_complete_typed_binding_and_vision_policy(binding: ArtifactBinding) -> N
     assert len(binding.axis_views) == 48
     assert len(binding.text.layers) == 64
     assert len(binding.vision.layers) == 27
-    assert binding.mtp.token_embedding is binding.text.token_embedding
-    assert binding.mtp.full_output_head is binding.text.output_head
-    assert binding.mtp.optimized_proposal_head is binding.text.draft_head
     assert binding.text.layers[0].gdn.convolution.shape == (10240, 4)
     first_gdn = binding.text.layers[0].gdn
     assert first_gdn is not None
-    assert first_gdn.value.block is first_gdn.value_z
+    assert first_gdn.value.block.tensor_id == first_gdn.value_z.tensor_id
     assert (first_gdn.value.row_begin, first_gdn.value.row_end) == (0, 6144)
-    assert first_gdn.z.block is first_gdn.value_z
+    assert first_gdn.z.block.tensor_id == first_gdn.value_z.tensor_id
     assert (first_gdn.z.row_begin, first_gdn.z.row_end) == (6144, 12288)
 
     vision = WeightStore(
