@@ -1,13 +1,13 @@
 # NInfer Persistent Tensor Numeric Formats
 
-This reference defines the seven persistent numeric tensor formats accepted by current `.ninfer`
-artifacts: their logical words, grouped quantization semantics, canonical reference encoder, and
-conformance boundaries. Container framing, physical byte layouts, checkpoint assignment, kernels,
-and runtime-state codecs are defined separately.
+This reference defines the eight persistent numeric tensor formats accepted by current `.ninfer`
+artifacts: their logical words, quantization semantics, canonical reference encoders where
+applicable, and conformance boundaries. Container framing, physical byte layouts, checkpoint
+assignment, kernels, and runtime-state codecs are defined separately.
 
 ## 1. Registered formats
 
-NInfer starts with exactly seven persistent numeric tensor formats in two categories.
+NInfer has exactly eight persistent numeric tensor formats in three categories.
 
 Direct scalar formats preserve one logical scalar word per tensor element:
 
@@ -26,10 +26,17 @@ Grouped quantized-weight formats preserve signed codes plus one scale per logica
 | `Q6G64_F16S` | 6 | 64 | `[-32, 31]` | one binary16 scale/group | 6.25 |
 | `W8G32_F16S` | 8 | 32 | `[-127, 127]` | one binary16 scale/group | 8.50 |
 
+The block-scaled floating-point weight format is:
+
+| Canonical name | Code | K group | Block scale | Global field |
+|---|---|---:|---|---|
+| `NVFP4` | E2M1, 4 bits/weight | 16 | one E4M3FN word/group | one positive FP32 weight divisor |
+
 This is a closed registry, not a template from which arbitrary scalar types, bit widths, and group
 sizes may be constructed. In particular, `FP16`, `I64`, `Q4G32_F16S`, `Q6G128_F16S`, and
 `W8G64_F16S` do not become valid merely because their components look familiar. The use of a
-binary16 scale inside the four quantized formats does not register `FP16` as a direct tensor format.
+binary16 scale inside the four grouped signed-integer formats does not register `FP16` as a direct
+tensor format.
 
 NInfer does not reserve entries for hypothetical formats. A future format is added only for a real
 selected checkpoint target, after its numerical contract, cited upstream quality evidence where
@@ -58,8 +65,9 @@ The registry keeps the following concerns separate.
 ### 2.1 Persistent numeric format
 
 A **persistent numeric format** defines the logical words needed to recover a numeric tensor from
-an artifact. The closed registry contains both direct scalar formats and grouped quantized-weight
-formats. It does not identify a tensor's model role, physical byte layout, or supported consumer.
+an artifact. The closed registry contains direct scalar formats, grouped signed-integer formats,
+and the block-scaled `NVFP4` format. It does not identify a tensor's model role, physical byte
+layout, or supported consumer.
 
 ### 2.2 Direct scalar format
 
@@ -75,13 +83,13 @@ word rather than a quantized approximation of another word.
 
 A **quantization scheme** defines only the persistent logical representation of a quantized weight:
 
-- the signed integer code domain;
+- the code domain;
 - the group axis and group size;
 - the scale type and scale granularity;
 - the validity rules for codes and scales;
 - the mathematical reconstruction of each represented weight.
 
-The four canonical names above identify schemes in this sense. Their meanings are immutable: a
+The five quantized names above identify schemes in this sense. Their meanings are immutable: a
 consumer must not infer a different zero point, scale geometry, code range, or reconstruction rule
 from context.
 
@@ -91,11 +99,16 @@ An **encoder profile** defines how source floating-point values are converted in
 scales of a scheme. Scale selection, rounding order, calibration, clipping, and error optimization
 belong here.
 
-NInfer defines one canonical quantization encoder profile in Section 7. That encoder provides a
-defined baseline and an independent artifact oracle. A checkpoint-specific process may use another
-documented encoder to produce the same scheme—for example, an upstream error-optimized recipe—but
-that does not create a new quantization scheme if the resulting persistent codes and scales obey the
-same logical contract. Encoder provenance must not be confused with decoder semantics.
+NInfer defines one canonical encoder profile for the four grouped signed-integer schemes in
+Section 7. That encoder provides their defined baseline and independent artifact oracle. A
+checkpoint-specific process may use another documented encoder to produce one of those schemes—for
+example, an upstream error-optimized recipe—but that does not create a new quantization scheme if
+the resulting persistent codes and binary16 scales obey the same logical contract.
+
+`NVFP4` has the exact decode contract in Section 3.3, but no NInfer-owned canonical source-to-NVFP4
+encoder. Its current checkpoint recipe copies already selected E2M1, E4M3FN, and FP32 divisor words
+from its fixed source and validates them without requantization. Encoder provenance must not be
+confused with decoder semantics.
 
 Direct formats also separate representation from conversion. For example, the `BF16` format does
 not decide whether an FP32 source is rounded, truncated, or rejected. Any conversion from a source
@@ -127,9 +140,9 @@ among other things:
 
 One format may have more than one deliberately supported layout, but every layout must decode to
 exactly the same direct words or logical codes and scales. The currently registered layouts are
-`contiguous-le-v1` for direct words and `row-split-k128-v1` for grouped formats. Their byte order,
-plane packing, 128-element K padding, and alignment rules belong to the layout registry, not to these
-seven numeric formats.
+`contiguous-le-v1` for direct words, `row-split-k128-v1` for grouped signed-integer formats, and
+`blockscale-k16-m128x4-v1` for `NVFP4`. Their byte order, plane packing, padding, swizzle, divisor
+placement, and alignment rules belong to the layout registry, not to these eight numeric formats.
 
 ### 2.7 Compute profile and kernel support
 
@@ -153,7 +166,7 @@ communication formats are runtime-state codecs. They are outside this persistent
 even if they also use signed integers and grouped scales. In particular, an INT8 KV-cache format
 must not be labeled `W8G32_F16S` merely because some of its fields look similar.
 
-## 3. Canonical identities and direct-format semantics
+## 3. Canonical identities and format semantics
 
 ### 3.1 Direct scalar formats
 
@@ -228,7 +241,7 @@ execution `QType` names, not persistent NInfer format identities, and receive no
 artifact registry. Control parameters, ordinary weights, norms, indexes, and maps use a direct
 format plus a separate model-assignment role.
 
-### 3.2 Grouped quantized-weight identities
+### 3.2 Grouped signed-integer weight identities
 
 The canonical names are closed identifiers with the following readable components:
 
@@ -243,7 +256,7 @@ Q4G64_F16S
 spelling for the signed 8-bit weight path. The different leading letter does not imply activation
 quantization or a generic family distinction beyond the exact rules in this document.
 
-All seven names are identifiers, not a grammar. A parser must compare a name against this closed
+These four names are identifiers, not a grammar. A parser must compare a name against this closed
 registry; it must not accept an unknown combination by splitting a name into components.
 Abbreviations such as `Q4`, `Q5`, `Q6`, `W8G32`, and `INT32` may be used in explanatory prose only.
 
@@ -251,11 +264,54 @@ A container representation must resolve its stored identity to exactly one of th
 without constructing or reinterpreting a format. The container contract owns how that identity is
 serialized.
 
-## 4. Grouped quantized tensor model
+### 3.3 `NVFP4`
+
+`NVFP4` is a block-scaled floating-point weight representation, not a signed-integer
+`QuantFormat`. For a logical matrix `[N,K]`, every K-axis group contains 16 E2M1 code words and one
+E4M3FN scale word. The representation also contains one FP32 serialized weight divisor `d_w` for
+the complete matrix.
+
+An E2M1 word has sign bit 3, exponent bits 2:1, and mantissa bit 0. Positive code words `0..7`
+decode to:
+
+```text
+0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0
+```
+
+Bit 3 negates that value. Words `0x0` and `0x8` are distinct positive and negative zero words; all
+16 code words are valid and must remain bit-exact.
+
+An E4M3FN word has sign bit 7, exponent `e` in bits 6:3, fraction `m` in bits 2:0, and bias 7:
+
+```text
+e == 0, m == 0 : signed zero
+e == 0, m != 0 : (-1)^sign * m * 2^-9
+1 <= e <= 14   : (-1)^sign * (1 + m/8) * 2^(e-7)
+e == 15, m < 7 : (-1)^sign * (1 + m/8) * 2^8
+e == 15, m == 7: NaN
+```
+
+Stored NVFP4 weight scales admit only sign-zero finite words, including positive zero. Negative
+values, negative zero, and both NaN words are invalid. The serialized binary32 word `d_w` must be
+finite and strictly positive.
+
+For code `c[n,k]`, scale word `s[n,g]`, and `g=floor(k/16)`, the exact represented weight is:
+
+```text
+W[n,k] = decode_e2m1(c[n,k]) * decode_e4m3fn(s[n,g]) / d_w
+```
+
+The checkpoint recipe copies all three fields from its selected source without requantizing or
+canonicalizing them. Activation calibration is not part of this weight format. In particular, a
+site-level input divisor used by an NVFP4 execution path is a separate model-role tensor and cannot
+be inferred from `NVFP4`, its block scales, or `d_w`.
+
+## 4. Grouped signed-integer tensor model
 
 ### 4.1 Shape and group axis
 
-Let a logical quantized weight tensor have rank `r >= 1`, a positive `K`, and shape:
+For the four grouped signed-integer schemes, let a logical quantized weight tensor have rank
+`r >= 1`, a positive `K`, and shape:
 
 ```text
 [D0, D1, ..., D(r-2), K]
@@ -306,7 +362,7 @@ The scheme does not choose a padded extent, alignment multiple, whether padding 
 canonical contents of materialized padding. Each storage layout defines those matters and validates
 them at its own boundary. A logical encoder produces no physical padding.
 
-## 5. Code domains
+## 5. Grouped signed-integer code domains
 
 All four schemes are zero-point-free, weight-only signed-integer schemes. “Symmetric” in this
 document means that reconstruction is `scale * signed_code` with zero point zero. It does not mean
@@ -346,7 +402,7 @@ signed-byte load because the registered conversion path establishes the code inv
 implementation convenience does not make `-128` legal. The trusted local runtime does not rescan
 the complete W8 payload solely to prove an invariant already established by its producer.
 
-## 6. Scale and reconstruction semantics
+## 6. Grouped signed-integer scale and reconstruction semantics
 
 ### 6.1 Scale representation
 
@@ -413,15 +469,16 @@ per weight at G32, while the scale contributes 0.25 bit per weight to Q4 at G64;
 their code payload. This cost calculation explains why the finer W8 grouping is affordable. It is
 not independent quality evidence or a claim that G32 is universally optimal.
 
-## 7. Canonical reference encoder
+## 7. Canonical grouped signed-integer reference encoder
 
 ### 7.1 Purpose and input boundary
 
 The canonical profile identity is `MAXABS_F16_RECIP_RNE_V1`. NInfer owns exactly one current
-canonical profile for conversion consistency, converter parity, and artifact verification. It is a
-per-row, per-group symmetric maximum-absolute-value encoder. It fixes the arithmetic order used by
-the registered converter. Direct division during code selection is not interchangeable with its
-reciprocal-multiply order at rounding boundaries.
+canonical profile for the four grouped signed-integer schemes, providing conversion consistency,
+converter parity, and artifact verification. It is a per-row, per-group symmetric
+maximum-absolute-value encoder. It fixes the arithmetic order used by the registered converter.
+Direct division during code selection is not interchangeable with its reciprocal-multiply order at
+rounding boundaries. It does not encode `NVFP4`.
 
 The current implementation applies this profile to positive rank-two matrices, rejects non-finite
 source values and unrepresentable scales, and defines physical tail padding through
@@ -519,21 +576,23 @@ A conforming producer must:
 - preserve each direct logical word exactly when no source-type conversion is requested;
 - apply only a source-type conversion explicitly defined by the checkpoint recipe;
 - for a quantized format, preserve the logical shape and last-axis group rule;
-- for a quantized format, emit one valid scale per logical group and only legal signed codes,
-  including never emitting W8 `-128`;
+- for a grouped signed-integer format, emit one valid binary16 scale per logical group and only
+  legal signed codes, including never emitting W8 `-128`;
+- for `NVFP4`, emit only valid E2M1 code words, nonnegative finite E4M3FN scale words, and one finite
+  positive FP32 weight divisor under Section 3.3;
 - record enough checkpoint-recipe provenance for the artifact producer to identify how the values
   were derived;
-- for quantization, fail rather than silently encode non-finite source data or an unrepresentable
-  scale.
+- when an encoder converts floating-point source values, fail rather than silently quantize
+  non-finite source data or emit an unrepresentable scale.
 
 Direct BF16 and FP32 formats can represent non-finite words, so their presence is not a producer
 error by itself. Whether such a word is allowed in one tensor is a checkpoint-recipe constraint.
 Physical padding is produced and validated by the selected storage layout, not by the logical direct
 or quantization encoder.
 
-Only an encoder claiming canonical-reference parity must reproduce Section 7 bit for bit. Another
-approved checkpoint recipe may choose different valid scales and codes, but it cannot change their
-meaning.
+Only a grouped signed-integer encoder claiming canonical-reference parity must reproduce Section 7
+bit for bit. Another approved checkpoint recipe may choose different valid words for any
+quantization scheme, but it cannot change their registered meaning.
 
 ### 8.2 Container and layout
 
@@ -542,8 +601,11 @@ The `.ninfer` container and each registered storage layout must:
 - identify the numeric format unambiguously;
 - preserve logical shape separately from any physical padded extent;
 - reconstruct every direct logical word exactly;
-- for grouped formats, make the number and ownership of logical groups unambiguous and reconstruct
-  every logical code and binary16 scale without inference from a kernel implementation;
+- for grouped signed-integer formats, make the number and ownership of logical groups unambiguous
+  and reconstruct every signed code and binary16 scale without inference from a kernel
+  implementation;
+- for `NVFP4`, reconstruct every E2M1 code word, natural E4M3FN scale word, and the matrix FP32
+  divisor under Section 3.3;
 - define its canonical physical-padding contents and producer responsibilities, if it materializes
   padding;
 - reject unknown formats and unsupported format/layout combinations;
@@ -555,10 +617,13 @@ that representation belongs to the container contract.
 
 ### 8.3 Verifier, loader, and binder
 
-The project-owned converter and quantizer establish the value invariants in Sections 3 through 7
-while writing the artifact: direct-word preservation, legal codes and scales, and canonical physical
-padding. The layout codec preserves those already selected words. The offline checkpoint verifier
-checks the complete target inventory and representative source-to-artifact values.
+Project-owned producers establish the applicable value invariants while writing the artifact:
+direct-word preservation under Section 3.1, legal grouped signed-integer identities, codes, and
+scales under Section 3.2 and Sections 4 through 7, and legal `NVFP4` words and divisor under
+Section 3.3. Section 7 governs only a producer claiming the canonical grouped signed-integer encoder
+profile. The layout codec
+preserves those already selected words and owns canonical physical padding. The offline checkpoint
+verifier checks the complete target inventory and representative source-to-artifact values.
 
 The runtime reader establishes numeric-format identity, layout compatibility, logical and physical
 extents, encoded size, alignment, and payload bounds. The model binder then establishes the exact
@@ -571,12 +636,12 @@ codec and operator tests independently protect the representation and numerical 
 
 ### 8.4 Kernel and operator
 
-A consuming kernel or model component must interpret direct logical words according to Section 3 or
-quantized codes and scales according to Sections 5 and 6. It may choose its private fusion,
-reduction, staging, and intermediate precision; the observable Op result is qualified against the
-independent oracle with the Op's named criterion for that implementation profile. Kernel
-implementation details do not alter the persistent format and must not be needed to decode an
-artifact independently.
+A consuming kernel or model component must interpret direct logical words according to Section 3.1,
+grouped signed-integer identities, codes, and scales according to Section 3.2 and Sections 5 and 6,
+and `NVFP4` words and divisor according to Section 3.3. It may choose its private fusion, reduction,
+staging, and intermediate precision; the observable Op result is qualified against the independent
+oracle with the Op's named criterion for that implementation profile. Kernel implementation details
+do not alter the persistent format and must not be needed to decode an artifact independently.
 
 There is no mandatory generic unpack-to-dense fallback. If NInfer has not implemented the exact
 combination required by a selected target, conversion or loading fails explicitly rather than
@@ -586,7 +651,7 @@ meanings defined here.
 
 ## 9. Checkpoint and model boundary
 
-This registry does not say where any of the seven formats are used. A checkpoint numeric-format
+This registry does not say where any of the eight formats are used. A checkpoint numeric-format
 document must separately define, for every persisted source tensor or derived tensor:
 
 - its source checkpoint identity and source tensor or derivation;
@@ -599,17 +664,18 @@ document must separately define, for every persisted source tensor or derived te
 
 Those facts may differ between exact checkpoints in the same family. Dense attention, MoE experts,
 MTP predictors, vision towers, embeddings, and output heads receive no automatic assignment from
-their role names. Section 4 defines how a higher-rank expert bank would be grouped numerically, but
-the current row-split storage implementation remains rank two; a future MoE recipe must explicitly
-register its physical layout or define the reshape used by its compiled target.
+their role names. Section 4 defines how a higher-rank grouped signed-integer expert bank would be
+grouped numerically, but the current row-split storage implementation remains rank two; a future MoE
+recipe must explicitly register its physical layout or define the reshape used by its compiled
+target.
 
 Similarly, a format's presence in a `.ninfer` artifact does not prove runtime support. The selected
 model implementation must bind that tensor to a supported model consumer or operator path on the
 current execution platform.
 
-## 10. Explicit exclusions from the first registry
+## 10. Explicit exclusions
 
-The first registry contains no implicit or reserved support for:
+The registry contains no implicit or reserved support for:
 
 - other direct scalar types, including `FP16`, `FP64`, signed widths other than `I32`, and unsigned
   integers;
@@ -620,9 +686,8 @@ The first registry contains no implicit or reserved support for:
 - codebook formats such as NF4;
 - GGUF K-quant, I-quant, or block layouts as scheme aliases;
 - GPTQ or AWQ serialization dialects as scheme aliases;
-- any persistent FP8 weight format, including per-tensor, per-row, per-channel, and block-scaled
-  variants;
-- MXFP4, NVFP4, or other microscaling/shared-exponent formats;
+- any other persistent FP8, FP4, microscaling, or shared-exponent format; `NVFP4` registers only
+  the exact E2M1/E4M3FN/divisor contract in Section 3.3;
 - activation, KV-cache, or recurrent-state quantization.
 
 These are exclusions, not judgments that the methods are poor. They have materially different
@@ -690,18 +755,22 @@ enum spellings or private kernel layout. The retained codec and encoder evidence
   payload bits, and integer extrema, plus rejection of implicit cross-type encoding;
 - Q4, Q5, Q6, and W8 plane bit order, legal interval endpoints, encoded-size geometry, partial-K zero
   padding, consecutive row views, and arbitrary row gathers;
+- all 16 E2M1 words, all 256 E4M3FN words, NVFP4 scale/divisor validity, the exact divisor-based
+  reconstruction equation, and known block-scale swizzle offsets;
 - canonical binary16 scale rounding, reciprocal-multiply rather than direct division, positive and
   negative ties-to-even, minimum-subnormal rescue, and rejection of non-finite or overflowing source
   groups;
 - canonical quantization followed by exact stored code/scale decode for a partially populated group.
 
-For direct formats, the independent decode oracle is the abstract logical word in Section 3. For
-grouped formats, it is the binary32 reconstruction in Section 6.2. The canonical quantization encode
-oracle is a bit-level host/software implementation of the ordered algorithm in Section 7; production
-converters require parity against it rather than defining the oracle through their own arithmetic.
-Numerical operator tests separately protect the combinations used by the registered target, including
-their public input/output formats, output tolerance, and real target shapes. Private staging and
-accumulation remain implementation choices.
+For direct formats, the independent decode oracle is the abstract logical word in Section 3.1. For
+grouped signed-integer formats, it is the binary32 reconstruction in Section 6.2. Their canonical
+encode oracle is a bit-level host/software implementation of the ordered algorithm in Section 7;
+production converters claiming that profile require parity against it rather than defining the
+oracle through their own arithmetic. The `NVFP4` decode oracle is the E2M1/E4M3FN/FP32 divisor
+reconstruction in Section 3.3; its current producer is protected by exact source-word comparison
+rather than Section 7. Numerical operator tests separately protect the combinations used by the
+registered target, including their public input/output formats, output tolerance, and real target
+shapes. Private staging and accumulation remain implementation choices.
 
 ## 13. Integration summary
 
@@ -709,15 +778,17 @@ This decision leaves directory, metadata encoding, integrity, sharding, and phys
 to the container and layout contracts. This numeric-format decision does not leave the following
 questions open:
 
-- persistent low-bit weights use only the four registered scheme identities until an explicit
-  admission changes the registry;
+- persistent low-bit weights use the four grouped signed-integer identities or the exact `NVFP4`
+  identity; no spelling constructs another scheme;
 - direct persistent tensors use only `BF16`, `FP32`, and `I32`, with the exact logical words in
-  Section 3;
-- groups run along the final logical dimension and never cross a leading coordinate;
-- scales are one finite nonnegative binary16 multiplier per group;
-- codes and reconstruction have the exact meanings in Sections 5 and 6;
-- the canonical `MAXABS_F16_RECIP_RNE_V1` encoder uses FP16-rounded scale followed by binary32
-  reciprocal-multiply;
+  Section 3.1;
+- quantization groups run along the final logical dimension and never cross a leading coordinate;
+- the four grouped signed-integer formats use one finite nonnegative binary16 multiplier per group,
+  with codes and reconstruction defined in Sections 5 and 6;
+- `NVFP4` uses E2M1 codes, one E4M3FN scale per K-axis group of 16, and one positive FP32 matrix
+  divisor under Section 3.3;
+- the canonical `MAXABS_F16_RECIP_RNE_V1` encoder applies only to the four grouped signed-integer
+  formats and uses FP16-rounded scale followed by binary32 reciprocal-multiply;
 - the container, checkpoint recipe, compute profile, and runtime-state codecs remain separate
   contracts.
 

@@ -179,9 +179,9 @@ The version-1 registry initially contains:
 
 | Namespace | Registered identities | Authority |
 |---|---|---|
-| tensor numeric format | `BF16`, `FP32`, `I32`, `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`, `W8G32_F16S` | [`tensor-formats.md`](tensor-formats.md) |
+| tensor numeric format | `BF16`, `FP32`, `I32`, `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`, `W8G32_F16S`, `NVFP4` | [`tensor-formats.md`](tensor-formats.md) |
 | `model_id` | `qwen3.6-27b` | [`qwen3.6-27b-artifact.md`](qwen3.6-27b-artifact.md) |
-| tensor layout | `contiguous-le-v1`, `row-split-k128-v1` | [`storage-layouts.md`](storage-layouts.md) |
+| tensor layout | `contiguous-le-v1`, `row-split-k128-v1`, `blockscale-k16-m128x4-v1` | [`storage-layouts.md`](storage-layouts.md) |
 | resource encoding | `raw-bytes-v1` | [`storage-layouts.md`](storage-layouts.md) |
 
 There are no retired tombstones at this revision.
@@ -378,9 +378,10 @@ The native implementation in `tools/artifact/`, `tools/convert/qwen3_6_27b/`,
 `tools/reference/qwen3_6_27b/`, and `src/artifact/` satisfies this layer. The compact evidence
 retained for later changes is:
 
-- Python version-1 round trips for all seven numeric formats and a raw resource;
+- Python version-1 round trips for all eight numeric formats and a raw resource;
 - representative framing, schema, offset/alignment, overlap, bounds, and encoded-size failures;
-- exact representative direct-word and Q4/Q5/Q6/W8 code/scale layout round trips;
+- exact representative direct-word, Q4/Q5/Q6/W8 code/scale, and NVFP4 block-scale layout round
+  trips;
 - an independently constructed C++ version-1 fixture covering object identities, payload spans,
   encoded sizes, and alignment;
 - the Qwen3.6-27B binder's complete 1124-object inventory and logical views;

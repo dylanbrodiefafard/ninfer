@@ -92,6 +92,7 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy, 
     case QType::BF16_CTRL:
     case QType::FP32_CTRL:
     case QType::I32_CTRL:
+    case QType::NVFP4:
         break;
     }
     throw std::invalid_argument("linear: unsupported weight qtype");

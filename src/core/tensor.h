@@ -35,11 +35,13 @@ enum class QType : std::uint16_t {
     BF16_CTRL  = 4,
     FP32_CTRL  = 5,
     I32_CTRL   = 6,
+    NVFP4      = 7,
 };
 
 enum class QuantLayout : std::uint16_t {
-    RowSplit   = 0,
-    Contiguous = 1,
+    RowSplit            = 0,
+    Contiguous          = 1,
+    BlockScaleK16M128x4 = 2,
 };
 
 struct Weight {
@@ -52,16 +54,18 @@ struct Weight {
     std::int32_t padded_shape[4]   = {1, 1, 1, 1};
     std::uint32_t ndim             = 0;
 
-    const void* qdata        = nullptr;
-    const void* qhigh        = nullptr;
-    const void* scales       = nullptr;
-    std::int32_t n           = 0;
-    std::int32_t k           = 0;
-    std::int32_t group       = 0;
-    QuantLayout layout       = QuantLayout::RowSplit;
-    DType scale_dtype        = DType::FP32;
-    std::int32_t scale_ne[4] = {1, 1, 1, 1};
-    std::int64_t scale_nb[4] = {0, 0, 0, 0};
+    const void* qdata          = nullptr;
+    const void* qhigh          = nullptr;
+    const void* scales         = nullptr;
+    std::int32_t n             = 0;
+    std::int32_t k             = 0;
+    std::int32_t group         = 0;
+    QuantLayout layout         = QuantLayout::RowSplit;
+    DType scale_dtype          = DType::FP32;
+    std::int32_t scale_ne[4]   = {1, 1, 1, 1};
+    std::int64_t scale_nb[4]   = {0, 0, 0, 0};
+    float weight_scale_divisor = 0.0F;
+    float input_scale_divisor  = 0.0F;
 };
 
 } // namespace ninfer

@@ -1,8 +1,9 @@
 # Qwen3.6-27B Artifact Reference
 
-This reference defines the complete `.ninfer` object inventory for `qwen3.6-27b`: object names,
+This reference defines both additive `.ninfer` storage artifacts for `qwen3.6-27b`: object names,
 order, shapes, numeric formats, storage layouts, fused row order, aliases, frontend resources, and
-source-to-object transforms. Common framing is defined in
+source-to-object transforms. Sections 2 through 12 define the released Q4/Q5 artifact; Section 13
+defines the separately generated NVFP4 artifact. Common framing is defined in
 [`artifact-container.md`](artifact-container.md), numeric semantics in
 [`tensor-formats.md`](tensor-formats.md), byte packing in
 [`storage-layouts.md`](storage-layouts.md), and model mathematics in
@@ -24,12 +25,15 @@ qwen3_6_27b
 
 The target key selects this exact checkpoint package and is not serialized as a second `model_id`.
 
-Every conforming artifact is one complete product image containing Text, the optimized MTP draft
-head, MTP, Vision, and the six frontend resources in this document. These components do not define
-separate artifacts or optional artifact profiles.
+Each artifact is one complete image containing Text, the optimized MTP draft head, MTP, Vision, and
+the six frontend resources in this document. These components do not define separate component
+artifacts or optional profiles.
 
-The artifact contains exactly 1118 tensor objects and six resource objects. Logical row views and
-aliases are not additional objects or JSON records.
+The released `qwen3_6_27b.ninfer` contains exactly 1118 tensor objects and six resource objects.
+It remains frozen and loadable by the current Engine. The additive
+`qwen3_6_27b_nvfp4.ninfer` contains 1365 tensor objects and the same six resources. Both serialize
+`model_id = qwen3.6-27b`; the new filename does not replace or update the released file. Logical row
+views and aliases are not additional objects or JSON records.
 
 ## 2. Fixed target facts
 
@@ -523,3 +527,219 @@ For source prefix `model.visual.merger.`:
 | `fc2_bias` | `linear_fc2.bias [5120]` | preserve BF16 |
 | `norm/weight` | `norm.weight [1152]` | preserve BF16 |
 | `norm/bias` | `norm.bias [1152]` | preserve BF16 |
+
+## 13. Additive NVFP4 artifact
+
+### 13.1 Identity and consumer status
+
+The additive artifact has this fixed identity:
+
+```text
+converter  = tools.convert.qwen3_6_27b.convert_nvfp4
+recipe_id  = qwen3_6_27b_nvfp4-v2
+filename   = qwen3_6_27b_nvfp4.ninfer
+model_id   = qwen3.6-27b
+objects    = 1371
+```
+
+It is additive to `qwen3_6_27b.ninfer`; the original converter, recipe, inventory, artifact, and
+published file are unchanged. Python can produce and verify the new artifact. The Python and C++
+generic artifact registries recognize `NVFP4` and `blockscale-k16-m128x4-v1`, and the C++ reader
+validates their descriptor geometry and payload range.
+
+The current 27B target binder still accepts only the 1124-object Q4/Q5 contract. Therefore the new
+artifact is not yet loadable or executable through Engine. No CLI, serving, model graph, Op
+dispatch, or kernel support is implied by generic-reader recognition.
+
+### 13.2 Fixed sources and component ownership
+
+The base source is `Qwen/Qwen3.6-27B` revision
+`6a9e13bd6fc8f0983b9b99948120bc37f49c13e9`. It remains the sole materialization source for:
+
+- all NVFP4-source Text linears selected as BF16;
+- Text direct tensors, norms, GDN convolution and controls;
+- embedding, full output head, optimized draft head and id map;
+- MTP, Vision, and all six frontend resources.
+
+The NVFP4 source is
+`rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm` revision
+`9b5389d4a1e207daab2d47732efea57d7e946dcf`. Its only artifact inputs are the Text-linear
+NVFP4/BF16 selection, packed E2M1 words, E4M3FN block-scale words, weight divisors, and input
+divisors. Its MTP, Vision, embedding, and head payloads are ignored.
+
+The converter exact-compares all 117 selected BF16 source linears against the base source before
+creating the output file. Before fusion, it also requires bit-identical weight divisors within all
+122 multi-source parent groups and bit-identical input divisors among every set of source linears
+mapped to one of the 247 sites. It copies NVFP4 words without decoding and requantizing them.
+
+### 13.3 Text allocation and complete counts
+
+Full-attention input parents `attention/query_key` and `attention/gate_value` are BF16 on layers
+`3,7,11,15,19,23` and NVFP4 on layers `27,31,35,39,43,47,51,55,59,63`.
+Full-attention `attention/output` is BF16 on layers `3,7` and NVFP4 on the other 14
+full-attention layers. Every GDN `query_key` and `value_z` is NVFP4; GDN `output` is BF16 only on
+layer 4 and NVFP4 on the other 47 GDN layers. Every Text `mlp/gate_up` and `mlp/down` is NVFP4.
+There is no per-tensor override.
+
+This produces 305 NVFP4 matrix parents and 15 BF16 exception parents. All non-Text components keep
+the formats in Sections 5 through 7. The complete tensor counts are:
+
+| Format | Tensors |
+|---|---:|
+| `BF16` | 597 |
+| `FP32` | 343 |
+| `I32` | 1 |
+| `Q4G64_F16S` | 55 |
+| `Q5G64_F16S` | 54 |
+| `Q6G64_F16S` | 3 |
+| `W8G32_F16S` | 7 |
+| `NVFP4` | 305 |
+| total | 1365 |
+
+The six frontend resources bring the object total to 1371. The 247 additional FP32 tensors are
+site-level input divisors; the matrix object count itself is unchanged from the original artifact.
+
+### 13.4 Weight and input-divisor ownership
+
+Every NVFP4 parent uses `blockscale-k16-m128x4-v1` and contains its packed E2M1 code plane,
+swizzled E4M3FN scale plane, and trailing FP32 weight divisor `d_w`. Its reconstruction and exact
+payload geometry are defined in [`tensor-formats.md`](tensor-formats.md) and
+[`storage-layouts.md`](storage-layouts.md).
+
+Source `input_global_scale` is a serialized divisor `d_x`, not a multiplier. The artifact stores it
+once per activation-quantization site as:
+
+```text
+shape   = []
+format  = FP32
+layout  = contiguous-le-v1
+value   = bit-exact source FP32 word, finite and > 0
+```
+
+The source shape `[1]` becomes the rank-zero artifact scalar without changing its FP32 word. For
+each K-axis block of 16 input elements, `x` is the represented BF16 activation entering the
+projection Op. The independent execution oracle promotes those BF16 values exactly to FP32 before
+computing absolute values, the block maximum, scale selection, and E2M1 conversion; it does not
+start from an unrepresented higher-precision value.
+
+For one finite represented BF16 block, activation quantization is:
+
+```text
+s_x       = E4M3FN(d_x * max_abs(block) / 6)
+q_x       = E2M1(x * d_x / decode_e4m3fn(s_x))
+decode(x) = decode_e2m1(q_x) * decode_e4m3fn(s_x) / d_x
+```
+
+`E4M3FN(y)` first saturates nonnegative finite `y` to `448`, then converts with
+round-to-nearest-even. `E2M1(y)` is NVIDIA E2M1 round-to-nearest-even with finite saturation to
+`[-6,6]`; ties choose the result whose retained significand bit is even, and input zero retains its
+sign. The magnitude midpoints are `0.25,0.75,1.25,1.75,2.5,3.5,5.0`.
+
+An all-zero block produces positive-zero `s_x` and positive-zero `q_x`. If a nonzero block scale
+rounds to positive zero, every `q_x` in that block is also positive zero and no division by zero is
+performed. The admitted execution input domain contains only finite represented BF16 activations.
+The dynamic `s_x` is execution-local; the artifact persists neither `s_x`, `q_x`, `1 / d_x`, nor a
+combined coefficient derived from `d_x` and `d_w`.
+
+The 247 objects use these names and layer domains:
+
+| Object suffix under `text/layers/{l}/` | Layers | Count |
+|---|---|---:|
+| `attention/input_projection/input_scale_divisor` | NVFP4 attention-input layers | 10 |
+| `attention/output_projection/input_scale_divisor` | NVFP4 attention-output layers | 14 |
+| `gdn/input_projection/input_scale_divisor` | all GDN layers | 48 |
+| `gdn/output_projection/input_scale_divisor` | GDN layers except 4 | 47 |
+| `mlp/gate_up_projection/input_scale_divisor` | `0..63` | 64 |
+| `mlp/down_projection/input_scale_divisor` | `0..63` | 64 |
+
+Each scalar is inserted immediately after the last matrix parent at its site. Attention-input
+`d_x` maps to both `query_key` and `gate_value`; GDN-input `d_x` maps to both `query_key` and
+`value_z`; every other site maps to its one named parent. Thus 247 scalars cover all 305 NVFP4
+parents exactly once without persisting 58 duplicate values.
+
+The internal runtime `Weight` representation already has `QType::NVFP4`,
+`QuantLayout::BlockScaleK16M128x4`, E4M3FN scale dtype, `weight_scale_divisor`, and
+`input_scale_divisor`; both divisor fields default to the invalid sentinel `0.0F`. The generic
+`materialized_weight` path deliberately rejects NVFP4 because only the future target-private
+binding plan can validate `d_w` and `d_x` and combine them into a consumable immutable weight.
+Other `QType` values never read either divisor field.
+
+A consumable NVFP4 `Weight` has `group_size = group = 16`, `qdata` at the E2M1 code plane,
+`scales` at the swizzled E4M3FN scale plane, `qhigh = nullptr`, `high_plane_bytes = 0`, and
+`payload_bytes` covering the complete parent payload including its trailing `d_w`. Before
+`Binder::finish()` and the end of the `Reader` lifetime, the future target-private `plan_load` must:
+
+1. exact-read and validate `d_w` from every NVFP4 parent tail;
+2. exact-read and validate the associated site-level `d_x`;
+3. retain both host FP32 values in the target-private binding plan.
+
+The site scalar is validation-only and receives no independent device allocation. During loaded
+model construction, the binder writes the parent `d_w` and the site's `d_x` into every associated
+immutable NVFP4 `Weight`; missing values must remain an error and must never default to `1.0`.
+
+NVFP4 row views accept only `row_begin` and `row_count` divisible by 128. For parent logical `K`,
+their plane addresses are:
+
+```text
+qdata  += row_begin * K / 2
+scales += (row_begin / 128) * (K / 64) * 512
+```
+
+Every row view, including the GDN `value` and `z` views of `value_z`, inherits both divisor values,
+the logical shape, and all NVFP4 metadata. It must not reuse the existing row-view formula that
+assumes FP16 scales are contiguous by row, and it must not consult the artifact directory during
+execution.
+
+When that binder is implemented, it must select the target-private Text storage contract once from
+the non-consuming descriptor of `text/layers/0/mlp/gate_up`:
+
+```text
+Q4G64_F16S + row-split-k128-v1       -> existing Q4/Q5 storage
+NVFP4 + blockscale-k16-m128x4-v1     -> NVFP4 block-scaled storage
+```
+
+It must then validate the complete selected inventory. It must not discriminate by object count,
+try one binder and catch failure, add a second model id, or carry a storage branch into the request
+path.
+
+The existing `attn_input_proj`, `gdn_input_proj`, `gdn_input_proj_conv_snapshot`, `linear`,
+`linear_add`, and `linear_swiglu` signatures remain unchanged. Each future NVFP4 leaf reads `d_x`
+and `d_w` from its `Weight` argument; the Op wrapper derives that weight's `1 / (d_x * d_w)` as a
+leaf-private kernel argument. That coefficient is not another artifact object, another `Weight`
+field, or a new Op parameter. CUDA Graph capture records the actual kernel argument, and replay does
+not repeat storage selection. Fused parents at one site receive the same persisted `d_x`;
+production execution compares neither `model_id`, storage signature, nor object inventory.
+
+The fifteen BF16 Text exceptions retain the same fused Op interfaces. Future consumer support must
+add BF16/BF16 admission to `attn_input_proj` for the early `query_key` and `gate_value` parents, and
+BF16 admission to `linear_add` for attention output layers 3 and 7 and GDN output layer 4. These are
+additional execution leaves behind existing signatures, not parallel Ops, family-schedule branches,
+or model-level graph branches.
+
+Target-private divisor extraction, row-view construction, Op admission/dispatch, and kernels remain
+unimplemented in the current scope; the preceding paragraphs fix their contract rather than claim
+current Engine support.
+
+### 13.5 Production and verification
+
+The canonical command is:
+
+```bash
+python3 -m tools.convert.qwen3_6_27b.convert_nvfp4 \
+  --model /path/to/home/models/llm/qwen/Qwen3.6-27B/base-hf-bf16 \
+  --nvfp4-model /path/to/home/models/llm/qwen/Qwen3.6-27B/vllm-nvfp4-bf16 \
+  --out out/qwen3_6_27b_nvfp4.ninfer
+```
+
+The converter refuses any other output basename before source I/O or file creation. The generated
+artifact and report are:
+
+```text
+out/qwen3_6_27b_nvfp4.ninfer
+out/qwen3_6_27b_nvfp4.ninfer.conversion.json
+```
+
+The generated file is 17,608,925,440 bytes, with a 17,608,708,352-byte payload region. Reopening it
+with `verify_nvfp4.py` validates the complete ordered directory, all 305 packed-code/scale/divisor
+payloads against 379 source linears, all 247 input-divisor words, all 111 fused/base BF16 Text
+matrix objects representing the 117 selected BF16 source linears, and all six resources.

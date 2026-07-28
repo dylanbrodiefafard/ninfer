@@ -29,6 +29,12 @@ def _small_specs():
         TensorSpec("quant/q5", (1, 64), "Q5G64_F16S", "row-split-k128-v1"),
         TensorSpec("quant/q6", (1, 64), "Q6G64_F16S", "row-split-k128-v1"),
         TensorSpec("quant/w8", (1, 32), "W8G32_F16S", "row-split-k128-v1"),
+        TensorSpec(
+            "quant/nvfp4",
+            (128, 64),
+            "NVFP4",
+            "blockscale-k16-m128x4-v1",
+        ),
     ]
 
 
@@ -57,7 +63,7 @@ def test_v1_round_trip_covers_every_registered_storage(tmp_path):
         for spec, expected in entries:
             assert bytes(artifact.payload(spec.name)) == expected
         summary = artifact_summary(artifact)
-        assert summary["objects"] == 8
+        assert summary["objects"] == 9
         assert summary["formats"] == {
             "BF16": 1,
             "FP32": 1,
@@ -66,6 +72,7 @@ def test_v1_round_trip_covers_every_registered_storage(tmp_path):
             "Q5G64_F16S": 1,
             "Q6G64_F16S": 1,
             "W8G32_F16S": 1,
+            "NVFP4": 1,
         }
 
 
