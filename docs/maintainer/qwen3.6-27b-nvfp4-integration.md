@@ -1,17 +1,23 @@
-# Qwen3.6-27B NVFP4 artifact 生产计划
+# Qwen3.6-27B NVFP4 artifact 与类型登记计划
 
-本文只负责生产一个新的 Qwen3.6-27B NVFP4 `.ninfer` artifact。交付范围是：
+本文负责生产一个新的 Qwen3.6-27B NVFP4 `.ninfer` artifact，并同步登记消费该
+artifact 所需的公共持久类型与内部 runtime weight representation。交付范围是：
 
-1. 登记生成该 artifact 所需的 Python numeric format 和 storage layout；
-2. 新增独立的 NVFP4 inventory、recipe、converter 和 verifier；
-3. 从固定的 base BF16 source 与 NVFP4 source 生成
+1. 在 Python 与 C++ artifact registry 同时登记 `NVFP4` numeric format 和
+   `blockscale-k16-m128x4-v1` storage layout；
+2. 在内部 `QType`、`QuantLayout`、scale dtype 和 `Weight` 中登记完整的 NVFP4
+   representation；
+3. 新增独立的 NVFP4 inventory、recipe、converter 和 verifier；
+4. 从固定的 base BF16 source 与 NVFP4 source 生成
    `out/qwen3_6_27b_nvfp4.ninfer`；
-4. 对新 artifact 做结构、字节和来源验证；
-5. 更新与新 artifact 直接相关的 maintainer 文档。
+5. 对新 artifact 做结构、字节和来源验证；
+6. 更新与新 artifact 直接相关的 maintainer 文档。
 
-本文不修改 C++ artifact reader、binder、target、runtime、Engine 或任何 Op，也不实现
-NVFP4 kernel。完成本文后，新 artifact 是已经生成并验证的后续 C++ 集成输入；本阶段
-不宣称它可以被当前 Engine 加载。
+本文不修改 27B target binder、target registry、family schedule、workspace policy、
+Engine 或公共 API，不增加 NVFP4 Op dispatch、execution leaf 或 kernel。完成本文后，
+C++ generic reader 已能识别并验证新 artifact 的持久格式和 byte geometry，内部
+`Weight` 已能完整表示后续 binder 所需的数据；当前 27B binder 仍只接受原 artifact
+合同，因此本阶段不宣称新 artifact 可以被 Engine 加载或执行。
 
 ## 1. 原 27B artifact 完全冻结
 
@@ -414,13 +420,29 @@ artifact site scalar   -- d_x ---------------------+
 NVFP4 runtime weight view 除 code/scale geometry 外必须直接暴露：
 
 ```cpp
-float weight_scale_divisor; // d_w，来自 NVFP4 parent payload
-float input_scale_divisor;  // d_x，来自站点级 FP32 object
+float weight_scale_divisor = 0.0F; // d_w，来自 NVFP4 parent payload
+float input_scale_divisor  = 0.0F; // d_x，来自站点级 FP32 object
 ```
 
 `weight_scale_divisor` 是 NVFP4 weight representation 本身要求的成员；
 `input_scale_divisor` 是相对于该 representation 唯一增加的站点派生成员。其他
-`QType` 不读取这两个字段。
+`QType` 不读取这两个字段。默认零值对 NVFP4 是有意设置的非法 sentinel；后续
+constructor/binder 必须在创建可消费的 NVFP4 `Weight` 时写入两个有限正数，不能把
+缺失标定静默解释为 `1.0`。
+
+本计划在 C++ 内部类型系统登记：
+
+```text
+QType::NVFP4
+QuantLayout::BlockScaleK16M128x4
+DType::FP8_E4M3FN
+```
+
+新枚举值只追加，不重排现有枚举值。NVFP4 `Weight` 的固定表示为
+`qtype = NVFP4`、`layout = BlockScaleK16M128x4`、`group_size = group = 16`、
+`scale_dtype = FP8_E4M3FN`、`qdata` 指向 code plane、`scales` 指向 swizzled scale
+plane、`qhigh = nullptr`、`high_plane_bytes = 0`，并携带上述两个 divisor values。
+`payload` 与 `payload_bytes` 仍描述包括尾部 `d_w` word 在内的完整 device payload。
 
 后续 `plan_load` 必须在 `Binder::finish()` 和 `Reader` 生命周期结束前：
 
@@ -481,7 +503,9 @@ object inventory。
 这些都是既有 fused Op 的 execution leaves，不增加 Op 参数、平行 Op、family schedule
 分支或模型级计算图分支。
 
-本节只冻结后续 C++ 集成边界；本计划仍不修改任何 C++ 或 Op。
+本节在本计划中只落地公共持久类型和内部 `Weight` representation；target-private
+divisor extraction、row-view construction、Op validation/dispatch 和 kernel argument
+传递仍属于后续 C++ 执行集成。
 
 ## 7. `blockscale-k16-m128x4-v1` layout
 
@@ -605,23 +629,61 @@ matrices 被 305 个 NVFP4 matrices 与 15 个 BF16 matrices 替代，matrix obj
 输入标定。这是持久 object inventory；它不阻止 binder 按 Section 6.3 把 divisor
 直接填入多个 runtime `Weight` views。
 
-## 9. Python 实现范围
+## 9. 实现范围
 
 ### 9.1 公共 artifact 工具
 
-只修改 Python 工具层：
+Python 公共工具修改：
 
-- `tools/artifact/numeric.py`：登记 `NVFP4`，不把它伪装成现有 integer
+- `tools/artifact/numeric.py`：登记 `NVFP4`，提供 Section 6.1 的 E2M1/E4M3FN exact
+  word decode 与 stored-word validity helpers，不把它伪装成现有 integer
   `QuantFormat`；
 - `tools/artifact/layouts.py`：实现 Section 7 的 geometry、encode/decode 和 exact
   scale swizzle；
 - `tools/artifact/container.py`：通过公共 registry 规划和验证新 payload size；
 - `tools/artifact/inspect.py`：能够报告新 format/layout，不解释模型语义；
-- `tests/artifact/`：增加 numeric/layout/container exact tests。
+- `tests/artifact/`：只增加 Section 10.1 规定的 numeric/layout/container tests。
 
-不修改 `src/artifact/`、`include/ninfer/` 或任何 C++ test。
+### 9.2 C++ 持久 registry 与内部 `Weight`
 
-### 9.2 新增 target-private modules
+本计划同步修改以下 C++ 内部边界：
+
+- `src/artifact/reader.h`、`reader.cpp`、`storage_layouts.cpp`：
+  - 登记 `NumericFormat::NVFP4` 和
+    `StorageLayout::BlockScaleK16M128x4V1`；
+  - 实现 format/layout 的 exact parse 与 name round trip；
+  - 新增 block-scale geometry，公开 code bytes、scale offset/bytes、
+    weight-divisor offset 和 encoded bytes；
+  - 只接受 Section 7 的唯一 format/layout 组合与 shape domain，并继续使用 256-byte
+    object alignment；
+- `src/core/dtype.h`、`dtype.cpp`：追加 `DType::FP8_E4M3FN`，其 element size 为
+  1 byte；
+- `src/core/tensor.h`：追加 `QType::NVFP4`、
+  `QuantLayout::BlockScaleK16M128x4` 和 Section 6.3 的两个 divisor fields；
+- `src/artifact/typed_binding.cpp`：登记 NVFP4 的 layout 与 qtype 映射，但现有
+  `materialized_weight` 必须明确拒绝构造 NVFP4 `Weight`。原因不是格式未知，而是
+  合法构造还需要 target-private `BindingPlan` 提供已经校验的 `d_w` 与 `d_x`；
+  不得把 NVFP4 错误地落入 RowSplit 构造；
+- closed-enum switch 因新增 `QType` 需要调整时，`NVFP4` 只能落入既有的
+  unsupported-format error，不增加任何 Op dispatch、workspace 分支或 execution leaf。
+
+C++ generic reader 的支持边界到 descriptor、geometry、payload range 和
+materialization 为止。它不解释 E2M1/E4M3FN 数值、不提取 divisor、不选择 27B storage
+signature，也不把 artifact 变成可执行模型。
+
+本计划不修改：
+
+- `src/targets/qwen3_6_27b` 的 binding plan、binder 或 `LoadedModel`；
+- family runtime、计算图、CUDA Graph、workspace 或 target registry；
+- `include/ninfer/engine.h`、`include/ninfer/types.h` 或任何产品 API；
+- Op contract、Op wrapper 的 NVFP4 admission、kernel 参数或 CUDA 实现。
+
+本计划不新增或修改任何 C++ test。新增 C++ 内容没有新的可执行消费路径；为 enum
+成员、`Weight` 私有字段、format-name round trip 或尚未被 target 使用的 geometry
+增加测试只会重复 Python 持久格式测试并锁定内部结构。C++ 侧只编译受影响 targets，
+用于发现 enum switch、声明和类型布局引起的编译错误。
+
+### 9.3 新增 target-private modules
 
 新增：
 
@@ -647,7 +709,7 @@ python3 -m tools.convert.qwen3_6_27b.convert_nvfp4 \
 Converter 不提供逐 layer override，不接受 NVFP4 MTP/Vision/head，也不从 BF16 source
 重新量化出 NVFP4。
 
-### 9.3 Preflight 与写入
+### 9.4 Preflight 与写入
 
 创建输出文件前必须完成：
 
@@ -702,22 +764,47 @@ report provenance value；项目自有 field、module、type 和 artifact name �
 `nvfp4`。Report 中的 repository/revision 是固定 recipe provenance，不表述为从普通
 本地目录反向证明得到的身份。
 
-验证必须覆盖：
+### 10.1 新增 Python tests
 
-- `py_compile` 与受影响 Python tests；
-- 现有 artifact/container 和原 27B converter tests，证明公共 Python registry 扩展
-  没有改变原路径；
-- 全部 E2M1 nibbles 和 E4M3FN finite/NaN classes 的 independent exact decoder；
-- E4M3FN weight-scale validity、E4M3FN activation conversion 和 E2M1
-  round-to-nearest-even/satfinite midpoint tests；
-- 从 represented BF16 activation 开始的 `d_x` block quantize/dequantize oracle，
-  包括全零和非零输入 round 到零 scale 的 block；
-- independent combined weight reconstruction：
-  `decode_e2m1(code) * decode_e4m3fn(scale) / d_w`，覆盖全部 E2M1 codes、代表性合法
-  E4M3FN words 和多个有限正 `d_w`；
-- encoded-size、offset、alignment 和 swizzle address exact tests；
-- layout 对非 rank-two、`N % 128 != 0` 或 `K % 64 != 0` 的拒绝测试；
-- natural-scale → swizzled-layout → logical-scale 的逐 word round trip；
+本计划只新增以下 tests：
+
+1. `tests/artifact/test_nvfp4_numeric.py`
+   - 对全部 16 个 E2M1 words 验证 exact value 和 signed-zero bit；
+   - 对全部 256 个 E4M3FN words 用独立 scalar oracle 验证 finite、NaN、signed-zero
+     分类与 exact value；
+   - 验证 weight scale 只接受非负 finite words，且 `d_w` 只接受 finite positive
+     FP32 words；
+   - 用少量手写 words 验证
+     `decode_e2m1(code) * decode_e4m3fn(scale) / d_w`，专门防止 divisor 被误写成
+     multiplier。
+2. `tests/artifact/test_layouts.py`
+   - 增加一个 `[128,64]` known-vector case，同时验证 `4612`-byte geometry、packed
+     nibble 顺序、若干跨 128-row/4-scale 边界的已知 swizzle offsets、尾部 `d_w`
+     word 和完整 logical-word round trip；
+   - 增加一个参数化 contract-rejection case，只覆盖 rank、`N % 128`、`K % 64` 和
+     format/layout mismatch 四类边界。
+3. `tests/artifact/test_container.py`
+   - 只在现有 `test_v1_round_trip_covers_every_registered_storage` fixture 中加入一个
+     NVFP4 object，复用同一测试验证 writer planning、reader reopen、payload range 和
+     inspector format count；不另建重复的 container test。
+4. `tests/targets/qwen3_6_27b/test_nvfp4_recipe.py`
+   - 从独立列出的 layer sets 验证 305 个 NVFP4 parents、15 个 BF16 exceptions、
+     247 个 site scalars 和 1371-object inventory；
+   - 验证 247 个 sites 对 305 个 parents 的映射闭合且每个 parent 恰好被覆盖一次；
+   - 验证 target-private `InputScaleDivisor` 只接受 finite positive FP32 words；
+   - 验证 converter 在任何 source I/O 和文件创建前拒绝非
+     `qwen3_6_27b_nvfp4.ninfer` basename，直接保护原 artifact。
+
+这些 tests 不 mock Hugging Face shard，不生成缩小版伪模型，也不复制完整 1371-object
+JSON snapshot。
+
+### 10.2 生成时验证
+
+以下检查属于一次真实 artifact 生产的 acceptance verification，不再各自复制成 unit
+test：
+
+- `py_compile`；
+- 运行现有 `tests/artifact/`、原 27B converter tests 和 Section 10.1 的新增 tests；
 - 117 个 BF16 Text linears 与 base 的逐 word equality；
 - 379 个 source linears 到 305 个 artifact parents 的 codes、scales 和 weight
   divisors equality；
@@ -727,10 +814,30 @@ report provenance value；项目自有 field、module、type 和 artifact name �
 - 247 个 `InputScaleDivisor` objects 到 305 个 NVFP4 parents 的完整一对多映射，且
   每个 NVFP4 parent 恰好被一个站点覆盖；
 - 1371-object inventory、directory、payload ranges 和 final file size；
-- 新 artifact 重新打开后对全部 payload 执行 `verify_nvfp4.py`。
+- 新 artifact 重新打开后对全部 payload 执行 `verify_nvfp4.py`；
+- 编译受影响 C++ targets，但不新增、修改或运行 C++ tests。
 
-本计划不运行 C++ build、Engine integration、model inference、CUDA Graph、kernel
-correctness 或性能测试，因为没有 C++ 或执行端改动。
+### 10.3 明确不增加的 tests
+
+以下 tests 对本次交付没有有效保护，不增加：
+
+- C++ enum 数值、format/layout name、`Weight` 字段默认值、struct size 或
+  `materialized_weight` rejection tests：它们只锁定内部表示，没有新的 C++ consumer；
+- 只断言 Python registry 常量、dataclass 类型、`__all__` 或 module/file 存在的 tests：
+  Section 10.1 的 layout/container tests 已经覆盖 registry 是否真正可用；
+- 动态 activation quantize/dequantize、E2M1 rounding midpoint、全零 activation block
+  或 `d_x` kernel arithmetic tests：本计划没有实现 activation quantizer 或执行端；
+- 只有 encode→decode round trip、没有 hand-authored byte offsets 或独立 oracle 的
+  tests：encoder 与 decoder 采用同一个错误 swizzle 时仍会通过；
+- 缩小版 mock checkpoint、mock shard index 或 mock converter end-to-end tests：它们
+  不能证明固定真实 source 的 tensor、fusion 和 divisor 关系；
+- 完整 1371-object JSON snapshot、逐 report field snapshot 或对同一 mapping 的多份
+  count tests：真实 artifact verifier 和一个独立 semantic inventory test 已覆盖；
+- future binder selection、NVFP4 row view、Op dispatch、workspace、CUDA Graph 或
+  kernel tests：相应实现不在本计划。
+
+本计划不运行 Engine integration、model inference、CUDA Graph、kernel correctness
+或性能测试，因为 target binder 与执行端没有接入 NVFP4。
 
 ## 11. 文档改动
 
@@ -746,10 +853,11 @@ correctness 或性能测试，因为没有 C++ 或执行端改动。
    和 Section 6.3 的持久站点到 runtime `Weight` 映射约束；
 5. `docs/README.md`：指向更新后的稳定 artifact 文档。
 
-这些稳定文档必须分别标记三个事实：Python producer 已支持；NVFP4 artifact 的持久
-格式合同已经登记；当前 C++ reader、binder 和 Engine consumer 尚不支持。登记新的
-format/layout 不得改写成当前 C++ reader 已接受该 identity。不得更新 CLI、serving
-或 performance 文档来宣称 NVFP4 可执行。
+这些稳定文档必须分别标记四个事实：Python producer 已支持；NVFP4 artifact 的持久
+格式合同已经登记；C++ generic reader 已接受并验证该 format/layout identity 与
+geometry；当前 27B binder 和 Engine consumer 尚不支持新 artifact。不得把 reader
+支持改写成 Engine 可加载或可执行。不得更新 CLI、serving 或 performance 文档来宣称
+NVFP4 可执行。
 
 稳定合同进入上述文档后删除本文及其索引，不保留已完成的临时计划。
 
@@ -759,10 +867,15 @@ format/layout 不得改写成当前 C++ reader 已接受该 identity。不得更
 
 1. 原 converter、recipe 和 `qwen3_6_27b.ninfer` 未修改、未覆盖；
 2. 新 Python format/layout codec 通过 exact tests；
-3. 四个 `_nvfp4.py` modules 完成并通过 tests；
-4. `out/qwen3_6_27b_nvfp4.ninfer` 从两个固定 source 成功生成；
-5. 新 artifact 的 1371-object signature、247 个 input divisors 和所有 NVFP4
+3. C++ generic reader 已登记 NVFP4 format/layout/geometry，受影响 C++ targets
+   编译通过，且没有新增、修改或运行 C++ tests；
+4. 内部 `DType`、`QType`、`QuantLayout` 和 `Weight` 已完整登记 Section 6.3 的
+   representation，且所有现有 Op 对 NVFP4 仍明确拒绝；
+5. 四个 `_nvfp4.py` modules 完成并通过 tests；
+6. `out/qwen3_6_27b_nvfp4.ninfer` 从两个固定 source 成功生成；
+7. 新 artifact 的 1371-object signature、247 个 input divisors 和所有 NVFP4
    logical words 通过独立验证；
-6. conversion report 完整；
-7. Section 11 的稳定文档完成更新；
-8. 本计划产生的变更不包含 C++、runtime、target 或 Op 实现。
+8. conversion report 完整；
+9. Section 11 的稳定文档完成更新；
+10. 本计划没有修改 target binder、family runtime、Engine/API、Op dispatch 或
+    CUDA kernel，新 artifact 仍不能被当前 Engine 加载或执行。
