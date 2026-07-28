@@ -159,16 +159,31 @@ void validate_weights(const SparseMoeWeights& weights, std::vector<AddressRange>
 
 } // namespace
 
-std::size_t sparse_moe_workspace_bytes(std::int32_t max_tokens) {
-    if (max_tokens < 1) {
-        throw std::invalid_argument("sparse_moe_workspace_bytes: max_tokens must be positive");
+std::size_t sparse_moe_workspace_capacity_bytes(QType routed_gate_up, QType routed_down,
+                                                std::int32_t min_tokens, std::int32_t max_tokens) {
+    if (min_tokens <= 0 || max_tokens < min_tokens) {
+        throw std::invalid_argument("sparse_moe workspace: invalid token interval");
     }
-    std::size_t required = detail::sparse_moe_decode_workspace_bytes();
-    if (max_tokens >= detail::kSparseMoeSmallTMin) {
-        const std::int32_t small_t_tokens = std::min(max_tokens, detail::kSparseMoeSmallTMax);
-        required = std::max(required, detail::sparse_moe_small_t_workspace_bytes(small_t_tokens));
+    (void)detail::resolve_sparse_moe_decode_plan(routed_gate_up, routed_down);
+
+    const bool w8_profile = routed_gate_up == QType::W8G32_F16S && routed_down == QType::W8G32_F16S;
+    const std::int32_t prefill_first =
+        w8_profile ? detail::kSparseMoePrefillW8W8Min
+                   : (routed_down == QType::Q5G64_F16S ? detail::kSparseMoePrefillQ4Q5Min
+                                                       : detail::kSparseMoePrefillQ4Q6Min);
+
+    std::size_t required = 0;
+    if (min_tokens == 1) { required = detail::sparse_moe_decode_workspace_bytes(); }
+
+    const std::int32_t small_first = std::max(min_tokens, detail::kSparseMoeSmallTMin);
+    const std::int32_t small_last =
+        std::min({max_tokens, detail::kSparseMoeSmallTMax, prefill_first - 1});
+    if (small_first <= small_last) {
+        required = std::max(required, detail::sparse_moe_small_t_workspace_bytes(small_last));
     }
-    if (max_tokens >= detail::kSparseMoePrefillWorkspaceMin) {
+
+    const std::int32_t prefill_interval_first = std::max(min_tokens, prefill_first);
+    if (prefill_interval_first <= max_tokens) {
         required = std::max(required, detail::sparse_moe_prefill_workspace_bytes(max_tokens));
     }
     return required;

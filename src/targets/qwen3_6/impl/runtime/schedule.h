@@ -37,7 +37,6 @@ struct State {
     KVCache& text_kv;
     KVCache* mtp_kv;
     DFlashPersistentState* dflash;
-    DFlashWorkspace* dflash_workspace;
     qwen3_6::GdnStateStore& gdn;
     qwen3_6::RoundState& io;
     Tensor& prefill_hidden;

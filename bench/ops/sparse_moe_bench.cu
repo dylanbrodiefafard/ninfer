@@ -679,7 +679,8 @@ public:
           shared_down_(QType::W8G32_F16S, kHidden, kIntermediate, seed ^ 0xec4e6c89u),
           flush_(kFlushBytes), private_arena_(private_workspace_bytes(tokens)),
           decode_arena_(ops::detail::sparse_moe_decode_workspace_bytes()),
-          public_workspace_(ops::sparse_moe_workspace_bytes(tokens)) {
+          public_workspace_(ops::sparse_moe_workspace_capacity_bytes(
+              gate_codec(profile), down_codec(profile), tokens, tokens)) {
         std::vector<std::uint16_t> input(static_cast<std::size_t>(tokens) * kHidden);
         std::vector<std::uint16_t> residual(static_cast<std::size_t>(tokens) * kHidden);
         const bool basis_router = tokens > ops::detail::kSparseMoeSmallTMax;
@@ -1438,9 +1439,12 @@ int main(int argc, char** argv) {
                 Candidate candidate         = make_candidate(profile, scope, name, options.tokens);
                 const RoutePattern& pattern = state.route_pattern();
                 const std::size_t workspace_bytes =
-                    candidate.public_production ? ops::sparse_moe_workspace_bytes(options.tokens)
-                    : candidate.small_t         ? candidate.small_t_plan.workspace_bytes
-                                                : candidate.plan.workspace_bytes;
+                    candidate.public_production
+                        ? ops::sparse_moe_workspace_capacity_bytes(gate_codec(profile),
+                                                                   down_codec(profile),
+                                                                   options.tokens, options.tokens)
+                    : candidate.small_t ? candidate.small_t_plan.workspace_bytes
+                                        : candidate.plan.workspace_bytes;
                 Result result{profile,
                               options.tokens,
                               options.distribution,

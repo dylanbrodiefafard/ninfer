@@ -315,6 +315,8 @@ std::string format_server_start_json(const std::string& server_instance_id, std:
     record["memory"]            = Json{{"weights", arena_json(memory.weights)},
                                        {"sequence", arena_json(memory.sequence)},
                                        {"workspace", arena_json(memory.workspace)},
+                                       {"request_transient", arena_json(memory.request_transient)},
+                                       {"cuda_graph_allowance_bytes", memory.cuda_graph_allowance_bytes},
                                        {"kv_payload_bytes", memory.kv_payload_bytes}};
     record["environment"] =
         Json{{"device", environment.device},

@@ -32,9 +32,12 @@ struct SamplingConfig {
     std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
 };
 
-// Caller-owned transient storage for the registered multi-block candidate path.
-// Returns zero for shapes that use the single-block fallback.
-[[nodiscard]] std::size_t sampling_workspace_bytes(std::int32_t token_domain, std::int32_t columns);
+// Caller-owned transient capacity for every column count in the inclusive interval. token_domain
+// is the fixed route profile. Invalid profiles or intervals throw; a legal single-block route
+// returns zero.
+[[nodiscard]] std::size_t sampling_workspace_capacity_bytes(std::int32_t token_domain,
+                                                            std::int32_t min_columns,
+                                                            std::int32_t max_columns);
 
 /**
  * Produces one token id per logits column. `logits` is contiguous BF16 [physical_rows,T], `out`
@@ -62,8 +65,8 @@ struct SamplingConfig {
  * uses counter-based RNG key (config->seed,*pos_base+t,purpose), without mutable RNG state. In the
  * positive-temperature branch the selected token atomically increments token_counts when it is
  * non-null. `out` must not overlap logits, config, pos_base, or token_counts. The Op writes all of
- * out, uses caller-owned transient storage reported by sampling_workspace_bytes(), and has no
- * other persistent state side effect.
+ * out, uses caller-owned transient storage reported by sampling_workspace_capacity_bytes(), and has
+ * no other persistent state side effect.
  */
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* config, const std::int32_t* pos_base, std::int32_t purpose,

@@ -27,7 +27,8 @@ For the 35B-A3B artifact, set both the artifact path and public model alias:
 
 The default `--model-id` is `qwen3.6-27b`; it is an HTTP alias and does not select the artifact.
 
-Vision is disabled by default: its weights and maximum workspace are not allocated, and media
+Vision is disabled by default: its weights, Vision scratch phase, and frozen request-transient
+buffer are not allocated, and media
 requests and token-count requests fail with HTTP 400 `vision_disabled`. Add `--vision` when the
 server must accept image or video input. Speculative residency is likewise frozen by
 `--spec mtp|dflash` and `--draft-tokens`; omitting `--spec` loads neither backend.
@@ -189,13 +190,13 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v2 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v3 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance.
 
 | Event | Contents |
 |---|---|
-| `server_start` | target/artifact, resolved Engine and sampler configuration, memory summary, CUDA/GPU environment, and redacted argv |
+| `server_start` | target/artifact, resolved Engine and sampler configuration, weights/sequence/workspace/request-transient arenas, CUDA Graph allowance, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, thinking mode, output budget, stream/message/tool shape |
 | `request_done` | finish reason, prompt/completion/cache tokens, unrounded phase seconds, and complete speculative-decoding counters |
 | `request_error` | the resolved request configuration and generation error message |

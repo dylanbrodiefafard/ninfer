@@ -753,9 +753,9 @@ encoder or audio projection tower. Token presence is not evidence of an audio in
 - DFlash proposal parity uses the all-non-causal mask defined in Section 9. A causal draft mask
   changes the logical formula and cannot serve as a numerical or behavioral oracle.
 
-## 16. Persistent state inventory
+## 16. Program memory inventory
 
-The logical per-sequence state is:
+The Program-owned memory classes are:
 
 | State | Shape basis | BF16/FP32 payload at 262144 context | Lifetime |
 |---|---|---:|---|
@@ -765,24 +765,37 @@ The logical per-sequence state is:
 | DFlash full context K and V | 1 layer × context × 8 heads × 128 × 2 planes | 1.0 GiB BF16 | active sequence when DFlash enabled |
 | GDN convolution history | 30 layers × 8192 channels × 3 columns | 1.406 MiB BF16 or 2.813 MiB FP32 | active sequence |
 | GDN recurrent matrices | 30 layers × 32 heads × 128 × 128 | 60 MiB FP32 | active sequence |
+| DFlash retained target features/positions | `[16384,C]` BF16 plus `[C]` I32 | `C=min(prefill_chunk,max_context)` | active sequence when DFlash enabled |
 | multimodal continuation | `rope_delta` and logical positions | negligible | active sequence |
 | MoE route data | token × 8 ids and weights plus grouping/reduction workspace | implementation-dependent | operator scope |
-| Vision workspace | patches, positions, QKV/MLP activations, merged embeddings | implementation-dependent | one multimodal prefill |
+| Program scratch | Text/MTP/DFlash/Vision phase temporaries | implementation-dependent | one phase in the shared workspace arena |
+| Vision request transient | encoded Vision output `[8192,V]` | `V<=min(max_context,32768)` | active prefix during request begin |
 
-Allocator alignment, paging metadata, and scratch are not included. Speculative verification,
-prefix reuse, or transactional rollback multiplies the bounded GDN state by the required snapshot
-slots. Target full-attention KV, MTP KV, and the final DFlash layer's context KV grow with
-configured context; GDN state and the first five DFlash context windows are bounded.
+Payload estimates exclude allocator alignment and paging metadata; the table separately identifies
+Program scratch and request transient because they are independently frozen allocations.
+Speculative verification, prefix reuse, or transactional rollback multiplies the bounded GDN state
+by the required snapshot slots. Target full-attention KV, MTP KV, and the final DFlash layer's
+context KV grow with configured context; GDN state and the first five DFlash context windows are
+bounded.
 The first five layers may use 4096-slot cyclic K/V storage, but a proposal query admits at most the
 last 4095 committed context positions according to its absolute position; a retained row at
 distance 4096 is outside the mask. These caches do not grow with total context.
 
-The Program freezes its feature set at startup. A disabled speculative backend has no proposal
-model state or optimized proposal-head view. MTP and DFlash each load the optimized proposal head
-only when that head route is selected; DFlash never loads MTP decoder weights or MTP KV state.
-With Vision disabled, the Program has no Vision weight view and the shared workspace excludes the
-maximum Vision envelope; media is rejected by the matching Frontend. The complete artifact
-inventory is still validated before these resident views are published.
+The Program freezes its feature set and memory plan at startup. The Qwen3.6 family computes named
+Text, MTP, DFlash, and Vision phase capacities from the configured finite execution domains and
+reserves their maximum as one pure scratch arena; sequential phases and scoped child Ops reuse the
+same addresses. DFlash target features and positions survive between target verification and
+proposal/context publication, so they are persistent sequence state rather than a workspace
+prefix. Prefill and retained-feature columns use `min(prefill_chunk,max_context)`.
+
+Vision encoded output uses a separate startup-frozen request-transient allocation and is not
+dynamically grown by a request. A disabled speculative backend has no proposal model state or
+optimized proposal-head view. MTP and DFlash each load the optimized proposal head only when that
+head route is selected; DFlash never loads MTP decoder weights or MTP KV state. With Vision
+disabled, the Program has no Vision weight view, Vision scratch phase, or request-transient
+allocation; media is rejected by the matching Frontend. CUDA Graph driver allowance remains a
+separate budget item. The complete artifact inventory is still validated before these resident
+views are published.
 
 ## 17. Base-checkpoint tensor layout
 

@@ -275,10 +275,10 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
 
 template <std::size_t N>
 std::size_t route_capacity(const std::array<RouteSpec, N>& routes, const Bf16GdnGatingProblem& base,
-                           std::int32_t max_cols) {
+                           std::int32_t min_cols, std::int32_t max_cols) {
     std::size_t maximum = 0;
     for (const RouteSpec& route : routes) {
-        if (route.cols.first > max_cols) { continue; }
+        if (route.cols.last < min_cols || route.cols.first > max_cols) { continue; }
         const std::int32_t endpoint = std::min(route.cols.last, max_cols);
         maximum                     = std::max(
             maximum,
@@ -367,11 +367,16 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& probl
     throw std::logic_error("BF16 GDN gating: admitted problem has no covering route");
 }
 
-std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t max_cols) {
-    (void)bf16_gdn_gating_resolve_plan({48, 5120, max_cols});
-    std::size_t maximum = route_capacity(k27Routes, {48, 5120, 1}, max_cols);
-    maximum             = std::max(maximum, route_capacity(k35Routes, {32, 2048, 1}, max_cols));
-    return maximum;
+std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t heads, std::int32_t input_rows,
+                                                     std::int32_t min_cols, std::int32_t max_cols) {
+    if (min_cols <= 0 || max_cols < min_cols) {
+        throw std::invalid_argument("BF16 GDN gating: invalid column interval");
+    }
+    const Bf16GdnGatingProblem base{heads, input_rows, 1};
+    (void)bf16_gdn_gating_resolve_plan({heads, input_rows, min_cols});
+    (void)bf16_gdn_gating_resolve_plan({heads, input_rows, max_cols});
+    return is_27(base) ? route_capacity(k27Routes, base, min_cols, max_cols)
+                       : route_capacity(k35Routes, base, min_cols, max_cols);
 }
 
 Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProblem& problem) {
@@ -389,11 +394,18 @@ Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProbl
     return {schedule, control, control.workspace_bytes + norm_partial_bytes};
 }
 
-std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t max_cols) {
-    std::size_t maximum           = bf16_gdn_gating_capacity_workspace_bytes(max_cols);
-    const std::int32_t fused_cols = std::min<std::int32_t>(max_cols, 16);
-    maximum                       = std::max(maximum,
-                                             bf16_gdn_norm_gating_resolve_plan({32, 2048, fused_cols}).workspace_bytes);
+std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t heads,
+                                                          std::int32_t input_rows,
+                                                          std::int32_t min_cols,
+                                                          std::int32_t max_cols) {
+    std::size_t maximum =
+        bf16_gdn_gating_capacity_workspace_bytes(heads, input_rows, min_cols, max_cols);
+    if (heads == 32 && input_rows == 2048 && min_cols <= 16) {
+        const std::int32_t fused_cols = std::min<std::int32_t>(max_cols, 16);
+        maximum                       = std::max(
+            maximum,
+            bf16_gdn_norm_gating_resolve_plan({heads, input_rows, fused_cols}).workspace_bytes);
+    }
     return maximum;
 }
 

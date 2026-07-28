@@ -244,7 +244,10 @@ struct MemorySummary {
     ArenaMemorySummary weights;
     ArenaMemorySummary sequence;
     ArenaMemorySummary workspace;
-    std::size_t kv_payload_bytes = 0;
+    ArenaMemorySummary request_transient;
+    std::size_t workspace_logical_peak_bytes = 0;
+    std::size_t cuda_graph_allowance_bytes   = 0;
+    std::size_t kv_payload_bytes             = 0;
 };
 
 struct LoadSummary {

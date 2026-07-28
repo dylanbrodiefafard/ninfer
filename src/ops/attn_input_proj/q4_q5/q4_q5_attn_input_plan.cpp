@@ -65,11 +65,7 @@ Q4Q5AttnInputPlan q4_q5_attn_input_resolve_plan(const Q4Q5AttnInputProblem& prob
 
     for (const RouteSpec& route : kRoutes) {
         if (!route.cols.contains(problem.cols)) { continue; }
-        Q4Q5AttnInputPlan plan{
-            route.schedule,
-            0,
-        };
-        return plan;
+        return {route.schedule};
     }
     throw std::logic_error("Q4/Q5 attention input: admitted problem has no covering route");
 }
@@ -81,7 +77,7 @@ void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& 
     const Q4Q5AttnInputProblem problem{x.ne[0], q.ne[0], k.ne[0], query_key_weight.padded_shape[1],
                                        x.ne[1]};
     const Q4Q5AttnInputPlan resolved = q4_q5_attn_input_resolve_plan(problem);
-    if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
+    if (resolved.schedule != plan.schedule) {
         throw std::invalid_argument("Q4/Q5 attention input: plan does not match exact problem");
     }
 

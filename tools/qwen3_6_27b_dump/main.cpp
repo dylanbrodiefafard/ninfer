@@ -462,16 +462,16 @@ int run(const Options& options) {
         throw std::invalid_argument("--max-context is too small for the diagnostic schedule");
     }
 
-    auto sequence_plan = target::Package::plan_sequence(device, engine);
-    auto program       = target::Package::create_program(*model, std::move(sequence_plan), device);
-    ninfer::runtime::RequestMemory transient(device);
+    auto sequence_plan                           = target::Package::plan_sequence(device, engine);
+    const std::size_t request_transient_capacity = sequence_plan.request_transient_capacity_bytes();
+    auto program = target::Package::create_program(*model, std::move(sequence_plan), device);
+    ninfer::runtime::RequestMemory transient(device, request_transient_capacity);
     ninfer::ExecutionOptions execution;
     execution.requested_output_tokens = options.decode;
     execution.sampling                = {};
     execution.allow_prefix_reuse      = false;
     auto request_plan                 = program->plan_request(prompt, execution);
     const auto summary                = request_plan.summary();
-    transient.ensure(summary.transient_bytes, summary.transient_alignment);
 
     ActivationWriter writer(options.output, options.representative_only);
     detail::ActivationDumpAccess::attach(*program, &writer, &ActivationWriter::text_callback,
@@ -480,7 +480,9 @@ int run(const Options& options) {
     generated.reserve(options.decode);
     std::string stop_reason = "length";
     try {
+        transient.activate(summary.transient_bytes, summary.transient_alignment);
         auto first = program->begin(std::move(prompt), std::move(request_plan), transient.region());
+        transient.deactivate();
         const auto tokens         = first.round.tokens;
         const std::uint32_t count = terminal_count(tokens, options.stop_ids, options.decode);
         generated.insert(generated.end(), tokens.begin(),
@@ -514,6 +516,7 @@ int run(const Options& options) {
             }
         }
     } catch (...) {
+        transient.deactivate();
         program->abort_request();
         detail::ActivationDumpAccess::detach(*program);
         throw;

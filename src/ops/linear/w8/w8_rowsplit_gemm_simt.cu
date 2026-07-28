@@ -55,15 +55,11 @@ void launch_route(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t st
 
 } // namespace
 
-void launch_w8_simt_r8_c4(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
-                          cudaStream_t stream) {
-    (void)ws;
+void launch_w8_simt_r8_c4(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     launch_route<4>(x, w, out, stream);
 }
 
-void launch_w8_simt_r8_c8(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
-                          cudaStream_t stream) {
-    (void)ws;
+void launch_w8_simt_r8_c8(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     launch_route<8>(x, w, out, stream);
 }
 

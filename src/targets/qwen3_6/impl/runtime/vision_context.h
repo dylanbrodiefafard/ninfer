@@ -49,7 +49,8 @@ public:
     VisionContext(DeviceContext& device, const LoadedModelData& model);
 
     [[nodiscard]] static std::size_t workspace_bytes(const qwen3_6::VisionItemControl& item);
-    [[nodiscard]] static std::size_t maximum_workspace_bytes();
+    [[nodiscard]] static std::size_t workspace_capacity_bytes(std::uint32_t max_merged_tokens,
+                                                              std::uint32_t max_segments);
     void encode(std::uint32_t item_index, const VisionItemView& item, Tensor& output,
                 WorkspaceArena& workspace, void* tap = nullptr,
                 VisionTapCallback callback = nullptr) const;

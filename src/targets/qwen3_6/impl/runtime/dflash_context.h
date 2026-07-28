@@ -15,6 +15,8 @@ struct DFlashPersistentState {
     KVCache boundary_local;
     KVCache full;
     Tensor commit_count;
+    Tensor target_features;
+    Tensor feature_positions;
 
     DFlashPersistentState() = default;
     DFlashPersistentState(DeviceSpan backing, const DFlashPersistentLayout& layout);
@@ -23,14 +25,6 @@ struct DFlashPersistentState {
     [[nodiscard]] KVCacheLayerView full_layer() const;
     void save_boundary(cudaStream_t stream) const;
     void restore_boundary(cudaStream_t stream) const;
-};
-
-struct DFlashWorkspace {
-    Tensor target_features;
-    Tensor feature_positions;
-
-    DFlashWorkspace() = default;
-    DFlashWorkspace(DeviceSpan backing, const DFlashWorkspaceLayout& layout);
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
+#include <initializer_list>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -255,7 +256,9 @@ int run_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint
     Tensor tensor_dt_bias(device_dt_bias.p, DType::FP32, {geometry.heads});
     Tensor tensor_g(device_g.data(), DType::FP32, {geometry.heads, tokens});
     Tensor tensor_beta(device_beta.data(), DType::FP32, {geometry.heads, tokens});
-    WorkspaceArena workspace(ops::gdn_gating_proj_workspace_bytes(tokens));
+    const std::size_t workspace_bytes = ops::gdn_gating_proj_workspace_capacity_bytes(
+        geometry.heads, geometry.hidden, tokens, tokens);
+    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
 
     if (geometry.parent_weight) {
         Weight parent = bf16_weight(device_weight.p, 2 * geometry.heads, geometry.hidden);
@@ -288,6 +291,10 @@ int run_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint
         failures += verify_exact((label + " b_weight immutable").c_str(),
                                  from_device<std::uint16_t>(device_b_weight, b_weight_bits.size()),
                                  b_weight_bits);
+    }
+    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+        std::cerr << label << ": workspace query/execution high-water mismatch\n";
+        ++failures;
     }
     return failures;
 }
@@ -344,7 +351,9 @@ int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std:
     Tensor tensor_dt_bias(device_dt_bias.p, DType::FP32, {geometry.heads});
     Tensor tensor_g(device_g.data(), DType::FP32, {geometry.heads, tokens});
     Tensor tensor_beta(device_beta.data(), DType::FP32, {geometry.heads, tokens});
-    WorkspaceArena workspace(ops::gdn_norm_gating_proj_workspace_bytes(tokens));
+    const std::size_t workspace_bytes = ops::gdn_norm_gating_proj_workspace_capacity_bytes(
+        geometry.heads, geometry.hidden, tokens, tokens);
+    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
 
     if (geometry.parent_weight) {
         Weight parent = bf16_weight(device_weight.p, 2 * geometry.heads, geometry.hidden);
@@ -382,6 +391,38 @@ int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std:
                                  from_device<std::uint16_t>(device_b_weight, b_weight_bits.size()),
                                  b_weight_bits);
     }
+    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+        std::cerr << label << ": workspace query/execution high-water mismatch\n";
+        ++failures;
+    }
+    return failures;
+}
+
+int verify_workspace_capacity_contract(const Geometry& geometry,
+                                       std::initializer_list<std::int32_t> route_endpoints) {
+    const std::int32_t last = *std::max_element(route_endpoints.begin(), route_endpoints.end());
+    const std::size_t interval =
+        ops::gdn_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 1, last);
+    std::size_t witness = 0;
+    for (const std::int32_t tokens : route_endpoints) {
+        witness = std::max(witness, ops::gdn_gating_proj_workspace_capacity_bytes(
+                                        geometry.heads, geometry.hidden, tokens, tokens));
+    }
+    int failures = 0;
+    if (interval != witness) {
+        std::cerr << geometry.label << ": GDN control interval missed a route endpoint\n";
+        ++failures;
+    }
+    const std::size_t norm_interval =
+        ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 1, 64);
+    const std::size_t norm_witness = std::max(
+        ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 16, 16),
+        ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 64,
+                                                           64));
+    if (norm_interval != norm_witness) {
+        std::cerr << geometry.label << ": GDN norm/control interval missed a route endpoint\n";
+        ++failures;
+    }
     return failures;
 }
 
@@ -394,14 +435,16 @@ int main() {
     }
 
     int failures = 0;
+    failures += verify_workspace_capacity_contract(kQwen27, {1, 8, 1024, 2048, 4096, 4097});
+    failures += verify_workspace_capacity_contract(kQwen35, {1, 127, 1024, 2048, 4096, 4097});
 
     // Every registered 27B projection route, including predicated and full token tiles.
-    for (const std::int32_t tokens : {1, 8, 9, 128, 1025, 2049, 4097}) {
+    for (const std::int32_t tokens : {1, 8, 9, 1024, 1025, 2049, 4097}) {
         failures +=
             run_projection_case(kQwen27, tokens, 0x1000u + static_cast<std::uint32_t>(tokens));
     }
     // Every registered 35B projection route and its contiguous-parent storage contract.
-    for (const std::int32_t tokens : {1, 64, 128, 1025, 2049, 4097}) {
+    for (const std::int32_t tokens : {1, 127, 128, 1024, 1025, 2049, 4097}) {
         failures +=
             run_projection_case(kQwen35, tokens, 0x2000u + static_cast<std::uint32_t>(tokens));
     }
@@ -409,6 +452,7 @@ int main() {
     // 27B uses the composed implementation; 35B also qualifies both sides of its fused boundary.
     failures += run_norm_projection_case(kQwen27, 1, 0x3001u);
     failures += run_norm_projection_case(kQwen27, 9, 0x3009u);
+    failures += run_norm_projection_case(kQwen27, 64, 0x3040u);
     failures += run_norm_projection_case(kQwen35, 1, 0x4001u);
     failures += run_norm_projection_case(kQwen35, 16, 0x4010u);
     failures += run_norm_projection_case(kQwen35, 17, 0x4011u);

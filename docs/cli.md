@@ -34,7 +34,8 @@ GPU residency is frozen when the Engine starts:
 - `--spec mtp` loads only MTP, while `--spec dflash` loads only the 35B-A3B text-only DFlash
   backend;
 - a speculative backend with the full proposal head omits the optimized proposal head;
-- Vision is disabled by default, omitting its weights and maximum workspace;
+- Vision is disabled by default, omitting its weights, Vision scratch phase, and frozen
+  request-transient allocation;
 - `--vision` loads those allocations and enables image/video input.
 
 The complete `.ninfer` inventory is still validated. These choices are not lazy loading: a
@@ -160,4 +161,13 @@ one RTX 5090 depends on the selected artifact, media workload, output budget, an
 Use `--kv-dtype int8` for large context allocations. The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
 
-All weight, sequence, workspace, and graph allocations are released when the Engine is destroyed.
+At Engine startup NInfer reserves model weights, persistent sequence state, one phase-reused
+Program scratch arena, the maximum Vision request-transient buffer when Vision is enabled, and a
+separate CUDA Graph driver allowance. Scratch is the maximum of the enabled Text, MTP, DFlash, and
+Vision phases, not their sum. Its prefill bound uses
+`min(--prefill-chunk,--max-context)`. The request-transient buffer is also frozen at startup; a
+media request activates only the needed prefix and performs no project-owned device allocation or
+growth.
+
+All weight, sequence, workspace, request-transient, and graph allocations are released when the
+Engine is destroyed.

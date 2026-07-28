@@ -140,14 +140,13 @@ public:
     const bool use_cuda_graph;
     const std::size_t kv_payload_bytes;
     const std::size_t graph_allowance_bytes;
-    const std::size_t workspace_fixed_bytes;
+    const WorkspacePlan workspace_plan;
 
     DeviceArena persistent;
     DeviceArena workspace_storage;
     WorkspaceArena work;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
     std::optional<DFlashPersistentState> dflash;
-    std::optional<DFlashWorkspace> dflash_workspace;
     qwen3_6::RoundState io;
     Tensor prefill_hidden;
     Tensor sampling_config;
@@ -189,6 +188,7 @@ public:
     PrefixCheckpoint boundary;
     PendingCandidate pending;
     GenerationTimings timings;
+    std::size_t workspace_logical_peak_bytes          = 0;
     void* diagnostic_context                          = nullptr;
     schedule::TextTapCallback diagnostic_text_tap     = nullptr;
     schedule::VisionTapCallback diagnostic_vision_tap = nullptr;
@@ -203,6 +203,7 @@ private:
     void copy_round_token();
     void flush_dflash_context_prefix(std::uint32_t count);
     void validate_licensed_tokens(std::span<const TokenId> tokens) const;
+    void mark_workspace_usage(std::size_t phase_bytes) noexcept;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

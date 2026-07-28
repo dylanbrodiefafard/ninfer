@@ -204,51 +204,55 @@ std::vector<qb::TestResult> sample_results() {
     pp.test = {qb::TestKind::Prefill, 512, 0, "pp512"};
     pp.reps = {{timings(0.01, 0.5, 0.0, 0.52), speculative(0, 0, 0, 0, {0, 0, 0, 0, 0}), 1},
                {timings(0.02, 0.25, 0.0, 0.28), speculative(0, 0, 0, 0, {0, 0, 0, 0, 0}), 1}};
-    pp.workspace_peak_bytes = 5ULL * 1024ULL * 1024ULL * 1024ULL;
+    pp.workspace_peak_bytes           = 5ULL * 1024ULL * 1024ULL * 1024ULL;
+    pp.workspace_allocator_peak_bytes = 4ULL * 1024ULL * 1024ULL;
 
     qb::TestResult tg;
     tg.test = {qb::TestKind::Decode, 0, 3, "tg3"};
     tg.reps = {{timings(0.01, 0.1, 0.5, 0.62), speculative(1, 5, 5, 0, {1, 1, 1, 1, 1}), 4},
                {timings(0.02, 0.1, 1.0, 1.13), speculative(0, 0, 0, 3, {0, 0, 0, 0, 0}), 4}};
-    tg.workspace_peak_bytes = 1024ULL * 1024ULL;
+    tg.workspace_peak_bytes           = 1024ULL * 1024ULL;
+    tg.workspace_allocator_peak_bytes = 512ULL * 1024ULL;
     return {std::move(pp), std::move(tg)};
 }
 
 qb::BenchEnvironment sample_environment() {
     qb::BenchEnvironment env;
-    env.gpu_name                         = "RTX 5090";
-    env.cuda_runtime_version             = "13.1";
-    env.cuda_driver_version              = "590.1";
-    env.device_id                        = 0;
-    env.artifact_path                    = "model.ninfer";
-    env.artifact_file_size_bytes         = 17500000000ULL;
-    env.load                             = {.target               = "qwen3_6_27b",
-                                            .load_seconds         = 2.5,
-                                            .upload_seconds       = 2.0,
-                                            .artifact_bytes_read  = 17500000000ULL,
-                                            .host_to_device_bytes = 17400000000ULL,
-                                            .peak_staging_bytes   = 134217728ULL,
-                                            .tensor_count         = 1118,
-                                            .resource_count       = 6};
-    env.memory.device                    = 0;
-    env.memory.max_context               = 4096;
-    env.memory.kv_cache                  = ninfer::KvCacheStorage::Int8Group64;
-    env.memory.weights                   = {17400000000ULL, 17400000000ULL, 17400000000ULL};
-    env.memory.sequence                  = {2000000000ULL, 1900000000ULL, 1900000000ULL};
-    env.memory.workspace                 = {100000000ULL, 0, 0};
-    env.memory.kv_payload_bytes          = 123456ULL;
-    env.max_context                      = 4096;
-    env.prefill_chunk                    = 1024;
-    env.kv_cache                         = ninfer::KvCacheStorage::Int8Group64;
-    env.mtp_draft_tokens                 = 5;
-    env.proposal_head                    = ninfer::ProposalHead::Optimized;
-    env.use_cuda_graph                   = true;
-    env.decode_graph_primed              = true;
-    env.decode_graph_prime_output_tokens = 13;
-    env.repetitions                      = 2;
-    env.warmup                           = 1;
-    env.corpus_path                      = "bench/fixtures/bench_corpus.ids";
-    env.corpus_tokens                    = 65536;
+    env.gpu_name                          = "RTX 5090";
+    env.cuda_runtime_version              = "13.1";
+    env.cuda_driver_version               = "590.1";
+    env.device_id                         = 0;
+    env.artifact_path                     = "model.ninfer";
+    env.artifact_file_size_bytes          = 17500000000ULL;
+    env.load                              = {.target               = "qwen3_6_27b",
+                                             .load_seconds         = 2.5,
+                                             .upload_seconds       = 2.0,
+                                             .artifact_bytes_read  = 17500000000ULL,
+                                             .host_to_device_bytes = 17400000000ULL,
+                                             .peak_staging_bytes   = 134217728ULL,
+                                             .tensor_count         = 1118,
+                                             .resource_count       = 6};
+    env.memory.device                     = 0;
+    env.memory.max_context                = 4096;
+    env.memory.kv_cache                   = ninfer::KvCacheStorage::Int8Group64;
+    env.memory.weights                    = {17400000000ULL, 17400000000ULL, 17400000000ULL};
+    env.memory.sequence                   = {2000000000ULL, 1900000000ULL, 1900000000ULL};
+    env.memory.workspace                  = {100000000ULL, 0, 0};
+    env.memory.request_transient          = {50000000ULL, 0, 40000000ULL};
+    env.memory.cuda_graph_allowance_bytes = 150000000ULL;
+    env.memory.kv_payload_bytes           = 123456ULL;
+    env.max_context                       = 4096;
+    env.prefill_chunk                     = 1024;
+    env.kv_cache                          = ninfer::KvCacheStorage::Int8Group64;
+    env.mtp_draft_tokens                  = 5;
+    env.proposal_head                     = ninfer::ProposalHead::Optimized;
+    env.use_cuda_graph                    = true;
+    env.decode_graph_primed               = true;
+    env.decode_graph_prime_output_tokens  = 13;
+    env.repetitions                       = 2;
+    env.warmup                            = 1;
+    env.corpus_path                       = "bench/fixtures/bench_corpus.ids";
+    env.corpus_tokens                     = 65536;
     return env;
 }
 
@@ -264,7 +268,7 @@ int test_report_contract() {
         return fail(std::string("invalid benchmark JSON: ") + error.what());
     }
 
-    failures += expect(report.at("schema_version") == 8, "report schema v8");
+    failures += expect(report.at("schema_version") == 9, "report schema v9");
     failures += expect(report.at("artifact_type") == "ninfer_bench_report", "report identity");
     failures += expect(report.at("artifact").at("path") == "model.ninfer", "artifact path");
     failures += expect(report.at("load").at("target") == "qwen3_6_27b", "load target");
@@ -273,6 +277,11 @@ int test_report_contract() {
     failures += expect(report.at("memory").at("kv_cache") == "int8-group64", "memory KV");
     failures += expect(report.at("memory").at("workspace").at("capacity_bytes") == 100000000ULL,
                        "workspace capacity");
+    failures +=
+        expect(report.at("memory").at("request_transient").at("capacity_bytes") == 50000000ULL,
+               "request transient capacity");
+    failures += expect(report.at("memory").at("cuda_graph_allowance_bytes") == 150000000ULL,
+                       "CUDA Graph allowance");
     failures += expect(report.at("memory").at("kv_payload_bytes") == 123456ULL, "KV payload");
     failures += expect(report.at("config").at("proposal_head") == "optimized", "proposal head");
     failures += expect(report.at("config").at("decode_graph_prime").at("output_tokens") == 13,
@@ -285,6 +294,8 @@ int test_report_contract() {
     failures += expect(pp.at("decode_output_tok_s_mean").is_null(), "pp decode is null");
     failures += expect(pp.at("workspace_peak_bytes") == 5ULL * 1024ULL * 1024ULL * 1024ULL,
                        "pp workspace peak");
+    failures += expect(pp.at("workspace_allocator_peak_bytes") == 4ULL * 1024ULL * 1024ULL,
+                       "pp allocator workspace peak");
 
     const Json& tg = report.at("tests").at(1);
     failures +=
@@ -325,9 +336,10 @@ int test_human_and_csv_reports() {
     const std::string csv = qb::format_csv(env, results);
     failures += expect(csv.starts_with("label,kind,n_prompt,n_gen,target"), "CSV identity columns");
     for (const std::string_view field :
-         {"proposal_head", "kv_payload_bytes", "load_host_to_device_bytes", "workspace_peak_bytes",
-          "spec_acceptance_rate", "decode_output_tok_s_mean", "decode_engine_tok_s_mean",
-          "total_seconds_mean"}) {
+         {"proposal_head", "kv_payload_bytes", "load_host_to_device_bytes",
+          "request_transient_capacity_bytes", "cuda_graph_allowance_bytes", "workspace_peak_bytes",
+          "workspace_allocator_peak_bytes", "spec_acceptance_rate", "decode_output_tok_s_mean",
+          "decode_engine_tok_s_mean", "total_seconds_mean"}) {
         failures += expect(csv.find(field) != std::string::npos,
                            std::string("CSV field ") + std::string(field));
     }

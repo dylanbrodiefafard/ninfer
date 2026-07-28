@@ -40,7 +40,6 @@ namespace {
 constexpr double kRtx5090DramGBs           = 1792.0;
 constexpr double kRtx5090DenseBf16Tflops   = 209.5;
 constexpr std::uint64_t kDefaultFlushBytes = 256ULL << 20;
-constexpr std::uint64_t kWorkspaceBytes    = 64ULL << 20;
 constexpr int kDefaultWarmup               = 3;
 constexpr int kDefaultRepeat               = 20;
 
@@ -559,7 +558,6 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
     CUDA_CHECK(cudaMemsetAsync(out.p, 0, out.bytes, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    WorkspaceArena workspace(kWorkspaceBytes);
     std::vector<Result> results;
     results.reserve(group.points.size());
     double previous_median = std::numeric_limits<double>::quiet_NaN();
@@ -568,8 +566,7 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
         Tensor activation(x.p, DType::BF16, {group.k, point.t});
         Tensor output(out.p, DType::BF16, {group.n, point.t});
         const auto launch = [&](cudaStream_t launch_stream) {
-            workspace.reset();
-            ops::linear(activation, weight.weight, output, group.policy, workspace, launch_stream);
+            ops::linear(activation, weight.weight, output, group.policy, launch_stream);
         };
         const bench::ColdTiming timing =
             bench::measure_cold_launch(launch, flush, stream, opt.warmup, opt.repeat);
@@ -596,12 +593,10 @@ void run_profile(const BenchPoint& point, const Options& opt, DeviceBuffer& flus
     CUDA_CHECK(cudaMemsetAsync(out.p, 0, out.bytes, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    WorkspaceArena workspace(kWorkspaceBytes);
     Tensor activation(x.p, DType::BF16, {point.k, point.t});
     Tensor output(out.p, DType::BF16, {point.n, point.t});
     const auto launch = [&]() {
-        workspace.reset();
-        ops::linear(activation, weight.weight, output, point.policy, workspace, stream);
+        ops::linear(activation, weight.weight, output, point.policy, stream);
     };
     for (int i = 0; i < opt.warmup; ++i) {
         bench::flush_l2(flush, stream);

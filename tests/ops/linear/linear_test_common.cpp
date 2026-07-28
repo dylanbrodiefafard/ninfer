@@ -281,7 +281,6 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
     DeviceBuffer device_weight(host_weight.payload.size());
     device_weight.copy_from_host(host_weight.payload.data(), device_weight.bytes);
     const Weight weight = host_weight.device_weight(device_weight.p);
-    WorkspaceArena workspace(64U << 20);
 
     std::vector<double> full_reference;
     if (shape.comparison == Comparison::Full) {
@@ -301,12 +300,11 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
         GuardedOutput output(checked_elements(shape.n, invocation.t, "guarded output"));
         Tensor input(device_activation.p, DType::BF16, {shape.k, invocation.t});
         Tensor destination(output.data(), DType::BF16, {shape.n, invocation.t});
-        workspace.reset();
         try {
             if (invocation.call_form == CallForm::A16Convenience) {
-                ops::linear(input, weight, destination, workspace, nullptr);
+                ops::linear(input, weight, destination, nullptr);
             } else {
-                ops::linear(input, weight, destination, invocation.policy, workspace, nullptr);
+                ops::linear(input, weight, destination, invocation.policy, nullptr);
             }
             cuda_check(cudaDeviceSynchronize(), "synchronize linear");
         } catch (const std::exception& error) {

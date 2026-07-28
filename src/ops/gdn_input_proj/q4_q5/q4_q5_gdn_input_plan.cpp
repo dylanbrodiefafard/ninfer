@@ -66,36 +66,23 @@ Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem
 
     for (const RouteSpec& route : kRoutes) {
         if (!route.cols.contains(problem.cols)) { continue; }
-        Q4Q5GdnInputPlan plan{
-            route.schedule,
-            0,
-        };
-        return plan;
+        return {route.schedule};
     }
     throw std::logic_error("Q4/Q5 GDN input: admitted problem has no covering route");
 }
 
-std::size_t q4_q5_gdn_input_capacity_workspace_bytes(std::int32_t qk_rows, std::int32_t value_rows,
-                                                     std::int32_t max_cols) {
-    constexpr std::int32_t output_rows = 10240;
-    (void)q4_q5_gdn_input_resolve_plan({5120, qk_rows, value_rows, output_rows, 5120, max_cols});
-
-    return 0;
-}
-
 void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
                                   const Weight& qk_weight, const Weight& v_weight, Tensor& qkv,
-                                  WorkspaceArena& ws, cudaStream_t stream) {
+                                  cudaStream_t stream) {
     const Q4Q5GdnInputProblem problem{
         x.ne[0], qk_weight.n, v_weight.n, qkv.ne[0], qk_weight.padded_shape[1], x.ne[1]};
     const Q4Q5GdnInputPlan resolved = q4_q5_gdn_input_resolve_plan(problem);
-    if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
+    if (resolved.schedule != plan.schedule) {
         throw std::invalid_argument("Q4/Q5 GDN input: plan does not match exact problem");
     }
 
     switch (plan.schedule) {
     case Q4Q5GdnInputScheduleId::IndependentDirectFixed: {
-        (void)ws;
         Tensor qk    = qkv.slice(0, 0, problem.qk_rows);
         Tensor value = qkv.slice(0, problem.qk_rows, problem.value_rows);
         q4_q5_gdn_input_independent_launch(x, qk_weight, v_weight, qk, value, stream);
@@ -109,11 +96,11 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
 }
 
 void q4_q5_gdn_input_dispatch(const Tensor& x, const Weight& qk_weight, const Weight& v_weight,
-                              Tensor& qkv, WorkspaceArena& ws, cudaStream_t stream) {
+                              Tensor& qkv, cudaStream_t stream) {
     const Q4Q5GdnInputProblem problem{
         x.ne[0], qk_weight.n, v_weight.n, qkv.ne[0], qk_weight.padded_shape[1], x.ne[1]};
     const Q4Q5GdnInputPlan plan = q4_q5_gdn_input_resolve_plan(problem);
-    q4_q5_gdn_input_execute_plan(plan, x, qk_weight, v_weight, qkv, ws, stream);
+    q4_q5_gdn_input_execute_plan(plan, x, qk_weight, v_weight, qkv, stream);
 }
 
 } // namespace ninfer::ops::detail

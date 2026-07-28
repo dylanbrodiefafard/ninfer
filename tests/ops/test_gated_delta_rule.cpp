@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <iostream>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -176,8 +177,9 @@ int inplace_case(const Case& test_case, std::uint32_t seed) {
     Tensor beta(device.beta.p, DType::FP32, {test_case.value_heads, test_case.tokens});
     Tensor state_tensor(state.data(), DType::FP32, {kHeadDim, kHeadDim, test_case.value_heads});
     Tensor out_tensor(out.data(), DType::BF16, {kHeadDim, test_case.value_heads, test_case.tokens});
-    const std::size_t workspace_bytes = ops::gated_delta_rule_workspace_bytes(
-        kHeadDim, kQkHeads, test_case.value_heads, test_case.tokens, test_case.normalize_qk);
+    const std::size_t workspace_bytes = ops::gated_delta_rule_workspace_capacity_bytes(
+        kHeadDim, kQkHeads, test_case.value_heads, test_case.normalize_qk, test_case.tokens,
+        test_case.tokens);
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
 
     ops::gated_delta_rule(q, k, v, g, beta, scale, test_case.normalize_qk, workspace, state_tensor,
@@ -194,6 +196,10 @@ int inplace_case(const Case& test_case, std::uint32_t seed) {
     failures += out.verify_guards((label + " out").c_str());
     failures += verify_common_inputs_unchanged(label, in, device.q, device.k, device.v, device.g,
                                                device.beta);
+    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+        std::cerr << label << ": workspace query/execution high-water mismatch\n";
+        ++failures;
+    }
     return failures;
 }
 
@@ -220,8 +226,9 @@ int distinct_state_case(const Case& test_case, std::uint32_t seed) {
     Tensor state_out_tensor(state_out.data(), DType::FP32,
                             {kHeadDim, kHeadDim, test_case.value_heads});
     Tensor out_tensor(out.data(), DType::BF16, {kHeadDim, test_case.value_heads, test_case.tokens});
-    const std::size_t workspace_bytes = ops::gated_delta_rule_workspace_bytes(
-        kHeadDim, kQkHeads, test_case.value_heads, test_case.tokens, test_case.normalize_qk);
+    const std::size_t workspace_bytes = ops::gated_delta_rule_workspace_capacity_bytes(
+        kHeadDim, kQkHeads, test_case.value_heads, test_case.normalize_qk, test_case.tokens,
+        test_case.tokens);
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
 
     ops::gated_delta_rule(q, k, v, g, beta, scale, test_case.normalize_qk, workspace,
@@ -241,6 +248,10 @@ int distinct_state_case(const Case& test_case, std::uint32_t seed) {
     failures += out.verify_guards((label + " out").c_str());
     failures += verify_common_inputs_unchanged(label, in, device.q, device.k, device.v, device.g,
                                                device.beta);
+    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+        std::cerr << label << ": workspace query/execution high-water mismatch\n";
+        ++failures;
+    }
     return failures;
 }
 
@@ -270,10 +281,8 @@ int snapshot_case(const Case& test_case, int slots, int initial_slot, std::uint3
                          {kHeadDim, kHeadDim, test_case.value_heads, slots});
     Tensor initial_slot_tensor(device_initial_slot.p, DType::I32, {1});
     Tensor out_tensor(out.data(), DType::BF16, {kHeadDim, test_case.value_heads, test_case.tokens});
-    WorkspaceArena workspace(256);
-
-    ops::gated_delta_rule_snapshot(q, k, v, g, beta, scale, test_case.normalize_qk, workspace,
-                                   states_tensor, initial_slot_tensor, out_tensor, nullptr);
+    ops::gated_delta_rule_snapshot(q, k, v, g, beta, scale, test_case.normalize_qk, states_tensor,
+                                   initial_slot_tensor, out_tensor, nullptr);
     cuda_synchronize();
 
     const std::string label             = std::string(test_case.name) + " snapshot";
@@ -313,12 +322,29 @@ int main() {
 
     int failures = 0;
 
+    for (const bool normalize_qk : {false, true}) {
+        const std::size_t interval = ops::gated_delta_rule_workspace_capacity_bytes(
+            kHeadDim, kQkHeads, 48, normalize_qk, 63, 65);
+        const std::size_t witness = ops::gated_delta_rule_workspace_capacity_bytes(
+            kHeadDim, kQkHeads, 48, normalize_qk, 65, 65);
+        if (interval != witness) {
+            std::cerr << "gated_delta_rule interval capacity missed the chunk boundary\n";
+            ++failures;
+        }
+    }
+    try {
+        (void)ops::gated_delta_rule_workspace_capacity_bytes(kHeadDim, kQkHeads, 48, true, 0, 65);
+        std::cerr << "gated_delta_rule accepted an invalid token interval\n";
+        ++failures;
+    } catch (const std::invalid_argument&) {}
+
     // Registered 27B/35B-A3B geometries, public state forms, and the recurrent/chunk/tail route
     // boundary are all qualified directly against the same complete FP64 recurrence.
     failures += inplace_case({"27b decode fused-qk-norm", 48, 1, true}, 12001u);
     failures += distinct_state_case({"27b raw-qk small-T", 48, 7, false}, 12007u);
     failures += distinct_state_case({"35b pre-chunk fused-qk-norm", 32, 63, true}, 12063u);
     failures += distinct_state_case({"27b exact chunk fused-qk-norm", 48, 64, true}, 12064u);
+    failures += distinct_state_case({"27b exact chunk raw-qk", 48, 64, false}, 12164u);
     failures += inplace_case({"35b chunk-tail fused-qk-norm", 32, 65, true}, 12065u);
 
     // Snapshot is a separate public state transition. Nonzero source slots also prove that the

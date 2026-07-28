@@ -202,10 +202,12 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     Tensor positions_tensor(d_positions.p, DType::I32, {tokens});
     Tensor out_tensor(d_out.data(), DType::BF16, {kD, kQHeads, tokens});
     CyclicKVCacheLayerView context = make_context_view(d_context_k, d_context_v);
-    DeviceArena workspace(ops::swa_workspace_bytes(tokens));
+    const ops::SwaContextExecutionEnvelope envelope{0, static_cast<std::uint32_t>(envelope_max)};
+    const std::size_t workspace_bytes = ops::swa_workspace_capacity_bytes(envelope, tokens, tokens);
+    DeviceArena workspace(workspace_bytes);
 
-    ops::swa(q_tensor, query_k_tensor, query_v_tensor, positions_tensor, kScale, context,
-             {0, static_cast<std::uint32_t>(envelope_max)}, workspace, out_tensor, nullptr);
+    ops::swa(q_tensor, query_k_tensor, query_v_tensor, positions_tensor, kScale, context, envelope,
+             workspace, out_tensor, nullptr);
     cuda_synchronize();
 
     std::string label = "swa T=" + std::to_string(tokens) + " L=" + std::to_string(context_length);
@@ -233,6 +235,10 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     failures +=
         verify_exact((label + " context v unchanged").c_str(),
                      from_device<std::uint16_t>(d_context_v, context_count), context_v_expected);
+    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+        std::cerr << label << ": workspace query/execution high-water mismatch\n";
+        ++failures;
+    }
     return failures;
 }
 
@@ -245,6 +251,18 @@ int main() {
     }
 
     int failures = 0;
+    constexpr ops::SwaContextExecutionEnvelope capacity_envelope{0, 8194};
+    const std::size_t interval = ops::swa_workspace_capacity_bytes(capacity_envelope, 1, 16);
+    const std::size_t endpoint = ops::swa_workspace_capacity_bytes(capacity_envelope, 16, 16);
+    if (interval != endpoint) {
+        std::cerr << "swa interval capacity did not resolve to its monotonic endpoint\n";
+        ++failures;
+    }
+    try {
+        (void)ops::swa_workspace_capacity_bytes(capacity_envelope, 0, 16);
+        std::cerr << "swa accepted an invalid token interval\n";
+        ++failures;
+    } catch (const std::invalid_argument&) {}
     failures += run_case(1, 0);
     failures += run_case(16, 1);
     failures += run_case(8, 96, InputProfile::Random, 4096);

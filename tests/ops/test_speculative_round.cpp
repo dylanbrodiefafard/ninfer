@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -159,8 +160,9 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
     Tensor num_sampled(d_num.data(), DType::I32, {1});
     Tensor accepted(d_accepted.data(), DType::I32, {1});
     Tensor stats(d_stats.data(), DType::I64, {static_cast<int>(initial_stats.size())});
-    WorkspaceArena workspace(
-        std::max<std::size_t>(256, ops::sampling_workspace_bytes(token_domain, k + 1)));
+    const std::size_t workspace_bytes =
+        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k);
+    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
     ops::speculative_accept_greedy_drafts(
         targets, logits, draft_tensor, length, token, sampled, num_sampled, accepted, stats,
         token_domain, static_cast<const ops::SamplingConfig*>(d_config.p), workspace, nullptr);
@@ -207,11 +209,14 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
     failures += d_num.verify_guards((label + " num guards").c_str());
     failures += d_accepted.verify_guards((label + " accepted guards").c_str());
     failures += d_stats.verify_guards((label + " stats guards").c_str());
+    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+        std::cerr << label << ": workspace query/execution high-water mismatch\n";
+        ++failures;
+    }
     return failures;
 }
 
-int greedy_accept_case(int k, int accepted_count) {
-    constexpr int token_domain = 64;
+int greedy_accept_case(int k, int accepted_count, int token_domain = 64) {
     std::vector<std::int32_t> targets(static_cast<std::size_t>(k + 1));
     std::vector<std::int32_t> drafts(static_cast<std::size_t>(k));
     for (int i = 0; i <= k; ++i) {
@@ -361,11 +366,24 @@ int main() {
     }
 
     int failures = 0;
+    const std::size_t k15 =
+        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 15, 15);
+    if (k15 == 0 || k15 != ops::sampling_workspace_capacity_bytes(257, 16, 16) ||
+        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 16, 16) != 0 ||
+        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 1, 16) != k15) {
+        std::cerr << "speculative accept workspace did not close over K+1 sampling columns\n";
+        ++failures;
+    }
+    try {
+        (void)ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 0, 15);
+        std::cerr << "speculative accept workspace accepted an invalid draft interval\n";
+        ++failures;
+    } catch (const std::invalid_argument&) {}
     for (const int k : {1, 5, 15}) failures += prepare_verify_case(k);
     failures += greedy_accept_case(1, 0);
     failures += greedy_accept_case(5, 2);
     failures += greedy_accept_case(5, 5);
-    failures += greedy_accept_case(15, 7);
+    failures += greedy_accept_case(15, 7, 257);
     failures += deterministic_sampling_case();
     failures += select_hidden_case(5120, 6, 0);
     failures += select_hidden_case(5120, 6, 5);

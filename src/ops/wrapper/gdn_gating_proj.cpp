@@ -60,12 +60,19 @@ void require_sequence_tensor(const Tensor& t, DType dtype, std::int32_t n0, std:
 
 } // namespace
 
-std::size_t gdn_gating_proj_workspace_bytes(std::int32_t max_tokens) {
-    return detail::bf16_gdn_gating_capacity_workspace_bytes(max_tokens);
+std::size_t gdn_gating_proj_workspace_capacity_bytes(std::int32_t heads, std::int32_t input_rows,
+                                                     std::int32_t min_tokens,
+                                                     std::int32_t max_tokens) {
+    return detail::bf16_gdn_gating_capacity_workspace_bytes(heads, input_rows, min_tokens,
+                                                            max_tokens);
 }
 
-std::size_t gdn_norm_gating_proj_workspace_bytes(std::int32_t max_tokens) {
-    return detail::bf16_gdn_norm_gating_capacity_workspace_bytes(max_tokens);
+std::size_t gdn_norm_gating_proj_workspace_capacity_bytes(std::int32_t heads,
+                                                          std::int32_t input_rows,
+                                                          std::int32_t min_tokens,
+                                                          std::int32_t max_tokens) {
+    return detail::bf16_gdn_norm_gating_capacity_workspace_bytes(heads, input_rows, min_tokens,
+                                                                 max_tokens);
 }
 
 void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_weight,

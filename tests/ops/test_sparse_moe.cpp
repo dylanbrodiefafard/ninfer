@@ -526,7 +526,9 @@ public:
         };
         Tensor x(device_input.p, DType::BF16, {kHidden, tokens});
         Tensor destination(destination_storage.data(), DType::BF16, {kHidden, tokens});
-        WorkspaceArena workspace(ops::sparse_moe_workspace_bytes(tokens));
+        const std::size_t workspace_bytes = ops::sparse_moe_workspace_capacity_bytes(
+            weights.routed_gate_up.qtype, weights.routed_down.qtype, tokens, tokens);
+        WorkspaceArena workspace(workspace_bytes);
 
         if (graph_replay) {
             cudaStream_t stream  = nullptr;
@@ -561,6 +563,10 @@ public:
         failures +=
             verify_exact((label + " input preservation").c_str(),
                          from_device<std::uint16_t>(device_input, input_bits.size()), input_bits);
+        if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+            std::cerr << label << ": workspace query/execution high-water mismatch\n";
+            ++failures;
+        }
         return failures;
     }
 
@@ -603,13 +609,23 @@ private:
 
 int run_profile(const CodecProfile& profile) {
     SparseMoeFixture fixture(profile);
-    int failures = 0;
+    int failures        = 0;
+    std::size_t witness = 0;
     for (std::size_t index = 0; index < profile.token_cases.size(); ++index) {
         const std::int32_t tokens = profile.token_cases[index];
+        witness =
+            std::max(witness, ops::sparse_moe_workspace_capacity_bytes(
+                                  profile.routed_gate_up, profile.routed_down, tokens, tokens));
         // Decode starts with the exact top-8 boundary tie; multi-token cases cycle the tie,
         // high/low expert ids, and a different ordering of the same experts.
         failures +=
             fixture.run(tokens, index == 0 ? 1 : 0, profile.verify_graph_replay && index == 1);
+    }
+    const std::size_t interval = ops::sparse_moe_workspace_capacity_bytes(
+        profile.routed_gate_up, profile.routed_down, 1, profile.token_cases.back());
+    if (interval != witness) {
+        std::cerr << profile.name << ": interval workspace capacity missed a route witness\n";
+        ++failures;
     }
     failures += fixture.verify_persistent_inputs();
     return failures;

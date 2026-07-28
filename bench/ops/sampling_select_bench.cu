@@ -169,7 +169,7 @@ void run_sample(DeviceBuffer& logits, DeviceBuffer& counts, Mode mode, bool coun
     CUDA_CHECK(cudaMemset(pos.p, 0, pos.bytes));
     Tensor tlogits(logits.p, DType::BF16, {kPhysicalRows, 1});
     Tensor tout(out.p, DType::I32, {1});
-    WorkspaceArena workspace(ops::sampling_workspace_bytes(kTokenDomain, 1));
+    WorkspaceArena workspace(ops::sampling_workspace_capacity_bytes(kTokenDomain, 1, 1));
     const auto* config_ptr = static_cast<const ops::SamplingConfig*>(config.p);
     const auto* pos_ptr    = static_cast<const std::int32_t*>(pos.p);
 
@@ -218,7 +218,8 @@ void run_mtp(DeviceBuffer& logits, DeviceBuffer& counts, int k, Mode mode, bool 
     Tensor tnum(num.p, DType::I32, {1});
     Tensor taccepted(accepted.p, DType::I32, {1});
     Tensor tstats(stats.p, DType::I64, {kStats});
-    WorkspaceArena workspace(ops::sampling_workspace_bytes(kTokenDomain, k + 1));
+    WorkspaceArena workspace(
+        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(kTokenDomain, k, k));
     const auto* config_ptr = static_cast<const ops::SamplingConfig*>(config.p);
 
     const double bytes  = mode == Mode::Greedy ? static_cast<double>((k + 1) * 4 + k * 4)
@@ -257,9 +258,12 @@ int main(int argc, char** argv) {
                     "counts=%.3f MiB/col\n",
                     kPhysicalRows, kTokenDomain, static_cast<double>(kTokenDomain * 2) / 1048576.0,
                     static_cast<double>(kTokenDomain * 4) / 1048576.0);
-        std::printf("workspace: C=1 %.1f KiB, C=6 %.1f KiB\n",
-                    static_cast<double>(ops::sampling_workspace_bytes(kTokenDomain, 1)) / 1024.0,
-                    static_cast<double>(ops::sampling_workspace_bytes(kTokenDomain, 6)) / 1024.0);
+        std::printf(
+            "workspace: C=1 %.1f KiB, C=6 %.1f KiB\n",
+            static_cast<double>(ops::sampling_workspace_capacity_bytes(kTokenDomain, 1, 1)) /
+                1024.0,
+            static_cast<double>(ops::sampling_workspace_capacity_bytes(kTokenDomain, 6, 6)) /
+                1024.0);
         if (options.matrix) {
             run_sample(logits, counts, Mode::Greedy, false, 1);
             run_sample(logits, counts, Mode::Stochastic, false, 20);

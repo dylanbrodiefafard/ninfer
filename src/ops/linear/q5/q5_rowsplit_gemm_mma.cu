@@ -59,15 +59,11 @@ void launch_route(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t st
 
 } // namespace
 
-void launch_q5_mma_r64_c64(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
-                           cudaStream_t stream) {
-    (void)ws;
+void launch_q5_mma_r64_c64(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     launch_route<MmaR64C64Schedule>(x, w, out, stream);
 }
 
-void launch_q5_mma_r64_c128(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
-                            cudaStream_t stream) {
-    (void)ws;
+void launch_q5_mma_r64_c128(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     launch_route<MmaR64C128Schedule>(x, w, out, stream);
 }
 

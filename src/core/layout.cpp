@@ -107,11 +107,12 @@ Tensor WorkspaceLayoutBuilder::alloc(DType dtype, std::initializer_list<std::int
     return tensor;
 }
 
-void WorkspaceLayoutBuilder::alloc_bytes(std::size_t bytes, std::size_t alignment) {
-    if (bytes == 0) { return; }
+DeviceSpan WorkspaceLayoutBuilder::alloc_bytes(std::size_t bytes, std::size_t alignment) {
+    if (bytes == 0) { return {}; }
     cursor_ = align_up(cursor_, alignment, "workspace layout");
     cursor_ = checked_add(cursor_, bytes, "workspace layout");
     if (cursor_ > peak_) { peak_ = cursor_; }
+    return DeviceSpan{nullptr, bytes};
 }
 
 WorkspaceLayoutBuilder::Scope WorkspaceLayoutBuilder::scope() noexcept { return Scope(*this); }

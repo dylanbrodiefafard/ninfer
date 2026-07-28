@@ -10,12 +10,19 @@
 
 namespace ninfer::ops {
 
-// Maximum transient capacity required for any positive T <= max_tokens. This query does not cap T.
-[[nodiscard]] std::size_t gdn_gating_proj_workspace_bytes(std::int32_t max_tokens);
+// The geometry is the fixed implementation profile. Each query covers every T in the inclusive
+// interval; invalid profiles or intervals throw.
+[[nodiscard]] std::size_t gdn_gating_proj_workspace_capacity_bytes(std::int32_t heads,
+                                                                   std::int32_t input_rows,
+                                                                   std::int32_t min_tokens,
+                                                                   std::int32_t max_tokens);
 
-// Maximum transient capacity for the corresponding pre-normalized control Op. The query covers
-// every positive T <= max_tokens and does not make the optimized route part of the semantic API.
-[[nodiscard]] std::size_t gdn_norm_gating_proj_workspace_bytes(std::int32_t max_tokens);
+// Transient capacity for the corresponding pre-normalized control Op. The query follows the same
+// interval rules and does not make the optimized route part of the semantic API.
+[[nodiscard]] std::size_t gdn_norm_gating_proj_workspace_capacity_bytes(std::int32_t heads,
+                                                                        std::int32_t input_rows,
+                                                                        std::int32_t min_tokens,
+                                                                        std::int32_t max_tokens);
 
 /**
  * Fuses two BF16 projections with Gated DeltaNet gate preparation. For each h,t:

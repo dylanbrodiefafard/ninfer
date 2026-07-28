@@ -107,29 +107,23 @@ void dispatch_exact_cols(std::int32_t cols, Launch&& launch) {
 
 } // namespace
 
-void launch_q5_simt_r8_c4(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
-                          cudaStream_t stream) {
-    (void)ws;
+void launch_q5_simt_r8_c4(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     launch_simt_route<4>(x, w, out, stream);
 }
 
-void launch_q5_simt_r8_c8(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
-                          cudaStream_t stream) {
-    (void)ws;
+void launch_q5_simt_r8_c8(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     launch_simt_route<8>(x, w, out, stream);
 }
 
-void launch_q5_simt_split2_exact(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+void launch_q5_simt_split2_exact(const Tensor& x, const Weight& w, Tensor& out,
                                  cudaStream_t stream) {
-    (void)ws;
     dispatch_exact_cols(x.ne[1],
                         [&]<int Cols>() { dispatch_split2_cols<Cols>(x, w, out, stream); });
     CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_q5_simt_split4_exact(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+void launch_q5_simt_split4_exact(const Tensor& x, const Weight& w, Tensor& out,
                                  cudaStream_t stream) {
-    (void)ws;
     dispatch_exact_cols(x.ne[1], [&]<int Cols>() { launch_split4<Cols>(x, w, out, stream); });
     CUDA_CHECK(cudaGetLastError());
 }

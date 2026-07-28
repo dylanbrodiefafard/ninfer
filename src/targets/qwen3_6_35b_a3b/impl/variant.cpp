@@ -3,6 +3,7 @@
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/sparse_moe.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -32,10 +33,17 @@ graph_ranges_through(std::uint32_t max_frontier, const std::vector<std::uint32_t
 void run_sparse_moe(const Tensor& hidden, const ops::SparseMoeWeights& weights, Tensor& residual,
                     WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope               = workspace.scope();
-    const DeviceSpan storage = workspace.alloc_bytes(ops::sparse_moe_workspace_bytes(hidden.ne[1]));
+    const DeviceSpan storage = workspace.alloc_bytes(ops::sparse_moe_workspace_capacity_bytes(
+        weights.routed_gate_up.qtype, weights.routed_down.qtype, hidden.ne[1], hidden.ne[1]));
     WorkspaceArena leaf_workspace(storage);
     ops::sparse_moe(hidden, weights, ops::SparseMoeEpilogue::AddResidual, residual, leaf_workspace,
                     stream);
+}
+
+void validate_token_interval(std::int32_t first, std::int32_t last) {
+    if (first <= 0 || last < first) {
+        throw std::invalid_argument("invalid target leaf token interval");
+    }
 }
 
 } // namespace
@@ -92,18 +100,15 @@ std::vector<GraphFrontierRange> Variant::dflash_graph_ranges(std::uint32_t capac
 
 void Variant::attention_projection(const Tensor& hidden,
                                    const FullAttentionProjectionWeights& weights, Tensor& query,
-                                   Tensor& gate, Tensor& key, Tensor& value,
-                                   WorkspaceArena& workspace, cudaStream_t stream) {
-    ops::attn_input_proj(hidden, weights.query_key_gate_value, query, gate, key, value, workspace,
-                         stream);
+                                   Tensor& gate, Tensor& key, Tensor& value, cudaStream_t stream) {
+    ops::attn_input_proj(hidden, weights.query_key_gate_value, query, gate, key, value, stream);
 }
 
 void Variant::mtp_attention_projection(const Tensor& hidden,
                                        const MtpAttentionProjectionWeights& weights, Tensor& query,
                                        Tensor& gate, Tensor& key, Tensor& value,
                                        WorkspaceArena& workspace, cudaStream_t stream) {
-    ops::attn_input_proj(hidden, weights.query_key_gate_value, query, gate, key, value, workspace,
-                         stream);
+    ops::attn_input_proj(hidden, weights.query_key_gate_value, query, gate, key, value, stream);
 }
 
 void Variant::mtp_kv_projection(const Tensor& hidden, const MtpAttentionProjectionWeights& weights,
@@ -113,8 +118,7 @@ void Variant::mtp_kv_projection(const Tensor& hidden, const MtpAttentionProjecti
     const int cols = hidden.ne[1];
     Tensor query   = workspace.alloc(DType::BF16, {TextConfig::query_size, cols});
     Tensor gate    = workspace.alloc(DType::BF16, {TextConfig::query_size, cols});
-    ops::attn_input_proj(hidden, weights.query_key_gate_value, query, gate, key, value, workspace,
-                         stream);
+    ops::attn_input_proj(hidden, weights.query_key_gate_value, query, gate, key, value, stream);
 }
 
 void Variant::mtp_q_gate_projection(const Tensor& hidden,
@@ -124,17 +128,14 @@ void Variant::mtp_q_gate_projection(const Tensor& hidden,
     const int cols = hidden.ne[1];
     Tensor key     = workspace.alloc(DType::BF16, {TextConfig::kv_size, cols});
     Tensor value   = workspace.alloc(DType::BF16, {TextConfig::kv_size, cols});
-    ops::attn_input_proj(hidden, weights.query_key_gate_value, query, gate, key, value, workspace,
-                         stream);
+    ops::attn_input_proj(hidden, weights.query_key_gate_value, query, gate, key, value, stream);
 }
 
 void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
-                                   Tensor& qkv, Tensor& output_gate, WorkspaceArena& workspace,
-                                   cudaStream_t stream) {
+                                   Tensor& qkv, Tensor& output_gate, cudaStream_t stream) {
     Tensor output_gate_flat =
         output_gate.view({TextConfig::value_dim, static_cast<int>(hidden.ne[1])});
-    ops::gdn_input_proj(hidden, weights.query_key_value_z, qkv, output_gate_flat, workspace,
-                        stream);
+    ops::gdn_input_proj(hidden, weights.query_key_value_z, qkv, output_gate_flat, stream);
 }
 
 void Variant::gdn_input_projection_snapshot(const Tensor& hidden,
@@ -159,7 +160,7 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
 }
 
 void Variant::gdn_output_gate_projection(const Tensor&, const GdnProjectionWeights&, Tensor&,
-                                         WorkspaceArena&, cudaStream_t) {}
+                                         cudaStream_t) {}
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          WorkspaceArena& workspace, cudaStream_t stream) {
@@ -171,44 +172,53 @@ void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& we
     run_sparse_moe(hidden, weights.op, residual, workspace, stream);
 }
 
-std::size_t Variant::mtp_attention_workspace_bytes(std::int32_t) { return 0; }
+std::size_t Variant::mtp_attention_projection_workspace_capacity_bytes(std::int32_t first,
+                                                                       std::int32_t last) {
+    validate_token_interval(first, last);
+    return 0;
+}
 
-std::size_t Variant::mtp_kv_workspace_bytes(std::int32_t tokens) {
+std::size_t Variant::mtp_kv_projection_workspace_capacity_bytes(std::int32_t first,
+                                                                std::int32_t last) {
+    validate_token_interval(first, last);
     WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::BF16, {TextConfig::query_size, tokens});
-    (void)layout.alloc(DType::BF16, {TextConfig::query_size, tokens});
-    return layout.peak_bytes();
+    (void)layout.alloc(DType::BF16, {TextConfig::query_size, last});
+    (void)layout.alloc(DType::BF16, {TextConfig::query_size, last});
+    return layout.peak_bytes(1);
 }
 
-std::size_t Variant::mtp_q_gate_workspace_bytes(std::int32_t tokens) {
+std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t first,
+                                                                    std::int32_t last) {
+    validate_token_interval(first, last);
     WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::BF16, {TextConfig::kv_size, tokens});
-    (void)layout.alloc(DType::BF16, {TextConfig::kv_size, tokens});
-    return layout.peak_bytes();
+    (void)layout.alloc(DType::BF16, {TextConfig::kv_size, last});
+    (void)layout.alloc(DType::BF16, {TextConfig::kv_size, last});
+    return layout.peak_bytes(1);
 }
 
-std::size_t Variant::gdn_input_projection_workspace_bytes(std::int32_t tokens) {
-    return ops::gdn_input_proj_workspace_bytes(TextConfig::convolution_dim, TextConfig::value_dim,
-                                               tokens);
+std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(std::int32_t first,
+                                                                            std::int32_t last) {
+    return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+        TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, first, last);
 }
 
-std::size_t Variant::gdn_input_projection_snapshot_workspace_bytes(std::int32_t tokens) {
-    return ops::gdn_input_proj_conv_snapshot_workspace_bytes(
-        TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, tokens);
+std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(std::int32_t first,
+                                                                          std::int32_t last) {
+    return ops::gdn_norm_gating_proj_workspace_capacity_bytes(TextConfig::gdn_value_heads,
+                                                              TextConfig::hidden, first, last);
 }
 
-std::size_t Variant::gdn_norm_control_projection_workspace_bytes(std::int32_t tokens) {
-    return ops::gdn_norm_gating_proj_workspace_bytes(tokens);
+std::size_t Variant::post_mixer_workspace_capacity_bytes(std::int32_t first, std::int32_t last) {
+    return std::max(
+        ops::sparse_moe_workspace_capacity_bytes(QType::Q4G64_F16S, QType::Q5G64_F16S, first, last),
+        ops::sparse_moe_workspace_capacity_bytes(QType::Q4G64_F16S, QType::Q6G64_F16S, first,
+                                                 last));
 }
 
-std::size_t Variant::gdn_output_gate_projection_workspace_bytes(std::int32_t) { return 0; }
-
-std::size_t Variant::post_mixer_workspace_bytes(std::int32_t tokens) {
-    return ops::sparse_moe_workspace_bytes(tokens);
-}
-
-std::size_t Variant::mtp_post_mixer_workspace_bytes(std::int32_t tokens) {
-    return ops::sparse_moe_workspace_bytes(tokens);
+std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
+                                                             std::int32_t last) {
+    return ops::sparse_moe_workspace_capacity_bytes(QType::W8G32_F16S, QType::W8G32_F16S, first,
+                                                    last);
 }
 
 } // namespace ninfer::targets::qwen3_6_35b_a3b::detail

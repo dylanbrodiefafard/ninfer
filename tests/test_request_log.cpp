@@ -64,12 +64,14 @@ int main() {
     load.resource_count       = 6;
 
     ninfer::MemorySummary memory;
-    memory.max_context              = 262144;
-    memory.kv_cache                 = ninfer::KvCacheStorage::Int8Group64;
-    memory.weights.capacity_bytes   = 100;
-    memory.sequence.capacity_bytes  = 200;
-    memory.workspace.capacity_bytes = 300;
-    memory.kv_payload_bytes         = 400;
+    memory.max_context                = 262144;
+    memory.kv_cache                   = ninfer::KvCacheStorage::Int8Group64;
+    memory.weights.capacity_bytes     = 100;
+    memory.sequence.capacity_bytes    = 200;
+    memory.workspace.capacity_bytes   = 300;
+    memory.request_transient          = {500, 0, 450};
+    memory.cuda_graph_allowance_bytes = 600;
+    memory.kv_payload_bytes           = 400;
 
     ServerLogEnvironment environment;
     environment.device                    = 0;
@@ -86,8 +88,7 @@ int main() {
         "serve-test", 1000, options, load, memory, environment, std::uint64_t{123456}));
     failures += check(server.at("artifact_type") == kRequestLogArtifactType,
                       "server record artifact type mismatch");
-    failures += check(server.at("schema_version") == kRequestLogSchemaVersion,
-                      "server record schema mismatch");
+    failures += check(server.at("schema_version") == 3, "server record schema mismatch");
     failures += check(server.at("event") == "server_start", "server event mismatch");
     failures += check(server.at("artifact").at("target") == "qwen3_6_27b", "server target missing");
     failures += check(server.at("artifact").at("size_bytes") == 123456, "artifact size missing");
@@ -104,6 +105,11 @@ int main() {
         check(server.at("engine").at("prefix_reuse") == false, "prefix-reuse state missing");
     failures += check(server.at("environment").at("gpu_name") == "NVIDIA GeForce RTX 5090",
                       "GPU name missing");
+    failures += check(server.at("memory").at("request_transient").at("capacity_bytes") == 500 &&
+                          server.at("memory").at("request_transient").at("peak_used_bytes") == 450,
+                      "request transient memory missing");
+    failures += check(server.at("memory").at("cuda_graph_allowance_bytes") == 600,
+                      "CUDA Graph allowance missing");
     failures += check(server.dump().find("must-not-appear") == std::string::npos,
                       "server JSON leaked the API key");
     failures += check(server.at("argv").at(3) == "<redacted>",

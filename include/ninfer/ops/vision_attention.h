@@ -8,15 +8,14 @@
 namespace ninfer::ops {
 
 /**
- * Returns the descriptor upper bound
- *
- *   M(P,S) = S==1 ? 0 : ceil(P/64) + S - 1
- *
- * for positive patch and segment counts. Each descriptor occupies four contiguous I32 elements.
- * The query allocates no workspace and has no side effects.
+ * Returns the caller-owned transient capacity for every legal patch/segment pair in the supplied
+ * inclusive envelope. A pair is legal when 1 <= segments <= patches. An envelope with no legal
+ * pair throws; a legal uniform single-segment envelope returns zero.
  */
-[[nodiscard]] std::int32_t vision_attention_scratch_tiles(std::int32_t patches,
-                                                          std::int32_t segments);
+[[nodiscard]] std::size_t vision_attention_workspace_capacity_bytes(std::int32_t min_patches,
+                                                                    std::int32_t max_patches,
+                                                                    std::int32_t min_segments,
+                                                                    std::int32_t max_segments);
 
 /**
  * Packed, non-causal multi-head attention. For each segment [begin,end), head h, and
@@ -32,17 +31,8 @@ namespace ninfer::ops {
  * storage rounding belongs to the Op's numerical criterion, not the oracle. Inputs and output are
  * mutually non-overlapping.
  *
- * For S=1, scratch_tiles is null (or has null data). Otherwise it points to distinct contiguous
- * I32 [4,M] storage with M>=vision_attention_scratch_tiles(P,S); the descriptors are opaque and
- * overwritten by the Op. There is no persistent state side effect.
- */
-void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& cu_seqlens,
-                      Tensor* scratch_tiles, Tensor& out, cudaStream_t stream);
-
-/**
- * Arena overload with the same mathematical, shape, layout, and alias contract. It allocates the
- * required opaque tile descriptors from `workspace` for the duration of the call; no capacity is
- * consumed for a single segment.
+ * The Op allocates required opaque tile descriptors from `workspace` for the duration of the call;
+ * no capacity is consumed for a single segment. There is no persistent state side effect.
  */
 void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& cu_seqlens,
                       WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);

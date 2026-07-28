@@ -213,7 +213,9 @@ int main(int argc, char** argv) {
                 require_cuda(cudaDeviceSynchronize(), "profile post-boundary synchronize");
                 require_cuda(cudaProfilerStop(), "cudaProfilerStop");
             }
-            result.workspace_peak_bytes = engine.memory_summary().workspace.peak_used_bytes;
+            const ninfer::MemorySummary memory    = engine.memory_summary();
+            result.workspace_peak_bytes           = memory.workspace_logical_peak_bytes;
+            result.workspace_allocator_peak_bytes = memory.workspace.peak_used_bytes;
             results.push_back(std::move(result));
         }
 

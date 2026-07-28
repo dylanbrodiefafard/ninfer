@@ -80,34 +80,13 @@ shortlist weight 和 token-id map，但不加载 MTP layer weights 或 MTP KV/st
 最终确认 licensed token prefix 前不写DFlash context；因此partial-terminal truncation不需要
 per-round cyclic-cache undo。
 
-## 2. 当前实现基础与缺口
+## 2. 当前实现
 
-当前代码已经具备以下可复用基础：
-
-- `SpeculativeRoundState` 的公共几何支持 `K=15`；
-- `speculative_prepare_verify_inputs`、target verify、
-  `speculative_accept_greedy_drafts` 和 accepted-hidden selection 已经与 MTP proposal
-  schedule 分离；
-- target causal verification 和 GDN snapshot publication 已覆盖 `A=0..15`；
-- Program 已有 `PendingKind::Speculative`、host licensed-token publication、
-  `resolve_pending` 和 speculative statistics；
-- Text layer runner 已有编译期 Tap 接口，并在每层 post-MLP residual 处提供
-  `AfterMlp` 观察点；
-- 35B artifact binder 已验证并可条件物化 DFlash 权重。
-
-仍缺少的引擎能力是：
-
-1. public option 仍把非零 `draft_tokens` 等同于 MTP；
-2. 35B `plan_load` 仍固定 `dflash=false`；
-3. Program 只接收 ordinary/MTP family model view，没有可执行的 DFlash view；
-4. persistent layout 只有 target/MTP state，没有六层 DFlash cache和boundary snapshot；
-5. workspace planner 不包含 target-feature capture 和六层 proposal route；
-6. production Text schedule 使用 `NullTap`，diagnostic tap 不能作为 Graph-safe feature
-   capture；
-7. speculative controller、graph vectors 和 frontier 字段仍带有 MTP 专属所有权；
-8. prefix restore 尚不知道 DFlash local cyclic cache。
-
-这些都是集成工作，不要求增加新的 proposal 数学 Op。
+当前 35B-A3B target 已完整接入 DFlash：public option、条件物化、六层 model view、
+persistent/local/boundary cache、Graph-safe target feature capture、proposal/context workspace
+phase、backend-neutral speculative controller、CUDA Graph frontier 和 prefix restore 均走同一
+Qwen3.6 family Program。Target feature/position 是跨 phase retained state，不属于 scratch；
+proposal 和 context temporaries 由启动时冻结的 named workspace phases 覆盖。
 
 ## 3. Public option 与启动配置
 
@@ -411,31 +390,32 @@ diagnostic tap 与 production feature sink 可以在测试构建中组合，但 
 
 ### 7.3 Shape 和生命周期
 
-Feature workspace 的最大形状是：
+Retained target feature state 的最大形状是：
 
 ```text
-[16384,prefill_chunk]
+[16384,min(prefill_chunk,max_context)]
 ```
 
 默认 `prefill_chunk=1024` 时为 32 MiB。Target verify 使用同一地址的
 `[16384,K+1]` view，最大只占 512 KiB。每个 target prefill chunk 或 verify call 的
 feature 必须在该地址被下一次覆盖前完成 DFlash context construction。
 
-该 buffer 不能是 `target_verify` 结束时随 `work_.reset()` 失效、随后被 sampling workspace
-覆盖的普通临时 allocation。DFlash mode 的 workspace 应显式分为：
+该 buffer 不能是 `target_verify` 结束时随 `work.reset()` 失效、随后被 sampling
+workspace 覆盖的普通临时 allocation。当前实现将跨阶段数据归入 sequence persistent：
 
 ```text
-round-live fixed regions
+sequence persistent
 ├── target feature capture
 ├── pending target positions/count
 └── graph-stable proposal tensors
 
-operator scratch subarena
-└── 可以在每个Op或stage后reset
+Program workspace
+└── 单阶段纯 scratch，可在每个 Op 或 stage 后复用
 ```
 
-两部分来自同一个预规划 workspace allocation，但拥有不同 reset 边界。CUDA Graph capture
-使用固定 region offsets，不依赖一次调用碰巧相同的动态 allocation 顺序。
+二者是独立的启动期 allocation。DFlash 不再切分 fixed-workspace 前缀；CUDA Graph
+capture 使用 Program scratch 的固定地址，而 retained feature/position 始终由 persistent
+layout 拥有。
 
 ## 8. DFlash context construction
 
@@ -757,11 +737,10 @@ decode graph。
 
 Full cache 在 `max_context=262144` 时为 1 GiB；在 2048 时为 8 MiB。
 
-### 15.2 Workspace additions
+### 15.2 Workspace composition
 
-至少包含：
+Program scratch phase 包含：
 
-- target features `[16384,prefill_chunk]`，默认最大 32 MiB；
 - normalized context `[2048,prefill_chunk]`；
 - per-layer context K/V candidates；
 - masked block hidden `[2048,B]`；
@@ -774,22 +753,29 @@ Shared RoundState 中已有的 `io.logits [248320,K+1]` 服务 target verify；f
 proposal 也复用它。`K=15` 时约 7.6 MiB，属于 persistent round state。optimized route
 只额外规划 3.75 MiB contiguous shortlist logits，不重复分配 full-vocabulary logits。
 
-Workspace planner先保留跨 stage 存活的 round-live fixed regions，再对各互斥 operator
-scratch stage 取峰值。它不把 prefill、target verify、DFlash proposal、decision 和
-Vision/MTP-exclusive scratch 机械求和。
+Target features `[16384,C]` 和 positions `[C]`（
+`C=min(prefill_chunk,max_context)`）由 sequence persistent layout 保留，不计入 Program
+scratch。Family planner 分别计算 DFlash context、proposal 和 round phase，并对互斥
+phase 及 scoped Op scratch 取峰值。它不把 prefill、target verify、DFlash proposal、
+decision 和 Vision/MTP-exclusive scratch 机械求和。
 
 ### 15.3 Memory summary
 
-建议：
+当前字段语义为：
 
-- DFlash weights计入 weight arena；
-- active DFlash K/V和boundary K/V snapshot计入 sequence arena；
+- DFlash weights 计入 weight arena；
+- active DFlash K/V、boundary K/V snapshot 和 retained target feature/position 计入
+  sequence arena；
 - `kv_payload_bytes` 包含 target KV、active DFlash K/V和boundary K/V snapshot，并在文档中
   明确它表示全部持久 attention cache payload；
-- frontier/control计入 sequence，但不伪装成 model KV；
-- feature/proposal temporaries计入 workspace。
+- frontier/control 计入 sequence，但不伪装成 model KV；
+- proposal/context temporaries 计入纯 Program workspace；
+- `workspace_logical_peak_bytes` 报告请求到达过的 planned phase envelope 峰值，包括
+  Graph replay；它是保守的 phase-capacity telemetry，不是 kernel 逐 allocation 追踪；
+- CUDA Graph allowance 作为独立字段，不伪装成 Arena capacity。
 
-最终字段语义需与 CLI/server memory report 同步，不能只修改内部容量。
+启动事件只报告冻结的 arena capacity、request transient 和 Graph allowance；动态 logical
+peak 由请求后的 `MemorySummary` 以及 benchmark 的 per-test `workspace_peak_bytes` 报告。
 
 ## 16. Controller 和统计
 

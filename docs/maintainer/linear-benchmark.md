@@ -9,7 +9,7 @@
 benchmark 只测量：
 
 ```text
-ninfer::ops::linear(x, w, out, policy, workspace, stream)
+ninfer::ops::linear(x, w, out, policy, stream)
 ```
 
 Q4/Q5/Q6/W8 LinearAdd、LinearSwiGLU、LinearPair 和其他 fused Ops 不属于这个
@@ -205,7 +205,6 @@ group points by (qtype, policy, N, K)
  v
 allocate and initialize one packed weight
 allocate x/out for max T in the group
-create one WorkspaceArena
  |
  v
 for each T:

@@ -174,7 +174,9 @@ MemorySummary Engine::memory_summary() const {
     return std::visit(
         [](const auto& target_ptr) {
             if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            return target_ptr->program->memory_summary();
+            MemorySummary out     = target_ptr->program->memory_summary();
+            out.request_transient = target_ptr->request_memory.summary();
+            return out;
         },
         impl_->active);
 }
@@ -187,7 +189,10 @@ void Engine::reset_memory_peaks() noexcept {
     } catch (...) { return; }
     std::visit(
         [](auto& target_ptr) {
-            if (target_ptr != nullptr) { target_ptr->program->reset_memory_peaks(); }
+            if (target_ptr != nullptr) {
+                target_ptr->program->reset_memory_peaks();
+                target_ptr->request_memory.reset_peak();
+            }
         },
         impl_->active);
 }

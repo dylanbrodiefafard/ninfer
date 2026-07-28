@@ -402,6 +402,9 @@ cmake --build build --parallel \
 
 The reported `target_side_effective_tok_s` is `(A+1)/target-side latency`. It deliberately excludes
 proposal generation and dFlash-specific context maintenance and is not an end-to-end speed claim.
+`program_workspace_capacity_bytes` is the frozen capacity of the complete DFlash Program plan used
+to supply the benchmark's shared arena; it is not a target-round scratch measurement and does not
+change the timed scope.
 
 ## 35B complete DFlash round benchmark
 
@@ -499,13 +502,18 @@ test shapes exercise the scalar fallbacks.
 
 Table, JSON, and CSV reports all identify the selected target, artifact, Engine configuration,
 load summary, memory capacity, KV payload, workspace peak, phase throughput, and speculative
-statistics. JSON schema version 8 records the public value objects directly:
+statistics. JSON schema version 9 records the public value objects directly:
 
 - `load`: target, load/upload time, file/H2D/staging bytes, tensor count, and resource count;
-- `memory`: weights/sequence/workspace arenas, planned context, KV storage, and KV payload;
+- `memory`: weights/sequence/workspace/request-transient arenas, planned context, KV storage,
+  CUDA Graph allowance, and KV payload;
 - each repetition's `timings`: prepare, Vision, prefill, decode, and total seconds;
 - each repetition's `speculative`: window, rounds, drafted/accepted tokens, fallbacks, and per-position
 acceptance.
+
+Each test reports `workspace_peak_bytes` from the planned phase markers, including CUDA Graph
+replay, and `workspace_allocator_peak_bytes` from host-side arena allocation activity. These are
+intentionally separate: replay reuses captured addresses without advancing the host allocator.
 
 `decode_output_tok_s` counts the requested `G` decode outputs. `decode_engine_tok_s` uses the
 Program's speculative round statistics, so it also describes work performed by a final partially

@@ -33,7 +33,6 @@ struct W8LinearSwiGluProblem {
 
 struct W8LinearSwiGluPlan {
     W8LinearSwiGluScheduleId schedule;
-    std::size_t workspace_bytes;
 };
 
 const char* w8_linear_swiglu_schedule_name(W8LinearSwiGluScheduleId schedule) noexcept;

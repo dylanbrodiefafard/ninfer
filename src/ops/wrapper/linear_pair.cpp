@@ -89,7 +89,7 @@ void require_nonoverlap(const Tensor& x, const Weight& first_weight, const Weigh
 } // namespace
 
 void linear_pair(const Tensor& x, const Weight& first_weight, const Weight& second_weight,
-                 Tensor& first_out, Tensor& second_out, WorkspaceArena& ws, cudaStream_t stream) {
+                 Tensor& first_out, Tensor& second_out, cudaStream_t stream) {
     const std::int32_t cols = x.ne[1];
     if (x.ne[0] != 5120 && x.ne[0] != 2048) {
         throw std::invalid_argument("linear_pair: x K must be 5120 or 2048");
@@ -101,7 +101,6 @@ void linear_pair(const Tensor& x, const Weight& first_weight, const Weight& seco
     require_weight(second_weight, x.ne[0], "second weight");
     require_nonoverlap(x, first_weight, second_weight, first_out, second_out);
 
-    (void)ws;
     detail::w8_pair_dispatch(x, first_weight, second_weight, first_out, second_out, stream);
 }
 

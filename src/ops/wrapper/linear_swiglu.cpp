@@ -15,13 +15,24 @@ bool aligned_to(const void* pointer, std::uintptr_t alignment) {
 
 } // namespace
 
-std::size_t linear_swiglu_workspace_bytes(std::int32_t gate_up_rows, std::int32_t max_tokens) {
-    if (gate_up_rows == 12288) {
-        (void)detail::w8_linear_swiglu_resolve_plan({12288, 6144, 2048, 2048, max_tokens});
+std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
+                                                   std::int32_t input_rows, std::int32_t min_tokens,
+                                                   std::int32_t max_tokens) {
+    if (min_tokens <= 0 || max_tokens < min_tokens || (gate_up_rows % 2) != 0) {
+        throw std::invalid_argument("linear_swiglu workspace: invalid profile or token interval");
+    }
+    if (qtype == QType::W8G32_F16S) {
+        (void)detail::w8_linear_swiglu_resolve_plan(
+            {gate_up_rows, gate_up_rows / 2, input_rows, input_rows, min_tokens});
+        (void)detail::w8_linear_swiglu_resolve_plan(
+            {gate_up_rows, gate_up_rows / 2, input_rows, input_rows, max_tokens});
         return 0;
     }
-    return detail::q4_linear_swiglu_capacity_workspace_bytes(gate_up_rows, gate_up_rows / 2, 5120,
-                                                             5120, max_tokens);
+    if (qtype != QType::Q4G64_F16S) {
+        throw std::invalid_argument("linear_swiglu workspace: unsupported weight format");
+    }
+    return detail::q4_linear_swiglu_capacity_workspace_bytes(
+        gate_up_rows, gate_up_rows / 2, input_rows, input_rows, min_tokens, max_tokens);
 }
 
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,

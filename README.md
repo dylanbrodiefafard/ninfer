@@ -143,9 +143,10 @@ Transformers checkpoint, Safetensors distribution, or GGUF file.
 
 The artifact is complete, while GPU residency is fixed at process startup. Speculative decoding is
 disabled by default, so MTP/DFlash state and the optimized proposal head are not uploaded.
-Vision is also disabled by default, so its weights and workspace are omitted. Add `--vision` to the
-CLI or server process that must accept image or video input. Disabled capabilities cannot be
-enabled by a later request. DFlash is available only for the 35B-A3B target and is text-only.
+Vision is also disabled by default, so its weights, Vision scratch phase, and frozen
+request-transient allocation are omitted. Add `--vision` to the CLI or server process that must
+accept image or video input. Disabled capabilities cannot be enabled by a later request. DFlash is
+available only for the 35B-A3B target and is text-only.
 
 ## Run the CLI
 

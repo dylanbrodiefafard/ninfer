@@ -3,6 +3,7 @@
 #include "core/layout.h"
 #include "ops/launcher/bidirectional_gqa_attention.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -67,7 +68,8 @@ struct PartialWorkspace {
     Tensor l;
 };
 
-PartialWorkspace allocate_workspace(WorkspaceArena& workspace, std::int32_t tokens,
+template <class Allocator>
+PartialWorkspace allocate_workspace(Allocator& workspace, std::int32_t tokens,
                                     std::int32_t splits) {
     return {
         workspace.alloc(DType::BF16, {kHeadDim, kQHeads, tokens, splits}),
@@ -78,17 +80,26 @@ PartialWorkspace allocate_workspace(WorkspaceArena& workspace, std::int32_t toke
 
 } // namespace
 
-std::size_t bidirectional_gqa_attention_workspace_bytes(std::int32_t tokens) {
-    if (tokens < 1 || tokens > 16) { return 0; }
-    const auto plan = detail::bidirectional_gqa_resolve_plan(
-        tokens, GqaContextExecutionEnvelope{1, std::numeric_limits<std::int32_t>::max()});
-    const Tensor acc(nullptr, DType::BF16, {kHeadDim, kQHeads, tokens, plan.split_capacity});
-    const Tensor stat(nullptr, DType::FP32, {kQHeads, tokens, plan.split_capacity});
-    LayoutBuilder layout;
-    (void)layout.add(acc.bytes(), 256, "bidirectional GQA partial numerator");
-    (void)layout.add(stat.bytes(), 256, "bidirectional GQA partial max");
-    (void)layout.add(stat.bytes(), 256, "bidirectional GQA partial sum");
-    return layout.finish(256, "bidirectional GQA workspace");
+std::size_t bidirectional_gqa_attention_workspace_capacity_bytes(
+    GqaContextExecutionEnvelope envelope, std::int32_t min_tokens, std::int32_t max_tokens) {
+    if (min_tokens < 1 || max_tokens < min_tokens || max_tokens > 16 ||
+        envelope.min_context > envelope.max_context ||
+        envelope.max_context >
+            static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::invalid_argument(
+            "bidirectional_gqa_attention workspace: invalid envelope or token interval");
+    }
+    const auto endpoint_capacity = [&](std::int32_t tokens) {
+        const auto plan = detail::bidirectional_gqa_resolve_plan(tokens, envelope);
+        WorkspaceLayoutBuilder layout;
+        (void)allocate_workspace(layout, tokens, plan.split_capacity);
+        return layout.peak_bytes(1);
+    };
+
+    std::size_t maximum = 0;
+    if (min_tokens <= 8) { maximum = endpoint_capacity(std::min(max_tokens, 8)); }
+    if (max_tokens >= 9) { maximum = std::max(maximum, endpoint_capacity(max_tokens)); }
+    return maximum;
 }
 
 void bidirectional_gqa_attention(const Tensor& q, const Tensor& query_k, const Tensor& query_v,

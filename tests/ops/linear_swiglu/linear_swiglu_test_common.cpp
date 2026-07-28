@@ -248,11 +248,12 @@ int run_profile(std::string_view label, const Profile& profile,
     device_activation.copy_from_host(host_activation.data(),
                                      host_activation.size() * sizeof(std::uint16_t));
 
-    const std::size_t workspace_bytes =
-        ops::linear_swiglu_workspace_bytes(profile.gate_up_rows, maximum_tokens);
+    const std::size_t workspace_bytes = ops::linear_swiglu_workspace_capacity_bytes(
+        profile.qtype, profile.gate_up_rows, profile.input_rows, 1, maximum_tokens);
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
 
-    int failures = 0;
+    int failures              = 0;
+    std::size_t executed_peak = 0;
     for (const std::int32_t tokens : token_cases) {
         const std::size_t output_elements =
             checked_elements(profile.output_rows, tokens, "output size");
@@ -262,6 +263,7 @@ int run_profile(std::string_view label, const Profile& profile,
         Tensor x(device_activation.data(), DType::BF16, {profile.input_rows, tokens});
         Tensor destination(output.data(), DType::BF16, {profile.output_rows, tokens});
         workspace.reset();
+        workspace.reset_peak();
         const std::string case_label = std::string(label) + " T=" + std::to_string(tokens);
         try {
             ops::linear_swiglu(x, weight, destination, workspace, nullptr);
@@ -271,11 +273,22 @@ int run_profile(std::string_view label, const Profile& profile,
             ++failures;
             continue;
         }
+        const std::size_t exact_workspace = ops::linear_swiglu_workspace_capacity_bytes(
+            profile.qtype, profile.gate_up_rows, profile.input_rows, tokens, tokens);
+        if (workspace.used() != 0 || workspace.peak_used() != exact_workspace) {
+            std::cerr << case_label << ": exact workspace query/execution high-water mismatch\n";
+            ++failures;
+        }
+        executed_peak = std::max(executed_peak, workspace.peak_used());
 
         failures += output.verify_guards(case_label);
         const std::vector<double> actual = read_bf16_output(output, output_elements);
         failures +=
             compare_output(case_label, actual, reference.data(), profile.activation_compute);
+    }
+    if (executed_peak != workspace_bytes) {
+        std::cerr << label << ": interval workspace capacity has no executed high-water witness\n";
+        ++failures;
     }
 
     failures += device_activation.verify_guards(std::string(label) + " activation");

@@ -143,17 +143,19 @@ int run(const Options& options) {
     auto frontend = target::Package::make_frontend(*model);
     auto prompt   = frontend.prepare_tokens(seed, false);
 
-    auto sequence = target::Package::plan_sequence(device, engine);
-    auto program  = target::Package::create_program(*model, std::move(sequence), device);
-    ninfer::runtime::RequestMemory request_memory(device);
+    auto sequence                      = target::Package::plan_sequence(device, engine);
+    const std::size_t request_capacity = sequence.request_transient_capacity_bytes();
+    auto program = target::Package::create_program(*model, std::move(sequence), device);
+    ninfer::runtime::RequestMemory request_memory(device, request_capacity);
     ninfer::ExecutionOptions execution;
     execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);
     execution.allow_prefix_reuse      = false;
     auto request_plan                 = program->plan_request(prompt, execution);
-    request_memory.ensure(request_plan.summary().transient_bytes,
-                          request_plan.summary().transient_alignment);
+    request_memory.activate(request_plan.summary().transient_bytes,
+                            request_plan.summary().transient_alignment);
     auto first =
         program->begin(std::move(prompt), std::move(request_plan), request_memory.region());
+    request_memory.deactivate();
     program->resolve_pending(static_cast<std::uint32_t>(first.round.tokens.size()), false);
 
     const std::uint64_t rounds_before = program->speculative_stats().rounds;

@@ -197,12 +197,12 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_weig
     Tensor conv(device_conv_weight.p, DType::BF16, {kChannels, 4});
     Tensor conv_state(state.data(), DType::BF16, {kChannels, 3, slots});
     Tensor initial(device_initial.p, DType::I32, {1});
-    Tensor q = query.tensor();
-    Tensor k = key.tensor();
-    Tensor v = value.tensor();
-    WorkspaceArena workspace(
-        std::max<std::size_t>(1, ops::gdn_input_proj_conv_snapshot_workspace_bytes(
-                                     kQueryRows, kKeyRows, kValueRows, tokens)));
+    Tensor q                          = query.tensor();
+    Tensor k                          = key.tensor();
+    Tensor v                          = value.tensor();
+    const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+        kQueryRows, kKeyRows, kValueRows, tokens, tokens);
+    WorkspaceArena workspace(std::max<std::size_t>(1, workspace_bytes));
 
     ops::gdn_input_proj_conv_snapshot(x, query_key.view(), value_weight.view(), conv, conv_state,
                                       initial, q, k, v, workspace, nullptr);
@@ -237,6 +237,10 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_weig
     failures += verify_preserved("snapshot initial slot" + suffix, device_initial, initial_value);
     failures += query_key.verify_preserved("snapshot query/key weight" + suffix);
     failures += value_weight.verify_preserved("snapshot value weight" + suffix);
+    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+        std::cerr << "snapshot" << suffix << ": workspace query/execution high-water mismatch\n";
+        ++failures;
+    }
     return failures;
 }
 
@@ -282,13 +286,13 @@ int run_w8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t in
     Tensor conv(device_conv_weight.p, DType::BF16, {kChannels, 4});
     Tensor conv_state(state.data(), DType::BF16, {kChannels, 3, slots});
     Tensor initial(device_initial.p, DType::I32, {1});
-    Tensor q        = query.tensor();
-    Tensor k        = key.tensor();
-    Tensor v        = value.tensor();
-    Tensor z_output = z.tensor();
-    WorkspaceArena workspace(
-        std::max<std::size_t>(1, ops::gdn_input_proj_conv_snapshot_workspace_bytes(
-                                     kQueryRows, kKeyRows, kValueRows, tokens)));
+    Tensor q                          = query.tensor();
+    Tensor k                          = key.tensor();
+    Tensor v                          = value.tensor();
+    Tensor z_output                   = z.tensor();
+    const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+        kQueryRows, kKeyRows, kValueRows, tokens, tokens);
+    WorkspaceArena workspace(std::max<std::size_t>(1, workspace_bytes));
 
     ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, conv_state, initial, q, k, v,
                                       z_output, workspace, nullptr);
@@ -324,6 +328,10 @@ int run_w8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t in
         verify_preserved("snapshot conv weight" + suffix, device_conv_weight, conv_weight_bits);
     failures += verify_preserved("snapshot initial slot" + suffix, device_initial, initial_value);
     failures += parent.verify_preserved("snapshot parent weight" + suffix);
+    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+        std::cerr << "snapshot" << suffix << ": workspace query/execution high-water mismatch\n";
+        ++failures;
+    }
     return failures;
 }
 
@@ -349,6 +357,22 @@ int main() {
     }
 
     int failures = 0;
+    const std::size_t q4_interval =
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 1, 6);
+    const std::size_t q4_witness =
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 4, 4);
+    const std::size_t q4_right_endpoint =
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 6, 6);
+    if (q4_interval != q4_witness || q4_witness == 0 || q4_right_endpoint != 0) {
+        std::cerr << "Q4/Q5 snapshot interval did not retain its non-monotonic T=4 route\n";
+        ++failures;
+    }
+    if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 16) != 0 ||
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 17) !=
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 17, 17)) {
+        std::cerr << "W8 snapshot interval did not preserve its zero/nonzero route boundary\n";
+        ++failures;
+    }
     failures += run_q4_q5();
     failures += run_w8();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_snapshot\n";

@@ -558,7 +558,9 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << format_bytes(env.load.peak_staging_bytes) << '\n'
         << "  memory:     weights " << format_bytes(env.memory.weights.capacity_bytes)
         << ", sequence " << format_bytes(env.memory.sequence.capacity_bytes) << ", workspace "
-        << format_bytes(env.memory.workspace.capacity_bytes) << ", KV payload "
+        << format_bytes(env.memory.workspace.capacity_bytes) << ", request transient "
+        << format_bytes(env.memory.request_transient.capacity_bytes) << ", graph allowance "
+        << format_bytes(env.memory.cuda_graph_allowance_bytes) << ", KV payload "
         << format_bytes(env.memory.kv_payload_bytes) << '\n'
         << "  corpus:     " << env.corpus_path << " (" << env.corpus_tokens << " tokens)\n"
         << "  config:     max_context=" << env.max_context << " prefill_chunk=" << env.prefill_chunk
@@ -641,7 +643,9 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
     append_arena_json(out, "weights", env.memory.weights, "    ", true);
     append_arena_json(out, "sequence", env.memory.sequence, "    ", true);
     append_arena_json(out, "workspace", env.memory.workspace, "    ", true);
-    out << "    \"kv_payload_bytes\": " << env.memory.kv_payload_bytes << "\n"
+    append_arena_json(out, "request_transient", env.memory.request_transient, "    ", true);
+    out << "    \"cuda_graph_allowance_bytes\": " << env.memory.cuda_graph_allowance_bytes << ",\n"
+        << "    \"kv_payload_bytes\": " << env.memory.kv_payload_bytes << "\n"
         << "  },\n"
         << "  \"config\": {\n"
         << "    \"max_context\": " << env.max_context << ",\n"
@@ -684,7 +688,9 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         append_stat(out, "decode_seconds", decode_time_series(result), "      ");
         out << ",\n";
         append_stat(out, "total_seconds", total_time_series(result), "      ");
-        out << ",\n      \"workspace_peak_bytes\": " << result.workspace_peak_bytes << ",\n";
+        out << ",\n      \"workspace_peak_bytes\": " << result.workspace_peak_bytes
+            << ",\n      \"workspace_allocator_peak_bytes\": "
+            << result.workspace_allocator_peak_bytes << ",\n";
         append_speculative_json(out, aggregate_speculative(result), "      ");
         out << ",\n      \"reps\": [\n";
         for (std::size_t r = 0; r < result.reps.size(); ++r) {
@@ -713,7 +719,9 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
     out << "label,kind,n_prompt,n_gen,target,max_context,prefill_chunk,mtp_draft_tokens,"
            "proposal_head,decode_path,kv_cache,kv_payload_bytes,load_host_to_device_bytes,"
            "weights_capacity_bytes,sequence_capacity_bytes,workspace_capacity_bytes,"
-           "workspace_peak_bytes,spec_rounds,spec_fallback_steps,spec_acceptance_rate,"
+           "request_transient_capacity_bytes,cuda_graph_allowance_bytes,"
+           "workspace_peak_bytes,workspace_allocator_peak_bytes,"
+           "spec_rounds,spec_fallback_steps,spec_acceptance_rate,"
            "repetitions,prefill_tok_s_mean,prefill_tok_s_stddev,decode_output_tok_s_mean,"
            "decode_output_tok_s_stddev,decode_engine_tok_s_mean,decode_engine_tok_s_stddev,"
            "prepare_seconds_mean,prefill_seconds_mean,decode_seconds_mean,total_seconds_mean\n";
@@ -737,7 +745,9 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
             << kv_cache_name(env.kv_cache) << ',' << env.memory.kv_payload_bytes << ','
             << env.load.host_to_device_bytes << ',' << env.memory.weights.capacity_bytes << ','
             << env.memory.sequence.capacity_bytes << ',' << env.memory.workspace.capacity_bytes
-            << ',' << result.workspace_peak_bytes << ',' << spec.rounds << ','
+            << ',' << env.memory.request_transient.capacity_bytes << ','
+            << env.memory.cuda_graph_allowance_bytes << ',' << result.workspace_peak_bytes << ','
+            << result.workspace_allocator_peak_bytes << ',' << spec.rounds << ','
             << spec.fallback_steps << ',' << acceptance << ',' << result.reps.size() << ','
             << mean(prefill_tok_s_series(result)) << ',' << stddev(prefill_tok_s_series(result))
             << ',' << mean(decode_output_tok_s_series(result)) << ','

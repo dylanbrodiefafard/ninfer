@@ -53,7 +53,7 @@ void require_w8_rowsplit(const Weight& weight, std::int32_t rows, const char* la
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
-                     WorkspaceArena& ws, cudaStream_t stream) {
+                     cudaStream_t stream) {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kQRows  = 6144;
     constexpr std::int32_t kKvRows = 1024;
@@ -66,13 +66,12 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
     require_rowsplit(query_key_weight, QType::Q4G64_F16S, kQRows + kKvRows, "query/key weight");
     require_rowsplit(gate_value_weight, QType::Q5G64_F16S, kQRows + kKvRows, "gate/value weight");
 
-    (void)ws;
     detail::q4_q5_attn_input_dispatch(x, query_key_weight, gate_value_weight, q, gate, k, v,
                                       stream);
 }
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,
-                     Tensor& gate, Tensor& k, Tensor& v, WorkspaceArena& ws, cudaStream_t stream) {
+                     Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
     constexpr std::int32_t kHidden = 2048;
     constexpr std::int32_t kQRows  = 4096;
     constexpr std::int32_t kKvRows = 512;
@@ -86,12 +85,11 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight,
     require_matrix(v, kKvRows, cols, "v");
     require_w8_rowsplit(query_key_gate_value_weight, kRows, "query/key/gate/value weight");
 
-    (void)ws;
     detail::w8_attn_input_dispatch(x, query_key_gate_value_weight, q, gate, k, v, stream);
 }
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tensor& q, Tensor& k,
-                     Tensor& v, WorkspaceArena& ws, cudaStream_t stream) {
+                     Tensor& v, cudaStream_t stream) {
     constexpr std::int32_t kHidden = 2048;
     constexpr std::int32_t kQRows  = 4096;
     constexpr std::int32_t kKvRows = 1024;
@@ -104,7 +102,6 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
     require_matrix(v, kKvRows, cols, "v");
     require_w8_rowsplit(query_key_value_weight, kRows, "query/key/value weight");
 
-    (void)ws;
     detail::w8_attn_input_dispatch(x, query_key_value_weight, q, k, v, stream);
 }
 

@@ -205,8 +205,9 @@ void run(const Options& opt, std::int32_t tokens, DeviceBuffer& flush) {
     const auto norm_plan = ops::detail::bf16_gdn_norm_gating_resolve_plan(problem);
     const std::size_t workspace_bytes =
         opt.norm_control
-            ? ops::gdn_norm_gating_proj_workspace_bytes(tokens)
-            : std::max(plan.workspace_bytes, ops::gdn_gating_proj_workspace_bytes(tokens));
+            ? ops::gdn_norm_gating_proj_workspace_capacity_bytes(heads, hidden, tokens, tokens)
+            : std::max(plan.workspace_bytes, ops::gdn_gating_proj_workspace_capacity_bytes(
+                                                 heads, hidden, tokens, tokens));
     WorkspaceArena ws(std::max<std::size_t>(1, workspace_bytes));
     const auto launch = [&](cudaStream_t stream) {
         if (opt.norm_control && opt.composed_norm_control) {

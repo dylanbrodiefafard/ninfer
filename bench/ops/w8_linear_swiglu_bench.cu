@@ -179,7 +179,7 @@ int main(int argc, char** argv) {
             if (options.production_only) { continue; }
 
             run("composed.linear+silu", [&](cudaStream_t candidate_stream) {
-                ops::linear(x, packed.weight, parent, workspace, candidate_stream);
+                ops::linear(x, packed.weight, parent, candidate_stream);
                 ops::silu_mul(parent.slice(0, 0, kOutputRows),
                               parent.slice(0, kOutputRows, kOutputRows), out, candidate_stream);
             });

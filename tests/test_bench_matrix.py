@@ -5,12 +5,12 @@ import json
 from tools.bench.run_ninfer_bench_matrix import BenchCase, report_rows
 
 
-def test_schema_v8_report_is_flattened_for_matrix_summary(tmp_path) -> None:
+def test_schema_v9_report_is_flattened_for_matrix_summary(tmp_path) -> None:
     report_path = tmp_path / "report.json"
     report_path.write_text(
         json.dumps(
             {
-                "schema_version": 8,
+                "schema_version": 9,
                 "artifact_type": "ninfer_bench_report",
                 "tool": "ninfer_bench",
                 "artifact": {"path": "model.ninfer"},
@@ -28,6 +28,8 @@ def test_schema_v8_report_is_flattened_for_matrix_summary(tmp_path) -> None:
                     "weights": {"capacity_bytes": 17_400_000_000},
                     "sequence": {"capacity_bytes": 2_000_000_000},
                     "workspace": {"capacity_bytes": 100_000_000},
+                    "request_transient": {"capacity_bytes": 50_000_000},
+                    "cuda_graph_allowance_bytes": 150_000_000,
                 },
                 "config": {
                     "max_context": 4096,
@@ -48,6 +50,7 @@ def test_schema_v8_report_is_flattened_for_matrix_summary(tmp_path) -> None:
                         "n_gen": 3,
                         "requested_output_tokens": 4,
                         "workspace_peak_bytes": 1_048_576,
+                        "workspace_allocator_peak_bytes": 524_288,
                         "decode_output_tok_s_mean": 4.5,
                         "decode_engine_tok_s_mean": 7.5,
                         "total_seconds_mean": 0.875,
@@ -92,7 +95,10 @@ def test_schema_v8_report_is_flattened_for_matrix_summary(tmp_path) -> None:
     assert row["decode_graph_prime_output_tokens"] == 13
     assert row["host_to_device_bytes"] == 17_400_000_000
     assert row["workspace_capacity_bytes"] == 100_000_000
+    assert row["request_transient_capacity_bytes"] == 50_000_000
+    assert row["cuda_graph_allowance_bytes"] == 150_000_000
     assert row["workspace_peak_bytes"] == 1_048_576
+    assert row["workspace_allocator_peak_bytes"] == 524_288
     assert row["decode_output_tok_s_mean"] == 4.5
     assert row["decode_engine_tok_s_mean"] == 7.5
     assert row["spec_fallback_steps"] == 3

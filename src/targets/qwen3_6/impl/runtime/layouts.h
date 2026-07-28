@@ -23,16 +23,12 @@ struct DFlashPersistentLayout {
     KVCacheLayout boundary_local;
     KVCacheLayout full;
     TensorLayout commit_count;
+    TensorLayout target_features;
+    TensorLayout feature_positions;
 
     [[nodiscard]] std::size_t kv_payload_bytes() const noexcept {
         return local.payload_bytes() + boundary_local.payload_bytes() + full.payload_bytes();
     }
-};
-
-struct DFlashWorkspaceLayout {
-    TensorLayout target_features;
-    TensorLayout feature_positions;
-    std::size_t fixed_bytes = 0;
 };
 
 struct PersistentLayout {
@@ -46,6 +42,18 @@ struct PersistentLayout {
     TensorLayout boundary_hidden;
     std::size_t bytes            = 0;
     std::size_t kv_payload_bytes = 0;
+};
+
+struct WorkspacePlan {
+    std::size_t text_prefill    = 0;
+    std::size_t ordinary_round  = 0;
+    std::size_t mtp_prefill     = 0;
+    std::size_t mtp_round       = 0;
+    std::size_t dflash_context  = 0;
+    std::size_t dflash_proposal = 0;
+    std::size_t dflash_round    = 0;
+    std::size_t vision_encode   = 0;
+    std::size_t capacity        = 0;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
@@ -65,11 +73,10 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     bool use_cuda_graph = true;
     int device          = 0;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
-    std::size_t workspace_bytes       = 0;
-    std::size_t workspace_fixed_bytes = 0;
-    NINFER_QWEN36_RUNTIME_NS::DFlashWorkspaceLayout dflash_workspace;
-    std::size_t graph_allowance_bytes    = 0;
-    std::size_t device_reservation_bytes = 0;
+    NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;
+    std::size_t request_transient_capacity_bytes = 0;
+    std::size_t graph_allowance_bytes            = 0;
+    std::size_t device_reservation_bytes         = 0;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail
@@ -81,7 +88,5 @@ using SequencePlanImpl = qwen3_6::detail::SequencePlanImpl<Variant>;
 void validate_target_options(DeviceContext& device, const EngineOptions& options);
 [[nodiscard]] std::unique_ptr<SequencePlanImpl> plan_sequence_impl(DeviceContext& device,
                                                                    const EngineOptions& options);
-[[nodiscard]] std::size_t target_speculative_workspace_bytes(std::uint32_t prefill_chunk,
-                                                             std::uint32_t draft_window);
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

@@ -33,7 +33,6 @@ struct W8AttnInputProblem {
 
 struct W8AttnInputPlan {
     W8AttnInputScheduleId schedule;
-    std::size_t workspace_bytes;
 };
 
 const char* w8_attn_input_schedule_name(W8AttnInputScheduleId schedule) noexcept;

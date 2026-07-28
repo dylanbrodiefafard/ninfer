@@ -50,8 +50,9 @@ void validate_device_budget(std::uint64_t weight_bytes, std::size_t sequence_byt
         throw std::invalid_argument(
             "model weights and requested context require " + std::to_string(required) +
             " bytes of device memory (weights " + std::to_string(weight_bytes) +
-            ", sequence/workspace/graphs " + std::to_string(sequence_bytes) + "), but only " +
-            std::to_string(free_bytes) + " bytes are free before loading weights");
+            ", sequence persistent/workspace/request transient/graphs " +
+            std::to_string(sequence_bytes) + "), but only " + std::to_string(free_bytes) +
+            " bytes are free before loading weights");
     }
 }
 
@@ -96,7 +97,9 @@ LoadedQwen3_6_27B::~LoadedQwen3_6_27B() = default;
 Qwen3_6_27BInstance::Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stable_loaded,
                                          Qwen3_6_27B::SequencePlan sequence_plan,
                                          DeviceContext& device)
-    : loaded(std::move(stable_loaded)), request_memory(device), capacity(sequence_plan.capacity()),
+    : loaded(std::move(stable_loaded)),
+      request_memory(device, sequence_plan.request_transient_capacity_bytes()),
+      capacity(sequence_plan.capacity()),
       program(Qwen3_6_27B::create_program(*loaded->model, std::move(sequence_plan), device)) {}
 
 Qwen3_6_27BInstance::~Qwen3_6_27BInstance() = default;
@@ -110,7 +113,9 @@ LoadedQwen3_6_35BA3B::~LoadedQwen3_6_35BA3B() = default;
 Qwen3_6_35BA3BInstance::Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35BA3B> stable_loaded,
                                                Qwen3_6_35BA3B::SequencePlan sequence_plan,
                                                DeviceContext& device)
-    : loaded(std::move(stable_loaded)), request_memory(device), capacity(sequence_plan.capacity()),
+    : loaded(std::move(stable_loaded)),
+      request_memory(device, sequence_plan.request_transient_capacity_bytes()),
+      capacity(sequence_plan.capacity()),
       program(Qwen3_6_35BA3B::create_program(*loaded->model, std::move(sequence_plan), device)) {}
 
 Qwen3_6_35BA3BInstance::~Qwen3_6_35BA3BInstance() = default;

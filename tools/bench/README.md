@@ -115,8 +115,9 @@ artifacts are supplied. Pass one `--artifact` to select a single target and `--m
 decode corpus with DFlash block=8 (`k=7`) and the optimized proposal head. Add
 `--sampling greedy` to force exact argmax while retaining the same fixtures and repetition count.
 
-Each raw report must be `ninfer_bench_report` schema v8. The flattened summary carries native names
+Each raw report must be `ninfer_bench_report` schema v9. The flattened summary carries native names
 from the report: selected target and artifact, load/read/upload/staging values, Engine memory arenas
-and KV payload, configured proposal head and graph mode, phase timings and throughput, and
-speculative rounds/drafts/acceptance/fallbacks. The matrix manifest is descriptive and records the
-commands and selected local inputs; it does not make repository state part of report validity.
+including request transient and CUDA Graph allowance, per-test planned logical and
+allocator-observed workspace peaks, KV payload, configured proposal head and graph mode, phase timings and throughput,
+and speculative rounds/drafts/acceptance/fallbacks. The matrix manifest is descriptive and records
+the commands and selected local inputs; it does not make repository state part of report validity.

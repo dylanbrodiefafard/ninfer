@@ -9,7 +9,9 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 DFlashPersistentState::DFlashPersistentState(DeviceSpan backing,
                                              const DFlashPersistentLayout& layout)
     : local(backing, layout.local), boundary_local(backing, layout.boundary_local),
-      full(backing, layout.full), commit_count(layout.commit_count.bind(backing)) {
+      full(backing, layout.full), commit_count(layout.commit_count.bind(backing)),
+      target_features(layout.target_features.bind(backing)),
+      feature_positions(layout.feature_positions.bind(backing)) {
     if (local.layer_count() != 5 || boundary_local.layer_count() != 5 || full.layer_count() != 1 ||
         local.dtype != DType::BF16 || boundary_local.dtype != DType::BF16 ||
         full.dtype != DType::BF16) {
@@ -50,9 +52,5 @@ void DFlashPersistentState::restore_boundary(cudaStream_t stream) const {
                                    local.v[layer].bytes(), cudaMemcpyDeviceToDevice, stream));
     }
 }
-
-DFlashWorkspace::DFlashWorkspace(DeviceSpan backing, const DFlashWorkspaceLayout& layout)
-    : target_features(layout.target_features.bind(backing)),
-      feature_positions(layout.feature_positions.bind(backing)) {}
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

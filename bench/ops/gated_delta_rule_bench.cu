@@ -210,8 +210,8 @@ void print_help(const char* prog) {
 float scale_for(const Options& opt) { return 1.0f / std::sqrt(static_cast<float>(opt.S)); }
 
 std::size_t wrapper_workspace_bytes(const Options& opt, int T, bool normalize_qk = false) {
-    const std::size_t required =
-        ops::gated_delta_rule_workspace_bytes(opt.S, opt.H_qk, opt.H_v, T, normalize_qk);
+    const std::size_t required = ops::gated_delta_rule_workspace_capacity_bytes(
+        opt.S, opt.H_qk, opt.H_v, normalize_qk, T, T);
     return std::max<std::size_t>(required, 256);
 }
 
@@ -399,7 +399,7 @@ BenchRow run_small_t_snapshot(const Options& opt, int T) {
                 k_recurrent = &tk_norm;
             }
             ops::gated_delta_rule_snapshot(*q_recurrent, *k_recurrent, tv, tg, tbeta,
-                                           scale_for(opt), fused, ws, tstates, tinitial, tout, s);
+                                           scale_for(opt), fused, tstates, tinitial, tout, s);
         },
         estimate_snapshot_user_bytes(opt, T), opt.warmup, opt.repeat);
     return row;

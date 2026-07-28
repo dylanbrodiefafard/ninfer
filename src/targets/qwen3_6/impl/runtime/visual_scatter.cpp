@@ -20,19 +20,17 @@ void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stre
 } // namespace
 
 void scatter_shifted_visual_embeddings(Tensor& input_embeddings, const Tensor& visual_embeddings,
-                                       std::span<const std::int32_t> scatter_indices,
-                                       std::uint32_t prompt_tokens,
-                                       const qwen3_6::MtpAlignmentWindow& window,
-                                       WorkspaceArena& work, cudaStream_t stream) {
-    const qwen3_6::MtpVisualOverlap overlap =
-        qwen3_6::shifted_visual_overlap(scatter_indices, prompt_tokens, window);
-    if (overlap.empty()) { return; }
-    const auto count      = static_cast<std::int32_t>(overlap.size());
-    Tensor indices_device = work.alloc(DType::I32, {count});
-    copy_i32(overlap.destination_columns.data(), indices_device, stream);
+                                       const qwen3_6::MtpVisualOverlap& overlap,
+                                       Tensor& destination_indices, cudaStream_t stream) {
+    if (overlap.empty() || destination_indices.dtype != DType::I32 ||
+        destination_indices.ne[0] != static_cast<std::int32_t>(overlap.size())) {
+        throw std::invalid_argument("shifted visual scatter has invalid destination indices");
+    }
+    const auto count = static_cast<std::int32_t>(overlap.size());
+    copy_i32(overlap.destination_columns.data(), destination_indices, stream);
     Tensor embeddings =
         visual_embeddings.slice(1, static_cast<std::int32_t>(overlap.source_begin), count);
-    ops::scatter(embeddings, indices_device, input_embeddings, stream);
+    ops::scatter(embeddings, destination_indices, input_embeddings, stream);
 }
 
 } // namespace ninfer::targets::qwen3_6::detail

@@ -74,9 +74,7 @@ W8GdnInputPlan w8_gdn_input_resolve_plan(const W8GdnInputProblem& problem) {
         throw std::invalid_argument("W8 GDN input: exact problem or column count is not admitted");
     }
     for (const RouteSpec& route : kRoutes) {
-        if (problem.cols >= route.first && problem.cols <= route.last) {
-            return {route.schedule, 0};
-        }
+        if (problem.cols >= route.first && problem.cols <= route.last) { return {route.schedule}; }
     }
     throw std::logic_error("W8 GDN input: admitted problem has no covering route");
 }
@@ -89,12 +87,6 @@ W8GdnInputSnapshotPlan w8_gdn_input_snapshot_resolve_plan(const W8GdnInputProble
     if (problem.cols == 1) { return {W8GdnInputSnapshotScheduleId::DecodeFused}; }
     if (problem.cols <= 16) { return {W8GdnInputSnapshotScheduleId::SplitKMmaFused}; }
     return {W8GdnInputSnapshotScheduleId::Composed};
-}
-
-std::size_t w8_gdn_input_capacity_workspace_bytes(std::int32_t qkv_rows, std::int32_t z_rows,
-                                                  std::int32_t max_cols) {
-    (void)w8_gdn_input_resolve_plan({2048, qkv_rows, z_rows, qkv_rows + z_rows, 2048, max_cols});
-    return 0;
 }
 
 void w8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,

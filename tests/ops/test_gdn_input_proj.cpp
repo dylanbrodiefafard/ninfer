@@ -42,10 +42,7 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_weig
     GuardedBf16Tensor qkv(kRows, tokens);
     Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
     Tensor output = qkv.tensor();
-    WorkspaceArena workspace(
-        std::max<std::size_t>(1, ops::gdn_input_proj_workspace_bytes(kQkRows, kValueRows, tokens)));
-
-    ops::gdn_input_proj(x, query_key.view(), value_weight.view(), output, workspace, nullptr);
+    ops::gdn_input_proj(x, query_key.view(), value_weight.view(), output, nullptr);
     cuda_synchronize();
 
     const std::string suffix = " Q4/Q5 A16 T=" + std::to_string(tokens);
@@ -86,10 +83,7 @@ int run_w8_case(DevicePackedWeight& parent, std::int32_t tokens) {
     Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
     Tensor qkv_output = qkv.tensor();
     Tensor z_output   = z.tensor();
-    WorkspaceArena workspace(
-        std::max<std::size_t>(1, ops::gdn_input_proj_workspace_bytes(kQkvRows, kZRows, tokens)));
-
-    ops::gdn_input_proj(x, parent.view(), qkv_output, z_output, workspace, nullptr);
+    ops::gdn_input_proj(x, parent.view(), qkv_output, z_output, nullptr);
     cuda_synchronize();
 
     const std::string suffix = " W8 A16 T=" + std::to_string(tokens);

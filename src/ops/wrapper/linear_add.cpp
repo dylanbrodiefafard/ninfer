@@ -42,14 +42,22 @@ bool aligned_to(const void* pointer, std::uintptr_t alignment) {
 
 } // namespace
 
-std::size_t linear_add_workspace_bytes(std::int32_t output_rows, std::int32_t input_rows,
-                                       std::int32_t max_tokens) {
-    if (output_rows == 2048 && (input_rows == 4096 || input_rows == 6144)) {
+std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output_rows,
+                                                std::int32_t input_rows, std::int32_t min_tokens,
+                                                std::int32_t max_tokens) {
+    if (min_tokens <= 0 || max_tokens < min_tokens) {
+        throw std::invalid_argument("linear_add workspace: invalid token interval");
+    }
+    if (qtype == QType::W8G32_F16S) {
+        (void)detail::w8_linear_add_resolve_plan({output_rows, input_rows, input_rows, min_tokens});
         (void)detail::w8_linear_add_resolve_plan({output_rows, input_rows, input_rows, max_tokens});
         return 0;
     }
+    if (qtype != QType::Q5G64_F16S) {
+        throw std::invalid_argument("linear_add workspace: unsupported weight format");
+    }
     return detail::q5_linear_add_capacity_workspace_bytes(output_rows, input_rows, input_rows,
-                                                          max_tokens);
+                                                          min_tokens, max_tokens);
 }
 
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, WorkspaceArena& ws,

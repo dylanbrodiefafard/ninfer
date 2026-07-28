@@ -82,7 +82,7 @@ public:
 
     [[nodiscard]] Tensor alloc(DType dtype, std::initializer_list<std::int32_t> shape,
                                std::size_t alignment = 256);
-    void alloc_bytes(std::size_t bytes, std::size_t alignment = 256);
+    [[nodiscard]] DeviceSpan alloc_bytes(std::size_t bytes, std::size_t alignment = 256);
     [[nodiscard]] Scope scope() noexcept;
     [[nodiscard]] std::size_t peak_bytes(std::size_t alignment = 256) const;
 

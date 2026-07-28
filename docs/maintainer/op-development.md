@@ -408,6 +408,29 @@ An Op may suballocate transient scratch within its call scope, but it must not c
 retain a workspace pointer, or own the arena. A sizing query and its execution path must share one
 private layout definition so Program can plan memory from the same requirements the wrapper uses.
 
+Each public Op entry has one of two workspace forms:
+
+- a static-zero entry has no `WorkspaceArena` argument and no sizing query;
+- a scratch-capable entry accepts `WorkspaceArena&` and exposes exactly one
+  `*_workspace_capacity_bytes(fixed_profile, first, last)` query.
+
+The capacity query returns the minimum high-water capacity required for every legal extent in the
+inclusive interval. `[T,T]` is the exact-call query. The fixed profile explicitly contains every
+host-visible route fact, including geometry, weight format, storage dtype, normalization choice,
+and execution envelope as applicable. Invalid profiles or intervals throw; zero is reserved for a
+legal route that needs no caller-owned global scratch.
+
+Capacity is measured from a 256-byte-aligned Op-local cursor. It includes internal alignment gaps
+but no trailing padding. The wrapper establishes and releases its own scope, so its caller cursor
+is restored on return. Query and execution share the same private route resolver and allocation
+recipe. Interval queries intersect a finite catalog of registered routes and evaluate their
+monotonic endpoints or finite policy boundaries; they do not enumerate every token count in a
+large interval. A composed Op reports the complete scratch of its public operation rather than
+requiring its caller to query private children.
+
+Host scope does not end device use of scratch. Kernels consuming a region must be submitted on the
+declared stream before the scope is released, and later reuse relies on stream ordering.
+
 Stateful Ops receive explicit state containers or views. Program owns instances and lifetime;
 core owns target-neutral physical mechanisms; the Op owns only the documented local reads, writes,
 and outputs of one call.

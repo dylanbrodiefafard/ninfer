@@ -154,25 +154,42 @@ void validate_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const T
     require_contiguous_nonnull(ssm_state_in, "ssm_state_in");
 }
 
+struct ChunkedWorkspace {
+    Tensor normalized_q;
+    Tensor normalized_k;
+    DeviceSpan stage;
+};
+
+template <class Allocator>
+ChunkedWorkspace allocate_chunked_workspace(Allocator& allocator, std::int32_t head_dim,
+                                            std::int32_t qk_heads, std::int32_t value_heads,
+                                            std::int32_t tokens, bool normalize_qk) {
+    ChunkedWorkspace out;
+    const std::int32_t full = (tokens / kChunkSize) * kChunkSize;
+    if (full == 0) { return out; }
+    if (normalize_qk) {
+        out.normalized_q = allocator.alloc(DType::BF16, {head_dim, qk_heads, tokens});
+        out.normalized_k = allocator.alloc(DType::BF16, {head_dim, qk_heads, tokens});
+    }
+    out.stage = allocator.alloc_bytes(
+        detail::gdn_chunked_workspace_bytes(head_dim, qk_heads, value_heads, full));
+    return out;
+}
+
 } // namespace
 
-std::size_t gated_delta_rule_workspace_bytes(std::int32_t head_dim, std::int32_t qk_heads,
-                                             std::int32_t value_heads, std::int32_t tokens,
-                                             bool normalize_qk) {
+std::size_t gated_delta_rule_workspace_capacity_bytes(std::int32_t head_dim, std::int32_t qk_heads,
+                                                      std::int32_t value_heads, bool normalize_qk,
+                                                      std::int32_t min_tokens,
+                                                      std::int32_t max_tokens) {
     if (!is_supported_gdn_head_dim(head_dim) || !are_gdn_head_counts_valid(qk_heads, value_heads) ||
-        tokens <= 0) {
-        throw std::invalid_argument("gated_delta_rule_workspace_bytes: invalid geometry");
+        min_tokens <= 0 || max_tokens < min_tokens) {
+        throw std::invalid_argument("gated_delta_rule workspace: invalid profile or interval");
     }
-    const std::int32_t full = (tokens / kChunkSize) * kChunkSize;
-    if (full == 0) { return 0; }
-
     WorkspaceLayoutBuilder layout;
-    if (normalize_qk) {
-        (void)layout.alloc(DType::BF16, {head_dim, qk_heads, tokens});
-        (void)layout.alloc(DType::BF16, {head_dim, qk_heads, tokens});
-    }
-    layout.alloc_bytes(detail::gdn_chunked_workspace_bytes(head_dim, qk_heads, value_heads, full));
-    return layout.peak_bytes();
+    (void)allocate_chunked_workspace(layout, head_dim, qk_heads, value_heads, max_tokens,
+                                     normalize_qk);
+    return layout.peak_bytes(1);
 }
 
 void gated_delta_rule(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
@@ -192,11 +209,10 @@ void gated_delta_rule(const Tensor& q, const Tensor& k, const Tensor& v, const T
 
 void gated_delta_rule_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                                const Tensor& beta, float scale, bool normalize_qk,
-                               WorkspaceArena& ws, Tensor& ssm_states, const Tensor& initial_slot,
-                               Tensor& out, cudaStream_t stream) {
+                               Tensor& ssm_states, const Tensor& initial_slot, Tensor& out,
+                               cudaStream_t stream) {
     validate_recurrent_snapshot(q, k, v, g, beta, scale, ssm_states, initial_slot, out);
 
-    (void)ws;
     detail::gated_delta_rule_recurrent_snapshot_bf16_launch(q, k, v, g, beta, scale, normalize_qk,
                                                             ssm_states, initial_slot, out, stream);
 }
@@ -210,30 +226,28 @@ void gated_delta_rule(const Tensor& q, const Tensor& k, const Tensor& v, const T
     auto scratch_scope        = ws.scope();
     const std::int32_t T      = q.ne[2];
     const std::int32_t T_full = (T / kChunkSize) * kChunkSize;
-    Tensor q_compute          = q;
-    Tensor k_compute          = k;
-    bool recurrent_normalize  = normalize_qk;
+    ChunkedWorkspace scratch =
+        allocate_chunked_workspace(ws, q.ne[0], q.ne[1], v.ne[1], T, normalize_qk);
+    Tensor q_compute         = q;
+    Tensor k_compute         = k;
+    bool recurrent_normalize = normalize_qk;
     if (normalize_qk && T_full > 0) {
-        q_compute = ws.alloc(DType::BF16, {q.ne[0], q.ne[1], T});
-        k_compute = ws.alloc(DType::BF16, {k.ne[0], k.ne[1], T});
+        q_compute = scratch.normalized_q;
+        k_compute = scratch.normalized_k;
         l2norm(q, 1.0e-6f, q_compute, stream);
         l2norm(k, 1.0e-6f, k_compute, stream);
         recurrent_normalize = false;
     }
     if (T_full > 0) {
-        const std::size_t stage_bytes =
-            detail::gdn_chunked_workspace_bytes(q.ne[0], q.ne[1], v.ne[1], T_full);
-        const DeviceSpan stage_workspace = ws.alloc_bytes(stage_bytes);
-
         Tensor q_full    = q_compute.slice(2, 0, T_full);
         Tensor k_full    = k_compute.slice(2, 0, T_full);
         Tensor v_full    = v.slice(2, 0, T_full);
         Tensor g_full    = g.slice(1, 0, T_full);
         Tensor beta_full = beta.slice(1, 0, T_full);
         Tensor out_full  = out.slice(2, 0, T_full);
-        detail::gated_delta_rule_chunked_launch(
-            q_full, k_full, v_full, g_full, beta_full, scale, ssm_state_in, ssm_state_out, out_full,
-            stage_workspace.data, stage_workspace.bytes, stream);
+        detail::gated_delta_rule_chunked_launch(q_full, k_full, v_full, g_full, beta_full, scale,
+                                                ssm_state_in, ssm_state_out, out_full,
+                                                scratch.stage.data, scratch.stage.bytes, stream);
     }
 
     const std::int32_t tail = T - T_full;

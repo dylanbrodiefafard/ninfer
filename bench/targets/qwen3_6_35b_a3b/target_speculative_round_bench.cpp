@@ -392,6 +392,20 @@ int run(const Options& options) {
 
     const std::uint32_t maximum_k =
         *std::max_element(options.draft_windows.begin(), options.draft_windows.end());
+    ninfer::EngineOptions capacity_options;
+    capacity_options.device        = options.device;
+    capacity_options.max_context   = options.context_tokens + maximum_k + 1;
+    capacity_options.prefill_chunk = options.prefill_chunk;
+    capacity_options.kv_cache      = options.kv_dtype == ninfer::DType::I8
+                                         ? ninfer::KvCacheStorage::Int8Group64
+                                         : ninfer::KvCacheStorage::BFloat16;
+    capacity_options.speculative =
+        ninfer::SpeculativeOptions{.backend       = ninfer::SpeculativeBackend::DFlash,
+                                   .draft_tokens  = maximum_k,
+                                   .proposal_head = ninfer::ProposalHead::Full};
+    capacity_options.use_cuda_graph = false;
+    auto capacity_plan              = target::Package::plan_sequence(device, capacity_options);
+
     const StateLayout layout = plan_state(options, maximum_k);
     ninfer::DeviceArena state_arena(layout.bytes);
     const ninfer::DeviceSpan backing{state_arena.base(), state_arena.capacity()};
@@ -401,9 +415,8 @@ int run(const Options& options) {
     ninfer::Tensor tail_hidden     = layout.tail_hidden.bind(backing);
     ninfer::Tensor boundary_hidden = layout.boundary_hidden.bind(backing);
 
-    const std::size_t workspace_bytes =
-        runtime::target_speculative_workspace_bytes(options.prefill_chunk, maximum_k);
-    ninfer::WorkspaceArena workspace(workspace_bytes);
+    const std::size_t program_workspace_capacity = capacity_plan.workspace_capacity_bytes();
+    ninfer::WorkspaceArena workspace(program_workspace_capacity);
     ninfer::DeviceArena sampling_storage(kArenaAlignment);
     const ninfer::DeviceSpan sampling_span =
         sampling_storage.alloc_bytes(sizeof(ninfer::ops::SamplingConfig), kArenaAlignment);
@@ -430,11 +443,11 @@ int run(const Options& options) {
                                cudaMemcpyDeviceToHost, device.stream));
     device.synchronize();
 
-    std::cout << "format,ninfer_qwen3_6_35b_a3b_target_speculative_round_bench_v1\n";
+    std::cout << "format,ninfer_qwen3_6_35b_a3b_target_speculative_round_bench_v2\n";
     std::cout << "artifact," << options.artifact.string() << '\n';
     std::cout << "device," << device.props.name << '\n';
     std::cout << "state_bytes," << layout.bytes << '\n';
-    std::cout << "workspace_bytes," << workspace_bytes << '\n';
+    std::cout << "program_workspace_capacity_bytes," << program_workspace_capacity << '\n';
     std::cout << "k,verify_tokens,accepted_drafts,mode,kv_dtype,context_tokens,mean_ms,median_ms,"
                  "min_ms,max_ms,target_side_effective_tok_s\n";
 
@@ -448,7 +461,6 @@ int run(const Options& options) {
             model.runtime,
             workspace,
             decoder.text_kv,
-            nullptr,
             nullptr,
             nullptr,
             decoder.gdn,

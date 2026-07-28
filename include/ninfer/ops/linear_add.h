@@ -13,13 +13,14 @@
 namespace ninfer::ops {
 
 /**
- * Returns the maximum transient capacity required by LinearAdd for any T in [1,max_tokens].
- * Dimensions must be positive. `max_tokens` sizes caller-owned storage; it does not cap later Op
- * calls when sufficient storage is provided.
+ * Returns the transient capacity required by LinearAdd for every T in the inclusive
+ * [min_tokens,max_tokens] interval. The QType and dimensions are the fixed implementation profile.
+ * Invalid profiles or intervals throw; a legal static-zero route returns zero.
  */
-[[nodiscard]] std::size_t linear_add_workspace_bytes(std::int32_t output_rows,
-                                                     std::int32_t input_rows,
-                                                     std::int32_t max_tokens);
+[[nodiscard]] std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output_rows,
+                                                              std::int32_t input_rows,
+                                                              std::int32_t min_tokens,
+                                                              std::int32_t max_tokens);
 
 /**
  * Op: linear_add
@@ -45,8 +46,8 @@ namespace ninfer::ops {
  *   Updates the full residual tensor in place; x/weight must not alias residual.
  *
  * Workspace:
- *   Caller-owned transient storage reported by linear_add_workspace_bytes(N,K,T), scoped to the
- *   call. There is no persistent state side effect.
+ *   Caller-owned transient storage reported by linear_add_workspace_capacity_bytes(), scoped to
+ *   the call. There is no persistent state side effect.
  */
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceArena& ws,
                 cudaStream_t stream);

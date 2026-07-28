@@ -2,6 +2,7 @@
 #include "ops/launcher/speculative_round.h"
 
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -49,6 +50,16 @@ void require_vector_at_least(const Tensor& t, DType dtype, std::int32_t n, const
 
 } // namespace
 
+std::size_t speculative_accept_greedy_drafts_workspace_capacity_bytes(std::int32_t token_domain,
+                                                                      std::int32_t min_drafts,
+                                                                      std::int32_t max_drafts) {
+    if (min_drafts <= 0 || max_drafts < min_drafts ||
+        max_drafts == std::numeric_limits<std::int32_t>::max()) {
+        throw std::invalid_argument("speculative accept workspace: invalid draft interval");
+    }
+    return sampling_workspace_capacity_bytes(token_domain, min_drafts + 1, max_drafts + 1);
+}
+
 void speculative_prepare_verify_inputs(const Tensor& token, const Tensor& drafts,
                                        const Tensor& length, Tensor& verify_ids, Tensor& positions,
                                        cudaStream_t stream) {
@@ -93,8 +104,9 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
     if (config == nullptr) {
         throw std::invalid_argument("speculative_accept_greedy_drafts: config must be non-null");
     }
-    auto scratch_scope       = workspace.scope();
-    const std::size_t bytes  = sampling_workspace_bytes(token_domain, k + 1);
+    auto scratch_scope = workspace.scope();
+    const std::size_t bytes =
+        speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k);
     const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
     detail::speculative_accept_greedy_drafts_launch(target_tokens, logits, drafts, length, token,
                                                     sampled_out, num_sampled, accepted, stats,

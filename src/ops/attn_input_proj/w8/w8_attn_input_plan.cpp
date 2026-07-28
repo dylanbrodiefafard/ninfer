@@ -103,7 +103,7 @@ W8AttnInputPlan w8_attn_input_resolve_plan(const W8AttnInputProblem& problem) {
     const auto resolve_from = [&](const auto& routes) -> W8AttnInputPlan {
         for (const RouteSpec& route : routes) {
             if (problem.cols >= route.first && problem.cols <= route.last) {
-                return {route.schedule, 0};
+                return {route.schedule};
             }
         }
         throw std::logic_error("W8 attention input: admitted problem has no covering route");
@@ -119,7 +119,7 @@ void w8_attn_input_execute_plan(const W8AttnInputPlan& plan, const Tensor& x, co
                                      x.ne[1]};
     const W8AttnInputPlan resolved = w8_attn_input_resolve_plan(problem);
     if (problem.parent_rows != 9216 || problem.kv_rows != 512 ||
-        resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
+        resolved.schedule != plan.schedule) {
         throw std::invalid_argument(
             "W8 attention input: plan does not match exact four-output problem");
     }
@@ -163,7 +163,7 @@ void w8_attn_input_execute_plan(const W8AttnInputPlan& plan, const Tensor& x, co
                                      x.ne[1]};
     const W8AttnInputPlan resolved = w8_attn_input_resolve_plan(problem);
     if (problem.parent_rows != 6144 || problem.kv_rows != 1024 ||
-        resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
+        resolved.schedule != plan.schedule) {
         throw std::invalid_argument(
             "W8 attention input: plan does not match exact three-output problem");
     }

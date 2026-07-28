@@ -177,8 +177,9 @@ int main(int argc, char** argv) {
         const std::size_t workspace_bytes =
             options.op == OpSelection::Attention
                 ? 1
-                : std::max<std::size_t>(1, ops::gdn_input_proj_conv_snapshot_workspace_bytes(
-                                               kGdnKeyRows, kGdnKeyRows, kGdnValueRows, max_t));
+                : std::max<std::size_t>(1,
+                                        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                                            kGdnKeyRows, kGdnKeyRows, kGdnValueRows, 1, max_t));
         WorkspaceArena workspace(workspace_bytes);
         std::vector<Result> results;
 
@@ -204,17 +205,17 @@ int main(int argc, char** argv) {
                 Tensor tv(v.p, DType::BF16, {kKvRows, t});
                 const auto production = [&](cudaStream_t launch_stream) {
                     ops::attn_input_proj(x, query_key.weight, gate_value.weight, tq, tg, tk, tv,
-                                         workspace, launch_stream);
+                                         launch_stream);
                 };
                 append_result(results, "attention", "production_parent_split", t,
                               bench::measure_cold_launch(production, flush, stream, options.warmup,
                                                          options.repeat));
                 if (t <= 16) {
                     const auto control = [&](cudaStream_t launch_stream) {
-                        ops::linear(x, query, tq, workspace, launch_stream);
-                        ops::linear(x, gate, tg, workspace, launch_stream);
-                        ops::linear(x, key, tk, workspace, launch_stream);
-                        ops::linear(x, value, tv, workspace, launch_stream);
+                        ops::linear(x, query, tq, launch_stream);
+                        ops::linear(x, gate, tg, launch_stream);
+                        ops::linear(x, key, tk, launch_stream);
+                        ops::linear(x, value, tv, launch_stream);
                     };
                     append_result(results, "attention", "control_four_projection", t,
                                   bench::measure_cold_launch(control, flush, stream, options.warmup,
@@ -257,7 +258,7 @@ int main(int argc, char** argv) {
                 Tensor states(conv_states.p, DType::BF16, {kGdnRows, 3, kGdnSlots});
                 Tensor initial(initial_slot.p, DType::I32, {1});
                 const auto production = [&](cudaStream_t launch_stream) {
-                    ops::gdn_input_proj(x, qk_weight.weight, value_weight.weight, out, workspace,
+                    ops::gdn_input_proj(x, qk_weight.weight, value_weight.weight, out,
                                         launch_stream);
                 };
                 append_result(results, "gdn", "production_direct", t,
@@ -274,7 +275,7 @@ int main(int argc, char** argv) {
                                                              options.warmup, options.repeat));
                     const auto composed_snapshot = [&](cudaStream_t launch_stream) {
                         ops::gdn_input_proj(x, qk_weight.weight, value_weight.weight, out,
-                                            workspace, launch_stream);
+                                            launch_stream);
                         ops::causal_conv1d_silu_snapshot(out, conv_w, states, initial, convolved,
                                                          launch_stream);
                         ops::extract_bf16_columns(convolved, 0, tq, launch_stream);
@@ -287,8 +288,8 @@ int main(int argc, char** argv) {
                 }
                 if (t <= 16) {
                     const auto projections = [&](cudaStream_t launch_stream) {
-                        ops::linear(x, qk_weight.weight, qk, workspace, launch_stream);
-                        ops::linear(x, value_weight.weight, value, workspace, launch_stream);
+                        ops::linear(x, qk_weight.weight, qk, launch_stream);
+                        ops::linear(x, value_weight.weight, value, launch_stream);
                     };
                     append_result(results, "gdn", "control_projection_only", t,
                                   bench::measure_cold_launch(projections, flush, stream,

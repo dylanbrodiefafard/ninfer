@@ -87,7 +87,6 @@ enum class StorageProfile {
 
 enum class PublicEntry {
     CuSeqlensArena,
-    CuSeqlensScratch,
     UniformSegments,
 };
 
@@ -104,8 +103,6 @@ const char* entry_name(PublicEntry entry) {
     switch (entry) {
     case PublicEntry::CuSeqlensArena:
         return "cu-arena";
-    case PublicEntry::CuSeqlensScratch:
-        return "cu-scratch";
     case PublicEntry::UniformSegments:
         return "uniform";
     }
@@ -190,23 +187,13 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
     d_out.fill(0x7f);
     Tensor out_tensor(d_out.data(), DType::BF16, {kDim, kHeads, patches});
 
-    const int scratch_tiles = ops::vision_attention_scratch_tiles(
-        patches, static_cast<std::int32_t>(cu_seqlens.size()) - 1);
-    DeviceArena workspace(std::max<std::size_t>(256, static_cast<std::size_t>(scratch_tiles) * 4 *
-                                                         sizeof(std::int32_t)));
-    GuardedDeviceBuffer d_scratch(std::max<std::size_t>(
-        sizeof(std::int32_t), static_cast<std::size_t>(scratch_tiles) * 4 * sizeof(std::int32_t)));
+    const std::int32_t segments = static_cast<std::int32_t>(cu_seqlens.size()) - 1;
+    const std::size_t workspace_bytes =
+        ops::vision_attention_workspace_capacity_bytes(patches, patches, segments, segments);
+    DeviceArena workspace(std::max<std::size_t>(256, workspace_bytes));
 
     if (entry == PublicEntry::CuSeqlensArena) {
         ops::vision_attention(q_tensor, k_tensor, v_tensor, cu_tensor, workspace, out_tensor,
-                              nullptr);
-    } else if (entry == PublicEntry::CuSeqlensScratch) {
-        if (scratch_tiles == 0) {
-            throw std::logic_error("raw scratch case requires multiple segments");
-        }
-        d_scratch.fill(0x7f);
-        Tensor scratch_tensor(d_scratch.data(), DType::I32, {4, scratch_tiles});
-        ops::vision_attention(q_tensor, k_tensor, v_tensor, cu_tensor, &scratch_tensor, out_tensor,
                               nullptr);
     } else {
         const int segment_length = cu_seqlens[1] - cu_seqlens[0];
@@ -228,9 +215,6 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
         verify_reduction(qualified_label.c_str(), from_device_bf16(d_out.data(), value_count),
                          reference, kVisionAttentionBf16Criterion);
     failures += d_out.verify_guards((qualified_label + " output guards").c_str());
-    if (entry == PublicEntry::CuSeqlensScratch) {
-        failures += d_scratch.verify_guards((qualified_label + " scratch guards").c_str());
-    }
     if (storage_profile == StorageProfile::Contiguous) {
         failures += verify_exact((qualified_label + " q unchanged").c_str(),
                                  from_device<std::uint16_t>(q_storage, value_count), q_expected);
@@ -247,6 +231,10 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
     if (entry != PublicEntry::UniformSegments) {
         failures += verify_exact((qualified_label + " cu_seqlens unchanged").c_str(),
                                  from_device<int>(d_cu_seqlens, cu_seqlens.size()), cu_seqlens);
+        if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+            std::cerr << qualified_label << ": workspace query/execution high-water mismatch\n";
+            ++failures;
+        }
     }
     return failures;
 }
@@ -260,11 +248,22 @@ int main() {
     }
 
     int failures = 0;
+    if (ops::vision_attention_workspace_capacity_bytes(4, 194, 1, 1) != 0 ||
+        ops::vision_attention_workspace_capacity_bytes(4, 194, 1, 3) !=
+            ops::vision_attention_workspace_capacity_bytes(194, 194, 3, 3)) {
+        std::cerr << "vision_attention rectangular capacity missed its maximal legal pair\n";
+        ++failures;
+    }
+    try {
+        (void)ops::vision_attention_workspace_capacity_bytes(1, 2, 3, 4);
+        std::cerr << "vision_attention accepted an envelope without a legal segment pair\n";
+        ++failures;
+    } catch (const std::invalid_argument&) {}
     failures += run_case({0, 4}, 1u, StorageProfile::Contiguous, PublicEntry::CuSeqlensArena);
     failures += run_case({0, 4, 11}, 7u, StorageProfile::InterleavedQkv,
                          PublicEntry::CuSeqlensArena, InputProfile::SegmentIsolation);
-    failures +=
-        run_case({0, 65, 194}, 31u, StorageProfile::InterleavedQkv, PublicEntry::CuSeqlensScratch);
+    failures += run_case({0, 64, 129, 194}, 31u, StorageProfile::InterleavedQkv,
+                         PublicEntry::CuSeqlensArena);
     failures +=
         run_case({0, 68, 136}, 101u, StorageProfile::InterleavedQkv, PublicEntry::UniformSegments);
     failures +=

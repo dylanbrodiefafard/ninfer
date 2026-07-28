@@ -28,10 +28,13 @@ benchmark-report, and external protocol behavior. Repository verification princi
   geometry behavior against a self-contained C++ fixture;
 - `test_generation_controller.cpp` — accepted-prefix, cancellation, publication ordering, and
   request-abort behavior in the common generated-token loop;
+- `test_request_memory.cpp` — startup-frozen request-transient capacity, stable address,
+  activation alignment, rejection, and peak semantics;
 - `test_openai_schema.cpp`, `test_anthropic_schema.cpp`, and `test_tool_call_parser.cpp` — current
   protocol translation and tool-call behavior;
-- `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v8 reports;
-- `test_bench_matrix.py` — schema-v8 report consumption by the Python matrix summarizer;
+- `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v9 reports;
+- `test_bench_matrix.py` — schema-v9 report consumption by the Python matrix summarizer;
+- `test_serve_corpus.py` — serving request-log schema compatibility at the measurement consumer;
 - device/tensor/arena tests — reusable lower-component behavior; KV tests cover the core physical
   container, family runtime tests cover dimension-driven GDN storage/view mechanics, and Op tests
   cover mathematical state transitions at their own boundary.
@@ -95,7 +98,7 @@ Run the native Python suites with the project Python environment:
 ```bash
 python3 -m pytest \
   tests/artifact tests/targets/qwen3_6_27b tests/targets/qwen3_6_35b_a3b \
-  tests/test_bench_matrix.py
+  tests/test_bench_matrix.py tests/test_serve_corpus.py
 ```
 
 The Python binding tests use `NINFER_QWEN3_6_27B_ARTIFACT` when set, otherwise they look for

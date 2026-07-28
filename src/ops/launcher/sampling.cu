@@ -10,7 +10,7 @@
 
 namespace ninfer::ops::detail {
 
-std::size_t sampling_workspace_bytes(std::int32_t token_domain, std::int32_t columns) {
+std::size_t sampling_workspace_exact_bytes(std::int32_t token_domain, std::int32_t columns) {
     return make_sampling_workspace_layout(token_domain, columns).bytes;
 }
 

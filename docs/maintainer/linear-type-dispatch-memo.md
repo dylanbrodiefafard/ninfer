@@ -155,7 +155,7 @@ switch (w.qtype)
 
 ```cpp
 void linear(const Tensor& x, const Weight& w, Tensor& out,
-            LinearPolicy policy, WorkspaceArena& ws, cudaStream_t stream);
+            LinearPolicy policy, cudaStream_t stream);
 ```
 
 语义保持：
@@ -244,19 +244,19 @@ schedule。Q4/Q5/Q6/W8 各自的 dispatcher 都直接调用 type-private selecto
 Q4 dispatcher 只做两步：
 
 ```cpp
-using Q4Launch = void (*)(const Tensor&, const Weight&, Tensor&,
-                          WorkspaceArena&, cudaStream_t);
+using Q4Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
 void q4_dispatch(const Tensor& x, const Weight& w, Tensor& out,
-                 LinearPolicy policy, WorkspaceArena& ws, cudaStream_t stream) {
+                 LinearPolicy policy, cudaStream_t stream) {
     const Q4Launch launch = select_q4_launch(w.n, w.k, x.ne[1], policy);
-    launch(x, w, out, ws, stream);
+    launch(x, w, out, stream);
 }
 ```
 
-`WorkspaceArena&` 是已有 `linear` execution-resource 合同的一部分。当前六个 A16 Q4
-launchers 不分配 workspace；以后某个经过选择的 A8 route 需要 scratch 时，可以在同一
-launcher 签名下使用它，不需要给 route 表增加 plan 或 workspace 字段。
+当前注册的 pure Linear Q4 entry 是静态零 scratch：公共入口、dispatcher 和 launcher
+都不接收 `WorkspaceArena&`，也不公开零值 query。将来只有在已注册 entry 确实需要
+caller-owned scratch 时，才在同一变更中为完整 entry 增加 Arena、capacity query 和
+caller plan；未使用的 Arena 不是扩展点。
 
 `select_q4_launch()` 的输入严格限制为：
 
@@ -853,12 +853,9 @@ framework 共享 selector、route registry 或 runtime plan。
 Q5、Q6、W8 分别定义自己的 function-pointer type：
 
 ```cpp
-using Q5Launch = void (*)(const Tensor&, const Weight&, Tensor&,
-                          WorkspaceArena&, cudaStream_t);
-using Q6Launch = void (*)(const Tensor&, const Weight&, Tensor&,
-                          WorkspaceArena&, cudaStream_t);
-using W8Launch = void (*)(const Tensor&, const Weight&, Tensor&,
-                          WorkspaceArena&, cudaStream_t);
+using Q5Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+using Q6Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+using W8Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 ```
 
 三个 dispatcher 都只有以下行为：
@@ -866,14 +863,14 @@ using W8Launch = void (*)(const Tensor&, const Weight&, Tensor&,
 ```text
 select_<type>_launch(w.n, w.k, x.ne[1], policy)
     -> 返回完整 host launcher
-    -> launcher(x, w, out, ws, stream)
+    -> launcher(x, w, out, stream)
 ```
 
 `A16Only` 与 `AllowA8` 当前都查询同一 A16 registry；`AllowA8` 是许可 A8，不是要求
 A8。`AllowA4` 对这三种格式均失败。selector 只读取 `(N,K,T,policy)`，不读取 layout、
 payload、padded K、device capability 或 workspace。
 
-`WorkspaceArena&` 即使当前 route 不分配 scratch 也继续保留在 launcher 合同中。
+Pure Q5/Q6/W8 entry 与 Q4 一样是静态零 scratch，launcher 合同不保留未使用的 Arena。
 Full/Predicated、CUDA grid 切分、exact-T switch 和复合 launch 都是选中 launcher 的
 内部实现。
 

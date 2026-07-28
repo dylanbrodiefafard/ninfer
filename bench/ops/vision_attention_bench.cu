@@ -208,12 +208,9 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpy(device_cu.p, cu.data(), device_cu.bytes, cudaMemcpyHostToDevice));
     Tensor cu_seqlens(device_cu.p, DType::I32, {static_cast<std::int32_t>(cu.size())});
 
-    const std::int32_t descriptor_tiles =
-        ops::vision_attention_scratch_tiles(patches, opt.segments);
     const std::size_t workspace_bytes =
-        descriptor_tiles == 0
-            ? 1u
-            : static_cast<std::size_t>(descriptor_tiles) * 4u * sizeof(std::int32_t) + 255u;
+        std::max<std::size_t>(1, ops::vision_attention_workspace_capacity_bytes(
+                                     patches, patches, opt.segments, opt.segments));
     WorkspaceArena workspace(workspace_bytes);
 
     const std::int32_t tile =
@@ -239,10 +236,11 @@ int main(int argc, char** argv) {
         }
     };
 
-    const std::int32_t descriptor_query_tiles =
-        opt.segments == 1 ? (patches + 63) / 64 : descriptor_tiles;
+    const std::int64_t descriptor_query_tiles =
+        (static_cast<std::int64_t>(patches) + 63) / 64 +
+        (opt.segments == 1 ? 0 : static_cast<std::int64_t>(opt.segments) - 1);
     const std::int64_t launched_ctas =
-        opt.descriptor ? static_cast<std::int64_t>(descriptor_query_tiles) * kHeads : active_ctas;
+        opt.descriptor ? descriptor_query_tiles * kHeads : active_ctas;
     const double mathematical_flops =
         4.0 * static_cast<double>(opt.segments) * opt.length * opt.length * kDim * kHeads;
     const double padded_length    = static_cast<double>(q_tiles_per_segment * tile);

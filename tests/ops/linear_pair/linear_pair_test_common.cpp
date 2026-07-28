@@ -271,7 +271,6 @@ int run_w8_a16_shape(std::string_view label, const ShapeCase& shape) {
         first_device_weight.data(), fixture.first_row, kOutputRows);
     const Weight second_weight =
         second_storage.device_row_view(second_payload, fixture.second_row, kOutputRows);
-    WorkspaceArena workspace(256);
 
     int failures = 0;
     for (const std::int32_t t : tokens) {
@@ -284,12 +283,11 @@ int run_w8_a16_shape(std::string_view label, const ShapeCase& shape) {
         Tensor input(device_activation.data(), DType::BF16, {shape.k, t});
         Tensor first(first_output.data(), DType::BF16, {kOutputRows, t});
         Tensor second(second_output.data(), DType::BF16, {kOutputRows, t});
-        workspace.reset();
 
         const std::string case_label =
             std::string(label) + " [1024," + std::to_string(shape.k) + "] T=" + std::to_string(t);
         try {
-            ops::linear_pair(input, first_weight, second_weight, first, second, workspace, nullptr);
+            ops::linear_pair(input, first_weight, second_weight, first, second, nullptr);
             test::cuda_check(cudaDeviceSynchronize(), "synchronize linear_pair");
         } catch (const std::exception& error) {
             std::cerr << case_label << ": unexpected exception: " << error.what() << '\n';

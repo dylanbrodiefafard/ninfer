@@ -590,12 +590,12 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     Tensor tv(dv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, test_case.tokens});
     Tensor tp(dp.data(), DType::I32, {test_case.tokens});
     Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
-    const std::size_t workspace_bytes =
-        ops::gqa_attention_workspace_bytes(geometry.q_heads, test_case.tokens);
-    GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
-    WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
     const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
                                              test_case.envelope_max};
+    const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
+        geometry.q_heads, dtype, envelope, test_case.tokens, test_case.tokens);
+    GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
+    WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
     ops::gqa_attention(tq, tk, tv, tp, kAttentionScale, cache.view(), envelope, workspace, tout,
                        nullptr);
@@ -613,6 +613,10 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     failures += verify_positions(label + " positions unchanged", dp, positions);
     failures += dout.verify_guards((label + " output").c_str());
     failures += workspace_buffer.verify_guards((label + " workspace").c_str());
+    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+        std::cerr << label << ": workspace query/execution high-water mismatch\n";
+        ++failures;
+    }
     failures += cache.verify_guards(label);
     return failures;
 }
@@ -646,12 +650,12 @@ int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
     Tensor tp(dp.data(), DType::I32, {test_case.tokens});
     Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
-    const std::size_t workspace_bytes =
-        ops::gqa_attention_workspace_bytes(geometry.q_heads, test_case.tokens);
-    GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
-    WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
     const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
                                              test_case.envelope_max};
+    const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
+        geometry.q_heads, dtype, envelope, test_case.tokens, test_case.tokens);
+    GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
+    WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
     ops::gqa_attention_cached(tq, tp, kAttentionScale, cache.view(), envelope, workspace, tout,
                               nullptr);
@@ -667,6 +671,10 @@ int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     failures += verify_positions(label + " positions unchanged", dp, positions);
     failures += dout.verify_guards((label + " output").c_str());
     failures += workspace_buffer.verify_guards((label + " workspace").c_str());
+    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+        std::cerr << label << ": workspace query/execution high-water mismatch\n";
+        ++failures;
+    }
     failures += cache.verify_guards(label);
     return failures;
 }
@@ -705,6 +713,31 @@ int run_geometry(const Geometry& geometry) {
     return failures;
 }
 
+int verify_workspace_capacity_contract() {
+    int failures = 0;
+    for (const DType dtype : {DType::BF16, DType::I8}) {
+        constexpr ops::GqaExecutionEnvelope envelope{1, 1025};
+        const std::size_t interval =
+            ops::gqa_attention_workspace_capacity_bytes(16, dtype, envelope, 1, 17);
+        std::size_t witness = 0;
+        for (std::int32_t tokens = 1; tokens <= 17; ++tokens) {
+            witness = std::max(witness, ops::gqa_attention_workspace_capacity_bytes(
+                                            16, dtype, envelope, tokens, tokens));
+        }
+        if (interval != witness) {
+            std::cerr << "gqa_attention interval capacity has no exact route witness\n";
+            ++failures;
+        }
+    }
+    try {
+        (void)ops::gqa_attention_workspace_capacity_bytes(
+            16, DType::BF16, {1, std::numeric_limits<std::uint32_t>::max()}, 1, 1);
+        std::cerr << "gqa_attention accepted an envelope outside the launcher domain\n";
+        ++failures;
+    } catch (const std::invalid_argument&) {}
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -714,6 +747,7 @@ int main() {
     }
 
     int failures = 0;
+    failures += verify_workspace_capacity_contract();
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
     std::cout << (failures == 0 ? "PASS" : "FAIL")
               << " gqa_attention public-contract correctness\n";

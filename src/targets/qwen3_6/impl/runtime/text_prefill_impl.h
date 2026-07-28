@@ -89,7 +89,7 @@ void sample_from_hidden(State& state, const Tensor& hidden, std::int32_t absolut
     }
     state.work.reset();
     Tensor logits = state.io.logits.slice(1, 0, 1);
-    ops::linear(hidden, state.model.output_head, logits, state.work, state.device.stream);
+    ops::linear(hidden, state.model.output_head, logits, state.device.stream);
     CUDA_CHECK(cudaMemcpyAsync(state.io.pos.data, &absolute_position, sizeof(absolute_position),
                                cudaMemcpyHostToDevice, state.device.stream));
     ops::sample(logits, state.io.token, TextConfig::token_domain, state.sampling,

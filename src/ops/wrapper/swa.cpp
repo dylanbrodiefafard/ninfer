@@ -3,6 +3,7 @@
 #include "core/layout.h"
 #include "ops/launcher/swa.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -63,7 +64,8 @@ struct PartialWorkspace {
     Tensor l;
 };
 
-PartialWorkspace allocate_workspace(WorkspaceArena& workspace, std::int32_t tokens,
+template <class Allocator>
+PartialWorkspace allocate_workspace(Allocator& workspace, std::int32_t tokens,
                                     std::int32_t splits) {
     return {
         workspace.alloc(DType::BF16, {kHeadDim, kQHeads, tokens, splits}),
@@ -74,17 +76,18 @@ PartialWorkspace allocate_workspace(WorkspaceArena& workspace, std::int32_t toke
 
 } // namespace
 
-std::size_t swa_workspace_bytes(std::int32_t tokens) {
-    if (tokens < 1 || tokens > 16) { return 0; }
-    const auto plan = detail::swa_resolve_plan(
-        tokens, SwaContextExecutionEnvelope{1, std::numeric_limits<std::int32_t>::max()});
-    const Tensor acc(nullptr, DType::BF16, {kHeadDim, kQHeads, tokens, plan.split_capacity});
-    const Tensor stat(nullptr, DType::FP32, {kQHeads, tokens, plan.split_capacity});
-    LayoutBuilder layout;
-    (void)layout.add(acc.bytes(), 256, "SWA partial numerator");
-    (void)layout.add(stat.bytes(), 256, "SWA partial max");
-    (void)layout.add(stat.bytes(), 256, "SWA partial sum");
-    return layout.finish(256, "SWA workspace");
+std::size_t swa_workspace_capacity_bytes(SwaContextExecutionEnvelope envelope,
+                                         std::int32_t min_tokens, std::int32_t max_tokens) {
+    if (min_tokens < 1 || max_tokens < min_tokens || max_tokens > 16 ||
+        envelope.min_context > envelope.max_context ||
+        envelope.max_context >
+            static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::invalid_argument("swa workspace: invalid envelope or token interval");
+    }
+    const auto plan = detail::swa_resolve_plan(max_tokens, envelope);
+    WorkspaceLayoutBuilder layout;
+    (void)allocate_workspace(layout, max_tokens, plan.split_capacity);
+    return layout.peak_bytes(1);
 }
 
 void swa(const Tensor& q, const Tensor& query_k, const Tensor& query_v, const Tensor& positions,

@@ -393,17 +393,25 @@ oracle. Equality between those different numerical paths is not a contract or ac
 | GDN conv | 48 layers × 10240 × 3, plus slots | active sequence |
 | GDN recurrent | 48 layers × 48 heads × 128 × 128 FP32, plus slots | active sequence |
 | Text step buffers | token, positions, logits, verify/draft/sampling tensors | Program lifetime |
-| Vision workspace | patch/control/intermediate/merger tensors | one multimodal prefill |
-| Text workspace | chunk/block temporaries | arena scope |
+| Program scratch | Text/MTP/Vision phase temporaries | one phase in the shared workspace arena |
+| Vision request transient | encoded Vision output `[8192,V]` | active prefix during request begin |
 
 KV memory grows with configured context. GDN recurrent state does not, although MTP snapshot count
 changes its fixed allocation.
 
-The Program freezes its feature set at startup. A zero MTP draft window has no MTP weight view,
-MTP KV cache, or optimized proposal head. With Vision disabled, it has no Vision weight view and
-the shared workspace excludes the maximum Vision envelope; media is rejected by the matching
-Frontend. The complete artifact inventory is still validated before these resident views are
-published.
+The Program freezes its feature set and memory plan at startup. The Qwen3.6 family builds named
+Text-prefill, ordinary-round, MTP-prefill, MTP-round, and Vision phase capacities from the
+configured execution domains and reserves the maximum as one pure scratch arena. Sequential
+phases and scoped child Ops reuse it. Prefill allocations use
+`min(prefill_chunk,max_context)`; Vision is bounded by both the registered frontend geometry and
+`max_context`.
+
+Vision encoded output is not part of that arena: its separate request-transient allocation is
+reserved at startup and only an active prefix is exposed to a request. A zero MTP draft window has
+no MTP weight view, MTP KV cache, or optimized proposal head. With Vision disabled, it has no
+Vision weight view, Vision scratch phase, or request-transient allocation; media is rejected by the
+matching Frontend. CUDA Graph driver allowance is budgeted separately from both arenas. The
+complete artifact inventory is still validated before these resident views are published.
 
 ## 14. Implementation map
 

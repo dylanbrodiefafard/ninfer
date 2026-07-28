@@ -97,16 +97,6 @@ void validate_graph_ranges(const std::vector<GraphFrontierRange>& ranges,
     }
 }
 
-DeviceSpan workspace_scratch_span(DeviceArena& storage, const SequencePlanImpl& plan) {
-    if (plan.workspace_fixed_bytes > storage.capacity()) {
-        throw std::logic_error("fixed workspace exceeds its backing allocation");
-    }
-    return DeviceSpan{
-        static_cast<std::byte*>(storage.base()) + plan.workspace_fixed_bytes,
-        storage.capacity() - plan.workspace_fixed_bytes,
-    };
-}
-
 } // namespace
 
 ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const SequencePlanImpl& plan,
@@ -117,10 +107,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       kv_quant_group(plan.kv_quant_group), proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
       kv_payload_bytes(plan.persistent.kv_payload_bytes),
-      graph_allowance_bytes(plan.graph_allowance_bytes),
-      workspace_fixed_bytes(plan.workspace_fixed_bytes), persistent(plan.persistent.bytes),
-      workspace_storage(plan.workspace_bytes),
-      work(workspace_scratch_span(workspace_storage, plan)),
+      graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
+      persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
+      work(DeviceSpan{workspace_storage.base(), workspace_storage.capacity()}),
       round_host((static_cast<std::size_t>(draft_window) + 2ULL) * sizeof(std::int32_t)) {
     if (model.weights_arena == nullptr) {
         throw std::invalid_argument("Qwen3.6 model view has no owning weight arena");
@@ -141,12 +130,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
     decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder);
     if (plan.persistent.dflash) { dflash.emplace(backing, *plan.persistent.dflash); }
-    if (plan.features.dflash()) {
-        dflash_workspace.emplace(DeviceSpan{workspace_storage.base(), plan.workspace_fixed_bytes},
-                                 plan.dflash_workspace);
-    }
-    if (dflash.has_value() != plan.features.dflash() ||
-        dflash_workspace.has_value() != plan.features.dflash()) {
+    if (dflash.has_value() != plan.features.dflash()) {
         throw std::logic_error("DFlash state does not match the frozen sequence plan");
     }
 
@@ -184,6 +168,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                                cudaMemcpyHostToDevice, device.stream));
     device.synchronize();
     prepare_graphs();
+    work.reset();
+    work.reset_peak();
+    workspace_logical_peak_bytes = 0;
 }
 
 ProgramImplCore::~ProgramImplCore() noexcept {
@@ -296,10 +283,10 @@ void ProgramImplCore::prepare_graphs() {
     if (dflash) {
         initialize_cache(dflash->local);
         initialize_cache(dflash->full);
-        CUDA_CHECK(cudaMemsetAsync(dflash_workspace->target_features.data, 0,
-                                   dflash_workspace->target_features.bytes(), device.stream));
-        CUDA_CHECK(cudaMemsetAsync(dflash_workspace->feature_positions.data, 0,
-                                   dflash_workspace->feature_positions.bytes(), device.stream));
+        CUDA_CHECK(cudaMemsetAsync(dflash->target_features.data, 0, dflash->target_features.bytes(),
+                                   device.stream));
+        CUDA_CHECK(cudaMemsetAsync(dflash->feature_positions.data, 0,
+                                   dflash->feature_positions.bytes(), device.stream));
     }
     device.synchronize();
 
@@ -327,7 +314,6 @@ void ProgramImplCore::prepare_graphs() {
                                decoder->text_kv,
                                decoder->mtp_cache(),
                                dflash ? &*dflash : nullptr,
-                               dflash_workspace ? &*dflash_workspace : nullptr,
                                decoder->gdn,
                                io,
                                prefill_hidden,
@@ -454,10 +440,13 @@ void ProgramImplCore::copy_round_token() {
                                device.stream));
 }
 
+void ProgramImplCore::mark_workspace_usage(std::size_t phase_bytes) noexcept {
+    workspace_logical_peak_bytes = std::max(workspace_logical_peak_bytes, phase_bytes);
+}
+
 void ProgramImplCore::flush_dflash_context_prefix(std::uint32_t count) {
-    if (!dflash || !dflash_workspace || !pending_context_valid ||
-        dflash_context_frontier != pending_context_base || count == 0 ||
-        count > pending_context_count) {
+    if (!dflash || !pending_context_valid || dflash_context_frontier != pending_context_base ||
+        count == 0 || count > pending_context_count) {
         throw std::logic_error("DFlash context flush does not match the pending target features");
     }
     schedule::State state{device,
@@ -466,7 +455,6 @@ void ProgramImplCore::flush_dflash_context_prefix(std::uint32_t count) {
                           decoder->text_kv,
                           decoder->mtp_cache(),
                           &*dflash,
-                          &*dflash_workspace,
                           decoder->gdn,
                           io,
                           prefill_hidden,
@@ -480,10 +468,9 @@ void ProgramImplCore::flush_dflash_context_prefix(std::uint32_t count) {
                           diagnostic_text_tap,
                           diagnostic_vision_tap};
     set_device_i32(dflash->commit_count, checked_i32(count, "DFlash context commit count"));
-    Tensor features =
-        dflash_workspace->target_features.slice(1, 0, static_cast<std::int32_t>(count));
-    Tensor positions =
-        dflash_workspace->feature_positions.slice(0, 0, static_cast<std::int32_t>(count));
+    Tensor features  = dflash->target_features.slice(1, 0, static_cast<std::int32_t>(count));
+    Tensor positions = dflash->feature_positions.slice(0, 0, static_cast<std::int32_t>(count));
+    mark_workspace_usage(workspace_plan.dflash_context);
     schedule::dflash_append_context(state, features, positions, dflash->commit_count,
                                     {count, count});
     device.synchronize();
@@ -609,7 +596,6 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
             decoder->text_kv,
             decoder->mtp_cache(),
             dflash ? &*dflash : nullptr,
-            dflash_workspace ? &*dflash_workspace : nullptr,
             decoder->gdn,
             io,
             prefill_hidden,
@@ -626,6 +612,7 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
         bool dflash_prepared = false;
 
         if (had_suffix && plan.needs_mtp_bridge) {
+            mark_workspace_usage(workspace_plan.mtp_prefill);
             Tensor bridge_token = io.speculative.target_input_ids.slice(0, 0, 1);
             const TokenId token = prompt.token_ids[base];
             CUDA_CHECK(cudaMemcpyAsync(bridge_token.data, &token, sizeof(token),
@@ -640,6 +627,9 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
         }
 
         if (plan.vision) {
+            mark_workspace_usage(workspace_plan.vision_encode);
+            mark_workspace_usage(plan.prepare_mtp ? workspace_plan.mtp_prefill
+                                                  : workspace_plan.text_prefill);
             const auto multimodal_start = Clock::now();
             const schedule::MultimodalPrefillResult result =
                 schedule::prefill_multimodal(schedule_state, prompt, *plan.vision, transient,
@@ -655,6 +645,9 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
         } else {
             const auto text_start = Clock::now();
             if (had_suffix) {
+                mark_workspace_usage(plan.prepare_mtp ? workspace_plan.mtp_prefill
+                                                      : workspace_plan.text_prefill);
+                if (dflash) { mark_workspace_usage(workspace_plan.dflash_context); }
                 mtp_prepared = schedule::prefill_text(
                     schedule_state, std::span<const TokenId>(prompt.token_ids).subspan(base),
                     snapshot_boundary, plan.prepare_mtp);
@@ -662,6 +655,7 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
                     base, prompt_tokens, prefill_chunk, snapshot_boundary);
                 copy_tail(prefill_hidden.slice(1, static_cast<int>(final_length) - 1, 1));
             } else {
+                mark_workspace_usage(workspace_plan.ordinary_round);
                 if (!tail_hidden_valid) {
                     throw std::logic_error("zero-suffix reuse has no target tail hidden");
                 }
@@ -681,6 +675,7 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
             if (dflash) {
                 dflash_context_frontier = prompt_tokens;
                 if (plan.prepare_dflash) {
+                    mark_workspace_usage(workspace_plan.dflash_proposal);
                     schedule::dflash_propose(
                         schedule_state, draft_window,
                         dflash_envelopes(prompt_tokens, prompt_tokens, draft_window));
@@ -803,7 +798,6 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
             decoder->text_kv,
             decoder->mtp_cache(),
             dflash ? &*dflash : nullptr,
-            dflash_workspace ? &*dflash_workspace : nullptr,
             decoder->gdn,
             io,
             prefill_hidden,
@@ -821,6 +815,7 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
         std::uint32_t accepted = 0;
         PendingKind kind       = PendingKind::Ordinary;
         if (use_mtp) {
+            mark_workspace_usage(workspace_plan.mtp_round);
             DecodeGraph* graph = nullptr;
             auto envelopes     = mtp_gqa_envelopes(base_E, base_E, draft_window);
             if (use_cuda_graph && diagnostic_text_tap == nullptr) {
@@ -861,6 +856,7 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
             drafts_ready      = true;
             tail_hidden_valid = true;
         } else if (use_dflash) {
+            mark_workspace_usage(workspace_plan.dflash_round);
             const bool steady  = pending_context_valid;
             DecodeGraph* graph = nullptr;
             auto envelopes     = dflash_envelopes(base_E, base_E, draft_window);
@@ -919,9 +915,10 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
             tail_hidden_valid        = true;
         } else {
             if (dflash && pending_context_valid) {
-                Tensor features = dflash_workspace->target_features.slice(
+                mark_workspace_usage(workspace_plan.dflash_context);
+                Tensor features = dflash->target_features.slice(
                     1, 0, static_cast<std::int32_t>(draft_window + 1));
-                Tensor positions = dflash_workspace->feature_positions.slice(
+                Tensor positions = dflash->feature_positions.slice(
                     0, 0, static_cast<std::int32_t>(draft_window + 1));
                 schedule::dflash_append_context(schedule_state, features, positions,
                                                 io.speculative.produced_count,
@@ -932,7 +929,8 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
                 pending_context_valid   = false;
             }
             const bool align_mtp = decoder->mtp_cache() != nullptr && mtp_kv_valid == base_E;
-            DecodeGraph* graph   = nullptr;
+            mark_workspace_usage(workspace_plan.ordinary_round);
+            DecodeGraph* graph = nullptr;
             ops::GqaExecutionEnvelope envelope{base_E + 1, base_E + 1};
             if (use_cuda_graph && diagnostic_text_tap == nullptr) {
                 OrdinaryGraphVariant& variant =
@@ -1094,10 +1092,10 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.weights = ArenaMemorySummary{weights.capacity(), weights.used(), weights.peak_used()};
     out.sequence =
         ArenaMemorySummary{persistent.capacity(), persistent.used(), persistent.peak_used()};
-    out.workspace =
-        ArenaMemorySummary{workspace_storage.capacity(), workspace_fixed_bytes + work.used(),
-                           workspace_fixed_bytes + work.peak_used()};
-    out.kv_payload_bytes = kv_payload_bytes;
+    out.workspace = ArenaMemorySummary{workspace_storage.capacity(), work.used(), work.peak_used()};
+    out.workspace_logical_peak_bytes = workspace_logical_peak_bytes;
+    out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
+    out.kv_payload_bytes             = kv_payload_bytes;
     return out;
 }
 
@@ -1128,6 +1126,7 @@ void ProgramImplCore::reset_memory_peaks() noexcept {
     model.weights_arena->reset_peak();
     persistent.reset_peak();
     work.reset_peak();
+    workspace_logical_peak_bytes = 0;
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

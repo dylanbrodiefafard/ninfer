@@ -26,8 +26,8 @@ auto ordinary_body(State& state, bool align_mtp, ops::GqaExecutionEnvelope envel
         target_verify(card, state, verify_id, position, envelope);
         if (state.dflash != nullptr) {
             ops::set_i32_scalar(state.dflash->commit_count, 1, state.device.stream);
-            Tensor features  = state.dflash_workspace->target_features.slice(1, 0, 1);
-            Tensor positions = state.dflash_workspace->feature_positions.slice(0, 0, 1);
+            Tensor features  = state.dflash->target_features.slice(1, 0, 1);
+            Tensor positions = state.dflash->feature_positions.slice(0, 0, 1);
             dflash_append_context(state, features, positions, state.dflash->commit_count, {1, 1});
         }
 

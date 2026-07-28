@@ -439,7 +439,7 @@ W8PairPlan w8_pair_resolve_plan(const W8PairProblem& problem) {
     const auto resolve_from = [&](const auto& routes) -> W8PairPlan {
         for (const W8PairRouteSpec& route : routes) {
             if (problem.cols >= route.first && problem.cols <= route.last) {
-                return {route.schedule, 0};
+                return {route.schedule};
             }
         }
         throw std::logic_error("w8 pair: admitted problem has no covering route");
@@ -549,7 +549,7 @@ void w8_pair_execute_plan(W8PairPlan plan, const Tensor& x, const Weight& first_
                           cudaStream_t stream) {
     const W8PairProblem problem = w8_pair_problem(x, first_weight, first_out);
     const W8PairPlan resolved   = w8_pair_resolve_plan(problem);
-    if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
+    if (resolved.schedule != plan.schedule) {
         throw std::invalid_argument("w8 pair: plan does not match the exact problem");
     }
 

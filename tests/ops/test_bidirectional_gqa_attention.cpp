@@ -197,11 +197,13 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     Tensor out_tensor(d_out.data(), DType::BF16, {kD, kQHeads, tokens});
     KVCacheLayerView context =
         make_context_view(d_context_k, d_context_v, max_context, padded_context);
-    DeviceArena workspace(ops::bidirectional_gqa_attention_workspace_bytes(tokens));
+    const ops::GqaContextExecutionEnvelope envelope{0, static_cast<std::uint32_t>(envelope_max)};
+    const std::size_t workspace_bytes =
+        ops::bidirectional_gqa_attention_workspace_capacity_bytes(envelope, tokens, tokens);
+    DeviceArena workspace(workspace_bytes);
 
     ops::bidirectional_gqa_attention(q_tensor, query_k_tensor, query_v_tensor, length_tensor,
-                                     kScale, context, {0, static_cast<std::uint32_t>(envelope_max)},
-                                     workspace, out_tensor, nullptr);
+                                     kScale, context, envelope, workspace, out_tensor, nullptr);
     cuda_synchronize();
 
     std::string label = "bidirectional_gqa_attention T=" + std::to_string(tokens) +
@@ -230,6 +232,10 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
                      from_device<std::uint16_t>(d_context_v, context_count), context_v_expected);
     failures += verify_exact((label + " context length unchanged").c_str(),
                              from_device<int>(d_length, 1), length_expected);
+    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+        std::cerr << label << ": workspace query/execution high-water mismatch\n";
+        ++failures;
+    }
     return failures;
 }
 
@@ -242,6 +248,21 @@ int main() {
     }
 
     int failures = 0;
+    constexpr ops::GqaContextExecutionEnvelope capacity_envelope{0, 196609};
+    const std::size_t interval =
+        ops::bidirectional_gqa_attention_workspace_capacity_bytes(capacity_envelope, 1, 16);
+    const std::size_t witness = std::max(
+        ops::bidirectional_gqa_attention_workspace_capacity_bytes(capacity_envelope, 8, 8),
+        ops::bidirectional_gqa_attention_workspace_capacity_bytes(capacity_envelope, 16, 16));
+    if (interval != witness) {
+        std::cerr << "bidirectional GQA interval capacity missed a token-band endpoint\n";
+        ++failures;
+    }
+    try {
+        (void)ops::bidirectional_gqa_attention_workspace_capacity_bytes(capacity_envelope, 9, 8);
+        std::cerr << "bidirectional GQA accepted an invalid token interval\n";
+        ++failures;
+    } catch (const std::invalid_argument&) {}
     failures += run_case(1, 0);
     failures += run_case(2, 1);
     failures += run_case(8, 95, InputProfile::Random, 4096);

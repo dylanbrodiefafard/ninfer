@@ -56,8 +56,6 @@ ControllerResult run_one(Program& program, PreparedPrompt prompt, OutputSession 
     if (plan_summary.effective_output_tokens == 0) {
         return finish_without_execution(plan_summary.effective_limit_reason);
     }
-    request_memory.ensure(plan_summary.transient_bytes, plan_summary.transient_alignment);
-
     GenerationBudget budget(plan_summary.effective_output_tokens,
                             plan_summary.effective_limit_reason);
     result.generated_token_ids.reserve(plan_summary.effective_output_tokens);
@@ -105,11 +103,25 @@ ControllerResult run_one(Program& program, PreparedPrompt prompt, OutputSession 
 
     if (cancellation.requested()) { return finish_without_execution(FinishReason::Cancelled); }
 
+    request_memory.activate(plan_summary.transient_bytes, plan_summary.transient_alignment);
+
+    struct DeactivateGuard {
+        RequestMemory* memory = nullptr;
+
+        ~DeactivateGuard() {
+            if (memory != nullptr) { memory->deactivate(); }
+        }
+
+        void release() noexcept { memory = nullptr; }
+    } transient_guard{&request_memory};
+
     const auto prefill_start = Clock::now();
     auto first               = [&] {
         nvtx::ScopedRange prefill_range(nvtx::Name::Prefill, nvtx::Category::Prefill);
         return program.begin(std::move(prompt), std::move(plan), request_memory.region());
     }();
+    request_memory.deactivate();
+    transient_guard.release();
     result.prefill_seconds = std::chrono::duration<double>(Clock::now() - prefill_start).count();
     result.summary.begin   = first.summary;
     guard.arm();

@@ -54,10 +54,14 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& probl
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId schedule,
                                                     const Bf16GdnGatingProblem& problem);
 
-std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t max_cols);
+std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t heads, std::int32_t input_rows,
+                                                     std::int32_t min_cols, std::int32_t max_cols);
 const char* bf16_gdn_norm_gating_schedule_name(Bf16GdnNormGatingScheduleId schedule) noexcept;
 Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProblem& problem);
-std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t max_cols);
+std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t heads,
+                                                          std::int32_t input_rows,
+                                                          std::int32_t min_cols,
+                                                          std::int32_t max_cols);
 
 void bf16_gdn_gating_execute_plan(const Bf16GdnGatingPlan& plan, const Tensor& x,
                                   const Weight& a_weight, const Weight& b_weight,

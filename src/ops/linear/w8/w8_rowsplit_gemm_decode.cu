@@ -89,9 +89,7 @@ void launch_decode(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t s
 
 } // namespace
 
-void launch_w8_decode_r4(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
-                         cudaStream_t stream) {
-    (void)ws;
+void launch_w8_decode_r4(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     launch_decode<4>(x, w, out, stream);
 }
 

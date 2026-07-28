@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/arena.h"
+#include "core/tensor.h"
 
 #include <cuda_runtime.h>
 
@@ -25,7 +25,6 @@ struct Q4Q5GdnInputProblem {
 
 struct Q4Q5GdnInputPlan {
     Q4Q5GdnInputScheduleId schedule;
-    std::size_t workspace_bytes;
 };
 
 const char* q4_q5_gdn_input_schedule_name(Q4Q5GdnInputScheduleId schedule) noexcept;
@@ -33,13 +32,10 @@ const char* q4_q5_gdn_input_schedule_name(Q4Q5GdnInputScheduleId schedule) noexc
 bool q4_q5_gdn_input_admits(const Q4Q5GdnInputProblem& problem) noexcept;
 Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem);
 
-std::size_t q4_q5_gdn_input_capacity_workspace_bytes(std::int32_t qk_rows, std::int32_t value_rows,
-                                                     std::int32_t max_cols);
-
 void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
                                   const Weight& qk_weight, const Weight& v_weight, Tensor& qkv,
-                                  WorkspaceArena& ws, cudaStream_t stream);
+                                  cudaStream_t stream);
 void q4_q5_gdn_input_dispatch(const Tensor& x, const Weight& qk_weight, const Weight& v_weight,
-                              Tensor& qkv, WorkspaceArena& ws, cudaStream_t stream);
+                              Tensor& qkv, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

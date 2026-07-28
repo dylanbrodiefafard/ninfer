@@ -54,8 +54,10 @@ void bidirectional_gqa_attention(const Tensor& q, const Tensor& query_k, const T
                                  Tensor& out, cudaStream_t stream);
 
 /**
- * Returns the transient arena capacity required for one exact T in the optimized T=1..16 domain.
+ * Returns the transient arena capacity required for every T in the inclusive optimized interval.
+ * The execution envelope is the fixed profile; invalid profiles or intervals throw.
  */
-[[nodiscard]] std::size_t bidirectional_gqa_attention_workspace_bytes(std::int32_t tokens);
+[[nodiscard]] std::size_t bidirectional_gqa_attention_workspace_capacity_bytes(
+    GqaContextExecutionEnvelope envelope, std::int32_t min_tokens, std::int32_t max_tokens);
 
 } // namespace ninfer::ops

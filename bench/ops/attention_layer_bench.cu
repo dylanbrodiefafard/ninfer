@@ -300,7 +300,7 @@ struct Geometry27 {
                                  WorkspaceArena& workspace, cudaStream_t stream) {
         if (!input1.has_value()) { throw std::logic_error("27B gate/value weight is missing"); }
         ops::attn_input_proj(hidden_tensor, input0.weight, input1->weight, query, gate, key, value,
-                             workspace, stream);
+                             stream);
     }
 
     static void input_projection_control(const Tensor& hidden_tensor,
@@ -353,8 +353,7 @@ struct Geometry35 {
                                  const std::optional<bench::PackedQuantizedWeight>&, Tensor& query,
                                  Tensor& gate, Tensor& key, Tensor& value,
                                  WorkspaceArena& workspace, cudaStream_t stream) {
-        ops::attn_input_proj(hidden_tensor, input0.weight, query, gate, key, value, workspace,
-                             stream);
+        ops::attn_input_proj(hidden_tensor, input0.weight, query, gate, key, value, stream);
     }
 
     static void input_projection_control(const Tensor& hidden_tensor,
@@ -584,9 +583,13 @@ void run_geometry(const Options& options, cudaStream_t stream, ninfer::DeviceBuf
     KVCache cache(cache_arena.alloc_bytes(cache_arena.capacity()), cache_layout);
     CUDA_CHECK(cudaMemset(cache_arena.base(), 0, cache_arena.capacity()));
 
-    const std::size_t workspace_bytes = std::max(
-        ops::gqa_attention_workspace_bytes(Geometry::query_heads, max_tokens),
-        ops::linear_add_workspace_bytes(Geometry::hidden, Geometry::query_rows, max_tokens));
+    const std::size_t workspace_bytes =
+        std::max(ops::gqa_attention_workspace_capacity_bytes(
+                     Geometry::query_heads, kv_dtype, {1, static_cast<std::uint32_t>(max_context)},
+                     1, max_tokens),
+                 ops::linear_add_workspace_capacity_bytes(
+                     Geometry::hidden == 5120 ? QType::Q5G64_F16S : QType::W8G32_F16S,
+                     Geometry::hidden, Geometry::query_rows, 1, max_tokens));
     Resources<Geometry> resources(max_tokens, workspace_bytes);
 
     for (const std::int32_t context : options.contexts) {

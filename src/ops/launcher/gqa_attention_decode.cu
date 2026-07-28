@@ -187,14 +187,19 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
 
 bool gqa_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && tokens <= 6; }
 
-std::int32_t gqa_attention_decode_splits(std::int32_t q_heads, std::int32_t kv_heads) {
-    if (q_heads == Gqa27Geometry::QHeads && kv_heads == Gqa27Geometry::KVHeads) {
-        return Gqa27Geometry::DecodeSplits;
+std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
+                                          DType cache_dtype, GqaExecutionEnvelope envelope) {
+    if (tokens < 1 || tokens > 6 || (cache_dtype != DType::BF16 && cache_dtype != DType::I8) ||
+        envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
+        throw std::invalid_argument("gqa_attention split capacity: invalid profile");
     }
-    if (q_heads == Gqa35Geometry::QHeads && kv_heads == Gqa35Geometry::KVHeads) {
-        return Gqa35Geometry::DecodeSplits;
+    if (q_heads == Gqa27Geometry::QHeads) {
+        return gqa_small_t_launch_capacity<Gqa27Geometry>(envelope, tokens, cache_dtype);
     }
-    throw std::invalid_argument("gqa_attention_decode_splits: unsupported head geometry");
+    if (q_heads == Gqa35Geometry::QHeads) {
+        return gqa_small_t_launch_capacity<Gqa35Geometry>(envelope, tokens, cache_dtype);
+    }
+    throw std::invalid_argument("gqa_attention split capacity: unsupported head geometry");
 }
 
 template <typename Geometry, typename CacheInput>

@@ -2,6 +2,7 @@
 
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/residual_add.h"
+#include "core/layout.h"
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 
 #include <algorithm>
@@ -68,17 +69,15 @@ bool supported_shape(const Q5LinearAddProblem& problem) noexcept {
     return false;
 }
 
-std::size_t checked_matrix_bytes(std::int32_t rows, std::int32_t cols) {
-    const std::size_t r = static_cast<std::size_t>(rows);
-    const std::size_t c = static_cast<std::size_t>(cols);
-    if (c != 0 && r > std::numeric_limits<std::size_t>::max() / c) {
-        throw std::overflow_error("q5 linear_add: workspace element count overflows size_t");
-    }
-    const std::size_t elements = r * c;
-    if (elements > std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t)) {
-        throw std::overflow_error("q5 linear_add: workspace byte count overflows size_t");
-    }
-    return elements * sizeof(std::uint16_t);
+template <class Allocator>
+Tensor allocate_materialized_workspace(Allocator& allocator, std::int32_t rows, std::int32_t cols) {
+    return allocator.alloc(DType::BF16, {rows, cols});
+}
+
+std::size_t materialized_workspace_bytes(std::int32_t rows, std::int32_t cols) {
+    WorkspaceLayoutBuilder layout;
+    (void)allocate_materialized_workspace(layout, rows, cols);
+    return layout.peak_bytes(1);
 }
 
 } // namespace
@@ -116,7 +115,7 @@ Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem) {
         case Q5LinearAddScheduleId::GemvResidual:
             return plan;
         case Q5LinearAddScheduleId::Materialized: {
-            plan.workspace_bytes = checked_matrix_bytes(problem.rows, problem.cols);
+            plan.workspace_bytes = materialized_workspace_bytes(problem.rows, problem.cols);
             return plan;
         }
         case Q5LinearAddScheduleId::MmaResidualR64C64:
@@ -128,13 +127,17 @@ Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem) {
 }
 
 std::size_t q5_linear_add_capacity_workspace_bytes(std::int32_t rows, std::int32_t k,
-                                                   std::int32_t padded_k, std::int32_t max_cols) {
-    const Q5LinearAddProblem maximum_problem{rows, k, padded_k, max_cols};
-    (void)q5_linear_add_resolve_plan(maximum_problem);
+                                                   std::int32_t padded_k, std::int32_t min_cols,
+                                                   std::int32_t max_cols) {
+    if (min_cols <= 0 || max_cols < min_cols) {
+        throw std::invalid_argument("q5 linear_add: invalid column interval");
+    }
+    (void)q5_linear_add_resolve_plan({rows, k, padded_k, min_cols});
+    (void)q5_linear_add_resolve_plan({rows, k, padded_k, max_cols});
 
     std::size_t maximum = 0;
     for (const RouteSpec& route : kRoutes) {
-        if (route.cols.first > max_cols) { continue; }
+        if (route.cols.last < min_cols || route.cols.first > max_cols) { continue; }
         const std::int32_t endpoint = std::min(route.cols.last, max_cols);
         maximum                     = std::max(
             maximum, q5_linear_add_resolve_plan({rows, k, padded_k, endpoint}).workspace_bytes);
@@ -156,8 +159,8 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
         return;
     case Q5LinearAddScheduleId::Materialized: {
         auto scratch_scope = ws.scope();
-        Tensor projected   = ws.alloc(DType::BF16, {problem.rows, problem.cols});
-        linear(x, w, projected, ws, stream);
+        Tensor projected   = allocate_materialized_workspace(ws, problem.rows, problem.cols);
+        linear(x, w, projected, stream);
         residual_add(projected, residual_out, stream);
         return;
     }

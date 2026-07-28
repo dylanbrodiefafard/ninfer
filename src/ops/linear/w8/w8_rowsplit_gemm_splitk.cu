@@ -62,9 +62,7 @@ void launch_medium(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t s
 
 } // namespace
 
-void launch_w8_exact_t_splitk(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
-                              cudaStream_t stream) {
-    (void)ws;
+void launch_w8_exact_t_splitk(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     require_problem(x, w, out);
     if (x.ne[1] < kFirstExactCols || x.ne[1] > kLastExactCols) {
         throw std::invalid_argument("W8 exact-T split-K requires T=2..32");
@@ -73,7 +71,7 @@ void launch_w8_exact_t_splitk(const Tensor& x, const Weight& w, Tensor& out, Wor
     CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_w8_exact_t_composite(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+void launch_w8_exact_t_composite(const Tensor& x, const Weight& w, Tensor& out,
                                  cudaStream_t stream) {
     require_problem(x, w, out);
     if (x.ne[1] < 33 || x.ne[1] > 127) {
@@ -84,7 +82,7 @@ void launch_w8_exact_t_composite(const Tensor& x, const Weight& w, Tensor& out, 
     while (x.ne[1] - offset >= 32) {
         const Tensor x_slice = x.slice(1, offset, 32);
         Tensor out_slice     = out.slice(1, offset, 32);
-        launch_w8_exact_t_splitk(x_slice, w, out_slice, ws, stream);
+        launch_w8_exact_t_splitk(x_slice, w, out_slice, stream);
         offset += 32;
     }
     const std::int32_t tail = x.ne[1] - offset;
@@ -95,14 +93,12 @@ void launch_w8_exact_t_composite(const Tensor& x, const Weight& w, Tensor& out, 
     } else if (tail >= 2) {
         const Tensor x_slice = x.slice(1, offset, tail);
         Tensor out_slice     = out.slice(1, offset, tail);
-        launch_w8_exact_t_splitk(x_slice, w, out_slice, ws, stream);
+        launch_w8_exact_t_splitk(x_slice, w, out_slice, stream);
     }
 }
 
 template <int TileCols, int KSplits, int NGroups, int MinBlocks>
-void launch_medium_route(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
-                         cudaStream_t stream) {
-    (void)ws;
+void launch_medium_route(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     require_problem(x, w, out);
     if (x.ne[1] > TileCols) {
         throw std::invalid_argument("W8 medium-T split-K route does not cover this T");
@@ -111,19 +107,19 @@ void launch_medium_route(const Tensor& x, const Weight& w, Tensor& out, Workspac
     CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_w8_medium_splitk_c96(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+void launch_w8_medium_splitk_c96(const Tensor& x, const Weight& w, Tensor& out,
                                  cudaStream_t stream) {
-    launch_medium_route<96, 2, 6, 3>(x, w, out, ws, stream);
+    launch_medium_route<96, 2, 6, 3>(x, w, out, stream);
 }
 
-void launch_w8_medium_splitk_c128(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+void launch_w8_medium_splitk_c128(const Tensor& x, const Weight& w, Tensor& out,
                                   cudaStream_t stream) {
-    launch_medium_route<128, 2, 4, 2>(x, w, out, ws, stream);
+    launch_medium_route<128, 2, 4, 2>(x, w, out, stream);
 }
 
-void launch_w8_medium_splitk_c144(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+void launch_w8_medium_splitk_c144(const Tensor& x, const Weight& w, Tensor& out,
                                   cudaStream_t stream) {
-    launch_medium_route<144, 2, 9, 2>(x, w, out, ws, stream);
+    launch_medium_route<144, 2, 9, 2>(x, w, out, stream);
 }
 
 } // namespace ninfer::ops::detail

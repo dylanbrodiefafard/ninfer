@@ -145,7 +145,7 @@ int run(const Options& options) {
 
         const auto body = [&](cudaStream_t body_stream) {
             ops::rmsnorm(x, norm_weight, kRmsEps, true, normalized, body_stream);
-            ops::linear(normalized, head.weight, output, workspace, body_stream);
+            ops::linear(normalized, head.weight, output, body_stream);
             if (options.argmax_block == 0) {
                 ops::argmax(output, selected, kValidVocab, body_stream);
             } else {

@@ -23,10 +23,14 @@ enum class SparseMoeEpilogue : std::uint8_t {
 };
 
 /**
- * Returns the transient capacity required by SparseMoe for every positive token count up to
- * max_tokens.
+ * Returns the transient capacity required by SparseMoe for every T in the inclusive
+ * [min_tokens,max_tokens] interval. The routed QTypes are the fixed implementation profile.
+ * Invalid profiles or intervals throw.
  */
-[[nodiscard]] std::size_t sparse_moe_workspace_bytes(std::int32_t max_tokens);
+[[nodiscard]] std::size_t sparse_moe_workspace_capacity_bytes(QType routed_gate_up,
+                                                              QType routed_down,
+                                                              std::int32_t min_tokens,
+                                                              std::int32_t max_tokens);
 
 /**
  * Closed sparse-MoE Op for the exact future 35B-A3B geometry.

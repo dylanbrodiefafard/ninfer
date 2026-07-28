@@ -19,7 +19,8 @@ using namespace ninfer::runtime;
 
 enum class Event : std::uint8_t {
     Plan,
-    EnsureMemory,
+    ActivateMemory,
+    DeactivateMemory,
     Begin,
     Decode,
     Preview,
@@ -75,6 +76,7 @@ struct Resolution {
 struct FakeProgram {
     [[nodiscard]] FakePlan plan_request(const FakePrompt&, const ExecutionOptions& execution) {
         log->add(Event::Plan);
+        if (cancel_during_plan != nullptr) { *cancel_during_plan = true; }
         return FakePlan{RequestPlanSummary{
             .prompt_tokens           = 4,
             .reusable_prompt_tokens  = 0,
@@ -89,6 +91,7 @@ struct FakeProgram {
     [[nodiscard]] BeginResult begin(FakePrompt&&, FakePlan&&, FakeRegion) {
         if (rounds.empty()) { throw std::logic_error("fake program has no first round"); }
         log->add(Event::Begin);
+        if (throw_in_begin) { throw std::runtime_error("fake begin failure"); }
         next_round = 1;
         if (cancel_during_begin != nullptr) { *cancel_during_begin = true; }
         return BeginResult{
@@ -130,23 +133,32 @@ struct FakeProgram {
     std::size_t next_round                = 0;
     std::size_t finish_active_calls       = 0;
     std::size_t abort_calls               = 0;
+    bool* cancel_during_plan              = nullptr;
     bool* cancel_during_begin             = nullptr;
+    bool throw_in_begin                   = false;
     std::uint32_t effective_output_tokens = 8;
     FinishReason effective_limit_reason   = FinishReason::OutputLimit;
 };
 
 struct FakeRequestMemory {
-    void ensure(std::size_t bytes, std::size_t alignment) {
-        log->add(Event::EnsureMemory);
-        ensured_bytes     = bytes;
-        ensured_alignment = alignment;
+    void activate(std::size_t bytes, std::size_t alignment) {
+        log->add(Event::ActivateMemory);
+        active              = true;
+        activated_bytes     = bytes;
+        activated_alignment = alignment;
+    }
+
+    void deactivate() noexcept {
+        log->add(Event::DeactivateMemory);
+        active = false;
     }
 
     [[nodiscard]] FakeRegion region() const noexcept { return {}; }
 
-    EventLog* log                 = nullptr;
-    std::size_t ensured_bytes     = 0;
-    std::size_t ensured_alignment = 0;
+    EventLog* log                   = nullptr;
+    std::size_t activated_bytes     = 0;
+    std::size_t activated_alignment = 0;
+    bool active                     = false;
 };
 
 struct PreviewStep {
@@ -294,6 +306,39 @@ int test_continue_then_partial_terminal_round() {
     failures += check(last_resolve < last_commit && last_commit < last_publish,
                       "terminal round was published before model and decoder commit");
     failures += check(program.abort_calls == 0, "successful generation was aborted");
+    failures +=
+        check(!memory.active && memory.activated_bytes == 128 && memory.activated_alignment == 64,
+              "request transient was not activated exactly for begin and released");
+    failures += check(log.position(Event::Plan) < log.position(Event::ActivateMemory) &&
+                          log.position(Event::ActivateMemory) < log.position(Event::Begin) &&
+                          log.position(Event::Begin) < log.position(Event::DeactivateMemory) &&
+                          log.position(Event::DeactivateMemory) < log.position(Event::Preview),
+                      "request transient lifetime did not exactly enclose begin");
+    return failures;
+}
+
+int test_cancellation_after_planning_skips_activation() {
+    EventLog log;
+    bool cancelled = false;
+    FakeProgram program{
+        .log                = &log,
+        .rounds             = {{30}},
+        .cancel_during_plan = &cancelled,
+    };
+    FakeOutputState output_state{.log = &log};
+    FakeRequestMemory memory{.log = &log};
+    FakeSink sink(log);
+    const CancellationView cancellation([&cancelled] { return cancelled; });
+
+    const ControllerResult result = run_one(program, FakePrompt{}, FakeOutputSession{&output_state},
+                                            memory, request_options(), cancellation, &sink);
+
+    int failures = 0;
+    failures += check(result.summary.finish_reason == FinishReason::Cancelled,
+                      "post-plan cancellation returned the wrong finish reason");
+    failures += check(log.count(Event::Plan) == 1 && log.count(Event::ActivateMemory) == 0 &&
+                          log.count(Event::Begin) == 0,
+                      "post-plan cancellation activated request memory or began execution");
     return failures;
 }
 
@@ -372,13 +417,42 @@ int test_cancellation_discards_provisional_round() {
     return failures;
 }
 
+int test_begin_exception_deactivates_request_memory() {
+    EventLog log;
+    FakeProgram program{
+        .log            = &log,
+        .rounds         = {{40}},
+        .throw_in_begin = true,
+    };
+    FakeOutputState output_state{.log = &log};
+    FakeRequestMemory memory{.log = &log};
+    FakeSink sink(log);
+    const CancellationView cancellation;
+
+    bool threw = false;
+    try {
+        (void)run_one(program, FakePrompt{}, FakeOutputSession{&output_state}, memory,
+                      request_options(), cancellation, &sink);
+    } catch (const std::runtime_error&) { threw = true; }
+
+    int failures = 0;
+    failures += check(threw, "begin exception was not propagated");
+    failures += check(!memory.active, "begin exception left request transient active");
+    failures +=
+        check(log.count(Event::ActivateMemory) == 1 && log.count(Event::DeactivateMemory) == 1,
+              "begin exception did not execute the transient RAII cleanup exactly once");
+    return failures;
+}
+
 } // namespace
 
 int main() {
     try {
         const int failures = test_continue_then_partial_terminal_round() +
+                             test_cancellation_after_planning_skips_activation() +
                              test_cancellation_between_rounds_finishes_active_sequence() +
-                             test_cancellation_discards_provisional_round();
+                             test_cancellation_discards_provisional_round() +
+                             test_begin_exception_deactivates_request_memory();
         if (failures == 0) { std::cout << "ok\n"; }
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

@@ -61,6 +61,7 @@ ninfer_add_test(ninfer_artifact_materialization_test
 ninfer_add_test(ninfer_device_test       SOURCES test_device.cpp)
 ninfer_add_test(ninfer_tensor_test       SOURCES test_tensor.cpp)
 ninfer_add_test(ninfer_arena_test        SOURCES test_arena.cpp)
+ninfer_add_test(ninfer_request_memory_test SOURCES test_request_memory.cpp)
 ninfer_add_test(ninfer_kv_cache_test
   SOURCES test_kv_cache.cpp
   LIBRARIES ninfer_core)
@@ -71,6 +72,7 @@ set_tests_properties(
   ninfer_artifact_materialization_test
   ninfer_device_test
   ninfer_arena_test
+  ninfer_request_memory_test
   ninfer_kv_cache_test
   ninfer_state_store_test
   PROPERTIES SKIP_RETURN_CODE 77)

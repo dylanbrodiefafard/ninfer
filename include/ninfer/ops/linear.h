@@ -1,6 +1,5 @@
 #pragma once
 
-#include "core/arena.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h>
@@ -73,25 +72,23 @@ enum class LinearPolicy : std::uint8_t {
  * @param[out] out Contiguous, non-null, 16-byte-aligned BF16 output matrix `[N,T]`. It must not
  * overlap `x` or any weight plane.
  * @param[in] policy Permitted private activation-compute profiles.
- * @param[in,out] ws Caller-owned transient storage. It carries no semantic state beyond the call.
  * @param[in] stream CUDA stream on which execution is enqueued.
  */
-void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy, WorkspaceArena& ws,
+void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
             cudaStream_t stream);
 
 /**
  * @brief Applies the A16-only form of the bias-free matrix projection.
  *
  * @details This overload is exactly equivalent to
- * `linear(x, w, out, LinearPolicy::A16Only, ws, stream)`. All tensor, weight, aliasing, workspace,
- * and execution-domain requirements of the policy-bearing overload apply.
+ * `linear(x, w, out, LinearPolicy::A16Only, stream)`. All tensor, weight, aliasing, and
+ * execution-domain requirements of the policy-bearing overload apply.
  *
  * @param[in] x Contiguous BF16 input matrix `[K,T]`.
  * @param[in] w Logical weight matrix `[N,K]` in a registered persistent format and layout.
  * @param[out] out Contiguous BF16 output matrix `[N,T]`.
- * @param[in,out] ws Caller-owned transient storage.
  * @param[in] stream CUDA stream on which execution is enqueued.
  */
-void linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws, cudaStream_t stream);
+void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops

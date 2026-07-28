@@ -9,6 +9,11 @@
 
 namespace ninfer::ops {
 
+// Caller-owned transient capacity for every draft count in the inclusive interval. token_domain
+// is the fixed sampling profile; invalid profiles or intervals throw.
+[[nodiscard]] std::size_t speculative_accept_greedy_drafts_workspace_capacity_bytes(
+    std::int32_t token_domain, std::int32_t min_drafts, std::int32_t max_drafts);
+
 /**
  * Op: speculative_prepare_verify_inputs
  *
@@ -63,7 +68,8 @@ void speculative_prepare_verify_inputs(const Tensor& token, const Tensor& drafts
  *   update token_counts. Inputs, logits, and drafts remain unchanged.
  *
  * Workspace:
- *   Caller-owned transient storage reported by sampling_workspace_bytes(token_domain,K+1).
+ *   Caller-owned transient storage reported by
+ *   speculative_accept_greedy_drafts_workspace_capacity_bytes().
  */
 void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor& logits,
                                       const Tensor& drafts, Tensor& length, Tensor& token,

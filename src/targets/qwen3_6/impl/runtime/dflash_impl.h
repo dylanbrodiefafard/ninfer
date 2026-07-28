@@ -1,5 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
+#include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/attn_input_proj.h"
@@ -25,9 +26,8 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
 
 void require_dflash_state(const State& state) {
-    if (state.dflash == nullptr || state.dflash_workspace == nullptr ||
-        !state.model.dflash.has_value()) {
-        throw std::logic_error("DFlash schedule requires DFlash weights, state, and workspace");
+    if (state.dflash == nullptr || !state.model.dflash.has_value()) {
+        throw std::logic_error("DFlash schedule requires DFlash weights and state");
     }
 }
 
@@ -40,8 +40,8 @@ DFlashFeatureSink dflash_feature_sink_impl(State& state,
         require_dflash_state(state);
         using Config = typename V::DFlashConfig;
         return DFlashFeatureSink{
-            .features        = &state.dflash_workspace->target_features,
-            .positions       = &state.dflash_workspace->feature_positions,
+            .features        = &state.dflash->target_features,
+            .positions       = &state.dflash->feature_positions,
             .layers          = std::span<const int>(Config::target_feature_layers),
             .consume_prefill = std::move(consume_prefill),
         };
@@ -65,15 +65,13 @@ void dflash_append_context_impl(State& state, const Tensor& features, const Tens
             throw std::invalid_argument("DFlash context append inputs are invalid");
         }
         const bool replace_local_window = tokens > Config::local_capacity;
-        if (replace_local_window &&
-            (envelope.min_count != static_cast<std::uint32_t>(tokens) ||
-             envelope.max_count != static_cast<std::uint32_t>(tokens))) {
+        if (replace_local_window && (envelope.min_count != static_cast<std::uint32_t>(tokens) ||
+                                     envelope.max_count != static_cast<std::uint32_t>(tokens))) {
             throw std::invalid_argument(
                 "DFlash oversized local append requires an exact full-prefix commit");
         }
         const int local_offset = replace_local_window ? tokens - Config::local_capacity : 0;
-        const int local_tokens =
-            replace_local_window ? Config::local_capacity : tokens;
+        const int local_tokens = replace_local_window ? Config::local_capacity : tokens;
         const ops::KVCacheAppendPrefixExecutionEnvelope local_envelope{
             replace_local_window ? static_cast<std::uint32_t>(Config::local_capacity)
                                  : envelope.min_count,
@@ -86,32 +84,34 @@ void dflash_append_context_impl(State& state, const Tensor& features, const Tens
         }
 
         state.work.reset();
-        Tensor projected = state.work.alloc(DType::BF16, {Config::hidden, tokens});
-        ops::linear(features, state.model.dflash->feature_projection, projected, state.work,
+        const auto context_roots = workspace_recipe::dflash_context<Config>(state.work, tokens);
+        Tensor projected         = context_roots.projected;
+        ops::linear(features, state.model.dflash->feature_projection, projected,
                     state.device.stream);
-        Tensor context = state.work.alloc(DType::BF16, {Config::hidden, tokens});
+        Tensor context = context_roots.normalized;
         ops::rmsnorm(projected, state.model.dflash->context_norm, Config::rms_epsilon, false,
                      context, state.device.stream);
 
         for (int layer = 0; layer < Config::layers; ++layer) {
-            auto layer_scope   = state.work.scope();
-            const auto& weight = state.model.dflash->layers.at(static_cast<std::size_t>(layer));
+            auto layer_scope       = state.work.scope();
+            const auto& weight     = state.model.dflash->layers.at(static_cast<std::size_t>(layer));
             const bool local_layer = layer < Config::local_layers;
             const int layer_tokens = local_layer ? local_tokens : tokens;
             Tensor layer_context =
                 local_layer ? context.slice(1, local_offset, local_tokens) : context;
             Tensor layer_positions =
                 local_layer ? positions.slice(0, local_offset, local_tokens) : positions;
+            const auto layer_roots =
+                workspace_recipe::dflash_context_layer<Config>(state.work, layer_tokens);
             Tensor key_raw =
-                state.work.alloc(DType::BF16, {Config::head_dim, Config::kv_heads, layer_tokens});
+                layer_roots.key_raw.view({Config::head_dim, Config::kv_heads, layer_tokens});
             Tensor value =
-                state.work.alloc(DType::BF16, {Config::head_dim, Config::kv_heads, layer_tokens});
+                layer_roots.value.view({Config::head_dim, Config::kv_heads, layer_tokens});
             Tensor key_flat   = key_raw.view({Config::kv_size, layer_tokens});
             Tensor value_flat = value.view({Config::kv_size, layer_tokens});
             ops::linear_pair(layer_context, weight.context_key, weight.context_value, key_flat,
-                             value_flat, state.work, state.device.stream);
-            Tensor key =
-                state.work.alloc(DType::BF16, {Config::head_dim, Config::kv_heads, layer_tokens});
+                             value_flat, state.device.stream);
+            Tensor key = layer_roots.key.view({Config::head_dim, Config::kv_heads, layer_tokens});
             ops::rmsnorm(key_raw, weight.key_norm, Config::rms_epsilon, false, key,
                          state.device.stream);
             ops::rope(layer_positions, Config::head_dim, Config::rope_theta, key,
@@ -146,35 +146,37 @@ void dflash_propose_impl(State& state, std::uint32_t k, DFlashEnvelopes envelope
         const int block = static_cast<int>(k + 1);
         state.work.reset();
 
-        Tensor ids       = state.work.alloc(DType::I32, {block});
-        Tensor positions = state.work.alloc(DType::I32, {block});
+        const auto proposal = workspace_recipe::dflash_proposal<Config>(state.work, block);
+        Tensor ids          = proposal.ids;
+        Tensor positions    = proposal.positions;
         ops::prepare_masked_block(state.io.token, state.io.pos, Config::mask_token, ids, positions,
                                   state.device.stream);
-        Tensor residual = state.work.alloc(DType::BF16, {Config::hidden, block});
+        Tensor residual = proposal.residual;
         ops::embedding(ids, state.model.token_embedding, residual, state.device.stream);
 
         for (int layer = 0; layer < Config::layers; ++layer) {
             const auto& weight = state.model.dflash->layers.at(static_cast<std::size_t>(layer));
             {
                 auto attention_scope = state.work.scope();
-                Tensor hidden        = state.work.alloc(DType::BF16, {Config::hidden, block});
+                const auto attention_roots =
+                    workspace_recipe::dflash_attention<Config>(state.work, block);
+                Tensor hidden = attention_roots.hidden;
                 ops::rmsnorm(residual, weight.input_norm, Config::rms_epsilon, false, hidden,
                              state.device.stream);
                 Tensor query_raw =
-                    state.work.alloc(DType::BF16, {Config::head_dim, Config::query_heads, block});
+                    attention_roots.query_raw.view({Config::head_dim, Config::query_heads, block});
                 Tensor key_raw =
-                    state.work.alloc(DType::BF16, {Config::head_dim, Config::kv_heads, block});
+                    attention_roots.key_raw.view({Config::head_dim, Config::kv_heads, block});
                 Tensor value =
-                    state.work.alloc(DType::BF16, {Config::head_dim, Config::kv_heads, block});
+                    attention_roots.value.view({Config::head_dim, Config::kv_heads, block});
                 Tensor query_flat = query_raw.view({Config::query_size, block});
                 Tensor key_flat   = key_raw.view({Config::kv_size, block});
                 Tensor value_flat = value.view({Config::kv_size, block});
                 ops::attn_input_proj(hidden, weight.query_key_value, query_flat, key_flat,
-                                     value_flat, state.work, state.device.stream);
+                                     value_flat, state.device.stream);
                 Tensor query =
-                    state.work.alloc(DType::BF16, {Config::head_dim, Config::query_heads, block});
-                Tensor key =
-                    state.work.alloc(DType::BF16, {Config::head_dim, Config::kv_heads, block});
+                    attention_roots.query.view({Config::head_dim, Config::query_heads, block});
+                Tensor key = attention_roots.key.view({Config::head_dim, Config::kv_heads, block});
                 ops::rmsnorm(query_raw, weight.query_norm, Config::rms_epsilon, false, query,
                              state.device.stream);
                 ops::rmsnorm(key_raw, weight.key_norm, Config::rms_epsilon, false, key,
@@ -182,7 +184,7 @@ void dflash_propose_impl(State& state, std::uint32_t k, DFlashEnvelopes envelope
                 ops::rope(positions, Config::head_dim, Config::rope_theta, query, key,
                           state.device.stream);
                 Tensor attention =
-                    state.work.alloc(DType::BF16, {Config::head_dim, Config::query_heads, block});
+                    attention_roots.attention.view({Config::head_dim, Config::query_heads, block});
                 if (layer < Config::local_layers) {
                     ops::swa(query, key, value, positions, Config::attention_scale,
                              state.dflash->local_layer(static_cast<std::uint32_t>(layer)),
@@ -198,10 +200,11 @@ void dflash_propose_impl(State& state, std::uint32_t k, DFlashEnvelopes envelope
             }
             {
                 auto mlp_scope = state.work.scope();
-                Tensor hidden  = state.work.alloc(DType::BF16, {Config::hidden, block});
+                const auto mlp = workspace_recipe::dflash_mlp<Config>(state.work, block);
+                Tensor hidden  = mlp.hidden;
                 ops::rmsnorm(residual, weight.post_attention_norm, Config::rms_epsilon, false,
                              hidden, state.device.stream);
-                Tensor intermediate = state.work.alloc(DType::BF16, {Config::intermediate, block});
+                Tensor intermediate = mlp.intermediate;
                 ops::linear_swiglu(hidden, weight.gate_up, intermediate, state.work,
                                    state.device.stream);
                 ops::linear_add(intermediate, weight.down, residual, state.work,
@@ -217,8 +220,7 @@ void dflash_propose_impl(State& state, std::uint32_t k, DFlashEnvelopes envelope
         Tensor drafts = state.io.speculative.draft_tokens.slice(0, 0, static_cast<int>(k));
         if (state.proposal_head == ProposalHead::Full) {
             Tensor logits = state.io.logits.slice(1, 0, static_cast<int>(k));
-            ops::linear(proposal_hidden, state.model.output_head, logits, state.work,
-                        state.device.stream);
+            ops::linear(proposal_hidden, state.model.output_head, logits, state.device.stream);
             ops::argmax(logits, drafts, TextConfig::token_domain, state.device.stream);
         } else {
             if (!state.model.optimized_proposal.has_value()) {
@@ -227,7 +229,7 @@ void dflash_propose_impl(State& state, std::uint32_t k, DFlashEnvelopes envelope
             const auto& proposal = *state.model.optimized_proposal;
             Tensor logits =
                 state.work.alloc(DType::BF16, {V::draft_head_rows, static_cast<int>(k)});
-            ops::linear(proposal_hidden, proposal.head, logits, state.work, state.device.stream);
+            ops::linear(proposal_hidden, proposal.head, logits, state.device.stream);
             ops::argmax(logits, drafts, V::draft_head_rows, state.device.stream);
             ops::proposal_remap_token_ids(drafts,
                                           static_cast<const std::int32_t*>(proposal.token_ids.data),
@@ -269,8 +271,8 @@ auto dflash_steady_body(State& state, std::uint32_t k, DFlashEnvelopes envelopes
                         ops::GqaExecutionEnvelope target_envelope) {
     return [&state, k, envelopes, target_envelope] {
         const int block  = static_cast<int>(k + 1);
-        Tensor features  = state.dflash_workspace->target_features.slice(1, 0, block);
-        Tensor positions = state.dflash_workspace->feature_positions.slice(0, 0, block);
+        Tensor features  = state.dflash->target_features.slice(1, 0, block);
+        Tensor positions = state.dflash->feature_positions.slice(0, 0, block);
         dflash_append_context(state, features, positions, state.io.speculative.produced_count,
                               envelopes.append);
         dflash_propose(state, k, envelopes);

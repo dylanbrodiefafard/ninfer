@@ -13,12 +13,15 @@
 namespace ninfer::ops {
 
 /**
- * Returns the maximum transient capacity required by LinearSwiGLU for any T in [1,max_tokens].
- * `max_tokens` sizes caller-owned storage; it does not cap later Op calls when sufficient storage
- * is provided.
+ * Returns the transient capacity required by LinearSwiGLU for every T in the inclusive
+ * [min_tokens,max_tokens] interval. The QType and dimensions are the fixed implementation profile.
+ * Invalid profiles or intervals throw; a legal static-zero route returns zero.
  */
-[[nodiscard]] std::size_t linear_swiglu_workspace_bytes(std::int32_t gate_up_rows,
-                                                        std::int32_t max_tokens);
+[[nodiscard]] std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype,
+                                                                 std::int32_t gate_up_rows,
+                                                                 std::int32_t input_rows,
+                                                                 std::int32_t min_tokens,
+                                                                 std::int32_t max_tokens);
 
 /**
  * Op: linear_swiglu
@@ -44,7 +47,7 @@ namespace ninfer::ops {
  *   Writes the full output; x/weight and output must not alias.
  *
  * Workspace:
- *   Caller-owned transient storage reported by linear_swiglu_workspace_bytes(gate_up_rows,T),
+ *   Caller-owned transient storage reported by linear_swiglu_workspace_capacity_bytes(),
  *   scoped to the call. The W8 profile requires zero bytes. There is no persistent state side
  *   effect.
  */

@@ -9,6 +9,7 @@
 #include "ops/gdn_input_proj/w8/w8_gdn_input_kernels.h"
 #include "ops/gdn_input_proj/w8/w8_gdn_input_plan.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -72,18 +73,62 @@ void require_w8_rowsplit(const Weight& weight, std::int32_t rows, const char* la
     }
 }
 
-} // namespace
+enum class SnapshotWorkspaceKind {
+    None,
+    Projected,
+    ProjectedAndConvolved,
+};
 
-std::size_t gdn_input_proj_workspace_bytes(std::int32_t qk_rows, std::int32_t value_rows,
-                                           std::int32_t max_tokens) {
-    if (qk_rows == 4096 && value_rows == 6144) {
-        return detail::q4_q5_gdn_input_capacity_workspace_bytes(qk_rows, value_rows, max_tokens);
+struct SnapshotRoute {
+    SnapshotWorkspaceKind workspace;
+    detail::W8GdnInputSnapshotScheduleId w8_schedule =
+        detail::W8GdnInputSnapshotScheduleId::Composed;
+};
+
+SnapshotRoute resolve_snapshot_route(bool q4_q5, std::int32_t tokens) {
+    if (tokens <= 0) {
+        throw std::invalid_argument("gdn_input_proj_conv_snapshot: T must be positive");
     }
-    return detail::w8_gdn_input_capacity_workspace_bytes(qk_rows, value_rows, max_tokens);
+    if (q4_q5) {
+        if (tokens == 4) { return {SnapshotWorkspaceKind::Projected}; }
+        if (tokens <= 6) { return {SnapshotWorkspaceKind::None}; }
+        return {SnapshotWorkspaceKind::ProjectedAndConvolved};
+    }
+
+    constexpr std::int32_t kHidden   = 2048;
+    constexpr std::int32_t kChannels = 8192;
+    constexpr std::int32_t kZRows    = 4096;
+    const auto plan                  = detail::w8_gdn_input_snapshot_resolve_plan(
+        {kHidden, kChannels, kZRows, kChannels + kZRows, kHidden, tokens});
+    return {
+        plan.schedule == detail::W8GdnInputSnapshotScheduleId::Composed
+            ? SnapshotWorkspaceKind::ProjectedAndConvolved
+            : SnapshotWorkspaceKind::None,
+        plan.schedule,
+    };
 }
 
+struct SnapshotWorkspace {
+    Tensor projected;
+    Tensor convolved;
+};
+
+template <class Allocator>
+SnapshotWorkspace allocate_snapshot_workspace(Allocator& allocator, std::int32_t channels,
+                                              std::int32_t tokens, SnapshotWorkspaceKind kind) {
+    SnapshotWorkspace out;
+    if (kind == SnapshotWorkspaceKind::None) { return out; }
+    out.projected = allocator.alloc(DType::BF16, {channels, tokens});
+    if (kind == SnapshotWorkspaceKind::ProjectedAndConvolved) {
+        out.convolved = allocator.alloc(DType::BF16, {channels, tokens});
+    }
+    return out;
+}
+
+} // namespace
+
 void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& v_weight, Tensor& qkv,
-                    WorkspaceArena& ws, cudaStream_t stream) {
+                    cudaStream_t stream) {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kQkRows = 4096;
     constexpr std::int32_t kVRows  = 6144;
@@ -94,11 +139,11 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& v_we
     require_rowsplit(qk_weight, QType::Q4G64_F16S, kQkRows, "qk weight");
     require_rowsplit(v_weight, QType::Q5G64_F16S, kVRows, "value weight");
 
-    detail::q4_q5_gdn_input_dispatch(x, qk_weight, v_weight, qkv, ws, stream);
+    detail::q4_q5_gdn_input_dispatch(x, qk_weight, v_weight, qkv, stream);
 }
 
 void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Tensor& qkv, Tensor& z,
-                    WorkspaceArena& ws, cudaStream_t stream) {
+                    cudaStream_t stream) {
     constexpr std::int32_t kHidden  = 2048;
     constexpr std::int32_t kQkvRows = 8192;
     constexpr std::int32_t kZRows   = 4096;
@@ -110,32 +155,35 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
     require_matrix(z, kZRows, cols, "z");
     require_w8_rowsplit(query_key_value_z_weight, kRows, "query/key/value/z weight");
 
-    (void)ws;
     detail::w8_gdn_input_dispatch(x, query_key_value_z_weight, qkv, z, stream);
 }
 
-std::size_t gdn_input_proj_conv_snapshot_workspace_bytes(std::int32_t query_rows,
-                                                         std::int32_t key_rows,
-                                                         std::int32_t value_rows,
-                                                         std::int32_t max_tokens) {
+std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(std::int32_t query_rows,
+                                                                  std::int32_t key_rows,
+                                                                  std::int32_t value_rows,
+                                                                  std::int32_t min_tokens,
+                                                                  std::int32_t max_tokens) {
     const bool q4_q5 = query_rows == 2048 && key_rows == 2048 && value_rows == 6144;
     const bool w8    = query_rows == 2048 && key_rows == 2048 && value_rows == 4096;
-    if ((!q4_q5 && !w8) || max_tokens <= 0) {
+    if ((!q4_q5 && !w8) || min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument(
-            "gdn_input_proj_conv_snapshot: unregistered shape or non-positive capacity");
+            "gdn_input_proj_conv_snapshot: unregistered shape or invalid token interval");
     }
     const std::int32_t channels = query_rows + key_rows + value_rows;
-    WorkspaceLayoutBuilder layout;
-    if (max_tokens <= 16) {
-        if (w8 || max_tokens < 4) { return 0; }
-        if (max_tokens <= 6) {
-            (void)layout.alloc(DType::BF16, {channels, 4});
-            return layout.peak_bytes();
-        }
-    }
-    (void)layout.alloc(DType::BF16, {channels, max_tokens});
-    (void)layout.alloc(DType::BF16, {channels, max_tokens});
-    return layout.peak_bytes();
+    const auto exact_capacity   = [&](std::int32_t tokens) {
+        WorkspaceLayoutBuilder layout;
+        const SnapshotRoute route = resolve_snapshot_route(q4_q5, tokens);
+        (void)allocate_snapshot_workspace(layout, channels, tokens, route.workspace);
+        return layout.peak_bytes(1);
+    };
+
+    std::size_t maximum = 0;
+    if (q4_q5 && min_tokens <= 4 && max_tokens >= 4) { maximum = exact_capacity(4); }
+    const std::int32_t composed_first = q4_q5 ? 7 : 17;
+    if (max_tokens >= composed_first) { maximum = std::max(maximum, exact_capacity(max_tokens)); }
+    (void)resolve_snapshot_route(q4_q5, min_tokens);
+    (void)resolve_snapshot_route(q4_q5, max_tokens);
+    return maximum;
 }
 
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
@@ -160,30 +208,27 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
     require_matrix(key, kKeyRows, tokens, "key");
     require_matrix(value, kValueRows, tokens, "value");
 
-    if (tokens == 4) {
-        auto scope       = ws.scope();
-        Tensor projected = ws.alloc(DType::BF16, {kChannels, tokens});
-        gdn_input_proj(x, qk_weight, value_weight, projected, ws, stream);
-        detail::q4_q5_gdn_input_t4_post_snapshot_launch(projected, conv_weight, conv_states,
-                                                        initial_slot, query, key, value, stream);
-        return;
-    }
-    if (tokens <= 6) {
+    const SnapshotRoute route = resolve_snapshot_route(true, tokens);
+    if (route.workspace == SnapshotWorkspaceKind::None) {
         detail::q4_q5_gdn_input_conv_snapshot_launch(x, qk_weight, value_weight, conv_weight,
                                                      conv_states, initial_slot, query, key, value,
                                                      stream);
         return;
     }
 
-    auto scope       = ws.scope();
-    Tensor projected = ws.alloc(DType::BF16, {kChannels, tokens});
-    Tensor convolved = ws.alloc(DType::BF16, {kChannels, tokens});
-    gdn_input_proj(x, qk_weight, value_weight, projected, ws, stream);
-    causal_conv1d_silu_snapshot(projected, conv_weight, conv_states, initial_slot, convolved,
-                                stream);
-    extract_bf16_columns(convolved, 0, query, stream);
-    extract_bf16_columns(convolved, kQueryRows, key, stream);
-    extract_bf16_columns(convolved, kQueryRows + kKeyRows, value, stream);
+    auto scope                = ws.scope();
+    SnapshotWorkspace scratch = allocate_snapshot_workspace(ws, kChannels, tokens, route.workspace);
+    gdn_input_proj(x, qk_weight, value_weight, scratch.projected, stream);
+    if (route.workspace == SnapshotWorkspaceKind::Projected) {
+        detail::q4_q5_gdn_input_t4_post_snapshot_launch(scratch.projected, conv_weight, conv_states,
+                                                        initial_slot, query, key, value, stream);
+    } else {
+        causal_conv1d_silu_snapshot(scratch.projected, conv_weight, conv_states, initial_slot,
+                                    scratch.convolved, stream);
+        extract_bf16_columns(scratch.convolved, 0, query, stream);
+        extract_bf16_columns(scratch.convolved, kQueryRows, key, stream);
+        extract_bf16_columns(scratch.convolved, kQueryRows + kKeyRows, value, stream);
+    }
 }
 
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value_z_weight,
@@ -209,30 +254,28 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
     require_matrix(value, kValueRows, tokens, "value");
     require_matrix(z, kZRows, tokens, "z");
 
-    const detail::W8GdnInputSnapshotPlan plan = detail::w8_gdn_input_snapshot_resolve_plan(
-        {kHidden, kChannels, kZRows, kChannels + kZRows, kHidden, tokens});
-    if (plan.schedule == detail::W8GdnInputSnapshotScheduleId::DecodeFused) {
+    const SnapshotRoute route = resolve_snapshot_route(false, tokens);
+    if (route.w8_schedule == detail::W8GdnInputSnapshotScheduleId::DecodeFused) {
         detail::w8_gdn_input_decode_conv_snapshot_launch(x, query_key_value_z_weight, conv_weight,
                                                          conv_states, initial_slot, query, key,
                                                          value, z, stream);
         return;
     }
-    if (plan.schedule == detail::W8GdnInputSnapshotScheduleId::SplitKMmaFused) {
+    if (route.w8_schedule == detail::W8GdnInputSnapshotScheduleId::SplitKMmaFused) {
         detail::w8_gdn_input_splitk_conv_snapshot_launch(x, query_key_value_z_weight, conv_weight,
                                                          conv_states, initial_slot, query, key,
                                                          value, z, stream);
         return;
     }
 
-    auto scope       = ws.scope();
-    Tensor projected = ws.alloc(DType::BF16, {kChannels, tokens});
-    Tensor convolved = ws.alloc(DType::BF16, {kChannels, tokens});
-    gdn_input_proj(x, query_key_value_z_weight, projected, z, ws, stream);
-    causal_conv1d_silu_snapshot(projected, conv_weight, conv_states, initial_slot, convolved,
-                                stream);
-    extract_bf16_columns(convolved, 0, query, stream);
-    extract_bf16_columns(convolved, kQueryRows, key, stream);
-    extract_bf16_columns(convolved, kQueryRows + kKeyRows, value, stream);
+    auto scope                = ws.scope();
+    SnapshotWorkspace scratch = allocate_snapshot_workspace(ws, kChannels, tokens, route.workspace);
+    gdn_input_proj(x, query_key_value_z_weight, scratch.projected, z, stream);
+    causal_conv1d_silu_snapshot(scratch.projected, conv_weight, conv_states, initial_slot,
+                                scratch.convolved, stream);
+    extract_bf16_columns(scratch.convolved, 0, query, stream);
+    extract_bf16_columns(scratch.convolved, kQueryRows, key, stream);
+    extract_bf16_columns(scratch.convolved, kQueryRows + kKeyRows, value, stream);
 }
 
 } // namespace ninfer::ops

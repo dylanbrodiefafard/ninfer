@@ -1,6 +1,5 @@
 #pragma once
 
-#include "core/arena.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h>
@@ -23,12 +22,12 @@ namespace ninfer::ops {
  * promoted and compared directly with those ideal values; final output storage rounding belongs
  * to AttnInputProj's named A16 criterion, not the oracle. Production routes choose their private
  * accumulator and staging precision. Inputs and the four outputs must be mutually non-overlapping.
- * Current registered routes require no transient allocation; `ws` remains the Op-owned workspace
- * boundary. The Op has no persistent state side effect.
+ * Current registered routes require no transient allocation. The Op has no persistent state side
+ * effect.
  */
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
-                     WorkspaceArena& ws, cudaStream_t stream);
+                     cudaStream_t stream);
 
 /**
  * Qwen3.6-35B W8 specialization. The one W8G32_F16S RowSplit parent has shape [9216,2048]
@@ -39,7 +38,7 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
  * independent exact-decode oracle and A16 criterion described above.
  */
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,
-                     Tensor& gate, Tensor& k, Tensor& v, WorkspaceArena& ws, cudaStream_t stream);
+                     Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
 
 /**
  * Qwen3.6 companion W8 specialization. The W8G32_F16S RowSplit parent has shape [6144,2048]
@@ -50,6 +49,6 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight,
  * Op does not normalize or rotate either tensor.
  */
 void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tensor& q, Tensor& k,
-                     Tensor& v, WorkspaceArena& ws, cudaStream_t stream);
+                     Tensor& v, cudaStream_t stream);
 
 } // namespace ninfer::ops

@@ -9,9 +9,7 @@
 
 namespace ninfer::ops::detail {
 
-void launch_q5_gemv_r16_s2_x(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
-                             cudaStream_t stream) {
-    (void)ws;
+void launch_q5_gemv_r16_s2_x(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     constexpr int kK = 5120;
     if (w.n == 6144) {
         q5_rowsplit_gemv_launch_kernel<6144, kK, 16, 2, true>(

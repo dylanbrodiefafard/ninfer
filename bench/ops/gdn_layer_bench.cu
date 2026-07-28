@@ -232,10 +232,13 @@ struct Resources {
                                         kSnapshotSlots * sizeof(std::uint16_t))),
           ssm_states(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * kHeadDim * kValueHeads *
                                        kSnapshotSlots * sizeof(float))),
-          workspace(std::max({std::size_t{1}, ops::gdn_norm_gating_proj_workspace_bytes(max_tokens),
-                              ops::gdn_input_proj_conv_snapshot_workspace_bytes(
-                                  kKeyRows, kKeyRows, kValueRows, max_tokens),
-                              ops::linear_add_workspace_bytes(kHidden, kValueRows, max_tokens)})) {}
+          workspace(std::max({std::size_t{1},
+                              ops::gdn_norm_gating_proj_workspace_capacity_bytes(
+                                  kValueHeads, kHidden, 1, max_tokens),
+                              ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                                  kKeyRows, kKeyRows, kValueRows, 1, max_tokens),
+                              ops::linear_add_workspace_capacity_bytes(
+                                  QType::W8G32_F16S, kHidden, kValueRows, 1, max_tokens)})) {}
 
     static ninfer::DeviceBuffer make_constant_i32(std::int32_t value) {
         ninfer::DeviceBuffer device(sizeof(value));
@@ -313,8 +316,7 @@ Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t 
                                               conv_states, initial_slot, q, k, v, z,
                                               resources.workspace, s);
         } else {
-            ops::gdn_input_proj(hidden, resources.input_weight.weight, qkv, z, resources.workspace,
-                                s);
+            ops::gdn_input_proj(hidden, resources.input_weight.weight, qkv, z, s);
             ops::causal_conv1d_silu_snapshot(qkv, conv_weight, conv_states, initial_slot, qkv_conv,
                                              s);
             ops::extract_bf16_columns(qkv_conv, 0, q, s);
@@ -334,9 +336,9 @@ Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t 
             q_recurrent = q_norm;
             k_recurrent = k_norm;
         }
-        ops::gated_delta_rule_snapshot(
-            q_recurrent, k_recurrent, v.view({kHeadDim, kValueHeads, tokens}), g, beta, kGdnScale,
-            fused_qk_norm, resources.workspace, ssm_states, initial_slot, recurrent_out, s);
+        ops::gated_delta_rule_snapshot(q_recurrent, k_recurrent,
+                                       v.view({kHeadDim, kValueHeads, tokens}), g, beta, kGdnScale,
+                                       fused_qk_norm, ssm_states, initial_slot, recurrent_out, s);
         if (options.gated_rms == "dv10-b1024") {
             constexpr int block          = 1024;
             constexpr int rows_per_block = block / 32;

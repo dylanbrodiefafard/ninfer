@@ -35,6 +35,16 @@ std::size_t SequencePlan<Variant>::device_reservation_bytes() const noexcept {
 }
 
 template <>
+std::size_t SequencePlan<Variant>::workspace_capacity_bytes() const noexcept {
+    return impl_ != nullptr ? impl_->workspace.capacity : 0;
+}
+
+template <>
+std::size_t SequencePlan<Variant>::request_transient_capacity_bytes() const noexcept {
+    return impl_ != nullptr ? impl_->request_transient_capacity_bytes : 0;
+}
+
+template <>
 RequestPlan<Variant>::RequestPlan(std::unique_ptr<detail::RequestPlanImpl<Variant>> impl) noexcept
     : impl_(std::move(impl)) {}
 

@@ -101,7 +101,10 @@ int verify_dflash_load(const ninfer::Engine& engine) {
     const ninfer::MemorySummary memory = engine.memory_summary();
     if (memory.max_context != 4352 || memory.kv_cache != ninfer::KvCacheStorage::BFloat16 ||
         memory.kv_payload_bytes != 274'726'912ULL ||
-        memory.weights.used_bytes != memory.weights.capacity_bytes) {
+        memory.weights.used_bytes != memory.weights.capacity_bytes ||
+        memory.sequence.used_bytes != memory.sequence.capacity_bytes ||
+        memory.workspace.capacity_bytes == 0 || memory.request_transient.capacity_bytes != 0 ||
+        memory.workspace_logical_peak_bytes != 0 || memory.cuda_graph_allowance_bytes == 0) {
         std::cerr << "DFlash Engine has an invalid frozen memory layout\n";
         return 1;
     }
@@ -249,6 +252,7 @@ int main() {
 
     ninfer::Engine engine(dflash_engine_options(artifact, ninfer::ProposalHead::Optimized, 4352));
     if (const int result = verify_dflash_load(engine); result != 0) { return result; }
+    engine.reset_memory_peaks();
     const ninfer::GenerationResult dflash =
         engine.generate(engine.prepare_tokens(prompt), greedy_options(24, false));
     if (dflash.generated_token_ids != target_output) {
@@ -261,6 +265,12 @@ int main() {
                   << (mismatch.first == dflash.generated_token_ids.end() ? -1 : *mismatch.first)
                   << " target=" << (mismatch.second == target_output.end() ? -1 : *mismatch.second)
                   << '\n';
+        return 1;
+    }
+    const ninfer::MemorySummary memory = engine.memory_summary();
+    if (memory.workspace_logical_peak_bytes == 0 ||
+        memory.workspace_logical_peak_bytes > memory.workspace.capacity_bytes) {
+        std::cerr << "DFlash request did not report a valid planned workspace phase\n";
         return 1;
     }
     if (dflash.speculative.backend != ninfer::SpeculativeBackend::DFlash ||

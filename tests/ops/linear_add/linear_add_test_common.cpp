@@ -248,10 +248,11 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
     const Weight weight = host_weight.device_weight(device_weight.data());
 
     const std::size_t workspace_bytes =
-        ops::linear_add_workspace_bytes(shape.n, shape.k, maximum_t);
+        ops::linear_add_workspace_capacity_bytes(qtype, shape.n, shape.k, 1, maximum_t);
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
 
-    int failures = 0;
+    int failures              = 0;
+    std::size_t executed_peak = 0;
     for (const std::int32_t t : tokens) {
         const std::size_t output_words = checked_elements(shape.n, t, "output");
         test::GuardedDeviceBuffer output(output_words * sizeof(std::uint16_t));
@@ -260,6 +261,7 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
         Tensor input(device_activation.data(), DType::BF16, {shape.k, t});
         Tensor residual_out(output.data(), DType::BF16, {shape.n, t});
         workspace.reset();
+        workspace.reset_peak();
 
         const std::string case_label = std::string(label) + " [" + std::to_string(shape.n) + "," +
                                        std::to_string(shape.k) + "] T=" + std::to_string(t);
@@ -271,6 +273,13 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
             ++failures;
             continue;
         }
+        const std::size_t exact_workspace =
+            ops::linear_add_workspace_capacity_bytes(qtype, shape.n, shape.k, t, t);
+        if (workspace.used() != 0 || workspace.peak_used() != exact_workspace) {
+            std::cerr << case_label << ": exact workspace query/execution high-water mismatch\n";
+            ++failures;
+        }
+        executed_peak = std::max(executed_peak, workspace.peak_used());
 
         failures += output.verify_guards(case_label.c_str());
         const std::vector<std::int32_t> columns = all_indices(t);
@@ -282,6 +291,10 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
             std::span<const double>(
                 full_reference.data(),
                 checked_elements(static_cast<std::int32_t>(oracle_rows.size()), t, "reference")));
+    }
+    if (executed_peak != workspace_bytes) {
+        std::cerr << label << ": interval workspace capacity has no executed high-water witness\n";
+        ++failures;
     }
 
     failures += device_activation.verify_guards("linear_add activation");

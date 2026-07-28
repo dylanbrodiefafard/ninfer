@@ -15,7 +15,7 @@
 
 namespace ninfer::bench {
 
-inline constexpr int kSchemaVersion                   = 8;
+inline constexpr int kSchemaVersion                   = 9;
 inline constexpr std::string_view kArtifactType       = "ninfer_bench_report";
 inline constexpr std::string_view kDefaultCorpusPath  = "bench/fixtures/bench_corpus.ids";
 inline constexpr int kDecodeSeedTokens                = 1;
@@ -82,7 +82,8 @@ struct RepTiming {
 struct TestResult {
     BenchTest test;
     std::vector<RepTiming> reps;
-    std::size_t workspace_peak_bytes = 0;
+    std::size_t workspace_peak_bytes           = 0;
+    std::size_t workspace_allocator_peak_bytes = 0;
 };
 
 struct Stats {

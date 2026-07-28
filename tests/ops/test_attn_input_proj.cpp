@@ -50,9 +50,7 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& gate_value
     Tensor g = gate.tensor();
     Tensor k = key.tensor();
     Tensor v = value.tensor();
-    WorkspaceArena workspace(1);
-
-    ops::attn_input_proj(x, query_key.view(), gate_value.view(), q, g, k, v, workspace, nullptr);
+    ops::attn_input_proj(x, query_key.view(), gate_value.view(), q, g, k, v, nullptr);
     cuda_synchronize();
 
     const std::string suffix = " Q4/Q5 A16 T=" + std::to_string(tokens);
@@ -103,9 +101,7 @@ int run_w8_target_case(DevicePackedWeight& parent, std::int32_t tokens) {
     Tensor g = gate.tensor();
     Tensor k = key.tensor();
     Tensor v = value.tensor();
-    WorkspaceArena workspace(1);
-
-    ops::attn_input_proj(x, parent.view(), q, g, k, v, workspace, nullptr);
+    ops::attn_input_proj(x, parent.view(), q, g, k, v, nullptr);
     cuda_synchronize();
 
     const std::string suffix = " W8 target A16 T=" + std::to_string(tokens);
@@ -149,9 +145,7 @@ int run_w8_companion_case(DevicePackedWeight& parent, std::int32_t tokens) {
     Tensor q = query.tensor();
     Tensor k = key.tensor();
     Tensor v = value.tensor();
-    WorkspaceArena workspace(1);
-
-    ops::attn_input_proj(x, parent.view(), q, k, v, workspace, nullptr);
+    ops::attn_input_proj(x, parent.view(), q, k, v, nullptr);
     cuda_synchronize();
 
     const std::string suffix = " W8 companion A16 T=" + std::to_string(tokens);

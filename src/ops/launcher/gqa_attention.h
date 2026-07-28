@@ -14,7 +14,8 @@ namespace ninfer::ops::detail {
 
 enum class GqaAttentionRoute { SmallT, ChunkedSmallT, Prompt };
 
-std::int32_t gqa_attention_decode_splits(std::int32_t q_heads, std::int32_t kv_heads);
+std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
+                                          DType cache_dtype, GqaExecutionEnvelope envelope);
 
 bool gqa_attention_uses_small_t(std::int32_t tokens);
 

@@ -390,8 +390,10 @@ std::size_t decode_workspace_bytes_for_pos(std::int32_t) {
     return partial_acc_bytes + partial_m_bytes + partial_l_bytes + align_overhead(3);
 }
 
-std::size_t small_t_workspace_bytes(std::int32_t tokens) {
-    return ops::gqa_attention_workspace_bytes(kQHeads, tokens);
+std::size_t small_t_workspace_bytes(std::int32_t tokens, std::int32_t visible_keys,
+                                    DType kv_dtype) {
+    const auto envelope = exact_envelope(static_cast<std::uint32_t>(visible_keys));
+    return ops::gqa_attention_workspace_capacity_bytes(kQHeads, kv_dtype, envelope, tokens, tokens);
 }
 
 std::size_t decode_workspace_bytes(const std::vector<std::int32_t>& positions) {
@@ -838,7 +840,7 @@ void run_append_small_t(KVCache& kv, std::int32_t tokens, std::int32_t context) 
     DeviceBuffer v   = make_bf16(kvn);
     DeviceBuffer pos = make_i32_sequence(context, tokens);
     DeviceBuffer out = make_zeros(qn * sizeof(std::uint16_t));
-    WorkspaceArena ws(small_t_workspace_bytes(tokens));
+    WorkspaceArena ws(small_t_workspace_bytes(tokens, context + tokens, kv.dtype));
 
     Tensor tq(q.p, DType::BF16, {kHeadDim, kQHeads, tokens});
     Tensor tk(k.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
@@ -871,7 +873,7 @@ void run_append_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int3
     DeviceBuffer v   = make_bf16(kvn);
     DeviceBuffer pos = make_i32_sequence(context, tokens);
     DeviceBuffer out = make_zeros(qn * sizeof(std::uint16_t));
-    WorkspaceArena ws(small_t_workspace_bytes(tokens));
+    WorkspaceArena ws(small_t_workspace_bytes(tokens, context + tokens, kv.dtype));
 
     Tensor tq(q.p, DType::BF16, {kHeadDim, kQHeads, tokens});
     Tensor tk(k.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
@@ -934,7 +936,7 @@ void run_cached_small_t(KVCache& kv, std::int32_t tokens, std::int32_t context) 
     DeviceBuffer q   = make_bf16(qn);
     DeviceBuffer pos = make_i32_sequence(context, tokens);
     DeviceBuffer out = make_zeros(qn * sizeof(std::uint16_t));
-    WorkspaceArena ws(small_t_workspace_bytes(tokens));
+    WorkspaceArena ws(small_t_workspace_bytes(tokens, context + tokens, kv.dtype));
 
     Tensor tq(q.p, DType::BF16, {kHeadDim, kQHeads, tokens});
     Tensor tpos(pos.p, DType::I32, {tokens});
@@ -961,7 +963,7 @@ void run_cached_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int3
     DeviceBuffer q   = make_bf16(qn);
     DeviceBuffer pos = make_i32_sequence(context, tokens);
     DeviceBuffer out = make_zeros(qn * sizeof(std::uint16_t));
-    WorkspaceArena ws(small_t_workspace_bytes(tokens));
+    WorkspaceArena ws(small_t_workspace_bytes(tokens, context + tokens, kv.dtype));
 
     Tensor tq(q.p, DType::BF16, {kHeadDim, kQHeads, tokens});
     Tensor tpos(pos.p, DType::I32, {tokens});
@@ -1287,7 +1289,7 @@ PrefillMetrics run_prefill(KVCache& kv, std::int32_t tokens, const PrefillTiming
     DeviceBuffer v   = make_bf16(kvn);
     DeviceBuffer pos = make_i32_sequence(0, tokens);
     DeviceBuffer out = make_zeros(qn * sizeof(std::uint16_t));
-    WorkspaceArena ws(tokens <= 6 ? small_t_workspace_bytes(tokens) : 1u);
+    WorkspaceArena ws(tokens <= 6 ? small_t_workspace_bytes(tokens, tokens, kv.dtype) : 1u);
 
     Tensor tq(q.p, DType::BF16, {kHeadDim, kQHeads, tokens});
     Tensor tk(k.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
@@ -1318,7 +1320,7 @@ void run_prefill_profile_once(KVCache& kv, std::int32_t tokens) {
     DeviceBuffer v   = make_bf16(kvn);
     DeviceBuffer pos = make_i32_sequence(0, tokens);
     DeviceBuffer out = make_zeros(qn * sizeof(std::uint16_t));
-    WorkspaceArena ws(tokens <= 6 ? small_t_workspace_bytes(tokens) : 1u);
+    WorkspaceArena ws(tokens <= 6 ? small_t_workspace_bytes(tokens, tokens, kv.dtype) : 1u);
 
     Tensor tq(q.p, DType::BF16, {kHeadDim, kQHeads, tokens});
     Tensor tk(k.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
@@ -1903,7 +1905,7 @@ void select_geometry(bool geometry_35b) {
         kKVHeads      = 4;
         kGeometryName = "27b";
     }
-    kGqaDecodeSplits = ops::detail::gqa_attention_decode_splits(kQHeads, kKVHeads);
+    kGqaDecodeSplits = 85 * (4 / kKVHeads);
 }
 
 } // namespace

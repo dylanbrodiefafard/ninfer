@@ -24,7 +24,6 @@ struct Q4Q5AttnInputProblem {
 
 struct Q4Q5AttnInputPlan {
     Q4Q5AttnInputScheduleId schedule;
-    std::size_t workspace_bytes;
 };
 
 const char* q4_q5_attn_input_schedule_name(Q4Q5AttnInputScheduleId schedule) noexcept;

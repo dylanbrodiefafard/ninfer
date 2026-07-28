@@ -45,9 +45,15 @@ struct GqaExecutionEnvelope {
  */
 
 /**
- * Returns transient arena capacity required for the exact positive T supplied.
+ * Returns the transient arena capacity required for every T in the inclusive interval. Head
+ * geometry, cache dtype, and execution envelope are the fixed implementation profile. Invalid
+ * profiles or intervals throw; a legal prompt route may return zero.
  */
-[[nodiscard]] std::size_t gqa_attention_workspace_bytes(std::int32_t q_heads, std::int32_t tokens);
+[[nodiscard]] std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads,
+                                                                 DType cache_dtype,
+                                                                 GqaExecutionEnvelope envelope,
+                                                                 std::int32_t min_tokens,
+                                                                 std::int32_t max_tokens);
 
 /**
  * A1: append K/V at the supplied absolute positions and compute causal grouped-query attention.
@@ -84,7 +90,7 @@ void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
  * A3: compute causal attention from an already populated cache without accepting new K/V or
  * mutating any cache plane. q/out are contiguous BF16 `[256,24|16,T]`, positions is contiguous
  * sequential I32 [T], and the mathematical formula and execution-envelope contract are identical
- * to A1. Caller workspace is reported by gqa_attention_workspace_bytes() for the exact T.
+ * to A1. Caller workspace is reported by gqa_attention_workspace_capacity_bytes().
  */
 void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
                           const KVCacheLayerView& cache, GqaExecutionEnvelope envelope,

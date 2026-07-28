@@ -16,7 +16,7 @@ std::size_t sparse_moe_small_t_workspace_bytes(std::int32_t tokens) {
     }
     WorkspaceLayoutBuilder layout;
     (void)allocate_sparse_moe_small_t_workspace(layout, tokens);
-    return layout.peak_bytes(256);
+    return layout.peak_bytes(1);
 }
 
 SparseMoeSmallTPlan resolve_sparse_moe_small_t_plan(std::int32_t tokens, QType routed_gate_up,

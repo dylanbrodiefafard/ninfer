@@ -72,22 +72,22 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
 
 } // namespace
 
-void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy, WorkspaceArena& ws,
+void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
             cudaStream_t stream) {
     validate_linear_semantics(x, w, out, policy);
 
     switch (w.qtype) {
     case QType::Q4G64_F16S:
-        detail::q4_dispatch(x, w, out, policy, ws, stream);
+        detail::q4_dispatch(x, w, out, policy, stream);
         return;
     case QType::Q5G64_F16S:
-        detail::q5_dispatch(x, w, out, policy, ws, stream);
+        detail::q5_dispatch(x, w, out, policy, stream);
         return;
     case QType::Q6G64_F16S:
-        detail::q6_dispatch(x, w, out, policy, ws, stream);
+        detail::q6_dispatch(x, w, out, policy, stream);
         return;
     case QType::W8G32_F16S:
-        detail::w8_dispatch(x, w, out, policy, ws, stream);
+        detail::w8_dispatch(x, w, out, policy, stream);
         return;
     case QType::BF16_CTRL:
     case QType::FP32_CTRL:
@@ -98,9 +98,8 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy, 
     throw std::invalid_argument("linear: unsupported weight qtype");
 }
 
-void linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
-            cudaStream_t stream) {
-    linear(x, w, out, LinearPolicy::A16Only, ws, stream);
+void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    linear(x, w, out, LinearPolicy::A16Only, stream);
 }
 
 } // namespace ninfer::ops

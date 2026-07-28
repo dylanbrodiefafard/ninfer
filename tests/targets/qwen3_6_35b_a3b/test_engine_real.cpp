@@ -69,7 +69,11 @@ int verify_loaded_product(const ninfer::Engine& engine) {
     const ninfer::MemorySummary memory = engine.memory_summary();
     if (memory.weights.capacity_bytes != 22'360'207'360ULL ||
         memory.weights.used_bytes != memory.weights.capacity_bytes ||
-        memory.sequence.capacity_bytes == 0 || memory.workspace.capacity_bytes == 0) {
+        memory.sequence.capacity_bytes == 0 ||
+        memory.sequence.used_bytes != memory.sequence.capacity_bytes ||
+        memory.workspace.capacity_bytes == 0 || memory.request_transient.capacity_bytes == 0 ||
+        memory.request_transient.used_bytes != 0 || memory.workspace_logical_peak_bytes != 0 ||
+        memory.cuda_graph_allowance_bytes == 0) {
         std::cerr << "35B Engine construction has an invalid memory summary\n";
         return 1;
     }
@@ -140,6 +144,12 @@ int exercise_text_mtp_and_prefix(ninfer::Engine& engine) {
 }
 
 int exercise_vision(ninfer::Engine& engine) {
+    engine.reset_memory_peaks();
+    const ninfer::MemorySummary before = engine.memory_summary();
+    if (before.request_transient.peak_used_bytes != 0) {
+        std::cerr << "35B request transient peak did not reset before Vision\n";
+        return 1;
+    }
     ninfer::MessagePart image;
     image.kind              = ninfer::MessagePartKind::Media;
     image.media.kind        = ninfer::MediaKind::Image;
@@ -164,6 +174,14 @@ int exercise_vision(ninfer::Engine& engine) {
         std::cerr << "35B Vision request did not complete through the public Engine\n";
         return 1;
     }
+    const ninfer::MemorySummary after = engine.memory_summary();
+    if (after.request_transient.capacity_bytes != before.request_transient.capacity_bytes ||
+        after.request_transient.capacity_bytes == 0 || after.request_transient.used_bytes != 0 ||
+        after.request_transient.peak_used_bytes == 0 || after.workspace_logical_peak_bytes == 0 ||
+        after.workspace_logical_peak_bytes > after.workspace.capacity_bytes) {
+        std::cerr << "35B Vision request did not use the startup-frozen request allocation\n";
+        return 1;
+    }
     return 0;
 }
 
@@ -173,7 +191,8 @@ int exercise_maximum_configuration(const char* artifact) {
     if (memory.max_context != 262144 || memory.kv_cache != ninfer::KvCacheStorage::Int8Group64 ||
         memory.kv_payload_bytes != 3'045'064'704ULL ||
         memory.sequence.used_bytes != memory.sequence.capacity_bytes ||
-        memory.workspace.capacity_bytes < 1024ULL * 1024ULL * 1024ULL) {
+        memory.workspace.capacity_bytes == 0 || memory.request_transient.capacity_bytes == 0 ||
+        memory.request_transient.used_bytes != 0 || memory.cuda_graph_allowance_bytes == 0) {
         std::cerr << "35B maximum configuration does not match the planned 256K layout: context="
                   << memory.max_context << " kv_payload=" << memory.kv_payload_bytes
                   << " sequence=" << memory.sequence.capacity_bytes
@@ -199,6 +218,12 @@ int exercise_maximum_configuration(const char* artifact) {
         engine.generate(engine.prepare_tokens(prompt), greedy_options(1, false));
     if (probe.generated_token_ids.size() != 1) {
         std::cerr << "35B Engine was unusable after rejecting an over-capacity request\n";
+        return 1;
+    }
+    const ninfer::MemorySummary after = engine.memory_summary();
+    if (after.workspace_logical_peak_bytes == 0 ||
+        after.workspace_logical_peak_bytes > after.workspace.capacity_bytes) {
+        std::cerr << "35B maximum configuration did not report its executed workspace phase\n";
         return 1;
     }
     return 0;

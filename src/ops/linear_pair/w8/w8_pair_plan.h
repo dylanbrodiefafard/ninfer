@@ -70,7 +70,6 @@ struct W8PairProblem {
 
 struct W8PairPlan {
     W8PairScheduleId schedule;
-    std::size_t workspace_bytes;
 };
 
 const char* w8_pair_schedule_name(W8PairScheduleId schedule);

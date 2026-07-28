@@ -42,9 +42,12 @@ int main() {
         work.reset();
         const auto window = targets::qwen3_6::plan_mtp_alignment_window(
             static_cast<std::uint32_t>(prompt_tokens), 0, t);
-        targets::qwen3_6::detail::scatter_shifted_visual_embeddings(
-            input, visual, scatter_indices, static_cast<std::uint32_t>(prompt_tokens), window, work,
-            nullptr);
+        const auto overlap = targets::qwen3_6::shifted_visual_overlap(
+            scatter_indices, static_cast<std::uint32_t>(prompt_tokens), window);
+        Tensor destination_indices =
+            work.alloc(DType::I32, {static_cast<std::int32_t>(overlap.size())});
+        targets::qwen3_6::detail::scatter_shifted_visual_embeddings(input, visual, overlap,
+                                                                    destination_indices, nullptr);
         cudaDeviceSynchronize();
 
         std::vector<double> reference(token_embeddings.begin(), token_embeddings.end());

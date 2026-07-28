@@ -34,7 +34,7 @@ std::size_t sparse_moe_prefill_workspace_bytes(std::int32_t max_tokens) {
     const std::int32_t capacity_tokens = std::min(max_tokens, kSparseMoePrefillSliceMax);
     WorkspaceLayoutBuilder layout;
     (void)allocate_sparse_moe_prefill_workspace(layout, capacity_tokens);
-    return layout.peak_bytes(256);
+    return layout.peak_bytes(1);
 }
 
 SparseMoePrefillPlan resolve_sparse_moe_prefill_plan(std::int32_t tokens, QType routed_gate_up,

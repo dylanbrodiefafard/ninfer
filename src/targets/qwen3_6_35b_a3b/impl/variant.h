@@ -33,6 +33,7 @@ struct Variant {
     static constexpr std::uint32_t maximum_context             = kNativeContext;
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
     static constexpr std::int32_t draft_head_rows              = 131072;
+    static constexpr QType text_projection_qtype               = QType::W8G32_F16S;
 
     [[nodiscard]] static std::vector<GraphFrontierRange>
     ordinary_graph_ranges(std::uint32_t capacity);
@@ -43,8 +44,7 @@ struct Variant {
 
     static void attention_projection(const Tensor& hidden,
                                      const FullAttentionProjectionWeights& weights, Tensor& query,
-                                     Tensor& gate, Tensor& key, Tensor& value,
-                                     WorkspaceArena& workspace, cudaStream_t stream);
+                                     Tensor& gate, Tensor& key, Tensor& value, cudaStream_t stream);
     static void mtp_attention_projection(const Tensor& hidden,
                                          const MtpAttentionProjectionWeights& weights,
                                          Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
@@ -56,8 +56,7 @@ struct Variant {
                                       const MtpAttentionProjectionWeights& weights, Tensor& query,
                                       Tensor& gate, WorkspaceArena& workspace, cudaStream_t stream);
     static void gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
-                                     Tensor& qkv, Tensor& output_gate, WorkspaceArena& workspace,
-                                     cudaStream_t stream);
+                                     Tensor& qkv, Tensor& output_gate, cudaStream_t stream);
     static void gdn_input_projection_snapshot(const Tensor& hidden,
                                               const GdnProjectionWeights& weights,
                                               const Tensor& conv_weight, Tensor& conv_states,
@@ -70,24 +69,26 @@ struct Variant {
                                             WorkspaceArena& workspace, cudaStream_t stream);
     static void gdn_output_gate_projection(const Tensor& hidden,
                                            const GdnProjectionWeights& weights, Tensor& output_gate,
-                                           WorkspaceArena& workspace, cudaStream_t stream);
+                                           cudaStream_t stream);
     static void post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                            WorkspaceArena& workspace, cudaStream_t stream);
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
 
-    [[nodiscard]] static std::size_t mtp_attention_workspace_bytes(std::int32_t tokens);
-    [[nodiscard]] static std::size_t mtp_kv_workspace_bytes(std::int32_t tokens);
-    [[nodiscard]] static std::size_t mtp_q_gate_workspace_bytes(std::int32_t tokens);
-    [[nodiscard]] static std::size_t gdn_input_projection_workspace_bytes(std::int32_t tokens);
     [[nodiscard]] static std::size_t
-    gdn_input_projection_snapshot_workspace_bytes(std::int32_t tokens);
+    mtp_attention_projection_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
+    [[nodiscard]] static std::size_t mtp_kv_projection_workspace_capacity_bytes(std::int32_t first,
+                                                                                std::int32_t last);
     [[nodiscard]] static std::size_t
-    gdn_norm_control_projection_workspace_bytes(std::int32_t tokens);
+    mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t
-    gdn_output_gate_projection_workspace_bytes(std::int32_t tokens);
-    [[nodiscard]] static std::size_t post_mixer_workspace_bytes(std::int32_t tokens);
-    [[nodiscard]] static std::size_t mtp_post_mixer_workspace_bytes(std::int32_t tokens);
+    gdn_input_projection_snapshot_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
+    [[nodiscard]] static std::size_t
+    gdn_norm_control_projection_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
+    [[nodiscard]] static std::size_t post_mixer_workspace_capacity_bytes(std::int32_t first,
+                                                                         std::int32_t last);
+    [[nodiscard]] static std::size_t mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
+                                                                             std::int32_t last);
 };
 
 } // namespace ninfer::targets::qwen3_6_35b_a3b::detail

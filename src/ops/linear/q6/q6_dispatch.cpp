@@ -55,9 +55,9 @@ Q6Launch select_q6_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
 }
 
 void q6_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
-                 WorkspaceArena& ws, cudaStream_t stream) {
+                 cudaStream_t stream) {
     const Q6Launch launch = select_q6_launch(w.n, w.k, x.ne[1], policy);
-    launch(x, w, out, ws, stream);
+    launch(x, w, out, stream);
 }
 
 } // namespace ninfer::ops::detail

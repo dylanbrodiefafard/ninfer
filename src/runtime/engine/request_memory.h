@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ninfer/types.h"
 #include "runtime/contract/transient_region.h"
 
 #include <cstddef>
@@ -11,13 +12,13 @@ struct DeviceContext;
 
 namespace runtime {
 
-// Owns the request-lifetime device buffer. ensure() may grow the allocation and
-// therefore must be called before target execution begins for the request.
+// Owns the startup-frozen request transient allocation. Requests activate only a prefix; no
+// request-time device allocation or replacement is permitted.
 class RequestMemory {
 public:
     static constexpr std::size_t kDeviceAllocationAlignment = 256;
 
-    explicit RequestMemory(DeviceContext& device);
+    RequestMemory(DeviceContext& device, std::size_t frozen_capacity_bytes);
     ~RequestMemory();
 
     RequestMemory(const RequestMemory&)            = delete;
@@ -25,11 +26,12 @@ public:
     RequestMemory(RequestMemory&&)                 = delete;
     RequestMemory& operator=(RequestMemory&&)      = delete;
 
-    void ensure(std::size_t bytes, std::size_t alignment);
-    void reset() noexcept;
+    void activate(std::size_t bytes, std::size_t alignment);
+    void deactivate() noexcept;
 
     [[nodiscard]] TransientRegion region() const noexcept;
-    [[nodiscard]] std::size_t capacity_bytes() const noexcept;
+    [[nodiscard]] ArenaMemorySummary summary() const noexcept;
+    void reset_peak() noexcept;
 
 private:
     class Impl;

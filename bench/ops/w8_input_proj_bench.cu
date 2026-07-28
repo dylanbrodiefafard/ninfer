@@ -181,7 +181,6 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         ninfer::DeviceBuffer flush(kFlushBytes);
         ninfer::DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t);
-        WorkspaceArena workspace(1);
         std::vector<Result> results;
 
         if (options.op == OpSelection::All || options.op == OpSelection::CompanionAttention) {
@@ -196,7 +195,7 @@ int main(int argc, char** argv) {
                 Tensor tk(k.p, DType::BF16, {kCompanionAttnKvRows, t});
                 Tensor tv(v.p, DType::BF16, {kCompanionAttnKvRows, t});
                 if (options.profile) {
-                    ops::attn_input_proj(x, packed.weight, tq, tk, tv, workspace, stream);
+                    ops::attn_input_proj(x, packed.weight, tq, tk, tv, stream);
                     CUDA_CHECK(cudaStreamSynchronize(stream));
                     const auto plan = ops::detail::w8_attn_input_resolve_plan(
                         {kHidden, kCompanionAttnQRows, kCompanionAttnKvRows, kCompanionAttnRows,
@@ -211,9 +210,8 @@ int main(int argc, char** argv) {
                                                       options.repeat),
                            kCompanionAttnRows);
                 };
-                run("production", [&](cudaStream_t s) {
-                    ops::attn_input_proj(x, packed.weight, tq, tk, tv, workspace, s);
-                });
+                run("production",
+                    [&](cudaStream_t s) { ops::attn_input_proj(x, packed.weight, tq, tk, tv, s); });
                 if (options.production_only) { continue; }
                 if (t == 1) {
                     run("decode_direct", [&](cudaStream_t s) {
@@ -290,7 +288,7 @@ int main(int argc, char** argv) {
                            kAttnRows);
                 };
                 run("production", [&](cudaStream_t s) {
-                    ops::attn_input_proj(x, packed.weight, tq, tg, tk, tv, workspace, s);
+                    ops::attn_input_proj(x, packed.weight, tq, tg, tk, tv, s);
                 });
                 if (t == 1) {
                     run("decode_direct", [&](cudaStream_t s) {
@@ -334,9 +332,8 @@ int main(int argc, char** argv) {
                                                       options.repeat),
                            kGdnRows);
                 };
-                run("production", [&](cudaStream_t s) {
-                    ops::gdn_input_proj(x, packed.weight, tqkv, tz, workspace, s);
-                });
+                run("production",
+                    [&](cudaStream_t s) { ops::gdn_input_proj(x, packed.weight, tqkv, tz, s); });
                 if (t == 1) {
                     run("decode_direct", [&](cudaStream_t s) {
                         ops::detail::w8_gdn_input_decode_launch(x, packed.weight, tqkv, tz, s);
@@ -373,8 +370,8 @@ int main(int argc, char** argv) {
             ninfer::DeviceBuffer qkv(static_cast<std::size_t>(kChannels) * max_t * 2);
             ninfer::DeviceBuffer convolved(static_cast<std::size_t>(kChannels) * max_t * 2);
             WorkspaceArena snapshot_workspace(
-                std::max<std::size_t>(1, ops::gdn_input_proj_conv_snapshot_workspace_bytes(
-                                             kQueryRows, kKeyRows, kValueRows, max_t)));
+                std::max<std::size_t>(1, ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                                             kQueryRows, kKeyRows, kValueRows, 1, max_t)));
 
             for (const std::int32_t t : options.t_sweep) {
                 Tensor x(input.p, DType::BF16, {kHidden, t});
@@ -402,7 +399,7 @@ int main(int argc, char** argv) {
                                                           tk, tv, tz, snapshot_workspace, s);
                     });
                 run("composed_control", [&](cudaStream_t s) {
-                    ops::gdn_input_proj(x, packed.weight, tqkv, tz, workspace, s);
+                    ops::gdn_input_proj(x, packed.weight, tqkv, tz, s);
                     ops::causal_conv1d_silu_snapshot(tqkv, tw, states, slot, tconvolved, s);
                     ops::extract_bf16_columns(tconvolved, 0, tq, s);
                     ops::extract_bf16_columns(tconvolved, kQueryRows, tk, s);

@@ -9,7 +9,7 @@ namespace ninfer::ops::detail {
 std::size_t sparse_moe_decode_workspace_bytes() {
     WorkspaceLayoutBuilder layout;
     (void)allocate_sparse_moe_decode_workspace(layout);
-    return layout.peak_bytes(256);
+    return layout.peak_bytes(1);
 }
 
 SparseMoeDecodePlan resolve_sparse_moe_decode_plan(QType routed_gate_up, QType routed_down) {

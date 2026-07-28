@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 using namespace ninfer;
@@ -156,8 +157,9 @@ RunResult run_once(const std::vector<float>& logits, int physical_rows, int toke
 
     Tensor logits_tensor(device_logits.p, DType::BF16, {physical_rows, columns});
     Tensor out_tensor(device_out.data(), DType::I32, {columns});
-    WorkspaceArena workspace(
-        std::max<std::size_t>(256, ops::sampling_workspace_bytes(token_domain, columns)));
+    const std::size_t workspace_bytes =
+        ops::sampling_workspace_capacity_bytes(token_domain, columns, columns);
+    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
     ops::sample(logits_tensor, out_tensor, token_domain,
                 static_cast<const ops::SamplingConfig*>(device_config.p),
                 static_cast<const std::int32_t*>(device_pos.p), purpose, workspace, nullptr);
@@ -188,6 +190,10 @@ RunResult run_once(const std::vector<float>& logits, int physical_rows, int toke
             from_device<int>(device_counts->data(), static_cast<std::size_t>(token_domain));
         result.integrity_failures += device_counts->verify_guards("sample token_counts");
     }
+    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+        std::cerr << "sample workspace query/execution high-water mismatch\n";
+        ++result.integrity_failures;
+    }
     return result;
 }
 
@@ -205,8 +211,9 @@ RunResult run_repeated(const std::vector<float>& column, int token_domain, int t
 
     Tensor logits_tensor(device_logits.p, DType::BF16, {physical_rows, batch_columns});
     Tensor out_tensor(device_out.data(), DType::I32, {batch_columns});
-    WorkspaceArena workspace(
-        std::max<std::size_t>(256, ops::sampling_workspace_bytes(token_domain, batch_columns)));
+    const std::size_t workspace_bytes =
+        ops::sampling_workspace_capacity_bytes(token_domain, batch_columns, batch_columns);
+    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
 
     int final_position = position;
     for (int produced = 0; produced < total; produced += batch_columns) {
@@ -236,6 +243,10 @@ RunResult run_repeated(const std::vector<float>& column, int token_domain, int t
     }
     if (from_device<std::int32_t>(device_pos, 1).front() != final_position) {
         std::cerr << "sample repeated modified pos_base\n";
+        ++result.integrity_failures;
+    }
+    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+        std::cerr << "sample repeated workspace query/execution high-water mismatch\n";
         ++result.integrity_failures;
     }
     return result;
@@ -468,6 +479,18 @@ int rng_key_contract() {
     return failures;
 }
 
+int workspace_route_boundary_contract() {
+    constexpr int token_domain = 257;
+    constexpr int columns      = 16;
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * columns, 0.0f);
+    const RunResult result = run_once(logits, token_domain, token_domain, columns,
+                                      ops::SamplingConfig{}, 0, ops::kSamplePurposeDecode);
+    int failures           = result.integrity_failures;
+    failures += verify_exact("sample workspace route boundary", result.tokens,
+                             std::vector<int>(columns, 0));
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -476,13 +499,26 @@ int main() {
         return 77;
     }
 
-    int failures = 0;
+    int failures            = 0;
+    const std::size_t at_16 = ops::sampling_workspace_capacity_bytes(257, 16, 16);
+    if (ops::sampling_workspace_capacity_bytes(256, 1, 16) != 0 || at_16 == 0 ||
+        ops::sampling_workspace_capacity_bytes(257, 17, 17) != 0 ||
+        ops::sampling_workspace_capacity_bytes(257, 1, 17) != at_16) {
+        std::cerr << "sampling workspace route boundary contract failed\n";
+        ++failures;
+    }
+    try {
+        (void)ops::sampling_workspace_capacity_bytes(257, 0, 16);
+        std::cerr << "sampling workspace accepted an invalid column interval\n";
+        ++failures;
+    } catch (const std::invalid_argument&) {}
     failures += greedy_contract();
     failures += deterministic_stochastic_contract();
     failures += filtered_distribution_contract();
     failures += capped_distribution_contract();
     failures += real_shape_distribution_contract();
     failures += rng_key_contract();
+    failures += workspace_route_boundary_contract();
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sample public contract\n";
     return failures == 0 ? 0 : 1;

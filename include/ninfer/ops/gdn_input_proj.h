@@ -13,16 +13,6 @@
 namespace ninfer::ops {
 
 /**
- * Validates a registered problem and positive token capacity. The admitted row pairs are
- * (4096,6144) for the 27B Q4/Q5 route and (8192,4096) for the 35B W8 QKV/Z route. Every route
- * writes directly to final outputs, so the required transient capacity is zero. `max_tokens` is
- * a capacity query, not an execution limit.
- */
-[[nodiscard]] std::size_t gdn_input_proj_workspace_bytes(std::int32_t qk_rows,
-                                                         std::int32_t value_rows,
-                                                         std::int32_t max_tokens);
-
-/**
  * Op: gdn_input_proj
  *
  * Math / indexing:
@@ -45,10 +35,10 @@ namespace ninfer::ops {
  *   Writes the full qkv output; inputs and output must not alias.
  *
  * Workspace:
- *   No transient bytes are required. The retained arena boundary is caller-owned and is not used.
+ *   No transient bytes are required.
  */
 void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& v_weight, Tensor& qkv,
-                    WorkspaceArena& ws, cudaStream_t stream);
+                    cudaStream_t stream);
 
 /**
  * Qwen3.6-35B W8 specialization. The one W8G32_F16S RowSplit parent has shape [12288,2048]
@@ -58,18 +48,18 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& v_we
  * and requires no transient workspace. T may be any positive value.
  */
 void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Tensor& qkv, Tensor& z,
-                    WorkspaceArena& ws, cudaStream_t stream);
+                    cudaStream_t stream);
 
 /**
  * Returns the transient capacity required by gdn_input_proj_conv_snapshot. The 35B W8 route writes
  * final outputs from projection epilogues for exact T=1..16; the 27B Q4/Q5 route may reserve
  * private BF16 staging for its small-T kernels. Extents outside a target route's optimized range
- * use the composed implementation and require two BF16 [C,T] intermediates.
+ * use the composed implementation and require two BF16 [C,T] intermediates. The row geometry is
+ * the fixed profile; the query covers the inclusive token interval and throws for invalid values.
  */
-[[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_bytes(std::int32_t query_rows,
-                                                                       std::int32_t key_rows,
-                                                                       std::int32_t value_rows,
-                                                                       std::int32_t max_tokens);
+[[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+    std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
+    std::int32_t min_tokens, std::int32_t max_tokens);
 
 /**
  * Op: gdn_input_proj_conv_snapshot
