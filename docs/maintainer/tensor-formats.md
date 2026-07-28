@@ -768,9 +768,13 @@ encode oracle is a bit-level host/software implementation of the ordered algorit
 production converters claiming that profile require parity against it rather than defining the
 oracle through their own arithmetic. The `NVFP4` decode oracle is the E2M1/E4M3FN/FP32 divisor
 reconstruction in Section 3.3; its current producer is protected by exact source-word comparison
-rather than Section 7. Numerical operator tests separately protect the combinations used by the
-registered target, including their public input/output formats, output tolerance, and real target
-shapes. Private staging and accumulation remain implementation choices.
+rather than Section 7. An NVFP4 Op oracle starts from the represented public activation and this
+exact-decoded persistent weight. A site-level activation divisor and any private activation
+quantization do not alter the ideal Op formula; their numerical effects are covered by the
+production route's output criterion rather than reproduced inside the oracle. Numerical operator
+tests separately protect the combinations used by the registered target, including their public
+input/output formats, output tolerance, and real target shapes. Private activation quantization,
+staging, and accumulation remain implementation choices.
 
 ## 13. Integration summary
 

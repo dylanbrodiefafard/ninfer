@@ -616,13 +616,9 @@ layout  = contiguous-le-v1
 value   = bit-exact source FP32 word, finite and > 0
 ```
 
-The source shape `[1]` becomes the rank-zero artifact scalar without changing its FP32 word. For
-each K-axis block of 16 input elements, `x` is the represented BF16 activation entering the
-projection Op. The independent execution oracle promotes those BF16 values exactly to FP32 before
-computing absolute values, the block maximum, scale selection, and E2M1 conversion; it does not
-start from an unrepresented higher-precision value.
-
-For one finite represented BF16 block, activation quantization is:
+The source shape `[1]` becomes the rank-zero artifact scalar without changing its FP32 word. `d_x`
+is calibration metadata for the planned private A4 activation-compute profile. For one finite
+represented BF16 K-axis block of 16 input elements, that profile interprets it as:
 
 ```text
 s_x       = E4M3FN(d_x * max_abs(block) / 6)
@@ -640,6 +636,16 @@ rounds to positive zero, every `q_x` in that block is also positive zero and no 
 performed. The admitted execution input domain contains only finite represented BF16 activations.
 The dynamic `s_x` is execution-local; the artifact persists neither `s_x`, `q_x`, `1 / d_x`, nor a
 combined coefficient derived from `d_x` and `d_w`.
+
+This activation quantization describes a private implementation profile, not the mathematical Op
+oracle and not an observable intermediate. The independent correctness oracle starts from the
+represented BF16 public activation, exact-decodes the persistent NVFP4 weight as
+`E2M1 * E4M3FN / d_w`, and evaluates the complete logical Op with naive FP64 accumulation. It does
+not quantize the activation, introduce a BF16 materialization of the decoded weight, or use `d_x`.
+Activation quantization, staging, accumulation, and output rounding contribute only to the
+production route's error against the named output criterion. Op precision tests therefore compare
+only observable outputs with this oracle; they do not inspect `s_x`, `q_x`, use of `d_x`, or the
+selected instruction path. Performance evidence separately qualifies the intended A4 route.
 
 The 247 objects use these names and layer domains:
 
@@ -708,7 +714,8 @@ and `d_w` from its `Weight` argument; the Op wrapper derives that weight's `1 / 
 leaf-private kernel argument. That coefficient is not another artifact object, another `Weight`
 field, or a new Op parameter. CUDA Graph capture records the actual kernel argument, and replay does
 not repeat storage selection. Fused parents at one site receive the same persisted `d_x`;
-production execution compares neither `model_id`, storage signature, nor object inventory.
+production execution compares neither `model_id`, storage signature, nor object inventory. These
+leaf-private choices do not change the observable Op oracle defined above.
 
 The fifteen BF16 Text exceptions retain the same fused Op interfaces. Future consumer support must
 add BF16/BF16 admission to `attn_input_proj` for the early `query_key` and `gate_value` parents, and
