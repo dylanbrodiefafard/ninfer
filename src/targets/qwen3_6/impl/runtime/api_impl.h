@@ -126,16 +126,21 @@ void Program<Variant>::reset_memory_peaks() noexcept {
 }
 
 template <>
-SequencePlan<Variant> plan_sequence<Variant>(DeviceContext& device, const EngineOptions& options) {
+SequencePlan<Variant> plan_sequence<Variant>(DeviceContext& device, const EngineOptions& options,
+                                             Variant::WeightsProfile weights_profile) {
     return SequencePlan<Variant>(
-        detail::NINFER_QWEN36_RUNTIME_NS::plan_sequence_impl(device, options));
+        detail::NINFER_QWEN36_RUNTIME_NS::plan_sequence_impl(device, options, weights_profile));
 }
 
 template <>
-std::unique_ptr<Program<Variant>> create_program<Variant>(const Variant::ModelView& model,
-                                                          SequencePlan<Variant>&& plan,
-                                                          DeviceContext& device) {
+std::unique_ptr<Program<Variant>>
+create_program<Variant>(const Variant::ModelView& model, Variant::WeightsProfile weights_profile,
+                        SequencePlan<Variant>&& plan, DeviceContext& device) {
     if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
+    if (plan.impl_->weights_profile != weights_profile) {
+        throw std::invalid_argument(
+            "loaded model weights profile does not match the sequence plan");
+    }
     auto impl = std::make_unique<detail::ProgramImpl<Variant>>(model, *plan.impl_, device);
     plan.impl_.reset();
     return std::unique_ptr<Program<Variant>>(new Program<Variant>(std::move(impl)));

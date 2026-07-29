@@ -59,16 +59,12 @@ void validate_device_budget(std::uint64_t weight_bytes, std::size_t sequence_byt
 template <class Target, class Loaded, class Instance>
 ConstructedTarget construct_registered(const EngineOptions& options, DeviceContext& device,
                                        artifact::Reader& reader, Clock::time_point load_start) {
-    const auto& identity = reader.identity();
-    if (identity.model_id != Target::model_id || identity.weights_id != Target::weights_id) {
-        throw std::runtime_error("artifact identity '" + identity.model_id + "/" +
-                                 identity.weights_id + "' is not supported by target '" +
-                                 std::string(Target::target_key) + "'");
-    }
-    auto sequence_plan = Target::plan_sequence(device, options);
+    const auto& identity       = reader.identity();
+    const auto weights_profile = Target::resolve_weights(identity);
+    auto sequence_plan         = Target::plan_sequence(device, options, weights_profile);
 
     artifact::Binder binder(reader);
-    auto load_plan = Target::plan_load(binder, options);
+    auto load_plan = Target::plan_load(binder, options, weights_profile);
     validate_device_budget(load_plan.materialization().device_capacity_bytes,
                            sequence_plan.device_reservation_bytes());
     auto progress     = artifact_progress(options.load_progress);
@@ -82,6 +78,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
 
     LoadSummary summary;
     summary.target               = std::string(Target::target_key);
+    summary.weights_id           = identity.weights_id;
     summary.load_seconds         = std::chrono::duration<double>(Clock::now() - load_start).count();
     summary.upload_seconds       = stats.upload_seconds;
     summary.artifact_bytes_read  = stats.file_bytes;

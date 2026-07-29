@@ -146,6 +146,7 @@ void print_load_summary(const ninfer::LoadSummary& load, double wall_seconds) {
     print_stage("load", "artifact/materialize", load.load_seconds);
     print_stage("load", "host to device", load.upload_seconds);
     print_metric("target", load.target);
+    print_metric("weights", load.weights_id);
     print_metric("artifact file read", format_bytes(load.artifact_bytes_read));
     print_metric("weight H2D", format_bytes(load.host_to_device_bytes));
     print_metric("pinned staging peak", format_bytes(load.peak_staging_bytes));

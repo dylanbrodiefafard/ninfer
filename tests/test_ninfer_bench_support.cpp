@@ -225,6 +225,7 @@ qb::BenchEnvironment sample_environment() {
     env.artifact_path                     = "model.ninfer";
     env.artifact_file_size_bytes          = 17500000000ULL;
     env.load                              = {.target               = "qwen3_6_27b",
+                                             .weights_id           = "groupwise-int",
                                              .load_seconds         = 2.5,
                                              .upload_seconds       = 2.0,
                                              .artifact_bytes_read  = 17500000000ULL,
@@ -268,10 +269,11 @@ int test_report_contract() {
         return fail(std::string("invalid benchmark JSON: ") + error.what());
     }
 
-    failures += expect(report.at("schema_version") == 9, "report schema v9");
+    failures += expect(report.at("schema_version") == 10, "report schema v10");
     failures += expect(report.at("artifact_type") == "ninfer_bench_report", "report identity");
     failures += expect(report.at("artifact").at("path") == "model.ninfer", "artifact path");
     failures += expect(report.at("load").at("target") == "qwen3_6_27b", "load target");
+    failures += expect(report.at("load").at("weights_id") == "groupwise-int", "load weights id");
     failures +=
         expect(report.at("load").at("host_to_device_bytes") == 17400000000ULL, "load H2D bytes");
     failures += expect(report.at("memory").at("kv_cache") == "int8-group64", "memory KV");
@@ -326,6 +328,7 @@ int test_human_and_csv_reports() {
     const auto results             = sample_results();
     const std::string table        = qb::format_table(env, results);
     failures += expect(table.find("qwen3_6_27b") != std::string::npos, "table target");
+    failures += expect(table.find("groupwise-int") != std::string::npos, "table weights id");
     failures += expect(table.find("model.ninfer") != std::string::npos, "table artifact");
     failures +=
         expect(table.find("proposal_head=optimized") != std::string::npos, "table proposal head");
@@ -334,7 +337,8 @@ int test_human_and_csv_reports() {
     failures += expect(table.find("work peak") != std::string::npos, "table workspace peak");
 
     const std::string csv = qb::format_csv(env, results);
-    failures += expect(csv.starts_with("label,kind,n_prompt,n_gen,target"), "CSV identity columns");
+    failures += expect(csv.starts_with("label,kind,n_prompt,n_gen,target,weights_id"),
+                       "CSV identity columns");
     for (const std::string_view field :
          {"proposal_head", "kv_payload_bytes", "load_host_to_device_bytes",
           "request_transient_capacity_bytes", "cuda_graph_allowance_bytes", "workspace_peak_bytes",

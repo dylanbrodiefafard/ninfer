@@ -20,7 +20,9 @@ runtime:
 Serving performance was measured on an RTX 5090 with INT8 group-64 KV cache, CUDA Graphs, a 1,024-
 token prefill chunk, and a maximum context of 262,144 tokens. Each reported fixture uses five fixed
 seeds after one warm-up. The two registered targets are reported independently and are not
-cross-target comparisons.
+cross-target comparisons. The published 27B serving figures below use `weights_id =
+groupwise-int`; the NVFP4 Engine qualification is reported separately in the
+[full performance document](docs/performance.md#nvfp4-integration-qualification).
 
 **Qwen3.6-35B-A3B**
 
@@ -29,7 +31,7 @@ cross-target comparisons.
 - MTP3 long reasoning: **584.0–695.1 decode tok/s** with **72.4–83.3% acceptance**.
 - MTP3 structured output: **714.3 decode tok/s**, **87.7% acceptance**, and **3.63 tokens/round**.
 
-**Qwen3.6-27B**
+**Qwen3.6-27B (`groupwise-int`)**
 
 - MTP0 at a 7,680-token prompt: **3,218.1 prefill tok/s** and **77.6 decode tok/s**.
 - MTP0 at a 260,096-token prompt: **1,614.8 prefill tok/s** and **54.8 decode tok/s**.

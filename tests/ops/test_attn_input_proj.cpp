@@ -225,6 +225,11 @@ int run_bf16_target() {
     constexpr std::int32_t kParentRows = 14336;
     DeviceWeight parent(make_patterned(kParentRows, kHidden, 313U));
     int failures = 0;
+    if (ops::attn_input_proj_workspace_capacity_bytes(QType::BF16_CTRL, kParentRows, kHidden,
+                                                      ops::LinearPolicy::A16Only, 1, 1024) != 0) {
+        std::cerr << "BF16 attention input workspace interval is not zero-capacity\n";
+        ++failures;
+    }
     for (const std::int32_t tokens : {1, 2, 4, 8, 16, 17, 22, 23, 32, 33, 128, 129, 1024}) {
         failures += run_bf16_target_case(parent, tokens);
     }

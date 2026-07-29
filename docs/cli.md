@@ -14,8 +14,9 @@ download an artifact using the [project README](../README.md) before following t
 
 Exactly one of `--prompt` and `--messages` is required.
 
-Answer content is streamed to stdout. Reasoning, model loading, timings, throughput, GPU memory, and
-speculative-decoding statistics are written to stderr, so stdout can be redirected independently:
+Answer content is streamed to stdout. Reasoning, model loading (including the registered target and
+canonical `weights_id`), timings, throughput, GPU memory, and speculative-decoding statistics are
+written to stderr, so stdout can be redirected independently:
 
 ```bash
 ./build/apps/ninfer models/qwen3_6_27b.ninfer \

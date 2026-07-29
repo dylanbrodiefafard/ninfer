@@ -2,6 +2,7 @@
 #include <ninfer/targets/qwen3_6/frontend_resources.h>
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
+#include "artifact/reader.h"
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
 #include "targets/qwen3_6_27b/impl/variant.h"
 
@@ -12,8 +13,10 @@ namespace ninfer::targets::qwen3_6_27b::detail {
 
 class LoadPlan::Impl {
 public:
-    explicit Impl(ArtifactLoadPlan target_plan) : plan(std::move(target_plan)) {}
+    Impl(WeightsProfile weights_profile_in, ArtifactLoadPlan target_plan)
+        : weights_profile(weights_profile_in), plan(std::move(target_plan)) {}
 
+    WeightsProfile weights_profile;
     ArtifactLoadPlan plan;
 };
 
@@ -36,16 +39,29 @@ LoadedModel::~LoadedModel() = default;
 
 namespace ninfer::targets::qwen3_6_27b {
 
-Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options) {
+Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity) {
+    if (identity.model_id == model_id && identity.weights_id == "groupwise-int") {
+        return WeightsProfile::GroupwiseInt;
+    }
+    if (identity.model_id == model_id && identity.weights_id == "nvfp4") {
+        return WeightsProfile::Nvfp4;
+    }
+    throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
+                             "' is not supported by target '" + std::string(target_key) + "'");
+}
+
+Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
+                                     WeightsProfile weights_profile) {
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
-        detail::bind_artifact(binder, qwen3_6::startup_features(options))));
+        weights_profile,
+        detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options))));
 }
 
 std::unique_ptr<Package::LoadedModel>
 Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized) {
     if (plan.impl_ == nullptr) { throw std::invalid_argument("target load plan is empty"); }
-    auto impl = std::make_unique<LoadedModel::Impl>(std::move(plan.impl_->plan.bindings),
-                                                    std::move(materialized));
+    auto impl = std::make_unique<LoadedModel::Impl>(
+        plan.impl_->weights_profile, std::move(plan.impl_->plan.bindings), std::move(materialized));
     plan.impl_.reset();
     return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));
 }
@@ -56,15 +72,16 @@ Package::Frontend Package::make_frontend(const LoadedModel& model) {
                                   model.impl_->data.runtime.features.vision);
 }
 
-Package::SequencePlan Package::plan_sequence(DeviceContext& device, const EngineOptions& options) {
-    return qwen3_6::plan_sequence<detail::Variant>(device, options);
+Package::SequencePlan Package::plan_sequence(DeviceContext& device, const EngineOptions& options,
+                                             WeightsProfile weights_profile) {
+    return qwen3_6::plan_sequence<detail::Variant>(device, options, weights_profile);
 }
 
 std::unique_ptr<Package::Program>
 Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
-    return qwen3_6::create_program<detail::Variant>(model.impl_->data.runtime, std::move(plan),
-                                                    device);
+    return qwen3_6::create_program<detail::Variant>(
+        model.impl_->data.runtime, model.impl_->weights_profile, std::move(plan), device);
 }
 
 } // namespace ninfer::targets::qwen3_6_27b

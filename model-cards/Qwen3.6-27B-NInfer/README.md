@@ -135,7 +135,10 @@ The following single-GPU serving measurements were collected on an NVIDIA GeForc
 CUDA 13.1. Requests were submitted serially to a persistent `ninfer-serve` process with CUDA Graph
 enabled, a 1,024-token prefill chunk, INT8 group-64 KV cache, and prefix reuse disabled. Each value
 is the arithmetic mean ± sample standard deviation over five fixed seeds; warm-up requests are
-excluded.
+excluded. These serving and evaluation results use `weights_id = groupwise-int`; they must not be
+attributed to the separate `nvfp4` weights. A focused NVFP4 public-Engine qualification is included
+in the
+[repository performance document](https://github.com/Neroued/ninfer/blob/master/docs/performance.md#nvfp4-integration-qualification).
 
 ### Long-context baseline (MTP disabled)
 

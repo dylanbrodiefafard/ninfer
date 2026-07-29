@@ -157,8 +157,7 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
 
     switch (parent_qtype) {
     case QType::BF16_CTRL:
-        if (parent_rows != 14336 || input_rows != 5120 || policy != LinearPolicy::A16Only ||
-            min_tokens != 1 || max_tokens != 1) {
+        if (parent_rows != 14336 || input_rows != 5120 || policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported BF16 profile");
         }
         return 0;

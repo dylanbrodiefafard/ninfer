@@ -437,12 +437,9 @@ int run(const Options& options) {
 
     ninfer::DeviceContext device(options.device);
     ninfer::artifact::Reader reader(options.weights);
-    if (reader.identity().model_id != target::Package::model_id ||
-        reader.identity().weights_id != target::Package::weights_id) {
-        throw std::invalid_argument("artifact identity does not match qwen3.6-27b");
-    }
+    const auto weights_profile = target::Package::resolve_weights(reader.identity());
     ninfer::artifact::Binder binder(reader);
-    auto load_plan = target::Package::plan_load(binder, engine);
+    auto load_plan = target::Package::plan_load(binder, engine, weights_profile);
     auto materialized =
         ninfer::artifact::materialize(reader, load_plan.materialization(), device, nullptr);
     auto model =
@@ -463,7 +460,7 @@ int run(const Options& options) {
         throw std::invalid_argument("--max-context is too small for the diagnostic schedule");
     }
 
-    auto sequence_plan                           = target::Package::plan_sequence(device, engine);
+    auto sequence_plan = target::Package::plan_sequence(device, engine, weights_profile);
     const std::size_t request_transient_capacity = sequence_plan.request_transient_capacity_bytes();
     auto program = target::Package::create_program(*model, std::move(sequence_plan), device);
     ninfer::runtime::RequestMemory transient(device, request_transient_capacity);

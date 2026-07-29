@@ -381,10 +381,7 @@ int run(const Options& options) {
 
     ninfer::DeviceContext device(options.device);
     ninfer::artifact::Reader reader(options.artifact);
-    if (reader.identity().model_id != target::Package::model_id ||
-        reader.identity().weights_id != target::Package::weights_id) {
-        throw std::invalid_argument("artifact identity does not match qwen3.6-35b-a3b");
-    }
+    const auto weights_profile = target::Package::resolve_weights(reader.identity());
     ninfer::artifact::Binder binder(reader);
     detail::ArtifactLoadPlan load = detail::bind_artifact(binder, family::StartupFeatures{});
     auto materialized =
@@ -405,7 +402,7 @@ int run(const Options& options) {
                                    .draft_tokens  = maximum_k,
                                    .proposal_head = ninfer::ProposalHead::Full};
     capacity_options.use_cuda_graph = false;
-    auto capacity_plan              = target::Package::plan_sequence(device, capacity_options);
+    auto capacity_plan = target::Package::plan_sequence(device, capacity_options, weights_profile);
 
     const StateLayout layout = plan_state(options, maximum_k);
     ninfer::DeviceArena state_arena(layout.bytes);

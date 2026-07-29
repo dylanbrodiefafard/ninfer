@@ -11,7 +11,9 @@ Tested Git revisions:
 
 These measurements characterize the two registered NInfer targets independently on one NVIDIA
 GeForce RTX 5090. They cover long-context prefill and baseline decode with speculative decoding
-disabled, plus long-reasoning and cross-scenario decode with MTP and DFlash.
+disabled, plus long-reasoning and cross-scenario decode with MTP and DFlash. All published serving
+tables below use `weights_id = groupwise-int`; they do not aggregate or imply results for the 27B
+`nvfp4` artifact.
 
 All requests were submitted serially to a persistent `ninfer-serve` process over the loopback
 OpenAI-compatible HTTP endpoint. Each reported fixture used five fixed seeds. Values are arithmetic
@@ -263,6 +265,9 @@ repetition loop is present.
 
 ## `qwen3_6_27b`
 
+The serving campaign in this section uses `(target, weights_id) =
+(qwen3_6_27b, groupwise-int)`.
+
 ### MTP0 context-length profile
 
 | Prompt tokens | Samples | Prefill tok/s | Server TTFT (ms) | Decode tok/s |
@@ -293,3 +298,43 @@ Each category contains three fixtures and five seeds per fixture, for 15 samples
 
 The baseline and speculative-decode suites intentionally measure different supported workloads.
 No per-scenario baseline/speculative speedup is reported.
+
+### NVFP4 integration qualification
+
+This focused public-Engine benchmark qualifies the newly executable
+`(qwen3_6_27b, nvfp4)` storage profile against the existing groupwise profile on the same RTX 5090.
+It is intentionally smaller than the serving campaign above: `ninfer_bench`, BF16 KV cache,
+`max_context=4096`, a 1,024-token prefill chunk, CUDA Graph enabled, speculative decoding disabled,
+one warm-up, and three measured repetitions. `pp512` measures a 512-token prefill; `tg32` measures
+32 ordinary decode output tokens after the benchmark's untimed seed prefill.
+
+| Weights ID | Load (s) | Resident weights (bytes) | H2D bytes | Device tensors | pp512 tok/s | tg32 tok/s |
+|---|---:|---:|---:|---:|---:|---:|
+| `groupwise-int` | 3.999 | 16,378,329,088 | 16,378,322,944 | 771 | 3,305.7 | 83.5 |
+| `nvfp4` | 4.014 | 16,491,769,600 | 16,491,701,212 | 707 | 10,099.6 | 85.4 |
+
+Both plans reserve 588,332,800 sequence bytes and 168,370,176 workspace bytes for this exact
+configuration; equality here is caused by other shared schedule allocations dominating the final
+arena maxima, not by reserving both storage profiles. Disabled Vision, MTP, and optimized-proposal
+weights explain why these device-tensor counts are below the all-features load-plan counts.
+
+Reproduce the reports with:
+
+```bash
+build/bench/ninfer_bench \
+  --weights out/qwen3_6_27b.ninfer \
+  -p 512 -n 32 -r 3 --warmup 1 \
+  --max-ctx 4096 --prefill-chunk 1024 --kv-dtype bf16 \
+  --mtp-draft-tokens 0 --output json
+
+build/bench/ninfer_bench \
+  --weights out/qwen3_6_27b_nvfp4.ninfer \
+  -p 512 -n 32 -r 3 --warmup 1 \
+  --max-ctx 4096 --prefill-chunk 1024 --kv-dtype bf16 \
+  --mtp-draft-tokens 0 --output json
+```
+
+An Nsight Systems route trace of a separate 54-token NVFP4 CLI request observes W4A4 quantize/MMA
+kernels in long prefill, NVFP4 small-T kernels in the short final chunk, and A16 NVFP4
+decode/GEMV kernels under CUDA Graph decode. This trace establishes route selection; it is not used
+as the throughput source for the table.

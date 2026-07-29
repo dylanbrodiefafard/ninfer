@@ -55,6 +55,7 @@ int main() {
 
     ninfer::LoadSummary load;
     load.target               = "qwen3_6_27b";
+    load.weights_id           = "groupwise-int";
     load.load_seconds         = 1.234567890123;
     load.upload_seconds       = 0.345678901234;
     load.artifact_bytes_read  = 1000;
@@ -88,9 +89,11 @@ int main() {
         "serve-test", 1000, options, load, memory, environment, std::uint64_t{123456}));
     failures += check(server.at("artifact_type") == kRequestLogArtifactType,
                       "server record artifact type mismatch");
-    failures += check(server.at("schema_version") == 3, "server record schema mismatch");
+    failures += check(server.at("schema_version") == 4, "server record schema mismatch");
     failures += check(server.at("event") == "server_start", "server event mismatch");
     failures += check(server.at("artifact").at("target") == "qwen3_6_27b", "server target missing");
+    failures += check(server.at("artifact").at("weights_id") == "groupwise-int",
+                      "server weights id missing");
     failures += check(server.at("artifact").at("size_bytes") == 123456, "artifact size missing");
     failures += check(server.at("engine").at("max_context") == 262144, "max context missing");
     failures += check(server.at("server").at("request_log_jsonl") == "requests.jsonl",

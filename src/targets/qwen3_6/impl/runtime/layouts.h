@@ -62,6 +62,7 @@ namespace ninfer::targets::qwen3_6::detail {
 
 template <>
 struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
+    typename NINFER_QWEN36_VARIANT::WeightsProfile weights_profile;
     std::uint32_t capacity                 = 0;
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
@@ -87,6 +88,7 @@ using SequencePlanImpl = qwen3_6::detail::SequencePlanImpl<Variant>;
 
 void validate_target_options(DeviceContext& device, const EngineOptions& options);
 [[nodiscard]] std::unique_ptr<SequencePlanImpl> plan_sequence_impl(DeviceContext& device,
-                                                                   const EngineOptions& options);
+                                                                   const EngineOptions& options,
+                                                                   WeightsProfile weights_profile);
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

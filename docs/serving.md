@@ -190,13 +190,13 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v3 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v4 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance.
 
 | Event | Contents |
 |---|---|
-| `server_start` | target/artifact, resolved Engine and sampler configuration, weights/sequence/workspace/request-transient arenas, CUDA Graph allowance, CUDA/GPU environment, and redacted argv |
+| `server_start` | target/weights identity and artifact, resolved Engine and sampler configuration, weights/sequence/workspace/request-transient arenas, CUDA Graph allowance, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, thinking mode, output budget, stream/message/tool shape |
 | `request_done` | finish reason, prompt/completion/cache tokens, unrounded phase seconds, and complete speculative-decoding counters |
 | `request_error` | the resolved request configuration and generation error message |

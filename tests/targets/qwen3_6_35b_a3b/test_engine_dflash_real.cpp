@@ -90,7 +90,8 @@ ninfer::PromptInput altered_history_after_boundary() {
 
 int verify_dflash_load(const ninfer::Engine& engine) {
     const ninfer::LoadSummary load = engine.load_summary();
-    if (load.target != "qwen3_6_35b_a3b" || load.tensor_count != 586 || load.resource_count != 6 ||
+    if (load.target != "qwen3_6_35b_a3b" || load.weights_id != "groupwise-int" ||
+        load.tensor_count != 586 || load.resource_count != 6 ||
         load.host_to_device_bytes != 21'591'646'208ULL ||
         load.artifact_bytes_read < load.host_to_device_bytes) {
         std::cerr << "DFlash Engine materialized the wrong artifact payload: target=" << load.target

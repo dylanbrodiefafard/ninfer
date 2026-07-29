@@ -547,6 +547,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
     std::ostringstream out;
     out << "ninfer_bench product throughput report\n"
         << "  target:     " << env.load.target << '\n'
+        << "  weights:    " << env.load.weights_id << '\n'
         << "  gpu:        " << env.gpu_name << " (device " << env.device_id << ")\n"
         << "  cuda:       runtime " << env.cuda_runtime_version << ", driver "
         << env.cuda_driver_version << '\n'
@@ -628,6 +629,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "\", \"file_size_bytes\": " << env.artifact_file_size_bytes << "},\n"
         << "  \"load\": {\n"
         << "    \"target\": \"" << json_escape(env.load.target) << "\",\n"
+        << "    \"weights_id\": \"" << json_escape(env.load.weights_id) << "\",\n"
         << "    \"load_seconds\": " << number(env.load.load_seconds) << ",\n"
         << "    \"upload_seconds\": " << number(env.load.upload_seconds) << ",\n"
         << "    \"artifact_bytes_read\": " << env.load.artifact_bytes_read << ",\n"
@@ -716,7 +718,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
 
 std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult>& results) {
     std::ostringstream out;
-    out << "label,kind,n_prompt,n_gen,target,max_context,prefill_chunk,mtp_draft_tokens,"
+    out << "label,kind,n_prompt,n_gen,target,weights_id,max_context,prefill_chunk,mtp_draft_tokens,"
            "proposal_head,decode_path,kv_cache,kv_payload_bytes,load_host_to_device_bytes,"
            "weights_capacity_bytes,sequence_capacity_bytes,workspace_capacity_bytes,"
            "request_transient_capacity_bytes,cuda_graph_allowance_bytes,"
@@ -739,8 +741,8 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
                                                     static_cast<double>(spec.drafted_tokens));
         out << result.test.label << ',' << kind_string(result.test.kind) << ','
             << result.test.n_prompt << ',' << result.test.n_gen << ',' << env.load.target << ','
-            << env.max_context << ',' << env.prefill_chunk << ',' << env.mtp_draft_tokens << ','
-            << proposal_head_name(env.proposal_head) << ','
+            << env.load.weights_id << ',' << env.max_context << ',' << env.prefill_chunk << ','
+            << env.mtp_draft_tokens << ',' << proposal_head_name(env.proposal_head) << ','
             << decode_path_name(env.use_cuda_graph, env.mtp_draft_tokens) << ','
             << kv_cache_name(env.kv_cache) << ',' << env.memory.kv_payload_bytes << ','
             << env.load.host_to_device_bytes << ',' << env.memory.weights.capacity_bytes << ','

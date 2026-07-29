@@ -109,8 +109,11 @@ so JSON does not repeat a schema or version number.
 
 `weights_id` is scoped by `model_id`; it is not globally unique. The common reader exposes the
 complete pair. The compiled target registry selects a candidate package from `model_id`, and that
-package decides whether the complete pair and actual device are executable. A generic inspector may
-display a structurally valid artifact for an unknown identity but cannot declare it executable.
+package resolves the complete pair to a closed target-private weights profile before sequence
+planning, load planning, or device materialization. Unknown `weights_id` values are rejected
+directly; a package does not infer them from filenames, object counts, formats, or representative
+descriptors. A generic inspector may display a structurally valid artifact for an unknown identity
+but cannot declare it executable.
 
 ### 3.2 Tensor object
 
@@ -304,6 +307,12 @@ validated tensor groups enter the compact device materialization plan. An omitte
 device address and cannot become resident later; this does not define a partial or alternate
 artifact.
 
+When one target accepts multiple `weights_id` values, the package resolver produces one typed
+profile and passes that same value to both the exact binder and the sequence/workspace planner. The
+loaded model and sequence plan retain it, and Program construction rejects a mismatch. Family
+scheduling remains identity-free after startup; request execution neither re-reads the directory
+nor branches on artifact strings.
+
 ### 6.3 Payload-content validation
 
 Persistent numeric and layout contracts still apply to the bytes produced by the project-owned
@@ -409,9 +418,10 @@ retained for later changes is:
   trips;
 - an independently constructed C++ version-2 fixture covering hierarchical identity, payload spans,
   encoded sizes, and alignment;
-- the Qwen3.6-27B binder's complete 1124-object inventory and logical views;
-- inspection, representative source probes, Python reference inference, and Engine loading on a real
-  converter-generated artifact where those paths are exercised.
+- the Qwen3.6-27B binder's complete 1124-object groupwise inventory and 1307-object NVFP4
+  inventory, including the latter's 247 validation-only input divisors;
+- inspection, representative source probes, Python reference inference, and public Engine loading
+  of both real converter-generated 27B artifacts and the real 35B-A3B artifact.
 
 This contract does not require canonical-JSON spelling tests, arbitrary malformed-input matrices,
 fuzz/resource-exhaustion campaigns, failure injection, interrupted-publication tests, full-file

@@ -80,9 +80,9 @@ SCENARIO_FIXTURES = {
 
 WARMUP_FIXTURE = "text_smoke_zh"
 RUN_ARTIFACT_TYPE = "ninfer_serve_corpus_result"
-RUN_SCHEMA_VERSION = 4
+RUN_SCHEMA_VERSION = 5
 SERVER_LOG_ARTIFACT_TYPE = "ninfer_serve_request_log"
-SERVER_LOG_SCHEMA_VERSION = 3
+SERVER_LOG_SCHEMA_VERSION = 4
 STARTUP_TIMEOUT_SECONDS = 1800.0
 REQUEST_TIMEOUT_SECONDS = 24.0 * 60.0 * 60.0
 LOG_EVENT_TIMEOUT_SECONDS = 10.0
@@ -452,7 +452,7 @@ def require_server_log_identity(event: dict[str, Any], event_name: str) -> None:
         raise CampaignError(f"unexpected serving log identity {identity!r}; expected {expected!r}")
 
 
-def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> str:
+def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> tuple[str, str]:
     require_server_log_identity(event, "server_start")
     engine = event.get("engine", {})
     actual = {
@@ -488,12 +488,15 @@ def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> 
             "loaded artifact target mismatch: "
             f"{event.get('artifact', {}).get('target')!r} != {spec.target!r}"
         )
+    weights_id = event.get("artifact", {}).get("weights_id")
+    if not isinstance(weights_id, str) or not weights_id:
+        raise CampaignError("server_start has no canonical artifact weights_id")
     if event.get("server", {}).get("public_model_id") != spec.model_id:
         raise CampaignError("server_start public model id does not match the campaign target")
     server_instance_id = event.get("server_instance_id")
     if not isinstance(server_instance_id, str) or not server_instance_id:
         raise CampaignError("server_start has no server_instance_id")
-    return server_instance_id
+    return server_instance_id, weights_id
 
 
 def safe_ratio(numerator: float, denominator: float) -> float | None:
@@ -504,6 +507,7 @@ def safe_ratio(numerator: float, denominator: float) -> float | None:
 
 def build_result_record(
     spec: RunSpec,
+    weights_id: str,
     payload: dict[str, Any],
     response: dict[str, Any],
     server_event: dict[str, Any],
@@ -587,6 +591,7 @@ def build_result_record(
         "artifact_type": RUN_ARTIFACT_TYPE,
         "schema_version": RUN_SCHEMA_VERSION,
         "target": spec.target,
+        "weights_id": weights_id,
         "model": spec.model_id,
         "artifact_path": str(spec.artifact),
         "fixture": spec.fixture.name,
@@ -727,7 +732,7 @@ def run_block(
     )
     with RunningServer(command, "127.0.0.1", port, server_log) as server:
         server_start = server.wait_until_ready()
-        server_instance_id = validate_server_start(server_start, first, device)
+        server_instance_id, weights_id = validate_server_start(server_start, first, device)
 
         connection = http.client.HTTPConnection(
             "127.0.0.1", port, timeout=REQUEST_TIMEOUT_SECONDS
@@ -750,7 +755,7 @@ def run_block(
                         f"non-sequential serving request id {request_id}; expected {last_request_id + 1}"
                     )
                 last_request_id = request_id
-                record = build_result_record(spec, payload, response, request_done)
+                record = build_result_record(spec, weights_id, payload, response, request_done)
                 append_record(run_handle, record)
                 records[spec.key] = record
                 completed = completed_before_block + block_index
@@ -798,6 +803,7 @@ def select_records(
 SUMMARY_FIELDS = (
     "section",
     "target",
+    "weights_id",
     "group",
     "fixture",
     "speculative_mode",
@@ -840,9 +846,13 @@ def summary_row(
     sampling_mode: str,
     records: Sequence[dict[str, Any]],
 ) -> dict[str, Any]:
+    weights_ids = {str(record.get("weights_id", "")) for record in records}
+    if len(weights_ids) != 1 or not next(iter(weights_ids)):
+        raise CampaignError("summary group does not have one canonical weights_id")
     row: dict[str, Any] = {
         "section": section,
         "target": target,
+        "weights_id": next(iter(weights_ids)),
         "group": group,
         "fixture": fixture,
         "speculative_mode": speculative_mode,
@@ -1006,6 +1016,7 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
             table = markdown_table(
                 (
                     "Target",
+                    "Weights",
                     "Fixture",
                     "n",
                     "Prompt tokens",
@@ -1016,6 +1027,7 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
                 [
                     (
                         row["target"],
+                        row["weights_id"],
                         row["fixture"],
                         str(row["samples"]),
                         format_mean_stddev(row, "prompt_tokens"),
@@ -1032,6 +1044,7 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
             table = markdown_table(
                 (
                     "Target",
+                    "Weights",
                     "Fixture",
                     "n",
                     "Completion tokens",
@@ -1042,6 +1055,7 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
                 [
                     (
                         row["target"],
+                        row["weights_id"],
                         row["fixture"],
                         str(row["samples"]),
                         format_mean_stddev(row, "completion_tokens"),
@@ -1060,6 +1074,7 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
             table = markdown_table(
                 (
                     "Target",
+                    "Weights",
                     "Category",
                     "n",
                     "Decode tok/s",
@@ -1069,6 +1084,7 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
                 [
                     (
                         row["target"],
+                        row["weights_id"],
                         row["group"],
                         str(row["samples"]),
                         format_mean_stddev(row, "decode_tok_s"),

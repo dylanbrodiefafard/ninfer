@@ -677,7 +677,8 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     Tensor gate_flat = gate.view({kCfg.q_size, T});
     Tensor k_flat    = k.view({kCfg.kv_size, T});
     Tensor v_flat    = v.view({kCfg.kv_size, T});
-    Variant::attention_projection(h, *w.projection, q_flat, gate_flat, k_flat, v_flat, s);
+    Variant::attention_projection(h, *w.projection, q_flat, gate_flat, k_flat, v_flat, ph, work_,
+                                  s);
 
     const auto results = workspace_recipe::text_attention_results<TextConfig>(work_, T);
     Tensor qn          = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, T});
@@ -695,7 +696,7 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
                        *active_gqa_envelope_, work_, a, s);
     ops::sigmoid_mul(gate, a, s);
 
-    ops::linear_add(a.view({kCfg.q_size, T}), *w.o_proj, x, work_, s);
+    Variant::attention_output_projection(a.view({kCfg.q_size, T}), *w.o_proj, x, ph, work_, s);
 }
 
 void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
@@ -717,11 +718,11 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     if (ph == Phase::Verify) {
         Tensor& conv_states = state_.conv.at(static_cast<std::size_t>(gidx));
         Variant::gdn_input_projection_snapshot(h, *w.projection, *w.conv1d, conv_states,
-                                               io_.gdn_initial_slot, qc, kc, vc, z, work_, s);
+                                               io_.gdn_initial_slot, qc, kc, vc, z, ph, work_, s);
     } else {
         const auto conv = workspace_recipe::gdn_prefill_conv<TextConfig>(work_, T);
         Tensor qkv      = conv.projected;
-        Variant::gdn_input_projection(h, *w.projection, qkv, z, s);
+        Variant::gdn_input_projection(h, *w.projection, qkv, z, ph, work_, s);
         Tensor qkv_c = conv.convolved;
         // Prefill reads the committed conv window from gdn_prefill_read_slot_ and writes the
         // running window to slot 0 (in-place when the read slot is 0).
@@ -757,18 +758,16 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s);
 
-    ops::linear_add(on.view({kCfg.value_dim, T}), *w.out_proj, x, work_, s);
+    Variant::gdn_output_projection(on.view({kCfg.value_dim, T}), *w.out_proj, x, ph, work_, s);
 }
 
 void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
-    (void)ph;
-
-    Tensor h = workspace_recipe::post_mixer_hidden<TextConfig>(work_, T);
+    Tensor h       = workspace_recipe::post_mixer_hidden<TextConfig>(work_, T);
     ops::rmsnorm(x, *post_norm, kCfg.rms_eps, true, h, s);
 
-    Variant::post_mixer(h, *m.payload, x, work_, s);
+    Variant::post_mixer(h, *m.payload, x, ph, work_, s);
 }
 
 template <class Tap>

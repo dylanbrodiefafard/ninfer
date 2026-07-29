@@ -252,6 +252,7 @@ struct MemorySummary {
 
 struct LoadSummary {
     std::string target;
+    std::string weights_id;
     double load_seconds                = 0.0;
     double upload_seconds              = 0.0;
     std::uint64_t artifact_bytes_read  = 0;

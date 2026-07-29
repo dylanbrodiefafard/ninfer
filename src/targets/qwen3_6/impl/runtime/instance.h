@@ -12,6 +12,7 @@
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 
 using Variant                        = NINFER_QWEN36_VARIANT;
+using WeightsProfile                 = typename Variant::WeightsProfile;
 using TextConfig                     = typename Variant::TextConfig;
 using VisionConfig                   = typename Variant::VisionConfig;
 using DFlashConfig                   = typename Variant::DFlashConfig;

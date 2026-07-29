@@ -56,7 +56,8 @@ std::vector<std::uint8_t> gradient_ppm() {
 
 int verify_loaded_product(const ninfer::Engine& engine) {
     const ninfer::LoadSummary load = engine.load_summary();
-    if (load.target != "qwen3_6_35b_a3b" || load.tensor_count != 883 || load.resource_count != 6 ||
+    if (load.target != "qwen3_6_35b_a3b" || load.weights_id != "groupwise-int" ||
+        load.tensor_count != 883 || load.resource_count != 6 ||
         load.host_to_device_bytes != 22'360'191'904ULL ||
         load.artifact_bytes_read < load.host_to_device_bytes) {
         std::cerr << "35B Engine construction has an incomplete load summary: target="

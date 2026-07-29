@@ -52,7 +52,8 @@ public:
     std::unique_ptr<detail::SequencePlanImpl<Variant>> impl_;
 
     template <class V>
-    friend SequencePlan<V> plan_sequence(DeviceContext&, const EngineOptions&);
+    friend SequencePlan<V> plan_sequence(DeviceContext&, const EngineOptions&,
+                                         typename V::WeightsProfile);
     template <class V>
     friend class detail::ProgramImpl;
 };
@@ -108,17 +109,20 @@ private:
 
     template <class V>
     friend std::unique_ptr<Program<V>> create_program(const typename V::ModelView&,
-                                                      SequencePlan<V>&&, DeviceContext&);
+                                                      typename V::WeightsProfile, SequencePlan<V>&&,
+                                                      DeviceContext&);
     friend Variant;
 };
 
 template <class Variant>
 [[nodiscard]] SequencePlan<Variant> plan_sequence(DeviceContext& device,
-                                                  const EngineOptions& options);
+                                                  const EngineOptions& options,
+                                                  typename Variant::WeightsProfile weights_profile);
 
 template <class Variant>
 [[nodiscard]] std::unique_ptr<Program<Variant>>
-create_program(const typename Variant::ModelView& model, SequencePlan<Variant>&& plan,
+create_program(const typename Variant::ModelView& model,
+               typename Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& plan,
                DeviceContext& device);
 
 } // namespace ninfer::targets::qwen3_6

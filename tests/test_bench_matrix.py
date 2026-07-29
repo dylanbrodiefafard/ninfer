@@ -5,18 +5,19 @@ import json
 from tools.bench.run_ninfer_bench_matrix import BenchCase, report_rows
 
 
-def test_schema_v9_report_is_flattened_for_matrix_summary(tmp_path) -> None:
+def test_schema_v10_report_is_flattened_for_matrix_summary(tmp_path) -> None:
     report_path = tmp_path / "report.json"
     report_path.write_text(
         json.dumps(
             {
-                "schema_version": 9,
+                "schema_version": 10,
                 "artifact_type": "ninfer_bench_report",
                 "tool": "ninfer_bench",
                 "artifact": {"path": "model.ninfer"},
                 "environment": {"gpu_name": "RTX 5090"},
                 "load": {
                     "target": "qwen3_6_27b",
+                    "weights_id": "nvfp4",
                     "load_seconds": 2.5,
                     "upload_seconds": 2.0,
                     "artifact_bytes_read": 17_500_000_000,
@@ -83,8 +84,9 @@ def test_schema_v9_report_is_flattened_for_matrix_summary(tmp_path) -> None:
         "tg3",
         "tg",
     )
-    assert (row["target"], row["artifact_path"], row["gpu_name"]) == (
+    assert (row["target"], row["weights_id"], row["artifact_path"], row["gpu_name"]) == (
         "qwen3_6_27b",
+        "nvfp4",
         "model.ninfer",
         "RTX 5090",
     )

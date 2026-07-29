@@ -149,55 +149,61 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             layout, tokens, plan.features.vision ? 3 : 0, plan.features.vision ? tokens : 0);
     };
     const auto attention_stage = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
-                                     std::int32_t last, ops::GqaExecutionEnvelope envelope) {
+                                     std::int32_t last, qwen3_6::TextPhase phase,
+                                     ops::GqaExecutionEnvelope envelope) {
         auto stage = layout.scope();
         (void)workspace_recipe::text_attention_projection<TextConfig>(layout, last);
+        scratch(layout, Variant::attention_projection_workspace_capacity_bytes(plan.weights_profile,
+                                                                               phase, first, last));
         (void)workspace_recipe::text_attention_results<TextConfig>(layout, last);
         scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
                             TextConfig::query_heads, plan.kv_dtype, envelope, first, last));
-        scratch(layout, ops::linear_add_workspace_capacity_bytes(
-                            Variant::text_projection_qtype, TextConfig::hidden,
-                            TextConfig::query_size, first, last));
+        scratch(layout, Variant::attention_output_projection_workspace_capacity_bytes(
+                            plan.weights_profile, phase, first, last));
     };
     const auto gdn_stage = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
-                               std::int32_t last, bool snapshot) {
+                               std::int32_t last, qwen3_6::TextPhase phase, bool snapshot) {
         auto stage = layout.scope();
         (void)workspace_recipe::gdn_control<TextConfig>(layout, last);
         scratch(layout, Variant::gdn_norm_control_projection_workspace_capacity_bytes(first, last));
         (void)workspace_recipe::gdn_projection<TextConfig>(layout, last);
         if (snapshot) {
-            scratch(layout,
-                    Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(first, last));
+            scratch(layout, Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
+                                plan.weights_profile, phase, first, last));
         } else {
             (void)workspace_recipe::gdn_prefill_conv<TextConfig>(layout, last);
+            scratch(layout, Variant::gdn_input_projection_workspace_capacity_bytes(
+                                plan.weights_profile, phase, first, last));
+        }
+        (void)workspace_recipe::gdn_recurrent_output<TextConfig>(layout, last);
+        if (!snapshot) {
             scratch(layout, ops::gated_delta_rule_workspace_capacity_bytes(
                                 TextConfig::gdn_value_head_dim, TextConfig::gdn_key_heads,
                                 TextConfig::gdn_value_heads, true, first, last));
         }
-        (void)workspace_recipe::gdn_recurrent_output<TextConfig>(layout, last);
         (void)workspace_recipe::gdn_normalized_output<TextConfig>(layout, last);
-        scratch(layout, ops::linear_add_workspace_capacity_bytes(
-                            Variant::text_projection_qtype, TextConfig::hidden,
-                            TextConfig::value_dim, first, last));
+        scratch(layout, Variant::gdn_output_projection_workspace_capacity_bytes(
+                            plan.weights_profile, phase, first, last));
     };
     const auto post_mixer_stage = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
-                                      std::int32_t last) {
+                                      std::int32_t last, qwen3_6::TextPhase phase) {
         auto stage = layout.scope();
         (void)workspace_recipe::post_mixer_hidden<TextConfig>(layout, last);
-        scratch(layout, Variant::post_mixer_workspace_capacity_bytes(first, last));
+        scratch(layout, Variant::post_mixer_workspace_capacity_bytes(plan.weights_profile, phase,
+                                                                     first, last));
     };
     const auto target_body = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
-                                 std::int32_t last, bool snapshot,
+                                 std::int32_t last, qwen3_6::TextPhase phase, bool snapshot,
                                  ops::GqaExecutionEnvelope envelope) {
-        attention_stage(layout, first, last, envelope);
-        gdn_stage(layout, first, last, snapshot);
-        post_mixer_stage(layout, first, last);
+        attention_stage(layout, first, last, phase, envelope);
+        gdn_stage(layout, first, last, phase, snapshot);
+        post_mixer_stage(layout, first, last, phase);
     };
     const auto target_verify = [&](std::int32_t tokens, ops::GqaExecutionEnvelope envelope) {
         WorkspaceLayoutBuilder layout;
         matrix(layout, DType::I32, 1, tokens);
         matrix(layout, DType::BF16, TextConfig::hidden, tokens);
-        target_body(layout, tokens, tokens, true, envelope);
+        target_body(layout, tokens, tokens, qwen3_6::TextPhase::Verify, true, envelope);
         return finish(layout);
     };
 
@@ -262,7 +268,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     WorkspacePlan out;
     WorkspaceLayoutBuilder text_prefill;
     text_common_root(text_prefill, chunk);
-    target_body(text_prefill, 1, chunk, false, text_envelope);
+    target_body(text_prefill, 1, chunk, qwen3_6::TextPhase::Prefill, false, text_envelope);
     scratch(text_prefill, ops::sampling_workspace_capacity_bytes(TextConfig::token_domain, 1, 1));
     out.text_prefill = finish(text_prefill);
 
@@ -274,7 +280,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     if (plan.features.mtp()) {
         WorkspaceLayoutBuilder mtp_prefill;
         text_common_root(mtp_prefill, chunk);
-        target_body(mtp_prefill, 1, chunk, false, text_envelope);
+        target_body(mtp_prefill, 1, chunk, qwen3_6::TextPhase::Prefill, false, text_envelope);
         matrix(mtp_prefill, DType::I32, 1, chunk);
         if (plan.features.vision) {
             matrix(mtp_prefill, DType::BF16, TextConfig::hidden, chunk);
@@ -414,10 +420,12 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
 }
 
 std::unique_ptr<SequencePlanImpl> plan_sequence_impl(DeviceContext& device,
-                                                     const EngineOptions& options) {
+                                                     const EngineOptions& options,
+                                                     WeightsProfile weights_profile) {
     validate_target_options(device, options);
 
     auto impl                 = std::make_unique<SequencePlanImpl>();
+    impl->weights_profile     = weights_profile;
     impl->capacity            = options.max_context;
     impl->prefill_chunk       = std::min(options.prefill_chunk, options.max_context);
     impl->draft_window        = options.speculative.draft_tokens;

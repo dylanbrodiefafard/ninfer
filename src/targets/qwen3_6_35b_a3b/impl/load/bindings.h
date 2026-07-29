@@ -152,9 +152,11 @@ public:
 
 class LoadedModel::Impl {
 public:
-    Impl(BindingPlan plan, artifact::MaterializedArtifact materialized)
-        : data(std::move(plan), std::move(materialized)) {}
+    Impl(WeightsProfile weights_profile_in, BindingPlan plan,
+         artifact::MaterializedArtifact materialized)
+        : weights_profile(weights_profile_in), data(std::move(plan), std::move(materialized)) {}
 
+    WeightsProfile weights_profile;
     LoadedModelData data;
 };
 

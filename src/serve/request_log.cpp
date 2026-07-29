@@ -286,6 +286,7 @@ std::string format_server_start_json(const std::string& server_instance_id, std:
     record["artifact"] = Json{{"path", options.artifact_path},
                               {"size_bytes", std::move(artifact_size)},
                               {"target", load.target},
+                              {"weights_id", load.weights_id},
                               {"bytes_read", load.artifact_bytes_read},
                               {"host_to_device_bytes", load.host_to_device_bytes},
                               {"peak_staging_bytes", load.peak_staging_bytes},

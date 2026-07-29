@@ -56,6 +56,25 @@ int exercise_registered_frontend(const ninfer::Engine& engine) {
     return 0;
 }
 
+int exercise_full_prefill_chunk(ninfer::Engine& engine) {
+    constexpr std::size_t kChunkTokens = 1024;
+    std::vector<ninfer::TokenId> prompt(kChunkTokens, 198);
+    ninfer::RequestOptions options;
+    options.execution.requested_output_tokens = 1;
+    options.execution.sampling.temperature    = 0.0F;
+    options.execution.allow_prefix_reuse      = false;
+    options.stop.include_model_defaults       = false;
+
+    const ninfer::GenerationResult result =
+        engine.generate(engine.prepare_tokens(std::move(prompt)), options);
+    if (result.generated_token_ids.size() != 1 ||
+        result.finish_reason != ninfer::FinishReason::OutputLimit) {
+        std::cerr << "full-chunk prefill did not complete through the planned workspace\n";
+        return 1;
+    }
+    return 0;
+}
+
 int exercise_partial_mtp_terminal(ninfer::Engine& engine,
                                   const std::vector<ninfer::TokenId>& prompt,
                                   const ninfer::GenerationResult& baseline) {
@@ -346,10 +365,15 @@ int exercise_vision(ninfer::Engine& engine) {
 }
 
 int verify_loaded_product(const ninfer::Engine& engine) {
-    const ninfer::LoadSummary load = engine.load_summary();
-    if (load.target != "qwen3_6_27b" || load.tensor_count != 1118 || load.resource_count != 6 ||
+    const ninfer::LoadSummary load     = engine.load_summary();
+    const std::size_t expected_tensors = load.weights_id == "groupwise-int" ? 1118 : 1054;
+    if (load.target != "qwen3_6_27b" ||
+        (load.weights_id != "groupwise-int" && load.weights_id != "nvfp4") ||
+        load.tensor_count != expected_tensors || load.resource_count != 6 ||
         load.host_to_device_bytes == 0 || load.artifact_bytes_read < load.host_to_device_bytes) {
-        std::cerr << "Engine construction has an incomplete load summary\n";
+        std::cerr << "Engine construction has an incomplete load summary: target=" << load.target
+                  << " weights=" << load.weights_id << " tensors=" << load.tensor_count
+                  << " resources=" << load.resource_count << '\n';
         return 1;
     }
     const ninfer::MemorySummary memory = engine.memory_summary();
@@ -366,18 +390,30 @@ int verify_loaded_product(const ninfer::Engine& engine) {
 
 } // namespace
 
-int main() {
-    const char* artifact = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
-    if (artifact == nullptr || *artifact == '\0') {
-        std::cout << "skip: NINFER_QWEN3_6_27B_WEIGHTS is not set\n";
-        return 77;
-    }
-
+int exercise_artifact(const char* artifact) {
     ninfer::Engine engine(engine_options(artifact));
     if (const int result = verify_loaded_product(engine); result != 0) { return result; }
     if (const int result = exercise_registered_frontend(engine); result != 0) { return result; }
+    if (const int result = exercise_full_prefill_chunk(engine); result != 0) { return result; }
     if (const int result = exercise_prefix(engine); result != 0) { return result; }
     if (const int result = exercise_vision(engine); result != 0) { return result; }
+    return 0;
+}
+
+int main() {
+    const char* groupwise = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
+    const char* nvfp4     = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
+    if ((groupwise == nullptr || *groupwise == '\0') && (nvfp4 == nullptr || *nvfp4 == '\0')) {
+        std::cout << "skip: neither NINFER_QWEN3_6_27B_WEIGHTS nor "
+                     "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS is set\n";
+        return 77;
+    }
+    if (groupwise != nullptr && *groupwise != '\0') {
+        if (const int result = exercise_artifact(groupwise); result != 0) { return result; }
+    }
+    if (nvfp4 != nullptr && *nvfp4 != '\0') {
+        if (const int result = exercise_artifact(nvfp4); result != 0) { return result; }
+    }
     std::cout << "ok\n";
     return 0;
 }

@@ -17,6 +17,7 @@ struct DeviceContext;
 namespace artifact {
 class Binder;
 class MaterializedArtifact;
+struct ArtifactIdentity;
 struct MaterializationPlan;
 } // namespace artifact
 
@@ -27,6 +28,11 @@ struct Package;
 namespace detail {
 
 struct Variant;
+
+enum class WeightsProfile : std::uint8_t {
+    GroupwiseInt,
+    Nvfp4,
+};
 
 using Frontend       = qwen3_6::Frontend;
 using PreparedPrompt = qwen3_6::PreparedPrompt;
@@ -72,9 +78,9 @@ private:
 
 struct Package {
     static constexpr std::string_view model_id   = "qwen3.6-27b";
-    static constexpr std::string_view weights_id = "groupwise-int";
     static constexpr std::string_view target_key = "qwen3_6_27b";
 
+    using WeightsProfile = detail::WeightsProfile;
     using LoadPlan       = detail::LoadPlan;
     using LoadedModel    = detail::LoadedModel;
     using Frontend       = detail::Frontend;
@@ -84,12 +90,15 @@ struct Package {
     using RequestPlan    = qwen3_6::RequestPlan<detail::Variant>;
     using Program        = qwen3_6::Program<detail::Variant>;
 
-    [[nodiscard]] static LoadPlan plan_load(artifact::Binder& binder, const EngineOptions& options);
+    [[nodiscard]] static WeightsProfile resolve_weights(const artifact::ArtifactIdentity& identity);
+    [[nodiscard]] static LoadPlan plan_load(artifact::Binder& binder, const EngineOptions& options,
+                                            WeightsProfile weights_profile);
     [[nodiscard]] static std::unique_ptr<LoadedModel>
     construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized);
     [[nodiscard]] static Frontend make_frontend(const LoadedModel& model);
     [[nodiscard]] static SequencePlan plan_sequence(DeviceContext& device,
-                                                    const EngineOptions& options);
+                                                    const EngineOptions& options,
+                                                    WeightsProfile weights_profile);
     [[nodiscard]] static std::unique_ptr<Program>
     create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device);
 };

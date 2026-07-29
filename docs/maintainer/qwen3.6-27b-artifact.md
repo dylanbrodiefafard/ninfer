@@ -32,11 +32,12 @@ the six frontend resources in this document. These components do not define sepa
 artifacts or optional profiles.
 
 The `qwen3_6_27b.ninfer` groupwise-int artifact contains exactly 1118 tensor objects and six
-resource objects. Its payload contract remains frozen and loadable by the current Engine. The
-separate `qwen3_6_27b_nvfp4.ninfer` artifact contains 1301 tensor objects and the same six resources.
-Both serialize `model_id = qwen3.6-27b`; their respective `weights_id = groupwise-int` and
-`weights_id = nvfp4` distinguish the complete inventories without inspecting filenames or object
-formats. Logical row views and aliases are not additional objects or JSON records.
+resource objects. The separate `qwen3_6_27b_nvfp4.ninfer` artifact contains 1301 tensor objects and
+the same six resources. Both are loadable by the current Engine through the same registered
+`qwen3_6_27b` target. Both serialize `model_id = qwen3.6-27b`; their respective
+`weights_id = groupwise-int` and `weights_id = nvfp4` select the complete inventory without
+inspecting filenames, object counts, or representative tensor descriptors. Logical row views and
+aliases are not additional objects or JSON records.
 
 ## 2. Fixed target facts
 
@@ -546,14 +547,13 @@ weights_id = nvfp4
 objects    = 1307
 ```
 
-It is a separate weight contract under the same model as `qwen3_6_27b.ninfer`. Python can produce
-and verify it. The Python and C++ generic artifact registries recognize `NVFP4` and
+It is a separate weight contract under the same model as `qwen3_6_27b.ninfer`. Python produces and
+verifies it. The Python and C++ generic artifact registries recognize `NVFP4` and
 `blockscale-k16-m128x4-v1`, and the C++ reader validates their descriptor geometry and payload
-range.
-
-The current 27B target binder still accepts only the 1124-object Q4/Q5 contract. Therefore the new
-artifact is not yet loadable or executable through Engine. No CLI, serving, model graph, Op
-dispatch, or kernel support is implied by generic-reader recognition.
+range. The 27B package resolves the complete identity to a closed target-private weights profile,
+then its exact NVFP4 binder consumes all 1307 objects. CLI, serving, benchmark, Text, Vision, MTP,
+prefix reuse, and CUDA Graph execution use the same public Engine and registered target as the
+groupwise artifact.
 
 ### 13.2 Fixed sources and component ownership
 
@@ -674,14 +674,14 @@ all 247 NVFP4 parents one-to-one.
 The internal runtime `Weight` representation already has `QType::NVFP4`,
 `QuantLayout::BlockScaleK16M128x4`, E4M3FN scale dtype, `weight_scale_divisor`, and
 `input_scale_divisor`; both divisor fields default to the invalid sentinel `0.0F`. The generic
-`materialized_weight` path deliberately rejects NVFP4 because only the future target-private
+`materialized_weight` path deliberately rejects NVFP4 because only the target-private
 binding plan can validate `d_w` and `d_x` and combine them into a consumable immutable weight.
 Other `QType` values never read either divisor field.
 
 A consumable NVFP4 `Weight` has `group_size = group = 16`, `qdata` at the E2M1 code plane,
 `scales` at the swizzled E4M3FN scale plane, `qhigh = nullptr`, `high_plane_bytes = 0`, and
 `payload_bytes` covering the complete parent payload including its trailing `d_w`. Before
-`Binder::finish()` and the end of the `Reader` lifetime, the future target-private `plan_load` must:
+`Binder::finish()` and the end of the `Reader` lifetime, target-private `plan_load`:
 
 1. exact-read and validate `d_w` from every NVFP4 parent tail;
 2. exact-read and validate the associated site-level `d_x`;
@@ -695,22 +695,24 @@ The fused Attention and GDN input Ops consume their complete NVFP4 parents. Thei
 binding and call boundaries do not construct query/key/gate/value/z `Weight` row views and do not
 consult the artifact directory during execution.
 
-When that binder is implemented, it must select the target-private Text storage contract once from
-the non-consuming descriptor of `text/layers/0/mlp/gate_up`:
+The package selects the Text storage contract exactly once:
 
 ```text
-Q4G64_F16S + row-split-k128-v1       -> existing Q4/Q5 storage
-NVFP4 + blockscale-k16-m128x4-v1     -> NVFP4 block-scaled storage
+ArtifactIdentity(qwen3.6-27b, groupwise-int) -> WeightsProfile::GroupwiseInt
+ArtifactIdentity(qwen3.6-27b, nvfp4)         -> WeightsProfile::Nvfp4
 ```
 
-It must then validate the complete selected inventory. It must not discriminate by object count,
-try one binder and catch failure, add a second model id, or carry a storage branch into the request
-path.
+The registry resolves this profile before sequence or load planning and passes the same typed value
+to both. The sequence plan retains it for profile-specific workspace sizing, the loaded model
+retains it for immutable payload construction, and Program construction requires equality. The
+binder then validates the complete selected inventory. It does not inspect a representative
+descriptor, discriminate by object count, try one binder and catch failure, add a model/target, or
+carry an artifact string branch into request execution.
 
 The existing `attn_input_proj`, `linear`, `linear_add`, and `linear_swiglu` signatures remain
 unchanged. The 27B Q4/Q5 `gdn_input_proj` and `gdn_input_proj_conv_snapshot` signatures now accept
 the complete `[12288,5120]` Q5 `value_z` parent and write Z as an explicit BF16 output. The existing
-Q4/Q5 artifact bytes are unchanged. Each future NVFP4 leaf reads `d_x` and `d_w` from its complete
+Q4/Q5 artifact bytes are unchanged. Each NVFP4 leaf reads `d_x` and `d_w` from its complete
 parent `Weight`; the Op wrapper derives that weight's `1 / (d_x * d_w)` as a leaf-private kernel
 argument. That coefficient is not another artifact object, another `Weight` field, or a new Op
 parameter.
@@ -720,9 +722,12 @@ their single-parent BF16 weights through `attn_input_proj` for the six early
 `query_key_gate_value` parents and through `linear_add` for attention output layers 3 and 7 and GDN
 output layer 4.
 
-Op support for all NVFP4 Text parents and BF16 exceptions described above is complete. The
-target-private binding remains separate work; Op support alone does not make the NVFP4 artifact
-Engine-loadable.
+All NVFP4 Text parents and BF16 exceptions described above are bound and executable. Text prefill
+passes `AllowA4` only for NVFP4 weights: `T >= 17` selects W4A4 MMA while `T <= 16` remains on A16.
+Ordinary decode and speculative target verify always pass `A16Only`; MTP and Vision retain their
+existing storage and execution paths. With all startup features enabled, 1054 tensors and six
+resources are materialized; the 247 site-level `d_x` scalars are consumed and validated but receive
+no device allocation.
 
 ### 13.5 Production and verification
 
@@ -747,3 +752,11 @@ The generated file is 17,608,902,400 bytes, with a 17,608,693,504-byte payload r
 with `verify_nvfp4.py` validates the complete ordered directory, all 247 packed-code/scale/divisor
 payloads against 379 source linears, all 247 input-divisor words, all 105 fused/base BF16 Text
 matrix objects representing the 117 selected BF16 source linears, and all six resources.
+
+Native qualification additionally validates both real 27B artifacts through their exact C++
+load plans. The NVFP4 plan consumes 1307 objects, retains six frontend resources, places 1054
+tensors on device when Text, Vision, MTP, and the optimized proposal head are enabled, and leaves
+exactly 247 `d_x` scalars validation-only. Public Engine smoke covers Text, MTP, Vision, prefix
+reuse, and CUDA Graph decode for both `weights_id` values. On an RTX 5090, an Nsight Systems trace
+of a 54-token NVFP4 prompt records W4A4 quantize/MMA kernels for the long prefill chunk, NVFP4
+small-T kernels for its short tail, and A16 decode/GEMV kernels during graph-backed decode.
