@@ -8,6 +8,6 @@
 namespace ninfer::ops::detail {
 
 void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
-                    cudaStream_t stream);
+                    WorkspaceArena* workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

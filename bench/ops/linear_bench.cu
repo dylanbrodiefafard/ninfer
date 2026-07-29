@@ -42,6 +42,7 @@ namespace {
 constexpr double kRtx5090DramGBs           = 1792.0;
 constexpr double kRtx5090SustainedReadGBs  = 1674.5;
 constexpr double kRtx5090DenseBf16Tflops   = 209.5;
+constexpr double kRtx5090DenseNvfp4Tflops  = 1676.0;
 constexpr std::uint64_t kDefaultFlushBytes = 256ULL << 20;
 constexpr int kDefaultWarmup               = 3;
 constexpr int kDefaultRepeat               = 20;
@@ -146,33 +147,35 @@ struct PointGroup {
 
 struct Result {
     std::string labels;
-    const char* qtype_name     = "";
-    const char* policy_name    = "";
-    std::int32_t n             = 0;
-    std::int32_t k             = 0;
-    std::int32_t t             = 0;
-    std::uint64_t weight_bytes = 0;
-    std::uint64_t x_bytes      = 0;
-    std::uint64_t out_bytes    = 0;
-    std::uint64_t model_bytes  = 0;
-    double useful_flops        = 0.0;
-    double median_us           = 0.0;
-    double min_us              = 0.0;
-    double p95_us              = 0.0;
-    double effective_gbs       = 0.0;
-    double dram_spec_pct       = 0.0;
-    double sustained_read_pct  = 0.0;
-    double useful_tflops       = 0.0;
-    double bf16_tc_spec_pct    = 0.0;
-    double memory_floor_us     = 0.0;
-    double compute_floor_us    = 0.0;
-    double roofline_floor_us   = 0.0;
-    double roofline_pct        = 0.0;
-    const char* bound          = "";
-    double delta_pct           = std::numeric_limits<double>::quiet_NaN();
-    int warmup                 = 0;
-    int repeat                 = 0;
-    std::uint64_t flush_bytes  = 0;
+    const char* qtype_name      = "";
+    const char* policy_name     = "";
+    const char* activation_name = "";
+    std::int32_t n              = 0;
+    std::int32_t k              = 0;
+    std::int32_t t              = 0;
+    std::uint64_t weight_bytes  = 0;
+    std::uint64_t x_bytes       = 0;
+    std::uint64_t out_bytes     = 0;
+    std::uint64_t model_bytes   = 0;
+    double useful_flops         = 0.0;
+    double median_us            = 0.0;
+    double min_us               = 0.0;
+    double p95_us               = 0.0;
+    double effective_gbs        = 0.0;
+    double dram_spec_pct        = 0.0;
+    double sustained_read_pct   = 0.0;
+    double useful_tflops        = 0.0;
+    double tc_peak_tflops       = 0.0;
+    double tc_spec_pct          = 0.0;
+    double memory_floor_us      = 0.0;
+    double compute_floor_us     = 0.0;
+    double roofline_floor_us    = 0.0;
+    double roofline_pct         = 0.0;
+    const char* bound           = "";
+    double delta_pct            = std::numeric_limits<double>::quiet_NaN();
+    int warmup                  = 0;
+    int repeat                  = 0;
+    std::uint64_t flush_bytes   = 0;
 };
 
 struct LinearBenchWeight {
@@ -248,7 +251,12 @@ const char* qtype_name(QType qtype) {
 
 const char* policy_name(LinearPolicy policy) {
     if (policy == LinearPolicy::A16Only) { return "A16"; }
+    if (policy == LinearPolicy::AllowA4) { return "A4"; }
     throw std::invalid_argument("unsupported Linear benchmark policy");
+}
+
+const char* activation_name(QType qtype, LinearPolicy policy, std::int32_t t) {
+    return qtype == QType::NVFP4 && policy == LinearPolicy::AllowA4 && t > 16 ? "A4" : "A16";
 }
 
 QType parse_qtype(std::string_view text) {
@@ -265,7 +273,8 @@ QType parse_qtype(std::string_view text) {
 LinearPolicy parse_policy(std::string_view text) {
     const std::string value = lower(text);
     if (value == "a16" || value == "a16only") { return LinearPolicy::A16Only; }
-    throw std::invalid_argument("only the current A16 Linear policy is benchmarkable");
+    if (value == "a4" || value == "allowa4") { return LinearPolicy::AllowA4; }
+    throw std::invalid_argument("Linear benchmark policy must be a16 or a4");
 }
 
 std::uint64_t parse_u64(std::string_view text, const char* label) {
@@ -328,7 +337,7 @@ void usage(const char* argv0) {
         "  %s --qtype Q4|Q5|Q6|W8|BF16|NVFP4 --n N --k K --sweep START:END[:STEP] [options]\n"
         "  %s --suite qwen3_6_27b|qwen3_6_35b_a3b|all [options]\n\n"
         "Options:\n"
-        "  --policy a16       Activation-compute policy (default a16; only current option).\n"
+        "  --policy a16|a4    Activation-compute policy (default a16).\n"
         "  --bf16-route R     BF16 route: production, small-t, mma, or all.\n"
         "  --profile          Capture exactly one post-warmup selected Linear launch.\n"
         "  --warmup N         Warmup calls per point (default %d).\n"
@@ -613,13 +622,18 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
     const double seconds = timing.median_us * 1.0e-6;
     const double memory_floor_us =
         static_cast<double>(model_bytes) / (kRtx5090DramGBs * 1.0e9) * 1.0e6;
-    const double compute_floor_us  = useful_flops / (kRtx5090DenseBf16Tflops * 1.0e12) * 1.0e6;
+    const bool uses_nvfp4_tensor_core =
+        point.qtype == QType::NVFP4 && point.policy == LinearPolicy::AllowA4 && point.t > 16;
+    const double tc_peak_tflops =
+        uses_nvfp4_tensor_core ? kRtx5090DenseNvfp4Tflops : kRtx5090DenseBf16Tflops;
+    const double compute_floor_us  = useful_flops / (tc_peak_tflops * 1.0e12) * 1.0e6;
     const double roofline_floor_us = std::max(memory_floor_us, compute_floor_us);
 
     Result result;
     result.labels             = join_labels(point.labels);
     result.qtype_name         = qtype_name(point.qtype);
     result.policy_name        = policy_name(point.policy);
+    result.activation_name    = activation_name(point.qtype, point.policy, point.t);
     result.n                  = point.n;
     result.k                  = point.k;
     result.t                  = point.t;
@@ -635,9 +649,8 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
     result.dram_spec_pct      = result.effective_gbs / kRtx5090DramGBs * 100.0;
     result.sustained_read_pct = result.effective_gbs / kRtx5090SustainedReadGBs * 100.0;
     result.useful_tflops      = useful_flops / seconds / 1.0e12;
-    result.bf16_tc_spec_pct   = point.qtype == QType::NVFP4
-                                    ? std::numeric_limits<double>::quiet_NaN()
-                                    : result.useful_tflops / kRtx5090DenseBf16Tflops * 100.0;
+    result.tc_peak_tflops     = tc_peak_tflops;
+    result.tc_spec_pct        = result.useful_tflops / tc_peak_tflops * 100.0;
     result.memory_floor_us    = memory_floor_us;
     result.compute_floor_us   = compute_floor_us;
     result.roofline_floor_us  = roofline_floor_us;
@@ -655,6 +668,10 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
         std::max_element(group.points.begin(), group.points.end(),
                          [](const BenchPoint& a, const BenchPoint& b) { return a.t < b.t; })
             ->t;
+    const std::int32_t min_t =
+        std::min_element(group.points.begin(), group.points.end(),
+                         [](const BenchPoint& a, const BenchPoint& b) { return a.t < b.t; })
+            ->t;
     const std::uint64_t x_elements =
         checked_mul(static_cast<std::uint64_t>(group.k), max_t, "activation allocation");
     const std::uint64_t out_elements =
@@ -663,6 +680,9 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
     LinearBenchWeight weight = make_weight(group.qtype, group.n, group.k);
     DeviceBuffer x(checked_mul(x_elements, 2, "activation allocation bytes"));
     DeviceBuffer out(checked_mul(out_elements, 2, "output allocation bytes"));
+    const std::size_t workspace_capacity = ops::linear_workspace_capacity_bytes(
+        group.qtype, group.n, group.k, group.policy, min_t, max_t);
+    DeviceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
     fill_activation(x, x_elements, stream);
     CUDA_CHECK(cudaMemsetAsync(out.p, 0, out.bytes, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -679,7 +699,19 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
             Bf16Route::SmallT,
             Bf16Route::Mma,
         };
-        const auto measure = [&](Bf16Route route) {
+        const auto record = [&](const auto& launch, const char* route_label, bool track_delta) {
+            const bench::ColdTiming timing =
+                bench::measure_cold_launch(launch, flush, stream, opt.warmup, opt.repeat);
+            BenchPoint measured_point = point;
+            if (route_label != nullptr) { measured_point.labels.push_back(route_label); }
+            Result result = make_result(measured_point, weight, timing, opt);
+            if (point.sweep_point && track_delta && std::isfinite(previous_median)) {
+                result.delta_pct = (result.median_us / previous_median - 1.0) * 100.0;
+            }
+            if (point.sweep_point && track_delta) { previous_median = result.median_us; }
+            results.push_back(std::move(result));
+        };
+        const auto measure_bf16 = [&](Bf16Route route) {
             if (!bf16_route_supports(route, point.t)) {
                 if (opt.bf16_route == Bf16Route::All) { return; }
                 throw std::invalid_argument("selected BF16 Linear route does not support T");
@@ -688,26 +720,21 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
                 launch_bf16_route(route, activation, weight.weight, output, group.policy,
                                   launch_stream);
             };
-            const bench::ColdTiming timing =
-                bench::measure_cold_launch(launch, flush, stream, opt.warmup, opt.repeat);
-            BenchPoint measured_point = point;
-            if (opt.bf16_route_explicit) {
-                measured_point.labels.push_back(bf16_route_name(route));
-            }
-            Result result = make_result(measured_point, weight, timing, opt);
-            if (point.sweep_point && opt.bf16_route != Bf16Route::All &&
-                std::isfinite(previous_median)) {
-                result.delta_pct = (result.median_us / previous_median - 1.0) * 100.0;
-            }
-            if (point.sweep_point && opt.bf16_route != Bf16Route::All) {
-                previous_median = result.median_us;
-            }
-            results.push_back(std::move(result));
+            record(launch, opt.bf16_route_explicit ? bf16_route_name(route) : nullptr,
+                   opt.bf16_route != Bf16Route::All);
         };
-        if (opt.bf16_route == Bf16Route::All) {
-            for (const Bf16Route route : kRoutes) { measure(route); }
+        if (group.qtype == QType::BF16_CTRL) {
+            if (opt.bf16_route == Bf16Route::All) {
+                for (const Bf16Route route : kRoutes) { measure_bf16(route); }
+            } else {
+                measure_bf16(opt.bf16_route);
+            }
         } else {
-            measure(opt.bf16_route);
+            const auto launch = [&](cudaStream_t launch_stream) {
+                ops::linear(activation, weight.weight, output, group.policy, workspace,
+                            launch_stream);
+            };
+            record(launch, nullptr, true);
         }
     }
     return results;
@@ -722,17 +749,25 @@ void run_profile(const BenchPoint& point, const Options& opt, DeviceBuffer& flus
     LinearBenchWeight weight = make_weight(point.qtype, point.n, point.k);
     DeviceBuffer x(checked_mul(x_elements, 2, "activation allocation bytes"));
     DeviceBuffer out(checked_mul(out_elements, 2, "output allocation bytes"));
+    const std::size_t workspace_capacity = ops::linear_workspace_capacity_bytes(
+        point.qtype, point.n, point.k, point.policy, point.t, point.t);
+    DeviceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
     fill_activation(x, x_elements, stream);
     CUDA_CHECK(cudaMemsetAsync(out.p, 0, out.bytes, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     Tensor activation(x.p, DType::BF16, {point.k, point.t});
     Tensor output(out.p, DType::BF16, {point.n, point.t});
-    if (!bf16_route_supports(opt.bf16_route, point.t)) {
+    if (point.qtype == QType::BF16_CTRL && !bf16_route_supports(opt.bf16_route, point.t)) {
         throw std::invalid_argument("selected BF16 Linear route does not support T");
     }
     const auto launch = [&]() {
-        launch_bf16_route(opt.bf16_route, activation, weight.weight, output, point.policy, stream);
+        if (point.qtype == QType::BF16_CTRL) {
+            launch_bf16_route(opt.bf16_route, activation, weight.weight, output, point.policy,
+                              stream);
+        } else {
+            ops::linear(activation, weight.weight, output, point.policy, workspace, stream);
+        }
     };
     for (int i = 0; i < opt.warmup; ++i) {
         bench::flush_l2(flush, stream);
@@ -748,11 +783,12 @@ void run_profile(const BenchPoint& point, const Options& opt, DeviceBuffer& flus
         checked_add(weight.model_weight_bytes(), x_bytes, "model bytes"), out_bytes, "model bytes");
     const double useful_flops = 2.0 * static_cast<double>(point.n) * static_cast<double>(point.k) *
                                 static_cast<double>(point.t);
+    const char* route =
+        point.qtype == QType::BF16_CTRL ? bf16_route_name(opt.bf16_route) : "public";
     std::printf("PROFILE linear qtype=%s policy=%s route=%s N=%d K=%d T=%d model_bytes=%llu "
                 "useful_flops=%.0f\n",
-                qtype_name(point.qtype), policy_name(point.policy), bf16_route_name(opt.bf16_route),
-                point.n, point.k, point.t, static_cast<unsigned long long>(model_bytes),
-                useful_flops);
+                qtype_name(point.qtype), policy_name(point.policy), route, point.n, point.k,
+                point.t, static_cast<unsigned long long>(model_bytes), useful_flops);
     std::fflush(stdout);
 
     CUDA_CHECK(cudaProfilerStart());
@@ -768,16 +804,17 @@ void print_header() {
     CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
     std::printf("# actual_gpu=%s sm=%d%d reference_gpu=RTX_5090\n", properties.name,
                 properties.major, properties.minor);
-    std::printf("# dram_spec_gbs=%.1f sustained_read_gbs=%.1f bf16_dense_tc_spec_tflops=%.1f "
-                "cache=cold\n",
-                kRtx5090DramGBs, kRtx5090SustainedReadGBs, kRtx5090DenseBf16Tflops);
+    std::printf("# dram_spec_gbs=%.1f sustained_read_gbs=%.1f "
+                "bf16_dense_tc_spec_tflops=%.1f nvfp4_dense_tc_spec_tflops=%.1f cache=cold\n",
+                kRtx5090DramGBs, kRtx5090SustainedReadGBs, kRtx5090DenseBf16Tflops,
+                kRtx5090DenseNvfp4Tflops);
 }
 
 void print_results(const std::vector<Result>& results) {
-    std::printf("%-44s %3s %3s %8s %8s %6s %11s %11s %11s %10s %7s %7s %10s %7s %7s %9s "
-                "%8s\n",
-                "label", "qt", "act", "N", "K", "T", "median_us", "min_us", "p95_us", "eff_GB/s",
-                "DRAM_%", "READ_%", "TFLOP/s", "TC_%", "bound", "roof_%", "delta_%");
+    std::printf("%-44s %5s %3s %3s %8s %8s %6s %11s %11s %11s %10s %7s %7s %10s %7s %7s "
+                "%9s %8s\n",
+                "label", "qt", "pol", "act", "N", "K", "T", "median_us", "min_us", "p95_us",
+                "eff_GB/s", "DRAM_%", "READ_%", "TFLOP/s", "TC_%", "bound", "roof_%", "delta_%");
     for (const Result& result : results) {
         const bool have_delta = std::isfinite(result.delta_pct);
         char delta[32];
@@ -787,17 +824,14 @@ void print_results(const std::vector<Result>& results) {
         } else {
             std::snprintf(delta, sizeof(delta), "-");
         }
-        if (std::isfinite(result.bf16_tc_spec_pct)) {
-            std::snprintf(tc_pct, sizeof(tc_pct), "%.2f", result.bf16_tc_spec_pct);
-        } else {
-            std::snprintf(tc_pct, sizeof(tc_pct), "N/A");
-        }
-        std::printf("%-44s %3s %3s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %7.2f "
+        std::snprintf(tc_pct, sizeof(tc_pct), "%.2f", result.tc_spec_pct);
+        std::printf("%-44s %5s %3s %3s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %7.2f "
                     "%7.2f %10.2f %7s %7s %9.2f %8s\n",
-                    result.labels.c_str(), result.qtype_name, result.policy_name, result.n,
-                    result.k, result.t, result.median_us, result.min_us, result.p95_us,
-                    result.effective_gbs, result.dram_spec_pct, result.sustained_read_pct,
-                    result.useful_tflops, tc_pct, result.bound, result.roofline_pct, delta);
+                    result.labels.c_str(), result.qtype_name, result.policy_name,
+                    result.activation_name, result.n, result.k, result.t, result.median_us,
+                    result.min_us, result.p95_us, result.effective_gbs, result.dram_spec_pct,
+                    result.sustained_read_pct, result.useful_tflops, tc_pct, result.bound,
+                    result.roofline_pct, delta);
     }
 }
 
@@ -815,24 +849,20 @@ void write_csv(const std::filesystem::path& path, const std::vector<Result>& res
     if (path.has_parent_path()) { std::filesystem::create_directories(path.parent_path()); }
     std::ofstream out(path);
     if (!out) { throw std::runtime_error("failed to open CSV output: " + path.string()); }
-    out << "label,qtype,policy,N,K,T,weight_bytes,x_bytes,out_bytes,model_bytes,useful_flops,"
-           "median_us,min_us,p95_us,effective_gbs,dram_spec_gbs,dram_spec_pct,"
-           "sustained_read_gbs,sustained_read_pct,useful_tflops,bf16_dense_tc_spec_tflops,"
-           "bf16_tc_spec_pct,memory_floor_us,compute_floor_us,roofline_floor_us,bound,"
-           "roofline_pct,delta_pct,warmup,repeat,flush_bytes\n";
+    out << "label,qtype,policy,activation_compute,N,K,T,weight_bytes,x_bytes,out_bytes,model_bytes,"
+           "useful_flops,median_us,min_us,p95_us,effective_gbs,dram_spec_gbs,dram_spec_pct,"
+           "sustained_read_gbs,sustained_read_pct,useful_tflops,tc_peak_tflops,tc_spec_pct,"
+           "memory_floor_us,compute_floor_us,roofline_floor_us,bound,roofline_pct,delta_pct,"
+           "warmup,repeat,flush_bytes\n";
     for (const Result& result : results) {
         out << csv_quote(result.labels) << ',' << result.qtype_name << ',' << result.policy_name
-            << ',' << result.n << ',' << result.k << ',' << result.t << ',' << result.weight_bytes
-            << ',' << result.x_bytes << ',' << result.out_bytes << ',' << result.model_bytes << ','
-            << result.useful_flops << ',' << result.median_us << ',' << result.min_us << ','
-            << result.p95_us << ',' << result.effective_gbs << ',' << kRtx5090DramGBs << ','
-            << result.dram_spec_pct << ',' << kRtx5090SustainedReadGBs << ','
-            << result.sustained_read_pct << ',' << result.useful_tflops << ',';
-        if (std::isfinite(result.bf16_tc_spec_pct)) {
-            out << kRtx5090DenseBf16Tflops << ',' << result.bf16_tc_spec_pct;
-        } else {
-            out << ',';
-        }
+            << ',' << result.activation_name << ',' << result.n << ',' << result.k << ','
+            << result.t << ',' << result.weight_bytes << ',' << result.x_bytes << ','
+            << result.out_bytes << ',' << result.model_bytes << ',' << result.useful_flops << ','
+            << result.median_us << ',' << result.min_us << ',' << result.p95_us << ','
+            << result.effective_gbs << ',' << kRtx5090DramGBs << ',' << result.dram_spec_pct << ','
+            << kRtx5090SustainedReadGBs << ',' << result.sustained_read_pct << ','
+            << result.useful_tflops << ',' << result.tc_peak_tflops << ',' << result.tc_spec_pct;
         out << ',' << result.memory_floor_us << ',' << result.compute_floor_us << ','
             << result.roofline_floor_us << ',' << result.bound << ',' << result.roofline_pct << ',';
         if (std::isfinite(result.delta_pct)) { out << result.delta_pct; }

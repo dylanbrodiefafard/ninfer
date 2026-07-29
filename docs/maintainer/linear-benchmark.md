@@ -9,16 +9,17 @@
 benchmark 只测量：
 
 ```text
-ninfer::ops::linear(x, w, out, policy, stream)
+ninfer::ops::linear(x, w, out, policy, workspace, stream)
 ```
 
 Q4/Q5/Q6/W8 LinearAdd、LinearSwiGLU、LinearPair 和其他 fused Ops 不属于这个
 benchmark。它们继续由各自的 benchmark 独立测量。
 
-当前只有 A16 pure Linear route。Q4/Q5/Q6/W8 使用 RowSplit packed weight；BF16_CTRL
-以及 exact `[14336,5120], T=1` NVFP4 decode route 作为显式开发单点使用，不加入 model
-suite。benchmark 不提供虚假的 A8 或 A4 选项；只有相应 production route、数值资格和
-硬件规格参照同时存在后，才增加新的执行类型。
+Q4/Q5/Q6/W8 和 BF16_CTRL 使用现有 A16 route。NVFP4 exact
+`[N,K]=[14336,5120]` 同时支持 A16 与 A4 policy，并作为永久开发 surface 使用，不加入
+model suite。`--policy a4` 测量完整 public 调用：`T<=16` 仍解析为 A16，`T>16` 由当前
+production route 量化 activation 后执行 W4A4。默认 prefill chunk `T=1024` 是这条 A4
+surface 的首要性能点；更大 T 只用于确认正 T 合同和 route 的可扩展性。
 
 ## 1. 使用场景
 
@@ -45,13 +46,25 @@ suite。benchmark 不提供虚假的 A8 或 A4 选项；只有相应 production 
   --n 14336 --k 5120 --t 1
 ```
 
-NVFP4 decode 的 permanent exact point 是：
+NVFP4 的永久 A16 decode point 是：
 
 ```bash
 ./build/bench/ninfer_linear_bench \
   --qtype nvfp4 --policy a16 \
   --n 14336 --k 5120 --t 1
 ```
+
+其主要 W4A4 MMA point 是：
+
+```bash
+./build/bench/ninfer_linear_bench \
+  --qtype nvfp4 --policy a4 \
+  --n 14336 --k 5120 --t 1024
+```
+
+workspace 在 timed region 前按 public capacity query 分配；activation quantization 和
+GEMM 的全部 launch 与流量都在一次 timed `linear()` 内。预量化后只计 GEMM 的结果不是
+这个 benchmark 的 production 指标。
 
 ### 1.2 NCU 单点
 
@@ -295,22 +308,26 @@ traffic。它不计：
 ```text
 useful_flops = 2*N*K*T
 useful_TFLOP/s = useful_flops / seconds / 1e12
-bf16_tc_spec_pct = useful_TFLOP/s / 209.5 * 100
+tc_spec_pct = useful_TFLOP/s / tc_peak_TFLOP/s * 100
 ```
 
 不把 dequantization、bit decode、padding、split-K 重复工作或 tile rounding 加入
 `useful_flops`，也不从 private schedule 推导 `executed_tflops`。这保证不同实现都用同一
 数学工作量比较。
 
-当前所有 suite point 都是 A16，因此 compute 参照使用 RTX 5090 dense BF16 Tensor
-Core `209.5 TFLOP/s`。以后若增加真实 A8/A4 path，必须登记对应的固定硬件规格；不能
-继续套用 BF16 peak，也不能用自建 probe 的实测值替代 datasheet/spec 参照。
+当前所有 suite point 都是 A16，compute 参照使用 RTX 5090 dense BF16 Tensor Core
+`209.5 TFLOP/s`。NVFP4 `AllowA4` 且 `T>16` 的显式 point 使用 RTX 5090 dense FP4
+FP32-accumulate `1676.0 TFLOP/s`；它包含 activation quantization 的完整 Op 时间。其他
+point 不得套用 FP4 peak，也不用自建 probe 的实测值替代固定硬件规格。
 
 统一 roofline 参考为：
 
 ```text
 memory_floor_us = model_bytes / 1792 GB/s
-compute_floor_us = useful_flops / 209.5 TFLOP/s
+tc_peak_TFLOP/s =
+    1676.0 for NVFP4 AllowA4 with T>16
+    209.5 otherwise
+compute_floor_us = useful_flops / tc_peak_TFLOP/s
 roofline_floor_us = max(memory_floor_us, compute_floor_us)
 roofline_efficiency = roofline_floor_us / median_us
 ```
@@ -341,15 +358,16 @@ gpu=RTX 5090
 dram_spec=1792 GB/s
 sustained_read=1674.5 GB/s
 bf16_dense_tc_spec=209.5 TFLOP/s
+nvfp4_dense_tc_spec=1676.0 TFLOP/s
 cache=cold
 ```
 
 单行结果保留：
 
 ```text
-label qtype policy N K T median_us min_us p95_us
+label qtype policy activation_compute N K T median_us min_us p95_us
 model_GB effective_GB/s DRAM_% READ_%
-useful_TFLOP/s BF16_TC_% bound roofline_%
+useful_TFLOP/s TC_% bound roofline_%
 ```
 
 sweep 额外输出相邻 T 的 `delta_%`。CSV 可以增加 weight/x/out byte breakdown、warmup、
@@ -429,8 +447,9 @@ benchmark。
 4. 对应固定硬件 peak 明确；
 5. public numerical suite 已按该 compute criterion 资格化。
 
-`AllowA8` 只是许可，不能直接在输出中冒充实际 A8。当前所有预置 suite 必须显式使用
-`A16Only`。
+policy 只是许可，输出中的 peak 必须按 production resolver 实际选择的 activation-compute
+profile 确定，不能把许可本身冒充为低精度执行。当前所有预置 suite 显式使用
+`A16Only`；NVFP4 A4 保留为数字 geometry 的显式 point。
 
 ## 10. 当前验证
 
@@ -451,8 +470,13 @@ benchmark。
 9. final NCU 单次 capture 的 DRAM read 为 `146825728` bytes，而 weight 加 activation
    的一遍 logical read 为 `146810880` bytes；额外 read 仅 `14848` bytes，没有 weight
    replay；
-10. 输出保留固定 `1792 GB/s` 和 `209.5 TFLOP/s` 参照，同时独立报告
-    `1674.5 GB/s` 的 `READ_%`。
+10. 输出同时登记固定 `209.5 TFLOP/s` BF16 与 `1676.0 TFLOP/s` NVFP4 dense Tensor
+    Core 参照，并按实际 activation-compute profile 选择 `TC_%` 与 compute roof；
+11. NVFP4 A4 Linear 在 `T=17`、代表性 cp.async point 和主要 `T=1024` TMA point
+    直接通过同一个 exact-decode/naive-FP64 oracle；
+12. RTX 5090、CUDA 13.1、cold-cache、5 warmups/30 samples 下，NVFP4 A4
+    `[14336,5120], T=1024` 的完整 quantization + GEMM median 为 `152.576 us`，
+    即 `985.24 TFLOP/s` 和 dense FP4 peak 的 `58.79%`。
 
-benchmark 不承担数值 correctness；Q4/Q5/Q6/W8 和 BF16 A16 correctness 继续由各自
-public Linear conformance suite 和统一 CPU FP64 GEMM oracle 负责。
+benchmark 不承担数值 correctness；各 weight/activation-compute profile 继续由 public
+Linear conformance suite 和统一 CPU FP64 GEMM oracle 负责。

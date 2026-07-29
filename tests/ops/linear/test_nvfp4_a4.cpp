@@ -1,0 +1,37 @@
+#include "ops/linear/linear_test_common.h"
+
+#include <array>
+#include <exception>
+#include <iostream>
+
+namespace {
+
+using namespace ninfer;
+using namespace ninfer::test::linear;
+
+int run_nvfp4_a4() {
+    constexpr std::array invocations{
+        Invocation{17, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{129, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA4},
+    };
+    return run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
+                     {14336, 5120, 719U, Comparison::Sampled, true, invocations});
+}
+
+} // namespace
+
+int main() {
+    if (!ninfer::test::linear::cuda_available()) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
+    try {
+        const int failures = run_nvfp4_a4();
+        std::cout << (failures == 0 ? "OK" : "FAIL") << " NVFP4_A4 Linear\n";
+        return failures == 0 ? 0 : 1;
+    } catch (const std::exception& error) {
+        std::cerr << "NVFP4_A4 Linear: " << error.what() << '\n';
+        return 1;
+    }
+}

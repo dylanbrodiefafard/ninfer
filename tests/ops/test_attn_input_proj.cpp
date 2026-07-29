@@ -22,18 +22,20 @@ namespace {
 
 // This criterion belongs to the complete A16 attention-input-projection Op.
 constexpr ReductionCriterion kAttnInputProjA16Tolerance{2.9e-3, 4.0e-3, 4.5e-3};
+constexpr ReductionCriterion kAttnInputProjA4Tolerance{0.16, 1.0 / 256.0, 0.16};
 
 int verify_output(std::string_view label, const GuardedBf16Tensor& output,
                   const quantized_weight::PackedWeight& weight, std::int32_t weight_row_offset,
                   std::int32_t output_rows, const std::vector<float>& activation,
-                  std::int32_t hidden, std::int32_t tokens) {
+                  std::int32_t hidden, std::int32_t tokens,
+                  const ReductionCriterion& criterion = kAttnInputProjA16Tolerance) {
     int failures = output.verify_guards(label);
     failures += output.verify_fully_written(label);
     const std::vector<double> actual =
         gather_rows(output.values(), output_rows, 0, output_rows, tokens);
     const std::vector<double> expected =
         projection_oracle(weight, weight_row_offset, output_rows, activation, hidden, tokens);
-    failures += compare(label, actual, expected, kAttnInputProjA16Tolerance);
+    failures += compare(label, actual, expected, criterion);
     return failures;
 }
 
@@ -229,7 +231,8 @@ int run_bf16_target() {
     return failures;
 }
 
-int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens) {
+int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens,
+                          ops::LinearPolicy policy = ops::LinearPolicy::A16Only) {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kQRows  = 6144;
     constexpr std::int32_t kKvRows = 1024;
@@ -243,26 +246,33 @@ int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens) {
     GuardedBf16Tensor key(kKvRows, tokens);
     GuardedBf16Tensor value(kKvRows, tokens);
     Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
-    Tensor q = query.tensor();
-    Tensor g = gate.tensor();
-    Tensor k = key.tensor();
-    Tensor v = value.tensor();
-    ops::attn_input_proj(x, parent.view(), q, g, k, v, nullptr);
+    Tensor q                   = query.tensor();
+    Tensor g                   = gate.tensor();
+    Tensor k                   = key.tensor();
+    Tensor v                   = value.tensor();
+    const std::size_t capacity = ops::attn_input_proj_workspace_capacity_bytes(
+        QType::NVFP4, 14336, kHidden, policy, tokens, tokens);
+    DeviceArena workspace(std::max<std::size_t>(capacity, 256));
+    ops::attn_input_proj(x, parent.view(), q, g, k, v, policy, workspace, nullptr);
     cuda_synchronize();
 
     constexpr std::int32_t kKeyBegin   = kQRows;
     constexpr std::int32_t kGateBegin  = kKeyBegin + kKvRows;
     constexpr std::int32_t kValueBegin = kGateBegin + kQRows;
     int failures                       = 0;
-    const std::string suffix           = " NVFP4 A16 T=" + std::to_string(tokens);
+    const bool a4                      = policy == ops::LinearPolicy::AllowA4;
+    const ReductionCriterion& criterion =
+        a4 ? kAttnInputProjA4Tolerance : kAttnInputProjA16Tolerance;
+    const std::string suffix =
+        std::string(" NVFP4 ") + (a4 ? "A4" : "A16") + " T=" + std::to_string(tokens);
     failures += verify_output("attn q" + suffix, query, parent.host, 0, kQRows, activation, kHidden,
-                              tokens);
+                              tokens, criterion);
     failures += verify_output("attn k" + suffix, key, parent.host, kKeyBegin, kKvRows, activation,
-                              kHidden, tokens);
+                              kHidden, tokens, criterion);
     failures += verify_output("attn gate" + suffix, gate, parent.host, kGateBegin, kQRows,
-                              activation, kHidden, tokens);
+                              activation, kHidden, tokens, criterion);
     failures += verify_output("attn value" + suffix, value, parent.host, kValueBegin, kKvRows,
-                              activation, kHidden, tokens);
+                              activation, kHidden, tokens, criterion);
     failures += verify_preserved("attn x" + suffix, device_activation, activation_bits);
     failures += parent.verify_preserved("attn parent" + suffix);
     return failures;
@@ -278,9 +288,11 @@ int run_nvfp4_target() {
         quantized_weight::make_patterned_weight(QType::NVFP4, kParentRows, kHidden, 331U, options));
 
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 4, 8, 16, 20, 32}) {
+    for (const std::int32_t tokens : {1, 2, 4, 8, 16, 20, 32, 33}) {
         failures += run_nvfp4_target_case(parent, tokens);
     }
+    failures += run_nvfp4_target_case(parent, 17, ops::LinearPolicy::AllowA4);
+    failures += run_nvfp4_target_case(parent, 1024, ops::LinearPolicy::AllowA4);
     return failures;
 }
 

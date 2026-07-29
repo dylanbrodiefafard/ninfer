@@ -1,7 +1,9 @@
 #include "ninfer/ops/linear.h"
 
+#include "ops/linear/bf16/bf16_config.h"
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
+#include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
@@ -72,12 +74,8 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
     validate_linear_policy(policy);
 }
 
-} // namespace
-
-void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
-            cudaStream_t stream) {
-    validate_linear_semantics(x, w, out, policy);
-
+void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
+                     WorkspaceArena* workspace, cudaStream_t stream) {
     switch (w.qtype) {
     case QType::Q4G64_F16S:
         detail::q4_dispatch(x, w, out, policy, stream);
@@ -95,7 +93,7 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
         detail::bf16_dispatch(x, w, out, policy, stream);
         return;
     case QType::NVFP4:
-        detail::nvfp4_dispatch(x, w, out, policy, stream);
+        detail::nvfp4_dispatch(x, w, out, policy, workspace, stream);
         return;
     case QType::FP32_CTRL:
     case QType::I32_CTRL:
@@ -104,8 +102,65 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
     throw std::invalid_argument("linear: unsupported weight qtype");
 }
 
+} // namespace
+
+std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_rows,
+                                            std::int32_t input_rows, LinearPolicy policy,
+                                            std::int32_t min_tokens, std::int32_t max_tokens) {
+    validate_linear_policy(policy);
+    if (min_tokens <= 0 || max_tokens < min_tokens) {
+        throw std::invalid_argument("linear workspace: invalid token interval");
+    }
+
+    switch (qtype) {
+    case QType::Q4G64_F16S:
+        (void)detail::select_q4_launch(output_rows, input_rows, min_tokens, policy);
+        (void)detail::select_q4_launch(output_rows, input_rows, max_tokens, policy);
+        return 0;
+    case QType::Q5G64_F16S:
+        (void)detail::select_q5_launch(output_rows, input_rows, min_tokens, policy);
+        (void)detail::select_q5_launch(output_rows, input_rows, max_tokens, policy);
+        return 0;
+    case QType::Q6G64_F16S:
+        (void)detail::select_q6_launch(output_rows, input_rows, min_tokens, policy);
+        (void)detail::select_q6_launch(output_rows, input_rows, max_tokens, policy);
+        return 0;
+    case QType::W8G32_F16S:
+        (void)detail::select_w8_launch(output_rows, input_rows, min_tokens, policy);
+        (void)detail::select_w8_launch(output_rows, input_rows, max_tokens, policy);
+        return 0;
+    case QType::BF16_CTRL:
+        if (policy != LinearPolicy::A16Only ||
+            output_rows != detail::Bf16LinearDecodeGeometry::kOutputRows ||
+            input_rows != detail::Bf16LinearDecodeGeometry::kInputRows || min_tokens != 1 ||
+            max_tokens != 1) {
+            throw std::invalid_argument("linear workspace: unsupported BF16 profile");
+        }
+        return 0;
+    case QType::NVFP4:
+        if (output_rows != detail::Nvfp4LinearDecodeGeometry::kOutputRows ||
+            input_rows != detail::Nvfp4LinearDecodeGeometry::kInputRows ||
+            (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
+            throw std::invalid_argument("linear workspace: unsupported NVFP4 profile");
+        }
+        if (policy == LinearPolicy::A16Only || max_tokens < detail::kNvfp4FirstA4T) { return 0; }
+        return detail::nvfp4_w4a4_workspace_capacity_bytes(max_tokens);
+    case QType::FP32_CTRL:
+    case QType::I32_CTRL:
+        break;
+    }
+    throw std::invalid_argument("linear workspace: unsupported weight qtype");
+}
+
+void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
+            WorkspaceArena& workspace, cudaStream_t stream) {
+    validate_linear_semantics(x, w, out, policy);
+    dispatch_linear(x, w, out, policy, &workspace, stream);
+}
+
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    linear(x, w, out, LinearPolicy::A16Only, stream);
+    validate_linear_semantics(x, w, out, LinearPolicy::A16Only);
+    dispatch_linear(x, w, out, LinearPolicy::A16Only, nullptr, stream);
 }
 
 } // namespace ninfer::ops

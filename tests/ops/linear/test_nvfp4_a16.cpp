@@ -18,6 +18,7 @@ int run_nvfp4_a16() {
         Invocation{16, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{20, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{32, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{33, CallForm::Policy, ops::LinearPolicy::A16Only},
     };
     return run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                      {14336, 5120, 701U, Comparison::Sampled, true, invocations});

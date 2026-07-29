@@ -128,14 +128,15 @@ functional checklist item.
 
 ### A1 — single-parent NVFP4 `attn_input_proj`
 
-当前 operator-private A16 execution frontier 是 `T=1` decode 和 `T=2..32` Small-T。
-`32` 是已经实现并 qualification 的内部 frontier，不是 public Op 的语义上限；后续应根据
-Small-T 与 MMA 的实测 crossover 上调，而不是把它提升为格式或 API 限制。
+当前实现已经覆盖每个正 `T`。`A16Only` 始终不量化 activation；`AllowA4` 在
+`T<=16` 仍走 decode/Small-T A16，在 `T>16` 走具有 caller-owned workspace 的 W4A4
+Tensor Core route。`16/17` 是 caller 精度许可的固定边界，不是格式 admission limit；
+private tile、TMA 整 tile 条件和 kernel instance 同样不构成 public T 限制。
 
-- [ ] Admit one complete NVFP4 `query_key_gate_value` weight `[14336,5120]`; do not expose four
+- [x] Admit one complete NVFP4 `query_key_gate_value` weight `[14336,5120]`; do not expose four
   weight row views or multiple weight arguments.
-- [ ] Accept `x BF16 [5120,T]`, with every positive `T`.
-- [ ] Write four distinct contiguous BF16 outputs:
+- [x] Accept `x BF16 [5120,T]`, with every positive `T`.
+- [x] Write four distinct contiguous BF16 outputs:
 
   ```text
   q    [6144,T]
@@ -144,7 +145,7 @@ Small-T 与 MMA 的实测 crossover 上调，而不是把它提升为格式或 A
   v    [1024,T]
   ```
 
-- [ ] Interpret physical parent rows exactly as:
+- [x] Interpret physical parent rows exactly as:
 
   ```text
   query       [0,6144)
@@ -154,46 +155,55 @@ Small-T 与 MMA 的实测 crossover 上调，而不是把它提升为格式或 A
   ```
 
   The public argument order `q, gate, k, v` is deliberately different from the physical row order.
-- [ ] Implement the four independent logical projections `q=Wq*x`, `k=Wk*x`,
+- [x] Implement the four independent logical projections `q=Wq*x`, `k=Wk*x`,
   `gate=Wgate*x`, and `v=Wv*x`. There is no observable packed `[14336,T]` output.
-- [ ] Reject an invalid NVFP4 layout, shape, plane geometry, or non-positive/non-finite divisor.
-- [ ] Preserve the existing two-parent 27B Q4/Q5 and single-parent 35B W8 admissions and outputs.
-- [ ] Add independent-oracle coverage for all four row ranges and verify that output allocations
+- [x] Reject an invalid NVFP4 layout, shape, plane geometry, or non-positive/non-finite divisor.
+- [x] Preserve the existing two-parent 27B Q4/Q5 and single-parent 35B W8 admissions and outputs.
+- [x] Add independent-oracle coverage for all four row ranges and verify that output allocations
   receive the intended semantic ranges.
 
 The existing single-parent C++ signature already expresses this semantic form; A1 extends its exact
 format/geometry admission rather than creating a second NVFP4-specific public name.
 
-Current A1 progress, which does not mark A1 complete:
+The permanent pure Linear surface and `attn_input_proj` use the same quantization and MMA compute
+body, with compile-time output policies for contiguous Linear or direct Q/K/gate/V stores. The A4
+route is deliberately two-stage: one kernel quantizes represented BF16 activation by token and K16
+group to compact E2M1 codes plus E4M3 scales, then the GEMM kernel consumes native SM120 NVFP4
+Tensor Cores. Fused repeated quantization was measured and removed.
 
-- [x] the complete NVFP4 parent `[14336,5120]` is admitted for A16 `T=1..32`;
-- [x] one shared matrix kernel writes either contiguous Linear output or the four final Attention
-  allocations directly, with the required physical-row mapping;
-- [x] the Linear result and all four Attention row ranges pass the independent exact-decode/FP64
-  oracle at representative decode, priority, and frontier points while the existing Q4/Q5, W8,
-  and BF16 cases remain qualified;
-- [x] permanent public Linear and input-projection benchmarks continuously sweep `T=1..32`;
-- [ ] `T>32` and the Small-T/MMA crossover still need to make every positive `T` executable.
+For exact T, caller-owned workspace contains `2560*T` code bytes and `320*T` scale bytes, allocated
+from the Op arena at 256-byte alignment. The capacity query and execution use the same allocation
+recipe; allocation occurs before benchmark timing, while quantization, workspace traffic and GEMM
+are all inside the timed public call. Neither Op allocates device memory or materializes an
+observable packed parent output.
 
-The qualified `T=1..32` implementation profile keeps the public activation in BF16, does not use
-Tensor Cores, launches one kernel per Linear or Attention call, and uses zero workspace. Linear and
-Attention share the matrix-compute body but own independent compile-time production mappings.
-These are implementation facts for the current RTX 5090 route, not additions to the mathematical
-Op contract.
+The primary `T=1024` route uses a non-RDC warp-specialized TMA `M256xN128xK128`, three-stage kernel
+so its register reallocation remains effective in the production binary. Other qualified extents
+use a small set of cp.async schedules; non-integral TMA tiles fall back instead of becoming invalid.
+These are current RTX 5090 implementation facts, not mathematical or API requirements. Larger T
+is secondary to the common `T=1024` workload and must not displace a faster `T=1024` schedule.
 
-RTX 5090, CUDA 13.1, cold-cache measurements with 5 warmups and 31 samples produced:
+Linear A4 is checked directly against the exact-decoded-weight/naive-FP64 oracle at the `T=17`
+precision boundary, a representative cp.async point, and the primary `T=1024` TMA point.
+Attention checks all four final allocations against the same independent mathematical definition
+at `T=17` and `T=1024`. Existing A16, Q4/Q5, W8 and BF16 suites remain qualified.
 
-| `T` | Linear median | Attention median |
-|---:|---:|---:|
-| 1 | `32.000 us` | `32.032 us` |
-| 4 | `35.776 us` | `36.064 us` |
-| 8 | `52.544 us` | `52.512 us` |
-| 16 | `79.136 us` | `81.184 us` |
-| 32 | `144.704 us` | `149.312 us` |
+RTX 5090, CUDA 13.1, cold-cache measurements with 5 warmups and 30 samples produced:
 
-The final public sweeps cover every adjacent `T`, including each production-instance transition;
-no extra dispatch threshold is inferred from these five summary points. Extending beyond `32`
-requires a new crossover measurement rather than extrapolating the current mapping.
+| Profile | `T` | Median | Useful throughput | Dense FP4 peak |
+|---|---:|---:|---:|---:|
+| Linear, quantization + GEMM | 1024 | `152.576 us` | `985.24 TFLOP/s` | `58.79%` |
+| Attention, quantization + direct four-output GEMM | 1024 | `152.544 us` | `985.45 TFLOP/s` | `58.80%` |
+
+Quantization accounts for about `11.52 us`; the effective GEMM portion is therefore about
+`141 us`, `1066 TFLOP/s`, or `63.6%` of dense FP4 peak. NCU on the TMA kernel reports no local
+memory or stack spill, `58.89%` tensor-pipe utilization, `79.89%` L2-tag throughput and
+`2.64` waves/SM. This evidence makes `T=1024` the production tuning anchor; larger-T wins alone do
+not justify replacing its schedule.
+
+The fixed `T<=16` A16 boundary is also performance-consistent: the measured full-call transition
+from A16 at `T=16` to A4 at `T=17` reduces latency rather than introducing an upward step. It is
+still a caller-approved precision boundary, not a benchmark-derived semantic choice.
 
 The matrix arithmetic is exactly equivalent to forming `Y = W*x` with
 `Y BF16 [14336,T]` and taking the four physical row ranges above. That equivalence does not make

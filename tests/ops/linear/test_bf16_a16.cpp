@@ -98,7 +98,8 @@ int run_bf16_linear_case(DeviceWeight& weight, std::int32_t tokens) {
 
     Tensor x(device_activation.p, DType::BF16, {hidden, tokens});
     Tensor output(guarded_output.data(), DType::BF16, {rows, tokens});
-    ops::linear(x, weight.view(), output, ops::LinearPolicy::A16Only, nullptr);
+    DeviceArena workspace(256);
+    ops::linear(x, weight.view(), output, ops::LinearPolicy::A16Only, workspace, nullptr);
     cuda_synchronize();
 
     const std::string suffix = " T=" + std::to_string(tokens);

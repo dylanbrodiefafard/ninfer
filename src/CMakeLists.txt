@@ -38,6 +38,19 @@ add_library(ninfer_artifact STATIC
 ninfer_internal_includes(ninfer_artifact)
 target_link_libraries(ninfer_artifact PUBLIC ninfer_core)
 
+# The warp-specialized SM120 kernel uses setmaxnreg to transfer registers from its
+# producer warpgroup to its consumer warpgroups. Relocatable device code makes ptxas
+# discard that contract, so this self-contained kernel is intentionally compiled in a
+# non-RDC archive and called through a host launcher from ninfer_ops.
+add_library(ninfer_nvfp4_tma STATIC
+  ops/linear/nvfp4/nvfp4_w4a4_tma.cu)
+ninfer_internal_includes(ninfer_nvfp4_tma)
+set_target_properties(ninfer_nvfp4_tma PROPERTIES
+  CUDA_SEPARABLE_COMPILATION OFF
+  CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
+target_compile_options(ninfer_nvfp4_tma PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+target_link_libraries(ninfer_nvfp4_tma PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
+
 # Shared mathematical Ops. The list is intentionally explicit: adding a
 # source is a build-boundary decision, not an accidental recursive-glob side effect.
 add_library(ninfer_ops STATIC
@@ -81,6 +94,7 @@ add_library(ninfer_ops STATIC
   ops/attn_input_proj/bf16/bf16_attn_input_plan.cpp
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_decode.cu
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_small_t.cu
+  ops/attn_input_proj/nvfp4/nvfp4_attn_input_w4a4.cu
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.cpp
   ops/attn_input_proj/q4_q5/q4_q5_attn_input_gemm_mma.cu
   ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu
@@ -107,6 +121,7 @@ add_library(ninfer_ops STATIC
   ops/linear/nvfp4/nvfp4_format.cpp
   ops/linear/nvfp4/nvfp4_gemv.cu
   ops/linear/nvfp4/nvfp4_small_t.cu
+  ops/linear/nvfp4/nvfp4_w4a4.cu
   ops/linear/nvfp4/nvfp4_dispatch.cpp
   ops/linear/q4/q4_rowsplit_gemm_mma.cu
   ops/linear/q4/q4_rowsplit_gemm_simt.cu
@@ -192,7 +207,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/vision_pos_embed.cpp)
 ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)
-target_link_libraries(ninfer_ops PUBLIC ninfer_core)
+target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_tma)
 
 # Product-independent text and media mechanisms.
 add_library(ninfer_text STATIC

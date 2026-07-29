@@ -1,8 +1,12 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "ninfer/ops/linear.h"
 
 #include <cuda_runtime.h>
+
+#include <cstddef>
+#include <cstdint>
 
 namespace ninfer::ops {
 
@@ -34,7 +38,8 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
  *
  * The parent stores rows in physical order query, key, output gate, value while the public output
  * argument order is q, gate, k, v. Every route writes the four independently contiguous final
- * allocations directly; no packed parent output or transient workspace is materialized.
+ * allocations directly; no packed parent output is materialized. The NVFP4 A4 profile may use
+ * caller-owned transient storage for its private quantized activation.
  *
  * Registered parent forms are:
  *
@@ -43,14 +48,31 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
  * - BF16_CTRL Contiguous `[14336,5120]`, with row counts `[6144,1024,6144,1024]`. `x` is
  *   BF16 `[5120,T]`, q/gate are BF16 `[6144,T]`, and k/v are BF16 `[1024,T]`.
  * - NVFP4 BlockScaleK16M128x4 `[14336,5120]`, with the same logical row and tensor shapes as
- *   BF16_CTRL. Its current private implementation frontier contains the `T=1` route; later routes
- *   complete the same positive-T contract.
+ *   BF16_CTRL.
  *
- * `T` is the positive token extent of the Op contract.
+ * `T` is the positive token extent of the Op contract. BF16_CTRL and W8G32_F16S admit only
+ * LinearPolicy::A16Only. NVFP4 admits A16Only and AllowA4; AllowA4 resolves to A16 for `T<=16` and
+ * may privately quantize the represented BF16 activation to NVFP4 for larger T.
  *
  * The oracle evaluates every projection independently with naive FP64 accumulation from the
  * logical values represented by the persistent weight and BF16 activation. The final four BF16
- * stores belong to the Op's A16 numerical criterion.
+ * stores belong to the Op's criterion for the selected activation-compute path.
+ *
+ * `workspace` is caller-owned call-scoped transient storage sized by
+ * attn_input_proj_workspace_capacity_bytes(). It must not overlap the input, parent weight, or any
+ * output. The Op does not allocate device memory internally.
+ */
+[[nodiscard]] std::size_t
+attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,
+                                         std::int32_t input_rows, LinearPolicy policy,
+                                         std::int32_t min_tokens, std::int32_t max_tokens);
+
+void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,
+                     Tensor& gate, Tensor& k, Tensor& v, LinearPolicy policy,
+                     WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
+ * Applies the A16-only single-parent Q/K/output-gate/V projection without transient workspace.
  */
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,
                      Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);

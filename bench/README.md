@@ -72,9 +72,11 @@ load, graph construction, and warmup do not enter topology counts.
 ## Linear Op benchmark
 
 `ninfer_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,
-W8, and registered BF16 weights with the current A16 activation-compute policy. LinearAdd,
-LinearSwiGLU, LinearPair, Attention/GDN projections, and sparse MoE remain separate semantic Ops
-and are not benchmark modes here. For registered BF16 problems, `--bf16-route
+W8, registered BF16 weights, and the exact NVFP4 `[14336,5120]` problem. Existing formats use
+`--policy a16`; NVFP4 additionally supports `--policy a4`, which keeps `T<=16` on A16 and measures
+the complete activation-quantization plus W4A4 GEMM call for `T>16`. LinearAdd, LinearSwiGLU,
+LinearPair, Attention/GDN projections, and sparse MoE remain separate semantic Ops and are not
+benchmark modes here. For registered BF16 problems, `--bf16-route
 production|small-t|mma|all` exposes benchmark-local launch controls with the same pure Linear
 semantics so dispatch crossovers can be measured directly.
 
@@ -84,6 +86,8 @@ Build the benchmark and measure one exact production point:
 cmake --build build --parallel --target ninfer_linear_bench
 ./build/bench/ninfer_linear_bench \
   --qtype q4 --policy a16 --n 4096 --k 5120 --t 8
+./build/bench/ninfer_linear_bench \
+  --qtype nvfp4 --policy a4 --n 14336 --k 5120 --t 1024
 ```
 
 A continuous small-T sweep reuses one packed weight and one maximum-T activation/output
@@ -124,11 +128,13 @@ Every ordinary sample is cold-cache: a 256 MiB L2 eviction write completes befor
 interval. Reported effective bandwidth uses the encoded weight planes once, one BF16 activation
 read, and one BF16 output write. Reported FLOPs are the mathematical `2*N*K*T`; neither metric
 copies route-private tile, replay, padding, split, schedule, host-launcher, or kernel-instance
-behavior. The fixed RTX 5090 references are `1792 GB/s` DRAM bandwidth and `209.5 TFLOP/s` dense
-BF16 Tensor Core throughput. `READ_%` additionally compares the same one-read model bytes with the
-measured `1674.5 GB/s` pure-read ceiling from `tools/hbm_bandwidth_probe.cu`; it is the practical
-utilization measure for read-dominated points. Physical traffic and instruction utilization still
-require NCU.
+behavior. The fixed RTX 5090 references are `1792 GB/s` DRAM bandwidth, `209.5 TFLOP/s` dense
+BF16 Tensor Core throughput, and `1676.0 TFLOP/s` dense FP4 Tensor Core throughput. `TC_%` selects
+the reference for the production activation-compute profile; `pol` and `act` separately report
+caller permission and the resolved profile. `READ_%` additionally compares the same one-read model
+bytes with the measured `1674.5 GB/s` pure-read ceiling from `tools/hbm_bandwidth_probe.cu`; it is
+the practical utilization measure for read-dominated points. Physical traffic and instruction
+utilization still require NCU.
 
 ## GDN control-projection Op benchmark
 
@@ -176,12 +182,13 @@ cmake --build build --parallel --target ninfer_gated_delta_rule_bench ninfer_gdn
 
 `ninfer_input_proj_bench` measures the exact Qwen3.6-27B Attention and GDN input-projection shapes.
 The default Q4/Q5 Attention production path uses two parent projections and its benchmark-only
-control uses the former four logical projections. BF16 mode measures the single-parent Attention
-route. GDN production writes directly into the pitched final output; its controls isolate
-projection time and the former materialize-plus-two-copy composition. All timed operands are
-allocated before measurement, and each sample is preceded by a 256 MiB L2 flush. Existing Q4/Q5
-production accepts the Text token extent through the benchmark allocation limit; controls remain
-limited to their Small-T domain.
+control uses the former four logical projections. BF16 and NVFP4 modes measure the single-parent
+Attention route; NVFP4 accepts `--policy a16|a4`. GDN production writes directly into the pitched
+final output; its controls isolate projection time and the former materialize-plus-two-copy
+composition. All timed operands, including the queried A4 workspace, are allocated before
+measurement, and each sample is preceded by a 256 MiB L2 flush. Activation quantization remains
+inside the timed public call. Existing Q4/Q5 production accepts the Text token extent through the
+benchmark allocation limit; controls remain limited to their Small-T domain.
 
 ```bash
 cmake --build build --parallel --target ninfer_input_proj_bench
@@ -206,7 +213,7 @@ tile pair, the primary prefill point, and representative larger chunks. A focuse
 controls. The candidate small-T implementation remains measurable through `T=32`; this range is
 not the production crossover.
 
-The corresponding NVFP4 decode point is:
+The NVFP4 A16 decode point is:
 
 ```bash
 ./build/bench/ninfer_input_proj_bench \
@@ -214,12 +221,19 @@ The corresponding NVFP4 decode point is:
   --warmup 10 --repeat 200
 ```
 
+The primary NVFP4 W4A4 point is:
+
+```bash
+./build/bench/ninfer_input_proj_bench \
+  --op attention --weight-type nvfp4 --policy a4 --t-sweep 1024 \
+  --warmup 5 --repeat 30
+```
+
 Both direct-parent modes count the complete parent exactly once, one activation read, and the four
 final output writes. The result reports the same fixed-spec `DRAM_%` and measured pure-read
-`READ_%` columns as the Linear control. BF16 compute-bound points also report useful Tensor Core
-`TFLOP/s`, `TC_%`, and roofline utilization. `--profile` performs setup, warmup, and L2 eviction
-before capturing exactly one selected launch; production routes enter through the public BF16 or
-NVFP4 `attn_input_proj` call.
+`READ_%` columns as the Linear control, plus profile-appropriate BF16 or FP4 `TC_%`. `--profile`
+performs setup, warmup, and L2 eviction before capturing exactly one selected launch; production
+routes enter through the public BF16 or NVFP4 `attn_input_proj` call.
 
 ## Bidirectional GQA Op benchmark
 

@@ -23,12 +23,13 @@
 namespace ninfer::test::linear {
 namespace {
 
-constexpr std::size_t kOutputGuardBytes  = 256;
-constexpr std::uint8_t kOutputGuardByte  = 0xa5;
-constexpr std::uint8_t kOutputPoisonByte = 0xff;
-constexpr std::size_t kOutputScanWords   = 1U << 20;
-constexpr int kOracleTBlock              = 8;
-constexpr double kBf16UnitRoundoff       = 1.0 / 256.0;
+constexpr std::size_t kOutputGuardBytes   = 256;
+constexpr std::uint8_t kOutputGuardByte   = 0xa5;
+constexpr std::uint8_t kOutputPoisonByte  = 0xff;
+constexpr std::size_t kOutputScanWords    = 1U << 20;
+constexpr int kOracleTBlock               = 8;
+constexpr double kBf16UnitRoundoff        = 1.0 / 256.0;
+constexpr double kA4QuantizationAllowance = 0.16;
 
 // The criterion belongs to the activation compute path, not to a private kernel, schedule, or
 // launcher selected inside that path. The relative-L2 allowance is one BF16 unit roundoff; the
@@ -37,6 +38,8 @@ constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute)
     switch (activation_compute) {
     case ActivationCompute::A16:
         return {kBf16UnitRoundoff, kBf16UnitRoundoff, 2.0 * kBf16UnitRoundoff};
+    case ActivationCompute::A4:
+        return {kA4QuantizationAllowance, kBf16UnitRoundoff, kA4QuantizationAllowance};
     }
     throw std::invalid_argument("linear test: unknown activation compute path");
 }
@@ -91,16 +94,28 @@ std::vector<std::int32_t> sampled_indices(std::int32_t extent) {
     return result;
 }
 
-std::vector<std::uint16_t> make_activation(std::int32_t k, std::int32_t t, std::uint32_t seed) {
+std::vector<std::uint16_t> make_activation(std::int32_t k, std::int32_t t, std::uint32_t seed,
+                                           ActivationCompute activation_compute) {
     const std::size_t elements = checked_elements(k, t, "activation");
     std::vector<std::uint16_t> result(elements);
     for (std::int32_t token = 0; token < t; ++token) {
         for (std::int32_t column = 0; column < k; ++column) {
-            const std::uint64_t token_block = static_cast<std::uint64_t>(token / 256);
-            const std::uint64_t coordinate =
-                static_cast<std::uint64_t>(column) * 17U + static_cast<std::uint64_t>(token) * 31U +
-                static_cast<std::uint64_t>(seed) * 13U +
-                token_block * (static_cast<std::uint64_t>(column / 256) * 13U + 47U);
+            std::uint32_t coordinate = seed ^ (static_cast<std::uint32_t>(column) * 0x9e3779b9U) ^
+                                       (static_cast<std::uint32_t>(token) * 0x85ebca6bU);
+            if (activation_compute == ActivationCompute::A16) {
+                const std::uint64_t token_block = static_cast<std::uint64_t>(token / 256);
+                coordinate                      = static_cast<std::uint32_t>(
+                    static_cast<std::uint64_t>(column) * 17U +
+                    static_cast<std::uint64_t>(token) * 31U +
+                    static_cast<std::uint64_t>(seed) * 13U +
+                    token_block * (static_cast<std::uint64_t>(column / 256) * 13U + 47U));
+            } else {
+                coordinate ^= coordinate >> 16;
+                coordinate *= 0x7feb352dU;
+                coordinate ^= coordinate >> 15;
+                coordinate *= 0x846ca68bU;
+                coordinate ^= coordinate >> 16;
+            }
             const int raw     = static_cast<int>(coordinate & 0xffU);
             const float value = static_cast<float>(raw - 128) * (1.0F / 256.0F);
             result[static_cast<std::size_t>(token) * k + column] = test::f32_to_bf16(value);
@@ -282,7 +297,7 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
     const std::vector<float> oracle_weight =
         quantized_weight::materialize_rows_fp32(host_weight, oracle_rows);
     const std::vector<std::uint16_t> activation_bits =
-        make_activation(shape.k, maximum->t, shape.seed + 1U);
+        make_activation(shape.k, maximum->t, shape.seed + 1U, activation_compute);
 
     DeviceBuffer device_activation(activation_bits.size() * sizeof(std::uint16_t));
     device_activation.copy_from_host(activation_bits.data(), device_activation.bytes);
@@ -308,11 +323,14 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
         GuardedOutput output(checked_elements(shape.n, invocation.t, "guarded output"));
         Tensor input(device_activation.p, DType::BF16, {shape.k, invocation.t});
         Tensor destination(output.data(), DType::BF16, {shape.n, invocation.t});
+        const std::size_t capacity = ops::linear_workspace_capacity_bytes(
+            weight.qtype, shape.n, shape.k, invocation.policy, invocation.t, invocation.t);
+        DeviceArena workspace(std::max<std::size_t>(capacity, 256));
         try {
             if (invocation.call_form == CallForm::A16Convenience) {
                 ops::linear(input, weight, destination, nullptr);
             } else {
-                ops::linear(input, weight, destination, invocation.policy, nullptr);
+                ops::linear(input, weight, destination, invocation.policy, workspace, nullptr);
             }
             cuda_check(cudaDeviceSynchronize(), "synchronize linear");
         } catch (const std::exception& error) {
