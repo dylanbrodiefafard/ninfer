@@ -5,17 +5,11 @@
 
 #include <cuda_bf16.h>
 
-#include <stdexcept>
-
 namespace ninfer::ops::detail {
 
 void launch_bf16_decode(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     using Geometry = Bf16LinearControlGeometry;
     using Schedule = Bf16LinearDecodeSchedule;
-    if (x.ne[0] != Geometry::kInputRows || x.ne[1] != 1 || out.ne[0] != Geometry::kOutputRows ||
-        out.ne[1] != 1 || weight.n != Geometry::kOutputRows || weight.k != Geometry::kInputRows) {
-        throw std::invalid_argument("bf16 linear decode requires [14336,5120] and T=1");
-    }
 
     const Bf16ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data)};
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;

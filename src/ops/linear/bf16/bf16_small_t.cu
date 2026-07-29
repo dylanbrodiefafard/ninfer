@@ -7,15 +7,10 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <stdexcept>
 #include <utility>
 
 namespace ninfer::ops::detail {
 namespace {
-
-constexpr int kFirstSmallT = 2;
-constexpr int kLastSmallT  = 32;
-using Launch               = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
 template <int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
@@ -35,20 +30,17 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
 
 template <std::size_t... Offsets>
 constexpr auto make_launchers(std::index_sequence<Offsets...>) {
-    return std::array<Launch, sizeof...(Offsets)>{
-        &launch_exact<kFirstSmallT + static_cast<int>(Offsets)>...};
+    return std::array<Bf16Launch, sizeof...(Offsets)>{
+        &launch_exact<kBf16FirstSmallT + static_cast<int>(Offsets)>...};
 }
 
 constexpr auto kLaunchers =
-    make_launchers(std::make_index_sequence<kLastSmallT - kFirstSmallT + 1>{});
+    make_launchers(std::make_index_sequence<kBf16LastSmallT - kBf16FirstSmallT + 1>{});
 
 } // namespace
 
 void launch_bf16_small_t(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    if (x.ne[1] < kFirstSmallT || x.ne[1] > kLastSmallT) {
-        throw std::invalid_argument("bf16 linear small-T requires T in [2,32]");
-    }
-    kLaunchers[x.ne[1] - kFirstSmallT](x, weight, out, stream);
+    kLaunchers[x.ne[1] - kBf16FirstSmallT](x, weight, out, stream);
 }
 
 } // namespace ninfer::ops::detail
