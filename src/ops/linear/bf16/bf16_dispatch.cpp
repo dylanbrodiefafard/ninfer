@@ -28,8 +28,8 @@ std::uint64_t required_payload_bytes(const Weight& weight) {
 }
 
 void validate_bf16_weight(const Weight& weight) {
-    constexpr std::int32_t kRows   = Bf16LinearDecodeGeometry::kOutputRows;
-    constexpr std::int32_t kHidden = Bf16LinearDecodeGeometry::kInputRows;
+    constexpr std::int32_t kRows   = Bf16LinearControlGeometry::kOutputRows;
+    constexpr std::int32_t kHidden = Bf16LinearControlGeometry::kInputRows;
     if (weight.qtype != QType::BF16_CTRL || weight.layout != QuantLayout::Contiguous ||
         weight.ndim != 2 || weight.n != kRows || weight.k != kHidden || weight.shape[0] != kRows ||
         weight.shape[1] != kHidden || weight.padded_shape[0] != kRows ||
@@ -48,9 +48,12 @@ void bf16_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPol
     if (policy != LinearPolicy::A16Only) {
         throw std::invalid_argument("bf16 linear: only A16Only is supported");
     }
-    if (x.ne[1] != 1) { throw std::invalid_argument("bf16 linear: unsupported shape or T"); }
     validate_bf16_weight(weight);
-    launch_bf16_decode(x, weight, out, stream);
+    if (x.ne[1] == 1) {
+        launch_bf16_decode(x, weight, out, stream);
+        return;
+    }
+    launch_bf16_small_t(x, weight, out, stream);
 }
 
 } // namespace ninfer::ops::detail

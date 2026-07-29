@@ -182,11 +182,12 @@ same four-contiguous-output contract as A1, not different projection arithmetic.
 
 Current A2 progress, which does not mark A2 complete:
 
-- [x] the exact contiguous BF16 parent `[14336,5120]` is admitted at `T=1`;
+- [x] the exact contiguous BF16 parent `[14336,5120]` is admitted and executable for
+  `T=1..32`;
 - [x] the public call writes Q, gate, K, and V directly with the required physical-row mapping;
-- [x] the complete `T=1` outputs pass the independent represented-BF16/FP64 oracle while existing
-  Q4/Q5 and W8 cases remain qualified;
-- [ ] Small-T and prefill execution regions still need to make every positive `T` executable.
+- [x] the complete `T=1` output and sampled rows and physical seams at `T=2,4,8,16,17,32` pass
+  the independent represented-BF16/FP64 oracle while existing Q4/Q5 and W8 cases remain qualified;
+- [ ] `T>32`, including prefill, still needs to make every positive `T` executable.
 
 ## 5. GDN input projection
 

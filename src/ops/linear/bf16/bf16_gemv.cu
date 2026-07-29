@@ -10,7 +10,7 @@
 namespace ninfer::ops::detail {
 
 void launch_bf16_decode(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    using Geometry = Bf16LinearDecodeGeometry;
+    using Geometry = Bf16LinearControlGeometry;
     using Schedule = Bf16LinearDecodeSchedule;
     if (x.ne[0] != Geometry::kInputRows || x.ne[1] != 1 || out.ne[0] != Geometry::kOutputRows ||
         out.ne[1] != 1 || weight.n != Geometry::kOutputRows || weight.k != Geometry::kInputRows) {

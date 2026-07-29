@@ -9,6 +9,7 @@
 #include <exception>
 #include <iostream>
 #include <span>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -22,12 +23,14 @@ constexpr std::int32_t kRows   = 14336;
 constexpr std::int32_t kHidden = 5120;
 constexpr ReductionCriterion kA16Tolerance{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
 
-std::vector<std::uint16_t> make_activation_bits() {
-    std::vector<std::uint16_t> result(kHidden);
-    for (std::int32_t column = 0; column < kHidden; ++column) {
-        const int centered = ((column * 29 + 17) & 0xff) - 128;
-        result[static_cast<std::size_t>(column)] =
-            f32_to_bf16(static_cast<float>(centered) * (1.0F / 512.0F));
+std::vector<std::uint16_t> make_activation_bits(std::int32_t tokens) {
+    std::vector<std::uint16_t> result(static_cast<std::size_t>(kHidden) * tokens);
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        for (std::int32_t column = 0; column < kHidden; ++column) {
+            const int centered = ((column * 29 + token * 71 + 17) & 0xff) - 128;
+            result[static_cast<std::size_t>(token) * kHidden + column] =
+                f32_to_bf16(static_cast<float>(centered) * (1.0F / 512.0F));
+        }
     }
     return result;
 }
@@ -61,41 +64,78 @@ std::vector<double> oracle_all_rows(const HostWeight& weight, std::span<const fl
     return result;
 }
 
-int run_bf16_linear() {
-    DeviceWeight weight(make_patterned(kRows, kHidden, 401U));
-    const std::vector<std::uint16_t> activation_bits = make_activation_bits();
+std::vector<std::int32_t> sampled_rows() {
+    return {0, 1, 1023, 6143, 6144, 7167, 7168, 13311, 13312, kRows - 2, kRows - 1};
+}
+
+int run_bf16_linear_case(DeviceWeight& weight, std::int32_t tokens) {
+    const std::vector<std::uint16_t> activation_bits = make_activation_bits(tokens);
     const std::vector<float> activation              = materialize(activation_bits);
-    const std::vector<double> expected               = oracle_all_rows(weight.host, activation);
     DeviceBuffer device_activation                   = to_device(activation_bits);
-    GuardedDeviceBuffer guarded_output(static_cast<std::size_t>(kRows) * sizeof(std::uint16_t));
+    GuardedDeviceBuffer guarded_output(static_cast<std::size_t>(kRows) * tokens *
+                                       sizeof(std::uint16_t));
     guarded_output.fill(0xff);
 
-    Tensor x(device_activation.p, DType::BF16, {kHidden, 1});
-    Tensor output(guarded_output.data(), DType::BF16, {kRows, 1});
+    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor output(guarded_output.data(), DType::BF16, {kRows, tokens});
     ops::linear(x, weight.view(), output, ops::LinearPolicy::A16Only, nullptr);
     cuda_synchronize();
 
-    int failures = guarded_output.verify_guards("BF16_A16 Linear output");
+    const std::string suffix = " T=" + std::to_string(tokens);
+    int failures             = guarded_output.verify_guards("BF16_A16 Linear output" + suffix);
     const std::vector<std::uint16_t> output_bits =
-        from_device<std::uint16_t>(guarded_output.data(), kRows);
-    std::vector<double> actual(kRows);
-    for (std::int32_t row = 0; row < kRows; ++row) {
-        const std::uint16_t bits = output_bits[static_cast<std::size_t>(row)];
+        from_device<std::uint16_t>(guarded_output.data(), static_cast<std::size_t>(kRows) * tokens);
+    for (std::size_t index = 0; index < output_bits.size(); ++index) {
+        const std::uint16_t bits = output_bits[index];
         if (!std::isfinite(bf16_to_f32(bits))) {
-            std::cerr << "BF16_A16 Linear output row " << row << " is not finite\n";
+            std::cerr << "BF16_A16 Linear output" << suffix << " element " << index
+                      << " is not finite\n";
             ++failures;
+            break;
         }
-        actual[static_cast<std::size_t>(row)] = bf16_to_f32(bits);
+    }
+
+    std::vector<double> actual;
+    std::vector<double> expected;
+    if (tokens == 1) {
+        const std::vector<double> complete =
+            oracle_all_rows(weight.host, std::span<const float>(activation));
+        actual.reserve(kRows);
+        for (const std::uint16_t bits : output_bits) { actual.push_back(bf16_to_f32(bits)); }
+        expected = complete;
+    } else {
+        const std::vector<std::int32_t> rows = sampled_rows();
+        actual.reserve(rows.size() * static_cast<std::size_t>(tokens));
+        expected.reserve(actual.capacity());
+        for (const std::int32_t row : rows) {
+            for (std::int32_t token = 0; token < tokens; ++token) {
+                actual.push_back(
+                    bf16_to_f32(output_bits[static_cast<std::size_t>(token) * kRows + row]));
+                expected.push_back(dot_fp64(
+                    weight.host, row,
+                    std::span<const float>(
+                        activation.data() + static_cast<std::size_t>(token) * kHidden, kHidden)));
+            }
+        }
     }
     failures +=
-        verify_reduction("BF16_A16 Linear [14336,5120] T=1", actual, expected, kA16Tolerance);
+        verify_reduction("BF16_A16 Linear [14336,5120]" + suffix, actual, expected, kA16Tolerance);
     const std::vector<std::uint16_t> activation_after =
         from_device<std::uint16_t>(device_activation, activation_bits.size());
     if (activation_after != activation_bits) {
-        std::cerr << "BF16_A16 Linear modified its activation\n";
+        std::cerr << "BF16_A16 Linear" << suffix << " modified its activation\n";
         ++failures;
     }
-    failures += weight.verify_preserved("BF16_A16 Linear weight");
+    failures += weight.verify_preserved("BF16_A16 Linear weight" + suffix);
+    return failures;
+}
+
+int run_bf16_linear() {
+    DeviceWeight weight(make_patterned(kRows, kHidden, 401U));
+    int failures = 0;
+    for (const std::int32_t tokens : {1, 2, 4, 8, 16, 17, 32}) {
+        failures += run_bf16_linear_case(weight, tokens);
+    }
     return failures;
 }
 

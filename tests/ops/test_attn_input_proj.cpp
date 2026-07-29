@@ -121,22 +121,45 @@ int verify_direct_output(std::string_view label, const GuardedBf16Tensor& output
     return failures;
 }
 
-int run_bf16_target() {
-    constexpr std::int32_t kHidden     = 5120;
-    constexpr std::int32_t kQRows      = 6144;
-    constexpr std::int32_t kKvRows     = 1024;
-    constexpr std::int32_t kParentRows = 14336;
-    DeviceWeight parent(make_patterned(kParentRows, kHidden, 313U));
-    const std::vector<float> activation              = make_bf16_activation(kHidden, 1, 317U);
+int verify_direct_output_sampled(std::string_view label, const GuardedBf16Tensor& output,
+                                 const HostWeight& weight, std::int32_t parent_row_offset,
+                                 std::int32_t output_rows, const std::vector<float>& activation,
+                                 std::int32_t hidden, std::int32_t tokens) {
+    int failures = output.verify_guards(label);
+    failures += output.verify_fully_written(label);
+    const std::vector<std::int32_t> rows = sampled_rows(output_rows);
+    const std::vector<double> values     = output.values();
+    std::vector<double> actual;
+    std::vector<double> expected;
+    actual.reserve(rows.size() * static_cast<std::size_t>(tokens));
+    expected.reserve(actual.capacity());
+    for (const std::int32_t local_row : rows) {
+        for (std::int32_t token = 0; token < tokens; ++token) {
+            actual.push_back(values[static_cast<std::size_t>(token) * output_rows + local_row]);
+            expected.push_back(dot_fp64(
+                weight, parent_row_offset + local_row,
+                std::span<const float>(activation.data() + static_cast<std::size_t>(token) * hidden,
+                                       hidden)));
+        }
+    }
+    failures += compare(label, actual, expected, kAttnInputProjA16Tolerance);
+    return failures;
+}
+
+int run_bf16_target_case(DeviceWeight& parent, std::int32_t tokens) {
+    constexpr std::int32_t kHidden      = 5120;
+    constexpr std::int32_t kQRows       = 6144;
+    constexpr std::int32_t kKvRows      = 1024;
+    constexpr std::int32_t kParentRows  = 14336;
+    const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 317U + tokens);
     const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
     DeviceBuffer device_activation                   = to_device(activation_bits);
-    const std::vector<double> expected = bf16_attention_oracle(parent.host, activation);
 
-    GuardedBf16Tensor query(kQRows, 1);
-    GuardedBf16Tensor gate(kQRows, 1);
-    GuardedBf16Tensor key(kKvRows, 1);
-    GuardedBf16Tensor value(kKvRows, 1);
-    Tensor x(device_activation.p, DType::BF16, {kHidden, 1});
+    GuardedBf16Tensor query(kQRows, tokens);
+    GuardedBf16Tensor gate(kQRows, tokens);
+    GuardedBf16Tensor key(kKvRows, tokens);
+    GuardedBf16Tensor value(kKvRows, tokens);
+    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
     Tensor q = query.tensor();
     Tensor g = gate.tensor();
     Tensor k = key.tensor();
@@ -147,21 +170,47 @@ int run_bf16_target() {
     constexpr std::int32_t kKeyBegin   = kQRows;
     constexpr std::int32_t kGateBegin  = kKeyBegin + kKvRows;
     constexpr std::int32_t kValueBegin = kGateBegin + kQRows;
+    const std::string suffix           = " BF16 A16 T=" + std::to_string(tokens);
     int failures                       = 0;
-    failures += verify_direct_output(
-        "attn q BF16 A16 T=1", query,
-        std::span<const double>(expected.data(), static_cast<std::size_t>(kQRows)));
-    failures += verify_direct_output(
-        "attn k BF16 A16 T=1", key,
-        std::span<const double>(expected.data() + kKeyBegin, static_cast<std::size_t>(kKvRows)));
-    failures += verify_direct_output(
-        "attn gate BF16 A16 T=1", gate,
-        std::span<const double>(expected.data() + kGateBegin, static_cast<std::size_t>(kQRows)));
-    failures += verify_direct_output(
-        "attn value BF16 A16 T=1", value,
-        std::span<const double>(expected.data() + kValueBegin, static_cast<std::size_t>(kKvRows)));
-    failures += verify_preserved("attn x BF16 A16 T=1", device_activation, activation_bits);
-    failures += parent.verify_preserved("attn parent BF16 A16 T=1");
+    if (tokens == 1) {
+        const std::vector<double> expected = bf16_attention_oracle(parent.host, activation);
+        failures += verify_direct_output(
+            "attn q" + suffix, query,
+            std::span<const double>(expected.data(), static_cast<std::size_t>(kQRows)));
+        failures +=
+            verify_direct_output("attn k" + suffix, key,
+                                 std::span<const double>(expected.data() + kKeyBegin,
+                                                         static_cast<std::size_t>(kKvRows)));
+        failures += verify_direct_output("attn gate" + suffix, gate,
+                                         std::span<const double>(expected.data() + kGateBegin,
+                                                                 static_cast<std::size_t>(kQRows)));
+        failures +=
+            verify_direct_output("attn value" + suffix, value,
+                                 std::span<const double>(expected.data() + kValueBegin,
+                                                         static_cast<std::size_t>(kKvRows)));
+    } else {
+        failures += verify_direct_output_sampled("attn q" + suffix, query, parent.host, 0, kQRows,
+                                                 activation, kHidden, tokens);
+        failures += verify_direct_output_sampled("attn k" + suffix, key, parent.host, kKeyBegin,
+                                                 kKvRows, activation, kHidden, tokens);
+        failures += verify_direct_output_sampled("attn gate" + suffix, gate, parent.host,
+                                                 kGateBegin, kQRows, activation, kHidden, tokens);
+        failures += verify_direct_output_sampled("attn value" + suffix, value, parent.host,
+                                                 kValueBegin, kKvRows, activation, kHidden, tokens);
+    }
+    failures += verify_preserved("attn x" + suffix, device_activation, activation_bits);
+    failures += parent.verify_preserved("attn parent" + suffix);
+    return failures;
+}
+
+int run_bf16_target() {
+    constexpr std::int32_t kHidden     = 5120;
+    constexpr std::int32_t kParentRows = 14336;
+    DeviceWeight parent(make_patterned(kParentRows, kHidden, 313U));
+    int failures = 0;
+    for (const std::int32_t tokens : {1, 2, 4, 8, 16, 17, 32}) {
+        failures += run_bf16_target_case(parent, tokens);
+    }
     return failures;
 }
 
