@@ -10,6 +10,7 @@ namespace ninfer::test::linear_swiglu {
 
 enum class ActivationCompute : std::uint8_t {
     A16,
+    A4,
 };
 
 struct Profile {

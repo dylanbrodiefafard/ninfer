@@ -77,6 +77,7 @@ void nvfp4_linear_add_w4a4_launch(const Tensor& x, const Weight& weight, Tensor&
         return;
     case Nvfp4Problem::AttnInput:
     case Nvfp4Problem::GdnInput:
+    case Nvfp4Problem::MlpGateUp:
         break;
     }
     throw std::invalid_argument("nvfp4 linear_add: unsupported problem");

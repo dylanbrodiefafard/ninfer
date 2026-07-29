@@ -119,6 +119,9 @@ void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
     case Nvfp4Problem::GdnInput:
         launch_problem<Nvfp4GdnInputGeometry>(weight, out, workspace, tokens, stream);
         return;
+    case Nvfp4Problem::MlpGateUp:
+        launch_problem<Nvfp4MlpGateUpGeometry>(weight, out, workspace, tokens, stream);
+        return;
     case Nvfp4Problem::Residual6144:
         launch_problem<Nvfp4Residual6144Geometry>(weight, out, workspace, tokens, stream);
         return;

@@ -55,6 +55,9 @@ void launch_nvfp4_small_t(const Tensor& x, const Weight& weight, Tensor& out, cu
     case Nvfp4Problem::GdnInput:
         launchers<Nvfp4GdnInputGeometry>()[index](x, weight, out, stream);
         return;
+    case Nvfp4Problem::MlpGateUp:
+        launchers<Nvfp4MlpGateUpGeometry>()[index](x, weight, out, stream);
+        return;
     case Nvfp4Problem::Residual6144:
         launchers<Nvfp4Residual6144Geometry>()[index](x, weight, out, stream);
         return;

@@ -59,9 +59,9 @@ enum class LinearPolicy : std::uint8_t {
  * with FP16 scales, block-scaled NVFP4 weights, plus registered contiguous BF16_CTRL problems.
  * Each format owns a finite registry of exact physical weight problems and selects its kernel
  * internally; a valid encoding and alignment do not imply arbitrary N/K support. The current
- * NVFP4 problems `[N,K]` in `{[14336,5120], [16384,5120], [5120,6144],
- * [5120,17408]}` accept every positive T. Text and MTP packed-weight problems accept every
- * positive column extent T. Registered Vision problems accept raw-patch P in
+ * NVFP4 problems `[N,K]` in `{[14336,5120], [16384,5120], [34816,5120],
+ * [5120,6144], [5120,17408]}` accept every positive T. Text and MTP packed-weight problems accept
+ * every positive column extent T. Registered Vision problems accept raw-patch P in
  * `{4,8,...,131072}` or merged-token V in `[1,32768]`; a matrix column does not inherently
  * represent a text token. FP32_CTRL is unsupported.
  *

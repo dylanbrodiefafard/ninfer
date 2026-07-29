@@ -35,6 +35,7 @@ void nvfp4_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tenso
         return;
     case Nvfp4Problem::AttnInput:
     case Nvfp4Problem::GdnInput:
+    case Nvfp4Problem::MlpGateUp:
         break;
     }
     throw std::invalid_argument("nvfp4 linear_add: unsupported problem");

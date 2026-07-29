@@ -591,9 +591,12 @@ bool bf16_route_supports(Bf16Route route, std::int32_t t) {
 
 void launch_bf16_route(Bf16Route route, const Tensor& x, const Weight& weight, Tensor& output,
                        LinearPolicy policy, cudaStream_t stream) {
+    if (policy != LinearPolicy::A16Only) {
+        throw std::invalid_argument("BF16 Linear routes admit only A16");
+    }
     switch (route) {
     case Bf16Route::Production:
-        ops::linear(x, weight, output, policy, stream);
+        ops::linear(x, weight, output, stream);
         return;
     case Bf16Route::SmallT:
         ops::detail::launch_bf16_small_t(x, weight, output, stream);

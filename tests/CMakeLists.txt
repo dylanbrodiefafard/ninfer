@@ -243,6 +243,10 @@ ninfer_add_fused_linear_test(
   ninfer_linear_swiglu_w8_a16_test
   ops/linear_swiglu/test_w8_a16.cpp
   ops/linear_swiglu/linear_swiglu_test_common.cpp)
+ninfer_add_fused_linear_test(
+  ninfer_linear_swiglu_nvfp4_test
+  ops/linear_swiglu/test_nvfp4.cpp
+  ops/linear_swiglu/linear_swiglu_test_common.cpp)
 
 ninfer_add_test(ninfer_qwen3_6_27b_visual_scatter_test
   SOURCES targets/qwen3_6_27b/test_visual_scatter.cpp

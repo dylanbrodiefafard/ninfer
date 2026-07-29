@@ -21,6 +21,7 @@ Q4/Q5/Q6/W8 和 BF16_CTRL 使用现有 A16 route。以下 NVFP4 exact problem �
 ```text
 [14336,5120]  attention input
 [16384,5120]  GDN input
+[34816,5120]  MLP gate/up development parent
 [ 5120,6144]  attention/GDN output
 [ 5120,17408] MLP down
 ```
@@ -70,12 +71,16 @@ NVFP4 的永久 A16 decode point 是：
   --n 14336 --k 5120 --t 1024
 ```
 
-其余三个永久 NVFP4 problem 使用同一数字入口，例如：
+其余四个永久 NVFP4 problem 使用同一数字入口，例如：
 
 ```bash
 ./build/bench/ninfer_linear_bench \
   --qtype nvfp4 --policy a4 \
   --n 16384 --k 5120 --t 1024
+
+./build/bench/ninfer_linear_bench \
+  --qtype nvfp4 --policy a4 \
+  --n 34816 --k 5120 --t 1024
 
 ./build/bench/ninfer_linear_bench \
   --qtype nvfp4 --policy a4 \
@@ -496,17 +501,21 @@ profile 确定，不能把许可本身冒充为低精度执行。当前所有预
    replay；
 10. 输出同时登记固定 `209.5 TFLOP/s` BF16 与 `1676.0 TFLOP/s` NVFP4 dense Tensor
     Core 参照，并按实际 activation-compute profile 选择 `TC_%` 与 compute roof；
-11. 四个 NVFP4 exact problem 的 A4 Linear 都在 `T=17`、代表性 cp.async point 和主要
+11. 五个 NVFP4 exact problem 的 A4 Linear 都在 `T=17`、代表性 cp.async point 和主要
     `T=1024` TMA point 直接通过同一个 exact-decode/naive-FP64 oracle；
-12. RTX 5090、CUDA 13.1、cold-cache、5 warmups/30 samples 下，四个 NVFP4 A4
+12. RTX 5090、CUDA 13.1、cold-cache 下，五个 NVFP4 A4
     `T=1024` 完整 quantization + GEMM 结果为：
 
     | `[N,K]` | Median | Useful throughput | Dense FP4 peak |
     |---:|---:|---:|---:|
     | `[14336,5120]` | `152.576 us` | `985.24 TFLOP/s` | `58.79%` |
     | `[16384,5120]` | `174.784 us` | `982.92 TFLOP/s` | `58.65%` |
+    | `[34816,5120]` | `390.112 us` | `935.81 TFLOP/s` | `55.84%` |
     | `[5120,6144]` | `72.992 us` | `882.62 TFLOP/s` | `52.66%` |
     | `[5120,17408]` | `197.888 us` | `922.42 TFLOP/s` | `55.04%` |
+
+    The four previously registered rows retain their 5-warmup/30-sample measurements; the new
+    `[34816,5120]` row uses 5 warmups and 40 samples.
 
 benchmark 不承担数值 correctness；各 weight/activation-compute profile 继续由 public
 Linear conformance suite 和统一 CPU FP64 GEMM oracle 负责。

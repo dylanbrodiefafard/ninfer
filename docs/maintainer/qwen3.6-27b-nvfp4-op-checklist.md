@@ -2,7 +2,7 @@
 
 ## 1. Purpose and boundary
 
-This document is the active checklist for making the fixed
+This document records the completed Op-level support that makes the fixed
 `qwen3_6_27b_nvfp4.ninfer` Text weights consumable by repository-internal semantic Ops. It starts
 from the artifact contract in
 [`qwen3.6-27b-artifact.md`](qwen3.6-27b-artifact.md) and lists only Op-level functional
@@ -73,10 +73,9 @@ and evaluates the complete logical formula independently with naive FP64 accumul
 activation quantization and `input_scale_divisor` do not alter that formula or create an observable
 intermediate.
 
-The current Op baseline already provides `QType::NVFP4`, its block-scale layout identity, exact
-decode fixtures, the revised 27B Q4/Q5 GDN Q/K/V/Z contracts, and single-parent W8 Attention/GDN
-overloads. A1, A2, G1, G2, R1, R2, and R3 are complete; partial implementation progress for the
-remaining registration is recorded only where it changes the next required step.
+The Op baseline provides `QType::NVFP4`, its block-scale layout identity, exact decode fixtures, the
+revised 27B Q4/Q5 GDN Q/K/V/Z contracts, and single-parent W8 Attention/GDN overloads. All eight
+registrations tracked below are complete.
 
 ## 3. Required format/problem registrations
 
@@ -89,7 +88,7 @@ site counts describe artifact coverage; they are not runtime dispatch inputs.
 | A2 | `attn_input_proj` | `BF16` → `BF16_CTRL` | `[14336,5120]` | attention input, 6 sites | [x] |
 | G1 | `gdn_input_proj` | `NVFP4` | `[16384,5120]` | GDN input, 48 sites | [x] |
 | G2 | `gdn_input_proj_conv_snapshot` | `NVFP4` | `[16384,5120]` | GDN verify input, same 48 sites | [x] |
-| M1 | `linear_swiglu` | `NVFP4` | `[34816,5120]` | MLP gate/up, 64 sites | [ ] |
+| M1 | `linear_swiglu` | `NVFP4` | `[34816,5120]` | MLP gate/up, 64 sites | [x] |
 | R1 | `linear_add` | `NVFP4` | `[5120,6144]` | attention output and GDN output, 61 sites | [x] |
 | R2 | `linear_add` | `NVFP4` | `[5120,17408]` | MLP down, 64 sites | [x] |
 | R3 | `linear_add` | `BF16` → `BF16_CTRL` | `[5120,6144]` | attention/GDN output exceptions, 3 sites | [x] |
@@ -362,10 +361,10 @@ not override that workload.
 
 ### M1 — NVFP4 `linear_swiglu`
 
-- [ ] Admit the exact NVFP4 `gate_up` parent `[34816,5120]` with row order
+- [x] Admit the exact NVFP4 `gate_up` parent `[34816,5120]` with row order
   `[gate 17408, up 17408]`.
-- [ ] Accept `x BF16 [5120,T]` and write `out BF16 [17408,T]` for every positive `T`.
-- [ ] Implement the complete logical formula:
+- [x] Accept `x BF16 [5120,T]` and write `out BF16 [17408,T]` for every positive `T`.
+- [x] Implement the complete logical formula:
 
   ```text
   gate[:,t] = Wgate * x[:,t]
@@ -373,19 +372,73 @@ not override that workload.
   out[:,t]  = SiLU(gate[:,t]) * up[:,t]
   ```
 
-- [ ] Keep projected gate/up private: a BF16 `[34816,T]` materialization is not an observable
+- [x] Keep projected gate/up private: a BF16 `[34816,T]` materialization is not an observable
   semantic boundary.
-- [ ] Extend `linear_swiglu_workspace_capacity_bytes` to admit
+- [x] Extend `linear_swiglu_workspace_capacity_bytes` to admit
   `(QType::NVFP4, gate_up_rows=34816, input_rows=5120)` for every valid positive `T` interval.
-- [ ] Add an independent complete-formula oracle using exact NVFP4 decode and represented BF16
+- [x] Add an independent complete-formula oracle using exact NVFP4 decode and represented BF16
   input values.
-- [ ] Preserve the existing 27B Q4 and 35B W8 registrations.
+- [x] Preserve the existing 27B Q4 and 35B W8 registrations.
 
 The two weight halves still represent ordinary linear maps, but their results are not outputs of
 M1. M1 exposes only `SiLU(Wgate*x) * (Wup*x)`. Even though the existing `silu_mul` Op can read
-strided gate/up views, composing public `linear` and `silu_mul` would first store a public BF16
-`[34816,T]` projection and make that rounding seam part of the composed semantics. M1 deliberately
-has no such observable intermediate.
+strided gate/up views, a composed implementation may only use its BF16 `[34816,T]` projection as
+private workspace. That private arithmetic profile is checked directly against the same complete
+formula oracle; it does not become an M1 output or a prescribed semantic rounding boundary.
+
+The policy-bearing form admits `A16Only` through `T=16` and `AllowA4` for every positive `T`.
+`AllowA4` remains A16 through `T=16`; `16/17` is the explicit activation-precision frontier.
+The no-policy convenience overload remains A16-only, preserving the existing Q4/W8 behavior while
+requiring NVFP4 callers above the frontier to opt into A4.
+
+At `T=1..16`, one fused A16 kernel owns each matching gate/up row pair, reuses the Linear-owned
+NVFP4 decode/FMA body, applies SwiGLU to FP32 accumulators, and writes only the final BF16 output.
+These routes do not quantize activation, do not use Tensor Cores, launch once, and require zero
+workspace. The Small-T instances use coarse measured schedule ranges anchored at `T=4/8/16`;
+there is no per-T continuity patching at the A4 frontier.
+
+For general `T>16`, the qualified fallback quantizes activation, invokes the tuned pure NVFP4
+Linear `[34816,5120]` into a private BF16 projection, then runs `silu_mul`. The primary `T=1024`
+point instead uses the adopted fused W4A4 TMA kernel. Its physical `M256xN128xK128` contraction
+maps each N128 tile to 64 matching gate/up pairs, retains both FP32 accumulator halves in the same
+warp, applies SwiGLU before the one final BF16 conversion, and never materializes gate/up. The
+three-stage fused instance won even though the corresponding pure Linear uses two stages; the
+extra gate/up scale pipeline changes the measured optimum.
+
+Both W4A4 routes include the same separate activation-quantization launch in public timing. The
+exact `T=1024` fused route needs only its `2.8125 MiB` activation code/scale workspace, versus about
+`70.8125 MiB` for projection plus activation workspace in the materialized baseline. Unmeasured
+larger full-tile extents retain the fallback; a kernel's structural ability to launch there is not
+treated as performance qualification.
+
+The permanent benchmark times the public Op, including quantization and every selected semantic
+kernel:
+
+```bash
+./build/bench/ninfer_nvfp4_linear_swiglu_bench \
+  --policy a16 --t-sweep 1,4,8,16
+
+./build/bench/ninfer_nvfp4_linear_swiglu_bench \
+  --policy a4 --t-sweep 17,128,1024
+```
+
+RTX 5090, CUDA 13.1, cold-cache measurements with 5 warmups and 40 samples produced:
+
+| Route | `T` | Median | Useful throughput | Dense FP4 peak |
+|---|---:|---:|---:|---:|
+| fused A16 decode | 1 | `72.992 us` | `4.88 TFLOP/s` | — |
+| fused A16 Small-T | 4 | `79.136 us` | `18.02 TFLOP/s` | — |
+| fused A16 Small-T | 8 | `105.664 us` | `26.99 TFLOP/s` | — |
+| fused A16 Small-T | 16 | `175.360 us` | `32.53 TFLOP/s` | — |
+| W4A4 Linear + post fallback | 17 | `82.816 us` | `73.18 TFLOP/s` | `4.37%` |
+| W4A4 Linear + post fallback | 128 | `87.040 us` | `524.29 TFLOP/s` | `31.28%` |
+| W4A4 fused TMA | 1024 | `408.160 us` | `894.43 TFLOP/s` | `53.37%` |
+
+An otherwise identical 40-sample `T=1024` run forcing the tuned Linear + post baseline measured
+`432.736 us`; the adopted fused route was about `5.7%` faster. A second fused run measured
+`404.736 us`, so the adoption decision is not based on a kernel-only comparison or one favorable
+sample. A16 `T=1/4/8/16` and A4 `T=17/128/1024` each pass the independent complete-formula oracle;
+the existing Q4 and W8 suites remain qualified.
 
 ## 7. Residual projections
 
@@ -460,24 +513,24 @@ in-place residual update as the Op-owned epilogue, with one final BF16 store and
 measured production dispatch is decode at `T=1`, small-T for `2 <= T <= 26`, and MMA for `T >= 27`;
 candidate overlap remains available in the Op benchmark so that the boundary is reproducible.
 
-## 8. Common completion criteria
+## 8. Common completion evidence
 
-Each registration remains incomplete until all applicable checks below pass:
+All applicable cross-registration checks are complete:
 
-- [ ] Public Op comments describe every newly admitted format, exact shape, row order, output, state
+- [x] Public Op comments describe every newly admitted format, exact shape, row order, output, state
   effect, alias rule, and `T` domain without exposing a kernel schedule as semantics.
-- [ ] Op wrappers validate the complete NVFP4 or BF16 `Weight` contract and reject unsupported
+- [x] Op wrappers validate the complete NVFP4 or BF16 `Weight` contract and reject unsupported
   shapes and malformed metadata.
-- [ ] Workspace-capacity functions admit the new format/problems and are sufficient over every
+- [x] Workspace-capacity functions admit the new format/problems and are sufficient over every
   accepted `[min_tokens,max_tokens]` interval.
-- [ ] Each production route selected by an admitted format/problem is compared directly with the
+- [x] Each production route selected by an admitted format/problem is compared directly with the
   same independent mathematical oracle.
-- [ ] NVFP4 criteria account for exact persistent-weight decode and production error from any
+- [x] NVFP4 criteria account for exact persistent-weight decode and production error from any
   private activation-compute profile without inserting that profile into the oracle.
-- [ ] BF16 exception routes are tested as first-class registrations, not treated as an NVFP4
+- [x] BF16 exception routes are tested as first-class registrations, not treated as an NVFP4
   fallback.
-- [ ] Existing 27B Q4/Q5 and peer-target W8 Op tests remain passing.
-- [ ] Op tests cover invalid format/shape/divisor metadata, output placement, state effects where
+- [x] Existing 27B Q4/Q5 and peer-target W8 Op tests remain passing.
+- [x] Op tests cover invalid format/shape/divisor metadata, output placement, state effects where
   applicable, and representative real target shapes.
 
 Completion of this checklist establishes Op-level support only. It does not establish that the

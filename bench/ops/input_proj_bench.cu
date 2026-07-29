@@ -1,5 +1,6 @@
 // Fixed-shape production/control benchmark for the 27B Attention and GDN input projections.
-// Controls are intentionally benchmark-local: production dispatch has no fallback to them.
+// Controls reproduce only the superseded Small-T compositions and are intentionally benchmark-
+// local: production dispatch has no fallback to them.
 
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
@@ -50,14 +51,16 @@ constexpr std::size_t kFlushBytes         = 256ULL << 20;
 constexpr double kRtx5090DramGBs          = 1792.0;
 constexpr double kRtx5090SustainedReadGBs = 1674.5;
 constexpr double kRtx5090Bf16Tflops       = 209.5;
+constexpr double kRtx5090Nvfp4Tflops      = 1676.0;
 
-enum class OpSelection { All, Attention, Gdn };
-enum class AttentionWeightType { Q4Q5, Bf16 };
+enum class OpSelection { All, Attention, Gdn, GdnSnapshot };
+enum class AttentionWeightType { Q4Q5, Bf16, Nvfp4 };
 enum class Bf16AttentionRoute { Production, SmallT, Mma, All };
 
 struct Options {
     OpSelection op                            = OpSelection::All;
     AttentionWeightType attention_weight_type = AttentionWeightType::Q4Q5;
+    ops::LinearPolicy policy                  = ops::LinearPolicy::A16Only;
     Bf16AttentionRoute bf16_attention_route   = Bf16AttentionRoute::Production;
     bool bf16_route_explicit                  = false;
     bool profile                              = false;
@@ -112,8 +115,10 @@ Options parse_options(int argc, char** argv) {
                 options.op = OpSelection::Attention;
             } else if (value == "gdn") {
                 options.op = OpSelection::Gdn;
+            } else if (value == "gdn-snapshot") {
+                options.op = OpSelection::GdnSnapshot;
             } else {
-                throw std::invalid_argument("--op must be all, attention, or gdn");
+                throw std::invalid_argument("--op must be all, attention, gdn, or gdn-snapshot");
             }
         } else if (arg == "--t-sweep") {
             options.t_sweep          = parse_t_sweep(next("--t-sweep value"));
@@ -124,8 +129,19 @@ Options parse_options(int argc, char** argv) {
                 options.attention_weight_type = AttentionWeightType::Q4Q5;
             } else if (value == "bf16") {
                 options.attention_weight_type = AttentionWeightType::Bf16;
+            } else if (value == "nvfp4") {
+                options.attention_weight_type = AttentionWeightType::Nvfp4;
             } else {
-                throw std::invalid_argument("--weight-type must be q4q5 or bf16");
+                throw std::invalid_argument("--weight-type must be q4q5, bf16, or nvfp4");
+            }
+        } else if (arg == "--policy") {
+            const std::string_view value = next("--policy value");
+            if (value == "a16") {
+                options.policy = ops::LinearPolicy::A16Only;
+            } else if (value == "a4") {
+                options.policy = ops::LinearPolicy::AllowA4;
+            } else {
+                throw std::invalid_argument("--policy must be a16 or a4");
             }
         } else if (arg == "--bf16-route") {
             const std::string_view value = next("--bf16-route value");
@@ -151,10 +167,12 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--csv-out") {
             options.csv_out = next("--csv-out path");
         } else if (arg == "--help" || arg == "-h") {
-            std::printf("Usage: %s [--op all|attention|gdn] [--weight-type q4q5|bf16] "
-                        "[--bf16-route production|small-t|mma|all] [--t-sweep 1,2,...] "
-                        "[--profile] [--warmup N] [--repeat N] [--csv-out PATH]\n",
-                        argv[0]);
+            std::printf(
+                "Usage: %s [--op all|attention|gdn|gdn-snapshot] "
+                "[--weight-type q4q5|bf16|nvfp4] "
+                "[--policy a16|a4] [--bf16-route production|small-t|mma|all] "
+                "[--t-sweep 1,2,...] [--profile] [--warmup N] [--repeat N] [--csv-out PATH]\n",
+                argv[0]);
             std::exit(0);
         } else {
             throw std::invalid_argument("unknown argument: " + std::string(arg));
@@ -163,22 +181,39 @@ Options parse_options(int argc, char** argv) {
     if (options.warmup < 0 || options.repeat <= 0) {
         throw std::invalid_argument("--warmup must be nonnegative and --repeat positive");
     }
-    if (options.attention_weight_type == AttentionWeightType::Bf16) {
-        if (options.op != OpSelection::Attention) {
-            throw std::invalid_argument("BF16 weight mode requires --op attention");
+    if (options.attention_weight_type != AttentionWeightType::Q4Q5) {
+        if (options.op == OpSelection::All) {
+            throw std::invalid_argument("direct weight mode requires one --op");
         }
-        if (!options.t_sweep_explicit) {
-            options.t_sweep.clear();
-            for (std::int32_t t = 1; t <= 32; ++t) { options.t_sweep.push_back(t); }
-            options.t_sweep.insert(options.t_sweep.end(), {33, 128, 129, 1024, 2048, 4096});
+        if ((options.op == OpSelection::Gdn || options.op == OpSelection::GdnSnapshot) &&
+            options.attention_weight_type != AttentionWeightType::Nvfp4) {
+            throw std::invalid_argument("direct GDN mode requires NVFP4");
         }
+        if (options.attention_weight_type == AttentionWeightType::Bf16) {
+            if (options.op != OpSelection::Attention) {
+                throw std::invalid_argument("BF16 weight mode requires --op attention");
+            }
+            if (!options.t_sweep_explicit) {
+                options.t_sweep.clear();
+                for (std::int32_t t = 1; t <= 32; ++t) { options.t_sweep.push_back(t); }
+                options.t_sweep.insert(options.t_sweep.end(), {33, 128, 129, 1024, 2048, 4096});
+            }
+        } else if (options.bf16_route_explicit) {
+            throw std::invalid_argument("--bf16-route requires BF16 weight mode");
+        }
+    } else if (options.op == OpSelection::GdnSnapshot) {
+        throw std::invalid_argument("--op gdn-snapshot requires --weight-type nvfp4");
     } else if (options.bf16_route_explicit) {
         throw std::invalid_argument("--bf16-route requires BF16 weight mode");
     }
+    if (options.policy == ops::LinearPolicy::AllowA4 &&
+        options.attention_weight_type != AttentionWeightType::Nvfp4) {
+        throw std::invalid_argument("--policy a4 requires direct NVFP4 mode");
+    }
     if (options.profile) {
-        if (options.attention_weight_type != AttentionWeightType::Bf16 ||
-            options.op != OpSelection::Attention || options.t_sweep.size() != 1) {
-            throw std::invalid_argument("--profile requires one BF16 Attention point");
+        if (options.attention_weight_type == AttentionWeightType::Q4Q5 ||
+            options.op == OpSelection::All || options.t_sweep.size() != 1) {
+            throw std::invalid_argument("--profile requires one direct Op point");
         }
         if (!options.csv_out.empty()) {
             throw std::invalid_argument("--profile does not write timing CSV");
@@ -226,7 +261,7 @@ void write_csv(const std::string& path, const std::vector<Result>& results,
     }
 }
 
-struct Bf16AttentionResult {
+struct DirectAttentionResult {
     const char* path = "";
     std::int32_t t   = 0;
     bench::ColdTiming timing;
@@ -239,7 +274,8 @@ struct Bf16AttentionResult {
     double dram_spec_pct       = 0.0;
     double sustained_read_pct  = 0.0;
     double useful_tflops       = 0.0;
-    double bf16_spec_pct       = 0.0;
+    double tc_peak_tflops      = 0.0;
+    double tc_spec_pct         = 0.0;
     double memory_floor_us     = 0.0;
     double compute_floor_us    = 0.0;
     double roofline_floor_us   = 0.0;
@@ -247,23 +283,28 @@ struct Bf16AttentionResult {
     const char* bound          = "";
 };
 
-Bf16AttentionResult make_bf16_attention_result(const bench::ColdTiming& timing,
-                                               std::uint64_t weight_bytes, std::int32_t t,
-                                               const char* path) {
+DirectAttentionResult make_direct_attention_result(const bench::ColdTiming& timing,
+                                                   std::uint64_t weight_bytes, std::int32_t t,
+                                                   std::int32_t rows,
+                                                   AttentionWeightType weight_type,
+                                                   ops::LinearPolicy policy, const char* path) {
     const std::uint64_t x_bytes =
         static_cast<std::uint64_t>(kHidden) * static_cast<std::uint64_t>(t) * 2;
     const std::uint64_t out_bytes =
-        static_cast<std::uint64_t>(14336) * static_cast<std::uint64_t>(t) * 2;
+        static_cast<std::uint64_t>(rows) * static_cast<std::uint64_t>(t) * 2;
     const std::uint64_t model_bytes = weight_bytes + x_bytes + out_bytes;
     const double useful_flops =
-        2.0 * static_cast<double>(14336) * static_cast<double>(kHidden) * static_cast<double>(t);
+        2.0 * static_cast<double>(rows) * static_cast<double>(kHidden) * static_cast<double>(t);
     const double seconds = timing.median_us * 1.0e-6;
     const double memory_floor_us =
         static_cast<double>(model_bytes) / (kRtx5090DramGBs * 1.0e9) * 1.0e6;
-    const double compute_floor_us  = useful_flops / (kRtx5090Bf16Tflops * 1.0e12) * 1.0e6;
+    const bool uses_nvfp4_tensor_core =
+        weight_type == AttentionWeightType::Nvfp4 && policy == ops::LinearPolicy::AllowA4 && t > 16;
+    const double tc_peak_tflops = uses_nvfp4_tensor_core ? kRtx5090Nvfp4Tflops : kRtx5090Bf16Tflops;
+    const double compute_floor_us  = useful_flops / (tc_peak_tflops * 1.0e12) * 1.0e6;
     const double roofline_floor_us = std::max(memory_floor_us, compute_floor_us);
 
-    Bf16AttentionResult result;
+    DirectAttentionResult result;
     result.path               = path;
     result.t                  = t;
     result.timing             = timing;
@@ -276,7 +317,8 @@ Bf16AttentionResult make_bf16_attention_result(const bench::ColdTiming& timing,
     result.dram_spec_pct      = result.effective_gbs / kRtx5090DramGBs * 100.0;
     result.sustained_read_pct = result.effective_gbs / kRtx5090SustainedReadGBs * 100.0;
     result.useful_tflops      = useful_flops / seconds / 1.0e12;
-    result.bf16_spec_pct      = result.useful_tflops / kRtx5090Bf16Tflops * 100.0;
+    result.tc_peak_tflops     = tc_peak_tflops;
+    result.tc_spec_pct        = result.useful_tflops / tc_peak_tflops * 100.0;
     result.memory_floor_us    = memory_floor_us;
     result.compute_floor_us   = compute_floor_us;
     result.roofline_floor_us  = roofline_floor_us;
@@ -285,32 +327,55 @@ Bf16AttentionResult make_bf16_attention_result(const bench::ColdTiming& timing,
     return result;
 }
 
-void print_bf16_attention_results(const std::vector<Bf16AttentionResult>& results) {
+const char* direct_weight_type_name(AttentionWeightType type) {
+    return type == AttentionWeightType::Bf16 ? "BF16" : "NVFP4";
+}
+
+const char* direct_policy_name(ops::LinearPolicy policy) {
+    return policy == ops::LinearPolicy::AllowA4 ? "A4" : "A16";
+}
+
+const char* direct_activation_name(AttentionWeightType weight_type, ops::LinearPolicy policy,
+                                   std::int32_t t) {
+    return weight_type == AttentionWeightType::Nvfp4 && policy == ops::LinearPolicy::AllowA4 &&
+                   t > 16
+               ? "A4"
+               : "A16";
+}
+
+void print_direct_attention_results(const std::vector<DirectAttentionResult>& results,
+                                    const char* op, std::int32_t rows,
+                                    AttentionWeightType weight_type, ops::LinearPolicy policy) {
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     cudaDeviceProp properties{};
     CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
     std::printf("# actual_gpu=%s sm=%d%d reference_gpu=RTX_5090\n", properties.name,
                 properties.major, properties.minor);
-    std::printf("# dram_spec_gbs=%.1f sustained_read_gbs=%.1f bf16_dense_tc_spec_tflops=%.1f "
-                "cache=cold\n",
-                kRtx5090DramGBs, kRtx5090SustainedReadGBs, kRtx5090Bf16Tflops);
-    std::printf("%-10s %-22s %5s %8s %8s %6s %11s %11s %11s %10s %7s %7s %10s %7s %7s %9s\n", "op",
-                "path", "type", "N", "K", "T", "median_us", "min_us", "p95_us", "eff_GB/s",
-                "DRAM_%", "READ_%", "TFLOP/s", "TC_%", "bound", "roof_%");
-    for (const Bf16AttentionResult& result : results) {
-        std::printf("%-10s %-22s %5s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %7.2f "
-                    "%7.2f %10.2f %7.2f %7s %9.2f\n",
-                    "attention", result.path, "BF16", 14336, kHidden, result.t,
+    std::printf("# dram_spec_gbs=%.1f sustained_read_gbs=%.1f "
+                "bf16_dense_tc_spec_tflops=%.1f nvfp4_dense_tc_spec_tflops=%.1f cache=cold\n",
+                kRtx5090DramGBs, kRtx5090SustainedReadGBs, kRtx5090Bf16Tflops, kRtx5090Nvfp4Tflops);
+    std::printf("%-10s %-22s %5s %3s %3s %8s %8s %6s %11s %11s %11s %10s %7s %7s %10s %7s "
+                "%7s %9s\n",
+                "op", "path", "type", "pol", "act", "N", "K", "T", "median_us", "min_us", "p95_us",
+                "eff_GB/s", "DRAM_%", "READ_%", "TFLOP/s", "TC_%", "bound", "roof_%");
+    for (const DirectAttentionResult& result : results) {
+        char tc_pct[32];
+        std::snprintf(tc_pct, sizeof(tc_pct), "%.2f", result.tc_spec_pct);
+        std::printf("%-10s %-22s %5s %3s %3s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %7.2f "
+                    "%7.2f %10.2f %7s %7s %9.2f\n",
+                    op, result.path, direct_weight_type_name(weight_type),
+                    direct_policy_name(policy),
+                    direct_activation_name(weight_type, policy, result.t), rows, kHidden, result.t,
                     result.timing.median_us, result.timing.min_us, result.timing.p95_us,
                     result.effective_gbs, result.dram_spec_pct, result.sustained_read_pct,
-                    result.useful_tflops, result.bf16_spec_pct, result.bound, result.roofline_pct);
+                    result.useful_tflops, tc_pct, result.bound, result.roofline_pct);
     }
 }
 
-void write_bf16_attention_csv(const std::string& path,
-                              const std::vector<Bf16AttentionResult>& results,
-                              const Options& options) {
+void write_direct_attention_csv(const std::string& path,
+                                const std::vector<DirectAttentionResult>& results,
+                                const Options& options, const char* op, std::int32_t rows) {
     if (path.empty()) { return; }
     const std::filesystem::path output(path);
     if (!output.parent_path().empty()) {
@@ -318,23 +383,46 @@ void write_bf16_attention_csv(const std::string& path,
     }
     std::ofstream stream(output);
     if (!stream) { throw std::runtime_error("failed to open CSV: " + path); }
-    stream << "op,path,weight_type,N,K,T,weight_bytes,x_bytes,out_bytes,model_bytes,useful_flops,"
+    stream << "op,path,weight_type,policy,activation_compute,N,K,T,weight_bytes,x_bytes,out_bytes,"
+              "model_bytes,useful_flops,"
               "median_us,min_us,p95_us,effective_gbs,dram_spec_gbs,dram_spec_pct,"
               "sustained_read_gbs,sustained_read_pct,useful_tflops,"
-              "bf16_dense_tc_spec_tflops,bf16_tc_spec_pct,memory_floor_us,compute_floor_us,"
+              "tc_peak_tflops,tc_spec_pct,memory_floor_us,compute_floor_us,"
               "roofline_floor_us,bound,roofline_pct,warmup,repeat,flush_bytes\n";
-    for (const Bf16AttentionResult& result : results) {
-        stream << "attention," << result.path << ",BF16,14336," << kHidden << ',' << result.t << ','
-               << result.weight_bytes << ',' << result.x_bytes << ',' << result.out_bytes << ','
-               << result.model_bytes << ',' << result.useful_flops << ',' << result.timing.median_us
-               << ',' << result.timing.min_us << ',' << result.timing.p95_us << ','
-               << result.effective_gbs << ',' << kRtx5090DramGBs << ',' << result.dram_spec_pct
-               << ',' << kRtx5090SustainedReadGBs << ',' << result.sustained_read_pct << ','
-               << result.useful_tflops << ',' << kRtx5090Bf16Tflops << ',' << result.bf16_spec_pct
-               << ',' << result.memory_floor_us << ',' << result.compute_floor_us << ','
+    for (const DirectAttentionResult& result : results) {
+        stream << op << ',' << result.path << ','
+               << direct_weight_type_name(options.attention_weight_type) << ','
+               << direct_policy_name(options.policy) << ','
+               << direct_activation_name(options.attention_weight_type, options.policy, result.t)
+               << ',' << rows << ',' << kHidden << ',' << result.t << ',' << result.weight_bytes
+               << ',' << result.x_bytes << ',' << result.out_bytes << ',' << result.model_bytes
+               << ',' << result.useful_flops << ',' << result.timing.median_us << ','
+               << result.timing.min_us << ',' << result.timing.p95_us << ',' << result.effective_gbs
+               << ',' << kRtx5090DramGBs << ',' << result.dram_spec_pct << ','
+               << kRtx5090SustainedReadGBs << ',' << result.sustained_read_pct << ','
+               << result.useful_tflops << ',' << result.tc_peak_tflops << ',' << result.tc_spec_pct;
+        stream << ',' << result.memory_floor_us << ',' << result.compute_floor_us << ','
                << result.roofline_floor_us << ',' << result.bound << ',' << result.roofline_pct
                << ',' << options.warmup << ',' << options.repeat << ',' << kFlushBytes << '\n';
     }
+}
+
+struct DirectAttentionWeight {
+    DeviceBuffer storage;
+    Weight weight;
+    std::uint64_t model_bytes;
+};
+
+DirectAttentionWeight make_direct_attention_weight(AttentionWeightType weight_type) {
+    constexpr std::int32_t kRows = 14336;
+    if (weight_type == AttentionWeightType::Bf16) {
+        bench::DirectBf16Weight direct  = bench::make_direct_bf16_weight(kRows, kHidden, 0x61U);
+        const std::uint64_t model_bytes = direct.model_weight_bytes();
+        return {std::move(direct.storage), direct.weight, model_bytes};
+    }
+    bench::PackedQuantizedWeight packed = bench::make_nvfp4_weight(kRows, kHidden);
+    const std::uint64_t model_bytes     = packed.model_weight_bytes();
+    return {std::move(packed.storage), packed.weight, model_bytes};
 }
 
 const char* bf16_attention_route_name(Bf16AttentionRoute route) {
@@ -376,20 +464,25 @@ void launch_bf16_attention_route(Bf16AttentionRoute route, const Tensor& x, cons
     throw std::invalid_argument("BF16 Attention route must resolve to one launch");
 }
 
-void run_bf16_attention(const Options& options, DeviceBuffer& flush, cudaStream_t stream) {
+void run_direct_attention(const Options& options, DeviceBuffer& flush, cudaStream_t stream) {
     constexpr std::int32_t kRows = 14336;
+    DirectAttentionWeight weight = make_direct_attention_weight(options.attention_weight_type);
     const std::int32_t max_t = *std::max_element(options.t_sweep.begin(), options.t_sweep.end());
-    bench::DirectBf16Weight weight = bench::make_direct_bf16_weight(kRows, kHidden, 0x61U);
+    const std::int32_t min_t = *std::min_element(options.t_sweep.begin(), options.t_sweep.end());
     DeviceBuffer input =
         bench::make_bf16(static_cast<std::size_t>(kHidden) * static_cast<std::size_t>(max_t));
     DeviceBuffer query(static_cast<std::size_t>(kQueryRows) * max_t * 2);
     DeviceBuffer gate(static_cast<std::size_t>(kQueryRows) * max_t * 2);
     DeviceBuffer key(static_cast<std::size_t>(kKvRows) * max_t * 2);
     DeviceBuffer value(static_cast<std::size_t>(kKvRows) * max_t * 2);
+    const std::size_t workspace_capacity = ops::attn_input_proj_workspace_capacity_bytes(
+        weight.weight.qtype, kRows, kHidden, options.policy, min_t, max_t);
+    DeviceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
 
     if (options.profile) {
         const std::int32_t t = options.t_sweep.front();
-        if (!bf16_attention_route_supports(options.bf16_attention_route, t)) {
+        if (options.attention_weight_type == AttentionWeightType::Bf16 &&
+            !bf16_attention_route_supports(options.bf16_attention_route, t)) {
             throw std::invalid_argument("selected BF16 Attention route does not support T");
         }
         Tensor x(input.p, DType::BF16, {kHidden, t});
@@ -398,8 +491,13 @@ void run_bf16_attention(const Options& options, DeviceBuffer& flush, cudaStream_
         Tensor k(key.p, DType::BF16, {kKvRows, t});
         Tensor v(value.p, DType::BF16, {kKvRows, t});
         const auto launch = [&](cudaStream_t launch_stream) {
-            launch_bf16_attention_route(options.bf16_attention_route, x, weight.weight, q, g, k, v,
-                                        launch_stream);
+            if (options.attention_weight_type == AttentionWeightType::Bf16) {
+                launch_bf16_attention_route(options.bf16_attention_route, x, weight.weight, q, g, k,
+                                            v, launch_stream);
+            } else {
+                ops::attn_input_proj(x, weight.weight, q, g, k, v, options.policy, workspace,
+                                     launch_stream);
+            }
         };
         for (int iteration = 0; iteration < options.warmup; ++iteration) {
             bench::flush_l2(flush, stream);
@@ -409,15 +507,18 @@ void run_bf16_attention(const Options& options, DeviceBuffer& flush, cudaStream_
         bench::flush_l2(flush, stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
         const std::uint64_t model_bytes =
-            weight.model_weight_bytes() +
-            static_cast<std::uint64_t>(kHidden + kRows) * static_cast<std::uint64_t>(t) * 2;
-        const double useful_flops = 2.0 * static_cast<double>(kRows) *
-                                    static_cast<double>(kHidden) * static_cast<double>(t);
-        std::printf(
-            "PROFILE attn_input_proj weight_type=BF16 route=%s N=%d K=%d T=%d model_bytes=%llu "
-            "useful_flops=%.0f\n",
-            bf16_attention_route_name(options.bf16_attention_route), kRows, kHidden, t,
-            static_cast<unsigned long long>(model_bytes), useful_flops);
+            weight.model_bytes + static_cast<std::uint64_t>(kHidden + kRows) * t * 2;
+        const double useful_flops =
+            2.0 * static_cast<double>(kRows) * static_cast<double>(kHidden) * t;
+        const char* path = options.attention_weight_type == AttentionWeightType::Bf16
+                               ? bf16_attention_route_name(options.bf16_attention_route)
+                               : "production_parent";
+        std::printf("PROFILE attn_input_proj weight_type=%s policy=%s route=%s N=%d K=%d T=%d "
+                    "model_bytes=%llu "
+                    "useful_flops=%.0f\n",
+                    direct_weight_type_name(options.attention_weight_type),
+                    direct_policy_name(options.policy), path, kRows, kHidden, t,
+                    static_cast<unsigned long long>(model_bytes), useful_flops);
         std::fflush(stdout);
         CUDA_CHECK(cudaProfilerStart());
         launch(stream);
@@ -426,7 +527,7 @@ void run_bf16_attention(const Options& options, DeviceBuffer& flush, cudaStream_
         return;
     }
 
-    std::vector<Bf16AttentionResult> results;
+    std::vector<DirectAttentionResult> results;
     results.reserve(options.t_sweep.size() *
                     (options.bf16_attention_route == Bf16AttentionRoute::All ? 3 : 1));
     for (const std::int32_t t : options.t_sweep) {
@@ -441,26 +542,281 @@ void run_bf16_attention(const Options& options, DeviceBuffer& flush, cudaStream_
             Bf16AttentionRoute::Mma,
         };
         const auto measure = [&](Bf16AttentionRoute route) {
-            if (!bf16_attention_route_supports(route, t)) {
+            if (options.attention_weight_type == AttentionWeightType::Bf16 &&
+                !bf16_attention_route_supports(route, t)) {
                 if (options.bf16_attention_route == Bf16AttentionRoute::All) { return; }
                 throw std::invalid_argument("selected BF16 Attention route does not support T");
             }
             const auto launch = [&](cudaStream_t launch_stream) {
-                launch_bf16_attention_route(route, x, weight.weight, q, g, k, v, launch_stream);
+                if (options.attention_weight_type == AttentionWeightType::Bf16) {
+                    launch_bf16_attention_route(route, x, weight.weight, q, g, k, v, launch_stream);
+                } else {
+                    ops::attn_input_proj(x, weight.weight, q, g, k, v, options.policy, workspace,
+                                         launch_stream);
+                }
             };
             const bench::ColdTiming timing =
                 bench::measure_cold_launch(launch, flush, stream, options.warmup, options.repeat);
-            results.push_back(make_bf16_attention_result(timing, weight.model_weight_bytes(), t,
-                                                         bf16_attention_route_name(route)));
+            const char* path = options.attention_weight_type == AttentionWeightType::Bf16
+                                   ? bf16_attention_route_name(route)
+                                   : "production_parent";
+            results.push_back(make_direct_attention_result(timing, weight.model_bytes, t, kRows,
+                                                           options.attention_weight_type,
+                                                           options.policy, path));
         };
-        if (options.bf16_attention_route == Bf16AttentionRoute::All) {
+        if (options.attention_weight_type == AttentionWeightType::Bf16 &&
+            options.bf16_attention_route == Bf16AttentionRoute::All) {
             for (const Bf16AttentionRoute route : kRoutes) { measure(route); }
         } else {
             measure(options.bf16_attention_route);
         }
     }
-    print_bf16_attention_results(results);
-    write_bf16_attention_csv(options.csv_out, results, options);
+    print_direct_attention_results(results, "attention", kRows, options.attention_weight_type,
+                                   options.policy);
+    write_direct_attention_csv(options.csv_out, results, options, "attention", kRows);
+}
+
+void run_direct_gdn(const Options& options, DeviceBuffer& flush, cudaStream_t stream) {
+    constexpr std::int32_t kRows        = 16384;
+    constexpr std::int32_t kQkvRows     = 10240;
+    constexpr std::int32_t kZRows       = 6144;
+    bench::PackedQuantizedWeight packed = bench::make_nvfp4_weight(kRows, kHidden);
+    const std::uint64_t weight_bytes    = packed.model_weight_bytes();
+    const std::int32_t max_t = *std::max_element(options.t_sweep.begin(), options.t_sweep.end());
+    const std::int32_t min_t = *std::min_element(options.t_sweep.begin(), options.t_sweep.end());
+    DeviceBuffer input =
+        bench::make_bf16(static_cast<std::size_t>(kHidden) * static_cast<std::size_t>(max_t));
+    DeviceBuffer qkv(static_cast<std::size_t>(kQkvRows) * max_t * 2);
+    DeviceBuffer z(static_cast<std::size_t>(kZRows) * max_t * 2);
+    const std::size_t workspace_capacity = ops::gdn_input_proj_workspace_capacity_bytes(
+        QType::NVFP4, kRows, kHidden, options.policy, min_t, max_t);
+    DeviceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
+
+    const auto make_launch = [&](std::int32_t t) {
+        return [&, t](cudaStream_t launch_stream) {
+            Tensor x(input.p, DType::BF16, {kHidden, t});
+            Tensor qkv_output(qkv.p, DType::BF16, {kQkvRows, t});
+            Tensor z_output(z.p, DType::BF16, {kZRows, t});
+            ops::gdn_input_proj(x, packed.weight, qkv_output, z_output, options.policy, workspace,
+                                launch_stream);
+        };
+    };
+
+    if (options.profile) {
+        const std::int32_t t = options.t_sweep.front();
+        const auto launch    = make_launch(t);
+        for (int iteration = 0; iteration < options.warmup; ++iteration) {
+            bench::flush_l2(flush, stream);
+            launch(stream);
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        bench::flush_l2(flush, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const std::uint64_t model_bytes =
+            weight_bytes + static_cast<std::uint64_t>(kHidden + kRows) * t * 2;
+        const double useful_flops =
+            2.0 * static_cast<double>(kRows) * static_cast<double>(kHidden) * t;
+        std::printf("PROFILE gdn_input_proj weight_type=NVFP4 policy=%s N=%d K=%d T=%d "
+                    "model_bytes=%llu useful_flops=%.0f\n",
+                    direct_policy_name(options.policy), kRows, kHidden, t,
+                    static_cast<unsigned long long>(model_bytes), useful_flops);
+        std::fflush(stdout);
+        CUDA_CHECK(cudaProfilerStart());
+        launch(stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaProfilerStop());
+        return;
+    }
+
+    std::vector<DirectAttentionResult> results;
+    results.reserve(options.t_sweep.size());
+    for (const std::int32_t t : options.t_sweep) {
+        const auto launch = make_launch(t);
+        const bench::ColdTiming timing =
+            bench::measure_cold_launch(launch, flush, stream, options.warmup, options.repeat);
+        results.push_back(make_direct_attention_result(timing, weight_bytes, t, kRows,
+                                                       AttentionWeightType::Nvfp4, options.policy,
+                                                       "production_parent"));
+    }
+    print_direct_attention_results(results, "gdn", kRows, AttentionWeightType::Nvfp4,
+                                   options.policy);
+    write_direct_attention_csv(options.csv_out, results, options, "gdn", kRows);
+}
+
+struct DirectGdnSnapshotResult {
+    std::int32_t t = 0;
+    bench::ColdTiming timing;
+    std::uint64_t logical_bytes            = 0;
+    std::uint64_t private_projection_bytes = 0;
+    std::uint64_t private_activation_bytes = 0;
+    std::uint64_t modeled_bytes            = 0;
+    std::size_t workspace_bytes            = 0;
+    double logical_gbs                     = 0.0;
+    double modeled_gbs                     = 0.0;
+};
+
+DirectGdnSnapshotResult make_direct_gdn_snapshot_result(const bench::ColdTiming& timing,
+                                                        std::uint64_t weight_bytes,
+                                                        std::int32_t tokens,
+                                                        ops::LinearPolicy policy,
+                                                        std::size_t workspace_bytes) {
+    constexpr std::uint64_t kParentRows = 16384;
+    constexpr std::uint64_t kChannels   = 10240;
+    const std::uint64_t t               = static_cast<std::uint64_t>(tokens);
+    const std::uint64_t logical_bytes = weight_bytes + static_cast<std::uint64_t>(kHidden) * t * 2 +
+                                        kChannels * 4 * 2 + kChannels * 3 * 2 +
+                                        kParentRows * t * 2 + kChannels * 3 * t * 2;
+    const bool a4 = policy == ops::LinearPolicy::AllowA4 && tokens > 16;
+    const std::uint64_t private_projection_bytes = a4 ? 2 * kParentRows * t * 2 : 0;
+    const std::uint64_t activation_footprint =
+        t * (static_cast<std::uint64_t>(kHidden) / 2 + static_cast<std::uint64_t>(kHidden) / 16);
+    const std::uint64_t private_activation_bytes = a4 ? 2 * activation_footprint : 0;
+    const std::uint64_t modeled_bytes =
+        logical_bytes + private_projection_bytes + private_activation_bytes;
+    const double seconds = timing.median_us * 1.0e-6;
+    return {
+        tokens,
+        timing,
+        logical_bytes,
+        private_projection_bytes,
+        private_activation_bytes,
+        modeled_bytes,
+        workspace_bytes,
+        static_cast<double>(logical_bytes) / seconds / 1.0e9,
+        static_cast<double>(modeled_bytes) / seconds / 1.0e9,
+    };
+}
+
+void print_direct_gdn_snapshot_results(const std::vector<DirectGdnSnapshotResult>& results,
+                                       ops::LinearPolicy policy) {
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp properties{};
+    CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
+    std::printf("# actual_gpu=%s sm=%d%d cache=cold\n", properties.name, properties.major,
+                properties.minor);
+    std::printf("%-13s %3s %3s %6s %11s %11s %11s %12s %12s %12s %12s %12s\n", "op", "pol", "act",
+                "T", "median_us", "min_us", "p95_us", "logical_B", "private_proj", "private_act",
+                "logical_GB/s", "modeled_GB/s");
+    for (const DirectGdnSnapshotResult& result : results) {
+        std::printf("%-13s %3s %3s %6d %11.3f %11.3f %11.3f %12llu %12llu %12llu %12.1f "
+                    "%12.1f\n",
+                    "gdn_snapshot", direct_policy_name(policy),
+                    direct_activation_name(AttentionWeightType::Nvfp4, policy, result.t), result.t,
+                    result.timing.median_us, result.timing.min_us, result.timing.p95_us,
+                    static_cast<unsigned long long>(result.logical_bytes),
+                    static_cast<unsigned long long>(result.private_projection_bytes),
+                    static_cast<unsigned long long>(result.private_activation_bytes),
+                    result.logical_gbs, result.modeled_gbs);
+    }
+}
+
+void write_direct_gdn_snapshot_csv(const std::string& path,
+                                   const std::vector<DirectGdnSnapshotResult>& results,
+                                   const Options& options) {
+    if (path.empty()) { return; }
+    const std::filesystem::path output(path);
+    if (!output.parent_path().empty()) {
+        std::filesystem::create_directories(output.parent_path());
+    }
+    std::ofstream stream(output);
+    if (!stream) { throw std::runtime_error("failed to open CSV: " + path); }
+    stream << "op,path,weight_type,policy,activation_compute,T,median_us,min_us,p95_us,"
+              "logical_bytes,private_projection_bytes,private_activation_bytes,modeled_bytes,"
+              "logical_gbs,modeled_gbs,workspace_bytes,warmup,repeat,flush_bytes\n";
+    for (const DirectGdnSnapshotResult& result : results) {
+        stream << "gdn_snapshot,production_parent,NVFP4," << direct_policy_name(options.policy)
+               << ','
+               << direct_activation_name(AttentionWeightType::Nvfp4, options.policy, result.t)
+               << ',' << result.t << ',' << result.timing.median_us << ',' << result.timing.min_us
+               << ',' << result.timing.p95_us << ',' << result.logical_bytes << ','
+               << result.private_projection_bytes << ',' << result.private_activation_bytes << ','
+               << result.modeled_bytes << ',' << result.logical_gbs << ',' << result.modeled_gbs
+               << ',' << result.workspace_bytes << ',' << options.warmup << ',' << options.repeat
+               << ',' << kFlushBytes << '\n';
+    }
+}
+
+void run_direct_gdn_snapshot(const Options& options, DeviceBuffer& flush, cudaStream_t stream) {
+    constexpr std::int32_t kRows        = 16384;
+    constexpr std::int32_t kChannels    = 10240;
+    constexpr std::int32_t kQueryRows   = 2048;
+    constexpr std::int32_t kKeyRows     = 2048;
+    constexpr std::int32_t kValueRows   = 6144;
+    constexpr std::int32_t kZRows       = 6144;
+    bench::PackedQuantizedWeight packed = bench::make_nvfp4_weight(kRows, kHidden);
+    const std::uint64_t weight_bytes    = packed.model_weight_bytes();
+    const std::int32_t max_t = *std::max_element(options.t_sweep.begin(), options.t_sweep.end());
+    const std::int32_t min_t = *std::min_element(options.t_sweep.begin(), options.t_sweep.end());
+    const std::int32_t slots = max_t + 1;
+    const std::int32_t initial_slot_value = max_t;
+
+    DeviceBuffer input =
+        bench::make_bf16(static_cast<std::size_t>(kHidden) * static_cast<std::size_t>(max_t));
+    DeviceBuffer conv_weight = bench::make_bf16(static_cast<std::size_t>(kChannels) * 4);
+    DeviceBuffer conv_states =
+        bench::make_zeros(static_cast<std::size_t>(kChannels) * 3 * slots * 2);
+    DeviceBuffer initial_slot(sizeof(std::int32_t));
+    initial_slot.copy_from_host(&initial_slot_value, sizeof(initial_slot_value));
+    DeviceBuffer query(static_cast<std::size_t>(kQueryRows) * max_t * 2);
+    DeviceBuffer key(static_cast<std::size_t>(kKeyRows) * max_t * 2);
+    DeviceBuffer value(static_cast<std::size_t>(kValueRows) * max_t * 2);
+    DeviceBuffer z(static_cast<std::size_t>(kZRows) * max_t * 2);
+    const std::size_t workspace_capacity =
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(QType::NVFP4, kRows, kHidden,
+                                                                   options.policy, min_t, max_t);
+    DeviceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
+
+    const auto make_launch = [&](std::int32_t t) {
+        return [&, t](cudaStream_t launch_stream) {
+            Tensor x(input.p, DType::BF16, {kHidden, t});
+            Tensor conv(conv_weight.p, DType::BF16, {kChannels, 4});
+            Tensor states(conv_states.p, DType::BF16, {kChannels, 3, slots});
+            Tensor initial(initial_slot.p, DType::I32, {1});
+            Tensor q(query.p, DType::BF16, {kQueryRows, t});
+            Tensor k(key.p, DType::BF16, {kKeyRows, t});
+            Tensor v(value.p, DType::BF16, {kValueRows, t});
+            Tensor z_output(z.p, DType::BF16, {kZRows, t});
+            ops::gdn_input_proj_conv_snapshot(x, packed.weight, conv, states, initial, q, k, v,
+                                              z_output, options.policy, workspace, launch_stream);
+        };
+    };
+
+    if (options.profile) {
+        const std::int32_t t = options.t_sweep.front();
+        const auto launch    = make_launch(t);
+        for (int iteration = 0; iteration < options.warmup; ++iteration) {
+            bench::flush_l2(flush, stream);
+            launch(stream);
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        bench::flush_l2(flush, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::printf("PROFILE gdn_input_proj_conv_snapshot weight_type=NVFP4 policy=%s "
+                    "N=%d K=%d T=%d workspace_bytes=%zu\n",
+                    direct_policy_name(options.policy), kRows, kHidden, t, workspace_capacity);
+        std::fflush(stdout);
+        CUDA_CHECK(cudaProfilerStart());
+        launch(stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaProfilerStop());
+        return;
+    }
+
+    std::vector<DirectGdnSnapshotResult> results;
+    results.reserve(options.t_sweep.size());
+    for (const std::int32_t t : options.t_sweep) {
+        const auto launch = make_launch(t);
+        const bench::ColdTiming timing =
+            bench::measure_cold_launch(launch, flush, stream, options.warmup, options.repeat);
+        const std::size_t exact_workspace =
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(QType::NVFP4, kRows, kHidden,
+                                                                       options.policy, t, t);
+        results.push_back(make_direct_gdn_snapshot_result(timing, weight_bytes, t, options.policy,
+                                                          exact_workspace));
+    }
+    print_direct_gdn_snapshot_results(results, options.policy);
+    write_direct_gdn_snapshot_csv(options.csv_out, results, options);
 }
 
 } // namespace
@@ -477,8 +833,14 @@ int main(int argc, char** argv) {
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         ninfer::DeviceBuffer flush(kFlushBytes);
-        if (options.attention_weight_type == AttentionWeightType::Bf16) {
-            run_bf16_attention(options, flush, stream);
+        if (options.attention_weight_type != AttentionWeightType::Q4Q5) {
+            if (options.op == OpSelection::GdnSnapshot) {
+                run_direct_gdn_snapshot(options, flush, stream);
+            } else if (options.op == OpSelection::Gdn) {
+                run_direct_gdn(options, flush, stream);
+            } else {
+                run_direct_attention(options, flush, stream);
+            }
             CUDA_CHECK(cudaStreamDestroy(stream));
             return 0;
         }

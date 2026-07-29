@@ -13,7 +13,8 @@
 namespace ninfer::ops::detail {
 namespace {
 
-using TmaM256N128 = Nvfp4W4a4TmaSchedule<256, 3, 1>;
+using TmaM256N128   = Nvfp4W4a4TmaSchedule<256, 3, 1>;
+using TmaM256N128S2 = Nvfp4W4a4TmaSchedule<256, 2, 1>;
 
 constexpr std::int32_t kQueryRows  = 6144;
 constexpr std::int32_t kKeyRows    = 1024;
@@ -100,6 +101,12 @@ void launch_nvfp4_w4a4_tma_linear(Nvfp4Problem problem, const std::uint8_t* acti
         launch_linear<Nvfp4GdnInputGeometry>(activation_codes, activation_scales, weight_codes,
                                              weight_scales, output, tokens, alpha, stream);
         return;
+    case Nvfp4Problem::MlpGateUp:
+        launch_tma<Nvfp4MlpGateUpGeometry, TmaM256N128S2>(
+            activation_codes, activation_scales, weight_codes, weight_scales, tokens, alpha,
+            Nvfp4IdentityEpilogue{},
+            Nvfp4ContiguousOutput{output, Nvfp4MlpGateUpGeometry::kOutputRows}, stream);
+        return;
     case Nvfp4Problem::Residual6144:
         launch_linear<Nvfp4Residual6144Geometry>(activation_codes, activation_scales, weight_codes,
                                                  weight_scales, output, tokens, alpha, stream);
@@ -161,6 +168,7 @@ void launch_nvfp4_w4a4_tma_linear_add(Nvfp4Problem problem, const std::uint8_t* 
         return;
     case Nvfp4Problem::AttnInput:
     case Nvfp4Problem::GdnInput:
+    case Nvfp4Problem::MlpGateUp:
         return;
     }
 }

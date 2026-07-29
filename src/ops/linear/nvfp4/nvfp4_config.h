@@ -107,6 +107,7 @@ struct Nvfp4SmallTSchedule {
 
 using Nvfp4AttnInputGeometry     = Nvfp4GemvGeometry<14336, 5120>;
 using Nvfp4GdnInputGeometry      = Nvfp4GemvGeometry<16384, 5120>;
+using Nvfp4MlpGateUpGeometry     = Nvfp4GemvGeometry<34816, 5120>;
 using Nvfp4Residual6144Geometry  = Nvfp4GemvGeometry<5120, 6144>;
 using Nvfp4Residual17408Geometry = Nvfp4GemvGeometry<5120, 17408>;
 
@@ -117,6 +118,7 @@ using Nvfp4Activation17408Geometry = Nvfp4ActivationGeometry<17408>;
 enum class Nvfp4Problem : std::uint8_t {
     AttnInput,
     GdnInput,
+    MlpGateUp,
     Residual6144,
     Residual17408,
 };
@@ -126,6 +128,8 @@ inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int
             input_rows == Nvfp4AttnInputGeometry::kInputRows) ||
            (output_rows == Nvfp4GdnInputGeometry::kOutputRows &&
             input_rows == Nvfp4GdnInputGeometry::kInputRows) ||
+           (output_rows == Nvfp4MlpGateUpGeometry::kOutputRows &&
+            input_rows == Nvfp4MlpGateUpGeometry::kInputRows) ||
            (output_rows == Nvfp4Residual6144Geometry::kOutputRows &&
             input_rows == Nvfp4Residual6144Geometry::kInputRows) ||
            (output_rows == Nvfp4Residual17408Geometry::kOutputRows &&
@@ -140,6 +144,10 @@ inline Nvfp4Problem resolve_nvfp4_problem(std::int32_t output_rows, std::int32_t
     if (output_rows == Nvfp4GdnInputGeometry::kOutputRows &&
         input_rows == Nvfp4GdnInputGeometry::kInputRows) {
         return Nvfp4Problem::GdnInput;
+    }
+    if (output_rows == Nvfp4MlpGateUpGeometry::kOutputRows &&
+        input_rows == Nvfp4MlpGateUpGeometry::kInputRows) {
+        return Nvfp4Problem::MlpGateUp;
     }
     if (output_rows == Nvfp4Residual6144Geometry::kOutputRows &&
         input_rows == Nvfp4Residual6144Geometry::kInputRows) {
