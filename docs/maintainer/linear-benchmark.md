@@ -16,8 +16,9 @@ Q4/Q5/Q6/W8 LinearAdd、LinearSwiGLU、LinearPair 和其他 fused Ops 不属于�
 benchmark。它们继续由各自的 benchmark 独立测量。
 
 当前只有 A16 pure Linear route。Q4/Q5/Q6/W8 使用 RowSplit packed weight；BF16_CTRL
-作为显式开发单点使用，不加入 model suite。benchmark 不提供虚假的 A8 或 A4 选项；
-只有相应 production route、数值资格和硬件规格参照同时存在后，才增加新的执行类型。
+以及 exact `[14336,5120], T=1` NVFP4 decode route 作为显式开发单点使用，不加入 model
+suite。benchmark 不提供虚假的 A8 或 A4 选项；只有相应 production route、数值资格和
+硬件规格参照同时存在后，才增加新的执行类型。
 
 ## 1. 使用场景
 
@@ -41,6 +42,14 @@ benchmark。它们继续由各自的 benchmark 独立测量。
 ```bash
 ./build/bench/ninfer_linear_bench \
   --qtype bf16 --policy a16 \
+  --n 14336 --k 5120 --t 1
+```
+
+NVFP4 decode 的 permanent exact point 是：
+
+```bash
+./build/bench/ninfer_linear_bench \
+  --qtype nvfp4 --policy a16 \
   --n 14336 --k 5120 --t 1
 ```
 
@@ -250,6 +259,7 @@ format weight bytes 是 kernel 需要消费的各存储平面之和，不包含 
 | Q5G64_F16S | 64 | `32 low + 8 high + 2 scale` | `groups * 42` |
 | Q6G64_F16S | 64 | `32 low + 16 high + 2 scale` | `groups * 50` |
 | W8G32_F16S | 32 | `32 code + 2 scale` | `groups * 34` |
+| NVFP4 | 16 | `8 code + 1 E4M3 scale` | `groups * 9` |
 | BF16_CTRL | — | direct BF16 | `2 * N * K` |
 
 一次 Linear 的理论最低流量为：
@@ -372,7 +382,7 @@ selector 源码是 host launcher route 的唯一 executable authority。
 
 当前 `linear_bench.cu` 保留：
 
-- deterministic packed Q4/Q5/Q6/W8 和 direct BF16 weight generation；
+- deterministic packed Q4/Q5/Q6/W8/NVFP4 和 direct BF16 weight generation；
 - BF16 activation/output allocation；
 - public Linear invocation；
 - cold-cache CUDA-event timing；

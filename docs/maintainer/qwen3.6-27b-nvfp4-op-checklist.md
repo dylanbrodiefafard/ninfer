@@ -128,6 +128,10 @@ functional checklist item.
 
 ### A1 — single-parent NVFP4 `attn_input_proj`
 
+当前 `T=1` decode 工作的临时实施方案见
+[`2026-07-29-qwen3.6-27b-nvfp4-attn-input-decode-plan.md`](2026-07-29-qwen3.6-27b-nvfp4-attn-input-decode-plan.md)。
+该方案完成后应删除，并将稳定结论并回本清单及对应 active references。
+
 - [ ] Admit one complete NVFP4 `query_key_gate_value` weight `[14336,5120]`; do not expose four
   weight row views or multiple weight arguments.
 - [ ] Accept `x BF16 [5120,T]`, with every positive `T`.
@@ -155,10 +159,20 @@ functional checklist item.
 - [ ] Reject an invalid NVFP4 layout, shape, plane geometry, or non-positive/non-finite divisor.
 - [ ] Preserve the existing two-parent 27B Q4/Q5 and single-parent 35B W8 admissions and outputs.
 - [ ] Add independent-oracle coverage for all four row ranges and verify that output allocations
-  are neither exchanged nor overlapped.
+  receive the intended semantic ranges.
 
 The existing single-parent C++ signature already expresses this semantic form; A1 extends its exact
 format/geometry admission rather than creating a second NVFP4-specific public name.
+
+Current A1 progress, which does not mark A1 complete:
+
+- [x] the complete NVFP4 parent `[14336,5120]` is admitted for A16 `T=1` decode;
+- [x] one shared matrix kernel writes either contiguous Linear output or the four final Attention
+  allocations directly, with the required physical-row mapping;
+- [x] the Linear result and all four Attention row ranges pass the independent exact-decode/FP64
+  oracle while the existing Q4/Q5, W8, and BF16 cases remain qualified;
+- [x] permanent public Linear and input-projection benchmark points cover this exact decode route;
+- [ ] Small-T and prefill execution regions still need to make every positive `T` executable.
 
 The matrix arithmetic is exactly equivalent to forming `Y = W*x` with
 `Y BF16 [14336,T]` and taking the four physical row ranges above. That equivalence does not make

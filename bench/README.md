@@ -206,11 +206,20 @@ tile pair, the primary prefill point, and representative larger chunks. A focuse
 controls. The candidate small-T implementation remains measurable through `T=32`; this range is
 not the production crossover.
 
-It counts the complete BF16 parent exactly once, one activation read, and the four final output
-writes. The result reports the same fixed-spec `DRAM_%` and measured pure-read `READ_%` columns as
-the Linear control; compute-bound points also report useful Tensor Core `TFLOP/s`, `TC_%`, and
-roofline utilization. `--profile` performs setup, warmup, and L2 eviction before capturing exactly
-one selected launch; the default production route enters through public BF16 `attn_input_proj`.
+The corresponding NVFP4 decode point is:
+
+```bash
+./build/bench/ninfer_input_proj_bench \
+  --op attention --weight-type nvfp4 --t-sweep 1 \
+  --warmup 10 --repeat 200
+```
+
+Both direct-parent modes count the complete parent exactly once, one activation read, and the four
+final output writes. The result reports the same fixed-spec `DRAM_%` and measured pure-read
+`READ_%` columns as the Linear control. BF16 compute-bound points also report useful Tensor Core
+`TFLOP/s`, `TC_%`, and roofline utilization. `--profile` performs setup, warmup, and L2 eviction
+before capturing exactly one selected launch; production routes enter through the public BF16 or
+NVFP4 `attn_input_proj` call.
 
 ## Bidirectional GQA Op benchmark
 

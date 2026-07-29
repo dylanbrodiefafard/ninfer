@@ -43,12 +43,15 @@ enum class LinearPolicy : std::uint8_t {
  *
  * @par Supported execution domain
  * Registered execution uses RowSplit Q4G64_F16S, Q5G64_F16S, Q6G64_F16S, or W8G32_F16S weights
- * with FP16 scales, plus registered contiguous BF16_CTRL problems. Each format owns a finite
- * registry of exact physical weight problems and selects its kernel internally; a valid encoding
- * and alignment do not imply arbitrary N/K support. Text and MTP packed-weight problems accept
+ * with FP16 scales, block-scaled NVFP4 weights, plus registered contiguous BF16_CTRL problems.
+ * Each format owns a finite registry of exact physical weight problems and selects its kernel
+ * internally; a valid encoding and alignment do not imply arbitrary N/K support. The current
+ * NVFP4 `[N,K]=[14336,5120]` implementation frontier contains its `T=1` route; later private
+ * routes complete the same positive-T Linear contract. Text and MTP packed-weight problems accept
  * every positive column extent T. Registered Vision problems accept raw-patch P in
  * `{4,8,...,131072}` or merged-token V in `[1,32768]`; a matrix column does not inherently
- * represent a text token. BF16_CTRL admits only `LinearPolicy::A16Only`. FP32_CTRL is unsupported.
+ * represent a text token. BF16_CTRL and NVFP4 admit only `LinearPolicy::A16Only`. FP32_CTRL is
+ * unsupported.
  *
  * @par Numerical contract
  * Test fixture code materializes the persistent weight as its logical FP32 dequantized matrix.
@@ -63,9 +66,9 @@ enum class LinearPolicy : std::uint8_t {
  * @par Compute policy
  * `policy` specifies the permitted private activation-compute set. A permission does not require a
  * corresponding low-precision route: the resolved plan may remain A16 when that is the qualified
- * choice. BF16_CTRL admits only LinearPolicy::A16Only. Registered Q4/Q5/Q6/W8 formats admit
- * LinearPolicy::A16Only and LinearPolicy::AllowA8. No currently registered weight format admits
- * LinearPolicy::AllowA4.
+ * choice. BF16_CTRL and NVFP4 admit only LinearPolicy::A16Only. Registered Q4/Q5/Q6/W8 formats
+ * admit LinearPolicy::A16Only and LinearPolicy::AllowA8. No currently registered weight format
+ * admits LinearPolicy::AllowA4.
  *
  * @param[in] x Contiguous, non-null, 16-byte-aligned BF16 input matrix `[K,T]`.
  * @param[in] w Logical weight matrix `[N,K]` in a registered persistent format and layout.

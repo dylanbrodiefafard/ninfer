@@ -229,6 +229,49 @@ int run_bf16_target() {
     return failures;
 }
 
+int run_nvfp4_target() {
+    constexpr std::int32_t kHidden     = 5120;
+    constexpr std::int32_t kQRows      = 6144;
+    constexpr std::int32_t kKvRows     = 1024;
+    constexpr std::int32_t kParentRows = 14336;
+    quantized_weight::PatternedWeightOptions options;
+    options.weight_scale_divisor = 0.125F;
+    options.input_scale_divisor  = 3.5F;
+    DevicePackedWeight parent(
+        quantized_weight::make_patterned_weight(QType::NVFP4, kParentRows, kHidden, 331U, options));
+    const std::vector<float> activation              = make_bf16_activation(kHidden, 1, 337U);
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    DeviceBuffer device_activation                   = to_device(activation_bits);
+
+    GuardedBf16Tensor query(kQRows, 1);
+    GuardedBf16Tensor gate(kQRows, 1);
+    GuardedBf16Tensor key(kKvRows, 1);
+    GuardedBf16Tensor value(kKvRows, 1);
+    Tensor x(device_activation.p, DType::BF16, {kHidden, 1});
+    Tensor q = query.tensor();
+    Tensor g = gate.tensor();
+    Tensor k = key.tensor();
+    Tensor v = value.tensor();
+    ops::attn_input_proj(x, parent.view(), q, g, k, v, nullptr);
+    cuda_synchronize();
+
+    constexpr std::int32_t kKeyBegin   = kQRows;
+    constexpr std::int32_t kGateBegin  = kKeyBegin + kKvRows;
+    constexpr std::int32_t kValueBegin = kGateBegin + kQRows;
+    int failures                       = 0;
+    failures += verify_output("attn q NVFP4 A16 T=1", query, parent.host, 0, kQRows, activation,
+                              kHidden, 1);
+    failures += verify_output("attn k NVFP4 A16 T=1", key, parent.host, kKeyBegin, kKvRows,
+                              activation, kHidden, 1);
+    failures += verify_output("attn gate NVFP4 A16 T=1", gate, parent.host, kGateBegin, kQRows,
+                              activation, kHidden, 1);
+    failures += verify_output("attn value NVFP4 A16 T=1", value, parent.host, kValueBegin, kKvRows,
+                              activation, kHidden, 1);
+    failures += verify_preserved("attn x NVFP4 A16 T=1", device_activation, activation_bits);
+    failures += parent.verify_preserved("attn parent NVFP4 A16 T=1");
+    return failures;
+}
+
 int run_w8_target_case(DevicePackedWeight& parent, std::int32_t tokens) {
     constexpr std::int32_t kHidden      = 2048;
     constexpr std::int32_t kQRows       = 4096;
@@ -329,6 +372,7 @@ int main() {
     int failures = 0;
     failures += run_q4_q5();
     failures += run_bf16_target();
+    failures += run_nvfp4_target();
     failures += run_w8_target();
     failures += run_w8_companion();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " attn_input_proj\n";

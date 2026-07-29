@@ -1,8 +1,10 @@
 #include "ninfer/ops/attn_input_proj.h"
 
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
+#include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/attn_input_proj/w8/w8_attn_input_plan.h"
+#include "ops/linear/nvfp4/nvfp4_format.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -102,6 +104,26 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight,
         require_bf16_contiguous(query_key_gate_value_weight, kRows, kHidden,
                                 "query/key/gate/value weight");
         detail::bf16_attn_input_dispatch(x, query_key_gate_value_weight, q, gate, k, v, stream);
+        return;
+    }
+
+    if (query_key_gate_value_weight.qtype == QType::NVFP4) {
+        constexpr std::int32_t kHidden = 5120;
+        constexpr std::int32_t kQRows  = 6144;
+        constexpr std::int32_t kKvRows = 1024;
+        constexpr std::int32_t kRows   = 14336;
+        const std::int32_t cols        = x.ne[1];
+        if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
+        require_matrix(x, kHidden, cols, "x");
+        require_matrix(q, kQRows, cols, "q");
+        require_matrix(gate, kQRows, cols, "gate");
+        require_matrix(k, kKvRows, cols, "k");
+        require_matrix(v, kKvRows, cols, "v");
+        detail::validate_nvfp4_weight(query_key_gate_value_weight, "nvfp4 attn_input_proj");
+        if (query_key_gate_value_weight.n != kRows || query_key_gate_value_weight.k != kHidden) {
+            throw std::invalid_argument("nvfp4 attn_input_proj: unsupported weight shape");
+        }
+        detail::nvfp4_attn_input_dispatch(x, query_key_gate_value_weight, q, gate, k, v, stream);
         return;
     }
 

@@ -42,6 +42,9 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
  *   BF16 `[2048,T]`, q/gate are BF16 `[4096,T]`, and k/v are BF16 `[512,T]`.
  * - BF16_CTRL Contiguous `[14336,5120]`, with row counts `[6144,1024,6144,1024]`. `x` is
  *   BF16 `[5120,T]`, q/gate are BF16 `[6144,T]`, and k/v are BF16 `[1024,T]`.
+ * - NVFP4 BlockScaleK16M128x4 `[14336,5120]`, with the same logical row and tensor shapes as
+ *   BF16_CTRL. Its current private implementation frontier contains the `T=1` route; later routes
+ *   complete the same positive-T contract.
  *
  * `T` is the positive token extent of the Op contract.
  *
