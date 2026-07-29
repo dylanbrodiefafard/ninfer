@@ -36,7 +36,7 @@ from . import recipe as base_recipe
 from . import recipe_nvfp4 as recipe
 
 
-RECIPE_ID = "qwen3_6_27b_nvfp4-v2"
+RECIPE_ID = "qwen3_6_27b_nvfp4-v1"
 OUTPUT_BASENAME = "qwen3_6_27b_nvfp4.ninfer"
 
 
@@ -230,6 +230,12 @@ def _encode_nvfp4_weight(
     return payload
 
 
+def _is_fused_text_attention_parent(name: str) -> bool:
+    return name.startswith("text/layers/") and name.endswith(
+        "/attention/query_key_gate_value"
+    )
+
+
 def _materialize_base_tensor(
     spec: inventory.TensorSpec,
     reader: ShardReader,
@@ -244,11 +250,27 @@ def _materialize_base_tensor(
             draft_head.DRAFT_HEAD_TOKEN_IDS_OBJECT:
             draft_head.materialize_draft_head_token_ids(draft)
         }
-    tensor = base_recipe.materialize_recipe(
-        base_recipe.RECIPES_BY_NAME[spec.name],
-        reader,
-        derived,
-    )
+    if _is_fused_text_attention_parent(spec.name):
+        prefix = spec.name.removesuffix("query_key_gate_value")
+        tensor = torch.cat(
+            (
+                base_recipe.materialize_recipe(
+                    base_recipe.RECIPES_BY_NAME[prefix + "query_key"],
+                    reader,
+                ),
+                base_recipe.materialize_recipe(
+                    base_recipe.RECIPES_BY_NAME[prefix + "gate_value"],
+                    reader,
+                ),
+            ),
+            dim=0,
+        )
+    else:
+        tensor = base_recipe.materialize_recipe(
+            base_recipe.RECIPES_BY_NAME[spec.name],
+            reader,
+            derived,
+        )
     if tuple(tensor.shape) != spec.shape:
         raise ValueError(
             f"{spec.name}: materialized shape {tuple(tensor.shape)} != {spec.shape}"

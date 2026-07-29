@@ -166,8 +166,7 @@ def _bf16_text_matrix_specs() -> tuple[inventory.TensorSpec, ...]:
         if (
             spec.name.endswith("/gdn/a_projection")
             or spec.name.endswith("/gdn/b_projection")
-            or spec.name.endswith("/attention/query_key")
-            or spec.name.endswith("/attention/gate_value")
+            or spec.name.endswith("/attention/query_key_gate_value")
             or spec.name.endswith("/attention/output")
             or spec.name.endswith("/gdn/output")
         ):
@@ -186,9 +185,25 @@ def _verify_bf16_text_matrices(
         obj = artifact.find(spec.name)
         if not isinstance(obj, TensorObject):
             _error(f"{spec.name}: expected tensor")
-        expected = base_recipe.materialize_recipe(
-            base_recipe.RECIPES_BY_NAME[spec.name], reader
-        )
+        if spec.name.endswith("/attention/query_key_gate_value"):
+            prefix = spec.name.removesuffix("query_key_gate_value")
+            expected = torch.cat(
+                (
+                    base_recipe.materialize_recipe(
+                        base_recipe.RECIPES_BY_NAME[prefix + "query_key"],
+                        reader,
+                    ),
+                    base_recipe.materialize_recipe(
+                        base_recipe.RECIPES_BY_NAME[prefix + "gate_value"],
+                        reader,
+                    ),
+                ),
+                dim=0,
+            )
+        else:
+            expected = base_recipe.materialize_recipe(
+                base_recipe.RECIPES_BY_NAME[spec.name], reader
+            )
         stored = decode_direct(artifact.payload(obj), obj.format, obj.shape)
         if not torch.equal(
             stored.view(torch.int16), expected.view(torch.int16)

@@ -17,8 +17,9 @@ enum class Q4Q5GdnInputScheduleId {
 struct Q4Q5GdnInputProblem {
     std::int32_t input_rows;
     std::int32_t qk_rows;
-    std::int32_t value_rows;
-    std::int32_t output_rows;
+    std::int32_t value_z_rows;
+    std::int32_t qkv_rows;
+    std::int32_t z_rows;
     std::int32_t padded_k;
     std::int32_t cols;
 };
@@ -33,9 +34,10 @@ bool q4_q5_gdn_input_admits(const Q4Q5GdnInputProblem& problem) noexcept;
 Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem);
 
 void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
-                                  const Weight& qk_weight, const Weight& v_weight, Tensor& qkv,
-                                  cudaStream_t stream);
-void q4_q5_gdn_input_dispatch(const Tensor& x, const Weight& qk_weight, const Weight& v_weight,
-                              Tensor& qkv, cudaStream_t stream);
+                                  const Weight& qk_weight, const Weight& value_z_weight,
+                                  Tensor& qkv, Tensor& z, cudaStream_t stream);
+void q4_q5_gdn_input_dispatch(const Tensor& x, const Weight& qk_weight,
+                              const Weight& value_z_weight, Tensor& qkv, Tensor& z,
+                              cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

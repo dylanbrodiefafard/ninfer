@@ -30,31 +30,38 @@ int verify_output_range(std::string_view label, const GuardedBf16Tensor& output,
     return compare(label, actual, expected, kGdnInputProjA16Tolerance);
 }
 
-int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_weight,
+int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_weight,
                    std::int32_t tokens) {
     constexpr std::int32_t kHidden      = 5120;
     constexpr std::int32_t kQkRows      = 4096;
     constexpr std::int32_t kValueRows   = 6144;
+    constexpr std::int32_t kZRows       = 6144;
     constexpr std::int32_t kRows        = kQkRows + kValueRows;
     const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 401U + tokens);
     const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
     DeviceBuffer device_activation                   = to_device(activation_bits);
     GuardedBf16Tensor qkv(kRows, tokens);
+    GuardedBf16Tensor z(kZRows, tokens);
     Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
-    Tensor output = qkv.tensor();
-    ops::gdn_input_proj(x, query_key.view(), value_weight.view(), output, nullptr);
+    Tensor output   = qkv.tensor();
+    Tensor z_output = z.tensor();
+    ops::gdn_input_proj(x, query_key.view(), value_z_weight.view(), output, z_output, nullptr);
     cuda_synchronize();
 
     const std::string suffix = " Q4/Q5 A16 T=" + std::to_string(tokens);
     int failures             = qkv.verify_guards("gdn qkv" + suffix);
+    failures += z.verify_guards("gdn z" + suffix);
     failures += qkv.verify_fully_written("gdn qkv" + suffix);
+    failures += z.verify_fully_written("gdn z" + suffix);
     failures += verify_output_range("gdn qk" + suffix, qkv, kRows, 0, kQkRows, query_key.host, 0,
                                     activation, kHidden, tokens);
     failures += verify_output_range("gdn value" + suffix, qkv, kRows, kQkRows, kValueRows,
-                                    value_weight.host, 0, activation, kHidden, tokens);
+                                    value_z_weight.host, 0, activation, kHidden, tokens);
+    failures += verify_output_range("gdn z" + suffix, z, kZRows, 0, kZRows, value_z_weight.host,
+                                    kValueRows, activation, kHidden, tokens);
     failures += verify_preserved("gdn x" + suffix, device_activation, activation_bits);
     failures += query_key.verify_preserved("gdn query/key weight" + suffix);
-    failures += value_weight.verify_preserved("gdn value weight" + suffix);
+    failures += value_z_weight.verify_preserved("gdn value/z weight" + suffix);
     return failures;
 }
 
@@ -62,11 +69,11 @@ int run_q4_q5() {
     constexpr std::int32_t kHidden = 5120;
     DevicePackedWeight query_key(
         quantized_weight::make_patterned_weight(QType::Q4G64_F16S, 4096, kHidden, 409U));
-    DevicePackedWeight value_weight(
-        quantized_weight::make_patterned_weight(QType::Q5G64_F16S, 6144, kHidden, 419U));
+    DevicePackedWeight value_z_weight(
+        quantized_weight::make_patterned_weight(QType::Q5G64_F16S, 12288, kHidden, 419U));
     int failures = 0;
     for (const std::int32_t tokens : {1, 2, 16, 17}) {
-        failures += run_q4_q5_case(query_key, value_weight, tokens);
+        failures += run_q4_q5_case(query_key, value_z_weight, tokens);
     }
     return failures;
 }

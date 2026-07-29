@@ -235,12 +235,10 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                 backing, source.gdn.b_projection, NumericFormat::BF16, 48, 5120);
             target.projection.query_key = artifact::materialized_weight(
                 backing, source.gdn.query_key, NumericFormat::Q4G64_F16S, 4096, 5120);
-            const Weight value_z = artifact::materialized_weight(
+            target.projection.value_z = artifact::materialized_weight(
                 backing, source.gdn.value_z, NumericFormat::Q5G64_F16S, 12288, 5120);
-            target.projection.value = row_view(value_z, 0, 6144);
             target.norm =
                 artifact::materialized_tensor(backing, source.gdn.norm, NumericFormat::BF16, {128});
-            target.projection.z        = row_view(value_z, 6144, 6144);
             target.output              = artifact::materialized_weight(backing, source.gdn.output,
                                                                        NumericFormat::Q5G64_F16S, 5120, 6144);
             target.post_attention_norm = artifact::materialized_tensor(

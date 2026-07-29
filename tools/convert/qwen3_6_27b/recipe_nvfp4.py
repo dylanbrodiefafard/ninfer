@@ -115,20 +115,12 @@ def _build_recipes() -> tuple[
             if layer in inventory.NVFP4_ATTENTION_INPUT_LAYERS:
                 group = (q, k, v)
                 weight_groups.append(group)
-                weights.extend(
-                    (
-                        Nvfp4WeightRecipe(
-                            object_prefix + "attention/query_key",
-                            (7168, 5120),
-                            (_q_part(q, False), _all(k)),
-                            group,
-                        ),
-                        Nvfp4WeightRecipe(
-                            object_prefix + "attention/gate_value",
-                            (7168, 5120),
-                            (_q_part(q, True), _all(v)),
-                            group,
-                        ),
+                weights.append(
+                    Nvfp4WeightRecipe(
+                        object_prefix + "attention/query_key_gate_value",
+                        (14336, 5120),
+                        (_q_part(q, False), _all(k), _q_part(q, True), _all(v)),
+                        group,
                     )
                 )
                 inputs.append(
@@ -137,8 +129,7 @@ def _build_recipes() -> tuple[
                         + "attention/input_projection/input_scale_divisor",
                         group,
                         (
-                            object_prefix + "attention/query_key",
-                            object_prefix + "attention/gate_value",
+                            object_prefix + "attention/query_key_gate_value",
                         ),
                     )
                 )
@@ -167,20 +158,12 @@ def _build_recipes() -> tuple[
             out = _source(source_prefix + "linear_attn.out_proj", 5120, 6144)
             group = (qkv, z)
             weight_groups.append(group)
-            weights.extend(
-                (
-                    Nvfp4WeightRecipe(
-                        object_prefix + "gdn/query_key",
-                        (4096, 5120),
-                        (_part(qkv, 0, 4096),),
-                        group,
-                    ),
-                    Nvfp4WeightRecipe(
-                        object_prefix + "gdn/value_z",
-                        (12288, 5120),
-                        (_part(qkv, 4096, 10240), _all(z)),
-                        group,
-                    ),
+            weights.append(
+                Nvfp4WeightRecipe(
+                    object_prefix + "gdn/query_key_value_z",
+                    (16384, 5120),
+                    (_all(qkv), _all(z)),
+                    group,
                 )
             )
             inputs.append(
@@ -188,8 +171,7 @@ def _build_recipes() -> tuple[
                     object_prefix + "gdn/input_projection/input_scale_divisor",
                     group,
                     (
-                        object_prefix + "gdn/query_key",
-                        object_prefix + "gdn/value_z",
+                        object_prefix + "gdn/query_key_value_z",
                     ),
                 )
             )
@@ -313,7 +295,7 @@ def validate_recipe() -> None:
         len(WEIGHT_DIVISOR_GROUPS),
         len(NVFP4_SOURCES),
         len(BF16_COMPARISONS),
-    ) != (305, 247, 122, 379, 117):
+    ) != (247, 247, 122, 379, 117):
         raise ValueError("NVFP4 source recipe is incomplete")
     if tuple(NVFP4_WEIGHTS_BY_NAME) != tuple(
         spec.name for spec in inventory.NVFP4_TENSOR_SPECS
@@ -333,8 +315,8 @@ def validate_recipe() -> None:
         name for site in INPUT_DIVISOR_RECIPES for name in site.weight_names
     )
     if (
-        len(bound_weights) != 305
-        or len(set(bound_weights)) != 305
+        len(bound_weights) != 247
+        or len(set(bound_weights)) != 247
         or set(bound_weights) != set(NVFP4_WEIGHTS_BY_NAME)
     ):
         raise ValueError("input-divisor sites do not cover NVFP4 parents exactly once")

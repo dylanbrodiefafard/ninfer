@@ -20,6 +20,8 @@ constexpr int kHidden      = 5120;
 constexpr int kQueryRows   = 2048;
 constexpr int kKeyRows     = 2048;
 constexpr int kValueRows   = 6144;
+constexpr int kZRows       = 6144;
+constexpr int kValueZRows  = kValueRows + kZRows;
 constexpr int kQkRows      = kQueryRows + kKeyRows;
 constexpr int kChannels    = kQkRows + kValueRows;
 constexpr int kValueOffset = kQkRows;
@@ -73,32 +75,46 @@ struct Q4GdnSmallTEpilogue {
 
 struct Q5GdnDecodeEpilogue {
     GdnConvSnapshotEpilogue conv;
+    __nv_bfloat16* z;
 
     template <bool, int>
     __device__ __forceinline__ void operator()(__nv_bfloat16*, __nv_bfloat16*, int row,
                                                float value) const {
-        const float projected[1]{value};
-        conv.store(row, projected);
+        if (row < kValueRows) {
+            const float projected[1]{value};
+            conv.store(row, projected);
+        } else {
+            z[row - kValueRows] = __float2bfloat16_rn(value);
+        }
     }
 };
 
 template <int Tokens>
 struct Q5GdnSmallTEpilogue {
     GdnConvSnapshotEpilogue conv;
+    __nv_bfloat16* z;
 
     template <bool, int, int ProducedTokens>
     __device__ __forceinline__ void operator()(__nv_bfloat16*, __nv_bfloat16*, std::int32_t,
                                                std::int32_t, std::int32_t row,
                                                const float (&values)[ProducedTokens]) const {
         static_assert(ProducedTokens == Tokens);
-        conv.store(row, values);
+        if (row < kValueRows) {
+            conv.store(row, values);
+        } else {
+#pragma unroll
+            for (int token = 0; token < Tokens; ++token) {
+                z[static_cast<std::int64_t>(token) * kZRows + row - kValueRows] =
+                    __float2bfloat16_rn(values[token]);
+            }
+        }
     }
 };
 
-void launch_t1(const Tensor& x, const Weight& qk_weight, const Weight& v_weight,
+void launch_t1(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                const GdnConvSnapshotEpilogue& qk_epilogue,
                const GdnConvSnapshotEpilogue& value_epilogue, Tensor& query, Tensor& value,
-               cudaStream_t stream) {
+               Tensor& z, cudaStream_t stream) {
     constexpr int q4_threads = Q4GemvR1W8DirectSchedule::kThreads;
     q4_rowsplit_gemv_kernel<Q4GemvR1W8DirectSchedule, false, 0, Q4GdnDecodeEpilogue>
         <<<kQkRows / Q4GemvR1W8DirectSchedule::kRowsPerCta, q4_threads, 0, stream>>>(
@@ -110,21 +126,22 @@ void launch_t1(const Tensor& x, const Weight& qk_weight, const Weight& v_weight,
 
     constexpr int q5_rows_per_block = 16;
     constexpr int q5_threads        = q5_rows_per_block * 32;
-    q5_rowsplit_gemv_kernel<kValueRows, kHidden, q5_rows_per_block, 2, true, false, false, 0,
-                            Q5GdnDecodeEpilogue>
-        <<<kValueRows / q5_rows_per_block, q5_threads, 0, stream>>>(
+    q5_rowsplit_gemv_kernel<kValueZRows, kHidden, q5_rows_per_block, 2, true, false, true,
+                            kValueRows, Q5GdnDecodeEpilogue>
+        <<<kValueZRows / q5_rows_per_block, q5_threads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(v_weight.qdata),
-            static_cast<const std::uint8_t*>(v_weight.qhigh),
-            static_cast<const std::uint8_t*>(v_weight.scales),
-            static_cast<__nv_bfloat16*>(value.data), nullptr, Q5GdnDecodeEpilogue{value_epilogue});
+            static_cast<const std::uint8_t*>(value_z_weight.qdata),
+            static_cast<const std::uint8_t*>(value_z_weight.qhigh),
+            static_cast<const std::uint8_t*>(value_z_weight.scales),
+            static_cast<__nv_bfloat16*>(value.data), static_cast<__nv_bfloat16*>(z.data),
+            Q5GdnDecodeEpilogue{value_epilogue, static_cast<__nv_bfloat16*>(z.data)});
 }
 
 template <int Tokens, class Q4Schedule>
-void launch_small_t_schedule(const Tensor& x, const Weight& qk_weight, const Weight& v_weight,
+void launch_small_t_schedule(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                              const GdnConvSnapshotEpilogue& qk_epilogue,
                              const GdnConvSnapshotEpilogue& value_epilogue, Tensor& query,
-                             Tensor& value, cudaStream_t stream) {
+                             Tensor& value, Tensor& z, cudaStream_t stream) {
     const dim3 q4_grid(kQkRows / Q4Schedule::kRowsPerCta, 1u, 1u);
     q4_rowsplit_gemm_simt_kernel<Q4Schedule, false, false, 0, Q4GdnSmallTEpilogue<Tokens>>
         <<<q4_grid, Q4Schedule::kThreads, 0, stream>>>(
@@ -135,38 +152,42 @@ void launch_small_t_schedule(const Tensor& x, const Weight& qk_weight, const Wei
             Tokens, kHidden, Q4GdnSmallTEpilogue<Tokens>{qk_epilogue});
 
     constexpr int q5_threads = 4 * 32;
-    const dim3 q5_grid(kValueRows, 1u, 1u);
-    q5_rowsplit_gemm_simt_split4_kernel<Q5RowSplitSimtSchedule, Tokens, 5, kHidden, false, 0,
-                                        Q5GdnSmallTEpilogue<Tokens>>
-        <<<q5_grid, q5_threads, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
-                                             static_cast<const std::uint8_t*>(v_weight.qdata),
-                                             static_cast<const std::uint8_t*>(v_weight.qhigh),
-                                             static_cast<const std::uint8_t*>(v_weight.scales),
-                                             static_cast<__nv_bfloat16*>(value.data), nullptr,
-                                             kValueRows, kValueRows, kHidden, Tokens, kHidden, 5,
-                                             Q5GdnSmallTEpilogue<Tokens>{value_epilogue});
+    const dim3 q5_grid(kValueZRows, 1u, 1u);
+    q5_rowsplit_gemm_simt_split4_kernel<Q5RowSplitSimtSchedule, Tokens, 5, kHidden, true,
+                                        kValueRows, Q5GdnSmallTEpilogue<Tokens>>
+        <<<q5_grid, q5_threads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(value_z_weight.qdata),
+            static_cast<const std::uint8_t*>(value_z_weight.qhigh),
+            static_cast<const std::uint8_t*>(value_z_weight.scales),
+            static_cast<__nv_bfloat16*>(value.data), static_cast<__nv_bfloat16*>(z.data),
+            kValueZRows, kValueRows, kHidden, Tokens, kHidden, 5,
+            Q5GdnSmallTEpilogue<Tokens>{
+                value_epilogue,
+                static_cast<__nv_bfloat16*>(z.data),
+            });
 }
 
 template <int Tokens>
-void launch_small_t(const Tensor& x, const Weight& qk_weight, const Weight& v_weight,
+void launch_small_t(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                     const GdnConvSnapshotEpilogue& qk_epilogue,
                     const GdnConvSnapshotEpilogue& value_epilogue, Tensor& query, Tensor& value,
-                    cudaStream_t stream) {
+                    Tensor& z, cudaStream_t stream) {
     if constexpr (Tokens <= 4) {
-        launch_small_t_schedule<Tokens, Q4ScheduleC4>(x, qk_weight, v_weight, qk_epilogue,
-                                                      value_epilogue, query, value, stream);
+        launch_small_t_schedule<Tokens, Q4ScheduleC4>(x, qk_weight, value_z_weight, qk_epilogue,
+                                                      value_epilogue, query, value, z, stream);
     } else {
-        launch_small_t_schedule<Tokens, Q4ScheduleC8>(x, qk_weight, v_weight, qk_epilogue,
-                                                      value_epilogue, query, value, stream);
+        launch_small_t_schedule<Tokens, Q4ScheduleC8>(x, qk_weight, value_z_weight, qk_epilogue,
+                                                      value_epilogue, query, value, z, stream);
     }
 }
 
 } // namespace
 
 void q4_q5_gdn_input_conv_snapshot_launch(const Tensor& x, const Weight& qk_weight,
-                                          const Weight& v_weight, const Tensor& conv_weight,
+                                          const Weight& value_z_weight, const Tensor& conv_weight,
                                           Tensor& conv_states, const Tensor& initial_slot,
-                                          Tensor& query, Tensor& key, Tensor& value,
+                                          Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                           cudaStream_t stream) {
     const GdnConvSnapshotEpilogue qk_epilogue =
         make_epilogue(conv_weight, conv_states, initial_slot, query, key, value, 0);
@@ -175,23 +196,24 @@ void q4_q5_gdn_input_conv_snapshot_launch(const Tensor& x, const Weight& qk_weig
 
     switch (x.ne[1]) {
     case 1:
-        launch_t1(x, qk_weight, v_weight, qk_epilogue, value_epilogue, query, value, stream);
+        launch_t1(x, qk_weight, value_z_weight, qk_epilogue, value_epilogue, query, value, z,
+                  stream);
         break;
     case 2:
-        launch_small_t<2>(x, qk_weight, v_weight, qk_epilogue, value_epilogue, query, value,
-                          stream);
+        launch_small_t<2>(x, qk_weight, value_z_weight, qk_epilogue, value_epilogue, query, value,
+                          z, stream);
         break;
     case 3:
-        launch_small_t<3>(x, qk_weight, v_weight, qk_epilogue, value_epilogue, query, value,
-                          stream);
+        launch_small_t<3>(x, qk_weight, value_z_weight, qk_epilogue, value_epilogue, query, value,
+                          z, stream);
         break;
     case 5:
-        launch_small_t<5>(x, qk_weight, v_weight, qk_epilogue, value_epilogue, query, value,
-                          stream);
+        launch_small_t<5>(x, qk_weight, value_z_weight, qk_epilogue, value_epilogue, query, value,
+                          z, stream);
         break;
     case 6:
-        launch_small_t<6>(x, qk_weight, v_weight, qk_epilogue, value_epilogue, query, value,
-                          stream);
+        launch_small_t<6>(x, qk_weight, value_z_weight, qk_epilogue, value_epilogue, query, value,
+                          z, stream);
         break;
     default:
         throw std::invalid_argument(

@@ -37,6 +37,8 @@ constexpr std::int32_t kKvRows         = 1024;
 constexpr std::int32_t kParentRows     = kQueryRows + kKvRows;
 constexpr std::int32_t kGdnQkRows      = 4096;
 constexpr std::int32_t kGdnValueRows   = 6144;
+constexpr std::int32_t kGdnZRows       = 6144;
+constexpr std::int32_t kGdnValueZRows  = kGdnValueRows + kGdnZRows;
 constexpr std::int32_t kGdnRows        = kGdnQkRows + kGdnValueRows;
 constexpr std::int32_t kGdnKeyRows     = 2048;
 constexpr std::int32_t kGdnSlots       = 7;
@@ -227,12 +229,16 @@ int main(int argc, char** argv) {
         if (options.op != OpSelection::Attention) {
             bench::PackedQuantizedWeight qk_weight = bench::make_row_split_weight(
                 QType::Q4G64_F16S, kGdnQkRows, kHidden, kHidden, {0x53, 0x53, 0x3c00});
-            bench::PackedQuantizedWeight value_weight = bench::make_row_split_weight(
-                QType::Q5G64_F16S, kGdnValueRows, kHidden, kHidden, {0x53, 0x53, 0x3c00});
+            bench::PackedQuantizedWeight value_z_weight = bench::make_row_split_weight(
+                QType::Q5G64_F16S, kGdnValueZRows, kHidden, kHidden, {0x53, 0x53, 0x3c00});
+            const Weight value_weight = bench::row_view(value_z_weight.weight, 0, kGdnValueRows);
+            const Weight z_weight =
+                bench::row_view(value_z_weight.weight, kGdnValueRows, kGdnZRows);
             ninfer::DeviceBuffer qkv(static_cast<std::size_t>(kGdnRows) * max_t * 2);
             ninfer::DeviceBuffer qkv_conv(static_cast<std::size_t>(kGdnRows) * max_t * 2);
             ninfer::DeviceBuffer qk_tmp(static_cast<std::size_t>(kGdnQkRows) * max_t * 2);
             ninfer::DeviceBuffer value_tmp(static_cast<std::size_t>(kGdnValueRows) * max_t * 2);
+            ninfer::DeviceBuffer z_out(static_cast<std::size_t>(kGdnZRows) * max_t * 2);
             ninfer::DeviceBuffer query(static_cast<std::size_t>(kGdnKeyRows) * max_t * 2);
             ninfer::DeviceBuffer key(static_cast<std::size_t>(kGdnKeyRows) * max_t * 2);
             ninfer::DeviceBuffer value_out(static_cast<std::size_t>(kGdnValueRows) * max_t * 2);
@@ -251,6 +257,7 @@ int main(int argc, char** argv) {
                 Tensor convolved(qkv_conv.p, DType::BF16, {kGdnRows, t});
                 Tensor qk(qk_tmp.p, DType::BF16, {kGdnQkRows, t});
                 Tensor value(value_tmp.p, DType::BF16, {kGdnValueRows, t});
+                Tensor z(z_out.p, DType::BF16, {kGdnZRows, t});
                 Tensor tq(query.p, DType::BF16, {kGdnKeyRows, t});
                 Tensor tk(key.p, DType::BF16, {kGdnKeyRows, t});
                 Tensor tv(value_out.p, DType::BF16, {kGdnValueRows, t});
@@ -258,7 +265,7 @@ int main(int argc, char** argv) {
                 Tensor states(conv_states.p, DType::BF16, {kGdnRows, 3, kGdnSlots});
                 Tensor initial(initial_slot.p, DType::I32, {1});
                 const auto production = [&](cudaStream_t launch_stream) {
-                    ops::gdn_input_proj(x, qk_weight.weight, value_weight.weight, out,
+                    ops::gdn_input_proj(x, qk_weight.weight, value_z_weight.weight, out, z,
                                         launch_stream);
                 };
                 append_result(results, "gdn", "production_direct", t,
@@ -266,15 +273,15 @@ int main(int argc, char** argv) {
                                                          options.repeat));
                 if (t <= 6) {
                     const auto fused_snapshot = [&](cudaStream_t launch_stream) {
-                        ops::gdn_input_proj_conv_snapshot(x, qk_weight.weight, value_weight.weight,
-                                                          conv_w, states, initial, tq, tk, tv,
-                                                          workspace, launch_stream);
+                        ops::gdn_input_proj_conv_snapshot(
+                            x, qk_weight.weight, value_z_weight.weight, conv_w, states, initial, tq,
+                            tk, tv, z, workspace, launch_stream);
                     };
                     append_result(results, "gdn", "fused_projection_conv_snapshot", t,
                                   bench::measure_cold_launch(fused_snapshot, flush, stream,
                                                              options.warmup, options.repeat));
                     const auto composed_snapshot = [&](cudaStream_t launch_stream) {
-                        ops::gdn_input_proj(x, qk_weight.weight, value_weight.weight, out,
+                        ops::gdn_input_proj(x, qk_weight.weight, value_z_weight.weight, out, z,
                                             launch_stream);
                         ops::causal_conv1d_silu_snapshot(out, conv_w, states, initial, convolved,
                                                          launch_stream);
@@ -289,7 +296,8 @@ int main(int argc, char** argv) {
                 if (t <= 16) {
                     const auto projections = [&](cudaStream_t launch_stream) {
                         ops::linear(x, qk_weight.weight, qk, launch_stream);
-                        ops::linear(x, value_weight.weight, value, launch_stream);
+                        ops::linear(x, value_weight, value, launch_stream);
+                        ops::linear(x, z_weight, z, launch_stream);
                     };
                     append_result(results, "gdn", "control_projection_only", t,
                                   bench::measure_cold_launch(projections, flush, stream,

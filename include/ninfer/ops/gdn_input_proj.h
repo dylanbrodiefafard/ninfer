@@ -1,6 +1,6 @@
 #pragma once
 
-// ninfer::ops - fused GDN Q/K/V input projections into one contiguous output.
+// ninfer::ops - fused GDN Q/K/V/Z input projections.
 
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -16,29 +16,30 @@ namespace ninfer::ops {
  * Op: gdn_input_proj
  *
  * Math / indexing:
- *   qkv[:,t] = concat(qk_weight * x[:,t], v_weight * x[:,t]) for every token t.
+ *   qkv[:,t] = concat(qk_weight * x[:,t], value_z_weight[0:6144,:] * x[:,t])
+ *   z[:,t]   = value_z_weight[6144:12288,:] * x[:,t]
  *
  * Logical shapes:
- *   x [5120,T], qk weight/output rows 4096, v weight/output rows 6144, qkv [10240,T].
- *   T may be any positive value.
- *   x and qkv are contiguous BF16. qk_weight is Q4G64_F16S RowSplit [4096,5120] and
- *   v_weight is Q5G64_F16S RowSplit [6144,5120], both with FP16 scales.
+ *   x [5120,T], qk weight/output rows 4096, value/z rows 6144 each, qkv [10240,T],
+ *   z [6144,T]. T may be any positive value. x, qkv, and z are contiguous BF16.
+ *   qk_weight is Q4G64_F16S RowSplit [4096,5120] and value_z_weight is one
+ *   Q5G64_F16S RowSplit parent [12288,5120] in [value,z] row order, both with FP16 scales.
  *
  * Numeric:
- *   The oracle exact-decodes both weights and evaluates both projections naively in FP64 from the
- *   represented input. The BF16 qkv output is promoted and compared directly with those ideal
- *   values; final output storage rounding belongs to GdnInputProj's named A16 criterion, not the
- *   oracle. Production routes may choose their private precision independently; every registered
- *   route writes the final qkv allocation directly.
+ *   The oracle exact-decodes both weight parents and evaluates all four logical projections
+ *   naively in FP64 from the represented input. The BF16 qkv and z outputs are promoted and
+ *   compared directly with those ideal values; final output storage rounding belongs to
+ *   GdnInputProj's named A16 criterion, not the oracle. Production routes may choose their
+ *   private precision independently; every registered route writes both final allocations.
  *
  * Effects:
- *   Writes the full qkv output; inputs and output must not alias.
+ *   Writes the full qkv and z outputs; inputs and outputs must not alias.
  *
  * Workspace:
  *   No transient bytes are required.
  */
-void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& v_weight, Tensor& qkv,
-                    cudaStream_t stream);
+void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                    Tensor& qkv, Tensor& z, cudaStream_t stream);
 
 /**
  * Qwen3.6-35B W8 specialization. The one W8G32_F16S RowSplit parent has shape [12288,2048]
@@ -65,33 +66,35 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  * Op: gdn_input_proj_conv_snapshot
  *
  * Math / indexing:
- *   Let p[:,t] be concat(qk_weight*x[:,t], value_weight*x[:,t]). Starting from the BF16
- *   width-three history selected by device I32 initial_slot, evaluate the width-four depthwise
- *   convolution over p, apply SiLU, and write its three channel ranges directly to query, key,
- *   and value. After token t, write the resulting width-three projection history to state slot t.
+ *   Let p[:,t] be concat(qk_weight*x[:,t], value_z_weight[0:6144,:]*x[:,t]) and
+ *   z[:,t] = value_z_weight[6144:12288,:]*x[:,t]. Starting from the BF16 width-three history
+ *   selected by device I32 initial_slot, evaluate the width-four depthwise convolution over p,
+ *   apply SiLU, and write its three channel ranges directly to query, key, and value. After token
+ *   t, write the resulting width-three projection history to state slot t. Z bypasses convolution.
  *
  * Logical shapes:
- *   The 27B registered form has x [5120,T], Q4 q/k weight [4096,5120], Q5 value weight
- *   [6144,5120], conv_weight [10240,4], conv_states [10240,3,Slots], query/key [2048,T],
- *   and value [6144,T]. T is positive, Slots>=T, and the device initial_slot value is in
- *   [0,Slots).
+ *   The 27B registered form has x [5120,T], Q4 q/k weight [4096,5120], one Q5 value/z parent
+ *   [12288,5120], conv_weight [10240,4], conv_states [10240,3,Slots], query/key [2048,T],
+ *   value [6144,T], and z [6144,T]. T is positive, Slots>=T, and the device initial_slot value
+ *   is in [0,Slots).
  *
  * Numeric:
- *   The oracle exact-decodes packed weights and evaluates projection, convolution, SiLU, and every
- *   snapshot value naively in FP64 from represented inputs. BF16 query/key/value and snapshots are
- *   promoted and compared directly with those ideal values; their final storage rounding belongs
- *   to the Op's named A16 criterion, not the oracle. Former unfused qkv tensors are not observable
- *   cast boundaries; production routes use their natural private accumulator and staging
- *   precision. Activation values are not quantized.
+ *   The oracle exact-decodes packed weights and evaluates projection, convolution, SiLU, z, and
+ *   every snapshot value naively in FP64 from represented inputs. BF16 query/key/value/z and
+ *   snapshots are promoted and compared directly with those ideal values; their final storage
+ *   rounding belongs to the Op's named A16 criterion, not the oracle. Former unfused projection
+ *   tensors are not observable cast boundaries; production routes use their natural private
+ *   accumulator and staging precision. Activation values are not quantized.
  *
  * Effects:
- *   Writes query/key/value and state slots [0,T); other slots are unchanged. Newly projected
- *   values remain private to the current call while each published snapshot is BF16.
+ *   Writes query/key/value/z and state slots [0,T); other slots are unchanged. Newly projected
+ *   convolution channels remain private to the current call while each published snapshot is
+ *   BF16.
  */
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
-                                  const Weight& value_weight, const Tensor& conv_weight,
+                                  const Weight& value_z_weight, const Tensor& conv_weight,
                                   Tensor& conv_states, const Tensor& initial_slot, Tensor& query,
-                                  Tensor& key, Tensor& value, WorkspaceArena& ws,
+                                  Tensor& key, Tensor& value, Tensor& z, WorkspaceArena& ws,
                                   cudaStream_t stream);
 
 /**

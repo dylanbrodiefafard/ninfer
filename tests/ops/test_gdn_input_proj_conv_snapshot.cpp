@@ -171,10 +171,11 @@ int verify_snapshot_outputs(std::string_view suffix, const GuardedBf16Tensor& qu
     return failures;
 }
 
-int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_weight,
+int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_weight,
                    std::int32_t tokens, std::int32_t initial_slot) {
     constexpr std::int32_t kHidden      = 5120;
     constexpr std::int32_t kValueRows   = 6144;
+    constexpr std::int32_t kZRows       = 6144;
     constexpr std::int32_t kChannels    = 10240;
     const std::int32_t slots            = std::max(tokens + 2, initial_slot + 1);
     const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 601U + tokens);
@@ -193,6 +194,7 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_weig
     GuardedBf16Tensor query(kQueryRows, tokens);
     GuardedBf16Tensor key(kKeyRows, tokens);
     GuardedBf16Tensor value(kValueRows, tokens);
+    GuardedBf16Tensor z(kZRows, tokens);
     Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
     Tensor conv(device_conv_weight.p, DType::BF16, {kChannels, 4});
     Tensor conv_state(state.data(), DType::BF16, {kChannels, 3, slots});
@@ -200,12 +202,13 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_weig
     Tensor q                          = query.tensor();
     Tensor k                          = key.tensor();
     Tensor v                          = value.tensor();
+    Tensor z_output                   = z.tensor();
     const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         kQueryRows, kKeyRows, kValueRows, tokens, tokens);
     WorkspaceArena workspace(std::max<std::size_t>(1, workspace_bytes));
 
-    ops::gdn_input_proj_conv_snapshot(x, query_key.view(), value_weight.view(), conv, conv_state,
-                                      initial, q, k, v, workspace, nullptr);
+    ops::gdn_input_proj_conv_snapshot(x, query_key.view(), value_z_weight.view(), conv, conv_state,
+                                      initial, q, k, v, z_output, workspace, nullptr);
     cuda_synchronize();
 
     const std::size_t initial_base = static_cast<std::size_t>(initial_slot) * 3 * kChannels;
@@ -218,7 +221,7 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_weig
             if (row < kQueryRows + kKeyRows) {
                 return quantized_weight::dot_fp64(query_key.host, row, token_activation, kHidden);
             }
-            return quantized_weight::dot_fp64(value_weight.host, row - kQueryRows - kKeyRows,
+            return quantized_weight::dot_fp64(value_z_weight.host, row - kQueryRows - kKeyRows,
                                               token_activation, kHidden);
         });
     const std::vector<std::uint16_t> state_after = state.bits();
@@ -231,12 +234,18 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_weig
     failures += state.verify_guards("snapshot state" + suffix);
     failures += verify_state_effects("snapshot state" + suffix, state_before, state_after,
                                      kChannels, tokens, slots);
+    failures += z.verify_guards("snapshot z" + suffix);
+    failures += z.verify_fully_written("snapshot z" + suffix);
+    failures += compare(
+        "snapshot z" + suffix, gather_rows(z.values(), kZRows, 0, kZRows, tokens),
+        projection_oracle(value_z_weight.host, kValueRows, kZRows, activation, kHidden, tokens),
+        kGdnInputProjConvSnapshotA16Tolerance);
     failures += verify_preserved("snapshot x" + suffix, device_activation, activation_bits);
     failures +=
         verify_preserved("snapshot conv weight" + suffix, device_conv_weight, conv_weight_bits);
     failures += verify_preserved("snapshot initial slot" + suffix, device_initial, initial_value);
     failures += query_key.verify_preserved("snapshot query/key weight" + suffix);
-    failures += value_weight.verify_preserved("snapshot value weight" + suffix);
+    failures += value_z_weight.verify_preserved("snapshot value/z weight" + suffix);
     if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
         std::cerr << "snapshot" << suffix << ": workspace query/execution high-water mismatch\n";
         ++failures;
@@ -248,13 +257,13 @@ int run_q4_q5() {
     constexpr std::int32_t kHidden = 5120;
     DevicePackedWeight query_key(
         quantized_weight::make_patterned_weight(QType::Q4G64_F16S, 4096, kHidden, 617U));
-    DevicePackedWeight value_weight(
-        quantized_weight::make_patterned_weight(QType::Q5G64_F16S, 6144, kHidden, 619U));
+    DevicePackedWeight value_z_weight(
+        quantized_weight::make_patterned_weight(QType::Q5G64_F16S, 12288, kHidden, 619U));
     int failures = 0;
     // Representative registered T values around every current execution boundary.
     for (const std::int32_t tokens : {1, 4, 5, 7}) {
         const std::int32_t initial_slot = tokens == 5 ? 0 : tokens + 1;
-        failures += run_q4_q5_case(query_key, value_weight, tokens, initial_slot);
+        failures += run_q4_q5_case(query_key, value_z_weight, tokens, initial_slot);
     }
     return failures;
 }

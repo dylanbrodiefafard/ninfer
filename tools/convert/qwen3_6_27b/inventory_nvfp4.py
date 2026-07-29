@@ -52,7 +52,7 @@ def _replacement_format(name: str, original: str) -> str:
     parts = name.split("/")
     layer = int(parts[2])
     suffix = "/".join(parts[3:])
-    if suffix in ("attention/query_key", "attention/gate_value"):
+    if suffix == "attention/query_key_gate_value":
         return (
             BF16
             if layer in EARLY_ATTENTION_INPUT_LAYERS
@@ -60,7 +60,7 @@ def _replacement_format(name: str, original: str) -> str:
         )
     if suffix == "attention/output":
         return BF16 if layer in BF16_ATTENTION_OUTPUT_LAYERS else NVFP4
-    if suffix in ("gdn/query_key", "gdn/value_z"):
+    if suffix == "gdn/query_key_value_z":
         return NVFP4
     if suffix == "gdn/output":
         return BF16 if layer in BF16_GDN_OUTPUT_LAYERS else NVFP4
@@ -83,11 +83,11 @@ def _input_scale_after(spec: TensorSpec) -> str | None:
     if spec.format != NVFP4:
         return None
     prefix, suffix = spec.name.rsplit("/", 1)
-    if suffix == "gate_value" and prefix.endswith("/attention"):
+    if suffix == "query_key_gate_value" and prefix.endswith("/attention"):
         return prefix + "/input_projection/input_scale_divisor"
     if suffix == "output" and prefix.endswith("/attention"):
         return prefix + "/output_projection/input_scale_divisor"
-    if suffix == "value_z" and prefix.endswith("/gdn"):
+    if suffix == "query_key_value_z" and prefix.endswith("/gdn"):
         return prefix + "/input_projection/input_scale_divisor"
     if suffix == "output" and prefix.endswith("/gdn"):
         return prefix + "/output_projection/input_scale_divisor"
@@ -101,6 +101,31 @@ def _input_scale_after(spec: TensorSpec) -> str | None:
 def _build_text_core_specs() -> tuple[TensorSpec, ...]:
     specs: list[TensorSpec] = []
     for original in base.TEXT_CORE_TENSOR_SPECS:
+        if original.name.endswith("/attention/query_key"):
+            name = original.name.removesuffix("query_key") + "query_key_gate_value"
+            spec = _tensor(name, (14336, 5120), _replacement_format(name, original.format))
+            specs.append(spec)
+            scalar_name = _input_scale_after(spec)
+            if scalar_name is not None:
+                specs.append(_tensor(scalar_name, (), FP32))
+            continue
+        if original.name.endswith("/attention/gate_value"):
+            continue
+        if original.name.endswith("/gdn/query_key"):
+            name = original.name.removesuffix("query_key") + "query_key_value_z"
+            spec = _tensor(name, (16384, 5120), NVFP4)
+            specs.append(spec)
+            specs.append(
+                _tensor(
+                    name.removesuffix("query_key_value_z")
+                    + "input_projection/input_scale_divisor",
+                    (),
+                    FP32,
+                )
+            )
+            continue
+        if original.name.endswith("/gdn/value_z"):
+            continue
         numeric_format = _replacement_format(original.name, original.format)
         spec = _tensor(original.name, original.shape, numeric_format)
         specs.append(spec)
@@ -134,7 +159,72 @@ LAYOUT_COUNTS = {
     for layout in LAYOUT_NAMES
 }
 
-LOGICAL_ROW_VIEW_SPECS = base.LOGICAL_ROW_VIEW_SPECS
+LOGICAL_ROW_VIEW_SPECS = (
+    base.LogicalRowViewSpec(
+        "text/layers/{l}/attention/query",
+        "text/layers/{l}/attention/query_key_gate_value",
+        0,
+        6144,
+        (6144, 5120),
+        FULL_ATTENTION_LAYERS,
+    ),
+    base.LogicalRowViewSpec(
+        "text/layers/{l}/attention/key",
+        "text/layers/{l}/attention/query_key_gate_value",
+        6144,
+        7168,
+        (1024, 5120),
+        FULL_ATTENTION_LAYERS,
+    ),
+    base.LogicalRowViewSpec(
+        "text/layers/{l}/attention/output_gate",
+        "text/layers/{l}/attention/query_key_gate_value",
+        7168,
+        13312,
+        (6144, 5120),
+        FULL_ATTENTION_LAYERS,
+    ),
+    base.LogicalRowViewSpec(
+        "text/layers/{l}/attention/value",
+        "text/layers/{l}/attention/query_key_gate_value",
+        13312,
+        14336,
+        (1024, 5120),
+        FULL_ATTENTION_LAYERS,
+    ),
+    base.LogicalRowViewSpec(
+        "text/layers/{l}/gdn/query",
+        "text/layers/{l}/gdn/query_key_value_z",
+        0,
+        2048,
+        (2048, 5120),
+        GDN_LAYERS,
+    ),
+    base.LogicalRowViewSpec(
+        "text/layers/{l}/gdn/key",
+        "text/layers/{l}/gdn/query_key_value_z",
+        2048,
+        4096,
+        (2048, 5120),
+        GDN_LAYERS,
+    ),
+    base.LogicalRowViewSpec(
+        "text/layers/{l}/gdn/value",
+        "text/layers/{l}/gdn/query_key_value_z",
+        4096,
+        10240,
+        (6144, 5120),
+        GDN_LAYERS,
+    ),
+    base.LogicalRowViewSpec(
+        "text/layers/{l}/gdn/z",
+        "text/layers/{l}/gdn/query_key_value_z",
+        10240,
+        16384,
+        (6144, 5120),
+        GDN_LAYERS,
+    ),
+) + base.LOGICAL_ROW_VIEW_SPECS[8:]
 ALIAS_SPECS = base.ALIAS_SPECS
 
 NVFP4_TENSOR_SPECS = tuple(
@@ -159,23 +249,23 @@ def validate_inventory() -> None:
         len(OBJECT_SPECS),
         len(NVFP4_TENSOR_SPECS),
         len(INPUT_SCALE_DIVISOR_SPECS),
-    ) != (1018, 2, 12, 333, 1365, 1371, 305, 247):
+    ) != (954, 2, 12, 333, 1301, 1307, 247, 247):
         raise ValueError("registered NVFP4 inventory is incomplete")
     if FORMAT_COUNTS != {
-        BF16: 597,
+        BF16: 591,
         FP32: 343,
         I32: 1,
         Q4: 55,
         Q5: 54,
         Q6: 3,
         W8: 7,
-        NVFP4: 305,
+        NVFP4: 247,
     }:
         raise ValueError(f"unexpected NVFP4 format allocation: {FORMAT_COUNTS}")
     if LAYOUT_COUNTS != {
-        CONTIGUOUS_LAYOUT: 941,
+        CONTIGUOUS_LAYOUT: 935,
         ROW_SPLIT_LAYOUT: 119,
-        BLOCK_SCALE_LAYOUT: 305,
+        BLOCK_SCALE_LAYOUT: 247,
     }:
         raise ValueError(f"unexpected NVFP4 layout allocation: {LAYOUT_COUNTS}")
 

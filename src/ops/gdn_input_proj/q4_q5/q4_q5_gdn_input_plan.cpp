@@ -38,8 +38,8 @@ constexpr bool catalog_is_closed() noexcept {
 static_assert(catalog_is_closed(), "GDN input routes must be exact and closed");
 
 bool supported_shape(const Q4Q5GdnInputProblem& problem) noexcept {
-    return problem.input_rows == 5120 && problem.qk_rows == 4096 && problem.value_rows == 6144 &&
-           problem.output_rows == 10240 && problem.padded_k == 5120;
+    return problem.input_rows == 5120 && problem.qk_rows == 4096 && problem.value_z_rows == 12288 &&
+           problem.qkv_rows == 10240 && problem.z_rows == 6144 && problem.padded_k == 5120;
 }
 
 } // namespace
@@ -72,10 +72,11 @@ Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem
 }
 
 void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
-                                  const Weight& qk_weight, const Weight& v_weight, Tensor& qkv,
-                                  cudaStream_t stream) {
-    const Q4Q5GdnInputProblem problem{
-        x.ne[0], qk_weight.n, v_weight.n, qkv.ne[0], qk_weight.padded_shape[1], x.ne[1]};
+                                  const Weight& qk_weight, const Weight& value_z_weight,
+                                  Tensor& qkv, Tensor& z, cudaStream_t stream) {
+    const Q4Q5GdnInputProblem problem{x.ne[0],   qk_weight.n, value_z_weight.n,
+                                      qkv.ne[0], z.ne[0],     qk_weight.padded_shape[1],
+                                      x.ne[1]};
     const Q4Q5GdnInputPlan resolved = q4_q5_gdn_input_resolve_plan(problem);
     if (resolved.schedule != plan.schedule) {
         throw std::invalid_argument("Q4/Q5 GDN input: plan does not match exact problem");
@@ -84,23 +85,25 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
     switch (plan.schedule) {
     case Q4Q5GdnInputScheduleId::IndependentDirectFixed: {
         Tensor qk    = qkv.slice(0, 0, problem.qk_rows);
-        Tensor value = qkv.slice(0, problem.qk_rows, problem.value_rows);
-        q4_q5_gdn_input_independent_launch(x, qk_weight, v_weight, qk, value, stream);
+        Tensor value = qkv.slice(0, problem.qk_rows, problem.z_rows);
+        q4_q5_gdn_input_independent_launch(x, qk_weight, value_z_weight, qk, value, z, stream);
         return;
     }
     case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128:
-        q4_q5_gdn_input_grouped_mma_launch(x, qk_weight, v_weight, qkv, stream);
+        q4_q5_gdn_input_grouped_mma_launch(x, qk_weight, value_z_weight, qkv, z, stream);
         return;
     }
     throw std::logic_error("Q4/Q5 GDN input: unknown schedule");
 }
 
-void q4_q5_gdn_input_dispatch(const Tensor& x, const Weight& qk_weight, const Weight& v_weight,
-                              Tensor& qkv, cudaStream_t stream) {
-    const Q4Q5GdnInputProblem problem{
-        x.ne[0], qk_weight.n, v_weight.n, qkv.ne[0], qk_weight.padded_shape[1], x.ne[1]};
+void q4_q5_gdn_input_dispatch(const Tensor& x, const Weight& qk_weight,
+                              const Weight& value_z_weight, Tensor& qkv, Tensor& z,
+                              cudaStream_t stream) {
+    const Q4Q5GdnInputProblem problem{x.ne[0],   qk_weight.n, value_z_weight.n,
+                                      qkv.ne[0], z.ne[0],     qk_weight.padded_shape[1],
+                                      x.ne[1]};
     const Q4Q5GdnInputPlan plan = q4_q5_gdn_input_resolve_plan(problem);
-    q4_q5_gdn_input_execute_plan(plan, x, qk_weight, v_weight, qkv, stream);
+    q4_q5_gdn_input_execute_plan(plan, x, qk_weight, value_z_weight, qkv, z, stream);
 }
 
 } // namespace ninfer::ops::detail

@@ -15,9 +15,11 @@
 namespace ninfer::ops::detail {
 namespace {
 
-constexpr std::int32_t kQkRows    = 4096;
-constexpr std::int32_t kValueRows = 6144;
-constexpr std::int32_t kHidden    = 5120;
+constexpr std::int32_t kQkRows     = 4096;
+constexpr std::int32_t kValueRows  = 6144;
+constexpr std::int32_t kZRows      = 6144;
+constexpr std::int32_t kValueZRows = kValueRows + kZRows;
+constexpr std::int32_t kHidden     = 5120;
 
 using Q4GdnSimtR8C4Schedule = Q4RowSplitSimtGemmSchedule<8, 4, 16, 2, Cache::ca, 1>;
 using Q4GdnSimtR8C8Schedule = Q4RowSplitSimtGemmSchedule<8, 8, 16, 2, Cache::ca, 1>;
@@ -74,83 +76,92 @@ void launch_q4(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t 
     throw std::invalid_argument("Q4/Q5 GDN independent launch requires T in [1,16]");
 }
 
-void launch_q5_gemv(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    q5_rowsplit_gemv_launch_kernel<kValueRows, kHidden, 16, 2, true>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const std::uint8_t*>(weight.qhigh),
-        static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(out.data),
-        stream);
+void launch_q5_gemv(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
+                    cudaStream_t stream) {
+    constexpr int kRowsPerBlock = 16;
+    constexpr int kThreads      = kRowsPerBlock * 32;
+    q5_rowsplit_gemv_kernel<kValueZRows, kHidden, kRowsPerBlock, 2, true, false, true, kValueRows>
+        <<<kValueZRows / kRowsPerBlock, kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.qhigh),
+            static_cast<const std::uint8_t*>(weight.scales),
+            static_cast<__nv_bfloat16*>(value.data), static_cast<__nv_bfloat16*>(z.data));
     CUDA_CHECK(cudaGetLastError());
 }
 
 template <int Cols>
-void launch_q5_split4(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+void launch_q5_split4(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
+                      cudaStream_t stream) {
     constexpr int kThreads    = 4 * 32;
-    const std::int32_t out_ld = static_cast<std::int32_t>(out.nb[1] / sizeof(__nv_bfloat16));
-    const dim3 grid(static_cast<unsigned>(kValueRows), 1u, 1u);
-    q5_rowsplit_gemm_simt_split4_kernel<Q5RowSplitSimtSchedule, Cols, 5, kHidden>
+    const std::int32_t out_ld = static_cast<std::int32_t>(value.nb[1] / sizeof(__nv_bfloat16));
+    const dim3 grid(static_cast<unsigned>(kValueZRows), 1u, 1u);
+    q5_rowsplit_gemm_simt_split4_kernel<Q5RowSplitSimtSchedule, Cols, 5, kHidden, true, kValueRows>
         <<<grid, kThreads, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
                                         static_cast<const std::uint8_t*>(weight.qdata),
                                         static_cast<const std::uint8_t*>(weight.qhigh),
                                         static_cast<const std::uint8_t*>(weight.scales),
-                                        static_cast<__nv_bfloat16*>(out.data), nullptr, kValueRows,
-                                        out_ld, kHidden, Cols, weight.padded_shape[1], 5);
+                                        static_cast<__nv_bfloat16*>(value.data),
+                                        static_cast<__nv_bfloat16*>(z.data), kValueZRows, out_ld,
+                                        kHidden, Cols, weight.padded_shape[1], 5);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_q5_split4_exact(const Tensor& x, const Weight& weight, Tensor& out,
+void launch_q5_split4_exact(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
                             cudaStream_t stream) {
     switch (x.ne[1]) {
     case 2:
-        launch_q5_split4<2>(x, weight, out, stream);
+        launch_q5_split4<2>(x, weight, value, z, stream);
         return;
     case 3:
-        launch_q5_split4<3>(x, weight, out, stream);
+        launch_q5_split4<3>(x, weight, value, z, stream);
         return;
     case 4:
-        launch_q5_split4<4>(x, weight, out, stream);
+        launch_q5_split4<4>(x, weight, value, z, stream);
         return;
     case 5:
-        launch_q5_split4<5>(x, weight, out, stream);
+        launch_q5_split4<5>(x, weight, value, z, stream);
         return;
     case 6:
-        launch_q5_split4<6>(x, weight, out, stream);
+        launch_q5_split4<6>(x, weight, value, z, stream);
         return;
     default:
         throw std::invalid_argument("GDN Q5 split4 requires T in [2,6]");
     }
 }
 
-void launch_q5_simt_r8_c8(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+void launch_q5_simt_r8_c8(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
+                          cudaStream_t stream) {
     constexpr int kColsPerTile  = 8;
     constexpr int kRowsPerBlock = 8;
     constexpr int kStages       = 2;
     constexpr int kThreads      = kRowsPerBlock * 32;
     const std::int32_t cols     = x.ne[1];
-    const std::int32_t out_ld   = static_cast<std::int32_t>(out.nb[1] / sizeof(__nv_bfloat16));
-    const dim3 grid(static_cast<unsigned>(div_up(kValueRows, kRowsPerBlock)),
+    const std::int32_t out_ld   = static_cast<std::int32_t>(value.nb[1] / sizeof(__nv_bfloat16));
+    const dim3 grid(static_cast<unsigned>(div_up(kValueZRows, kRowsPerBlock)),
                     static_cast<unsigned>(div_up(cols, kColsPerTile)), 1u);
-    q5_rowsplit_gemm_simt_kernel<Q5RowSplitSimtSchedule, kColsPerTile, kRowsPerBlock, kStages>
-        <<<grid, kThreads, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
-                                        static_cast<const std::uint8_t*>(weight.qdata),
-                                        static_cast<const std::uint8_t*>(weight.qhigh),
-                                        static_cast<const std::uint8_t*>(weight.scales),
-                                        static_cast<__nv_bfloat16*>(out.data), nullptr, kValueRows,
-                                        out_ld, kHidden, cols, weight.padded_shape[1], 5);
+    q5_rowsplit_gemm_simt_kernel<Q5RowSplitSimtSchedule, kColsPerTile, kRowsPerBlock, kStages, true,
+                                 kValueRows><<<grid, kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.qhigh),
+        static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(value.data),
+        static_cast<__nv_bfloat16*>(z.data), kValueZRows, out_ld, kHidden, cols,
+        weight.padded_shape[1], 5);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_q5(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+void launch_q5(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
+               cudaStream_t stream) {
     if (x.ne[1] == 1) {
-        launch_q5_gemv(x, weight, out, stream);
+        launch_q5_gemv(x, weight, value, z, stream);
         return;
     }
     if (x.ne[1] <= 6) {
-        launch_q5_split4_exact(x, weight, out, stream);
+        launch_q5_split4_exact(x, weight, value, z, stream);
         return;
     }
     if (x.ne[1] <= 16) {
-        launch_q5_simt_r8_c8(x, weight, out, stream);
+        launch_q5_simt_r8_c8(x, weight, value, z, stream);
         return;
     }
     throw std::invalid_argument("Q4/Q5 GDN independent launch requires T in [1,16]");
@@ -159,10 +170,10 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t 
 } // namespace
 
 void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight,
-                                        const Weight& v_weight, Tensor& qk, Tensor& value,
-                                        cudaStream_t stream) {
+                                        const Weight& value_z_weight, Tensor& qk, Tensor& value,
+                                        Tensor& z, cudaStream_t stream) {
     launch_q4(x, qk_weight, qk, stream);
-    launch_q5(x, v_weight, value, stream);
+    launch_q5(x, value_z_weight, value, z, stream);
 }
 
 } // namespace ninfer::ops::detail

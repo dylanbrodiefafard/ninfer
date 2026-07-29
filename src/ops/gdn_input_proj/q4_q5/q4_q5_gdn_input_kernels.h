@@ -7,16 +7,17 @@
 namespace ninfer::ops::detail {
 
 void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight,
-                                        const Weight& v_weight, Tensor& qk, Tensor& value,
-                                        cudaStream_t stream);
+                                        const Weight& value_z_weight, Tensor& qk, Tensor& value,
+                                        Tensor& z, cudaStream_t stream);
 
 void q4_q5_gdn_input_grouped_mma_launch(const Tensor& x, const Weight& qk_weight,
-                                        const Weight& v_weight, Tensor& qkv, cudaStream_t stream);
+                                        const Weight& value_z_weight, Tensor& qkv, Tensor& z,
+                                        cudaStream_t stream);
 
 void q4_q5_gdn_input_conv_snapshot_launch(const Tensor& x, const Weight& qk_weight,
-                                          const Weight& v_weight, const Tensor& conv_weight,
+                                          const Weight& value_z_weight, const Tensor& conv_weight,
                                           Tensor& conv_states, const Tensor& initial_slot,
-                                          Tensor& query, Tensor& key, Tensor& value,
+                                          Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                           cudaStream_t stream);
 
 void q4_q5_gdn_input_t4_post_snapshot_launch(const Tensor& projected, const Tensor& conv_weight,

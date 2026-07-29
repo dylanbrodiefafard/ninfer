@@ -159,9 +159,6 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
                               weights.dt_bias, workspace, hidden, g, beta, stream);
 }
 
-void Variant::gdn_output_gate_projection(const Tensor&, const GdnProjectionWeights&, Tensor&,
-                                         cudaStream_t) {}
-
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          WorkspaceArena& workspace, cudaStream_t stream) {
     run_sparse_moe(hidden, weights.op, residual, workspace, stream);

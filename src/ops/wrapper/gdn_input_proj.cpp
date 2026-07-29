@@ -127,19 +127,23 @@ SnapshotWorkspace allocate_snapshot_workspace(Allocator& allocator, std::int32_t
 
 } // namespace
 
-void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& v_weight, Tensor& qkv,
-                    cudaStream_t stream) {
-    constexpr std::int32_t kHidden = 5120;
-    constexpr std::int32_t kQkRows = 4096;
-    constexpr std::int32_t kVRows  = 6144;
-    constexpr std::int32_t kRows   = kQkRows + kVRows;
-    const std::int32_t cols        = x.ne[1];
+void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                    Tensor& qkv, Tensor& z, cudaStream_t stream) {
+    constexpr std::int32_t kHidden     = 5120;
+    constexpr std::int32_t kQkRows     = 4096;
+    constexpr std::int32_t kValueRows  = 6144;
+    constexpr std::int32_t kZRows      = 6144;
+    constexpr std::int32_t kQkvRows    = kQkRows + kValueRows;
+    constexpr std::int32_t kParentRows = kValueRows + kZRows;
+    const std::int32_t cols            = x.ne[1];
+    if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
     require_matrix(x, kHidden, cols, "x");
-    require_matrix(qkv, kRows, cols, "qkv");
+    require_matrix(qkv, kQkvRows, cols, "qkv");
+    require_matrix(z, kZRows, cols, "z");
     require_rowsplit(qk_weight, QType::Q4G64_F16S, kQkRows, "qk weight");
-    require_rowsplit(v_weight, QType::Q5G64_F16S, kVRows, "value weight");
+    require_rowsplit(value_z_weight, QType::Q5G64_F16S, kParentRows, "value/z weight");
 
-    detail::q4_q5_gdn_input_dispatch(x, qk_weight, v_weight, qkv, stream);
+    detail::q4_q5_gdn_input_dispatch(x, qk_weight, value_z_weight, qkv, z, stream);
 }
 
 void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Tensor& qkv, Tensor& z,
@@ -187,38 +191,41 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(std::int32_t q
 }
 
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
-                                  const Weight& value_weight, const Tensor& conv_weight,
+                                  const Weight& value_z_weight, const Tensor& conv_weight,
                                   Tensor& conv_states, const Tensor& initial_slot, Tensor& query,
-                                  Tensor& key, Tensor& value, WorkspaceArena& ws,
+                                  Tensor& key, Tensor& value, Tensor& z, WorkspaceArena& ws,
                                   cudaStream_t stream) {
-    constexpr std::int32_t kHidden    = 5120;
-    constexpr std::int32_t kQueryRows = 2048;
-    constexpr std::int32_t kKeyRows   = 2048;
-    constexpr std::int32_t kValueRows = 6144;
-    constexpr std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
-    const std::int32_t tokens         = x.ne[1];
+    constexpr std::int32_t kHidden     = 5120;
+    constexpr std::int32_t kQueryRows  = 2048;
+    constexpr std::int32_t kKeyRows    = 2048;
+    constexpr std::int32_t kValueRows  = 6144;
+    constexpr std::int32_t kZRows      = 6144;
+    constexpr std::int32_t kChannels   = kQueryRows + kKeyRows + kValueRows;
+    constexpr std::int32_t kParentRows = kValueRows + kZRows;
+    const std::int32_t tokens          = x.ne[1];
     if (tokens <= 0) {
         throw std::invalid_argument("gdn_input_proj_conv_snapshot: T must be positive");
     }
     require_matrix(x, kHidden, tokens, "x");
     require_rowsplit(qk_weight, QType::Q4G64_F16S, kQueryRows + kKeyRows, "qk weight");
-    require_rowsplit(value_weight, QType::Q5G64_F16S, kValueRows, "value weight");
+    require_rowsplit(value_z_weight, QType::Q5G64_F16S, kParentRows, "value/z weight");
     require_snapshot_operands(conv_weight, conv_states, initial_slot, kChannels, tokens);
     require_matrix(query, kQueryRows, tokens, "query");
     require_matrix(key, kKeyRows, tokens, "key");
     require_matrix(value, kValueRows, tokens, "value");
+    require_matrix(z, kZRows, tokens, "z");
 
     const SnapshotRoute route = resolve_snapshot_route(true, tokens);
     if (route.workspace == SnapshotWorkspaceKind::None) {
-        detail::q4_q5_gdn_input_conv_snapshot_launch(x, qk_weight, value_weight, conv_weight,
+        detail::q4_q5_gdn_input_conv_snapshot_launch(x, qk_weight, value_z_weight, conv_weight,
                                                      conv_states, initial_slot, query, key, value,
-                                                     stream);
+                                                     z, stream);
         return;
     }
 
     auto scope                = ws.scope();
     SnapshotWorkspace scratch = allocate_snapshot_workspace(ws, kChannels, tokens, route.workspace);
-    gdn_input_proj(x, qk_weight, value_weight, scratch.projected, stream);
+    gdn_input_proj(x, qk_weight, value_z_weight, scratch.projected, z, stream);
     if (route.workspace == SnapshotWorkspaceKind::Projected) {
         detail::q4_q5_gdn_input_t4_post_snapshot_launch(scratch.projected, conv_weight, conv_states,
                                                         initial_slot, query, key, value, stream);

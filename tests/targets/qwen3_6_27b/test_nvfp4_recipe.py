@@ -27,19 +27,66 @@ def test_closed_allocation_inventory_and_site_coverage():
     assert inventory.GDN_LAYERS == GDN
     assert inventory.BF16_GDN_OUTPUT_LAYERS == (4,)
 
-    assert len(inventory.OBJECT_SPECS) == 1371
-    assert len(inventory.NVFP4_TENSOR_SPECS) == 305
+    assert len(inventory.OBJECT_SPECS) == 1307
+    assert len(inventory.NVFP4_TENSOR_SPECS) == 247
     assert len(inventory.INPUT_SCALE_DIVISOR_SPECS) == 247
     assert inventory.FORMAT_COUNTS == {
-        "BF16": 597,
+        "BF16": 591,
         "FP32": 343,
         "I32": 1,
         "Q4G64_F16S": 55,
         "Q5G64_F16S": 54,
         "Q6G64_F16S": 3,
         "W8G32_F16S": 7,
-        "NVFP4": 305,
+        "NVFP4": 247,
     }
+    tensors = {spec.name: spec for spec in inventory.TENSOR_SPECS}
+    assert tensors["text/layers/3/attention/query_key_gate_value"] == inventory.TensorSpec(
+        "text/layers/3/attention/query_key_gate_value",
+        (14336, 5120),
+        "BF16",
+        "contiguous-le-v1",
+    )
+    assert tensors["text/layers/27/attention/query_key_gate_value"] == inventory.TensorSpec(
+        "text/layers/27/attention/query_key_gate_value",
+        (14336, 5120),
+        "NVFP4",
+        "blockscale-k16-m128x4-v1",
+    )
+    assert tensors["text/layers/0/gdn/query_key_value_z"] == inventory.TensorSpec(
+        "text/layers/0/gdn/query_key_value_z",
+        (16384, 5120),
+        "NVFP4",
+        "blockscale-k16-m128x4-v1",
+    )
+    assert "text/layers/3/attention/query_key" not in tensors
+    assert "text/layers/3/attention/gate_value" not in tensors
+    assert "text/layers/0/gdn/query_key" not in tensors
+    assert "text/layers/0/gdn/value_z" not in tensors
+
+    views = {view.name_pattern: view for view in inventory.LOGICAL_ROW_VIEW_SPECS}
+    assert (
+        views["text/layers/{l}/attention/value"].parent_pattern,
+        views["text/layers/{l}/attention/value"].row_begin,
+        views["text/layers/{l}/attention/value"].row_end,
+    ) == ("text/layers/{l}/attention/query_key_gate_value", 13312, 14336)
+    assert (
+        views["text/layers/{l}/gdn/z"].parent_pattern,
+        views["text/layers/{l}/gdn/z"].row_begin,
+        views["text/layers/{l}/gdn/z"].row_end,
+    ) == ("text/layers/{l}/gdn/query_key_value_z", 10240, 16384)
+
+    assert convert_nvfp4.RECIPE_ID == "qwen3_6_27b_nvfp4-v1"
+
+
+def test_fused_text_attention_dispatch_does_not_capture_mtp_parent():
+    assert convert_nvfp4._is_fused_text_attention_parent(
+        "text/layers/3/attention/query_key_gate_value"
+    )
+    assert not convert_nvfp4._is_fused_text_attention_parent(
+        "mtp/layer/attention/query_key_gate_value"
+    )
+
 
 def test_input_divisor_materialization_preserves_positive_fp32_word():
     class Reader:

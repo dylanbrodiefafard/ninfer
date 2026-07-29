@@ -68,9 +68,6 @@ struct Variant {
                                             float eps, const GdnProjectionWeights& weights,
                                             Tensor& hidden, Tensor& g, Tensor& beta,
                                             WorkspaceArena& workspace, cudaStream_t stream);
-    static void gdn_output_gate_projection(const Tensor& hidden,
-                                           const GdnProjectionWeights& weights, Tensor& output_gate,
-                                           cudaStream_t stream);
     static void post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                            WorkspaceArena& workspace, cudaStream_t stream);
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,

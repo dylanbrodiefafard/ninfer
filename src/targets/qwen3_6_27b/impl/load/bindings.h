@@ -111,8 +111,7 @@ struct GdnProjectionPayload {
     Weight a_projection;
     Weight b_projection;
     Weight query_key;
-    Weight value;
-    Weight z;
+    Weight value_z;
 };
 
 struct MtpAttentionPayload {

@@ -132,8 +132,9 @@ void Variant::mtp_q_gate_projection(const Tensor& hidden,
 
 void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
                                    Tensor& qkv, Tensor& output_gate, cudaStream_t stream) {
-    (void)output_gate;
-    ops::gdn_input_proj(hidden, weights.query_key, weights.value, qkv, stream);
+    Tensor output_gate_flat =
+        output_gate.view({TextConfig::value_dim, static_cast<int>(hidden.ne[1])});
+    ops::gdn_input_proj(hidden, weights.query_key, weights.value_z, qkv, output_gate_flat, stream);
 }
 
 void Variant::gdn_input_projection_snapshot(const Tensor& hidden,
@@ -142,10 +143,11 @@ void Variant::gdn_input_projection_snapshot(const Tensor& hidden,
                                             const Tensor& initial_slot, Tensor& query, Tensor& key,
                                             Tensor& value, Tensor& output_gate,
                                             WorkspaceArena& workspace, cudaStream_t stream) {
-    (void)output_gate;
-    ops::gdn_input_proj_conv_snapshot(hidden, weights.query_key, weights.value, conv_weight,
-                                      conv_states, initial_slot, query, key, value, workspace,
-                                      stream);
+    Tensor output_gate_flat =
+        output_gate.view({TextConfig::value_dim, static_cast<int>(hidden.ne[1])});
+    ops::gdn_input_proj_conv_snapshot(hidden, weights.query_key, weights.value_z, conv_weight,
+                                      conv_states, initial_slot, query, key, value,
+                                      output_gate_flat, workspace, stream);
 }
 
 void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& norm_weight,
@@ -155,13 +157,6 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
     ops::gdn_norm_gating_proj(residual, norm_weight, eps, weights.a_projection,
                               weights.b_projection, weights.a_log, weights.dt_bias, workspace,
                               hidden, g, beta, stream);
-}
-
-void Variant::gdn_output_gate_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
-                                         Tensor& output_gate, cudaStream_t stream) {
-    Tensor output_gate_flat =
-        output_gate.view({TextConfig::value_dim, static_cast<int>(hidden.ne[1])});
-    ops::linear(hidden, weights.z, output_gate_flat, stream);
 }
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
