@@ -13,6 +13,7 @@ import torch
 
 from tools.artifact.container import (
     Artifact,
+    ArtifactIdentity,
     ResourceObject,
     TensorObject,
     object_alignment,
@@ -52,9 +53,11 @@ def _error(message: str) -> None:
 
 
 def validate_structure(artifact: Artifact) -> int:
-    if artifact.model_id != inventory.MODEL_ID:
+    expected_identity = ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID)
+    if artifact.identity != expected_identity:
         _error(
-            f"model_id is {artifact.model_id!r}, expected {inventory.MODEL_ID!r}"
+            f"artifact identity is {artifact.identity!r}, expected "
+            f"{expected_identity!r}"
         )
     if len(artifact.objects) != len(inventory.OBJECT_SPECS):
         _error(

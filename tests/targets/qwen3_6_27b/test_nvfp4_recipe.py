@@ -19,6 +19,8 @@ GDN = tuple(layer for layer in range(64) if layer not in FULL_ATTENTION)
 
 
 def test_closed_allocation_inventory_and_site_coverage():
+    assert inventory.MODEL_ID == "qwen3.6-27b"
+    assert inventory.WEIGHTS_ID == "nvfp4"
     assert inventory.FULL_ATTENTION_LAYERS == FULL_ATTENTION
     assert inventory.EARLY_ATTENTION_INPUT_LAYERS == EARLY_INPUT
     assert inventory.NVFP4_ATTENTION_INPUT_LAYERS == NVFP4_INPUT

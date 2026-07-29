@@ -3,7 +3,9 @@ library_name: ninfer
 pipeline_tag: image-text-to-text
 inference: false
 license: apache-2.0
-base_model: Qwen/Qwen3.6-27B
+base_model:
+  - Qwen/Qwen3.6-27B
+  - rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm
 base_model_relation: quantized
 tags:
   - ninfer
@@ -63,29 +65,28 @@ This model card is the version-controlled source for
 
 The repository contains
 [Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B) converted to the native
-[NInfer](https://github.com/Neroued/ninfer) `.ninfer` artifact format. The artifact is intended
-only for NInfer; it is not a Transformers checkpoint, Safetensors distribution, or GGUF file.
+[NInfer](https://github.com/Neroued/ninfer) `.ninfer` artifact format. The artifacts are intended
+only for NInfer; they are not Transformers checkpoints, Safetensors distributions, or GGUF files.
 
-## Artifact
+## Artifacts
 
-| Field | Value |
-|---|---|
-| Filename | `qwen3_6_27b.ninfer` |
-| Size | 17,495,365,888 bytes (16.29 GiB) |
-| SHA-256 | `74fac75f3a6b7ab7b52e08c36969c7a33a8ba23465910eccd72d195adb497127` |
-| Container version | 1 |
-| NInfer model ID | `qwen3.6-27b` |
-| NInfer target key | `qwen3_6_27b` |
+| Weights ID | Filename | Size | SHA-256 |
+|---|---|---:|---|
+| `groupwise-int` | `qwen3_6_27b.ninfer` | 17,495,365,888 bytes (16.29 GiB) | `7b51600ffd10632b9660f56085efdd9b751d79733ad32036a652234b64bebe7b` |
+| `nvfp4` | `qwen3_6_27b_nvfp4.ninfer` | 17,608,902,400 bytes (16.40 GiB) | `886144e76f3ab8a132555e40b7182af187d7a9aeab5cff56b41d7c6e43fb91e1` |
 
-The file contains the registered Text, Vision, MTP, proposal-head, tokenizer, chat-template,
-generation, and media-processor objects required by NInfer.
+Both files use container version 2, `model_id = qwen3.6-27b`, and target key
+`qwen3_6_27b`. Each contains the registered Text, Vision, MTP, proposal-head, tokenizer,
+chat-template, generation, and media-processor objects required by NInfer.
 
-Verify a downloaded file with:
+Verify downloaded files with:
 
 ```bash
 printf '%s  %s\n' \
-  '74fac75f3a6b7ab7b52e08c36969c7a33a8ba23465910eccd72d195adb497127' \
-  'qwen3_6_27b.ninfer' | sha256sum --check
+  '7b51600ffd10632b9660f56085efdd9b751d79733ad32036a652234b64bebe7b' \
+  'qwen3_6_27b.ninfer' \
+  '886144e76f3ab8a132555e40b7182af187d7a9aeab5cff56b41d7c6e43fb91e1' \
+  'qwen3_6_27b_nvfp4.ninfer' | sha256sum --check
 ```
 
 ## Requirements
@@ -118,7 +119,7 @@ For images, videos, structured chat history, and HTTP serving, see the
 
 ## Supported use
 
-The artifact supports:
+Both artifacts support:
 
 - text generation in thinking and non-thinking modes;
 - image, multi-image, video, and mixed multimodal messages;
@@ -202,7 +203,9 @@ These will be single-sample results under the stated NInfer evaluation profile, 
 |---|---|
 | Source repository | `Qwen/Qwen3.6-27B` |
 | Source revision | `6a9e13bd6fc8f0983b9b99948120bc37f49c13e9` |
-| Conversion recipe | `qwen3_6_27b-v2` |
+| NVFP4 source repository | `rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm` |
+| NVFP4 source revision | `9b5389d4a1e207daab2d47732efea57d7e946dcf` |
+| Conversion recipes | `qwen3_6_27b-v2`, `qwen3_6_27b_nvfp4-v1` |
 | Converter repository | `https://github.com/Neroued/ninfer` |
 | Converter revision | `d6319426e5ef08fa95c36e75cb3ab8b18e5fb957` |
 

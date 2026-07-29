@@ -1,6 +1,6 @@
-# NInfer Artifact Container Version 1
+# NInfer Artifact Container Version 2
 
-This reference defines the current `.ninfer` version-1 framing, embedded JSON object directory,
+This reference defines the current `.ninfer` version-2 framing, embedded JSON object directory,
 payload geometry, registries, and boundary between the generic reader and a registered model
 binder. Numeric formats are defined in [`tensor-formats.md`](tensor-formats.md), physical layouts
 in [`storage-layouts.md`](storage-layouts.md), and exact object inventories in the two target
@@ -19,7 +19,7 @@ tensor and required-resource payloads
 
 The artifact carries the information that a loader cannot recover from compiled model code:
 
-- exact `model_id`;
+- exact hierarchical `(model_id, weights_id)` identity;
 - persistent object names and kinds;
 - tensor shape, numeric format, and storage layout;
 - required-resource encoding;
@@ -33,7 +33,7 @@ The ownership boundary is:
 
 ```text
 .ninfer directory
-    what persistent objects exist and where their bytes are
+    which model/weight contract is stored, what persistent objects exist, and where their bytes are
 
 registered storage layout
     how one tensor payload maps to persistent logical words
@@ -48,7 +48,7 @@ conversion specification
 The directory removes the need to compile tensor names, file offsets, physical order, and stored
 lengths into C++. It does not make an unknown model executable.
 
-## 2. Version-1 framing
+## 2. Version-2 framing
 
 ### 2.1 File prefix
 
@@ -56,10 +56,10 @@ The prefix occupies exactly 16 bytes at file offset zero:
 
 | Offset | Size | Type | Field | Required value |
 |---:|---:|---|---|---|
-| 0 | 8 | bytes | `magic` | `4e 49 4e 46 45 52 00 01` |
+| 0 | 8 | bytes | `magic` | `4e 49 4e 46 45 52 00 02` |
 | 8 | 8 | little-endian `u64` | `json_bytes` | positive JSON byte length |
 
-The magic is ASCII `NINFER`, one zero byte, and framing revision `1`. A reader compares all eight
+The magic is ASCII `NINFER`, one zero byte, and framing revision `2`. A reader compares all eight
 bytes exactly.
 
 `json_bytes` counts only the JSON text. It excludes the prefix and following padding. A reader uses
@@ -77,7 +77,7 @@ The file must extend through `payload_offset`. Bytes in `[metadata_end, payload_
 with no loading semantics. A writer naturally emits them as zero; a reader need not inspect them.
 
 All object offsets in JSON are relative to `payload_offset`. The prefix contains no file size,
-flags, checksum, object count, target profile, directory offset, or extension area.
+flags, checksum, object count, identity fields, directory offset, or extension area.
 
 ## 3. JSON directory
 
@@ -87,15 +87,30 @@ The complete JSON value is one object with exactly two members:
 
 | Member | Type | Meaning |
 |---|---|---|
-| `model_id` | nonempty string | exact checkpoint-native model identity |
+| `identity` | object | exact hierarchical model and weights identity |
 | `objects` | nonempty array | tensor and required-resource objects in physical-offset order |
 
 No additional root member is valid. The framing revision already determines the directory schema,
 so JSON does not repeat a schema or version number.
 
-The common reader exposes `model_id`; the compiled target registry decides whether the current
-executable and device can run it. A generic inspector may display a structurally valid artifact for
-an unknown model, but cannot declare it executable.
+`identity` has exactly two members:
+
+```json
+{
+  "model_id": "qwen3.6-27b",
+  "weights_id": "groupwise-int"
+}
+```
+
+| Member | Type | Meaning |
+|---|---|---|
+| `model_id` | nonempty string | exact checkpoint-native model identity |
+| `weights_id` | nonempty string | complete weight-storage contract within that model |
+
+`weights_id` is scoped by `model_id`; it is not globally unique. The common reader exposes the
+complete pair. The compiled target registry selects a candidate package from `model_id`, and that
+package decides whether the complete pair and actual device are executable. A generic inspector may
+display a structurally valid artifact for an unknown identity but cannot declare it executable.
 
 ### 3.2 Tensor object
 
@@ -155,9 +170,9 @@ mapping.
 
 ### 3.4 Closed member sets and values
 
-The root and both object kinds use closed member sets. Missing members, extra members, JSON `null`,
-wrong JSON types, and fields from the other object kind are invalid. This rule keeps source recipes
-and execution facts out of the common artifact contract.
+The root, identity, and both object kinds use closed member sets. Missing members, extra members,
+JSON `null`, wrong JSON types, and fields from another scope or object kind are invalid. This rule
+keeps source recipes and execution facts out of the common artifact contract.
 
 The implementation uses a standard JSON library, then validates the decoded value against this
 schema. Integers must be represented by the library as integers rather than booleans or floating
@@ -175,12 +190,13 @@ artifact identity, validity condition, or reproducibility requirement.
 
 ## 4. Registered identities
 
-The version-1 registry initially contains:
+The version-2 registry contains:
 
 | Namespace | Registered identities | Authority |
 |---|---|---|
 | tensor numeric format | `BF16`, `FP32`, `I32`, `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`, `W8G32_F16S`, `NVFP4` | [`tensor-formats.md`](tensor-formats.md) |
-| `model_id` | `qwen3.6-27b` | [`qwen3.6-27b-artifact.md`](qwen3.6-27b-artifact.md) |
+| `model_id` | `qwen3.6-27b`, `qwen3.6-35b-a3b` | respective target artifact reference |
+| `(model_id, weights_id)` | `qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`, `qwen3.6-35b-a3b/groupwise-int` | respective target artifact reference |
 | tensor layout | `contiguous-le-v1`, `row-split-k128-v1`, `blockscale-k16-m128x4-v1` | [`storage-layouts.md`](storage-layouts.md) |
 | resource encoding | `raw-bytes-v1` | [`storage-layouts.md`](storage-layouts.md) |
 
@@ -194,9 +210,15 @@ encoded size. It is not a GPU or kernel name. The model contract owns which regi
 is accepted for each role and which actual device implementation can consume it.
 
 `model_id` identifies exact checkpoint-native semantics, not a GPU, converter revision, one
-quantization run, physical object order, or artifact instance. It selects a candidate compiled
-package; that package must then accept the actual device and the model contract's complete storage
-signatures. No GPU/profile field is added to JSON.
+quantization run, physical object order, or artifact instance.
+
+`weights_id` identifies one complete target-owned weight-storage contract under that model:
+inventory, names, fusion, format assignment, layout assignment, and associated persistent scalar
+objects. It is not a dominant tensor format, an average BPW, a converter recipe, an execution
+policy, or an artifact-instance digest. `groupwise-int` therefore covers the existing mixed
+groupwise-integer contracts of both registered models without naming either artifact after one
+internal format; `nvfp4` identifies the 27B NVFP4 contract including its fixed BF16 and non-Text
+exceptions.
 
 ## 5. Payload geometry
 
@@ -249,7 +271,7 @@ The generic reader performs only common file work:
 1. read and validate the 16-byte prefix;
 2. derive the JSON and payload positions;
 3. parse the UTF-8 JSON with a standard library;
-4. validate the closed root/tensor/resource schema and integer domains;
+4. validate the closed root/identity/tensor/resource schema and integer domains;
 5. build a unique `name -> object` index;
 6. resolve numeric-format, layout, and encoding identities;
 7. validate layout compatibility, encoded sizes, alignment, ordering, overlap, and file bounds;
@@ -265,7 +287,7 @@ reparse JSON or perform per-layer/per-token directory lookups.
 
 The binder selected for an executable target validates:
 
-- exact `model_id`;
+- exact `(model_id, weights_id)`;
 - the complete required tensor and resource inventory;
 - every canonical name and object kind;
 - required shape relationships and exact per-role format/layout/encoding assignments;
@@ -306,7 +328,7 @@ spans. Both consume the same directory and registered layout bytes.
 
 A writer:
 
-1. obtains the complete model-specific object inventory;
+1. obtains the registered `(model_id, weights_id)` and its complete object inventory;
 2. obtains already transformed direct words or quantized codes/scales from the conversion recipe;
 3. encodes each tensor with its registered layout and each resource with its encoding;
 4. computes exact lengths and aligned payload-relative offsets;
@@ -328,7 +350,7 @@ Rerunning the local converter replaces an incomplete output.
 
 ## 8. Integrity and provenance boundary
 
-Version 1 requires no checksum, digest, signature, publisher identity, or sidecar. Schema, range,
+Version 2 requires no checksum, digest, signature, publisher identity, or sidecar. Schema, range,
 inventory, layout, and source-value verification catch the classes of mistakes relevant to the
 project's own conversion workflow; they are not an identity system for externally supplied files.
 
@@ -343,14 +365,16 @@ Adding a model, layout, encoding, or numeric format updates the corresponding re
 authoritative semantic document in the same change.
 
 Changing the byte interpretation or encoded-size rule of an existing layout/encoding requires a new
-identity. Changing exact checkpoint-native semantics requires a new `model_id`. Converter
-implementation, object order, aligned offsets, artifact values, device placement, and a conforming
-kernel may change without renaming the model.
+layout/encoding identity. Changing exact checkpoint-native semantics requires a new `model_id`.
+Changing the complete inventory, fusion contract, or incompatible per-role storage assignment under
+one model requires a new `weights_id`. Converter implementation, object order, aligned offsets,
+artifact values, device placement, and a conforming kernel may change without renaming an otherwise
+unchanged weight contract.
 
 A new framing revision is required when the common accepted-file language changes: prefix, JSON
 root/object schema, payload-start calculation, offset meaning, or common range interpretation. It
 uses a different complete magic value. There are no ignored extension members or reserved JSON
-dictionaries in version 1.
+dictionaries in version 2.
 
 Project-owned formats have no compatibility obligation. A runtime may remove an obsolete framing,
 model, layout, or encoding directly. A `.ninfer` reader never treats `.qus` as a fallback or alias.
@@ -361,6 +385,7 @@ The prefix and JSON contain none of the following:
 
 - source tensor names, files, revisions, hashes, or transformation rules;
 - quantization encoder recipe, calibration data, clipping policy, or quality evidence;
+- dominant-format or BPW summaries beyond the registered `weights_id`;
 - model dimensions beyond each stored tensor's logical shape;
 - model graph, operators, schedules, layer/module enums, fusion records, or logical-view tables;
 - arbitrary strides, plane offsets, padded shapes, group settings, or layout parameters;
@@ -378,11 +403,11 @@ The native implementation in `tools/artifact/`, `tools/convert/qwen3_6_27b/`,
 `tools/reference/qwen3_6_27b/`, and `src/artifact/` satisfies this layer. The compact evidence
 retained for later changes is:
 
-- Python version-1 round trips for all eight numeric formats and a raw resource;
+- Python version-2 round trips for all eight numeric formats and a raw resource;
 - representative framing, schema, offset/alignment, overlap, bounds, and encoded-size failures;
 - exact representative direct-word, Q4/Q5/Q6/W8 code/scale, and NVFP4 block-scale layout round
   trips;
-- an independently constructed C++ version-1 fixture covering object identities, payload spans,
+- an independently constructed C++ version-2 fixture covering hierarchical identity, payload spans,
   encoded sizes, and alignment;
 - the Qwen3.6-27B binder's complete 1124-object inventory and logical views;
 - inspection, representative source probes, Python reference inference, and Engine loading on a real
@@ -398,10 +423,10 @@ The reusable container mechanism remains intentionally small:
 
 ```text
 converter
-    writes names, storage identities, offsets, lengths, and payloads
+    writes hierarchical identity, names, storage identities, offsets, lengths, and payloads
 
 generic reader
-    parses prefix/JSON and validates directory geometry
+    parses prefix/JSON and validates identity syntax and directory geometry
 
 registered model binder
     validates the exact inventory and constructs target-private logical views

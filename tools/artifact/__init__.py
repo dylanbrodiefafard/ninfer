@@ -5,6 +5,7 @@ from .container import (
     PAYLOAD_ALIGNMENT,
     Artifact,
     ArtifactError,
+    ArtifactIdentity,
     ArtifactObject,
     ArtifactWriter,
     ResourceObject,
@@ -53,6 +54,7 @@ from .numeric import (
 __all__ = [
     "Artifact",
     "ArtifactError",
+    "ArtifactIdentity",
     "ArtifactObject",
     "ArtifactWriter",
     "BF16",

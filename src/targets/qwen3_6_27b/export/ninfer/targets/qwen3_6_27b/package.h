@@ -72,6 +72,7 @@ private:
 
 struct Package {
     static constexpr std::string_view model_id   = "qwen3.6-27b";
+    static constexpr std::string_view weights_id = "groupwise-int";
     static constexpr std::string_view target_key = "qwen3_6_27b";
 
     using LoadPlan       = detail::LoadPlan;

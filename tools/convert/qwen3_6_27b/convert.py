@@ -19,6 +19,7 @@ from typing import Mapping, Sequence
 import torch
 
 from tools.artifact.container import (
+    ArtifactIdentity,
     ArtifactObject,
     ArtifactWriter,
 )
@@ -267,7 +268,7 @@ def build_conversion_report(
     """Build the external descriptive conversion report."""
 
     return family_conversion.build_conversion_report(
-        model_id=inventory.MODEL_ID,
+        identity=ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
         target_key=inventory.TARGET_KEY,
         recipe_id=RECIPE_ID,
         repo_root=_repo_root(),
@@ -311,7 +312,7 @@ def convert(
     with ShardReader(model) as reader:
         with ArtifactWriter(
             output,
-            inventory.MODEL_ID,
+            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
             preflight.object_plan.specs,
         ) as writer:
             if writer.objects != preflight.object_plan.objects:

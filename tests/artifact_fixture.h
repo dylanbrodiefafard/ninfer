@@ -19,7 +19,12 @@ namespace ninfer::test::artifact_fixture {
 
 using Json = nlohmann::json;
 
-inline constexpr std::array<std::uint8_t, 8> kMagic = {'N', 'I', 'N', 'F', 'E', 'R', 0, 1};
+inline constexpr std::array<std::uint8_t, 8> kV1Magic = {
+    'N', 'I', 'N', 'F', 'E', 'R', 0, 1,
+};
+inline constexpr std::array<std::uint8_t, 8> kMagic = {
+    'N', 'I', 'N', 'F', 'E', 'R', 0, 2,
+};
 
 inline std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
     return (value + alignment - 1) / alignment * alignment;
@@ -38,7 +43,8 @@ struct TemporaryArtifact {
     }
 };
 
-inline TemporaryArtifact write_fixture(const Json& directory, std::string_view suffix) {
+inline TemporaryArtifact write_fixture(const Json& directory, std::string_view suffix,
+                                       const std::array<std::uint8_t, 8>& magic = kMagic) {
     const std::string json         = directory.dump();
     const auto payload_offset      = align_up(16 + json.size(), 4096);
     const auto nonnegative_integer = [](const Json& value) {
@@ -55,7 +61,7 @@ inline TemporaryArtifact write_fixture(const Json& directory, std::string_view s
     }
 
     std::vector<std::byte> file(payload_offset + payload_bytes, std::byte{0});
-    for (std::size_t i = 0; i < kMagic.size(); ++i) { file[i] = std::byte{kMagic[i]}; }
+    for (std::size_t i = 0; i < magic.size(); ++i) { file[i] = std::byte{magic[i]}; }
     write_u64_le(file.data() + 8, json.size());
     std::memcpy(file.data() + 16, json.data(), json.size());
 

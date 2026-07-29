@@ -4,7 +4,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tools.artifact.container import ResourceSpec, TensorSpec, plan_objects
+from tools.artifact.container import (
+    ArtifactIdentity,
+    ResourceSpec,
+    TensorSpec,
+    plan_objects,
+)
 from tools.artifact.layouts import encode_row_split
 from tools.convert.common.quantize import quantize_matrix
 from tools.convert.qwen3_6_27b import inventory, verify
@@ -22,7 +27,7 @@ def _structural_artifact():
     objects = plan_objects(specs)
     payload_bytes = objects[-1].offset + objects[-1].bytes
     return SimpleNamespace(
-        model_id=inventory.MODEL_ID,
+        identity=ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
         objects=objects,
         payload_offset=4096,
         file_bytes=4096 + payload_bytes,
@@ -52,8 +57,10 @@ def test_complete_structure_and_logical_bindings_without_large_payload() -> None
 
 def test_structure_rejects_identity_signature_and_offset_drift() -> None:
     artifact = _structural_artifact()
-    with pytest.raises(verify.VerificationError, match="model_id"):
-        verify.validate_structure(_changed(artifact, model_id="wrong-model"))
+    with pytest.raises(verify.VerificationError, match="identity"):
+        verify.validate_structure(
+            _changed(artifact, identity=ArtifactIdentity("wrong-model", "wrong"))
+        )
 
     objects = list(artifact.objects)
     objects[6] = replace(objects[6], shape=(248319, 5120))

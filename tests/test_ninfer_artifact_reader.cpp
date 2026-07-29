@@ -25,7 +25,7 @@ using ninfer::test::artifact_fixture::write_fixture;
 
 Json normative_directory() {
     return {
-        {"model_id", "fixture-model"},
+        {"identity", {{"model_id", "fixture-model"}, {"weights_id", "fixture-weights"}}},
         {"objects", Json::array({
                         {{"name", "resource"},
                          {"kind", "resource"},
@@ -119,7 +119,8 @@ void test_registered_sizes() {
 void test_normative_fixture() {
     auto fixture = write_fixture(normative_directory(), "valid");
     Reader reader(fixture.path);
-    if (reader.model_id() != "fixture-model" || reader.objects().size() != 8 ||
+    if (reader.identity().model_id != "fixture-model" ||
+        reader.identity().weights_id != "fixture-weights" || reader.objects().size() != 8 ||
         reader.payload_offset() != 4096) {
         throw std::runtime_error("fixture root descriptor mismatch");
     }
@@ -165,6 +166,22 @@ void test_common_validation() {
         directory["objects"][1]["offset"] = 257;
         auto fixture                      = write_fixture(directory, "misaligned_offset");
         expect_artifact_error([&] { Reader reader(fixture.path); }, "misaligned offset");
+    }
+    {
+        auto directory = normative_directory();
+        auto fixture =
+            write_fixture(directory, "legacy_v1", ninfer::test::artifact_fixture::kV1Magic);
+        try {
+            Reader reader(fixture.path);
+        } catch (const ninfer::artifact::ArtifactError& error) {
+            if (std::string_view(error.what())
+                    .find("python3 -m tools.artifact.migrate_v1_to_v2 <artifact>") ==
+                std::string_view::npos) {
+                throw std::runtime_error("v1 rejection omitted the migration command");
+            }
+            return;
+        }
+        throw std::runtime_error("v1 artifact was accepted");
     }
 }
 

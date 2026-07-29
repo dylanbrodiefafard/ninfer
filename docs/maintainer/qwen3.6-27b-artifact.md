@@ -11,10 +11,11 @@ defines the separately generated NVFP4 artifact. Common framing is defined in
 
 ## 1. Artifact identity and contents
 
-The registered model identity is:
+The registered hierarchical artifact identities are:
 
 ```text
-qwen3.6-27b
+qwen3.6-27b / groupwise-int
+qwen3.6-27b / nvfp4
 ```
 
 The source/tool/compiled target key is:
@@ -23,17 +24,19 @@ The source/tool/compiled target key is:
 qwen3_6_27b
 ```
 
-The target key selects this exact checkpoint package and is not serialized as a second `model_id`.
+The first identity component is the shared base-model contract. The second selects one complete
+weight-storage contract under it. The target key is a source/build identity and is not serialized.
 
 Each artifact is one complete image containing Text, the optimized MTP draft head, MTP, Vision, and
 the six frontend resources in this document. These components do not define separate component
 artifacts or optional profiles.
 
-The released `qwen3_6_27b.ninfer` contains exactly 1118 tensor objects and six resource objects.
-It remains frozen and loadable by the current Engine. The additive
-`qwen3_6_27b_nvfp4.ninfer` contains 1301 tensor objects and the same six resources. Both serialize
-`model_id = qwen3.6-27b`; the new filename does not replace or update the released file. Logical row
-views and aliases are not additional objects or JSON records.
+The `qwen3_6_27b.ninfer` groupwise-int artifact contains exactly 1118 tensor objects and six
+resource objects. Its payload contract remains frozen and loadable by the current Engine. The
+separate `qwen3_6_27b_nvfp4.ninfer` artifact contains 1301 tensor objects and the same six resources.
+Both serialize `model_id = qwen3.6-27b`; their respective `weights_id = groupwise-int` and
+`weights_id = nvfp4` distinguish the complete inventories without inspecting filenames or object
+formats. Logical row views and aliases are not additional objects or JSON records.
 
 ## 2. Fixed target facts
 
@@ -539,13 +542,14 @@ converter  = tools.convert.qwen3_6_27b.convert_nvfp4
 recipe_id  = qwen3_6_27b_nvfp4-v1
 filename   = qwen3_6_27b_nvfp4.ninfer
 model_id   = qwen3.6-27b
+weights_id = nvfp4
 objects    = 1307
 ```
 
-It is additive to `qwen3_6_27b.ninfer`; the original converter, recipe, inventory, artifact, and
-published file are unchanged. Python can produce and verify the new artifact. The Python and C++
-generic artifact registries recognize `NVFP4` and `blockscale-k16-m128x4-v1`, and the C++ reader
-validates their descriptor geometry and payload range.
+It is a separate weight contract under the same model as `qwen3_6_27b.ninfer`. Python can produce
+and verify it. The Python and C++ generic artifact registries recognize `NVFP4` and
+`blockscale-k16-m128x4-v1`, and the C++ reader validates their descriptor geometry and payload
+range.
 
 The current 27B target binder still accepts only the 1124-object Q4/Q5 contract. Therefore the new
 artifact is not yet loadable or executable through Engine. No CLI, serving, model graph, Op

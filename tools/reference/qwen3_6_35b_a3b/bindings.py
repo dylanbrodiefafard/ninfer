@@ -8,10 +8,17 @@ from typing import Literal, TypeAlias
 
 import torch
 
-from tools.artifact import Artifact, ResourceObject, TensorObject, decode_direct
+from tools.artifact import (
+    Artifact,
+    ArtifactIdentity,
+    ResourceObject,
+    TensorObject,
+    decode_direct,
+)
 
 
 MODEL_ID = "qwen3.6-35b-a3b"
+WEIGHTS_ID = "groupwise-int"
 TOKENIZER_VOCAB_SIZE = 248077
 
 CONTIGUOUS = "contiguous-le-v1"
@@ -487,9 +494,11 @@ def _component(name: str) -> Component:
 
 
 def _validate_inventory(artifact: Artifact) -> None:
-    if artifact.model_id != MODEL_ID:
+    expected_identity = ArtifactIdentity(MODEL_ID, WEIGHTS_ID)
+    if artifact.identity != expected_identity:
         raise BindingError(
-            f"artifact model_id is {artifact.model_id!r}; expected {MODEL_ID!r}"
+            f"artifact identity is {artifact.identity!r}; expected "
+            f"{expected_identity!r}"
         )
     if len(artifact.objects) != len(_OBJECT_CONTRACT):
         raise BindingError(
@@ -819,8 +828,8 @@ class ArtifactBinding:
         return cls(artifact, owns_artifact=False)
 
     @property
-    def model_id(self) -> str:
-        return self._artifact.model_id
+    def identity(self) -> ArtifactIdentity:
+        return self._artifact.identity
 
     def payload(self, block: PhysicalBlock) -> memoryview:
         return self._artifact.payload(block.descriptor)

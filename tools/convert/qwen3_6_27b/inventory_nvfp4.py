@@ -8,6 +8,7 @@ from . import inventory as base
 
 
 MODEL_ID = base.MODEL_ID
+WEIGHTS_ID = "nvfp4"
 TARGET_KEY = base.TARGET_KEY
 
 BF16 = base.BF16

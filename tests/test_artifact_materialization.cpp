@@ -35,7 +35,7 @@ ninfer::test::artifact_fixture::TemporaryArtifact write_fixture() {
     using Json = ninfer::test::artifact_fixture::Json;
     return ninfer::test::artifact_fixture::write_fixture(
         {
-            {"model_id", "fixture-model"},
+            {"identity", {{"model_id", "fixture-model"}, {"weights_id", "fixture-weights"}}},
             {"objects", Json::array({
                             {{"name", "frontend/test.json"},
                              {"kind", "resource"},

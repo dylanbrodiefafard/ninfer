@@ -76,9 +76,10 @@ Its optional DFlash companion weights come from
 |---|---|
 | Filename | `qwen3_6_35b_a3b.ninfer` |
 | Size | 22,783,246,080 bytes (21.22 GiB) |
-| SHA-256 | `5194407dd6d3092b8c2f81ce41e014b50ca0d6f1ba4e5d8c1492b8652bfa267f` |
-| Container version | 1 |
+| SHA-256 | `1fb9ea0b5b8561e49d9604115ec89e5d9f2b6f6434e32c37c57fffd480a325d2` |
+| Container version | 2 |
 | NInfer model ID | `qwen3.6-35b-a3b` |
+| NInfer weights ID | `groupwise-int` |
 | NInfer target key | `qwen3_6_35b_a3b` |
 
 The file contains the registered Text, Vision, MTP, proposal-head, DFlash, tokenizer,
@@ -88,7 +89,7 @@ Verify a downloaded file with:
 
 ```bash
 printf '%s  %s\n' \
-  '5194407dd6d3092b8c2f81ce41e014b50ca0d6f1ba4e5d8c1492b8652bfa267f' \
+  '1fb9ea0b5b8561e49d9604115ec89e5d9f2b6f6434e32c37c57fffd480a325d2' \
   'qwen3_6_35b_a3b.ninfer' | sha256sum --check
 ```
 

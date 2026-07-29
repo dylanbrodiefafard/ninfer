@@ -381,8 +381,9 @@ int run(const Options& options) {
 
     ninfer::DeviceContext device(options.device);
     ninfer::artifact::Reader reader(options.artifact);
-    if (reader.model_id() != target::Package::model_id) {
-        throw std::invalid_argument("artifact model_id does not match qwen3.6-35b-a3b");
+    if (reader.identity().model_id != target::Package::model_id ||
+        reader.identity().weights_id != target::Package::weights_id) {
+        throw std::invalid_argument("artifact identity does not match qwen3.6-35b-a3b");
     }
     ninfer::artifact::Binder binder(reader);
     detail::ArtifactLoadPlan load = detail::bind_artifact(binder, family::StartupFeatures{});

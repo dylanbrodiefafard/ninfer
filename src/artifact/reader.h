@@ -107,6 +107,13 @@ struct PayloadSpan {
     std::span<const std::byte> data;
 };
 
+struct ArtifactIdentity {
+    std::string model_id;
+    std::string weights_id;
+
+    bool operator==(const ArtifactIdentity&) const = default;
+};
+
 class Reader {
 public:
     static constexpr std::size_t direct_io_alignment = 4096;
@@ -119,7 +126,7 @@ public:
     Reader(const Reader&)            = delete;
     Reader& operator=(const Reader&) = delete;
 
-    const std::string& model_id() const noexcept;
+    const ArtifactIdentity& identity() const noexcept;
     const std::vector<ObjectDescriptor>& objects() const noexcept;
     const ObjectDescriptor* find(std::string_view name) const noexcept;
 

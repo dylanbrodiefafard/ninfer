@@ -35,7 +35,10 @@ def test_report_retains_target_specific_provenance_and_component_bytes(
         environment={"python": "test"},
     )
 
-    assert report["model_id"] == inventory.MODEL_ID
+    assert report["identity"] == {
+        "model_id": inventory.MODEL_ID,
+        "weights_id": inventory.WEIGHTS_ID,
+    }
     assert report["target_key"] == inventory.TARGET_KEY
     assert report["recipe_id"] == convert.RECIPE_ID
     assert report["source"]["base_model_path"] == str(

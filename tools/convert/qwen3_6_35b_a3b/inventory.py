@@ -28,6 +28,7 @@ from tools.convert.qwen3_6.common.inventory import (
 
 
 MODEL_ID = "qwen3.6-35b-a3b"
+WEIGHTS_ID = "groupwise-int"
 TARGET_KEY = "qwen3_6_35b_a3b"
 
 TEXT_LAYERS = tuple(range(40))

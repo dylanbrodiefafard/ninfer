@@ -15,7 +15,8 @@ def artifact_summary(artifact: Artifact) -> dict[str, object]:
     resources = [obj for obj in artifact.objects if isinstance(obj, ResourceObject)]
     return {
         "path": str(artifact.path),
-        "model_id": artifact.model_id,
+        "model_id": artifact.identity.model_id,
+        "weights_id": artifact.identity.weights_id,
         "file_bytes": artifact.file_bytes,
         "payload_offset": artifact.payload_offset,
         "objects": len(artifact.objects),
@@ -49,6 +50,7 @@ def main() -> None:
             print(json.dumps(summary, ensure_ascii=False, indent=2))
         else:
             print(f"model_id: {summary['model_id']}")
+            print(f"weights_id: {summary['weights_id']}")
             print(
                 f"objects: {summary['objects']} "
                 f"({summary['tensors']} tensors, {summary['resources']} resources)"

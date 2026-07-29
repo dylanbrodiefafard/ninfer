@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from tools.artifact import ArtifactIdentity
 from tools.reference.qwen3_6_27b.bindings import ArtifactBinding
 from tools.reference.qwen3_6_27b.weights import WeightStore
 
@@ -28,7 +29,7 @@ def binding():
 
 
 def test_complete_typed_binding_and_vision_policy(binding: ArtifactBinding) -> None:
-    assert binding.model_id == "qwen3.6-27b"
+    assert binding.identity == ArtifactIdentity("qwen3.6-27b", "groupwise-int")
     assert len(binding.tensors) == 1118
     assert len(binding.row_views) == 390
     assert len(binding.axis_views) == 48

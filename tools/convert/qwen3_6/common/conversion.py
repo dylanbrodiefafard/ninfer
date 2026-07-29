@@ -18,6 +18,7 @@ from typing import Mapping, Sequence
 import torch
 
 from tools.artifact.container import (
+    ArtifactIdentity,
     ArtifactObject,
     ObjectSpec,
     ResourceObject,
@@ -185,7 +186,7 @@ def environment(device: torch.device) -> dict[str, object]:
 
 def build_conversion_report(
     *,
-    model_id: str,
+    identity: ArtifactIdentity,
     target_key: str,
     recipe_id: str,
     repo_root: str | Path,
@@ -205,7 +206,10 @@ def build_conversion_report(
     """Build the shared report envelope without defining target validity."""
 
     return {
-        "model_id": model_id,
+        "identity": {
+            "model_id": identity.model_id,
+            "weights_id": identity.weights_id,
+        },
         "target_key": target_key,
         "recipe_id": recipe_id,
         "source": {

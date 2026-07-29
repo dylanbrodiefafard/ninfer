@@ -1,6 +1,12 @@
 from tools.convert.qwen3_6_35b_a3b import inventory
 
 
+def test_identity() -> None:
+    assert inventory.MODEL_ID == "qwen3.6-35b-a3b"
+    assert inventory.WEIGHTS_ID == "groupwise-int"
+    assert inventory.TARGET_KEY == "qwen3_6_35b_a3b"
+
+
 def _tensors() -> dict[str, inventory.TensorSpec]:
     return {spec.name: spec for spec in inventory.TENSOR_SPECS}
 

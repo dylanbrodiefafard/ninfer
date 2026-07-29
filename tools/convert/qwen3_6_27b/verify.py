@@ -14,7 +14,13 @@ import numpy as np
 from safetensors import safe_open
 import torch
 
-from tools.artifact.container import Artifact, ResourceObject, TensorObject, object_alignment
+from tools.artifact.container import (
+    Artifact,
+    ArtifactIdentity,
+    ResourceObject,
+    TensorObject,
+    object_alignment,
+)
 from tools.artifact.layouts import (
     align_up,
     decode_direct,
@@ -144,9 +150,11 @@ def validate_logical_bindings(
 def validate_structure(artifact: Artifact) -> StructureSummary:
     """Validate the complete directory without reading tensor payload values."""
 
-    if artifact.model_id != inventory.MODEL_ID:
+    expected_identity = ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID)
+    if artifact.identity != expected_identity:
         _contract_error(
-            f"model_id is {artifact.model_id!r}, expected {inventory.MODEL_ID!r}"
+            f"artifact identity is {artifact.identity!r}, expected "
+            f"{expected_identity!r}"
         )
     if len(artifact.objects) != len(inventory.OBJECT_SPECS):
         _contract_error(

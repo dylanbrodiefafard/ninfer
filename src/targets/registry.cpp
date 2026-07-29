@@ -59,6 +59,12 @@ void validate_device_budget(std::uint64_t weight_bytes, std::size_t sequence_byt
 template <class Target, class Loaded, class Instance>
 ConstructedTarget construct_registered(const EngineOptions& options, DeviceContext& device,
                                        artifact::Reader& reader, Clock::time_point load_start) {
+    const auto& identity = reader.identity();
+    if (identity.model_id != Target::model_id || identity.weights_id != Target::weights_id) {
+        throw std::runtime_error("artifact identity '" + identity.model_id + "/" +
+                                 identity.weights_id + "' is not supported by target '" +
+                                 std::string(Target::target_key) + "'");
+    }
     auto sequence_plan = Target::plan_sequence(device, options);
 
     artifact::Binder binder(reader);
@@ -125,15 +131,16 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
     const auto load_start = Clock::now();
 
     artifact::Reader reader(options.artifact_path);
-    if (reader.model_id() == Qwen3_6_27B::model_id) {
+    const auto& identity = reader.identity();
+    if (identity.model_id == Qwen3_6_27B::model_id) {
         return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(
             options, device, reader, load_start);
     }
-    if (reader.model_id() == Qwen3_6_35BA3B::model_id) {
+    if (identity.model_id == Qwen3_6_35BA3B::model_id) {
         return construct_registered<Qwen3_6_35BA3B, LoadedQwen3_6_35BA3B, Qwen3_6_35BA3BInstance>(
             options, device, reader, load_start);
     }
-    throw std::runtime_error("artifact model_id '" + reader.model_id() +
+    throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' has no registered target for this device");
 }
 

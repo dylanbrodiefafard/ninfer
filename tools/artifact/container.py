@@ -1,4 +1,4 @@
-"""Minimal reader and streaming writer for the NInfer v1 object directory."""
+"""Minimal reader and streaming writer for the NInfer v2 object directory."""
 
 from __future__ import annotations
 
@@ -12,13 +12,15 @@ from typing import Iterable, Iterator, Sequence, TypeAlias
 from .layouts import align_up, encoded_size, get_layout
 
 
-MAGIC = b"NINFER\x00\x01"
+MAGIC = b"NINFER\x00\x02"
+_V1_MAGIC = b"NINFER\x00\x01"
 PREFIX = struct.Struct("<8sQ")
 PREFIX_BYTES = PREFIX.size
 PAYLOAD_ALIGNMENT = 4096
 RAW_BYTES_V1 = "raw-bytes-v1"
 
-_ROOT_MEMBERS = frozenset({"model_id", "objects"})
+_ROOT_MEMBERS = frozenset({"identity", "objects"})
+_IDENTITY_MEMBERS = frozenset({"model_id", "weights_id"})
 _TENSOR_MEMBERS = frozenset(
     {"name", "kind", "shape", "format", "layout", "offset", "bytes"}
 )
@@ -26,7 +28,13 @@ _RESOURCE_MEMBERS = frozenset({"name", "kind", "encoding", "offset", "bytes"})
 
 
 class ArtifactError(ValueError):
-    """The file does not satisfy the NInfer v1 directory contract."""
+    """The file does not satisfy the NInfer v2 directory contract."""
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactIdentity:
+    model_id: str
+    weights_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,12 +178,26 @@ def plan_objects(specs: Sequence[ObjectSpec]) -> tuple[ArtifactObject, ...]:
     return tuple(objects)
 
 
-def encode_directory(model_id: str, objects: Sequence[ArtifactObject]) -> bytes:
-    _require_string(model_id, "model_id")
+def _require_identity(identity: ArtifactIdentity) -> ArtifactIdentity:
+    if not isinstance(identity, ArtifactIdentity):
+        raise TypeError("artifact identity must be an ArtifactIdentity")
+    return ArtifactIdentity(
+        model_id=_require_string(identity.model_id, "model_id"),
+        weights_id=_require_string(identity.weights_id, "weights_id"),
+    )
+
+
+def encode_directory(
+    identity: ArtifactIdentity, objects: Sequence[ArtifactObject]
+) -> bytes:
+    checked_identity = _require_identity(identity)
     if not objects:
         raise ArtifactError("objects must not be empty")
     value = {
-        "model_id": model_id,
+        "identity": {
+            "model_id": checked_identity.model_id,
+            "weights_id": checked_identity.weights_id,
+        },
         "objects": [obj.to_json() for obj in objects],
     }
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -215,14 +237,27 @@ def _parse_object(value: object) -> ArtifactObject:
     raise ArtifactError("object kind must be 'tensor' or 'resource'")
 
 
-def parse_directory(data: bytes) -> tuple[str, tuple[ArtifactObject, ...]]:
+def parse_directory(
+    data: bytes,
+) -> tuple[ArtifactIdentity, tuple[ArtifactObject, ...]]:
     try:
         value = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ArtifactError(f"invalid JSON directory: {exc}") from exc
     if not isinstance(value, dict) or frozenset(value) != _ROOT_MEMBERS:
-        raise ArtifactError("directory root must contain exactly model_id and objects")
-    model_id = _require_string(value["model_id"], "model_id")
+        raise ArtifactError("directory root must contain exactly identity and objects")
+    raw_identity = value["identity"]
+    if (
+        not isinstance(raw_identity, dict)
+        or frozenset(raw_identity) != _IDENTITY_MEMBERS
+    ):
+        raise ArtifactError(
+            "artifact identity must contain exactly model_id and weights_id"
+        )
+    identity = ArtifactIdentity(
+        model_id=_require_string(raw_identity["model_id"], "model_id"),
+        weights_id=_require_string(raw_identity["weights_id"], "weights_id"),
+    )
     raw_objects = value["objects"]
     if not isinstance(raw_objects, list) or not raw_objects:
         raise ArtifactError("objects must be a nonempty array")
@@ -232,7 +267,7 @@ def parse_directory(data: bytes) -> tuple[str, tuple[ArtifactObject, ...]]:
         if obj.name in names:
             raise ArtifactError(f"duplicate object name: {obj.name}")
         names.add(obj.name)
-    return model_id, objects
+    return identity, objects
 
 
 def _validate_ranges(
@@ -266,11 +301,16 @@ class Artifact:
             self.file_bytes = self._file.tell()
             self._file.seek(0)
             if self.file_bytes < PREFIX_BYTES:
-                raise ArtifactError("artifact is shorter than the v1 prefix")
+                raise ArtifactError("artifact is shorter than the v2 prefix")
             prefix = self._file.read(PREFIX_BYTES)
             magic, json_bytes = PREFIX.unpack(prefix)
+            if magic == _V1_MAGIC:
+                raise ArtifactError(
+                    "NInfer artifact v1 is no longer supported; migrate it with: "
+                    "python3 -m tools.artifact.migrate_v1_to_v2 <artifact>"
+                )
             if magic != MAGIC:
-                raise ArtifactError("artifact magic is not NInfer v1")
+                raise ArtifactError("artifact magic is not NInfer v2")
             if json_bytes == 0:
                 raise ArtifactError("json_bytes must be positive")
             metadata_end = PREFIX_BYTES + json_bytes
@@ -280,7 +320,7 @@ class Artifact:
             directory = self._file.read(json_bytes)
             if len(directory) != json_bytes:
                 raise ArtifactError("artifact JSON is truncated")
-            self.model_id, self.objects = parse_directory(directory)
+            self.identity, self.objects = parse_directory(directory)
             payload_bytes = self.file_bytes - self.payload_offset
             self._index = _validate_ranges(self.objects, payload_bytes)
             self._mapping = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
@@ -332,11 +372,16 @@ def _payload_chunks(payload: Payload) -> Iterator[memoryview]:
 class ArtifactWriter:
     """Write one preplanned artifact payload at a time in directory order."""
 
-    def __init__(self, path: str | Path, model_id: str, specs: Sequence[ObjectSpec]):
+    def __init__(
+        self,
+        path: str | Path,
+        identity: ArtifactIdentity,
+        specs: Sequence[ObjectSpec],
+    ):
         self.path = Path(path)
-        self.model_id = _require_string(model_id, "model_id")
+        self.identity = _require_identity(identity)
         self.objects = plan_objects(specs)
-        directory = encode_directory(self.model_id, self.objects)
+        directory = encode_directory(self.identity, self.objects)
         self.payload_offset = align_up(PREFIX_BYTES + len(directory), PAYLOAD_ALIGNMENT)
         self._file = self.path.open("wb")
         self._file.write(PREFIX.pack(MAGIC, len(directory)))
@@ -399,11 +444,11 @@ class ArtifactWriter:
 
 def write_artifact(
     path: str | Path,
-    model_id: str,
+    identity: ArtifactIdentity,
     entries: Sequence[tuple[ObjectSpec, Payload]],
 ) -> tuple[ArtifactObject, ...]:
     specs = [spec for spec, _ in entries]
-    with ArtifactWriter(path, model_id, specs) as writer:
+    with ArtifactWriter(path, identity, specs) as writer:
         for spec, payload in entries:
             writer.write(spec.name, payload)
     return writer.objects

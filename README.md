@@ -9,10 +9,11 @@ OpenAI-/Anthropic-compatible HTTP APIs.
 NInfer deliberately supports a closed set of model artifacts instead of acting as a general model
 runtime:
 
-| Model | NInfer artifact | Size | SHA-256 |
-|---|---|---:|---|
-| [Qwen3.6-27B](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | `qwen3_6_27b.ninfer` | 17,495,365,888 bytes (16.29 GiB) | `74fac75f3a6b7ab7b52e08c36969c7a33a8ba23465910eccd72d195adb497127` |
-| [Qwen3.6-35B-A3B](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | `qwen3_6_35b_a3b.ninfer` | 22,783,246,080 bytes (21.22 GiB) | `5194407dd6d3092b8c2f81ce41e014b50ca0d6f1ba4e5d8c1492b8652bfa267f` |
+| Model | Weights | NInfer artifact | Size | SHA-256 |
+|---|---|---|---:|---|
+| [Qwen3.6-27B](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | `groupwise-int` | `qwen3_6_27b.ninfer` | 17,495,365,888 bytes (16.29 GiB) | `7b51600ffd10632b9660f56085efdd9b751d79733ad32036a652234b64bebe7b` |
+| [Qwen3.6-27B](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | `nvfp4` | `qwen3_6_27b_nvfp4.ninfer` | 17,608,902,400 bytes (16.40 GiB) | `886144e76f3ab8a132555e40b7182af187d7a9aeab5cff56b41d7c6e43fb91e1` |
+| [Qwen3.6-35B-A3B](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | `groupwise-int` | `qwen3_6_35b_a3b.ninfer` | 22,783,246,080 bytes (21.22 GiB) | `1fb9ea0b5b8561e49d9604115ec89e5d9f2b6f6434e32c37c57fffd480a325d2` |
 
 ## Performance
 
@@ -125,11 +126,16 @@ docker run --rm \
 
 ## Download a model
 
-Use the Hugging Face CLI to download either registered artifact:
+Use the Hugging Face CLI to download one of the registered artifacts:
 
 ```bash
 hf download neroued/Qwen3.6-27B-NInfer \
   qwen3_6_27b.ninfer \
+  --local-dir models
+
+# Or the 27B NVFP4 weight variant:
+hf download neroued/Qwen3.6-27B-NInfer \
+  qwen3_6_27b_nvfp4.ninfer \
   --local-dir models
 
 # Or:
@@ -138,10 +144,20 @@ hf download neroued/Qwen3.6-35B-A3B-NInfer \
   --local-dir models
 ```
 
-The `.ninfer` file contains the weights and frontend resources needed by NInfer. It is not a
+Development builds accept only the version-2 artifact container. Migrate either exact artifact
+published before this container change in place:
+
+```bash
+python3 -m tools.artifact.migrate_v1_to_v2 models/qwen3_6_27b.ninfer
+```
+
+Use the same command with `qwen3_6_35b_a3b.ninfer` for the 35B-A3B artifact. The migration updates
+only container metadata; it does not rewrite the weight payload.
+
+Each `.ninfer` file contains the weights and frontend resources needed by NInfer. It is not a
 Transformers checkpoint, Safetensors distribution, or GGUF file.
 
-The artifact is complete, while GPU residency is fixed at process startup. Speculative decoding is
+Each artifact is complete, while GPU residency is fixed at process startup. Speculative decoding is
 disabled by default, so MTP/DFlash state and the optimized proposal head are not uploaded.
 Vision is also disabled by default, so its weights, Vision scratch phase, and frozen
 request-transient allocation are omitted. Add `--vision` to the CLI or server process that must
@@ -200,7 +216,7 @@ function-tool request/response translation. See [HTTP serving](docs/serving.md).
 
 ## Capabilities
 
-Both registered artifacts support:
+Both registered model targets support:
 
 - text generation with thinking and non-thinking prompt modes;
 - image, multi-image, video, and mixed multimodal messages;
@@ -214,7 +230,7 @@ Both registered artifacts support:
 
 ## Current limits
 
-- Only the two artifacts listed above are accepted product targets.
+- Only the two model targets listed above are accepted product targets.
 - Execution is specialized for one RTX 5090 and one CUDA device.
 - One Engine owns one resident sequence and runs one active request at a time.
 - Continuous batching, multi-GPU execution, CPU/GPU offload, and distributed serving are not

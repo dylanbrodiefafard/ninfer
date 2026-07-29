@@ -10,10 +10,10 @@ resources, and source-to-object transforms. Common framing is defined in
 
 ## 1. Artifact identity and contents
 
-The registered model identity is:
+The registered hierarchical artifact identity is:
 
 ```text
-qwen3.6-35b-a3b
+qwen3.6-35b-a3b / groupwise-int
 ```
 
 The source/tool/compiled target key is:
@@ -22,7 +22,8 @@ The source/tool/compiled target key is:
 qwen3_6_35b_a3b
 ```
 
-The target key selects this exact checkpoint package and is not serialized as a second `model_id`.
+The identity serializes `model_id = qwen3.6-35b-a3b` and `weights_id = groupwise-int`. The target
+key is a source/build identity and is not serialized.
 
 Every conforming artifact is one complete product image containing Text, the optimized proposal
 head, MTP, Vision, DFlash, and the six frontend resources in this document. DFlash is part of the

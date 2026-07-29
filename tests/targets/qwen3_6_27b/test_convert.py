@@ -8,6 +8,7 @@ import torch
 
 from tools.artifact.container import (
     Artifact,
+    ArtifactIdentity,
     ArtifactWriter,
     ResourceSpec,
     TensorSpec,
@@ -72,7 +73,11 @@ def test_synthetic_encode_seam_and_descriptive_report(tmp_path):
         ),
     )
     path = tmp_path / "mini.ninfer"
-    with ArtifactWriter(path, "mini-model", artifact_specs) as writer:
+    with ArtifactWriter(
+        path,
+        ArtifactIdentity("mini-model", "mini-weights"),
+        artifact_specs,
+    ) as writer:
         writer.write("frontend/test.json", b"{}")
         writer.write(direct_target.name, direct_payload)
         writer.write(quant_target.name, quant_payload)
@@ -115,7 +120,10 @@ def test_synthetic_encode_seam_and_descriptive_report(tmp_path):
         revision="test-revision",
         environment={"python": "test", "torch": "test", "device": "cpu"},
     )
-    assert report["model_id"] == inventory.MODEL_ID
+    assert report["identity"] == {
+        "model_id": inventory.MODEL_ID,
+        "weights_id": inventory.WEIGHTS_ID,
+    }
     assert report["target_key"] == inventory.TARGET_KEY
     assert report["recipe_id"] == convert.RECIPE_ID
     assert report["source"]["model_path"].endswith("/model")

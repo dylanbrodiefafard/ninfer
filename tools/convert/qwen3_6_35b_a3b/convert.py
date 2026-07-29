@@ -24,7 +24,7 @@ from typing import Mapping, Sequence
 
 import torch
 
-from tools.artifact.container import ArtifactObject, ArtifactWriter
+from tools.artifact.container import ArtifactIdentity, ArtifactObject, ArtifactWriter
 from tools.convert.common.quantize import pick_device
 from tools.convert.common.safetensors import ShardReader
 from tools.convert.qwen3_6.common import conversion as family_conversion
@@ -400,7 +400,7 @@ def build_conversion_report(
         },
     )
     report = family_conversion.build_conversion_report(
-        model_id=inventory.MODEL_ID,
+        identity=ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
         target_key=inventory.TARGET_KEY,
         recipe_id=RECIPE_ID,
         repo_root=_repo_root(),
@@ -490,7 +490,7 @@ def convert(
     resources = {resource.name: resource.data for resource in preflight.resources}
     with ArtifactWriter(
         output,
-        inventory.MODEL_ID,
+        ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
         preflight.object_plan.specs,
     ) as writer:
         index = 0

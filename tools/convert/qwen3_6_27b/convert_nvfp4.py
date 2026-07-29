@@ -19,7 +19,7 @@ from typing import Mapping, Sequence
 
 import torch
 
-from tools.artifact.container import ArtifactObject, ArtifactWriter
+from tools.artifact.container import ArtifactIdentity, ArtifactObject, ArtifactWriter
 from tools.artifact.layouts import (
     decode_nvfp4_words,
     encode_direct,
@@ -290,7 +290,7 @@ def _build_report(
 ) -> dict[str, object]:
     ranking = _repo_root() / draft_head.DEFAULT_RANKING
     report = family_conversion.build_conversion_report(
-        model_id=inventory.MODEL_ID,
+        identity=ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
         target_key=inventory.TARGET_KEY,
         recipe_id=RECIPE_ID,
         repo_root=_repo_root(),
@@ -366,7 +366,7 @@ def convert(
     ) as nvfp4_reader:
         with ArtifactWriter(
             output,
-            inventory.MODEL_ID,
+            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
             preflight.object_plan.specs,
         ) as writer:
             if writer.objects != preflight.object_plan.objects:
