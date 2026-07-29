@@ -128,9 +128,9 @@ functional checklist item.
 
 ### A1 — single-parent NVFP4 `attn_input_proj`
 
-当前 `T=1` decode 工作的临时实施方案见
-[`2026-07-29-qwen3.6-27b-nvfp4-attn-input-decode-plan.md`](2026-07-29-qwen3.6-27b-nvfp4-attn-input-decode-plan.md)。
-该方案完成后应删除，并将稳定结论并回本清单及对应 active references。
+当前 operator-private A16 execution frontier 是 `T=1` decode 和 `T=2..32` Small-T。
+`32` 是已经实现并 qualification 的内部 frontier，不是 public Op 的语义上限；后续应根据
+Small-T 与 MMA 的实测 crossover 上调，而不是把它提升为格式或 API 限制。
 
 - [ ] Admit one complete NVFP4 `query_key_gate_value` weight `[14336,5120]`; do not expose four
   weight row views or multiple weight arguments.
@@ -166,13 +166,34 @@ format/geometry admission rather than creating a second NVFP4-specific public na
 
 Current A1 progress, which does not mark A1 complete:
 
-- [x] the complete NVFP4 parent `[14336,5120]` is admitted for A16 `T=1` decode;
+- [x] the complete NVFP4 parent `[14336,5120]` is admitted for A16 `T=1..32`;
 - [x] one shared matrix kernel writes either contiguous Linear output or the four final Attention
   allocations directly, with the required physical-row mapping;
 - [x] the Linear result and all four Attention row ranges pass the independent exact-decode/FP64
-  oracle while the existing Q4/Q5, W8, and BF16 cases remain qualified;
-- [x] permanent public Linear and input-projection benchmark points cover this exact decode route;
-- [ ] Small-T and prefill execution regions still need to make every positive `T` executable.
+  oracle at representative decode, priority, and frontier points while the existing Q4/Q5, W8,
+  and BF16 cases remain qualified;
+- [x] permanent public Linear and input-projection benchmarks continuously sweep `T=1..32`;
+- [ ] `T>32` and the Small-T/MMA crossover still need to make every positive `T` executable.
+
+The qualified `T=1..32` implementation profile keeps the public activation in BF16, does not use
+Tensor Cores, launches one kernel per Linear or Attention call, and uses zero workspace. Linear and
+Attention share the matrix-compute body but own independent compile-time production mappings.
+These are implementation facts for the current RTX 5090 route, not additions to the mathematical
+Op contract.
+
+RTX 5090, CUDA 13.1, cold-cache measurements with 5 warmups and 31 samples produced:
+
+| `T` | Linear median | Attention median |
+|---:|---:|---:|
+| 1 | `32.000 us` | `32.032 us` |
+| 4 | `35.776 us` | `36.064 us` |
+| 8 | `52.544 us` | `52.512 us` |
+| 16 | `79.136 us` | `81.184 us` |
+| 32 | `144.704 us` | `149.312 us` |
+
+The final public sweeps cover every adjacent `T`, including each production-instance transition;
+no extra dispatch threshold is inferred from these five summary points. Extending beyond `32`
+requires a new crossover measurement rather than extrapolating the current mapping.
 
 The matrix arithmetic is exactly equivalent to forming `Y = W*x` with
 `Y BF16 [14336,T]` and taking the four physical row ranges above. That equivalence does not make

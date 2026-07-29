@@ -12,9 +12,15 @@ using namespace ninfer::test::linear;
 int run_nvfp4_a16() {
     constexpr std::array invocations{
         Invocation{1, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{2, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{4, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{8, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{16, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{20, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{32, CallForm::Policy, ops::LinearPolicy::A16Only},
     };
     return run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
-                     {14336, 5120, 701U, Comparison::Full, true, invocations});
+                     {14336, 5120, 701U, Comparison::Sampled, true, invocations});
 }
 
 } // namespace

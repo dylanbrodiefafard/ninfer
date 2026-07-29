@@ -635,7 +635,9 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
     result.dram_spec_pct      = result.effective_gbs / kRtx5090DramGBs * 100.0;
     result.sustained_read_pct = result.effective_gbs / kRtx5090SustainedReadGBs * 100.0;
     result.useful_tflops      = useful_flops / seconds / 1.0e12;
-    result.bf16_tc_spec_pct   = result.useful_tflops / kRtx5090DenseBf16Tflops * 100.0;
+    result.bf16_tc_spec_pct   = point.qtype == QType::NVFP4
+                                    ? std::numeric_limits<double>::quiet_NaN()
+                                    : result.useful_tflops / kRtx5090DenseBf16Tflops * 100.0;
     result.memory_floor_us    = memory_floor_us;
     result.compute_floor_us   = compute_floor_us;
     result.roofline_floor_us  = roofline_floor_us;
@@ -779,18 +781,23 @@ void print_results(const std::vector<Result>& results) {
     for (const Result& result : results) {
         const bool have_delta = std::isfinite(result.delta_pct);
         char delta[32];
+        char tc_pct[32];
         if (have_delta) {
             std::snprintf(delta, sizeof(delta), "%.2f", result.delta_pct);
         } else {
             std::snprintf(delta, sizeof(delta), "-");
         }
+        if (std::isfinite(result.bf16_tc_spec_pct)) {
+            std::snprintf(tc_pct, sizeof(tc_pct), "%.2f", result.bf16_tc_spec_pct);
+        } else {
+            std::snprintf(tc_pct, sizeof(tc_pct), "N/A");
+        }
         std::printf("%-44s %3s %3s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %7.2f "
-                    "%7.2f %10.2f %7.2f %7s %9.2f %8s\n",
+                    "%7.2f %10.2f %7s %7s %9.2f %8s\n",
                     result.labels.c_str(), result.qtype_name, result.policy_name, result.n,
                     result.k, result.t, result.median_us, result.min_us, result.p95_us,
                     result.effective_gbs, result.dram_spec_pct, result.sustained_read_pct,
-                    result.useful_tflops, result.bf16_tc_spec_pct, result.bound,
-                    result.roofline_pct, delta);
+                    result.useful_tflops, tc_pct, result.bound, result.roofline_pct, delta);
     }
 }
 
@@ -820,9 +827,13 @@ void write_csv(const std::filesystem::path& path, const std::vector<Result>& res
             << result.useful_flops << ',' << result.median_us << ',' << result.min_us << ','
             << result.p95_us << ',' << result.effective_gbs << ',' << kRtx5090DramGBs << ','
             << result.dram_spec_pct << ',' << kRtx5090SustainedReadGBs << ','
-            << result.sustained_read_pct << ',' << result.useful_tflops << ','
-            << kRtx5090DenseBf16Tflops << ',' << result.bf16_tc_spec_pct << ','
-            << result.memory_floor_us << ',' << result.compute_floor_us << ','
+            << result.sustained_read_pct << ',' << result.useful_tflops << ',';
+        if (std::isfinite(result.bf16_tc_spec_pct)) {
+            out << kRtx5090DenseBf16Tflops << ',' << result.bf16_tc_spec_pct;
+        } else {
+            out << ',';
+        }
+        out << ',' << result.memory_floor_us << ',' << result.compute_floor_us << ','
             << result.roofline_floor_us << ',' << result.bound << ',' << result.roofline_pct << ',';
         if (std::isfinite(result.delta_pct)) { out << result.delta_pct; }
         out << ',' << result.warmup << ',' << result.repeat << ',' << result.flush_bytes << '\n';

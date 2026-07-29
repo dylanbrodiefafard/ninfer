@@ -15,10 +15,15 @@ void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPo
     }
     validate_nvfp4_weight(weight, "nvfp4 linear");
     if (weight.n != Nvfp4LinearDecodeGeometry::kOutputRows ||
-        weight.k != Nvfp4LinearDecodeGeometry::kInputRows || x.ne[1] != 1) {
+        weight.k != Nvfp4LinearDecodeGeometry::kInputRows || x.ne[1] <= 0 ||
+        x.ne[1] > kNvfp4LastSmallT) {
         throw std::invalid_argument("nvfp4 linear: unsupported shape or T");
     }
-    launch_nvfp4_decode(x, weight, out, stream);
+    if (x.ne[1] == 1) {
+        launch_nvfp4_decode(x, weight, out, stream);
+    } else {
+        launch_nvfp4_small_t(x, weight, out, stream);
+    }
 }
 
 } // namespace ninfer::ops::detail
