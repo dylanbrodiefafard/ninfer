@@ -716,9 +716,10 @@ must add single-parent BF16 admission to `attn_input_proj` for the six early
 `query_key_gate_value` parents, and BF16 admission to `linear_add` for attention output layers 3
 and 7 and GDN output layer 4.
 
-Target-private divisor extraction, the NVFP4 binding contract, NVFP4/BF16 Op admission, and their
-CUDA leaves remain unimplemented. The implemented Q4/Q5 GDN signature change does not make the
-NVFP4 artifact Engine-loadable.
+Current Op completion status is authoritative only in
+[`qwen3.6-27b-nvfp4-op-checklist.md`](qwen3.6-27b-nvfp4-op-checklist.md). Until that work and the
+separate target-private binding are complete, neither partial Op support nor the implemented Q4/Q5
+GDN signature change makes the NVFP4 artifact Engine-loadable.
 
 ### 13.5 Production and verification
 

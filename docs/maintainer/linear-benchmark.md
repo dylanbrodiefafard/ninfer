@@ -15,8 +15,9 @@ ninfer::ops::linear(x, w, out, policy, stream)
 Q4/Q5/Q6/W8 LinearAdd、LinearSwiGLU、LinearPair 和其他 fused Ops 不属于这个
 benchmark。它们继续由各自的 benchmark 独立测量。
 
-当前只有 A16 pure Linear route。benchmark 不提供虚假的 BF16、A8 或 A4 选项；只有
-相应 production route、数值资格和硬件规格参照同时存在后，才增加新的执行类型。
+当前只有 A16 pure Linear route。Q4/Q5/Q6/W8 使用 RowSplit packed weight；BF16_CTRL
+作为显式开发单点使用，不加入 model suite。benchmark 不提供虚假的 A8 或 A4 选项；
+只有相应 production route、数值资格和硬件规格参照同时存在后，才增加新的执行类型。
 
 ## 1. 使用场景
 
@@ -34,6 +35,14 @@ benchmark。它们继续由各自的 benchmark 独立测量。
 
 数字 `(N,K)` 是主入口。benchmark 不复制 production selector 的完整 shape admission
 表；不支持的 point 由 public `linear()` 及其 format selector 拒绝。
+
+BF16 decode control 的 exact 命令是：
+
+```bash
+./build/bench/ninfer_linear_bench \
+  --qtype bf16 --policy a16 \
+  --n 14336 --k 5120 --t 1
+```
 
 ### 1.2 NCU 单点
 
@@ -214,7 +223,7 @@ for each T:
     time public ops::linear()
  |
  v
-derive model bytes, useful FLOPs and fixed-spec ratios
+derive model bytes, useful FLOPs, fixed-spec ratios and measured-read ratio
  |
  v
 compact table and optional CSV
@@ -241,6 +250,7 @@ format weight bytes 是 kernel 需要消费的各存储平面之和，不包含 
 | Q5G64_F16S | 64 | `32 low + 8 high + 2 scale` | `groups * 42` |
 | Q6G64_F16S | 64 | `32 low + 16 high + 2 scale` | `groups * 50` |
 | W8G32_F16S | 32 | `32 code + 2 scale` | `groups * 34` |
+| BF16_CTRL | — | direct BF16 | `2 * N * K` |
 
 一次 Linear 的理论最低流量为：
 
@@ -248,6 +258,7 @@ format weight bytes 是 kernel 需要消费的各存储平面之和，不包含 
 model_bytes = weight_bytes + 2*K*T + 2*N*T
 effective_GB/s = model_bytes / seconds / 1e9
 dram_spec_pct = effective_GB/s / 1792 * 100
+read_ceiling_pct = effective_GB/s / 1674.5 * 100
 ```
 
 这是从 public representation 得到的 model floor，不是 profiler 观测的 physical DRAM
@@ -260,6 +271,12 @@ traffic。它不计：
 
 这些问题需要 NCU 回答。benchmark 不再根据 launcher column tile 推导
 `weight_replay_lower_bound_bytes`。
+
+`1792 GB/s` 仍是固定硬件规格，用于原有 `DRAM_%` 和 fixed-spec roofline。附加的
+`READ_%` 使用 RTX 5090 上 `tools/hbm_bandwidth_probe.cu` 的 4 GiB `uint4` 纯读结果
+`1674.5 GB/s`，表示该机器已经实测可持续的只读上限。它只为读主导 Linear 提供实际
+可达利用率，不替换 fixed-spec 指标，也不改变一遍 logical weight read 的
+`model_bytes` 口径。copy probe 同时读写，不是这类 GEMV 的适用上限。
 
 ## 5. 理论计算量
 
@@ -312,6 +329,7 @@ console header 固定打印：
 ```text
 gpu=RTX 5090
 dram_spec=1792 GB/s
+sustained_read=1674.5 GB/s
 bf16_dense_tc_spec=209.5 TFLOP/s
 cache=cold
 ```
@@ -320,7 +338,7 @@ cache=cold
 
 ```text
 label qtype policy N K T median_us min_us p95_us
-model_GB effective_GB/s DRAM_%
+model_GB effective_GB/s DRAM_% READ_%
 useful_TFLOP/s BF16_TC_% bound roofline_%
 ```
 
@@ -354,7 +372,7 @@ selector 源码是 host launcher route 的唯一 executable authority。
 
 当前 `linear_bench.cu` 保留：
 
-- deterministic packed Q4/Q5/Q6/W8 weight generation；
+- deterministic packed Q4/Q5/Q6/W8 和 direct BF16 weight generation；
 - BF16 activation/output allocation；
 - public Linear invocation；
 - cold-cache CUDA-event timing；
@@ -417,7 +435,14 @@ benchmark。
    `q4_rowsplit_gemv_kernel` 实例；
 6. Q4 `[4096,5120], T=1` 的 weight-byte 结果为 `11141120`，等于
    `4096*5120*(4/8+2/64)`；console 与 CSV 使用同一计算；
-7. 输出固定引用 `1792 GB/s` 和 `209.5 TFLOP/s`，不存在实测 ceiling probe。
+7. 上述 BF16 exact point 通过 public Linear 执行；500 次 cold-cache sample 的 median
+   在重复运行中为 `95.520–97.536 us`，即 `1505.5–1537.3 GB/s`；
+8. 相对 `1674.5 GB/s` 纯读 probe，这一范围为 `89.91%–91.80%` 实际可达读带宽；
+9. final NCU 单次 capture 的 DRAM read 为 `146825728` bytes，而 weight 加 activation
+   的一遍 logical read 为 `146810880` bytes；额外 read 仅 `14848` bytes，没有 weight
+   replay；
+10. 输出保留固定 `1792 GB/s` 和 `209.5 TFLOP/s` 参照，同时独立报告
+    `1674.5 GB/s` 的 `READ_%`。
 
-benchmark 不承担数值 correctness；Q4/Q5/Q6/W8 A16 correctness 继续由各自 public
-Linear conformance suite 和统一 CPU FP64 GEMM oracle 负责。
+benchmark 不承担数值 correctness；Q4/Q5/Q6/W8 和 BF16 A16 correctness 继续由各自
+public Linear conformance suite 和统一 CPU FP64 GEMM oracle 负责。

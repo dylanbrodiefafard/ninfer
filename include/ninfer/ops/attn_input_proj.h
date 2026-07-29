@@ -30,12 +30,24 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      cudaStream_t stream);
 
 /**
- * Qwen3.6-35B W8 specialization. The one W8G32_F16S RowSplit parent has shape [9216,2048]
- * and stored row order [query 4096, key 512, gate 4096, value 512]. `x` is contiguous BF16
- * [2048,T], q/gate are contiguous BF16 [4096,T], and k/v are contiguous BF16 [512,T]. Every
- * route writes the four independent final allocations directly; no parent output or transient
- * workspace is materialized. T may be any positive value. The observable outputs use the same
- * independent exact-decode oracle and A16 criterion described above.
+ * Computes the single-parent Q/K/output-gate/V projection.
+ *
+ * The parent stores rows in physical order query, key, output gate, value while the public output
+ * argument order is q, gate, k, v. Every route writes the four independently contiguous final
+ * allocations directly; no packed parent output or transient workspace is materialized.
+ *
+ * Registered parent forms are:
+ *
+ * - W8G32_F16S RowSplit `[9216,2048]`, with row counts `[4096,512,4096,512]`. `x` is
+ *   BF16 `[2048,T]`, q/gate are BF16 `[4096,T]`, and k/v are BF16 `[512,T]`.
+ * - BF16_CTRL Contiguous `[14336,5120]`, with row counts `[6144,1024,6144,1024]`. `x` is
+ *   BF16 `[5120,T]`, q/gate are BF16 `[6144,T]`, and k/v are BF16 `[1024,T]`.
+ *
+ * `T` is the positive token extent of the Op contract.
+ *
+ * The oracle evaluates every projection independently with naive FP64 accumulation from the
+ * logical values represented by the persistent weight and BF16 activation. The final four BF16
+ * stores belong to the Op's A16 numerical criterion.
  */
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,
                      Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);

@@ -72,9 +72,9 @@ load, graph construction, and warmup do not enter topology counts.
 ## Linear Op benchmark
 
 `ninfer_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,
-and W8 packed weights with the current A16 activation-compute policy. LinearAdd, LinearSwiGLU,
-LinearPair, Attention/GDN projections, and sparse MoE remain separate semantic Ops and are not
-benchmark modes here.
+W8, and registered BF16 weights with the current A16 activation-compute policy. LinearAdd,
+LinearSwiGLU, LinearPair, Attention/GDN projections, and sparse MoE remain separate semantic Ops
+and are not benchmark modes here.
 
 Build the benchmark and measure one exact production point:
 
@@ -120,7 +120,10 @@ interval. Reported effective bandwidth uses the encoded weight planes once, one 
 read, and one BF16 output write. Reported FLOPs are the mathematical `2*N*K*T`; neither metric
 copies route-private tile, replay, padding, split, schedule, host-launcher, or kernel-instance
 behavior. The fixed RTX 5090 references are `1792 GB/s` DRAM bandwidth and `209.5 TFLOP/s` dense
-BF16 Tensor Core throughput. Physical traffic and instruction utilization require NCU.
+BF16 Tensor Core throughput. `READ_%` additionally compares the same one-read model bytes with the
+measured `1674.5 GB/s` pure-read ceiling from `tools/hbm_bandwidth_probe.cu`; it is the practical
+utilization measure for read-dominated points. Physical traffic and instruction utilization still
+require NCU.
 
 ## GDN control-projection Op benchmark
 
@@ -167,11 +170,12 @@ cmake --build build --parallel --target ninfer_gated_delta_rule_bench ninfer_gdn
 ## Input-projection Op benchmark
 
 `ninfer_input_proj_bench` measures the exact Qwen3.6-27B Attention and GDN input-projection shapes.
-Attention production uses the two parent projections and its benchmark-only control uses the
-former four logical projections. GDN production writes directly into the pitched final output;
-its controls isolate projection time and the former materialize-plus-two-copy composition. All
-timed operands are allocated before measurement, and each sample is preceded by a 256 MiB L2 flush.
-Production accepts the Text token extent through the benchmark allocation limit; controls remain
+The default Q4/Q5 Attention production path uses two parent projections and its benchmark-only
+control uses the former four logical projections. BF16 mode measures the single-parent Attention
+route. GDN production writes directly into the pitched final output; its controls isolate
+projection time and the former materialize-plus-two-copy composition. All timed operands are
+allocated before measurement, and each sample is preceded by a 256 MiB L2 flush. Existing Q4/Q5
+production accepts the Text token extent through the benchmark allocation limit; controls remain
 limited to their Small-T domain.
 
 ```bash
@@ -183,6 +187,19 @@ cmake --build build --parallel --target ninfer_input_proj_bench
 
 The four-projection and materialize/copy controls exist only in this benchmark and are not
 production-callable routes.
+
+The BF16 Attention decode point is:
+
+```bash
+./build/bench/ninfer_input_proj_bench \
+  --op attention --weight-type bf16 --t-sweep 1 \
+  --warmup 20 --repeat 500
+```
+
+It counts the complete BF16 parent exactly once, one activation read, and the four final output
+writes. The result reports the same fixed-spec `DRAM_%` and measured pure-read `READ_%` columns as
+the Linear control. `--profile` performs setup, warmup, and L2 eviction before capturing exactly
+one public BF16 `attn_input_proj` call.
 
 ## Bidirectional GQA Op benchmark
 

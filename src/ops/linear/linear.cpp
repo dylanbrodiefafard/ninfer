@@ -1,5 +1,6 @@
 #include "ninfer/ops/linear.h"
 
+#include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
@@ -90,6 +91,8 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
         detail::w8_dispatch(x, w, out, policy, stream);
         return;
     case QType::BF16_CTRL:
+        detail::bf16_dispatch(x, w, out, policy, stream);
+        return;
     case QType::FP32_CTRL:
     case QType::I32_CTRL:
     case QType::NVFP4:

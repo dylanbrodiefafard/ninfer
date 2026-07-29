@@ -1,16 +1,21 @@
 #include "ninfer/ops/attn_input_proj.h"
 
+#include "ops/direct_bf16_weight.h"
 #include "ops/input_projection_test_common.h"
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
+#include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace ninfer;
 using namespace ninfer::test;
+using namespace ninfer::test::direct_bf16_weight;
 using namespace ninfer::test::input_projection;
 
 namespace {
@@ -81,6 +86,82 @@ int run_q4_q5() {
     for (const std::int32_t tokens : {1, 2, 16, 17}) {
         failures += run_q4_q5_case(query_key, gate_value, tokens);
     }
+    return failures;
+}
+
+std::vector<double> bf16_attention_oracle(const HostWeight& weight,
+                                          std::span<const float> activation) {
+    std::vector<double> result(static_cast<std::size_t>(weight.n));
+    const unsigned available   = std::max(1U, std::thread::hardware_concurrency());
+    const std::int32_t threads = std::min(weight.n, static_cast<std::int32_t>(available));
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<std::size_t>(threads));
+    for (std::int32_t thread = 0; thread < threads; ++thread) {
+        const std::int32_t begin =
+            static_cast<std::int32_t>((static_cast<std::int64_t>(weight.n) * thread) / threads);
+        const std::int32_t end = static_cast<std::int32_t>(
+            (static_cast<std::int64_t>(weight.n) * (thread + 1)) / threads);
+        workers.emplace_back([&, begin, end] {
+            for (std::int32_t row = begin; row < end; ++row) {
+                result[static_cast<std::size_t>(row)] = dot_fp64(weight, row, activation);
+            }
+        });
+    }
+    for (std::thread& worker : workers) { worker.join(); }
+    return result;
+}
+
+int verify_direct_output(std::string_view label, const GuardedBf16Tensor& output,
+                         std::span<const double> expected) {
+    int failures = output.verify_guards(label);
+    failures += output.verify_fully_written(label);
+    failures +=
+        compare(label, output.values(), std::vector<double>(expected.begin(), expected.end()),
+                kAttnInputProjA16Tolerance);
+    return failures;
+}
+
+int run_bf16_target() {
+    constexpr std::int32_t kHidden     = 5120;
+    constexpr std::int32_t kQRows      = 6144;
+    constexpr std::int32_t kKvRows     = 1024;
+    constexpr std::int32_t kParentRows = 14336;
+    DeviceWeight parent(make_patterned(kParentRows, kHidden, 313U));
+    const std::vector<float> activation              = make_bf16_activation(kHidden, 1, 317U);
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    DeviceBuffer device_activation                   = to_device(activation_bits);
+    const std::vector<double> expected = bf16_attention_oracle(parent.host, activation);
+
+    GuardedBf16Tensor query(kQRows, 1);
+    GuardedBf16Tensor gate(kQRows, 1);
+    GuardedBf16Tensor key(kKvRows, 1);
+    GuardedBf16Tensor value(kKvRows, 1);
+    Tensor x(device_activation.p, DType::BF16, {kHidden, 1});
+    Tensor q = query.tensor();
+    Tensor g = gate.tensor();
+    Tensor k = key.tensor();
+    Tensor v = value.tensor();
+    ops::attn_input_proj(x, parent.view(), q, g, k, v, nullptr);
+    cuda_synchronize();
+
+    constexpr std::int32_t kKeyBegin   = kQRows;
+    constexpr std::int32_t kGateBegin  = kKeyBegin + kKvRows;
+    constexpr std::int32_t kValueBegin = kGateBegin + kQRows;
+    int failures                       = 0;
+    failures += verify_direct_output(
+        "attn q BF16 A16 T=1", query,
+        std::span<const double>(expected.data(), static_cast<std::size_t>(kQRows)));
+    failures += verify_direct_output(
+        "attn k BF16 A16 T=1", key,
+        std::span<const double>(expected.data() + kKeyBegin, static_cast<std::size_t>(kKvRows)));
+    failures += verify_direct_output(
+        "attn gate BF16 A16 T=1", gate,
+        std::span<const double>(expected.data() + kGateBegin, static_cast<std::size_t>(kQRows)));
+    failures += verify_direct_output(
+        "attn value BF16 A16 T=1", value,
+        std::span<const double>(expected.data() + kValueBegin, static_cast<std::size_t>(kKvRows)));
+    failures += verify_preserved("attn x BF16 A16 T=1", device_activation, activation_bits);
+    failures += parent.verify_preserved("attn parent BF16 A16 T=1");
     return failures;
 }
 
@@ -183,6 +264,7 @@ int main() {
 
     int failures = 0;
     failures += run_q4_q5();
+    failures += run_bf16_target();
     failures += run_w8_target();
     failures += run_w8_companion();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " attn_input_proj\n";

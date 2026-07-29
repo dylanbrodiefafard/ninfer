@@ -379,6 +379,11 @@ from the finite formats, shapes, and devices that NInfer actually supports. Keep
 independent of benchmark or schedule phases, and preserve separately declared domains such as
 Vision P/V.
 
+A projection Op whose matrix arithmetic matches Linear may instantiate a Linear-owned computation
+body with an Op-local compile-time output/epilogue policy. The owning Op still defines and
+dispatches its output mapping and observable fusion boundary; it does not call public `linear`,
+expose a packed temporary, or copy the computation body into its own subtree.
+
 ### 5.6 Implementation comments
 
 Launcher and kernel files reference the semantic contract instead of copying it. Record the match

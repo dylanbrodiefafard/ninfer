@@ -9,12 +9,15 @@
 #include "ninfer/ops/scatter.h"
 
 #include "core/device.h"
+#include "direct_bf16_weight.cuh"
 #include "ninfer_bench_common.h"
 #include "quantized_weight.cuh"
 
+#include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -31,24 +34,30 @@ using namespace ninfer;
 
 namespace {
 
-constexpr std::int32_t kHidden         = 5120;
-constexpr std::int32_t kQueryRows      = 6144;
-constexpr std::int32_t kKvRows         = 1024;
-constexpr std::int32_t kParentRows     = kQueryRows + kKvRows;
-constexpr std::int32_t kGdnQkRows      = 4096;
-constexpr std::int32_t kGdnValueRows   = 6144;
-constexpr std::int32_t kGdnZRows       = 6144;
-constexpr std::int32_t kGdnValueZRows  = kGdnValueRows + kGdnZRows;
-constexpr std::int32_t kGdnRows        = kGdnQkRows + kGdnValueRows;
-constexpr std::int32_t kGdnKeyRows     = 2048;
-constexpr std::int32_t kGdnSlots       = 7;
-constexpr std::int32_t kMaxBenchTokens = 16384;
-constexpr std::size_t kFlushBytes      = 256ULL << 20;
+constexpr std::int32_t kHidden            = 5120;
+constexpr std::int32_t kQueryRows         = 6144;
+constexpr std::int32_t kKvRows            = 1024;
+constexpr std::int32_t kParentRows        = kQueryRows + kKvRows;
+constexpr std::int32_t kGdnQkRows         = 4096;
+constexpr std::int32_t kGdnValueRows      = 6144;
+constexpr std::int32_t kGdnZRows          = 6144;
+constexpr std::int32_t kGdnValueZRows     = kGdnValueRows + kGdnZRows;
+constexpr std::int32_t kGdnRows           = kGdnQkRows + kGdnValueRows;
+constexpr std::int32_t kGdnKeyRows        = 2048;
+constexpr std::int32_t kGdnSlots          = 7;
+constexpr std::int32_t kMaxBenchTokens    = 16384;
+constexpr std::size_t kFlushBytes         = 256ULL << 20;
+constexpr double kRtx5090DramGBs          = 1792.0;
+constexpr double kRtx5090SustainedReadGBs = 1674.5;
+constexpr double kRtx5090Bf16Tflops       = 209.5;
 
 enum class OpSelection { All, Attention, Gdn };
+enum class AttentionWeightType { Q4Q5, Bf16 };
 
 struct Options {
-    OpSelection op = OpSelection::All;
+    OpSelection op                            = OpSelection::All;
+    AttentionWeightType attention_weight_type = AttentionWeightType::Q4Q5;
+    bool profile                              = false;
     std::vector<std::int32_t> t_sweep{1,  2,  3,  4,  5,  6,  7,  8,   9,   10,
                                       11, 12, 13, 14, 15, 16, 17, 128, 129, 1024};
     int warmup = 5;
@@ -104,6 +113,17 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (arg == "--t-sweep") {
             options.t_sweep = parse_t_sweep(next("--t-sweep value"));
+        } else if (arg == "--weight-type") {
+            const std::string_view value = next("--weight-type value");
+            if (value == "q4q5") {
+                options.attention_weight_type = AttentionWeightType::Q4Q5;
+            } else if (value == "bf16") {
+                options.attention_weight_type = AttentionWeightType::Bf16;
+            } else {
+                throw std::invalid_argument("--weight-type must be q4q5 or bf16");
+            }
+        } else if (arg == "--profile") {
+            options.profile = true;
         } else if (arg == "--warmup") {
             options.warmup = std::stoi(std::string(next("--warmup value")));
         } else if (arg == "--repeat") {
@@ -111,8 +131,9 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--csv-out") {
             options.csv_out = next("--csv-out path");
         } else if (arg == "--help" || arg == "-h") {
-            std::printf("Usage: %s [--op all|attention|gdn] [--t-sweep 1,2,...] "
-                        "[--warmup N] [--repeat N] [--csv-out PATH]\n",
+            std::printf("Usage: %s [--op all|attention|gdn] [--weight-type q4q5|bf16] "
+                        "[--t-sweep 1,2,...] [--profile] [--warmup N] [--repeat N] "
+                        "[--csv-out PATH]\n",
                         argv[0]);
             std::exit(0);
         } else {
@@ -121,6 +142,23 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.warmup < 0 || options.repeat <= 0) {
         throw std::invalid_argument("--warmup must be nonnegative and --repeat positive");
+    }
+    if (options.attention_weight_type == AttentionWeightType::Bf16) {
+        if (options.op != OpSelection::Attention) {
+            throw std::invalid_argument("BF16 weight mode requires --op attention");
+        }
+        if (options.t_sweep.size() != 1 || options.t_sweep.front() != 1) {
+            throw std::invalid_argument("BF16 attention currently requires --t-sweep 1");
+        }
+    }
+    if (options.profile) {
+        if (options.attention_weight_type != AttentionWeightType::Bf16 ||
+            options.op != OpSelection::Attention || options.t_sweep.size() != 1) {
+            throw std::invalid_argument("--profile requires one BF16 Attention point");
+        }
+        if (!options.csv_out.empty()) {
+            throw std::invalid_argument("--profile does not write timing CSV");
+        }
     }
     return options;
 }
@@ -161,6 +199,151 @@ void write_csv(const std::string& path, const std::vector<Result>& results,
     }
 }
 
+struct Bf16AttentionResult {
+    bench::ColdTiming timing;
+    std::uint64_t weight_bytes = 0;
+    std::uint64_t x_bytes      = 0;
+    std::uint64_t out_bytes    = 0;
+    std::uint64_t model_bytes  = 0;
+    double useful_flops        = 0.0;
+    double effective_gbs       = 0.0;
+    double dram_spec_pct       = 0.0;
+    double sustained_read_pct  = 0.0;
+    double useful_tflops       = 0.0;
+    double bf16_spec_pct       = 0.0;
+    double memory_floor_us     = 0.0;
+    double compute_floor_us    = 0.0;
+    double roofline_floor_us   = 0.0;
+    double roofline_pct        = 0.0;
+    const char* bound          = "";
+};
+
+Bf16AttentionResult make_bf16_attention_result(const bench::ColdTiming& timing,
+                                               std::uint64_t weight_bytes) {
+    constexpr std::uint64_t kXBytes   = static_cast<std::uint64_t>(kHidden) * 2;
+    constexpr std::uint64_t kOutBytes = static_cast<std::uint64_t>(14336) * 2;
+    const std::uint64_t model_bytes   = weight_bytes + kXBytes + kOutBytes;
+    const double useful_flops = 2.0 * static_cast<double>(14336) * static_cast<double>(kHidden);
+    const double seconds      = timing.median_us * 1.0e-6;
+    const double memory_floor_us =
+        static_cast<double>(model_bytes) / (kRtx5090DramGBs * 1.0e9) * 1.0e6;
+    const double compute_floor_us  = useful_flops / (kRtx5090Bf16Tflops * 1.0e12) * 1.0e6;
+    const double roofline_floor_us = std::max(memory_floor_us, compute_floor_us);
+
+    Bf16AttentionResult result;
+    result.timing             = timing;
+    result.weight_bytes       = weight_bytes;
+    result.x_bytes            = kXBytes;
+    result.out_bytes          = kOutBytes;
+    result.model_bytes        = model_bytes;
+    result.useful_flops       = useful_flops;
+    result.effective_gbs      = static_cast<double>(model_bytes) / seconds / 1.0e9;
+    result.dram_spec_pct      = result.effective_gbs / kRtx5090DramGBs * 100.0;
+    result.sustained_read_pct = result.effective_gbs / kRtx5090SustainedReadGBs * 100.0;
+    result.useful_tflops      = useful_flops / seconds / 1.0e12;
+    result.bf16_spec_pct      = result.useful_tflops / kRtx5090Bf16Tflops * 100.0;
+    result.memory_floor_us    = memory_floor_us;
+    result.compute_floor_us   = compute_floor_us;
+    result.roofline_floor_us  = roofline_floor_us;
+    result.roofline_pct       = roofline_floor_us / timing.median_us * 100.0;
+    result.bound              = memory_floor_us >= compute_floor_us ? "memory" : "compute";
+    return result;
+}
+
+void print_bf16_attention_result(const Bf16AttentionResult& result) {
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp properties{};
+    CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
+    std::printf("# actual_gpu=%s sm=%d%d reference_gpu=RTX_5090\n", properties.name,
+                properties.major, properties.minor);
+    std::printf("# dram_spec_gbs=%.1f sustained_read_gbs=%.1f bf16_dense_tc_spec_tflops=%.1f "
+                "cache=cold\n",
+                kRtx5090DramGBs, kRtx5090SustainedReadGBs, kRtx5090Bf16Tflops);
+    std::printf("%-10s %-22s %5s %8s %8s %6s %11s %11s %11s %10s %7s %7s %10s %7s %7s %9s\n", "op",
+                "path", "type", "N", "K", "T", "median_us", "min_us", "p95_us", "eff_GB/s",
+                "DRAM_%", "READ_%", "TFLOP/s", "TC_%", "bound", "roof_%");
+    std::printf("%-10s %-22s %5s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %7.2f "
+                "%7.2f %10.2f %7.2f %7s %9.2f\n",
+                "attention", "production_parent", "BF16", 14336, kHidden, 1,
+                result.timing.median_us, result.timing.min_us, result.timing.p95_us,
+                result.effective_gbs, result.dram_spec_pct, result.sustained_read_pct,
+                result.useful_tflops, result.bf16_spec_pct, result.bound, result.roofline_pct);
+}
+
+void write_bf16_attention_csv(const std::string& path, const Bf16AttentionResult& result,
+                              const Options& options) {
+    if (path.empty()) { return; }
+    const std::filesystem::path output(path);
+    if (!output.parent_path().empty()) {
+        std::filesystem::create_directories(output.parent_path());
+    }
+    std::ofstream stream(output);
+    if (!stream) { throw std::runtime_error("failed to open CSV: " + path); }
+    stream << "op,path,weight_type,N,K,T,weight_bytes,x_bytes,out_bytes,model_bytes,useful_flops,"
+              "median_us,min_us,p95_us,effective_gbs,dram_spec_gbs,dram_spec_pct,"
+              "sustained_read_gbs,sustained_read_pct,useful_tflops,"
+              "bf16_dense_tc_spec_tflops,bf16_tc_spec_pct,memory_floor_us,compute_floor_us,"
+              "roofline_floor_us,bound,roofline_pct,warmup,repeat,flush_bytes\n";
+    stream << "attention,production_parent,BF16,14336," << kHidden << ",1," << result.weight_bytes
+           << ',' << result.x_bytes << ',' << result.out_bytes << ',' << result.model_bytes << ','
+           << result.useful_flops << ',' << result.timing.median_us << ',' << result.timing.min_us
+           << ',' << result.timing.p95_us << ',' << result.effective_gbs << ',' << kRtx5090DramGBs
+           << ',' << result.dram_spec_pct << ',' << kRtx5090SustainedReadGBs << ','
+           << result.sustained_read_pct << ',' << result.useful_tflops << ',' << kRtx5090Bf16Tflops
+           << ',' << result.bf16_spec_pct << ',' << result.memory_floor_us << ','
+           << result.compute_floor_us << ',' << result.roofline_floor_us << ',' << result.bound
+           << ',' << result.roofline_pct << ',' << options.warmup << ',' << options.repeat << ','
+           << kFlushBytes << '\n';
+}
+
+void run_bf16_attention(const Options& options, DeviceBuffer& flush, cudaStream_t stream) {
+    constexpr std::int32_t kRows   = 14336;
+    bench::DirectBf16Weight weight = bench::make_direct_bf16_weight(kRows, kHidden, 0x61U);
+    DeviceBuffer input             = bench::make_bf16(static_cast<std::size_t>(kHidden));
+    DeviceBuffer query(static_cast<std::size_t>(kQueryRows) * 2);
+    DeviceBuffer gate(static_cast<std::size_t>(kQueryRows) * 2);
+    DeviceBuffer key(static_cast<std::size_t>(kKvRows) * 2);
+    DeviceBuffer value(static_cast<std::size_t>(kKvRows) * 2);
+    Tensor x(input.p, DType::BF16, {kHidden, 1});
+    Tensor q(query.p, DType::BF16, {kQueryRows, 1});
+    Tensor g(gate.p, DType::BF16, {kQueryRows, 1});
+    Tensor k(key.p, DType::BF16, {kKvRows, 1});
+    Tensor v(value.p, DType::BF16, {kKvRows, 1});
+    const auto launch = [&](cudaStream_t launch_stream) {
+        ops::attn_input_proj(x, weight.weight, q, g, k, v, launch_stream);
+    };
+
+    if (options.profile) {
+        for (int iteration = 0; iteration < options.warmup; ++iteration) {
+            bench::flush_l2(flush, stream);
+            launch(stream);
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        bench::flush_l2(flush, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const std::uint64_t model_bytes =
+            weight.model_weight_bytes() + static_cast<std::uint64_t>(kHidden + kRows) * 2;
+        const double useful_flops = 2.0 * static_cast<double>(kRows) * static_cast<double>(kHidden);
+        std::printf("PROFILE attn_input_proj weight_type=BF16 N=%d K=%d T=1 model_bytes=%llu "
+                    "useful_flops=%.0f\n",
+                    kRows, kHidden, static_cast<unsigned long long>(model_bytes), useful_flops);
+        std::fflush(stdout);
+        CUDA_CHECK(cudaProfilerStart());
+        launch(stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaProfilerStop());
+        return;
+    }
+
+    const bench::ColdTiming timing =
+        bench::measure_cold_launch(launch, flush, stream, options.warmup, options.repeat);
+    const Bf16AttentionResult result =
+        make_bf16_attention_result(timing, weight.model_weight_bytes());
+    print_bf16_attention_result(result);
+    write_bf16_attention_csv(options.csv_out, result, options);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -175,6 +358,12 @@ int main(int argc, char** argv) {
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         ninfer::DeviceBuffer flush(kFlushBytes);
+        if (options.attention_weight_type == AttentionWeightType::Bf16) {
+            run_bf16_attention(options, flush, stream);
+            CUDA_CHECK(cudaStreamDestroy(stream));
+            return 0;
+        }
+
         ninfer::DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t);
         const std::size_t workspace_bytes =
             options.op == OpSelection::Attention

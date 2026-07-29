@@ -1,5 +1,6 @@
 #include "ninfer/ops/attn_input_proj.h"
 
+#include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/attn_input_proj/w8/w8_attn_input_plan.h"
 
@@ -49,6 +50,20 @@ void require_w8_rowsplit(const Weight& weight, std::int32_t rows, const char* la
     }
 }
 
+void require_bf16_contiguous(const Weight& weight, std::int32_t rows, std::int32_t hidden,
+                             const char* label) {
+    const std::uint64_t payload_bytes = static_cast<std::uint64_t>(rows) *
+                                        static_cast<std::uint64_t>(hidden) * sizeof(std::uint16_t);
+    if (weight.qtype != QType::BF16_CTRL || weight.layout != QuantLayout::Contiguous ||
+        weight.payload_bytes < payload_bytes || weight.high_plane_bytes != 0 || weight.ndim != 2 ||
+        weight.n != rows || weight.k != hidden || weight.shape[0] != rows ||
+        weight.shape[1] != hidden || weight.padded_shape[0] != rows ||
+        weight.padded_shape[1] != hidden || weight.qhigh != nullptr || weight.scales != nullptr ||
+        weight.group_size != 0 || weight.group != 0 || !aligned_to(weight.qdata, 16)) {
+        throw std::invalid_argument(std::string("attn_input_proj: invalid ") + label);
+    }
+}
+
 } // namespace
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
@@ -72,6 +87,24 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,
                      Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
+    if (query_key_gate_value_weight.qtype == QType::BF16_CTRL) {
+        constexpr std::int32_t kHidden = 5120;
+        constexpr std::int32_t kQRows  = 6144;
+        constexpr std::int32_t kKvRows = 1024;
+        constexpr std::int32_t kRows   = 14336;
+        const std::int32_t cols        = x.ne[1];
+        if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
+        require_matrix(x, kHidden, cols, "x");
+        require_matrix(q, kQRows, cols, "q");
+        require_matrix(gate, kQRows, cols, "gate");
+        require_matrix(k, kKvRows, cols, "k");
+        require_matrix(v, kKvRows, cols, "v");
+        require_bf16_contiguous(query_key_gate_value_weight, kRows, kHidden,
+                                "query/key/gate/value weight");
+        detail::bf16_attn_input_dispatch(x, query_key_gate_value_weight, q, gate, k, v, stream);
+        return;
+    }
+
     constexpr std::int32_t kHidden = 2048;
     constexpr std::int32_t kQRows  = 4096;
     constexpr std::int32_t kKvRows = 512;

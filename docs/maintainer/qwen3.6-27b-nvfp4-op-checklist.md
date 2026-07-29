@@ -75,8 +75,8 @@ intermediate.
 
 The current Op baseline already provides `QType::NVFP4`, its block-scale layout identity, exact
 decode fixtures, the revised 27B Q4/Q5 GDN Q/K/V/Z contracts, and single-parent W8 Attention/GDN
-overloads. It does not yet admit any of the eight exact NVFP4/BF16 problems below, so every item
-starts unchecked.
+overloads. No table item is complete; partial implementation progress is recorded only where it
+changes the next required step.
 
 ## 3. Required format/problem registrations
 
@@ -179,6 +179,14 @@ output allocation order does not.
 A2 is required even though it contains no NVFP4 weight: without it, the six BF16 attention-input
 parents in the NVFP4 artifact do not have an Op consumer. Its distinction from BF16 `linear` is the
 same four-contiguous-output contract as A1, not different projection arithmetic.
+
+Current A2 progress, which does not mark A2 complete:
+
+- [x] the exact contiguous BF16 parent `[14336,5120]` is admitted at `T=1`;
+- [x] the public call writes Q, gate, K, and V directly with the required physical-row mapping;
+- [x] the complete `T=1` outputs pass the independent represented-BF16/FP64 oracle while existing
+  Q4/Q5 and W8 cases remain qualified;
+- [ ] Small-T and prefill execution regions still need to make every positive `T` executable.
 
 ## 5. GDN input projection
 

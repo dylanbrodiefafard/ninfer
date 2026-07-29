@@ -10,6 +10,7 @@
 #include "ninfer/ops/linear.h"
 
 #include "core/device.h"
+#include "direct_bf16_weight.cuh"
 #include "ninfer_bench_common.h"
 #include "quantized_weight.cuh"
 
@@ -38,6 +39,7 @@ using ninfer::ops::LinearPolicy;
 namespace {
 
 constexpr double kRtx5090DramGBs           = 1792.0;
+constexpr double kRtx5090SustainedReadGBs  = 1674.5;
 constexpr double kRtx5090DenseBf16Tflops   = 209.5;
 constexpr std::uint64_t kDefaultFlushBytes = 256ULL << 20;
 constexpr int kDefaultWarmup               = 3;
@@ -149,6 +151,7 @@ struct Result {
     double p95_us              = 0.0;
     double effective_gbs       = 0.0;
     double dram_spec_pct       = 0.0;
+    double sustained_read_pct  = 0.0;
     double useful_tflops       = 0.0;
     double bf16_tc_spec_pct    = 0.0;
     double memory_floor_us     = 0.0;
@@ -160,6 +163,14 @@ struct Result {
     int warmup                 = 0;
     int repeat                 = 0;
     std::uint64_t flush_bytes  = 0;
+};
+
+struct LinearBenchWeight {
+    DeviceBuffer storage;
+    Weight weight{};
+    std::uint64_t model_bytes = 0;
+
+    [[nodiscard]] std::uint64_t model_weight_bytes() const noexcept { return model_bytes; }
 };
 
 __global__ void fill_bf16_kernel(__nv_bfloat16* values, std::uint64_t count) {
@@ -215,6 +226,8 @@ const char* qtype_name(QType qtype) {
         return "Q6";
     case QType::W8G32_F16S:
         return "W8";
+    case QType::BF16_CTRL:
+        return "BF16";
     default:
         break;
     }
@@ -232,6 +245,7 @@ QType parse_qtype(std::string_view text) {
     if (value == "q5" || value == "q5g64_f16s") { return QType::Q5G64_F16S; }
     if (value == "q6" || value == "q6g64_f16s") { return QType::Q6G64_F16S; }
     if (value == "w8" || value == "w8g32" || value == "w8g32_f16s") { return QType::W8G32_F16S; }
+    if (value == "bf16" || value == "bf16_ctrl") { return QType::BF16_CTRL; }
     throw std::invalid_argument("unknown qtype: " + std::string(text));
 }
 
@@ -297,8 +311,8 @@ void usage(const char* argv0) {
     std::fprintf(
         stderr,
         "Usage:\n"
-        "  %s --qtype Q4|Q5|Q6|W8 --n N --k K --t T [options]\n"
-        "  %s --qtype Q4|Q5|Q6|W8 --n N --k K --sweep START:END[:STEP] [options]\n"
+        "  %s --qtype Q4|Q5|Q6|W8|BF16 --n N --k K --t T [options]\n"
+        "  %s --qtype Q4|Q5|Q6|W8|BF16 --n N --k K --sweep START:END[:STEP] [options]\n"
         "  %s --suite qwen3_6_27b|qwen3_6_35b_a3b|all [options]\n\n"
         "Options:\n"
         "  --policy a16       Activation-compute policy (default a16; only current option).\n"
@@ -468,13 +482,21 @@ std::vector<PointGroup> group_points(const std::vector<BenchPoint>& points) {
     return groups;
 }
 
-bench::PackedQuantizedWeight make_weight(QType qtype, std::int32_t n, std::int32_t k) {
+LinearBenchWeight make_weight(QType qtype, std::int32_t n, std::int32_t k) {
+    if (qtype == QType::BF16_CTRL) {
+        bench::DirectBf16Weight direct  = bench::make_direct_bf16_weight(n, k);
+        const std::uint64_t model_bytes = direct.model_weight_bytes();
+        return {std::move(direct.storage), direct.weight, model_bytes};
+    }
     const std::uint64_t padded_k_u64 = align_up(static_cast<std::uint64_t>(k), 128);
     if (padded_k_u64 > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("padded K does not fit int32");
     }
-    return bench::make_row_split_weight(qtype, n, k, static_cast<std::int32_t>(padded_k_u64),
-                                        bench::QuantizedWeightFill{0x31, 0xa5, 0x3c00});
+    bench::PackedQuantizedWeight packed =
+        bench::make_row_split_weight(qtype, n, k, static_cast<std::int32_t>(padded_k_u64),
+                                     bench::QuantizedWeightFill{0x31, 0xa5, 0x3c00});
+    const std::uint64_t model_bytes = packed.model_weight_bytes();
+    return {std::move(packed.storage), packed.weight, model_bytes};
 }
 
 void fill_activation(DeviceBuffer& buffer, std::uint64_t elements, cudaStream_t stream) {
@@ -492,7 +514,7 @@ std::string join_labels(const std::vector<std::string>& labels) {
     return out;
 }
 
-Result make_result(const BenchPoint& point, const bench::PackedQuantizedWeight& weight,
+Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
                    const bench::ColdTiming& timing, const Options& opt) {
     const std::uint64_t x_elements =
         checked_mul(static_cast<std::uint64_t>(point.k), point.t, "activation elements");
@@ -511,32 +533,33 @@ Result make_result(const BenchPoint& point, const bench::PackedQuantizedWeight& 
     const double roofline_floor_us = std::max(memory_floor_us, compute_floor_us);
 
     Result result;
-    result.labels            = join_labels(point.labels);
-    result.qtype_name        = qtype_name(point.qtype);
-    result.policy_name       = policy_name(point.policy);
-    result.n                 = point.n;
-    result.k                 = point.k;
-    result.t                 = point.t;
-    result.weight_bytes      = weight.model_weight_bytes();
-    result.x_bytes           = x_bytes;
-    result.out_bytes         = out_bytes;
-    result.model_bytes       = model_bytes;
-    result.useful_flops      = useful_flops;
-    result.median_us         = timing.median_us;
-    result.min_us            = timing.min_us;
-    result.p95_us            = timing.p95_us;
-    result.effective_gbs     = static_cast<double>(model_bytes) / seconds / 1.0e9;
-    result.dram_spec_pct     = result.effective_gbs / kRtx5090DramGBs * 100.0;
-    result.useful_tflops     = useful_flops / seconds / 1.0e12;
-    result.bf16_tc_spec_pct  = result.useful_tflops / kRtx5090DenseBf16Tflops * 100.0;
-    result.memory_floor_us   = memory_floor_us;
-    result.compute_floor_us  = compute_floor_us;
-    result.roofline_floor_us = roofline_floor_us;
-    result.roofline_pct      = roofline_floor_us / timing.median_us * 100.0;
-    result.bound             = memory_floor_us >= compute_floor_us ? "memory" : "compute";
-    result.warmup            = opt.warmup;
-    result.repeat            = opt.repeat;
-    result.flush_bytes       = opt.flush_bytes;
+    result.labels             = join_labels(point.labels);
+    result.qtype_name         = qtype_name(point.qtype);
+    result.policy_name        = policy_name(point.policy);
+    result.n                  = point.n;
+    result.k                  = point.k;
+    result.t                  = point.t;
+    result.weight_bytes       = weight.model_weight_bytes();
+    result.x_bytes            = x_bytes;
+    result.out_bytes          = out_bytes;
+    result.model_bytes        = model_bytes;
+    result.useful_flops       = useful_flops;
+    result.median_us          = timing.median_us;
+    result.min_us             = timing.min_us;
+    result.p95_us             = timing.p95_us;
+    result.effective_gbs      = static_cast<double>(model_bytes) / seconds / 1.0e9;
+    result.dram_spec_pct      = result.effective_gbs / kRtx5090DramGBs * 100.0;
+    result.sustained_read_pct = result.effective_gbs / kRtx5090SustainedReadGBs * 100.0;
+    result.useful_tflops      = useful_flops / seconds / 1.0e12;
+    result.bf16_tc_spec_pct   = result.useful_tflops / kRtx5090DenseBf16Tflops * 100.0;
+    result.memory_floor_us    = memory_floor_us;
+    result.compute_floor_us   = compute_floor_us;
+    result.roofline_floor_us  = roofline_floor_us;
+    result.roofline_pct       = roofline_floor_us / timing.median_us * 100.0;
+    result.bound              = memory_floor_us >= compute_floor_us ? "memory" : "compute";
+    result.warmup             = opt.warmup;
+    result.repeat             = opt.repeat;
+    result.flush_bytes        = opt.flush_bytes;
     return result;
 }
 
@@ -551,7 +574,7 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
     const std::uint64_t out_elements =
         checked_mul(static_cast<std::uint64_t>(group.n), max_t, "output allocation");
 
-    bench::PackedQuantizedWeight weight = make_weight(group.qtype, group.n, group.k);
+    LinearBenchWeight weight = make_weight(group.qtype, group.n, group.k);
     DeviceBuffer x(checked_mul(x_elements, 2, "activation allocation bytes"));
     DeviceBuffer out(checked_mul(out_elements, 2, "output allocation bytes"));
     fill_activation(x, x_elements, stream);
@@ -586,7 +609,7 @@ void run_profile(const BenchPoint& point, const Options& opt, DeviceBuffer& flus
         checked_mul(static_cast<std::uint64_t>(point.k), point.t, "activation allocation");
     const std::uint64_t out_elements =
         checked_mul(static_cast<std::uint64_t>(point.n), point.t, "output allocation");
-    bench::PackedQuantizedWeight weight = make_weight(point.qtype, point.n, point.k);
+    LinearBenchWeight weight = make_weight(point.qtype, point.n, point.k);
     DeviceBuffer x(checked_mul(x_elements, 2, "activation allocation bytes"));
     DeviceBuffer out(checked_mul(out_elements, 2, "output allocation bytes"));
     fill_activation(x, x_elements, stream);
@@ -631,14 +654,16 @@ void print_header() {
     CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
     std::printf("# actual_gpu=%s sm=%d%d reference_gpu=RTX_5090\n", properties.name,
                 properties.major, properties.minor);
-    std::printf("# dram_spec_gbs=%.1f bf16_dense_tc_spec_tflops=%.1f cache=cold\n", kRtx5090DramGBs,
-                kRtx5090DenseBf16Tflops);
+    std::printf("# dram_spec_gbs=%.1f sustained_read_gbs=%.1f bf16_dense_tc_spec_tflops=%.1f "
+                "cache=cold\n",
+                kRtx5090DramGBs, kRtx5090SustainedReadGBs, kRtx5090DenseBf16Tflops);
 }
 
 void print_results(const std::vector<Result>& results) {
-    std::printf("%-44s %3s %3s %8s %8s %6s %11s %11s %11s %10s %7s %10s %7s %7s %9s %8s\n", "label",
-                "qt", "act", "N", "K", "T", "median_us", "min_us", "p95_us", "eff_GB/s", "DRAM_%",
-                "TFLOP/s", "TC_%", "bound", "roof_%", "delta_%");
+    std::printf("%-44s %3s %3s %8s %8s %6s %11s %11s %11s %10s %7s %7s %10s %7s %7s %9s "
+                "%8s\n",
+                "label", "qt", "act", "N", "K", "T", "median_us", "min_us", "p95_us", "eff_GB/s",
+                "DRAM_%", "READ_%", "TFLOP/s", "TC_%", "bound", "roof_%", "delta_%");
     for (const Result& result : results) {
         const bool have_delta = std::isfinite(result.delta_pct);
         char delta[32];
@@ -647,12 +672,13 @@ void print_results(const std::vector<Result>& results) {
         } else {
             std::snprintf(delta, sizeof(delta), "-");
         }
-        std::printf("%-44s %3s %3s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %7.2f %10.2f %7.2f "
-                    "%7s %9.2f %8s\n",
+        std::printf("%-44s %3s %3s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %7.2f "
+                    "%7.2f %10.2f %7.2f %7s %9.2f %8s\n",
                     result.labels.c_str(), result.qtype_name, result.policy_name, result.n,
                     result.k, result.t, result.median_us, result.min_us, result.p95_us,
-                    result.effective_gbs, result.dram_spec_pct, result.useful_tflops,
-                    result.bf16_tc_spec_pct, result.bound, result.roofline_pct, delta);
+                    result.effective_gbs, result.dram_spec_pct, result.sustained_read_pct,
+                    result.useful_tflops, result.bf16_tc_spec_pct, result.bound,
+                    result.roofline_pct, delta);
     }
 }
 
@@ -671,19 +697,21 @@ void write_csv(const std::filesystem::path& path, const std::vector<Result>& res
     std::ofstream out(path);
     if (!out) { throw std::runtime_error("failed to open CSV output: " + path.string()); }
     out << "label,qtype,policy,N,K,T,weight_bytes,x_bytes,out_bytes,model_bytes,useful_flops,"
-           "median_us,min_us,p95_us,effective_gbs,dram_spec_gbs,dram_spec_pct,useful_tflops,"
-           "bf16_dense_tc_spec_tflops,bf16_tc_spec_pct,memory_floor_us,compute_floor_us,"
-           "roofline_floor_us,bound,roofline_pct,delta_pct,warmup,repeat,flush_bytes\n";
+           "median_us,min_us,p95_us,effective_gbs,dram_spec_gbs,dram_spec_pct,"
+           "sustained_read_gbs,sustained_read_pct,useful_tflops,bf16_dense_tc_spec_tflops,"
+           "bf16_tc_spec_pct,memory_floor_us,compute_floor_us,roofline_floor_us,bound,"
+           "roofline_pct,delta_pct,warmup,repeat,flush_bytes\n";
     for (const Result& result : results) {
         out << csv_quote(result.labels) << ',' << result.qtype_name << ',' << result.policy_name
             << ',' << result.n << ',' << result.k << ',' << result.t << ',' << result.weight_bytes
             << ',' << result.x_bytes << ',' << result.out_bytes << ',' << result.model_bytes << ','
             << result.useful_flops << ',' << result.median_us << ',' << result.min_us << ','
             << result.p95_us << ',' << result.effective_gbs << ',' << kRtx5090DramGBs << ','
-            << result.dram_spec_pct << ',' << result.useful_tflops << ',' << kRtx5090DenseBf16Tflops
-            << ',' << result.bf16_tc_spec_pct << ',' << result.memory_floor_us << ','
-            << result.compute_floor_us << ',' << result.roofline_floor_us << ',' << result.bound
-            << ',' << result.roofline_pct << ',';
+            << result.dram_spec_pct << ',' << kRtx5090SustainedReadGBs << ','
+            << result.sustained_read_pct << ',' << result.useful_tflops << ','
+            << kRtx5090DenseBf16Tflops << ',' << result.bf16_tc_spec_pct << ','
+            << result.memory_floor_us << ',' << result.compute_floor_us << ','
+            << result.roofline_floor_us << ',' << result.bound << ',' << result.roofline_pct << ',';
         if (std::isfinite(result.delta_pct)) { out << result.delta_pct; }
         out << ',' << result.warmup << ',' << result.repeat << ',' << result.flush_bytes << '\n';
     }

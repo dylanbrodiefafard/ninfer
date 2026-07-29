@@ -43,12 +43,12 @@ enum class LinearPolicy : std::uint8_t {
  *
  * @par Supported execution domain
  * Registered execution uses RowSplit Q4G64_F16S, Q5G64_F16S, Q6G64_F16S, or W8G32_F16S weights
- * with FP16 scales. Each format owns a finite registry of exact physical weight problems and
- * selects its kernel internally; a valid encoding and alignment do not imply arbitrary N/K
- * support. Text and MTP problems accept every positive column extent T. Registered Vision problems
- * accept raw-patch P in `{4,8,...,131072}` or merged-token V in `[1,32768]`; a matrix column does
- * not inherently represent a text token. BF16_CTRL has a reserved format-local boundary but
- * currently admits no pure Linear problem. FP32_CTRL is unsupported.
+ * with FP16 scales, plus registered contiguous BF16_CTRL problems. Each format owns a finite
+ * registry of exact physical weight problems and selects its kernel internally; a valid encoding
+ * and alignment do not imply arbitrary N/K support. Text and MTP packed-weight problems accept
+ * every positive column extent T. Registered Vision problems accept raw-patch P in
+ * `{4,8,...,131072}` or merged-token V in `[1,32768]`; a matrix column does not inherently
+ * represent a text token. BF16_CTRL admits only `LinearPolicy::A16Only`. FP32_CTRL is unsupported.
  *
  * @par Numerical contract
  * Test fixture code materializes the persistent weight as its logical FP32 dequantized matrix.
