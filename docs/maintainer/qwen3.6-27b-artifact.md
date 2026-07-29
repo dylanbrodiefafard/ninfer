@@ -716,10 +716,9 @@ their single-parent BF16 weights through `attn_input_proj` for the six early
 `query_key_gate_value` parents and through `linear_add` for attention output layers 3 and 7 and GDN
 output layer 4.
 
-Current Op completion status is authoritative only in
-[`qwen3.6-27b-nvfp4-op-checklist.md`](qwen3.6-27b-nvfp4-op-checklist.md). Until that work and the
-separate target-private binding are complete, neither partial Op support nor the implemented Q4/Q5
-GDN signature change makes the NVFP4 artifact Engine-loadable.
+Op support for all NVFP4 Text parents and BF16 exceptions described above is complete. The
+target-private binding remains separate work; Op support alone does not make the NVFP4 artifact
+Engine-loadable.
 
 ### 13.5 Production and verification
 

@@ -39,6 +39,5 @@ Active implementation references:
 - [Linear direct-route architecture and registration rules](maintainer/linear-type-dispatch-memo.md)
 - [Linear benchmark contract and registered suites](maintainer/linear-benchmark.md)
 - [Qwen3.6-27B artifact contracts, including NVFP4](maintainer/qwen3.6-27b-artifact.md)
-- [Qwen3.6-27B NVFP4 Op support checklist](maintainer/qwen3.6-27b-nvfp4-op-checklist.md)
 - [Qwen3.6-35B-A3B DFlash Op checklist](maintainer/qwen3.6-35b-a3b-dflash-op-checklist.md)
 - [Qwen3.6-35B-A3B DFlash Engine integration](maintainer/qwen3.6-35b-a3b-dflash-engine-integration.md)
