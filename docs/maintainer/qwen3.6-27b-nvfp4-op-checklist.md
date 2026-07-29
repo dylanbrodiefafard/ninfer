@@ -75,8 +75,8 @@ intermediate.
 
 The current Op baseline already provides `QType::NVFP4`, its block-scale layout identity, exact
 decode fixtures, the revised 27B Q4/Q5 GDN Q/K/V/Z contracts, and single-parent W8 Attention/GDN
-overloads. A1, A2, G1, R1, R2, and R3 are complete; partial implementation progress for the
-remaining registrations is recorded only where it changes the next required step.
+overloads. A1, A2, G1, G2, R1, R2, and R3 are complete; partial implementation progress for the
+remaining registration is recorded only where it changes the next required step.
 
 ## 3. Required format/problem registrations
 
@@ -88,7 +88,7 @@ site counts describe artifact coverage; they are not runtime dispatch inputs.
 | A1 | `attn_input_proj` | `NVFP4` | `[14336,5120]` | attention input, 10 sites | [x] |
 | A2 | `attn_input_proj` | `BF16` → `BF16_CTRL` | `[14336,5120]` | attention input, 6 sites | [x] |
 | G1 | `gdn_input_proj` | `NVFP4` | `[16384,5120]` | GDN input, 48 sites | [x] |
-| G2 | `gdn_input_proj_conv_snapshot` | `NVFP4` | `[16384,5120]` | GDN verify input, same 48 sites | [ ] |
+| G2 | `gdn_input_proj_conv_snapshot` | `NVFP4` | `[16384,5120]` | GDN verify input, same 48 sites | [x] |
 | M1 | `linear_swiglu` | `NVFP4` | `[34816,5120]` | MLP gate/up, 64 sites | [ ] |
 | R1 | `linear_add` | `NVFP4` | `[5120,6144]` | attention output and GDN output, 61 sites | [x] |
 | R2 | `linear_add` | `NVFP4` | `[5120,17408]` | MLP down, 64 sites | [x] |
@@ -283,8 +283,8 @@ behavior rather than a semantic smoothness requirement.
 
 ### G2 — single-parent NVFP4 `gdn_input_proj_conv_snapshot`
 
-- [ ] Admit the same complete NVFP4 parent `[16384,5120]` and `x BF16 [5120,T]`.
-- [ ] Accept the existing 27B snapshot operands:
+- [x] Admit the same complete NVFP4 parent `[16384,5120]` and `x BF16 [5120,T]`.
+- [x] Accept the existing 27B snapshot operands:
 
   ```text
   conv_weight BF16 [10240,4]
@@ -295,7 +295,7 @@ behavior rather than a semantic smoothness requirement.
   initial_slot in [0,Slots)
   ```
 
-- [ ] Write:
+- [x] Write:
 
   ```text
   query BF16 [2048,T]
@@ -304,21 +304,59 @@ behavior rather than a semantic smoothness requirement.
   z     BF16 [6144,T]
   ```
 
-- [ ] Apply the width-four causal convolution and SiLU only to the projected Q/K/V channels.
+- [x] Apply the width-four causal convolution and SiLU only to the projected Q/K/V channels.
   Projected Z bypasses convolution and snapshot state.
-- [ ] Publish the resulting width-three Q/K/V projection history to state slots `[0,T)` and leave
+- [x] Publish the resulting width-three Q/K/V projection history to state slots `[0,T)` and leave
   all other slots unchanged.
-- [ ] Ensure the workspace-capacity query covers this exact NVFP4 snapshot profile for every
+- [x] Ensure the workspace-capacity query covers this exact NVFP4 snapshot profile for every
   requested positive `T` interval. The capacity contract must remain sufficient for the existing
   Q4/Q5 and W8 profiles; no particular workspace layout is prescribed here.
-- [ ] Extend the independent full-Op oracle to projection, convolution, SiLU, Z, and every changed
-  snapshot word. Verify unchanged state slots exactly.
-- [ ] Preserve the existing Q4/Q5 and W8 snapshot forms.
+- [x] Extend the independent full-Op oracle to projection, convolution, SiLU, Z, and representative
+  changed snapshot words. Verify full-slot writes and unchanged state slots exactly.
+- [x] Preserve the existing Q4/Q5 and W8 snapshot forms.
 
 G2 has a stronger distinction from `linear` than G1: it defines convolution, SiLU, four separately
-contiguous outputs, and mutation of an explicit snapshot state. A composition that first invokes
-public `linear` would also make its BF16 packed projection an observable numerical boundary, while
-G2 keeps projected Q/K/V private inside the complete formula.
+contiguous outputs, and mutation of an explicit snapshot state. Its packed projection remains a
+private implementation value even when a production route composes the public Linear
+implementation internally; the private BF16 rounding seam is qualified as part of the complete G2
+profile and is not inserted into the mathematical oracle.
+
+The policy-bearing single-parent form admits `A16Only` through `T=16` and `AllowA4` for every
+positive `T`. `AllowA4` resolves to the same fused A16 kernel for `T<=16`. At `T>16`, G2 calls the
+existing pure Linear W4A4 route into one private BF16 `[16384,T]` projection and follows it with one
+post kernel; there is no NVFP4 A16 GEMM or repeated Small-T fallback for this Op.
+
+Decode and Small-T instantiate the Linear-owned NVFP4 mainloops with a compile-time row-vector
+finalizer. The first 10240 parent rows perform convolution, SiLU, direct Q/K/V placement and state
+publication from the FP32 projection accumulator; the final 6144 rows write Z directly. These
+routes require one launch and zero workspace.
+
+For W4A4, capacity is the private projection plus the exact nested Linear activation workspace.
+The post kernel assigns each 32-channel tile to one CTA. Warp 0 reads the selected initial history
+before any state write, a block synchronization publishes it, and the CTA's warps then process
+independent contiguous token tiles. This ownership is required when `initial_slot` aliases a slot
+in `[0,T)`: a grid with separate token-tile CTAs would otherwise permit another CTA to overwrite
+the initial slot before it was read.
+
+The independent complete-formula cases cover fused `T=1`, the A16 boundary at `T=16`, the first
+W4A4 point `T=17` with `initial_slot=0`, and the primary TMA workload `T=1024`. The same test retains
+the existing Q4/Q5 and W8 routes, checks every output allocation and state effect, and matches
+workspace execution high-water to the public capacity query.
+
+RTX 5090, CUDA 13.1, cold-cache public-Op measurements with 10 warmups and 100 samples produced:
+
+| `T` | Activation compute | Median |
+|---:|---|---:|
+| 1 | A16 fused | `38.144 us` |
+| 4 | A16 fused | `44.224 us` |
+| 8 | A16 fused | `58.016 us` |
+| 16 | A16 fused | `93.472 us` |
+| 17 | W4A4 Linear + post | `45.984 us` |
+| 1024 | W4A4 Linear + post | `263.104 us` |
+
+The `16/17` route change is an approved precision boundary and its latency step is normal kernel
+behavior. Post tuning was anchored on `T=1024`; larger extents and individual boundary values do
+not override that workload.
 
 ## 6. Text MLP gate/up
 

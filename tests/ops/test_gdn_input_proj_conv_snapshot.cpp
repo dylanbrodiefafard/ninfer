@@ -21,6 +21,7 @@ namespace {
 
 // This criterion belongs to the complete A16 fused projection/conv/snapshot Op.
 constexpr ReductionCriterion kGdnInputProjConvSnapshotA16Tolerance{3.15e-3, 4.0e-3, 3.2e-3};
+constexpr ReductionCriterion kGdnInputProjConvSnapshotA4Tolerance{0.16, 4.0e-3, 0.16};
 
 constexpr std::int32_t kQueryRows = 2048;
 constexpr std::int32_t kKeyRows   = 2048;
@@ -148,10 +149,11 @@ int verify_state_effects(std::string_view label, const std::vector<std::uint16_t
     return 0;
 }
 
-int verify_snapshot_outputs(std::string_view suffix, const GuardedBf16Tensor& query,
-                            const GuardedBf16Tensor& key, const GuardedBf16Tensor& value,
-                            std::int32_t value_rows, std::int32_t tokens,
-                            const SnapshotOracle& oracle) {
+int verify_snapshot_outputs(
+    std::string_view suffix, const GuardedBf16Tensor& query, const GuardedBf16Tensor& key,
+    const GuardedBf16Tensor& value, std::int32_t value_rows, std::int32_t tokens,
+    const SnapshotOracle& oracle,
+    const ReductionCriterion& criterion = kGdnInputProjConvSnapshotA16Tolerance) {
     int failures = 0;
     failures += query.verify_guards("snapshot query" + std::string(suffix));
     failures += key.verify_guards("snapshot key" + std::string(suffix));
@@ -161,13 +163,13 @@ int verify_snapshot_outputs(std::string_view suffix, const GuardedBf16Tensor& qu
     failures += value.verify_fully_written("snapshot value" + std::string(suffix));
     failures += compare("snapshot query" + std::string(suffix),
                         gather_rows(query.values(), kQueryRows, 0, kQueryRows, tokens),
-                        oracle.query, kGdnInputProjConvSnapshotA16Tolerance);
-    failures += compare("snapshot key" + std::string(suffix),
-                        gather_rows(key.values(), kKeyRows, 0, kKeyRows, tokens), oracle.key,
-                        kGdnInputProjConvSnapshotA16Tolerance);
+                        oracle.query, criterion);
+    failures +=
+        compare("snapshot key" + std::string(suffix),
+                gather_rows(key.values(), kKeyRows, 0, kKeyRows, tokens), oracle.key, criterion);
     failures += compare("snapshot value" + std::string(suffix),
                         gather_rows(value.values(), value_rows, 0, value_rows, tokens),
-                        oracle.value, kGdnInputProjConvSnapshotA16Tolerance);
+                        oracle.value, criterion);
     return failures;
 }
 
@@ -357,6 +359,106 @@ int run_w8() {
     return failures;
 }
 
+int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPolicy policy,
+                   std::int32_t initial_slot) {
+    constexpr std::int32_t kHidden    = 5120;
+    constexpr std::int32_t kValueRows = 6144;
+    constexpr std::int32_t kZRows     = 6144;
+    constexpr std::int32_t kChannels  = 10240;
+    constexpr std::int32_t kRows      = kChannels + kZRows;
+    const std::int32_t slots          = std::max(tokens + 2, initial_slot + 1);
+    const std::vector<float> activation =
+        make_bf16_activation(kHidden, tokens, 809U + static_cast<std::uint32_t>(tokens));
+    const std::vector<std::uint16_t> activation_bits  = bf16_bits(activation);
+    const std::vector<float> conv_weight              = make_conv_weight(kChannels, 811U);
+    const std::vector<std::uint16_t> conv_weight_bits = bf16_bits(conv_weight);
+    const std::vector<std::uint16_t> state_before =
+        make_state(kChannels, slots, initial_slot, 821U + static_cast<std::uint32_t>(tokens));
+    const std::vector<std::int32_t> initial_value{initial_slot};
+
+    DeviceBuffer device_activation  = to_device(activation_bits);
+    DeviceBuffer device_conv_weight = to_device(conv_weight_bits);
+    DeviceBuffer device_initial     = to_device(initial_value);
+    GuardedBf16Tensor state(kChannels * 3, slots);
+    state.copy_from_bits(state_before);
+    GuardedBf16Tensor query(kQueryRows, tokens);
+    GuardedBf16Tensor key(kKeyRows, tokens);
+    GuardedBf16Tensor value(kValueRows, tokens);
+    GuardedBf16Tensor z(kZRows, tokens);
+    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor conv(device_conv_weight.p, DType::BF16, {kChannels, 4});
+    Tensor conv_state(state.data(), DType::BF16, {kChannels, 3, slots});
+    Tensor initial(device_initial.p, DType::I32, {1});
+    Tensor q                          = query.tensor();
+    Tensor k                          = key.tensor();
+    Tensor v                          = value.tensor();
+    Tensor z_output                   = z.tensor();
+    const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+        QType::NVFP4, kRows, kHidden, policy, tokens, tokens);
+    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+
+    ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, conv_state, initial, q, k, v,
+                                      z_output, policy, workspace, nullptr);
+    cuda_synchronize();
+
+    const std::size_t initial_base = static_cast<std::size_t>(initial_slot) * 3 * kChannels;
+    const std::span<const std::uint16_t> initial_state(state_before.data() + initial_base,
+                                                       3 * kChannels);
+    const SnapshotOracle oracle = snapshot_oracle(
+        kValueRows, tokens, conv_weight, initial_state, [&](std::int32_t row, std::int32_t token) {
+            return quantized_weight::dot_fp64(
+                parent.host, row, activation.data() + static_cast<std::size_t>(token) * kHidden,
+                kHidden);
+        });
+    const bool a4 = policy == ops::LinearPolicy::AllowA4 && tokens > 16;
+    const ReductionCriterion& criterion =
+        a4 ? kGdnInputProjConvSnapshotA4Tolerance : kGdnInputProjConvSnapshotA16Tolerance;
+    const std::string suffix = std::string(" NVFP4 ") + (a4 ? "A4" : "A16") +
+                               " T=" + std::to_string(tokens) +
+                               " initial=" + std::to_string(initial_slot);
+    const std::vector<std::uint16_t> state_after = state.bits();
+    int failures =
+        verify_snapshot_outputs(suffix, query, key, value, kValueRows, tokens, oracle, criterion);
+    failures +=
+        compare("snapshot state" + suffix, gather_state(state_after, kChannels, kValueRows, tokens),
+                oracle.state, criterion);
+    failures += state.verify_guards("snapshot state" + suffix);
+    failures += verify_state_effects("snapshot state" + suffix, state_before, state_after,
+                                     kChannels, tokens, slots);
+    failures += z.verify_guards("snapshot z" + suffix);
+    failures += z.verify_fully_written("snapshot z" + suffix);
+    failures += compare(
+        "snapshot z" + suffix, gather_rows(z.values(), kZRows, 0, kZRows, tokens),
+        projection_oracle(parent.host, kChannels, kZRows, activation, kHidden, tokens), criterion);
+    failures += verify_preserved("snapshot x" + suffix, device_activation, activation_bits);
+    failures +=
+        verify_preserved("snapshot conv weight" + suffix, device_conv_weight, conv_weight_bits);
+    failures += verify_preserved("snapshot initial slot" + suffix, device_initial, initial_value);
+    failures += parent.verify_preserved("snapshot parent weight" + suffix);
+    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+        std::cerr << "snapshot" << suffix << ": workspace query/execution high-water mismatch\n";
+        ++failures;
+    }
+    return failures;
+}
+
+int run_nvfp4() {
+    constexpr std::int32_t kHidden = 5120;
+    constexpr std::int32_t kRows   = 16384;
+    quantized_weight::PatternedWeightOptions options;
+    options.weight_scale_divisor = 0.125F;
+    options.input_scale_divisor  = 3.5F;
+    DevicePackedWeight parent(
+        quantized_weight::make_patterned_weight(QType::NVFP4, kRows, kHidden, 823U, options));
+
+    int failures = 0;
+    failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only, 2);
+    failures += run_nvfp4_case(parent, 16, ops::LinearPolicy::AllowA4, 17);
+    failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4, 0);
+    failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4, 1025);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -382,8 +484,21 @@ int main() {
         std::cerr << "W8 snapshot interval did not preserve its zero/nonzero route boundary\n";
         ++failures;
     }
+    const std::size_t nvfp4_a4_17 = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+        QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 17, 17);
+    if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+            QType::NVFP4, 16384, 5120, ops::LinearPolicy::A16Only, 1, 16) != 0 ||
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+            QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 16) != 0 ||
+        nvfp4_a4_17 == 0 ||
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+            QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 17) != nvfp4_a4_17) {
+        std::cerr << "NVFP4 snapshot interval did not preserve its A16/A4 route boundary\n";
+        ++failures;
+    }
     failures += run_q4_q5();
     failures += run_w8();
+    failures += run_nvfp4();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_snapshot\n";
     return failures == 0 ? 0 : 1;
 }

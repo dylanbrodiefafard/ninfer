@@ -9,6 +9,11 @@
 
 namespace ninfer::ops::detail {
 
+enum class Nvfp4SmallTFinalization {
+    Elementwise,
+    RowVector,
+};
+
 template <class Geometry, int ActiveTokens, class Schedule>
 struct Nvfp4SmallTSharedStorage {
     static constexpr int kValuesPerPhase = Schedule::kWarpsPerRow * 32 * Schedule::kValuesPerLane;
@@ -200,7 +205,8 @@ __device__ __forceinline__ void compute_nvfp4_small_t_rows(
     }
 }
 
-template <class Geometry, int ActiveTokens, class Schedule, class Epilogue, class OutputPolicy>
+template <class Geometry, int ActiveTokens, class Schedule, class Epilogue, class OutputPolicy,
+          Nvfp4SmallTFinalization Finalization = Nvfp4SmallTFinalization::Elementwise>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_small_t_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
@@ -253,48 +259,110 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_smal
         x, codes, scales, shared, inverse_weight_divisor, parent_rows, flat_row0, token0,
         warp_in_row, lane, accumulators);
 
+    if constexpr (Finalization == Nvfp4SmallTFinalization::RowVector) {
+        static_assert(Schedule::kTokenTile == ActiveTokens,
+                      "row-vector finalization requires one CTA to own the full token row");
+        if constexpr (Schedule::kWarpsPerRow == 1) {
 #pragma unroll
-    for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
+            for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
+                float projected[ActiveTokens];
 #pragma unroll
-        for (int local_token = 0; local_token < Schedule::kTokenTile; ++local_token) {
-            const int token = token0 + local_token;
-            if (token < ActiveTokens) {
-                float total = 0.0F;
+                for (int local_token = 0; local_token < ActiveTokens; ++local_token) {
+                    float total = 0.0F;
 #pragma unroll
-                for (int chain = 0; chain < Schedule::kAccumulatorChains; ++chain) {
-                    total += accumulators[local_row][local_token][chain];
-                }
-                total = warp_reduce_sum(total);
-                if constexpr (Schedule::kWarpsPerRow == 1) {
-                    if (lane == 0) {
-                        const int parent_row = parent_rows[local_row];
-                        output.store(parent_row, token, epilogue.apply(parent_row, token, total));
+                    for (int chain = 0; chain < Schedule::kAccumulatorChains; ++chain) {
+                        total += accumulators[local_row][local_token][chain];
                     }
-                } else if (lane == 0) {
-                    shared.partials[row_group][local_row][local_token][warp_in_row] = total;
+                    total = warp_reduce_sum(total);
+                    if (lane == 0) {
+                        const int parent_row   = parent_rows[local_row];
+                        projected[local_token] = epilogue.apply(parent_row, local_token, total);
+                    }
                 }
+                if (lane == 0) { output.store_row(parent_rows[local_row], projected); }
             }
-        }
-    }
-
-    if constexpr (Schedule::kWarpsPerRow > 1) {
-        __syncthreads();
-        if (warp_in_row == 0) {
+        } else {
 #pragma unroll
             for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
 #pragma unroll
-                for (int local_token = 0; local_token < Schedule::kTokenTile; ++local_token) {
-                    const int token = token0 + local_token;
-                    if (token < ActiveTokens) {
+                for (int local_token = 0; local_token < ActiveTokens; ++local_token) {
+                    float total = 0.0F;
+#pragma unroll
+                    for (int chain = 0; chain < Schedule::kAccumulatorChains; ++chain) {
+                        total += accumulators[local_row][local_token][chain];
+                    }
+                    total = warp_reduce_sum(total);
+                    if (lane == 0) {
+                        shared.partials[row_group][local_row][local_token][warp_in_row] = total;
+                    }
+                }
+            }
+            __syncthreads();
+            if (warp_in_row == 0) {
+#pragma unroll
+                for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
+                    float projected[ActiveTokens];
+#pragma unroll
+                    for (int local_token = 0; local_token < ActiveTokens; ++local_token) {
                         const float partial =
                             lane < Schedule::kWarpsPerRow
                                 ? shared.partials[row_group][local_row][local_token][lane]
                                 : 0.0F;
                         const float total = warp_reduce_sum(partial);
                         if (lane == 0) {
+                            const int parent_row   = parent_rows[local_row];
+                            projected[local_token] = epilogue.apply(parent_row, local_token, total);
+                        }
+                    }
+                    if (lane == 0) { output.store_row(parent_rows[local_row], projected); }
+                }
+            }
+        }
+    } else {
+#pragma unroll
+        for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
+#pragma unroll
+            for (int local_token = 0; local_token < Schedule::kTokenTile; ++local_token) {
+                const int token = token0 + local_token;
+                if (token < ActiveTokens) {
+                    float total = 0.0F;
+#pragma unroll
+                    for (int chain = 0; chain < Schedule::kAccumulatorChains; ++chain) {
+                        total += accumulators[local_row][local_token][chain];
+                    }
+                    total = warp_reduce_sum(total);
+                    if constexpr (Schedule::kWarpsPerRow == 1) {
+                        if (lane == 0) {
                             const int parent_row = parent_rows[local_row];
                             output.store(parent_row, token,
                                          epilogue.apply(parent_row, token, total));
+                        }
+                    } else if (lane == 0) {
+                        shared.partials[row_group][local_row][local_token][warp_in_row] = total;
+                    }
+                }
+            }
+        }
+
+        if constexpr (Schedule::kWarpsPerRow > 1) {
+            __syncthreads();
+            if (warp_in_row == 0) {
+#pragma unroll
+                for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
+#pragma unroll
+                    for (int local_token = 0; local_token < Schedule::kTokenTile; ++local_token) {
+                        const int token = token0 + local_token;
+                        if (token < ActiveTokens) {
+                            const float partial =
+                                lane < Schedule::kWarpsPerRow
+                                    ? shared.partials[row_group][local_row][local_token][lane]
+                                    : 0.0F;
+                            const float total = warp_reduce_sum(partial);
+                            if (lane == 0) {
+                                const int parent_row = parent_rows[local_row];
+                                output.store(parent_row, token,
+                                             epilogue.apply(parent_row, token, total));
+                            }
                         }
                     }
                 }

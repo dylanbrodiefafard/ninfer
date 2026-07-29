@@ -180,7 +180,8 @@ cmake --build build --parallel --target ninfer_gated_delta_rule_bench ninfer_gdn
 
 ## Input-projection Op benchmark
 
-`ninfer_input_proj_bench` measures the exact Qwen3.6-27B Attention and GDN input-projection shapes.
+`ninfer_input_proj_bench` measures the exact Qwen3.6-27B Attention and GDN input-projection shapes,
+including the stateful GDN convolution/snapshot form.
 The default Q4/Q5 Attention production path uses two parent projections and its benchmark-only
 control uses the former four logical projections. BF16 and NVFP4 modes measure the single-parent
 Attention route; NVFP4 accepts `--policy a16|a4`. GDN production writes directly into the pitched
@@ -229,11 +230,27 @@ The primary NVFP4 W4A4 point is:
   --warmup 5 --repeat 30
 ```
 
-Both direct-parent modes count the complete parent exactly once, one activation read, and the four
-final output writes. The result reports the same fixed-spec `DRAM_%` and measured pure-read
-`READ_%` columns as the Linear control, plus profile-appropriate BF16 or FP4 `TC_%`. `--profile`
-performs setup, warmup, and L2 eviction before capturing exactly one selected launch; production
-routes enter through the public BF16 or NVFP4 `attn_input_proj` call.
+The NVFP4 GDN snapshot mode calls only the complete public Op. `a16` is registered through `T=16`;
+`a4` keeps those extents on the same fused A16 kernels and uses W4A4 Linear plus one post kernel
+for `T>16`:
+
+```bash
+./build/bench/ninfer_input_proj_bench \
+  --op gdn-snapshot --weight-type nvfp4 --policy a4 \
+  --t-sweep 1,4,8,16,17,1024 --warmup 10 --repeat 100
+```
+
+Its table and CSV separate logical Op bytes from route-private single-pass bytes. Logical bytes
+include the encoded parent, BF16 activation, convolution weights, selected initial history, four
+final outputs, and published snapshots. Private bytes report the packed BF16 projection
+write/read and, on W4A4 routes, activation-code/scale write/read. These are an explicit useful-byte
+model, not a claim about cache-line or physical DRAM traffic.
+
+The direct Attention and stateless GDN modes count the complete parent exactly once, one activation
+read, and the final output writes. Their result reports the same fixed-spec `DRAM_%` and measured
+pure-read `READ_%` columns as the Linear control, plus profile-appropriate BF16 or FP4 `TC_%`.
+`--profile` performs setup, warmup, and L2 eviction before capturing exactly one selected launch;
+production routes enter through the corresponding public BF16 or NVFP4 Op call.
 
 ## Bidirectional GQA Op benchmark
 
