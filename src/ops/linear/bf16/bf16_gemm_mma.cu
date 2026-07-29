@@ -7,12 +7,13 @@
 
 #include <cuda_bf16.h>
 
+#include <stdexcept>
+
 namespace ninfer::ops::detail {
 namespace {
 
-template <class Schedule, bool FullTokens>
+template <class Geometry, class Schedule, bool FullTokens>
 void launch_variant(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    using Geometry = Bf16LinearControlGeometry;
     static_assert((Geometry::kOutputRows % Schedule::kBlockRows) == 0);
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
 
@@ -35,19 +36,28 @@ void launch_variant(const Tensor& x, const Weight& weight, Tensor& out, cudaStre
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <class Schedule>
-void launch_schedule(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+template <class Geometry>
+void launch_geometry(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    using Schedule = Bf16MmaProductionSchedule<Geometry>;
     if ((x.ne[1] % Schedule::kBlockCols) == 0) {
-        launch_variant<Schedule, true>(x, weight, out, stream);
+        launch_variant<Geometry, Schedule, true>(x, weight, out, stream);
     } else {
-        launch_variant<Schedule, false>(x, weight, out, stream);
+        launch_variant<Geometry, Schedule, false>(x, weight, out, stream);
     }
 }
 
 } // namespace
 
 void launch_bf16_mma(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    launch_schedule<Bf16MmaProductionSchedule>(x, weight, out, stream);
+    if (weight.n == 14336 && weight.k == 5120) {
+        launch_geometry<Bf16GemvGeometry<14336, 5120>>(x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 5120 && weight.k == 6144) {
+        launch_geometry<Bf16GemvGeometry<5120, 6144>>(x, weight, out, stream);
+        return;
+    }
+    throw std::invalid_argument("bf16 linear MMA: unsupported exact problem");
 }
 
 } // namespace ninfer::ops::detail

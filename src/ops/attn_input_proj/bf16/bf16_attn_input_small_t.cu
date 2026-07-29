@@ -70,7 +70,7 @@ struct Bf16AttentionSmallTProductionSchedule {
 template <int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
                   Tensor& v, cudaStream_t stream) {
-    using Geometry = Bf16LinearControlGeometry;
+    using Geometry = Bf16GemvGeometry<14336, 5120>;
     using Schedule = typename Bf16AttentionSmallTProductionSchedule<ActiveTokens>::Type;
     static_assert((Geometry::kOutputRows % Schedule::kRowsPerCta) == 0);
     static_assert((6144 % Schedule::kRowsPerCta) == 0);

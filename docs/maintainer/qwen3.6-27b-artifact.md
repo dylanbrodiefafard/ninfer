@@ -711,10 +711,10 @@ parent `Weight`; the Op wrapper derives that weight's `1 / (d_x * d_w)` as a lea
 argument. That coefficient is not another artifact object, another `Weight` field, or a new Op
 parameter.
 
-The nine BF16 Text exceptions retain the same fused semantic Op boundaries. Future consumer support
-must add single-parent BF16 admission to `attn_input_proj` for the six early
-`query_key_gate_value` parents, and BF16 admission to `linear_add` for attention output layers 3
-and 7 and GDN output layer 4.
+The nine BF16 Text exceptions retain the same fused semantic Op boundaries. The Op layer admits
+their single-parent BF16 weights through `attn_input_proj` for the six early
+`query_key_gate_value` parents and through `linear_add` for attention output layers 3 and 7 and GDN
+output layer 4.
 
 Current Op completion status is authoritative only in
 [`qwen3.6-27b-nvfp4-op-checklist.md`](qwen3.6-27b-nvfp4-op-checklist.md). Until that work and the

@@ -30,14 +30,15 @@ namespace ninfer::ops {
  *
  * Logical shapes:
  *   Contiguous BF16 x [K,T] and residual [N,T]. Weight is either Q5G64_F16S RowSplit with
- *   logical shape [5120,17408] or [5120,6144], or W8G32_F16S RowSplit [2048,4096] or
- *   [2048,6144].
+ *   logical shape [5120,17408] or [5120,6144], W8G32_F16S RowSplit [2048,4096] or
+ *   [2048,6144], or BF16_CTRL Contiguous [5120,6144].
  *   T may be any positive value.
  *
  * Numeric:
- *   The oracle exact-decodes the registered weight and evaluates `ideal` naively in FP64 from the
- *   represented inputs. The updated BF16 residual is promoted and compared directly with that
- *   result; output storage rounding belongs to LinearAdd's named A16 criterion, not the oracle.
+ *   The oracle reads a registered BF16 weight directly or exact-decodes a registered packed
+ *   weight, then evaluates `ideal` naively in FP64 from the represented inputs. The updated BF16
+ *   residual is promoted and compared directly with that result; output storage rounding belongs
+ *   to LinearAdd's named A16 criterion, not the oracle.
  *   Production routes may fuse or materialize the projection and may choose their natural
  *   accumulator, staging, and workspace precision; those private choices are not semantic
  *   rounding boundaries.

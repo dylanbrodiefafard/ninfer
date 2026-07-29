@@ -1,6 +1,7 @@
 #include "ops/linear_add/linear_add_test_common.h"
 
 #include "ninfer/ops/linear_add.h"
+#include "ops/direct_bf16_weight.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 
@@ -17,6 +18,8 @@
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
+#include <variant>
 #include <vector>
 
 namespace ninfer::test::linear_add {
@@ -120,15 +123,13 @@ std::vector<std::uint16_t> make_residual(std::int32_t n, std::int32_t t, std::ui
     return result;
 }
 
-std::vector<double> linear_add_oracle(const quantized_weight::PackedWeight& weight,
+std::vector<double> linear_add_oracle(std::int32_t n, std::int32_t k,
                                       std::span<const std::int32_t> oracle_rows,
                                       std::span<const float> oracle_weight,
                                       const std::vector<std::uint16_t>& activation,
                                       const std::vector<std::uint16_t>& residual,
                                       std::span<const std::int32_t> columns) {
     const std::int32_t oracle_n = static_cast<std::int32_t>(oracle_rows.size());
-    const std::int32_t k        = weight.weight.k;
-    const std::int32_t n        = weight.weight.n;
     std::vector<double> result(
         checked_elements(oracle_n, static_cast<std::int32_t>(columns.size()), "oracle output"));
     for (std::size_t selected_column = 0; selected_column < columns.size(); ++selected_column) {
@@ -214,6 +215,76 @@ int verify_preserved(const test::GuardedDeviceBuffer& device,
     return 1;
 }
 
+using HostWeight = std::variant<quantized_weight::PackedWeight, direct_bf16_weight::HostWeight>;
+
+QType qtype_for(WeightFormat format) {
+    switch (format) {
+    case WeightFormat::BF16:
+        return QType::BF16_CTRL;
+    case WeightFormat::Q5G64F16S:
+        return QType::Q5G64_F16S;
+    case WeightFormat::W8G32F16S:
+        return QType::W8G32_F16S;
+    }
+    throw std::invalid_argument("linear_add test: unknown weight format");
+}
+
+HostWeight make_weight(WeightFormat format, const ShapeCase& shape) {
+    if (format == WeightFormat::BF16) {
+        return direct_bf16_weight::make_patterned(shape.n, shape.k, shape.seed);
+    }
+    const quantized_weight::PatternedWeightOptions options{
+        format == WeightFormat::Q5G64F16S ? quantized_weight::RowSplitScalePattern::Small
+                                          : quantized_weight::RowSplitScalePattern::Tiny,
+        quantized_weight::RowSplitCodePattern::Hashed,
+    };
+    return quantized_weight::make_patterned_weight(qtype_for(format), shape.n, shape.k, shape.seed,
+                                                   options);
+}
+
+std::span<const std::uint8_t> weight_payload(const HostWeight& weight) {
+    return std::visit(
+        [](const auto& value) -> std::span<const std::uint8_t> {
+            using Value = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<Value, quantized_weight::PackedWeight>) {
+                return value.payload;
+            } else {
+                return {reinterpret_cast<const std::uint8_t*>(value.bits.data()),
+                        value.bits.size() * sizeof(std::uint16_t)};
+            }
+        },
+        weight);
+}
+
+Weight make_device_weight_view(const HostWeight& weight, void* data) {
+    return std::visit([&](const auto& value) { return value.device_weight(data); }, weight);
+}
+
+std::vector<float> materialize_weight_rows(const HostWeight& weight,
+                                           std::span<const std::int32_t> rows) {
+    return std::visit(
+        [&](const auto& value) {
+            using Value = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<Value, quantized_weight::PackedWeight>) {
+                return quantized_weight::materialize_rows_fp32(value, rows);
+            } else {
+                std::vector<float> result(checked_elements(static_cast<std::int32_t>(rows.size()),
+                                                           value.k, "oracle weight"));
+                for (std::size_t selected = 0; selected < rows.size(); ++selected) {
+                    const std::uint16_t* source =
+                        value.bits.data() + static_cast<std::size_t>(rows[selected]) * value.k;
+                    float* destination =
+                        result.data() + selected * static_cast<std::size_t>(value.k);
+                    for (std::int32_t column = 0; column < value.k; ++column) {
+                        destination[column] = test::bf16_to_f32(source[column]);
+                    }
+                }
+                return result;
+            }
+        },
+        weight);
+}
+
 } // namespace
 
 bool cuda_available() { return !test::cuda_unavailable(); }
@@ -224,28 +295,22 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
     const std::int32_t maximum_t = tokens.back();
 
     const std::vector<std::int32_t> oracle_rows = sampled_indices(shape.n);
-    const QType qtype = format == WeightFormat::Q5G64F16S ? QType::Q5G64_F16S : QType::W8G32_F16S;
-    const quantized_weight::PatternedWeightOptions weight_options{
-        format == WeightFormat::Q5G64F16S ? quantized_weight::RowSplitScalePattern::Small
-                                          : quantized_weight::RowSplitScalePattern::Tiny,
-        quantized_weight::RowSplitCodePattern::Hashed,
-    };
-    quantized_weight::PackedWeight host_weight = quantized_weight::make_patterned_weight(
-        qtype, shape.n, shape.k, shape.seed, weight_options);
-    const std::vector<float> oracle_weight =
-        quantized_weight::materialize_rows_fp32(host_weight, oracle_rows);
+    const QType qtype                           = qtype_for(format);
+    const HostWeight host_weight                = make_weight(format, shape);
+    const std::vector<float> oracle_weight      = materialize_weight_rows(host_weight, oracle_rows);
     const std::vector<std::uint16_t> activation =
         make_activation(shape.k, maximum_t, shape.seed + 1U);
     const std::vector<std::uint16_t> residual = make_residual(shape.n, maximum_t, shape.seed + 2U);
     const std::vector<std::int32_t> all_columns = all_indices(maximum_t);
     const std::vector<double> full_reference    = linear_add_oracle(
-        host_weight, oracle_rows, oracle_weight, activation, residual, all_columns);
+        shape.n, shape.k, oracle_rows, oracle_weight, activation, residual, all_columns);
 
     test::GuardedDeviceBuffer device_activation(activation.size() * sizeof(std::uint16_t));
     device_activation.copy_from_host(activation.data(), device_activation.bytes());
-    test::GuardedDeviceBuffer device_weight(host_weight.payload.size());
-    device_weight.copy_from_host(host_weight.payload.data(), host_weight.payload.size());
-    const Weight weight = host_weight.device_weight(device_weight.data());
+    const std::span<const std::uint8_t> host_payload = weight_payload(host_weight);
+    test::GuardedDeviceBuffer device_weight(host_payload.size());
+    device_weight.copy_from_host(host_payload.data(), host_payload.size());
+    const Weight weight = make_device_weight_view(host_weight, device_weight.data());
 
     const std::size_t workspace_bytes =
         ops::linear_add_workspace_capacity_bytes(qtype, shape.n, shape.k, 1, maximum_t);
@@ -304,7 +369,7 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
         std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(activation.data()),
                                       activation.size() * sizeof(std::uint16_t)),
         "linear_add activation");
-    failures += verify_preserved(device_weight, host_weight.payload, "linear_add weight");
+    failures += verify_preserved(device_weight, host_payload, "linear_add weight");
     return failures;
 }
 

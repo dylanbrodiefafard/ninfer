@@ -9,12 +9,14 @@
 namespace ninfer::ops::detail {
 
 Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
-    using Geometry = Bf16LinearControlGeometry;
-    if (n != Geometry::kOutputRows || k != Geometry::kInputRows || t <= 0) {
+    const bool supported_problem = (n == 14336 && k == 5120) || (n == 5120 && k == 6144);
+    if (!supported_problem || t <= 0) {
         throw std::invalid_argument("bf16 linear: unsupported shape or T");
     }
     if (t == 1) { return launch_bf16_decode; }
-    if (t <= kBf16LinearSmallTDispatchEnd) { return launch_bf16_small_t; }
+    const std::int32_t small_t_end =
+        n == 5120 ? kBf16SmallTMaxTokens : kBf16LinearSmallTDispatchEnd;
+    if (t <= small_t_end) { return launch_bf16_small_t; }
     return launch_bf16_mma;
 }
 

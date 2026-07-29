@@ -1,5 +1,6 @@
 #include "ninfer/ops/linear_add.h"
 
+#include "ops/linear_add/bf16/bf16_linear_add_plan.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 #include "ops/linear_add/w8/w8_linear_add_plan.h"
 
@@ -36,6 +37,12 @@ void require_w8(const Weight& w) {
     }
 }
 
+void require_bf16(const Weight& w) {
+    if (w.qtype != QType::BF16_CTRL || w.layout != QuantLayout::Contiguous || w.qdata == nullptr) {
+        throw std::invalid_argument("linear_add: weight must be contiguous BF16_CTRL");
+    }
+}
+
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
 }
@@ -47,6 +54,11 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
                                                 std::int32_t max_tokens) {
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("linear_add workspace: invalid token interval");
+    }
+    if (qtype == QType::BF16_CTRL) {
+        (void)detail::bf16_linear_add_select(output_rows, input_rows, min_tokens);
+        (void)detail::bf16_linear_add_select(output_rows, input_rows, max_tokens);
+        return 0;
     }
     if (qtype == QType::W8G32_F16S) {
         (void)detail::w8_linear_add_resolve_plan({output_rows, input_rows, input_rows, min_tokens});
@@ -63,8 +75,24 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, WorkspaceArena& ws,
                 cudaStream_t stream) {
     const std::int32_t t = x.ne[1];
+    if (t <= 0) { throw std::invalid_argument("linear_add: T must be positive"); }
     require_tensor(x, DType::BF16, w.k, t, "x");
     require_tensor(residual_out, DType::BF16, w.n, t, "residual_out");
+
+    if (w.qtype == QType::BF16_CTRL) {
+        require_bf16(w);
+        if (!detail::bf16_linear_add_admits(w.n, w.k, t)) {
+            throw std::invalid_argument("linear_add: unsupported BF16 shape");
+        }
+        if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16) ||
+            !aligned_to(w.qdata, 16)) {
+            throw std::invalid_argument(
+                "linear_add: BF16 requires 16-byte x/residual/weight alignment");
+        }
+        (void)ws;
+        detail::bf16_linear_add_dispatch(x, w, residual_out, stream);
+        return;
+    }
 
     if (w.qtype == QType::Q5G64_F16S) {
         require_q5(w);

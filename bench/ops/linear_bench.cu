@@ -425,10 +425,12 @@ Options parse_args(int argc, char** argv) {
         if (opt.profile && !opt.have_t) {
             throw std::invalid_argument("--profile requires one exact --t");
         }
+        const bool bf16_exact_problem =
+            (opt.n == 14336 && opt.k == 5120) || (opt.n == 5120 && opt.k == 6144);
         if (opt.bf16_route_explicit &&
             (opt.qtype != QType::BF16_CTRL || opt.policy != LinearPolicy::A16Only ||
-             opt.n != 14336 || opt.k != 5120)) {
-            throw std::invalid_argument("--bf16-route requires BF16 A16 with N=14336 and K=5120");
+             !bf16_exact_problem)) {
+            throw std::invalid_argument("--bf16-route requires a registered BF16 A16 problem");
         }
     }
     if (opt.profile && !opt.csv_out.empty()) {

@@ -74,7 +74,7 @@ load, graph construction, and warmup do not enter topology counts.
 `ninfer_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,
 W8, and registered BF16 weights with the current A16 activation-compute policy. LinearAdd,
 LinearSwiGLU, LinearPair, Attention/GDN projections, and sparse MoE remain separate semantic Ops
-and are not benchmark modes here. For the registered BF16 problem, `--bf16-route
+and are not benchmark modes here. For registered BF16 problems, `--bf16-route
 production|small-t|mma|all` exposes benchmark-local launch controls with the same pure Linear
 semantics so dispatch crossovers can be measured directly.
 
@@ -313,6 +313,26 @@ cmake --build build --parallel --target ninfer_w8_linear_swiglu_bench
   --warmup 10 --repeat 50 --csv-out profiles/bench/w8_linear_swiglu.csv
 ./build/bench/ninfer_w8_linear_swiglu_bench \
   --profile --t-sweep 1024
+```
+
+## BF16 LinearAdd Op benchmark
+
+`ninfer_bf16_linear_add_bench` measures the contiguous BF16 `[5120,6144]` projection with its
+in-place BF16 residual epilogue. Production uses decode at `T=1`, exact-small-T at `T=2..26`, and
+MMA from `T=27`; `--route all` retains the legal overlap needed to reproduce that crossover.
+Every sample is cold-cache. Effective bandwidth counts the weight once, the activation once, and
+the residual read plus write; `READ_%` and `TC_%` use the same RTX 5090 references as the Linear
+benchmark.
+
+```bash
+cmake --build build --parallel --target ninfer_bf16_linear_add_bench
+./build/bench/ninfer_bf16_linear_add_bench \
+  --sweep 1:32:1 --route all --warmup 10 --repeat 50 \
+  --csv-out profiles/bench/bf16_linear_add_t1_32.csv
+./build/bench/ninfer_bf16_linear_add_bench \
+  --t-sweep 1024,1536,2048 --route production --warmup 10 --repeat 50
+./build/bench/ninfer_bf16_linear_add_bench \
+  --t-sweep 1024 --route production --profile
 ```
 
 ## W8 LinearAdd Op benchmark

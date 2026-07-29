@@ -219,6 +219,10 @@ ninfer_add_fused_linear_test(
   ops/linear_add/test_q5_a16.cpp
   ops/linear_add/linear_add_test_common.cpp)
 ninfer_add_fused_linear_test(
+  ninfer_linear_add_bf16_a16_test
+  ops/linear_add/test_bf16_a16.cpp
+  ops/linear_add/linear_add_test_common.cpp)
+ninfer_add_fused_linear_test(
   ninfer_linear_add_w8_a16_test
   ops/linear_add/test_w8_a16.cpp
   ops/linear_add/linear_add_test_common.cpp)

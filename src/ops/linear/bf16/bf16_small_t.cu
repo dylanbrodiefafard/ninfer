@@ -7,15 +7,15 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <utility>
 
 namespace ninfer::ops::detail {
 namespace {
 
-template <int ActiveTokens>
+template <class Geometry, int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    using Geometry = Bf16LinearControlGeometry;
-    using Schedule = typename Bf16LinearSmallTProductionSchedule<ActiveTokens>::Type;
+    using Schedule = typename Bf16LinearSmallTProductionSchedule<Geometry, ActiveTokens>::Type;
     static_assert((Geometry::kOutputRows % Schedule::kRowsPerCta) == 0);
 
     const Bf16SmallTContiguousOutput output{static_cast<__nv_bfloat16*>(out.data),
@@ -28,19 +28,33 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <std::size_t... Offsets>
+template <class Geometry, std::size_t... Offsets>
 constexpr auto make_launchers(std::index_sequence<Offsets...>) {
     return std::array<Bf16Launch, sizeof...(Offsets)>{
-        &launch_exact<kBf16SmallTMinTokens + static_cast<int>(Offsets)>...};
+        &launch_exact<Geometry, kBf16SmallTMinTokens + static_cast<int>(Offsets)>...};
 }
 
-constexpr auto kLaunchers =
-    make_launchers(std::make_index_sequence<kBf16SmallTMaxTokens - kBf16SmallTMinTokens + 1>{});
+using ControlGeometry = Bf16GemvGeometry<14336, 5120>;
+using OutputGeometry  = Bf16GemvGeometry<5120, 6144>;
+
+constexpr auto kControlLaunchers = make_launchers<ControlGeometry>(
+    std::make_index_sequence<kBf16SmallTMaxTokens - kBf16SmallTMinTokens + 1>{});
+constexpr auto kOutputLaunchers = make_launchers<OutputGeometry>(
+    std::make_index_sequence<kBf16SmallTMaxTokens - kBf16SmallTMinTokens + 1>{});
 
 } // namespace
 
 void launch_bf16_small_t(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    kLaunchers[x.ne[1] - kBf16SmallTMinTokens](x, weight, out, stream);
+    const std::size_t index = static_cast<std::size_t>(x.ne[1] - kBf16SmallTMinTokens);
+    if (weight.n == ControlGeometry::kOutputRows && weight.k == ControlGeometry::kInputRows) {
+        kControlLaunchers[index](x, weight, out, stream);
+        return;
+    }
+    if (weight.n == OutputGeometry::kOutputRows && weight.k == OutputGeometry::kInputRows) {
+        kOutputLaunchers[index](x, weight, out, stream);
+        return;
+    }
+    throw std::invalid_argument("bf16 linear small-T: unsupported exact problem");
 }
 
 } // namespace ninfer::ops::detail

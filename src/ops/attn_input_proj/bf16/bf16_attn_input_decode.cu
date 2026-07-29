@@ -38,8 +38,8 @@ struct Bf16AttentionInputOutput {
 
 void bf16_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                    Tensor& k, Tensor& v, cudaStream_t stream) {
-    using Geometry = Bf16LinearControlGeometry;
-    using Schedule = Bf16LinearDecodeSchedule;
+    using Geometry = Bf16GemvGeometry<14336, 5120>;
+    using Schedule = Bf16LinearDecodeSchedule<Geometry>;
     static_assert((6144 % Schedule::kRowsPerCta) == 0);
     static_assert((1024 % Schedule::kRowsPerCta) == 0);
 

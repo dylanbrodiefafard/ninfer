@@ -83,6 +83,11 @@ struct Bf16MmaOutputTile {
         return data + static_cast<std::int64_t>(token) * leading_dim + parent_row -
                parent_row_begin;
     }
+
+    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
+                                          float value) const {
+        *at(parent_row, token) = __float2bfloat16_rn(value);
+    }
 };
 
 struct Bf16MmaContiguousOutput {
@@ -164,9 +169,9 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void bf16
     int tile_n            = 0;
     bf16_mma_tile_coordinates<Schedule>(static_cast<int>(blockIdx.x), tiles_m, tiles_n, tile_m,
                                         tile_n);
-    const int m0                        = tile_m * BM;
-    const int n0                        = tile_n * BN;
-    const Bf16MmaOutputTile output_tile = output.tile(m0);
+    const int m0           = tile_m * BM;
+    const int n0           = tile_n * BN;
+    const auto output_tile = output.tile(m0);
 
     float accum[MT][NT][4] = {};
 
@@ -308,18 +313,18 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void bf16
             const int token1   = token0 + 1;
             const float* value = accum[mi][ni];
             if constexpr (FullTokens) {
-                *output_tile.at(row0, token0) = __float2bfloat16_rn(value[0]);
-                *output_tile.at(row0, token1) = __float2bfloat16_rn(value[1]);
-                *output_tile.at(row1, token0) = __float2bfloat16_rn(value[2]);
-                *output_tile.at(row1, token1) = __float2bfloat16_rn(value[3]);
+                output_tile.store(row0, token0, value[0]);
+                output_tile.store(row0, token1, value[1]);
+                output_tile.store(row1, token0, value[2]);
+                output_tile.store(row1, token1, value[3]);
             } else {
                 if (token0 < tokens) {
-                    *output_tile.at(row0, token0) = __float2bfloat16_rn(value[0]);
-                    *output_tile.at(row1, token0) = __float2bfloat16_rn(value[2]);
+                    output_tile.store(row0, token0, value[0]);
+                    output_tile.store(row1, token0, value[2]);
                 }
                 if (token1 < tokens) {
-                    *output_tile.at(row0, token1) = __float2bfloat16_rn(value[1]);
-                    *output_tile.at(row1, token1) = __float2bfloat16_rn(value[3]);
+                    output_tile.store(row0, token1, value[1]);
+                    output_tile.store(row1, token1, value[3]);
                 }
             }
         }

@@ -36,8 +36,8 @@ struct Bf16AttentionInputMmaOutput {
 template <bool FullTokens>
 void launch_variant(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
                     Tensor& v, cudaStream_t stream) {
-    using Geometry = Bf16LinearControlGeometry;
-    using Schedule = Bf16MmaProductionSchedule;
+    using Geometry = Bf16GemvGeometry<14336, 5120>;
+    using Schedule = Bf16MmaProductionSchedule<Geometry>;
     static_assert((Geometry::kOutputRows % Schedule::kBlockRows) == 0);
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     static_assert((6144 % Schedule::kBlockRows) == 0);
@@ -70,7 +70,8 @@ void launch_variant(const Tensor& x, const Weight& weight, Tensor& q, Tensor& ga
 
 void bf16_attn_input_mma_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                 Tensor& k, Tensor& v, cudaStream_t stream) {
-    using Schedule = Bf16MmaProductionSchedule;
+    using Geometry = Bf16GemvGeometry<14336, 5120>;
+    using Schedule = Bf16MmaProductionSchedule<Geometry>;
     if ((x.ne[1] % Schedule::kBlockCols) == 0) {
         launch_variant<true>(x, weight, q, gate, k, v, stream);
     } else {

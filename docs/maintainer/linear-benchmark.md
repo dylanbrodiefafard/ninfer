@@ -36,7 +36,7 @@ benchmark。它们继续由各自的 benchmark 独立测量。
 数字 `(N,K)` 是主入口。benchmark 不复制 production selector 的完整 shape admission
 表；不支持的 point 由 public `linear()` 及其 format selector 拒绝。
 
-BF16 decode control 的 exact 命令是：
+一个 BF16 decode exact point 的命令是：
 
 ```bash
 ./build/bench/ninfer_linear_bench \

@@ -75,8 +75,8 @@ intermediate.
 
 The current Op baseline already provides `QType::NVFP4`, its block-scale layout identity, exact
 decode fixtures, the revised 27B Q4/Q5 GDN Q/K/V/Z contracts, and single-parent W8 Attention/GDN
-overloads. No table item is complete; partial implementation progress is recorded only where it
-changes the next required step.
+overloads. Completed registrations are marked in the table; partial implementation progress is
+recorded only where it changes the next required step.
 
 ## 3. Required format/problem registrations
 
@@ -92,7 +92,7 @@ site counts describe artifact coverage; they are not runtime dispatch inputs.
 | M1 | `linear_swiglu` | `NVFP4` | `[34816,5120]` | MLP gate/up, 64 sites | [ ] |
 | R1 | `linear_add` | `NVFP4` | `[5120,6144]` | attention output and GDN output, 61 sites | [ ] |
 | R2 | `linear_add` | `NVFP4` | `[5120,17408]` | MLP down, 64 sites | [ ] |
-| R3 | `linear_add` | `BF16` → `BF16_CTRL` | `[5120,6144]` | attention/GDN output exceptions, 3 sites | [ ] |
+| R3 | `linear_add` | `BF16` → `BF16_CTRL` | `[5120,6144]` | attention/GDN output exceptions, 3 sites | [x] |
 
 No generic `linear` registration is an artifact-level requirement for these changed Text weights.
 This conclusion does not come from the number or format of weight parents: the matrix portion of
@@ -329,16 +329,21 @@ complete-formula oracle.
 
 ### R3 — BF16 `linear_add [5120,6144]`
 
-- [ ] Admit one contiguous `BF16_CTRL` weight `[5120,6144]`.
-- [ ] Use the same `x [6144,T]`, residual `[5120,T]`, `T > 0`, aliasing, and complete-formula
+- [x] Admit one contiguous `BF16_CTRL` weight `[5120,6144]`.
+- [x] Use the same `x [6144,T]`, residual `[5120,T]`, `T > 0`, aliasing, and complete-formula
   contract as R1.
-- [ ] Extend `linear_add_workspace_capacity_bytes` for
+- [x] Extend `linear_add_workspace_capacity_bytes` for
   `(QType::BF16_CTRL, output_rows=5120, input_rows=6144)`.
-- [ ] Add an independent BF16-weight oracle case.
-- [ ] Preserve the existing Q5 and W8 registrations for both supported shapes.
+- [x] Add an independent BF16-weight oracle case.
+- [x] Preserve the existing Q5 and W8 registrations for both supported shapes.
 
 R3 covers the two BF16 attention-output parents and the one BF16 GDN-output parent. There is no
 BF16 MLP gate/up or down registration in this artifact.
+
+R3 reuses the BF16 Linear decode, exact-small-T, and MMA computation bodies and supplies the
+in-place residual update as the Op-owned epilogue, with one final BF16 store and no workspace. The
+measured production dispatch is decode at `T=1`, small-T for `2 <= T <= 26`, and MMA for `T >= 27`;
+candidate overlap remains available in the Op benchmark so that the boundary is reproducible.
 
 ## 8. Common completion criteria
 
