@@ -2,6 +2,7 @@
 
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
+#include "ops/linear/nvfp4/nvfp4_output.cuh"
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -178,11 +179,11 @@ __device__ __forceinline__ void nvfp4_tma_load_2d(void* destination, const CUten
                  : "memory");
 }
 
-template <class Geometry, class Schedule, class OutputPolicy>
+template <class Geometry, class Schedule, class Epilogue, class OutputPolicy>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4_tma_kernel(
     const __grid_constant__ Nvfp4W4a4TmaDescriptors descriptors, float alpha,
-    const __grid_constant__ OutputPolicy output) {
+    const __grid_constant__ Epilogue epilogue, const __grid_constant__ OutputPolicy output) {
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     static_assert((Geometry::kOutputRows % Schedule::kBlockN) == 0);
 
@@ -337,10 +338,20 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
                 shared_output + token0 * kOutputStride + parent_row);
             auto* destination1 = reinterpret_cast<__nv_bfloat162*>(
                 shared_output + token1 * kOutputStride + parent_row);
-            *destination0 = __floats2bfloat162_rn(accumulators[mma_m][mma_n][0] * alpha,
-                                                  accumulators[mma_m][mma_n][1] * alpha);
-            *destination1 = __floats2bfloat162_rn(accumulators[mma_m][mma_n][2] * alpha,
-                                                  accumulators[mma_m][mma_n][3] * alpha);
+            const int global_row0   = row_begin + parent_row;
+            const int global_row1   = global_row0 + 1;
+            const int global_token0 = token_begin + token0;
+            const int global_token1 = token_begin + token1;
+            const float value00 =
+                epilogue.apply(global_row0, global_token0, accumulators[mma_m][mma_n][0] * alpha);
+            const float value01 =
+                epilogue.apply(global_row1, global_token0, accumulators[mma_m][mma_n][1] * alpha);
+            const float value10 =
+                epilogue.apply(global_row0, global_token1, accumulators[mma_m][mma_n][2] * alpha);
+            const float value11 =
+                epilogue.apply(global_row1, global_token1, accumulators[mma_m][mma_n][3] * alpha);
+            *destination0 = __floats2bfloat162_rn(value00, value01);
+            *destination1 = __floats2bfloat162_rn(value10, value11);
         }
     }
 

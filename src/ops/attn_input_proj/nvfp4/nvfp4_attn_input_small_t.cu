@@ -65,7 +65,7 @@ struct Nvfp4AttentionSmallTProductionSchedule {
 template <int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
                   Tensor& v, cudaStream_t stream) {
-    using Geometry            = Nvfp4LinearDecodeGeometry;
+    using Geometry            = Nvfp4AttnInputGeometry;
     using Schedule            = typename Nvfp4AttentionSmallTProductionSchedule<ActiveTokens>::Type;
     constexpr int kTokenTiles = (ActiveTokens + Schedule::kTokenTile - 1) / Schedule::kTokenTile;
     constexpr int kBlocks     = (Geometry::kOutputRows / Schedule::kRowsPerCta) * kTokenTiles;
@@ -81,7 +81,8 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate
         <<<kBlocks, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), inverse_weight_divisor, output);
+            static_cast<const std::uint8_t*>(weight.scales), inverse_weight_divisor,
+            Nvfp4IdentityEpilogue{}, output);
     CUDA_CHECK(cudaGetLastError());
 }
 

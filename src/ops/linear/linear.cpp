@@ -138,13 +138,12 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
         }
         return 0;
     case QType::NVFP4:
-        if (output_rows != detail::Nvfp4LinearDecodeGeometry::kOutputRows ||
-            input_rows != detail::Nvfp4LinearDecodeGeometry::kInputRows ||
+        if (!detail::is_nvfp4_linear_problem(output_rows, input_rows) ||
             (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
             throw std::invalid_argument("linear workspace: unsupported NVFP4 profile");
         }
         if (policy == LinearPolicy::A16Only || max_tokens < detail::kNvfp4FirstA4T) { return 0; }
-        return detail::nvfp4_w4a4_workspace_capacity_bytes(max_tokens);
+        return detail::nvfp4_w4a4_workspace_capacity_bytes(max_tokens, input_rows);
     case QType::FP32_CTRL:
     case QType::I32_CTRL:
         break;

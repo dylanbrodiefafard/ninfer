@@ -75,23 +75,23 @@ intermediate.
 
 The current Op baseline already provides `QType::NVFP4`, its block-scale layout identity, exact
 decode fixtures, the revised 27B Q4/Q5 GDN Q/K/V/Z contracts, and single-parent W8 Attention/GDN
-overloads. Completed registrations are marked in the table; partial implementation progress is
-recorded only where it changes the next required step.
+overloads. A1, A2, G1, R1, R2, and R3 are complete; partial implementation progress for the
+remaining registrations is recorded only where it changes the next required step.
 
 ## 3. Required format/problem registrations
 
-There are five semantic Op surfaces and eight exact format/problem registrations to complete. The
+There are five semantic Op surfaces and eight exact format/problem registrations tracked here. The
 site counts describe artifact coverage; they are not runtime dispatch inputs.
 
 | ID | Semantic Op | Weight format | Exact parent `[N,K]` | Artifact roles | Status |
 |---|---|---|---:|---|---|
-| A1 | `attn_input_proj` | `NVFP4` | `[14336,5120]` | attention input, 10 sites | [ ] |
+| A1 | `attn_input_proj` | `NVFP4` | `[14336,5120]` | attention input, 10 sites | [x] |
 | A2 | `attn_input_proj` | `BF16` → `BF16_CTRL` | `[14336,5120]` | attention input, 6 sites | [x] |
-| G1 | `gdn_input_proj` | `NVFP4` | `[16384,5120]` | GDN input, 48 sites | [ ] |
+| G1 | `gdn_input_proj` | `NVFP4` | `[16384,5120]` | GDN input, 48 sites | [x] |
 | G2 | `gdn_input_proj_conv_snapshot` | `NVFP4` | `[16384,5120]` | GDN verify input, same 48 sites | [ ] |
 | M1 | `linear_swiglu` | `NVFP4` | `[34816,5120]` | MLP gate/up, 64 sites | [ ] |
-| R1 | `linear_add` | `NVFP4` | `[5120,6144]` | attention output and GDN output, 61 sites | [ ] |
-| R2 | `linear_add` | `NVFP4` | `[5120,17408]` | MLP down, 64 sites | [ ] |
+| R1 | `linear_add` | `NVFP4` | `[5120,6144]` | attention output and GDN output, 61 sites | [x] |
+| R2 | `linear_add` | `NVFP4` | `[5120,17408]` | MLP down, 64 sites | [x] |
 | R3 | `linear_add` | `BF16` → `BF16_CTRL` | `[5120,6144]` | attention/GDN output exceptions, 3 sites | [x] |
 
 No generic `linear` registration is an artifact-level requirement for these changed Text weights.
@@ -247,19 +247,24 @@ participates in convolution state.
 
 ### G1 — single-parent NVFP4 `gdn_input_proj`
 
-- [ ] Admit one complete NVFP4 `query_key_value_z` weight `[16384,5120]`.
-- [ ] Accept `x BF16 [5120,T]`, with every positive `T`.
-- [ ] Write distinct contiguous outputs:
+G1 accepts every positive `T`. `A16Only` never quantizes activation; `AllowA4` resolves to A16 for
+`T<=16` and to W4A4 for `T>16`. The policy-bearing entry uses caller-owned workspace sized by the
+public capacity query, while the existing no-workspace overload remains the A16-only form for W8
+and NVFP4.
+
+- [x] Admit one complete NVFP4 `query_key_value_z` weight `[16384,5120]`.
+- [x] Accept `x BF16 [5120,T]`, with every positive `T`.
+- [x] Write distinct contiguous outputs:
 
   ```text
   qkv BF16 [10240,T]  # row order [query 2048, key 2048, value 6144]
   z   BF16 [6144,T]
   ```
 
-- [ ] Evaluate all four projections from the same public `x`; Z is not a later generic Linear Op.
-- [ ] Reject row-view substitutes, invalid NVFP4 metadata, and output aliasing.
-- [ ] Preserve the current 27B two-parent Q4/Q5 form and the 35B single-parent W8 form.
-- [ ] Add independent-oracle coverage that checks Q, K, V, and Z separately.
+- [x] Evaluate all four projections from the same public `x`; Z is not a later generic Linear Op.
+- [x] Reject row-view substitutes, invalid NVFP4 metadata, and output aliasing.
+- [x] Preserve the current 27B two-parent Q4/Q5 form and the 35B single-parent W8 form.
+- [x] Add independent-oracle coverage that checks Q, K, V, and Z separately.
 
 The existing single-parent overload already has the correct semantic argument list. G1 extends its
 admitted weight format and the exact 27B geometry.
@@ -268,6 +273,13 @@ As with Attention, the matrix arithmetic can be written as `Y = W*x`, followed l
 `qkv = Y[0:10240,:]` and `z = Y[10240:16384,:]`. For `T > 1`, both are strided row views of one
 contiguous `Y [16384,T]`; G1 instead promises two independently contiguous outputs. This layout
 effect, rather than a different dot-product formula, distinguishes G1 from generic `linear`.
+
+The production path instantiates the same Linear-owned NVFP4 mainloops with a compile-time QKV/Z
+output mapping; it neither calls public `linear` nor materializes/copies a packed parent output.
+Pure Linear and G1 were qualified directly against the exact-decoded-weight/naive-FP64 oracle in
+A16 decode/Small-T and W4A4 MMA/TMA regions. The A16 `T=1..16` public sweep has no unexplained
+route step; once W4A4 MMA begins, tile- and instance-dependent steps are normal implementation
+behavior rather than a semantic smoothness requirement.
 
 ### G2 — single-parent NVFP4 `gdn_input_proj_conv_snapshot`
 
@@ -356,21 +368,41 @@ complete-formula oracle.
 
 ### R1 — NVFP4 `linear_add [5120,6144]`
 
-- [ ] Admit an NVFP4 weight `[5120,6144]`.
-- [ ] Accept `x BF16 [6144,T]` and update `residual BF16 [5120,T]` for every positive `T`.
-- [ ] Use this one registration for both full-attention output (14 sites) and GDN output (47 sites);
+- [x] Admit an NVFP4 weight `[5120,6144]`.
+- [x] Accept `x BF16 [6144,T]` and update `residual BF16 [5120,T]` for every positive `T`.
+- [x] Use this one registration for both full-attention output (14 sites) and GDN output (47 sites);
   the Op has no model-role discriminator.
-- [ ] Extend `linear_add_workspace_capacity_bytes` for
+- [x] Extend `linear_add_workspace_capacity_bytes` for
   `(QType::NVFP4, output_rows=5120, input_rows=6144)`.
-- [ ] Add independent-oracle coverage of the complete in-place result.
+- [x] Add independent-oracle coverage of the complete in-place result.
 
 ### R2 — NVFP4 `linear_add [5120,17408]`
 
-- [ ] Admit an NVFP4 weight `[5120,17408]`.
-- [ ] Accept `x BF16 [17408,T]` and update `residual BF16 [5120,T]` for every positive `T`.
-- [ ] Extend `linear_add_workspace_capacity_bytes` for
+- [x] Admit an NVFP4 weight `[5120,17408]`.
+- [x] Accept `x BF16 [17408,T]` and update `residual BF16 [5120,T]` for every positive `T`.
+- [x] Extend `linear_add_workspace_capacity_bytes` for
   `(QType::NVFP4, output_rows=5120, input_rows=17408)`.
-- [ ] Add independent-oracle coverage of the complete in-place result.
+- [x] Add independent-oracle coverage of the complete in-place result.
+
+R1 and R2 use the Linear-owned mainloops with a compile-time epilogue that adds the represented
+input residual to the FP32 accumulator before the one final BF16 conversion. They do not expose a
+rounded projection temporary. Both exact geometries pass the same complete-formula oracle in A16
+decode/Small-T and W4A4 MMA/TMA regions; the existing Q5 and W8 registrations remain A16-only and
+unchanged.
+
+RTX 5090, CUDA 13.1, cold-cache public-Op measurements with 5 warmups and 30 samples produced:
+
+| Op | `T=1` | `T=4` | `T=8` | `T=16` | `T=17` | `T=128` | `T=512` | `T=1024` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| G1 | `37.888 us` | `42.080 us` | `56.320 us` | `93.536 us` | `37.824 us` | `40.032 us` | `107.552 us` | `177.152 us` |
+| R1 | `17.664 us` | `21.760 us` | `29.984 us` | `42.272 us` | `25.888 us` | `31.872 us` | `47.648 us` | `83.168 us` |
+| R2 | `38.144 us` | `44.288 us` | `60.576 us` | `89.184 us` | `54.368 us` | `58.336 us` | `109.568 us` | `202.944 us` |
+
+At the primary `T=1024` point, G1, R1, and R2 respectively reach `969.78`, `774.63`, and
+`899.44 TFLOP/s`, or `57.86%`, `46.22%`, and `53.67%` of the RTX 5090 dense FP4 reference.
+Quantization and residual reads are included. Candidate scanning found no stable semantic-Op
+schedule crossover relative to each geometry's tuned pure Linear winner, so production retains
+the shared schedules rather than adding Op-local parameter tables.
 
 ### R3 — BF16 `linear_add [5120,6144]`
 
@@ -392,7 +424,7 @@ candidate overlap remains available in the Op benchmark so that the boundary is 
 
 ## 8. Common completion criteria
 
-The eight registrations remain incomplete until all applicable checks below pass:
+Each registration remains incomplete until all applicable checks below pass:
 
 - [ ] Public Op comments describe every newly admitted format, exact shape, row order, output, state
   effect, alias rule, and `T` domain without exposing a kernel schedule as semantics.

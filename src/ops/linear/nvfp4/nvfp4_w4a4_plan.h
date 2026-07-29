@@ -31,19 +31,24 @@ inline std::size_t nvfp4_w4a4_checked_bytes(std::int32_t tokens, std::size_t byt
 }
 
 template <class Arena>
-Nvfp4W4a4Workspace allocate_nvfp4_w4a4_workspace(Arena& arena, std::int32_t tokens) {
+Nvfp4W4a4Workspace allocate_nvfp4_w4a4_workspace(Arena& arena, std::int32_t tokens,
+                                                 std::int32_t input_rows) {
+    if (input_rows <= 0 || (input_rows % 64) != 0) {
+        throw std::invalid_argument("nvfp4 W4A4 workspace: invalid K");
+    }
     const std::size_t code_bytes =
-        nvfp4_w4a4_checked_bytes(tokens, Nvfp4LinearDecodeGeometry::kCodeBytesPerRow);
+        nvfp4_w4a4_checked_bytes(tokens, static_cast<std::size_t>(input_rows) / 2);
     const std::size_t scale_bytes =
-        nvfp4_w4a4_checked_bytes(tokens, Nvfp4LinearDecodeGeometry::kGroupsPerRow);
+        nvfp4_w4a4_checked_bytes(tokens, static_cast<std::size_t>(input_rows) / 16);
     const DeviceSpan codes  = arena.alloc_bytes(code_bytes, 256);
     const DeviceSpan scales = arena.alloc_bytes(scale_bytes, 256);
     return {static_cast<std::uint8_t*>(codes.data), static_cast<std::uint8_t*>(scales.data)};
 }
 
-inline std::size_t nvfp4_w4a4_workspace_capacity_bytes(std::int32_t tokens) {
+inline std::size_t nvfp4_w4a4_workspace_capacity_bytes(std::int32_t tokens,
+                                                       std::int32_t input_rows) {
     WorkspaceLayoutBuilder layout;
-    (void)allocate_nvfp4_w4a4_workspace(layout, tokens);
+    (void)allocate_nvfp4_w4a4_workspace(layout, tokens, input_rows);
     return layout.peak_bytes(1);
 }
 

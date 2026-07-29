@@ -12,7 +12,7 @@
 namespace ninfer::ops::detail {
 namespace {
 
-using Geometry = Nvfp4LinearDecodeGeometry;
+using Geometry = Nvfp4AttnInputGeometry;
 
 constexpr std::int32_t kQueryRows  = 6144;
 constexpr std::int32_t kKeyRows    = 1024;
@@ -73,7 +73,8 @@ void launch_gemm(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tenso
     const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
     nvfp4_w4a4_mma_kernel<Geometry, Schedule><<<grid, Schedule::kThreads, 0, stream>>>(
         activation, static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const std::uint8_t*>(weight.scales), tokens, alpha, output);
+        static_cast<const std::uint8_t*>(weight.scales), tokens, alpha, Nvfp4IdentityEpilogue{},
+        output);
     CUDA_CHECK(cudaGetLastError());
 }
 

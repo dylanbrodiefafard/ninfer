@@ -4,10 +4,14 @@
 #include "ninfer/ops/scatter.h"
 
 #include "core/layout.h"
+#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
 #include "ops/gdn_input_proj/w8/w8_gdn_input_kernels.h"
 #include "ops/gdn_input_proj/w8/w8_gdn_input_plan.h"
+#include "ops/linear/nvfp4/nvfp4_config.h"
+#include "ops/linear/nvfp4/nvfp4_format.h"
+#include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -26,6 +30,18 @@ void require_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t cols, 
         tensor.ne[2] != 1 || tensor.ne[3] != 1 || !tensor.is_contiguous() ||
         !aligned_to(tensor.data, 16)) {
         throw std::invalid_argument(std::string("gdn_input_proj: invalid ") + label);
+    }
+}
+
+bool overlaps(const Tensor& lhs, const Tensor& rhs) {
+    const auto lhs_begin = reinterpret_cast<std::uintptr_t>(lhs.data);
+    const auto rhs_begin = reinterpret_cast<std::uintptr_t>(rhs.data);
+    return lhs_begin < rhs_begin + rhs.bytes() && rhs_begin < lhs_begin + lhs.bytes();
+}
+
+void require_single_parent_nonoverlap(const Tensor& x, const Tensor& qkv, const Tensor& z) {
+    if (overlaps(x, qkv) || overlaps(x, z) || overlaps(qkv, z)) {
+        throw std::invalid_argument("gdn_input_proj: x, qkv, and z must not overlap");
     }
 }
 
@@ -71,6 +87,57 @@ void require_w8_rowsplit(const Weight& weight, std::int32_t rows, const char* la
         !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 16)) {
         throw std::invalid_argument(std::string("gdn_input_proj: invalid ") + label);
     }
+}
+
+void validate_policy(LinearPolicy policy) {
+    switch (policy) {
+    case LinearPolicy::A16Only:
+    case LinearPolicy::AllowA8:
+    case LinearPolicy::AllowA4:
+        return;
+    }
+    throw std::invalid_argument("gdn_input_proj: invalid compute policy");
+}
+
+void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                            LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
+    validate_policy(policy);
+    const std::int32_t cols = x.ne[1];
+    if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
+
+    if (weight.qtype == QType::NVFP4) {
+        constexpr std::int32_t kHidden  = 5120;
+        constexpr std::int32_t kQkvRows = 10240;
+        constexpr std::int32_t kZRows   = 6144;
+        constexpr std::int32_t kRows    = kQkvRows + kZRows;
+        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
+            throw std::invalid_argument("NVFP4 gdn_input_proj admits only A16 or A4");
+        }
+        require_matrix(x, kHidden, cols, "x");
+        require_matrix(qkv, kQkvRows, cols, "qkv");
+        require_matrix(z, kZRows, cols, "z");
+        require_single_parent_nonoverlap(x, qkv, z);
+        detail::validate_nvfp4_weight(weight, "nvfp4 gdn_input_proj");
+        if (weight.n != kRows || weight.k != kHidden) {
+            throw std::invalid_argument("nvfp4 gdn_input_proj: unsupported weight shape");
+        }
+        detail::nvfp4_gdn_input_dispatch(x, weight, qkv, z, policy, workspace, stream);
+        return;
+    }
+
+    constexpr std::int32_t kHidden  = 2048;
+    constexpr std::int32_t kQkvRows = 8192;
+    constexpr std::int32_t kZRows   = 4096;
+    constexpr std::int32_t kRows    = kQkvRows + kZRows;
+    if (policy != LinearPolicy::A16Only) {
+        throw std::invalid_argument("W8 gdn_input_proj admits only A16");
+    }
+    require_matrix(x, kHidden, cols, "x");
+    require_matrix(qkv, kQkvRows, cols, "qkv");
+    require_matrix(z, kZRows, cols, "z");
+    require_single_parent_nonoverlap(x, qkv, z);
+    require_w8_rowsplit(weight, kRows, "query/key/value/z weight");
+    detail::w8_gdn_input_dispatch(x, weight, qkv, z, stream);
 }
 
 enum class SnapshotWorkspaceKind {
@@ -146,20 +213,43 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
     detail::q4_q5_gdn_input_dispatch(x, qk_weight, value_z_weight, qkv, z, stream);
 }
 
+std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,
+                                                    std::int32_t input_rows, LinearPolicy policy,
+                                                    std::int32_t min_tokens,
+                                                    std::int32_t max_tokens) {
+    validate_policy(policy);
+    if (min_tokens <= 0 || max_tokens < min_tokens) {
+        throw std::invalid_argument("gdn_input_proj workspace: invalid token interval");
+    }
+    if (parent_qtype == QType::NVFP4) {
+        if (parent_rows != detail::Nvfp4GdnInputGeometry::kOutputRows ||
+            input_rows != detail::Nvfp4GdnInputGeometry::kInputRows ||
+            (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
+            throw std::invalid_argument("gdn_input_proj workspace: unsupported NVFP4 profile");
+        }
+        if (policy == LinearPolicy::A16Only || max_tokens < detail::kNvfp4FirstA4T) { return 0; }
+        return detail::nvfp4_w4a4_workspace_capacity_bytes(max_tokens, input_rows);
+    }
+    if (parent_qtype == QType::W8G32_F16S && parent_rows == 12288 && input_rows == 2048 &&
+        policy == LinearPolicy::A16Only) {
+        (void)detail::w8_gdn_input_resolve_plan(
+            {input_rows, 8192, 4096, parent_rows, input_rows, min_tokens});
+        (void)detail::w8_gdn_input_resolve_plan(
+            {input_rows, 8192, 4096, parent_rows, input_rows, max_tokens});
+        return 0;
+    }
+    throw std::invalid_argument("gdn_input_proj workspace: unsupported parent profile");
+}
+
+void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Tensor& qkv, Tensor& z,
+                    LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream) {
+    dispatch_single_parent(x, query_key_value_z_weight, qkv, z, policy, &workspace, stream);
+}
+
 void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Tensor& qkv, Tensor& z,
                     cudaStream_t stream) {
-    constexpr std::int32_t kHidden  = 2048;
-    constexpr std::int32_t kQkvRows = 8192;
-    constexpr std::int32_t kZRows   = 4096;
-    constexpr std::int32_t kRows    = kQkvRows + kZRows;
-    const std::int32_t cols         = x.ne[1];
-    if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
-    require_matrix(x, kHidden, cols, "x");
-    require_matrix(qkv, kQkvRows, cols, "qkv");
-    require_matrix(z, kZRows, cols, "z");
-    require_w8_rowsplit(query_key_value_z_weight, kRows, "query/key/value/z weight");
-
-    detail::w8_gdn_input_dispatch(x, query_key_value_z_weight, qkv, z, stream);
+    dispatch_single_parent(x, query_key_value_z_weight, qkv, z, LinearPolicy::A16Only, nullptr,
+                           stream);
 }
 
 std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(std::int32_t query_rows,

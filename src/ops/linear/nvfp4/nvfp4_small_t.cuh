@@ -200,11 +200,12 @@ __device__ __forceinline__ void compute_nvfp4_small_t_rows(
     }
 }
 
-template <class Geometry, int ActiveTokens, class Schedule, class OutputPolicy>
+template <class Geometry, int ActiveTokens, class Schedule, class Epilogue, class OutputPolicy>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_small_t_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ scales, float inverse_weight_divisor, OutputPolicy output) {
+    const std::uint8_t* __restrict__ scales, float inverse_weight_divisor, Epilogue epilogue,
+    OutputPolicy output) {
     static_assert(ActiveTokens >= 2);
     static_assert(Schedule::kTokenTile <= ActiveTokens);
     static_assert((Geometry::kOutputRows % 128) == 0);
@@ -265,7 +266,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_smal
                 }
                 total = warp_reduce_sum(total);
                 if constexpr (Schedule::kWarpsPerRow == 1) {
-                    if (lane == 0) { output.store(parent_rows[local_row], token, total); }
+                    if (lane == 0) {
+                        const int parent_row = parent_rows[local_row];
+                        output.store(parent_row, token, epilogue.apply(parent_row, token, total));
+                    }
                 } else if (lane == 0) {
                     shared.partials[row_group][local_row][local_token][warp_in_row] = total;
                 }
@@ -287,22 +291,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_smal
                                 ? shared.partials[row_group][local_row][local_token][lane]
                                 : 0.0F;
                         const float total = warp_reduce_sum(partial);
-                        if (lane == 0) { output.store(parent_rows[local_row], token, total); }
+                        if (lane == 0) {
+                            const int parent_row = parent_rows[local_row];
+                            output.store(parent_row, token,
+                                         epilogue.apply(parent_row, token, total));
+                        }
                     }
                 }
             }
         }
     }
 }
-
-struct Nvfp4SmallTContiguousOutput {
-    __nv_bfloat16* data;
-    std::int32_t rows;
-
-    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
-                                          float value) const {
-        data[static_cast<std::int64_t>(token) * rows + parent_row] = __float2bfloat16_rn(value);
-    }
-};
 
 } // namespace ninfer::ops::detail

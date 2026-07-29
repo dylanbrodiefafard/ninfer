@@ -15,8 +15,16 @@ int run_nvfp4_a4() {
         Invocation{129, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA4},
     };
-    return run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
-                     {14336, 5120, 719U, Comparison::Sampled, true, invocations});
+    int failures = 0;
+    failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
+                          {14336, 5120, 719U, Comparison::Sampled, true, invocations});
+    failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
+                          {16384, 5120, 721U, Comparison::Sampled, true, invocations});
+    failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
+                          {5120, 6144, 723U, Comparison::Sampled, true, invocations});
+    failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
+                          {5120, 17408, 725U, Comparison::Sampled, true, invocations});
+    return failures;
 }
 
 } // namespace

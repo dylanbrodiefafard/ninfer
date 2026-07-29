@@ -2,6 +2,7 @@
 
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
+#include "ops/linear/nvfp4/nvfp4_output.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
@@ -199,10 +200,11 @@ compute_nvfp4_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __re
     }
 }
 
-template <class Geometry, class Schedule, class Output>
+template <class Geometry, class Schedule, class Epilogue, class Output>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_gemv_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ scales, float inverse_weight_divisor, Output output) {
+    const std::uint8_t* __restrict__ scales, float inverse_weight_divisor, Epilogue epilogue,
+    Output output) {
     static_assert((Geometry::kOutputRows % 128) == 0);
     static_assert((Schedule::kRowsPerCta % 4) == 0);
     static_assert((128 % Schedule::kRowsPerCta) == 0);
@@ -238,16 +240,11 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             total += accumulators[local_row][chain];
         }
         total = warp_reduce_sum(total);
-        if (lane == 0) { output.store(parent_rows[local_row], __float2bfloat16_rn(total)); }
+        if (lane == 0) {
+            const int parent_row = parent_rows[local_row];
+            output.store(parent_row, 0, epilogue.apply(parent_row, 0, total));
+        }
     }
 }
-
-struct Nvfp4ContiguousOutput {
-    __nv_bfloat16* data;
-
-    __device__ __forceinline__ void store(std::int32_t parent_row, __nv_bfloat16 value) const {
-        data[parent_row] = value;
-    }
-};
 
 } // namespace ninfer::ops::detail

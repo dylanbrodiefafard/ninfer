@@ -35,8 +35,7 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
 void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                     WorkspaceArena* workspace, cudaStream_t stream) {
     validate_nvfp4_weight(weight, "nvfp4 linear");
-    if (weight.n != Nvfp4LinearDecodeGeometry::kOutputRows ||
-        weight.k != Nvfp4LinearDecodeGeometry::kInputRows || x.ne[1] <= 0) {
+    if (!is_nvfp4_linear_problem(weight.n, weight.k) || x.ne[1] <= 0) {
         throw std::invalid_argument("nvfp4 linear: unsupported shape");
     }
 
@@ -52,7 +51,7 @@ void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPo
         throw std::invalid_argument("nvfp4 W4A4 linear requires caller workspace");
     }
     auto scope                       = workspace->scope();
-    const Nvfp4W4a4Workspace scratch = allocate_nvfp4_w4a4_workspace(*workspace, x.ne[1]);
+    const Nvfp4W4a4Workspace scratch = allocate_nvfp4_w4a4_workspace(*workspace, x.ne[1], weight.k);
     launch_nvfp4_w4a4(x, weight, out, scratch, stream);
 }
 

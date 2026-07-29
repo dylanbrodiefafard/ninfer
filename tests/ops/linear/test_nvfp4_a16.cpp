@@ -10,7 +10,7 @@ using namespace ninfer;
 using namespace ninfer::test::linear;
 
 int run_nvfp4_a16() {
-    constexpr std::array invocations{
+    constexpr std::array attn_invocations{
         Invocation{1, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{2, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{4, CallForm::Policy, ops::LinearPolicy::A16Only},
@@ -20,8 +20,21 @@ int run_nvfp4_a16() {
         Invocation{32, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{33, CallForm::Policy, ops::LinearPolicy::A16Only},
     };
-    return run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
-                     {14336, 5120, 701U, Comparison::Sampled, true, invocations});
+    constexpr std::array new_problem_invocations{
+        Invocation{1, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{4, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{16, CallForm::Policy, ops::LinearPolicy::A16Only},
+    };
+    int failures = 0;
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {14336, 5120, 701U, Comparison::Sampled, true, attn_invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {16384, 5120, 703U, Comparison::Sampled, true, new_problem_invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {5120, 6144, 705U, Comparison::Sampled, true, new_problem_invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {5120, 17408, 707U, Comparison::Sampled, true, new_problem_invocations});
+    return failures;
 }
 
 } // namespace

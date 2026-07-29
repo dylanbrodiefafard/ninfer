@@ -59,7 +59,7 @@ void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q,
         throw std::invalid_argument("nvfp4 W4A4 attn_input_proj requires caller workspace");
     }
     auto scope                       = workspace->scope();
-    const Nvfp4W4a4Workspace scratch = allocate_nvfp4_w4a4_workspace(*workspace, x.ne[1]);
+    const Nvfp4W4a4Workspace scratch = allocate_nvfp4_w4a4_workspace(*workspace, x.ne[1], weight.k);
     nvfp4_attn_input_w4a4_launch(x, weight, q, gate, k, v, scratch, stream);
 }
 

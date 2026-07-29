@@ -15,7 +15,8 @@ struct Nvfp4AttentionInputOutput {
     __nv_bfloat16* gate;
     __nv_bfloat16* value;
 
-    __device__ __forceinline__ void store(std::int32_t parent_row, __nv_bfloat16 result) const {
+    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t,
+                                          float result) const {
         constexpr std::int32_t kQueryRows  = 6144;
         constexpr std::int32_t kKeyRows    = 1024;
         constexpr std::int32_t kGateRows   = 6144;
@@ -23,14 +24,15 @@ struct Nvfp4AttentionInputOutput {
         constexpr std::int32_t kGateBegin  = kKeyBegin + kKeyRows;
         constexpr std::int32_t kValueBegin = kGateBegin + kGateRows;
 
+        const __nv_bfloat16 result_bf16 = __float2bfloat16_rn(result);
         if (parent_row < kKeyBegin) {
-            query[parent_row] = result;
+            query[parent_row] = result_bf16;
         } else if (parent_row < kGateBegin) {
-            key[parent_row - kKeyBegin] = result;
+            key[parent_row - kKeyBegin] = result_bf16;
         } else if (parent_row < kValueBegin) {
-            gate[parent_row - kGateBegin] = result;
+            gate[parent_row - kGateBegin] = result_bf16;
         } else {
-            value[parent_row - kValueBegin] = result;
+            value[parent_row - kValueBegin] = result_bf16;
         }
     }
 };
@@ -39,8 +41,8 @@ struct Nvfp4AttentionInputOutput {
 
 void nvfp4_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                     Tensor& k, Tensor& v, cudaStream_t stream) {
-    using Geometry = Nvfp4LinearDecodeGeometry;
-    using Schedule = Nvfp4LinearDecodeSchedule;
+    using Geometry = Nvfp4AttnInputGeometry;
+    using Schedule = typename Nvfp4LinearDecodeProductionSchedule<Geometry>::Type;
     static_assert((6144 % 128) == 0);
     static_assert((1024 % 128) == 0);
 
@@ -54,7 +56,8 @@ void nvfp4_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tenso
     const float inverse_weight_divisor = 1.0F / weight.weight_scale_divisor;
     nvfp4_gemv_kernel<Geometry, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const std::uint8_t*>(weight.scales), inverse_weight_divisor, output);
+        static_cast<const std::uint8_t*>(weight.scales), inverse_weight_divisor,
+        Nvfp4IdentityEpilogue{}, output);
     CUDA_CHECK(cudaGetLastError());
 }
 

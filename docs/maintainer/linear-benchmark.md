@@ -15,11 +15,19 @@ ninfer::ops::linear(x, w, out, policy, workspace, stream)
 Q4/Q5/Q6/W8 LinearAdd、LinearSwiGLU、LinearPair 和其他 fused Ops 不属于这个
 benchmark。它们继续由各自的 benchmark 独立测量。
 
-Q4/Q5/Q6/W8 和 BF16_CTRL 使用现有 A16 route。NVFP4 exact
-`[N,K]=[14336,5120]` 同时支持 A16 与 A4 policy，并作为永久开发 surface 使用，不加入
-model suite。`--policy a4` 测量完整 public 调用：`T<=16` 仍解析为 A16，`T>16` 由当前
-production route 量化 activation 后执行 W4A4。默认 prefill chunk `T=1024` 是这条 A4
-surface 的首要性能点；更大 T 只用于确认正 T 合同和 route 的可扩展性。
+Q4/Q5/Q6/W8 和 BF16_CTRL 使用现有 A16 route。以下 NVFP4 exact problem 同时支持 A16
+与 A4 policy，并作为永久开发 surface 使用，不加入 model suite：
+
+```text
+[14336,5120]  attention input
+[16384,5120]  GDN input
+[ 5120,6144]  attention/GDN output
+[ 5120,17408] MLP down
+```
+
+`--policy a4` 测量完整 public 调用：`T<=16` 仍解析为 A16，`T>16` 由当前 production
+route 量化 activation 后执行 W4A4。默认 prefill chunk `T=1024` 是 A4 surface 的首要
+性能点；更大 T 只用于确认正 T 合同和 route 的可扩展性。
 
 ## 1. 使用场景
 
@@ -60,6 +68,22 @@ NVFP4 的永久 A16 decode point 是：
 ./build/bench/ninfer_linear_bench \
   --qtype nvfp4 --policy a4 \
   --n 14336 --k 5120 --t 1024
+```
+
+其余三个永久 NVFP4 problem 使用同一数字入口，例如：
+
+```bash
+./build/bench/ninfer_linear_bench \
+  --qtype nvfp4 --policy a4 \
+  --n 16384 --k 5120 --t 1024
+
+./build/bench/ninfer_linear_bench \
+  --qtype nvfp4 --policy a4 \
+  --n 5120 --k 6144 --t 1024
+
+./build/bench/ninfer_linear_bench \
+  --qtype nvfp4 --policy a4 \
+  --n 5120 --k 17408 --t 1024
 ```
 
 workspace 在 timed region 前按 public capacity query 分配；activation quantization 和
@@ -472,11 +496,17 @@ profile 确定，不能把许可本身冒充为低精度执行。当前所有预
    replay；
 10. 输出同时登记固定 `209.5 TFLOP/s` BF16 与 `1676.0 TFLOP/s` NVFP4 dense Tensor
     Core 参照，并按实际 activation-compute profile 选择 `TC_%` 与 compute roof；
-11. NVFP4 A4 Linear 在 `T=17`、代表性 cp.async point 和主要 `T=1024` TMA point
-    直接通过同一个 exact-decode/naive-FP64 oracle；
-12. RTX 5090、CUDA 13.1、cold-cache、5 warmups/30 samples 下，NVFP4 A4
-    `[14336,5120], T=1024` 的完整 quantization + GEMM median 为 `152.576 us`，
-    即 `985.24 TFLOP/s` 和 dense FP4 peak 的 `58.79%`。
+11. 四个 NVFP4 exact problem 的 A4 Linear 都在 `T=17`、代表性 cp.async point 和主要
+    `T=1024` TMA point 直接通过同一个 exact-decode/naive-FP64 oracle；
+12. RTX 5090、CUDA 13.1、cold-cache、5 warmups/30 samples 下，四个 NVFP4 A4
+    `T=1024` 完整 quantization + GEMM 结果为：
+
+    | `[N,K]` | Median | Useful throughput | Dense FP4 peak |
+    |---:|---:|---:|---:|
+    | `[14336,5120]` | `152.576 us` | `985.24 TFLOP/s` | `58.79%` |
+    | `[16384,5120]` | `174.784 us` | `982.92 TFLOP/s` | `58.65%` |
+    | `[5120,6144]` | `72.992 us` | `882.62 TFLOP/s` | `52.66%` |
+    | `[5120,17408]` | `197.888 us` | `922.42 TFLOP/s` | `55.04%` |
 
 benchmark 不承担数值 correctness；各 weight/activation-compute profile 继续由 public
 Linear conformance suite 和统一 CPU FP64 GEMM oracle 负责。

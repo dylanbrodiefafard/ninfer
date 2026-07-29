@@ -4,6 +4,7 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/linear.h"
 
 #include <cuda_runtime.h>
 
@@ -42,11 +43,33 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
                     Tensor& qkv, Tensor& z, cudaStream_t stream);
 
 /**
- * Qwen3.6-35B W8 specialization. The one W8G32_F16S RowSplit parent has shape [12288,2048]
- * and stored row order [query 2048, key 2048, value 4096, z 4096]. `x` is contiguous BF16
- * [2048,T], qkv is contiguous BF16 [8192,T] in the exact causal-convolution channel order, and z
- * is an independent contiguous BF16 [4096,T] output. Every route writes both allocations directly
- * and requires no transient workspace. T may be any positive value.
+ * Single-parent GDN projection. Registered parent forms are:
+ *
+ * - W8G32_F16S RowSplit [12288,2048], with stored row counts [2048,2048,4096,4096];
+ * - NVFP4 BlockScaleK16M128x4 [16384,5120], with stored row counts [2048,2048,6144,6144].
+ *
+ * The first three ranges are written contiguously to qkv and the final range is written to z.
+ * W8 admits A16 only. NVFP4 admits A16Only and AllowA4; AllowA4 remains A16 for T<=16 and may
+ * privately quantize the represented BF16 activation for larger T. Every route writes the two
+ * independent final allocations directly. The complete projection is evaluated against the same
+ * exact-decode/naive-FP64 oracle; activation quantization and the production reduction profile are
+ * private effects covered by the selected criterion. x, qkv, and z must be pairwise
+ * non-overlapping.
+ *
+ * The policy-bearing form uses caller-owned call-scoped transient storage sized by
+ * gdn_input_proj_workspace_capacity_bytes(). A16 requires zero bytes. The convenience overload
+ * selects A16Only and requires no transient workspace.
+ */
+[[nodiscard]] std::size_t
+gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,
+                                        std::int32_t input_rows, LinearPolicy policy,
+                                        std::int32_t min_tokens, std::int32_t max_tokens);
+
+void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Tensor& qkv, Tensor& z,
+                    LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
+ * Applies the A16-only single-parent GDN projection without transient workspace.
  */
 void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Tensor& qkv, Tensor& z,
                     cudaStream_t stream);

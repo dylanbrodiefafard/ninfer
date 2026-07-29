@@ -3,6 +3,7 @@
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
+#include "ops/linear/nvfp4/nvfp4_output.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -44,17 +45,6 @@ struct Nvfp4W4a4MmaSchedule {
 struct Nvfp4W4a4MaterializedActivation {
     const std::uint8_t* codes;
     const std::uint8_t* scales;
-};
-
-struct Nvfp4W4a4ContiguousOutput {
-    __nv_bfloat16* data;
-    std::int32_t rows;
-
-    __device__ __forceinline__ void store_vector(std::int32_t parent_row, std::int32_t token,
-                                                 uint4 values) const {
-        auto* destination = data + static_cast<std::int64_t>(token) * rows + parent_row;
-        store_vec(destination, values);
-    }
 };
 
 template <class Schedule>
@@ -177,12 +167,12 @@ __device__ __forceinline__ void stage_nvfp4_w4a4_weight(const std::uint8_t* __re
     }
 }
 
-template <class Geometry, class Schedule, class OutputPolicy>
+template <class Geometry, class Schedule, class Epilogue, class OutputPolicy>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4_mma_kernel(
     Nvfp4W4a4MaterializedActivation activation, const std::uint8_t* __restrict__ weight_codes,
     const std::uint8_t* __restrict__ weight_scales, std::int32_t tokens, float alpha,
-    OutputPolicy output) {
+    Epilogue epilogue, OutputPolicy output) {
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     static_assert((Geometry::kOutputRows % Schedule::kBlockN) == 0);
 
@@ -310,10 +300,21 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
                 shared_output + (token0 - token_begin) * kOutputStride + parent_row0 - row_begin);
             auto* destination1 = reinterpret_cast<__nv_bfloat162*>(
                 shared_output + (token1 - token_begin) * kOutputStride + parent_row0 - row_begin);
-            *destination0 = __floats2bfloat162_rn(accumulators[mma_m][mma_n][0] * alpha,
-                                                  accumulators[mma_m][mma_n][1] * alpha);
-            *destination1 = __floats2bfloat162_rn(accumulators[mma_m][mma_n][2] * alpha,
-                                                  accumulators[mma_m][mma_n][3] * alpha);
+            const int parent_row1 = parent_row0 + 1;
+            float value00         = accumulators[mma_m][mma_n][0] * alpha;
+            float value01         = accumulators[mma_m][mma_n][1] * alpha;
+            float value10         = accumulators[mma_m][mma_n][2] * alpha;
+            float value11         = accumulators[mma_m][mma_n][3] * alpha;
+            if (token0 < tokens) {
+                value00 = epilogue.apply(parent_row0, token0, value00);
+                value01 = epilogue.apply(parent_row1, token0, value01);
+            }
+            if (token1 < tokens) {
+                value10 = epilogue.apply(parent_row0, token1, value10);
+                value11 = epilogue.apply(parent_row1, token1, value11);
+            }
+            *destination0 = __floats2bfloat162_rn(value00, value01);
+            *destination1 = __floats2bfloat162_rn(value10, value11);
         }
     }
     __syncthreads();
