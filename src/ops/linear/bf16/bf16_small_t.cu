@@ -31,16 +31,16 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
 template <std::size_t... Offsets>
 constexpr auto make_launchers(std::index_sequence<Offsets...>) {
     return std::array<Bf16Launch, sizeof...(Offsets)>{
-        &launch_exact<kBf16FirstSmallT + static_cast<int>(Offsets)>...};
+        &launch_exact<kBf16SmallTMinTokens + static_cast<int>(Offsets)>...};
 }
 
 constexpr auto kLaunchers =
-    make_launchers(std::make_index_sequence<kBf16LastSmallT - kBf16FirstSmallT + 1>{});
+    make_launchers(std::make_index_sequence<kBf16SmallTMaxTokens - kBf16SmallTMinTokens + 1>{});
 
 } // namespace
 
 void launch_bf16_small_t(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    kLaunchers[x.ne[1] - kBf16FirstSmallT](x, weight, out, stream);
+    kLaunchers[x.ne[1] - kBf16SmallTMinTokens](x, weight, out, stream);
 }
 
 } // namespace ninfer::ops::detail

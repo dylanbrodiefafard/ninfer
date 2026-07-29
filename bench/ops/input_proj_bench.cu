@@ -1,6 +1,5 @@
 // Fixed-shape production/control benchmark for the 27B Attention and GDN input projections.
-// Controls reproduce only the superseded Small-T compositions and are intentionally benchmark-
-// local: production dispatch has no fallback to them.
+// Controls are intentionally benchmark-local: production dispatch has no fallback to them.
 
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
@@ -11,6 +10,7 @@
 #include "core/device.h"
 #include "direct_bf16_weight.cuh"
 #include "ninfer_bench_common.h"
+#include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
 #include "quantized_weight.cuh"
 
 #include <cuda_profiler_api.h>
@@ -53,10 +53,13 @@ constexpr double kRtx5090Bf16Tflops       = 209.5;
 
 enum class OpSelection { All, Attention, Gdn };
 enum class AttentionWeightType { Q4Q5, Bf16 };
+enum class Bf16AttentionRoute { Production, SmallT, Mma, All };
 
 struct Options {
     OpSelection op                            = OpSelection::All;
     AttentionWeightType attention_weight_type = AttentionWeightType::Q4Q5;
+    Bf16AttentionRoute bf16_attention_route   = Bf16AttentionRoute::Production;
+    bool bf16_route_explicit                  = false;
     bool profile                              = false;
     bool t_sweep_explicit                     = false;
     std::vector<std::int32_t> t_sweep{1,  2,  3,  4,  5,  6,  7,  8,   9,   10,
@@ -124,6 +127,21 @@ Options parse_options(int argc, char** argv) {
             } else {
                 throw std::invalid_argument("--weight-type must be q4q5 or bf16");
             }
+        } else if (arg == "--bf16-route") {
+            const std::string_view value = next("--bf16-route value");
+            if (value == "production") {
+                options.bf16_attention_route = Bf16AttentionRoute::Production;
+            } else if (value == "small-t") {
+                options.bf16_attention_route = Bf16AttentionRoute::SmallT;
+            } else if (value == "mma") {
+                options.bf16_attention_route = Bf16AttentionRoute::Mma;
+            } else if (value == "all") {
+                options.bf16_attention_route = Bf16AttentionRoute::All;
+            } else {
+                throw std::invalid_argument(
+                    "--bf16-route must be production, small-t, mma, or all");
+            }
+            options.bf16_route_explicit = true;
         } else if (arg == "--profile") {
             options.profile = true;
         } else if (arg == "--warmup") {
@@ -134,8 +152,8 @@ Options parse_options(int argc, char** argv) {
             options.csv_out = next("--csv-out path");
         } else if (arg == "--help" || arg == "-h") {
             std::printf("Usage: %s [--op all|attention|gdn] [--weight-type q4q5|bf16] "
-                        "[--t-sweep 1,2,...] [--profile] [--warmup N] [--repeat N] "
-                        "[--csv-out PATH]\n",
+                        "[--bf16-route production|small-t|mma|all] [--t-sweep 1,2,...] "
+                        "[--profile] [--warmup N] [--repeat N] [--csv-out PATH]\n",
                         argv[0]);
             std::exit(0);
         } else {
@@ -152,7 +170,10 @@ Options parse_options(int argc, char** argv) {
         if (!options.t_sweep_explicit) {
             options.t_sweep.clear();
             for (std::int32_t t = 1; t <= 32; ++t) { options.t_sweep.push_back(t); }
+            options.t_sweep.insert(options.t_sweep.end(), {33, 128, 129, 1024, 2048, 4096});
         }
+    } else if (options.bf16_route_explicit) {
+        throw std::invalid_argument("--bf16-route requires BF16 weight mode");
     }
     if (options.profile) {
         if (options.attention_weight_type != AttentionWeightType::Bf16 ||
@@ -161,6 +182,9 @@ Options parse_options(int argc, char** argv) {
         }
         if (!options.csv_out.empty()) {
             throw std::invalid_argument("--profile does not write timing CSV");
+        }
+        if (options.bf16_attention_route == Bf16AttentionRoute::All) {
+            throw std::invalid_argument("--profile requires one BF16 route");
         }
     }
     return options;
@@ -203,7 +227,8 @@ void write_csv(const std::string& path, const std::vector<Result>& results,
 }
 
 struct Bf16AttentionResult {
-    std::int32_t t = 0;
+    const char* path = "";
+    std::int32_t t   = 0;
     bench::ColdTiming timing;
     std::uint64_t weight_bytes = 0;
     std::uint64_t x_bytes      = 0;
@@ -223,7 +248,8 @@ struct Bf16AttentionResult {
 };
 
 Bf16AttentionResult make_bf16_attention_result(const bench::ColdTiming& timing,
-                                               std::uint64_t weight_bytes, std::int32_t t) {
+                                               std::uint64_t weight_bytes, std::int32_t t,
+                                               const char* path) {
     const std::uint64_t x_bytes =
         static_cast<std::uint64_t>(kHidden) * static_cast<std::uint64_t>(t) * 2;
     const std::uint64_t out_bytes =
@@ -238,6 +264,7 @@ Bf16AttentionResult make_bf16_attention_result(const bench::ColdTiming& timing,
     const double roofline_floor_us = std::max(memory_floor_us, compute_floor_us);
 
     Bf16AttentionResult result;
+    result.path               = path;
     result.t                  = t;
     result.timing             = timing;
     result.weight_bytes       = weight_bytes;
@@ -274,7 +301,7 @@ void print_bf16_attention_results(const std::vector<Bf16AttentionResult>& result
     for (const Bf16AttentionResult& result : results) {
         std::printf("%-10s %-22s %5s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %7.2f "
                     "%7.2f %10.2f %7.2f %7s %9.2f\n",
-                    "attention", "production_parent", "BF16", 14336, kHidden, result.t,
+                    "attention", result.path, "BF16", 14336, kHidden, result.t,
                     result.timing.median_us, result.timing.min_us, result.timing.p95_us,
                     result.effective_gbs, result.dram_spec_pct, result.sustained_read_pct,
                     result.useful_tflops, result.bf16_spec_pct, result.bound, result.roofline_pct);
@@ -297,7 +324,7 @@ void write_bf16_attention_csv(const std::string& path,
               "bf16_dense_tc_spec_tflops,bf16_tc_spec_pct,memory_floor_us,compute_floor_us,"
               "roofline_floor_us,bound,roofline_pct,warmup,repeat,flush_bytes\n";
     for (const Bf16AttentionResult& result : results) {
-        stream << "attention,production_parent,BF16,14336," << kHidden << ',' << result.t << ','
+        stream << "attention," << result.path << ",BF16,14336," << kHidden << ',' << result.t << ','
                << result.weight_bytes << ',' << result.x_bytes << ',' << result.out_bytes << ','
                << result.model_bytes << ',' << result.useful_flops << ',' << result.timing.median_us
                << ',' << result.timing.min_us << ',' << result.timing.p95_us << ','
@@ -308,6 +335,45 @@ void write_bf16_attention_csv(const std::string& path,
                << result.roofline_floor_us << ',' << result.bound << ',' << result.roofline_pct
                << ',' << options.warmup << ',' << options.repeat << ',' << kFlushBytes << '\n';
     }
+}
+
+const char* bf16_attention_route_name(Bf16AttentionRoute route) {
+    switch (route) {
+    case Bf16AttentionRoute::Production:
+        return "production_parent";
+    case Bf16AttentionRoute::SmallT:
+        return "candidate_small_t";
+    case Bf16AttentionRoute::Mma:
+        return "candidate_mma";
+    case Bf16AttentionRoute::All:
+        break;
+    }
+    throw std::invalid_argument("BF16 Attention route does not name one launch");
+}
+
+bool bf16_attention_route_supports(Bf16AttentionRoute route, std::int32_t t) {
+    return route != Bf16AttentionRoute::SmallT ||
+           (t >= ops::detail::kBf16AttnInputSmallTMinTokens &&
+            t <= ops::detail::kBf16AttnInputSmallTMaxTokens);
+}
+
+void launch_bf16_attention_route(Bf16AttentionRoute route, const Tensor& x, const Weight& weight,
+                                 Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
+                                 cudaStream_t stream) {
+    switch (route) {
+    case Bf16AttentionRoute::Production:
+        ops::attn_input_proj(x, weight, q, gate, k, v, stream);
+        return;
+    case Bf16AttentionRoute::SmallT:
+        ops::detail::bf16_attn_input_small_t_launch(x, weight, q, gate, k, v, stream);
+        return;
+    case Bf16AttentionRoute::Mma:
+        ops::detail::bf16_attn_input_mma_launch(x, weight, q, gate, k, v, stream);
+        return;
+    case Bf16AttentionRoute::All:
+        break;
+    }
+    throw std::invalid_argument("BF16 Attention route must resolve to one launch");
 }
 
 void run_bf16_attention(const Options& options, DeviceBuffer& flush, cudaStream_t stream) {
@@ -323,13 +389,17 @@ void run_bf16_attention(const Options& options, DeviceBuffer& flush, cudaStream_
 
     if (options.profile) {
         const std::int32_t t = options.t_sweep.front();
+        if (!bf16_attention_route_supports(options.bf16_attention_route, t)) {
+            throw std::invalid_argument("selected BF16 Attention route does not support T");
+        }
         Tensor x(input.p, DType::BF16, {kHidden, t});
         Tensor q(query.p, DType::BF16, {kQueryRows, t});
         Tensor g(gate.p, DType::BF16, {kQueryRows, t});
         Tensor k(key.p, DType::BF16, {kKvRows, t});
         Tensor v(value.p, DType::BF16, {kKvRows, t});
         const auto launch = [&](cudaStream_t launch_stream) {
-            ops::attn_input_proj(x, weight.weight, q, g, k, v, launch_stream);
+            launch_bf16_attention_route(options.bf16_attention_route, x, weight.weight, q, g, k, v,
+                                        launch_stream);
         };
         for (int iteration = 0; iteration < options.warmup; ++iteration) {
             bench::flush_l2(flush, stream);
@@ -343,9 +413,11 @@ void run_bf16_attention(const Options& options, DeviceBuffer& flush, cudaStream_
             static_cast<std::uint64_t>(kHidden + kRows) * static_cast<std::uint64_t>(t) * 2;
         const double useful_flops = 2.0 * static_cast<double>(kRows) *
                                     static_cast<double>(kHidden) * static_cast<double>(t);
-        std::printf("PROFILE attn_input_proj weight_type=BF16 N=%d K=%d T=%d model_bytes=%llu "
-                    "useful_flops=%.0f\n",
-                    kRows, kHidden, t, static_cast<unsigned long long>(model_bytes), useful_flops);
+        std::printf(
+            "PROFILE attn_input_proj weight_type=BF16 route=%s N=%d K=%d T=%d model_bytes=%llu "
+            "useful_flops=%.0f\n",
+            bf16_attention_route_name(options.bf16_attention_route), kRows, kHidden, t,
+            static_cast<unsigned long long>(model_bytes), useful_flops);
         std::fflush(stdout);
         CUDA_CHECK(cudaProfilerStart());
         launch(stream);
@@ -355,19 +427,37 @@ void run_bf16_attention(const Options& options, DeviceBuffer& flush, cudaStream_
     }
 
     std::vector<Bf16AttentionResult> results;
-    results.reserve(options.t_sweep.size());
+    results.reserve(options.t_sweep.size() *
+                    (options.bf16_attention_route == Bf16AttentionRoute::All ? 3 : 1));
     for (const std::int32_t t : options.t_sweep) {
         Tensor x(input.p, DType::BF16, {kHidden, t});
         Tensor q(query.p, DType::BF16, {kQueryRows, t});
         Tensor g(gate.p, DType::BF16, {kQueryRows, t});
         Tensor k(key.p, DType::BF16, {kKvRows, t});
         Tensor v(value.p, DType::BF16, {kKvRows, t});
-        const auto launch = [&](cudaStream_t launch_stream) {
-            ops::attn_input_proj(x, weight.weight, q, g, k, v, launch_stream);
+        constexpr Bf16AttentionRoute kRoutes[] = {
+            Bf16AttentionRoute::Production,
+            Bf16AttentionRoute::SmallT,
+            Bf16AttentionRoute::Mma,
         };
-        const bench::ColdTiming timing =
-            bench::measure_cold_launch(launch, flush, stream, options.warmup, options.repeat);
-        results.push_back(make_bf16_attention_result(timing, weight.model_weight_bytes(), t));
+        const auto measure = [&](Bf16AttentionRoute route) {
+            if (!bf16_attention_route_supports(route, t)) {
+                if (options.bf16_attention_route == Bf16AttentionRoute::All) { return; }
+                throw std::invalid_argument("selected BF16 Attention route does not support T");
+            }
+            const auto launch = [&](cudaStream_t launch_stream) {
+                launch_bf16_attention_route(route, x, weight.weight, q, g, k, v, launch_stream);
+            };
+            const bench::ColdTiming timing =
+                bench::measure_cold_launch(launch, flush, stream, options.warmup, options.repeat);
+            results.push_back(make_bf16_attention_result(timing, weight.model_weight_bytes(), t,
+                                                         bf16_attention_route_name(route)));
+        };
+        if (options.bf16_attention_route == Bf16AttentionRoute::All) {
+            for (const Bf16AttentionRoute route : kRoutes) { measure(route); }
+        } else {
+            measure(options.bf16_attention_route);
+        }
     }
     print_bf16_attention_results(results);
     write_bf16_attention_csv(options.csv_out, results, options);

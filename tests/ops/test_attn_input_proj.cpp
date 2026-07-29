@@ -121,20 +121,35 @@ int verify_direct_output(std::string_view label, const GuardedBf16Tensor& output
     return failures;
 }
 
+std::vector<std::int32_t> sampled_tokens(std::int32_t tokens) {
+    if (tokens <= 32) {
+        std::vector<std::int32_t> result(static_cast<std::size_t>(tokens));
+        for (std::int32_t token = 0; token < tokens; ++token) {
+            result[static_cast<std::size_t>(token)] = token;
+        }
+        return result;
+    }
+    std::vector<std::int32_t> result{0, 1, tokens / 2, tokens - 2, tokens - 1};
+    std::sort(result.begin(), result.end());
+    result.erase(std::unique(result.begin(), result.end()), result.end());
+    return result;
+}
+
 int verify_direct_output_sampled(std::string_view label, const GuardedBf16Tensor& output,
                                  const HostWeight& weight, std::int32_t parent_row_offset,
                                  std::int32_t output_rows, const std::vector<float>& activation,
                                  std::int32_t hidden, std::int32_t tokens) {
     int failures = output.verify_guards(label);
     failures += output.verify_fully_written(label);
-    const std::vector<std::int32_t> rows = sampled_rows(output_rows);
-    const std::vector<double> values     = output.values();
+    const std::vector<std::int32_t> rows          = sampled_rows(output_rows);
+    const std::vector<std::int32_t> token_samples = sampled_tokens(tokens);
+    const std::vector<double> values              = output.values();
     std::vector<double> actual;
     std::vector<double> expected;
-    actual.reserve(rows.size() * static_cast<std::size_t>(tokens));
+    actual.reserve(rows.size() * token_samples.size());
     expected.reserve(actual.capacity());
     for (const std::int32_t local_row : rows) {
-        for (std::int32_t token = 0; token < tokens; ++token) {
+        for (const std::int32_t token : token_samples) {
             actual.push_back(values[static_cast<std::size_t>(token) * output_rows + local_row]);
             expected.push_back(dot_fp64(
                 weight, parent_row_offset + local_row,
@@ -208,7 +223,7 @@ int run_bf16_target() {
     constexpr std::int32_t kParentRows = 14336;
     DeviceWeight parent(make_patterned(kParentRows, kHidden, 313U));
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 4, 8, 16, 17, 32}) {
+    for (const std::int32_t tokens : {1, 2, 4, 8, 16, 17, 22, 23, 32, 33, 128, 129, 1024}) {
         failures += run_bf16_target_case(parent, tokens);
     }
     return failures;

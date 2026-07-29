@@ -68,6 +68,20 @@ std::vector<std::int32_t> sampled_rows() {
     return {0, 1, 1023, 6143, 6144, 7167, 7168, 13311, 13312, kRows - 2, kRows - 1};
 }
 
+std::vector<std::int32_t> sampled_tokens(std::int32_t tokens) {
+    if (tokens <= 32) {
+        std::vector<std::int32_t> result(static_cast<std::size_t>(tokens));
+        for (std::int32_t token = 0; token < tokens; ++token) {
+            result[static_cast<std::size_t>(token)] = token;
+        }
+        return result;
+    }
+    std::vector<std::int32_t> result{0, 1, tokens / 2, tokens - 2, tokens - 1};
+    std::sort(result.begin(), result.end());
+    result.erase(std::unique(result.begin(), result.end()), result.end());
+    return result;
+}
+
 int run_bf16_linear_case(DeviceWeight& weight, std::int32_t tokens) {
     const std::vector<std::uint16_t> activation_bits = make_activation_bits(tokens);
     const std::vector<float> activation              = materialize(activation_bits);
@@ -104,11 +118,12 @@ int run_bf16_linear_case(DeviceWeight& weight, std::int32_t tokens) {
         for (const std::uint16_t bits : output_bits) { actual.push_back(bf16_to_f32(bits)); }
         expected = complete;
     } else {
-        const std::vector<std::int32_t> rows = sampled_rows();
-        actual.reserve(rows.size() * static_cast<std::size_t>(tokens));
+        const std::vector<std::int32_t> rows          = sampled_rows();
+        const std::vector<std::int32_t> token_samples = sampled_tokens(tokens);
+        actual.reserve(rows.size() * token_samples.size());
         expected.reserve(actual.capacity());
         for (const std::int32_t row : rows) {
-            for (std::int32_t token = 0; token < tokens; ++token) {
+            for (const std::int32_t token : token_samples) {
                 actual.push_back(
                     bf16_to_f32(output_bits[static_cast<std::size_t>(token) * kRows + row]));
                 expected.push_back(dot_fp64(
@@ -133,7 +148,7 @@ int run_bf16_linear_case(DeviceWeight& weight, std::int32_t tokens) {
 int run_bf16_linear() {
     DeviceWeight weight(make_patterned(kRows, kHidden, 401U));
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 4, 8, 16, 17, 32}) {
+    for (const std::int32_t tokens : {1, 2, 4, 8, 16, 17, 27, 28, 32, 33, 128, 129, 1024}) {
         failures += run_bf16_linear_case(weight, tokens);
     }
     return failures;

@@ -74,7 +74,9 @@ load, graph construction, and warmup do not enter topology counts.
 `ninfer_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,
 W8, and registered BF16 weights with the current A16 activation-compute policy. LinearAdd,
 LinearSwiGLU, LinearPair, Attention/GDN projections, and sparse MoE remain separate semantic Ops
-and are not benchmark modes here.
+and are not benchmark modes here. For the registered BF16 problem, `--bf16-route
+production|small-t|mma|all` exposes benchmark-local launch controls with the same pure Linear
+semantics so dispatch crossovers can be measured directly.
 
 Build the benchmark and measure one exact production point:
 
@@ -94,6 +96,9 @@ allocation:
 ./build/bench/ninfer_linear_bench \
   --qtype q4 --policy a16 --n 3456 --k 1152 \
   --sweep 4:512:4 --csv-out profiles/bench/q4_vision_qkv.csv
+./build/bench/ninfer_linear_bench \
+  --qtype bf16 --policy a16 --n 14336 --k 5120 --sweep 24:32:1 \
+  --bf16-route all --warmup 20 --repeat 500
 ```
 
 The registered suites run representative public Linear shapes for one or both exact products.
@@ -107,7 +112,7 @@ matrix:
 ```
 
 For NCU, `--profile` performs setup, warmup, and the L2 flush before enabling the profiler, then
-captures exactly one public Linear call:
+captures exactly one selected launch. The default production route enters through public Linear:
 
 ```bash
 ncu --profile-from-start off --set full \
@@ -188,7 +193,8 @@ cmake --build build --parallel --target ninfer_input_proj_bench
 The four-projection and materialize/copy controls exist only in this benchmark and are not
 production-callable routes.
 
-The BF16 Attention decode point is:
+BF16 Attention defaults to the complete decode/small-T sweep plus the first MMA point, a full/tail
+tile pair, the primary prefill point, and representative larger chunks. A focused decode run is:
 
 ```bash
 ./build/bench/ninfer_input_proj_bench \
@@ -196,10 +202,15 @@ The BF16 Attention decode point is:
   --warmup 20 --repeat 500
 ```
 
+`--bf16-route production|small-t|mma|all` provides the corresponding benchmark-local crossover
+controls. The candidate small-T implementation remains measurable through `T=32`; this range is
+not the production crossover.
+
 It counts the complete BF16 parent exactly once, one activation read, and the four final output
 writes. The result reports the same fixed-spec `DRAM_%` and measured pure-read `READ_%` columns as
-the Linear control. `--profile` performs setup, warmup, and L2 eviction before capturing exactly
-one public BF16 `attn_input_proj` call.
+the Linear control; compute-bound points also report useful Tensor Core `TFLOP/s`, `TC_%`, and
+roofline utilization. `--profile` performs setup, warmup, and L2 eviction before capturing exactly
+one selected launch; the default production route enters through public BF16 `attn_input_proj`.
 
 ## Bidirectional GQA Op benchmark
 

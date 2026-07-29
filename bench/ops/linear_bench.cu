@@ -12,6 +12,7 @@
 #include "core/device.h"
 #include "direct_bf16_weight.cuh"
 #include "ninfer_bench_common.h"
+#include "ops/linear/bf16/bf16_launch.h"
 #include "quantized_weight.cuh"
 
 #include <cuda_bf16.h>
@@ -48,6 +49,13 @@ constexpr int kDefaultRepeat               = 20;
 enum class TClass : std::uint8_t {
     Continuous,
     VisionStep4,
+};
+
+enum class Bf16Route : std::uint8_t {
+    Production,
+    SmallT,
+    Mma,
+    All,
 };
 
 struct SuiteEntry {
@@ -96,18 +104,20 @@ struct Sweep {
 };
 
 struct Options {
-    bool have_qtype     = false;
-    bool have_n         = false;
-    bool have_k         = false;
-    bool have_t         = false;
-    bool have_sweep     = false;
-    bool have_suite     = false;
-    bool profile        = false;
-    QType qtype         = QType::Q4G64_F16S;
-    LinearPolicy policy = LinearPolicy::A16Only;
-    std::int32_t n      = 0;
-    std::int32_t k      = 0;
-    std::int32_t t      = 0;
+    bool have_qtype          = false;
+    bool have_n              = false;
+    bool have_k              = false;
+    bool have_t              = false;
+    bool have_sweep          = false;
+    bool have_suite          = false;
+    bool profile             = false;
+    bool bf16_route_explicit = false;
+    QType qtype              = QType::Q4G64_F16S;
+    LinearPolicy policy      = LinearPolicy::A16Only;
+    Bf16Route bf16_route     = Bf16Route::Production;
+    std::int32_t n           = 0;
+    std::int32_t k           = 0;
+    std::int32_t t           = 0;
     Sweep sweep;
     std::string suite;
     int warmup                = kDefaultWarmup;
@@ -316,7 +326,8 @@ void usage(const char* argv0) {
         "  %s --suite qwen3_6_27b|qwen3_6_35b_a3b|all [options]\n\n"
         "Options:\n"
         "  --policy a16       Activation-compute policy (default a16; only current option).\n"
-        "  --profile          Capture exactly one post-warmup public Linear call.\n"
+        "  --bf16-route R     BF16 route: production, small-t, mma, or all.\n"
+        "  --profile          Capture exactly one post-warmup selected Linear launch.\n"
         "  --warmup N         Warmup calls per point (default %d).\n"
         "  --repeat N         Measured cold-cache samples per point (default %d).\n"
         "  --flush-mib N      L2 eviction buffer size (default 256 MiB).\n"
@@ -338,6 +349,21 @@ Options parse_args(int argc, char** argv) {
             opt.have_qtype = true;
         } else if (arg == "--policy") {
             opt.policy = parse_policy(next("policy"));
+        } else if (arg == "--bf16-route") {
+            const std::string value = lower(next("bf16 route"));
+            if (value == "production") {
+                opt.bf16_route = Bf16Route::Production;
+            } else if (value == "small-t") {
+                opt.bf16_route = Bf16Route::SmallT;
+            } else if (value == "mma") {
+                opt.bf16_route = Bf16Route::Mma;
+            } else if (value == "all") {
+                opt.bf16_route = Bf16Route::All;
+            } else {
+                throw std::invalid_argument(
+                    "--bf16-route must be production, small-t, mma, or all");
+            }
+            opt.bf16_route_explicit = true;
         } else if (arg == "--n") {
             opt.n      = parse_i32(next("N"), "N");
             opt.have_n = true;
@@ -386,6 +412,9 @@ Options parse_args(int argc, char** argv) {
             throw std::invalid_argument("--suite cannot be combined with an explicit point");
         }
         if (opt.profile) { throw std::invalid_argument("--profile does not accept a suite"); }
+        if (opt.bf16_route_explicit) {
+            throw std::invalid_argument("--bf16-route does not accept a suite");
+        }
     } else {
         if (!opt.have_qtype || !opt.have_n || !opt.have_k) {
             throw std::invalid_argument("explicit mode requires --qtype, --n, and --k");
@@ -396,9 +425,17 @@ Options parse_args(int argc, char** argv) {
         if (opt.profile && !opt.have_t) {
             throw std::invalid_argument("--profile requires one exact --t");
         }
+        if (opt.bf16_route_explicit &&
+            (opt.qtype != QType::BF16_CTRL || opt.policy != LinearPolicy::A16Only ||
+             opt.n != 14336 || opt.k != 5120)) {
+            throw std::invalid_argument("--bf16-route requires BF16 A16 with N=14336 and K=5120");
+        }
     }
     if (opt.profile && !opt.csv_out.empty()) {
         throw std::invalid_argument("--profile does not write timing CSV");
+    }
+    if (opt.profile && opt.bf16_route == Bf16Route::All) {
+        throw std::invalid_argument("--profile requires one BF16 route");
     }
     return opt;
 }
@@ -514,6 +551,43 @@ std::string join_labels(const std::vector<std::string>& labels) {
     return out;
 }
 
+const char* bf16_route_name(Bf16Route route) {
+    switch (route) {
+    case Bf16Route::Production:
+        return "production";
+    case Bf16Route::SmallT:
+        return "candidate_small_t";
+    case Bf16Route::Mma:
+        return "candidate_mma";
+    case Bf16Route::All:
+        break;
+    }
+    throw std::invalid_argument("BF16 Linear route does not name one launch");
+}
+
+bool bf16_route_supports(Bf16Route route, std::int32_t t) {
+    return route != Bf16Route::SmallT ||
+           (t >= ops::detail::kBf16SmallTMinTokens && t <= ops::detail::kBf16SmallTMaxTokens);
+}
+
+void launch_bf16_route(Bf16Route route, const Tensor& x, const Weight& weight, Tensor& output,
+                       LinearPolicy policy, cudaStream_t stream) {
+    switch (route) {
+    case Bf16Route::Production:
+        ops::linear(x, weight, output, policy, stream);
+        return;
+    case Bf16Route::SmallT:
+        ops::detail::launch_bf16_small_t(x, weight, output, stream);
+        return;
+    case Bf16Route::Mma:
+        ops::detail::launch_bf16_mma(x, weight, output, stream);
+        return;
+    case Bf16Route::All:
+        break;
+    }
+    throw std::invalid_argument("BF16 Linear route must resolve to one launch");
+}
+
 Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
                    const bench::ColdTiming& timing, const Options& opt) {
     const std::uint64_t x_elements =
@@ -582,23 +656,47 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     std::vector<Result> results;
-    results.reserve(group.points.size());
+    results.reserve(group.points.size() * (opt.bf16_route == Bf16Route::All ? 3 : 1));
     double previous_median = std::numeric_limits<double>::quiet_NaN();
 
     for (const BenchPoint& point : group.points) {
         Tensor activation(x.p, DType::BF16, {group.k, point.t});
         Tensor output(out.p, DType::BF16, {group.n, point.t});
-        const auto launch = [&](cudaStream_t launch_stream) {
-            ops::linear(activation, weight.weight, output, group.policy, launch_stream);
+        constexpr Bf16Route kRoutes[] = {
+            Bf16Route::Production,
+            Bf16Route::SmallT,
+            Bf16Route::Mma,
         };
-        const bench::ColdTiming timing =
-            bench::measure_cold_launch(launch, flush, stream, opt.warmup, opt.repeat);
-        Result result = make_result(point, weight, timing, opt);
-        if (point.sweep_point && std::isfinite(previous_median)) {
-            result.delta_pct = (result.median_us / previous_median - 1.0) * 100.0;
+        const auto measure = [&](Bf16Route route) {
+            if (!bf16_route_supports(route, point.t)) {
+                if (opt.bf16_route == Bf16Route::All) { return; }
+                throw std::invalid_argument("selected BF16 Linear route does not support T");
+            }
+            const auto launch = [&](cudaStream_t launch_stream) {
+                launch_bf16_route(route, activation, weight.weight, output, group.policy,
+                                  launch_stream);
+            };
+            const bench::ColdTiming timing =
+                bench::measure_cold_launch(launch, flush, stream, opt.warmup, opt.repeat);
+            BenchPoint measured_point = point;
+            if (opt.bf16_route_explicit) {
+                measured_point.labels.push_back(bf16_route_name(route));
+            }
+            Result result = make_result(measured_point, weight, timing, opt);
+            if (point.sweep_point && opt.bf16_route != Bf16Route::All &&
+                std::isfinite(previous_median)) {
+                result.delta_pct = (result.median_us / previous_median - 1.0) * 100.0;
+            }
+            if (point.sweep_point && opt.bf16_route != Bf16Route::All) {
+                previous_median = result.median_us;
+            }
+            results.push_back(std::move(result));
+        };
+        if (opt.bf16_route == Bf16Route::All) {
+            for (const Bf16Route route : kRoutes) { measure(route); }
+        } else {
+            measure(opt.bf16_route);
         }
-        if (point.sweep_point) { previous_median = result.median_us; }
-        results.push_back(std::move(result));
     }
     return results;
 }
@@ -618,8 +716,11 @@ void run_profile(const BenchPoint& point, const Options& opt, DeviceBuffer& flus
 
     Tensor activation(x.p, DType::BF16, {point.k, point.t});
     Tensor output(out.p, DType::BF16, {point.n, point.t});
+    if (!bf16_route_supports(opt.bf16_route, point.t)) {
+        throw std::invalid_argument("selected BF16 Linear route does not support T");
+    }
     const auto launch = [&]() {
-        ops::linear(activation, weight.weight, output, point.policy, stream);
+        launch_bf16_route(opt.bf16_route, activation, weight.weight, output, point.policy, stream);
     };
     for (int i = 0; i < opt.warmup; ++i) {
         bench::flush_l2(flush, stream);
@@ -635,10 +736,11 @@ void run_profile(const BenchPoint& point, const Options& opt, DeviceBuffer& flus
         checked_add(weight.model_weight_bytes(), x_bytes, "model bytes"), out_bytes, "model bytes");
     const double useful_flops = 2.0 * static_cast<double>(point.n) * static_cast<double>(point.k) *
                                 static_cast<double>(point.t);
-    std::printf("PROFILE linear qtype=%s policy=%s N=%d K=%d T=%d model_bytes=%llu "
+    std::printf("PROFILE linear qtype=%s policy=%s route=%s N=%d K=%d T=%d model_bytes=%llu "
                 "useful_flops=%.0f\n",
-                qtype_name(point.qtype), policy_name(point.policy), point.n, point.k, point.t,
-                static_cast<unsigned long long>(model_bytes), useful_flops);
+                qtype_name(point.qtype), policy_name(point.policy), bf16_route_name(opt.bf16_route),
+                point.n, point.k, point.t, static_cast<unsigned long long>(model_bytes),
+                useful_flops);
     std::fflush(stdout);
 
     CUDA_CHECK(cudaProfilerStart());

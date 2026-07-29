@@ -86,7 +86,7 @@ site counts describe artifact coverage; they are not runtime dispatch inputs.
 | ID | Semantic Op | Weight format | Exact parent `[N,K]` | Artifact roles | Status |
 |---|---|---|---:|---|---|
 | A1 | `attn_input_proj` | `NVFP4` | `[14336,5120]` | attention input, 10 sites | [ ] |
-| A2 | `attn_input_proj` | `BF16` → `BF16_CTRL` | `[14336,5120]` | attention input, 6 sites | [ ] |
+| A2 | `attn_input_proj` | `BF16` → `BF16_CTRL` | `[14336,5120]` | attention input, 6 sites | [x] |
 | G1 | `gdn_input_proj` | `NVFP4` | `[16384,5120]` | GDN input, 48 sites | [ ] |
 | G2 | `gdn_input_proj_conv_snapshot` | `NVFP4` | `[16384,5120]` | GDN verify input, same 48 sites | [ ] |
 | M1 | `linear_swiglu` | `NVFP4` | `[34816,5120]` | MLP gate/up, 64 sites | [ ] |
@@ -168,26 +168,23 @@ output allocation order does not.
 
 ### A2 — single-parent BF16 `attn_input_proj`
 
-- [ ] Admit one complete contiguous `BF16_CTRL` `query_key_gate_value` weight
+- [x] Admit one complete contiguous `BF16_CTRL` `query_key_gate_value` weight
   `[14336,5120]`.
-- [ ] Use the same input, output, row-order, aliasing, and `T > 0` contract as A1.
-- [ ] Evaluate each projection from the represented BF16 weight and activation values; no
+- [x] Use the same input, output, row-order, aliasing, and `T > 0` contract as A1.
+- [x] Evaluate each projection from the represented BF16 weight and activation values; no
   quantization divisor is accepted or used.
-- [ ] Cover all four row ranges with the independent oracle and retain the existing Q4/Q5 and W8
+- [x] Cover all four row ranges with the independent oracle and retain the existing Q4/Q5 and W8
   regressions.
 
 A2 is required even though it contains no NVFP4 weight: without it, the six BF16 attention-input
 parents in the NVFP4 artifact do not have an Op consumer. Its distinction from BF16 `linear` is the
 same four-contiguous-output contract as A1, not different projection arithmetic.
 
-Current A2 progress, which does not mark A2 complete:
-
-- [x] the exact contiguous BF16 parent `[14336,5120]` is admitted and executable for
-  `T=1..32`;
-- [x] the public call writes Q, gate, K, and V directly with the required physical-row mapping;
-- [x] the complete `T=1` output and sampled rows and physical seams at `T=2,4,8,16,17,32` pass
-  the independent represented-BF16/FP64 oracle while existing Q4/Q5 and W8 cases remain qualified;
-- [ ] `T>32`, including prefill, still needs to make every positive `T` executable.
+A2 is complete. Its private dispatch is monotone: decode at `T=1`, the qualified small-T family at
+`T=2..22`, then one shared Linear-owned BF16 MMA body from `T=23` with an Attention-owned
+four-output epilogue.
+Full and predicated MMA tiles, the route boundary, and `T=1024` pass the independent
+represented-BF16/FP64 oracle while the existing Q4/Q5 and W8 cases remain qualified.
 
 ## 5. GDN input projection
 
