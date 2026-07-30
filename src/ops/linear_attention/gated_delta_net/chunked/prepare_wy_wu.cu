@@ -6,15 +6,20 @@ namespace {
 
 namespace kernel = prepare_wy_wu;
 
-cudaError_t launch_fixed(const prepare_wy_wu_config& cfg, dim3 grid, dim3 block, head_map qk_map) {
-    constexpr int smem_bytes = kernel::kernel_dims::SMEM_FLOATS * static_cast<int>(sizeof(float));
+template <int KPanelCols, int WuPanelCols, int BlockWarps>
+cudaError_t launch_fixed(const prepare_wy_wu_config& cfg, dim3 grid, head_map qk_map) {
+    using dims               = kernel::kernel_dims<KPanelCols, WuPanelCols>;
+    constexpr int smem_bytes = dims::SMEM_FLOATS * static_cast<int>(sizeof(float));
+    constexpr int threads    = BlockWarps * ninfer::ops::kWarpSize;
 
-    cudaError_t err = cudaFuncSetAttribute(kernel::prepare_wy_wu_kernel,
-                                           cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    cudaError_t err =
+        cudaFuncSetAttribute(kernel::prepare_wy_wu_kernel<KPanelCols, WuPanelCols, BlockWarps>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     if (err != cudaSuccess) { return err; }
 
-    kernel::prepare_wy_wu_kernel<<<grid, block, smem_bytes, cfg.stream>>>(
-        cfg.k, cfg.v, cfg.g_in, cfg.beta, cfg.W, cfg.U, cfg.g_cumsum_out, qk_map);
+    kernel::prepare_wy_wu_kernel<KPanelCols, WuPanelCols, BlockWarps>
+        <<<grid, dim3(threads, 1, 1), smem_bytes, cfg.stream>>>(
+            cfg.k, cfg.v, cfg.g_in, cfg.beta, cfg.W, cfg.U, cfg.g_cumsum_out, qk_map);
     return cudaGetLastError();
 }
 
@@ -34,8 +39,8 @@ cudaError_t launch_prepare_wy_wu(const prepare_wy_wu_config& cfg) {
     NINFER_GATED_DELTA_NET_PROPAGATE(v.check_grid(NT, cfg.H_v));
 
     const dim3 grid(static_cast<unsigned>(NT), static_cast<unsigned>(cfg.H_v), 1);
-    const dim3 block(kernel::THREADS, 1, 1);
-    return launch_fixed(cfg, grid, block, qk_map);
+    if (cfg.H_v == 32) { return launch_fixed<32, 16, 4>(cfg, grid, qk_map); }
+    return launch_fixed<64, 32, 8>(cfg, grid, qk_map);
 }
 
 } // namespace ninfer::ops::detail::gated_delta_net::chunked
