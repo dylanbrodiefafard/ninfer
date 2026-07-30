@@ -25,7 +25,7 @@
   "conversion": {
     "recipe_id": "qwen3_6_27b_nvfp4-v1",
     "converter_repository": "https://github.com/Neroued/ninfer",
-    "converter_revision": "c6b2ef0572c757a0a8e088a28a72d972ae3b1145",
+    "converter_revision": "a85109c4ef16b0b4a218c61e4641cfd0d11320fe",
     "ranking_input": {
       "path": "tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64",
       "sha256": "c692dc76388132c910547589b4fb4a0503fbd6ad50aaac6a509bbcb192a8afa5"
@@ -33,7 +33,7 @@
   },
   "runtime": {
     "repository": "https://github.com/Neroued/ninfer",
-    "minimum_revision": "2140dda4b63f31bf7024cdf094784ac3904274ef",
+    "minimum_revision": "a85109c4ef16b0b4a218c61e4641cfd0d11320fe",
     "cuda_architecture": "sm_120a"
   },
   "inventory": {

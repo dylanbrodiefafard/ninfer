@@ -108,7 +108,7 @@ printf '%s  %s\n' \
 ## Requirements
 
 - [NInfer](https://github.com/Neroued/ninfer) revision
-  [`2140dda`](https://github.com/Neroued/ninfer/commit/2140dda4b63f31bf7024cdf094784ac3904274ef)
+  [`a85109c`](https://github.com/Neroued/ninfer/commit/a85109c4ef16b0b4a218c61e4641cfd0d11320fe)
   or later, built from source;
 - 64-bit Linux;
 - NVIDIA GeForce RTX 5090 (`sm_120a`);
@@ -210,7 +210,7 @@ These are single-sample results under the stated NInfer evaluation profile, not 
 
 ## Limits
 
-- The artifact is accepted only by NInfer revision `2140dda` or later and the matching registered
+- The artifact is accepted only by NInfer revision `a85109c` or later and the matching registered
   target.
 - NInfer currently executes on one RTX 5090, one CUDA device, and one active request per Engine.
 - It does not provide continuous batching, multi-GPU execution, CPU/GPU offload, or distributed
@@ -228,8 +228,8 @@ These are single-sample results under the stated NInfer evaluation profile, not 
 | NVFP4 source revision | `9b5389d4a1e207daab2d47732efea57d7e946dcf` |
 | Conversion recipe | `qwen3_6_27b_nvfp4-v1` |
 | Converter repository | `https://github.com/Neroued/ninfer` |
-| Converter revision | `c6b2ef0572c757a0a8e088a28a72d972ae3b1145` |
-| Minimum runtime revision | `2140dda4b63f31bf7024cdf094784ac3904274ef` |
+| Converter revision | `a85109c4ef16b0b4a218c61e4641cfd0d11320fe` |
+| Minimum runtime revision | `a85109c4ef16b0b4a218c61e4641cfd0d11320fe` |
 | Ranking input SHA-256 | `c692dc76388132c910547589b4fb4a0503fbd6ad50aaac6a509bbcb192a8afa5` |
 
 The artifact identity, summarized object inventory, and conversion provenance are published in
