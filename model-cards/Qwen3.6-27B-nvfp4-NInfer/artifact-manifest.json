@@ -3,8 +3,8 @@
   "schema_version": 1,
   "artifact": {
     "filename": "qwen3_6_27b_nvfp4.ninfer",
-    "bytes": 17608902400,
-    "sha256": "886144e76f3ab8a132555e40b7182af187d7a9aeab5cff56b41d7c6e43fb91e1",
+    "bytes": 18324064000,
+    "sha256": "bce5f00d066c0f20f1317bf1fdcb458264cf95837c3b1f3fbec163694627893a",
     "container_version": 2,
     "model_id": "qwen3.6-27b",
     "weights_id": "nvfp4",
@@ -47,8 +47,8 @@
       "NVFP4": 247,
       "Q4G64_F16S": 55,
       "Q5G64_F16S": 54,
-      "Q6G64_F16S": 3,
-      "W8G32_F16S": 7
+      "Q6G64_F16S": 1,
+      "W8G32_F16S": 9
     },
     "layouts": {
       "blockscale-k16-m128x4-v1": 247,
@@ -59,10 +59,10 @@
       "raw-bytes-v1": 6
     },
     "bytes": {
-      "tensor": 17595721560,
+      "tensor": 18310883160,
       "resource": 12833441,
-      "object": 17608555001,
-      "payload_span": 17608693504,
+      "object": 18323716601,
+      "payload_span": 18323855104,
       "alignment": 138503
     }
   }

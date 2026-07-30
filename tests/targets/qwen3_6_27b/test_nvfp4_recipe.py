@@ -38,11 +38,23 @@ def test_closed_allocation_inventory_and_site_coverage():
         "I32": 1,
         "Q4G64_F16S": 55,
         "Q5G64_F16S": 54,
-        "Q6G64_F16S": 3,
-        "W8G32_F16S": 7,
+        "Q6G64_F16S": 1,
+        "W8G32_F16S": 9,
         "NVFP4": 247,
     }
     tensors = {spec.name: spec for spec in inventory.TENSOR_SPECS}
+    assert tensors["text/token_embedding"] == inventory.TensorSpec(
+        "text/token_embedding",
+        (248320, 5120),
+        "W8G32_F16S",
+        "row-split-k128-v1",
+    )
+    assert tensors["text/output_head"] == inventory.TensorSpec(
+        "text/output_head",
+        (248320, 5120),
+        "W8G32_F16S",
+        "row-split-k128-v1",
+    )
     assert tensors["text/layers/3/attention/query_key_gate_value"] == inventory.TensorSpec(
         "text/layers/3/attention/query_key_gate_value",
         (14336, 5120),

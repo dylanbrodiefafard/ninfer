@@ -1,6 +1,6 @@
 # Qwen3.6-27B Artifact Reference
 
-This reference defines both additive `.ninfer` storage artifacts for `qwen3.6-27b`: object names,
+This reference defines both `.ninfer` storage artifacts for `qwen3.6-27b`: object names,
 order, shapes, numeric formats, storage layouts, fused row order, aliases, frontend resources, and
 source-to-object transforms. Sections 2 through 12 define the released Q4/Q5 artifact; Section 13
 defines the separately generated NVFP4 artifact. Common framing is defined in
@@ -532,11 +532,11 @@ For source prefix `model.visual.merger.`:
 | `norm/weight` | `norm.weight [1152]` | preserve BF16 |
 | `norm/bias` | `norm.bias [1152]` | preserve BF16 |
 
-## 13. Additive NVFP4 artifact
+## 13. NVFP4 artifact
 
 ### 13.1 Identity and consumer status
 
-The additive artifact has this fixed identity:
+The NVFP4 artifact has this fixed identity:
 
 ```text
 converter  = tools.convert.qwen3_6_27b.convert_nvfp4
@@ -589,7 +589,9 @@ NVFP4 on the other 47 GDN layers. Every Text `mlp/gate_up` and `mlp/down` is NVF
 per-tensor override.
 
 This produces 247 NVFP4 matrix parents and nine BF16 exception parents. All non-Text components keep
-the formats in Sections 5 through 7. The complete tensor counts are:
+the formats in Sections 5 through 7. `text/token_embedding [248320,5120]` and
+`text/output_head [248320,5120]` use `W8G32_F16S`, encoder profile
+`MAXABS_F16_RECIP_RNE_V1`, and `row-split-k128-v1`. The complete tensor counts are:
 
 | Format | Tensors |
 |---|---:|
@@ -598,14 +600,14 @@ the formats in Sections 5 through 7. The complete tensor counts are:
 | `I32` | 1 |
 | `Q4G64_F16S` | 55 |
 | `Q5G64_F16S` | 54 |
-| `Q6G64_F16S` | 3 |
-| `W8G32_F16S` | 7 |
+| `Q6G64_F16S` | 1 |
+| `W8G32_F16S` | 9 |
 | `NVFP4` | 247 |
 | total | 1301 |
 
 The six frontend resources bring the object total to 1307. The 247 additional FP32 tensors are
-site-level input divisors. Physical attention-input and GDN-input fusion removes 64 matrix objects
-relative to the original artifact without changing the represented source rows.
+site-level input divisors. Physical attention-input and GDN-input parents store the fused
+represented source rows defined above.
 
 ### 13.4 Weight and input-divisor ownership
 
@@ -671,7 +673,7 @@ single `query_key_gate_value` parent and GDN-input `d_x` maps to the single
 `query_key_value_z` parent. Every other site maps to its one named parent. Thus 247 scalars cover
 all 247 NVFP4 parents one-to-one.
 
-The internal runtime `Weight` representation already has `QType::NVFP4`,
+The runtime `Weight` representation uses `QType::NVFP4`,
 `QuantLayout::BlockScaleK16M128x4`, E4M3FN scale dtype, `weight_scale_divisor`, and
 `input_scale_divisor`; both divisor fields default to the invalid sentinel `0.0F`. The generic
 `materialized_weight` path deliberately rejects NVFP4 because only the target-private
@@ -709,23 +711,23 @@ binder then validates the complete selected inventory. It does not inspect a rep
 descriptor, discriminate by object count, try one binder and catch failure, add a model/target, or
 carry an artifact string branch into request execution.
 
-The existing `attn_input_proj`, `linear`, `linear_add`, and `linear_swiglu` signatures remain
-unchanged. The 27B Q4/Q5 `gdn_input_proj` and `gdn_input_proj_conv_snapshot` signatures now accept
-the complete `[12288,5120]` Q5 `value_z` parent and write Z as an explicit BF16 output. The existing
-Q4/Q5 artifact bytes are unchanged. Each NVFP4 leaf reads `d_x` and `d_w` from its complete
+The `attn_input_proj`, `linear`, `linear_add`, and `linear_swiglu` signatures consume their
+registered immutable weights. The 27B groupwise `gdn_input_proj` and
+`gdn_input_proj_conv_snapshot` signatures accept the complete `[12288,5120]` Q5 `value_z` parent
+and write Z as an explicit BF16 output. Each NVFP4 leaf reads `d_x` and `d_w` from its complete
 parent `Weight`; the Op wrapper derives that weight's `1 / (d_x * d_w)` as a leaf-private kernel
 argument. That coefficient is not another artifact object, another `Weight` field, or a new Op
 parameter.
 
-The nine BF16 Text exceptions retain the same fused semantic Op boundaries. The Op layer admits
+The nine BF16 Text exceptions use the fused semantic Op boundaries. The Op layer admits
 their single-parent BF16 weights through `attn_input_proj` for the six early
 `query_key_gate_value` parents and through `linear_add` for attention output layers 3 and 7 and GDN
 output layer 4.
 
 All NVFP4 Text parents and BF16 exceptions described above are bound and executable. Text prefill
 passes `AllowA4` only for NVFP4 weights: `T >= 17` selects W4A4 MMA while `T <= 16` remains on A16.
-Ordinary decode and speculative target verify always pass `A16Only`; MTP and Vision retain their
-existing storage and execution paths. With all startup features enabled, 1054 tensors and six
+Ordinary decode and speculative target verify always pass `A16Only`; MTP and Vision use their
+registered storage and execution paths. With all startup features enabled, 1054 tensors and six
 resources are materialized; the 247 site-level `d_x` scalars are consumed and validated but receive
 no device allocation.
 
@@ -748,10 +750,11 @@ out/qwen3_6_27b_nvfp4.ninfer
 out/qwen3_6_27b_nvfp4.ninfer.conversion.json
 ```
 
-The generated file is 17,608,902,400 bytes, with a 17,608,693,504-byte payload region. Reopening it
-with `verify_nvfp4.py` validates the complete ordered directory, all 247 packed-code/scale/divisor
-payloads against 379 source linears, all 247 input-divisor words, all 105 fused/base BF16 Text
-matrix objects representing the 117 selected BF16 source linears, and all six resources.
+The generated file is 18,324,064,000 bytes, with an 18,323,855,104-byte payload region. Reopening it
+with `verify_nvfp4.py` validates the complete ordered directory, representative rows and groups
+from both W8 endpoints against their base BF16 sources, all 247 packed-code/scale/divisor payloads
+against 379 source linears, all 247 input-divisor words, all 105 fused/base BF16 Text matrix
+objects representing the 117 selected BF16 source linears, and all six resources.
 
 Native qualification additionally validates both real 27B artifacts through their exact C++
 load plans. The NVFP4 plan consumes 1307 objects, retains six frontend resources, places 1054

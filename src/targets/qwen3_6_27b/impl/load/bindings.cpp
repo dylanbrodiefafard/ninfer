@@ -32,6 +32,16 @@ bool is_bf16_attention_output(std::size_t layer) { return layer == 3 || layer ==
 
 bool is_bf16_gdn_output(std::size_t layer) { return layer == 4; }
 
+NumericFormat endpoint_format(WeightsProfile weights_profile) {
+    switch (weights_profile) {
+    case WeightsProfile::GroupwiseInt:
+        return NumericFormat::Q6G64_F16S;
+    case WeightsProfile::Nvfp4:
+        return NumericFormat::W8G32_F16S;
+    }
+    throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
+}
+
 std::uint32_t read_u32_le(std::span<const std::byte> bytes, std::uint64_t offset,
                           std::string_view label) {
     if (offset > bytes.size() || bytes.size() - static_cast<std::size_t>(offset) < 4) {
@@ -332,8 +342,9 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.frontend     = qwen3_6::bind_frontend_resources(binder);
     out.features     = features;
 
-    out.token_embedding = artifact::bind_device_tensor(binder, "text/token_embedding",
-                                                       NumericFormat::Q6G64_F16S, {248320, 5120});
+    const NumericFormat vocabulary_format = endpoint_format(weights_profile);
+    out.token_embedding =
+        bind_weight(binder, "text/token_embedding", vocabulary_format, {248320, 5120});
     switch (weights_profile) {
     case WeightsProfile::GroupwiseInt:
         bind_groupwise_text_layers(binder, out);
@@ -346,8 +357,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     }
     out.final_norm =
         artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16, {5120});
-    out.output_head = artifact::bind_device_tensor(binder, "text/output_head",
-                                                   NumericFormat::Q6G64_F16S, {248320, 5120});
+    out.output_head = bind_weight(binder, "text/output_head", vocabulary_format, {248320, 5120});
     const artifact::TensorPlacement proposal_placement =
         features.optimized_proposal() ? artifact::TensorPlacement::Device
                                       : artifact::TensorPlacement::ValidateOnly;
@@ -412,8 +422,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     auto& final_norm      = runtime.final_norm;
     auto& output_head     = runtime.output_head;
 
-    token_embedding        = artifact::materialized_weight(backing, plan.token_embedding,
-                                                           NumericFormat::Q6G64_F16S, 248320, 5120);
+    token_embedding        = materialized_weight(backing, plan.token_embedding, 248320, 5120);
     std::size_t full_index = 0;
     std::size_t gdn_index  = 0;
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
@@ -459,8 +468,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     }
     final_norm =
         artifact::materialized_tensor(backing, plan.final_norm, NumericFormat::BF16, {5120});
-    output_head = artifact::materialized_weight(backing, plan.output_head,
-                                                NumericFormat::Q6G64_F16S, 248320, 5120);
+    output_head = materialized_weight(backing, plan.output_head, 248320, 5120);
     if (plan.features.optimized_proposal()) {
         auto& proposal     = runtime.optimized_proposal.emplace();
         proposal.head      = artifact::materialized_weight(backing, plan.draft_head,

@@ -17,8 +17,8 @@ namespace ninfer::ops {
  * quantized tables, the oracle independently decodes each signed code and multiplies it by the
  * exact stored FP16 scale in FP64; the BF16 output is promoted and compared directly with that
  * ideal. Final output storage rounding belongs to the quantized embedding criterion, not the
- * oracle. The registered fast domains are Q6/D=5120 and W8/D=2048. `out` must not overlap `ids` or
- * any table plane. There is no workspace or persistent state side effect.
+ * oracle. The registered domains are Q6/D=5120 and W8/D=2048 or D=5120. `out` must not overlap
+ * `ids` or any table plane. There is no workspace or persistent state side effect.
  */
 void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream);
 

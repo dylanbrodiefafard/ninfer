@@ -59,6 +59,11 @@ int verify_groupwise(const std::filesystem::path& path) {
         std::cerr << "groupwise materialization plan is incomplete\n";
         return 1;
     }
+    if (plan.bindings.token_embedding.format != NumericFormat::Q6G64_F16S ||
+        plan.bindings.output_head.format != NumericFormat::Q6G64_F16S) {
+        std::cerr << "groupwise vocabulary endpoints have the wrong storage profile\n";
+        return 1;
+    }
     for (const TextLayerPlan& layer : plan.bindings.text_layers) {
         if (layer.is_full_attention) {
             if (!std::holds_alternative<SplitAttentionProjectionPlan>(layer.attention.projection)) {
@@ -98,6 +103,11 @@ int verify_nvfp4(const std::filesystem::path& path) {
                   << plan.materialization.object_count
                   << " device=" << plan.materialization.device_objects.size()
                   << " host=" << plan.materialization.host_objects.size() << '\n';
+        return 1;
+    }
+    if (plan.bindings.token_embedding.format != NumericFormat::W8G32_F16S ||
+        plan.bindings.output_head.format != NumericFormat::W8G32_F16S) {
+        std::cerr << "NVFP4 vocabulary endpoints have the wrong storage profile\n";
         return 1;
     }
 

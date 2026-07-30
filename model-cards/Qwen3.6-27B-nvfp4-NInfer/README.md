@@ -83,8 +83,8 @@ MTP, prefix-reuse, CLI, and serving paths as the groupwise-int profile.
 | Field | Value |
 |---|---|
 | Filename | `qwen3_6_27b_nvfp4.ninfer` |
-| Size | 17,608,902,400 bytes (16.40 GiB) |
-| SHA-256 | `886144e76f3ab8a132555e40b7182af187d7a9aeab5cff56b41d7c6e43fb91e1` |
+| Size | 18,324,064,000 bytes (17.07 GiB) |
+| SHA-256 | `bce5f00d066c0f20f1317bf1fdcb458264cf95837c3b1f3fbec163694627893a` |
 | Container version | 2 |
 | NInfer model ID | `qwen3.6-27b` |
 | NInfer weights ID | `nvfp4` |
@@ -101,7 +101,7 @@ Verify a downloaded file with:
 
 ```bash
 printf '%s  %s\n' \
-  '886144e76f3ab8a132555e40b7182af187d7a9aeab5cff56b41d7c6e43fb91e1' \
+  'bce5f00d066c0f20f1317bf1fdcb458264cf95837c3b1f3fbec163694627893a' \
   'qwen3_6_27b_nvfp4.ninfer' | sha256sum --check
 ```
 

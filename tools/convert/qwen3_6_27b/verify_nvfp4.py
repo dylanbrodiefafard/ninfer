@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 from typing import Sequence
 
+from safetensors import safe_open
 import torch
 
 from tools.artifact.container import (
@@ -31,6 +32,7 @@ from . import convert_nvfp4
 from . import inventory_nvfp4 as inventory
 from . import recipe as base_recipe
 from . import recipe_nvfp4 as recipe
+from . import verify as base_verify
 
 
 class VerificationError(ValueError):
@@ -42,6 +44,9 @@ class VerificationSummary:
     objects: int
     tensors: int
     resources: int
+    w8_endpoint_weights: int
+    w8_endpoint_rows: int
+    w8_endpoint_groups: int
     nvfp4_weights: int
     bf16_text_matrices: int
     input_divisors: int
@@ -118,6 +123,58 @@ def _verify_resources(artifact: Artifact, base_dir: Path) -> None:
         source = (base_dir / spec.name.removeprefix("frontend/")).read_bytes()
         if bytes(artifact.payload(obj)) != source:
             _error(f"{spec.name}: resource payload differs from base source")
+
+
+W8_ENDPOINT_SPECS = tuple(
+    spec
+    for spec in inventory.TENSOR_SPECS
+    if spec.name in ("text/token_embedding", "text/output_head")
+)
+
+
+def _source_rows(
+    reader: ShardReader,
+    source: base_recipe.SourceTensor,
+    rows: Sequence[int],
+) -> torch.Tensor:
+    shard = reader.weight_map[source.name]
+    with safe_open(
+        str(reader.model_dir / shard),
+        framework="pt",
+        device="cpu",
+    ) as handle:
+        tensor_slice = handle.get_slice(source.name)
+        pieces = [tensor_slice[row : row + 1] for row in rows]
+    return torch.cat(pieces, dim=0)
+
+
+def _verify_w8_endpoints(
+    artifact: Artifact,
+    reader: ShardReader,
+) -> tuple[int, int]:
+    verified_rows = 0
+    verified_groups = 0
+    for spec in W8_ENDPOINT_SPECS:
+        obj = artifact.find(spec.name)
+        if not isinstance(obj, TensorObject):
+            _error(f"{spec.name}: expected tensor")
+        expression = base_recipe.RECIPES_BY_NAME[spec.name].expression
+        if not isinstance(expression, base_recipe.SourceTensor):
+            _error(f"{spec.name}: endpoint source must be one direct BF16 matrix")
+        rows = tuple(dict.fromkeys((0, spec.shape[0] // 2, spec.shape[0] - 1)))
+        source_rows = _source_rows(reader, expression, rows)
+        try:
+            verified_groups += base_verify.verify_quantized_rows(
+                artifact.payload(obj),
+                obj.format,
+                obj.shape,
+                rows,
+                source_rows,
+            )
+        except base_verify.VerificationError as error:
+            _error(f"{spec.name}: {error}")
+        verified_rows += len(rows)
+    return verified_rows, verified_groups
 
 
 def _verify_nvfp4_weights(
@@ -225,6 +282,9 @@ def verify_artifact(
     convert_nvfp4.preflight_conversion(base, nvfp4)
     _verify_resources(artifact, base)
     with ShardReader(base) as base_reader:
+        w8_endpoint_rows, w8_endpoint_groups = _verify_w8_endpoints(
+            artifact, base_reader
+        )
         _verify_bf16_text_matrices(artifact, base_reader)
     with ShardReader(nvfp4) as nvfp4_reader:
         _verify_nvfp4_weights(artifact, nvfp4_reader)
@@ -233,6 +293,9 @@ def verify_artifact(
         objects=len(artifact.objects),
         tensors=len(inventory.TENSOR_SPECS),
         resources=len(inventory.RESOURCE_SPECS),
+        w8_endpoint_weights=len(W8_ENDPOINT_SPECS),
+        w8_endpoint_rows=w8_endpoint_rows,
+        w8_endpoint_groups=w8_endpoint_groups,
         nvfp4_weights=len(recipe.NVFP4_WEIGHT_RECIPES),
         bf16_text_matrices=len(BF16_TEXT_MATRIX_SPECS),
         input_divisors=len(recipe.INPUT_DIVISOR_RECIPES),

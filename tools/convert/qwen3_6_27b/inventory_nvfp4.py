@@ -48,6 +48,8 @@ NVFP4_GDN_OUTPUT_LAYERS = tuple(
 
 
 def _replacement_format(name: str, original: str) -> str:
+    if name in ("text/token_embedding", "text/output_head"):
+        return W8
     if not name.startswith("text/layers/"):
         return original
     parts = name.split("/")
@@ -258,8 +260,8 @@ def validate_inventory() -> None:
         I32: 1,
         Q4: 55,
         Q5: 54,
-        Q6: 3,
-        W8: 7,
+        Q6: 1,
+        W8: 9,
         NVFP4: 247,
     }:
         raise ValueError(f"unexpected NVFP4 format allocation: {FORMAT_COUNTS}")

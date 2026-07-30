@@ -22,7 +22,8 @@ constexpr std::int32_t kVocab             = 248320;
 constexpr std::int32_t kLastFrontendToken = 248076;
 constexpr std::int32_t kMaskToken         = 248077;
 constexpr std::int32_t kQ6D               = 5120;
-constexpr std::int32_t kW8D               = 2048;
+constexpr std::int32_t kW8VisionD         = 2048;
+constexpr std::int32_t kW8TextD           = 5120;
 constexpr std::int32_t kDenseRows         = 2304;
 constexpr std::int32_t kDenseD            = 1152;
 constexpr std::int32_t kQ6Group           = 64;
@@ -288,8 +289,8 @@ struct W8Row {
 
 class W8Table {
 public:
-    W8Table()
-        : groups_(kW8D / kW8Group), code_plane_bytes_(static_cast<std::size_t>(kVocab) * kW8D),
+    explicit W8Table(std::int32_t d)
+        : d_(d), groups_(d / kW8Group), code_plane_bytes_(static_cast<std::size_t>(kVocab) * d),
           scale_offset_(align_up(code_plane_bytes_, 256)),
           payload_(scale_offset_ + static_cast<std::size_t>(kVocab) * groups_ * 2) {
         for (const std::int32_t row : repeated_ids(8)) {
@@ -313,25 +314,25 @@ public:
         result.group            = kW8Group;
         result.ndim             = 2;
         result.shape[0]         = kVocab;
-        result.shape[1]         = kW8D;
+        result.shape[1]         = d_;
         result.padded_shape[0]  = kVocab;
-        result.padded_shape[1]  = kW8D;
+        result.padded_shape[1]  = d_;
         result.n                = kVocab;
-        result.k                = kW8D;
+        result.k                = d_;
         return result;
     }
 
     std::vector<double> oracle(const std::vector<std::int32_t>& ids) const {
-        std::vector<double> result(static_cast<std::size_t>(kW8D) * ids.size());
+        std::vector<double> result(static_cast<std::size_t>(d_) * ids.size());
         for (std::size_t t = 0; t < ids.size(); ++t) {
             const W8Row* row = find(ids[t]);
             if (row == nullptr) throw std::out_of_range("W8 oracle row was not materialized");
-            for (std::int32_t d = 0; d < kW8D; ++d) {
+            for (std::int32_t d = 0; d < d_; ++d) {
                 const std::uint8_t raw = row->codes[d];
                 const int code = raw < 0x80u ? static_cast<int>(raw) : static_cast<int>(raw) - 256;
-                const double scale                             = static_cast<double>(f16_to_f32(
+                const double scale                           = static_cast<double>(f16_to_f32(
                     load_u16_le(row->scales, static_cast<std::size_t>(d / kW8Group) * 2)));
-                result[t * static_cast<std::size_t>(kW8D) + d] = static_cast<double>(code) * scale;
+                result[t * static_cast<std::size_t>(d_) + d] = static_cast<double>(code) * scale;
             }
         }
         return result;
@@ -341,7 +342,7 @@ public:
         int failures = payload_.verify_guards(label);
         for (const W8Row& row : rows_) {
             std::vector<std::uint8_t> got(row.codes.size());
-            payload_.copy_to_host(got.data(), got.size(), static_cast<std::size_t>(row.id) * kW8D);
+            payload_.copy_to_host(got.data(), got.size(), static_cast<std::size_t>(row.id) * d_);
             failures += verify_exact(label, got, row.codes);
             got.resize(row.scales.size());
             payload_.copy_to_host(got.data(), got.size(),
@@ -359,7 +360,7 @@ private:
     }
 
     void add_row(std::int32_t id) {
-        W8Row row{id, std::vector<std::uint8_t>(kW8D),
+        W8Row row{id, std::vector<std::uint8_t>(d_),
                   std::vector<std::uint8_t>(static_cast<std::size_t>(groups_) * 2)};
         for (std::int32_t group = 0; group < groups_; ++group) {
             const std::uint16_t scale =
@@ -377,12 +378,13 @@ private:
             }
         }
         payload_.copy_from_host(row.codes.data(), row.codes.size(),
-                                static_cast<std::size_t>(id) * kW8D);
+                                static_cast<std::size_t>(id) * d_);
         payload_.copy_from_host(row.scales.data(), row.scales.size(),
                                 scale_offset_ + static_cast<std::size_t>(id) * groups_ * 2);
         rows_.push_back(std::move(row));
     }
 
+    std::int32_t d_;
     std::int32_t groups_;
     std::size_t code_plane_bytes_;
     std::size_t scale_offset_;
@@ -422,12 +424,14 @@ int test_q6() {
 }
 
 int test_w8() {
-    W8Table table;
     int failures = 0;
-    for (const std::size_t t : {1u, 6u, 7u, 16u, 1024u}) {
-        const std::string label =
-            "embedding W8 [248320,2048] T=" + std::to_string(static_cast<unsigned long long>(t));
-        failures += run_quantized_case(label.c_str(), table, repeated_ids(t), kW8D);
+    for (const std::int32_t d : {kW8VisionD, kW8TextD}) {
+        W8Table table(d);
+        for (const std::size_t t : {1u, 6u, 16u, 1024u}) {
+            const std::string label = "embedding W8 [248320," + std::to_string(d) +
+                                      "] T=" + std::to_string(static_cast<unsigned long long>(t));
+            failures += run_quantized_case(label.c_str(), table, repeated_ids(t), d);
+        }
     }
     return failures;
 }
