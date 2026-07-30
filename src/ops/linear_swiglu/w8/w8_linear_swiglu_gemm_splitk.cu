@@ -2,7 +2,7 @@
 
 #include "core/device.h"
 #include "ops/common/math.cuh"
-#include "ops/linear/w8/w8_rowsplit_gemm_exact_t_splitk.cuh"
+#include "ops/linear/w8/w8_small_t_mma.cuh"
 
 #include <array>
 #include <cstdint>
@@ -53,12 +53,14 @@ template <int ActiveCols>
 void launch_active_cols(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     constexpr int TileCols =
         ActiveCols <= 8 ? 8 : (ActiveCols <= 16 ? 16 : (ActiveCols <= 24 ? 24 : 32));
+    using Geometry = W8LinearGeometry<2 * kIntermediate, kHidden>;
+    using Schedule = W8SmallTMmaDefaultSchedule<TileCols, ActiveCols>;
     const W8ContiguousOutput ignored_output{static_cast<__nv_bfloat16*>(out.data), kIntermediate};
     const W8SwiGluExactTEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data), kIntermediate};
     const W8SwiGluExactTRows row_policy{kIntermediate};
-    w8_rowsplit_exact_t_splitk_kernel<kHidden, TileCols, ActiveCols, W8ContiguousOutput,
-                                      W8SwiGluExactTEpilogue, W8SwiGluExactTRows>
-        <<<kIntermediate / kRowsPerCta, 8 * 32, 0, stream>>>(
+    w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule, W8ContiguousOutput,
+                          W8SwiGluExactTEpilogue, W8SwiGluExactTRows>
+        <<<kIntermediate / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.scales), ignored_output, epilogue, row_policy);
 }

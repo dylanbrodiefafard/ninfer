@@ -1,15 +1,15 @@
 #pragma once
 
-// W8G32 RowSplit exact-small-T split-K MMA core.
+// Reusable W8G32 RowSplit exact-small-T MMA core.
 //
-// Eight warps cooperatively own one 16-row output tile. Each warp evaluates a
-// disjoint 64-wide K slice, then the CTA reduces the eight FP32 partials in
-// shared memory. ActiveCols is compile-time exact, so T=2..32 has neither a
-// runtime column loop nor padded output work. Output owns the physical split
-// epilogue; an optional caller epilogue may instead consume the FP32 tile.
+// Geometry, active tokens, and scheduling are independent compile-time values. K-split warps
+// cooperatively own one 16-row output tile; each warp evaluates a disjoint 64-wide K slice, then
+// the CTA reduces FP32 partials in shared memory. Output owns physical row/token addressing; an
+// optional caller epilogue may instead consume the FP32 tile.
 
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
+#include "ops/linear/w8/w8_config.h"
 #include "ops/linear/w8/w8_rowsplit_output.cuh"
 
 #include <cuda_bf16.h>
@@ -20,9 +20,9 @@
 
 namespace ninfer::ops::detail {
 
-struct W8ExactTSplitKStoreEpilogue {};
+struct W8SmallTMmaStoreEpilogue {};
 
-struct W8ExactTIdentityRows {
+struct W8SmallTMmaIdentityRows {
     static constexpr int kOutputRowsPerCta = 16;
 
     __device__ __forceinline__ int weight_row(int output_row0, int local_row) const {
@@ -30,54 +30,54 @@ struct W8ExactTIdentityRows {
     }
 };
 
-__device__ __forceinline__ int w8_exact_t_swizzle_64(int row, int col) {
+__device__ __forceinline__ int w8_small_t_swizzle_64(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
 }
 
-union W8ExactTBf16PairBits {
+union W8SmallTBf16PairBits {
     __nv_bfloat162 pair;
     unsigned bits;
 };
 
-__device__ __forceinline__ unsigned w8_exact_t_bf16_pair_from_s8(unsigned values) {
-    W8ExactTBf16PairBits biased;
+__device__ __forceinline__ unsigned w8_small_t_bf16_pair_from_s8(unsigned values) {
+    W8SmallTBf16PairBits biased;
     biased.bits          = __byte_perm(values, 0x43004300u, 0x7150) & 0xff7fff7fu;
     const unsigned signs = (values & 0x80u) | ((values & 0x8000u) << 8);
-    W8ExactTBf16PairBits bias;
+    W8SmallTBf16PairBits bias;
     bias.bits = 0x43004300u | signs;
-    W8ExactTBf16PairBits result;
+    W8SmallTBf16PairBits result;
     result.pair = __hsub2_rn(biased.pair, bias.pair);
     return result.bits;
 }
 
-template <int TileCols>
-inline constexpr int kW8ExactTMinBlocks =
-    TileCols == 8 ? 5 : (TileCols == 16 ? 4 : (TileCols == 24 ? 3 : 2));
-
-template <int Hidden, int TileCols, int ActiveCols, class Output,
-          class Epilogue = W8ExactTSplitKStoreEpilogue, class RowPolicy = W8ExactTIdentityRows>
+template <class Geometry, int ActiveCols, class Schedule, class Output,
+          class Epilogue = W8SmallTMmaStoreEpilogue, class RowPolicy = W8SmallTMmaIdentityRows>
 __global__
-__launch_bounds__(8 * 32, kW8ExactTMinBlocks<TileCols>) void w8_rowsplit_exact_t_splitk_kernel(
+__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, Output output, Epilogue epilogue = {},
     RowPolicy row_policy = {}) {
-    constexpr int kTileK      = 64;
-    constexpr int kWarps      = 8;
-    constexpr int kMmaRows    = 16;
-    constexpr int kRowsPerCta = 16;
-    constexpr int kGroupK     = kWarps * kTileK;
-    constexpr int kGroups     = Hidden / kGroupK;
-    static_assert(Hidden % kGroupK == 0);
-    static_assert(TileCols == 8 || TileCols == 16 || TileCols == 24 || TileCols == 32);
-    static_assert(ActiveCols >= 2 && ActiveCols <= TileCols);
-    constexpr int kNt        = TileCols / 8;
+    constexpr int kHidden     = Geometry::kInputRows;
+    constexpr int kTileK      = Schedule::kTileKPerWarp;
+    constexpr int kWarps      = Schedule::kKWarps;
+    constexpr int kMmaRows    = Schedule::kRowsPerCta;
+    constexpr int kRowsPerCta = Schedule::kRowsPerCta;
+    constexpr int kGroupK     = Schedule::kGroupK;
+    constexpr int kGroups     = kHidden / kGroupK;
+    constexpr int kTileCols   = Schedule::kTileTokens;
+    static_assert((kHidden % kGroupK) == 0);
+    static_assert(ActiveCols >= 1 && ActiveCols <= kTileCols);
+    static_assert(RowPolicy::kOutputRowsPerCta <= kRowsPerCta);
+    constexpr int kNt        = kTileCols / 8;
     constexpr unsigned kMask = 0xffffffffu;
 
     union SharedStorage {
         struct {
             std::uint8_t codes[kMmaRows][kGroupK];
-            __nv_bfloat16 activations[kWarps][TileCols * kTileK];
-            std::uint8_t scales[kMmaRows][ActiveCols > 4 ? kGroupK / 16 : 1];
+            __nv_bfloat16 activations[kWarps][kTileCols * kTileK];
+            std::uint8_t scales[kMmaRows][Schedule::kScaleAccess == W8SmallTMmaScaleAccess::Shared
+                                              ? Schedule::kScaleBytesPerRow
+                                              : 1];
         } staging;
 
         float partial[kWarps * kNt * 32 * 4];
@@ -102,35 +102,38 @@ __launch_bounds__(8 * 32, kW8ExactTMinBlocks<TileCols>) void w8_rowsplit_exact_t
         for (int item = lane; item < kItemsPerSplit; item += 32) {
             const int col = item / (kTileK / 8);
             const int k8  = item - col * (kTileK / 8);
-            auto* dst     = &b_shared[warp][col * kTileK + w8_exact_t_swizzle_64(col, k8 * 8)];
-            cp_async<16, Cache::ca>(
+            auto* dst     = &b_shared[warp][col * kTileK + w8_small_t_swizzle_64(col, k8 * 8)];
+            cp_async<16, Schedule::kActivationCache>(
                 dst,
-                &x[static_cast<std::int64_t>(col) * Hidden + group_k0 + warp * kTileK + k8 * 8]);
+                &x[static_cast<std::int64_t>(col) * kHidden + group_k0 + warp * kTileK + k8 * 8]);
         }
         cp_commit();
     };
 
     const auto stage_codes = [&](int group_k0) {
 #pragma unroll
-        for (int row_item = 0; row_item < 2; ++row_item) {
-            const int row            = warp * 2 + row_item;
-            const int chunk          = lane;
-            const int swizzled_chunk = chunk ^ (row & 7);
-            const int weight_row     = row_policy.weight_row(cta_row0, row);
-            cp_async<16, Cache::cg>(&code_shared[row][swizzled_chunk * 16],
-                                    codes + static_cast<std::int64_t>(weight_row) * Hidden +
-                                        group_k0 + chunk * 16);
+        for (int row_item = 0; row_item < Schedule::kRowsPerLoaderWarp; ++row_item) {
+            const int row        = warp * Schedule::kRowsPerLoaderWarp + row_item;
+            const int weight_row = row_policy.weight_row(cta_row0, row);
+            for (int chunk = lane; chunk < kGroupK / 16; chunk += 32) {
+                const int swizzled_chunk = chunk ^ (row & 7);
+                cp_async<16, Schedule::kWeightCache>(
+                    &code_shared[row][swizzled_chunk * 16],
+                    codes + static_cast<std::int64_t>(weight_row) * kHidden + group_k0 +
+                        chunk * 16);
+            }
         }
-        if constexpr (ActiveCols > 4) {
-            for (int item = tid; item < kMmaRows * 2; item += kWarps * 32) {
-                const int row        = item >> 1;
-                const int chunk      = item & 1;
+        if constexpr (Schedule::kScaleAccess == W8SmallTMmaScaleAccess::Shared) {
+            constexpr int kScaleChunksPerRow = Schedule::kScaleBytesPerRow / 16;
+            for (int item = tid; item < kMmaRows * kScaleChunksPerRow; item += kWarps * 32) {
+                const int row        = item / kScaleChunksPerRow;
+                const int chunk      = item - row * kScaleChunksPerRow;
                 const int weight_row = row_policy.weight_row(cta_row0, row);
-                cp_async<16, Cache::cg>(&scale_shared[row][chunk * 16],
-                                        scales +
-                                            (static_cast<std::int64_t>(weight_row) * (Hidden / 32) +
-                                             group_k0 / 32 + chunk * 8) *
-                                                2);
+                cp_async<16, Schedule::kWeightCache>(
+                    &scale_shared[row][chunk * 16],
+                    scales + (static_cast<std::int64_t>(weight_row) * Geometry::kGroupsPerRow +
+                              group_k0 / 32 + chunk * 8) *
+                                 2);
             }
         }
         cp_commit();
@@ -153,22 +156,22 @@ __launch_bounds__(8 * 32, kW8ExactTMinBlocks<TileCols>) void w8_rowsplit_exact_t
     cp_wait<0>();
     __syncthreads();
 
-    constexpr int kGroupUnroll = Hidden <= 6144 ? kGroups : 12;
+    constexpr int kGroupUnroll = kHidden <= 6144 ? kGroups : 12;
 #pragma unroll kGroupUnroll
     for (int group_index = 0; group_index < kGroups; ++group_index) {
         const int group_k0 = group_index * kGroupK;
 
         unsigned lane_scale_pair = 0;
         if (lid < 2) {
-            if constexpr (ActiveCols > 4) {
+            if constexpr (Schedule::kScaleAccess == W8SmallTMmaScaleAccess::Shared) {
                 const int scale_row = gid + lid * 8;
                 lane_scale_pair =
                     *reinterpret_cast<const unsigned*>(&scale_shared[scale_row][warp_koff / 16]);
             } else {
                 const int scale_row = row_policy.weight_row(cta_row0, gid + lid * 8);
                 lane_scale_pair     = *reinterpret_cast<const unsigned*>(
-                    scales + (static_cast<std::int64_t>(scale_row) * (Hidden / 32) + group_k0 / 32 +
-                              warp_koff / 32) *
+                    scales + (static_cast<std::int64_t>(scale_row) * Geometry::kGroupsPerRow +
+                              group_k0 / 32 + warp_koff / 32) *
                                  2);
             }
         }
@@ -195,13 +198,13 @@ __launch_bounds__(8 * 32, kW8ExactTMinBlocks<TileCols>) void w8_rowsplit_exact_t
                     return static_cast<unsigned>(
                         *reinterpret_cast<const unsigned short*>(&code_shared[code_row][offset]));
                 };
-                const unsigned af0 = w8_exact_t_bf16_pair_from_s8(load_code_pair(gid, code_col));
+                const unsigned af0 = w8_small_t_bf16_pair_from_s8(load_code_pair(gid, code_col));
                 const unsigned af1 =
-                    w8_exact_t_bf16_pair_from_s8(load_code_pair(gid + 8, code_col));
+                    w8_small_t_bf16_pair_from_s8(load_code_pair(gid + 8, code_col));
                 const unsigned af2 =
-                    w8_exact_t_bf16_pair_from_s8(load_code_pair(gid, code_col + 8));
+                    w8_small_t_bf16_pair_from_s8(load_code_pair(gid, code_col + 8));
                 const unsigned af3 =
-                    w8_exact_t_bf16_pair_from_s8(load_code_pair(gid + 8, code_col + 8));
+                    w8_small_t_bf16_pair_from_s8(load_code_pair(gid + 8, code_col + 8));
 #pragma unroll
                 for (int ni = 0; ni < kNt; ++ni) {
                     unsigned bf0, bf1;
@@ -209,7 +212,7 @@ __launch_bounds__(8 * 32, kW8ExactTMinBlocks<TileCols>) void w8_rowsplit_exact_t
                     ldmatrix_x2(
                         bf0, bf1,
                         smem_addr(&b_shared[k_split][br * kTileK +
-                                                     w8_exact_t_swizzle_64(br, ks * 16 + b_koff)]));
+                                                     w8_small_t_swizzle_64(br, ks * 16 + b_koff)]));
                     mma_bf16(group_acc[ni][0], group_acc[ni][1], group_acc[ni][2], group_acc[ni][3],
                              af0, af1, af2, af3, bf0, bf1);
                 }
@@ -280,7 +283,7 @@ __launch_bounds__(8 * 32, kW8ExactTMinBlocks<TileCols>) void w8_rowsplit_exact_t
                 sum.w += value.w;
             }
             const int col0 = ni * 8 + 2 * lid;
-            if constexpr (std::is_same_v<Epilogue, W8ExactTSplitKStoreEpilogue>) {
+            if constexpr (std::is_same_v<Epilogue, W8SmallTMmaStoreEpilogue>) {
                 if (col0 < ActiveCols) {
                     *output_tile.at(cta_row0 + gid, col0)     = __float2bfloat16_rn(sum.x);
                     *output_tile.at(cta_row0 + gid + 8, col0) = __float2bfloat16_rn(sum.z);
@@ -291,22 +294,22 @@ __launch_bounds__(8 * 32, kW8ExactTMinBlocks<TileCols>) void w8_rowsplit_exact_t
                 }
             } else {
                 if (col0 < ActiveCols) {
-                    projected[gid * TileCols + col0]       = sum.x;
-                    projected[(gid + 8) * TileCols + col0] = sum.z;
+                    projected[gid * kTileCols + col0]       = sum.x;
+                    projected[(gid + 8) * kTileCols + col0] = sum.z;
                 }
                 if (col0 + 1 < ActiveCols) {
-                    projected[gid * TileCols + col0 + 1]       = sum.y;
-                    projected[(gid + 8) * TileCols + col0 + 1] = sum.w;
+                    projected[gid * kTileCols + col0 + 1]       = sum.y;
+                    projected[(gid + 8) * kTileCols + col0 + 1] = sum.w;
                 }
             }
         }
-        if constexpr (!std::is_same_v<Epilogue, W8ExactTSplitKStoreEpilogue>) {
+        if constexpr (!std::is_same_v<Epilogue, W8SmallTMmaStoreEpilogue>) {
             __syncwarp();
             if (lane < kRowsPerCta) {
                 float row_values[ActiveCols];
 #pragma unroll
                 for (int token = 0; token < ActiveCols; ++token) {
-                    row_values[token] = projected[lane * TileCols + token];
+                    row_values[token] = projected[lane * kTileCols + token];
                 }
                 epilogue.store(cta_row0 + lane, row_values);
             }

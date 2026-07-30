@@ -30,6 +30,10 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             if (t <= 4) { return launch_w8_simt_r8_c4; }
             if (t <= 8) { return launch_w8_simt_r8_c8; }
             return launch_w8_mma_r64_c128;
+        case 248320:
+            if (t <= 32) { return launch_w8_small_t; }
+            if (t <= 64) { return launch_w8_mma_r32_c64; }
+            return launch_w8_mma_r64_c128;
         default:
             break;
         }

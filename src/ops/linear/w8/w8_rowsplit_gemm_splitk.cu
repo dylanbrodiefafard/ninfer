@@ -1,5 +1,5 @@
 #include "core/device.h"
-#include "ops/linear/w8/w8_rowsplit_gemm_exact_t_splitk.cuh"
+#include "ops/linear/w8/w8_small_t_mma.cuh"
 #include "ops/linear/w8/w8_rowsplit_gemm_medium_t_splitk.cuh"
 #include "ops/linear/w8/w8_launch.h"
 
@@ -26,10 +26,12 @@ template <int ActiveCols>
 void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     constexpr int TileCols =
         ActiveCols <= 8 ? 8 : (ActiveCols <= 16 ? 16 : (ActiveCols <= 24 ? 24 : 32));
+    using Geometry = W8LinearGeometry<kRows, kHidden>;
+    using Schedule = W8SmallTMmaDefaultSchedule<TileCols, ActiveCols>;
     static_assert((kRows % kRowsPerCta) == 0);
     const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), kRows};
-    w8_rowsplit_exact_t_splitk_kernel<kHidden, TileCols, ActiveCols>
-        <<<kRows / kRowsPerCta, 8 * 32, 0, stream>>>(
+    w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule>
+        <<<kRows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), output);

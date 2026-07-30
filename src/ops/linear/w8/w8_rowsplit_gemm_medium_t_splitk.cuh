@@ -4,7 +4,7 @@
 // weight tile while N-groups cover disjoint column ranges. Output owns the
 // physical direct-write policy.
 
-#include "ops/linear/w8/w8_rowsplit_gemm_exact_t_splitk.cuh"
+#include "ops/linear/w8/w8_small_t_mma.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -50,8 +50,7 @@ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void w8_rowsplit_medium_t_sp
         for (int item = lane; item < local_cols * (kTileK / 8); item += 32) {
             const int col = item / (kTileK / 8);
             const int k8  = item - col * (kTileK / 8);
-            auto* dst =
-                &b_shared[warp][col * kTileK + w8_exact_t_swizzle_64(col, k8 * 8)];
+            auto* dst     = &b_shared[warp][col * kTileK + w8_small_t_swizzle_64(col, k8 * 8)];
             cp_async<16, Cache::cg>(
                 dst, &x[static_cast<std::int64_t>(n_base + col) * Hidden + k0 + k8 * 8]);
         }
@@ -114,33 +113,31 @@ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void w8_rowsplit_medium_t_sp
             }
 #pragma unroll
             for (int ki = 0; ki < 2; ++ki) {
-                const int ks       = group * 2 + ki;
-                const int code_col = ks * 16 + lid * 2;
+                const int ks              = group * 2 + ki;
+                const int code_col        = ks * 16 + lid * 2;
                 const auto load_code_pair = [&](int code_row, int col) {
                     const int chunk  = (warp_koff + col) >> 4;
                     const int offset = (chunk ^ (code_row & 7)) * 16 + (col & 15);
                     return static_cast<unsigned>(
                         *reinterpret_cast<const unsigned short*>(&code_shared[code_row][offset]));
                 };
-                const unsigned af0 =
-                    w8_exact_t_bf16_pair_from_s8(load_code_pair(gid, code_col));
+                const unsigned af0 = w8_small_t_bf16_pair_from_s8(load_code_pair(gid, code_col));
                 const unsigned af1 =
-                    w8_exact_t_bf16_pair_from_s8(load_code_pair(gid + 8, code_col));
+                    w8_small_t_bf16_pair_from_s8(load_code_pair(gid + 8, code_col));
                 const unsigned af2 =
-                    w8_exact_t_bf16_pair_from_s8(load_code_pair(gid, code_col + 8));
+                    w8_small_t_bf16_pair_from_s8(load_code_pair(gid, code_col + 8));
                 const unsigned af3 =
-                    w8_exact_t_bf16_pair_from_s8(load_code_pair(gid + 8, code_col + 8));
+                    w8_small_t_bf16_pair_from_s8(load_code_pair(gid + 8, code_col + 8));
 #pragma unroll
                 for (int ni = 0; ni < kNt; ++ni) {
                     unsigned bf0, bf1;
                     const int br = ni * 8 + b_rin;
                     ldmatrix_x2(
                         bf0, bf1,
-                        smem_addr(&b_shared[warp]
-                                          [br * kTileK +
-                                           w8_exact_t_swizzle_64(br, ks * 16 + b_koff)]));
-                    mma_bf16(group_acc[ni][0], group_acc[ni][1], group_acc[ni][2],
-                             group_acc[ni][3], af0, af1, af2, af3, bf0, bf1);
+                        smem_addr(&b_shared[warp][br * kTileK +
+                                                  w8_small_t_swizzle_64(br, ks * 16 + b_koff)]));
+                    mma_bf16(group_acc[ni][0], group_acc[ni][1], group_acc[ni][2], group_acc[ni][3],
+                             af0, af1, af2, af3, bf0, bf1);
                 }
             }
             const unsigned top_bits = group == 0 ? top_scale_pair & 0xffffu : top_scale_pair >> 16;

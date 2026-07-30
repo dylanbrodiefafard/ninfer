@@ -2,7 +2,7 @@
 #include "ops/linear_pair/w8/w8_pair_plan.h"
 
 #include "core/device.h"
-#include "ops/linear/w8/w8_rowsplit_gemm_exact_t_splitk.cuh"
+#include "ops/linear/w8/w8_small_t_mma.cuh"
 #include "ops/linear/w8/w8_rowsplit_gemm_medium_t_splitk.cuh"
 
 #include <cuda_bf16.h>
@@ -61,6 +61,8 @@ void launch_active_cols(const Tensor& x, const Weight& first_weight, const Weigh
                         Tensor& first_out, Tensor& second_out, cudaStream_t stream) {
     constexpr int TileCols =
         ActiveCols <= 8 ? 8 : (ActiveCols <= 16 ? 16 : (ActiveCols <= 24 ? 24 : 32));
+    using Geometry           = W8LinearGeometry<2 * kRows, kHidden>;
+    using Schedule           = W8SmallTMmaDefaultSchedule<TileCols, ActiveCols>;
     const auto* first_codes  = static_cast<const std::uint8_t*>(first_weight.qdata);
     const auto* first_scales = static_cast<const std::uint8_t*>(first_weight.scales);
     if (static_cast<const std::uint8_t*>(second_weight.qdata) != first_codes + kRows * kHidden ||
@@ -72,11 +74,10 @@ void launch_active_cols(const Tensor& x, const Weight& first_weight, const Weigh
     const W8ContiguousOutput ignored{static_cast<__nv_bfloat16*>(first_out.data), kRows};
     const W8PairExactTEpilogue epilogue{static_cast<__nv_bfloat16*>(first_out.data),
                                         static_cast<__nv_bfloat16*>(second_out.data)};
-    w8_rowsplit_exact_t_splitk_kernel<kHidden, TileCols, ActiveCols, W8ContiguousOutput,
-                                      W8PairExactTEpilogue, W8PairExactTRows>
-        <<<kRows / kRowsPerCta, 8 * 32, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
-                                                     first_codes, first_scales, ignored, epilogue,
-                                                     W8PairExactTRows{});
+    w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule, W8ContiguousOutput, W8PairExactTEpilogue,
+                          W8PairExactTRows><<<kRows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), first_codes, first_scales, ignored, epilogue,
+        W8PairExactTRows{});
 }
 
 template <std::size_t... Offsets>

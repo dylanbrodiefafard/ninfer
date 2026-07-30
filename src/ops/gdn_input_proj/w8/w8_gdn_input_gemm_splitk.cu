@@ -4,7 +4,7 @@
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/gdn_input_proj/gdn_conv_snapshot.cuh"
-#include "ops/linear/w8/w8_rowsplit_gemm_exact_t_splitk.cuh"
+#include "ops/linear/w8/w8_small_t_mma.cuh"
 #include "ops/linear/w8/w8_rowsplit_output.cuh"
 
 #include <cuda_bf16.h>
@@ -21,7 +21,6 @@ namespace {
 constexpr int kRows                    = 12288;
 constexpr int kHidden                  = 2048;
 constexpr int kTileK                   = 64;
-constexpr int kWarps                   = 8;
 constexpr int kMmaRows                 = 16;
 constexpr int kRowsPerCta              = 16;
 constexpr int kFirstExactCols          = 2;
@@ -277,10 +276,12 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& qkv, Tens
                         cudaStream_t stream) {
     constexpr int TileCols =
         ActiveCols <= 8 ? 8 : (ActiveCols <= 16 ? 16 : (ActiveCols <= 24 ? 24 : 32));
+    using Geometry = W8LinearGeometry<kRows, kHidden>;
+    using Schedule = W8SmallTMmaDefaultSchedule<TileCols, ActiveCols>;
     static_assert((8192 % kRowsPerCta) == 0 && (4096 % kRowsPerCta) == 0);
     const Output output{static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)};
-    w8_rowsplit_exact_t_splitk_kernel<kHidden, TileCols, ActiveCols>
-        <<<kRows / kRowsPerCta, kWarps * 32, 0, stream>>>(
+    w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule>
+        <<<kRows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), output);
@@ -293,6 +294,8 @@ void launch_active_cols_conv_snapshot(const Tensor& x, const Weight& weight,
                                       Tensor& value, Tensor& z, cudaStream_t stream) {
     static_assert(ActiveCols >= 2 && ActiveCols <= 16);
     constexpr int TileCols = ActiveCols <= 8 ? 8 : 16;
+    using Geometry         = W8LinearGeometry<kRows, kHidden>;
+    using Schedule         = W8SmallTMmaDefaultSchedule<TileCols, ActiveCols>;
     const Output ignored_output{static_cast<__nv_bfloat16*>(query.data),
                                 static_cast<__nv_bfloat16*>(z.data)};
     const W8GdnSplitKConvEpilogue epilogue{
@@ -311,9 +314,8 @@ void launch_active_cols_conv_snapshot(const Tensor& x, const Weight& weight,
         },
         static_cast<__nv_bfloat16*>(z.data),
     };
-    w8_rowsplit_exact_t_splitk_kernel<kHidden, TileCols, ActiveCols, Output,
-                                      W8GdnSplitKConvEpilogue>
-        <<<kRows / kRowsPerCta, kWarps * 32, 0, stream>>>(
+    w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule, Output, W8GdnSplitKConvEpilogue>
+        <<<kRows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), ignored_output, epilogue);

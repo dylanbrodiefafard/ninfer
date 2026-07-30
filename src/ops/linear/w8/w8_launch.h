@@ -9,6 +9,7 @@ namespace ninfer::ops::detail {
 using W8Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
 void launch_w8_decode_r4(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_w8_small_t(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_w8_exact_t_splitk(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_w8_exact_t_composite(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_w8_medium_splitk_c96(const Tensor&, const Weight&, Tensor&, cudaStream_t);
