@@ -469,7 +469,7 @@ metadata。
 新增或替换 host launcher 不修改 benchmark。single、sweep 和 suite 始终调用 public
 Linear，因此自然测量 selector 当前返回的 production route。
 
-候选选择遵循 [`op-development.md`](op-development.md#91-public-benchmarks-and-temporary-crossover-sweeps)
+候选选择遵循 [`op-development.md`](op-development.md#7-performance-evidence)
 定义的推荐工作流：
 
 1. 在该格式或 route 的开发任务范围内编写临时 benchmark/sweep，必要时直接调用私有

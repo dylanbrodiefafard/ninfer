@@ -158,8 +158,8 @@ routing map, not a mandatory reading list:
   inventories, conversion, and binding;
 - `docs/maintainer/qwen3.6-27b-model.md` and `qwen3.6-35b-a3b-model.md`: exact model mathematics,
   dimensions, and state semantics;
-- `docs/maintainer/op-development.md`: Op contracts, implementation ownership, correctness, and
-  performance workflow;
+- `docs/maintainer/op-development.md`: Op admission, contracts, implementation ownership,
+  qualification, and performance evidence rules;
 - `include/ninfer/engine.h` and `include/ninfer/types.h`: in-tree C++ product interface.
 
 Do not survey unrelated references for completeness. Read additional documents only when they

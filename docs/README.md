@@ -37,7 +37,7 @@ additional user workflows or installed API documentation.
 
 Active implementation and architecture references:
 
-- [Op semantic contracts, source ownership, correctness, and performance workflow](maintainer/op-development.md)
+- [Op admission, contracts, ownership, qualification, and performance rules](maintainer/op-development.md)
 - [Softmax Attention organization and migration contract](maintainer/softmax-attention.md)
 - [Linear benchmark contract and registered suites](maintainer/linear-benchmark.md)
 - [Qwen3.6-27B artifact contracts, including NVFP4](maintainer/qwen3.6-27b-artifact.md)
