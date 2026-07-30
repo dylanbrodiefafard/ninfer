@@ -3,8 +3,9 @@
 // Gated DeltaNet head mapping and shared-memory layouts. Generic CUDA primitives
 // live under ops/common and are included only where this header uses them.
 
-#include "ops/linear_attention/gated_delta_net/common.h"
+#include "ops/common/bf16_vector.cuh"
 #include "ops/common/math.h"
+#include "ops/linear_attention/gated_delta_net/common.h"
 
 #include <cuda_runtime.h>
 
@@ -74,89 +75,25 @@ struct SmemTile {
 
 template <int ROWS, int STRIDE, int THREADS, class View>
 static __device__ __forceinline__ void
-issue_async_load_vec4(View view, const float* __restrict__ gmem_base_row0,
-                      std::int64_t gmem_row_stride_floats, int cl, int tid) {
-    static_assert(STRIDE % 4 == 0, "issue_async_load_vec4: STRIDE must be a multiple of 4");
-    constexpr int VEC_PER_ROW = STRIDE / 4;
-    constexpr int N_VEC       = ROWS * VEC_PER_ROW;
-#    pragma unroll
-    for (int v = tid; v < N_VEC; v += THREADS) {
-        const int row       = v / VEC_PER_ROW;
-        const int col4      = v - row * VEC_PER_ROW;
-        float* smem_ptr     = reinterpret_cast<float*>(&view.vec4_at(row, col4 * 4));
-        const bool in_range = row < cl;
-        if (in_range) {
-            const float* gmem_ptr =
-                gmem_base_row0 + static_cast<std::int64_t>(row) * gmem_row_stride_floats + col4 * 4;
-            cp_async<16>(smem_ptr, gmem_ptr);
-        } else {
-            store_vec(smem_ptr, make_float4(0.0f, 0.0f, 0.0f, 0.0f));
-        }
-    }
-}
-
-static __device__ __forceinline__ float4
-load_bf16_vec4_as_float4(const __nv_bfloat16* __restrict__ src) {
-    const auto* src2 = reinterpret_cast<const __nv_bfloat162*>(src);
-    const float2 lo  = __bfloat1622float2(src2[0]);
-    const float2 hi  = __bfloat1622float2(src2[1]);
-    return make_float4(lo.x, lo.y, hi.x, hi.y);
-}
-
-template <int ROWS, int STRIDE, int THREADS, class View>
-static __device__ __forceinline__ void
 issue_load_bf16_to_float_vec4(View view, const __nv_bfloat16* __restrict__ gmem_base_row0,
-                              std::int64_t gmem_row_stride_elems, int cl, int tid) {
+                              std::int64_t gmem_row_stride_elems, int tid) {
     static_assert(STRIDE % 4 == 0, "issue_load_bf16_to_float_vec4: STRIDE must be a multiple of 4");
     constexpr int VEC_PER_ROW = STRIDE / 4;
     constexpr int N_VEC       = ROWS * VEC_PER_ROW;
 #    pragma unroll
     for (int v = tid; v < N_VEC; v += THREADS) {
-        const int row       = v / VEC_PER_ROW;
-        const int col4      = v - row * VEC_PER_ROW;
-        float4 val          = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        const bool in_range = row < cl;
-        if (in_range) {
-            const __nv_bfloat16* gmem_ptr =
-                gmem_base_row0 + static_cast<std::int64_t>(row) * gmem_row_stride_elems + col4 * 4;
-            val = load_bf16_vec4_as_float4(gmem_ptr);
-        }
-        view.vec4_at(row, col4 * 4) = val;
+        const int row  = v / VEC_PER_ROW;
+        const int col4 = v - row * VEC_PER_ROW;
+        const __nv_bfloat16* gmem_ptr =
+            gmem_base_row0 + static_cast<std::int64_t>(row) * gmem_row_stride_elems + col4 * 4;
+        const Bf16x4Pack packed     = load_vec<Bf16x4Pack>(gmem_ptr);
+        const float2 lo             = bf16x2_to_float2(packed.pair[0]);
+        const float2 hi             = bf16x2_to_float2(packed.pair[1]);
+        view.vec4_at(row, col4 * 4) = make_float4(lo.x, lo.y, hi.x, hi.y);
     }
 }
 
-struct mma_lane_t {
-    int lane;
-    int warp;
-    int lane_g;
-    int lane_t;
-
-    static __device__ __forceinline__ mma_lane_t decode(int tid) {
-        mma_lane_t L{};
-        L.lane   = tid & (kWarpSize - 1);
-        L.warp   = tid >> 5;
-        L.lane_g = L.lane >> 2;
-        L.lane_t = L.lane & 3;
-        return L;
-    }
-};
-
-struct chunk_bounds_t {
-    std::int64_t cs;
-    std::int64_t ce;
-    int cl;
-
-    static __device__ __forceinline__ chunk_bounds_t of(int chunk_idx, std::int64_t T, int BT) {
-        chunk_bounds_t b{};
-        b.cs                    = static_cast<std::int64_t>(chunk_idx) * BT;
-        const std::int64_t ce64 = b.cs + BT;
-        b.ce                    = (ce64 < T) ? ce64 : T;
-        b.cl                    = static_cast<int>(b.ce - b.cs);
-        return b;
-    }
-};
-
-inline constexpr float RCP_LN2_F = 1.4426950408889634f;
+inline constexpr float kLog2E = 1.4426950408889634f;
 
 #endif // __CUDACC__
 
@@ -179,8 +116,6 @@ struct head_map {
         return h_v / group_size();
 #endif
     }
-
-    NINFER_KERNELS_HOST_DEVICE int cta_h_v(int cta_h) const { return cta_h; }
 };
 
 } // namespace ninfer::ops::detail::gated_delta_net

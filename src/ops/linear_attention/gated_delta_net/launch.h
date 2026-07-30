@@ -27,8 +27,7 @@ void launch_recurrent_snapshot(const Tensor& q, const Tensor& k, const Tensor& v
                                Tensor& ssm_states, const Tensor& initial_slot, Tensor& out,
                                cudaStream_t stream);
 
-std::size_t chunked_workspace_bytes(std::int64_t head_dim, std::int64_t qk_heads,
-                                    std::int64_t value_heads, std::int64_t tokens);
+std::size_t chunked_workspace_bytes(std::int32_t value_heads, std::int32_t tokens);
 
 void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                     const Tensor& beta, float scale, const Tensor& ssm_state_in,

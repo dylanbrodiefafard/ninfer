@@ -162,6 +162,8 @@ rate includes raw Q/K/V, g/beta, output, the selected initial FP32 state read, a
 snapshot writes; it does not inflate the rate with cache-line or implementation traffic.
 `--qk-norm fused` is the production one-kernel route. `composed` explicitly runs two L2Norm kernels
 and the pre-normalized recurrent kernel as a containing-layer control.
+The benchmark fixes the state/head dimension at 128 and batch at 1. `--H_qk` and `--H_v` remain
+configurable for any positive, divisible `H_v >= H_qk` mapping.
 
 ```bash
 cmake --build build --parallel --target ninfer_gated_delta_net_bench ninfer_gdn_layer_bench

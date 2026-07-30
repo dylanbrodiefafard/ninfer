@@ -12,14 +12,15 @@ namespace ninfer::ops {
 
 /**
  * Returns the transient arena capacity required by gated_delta_net for the given geometry. It is
- * zero when the private implementation requires no transient storage. `head_dim` must be one of
- * {16,32,64,128}; `value_heads` must be at least `qk_heads` and divisible by it. The query covers
+ * zero when the private implementation requires no transient storage. The state/head dimension is
+ * fixed at 128; `value_heads` must be at least `qk_heads` and divisible by it. The query covers
  * every T in the inclusive interval and throws for an invalid profile or interval.
  */
-[[nodiscard]] std::size_t
-gated_delta_net_workspace_capacity_bytes(std::int32_t head_dim, std::int32_t qk_heads,
-                                         std::int32_t value_heads, bool normalize_qk,
-                                         std::int32_t min_tokens, std::int32_t max_tokens);
+[[nodiscard]] std::size_t gated_delta_net_workspace_capacity_bytes(std::int32_t qk_heads,
+                                                                   std::int32_t value_heads,
+                                                                   bool normalize_qk,
+                                                                   std::int32_t min_tokens,
+                                                                   std::int32_t max_tokens);
 
 /**
  * Applies the Gated DeltaNet recurrence independently for each value head h. Let
@@ -31,16 +32,16 @@ gated_delta_net_workspace_capacity_bytes(std::int32_t head_dim, std::int32_t qk_
  *   S_h         = alpha * S_h + outer(delta, k[:,qh,t])
  *   ideal[:,h,t] = scale * S_h * q[:,qh,t].
  *
- * Shapes/dtypes are contiguous q/k BF16 [S,Hqk,T], v/out BF16 [S,Hv,T], g/beta FP32 [Hv,T], and
- * state FP32 [S,S,Hv], where S is one of {16,32,64,128}, Hqk>=1, Hv>=Hqk, and Hv%Hqk==0. `scale`
- * is 1/sqrt(S). When `normalize_qk` is true, the recurrent implementation consumes raw q/k and
- * applies x / sqrt(sum(x^2) + 1e-6) independently to every [S] row before using it. When false,
+ * Shapes/dtypes are contiguous q/k BF16 [128,Hqk,T], v/out BF16 [128,Hv,T], g/beta FP32 [Hv,T],
+ * and state FP32 [128,128,Hv], where Hqk>=1, Hv>=Hqk, and Hv%Hqk==0. `scale` is 1/sqrt(128). When
+ * `normalize_qk` is true, the recurrent implementation consumes raw q/k and applies
+ * x / sqrt(sum(x^2) + 1e-6) independently to every 128-element row before using it. When false,
  * q/k are consumed as supplied. The oracle evaluates the complete recurrence and `ideal` naively
- * in FP64 from the represented inputs and FP32 initial state. The BF16 out is promoted and compared
- * directly with that result; output storage rounding belongs to the Op's numerical criterion, not
- * the oracle. Recurrent implementations may apply the normalization directly; chunked
- * implementations may use private normalized staging. The corresponding private storage is
- * included by gated_delta_net_workspace_capacity_bytes when `normalize_qk` is true.
+ * in FP64 from the represented inputs and FP32 initial state. The BF16 out is promoted and
+ * compared directly with that result; output storage rounding belongs to the Op's numerical
+ * criterion, not the oracle. Recurrent implementations may apply the normalization directly;
+ * chunked implementations may use private normalized staging. The corresponding private storage
+ * is included by gated_delta_net_workspace_capacity_bytes when `normalize_qk` is true.
  * Inputs and out do not overlap state or one another. `ws` supplies transient storage reported by
  * gated_delta_net_workspace_capacity_bytes; scratch is scoped to the call. T may be any positive
  * value.
@@ -62,7 +63,7 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                      cudaStream_t stream);
 
 /**
- * Snapshot form of the same recurrence. `ssm_states` is contiguous FP32 [S,S,Hv,Slots],
+ * Snapshot form of the same recurrence. `ssm_states` is contiguous FP32 [128,128,Hv,Slots],
  * `initial_slot` is a contiguous I32 scalar in [0,Slots), and Slots>=T. The selected slot supplies
  * the initial state; after token t, the new state is written to slot t. Slots at and above T are
  * unchanged. This form uses no arena allocation, and `ssm_states` is the only persistent state

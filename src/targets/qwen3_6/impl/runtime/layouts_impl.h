@@ -177,9 +177,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         }
         (void)workspace_recipe::gdn_recurrent_output<TextConfig>(layout, last);
         if (!snapshot) {
-            scratch(layout, ops::gated_delta_net_workspace_capacity_bytes(
-                                TextConfig::gdn_value_head_dim, TextConfig::gdn_key_heads,
-                                TextConfig::gdn_value_heads, true, first, last));
+            scratch(layout,
+                    ops::gated_delta_net_workspace_capacity_bytes(
+                        TextConfig::gdn_key_heads, TextConfig::gdn_value_heads, true, first, last));
         }
         (void)workspace_recipe::gdn_normalized_output<TextConfig>(layout, last);
         scratch(layout, Variant::gdn_output_projection_workspace_capacity_bytes(

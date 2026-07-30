@@ -444,6 +444,11 @@ model-layer projections, control transforms, convolution, or norm Ops. Consequen
 `gdn_input_proj`, `gdn_gating`, `gdn_gating_proj`, `causal_conv1d_silu`, and `gated_rmsnorm` remain
 under their independent Op ownership.
 
+The production contract fixes the Q/K, value/output, and both state axes at 128. Head mapping
+remains general: `Hqk > 0`, `Hv >= Hqk`, `Hv % Hqk == 0`, and value head `h` consumes Q/K head
+`floor(h / (Hv / Hqk))`. The public wrapper accepts any positive token count, dispatches complete
+64-token chunks to the chunked path, and executes any remainder through the recurrent path.
+
 Formal paths, contract entries, tests, and core benchmarks spell the algorithm
 `gated_delta_net` (Gated DeltaNet). The abbreviation `gdn` is reserved for places where it is
 materially useful, such as established compound model-layer names and state/layout identifiers; it

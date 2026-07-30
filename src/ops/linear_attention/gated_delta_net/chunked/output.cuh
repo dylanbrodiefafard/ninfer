@@ -19,6 +19,7 @@ using ninfer::ops::exp2_approx;
 
 static_assert(kChunkSize == 64,
               "stage_chunk_output: kChunkSize must be 64 (kernel hard-codes BT=64)");
+static_assert(kStateDim == 128);
 
 constexpr int N_WARPS = 4;
 constexpr int THREADS = N_WARPS * ninfer::ops::kWarpSize; // 128
@@ -29,122 +30,95 @@ static_assert(BT == N_WARPS * MMA_M,
 constexpr int K_TILES_BT = BT / MMA_K; // 8 K-tiles when K-axis = BT (MM3)
 constexpr int N_TILES_BT = BT / MMA_N; // 8 N-tiles when N-axis = BT (MM2)
 
-// ---------------------------------------------------------------------------
-// kernel_dims<S>: per-S tiling + smem layout.
-//
-// K_TILE_PASSES = 2 only at S=128 (full k would be 32 KB without splitting);
-// at S<=64 the full k fits in <=16 KB so single pass.
-// ---------------------------------------------------------------------------
-template <int S>
 struct kernel_dims {
-    static constexpr int N_TILES_TOTAL_S   = S / MMA_N;
-    static constexpr int N_TILES_PER_CHUNK = (N_TILES_TOTAL_S >= 4) ? 4 : N_TILES_TOTAL_S;
-    static constexpr int N_CHUNKS          = N_TILES_TOTAL_S / N_TILES_PER_CHUNK;
-    static_assert(N_CHUNKS * N_TILES_PER_CHUNK == N_TILES_TOTAL_S,
-                  "N_TILES_PER_CHUNK must divide N_TILES_TOTAL_S");
-    static constexpr int D_CHUNK   = N_TILES_PER_CHUNK * MMA_N;
-    static constexpr int K_TILES_S = S / MMA_K;
+    static constexpr int N_TILES_TOTAL     = kStateDim / MMA_N;
+    static constexpr int N_TILES_PER_CHUNK = 4;
+    static constexpr int N_CHUNKS          = N_TILES_TOTAL / N_TILES_PER_CHUNK;
+    static_assert(N_CHUNKS * N_TILES_PER_CHUNK == N_TILES_TOTAL,
+                  "N_TILES_PER_CHUNK must divide N_TILES_TOTAL");
+    static constexpr int D_CHUNK = N_TILES_PER_CHUNK * MMA_N;
+    static constexpr int K_TILES = kStateDim / MMA_K;
 
-    // 16 KB threshold for k_pass.
-    static constexpr int K_TILE_PASSES = (BT * S * (int)sizeof(float) > 16 * 1024) ? 2 : 1;
-    static_assert(K_TILES_S % K_TILE_PASSES == 0, "K_TILE_PASSES must divide K_TILES_S");
-    static constexpr int K_TILES_PER_PASS = K_TILES_S / K_TILE_PASSES;
-    static constexpr int K_PER_PASS       = S / K_TILE_PASSES;
+    static constexpr int K_TILE_PASSES    = 2;
+    static constexpr int K_TILES_PER_PASS = K_TILES / K_TILE_PASSES;
+    static constexpr int K_PER_PASS       = kStateDim / K_TILE_PASSES;
 
-    static constexpr int Q_FLOATS      = BT * S;
+    static constexpr int Q_FLOATS      = BT * kStateDim;
     static constexpr int K_PASS_FLOATS = BT * K_PER_PASS;
-    static constexpr int H_PART_FLOATS = D_CHUNK * S;
+    static constexpr int H_PART_FLOATS = D_CHUNK * kStateDim;
     static constexpr int V_PART_FLOATS = BT * D_CHUNK;
-    static constexpr int PART_FLOATS =
-        (H_PART_FLOATS > V_PART_FLOATS) ? H_PART_FLOATS : V_PART_FLOATS;
+    static constexpr int PART_FLOATS   = H_PART_FLOATS;
+    static_assert(V_PART_FLOATS <= PART_FLOATS);
 
     // shared_smem aliases k_pass (Phase B) and h_part / v_part (Phase E).
-    static constexpr int SHARED_FLOATS =
-        (K_PASS_FLOATS > PART_FLOATS) ? K_PASS_FLOATS : PART_FLOATS;
+    static constexpr int SHARED_FLOATS = K_PASS_FLOATS;
+    static_assert(SHARED_FLOATS == PART_FLOATS);
     static constexpr int SMEM_FLOATS = Q_FLOATS + SHARED_FLOATS + BT;
 };
 
-template <int S>
 __launch_bounds__(THREADS, 3) __global__
     void output_kernel(const __nv_bfloat16* __restrict__ q_in,
                        const __nv_bfloat16* __restrict__ k_in,
                        const __nv_bfloat16* __restrict__ v_new_in,
                        const float* __restrict__ g_cumsum_in,
                        const __nv_bfloat16* __restrict__ h_chunk_in,
-                       __nv_bfloat16* __restrict__ attn_out, int64_t T, int64_t H_v,
-                       head_map qk_map,
-                       // Token-axis strides (in floats) for
-                       // q / k. Caller passes materialised
-                       // values (launcher handles 0 ->
-                       // packed default H_qk * S each).
-                       int64_t q_stride_t, int64_t k_stride_t, int NT, float scale) {
-    using D                         = kernel_dims<S>;
-    constexpr int N_TILES_PER_CHUNK = D::N_TILES_PER_CHUNK;
-    constexpr int N_CHUNKS          = D::N_CHUNKS;
-    constexpr int D_CHUNK           = D::D_CHUNK;
-    constexpr int K_TILES_S         = D::K_TILES_S;
-    constexpr int K_TILE_PASSES     = D::K_TILE_PASSES;
-    constexpr int K_TILES_PER_PASS  = D::K_TILES_PER_PASS;
-    constexpr int K_PER_PASS        = D::K_PER_PASS;
-    constexpr int Q_FLOATS          = D::Q_FLOATS;
-    constexpr int SHARED_FLOATS     = D::SHARED_FLOATS;
+                       __nv_bfloat16* __restrict__ attn_out, head_map qk_map, float scale) {
+    constexpr int N_TILES_PER_CHUNK = kernel_dims::N_TILES_PER_CHUNK;
+    constexpr int N_CHUNKS          = kernel_dims::N_CHUNKS;
+    constexpr int D_CHUNK           = kernel_dims::D_CHUNK;
+    constexpr int K_TILES           = kernel_dims::K_TILES;
+    constexpr int K_TILE_PASSES     = kernel_dims::K_TILE_PASSES;
+    constexpr int K_TILES_PER_PASS  = kernel_dims::K_TILES_PER_PASS;
+    constexpr int K_PER_PASS        = kernel_dims::K_PER_PASS;
+    constexpr int Q_FLOATS          = kernel_dims::Q_FLOATS;
+    constexpr int SHARED_FLOATS     = kernel_dims::SHARED_FLOATS;
 
     extern __shared__ float smem[];
     float* const q_smem      = smem;
     float* const shared_smem = q_smem + Q_FLOATS; // alias: k_pass / h_part / v_part
     float* const g_smem      = q_smem + Q_FLOATS + SHARED_FLOATS;
 
-    SmemTile<S> q_view{q_smem};
+    SmemTile<kStateDim> q_view{q_smem};
     SmemTile<K_PER_PASS> k_pass_view{shared_smem};
-    SmemTile<S> h_part_view{shared_smem};
+    SmemTile<kStateDim> h_part_view{shared_smem};
     SmemTile<D_CHUNK> v_part_view{shared_smem};
 
-    const int tid    = threadIdx.x;
-    const auto lanes = mma_lane_t::decode(tid);
-    const int warp   = lanes.warp;
-    const int lane_g = lanes.lane_g;
-    const int lane_t = lanes.lane_t;
+    const int tid    = static_cast<int>(threadIdx.x);
+    const int lane   = tid & (kWarpSize - 1);
+    const int warp   = tid / kWarpSize;
+    const int lane_g = lane >> 2;
+    const int lane_t = lane & 3;
 
-    const int chunk = blockIdx.x;
-    // Grouped mapping: adjacent CTAs already share the same qk head under
-    // identity cta_h_v (0..G-1 -> qk_head 0, etc.).
-    const auto bh = bh_decode_t::of(blockIdx.y, qk_map);
-    const int b   = bh.b;
-    const int h_v = bh.h_v;
+    const int chunk                = static_cast<int>(blockIdx.x);
+    const int h_v                  = static_cast<int>(blockIdx.y);
+    const std::int64_t cs          = static_cast<std::int64_t>(chunk) * BT;
+    const std::int64_t H_v         = qk_map.H_v;
+    const std::int64_t qk_stride_t = static_cast<std::int64_t>(qk_map.H_qk) * kStateDim;
+    const std::int64_t qk_head_idx = static_cast<std::int64_t>(qk_map.qk_head(h_v)) * kStateDim;
+    const std::int64_t q_base      = cs * qk_stride_t + qk_head_idx;
+    const std::int64_t k_base      = cs * qk_stride_t + qk_head_idx;
+    const std::int64_t vn_base = cs * H_v * kStateDim + static_cast<std::int64_t>(h_v) * kStateDim;
+    const std::int64_t hc_base =
+        (static_cast<std::int64_t>(chunk) * H_v + h_v) * kStateDim * kStateDim;
+    const std::int64_t out_base = vn_base;
 
-    const auto cb    = chunk_bounds_t::of(chunk, T, BT);
-    const int64_t cs = cb.cs;
-    const int cl     = cb.cl;
-
-    const int64_t qk_head_idx = (int64_t)qk_map.qk_head(h_v) * S;
-    const int64_t q_base      = ((int64_t)b * T + cs) * q_stride_t + qk_head_idx;
-    const int64_t k_base      = ((int64_t)b * T + cs) * k_stride_t + qk_head_idx;
-    const int64_t vn_base     = ((int64_t)b * T + cs) * H_v * S + (int64_t)h_v * S;
-    const int64_t hc_base     = (((int64_t)b * NT + chunk) * H_v + h_v) * S * S;
-    const int64_t out_base    = vn_base;
-
-    const int64_t v_row_stride   = (int64_t)H_v * S;
+    const int64_t v_row_stride   = H_v * kStateDim;
     const int64_t out_row_stride = v_row_stride;
 
-    // === Phase A: bf16 q (full S) + k_pass[0] -> float smem; sync-load g_cumsum ===
-    issue_load_bf16_to_float_vec4<BT, S, THREADS>(q_view, q_in + q_base, q_stride_t, cl, tid);
-    issue_load_bf16_to_float_vec4<BT, K_PER_PASS, THREADS>(k_pass_view, k_in + k_base, k_stride_t,
-                                                           cl, tid);
+    // === Phase A: bf16 q + k_pass[0] -> float smem; sync-load g_cumsum ===
+    issue_load_bf16_to_float_vec4<BT, kStateDim, THREADS>(q_view, q_in + q_base, qk_stride_t, tid);
+    issue_load_bf16_to_float_vec4<BT, K_PER_PASS, THREADS>(k_pass_view, k_in + k_base, qk_stride_t,
+                                                           tid);
 
     if (tid < BT) {
-        float val = 0.0f;
-        if (tid < cl) {
-            const int64_t goff = ((int64_t)b * T + cs + tid) * H_v + h_v;
-            val                = g_cumsum_in[goff];
-        }
-        g_smem[tid] = val;
+        const std::int64_t goff = (cs + tid) * H_v + h_v;
+        g_smem[tid]             = g_cumsum_in[goff];
     }
 
     __syncthreads();
 
     // === Phase B: MM2 = Q @ K^T, accumulate over K_TILE_PASSES passes ===
-    float A_strip[N_TILES_BT][4];
-    zero_frag(A_strip);
+    float A_strip[N_TILES_BT][4] = {};
 
     const int row_g0 = warp * MMA_M + lane_g; // M-row top half
     const int row_g1 = row_g0 + 8;            // M-row bottom half
@@ -182,7 +156,7 @@ __launch_bounds__(THREADS, 3) __global__
         if (pass + 1 < K_TILE_PASSES) {
             __syncthreads();
             issue_load_bf16_to_float_vec4<BT, K_PER_PASS, THREADS>(
-                k_pass_view, k_in + k_base + (int64_t)(pass + 1) * K_PER_PASS, k_stride_t, cl, tid);
+                k_pass_view, k_in + k_base + (int64_t)(pass + 1) * K_PER_PASS, qk_stride_t, tid);
             __syncthreads();
         }
     }
@@ -203,10 +177,10 @@ __launch_bounds__(THREADS, 3) __global__
             const float g_s0 = g_smem[s0];
             const float g_s1 = g_smem[s1];
 
-            const float dec00 = exp2_approx((g_r0 - g_s0) * RCP_LN2_F);
-            const float dec01 = exp2_approx((g_r0 - g_s1) * RCP_LN2_F);
-            const float dec10 = exp2_approx((g_r1 - g_s0) * RCP_LN2_F);
-            const float dec11 = exp2_approx((g_r1 - g_s1) * RCP_LN2_F);
+            const float dec00 = exp2_approx((g_r0 - g_s0) * kLog2E);
+            const float dec01 = exp2_approx((g_r0 - g_s1) * kLog2E);
+            const float dec10 = exp2_approx((g_r1 - g_s0) * kLog2E);
+            const float dec11 = exp2_approx((g_r1 - g_s1) * kLog2E);
 
             A_strip[nt][0] = (s0 <= r0) ? A_strip[nt][0] * dec00 : 0.0f;
             A_strip[nt][1] = (s1 <= r0) ? A_strip[nt][1] * dec01 : 0.0f;
@@ -253,8 +227,8 @@ __launch_bounds__(THREADS, 3) __global__
     //
     // gamma_r0 / gamma_r1 in [0, 1] under the test's g distribution; underflow
     // to 0 is safe.
-    const float gamma_r0 = exp2_approx(g_smem[row_g0] * RCP_LN2_F);
-    const float gamma_r1 = exp2_approx(g_smem[row_g1] * RCP_LN2_F);
+    const float gamma_r0 = exp2_approx(g_smem[row_g0] * kLog2E);
+    const float gamma_r1 = exp2_approx(g_smem[row_g1] * kLog2E);
 
 #pragma unroll 1
     for (int c = 0; c < N_CHUNKS; ++c) {
@@ -262,18 +236,18 @@ __launch_bounds__(THREADS, 3) __global__
 
         // --- E.1: bf16 h_chunk[..., d_off:+D_CHUNK, :] -> float h_part[c] ---
         {
-            const __nv_bfloat16* h_part_gmem = h_chunk_in + hc_base + (int64_t)d_chunk_off * S;
-            issue_load_bf16_to_float_vec4<D_CHUNK, S, THREADS>(
-                h_part_view, h_part_gmem, /*row_stride=*/(int64_t)S, /*cl=*/D_CHUNK, tid);
+            const __nv_bfloat16* h_part_gmem =
+                h_chunk_in + hc_base + (int64_t)d_chunk_off * kStateDim;
+            issue_load_bf16_to_float_vec4<D_CHUNK, kStateDim, THREADS>(
+                h_part_view, h_part_gmem, /*row_stride=*/kStateDim, tid);
         }
         __syncthreads();
 
         // --- E.2: MM1: D_frag = Q @ h^T (raw, gamma_r applied below) ---
-        float D_frag[N_TILES_PER_CHUNK][4];
-        zero_frag(D_frag);
+        float D_frag[N_TILES_PER_CHUNK][4] = {};
 
 #pragma unroll
-        for (int kt = 0; kt < K_TILES_S; ++kt) {
+        for (int kt = 0; kt < K_TILES; ++kt) {
             const int k_off  = kt * MMA_K;
             const int col_t0 = k_off + lane_t;
             const int col_t1 = col_t0 + 4;
@@ -294,7 +268,7 @@ __launch_bounds__(THREADS, 3) __global__
             }
         }
 
-// --- E.3: gamma_r row-scale (turns MM1 result into o_inter) ---
+        // --- E.3: gamma_r row-scale (turns MM1 result into o_inter) ---
 #pragma unroll
         for (int nt = 0; nt < N_TILES_PER_CHUNK; ++nt) {
             D_frag[nt][0] *= gamma_r0;
@@ -309,11 +283,11 @@ __launch_bounds__(THREADS, 3) __global__
         {
             const __nv_bfloat16* v_part_gmem = v_new_in + vn_base + (int64_t)d_chunk_off;
             issue_load_bf16_to_float_vec4<BT, D_CHUNK, THREADS>(v_part_view, v_part_gmem,
-                                                                v_row_stride, cl, tid);
+                                                                v_row_stride, tid);
         }
         __syncthreads();
 
-// --- E.5: MM3: D_frag += A_a (regs) @ v_part ---
+        // --- E.5: MM3: D_frag += A_a (regs) @ v_part ---
 #pragma unroll
         for (int kt = 0; kt < K_TILES_BT; ++kt) {
             const int k_off = kt * MMA_K;
@@ -335,7 +309,7 @@ __launch_bounds__(THREADS, 3) __global__
             }
         }
 
-// --- E.6: scale + float2 store -> attn_out ---
+        // --- E.6: scale + float2 store -> attn_out ---
 #pragma unroll
         for (int nt = 0; nt < N_TILES_PER_CHUNK; ++nt) {
             const int n_off    = nt * MMA_N;
@@ -344,17 +318,12 @@ __launch_bounds__(THREADS, 3) __global__
                 __floats2bfloat162_rn(scale * D_frag[nt][0], scale * D_frag[nt][1]);
             const __nv_bfloat162 v1 =
                 __floats2bfloat162_rn(scale * D_frag[nt][2], scale * D_frag[nt][3]);
-            if (row_g0 < cl) {
-                store_vec(&attn_out[out_base + (int64_t)row_g0 * out_row_stride + d_global], v0);
-            }
-            if (row_g1 < cl) {
-                store_vec(&attn_out[out_base + (int64_t)row_g1 * out_row_stride + d_global], v1);
-            }
+            store_vec(&attn_out[out_base + (int64_t)row_g0 * out_row_stride + d_global], v0);
+            store_vec(&attn_out[out_base + (int64_t)row_g1 * out_row_stride + d_global], v1);
         }
 
         __syncthreads(); // gates v_part read before next h_part overwrite
     }
 }
-
 
 } // namespace ninfer::ops::detail::gated_delta_net::chunked::output

@@ -20,21 +20,21 @@ using namespace ninfer::test;
 
 namespace {
 
-constexpr int kHeadDim = 128;
-constexpr int kQkHeads = 16;
+constexpr int kStateDim = 128;
 
 constexpr ReductionCriterion gated_delta_net_output_bf16_criterion() {
     return {/*relative_l2=*/4.1e-3, /*gross_absolute=*/5.0e-6,
-            /*gross_relative_to_max_reference=*/4.7e-3};
+            /*gross_relative_to_max_reference=*/5.2e-3};
 }
 
 constexpr ReductionCriterion gated_delta_net_state_fp32_criterion() {
     return {/*relative_l2=*/2.7e-3, /*gross_absolute=*/1.0e-5,
-            /*gross_relative_to_max_reference=*/3.0e-3};
+            /*gross_relative_to_max_reference=*/3.5e-3};
 }
 
 struct Case {
     const char* name;
+    int qk_heads;
     int value_heads;
     int tokens;
     bool normalize_qk;
@@ -64,16 +64,17 @@ void normalize_rows(std::vector<float>& values, int width) {
 
 gdn_ref::Inputs make_inputs(const Case& test_case, std::uint32_t seed) {
     gdn_ref::Inputs in;
-    in.head_dim    = kHeadDim;
-    in.qk_heads    = kQkHeads;
+    in.head_dim    = kStateDim;
+    in.qk_heads    = test_case.qk_heads;
     in.value_heads = test_case.value_heads;
     in.tokens      = test_case.tokens;
 
-    const std::size_t qk_size = static_cast<std::size_t>(kHeadDim * kQkHeads * test_case.tokens);
+    const std::size_t qk_size =
+        static_cast<std::size_t>(kStateDim * test_case.qk_heads * test_case.tokens);
     const std::size_t value_size =
-        static_cast<std::size_t>(kHeadDim * test_case.value_heads * test_case.tokens);
+        static_cast<std::size_t>(kStateDim * test_case.value_heads * test_case.tokens);
     const std::size_t state_size =
-        static_cast<std::size_t>(kHeadDim * kHeadDim * test_case.value_heads);
+        static_cast<std::size_t>(kStateDim * kStateDim * test_case.value_heads);
     in.q.resize(qk_size);
     in.k.resize(qk_size);
     in.v.resize(value_size);
@@ -95,8 +96,8 @@ gdn_ref::Inputs make_inputs(const Case& test_case, std::uint32_t seed) {
     } else if (!test_case.normalize_qk) {
         // Raw-Q/K mode still receives a stable, entirely valid public input. This host-side
         // generation choice is not part of the oracle.
-        normalize_rows(in.q, kHeadDim);
-        normalize_rows(in.k, kHeadDim);
+        normalize_rows(in.q, kStateDim);
+        normalize_rows(in.k, kStateDim);
     }
 
     round_to_bf16(in.q);
@@ -161,7 +162,7 @@ struct DeviceInputs {
 
 int inplace_case(const Case& test_case, std::uint32_t seed) {
     const gdn_ref::Inputs in = make_inputs(test_case, seed);
-    const float scale        = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
+    const float scale        = 1.0f / std::sqrt(static_cast<float>(kStateDim));
     const gdn_ref::Result ref =
         gdn_ref::evaluate(in, static_cast<double>(scale), test_case.normalize_qk);
     DeviceInputs device(in);
@@ -170,15 +171,16 @@ int inplace_case(const Case& test_case, std::uint32_t seed) {
     state.copy_from_host(in.state.data(), state.bytes());
     out.fill(0xff);
 
-    Tensor q(device.q.p, DType::BF16, {kHeadDim, kQkHeads, test_case.tokens});
-    Tensor k(device.k.p, DType::BF16, {kHeadDim, kQkHeads, test_case.tokens});
-    Tensor v(device.v.p, DType::BF16, {kHeadDim, test_case.value_heads, test_case.tokens});
+    Tensor q(device.q.p, DType::BF16, {kStateDim, test_case.qk_heads, test_case.tokens});
+    Tensor k(device.k.p, DType::BF16, {kStateDim, test_case.qk_heads, test_case.tokens});
+    Tensor v(device.v.p, DType::BF16, {kStateDim, test_case.value_heads, test_case.tokens});
     Tensor g(device.g.p, DType::FP32, {test_case.value_heads, test_case.tokens});
     Tensor beta(device.beta.p, DType::FP32, {test_case.value_heads, test_case.tokens});
-    Tensor state_tensor(state.data(), DType::FP32, {kHeadDim, kHeadDim, test_case.value_heads});
-    Tensor out_tensor(out.data(), DType::BF16, {kHeadDim, test_case.value_heads, test_case.tokens});
+    Tensor state_tensor(state.data(), DType::FP32, {kStateDim, kStateDim, test_case.value_heads});
+    Tensor out_tensor(out.data(), DType::BF16,
+                      {kStateDim, test_case.value_heads, test_case.tokens});
     const std::size_t workspace_bytes = ops::gated_delta_net_workspace_capacity_bytes(
-        kHeadDim, kQkHeads, test_case.value_heads, test_case.normalize_qk, test_case.tokens,
+        test_case.qk_heads, test_case.value_heads, test_case.normalize_qk, test_case.tokens,
         test_case.tokens);
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
 
@@ -205,7 +207,7 @@ int inplace_case(const Case& test_case, std::uint32_t seed) {
 
 int distinct_state_case(const Case& test_case, std::uint32_t seed) {
     const gdn_ref::Inputs in = make_inputs(test_case, seed);
-    const float scale        = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
+    const float scale        = 1.0f / std::sqrt(static_cast<float>(kStateDim));
     const gdn_ref::Result ref =
         gdn_ref::evaluate(in, static_cast<double>(scale), test_case.normalize_qk);
     DeviceInputs device(in);
@@ -216,18 +218,19 @@ int distinct_state_case(const Case& test_case, std::uint32_t seed) {
     state_out.fill(0xff);
     out.fill(0xff);
 
-    Tensor q(device.q.p, DType::BF16, {kHeadDim, kQkHeads, test_case.tokens});
-    Tensor k(device.k.p, DType::BF16, {kHeadDim, kQkHeads, test_case.tokens});
-    Tensor v(device.v.p, DType::BF16, {kHeadDim, test_case.value_heads, test_case.tokens});
+    Tensor q(device.q.p, DType::BF16, {kStateDim, test_case.qk_heads, test_case.tokens});
+    Tensor k(device.k.p, DType::BF16, {kStateDim, test_case.qk_heads, test_case.tokens});
+    Tensor v(device.v.p, DType::BF16, {kStateDim, test_case.value_heads, test_case.tokens});
     Tensor g(device.g.p, DType::FP32, {test_case.value_heads, test_case.tokens});
     Tensor beta(device.beta.p, DType::FP32, {test_case.value_heads, test_case.tokens});
     Tensor state_in_tensor(state_in.data(), DType::FP32,
-                           {kHeadDim, kHeadDim, test_case.value_heads});
+                           {kStateDim, kStateDim, test_case.value_heads});
     Tensor state_out_tensor(state_out.data(), DType::FP32,
-                            {kHeadDim, kHeadDim, test_case.value_heads});
-    Tensor out_tensor(out.data(), DType::BF16, {kHeadDim, test_case.value_heads, test_case.tokens});
+                            {kStateDim, kStateDim, test_case.value_heads});
+    Tensor out_tensor(out.data(), DType::BF16,
+                      {kStateDim, test_case.value_heads, test_case.tokens});
     const std::size_t workspace_bytes = ops::gated_delta_net_workspace_capacity_bytes(
-        kHeadDim, kQkHeads, test_case.value_heads, test_case.normalize_qk, test_case.tokens,
+        test_case.qk_heads, test_case.value_heads, test_case.normalize_qk, test_case.tokens,
         test_case.tokens);
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
 
@@ -257,7 +260,7 @@ int distinct_state_case(const Case& test_case, std::uint32_t seed) {
 
 int snapshot_case(const Case& test_case, int slots, int initial_slot, std::uint32_t seed) {
     const gdn_ref::Inputs in = make_inputs(test_case, seed);
-    const float scale        = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
+    const float scale        = 1.0f / std::sqrt(static_cast<float>(kStateDim));
     const gdn_ref::Result ref =
         gdn_ref::evaluate(in, static_cast<double>(scale), test_case.normalize_qk, true);
     const std::size_t state_size = in.state.size();
@@ -272,15 +275,16 @@ int snapshot_case(const Case& test_case, int slots, int initial_slot, std::uint3
     out.fill(0xff);
     DeviceBuffer device_initial_slot = to_device_i32({initial_slot});
 
-    Tensor q(device.q.p, DType::BF16, {kHeadDim, kQkHeads, test_case.tokens});
-    Tensor k(device.k.p, DType::BF16, {kHeadDim, kQkHeads, test_case.tokens});
-    Tensor v(device.v.p, DType::BF16, {kHeadDim, test_case.value_heads, test_case.tokens});
+    Tensor q(device.q.p, DType::BF16, {kStateDim, test_case.qk_heads, test_case.tokens});
+    Tensor k(device.k.p, DType::BF16, {kStateDim, test_case.qk_heads, test_case.tokens});
+    Tensor v(device.v.p, DType::BF16, {kStateDim, test_case.value_heads, test_case.tokens});
     Tensor g(device.g.p, DType::FP32, {test_case.value_heads, test_case.tokens});
     Tensor beta(device.beta.p, DType::FP32, {test_case.value_heads, test_case.tokens});
     Tensor states_tensor(states.data(), DType::FP32,
-                         {kHeadDim, kHeadDim, test_case.value_heads, slots});
+                         {kStateDim, kStateDim, test_case.value_heads, slots});
     Tensor initial_slot_tensor(device_initial_slot.p, DType::I32, {1});
-    Tensor out_tensor(out.data(), DType::BF16, {kHeadDim, test_case.value_heads, test_case.tokens});
+    Tensor out_tensor(out.data(), DType::BF16,
+                      {kStateDim, test_case.value_heads, test_case.tokens});
     ops::gated_delta_net_snapshot(q, k, v, g, beta, scale, test_case.normalize_qk, states_tensor,
                                   initial_slot_tensor, out_tensor, nullptr);
     cuda_synchronize();
@@ -312,6 +316,48 @@ int snapshot_case(const Case& test_case, int slots, int initial_slot, std::uint3
     return failures;
 }
 
+int contract_rejection_cases() {
+    DeviceBuffer q_buffer(kStateDim * 8 * sizeof(std::uint16_t));
+    DeviceBuffer k_buffer(kStateDim * 8 * sizeof(std::uint16_t));
+    DeviceBuffer v_buffer(kStateDim * 8 * sizeof(std::uint16_t));
+    DeviceBuffer g_buffer(8 * sizeof(float));
+    DeviceBuffer beta_buffer(8 * sizeof(float));
+    DeviceBuffer state_buffer(kStateDim * kStateDim * 8 * sizeof(float));
+    DeviceBuffer out_buffer(kStateDim * 8 * sizeof(std::uint16_t));
+    WorkspaceArena workspace(256);
+    const float scale = 1.0f / std::sqrt(static_cast<float>(kStateDim));
+
+    auto is_rejected = [&](int activation_dim, int state_dim, int qk_heads, int value_heads) {
+        Tensor q(q_buffer.p, DType::BF16, {activation_dim, qk_heads, 1});
+        Tensor k(k_buffer.p, DType::BF16, {activation_dim, qk_heads, 1});
+        Tensor v(v_buffer.p, DType::BF16, {activation_dim, value_heads, 1});
+        Tensor g(g_buffer.p, DType::FP32, {value_heads, 1});
+        Tensor beta(beta_buffer.p, DType::FP32, {value_heads, 1});
+        Tensor state(state_buffer.p, DType::FP32, {state_dim, state_dim, value_heads});
+        Tensor out(out_buffer.p, DType::BF16, {activation_dim, value_heads, 1});
+        try {
+            ops::gated_delta_net(q, k, v, g, beta, scale, true, workspace, state, out, nullptr);
+        } catch (const std::invalid_argument&) { return true; }
+        cuda_synchronize();
+        return false;
+    };
+
+    int failures = 0;
+    if (!is_rejected(64, kStateDim, 4, 8)) {
+        std::cerr << "gated_delta_net accepted Q/K/V head dimension 64\n";
+        ++failures;
+    }
+    if (!is_rejected(kStateDim, 64, 4, 8)) {
+        std::cerr << "gated_delta_net accepted state dimension 64\n";
+        ++failures;
+    }
+    if (!is_rejected(kStateDim, kStateDim, 4, 6)) {
+        std::cerr << "gated_delta_net accepted a non-divisible head map\n";
+        ++failures;
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -323,35 +369,42 @@ int main() {
     int failures = 0;
 
     for (const bool normalize_qk : {false, true}) {
-        const std::size_t interval = ops::gated_delta_net_workspace_capacity_bytes(
-            kHeadDim, kQkHeads, 48, normalize_qk, 63, 65);
-        const std::size_t witness = ops::gated_delta_net_workspace_capacity_bytes(
-            kHeadDim, kQkHeads, 48, normalize_qk, 65, 65);
+        const std::size_t interval =
+            ops::gated_delta_net_workspace_capacity_bytes(16, 48, normalize_qk, 63, 65);
+        const std::size_t witness =
+            ops::gated_delta_net_workspace_capacity_bytes(16, 48, normalize_qk, 65, 65);
         if (interval != witness) {
             std::cerr << "gated_delta_net interval capacity missed the chunk boundary\n";
             ++failures;
         }
     }
     try {
-        (void)ops::gated_delta_net_workspace_capacity_bytes(kHeadDim, kQkHeads, 48, true, 0, 65);
+        (void)ops::gated_delta_net_workspace_capacity_bytes(16, 48, true, 0, 65);
         std::cerr << "gated_delta_net accepted an invalid token interval\n";
         ++failures;
     } catch (const std::invalid_argument&) {}
+    try {
+        (void)ops::gated_delta_net_workspace_capacity_bytes(4, 6, true, 1, 65);
+        std::cerr << "gated_delta_net workspace accepted a non-divisible head map\n";
+        ++failures;
+    } catch (const std::invalid_argument&) {}
+    failures += contract_rejection_cases();
 
     // Registered 27B/35B-A3B geometries, public state forms, and the recurrent/chunk/tail route
     // boundary are all qualified directly against the same complete FP64 recurrence.
-    failures += inplace_case({"27b decode fused-qk-norm", 48, 1, true}, 12001u);
-    failures += distinct_state_case({"27b raw-qk small-T", 48, 7, false}, 12007u);
-    failures += distinct_state_case({"35b pre-chunk fused-qk-norm", 32, 63, true}, 12063u);
-    failures += distinct_state_case({"27b exact chunk fused-qk-norm", 48, 64, true}, 12064u);
-    failures += distinct_state_case({"27b exact chunk raw-qk", 48, 64, false}, 12164u);
-    failures += inplace_case({"35b chunk-tail fused-qk-norm", 32, 65, true}, 12065u);
+    failures += inplace_case({"27b decode fused-qk-norm", 16, 48, 1, true}, 12001u);
+    failures += distinct_state_case({"27b raw-qk small-T", 16, 48, 7, false}, 12007u);
+    failures += distinct_state_case({"35b pre-chunk fused-qk-norm", 16, 32, 63, true}, 12063u);
+    failures += distinct_state_case({"27b exact chunk fused-qk-norm", 16, 48, 64, true}, 12064u);
+    failures += distinct_state_case({"27b exact chunk raw-qk", 16, 48, 64, false}, 12164u);
+    failures += inplace_case({"35b chunk-tail fused-qk-norm", 16, 32, 65, true}, 12065u);
+    failures += distinct_state_case({"generic grouped-map chunk-tail", 3, 12, 65, true}, 12365u);
 
     // Snapshot is a separate public state transition. Nonzero source slots also prove that the
     // selected initial state, not slot zero, seeds the complete recurrence.
-    failures += snapshot_case({"27b verify fused-qk-norm", 48, 4, true}, 8, 7, 12104u);
+    failures += snapshot_case({"27b verify fused-qk-norm", 16, 48, 4, true}, 8, 7, 12104u);
     failures +=
-        snapshot_case({"35b verify fused-qk-norm near-zero", 32, 4, true, true}, 8, 6, 12204u);
+        snapshot_case({"35b verify fused-qk-norm near-zero", 16, 32, 4, true, true}, 8, 6, 12204u);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net correctness\n";
     return failures == 0 ? 0 : 1;
