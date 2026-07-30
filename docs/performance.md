@@ -5,26 +5,28 @@ Tested Git revisions:
 - Qwen3.6-35B-A3B MTP3: `b1a220f028aa750f75bceb3522ac00bbaab7e42d`;
 - Qwen3.6-35B-A3B DFlash block=8 (`k=7`):
   `0dc94097e8ec5c5bcf59b9e13e9d1852f504eb61`;
-- Qwen3.6-27B MTP3: `5ea3242a206cdb0c4c1beaeb9d8a3048e6248423`;
-- Qwen3.6-35B-A3B MTP0 and Qwen3.6-27B MTP0:
+- Qwen3.6-27B NVFP4 accuracy, MTP0, and MTP3:
+  `2140dda4b63f31bf7024cdf094784ac3904274ef`;
+- Qwen3.6-27B groupwise-int MTP3: `5ea3242a206cdb0c4c1beaeb9d8a3048e6248423`;
+- Qwen3.6-35B-A3B MTP0 and Qwen3.6-27B groupwise-int MTP0:
   `0795169393cab0f2c16246d4bac20dee735dc2a4`.
 
-These measurements characterize the two registered NInfer targets independently on one NVIDIA
-GeForce RTX 5090. They cover long-context prefill and baseline decode with speculative decoding
-disabled, plus long-reasoning and cross-scenario decode with MTP and DFlash. All published serving
-tables below use `weights_id = groupwise-int`; they do not aggregate or imply results for the 27B
-`nvfp4` artifact.
+The serving measurements characterize the two registered NInfer targets independently on one
+NVIDIA GeForce RTX 5090. They cover long-context prefill and baseline decode with speculative
+decoding disabled, plus long-reasoning and cross-scenario decode with MTP and DFlash. The 27B
+results report its `groupwise-int` and `nvfp4` weight profiles separately.
 
-All requests were submitted serially to a persistent `ninfer-serve` process over the loopback
-OpenAI-compatible HTTP endpoint. Each reported fixture used five fixed seeds. Values are arithmetic
-mean ± sample standard deviation; warm-up requests are excluded.
+All serving-performance requests were submitted serially to a persistent `ninfer-serve` process
+over the loopback OpenAI-compatible HTTP endpoint. Each reported performance fixture used five
+fixed seeds. Values are arithmetic mean ± sample standard deviation; warm-up requests are excluded.
 
-## Test method
+## Serving performance method
 
 | Setting | Value |
 |---|---|
 | GPU | NVIDIA GeForce RTX 5090, 32 GiB |
-| CUDA compile/runtime/driver API | 13.1 / 13.1 / 13.1 |
+| CUDA compile/runtime | 13.1 / 13.1 |
+| CUDA driver API | 13.1 for the groupwise-int and 35B campaigns; 13.3 for NVFP4 |
 | Request mode | One active request, `stream=false` |
 | Maximum context | 262,144 tokens |
 | Prefill chunk | 1,024 tokens |
@@ -65,8 +67,8 @@ stress sample, but is not presented as a successfully completed task.
 
 ## Reproduction
 
-Build `ninfer-serve` and prepare the registered `.ninfer` artifacts. The refreshed per-target MTP3
-tables use:
+Build `ninfer-serve` and prepare the registered `.ninfer` artifacts. The refreshed per-target
+serving tables use:
 
 ```bash
 python3 tools/bench/run_serve_corpus.py \
@@ -80,12 +82,19 @@ python3 tools/bench/run_serve_corpus.py \
   --artifact qwen3_6_27b=out/qwen3_6_27b.ninfer \
   --mode mtp3 \
   --output profiles/bench/serve_corpus_27b_mtp3_20260724
+
+python3 tools/bench/run_serve_corpus.py \
+  --serve build/apps/ninfer-serve \
+  --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
+  --mode mtp0 --mode mtp3 --sampling stochastic \
+  --output profiles/bench/serve_corpus_27b_nvfp4_20260730
 ```
 
 Use `--mode dflash7` for the corresponding DFlash block=8 campaign; add `--sampling greedy` for
 the exact-argmax profile.
 
-Omit `--mode` and supply both artifacts to run the complete two-target MTP0/MTP3 campaign:
+Omit `--mode` and supply the two groupwise-int target artifacts to run the complete two-target
+MTP0/MTP3 campaign:
 
 ```bash
 python3 tools/bench/run_serve_corpus.py \
@@ -93,6 +102,23 @@ python3 tools/bench/run_serve_corpus.py \
   --artifact qwen3_6_35b_a3b=out/qwen3_6_35b_a3b.ninfer \
   --artifact qwen3_6_27b=out/qwen3_6_27b.ninfer \
   --output profiles/bench/serve_corpus_20260720
+```
+
+For the 27B NVFP4 accuracy run, start the model service with:
+
+```bash
+build/apps/ninfer-serve out/qwen3_6_27b_nvfp4.ninfer \
+  --host 127.0.0.1 --port 18080 --model-id qwen3.6-27b \
+  --max-context 262144 --prefill-chunk 1024 --kv-dtype int8 \
+  --spec mtp --draft-tokens 3 --lm-head-draft
+```
+
+Then run the repository's full 27B reasoning suite in a separate shell:
+
+```bash
+PYTHONPATH=eval eval/.venv/bin/python -m ninfer_eval run \
+  --config eval/configs/qwen3_6_27b_reasoning.yaml \
+  --suite reasoning_full
 ```
 
 ## `qwen3_6_35b_a3b`
@@ -265,10 +291,24 @@ repetition loop is present.
 
 ## `qwen3_6_27b`
 
-The serving campaign in this section uses `(target, weights_id) =
-(qwen3_6_27b, groupwise-int)`.
+### EvalScope reasoning accuracy
 
-### MTP0 context-length profile
+Both weight profiles were evaluated through NInfer's OpenAI-compatible serving route with thinking
+enabled, MTP=3, and a 262,144-token context limit. EvalScope 1.9.0 used 0-shot prompts, rule-based
+scoring, and one sample per problem with temperature 0.6, top-p 0.95, top-k 20, presence penalty
+1.0, and seed 42. All 258 samples completed and were scored for each profile.
+
+| Weights ID | AIME 2025 | AIME 2026 | GPQA-Diamond |
+|---|---:|---:|---:|
+| `groupwise-int` | 86.67% (26 / 30) | 93.33% (28 / 30) | 86.87% (172 / 198) |
+| `nvfp4` | 93.33% (28 / 30) | 90.00% (27 / 30) | 85.86% (170 / 198) |
+
+These are single-sample results under the stated evaluation profile, not pass@k scores. Each
+benchmark remains independently reportable; no combined score is computed.
+
+### `groupwise-int`
+
+#### MTP0 context-length profile
 
 | Prompt tokens | Samples | Prefill tok/s | Server TTFT (ms) | Decode tok/s |
 |---:|---:|---:|---:|---:|
@@ -277,7 +317,7 @@ The serving campaign in this section uses `(target, weights_id) =
 | 130,048 | 5 | 2,185.3 ± 0.3 | 59,590.3 ± 8.9 | 64.5 ± 0.1 |
 | 260,096 | 5 | 1,614.8 ± 0.6 | 161,221.8 ± 62.5 | 54.8 ± 0.1 |
 
-### MTP3 long-reasoning decode
+#### MTP3 long-reasoning decode
 
 | Fixture | Samples | Completion tokens | Decode tok/s | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|---:|---:|
@@ -285,7 +325,7 @@ The serving campaign in this section uses `(target, weights_id) =
 | `long_decode_aime26_15` | 5 | 61,604.2 ± 5,677.9 | 161.9 ± 2.8 | 73.4% ± 1.7% | 3.20 ± 0.05 |
 | `long_decode_aime26_30` | 5 | 47,339.8 ± 9,162.2 | 172.2 ± 0.9 | 78.8% ± 0.8% | 3.36 ± 0.02 |
 
-### MTP3 cross-scenario decode
+#### MTP3 cross-scenario decode
 
 Each category contains three fixtures and five seeds per fixture, for 15 samples.
 
@@ -296,45 +336,39 @@ Each category contains three fixtures and five seeds per fixture, for 15 samples
 | Translation | 15 | 161.5 ± 11.3 | 68.3% ± 7.2% | 3.05 ± 0.22 |
 | Structured | 15 | 193.0 ± 18.8 | 88.7% ± 11.7% | 3.66 ± 0.35 |
 
+### `nvfp4`
+
+The fixtures, seeds, sampling parameters, output limits, and runtime options are identical to the
+groupwise-int serving campaign. Quantization can change sampled tokens, so the MTP3 results are a
+fixed-workload comparison rather than a token-identical output comparison.
+
+#### MTP0 context-length profile
+
+| Prompt tokens | Samples | Prefill tok/s | Server TTFT (ms) | Decode tok/s |
+|---:|---:|---:|---:|---:|
+| 7,680 | 5 | 11,139.0 ± 24.8 | 695.8 ± 1.5 | 88.6 ± 0.2 |
+| 64,512 | 5 | 6,385.1 ± 27.1 | 10,148.8 ± 42.4 | 80.0 ± 0.3 |
+| 130,048 | 5 | 4,195.6 ± 7.2 | 31,078.7 ± 53.5 | 72.5 ± 0.1 |
+| 260,096 | 5 | 2,509.8 ± 1.1 | 103,797.3 ± 52.5 | 60.5 ± 0.2 |
+
+#### MTP3 long-reasoning decode
+
+| Fixture | Samples | Completion tokens | Decode tok/s | MTP acceptance | MTP tokens/round |
+|---|---:|---:|---:|---:|---:|
+| `long_decode_aime26_01` | 5 | 10,957.0 ± 872.9 | 219.1 ± 3.6 | 80.2% ± 2.0% | 3.41 ± 0.06 |
+| `long_decode_aime26_15` | 5 | 65,536.0 ± 0.0 | 201.7 ± 1.1 | 76.3% ± 0.7% | 3.29 ± 0.02 |
+| `long_decode_aime26_30` | 5 | 50,642.2 ± 6,772.2 | 211.8 ± 3.0 | 81.0% ± 1.1% | 3.43 ± 0.03 |
+
+#### MTP3 cross-scenario decode
+
+Each category contains three fixtures and five seeds per fixture, for 15 samples.
+
+| Category | Samples | Decode tok/s | MTP acceptance | MTP tokens/round |
+|---|---:|---:|---:|---:|
+| Code | 15 | 205.4 ± 8.9 | 73.1% ± 4.7% | 3.19 ± 0.14 |
+| Story | 15 | 141.6 ± 12.8 | 39.9% ± 6.6% | 2.20 ± 0.20 |
+| Translation | 15 | 201.5 ± 10.6 | 70.4% ± 5.5% | 3.11 ± 0.16 |
+| Structured | 15 | 240.3 ± 12.2 | 91.2% ± 6.3% | 3.74 ± 0.19 |
+
 The baseline and speculative-decode suites intentionally measure different supported workloads.
 No per-scenario baseline/speculative speedup is reported.
-
-### NVFP4 integration qualification
-
-This focused public-Engine benchmark qualifies the newly executable
-`(qwen3_6_27b, nvfp4)` storage profile against the existing groupwise profile on the same RTX 5090.
-It is intentionally smaller than the serving campaign above: `ninfer_bench`, BF16 KV cache,
-`max_context=4096`, a 1,024-token prefill chunk, CUDA Graph enabled, speculative decoding disabled,
-one warm-up, and three measured repetitions. `pp512` measures a 512-token prefill; `tg32` measures
-32 ordinary decode output tokens after the benchmark's untimed seed prefill.
-
-| Weights ID | Load (s) | Resident weights (bytes) | H2D bytes | Device tensors | pp512 tok/s | tg32 tok/s |
-|---|---:|---:|---:|---:|---:|---:|
-| `groupwise-int` | 3.999 | 16,378,329,088 | 16,378,322,944 | 771 | 3,305.7 | 83.5 |
-| `nvfp4` | 4.014 | 16,491,769,600 | 16,491,701,212 | 707 | 10,099.6 | 85.4 |
-
-Both plans reserve 588,332,800 sequence bytes and 168,370,176 workspace bytes for this exact
-configuration; equality here is caused by other shared schedule allocations dominating the final
-arena maxima, not by reserving both storage profiles. Disabled Vision, MTP, and optimized-proposal
-weights explain why these device-tensor counts are below the all-features load-plan counts.
-
-Reproduce the reports with:
-
-```bash
-build/bench/ninfer_bench \
-  --weights out/qwen3_6_27b.ninfer \
-  -p 512 -n 32 -r 3 --warmup 1 \
-  --max-ctx 4096 --prefill-chunk 1024 --kv-dtype bf16 \
-  --mtp-draft-tokens 0 --output json
-
-build/bench/ninfer_bench \
-  --weights out/qwen3_6_27b_nvfp4.ninfer \
-  -p 512 -n 32 -r 3 --warmup 1 \
-  --max-ctx 4096 --prefill-chunk 1024 --kv-dtype bf16 \
-  --mtp-draft-tokens 0 --output json
-```
-
-An Nsight Systems route trace of a separate 54-token NVFP4 CLI request observes W4A4 quantize/MMA
-kernels in long prefill, NVFP4 small-T kernels in the short final chunk, and A16 NVFP4
-decode/GEMV kernels under CUDA Graph decode. This trace establishes route selection; it is not used
-as the throughput source for the table.

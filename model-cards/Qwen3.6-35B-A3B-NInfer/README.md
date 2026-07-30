@@ -95,7 +95,9 @@ printf '%s  %s\n' \
 
 ## Requirements
 
-- [NInfer](https://github.com/Neroued/ninfer) built from source;
+- [NInfer](https://github.com/Neroued/ninfer) revision
+  [`bd265a3`](https://github.com/Neroued/ninfer/commit/bd265a36fe990475bae143d2073d6a6cf67d0da3)
+  or later, built from source;
 - 64-bit Linux;
 - NVIDIA GeForce RTX 5090 (`sm_120a`);
 - CUDA Toolkit 13.1 or newer.
@@ -231,7 +233,8 @@ These are single-sample results under the stated NInfer evaluation profile, not 
 
 ## Limits
 
-- The artifact is accepted only by the matching NInfer target.
+- The artifact is accepted only by NInfer revision `bd265a3` or later and the matching registered
+  target.
 - NInfer currently executes on one RTX 5090, one CUDA device, and one active request per Engine.
 - It does not provide continuous batching, multi-GPU execution, CPU/GPU offload, or distributed
   serving.
@@ -248,9 +251,13 @@ These are single-sample results under the stated NInfer evaluation profile, not 
 | DFlash source revision | [`f181eece646affea2c38b2765f1aaa01a9734ccd`](https://huggingface.co/z-lab/Qwen3.6-35B-A3B-DFlash/tree/f181eece646affea2c38b2765f1aaa01a9734ccd) |
 | Conversion recipe | `qwen3_6_35b_a3b-v2` |
 | Converter repository | `https://github.com/Neroued/ninfer` |
+| Converter revision | `872b9792b4f43244e38faca5cded79136eca5666` |
+| Minimum runtime revision | `bd265a36fe990475bae143d2073d6a6cf67d0da3` |
 
-The complete object inventory and conversion metadata are published in
+The artifact identity, summarized object inventory, and conversion provenance are published in
 [`artifact-manifest.json`](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/blob/main/artifact-manifest.json).
+The exact storage contract is maintained in the
+[Qwen3.6-35B-A3B artifact reference](https://github.com/Neroued/ninfer/blob/master/docs/maintainer/qwen3.6-35b-a3b-artifact.md).
 
 ## License
 

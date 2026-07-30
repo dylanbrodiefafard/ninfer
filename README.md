@@ -12,17 +12,20 @@ runtime:
 | Model | Weights | NInfer artifact | Size | SHA-256 |
 |---|---|---|---:|---|
 | [Qwen3.6-27B](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | `groupwise-int` | `qwen3_6_27b.ninfer` | 17,495,365,888 bytes (16.29 GiB) | `7b51600ffd10632b9660f56085efdd9b751d79733ad32036a652234b64bebe7b` |
-| [Qwen3.6-27B](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | `nvfp4` | `qwen3_6_27b_nvfp4.ninfer` | 17,608,902,400 bytes (16.40 GiB) | `886144e76f3ab8a132555e40b7182af187d7a9aeab5cff56b41d7c6e43fb91e1` |
+| [Qwen3.6-27B NVFP4](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) | `nvfp4` | `qwen3_6_27b_nvfp4.ninfer` | 17,608,902,400 bytes (16.40 GiB) | `886144e76f3ab8a132555e40b7182af187d7a9aeab5cff56b41d7c6e43fb91e1` |
 | [Qwen3.6-35B-A3B](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | `groupwise-int` | `qwen3_6_35b_a3b.ninfer` | 22,783,246,080 bytes (21.22 GiB) | `1fb9ea0b5b8561e49d9604115ec89e5d9f2b6f6434e32c37c57fffd480a325d2` |
+
+Both 27B artifacts bind to the same registered `qwen3_6_27b` target; the version-2 artifact identity
+selects the weight profile without a separate target or runtime flag. The `nvfp4` profile uses W4A4
+Tensor Core MMA for prefill and A16 NVFP4 kernels for decode while retaining the same Text, Vision,
+MTP, prefix-reuse, CLI, and serving paths.
 
 ## Performance
 
 Serving performance was measured on an RTX 5090 with INT8 group-64 KV cache, CUDA Graphs, a 1,024-
 token prefill chunk, and a maximum context of 262,144 tokens. Each reported fixture uses five fixed
 seeds after one warm-up. The two registered targets are reported independently and are not
-cross-target comparisons. The published 27B serving figures below use `weights_id =
-groupwise-int`; the NVFP4 Engine qualification is reported separately in the
-[full performance document](docs/performance.md#nvfp4-integration-qualification).
+cross-target comparisons. The two 27B weight profiles are reported separately.
 
 **Qwen3.6-35B-A3B**
 
@@ -38,22 +41,33 @@ groupwise-int`; the NVFP4 Engine qualification is reported separately in the
 - MTP3 long reasoning: **161.9–175.4 decode tok/s** with **73.4–78.8% acceptance**.
 - MTP3 structured output: **193.0 decode tok/s**, **88.7% acceptance**, and **3.66 tokens/round**.
 
+**Qwen3.6-27B (`nvfp4`)**
+
+- MTP0 at a 7,680-token prompt: **11,139.0 prefill tok/s** and **88.6 decode tok/s**.
+- MTP0 at a 260,096-token prompt: **2,509.8 prefill tok/s** and **60.5 decode tok/s**.
+- MTP3 long reasoning: **201.7–219.1 decode tok/s** with **76.3–81.0% acceptance**.
+- MTP3 structured output: **240.3 decode tok/s**, **91.2% acceptance**, and **3.74 tokens/round**.
+- Against groupwise-int on the same corpus and runtime options: **3.46× the 7,680-token prefill
+  throughput**, **1.55× the 260,096-token prefill throughput**, and **23–26% higher MTP3 decode
+  throughput**.
+
 See [Performance](docs/performance.md) for the full methodology, variability, reproduction command,
 and per-fixture results.
 
 ## Evaluation
 
-Capability scores from the published model cards, measured through NInfer's OpenAI-compatible
-serving route with thinking enabled, MTP=3, and EvalScope 1.9.0 (0-shot, rule scoring, one sample
-per problem):
+Capability scores were measured through NInfer's OpenAI-compatible serving route with thinking
+enabled, MTP=3, and EvalScope 1.9.0 (0-shot, rule scoring, one sample per problem):
 
-| Model | AIME 2025 | AIME 2026 | GPQA-Diamond |
+| Model profile | AIME 2025 | AIME 2026 | GPQA-Diamond |
 |---|---:|---:|---:|
-| [Qwen3.6-27B](model-cards/Qwen3.6-27B-NInfer/README.md) | 86.67% | 93.33% | 86.87% |
-| [Qwen3.6-35B-A3B](model-cards/Qwen3.6-35B-A3B-NInfer/README.md) | 90.00% | 90.00% | 85.35% |
+| [Qwen3.6-27B groupwise-int](model-cards/Qwen3.6-27B-NInfer/README.md) | 86.67% | 93.33% | 86.87% |
+| [Qwen3.6-27B NVFP4](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) | 93.33% | 90.00% | 85.86% |
+| [Qwen3.6-35B-A3B groupwise-int](model-cards/Qwen3.6-35B-A3B-NInfer/README.md) | 90.00% | 90.00% | 85.35% |
 
-These are single-sample results under that NInfer evaluation profile, not pass@k. See each model
-card for correct/total counts and the full evaluation notes.
+These are single-sample results under that NInfer evaluation profile, not pass@k. See the model
+cards and [full performance document](docs/performance.md) for correct/total counts and evaluation
+notes.
 
 ## Requirements
 
@@ -136,7 +150,7 @@ hf download neroued/Qwen3.6-27B-NInfer \
   --local-dir models
 
 # Or the 27B NVFP4 weight variant:
-hf download neroued/Qwen3.6-27B-NInfer \
+hf download neroued/Qwen3.6-27B-nvfp4-NInfer \
   qwen3_6_27b_nvfp4.ninfer \
   --local-dir models
 
@@ -146,15 +160,17 @@ hf download neroued/Qwen3.6-35B-A3B-NInfer \
   --local-dir models
 ```
 
-Development builds accept only the version-2 artifact container. Migrate either exact artifact
-published before this container change in place:
+Current NInfer builds accept only the version-2 artifact container, and all three downloads above
+are version 2. If an older 27B or 35B-A3B artifact was downloaded before this publication, migrate
+that exact local file in place:
 
 ```bash
 python3 -m tools.artifact.migrate_v1_to_v2 models/qwen3_6_27b.ninfer
 ```
 
 Use the same command with `qwen3_6_35b_a3b.ninfer` for the 35B-A3B artifact. The migration updates
-only container metadata; it does not rewrite the weight payload.
+only container metadata; it does not rewrite the weight payload. Alternatively, download the
+current version-2 file again from its Hugging Face repository.
 
 Each `.ninfer` file contains the weights and frontend resources needed by NInfer. It is not a
 Transformers checkpoint, Safetensors distribution, or GGUF file.
@@ -257,5 +273,8 @@ NInfer is licensed under the [Apache License 2.0](LICENSE).
 
 The published artifacts are derived from
 [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B) and
-[Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B), which are also distributed
-under Apache-2.0. Vendored dependencies retain their own license files under `third_party/`.
+[Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B). The 27B NVFP4 artifact also
+uses the fixed packed weights from
+[rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm](https://huggingface.co/rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm).
+These source repositories are distributed under Apache-2.0. Vendored dependencies retain their own
+license files under `third_party/`.

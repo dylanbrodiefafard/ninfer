@@ -1,7 +1,7 @@
 # NInfer documentation
 
-Start with the [project README](../README.md) to build NInfer, download one of the two registered
-artifacts, and run the CLI or HTTP server.
+Start with the [project README](../README.md) to build NInfer, download one of the published
+artifacts for the two registered targets, and run the CLI or HTTP server.
 
 ## User guides
 
@@ -16,10 +16,11 @@ The executable `--help` output is the exact source for command-line option spell
 
 ## Model artifacts
 
-| Model | Download | Versioned model card source |
-|---|---|---|
-| Qwen3.6-27B | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | [model card](../model-cards/Qwen3.6-27B-NInfer/README.md) |
-| Qwen3.6-35B-A3B | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | [model card](../model-cards/Qwen3.6-35B-A3B-NInfer/README.md) |
+| Model | Weights | Download | Versioned model card source |
+|---|---|---|---|
+| Qwen3.6-27B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | [model card](../model-cards/Qwen3.6-27B-NInfer/README.md) |
+| Qwen3.6-27B | `nvfp4` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) | [model card](../model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) |
+| Qwen3.6-35B-A3B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | [model card](../model-cards/Qwen3.6-35B-A3B-NInfer/README.md) |
 
 ## Repository-local guides
 
