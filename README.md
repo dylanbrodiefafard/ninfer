@@ -43,12 +43,12 @@ cross-target comparisons. The two 27B weight profiles are reported separately.
 
 **Qwen3.6-27B (`nvfp4`)**
 
-- MTP0 at a 7,680-token prompt: **11,139.0 prefill tok/s** and **88.6 decode tok/s**.
-- MTP0 at a 260,096-token prompt: **2,509.8 prefill tok/s** and **60.5 decode tok/s**.
-- MTP3 long reasoning: **201.7–219.1 decode tok/s** with **76.3–81.0% acceptance**.
-- MTP3 structured output: **240.3 decode tok/s**, **91.2% acceptance**, and **3.74 tokens/round**.
-- Against groupwise-int on the same corpus and runtime options: **3.46× the 7,680-token prefill
-  throughput**, **1.55× the 260,096-token prefill throughput**, and **23–26% higher MTP3 decode
+- MTP0 at a 7,680-token prompt: **11,191.5 prefill tok/s** and **86.4 decode tok/s**.
+- MTP0 at a 260,096-token prompt: **2,510.6 prefill tok/s** and **59.9 decode tok/s**.
+- MTP3 long reasoning: **201.6–222.7 decode tok/s** with **74.7–80.8% acceptance**.
+- MTP3 structured output: **243.1 decode tok/s**, **90.2% acceptance**, and **3.71 tokens/round**.
+- Against groupwise-int on the same corpus and runtime options: **3.48× the 7,680-token prefill
+  throughput**, **1.55× the 260,096-token prefill throughput**, and **25–28% higher MTP3 decode
   throughput**.
 
 See [Performance](docs/performance.md) for the full methodology, variability, reproduction command,
@@ -62,7 +62,7 @@ enabled, MTP=3, and EvalScope 1.9.0 (0-shot, rule scoring, one sample per proble
 | Model profile | AIME 2025 | AIME 2026 | GPQA-Diamond |
 |---|---:|---:|---:|
 | [Qwen3.6-27B groupwise-int](model-cards/Qwen3.6-27B-NInfer/README.md) | 86.67% | 93.33% | 86.87% |
-| [Qwen3.6-27B NVFP4](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) | 93.33% | 90.00% | 85.86% |
+| [Qwen3.6-27B NVFP4](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) | 93.33% | 93.33% | 84.34% |
 | [Qwen3.6-35B-A3B groupwise-int](model-cards/Qwen3.6-35B-A3B-NInfer/README.md) | 90.00% | 90.00% | 85.35% |
 
 These are single-sample results under that NInfer evaluation profile, not pass@k. See the model

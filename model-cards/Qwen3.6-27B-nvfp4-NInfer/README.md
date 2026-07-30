@@ -41,7 +41,7 @@ model-index:
           type: aime26
         metrics:
           - type: accuracy
-            value: 90.00
+            value: 93.33
             name: Accuracy (0-shot, rule)
         source:
           url: https://github.com/Neroued/ninfer/tree/master/eval
@@ -54,7 +54,7 @@ model-index:
           type: gpqa_diamond
         metrics:
           - type: accuracy
-            value: 85.86
+            value: 84.34
             name: Accuracy (0-shot, rule)
         source:
           url: https://github.com/Neroued/ninfer/tree/master/eval
@@ -159,12 +159,12 @@ fixed seeds; warm-up requests are excluded.
 
 | Prompt tokens | Prefill tok/s | Server TTFT (ms) | Decode tok/s |
 |---:|---:|---:|---:|
-| 7,680 | 11,139.0 ± 24.8 | 695.8 ± 1.5 | 88.6 ± 0.2 |
-| 64,512 | 6,385.1 ± 27.1 | 10,148.8 ± 42.4 | 80.0 ± 0.3 |
-| 130,048 | 4,195.6 ± 7.2 | 31,078.7 ± 53.5 | 72.5 ± 0.1 |
-| 260,096 | 2,509.8 ± 1.1 | 103,797.3 ± 52.5 | 60.5 ± 0.2 |
+| 7,680 | 11,191.5 ± 70.2 | 692.5 ± 4.3 | 86.4 ± 0.5 |
+| 64,512 | 6,298.5 ± 97.6 | 10,288.6 ± 159.3 | 78.0 ± 1.2 |
+| 130,048 | 4,204.7 ± 14.1 | 31,012.5 ± 104.6 | 71.2 ± 0.2 |
+| 260,096 | 2,510.6 ± 16.8 | 103,761.1 ± 698.8 | 59.9 ± 0.3 |
 
-At 7,680 prompt tokens this is 3.46× the prefill throughput of the published groupwise-int profile;
+At 7,680 prompt tokens this is 3.48× the prefill throughput of the published groupwise-int profile;
 at 260,096 prompt tokens it is 1.55×.
 
 ### MTP=3 long-reasoning decode
@@ -173,9 +173,9 @@ Thinking was enabled and the output limit was 65,536 tokens.
 
 | AIME 2026 fixture | Completion tokens | Decode tok/s | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|---:|
-| Problem 1 | 10,957.0 ± 872.9 | 219.1 ± 3.6 | 80.2% ± 2.0% | 3.41 ± 0.06 |
-| Problem 15 | 65,536.0 ± 0.0 | 201.7 ± 1.1 | 76.3% ± 0.7% | 3.29 ± 0.02 |
-| Problem 30 | 50,642.2 ± 6,772.2 | 211.8 ± 3.0 | 81.0% ± 1.1% | 3.43 ± 0.03 |
+| Problem 1 | 11,717.0 ± 476.7 | 222.7 ± 3.4 | 80.8% ± 1.8% | 3.43 ± 0.06 |
+| Problem 15 | 65,536.0 ± 0.0 | 201.6 ± 2.9 | 74.7% ± 1.5% | 3.24 ± 0.04 |
+| Problem 30 | 46,439.2 ± 3,719.0 | 216.3 ± 1.5 | 80.8% ± 0.9% | 3.42 ± 0.03 |
 
 ### MTP=3 cross-scenario decode
 
@@ -184,10 +184,10 @@ disabled and the output limit was 4,096 tokens.
 
 | Category | Decode tok/s | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|
-| Code | 205.4 ± 8.9 | 73.1% ± 4.7% | 3.19 ± 0.14 |
-| Story | 141.6 ± 12.8 | 39.9% ± 6.6% | 2.20 ± 0.20 |
-| Translation | 201.5 ± 10.6 | 70.4% ± 5.5% | 3.11 ± 0.16 |
-| Structured output | 240.3 ± 12.2 | 91.2% ± 6.3% | 3.74 ± 0.19 |
+| Code | 211.7 ± 7.0 | 74.2% ± 3.6% | 3.23 ± 0.11 |
+| Story | 144.5 ± 10.5 | 40.0% ± 5.4% | 2.20 ± 0.16 |
+| Translation | 205.2 ± 13.9 | 70.4% ± 7.1% | 3.11 ± 0.21 |
+| Structured output | 243.1 ± 15.3 | 90.2% ± 7.8% | 3.71 ± 0.24 |
 
 See the
 [full methodology and results](https://github.com/Neroued/ninfer/blob/master/docs/performance.md),
@@ -203,8 +203,8 @@ seed 42. All 258 configured samples completed and were scored.
 | Benchmark | Accuracy | Correct / total |
 |---|---:|---:|
 | AIME 2025 | 93.33% | 28 / 30 |
-| AIME 2026 | 90.00% | 27 / 30 |
-| GPQA-Diamond | 85.86% | 170 / 198 |
+| AIME 2026 | 93.33% | 28 / 30 |
+| GPQA-Diamond | 84.34% | 167 / 198 |
 
 These are single-sample results under the stated NInfer evaluation profile, not pass@k scores.
 

@@ -6,7 +6,7 @@ Tested Git revisions:
 - Qwen3.6-35B-A3B DFlash block=8 (`k=7`):
   `0dc94097e8ec5c5bcf59b9e13e9d1852f504eb61`;
 - Qwen3.6-27B NVFP4 accuracy, MTP0, and MTP3:
-  `2140dda4b63f31bf7024cdf094784ac3904274ef`;
+  `b3d4d0f50b868711c62432bbd68e746217a2f49a`;
 - Qwen3.6-27B groupwise-int MTP3: `5ea3242a206cdb0c4c1beaeb9d8a3048e6248423`;
 - Qwen3.6-35B-A3B MTP0 and Qwen3.6-27B groupwise-int MTP0:
   `0795169393cab0f2c16246d4bac20dee735dc2a4`.
@@ -87,7 +87,7 @@ python3 tools/bench/run_serve_corpus.py \
   --serve build/apps/ninfer-serve \
   --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
   --mode mtp0 --mode mtp3 --sampling stochastic \
-  --output profiles/bench/serve_corpus_27b_nvfp4_20260730
+  --output profiles/bench/serve_corpus_27b_nvfp4_w8_20260731
 ```
 
 Use `--mode dflash7` for the corresponding DFlash block=8 campaign; add `--sampling greedy` for
@@ -301,7 +301,7 @@ scoring, and one sample per problem with temperature 0.6, top-p 0.95, top-k 20, 
 | Weights ID | AIME 2025 | AIME 2026 | GPQA-Diamond |
 |---|---:|---:|---:|
 | `groupwise-int` | 86.67% (26 / 30) | 93.33% (28 / 30) | 86.87% (172 / 198) |
-| `nvfp4` | 93.33% (28 / 30) | 90.00% (27 / 30) | 85.86% (170 / 198) |
+| `nvfp4` | 93.33% (28 / 30) | 93.33% (28 / 30) | 84.34% (167 / 198) |
 
 These are single-sample results under the stated evaluation profile, not pass@k scores. Each
 benchmark remains independently reportable; no combined score is computed.
@@ -346,18 +346,18 @@ fixed-workload comparison rather than a token-identical output comparison.
 
 | Prompt tokens | Samples | Prefill tok/s | Server TTFT (ms) | Decode tok/s |
 |---:|---:|---:|---:|---:|
-| 7,680 | 5 | 11,139.0 ± 24.8 | 695.8 ± 1.5 | 88.6 ± 0.2 |
-| 64,512 | 5 | 6,385.1 ± 27.1 | 10,148.8 ± 42.4 | 80.0 ± 0.3 |
-| 130,048 | 5 | 4,195.6 ± 7.2 | 31,078.7 ± 53.5 | 72.5 ± 0.1 |
-| 260,096 | 5 | 2,509.8 ± 1.1 | 103,797.3 ± 52.5 | 60.5 ± 0.2 |
+| 7,680 | 5 | 11,191.5 ± 70.2 | 692.5 ± 4.3 | 86.4 ± 0.5 |
+| 64,512 | 5 | 6,298.5 ± 97.6 | 10,288.6 ± 159.3 | 78.0 ± 1.2 |
+| 130,048 | 5 | 4,204.7 ± 14.1 | 31,012.5 ± 104.6 | 71.2 ± 0.2 |
+| 260,096 | 5 | 2,510.6 ± 16.8 | 103,761.1 ± 698.8 | 59.9 ± 0.3 |
 
 #### MTP3 long-reasoning decode
 
 | Fixture | Samples | Completion tokens | Decode tok/s | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|---:|---:|
-| `long_decode_aime26_01` | 5 | 10,957.0 ± 872.9 | 219.1 ± 3.6 | 80.2% ± 2.0% | 3.41 ± 0.06 |
-| `long_decode_aime26_15` | 5 | 65,536.0 ± 0.0 | 201.7 ± 1.1 | 76.3% ± 0.7% | 3.29 ± 0.02 |
-| `long_decode_aime26_30` | 5 | 50,642.2 ± 6,772.2 | 211.8 ± 3.0 | 81.0% ± 1.1% | 3.43 ± 0.03 |
+| `long_decode_aime26_01` | 5 | 11,717.0 ± 476.7 | 222.7 ± 3.4 | 80.8% ± 1.8% | 3.43 ± 0.06 |
+| `long_decode_aime26_15` | 5 | 65,536.0 ± 0.0 | 201.6 ± 2.9 | 74.7% ± 1.5% | 3.24 ± 0.04 |
+| `long_decode_aime26_30` | 5 | 46,439.2 ± 3,719.0 | 216.3 ± 1.5 | 80.8% ± 0.9% | 3.42 ± 0.03 |
 
 #### MTP3 cross-scenario decode
 
@@ -365,10 +365,10 @@ Each category contains three fixtures and five seeds per fixture, for 15 samples
 
 | Category | Samples | Decode tok/s | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|---:|
-| Code | 15 | 205.4 ± 8.9 | 73.1% ± 4.7% | 3.19 ± 0.14 |
-| Story | 15 | 141.6 ± 12.8 | 39.9% ± 6.6% | 2.20 ± 0.20 |
-| Translation | 15 | 201.5 ± 10.6 | 70.4% ± 5.5% | 3.11 ± 0.16 |
-| Structured | 15 | 240.3 ± 12.2 | 91.2% ± 6.3% | 3.74 ± 0.19 |
+| Code | 15 | 211.7 ± 7.0 | 74.2% ± 3.6% | 3.23 ± 0.11 |
+| Story | 15 | 144.5 ± 10.5 | 40.0% ± 5.4% | 2.20 ± 0.16 |
+| Translation | 15 | 205.2 ± 13.9 | 70.4% ± 7.1% | 3.11 ± 0.21 |
+| Structured | 15 | 243.1 ± 15.3 | 90.2% ± 7.8% | 3.71 ± 0.24 |
 
 The baseline and speculative-decode suites intentionally measure different supported workloads.
 No per-scenario baseline/speculative speedup is reported.
