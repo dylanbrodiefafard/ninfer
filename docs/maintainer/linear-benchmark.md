@@ -12,6 +12,11 @@ benchmark 只测量：
 ninfer::ops::linear(x, w, out, policy, workspace, stream)
 ```
 
+这是一个长期保留的 public benchmark。single、sweep、suite 和 profile 的被测调用都必须
+经过上述公开入口；fixture 可以按公开 weight format 构造输入，但 benchmark 不得包含
+Linear 私有 launcher/plan/dispatch 头，不得调用 `ninfer::ops::detail`，也不得提供
+candidate、kernel 或 route forcing 选项。
+
 Q4/Q5/Q6/W8 LinearAdd、LinearSwiGLU、LinearPair 和其他 fused Ops 不属于这个
 benchmark。它们继续由各自的 benchmark 独立测量。
 
@@ -145,8 +150,9 @@ Vision step domain 可以直接表达为：
 ```
 
 每个 T 输出相邻点的 median latency 变化。sweep 用于发现不合理耗时阶跃、观察已有
-route seam，并为独立的 route 测量任务提供边界依据；它不设置自动性能 gate，也不在
-benchmark 中复制 selector 或 candidate-legality 表。
+production route seam，并为独立的 route 测量任务提供线索；每个点仍只调用 public
+Linear。它不比较强制候选、不设置自动性能 gate，也不在 benchmark 中复制 selector、
+crossover 或 candidate-legality 表。
 
 ### 1.4 典型模型 suite
 
@@ -425,6 +431,7 @@ selector 源码是 host launcher route 的唯一 executable authority。
 - Tensor Core peak probe；
 - warm-cache second pass；
 - per-shape default route-boundary T tables；
+- BF16 `--bf16-route`、candidate 合法域镜像和对私有 launcher 的直接调用；
 - `candidate_name` 和 `kernel_variant` 输出。
 
 当前 `linear_bench.cu` 保留：
@@ -462,9 +469,19 @@ metadata。
 新增或替换 host launcher 不修改 benchmark。single、sweep 和 suite 始终调用 public
 Linear，因此自然测量 selector 当前返回的 production route。
 
-如果需要在 route 入选前比较多个候选，应建立该格式任务范围内的临时测量代码；不得把
-generic candidate forcing、legality registry 或 plan 层重新引入长期 pure Linear
-benchmark。
+候选选择遵循 [`op-development.md`](op-development.md#91-public-benchmarks-and-temporary-crossover-sweeps)
+定义的推荐工作流：
+
+1. 在该格式或 route 的开发任务范围内编写临时 benchmark/sweep，必要时直接调用私有
+   launcher；
+2. 在候选共同合法域、相同输入和 cache/timing 条件下确定固定胜者或 crossover；
+3. 将决定只写入 production selector；
+4. 通过 public Linear 重新验证 correctness 和最终性能；
+5. 删除临时 sweep、candidate forcing 和仅为比较保留的私有入口。
+
+不得把 generic candidate forcing、私有合法域、crossover 镜像、launcher catalog 或
+plan 层重新引入长期 pure Linear benchmark。public `--sweep` 只观察最终 selector 的
+整体表现，不承担候选选择。
 
 ### 9.3 新 weight/activation compute type
 

@@ -72,13 +72,16 @@ load, graph construction, and warmup do not enter topology counts.
 ## Linear Op benchmark
 
 `ninfer_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,
-W8, registered BF16 weights, and the exact NVFP4 `[14336,5120]` problem. Existing formats use
+W8, registered BF16 weights, and the registered NVFP4 problems. Existing formats use
 `--policy a16`; NVFP4 additionally supports `--policy a4`, which keeps `T<=16` on A16 and measures
 the complete activation-quantization plus W4A4 GEMM call for `T>16`. LinearAdd, LinearSwiGLU,
 LinearPair, Attention/GDN projections, and sparse MoE remain separate semantic Ops and are not
-benchmark modes here. For registered BF16 problems, `--bf16-route
-production|small-t|mma|all` exposes benchmark-local launch controls with the same pure Linear
-semantics so dispatch crossovers can be measured directly.
+benchmark modes here.
+
+This is a long-lived public benchmark: every timed and profiled point calls `ninfer::ops::linear`
+and lets production dispatch choose the implementation. Candidate crossover work uses a
+task-local temporary sweep, records the winner or boundary in production dispatch, and deletes the
+temporary candidate controls afterward; private launchers and route forcing do not belong here.
 
 Build the benchmark and measure one exact production point:
 
@@ -100,9 +103,6 @@ allocation:
 ./build/bench/ninfer_linear_bench \
   --qtype q4 --policy a16 --n 3456 --k 1152 \
   --sweep 4:512:4 --csv-out profiles/bench/q4_vision_qkv.csv
-./build/bench/ninfer_linear_bench \
-  --qtype bf16 --policy a16 --n 14336 --k 5120 --sweep 24:32:1 \
-  --bf16-route all --warmup 20 --repeat 500
 ```
 
 The registered suites run representative public Linear shapes for one or both exact products.
@@ -116,7 +116,8 @@ matrix:
 ```
 
 For NCU, `--profile` performs setup, warmup, and the L2 flush before enabling the profiler, then
-captures exactly one selected launch. The default production route enters through public Linear:
+captures exactly one public Linear call. That call may emit one or more production-selected kernel
+launches:
 
 ```bash
 ncu --profile-from-start off --set full \

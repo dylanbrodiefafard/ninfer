@@ -673,9 +673,11 @@ coverage, retired compatibility, or hypothetical behavior.
 ## 9. Performance workflow
 
 Op microbenchmarks live under `bench/ops/` and link the Op layer directly. A useful result records
-the semantic operation, exact shape, format/layout, workload token extent, device/toolchain, warmup and
-measurement method, cache conditions, and actual selected implementation. A microbenchmark is an
-implementation measurement, not a correctness oracle or proof of end-to-end improvement.
+the semantic operation, exact shape, format/layout, workload token extent, device/toolchain, warmup
+and measurement method, and cache conditions. When the actual selected implementation matters,
+obtain it from the production selector or a profiler rather than reproducing dispatch in the
+benchmark. A microbenchmark is an implementation measurement, not a correctness oracle or proof of
+end-to-end improvement.
 
 For a performance change:
 
@@ -688,6 +690,33 @@ For a performance change:
 Collect only the profiler evidence needed to answer the concrete question. Preserve enough context
 to interpret a result; fixed repository or artifact hashes are not required unless a separate
 contract calls for them.
+
+### 9.1 Public benchmarks and temporary crossover sweeps
+
+A long-lived Op benchmark measures the delivered production Op through its public contract. Its
+timed and profiled calls use the public entry point and, when applicable, the public workspace
+capacity query. The benchmark may own deterministic input fixtures, cache control, timing, and
+metric calculation, but it must not:
+
+- include private launcher, kernel, plan, codec, or dispatch headers;
+- call `ninfer::ops::detail` symbols or otherwise bypass wrapper validation and production
+  selection;
+- expose candidate-forcing, kernel-forcing, or private-route command-line options; or
+- copy a candidate legality table, crossover boundary, schedule catalog, or selector into benchmark
+  code.
+
+A public sweep may scan token extents to measure final production performance and reveal a
+regression or unexpected seam. It still invokes only the public Op and does not compare forced
+candidates.
+
+Route selection uses a separate development workflow. This is the recommended route-development
+method for NInfer Ops. While developing overlapping implementations, create task-local temporary
+benchmark or sweep code that may call private launchers and encode the exact candidate domains needed
+for the comparison. Measure the candidates under the same cache, input, device, and timing conditions
+over their legal overlap. Select the fixed winner or crossover, record that decision once in the
+production selector, then verify correctness and final performance again through the public Op.
+Delete the temporary sweep, candidate-forcing controls, and comparison-only private entry points
+when the decision is complete. Do not merge them into a long-lived common benchmark.
 
 Full inference exposes persistent registered NVTX ranges in the `ninfer` domain. The outer
 `generate` range is the stable capture trigger; its direct children are `prefill` and `decode`.
@@ -761,4 +790,6 @@ only private dispatch/implementation code and the evidence relevant to that path
 - Does the independent qualification suite cover every affected entry and reachable route with the
   correct oracle, effects checks, and named acceptance criterion?
 - If performance changed, was the relevant Op measured and the affected product route checked?
+- Does every long-lived Op benchmark call only the public contract, with any candidate crossover
+  sweep kept temporary and deleted after production selection?
 - Does each source and symbol have one clear build/link owner?
