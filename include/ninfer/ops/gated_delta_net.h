@@ -11,15 +11,15 @@
 namespace ninfer::ops {
 
 /**
- * Returns the transient arena capacity required by gated_delta_rule for the given geometry. It is
+ * Returns the transient arena capacity required by gated_delta_net for the given geometry. It is
  * zero when the private implementation requires no transient storage. `head_dim` must be one of
  * {16,32,64,128}; `value_heads` must be at least `qk_heads` and divisible by it. The query covers
  * every T in the inclusive interval and throws for an invalid profile or interval.
  */
 [[nodiscard]] std::size_t
-gated_delta_rule_workspace_capacity_bytes(std::int32_t head_dim, std::int32_t qk_heads,
-                                          std::int32_t value_heads, bool normalize_qk,
-                                          std::int32_t min_tokens, std::int32_t max_tokens);
+gated_delta_net_workspace_capacity_bytes(std::int32_t head_dim, std::int32_t qk_heads,
+                                         std::int32_t value_heads, bool normalize_qk,
+                                         std::int32_t min_tokens, std::int32_t max_tokens);
 
 /**
  * Applies the Gated DeltaNet recurrence independently for each value head h. Let
@@ -40,26 +40,26 @@ gated_delta_rule_workspace_capacity_bytes(std::int32_t head_dim, std::int32_t qk
  * directly with that result; output storage rounding belongs to the Op's numerical criterion, not
  * the oracle. Recurrent implementations may apply the normalization directly; chunked
  * implementations may use private normalized staging. The corresponding private storage is
- * included by gated_delta_rule_workspace_capacity_bytes when `normalize_qk` is true.
+ * included by gated_delta_net_workspace_capacity_bytes when `normalize_qk` is true.
  * Inputs and out do not overlap state or one another. `ws` supplies transient storage reported by
- * gated_delta_rule_workspace_capacity_bytes; scratch is scoped to the call. T may be any positive
+ * gated_delta_net_workspace_capacity_bytes; scratch is scoped to the call. T may be any positive
  * value.
  *
  * This overload reads and writes the same `ssm_state`, publishing the state after all T tokens.
  */
-void gated_delta_rule(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                      const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
-                      Tensor& ssm_state, Tensor& out, cudaStream_t stream);
+void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                     const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
+                     Tensor& ssm_state, Tensor& out, cudaStream_t stream);
 
 /**
  * Distinct-state form of the same recurrence. `ssm_state_out` receives the final state;
  * `ssm_state_in` and `ssm_state_out` may be disjoint or exactly the same storage. No other
  * arguments may overlap either state.
  */
-void gated_delta_rule(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                      const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
-                      const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
-                      cudaStream_t stream);
+void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                     const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
+                     const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
+                     cudaStream_t stream);
 
 /**
  * Snapshot form of the same recurrence. `ssm_states` is contiguous FP32 [S,S,Hv,Slots],
@@ -68,9 +68,9 @@ void gated_delta_rule(const Tensor& q, const Tensor& k, const Tensor& v, const T
  * unchanged. This form uses no arena allocation, and `ssm_states` is the only persistent state
  * mutated.
  */
-void gated_delta_rule_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                               const Tensor& beta, float scale, bool normalize_qk,
-                               Tensor& ssm_states, const Tensor& initial_slot, Tensor& out,
-                               cudaStream_t stream);
+void gated_delta_net_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                              const Tensor& beta, float scale, bool normalize_qk,
+                              Tensor& ssm_states, const Tensor& initial_slot, Tensor& out,
+                              cudaStream_t stream);
 
 } // namespace ninfer::ops

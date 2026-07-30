@@ -15,7 +15,7 @@
 //       --repeat 50
 
 #include "ninfer/ops/causal_conv1d_silu.h"
-#include "ninfer/ops/gated_delta_rule.h"
+#include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/gated_rmsnorm.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
@@ -336,9 +336,9 @@ Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t 
             q_recurrent = q_norm;
             k_recurrent = k_norm;
         }
-        ops::gated_delta_rule_snapshot(q_recurrent, k_recurrent,
-                                       v.view({kHeadDim, kValueHeads, tokens}), g, beta, kGdnScale,
-                                       fused_qk_norm, ssm_states, initial_slot, recurrent_out, s);
+        ops::gated_delta_net_snapshot(q_recurrent, k_recurrent,
+                                      v.view({kHeadDim, kValueHeads, tokens}), g, beta, kGdnScale,
+                                      fused_qk_norm, ssm_states, initial_slot, recurrent_out, s);
         if (options.gated_rms == "dv10-b1024") {
             constexpr int block          = 1024;
             constexpr int rows_per_block = block / 32;
@@ -384,11 +384,11 @@ Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t 
             options.route == "fused"
                 ? std::string(
                       ops::detail::w8_gdn_input_snapshot_schedule_name(snapshot_plan.schedule)) +
-                      "+gated_delta_rule_snapshot.bf16.recurrent." +
+                      "+gated_delta_net_snapshot.bf16.recurrent." +
                       (options.qk_norm == "fused" ? "qk_fused.w4" : "qk_pre_normalized.w4")
                 : std::string("gdn_input_proj_conv_snapshot.w8.composed_control+") +
                       ops::detail::w8_gdn_input_schedule_name(input_plan.schedule) +
-                      "+gated_delta_rule_snapshot.bf16.recurrent." +
+                      "+gated_delta_net_snapshot.bf16.recurrent." +
                       (options.qk_norm == "fused" ? "qk_fused.w4" : "qk_pre_normalized.w4"),
             options.norm_control == "fused"
                 ? ops::detail::bf16_gdn_norm_gating_schedule_name(norm_control_plan.schedule)

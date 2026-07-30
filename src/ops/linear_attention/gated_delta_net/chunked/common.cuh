@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ops/kernel/gdn_common.cuh"
+#include "ops/linear_attention/gated_delta_net/common.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -8,15 +8,15 @@
 #include <cstdint>
 #include <cstdio>
 
-#define NINFER_GDN_PROPAGATE(expr)                                                                 \
+#define NINFER_GATED_DELTA_NET_PROPAGATE(expr)                                                     \
     do {                                                                                           \
-        const cudaError_t ninfer_gdn_err = (expr);                                                 \
-        if (ninfer_gdn_err != cudaSuccess) { return ninfer_gdn_err; }                              \
+        const cudaError_t ninfer_gated_delta_net_error = (expr);                                   \
+        if (ninfer_gated_delta_net_error != cudaSuccess) { return ninfer_gated_delta_net_error; }  \
     } while (0)
 
-namespace ninfer::ops::detail::gdn_chunked {
+namespace ninfer::ops::detail::gated_delta_net::chunked {
 
-inline constexpr std::int64_t kChunkSize      = 64;
+inline constexpr std::int64_t kChunkSize      = kChunkTokens;
 inline constexpr std::int64_t kSubChunkSize   = 16;
 inline constexpr std::int64_t kWorkspaceAlign = 256;
 
@@ -154,7 +154,7 @@ struct bh_decode_t {
         return r;
     }
 
-    static __device__ __forceinline__ bh_decode_t of(int bh, ninfer::ops::head_map qk_map) {
+    static __device__ __forceinline__ bh_decode_t of(int bh, head_map qk_map) {
         bh_decode_t r{};
         const int H_v   = qk_map.H_v;
         r.b             = bh / H_v;
@@ -201,12 +201,12 @@ struct stage_validator {
                          static_cast<long long>(B));
             return cudaErrorInvalidValue;
         }
-        if (!ninfer::ops::is_supported_gdn_head_dim(S)) {
+        if (!is_supported_head_dim(S)) {
             std::fprintf(stderr, "%s: unsupported S=%lld (allowed: 16, 32, 64, 128)\n", name,
                          static_cast<long long>(S));
             return cudaErrorInvalidValue;
         }
-        if (require_h_qk && !ninfer::ops::are_gdn_head_counts_valid(H_qk, H_v)) {
+        if (require_h_qk && !are_head_counts_valid(H_qk, H_v)) {
             std::fprintf(stderr,
                          "%s: invalid head counts H_qk=%lld H_v=%lld "
                          "(need H_qk >= 1, H_v >= H_qk, H_v %% H_qk == 0)\n",
@@ -216,10 +216,10 @@ struct stage_validator {
         return cudaSuccess;
     }
 
-    cudaError_t check_gdn_full_chunks() const {
+    cudaError_t check_full_chunks() const {
         if ((T % BT) != 0) {
             std::fprintf(stderr,
-                         "%s: GDN chunked path requires T to be a multiple of %d; "
+                         "%s: Gated DeltaNet chunked path requires T to be a multiple of %d; "
                          "route tail tokens through AR instead (T=%lld)\n",
                          name, BT, static_cast<long long>(T));
             return cudaErrorInvalidValue;
@@ -248,16 +248,8 @@ struct stage_validator {
     }
 };
 
-} // namespace ninfer::ops::detail::gdn_chunked
+cudaError_t launch_prepare_wy_wu(const prepare_wy_wu_config& cfg);
+cudaError_t launch_state_passing(const state_passing_config& cfg);
+cudaError_t launch_output(const chunk_output_config& cfg);
 
-namespace ninfer::ops::detail::gdn_prepare_wy_wu {
-cudaError_t launch_prepare_wy_wu(const gdn_chunked::prepare_wy_wu_config& cfg);
-} // namespace ninfer::ops::detail::gdn_prepare_wy_wu
-
-namespace ninfer::ops::detail::gdn_state_passing {
-cudaError_t launch_state_passing(const gdn_chunked::state_passing_config& cfg);
-} // namespace ninfer::ops::detail::gdn_state_passing
-
-namespace ninfer::ops::detail::gdn_chunk_output {
-cudaError_t launch_chunk_output(const gdn_chunked::chunk_output_config& cfg);
-} // namespace ninfer::ops::detail::gdn_chunk_output
+} // namespace ninfer::ops::detail::gated_delta_net::chunked

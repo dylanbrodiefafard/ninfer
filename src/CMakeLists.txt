@@ -60,12 +60,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/cast.cu
   ops/launcher/causal_conv1d.cu
   ops/launcher/embed_gather.cu
-  ops/launcher/gated_delta_rule_chunked.cu
-  ops/launcher/gated_delta_rule_recurrent.cu
-  ops/launcher/gdn_chunk_output.cu
   ops/launcher/gdn_gating.cu
-  ops/launcher/gdn_prepare_wy_wu.cu
-  ops/launcher/gdn_state_passing.cu
   ops/launcher/gelu.cu
   ops/launcher/bidirectional_gqa_attention.cu
   ops/launcher/swa.cu
@@ -89,6 +84,13 @@ add_library(ninfer_ops STATIC
   ops/launcher/silu_and_mul.cu
   ops/launcher/vision_attention.cu
   ops/launcher/vision_pos_embed.cu
+  # Gated DeltaNet Linear Attention core.
+  ops/linear_attention/gated_delta_net/gated_delta_net.cpp
+  ops/linear_attention/gated_delta_net/recurrent.cu
+  ops/linear_attention/gated_delta_net/chunked/launch.cu
+  ops/linear_attention/gated_delta_net/chunked/prepare_wy_wu.cu
+  ops/linear_attention/gated_delta_net/chunked/state_passing.cu
+  ops/linear_attention/gated_delta_net/chunked/output.cu
   ops/attn_input_proj/bf16/bf16_attn_input_decode.cu
   ops/attn_input_proj/bf16/bf16_attn_input_gemm_mma.cu
   ops/attn_input_proj/bf16/bf16_attn_input_small_t.cu
@@ -190,7 +192,6 @@ add_library(ninfer_ops STATIC
   ops/wrapper/cast.cpp
   ops/wrapper/causal_conv1d_silu.cpp
   ops/wrapper/embedding.cpp
-  ops/wrapper/gated_delta_rule.cpp
   ops/wrapper/gdn_gating.cpp
   ops/wrapper/gdn_gating_proj.cpp
   ops/wrapper/gdn_input_proj.cpp

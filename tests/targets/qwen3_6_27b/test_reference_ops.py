@@ -8,11 +8,11 @@ import torch.nn.functional as F
 
 from tools.reference.qwen3_6_27b.config import ATTN_SCALE, CFG, VISION_CFG
 from tools.reference.qwen3_6_27b.ops import (
-    _naive_gated_delta_rule,
+    _naive_gated_delta_net,
     apply_rope,
     attention,
     causal_conv1d,
-    gated_delta_rule,
+    gated_delta_net,
 )
 from tools.reference.qwen3_6_27b.state import KVCache
 from tools.reference.qwen3_6.common.vision_ops import vision_attention
@@ -83,8 +83,8 @@ def test_t1_gdn_matches_sequential_oracle() -> None:
         )
         * 0.01
     )
-    actual, actual_state = gated_delta_rule(q, k, v, g, beta, state)
-    expected, expected_state = _naive_gated_delta_rule(q, k, v, g, beta, state)
+    actual, actual_state = gated_delta_net(q, k, v, g, beta, state)
+    expected, expected_state = _naive_gated_delta_net(q, k, v, g, beta, state)
     assert torch.equal(actual, expected)
     assert torch.equal(actual_state, expected_state)
 

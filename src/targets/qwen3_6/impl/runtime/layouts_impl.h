@@ -4,7 +4,7 @@
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
 #include "core/device.h"
-#include "ninfer/ops/gated_delta_rule.h"
+#include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/linear_add.h"
@@ -177,7 +177,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         }
         (void)workspace_recipe::gdn_recurrent_output<TextConfig>(layout, last);
         if (!snapshot) {
-            scratch(layout, ops::gated_delta_rule_workspace_capacity_bytes(
+            scratch(layout, ops::gated_delta_net_workspace_capacity_bytes(
                                 TextConfig::gdn_value_head_dim, TextConfig::gdn_key_heads,
                                 TextConfig::gdn_value_heads, true, first, last));
         }

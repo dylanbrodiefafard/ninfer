@@ -1,7 +1,5 @@
-#pragma once
-
 #include "ops/common/mma.cuh"
-#include "ops/kernel/gdn_chunked_common.cuh"
+#include "ops/linear_attention/gated_delta_net/chunked/common.cuh"
 
 #include <cmath>
 #include <cstdio>
@@ -9,30 +7,19 @@
 
 // Stage 4: chunk_output. Builds attn_out per chunk via fused MM2 + MM3.
 //
-// Math + I/O layouts: see gdn chunked chunk_output_config.
+// Math + I/O layouts: see the Gated DeltaNet chunked chunk_output_config.
 // Block / smem total: 4 warps (128 t) with __launch_bounds__(128, 3);
 //                     ~48 KB smem at S=128 (q permanent + k_pass / h / v
 //                     alias + g).
 
-
-#include <cstdio>
-
-namespace ninfer::ops::detail::gdn_chunk_output {
+namespace ninfer::ops::detail::gated_delta_net::chunked {
 
 namespace {
 
-using gdn_chunked::BT;
-using gdn_chunked::MMA_M;
-using gdn_chunked::MMA_N;
-using gdn_chunked::MMA_K;
-using gdn_chunked::bh_decode_t;
-using gdn_chunked::zero_frag;
-using ninfer::ops::SmemTile;
 using ninfer::ops::mma_tf32;
 using ninfer::ops::exp2_approx;
-using ninfer::ops::RCP_LN2_F;
 
-static_assert(gdn_chunked::kChunkSize == 64,
+static_assert(kChunkSize == 64,
               "stage_chunk_output: kChunkSize must be 64 (kernel hard-codes BT=64)");
 
 constexpr int N_WARPS = 4;
@@ -81,18 +68,18 @@ struct kernel_dims {
 
 template <int S>
 __launch_bounds__(THREADS, 3) __global__
-    void chunk_output_gdn_kernel(const __nv_bfloat16* __restrict__ q_in,
-                                 const __nv_bfloat16* __restrict__ k_in,
-                                 const __nv_bfloat16* __restrict__ v_new_in,
-                                 const float* __restrict__ g_cumsum_in,
-                                 const __nv_bfloat16* __restrict__ h_chunk_in,
-                                 __nv_bfloat16* __restrict__ attn_out, int64_t T, int64_t H_v,
-                                 ninfer::ops::head_map qk_map,
-                                 // Token-axis strides (in floats) for
-                                 // q / k. Caller passes materialised
-                                 // values (launcher handles 0 ->
-                                 // packed default H_qk * S each).
-                                 int64_t q_stride_t, int64_t k_stride_t, int NT, float scale) {
+    void output_kernel(const __nv_bfloat16* __restrict__ q_in,
+                       const __nv_bfloat16* __restrict__ k_in,
+                       const __nv_bfloat16* __restrict__ v_new_in,
+                       const float* __restrict__ g_cumsum_in,
+                       const __nv_bfloat16* __restrict__ h_chunk_in,
+                       __nv_bfloat16* __restrict__ attn_out, int64_t T, int64_t H_v,
+                       head_map qk_map,
+                       // Token-axis strides (in floats) for
+                       // q / k. Caller passes materialised
+                       // values (launcher handles 0 ->
+                       // packed default H_qk * S each).
+                       int64_t q_stride_t, int64_t k_stride_t, int NT, float scale) {
     using D                         = kernel_dims<S>;
     constexpr int N_TILES_PER_CHUNK = D::N_TILES_PER_CHUNK;
     constexpr int N_CHUNKS          = D::N_CHUNKS;
@@ -115,7 +102,7 @@ __launch_bounds__(THREADS, 3) __global__
     SmemTile<D_CHUNK> v_part_view{shared_smem};
 
     const int tid    = threadIdx.x;
-    const auto lanes = ninfer::ops::mma_lane_t::decode(tid);
+    const auto lanes = mma_lane_t::decode(tid);
     const int warp   = lanes.warp;
     const int lane_g = lanes.lane_g;
     const int lane_t = lanes.lane_t;
@@ -127,7 +114,7 @@ __launch_bounds__(THREADS, 3) __global__
     const int b   = bh.b;
     const int h_v = bh.h_v;
 
-    const auto cb    = ninfer::ops::chunk_bounds_t::of(chunk, T, BT);
+    const auto cb    = chunk_bounds_t::of(chunk, T, BT);
     const int64_t cs = cb.cs;
     const int cl     = cb.cl;
 
@@ -142,10 +129,9 @@ __launch_bounds__(THREADS, 3) __global__
     const int64_t out_row_stride = v_row_stride;
 
     // === Phase A: bf16 q (full S) + k_pass[0] -> float smem; sync-load g_cumsum ===
-    ninfer::ops::issue_load_bf16_to_float_vec4<BT, S, THREADS>(q_view, q_in + q_base, q_stride_t,
-                                                               cl, tid);
-    ninfer::ops::issue_load_bf16_to_float_vec4<BT, K_PER_PASS, THREADS>(k_pass_view, k_in + k_base,
-                                                                        k_stride_t, cl, tid);
+    issue_load_bf16_to_float_vec4<BT, S, THREADS>(q_view, q_in + q_base, q_stride_t, cl, tid);
+    issue_load_bf16_to_float_vec4<BT, K_PER_PASS, THREADS>(k_pass_view, k_in + k_base, k_stride_t,
+                                                           cl, tid);
 
     if (tid < BT) {
         float val = 0.0f;
@@ -197,7 +183,7 @@ __launch_bounds__(THREADS, 3) __global__
         // Issue + wait next pass's k_pass into the same alias region.
         if (pass + 1 < K_TILE_PASSES) {
             __syncthreads();
-            ninfer::ops::issue_load_bf16_to_float_vec4<BT, K_PER_PASS, THREADS>(
+            issue_load_bf16_to_float_vec4<BT, K_PER_PASS, THREADS>(
                 k_pass_view, k_in + k_base + (int64_t)(pass + 1) * K_PER_PASS, k_stride_t, cl, tid);
             __syncthreads();
         }
@@ -279,7 +265,7 @@ __launch_bounds__(THREADS, 3) __global__
         // --- E.1: bf16 h_chunk[..., d_off:+D_CHUNK, :] -> float h_part[c] ---
         {
             const __nv_bfloat16* h_part_gmem = h_chunk_in + hc_base + (int64_t)d_chunk_off * S;
-            ninfer::ops::issue_load_bf16_to_float_vec4<D_CHUNK, S, THREADS>(
+            issue_load_bf16_to_float_vec4<D_CHUNK, S, THREADS>(
                 h_part_view, h_part_gmem, /*row_stride=*/(int64_t)S, /*cl=*/D_CHUNK, tid);
         }
         __syncthreads();
@@ -324,8 +310,8 @@ __launch_bounds__(THREADS, 3) __global__
         // --- E.4: bf16 v_new[..., d_off:+D_CHUNK] -> float v_part[c] ---
         {
             const __nv_bfloat16* v_part_gmem = v_new_in + vn_base + (int64_t)d_chunk_off;
-            ninfer::ops::issue_load_bf16_to_float_vec4<BT, D_CHUNK, THREADS>(
-                v_part_view, v_part_gmem, v_row_stride, cl, tid);
+            issue_load_bf16_to_float_vec4<BT, D_CHUNK, THREADS>(v_part_view, v_part_gmem,
+                                                                v_row_stride, cl, tid);
         }
         __syncthreads();
 
@@ -373,11 +359,11 @@ __launch_bounds__(THREADS, 3) __global__
 }
 
 template <int S>
-cudaError_t launch_typed(const gdn_chunked::chunk_output_config& cfg, dim3 grid,
-                         ninfer::ops::head_map qk_map, int NT, float scale) {
+cudaError_t launch_typed(const chunk_output_config& cfg, dim3 grid, head_map qk_map, int NT,
+                         float scale) {
     constexpr int smem_bytes = kernel_dims<S>::SMEM_FLOATS * (int)sizeof(float);
 
-    cudaError_t err = cudaFuncSetAttribute(chunk_output_gdn_kernel<S>,
+    cudaError_t err = cudaFuncSetAttribute(output_kernel<S>,
                                            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     if (err != cudaSuccess) return err;
 
@@ -388,7 +374,7 @@ cudaError_t launch_typed(const gdn_chunked::chunk_output_config& cfg, dim3 grid,
     const int64_t k_stride_t =
         (cfg.k_stride_t_floats != 0) ? cfg.k_stride_t_floats : (int64_t)cfg.H_qk * cfg.S;
 
-    chunk_output_gdn_kernel<S><<<grid, block, smem_bytes, cfg.stream>>>(
+    output_kernel<S><<<grid, block, smem_bytes, cfg.stream>>>(
         cfg.q, cfg.k, cfg.v_new, cfg.g_cumsum, cfg.h_chunk, cfg.attn_out, cfg.L, cfg.H_v, qk_map,
         q_stride_t, k_stride_t, NT, scale);
     return cudaGetLastError();
@@ -396,21 +382,21 @@ cudaError_t launch_typed(const gdn_chunked::chunk_output_config& cfg, dim3 grid,
 
 } // namespace
 
-cudaError_t launch_chunk_output(const gdn_chunked::chunk_output_config& cfg) {
-    gdn_chunked::stage_validator v{"launch_chunk_output", cfg.S, cfg.H_qk, cfg.H_v, cfg.L, cfg.B};
-    NINFER_GDN_PROPAGATE(v.check_shape());
-    NINFER_GDN_PROPAGATE(v.check_gdn_full_chunks());
+cudaError_t launch_output(const chunk_output_config& cfg) {
+    stage_validator v{"launch_output", cfg.S, cfg.H_qk, cfg.H_v, cfg.L, cfg.B};
+    NINFER_GATED_DELTA_NET_PROPAGATE(v.check_shape());
+    NINFER_GATED_DELTA_NET_PROPAGATE(v.check_full_chunks());
     if (cfg.q == nullptr || cfg.v_new == nullptr || cfg.g_cumsum == nullptr ||
         cfg.h_chunk == nullptr || cfg.attn_out == nullptr) {
         return cudaErrorInvalidValue;
     }
     if (cfg.k == nullptr) return cudaErrorInvalidValue;
 
-    const auto qk_map = ninfer::ops::head_map::of((int)cfg.H_qk, (int)cfg.H_v);
+    const auto qk_map = head_map::of((int)cfg.H_qk, (int)cfg.H_v);
     const int64_t NT  = div_up(cfg.L, static_cast<int64_t>(BT));
     const int64_t bh  = cfg.B * cfg.H_v;
     const float scale = cfg.scale;
-    NINFER_GDN_PROPAGATE(v.check_grid(NT, bh));
+    NINFER_GATED_DELTA_NET_PROPAGATE(v.check_grid(NT, bh));
 
     const dim3 grid((unsigned)NT, (unsigned)bh, 1);
 
@@ -428,4 +414,4 @@ cudaError_t launch_chunk_output(const gdn_chunked::chunk_output_config& cfg) {
     }
 }
 
-} // namespace ninfer::ops::detail::gdn_chunk_output
+} // namespace ninfer::ops::detail::gated_delta_net::chunked

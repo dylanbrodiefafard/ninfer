@@ -42,7 +42,7 @@ runtime configuration of this one.
 | tokenizer-addressable tokens | 248077 |
 | full-attention interval | 4 |
 | full-attention layers | 10 |
-| Gated-DeltaNet layers | 30 |
+| Gated DeltaNet layers | 30 |
 | routed experts per layer | 256 |
 | selected routed experts per token | 8 |
 | shared experts per layer | 1 |
@@ -86,7 +86,7 @@ first 4096 rows from the last 4096 rows is wrong. Q and K use zero-centered RMSN
 interleaved MRoPE. The causal-attention result is multiplied elementwise by `sigmoid(output_gate)`
 before the output projection.
 
-### 2.3 Gated-DeltaNet
+### 2.3 Gated DeltaNet
 
 | Field | Value |
 |---|---:|
@@ -276,7 +276,7 @@ all three position rows are equal and the result is exactly ordinary one-dimensi
 The gate half of `q_proj` is neither normalized nor rotated. It bypasses attention and is applied
 only after the per-head value aggregation, immediately before `o_proj`.
 
-## 5. Gated-DeltaNet layer
+## 5. Gated DeltaNet layer
 
 The normalized input first produces logical Q/K/V, the output gate Z, and per-V-head controls:
 

@@ -157,7 +157,7 @@ set(ninfer_op_tests
   rmsnorm
   gated_rmsnorm
   l2norm
-  gated_delta_rule
+  gated_delta_net
   causal_conv1d_silu
   layer_norm
   embedding

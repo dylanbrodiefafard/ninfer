@@ -1,4 +1,4 @@
-#include "ninfer/ops/gated_delta_rule.h"
+#include "ninfer/ops/gated_delta_net.h"
 
 #include "ops/gdn_ref.h"
 #include "ops/op_tester.h"
@@ -23,12 +23,12 @@ namespace {
 constexpr int kHeadDim = 128;
 constexpr int kQkHeads = 16;
 
-constexpr ReductionCriterion gated_delta_rule_output_bf16_criterion() {
+constexpr ReductionCriterion gated_delta_net_output_bf16_criterion() {
     return {/*relative_l2=*/4.1e-3, /*gross_absolute=*/5.0e-6,
             /*gross_relative_to_max_reference=*/4.7e-3};
 }
 
-constexpr ReductionCriterion gated_delta_rule_state_fp32_criterion() {
+constexpr ReductionCriterion gated_delta_net_state_fp32_criterion() {
     return {/*relative_l2=*/2.7e-3, /*gross_absolute=*/1.0e-5,
             /*gross_relative_to_max_reference=*/3.0e-3};
 }
@@ -177,21 +177,21 @@ int inplace_case(const Case& test_case, std::uint32_t seed) {
     Tensor beta(device.beta.p, DType::FP32, {test_case.value_heads, test_case.tokens});
     Tensor state_tensor(state.data(), DType::FP32, {kHeadDim, kHeadDim, test_case.value_heads});
     Tensor out_tensor(out.data(), DType::BF16, {kHeadDim, test_case.value_heads, test_case.tokens});
-    const std::size_t workspace_bytes = ops::gated_delta_rule_workspace_capacity_bytes(
+    const std::size_t workspace_bytes = ops::gated_delta_net_workspace_capacity_bytes(
         kHeadDim, kQkHeads, test_case.value_heads, test_case.normalize_qk, test_case.tokens,
         test_case.tokens);
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
 
-    ops::gated_delta_rule(q, k, v, g, beta, scale, test_case.normalize_qk, workspace, state_tensor,
-                          out_tensor, nullptr);
+    ops::gated_delta_net(q, k, v, g, beta, scale, test_case.normalize_qk, workspace, state_tensor,
+                         out_tensor, nullptr);
     cuda_synchronize();
 
     const std::string label = std::string(test_case.name) + " inplace";
     int failures            = 0;
     failures += verify_recurrence(label + " out", from_device_bf16(out.data(), in.v.size()),
-                                  ref.out, gated_delta_rule_output_bf16_criterion());
+                                  ref.out, gated_delta_net_output_bf16_criterion());
     failures += verify_recurrence(label + " state", read_f32(state.data(), in.state.size()),
-                                  ref.final_state, gated_delta_rule_state_fp32_criterion());
+                                  ref.final_state, gated_delta_net_state_fp32_criterion());
     failures += state.verify_guards((label + " state").c_str());
     failures += out.verify_guards((label + " out").c_str());
     failures += verify_common_inputs_unchanged(label, in, device.q, device.k, device.v, device.g,
@@ -226,21 +226,21 @@ int distinct_state_case(const Case& test_case, std::uint32_t seed) {
     Tensor state_out_tensor(state_out.data(), DType::FP32,
                             {kHeadDim, kHeadDim, test_case.value_heads});
     Tensor out_tensor(out.data(), DType::BF16, {kHeadDim, test_case.value_heads, test_case.tokens});
-    const std::size_t workspace_bytes = ops::gated_delta_rule_workspace_capacity_bytes(
+    const std::size_t workspace_bytes = ops::gated_delta_net_workspace_capacity_bytes(
         kHeadDim, kQkHeads, test_case.value_heads, test_case.normalize_qk, test_case.tokens,
         test_case.tokens);
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
 
-    ops::gated_delta_rule(q, k, v, g, beta, scale, test_case.normalize_qk, workspace,
-                          state_in_tensor, state_out_tensor, out_tensor, nullptr);
+    ops::gated_delta_net(q, k, v, g, beta, scale, test_case.normalize_qk, workspace,
+                         state_in_tensor, state_out_tensor, out_tensor, nullptr);
     cuda_synchronize();
 
     const std::string label = std::string(test_case.name) + " distinct-state";
     int failures            = 0;
     failures += verify_recurrence(label + " out", from_device_bf16(out.data(), in.v.size()),
-                                  ref.out, gated_delta_rule_output_bf16_criterion());
+                                  ref.out, gated_delta_net_output_bf16_criterion());
     failures += verify_recurrence(label + " state", read_f32(state_out.data(), in.state.size()),
-                                  ref.final_state, gated_delta_rule_state_fp32_criterion());
+                                  ref.final_state, gated_delta_net_state_fp32_criterion());
     failures += verify_exact(label + " state-in unchanged",
                              from_device<float>(state_in.data(), in.state.size()), in.state);
     failures += state_in.verify_guards((label + " state-in").c_str());
@@ -281,8 +281,8 @@ int snapshot_case(const Case& test_case, int slots, int initial_slot, std::uint3
                          {kHeadDim, kHeadDim, test_case.value_heads, slots});
     Tensor initial_slot_tensor(device_initial_slot.p, DType::I32, {1});
     Tensor out_tensor(out.data(), DType::BF16, {kHeadDim, test_case.value_heads, test_case.tokens});
-    ops::gated_delta_rule_snapshot(q, k, v, g, beta, scale, test_case.normalize_qk, states_tensor,
-                                   initial_slot_tensor, out_tensor, nullptr);
+    ops::gated_delta_net_snapshot(q, k, v, g, beta, scale, test_case.normalize_qk, states_tensor,
+                                  initial_slot_tensor, out_tensor, nullptr);
     cuda_synchronize();
 
     const std::string label             = std::string(test_case.name) + " snapshot";
@@ -291,10 +291,10 @@ int snapshot_case(const Case& test_case, int slots, int initial_slot, std::uint3
         got_states.begin() + static_cast<std::size_t>(test_case.tokens) * state_size;
     int failures = 0;
     failures += verify_recurrence(label + " out", from_device_bf16(out.data(), in.v.size()),
-                                  ref.out, gated_delta_rule_output_bf16_criterion());
+                                  ref.out, gated_delta_net_output_bf16_criterion());
     failures += verify_recurrence(label + " updated state slots",
                                   doubles(std::vector<float>(got_states.begin(), got_updated_end)),
-                                  ref.snapshots, gated_delta_rule_state_fp32_criterion());
+                                  ref.snapshots, gated_delta_net_state_fp32_criterion());
     const auto unchanged_begin =
         initial_states.begin() + static_cast<std::size_t>(test_case.tokens) * state_size;
     const auto got_unchanged_begin =
@@ -323,18 +323,18 @@ int main() {
     int failures = 0;
 
     for (const bool normalize_qk : {false, true}) {
-        const std::size_t interval = ops::gated_delta_rule_workspace_capacity_bytes(
+        const std::size_t interval = ops::gated_delta_net_workspace_capacity_bytes(
             kHeadDim, kQkHeads, 48, normalize_qk, 63, 65);
-        const std::size_t witness = ops::gated_delta_rule_workspace_capacity_bytes(
+        const std::size_t witness = ops::gated_delta_net_workspace_capacity_bytes(
             kHeadDim, kQkHeads, 48, normalize_qk, 65, 65);
         if (interval != witness) {
-            std::cerr << "gated_delta_rule interval capacity missed the chunk boundary\n";
+            std::cerr << "gated_delta_net interval capacity missed the chunk boundary\n";
             ++failures;
         }
     }
     try {
-        (void)ops::gated_delta_rule_workspace_capacity_bytes(kHeadDim, kQkHeads, 48, true, 0, 65);
-        std::cerr << "gated_delta_rule accepted an invalid token interval\n";
+        (void)ops::gated_delta_net_workspace_capacity_bytes(kHeadDim, kQkHeads, 48, true, 0, 65);
+        std::cerr << "gated_delta_net accepted an invalid token interval\n";
         ++failures;
     } catch (const std::invalid_argument&) {}
 
@@ -353,6 +353,6 @@ int main() {
     failures +=
         snapshot_case({"35b verify fused-qk-norm near-zero", 32, 4, true, true}, 8, 6, 12204u);
 
-    std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_rule correctness\n";
+    std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net correctness\n";
     return failures == 0 ? 0 : 1;
 }

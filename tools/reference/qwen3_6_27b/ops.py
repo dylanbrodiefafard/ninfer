@@ -144,7 +144,7 @@ def gdn_gating(
     return -torch.exp(a_log.float()) * softplus, torch.sigmoid(b.float())
 
 
-def gated_delta_rule(
+def gated_delta_net(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -171,7 +171,9 @@ def gated_delta_rule(
         out = torch.einsum("bhkv,hk->bhv", next_state, qt) * GDN_SCALE
         return bf16(out.squeeze(0).unsqueeze(0)), next_state
     try:
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+        from fla.ops.gated_delta_rule import (
+            chunk_gated_delta_rule as fla_chunk_gated_delta_net,
+        )
     except ImportError as exc:
         raise RuntimeError(
             "Qwen3.6-27B reference requires flash-linear-attention>=0.5.1 "
@@ -181,7 +183,7 @@ def gated_delta_rule(
     # model tensors are contiguous slices with a non-zero storage offset; a
     # plain .contiguous() is allowed to return the same view and is insufficient.
     q, k, v, g, beta = (tensor.clone() for tensor in (q, k, v, g, beta))
-    out, final = chunk_gated_delta_rule(
+    out, final = fla_chunk_gated_delta_net(
         q.unsqueeze(0),
         k.unsqueeze(0),
         v.unsqueeze(0),
@@ -194,7 +196,7 @@ def gated_delta_rule(
     return bf16(out.squeeze(0)), final.float()
 
 
-def _naive_gated_delta_rule(
+def _naive_gated_delta_net(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,

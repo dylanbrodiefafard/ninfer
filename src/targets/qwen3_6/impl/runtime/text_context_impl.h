@@ -10,7 +10,7 @@
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "ninfer/ops/embedding.h"
-#include "ninfer/ops/gated_delta_rule.h"
+#include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/gated_rmsnorm.h"
 #include "ninfer/ops/gdn_gating.h"
 #include "ninfer/ops/gdn_gating_proj.h"
@@ -742,16 +742,16 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     if (ph == Phase::Verify) {
         Tensor& ssm_states = state_.ssm.at(static_cast<std::size_t>(gidx));
-        ops::gated_delta_rule_snapshot(q_recurrent, k_recurrent, vv, g, beta, kGdnScale,
-                                       /*normalize_qk=*/true, ssm_states, io_.gdn_initial_slot, o,
-                                       s);
+        ops::gated_delta_net_snapshot(q_recurrent, k_recurrent, vv, g, beta, kGdnScale,
+                                      /*normalize_qk=*/true, ssm_states, io_.gdn_initial_slot, o,
+                                      s);
     } else {
         // Prefill reads the committed recurrent state from gdn_prefill_read_slot_ and writes the
         // running state to slot 0 (in-place when the read slot is 0).
         Tensor ssm_in  = state_.ssm_slot(static_cast<std::uint32_t>(gidx), gdn_prefill_read_slot_);
         Tensor ssm_out = state_.ssm_slot(static_cast<std::uint32_t>(gidx), 0);
-        ops::gated_delta_rule(q_recurrent, k_recurrent, vv, g, beta, kGdnScale,
-                              /*normalize_qk=*/true, work_, ssm_in, ssm_out, o, s);
+        ops::gated_delta_net(q_recurrent, k_recurrent, vv, g, beta, kGdnScale,
+                             /*normalize_qk=*/true, work_, ssm_in, ssm_out, o, s);
     }
 
     Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(

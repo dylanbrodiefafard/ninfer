@@ -31,7 +31,7 @@ layout, or Vision tower is a different model implementation rather than a runtim
 | tokenizer-addressable token IDs | 248077 (`0..248076`) |
 | full-attention interval | 4 |
 | full-attention layers | 16 |
-| Gated-DeltaNet layers | 48 |
+| Gated DeltaNet layers | 48 |
 | RMSNorm epsilon | `1e-6` |
 | RoPE theta | `1e7` |
 | checkpoint position capacity | 262144 |
@@ -57,7 +57,7 @@ Each query projection also produces a 256-dimensional per-head output gate. Q an
 zero-centered `(1+w)` RMSNorm before partial NeoX RoPE. The attention result is multiplied by
 `sigmoid(gate)` before the output projection.
 
-### 2.3 Gated-DeltaNet
+### 2.3 Gated DeltaNet
 
 | Field | Value |
 |---|---:|
@@ -163,7 +163,7 @@ Gate/V through a split epilogue, so a full-attention layer issues exactly two in
 kernels. The `T>=17` route likewise evaluates the two homogeneous parents with grouped MMA
 launches. This is an implementation profile; Q, Gate, K, and V remain the four logical Op outputs.
 
-## 5. Gated-DeltaNet layer
+## 5. Gated DeltaNet layer
 
 The normalized input produces Q, K, V, Z, and per-V-head A/B controls:
 

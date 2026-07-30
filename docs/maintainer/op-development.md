@@ -291,35 +291,44 @@ Helpers covered by the same contract, such as workspace sizing queries, do not r
 
 ## 5. Source organization
 
-The normal responsibility chain is:
+Every Op follows the same responsibility chain:
 
 ```text
 include/ninfer/ops/<family>.h      semantic contract
                 |
                 v
-src/ops/wrapper/<family>.cpp      validation, workspace scope, finite dispatch
+wrapper responsibility             validation, workspace scope, finite dispatch
                 |
                 v
-src/ops/launcher/<family>.*       private CUDA launch policy
+launcher responsibility            private CUDA launch policy
                 |
                 v
-src/ops/kernel/<family>*.cuh      device implementation
+kernel responsibility              device implementation
 ```
 
-Shared implementation facilities live in:
+The default horizontal layout places those private responsibilities under
+`src/ops/{wrapper,launcher,kernel}`. A semantically closed family with several implementation
+routes or stages may instead own a vertical `src/ops/<category>/<family>/` subtree. The vertical
+layout changes physical ownership, not the contract boundary or dependency direction: its
+family-root `.cpp` is the wrapper, its private launch header and host launch definitions are the
+launcher, and its `.cu` files own the kernels.
+
+Shared and category-owned implementation facilities include:
 
 ```text
 src/ops/common/                   narrow CUDA primitives
 src/ops/linear/                   linear codec, plan, reference, GEMV, and GEMM paths
+src/ops/linear_attention/         vertically owned Linear Attention families
 ```
 
-This is a responsibility model, not a requirement for four files per Op. Related Ops may share a
-launcher, a wrapper may implement a fallback by composing other Ops, and a small operation does not
-need empty source layers.
+This is a responsibility model, not a requirement for four files per Op or permission to split one
+semantic transformation into stage Ops. Related Ops may share a launcher, a wrapper may implement
+a fallback by composing other Ops, and a small operation does not need empty source layers.
 
 ### 5.1 Wrapper
 
-`src/ops/wrapper/` owns:
+The wrapper layer—normally `src/ops/wrapper/<family>.cpp`, or the family-root `.cpp` in a vertical
+subtree—owns:
 
 1. semantic dtype, rank, shape, layout, and alignment validation;
 2. scalar, configuration, and explicit state validation;
@@ -334,13 +343,15 @@ capture graphs, or choose model call order.
 
 ### 5.2 Launcher
 
-`src/ops/launcher/` owns private launch declarations, grid/block/shared-memory policy, template
-instantiation, and launch-error handling. Launcher headers are implementation-private. Contract
-headers, targets, and product code never include them.
+The launcher layer—normally under `src/ops/launcher/`, or family-private in a vertical
+subtree—owns private launch declarations, grid/block/shared-memory policy, template instantiation,
+and launch-error handling. Launcher headers are implementation-private. Contract headers, targets,
+and product code never include them.
 
 ### 5.3 Kernel
 
-`src/ops/kernel/` owns `__global__` functions and Op-local reusable `__device__` computation. A
+The kernel layer—normally under `src/ops/kernel/`, or in family-owned `.cu`/`.cuh` files in a
+vertical subtree—owns `__global__` functions and Op-local reusable `__device__` computation. A
 kernel may encode exact shape, tensor format, SM capability, tiling, padding, and alignment
 assumptions. Every assumption must correspond to a wrapper/launcher predicate and must not be
 inferred from model identity.
@@ -384,7 +395,46 @@ body with an Op-local compile-time output/epilogue policy. The owning Op still d
 dispatches its output mapping and observable fusion boundary; it does not call public `linear`,
 expose a packed temporary, or copy the computation body into its own subtree.
 
-### 5.6 Implementation comments
+### 5.6 Linear Attention
+
+`src/ops/linear_attention/` is the algorithm category for stateful or otherwise non-softmax
+attention transformations. It is distinct from `src/ops/linear/`, which owns matrix Linear formats
+and execution paths. Each admitted Linear Attention algorithm owns a peer vertical family subtree;
+private recurrent, chunked, or other execution routes remain implementations of that family rather
+than becoming separate Ops.
+
+The current Gated DeltaNet core is organized as:
+
+```text
+include/ninfer/ops/gated_delta_net.h
+
+src/ops/linear_attention/gated_delta_net/
+├── gated_delta_net.cpp
+├── common.h
+├── common.cuh
+├── launch.h
+├── recurrent.cu
+└── chunked/
+    ├── common.cuh
+    ├── launch.cu
+    ├── prepare_wy_wu.cu
+    ├── state_passing.cu
+    └── output.cu
+```
+
+This family owns the complete Gated DeltaNet state recurrence and output transformation, including
+the recurrent and chunked formulations, snapshot execution, full-chunk plus recurrent-tail
+composition, and Op-local workspace and Q/K normalization policy. It does not own the surrounding
+model-layer projections, control transforms, convolution, or norm Ops. Consequently,
+`gdn_input_proj`, `gdn_gating`, `gdn_gating_proj`, `causal_conv1d_silu`, and `gated_rmsnorm` remain
+under their independent Op ownership.
+
+Formal paths, contract entries, tests, and core benchmarks spell the algorithm
+`gated_delta_net` (Gated DeltaNet). The abbreviation `gdn` is reserved for places where it is
+materially useful, such as established compound model-layer names and state/layout identifiers; it
+is not a second algorithm name.
+
+### 5.7 Implementation comments
 
 Launcher and kernel files reference the semantic contract instead of copying it. Record the match
 predicate and implementation assumptions in a compact form:
@@ -654,9 +704,12 @@ Use this sequence for a proposed device transformation:
    ranges, state forms, and devices actually implemented. Keep every positive Text/MTP T admitted;
    list its measured counts only as correctness/performance evidence or private route thresholds.
    Preserve genuine finite domains such as Vision geometry, cache capacity, or proposal count.
-5. **Place implementation code.** Put validation/dispatch in `wrapper`, launch policy in `launcher`,
-   device code in `kernel`, and only genuinely narrow reusable primitives in `common`. Use the
-   dedicated linear subtree for linear format/plan/GEMV/GEMM work.
+5. **Place implementation code.** Keep validation/dispatch in the wrapper responsibility, launch
+   policy in the launcher responsibility, device code in the kernel responsibility, and only
+   genuinely narrow reusable primitives in `common`. Use the horizontal directories by default or
+   one vertically owned category/family subtree for a semantically closed family with several
+   routes or stages. Use `linear/` for matrix Linear format/plan/GEMV/GEMM work and
+   `linear_attention/` for admitted Linear Attention families.
 6. **Make resource ownership explicit.** The caller supplies outputs, state views, workspace, and
    stream. Keep persistent state and schedule policy outside the Op.
 7. **Add necessary evidence.** Add or update the smallest independent Op qualification suite that

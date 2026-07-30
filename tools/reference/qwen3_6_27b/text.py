@@ -10,7 +10,7 @@ from .config import CFG
 from .ops import (
     apply_rope,
     causal_conv1d,
-    gated_delta_rule,
+    gated_delta_net,
     gdn_gating,
     l2norm,
     linear,
@@ -77,7 +77,7 @@ def gdn_mixer(model, layer, x, tap, context) -> torch.Tensor:
         )
     )
     value = qkv[:, 2 * CFG.key_dim:].reshape(-1, CFG.gdn_v_heads, CFG.gdn_v_dim)
-    out, state.ssm[index] = gated_delta_rule(q, k, value, g, beta, state.ssm[index])
+    out, state.ssm[index] = gated_delta_net(q, k, value, g, beta, state.ssm[index])
     z = linear(h, model.weight(gdn_weights.z)).reshape(
         -1, CFG.gdn_v_heads, CFG.gdn_v_dim
     )

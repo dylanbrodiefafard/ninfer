@@ -1,21 +1,21 @@
-// Performance bench for the native gated_delta_rule geometry. Defaults are the Qwen3.6-27B shape;
+// Performance bench for the native Gated DeltaNet geometry. Defaults are the Qwen3.6-27B shape;
 // pass --H_v 32 for Qwen3.6-35B-A3B.
 //
 // Default keeps the original decode behavior:
-//   ./ninfer_gated_delta_rule_bench
-//   ./ninfer_gated_delta_rule_bench --decode --kernel-only
+//   ./ninfer_gated_delta_net_bench
+//   ./ninfer_gated_delta_net_bench --decode --kernel-only
 //
 // Chunked prefill is explicit:
-//   ./ninfer_gated_delta_rule_bench --prefill
-//   ./ninfer_gated_delta_rule_bench --prefill --kernel-only
-//   ./ninfer_gated_delta_rule_bench --prefill --sweep --csv
+//   ./ninfer_gated_delta_net_bench --prefill
+//   ./ninfer_gated_delta_net_bench --prefill --kernel-only
+//   ./ninfer_gated_delta_net_bench --prefill --sweep --csv
 //
 // The public-wrapper chunked row includes WorkspaceArena scratch. The
 // kernel-only row times the detail chunked launcher with preallocated
 // workspace, matching ~/chunked_gdn/bench_chunked's allocation policy.
-#include "ninfer/ops/gated_delta_rule.h"
+#include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/l2norm.h"
-#include "ops/launcher/gated_delta_rule.h"
+#include "ops/linear_attention/gated_delta_net/launch.h"
 #include "ninfer_bench_common.h"
 
 #include <cuda_runtime.h>
@@ -166,9 +166,9 @@ Options parse_options(int argc, char** argv) {
     }
     const bool supported_head_dim = opt.S == 16 || opt.S == 32 || opt.S == 64 || opt.S == 128;
     if (!supported_head_dim || opt.H_v < opt.H_qk || (opt.H_v % opt.H_qk) != 0) {
-        fail("gated_delta_rule requires S in {16,32,64,128} and divisible H_v >= H_qk");
+        fail("gated_delta_net requires S in {16,32,64,128} and divisible H_v >= H_qk");
     }
-    if (opt.B != kB) { fail("gated_delta_rule NInfer bench supports the product batch B=1"); }
+    if (opt.B != kB) { fail("gated_delta_net NInfer bench supports the product batch B=1"); }
     if (opt.kernel_only && opt.prefill && (opt.L % kChunkSize) != 0 && !opt.sweep) {
         fail("--prefill --kernel-only requires L to be a multiple of 64");
     }
@@ -210,8 +210,8 @@ void print_help(const char* prog) {
 float scale_for(const Options& opt) { return 1.0f / std::sqrt(static_cast<float>(opt.S)); }
 
 std::size_t wrapper_workspace_bytes(const Options& opt, int T, bool normalize_qk = false) {
-    const std::size_t required = ops::gated_delta_rule_workspace_capacity_bytes(
-        opt.S, opt.H_qk, opt.H_v, normalize_qk, T, T);
+    const std::size_t required =
+        ops::gated_delta_net_workspace_capacity_bytes(opt.S, opt.H_qk, opt.H_v, normalize_qk, T, T);
     return std::max<std::size_t>(required, 256);
 }
 
@@ -383,8 +383,8 @@ BenchRow run_small_t_snapshot(const Options& opt, int T) {
     const bool fused = opt.qk_norm == "fused";
 
     BenchRow row{"small-t",
-                 fused ? "gated_delta_rule_snapshot.bf16.recurrent.qk_fused.w4"
-                       : "l2norm_x2+gated_delta_rule_snapshot.bf16.recurrent.qk_pre_normalized.w4",
+                 fused ? "gated_delta_net_snapshot.bf16.recurrent.qk_fused.w4"
+                       : "l2norm_x2+gated_delta_net_snapshot.bf16.recurrent.qk_pre_normalized.w4",
                  T,
                  0,
                  {}};
@@ -398,8 +398,8 @@ BenchRow run_small_t_snapshot(const Options& opt, int T) {
                 q_recurrent = &tq_norm;
                 k_recurrent = &tk_norm;
             }
-            ops::gated_delta_rule_snapshot(*q_recurrent, *k_recurrent, tv, tg, tbeta,
-                                           scale_for(opt), fused, tstates, tinitial, tout, s);
+            ops::gated_delta_net_snapshot(*q_recurrent, *k_recurrent, tv, tg, tbeta, scale_for(opt),
+                                          fused, tstates, tinitial, tout, s);
         },
         estimate_snapshot_user_bytes(opt, T), opt.warmup, opt.repeat);
     return row;
@@ -432,8 +432,7 @@ BenchRow run_decode_public(const Options& opt) {
     BenchRow row{"decode", "public-wrapper", T, 0, {}};
     row.result = bench_loop(
         [&](cudaStream_t s) {
-            ops::gated_delta_rule(tq, tk, tv, tg, tbeta, scale_for(opt), false, ws, tstate, tout,
-                                  s);
+            ops::gated_delta_net(tq, tk, tv, tg, tbeta, scale_for(opt), false, ws, tstate, tout, s);
         },
         estimate_user_bytes(opt, T, sizeof(std::uint16_t)), opt.warmup, opt.repeat,
         opt.min_time_ms);
@@ -467,8 +466,8 @@ BenchRow run_decode_kernel_only(const Options& opt) {
     BenchRow row{"decode", "kernel-only-fp32", T, 0, {}};
     row.result = bench_loop(
         [&](cudaStream_t s) {
-            ops::detail::gated_delta_rule_recurrent_launch(tq, tk, tv, tg, tbeta, scale_for(opt),
-                                                           tstate, tout, s);
+            ops::detail::gated_delta_net::launch_recurrent_fp32(tq, tk, tv, tg, tbeta,
+                                                                scale_for(opt), tstate, tout, s);
         },
         estimate_user_bytes(opt, T, sizeof(float)), opt.warmup, opt.repeat, opt.min_time_ms);
     return row;
@@ -502,8 +501,7 @@ BenchRow run_prefill_public(const Options& opt, int T) {
     BenchRow row{"prefill", "public-wrapper", T, ws_bytes, {}};
     row.result = bench_loop(
         [&](cudaStream_t s) {
-            ops::gated_delta_rule(tq, tk, tv, tg, tbeta, scale_for(opt), false, ws, tstate, tout,
-                                  s);
+            ops::gated_delta_net(tq, tk, tv, tg, tbeta, scale_for(opt), false, ws, tstate, tout, s);
         },
         estimate_user_bytes(opt, T, sizeof(std::uint16_t)), opt.warmup, opt.repeat,
         opt.min_time_ms);
@@ -518,7 +516,7 @@ BenchRow run_prefill_kernel_only(const Options& opt, int T) {
     const std::size_t gb_n    = static_cast<std::size_t>(opt.H_v) * T;
     const std::size_t state_n = static_cast<std::size_t>(opt.S) * opt.S * opt.H_v;
     const std::size_t ws_bytes =
-        ops::detail::gdn_chunked_workspace_bytes(opt.S, opt.H_qk, opt.H_v, T);
+        ops::detail::gated_delta_net::chunked_workspace_bytes(opt.S, opt.H_qk, opt.H_v, T);
 
     DeviceBuffer q = make_bf16_from_f32(
         make_normalized_qk(static_cast<std::size_t>(opt.H_qk) * T, opt.S, 0x12345678u));
@@ -542,7 +540,7 @@ BenchRow run_prefill_kernel_only(const Options& opt, int T) {
     BenchRow row{"prefill", "kernel-only-bf16", T, ws_bytes, {}};
     row.result = bench_loop(
         [&](cudaStream_t s) {
-            ops::detail::gated_delta_rule_chunked_launch(tq, tk, tv, tg, tbeta, scale_for(opt),
+            ops::detail::gated_delta_net::launch_chunked(tq, tk, tv, tg, tbeta, scale_for(opt),
                                                          tstate, tstate, tout, workspace.p,
                                                          workspace.bytes, s);
         },
@@ -566,8 +564,8 @@ void print_row(const BenchRow& row, const Options& opt) {
     }
 
     char tag[128];
-    std::snprintf(tag, sizeof(tag), "gdn %s %s [S%d,Hqk%d,Hv%d,L%d,ws=%.1fMiB]", row.mode, row.path,
-                  opt.S, opt.H_qk, opt.H_v, row.L,
+    std::snprintf(tag, sizeof(tag), "gated_delta_net %s %s [S%d,Hqk%d,Hv%d,L%d,ws=%.1fMiB]",
+                  row.mode, row.path, opt.S, opt.H_qk, opt.H_v, row.L,
                   static_cast<double>(row.workspace_bytes) / (1024.0 * 1024.0));
     print_result(tag, row.result);
 }

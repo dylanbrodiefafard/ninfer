@@ -1,8 +1,9 @@
 #pragma once
 
-// GDN-specific head mapping and shared-memory layouts. Generic CUDA primitives
+// Gated DeltaNet head mapping and shared-memory layouts. Generic CUDA primitives
 // live under ops/common and are included only where this header uses them.
 
+#include "ops/linear_attention/gated_delta_net/common.h"
 #include "ops/common/math.h"
 
 #include <cuda_runtime.h>
@@ -21,11 +22,13 @@
 #    define NINFER_KERNELS_HOST_DEVICE
 #endif
 
-namespace ninfer::ops {
+namespace ninfer::ops::detail::gated_delta_net {
 
 inline uint3 init_fastdiv_values(std::uint64_t d64) {
     if (d64 == 0 || d64 > static_cast<std::uint64_t>(0xffffffffu)) {
-        std::fprintf(stderr, "ninfer::ops::init_fastdiv_values: invalid divisor %llu\n",
+        std::fprintf(stderr,
+                     "ninfer::ops::detail::gated_delta_net::init_fastdiv_values: "
+                     "invalid divisor %llu\n",
                      static_cast<unsigned long long>(d64));
         std::abort();
     }
@@ -37,14 +40,6 @@ inline uint3 init_fastdiv_values(std::uint64_t d64) {
         ((static_cast<std::uint64_t>(1) << 32) * ((static_cast<std::uint64_t>(1) << L) - d)) / d +
         1);
     return make_uint3(mp, L, d);
-}
-
-inline bool is_supported_gdn_head_dim(std::int64_t S) {
-    return S == 16 || S == 32 || S == 64 || S == 128;
-}
-
-inline bool are_gdn_head_counts_valid(std::int64_t H_qk, std::int64_t H_v) {
-    return H_qk > 0 && H_v >= H_qk && (H_v % H_qk) == 0;
 }
 
 #ifdef __CUDACC__
@@ -188,6 +183,6 @@ struct head_map {
     NINFER_KERNELS_HOST_DEVICE int cta_h_v(int cta_h) const { return cta_h; }
 };
 
-} // namespace ninfer::ops
+} // namespace ninfer::ops::detail::gated_delta_net
 
 #undef NINFER_KERNELS_HOST_DEVICE

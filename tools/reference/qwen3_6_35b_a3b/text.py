@@ -11,7 +11,7 @@ from .moe import forward as sparse_moe
 from .ops import (
     apply_rope,
     causal_conv1d,
-    gated_delta_rule,
+    gated_delta_net,
     gdn_gating,
     l2norm,
     linear,
@@ -131,7 +131,7 @@ def gdn_mixer(model, layer, x, tap, context, *, small_t) -> torch.Tensor:
         CFG.gdn_v_heads,
         CFG.gdn_v_dim,
     )
-    output, state.ssm[index] = gated_delta_rule(
+    output, state.ssm[index] = gated_delta_net(
         q,
         k,
         value,

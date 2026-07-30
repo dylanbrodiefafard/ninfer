@@ -1,7 +1,5 @@
-#pragma once
-
 #include "ops/common/mma.cuh"
-#include "ops/kernel/gdn_chunked_common.cuh"
+#include "ops/linear_attention/gated_delta_net/chunked/common.cuh"
 
 #include <cmath>
 #include <cstdio>
@@ -9,33 +7,22 @@
 
 // Stage 3: chunk-sequential state passing.
 //
-// Math + I/O layouts: see gdn chunked state_passing_config.
+// Math + I/O layouts: see the Gated DeltaNet chunked state_passing_config.
 // Block / smem total: 8 warps (256 t) at S=128 with __launch_bounds__(256, 2);
 //                     ~33 KB smem (W_half + UVD alias + k_half + snap + g).
 
-
-#include <cstdio>
-
-namespace ninfer::ops::detail::gdn_state_passing {
+namespace ninfer::ops::detail::gated_delta_net::chunked {
 
 namespace {
 
-using gdn_chunked::BT;
-using gdn_chunked::MMA_M;
-using gdn_chunked::MMA_N;
-using gdn_chunked::MMA_K;
-using gdn_chunked::bh_decode_t;
-using gdn_chunked::zero_frag;
-using ninfer::ops::SmemTile;
 using ninfer::ops::mma_tf32;
 using ninfer::ops::mma_tf32_bits;
 using ninfer::ops::ldmatrix_x4;
 using ninfer::ops::ldmatrix_x2;
 using ninfer::ops::smem_addr;
 using ninfer::ops::exp2_approx;
-using ninfer::ops::RCP_LN2_F;
 
-static_assert(gdn_chunked::kChunkSize == 64, "stage_state_passing: kChunkSize must be 64");
+static_assert(kChunkSize == 64, "stage_state_passing: kChunkSize must be 64");
 
 // ---------------------------------------------------------------------------
 // Per-S kernel dimensions for the d-strip + BT-split design.
@@ -161,7 +148,7 @@ struct smem_layout {
 // ---------------------------------------------------------------------------
 // SnapView<STRIDE>: custom swizzle for snap_smem (transposed h[d][k] layout).
 // Different from SmemTile<32>'s default swizzle to keep the 4-d-row scatter
-// conflict-free. Do NOT merge with ninfer::ops::SmemTile.
+// conflict-free. Do NOT merge with the family-wide SmemTile.
 //
 // STRIDE=64 case (S=128 wide-block design): with row*64/4=row*16 mod 32, even
 // rows start at bank 0, odd rows at bank 16. For the 4-d-row scatter (d takes
@@ -205,17 +192,17 @@ struct SnapView {
 // dropping min_blocks costs nothing.
 template <int S>
 __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
-    void state_passing_gdn_kernel(const __nv_bfloat16* __restrict__ W_in,
-                                  const __nv_bfloat16* __restrict__ U_in,
-                                  const __nv_bfloat16* __restrict__ k_in,
-                                  const float* __restrict__ g_cumsum, const float* state_in,
-                                  __nv_bfloat16* __restrict__ v_new,
-                                  __nv_bfloat16* __restrict__ h_chunk, float* state_out, int64_t T,
-                                  int64_t H_v, ninfer::ops::head_map qk_map,
-                                  // Token-axis stride for k (in floats).
-                                  // Caller passes the materialised value
-                                  // (launcher handles 0 -> H_qk * S).
-                                  int64_t k_stride_t, int NT) {
+    void state_passing_kernel(const __nv_bfloat16* __restrict__ W_in,
+                              const __nv_bfloat16* __restrict__ U_in,
+                              const __nv_bfloat16* __restrict__ k_in,
+                              const float* __restrict__ g_cumsum, const float* state_in,
+                              __nv_bfloat16* __restrict__ v_new,
+                              __nv_bfloat16* __restrict__ h_chunk, float* state_out, int64_t T,
+                              int64_t H_v, head_map qk_map,
+                              // Token-axis stride for k (in floats).
+                              // Caller passes the materialised value
+                              // (launcher handles 0 -> H_qk * S).
+                              int64_t k_stride_t, int NT) {
     using D                         = kernel_dims<S>;
     using L                         = smem_layout<S>;
     constexpr int N_STRIP_PER_BLOCK = D::N_STRIP_PER_BLOCK;
@@ -281,7 +268,7 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
     //   grid.x = bhd in [0, B*H_v*D_STRIPS).
     //   warp = dt_idx * BT_SPLITS + s_idx.
     const int tid    = threadIdx.x;
-    const auto lanes = ninfer::ops::mma_lane_t::decode(tid);
+    const auto lanes = mma_lane_t::decode(tid);
     const int warp   = lanes.warp;
     const int lane_g = lanes.lane_g;
     const int lane_t = lanes.lane_t;
@@ -349,13 +336,13 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
     {
         const int64_t ce0_64 = BT; // chunk_0 end = BT
         const int cl0        = (ce0_64 < T) ? (int)ce0_64 : (int)T;
-        ninfer::ops::issue_load_bf16_to_float_vec4<BT, W_STRIDE, THREADS_K>(
-            W_view, W_in + W_block_base, W_stride, cl0, tid);
-        ninfer::ops::issue_load_bf16_to_float_vec4<BT, N_STRIP_PER_BLOCK, THREADS_K>(
+        issue_load_bf16_to_float_vec4<BT, W_STRIDE, THREADS_K>(W_view, W_in + W_block_base,
+                                                               W_stride, cl0, tid);
+        issue_load_bf16_to_float_vec4<BT, N_STRIP_PER_BLOCK, THREADS_K>(
             U_view, U_in + W_block_base + d_off, W_stride, cl0, tid);
         const int cl_k0 = (cl0 < K_LOAD_ROWS) ? cl0 : K_LOAD_ROWS;
-        ninfer::ops::issue_load_bf16_to_float_vec4<K_LOAD_ROWS, S, THREADS_K>(
-            k_view, k_in + k_block_base, k_stride, cl_k0, tid);
+        issue_load_bf16_to_float_vec4<K_LOAD_ROWS, S, THREADS_K>(k_view, k_in + k_block_base,
+                                                                 k_stride, cl_k0, tid);
     }
 
     // === Main chunk loop ===
@@ -431,7 +418,7 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
         for (int half = 0; half < W_HALVES; ++half) {
             if (half >= 1) {
                 __syncthreads(); // gates prev half's mma reads of W_smem
-                ninfer::ops::issue_load_bf16_to_float_vec4<BT, W_STRIDE, THREADS_K>(
+                issue_load_bf16_to_float_vec4<BT, W_STRIDE, THREADS_K>(
                     W_view, W_in + W_base + (int64_t)(half * W_STRIDE), W_stride, cl, tid);
                 __syncthreads();
             }
@@ -532,7 +519,8 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
                         const int a_col       = W_k_local + which_horiz * 4;
                         const unsigned a_addr = smem_addr(&W_view.at(a_row, a_col));
                         unsigned ua0, ua1, ua2, ua3;
-                        // GDN's TF32 fragment consumes ldmatrix registers in 0,2,1,3 order.
+                        // The Gated DeltaNet TF32 fragment consumes ldmatrix registers in 0,2,1,3
+                        // order.
                         ldmatrix_x4(ua0, ua2, ua1, ua3, a_addr);
 
                         mma_tf32_bits(vnew_frag[m_mm1][0], vnew_frag[m_mm1][1], vnew_frag[m_mm1][2],
@@ -553,8 +541,8 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
         // arriving W, not the *prior* read of the outgoing W).
         if (chunk + 1 < NT) {
             __syncthreads();
-            ninfer::ops::issue_load_bf16_to_float_vec4<BT, W_STRIDE, THREADS_K>(
-                W_view, W_in + W_base_next, W_stride, cl_next, tid);
+            issue_load_bf16_to_float_vec4<BT, W_STRIDE, THREADS_K>(W_view, W_in + W_base_next,
+                                                                   W_stride, cl_next, tid);
         }
 
 // === Phase C: subtract U from U_smem (no global wait, U landed in A) ===
@@ -690,8 +678,8 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
 
             const int64_t k_base_h1 = k_base + (int64_t)K_LOAD_ROWS * k_stride;
             const int cl_kh1        = (cl > K_LOAD_ROWS) ? (cl - K_LOAD_ROWS) : 0;
-            ninfer::ops::issue_load_bf16_to_float_vec4<K_LOAD_ROWS, S, THREADS_K>(
-                k_view, k_in + k_base_h1, k_stride, cl_kh1, tid);
+            issue_load_bf16_to_float_vec4<K_LOAD_ROWS, S, THREADS_K>(k_view, k_in + k_base_h1,
+                                                                     k_stride, cl_kh1, tid);
             __syncthreads();
 
 #pragma unroll
@@ -728,10 +716,10 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
         // Cross-chunk load: chunk t+1 U/k are converted synchronously into
         // shared memory.
         if (chunk + 1 < NT) {
-            ninfer::ops::issue_load_bf16_to_float_vec4<BT, N_STRIP_PER_BLOCK, THREADS_K>(
+            issue_load_bf16_to_float_vec4<BT, N_STRIP_PER_BLOCK, THREADS_K>(
                 U_view, U_in + W_base_next + d_off, W_stride, cl_next, tid);
-            ninfer::ops::issue_load_bf16_to_float_vec4<K_LOAD_ROWS, S, THREADS_K>(
-                k_view, k_in + k_base_next, k_stride, cl_k_next, tid);
+            issue_load_bf16_to_float_vec4<K_LOAD_ROWS, S, THREADS_K>(k_view, k_in + k_base_next,
+                                                                     k_stride, cl_k_next, tid);
         }
 
         // R7.1: advance loop-carried accumulators for next iter.
@@ -760,12 +748,11 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
 }
 
 template <int S>
-cudaError_t launch_typed(const gdn_chunked::state_passing_config& cfg, ninfer::ops::head_map qk_map,
-                         int NT) {
+cudaError_t launch_typed(const state_passing_config& cfg, head_map qk_map, int NT) {
     using D                  = kernel_dims<S>;
     constexpr int smem_bytes = smem_layout<S>::SMEM_FLOATS * (int)sizeof(float);
 
-    cudaError_t err = cudaFuncSetAttribute(state_passing_gdn_kernel<S>,
+    cudaError_t err = cudaFuncSetAttribute(state_passing_kernel<S>,
                                            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     if (err != cudaSuccess) return err;
 
@@ -775,7 +762,7 @@ cudaError_t launch_typed(const gdn_chunked::state_passing_config& cfg, ninfer::o
     const int64_t k_stride_t =
         (cfg.k_stride_t_floats != 0) ? cfg.k_stride_t_floats : (int64_t)cfg.H_qk * cfg.S;
 
-    state_passing_gdn_kernel<S><<<grid, block, smem_bytes, cfg.stream>>>(
+    state_passing_kernel<S><<<grid, block, smem_bytes, cfg.stream>>>(
         cfg.W, cfg.U, cfg.k, cfg.g_cumsum, cfg.state_in, cfg.v_new, cfg.h_chunk, cfg.state_out,
         cfg.L, cfg.H_v, qk_map, k_stride_t, NT);
     return cudaGetLastError();
@@ -783,17 +770,17 @@ cudaError_t launch_typed(const gdn_chunked::state_passing_config& cfg, ninfer::o
 
 } // namespace
 
-cudaError_t launch_state_passing(const gdn_chunked::state_passing_config& cfg) {
-    gdn_chunked::stage_validator v{"launch_state_passing", cfg.S, cfg.H_qk, cfg.H_v, cfg.L, cfg.B};
-    NINFER_GDN_PROPAGATE(v.check_shape());
-    NINFER_GDN_PROPAGATE(v.check_gdn_full_chunks());
+cudaError_t launch_state_passing(const state_passing_config& cfg) {
+    stage_validator v{"launch_state_passing", cfg.S, cfg.H_qk, cfg.H_v, cfg.L, cfg.B};
+    NINFER_GATED_DELTA_NET_PROPAGATE(v.check_shape());
+    NINFER_GATED_DELTA_NET_PROPAGATE(v.check_full_chunks());
     if (cfg.W == nullptr || cfg.U == nullptr || cfg.k == nullptr || cfg.g_cumsum == nullptr ||
         cfg.state_in == nullptr || cfg.v_new == nullptr || cfg.h_chunk == nullptr ||
         cfg.state_out == nullptr) {
         return cudaErrorInvalidValue;
     }
 
-    const auto qk_map = ninfer::ops::head_map::of((int)cfg.H_qk, (int)cfg.H_v);
+    const auto qk_map = head_map::of((int)cfg.H_qk, (int)cfg.H_v);
     const int64_t NT  = div_up(cfg.L, static_cast<int64_t>(BT));
 
     // grid_x = B * H_v * D_STRIPS depends on S; check inside each case.
@@ -803,20 +790,20 @@ cudaError_t launch_state_passing(const gdn_chunked::state_passing_config& cfg) {
 
     switch (cfg.S) {
     case 16:
-        NINFER_GDN_PROPAGATE(check_grid_for(kernel_dims<16>::D_STRIPS));
+        NINFER_GATED_DELTA_NET_PROPAGATE(check_grid_for(kernel_dims<16>::D_STRIPS));
         return launch_typed<16>(cfg, qk_map, (int)NT);
     case 32:
-        NINFER_GDN_PROPAGATE(check_grid_for(kernel_dims<32>::D_STRIPS));
+        NINFER_GATED_DELTA_NET_PROPAGATE(check_grid_for(kernel_dims<32>::D_STRIPS));
         return launch_typed<32>(cfg, qk_map, (int)NT);
     case 64:
-        NINFER_GDN_PROPAGATE(check_grid_for(kernel_dims<64>::D_STRIPS));
+        NINFER_GATED_DELTA_NET_PROPAGATE(check_grid_for(kernel_dims<64>::D_STRIPS));
         return launch_typed<64>(cfg, qk_map, (int)NT);
     case 128:
-        NINFER_GDN_PROPAGATE(check_grid_for(kernel_dims<128>::D_STRIPS));
+        NINFER_GATED_DELTA_NET_PROPAGATE(check_grid_for(kernel_dims<128>::D_STRIPS));
         return launch_typed<128>(cfg, qk_map, (int)NT);
     default:
         return cudaErrorInvalidValue; // check_shape already filtered
     }
 }
 
-} // namespace ninfer::ops::detail::gdn_state_passing
+} // namespace ninfer::ops::detail::gated_delta_net::chunked

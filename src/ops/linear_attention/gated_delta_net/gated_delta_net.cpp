@@ -1,12 +1,12 @@
-#include "ninfer/ops/gated_delta_rule.h"
+#include "ninfer/ops/gated_delta_net.h"
 
 #include "ninfer/ops/l2norm.h"
 
-#include "ops/common/math.h"
-#include "ops/kernel/gdn_common.cuh"
-#include "ops/launcher/gated_delta_rule.h"
 #include "core/device.h"
 #include "core/layout.h"
+#include "ops/common/math.h"
+#include "ops/linear_attention/gated_delta_net/common.h"
+#include "ops/linear_attention/gated_delta_net/launch.h"
 
 #include <cmath>
 #include <cstddef>
@@ -17,8 +17,6 @@
 namespace ninfer::ops {
 namespace {
 
-constexpr std::int32_t kChunkSize = 64;
-
 struct Geometry {
     std::int32_t head_dim;
     std::int32_t qk_heads;
@@ -27,38 +25,38 @@ struct Geometry {
 };
 
 void require_dtype(const Tensor& t, DType dtype, const char* name) {
-    if (t.dtype != dtype) { throw std::invalid_argument(std::string("gated_delta_rule: ") + name); }
+    if (t.dtype != dtype) { throw std::invalid_argument(std::string("gated_delta_net: ") + name); }
 }
 
 void require_shape(const Tensor& t, std::int32_t n0, std::int32_t n1, std::int32_t n2,
                    std::int32_t n3, const char* name) {
     if (t.ne[0] != n0 || t.ne[1] != n1 || t.ne[2] != n2 || t.ne[3] != n3) {
-        throw std::invalid_argument(std::string("gated_delta_rule: invalid shape for ") + name);
+        throw std::invalid_argument(std::string("gated_delta_net: invalid shape for ") + name);
     }
 }
 
 void require_contiguous_nonnull(const Tensor& t, const char* name) {
     if (!t.is_contiguous()) {
-        throw std::invalid_argument(std::string("gated_delta_rule: ") + name +
+        throw std::invalid_argument(std::string("gated_delta_net: ") + name +
                                     " must be contiguous");
     }
     if (t.data == nullptr) {
-        throw std::invalid_argument(std::string("gated_delta_rule: ") + name +
+        throw std::invalid_argument(std::string("gated_delta_net: ") + name +
                                     " data must be non-null");
     }
 }
 
 Geometry require_geometry(const Tensor& q, const Tensor& v) {
     const Geometry geometry{q.ne[0], q.ne[1], v.ne[1], q.ne[2]};
-    if (!is_supported_gdn_head_dim(geometry.head_dim)) {
-        throw std::invalid_argument("gated_delta_rule: head dimension must be 16, 32, 64, or 128");
+    if (!detail::gated_delta_net::is_supported_head_dim(geometry.head_dim)) {
+        throw std::invalid_argument("gated_delta_net: head dimension must be 16, 32, 64, or 128");
     }
-    if (!are_gdn_head_counts_valid(geometry.qk_heads, geometry.value_heads)) {
+    if (!detail::gated_delta_net::are_head_counts_valid(geometry.qk_heads, geometry.value_heads)) {
         throw std::invalid_argument(
-            "gated_delta_rule: value heads must be at least q/k heads and divisible by them");
+            "gated_delta_net: value heads must be at least q/k heads and divisible by them");
     }
     if (geometry.tokens <= 0) {
-        throw std::invalid_argument("gated_delta_rule: T must be positive");
+        throw std::invalid_argument("gated_delta_net: T must be positive");
     }
     return geometry;
 }
@@ -66,7 +64,7 @@ Geometry require_geometry(const Tensor& q, const Tensor& v) {
 void require_scale(float scale, std::int32_t head_dim) {
     const float expected_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
     if (!std::isfinite(scale) || scale <= 0.0f || std::abs(scale - expected_scale) > 1.0e-6f) {
-        throw std::invalid_argument("gated_delta_rule: scale must be 1/sqrt(head_dim)");
+        throw std::invalid_argument("gated_delta_net: scale must be 1/sqrt(head_dim)");
     }
 }
 
@@ -125,7 +123,7 @@ Geometry validate_recurrent_snapshot(const Tensor& q, const Tensor& k, const Ten
     require_shape(beta, geometry.value_heads, geometry.tokens, 1, 1, "beta");
     if (ssm_states.ne[0] != geometry.head_dim || ssm_states.ne[1] != geometry.head_dim ||
         ssm_states.ne[2] != geometry.value_heads || ssm_states.ne[3] < geometry.tokens) {
-        throw std::invalid_argument("gated_delta_rule: invalid shape for ssm_states snapshot");
+        throw std::invalid_argument("gated_delta_net: invalid shape for ssm_states snapshot");
     }
     require_shape(initial_slot, 1, 1, 1, 1, "initial_slot");
 
@@ -165,26 +163,28 @@ ChunkedWorkspace allocate_chunked_workspace(Allocator& allocator, std::int32_t h
                                             std::int32_t qk_heads, std::int32_t value_heads,
                                             std::int32_t tokens, bool normalize_qk) {
     ChunkedWorkspace out;
-    const std::int32_t full = (tokens / kChunkSize) * kChunkSize;
+    const std::int32_t full =
+        (tokens / detail::gated_delta_net::kChunkTokens) * detail::gated_delta_net::kChunkTokens;
     if (full == 0) { return out; }
     if (normalize_qk) {
         out.normalized_q = allocator.alloc(DType::BF16, {head_dim, qk_heads, tokens});
         out.normalized_k = allocator.alloc(DType::BF16, {head_dim, qk_heads, tokens});
     }
     out.stage = allocator.alloc_bytes(
-        detail::gdn_chunked_workspace_bytes(head_dim, qk_heads, value_heads, full));
+        detail::gated_delta_net::chunked_workspace_bytes(head_dim, qk_heads, value_heads, full));
     return out;
 }
 
 } // namespace
 
-std::size_t gated_delta_rule_workspace_capacity_bytes(std::int32_t head_dim, std::int32_t qk_heads,
-                                                      std::int32_t value_heads, bool normalize_qk,
-                                                      std::int32_t min_tokens,
-                                                      std::int32_t max_tokens) {
-    if (!is_supported_gdn_head_dim(head_dim) || !are_gdn_head_counts_valid(qk_heads, value_heads) ||
-        min_tokens <= 0 || max_tokens < min_tokens) {
-        throw std::invalid_argument("gated_delta_rule workspace: invalid profile or interval");
+std::size_t gated_delta_net_workspace_capacity_bytes(std::int32_t head_dim, std::int32_t qk_heads,
+                                                     std::int32_t value_heads, bool normalize_qk,
+                                                     std::int32_t min_tokens,
+                                                     std::int32_t max_tokens) {
+    if (!detail::gated_delta_net::is_supported_head_dim(head_dim) ||
+        !detail::gated_delta_net::are_head_counts_valid(qk_heads, value_heads) || min_tokens <= 0 ||
+        max_tokens < min_tokens) {
+        throw std::invalid_argument("gated_delta_net workspace: invalid profile or interval");
     }
     WorkspaceLayoutBuilder layout;
     (void)allocate_chunked_workspace(layout, head_dim, qk_heads, value_heads, max_tokens,
@@ -192,40 +192,41 @@ std::size_t gated_delta_rule_workspace_capacity_bytes(std::int32_t head_dim, std
     return layout.peak_bytes(1);
 }
 
-void gated_delta_rule(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                      const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
-                      Tensor& ssm_state, Tensor& out, cudaStream_t stream) {
+void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                     const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
+                     Tensor& ssm_state, Tensor& out, cudaStream_t stream) {
     if (q.ne[2] != 1) {
-        gated_delta_rule(q, k, v, g, beta, scale, normalize_qk, ws, ssm_state, ssm_state, out,
-                         stream);
+        gated_delta_net(q, k, v, g, beta, scale, normalize_qk, ws, ssm_state, ssm_state, out,
+                        stream);
         return;
     }
     validate_recurrent(q, k, v, g, beta, scale, ssm_state, out);
 
     (void)ws;
-    detail::gated_delta_rule_recurrent_bf16_launch(q, k, v, g, beta, scale, normalize_qk, ssm_state,
-                                                   out, stream);
+    detail::gated_delta_net::launch_recurrent(q, k, v, g, beta, scale, normalize_qk, ssm_state, out,
+                                              stream);
 }
 
-void gated_delta_rule_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                               const Tensor& beta, float scale, bool normalize_qk,
-                               Tensor& ssm_states, const Tensor& initial_slot, Tensor& out,
-                               cudaStream_t stream) {
+void gated_delta_net_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                              const Tensor& beta, float scale, bool normalize_qk,
+                              Tensor& ssm_states, const Tensor& initial_slot, Tensor& out,
+                              cudaStream_t stream) {
     validate_recurrent_snapshot(q, k, v, g, beta, scale, ssm_states, initial_slot, out);
 
-    detail::gated_delta_rule_recurrent_snapshot_bf16_launch(q, k, v, g, beta, scale, normalize_qk,
-                                                            ssm_states, initial_slot, out, stream);
+    detail::gated_delta_net::launch_recurrent_snapshot(q, k, v, g, beta, scale, normalize_qk,
+                                                       ssm_states, initial_slot, out, stream);
 }
 
-void gated_delta_rule(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                      const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
-                      const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
-                      cudaStream_t stream) {
+void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                     const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
+                     const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
+                     cudaStream_t stream) {
     validate_chunked(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out, out);
 
-    auto scratch_scope        = ws.scope();
-    const std::int32_t T      = q.ne[2];
-    const std::int32_t T_full = (T / kChunkSize) * kChunkSize;
+    auto scratch_scope   = ws.scope();
+    const std::int32_t T = q.ne[2];
+    const std::int32_t T_full =
+        (T / detail::gated_delta_net::kChunkTokens) * detail::gated_delta_net::kChunkTokens;
     ChunkedWorkspace scratch =
         allocate_chunked_workspace(ws, q.ne[0], q.ne[1], v.ne[1], T, normalize_qk);
     Tensor q_compute         = q;
@@ -245,7 +246,7 @@ void gated_delta_rule(const Tensor& q, const Tensor& k, const Tensor& v, const T
         Tensor g_full    = g.slice(1, 0, T_full);
         Tensor beta_full = beta.slice(1, 0, T_full);
         Tensor out_full  = out.slice(2, 0, T_full);
-        detail::gated_delta_rule_chunked_launch(q_full, k_full, v_full, g_full, beta_full, scale,
+        detail::gated_delta_net::launch_chunked(q_full, k_full, v_full, g_full, beta_full, scale,
                                                 ssm_state_in, ssm_state_out, out_full,
                                                 scratch.stage.data, scratch.stage.bytes, stream);
     }
@@ -262,9 +263,9 @@ void gated_delta_rule(const Tensor& q, const Tensor& k, const Tensor& v, const T
         // chunks) reads the caller-provided ssm_state_in. Either way the tail publishes to
         // ssm_state_out.
         const Tensor& tail_in = (T_full > 0) ? ssm_state_out : ssm_state_in;
-        detail::gated_delta_rule_recurrent_inout_bf16_launch(
-            q_tail, k_tail, v_tail, g_tail, beta_tail, scale, recurrent_normalize, tail_in,
-            ssm_state_out, out_tail, stream);
+        detail::gated_delta_net::launch_recurrent_inout(q_tail, k_tail, v_tail, g_tail, beta_tail,
+                                                        scale, recurrent_normalize, tail_in,
+                                                        ssm_state_out, out_tail, stream);
     }
 }
 

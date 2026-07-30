@@ -172,7 +172,7 @@ def gdn_gating(
     return -torch.exp(a_log.float()) * softplus, torch.sigmoid(b.float())
 
 
-def gated_delta_rule(
+def gated_delta_net(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -202,14 +202,16 @@ def gated_delta_rule(
         return bf16(out.squeeze(0).unsqueeze(0)), next_state
 
     try:
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+        from fla.ops.gated_delta_rule import (
+            chunk_gated_delta_rule as fla_chunk_gated_delta_net,
+        )
     except ImportError as exc:
         raise RuntimeError(
             "Qwen3.6-35B-A3B reference requires flash-linear-attention>=0.5.1 "
             "for prefill GDN"
         ) from exc
     q, k, v, g, beta = (tensor.clone() for tensor in (q, k, v, g, beta))
-    out, final = chunk_gated_delta_rule(
+    out, final = fla_chunk_gated_delta_net(
         q.unsqueeze(0),
         k.unsqueeze(0),
         v.unsqueeze(0),
@@ -222,7 +224,7 @@ def gated_delta_rule(
     return bf16(out.squeeze(0)), final.float()
 
 
-def _naive_gated_delta_rule(
+def _naive_gated_delta_net(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -251,12 +253,12 @@ def _naive_gated_delta_rule(
 
 
 __all__ = [
-    "_naive_gated_delta_rule",
+    "_naive_gated_delta_net",
     "apply_rope",
     "attention",
     "bf16",
     "causal_conv1d",
-    "gated_delta_rule",
+    "gated_delta_net",
     "gdn_gating",
     "l2norm",
     "linear",
