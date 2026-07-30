@@ -311,7 +311,7 @@ The default horizontal layout places those private responsibilities under
 routes or stages may instead own a vertical `src/ops/<category>/<family>/` subtree. The vertical
 layout changes physical ownership, not the contract boundary or dependency direction: its
 family-root `.cpp` is the wrapper, its private launch header and host launch definitions are the
-launcher, and its `.cu` files own the kernels.
+launcher, and matching `.cuh` files own the kernels and Op-local device computation.
 
 Shared and category-owned implementation facilities include:
 
@@ -344,15 +344,18 @@ capture graphs, or choose model call order.
 ### 5.2 Launcher
 
 The launcher layer—normally under `src/ops/launcher/`, or family-private in a vertical
-subtree—owns private launch declarations, grid/block/shared-memory policy, template instantiation,
-and launch-error handling. Launcher headers are implementation-private. Contract headers, targets,
-and product code never include them.
+subtree—owns private launch declarations and `.cu` definitions, grid/block/shared-memory policy,
+template instantiation, and launch-error handling. In the conventional paired layout, a
+launch-owner `.cu` includes the corresponding kernel `.cuh` and does not define `__global__`
+functions itself. Launcher headers are implementation-private. Contract headers, targets, and
+product code never include them.
 
 ### 5.3 Kernel
 
-The kernel layer—normally under `src/ops/kernel/`, or in family-owned `.cu`/`.cuh` files in a
-vertical subtree—owns `__global__` functions and Op-local reusable `__device__` computation. A
-kernel may encode exact shape, tensor format, SM capability, tiling, padding, and alignment
+The kernel layer—normally under `src/ops/kernel/`, or in family-owned `.cuh` files in a vertical
+subtree—owns `__global__` functions and Op-local reusable `__device__` computation. A paired kernel
+header has an explicit launch-owner `.cu`; it is not included by wrappers, targets, or benchmarks.
+A kernel may encode exact shape, tensor format, SM capability, tiling, padding, and alignment
 assumptions. Every assumption must correspond to a wrapper/launcher predicate and must not be
 inferred from model identity.
 
@@ -413,14 +416,26 @@ src/ops/linear_attention/gated_delta_net/
 ├── common.h
 ├── common.cuh
 ├── launch.h
+├── recurrent.cuh
 ├── recurrent.cu
 └── chunked/
     ├── common.cuh
+    ├── launch.h
     ├── launch.cu
+    ├── prepare_wy_wu.cuh
     ├── prepare_wy_wu.cu
+    ├── state_passing.cuh
     ├── state_passing.cu
+    ├── output.cuh
     └── output.cu
 ```
+
+`recurrent.cu` and each stage `.cu` own host dispatch and CUDA launch policy; their matching
+`.cuh` files own kernels and device helpers. `chunked/launch.cu` is the kernel-free composition
+launcher that binds workspace and invokes the three stages. The family-root `launch.h` is the
+wrapper-to-family interface, while `chunked/launch.h` contains only the internal stage launch
+contracts and host workspace/configuration types. The two `common.cuh` files contain shared device
+facilities, not launcher declarations.
 
 This family owns the complete Gated DeltaNet state recurrence and output transformation, including
 the recurrent and chunked formulations, snapshot execution, full-chunk plus recurrent-tail

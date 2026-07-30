@@ -1,7 +1,7 @@
 #include "ops/linear_attention/gated_delta_net/launch.h"
 
 #include "core/device.h"
-#include "ops/linear_attention/gated_delta_net/chunked/common.cuh"
+#include "ops/linear_attention/gated_delta_net/chunked/launch.h"
 
 #include <cuda_bf16.h>
 #include <cstddef>
