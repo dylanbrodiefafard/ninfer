@@ -81,15 +81,22 @@ struct BenchRow {
     const char* state_form    = "";
     const char* normalization = "";
     std::string implementation;
-    std::int32_t tokens         = 0;
-    std::int32_t full_chunks    = 0;
-    std::int32_t tail_tokens    = 0;
-    std::size_t workspace_bytes = 0;
-    std::size_t graph_nodes     = 0;
-    double logical_bytes        = 0.0;
-    double stage_share_pct      = -1.0;
-    double relative_to_e2e_pct  = -1.0;
+    std::int32_t tokens               = 0;
+    std::int32_t full_chunks          = 0;
+    std::int32_t tail_tokens          = 0;
+    std::size_t workspace_bytes       = 0;
+    std::size_t graph_nodes           = 0;
+    double logical_bytes              = 0.0;
+    double traffic_bytes              = 0.0;
+    double intermediate_traffic_bytes = 0.0;
+    double stage_share_pct            = -1.0;
+    double relative_to_e2e_pct        = -1.0;
     ColdTiming timing{};
+};
+
+struct TrafficBytes {
+    double total        = 0.0;
+    double intermediate = 0.0;
 };
 
 [[noreturn]] void fail(const std::string& message) { throw std::invalid_argument(message); }
@@ -360,30 +367,130 @@ GraphMeasurement measure_graph(Launch& launch, DeviceBuffer& flush, cudaStream_t
 }
 
 double running_logical_bytes(const Problem& problem) {
-    const double tokens = static_cast<double>(problem.tokens);
-    const double qk_elements =
-        static_cast<double>(gated_delta_net_detail::kStateDim) * problem.qk_heads * tokens;
-    const double value_elements =
-        static_cast<double>(gated_delta_net_detail::kStateDim) * problem.value_heads * tokens;
-    const double gate_elements  = static_cast<double>(problem.value_heads) * tokens;
-    const double state_elements = static_cast<double>(gated_delta_net_detail::kStateDim) *
-                                  gated_delta_net_detail::kStateDim * problem.value_heads;
-    return (2.0 * qk_elements + 2.0 * value_elements) * sizeof(std::uint16_t) +
-           (2.0 * gate_elements + 2.0 * state_elements) * sizeof(float);
+    const double tokens   = static_cast<double>(problem.tokens);
+    const double qk_bytes = static_cast<double>(gated_delta_net_detail::kStateDim) *
+                            problem.qk_heads * tokens * sizeof(std::uint16_t);
+    const double value_bytes = static_cast<double>(gated_delta_net_detail::kStateDim) *
+                               problem.value_heads * tokens * sizeof(std::uint16_t);
+    const double gate_bytes  = static_cast<double>(problem.value_heads) * tokens * sizeof(float);
+    const double state_bytes = static_cast<double>(gated_delta_net_detail::kStateDim) *
+                               gated_delta_net_detail::kStateDim * problem.value_heads *
+                               sizeof(float);
+    return 2.0 * qk_bytes + 2.0 * value_bytes + 2.0 * gate_bytes + 2.0 * state_bytes;
 }
 
 double snapshot_logical_bytes(const Problem& problem) {
-    const double tokens = static_cast<double>(problem.tokens);
-    const double qk_elements =
-        static_cast<double>(gated_delta_net_detail::kStateDim) * problem.qk_heads * tokens;
-    const double value_elements =
-        static_cast<double>(gated_delta_net_detail::kStateDim) * problem.value_heads * tokens;
-    const double gate_elements  = static_cast<double>(problem.value_heads) * tokens;
-    const double state_elements = static_cast<double>(gated_delta_net_detail::kStateDim) *
-                                  gated_delta_net_detail::kStateDim * problem.value_heads;
-    return (2.0 * qk_elements + 2.0 * value_elements) * sizeof(std::uint16_t) +
-           2.0 * gate_elements * sizeof(float) + (1.0 + tokens) * state_elements * sizeof(float) +
+    const double tokens   = static_cast<double>(problem.tokens);
+    const double qk_bytes = static_cast<double>(gated_delta_net_detail::kStateDim) *
+                            problem.qk_heads * tokens * sizeof(std::uint16_t);
+    const double value_bytes = static_cast<double>(gated_delta_net_detail::kStateDim) *
+                               problem.value_heads * tokens * sizeof(std::uint16_t);
+    const double gate_bytes  = static_cast<double>(problem.value_heads) * tokens * sizeof(float);
+    const double state_bytes = static_cast<double>(gated_delta_net_detail::kStateDim) *
+                               gated_delta_net_detail::kStateDim * problem.value_heads *
+                               sizeof(float);
+    return 2.0 * qk_bytes + 2.0 * value_bytes + 2.0 * gate_bytes + (1.0 + tokens) * state_bytes +
            sizeof(std::int32_t);
+}
+
+double qk_tensor_bytes(const Problem& problem) {
+    return static_cast<double>(gated_delta_net_detail::kStateDim) * problem.qk_heads *
+           problem.tokens * sizeof(std::uint16_t);
+}
+
+double value_tensor_bytes(const Problem& problem) {
+    return static_cast<double>(gated_delta_net_detail::kStateDim) * problem.value_heads *
+           problem.tokens * sizeof(std::uint16_t);
+}
+
+double gate_tensor_bytes(const Problem& problem) {
+    return static_cast<double>(problem.value_heads) * problem.tokens * sizeof(float);
+}
+
+double state_tensor_bytes(const Problem& problem) {
+    return static_cast<double>(gated_delta_net_detail::kStateDim) *
+           gated_delta_net_detail::kStateDim * problem.value_heads * sizeof(float);
+}
+
+double chunk_state_tensor_bytes(const Problem& problem) {
+    const double chunks = static_cast<double>(problem.tokens / gated_delta_net_detail::kChunkSize);
+    return state_tensor_bytes(problem) * chunks * 0.5;
+}
+
+TrafficBytes chunked_prepare_traffic(const Problem& problem) {
+    const double qk    = qk_tensor_bytes(problem);
+    const double value = value_tensor_bytes(problem);
+    const double gate  = gate_tensor_bytes(problem);
+    return {
+        qk + 3.0 * value + 3.0 * gate,
+        2.0 * value + gate,
+    };
+}
+
+TrafficBytes chunked_state_traffic(const Problem& problem) {
+    const double qk          = qk_tensor_bytes(problem);
+    const double value       = value_tensor_bytes(problem);
+    const double gate        = gate_tensor_bytes(problem);
+    const double state       = state_tensor_bytes(problem);
+    const double chunk_state = chunk_state_tensor_bytes(problem);
+    return {
+        qk + 3.0 * value + gate + 2.0 * state + chunk_state,
+        3.0 * value + gate + chunk_state,
+    };
+}
+
+TrafficBytes chunked_output_traffic(const Problem& problem) {
+    const double qk          = qk_tensor_bytes(problem);
+    const double value       = value_tensor_bytes(problem);
+    const double gate        = gate_tensor_bytes(problem);
+    const double chunk_state = chunk_state_tensor_bytes(problem);
+    return {
+        2.0 * qk + 2.0 * value + gate + chunk_state,
+        value + gate + chunk_state,
+    };
+}
+
+TrafficBytes chunked_pipeline_traffic(const Problem& problem) {
+    const TrafficBytes prepare = chunked_prepare_traffic(problem);
+    const TrafficBytes state   = chunked_state_traffic(problem);
+    const TrafficBytes output  = chunked_output_traffic(problem);
+    return {
+        prepare.total + state.total + output.total,
+        prepare.intermediate + state.intermediate + output.intermediate,
+    };
+}
+
+TrafficBytes running_traffic(const Problem& problem) {
+    const std::int32_t full_tokens =
+        (problem.tokens / gated_delta_net_detail::kChunkSize) * gated_delta_net_detail::kChunkSize;
+    if (full_tokens == 0) { return {running_logical_bytes(problem), 0.0}; }
+
+    const Problem full{problem.qk_heads, problem.value_heads, full_tokens};
+    const std::int32_t tail_tokens = problem.tokens - full_tokens;
+    const double qk_all            = qk_tensor_bytes(problem);
+    const double normalization     = 4.0 * qk_all;
+    const TrafficBytes chunked     = chunked_pipeline_traffic(full);
+
+    TrafficBytes traffic{
+        normalization + chunked.total,
+        2.0 * qk_all + 4.0 * qk_tensor_bytes(full) + chunked.intermediate,
+    };
+    if (tail_tokens > 0) {
+        const Problem tail{problem.qk_heads, problem.value_heads, tail_tokens};
+        traffic.total += running_logical_bytes(tail);
+        traffic.intermediate += 2.0 * qk_tensor_bytes(tail);
+    }
+    return traffic;
+}
+
+TrafficBytes snapshot_traffic(const Problem& problem, bool composed) {
+    const double logical = snapshot_logical_bytes(problem);
+    if (!composed) { return {logical, 0.0}; }
+    const double normalized_qk_round_trip = 4.0 * qk_tensor_bytes(problem);
+    return {
+        logical + normalized_qk_round_trip,
+        normalized_qk_round_trip,
+    };
 }
 
 std::string running_implementation(std::int32_t tokens) {
@@ -425,6 +532,7 @@ BenchRow run_running(const Options& options, std::int32_t tokens, DeviceBuffer& 
                              ssm_out, out, launch_stream);
     };
     const GraphMeasurement measurement = measure_graph(launch, flush, stream, options);
+    const TrafficBytes traffic         = running_traffic(problem);
 
     const std::int32_t full_chunks = tokens / gated_delta_net_detail::kChunkSize;
     return {
@@ -437,6 +545,8 @@ BenchRow run_running(const Options& options, std::int32_t tokens, DeviceBuffer& 
         workspace_bytes,
         measurement.graph_nodes,
         running_logical_bytes(problem),
+        traffic.total,
+        traffic.intermediate,
         -1.0,
         -1.0,
         measurement.timing,
@@ -492,6 +602,7 @@ BenchRow run_snapshot(const Options& options, std::int32_t tokens, DeviceBuffer&
                                               !composed, ssm_states, initial, out, launch_stream);
     };
     const GraphMeasurement measurement = measure_graph(launch, flush, stream, options);
+    const TrafficBytes traffic         = snapshot_traffic(problem, composed);
 
     return {
         "snapshot",
@@ -503,6 +614,8 @@ BenchRow run_snapshot(const Options& options, std::int32_t tokens, DeviceBuffer&
         0,
         measurement.graph_nodes,
         snapshot_logical_bytes(problem),
+        traffic.total,
+        traffic.intermediate,
         -1.0,
         -1.0,
         measurement.timing,
@@ -541,6 +654,7 @@ std::vector<BenchRow> run_chunked(const Options& options, std::int32_t tokens, D
                                                launch_stream);
     };
     const GraphMeasurement pipeline_measurement = measure_graph(pipeline, flush, stream, options);
+    const TrafficBytes pipeline_traffic         = chunked_pipeline_traffic(problem);
 
     std::vector<BenchRow> rows;
     rows.push_back({
@@ -553,6 +667,8 @@ std::vector<BenchRow> run_chunked(const Options& options, std::int32_t tokens, D
         workspace_bytes,
         pipeline_measurement.graph_nodes,
         running_logical_bytes(problem),
+        pipeline_traffic.total,
+        pipeline_traffic.intermediate,
         -1.0,
         options.breakdown ? 100.0 : -1.0,
         pipeline_measurement.timing,
@@ -605,7 +721,8 @@ std::vector<BenchRow> run_chunked(const Options& options, std::int32_t tokens, D
     output.attn_out = static_cast<__nv_bfloat16*>(out.data);
     output.scale    = gated_delta_net_scale();
 
-    const auto append_stage = [&](const char* implementation, auto& launch) {
+    const auto append_stage = [&](const char* implementation, const TrafficBytes& traffic,
+                                  auto& launch) {
         const GraphMeasurement measurement = measure_graph(launch, flush, stream, options);
         rows.push_back({
             "running",
@@ -617,6 +734,8 @@ std::vector<BenchRow> run_chunked(const Options& options, std::int32_t tokens, D
             workspace_bytes,
             measurement.graph_nodes,
             0.0,
+            traffic.total,
+            traffic.intermediate,
             0.0,
             100.0 * measurement.timing.median_us / pipeline_measurement.timing.median_us,
             measurement.timing,
@@ -627,19 +746,19 @@ std::vector<BenchRow> run_chunked(const Options& options, std::int32_t tokens, D
         prepare.stream = launch_stream;
         CUDA_CHECK(chunked_detail::launch_prepare_wy_wu(prepare));
     };
-    append_stage("chunked.prepare_wy_wu", launch_prepare);
+    append_stage("chunked.prepare_wy_wu", chunked_prepare_traffic(problem), launch_prepare);
 
     auto launch_state = [&](cudaStream_t launch_stream) {
         state.stream = launch_stream;
         CUDA_CHECK(chunked_detail::launch_state_passing(state));
     };
-    append_stage("chunked.state_passing", launch_state);
+    append_stage("chunked.state_passing", chunked_state_traffic(problem), launch_state);
 
     auto launch_output = [&](cudaStream_t launch_stream) {
         output.stream = launch_stream;
         CUDA_CHECK(chunked_detail::launch_output(output));
     };
-    append_stage("chunked.output", launch_output);
+    append_stage("chunked.output", chunked_output_traffic(problem), launch_output);
 
     double stage_sum_us = 0.0;
     for (std::size_t index = 1; index < rows.size(); ++index) {
@@ -657,22 +776,30 @@ double logical_gbps(const BenchRow& row) {
     return row.logical_bytes / (row.timing.median_us * 1.0e3);
 }
 
+double traffic_gbps(const BenchRow& row) {
+    if (row.traffic_bytes == 0.0 || row.timing.median_us <= 0.0) { return 0.0; }
+    return row.traffic_bytes / (row.timing.median_us * 1.0e3);
+}
+
 void print_csv_header() {
     std::printf(
         "state_form,normalization,implementation,dtype,state_dim,qk_heads,value_heads,tokens,"
-        "batch,full_chunks,tail_tokens,workspace_bytes,graph_nodes,cache,execution,warmup,repeat,"
-        "median_us,min_us,p95_us,logical_gbps,stage_share_pct,relative_to_e2e_pct\n");
+        "batch,full_chunks,tail_tokens,workspace_bytes,logical_bytes,traffic_bytes,"
+        "intermediate_traffic_bytes,graph_nodes,cache,execution,warmup,repeat,"
+        "median_us,min_us,p95_us,logical_gbps,traffic_gbps,stage_share_pct,"
+        "relative_to_e2e_pct\n");
 }
 
 void print_row(const BenchRow& row, const Options& options) {
     if (options.csv) {
-        std::printf("%s,%s,%s,BF16,%d,%d,%d,%d,1,%d,%d,%zu,%zu,cold_l2,cuda_graph,%d,%d,"
-                    "%.3f,%.3f,%.3f,%.3f,",
+        std::printf("%s,%s,%s,BF16,%d,%d,%d,%d,1,%d,%d,%zu,%.0f,%.0f,%.0f,%zu,"
+                    "cold_l2,cuda_graph,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,",
                     row.state_form, row.normalization, row.implementation.c_str(),
                     gated_delta_net_detail::kStateDim, options.qk_heads, options.value_heads,
                     row.tokens, row.full_chunks, row.tail_tokens, row.workspace_bytes,
+                    row.logical_bytes, row.traffic_bytes, row.intermediate_traffic_bytes,
                     row.graph_nodes, options.warmup, options.repeat, row.timing.median_us,
-                    row.timing.min_us, row.timing.p95_us, logical_gbps(row));
+                    row.timing.min_us, row.timing.p95_us, logical_gbps(row), traffic_gbps(row));
         if (row.stage_share_pct >= 0.0) { std::printf("%.2f", row.stage_share_pct); }
         std::printf(",");
         if (row.relative_to_e2e_pct >= 0.0) { std::printf("%.2f", row.relative_to_e2e_pct); }
@@ -681,15 +808,21 @@ void print_row(const BenchRow& row, const Options& options) {
     }
 
     std::printf("%-8s T=%-4d chunks=%-2d tail=%-2d nodes=%zu ws=%7.2f MiB "
-                "median=%8.3f us min=%8.3f us p95=%8.3f us logical=%8.1f GB/s",
+                "median=%8.3f us min=%8.3f us p95=%8.3f us",
                 row.state_form, row.tokens, row.full_chunks, row.tail_tokens, row.graph_nodes,
                 static_cast<double>(row.workspace_bytes) / static_cast<double>(1ULL << 20),
-                row.timing.median_us, row.timing.min_us, row.timing.p95_us, logical_gbps(row));
+                row.timing.median_us, row.timing.min_us, row.timing.p95_us);
     if (row.stage_share_pct >= 0.0) { std::printf(" stage_share=%6.2f%%", row.stage_share_pct); }
     if (row.relative_to_e2e_pct >= 0.0) {
         std::printf(" e2e_ratio=%6.2f%%", row.relative_to_e2e_pct);
     }
-    std::printf("\n  %s\n", row.implementation.c_str());
+    std::printf("\n  bytes logical=%7.2f MiB traffic=%7.2f MiB intermediate=%7.2f MiB"
+                " | bandwidth logical=%8.1f GB/s traffic=%8.1f GB/s"
+                "\n  %s\n",
+                row.logical_bytes / static_cast<double>(1ULL << 20),
+                row.traffic_bytes / static_cast<double>(1ULL << 20),
+                row.intermediate_traffic_bytes / static_cast<double>(1ULL << 20), logical_gbps(row),
+                traffic_gbps(row), row.implementation.c_str());
 }
 
 void print_banner(const Options& options, const cudaDeviceProp& device) {
@@ -704,6 +837,7 @@ void print_banner(const Options& options, const cudaDeviceProp& device) {
     std::printf("  execution   CUDA Graph replay\n");
     std::printf("  cache       cold L2 (%zu MiB flush before each sample)\n",
                 options.flush_bytes >> 20);
+    std::printf("  traffic     kernel tensor I/O including materialized intermediates\n");
     std::printf("  samples     %d warmup + %d measured per case\n\n", options.warmup,
                 options.repeat);
 }

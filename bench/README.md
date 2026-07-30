@@ -169,8 +169,14 @@ end-to-end pipeline and isolated `prepare_wy_wu`, `state_passing`, and `output` 
 `stage_share_pct` partitions the sum of isolated-stage medians. Each isolated stage receives its own
 cold-L2 flush, so `relative_to_e2e_pct` is informative but is not an additive partition of the
 pipeline latency.
-`logical_gbps` covers only contract-visible tensors and state; stage rows leave it zero because
-implementation workspace traffic requires profiler counters.
+
+`logical_bytes` and `logical_gbps` count each contract-visible tensor and state transfer once.
+`traffic_bytes` and `traffic_gbps` instead sum one full tensor extent for every kernel input and
+output in the selected implementation. This includes repeated consumption by different kernels,
+the composed or public chunked Q/K-normalization intermediates, and every producer/consumer access
+to chunked `g_cumsum`, W, U, `v_new`, and `h_chunk`. `intermediate_traffic_bytes` isolates those
+normalization and chunked-workspace accesses. These deterministic byte counts describe
+implementation-level tensor traffic; physical DRAM/L2 sectors and cache reuse still require NCU.
 
 ```bash
 cmake --build build --parallel --target ninfer_gated_delta_net_bench ninfer_gdn_layer_bench
