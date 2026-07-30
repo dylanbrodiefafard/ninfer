@@ -154,27 +154,33 @@ cmake --build build --parallel --target ninfer_gdn_gating_proj_bench
   -p 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 --warmup 10 --repeat 200
 ```
 
-## Gated DeltaNet snapshot Op benchmark
+## Gated DeltaNet Op benchmark
 
-`ninfer_gated_delta_net_bench --small-t` measures the stateful recurrent snapshot contract with
-17 state slots and exact `T=1..16`. Every row reports the complete selected route. Its useful-byte
-rate includes raw Q/K/V, g/beta, output, the selected initial FP32 state read, and all `T` FP32
-snapshot writes; it does not inflate the rate with cache-line or implementation traffic.
-`--qk-norm fused` is the production one-kernel route. `composed` explicitly runs two L2Norm kernels
-and the pre-normalized recurrent kernel as a containing-layer control.
-The benchmark fixes the state/head dimension at 128 and batch at 1. `--H_qk` and `--H_v` remain
-configurable for any positive, divisible `H_v >= H_qk` mapping.
+`ninfer_gated_delta_net_bench` measures the BF16 Gated DeltaNet contract with state/head dimension
+128, batch 1, production Q/K normalization, and any positive, divisible
+`value_heads >= qk_heads` mapping. Every measurement is a CUDA Graph replay preceded by a 256 MiB
+L2 flush outside the timed interval.
+
+`--running` measures the public running-state entry across recurrent-only, complete 64-token
+chunks, and chunked-plus-recurrent-tail routes. `--snapshot` measures the 17-slot snapshot entry over
+the production `T=1..16` range; `--qk-norm composed` retains the two-L2Norm comparison.
+`--chunked-only` measures the private pre-normalized BF16 pipeline. Adding `--breakdown` reports the
+end-to-end pipeline and isolated `prepare_wy_wu`, `state_passing`, and `output` stage timings.
+`stage_share_pct` partitions the sum of isolated-stage medians. Each isolated stage receives its own
+cold-L2 flush, so `relative_to_e2e_pct` is informative but is not an additive partition of the
+pipeline latency.
+`logical_gbps` covers only contract-visible tensors and state; stage rows leave it zero because
+implementation workspace traffic requires profiler counters.
 
 ```bash
 cmake --build build --parallel --target ninfer_gated_delta_net_bench ninfer_gdn_layer_bench
 ./build/bench/ninfer_gated_delta_net_bench \
-  --small-t --H_v 32 --qk-norm fused \
-  --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
-  --warmup 20 --repeat 500 --csv
+  --running --value-heads 32 --sweep --warmup 20 --repeat 100 --csv
 ./build/bench/ninfer_gated_delta_net_bench \
-  --small-t --H_v 32 --qk-norm composed \
-  --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
-  --warmup 20 --repeat 500 --csv
+  --snapshot --value-heads 32 --qk-norm fused --warmup 20 --repeat 100 --csv
+./build/bench/ninfer_gated_delta_net_bench \
+  --chunked-only --value-heads 32 --tokens 1024 --breakdown \
+  --warmup 20 --repeat 100
 ./build/bench/ninfer_gdn_layer_bench \
   --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
   --route fused --norm-control fused --qk-norm fused --warmup 20 --repeat 500
