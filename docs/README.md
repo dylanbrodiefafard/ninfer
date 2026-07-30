@@ -35,10 +35,9 @@ The files under [`maintainer/`](maintainer/) record the current artifact formats
 artifact contracts, and Op-development rules used for ongoing project maintenance. They are not
 additional user workflows or installed API documentation.
 
-Active implementation references:
+Active implementation and architecture references:
 
-- [Linear direct-route architecture and registration rules](maintainer/linear-type-dispatch-memo.md)
+- [Op semantic contracts, source ownership, correctness, and performance workflow](maintainer/op-development.md)
+- [Softmax Attention organization and migration contract](maintainer/softmax-attention.md)
 - [Linear benchmark contract and registered suites](maintainer/linear-benchmark.md)
 - [Qwen3.6-27B artifact contracts, including NVFP4](maintainer/qwen3.6-27b-artifact.md)
-- [Qwen3.6-35B-A3B DFlash Op checklist](maintainer/qwen3.6-35b-a3b-dflash-op-checklist.md)
-- [Qwen3.6-35B-A3B DFlash Engine integration](maintainer/qwen3.6-35b-a3b-dflash-engine-integration.md)

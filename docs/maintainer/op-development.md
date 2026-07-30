@@ -120,10 +120,12 @@ selection. The envelope is an execution-resource promise, not a second mathemati
   a target lifecycle cursor;
 - target-private graph tiers may choose intervals, while the Op owns interval-aware finite dispatch.
 
-GQA is the current concrete use: device `positions` define the causal mask, while
-`GqaExecutionEnvelope[min_visible_keys,max_visible_keys]` bounds the visible-key window for
-split capacity and INT8 implementation selection. The physical cache view contains no frontier or
-graph identity.
+Cached causal Softmax Attention is the current concrete use: device `positions` define the causal
+mask, while the target `CausalAttentionExecutionEnvelope[min_visible_keys,max_visible_keys]`
+contract bounds the visible-key window for split capacity and INT8 implementation selection. The
+physical cache view contains no frontier or graph identity. The pre-migration implementation still
+uses legacy GQA names; the final Attention organization and one-time cutover are defined in
+[`softmax-attention.md`](softmax-attention.md).
 
 ### 1.4 Logical assignment versus raw transfer
 
@@ -318,6 +320,7 @@ Shared and category-owned implementation facilities include:
 ```text
 src/ops/common/                   narrow CUDA primitives
 src/ops/linear/                   linear codec, plan, reference, GEMV, and GEMM paths
+src/ops/softmax_attention/        vertically owned Softmax Attention families
 src/ops/linear_attention/         vertically owned Linear Attention families
 ```
 
@@ -398,7 +401,30 @@ body with an Op-local compile-time output/epilogue policy. The owning Op still d
 dispatches its output mapping and observable fusion boundary; it does not call public `linear`,
 expose a packed temporary, or copy the computation body into its own subtree.
 
-### 5.6 Linear Attention
+### 5.6 Softmax Attention
+
+`src/ops/softmax_attention/` is the algorithm category for Attention transformations whose
+probabilities are produced by stable Softmax over an explicitly defined visible-key set. Its
+target peer families are `dense/` and `sliding_window/`. Until the one-time cutover, the existing
+horizontal GQA, Vision, bidirectional-GQA, and SWA files are migration sources, not an alternative
+ownership model.
+
+MHA, MQA, and GQA are values of the common Head geometry, not family names. Text, Vision, MTP, and
+DFlash are callers, not Op identities. Flash, split-KV, small-T, prompt, and paged execution are
+private implementation or storage strategies, not semantic contracts.
+
+Dense Attention may expose separate entries for plain Q/K/V, packed segments, causal cache
+append-and-attend, cached-only causal execution, and read-only context plus a query segment. These
+entries share the scaled dot-product Softmax formula and Head mapping, but each states its own
+visible set, physical operands, mutations, workspace, and execution envelope. Sliding-window
+Attention remains a peer family because its absolute-position window and cyclic cache define a
+different visible set and state layout.
+
+The authoritative directory, contract, naming, migration, test, and extension rules are in
+[`softmax-attention.md`](softmax-attention.md). Do not add an Attention base class, arbitrary mask
+IR, runtime kind registry, forwarding compatibility header, or empty future family.
+
+### 5.7 Linear Attention
 
 `src/ops/linear_attention/` is the algorithm category for stateful or otherwise non-softmax
 attention transformations. It is distinct from `src/ops/linear/`, which owns matrix Linear formats
@@ -454,7 +480,7 @@ Formal paths, contract entries, tests, and core benchmarks spell the algorithm
 materially useful, such as established compound model-layer names and state/layout identifiers; it
 is not a second algorithm name.
 
-### 5.7 Implementation comments
+### 5.8 Implementation comments
 
 Launcher and kernel files reference the semantic contract instead of copying it. Record the match
 predicate and implementation assumptions in a compact form:
@@ -574,11 +600,12 @@ conformance matrix, and target-representative activations is not a universal err
 arbitrary unbounded or adversarial tensors. Each semantically complete entry point is checked
 directly against the oracle; pairwise implementation parity is supplementary evidence.
 
-GQA applies this rule concretely. BF16-cache and INT8-G64-cache A1/A3 share an FP64 ideal attention
-oracle over BF16 Q and logical cache values (BF16 or FP32-decoded INT8-G64). The target's INT8
-Q8-G64 query compute profile remains an intentional optimized implementation; the GQA suite gives
-the BF16-cache and INT8-cache compute profiles separate named criteria without folding either into
-a second reference. Exact INT8 cache code and scale validation remains a separate codec check.
+Cached causal Softmax Attention applies this rule concretely. BF16-cache and INT8-G64-cache
+append-and-attend/cached-only entries share an FP64 ideal attention oracle over BF16 Q and logical
+cache values (BF16 or FP32-decoded INT8-G64). The target's INT8 Q8-G64 query compute profile remains
+an intentional optimized implementation; the Softmax Attention suite gives the BF16-cache and
+INT8-cache compute profiles separate named criteria without folding either into a second reference.
+Exact INT8 cache code and scale validation remains a separate codec check.
 
 ### 8.1 Op qualification standard
 
@@ -758,7 +785,8 @@ Use this sequence for a proposed device transformation:
    genuinely narrow reusable primitives in `common`. Use the horizontal directories by default or
    one vertically owned category/family subtree for a semantically closed family with several
    routes or stages. Use `linear/` for matrix Linear format/plan/GEMV/GEMM work and
-   `linear_attention/` for admitted Linear Attention families.
+   `softmax_attention/` for admitted Softmax Attention families, and `linear_attention/` for
+   admitted Linear Attention families.
 6. **Make resource ownership explicit.** The caller supplies outputs, state views, workspace, and
    stream. Keep persistent state and schedule policy outside the Op.
 7. **Add necessary evidence.** Add or update the smallest independent Op qualification suite that
