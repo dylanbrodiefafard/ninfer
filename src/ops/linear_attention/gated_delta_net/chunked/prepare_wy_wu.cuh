@@ -269,7 +269,7 @@ load_scaled_wu_panel_from_smem(SmemTile<WU_PANEL_COLS> panel, Bf16SmemTile<WU_PA
     }
 }
 
-template <int WU_PANEL_COLS, int BLOCK_WARPS>
+template <bool InterleaveOutput, int WU_PANEL_COLS, int BLOCK_WARPS>
 __device__ __forceinline__ void
 compute_store_wu_panel(SmemTile<BT> T_view, SmemTile<WU_PANEL_COLS> panel,
                        __nv_bfloat16* __restrict__ output_smem,
@@ -330,9 +330,20 @@ compute_store_wu_panel(SmemTile<BT> T_view, SmemTile<WU_PANEL_COLS> panel,
     for (int v = lane; v < STORE_PER_WARP; v += ninfer::ops::kWarpSize) {
         const int row  = v / STORE_PER_ROW;
         const int col8 = (v - row * STORE_PER_ROW) * STORE_ELEMS;
-        const int4 packed =
-            load_vec<int4>(&warp_output[row * WARP_PANEL_COLS +
-                                        wu_output_swizzled_col<WARP_PANEL_COLS>(row, col8)]);
+        uint4 packed =
+            load_vec<uint4>(&warp_output[row * WARP_PANEL_COLS +
+                                         wu_output_swizzled_col<WARP_PANEL_COLS>(row, col8)]);
+        if constexpr (InterleaveOutput) {
+            // W is a private prepare -> state-passing workspace. Store every
+            // group of eight columns as {0,4,1,5,2,6,3,7}, so the consumer's
+            // native-BF16 ldmatrix.x2 directly produces its TF32 A fragment.
+            packed = {
+                (packed.x & 0x0000ffffU) | (packed.z << 16),
+                (packed.x >> 16) | (packed.z & 0xffff0000U),
+                (packed.y & 0x0000ffffU) | (packed.w << 16),
+                (packed.y >> 16) | (packed.w & 0xffff0000U),
+            };
+        }
         store_vec(output_row0 + (std::int64_t)(row_tile * MMA_M + row) * output_row_stride +
                       panel_col + warp_panel_col + col8,
                   packed);
@@ -692,7 +703,7 @@ prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16
                                                                beta_smem, panel_col, tid);
         }
         __syncthreads();
-        compute_store_wu_panel<WU_PANEL_COLS, BLOCK_WARPS>(
+        compute_store_wu_panel<false, WU_PANEL_COLS, BLOCK_WARPS>(
             T_view, WU_view, output_smem, U + out_base, out_row_stride, panel_col, warp, lane);
     }
 
@@ -705,7 +716,7 @@ prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16
         load_scaled_wu_panel<WU_PANEL_COLS, BLOCK_THREADS>(WU_view, k_in + k_wu_base, k_stride_t,
                                                            bg_smem, panel_col, tid);
         __syncthreads();
-        compute_store_wu_panel<WU_PANEL_COLS, BLOCK_WARPS>(
+        compute_store_wu_panel<true, WU_PANEL_COLS, BLOCK_WARPS>(
             T_view, WU_view, output_smem, W + out_base, out_row_stride, panel_col, warp, lane);
     }
 }

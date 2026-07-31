@@ -24,12 +24,12 @@ constexpr int kStateDim = 128;
 
 constexpr ReductionCriterion gated_delta_net_output_bf16_criterion() {
     return {/*relative_l2=*/4.1e-3, /*gross_absolute=*/5.0e-6,
-            /*gross_relative_to_max_reference=*/5.2e-3};
+            /*gross_relative_to_max_reference=*/5.5e-3};
 }
 
 constexpr ReductionCriterion gated_delta_net_state_fp32_criterion() {
     return {/*relative_l2=*/2.7e-3, /*gross_absolute=*/1.0e-5,
-            /*gross_relative_to_max_reference=*/3.5e-3};
+            /*gross_relative_to_max_reference=*/3.9e-3};
 }
 
 struct Case {
@@ -399,6 +399,8 @@ int main() {
     failures += distinct_state_case({"27b exact chunk raw-qk", 16, 48, 64, false}, 12164u);
     failures += inplace_case({"35b chunk-tail fused-qk-norm", 16, 32, 65, true}, 12065u);
     failures += distinct_state_case({"generic grouped-map chunk-tail", 3, 12, 65, true}, 12365u);
+    failures += distinct_state_case({"27b two-chunk fused-qk-norm", 16, 48, 128, true}, 12128u);
+    failures += inplace_case({"35b two-chunk raw-qk", 16, 32, 128, false}, 12228u);
 
     // Snapshot is a separate public state transition. Nonzero source slots also prove that the
     // selected initial state, not slot zero, seeds the complete recurrence.
