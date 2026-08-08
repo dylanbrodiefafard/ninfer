@@ -37,6 +37,7 @@ additional user workflows or installed API documentation.
 
 Active implementation and architecture references:
 
+- [Small-scale concurrent inference architecture](maintainer/concurrent-inference-architecture.md)
 - [Op admission, contracts, ownership, qualification, and performance rules](maintainer/op-development.md)
 - [Softmax Attention organization and migration contract](maintainer/softmax-attention.md)
 - [Linear benchmark contract and registered suites](maintainer/linear-benchmark.md)
