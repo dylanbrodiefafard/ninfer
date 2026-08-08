@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/pdl.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
@@ -402,7 +403,7 @@ struct Q4GemvStoreEpilogue {
 };
 
 template <class Schedule, bool SplitOutput = false, int SplitRow = 0,
-          class Epilogue = Q4GemvStoreEpilogue>
+          class Epilogue = Q4GemvStoreEpilogue, bool TriggerPdl = false, bool JoinPdl = false>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kLaunchBoundsMinBlocks)
 void q4_rowsplit_gemv_kernel(
     const __nv_bfloat16* __restrict__ x,
@@ -418,6 +419,10 @@ void q4_rowsplit_gemv_kernel(
     constexpr int kWarpsPerRow = Schedule::kWarpsPerRow;
     static_assert(!SplitOutput || SplitRow > 0,
                   "split-output Q4 GEMV requires a positive compile-time seam");
+
+    if constexpr (TriggerPdl) {
+        if (threadIdx.x == 0) { pdl::trigger_dependents(); }
+    }
 
     __shared__ Q4GemvTileStorage<Schedule> shared_tiles;
     __shared__ float row_partials[kRowsPerCta][kWarpsPerRow];
@@ -508,6 +513,7 @@ void q4_rowsplit_gemv_kernel(
                                                                 row_accumulator);
         }
     }
+    if constexpr (JoinPdl) { pdl::wait_for_dependencies(); }
 }
 
 } // namespace ninfer::ops::detail

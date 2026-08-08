@@ -193,79 +193,29 @@ cmake --build build --parallel --target ninfer_gated_delta_net_bench ninfer_gdn_
   --route fused --norm-control fused --qk-norm fused --warmup 20 --repeat 500
 ```
 
-## Input-projection Op benchmark
+## GDN input projection/convolution/snapshot Op benchmark
 
-`ninfer_input_proj_bench` measures the exact Qwen3.6-27B Attention and GDN input-projection shapes,
-including the stateful GDN convolution/snapshot form.
-The default Q4/Q5 Attention production path uses two parent projections and its benchmark-only
-control uses the former four logical projections. BF16 and NVFP4 modes measure the single-parent
-Attention route; NVFP4 accepts `--policy a16|a4`. GDN production writes directly into the pitched
-final output; its controls isolate projection time and the former materialize-plus-two-copy
-composition. All timed operands, including the queried A4 workspace, are allocated before
-measurement, and each sample is preceded by a 256 MiB L2 flush. Activation quantization remains
-inside the timed public call. Existing Q4/Q5 production accepts the Text token extent through the
-benchmark allocation limit; controls remain limited to their Small-T domain.
+`ninfer_gdn_input_proj_conv_snapshot_bench` measures the public Qwen3.6-27B Q4/Q5
+`gdn_input_proj_conv_snapshot` contract. The timed body is exactly one complete public Op call;
+the benchmark does not include private launchers, candidate selection, duplicated compositions, or
+route labels. Its default `T=1..6` sweep is the production MTP verification interval.
 
-```bash
-cmake --build build --parallel --target ninfer_input_proj_bench
-./build/bench/ninfer_input_proj_bench \
-  --op all --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,128,129,1024 \
-  --warmup 5 --repeat 50 --csv-out profiles/bench/input_proj.csv
-```
-
-The four-projection and materialize/copy controls exist only in this benchmark and are not
-production-callable routes.
-
-BF16 Attention defaults to the complete decode/small-T sweep plus the first MMA point, a full/tail
-tile pair, the primary prefill point, and representative larger chunks. A focused decode run is:
+CUDA Graph replay is the default execution mode. The graph contains external timing event nodes
+around the complete Op body, while L2 eviction stays outside the timed interval. Cold-cache results
+model successive model layers with distinct weights and are the authoritative comparison; warm
+results make launch and cache effects visible. The initial state occupies a slot disjoint from all
+published snapshot slots, so repeated replay does not introduce a benchmark-only state reset.
 
 ```bash
-./build/bench/ninfer_input_proj_bench \
-  --op attention --weight-type bf16 --t-sweep 1 \
-  --warmup 20 --repeat 500
+cmake --build build --parallel --target ninfer_gdn_input_proj_conv_snapshot_bench
+./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
+  --sweep 1:6 --execution graph --cache both \
+  --warmup 10 --repeat 100 \
+  --csv-out profiles/bench/gdn_input_proj_conv_snapshot.csv
 ```
 
-`--bf16-route production|small-t|mma|all` provides the corresponding benchmark-local crossover
-controls. The candidate small-T implementation remains measurable through `T=32`; this range is
-not the production crossover.
-
-The NVFP4 A16 decode point is:
-
-```bash
-./build/bench/ninfer_input_proj_bench \
-  --op attention --weight-type nvfp4 --t-sweep 1 \
-  --warmup 10 --repeat 200
-```
-
-The primary NVFP4 W4A4 point is:
-
-```bash
-./build/bench/ninfer_input_proj_bench \
-  --op attention --weight-type nvfp4 --policy a4 --t-sweep 1024 \
-  --warmup 5 --repeat 30
-```
-
-The NVFP4 GDN snapshot mode calls only the complete public Op. `a16` is registered through `T=16`;
-`a4` keeps those extents on the same fused A16 kernels and uses W4A4 Linear plus one post kernel
-for `T>16`:
-
-```bash
-./build/bench/ninfer_input_proj_bench \
-  --op gdn-snapshot --weight-type nvfp4 --policy a4 \
-  --t-sweep 1,4,8,16,17,1024 --warmup 10 --repeat 100
-```
-
-Its table and CSV separate logical Op bytes from route-private single-pass bytes. Logical bytes
-include the encoded parent, BF16 activation, convolution weights, selected initial history, four
-final outputs, and published snapshots. Private bytes report the packed BF16 projection
-write/read and, on W4A4 routes, activation-code/scale write/read. These are an explicit useful-byte
-model, not a claim about cache-line or physical DRAM traffic.
-
-The direct Attention and stateless GDN modes count the complete parent exactly once, one activation
-read, and the final output writes. Their result reports the same fixed-spec `DRAM_%` and measured
-pure-read `READ_%` columns as the Linear control, plus profile-appropriate BF16 or FP4 `TC_%`.
-`--profile` performs setup, warmup, and L2 eviction before capturing exactly one selected launch;
-production routes enter through the corresponding public BF16 or NVFP4 Op call.
+`--execution eager|both` is available only to attribute launch behavior; it calls the same public
+Op with the same operands and workspace.
 
 ## Bidirectional GQA Op benchmark
 

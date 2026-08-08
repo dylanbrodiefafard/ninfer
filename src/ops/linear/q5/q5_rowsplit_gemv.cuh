@@ -18,6 +18,7 @@
 // (8 uint4), 32 scale bytes (2 uint4). All weight reads are fully coalesced 128-bit
 // loads, so the kernel runs DRAM-bound instead of L1/LSU- or latency-bound.
 
+#include "core/pdl.cuh"
 #include "ops/common/math.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
@@ -101,7 +102,8 @@ struct Q5GemvStoreEpilogue {
 };
 
 template <int kN, int kK, int kRowsPerBlock, int kStages, bool kStageX, bool kResidual,
-          bool kSplitOutput = false, int kSplitRow = 0, class Epilogue = Q5GemvStoreEpilogue>
+          bool kSplitOutput = false, int kSplitRow = 0, class Epilogue = Q5GemvStoreEpilogue,
+          bool TriggerPdl = false, bool JoinPdl = false>
 __global__ void
 q5_rowsplit_gemv_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
                         const std::uint8_t* __restrict__ high_bits,
@@ -121,6 +123,10 @@ q5_rowsplit_gemv_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t*
     static_assert(!kSplitOutput || (kSplitRow > 0 && kSplitRow < kN),
                   "split-output Q5 GEMV requires an interior compile-time seam");
     static_assert(!kResidual || !kSplitOutput, "the Q5 residual GEMV epilogue is contiguous-only");
+
+    if constexpr (TriggerPdl) {
+        if (threadIdx.x == 0) { pdl::trigger_dependents(); }
+    }
 
     // __align__(16) so the uint4 staging below is well-defined by construction.
     __shared__ __align__(16) __nv_bfloat16 x_sh[kStageX ? kK : 1];
@@ -190,6 +196,7 @@ q5_rowsplit_gemv_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t*
     if (lane == 0) {
         epilogue.template operator()<kSplitOutput, kSplitRow>(out, out_tail, row, acc);
     }
+    if constexpr (JoinPdl) { pdl::wait_for_dependencies(); }
 }
 
 // One block per kRowsPerBlock rows; kRowsPerBlock warps per block.

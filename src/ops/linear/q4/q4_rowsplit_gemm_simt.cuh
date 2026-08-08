@@ -13,6 +13,7 @@
 // never falls back to scalar code-pair loads, and lanes belonging to inactive
 // groups do not form or read an activation address.
 
+#include "core/pdl.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
@@ -183,7 +184,7 @@ struct Q4SimtStoreEpilogue {
 };
 
 template <class Schedule, bool Full, bool SplitOutput = false, int SplitRow = 0,
-          class Epilogue = Q4SimtStoreEpilogue>
+          class Epilogue = Q4SimtStoreEpilogue, bool TriggerPdl = false, bool JoinPdl = false>
 __global__ __launch_bounds__(
     Schedule::kThreads,
     Schedule::
@@ -202,6 +203,10 @@ __global__ __launch_bounds__(
                                                                   Epilogue epilogue = {}) {
     static_assert(!SplitOutput || SplitRow > 0,
                   "split-output Q4 SIMT requires a positive compile-time seam");
+
+    if constexpr (TriggerPdl) {
+        if (threadIdx.x == 0) { pdl::trigger_dependents(); }
+    }
 
     constexpr bool kFull              = Full;
     constexpr int kRowsPerCta         = Schedule::kRowsPerCta;
@@ -311,6 +316,7 @@ __global__ __launch_bounds__(
                                                                 row, col0, active_cols, sums);
         }
     }
+    if constexpr (JoinPdl) { pdl::wait_for_dependencies(); }
 }
 
 } // namespace ninfer::ops::detail
