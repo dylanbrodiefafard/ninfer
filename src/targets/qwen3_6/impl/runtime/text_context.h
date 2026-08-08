@@ -192,7 +192,8 @@ public:
     void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                            ops::GqaExecutionEnvelope envelope, Tensor& mtp_hidden,
                            int logits_column, Tensor* logits, Tensor* draft_token,
-                           const Tensor* explicit_rope_positions = nullptr);
+                           const Tensor* explicit_rope_positions = nullptr,
+                           const Tensor* input_embeddings        = nullptr);
     void mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
                              const Tensor& position, ops::GqaExecutionEnvelope envelope,
                              Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token);
@@ -219,7 +220,7 @@ private:
                           Tensor& mtp_hidden);
     void mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                           const Tensor& rope_positions, ops::GqaExecutionEnvelope envelope,
-                          Tensor& mtp_hidden);
+                          Tensor& mtp_hidden, const Tensor* input_embeddings);
     void mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
                            const Tensor& positions, const Tensor& rope_positions,
                            ops::GqaExecutionEnvelope envelope, bool final_chunk,

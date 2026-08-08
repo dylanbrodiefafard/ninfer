@@ -11,7 +11,7 @@
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 void mtp_bridge_and_propose(State& state, const Tensor& next_token, const Tensor& previous_hidden,
                             std::int32_t position, std::span<const std::int32_t> rope_position,
-                            bool build_proposal) {
+                            bool build_proposal, const Tensor* next_embedding) {
     if (state.mtp_kv == nullptr || !state.io.mtp) {
         throw std::logic_error("MTP bridge requires MTP storage");
     }
@@ -37,7 +37,7 @@ void mtp_bridge_and_propose(State& state, const Tensor& next_token, const Tensor
     const ops::GqaExecutionEnvelope bridge_envelope{bridge_visible, bridge_visible};
     card.mtp_forward_batch(next_token, previous_hidden, position_view, bridge_envelope, mtp_hidden,
                            build_proposal ? 0 : -1, build_proposal ? &logits : nullptr,
-                           build_proposal ? &draft0 : nullptr, &rope_position_view);
+                           build_proposal ? &draft0 : nullptr, &rope_position_view, next_embedding);
     if (!build_proposal) { return; }
 
     ops::set_i32_scalar(state.io.mtp->position, position + 1, state.device.stream);

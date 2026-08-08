@@ -76,10 +76,17 @@ struct MultimodalPrefillResult {
     double vision_seconds            = 0.0;
 };
 
+struct MtpBridgeInput {
+    const Tensor* previous_hidden = nullptr;
+    std::int32_t position         = 0;
+    std::array<std::int32_t, 3> rope_position{};
+};
+
 [[nodiscard]] MultimodalPrefillResult
 prefill_multimodal(State& state, const PreparedPromptData& prompt, const VisionPrefillPlan& plan,
                    runtime::TransientRegion transient,
-                   std::optional<std::uint32_t> snapshot_boundary, bool prepare_mtp);
+                   std::optional<std::uint32_t> snapshot_boundary, bool prepare_mtp,
+                   const MtpBridgeInput* mtp_bridge);
 
 void sample_from_hidden(State& state, const Tensor& hidden, std::int32_t absolute_position,
                         std::int32_t purpose);
@@ -89,7 +96,7 @@ void speculative_verify_and_accept(State& state, TextContext& card, std::uint32_
                                    ops::GqaExecutionEnvelope target_envelope);
 void mtp_bridge_and_propose(State& state, const Tensor& next_token, const Tensor& previous_hidden,
                             std::int32_t position, std::span<const std::int32_t> rope_position,
-                            bool build_proposal);
+                            bool build_proposal, const Tensor* next_embedding = nullptr);
 
 // Executes an exact one-token target step through the verify schedule. The resulting target hidden
 // is in io.verify_hidden[:,0], the sampled token is in io.token, and the configured Linear

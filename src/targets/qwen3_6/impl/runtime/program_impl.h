@@ -619,7 +619,7 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
         bool mtp_prepared    = false;
         bool dflash_prepared = false;
 
-        if (had_suffix && plan.needs_mtp_bridge) {
+        if (had_suffix && plan.needs_mtp_bridge && !plan.vision) {
             mark_workspace_usage(workspace_plan.mtp_prefill);
             Tensor bridge_token = io.speculative.target_input_ids.slice(0, 0, 1);
             const TokenId token = prompt.token_ids[base];
@@ -638,10 +638,21 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
             mark_workspace_usage(workspace_plan.vision_encode);
             mark_workspace_usage(plan.prepare_mtp ? workspace_plan.mtp_prefill
                                                   : workspace_plan.text_prefill);
-            const auto multimodal_start = Clock::now();
-            const schedule::MultimodalPrefillResult result =
-                schedule::prefill_multimodal(schedule_state, prompt, *plan.vision, transient,
-                                             snapshot_boundary, plan.prepare_mtp);
+            std::optional<schedule::MtpBridgeInput> mtp_bridge;
+            if (plan.needs_mtp_bridge) {
+                const Tensor& bridge_hidden =
+                    plan.reuse == ReusePath::RestoreBoundary ? boundary_hidden : tail_hidden;
+                mtp_bridge = schedule::MtpBridgeInput{
+                    .previous_hidden = &bridge_hidden,
+                    .position        = checked_i32(base - 1, "bridge position"),
+                    .rope_position   = prompt_rope_position(prompt, base - 1),
+                };
+            }
+            const auto multimodal_start                    = Clock::now();
+            const schedule::MultimodalPrefillResult result = schedule::prefill_multimodal(
+                schedule_state, prompt, *plan.vision, transient, snapshot_boundary,
+                plan.prepare_mtp, mtp_bridge ? &*mtp_bridge : nullptr);
+            if (mtp_bridge) { mtp_kv_valid = base; }
             mtp_prepared = result.mtp_prepared;
             copy_tail(prefill_hidden.slice(1, static_cast<int>(result.final_chunk_tokens) - 1, 1));
             copy_round_token();

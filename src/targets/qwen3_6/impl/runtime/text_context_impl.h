@@ -371,12 +371,12 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
 
 void TextContext::mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                                    const Tensor& rope_positions, ops::GqaExecutionEnvelope envelope,
-                                   Tensor& mtp_hidden) {
+                                   Tensor& mtp_hidden, const Tensor* input_embeddings) {
     if (mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     auto scratch_scope = work_.scope();
     Tensor x;
     Tensor ah;
-    mtp_forward_stem(ids, hidden, nullptr, x, ah);
+    mtp_forward_stem(ids, hidden, input_embeddings, x, ah);
     mtp_forward_tail(x, ah, positions, rope_positions, envelope, mtp_hidden);
 }
 
@@ -516,7 +516,8 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
 void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
                                     const Tensor& positions, ops::GqaExecutionEnvelope envelope,
                                     Tensor& mtp_hidden, int logits_column, Tensor* logits,
-                                    Tensor* draft_token, const Tensor* explicit_rope_positions) {
+                                    Tensor* draft_token, const Tensor* explicit_rope_positions,
+                                    const Tensor* input_embeddings) {
     if (mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     const int T = ids.ne[0];
     if (T <= 0 || static_cast<std::uint32_t>(T) > prefill_chunk_) {
@@ -548,7 +549,8 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
                !rope_positions->is_contiguous() || rope_positions->data == nullptr) {
         throw std::invalid_argument("MTP explicit rope positions must be [T] or [T,3]");
     }
-    mtp_forward_core(ids, hidden, positions, *rope_positions, envelope, mtp_hidden);
+    mtp_forward_core(ids, hidden, positions, *rope_positions, envelope, mtp_hidden,
+                     input_embeddings);
 
     if (logits_column >= 0) {
         auto logits_scope = work_.scope();
@@ -571,7 +573,8 @@ void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
     auto position_scope  = work_.scope();
     Tensor rope_position = work_.alloc(DType::I32, {1});
     ops::offset_i32_positions(position, io_.rope_delta, rope_position, ctx_.stream);
-    mtp_forward_core(token, previous_hidden, position, rope_position, envelope, mtp_hidden);
+    mtp_forward_core(token, previous_hidden, position, rope_position, envelope, mtp_hidden,
+                     nullptr);
     auto logits_scope = work_.scope();
     proposal_argmax(mtp_hidden, logits, draft_token);
 }

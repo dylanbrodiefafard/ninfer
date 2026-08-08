@@ -140,14 +140,6 @@ RequestPlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     plan->prepare_dflash =
         speculative_backend == SpeculativeBackend::DFlash &&
         static_cast<std::uint64_t>(plan->summary.prompt_tokens) + draft_window + 1ULL <= capacity;
-    if (plan->needs_mtp_bridge && plan->reuse_base < plan->summary.prompt_tokens &&
-        prompt.token_types[plan->reuse_base] != 0) {
-        // A bridge consumes the first suffix token as the MTP shifted embedding. Reusing target
-        // state remains valid when that token is visual, but the one-column bridge currently has
-        // no Vision embedding input. Keep the target prefix and fall back to ordinary decode.
-        plan->prepare_mtp      = false;
-        plan->needs_mtp_bridge = false;
-    }
 
     if (prompt.has_media()) {
         VisionPrefillPlan vision;

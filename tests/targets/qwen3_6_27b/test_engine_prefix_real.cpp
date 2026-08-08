@@ -361,6 +361,38 @@ int exercise_vision(ninfer::Engine& engine) {
                   << " vision=" << stopped_reuse.timings.vision_seconds << '\n';
         return 1;
     }
+
+    // Exact registered rendering prefix before the first image-pad column:
+    // <|im_start|>user\n<|vision_start|>. Reusing it places the MTP bridge directly on the first
+    // Vision merger column rather than on an ordinary token embedding.
+    const std::vector<ninfer::TokenId> visual_prefix{248045, 846, 198, 248053};
+    ninfer::RequestOptions source_options            = options(false);
+    source_options.execution.requested_output_tokens = 1;
+    const ninfer::GenerationResult bridge_source =
+        engine.generate(engine.prepare_tokens(visual_prefix), source_options);
+    ninfer::RequestOptions bridge_options            = options(true);
+    bridge_options.execution.requested_output_tokens = 5;
+    const ninfer::GenerationResult visual_bridge =
+        engine.generate(engine.prepare(first_input(image_bytes)), bridge_options);
+    if (bridge_source.generated_token_ids.size() != 1 ||
+        visual_bridge.reused_prompt_tokens != visual_prefix.size() ||
+        !(visual_bridge.timings.vision_seconds > 0.0) || visual_bridge.speculative.rounds == 0) {
+        std::cerr << "visual MTP bridge did not append the prefix and enter speculative decode: "
+                  << "source_outputs=" << bridge_source.generated_token_ids.size()
+                  << " reused=" << visual_bridge.reused_prompt_tokens
+                  << " vision=" << visual_bridge.timings.vision_seconds
+                  << " rounds=" << visual_bridge.speculative.rounds
+                  << " fallbacks=" << visual_bridge.speculative.fallback_steps << '\n';
+        return 1;
+    }
+    ninfer::RequestOptions bridge_baseline_options       = bridge_options;
+    bridge_baseline_options.execution.allow_prefix_reuse = false;
+    const ninfer::GenerationResult visual_bridge_baseline =
+        engine.generate(engine.prepare(first_input(image_bytes)), bridge_baseline_options);
+    if (visual_bridge.generated_token_ids != visual_bridge_baseline.generated_token_ids) {
+        std::cerr << "visual MTP bridge changed greedy output relative to full prefill\n";
+        return 1;
+    }
     return 0;
 }
 

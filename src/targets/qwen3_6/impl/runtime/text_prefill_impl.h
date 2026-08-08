@@ -7,6 +7,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
@@ -56,7 +57,7 @@ MultimodalPrefillResult prefill_multimodal(State& state, const PreparedPromptDat
                                            const VisionPrefillPlan& plan,
                                            runtime::TransientRegion transient,
                                            std::optional<std::uint32_t> snapshot_boundary,
-                                           bool prepare_mtp) {
+                                           bool prepare_mtp, const MtpBridgeInput* mtp_bridge) {
     TextContext card(state.device, state.model, state.work, state.text_kv, state.linear_attention,
                      state.io, state.prefill_hidden, state.prefill_chunk, state.text_kv_base,
                      prepare_mtp ? state.mtp_kv : nullptr);
@@ -68,6 +69,43 @@ MultimodalPrefillResult prefill_multimodal(State& state, const PreparedPromptDat
         state.diagnostic_vision_tap != nullptr ? state.diagnostic_context : nullptr;
     VisionPrefillSession vision(state.device, state.model, state.work, prompt, plan, transient,
                                 vision_tap_context, state.diagnostic_vision_tap);
+    if (mtp_bridge != nullptr) {
+        if (!prepare_mtp || mtp_bridge->previous_hidden == nullptr || state.text_kv_base == 0 ||
+            mtp_bridge->position < 0 ||
+            static_cast<std::uint32_t>(mtp_bridge->position) + 1 != state.text_kv_base) {
+            throw std::logic_error("multimodal MTP bridge does not match the reusable frontier");
+        }
+
+        Tensor bridge_token = state.io.speculative.target_input_ids.slice(0, 0, 1);
+        const TokenId token = prompt.token_ids[state.text_kv_base];
+        CUDA_CHECK(cudaMemcpyAsync(bridge_token.data, &token, sizeof(token), cudaMemcpyHostToDevice,
+                                   state.device.stream));
+
+        Tensor visual_embedding;
+        const Tensor* composed_embedding = nullptr;
+        if (prompt.token_types[state.text_kv_base] != 0) {
+            const VisionChunk chunk = vision.prepare_chunk(state.text_kv_base, 1);
+            if (chunk.control == nullptr) {
+                throw std::logic_error("visual MTP bridge has no encoded Vision item");
+            }
+            const auto& scatter = chunk.control->scatter_indices;
+            const auto column   = std::lower_bound(scatter.begin(), scatter.end(),
+                                                   static_cast<std::int32_t>(state.text_kv_base));
+            if (column == scatter.end() ||
+                *column != static_cast<std::int32_t>(state.text_kv_base) ||
+                static_cast<std::uint8_t>(chunk.control->modality) !=
+                    prompt.token_types[state.text_kv_base]) {
+                throw std::logic_error("visual MTP bridge does not match Vision scatter metadata");
+            }
+            visual_embedding =
+                chunk.embeddings.slice(1, static_cast<std::int32_t>(column - scatter.begin()), 1);
+            composed_embedding = &visual_embedding;
+        }
+
+        mtp_bridge_and_propose(state, bridge_token, *mtp_bridge->previous_hidden,
+                               mtp_bridge->position, mtp_bridge->rope_position, false,
+                               composed_embedding);
+    }
     if (state.diagnostic_text_tap != nullptr) {
         card.diagnostic_prefill(prompt, state.text_kv_base, vision, state.diagnostic_context,
                                 state.diagnostic_text_tap);
