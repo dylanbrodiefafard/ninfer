@@ -1,0 +1,1446 @@
+# NInfer Paged KV Context Store
+
+本文定义 NInfer 在单 GPU、单 resident model、少量并发请求下的 growing KV 存储架构。它是
+[小规模并发推理架构](concurrent-inference-architecture.md)所依赖的 KV substrate。
+
+本文定义 KV pool layout、page ownership、容量预留、逻辑 frontier、prefix retention 和生命周期，
+同时定义当前迁移所需的 device block-table representation、单 sequence paged KV execution view、
+受影响 Op 的状态效果、kernel 寻址约束和性能准入条件。具体 allocator 算法和 CUDA kernel 代码不由
+本文规定。
+
+---
+
+## 1. Requirements
+
+- `max_concurrency=2..8` 的 active requests 共享各类 growing KV capacity；
+- 单个 request 可以使用 main KV pool 的大部分容量，不按 slot 平均切分；
+- 不同 request 的物理 KV 不要求连续；
+- active、retained 和 speculative provisional KV 使用同一套 reservation accounting；
+- prefix state 可以在不复制 KV payload 的情况下从 retained owner 转移给 active request；
+- active request 一旦 admission，其声明范围内的 prefill、decode 和 speculative temporary growth
+  都有 completion capacity guarantee；
+- 一个 GPU execution unit 期间，page mappings 和 logical valid frontiers 保持稳定；
+- BF16、INT8-G64 以及 target 定义的其他固定 bytes-per-token layouts 使用同一管理语义；
+- common allocator 不理解 GQA、MHA、MLA、MTP 或 DFlash 等模型语义；
+- 当前单请求 Attention、KV append 和 DFlash full-context consumer 全部直接消费 paged KV，
+  不再要求 sequence 的 growing KV 物理连续；
+- paged 寻址不能引入 gather-to-contiguous copy，并必须通过与当前连续实现相同 workload 的性能准入。
+
+### 1.1 Non-goals
+
+- request preemption、swap、KV offload 或跨 GPU storage；
+- active requests 之间共享可写 prefix、page reference counting 或 copy-on-write branching；
+- arbitrary longest-common-prefix reuse；
+- 用一个 universal raw-byte allocator 在 serving 期间动态重分不同 KV layouts 的显存；
+- 为 bounded cyclic KV 或 operator transient K/V 强行提供同一种 paging；
+- 在 serving 期间改变 pool layout 或 page size；
+- 在本次迁移中加入 batched Attention、ragged batch descriptor 或其他并发 model-execution 接口；
+- 借 paged KV 迁移重组 Attention 源码目录、重命名 Attention family 或扩大支持的数学 domain。
+
+---
+
+## 2. Three independent granularities
+
+KV 设计必须区分三个彼此独立的粒度：
+
+| 粒度 | 含义 | 固定值或约束 |
+|---|---|---|
+| allocation granularity | 一个 homogeneous pool 一次取得或释放多少 token 的 payload | 当前各 growing pool 均为 `P=64` |
+| valid-frontier granularity | 哪些逻辑 KV positions 可以被读取 | 1 token |
+| reusable-state granularity | 哪些 prefix positions 拥有完整 continuation state | 由完整 sequence state checkpoint 决定 |
+
+Page boundary 既不是 Attention 语义边界，也不是 prefix-cache hit boundary。一个合法 frontier 可以位于
+page 内部任意 token offset。
+
+当前 Qwen3.6 target 的 Linear Attention state 不能从 KV prefix 单独重建。Prefix lookup 只能使用保留了
+完整 continuation state 的 target-declared checkpoint。当前可复用位置是 current resume frontier 和一份
+有效时的 assistant-content boundary checkpoint，具体 claim/restore 语义见 §10。落在这两个 checkpoint
+之外的更短 token prefix 是 arbitrary partial hit，本设计不支持。
+
+Paged KV Store 本身可以按任意 logical frontier truncate；这不表示上层拥有在任意位置恢复整个模型的
+能力。Reusable position 必须由 target 的完整 checkpoint 证明；增加新的 checkpoint 不需要改变 page
+geometry。
+
+---
+
+## 3. KV pool set and capacity model
+
+### 3.1 Homogeneous pools
+
+一个 Engine 在 startup 时由 exact target、KV dtype 和 speculative backend 建立一个固定的 KV pool set：
+
+```text
+ordinary Engine:
+    Main Text KV Pool
+
+MTP Engine:
+    Main Text KV Pool
+    MTP KV Pool
+
+DFlash Engine:
+    Main Text KV Pool
+    DFlash Full-Context KV Pool
+```
+
+MTP 与 DFlash 是 engine-wide mutually exclusive backends，因此一个 Engine 当前最多包含两个 growing
+KV pools。DFlash local cyclic KV 属于 fixed state，不在这个 pool set 中。
+
+这些名称属于 target/runtime 对 pool 的使用方式。Common KV Store 只看到一组 immutable pool layouts
+和 opaque pool handles，不根据 feature name、attention type 或 runtime string 分派。
+
+### 3.2 Capacity is a vector
+
+完整并发 Engine 的 startup configuration 必须显式给出：
+
+```text
+max_sequence_context          单个 sequence 允许到达的最大逻辑 context
+main_aggregate_context        所有 active/retained requests 共享的 main KV token capacity
+max_concurrency               active sequence 上限
+selected speculative backend  off、MTP 或 DFlash
+```
+
+`max_concurrency` 只确定 control slots 和 fixed per-sequence resources 的上限，不决定任何 KV partition。
+`main_aggregate_context` 不得小于 `max_sequence_context`。Backend pool capacity 不是独立的用户配置，
+而是 startup planner 根据上述输入和 exact target frontier contract 唯一导出的结果。当前单请求 cutover
+按 §6.2 从现有 `EngineOptions.max_context` 唯一导出等价 profile，不提前增加 public 并发配置。
+
+Planner 先把显式 main aggregate capacity 归一化为 physical page capacity：
+
+```text
+N_main = ceil(main_aggregate_context / P_main)
+effective_main_aggregate_context = N_main * P_main
+```
+
+Engine 对外报告归一化后的 effective capacity；page rounding 产生的尾部不能成为未计费的隐藏容量。
+内部 admission 使用 target-derived capacity vector：
+
+```text
+KVCapacity = {
+    main_page_groups,
+    optional_backend_page_groups,
+}
+```
+
+每个 pool `s` 的 token-equivalents 为：
+
+```text
+capacity_tokens[s] = page_group_count[s] * P[s]
+```
+
+Engine 若声明单请求 `max_sequence_context=L`，Main Text pool 必须至少满足：
+
+```text
+main_page_group_count >= ceil(L / P_main)
+```
+
+Backend pool 的 page-group count 由 selected backend 的 fixed frontier relation 推导，不能从
+main/backend bytes-per-token 比例推导，也不能独立配置。
+
+### 3.3 Physical separation, coordinated capacity
+
+物理分池不表示 Main 与 backend 可以作为两个无关容量分别耗尽。当前 registered targets 的 Main、MTP
+和 DFlash Full pools 都使用 `P=64`，并满足逐 request frontier invariant：
+
+```text
+R_backend(r) <= R_main(r)
+```
+
+这里 `R_main(r)` 是 Main Text 可能 materialize 的最大 page-rounded extent，包含 target verification 的
+provisional tail；`R_backend(r)` 是 selected growing backend 的对应最大 extent：
+
+- MTP persistent KV 只推进 target 已经同时 materialize 的 cache-ordinal domain，任何 proposal tail 都不
+  超过同 round 的 Main Text provisional frontier；
+- DFlash Full 只保存从 target-produced committed features 生成的 persistent context，proposal query K/V
+  是 transient workspace，local K/V 是 fixed cyclic state，因此 DFlash Full frontier 从不领先 Main。
+
+三个 growing pools 的 page size 相同，因此 logical-frontier inequality 在 page rounding 后仍成立。由此
+startup capacity profile 唯一固定为：
+
+```text
+speculative_backend = off:
+    no backend growing pool
+
+speculative_backend = MTP or DFlash:
+    N_backend = N_main
+```
+
+这不是让两个 pools 共享 physical pages，而是为相同数量的 logical 64-token groups 分别分配 typed
+payload。Backend 不会先于 main contract 耗尽；DFlash Full frontier 暂时落后于 Main 时，main 可能先
+materialize 更多 pages，而 backend 留有 typed free pages，这不改变 capacity guarantee。
+
+因此，startup 必须在建立任一 pool 前完成全部 typed slabs、fixed state、workspace 和 driver allowance
+的显存验证；无法兑现显式 main contract 时拒绝 Engine configuration，不静默降低 capacity，也不根据
+剩余显存机会性扩容。Retained eviction 后，若一个 request set 仍满足 advertised main capacity，却无法
+取得必要 backend reservation，这是 sizing/accounting invariant violation；运行期按 Engine failure 处理，
+不能等待碰巧释放 backend pages。
+
+Main pool 已 materialize 全部 entitlement 而 backend 仍有 free pages 仍可能发生，例如 DFlash Full
+frontier 落后于 Main。Backend pages 不能解释为 Main payload，属于 coordinated profile 的 typed slack，
+不是外部碎片。Exact backend 在 startup 时已固定，Engine 应一次性规划各 typed slabs，而不是引入
+variable-size raw allocator、runtime repartition 或 compaction。
+
+---
+
+## 4. Pool layout and grouping rule
+
+### 4.1 The grouping invariant
+
+只有同时满足以下条件的 cache planes 才能组成一个 homogeneous page-group pool：
+
+1. 使用同一 cache-ordinal domain；
+2. 由同一个 logical valid frontier 管理；
+3. 一起 reserve、materialize、truncate、retain 和 release；
+4. 适合相同的 token page size `P`；
+5. 不存在有意义的独立 ownership 或独立容量复用需求。
+
+因此 grouping boundary 由 frontier 和 lifetime 决定，不由“属于同一个 request”或“属于同一个模型”
+决定。
+
+当前 pool grouping 是：
+
+| Pool | Grouped planes | Pool frontier |
+|---|---|---|
+| Main Text | 所有 target full-attention layers 的 K、V 和 optional code/scale planes | target materialized KV frontier |
+| MTP | MTP layer 的 K、V 和 optional code/scale planes | MTP KV frontier |
+| DFlash Full | DFlash full-context layer 的 K、V planes | DFlash context frontier |
+
+Text、MTP 和 DFlash 不组成同一个 physical page group，因为它们可以具有不同 valid/provisional
+frontiers、不同 retention readiness 和不同 consumer geometry。
+
+### 4.2 Allocator-visible layout
+
+每个 pool layout 至少给出：
+
+- page size `P`；
+- plane 数量；
+- 每个 plane 的 element type、logical page payload bytes、physical strides 和 alignment；
+- pool page-group count；
+- target-owned plane index mapping。
+
+KV Store 只使用这些 storage facts。Head count、head dimension、GQA/MHA/MLA 关系、quantization 公式、
+MTP/DFlash 身份以及 Attention 语义全部由 target layout 和 consuming Op 解释。Allocator 不包含
+attention-type variant。
+
+Consumer 对 K/V plane 使用统一的语义坐标：
+
+```text
+BF16 K/V plane       [D, P, Hkv, Nphysical]
+INT8 code plane      [D, P, Hkv, Nphysical]
+INT8-G64 scale plane [D/64, P, Hkv, Nphysical]
+```
+
+所有 growing KV planes 固定使用 contiguous page-major physical order；semantic axes 与 physical axes
+完全相同。对 element bytes `E` 和第一维 extent `X`（K/V/code 为 `D`，scale 为 `D/64`）：
+
+```text
+nb[0] = E
+nb[1] = X * nb[0]
+nb[2] = P * nb[1]
+nb[3] = Hkv * nb[2]
+```
+
+Plane 之间可以有 slab alignment，但单个 plane 内不允许 padding、axis permutation 或 target-specific
+physical order。对逻辑 position `p`：
+
+```text
+b = floor(p / P)
+o = p mod P
+g = block_table[b]
+
+K[d,h,p] = k_pages[d,o,h,g]
+V[d,h,p] = v_pages[d,o,h,g]
+```
+
+INT8 code 使用同一公式；scale 把 `d` 换成 quant group `d/64`。K、V、code 和 scale 不保存各自的
+page pointer table，而是使用同一个 pool-local page-group ID `g`。
+
+Common allocator 接收已经确定的 plane bytes、strides 和 alignment，不从中推导 head 或 codec 语义。
+Production wrapper 只接受上述 closed stride formula 及其 startup instance。Kernel 在 page/tile 粒度计算
+base，不在 hot loop 中解释 arbitrary layout。
+
+### 4.3 Fixed page-major order
+
+Page-major 是 Main Text、MTP 和 DFlash Full growing pools 的共同存储契约：
+
+```text
+plane
+├── physical page 0: head 0, head 1, ... head H-1
+├── physical page 1: head 0, head 1, ... head H-1
+└── ...
+```
+
+一个 page-group ID 因而在每个 plane 中选择一个 contiguous `P*Hkv` slice；同一 page 内每个 head 的
+`P` 个 positions 连续，同一 physical page 的所有 heads 也相邻。Allocator 可以返回任意 page IDs，
+consumer correctness 和 launch topology 不依赖 ID 连续性。
+
+这是唯一 registered growing-plane axis order。任何 target、dtype 和 speculative backend 都使用该契约；
+它们只在 plane inventory、shape、element type 和 pool capacity 上不同。
+
+### 4.4 Logical position domain
+
+Page table 使用 autoregressive cache ordinal，而不是 RoPE/MRoPE coordinate：
+
+```text
+logical block b covers cache positions [b*P, (b+1)*P)
+```
+
+Multimodal 三轴位置、`rope_delta` 和其他 position transformation 不改变 KV slot ownership。它们属于
+Attention input metadata。
+
+### 4.5 Fixed bytes per logical position
+
+对一个 cache family 的 `layers=L`、KV heads `H`、head dimension `D`：
+
+```text
+BF16 bytes/token
+    = 2(K,V) * L * H * D * 2
+
+INT8-G64 bytes/token
+    = 2(K,V) * L * H * D
+    + 2(K,V) * L * H * (D/64) * sizeof(FP16 scale)
+```
+
+一个 homogeneous pool 的 logical page-group payload 是其全部 grouped planes 的 bytes/token 之和乘以
+该 pool 的 `P`。Startup physical pool bytes 则由 registered plane storage spans 之和再加 slab/head
+alignment 得出；alignment 不改变 allocator 的 page-group ID 计数。不同 pools 的 page-group payload
+无需相等。
+
+---
+
+## 5. Physical page-group pool
+
+### 5.1 One allocation unit within one pool
+
+一个 Main Text page group 表示同一段 `P_main` positions 在全部 Main Text planes 中的 payload：
+
+```text
+Main Text page-group id = g
+
+target layer 3 K plane   -> page[g]
+target layer 3 V plane   -> page[g]
+target layer 7 K plane   -> page[g]
+target layer 7 V plane   -> page[g]
+...
+```
+
+MTP 和 DFlash pools 各自拥有独立的 page-group ID namespace、free set 和 block tables。数值相同的
+page ID 在不同 pool 中没有任何 ownership 关系。
+
+### 5.2 Plane slabs
+
+同一个 pool 内的 grouped planes 不要求组成一个连续 blob。每个 plane 拥有 Engine-lifetime-stable storage；
+pool-local page-group ID `g` 按固定 page-major order，在每个 plane 中选择该 logical page group 对应的
+contiguous slice：
+
+```text
+page-major plane: [page 0: all heads] [page 1: all heads] ...
+
+page-group g      -> plane 0 slices selected by g
+                  -> plane 1 slices selected by g
+                  -> ...
+```
+
+一个 pool 只有一个 page-group ID namespace、一个 free set 和一份 per-sequence block table。§7 中的
+page-group payload 是 reservation/accounting unit 的总 bytes；不同 planes 之间不要求物理相邻。
+
+Plane base 在 Engine lifetime 内保持不变。Consumer 使用 plane base、registered strides 和 `g` 计算地址；
+不得把 block table 展开为 per-layer、per-head 或 per-plane device pointer arrays。Allocator 可以优先返回
+连续 page IDs 改善 locality，但 kernel correctness 和 launch topology 不能依赖这种连续性。
+
+### 5.3 Why K/V and layers remain grouped inside a pool
+
+同一 pool 内的 K、V、code、scale 和 full-attention layers 具有相同 frontier 和 lifetime。将它们分别
+分配不会产生可单独释放的有效资源，却会引入：
+
+- 每层或每 plane 的独立 block table；
+- 重复 reservation counters；
+- layer-by-layer partial allocation failure；
+- retained ownership 的重复 bookkeeping。
+
+因此 Main Text layers 应分组，但 Main Text 与 MTP/DFlash 不应分组。
+
+### 5.4 Fragmentation and locality
+
+每个 pool 内所有 page groups 等价，因此不产生 variable-size external fragmentation，也不需要
+compaction。Allocation success 只依赖该 pool 的 free-page 总数，不依赖 largest contiguous hole。
+
+例如 Main Text pool 有 128 Ki token-equivalents，`P=64`，共 2048 pages：
+
+```text
+A owns 48 Ki = 768 pages
+B owns 48 Ki = 768 pages
+free          = 512 pages
+```
+
+A release 后，768 个旧 pages 与尾部 512 个 pages 可能被 B 的物理区间隔开。新请求 C 需要
+64 Ki，即 1024 pages：
+
+```text
+total free pages = 1280
+needed pages     = 1024
+```
+
+连续 allocator 会因为最大 hole 只有 768 pages 而失败；paged allocator 可以把 C 的前 768 个 logical
+pages 映射到 A 的旧 pages，再从尾部取得 256 pages，因此无需搬移 B。
+
+Retained allocation 持有的 pages 不是 free capacity。若 retained A 阻塞 active admission，Prefix Cache
+先 eviction A；这是 occupancy 回收，不是 compaction。
+
+唯一的 payload slack 是每个 pool allocation 的最后一个未填满 page，最多 `P-1` positions。对于
+`P=64`，8 个 active allocations 在一个 pool 中的最大尾页 slack 为：
+
+```text
+8 * 63 = 504 token-equivalents
+504 / 131072 = 0.38% of a 128 Ki pool
+```
+
+Allocator 应优先给同一 sequence 分配连续 page IDs，使相邻 logical pages 在 plane slab 中尽可能连续；
+但连续 run 不是 admission 条件。找不到连续 run 时使用任意 free pages，不能因此拒绝 request。
+Active pages 不搬迁。
+
+---
+
+## 6. Per-sequence allocation bundle
+
+一个 admitted sequence 持有与 slot identity 无关的 allocation bundle：
+
+```text
+SequenceKVBundle
+├── Main Text PoolAllocation
+└── selected Backend PoolAllocation (MTP or DFlash Full, iff enabled)
+```
+
+每个 `PoolAllocation` 独立包含：
+
+```text
+PoolAllocation
+├── ordered logical-block -> pool-local page-group mapping
+├── mapped page-group count
+├── total reserved entitlement
+└── target-owned valid frontier
+```
+
+MTP 与 DFlash 互斥。Backend 关闭时 bundle 只有 Main；启用某个 backend 时，每个 admitted sequence
+必须同时拥有 Main 与该 backend 的 allocation，不能按 request 降级成缺少 backend state 的 bundle。
+
+### 6.1 Three extents per pool
+
+每个 pool allocation 必须区分：
+
+| Extent | Ownership |
+|---|---|
+| reserved entitlement | admission/resource layer；保证未来可取得的 pool-local pages |
+| mapped extent | KV Store；已经绑定 page IDs 的逻辑范围 |
+| valid frontier | target sequence state；当前可以被 consuming Op 读取的 prefix |
+
+Mapped extent 可以暂时大于 valid frontier，用于 prefill chunk 或 speculative round 的 provisional writes。
+Mapped 不等于 committed。
+
+不同 pool allocations 可以具有不同 mapped extents 和 valid frontiers。Store 不计算它们之间的语义关系。
+
+### 6.2 Slot execution views
+
+Active slot 对每个 enabled pool 拥有一行固定地址的 device block-table metadata，最大宽度为：
+
+```text
+ceil(max_pool_logical_extent[s] / P[s])
+```
+
+一个 pool 的 rows 组成固定地址矩阵：
+
+```text
+device_block_tables[s][slot][logical_block] -> pool-local page-group ID
+```
+
+每行 contiguous，元素为 I32 page ID。行宽由该 pool 的 maximum logical extent 决定；并发 Engine 的
+行数为 `max_concurrency`，当前单请求 profile 的行数为 1。矩阵是 execution metadata，不是 KV capacity，
+也不拥有 physical pages。
+
+`PoolAllocation` 持有 authoritative ordered mapping；slot admission 或 recycling 时把该 mapping 安装到
+对应 row。Retained state 不占 slot row；重新 admission 时，同一 allocation 可以安装到任意 free slot。
+未映射的 tail entries 不具有 consumer-visible 含义，可以在 debug/test 中使用 invalid sentinel，但
+production kernel 不为每次读取增加 page-ID bounds branch。
+
+当前 Attention 迁移仍是单请求执行。一个 Op 只取得当前 active sequence 在相应 pool 中的一行 view，
+不接收 slot index、table matrix、batch row 或其他 sequence 的 mapping。这样 pool/table substrate 已能
+同时容纳多个 active allocations，而当前 Attention kernel 不需要提前承担并发执行语义。
+
+当前单请求产品在本次 cutover 中固定使用：
+
+```text
+max_sequence_context   = EngineOptions.max_context
+main_aggregate_context = EngineOptions.max_context
+active table rows      = 1
+```
+
+Core KV substrate 仍以 capacity profile 和 row count 作为构造事实，并以多个 allocations、多个 rows 的
+测试闭合 ownership 和 isolation；当前 public Engine 不因此增加尚不能执行的并发配置。后续并发 Engine
+直接传入其 `main_aggregate_context` 和 `max_concurrency`，不改变 pool、allocation 或 table 语义。
+
+### 6.3 Stable execution unit
+
+在一次 prefill chunk 或 decode round 开始前，KV Store 为每个可能写入的 pool materialize 本 unit 的
+最大 logical extent，并发布完整 mappings。GPU work in-flight 期间：
+
+- 所有参与 pools 的 block tables 不增删、不改写；
+- page payload 不搬迁；
+- consuming operators 使用该 unit 冻结的 valid-frontier inputs；
+- slot recycling 和 retained ownership transfer 禁止发生。
+
+所有 mapping 更新、frontier commit 和 page release 都发生在 GPU boundary。
+
+---
+
+## 7. Fixed page size
+
+Page size 是 homogeneous pool layout 的属性，不是整个 KV Store 的全局语义。当前全部 registered
+growing pools 固定为：
+
+```text
+P_main          = 64
+P_mtp           = 64
+P_dflash_full   = 64
+```
+
+三个 pools 拥有独立的 storage、page ID namespace 和 capacity，但采用同一个 `P=64`。`P` 不是 request
+option，也不在 serving 期间动态变化。
+
+### 7.1 Design basis
+
+一个 pool 的 `P` 由 storage 和 consumer locality 决定：
+
+- consuming Attention 常用 key tile 覆盖多少连续 positions；
+- prefill chunk 或 proposal block 如何跨 page；
+- page-table lookup、address discontinuity 和 boundary handling 的频率；
+- per-sequence block-table metadata；
+- active/retained allocation 的尾页 slack；
+- 单 plane page 是否足够大，能形成连续、合并良好的读写区间。
+
+Prefix hit granularity不参与 `P` 的选择。合法 retained frontier 可以位于 page 内任意 offset；只有完整
+Linear Attention/backend state 是否存在才决定该 frontier 能否复用。
+
+### 7.2 Main Text geometry
+
+当前 target 的 main decode Attention 以 32/64-key 作为主要读取尺度，Text prefill chunk 是 128 的
+倍数。固定 `P_main=64` 后：
+
+- 一个 page 足以覆盖一个 aligned 64-key span；
+- 128-token aligned prefill interval 只跨两个 pages；
+- 128 Ki context 只需 2048 entries，native 256 Ki context 只需 4096 entries；
+- 最大的 27B Main Text BF16 pool 每个 page-group 为 4 MiB，单 allocation 的尾页 slack 小于 4 MiB；
+- block-table metadata 相对 KV payload 可忽略，同时 32-key tile 不跨 page、64-key tile 与 page 对齐。
+
+### 7.3 Backend page sizes
+
+MTP full Attention 的 context traversal 与相应 target full Attention 使用相同的 `P_mtp=64`。DFlash
+proposal block 为 16 positions，`P_dflash_full=64` 正好容纳四个 proposal blocks。两者保留独立 pool
+ownership 和 capacity，但使用相同的 page size 与 page-major order。
+
+### 7.4 Current pool payloads at `P=64`
+
+下表只计算 KV payload，不含静态 slab alignment：
+
+| Pool layout | KV storage | bytes/token | page-group payload | worst tail slack |
+|---|---|---:|---:|---:|
+| 27B Main Text | BF16 | 65536 | 4.0000 MiB | 3.9375 MiB |
+| 27B Main Text | INT8-G64 | 33792 | 2.0625 MiB | 2.0303 MiB |
+| 35B-A3B Main Text | BF16 | 20480 | 1.2500 MiB | 1.2305 MiB |
+| 35B-A3B Main Text | INT8-G64 | 10560 | 0.6445 MiB | 0.6345 MiB |
+| 27B MTP | BF16 | 4096 | 0.2500 MiB | 0.2461 MiB |
+| 27B MTP | INT8-G64 | 2112 | 0.1289 MiB | 0.1269 MiB |
+| 35B-A3B MTP | BF16 | 2048 | 0.1250 MiB | 0.1230 MiB |
+| 35B-A3B MTP | INT8-G64 | 1056 | 0.0645 MiB | 0.0634 MiB |
+| 35B-A3B DFlash Full | BF16 | 4096 | 0.2500 MiB | 0.2461 MiB |
+
+27B Main Text BF16 的 4 MiB page group 分布在全部 full-attention planes。单层单个 K 或 V plane
+每个 page ID 对应的 aggregate bytes 为 128 KiB；35B-A3B Main Text BF16 对应 64 KiB。每个 head 内
+`P` 个 positions 连续，同一 page ID 的所有 heads 按 §4.3 相邻。Consumer 始终看到一个 typed
+page-major plane view，而不是跨模型机制的 composite payload。
+
+假设 page ID 为 32-bit，128 Ki context 的单个 block-table row 为 8 KiB。即使
+`max_concurrency=8` 且每个 slot 同时持有 main 与一个 backend row，全部 metadata 也只有 128 KiB。
+
+---
+
+## 8. Vector reservation and admission
+
+NInfer 不支持 preemption，因此 admission 必须为 sequence 的最大物理 KV extent 建立完整 reservation
+vector。Target 根据 request 和 fixed Engine mode 计算：
+
+```text
+KVReservation(request) = {
+    main_total_pages,
+    optional_backend_total_pages,
+}
+```
+
+计算包含：
+
+- prompt 尚未 materialize 的 main/backend positions；
+- maximum permitted generated output；
+- selected backend 可能触及的 bounded provisional tail；
+- 每个 pool 自己的 page rounding；
+- retained bundle 已经持有的 mapped pages；
+- request 是否能够或必须建立 backend continuation。
+
+对每个 pool `s` 分别保持：
+
+```text
+active_mapped[s]
++ active_reserved_but_unmapped[s]
++ retained_mapped[s]
+<= total_page_groups[s]
+```
+
+Admission 是跨所有 pools、fixed state 和 output capacity 的原子 transaction。任何一个必要 pool 无法
+完成 reservation，request 都不获得 slot 或部分 allocation。
+
+这个 per-request vector check 不表示 backend 是一个可以正常先于 main contract 耗尽的独立 admission
+维度。Startup `KVCapacityProfile` 必须满足 §3.3 的 active-set implication：当 request 在 slot、fixed state
+和 advertised main capacity 上可 admission 时，selected-backend reservation 也必须可兑现。Retained
+backend pages 在判断前先按 active-priority policy eviction。
+
+Reservation 只承诺 pool-local page 数量，不提前选择 IDs。Prefill/decode 推进把 reserved capacity 转为
+mapped pages，不改变总 entitlement。因此一个 admitted request 不会因其他 request 后来增长而失去
+已经承诺的 KV capacity。
+
+Retained bundle 没有 future-growth reservation。Claim 时，各已有 allocations 从 retained mapped 转为
+active mapped，并为 incoming suffix、output 和 provisional tail 分别预留差额。
+
+Boundary claim 的 admission check 使用 checkpoint 截断后的 mapped vector；trailing full pages 可以在同一
+atomic transaction 中转为可用容量，但在完整 reservation vector 成功前不修改 retained ownership 或
+mapping。
+
+Engine 选定的 speculative backend 在 Engine lifetime 内固定。启用 backend 时，每个 admitted sequence
+在整个 active lifetime 都保留对应 allocation 和 entitlement；某一 round 因剩余 output/context 只能执行
+ordinary target progress，不构成 backend capability 降级，也不能据此释放 backend state。完成时要么把
+完整、可继续的 bundle 一起 retain，要么释放整个 bundle。
+
+Admission 被 retained occupancy 阻塞时，Prefix Cache 选择并释放完整 retained entries，再重新执行
+atomic admission。KV Store 不自行选择 eviction victim。
+
+---
+
+## 9. KV lifecycle
+
+### 9.1 Admission
+
+```text
+WAITING
+  -> claim optional retained SequenceKVBundle
+  -> reserve required pages in every pool
+  -> bind bundle to active sequence state
+  -> install pool mappings in an active slot execution view
+```
+
+这些步骤与 fixed Linear Attention/backend state 和 output capacity 一起构成 concurrent architecture 的
+atomic admission transaction。
+
+### 9.2 Prefill chunk
+
+在 chunk launch 前，target 确定该 chunk 会写哪些 pools 以及各自最大 position。KV Store 分别
+materialize 所需 pages。Chunk 成功后，target 才推进对应 pool frontiers。
+
+Chunk 内部分 layers 已写、但 unit 未成功完成时，不发布新的 frontier；GPU/state-integrity failure 按
+Engine-wide failure 处理。
+
+### 9.3 Ordinary decode
+
+Main Text decode 通常增加一个 materialized position。当前尾页尚有空间时不分配；跨越
+`P_main` boundary 时，在 round launch 前从 main entitlement 中绑定下一个 page。
+
+Backend pool 是否在同一 round 增长由 target decode mode 决定，不与 main page ID 绑定。
+
+### 9.4 Truncate and rollback
+
+每个 pool 根据自己的 valid/provisional frontier 独立计算需要保留的 page 数：
+
+```text
+needed_pages[s] = ceil(max(valid_frontier[s], provisional_frontier[s]) / P[s])
+```
+
+完全位于该范围之后的 pool-local pages 返回对应 free set。最后一个部分使用的 page 保留；frontier
+之后的 bytes 可以是 stale data，但不得进入 execution view 的有效范围。
+
+### 9.5 Finish, retain, release
+
+Request 到达 model completion 后执行两种互斥操作之一：
+
+```text
+retain:
+    active sequence transfers complete SequenceKVBundle ownership to Prefix Cache
+
+release:
+    every PoolAllocation returns mapped pages to its own pool
+    all unused reservations are cancelled
+```
+
+启用 speculative backend 时，只有 Main、backend 和其他 continuation state 位于同一 exact frontier 的
+完整 bundle 才能进入 Prefix Cache。不完整状态释放整个 bundle，不能发布 target-only reusable entry。
+
+Slot 和 device table rows 随后可以复用。Network response lifetime 不延长 KV ownership。
+Cancellation 在第一个观察到它的 GPU boundary release bundle；不修改 in-flight round mappings。
+
+---
+
+## 10. Prefix reuse
+
+### 10.1 Reusable checkpoints
+
+一个 retained entry 发布 target 已证明拥有完整 continuation state 的 reusable checkpoints。当前
+Qwen3.6 retained sequence 包含：
+
+- current resume frontier；
+- 一份有效时的 assistant-content boundary checkpoint。
+
+每个 checkpoint 都必须同时描述：
+
+- Main Text allocation 可到达的 frontier 和 page mapping；
+- selected backend 的 allocation、frontier 和 continuation state（backend 关闭时无此项）；
+- Linear Attention state 和继续执行所需的 hidden state；
+- position/model-continuation metadata；
+- 与上述状态一致的 prefix identity。
+
+Current resume frontier 和 boundary checkpoint 引用同一个 exclusively owned KV bundle；boundary 不是第二份
+KV allocation。Incoming prompt 的复用路径为：
+
+- prompt 正好结束在 current resume frontier，且 decode anchor 完整时，直接成为 decode-ready；
+- prompt 完整包含 current resume frontier 并有 suffix 时，从该 frontier prefill suffix；
+- prompt 匹配已保存 assistant-content boundary 并在其后有新 suffix 时，claim bundle、truncate 到 boundary、
+  恢复 checkpoint，再 prefill suffix；
+- common prefix 结束在没有完整 checkpoint 的任意其他位置时，cache miss。
+
+最后一种情况不是 page-size limitation。缺少的是对应 Linear Attention/backend continuation state，而不是
+KV page。
+
+### 10.2 Non-page-aligned frontier
+
+例如 Main Text `P=64`、retained frontier `F=1000`：
+
+```text
+mapped main pages = ceil(1000 / 64) = 16
+last page valid offsets = [0, 40)
+```
+
+Ownership transfer 后可以从 logical position 1000 继续。无需把 frontier 向下取整到 960，也无需复制
+或重算最后一页。Backend allocation 使用自己的 `P` 和 frontier 独立描述，不要求与 main 尾页对齐。
+
+### 10.3 Exclusive bundle ownership
+
+一个 retained bundle 同时只能被一个 active request claim。所谓 pin 是 retained entry 持有各 pool
+allocations，使相应 IDs 不属于各自 free sets；不需要 page refcount 或特殊 allocator role。
+
+选择 boundary checkpoint 时，claim transaction 保留包含 boundary 的最后一个部分 page，并把其后的完整
+pages 返回各自 pool；随后各 pool 的 exact frontier 和 fixed continuation state 一起切换到该 checkpoint。
+该过程不复制 retained KV payload。
+
+多个 active requests 不从同一 retained bundle 分叉。若未来产品需要同一大 prefix 同时 fan-out，必须
+连同 Linear Attention/backend state branching 一起重新设计；仅共享 Main Text pages 不能形成完整
+可继续的 sequence state。
+
+---
+
+## 11. Speculative decoding
+
+MTP/DFlash runtime 不管理自己的显存 allocator。它们的 growing KV 仍从 common KV Store 中 target-defined
+backend pool 获取，只是与 Main Text pool 物理分离。
+
+一次 speculative round 的 KV 过程是：
+
+```text
+1. main/backend reservations 已在 admission 时完成
+2. round boundary 分别 materialize 本轮各 pool 最大可能触及的位置
+3. target writes provisional Main Text KV
+4. backend writes provisional MTP 或 DFlash KV
+5. acceptance 产生 target-owned committed frontiers
+6. rejected tails 在各 pool 中分别变为 logically unreachable
+7. 各 pool 独立释放不再引用的完整 trailing pages
+```
+
+不同 requests 接受不同 proposal length，只改变各自 bundle frontiers，不形成新的 pool type。Rejected
+bytes 可以留在部分尾页；后续 append 在它们重新变为 valid 前必须完整覆盖对应 code 和 scale planes。
+
+KV Store 不理解 proposal、verify 或 acceptance，也不推导 Main Text、MTP 与 DFlash frontiers 之间的
+关系。Target 把每个 pool 的最终 frontier 作为 transaction result 提交。
+
+---
+
+## 12. KV resources outside growing pools
+
+并非所有 K/V-shaped state 都按 context 增长：
+
+| Resource | Storage class | Reason |
+|---|---|---|
+| target full-attention KV | Main Text paged pool | 每个 target materialized token 增长 |
+| MTP persistent KV | MTP paged pool | 独立 MTP frontier |
+| DFlash full-context KV | DFlash Full paged pool | 独立 DFlash context frontier |
+| DFlash local sliding-window KV | fixed per-sequence KV state | 容量固定为 window，不随总 context 增长 |
+| DFlash boundary-local snapshot | fixed per-sequence KV state | 固定 checkpoint payload |
+| Vision/temporary query K/V | shared execution workspace | 只在一个 operator/phase 内存活 |
+
+### 12.1 Fixed cyclic physical contract
+
+DFlash local sliding-window 和 boundary-local snapshot 使用同一个 closed cyclic layout，但拥有彼此独立的
+storage。当前 registered target 对每个 local layer 固定为：
+
+```text
+capacity        = 4096
+padded_capacity = 4096
+K/V dtype       = BF16
+K/V shape       = [128, 4096, 8] = [D, padded_capacity, Hkv]
+
+nb[0] = sizeof(BF16)
+nb[1] = D * nb[0]
+nb[2] = padded_capacity * nb[1]
+
+physical_slot(p) = p mod capacity
+K[d,h,p] = k[d, physical_slot(p), h]
+V[d,h,p] = v[d, physical_slot(p), h]
+```
+
+每个 active sequence 持有五层 local K/V 和五层等形状 boundary-local K/V。两组 plane bases 在其 fixed
+state unit lifetime 内稳定；save/restore 复制完整五层 payload，不能通过 aliasing 让 live local state 与
+checkpoint 共用可写 storage。
+
+`CyclicKVCacheLayerView` 只携带 contiguous K/V tensors、capacity 和 geometry，不携带 block table、page
+ID、allocator handle 或 mutable frontier。Caller 用绝对位置和 live interval 定义有效内容。Cyclic storage
+不进入 growing pools，不参与 page reservation，不使用 `PagedKVLayerView`，也不因 paged migration 改变
+modulo/window 语义。
+
+Fixed KV state 从按 admitted sequence 管理的 fixed-state pool 获取。Engine 必须始终能够为
+`max_concurrency` 个 active sequences 提供这类固定资源。Retained entries 只能使用额外或当前空闲的
+fixed units；new admission 需要时先驱逐 retained entry，不能降低 active concurrency guarantee。
+
+---
+
+## 13. Correctness invariants
+
+1. 一个 page-group ID 在其所属 pool 内至多属于一个 active 或 retained allocation；
+2. pool grouping 只包含共享 frontier、lifetime 和 page geometry 的 planes；
+3. reserved-but-unmapped entitlement 不能被同一 pool 的其他 request 或 retained entry 消费；
+4. admission 对完整 pool reservation vector 原子成功或失败；
+5. 一个 execution unit 内所有 pool mappings 不变；
+6. operator 只能读取对应 pool valid frontier 内的 positions；
+7. frontier publish 前，该 pool position 的完整 K/V 以及必要 code/scale planes 必须已经写入；
+8. page recycle 不要求清零，但新 owner 不得从旧 frontier 或 stale bytes 推导有效状态；
+9. page mapping 使用 cache ordinal，不使用 RoPE/MRoPE coordinate；
+10. prefix hit 必须由完整 SequenceState 证明，KV token match 或 page match 本身不构成 hit；
+11. active pages 不因 compaction、retained eviction 或其他 request growth 被搬迁；
+12. admitted request 的合法最大 per-pool growth 必须始终被 reservation vector 覆盖；
+13. `KVCapacityProfile` 必须按 §3.3 从显式 main aggregate contract 唯一导出；启用 MTP 或 DFlash 时
+    `N_backend=N_main`，backend 不得先于 main contract 耗尽；
+14. 一个 pool allocation 的 logical block 在该 pool 全部 grouped planes 中使用同一个 page-group ID；
+15. active slot table row 只镜像 allocation mapping，不拥有 page payload 或 frontier；
+16. growing-cache Op 只消费单 sequence `PagedKVLayerView`，不取得 allocator 或 lifecycle authority；
+17. K/V、code 和 scale 的 semantic axes、exact page-major strides 和 storage bounds 必须与 §4.2
+    一致；
+18. 一个 page-group ID 在全部 grouped planes 中选择同一 logical page group，但不要求这些 slices
+    物理相邻；
+19. DFlash local 与 boundary-local 分别拥有 §12.1 的完整 fixed cyclic payload；absolute position 只通过
+    `p mod 4096` 选择 physical slot，两者不共享可写 backing storage；
+20. MTP Vision prefill，以及任一 selected backend 下的 prefix reuse 和 ordinary tail round，都不得把
+    sequence 降级为缺少该 backend continuation state。
+
+---
+
+## 14. Edge cases
+
+| Case | Required behavior |
+|---|---|
+| context 在 page 中间结束 | 只推进 exact frontier，保留相应 pool 的部分尾页 |
+| prefill chunk 跨多个 pages | launch 前分别 materialize 所需 pool pages，unit 内 mappings 冻结 |
+| speculative tails 不同 | Main、MTP 或 DFlash 按各自 frontier 独立 trim |
+| accepted length 为零 | target 决定各 pool progress；KV Store 不产生特殊状态 |
+| retained frontier 非 page-aligned | 原 offset 精确复用，不向 page boundary 取整 |
+| 命中已保存 assistant-content boundary | exclusive claim 后 truncate pages、恢复完整 checkpoint，再 prefill suffix |
+| 只有更短 token prefix match，但该位置没有 checkpoint | cache miss |
+| retained occupancy 阻塞 admission | Prefix Cache eviction 完整 entry 后重试 atomic admission |
+| retained eviction 后，request set 满足 main contract 但 backend reservation 失败 | startup sizing 或 accounting invariant violation；不是正常等待条件 |
+| request cancellation | in-flight unit 完成后的 boundary release bundle |
+| admitted request materialize 时无 free page | reservation-accounting violation，作为 Engine failure |
+| 一个 request 使用 main pool 大部分容量 | 合法，只要其他 per-pool entitlements 仍满足 invariants |
+
+---
+
+## 15. Current consumer migration boundary
+
+Paged KV storage 与 batched model execution 是两项独立改动。当前迁移完整实现多 allocation、固定 slot
+table rows 和 prefix ownership 所需的 KV substrate，但只替换现有单请求 consumer 的 cache 表示：
+
+```text
+many PoolAllocations and slot table rows
+                    │
+                    │ select one active sequence row
+                    ▼
+single-sequence Attention / append invocation
+```
+
+当前 Attention 的 Q/K/V/Out Tensor 不增加 batch axis，kernel grid 不增加 request dimension，target 也不把
+多个 requests 合并成一次 Attention invocation。将来的 batched Attention 可以直接消费同一 fixed table
+matrix，但不在本次接口或实现中预定义 row descriptors、ragged shapes 或 launch topology。
+
+### 15.1 `PagedKVLayerView`
+
+Growing KV consumer 使用一个 non-owning、single-sequence typed view。Tensor shape 描述 semantic axes，
+page tensors 按 §4.2 的 fixed page-major order contiguous。逻辑字段为：
+
+```text
+PagedKVLayerView
+├── k_pages           Tensor [D, P, Hkv, Nphysical]
+├── v_pages           Tensor [D, P, Hkv, Nphysical]
+├── k_scale_pages     optional Tensor [D/64, P, Hkv, Nphysical]
+├── v_scale_pages     optional Tensor [D/64, P, Hkv, Nphysical]
+├── block_table       I32 Tensor [M]
+├── head_dim          D
+├── num_kv_heads      Hkv
+├── dtype             BF16 or I8
+└── quant_group       0 or 64
+```
+
+`P` 和 `Nphysical` 由 page tensors 的 shape 给出，logical capacity 为 `M*P`。当前所有注册 growing
+routes 只接受 `P=64`；kernel 将其作为 compile-time fact，而不是在 inner loop 中执行 runtime division。
+K/V/code tensors 必须是 contiguous `[D,P,Hkv,Nphysical]`；INT8-G64 scale tensors 必须是 contiguous
+`[D/64,P,Hkv,Nphysical]`。Op 不接受 permuted 或 arbitrary-stride growing views。
+
+同一 pool 的每个 layer view 引用不同 plane slabs，但引用同一个 active slot block-table row。View 不含：
+
+- allocation、reservation 或 free-list handle；
+- request identity、slot identity 或 batch row；
+- mapped extent 或 valid/provisional frontier；
+- prefix-cache ownership 或 backend mode；
+- per-page K/V pointers。
+
+这些事实分别属于 KV Store、target sequence state 或 scheduler。Consumer wrapper 根据 Tensor shape 和
+execution envelope 验证静态范围；caller 保证实际访问位置已 mapped 且位于该 Op 声明的有效域。
+
+### 15.2 Device address contract
+
+对当前 `P=64`，device address calculation 为：
+
+```text
+logical_block = position >> 6
+page_offset   = position & 63
+physical_page = block_table[logical_block]
+
+element_address = plane_base
+                + d             * nb[0]
+                + page_offset   * nb[1]
+                + kv_head       * nb[2]
+                + physical_page * nb[3]
+```
+
+INT8 scale 使用 quant group `d/64` 作为第一维坐标，并使用 scale Tensor 自己的 `nb`。一个 key tile
+取得 `physical_page` 后，K、V、code 和 scale 都复用该 page-group ID。Exact strides 由 §4.2 唯一确定。
+
+上述公式是 Op contract，不要求 production kernel 在每个 element 上执行四次通用整数乘法。Wrapper
+验证 fixed page-major strides；CTA 在 page/head 粒度计算 base 并广播，inner loop 继续使用静态
+row/vector offsets。Production kernel 不检查 page ID 是否为 sentinel；mapping completeness 已由
+execution-unit materialization 保证。
+
+### 15.3 Pool-to-consumer binding
+
+Target/runtime 在调用 Op 前组合两类互不拥有的 view：
+
+```text
+pool.layer_planes(layer)
+        +
+active_slot.block_table_row(pool)
+        =
+PagedKVLayerView
+```
+
+Main Text consumer 只能绑定 Main Text pool；MTP consumer 只能绑定 MTP pool；DFlash full-context
+consumer 只能绑定 DFlash Full pool。Common Op 不接收 pool kind，也不根据 target、layer role 或 backend
+string 选择 pool。
+
+---
+
+## 16. Op contract migration
+
+本次迁移直接替换现有 growing-cache 参数，不增加 parallel continuous overload，也不建立名为
+`paged_attention` 的新数学 Op。Paging 是 cache storage/addressing contract；Attention 的公式、可见域和
+现有单请求 Tensor domain 保持不变。
+
+### 16.1 Affected entries
+
+| Current entry | Paged target state | State effect |
+|---|---|---|
+| `gqa_attention` | `KVCacheLayerView` 替换为 writable `PagedKVLayerView` | 把全部 current K/V rows 写入 paged cache，并执行 causal Attention |
+| `gqa_attention_cached` | cache 替换为 read-only `PagedKVLayerView` | 只读已经 populated 的 paged cache |
+| `gqa_kv_append` | destination 替换为 writable `PagedKVLayerView` | 写入全部 supplied rows，BF16 copy 或 INT8-G64 encode |
+| `kv_cache_append_prefix` growing overload | destination 替换为 writable `PagedKVLayerView` | 只写 device `commit_count` 选择的 exact prefix |
+| `bidirectional_gqa_attention` | persistent context 替换为 read-only `PagedKVLayerView` | 读取 DFlash Full pool；query K/V 仍是 transient Tensor |
+| `kv_cache_append_prefix` cyclic overload | 保持 `CyclicKVCacheLayerView` | DFlash local fixed window，不属于 growing pool |
+| `swa` | 保持 `CyclicKVCacheLayerView` | 不在本次 paged migration 中修改 |
+
+目标签名中的 cache 参数明确为：
+
+```cpp
+void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                   const Tensor& positions, float scale,
+                   PagedKVLayerView cache, GqaExecutionEnvelope envelope,
+                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+
+void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
+                          const PagedKVLayerView& cache,
+                          GqaExecutionEnvelope envelope,
+                          WorkspaceArena& workspace, Tensor& out,
+                          cudaStream_t stream);
+
+void gqa_kv_append(const Tensor& k, const Tensor& v,
+                   const Tensor& positions, PagedKVLayerView cache,
+                   cudaStream_t stream);
+
+void kv_cache_append_prefix(const Tensor& k, const Tensor& v,
+                            const Tensor& positions,
+                            const Tensor& commit_count,
+                            KVCacheAppendPrefixExecutionEnvelope envelope,
+                            PagedKVLayerView cache, cudaStream_t stream);
+
+void bidirectional_gqa_attention(
+    const Tensor& q, const Tensor& query_k, const Tensor& query_v,
+    const Tensor& context_length, float scale,
+    const PagedKVLayerView& context,
+    GqaContextExecutionEnvelope envelope,
+    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+```
+
+这些是现有entry的cache-parameter cutover，不引入新overload family。Workspace capacity query继续由
+现有execution envelope和token interval决定；paging不会成为一个workspace route，也不额外申请与context
+长度成正比的transient buffer。
+
+迁移完成后删除 growing `KVCacheLayerView` 和依赖连续 `[D,padded_context,Hkv]` 的实现。固定 cyclic
+storage 需要拥有独立 layout/container，不能继续把旧 growing `KVCache` 当作内部 backing abstraction。
+
+### 16.2 Single-sequence tensor domain
+
+Main Text 和 MTP causal entries 继续接受：
+
+```text
+Q       BF16 [D, Hq, T]
+K/V     BF16 [D, Hkv, T]
+Out     BF16 [D, Hq, T]
+positions I32 [T], contiguous and sequential cache ordinals
+```
+
+`positions` 是 KV logical ordinal，不是 RoPE/MRoPE coordinate。对 query position `p`，causal visible
+domain 仍是 `[0,p]`。Page boundary 不产生 mask boundary，position 63 与64之间没有特殊数学语义。
+
+DFlash full-context entry 继续接受一个 query block和 device `context_length=L`；每个 query row看见
+context `[0,L)` 加完整 transient query K/V segment。只有 persistent context 的地址来源发生变化。
+
+### 16.3 Wrapper validation and caller promises
+
+Wrapper 必须验证：
+
+- K/V page tensors 的 semantic shape 一致、`P=64`，并精确匹配 §4.2 的 page-major contiguous strides；
+- physical page count、head geometry、dtype 和 optional scale planes 一致；
+- block table 是 contiguous I32 `[M]`；
+- BF16 cache 不携带 scale planes，INT8-G64 cache 的 scale shape 和 strides 完整；
+- causal `max_visible_keys <= M*P`；
+- DFlash `max_context <= M*P`；
+- input/output Tensor domain 与当前 entry 的已注册 geometry 一致。
+
+Wrapper 不读取 device positions、context length、commit count 或 page IDs。Caller 保证：
+
+- execution envelope 覆盖本次 exact device values；
+- page tensors 由 pool binding 在对应 registered plane storage bounds 内建立；
+- 本次最大可能访问的每个 logical block 已在 launch 前 materialize；
+- read domain 不超过 target-owned valid frontier；
+- writable rows 的全部 K/V code/scale bytes会在 frontier publish 前完成；
+- Op in-flight 期间 block-table row 不变化。
+
+对 device-count prefix append，materialization 按 envelope 的最大可能 write extent完成，而不是按 host
+不可见的 exact `commit_count` 猜测。未被接受的 rows 不写入，也不推进 frontier。
+
+---
+
+## 17. Kernel migration design
+
+### 17.1 Addressing primitive
+
+Kernel 只接收 layer plane bases、一个 block-table row pointer 和现有 execution inputs。Page translation
+应是 route-local inline device primitive；当前生产 route 对 `P=64`、page-major order、head geometry
+和 codec 编译期专用。Page/head bases 在 CTA 或 tile 粒度计算并共享，不能把 semantic stride formula
+机械地留在每次 scalar/vector access 上。
+
+不得实现一个在 inner loop 中解释 arbitrary page size、arbitrary layout 或 cache-kind variant 的通用
+runtime accessor。可以共享 shift/mask、page-base calculation 和 INT8 codec 等窄 primitive，但 BF16、
+INT8、causal prefill、causal small-T 和 DFlash context 保留各自可独立优化的 kernel body。
+
+### 17.2 Causal small-T BF16
+
+现有 small-T partial/reduce 分解保持不变：
+
+```text
+partial grid: (KV head, split)
+reduce grid:  (Q head, D chunk, query token)
+```
+
+不增加 batch dimension。修改点为：
+
+1. 删除基于 `padded_context` 的 flat cache index；
+2. 对每个 logical key tile 取得一次 page ID，计算当前 KV head 的 page-local K/V bases；
+3. page ID 在 CTA 内共享，不能由每个 vector lane 重复查询；
+4. current K/V rows 仍从 input Tensor直接参与 Attention，同时写入对应 page；
+5. 不让其他 split依赖本 split的 cache write；
+6. partial accumulator、softmax statistics 和 reducer layout 不因 paging 改变。
+
+当前 BF16 key tile 为32 keys，`P=64`恰好包含两个 tiles。Route planner必须避免保留会产生任意
+`split_start` 的 `ceil(window/active_splits)` 分割。正常路径按完整32-key tiles分配；极短 context 若为
+增加并行度拆分一个 tile，sub-page span 的 start/end 也必须落在 page-local有效范围内。任何 vectorized
+global load 都不得跨两个 physical pages。
+
+### 17.3 Causal small-T INT8-G64
+
+INT8 code和FP16 scale使用同一 page ID。一个 key tile 的 translation 顺序为：
+
+```text
+logical tile -> physical page ID
+             -> K/V code page bases
+             -> K/V scale page bases
+```
+
+32/64-key implementation blocks都整除 `P=64`。Route可以继续针对 T 和 context选择不同 warp数、
+key block和dynamic shared-memory profile，但 split span必须以 page-compatible tile units表达。现有24、
+480等经验跨度不是语义；若它们造成跨页tile，必须在 paged route tuning 中重新选择，而不能为
+保留旧 heuristic引入逐元素boundary branch。
+
+Append/encode阶段应以至少 `(token, kv_head)` 为page-translation共享单位。四个64-d quant groups不能
+各自从global memory重复加载同一个 block-table entry。Codec公式和最终 code/scale bits不变。
+
+### 17.4 Causal prefill and cached prompt route
+
+Prefill 保持现有两阶段效果：
+
+```text
+fill current K/V rows into cache
+    -> Attention reads complete populated history
+```
+
+Fill kernel按每个 logical token选择 page。一个 execution unit可以从 page中间开始并跨任意数量pages；
+不要求 prefill chunk、retained frontier或positions[0] page-aligned。
+
+Attention key loop继续从logical position 0遍历到当前query可见上界。当前 BF16和INT8 prefill的
+key tile均为64，因而一个完整key tile正好对应一个physical page：
+
+```text
+logical block b -> block_table[b] -> one K page group and one V page group
+```
+
+每个 tile 的 page ID 在 K stage 和 V stage 之间复用。现有 Q staging、online softmax、MMA和output
+epilogue不因 paging 改变。最后一个partial tile继续通过logical visibility mask清零越界rows，不能读取
+未初始化page tail作为有效key。
+
+Cached prompt route使用相同page-aware key traversal，但不执行fill。
+
+### 17.5 Standalone append
+
+Full append和device-count prefix append都直接写最终physical pages，不建立连续staging cache。
+
+- BF16 copy：一个 `(token, kv_head)` work unit查询一次page并协作复制完整D；
+- INT8 encode：同一work unit复用page ID写code与scale；
+- sequential positions允许一个CTA处理多个tokens，但跨page时必须重新取得page ID；
+- device-count prefix route先读取一次合法count，再只调度或mask `[0,count)`；
+- paged与cyclic append编译为不同physical-address routes，不在每个store上保留runtime cache-kind branch。
+
+### 17.6 DFlash full-context Attention
+
+DFlash transient query K/V保持连续；只有persistent full context改为paged。现有32/64-key blocks均整除
+`P=64`，每个context tile取得一次page ID。Split partial和reduce workspace语义保持不变。
+
+`context_length=0` 的direct route不访问block table。DFlash local和boundary-local cache继续使用独立
+cyclic storage，不能因full-context migration改变其modulo/window语义。
+
+### 17.7 CUDA Graph behavior
+
+Plane slab bases和每个slot的block-table row pointer在Engine lifetime内稳定。跨replay变化的是table
+content、positions、context length和commit count的device values，而不是kernel pointer arguments。
+
+在需要新page的execution unit之前：
+
+```text
+reserve entitlement already exists
+    -> bind physical page ID
+    -> update host allocation mapping
+    -> publish corresponding device table entry
+    -> launch/replay consumer on the same ordered stream
+```
+
+Graph capture不以page IDs、physical contiguity或retained owner为key。Mapping update必须先于consumer，
+in-flight期间禁止改写同一row；Op和kernel内部不调用allocator，也不等待host page fault。
+
+### 17.8 Prohibited implementations
+
+以下实现即使功能正确也不接受：
+
+- 每次Attention前把paged KV gather成request-contiguous buffer；
+- 为每个layer、K/V或scale维护独立logical page table；
+- block table存放per-plane 64-bit pointers；
+- 每个scalar/vector lane独立执行同一个page-table lookup；
+- 一个physical page启动一次独立CUDA kernel；
+- 假设相邻logical pages拥有相邻physical IDs；
+- page boundary回退到保留的continuous-cache kernel；
+- 为未来并发提前把当前单请求Tensor padding到`max_concurrency`。
+
+---
+
+## 18. Correctness qualification
+
+Paging不得改变Attention数学结果、cache codec或状态效果。现有独立Attention oracle继续从逻辑
+positions和represented cache values计算结果，不复制production page traversal。
+
+### 18.1 Required mapping patterns
+
+每个受影响Op至少使用以下三种physical mapping执行同一logical case：
+
+| Pattern | Purpose |
+|---|---|
+| identity | `logical block b -> physical page b`，便于oracle和boundary诊断 |
+| contiguous offset | page IDs连续但不从0开始，排除隐含base假设 |
+| fragmented permutation | logical相邻pages映射到非相邻IDs，证明无连续性依赖 |
+
+三者必须产生相同逻辑结果和相同目标rows的cache bits。
+
+### 18.2 Required cases
+
+- positions/context覆盖 `0, 1, 31, 32, 63, 64, 65, 127, 128` 等tile/page边界；
+- prefill从page中间开始，跨一个和多个pages；
+- current retained frontier 位于 page 中间并在同一 tail page 继续 append；
+- assistant-content boundary restore 截断 fragmented mapping、释放 trailing pages 并从 exact checkpoint
+  继续；
+- BF16 append bit-exact；
+- INT8-G64 code和FP16 scale bits与独立codec oracle一致；
+- cached-only route不修改任意cache plane；
+- prefix append的count为0、page边界前后和full count；
+- rejected/provisional stale bytes不进入valid read domain；
+- DFlash full-context长度为0、page边界和最大registered范围；
+- cyclic DFlash local behavior在迁移后保持原语义；
+- graph replay之间更新同一个stable table row的content，下一replay读取新mapping；
+- 同一pool中两个allocations绑定不同slot rows，顺序调用单请求Op后互不串扰；
+- page release/recycle后，新owner不能观察旧owner的stale bytes为valid state。
+
+最后两项验证KV substrate的多allocation能力，不表示当前Attention已经支持batched invocation。
+
+---
+
+## 19. Performance qualification
+
+### 19.1 Cost model
+
+`P=64`时，一个page-table entry为4 bytes，而每个KV head读取一个完整page的K+V payload约为：
+
+| Format | K+V payload per KV head per page |
+|---|---:|
+| D256 BF16 | 64 KiB |
+| D256 INT8-G64 incl. scales | 33 KiB |
+| D128 BF16 | 32 KiB |
+
+因此page-table payload本身不是主要带宽成本。需要实测防止的是重复lookup、跨页vector load、TLB/cache
+locality下降、split imbalance和原有`cp.async`/MMA overlap被破坏。性能 qualification 只评估和调整
+route-local tile、split、lookup sharing 和 staging；storage layout 不是 route tuning variable。
+
+### 19.2 Comparison boundary
+
+在删除continuous route前，必须用同一RTX 5090、相同toolchain、clock conditioning、artifact geometry和
+benchmark参数保存当前实现的结果。Baseline可以是外部结果或单独baseline binary；最终product和benchmark
+不保留continuous runtime route、control kernel或compatibility switch。
+
+最终 cutover 比较必须使用相同数学语义、workload、dtype、context、cache condition 和 measurement
+procedure；continuous baseline 与 paged implementation 各自使用其 qualified production route。Paged
+route 可以按 §17 调整 tile、split、lookup sharing 和 staging。需要归因 page translation 成本时，可以
+额外运行 topology 与 split policy 匹配的受控对照，但该对照不替代最终 production gate。短 kernel 使用
+成对交替测量和绝对 latency，长 route 使用吞吐中位数。只有结果无法解释或超过 gate 时才使用 profiler，
+不建立长期的 benchmark research framework。
+
+### 19.3 Representative coverage
+
+性能证据覆盖实际 route，而不是所有参数的笛卡尔积：
+
+- 两个 exact target 的 BF16/INT8-G64 causal decode `T=1` 和代表性 verify small-T；
+- causal prefill/cached-only 的一个普通 chunk 和一个长 chunk，并包含 non-aligned prefix base；
+- standalone append 的 small-T 与一个 prefill-sized chunk；
+- DFlash full-context 的 `T=1` 和完整 proposal block，覆盖普通与长 context；
+- identity mapping 与一个固定 fragmented permutation；
+- production CUDA Graph replay，以及 ordinary、MTP、DFlash 的 real-artifact single-request path。
+
+§18 已覆盖 page/tile 边界的 correctness，不为每个 boundary 重复建立性能 case。只有现有 production
+route 在某个 context seam 改变 kernel topology 时，才在 seam 两侧补测。
+
+### 19.4 Cutover gates
+
+Paged cutover只有同时满足以下条件才完成：
+
+1. 两个targets的代表性单请求end-to-end decode throughput中位数相对baseline回退不超过1%；
+2. context不小于2K的causal decode/cached Attention和DFlash full-context kernel中位数回退不超过3%；
+3. prefill Attention吞吐中位数回退不超过3%；
+4. standalone append不出现超过5%的可重复带宽回退；
+5. CUDA Graph replay不产生额外host synchronization、per-page launch或mapping-dependent recapture；
+6. §18 correctness matrix全部通过。
+
+短context的单个极小kernel容易受timer noise影响，不能用一个相对百分比点否决或掩盖结果；它同时受
+repeat distribution、绝对latency和end-to-end gate约束。任何稳定超过上述门槛的回退都必须先定位到
+lookup、TLB、split、staging或reduction，再调整对应 route；不能通过保留continuous fallback完成迁移。
+
+---
+
+## 20. Execution plan
+
+这项迁移按 ownership 和 consumer boundary 纵向推进。所有 phases 直接消费 §4 和 §7 的 fixed storage
+contract；production tree 只保留 paged growing route，不包含 continuous/paged selector。
+
+```text
+Phase 0              Phase 1             Phase 2
+freeze baseline  ->  KV substrate    ->  Main + MTP causal cut
+                                              |
+                                              v
+Phase 4                                      Phase 3
+cleanup + final qualification  <-  DFlash vertical cut
+```
+
+Phase 是工程闭合边界，不是 runtime feature flag。一个 phase 内若 storage、Op contract 和 caller 必须
+同时改变才能形成 coherent build，就在同一 source-level cut 完成，不用 compatibility overload 伪造
+中间产品。
+
+主要 affected source surface：
+
+| Area | Responsibility |
+|---|---|
+| Core KV storage | page-major plane slabs、paged pools/allocations/tables、独立 cyclic storage |
+| Causal GQA | Main/MTP view validation、append、prefill、decode、cached-only paged addressing |
+| DFlash | growing prefix append、Full context Attention，以及独立 local cyclic storage |
+| Target state | pool inventory、allocation ownership、row binding、materialize/frontier lifecycle |
+| Qualification | mapping/lifetime tests、affected Op correctness/performance、real target paths |
+
+### 20.1 Gate summary
+
+| Gate | Closed when |
+|---|---|
+| G0 baseline | 将被替换的 continuous operator 与 real-artifact paths 有可比较 reference |
+| G1 substrate | ownership、reservation、mapping、row binding、retention 和 fragmentation invariants 成立 |
+| G2 Main/MTP | 两个 targets 的全部 causal growing-KV callers 使用 paged contract |
+| G3 DFlash | Full storage paged，local/boundary-local storage 明确为 cyclic |
+| G4 final | §18、§19 与 superseded-path cleanup 全部完成 |
+
+### Phase 0: Freeze the comparison boundary
+
+- 固定范围为 growing KV storage、single-sequence consumer addressing 和现有 target binding；
+- 列出 Main、MTP、DFlash Full 实际调用的 Op routes；
+- 按 §19.3 保存 continuous operator 与 real-artifact baseline；
+- 确认当前相关 correctness tests 与 baseline 可复现。
+
+Exit: G0。Baseline 只用于比较，不成为 fallback。
+
+### Phase 1: Build and close the KV substrate
+
+1. 按 §4 的 fixed page-major layout 建立各 pool 的 stable plane slabs 和 page-group namespace；
+2. 实现 pool-local reservation、materialize、trim、release 与 authoritative ordered mapping；
+3. 将 Main 与 selected backend allocation（若 Engine 启用 backend）组合为 sequence-owned bundle；
+4. 建立每个 pool 固定 row count 的 I32 device block-table matrix；当前 Program 使用一行，substrate
+   qualification 使用多行，后续并发 Engine 使用 `max_concurrency` 行；
+5. 实现 allocation 对空闲 row 的 bind、update、unbind 和 rebind；retained allocation 不占 row；
+6. 固定 GPU boundary ordering：publish 后才能 launch，in-flight 时 mapping 不变，consumer 完成后才能
+   release；
+7. 验证 multi-allocation、fragmented free pages、partial tail、truncate/recycle、retain/claim 和 row
+   isolation。
+
+本 phase 不修改 Attention Tensor domain，不加入 scheduler、batched Attention 或 request descriptors。
+
+Exit: G1。Substrate 可以同时容纳多个 allocations，但 consumer 尚未切换。
+
+### Phase 2: Cut Main and MTP through one causal boundary
+
+Main Text 在 ordinary、MTP 和 DFlash modes 中共享 causal GQA family；MTP persistent KV 也使用同一组
+growing-cache contracts。因此 causal entries、实现与所有 callers 作为一个 source-level cut 迁移：
+
+1. 将 causal Op contracts 和 validation 切到 `PagedKVLayerView`；
+2. 迁移 BF16 copy 与 INT8-G64 encode/append，闭合 exact cache-bit checks；
+3. 迁移 causal prefill 与 cached traversal，覆盖 non-aligned base 和跨页 unit；
+4. 迁移 small-T BF16 与 INT8-G64 append-and-attend/cached-only routes；
+5. 让 page lookup 在 tile/CTA 粒度共享，保持原 partial/reduce 数学；
+6. 同时切换两个 targets 的 Main/MTP pools、callers 和 CUDA Graph captures；
+7. 每条 route 完成后直接与 G0 baseline 比较。
+
+Runtime 在 launch 前按 execution envelope materialize 最大可能范围。当前单请求绑定一个 fixed row；
+prefix reuse 保留同一 allocation，claim 时重绑 row。命中 assistant-content boundary 时 truncate trailing
+pages 并恢复 checkpoint，不复制 retained KV payload。Frontier 仍由 target sequence state 拥有，不进入
+Op view。
+
+Exit: G2。Text、Vision+Text、ordinary、MTP、prefix reuse 和 graph replay 均使用 paged Main/MTP。
+
+### Phase 3: Cut DFlash as a separate vertical slice
+
+DFlash 与 MTP 同属 speculative decoding，但使用独立 Full consumer 和 local cyclic state，因此单独迁移：
+
+1. 按 §12.1 建立独立 fixed cyclic container，承接 local 与 boundary-local ownership；
+2. 建立并绑定 DFlash Full pool allocation 与 block-table row；
+3. 将 growing prefix append 切到 paged view，cyclic entry 只接受 cyclic view；
+4. 将 `bidirectional_gqa_attention` persistent context loads 切到 paged view，transient query K/V 保持
+   连续；
+5. 验证 context 0、page boundaries、accept/rollback、retained prefix、graph replay 和最大 context；
+6. 运行 DFlash Op、round 与 text-only real-artifact qualification。
+
+Exit: G3。Full、local 和 boundary-local 各自只有一个明确 storage owner。
+
+### Phase 4: Remove the superseded path and qualify the product
+
+- 删除 growing `KVCacheLayerView`、continuous `KVCache`、flat `padded_context` addressing 及 helpers；
+- 删除 obsolete arguments、fixtures、overloads、aliases 和 runtime switches；
+- 只保留 `PagedKVLayerView` 与 `CyclicKVCacheLayerView`；
+- 执行 §18 correctness、multi-allocation lifecycle 和两个 exact targets 的 integration；
+- 执行 §19 performance gates，并确认 CUDA Graph 没有 mapping-dependent recapture、额外 host
+  synchronization 或 per-page launch。
+
+Exit: G4。最终 tree 只有 paged growing KV 与 fixed cyclic KV；Attention 仍是单请求语义，KV substrate
+已经具备之后并发绑定所需的 multi-allocation 与 fixed-row 能力。
+
+### 20.2 Qualification cadence and failure handling
+
+每条 route 的闭合顺序：
+
+```text
+independent oracle
+    -> identity / fragmented mappings and page boundaries
+    -> operator eager execution
+    -> production graph replay
+    -> containing target path
+```
+
+- mapping、ownership 或 lifetime 错误回到 G1，不在 kernel 中增加 allocator 容错；
+- 单一 route 回退只调整其 lookup sharing、tile、split 或 staging；
+- end-to-end 回退先归因到具体 route；
+- fixed `P=64` 或 page-major contract 若无法满足 product gate，必须作为新的 architecture change 显式
+  处理；不能暗中增加第二种 layout、continuous fallback 或 gather path。
+
+---
+
+## 21. Fixed decisions and tuning freedom
+
+以下是实现必须遵守的 architecture contract：
+
+- 并发 Engine 的 `main_aggregate_context` 是显式 startup contract；当前单请求 cutover 从
+  `EngineOptions.max_context` 导出相等的 per-sequence/aggregate profile；`N_main` 经 `P=64` 归一化，
+  启用 MTP 或 DFlash 时 `N_backend=N_main`，startup 显存不足即拒绝配置；
+- growing KV 使用 homogeneous pools、pool-local I32 page-group IDs 和 allocation-owned ordered mapping；
+- 全部 registered growing pools 的 page size 为 `P=64`；
+- K/V 与 code planes 固定为 contiguous page-major `[D,P,Hkv,Nphysical]`；INT8-G64 scale planes 固定为
+  contiguous page-major `[D/64,P,Hkv,Nphysical]`；
+- exact strides 由 §4.2 唯一确定；target、dtype 和 speculative backend 不改变 axis order；
+- K/V/code/scale 及同 pool layers 共享一个 page-group ID 和一份 per-sequence block table；
+- device tables 使用 startup-fixed row count：当前单请求 profile 为 1，并发 Engine 为
+  `max_concurrency`；Attention Op 在本次迁移中保持 single-sequence Tensor domain；
+- no gather-to-contiguous、no per-plane/per-head pointer tables、no continuous fallback、no
+  arbitrary-layout runtime dispatch；
+- DFlash local 与 boundary-local 使用 §12.1 的 fixed contiguous cyclic layout，不进入 growing pools；
+- ownership、reservation、frontier、request identity 和 slot identity 不进入 Op view。
+
+以下内容属于 route-specific implementation profile，可以在不改变 storage contract 时测量和调整：
+
+- BF16/INT8 route 的 warps per CTA、split count、keys per split 和 32/64-key route interval；
+- block-table entry 在 register/shared memory 中的广播方式；
+- append kernel 每个 CTA 处理的 tokens/heads；
+- allocator 优先选择连续 free IDs 的 heuristic；
+- route-private staging、workspace representation 和 reduction decomposition。
+
+改变 `P`、pool grouping、page ID model 或 page-major order 都是 architecture contract 变更，不属于
+kernel tuning。任何实现都不能在 kernel 内暗中建立第二套 storage contract。

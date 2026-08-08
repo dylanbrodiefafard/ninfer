@@ -49,6 +49,9 @@ model execution：一次 model traversal、一次 CUDA Graph replay 和一组 ba
 
 本文定义并发层如何预留、持有、组批和转移这些 state，不定义 substrate 的 page
 geometry、物理 slab layout、allocator、block-table representation 或 page-aware operator implementation。
+Growing KV substrate 的 active contract 由
+[Paged KV Context Store](paged-kv-cache.md)定义；本文只消费其 allocation、reservation 和 execution-view
+语义。
 
 ---
 
@@ -164,7 +167,8 @@ RECEIVED
 WAITING
    │ bounded CPU preparation, then admission:
    │ slot + state + completion reservation
-   ├── complete prefix hit ─────────────────────► DECODE_READY
+   ├── retained current frontier == prompt
+   │   and decode anchor is complete ───────────► DECODE_READY
    ▼
 PREFILL
    │ chunks; final chunk establishes decode anchor
@@ -189,8 +193,9 @@ admission；二者是 server-side phases，不需要扩展成更多 model-execut
 当前 in-flight round 由该 round 记录，不再建模成一个长期 request state。
 
 Intermediate prefill chunks 只推进 prompt state。Final prefill 执行一次 target output selection，建立 decode
-anchor；如果立即命中 terminal condition，请求不进入 decode batch。Complete prefix hit 必须同时
-恢复等价 continuation frontier；单独的 KV match 不足以进入 `DECODE_READY`。
+anchor；如果立即命中 terminal condition，请求不进入 decode batch。只有 retained current frontier 正好
+覆盖完整 prompt 且 decode anchor 完整时才能跳过 prefill；命中已保存 boundary checkpoint 仍需从该
+checkpoint prefill 新 suffix。单独的 KV match 不足以进入 `DECODE_READY`。
 
 ### 4.2 Slot
 
@@ -273,8 +278,8 @@ Admission 是一次 atomic boundary transaction：prepared FIFO entry、optional
 fixed/growing state reservation 和 host result capacity 要么全部取得并发布 admitted request，要么不改变
 任何 request-visible ownership。不允许请求带着部分 reservation 回到 queue。
 
-Prepared requests 之间使用 strict FIFO。暂时受阻的队首不能被绕过。Complete prefix hit 可以跳过
-prefill，但不能绕过更早的 FIFO entry。
+Prepared requests 之间使用 strict FIFO。暂时受阻的队首不能被绕过。Retained checkpoint reuse 可以减少
+prefill；current-frontier exact hit 可以跳过 prefill，但二者都不能绕过更早的 FIFO entry。
 
 Admission 结果分为：
 
@@ -341,11 +346,16 @@ active used capacity
 <= total usable capacity
 ```
 
+Selected speculative backend 的物理 KV pool 虽与 Main Text pool 分离，但容量由同一个 target-specific
+profile 联合规划。Active-priority retained eviction 后，任何满足 advertised main-context contract 和
+`max_concurrency` 的合法 active set，都必须同时满足 backend reservation；backend 更早失败属于
+startup sizing 或 accounting invariant violation，不是正常 admission backpressure。
+
 Prefill/decode 推进只把该 request 已有的 logical reservation 转换成 used capacity，不创建
 新的资源要求。Physical blocks 是提前划归还是按需绑定，属于 Sequence-State Store。
 
-Prefix reuse 把 retained used capacity 转为 active used capacity，不重复计费。Boundary restore 或
-eviction 释放不再可达的 state，然后才重新计算 future reservation。
+Prefix reuse 把 retained used capacity 转为 active used capacity，不重复计费。Retained eviction 释放
+不再可达的 state，然后才重新计算 future reservation。
 
 启动 prefill chunk 或 decode round 前，Scheduler 用 request 的 remaining reservation 和 logical
 context/output limit 限制该 unit 最大可能的 state growth。没有合法增长空间的 request 直接 terminal，
@@ -366,24 +376,33 @@ generation cap。
 KV cache 等 growing state 按 request context 计费。Fixed-size recurrent/backend state 按 admitted
 sequence 分配。即使二者来自不同内部 pool，也必须在同一次 admission decision 中同时满足。
 
-Growing state 由前置 substrate 以 block-addressable shared storage 承载，不要求单个 request 的
-physical context 连续；model execution 通过 opaque state view 访问它。Concurrent engine 只操作
-allocation handle、logical frontier 和 resource reservation，不参与 page 或物理地址管理。
+Growing KV state 由 [Paged KV Context Store](paged-kv-cache.md) 以 target-defined homogeneous
+page-group pools 承载。一个 sequence 始终持有 Main Text allocation；Engine 选定 MTP 或 DFlash 时还
+必须持有对应的 backend allocation。各 pool 具有独立 frontier 和 reservation；单个 request 的 physical
+context 不要求连续。Concurrent engine 只操作 bundle handle、logical frontiers 和 reservation vector，
+不参与 page 或物理地址管理。
 
-GPU work in-flight 期间，per-request state handle 和 view 的含义必须稳定。Page size、slab
-layout、virtual-address mechanism 和 allocator 属于 Sequence-State Store 的设计，不属于本并发架构。
+GPU work in-flight 期间，per-request state handle 和 view 的含义必须稳定。Page size、slab layout、
+block-table 和 allocator 的 contract 属于 Paged KV Context Store，不在本并发文档重复定义。
 
 ### 6.4 Prefix reuse
 
-Retained prefix 是从已结束 request 中分离出来的、单一 owner 的 SequenceState allocation。它保留当前
-resume frontier，以及 prefill 期间显式保存的有限 reusable-boundary checkpoints。复用点只能是当前
-frontier 或这些 checkpoints，不能是任意 longest token prefix。
+Retained prefix 是从已结束 request 中分离出来的、单一 owner 的 SequenceState allocation。它只发布
+target 已保存完整 continuation state 的 checkpoints。当前 Qwen3.6 retained state 可以发布 current
+resume frontier，以及一份有效时的 assistant-content boundary checkpoint。两者引用同一份 KV
+allocation；boundary checkpoint 额外保存对应的 recurrent、hidden、speculative-backend 和 position state，
+不复制 KV payload。
 
 Admission 成功时消费 retained entry，并把 SequenceState ownership 转移给新 slot：
 
-- frontier reuse 直接从 retained frontier 继续；
-- boundary reuse 把 KV logical length 截到 checkpoint，并恢复对应的 recurrent/backend state；
-- complete prefix hit 直接进入 `DECODE_READY`，partial hit 只 prefill 未命中的 suffix。
+- incoming prompt 在 current resume frontier 结束且 decode anchor 完整时，直接进入 `DECODE_READY`；
+- incoming prompt 完整包含 current resume frontier 并有后续 suffix 时，从该 frontier prefill suffix；
+- incoming prompt 匹配已保存 assistant-content boundary 并在其后有新 suffix 时，在 atomic admission
+  transaction 提交后把 growing allocations truncate 到 boundary、恢复完整 checkpoint，再 prefill suffix；
+- common prefix 结束在没有 checkpoint 的任意其他位置时视为 cache miss。
+
+Boundary restore 保留包含 checkpoint 的部分尾页，释放其后的完整 pages。KV page 或 token prefix match
+本身不是 checkpoint；当前架构不支持 arbitrary longest-common-prefix reuse。
 
 一个 retained entry 同时只能被一个 active request 消费。多个 active requests 不共享同一份可写
 sequence state，也不使用 copy-on-write branching。Request-local RNG、sampling、stop、generation
@@ -458,7 +477,7 @@ unbounded prefill work。
 
 ### 7.4 Joining and leaving decode
 
-- request 在 final prefill 完成或 admitted complete prefix hit ready 后加入 active decode set；
+- request 在 final prefill 完成或 retained current frontier exact hit 后加入 active decode set；
 - newly ready request 首次出现在下一个 boundary 构建的 batch；
 - EOS、stop 或 generation limit 在 completed round commit 后移除 request；
 - 每次 join/leave 后重新 compact batch rows；
@@ -606,6 +625,11 @@ MTP autoregressively 推进 proposal positions，每个 position 都在全部 ac
 DFlash 通过一次 batched block forward 产生 proposal block。二者的区别只存在于选定的 decode graph
 内部，不改变 slot、admission、scheduling 或 active-batch formation。
 
+Engine capability 在 startup 时固定。MTP Engine 可以同时启用 Vision；MTP 的 shifted input 落在视觉列
+时使用与 target 相同的 Vision-composed embedding，prefix-reuse bridge 与正常 prefill 遵守同一输入
+语义。当前 DFlash companion checkpoint 是 text-only，因此 `DFlash + Vision` 在 Engine 构造时拒绝，
+不形成 request-level fallback。
+
 不同 request 可以接受不同数量的 proposals。Acceptance length 是 result metadata，不能据此拆分
 verification、重放 model 或形成 acceptance cohort。Target model 始终是 output authority，只有 accepted
 target/backend state 可以 commit。ReplaySSM 在同一 per-request state/commit interface 后工作。
@@ -626,7 +650,8 @@ boundary 把 committed tokens 追加到该 record，因此 ordinary 或 multi-to
 network progress 才能 commit。
 
 Model completion 时，GPU Executor 终结 owning result record，释放 request 的 slot 和 unused reservation，
-并释放 sequence state 或按 §6.4 把 exact reusable state 转移给 retained-prefix cache。上述 GPU
+并释放 sequence state 或按 §6.4 把带有 target-declared reusable checkpoints 的 state 转移给
+retained-prefix cache。上述 GPU
 resource 被复用后，response path 仍可继续读取 owning record。
 
 Committed output events 进入同时具有 per-request 和 aggregate bound 的 asynchronous transport queue。
