@@ -258,8 +258,7 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     for (std::int32_t token = 0; token < tokens; ++token) {
         const Tensor x_column     = x.slice(1, token, 1);
         Tensor destination_column = destination.slice(1, token, 1);
-        detail::sparse_moe_decode_launch(x_column, weights, destination_column, views, plan,
-                                         stream);
+        detail::sparse_moe_decode_launch(x_column, weights, destination_column, views, stream);
     }
 }
 

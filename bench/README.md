@@ -451,28 +451,34 @@ The executable isolates these Op contracts; end-to-end 35B-A3B measurement uses 
 ## 35B sparse-MoE dFlash benchmark
 
 `ninfer_sparse_moe_bench` measures the complete routed-plus-shared post-mixer Op for the 35B Text
-Q4+Q5/Q6 profiles and the MTP W8+W8 profile. Small-T rows report the selected number of D3
-paths/CTA (`p`) and D4 output rows/CTA (`r`). `--matrix` includes the former three-path/one-row
-schedule as a same-process control.
+Q4+Q5/Q6 profiles and the MTP W8+W8 profile. It is a long-lived public Op benchmark: fixture setup
+uses `sparse_moe_workspace_capacity_bytes()`, and every eager or captured measurement calls only
+`ninfer::ops::sparse_moe()`. Production dispatch exclusively owns decode, Small-T, prefill,
+workspace views, launch decomposition, and schedule selection.
+
+CUDA Graph replay is the default and authoritative execution mode. The benchmark eagerly
+materializes the public call, captures it with stable tensor and workspace addresses, instantiates
+the graph, and primes one replay before configured warmup. Timing-enabled external event nodes
+surround the captured public call, so `graph_replay` reports the complete device-side SparseMoe
+body while excluding fixture reset, L2 eviction, graph capture/instantiation/prime, host launch,
+and host synchronization. `eager` uses the same public-call lambda and is only a comparison mode.
 
 ```bash
 cmake --build build --parallel --target ninfer_sparse_moe_bench
-for codec in q4-q5 q4-q6 w8-w8; do
-  for tokens in $(seq 1 16); do
-    ./build/bench/ninfer_sparse_moe_bench \
-      --scope full --candidate production --codec "$codec" --tokens "$tokens" \
-      --distribution trace-like --warmup 5 --repeat 50
-  done
-done
-
 ./build/bench/ninfer_sparse_moe_bench \
-  --matrix --tokens 16 --distribution trace-like --warmup 5 --repeat 80
+  --codec q4-q5 --tokens 1 --execution graph --cache both \
+  --distribution trace-like --warmup 20 --repeat 200
+./build/bench/ninfer_sparse_moe_bench \
+  --codec all --sweep 1:44:1 --execution graph --cache cold \
+  --distribution trace-like --warmup 5 --repeat 50 \
+  --csv-out profiles/bench/sparse_moe_public_graph.csv
 ```
 
 Each cold sample flushes 256 MiB before the timed interval. `trace-like` is the primary
 single-sequence verification distribution; `independent` and `same` bound zero and complete expert
-overlap. Candidate names `small-t-p{1,3,9}-r{1,2,4}` expose the compiled schedule matrix without
-changing public dispatch.
+overlap. `--execution eager|graph|both` and `--cache cold|warm|both` change only the harness around
+the same public call. The CSV `timed_scope` is `full_sparse_moe_device_body`; it contains no private
+route, candidate, grid, block, or launch-count fields.
 
 ## Target MTP round benchmark
 

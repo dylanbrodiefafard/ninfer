@@ -60,17 +60,6 @@ SparseMoeSmallTWorkspace allocate_sparse_moe_small_t_workspace(Arena& arena, std
 [[nodiscard]] SparseMoeSmallTPlan
 resolve_sparse_moe_small_t_plan(std::int32_t tokens, QType routed_gate_up, QType routed_down);
 
-void sparse_moe_small_t_launch_s1(const Tensor& x, const Weight& router_shared_gate,
-                                  const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream);
-void sparse_moe_small_t_launch_s2(const SparseMoeSmallTPlan& plan,
-                                  const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream);
-void sparse_moe_small_t_launch_s3(const Tensor& x, const SparseMoeWeights& weights,
-                                  const SparseMoeSmallTPlan& plan,
-                                  const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream);
-void sparse_moe_small_t_launch_s4(const SparseMoeWeights& weights, Tensor& destination,
-                                  const SparseMoeSmallTPlan& plan,
-                                  const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream);
-
 void sparse_moe_small_t_launch(const Tensor& x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoeSmallTPlan& plan,
                                const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream);
