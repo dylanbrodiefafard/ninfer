@@ -1,292 +1,307 @@
-// Candidate and production qualification benchmark for prepare_masked_block.
-// Every timed invocation is one CUDA Graph replay. A 256 MiB untimed write conditions GPU clocks;
-// hot mode then primes this Op once, while cold mode measures immediately after the cache flush.
-#include "core/device.h"
-#include "ninfer/ops/prepare_masked_block.h"
-#include "ninfer_bench_common.h"
-#include "ops/launcher/prepare_masked_block.h"
+// Public-Op benchmark for the exact anchor-and-mask block transform.
 
+#include "ninfer/ops/prepare_masked_block.h"
+
+#include "core/device.h"
+#include "ninfer_bench_common.h"
+
+#include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
 
-#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
 
 using namespace ninfer;
-using namespace ninfer::bench;
 
 namespace {
 
-constexpr std::int32_t kMaskId = 248077;
-constexpr std::size_t kFlush   = std::size_t{256} << 20;
+constexpr std::int32_t kMaskId    = 248077;
+constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
+constexpr double kRtx5090DramGBs  = 1792.0;
 
-enum class RouteChoice {
-    Production,
-    Warp32,
-    Block64,
-    Block128,
-    Block256,
-    All,
-};
+enum class Execution : std::uint8_t { Eager, Graph, Both };
+enum class CacheMode : std::uint8_t { Cold, Warm, Both };
+enum class CacheState : std::uint8_t { Cold, Warm };
 
 struct Options {
-    std::vector<int> block_sizes{2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
-    RouteChoice route = RouteChoice::All;
-    bool cold         = false;
-    bool profile_once = false;
-    int warmup        = 20;
-    int repeat        = 101;
+    std::vector<std::int32_t> block_sizes{2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    Execution execution = Execution::Graph;
+    CacheMode cache     = CacheMode::Cold;
+    int warmup          = 20;
+    int repeat          = 101;
+    bool profile        = false;
+    std::string csv_out;
+};
+
+struct Result {
+    std::int32_t block_size;
+    Execution execution;
+    CacheState cache;
+    double useful_bytes;
+    bench::ColdTiming timing;
 };
 
 [[noreturn]] void usage(const char* message) {
-    std::fprintf(stderr, "error: %s\n", message);
-    std::fprintf(stderr, "usage: ninfer_prepare_masked_block_bench [--block-sizes 2,...] "
-                         "[--route production|warp32|block64|block128|block256|all] "
-                         "[--cold-cache] [--profile-once] [--warmup N] [--repeat N]\n");
+    std::fprintf(stderr,
+                 "error: %s\n"
+                 "usage: ninfer_prepare_masked_block_bench [--block-sizes 2,...,16] "
+                 "[--execution eager|graph|both] [--cache cold|warm|both] "
+                 "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
+                 message);
     std::exit(2);
 }
 
-int parse_int(std::string_view text, int minimum, int maximum, const char* flag) {
+std::int32_t parse_i32(std::string_view text, std::int32_t minimum, std::int32_t maximum,
+                       const char* flag) {
     const std::string value(text);
-    errno             = 0;
-    char* end         = nullptr;
-    const long parsed = std::strtol(value.c_str(), &end, 10);
+    errno       = 0;
+    char* end   = nullptr;
+    long parsed = std::strtol(value.c_str(), &end, 10);
     if (errno != 0 || end == value.c_str() || *end != '\0' || parsed < minimum ||
         parsed > maximum) {
         usage(flag);
     }
-    return static_cast<int>(parsed);
+    return static_cast<std::int32_t>(parsed);
 }
 
-std::vector<int> parse_list(const char* text, int minimum, int maximum, const char* flag) {
-    std::vector<int> result;
+std::vector<std::int32_t> parse_list(const char* text, const char* flag) {
+    std::vector<std::int32_t> result;
     std::string_view remaining(text);
     while (!remaining.empty()) {
-        const auto comma            = remaining.find(',');
+        const std::size_t comma     = remaining.find(',');
         const std::string_view item = remaining.substr(0, comma);
-        if (item.empty()) usage(flag);
-        result.push_back(parse_int(item, minimum, maximum, flag));
-        if (comma == std::string_view::npos) break;
+        if (item.empty()) { usage(flag); }
+        result.push_back(parse_i32(item, 2, 16, flag));
+        if (comma == std::string_view::npos) { break; }
         remaining.remove_prefix(comma + 1);
     }
+    if (result.empty()) { usage(flag); }
     return result;
 }
 
 Options parse_options(int argc, char** argv) {
     Options options;
-    for (int i = 1; i < argc; ++i) {
-        const std::string_view arg(argv[i]);
-        const auto next = [&](const char* message) {
-            if (++i == argc) usage(message);
-            return argv[i];
+    for (int index = 1; index < argc; ++index) {
+        const std::string_view argument(argv[index]);
+        const auto next = [&](const char* flag) -> const char* {
+            if (++index == argc) { usage(flag); }
+            return argv[index];
         };
-        if (arg == "--block-sizes") {
+        if (argument == "--block-sizes") {
             options.block_sizes =
-                parse_list(next("--block-sizes requires a value"), 2, 16, "--block-sizes");
-        } else if (arg == "--route") {
-            const std::string_view value(next("--route requires a value"));
-            if (value == "production") {
-                options.route = RouteChoice::Production;
-            } else if (value == "warp32") {
-                options.route = RouteChoice::Warp32;
-            } else if (value == "block64") {
-                options.route = RouteChoice::Block64;
-            } else if (value == "block128") {
-                options.route = RouteChoice::Block128;
-            } else if (value == "block256") {
-                options.route = RouteChoice::Block256;
-            } else if (value == "all") {
-                options.route = RouteChoice::All;
-            } else {
-                usage("--route expects production, warp32, block64, block128, block256, or all");
-            }
-        } else if (arg == "--cold-cache") {
-            options.cold = true;
-        } else if (arg == "--profile-once") {
-            options.profile_once = true;
-        } else if (arg == "--warmup") {
-            options.warmup = parse_int(next("--warmup requires a value"), 0, 10000, "--warmup");
-        } else if (arg == "--repeat") {
-            options.repeat = parse_int(next("--repeat requires a value"), 1, 10000, "--repeat");
+                parse_list(next("--block-sizes requires a value"), "--block-sizes");
+        } else if (argument == "--execution") {
+            const std::string_view value(next("--execution requires a value"));
+            if (value == "eager")
+                options.execution = Execution::Eager;
+            else if (value == "graph")
+                options.execution = Execution::Graph;
+            else if (value == "both")
+                options.execution = Execution::Both;
+            else
+                usage("--execution expects eager, graph, or both");
+        } else if (argument == "--cache") {
+            const std::string_view value(next("--cache requires a value"));
+            if (value == "cold")
+                options.cache = CacheMode::Cold;
+            else if (value == "warm")
+                options.cache = CacheMode::Warm;
+            else if (value == "both")
+                options.cache = CacheMode::Both;
+            else
+                usage("--cache expects cold, warm, or both");
+        } else if (argument == "--warmup") {
+            options.warmup = parse_i32(next("--warmup requires a value"), 0, 10000, "--warmup");
+        } else if (argument == "--repeat") {
+            options.repeat = parse_i32(next("--repeat requires a value"), 1, 10000, "--repeat");
+        } else if (argument == "--profile") {
+            options.profile = true;
+        } else if (argument == "--csv-out") {
+            options.csv_out = next("--csv-out requires a path");
+        } else if (argument == "--help" || argument == "-h") {
+            usage("help");
         } else {
             usage("unknown argument");
         }
     }
+    if (options.profile &&
+        (options.block_sizes.size() != 1 || options.execution == Execution::Both ||
+         options.cache == CacheMode::Both)) {
+        usage("--profile requires one block size, one execution, and one cache state");
+    }
     return options;
 }
 
-struct Graph {
-    cudaGraph_t graph          = nullptr;
-    cudaGraphExec_t executable = nullptr;
-
-    Graph() = default;
-
-    Graph(const Graph&)            = delete;
-    Graph& operator=(const Graph&) = delete;
-
-    Graph(Graph&& other) noexcept : graph(other.graph), executable(other.executable) {
-        other.graph      = nullptr;
-        other.executable = nullptr;
+class Case {
+public:
+    explicit Case(std::int32_t block_size)
+        : block_size_(block_size), anchor_(sizeof(std::int32_t)), length_(sizeof(std::int32_t)),
+          ids_(static_cast<std::size_t>(block_size) * sizeof(std::int32_t)),
+          positions_(static_cast<std::size_t>(block_size) * sizeof(std::int32_t)),
+          anchor_tensor_(anchor_.p, DType::I32, {1}), length_tensor_(length_.p, DType::I32, {1}),
+          ids_tensor_(ids_.p, DType::I32, {block_size}),
+          positions_tensor_(positions_.p, DType::I32, {block_size}) {
+        const std::int32_t anchor = 42;
+        const std::int32_t length = 4096;
+        CUDA_CHECK(cudaMemcpy(anchor_.p, &anchor, sizeof(anchor), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(length_.p, &length, sizeof(length), cudaMemcpyHostToDevice));
     }
 
-    ~Graph() {
-        if (executable != nullptr) cudaGraphExecDestroy(executable);
-        if (graph != nullptr) cudaGraphDestroy(graph);
+    void launch(cudaStream_t stream) {
+        ops::prepare_masked_block(anchor_tensor_, length_tensor_, kMaskId, ids_tensor_,
+                                  positions_tensor_, stream);
     }
+
+private:
+    std::int32_t block_size_;
+    DeviceBuffer anchor_;
+    DeviceBuffer length_;
+    DeviceBuffer ids_;
+    DeviceBuffer positions_;
+    Tensor anchor_tensor_;
+    Tensor length_tensor_;
+    Tensor ids_tensor_;
+    Tensor positions_tensor_;
 };
 
-template <class Launch>
-Graph capture_graph(Launch&& launch, cudaStream_t stream) {
-    Graph result;
-    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-    launch(stream);
-    CUDA_CHECK(cudaStreamEndCapture(stream, &result.graph));
-    CUDA_CHECK(cudaGraphInstantiate(&result.executable, result.graph, nullptr, nullptr, 0));
-    return result;
+const char* execution_name(Execution execution) {
+    return execution == Execution::Eager ? "eager" : "graph";
 }
 
-Result bench_graph(cudaGraphExec_t graph, DeviceBuffer& flush, bool cold, cudaStream_t stream,
-                   double bytes, int warmup, int repeat) {
-    cudaEvent_t begin = nullptr;
-    cudaEvent_t end   = nullptr;
-    CUDA_CHECK(cudaEventCreate(&begin));
-    CUDA_CHECK(cudaEventCreate(&end));
-    for (int i = 0; i < warmup; ++i) {
-        CUDA_CHECK(cudaMemsetAsync(flush.p, 0xa5, flush.bytes, stream));
-        if (!cold) CUDA_CHECK(cudaGraphLaunch(graph, stream));
-        CUDA_CHECK(cudaGraphLaunch(graph, stream));
+const char* cache_name(CacheState cache) { return cache == CacheState::Cold ? "cold" : "warm"; }
+
+bench::ColdTiming measure(Case& data, Execution execution, CacheState cache,
+                          bench::TimedGraph* graph, DeviceBuffer& flush, cudaStream_t stream,
+                          int warmup, int repeat) {
+    if (execution == Execution::Eager) {
+        const auto launch = [&](cudaStream_t launch_stream) { data.launch(launch_stream); };
+        return cache == CacheState::Cold
+                   ? bench::measure_cold_launch(launch, flush, stream, warmup, repeat)
+                   : bench::measure_launch(launch, stream, warmup, repeat);
+    }
+    return cache == CacheState::Cold
+               ? bench::measure_cold_graph(*graph, flush, stream, warmup, repeat)
+               : bench::measure_graph(*graph, stream, warmup, repeat);
+}
+
+void report(const Result& result) {
+    const double seconds = result.timing.median_us * 1.0e-6;
+    const double gbps    = result.useful_bytes / seconds / 1.0e9;
+    std::printf("entry=prepare_masked_block execution=%-5s cache=%-4s B=%2d "
+                "median=%7.3f us min=%7.3f us p95=%7.3f us useful=%7.4f GB/s "
+                "(%7.4f%% of %.0f)\n",
+                execution_name(result.execution), cache_name(result.cache), result.block_size,
+                result.timing.median_us, result.timing.min_us, result.timing.p95_us, gbps,
+                gbps / kRtx5090DramGBs * 100.0, kRtx5090DramGBs);
+}
+
+void write_csv(const Options& options, const std::vector<Result>& results) {
+    if (options.csv_out.empty()) { return; }
+    const std::filesystem::path path(options.csv_out);
+    if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
+    std::ofstream output(path);
+    if (!output) { throw std::runtime_error("failed to open CSV output"); }
+    output << "entry,execution,cache,block_size,useful_bytes,median_us,min_us,p95_us\n";
+    for (const Result& result : results) {
+        output << "prepare_masked_block," << execution_name(result.execution) << ','
+               << cache_name(result.cache) << ',' << result.block_size << ',' << result.useful_bytes
+               << ',' << result.timing.median_us << ',' << result.timing.min_us << ','
+               << result.timing.p95_us << '\n';
+    }
+}
+
+void profile(Case& data, const Options& options, DeviceBuffer& flush, cudaStream_t stream) {
+    const Execution execution = options.execution;
+    const CacheState cache = options.cache == CacheMode::Cold ? CacheState::Cold : CacheState::Warm;
+    bench::TimedGraph graph;
+    if (execution == Execution::Graph) {
+        data.launch(stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        graph.capture(stream, [&](cudaStream_t launch_stream) { data.launch(launch_stream); });
+        for (int index = 0; index < options.warmup; ++index) { graph.launch(stream); }
+    } else {
+        for (int index = 0; index < options.warmup; ++index) { data.launch(stream); }
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    std::vector<double> samples;
-    samples.reserve(static_cast<std::size_t>(repeat));
-    for (int i = 0; i < repeat; ++i) {
-        CUDA_CHECK(cudaMemsetAsync(flush.p, 0xa5, flush.bytes, stream));
-        if (!cold) CUDA_CHECK(cudaGraphLaunch(graph, stream));
-        CUDA_CHECK(cudaEventRecord(begin, stream));
-        CUDA_CHECK(cudaGraphLaunch(graph, stream));
-        CUDA_CHECK(cudaEventRecord(end, stream));
-        CUDA_CHECK(cudaEventSynchronize(end));
-        float milliseconds = 0.0F;
-        CUDA_CHECK(cudaEventElapsedTime(&milliseconds, begin, end));
-        samples.push_back(static_cast<double>(milliseconds) * 1000.0);
-    }
-    CUDA_CHECK(cudaEventDestroy(begin));
-    CUDA_CHECK(cudaEventDestroy(end));
-
-    std::sort(samples.begin(), samples.end());
-    Result result;
-    result.n_runs    = repeat;
-    result.median_us = samples[samples.size() / 2];
-    result.min_us    = samples.front();
-    result.p95_us = samples[std::min(samples.size() - 1, samples.size() * std::size_t{95} / 100)];
-    result.gbs    = bytes / (result.median_us * 1.0e3);
-    return result;
-}
-
-ops::detail::PrepareMaskedBlockRoute route_value(RouteChoice route) {
-    switch (route) {
-    case RouteChoice::Warp32:
-        return ops::detail::PrepareMaskedBlockRoute::Warp32;
-    case RouteChoice::Block64:
-        return ops::detail::PrepareMaskedBlockRoute::Block64;
-    case RouteChoice::Block128:
-        return ops::detail::PrepareMaskedBlockRoute::Block128;
-    case RouteChoice::Block256:
-        return ops::detail::PrepareMaskedBlockRoute::Block256;
-    case RouteChoice::Production:
-    case RouteChoice::All:
-        break;
-    }
-    return ops::detail::PrepareMaskedBlockRoute::Warp32;
-}
-
-struct Case {
-    int block_size;
-    DeviceBuffer anchor{sizeof(std::int32_t)};
-    DeviceBuffer length{sizeof(std::int32_t)};
-    DeviceBuffer ids;
-    DeviceBuffer positions;
-    Tensor anchor_tensor;
-    Tensor length_tensor;
-    Tensor ids_tensor;
-    Tensor positions_tensor;
-
-    explicit Case(int size)
-        : block_size(size), ids(static_cast<std::size_t>(size) * sizeof(std::int32_t)),
-          positions(static_cast<std::size_t>(size) * sizeof(std::int32_t)),
-          anchor_tensor(anchor.p, DType::I32, {1}), length_tensor(length.p, DType::I32, {1}),
-          ids_tensor(ids.p, DType::I32, {size}), positions_tensor(positions.p, DType::I32, {size}) {
-        const std::int32_t anchor_value = 42;
-        const std::int32_t length_value = 4096;
-        CUDA_CHECK(
-            cudaMemcpy(anchor.p, &anchor_value, sizeof(anchor_value), cudaMemcpyHostToDevice));
-        CUDA_CHECK(
-            cudaMemcpy(length.p, &length_value, sizeof(length_value), cudaMemcpyHostToDevice));
-    }
-};
-
-void run_route(Case& data, RouteChoice choice, const Options& options, DeviceBuffer& flush,
-               cudaStream_t stream) {
-    auto plan = ops::detail::prepare_masked_block_resolve_plan(data.block_size);
-    if (choice != RouteChoice::Production) plan.route = route_value(choice);
-    const auto launch = [&](cudaStream_t launch_stream) {
-        ops::detail::prepare_masked_block_launch(data.anchor_tensor, data.length_tensor, kMaskId,
-                                                 data.ids_tensor, data.positions_tensor, plan,
-                                                 launch_stream);
-    };
-    const char* route = ops::detail::prepare_masked_block_route_name(plan.route);
-    if (options.profile_once) {
-        launch(stream);
+    if (cache == CacheState::Cold) {
+        bench::flush_l2(flush, stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        std::printf("PROFILE_ONCE route=%s B=%d threads=%d "
-                    "kernel_regex='prepare_masked_block_kernel'\n",
-                    route, data.block_size,
-                    ops::detail::prepare_masked_block_route_threads(plan.route));
-        return;
     }
-
-    Graph graph          = capture_graph(launch, stream);
-    const double bytes   = static_cast<double>(2 + 2 * data.block_size) * sizeof(std::int32_t);
-    Result result        = bench_graph(graph.executable, flush, options.cold, stream, bytes,
-                                       options.warmup, options.repeat);
-    const double roof_us = bytes / (kRooflineGBs * 1.0e3);
-    std::printf("selection=%-10s route=%-8s cache=%s B=%2d threads=%3d median_us=%7.3f "
-                "min_us=%7.3f p95_us=%7.3f useful_GBs=%6.3f roof_us=%8.6f "
-                "roof_eff_pct=%7.4f\n",
-                choice == RouteChoice::Production ? "production" : "candidate", route,
-                options.cold ? "cold" : "hot ", data.block_size,
-                ops::detail::prepare_masked_block_route_threads(plan.route), result.median_us,
-                result.min_us, result.p95_us, result.gbs, roof_us,
-                result.median_us > 0.0 ? 100.0 * roof_us / result.median_us : 0.0);
+    std::printf("PROFILE entry=prepare_masked_block dispatch=public execution=%s cache=%s\n",
+                execution_name(execution), cache_name(cache));
+    std::fflush(stdout);
+    CUDA_CHECK(cudaProfilerStart());
+    if (execution == Execution::Graph)
+        graph.launch(stream);
+    else
+        data.launch(stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaProfilerStop());
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
-    const Options options = parse_options(argc, argv);
-    cudaStream_t stream   = nullptr;
-    CUDA_CHECK(cudaStreamCreate(&stream));
-    DeviceBuffer flush(kFlush);
-    std::printf("# RTX 5090 sm_120a; graph replay; exact I32 anchor/mask block; cache=%s\n",
-                options.cold ? "cold" : "hot");
-
-    for (const int block_size : options.block_sizes) {
-        Case data(block_size);
-        if (options.route == RouteChoice::All) {
-            for (const auto route : {RouteChoice::Warp32, RouteChoice::Block64,
-                                     RouteChoice::Block128, RouteChoice::Block256}) {
-                run_route(data, route, options, flush, stream);
-            }
-        } else {
-            run_route(data, options.route, options, flush, stream);
+    try {
+        int devices = 0;
+        if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
+            std::printf("SKIP: no usable CUDA device\n");
+            return 0;
         }
+        const Options options = parse_options(argc, argv);
+        cudaStream_t stream   = nullptr;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        DeviceBuffer flush(kFlushBytes);
+
+        if (options.profile) {
+            Case data(options.block_sizes.front());
+            profile(data, options, flush, stream);
+            CUDA_CHECK(cudaStreamDestroy(stream));
+            return 0;
+        }
+
+        std::vector<Result> results;
+        for (const std::int32_t block_size : options.block_sizes) {
+            Case data(block_size);
+            bench::TimedGraph graph;
+            if (options.execution != Execution::Eager) {
+                data.launch(stream);
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                graph.capture(stream,
+                              [&](cudaStream_t launch_stream) { data.launch(launch_stream); });
+            }
+            for (const Execution execution : {Execution::Eager, Execution::Graph}) {
+                if ((options.execution == Execution::Eager && execution != Execution::Eager) ||
+                    (options.execution == Execution::Graph && execution != Execution::Graph)) {
+                    continue;
+                }
+                for (const CacheState cache : {CacheState::Cold, CacheState::Warm}) {
+                    if ((options.cache == CacheMode::Cold && cache != CacheState::Cold) ||
+                        (options.cache == CacheMode::Warm && cache != CacheState::Warm)) {
+                        continue;
+                    }
+                    Result result{block_size, execution, cache,
+                                  static_cast<double>(2 + 2 * block_size) * sizeof(std::int32_t),
+                                  measure(data, execution, cache, &graph, flush, stream,
+                                          options.warmup, options.repeat)};
+                    report(result);
+                    results.push_back(result);
+                }
+            }
+        }
+        write_csv(options, results);
+        CUDA_CHECK(cudaStreamDestroy(stream));
+        return 0;
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "ninfer_prepare_masked_block_bench: %s\n", error.what());
+        return 1;
     }
-    CUDA_CHECK(cudaStreamDestroy(stream));
-    return 0;
 }

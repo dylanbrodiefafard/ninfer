@@ -545,22 +545,25 @@ Oracle 必须从 geometry 和 entry 可见集合计算 Head 映射，不复制�
 
 ### 7.2 Benchmarks
 
-长驻 benchmark 使用公共契约并按语义改名：
+长驻 benchmark 按公共语义分为：
 
-| 现有 benchmark | 目标 benchmark |
+| benchmark | 单次计时体的公共 entry |
 |---|---|
-| `ninfer_gqa_attention_bench` | `ninfer_causal_softmax_attention_bench` |
-| `ninfer_vision_attention_bench` | `ninfer_packed_softmax_attention_bench` |
-| `ninfer_bidirectional_gqa_attention_bench` | `ninfer_context_softmax_attention_bench` |
-| `ninfer_swa_bench` | `ninfer_sliding_window_attention_bench` |
-| `ninfer_kv_cache_append_prefix_bench` | `ninfer_kv_cache_append_bench`，用 mode 区分 full/prefix |
+| `ninfer_causal_softmax_attention_bench` | append-and-attend 或 cached-only |
+| `ninfer_packed_softmax_attention_bench` | uniform plain segment 或 packed segments |
+| `ninfer_context_softmax_attention_bench` | context-plus-query |
+| `ninfer_sliding_window_attention_bench` | symmetric sliding window |
+| `ninfer_kv_cache_append_bench` | full append 或 device-count prefix append |
 
-benchmark 的输出标签、JSON `artifact_type`、usage、README 命令和 profiler kernel regex 同步
-改名。实现 kernel regex 可以包含 `small_t`、`split_kv`、`bf16`、`i8` 等事实，不包含 GQA、
-Vision 或目标名。
+fixture 构造、公共 capacity 查询、cache 条件化、CUDA Graph capture/instantiate 和同步都在计时
+区间之外。eager 计时体恰好调用一次公共 Op；Graph 内也只 capture 同一次公共调用。
+benchmark 不包含 private header、launcher、candidate、route forcing、tile/split 参数、生产
+dispatch 复制或 kernel-name 正则。`--profile` 包围的是完整公共调用，调用内部出现的全部生产
+kernel 都属于该 Op 的实测结果。
 
-`attention_layer_bench` 若继续作为长驻 benchmark，必须通过新公共契约测量生产 route。强制
-private candidate 的比较只允许存在于任务期临时代码，route 选定后删除。
+`attention_layer_bench` 不是闭合的公共 Op 契约，且原实现组合多个内部阶段并暴露 private
+route，因此从长驻 Op benchmark 移除。完整 mixer 和 target 影响由公共 Engine 或 target round
+benchmark 测量；private candidate 比较只允许存在于任务期临时代码，route 选定后删除。
 
 ## 8. 一次性迁移顺序
 

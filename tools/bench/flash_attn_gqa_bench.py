@@ -3,7 +3,7 @@
 
 This is an optional performance oracle, not a project runtime dependency. It
 measures the same causal append-prompt attention geometry as
-bench/gqa_attention_bench.cu:
+bench/ops/causal_softmax_attention_bench.cu:
 
   q: [1, T, 24, 256]
   k/v: [1, context + T, 4, 256]
@@ -141,7 +141,18 @@ def load_ninfer_csv(path: str) -> dict[tuple[int, int], dict[str, str]]:
     out: dict[tuple[int, int], dict[str, str]] = {}
     with open(path, newline="") as f:
         for row in csv.DictReader(f):
-            out[(int(row["T"]), int(row["context"]))] = row
+            if (
+                row["entry"] != "append"
+                or row["geometry"] != "d256-h24-kv4"
+                or row["kv_dtype"] != "bf16"
+            ):
+                continue
+            key = (int(row["T"]), int(row["context"]))
+            if key in out:
+                raise SystemExit(
+                    "--ninfer-csv must contain only one execution/cache result for each T/context"
+                )
+            out[key] = row
     return out
 
 
@@ -150,8 +161,9 @@ def attach_ninfer_comparison(rows: list[dict], ninfer_rows: dict[tuple[int, int]
         ninfer = ninfer_rows.get((int(row["T"]), int(row["context"])))
         if ninfer is None:
             continue
-        ninfer_ms = float(ninfer["ms"])
-        ninfer_tflops = float(ninfer["tflops"])
+        ninfer_us = float(ninfer["median_us"])
+        ninfer_ms = ninfer_us * 1.0e-3
+        ninfer_tflops = float(ninfer["useful_flops"]) / (ninfer_us * 1.0e-6) / 1.0e12
         row["ninfer_ms"] = ninfer_ms
         row["ninfer_tflops"] = ninfer_tflops
         row["flash_vs_ninfer_speedup"] = ninfer_ms / float(row["ms"]) if float(row["ms"]) > 0.0 else None
@@ -200,7 +212,7 @@ def write_json(path: str, rows: list[dict], metadata: dict) -> None:
 def run_decode_bench(torch_mod, flash_attn_with_kvcache, positions, warmup, repeat, min_time_ms):
     """Single-token decode: q seqlen 1, GQA over a pos+1 KV cache, causal.
 
-    Mirrors bench/gqa_attention_bench.cu --decode: append one new K/V token at
+    Mirrors causal_softmax_attention_bench --entry append at T=1: append one new K/V token at
     index `pos`, then attend query row over keys [0, pos]. useful_kv counts the
     K and V cache bytes streamed per step (the decode is DRAM-bandwidth bound).
     """
@@ -269,7 +281,7 @@ def run_verify_bench(
     """Small-T MTP-verify: q seqlen T (1..4), append T new K/V tokens at index
     `context`, GQA causal attention over the context+T KV cache.
 
-    Mirrors bench/gqa_attention_bench.cu --append-small-t. useful_kv counts the
+    Mirrors causal_softmax_attention_bench --entry append. useful_kv counts the
     K and V cache bytes streamed once per step over the context+T window.
     """
     rows: list[dict] = []
@@ -367,7 +379,11 @@ def main() -> int:
     )
     parser.add_argument("--csv-out", default="")
     parser.add_argument("--json-out", default="")
-    parser.add_argument("--ninfer-csv", default="", help="optional ninfer_gqa_attention_bench CSV to merge")
+    parser.add_argument(
+        "--ninfer-csv",
+        default="",
+        help="optional ninfer_causal_softmax_attention_bench CSV to merge",
+    )
     parser.add_argument("--seed", type=int, default=1234)
     args = parser.parse_args()
 

@@ -23,6 +23,7 @@
 #include <cstring>
 #include <functional>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace ninfer::bench {
@@ -122,6 +123,62 @@ private:
     cudaEvent_t stop_     = nullptr;
     std::size_t nodes_    = 0;
 };
+
+inline ColdTiming summarize_timings(std::vector<double> samples) {
+    if (samples.empty()) { throw std::invalid_argument("cannot summarize empty timings"); }
+    std::sort(samples.begin(), samples.end());
+    const auto percentile = [&](double fraction) {
+        const std::size_t index =
+            std::min(samples.size() - 1,
+                     static_cast<std::size_t>(fraction * static_cast<double>(samples.size() - 1)));
+        return samples[index];
+    };
+    return {percentile(0.50), samples.front(), percentile(0.95)};
+}
+
+template <class Launch>
+ColdTiming measure_launch(Launch&& launch, cudaStream_t stream, int warmup, int repeat) {
+    if (warmup < 0 || repeat <= 0) {
+        throw std::invalid_argument("benchmark requires nonnegative warmup and positive repeat");
+    }
+
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop  = nullptr;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    for (int index = 0; index < warmup; ++index) { launch(stream); }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<double> samples;
+    samples.reserve(static_cast<std::size_t>(repeat));
+    for (int index = 0; index < repeat; ++index) {
+        CUDA_CHECK(cudaEventRecord(start, stream));
+        launch(stream);
+        CUDA_CHECK(cudaEventRecord(stop, stream));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float milliseconds = 0.0F;
+        CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
+        samples.push_back(static_cast<double>(milliseconds) * 1000.0);
+    }
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    return summarize_timings(std::move(samples));
+}
+
+inline ColdTiming measure_graph(const TimedGraph& graph, cudaStream_t stream, int warmup,
+                                int repeat) {
+    if (warmup < 0 || repeat <= 0) {
+        throw std::invalid_argument("benchmark requires nonnegative warmup and positive repeat");
+    }
+    for (int index = 0; index < warmup; ++index) { graph.launch(stream); }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<double> samples;
+    samples.reserve(static_cast<std::size_t>(repeat));
+    for (int index = 0; index < repeat; ++index) { samples.push_back(graph.launch_timed(stream)); }
+    return summarize_timings(std::move(samples));
+}
 
 inline void flush_l2(DeviceBuffer& flush, cudaStream_t stream) {
     CUDA_CHECK(cudaMemsetAsync(flush.p, 0xa5, flush.bytes, stream));

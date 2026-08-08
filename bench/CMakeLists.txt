@@ -19,14 +19,14 @@ ninfer_add_op_bench(ninfer_gdn_gating_bench SOURCES ops/gdn_gating_bench.cu)
 ninfer_add_op_bench(ninfer_gdn_gating_proj_bench SOURCES ops/gdn_gating_proj_bench.cu)
 ninfer_add_op_bench(ninfer_gated_delta_net_bench SOURCES ops/gated_delta_net_bench.cu)
 ninfer_add_op_bench(ninfer_gdn_layer_bench SOURCES ops/gdn_layer_bench.cu)
-ninfer_add_op_bench(ninfer_attention_layer_bench SOURCES ops/attention_layer_bench.cu)
 ninfer_add_op_bench(ninfer_rope_bench SOURCES ops/rope_bench.cu)
 ninfer_add_op_bench(ninfer_add_bias_bench SOURCES ops/add_bias_bench.cu)
 ninfer_add_op_bench(ninfer_gelu_bench SOURCES ops/gelu_bench.cu)
 ninfer_add_op_bench(ninfer_layer_norm_bench SOURCES ops/layer_norm_bench.cu)
 ninfer_add_op_bench(ninfer_vision_pos_embed_bench SOURCES ops/vision_pos_embed_bench.cu)
 ninfer_add_op_bench(ninfer_scatter_bench SOURCES ops/scatter_bench.cu)
-ninfer_add_op_bench(ninfer_vision_attention_bench SOURCES ops/vision_attention_bench.cu)
+ninfer_add_op_bench(ninfer_packed_softmax_attention_bench
+  SOURCES ops/packed_softmax_attention_bench.cu)
 ninfer_add_op_bench(ninfer_embedding_bench SOURCES ops/embedding_bench.cu)
 ninfer_add_op_bench(ninfer_position_bench SOURCES ops/position_bench.cu)
 ninfer_add_op_bench(ninfer_cast_bench SOURCES ops/cast_bench.cu)
@@ -36,18 +36,19 @@ ninfer_add_op_bench(ninfer_linear_bench SOURCES ops/linear_bench.cu)
 ninfer_add_op_bench(ninfer_output_stage_bench SOURCES ops/output_stage_bench.cu)
 ninfer_add_op_bench(ninfer_gdn_input_proj_conv_snapshot_bench
   SOURCES ops/gdn_input_proj_conv_snapshot_bench.cu)
-ninfer_add_op_bench(ninfer_w8_input_proj_bench SOURCES ops/w8_input_proj_bench.cu)
+ninfer_add_op_bench(ninfer_attn_input_proj_bench SOURCES ops/attn_input_proj_bench.cu)
 ninfer_add_op_bench(ninfer_w8_linear_swiglu_bench SOURCES ops/w8_linear_swiglu_bench.cu)
 ninfer_add_op_bench(ninfer_nvfp4_linear_swiglu_bench SOURCES ops/nvfp4_linear_swiglu_bench.cu)
 ninfer_add_op_bench(ninfer_w8_linear_add_bench SOURCES ops/w8_linear_add_bench.cu)
 ninfer_add_op_bench(ninfer_bf16_linear_add_bench SOURCES ops/bf16_linear_add_bench.cu)
 ninfer_add_op_bench(ninfer_nvfp4_linear_add_bench SOURCES ops/nvfp4_linear_add_bench.cu)
-ninfer_add_op_bench(ninfer_gqa_attention_bench SOURCES ops/gqa_attention_bench.cu)
-ninfer_add_op_bench(ninfer_bidirectional_gqa_attention_bench
-  SOURCES ops/bidirectional_gqa_attention_bench.cu)
-ninfer_add_op_bench(ninfer_swa_bench SOURCES ops/swa_bench.cu)
-ninfer_add_op_bench(ninfer_kv_cache_append_prefix_bench
-  SOURCES ops/kv_cache_append_prefix_bench.cu)
+ninfer_add_op_bench(ninfer_causal_softmax_attention_bench
+  SOURCES ops/causal_softmax_attention_bench.cu)
+ninfer_add_op_bench(ninfer_context_softmax_attention_bench
+  SOURCES ops/context_softmax_attention_bench.cu)
+ninfer_add_op_bench(ninfer_sliding_window_attention_bench
+  SOURCES ops/sliding_window_attention_bench.cu)
+ninfer_add_op_bench(ninfer_kv_cache_append_bench SOURCES ops/kv_cache_append_bench.cu)
 ninfer_add_op_bench(ninfer_prepare_masked_block_bench
   SOURCES ops/prepare_masked_block_bench.cu)
 ninfer_add_op_bench(ninfer_sampling_select_bench SOURCES ops/sampling_select_bench.cu)
