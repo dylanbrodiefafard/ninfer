@@ -328,10 +328,7 @@ void ProgramImplCore::prepare_graphs() {
                                static_cast<const ops::SamplingConfig*>(sampling_config.data),
                                proposal_head,
                                &tail_hidden,
-                               &boundary_hidden,
-                               nullptr,
-                               nullptr,
-                               nullptr};
+                               &boundary_hidden};
     };
 
     const auto ordinary_ranges = ordinary_graph_ranges(capacity);
@@ -469,10 +466,7 @@ void ProgramImplCore::flush_dflash_context_prefix(std::uint32_t count) {
                           static_cast<const ops::SamplingConfig*>(sampling_config.data),
                           proposal_head,
                           &tail_hidden,
-                          &boundary_hidden,
-                          diagnostic_context,
-                          diagnostic_text_tap,
-                          diagnostic_vision_tap};
+                          &boundary_hidden};
     set_device_i32(dflash->commit_count, checked_i32(count, "DFlash context commit count"));
     Tensor features  = dflash->target_features.slice(1, 0, static_cast<std::int32_t>(count));
     Tensor positions = dflash->feature_positions.slice(0, 0, static_cast<std::int32_t>(count));
@@ -612,10 +606,7 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
             static_cast<const ops::SamplingConfig*>(sampling_config.data),
             proposal_head,
             &tail_hidden,
-            &boundary_hidden,
-            diagnostic_context,
-            diagnostic_text_tap,
-            diagnostic_vision_tap};
+            &boundary_hidden};
         bool mtp_prepared    = false;
         bool dflash_prepared = false;
 
@@ -827,10 +818,7 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
             static_cast<const ops::SamplingConfig*>(sampling_config.data),
             proposal_head,
             &tail_hidden,
-            &boundary_hidden,
-            diagnostic_context,
-            diagnostic_text_tap,
-            diagnostic_vision_tap};
+            &boundary_hidden};
 
         std::uint32_t produced = 1;
         std::uint32_t accepted = 0;
@@ -839,7 +827,7 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
             mark_workspace_usage(workspace_plan.mtp_round);
             DecodeGraph* graph = nullptr;
             auto envelopes     = mtp_gqa_envelopes(base_E, base_E, draft_window);
-            if (use_cuda_graph && diagnostic_text_tap == nullptr) {
+            if (use_cuda_graph) {
                 MtpGraphVariant& variant = select_graph_variant(mtp_graphs, base_E, "MTP");
                 graph                    = &variant.mtp;
                 envelopes                = mtp_gqa_envelopes(variant.min_execution_frontier,
@@ -884,7 +872,7 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
             auto envelopes     = dflash_envelopes(base_E, base_E, draft_window);
             ops::GqaExecutionEnvelope target_envelope{base_E + draft_window + 1,
                                                       base_E + draft_window + 1};
-            if (use_cuda_graph && diagnostic_text_tap == nullptr) {
+            if (use_cuda_graph) {
                 DFlashGraphVariant& variant = select_graph_variant(dflash_graphs, base_E, "DFlash");
                 graph                       = steady ? &variant.steady : &variant.initial;
                 envelopes                   = dflash_envelopes(variant.min_execution_frontier,
@@ -955,7 +943,7 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
             mark_workspace_usage(workspace_plan.ordinary_round);
             DecodeGraph* graph = nullptr;
             ops::GqaExecutionEnvelope envelope{base_E + 1, base_E + 1};
-            if (use_cuda_graph && diagnostic_text_tap == nullptr) {
+            if (use_cuda_graph) {
                 OrdinaryGraphVariant& variant =
                     select_graph_variant(ordinary_graphs, base_E, "ordinary");
                 graph    = align_mtp ? &variant.ordinary_aligned : &variant.ordinary;

@@ -42,5 +42,4 @@ codec. Vision decodes large matrices one at a time and releases its weight store
 preparation. Multimodal MTP uses the composed Vision embedding for the shifted input, including at
 prefill chunk boundaries.
 
-Target-specific numerical and C++ Engine parity commands live in
-`tools/parity/qwen3_6_27b/`.
+The target-specific source-BF16 Vision comparison lives in `tools/parity/qwen3_6_27b/`.

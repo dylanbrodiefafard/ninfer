@@ -46,9 +46,6 @@ struct State {
     ProposalHead proposal_head;
     Tensor* tail_hidden;
     Tensor* boundary_hidden;
-    void* diagnostic_context                = nullptr;
-    TextTapCallback diagnostic_text_tap     = nullptr;
-    VisionTapCallback diagnostic_vision_tap = nullptr;
 };
 
 struct MtpGqaEnvelopes {

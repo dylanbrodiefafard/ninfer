@@ -479,10 +479,7 @@ int run(const Options& options) {
             static_cast<const ninfer::ops::SamplingConfig*>(sampling_span.data),
             ninfer::ProposalHead::Full,
             &tail_hidden,
-            &boundary_hidden,
-            nullptr,
-            nullptr,
-            nullptr};
+            &boundary_hidden};
         runtime::schedule::TextContext card(device, model.runtime, workspace, decoder.text_kv,
                                             decoder.linear_attention, io, prefill_hidden,
                                             options.prefill_chunk, options.context_tokens, nullptr);

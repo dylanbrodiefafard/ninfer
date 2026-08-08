@@ -94,19 +94,6 @@ std::vector<GraphFrontierRange> Variant::dflash_graph_ranges(std::uint32_t, std:
     return {};
 }
 
-void Variant::attach_diagnostics(qwen3_6::Program<Variant>& program, void* context,
-                                 qwen3_6::TextTapCallback text, qwen3_6::VisionTapCallback vision) {
-    program.impl_->diagnostic_context    = context;
-    program.impl_->diagnostic_text_tap   = text;
-    program.impl_->diagnostic_vision_tap = vision;
-}
-
-void Variant::detach_diagnostics(qwen3_6::Program<Variant>& program) noexcept {
-    program.impl_->diagnostic_context    = nullptr;
-    program.impl_->diagnostic_text_tap   = nullptr;
-    program.impl_->diagnostic_vision_tap = nullptr;
-}
-
 void Variant::attention_projection(const Tensor& hidden,
                                    const FullAttentionProjectionWeights& weights, Tensor& query,
                                    Tensor& gate, Tensor& key, Tensor& value,

@@ -12,7 +12,6 @@
 #include "ninfer/ops/gqa_attention.h"
 #include "core/kv_cache.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
-#include <ninfer/targets/qwen3_6/diagnostics.h>
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 #include <ninfer/targets/qwen3_6/round_state.h>
 
@@ -110,9 +109,7 @@ struct MtpW {
     const Tensor* norm                  = nullptr;
 };
 
-using Phase           = qwen3_6::TextPhase;
-using TapId           = qwen3_6::TextTapId;
-using TextTapCallback = qwen3_6::TextTapCallback;
+using Phase = qwen3_6::TextPhase;
 
 struct NullTap {
     static constexpr bool enabled = false;
@@ -129,7 +126,8 @@ struct DFlashFeatureSink {
     std::uint32_t captured_mask = 0;
     std::int32_t active_tokens  = 0;
 
-    void operator()(TapId id, int layer, Phase phase, const Tensor& value, cudaStream_t stream);
+    void begin(const Tensor& value);
+    void capture_layer(int layer, const Tensor& value, cudaStream_t stream);
     void capture_positions(const Tensor& source, cudaStream_t stream);
     void consume_prefill_chunk(std::int32_t tokens, bool boundary);
 };
@@ -179,16 +177,10 @@ public:
     void prefill(std::span<const int> ids, DFlashFeatureSink& sink);
     void prefill(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
                  VisionPrefillSession& vision);
-    void diagnostic_prefill(std::span<const int> ids, void* context, TextTapCallback callback);
-    void diagnostic_prefill(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
-                            VisionPrefillSession& vision, void* context, TextTapCallback callback);
     void target_verify(const Tensor& ids, const Tensor& positions,
                        ops::GqaExecutionEnvelope envelope);
     void target_verify(const Tensor& ids, const Tensor& positions,
                        ops::GqaExecutionEnvelope envelope, DFlashFeatureSink& sink);
-    void diagnostic_target_verify(const Tensor& ids, const Tensor& positions,
-                                  ops::GqaExecutionEnvelope envelope, void* context,
-                                  TextTapCallback callback);
     void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                            ops::GqaExecutionEnvelope envelope, Tensor& mtp_hidden,
                            int logits_column, Tensor* logits, Tensor* draft_token,

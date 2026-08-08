@@ -13,9 +13,6 @@ void target_verify(TextContext& card, State& state, const Tensor& ids, const Ten
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = dflash_feature_sink(state);
         card.target_verify(ids, positions, envelope, sink);
-    } else if (state.diagnostic_text_tap != nullptr) {
-        card.diagnostic_target_verify(ids, positions, envelope, state.diagnostic_context,
-                                      state.diagnostic_text_tap);
     } else {
         card.target_verify(ids, positions, envelope);
     }

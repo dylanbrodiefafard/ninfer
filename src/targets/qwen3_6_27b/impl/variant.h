@@ -2,7 +2,6 @@
 
 #include "targets/qwen3_6_27b/impl/config.h"
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
-#include <ninfer/targets/qwen3_6/diagnostics.h>
 #include <ninfer/targets/qwen3_6/runtime.h>
 
 #include <cstddef>
@@ -37,11 +36,6 @@ struct Variant {
     static constexpr std::uint32_t maximum_context             = kNativeContext;
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
     static constexpr std::int32_t draft_head_rows              = 131072;
-
-    static void attach_diagnostics(qwen3_6::Program<Variant>& program, void* context,
-                                   qwen3_6::TextTapCallback text,
-                                   qwen3_6::VisionTapCallback vision);
-    static void detach_diagnostics(qwen3_6::Program<Variant>& program) noexcept;
 
     static void attention_projection(const Tensor& hidden,
                                      const FullAttentionProjectionWeights& weights, Tensor& query,

@@ -144,31 +144,17 @@ private:
     const ops::GqaExecutionEnvelope*& slot_;
 };
 
-struct CallbackTap {
-    static constexpr bool enabled = true;
-
-    void* context            = nullptr;
-    TextTapCallback callback = nullptr;
-
-    void operator()(TapId id, int layer, Phase phase, const Tensor& value,
-                    cudaStream_t stream) const {
-        callback(context, id, layer, phase, value, stream);
-    }
-};
-
 } // namespace
 
-void DFlashFeatureSink::operator()(TapId id, int layer, Phase, const Tensor& value,
-                                   cudaStream_t stream) {
+void DFlashFeatureSink::begin(const Tensor& value) {
     if (features == nullptr || positions == nullptr || layers.empty()) {
         throw std::logic_error("DFlash feature sink is incomplete");
     }
-    if (id == TapId::AfterEmbed) {
-        captured_mask = 0;
-        active_tokens = value.ne[1];
-        return;
-    }
-    if (id != TapId::AfterMlp) { return; }
+    captured_mask = 0;
+    active_tokens = value.ne[1];
+}
+
+void DFlashFeatureSink::capture_layer(int layer, const Tensor& value, cudaStream_t stream) {
     const auto it = std::find(layers.begin(), layers.end(), layer);
     if (it == layers.end()) { return; }
     const std::size_t index = static_cast<std::size_t>(it - layers.begin());
@@ -618,7 +604,7 @@ void TextContext::target_verify_impl(const Tensor& ids, const Tensor& positions,
         ops::offset_i32_positions(positions, io_.rope_delta, rope_positions, ctx_.stream);
         Tensor x = work_.alloc(DType::BF16, {kCfg.hidden, T});
         ops::embedding(ids, *embed_, x, s);
-        if constexpr (Tap::enabled) { tap(TapId::AfterEmbed, -1, Phase::Verify, x, s); }
+        if constexpr (Tap::enabled) { tap.begin(x); }
         ScopedPositions scoped_cache(active_cache_positions_, positions);
         ScopedPositions scoped_rope(active_rope_positions_, rope_positions);
         ScopedEnvelope scoped_envelope(active_gqa_envelope_, envelope);
@@ -631,9 +617,7 @@ void TextContext::target_verify_impl(const Tensor& ids, const Tensor& positions,
         Tensor logits = matrix_window(io_.logits, T);
         Tensor target = vector_window(io_.speculative.target_argmax, T);
         ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, hidden, s);
-        if constexpr (Tap::enabled) { tap(TapId::AfterFinalNorm, -1, Phase::Verify, hidden, s); }
         ops::linear(hidden, *lm_head_, logits, s);
-        if constexpr (Tap::enabled) { tap(TapId::AfterLogits, -1, Phase::Verify, logits, s); }
         ops::argmax(logits, target, kCfg.token_domain, s);
     }
 
@@ -649,16 +633,6 @@ void TextContext::target_verify(const Tensor& ids, const Tensor& positions,
 void TextContext::target_verify(const Tensor& ids, const Tensor& positions,
                                 ops::GqaExecutionEnvelope envelope, DFlashFeatureSink& sink) {
     target_verify_impl(ids, positions, envelope, sink);
-}
-
-void TextContext::diagnostic_target_verify(const Tensor& ids, const Tensor& positions,
-                                           ops::GqaExecutionEnvelope envelope, void* context,
-                                           TextTapCallback callback) {
-    if (callback == nullptr) {
-        throw std::invalid_argument("diagnostic target verify callback is null");
-    }
-    CallbackTap tap{context, callback};
-    target_verify_impl(ids, positions, envelope, tap);
 }
 
 void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
@@ -795,7 +769,6 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     nvtx::Category::Attention, static_cast<std::uint64_t>(layer));
                 auto mixer_scope = work_.scope();
                 attn_mix(full, x, fidx, ph);
-                if constexpr (Tap::enabled) { tap(TapId::AfterMixer, layer, ph, x, ctx_.stream); }
             }
             {
                 nvtx::ScopedRange post_mixer_range(
@@ -803,7 +776,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 auto mlp_scope = work_.scope();
                 mlp_tail(full.post_attn_norm, full.mlp, x, ph);
-                if constexpr (Tap::enabled) { tap(TapId::AfterMlp, layer, ph, x, ctx_.stream); }
+                if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
         } else {
             const int gidx       = ModelConfig::gdn_idx(layer);
@@ -817,7 +790,6 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     static_cast<std::uint64_t>(layer));
                 auto mixer_scope = work_.scope();
                 gdn_mix(gdn, x, gidx, ph);
-                if constexpr (Tap::enabled) { tap(TapId::AfterMixer, layer, ph, x, ctx_.stream); }
             }
             {
                 nvtx::ScopedRange post_mixer_range(
@@ -825,7 +797,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 auto mlp_scope = work_.scope();
                 mlp_tail(gdn.post_attn_norm, gdn.mlp, x, ph);
-                if constexpr (Tap::enabled) { tap(TapId::AfterMlp, layer, ph, x, ctx_.stream); }
+                if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
         }
     }
@@ -1001,7 +973,7 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
                     1, visual_begin, static_cast<std::int32_t>(local_scatter_indices.size()));
                 ops::scatter(embeddings, indices_device, x, s);
             }
-            if constexpr (Tap::enabled) { tap(TapId::AfterEmbed, -1, Phase::Prefill, x, s); }
+            if constexpr (Tap::enabled) { tap.begin(x); }
             run_layers(x, Phase::Prefill, tap);
             if constexpr (requires { tap.capture_positions(positions, s); }) {
                 tap.capture_positions(positions, s);
@@ -1011,15 +983,11 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
                             ? matrix_window(prefill_hidden_, len)
                             : work_.alloc(DType::BF16, {kCfg.hidden, len});
             ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, xf, s);
-            if constexpr (Tap::enabled) { tap(TapId::AfterFinalNorm, -1, Phase::Prefill, xf, s); }
 
             if (is_last) {
                 Tensor last_xf = xf.slice(1, len - 1, 1);
                 Tensor logits  = matrix_window(io_.logits, 1);
                 ops::linear(last_xf, *lm_head_, logits, s);
-                if constexpr (Tap::enabled) {
-                    tap(TapId::AfterLogits, -1, Phase::Prefill, logits, s);
-                }
                 // Set io_.pos to the bonus token's absolute position (base + T) before picking so
                 // the sampler RNG is keyed by it (prefill purpose keeps it distinct from the first
                 // decode step, which reuses the same io_.pos).
@@ -1152,13 +1120,6 @@ void TextContext::prefill(std::span<const int> ids, DFlashFeatureSink& sink) {
     prefill_impl(ids, nullptr, sink);
 }
 
-void TextContext::diagnostic_prefill(std::span<const int> ids, void* context,
-                                     TextTapCallback callback) {
-    if (callback == nullptr) { throw std::invalid_argument("diagnostic prefill callback is null"); }
-    CallbackTap tap{context, callback};
-    prefill_impl(ids, nullptr, tap);
-}
-
 void TextContext::prefill(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
                           VisionPrefillSession& vision) {
     if (begin >= input.token_ids.size()) {
@@ -1169,19 +1130,5 @@ void TextContext::prefill(const qwen3_6::PreparedPromptData& input, std::uint32_
     NullTap tap;
     prefill_impl(tokens.subspan(begin), &multimodal, tap);
 }
-
-void TextContext::diagnostic_prefill(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
-                                     VisionPrefillSession& vision, void* context,
-                                     TextTapCallback callback) {
-    if (callback == nullptr) { throw std::invalid_argument("diagnostic prefill callback is null"); }
-    if (begin >= input.token_ids.size()) {
-        throw std::invalid_argument("diagnostic multimodal prefill suffix is empty");
-    }
-    const std::span<const int> tokens(input.token_ids);
-    const MultimodalPrefill multimodal{tokens, input.positions, &vision, begin, input.rope_delta};
-    CallbackTap tap{context, callback};
-    prefill_impl(tokens.subspan(begin), &multimodal, tap);
-}
-
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

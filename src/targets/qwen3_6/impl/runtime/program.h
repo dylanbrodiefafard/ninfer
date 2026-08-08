@@ -189,10 +189,7 @@ public:
     PrefixCheckpoint boundary;
     PendingCandidate pending;
     GenerationTimings timings;
-    std::size_t workspace_logical_peak_bytes          = 0;
-    void* diagnostic_context                          = nullptr;
-    schedule::TextTapCallback diagnostic_text_tap     = nullptr;
-    schedule::VisionTapCallback diagnostic_vision_tap = nullptr;
+    std::size_t workspace_logical_peak_bytes = 0;
 
 private:
     void make_invalid() noexcept;

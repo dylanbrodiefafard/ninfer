@@ -17,7 +17,7 @@ for the selected tool.
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
 | Run the 27B Python reference | [`reference/qwen3_6_27b/`](reference/qwen3_6_27b/README.md) |
 | Run the 35B-A3B Python reference | [`reference/qwen3_6_35b_a3b/`](reference/qwen3_6_35b_a3b/README.md) |
-| Compare 27B reference/C++/source activations | [`parity/qwen3_6_27b/`](parity/qwen3_6_27b/README.md) |
+| Compare 27B artifact/source Vision activations | [`parity/qwen3_6_27b/`](parity/qwen3_6_27b/README.md) |
 | Run benchmark matrices | [`bench/`](bench/README.md) |
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
 
@@ -60,16 +60,8 @@ python3 -m tools.reference.qwen3_6_35b_a3b \
 ```
 
 The Python implementations are independent diagnostic references, not alternate public inference
-products or generated-token goldens for the C++ engine.
-
-Build the target-private C++ diagnostic only when needed:
-
-```bash
-cmake -S . -B build -DNINFER_BUILD_TOOLS=ON
-cmake --build build --parallel --target ninfer-qwen3_6_27b-dump
-```
-
-See the parity README for activation and multimodal/MTP comparison commands.
+products or generated-token goldens for the C++ engine. See the parity README for the direct 27B
+artifact/source Vision comparison command.
 
 ## Benchmark orchestration
 

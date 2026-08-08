@@ -2,7 +2,6 @@
 
 #include "targets/qwen3_6_35b_a3b/impl/config.h"
 #include "targets/qwen3_6_35b_a3b/impl/load/bindings.h"
-#include <ninfer/targets/qwen3_6/diagnostics.h>
 #include <ninfer/targets/qwen3_6/runtime.h>
 
 #include <cstddef>

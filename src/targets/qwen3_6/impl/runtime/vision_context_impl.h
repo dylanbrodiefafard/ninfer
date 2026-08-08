@@ -188,11 +188,8 @@ std::size_t VisionContext::workspace_capacity_bytes(std::uint32_t max_merged_tok
         .bytes;
 }
 
-void VisionContext::encode(std::uint32_t item_index, const VisionItemView& item, Tensor& output,
-                           WorkspaceArena& workspace, void* tap, VisionTapCallback callback) const {
-    if ((tap == nullptr) != (callback == nullptr)) {
-        throw std::invalid_argument("Vision tap context and callback must be provided together");
-    }
+void VisionContext::encode(const VisionItemView& item, Tensor& output,
+                           WorkspaceArena& workspace) const {
     if (item.control == nullptr) { throw std::invalid_argument("Vision item control is null"); }
     const qwen3_6::VisionItemControl& control = *item.control;
     const auto patches64                      = control.patch_count;
@@ -239,8 +236,6 @@ void VisionContext::encode(std::uint32_t item_index, const VisionItemView& item,
     Tensor position_table = position_embed_->reshape(
         {VisionScheduleConfig::hidden, VisionScheduleConfig::position_embeddings});
     ops::vision_pos_embed_add(position_table, pos_indices, pos_weights, x, stream);
-    if (callback != nullptr) { callback(tap, item_index, VisionTapId::PatchEmbed, -1, x, stream); }
-
     for (std::size_t layer = 0; layer < blocks_.size(); ++layer) {
         const BlockW& block = blocks_[layer];
         {
@@ -296,9 +291,6 @@ void VisionContext::encode(std::uint32_t item_index, const VisionItemView& item,
             ops::add_bias(*block.fc2_bias, down, stream);
             ops::residual_add(down, x, stream);
         }
-        if (callback != nullptr) {
-            callback(tap, item_index, VisionTapId::Block, static_cast<int>(layer), x, stream);
-        }
     }
 
     Tensor normalized = layout.normalized.bind(backing);
@@ -311,20 +303,15 @@ void VisionContext::encode(std::uint32_t item_index, const VisionItemView& item,
     ops::gelu(hidden, ops::GeluMode::Exact, stream);
     ops::linear(hidden, *merger_.fc2, output, stream);
     ops::add_bias(*merger_.fc2_bias, output, stream);
-    if (callback != nullptr) { callback(tap, item_index, VisionTapId::Merger, -1, output, stream); }
 }
 
 VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedModelData& model,
                                            WorkspaceArena& workspace,
                                            const qwen3_6::PreparedPromptData& prompt,
                                            const VisionPrefillPlan& plan,
-                                           runtime::TransientRegion transient, void* tap,
-                                           VisionTapCallback callback)
+                                           runtime::TransientRegion transient)
     : device_(device), workspace_(workspace), prompt_(prompt), plan_(plan), transient_(transient),
-      context_(device, model), tap_(tap), callback_(callback) {
-    if ((tap_ == nullptr) != (callback_ == nullptr)) {
-        throw std::invalid_argument("Vision tap context and callback must be provided together");
-    }
+      context_(device, model) {
     if (plan_.control.items.empty() || plan_.uses.empty()) {
         throw std::invalid_argument("Vision prefill plan has no suffix item spans");
     }
@@ -400,11 +387,10 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
         timers_.emplace_back(device_);
         timers_.back().start();
         context_.encode(
-            active->item_index,
             VisionItemView{
                 std::span<const float>(prompt_.patches).subspan(patch_offset, patch_elements),
                 &control},
-            output, workspace_, tap_, callback_);
+            output, workspace_);
         timers_.back().record_stop();
         workspace_.reset();
         active_item_ = active->item_index;

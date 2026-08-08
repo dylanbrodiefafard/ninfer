@@ -15,6 +15,11 @@ struct DeviceContext;
 
 namespace ninfer::targets::qwen3_6 {
 
+enum class TextPhase {
+    Prefill,
+    Verify,
+};
+
 struct GraphFrontierRange {
     std::uint32_t min = 0;
     std::uint32_t max = 0;
@@ -111,7 +116,6 @@ private:
     friend std::unique_ptr<Program<V>> create_program(const typename V::ModelView&,
                                                       typename V::WeightsProfile, SequencePlan<V>&&,
                                                       DeviceContext&);
-    friend Variant;
 };
 
 template <class Variant>
