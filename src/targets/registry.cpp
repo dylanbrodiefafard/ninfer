@@ -35,8 +35,7 @@ void validate_options(const EngineOptions& options) {
 }
 
 artifact::LoadProgress artifact_progress(const LoadProgress& progress) {
-    return artifact::LoadProgress{.callback           = progress.callback,
-                                  .min_interval_bytes = progress.min_interval_bytes};
+    return artifact::LoadProgress{.callback = progress.callback};
 }
 
 void validate_device_budget(std::uint64_t weight_bytes, std::size_t sequence_bytes) {

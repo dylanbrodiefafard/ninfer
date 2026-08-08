@@ -124,7 +124,8 @@ private:
 
 } // namespace
 
-GenerationService::GenerationService(ServeOptions options) : options_(std::move(options)) {
+GenerationService::GenerationService(ServeOptions options, LoadProgress load_progress)
+    : options_(std::move(options)) {
     ninfer::EngineOptions engine_options;
     engine_options.artifact_path  = options_.artifact_path;
     engine_options.device         = options_.device;
@@ -134,6 +135,7 @@ GenerationService::GenerationService(ServeOptions options) : options_(std::move(
     engine_options.enable_vision  = options_.enable_vision;
     engine_options.use_cuda_graph = options_.use_cuda_graph;
     engine_options.speculative    = options_.speculative;
+    engine_options.load_progress  = std::move(load_progress);
     engine_                       = std::make_unique<ninfer::Engine>(std::move(engine_options));
 }
 

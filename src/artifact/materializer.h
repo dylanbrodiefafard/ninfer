@@ -16,7 +16,6 @@ namespace ninfer::artifact {
 
 struct LoadProgress {
     std::function<void(std::string_view, std::uint64_t, std::uint64_t)> callback;
-    std::uint64_t min_interval_bytes = 256ULL * 1024ULL * 1024ULL;
 };
 
 struct MaterializationStats {

@@ -119,9 +119,9 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
 
     std::vector<CopyRange> ranges;
     ranges.reserve(plan.device_objects.size());
-    std::uint64_t copied        = 0;
-    std::uint64_t last_reported = 0;
-    std::uint64_t total         = 0;
+    std::uint64_t copied         = 0;
+    std::uint64_t last_published = 0;
+    std::uint64_t total          = 0;
     for (const DeviceMaterialization& placement : plan.device_objects) {
         const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
         DeviceSpan storage =
@@ -185,6 +185,7 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     std::size_t next_slot  = 0;
     std::size_t next_range = 0;
     const auto start       = std::chrono::steady_clock::now();
+    if (progress != nullptr && progress->callback) { progress->callback("weights", 0, total); }
     for (const ReadSpan& span : read_spans) {
         for (std::uint64_t source = span.begin; source < span.end; source += slot_bytes) {
             Slot& slot = *slots[next_slot++ % slot_count];
@@ -235,9 +236,9 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
             CUDA_CHECK(cudaEventRecord(slot.event, device.load_stream));
             slot.pending = true;
 
-            if (progress != nullptr && progress->callback &&
-                (copied == total || copied - last_reported >= progress->min_interval_bytes)) {
-                last_reported = copied;
+            if (progress != nullptr && progress->callback && copied != last_published &&
+                copied < total) {
+                last_published = copied;
                 progress->callback("weights", copied, total);
             }
         }
@@ -250,6 +251,7 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     out.stats_.h2d_bytes = copied;
     out.stats_.upload_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    if (progress != nullptr && progress->callback) { progress->callback("weights", copied, total); }
     return out;
 }
 

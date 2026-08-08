@@ -39,7 +39,6 @@ struct SpeculativeOptions {
 
 struct LoadProgress {
     std::function<void(std::string_view phase, std::uint64_t done, std::uint64_t total)> callback;
-    std::uint64_t min_interval_bytes = 256ULL * 1024ULL * 1024ULL;
 };
 
 struct EngineOptions {

@@ -1,3 +1,4 @@
+#include "product/load_progress/load_progress.h"
 #include "serve/generation_service.h"
 #include "serve/http_server.h"
 #include "serve/serve_options.h"
@@ -35,8 +36,10 @@ int main(int argc, char** argv) {
         }
 
         std::cerr << "ninfer-serve: loading model...\n";
+        ninfer::product::LoadProgressRenderer load_progress(
+            std::cerr, ninfer::product::stderr_load_progress_options());
         const auto load_start = Clock::now();
-        ninfer::serve::GenerationService service(options);
+        ninfer::serve::GenerationService service(options, load_progress.callback());
         server.attach(service);
         std::cerr << "ninfer-serve: model loaded in "
                   << std::chrono::duration<double>(Clock::now() - load_start).count() << " s\n";

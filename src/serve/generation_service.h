@@ -70,7 +70,7 @@ struct PreparedRequest {
 
 class GenerationService {
 public:
-    explicit GenerationService(ServeOptions options);
+    explicit GenerationService(ServeOptions options, LoadProgress load_progress = {});
 
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
 

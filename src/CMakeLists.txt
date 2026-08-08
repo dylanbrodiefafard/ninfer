@@ -254,6 +254,12 @@ if(NINFER_BUILD_PROMPT_INPUT)
   target_link_libraries(ninfer_product_prompt_input PRIVATE ninfer_media_acquire)
 endif()
 
+if(NINFER_BUILD_APPS OR BUILD_TESTING)
+  add_library(ninfer_product_load_progress STATIC
+    product/load_progress/load_progress.cpp)
+  ninfer_internal_includes(ninfer_product_load_progress)
+endif()
+
 # One cold closed registry plus the opaque public product Engine. Family and exact-target
 # directories contribute their sources directly to this single compile owner below.
 add_library(ninfer_engine STATIC
