@@ -64,14 +64,15 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
     const auto i32 = [&](std::int32_t count, const char* label) {
         return add_tensor(builder, DType::I32, {count}, label);
     };
-    layout.gdn_initial_slot             = i32(1, "step GDN initial slot");
-    layout.speculative.target_argmax    = i32(columns, "step target argmax");
-    layout.speculative.draft_tokens     = i32(drafts, "step draft tokens");
-    layout.speculative.round_tokens     = i32(columns, "step speculative round tokens");
-    layout.speculative.produced_count   = i32(1, "step speculative produced count");
-    layout.speculative.target_input_ids = i32(columns, "step target input ids");
-    layout.speculative.target_positions = i32(columns, "step target positions");
-    layout.speculative.accepted_drafts  = i32(1, "step accepted drafts");
+    layout.linear_state_read_slot          = i32(1, "step Linear Attention read slot");
+    layout.linear_state_snapshot_base_slot = i32(1, "step Linear Attention snapshot base slot");
+    layout.speculative.target_argmax       = i32(columns, "step target argmax");
+    layout.speculative.draft_tokens        = i32(drafts, "step draft tokens");
+    layout.speculative.round_tokens        = i32(columns, "step speculative round tokens");
+    layout.speculative.produced_count      = i32(1, "step speculative produced count");
+    layout.speculative.target_input_ids    = i32(columns, "step target input ids");
+    layout.speculative.target_positions    = i32(columns, "step target positions");
+    layout.speculative.accepted_drafts     = i32(1, "step accepted drafts");
     layout.speculative.stats =
         add_tensor(builder, DType::I64, {stats_counters}, "step speculative stats");
     if (layout.spec.enable_mtp) {
@@ -100,14 +101,15 @@ MtpRoundState::MtpRoundState(DeviceSpan backing, const MtpRoundStateLayout& layo
 
 RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     if (!layout.complete) { throw std::invalid_argument("RoundState layout is incomplete"); }
-    token            = layout.token.bind(backing);
-    pos              = layout.pos.bind(backing);
-    rope_pos         = layout.rope_pos.bind(backing);
-    rope_delta       = layout.rope_delta.bind(backing);
-    logits           = layout.logits.bind(backing);
-    verify_hidden    = layout.verify_hidden.bind(backing);
-    gdn_initial_slot = layout.gdn_initial_slot.bind(backing);
-    speculative      = SpeculativeRoundState(backing, layout.speculative);
+    token                           = layout.token.bind(backing);
+    pos                             = layout.pos.bind(backing);
+    rope_pos                        = layout.rope_pos.bind(backing);
+    rope_delta                      = layout.rope_delta.bind(backing);
+    logits                          = layout.logits.bind(backing);
+    verify_hidden                   = layout.verify_hidden.bind(backing);
+    linear_state_read_slot          = layout.linear_state_read_slot.bind(backing);
+    linear_state_snapshot_base_slot = layout.linear_state_snapshot_base_slot.bind(backing);
+    speculative                     = SpeculativeRoundState(backing, layout.speculative);
     if (layout.mtp) { mtp.emplace(backing, *layout.mtp); }
 }
 

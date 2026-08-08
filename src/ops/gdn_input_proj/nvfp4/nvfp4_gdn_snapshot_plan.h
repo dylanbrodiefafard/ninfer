@@ -17,21 +17,25 @@ namespace ninfer::ops::detail {
 
 void nvfp4_gdn_snapshot_decode_launch(const Tensor& x, const Weight& weight,
                                       const Tensor& conv_weight, Tensor& conv_states,
-                                      const Tensor& initial_slot, Tensor& query, Tensor& key,
-                                      Tensor& value, Tensor& z, cudaStream_t stream);
+                                      const Tensor& initial_slot, const Tensor& snapshot_base_slot,
+                                      Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                      cudaStream_t stream);
 
 void nvfp4_gdn_snapshot_small_t_launch(const Tensor& x, const Weight& weight,
                                        const Tensor& conv_weight, Tensor& conv_states,
-                                       const Tensor& initial_slot, Tensor& query, Tensor& key,
-                                       Tensor& value, Tensor& z, cudaStream_t stream);
+                                       const Tensor& initial_slot, const Tensor& snapshot_base_slot,
+                                       Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                       cudaStream_t stream);
 
 void nvfp4_gdn_snapshot_post_launch(const Tensor& projected, const Tensor& conv_weight,
-                                    Tensor& conv_states, const Tensor& initial_slot, Tensor& query,
-                                    Tensor& key, Tensor& value, Tensor& z, cudaStream_t stream);
+                                    Tensor& conv_states, const Tensor& initial_slot,
+                                    const Tensor& snapshot_base_slot, Tensor& query, Tensor& key,
+                                    Tensor& value, Tensor& z, cudaStream_t stream);
 
 void nvfp4_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
-                                 Tensor& conv_states, const Tensor& initial_slot, Tensor& query,
-                                 Tensor& key, Tensor& value, Tensor& z, LinearPolicy policy,
+                                 Tensor& conv_states, const Tensor& initial_slot,
+                                 const Tensor& snapshot_base_slot, Tensor& query, Tensor& key,
+                                 Tensor& value, Tensor& z, LinearPolicy policy,
                                  WorkspaceArena& workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

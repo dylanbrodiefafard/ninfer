@@ -19,6 +19,7 @@
 #define NINFER_QWEN36_VARIANT    ::ninfer::targets::qwen3_6_35b_a3b::detail::Variant
 #define NINFER_QWEN36_RUNTIME_NS qwen3_6_35b_a3b_runtime
 #include "targets/qwen3_6/impl/runtime/layouts.h"
+#include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 
 #include <cuda_runtime.h>
@@ -202,15 +203,15 @@ StateLayout plan_state(const Options& options, std::uint32_t maximum_k) {
             .kv_dtype              = options.kv_dtype,
             .kv_quant_group = options.kv_dtype == ninfer::DType::I8 ? ninfer::kKvQuantGroup : 0,
             .enable_mtp     = false,
-            .gdn =
+            .linear_attention =
                 {
                     .layers         = detail::TextConfig::gdn_layers(),
-                    .conv_dim       = detail::TextConfig::convolution_dim,
+                    .conv_channels  = detail::TextConfig::convolution_dim,
                     .conv_width     = detail::TextConfig::gdn_conv_state_width,
                     .value_heads    = detail::TextConfig::gdn_value_heads,
                     .value_head_dim = detail::TextConfig::gdn_value_head_dim,
                     .key_head_dim   = detail::TextConfig::gdn_key_head_dim,
-                    .snapshot_slots = static_cast<std::int32_t>(maximum_k + 2),
+                    .slot_count     = runtime::LinearStateSlots::required_slot_count(maximum_k),
                     .conv_dtype     = ninfer::DType::BF16,
                 },
         });
@@ -271,7 +272,9 @@ void reset_round_controls(family::RoundState& io, std::int32_t anchor, std::int3
                           std::int32_t initial_slot, cudaStream_t stream) {
     copy_i32(io.token, anchor, stream);
     copy_i32(io.pos, position, stream);
-    copy_i32(io.gdn_initial_slot, initial_slot, stream);
+    copy_i32(io.linear_state_read_slot, initial_slot, stream);
+    copy_i32(io.linear_state_snapshot_base_slot,
+             runtime::LinearStateSlots::verify_snapshot_base_slot(), stream);
 }
 
 std::vector<std::int32_t> prepare_drafts(runtime::schedule::State& state,
@@ -423,19 +426,26 @@ int run(const Options& options) {
                                cudaMemcpyHostToDevice, device.stream));
     CUDA_CHECK(cudaMemsetAsync(round_storage.speculative.stats.data, 0,
                                round_storage.speculative.stats.bytes(), device.stream));
-    decoder.gdn.reset_running(device.stream);
+    decoder.linear_attention.zero_slot(runtime::LinearStateSlots::prefill_working_slot(),
+                                       device.stream);
+    copy_i32(round_storage.linear_state_read_slot,
+             runtime::LinearStateSlots::prefill_working_slot(), device.stream);
+    copy_i32(round_storage.linear_state_snapshot_base_slot,
+             runtime::LinearStateSlots::verify_snapshot_base_slot(), device.stream);
 
     {
         runtime::schedule::TextContext prefill_card(
-            device, model.runtime, workspace, decoder.text_kv, decoder.gdn, round_storage,
-            prefill_hidden, options.prefill_chunk, 0, nullptr);
+            device, model.runtime, workspace, decoder.text_kv, decoder.linear_attention,
+            round_storage, prefill_hidden, options.prefill_chunk, 0, nullptr);
         prefill_card.set_sampling(
             static_cast<const ninfer::ops::SamplingConfig*>(sampling_span.data));
         const std::vector<ninfer::TokenId> prompt = prompt_tokens(options.context_tokens);
         prefill_card.prefill(prompt);
     }
-    const std::int32_t base_slot = static_cast<std::int32_t>(maximum_k + 1);
-    decoder.gdn.copy_slot(0, base_slot, device.stream);
+    const std::int32_t base_slot =
+        runtime::LinearStateSlots::prefix_boundary_slot(decoder.linear_attention.slot_count());
+    decoder.linear_attention.copy_slot(runtime::LinearStateSlots::prefill_working_slot(), base_slot,
+                                       device.stream);
     std::int32_t anchor = 0;
     CUDA_CHECK(cudaMemcpyAsync(&anchor, round_storage.token.data, sizeof(anchor),
                                cudaMemcpyDeviceToHost, device.stream));
@@ -461,7 +471,7 @@ int run(const Options& options) {
             decoder.text_kv,
             nullptr,
             nullptr,
-            decoder.gdn,
+            decoder.linear_attention,
             io,
             prefill_hidden,
             options.prefill_chunk,
@@ -474,8 +484,8 @@ int run(const Options& options) {
             nullptr,
             nullptr};
         runtime::schedule::TextContext card(device, model.runtime, workspace, decoder.text_kv,
-                                            decoder.gdn, io, prefill_hidden, options.prefill_chunk,
-                                            options.context_tokens, nullptr);
+                                            decoder.linear_attention, io, prefill_hidden,
+                                            options.prefill_chunk, options.context_tokens, nullptr);
         card.set_sampling(static_cast<const ninfer::ops::SamplingConfig*>(sampling_span.data));
         const std::vector<std::int32_t> drafts =
             prepare_drafts(state, card, k, accepted, anchor, base_slot, envelope);

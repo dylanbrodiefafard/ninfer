@@ -258,7 +258,8 @@ int distinct_state_case(const Case& test_case, std::uint32_t seed) {
     return failures;
 }
 
-int snapshot_case(const Case& test_case, int slots, int initial_slot, std::uint32_t seed) {
+int snapshot_case(const Case& test_case, int slots, int initial_slot, int snapshot_base_slot,
+                  std::uint32_t seed) {
     const gdn_ref::Inputs in = make_inputs(test_case, seed);
     const float scale        = 1.0f / std::sqrt(static_cast<float>(kStateDim));
     const gdn_ref::Result ref =
@@ -273,7 +274,8 @@ int snapshot_case(const Case& test_case, int slots, int initial_slot, std::uint3
     GuardedDeviceBuffer out(in.v.size() * sizeof(std::uint16_t));
     states.copy_from_host(initial_states.data(), states.bytes());
     out.fill(0xff);
-    DeviceBuffer device_initial_slot = to_device_i32({initial_slot});
+    DeviceBuffer device_initial_slot       = to_device_i32({initial_slot});
+    DeviceBuffer device_snapshot_base_slot = to_device_i32({snapshot_base_slot});
 
     Tensor q(device.q.p, DType::BF16, {kStateDim, test_case.qk_heads, test_case.tokens});
     Tensor k(device.k.p, DType::BF16, {kStateDim, test_case.qk_heads, test_case.tokens});
@@ -283,32 +285,42 @@ int snapshot_case(const Case& test_case, int slots, int initial_slot, std::uint3
     Tensor states_tensor(states.data(), DType::FP32,
                          {kStateDim, kStateDim, test_case.value_heads, slots});
     Tensor initial_slot_tensor(device_initial_slot.p, DType::I32, {1});
+    Tensor snapshot_base_slot_tensor(device_snapshot_base_slot.p, DType::I32, {1});
     Tensor out_tensor(out.data(), DType::BF16,
                       {kStateDim, test_case.value_heads, test_case.tokens});
     ops::gated_delta_net_snapshot(q, k, v, g, beta, scale, test_case.normalize_qk, states_tensor,
-                                  initial_slot_tensor, out_tensor, nullptr);
+                                  initial_slot_tensor, snapshot_base_slot_tensor, out_tensor,
+                                  nullptr);
     cuda_synchronize();
 
     const std::string label             = std::string(test_case.name) + " snapshot";
     const std::vector<float> got_states = from_device<float>(states.data(), initial_states.size());
+    const auto got_updated_begin =
+        got_states.begin() + static_cast<std::size_t>(snapshot_base_slot) * state_size;
     const auto got_updated_end =
-        got_states.begin() + static_cast<std::size_t>(test_case.tokens) * state_size;
+        got_updated_begin + static_cast<std::size_t>(test_case.tokens) * state_size;
     int failures = 0;
     failures += verify_recurrence(label + " out", from_device_bf16(out.data(), in.v.size()),
                                   ref.out, gated_delta_net_output_bf16_criterion());
     failures += verify_recurrence(label + " updated state slots",
-                                  doubles(std::vector<float>(got_states.begin(), got_updated_end)),
+                                  doubles(std::vector<float>(got_updated_begin, got_updated_end)),
                                   ref.snapshots, gated_delta_net_state_fp32_criterion());
-    const auto unchanged_begin =
-        initial_states.begin() + static_cast<std::size_t>(test_case.tokens) * state_size;
-    const auto got_unchanged_begin =
-        got_states.begin() + static_cast<std::size_t>(test_case.tokens) * state_size;
-    failures += verify_exact(label + " slots >= T unchanged",
-                             std::vector<float>(got_unchanged_begin, got_states.end()),
-                             std::vector<float>(unchanged_begin, initial_states.end()));
+    const auto initial_updated_begin =
+        initial_states.begin() + static_cast<std::size_t>(snapshot_base_slot) * state_size;
+    const auto initial_updated_end =
+        initial_updated_begin + static_cast<std::size_t>(test_case.tokens) * state_size;
+    failures += verify_exact(label + " slots before destination unchanged",
+                             std::vector<float>(got_states.begin(), got_updated_begin),
+                             std::vector<float>(initial_states.begin(), initial_updated_begin));
+    failures += verify_exact(label + " slots after destination unchanged",
+                             std::vector<float>(got_updated_end, got_states.end()),
+                             std::vector<float>(initial_updated_end, initial_states.end()));
     failures +=
         verify_exact(label + " initial-slot scalar unchanged",
                      from_device_i32(device_initial_slot, 1), std::vector<int>{initial_slot});
+    failures += verify_exact(label + " snapshot-base scalar unchanged",
+                             from_device_i32(device_snapshot_base_slot, 1),
+                             std::vector<int>{snapshot_base_slot});
     failures += states.verify_guards((label + " states").c_str());
     failures += out.verify_guards((label + " out").c_str());
     failures += verify_common_inputs_unchanged(label, in, device.q, device.k, device.v, device.g,
@@ -404,9 +416,9 @@ int main() {
 
     // Snapshot is a separate public state transition. Nonzero source slots also prove that the
     // selected initial state, not slot zero, seeds the complete recurrence.
-    failures += snapshot_case({"27b verify fused-qk-norm", 16, 48, 4, true}, 8, 7, 12104u);
-    failures +=
-        snapshot_case({"35b verify fused-qk-norm near-zero", 16, 32, 4, true, true}, 8, 6, 12204u);
+    failures += snapshot_case({"27b verify fused-qk-norm", 16, 48, 4, true}, 8, 7, 1, 12104u);
+    failures += snapshot_case({"35b verify fused-qk-norm near-zero", 16, 32, 4, true, true}, 8, 6,
+                              1, 12204u);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net correctness\n";
     return failures == 0 ? 0 : 1;

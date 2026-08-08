@@ -75,6 +75,38 @@ int assign_i32_contract(cudaStream_t stream) {
     return failures;
 }
 
+int add_i32_contract(cudaStream_t stream) {
+    GuardedDeviceBuffer lhs(sizeof(std::int32_t));
+    GuardedDeviceBuffer rhs(sizeof(std::int32_t));
+    GuardedDeviceBuffer destination(sizeof(std::int32_t));
+    constexpr std::int32_t lhs_value = 23;
+    constexpr std::int32_t rhs_value = 41;
+    store<std::int32_t>(lhs, lhs_value);
+    store<std::int32_t>(rhs, rhs_value);
+    store<std::int32_t>(destination, -1);
+    Tensor lhs_tensor(lhs.data(), DType::I32, {1});
+    Tensor rhs_tensor(rhs.data(), DType::I32, {1});
+    Tensor destination_tensor(destination.data(), DType::I32, {1});
+
+    ops::add_i32_scalars(lhs_tensor, rhs_tensor, destination_tensor, stream);
+    cuda_synchronize(stream);
+
+    int failures = 0;
+    failures += verify_exact("add_i32_scalars destination transition",
+                             std::vector<std::int32_t>{load<std::int32_t>(destination)},
+                             std::vector<std::int32_t>{lhs_value + rhs_value});
+    failures += verify_exact("add_i32_scalars lhs remains unchanged",
+                             std::vector<std::int32_t>{load<std::int32_t>(lhs)},
+                             std::vector<std::int32_t>{lhs_value});
+    failures += verify_exact("add_i32_scalars rhs remains unchanged",
+                             std::vector<std::int32_t>{load<std::int32_t>(rhs)},
+                             std::vector<std::int32_t>{rhs_value});
+    failures += lhs.verify_guards("add_i32_scalars lhs");
+    failures += rhs.verify_guards("add_i32_scalars rhs");
+    failures += destination.verify_guards("add_i32_scalars destination");
+    return failures;
+}
+
 int increment_i64_contract(cudaStream_t stream) {
     GuardedDeviceBuffer state(sizeof(std::int64_t));
     constexpr std::int64_t initial = (std::int64_t{1} << 45) + 987654321;
@@ -106,6 +138,7 @@ int main() {
     int failures = 0;
     failures += set_and_increment_i32_contract(stream);
     failures += assign_i32_contract(stream);
+    failures += add_i32_contract(stream);
     failures += increment_i64_contract(stream);
 
     cuda_check(cudaStreamDestroy(stream), "cudaStreamDestroy");

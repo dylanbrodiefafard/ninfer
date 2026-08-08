@@ -1,5 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/layouts.h"
+#include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
@@ -51,8 +52,8 @@ TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
 }
 
 PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
-    const std::size_t columns = plan.draft_window + 1ULL;
-    const std::size_t slots   = columns + 1ULL;
+    const std::int32_t linear_state_slots =
+        LinearStateSlots::required_slot_count(plan.draft_window);
     const auto effective_prefill_chunk =
         static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));
     LayoutBuilder builder;
@@ -67,15 +68,15 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .kv_dtype              = plan.kv_dtype,
                      .kv_quant_group        = plan.kv_quant_group,
                      .enable_mtp            = plan.features.mtp(),
-                     .gdn =
+                     .linear_attention =
                          {
                              .layers         = TextConfig::gdn_layers(),
-                             .conv_dim       = TextConfig::convolution_dim,
+                             .conv_channels  = TextConfig::convolution_dim,
                              .conv_width     = TextConfig::gdn_conv_state_width,
                              .value_heads    = TextConfig::gdn_value_heads,
                              .value_head_dim = TextConfig::gdn_value_head_dim,
                              .key_head_dim   = TextConfig::gdn_key_head_dim,
-                             .snapshot_slots = static_cast<std::int32_t>(slots),
+                             .slot_count     = linear_state_slots,
                              .conv_dtype     = DType::BF16,
                          },
                  });

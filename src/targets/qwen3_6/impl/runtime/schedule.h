@@ -37,7 +37,7 @@ struct State {
     KVCache& text_kv;
     KVCache* mtp_kv;
     DFlashPersistentState* dflash;
-    qwen3_6::GdnStateStore& gdn;
+    LinearAttentionStatePool& linear_attention;
     qwen3_6::RoundState& io;
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
@@ -92,8 +92,8 @@ void mtp_bridge_and_propose(State& state, const Tensor& next_token, const Tensor
                             bool build_proposal);
 
 // Executes an exact one-token target step through the verify schedule. The resulting target hidden
-// is in io.verify_hidden[:,0], the sampled token is in io.token, and GDN snapshot slot 0 is the
-// resulting recurrent state.
+// is in io.verify_hidden[:,0], the sampled token is in io.token, and the configured Linear
+// Attention snapshot destination is the resulting state.
 void warm_capture_ordinary_round(State& state, bool align_mtp, ops::GqaExecutionEnvelope envelope,
                                  const GraphPrepare& prepare, DecodeGraph& graph);
 void ordinary_round(State& state, bool align_mtp, ops::GqaExecutionEnvelope envelope,

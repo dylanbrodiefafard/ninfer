@@ -31,12 +31,15 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& con
                         Tensor& conv_state_out, Tensor& out, cudaStream_t stream);
 
 /**
- * Snapshot form. `conv_states` is contiguous BF16 [C,3,Slots], `initial_slot` is a contiguous I32
- * scalar selecting an initial window in [0,Slots), and Slots>=T. After token t, the resulting
- * [C,3] window is written to snapshot slot t; slots at and above T are unchanged. `conv_states`
- * is the only persistent state mutated. It must not overlap x, weight, initial_slot, or out.
+ * Snapshot form. `conv_states` is contiguous BF16 [C,3,Slots]. `initial_slot` and
+ * `snapshot_base_slot` are contiguous I32 scalars. The former selects an initial window in
+ * [0,Slots); after token t, the resulting [C,3] window is written to
+ * `snapshot_base_slot + t`. The selected destination range is within [0,Slots). Other slots are
+ * unchanged. `conv_states` is the only persistent state mutated. It must not overlap x, weight,
+ * either selector, or out.
  */
 void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& conv_states,
-                                 const Tensor& initial_slot, Tensor& out, cudaStream_t stream);
+                                 const Tensor& initial_slot, const Tensor& snapshot_base_slot,
+                                 Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops

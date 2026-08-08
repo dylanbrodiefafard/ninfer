@@ -25,8 +25,8 @@ void configure_text_card(TextContext& card, const State& state) {
 
 bool prefill_text(State& state, std::span<const TokenId> ids,
                   std::optional<std::uint32_t> snapshot_boundary, bool prepare_mtp) {
-    TextContext card(state.device, state.model, state.work, state.text_kv, state.gdn, state.io,
-                     state.prefill_hidden, state.prefill_chunk, state.text_kv_base,
+    TextContext card(state.device, state.model, state.work, state.text_kv, state.linear_attention,
+                     state.io, state.prefill_hidden, state.prefill_chunk, state.text_kv_base,
                      prepare_mtp ? state.mtp_kv : nullptr);
     configure_text_card(card, state);
     card.set_boundary_hidden_output(state.boundary_hidden);
@@ -57,8 +57,8 @@ MultimodalPrefillResult prefill_multimodal(State& state, const PreparedPromptDat
                                            runtime::TransientRegion transient,
                                            std::optional<std::uint32_t> snapshot_boundary,
                                            bool prepare_mtp) {
-    TextContext card(state.device, state.model, state.work, state.text_kv, state.gdn, state.io,
-                     state.prefill_hidden, state.prefill_chunk, state.text_kv_base,
+    TextContext card(state.device, state.model, state.work, state.text_kv, state.linear_attention,
+                     state.io, state.prefill_hidden, state.prefill_chunk, state.text_kv_base,
                      prepare_mtp ? state.mtp_kv : nullptr);
     configure_text_card(card, state);
     card.set_boundary_hidden_output(state.boundary_hidden);

@@ -136,7 +136,7 @@ __device__ __forceinline__ void load_qk_lane_bf16(float (&reg)[kQkPerLane],
 
 // state_read / state_write are the read and write bases (fp32).
 //   Spec (snapshot):    read from state_read[safe(*initial_slot)] slot, write per-token snapshots
-//                       into state_write slots 0..T-1.
+//                       from *snapshot_base_slot.
 //   non-spec:           read from state_read (caller-resolved view), write the final running state
 //                       into state_write (slot-0 view). Passing state_read == state_write is the
 //                       in-place form; distinct views let prefix-append prefill read a committed
@@ -148,6 +148,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
                           const float* __restrict__ beta, float* __restrict__ state_read,
                           float* __restrict__ state_write,
                           const std::int32_t* __restrict__ initial_slot,
+                          const std::int32_t* __restrict__ snapshot_base_slot,
                           __nv_bfloat16* __restrict__ out, std::int64_t T, head_map heads,
                           float scale, std::int64_t state_slot_stride, std::int32_t slots) {
     const int lane           = threadIdx.x;
@@ -228,8 +229,10 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
         }
 
         if constexpr (Spec) {
-            float* snapshot_h = state_write + t * state_slot_stride +
-                                static_cast<std::int64_t>(h_v) * kStateDim * kStateDim;
+            float* snapshot_h =
+                state_write +
+                static_cast<std::int64_t>(*snapshot_base_slot + t) * state_slot_stride +
+                static_cast<std::int64_t>(h_v) * kStateDim * kStateDim;
 #pragma unroll
             for (int r = 0; r < kDvPerWarp; ++r) {
                 store_qk_lane(s_tile[r],

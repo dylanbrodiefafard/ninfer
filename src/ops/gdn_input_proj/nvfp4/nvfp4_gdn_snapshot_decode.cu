@@ -9,8 +9,9 @@ namespace ninfer::ops::detail {
 
 void nvfp4_gdn_snapshot_decode_launch(const Tensor& x, const Weight& weight,
                                       const Tensor& conv_weight, Tensor& conv_states,
-                                      const Tensor& initial_slot, Tensor& query, Tensor& key,
-                                      Tensor& value, Tensor& z, cudaStream_t stream) {
+                                      const Tensor& initial_slot, const Tensor& snapshot_base_slot,
+                                      Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                      cudaStream_t stream) {
     using Geometry = Nvfp4GdnInputGeometry;
     using Schedule = typename Nvfp4LinearDecodeProductionSchedule<Geometry>::Type;
 
@@ -19,8 +20,8 @@ void nvfp4_gdn_snapshot_decode_launch(const Tensor& x, const Weight& weight,
     nvfp4_gemv_kernel<Geometry, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), inverse, Nvfp4IdentityEpilogue{},
-        make_nvfp4_gdn_snapshot_output<1>(conv_weight, conv_states, initial_slot, query, key, value,
-                                          z));
+        make_nvfp4_gdn_snapshot_output<1>(conv_weight, conv_states, initial_slot,
+                                          snapshot_base_slot, query, key, value, z));
     CUDA_CHECK(cudaGetLastError());
 }
 

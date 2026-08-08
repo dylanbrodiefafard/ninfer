@@ -63,15 +63,15 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                      cudaStream_t stream);
 
 /**
- * Snapshot form of the same recurrence. `ssm_states` is contiguous FP32 [128,128,Hv,Slots],
- * `initial_slot` is a contiguous I32 scalar in [0,Slots), and Slots>=T. The selected slot supplies
- * the initial state; after token t, the new state is written to slot t. Slots at and above T are
- * unchanged. This form uses no arena allocation, and `ssm_states` is the only persistent state
- * mutated.
+ * Snapshot form of the same recurrence. `ssm_states` is contiguous FP32 [128,128,Hv,Slots].
+ * `initial_slot` and `snapshot_base_slot` are contiguous I32 scalars. The selected initial slot is
+ * in [0,Slots); after token t, the new state is written to `snapshot_base_slot + t`. The selected
+ * destination range is within [0,Slots), and all other slots are unchanged. This form uses no
+ * arena allocation, and `ssm_states` is the only persistent state mutated.
  */
 void gated_delta_net_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                               const Tensor& beta, float scale, bool normalize_qk,
-                              Tensor& ssm_states, const Tensor& initial_slot, Tensor& out,
-                              cudaStream_t stream);
+                              Tensor& ssm_states, const Tensor& initial_slot,
+                              const Tensor& snapshot_base_slot, Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops

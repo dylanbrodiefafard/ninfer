@@ -49,15 +49,15 @@ q36::DecoderStateSpec decoder_spec(ninfer::DType dtype, bool mtp) {
         .kv_dtype              = dtype,
         .kv_quant_group        = dtype == ninfer::DType::I8 ? ninfer::kKvQuantGroup : 0,
         .enable_mtp            = mtp,
-        .gdn =
+        .linear_attention =
             {
                 .layers         = 3,
-                .conv_dim       = 10,
+                .conv_channels  = 10,
                 .conv_width     = 3,
                 .value_heads    = 4,
                 .value_head_dim = 5,
                 .key_head_dim   = 6,
-                .snapshot_slots = 4,
+                .slot_count     = 4,
                 .conv_dtype     = ninfer::DType::BF16,
             },
     };
@@ -73,8 +73,9 @@ void test_decoder_layout() {
     expect(bf16.text_kv.k_scale.empty() && bf16.text_kv.v_scale.empty(),
            "BF16 KV has no scale planes");
     expect(!bf16.mtp_kv.has_value(), "disabled MTP omits KV storage");
-    expect(bf16.gdn.conv.size() == 3 && bf16.gdn.ssm.size() == 3, "GDN layer storage");
-    expect(bf16.gdn.spec.snapshot_slots == 4, "GDN snapshot geometry");
+    expect(bf16.linear_attention.conv.size() == 3 && bf16.linear_attention.recurrent.size() == 3,
+           "Linear Attention layer storage");
+    expect(bf16.linear_attention.spec.slot_count == 4, "Linear Attention slot geometry");
     expect(bf16.kv_payload_bytes() == bf16.text_kv.payload_bytes(), "BF16 KV payload accounting");
 
     ninfer::LayoutBuilder int8_builder;

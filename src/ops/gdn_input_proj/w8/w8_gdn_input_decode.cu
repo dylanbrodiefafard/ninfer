@@ -26,12 +26,14 @@ struct W8GdnDecodeConvEpilogue {
 };
 
 GdnConvSnapshotEpilogue make_conv_epilogue(const Tensor& conv_weight, Tensor& conv_states,
-                                           const Tensor& initial_slot, Tensor& query, Tensor& key,
-                                           Tensor& value) {
+                                           const Tensor& initial_slot,
+                                           const Tensor& snapshot_base_slot, Tensor& query,
+                                           Tensor& key, Tensor& value) {
     return {
         static_cast<const __nv_bfloat16*>(conv_weight.data),
         static_cast<__nv_bfloat16*>(conv_states.data),
         static_cast<const std::int32_t*>(initial_slot.data),
+        static_cast<const std::int32_t*>(snapshot_base_slot.data),
         static_cast<__nv_bfloat16*>(query.data),
         static_cast<__nv_bfloat16*>(key.data),
         static_cast<__nv_bfloat16*>(value.data),
@@ -61,7 +63,8 @@ void w8_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q
 
 void w8_gdn_input_decode_conv_snapshot_launch(const Tensor& x, const Weight& weight,
                                               const Tensor& conv_weight, Tensor& conv_states,
-                                              const Tensor& initial_slot, Tensor& query,
+                                              const Tensor& initial_slot,
+                                              const Tensor& snapshot_base_slot, Tensor& query,
                                               Tensor& key, Tensor& value, Tensor& z,
                                               cudaStream_t stream) {
     constexpr int kRows       = 12288;
@@ -69,7 +72,8 @@ void w8_gdn_input_decode_conv_snapshot_launch(const Tensor& x, const Weight& wei
     const Output ignored_output{static_cast<__nv_bfloat16*>(query.data),
                                 static_cast<__nv_bfloat16*>(z.data)};
     const W8GdnDecodeConvEpilogue epilogue{
-        make_conv_epilogue(conv_weight, conv_states, initial_slot, query, key, value),
+        make_conv_epilogue(conv_weight, conv_states, initial_slot, snapshot_base_slot, query, key,
+                           value),
         static_cast<__nv_bfloat16*>(z.data),
     };
     w8_k2048_decode_kernel<kRows, kRowsPerCta, Output, W8GdnDecodeConvEpilogue>

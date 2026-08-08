@@ -142,9 +142,10 @@ void run_snapshot(const Options& options) {
     DeviceBuffer x = make_varied_bf16(n, 0x12345678U);
     DeviceBuffer weight =
         make_varied_bf16(static_cast<std::size_t>(options.channels) * 4u, 0x87654321U);
-    DeviceBuffer states       = make_varied_bf16(state_n, 0x31415926U);
-    DeviceBuffer initial_slot = make_zeros(sizeof(std::int32_t));
-    DeviceBuffer out          = make_zeros(n * 2u);
+    DeviceBuffer states             = make_varied_bf16(state_n, 0x31415926U);
+    DeviceBuffer initial_slot       = make_zeros(sizeof(std::int32_t));
+    DeviceBuffer snapshot_base_slot = make_zeros(sizeof(std::int32_t));
+    DeviceBuffer out                = make_zeros(n * 2u);
     CUDA_CHECK(cudaMemcpy(initial_slot.p, &options.initial_slot, sizeof(options.initial_slot),
                           cudaMemcpyHostToDevice));
 
@@ -152,13 +153,16 @@ void run_snapshot(const Options& options) {
     Tensor tw(weight.p, DType::BF16, {options.channels, 4});
     Tensor ts(states.p, DType::BF16, {options.channels, 3, options.slots});
     Tensor tslot(initial_slot.p, DType::I32, {1});
+    Tensor tsnapshot_base(snapshot_base_slot.p, DType::I32, {1});
     Tensor tout(out.p, DType::BF16, {options.channels, options.tokens});
 
     // The selected history and four weights are reusable across T; each token reads x, writes out,
     // and publishes three BF16 state columns.
     const double bytes = 14.0 * options.channels + 10.0 * static_cast<double>(n);
     const Result r     = bench_loop(
-        [&](cudaStream_t s) { ops::causal_conv1d_silu_snapshot(tx, tw, ts, tslot, tout, s); },
+        [&](cudaStream_t s) {
+            ops::causal_conv1d_silu_snapshot(tx, tw, ts, tslot, tsnapshot_base, tout, s);
+        },
         bytes);
     const std::string tag = shape_tag("snapshot", options.channels, options.tokens);
     print_result(tag.c_str(), r);

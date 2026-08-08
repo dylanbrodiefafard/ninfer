@@ -2,6 +2,8 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
+#include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
+
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/tensor.h"
@@ -137,7 +139,7 @@ class VisionPrefillSession;
 class TextContext {
 public:
     TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
-                KVCache& kv, qwen3_6::GdnStateStore& state, qwen3_6::RoundState& io,
+                KVCache& kv, LinearAttentionStatePool& state, qwen3_6::RoundState& io,
                 Tensor& prefill_hidden, std::uint32_t prefill_chunk, std::uint32_t text_kv_base,
                 KVCache* mtp_kv = nullptr);
     ~TextContext();
@@ -243,7 +245,7 @@ private:
     WorkspaceArena& work_;
     KVCache& kv_;
     KVCache* mtp_kv_;
-    qwen3_6::GdnStateStore& state_;
+    LinearAttentionStatePool& state_;
     qwen3_6::RoundState& io_;
     Tensor& prefill_hidden_;
     std::uint32_t prefill_chunk_;
@@ -252,7 +254,7 @@ private:
     const Tensor* active_rope_positions_                  = nullptr;
     const ops::GqaExecutionEnvelope* active_gqa_envelope_ = nullptr;
     std::int32_t rope_delta_                              = 0;
-    std::int32_t gdn_prefill_read_slot_                   = 0;
+    std::int32_t linear_state_prefill_read_slot_          = 0;
     std::int64_t prefill_snapshot_boundary_               = -1;
     Tensor* boundary_hidden_output_                       = nullptr;
     bool mtp_prompt_prepared_                             = false;

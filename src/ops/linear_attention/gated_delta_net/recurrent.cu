@@ -30,7 +30,7 @@ template <bool Snapshot, bool NormalizeQK>
 void launch_recurrent_fixed(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                             const Tensor& beta, float scale, const Tensor& state_read,
                             Tensor& state_write, const Tensor* initial_slot, std::int32_t slots,
-                            Tensor& out, cudaStream_t stream) {
+                            const Tensor* snapshot_base_slot, Tensor& out, cudaStream_t stream) {
     const std::int64_t T = q.ne[2];
     const auto heads     = head_map::of(q.ne[1], v.ne[1]);
     const dim3 grid(static_cast<unsigned>(v.ne[1]), 1, static_cast<unsigned>(kStateDim / kBlockDv));
@@ -39,13 +39,16 @@ void launch_recurrent_fixed(const Tensor& q, const Tensor& k, const Tensor& v, c
         static_cast<std::int64_t>(kStateDim) * kStateDim * state_write.ne[2];
     const auto* initial =
         initial_slot == nullptr ? nullptr : static_cast<const std::int32_t*>(initial_slot->data);
+    const auto* snapshot_base = snapshot_base_slot == nullptr
+                                    ? nullptr
+                                    : static_cast<const std::int32_t*>(snapshot_base_slot->data);
 
     recurrent_bf16_kernel<Snapshot, NormalizeQK><<<grid, block, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data), static_cast<const float*>(g.data),
         static_cast<const float*>(beta.data), static_cast<float*>(state_read.data),
-        static_cast<float*>(state_write.data), initial, static_cast<__nv_bfloat16*>(out.data), T,
-        heads, scale, state_slot_stride, slots);
+        static_cast<float*>(state_write.data), initial, snapshot_base,
+        static_cast<__nv_bfloat16*>(out.data), T, heads, scale, state_slot_stride, slots);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -62,10 +65,10 @@ void launch_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, const T
                       Tensor& out, cudaStream_t stream) {
     if (normalize_qk) {
         launch_recurrent_fixed<false, true>(q, k, v, g, beta, scale, ssm_state, ssm_state, nullptr,
-                                            1, out, stream);
+                                            1, nullptr, out, stream);
     } else {
         launch_recurrent_fixed<false, false>(q, k, v, g, beta, scale, ssm_state, ssm_state, nullptr,
-                                             1, out, stream);
+                                             1, nullptr, out, stream);
     }
 }
 
@@ -75,24 +78,24 @@ void launch_recurrent_inout(const Tensor& q, const Tensor& k, const Tensor& v, c
                             cudaStream_t stream) {
     if (normalize_qk) {
         launch_recurrent_fixed<false, true>(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out,
-                                            nullptr, 1, out, stream);
+                                            nullptr, 1, nullptr, out, stream);
     } else {
         launch_recurrent_fixed<false, false>(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out,
-                                             nullptr, 1, out, stream);
+                                             nullptr, 1, nullptr, out, stream);
     }
 }
 
 void launch_recurrent_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                                const Tensor& beta, float scale, bool normalize_qk,
-                               Tensor& ssm_states, const Tensor& initial_slot, Tensor& out,
-                               cudaStream_t stream) {
+                               Tensor& ssm_states, const Tensor& initial_slot,
+                               const Tensor& snapshot_base_slot, Tensor& out, cudaStream_t stream) {
     const std::int32_t slots = ssm_states.ne[3];
     if (normalize_qk) {
         launch_recurrent_fixed<true, true>(q, k, v, g, beta, scale, ssm_states, ssm_states,
-                                           &initial_slot, slots, out, stream);
+                                           &initial_slot, slots, &snapshot_base_slot, out, stream);
     } else {
         launch_recurrent_fixed<true, false>(q, k, v, g, beta, scale, ssm_states, ssm_states,
-                                            &initial_slot, slots, out, stream);
+                                            &initial_slot, slots, &snapshot_base_slot, out, stream);
     }
 }
 

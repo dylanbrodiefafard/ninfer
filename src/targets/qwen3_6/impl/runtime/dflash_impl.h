@@ -260,8 +260,9 @@ namespace {
 
 auto dflash_initial_body(State& state, std::uint32_t k, ops::GqaExecutionEnvelope target_envelope) {
     return [&state, k, target_envelope] {
-        TextContext card(state.device, state.model, state.work, state.text_kv, state.gdn, state.io,
-                         state.prefill_hidden, state.prefill_chunk, state.text_kv_base);
+        TextContext card(state.device, state.model, state.work, state.text_kv,
+                         state.linear_attention, state.io, state.prefill_hidden,
+                         state.prefill_chunk, state.text_kv_base);
         configure_text_card(card, state);
         speculative_verify_and_accept(state, card, k, target_envelope);
     };
@@ -276,8 +277,9 @@ auto dflash_steady_body(State& state, std::uint32_t k, DFlashEnvelopes envelopes
         dflash_append_context(state, features, positions, state.io.speculative.produced_count,
                               envelopes.append);
         dflash_propose(state, k, envelopes);
-        TextContext card(state.device, state.model, state.work, state.text_kv, state.gdn, state.io,
-                         state.prefill_hidden, state.prefill_chunk, state.text_kv_base);
+        TextContext card(state.device, state.model, state.work, state.text_kv,
+                         state.linear_attention, state.io, state.prefill_hidden,
+                         state.prefill_chunk, state.text_kv_base);
         configure_text_card(card, state);
         speculative_verify_and_accept(state, card, k, target_envelope);
     };

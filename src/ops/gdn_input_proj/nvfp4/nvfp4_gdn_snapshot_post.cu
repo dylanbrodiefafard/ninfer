@@ -15,8 +15,9 @@ template <int WarpsPerCta, int TokenTile>
 __global__ __launch_bounds__(WarpsPerCta * 32) void nvfp4_gdn_snapshot_post_kernel(
     const __nv_bfloat16* __restrict__ projected, const __nv_bfloat16* __restrict__ conv_weight,
     __nv_bfloat16* __restrict__ conv_states, const std::int32_t* __restrict__ initial_slot,
-    __nv_bfloat16* __restrict__ query, __nv_bfloat16* __restrict__ key,
-    __nv_bfloat16* __restrict__ value, __nv_bfloat16* __restrict__ z, std::int32_t tokens) {
+    const std::int32_t* __restrict__ snapshot_base_slot, __nv_bfloat16* __restrict__ query,
+    __nv_bfloat16* __restrict__ key, __nv_bfloat16* __restrict__ value,
+    __nv_bfloat16* __restrict__ z, std::int32_t tokens) {
     static_assert((kNvfp4GdnSnapshotChannels % 32) == 0);
 
     struct Shared {
@@ -94,7 +95,8 @@ __global__ __launch_bounds__(WarpsPerCta * 32) void nvfp4_gdn_snapshot_post_kern
                 output[static_cast<std::int64_t>(token) * output_rows + output_row] =
                     __float2bfloat16_rn(silu(conv));
 
-                const std::int64_t snapshot_base = static_cast<std::int64_t>(token) * kSlotStride;
+                const std::int64_t snapshot_base =
+                    static_cast<std::int64_t>(*snapshot_base_slot + token) * kSlotStride;
                 conv_states[snapshot_base + row] = __float2bfloat16_rn(s1);
                 conv_states[snapshot_base + kNvfp4GdnSnapshotChannels + row] =
                     __float2bfloat16_rn(s2);
@@ -117,8 +119,9 @@ __global__ __launch_bounds__(WarpsPerCta * 32) void nvfp4_gdn_snapshot_post_kern
 } // namespace
 
 void nvfp4_gdn_snapshot_post_launch(const Tensor& projected, const Tensor& conv_weight,
-                                    Tensor& conv_states, const Tensor& initial_slot, Tensor& query,
-                                    Tensor& key, Tensor& value, Tensor& z, cudaStream_t stream) {
+                                    Tensor& conv_states, const Tensor& initial_slot,
+                                    const Tensor& snapshot_base_slot, Tensor& query, Tensor& key,
+                                    Tensor& value, Tensor& z, cudaStream_t stream) {
     constexpr int kWarpsPerCta = 32;
     constexpr int kTokenTile   = 8;
     constexpr int kBlocks      = kNvfp4GdnSnapshotChannels / 32;
@@ -128,6 +131,7 @@ void nvfp4_gdn_snapshot_post_launch(const Tensor& projected, const Tensor& conv_
             static_cast<const __nv_bfloat16*>(conv_weight.data),
             static_cast<__nv_bfloat16*>(conv_states.data),
             static_cast<const std::int32_t*>(initial_slot.data),
+            static_cast<const std::int32_t*>(snapshot_base_slot.data),
             static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
             static_cast<__nv_bfloat16*>(value.data), static_cast<__nv_bfloat16*>(z.data),
             projected.ne[1]);

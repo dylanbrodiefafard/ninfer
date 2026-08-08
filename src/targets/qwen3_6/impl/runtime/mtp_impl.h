@@ -19,8 +19,9 @@ void mtp_bridge_and_propose(State& state, const Tensor& next_token, const Tensor
         throw std::invalid_argument("MTP bridge requires one three-axis rope position");
     }
     state.work.reset();
-    TextContext card(state.device, state.model, state.work, state.text_kv, state.gdn, state.io,
-                     state.prefill_hidden, state.prefill_chunk, state.text_kv_base, state.mtp_kv);
+    TextContext card(state.device, state.model, state.work, state.text_kv, state.linear_attention,
+                     state.io, state.prefill_hidden, state.prefill_chunk, state.text_kv_base,
+                     state.mtp_kv);
     configure_text_card(card, state);
 
     Tensor position_view = state.io.speculative.target_positions.slice(0, 0, 1);
@@ -62,9 +63,9 @@ auto mtp_body(State& state, std::uint32_t k, MtpGqaEnvelopes envelopes) {
     }
 
     auto record = [&state, k, envelopes] {
-        TextContext card(state.device, state.model, state.work, state.text_kv, state.gdn, state.io,
-                         state.prefill_hidden, state.prefill_chunk, state.text_kv_base,
-                         state.mtp_kv);
+        TextContext card(state.device, state.model, state.work, state.text_kv,
+                         state.linear_attention, state.io, state.prefill_hidden,
+                         state.prefill_chunk, state.text_kv_base, state.mtp_kv);
         configure_text_card(card, state);
 
         speculative_verify_and_accept(state, card, k, envelopes.target_verify);

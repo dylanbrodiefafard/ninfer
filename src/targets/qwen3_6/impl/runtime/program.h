@@ -9,6 +9,7 @@
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
+#include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
@@ -169,7 +170,7 @@ public:
     std::vector<TokenId> ledger;
     qwen3_6::detail::ResidentPrefixIdentity prefix_identity;
     std::int32_t rope_delta                = 0;
-    std::int32_t current_gdn_slot          = 0;
+    std::int32_t current_linear_state_slot = 0;
     std::uint32_t text_kv_valid            = 0;
     std::uint32_t mtp_kv_valid             = 0;
     std::uint32_t dflash_context_frontier  = 0;

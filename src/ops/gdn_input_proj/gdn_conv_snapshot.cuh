@@ -15,6 +15,7 @@ struct GdnConvSnapshotEpilogue {
     const __nv_bfloat16* conv_weight;
     __nv_bfloat16* conv_states;
     const std::int32_t* initial_slot;
+    const std::int32_t* snapshot_base_slot;
     __nv_bfloat16* query;
     __nv_bfloat16* key;
     __nv_bfloat16* value;
@@ -57,8 +58,9 @@ struct GdnConvSnapshotEpilogue {
                     output;
             }
 
-            const std::int64_t snapshot_base = static_cast<std::int64_t>(token) * slot_stride;
-            conv_states[snapshot_base + row] = __float2bfloat16_rn(s1);
+            const std::int64_t snapshot_base =
+                static_cast<std::int64_t>(*snapshot_base_slot + token) * slot_stride;
+            conv_states[snapshot_base + row]                  = __float2bfloat16_rn(s1);
             conv_states[snapshot_base + channels + row]       = __float2bfloat16_rn(s2);
             conv_states[snapshot_base + 2LL * channels + row] = __float2bfloat16_rn(p);
             s0                                                = s1;
@@ -69,14 +71,11 @@ struct GdnConvSnapshotEpilogue {
 };
 
 template <int Channels, int QueryRows, int KeyRows, int ValueRows, int Tokens>
-__launch_bounds__(64) __global__
-    void gdn_projected_conv_snapshot_kernel(const __nv_bfloat16* __restrict__ projected,
-                                            const __nv_bfloat16* __restrict__ conv_weight,
-                                            __nv_bfloat16* __restrict__ conv_states,
-                                            const std::int32_t* __restrict__ initial_slot,
-                                            __nv_bfloat16* __restrict__ query,
-                                            __nv_bfloat16* __restrict__ key,
-                                            __nv_bfloat16* __restrict__ value) {
+__launch_bounds__(64) __global__ void gdn_projected_conv_snapshot_kernel(
+    const __nv_bfloat16* __restrict__ projected, const __nv_bfloat16* __restrict__ conv_weight,
+    __nv_bfloat16* __restrict__ conv_states, const std::int32_t* __restrict__ initial_slot,
+    const std::int32_t* __restrict__ snapshot_base_slot, __nv_bfloat16* __restrict__ query,
+    __nv_bfloat16* __restrict__ key, __nv_bfloat16* __restrict__ value) {
     static_assert(Channels == QueryRows + KeyRows + ValueRows && Tokens >= 1);
     const int row =
         static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
@@ -110,8 +109,9 @@ __launch_bounds__(64) __global__
                 output;
         }
 
-        const std::int64_t snapshot_base = static_cast<std::int64_t>(token) * slot_stride;
-        conv_states[snapshot_base + row] = __float2bfloat16_rn(s1);
+        const std::int64_t snapshot_base =
+            static_cast<std::int64_t>(*snapshot_base_slot + token) * slot_stride;
+        conv_states[snapshot_base + row]                  = __float2bfloat16_rn(s1);
         conv_states[snapshot_base + Channels + row]       = __float2bfloat16_rn(s2);
         conv_states[snapshot_base + 2LL * Channels + row] = __float2bfloat16_rn(p);
         s0                                                = s1;

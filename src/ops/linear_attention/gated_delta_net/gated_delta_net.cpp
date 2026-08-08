@@ -108,7 +108,7 @@ Geometry validate_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, c
 Geometry validate_recurrent_snapshot(const Tensor& q, const Tensor& k, const Tensor& v,
                                      const Tensor& g, const Tensor& beta, float scale,
                                      const Tensor& ssm_states, const Tensor& initial_slot,
-                                     const Tensor& out) {
+                                     const Tensor& snapshot_base_slot, const Tensor& out) {
     require_dtype(q, DType::BF16, "q must be BF16");
     require_dtype(k, DType::BF16, "k must be BF16");
     require_dtype(v, DType::BF16, "v must be BF16");
@@ -117,6 +117,7 @@ Geometry validate_recurrent_snapshot(const Tensor& q, const Tensor& k, const Ten
     require_dtype(beta, DType::FP32, "beta must be FP32");
     require_dtype(ssm_states, DType::FP32, "ssm_states must be FP32");
     require_dtype(initial_slot, DType::I32, "initial_slot must be I32");
+    require_dtype(snapshot_base_slot, DType::I32, "snapshot_base_slot must be I32");
 
     const Geometry geometry = require_geometry(q, v);
     require_shape(q, detail::gated_delta_net::kStateDim, geometry.qk_heads, geometry.tokens, 1,
@@ -135,6 +136,7 @@ Geometry validate_recurrent_snapshot(const Tensor& q, const Tensor& k, const Ten
         throw std::invalid_argument("gated_delta_net: invalid shape for ssm_states snapshot");
     }
     require_shape(initial_slot, 1, 1, 1, 1, "initial_slot");
+    require_shape(snapshot_base_slot, 1, 1, 1, 1, "snapshot_base_slot");
 
     require_contiguous_nonnull(q, "q");
     require_contiguous_nonnull(k, "k");
@@ -143,6 +145,7 @@ Geometry validate_recurrent_snapshot(const Tensor& q, const Tensor& k, const Ten
     require_contiguous_nonnull(beta, "beta");
     require_contiguous_nonnull(ssm_states, "ssm_states");
     require_contiguous_nonnull(initial_slot, "initial_slot");
+    require_contiguous_nonnull(snapshot_base_slot, "snapshot_base_slot");
     require_contiguous_nonnull(out, "out");
 
     require_scale(scale);
@@ -218,12 +221,14 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
 
 void gated_delta_net_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                               const Tensor& beta, float scale, bool normalize_qk,
-                              Tensor& ssm_states, const Tensor& initial_slot, Tensor& out,
-                              cudaStream_t stream) {
-    validate_recurrent_snapshot(q, k, v, g, beta, scale, ssm_states, initial_slot, out);
+                              Tensor& ssm_states, const Tensor& initial_slot,
+                              const Tensor& snapshot_base_slot, Tensor& out, cudaStream_t stream) {
+    validate_recurrent_snapshot(q, k, v, g, beta, scale, ssm_states, initial_slot,
+                                snapshot_base_slot, out);
 
     detail::gated_delta_net::launch_recurrent_snapshot(q, k, v, g, beta, scale, normalize_qk,
-                                                       ssm_states, initial_slot, out, stream);
+                                                       ssm_states, initial_slot, snapshot_base_slot,
+                                                       out, stream);
 }
 
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,

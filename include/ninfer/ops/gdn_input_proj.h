@@ -103,13 +103,15 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  *   z[:,t] = value_z_weight[6144:12288,:]*x[:,t]. Starting from the BF16 width-three history
  *   selected by device I32 initial_slot, evaluate the width-four depthwise convolution over p,
  *   apply SiLU, and write its three channel ranges directly to query, key, and value. After token
- *   t, write the resulting width-three projection history to state slot t. Z bypasses convolution.
+ *   t, write the resulting width-three projection history to state slot
+ *   snapshot_base_slot+t. Z bypasses convolution.
  *
  * Logical shapes:
  *   The 27B registered form has x [5120,T], Q4 q/k weight [4096,5120], one Q5 value/z parent
  *   [12288,5120], conv_weight [10240,4], conv_states [10240,3,Slots], query/key [2048,T],
- *   value [6144,T], and z [6144,T]. T is positive, Slots>=T, and the device initial_slot value
- *   is in [0,Slots).
+ *   value [6144,T], and z [6144,T]. T is positive. initial_slot and snapshot_base_slot are
+ *   contiguous device I32 scalars; the former is in [0,Slots), and the latter selects a
+ *   destination interval [snapshot_base_slot,snapshot_base_slot+T) within [0,Slots).
  *
  * Numeric:
  *   The oracle exact-decodes packed weights and evaluates projection, convolution, SiLU, z, and
@@ -121,14 +123,15 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  *   the single-parent policy-bearing form below defines its own permitted compute profiles.
  *
  * Effects:
- *   Writes query/key/value/z and state slots [0,T); other slots are unchanged. Newly projected
- *   convolution channels remain private to the current call while each published snapshot is
- *   BF16.
+ *   Writes query/key/value/z and the selected destination state interval; other slots are
+ *   unchanged. Newly projected convolution channels remain private to the current call while
+ *   each published snapshot is BF16.
  */
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
                                   const Weight& value_z_weight, const Tensor& conv_weight,
-                                  Tensor& conv_states, const Tensor& initial_slot, Tensor& query,
-                                  Tensor& key, Tensor& value, Tensor& z, WorkspaceArena& ws,
+                                  Tensor& conv_states, const Tensor& initial_slot,
+                                  const Tensor& snapshot_base_slot, Tensor& query, Tensor& key,
+                                  Tensor& value, Tensor& z, WorkspaceArena& ws,
                                   cudaStream_t stream);
 
 /**
@@ -140,9 +143,9 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
  */
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value_z_weight,
                                   const Tensor& conv_weight, Tensor& conv_states,
-                                  const Tensor& initial_slot, Tensor& query, Tensor& key,
-                                  Tensor& value, Tensor& z, LinearPolicy policy, WorkspaceArena& ws,
-                                  cudaStream_t stream);
+                                  const Tensor& initial_slot, const Tensor& snapshot_base_slot,
+                                  Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                  LinearPolicy policy, WorkspaceArena& ws, cudaStream_t stream);
 
 /**
  * Applies the A16-only single-parent form. For NVFP4 this convenience overload is valid only for
@@ -150,8 +153,8 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
  */
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value_z_weight,
                                   const Tensor& conv_weight, Tensor& conv_states,
-                                  const Tensor& initial_slot, Tensor& query, Tensor& key,
-                                  Tensor& value, Tensor& z, WorkspaceArena& ws,
-                                  cudaStream_t stream);
+                                  const Tensor& initial_slot, const Tensor& snapshot_base_slot,
+                                  Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                  WorkspaceArena& ws, cudaStream_t stream);
 
 } // namespace ninfer::ops

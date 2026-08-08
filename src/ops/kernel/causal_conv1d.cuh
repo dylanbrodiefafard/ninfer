@@ -275,12 +275,11 @@ __global__ void causal_conv1d_decode_distinct_kernel(
     }
 }
 
-__global__ void causal_conv1d_snapshot_decode_kernel(const __nv_bfloat16* __restrict__ x,
-                                                     const __nv_bfloat16* __restrict__ weight,
-                                                     __nv_bfloat16* __restrict__ conv_states,
-                                                     const std::int32_t* __restrict__ initial_slot,
-                                                     __nv_bfloat16* __restrict__ out,
-                                                     std::int32_t C, std::int64_t slot_stride) {
+__global__ void causal_conv1d_snapshot_decode_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ conv_states, const std::int32_t* __restrict__ initial_slot,
+    const std::int32_t* __restrict__ snapshot_base_slot, __nv_bfloat16* __restrict__ out,
+    std::int32_t C, std::int64_t slot_stride) {
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     const std::int64_t C64    = static_cast<std::int64_t>(C);
@@ -300,19 +299,20 @@ __global__ void causal_conv1d_snapshot_decode_kernel(const __nv_bfloat16* __rest
         acc += __bfloat162float(weight[2 * C64 + c]) * __bfloat162float(s2);
         acc += __bfloat162float(weight[3 * C64 + c]) * __bfloat162float(x0);
 
-        out[c]                   = __float2bfloat16_rn(silu(acc));
-        conv_states[c]           = s1;
-        conv_states[C64 + c]     = s2;
-        conv_states[2 * C64 + c] = x0;
+        out[c] = __float2bfloat16_rn(silu(acc));
+        __nv_bfloat16* snapshot =
+            conv_states + static_cast<std::int64_t>(*snapshot_base_slot) * slot_stride;
+        snapshot[c]           = s1;
+        snapshot[C64 + c]     = s2;
+        snapshot[2 * C64 + c] = x0;
     }
 }
 
-__global__ void causal_conv1d_sequence_snapshot_kernel(const __nv_bfloat16* x,
-                                                       const __nv_bfloat16* weight,
-                                                       __nv_bfloat16* conv_states,
-                                                       const std::int32_t* initial_slot,
-                                                       __nv_bfloat16* out, std::int32_t C,
-                                                       std::int32_t T, std::int64_t slot_stride) {
+__global__ void
+causal_conv1d_sequence_snapshot_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                                       __nv_bfloat16* conv_states, const std::int32_t* initial_slot,
+                                       const std::int32_t* snapshot_base_slot, __nv_bfloat16* out,
+                                       std::int32_t C, std::int32_t T, std::int64_t slot_stride) {
     const std::int64_t c64 = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t C64 = static_cast<std::int64_t>(C);
     if (c64 >= C64) { return; }
@@ -342,7 +342,8 @@ __global__ void causal_conv1d_sequence_snapshot_kernel(const __nv_bfloat16* x,
         s1           = s2;
         s2           = x0;
 
-        __nv_bfloat16* snapshot = conv_states + static_cast<std::int64_t>(t) * slot_stride;
+        __nv_bfloat16* snapshot =
+            conv_states + static_cast<std::int64_t>(*snapshot_base_slot + t) * slot_stride;
         snapshot[c64]           = s0;
         snapshot[C64 + c64]     = s1;
         snapshot[2 * C64 + c64] = s2;
@@ -352,12 +353,11 @@ __global__ void causal_conv1d_sequence_snapshot_kernel(const __nv_bfloat16* x,
 // Small-T snapshot form. A CTA owns all token outputs for one channel tile. The selected history
 // is cached before any snapshot slot is written, so initial_slot may name any slot, including one
 // overwritten by this call.
-__global__ void causal_conv1d_snapshot_smallt_kernel(const __nv_bfloat16* x,
-                                                     const __nv_bfloat16* weight,
-                                                     __nv_bfloat16* conv_states,
-                                                     const std::int32_t* initial_slot,
-                                                     __nv_bfloat16* out, std::int32_t C,
-                                                     std::int32_t T, std::int64_t slot_stride) {
+__global__ void
+causal_conv1d_snapshot_smallt_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                                     __nv_bfloat16* conv_states, const std::int32_t* initial_slot,
+                                     const std::int32_t* snapshot_base_slot, __nv_bfloat16* out,
+                                     std::int32_t C, std::int32_t T, std::int64_t slot_stride) {
     __shared__ __nv_bfloat16 history[3][kCausalConvChannelTile];
     __shared__ __nv_bfloat16 weights[4][kCausalConvChannelTile];
 
@@ -401,7 +401,8 @@ __global__ void causal_conv1d_snapshot_smallt_kernel(const __nv_bfloat16* x,
     acc += __bfloat162float(weights[3][lane]) * __bfloat162float(x3);
     out[out_idx] = __float2bfloat16_rn(silu(acc));
 
-    __nv_bfloat16* snapshot = conv_states + static_cast<std::int64_t>(t) * slot_stride;
+    __nv_bfloat16* snapshot =
+        conv_states + static_cast<std::int64_t>(*snapshot_base_slot + t) * slot_stride;
     for (std::int32_t s = 0; s < 3; ++s) {
         const std::int32_t pos = t - 2 + s;
         snapshot[static_cast<std::int64_t>(s) * C64 + c64] =

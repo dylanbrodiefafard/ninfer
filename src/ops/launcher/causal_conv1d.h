@@ -25,6 +25,7 @@ void causal_conv1d_decode_launch(const Tensor& x, const Tensor& weight, const Te
                                  Tensor& conv_state_out, Tensor& out, cudaStream_t stream);
 void causal_conv1d_sequence_snapshot_launch(const Tensor& x, const Tensor& weight,
                                             Tensor& conv_states, const Tensor& initial_slot,
-                                            Tensor& out, cudaStream_t stream);
+                                            const Tensor& snapshot_base_slot, Tensor& out,
+                                            cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

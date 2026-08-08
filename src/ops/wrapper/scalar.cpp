@@ -31,6 +31,17 @@ void assign_i32_scalar(const Tensor& source, Tensor& destination, cudaStream_t s
     detail::assign_i32_scalar_launch(source, destination, stream);
 }
 
+void add_i32_scalars(const Tensor& lhs, const Tensor& rhs, Tensor& destination,
+                     cudaStream_t stream) {
+    require_scalar(lhs, DType::I32, "add_i32_scalars lhs");
+    require_scalar(rhs, DType::I32, "add_i32_scalars rhs");
+    require_scalar(destination, DType::I32, "add_i32_scalars destination");
+    if (destination.data == lhs.data || destination.data == rhs.data) {
+        throw std::invalid_argument("add_i32_scalars: inputs must not alias destination");
+    }
+    detail::add_i32_scalars_launch(lhs, rhs, destination, stream);
+}
+
 void increment_i32_scalar(Tensor& scalar, cudaStream_t stream) {
     require_scalar(scalar, DType::I32, "increment_i32_scalar scalar");
     detail::increment_i32_scalar_launch(scalar, stream);

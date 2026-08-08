@@ -67,7 +67,7 @@ ninfer_add_test(ninfer_kv_cache_test
   LIBRARIES ninfer_core)
 ninfer_add_test(ninfer_state_store_test
   SOURCES test_state_store.cpp
-  LIBRARIES ninfer_engine ninfer_core)
+  LIBRARIES ninfer_core)
 set_tests_properties(
   ninfer_artifact_materialization_test
   ninfer_device_test
@@ -76,8 +76,6 @@ set_tests_properties(
   ninfer_kv_cache_test
   ninfer_state_store_test
   PROPERTIES SKIP_RETURN_CODE 77)
-target_include_directories(ninfer_state_store_test PRIVATE
-  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 ninfer_add_test(ninfer_generation_controller_test SOURCES test_generation_controller.cpp)
 
 # Family frontend and one opt-in real-artifact prefix/MTP integration test.

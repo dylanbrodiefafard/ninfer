@@ -212,7 +212,7 @@ void DFlashFeatureSink::consume_prefill_chunk(std::int32_t tokens, bool boundary
 }
 
 TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
-                         KVCache& kv, qwen3_6::GdnStateStore& state, qwen3_6::RoundState& io,
+                         KVCache& kv, LinearAttentionStatePool& state, qwen3_6::RoundState& io,
                          Tensor& prefill_hidden, std::uint32_t prefill_chunk,
                          std::uint32_t text_kv_base, KVCache* mtp_kv)
     : ctx_(ctx), weights_(weights), work_(work), kv_(kv), mtp_kv_(mtp_kv), state_(state), io_(io),
@@ -717,17 +717,20 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor vc             = projection.value;
     if (ph == Phase::Verify) {
         Tensor& conv_states = state_.conv.at(static_cast<std::size_t>(gidx));
-        Variant::gdn_input_projection_snapshot(h, *w.projection, *w.conv1d, conv_states,
-                                               io_.gdn_initial_slot, qc, kc, vc, z, ph, work_, s);
+        Variant::gdn_input_projection_snapshot(
+            h, *w.projection, *w.conv1d, conv_states, io_.linear_state_read_slot,
+            io_.linear_state_snapshot_base_slot, qc, kc, vc, z, ph, work_, s);
     } else {
         const auto conv = workspace_recipe::gdn_prefill_conv<TextConfig>(work_, T);
         Tensor qkv      = conv.projected;
         Variant::gdn_input_projection(h, *w.projection, qkv, z, ph, work_, s);
         Tensor qkv_c = conv.convolved;
-        // Prefill reads the committed conv window from gdn_prefill_read_slot_ and writes the
-        // running window to slot 0 (in-place when the read slot is 0).
-        Tensor conv_in = state_.conv_slot(static_cast<std::uint32_t>(gidx), gdn_prefill_read_slot_);
-        Tensor conv_out = state_.conv_slot(static_cast<std::uint32_t>(gidx), 0);
+        // Prefill reads the committed conv window from linear_state_prefill_read_slot_ and writes
+        // the running window to the target working slot (in-place when both roles select it).
+        Tensor conv_in =
+            state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_prefill_read_slot_);
+        Tensor conv_out = state_.conv_slot(static_cast<std::uint32_t>(gidx),
+                                           LinearStateSlots::prefill_working_slot());
         ops::causal_conv1d_silu(qkv, *w.conv1d, conv_in, conv_out, qkv_c, s);
         ops::extract_bf16_columns(qkv_c, 0, qc, s);
         ops::extract_bf16_columns(qkv_c, kCfg.key_dim, kc, s);
@@ -741,17 +744,20 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor o  = workspace_recipe::gdn_recurrent_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     if (ph == Phase::Verify) {
-        Tensor& ssm_states = state_.ssm.at(static_cast<std::size_t>(gidx));
+        Tensor& recurrent_states = state_.recurrent.at(static_cast<std::size_t>(gidx));
         ops::gated_delta_net_snapshot(q_recurrent, k_recurrent, vv, g, beta, kGdnScale,
-                                      /*normalize_qk=*/true, ssm_states, io_.gdn_initial_slot, o,
-                                      s);
+                                      /*normalize_qk=*/true, recurrent_states,
+                                      io_.linear_state_read_slot,
+                                      io_.linear_state_snapshot_base_slot, o, s);
     } else {
-        // Prefill reads the committed recurrent state from gdn_prefill_read_slot_ and writes the
-        // running state to slot 0 (in-place when the read slot is 0).
-        Tensor ssm_in  = state_.ssm_slot(static_cast<std::uint32_t>(gidx), gdn_prefill_read_slot_);
-        Tensor ssm_out = state_.ssm_slot(static_cast<std::uint32_t>(gidx), 0);
+        // Prefill reads the committed recurrent state from linear_state_prefill_read_slot_ and
+        // writes the running state to the target working slot (in-place when both roles select it).
+        Tensor recurrent_in  = state_.recurrent_slot(static_cast<std::uint32_t>(gidx),
+                                                     linear_state_prefill_read_slot_);
+        Tensor recurrent_out = state_.recurrent_slot(static_cast<std::uint32_t>(gidx),
+                                                     LinearStateSlots::prefill_working_slot());
         ops::gated_delta_net(q_recurrent, k_recurrent, vv, g, beta, kGdnScale,
-                             /*normalize_qk=*/true, work_, ssm_in, ssm_out, o, s);
+                             /*normalize_qk=*/true, work_, recurrent_in, recurrent_out, o, s);
     }
 
     Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
@@ -865,14 +871,16 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
     }
     const int base_i = static_cast<int>(base);
 
-    // The committed GDN state for the resident prefix lives in snapshot slot gdn_initial_slot
-    // (slot 0 for a reset). Chunk 0 reads from it; every later chunk reads slot 0 (the running
-    // state chunk 0 produced). Resolved on the host because prefill is eager.
-    std::int32_t gdn_read_slot0 = 0;
+    // The committed Linear Attention state for the resident prefix lives in the read slot.
+    // Chunk 0 reads it; every later chunk reads the target's prefill working slot. Resolved on the
+    // host because prefill is eager.
+    std::int32_t initial_linear_state_slot = LinearStateSlots::prefill_working_slot();
     CUDA_CHECK(cudaStreamSynchronize(s));
-    CUDA_CHECK(cudaMemcpy(&gdn_read_slot0, io_.gdn_initial_slot.data, sizeof(gdn_read_slot0),
-                          cudaMemcpyDeviceToHost));
-    if (gdn_read_slot0 < 0 || gdn_read_slot0 >= state_.spec.snapshot_slots) { gdn_read_slot0 = 0; }
+    CUDA_CHECK(cudaMemcpy(&initial_linear_state_slot, io_.linear_state_read_slot.data,
+                          sizeof(initial_linear_state_slot), cudaMemcpyDeviceToHost));
+    if (initial_linear_state_slot < 0 || initial_linear_state_slot >= state_.slot_count()) {
+        throw std::logic_error("prefill Linear Attention read slot is out of range");
+    }
 
     // Turn-boundary GDN snapshot: when a boundary is requested, publish the running conv/SSM state
     // into the dedicated last snapshot slot exactly at absolute position
@@ -885,7 +893,7 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
     const bool has_snapshot =
         snap_abs > base64 && snap_abs <= base64 + static_cast<std::int64_t>(T);
     const int snap_rel               = has_snapshot ? static_cast<int>(snap_abs - base64) : -1;
-    const std::int32_t boundary_slot = state_.spec.snapshot_slots - 1;
+    const std::int32_t boundary_slot = LinearStateSlots::prefix_boundary_slot(state_.slot_count());
 
     bool prepare_mtp_prompt = false;
     if (mtp_enabled() && io_.speculative.draft_tokens.data != nullptr) {
@@ -929,7 +937,8 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
         nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                       static_cast<std::uint64_t>(len));
 
-        gdn_prefill_read_slot_ = (t0 == 0) ? gdn_read_slot0 : 0;
+        linear_state_prefill_read_slot_ =
+            (t0 == 0) ? initial_linear_state_slot : LinearStateSlots::prefill_working_slot();
 
         {
             std::vector<std::int32_t> local_scatter_indices;
@@ -1113,7 +1122,9 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
         // Snapshot the running GDN state at the requested boundary into the dedicated slot. This
         // chunk ended exactly at the boundary (see the len cap above), so slot 0 is the state
         // there.
-        if (snap_rel > 0 && t0 + len == snap_rel) { state_.copy_slot(0, boundary_slot, s); }
+        if (snap_rel > 0 && t0 + len == snap_rel) {
+            state_.copy_slot(LinearStateSlots::prefill_working_slot(), boundary_slot, s);
+        }
 
         t0 += len;
     }
@@ -1122,8 +1133,8 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
     // snapshot.
     prefill_snapshot_boundary_ = -1;
 
-    // Prefill wrote the running GDN state to slot 0; the first decode round must read slot 0.
-    ops::set_i32_scalar(io_.gdn_initial_slot, 0, s);
+    // Prefill wrote the target working state; the first decode round reads that slot.
+    ops::set_i32_scalar(io_.linear_state_read_slot, LinearStateSlots::prefill_working_slot(), s);
 
     ctx_.synchronize();
     work_.reset();

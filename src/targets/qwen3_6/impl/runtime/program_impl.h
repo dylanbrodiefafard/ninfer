@@ -154,8 +154,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     CUDA_CHECK(cudaMemsetAsync(io.rope_delta.data, 0, io.rope_delta.bytes(), device.stream));
     CUDA_CHECK(cudaMemsetAsync(io.speculative.accepted_drafts.data, 0,
                                io.speculative.accepted_drafts.bytes(), device.stream));
-    CUDA_CHECK(
-        cudaMemsetAsync(io.gdn_initial_slot.data, 0, io.gdn_initial_slot.bytes(), device.stream));
+    CUDA_CHECK(cudaMemsetAsync(io.linear_state_read_slot.data, 0, io.linear_state_read_slot.bytes(),
+                               device.stream));
+    CUDA_CHECK(cudaMemsetAsync(io.linear_state_snapshot_base_slot.data, 0,
+                               io.linear_state_snapshot_base_slot.bytes(), device.stream));
     if (io.mtp) {
         CUDA_CHECK(
             cudaMemsetAsync(io.mtp->position.data, 0, io.mtp->position.bytes(), device.stream));
@@ -183,23 +185,23 @@ void ProgramImplCore::make_invalid() noexcept {
     S         = 0;
     ledger.clear();
     prefix_identity.clear();
-    current_gdn_slot         = 0;
-    text_kv_valid            = 0;
-    mtp_kv_valid             = 0;
-    dflash_context_frontier  = 0;
-    dflash_proposal_frontier = 0;
-    dflash_proposal_anchor   = 0;
-    dflash_proposal_epoch    = 0;
-    pending_context_base     = 0;
-    pending_context_count    = 0;
-    pending_context_valid    = false;
-    dflash_boundary_valid    = false;
-    dflash_boundary_frontier = 0;
-    ordinary_tail            = false;
-    drafts_ready             = false;
-    tail_hidden_valid        = false;
-    boundary                 = {};
-    pending                  = {};
+    current_linear_state_slot = LinearStateSlots::prefill_working_slot();
+    text_kv_valid             = 0;
+    mtp_kv_valid              = 0;
+    dflash_context_frontier   = 0;
+    dflash_proposal_frontier  = 0;
+    dflash_proposal_anchor    = 0;
+    dflash_proposal_epoch     = 0;
+    pending_context_base      = 0;
+    pending_context_count     = 0;
+    pending_context_valid     = false;
+    dflash_boundary_valid     = false;
+    dflash_boundary_frontier  = 0;
+    ordinary_tail             = false;
+    drafts_ready              = false;
+    tail_hidden_valid         = false;
+    boundary                  = {};
+    pending                   = {};
 }
 
 void ProgramImplCore::set_device_i32(Tensor& tensor, std::int32_t value) {
@@ -208,28 +210,30 @@ void ProgramImplCore::set_device_i32(Tensor& tensor, std::int32_t value) {
 }
 
 void ProgramImplCore::ordered_reset() {
-    decoder->gdn.reset_running(device.stream);
+    decoder->linear_attention.zero_slot(LinearStateSlots::prefill_working_slot(), device.stream);
     work.reset();
     set_device_i32(io.pos, 0);
     set_device_i32(io.rope_pos, 0);
     set_device_i32(io.rope_delta, 0);
     set_device_i32(io.speculative.accepted_drafts, 0);
-    set_device_i32(io.gdn_initial_slot, 0);
+    set_device_i32(io.linear_state_read_slot, LinearStateSlots::prefill_working_slot());
+    set_device_i32(io.linear_state_snapshot_base_slot,
+                   LinearStateSlots::verify_snapshot_base_slot());
     if (io.mtp) { set_device_i32(io.mtp->position, 0); }
-    current_gdn_slot         = 0;
-    text_kv_valid            = 0;
-    mtp_kv_valid             = 0;
-    dflash_context_frontier  = 0;
-    dflash_proposal_frontier = 0;
-    dflash_proposal_anchor   = 0;
-    dflash_proposal_epoch    = 0;
-    pending_context_base     = 0;
-    pending_context_count    = 0;
-    pending_context_valid    = false;
-    dflash_boundary_valid    = false;
-    dflash_boundary_frontier = 0;
-    ordinary_tail            = false;
-    drafts_ready             = false;
+    current_linear_state_slot = LinearStateSlots::prefill_working_slot();
+    text_kv_valid             = 0;
+    mtp_kv_valid              = 0;
+    dflash_context_frontier   = 0;
+    dflash_proposal_frontier  = 0;
+    dflash_proposal_anchor    = 0;
+    dflash_proposal_epoch     = 0;
+    pending_context_base      = 0;
+    pending_context_count     = 0;
+    pending_context_valid     = false;
+    dflash_boundary_valid     = false;
+    dflash_boundary_frontier  = 0;
+    ordinary_tail             = false;
+    drafts_ready              = false;
     if (dflash) { set_device_i32(dflash->commit_count, 0); }
 }
 
@@ -253,7 +257,8 @@ void ProgramImplCore::prepare_graphs() {
             io.speculative.target_input_ids,
             io.speculative.target_positions,
             io.speculative.accepted_drafts,
-            io.gdn_initial_slot,
+            io.linear_state_read_slot,
+            io.linear_state_snapshot_base_slot,
             io.speculative.stats,
         };
         if (io.mtp) {
@@ -293,7 +298,8 @@ void ProgramImplCore::prepare_graphs() {
     const auto prepare_representative = [&](std::uint32_t frontier) {
         work.reset();
         clear_stable_controls();
-        decoder->gdn.reset_running(device.stream);
+        decoder->linear_attention.zero_slot(LinearStateSlots::prefill_working_slot(),
+                                            device.stream);
         set_device_i32(io.pos, checked_i32(frontier, "graph representative position"));
         set_device_i32(io.rope_pos, checked_i32(frontier, "graph representative rope position"));
         if (io.mtp) {
@@ -314,7 +320,7 @@ void ProgramImplCore::prepare_graphs() {
                                decoder->text_kv,
                                decoder->mtp_cache(),
                                dflash ? &*dflash : nullptr,
-                               decoder->gdn,
+                               decoder->linear_attention,
                                io,
                                prefill_hidden,
                                prefill_chunk,
@@ -394,10 +400,10 @@ void ProgramImplCore::prepare_graphs() {
 
     ordered_reset();
     clear_stable_controls();
-    for (Tensor& tensor : decoder->gdn.conv) {
+    for (Tensor& tensor : decoder->linear_attention.conv) {
         CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
     }
-    for (Tensor& tensor : decoder->gdn.ssm) {
+    for (Tensor& tensor : decoder->linear_attention.recurrent) {
         CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
     }
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
@@ -455,7 +461,7 @@ void ProgramImplCore::flush_dflash_context_prefix(std::uint32_t count) {
                           decoder->text_kv,
                           decoder->mtp_cache(),
                           &*dflash,
-                          decoder->gdn,
+                          decoder->linear_attention,
                           io,
                           prefill_hidden,
                           prefill_chunk,
@@ -541,7 +547,7 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
             }
             text_kv_valid = base;
             ledger.resize(base);
-            set_device_i32(io.gdn_initial_slot, current_gdn_slot);
+            set_device_i32(io.linear_state_read_slot, current_linear_state_slot);
             if (dflash && (pending_context_valid || dflash_context_frontier != base)) {
                 throw std::logic_error("resident DFlash context is not at the append frontier");
             }
@@ -550,9 +556,11 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
                 throw std::logic_error("resident Text KV is shorter than boundary");
             }
             text_kv_valid = base;
-            decoder->gdn.copy_slot(decoder->gdn.spec.snapshot_slots - 1, 0, device.stream);
-            current_gdn_slot = 0;
-            set_device_i32(io.gdn_initial_slot, 0);
+            decoder->linear_attention.copy_slot(
+                LinearStateSlots::prefix_boundary_slot(decoder->linear_attention.slot_count()),
+                LinearStateSlots::prefill_working_slot(), device.stream);
+            current_linear_state_slot = LinearStateSlots::prefill_working_slot();
+            set_device_i32(io.linear_state_read_slot, current_linear_state_slot);
             ledger.resize(base);
             if (dflash) {
                 if (!dflash_boundary_valid || dflash_boundary_frontier != base) {
@@ -596,7 +604,7 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
             decoder->text_kv,
             decoder->mtp_cache(),
             dflash ? &*dflash : nullptr,
-            decoder->gdn,
+            decoder->linear_attention,
             io,
             prefill_hidden,
             prefill_chunk,
@@ -697,7 +705,7 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
         text_kv_valid = prompt_tokens;
         // Target prefill leaves its recurrent state in slot 0. Exact-frontier reuse performs no
         // target work, so it must retain the MTP snapshot that was committed at the old frontier.
-        if (had_suffix) { current_gdn_slot = 0; }
+        if (had_suffix) { current_linear_state_slot = LinearStateSlots::prefill_working_slot(); }
         mtp_kv_valid = mtp_prepared ? prompt_tokens : 0;
         drafts_ready = mtp_prepared || dflash_prepared;
         if (dflash) {
@@ -790,7 +798,9 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
                    : (use_mtp ? nvtx::Category::Mtp : nvtx::Category::Decode);
     nvtx::ScopedRange round_range(round_name, round_category, base_E);
     try {
-        set_device_i32(io.gdn_initial_slot, current_gdn_slot);
+        set_device_i32(io.linear_state_read_slot, current_linear_state_slot);
+        set_device_i32(io.linear_state_snapshot_base_slot,
+                       LinearStateSlots::verify_snapshot_base_slot());
         schedule::State schedule_state{
             device,
             model,
@@ -798,7 +808,7 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
             decoder->text_kv,
             decoder->mtp_cache(),
             dflash ? &*dflash : nullptr,
-            decoder->gdn,
+            decoder->linear_attention,
             io,
             prefill_hidden,
             prefill_chunk,
@@ -848,10 +858,11 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
                 static_cast<std::uint64_t>(base_E) + produced > capacity) {
                 throw std::runtime_error("MTP round exceeded its budget or context capacity");
             }
-            accepted          = produced - 1;
-            kind              = PendingKind::Speculative;
-            text_kv_valid     = base_E + produced;
-            current_gdn_slot  = static_cast<std::int32_t>(accepted);
+            accepted                  = produced - 1;
+            kind                      = PendingKind::Speculative;
+            text_kv_valid             = base_E + produced;
+            current_linear_state_slot = LinearStateSlots::committed_snapshot_slot(
+                produced, decoder->linear_attention.slot_count());
             mtp_kv_valid      = base_E + produced;
             drafts_ready      = true;
             tail_hidden_valid = true;
@@ -900,10 +911,11 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
                 static_cast<std::uint64_t>(base_E) + produced > capacity) {
                 throw std::runtime_error("DFlash round exceeded its budget or context capacity");
             }
-            accepted                 = produced - 1;
-            kind                     = PendingKind::Speculative;
-            text_kv_valid            = base_E + produced;
-            current_gdn_slot         = static_cast<std::int32_t>(accepted);
+            accepted                  = produced - 1;
+            kind                      = PendingKind::Speculative;
+            text_kv_valid             = base_E + produced;
+            current_linear_state_slot = LinearStateSlots::committed_snapshot_slot(
+                produced, decoder->linear_attention.slot_count());
             dflash_context_frontier  = base_E;
             pending_context_base     = base_E;
             pending_context_count    = produced;
@@ -950,8 +962,9 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
                                              nvtx::Category::Control, base_E);
                 device.synchronize();
             }
-            text_kv_valid    = base_E + 1;
-            current_gdn_slot = 0;
+            text_kv_valid             = base_E + 1;
+            current_linear_state_slot = LinearStateSlots::committed_snapshot_slot(
+                1, decoder->linear_attention.slot_count());
             if (align_mtp) { mtp_kv_valid = base_E + 1; }
             if (dflash) {
                 dflash_context_frontier  = base_E + 1;
@@ -1021,10 +1034,11 @@ void ProgramImplCore::resolve_pending(std::uint32_t accepted_tokens, bool termin
         copy_tail(io.verify_hidden.slice(1, static_cast<int>(accepted_tokens) - 1, 1));
         ledger.resize(committed_S);
         prefix_identity.truncate(committed_S);
-        E                = committed_E;
-        S                = committed_S;
-        current_gdn_slot = static_cast<std::int32_t>(accepted_tokens - 1);
-        text_kv_valid    = committed_E;
+        E                         = committed_E;
+        S                         = committed_S;
+        current_linear_state_slot = LinearStateSlots::committed_snapshot_slot(
+            accepted_tokens, decoder->linear_attention.slot_count());
+        text_kv_valid = committed_E;
         if (speculative_backend == SpeculativeBackend::Mtp) { mtp_kv_valid = committed_E; }
         set_device_i32(io.pos, checked_i32(committed_E, "partial speculative frontier"));
         set_device_i32(io.rope_pos,

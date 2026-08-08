@@ -64,13 +64,11 @@ struct Variant {
     static void gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
                                      Tensor& qkv, Tensor& output_gate, qwen3_6::TextPhase phase,
                                      WorkspaceArena& workspace, cudaStream_t stream);
-    static void gdn_input_projection_snapshot(const Tensor& hidden,
-                                              const GdnProjectionWeights& weights,
-                                              const Tensor& conv_weight, Tensor& conv_states,
-                                              const Tensor& initial_slot, Tensor& query,
-                                              Tensor& key, Tensor& value, Tensor& output_gate,
-                                              qwen3_6::TextPhase phase, WorkspaceArena& workspace,
-                                              cudaStream_t stream);
+    static void gdn_input_projection_snapshot(
+        const Tensor& hidden, const GdnProjectionWeights& weights, const Tensor& conv_weight,
+        Tensor& conv_states, const Tensor& initial_slot, const Tensor& snapshot_base_slot,
+        Tensor& query, Tensor& key, Tensor& value, Tensor& output_gate, qwen3_6::TextPhase phase,
+        WorkspaceArena& workspace, cudaStream_t stream);
     static void gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
                                       qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                                       cudaStream_t stream);

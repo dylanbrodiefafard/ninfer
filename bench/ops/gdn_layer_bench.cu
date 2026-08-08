@@ -213,7 +213,7 @@ struct Resources {
           conv_weight(bench::make_bf16(static_cast<std::size_t>(kConvRows) * 4)),
           a_log(make_constant_f32(kValueHeads, -1.0F)),
           dt_bias(make_constant_f32(kValueHeads, 0.0F)),
-          initial_slot(make_constant_i32(kInitialSlot)),
+          initial_slot(make_constant_i32(kInitialSlot)), snapshot_base_slot(make_constant_i32(0)),
           residual(bench::make_bf16(static_cast<std::size_t>(kHidden) * max_tokens)),
           hidden(static_cast<std::size_t>(kHidden) * max_tokens * sizeof(std::uint16_t)),
           qkv(static_cast<std::size_t>(kConvRows) * max_tokens * sizeof(std::uint16_t)),
@@ -256,6 +256,7 @@ struct Resources {
     ninfer::DeviceBuffer a_log;
     ninfer::DeviceBuffer dt_bias;
     ninfer::DeviceBuffer initial_slot;
+    ninfer::DeviceBuffer snapshot_base_slot;
 
     ninfer::DeviceBuffer residual;
     ninfer::DeviceBuffer hidden;
@@ -287,6 +288,7 @@ Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t 
     Tensor conv_states(resources.conv_states.p, DType::BF16,
                        {kConvRows, kConvStateRows, kSnapshotSlots});
     Tensor initial_slot(resources.initial_slot.p, DType::I32, {1});
+    Tensor snapshot_base_slot(resources.snapshot_base_slot.p, DType::I32, {1});
     Tensor qkv_conv(resources.qkv_conv.p, DType::BF16, {kConvRows, tokens});
     Tensor a_log(resources.a_log.p, DType::FP32, {kValueHeads});
     Tensor dt_bias(resources.dt_bias.p, DType::FP32, {kValueHeads});
@@ -313,12 +315,12 @@ Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t 
         }
         if (options.route == "fused") {
             ops::gdn_input_proj_conv_snapshot(hidden, resources.input_weight.weight, conv_weight,
-                                              conv_states, initial_slot, q, k, v, z,
-                                              resources.workspace, s);
+                                              conv_states, initial_slot, snapshot_base_slot, q, k,
+                                              v, z, resources.workspace, s);
         } else {
             ops::gdn_input_proj(hidden, resources.input_weight.weight, qkv, z, s);
-            ops::causal_conv1d_silu_snapshot(qkv, conv_weight, conv_states, initial_slot, qkv_conv,
-                                             s);
+            ops::causal_conv1d_silu_snapshot(qkv, conv_weight, conv_states, initial_slot,
+                                             snapshot_base_slot, qkv_conv, s);
             ops::extract_bf16_columns(qkv_conv, 0, q, s);
             ops::extract_bf16_columns(qkv_conv, kKeyRows, k, s);
             ops::extract_bf16_columns(qkv_conv, 2 * kKeyRows, v, s);
@@ -336,9 +338,9 @@ Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t 
             q_recurrent = q_norm;
             k_recurrent = k_norm;
         }
-        ops::gated_delta_net_snapshot(q_recurrent, k_recurrent,
-                                      v.view({kHeadDim, kValueHeads, tokens}), g, beta, kGdnScale,
-                                      fused_qk_norm, ssm_states, initial_slot, recurrent_out, s);
+        ops::gated_delta_net_snapshot(
+            q_recurrent, k_recurrent, v.view({kHeadDim, kValueHeads, tokens}), g, beta, kGdnScale,
+            fused_qk_norm, ssm_states, initial_slot, snapshot_base_slot, recurrent_out, s);
         if (options.gated_rms == "dv10-b1024") {
             constexpr int block          = 1024;
             constexpr int rows_per_block = block / 32;

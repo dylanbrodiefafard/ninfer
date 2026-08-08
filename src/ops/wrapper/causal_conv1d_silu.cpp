@@ -172,19 +172,21 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, Tensor& conv_stat
 }
 
 void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& conv_states,
-                                 const Tensor& initial_slot, Tensor& out, cudaStream_t stream) {
+                                 const Tensor& initial_slot, const Tensor& snapshot_base_slot,
+                                 Tensor& out, cudaStream_t stream) {
     if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 || conv_states.dtype != DType::BF16 ||
         out.dtype != DType::BF16) {
         throw std::invalid_argument("causal_conv1d: x/weight/conv_states/out must be BF16");
     }
-    if (initial_slot.dtype != DType::I32) {
-        throw std::invalid_argument("causal_conv1d: initial_slot must be I32");
+    if (initial_slot.dtype != DType::I32 || snapshot_base_slot.dtype != DType::I32) {
+        throw std::invalid_argument("causal_conv1d: snapshot selectors must be I32");
     }
 
     const std::int64_t n = numel_allow_zero(x, "x");
     (void)numel_allow_zero(weight, "weight");
     (void)numel_allow_zero(conv_states, "conv_states");
     (void)numel_allow_zero(initial_slot, "initial_slot");
+    (void)numel_allow_zero(snapshot_base_slot, "snapshot_base_slot");
     (void)numel_allow_zero(out, "out");
 
     require_x_shape(x);
@@ -192,13 +194,15 @@ void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& 
     require_weight_shape(weight, x.ne[0]);
     require_snapshot_state_shape(conv_states, x.ne[0], x.ne[1]);
     require_initial_slot_shape(initial_slot);
+    require_initial_slot_shape(snapshot_base_slot);
     require_out_shape(x, out);
     if (n == 0) { return; }
 
     require_non_empty_accessible(x, weight, conv_states, out);
     require_initial_slot_accessible(initial_slot);
-    detail::causal_conv1d_sequence_snapshot_launch(x, weight, conv_states, initial_slot, out,
-                                                   stream);
+    require_initial_slot_accessible(snapshot_base_slot);
+    detail::causal_conv1d_sequence_snapshot_launch(x, weight, conv_states, initial_slot,
+                                                   snapshot_base_slot, out, stream);
 }
 
 } // namespace ninfer::ops

@@ -61,17 +61,18 @@ std::size_t nvfp4_gdn_snapshot_workspace_capacity_bytes(LinearPolicy policy,
 }
 
 void nvfp4_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
-                                 Tensor& conv_states, const Tensor& initial_slot, Tensor& query,
-                                 Tensor& key, Tensor& value, Tensor& z, LinearPolicy policy,
+                                 Tensor& conv_states, const Tensor& initial_slot,
+                                 const Tensor& snapshot_base_slot, Tensor& query, Tensor& key,
+                                 Tensor& value, Tensor& z, LinearPolicy policy,
                                  WorkspaceArena& workspace, cudaStream_t stream) {
     switch (resolve_route(policy, x.ne[1])) {
     case Nvfp4GdnSnapshotRoute::DecodeFusedA16:
-        nvfp4_gdn_snapshot_decode_launch(x, weight, conv_weight, conv_states, initial_slot, query,
-                                         key, value, z, stream);
+        nvfp4_gdn_snapshot_decode_launch(x, weight, conv_weight, conv_states, initial_slot,
+                                         snapshot_base_slot, query, key, value, z, stream);
         return;
     case Nvfp4GdnSnapshotRoute::SmallTFusedA16:
-        nvfp4_gdn_snapshot_small_t_launch(x, weight, conv_weight, conv_states, initial_slot, query,
-                                          key, value, z, stream);
+        nvfp4_gdn_snapshot_small_t_launch(x, weight, conv_weight, conv_states, initial_slot,
+                                          snapshot_base_slot, query, key, value, z, stream);
         return;
     case Nvfp4GdnSnapshotRoute::LinearW4A4Post:
         break;
@@ -81,8 +82,8 @@ void nvfp4_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Te
     Nvfp4GdnSnapshotWorkspace scratch = allocate_workspace(workspace, x.ne[1]);
     WorkspaceArena linear_workspace(scratch.linear);
     linear(x, weight, scratch.projected, LinearPolicy::AllowA4, linear_workspace, stream);
-    nvfp4_gdn_snapshot_post_launch(scratch.projected, conv_weight, conv_states, initial_slot, query,
-                                   key, value, z, stream);
+    nvfp4_gdn_snapshot_post_launch(scratch.projected, conv_weight, conv_states, initial_slot,
+                                   snapshot_base_slot, query, key, value, z, stream);
 }
 
 } // namespace ninfer::ops::detail

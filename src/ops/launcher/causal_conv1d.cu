@@ -132,7 +132,8 @@ void causal_conv1d_decode_launch(const Tensor& x, const Tensor& weight, const Te
 
 void causal_conv1d_sequence_snapshot_launch(const Tensor& x, const Tensor& weight,
                                             Tensor& conv_states, const Tensor& initial_slot,
-                                            Tensor& out, cudaStream_t stream) {
+                                            const Tensor& snapshot_base_slot, Tensor& out,
+                                            cudaStream_t stream) {
     const std::int32_t C = x.ne[0];
     const std::int32_t T = x.ne[1];
     const std::int64_t slot_stride =
@@ -146,6 +147,7 @@ void causal_conv1d_sequence_snapshot_launch(const Tensor& x, const Tensor& weigh
             static_cast<const __nv_bfloat16*>(weight.data),
             static_cast<__nv_bfloat16*>(conv_states.data),
             static_cast<const std::int32_t*>(initial_slot.data),
+            static_cast<const std::int32_t*>(snapshot_base_slot.data),
             static_cast<__nv_bfloat16*>(out.data), C, slot_stride);
     } else if (T <= kCausalConvParallelMaxTokens) {
         const dim3 block(kCausalConvChannelTile, static_cast<unsigned int>(T));
@@ -155,6 +157,7 @@ void causal_conv1d_sequence_snapshot_launch(const Tensor& x, const Tensor& weigh
             static_cast<const __nv_bfloat16*>(weight.data),
             static_cast<__nv_bfloat16*>(conv_states.data),
             static_cast<const std::int32_t*>(initial_slot.data),
+            static_cast<const std::int32_t*>(snapshot_base_slot.data),
             static_cast<__nv_bfloat16*>(out.data), C, T, slot_stride);
     } else {
         constexpr int kBlock = 32;
@@ -164,6 +167,7 @@ void causal_conv1d_sequence_snapshot_launch(const Tensor& x, const Tensor& weigh
             static_cast<const __nv_bfloat16*>(weight.data),
             static_cast<__nv_bfloat16*>(conv_states.data),
             static_cast<const std::int32_t*>(initial_slot.data),
+            static_cast<const std::int32_t*>(snapshot_base_slot.data),
             static_cast<__nv_bfloat16*>(out.data), C, T, slot_stride);
     }
     CUDA_CHECK(cudaGetLastError());

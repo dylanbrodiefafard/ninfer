@@ -174,22 +174,23 @@ void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeig
 
 void Variant::gdn_input_projection_snapshot(
     const Tensor& hidden, const GdnProjectionWeights& weights, const Tensor& conv_weight,
-    Tensor& conv_states, const Tensor& initial_slot, Tensor& query, Tensor& key, Tensor& value,
-    Tensor& output_gate, qwen3_6::TextPhase phase, WorkspaceArena& workspace, cudaStream_t stream) {
+    Tensor& conv_states, const Tensor& initial_slot, const Tensor& snapshot_base_slot,
+    Tensor& query, Tensor& key, Tensor& value, Tensor& output_gate, qwen3_6::TextPhase phase,
+    WorkspaceArena& workspace, cudaStream_t stream) {
     Tensor output_gate_flat =
         output_gate.view({TextConfig::value_dim, static_cast<int>(hidden.ne[1])});
     if (const auto* split =
             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
         ops::gdn_input_proj_conv_snapshot(hidden, split->query_key, split->value_z, conv_weight,
-                                          conv_states, initial_slot, query, key, value,
-                                          output_gate_flat, workspace, stream);
+                                          conv_states, initial_slot, snapshot_base_slot, query, key,
+                                          value, output_gate_flat, workspace, stream);
         return;
     }
     const Weight& fused =
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
-    ops::gdn_input_proj_conv_snapshot(hidden, fused, conv_weight, conv_states, initial_slot, query,
-                                      key, value, output_gate_flat, text_policy(phase, fused),
-                                      workspace, stream);
+    ops::gdn_input_proj_conv_snapshot(hidden, fused, conv_weight, conv_states, initial_slot,
+                                      snapshot_base_slot, query, key, value, output_gate_flat,
+                                      text_policy(phase, fused), workspace, stream);
 }
 
 void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,

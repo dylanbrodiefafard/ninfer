@@ -290,8 +290,9 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& qkv, Tens
 template <int ActiveCols>
 void launch_active_cols_conv_snapshot(const Tensor& x, const Weight& weight,
                                       const Tensor& conv_weight, Tensor& conv_states,
-                                      const Tensor& initial_slot, Tensor& query, Tensor& key,
-                                      Tensor& value, Tensor& z, cudaStream_t stream) {
+                                      const Tensor& initial_slot, const Tensor& snapshot_base_slot,
+                                      Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                      cudaStream_t stream) {
     static_assert(ActiveCols >= 2 && ActiveCols <= 16);
     constexpr int TileCols = ActiveCols <= 8 ? 8 : 16;
     using Geometry         = W8LinearGeometry<kRows, kHidden>;
@@ -303,6 +304,7 @@ void launch_active_cols_conv_snapshot(const Tensor& x, const Weight& weight,
             static_cast<const __nv_bfloat16*>(conv_weight.data),
             static_cast<__nv_bfloat16*>(conv_states.data),
             static_cast<const std::int32_t*>(initial_slot.data),
+            static_cast<const std::int32_t*>(snapshot_base_slot.data),
             static_cast<__nv_bfloat16*>(query.data),
             static_cast<__nv_bfloat16*>(key.data),
             static_cast<__nv_bfloat16*>(value.data),
@@ -335,7 +337,8 @@ void launch_medium_cols(const Tensor& x, const Weight& weight, Tensor& qkv, Tens
 
 using ProjectionLauncher = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, cudaStream_t);
 using SnapshotLauncher   = void (*)(const Tensor&, const Weight&, const Tensor&, Tensor&,
-                                  const Tensor&, Tensor&, Tensor&, Tensor&, Tensor&, cudaStream_t);
+                                  const Tensor&, const Tensor&, Tensor&, Tensor&, Tensor&, Tensor&,
+                                  cudaStream_t);
 
 template <std::size_t... Offsets>
 constexpr auto make_projection_launchers(std::index_sequence<Offsets...>) {
@@ -376,7 +379,8 @@ void w8_gdn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tenso
 
 void w8_gdn_input_splitk_conv_snapshot_launch(const Tensor& x, const Weight& weight,
                                               const Tensor& conv_weight, Tensor& conv_states,
-                                              const Tensor& initial_slot, Tensor& query,
+                                              const Tensor& initial_slot,
+                                              const Tensor& snapshot_base_slot, Tensor& query,
                                               Tensor& key, Tensor& value, Tensor& z,
                                               cudaStream_t stream) {
     const std::int32_t cols = x.ne[1];
@@ -384,7 +388,7 @@ void w8_gdn_input_splitk_conv_snapshot_launch(const Tensor& x, const Weight& wei
         throw std::invalid_argument("W8 fused GDN input snapshot requires T=2..16");
     }
     kSnapshotLaunchers[cols - kFirstExactCols](x, weight, conv_weight, conv_states, initial_slot,
-                                               query, key, value, z, stream);
+                                               snapshot_base_slot, query, key, value, z, stream);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -362,7 +362,8 @@ int main(int argc, char** argv) {
                 bench::make_bf16(static_cast<std::size_t>(kChannels) * 4);
             ninfer::DeviceBuffer conv_states =
                 bench::make_bf16(static_cast<std::size_t>(kChannels) * 3 * slots);
-            ninfer::DeviceBuffer initial_slot = make_i32(max_t);
+            ninfer::DeviceBuffer initial_slot       = make_i32(max_t);
+            ninfer::DeviceBuffer snapshot_base_slot = make_i32(0);
             ninfer::DeviceBuffer q(static_cast<std::size_t>(kQueryRows) * max_t * 2);
             ninfer::DeviceBuffer k(static_cast<std::size_t>(kKeyRows) * max_t * 2);
             ninfer::DeviceBuffer v(static_cast<std::size_t>(kValueRows) * max_t * 2);
@@ -378,6 +379,7 @@ int main(int argc, char** argv) {
                 Tensor tw(conv_weight.p, DType::BF16, {kChannels, 4});
                 Tensor states(conv_states.p, DType::BF16, {kChannels, 3, slots});
                 Tensor slot(initial_slot.p, DType::I32, {1});
+                Tensor snapshot_base(snapshot_base_slot.p, DType::I32, {1});
                 Tensor tq(q.p, DType::BF16, {kQueryRows, t});
                 Tensor tk(k.p, DType::BF16, {kKeyRows, t});
                 Tensor tv(v.p, DType::BF16, {kValueRows, t});
@@ -395,12 +397,14 @@ int main(int argc, char** argv) {
                     {kHidden, kChannels, kValueRows, kGdnRows, kHidden, t});
                 run(ops::detail::w8_gdn_input_snapshot_schedule_name(snapshot_plan.schedule),
                     [&](cudaStream_t s) {
-                        ops::gdn_input_proj_conv_snapshot(x, packed.weight, tw, states, slot, tq,
-                                                          tk, tv, tz, snapshot_workspace, s);
+                        ops::gdn_input_proj_conv_snapshot(x, packed.weight, tw, states, slot,
+                                                          snapshot_base, tq, tk, tv, tz,
+                                                          snapshot_workspace, s);
                     });
                 run("composed_control", [&](cudaStream_t s) {
                     ops::gdn_input_proj(x, packed.weight, tqkv, tz, s);
-                    ops::causal_conv1d_silu_snapshot(tqkv, tw, states, slot, tconvolved, s);
+                    ops::causal_conv1d_silu_snapshot(tqkv, tw, states, slot, snapshot_base,
+                                                     tconvolved, s);
                     ops::extract_bf16_columns(tconvolved, 0, tq, s);
                     ops::extract_bf16_columns(tconvolved, kQueryRows, tk, s);
                     ops::extract_bf16_columns(tconvolved, kQueryRows + kKeyRows, tv, s);

@@ -1,5 +1,5 @@
 #include "core/device.h"
-#include <ninfer/targets/qwen3_6/decoder_state.h>
+#include "core/linear_attention_state.h"
 
 #include <cuda_runtime.h>
 
@@ -10,26 +10,25 @@
 
 namespace {
 
-namespace q36 = ninfer::targets::qwen3_6;
-
 struct PlannedState {
-    q36::GdnStateLayout layout;
+    ninfer::LinearAttentionStatePoolLayout layout;
     std::size_t bytes = 0;
 };
 
-PlannedState plan_state(std::uint32_t layers, std::int32_t conv_dim, std::int32_t conv_width,
+PlannedState plan_state(std::uint32_t layers, std::int32_t conv_channels, std::int32_t conv_width,
                         std::int32_t value_heads, std::int32_t value_head_dim,
-                        std::int32_t key_head_dim, std::int32_t snapshot_slots = 1,
+                        std::int32_t key_head_dim, std::int32_t slot_count = 1,
                         ninfer::DType conv_dtype = ninfer::DType::BF16) {
     ninfer::LayoutBuilder builder;
-    auto layout = q36::plan_gdn_state(builder, q36::GdnStateSpec{.layers         = layers,
-                                                                 .conv_dim       = conv_dim,
-                                                                 .conv_width     = conv_width,
-                                                                 .value_heads    = value_heads,
-                                                                 .value_head_dim = value_head_dim,
-                                                                 .key_head_dim   = key_head_dim,
-                                                                 .snapshot_slots = snapshot_slots,
-                                                                 .conv_dtype     = conv_dtype});
+    auto layout = ninfer::plan_linear_attention_state_pool(
+        builder, ninfer::LinearAttentionStatePoolSpec{.layers         = layers,
+                                                      .conv_channels  = conv_channels,
+                                                      .conv_width     = conv_width,
+                                                      .value_heads    = value_heads,
+                                                      .value_head_dim = value_head_dim,
+                                                      .key_head_dim   = key_head_dim,
+                                                      .slot_count     = slot_count,
+                                                      .conv_dtype     = conv_dtype});
     return PlannedState{std::move(layout), builder.finish(256)};
 }
 
@@ -48,13 +47,14 @@ int expect_size(std::size_t actual, std::size_t expected, const char* label) {
     return 1;
 }
 
-int check_shape(const ninfer::Tensor& t, const std::int32_t (&expected)[4], const char* label) {
+int check_shape(const ninfer::Tensor& tensor, const std::int32_t (&expected)[4],
+                const char* label) {
     int failures = 0;
     for (int i = 0; i < 4; ++i) {
-        if (t.ne[i] != expected[i]) {
+        if (tensor.ne[i] != expected[i]) {
             ++failures;
-            std::cerr << label << ".ne[" << i << "] expected " << expected[i] << ", got " << t.ne[i]
-                      << '\n';
+            std::cerr << label << ".ne[" << i << "] expected " << expected[i] << ", got "
+                      << tensor.ne[i] << '\n';
         }
     }
     return failures;
@@ -94,90 +94,103 @@ int main() {
     int failures = 0;
     ninfer::DeviceContext ctx(0);
     auto state_plan = plan_state(3, 10, 3, 4, 5, 6);
-    ninfer::DeviceArena cache_arena(state_plan.bytes);
-    q36::GdnStateStore state({cache_arena.base(), cache_arena.capacity()}, state_plan.layout);
+    ninfer::DeviceArena state_arena(state_plan.bytes);
+    CUDA_CHECK(cudaMemset(state_arena.base(), 0x4a, state_arena.capacity()));
+    ninfer::LinearAttentionStatePool state({state_arena.base(), state_arena.capacity()},
+                                           state_plan.layout);
 
     failures += expect_size(state.layer_count(), 3, "state.layer_count");
+    failures += expect_size(state.slot_count(), 1, "state.slot_count");
     failures += expect_size(state.conv.size(), 3, "state.conv.size");
-    failures += expect_size(state.ssm.size(), 3, "state.ssm.size");
+    failures += expect_size(state.recurrent.size(), 3, "state.recurrent.size");
     failures += expect_size(state.spec.conv_width, 3, "state.conv_width");
-    failures += expect_size(state.spec.snapshot_slots, 1, "state.snapshot_slots");
+    failures += expect_size(state.conv_slot_stride_elements(), 30, "state.conv slot stride");
+    failures +=
+        expect_size(state.recurrent_slot_stride_elements(), 120, "state recurrent slot stride");
     for (std::size_t layer = 0; layer < state.layer_count(); ++layer) {
         failures += check_shape(state.conv[layer], {10, 3, 1, 1}, "state.conv");
-        failures += check_shape(state.ssm[layer], {6, 5, 4, 1}, "state.ssm");
+        failures += check_shape(state.recurrent[layer], {6, 5, 4, 1}, "state.recurrent");
         failures += check_shape(state.conv_slot(static_cast<std::uint32_t>(layer), 0),
                                 {10, 3, 1, 1}, "state.conv_slot");
-        failures += check_shape(state.ssm_slot(static_cast<std::uint32_t>(layer), 0), {6, 5, 4, 1},
-                                "state.ssm_slot");
+        failures += check_shape(state.recurrent_slot(static_cast<std::uint32_t>(layer), 0),
+                                {6, 5, 4, 1}, "state.recurrent_slot");
         if (state.conv[layer].dtype != ninfer::DType::BF16) {
             ++failures;
             std::cerr << "conv dtype is not BF16\n";
         }
-        if (state.ssm[layer].dtype != ninfer::DType::FP32) {
+        if (state.recurrent[layer].dtype != ninfer::DType::FP32) {
             ++failures;
-            std::cerr << "ssm dtype is not FP32\n";
+            std::cerr << "recurrent dtype is not FP32\n";
         }
-        if (state.conv[layer].data == state.ssm[layer].data) {
+        if (state.conv[layer].data == state.recurrent[layer].data) {
             ++failures;
-            std::cerr << "conv/ssm alias for layer " << layer << '\n';
+            std::cerr << "conv/recurrent alias for layer " << layer << '\n';
         }
-        failures += expect_device_byte(state.conv[layer], 0, "initial conv");
-        failures += expect_device_byte(state.ssm[layer], 0, "initial ssm");
+        failures += expect_device_byte(state.conv[layer], 0x4a, "constructor-mutated conv");
+        failures +=
+            expect_device_byte(state.recurrent[layer], 0x4a, "constructor-mutated recurrent");
+    }
+    if (state.conv[0].data == state.conv[1].data ||
+        state.recurrent[0].data == state.recurrent[1].data) {
+        ++failures;
+        std::cerr << "state layers alias\n";
     }
 
-    CUDA_CHECK(cudaMemset(state.conv[0].data, 0x7a, state.conv[0].bytes()));
-    CUDA_CHECK(cudaMemset(state.ssm[1].data, 0x5c, state.ssm[1].bytes()));
-    failures += expect_device_byte(state.conv[0], 0x7a, "sentinel conv0");
-    failures += expect_device_byte(state.conv[1], 0, "untouched conv1");
-    failures += expect_device_byte(state.ssm[0], 0, "untouched ssm0");
-    failures += expect_device_byte(state.ssm[1], 0x5c, "sentinel ssm1");
-
-    state.reset_running(ctx.stream);
+    state.zero_slot(0, ctx.stream);
     ctx.synchronize();
-    failures += expect_device_byte(state.conv[0], 0, "reset conv0");
-    failures += expect_device_byte(state.ssm[1], 0, "reset ssm1");
+    failures += expect_device_byte(state.conv[0], 0, "zeroed conv");
+    failures += expect_device_byte(state.recurrent[1], 0, "zeroed recurrent");
 
     auto slotted_plan = plan_state(2, 10, 3, 4, 5, 6, 3);
     ninfer::DeviceArena slotted_arena(slotted_plan.bytes);
-    q36::GdnStateStore slotted({slotted_arena.base(), slotted_arena.capacity()},
-                               slotted_plan.layout);
-    failures += expect_size(slotted.spec.snapshot_slots, 3, "slotted.snapshot_slots");
+    CUDA_CHECK(cudaMemset(slotted_arena.base(), 0, slotted_arena.capacity()));
+    ninfer::LinearAttentionStatePool slotted({slotted_arena.base(), slotted_arena.capacity()},
+                                             slotted_plan.layout);
+    failures += expect_size(slotted.slot_count(), 3, "slotted.slot_count");
     failures += check_shape(slotted.conv[0], {10, 3, 3, 1}, "slotted.conv");
-    failures += check_shape(slotted.ssm[0], {6, 5, 4, 3}, "slotted.ssm");
+    failures += check_shape(slotted.recurrent[0], {6, 5, 4, 3}, "slotted.recurrent");
     failures += check_shape(slotted.conv_slot(0, 2), {10, 3, 1, 1}, "slotted.conv_slot");
-    failures += check_shape(slotted.ssm_slot(0, 2), {6, 5, 4, 1}, "slotted.ssm_slot");
-    ninfer::Tensor conv0        = slotted.conv_slot(0, 0);
-    ninfer::Tensor conv1        = slotted.conv_slot(0, 1);
-    ninfer::Tensor ssm0         = slotted.ssm_slot(0, 0);
-    ninfer::Tensor ssm1         = slotted.ssm_slot(0, 1);
-    ninfer::Tensor conv1_layer1 = slotted.conv_slot(1, 1);
-    ninfer::Tensor ssm1_layer1  = slotted.ssm_slot(1, 1);
+    failures += check_shape(slotted.recurrent_slot(0, 2), {6, 5, 4, 1}, "slotted.recurrent_slot");
+
+    ninfer::Tensor conv0             = slotted.conv_slot(0, 0);
+    ninfer::Tensor conv1             = slotted.conv_slot(0, 1);
+    ninfer::Tensor recurrent0        = slotted.recurrent_slot(0, 0);
+    ninfer::Tensor recurrent1        = slotted.recurrent_slot(0, 1);
+    ninfer::Tensor conv1_layer1      = slotted.conv_slot(1, 1);
+    ninfer::Tensor recurrent1_layer1 = slotted.recurrent_slot(1, 1);
     CUDA_CHECK(cudaMemset(conv0.data, 0x7a, conv0.bytes()));
     CUDA_CHECK(cudaMemset(conv1.data, 0x6b, conv1.bytes()));
-    CUDA_CHECK(cudaMemset(ssm0.data, 0x5c, ssm0.bytes()));
-    CUDA_CHECK(cudaMemset(ssm1.data, 0x4d, ssm1.bytes()));
+    CUDA_CHECK(cudaMemset(recurrent0.data, 0x5c, recurrent0.bytes()));
+    CUDA_CHECK(cudaMemset(recurrent1.data, 0x4d, recurrent1.bytes()));
     CUDA_CHECK(cudaMemset(conv1_layer1.data, 0x3c, conv1_layer1.bytes()));
-    CUDA_CHECK(cudaMemset(ssm1_layer1.data, 0x2d, ssm1_layer1.bytes()));
-    failures += expect_device_byte(conv0, 0x7a, "slotted sentinel conv slot0");
-    failures += expect_device_byte(conv1, 0x6b, "slotted sentinel conv slot1");
-    failures += expect_device_byte(ssm0, 0x5c, "slotted sentinel ssm slot0");
-    failures += expect_device_byte(ssm1, 0x4d, "slotted sentinel ssm slot1");
+    CUDA_CHECK(cudaMemset(recurrent1_layer1.data, 0x2d, recurrent1_layer1.bytes()));
 
     slotted.copy_slot(1, 2, ctx.stream);
     ctx.synchronize();
-    failures += expect_device_byte(slotted.conv_slot(0, 2), 0x6b, "copied conv snapshot");
-    failures += expect_device_byte(slotted.ssm_slot(0, 2), 0x4d, "copied ssm snapshot");
-    failures += expect_device_byte(slotted.conv_slot(1, 2), 0x3c, "copied conv snapshot layer1");
-    failures += expect_device_byte(slotted.ssm_slot(1, 2), 0x2d, "copied ssm snapshot layer1");
+    failures += expect_device_byte(slotted.conv_slot(0, 2), 0x6b, "copied conv slot");
+    failures += expect_device_byte(slotted.recurrent_slot(0, 2), 0x4d, "copied recurrent slot");
+    failures += expect_device_byte(slotted.conv_slot(1, 2), 0x3c, "copied conv layer1");
+    failures += expect_device_byte(slotted.recurrent_slot(1, 2), 0x2d, "copied recurrent layer1");
 
-    slotted.reset_running(ctx.stream);
+    slotted.zero_slot(0, ctx.stream);
     ctx.synchronize();
-    failures += expect_device_byte(slotted.conv_slot(0, 0), 0, "slotted reset conv slot0");
-    failures += expect_device_byte(slotted.conv_slot(0, 1), 0x6b, "slotted reset keeps conv slot1");
-    failures += expect_device_byte(slotted.conv_slot(0, 2), 0x6b, "slotted reset keeps conv slot2");
-    failures += expect_device_byte(slotted.ssm_slot(0, 0), 0, "slotted reset ssm slot0");
-    failures += expect_device_byte(slotted.ssm_slot(0, 1), 0x4d, "slotted reset keeps ssm slot1");
-    failures += expect_device_byte(slotted.ssm_slot(0, 2), 0x4d, "slotted reset keeps ssm slot2");
+    failures += expect_device_byte(slotted.conv_slot(0, 0), 0, "zeroed conv slot0");
+    failures += expect_device_byte(slotted.recurrent_slot(0, 0), 0, "zeroed recurrent slot0");
+    failures += expect_device_byte(slotted.conv_slot(0, 1), 0x6b, "zero kept conv slot1");
+    failures += expect_device_byte(slotted.recurrent_slot(0, 1), 0x4d, "zero kept recurrent slot1");
+    failures += expect_device_byte(slotted.conv_slot(0, 2), 0x6b, "zero kept conv slot2");
+    failures += expect_device_byte(slotted.recurrent_slot(0, 2), 0x4d, "zero kept recurrent slot2");
 
-    return failures == 0 ? 0 : fail("state store test failed");
+    auto fp32_conv_plan = plan_state(1, 7, 2, 2, 3, 4, 2, ninfer::DType::FP32);
+    ninfer::DeviceArena fp32_conv_arena(fp32_conv_plan.bytes);
+    ninfer::LinearAttentionStatePool fp32_conv({fp32_conv_arena.base(), fp32_conv_arena.capacity()},
+                                               fp32_conv_plan.layout);
+    if (fp32_conv.conv[0].dtype != ninfer::DType::FP32) {
+        ++failures;
+        std::cerr << "FP32 conv geometry did not retain its dtype\n";
+    }
+    failures += check_shape(fp32_conv.conv[0], {7, 2, 2, 1}, "fp32_conv.conv");
+    failures += check_shape(fp32_conv.recurrent[0], {4, 3, 2, 2}, "fp32_conv.recurrent");
+
+    return failures == 0 ? 0 : fail("linear attention state pool test failed");
 }

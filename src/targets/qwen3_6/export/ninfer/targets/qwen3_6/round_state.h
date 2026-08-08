@@ -40,7 +40,8 @@ struct RoundStateLayout {
     TensorRegion rope_delta;
     TensorRegion logits;
     TensorRegion verify_hidden;
-    TensorRegion gdn_initial_slot;
+    TensorRegion linear_state_read_slot;
+    TensorRegion linear_state_snapshot_base_slot;
     SpeculativeRoundStateLayout speculative;
     std::optional<MtpRoundStateLayout> mtp;
     bool complete = false;
@@ -83,7 +84,8 @@ struct RoundState {
     Tensor rope_delta;
     Tensor logits;
     Tensor verify_hidden;
-    Tensor gdn_initial_slot;
+    Tensor linear_state_read_slot;
+    Tensor linear_state_snapshot_base_slot;
     SpeculativeRoundState speculative;
     std::optional<MtpRoundState> mtp;
 

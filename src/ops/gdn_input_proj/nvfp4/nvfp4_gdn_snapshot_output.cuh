@@ -48,13 +48,14 @@ struct Nvfp4GdnSnapshotOutput {
 template <int Tokens>
 Nvfp4GdnSnapshotOutput<Tokens>
 make_nvfp4_gdn_snapshot_output(const Tensor& conv_weight, Tensor& conv_states,
-                               const Tensor& initial_slot, Tensor& query, Tensor& key,
-                               Tensor& value, Tensor& z) {
+                               const Tensor& initial_slot, const Tensor& snapshot_base_slot,
+                               Tensor& query, Tensor& key, Tensor& value, Tensor& z) {
     return {
         {
             static_cast<const __nv_bfloat16*>(conv_weight.data),
             static_cast<__nv_bfloat16*>(conv_states.data),
             static_cast<const std::int32_t*>(initial_slot.data),
+            static_cast<const std::int32_t*>(snapshot_base_slot.data),
             static_cast<__nv_bfloat16*>(query.data),
             static_cast<__nv_bfloat16*>(key.data),
             static_cast<__nv_bfloat16*>(value.data),

@@ -30,12 +30,14 @@ using Q4ScheduleC4 = Q4RowSplitSimtGemmSchedule<8, 4, 16, 2, Cache::ca, 1>;
 using Q4ScheduleC8 = Q4RowSplitSimtGemmSchedule<8, 8, 16, 2, Cache::ca, 1>;
 
 GdnConvSnapshotEpilogue make_epilogue(const Tensor& conv_weight, Tensor& conv_states,
-                                      const Tensor& initial_slot, Tensor& query, Tensor& key,
-                                      Tensor& value, int global_row_offset) {
+                                      const Tensor& initial_slot, const Tensor& snapshot_base_slot,
+                                      Tensor& query, Tensor& key, Tensor& value,
+                                      int global_row_offset) {
     return {
         static_cast<const __nv_bfloat16*>(conv_weight.data),
         static_cast<__nv_bfloat16*>(conv_states.data),
         static_cast<const std::int32_t*>(initial_slot.data),
+        static_cast<const std::int32_t*>(snapshot_base_slot.data),
         static_cast<__nv_bfloat16*>(query.data),
         static_cast<__nv_bfloat16*>(key.data),
         static_cast<__nv_bfloat16*>(value.data),
@@ -187,12 +189,14 @@ void launch_small_t(const Tensor& x, const Weight& qk_weight, const Weight& valu
 void q4_q5_gdn_input_conv_snapshot_launch(const Tensor& x, const Weight& qk_weight,
                                           const Weight& value_z_weight, const Tensor& conv_weight,
                                           Tensor& conv_states, const Tensor& initial_slot,
-                                          Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                          const Tensor& snapshot_base_slot, Tensor& query,
+                                          Tensor& key, Tensor& value, Tensor& z,
                                           cudaStream_t stream) {
-    const GdnConvSnapshotEpilogue qk_epilogue =
-        make_epilogue(conv_weight, conv_states, initial_slot, query, key, value, 0);
+    const GdnConvSnapshotEpilogue qk_epilogue = make_epilogue(
+        conv_weight, conv_states, initial_slot, snapshot_base_slot, query, key, value, 0);
     const GdnConvSnapshotEpilogue value_epilogue =
-        make_epilogue(conv_weight, conv_states, initial_slot, query, key, value, kValueOffset);
+        make_epilogue(conv_weight, conv_states, initial_slot, snapshot_base_slot, query, key, value,
+                      kValueOffset);
 
     switch (x.ne[1]) {
     case 1:
@@ -224,8 +228,8 @@ void q4_q5_gdn_input_conv_snapshot_launch(const Tensor& x, const Weight& qk_weig
 
 void q4_q5_gdn_input_t4_post_snapshot_launch(const Tensor& projected, const Tensor& conv_weight,
                                              Tensor& conv_states, const Tensor& initial_slot,
-                                             Tensor& query, Tensor& key, Tensor& value,
-                                             cudaStream_t stream) {
+                                             const Tensor& snapshot_base_slot, Tensor& query,
+                                             Tensor& key, Tensor& value, cudaStream_t stream) {
     if (projected.ne[1] != 4) {
         throw std::invalid_argument("Q4/Q5 staged GDN post projection requires T=4");
     }
@@ -236,6 +240,7 @@ void q4_q5_gdn_input_t4_post_snapshot_launch(const Tensor& projected, const Tens
                                          static_cast<const __nv_bfloat16*>(conv_weight.data),
                                          static_cast<__nv_bfloat16*>(conv_states.data),
                                          static_cast<const std::int32_t*>(initial_slot.data),
+                                         static_cast<const std::int32_t*>(snapshot_base_slot.data),
                                          static_cast<__nv_bfloat16*>(query.data),
                                          static_cast<__nv_bfloat16*>(key.data),
                                          static_cast<__nv_bfloat16*>(value.data));

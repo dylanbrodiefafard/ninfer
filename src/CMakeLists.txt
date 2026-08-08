@@ -19,6 +19,7 @@ add_library(ninfer_core STATIC
   core/device.cu
   core/dtype.cpp
   core/kv_cache.cpp
+  core/linear_attention_state.cpp
   core/layout.cpp
   core/tensor.cpp
   core/decode_graph.cpp

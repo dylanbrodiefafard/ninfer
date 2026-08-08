@@ -562,8 +562,9 @@ BenchRow run_snapshot(const Options& options, std::int32_t tokens, DeviceBuffer&
         static_cast<std::size_t>(gated_delta_net_detail::kStateDim) * problem.qk_heads * tokens;
     const std::size_t state_elements = static_cast<std::size_t>(gated_delta_net_detail::kStateDim) *
                                        gated_delta_net_detail::kStateDim * problem.value_heads;
-    DeviceBuffer states       = make_zeros(state_elements * kSnapshotSlots * sizeof(float));
-    DeviceBuffer initial_slot = make_scalar_i32(kSnapshotInitialSlot);
+    DeviceBuffer states             = make_zeros(state_elements * kSnapshotSlots * sizeof(float));
+    DeviceBuffer initial_slot       = make_scalar_i32(kSnapshotInitialSlot);
+    DeviceBuffer snapshot_base_slot = make_scalar_i32(0);
     DeviceBuffer q_normalized;
     DeviceBuffer k_normalized;
     if (options.qk_norm == "composed") {
@@ -581,6 +582,7 @@ BenchRow run_snapshot(const Options& options, std::int32_t tokens, DeviceBuffer&
                       {gated_delta_net_detail::kStateDim, gated_delta_net_detail::kStateDim,
                        problem.value_heads, kSnapshotSlots});
     Tensor initial(initial_slot.p, DType::I32, {1});
+    Tensor snapshot_base(snapshot_base_slot.p, DType::I32, {1});
     Tensor q_norm;
     Tensor k_norm;
     if (options.qk_norm == "composed") {
@@ -599,7 +601,8 @@ BenchRow run_snapshot(const Options& options, std::int32_t tokens, DeviceBuffer&
         const Tensor& q_input = composed ? q_norm : q;
         const Tensor& k_input = composed ? k_norm : k;
         ops::gated_delta_net_snapshot(q_input, k_input, v, g, beta, gated_delta_net_scale(),
-                                              !composed, ssm_states, initial, out, launch_stream);
+                                              !composed, ssm_states, initial, snapshot_base, out,
+                                              launch_stream);
     };
     const GraphMeasurement measurement = measure_graph(launch, flush, stream, options);
     const TrafficBytes traffic         = snapshot_traffic(problem, composed);

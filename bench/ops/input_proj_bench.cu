@@ -758,6 +758,7 @@ void run_direct_gdn_snapshot(const Options& options, DeviceBuffer& flush, cudaSt
         bench::make_zeros(static_cast<std::size_t>(kChannels) * 3 * slots * 2);
     DeviceBuffer initial_slot(sizeof(std::int32_t));
     initial_slot.copy_from_host(&initial_slot_value, sizeof(initial_slot_value));
+    DeviceBuffer snapshot_base_slot = bench::make_zeros(sizeof(std::int32_t));
     DeviceBuffer query(static_cast<std::size_t>(kQueryRows) * max_t * 2);
     DeviceBuffer key(static_cast<std::size_t>(kKeyRows) * max_t * 2);
     DeviceBuffer value(static_cast<std::size_t>(kValueRows) * max_t * 2);
@@ -773,12 +774,14 @@ void run_direct_gdn_snapshot(const Options& options, DeviceBuffer& flush, cudaSt
             Tensor conv(conv_weight.p, DType::BF16, {kChannels, 4});
             Tensor states(conv_states.p, DType::BF16, {kChannels, 3, slots});
             Tensor initial(initial_slot.p, DType::I32, {1});
+            Tensor snapshot_base(snapshot_base_slot.p, DType::I32, {1});
             Tensor q(query.p, DType::BF16, {kQueryRows, t});
             Tensor k(key.p, DType::BF16, {kKeyRows, t});
             Tensor v(value.p, DType::BF16, {kValueRows, t});
             Tensor z_output(z.p, DType::BF16, {kZRows, t});
-            ops::gdn_input_proj_conv_snapshot(x, packed.weight, conv, states, initial, q, k, v,
-                                              z_output, options.policy, workspace, launch_stream);
+            ops::gdn_input_proj_conv_snapshot(x, packed.weight, conv, states, initial,
+                                              snapshot_base, q, k, v, z_output, options.policy,
+                                              workspace, launch_stream);
         };
     };
 
@@ -917,7 +920,8 @@ int main(int argc, char** argv) {
             ninfer::DeviceBuffer conv_states =
                 bench::make_zeros(static_cast<std::size_t>(kGdnRows) * 3 * kGdnSlots * 2);
             ninfer::DeviceBuffer initial_slot(sizeof(std::int32_t));
-            constexpr std::int32_t kInitialSlot = 6;
+            ninfer::DeviceBuffer snapshot_base_slot = bench::make_zeros(sizeof(std::int32_t));
+            constexpr std::int32_t kInitialSlot     = 6;
             CUDA_CHECK(cudaMemcpy(initial_slot.p, &kInitialSlot, sizeof(kInitialSlot),
                                   cudaMemcpyHostToDevice));
 
@@ -934,6 +938,7 @@ int main(int argc, char** argv) {
                 Tensor conv_w(conv_weight.p, DType::BF16, {kGdnRows, 4});
                 Tensor states(conv_states.p, DType::BF16, {kGdnRows, 3, kGdnSlots});
                 Tensor initial(initial_slot.p, DType::I32, {1});
+                Tensor snapshot_base(snapshot_base_slot.p, DType::I32, {1});
                 const auto production = [&](cudaStream_t launch_stream) {
                     ops::gdn_input_proj(x, qk_weight.weight, value_z_weight.weight, out, z,
                                         launch_stream);
@@ -944,8 +949,8 @@ int main(int argc, char** argv) {
                 if (t <= 6) {
                     const auto fused_snapshot = [&](cudaStream_t launch_stream) {
                         ops::gdn_input_proj_conv_snapshot(
-                            x, qk_weight.weight, value_z_weight.weight, conv_w, states, initial, tq,
-                            tk, tv, z, workspace, launch_stream);
+                            x, qk_weight.weight, value_z_weight.weight, conv_w, states, initial,
+                            snapshot_base, tq, tk, tv, z, workspace, launch_stream);
                     };
                     append_result(results, "gdn", "fused_projection_conv_snapshot", t,
                                   bench::measure_cold_launch(fused_snapshot, flush, stream,
@@ -953,8 +958,8 @@ int main(int argc, char** argv) {
                     const auto composed_snapshot = [&](cudaStream_t launch_stream) {
                         ops::gdn_input_proj(x, qk_weight.weight, value_z_weight.weight, out, z,
                                             launch_stream);
-                        ops::causal_conv1d_silu_snapshot(out, conv_w, states, initial, convolved,
-                                                         launch_stream);
+                        ops::causal_conv1d_silu_snapshot(out, conv_w, states, initial,
+                                                         snapshot_base, convolved, launch_stream);
                         ops::extract_bf16_columns(convolved, 0, tq, launch_stream);
                         ops::extract_bf16_columns(convolved, kGdnKeyRows, tk, launch_stream);
                         ops::extract_bf16_columns(convolved, 2 * kGdnKeyRows, tv, launch_stream);

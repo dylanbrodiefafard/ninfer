@@ -40,7 +40,8 @@ void speculative_verify_and_accept(State& state, TextContext& card, std::uint32_
         spec.target_argmax, state.io.logits, spec.draft_tokens, state.io.pos, state.io.token,
         spec.round_tokens, spec.produced_count, spec.accepted_drafts, spec.stats,
         TextConfig::token_domain, state.sampling, state.work, state.device.stream);
-    ops::assign_i32_scalar(spec.accepted_drafts, state.io.gdn_initial_slot, state.device.stream);
+    ops::add_i32_scalars(spec.accepted_drafts, state.io.linear_state_snapshot_base_slot,
+                         state.io.linear_state_read_slot, state.device.stream);
     ops::speculative_select_accepted_hidden(state.io.verify_hidden, spec.accepted_drafts,
                                             *state.tail_hidden, state.device.stream);
 }
