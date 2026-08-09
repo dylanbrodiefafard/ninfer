@@ -1,6 +1,6 @@
 // Qualification benchmark for Qwen3.6-35B G2 sampling and G3 MTP accept.
 //
-//   ./ninfer_sampling_select_bench --sample --mode stochastic
+//   ./ninfer_sampling_select_bench --sample --batch 8 --mode stochastic
 //   ./ninfer_sampling_select_bench --mtp --mode stochastic --mtp-k 5
 //   ./ninfer_sampling_select_bench --matrix
 #include "core/device.h"
@@ -11,6 +11,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -39,13 +40,14 @@ struct Options {
     bool matrix        = false;
     bool counts_active = true;
     Mode mode          = Mode::Stochastic;
+    int batch          = 1;
     int mtp_k          = 3;
     int top_k          = 20;
 };
 
 void usage(const char* argv0) {
     std::printf("usage: %s [--sample|--mtp|--matrix] [--mode greedy|stochastic] "
-                "[--mtp-k 1..5] [--top-k 1..20] [--no-counts]\n",
+                "[--batch 1..8] [--mtp-k 1..5] [--top-k 1..20] [--no-counts]\n",
                 argv0);
 }
 
@@ -85,6 +87,8 @@ Options parse_args(int argc, char** argv) {
             } else {
                 throw std::invalid_argument("--mode must be greedy or stochastic");
             }
+        } else if (arg == "--batch") {
+            options.batch = parse_int(need_value("--batch"), "--batch");
         } else if (arg == "--mtp-k") {
             options.mtp_k = parse_int(need_value("--mtp-k"), "--mtp-k");
         } else if (arg == "--top-k") {
@@ -104,6 +108,9 @@ Options parse_args(int argc, char** argv) {
     }
     if (options.mtp_k < 1 || options.mtp_k > 5) {
         throw std::invalid_argument("--mtp-k must be in [1,5]");
+    }
+    if (options.batch < 1 || options.batch > 8) {
+        throw std::invalid_argument("--batch must be in [1,8]");
     }
     if (options.top_k < 1 || options.top_k > 20) {
         throw std::invalid_argument("--top-k must be in [1,20]");
@@ -154,34 +161,55 @@ DeviceBuffer make_config(DeviceBuffer& counts, Mode mode, bool counts_active, in
     return device;
 }
 
+DeviceBuffer make_batch_configs(DeviceBuffer& counts, int batch, Mode mode, bool counts_active,
+                                int top_k) {
+    std::vector<ops::SamplingConfig> configs(static_cast<std::size_t>(batch));
+    for (int row = 0; row < batch; ++row) {
+        ops::SamplingConfig& config = configs[static_cast<std::size_t>(row)];
+        config.temperature          = mode == Mode::Greedy ? 0.0f : 0.6f;
+        config.top_k                = top_k;
+        config.top_p                = 0.95f;
+        config.presence_penalty     = mode == Mode::Stochastic && counts_active ? 1.0f : 0.0f;
+        config.seed                 = 20260716ull + static_cast<unsigned long long>(row);
+        config.token_counts         = mode == Mode::Stochastic && counts_active
+                                          ? static_cast<std::int32_t*>(counts.p) +
+                                        static_cast<std::size_t>(row) * kTokenDomain
+                                          : nullptr;
+    }
+    DeviceBuffer device(configs.size() * sizeof(ops::SamplingConfig));
+    CUDA_CHECK(cudaMemcpy(device.p, configs.data(), device.bytes, cudaMemcpyHostToDevice));
+    return device;
+}
+
 double stochastic_payload_bytes(int cols, bool counts_active) {
     const double per_col = static_cast<double>(kTokenDomain) * 2.0 +
                            (counts_active ? static_cast<double>(kTokenDomain) * 4.0 : 0.0);
     return per_col * static_cast<double>(cols);
 }
 
-void run_sample(DeviceBuffer& logits, DeviceBuffer& counts, Mode mode, bool counts_active,
-                int top_k) {
+void run_sample(DeviceBuffer& logits, DeviceBuffer& counts, int batch, Mode mode,
+                bool counts_active, int top_k) {
     CUDA_CHECK(cudaMemset(counts.p, 0, counts.bytes));
-    DeviceBuffer config = make_config(counts, mode, counts_active, top_k);
-    DeviceBuffer out(sizeof(std::int32_t));
-    DeviceBuffer pos(sizeof(std::int32_t));
-    CUDA_CHECK(cudaMemset(pos.p, 0, pos.bytes));
-    Tensor tlogits(logits.p, DType::BF16, {kPhysicalRows, 1});
-    Tensor tout(out.p, DType::I32, {1});
-    WorkspaceArena workspace(ops::sampling_workspace_capacity_bytes(kTokenDomain, 1, 1));
-    const auto* config_ptr = static_cast<const ops::SamplingConfig*>(config.p);
-    const auto* pos_ptr    = static_cast<const std::int32_t*>(pos.p);
+    DeviceBuffer configs = make_batch_configs(counts, batch, mode, counts_active, top_k);
+    DeviceBuffer out(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(batch));
+    for (int row = 0; row < batch; ++row) { positions[static_cast<std::size_t>(row)] = 4096 + row; }
+    DeviceBuffer device_positions = make_i32(positions);
+    Tensor tlogits(logits.p, DType::BF16, {kPhysicalRows, batch});
+    Tensor tout(out.p, DType::I32, {batch});
+    Tensor tpositions(device_positions.p, DType::I32, {batch});
+    WorkspaceArena workspace(ops::sampling_workspace_capacity_bytes(kTokenDomain, batch, batch));
+    const auto* config_ptr = static_cast<const ops::SamplingConfig*>(configs.p);
 
-    const double bytes  = mode == Mode::Greedy ? static_cast<double>(kTokenDomain) * 2.0
-                                               : stochastic_payload_bytes(1, counts_active);
+    const double bytes  = mode == Mode::Greedy ? static_cast<double>(kTokenDomain) * 2.0 * batch
+                                               : stochastic_payload_bytes(batch, counts_active);
     const Result result = bench_loop(
         [&](cudaStream_t stream) {
-            ops::sample(tlogits, tout, kTokenDomain, config_ptr, pos_ptr, ops::kSamplePurposeDecode,
-                        workspace, stream);
+            ops::sample(tlogits, tout, kTokenDomain, config_ptr, tpositions,
+                        ops::kSamplePurposeDecode, workspace, stream);
         },
         bytes);
-    const std::string label = std::string("G2 ") +
+    const std::string label = std::string("G2 B=") + std::to_string(batch) + " " +
                               (mode == Mode::Greedy ? "greedy" : "stochastic") +
                               (counts_active && mode == Mode::Stochastic ? " counts" : "") +
                               " top_k=" + std::to_string(top_k);
@@ -249,32 +277,39 @@ int main(int argc, char** argv) {
 
     try {
         const Options options = parse_args(argc, argv);
-        const int max_cols    = options.matrix ? 6 : (options.mtp ? options.mtp_k + 1 : 1);
+        const int max_cols    = options.matrix ? 8
+                                               : std::max(options.sample ? options.batch : 1,
+                                                       options.mtp ? options.mtp_k + 1 : 1);
         DeviceBuffer logits   = make_logits(max_cols);
-        DeviceBuffer counts(static_cast<std::size_t>(kTokenDomain) * sizeof(std::int32_t));
+        const int count_rows  = options.matrix ? 8 : (options.sample ? options.batch : 1);
+        DeviceBuffer counts(static_cast<std::size_t>(kTokenDomain) * count_rows *
+                            sizeof(std::int32_t));
         CUDA_CHECK(cudaMemset(counts.p, 0, counts.bytes));
 
-        std::printf("payload: physical_rows=%d token_domain=%d logits=%.3f MiB/col "
-                    "counts=%.3f MiB/col\n",
+        std::printf("payload: physical_rows=%d token_domain=%d logits=%.3f MiB/row "
+                    "counts=%.3f MiB/row\n",
                     kPhysicalRows, kTokenDomain, static_cast<double>(kTokenDomain * 2) / 1048576.0,
                     static_cast<double>(kTokenDomain * 4) / 1048576.0);
         std::printf(
-            "workspace: C=1 %.1f KiB, C=6 %.1f KiB\n",
+            "workspace: lanes=1 %.1f KiB, lanes=8 %.1f KiB\n",
             static_cast<double>(ops::sampling_workspace_capacity_bytes(kTokenDomain, 1, 1)) /
                 1024.0,
-            static_cast<double>(ops::sampling_workspace_capacity_bytes(kTokenDomain, 6, 6)) /
+            static_cast<double>(ops::sampling_workspace_capacity_bytes(kTokenDomain, 8, 8)) /
                 1024.0);
         if (options.matrix) {
-            run_sample(logits, counts, Mode::Greedy, false, 1);
-            run_sample(logits, counts, Mode::Stochastic, false, 20);
-            run_sample(logits, counts, Mode::Stochastic, true, 20);
+            for (const int batch : {1, 2, 4, 8}) {
+                run_sample(logits, counts, batch, Mode::Greedy, false, 1);
+                run_sample(logits, counts, batch, Mode::Stochastic, true, 20);
+            }
+            run_sample(logits, counts, 1, Mode::Stochastic, false, 20);
             for (int k = 1; k <= 5; ++k) {
                 run_mtp(logits, counts, k, Mode::Greedy, false, 1);
                 run_mtp(logits, counts, k, Mode::Stochastic, true, 20);
             }
         } else {
             if (options.sample) {
-                run_sample(logits, counts, options.mode, options.counts_active, options.top_k);
+                run_sample(logits, counts, options.batch, options.mode, options.counts_active,
+                           options.top_k);
             }
             if (options.mtp) {
                 run_mtp(logits, counts, options.mtp_k, options.mode, options.counts_active,

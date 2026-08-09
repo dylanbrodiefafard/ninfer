@@ -551,12 +551,12 @@ cmake --build build --parallel --target ninfer_argmax_bench ninfer_sampling_sele
 ```
 
 The G2/G3 benchmark uses physical rows 248320, valid token domain 248077, optional occurrence
-counts, and every MTP window `K=1..5`. With no arguments it runs the full greedy/stochastic matrix;
-individual routes are suitable for Nsight Compute capture:
+counts, batched sampling at `B=1,2,4,8`, and every MTP window `K=1..5`. With no arguments it runs
+the full greedy/stochastic matrix; individual routes are suitable for Nsight Compute capture:
 
 ```bash
 ./build/bench/ninfer_sampling_select_bench --matrix
-./build/bench/ninfer_sampling_select_bench --sample --mode stochastic --top-k 20
+./build/bench/ninfer_sampling_select_bench --sample --batch 8 --mode stochastic --top-k 20
 ./build/bench/ninfer_sampling_select_bench --mtp --mode stochastic --mtp-k 5 --top-k 20
 ```
 

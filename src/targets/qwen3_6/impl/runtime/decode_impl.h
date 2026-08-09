@@ -33,9 +33,8 @@ auto ordinary_body(State& state, bool align_mtp, ops::GqaExecutionEnvelope envel
         }
 
         Tensor logits = state.io.logits.slice(1, 0, 1);
-        ops::sample(logits, state.io.token, TextConfig::token_domain, state.sampling,
-                    static_cast<const std::int32_t*>(state.io.pos.data), ops::kSamplePurposeDecode,
-                    state.work, state.device.stream);
+        ops::sample(logits, state.io.token, TextConfig::token_domain, state.sampling, state.io.pos,
+                    ops::kSamplePurposeDecode, state.work, state.device.stream);
 
         if (align_mtp) {
             Tensor hidden     = state.io.verify_hidden.slice(1, 0, 1);

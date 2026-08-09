@@ -15,6 +15,7 @@
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 using namespace ninfer;
@@ -34,7 +35,7 @@ struct Distribution {
 
 struct RunResult {
     std::vector<int> tokens;
-    std::vector<int> counts;
+    std::vector<std::vector<int>> counts;
     int integrity_failures = 0;
 };
 
@@ -133,62 +134,76 @@ Distribution distribution_oracle(const std::vector<float>& column, int token_dom
     return out;
 }
 
-RunResult run_once(const std::vector<float>& logits, int physical_rows, int token_domain,
-                   int columns, ops::SamplingConfig config, int position, int purpose,
-                   const std::vector<int>* initial_counts = nullptr) {
+RunResult run_batch(const std::vector<float>& logits, int physical_rows, int token_domain,
+                    std::vector<ops::SamplingConfig> configs,
+                    const std::vector<int>& logical_positions, int purpose,
+                    const std::vector<std::vector<int>>& initial_counts = {}) {
+    const int batch = static_cast<int>(configs.size());
+    if (batch <= 0 || logical_positions.size() != configs.size() ||
+        logits.size() != static_cast<std::size_t>(physical_rows) * configs.size() ||
+        (!initial_counts.empty() && initial_counts.size() != configs.size())) {
+        throw std::invalid_argument("invalid sample batch fixture");
+    }
     const std::vector<std::uint16_t> input_bits = bf16_bits(logits);
     DeviceBuffer device_logits                  = to_device(input_bits);
-    GuardedDeviceBuffer device_out(static_cast<std::size_t>(columns) * sizeof(std::int32_t));
-    const std::vector<int> output_sentinel(static_cast<std::size_t>(columns), -777777);
+    GuardedDeviceBuffer device_out(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
+    const std::vector<int> output_sentinel(static_cast<std::size_t>(batch), -777777);
     device_out.copy_from_host(output_sentinel.data(),
                               output_sentinel.size() * sizeof(std::int32_t));
 
-    std::unique_ptr<GuardedDeviceBuffer> device_counts;
-    if (initial_counts != nullptr) {
-        device_counts =
-            std::make_unique<GuardedDeviceBuffer>(initial_counts->size() * sizeof(std::int32_t));
-        device_counts->copy_from_host(initial_counts->data(),
-                                      initial_counts->size() * sizeof(std::int32_t));
-        config.token_counts = static_cast<std::int32_t*>(device_counts->data());
+    std::vector<std::unique_ptr<GuardedDeviceBuffer>> device_counts;
+    if (!initial_counts.empty()) {
+        device_counts.reserve(configs.size());
+        for (std::size_t row = 0; row < configs.size(); ++row) {
+            if (initial_counts[row].size() != static_cast<std::size_t>(token_domain)) {
+                throw std::invalid_argument("invalid sample token-count fixture");
+            }
+            auto counts = std::make_unique<GuardedDeviceBuffer>(initial_counts[row].size() *
+                                                                sizeof(std::int32_t));
+            counts->copy_from_host(initial_counts[row].data(), counts->bytes());
+            configs[row].token_counts = static_cast<std::int32_t*>(counts->data());
+            device_counts.push_back(std::move(counts));
+        }
     }
-    const ops::SamplingConfig expected_config = config;
-    DeviceBuffer device_config                = to_device(std::vector<ops::SamplingConfig>{config});
-    DeviceBuffer device_pos                   = to_device(std::vector<std::int32_t>{position});
+    const std::vector<ops::SamplingConfig> expected_configs = configs;
+    DeviceBuffer device_configs                             = to_device(configs);
+    DeviceBuffer device_positions                           = to_device(logical_positions);
 
-    Tensor logits_tensor(device_logits.p, DType::BF16, {physical_rows, columns});
-    Tensor out_tensor(device_out.data(), DType::I32, {columns});
+    Tensor logits_tensor(device_logits.p, DType::BF16, {physical_rows, batch});
+    Tensor out_tensor(device_out.data(), DType::I32, {batch});
+    Tensor positions_tensor(device_positions.p, DType::I32, {batch});
     const std::size_t workspace_bytes =
-        ops::sampling_workspace_capacity_bytes(token_domain, columns, columns);
+        ops::sampling_workspace_capacity_bytes(token_domain, batch, batch);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
     ops::sample(logits_tensor, out_tensor, token_domain,
-                static_cast<const ops::SamplingConfig*>(device_config.p),
-                static_cast<const std::int32_t*>(device_pos.p), purpose, workspace, nullptr);
+                static_cast<const ops::SamplingConfig*>(device_configs.p), positions_tensor,
+                purpose, workspace, nullptr);
     cuda_synchronize();
 
     RunResult result;
-    result.tokens = from_device<int>(device_out.data(), static_cast<std::size_t>(columns));
+    result.tokens = from_device<int>(device_out.data(), static_cast<std::size_t>(batch));
     result.integrity_failures += device_out.verify_guards("sample output");
     result.integrity_failures +=
         verify_exact("sample read-only logits",
                      from_device<std::uint16_t>(device_logits, input_bits.size()), input_bits);
 
-    const ops::SamplingConfig actual_config =
-        from_device<ops::SamplingConfig>(device_config, 1).front();
-    if (!same_config(actual_config, expected_config)) {
-        std::cerr << "sample modified SamplingConfig\n";
-        ++result.integrity_failures;
+    const std::vector<ops::SamplingConfig> actual_configs =
+        from_device<ops::SamplingConfig>(device_configs, configs.size());
+    for (std::size_t row = 0; row < configs.size(); ++row) {
+        if (!same_config(actual_configs[row], expected_configs[row])) {
+            std::cerr << "sample modified SamplingConfig row " << row << '\n';
+            ++result.integrity_failures;
+        }
     }
-    const int actual_position = from_device<std::int32_t>(device_pos, 1).front();
-    if (actual_position != position) {
-        std::cerr << "sample modified pos_base: got=" << actual_position << " expected=" << position
-                  << '\n';
-        ++result.integrity_failures;
-    }
+    result.integrity_failures += verify_exact(
+        "sample read-only logical positions",
+        from_device<std::int32_t>(device_positions, configs.size()), logical_positions);
 
-    if (device_counts != nullptr) {
-        result.counts =
-            from_device<int>(device_counts->data(), static_cast<std::size_t>(token_domain));
-        result.integrity_failures += device_counts->verify_guards("sample token_counts");
+    result.counts.reserve(device_counts.size());
+    for (std::size_t row = 0; row < device_counts.size(); ++row) {
+        result.counts.push_back(
+            from_device<int>(device_counts[row]->data(), static_cast<std::size_t>(token_domain)));
+        result.integrity_failures += device_counts[row]->verify_guards("sample token_counts");
     }
     if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
         std::cerr << "sample workspace query/execution high-water mismatch\n";
@@ -197,54 +212,73 @@ RunResult run_once(const std::vector<float>& logits, int physical_rows, int toke
     return result;
 }
 
-RunResult run_repeated(const std::vector<float>& column, int token_domain, int total,
-                       int batch_columns, ops::SamplingConfig config, int position, int purpose) {
+RunResult run_homogeneous_batch(const std::vector<float>& logits, int physical_rows,
+                                int token_domain, int batch, ops::SamplingConfig config,
+                                int first_position, int purpose,
+                                const std::vector<int>* initial_counts = nullptr) {
+    std::vector<ops::SamplingConfig> configs(static_cast<std::size_t>(batch), config);
+    std::vector<int> positions(static_cast<std::size_t>(batch));
+    for (int row = 0; row < batch; ++row) {
+        positions[static_cast<std::size_t>(row)] = first_position + row;
+    }
+    std::vector<std::vector<int>> row_counts;
+    if (initial_counts != nullptr) {
+        row_counts.assign(static_cast<std::size_t>(batch), *initial_counts);
+    }
+    return run_batch(logits, physical_rows, token_domain, std::move(configs), positions, purpose,
+                     row_counts);
+}
+
+RunResult run_repeated(const std::vector<float>& column, int token_domain, int total, int batch,
+                       ops::SamplingConfig config, int position, int purpose) {
+    if (batch <= 0 || total <= 0 || total % batch != 0) {
+        throw std::invalid_argument("repeated sample count must be a positive batch multiple");
+    }
     const int physical_rows                     = static_cast<int>(column.size());
-    const std::vector<float> logits             = repeat_column(column, batch_columns);
+    const std::vector<float> logits             = repeat_column(column, batch);
     const std::vector<std::uint16_t> input_bits = bf16_bits(logits);
     DeviceBuffer device_logits                  = to_device(input_bits);
-    GuardedDeviceBuffer device_out(static_cast<std::size_t>(batch_columns) * sizeof(std::int32_t));
-    DeviceBuffer collected(static_cast<std::size_t>(total) * sizeof(std::int32_t));
-    DeviceBuffer device_config                = to_device(std::vector<ops::SamplingConfig>{config});
-    DeviceBuffer device_pos                   = to_device(std::vector<std::int32_t>{position});
-    const ops::SamplingConfig expected_config = config;
+    GuardedDeviceBuffer collected(static_cast<std::size_t>(total) * sizeof(std::int32_t));
+    std::vector<ops::SamplingConfig> configs(static_cast<std::size_t>(batch), config);
+    const std::vector<ops::SamplingConfig> expected_configs = configs;
+    DeviceBuffer device_configs                             = to_device(configs);
+    std::vector<int> positions(static_cast<std::size_t>(total));
+    for (int i = 0; i < total; ++i) { positions[static_cast<std::size_t>(i)] = position + i; }
+    DeviceBuffer device_positions = to_device(positions);
 
-    Tensor logits_tensor(device_logits.p, DType::BF16, {physical_rows, batch_columns});
-    Tensor out_tensor(device_out.data(), DType::I32, {batch_columns});
+    Tensor logits_tensor(device_logits.p, DType::BF16, {physical_rows, batch});
     const std::size_t workspace_bytes =
-        ops::sampling_workspace_capacity_bytes(token_domain, batch_columns, batch_columns);
+        ops::sampling_workspace_capacity_bytes(token_domain, batch, batch);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
 
-    int final_position = position;
-    for (int produced = 0; produced < total; produced += batch_columns) {
-        final_position = position + produced;
-        device_pos.copy_from_host(&final_position, sizeof(final_position));
+    for (int produced = 0; produced < total; produced += batch) {
+        auto* out = static_cast<std::int32_t*>(collected.data()) + produced;
+        auto* pos = static_cast<std::int32_t*>(device_positions.p) + produced;
+        Tensor out_tensor(out, DType::I32, {batch});
+        Tensor positions_tensor(pos, DType::I32, {batch});
         ops::sample(logits_tensor, out_tensor, token_domain,
-                    static_cast<const ops::SamplingConfig*>(device_config.p),
-                    static_cast<const std::int32_t*>(device_pos.p), purpose, workspace, nullptr);
-        cuda_check(cudaMemcpy(static_cast<std::int32_t*>(collected.p) + produced, device_out.data(),
-                              static_cast<std::size_t>(batch_columns) * sizeof(std::int32_t),
-                              cudaMemcpyDeviceToDevice),
-                   "cudaMemcpy sampled batch");
+                    static_cast<const ops::SamplingConfig*>(device_configs.p), positions_tensor,
+                    purpose, workspace, nullptr);
     }
     cuda_synchronize();
 
     RunResult result;
-    result.tokens = from_device_i32(collected, static_cast<std::size_t>(total));
-    result.integrity_failures += device_out.verify_guards("sample repeated output");
+    result.tokens = from_device<int>(collected.data(), static_cast<std::size_t>(total));
+    result.integrity_failures += collected.verify_guards("sample repeated output");
     result.integrity_failures +=
         verify_exact("sample repeated read-only logits",
                      from_device<std::uint16_t>(device_logits, input_bits.size()), input_bits);
-    const ops::SamplingConfig actual_config =
-        from_device<ops::SamplingConfig>(device_config, 1).front();
-    if (!same_config(actual_config, expected_config)) {
-        std::cerr << "sample repeated modified SamplingConfig\n";
-        ++result.integrity_failures;
+    const std::vector<ops::SamplingConfig> actual_configs =
+        from_device<ops::SamplingConfig>(device_configs, configs.size());
+    for (std::size_t row = 0; row < configs.size(); ++row) {
+        if (!same_config(actual_configs[row], expected_configs[row])) {
+            std::cerr << "sample repeated modified SamplingConfig row " << row << '\n';
+            ++result.integrity_failures;
+        }
     }
-    if (from_device<std::int32_t>(device_pos, 1).front() != final_position) {
-        std::cerr << "sample repeated modified pos_base\n";
-        ++result.integrity_failures;
-    }
+    result.integrity_failures +=
+        verify_exact("sample repeated read-only logical positions",
+                     from_device<std::int32_t>(device_positions, positions.size()), positions);
     if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
         std::cerr << "sample repeated workspace query/execution high-water mismatch\n";
         ++result.integrity_failures;
@@ -287,16 +321,16 @@ int verify_distribution(const char* label, const std::vector<int>& samples,
 int greedy_contract() {
     constexpr int physical_rows = 248320;
     constexpr int token_domain  = 248077;
-    constexpr int columns       = 3;
-    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * columns, -9.0f);
-    for (int column = 0; column < columns; ++column) {
-        const std::size_t base = static_cast<std::size_t>(column) * physical_rows;
-        int first              = (17 + 7919 * column) % token_domain;
-        int second             = token_domain - 1 - ((31 + 65537 * column) % token_domain);
+    constexpr int batch         = 8;
+    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * batch, -9.0f);
+    for (int row = 0; row < batch; ++row) {
+        const std::size_t base = static_cast<std::size_t>(row) * physical_rows;
+        int first              = (17 + 7919 * row) % token_domain;
+        int second             = token_domain - 1 - ((31 + 65537 * row) % token_domain);
         if (second == first) { second = (first + 1) % token_domain; }
         if (second < first) { std::swap(first, second); }
-        logits[base + first]             = column == 0 ? -0.0f : 16.0f + column;
-        logits[base + second]            = column == 0 ? 0.0f : 16.0f + column;
+        logits[base + first]             = row == 0 ? -0.0f : 16.0f + row;
+        logits[base + second]            = row == 0 ? 0.0f : 16.0f + row;
         logits[base + token_domain]      = 100.0f;
         logits[base + physical_rows - 1] = 200.0f;
     }
@@ -313,12 +347,14 @@ int greedy_contract() {
     config.frequency_penalty = 100.0f;
     config.seed              = 12345;
 
-    const RunResult result = run_once(logits, physical_rows, token_domain, columns, config, 77,
-                                      ops::kSamplePurposeDecode, &counts);
+    const RunResult result = run_homogeneous_batch(logits, physical_rows, token_domain, batch,
+                                                   config, 77, ops::kSamplePurposeDecode, &counts);
     int failures           = result.integrity_failures;
     failures += verify_exact("sample greedy mathematical result", result.tokens,
-                             greedy_oracle(logits, physical_rows, token_domain, columns));
-    failures += verify_exact("sample greedy skips token_counts updates", result.counts, counts);
+                             greedy_oracle(logits, physical_rows, token_domain, batch));
+    for (const std::vector<int>& row_counts : result.counts) {
+        failures += verify_exact("sample greedy skips token_counts updates", row_counts, counts);
+    }
     return failures;
 }
 
@@ -348,16 +384,65 @@ int deterministic_stochastic_contract() {
         config.seed              = 9981;
         const Distribution oracle =
             distribution_oracle(column, static_cast<int>(column.size()), config, &test_case.counts);
-        RunResult result =
-            run_once(column, static_cast<int>(column.size()), static_cast<int>(column.size()), 1,
-                     config, 11, ops::kSamplePurposeDecode, &test_case.counts);
+        RunResult result = run_homogeneous_batch(column, static_cast<int>(column.size()),
+                                                 static_cast<int>(column.size()), 1, config, 11,
+                                                 ops::kSamplePurposeDecode, &test_case.counts);
 
         std::vector<int> expected_counts = test_case.counts;
         ++expected_counts[static_cast<std::size_t>(oracle.tokens.front())];
         failures += result.integrity_failures;
         failures += verify_exact(test_case.label, result.tokens, {oracle.tokens.front()});
-        failures +=
-            verify_exact("sample increments only selected token", result.counts, expected_counts);
+        failures += verify_exact("sample increments only selected token", result.counts.front(),
+                                 expected_counts);
+    }
+    return failures;
+}
+
+int heterogeneous_batch_contract() {
+    constexpr int physical_rows = 260;
+    constexpr int token_domain  = 257;
+    constexpr int batch         = 4;
+    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * batch, -8.0f);
+    const auto set = [&](int row, int token, float value) {
+        logits[static_cast<std::size_t>(row) * physical_rows + token] = value;
+    };
+    set(0, 5, 4.0f);
+    set(0, 7, 3.0f);
+    set(1, 11, 4.0f);
+    set(1, 12, 3.0f);
+    set(2, 13, 5.0f);
+    set(2, 17, 4.5f);
+    set(3, 19, 2.0f);
+    set(3, 23, 2.0f);
+    for (int row = 0; row < batch; ++row) { set(row, physical_rows - 1, 100.0f); }
+    round_to_bf16(logits);
+
+    std::vector<ops::SamplingConfig> configs(batch);
+    configs[0].temperature      = 0.0f;
+    configs[1].temperature      = 0.7f;
+    configs[1].top_k            = 1;
+    configs[1].seed             = 101;
+    configs[2].temperature      = 0.7f;
+    configs[2].top_k            = 1;
+    configs[2].presence_penalty = 1.0f;
+    configs[2].seed             = 202;
+    configs[3].temperature      = 0.0f;
+
+    std::vector<std::vector<int>> counts(batch, std::vector<int>(token_domain, 0));
+    counts[0][5]           = 9;
+    counts[2][13]          = 1;
+    const RunResult result = run_batch(logits, physical_rows, token_domain, std::move(configs),
+                                       {7, 103, 999, 41}, ops::kSamplePurposeDecode, counts);
+
+    int failures = result.integrity_failures;
+    failures += verify_exact("sample heterogeneous batch tokens", result.tokens, {5, 11, 17, 19});
+    std::vector<std::vector<int>> expected = counts;
+    ++expected[1][11];
+    ++expected[2][17];
+    for (int row = 0; row < batch; ++row) {
+        failures += verify_exact("sample heterogeneous batch isolated token counts",
+                                 result.counts[static_cast<std::size_t>(row)],
+                                 expected[static_cast<std::size_t>(row)]);
     }
     return failures;
 }
@@ -380,11 +465,9 @@ int filtered_distribution_contract() {
         return 1;
     }
 
-    constexpr int samples           = 16384;
-    const std::vector<float> logits = repeat_column(column, samples);
-    const RunResult result =
-        run_once(logits, static_cast<int>(column.size()), static_cast<int>(column.size()), samples,
-                 config, 400, ops::kSamplePurposeDecode);
+    constexpr int samples  = 16384;
+    const RunResult result = run_repeated(column, static_cast<int>(column.size()), samples, 8,
+                                          config, 400, ops::kSamplePurposeDecode);
     return result.integrity_failures +
            verify_distribution("sample top-k/top-p/min-p", result.tokens, oracle);
 }
@@ -407,10 +490,9 @@ int capped_distribution_contract() {
         return 1;
     }
 
-    constexpr int samples = 16384;
-    const RunResult result =
-        run_once(repeat_column(column, samples), static_cast<int>(column.size()),
-                 static_cast<int>(column.size()), samples, config, 900, ops::kSamplePurposePrefill);
+    constexpr int samples  = 16384;
+    const RunResult result = run_repeated(column, static_cast<int>(column.size()), samples, 8,
+                                          config, 900, ops::kSamplePurposePrefill);
     return result.integrity_failures +
            verify_distribution("sample top-k public cap", result.tokens, oracle);
 }
@@ -434,9 +516,9 @@ int real_shape_distribution_contract() {
 
     constexpr int samples = 4096;
     RunResult result =
-        run_repeated(column, token_domain, samples, 1, config, 2000, ops::kSamplePurposeDecode);
+        run_repeated(column, token_domain, samples, 8, config, 2000, ops::kSamplePurposeDecode);
     return result.integrity_failures +
-           verify_distribution("sample real token-domain T=1", result.tokens, oracle);
+           verify_distribution("sample real token-domain B=8", result.tokens, oracle);
 }
 
 int rng_key_contract() {
@@ -447,26 +529,31 @@ int rng_key_contract() {
     config.top_k       = 2;
     config.seed        = 424242;
 
-    constexpr int columns    = 128;
-    const RunResult baseline = run_once(repeat_column(column, columns), 2, 2, columns, config, 100,
-                                        ops::kSamplePurposeDecode);
-    const RunResult repeat   = run_once(repeat_column(column, columns), 2, 2, columns, config, 100,
-                                        ops::kSamplePurposeDecode);
-    const RunResult shifted  = run_once(repeat_column(column, columns - 1), 2, 2, columns - 1,
-                                        config, 101, ops::kSamplePurposeDecode);
-    const RunResult other_purpose = run_once(repeat_column(column, columns), 2, 2, columns, config,
-                                             100, ops::kSamplePurposePrefill);
+    constexpr int samples = 128;
+    const RunResult baseline =
+        run_repeated(column, 2, samples, 8, config, 100, ops::kSamplePurposeDecode);
+    const RunResult repeat =
+        run_repeated(column, 2, samples, 8, config, 100, ops::kSamplePurposeDecode);
+    const RunResult rechunked =
+        run_repeated(column, 2, samples, 1, config, 100, ops::kSamplePurposeDecode);
+    const RunResult shifted =
+        run_repeated(column, 2, samples, 8, config, 101, ops::kSamplePurposeDecode);
+    const RunResult other_purpose =
+        run_repeated(column, 2, samples, 8, config, 100, ops::kSamplePurposePrefill);
     ops::SamplingConfig other_seed_config = config;
     ++other_seed_config.seed;
-    const RunResult other_seed = run_once(repeat_column(column, columns), 2, 2, columns,
-                                          other_seed_config, 100, ops::kSamplePurposeDecode);
+    const RunResult other_seed =
+        run_repeated(column, 2, samples, 8, other_seed_config, 100, ops::kSamplePurposeDecode);
 
     int failures = baseline.integrity_failures + repeat.integrity_failures +
-                   shifted.integrity_failures + other_purpose.integrity_failures +
-                   other_seed.integrity_failures;
+                   rechunked.integrity_failures + shifted.integrity_failures +
+                   other_purpose.integrity_failures + other_seed.integrity_failures;
     failures += verify_exact("sample identical counter key is reproducible", repeat.tokens,
                              baseline.tokens);
-    failures += verify_exact("sample position selects the corresponding counter", shifted.tokens,
+    failures += verify_exact("sample RNG does not depend on compact row", rechunked.tokens,
+                             baseline.tokens);
+    failures += verify_exact("sample position selects the corresponding counter",
+                             std::vector<int>(shifted.tokens.begin(), shifted.tokens.end() - 1),
                              std::vector<int>(baseline.tokens.begin() + 1, baseline.tokens.end()));
     if (other_purpose.tokens == baseline.tokens) {
         std::cerr << "sample purpose did not separate the counter stream\n";
@@ -481,13 +568,14 @@ int rng_key_contract() {
 
 int workspace_route_boundary_contract() {
     constexpr int token_domain = 257;
-    constexpr int columns      = 16;
-    std::vector<float> logits(static_cast<std::size_t>(token_domain) * columns, 0.0f);
-    const RunResult result = run_once(logits, token_domain, token_domain, columns,
-                                      ops::SamplingConfig{}, 0, ops::kSamplePurposeDecode);
-    int failures           = result.integrity_failures;
-    failures += verify_exact("sample workspace route boundary", result.tokens,
-                             std::vector<int>(columns, 0));
+    constexpr int batch        = 8;
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * batch, 0.0f);
+    const RunResult result =
+        run_homogeneous_batch(logits, token_domain, token_domain, batch, ops::SamplingConfig{}, 0,
+                              ops::kSamplePurposeDecode);
+    int failures = result.integrity_failures;
+    failures +=
+        verify_exact("sample workspace route boundary", result.tokens, std::vector<int>(batch, 0));
     return failures;
 }
 
@@ -509,11 +597,12 @@ int main() {
     }
     try {
         (void)ops::sampling_workspace_capacity_bytes(257, 0, 16);
-        std::cerr << "sampling workspace accepted an invalid column interval\n";
+        std::cerr << "sampling workspace accepted an invalid lane interval\n";
         ++failures;
     } catch (const std::invalid_argument&) {}
     failures += greedy_contract();
     failures += deterministic_stochastic_contract();
+    failures += heterogeneous_batch_contract();
     failures += filtered_distribution_contract();
     failures += capped_distribution_contract();
     failures += real_shape_distribution_contract();

@@ -32,44 +32,48 @@ struct SamplingConfig {
     std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
 };
 
-// Caller-owned transient capacity for every column count in the inclusive interval. token_domain
-// is the fixed route profile. Invalid profiles or intervals throw; a legal single-block route
-// returns zero.
+// Caller-owned transient capacity for every parallel sampling-lane count in the inclusive
+// interval. For sample(), one lane is one batch row; speculative acceptance uses the same
+// workspace substrate for its verification columns. token_domain is the fixed route profile.
+// Invalid profiles or intervals throw; a legal single-block route returns zero.
 [[nodiscard]] std::size_t sampling_workspace_capacity_bytes(std::int32_t token_domain,
-                                                            std::int32_t min_columns,
-                                                            std::int32_t max_columns);
+                                                            std::int32_t min_lanes,
+                                                            std::int32_t max_lanes);
 
 /**
- * Produces one token id per logits column. `logits` is contiguous BF16 [physical_rows,T], `out`
- * is contiguous I32 [T], and only rows v in [0,token_domain) participate.
+ * Produces one token id per independent request row. `logits` is contiguous BF16
+ * [physical_rows,B], `out` and `logical_positions` are contiguous I32 [B], and only vocabulary
+ * rows v in [0,token_domain) participate. `configs` is a device-resident contiguous
+ * SamplingConfig[B] array. Greedy and stochastic rows may coexist in one invocation.
  *
- * With temperature<=0:
+ * For row b with configs[b].temperature<=0:
  *
- *   out[t] = min argmax_v float(logits[v,t]).
+ *   out[b] = min argmax_v float(logits[v,b]).
  *
- * Penalties, filters, RNG, and token_counts updates are skipped in this branch. With positive
- * temperature, let c_v=token_counts[v] (or zero when the pointer is null):
+ * Penalties, filters, RNG, and token_counts updates are skipped for that row. With positive
+ * temperature, let c_v=configs[b].token_counts[v] (or zero when the pointer is null):
  *
- *   adjusted_v = float(logits[v,t])
- *                - presence_penalty * (c_v > 0)
- *                - frequency_penalty * c_v.
+ *   adjusted_v = float(logits[v,b])
+ *                - configs[b].presence_penalty * (c_v > 0)
+ *                - configs[b].frequency_penalty * c_v.
  *
- * Candidates are sorted by adjusted_v descending with lower token id breaking ties. top_k in
- * [1,19] keeps that many candidates; top_k<=0 or top_k>=20 keeps min(20,token_domain). Candidate
- * weights are exp(adjusted_v/temperature-max). min_p removes the suffix below
+ * Candidates are sorted by adjusted_v descending with lower token id breaking ties. Per-row top_k
+ * in [1,19] keeps that many candidates; top_k<=0 or top_k>=20 keeps min(20,token_domain).
+ * Candidate weights are exp(adjusted_v/temperature-max). min_p removes the suffix below
  * min_p*max_weight; top_p keeps the shortest remaining prefix whose cumulative weight reaches
  * top_p times the pre-truncation candidate weight. At least the best candidate remains, the
- * support is renormalized, and one id is drawn.
+ * support is renormalized, and one id is drawn for that row.
  *
- * `config` and `pos_base` are device pointers, with pos_base addressing one I32 scalar. Column t
- * uses counter-based RNG key (config->seed,*pos_base+t,purpose), without mutable RNG state. In the
- * positive-temperature branch the selected token atomically increments token_counts when it is
- * non-null. `out` must not overlap logits, config, pos_base, or token_counts. The Op writes all of
- * out, uses caller-owned transient storage reported by sampling_workspace_capacity_bytes(), and has
- * no other persistent state side effect.
+ * Row b uses counter-based RNG key
+ * (configs[b].seed,logical_positions[b],purpose), without mutable RNG state or dependence on the
+ * compact row index. In the positive-temperature branch the selected token atomically increments
+ * configs[b].token_counts when it is non-null. Non-null token-count arrays belonging to distinct
+ * active requests must not alias. `out` must not overlap logits, configs, logical_positions, or any
+ * token-count array. The Op writes all of out, uses caller-owned transient storage reported by
+ * sampling_workspace_capacity_bytes(), and has no other persistent-state side effect.
  */
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
-            const SamplingConfig* config, const std::int32_t* pos_base, std::int32_t purpose,
+            const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
             WorkspaceArena& workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops

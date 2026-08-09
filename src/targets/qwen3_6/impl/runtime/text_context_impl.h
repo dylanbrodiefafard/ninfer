@@ -995,8 +995,7 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
                 ops::set_i32_scalar(io_.pos, base_i + T, s);
                 ops::set_i32_scalar(io_.rope_pos, base_i + T + rope_delta_, s);
                 if (sampling_config_ != nullptr) {
-                    ops::sample(logits, io_.token, kCfg.token_domain, sampling_config_,
-                                static_cast<const std::int32_t*>(io_.pos.data),
+                    ops::sample(logits, io_.token, kCfg.token_domain, sampling_config_, io_.pos,
                                 ops::kSamplePurposePrefill, work_, s);
                 } else {
                     ops::argmax(logits, io_.token, kCfg.token_domain, s);

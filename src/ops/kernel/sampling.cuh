@@ -12,14 +12,14 @@
 namespace ninfer::ops {
 
 __launch_bounds__(kSamplerBlock) __global__
-    void sample_column_kernel(const __nv_bfloat16* logits, std::int32_t* out,
-                              const SamplingConfig* cfg_ptr, const std::int32_t* pos_base,
-                              std::int32_t purpose, std::int32_t token_domain,
-                              std::int32_t physical_rows) {
-    const int t              = static_cast<int>(blockIdx.x);
-    const std::int64_t base  = static_cast<std::int64_t>(t) * physical_rows;
+    void sample_row_kernel(const __nv_bfloat16* logits, std::int32_t* out,
+                           const SamplingConfig* configs, const std::int32_t* logical_positions,
+                           std::int32_t purpose, std::int32_t token_domain,
+                           std::int32_t physical_rows) {
+    const int row            = static_cast<int>(blockIdx.x);
+    const std::int64_t base  = static_cast<std::int64_t>(row) * physical_rows;
     const int tid            = threadIdx.x;
-    const SamplingConfig cfg = *cfg_ptr;
+    const SamplingConfig cfg = configs[row];
 
     __shared__ float red_val[kSamplerBlock];
     __shared__ int red_idx[kSamplerBlock];
@@ -46,13 +46,13 @@ __launch_bounds__(kSamplerBlock) __global__
             }
             __syncthreads();
         }
-        if (tid == 0) { out[t] = red_idx[0]; }
+        if (tid == 0) { out[row] = red_idx[0]; }
         return;
     }
 
     const int partial_blocks = div_up(token_domain, kSamplerPartialTileItems);
     const int group_count    = sampler_group_count(partial_blocks);
-    // No-op when the scratch/group path owns this shape (see sample_column_launch).
+    // No-op when the scratch/group path owns this shape (see sample_batch_launch).
     if (sampler_multiblock_ok(token_domain, static_cast<int>(gridDim.x), partial_blocks,
                               group_count)) {
         return;
@@ -75,7 +75,7 @@ __launch_bounds__(kSamplerBlock) __global__
 
     if (tid != 0) { return; }
     const int support = n_support;
-    const float u     = sampling_uniform(cfg.seed, *pos_base + t, purpose, 0u);
+    const float u     = sampling_uniform(cfg.seed, logical_positions[row], purpose, 0u);
     float acc         = 0.0f;
     int picked        = cand_idx[support - 1];
     for (int j = 0; j < support; ++j) {
@@ -85,7 +85,7 @@ __launch_bounds__(kSamplerBlock) __global__
             break;
         }
     }
-    out[t] = picked;
+    out[row] = picked;
     if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
 }
 
@@ -95,7 +95,7 @@ __launch_bounds__(kSamplerBlock) __global__
                                       SamplingWorkspace workspace) {
     const int col            = static_cast<int>(blockIdx.y);
     const int partial        = static_cast<int>(blockIdx.x);
-    const SamplingConfig cfg = *cfg_ptr;
+    const SamplingConfig cfg = cfg_ptr[col];
     if (partial == 0 && threadIdx.x == 0) { workspace.group_done[col] = 0; }
 
     __shared__ typename SamplingPartialSort::TempStorage sort_storage;
@@ -143,13 +143,13 @@ __launch_bounds__(kSamplerBlock) __global__
 }
 
 __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sample_kernel(
-    std::int32_t* out, const SamplingConfig* cfg_ptr, const std::int32_t* pos_base,
+    std::int32_t* out, const SamplingConfig* cfg_ptr, const std::int32_t* logical_positions,
     std::int32_t purpose, std::int32_t token_domain, std::int32_t partial_blocks,
     std::int32_t group_count, SamplingWorkspace workspace) {
     const int group          = static_cast<int>(blockIdx.x);
     const int col            = static_cast<int>(blockIdx.y);
     const int tid            = threadIdx.x;
-    const SamplingConfig cfg = *cfg_ptr;
+    const SamplingConfig cfg = cfg_ptr[col];
     __shared__ typename SamplingGroupSort::TempStorage sort_storage;
     __shared__ float cand_val[kSamplerCandidateCap];
     __shared__ int cand_idx[kSamplerCandidateCap];
@@ -261,7 +261,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
     sampling_normalize_support(cfg, cand_val, cand_idx, prob, &n_support, cap);
     if (tid == 0) {
         const int support = n_support;
-        const float u     = sampling_uniform(cfg.seed, *pos_base + col, purpose, 0u);
+        const float u     = sampling_uniform(cfg.seed, logical_positions[col], purpose, 0u);
         float acc         = 0.0f;
         int picked        = cand_idx[support - 1];
         for (int j = 0; j < support; ++j) {
