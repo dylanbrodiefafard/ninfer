@@ -236,7 +236,7 @@ struct Resources {
                               ops::gdn_norm_gating_proj_workspace_capacity_bytes(
                                   kValueHeads, kHidden, 1, max_tokens),
                               ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-                                  kKeyRows, kKeyRows, kValueRows, 1, max_tokens),
+                                  kKeyRows, kKeyRows, kValueRows, 1, 1, max_tokens),
                               ops::linear_add_workspace_capacity_bytes(
                                   QType::W8G32_F16S, kHidden, kValueRows, 1, max_tokens)})) {}
 
@@ -314,12 +314,12 @@ Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t 
             ops::rmsnorm(residual, input_norm, kEps, true, hidden, s);
         }
         if (options.route == "fused") {
-            ops::gdn_input_proj_conv_snapshot(hidden, resources.input_weight.weight, conv_weight,
-                                              conv_states, initial_slot, snapshot_base_slot, q, k,
-                                              v, z, resources.workspace, s);
+            ops::gdn_input_proj_conv_snapshot(
+                hidden, resources.input_weight.weight, conv_weight, conv_states, Tensor{},
+                initial_slot, snapshot_base_slot, q, k, v, z, resources.workspace, s);
         } else {
             ops::gdn_input_proj(hidden, resources.input_weight.weight, qkv, z, s);
-            ops::causal_conv1d_silu_snapshot(qkv, conv_weight, conv_states, initial_slot,
+            ops::causal_conv1d_silu_snapshot(qkv, conv_weight, conv_states, Tensor{}, initial_slot,
                                              snapshot_base_slot, qkv_conv, s);
             ops::extract_bf16_columns(qkv_conv, 0, q, s);
             ops::extract_bf16_columns(qkv_conv, kKeyRows, k, s);
@@ -338,9 +338,10 @@ Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t 
             q_recurrent = q_norm;
             k_recurrent = k_norm;
         }
-        ops::gated_delta_net_snapshot(
-            q_recurrent, k_recurrent, v.view({kHeadDim, kValueHeads, tokens}), g, beta, kGdnScale,
-            fused_qk_norm, ssm_states, initial_slot, snapshot_base_slot, recurrent_out, s);
+        ops::gated_delta_net_snapshot(q_recurrent, k_recurrent,
+                                      v.view({kHeadDim, kValueHeads, tokens}), g, beta, kGdnScale,
+                                      fused_qk_norm, ssm_states, Tensor{}, initial_slot,
+                                      snapshot_base_slot, recurrent_out, s);
         if (options.gated_rms == "dv10-b1024") {
             constexpr int block          = 1024;
             constexpr int rows_per_block = block / 32;

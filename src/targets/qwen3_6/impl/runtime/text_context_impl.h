@@ -724,7 +724,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     if (ph == Phase::Verify) {
         Tensor& recurrent_states = state_.recurrent.at(static_cast<std::size_t>(gidx));
         ops::gated_delta_net_snapshot(q_recurrent, k_recurrent, vv, g, beta, kGdnScale,
-                                      /*normalize_qk=*/true, recurrent_states,
+                                      /*normalize_qk=*/true, recurrent_states, Tensor{},
                                       io_.linear_state_read_slot,
                                       io_.linear_state_snapshot_base_slot, o, s);
     } else {

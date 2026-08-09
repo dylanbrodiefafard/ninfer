@@ -187,6 +187,237 @@ int verify_snapshot_outputs(
     return failures;
 }
 
+std::vector<double> gather_batch_rows(const std::vector<double>& full, std::int32_t full_rows,
+                                      std::int32_t row_count, std::int32_t width,
+                                      std::int32_t batch_row, std::int32_t valid,
+                                      std::int32_t sample_count) {
+    std::vector<double> gathered;
+    const std::vector<std::int32_t> selected = sampled_rows(row_count, sample_count);
+    gathered.reserve(selected.size() * static_cast<std::size_t>(valid));
+    for (const std::int32_t row : selected) {
+        for (std::int32_t column = 0; column < valid; ++column) {
+            const std::int32_t flat_column = batch_row * width + column;
+            gathered.push_back(full[static_cast<std::size_t>(flat_column) * full_rows + row]);
+        }
+    }
+    return gathered;
+}
+
+int verify_zero_tail(std::string_view label, const GuardedBf16Tensor& output, std::int32_t rows,
+                     std::int32_t width, std::int32_t batch,
+                     const std::vector<std::int32_t>& valid_columns) {
+    if (valid_columns.empty()) { return 0; }
+    const std::vector<std::uint16_t> bits = output.bits();
+    for (std::int32_t batch_row = 0; batch_row < batch; ++batch_row) {
+        for (std::int32_t column = valid_columns[static_cast<std::size_t>(batch_row)];
+             column < width; ++column) {
+            const std::size_t base = static_cast<std::size_t>(batch_row * width + column) * rows;
+            for (std::int32_t row = 0; row < rows; ++row) {
+                if (bits[base + static_cast<std::size_t>(row)] != 0) {
+                    std::cerr << label << ": invalid tail was not exact zero\n";
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+int verify_batched_state_effects(std::string_view label, const std::vector<std::uint16_t>& before,
+                                 const std::vector<std::uint16_t>& after, std::int32_t channels,
+                                 std::int32_t slots, std::int32_t width, std::int32_t batch,
+                                 const std::vector<std::int32_t>& valid_columns,
+                                 const std::vector<std::int32_t>& snapshot_bases) {
+    const std::size_t slot_stride = static_cast<std::size_t>(channels) * 3;
+    std::vector<bool> written(static_cast<std::size_t>(slots), false);
+    for (std::int32_t batch_row = 0; batch_row < batch; ++batch_row) {
+        const std::int32_t valid =
+            valid_columns.empty() ? width : valid_columns[static_cast<std::size_t>(batch_row)];
+        for (std::int32_t column = 0; column < valid; ++column) {
+            written[static_cast<std::size_t>(snapshot_bases[static_cast<std::size_t>(batch_row)] +
+                                             column)] = true;
+        }
+    }
+    for (std::int32_t slot = 0; slot < slots; ++slot) {
+        const std::size_t base = static_cast<std::size_t>(slot) * slot_stride;
+        if (!written[static_cast<std::size_t>(slot)]) {
+            if (!std::equal(before.begin() + static_cast<std::ptrdiff_t>(base),
+                            before.begin() + static_cast<std::ptrdiff_t>(base + slot_stride),
+                            after.begin() + static_cast<std::ptrdiff_t>(base))) {
+                std::cerr << label << ": unwritten state slot " << slot << " was modified\n";
+                return 1;
+            }
+            continue;
+        }
+        for (std::size_t index = 0; index < slot_stride; ++index) {
+            if (!std::isfinite(bf16_to_f32(after[base + index]))) {
+                std::cerr << label << ": state slot " << slot << " was not fully written\n";
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+template <class ProjectQkv, class ProjectZ, class Launch>
+int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t value_rows,
+                     std::int32_t z_rows, std::int32_t width, std::int32_t batch,
+                     std::vector<std::int32_t> valid_columns, const std::vector<float>& conv_weight,
+                     std::size_t workspace_bytes, const ReductionCriterion& criterion,
+                     ProjectQkv&& project_qkv, ProjectZ&& project_z, Launch&& launch) {
+    const std::int32_t channels          = kQueryRows + kKeyRows + value_rows;
+    const std::int32_t aggregate_columns = width * batch;
+    const std::int32_t slots             = aggregate_columns + batch;
+    const std::size_t slot_stride        = static_cast<std::size_t>(channels) * 3;
+    const std::vector<float> activation =
+        make_bf16_activation(hidden, aggregate_columns, 1103U + width + batch);
+    const std::vector<std::uint16_t> activation_bits  = bf16_bits(activation);
+    const std::vector<std::uint16_t> conv_weight_bits = bf16_bits(conv_weight);
+
+    std::vector<std::int32_t> initial_slots(static_cast<std::size_t>(batch));
+    std::vector<std::int32_t> snapshot_bases(static_cast<std::size_t>(batch));
+    std::vector<std::uint16_t> state_before(slot_stride * slots, 0xffffU);
+    for (std::int32_t batch_row = 0; batch_row < batch; ++batch_row) {
+        snapshot_bases[static_cast<std::size_t>(batch_row)] = batch_row * width;
+        initial_slots[static_cast<std::size_t>(batch_row)] =
+            batch_row == 0 ? 0 : aggregate_columns + batch_row;
+        std::vector<float> initial(slot_stride);
+        fill_uniform(initial, 1201U + static_cast<std::uint32_t>(batch_row), -0.05F, 0.05F);
+        round_to_bf16(initial);
+        const std::size_t base =
+            static_cast<std::size_t>(initial_slots[static_cast<std::size_t>(batch_row)]) *
+            slot_stride;
+        for (std::size_t index = 0; index < slot_stride; ++index) {
+            state_before[base + index] = f32_to_bf16(initial[index]);
+        }
+    }
+
+    DeviceBuffer device_activation    = to_device(activation_bits);
+    DeviceBuffer device_conv_weight   = to_device(conv_weight_bits);
+    DeviceBuffer device_initial       = to_device(initial_slots);
+    DeviceBuffer device_snapshot_base = to_device(snapshot_bases);
+    DeviceBuffer device_valid;
+    if (!valid_columns.empty()) { device_valid = to_device(valid_columns); }
+    GuardedBf16Tensor state(channels * 3, slots);
+    state.copy_from_bits(state_before);
+    GuardedBf16Tensor query(kQueryRows, aggregate_columns);
+    GuardedBf16Tensor key(kKeyRows, aggregate_columns);
+    GuardedBf16Tensor value(value_rows, aggregate_columns);
+    GuardedBf16Tensor z(z_rows, aggregate_columns);
+
+    Tensor x(device_activation.p, DType::BF16, {hidden, width, batch});
+    Tensor conv(device_conv_weight.p, DType::BF16, {channels, 4});
+    Tensor conv_state(state.data(), DType::BF16, {channels, 3, slots});
+    Tensor valid;
+    if (!valid_columns.empty()) { valid = Tensor(device_valid.p, DType::I32, {batch}); }
+    Tensor initial(device_initial.p, DType::I32, {batch});
+    Tensor snapshot_base(device_snapshot_base.p, DType::I32, {batch});
+    Tensor q(query.data(), DType::BF16, {kQueryRows, width, batch});
+    Tensor k(key.data(), DType::BF16, {kKeyRows, width, batch});
+    Tensor v(value.data(), DType::BF16, {value_rows, width, batch});
+    Tensor z_output(z.data(), DType::BF16, {z_rows, width, batch});
+    WorkspaceArena workspace(std::max<std::size_t>(1, workspace_bytes));
+
+    launch(x, conv, conv_state, valid, initial, snapshot_base, q, k, v, z_output, workspace);
+    cuda_synchronize();
+
+    int failures                                 = 0;
+    const std::vector<double> query_values       = query.values();
+    const std::vector<double> key_values         = key.values();
+    const std::vector<double> value_values       = value.values();
+    const std::vector<double> z_values           = z.values();
+    const std::vector<std::uint16_t> state_after = state.bits();
+    std::vector<double> query_actual;
+    std::vector<double> query_expected;
+    std::vector<double> key_actual;
+    std::vector<double> key_expected;
+    std::vector<double> value_actual;
+    std::vector<double> value_expected;
+    std::vector<double> state_actual;
+    std::vector<double> state_expected;
+    std::vector<double> z_actual;
+    std::vector<double> z_expected;
+    const auto append = [](std::vector<double>& destination, std::vector<double> source) {
+        destination.insert(destination.end(), source.begin(), source.end());
+    };
+    for (std::int32_t batch_row = 0; batch_row < batch; ++batch_row) {
+        const std::int32_t valid_extent =
+            valid_columns.empty() ? width : valid_columns[static_cast<std::size_t>(batch_row)];
+        const std::size_t initial_base =
+            static_cast<std::size_t>(initial_slots[static_cast<std::size_t>(batch_row)]) *
+            slot_stride;
+        const std::span<const std::uint16_t> initial_state(state_before.data() + initial_base,
+                                                           slot_stride);
+        const SnapshotOracle oracle =
+            snapshot_oracle(value_rows, valid_extent, conv_weight, initial_state,
+                            [&](std::int32_t row, std::int32_t column) {
+                                return project_qkv(row, batch_row * width + column, activation);
+                            });
+        const std::int32_t sample_count = snapshot_sample_count(valid_extent);
+        append(query_actual, gather_batch_rows(query_values, kQueryRows, kQueryRows, width,
+                                               batch_row, valid_extent, sample_count));
+        append(query_expected, oracle.query);
+        append(key_actual, gather_batch_rows(key_values, kKeyRows, kKeyRows, width, batch_row,
+                                             valid_extent, sample_count));
+        append(key_expected, oracle.key);
+        append(value_actual, gather_batch_rows(value_values, value_rows, value_rows, width,
+                                               batch_row, valid_extent, sample_count));
+        append(value_expected, oracle.value);
+        append(state_actual, gather_state(state_after, channels, value_rows, valid_extent,
+                                          snapshot_bases[static_cast<std::size_t>(batch_row)]));
+        append(state_expected, oracle.state);
+
+        std::vector<double> row_z_expected;
+        for (const std::int32_t row : sampled_rows(z_rows, sample_count)) {
+            for (std::int32_t column = 0; column < width; ++column) {
+                row_z_expected.push_back(project_z(row, batch_row * width + column, activation));
+            }
+        }
+        append(z_actual,
+               gather_batch_rows(z_values, z_rows, z_rows, width, batch_row, width, sample_count));
+        append(z_expected, std::move(row_z_expected));
+    }
+    failures += compare(std::string(label) + " query", query_actual, query_expected, criterion);
+    failures += compare(std::string(label) + " key", key_actual, key_expected, criterion);
+    failures += compare(std::string(label) + " value", value_actual, value_expected, criterion);
+    failures += compare(std::string(label) + " state", state_actual, state_expected, criterion);
+    failures += compare(std::string(label) + " z", z_actual, z_expected, criterion);
+
+    failures += query.verify_guards(std::string(label) + " query");
+    failures += key.verify_guards(std::string(label) + " key");
+    failures += value.verify_guards(std::string(label) + " value");
+    failures += z.verify_guards(std::string(label) + " z");
+    failures += state.verify_guards(std::string(label) + " state");
+    failures += query.verify_fully_written(std::string(label) + " query");
+    failures += key.verify_fully_written(std::string(label) + " key");
+    failures += value.verify_fully_written(std::string(label) + " value");
+    failures += z.verify_fully_written(std::string(label) + " z");
+    failures += verify_zero_tail(std::string(label) + " query", query, kQueryRows, width, batch,
+                                 valid_columns);
+    failures +=
+        verify_zero_tail(std::string(label) + " key", key, kKeyRows, width, batch, valid_columns);
+    failures += verify_zero_tail(std::string(label) + " value", value, value_rows, width, batch,
+                                 valid_columns);
+    failures += verify_batched_state_effects(label, state_before, state_after, channels, slots,
+                                             width, batch, valid_columns, snapshot_bases);
+    failures += verify_preserved(std::string(label) + " x", device_activation, activation_bits);
+    failures +=
+        verify_preserved(std::string(label) + " conv weight", device_conv_weight, conv_weight_bits);
+    failures +=
+        verify_preserved(std::string(label) + " initial slots", device_initial, initial_slots);
+    failures += verify_preserved(std::string(label) + " snapshot bases", device_snapshot_base,
+                                 snapshot_bases);
+    if (!valid_columns.empty()) {
+        failures +=
+            verify_preserved(std::string(label) + " valid columns", device_valid, valid_columns);
+    }
+    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+        std::cerr << label << ": workspace query/execution high-water mismatch\n";
+        ++failures;
+    }
+    return failures;
+}
+
 int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_weight,
                    std::int32_t tokens, std::int32_t initial_slot) {
     constexpr std::int32_t kHidden           = 5120;
@@ -224,12 +455,12 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
     Tensor v                          = value.tensor();
     Tensor z_output                   = z.tensor();
     const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        kQueryRows, kKeyRows, kValueRows, tokens, tokens);
+        kQueryRows, kKeyRows, kValueRows, 1, tokens, tokens);
     WorkspaceArena workspace(std::max<std::size_t>(1, workspace_bytes));
 
     ops::gdn_input_proj_conv_snapshot(x, query_key.view(), value_z_weight.view(), conv, conv_state,
-                                      initial, snapshot_base, q, k, v, z_output, workspace,
-                                      nullptr);
+                                      Tensor{}, initial, snapshot_base, q, k, v, z_output,
+                                      workspace, nullptr);
     cuda_synchronize();
 
     const std::size_t initial_base = static_cast<std::size_t>(initial_slot) * 3 * kChannels;
@@ -289,6 +520,38 @@ int run_q4_q5() {
         const std::int32_t initial_slot = tokens == 5 ? 0 : tokens + 1;
         failures += run_q4_q5_case(query_key, value_z_weight, tokens, initial_slot);
     }
+    constexpr std::int32_t kValueRows    = 6144;
+    constexpr std::int32_t kZRows        = 6144;
+    constexpr std::int32_t kChannels     = 10240;
+    const std::vector<float> conv_weight = make_conv_weight(kChannels, 631U);
+    const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+        kQueryRows, kKeyRows, kValueRows, 8, 1, 1);
+    failures += run_batched_case(
+        "Q4/Q5 A16 B=8 W=1", kHidden, kValueRows, kZRows, 1, 8, {}, conv_weight, workspace_bytes,
+        kGdnInputProjConvSnapshotA16Tolerance,
+        [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+            const float* column =
+                activation.data() + static_cast<std::size_t>(flat_column) * kHidden;
+            if (row < kQueryRows + kKeyRows) {
+                return quantized_weight::dot_fp64(query_key.host, row, column, kHidden);
+            }
+            return quantized_weight::dot_fp64(value_z_weight.host, row - kQueryRows - kKeyRows,
+                                              column, kHidden);
+        },
+        [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+            return quantized_weight::dot_fp64(
+                value_z_weight.host, kValueRows + row,
+                activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
+        },
+        [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
+            const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
+            Tensor& z, WorkspaceArena& workspace) {
+            ops::gdn_input_proj_conv_snapshot(x, query_key.view(), value_z_weight.view(), conv,
+                                              state, valid, initial, snapshot_base, q, k, v, z,
+                                              workspace, nullptr);
+        });
+    failures += query_key.verify_preserved("batched Q4/Q5 query/key weight");
+    failures += value_z_weight.verify_preserved("batched Q4/Q5 value/z weight");
     return failures;
 }
 
@@ -328,11 +591,11 @@ int run_w8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t in
     Tensor v                          = value.tensor();
     Tensor z_output                   = z.tensor();
     const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        kQueryRows, kKeyRows, kValueRows, tokens, tokens);
+        kQueryRows, kKeyRows, kValueRows, 1, tokens, tokens);
     WorkspaceArena workspace(std::max<std::size_t>(1, workspace_bytes));
 
-    ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, conv_state, initial, snapshot_base, q,
-                                      k, v, z_output, workspace, nullptr);
+    ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, conv_state, Tensor{}, initial,
+                                      snapshot_base, q, k, v, z_output, workspace, nullptr);
     cuda_synchronize();
 
     const std::size_t initial_base = static_cast<std::size_t>(initial_slot) * 3 * kChannels;
@@ -385,6 +648,35 @@ int run_w8() {
         const std::int32_t initial_slot = tokens == 2 ? 0 : tokens + 1;
         failures += run_w8_case(parent, tokens, initial_slot);
     }
+    constexpr std::int32_t kValueRows = 4096;
+    constexpr std::int32_t kZRows     = 4096;
+    constexpr std::int32_t kChannels  = 8192;
+    constexpr std::int32_t kWidth     = 16;
+    constexpr std::int32_t kBatch     = 2;
+    const std::vector<std::int32_t> valid_columns{16, 7};
+    const std::vector<float> conv_weight = make_conv_weight(kChannels, 733U);
+    const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+        kQueryRows, kKeyRows, kValueRows, kBatch, kWidth, kWidth);
+    failures += run_batched_case(
+        "W8 A16 B=2 W=16 masked", kHidden, kValueRows, kZRows, kWidth, kBatch, valid_columns,
+        conv_weight, workspace_bytes, kGdnInputProjConvSnapshotA16Tolerance,
+        [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+            return quantized_weight::dot_fp64(
+                parent.host, row,
+                activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
+        },
+        [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+            return quantized_weight::dot_fp64(
+                parent.host, kChannels + row,
+                activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
+        },
+        [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
+            const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
+            Tensor& z, WorkspaceArena& workspace) {
+            ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid, initial,
+                                              snapshot_base, q, k, v, z, workspace, nullptr);
+        });
+    failures += parent.verify_preserved("batched W8 parent weight");
     return failures;
 }
 
@@ -427,11 +719,11 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     Tensor v                          = value.tensor();
     Tensor z_output                   = z.tensor();
     const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        QType::NVFP4, kRows, kHidden, policy, tokens, tokens);
+        QType::NVFP4, kRows, kHidden, policy, 1, tokens, tokens);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
 
-    ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, conv_state, initial, snapshot_base, q,
-                                      k, v, z_output, policy, workspace, nullptr);
+    ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, conv_state, Tensor{}, initial,
+                                      snapshot_base, q, k, v, z_output, policy, workspace, nullptr);
     cuda_synchronize();
 
     const std::size_t initial_base = static_cast<std::size_t>(initial_slot) * 3 * kChannels;
@@ -495,6 +787,36 @@ int run_nvfp4() {
     failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::AllowA4, 5);
     failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4, 0);
     failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4, 1025);
+    constexpr std::int32_t kValueRows = 6144;
+    constexpr std::int32_t kZRows     = 6144;
+    constexpr std::int32_t kChannels  = 10240;
+    constexpr std::int32_t kWidth     = 6;
+    constexpr std::int32_t kBatch     = 3;
+    const std::vector<std::int32_t> valid_columns{6, 3, 1};
+    const std::vector<float> conv_weight = make_conv_weight(kChannels, 829U);
+    const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+        QType::NVFP4, kRows, kHidden, ops::LinearPolicy::AllowA4, kBatch, kWidth, kWidth);
+    failures += run_batched_case(
+        "NVFP4 A4 B=3 W=6 masked", kHidden, kValueRows, kZRows, kWidth, kBatch, valid_columns,
+        conv_weight, workspace_bytes, kGdnInputProjConvSnapshotA4Tolerance,
+        [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+            return quantized_weight::dot_fp64(
+                parent.host, row,
+                activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
+        },
+        [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+            return quantized_weight::dot_fp64(
+                parent.host, kChannels + row,
+                activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
+        },
+        [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
+            const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
+            Tensor& z, WorkspaceArena& workspace) {
+            ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid, initial,
+                                              snapshot_base, q, k, v, z, ops::LinearPolicy::AllowA4,
+                                              workspace, nullptr);
+        });
+    failures += parent.verify_preserved("batched NVFP4 parent weight");
     return failures;
 }
 
@@ -508,30 +830,32 @@ int main() {
 
     int failures = 0;
     const std::size_t q4_interval =
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 1, 6);
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 1, 1, 6);
     const std::size_t q4_witness =
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 4, 4);
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 1, 4, 4);
     const std::size_t q4_right_endpoint =
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 6, 6);
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 1, 6, 6);
     if (q4_interval != q4_witness || q4_witness == 0 || q4_right_endpoint != 0) {
         std::cerr << "Q4/Q5 snapshot interval did not retain its non-monotonic T=4 route\n";
         ++failures;
     }
-    if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 16) != 0 ||
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 17) !=
-            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 17, 17)) {
+    if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 1, 16) !=
+            0 ||
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 1, 17) !=
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 17,
+                                                                       17)) {
         std::cerr << "W8 snapshot interval did not preserve its zero/nonzero route boundary\n";
         ++failures;
     }
     const std::size_t nvfp4_a4_4 = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 4, 4);
+        QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 4, 4);
     if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, 16384, 5120, ops::LinearPolicy::A16Only, 1, 16) != 0 ||
+            QType::NVFP4, 16384, 5120, ops::LinearPolicy::A16Only, 1, 1, 16) != 0 ||
         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 3) != 0 ||
+            QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 1, 3) != 0 ||
         nvfp4_a4_4 == 0 ||
         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 4) != nvfp4_a4_4) {
+            QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 1, 4) != nvfp4_a4_4) {
         std::cerr << "NVFP4 snapshot interval did not preserve its A16/A4 route boundary\n";
         ++failures;
     }

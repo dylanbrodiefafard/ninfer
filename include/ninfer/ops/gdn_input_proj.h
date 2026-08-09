@@ -75,43 +75,42 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
                     cudaStream_t stream);
 
 /**
- * Returns the transient capacity required by gdn_input_proj_conv_snapshot. The 35B W8 route writes
- * final outputs from projection epilogues for exact T=1..16; the 27B Q4/Q5 route may reserve
- * private BF16 staging for its small-T kernels. Extents outside a target route's optimized range
- * use the composed implementation and require two BF16 [C,T] intermediates. The row geometry is
- * the fixed profile; the query covers the inclusive token interval and throws for invalid values.
+ * Returns the transient capacity required by the registered two-parent Q4/Q5 or single-parent W8
+ * snapshot profile. `batch_size` is exact and the query covers every W in the inclusive width
+ * interval. B=1 preserves the format-specific fused/composed resolver. B=2..8 uses aggregate
+ * projection plus two BF16 [C,B*W] intermediates. The query throws for an unregistered row profile
+ * or unsupported B/W domain.
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
-    std::int32_t min_tokens, std::int32_t max_tokens);
+    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
 
 /**
- * Returns the transient capacity for the single-parent GDN snapshot form. The registered NVFP4
- * parent is [16384,5120]. A16Only is valid for T<=16 and requires no storage. AllowA4 is valid for
- * every positive T and the returned high-water covers whichever qualified A16 or A4 route the
- * private resolver selects across the requested interval.
+ * Returns the transient capacity for the [16384,5120] NVFP4 snapshot profile. `batch_size` is exact
+ * and the query covers every W in the inclusive width interval. B=1 preserves the existing fused
+ * snapshot resolver. B=2..8 covers aggregate gdn_input_proj workspace plus projected/convolved
+ * BF16 staging.
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
-    std::int32_t min_tokens, std::int32_t max_tokens);
+    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
 
 /**
  * Op: gdn_input_proj_conv_snapshot
  *
  * Math / indexing:
- *   Let p[:,t] be concat(qk_weight*x[:,t], value_z_weight[0:6144,:]*x[:,t]) and
- *   z[:,t] = value_z_weight[6144:12288,:]*x[:,t]. Starting from the BF16 width-three history
- *   selected by device I32 initial_slot, evaluate the width-four depthwise convolution over p,
- *   apply SiLU, and write its three channel ranges directly to query, key, and value. After token
- *   t, write the resulting width-three projection history to state slot
- *   snapshot_base_slot+t. Z bypasses convolution.
+ *   For each row b, let p[:,j,b] be the concatenated q/k/value projection of x[:,j,b], while
+ *   z[:,j,b] is the independent z projection. Starting from the BF16 width-three history selected
+ *   by initial_state_slots[b], evaluate the width-four depthwise convolution over p, apply SiLU,
+ *   and publish its channel ranges to query, key, and value. After valid column j, write the new
+ *   width-three history to snapshot_base_slots[b]+j. Z bypasses convolution.
  *
  * Logical shapes:
- *   The 27B registered form has x [5120,T], Q4 q/k weight [4096,5120], one Q5 value/z parent
- *   [12288,5120], conv_weight [10240,4], conv_states [10240,3,Slots], query/key [2048,T],
- *   value [6144,T], and z [6144,T]. T is positive. initial_slot and snapshot_base_slot are
- *   contiguous device I32 scalars; the former is in [0,Slots), and the latter selects a
- *   destination interval [snapshot_base_slot,snapshot_base_slot+T) within [0,Slots).
+ *   The 27B registered form has x [5120,W,B], Q4 q/k weight [4096,5120], one Q5 value/z parent
+ *   [12288,5120], conv_weight [10240,4], conv_states [10240,3,Slots], query/key [2048,W,B],
+ *   value/z [6144,W,B], and I32 selectors [B]. B=1 accepts every positive W; B=2..8 accepts
+ *   W=1..16. `valid_columns` is empty for a dense invocation or I32 [B] for a mixed-width batch.
+ *   A mixed-width batch has B>=2 and every valid extent lies in [1,W].
  *
  * Numeric:
  *   The oracle exact-decodes packed weights and evaluates projection, convolution, SiLU, z, and
@@ -123,38 +122,43 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  *   the single-parent policy-bearing form below defines its own permitted compute profiles.
  *
  * Effects:
- *   Writes query/key/value/z and the selected destination state interval; other slots are
- *   unchanged. Newly projected convolution channels remain private to the current call while
- *   each published snapshot is BF16.
+ *   Each row writes query/key/value through its valid prefix and exact zero to its invalid tail;
+ *   z is projected for all B*W safe input columns. A row writes only its valid destination state
+ *   prefix. The caller reserves disjoint complete [base,base+W) intervals, prevents one row from
+ *   overwriting another row's initial slot, and may overlap a row's own initial slot with its
+ *   destination after that initial history has been loaded. Other slots are unchanged. Newly
+ *   projected convolution channels remain private to the call while published snapshots are BF16.
  */
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
                                   const Weight& value_z_weight, const Tensor& conv_weight,
-                                  Tensor& conv_states, const Tensor& initial_slot,
-                                  const Tensor& snapshot_base_slot, Tensor& query, Tensor& key,
+                                  Tensor& conv_states, const Tensor& valid_columns,
+                                  const Tensor& initial_state_slots,
+                                  const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
                                   Tensor& value, Tensor& z, WorkspaceArena& ws,
                                   cudaStream_t stream);
 
 /**
  * Single-parent form of gdn_input_proj_conv_snapshot. Registered parents are W8G32_F16S RowSplit
  * [12288,2048] and NVFP4 BlockScaleK16M128x4 [16384,5120], both in q/k/value/z row order. W8
- * admits A16Only. NVFP4 admits A16Only for T<=16 and AllowA4 for every positive T. The NVFP4
- * AllowA4 policy permits the private resolver to select a qualified fused A16 route or an A4
- * projection composition.
+ * admits A16Only. For dense B=1, NVFP4 A16Only is registered through W=16 and AllowA4 for every
+ * positive W; B>1 uses the aggregate projection policy directly over B*W columns.
  */
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value_z_weight,
                                   const Tensor& conv_weight, Tensor& conv_states,
-                                  const Tensor& initial_slot, const Tensor& snapshot_base_slot,
-                                  Tensor& query, Tensor& key, Tensor& value, Tensor& z,
-                                  LinearPolicy policy, WorkspaceArena& ws, cudaStream_t stream);
+                                  const Tensor& valid_columns, const Tensor& initial_state_slots,
+                                  const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
+                                  Tensor& value, Tensor& z, LinearPolicy policy, WorkspaceArena& ws,
+                                  cudaStream_t stream);
 
 /**
- * Applies the A16-only single-parent form. For NVFP4 this convenience overload is valid only for
- * T<=16.
+ * Applies the A16-only single-parent form. For NVFP4, dense B=1 is valid through W=16; the batched
+ * domain is B=2..8 and W=1..16.
  */
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value_z_weight,
                                   const Tensor& conv_weight, Tensor& conv_states,
-                                  const Tensor& initial_slot, const Tensor& snapshot_base_slot,
-                                  Tensor& query, Tensor& key, Tensor& value, Tensor& z,
-                                  WorkspaceArena& ws, cudaStream_t stream);
+                                  const Tensor& valid_columns, const Tensor& initial_state_slots,
+                                  const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
+                                  Tensor& value, Tensor& z, WorkspaceArena& ws,
+                                  cudaStream_t stream);
 
 } // namespace ninfer::ops

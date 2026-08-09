@@ -157,15 +157,18 @@ cmake --build build --parallel --target ninfer_gdn_gating_proj_bench
 ## Gated DeltaNet Op benchmark
 
 `ninfer_gated_delta_net_bench` measures the BF16 Gated DeltaNet contract with state/head dimension
-128, batch 1, production Q/K normalization, and any positive, divisible
-`value_heads >= qk_heads` mapping. Every measurement is a CUDA Graph replay preceded by a 256 MiB
-L2 flush outside the timed interval.
+128, production Q/K normalization, and any positive, divisible `value_heads >= qk_heads` mapping.
+Running/chunked modes use batch 1; snapshot mode accepts exact `B=1..8` and optional mixed valid
+prefixes. Every measurement is a CUDA Graph replay preceded by a 256 MiB L2 flush outside the timed
+interval.
 
 `--running` measures the public running-state entry across recurrent-only, complete 64-token
-chunks, and chunked-plus-recurrent-tail routes. `--snapshot` measures the 17-slot snapshot entry over
-the production `T=1..16` range; `--qk-norm composed` retains the two-L2Norm comparison.
-`--chunked-only` measures the private pre-normalized BF16 pipeline. Adding `--breakdown` reports the
-end-to-end pipeline and isolated `prepare_wy_wu`, `state_passing`, and `output` stage timings.
+chunks, and chunked-plus-recurrent-tail routes. `--snapshot` measures the snapshot entry over the
+production `W=1..16` batch range; `--qk-norm composed` retains the B=1 two-L2Norm comparison.
+`--chunked-only` measures the complete pre-normalized BF16 pipeline through the public Op. Adding
+`--breakdown` reports isolated `prepare_wy_wu`, `state_passing`, and `output` stage timings. These
+three intrinsic algorithm stages are the benchmark's sole private-launcher exception; the complete
+pipeline and every other mode remain public-contract calls.
 `stage_share_pct` partitions the sum of isolated-stage medians. Each isolated stage receives its own
 cold-L2 flush, so `relative_to_e2e_pct` is informative but is not an additive partition of the
 pipeline latency.
@@ -216,10 +219,11 @@ cmake --build build --parallel --target ninfer_gdn_input_proj_bench
 
 ## GDN input projection/convolution/snapshot Op benchmark
 
-`ninfer_gdn_input_proj_conv_snapshot_bench` measures the public Qwen3.6-27B Q4/Q5 and NVFP4
-`gdn_input_proj_conv_snapshot` forms. The timed body is exactly one complete public Op call;
-the benchmark does not include private launchers, candidate selection, duplicated compositions, or
-route labels. Its default `T=1..6` sweep is the production MTP verification interval. NVFP4 accepts
+`ninfer_gdn_input_proj_conv_snapshot_bench` measures the public Qwen3.6 Q4/Q5, NVFP4, and W8
+`gdn_input_proj_conv_snapshot` forms for exact `B=1..8`. The timed body is exactly one complete
+public Op call; the benchmark does not include private launchers, candidate selection, duplicated
+compositions, or route labels. Its default `T=1..6` sweep is the production MTP verification
+interval. NVFP4 accepts
 the public `a16` and `a4` policies; the reported profile names the caller policy, not a private
 resolved route.
 
@@ -237,6 +241,12 @@ cmake --build build --parallel --target ninfer_gdn_input_proj_conv_snapshot_benc
   --csv-out profiles/bench/gdn_input_proj_conv_snapshot.csv
 ./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
   --format nvfp4 --nvfp4-policy a4 --sweep 1:17 \
+  --execution graph --cache cold --warmup 10 --repeat 100
+./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
+  --format w8 --tokens 16 --batch 8 \
+  --execution graph --cache cold --warmup 10 --repeat 100
+./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
+  --format nvfp4 --tokens 6 --batch 3 --valid-columns 6,3,1 \
   --execution graph --cache cold --warmup 10 --repeat 100
 ```
 

@@ -289,8 +289,8 @@ int snapshot_case(const Case& test_case, int slots, int initial_slot, int snapsh
     Tensor out_tensor(out.data(), DType::BF16,
                       {kStateDim, test_case.value_heads, test_case.tokens});
     ops::gated_delta_net_snapshot(q, k, v, g, beta, scale, test_case.normalize_qk, states_tensor,
-                                  initial_slot_tensor, snapshot_base_slot_tensor, out_tensor,
-                                  nullptr);
+                                  Tensor{}, initial_slot_tensor, snapshot_base_slot_tensor,
+                                  out_tensor, nullptr);
     cuda_synchronize();
 
     const std::string label             = std::string(test_case.name) + " snapshot";
@@ -325,6 +325,169 @@ int snapshot_case(const Case& test_case, int slots, int initial_slot, int snapsh
     failures += out.verify_guards((label + " out").c_str());
     failures += verify_common_inputs_unchanged(label, in, device.q, device.k, device.v, device.g,
                                                device.beta);
+    return failures;
+}
+
+int batched_snapshot_case(const Case& test_case, const std::vector<int>& initial_slots,
+                          const std::vector<int>& snapshot_bases,
+                          const std::vector<int>& valid_columns, int slots, std::uint32_t seed) {
+    const int batch   = static_cast<int>(initial_slots.size());
+    const int width   = test_case.tokens;
+    const bool masked = !valid_columns.empty();
+    const float scale = 1.0f / std::sqrt(static_cast<float>(kStateDim));
+    const std::size_t qk_row_size =
+        static_cast<std::size_t>(kStateDim * test_case.qk_heads * width);
+    const std::size_t value_row_size =
+        static_cast<std::size_t>(kStateDim * test_case.value_heads * width);
+    const std::size_t gate_row_size = static_cast<std::size_t>(test_case.value_heads * width);
+    const std::size_t state_size =
+        static_cast<std::size_t>(kStateDim * kStateDim * test_case.value_heads);
+
+    gdn_ref::Inputs aggregate;
+    aggregate.head_dim    = kStateDim;
+    aggregate.qk_heads    = test_case.qk_heads;
+    aggregate.value_heads = test_case.value_heads;
+    aggregate.tokens      = static_cast<std::int64_t>(width) * batch;
+    aggregate.q.reserve(qk_row_size * static_cast<std::size_t>(batch));
+    aggregate.k.reserve(qk_row_size * static_cast<std::size_t>(batch));
+    aggregate.v.reserve(value_row_size * static_cast<std::size_t>(batch));
+    aggregate.g.reserve(gate_row_size * static_cast<std::size_t>(batch));
+    aggregate.beta.reserve(gate_row_size * static_cast<std::size_t>(batch));
+
+    std::vector<gdn_ref::Inputs> rows;
+    rows.reserve(static_cast<std::size_t>(batch));
+    std::vector<float> initial_states(state_size * static_cast<std::size_t>(slots), 0.125f);
+    for (int row = 0; row < batch; ++row) {
+        gdn_ref::Inputs input =
+            make_inputs(test_case, seed + static_cast<std::uint32_t>(row) * 97U);
+        aggregate.q.insert(aggregate.q.end(), input.q.begin(), input.q.end());
+        aggregate.k.insert(aggregate.k.end(), input.k.begin(), input.k.end());
+        aggregate.v.insert(aggregate.v.end(), input.v.begin(), input.v.end());
+        aggregate.g.insert(aggregate.g.end(), input.g.begin(), input.g.end());
+        aggregate.beta.insert(aggregate.beta.end(), input.beta.begin(), input.beta.end());
+        std::copy(input.state.begin(), input.state.end(),
+                  initial_states.begin() +
+                      static_cast<std::size_t>(initial_slots[static_cast<std::size_t>(row)]) *
+                          state_size);
+        rows.push_back(std::move(input));
+    }
+
+    std::vector<gdn_ref::Result> references;
+    references.reserve(static_cast<std::size_t>(batch));
+    std::vector<double> expected_output(value_row_size * static_cast<std::size_t>(batch), 0.0);
+    std::vector<bool> written_slots(static_cast<std::size_t>(slots), false);
+    for (int row = 0; row < batch; ++row) {
+        const int valid = masked ? valid_columns[static_cast<std::size_t>(row)] : width;
+        gdn_ref::Inputs oracle_input = rows[static_cast<std::size_t>(row)];
+        oracle_input.tokens          = valid;
+        oracle_input.q.resize(static_cast<std::size_t>(kStateDim * test_case.qk_heads * valid));
+        oracle_input.k.resize(static_cast<std::size_t>(kStateDim * test_case.qk_heads * valid));
+        oracle_input.v.resize(static_cast<std::size_t>(kStateDim * test_case.value_heads * valid));
+        oracle_input.g.resize(static_cast<std::size_t>(test_case.value_heads * valid));
+        oracle_input.beta.resize(static_cast<std::size_t>(test_case.value_heads * valid));
+        gdn_ref::Result reference = gdn_ref::evaluate(oracle_input, static_cast<double>(scale),
+                                                      test_case.normalize_qk, true);
+        std::copy(reference.out.begin(), reference.out.end(),
+                  expected_output.begin() + static_cast<std::size_t>(row) * value_row_size);
+        for (int column = 0; column < valid; ++column) {
+            written_slots[static_cast<std::size_t>(snapshot_bases[static_cast<std::size_t>(row)] +
+                                                   column)] = true;
+        }
+        references.push_back(std::move(reference));
+    }
+
+    DeviceInputs device(aggregate);
+    GuardedDeviceBuffer states(initial_states.size() * sizeof(float));
+    GuardedDeviceBuffer out(aggregate.v.size() * sizeof(std::uint16_t));
+    states.copy_from_host(initial_states.data(), states.bytes());
+    out.fill(0xff);
+    DeviceBuffer device_initial_slots  = to_device(initial_slots);
+    DeviceBuffer device_snapshot_bases = to_device(snapshot_bases);
+    DeviceBuffer device_valid_columns;
+    if (masked) { device_valid_columns = to_device(valid_columns); }
+
+    Tensor q(device.q.p, DType::BF16, {kStateDim, test_case.qk_heads, width, batch});
+    Tensor k(device.k.p, DType::BF16, {kStateDim, test_case.qk_heads, width, batch});
+    Tensor v(device.v.p, DType::BF16, {kStateDim, test_case.value_heads, width, batch});
+    Tensor g(device.g.p, DType::FP32, {test_case.value_heads, width, batch});
+    Tensor beta(device.beta.p, DType::FP32, {test_case.value_heads, width, batch});
+    Tensor states_tensor(states.data(), DType::FP32,
+                         {kStateDim, kStateDim, test_case.value_heads, slots});
+    Tensor valid_tensor;
+    if (masked) { valid_tensor = Tensor(device_valid_columns.p, DType::I32, {batch}); }
+    Tensor initial_tensor(device_initial_slots.p, DType::I32, {batch});
+    Tensor bases_tensor(device_snapshot_bases.p, DType::I32, {batch});
+    Tensor out_tensor(out.data(), DType::BF16, {kStateDim, test_case.value_heads, width, batch});
+    ops::gated_delta_net_snapshot(q, k, v, g, beta, scale, test_case.normalize_qk, states_tensor,
+                                  valid_tensor, initial_tensor, bases_tensor, out_tensor, nullptr);
+    cuda_synchronize();
+
+    const std::string label = std::string(test_case.name) +
+                              " batched snapshot B=" + std::to_string(batch) +
+                              (masked ? " masked" : " dense");
+    int failures                         = 0;
+    const std::vector<double> got_output = from_device_bf16(out.data(), aggregate.v.size());
+    failures += verify_recurrence(label + " out", got_output, expected_output,
+                                  gated_delta_net_output_bf16_criterion());
+    if (masked) {
+        const std::vector<std::uint16_t> output_bits =
+            from_device<std::uint16_t>(out.data(), aggregate.v.size());
+        for (int row = 0; row < batch; ++row) {
+            for (int column = valid_columns[static_cast<std::size_t>(row)]; column < width;
+                 ++column) {
+                const std::size_t begin =
+                    static_cast<std::size_t>(row) * value_row_size +
+                    static_cast<std::size_t>(column) * kStateDim * test_case.value_heads;
+                const std::size_t end =
+                    begin + static_cast<std::size_t>(kStateDim * test_case.value_heads);
+                if (!std::all_of(output_bits.begin() + begin, output_bits.begin() + end,
+                                 [](std::uint16_t value) { return value == 0; })) {
+                    std::cerr << label << ": invalid output tail is not exact zero\n";
+                    ++failures;
+                    row = batch;
+                    break;
+                }
+            }
+        }
+    }
+
+    const std::vector<float> got_states = from_device<float>(states.data(), initial_states.size());
+    for (int row = 0; row < batch; ++row) {
+        const int valid = masked ? valid_columns[static_cast<std::size_t>(row)] : width;
+        const std::size_t begin =
+            static_cast<std::size_t>(snapshot_bases[static_cast<std::size_t>(row)]) * state_size;
+        failures += verify_recurrence(
+            label + " row " + std::to_string(row) + " snapshots",
+            doubles(std::vector<float>(got_states.begin() + begin,
+                                       got_states.begin() + begin +
+                                           static_cast<std::size_t>(valid) * state_size)),
+            references[static_cast<std::size_t>(row)].snapshots,
+            gated_delta_net_state_fp32_criterion());
+    }
+    for (int slot = 0; slot < slots; ++slot) {
+        if (written_slots[static_cast<std::size_t>(slot)]) continue;
+        const std::size_t begin = static_cast<std::size_t>(slot) * state_size;
+        failures += verify_exact(
+            label + " untouched slot " + std::to_string(slot),
+            std::vector<float>(got_states.begin() + begin, got_states.begin() + begin + state_size),
+            std::vector<float>(initial_states.begin() + begin,
+                               initial_states.begin() + begin + state_size));
+    }
+    failures +=
+        verify_exact(label + " initial selectors unchanged",
+                     from_device_i32(device_initial_slots, initial_slots.size()), initial_slots);
+    failures +=
+        verify_exact(label + " snapshot bases unchanged",
+                     from_device_i32(device_snapshot_bases, snapshot_bases.size()), snapshot_bases);
+    if (masked) {
+        failures += verify_exact(label + " valid columns unchanged",
+                                 from_device_i32(device_valid_columns, valid_columns.size()),
+                                 valid_columns);
+    }
+    failures += states.verify_guards((label + " states").c_str());
+    failures += out.verify_guards((label + " out").c_str());
+    failures += verify_common_inputs_unchanged(label, aggregate, device.q, device.k, device.v,
+                                               device.g, device.beta);
     return failures;
 }
 
@@ -419,6 +582,14 @@ int main() {
     failures += snapshot_case({"27b verify fused-qk-norm", 16, 48, 4, true}, 8, 7, 1, 12104u);
     failures += snapshot_case({"35b verify fused-qk-norm near-zero", 16, 32, 4, true, true}, 8, 6,
                               1, 12204u);
+    failures +=
+        batched_snapshot_case({"35b ordinary", 16, 32, 1, true}, {8, 9, 10, 11, 12, 13, 14, 15},
+                              {0, 1, 2, 3, 4, 5, 6, 7}, {}, 16, 13001u);
+    failures += batched_snapshot_case({"27b MTP", 16, 48, 6, true}, {18, 19, 20}, {0, 6, 12},
+                                      {6, 3, 1}, 21, 13006u);
+    // Row 0's initial state is its final destination; every state tile must load it before write.
+    failures += batched_snapshot_case({"35b DFlash", 16, 32, 16, true}, {15, 33}, {0, 16}, {16, 7},
+                                      34, 13016u);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net correctness\n";
     return failures == 0 ? 0 : 1;

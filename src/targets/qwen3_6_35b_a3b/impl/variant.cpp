@@ -177,7 +177,7 @@ void Variant::gdn_input_projection_snapshot(
     Tensor output_gate_flat =
         output_gate.view({TextConfig::value_dim, static_cast<int>(hidden.ne[1])});
     ops::gdn_input_proj_conv_snapshot(hidden, weights.query_key_value_z, conv_weight, conv_states,
-                                      initial_slot, snapshot_base_slot, query, key, value,
+                                      Tensor{}, initial_slot, snapshot_base_slot, query, key, value,
                                       output_gate_flat, workspace, stream);
 }
 
@@ -259,7 +259,7 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(Weig
                                                                             std::int32_t first,
                                                                             std::int32_t last) {
     return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, first, last);
+        TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, 1, first, last);
 }
 
 std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfile,

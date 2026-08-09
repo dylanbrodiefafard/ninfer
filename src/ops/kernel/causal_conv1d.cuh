@@ -350,6 +350,59 @@ causal_conv1d_sequence_snapshot_kernel(const __nv_bfloat16* x, const __nv_bfloat
     }
 }
 
+// Batched serial-column form. One block row owns one request and one thread owns a channel, so
+// request-local state is loaded before that row publishes any snapshot. It is used for W=1 and
+// for masked B=1 widths outside the parallel small-W domain.
+template <bool Masked>
+__global__ void causal_conv1d_batched_sequence_snapshot_kernel(
+    const __nv_bfloat16* x, const __nv_bfloat16* weight, __nv_bfloat16* conv_states,
+    const std::int32_t* valid_columns, const std::int32_t* initial_state_slots,
+    const std::int32_t* snapshot_base_slots, __nv_bfloat16* out, std::int32_t C, std::int32_t width,
+    std::int64_t slot_stride) {
+    const std::int32_t batch = static_cast<std::int32_t>(blockIdx.y);
+    const std::int64_t c64   = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t C64   = static_cast<std::int64_t>(C);
+    if (c64 >= C64) { return; }
+
+    const std::int32_t valid = Masked ? valid_columns[batch] : width;
+    const __nv_bfloat16* init =
+        conv_states + static_cast<std::int64_t>(initial_state_slots[batch]) * slot_stride;
+    __nv_bfloat16 s0            = init[c64];
+    __nv_bfloat16 s1            = init[C64 + c64];
+    __nv_bfloat16 s2            = init[2 * C64 + c64];
+    const float w0              = __bfloat162float(weight[c64]);
+    const float w1              = __bfloat162float(weight[C64 + c64]);
+    const float w2              = __bfloat162float(weight[2 * C64 + c64]);
+    const float w3              = __bfloat162float(weight[3 * C64 + c64]);
+    const std::int64_t row_base = static_cast<std::int64_t>(batch) * width * C64;
+
+    for (std::int32_t column = 0; column < width; ++column) {
+        const std::int64_t out_idx = row_base + static_cast<std::int64_t>(column) * C64 + c64;
+        if (column >= valid) {
+            out[out_idx] = __float2bfloat16(0.0f);
+            continue;
+        }
+
+        const __nv_bfloat16 x0 = x[out_idx];
+        float acc              = 0.0f;
+        acc += w0 * __bfloat162float(s0);
+        acc += w1 * __bfloat162float(s1);
+        acc += w2 * __bfloat162float(s2);
+        acc += w3 * __bfloat162float(x0);
+        out[out_idx] = __float2bfloat16_rn(silu(acc));
+        s0           = s1;
+        s1           = s2;
+        s2           = x0;
+
+        __nv_bfloat16* snapshot =
+            conv_states +
+            static_cast<std::int64_t>(snapshot_base_slots[batch] + column) * slot_stride;
+        snapshot[c64]           = s0;
+        snapshot[C64 + c64]     = s1;
+        snapshot[2 * C64 + c64] = s2;
+    }
+}
+
 // Small-T snapshot form. A CTA owns all token outputs for one channel tile. The selected history
 // is cached before any snapshot slot is written, so initial_slot may name any slot, including one
 // overwritten by this call.
@@ -407,6 +460,73 @@ causal_conv1d_snapshot_smallt_kernel(const __nv_bfloat16* x, const __nv_bfloat16
         const std::int32_t pos = t - 2 + s;
         snapshot[static_cast<std::int64_t>(s) * C64 + c64] =
             pos < 0 ? history[pos + 3][lane] : x[static_cast<std::int64_t>(pos) * C64 + c64];
+    }
+}
+
+template <bool Masked>
+__global__ void causal_conv1d_batched_snapshot_smallt_kernel(
+    const __nv_bfloat16* x, const __nv_bfloat16* weight, __nv_bfloat16* conv_states,
+    const std::int32_t* valid_columns, const std::int32_t* initial_state_slots,
+    const std::int32_t* snapshot_base_slots, __nv_bfloat16* out, std::int32_t C, std::int32_t width,
+    std::int64_t slot_stride) {
+    __shared__ __nv_bfloat16 history[3][kCausalConvChannelTile];
+    __shared__ __nv_bfloat16 weights[4][kCausalConvChannelTile];
+
+    const std::int32_t batch  = static_cast<std::int32_t>(blockIdx.y);
+    const std::int32_t lane   = static_cast<std::int32_t>(threadIdx.x);
+    const std::int32_t column = static_cast<std::int32_t>(threadIdx.y);
+    const std::int64_t c64 = static_cast<std::int64_t>(blockIdx.x) * kCausalConvChannelTile + lane;
+    const std::int64_t C64 = static_cast<std::int64_t>(C);
+    const bool channel_valid = c64 < C64;
+
+    if (column == 0) {
+        const __nv_bfloat16* init =
+            conv_states + static_cast<std::int64_t>(initial_state_slots[batch]) * slot_stride;
+        for (std::int32_t s = 0; s < 3; ++s) {
+            history[s][lane] = channel_valid ? init[static_cast<std::int64_t>(s) * C64 + c64]
+                                             : __float2bfloat16(0.0f);
+        }
+        for (std::int32_t r = 0; r < 4; ++r) {
+            weights[r][lane] = channel_valid ? weight[static_cast<std::int64_t>(r) * C64 + c64]
+                                             : __float2bfloat16(0.0f);
+        }
+    }
+    __syncthreads();
+    if (!channel_valid) { return; }
+
+    const std::int32_t valid    = Masked ? valid_columns[batch] : width;
+    const std::int64_t row_base = static_cast<std::int64_t>(batch) * width * C64;
+    const std::int64_t out_idx  = row_base + static_cast<std::int64_t>(column) * C64 + c64;
+    if (column >= valid) {
+        out[out_idx] = __float2bfloat16(0.0f);
+        return;
+    }
+
+    const std::int32_t p0 = column - 3;
+    const std::int32_t p1 = column - 2;
+    const std::int32_t p2 = column - 1;
+    const __nv_bfloat16 x0 =
+        p0 < 0 ? history[p0 + 3][lane] : x[row_base + static_cast<std::int64_t>(p0) * C64 + c64];
+    const __nv_bfloat16 x1 =
+        p1 < 0 ? history[p1 + 3][lane] : x[row_base + static_cast<std::int64_t>(p1) * C64 + c64];
+    const __nv_bfloat16 x2 =
+        p2 < 0 ? history[p2 + 3][lane] : x[row_base + static_cast<std::int64_t>(p2) * C64 + c64];
+    const __nv_bfloat16 x3 = x[out_idx];
+
+    float acc = 0.0f;
+    acc += __bfloat162float(weights[0][lane]) * __bfloat162float(x0);
+    acc += __bfloat162float(weights[1][lane]) * __bfloat162float(x1);
+    acc += __bfloat162float(weights[2][lane]) * __bfloat162float(x2);
+    acc += __bfloat162float(weights[3][lane]) * __bfloat162float(x3);
+    out[out_idx] = __float2bfloat16_rn(silu(acc));
+
+    __nv_bfloat16* snapshot =
+        conv_states + static_cast<std::int64_t>(snapshot_base_slots[batch] + column) * slot_stride;
+    for (std::int32_t s = 0; s < 3; ++s) {
+        const std::int32_t pos = column - 2 + s;
+        snapshot[static_cast<std::int64_t>(s) * C64 + c64] =
+            pos < 0 ? history[pos + 3][lane]
+                    : x[row_base + static_cast<std::int64_t>(pos) * C64 + c64];
     }
 }
 

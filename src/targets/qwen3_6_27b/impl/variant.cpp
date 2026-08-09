@@ -170,15 +170,15 @@ void Variant::gdn_input_projection_snapshot(
     if (const auto* split =
             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
         ops::gdn_input_proj_conv_snapshot(hidden, split->query_key, split->value_z, conv_weight,
-                                          conv_states, initial_slot, snapshot_base_slot, query, key,
-                                          value, output_gate_flat, workspace, stream);
+                                          conv_states, Tensor{}, initial_slot, snapshot_base_slot,
+                                          query, key, value, output_gate_flat, workspace, stream);
         return;
     }
     const Weight& fused =
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
-    ops::gdn_input_proj_conv_snapshot(hidden, fused, conv_weight, conv_states, initial_slot,
-                                      snapshot_base_slot, query, key, value, output_gate_flat,
-                                      text_policy(fused), workspace, stream);
+    ops::gdn_input_proj_conv_snapshot(hidden, fused, conv_weight, conv_states, Tensor{},
+                                      initial_slot, snapshot_base_slot, query, key, value,
+                                      output_gate_flat, text_policy(fused), workspace, stream);
 }
 
 void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
@@ -293,10 +293,10 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
     switch (weights_profile) {
     case WeightsProfile::GroupwiseInt:
         return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, first, last);
+            TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, 1, first, last);
     case WeightsProfile::Nvfp4:
         return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, first, last);
+            QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, 1, first, last);
     }
     throw std::logic_error("invalid 27B weights profile");
 }

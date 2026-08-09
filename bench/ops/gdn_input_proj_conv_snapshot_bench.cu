@@ -1,4 +1,4 @@
-// Public Qwen3.6-27B GDN projection/convolution/snapshot benchmark.
+// Public Qwen3.6 GDN projection/convolution/snapshot benchmark.
 //
 // The timed body is exactly one gdn_input_proj_conv_snapshot() public Op call.
 // Production dispatch, kernel topology, and workspace use remain behind that contract.
@@ -61,7 +61,18 @@ enum class CacheState : std::uint8_t {
 enum class Format : std::uint8_t {
     Q4Q5,
     Nvfp4,
+    W8,
     All,
+};
+
+struct GdnGeometry {
+    std::int32_t hidden;
+    std::int32_t query_rows;
+    std::int32_t key_rows;
+    std::int32_t value_rows;
+    std::int32_t z_rows;
+
+    [[nodiscard]] std::int32_t channels() const { return query_rows + key_rows + value_rows; }
 };
 
 struct TokenSweep {
@@ -79,6 +90,8 @@ struct Options {
     int warmup                     = 10;
     int repeat                     = 100;
     std::uint64_t flush_bytes      = kDefaultFlushBytes;
+    std::int32_t batch             = 1;
+    std::vector<std::int32_t> valid_columns;
     std::string csv_out;
 };
 
@@ -91,6 +104,7 @@ struct Stats {
 struct Result {
     const char* profile;
     std::int32_t tokens;
+    std::int32_t batch;
     Execution execution;
     CacheState cache;
     Stats stats;
@@ -167,8 +181,20 @@ CacheMode parse_cache(std::string_view value) {
 Format parse_format(std::string_view value) {
     if (value == "q4q5") return Format::Q4Q5;
     if (value == "nvfp4") return Format::Nvfp4;
+    if (value == "w8") return Format::W8;
     if (value == "all") return Format::All;
-    throw std::invalid_argument("--format must be q4q5, nvfp4, or all");
+    throw std::invalid_argument("--format must be q4q5, nvfp4, w8, or all");
+}
+
+std::vector<std::int32_t> parse_valid_columns(std::string_view text) {
+    std::vector<std::int32_t> values;
+    while (!text.empty()) {
+        const std::size_t comma = text.find(',');
+        values.push_back(parse_positive_i32(text.substr(0, comma), "valid column"));
+        if (comma == std::string_view::npos) { break; }
+        text.remove_prefix(comma + 1);
+    }
+    return values;
 }
 
 ops::LinearPolicy parse_nvfp4_policy(std::string_view value) {
@@ -181,10 +207,12 @@ void usage(const char* argv0) {
     std::fprintf(stderr,
                  "Usage: %s [options]\n\n"
                  "Public workload:\n"
-                 "  --format q4q5|nvfp4|all      Default q4q5.\n"
+                 "  --format q4q5|nvfp4|w8|all   Default q4q5.\n"
                  "  --nvfp4-policy a16|a4        Default a4.\n"
                  "  --tokens T                    Exact token extent.\n"
                  "  --sweep START:END[:STEP]      Token sweep (default 1:6).\n\n"
+                 "  --batch B                     Exact batch in [1,8] (default 1).\n"
+                 "  --valid-columns V0,V1,...     Mixed valid prefixes; requires exact tokens.\n\n"
                  "Measurement:\n"
                  "  --execution graph|eager|both  Default graph.\n"
                  "  --cache cold|warm|both        Default both; cold matches layer-to-layer use.\n"
@@ -217,6 +245,10 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--sweep") {
             options.tokens = parse_sweep(next("sweep"));
             have_sweep     = true;
+        } else if (argument == "--batch") {
+            options.batch = parse_positive_i32(next("batch"), "batch");
+        } else if (argument == "--valid-columns") {
+            options.valid_columns = parse_valid_columns(next("valid columns"));
         } else if (argument == "--execution") {
             options.execution = parse_execution(next("execution"));
         } else if (argument == "--cache") {
@@ -246,6 +278,17 @@ Options parse_options(int argc, char** argv) {
     if (options.repeat <= 0) { throw std::invalid_argument("--repeat must be positive"); }
     if (options.flush_bytes > std::numeric_limits<std::size_t>::max()) {
         throw std::invalid_argument("flush buffer does not fit size_t");
+    }
+    if (options.batch > 8 || (options.batch > 1 && options.tokens.end > 16) ||
+        (!options.valid_columns.empty() &&
+         (options.batch == 1 || !have_tokens ||
+          options.valid_columns.size() != static_cast<std::size_t>(options.batch)))) {
+        throw std::invalid_argument("invalid batch or valid-column workload");
+    }
+    for (const std::int32_t valid : options.valid_columns) {
+        if (valid > options.tokens.begin) {
+            throw std::invalid_argument("valid column exceeds exact width");
+        }
     }
     return options;
 }
@@ -306,18 +349,23 @@ public:
 
     [[nodiscard]] const char* profile() const noexcept { return "q4-q5"; }
 
-    [[nodiscard]] std::size_t workspace_capacity(std::int32_t tokens) const {
+    [[nodiscard]] GdnGeometry geometry() const noexcept {
+        return {kHidden, kQueryRows, kKeyRows, kValueRows, kZRows};
+    }
+
+    [[nodiscard]] std::size_t workspace_capacity(std::int32_t batch, std::int32_t tokens) const {
         return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            kQueryRows, kKeyRows, kValueRows, tokens, tokens);
+            kQueryRows, kKeyRows, kValueRows, batch, tokens, tokens);
     }
 
     void launch(const Tensor& x, Tensor& conv_states, const Tensor& initial,
-                const Tensor& snapshot_base, Tensor& query, Tensor& key, Tensor& value, Tensor& z,
-                WorkspaceArena& workspace, cudaStream_t stream) {
+                const Tensor& snapshot_base, const Tensor& valid_columns, Tensor& query,
+                Tensor& key, Tensor& value, Tensor& z, WorkspaceArena& workspace,
+                cudaStream_t stream) {
         Tensor convolution_weight = conv_weight();
         ops::gdn_input_proj_conv_snapshot(x, qk_.weight, value_z_.weight, convolution_weight,
-                                          conv_states, initial, snapshot_base, query, key, value, z,
-                                          workspace, stream);
+                                          conv_states, valid_columns, initial, snapshot_base, query,
+                                          key, value, z, workspace, stream);
     }
 
     void flush(cudaStream_t stream) {
@@ -349,18 +397,23 @@ public:
         return policy_ == ops::LinearPolicy::AllowA4 ? "nvfp4-a4" : "nvfp4-a16";
     }
 
-    [[nodiscard]] std::size_t workspace_capacity(std::int32_t tokens) const {
+    [[nodiscard]] GdnGeometry geometry() const noexcept {
+        return {kHidden, kQueryRows, kKeyRows, kValueRows, kZRows};
+    }
+
+    [[nodiscard]] std::size_t workspace_capacity(std::int32_t batch, std::int32_t tokens) const {
         return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, kChannels + kZRows, kHidden, policy_, tokens, tokens);
+            QType::NVFP4, kChannels + kZRows, kHidden, policy_, batch, tokens, tokens);
     }
 
     void launch(const Tensor& x, Tensor& conv_states, const Tensor& initial,
-                const Tensor& snapshot_base, Tensor& query, Tensor& key, Tensor& value, Tensor& z,
-                WorkspaceArena& workspace, cudaStream_t stream) {
+                const Tensor& snapshot_base, const Tensor& valid_columns, Tensor& query,
+                Tensor& key, Tensor& value, Tensor& z, WorkspaceArena& workspace,
+                cudaStream_t stream) {
         Tensor convolution_weight = conv_weight();
         ops::gdn_input_proj_conv_snapshot(x, parent_.weight, convolution_weight, conv_states,
-                                          initial, snapshot_base, query, key, value, z, policy_,
-                                          workspace, stream);
+                                          valid_columns, initial, snapshot_base, query, key, value,
+                                          z, policy_, workspace, stream);
     }
 
     void flush(cudaStream_t stream) {
@@ -374,32 +427,90 @@ private:
     ops::LinearPolicy policy_;
 };
 
+class W8Fixture {
+public:
+    explicit W8Fixture(std::size_t flush_bytes)
+        : parent_(bench::make_row_split_weight(QType::W8G32_F16S, 12288, 2048, 2048,
+                                               {0x03, 0x00, 0x3c00})),
+          conv_weight_(bench::make_bf16(static_cast<std::size_t>(8192) * 4)), flush_(flush_bytes) {
+        CUDA_CHECK(cudaMemset(flush_.p, 0xa5, flush_.bytes));
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+
+    [[nodiscard]] Tensor conv_weight() const {
+        return Tensor(conv_weight_.p, DType::BF16, {8192, 4});
+    }
+
+    [[nodiscard]] const char* profile() const noexcept { return "w8"; }
+
+    [[nodiscard]] GdnGeometry geometry() const noexcept { return {2048, 2048, 2048, 4096, 4096}; }
+
+    [[nodiscard]] std::size_t workspace_capacity(std::int32_t batch, std::int32_t tokens) const {
+        return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, batch,
+                                                                          tokens, tokens);
+    }
+
+    void launch(const Tensor& x, Tensor& conv_states, const Tensor& initial,
+                const Tensor& snapshot_base, const Tensor& valid_columns, Tensor& query,
+                Tensor& key, Tensor& value, Tensor& z, WorkspaceArena& workspace,
+                cudaStream_t stream) {
+        Tensor convolution_weight = conv_weight();
+        ops::gdn_input_proj_conv_snapshot(x, parent_.weight, convolution_weight, conv_states,
+                                          valid_columns, initial, snapshot_base, query, key, value,
+                                          z, workspace, stream);
+    }
+
+    void flush(cudaStream_t stream) {
+        CUDA_CHECK(cudaMemsetAsync(flush_.p, 0xa5, flush_.bytes, stream));
+    }
+
+private:
+    bench::PackedQuantizedWeight parent_;
+    DeviceBuffer conv_weight_;
+    DeviceBuffer flush_;
+};
+
 template <class Fixture>
 class BenchmarkState {
 public:
-    BenchmarkState(Fixture& fixture, std::int32_t tokens)
-        : fixture_(fixture), slots_(tokens + 1),
-          input_(bench::make_bf16(static_cast<std::size_t>(kHidden) * tokens)),
-          states_(bench::make_bf16(static_cast<std::size_t>(kChannels) * 3 * slots_)),
-          initial_slot_(sizeof(std::int32_t)), snapshot_base_slot_(sizeof(std::int32_t)),
-          query_(static_cast<std::size_t>(kQueryRows) * tokens * 2),
-          key_(static_cast<std::size_t>(kKeyRows) * tokens * 2),
-          value_(static_cast<std::size_t>(kValueRows) * tokens * 2),
-          z_(static_cast<std::size_t>(kZRows) * tokens * 2),
-          workspace_bytes_(fixture.workspace_capacity(tokens)),
+    BenchmarkState(Fixture& fixture, std::int32_t tokens, const Options& options)
+        : fixture_(fixture), geometry_(fixture.geometry()), batch_(options.batch),
+          slots_(batch_ == 1 ? tokens + 1 : batch_ * tokens + batch_),
+          input_(bench::make_bf16(static_cast<std::size_t>(geometry_.hidden) * tokens * batch_)),
+          states_(bench::make_bf16(static_cast<std::size_t>(geometry_.channels()) * 3 * slots_)),
+          initial_slot_(static_cast<std::size_t>(batch_) * sizeof(std::int32_t)),
+          snapshot_base_slot_(static_cast<std::size_t>(batch_) * sizeof(std::int32_t)),
+          query_(static_cast<std::size_t>(geometry_.query_rows) * tokens * batch_ * 2),
+          key_(static_cast<std::size_t>(geometry_.key_rows) * tokens * batch_ * 2),
+          value_(static_cast<std::size_t>(geometry_.value_rows) * tokens * batch_ * 2),
+          z_(static_cast<std::size_t>(geometry_.z_rows) * tokens * batch_ * 2),
+          workspace_bytes_(fixture.workspace_capacity(batch_, tokens)),
           workspace_(std::max<std::size_t>(1, workspace_bytes_)),
-          x_(input_.p, DType::BF16, {kHidden, tokens}),
-          conv_states_(states_.p, DType::BF16, {kChannels, 3, slots_}),
-          initial_(initial_slot_.p, DType::I32, {1}),
-          snapshot_base_(snapshot_base_slot_.p, DType::I32, {1}),
-          query_tensor_(query_.p, DType::BF16, {kQueryRows, tokens}),
-          key_tensor_(key_.p, DType::BF16, {kKeyRows, tokens}),
-          value_tensor_(value_.p, DType::BF16, {kValueRows, tokens}),
-          z_tensor_(z_.p, DType::BF16, {kZRows, tokens}) {
-        const std::int32_t initial_slot          = tokens;
-        constexpr std::int32_t kSnapshotBaseSlot = 0;
-        initial_slot_.copy_from_host(&initial_slot, sizeof(initial_slot));
-        snapshot_base_slot_.copy_from_host(&kSnapshotBaseSlot, sizeof(kSnapshotBaseSlot));
+          x_(input_.p, DType::BF16, {geometry_.hidden, tokens, batch_}),
+          conv_states_(states_.p, DType::BF16, {geometry_.channels(), 3, slots_}),
+          initial_(initial_slot_.p, DType::I32, {batch_}),
+          snapshot_base_(snapshot_base_slot_.p, DType::I32, {batch_}),
+          query_tensor_(query_.p, DType::BF16, {geometry_.query_rows, tokens, batch_}),
+          key_tensor_(key_.p, DType::BF16, {geometry_.key_rows, tokens, batch_}),
+          value_tensor_(value_.p, DType::BF16, {geometry_.value_rows, tokens, batch_}),
+          z_tensor_(z_.p, DType::BF16, {geometry_.z_rows, tokens, batch_}) {
+        std::vector<std::int32_t> initial(static_cast<std::size_t>(batch_));
+        std::vector<std::int32_t> snapshot_base(static_cast<std::size_t>(batch_));
+        if (batch_ == 1) {
+            initial[0] = tokens;
+        } else {
+            for (std::int32_t row = 0; row < batch_; ++row) {
+                snapshot_base[static_cast<std::size_t>(row)] = row * tokens;
+                initial[static_cast<std::size_t>(row)]       = batch_ * tokens + row;
+            }
+        }
+        initial_slot_.copy_from_host(initial.data(), initial_slot_.bytes);
+        snapshot_base_slot_.copy_from_host(snapshot_base.data(), snapshot_base_slot_.bytes);
+        if (!options.valid_columns.empty()) {
+            valid_columns_ = DeviceBuffer(options.valid_columns.size() * sizeof(std::int32_t));
+            valid_columns_.copy_from_host(options.valid_columns.data(), valid_columns_.bytes);
+            valid_ = Tensor(valid_columns_.p, DType::I32, {batch_});
+        }
         CUDA_CHECK(cudaDeviceSynchronize());
     }
 
@@ -412,17 +523,20 @@ public:
     }
 
     void launch(cudaStream_t stream) {
-        fixture_.launch(x_, conv_states_, initial_, snapshot_base_, query_tensor_, key_tensor_,
-                        value_tensor_, z_tensor_, workspace_, stream);
+        fixture_.launch(x_, conv_states_, initial_, snapshot_base_, valid_, query_tensor_,
+                        key_tensor_, value_tensor_, z_tensor_, workspace_, stream);
     }
 
 private:
     Fixture& fixture_;
+    GdnGeometry geometry_;
+    std::int32_t batch_;
     std::int32_t slots_;
     DeviceBuffer input_;
     DeviceBuffer states_;
     DeviceBuffer initial_slot_;
     DeviceBuffer snapshot_base_slot_;
+    DeviceBuffer valid_columns_;
     DeviceBuffer query_;
     DeviceBuffer key_;
     DeviceBuffer value_;
@@ -433,6 +547,7 @@ private:
     Tensor conv_states_;
     Tensor initial_;
     Tensor snapshot_base_;
+    Tensor valid_;
     Tensor query_tensor_;
     Tensor key_tensor_;
     Tensor value_tensor_;
@@ -553,7 +668,7 @@ Stats measure_graph(BenchmarkState<Fixture>& state, const BodyTimedGraph& graph,
 template <class Fixture>
 std::vector<Result> run_point(Fixture& fixture, std::int32_t tokens, const Options& options,
                               cudaStream_t stream) {
-    BenchmarkState<Fixture> state(fixture, tokens);
+    BenchmarkState<Fixture> state(fixture, tokens, options);
 
     // Match production graph lifecycle: materialize once, capture, instantiate,
     // and prime one replay before the configured measurements.
@@ -575,17 +690,17 @@ std::vector<Result> run_point(Fixture& fixture, std::int32_t tokens, const Optio
                 execution == Execution::Graph
                     ? measure_graph(state, graph, cache, stream, options.warmup, options.repeat)
                     : measure_eager(state, cache, stream, options.warmup, options.repeat);
-            results.push_back(
-                {state.profile(), tokens, execution, cache, stats, state.workspace_bytes()});
+            results.push_back({state.profile(), tokens, options.batch, execution, cache, stats,
+                               state.workspace_bytes()});
         }
     }
     return results;
 }
 
 void print_result(const Result& result) {
-    std::printf("%-10s T=%-3d %-12s %-4s median=%8.3f us min=%8.3f us p95=%8.3f us "
+    std::printf("%-10s T=%-3d B=%-2d %-12s %-4s median=%8.3f us min=%8.3f us p95=%8.3f us "
                 "workspace=%zu\n",
-                result.profile, result.tokens, execution_name(result.execution),
+                result.profile, result.tokens, result.batch, execution_name(result.execution),
                 cache_name(result.cache), result.stats.median_us, result.stats.min_us,
                 result.stats.p95_us, result.workspace_bytes);
 }
@@ -601,10 +716,11 @@ void write_csv(const std::string& path, const std::vector<Result>& results, cons
     if (!stream) { throw std::runtime_error("failed to open CSV output"); }
     int runtime = 0;
     CUDA_CHECK(cudaRuntimeGetVersion(&runtime));
-    stream << "profile,tokens,execution,timed_scope,cache,median_us,min_us,p95_us,"
+    stream << "profile,tokens,batch,execution,timed_scope,cache,median_us,min_us,p95_us,"
               "workspace_bytes,warmup,repeat,flush_bytes,build_type,gpu,cuda_runtime\n";
     for (const Result& result : results) {
-        stream << result.profile << ',' << result.tokens << ',' << execution_name(result.execution)
+        stream << result.profile << ',' << result.tokens << ',' << result.batch << ','
+               << execution_name(result.execution)
                << ",full_gdn_input_proj_conv_snapshot_device_body," << cache_name(result.cache)
                << ',' << result.stats.median_us << ',' << result.stats.min_us << ','
                << result.stats.p95_us << ',' << result.workspace_bytes << ',' << options.warmup
@@ -635,16 +751,18 @@ int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
         DeviceContext context;
-        const char* configured_format = options.format == Format::Q4Q5
-                                            ? "q4q5"
-                                            : (options.format == Format::Nvfp4 ? "nvfp4" : "all");
-        std::printf(
-            "# op=gdn_input_proj_conv_snapshot format=%s nvfp4_policy=%s gpu=%s sm=%d "
-            "execution=%s "
-            "timed_scope=full_public_op_device_body cold_flush_mib=%llu\n",
-            configured_format, policy_name(options.nvfp4_policy), context.props.name, context.sm(),
-            options.execution == Execution::Both ? "both" : execution_name(options.execution),
-            static_cast<unsigned long long>(options.flush_bytes >> 20));
+        const char* configured_format = options.format == Format::Q4Q5    ? "q4q5"
+                                        : options.format == Format::Nvfp4 ? "nvfp4"
+                                        : options.format == Format::W8    ? "w8"
+                                                                          : "all";
+        std::printf("# op=gdn_input_proj_conv_snapshot format=%s nvfp4_policy=%s gpu=%s sm=%d "
+                    "batch=%d execution=%s "
+                    "timed_scope=full_public_op_device_body cold_flush_mib=%llu\n",
+                    configured_format, policy_name(options.nvfp4_policy), context.props.name,
+                    context.sm(), options.batch,
+                    options.execution == Execution::Both ? "both"
+                                                         : execution_name(options.execution),
+                    static_cast<unsigned long long>(options.flush_bytes >> 20));
 
         std::vector<Result> results;
         if (options.format == Format::Q4Q5 || options.format == Format::All) {
@@ -654,6 +772,10 @@ int main(int argc, char** argv) {
         if (options.format == Format::Nvfp4 || options.format == Format::All) {
             Nvfp4Fixture fixture(static_cast<std::size_t>(options.flush_bytes),
                                  options.nvfp4_policy);
+            run_fixture(fixture, options, context.stream, results);
+        }
+        if (options.format == Format::W8 || options.format == Format::All) {
+            W8Fixture fixture(static_cast<std::size_t>(options.flush_bytes));
             run_fixture(fixture, options, context.stream, results);
         }
         write_csv(options.csv_out, results, options, context);

@@ -135,26 +135,30 @@ __device__ __forceinline__ void load_qk_lane_bf16(float (&reg)[kQkPerLane],
 }
 
 // state_read / state_write are the read and write bases (fp32).
-//   Spec (snapshot):    read from state_read[safe(*initial_slot)] slot, write per-token snapshots
-//                       from *snapshot_base_slot.
+//   Spec (snapshot):    read a selected state slot and write per-column snapshots.
 //   non-spec:           read from state_read (caller-resolved view), write the final running state
 //                       into state_write (slot-0 view). Passing state_read == state_write is the
 //                       in-place form; distinct views let prefix-append prefill read a committed
 //                       snapshot slot and publish the running state to slot 0.
-template <bool Spec, bool NormalizeQK>
+template <bool Spec, bool NormalizeQK, bool Batched = false, bool Masked = false>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     recurrent_bf16_kernel(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
                           const __nv_bfloat16* __restrict__ v, const float* __restrict__ g,
                           const float* __restrict__ beta, float* __restrict__ state_read,
                           float* __restrict__ state_write,
-                          const std::int32_t* __restrict__ initial_slot,
-                          const std::int32_t* __restrict__ snapshot_base_slot,
+                          const std::int32_t* __restrict__ valid_columns,
+                          const std::int32_t* __restrict__ initial_state_slots,
+                          const std::int32_t* __restrict__ snapshot_base_slots,
                           __nv_bfloat16* __restrict__ out, std::int64_t T, head_map heads,
-                          float scale, std::int64_t state_slot_stride, std::int32_t slots) {
+                          float scale, std::int64_t state_slot_stride) {
+    static_assert(!Masked || (Spec && Batched));
     const int lane           = threadIdx.x;
     const int warp_id        = threadIdx.y;
+    const std::int32_t batch = Batched ? static_cast<std::int32_t>(blockIdx.y) : 0;
     const std::uint32_t h_v  = static_cast<std::uint32_t>(blockIdx.x);
     const std::uint32_t h_qk = static_cast<std::uint32_t>(heads.qk_head(static_cast<int>(h_v)));
+    const std::int32_t valid = Masked ? valid_columns[batch] : static_cast<std::int32_t>(T);
+    const std::int64_t column_base = static_cast<std::int64_t>(batch) * T;
 
     const std::uint32_t dv_base =
         static_cast<std::uint32_t>(blockIdx.z * kBlockDv + warp_id * kDvPerWarp);
@@ -162,9 +166,8 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
 
     float* read_base = state_read;
     if constexpr (Spec) {
-        const std::int32_t slot      = *initial_slot;
-        const std::int32_t safe_slot = (slot >= 0 && slot < slots) ? slot : 0;
-        read_base = state_read + static_cast<std::int64_t>(safe_slot) * state_slot_stride;
+        read_base =
+            state_read + static_cast<std::int64_t>(initial_state_slots[batch]) * state_slot_stride;
     }
     float* read_h = read_base + static_cast<std::int64_t>(h_v) * kStateDim * kStateDim;
 
@@ -176,12 +179,13 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     }
 
     __align__(16) float k_reg[kQkPerLane];
-    load_qk_lane_bf16<NormalizeQK>(k_reg, k + static_cast<std::int64_t>(h_qk) * kStateDim, lane,
+    load_qk_lane_bf16<NormalizeQK>(k_reg, k + (column_base * heads.H_qk + h_qk) * kStateDim, lane,
                                    dqk_base);
 
-    for (std::int64_t t = 0; t < T; ++t) {
-        const __nv_bfloat16* v_t  = v + (t * heads.H_v + h_v) * kStateDim;
-        const std::int64_t gb_off = t * heads.H_v + h_v;
+    for (std::int32_t t = 0; t < valid; ++t) {
+        const std::int64_t column = column_base + t;
+        const __nv_bfloat16* v_t  = v + (column * heads.H_v + h_v) * kStateDim;
+        const std::int64_t gb_off = column * heads.H_v + h_v;
         const float beta_val      = beta[gb_off];
         const float alpha         = expf(g[gb_off]);
 
@@ -204,13 +208,13 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
             }
         }
 
-        if (t + 1 < T) {
-            load_qk_lane_bf16<NormalizeQK>(k_reg, k + ((t + 1) * heads.H_qk + h_qk) * kStateDim,
-                                           lane, dqk_base);
+        if (t + 1 < valid) {
+            load_qk_lane_bf16<NormalizeQK>(
+                k_reg, k + ((column + 1) * heads.H_qk + h_qk) * kStateDim, lane, dqk_base);
         }
 
         __align__(16) float q_reg[kQkPerLane];
-        load_qk_lane_bf16<NormalizeQK>(q_reg, q + (t * heads.H_qk + h_qk) * kStateDim, lane,
+        load_qk_lane_bf16<NormalizeQK>(q_reg, q + (column * heads.H_qk + h_qk) * kStateDim, lane,
                                        dqk_base);
 
         float attn_val = 0.0f;
@@ -224,20 +228,30 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
         }
 
         if (lane < kDvPerWarp) {
-            out[(t * heads.H_v + h_v) * kStateDim + dv_base + lane] =
+            out[(column * heads.H_v + h_v) * kStateDim + dv_base + lane] =
                 __float2bfloat16(attn_val * scale);
         }
 
         if constexpr (Spec) {
             float* snapshot_h =
                 state_write +
-                static_cast<std::int64_t>(*snapshot_base_slot + t) * state_slot_stride +
+                static_cast<std::int64_t>(snapshot_base_slots[batch] + t) * state_slot_stride +
                 static_cast<std::int64_t>(h_v) * kStateDim * kStateDim;
 #pragma unroll
             for (int r = 0; r < kDvPerWarp; ++r) {
                 store_qk_lane(s_tile[r],
                               snapshot_h + static_cast<std::int64_t>(dv_base + r) * kStateDim,
                               dqk_base);
+            }
+        }
+    }
+
+    if constexpr (Spec && Batched) {
+        if (lane < kDvPerWarp) {
+            for (std::int32_t t = valid; t < T; ++t) {
+                const std::int64_t column = column_base + t;
+                out[(column * heads.H_v + h_v) * kStateDim + dv_base + lane] =
+                    __float2bfloat16(0.0f);
             }
         }
     }

@@ -31,15 +31,22 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& con
                         Tensor& conv_state_out, Tensor& out, cudaStream_t stream);
 
 /**
- * Snapshot form. `conv_states` is contiguous BF16 [C,3,Slots]. `initial_slot` and
- * `snapshot_base_slot` are contiguous I32 scalars. The former selects an initial window in
- * [0,Slots); after token t, the resulting [C,3] window is written to
- * `snapshot_base_slot + t`. The selected destination range is within [0,Slots). Other slots are
- * unchanged. `conv_states` is the only persistent state mutated. It must not overlap x, weight,
- * either selector, or out.
+ * Snapshot form for B independent sequences. `x` and `out` are contiguous BF16 [C,W,B],
+ * `conv_states` is contiguous BF16 [C,3,Slots], and `initial_state_slots` and
+ * `snapshot_base_slots` are contiguous I32 [B]. `valid_columns` is either contiguous I32 [B],
+ * with every value in [1,W], or an empty Tensor meaning every row has W valid columns. B=1
+ * accepts every positive W; B=2..8 accepts W=1..16.
+ *
+ * Row b starts from the window selected by initial_state_slots[b]. After valid column j, the new
+ * window is written to snapshot_base_slots[b]+j. Invalid-tail output columns are exact BF16 zero
+ * and do not mutate state. The caller reserves the complete [base,base+W) interval for every row;
+ * all row reservations are disjoint and no row overwrites another row's initial slot. A row's own
+ * initial slot may lie in its destination reservation. `conv_states` is the only persistent state
+ * mutated and must not overlap x, weight, metadata, or out.
  */
 void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& conv_states,
-                                 const Tensor& initial_slot, const Tensor& snapshot_base_slot,
-                                 Tensor& out, cudaStream_t stream);
+                                 const Tensor& valid_columns, const Tensor& initial_state_slots,
+                                 const Tensor& snapshot_base_slots, Tensor& out,
+                                 cudaStream_t stream);
 
 } // namespace ninfer::ops

@@ -130,45 +130,115 @@ void causal_conv1d_decode_launch(const Tensor& x, const Tensor& weight, const Te
     CUDA_CHECK(cudaGetLastError());
 }
 
-void causal_conv1d_sequence_snapshot_launch(const Tensor& x, const Tensor& weight,
-                                            Tensor& conv_states, const Tensor& initial_slot,
-                                            const Tensor& snapshot_base_slot, Tensor& out,
-                                            cudaStream_t stream) {
+template <bool Masked>
+void launch_batched_sequence_snapshot(const Tensor& x, const Tensor& weight, Tensor& conv_states,
+                                      const Tensor& valid_columns,
+                                      const Tensor& initial_state_slots,
+                                      const Tensor& snapshot_base_slots, Tensor& out,
+                                      std::int64_t slot_stride, cudaStream_t stream) {
+    const std::int32_t C     = x.ne[0];
+    const std::int32_t width = x.ne[1];
+    const std::int32_t batch = x.ne[2];
+    const int block          = width == 1 ? 256 : 32;
+    const dim3 grid(grid_for(C, block, "batched sequence snapshot"),
+                    static_cast<unsigned int>(batch));
+    causal_conv1d_batched_sequence_snapshot_kernel<Masked><<<grid, block, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.data),
+        static_cast<__nv_bfloat16*>(conv_states.data),
+        Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
+        static_cast<const std::int32_t*>(initial_state_slots.data),
+        static_cast<const std::int32_t*>(snapshot_base_slots.data),
+        static_cast<__nv_bfloat16*>(out.data), C, width, slot_stride);
+}
+
+template <bool Masked>
+void launch_batched_smallt_snapshot(const Tensor& x, const Tensor& weight, Tensor& conv_states,
+                                    const Tensor& valid_columns, const Tensor& initial_state_slots,
+                                    const Tensor& snapshot_base_slots, Tensor& out,
+                                    std::int64_t slot_stride, cudaStream_t stream) {
+    const std::int32_t C     = x.ne[0];
+    const std::int32_t width = x.ne[1];
+    const std::int32_t batch = x.ne[2];
+    const dim3 block(kCausalConvChannelTile, static_cast<unsigned int>(width));
+    const dim3 grid(grid_for(C, kCausalConvChannelTile, "batched small-T snapshot"),
+                    static_cast<unsigned int>(batch));
+    causal_conv1d_batched_snapshot_smallt_kernel<Masked><<<grid, block, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.data),
+        static_cast<__nv_bfloat16*>(conv_states.data),
+        Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
+        static_cast<const std::int32_t*>(initial_state_slots.data),
+        static_cast<const std::int32_t*>(snapshot_base_slots.data),
+        static_cast<__nv_bfloat16*>(out.data), C, width, slot_stride);
+}
+
+void causal_conv1d_snapshot_launch(const Tensor& x, const Tensor& weight, Tensor& conv_states,
+                                   const Tensor& valid_columns, const Tensor& initial_state_slots,
+                                   const Tensor& snapshot_base_slots, Tensor& out,
+                                   cudaStream_t stream) {
     const std::int32_t C = x.ne[0];
     const std::int32_t T = x.ne[1];
+    const std::int32_t B = x.ne[2];
     const std::int64_t slot_stride =
         static_cast<std::int64_t>(conv_states.ne[0]) * static_cast<std::int64_t>(conv_states.ne[1]);
 
-    if (T == 1) {
+    if (B == 1 && valid_columns.data == nullptr && T == 1) {
         constexpr int kBlock = 256;
         causal_conv1d_snapshot_decode_kernel<<<grid_for(C, kBlock, "snapshot decode"), kBlock, 0,
                                                stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const __nv_bfloat16*>(weight.data),
             static_cast<__nv_bfloat16*>(conv_states.data),
-            static_cast<const std::int32_t*>(initial_slot.data),
-            static_cast<const std::int32_t*>(snapshot_base_slot.data),
+            static_cast<const std::int32_t*>(initial_state_slots.data),
+            static_cast<const std::int32_t*>(snapshot_base_slots.data),
             static_cast<__nv_bfloat16*>(out.data), C, slot_stride);
-    } else if (T <= kCausalConvParallelMaxTokens) {
+    } else if (B == 1 && valid_columns.data == nullptr && T <= kCausalConvParallelMaxTokens) {
         const dim3 block(kCausalConvChannelTile, static_cast<unsigned int>(T));
         const int grid = grid_for(C, kCausalConvChannelTile, "small-T snapshot");
         causal_conv1d_snapshot_smallt_kernel<<<grid, block, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const __nv_bfloat16*>(weight.data),
             static_cast<__nv_bfloat16*>(conv_states.data),
-            static_cast<const std::int32_t*>(initial_slot.data),
-            static_cast<const std::int32_t*>(snapshot_base_slot.data),
+            static_cast<const std::int32_t*>(initial_state_slots.data),
+            static_cast<const std::int32_t*>(snapshot_base_slots.data),
             static_cast<__nv_bfloat16*>(out.data), C, T, slot_stride);
-    } else {
+    } else if (B == 1 && valid_columns.data == nullptr) {
         constexpr int kBlock = 32;
         causal_conv1d_sequence_snapshot_kernel<<<grid_for(C, kBlock, "sequence snapshot"), kBlock,
                                                  0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const __nv_bfloat16*>(weight.data),
             static_cast<__nv_bfloat16*>(conv_states.data),
-            static_cast<const std::int32_t*>(initial_slot.data),
-            static_cast<const std::int32_t*>(snapshot_base_slot.data),
+            static_cast<const std::int32_t*>(initial_state_slots.data),
+            static_cast<const std::int32_t*>(snapshot_base_slots.data),
             static_cast<__nv_bfloat16*>(out.data), C, T, slot_stride);
+    } else if (T == 1) {
+        if (valid_columns.data == nullptr) {
+            launch_batched_sequence_snapshot<false>(x, weight, conv_states, valid_columns,
+                                                    initial_state_slots, snapshot_base_slots, out,
+                                                    slot_stride, stream);
+        } else {
+            launch_batched_sequence_snapshot<true>(x, weight, conv_states, valid_columns,
+                                                   initial_state_slots, snapshot_base_slots, out,
+                                                   slot_stride, stream);
+        }
+    } else if (T <= kCausalConvParallelMaxTokens) {
+        if (valid_columns.data == nullptr) {
+            launch_batched_smallt_snapshot<false>(x, weight, conv_states, valid_columns,
+                                                  initial_state_slots, snapshot_base_slots, out,
+                                                  slot_stride, stream);
+        } else {
+            launch_batched_smallt_snapshot<true>(x, weight, conv_states, valid_columns,
+                                                 initial_state_slots, snapshot_base_slots, out,
+                                                 slot_stride, stream);
+        }
+    } else if (valid_columns.data == nullptr) {
+        launch_batched_sequence_snapshot<false>(x, weight, conv_states, valid_columns,
+                                                initial_state_slots, snapshot_base_slots, out,
+                                                slot_stride, stream);
+    } else {
+        launch_batched_sequence_snapshot<true>(x, weight, conv_states, valid_columns,
+                                               initial_state_slots, snapshot_base_slots, out,
+                                               slot_stride, stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }
