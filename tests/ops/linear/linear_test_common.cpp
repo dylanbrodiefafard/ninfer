@@ -83,8 +83,10 @@ std::vector<std::int32_t> all_indices(std::int32_t extent) {
 
 std::vector<std::int32_t> sampled_indices(std::int32_t extent) {
     std::vector<std::int32_t> result;
-    for (const std::int32_t index :
-         {0, 1, extent / 4, extent / 2, (3 * extent) / 4, extent - 2, extent - 1}) {
+    constexpr std::int32_t kSamples = 32;
+    for (std::int32_t sample = 0; sample < kSamples; ++sample) {
+        const std::int32_t index = static_cast<std::int32_t>(
+            (static_cast<std::int64_t>(extent - 1) * sample) / (kSamples - 1));
         if (index >= 0 && index < extent &&
             std::find(result.begin(), result.end(), index) == result.end()) {
             result.push_back(index);

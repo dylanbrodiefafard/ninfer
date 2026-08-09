@@ -40,8 +40,6 @@ namespace {
 
 constexpr double kRtx5090DramGBs           = 1792.0;
 constexpr double kRtx5090SustainedReadGBs  = 1674.5;
-constexpr double kRtx5090DenseBf16Tflops   = 209.5;
-constexpr double kRtx5090DenseNvfp4Tflops  = 1676.0;
 constexpr std::uint64_t kDefaultFlushBytes = 256ULL << 20;
 constexpr int kDefaultWarmup               = 3;
 constexpr int kDefaultRepeat               = 20;
@@ -137,35 +135,29 @@ struct PointGroup {
 
 struct Result {
     std::string labels;
-    const char* qtype_name      = "";
-    const char* policy_name     = "";
-    const char* activation_name = "";
-    std::int32_t n              = 0;
-    std::int32_t k              = 0;
-    std::int32_t t              = 0;
-    std::uint64_t weight_bytes  = 0;
-    std::uint64_t x_bytes       = 0;
-    std::uint64_t out_bytes     = 0;
-    std::uint64_t model_bytes   = 0;
-    double useful_flops         = 0.0;
-    double median_us            = 0.0;
-    double min_us               = 0.0;
-    double p95_us               = 0.0;
-    double effective_gbs        = 0.0;
-    double dram_spec_pct        = 0.0;
-    double sustained_read_pct   = 0.0;
-    double useful_tflops        = 0.0;
-    double tc_peak_tflops       = 0.0;
-    double tc_spec_pct          = 0.0;
-    double memory_floor_us      = 0.0;
-    double compute_floor_us     = 0.0;
-    double roofline_floor_us    = 0.0;
-    double roofline_pct         = 0.0;
-    const char* bound           = "";
-    double delta_pct            = std::numeric_limits<double>::quiet_NaN();
-    int warmup                  = 0;
-    int repeat                  = 0;
-    std::uint64_t flush_bytes   = 0;
+    const char* qtype_name     = "";
+    const char* policy_name    = "";
+    std::int32_t n             = 0;
+    std::int32_t k             = 0;
+    std::int32_t t             = 0;
+    std::uint64_t weight_bytes = 0;
+    std::uint64_t x_bytes      = 0;
+    std::uint64_t out_bytes    = 0;
+    std::uint64_t model_bytes  = 0;
+    double useful_flops        = 0.0;
+    double median_us           = 0.0;
+    double min_us              = 0.0;
+    double p95_us              = 0.0;
+    double effective_gbs       = 0.0;
+    double dram_spec_pct       = 0.0;
+    double sustained_read_pct  = 0.0;
+    double useful_tflops       = 0.0;
+    double memory_floor_us     = 0.0;
+    double memory_floor_pct    = 0.0;
+    double delta_pct           = std::numeric_limits<double>::quiet_NaN();
+    int warmup                 = 0;
+    int repeat                 = 0;
+    std::uint64_t flush_bytes  = 0;
 };
 
 struct LinearBenchWeight {
@@ -243,10 +235,6 @@ const char* policy_name(LinearPolicy policy) {
     if (policy == LinearPolicy::A16Only) { return "A16"; }
     if (policy == LinearPolicy::AllowA4) { return "A4"; }
     throw std::invalid_argument("unsupported Linear benchmark policy");
-}
-
-const char* activation_name(QType qtype, LinearPolicy policy, std::int32_t t) {
-    return qtype == QType::NVFP4 && policy == LinearPolicy::AllowA4 && t > 16 ? "A4" : "A16";
 }
 
 QType parse_qtype(std::string_view text) {
@@ -546,18 +534,11 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
     const double seconds = timing.median_us * 1.0e-6;
     const double memory_floor_us =
         static_cast<double>(model_bytes) / (kRtx5090DramGBs * 1.0e9) * 1.0e6;
-    const bool uses_nvfp4_tensor_core =
-        point.qtype == QType::NVFP4 && point.policy == LinearPolicy::AllowA4 && point.t > 16;
-    const double tc_peak_tflops =
-        uses_nvfp4_tensor_core ? kRtx5090DenseNvfp4Tflops : kRtx5090DenseBf16Tflops;
-    const double compute_floor_us  = useful_flops / (tc_peak_tflops * 1.0e12) * 1.0e6;
-    const double roofline_floor_us = std::max(memory_floor_us, compute_floor_us);
 
     Result result;
     result.labels             = join_labels(point.labels);
     result.qtype_name         = qtype_name(point.qtype);
     result.policy_name        = policy_name(point.policy);
-    result.activation_name    = activation_name(point.qtype, point.policy, point.t);
     result.n                  = point.n;
     result.k                  = point.k;
     result.t                  = point.t;
@@ -573,13 +554,8 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
     result.dram_spec_pct      = result.effective_gbs / kRtx5090DramGBs * 100.0;
     result.sustained_read_pct = result.effective_gbs / kRtx5090SustainedReadGBs * 100.0;
     result.useful_tflops      = useful_flops / seconds / 1.0e12;
-    result.tc_peak_tflops     = tc_peak_tflops;
-    result.tc_spec_pct        = result.useful_tflops / tc_peak_tflops * 100.0;
     result.memory_floor_us    = memory_floor_us;
-    result.compute_floor_us   = compute_floor_us;
-    result.roofline_floor_us  = roofline_floor_us;
-    result.roofline_pct       = roofline_floor_us / timing.median_us * 100.0;
-    result.bound              = memory_floor_us >= compute_floor_us ? "memory" : "compute";
+    result.memory_floor_pct   = memory_floor_us / timing.median_us * 100.0;
     result.warmup             = opt.warmup;
     result.repeat             = opt.repeat;
     result.flush_bytes        = opt.flush_bytes;
@@ -687,34 +663,28 @@ void print_header() {
     CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
     std::printf("# actual_gpu=%s sm=%d%d reference_gpu=RTX_5090\n", properties.name,
                 properties.major, properties.minor);
-    std::printf("# dram_spec_gbs=%.1f sustained_read_gbs=%.1f "
-                "bf16_dense_tc_spec_tflops=%.1f nvfp4_dense_tc_spec_tflops=%.1f cache=cold\n",
-                kRtx5090DramGBs, kRtx5090SustainedReadGBs, kRtx5090DenseBf16Tflops,
-                kRtx5090DenseNvfp4Tflops);
+    std::printf("# dram_spec_gbs=%.1f sustained_read_gbs=%.1f cache=cold\n", kRtx5090DramGBs,
+                kRtx5090SustainedReadGBs);
 }
 
 void print_results(const std::vector<Result>& results) {
-    std::printf("%-44s %5s %3s %3s %8s %8s %6s %11s %11s %11s %10s %7s %7s %10s %7s %7s "
-                "%9s %8s\n",
-                "label", "qt", "pol", "act", "N", "K", "T", "median_us", "min_us", "p95_us",
-                "eff_GB/s", "DRAM_%", "READ_%", "TFLOP/s", "TC_%", "bound", "roof_%", "delta_%");
+    std::printf("%-44s %5s %3s %8s %8s %6s %11s %11s %11s %10s %7s %7s %10s %9s %8s\n", "label",
+                "qt", "pol", "N", "K", "T", "median_us", "min_us", "p95_us", "eff_GB/s", "DRAM_%",
+                "READ_%", "TFLOP/s", "mem_%", "delta_%");
     for (const Result& result : results) {
         const bool have_delta = std::isfinite(result.delta_pct);
         char delta[32];
-        char tc_pct[32];
         if (have_delta) {
             std::snprintf(delta, sizeof(delta), "%.2f", result.delta_pct);
         } else {
             std::snprintf(delta, sizeof(delta), "-");
         }
-        std::snprintf(tc_pct, sizeof(tc_pct), "%.2f", result.tc_spec_pct);
-        std::printf("%-44s %5s %3s %3s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %7.2f "
-                    "%7.2f %10.2f %7s %7s %9.2f %8s\n",
-                    result.labels.c_str(), result.qtype_name, result.policy_name,
-                    result.activation_name, result.n, result.k, result.t, result.median_us,
-                    result.min_us, result.p95_us, result.effective_gbs, result.dram_spec_pct,
-                    result.sustained_read_pct, result.useful_tflops, tc_pct, result.bound,
-                    result.roofline_pct, delta);
+        std::printf("%-44s %5s %3s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %7.2f "
+                    "%7.2f %10.2f %9.2f %8s\n",
+                    result.labels.c_str(), result.qtype_name, result.policy_name, result.n,
+                    result.k, result.t, result.median_us, result.min_us, result.p95_us,
+                    result.effective_gbs, result.dram_spec_pct, result.sustained_read_pct,
+                    result.useful_tflops, result.memory_floor_pct, delta);
     }
 }
 
@@ -732,22 +702,20 @@ void write_csv(const std::filesystem::path& path, const std::vector<Result>& res
     if (path.has_parent_path()) { std::filesystem::create_directories(path.parent_path()); }
     std::ofstream out(path);
     if (!out) { throw std::runtime_error("failed to open CSV output: " + path.string()); }
-    out << "label,qtype,policy,activation_compute,N,K,T,weight_bytes,x_bytes,out_bytes,model_bytes,"
+    out << "label,qtype,policy,N,K,T,weight_bytes,x_bytes,out_bytes,model_bytes,"
            "useful_flops,median_us,min_us,p95_us,effective_gbs,dram_spec_gbs,dram_spec_pct,"
-           "sustained_read_gbs,sustained_read_pct,useful_tflops,tc_peak_tflops,tc_spec_pct,"
-           "memory_floor_us,compute_floor_us,roofline_floor_us,bound,roofline_pct,delta_pct,"
+           "sustained_read_gbs,sustained_read_pct,useful_tflops,memory_floor_us,memory_floor_pct,"
+           "delta_pct,"
            "warmup,repeat,flush_bytes\n";
     for (const Result& result : results) {
         out << csv_quote(result.labels) << ',' << result.qtype_name << ',' << result.policy_name
-            << ',' << result.activation_name << ',' << result.n << ',' << result.k << ','
-            << result.t << ',' << result.weight_bytes << ',' << result.x_bytes << ','
-            << result.out_bytes << ',' << result.model_bytes << ',' << result.useful_flops << ','
-            << result.median_us << ',' << result.min_us << ',' << result.p95_us << ','
-            << result.effective_gbs << ',' << kRtx5090DramGBs << ',' << result.dram_spec_pct << ','
-            << kRtx5090SustainedReadGBs << ',' << result.sustained_read_pct << ','
-            << result.useful_tflops << ',' << result.tc_peak_tflops << ',' << result.tc_spec_pct;
-        out << ',' << result.memory_floor_us << ',' << result.compute_floor_us << ','
-            << result.roofline_floor_us << ',' << result.bound << ',' << result.roofline_pct << ',';
+            << ',' << result.n << ',' << result.k << ',' << result.t << ',' << result.weight_bytes
+            << ',' << result.x_bytes << ',' << result.out_bytes << ',' << result.model_bytes << ','
+            << result.useful_flops << ',' << result.median_us << ',' << result.min_us << ','
+            << result.p95_us << ',' << result.effective_gbs << ',' << kRtx5090DramGBs << ','
+            << result.dram_spec_pct << ',' << kRtx5090SustainedReadGBs << ','
+            << result.sustained_read_pct << ',' << result.useful_tflops << ','
+            << result.memory_floor_us << ',' << result.memory_floor_pct << ',';
         if (std::isfinite(result.delta_pct)) { out << result.delta_pct; }
         out << ',' << result.warmup << ',' << result.repeat << ',' << result.flush_bytes << '\n';
     }

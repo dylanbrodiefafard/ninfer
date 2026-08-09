@@ -87,9 +87,11 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
 }
 
 int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
-    constexpr std::array invocations{
+    const std::int32_t first_a4 = k == 6144 ? 7 : 8;
+    const std::array invocations{
         Invocation{1, ops::LinearPolicy::A16Only},
         Invocation{4, ops::LinearPolicy::A16Only},
+        Invocation{first_a4, ops::LinearPolicy::AllowA4},
         Invocation{17, ops::LinearPolicy::AllowA4},
         Invocation{1024, ops::LinearPolicy::AllowA4},
     };
@@ -124,7 +126,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         ops::linear_add(x, weight, residual, invocation.policy, workspace, nullptr);
         cuda_check(cudaDeviceSynchronize(), "synchronize NVFP4 linear_add");
 
-        const bool a4 = invocation.policy == ops::LinearPolicy::AllowA4 && invocation.tokens > 16;
+        const bool a4           = invocation.policy == ops::LinearPolicy::AllowA4;
         const std::string label = "NVFP4 linear_add [" + std::to_string(n) + "," +
                                   std::to_string(k) + "] " + (a4 ? "A4" : "A16") +
                                   " T=" + std::to_string(invocation.tokens);

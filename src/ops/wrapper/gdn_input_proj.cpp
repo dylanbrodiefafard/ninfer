@@ -12,7 +12,6 @@
 #include "ops/gdn_input_proj/w8/w8_gdn_input_plan.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
-#include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -312,8 +311,7 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
             (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
             throw std::invalid_argument("gdn_input_proj workspace: unsupported NVFP4 profile");
         }
-        if (policy == LinearPolicy::A16Only || max_tokens < detail::kNvfp4FirstA4T) { return 0; }
-        return detail::nvfp4_w4a4_workspace_capacity_bytes(max_tokens, input_rows);
+        return detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
     if (parent_qtype == QType::W8G32_F16S && parent_rows == 12288 && input_rows == 2048 &&
         policy == LinearPolicy::A16Only) {

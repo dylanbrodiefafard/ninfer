@@ -3,7 +3,6 @@
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
-#include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 #include "ops/linear_add/w8/w8_linear_add_plan.h"
@@ -114,8 +113,8 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         if (!supported || (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
             throw std::invalid_argument("linear_add workspace: unsupported NVFP4 profile");
         }
-        if (policy == LinearPolicy::A16Only || max_tokens < detail::kNvfp4FirstA4T) { return 0; }
-        return detail::nvfp4_w4a4_workspace_capacity_bytes(max_tokens, input_rows);
+        return detail::nvfp4_linear_add_workspace_capacity_bytes(output_rows, input_rows, policy,
+                                                                 min_tokens, max_tokens);
     }
     throw std::invalid_argument("linear_add workspace: unsupported weight format");
 }

@@ -9,6 +9,18 @@
 namespace ninfer::ops::detail {
 namespace {
 
+enum class Nvfp4GdnInputRoute : std::uint8_t {
+    A16,
+    W4A4,
+};
+
+Nvfp4GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
+    if (tokens <= 0) { throw std::invalid_argument("nvfp4 gdn_input_proj: T must be positive"); }
+    if (policy == LinearPolicy::A16Only) { return Nvfp4GdnInputRoute::A16; }
+    if (policy == LinearPolicy::AllowA4) { return Nvfp4GdnInputRoute::W4A4; }
+    throw std::invalid_argument("nvfp4 gdn_input_proj: unsupported policy");
+}
+
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                 cudaStream_t stream) {
     constexpr std::int32_t kChunk   = kNvfp4LastSmallT;
@@ -36,15 +48,22 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
 
 } // namespace
 
+std::size_t nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::int32_t min_tokens,
+                                                     std::int32_t max_tokens) {
+    if (min_tokens <= 0 || max_tokens < min_tokens) {
+        throw std::invalid_argument("nvfp4 gdn_input_proj workspace: invalid token interval");
+    }
+    (void)resolve_route(policy, min_tokens);
+    return resolve_route(policy, max_tokens) == Nvfp4GdnInputRoute::W4A4
+               ? nvfp4_w4a4_workspace_capacity_bytes(max_tokens, Nvfp4GdnInputGeometry::kInputRows)
+               : 0;
+}
+
 void nvfp4_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                               LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
-    if (policy == LinearPolicy::A16Only ||
-        (policy == LinearPolicy::AllowA4 && x.ne[1] < kNvfp4FirstA4T)) {
+    if (resolve_route(policy, x.ne[1]) == Nvfp4GdnInputRoute::A16) {
         launch_a16(x, weight, qkv, z, stream);
         return;
-    }
-    if (policy != LinearPolicy::AllowA4) {
-        throw std::invalid_argument("nvfp4 gdn_input_proj: unsupported policy");
     }
     if (workspace == nullptr) {
         throw std::invalid_argument("nvfp4 W4A4 gdn_input_proj requires caller workspace");

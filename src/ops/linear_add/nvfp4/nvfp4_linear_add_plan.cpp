@@ -9,6 +9,24 @@
 namespace ninfer::ops::detail {
 namespace {
 
+enum class Nvfp4LinearAddRoute : std::uint8_t {
+    A16,
+    W4A4,
+};
+
+Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows,
+                                  LinearPolicy policy, std::int32_t tokens) {
+    if (tokens <= 0 || output_rows != 5120 || (input_rows != 6144 && input_rows != 17408)) {
+        throw std::invalid_argument("nvfp4 linear_add: unsupported shape");
+    }
+    if (policy == LinearPolicy::A16Only) { return Nvfp4LinearAddRoute::A16; }
+    if (policy != LinearPolicy::AllowA4) {
+        throw std::invalid_argument("nvfp4 linear_add: unsupported policy");
+    }
+    const std::int32_t first_w4a4 = input_rows == 6144 ? 7 : 8;
+    return tokens >= first_w4a4 ? Nvfp4LinearAddRoute::W4A4 : Nvfp4LinearAddRoute::A16;
+}
+
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
     constexpr std::int32_t kChunk = kNvfp4LastSmallT;
     for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kChunk) {
@@ -29,16 +47,25 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& residual, cudaStr
 
 } // namespace
 
+std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
+                                                      std::int32_t input_rows, LinearPolicy policy,
+                                                      std::int32_t min_tokens,
+                                                      std::int32_t max_tokens) {
+    if (min_tokens <= 0 || max_tokens < min_tokens) {
+        throw std::invalid_argument("nvfp4 linear_add workspace: invalid token interval");
+    }
+    (void)resolve_route(output_rows, input_rows, policy, min_tokens);
+    return resolve_route(output_rows, input_rows, policy, max_tokens) == Nvfp4LinearAddRoute::W4A4
+               ? nvfp4_w4a4_workspace_capacity_bytes(max_tokens, input_rows)
+               : 0;
+}
+
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                                LinearPolicy policy, WorkspaceArena& workspace,
                                cudaStream_t stream) {
-    if (policy == LinearPolicy::A16Only ||
-        (policy == LinearPolicy::AllowA4 && x.ne[1] < kNvfp4FirstA4T)) {
+    if (resolve_route(weight.n, weight.k, policy, x.ne[1]) == Nvfp4LinearAddRoute::A16) {
         launch_a16(x, weight, residual, stream);
         return;
-    }
-    if (policy != LinearPolicy::AllowA4) {
-        throw std::invalid_argument("nvfp4 linear_add: unsupported policy");
     }
     auto scope                       = workspace.scope();
     const Nvfp4W4a4Workspace scratch = allocate_nvfp4_w4a4_workspace(workspace, x.ne[1], weight.k);

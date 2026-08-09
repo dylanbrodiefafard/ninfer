@@ -31,9 +31,10 @@ Q4/Q5/Q6/W8 和 BF16_CTRL 使用现有 A16 route。以下 NVFP4 exact problem �
 [ 5120,17408] MLP down
 ```
 
-`--policy a4` 测量完整 public 调用：`T<=16` 仍解析为 A16，`T>16` 由当前 production
-route 量化 activation 后执行 W4A4。默认 prefill chunk `T=1024` 是 A4 surface 的首要
-性能点；更大 T 只用于确认正 T 合同和 route 的可扩展性。
+`--policy a4` 测量完整 public 调用，由 production resolver 根据 exact geometry 与 T
+选择已经资格化的 A16 或 A4 route。benchmark 不复制或推断该 private 选择。默认 prefill
+chunk `T=1024` 是 AllowA4 surface 的首要性能点；更大 T 只用于确认正 T 合同和 route
+的可扩展性。
 
 ## 1. 使用场景
 
@@ -336,38 +337,28 @@ traffic。它不计：
 可达利用率，不替换 fixed-spec 指标，也不改变一遍 logical weight read 的
 `model_bytes` 口径。copy probe 同时读写，不是这类 GEMV 的适用上限。
 
-## 5. 理论计算量
+## 5. 数学工作量与 route-neutral 指标
 
 所有 weight types 使用同一个数学 GEMM 工作量：
 
 ```text
 useful_flops = 2*N*K*T
 useful_TFLOP/s = useful_flops / seconds / 1e12
-tc_spec_pct = useful_TFLOP/s / tc_peak_TFLOP/s * 100
 ```
 
 不把 dequantization、bit decode、padding、split-K 重复工作或 tile rounding 加入
 `useful_flops`，也不从 private schedule 推导 `executed_tflops`。这保证不同实现都用同一
 数学工作量比较。
 
-当前所有 suite point 都是 A16，compute 参照使用 RTX 5090 dense BF16 Tensor Core
-`209.5 TFLOP/s`。NVFP4 `AllowA4` 且 `T>16` 的显式 point 使用 RTX 5090 dense FP4
-FP32-accumulate `1676.0 TFLOP/s`；它包含 activation quantization 的完整 Op 时间。其他
-point 不得套用 FP4 peak，也不用自建 probe 的实测值替代固定硬件规格。
-
-统一 roofline 参考为：
+`AllowA4` 是许可而不是 actual activation-compute profile；同一 policy 下不同 exact
+geometry 和 T 可以选择不同 route。因此长期 public benchmark 不输出
+`activation_compute`、`TC_%`、compute roof、`bound` 或组合 roofline，也不通过 policy
+猜测 private resolver。统一保留的固定规格参考只有 memory floor：
 
 ```text
 memory_floor_us = model_bytes / 1792 GB/s
-tc_peak_TFLOP/s =
-    1676.0 for NVFP4 AllowA4 with T>16
-    209.5 otherwise
-compute_floor_us = useful_flops / tc_peak_TFLOP/s
-roofline_floor_us = max(memory_floor_us, compute_floor_us)
-roofline_efficiency = roofline_floor_us / median_us
+memory_floor_pct = memory_floor_us / median_us
 ```
-
-每个结果同时输出 `memory` 或 `compute` bound。不存在写死的“小 T/大 T”分界。
 
 ## 6. 计时合同
 
@@ -392,17 +383,15 @@ console header 固定打印：
 gpu=RTX 5090
 dram_spec=1792 GB/s
 sustained_read=1674.5 GB/s
-bf16_dense_tc_spec=209.5 TFLOP/s
-nvfp4_dense_tc_spec=1676.0 TFLOP/s
 cache=cold
 ```
 
 单行结果保留：
 
 ```text
-label qtype policy activation_compute N K T median_us min_us p95_us
+label qtype policy N K T median_us min_us p95_us
 model_GB effective_GB/s DRAM_% READ_%
-useful_TFLOP/s TC_% bound roofline_%
+useful_TFLOP/s memory_floor_pct
 ```
 
 sweep 额外输出相邻 T 的 `delta_%`。CSV 可以增加 weight/x/out byte breakdown、warmup、
@@ -487,15 +476,13 @@ plan 层重新引入长期 pure Linear benchmark。public `--sweep` 只观察最
 
 只有同时完成以下事项才增加新的 benchmark type：
 
-1. public policy 对应真实可达的 compute path；
+1. public policy 对应真实可达的 production path；
 2. packed-weight fixture 支持该 persistent format；
 3. model-byte 公式明确；
-4. 对应固定硬件 peak 明确；
-5. public numerical suite 已按该 compute criterion 资格化。
+4. public numerical suite 已按该 policy 下实际可达 routes 资格化。
 
-policy 只是许可，输出中的 peak 必须按 production resolver 实际选择的 activation-compute
-profile 确定，不能把许可本身冒充为低精度执行。当前所有预置 suite 显式使用
-`A16Only`；NVFP4 A4 保留为数字 geometry 的显式 point。
+policy 只是许可，长期 benchmark 不把许可本身冒充为低精度执行。当前所有预置 suite
+显式使用 `A16Only`；NVFP4 AllowA4 保留为数字 geometry 的显式 point。
 
 ## 10. 当前验证
 
@@ -516,8 +503,8 @@ profile 确定，不能把许可本身冒充为低精度执行。当前所有预
 9. final NCU 单次 capture 的 DRAM read 为 `146825728` bytes，而 weight 加 activation
    的一遍 logical read 为 `146810880` bytes；额外 read 仅 `14848` bytes，没有 weight
    replay；
-10. 输出同时登记固定 `209.5 TFLOP/s` BF16 与 `1676.0 TFLOP/s` NVFP4 dense Tensor
-    Core 参照，并按实际 activation-compute profile 选择 `TC_%` 与 compute roof；
+10. 输出保留 route-neutral useful TFLOP/s 和 memory-floor 指标，不从 AllowA4 推断实际
+    activation-compute profile；
 11. 五个 NVFP4 exact problem 的 A4 Linear 都在 `T=17`、代表性 cp.async point 和主要
     `T=1024` TMA point 直接通过同一个 exact-decode/naive-FP64 oracle；
 12. RTX 5090、CUDA 13.1、cold-cache 下，五个 NVFP4 A4

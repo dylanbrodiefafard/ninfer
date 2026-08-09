@@ -23,12 +23,10 @@ using namespace ninfer;
 
 namespace {
 
-constexpr std::int32_t kGateUpRows   = 34816;
-constexpr std::int32_t kOutputRows   = 17408;
-constexpr std::int32_t kHidden       = 5120;
-constexpr std::size_t kFlushBytes    = 256ULL << 20;
-constexpr double kRtx5090Bf16Tflops  = 209.5;
-constexpr double kRtx5090Nvfp4Tflops = 1676.0;
+constexpr std::int32_t kGateUpRows = 34816;
+constexpr std::int32_t kOutputRows = 17408;
+constexpr std::int32_t kHidden     = 5120;
+constexpr std::size_t kFlushBytes  = 256ULL << 20;
 
 struct Options {
     ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
@@ -44,7 +42,6 @@ struct Result {
     bench::ColdTiming timing;
     double effective_gbs;
     double useful_tflops;
-    double tc_peak_pct;
 };
 
 std::vector<std::int32_t> parse_t_sweep(std::string_view raw) {
@@ -121,10 +118,6 @@ const char* policy_name(ops::LinearPolicy policy) {
     return policy == ops::LinearPolicy::AllowA4 ? "A4" : "A16";
 }
 
-const char* activation_name(const Options& options, std::int32_t tokens) {
-    return options.policy == ops::LinearPolicy::AllowA4 && tokens > 16 ? "A4" : "A16";
-}
-
 void write_csv(const Options& options, const std::vector<Result>& results,
                std::uint64_t weight_bytes) {
     if (options.csv_out.empty()) { return; }
@@ -132,14 +125,13 @@ void write_csv(const Options& options, const std::vector<Result>& results,
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
     std::ofstream out(path);
     if (!out) { throw std::runtime_error("failed to open CSV: " + options.csv_out); }
-    out << "op,weight_type,policy,activation_compute,N,K,T,weight_bytes,median_us,min_us,p95_us,"
-           "effective_gbs,useful_tflops,tc_peak_pct,warmup,repeat,flush_bytes\n";
+    out << "op,weight_type,policy,N,K,T,weight_bytes,median_us,min_us,p95_us,effective_gbs,"
+           "useful_tflops,warmup,repeat,flush_bytes\n";
     for (const Result& result : results) {
-        out << "linear_swiglu,NVFP4," << policy_name(options.policy) << ','
-            << activation_name(options, result.tokens) << ',' << kGateUpRows << ',' << kHidden
-            << ',' << result.tokens << ',' << weight_bytes << ',' << result.timing.median_us << ','
-            << result.timing.min_us << ',' << result.timing.p95_us << ',' << result.effective_gbs
-            << ',' << result.useful_tflops << ',' << result.tc_peak_pct << ',' << options.warmup
+        out << "linear_swiglu,NVFP4," << policy_name(options.policy) << ',' << kGateUpRows << ','
+            << kHidden << ',' << result.tokens << ',' << weight_bytes << ','
+            << result.timing.median_us << ',' << result.timing.min_us << ',' << result.timing.p95_us
+            << ',' << result.effective_gbs << ',' << result.useful_tflops << ',' << options.warmup
             << ',' << options.repeat << ',' << kFlushBytes << '\n';
     }
 }
@@ -194,8 +186,8 @@ int main(int argc, char** argv) {
 
         std::vector<Result> results;
         results.reserve(options.t_sweep.size());
-        std::printf("%-14s %3s %3s %8s %8s %6s %11s %11s %11s %10s %10s %7s\n", "op", "pol", "act",
-                    "N", "K", "T", "median_us", "min_us", "p95_us", "eff_GB/s", "TFLOP/s", "TC_%");
+        std::printf("%-14s %3s %8s %8s %6s %11s %11s %11s %10s %10s\n", "op", "pol", "N", "K", "T",
+                    "median_us", "min_us", "p95_us", "eff_GB/s", "TFLOP/s");
         for (const std::int32_t tokens : options.t_sweep) {
             const auto launch = make_launch(tokens);
             const bench::ColdTiming timing =
@@ -206,16 +198,11 @@ int main(int argc, char** argv) {
                                        2.0 * static_cast<double>(kHidden + kOutputRows) * tokens;
             const double useful_tflops = useful_flops / seconds / 1.0e12;
             const double effective_gbs = model_bytes / seconds / 1.0e9;
-            const double peak          = options.policy == ops::LinearPolicy::AllowA4 && tokens > 16
-                                             ? kRtx5090Nvfp4Tflops
-                                             : kRtx5090Bf16Tflops;
-            const double tc_pct        = useful_tflops / peak * 100.0;
-            std::printf("%-14s %3s %3s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %10.2f %7.2f\n",
-                        "linear_swiglu", policy_name(options.policy),
-                        activation_name(options, tokens), kGateUpRows, kHidden, tokens,
+            std::printf("%-14s %3s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %10.2f\n",
+                        "linear_swiglu", policy_name(options.policy), kGateUpRows, kHidden, tokens,
                         timing.median_us, timing.min_us, timing.p95_us, effective_gbs,
-                        useful_tflops, tc_pct);
-            results.push_back({tokens, timing, effective_gbs, useful_tflops, tc_pct});
+                        useful_tflops);
+            results.push_back({tokens, timing, effective_gbs, useful_tflops});
         }
         write_csv(options, results, packed.model_weight_bytes());
         CUDA_CHECK(cudaStreamDestroy(stream));

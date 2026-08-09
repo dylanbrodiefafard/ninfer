@@ -29,10 +29,8 @@ using namespace ninfer;
 
 namespace {
 
-constexpr std::size_t kFlushBytes   = std::size_t{256} << 20;
-constexpr double kRtx5090DramGBs    = 1792.0;
-constexpr double kDenseBf16TcTflops = 209.5;
-constexpr double kDenseFp4TcTflops  = 1676.0;
+constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
+constexpr double kRtx5090DramGBs  = 1792.0;
 
 enum class Format : std::uint8_t { Q4Q5, W8Qgkv, W8Qkv, Bf16, Nvfp4, All };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
@@ -201,18 +199,13 @@ void report(const Result& result) {
     const double seconds = result.timing.median_us * 1.0e-6;
     const double gbps    = static_cast<double>(result.logical_bytes) / seconds / 1.0e9;
     const double tflops  = result.useful_flops / seconds / 1.0e12;
-    const double tc_peak = std::string_view(result.format) == "nvfp4" &&
-                                   std::string_view(result.policy) == "a4" && result.tokens > 16
-                               ? kDenseFp4TcTflops
-                               : kDenseBf16TcTflops;
     std::printf("entry=attn_input_proj format=%-8s policy=%-3s cache=%-4s T=%4d "
                 "workspace=%9zu median=%9.3f us min=%9.3f us p95=%9.3f us "
-                "logical=%8.1f GB/s (%5.1f%% of %.0f) math=%8.2f TFLOP/s "
-                "(%5.1f%% of %.1f)\n",
+                "logical=%8.1f GB/s (%5.1f%% of %.0f) math=%8.2f TFLOP/s\n",
                 result.format, result.policy, cache_name(result.cache), result.tokens,
                 result.workspace_bytes, result.timing.median_us, result.timing.min_us,
-                result.timing.p95_us, gbps, gbps / kRtx5090DramGBs * 100.0, kRtx5090DramGBs, tflops,
-                tflops / tc_peak * 100.0, tc_peak);
+                result.timing.p95_us, gbps, gbps / kRtx5090DramGBs * 100.0, kRtx5090DramGBs,
+                tflops);
 }
 
 void append_result(std::vector<Result>& results, const char* format, const char* policy,

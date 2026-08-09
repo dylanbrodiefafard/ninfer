@@ -49,8 +49,8 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
  * - NVFP4 BlockScaleK16M128x4 [16384,5120], with stored row counts [2048,2048,6144,6144].
  *
  * The first three ranges are written contiguously to qkv and the final range is written to z.
- * W8 admits A16 only. NVFP4 admits A16Only and AllowA4; AllowA4 remains A16 for T<=16 and may
- * privately quantize the represented BF16 activation for larger T. Every route writes the two
+ * W8 admits A16 only. NVFP4 admits A16Only and AllowA4; AllowA4 permits private activation
+ * quantization at every positive T. Every route writes the two
  * independent final allocations directly. The complete projection is evaluated against the same
  * exact-decode/naive-FP64 oracle; activation quantization and the production reduction profile are
  * private effects covered by the selected criterion. x, qkv, and z must be pairwise
@@ -87,9 +87,9 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
 
 /**
  * Returns the transient capacity for the single-parent GDN snapshot form. The registered NVFP4
- * parent is [16384,5120]. A16Only is valid for T<=16 and requires no storage. AllowA4 resolves to
- * the same fused A16 route for T<=16; for larger T it reserves one private BF16 projection plus
- * the workspace required by the public W4A4 Linear route.
+ * parent is [16384,5120]. A16Only is valid for T<=16 and requires no storage. AllowA4 is valid for
+ * every positive T and the returned high-water covers whichever qualified A16 or A4 route the
+ * private resolver selects across the requested interval.
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
@@ -138,8 +138,8 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
  * Single-parent form of gdn_input_proj_conv_snapshot. Registered parents are W8G32_F16S RowSplit
  * [12288,2048] and NVFP4 BlockScaleK16M128x4 [16384,5120], both in q/k/value/z row order. W8
  * admits A16Only. NVFP4 admits A16Only for T<=16 and AllowA4 for every positive T. The NVFP4
- * AllowA4 route remains fused A16 through T=16, then privately quantizes the represented BF16
- * activation and composes public W4A4 Linear with one convolution/snapshot post kernel.
+ * AllowA4 policy permits the private resolver to select a qualified fused A16 route or an A4
+ * projection composition.
  */
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value_z_weight,
                                   const Tensor& conv_weight, Tensor& conv_states,

@@ -10,6 +10,20 @@
 namespace ninfer::ops::detail {
 namespace {
 
+enum class Nvfp4AttnInputRoute : std::uint8_t {
+    A16,
+    W4A4,
+};
+
+Nvfp4AttnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
+    if (tokens <= 0) { throw std::invalid_argument("nvfp4 attn_input_proj: T must be positive"); }
+    if (policy == LinearPolicy::A16Only) { return Nvfp4AttnInputRoute::A16; }
+    if (policy != LinearPolicy::AllowA4) {
+        throw std::invalid_argument("nvfp4 attn_input_proj: unsupported policy");
+    }
+    return tokens >= 4 ? Nvfp4AttnInputRoute::W4A4 : Nvfp4AttnInputRoute::A16;
+}
+
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
                 Tensor& v, cudaStream_t stream) {
     constexpr std::int32_t kChunk  = kNvfp4LastSmallT;
@@ -44,16 +58,23 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, 
 
 } // namespace
 
+std::size_t nvfp4_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::int32_t min_tokens,
+                                                      std::int32_t max_tokens) {
+    if (min_tokens <= 0 || max_tokens < min_tokens) {
+        throw std::invalid_argument("nvfp4 attn_input_proj workspace: invalid token interval");
+    }
+    (void)resolve_route(policy, min_tokens);
+    return resolve_route(policy, max_tokens) == Nvfp4AttnInputRoute::W4A4
+               ? nvfp4_w4a4_workspace_capacity_bytes(max_tokens, Nvfp4AttnInputGeometry::kInputRows)
+               : 0;
+}
+
 void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                                cudaStream_t stream) {
-    if (policy == LinearPolicy::A16Only ||
-        (policy == LinearPolicy::AllowA4 && x.ne[1] < kNvfp4FirstA4T)) {
+    if (resolve_route(policy, x.ne[1]) == Nvfp4AttnInputRoute::A16) {
         launch_a16(x, weight, q, gate, k, v, stream);
         return;
-    }
-    if (policy != LinearPolicy::AllowA4) {
-        throw std::invalid_argument("nvfp4 attn_input_proj: unsupported policy");
     }
     if (workspace == nullptr) {
         throw std::invalid_argument("nvfp4 W4A4 attn_input_proj requires caller workspace");

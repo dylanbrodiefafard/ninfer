@@ -80,8 +80,8 @@ enum class LinearPolicy : std::uint8_t {
  * corresponding low-precision route: the resolved plan may remain A16 when that is the qualified
  * choice. BF16_CTRL admits only LinearPolicy::A16Only. Registered Q4/Q5/Q6/W8 formats admit
  * LinearPolicy::A16Only and LinearPolicy::AllowA8. NVFP4 admits A16Only and AllowA4; AllowA4
- * resolves to A16 for `T<=16` and may privately quantize the represented BF16 activation to NVFP4
- * for larger T.
+ * permits the private resolver to select either a qualified A16 route or activation quantization
+ * to NVFP4 at every positive T. The selected route depends only on the registered problem and T.
  *
  * @par Workspace
  * `workspace` is caller-owned call-scoped transient storage sized by

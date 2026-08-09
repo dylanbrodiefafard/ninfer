@@ -51,8 +51,8 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
  *   BF16_CTRL.
  *
  * `T` is the positive token extent of the Op contract. BF16_CTRL and W8G32_F16S admit only
- * LinearPolicy::A16Only. NVFP4 admits A16Only and AllowA4; AllowA4 resolves to A16 for `T<=16` and
- * may privately quantize the represented BF16 activation to NVFP4 for larger T.
+ * LinearPolicy::A16Only. NVFP4 admits A16Only and AllowA4; AllowA4 permits the private resolver to
+ * select either a qualified A16 route or activation quantization to NVFP4 at every positive T.
  *
  * The oracle evaluates every projection independently with naive FP64 accumulation from the
  * logical values represented by the persistent weight and BF16 activation. The final four BF16

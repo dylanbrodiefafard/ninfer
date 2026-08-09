@@ -14,8 +14,6 @@
 
 namespace ninfer::ops::detail {
 
-inline constexpr std::int32_t kNvfp4FirstA4T = 17;
-
 struct Nvfp4W4a4Workspace {
     std::uint8_t* codes  = nullptr;
     std::uint8_t* scales = nullptr;

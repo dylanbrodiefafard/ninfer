@@ -26,6 +26,8 @@ constexpr ReductionCriterion kGdnInputProjConvSnapshotA4Tolerance{0.16, 4.0e-3, 
 constexpr std::int32_t kQueryRows = 2048;
 constexpr std::int32_t kKeyRows   = 2048;
 
+std::int32_t snapshot_sample_count(std::int32_t tokens) { return tokens <= 4 ? 32 : 7; }
+
 double silu_fp64(double value) {
     if (value >= 0.0) { return value / (1.0 + std::exp(-value)); }
     const double exponential = std::exp(value);
@@ -66,9 +68,10 @@ snapshot_oracle(std::int32_t value_rows, std::int32_t tokens, const std::vector<
                 std::span<const std::uint16_t> initial_state, Projection&& projection) {
     const std::int32_t channels = kQueryRows + kKeyRows + value_rows;
     SnapshotOracle oracle;
-    const std::vector<std::int32_t> query_rows     = sampled_rows(kQueryRows);
-    const std::vector<std::int32_t> key_rows       = sampled_rows(kKeyRows);
-    const std::vector<std::int32_t> value_selected = sampled_rows(value_rows);
+    const std::int32_t sample_count                = snapshot_sample_count(tokens);
+    const std::vector<std::int32_t> query_rows     = sampled_rows(kQueryRows, sample_count);
+    const std::vector<std::int32_t> key_rows       = sampled_rows(kKeyRows, sample_count);
+    const std::vector<std::int32_t> value_selected = sampled_rows(value_rows, sample_count);
     const std::size_t sampled_channel_count =
         query_rows.size() + key_rows.size() + value_selected.size();
     oracle.query.reserve(query_rows.size() * static_cast<std::size_t>(tokens));
@@ -120,9 +123,14 @@ std::vector<double> gather_state(const std::vector<std::uint16_t>& full, std::in
             }
         }
     };
-    for (const std::int32_t row : sampled_rows(kQueryRows)) { append(row); }
-    for (const std::int32_t row : sampled_rows(kKeyRows)) { append(kQueryRows + row); }
-    for (const std::int32_t row : sampled_rows(value_rows)) { append(kQueryRows + kKeyRows + row); }
+    const std::int32_t sample_count = snapshot_sample_count(tokens);
+    for (const std::int32_t row : sampled_rows(kQueryRows, sample_count)) { append(row); }
+    for (const std::int32_t row : sampled_rows(kKeyRows, sample_count)) {
+        append(kQueryRows + row);
+    }
+    for (const std::int32_t row : sampled_rows(value_rows, sample_count)) {
+        append(kQueryRows + kKeyRows + row);
+    }
     return gathered;
 }
 
@@ -157,22 +165,25 @@ int verify_snapshot_outputs(
     const GuardedBf16Tensor& value, std::int32_t value_rows, std::int32_t tokens,
     const SnapshotOracle& oracle,
     const ReductionCriterion& criterion = kGdnInputProjConvSnapshotA16Tolerance) {
-    int failures = 0;
+    int failures                    = 0;
+    const std::int32_t sample_count = snapshot_sample_count(tokens);
     failures += query.verify_guards("snapshot query" + std::string(suffix));
     failures += key.verify_guards("snapshot key" + std::string(suffix));
     failures += value.verify_guards("snapshot value" + std::string(suffix));
     failures += query.verify_fully_written("snapshot query" + std::string(suffix));
     failures += key.verify_fully_written("snapshot key" + std::string(suffix));
     failures += value.verify_fully_written("snapshot value" + std::string(suffix));
-    failures += compare("snapshot query" + std::string(suffix),
-                        gather_rows(query.values(), kQueryRows, 0, kQueryRows, tokens),
-                        oracle.query, criterion);
     failures +=
-        compare("snapshot key" + std::string(suffix),
-                gather_rows(key.values(), kKeyRows, 0, kKeyRows, tokens), oracle.key, criterion);
-    failures += compare("snapshot value" + std::string(suffix),
-                        gather_rows(value.values(), value_rows, 0, value_rows, tokens),
-                        oracle.value, criterion);
+        compare("snapshot query" + std::string(suffix),
+                gather_rows(query.values(), kQueryRows, 0, kQueryRows, tokens, sample_count),
+                oracle.query, criterion);
+    failures += compare("snapshot key" + std::string(suffix),
+                        gather_rows(key.values(), kKeyRows, 0, kKeyRows, tokens, sample_count),
+                        oracle.key, criterion);
+    failures +=
+        compare("snapshot value" + std::string(suffix),
+                gather_rows(value.values(), value_rows, 0, value_rows, tokens, sample_count),
+                oracle.value, criterion);
     return failures;
 }
 
@@ -432,7 +443,7 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
                 parent.host, row, activation.data() + static_cast<std::size_t>(token) * kHidden,
                 kHidden);
         });
-    const bool a4 = policy == ops::LinearPolicy::AllowA4 && tokens > 16;
+    const bool a4 = policy == ops::LinearPolicy::AllowA4 && tokens >= 4;
     const ReductionCriterion& criterion =
         a4 ? kGdnInputProjConvSnapshotA4Tolerance : kGdnInputProjConvSnapshotA16Tolerance;
     const std::string suffix =
@@ -449,9 +460,12 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
                                      kChannels, tokens, slots, kSnapshotBaseSlot);
     failures += z.verify_guards("snapshot z" + suffix);
     failures += z.verify_fully_written("snapshot z" + suffix);
-    failures += compare(
-        "snapshot z" + suffix, gather_rows(z.values(), kZRows, 0, kZRows, tokens),
-        projection_oracle(parent.host, kChannels, kZRows, activation, kHidden, tokens), criterion);
+    failures +=
+        compare("snapshot z" + suffix,
+                gather_rows(z.values(), kZRows, 0, kZRows, tokens, snapshot_sample_count(tokens)),
+                projection_oracle(parent.host, kChannels, kZRows, activation, kHidden, tokens,
+                                  snapshot_sample_count(tokens)),
+                criterion);
     failures += verify_preserved("snapshot x" + suffix, device_activation, activation_bits);
     failures +=
         verify_preserved("snapshot conv weight" + suffix, device_conv_weight, conv_weight_bits);
@@ -477,7 +491,8 @@ int run_nvfp4() {
 
     int failures = 0;
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only, 2);
-    failures += run_nvfp4_case(parent, 16, ops::LinearPolicy::AllowA4, 17);
+    failures += run_nvfp4_case(parent, 3, ops::LinearPolicy::AllowA4, 4);
+    failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::AllowA4, 5);
     failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4, 0);
     failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4, 1025);
     return failures;
@@ -508,15 +523,15 @@ int main() {
         std::cerr << "W8 snapshot interval did not preserve its zero/nonzero route boundary\n";
         ++failures;
     }
-    const std::size_t nvfp4_a4_17 = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 17, 17);
+    const std::size_t nvfp4_a4_4 = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+        QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 4, 4);
     if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
             QType::NVFP4, 16384, 5120, ops::LinearPolicy::A16Only, 1, 16) != 0 ||
         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 16) != 0 ||
-        nvfp4_a4_17 == 0 ||
+            QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 3) != 0 ||
+        nvfp4_a4_4 == 0 ||
         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 17) != nvfp4_a4_17) {
+            QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 4) != nvfp4_a4_4) {
         std::cerr << "NVFP4 snapshot interval did not preserve its A16/A4 route boundary\n";
         ++failures;
     }

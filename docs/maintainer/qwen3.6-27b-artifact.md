@@ -724,10 +724,11 @@ their single-parent BF16 weights through `attn_input_proj` for the six early
 `query_key_gate_value` parents and through `linear_add` for attention output layers 3 and 7 and GDN
 output layer 4.
 
-All NVFP4 Text parents and BF16 exceptions described above are bound and executable. Text prefill
-passes `AllowA4` only for NVFP4 weights: `T >= 17` selects W4A4 MMA while `T <= 16` remains on A16.
-Ordinary decode and speculative target verify always pass `A16Only`; MTP and Vision use their
-registered storage and execution paths. With all startup features enabled, 1054 tensors and six
+All NVFP4 Text parents and BF16 exceptions described above are bound and executable. Every Text
+phase passes `AllowA4` for NVFP4 weights and `A16Only` for all other formats. Each semantic Op then
+resolves its qualified route from the exact geometry and T; Prefill, ordinary decode, and
+speculative target verify do not create separate activation-policy variants. MTP and Vision use
+their registered storage and execution paths. With all startup features enabled, 1054 tensors and six
 resources are materialized; the 247 site-level `d_x` scalars are consumed and validated but receive
 no device allocation.
 
@@ -760,6 +761,5 @@ Native qualification additionally validates both real 27B artifacts through thei
 load plans. The NVFP4 plan consumes 1307 objects, retains six frontend resources, places 1054
 tensors on device when Text, Vision, MTP, and the optimized proposal head are enabled, and leaves
 exactly 247 `d_x` scalars validation-only. Public Engine smoke covers Text, MTP, Vision, prefix
-reuse, and CUDA Graph decode for both `weights_id` values. On an RTX 5090, an Nsight Systems trace
-of a 54-token NVFP4 prompt records W4A4 quantize/MMA kernels for the long prefill chunk, NVFP4
-small-T kernels for its short tail, and A16 decode/GEMV kernels during graph-backed decode.
+reuse, and CUDA Graph decode for both `weights_id` values. CUDA Graph capture records the route
+already selected for each exact call shape; it does not add an A16/A4 graph dimension.

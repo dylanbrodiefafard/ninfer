@@ -73,8 +73,8 @@ load, graph construction, and warmup do not enter topology counts.
 
 `ninfer_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,
 W8, registered BF16 weights, and the registered NVFP4 problems. Existing formats use
-`--policy a16`; NVFP4 additionally supports `--policy a4`, which keeps `T<=16` on A16 and measures
-the complete activation-quantization plus W4A4 GEMM call for `T>16`. LinearAdd, LinearSwiGLU,
+`--policy a16`; NVFP4 additionally supports `--policy a4`, which lets the production resolver
+select the qualified route for each exact geometry and T. LinearAdd, LinearSwiGLU,
 LinearPair, Attention/GDN projections, and sparse MoE remain separate semantic Ops and are not
 benchmark modes here.
 
@@ -129,10 +129,9 @@ Every ordinary sample is cold-cache: a 256 MiB L2 eviction write completes befor
 interval. Reported effective bandwidth uses the encoded weight planes once, one BF16 activation
 read, and one BF16 output write. Reported FLOPs are the mathematical `2*N*K*T`; neither metric
 copies route-private tile, replay, padding, split, schedule, host-launcher, or kernel-instance
-behavior. The fixed RTX 5090 references are `1792 GB/s` DRAM bandwidth, `209.5 TFLOP/s` dense
-BF16 Tensor Core throughput, and `1676.0 TFLOP/s` dense FP4 Tensor Core throughput. `TC_%` selects
-the reference for the production activation-compute profile; `pol` and `act` separately report
-caller permission and the resolved profile. `READ_%` additionally compares the same one-read model
+behavior. The fixed RTX 5090 memory reference is `1792 GB/s` DRAM bandwidth. Because `AllowA4` is
+a permission rather than an execution-profile label, the long-lived benchmark does not infer or
+report private activation compute or Tensor Core utilization. `READ_%` additionally compares the same one-read model
 bytes with the measured `1674.5 GB/s` pure-read ceiling from `tools/hbm_bandwidth_probe.cu`; it is
 the practical utilization measure for read-dominated points. Physical traffic and instruction
 utilization still require NCU.
@@ -193,12 +192,36 @@ cmake --build build --parallel --target ninfer_gated_delta_net_bench ninfer_gdn_
   --route fused --norm-control fused --qk-norm fused --warmup 20 --repeat 500
 ```
 
+## GDN input-projection Op benchmark
+
+`ninfer_gdn_input_proj_bench` measures all registered public `gdn_input_proj` forms: the 27B
+Q4/Q5 two-parent projection, the 35B W8 single-parent projection, and the 27B NVFP4 single-parent
+projection under either admitted policy. Every timed and profiled point is exactly one public Op
+call. Single-parent workspace is queried and allocated through the public capacity entry before
+timing; the benchmark has no private launchers, route controls, or candidate mode.
+
+Cold cache is the primary model-layer condition. Reported logical traffic counts encoded weights
+once, BF16 input once, and QKV/Z outputs once. FLOPs describe the complete registered projection.
+The benchmark reports caller policy rather than inferring a private activation-compute route.
+
+```bash
+cmake --build build --parallel --target ninfer_gdn_input_proj_bench
+./build/bench/ninfer_gdn_input_proj_bench \
+  --format all --tokens 1,2,4,8,12,16,32,64,128,256,512,1024 \
+  --cache cold --warmup 5 --repeat 30 \
+  --csv-out profiles/bench/gdn_input_proj.csv
+./build/bench/ninfer_gdn_input_proj_bench \
+  --format nvfp4 --nvfp4-policy a4 --tokens 1024 --cache cold --profile
+```
+
 ## GDN input projection/convolution/snapshot Op benchmark
 
-`ninfer_gdn_input_proj_conv_snapshot_bench` measures the public Qwen3.6-27B Q4/Q5
-`gdn_input_proj_conv_snapshot` contract. The timed body is exactly one complete public Op call;
+`ninfer_gdn_input_proj_conv_snapshot_bench` measures the public Qwen3.6-27B Q4/Q5 and NVFP4
+`gdn_input_proj_conv_snapshot` forms. The timed body is exactly one complete public Op call;
 the benchmark does not include private launchers, candidate selection, duplicated compositions, or
-route labels. Its default `T=1..6` sweep is the production MTP verification interval.
+route labels. Its default `T=1..6` sweep is the production MTP verification interval. NVFP4 accepts
+the public `a16` and `a4` policies; the reported profile names the caller policy, not a private
+resolved route.
 
 CUDA Graph replay is the default execution mode. The graph contains external timing event nodes
 around the complete Op body, while L2 eviction stays outside the timed interval. Cold-cache results
@@ -209,9 +232,12 @@ published snapshot slots, so repeated replay does not introduce a benchmark-only
 ```bash
 cmake --build build --parallel --target ninfer_gdn_input_proj_conv_snapshot_bench
 ./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
-  --sweep 1:6 --execution graph --cache both \
+  --format q4q5 --sweep 1:6 --execution graph --cache both \
   --warmup 10 --repeat 100 \
   --csv-out profiles/bench/gdn_input_proj_conv_snapshot.csv
+./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
+  --format nvfp4 --nvfp4-policy a4 --sweep 1:17 \
+  --execution graph --cache cold --warmup 10 --repeat 100
 ```
 
 `--execution eager|both` is available only to attribute launch behavior; it calls the same public
@@ -356,8 +382,8 @@ cmake --build build --parallel --target ninfer_w8_linear_swiglu_bench
 in-place BF16 residual epilogue. Production uses decode at `T=1`, exact-small-T at `T=2..26`, and
 MMA from `T=27`; `--route all` retains the legal overlap needed to reproduce that crossover.
 Every sample is cold-cache. Effective bandwidth counts the weight once, the activation once, and
-the residual read plus write; `READ_%` and `TC_%` use the same RTX 5090 references as the Linear
-benchmark.
+the residual read plus write; its `READ_%` and `TC_%` use the benchmark's explicit RTX 5090 BF16
+references.
 
 ```bash
 cmake --build build --parallel --target ninfer_bf16_linear_add_bench

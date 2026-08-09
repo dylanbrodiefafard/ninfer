@@ -50,8 +50,8 @@ namespace ninfer::ops {
  *   staging, and workspace precision; those private choices are not semantic rounding boundaries.
  *
  * Compute policy:
- *   Q5, W8, and BF16_CTRL admit only A16Only. NVFP4 admits A16Only and AllowA4; AllowA4 remains
- *   A16 for T<=16 and may privately quantize the represented BF16 activation for larger T.
+ *   Q5, W8, and BF16_CTRL admit only A16Only. NVFP4 admits A16Only and AllowA4; AllowA4 permits
+ *   the private resolver to select a qualified A16 or A4 route at every positive T.
  *
  * Effects:
  *   Updates the full residual tensor in place; x/weight must not alias residual.

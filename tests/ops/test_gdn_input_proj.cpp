@@ -172,7 +172,7 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     ops::gdn_input_proj(x, parent.view(), qkv_output, z_output, policy, workspace, nullptr);
     cuda_synchronize();
 
-    const bool a4                       = policy == ops::LinearPolicy::AllowA4 && tokens > 16;
+    const bool a4                       = policy == ops::LinearPolicy::AllowA4;
     const ReductionCriterion& criterion = a4 ? kGdnInputProjA4Tolerance : kGdnInputProjA16Tolerance;
     const std::string suffix =
         std::string(" NVFP4 ") + (a4 ? "A4" : "A16") + " T=" + std::to_string(tokens);
@@ -210,6 +210,8 @@ int run_nvfp4() {
     int failures = 0;
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only);
     failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::A16Only);
+    failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::AllowA4);
+    failures += run_nvfp4_case(parent, 2, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4);
     return failures;

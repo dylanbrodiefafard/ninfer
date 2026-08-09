@@ -19,11 +19,13 @@ Nvfp4GdnSnapshotRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
         throw std::invalid_argument("nvfp4 gdn snapshot admits only A16 or A4");
     }
-    if (tokens == 1) { return Nvfp4GdnSnapshotRoute::DecodeFusedA16; }
-    if (tokens <= 16) { return Nvfp4GdnSnapshotRoute::SmallTFusedA16; }
     if (policy == LinearPolicy::A16Only) {
+        if (tokens == 1) { return Nvfp4GdnSnapshotRoute::DecodeFusedA16; }
+        if (tokens <= 16) { return Nvfp4GdnSnapshotRoute::SmallTFusedA16; }
         throw std::invalid_argument("nvfp4 gdn snapshot A16 is registered only through T=16");
     }
+    if (tokens == 1) { return Nvfp4GdnSnapshotRoute::DecodeFusedA16; }
+    if (tokens <= 3) { return Nvfp4GdnSnapshotRoute::SmallTFusedA16; }
     return Nvfp4GdnSnapshotRoute::LinearW4A4Post;
 }
 

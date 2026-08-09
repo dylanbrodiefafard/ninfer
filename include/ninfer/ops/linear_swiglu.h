@@ -26,7 +26,8 @@ namespace ninfer::ops {
 
 /**
  * Policy-bearing capacity query. Q4/W8 admit A16Only. NVFP4 admits A16Only through T=16 and
- * AllowA4 for every positive T; AllowA4 remains A16 through T=16.
+ * AllowA4 for every positive T. AllowA4 covers whichever qualified A16 or A4 route the private
+ * resolver selects across the requested interval.
  */
 [[nodiscard]] std::size_t
 linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,

@@ -2,8 +2,8 @@
 
 #include "ops/linear/bf16/bf16_config.h"
 #include "ops/linear/bf16/bf16_dispatch.h"
+#include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
-#include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
@@ -138,8 +138,8 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
             (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
             throw std::invalid_argument("linear workspace: unsupported NVFP4 profile");
         }
-        if (policy == LinearPolicy::A16Only || max_tokens < detail::kNvfp4FirstA4T) { return 0; }
-        return detail::nvfp4_w4a4_workspace_capacity_bytes(max_tokens, input_rows);
+        return detail::nvfp4_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
+                                                             min_tokens, max_tokens);
     case QType::FP32_CTRL:
     case QType::I32_CTRL:
         break;
