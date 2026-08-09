@@ -10,7 +10,7 @@
 
 namespace ninfer::targets::qwen3_6_27b::detail {
 
-using GraphFrontierRange = qwen3_6::GraphFrontierRange;
+using GraphExecutionProfile = qwen3_6::GraphExecutionProfile;
 
 // Compile-time data and the three closed execution leaves supplied to the Qwen3.6 family runtime.
 // It owns no request state, execution phase, graph object, or schedule callback.
@@ -26,7 +26,7 @@ struct Variant {
     using MtpAttentionProjectionWeights  = detail::MtpAttentionPayload;
     using MtpPostMixerWeights            = detail::DensePostMixerPayload;
     using VisionWeights                  = qwen3_6::VisionWeights;
-    using GraphFrontierRange             = detail::GraphFrontierRange;
+    using GraphExecutionProfile          = detail::GraphExecutionProfile;
 
     static constexpr float attention_scale                     = kAttentionScale;
     static constexpr float gdn_scale                           = kGdnScale;
@@ -109,12 +109,14 @@ struct Variant {
     [[nodiscard]] static std::size_t mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
                                                                              std::int32_t last);
 
-    [[nodiscard]] static std::vector<GraphFrontierRange>
-    ordinary_graph_ranges(std::uint32_t capacity);
-    [[nodiscard]] static std::vector<GraphFrontierRange>
-    mtp_graph_ranges(std::uint32_t capacity, std::uint32_t draft_window);
-    [[nodiscard]] static std::vector<GraphFrontierRange>
-    dflash_graph_ranges(std::uint32_t capacity, std::uint32_t draft_window);
+    [[nodiscard]] static std::vector<GraphExecutionProfile>
+    ordinary_graph_profiles(std::uint32_t capacity);
+    [[nodiscard]] static std::vector<GraphExecutionProfile>
+    mtp_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window);
+    [[nodiscard]] static std::vector<GraphExecutionProfile>
+    dflash_initial_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window);
+    [[nodiscard]] static std::vector<GraphExecutionProfile>
+    dflash_steady_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window);
 };
 
 } // namespace ninfer::targets::qwen3_6_27b::detail

@@ -99,16 +99,17 @@ void mtp_bridge_and_propose(State& state, const Tensor& next_token, const Tensor
 // is in io.verify_hidden[:,0], the sampled token is in io.token, and the configured Linear
 // Attention snapshot destination is the resulting state.
 void warm_capture_ordinary_round(State& state, bool align_mtp, ops::GqaExecutionEnvelope envelope,
-                                 const GraphPrepare& prepare, DecodeGraph& graph);
+                                 const GraphPrepare& prepare, DecodeGraphDefinition& definition);
 void ordinary_round(State& state, bool align_mtp, ops::GqaExecutionEnvelope envelope,
-                    DecodeGraph* graph);
+                    DecodeGraphExecutable* executable);
 
 // Executes one fixed-k MTP synchronization/proposal round around the common speculative
 // verification transaction. The number of licensed tokens and their values are written to
 // io.speculative.
 void warm_capture_mtp_round(State& state, std::uint32_t k, MtpGqaEnvelopes envelopes,
-                            const GraphPrepare& prepare, DecodeGraph& graph);
-void mtp_round(State& state, std::uint32_t k, MtpGqaEnvelopes envelopes, DecodeGraph* graph);
+                            const GraphPrepare& prepare, DecodeGraphDefinition& definition);
+void mtp_round(State& state, std::uint32_t k, MtpGqaEnvelopes envelopes,
+               DecodeGraphExecutable* executable);
 
 [[nodiscard]] DFlashFeatureSink
 dflash_feature_sink(State& state, DFlashFeatureSink::PrefillConsumer consume_prefill = {});
@@ -118,13 +119,16 @@ void dflash_append_context(State& state, const Tensor& features, const Tensor& p
 void dflash_propose(State& state, std::uint32_t k, DFlashEnvelopes envelopes);
 void warm_capture_dflash_initial_round(State& state, std::uint32_t k,
                                        ops::GqaExecutionEnvelope target_envelope,
-                                       const GraphPrepare& prepare, DecodeGraph& graph);
+                                       const GraphPrepare& prepare,
+                                       DecodeGraphDefinition& definition);
 void dflash_initial_round(State& state, std::uint32_t k, ops::GqaExecutionEnvelope target_envelope,
-                          DecodeGraph* graph);
+                          DecodeGraphExecutable* executable);
 void warm_capture_dflash_steady_round(State& state, std::uint32_t k, DFlashEnvelopes envelopes,
                                       ops::GqaExecutionEnvelope target_envelope,
-                                      const GraphPrepare& prepare, DecodeGraph& graph);
+                                      const GraphPrepare& prepare,
+                                      DecodeGraphDefinition& definition);
 void dflash_steady_round(State& state, std::uint32_t k, DFlashEnvelopes envelopes,
-                         ops::GqaExecutionEnvelope target_envelope, DecodeGraph* graph);
+                         ops::GqaExecutionEnvelope target_envelope,
+                         DecodeGraphExecutable* executable);
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

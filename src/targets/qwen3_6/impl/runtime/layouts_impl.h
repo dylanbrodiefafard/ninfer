@@ -22,6 +22,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 namespace {
@@ -44,6 +45,30 @@ std::size_t checked_mul(std::size_t a, std::size_t b, const char* label) {
 std::size_t align_up(std::size_t value, std::size_t alignment, const char* label) {
     const std::size_t padding = (alignment - value % alignment) % alignment;
     return checked_add(value, padding, label);
+}
+
+template <class ProfileAllowance>
+std::size_t graph_topology_allowance(const std::vector<GraphExecutionProfile>& profiles,
+                                     ProfileAllowance&& profile_allowance, const char* label) {
+    std::vector<std::pair<std::uint32_t, std::size_t>> classes;
+    for (const GraphExecutionProfile profile : profiles) {
+        const std::size_t allowance = profile_allowance(profile);
+        const auto existing = std::find_if(classes.begin(), classes.end(), [&](const auto& entry) {
+            return entry.first == profile.topology_class;
+        });
+        if (existing == classes.end()) {
+            classes.emplace_back(profile.topology_class, allowance);
+        } else {
+            existing->second = std::max(existing->second, allowance);
+        }
+    }
+
+    std::size_t total = 0;
+    for (const auto& [topology_class, allowance] : classes) {
+        (void)topology_class;
+        total = checked_add(total, allowance, label);
+    }
+    return total;
 }
 
 TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
@@ -470,31 +495,44 @@ std::unique_ptr<SequencePlanImpl> plan_sequence_impl(DeviceContext& device,
                      kArenaAlign, "request transient alignment");
     }
     if (impl->use_cuda_graph) {
-        const std::size_t ordinary_variants = ordinary_graph_ranges(impl->capacity).size();
-        const std::size_t ordinary_graphs =
-            ordinary_variants *
-            (impl->speculative_backend == SpeculativeBackend::Mtp ? 2ULL : 1ULL);
-        // Cold full-model capture also materializes lazy CUDA module state. The 35B
-        // K=3/C=4096 public benchmark measured 123,277,312 bytes across its 12 ordinary/aligned
-        // and short-window executables. Keep one conservative family allowance of 12 MiB per
-        // executable. Long MTP executables also trigger substantially larger driver allocations.
-        impl->graph_allowance_bytes = ordinary_graphs * 12ULL * kMiB;
+        // Definitions remain per execution profile, but only one executable is instantiated for
+        // each reachable node-topology class. These bounds cover the largest profile installed in
+        // each class and the driver/module state materialized while qualifying all definitions.
+        impl->graph_allowance_bytes = 12ULL * kMiB;
         if (impl->speculative_backend == SpeculativeBackend::Mtp) {
-            for (const GraphFrontierRange range :
-                 mtp_graph_ranges(impl->capacity, impl->draft_window)) {
-                const std::uint64_t final_visible =
-                    static_cast<std::uint64_t>(range.max) + 2ULL * impl->draft_window;
-                impl->graph_allowance_bytes += (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
-            }
+            impl->graph_allowance_bytes = checked_add(impl->graph_allowance_bytes, 12ULL * kMiB,
+                                                      "ordinary aligned graph allowance");
+        }
+        if (impl->speculative_backend == SpeculativeBackend::Mtp) {
+            const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
+            const std::size_t mtp_allowance = graph_topology_allowance(
+                profiles,
+                [&](GraphExecutionProfile profile) {
+                    const std::uint64_t final_visible =
+                        static_cast<std::uint64_t>(profile.max) + 2ULL * impl->draft_window;
+                    return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
+                },
+                "MTP graph allowance");
+            impl->graph_allowance_bytes =
+                checked_add(impl->graph_allowance_bytes, mtp_allowance, "MTP graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::DFlash) {
-            for (const GraphFrontierRange range :
-                 dflash_graph_ranges(impl->capacity, impl->draft_window)) {
-                const std::uint64_t final_visible =
-                    static_cast<std::uint64_t>(range.max) + impl->draft_window + 1ULL;
-                const std::size_t per_graph = final_visible <= 4096 ? 64ULL : 96ULL;
-                impl->graph_allowance_bytes = checked_add(
-                    impl->graph_allowance_bytes, 2ULL * per_graph * kMiB, "DFlash graph allowance");
-            }
+            const auto class_allowance = [&](const std::vector<GraphExecutionProfile>& profiles) {
+                return graph_topology_allowance(
+                    profiles,
+                    [&](GraphExecutionProfile profile) {
+                        const std::uint64_t final_visible =
+                            static_cast<std::uint64_t>(profile.max) + impl->draft_window + 1ULL;
+                        return (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
+                    },
+                    "DFlash graph allowance");
+            };
+            const std::size_t initial =
+                class_allowance(dflash_initial_graph_profiles(impl->capacity, impl->draft_window));
+            const std::size_t steady =
+                class_allowance(dflash_steady_graph_profiles(impl->capacity, impl->draft_window));
+            impl->graph_allowance_bytes = checked_add(
+                checked_add(impl->graph_allowance_bytes, initial, "DFlash initial allowance"),
+                steady, "DFlash steady allowance");
         }
     }
 

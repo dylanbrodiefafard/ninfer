@@ -59,15 +59,15 @@ auto ordinary_body(State& state, bool align_mtp, ops::GqaExecutionEnvelope envel
 } // namespace
 
 void warm_capture_ordinary_round(State& state, bool align_mtp, ops::GqaExecutionEnvelope envelope,
-                                 const GraphPrepare& prepare, DecodeGraph& graph) {
+                                 const GraphPrepare& prepare, DecodeGraphDefinition& definition) {
     auto body = ordinary_body(state, align_mtp, envelope);
-    warm_capture(state, graph, prepare, body);
+    warm_capture(state, definition, prepare, body);
 }
 
 void ordinary_round(State& state, bool align_mtp, ops::GqaExecutionEnvelope envelope,
-                    DecodeGraph* graph) {
+                    DecodeGraphExecutable* executable) {
     auto body = ordinary_body(state, align_mtp, envelope);
-    run_prepared(state, graph, body);
+    run_prepared(state, executable, body);
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

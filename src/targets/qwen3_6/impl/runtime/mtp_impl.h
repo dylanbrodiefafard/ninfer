@@ -102,14 +102,15 @@ auto mtp_body(State& state, std::uint32_t k, MtpGqaEnvelopes envelopes) {
 }
 
 void warm_capture_mtp_round(State& state, std::uint32_t k, MtpGqaEnvelopes envelopes,
-                            const GraphPrepare& prepare, DecodeGraph& graph) {
+                            const GraphPrepare& prepare, DecodeGraphDefinition& definition) {
     auto body = mtp_body(state, k, envelopes);
-    warm_capture(state, graph, prepare, body);
+    warm_capture(state, definition, prepare, body);
 }
 
-void mtp_round(State& state, std::uint32_t k, MtpGqaEnvelopes envelopes, DecodeGraph* graph) {
+void mtp_round(State& state, std::uint32_t k, MtpGqaEnvelopes envelopes,
+               DecodeGraphExecutable* executable) {
     auto body = mtp_body(state, k, envelopes);
-    run_prepared(state, graph, body);
+    run_prepared(state, executable, body);
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

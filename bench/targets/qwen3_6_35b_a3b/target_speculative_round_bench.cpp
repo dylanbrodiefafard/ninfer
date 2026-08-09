@@ -506,12 +506,14 @@ int run(const Options& options) {
             print_row(options, k, accepted, "eager", timing);
         }
         if (options.graph) {
-            ninfer::DecodeGraph graph;
+            ninfer::DecodeGraphDefinition definition;
+            ninfer::DecodeGraphExecutable executable;
             reset();
             device.synchronize();
-            graph.capture(device.stream, body);
+            definition.capture(device.stream, body);
+            executable.instantiate(definition);
             const Timing timing =
-                measure(options, device, [&] { graph.launch(device.stream); }, reset);
+                measure(options, device, [&] { executable.launch(device.stream); }, reset);
             print_row(options, k, accepted, "graph", timing);
         }
     }

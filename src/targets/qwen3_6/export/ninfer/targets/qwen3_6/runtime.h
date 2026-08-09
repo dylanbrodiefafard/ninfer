@@ -20,9 +20,10 @@ enum class TextPhase {
     Verify,
 };
 
-struct GraphFrontierRange {
-    std::uint32_t min = 0;
-    std::uint32_t max = 0;
+struct GraphExecutionProfile {
+    std::uint32_t min            = 0;
+    std::uint32_t max            = 0;
+    std::uint32_t topology_class = 0;
 };
 
 namespace detail {

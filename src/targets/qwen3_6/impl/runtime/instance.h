@@ -25,7 +25,7 @@ using DFlashWeights                  = typename LoadedModelData::DFlash;
 using FullAttentionProjectionWeights = typename Variant::FullAttentionProjectionWeights;
 using GdnProjectionWeights           = typename Variant::GdnProjectionWeights;
 using VisionWeights                  = typename Variant::VisionWeights;
-using GraphFrontierRange             = typename Variant::GraphFrontierRange;
+using GraphExecutionProfile          = typename Variant::GraphExecutionProfile;
 
 using SequencePlan = qwen3_6::SequencePlan<Variant>;
 using RequestPlan  = qwen3_6::RequestPlan<Variant>;
@@ -37,18 +37,23 @@ inline constexpr std::uint32_t kPrefillChunkAlignment    = Variant::prefill_chun
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = Variant::maximum_mtp_draft_tokens;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = Variant::maximum_dflash_draft_tokens;
 
-inline std::vector<GraphFrontierRange> ordinary_graph_ranges(std::uint32_t capacity) {
-    return Variant::ordinary_graph_ranges(capacity);
+inline std::vector<GraphExecutionProfile> ordinary_graph_profiles(std::uint32_t capacity) {
+    return Variant::ordinary_graph_profiles(capacity);
 }
 
-inline std::vector<GraphFrontierRange> mtp_graph_ranges(std::uint32_t capacity,
-                                                        std::uint32_t draft_window) {
-    return Variant::mtp_graph_ranges(capacity, draft_window);
+inline std::vector<GraphExecutionProfile> mtp_graph_profiles(std::uint32_t capacity,
+                                                             std::uint32_t draft_window) {
+    return Variant::mtp_graph_profiles(capacity, draft_window);
 }
 
-inline std::vector<GraphFrontierRange> dflash_graph_ranges(std::uint32_t capacity,
-                                                           std::uint32_t draft_window) {
-    return Variant::dflash_graph_ranges(capacity, draft_window);
+inline std::vector<GraphExecutionProfile>
+dflash_initial_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window) {
+    return Variant::dflash_initial_graph_profiles(capacity, draft_window);
+}
+
+inline std::vector<GraphExecutionProfile> dflash_steady_graph_profiles(std::uint32_t capacity,
+                                                                       std::uint32_t draft_window) {
+    return Variant::dflash_steady_graph_profiles(capacity, draft_window);
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

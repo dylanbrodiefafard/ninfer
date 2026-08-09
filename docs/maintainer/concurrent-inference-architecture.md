@@ -736,6 +736,7 @@ FIFO，直到 A 释放容量或 B 的 queue timeout 到期。NInfer 不会先 ad
 
 ## Related documents
 
+- [Single-request Decode CUDA Graph topology](decode-cuda-graph-topology.md)
 - [Serving behavior](../serving.md)
 - [Qwen3.6-27B model semantics](qwen3.6-27b-model.md)
 - [Qwen3.6-35B-A3B model semantics](qwen3.6-35b-a3b-model.md)

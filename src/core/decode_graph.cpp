@@ -3,6 +3,8 @@
 #include "core/device.h"
 
 #include <cstdio>
+#include <stdexcept>
+#include <string>
 
 namespace ninfer {
 namespace {
@@ -36,26 +38,24 @@ void discard_capture(cudaStream_t stream) noexcept {
 
 } // namespace
 
-DecodeGraph::~DecodeGraph() { reset(); }
+DecodeGraphDefinition::~DecodeGraphDefinition() { reset(); }
 
-DecodeGraph::DecodeGraph(DecodeGraph&& other) noexcept : graph_(other.graph_), exec_(other.exec_) {
+DecodeGraphDefinition::DecodeGraphDefinition(DecodeGraphDefinition&& other) noexcept
+    : graph_(other.graph_) {
     other.graph_ = nullptr;
-    other.exec_  = nullptr;
 }
 
-DecodeGraph& DecodeGraph::operator=(DecodeGraph&& other) noexcept {
+DecodeGraphDefinition& DecodeGraphDefinition::operator=(DecodeGraphDefinition&& other) noexcept {
     if (this == &other) { return *this; }
 
     reset();
     graph_ = other.graph_;
-    exec_  = other.exec_;
 
     other.graph_ = nullptr;
-    other.exec_  = nullptr;
     return *this;
 }
 
-void DecodeGraph::capture(cudaStream_t stream, const std::function<void()>& body) {
+void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<void()>& body) {
     reset();
 
     CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
@@ -67,8 +67,7 @@ void DecodeGraph::capture(cudaStream_t stream, const std::function<void()>& body
         throw;
     }
 
-    cudaGraph_t graph    = nullptr;
-    cudaGraphExec_t exec = nullptr;
+    cudaGraph_t graph = nullptr;
 
     cudaError_t err = cudaStreamEndCapture(stream, &graph);
     if (err != cudaSuccess) {
@@ -76,24 +75,65 @@ void DecodeGraph::capture(cudaStream_t stream, const std::function<void()>& body
         CUDA_CHECK(err);
     }
 
-    err = cudaGraphInstantiate(&exec, graph, 0);
+    graph_ = graph;
+}
+
+bool DecodeGraphDefinition::ready() const noexcept { return graph_ != nullptr; }
+
+void DecodeGraphDefinition::reset() noexcept { destroy_graph(graph_); }
+
+DecodeGraphExecutable::~DecodeGraphExecutable() { reset(); }
+
+DecodeGraphExecutable::DecodeGraphExecutable(DecodeGraphExecutable&& other) noexcept
+    : exec_(other.exec_) {
+    other.exec_ = nullptr;
+}
+
+DecodeGraphExecutable& DecodeGraphExecutable::operator=(DecodeGraphExecutable&& other) noexcept {
+    if (this == &other) { return *this; }
+
+    reset();
+    exec_       = other.exec_;
+    other.exec_ = nullptr;
+    return *this;
+}
+
+void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition) {
+    if (!definition.ready()) {
+        throw std::logic_error("cannot instantiate an empty CUDA Graph definition");
+    }
+    reset();
+
+    cudaGraphExec_t exec  = nullptr;
+    const cudaError_t err = cudaGraphInstantiate(&exec, definition.graph_, 0);
     if (err != cudaSuccess) {
         destroy_graph_exec(exec);
-        destroy_graph(graph);
         CUDA_CHECK(err);
     }
-
-    graph_ = graph;
-    exec_  = exec;
+    exec_ = exec;
 }
 
-void DecodeGraph::launch(cudaStream_t stream) { CUDA_CHECK(cudaGraphLaunch(exec_, stream)); }
+void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
+    if (!ready() || !definition.ready()) {
+        throw std::logic_error("CUDA Graph update requires a definition and executable");
+    }
 
-bool DecodeGraph::ready() const noexcept { return exec_ != nullptr; }
-
-void DecodeGraph::reset() noexcept {
-    destroy_graph_exec(exec_);
-    destroy_graph(graph_);
+    cudaGraphExecUpdateResultInfo result{};
+    const cudaError_t err = cudaGraphExecUpdate(exec_, definition.graph_, &result);
+    if (err != cudaSuccess || result.result != cudaGraphExecUpdateSuccess) {
+        throw std::runtime_error(
+            "CUDA Graph executable update failed: " + std::string(cudaGetErrorName(err)) +
+            " (update result " + std::to_string(static_cast<int>(result.result)) + ")");
+    }
 }
+
+void DecodeGraphExecutable::launch(cudaStream_t stream) {
+    if (!ready()) { throw std::logic_error("cannot launch an empty CUDA Graph executable"); }
+    CUDA_CHECK(cudaGraphLaunch(exec_, stream));
+}
+
+bool DecodeGraphExecutable::ready() const noexcept { return exec_ != nullptr; }
+
+void DecodeGraphExecutable::reset() noexcept { destroy_graph_exec(exec_); }
 
 } // namespace ninfer

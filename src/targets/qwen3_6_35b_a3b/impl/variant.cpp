@@ -16,9 +16,10 @@
 namespace ninfer::targets::qwen3_6_35b_a3b::detail {
 namespace {
 
-std::vector<GraphFrontierRange>
-graph_ranges_through(std::uint32_t max_frontier, const std::vector<std::uint32_t>& preferred_ends) {
-    std::vector<GraphFrontierRange> out;
+std::vector<GraphExecutionProfile>
+graph_profiles_through(std::uint32_t max_frontier,
+                       const std::vector<std::uint32_t>& preferred_ends) {
+    std::vector<GraphExecutionProfile> out;
     std::uint32_t begin = 0;
     for (const std::uint32_t preferred_end : preferred_ends) {
         if (begin > max_frontier) { break; }
@@ -29,6 +30,37 @@ graph_ranges_through(std::uint32_t max_frontier, const std::vector<std::uint32_t
     }
     if (begin <= max_frontier) { out.push_back({begin, max_frontier}); }
     return out;
+}
+
+std::vector<GraphExecutionProfile> dflash_base_profiles(std::uint32_t capacity,
+                                                        std::uint32_t draft_window) {
+    if (draft_window == 0 || static_cast<std::uint64_t>(draft_window) + 1ULL > capacity) {
+        return {};
+    }
+    const std::uint32_t block        = draft_window + 1;
+    const std::uint32_t max_frontier = capacity - block;
+    std::vector<std::uint32_t> ends{
+        96U, 127U, 511U, 1023U, 2047U, 4095U, 8191U, 16383U, 32767U, 65536U, 131072U, 196608U,
+    };
+    const auto add_target_boundary = [&](std::uint32_t visible_end) {
+        if (visible_end >= block) { ends.push_back(visible_end - block); }
+    };
+    for (const std::uint32_t visible_end : {128U, 512U, 2048U, 4096U, 8198U, 16390U, 32768U}) {
+        add_target_boundary(visible_end);
+    }
+    if (draft_window >= 6 && draft_window <= 15) {
+        add_target_boundary(draft_window <= 11 ? 512U : 1024U);
+    }
+    std::sort(ends.begin(), ends.end());
+    ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
+    return graph_profiles_through(max_frontier, ends);
+}
+
+bool dflash_target_uses_chunked_small_t(std::uint32_t draft_window, std::uint32_t max_frontier) {
+    const std::uint32_t tokens = draft_window + 1;
+    if (tokens <= 6) { return false; }
+    const std::uint32_t prompt_visible_limit = tokens <= 12 ? 512U : 1024U;
+    return max_frontier + tokens > prompt_visible_limit;
 }
 
 void run_sparse_moe(const Tensor& hidden, const ops::SparseMoeWeights& weights, Tensor& residual,
@@ -49,12 +81,12 @@ void validate_token_interval(std::int32_t first, std::int32_t last) {
 
 } // namespace
 
-std::vector<GraphFrontierRange> Variant::ordinary_graph_ranges(std::uint32_t capacity) {
-    return graph_ranges_through(capacity - 1, {127, 511, 2047, 4095, 8197, 16389, 32767});
+std::vector<GraphExecutionProfile> Variant::ordinary_graph_profiles(std::uint32_t capacity) {
+    return graph_profiles_through(capacity - 1, {127, 511, 2047, 4095, 8197, 16389, 32767});
 }
 
-std::vector<GraphFrontierRange> Variant::mtp_graph_ranges(std::uint32_t capacity,
-                                                          std::uint32_t draft_window) {
+std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t capacity,
+                                                               std::uint32_t draft_window) {
     if (draft_window == 0 || 2ULL * draft_window > capacity) { return {}; }
     std::vector<std::uint32_t> ends;
     const auto add_shifted = [&](std::uint32_t visible_end, std::uint32_t offset) {
@@ -63,40 +95,30 @@ std::vector<GraphFrontierRange> Variant::mtp_graph_ranges(std::uint32_t capacity
     for (const std::uint32_t visible_end : {128U, 512U, 2048U, 4096U, 8198U, 16390U, 32768U}) {
         add_shifted(visible_end, 2 * draft_window);
     }
-    // Keep the fixed-T target verify/batch graph on one side of the prompt-to-chunked
-    // attention crossover. The target call has T=draft_window+1; its three-chunk route needs
-    // a longer prompt interval to amortize the third partial/reduce launch pair.
-    if (draft_window >= 6 && draft_window <= 15) {
-        const std::uint32_t route_visible_end = draft_window <= 11 ? 512U : 1024U;
-        add_shifted(route_visible_end, draft_window + 1);
-    }
     std::sort(ends.begin(), ends.end());
     ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
-    return graph_ranges_through(capacity - 2 * draft_window, ends);
+    return graph_profiles_through(capacity - 2 * draft_window, ends);
 }
 
-std::vector<GraphFrontierRange> Variant::dflash_graph_ranges(std::uint32_t capacity,
-                                                             std::uint32_t draft_window) {
-    if (draft_window == 0 || static_cast<std::uint64_t>(draft_window) + 1ULL > capacity) {
-        return {};
+std::vector<GraphExecutionProfile>
+Variant::dflash_initial_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window) {
+    std::vector<GraphExecutionProfile> profiles = dflash_base_profiles(capacity, draft_window);
+    for (GraphExecutionProfile& profile : profiles) {
+        profile.topology_class =
+            dflash_target_uses_chunked_small_t(draft_window, profile.max) ? 1U : 0U;
     }
-    const std::uint32_t block        = draft_window + 1;
-    const std::uint32_t max_frontier = capacity - block;
-    std::vector<std::uint32_t> ends{
-        96U, 127U, 511U, 1023U, 2047U, 4095U, 8191U, 16383U, 32767U, 65536U, 131072U, 196608U,
-    };
-    const auto add_target_boundary = [&](std::uint32_t visible_end) {
-        if (visible_end >= block) { ends.push_back(visible_end - block); }
-    };
-    for (const std::uint32_t visible_end : {128U, 512U, 2048U, 4096U, 8198U, 16390U, 32768U}) {
-        add_target_boundary(visible_end);
+    return profiles;
+}
+
+std::vector<GraphExecutionProfile>
+Variant::dflash_steady_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window) {
+    std::vector<GraphExecutionProfile> profiles = dflash_base_profiles(capacity, draft_window);
+    for (GraphExecutionProfile& profile : profiles) {
+        const bool split_swa      = profile.max > 96U;
+        const bool chunked_target = dflash_target_uses_chunked_small_t(draft_window, profile.max);
+        profile.topology_class    = (chunked_target ? 2U : 0U) | (split_swa ? 1U : 0U);
     }
-    if (draft_window >= 6 && draft_window <= 15) {
-        add_target_boundary(draft_window <= 11 ? 512U : 1024U);
-    }
-    std::sort(ends.begin(), ends.end());
-    ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
-    return graph_ranges_through(max_frontier, ends);
+    return profiles;
 }
 
 void Variant::attention_projection(const Tensor& hidden,

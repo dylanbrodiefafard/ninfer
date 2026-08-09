@@ -21,9 +21,10 @@
 namespace ninfer::targets::qwen3_6_27b::detail {
 namespace {
 
-std::vector<GraphFrontierRange>
-graph_ranges_through(std::uint32_t max_frontier, const std::vector<std::uint32_t>& preferred_ends) {
-    std::vector<GraphFrontierRange> out;
+std::vector<GraphExecutionProfile>
+graph_profiles_through(std::uint32_t max_frontier,
+                       const std::vector<std::uint32_t>& preferred_ends) {
+    std::vector<GraphExecutionProfile> out;
     std::uint32_t begin = 0;
     for (const std::uint32_t preferred_end : preferred_ends) {
         if (begin > max_frontier) { break; }
@@ -55,14 +56,14 @@ ops::LinearPolicy nvfp4_policy(qwen3_6::TextPhase phase) {
 
 } // namespace
 
-std::vector<GraphFrontierRange> Variant::ordinary_graph_ranges(std::uint32_t capacity) {
+std::vector<GraphExecutionProfile> Variant::ordinary_graph_profiles(std::uint32_t capacity) {
     // E+1 is the one-token visible window. Early ranges limit empty producer CTAs; later ranges
     // follow measured split-policy transitions until the producer grid reaches its fixed cap.
-    return graph_ranges_through(capacity - 1, {127, 511, 2047, 4095, 8197, 16389, 32767});
+    return graph_profiles_through(capacity - 1, {127, 511, 2047, 4095, 8197, 16389, 32767});
 }
 
-std::vector<GraphFrontierRange> Variant::mtp_graph_ranges(std::uint32_t capacity,
-                                                          std::uint32_t draft_window) {
+std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t capacity,
+                                                               std::uint32_t draft_window) {
     if (draft_window == 0 || 2ULL * draft_window > capacity) { return {}; }
     // Bound the final AR window E+2K at split-policy transitions until the grid reaches its cap.
     std::vector<std::uint32_t> ends;
@@ -87,10 +88,16 @@ std::vector<GraphFrontierRange> Variant::mtp_graph_ranges(std::uint32_t capacity
     }
     std::sort(ends.begin(), ends.end());
     ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
-    return graph_ranges_through(capacity - 2 * draft_window, ends);
+    return graph_profiles_through(capacity - 2 * draft_window, ends);
 }
 
-std::vector<GraphFrontierRange> Variant::dflash_graph_ranges(std::uint32_t, std::uint32_t) {
+std::vector<GraphExecutionProfile> Variant::dflash_initial_graph_profiles(std::uint32_t,
+                                                                          std::uint32_t) {
+    return {};
+}
+
+std::vector<GraphExecutionProfile> Variant::dflash_steady_graph_profiles(std::uint32_t,
+                                                                         std::uint32_t) {
     return {};
 }
 

@@ -291,28 +291,31 @@ auto dflash_steady_body(State& state, std::uint32_t k, DFlashEnvelopes envelopes
 
 void warm_capture_dflash_initial_round(State& state, std::uint32_t k,
                                        ops::GqaExecutionEnvelope target_envelope,
-                                       const GraphPrepare& prepare, DecodeGraph& graph) {
+                                       const GraphPrepare& prepare,
+                                       DecodeGraphDefinition& definition) {
     auto body = dflash_initial_body(state, k, target_envelope);
-    warm_capture(state, graph, prepare, body);
+    warm_capture(state, definition, prepare, body);
 }
 
 void dflash_initial_round(State& state, std::uint32_t k, ops::GqaExecutionEnvelope target_envelope,
-                          DecodeGraph* graph) {
+                          DecodeGraphExecutable* executable) {
     auto body = dflash_initial_body(state, k, target_envelope);
-    run_prepared(state, graph, body);
+    run_prepared(state, executable, body);
 }
 
 void warm_capture_dflash_steady_round(State& state, std::uint32_t k, DFlashEnvelopes envelopes,
                                       ops::GqaExecutionEnvelope target_envelope,
-                                      const GraphPrepare& prepare, DecodeGraph& graph) {
+                                      const GraphPrepare& prepare,
+                                      DecodeGraphDefinition& definition) {
     auto body = dflash_steady_body(state, k, envelopes, target_envelope);
-    warm_capture(state, graph, prepare, body);
+    warm_capture(state, definition, prepare, body);
 }
 
 void dflash_steady_round(State& state, std::uint32_t k, DFlashEnvelopes envelopes,
-                         ops::GqaExecutionEnvelope target_envelope, DecodeGraph* graph) {
+                         ops::GqaExecutionEnvelope target_envelope,
+                         DecodeGraphExecutable* executable) {
     auto body = dflash_steady_body(state, k, envelopes, target_envelope);
-    run_prepared(state, graph, body);
+    run_prepared(state, executable, body);
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

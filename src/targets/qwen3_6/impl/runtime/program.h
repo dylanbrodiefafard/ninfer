@@ -88,24 +88,22 @@ struct SequenceKVBundle {
     std::optional<PagedKVAllocation> backend;
 };
 
-struct OrdinaryGraphVariant {
+struct DecodeGraphProfile {
     std::uint32_t min_execution_frontier = 0;
     std::uint32_t max_execution_frontier = 0;
-    DecodeGraph ordinary;
-    DecodeGraph ordinary_aligned;
+    std::uint32_t topology_class         = 0;
+    DecodeGraphDefinition definition;
 };
 
-struct MtpGraphVariant {
-    std::uint32_t min_execution_frontier = 0;
-    std::uint32_t max_execution_frontier = 0;
-    DecodeGraph mtp;
+struct DecodeGraphTopology {
+    std::uint32_t topology_class = 0;
+    DecodeGraphExecutable executable;
+    std::optional<std::size_t> installed_profile;
 };
 
-struct DFlashGraphVariant {
-    std::uint32_t min_execution_frontier = 0;
-    std::uint32_t max_execution_frontier = 0;
-    DecodeGraph initial;
-    DecodeGraph steady;
+struct DecodeGraphFamily {
+    std::vector<DecodeGraphProfile> profiles;
+    std::vector<DecodeGraphTopology> topologies;
 };
 
 class ProgramImplCore {
@@ -162,9 +160,11 @@ public:
     Tensor boundary_hidden;
     ops::SamplingConfig sampling_host;
 
-    std::vector<OrdinaryGraphVariant> ordinary_graphs;
-    std::vector<MtpGraphVariant> mtp_graphs;
-    std::vector<DFlashGraphVariant> dflash_graphs;
+    DecodeGraphFamily ordinary_graphs;
+    DecodeGraphFamily ordinary_aligned_graphs;
+    DecodeGraphFamily mtp_graphs;
+    DecodeGraphFamily dflash_initial_graphs;
+    DecodeGraphFamily dflash_steady_graphs;
 
     PinnedHostBuffer round_host;
     std::int32_t* host_count = nullptr;

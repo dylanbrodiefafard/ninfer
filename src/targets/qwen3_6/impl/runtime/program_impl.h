@@ -72,27 +72,102 @@ schedule::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier, std::uint
     };
 }
 
-template <typename Variant>
-Variant& select_graph_variant(std::vector<Variant>& variants, std::uint32_t frontier,
-                              const char* label) {
-    const auto it = std::lower_bound(variants.begin(), variants.end(), frontier,
-                                     [](const Variant& variant, std::uint32_t value) {
-                                         return variant.max_execution_frontier < value;
+DecodeGraphProfile& select_graph_profile(DecodeGraphFamily& family, std::uint32_t frontier,
+                                         const char* label) {
+    const auto it = std::lower_bound(family.profiles.begin(), family.profiles.end(), frontier,
+                                     [](const DecodeGraphProfile& profile, std::uint32_t value) {
+                                         return profile.max_execution_frontier < value;
                                      });
-    if (it == variants.end() || frontier < it->min_execution_frontier) {
+    if (it == family.profiles.end() || frontier < it->min_execution_frontier) {
         throw std::logic_error(std::string(label) + " CUDA Graph coverage is incomplete");
     }
     return *it;
 }
 
-void validate_graph_ranges(const std::vector<GraphFrontierRange>& ranges,
-                           std::uint32_t max_frontier, const char* label) {
-    if (ranges.empty() || ranges.front().min != 0 || ranges.back().max != max_frontier) {
+void validate_graph_profiles(const std::vector<GraphExecutionProfile>& profiles,
+                             std::uint32_t max_frontier, const char* label) {
+    if (profiles.empty() || profiles.front().min != 0 || profiles.back().max != max_frontier) {
         throw std::logic_error(std::string(label) + " CUDA Graph coverage has invalid endpoints");
     }
-    for (std::size_t i = 0; i < ranges.size(); ++i) {
-        if (ranges[i].min > ranges[i].max || (i != 0 && ranges[i].min != ranges[i - 1].max + 1)) {
+    for (std::size_t i = 0; i < profiles.size(); ++i) {
+        if (profiles[i].min > profiles[i].max ||
+            (i != 0 && profiles[i].min != profiles[i - 1].max + 1)) {
             throw std::logic_error(std::string(label) + " CUDA Graph coverage has a gap");
+        }
+    }
+}
+
+DecodeGraphTopology& select_graph_topology(DecodeGraphFamily& family, std::uint32_t topology_class,
+                                           const char* label) {
+    const auto it = std::find_if(family.topologies.begin(), family.topologies.end(),
+                                 [topology_class](const DecodeGraphTopology& topology) {
+                                     return topology.topology_class == topology_class;
+                                 });
+    if (it == family.topologies.end()) {
+        throw std::logic_error(std::string(label) + " CUDA Graph topology is unavailable");
+    }
+    return *it;
+}
+
+DecodeGraphExecutable& install_graph_profile(DecodeGraphFamily& family, DecodeGraphProfile& profile,
+                                             const char* label) {
+    DecodeGraphTopology& topology   = select_graph_topology(family, profile.topology_class, label);
+    const std::size_t profile_index = static_cast<std::size_t>(&profile - family.profiles.data());
+    if (topology.installed_profile != profile_index) {
+        topology.executable.update(profile.definition);
+        topology.installed_profile = profile_index;
+    }
+    return topology.executable;
+}
+
+template <class Prepare>
+void instantiate_graph_family(DecodeGraphFamily& family, const char* label, DeviceContext& device,
+                              Prepare&& prepare) {
+    if (family.profiles.empty()) {
+        throw std::logic_error(std::string(label) + " CUDA Graph family has no profiles");
+    }
+
+    for (std::size_t i = 0; i < family.profiles.size(); ++i) {
+        DecodeGraphProfile& profile = family.profiles[i];
+        if (!profile.definition.ready()) {
+            throw std::logic_error(std::string(label) + " CUDA Graph definition is empty");
+        }
+        const auto existing =
+            std::find_if(family.topologies.begin(), family.topologies.end(),
+                         [&](const DecodeGraphTopology& topology) {
+                             return topology.topology_class == profile.topology_class;
+                         });
+        if (existing != family.topologies.end()) { continue; }
+
+        family.topologies.emplace_back();
+        DecodeGraphTopology& topology = family.topologies.back();
+        topology.topology_class       = profile.topology_class;
+        topology.executable.instantiate(profile.definition);
+        topology.installed_profile = i;
+    }
+
+    const auto replay_profile = [&](DecodeGraphTopology& topology, std::size_t profile_index) {
+        DecodeGraphProfile& profile = family.profiles[profile_index];
+        prepare(profile.min_execution_frontier);
+        device.synchronize();
+        if (topology.installed_profile != profile_index) {
+            topology.executable.update(profile.definition);
+            topology.installed_profile = profile_index;
+        }
+        topology.executable.launch(device.stream);
+        device.synchronize();
+    };
+
+    for (DecodeGraphTopology& topology : family.topologies) {
+        for (std::size_t i = 0; i < family.profiles.size(); ++i) {
+            if (family.profiles[i].topology_class == topology.topology_class) {
+                replay_profile(topology, i);
+            }
+        }
+        for (std::size_t i = family.profiles.size(); i-- > 0;) {
+            if (family.profiles[i].topology_class == topology.topology_class) {
+                replay_profile(topology, i);
+            }
         }
     }
 }
@@ -446,68 +521,111 @@ void ProgramImplCore::prepare_graphs() {
                                &boundary_hidden};
     };
 
-    const auto ordinary_ranges = ordinary_graph_ranges(capacity);
-    validate_graph_ranges(ordinary_ranges, capacity - 1, "ordinary");
-    ordinary_graphs.reserve(ordinary_ranges.size());
-    for (const GraphFrontierRange range : ordinary_ranges) {
-        ordinary_graphs.emplace_back();
-        OrdinaryGraphVariant& variant      = ordinary_graphs.back();
-        variant.min_execution_frontier     = range.min;
-        variant.max_execution_frontier     = range.max;
-        const std::uint32_t representative = range.min;
-        const ops::GqaExecutionEnvelope envelope{range.min + 1, range.max + 1};
+    const auto ordinary_profiles = ordinary_graph_profiles(capacity);
+    validate_graph_profiles(ordinary_profiles, capacity - 1, "ordinary");
+    ordinary_graphs.profiles.reserve(ordinary_profiles.size());
+    if (decoder->mtp_cache() != nullptr) {
+        ordinary_aligned_graphs.profiles.reserve(ordinary_profiles.size());
+    }
+    for (const GraphExecutionProfile planned : ordinary_profiles) {
+        ordinary_graphs.profiles.emplace_back();
+        DecodeGraphProfile& profile        = ordinary_graphs.profiles.back();
+        profile.min_execution_frontier     = planned.min;
+        profile.max_execution_frontier     = planned.max;
+        profile.topology_class             = planned.topology_class;
+        const std::uint32_t representative = planned.min;
+        const ops::GqaExecutionEnvelope envelope{planned.min + 1, planned.max + 1};
         const auto prepare = [&, representative] { prepare_representative(representative); };
 
         auto ordinary_state = state(representative);
         schedule::warm_capture_ordinary_round(ordinary_state, false, envelope, prepare,
-                                              variant.ordinary);
+                                              profile.definition);
         if (decoder->mtp_cache() != nullptr) {
-            auto aligned_state = state(representative);
+            ordinary_aligned_graphs.profiles.emplace_back();
+            DecodeGraphProfile& aligned_profile    = ordinary_aligned_graphs.profiles.back();
+            aligned_profile.min_execution_frontier = planned.min;
+            aligned_profile.max_execution_frontier = planned.max;
+            aligned_profile.topology_class         = planned.topology_class;
+            auto aligned_state                     = state(representative);
             schedule::warm_capture_ordinary_round(aligned_state, true, envelope, prepare,
-                                                  variant.ordinary_aligned);
+                                                  aligned_profile.definition);
         }
     }
 
-    const auto mtp_ranges = mtp_graph_ranges(capacity, draft_window);
     if (speculative_backend == SpeculativeBackend::Mtp) {
-        validate_graph_ranges(mtp_ranges, capacity - 2 * draft_window, "MTP");
-        mtp_graphs.reserve(mtp_ranges.size());
-        for (const GraphFrontierRange range : mtp_ranges) {
-            mtp_graphs.emplace_back();
-            MtpGraphVariant& variant           = mtp_graphs.back();
-            variant.min_execution_frontier     = range.min;
-            variant.max_execution_frontier     = range.max;
-            const std::uint32_t representative = range.min;
+        const auto planned_profiles = mtp_graph_profiles(capacity, draft_window);
+        validate_graph_profiles(planned_profiles, capacity - 2 * draft_window, "MTP");
+        mtp_graphs.profiles.reserve(planned_profiles.size());
+        for (const GraphExecutionProfile planned : planned_profiles) {
+            mtp_graphs.profiles.emplace_back();
+            DecodeGraphProfile& profile        = mtp_graphs.profiles.back();
+            profile.min_execution_frontier     = planned.min;
+            profile.max_execution_frontier     = planned.max;
+            profile.topology_class             = planned.topology_class;
+            const std::uint32_t representative = planned.min;
             const auto prepare = [&, representative] { prepare_representative(representative); };
 
             auto mtp_state = state(representative);
-            schedule::warm_capture_mtp_round(mtp_state, draft_window,
-                                             mtp_gqa_envelopes(range.min, range.max, draft_window),
-                                             prepare, variant.mtp);
+            schedule::warm_capture_mtp_round(
+                mtp_state, draft_window, mtp_gqa_envelopes(planned.min, planned.max, draft_window),
+                prepare, profile.definition);
         }
     }
     if (speculative_backend == SpeculativeBackend::DFlash) {
-        const auto ranges = dflash_graph_ranges(capacity, draft_window);
-        validate_graph_ranges(ranges, capacity - draft_window - 1, "DFlash");
-        dflash_graphs.reserve(ranges.size());
-        for (const GraphFrontierRange range : ranges) {
-            dflash_graphs.emplace_back();
-            DFlashGraphVariant& variant        = dflash_graphs.back();
-            variant.min_execution_frontier     = range.min;
-            variant.max_execution_frontier     = range.max;
-            const std::uint32_t representative = range.min;
+        const auto initial_profiles = dflash_initial_graph_profiles(capacity, draft_window);
+        validate_graph_profiles(initial_profiles, capacity - draft_window - 1, "DFlash initial");
+        dflash_initial_graphs.profiles.reserve(initial_profiles.size());
+        for (const GraphExecutionProfile planned : initial_profiles) {
+            dflash_initial_graphs.profiles.emplace_back();
+            DecodeGraphProfile& profile        = dflash_initial_graphs.profiles.back();
+            profile.min_execution_frontier     = planned.min;
+            profile.max_execution_frontier     = planned.max;
+            profile.topology_class             = planned.topology_class;
+            const std::uint32_t representative = planned.min;
             const auto prepare = [&, representative] { prepare_representative(representative); };
-            const ops::GqaExecutionEnvelope target_envelope{range.min + draft_window + 1,
-                                                            range.max + draft_window + 1};
+            const ops::GqaExecutionEnvelope target_envelope{planned.min + draft_window + 1,
+                                                            planned.max + draft_window + 1};
 
             auto initial_state = state(representative);
-            schedule::warm_capture_dflash_initial_round(initial_state, draft_window,
-                                                        target_envelope, prepare, variant.initial);
+            schedule::warm_capture_dflash_initial_round(
+                initial_state, draft_window, target_envelope, prepare, profile.definition);
+        }
+
+        const auto steady_profiles = dflash_steady_graph_profiles(capacity, draft_window);
+        validate_graph_profiles(steady_profiles, capacity - draft_window - 1, "DFlash steady");
+        dflash_steady_graphs.profiles.reserve(steady_profiles.size());
+        for (const GraphExecutionProfile planned : steady_profiles) {
+            dflash_steady_graphs.profiles.emplace_back();
+            DecodeGraphProfile& profile        = dflash_steady_graphs.profiles.back();
+            profile.min_execution_frontier     = planned.min;
+            profile.max_execution_frontier     = planned.max;
+            profile.topology_class             = planned.topology_class;
+            const std::uint32_t representative = planned.min;
+            const auto prepare = [&, representative] { prepare_representative(representative); };
+            const ops::GqaExecutionEnvelope target_envelope{planned.min + draft_window + 1,
+                                                            planned.max + draft_window + 1};
+
             auto steady_state = state(representative);
             schedule::warm_capture_dflash_steady_round(
-                steady_state, draft_window, dflash_envelopes(range.min, range.max, draft_window),
-                target_envelope, prepare, variant.steady);
+                steady_state, draft_window,
+                dflash_envelopes(planned.min, planned.max, draft_window), target_envelope, prepare,
+                profile.definition);
         }
+    }
+
+    instantiate_graph_family(ordinary_graphs, "ordinary", device, prepare_representative);
+    if (decoder->mtp_cache() != nullptr) {
+        instantiate_graph_family(ordinary_aligned_graphs, "ordinary aligned", device,
+                                 prepare_representative);
+    }
+    if (speculative_backend == SpeculativeBackend::Mtp) {
+        instantiate_graph_family(mtp_graphs, "MTP", device, prepare_representative);
+    }
+    if (speculative_backend == SpeculativeBackend::DFlash) {
+        instantiate_graph_family(dflash_initial_graphs, "DFlash initial", device,
+                                 prepare_representative);
+        instantiate_graph_family(dflash_steady_graphs, "DFlash steady", device,
+                                 prepare_representative);
     }
 
     ordered_reset();
@@ -967,13 +1085,13 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
         PendingKind kind       = PendingKind::Ordinary;
         if (use_mtp) {
             mark_workspace_usage(workspace_plan.mtp_round);
-            DecodeGraph* graph = nullptr;
-            auto envelopes     = mtp_gqa_envelopes(base_E, base_E, draft_window);
+            DecodeGraphExecutable* executable = nullptr;
+            auto envelopes                    = mtp_gqa_envelopes(base_E, base_E, draft_window);
             if (use_cuda_graph) {
-                MtpGraphVariant& variant = select_graph_variant(mtp_graphs, base_E, "MTP");
-                graph                    = &variant.mtp;
-                envelopes                = mtp_gqa_envelopes(variant.min_execution_frontier,
-                                                             variant.max_execution_frontier, draft_window);
+                DecodeGraphProfile& profile = select_graph_profile(mtp_graphs, base_E, "MTP");
+                executable                  = &install_graph_profile(mtp_graphs, profile, "MTP");
+                envelopes                   = mtp_gqa_envelopes(profile.min_execution_frontier,
+                                                                profile.max_execution_frontier, draft_window);
             }
             const std::uint32_t main_materialized = envelopes.target_verify.max_visible_keys;
             const std::uint32_t backend_materialized =
@@ -984,7 +1102,7 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
             {
                 nvtx::ScopedRange submit_range(nvtx::Name::DecodeMtpSubmit, nvtx::Category::Mtp,
                                                base_E);
-                schedule::mtp_round(schedule_state, draft_window, envelopes, graph);
+                schedule::mtp_round(schedule_state, draft_window, envelopes, executable);
                 CUDA_CHECK(cudaMemcpyAsync(host_count, io.speculative.produced_count.data,
                                            sizeof(std::int32_t), cudaMemcpyDeviceToHost,
                                            device.stream));
@@ -1015,18 +1133,20 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
             tail_hidden_valid = true;
         } else if (use_dflash) {
             mark_workspace_usage(workspace_plan.dflash_round);
-            const bool steady  = pending_context_valid;
-            DecodeGraph* graph = nullptr;
-            auto envelopes     = dflash_envelopes(base_E, base_E, draft_window);
+            const bool steady                 = pending_context_valid;
+            DecodeGraphExecutable* executable = nullptr;
+            auto envelopes                    = dflash_envelopes(base_E, base_E, draft_window);
             ops::GqaExecutionEnvelope target_envelope{base_E + draft_window + 1,
                                                       base_E + draft_window + 1};
             if (use_cuda_graph) {
-                DFlashGraphVariant& variant = select_graph_variant(dflash_graphs, base_E, "DFlash");
-                graph                       = steady ? &variant.steady : &variant.initial;
-                envelopes                   = dflash_envelopes(variant.min_execution_frontier,
-                                                               variant.max_execution_frontier, draft_window);
-                target_envelope             = {variant.min_execution_frontier + draft_window + 1,
-                                               variant.max_execution_frontier + draft_window + 1};
+                DecodeGraphFamily& family   = steady ? dflash_steady_graphs : dflash_initial_graphs;
+                const char* label           = steady ? "DFlash steady" : "DFlash initial";
+                DecodeGraphProfile& profile = select_graph_profile(family, base_E, label);
+                executable                  = &install_graph_profile(family, profile, label);
+                envelopes                   = dflash_envelopes(profile.min_execution_frontier,
+                                                               profile.max_execution_frontier, draft_window);
+                target_envelope             = {profile.min_execution_frontier + draft_window + 1,
+                                               profile.max_execution_frontier + draft_window + 1};
             }
             materialize_sequence_kv(target_envelope.max_visible_keys, envelopes.full.max_context);
             {
@@ -1034,10 +1154,10 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
                                                nvtx::Category::DFlash, base_E);
                 if (steady) {
                     schedule::dflash_steady_round(schedule_state, draft_window, envelopes,
-                                                  target_envelope, graph);
+                                                  target_envelope, executable);
                 } else {
                     schedule::dflash_initial_round(schedule_state, draft_window, target_envelope,
-                                                   graph);
+                                                   executable);
                 }
                 CUDA_CHECK(cudaMemcpyAsync(host_count, io.speculative.produced_count.data,
                                            sizeof(std::int32_t), cudaMemcpyDeviceToHost,
@@ -1091,13 +1211,14 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
             }
             const bool align_mtp = decoder->mtp_cache() != nullptr && mtp_kv_valid == base_E;
             mark_workspace_usage(workspace_plan.ordinary_round);
-            DecodeGraph* graph = nullptr;
+            DecodeGraphExecutable* executable = nullptr;
             ops::GqaExecutionEnvelope envelope{base_E + 1, base_E + 1};
             if (use_cuda_graph) {
-                OrdinaryGraphVariant& variant =
-                    select_graph_variant(ordinary_graphs, base_E, "ordinary");
-                graph    = align_mtp ? &variant.ordinary_aligned : &variant.ordinary;
-                envelope = {variant.min_execution_frontier + 1, variant.max_execution_frontier + 1};
+                DecodeGraphFamily& family   = align_mtp ? ordinary_aligned_graphs : ordinary_graphs;
+                const char* label           = align_mtp ? "ordinary aligned" : "ordinary";
+                DecodeGraphProfile& profile = select_graph_profile(family, base_E, label);
+                executable                  = &install_graph_profile(family, profile, label);
+                envelope = {profile.min_execution_frontier + 1, profile.max_execution_frontier + 1};
             }
             const std::uint32_t backend_materialized =
                 align_mtp || speculative_backend == SpeculativeBackend::DFlash
@@ -1107,7 +1228,7 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
             {
                 nvtx::ScopedRange submit_range(nvtx::Name::DecodeOrdinarySubmit,
                                                nvtx::Category::Decode, base_E);
-                schedule::ordinary_round(schedule_state, align_mtp, envelope, graph);
+                schedule::ordinary_round(schedule_state, align_mtp, envelope, executable);
                 copy_tail(io.verify_hidden.slice(1, 0, 1));
                 copy_round_token();
             }
