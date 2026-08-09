@@ -1,11 +1,13 @@
 #include "ninfer/engine.h"
 
 #include "core/device.h"
+#include "runtime/engine/ordinary_executor.h"
 #include "runtime/generation/generation_controller.h"
 #include "targets/registry.h"
 
 #include <mutex>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <variant>
 
@@ -37,29 +39,143 @@ const PromptSummary& PreparedPrompt::summary() const noexcept {
 
 PreparedPrompt::operator bool() const noexcept { return impl_ != nullptr; }
 
+class GenerationHandle::Impl {
+public:
+    class Concept {
+    public:
+        virtual ~Concept() = default;
+        virtual GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) = 0;
+    };
+
+    template <class Submission>
+    class Model final : public Concept {
+    public:
+        Model(std::shared_ptr<void> keep_alive, Submission submission)
+            : keep_alive_(std::move(keep_alive)), submission_(std::move(submission)) {}
+
+        GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) override {
+            return submission_.wait(sink, cancellation);
+        }
+
+    private:
+        std::shared_ptr<void> keep_alive_;
+        Submission submission_;
+    };
+
+    template <class Submission>
+    Impl(std::shared_ptr<void> keep_alive, Submission submission)
+        : state_(
+              std::make_unique<Model<Submission>>(std::move(keep_alive), std::move(submission))) {}
+
+    GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
+        return state_->wait(sink, cancellation);
+    }
+
+private:
+    std::unique_ptr<Concept> state_;
+};
+
+GenerationHandle::GenerationHandle() noexcept                              = default;
+GenerationHandle::~GenerationHandle()                                      = default;
+GenerationHandle::GenerationHandle(GenerationHandle&&) noexcept            = default;
+GenerationHandle& GenerationHandle::operator=(GenerationHandle&&) noexcept = default;
+
+GenerationHandle::GenerationHandle(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+
+GenerationHandle::operator bool() const noexcept { return impl_ != nullptr; }
+
+GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView& cancellation) {
+    if (impl_ == nullptr) { throw std::logic_error("GenerationHandle is empty"); }
+    std::unique_ptr<Impl> impl = std::move(impl_);
+    return impl->wait(sink, cancellation);
+}
+
 class Engine::Impl {
 public:
+    using Executor27 = runtime::OrdinaryExecutor<targets::Qwen3_6_27BInstance>;
+    using Executor35 = runtime::OrdinaryExecutor<targets::Qwen3_6_35BA3BInstance>;
+    using Executor =
+        std::variant<std::monostate, std::unique_ptr<Executor27>, std::unique_ptr<Executor35>>;
+
     explicit Impl(EngineOptions engine_options)
         : options(std::move(engine_options)), device(options.device) {
         auto constructed = targets::construct_target(options, device);
         active           = std::move(constructed.active);
         load             = std::move(constructed.load);
+        if (options.speculative.backend == SpeculativeBackend::None) {
+            executor = std::visit(
+                [&](auto& target_ptr) -> Executor {
+                    using Instance =
+                        typename std::remove_reference_t<decltype(target_ptr)>::element_type;
+                    if constexpr (std::is_same_v<Instance, targets::Qwen3_6_27BInstance>) {
+                        return std::make_unique<Executor27>(*target_ptr, options);
+                    } else {
+                        return std::make_unique<Executor35>(*target_ptr, options);
+                    }
+                },
+                active);
+        }
     }
 
     ~Impl() noexcept {
+        executor.emplace<std::monostate>();
         try {
             device.synchronize();
         } catch (...) {}
+    }
+
+    GenerationResult run_legacy(std::unique_ptr<PreparedPrompt::Impl> prompt,
+                                RequestOptions request_options, OutputSink* sink,
+                                const CancellationView& cancellation) {
+        std::scoped_lock lock(legacy_generation_mutex);
+        return std::visit(
+            [&](auto& target_ptr) -> GenerationResult {
+                if (target_ptr == nullptr) {
+                    throw std::logic_error("Engine target is not active");
+                }
+                if (prompt->summary.prompt_tokens > target_ptr->capacity) {
+                    throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                                       "prepared prompt exceeds Engine context capacity");
+                }
+                auto output = target_ptr->loaded->frontend.make_output_session(
+                    prompt->value, request_options.stop, request_options.output);
+                auto controller = runtime::run_one(*target_ptr->program, std::move(prompt->value),
+                                                   std::move(output), target_ptr->request_memory,
+                                                   request_options, cancellation, sink);
+
+                GenerationResult result;
+                result.prompt              = prompt->summary;
+                result.generated_token_ids = std::move(controller.generated_token_ids);
+                result.content             = std::move(controller.content);
+                result.reasoning           = std::move(controller.reasoning);
+                result.finish_reason       = controller.summary.finish_reason;
+                if (controller.summary.begin) {
+                    result.reused_prompt_tokens = controller.summary.begin->reused_prompt_tokens;
+                    result.timings              = target_ptr->program->generation_timings();
+                    result.speculative          = target_ptr->program->speculative_stats();
+                }
+                result.timings.prepare_seconds = prompt->prepare_seconds;
+                if (result.timings.prefill_seconds == 0.0) {
+                    result.timings.prefill_seconds = controller.prefill_seconds;
+                }
+                result.timings.decode_seconds = controller.decode_seconds;
+                result.timings.first_token_seconds =
+                    prompt->prepare_seconds + controller.first_token_seconds;
+                result.timings.total_seconds = prompt->prepare_seconds + controller.total_seconds;
+                return result;
+            },
+            active);
     }
 
     EngineOptions options;
     DeviceContext device;
     targets::ActiveTarget active;
     LoadSummary load;
-    mutable std::mutex generation_mutex;
+    Executor executor;
+    mutable std::mutex legacy_generation_mutex;
 };
 
-Engine::Engine(EngineOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {}
+Engine::Engine(EngineOptions options) : impl_(std::make_shared<Impl>(std::move(options))) {}
 
 Engine::~Engine()                            = default;
 Engine::Engine(Engine&&) noexcept            = default;
@@ -113,49 +229,68 @@ std::uint32_t Engine::count_tokens(PromptInput input) const {
         impl_->active);
 }
 
-GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options, OutputSink* sink,
-                                  const CancellationView& cancellation) {
+GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
+                                std::chrono::steady_clock::time_point pending_deadline) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (prompt.impl_ == nullptr) { throw std::invalid_argument("PreparedPrompt is empty"); }
 
-    std::scoped_lock lock(impl_->generation_mutex);
-    return std::visit(
-        [&](auto& target_ptr) -> GenerationResult {
-            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            const PromptSummary prompt_summary = prompt.impl_->summary;
-            if (prompt_summary.prompt_tokens > target_ptr->capacity) {
-                throw RequestError(RequestErrorKind::ContextLengthExceeded,
-                                   "prepared prompt exceeds Engine context capacity");
-            }
-            const double prepare_seconds = prompt.impl_->prepare_seconds;
-            auto output                  = target_ptr->loaded->frontend.make_output_session(
-                prompt.impl_->value, options.stop, options.output);
-            auto controller = runtime::run_one(*target_ptr->program, std::move(prompt.impl_->value),
-                                               std::move(output), target_ptr->request_memory,
-                                               options, cancellation, sink);
-
+    const PromptSummary prompt_summary = prompt.impl_->summary;
+    if (prompt_summary.prompt_tokens > impl_->options.max_context) {
+        throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                           "prepared prompt exceeds Engine context capacity");
+    }
+    const double prepare_seconds = prompt.impl_->prepare_seconds;
+    if (options.execution.requested_output_tokens == 0) {
+        struct ImmediateSubmission {
             GenerationResult result;
-            result.prompt              = prompt_summary;
-            result.generated_token_ids = std::move(controller.generated_token_ids);
-            result.content             = std::move(controller.content);
-            result.reasoning           = std::move(controller.reasoning);
-            result.finish_reason       = controller.summary.finish_reason;
-            if (controller.summary.begin) {
-                result.reused_prompt_tokens = controller.summary.begin->reused_prompt_tokens;
+
+            GenerationResult wait(OutputSink*, const CancellationView& cancellation) {
+                if (cancellation.requested()) { result.finish_reason = FinishReason::Cancelled; }
+                return std::move(result);
             }
-            if (controller.summary.begin) {
-                result.timings     = target_ptr->program->generation_timings();
-                result.speculative = target_ptr->program->speculative_stats();
-            }
-            result.timings.prepare_seconds = prepare_seconds;
-            if (result.timings.prefill_seconds == 0.0) {
-                result.timings.prefill_seconds = controller.prefill_seconds;
-            }
-            result.timings.decode_seconds = controller.decode_seconds;
-            result.timings.total_seconds  = prepare_seconds + controller.total_seconds;
-            return result;
-        },
-        impl_->active);
+        } immediate;
+
+        immediate.result.prompt                  = prompt_summary;
+        immediate.result.finish_reason           = FinishReason::OutputLimit;
+        immediate.result.timings.prepare_seconds = prepare_seconds;
+        immediate.result.timings.total_seconds   = prepare_seconds;
+        return GenerationHandle(
+            std::make_unique<GenerationHandle::Impl>(impl_, std::move(immediate)));
+    }
+
+    if (impl_->options.speculative.backend == SpeculativeBackend::None) {
+        return std::visit(
+            [&](auto& executor) -> GenerationHandle {
+                using Executor = std::remove_cvref_t<decltype(executor)>;
+                if constexpr (std::is_same_v<Executor, std::monostate>) {
+                    throw std::logic_error("ordinary Engine executor is unavailable");
+                } else {
+                    auto submission =
+                        executor->submit(std::move(prompt.impl_->value), prompt_summary,
+                                         prepare_seconds, std::move(options), pending_deadline);
+                    return GenerationHandle(
+                        std::make_unique<GenerationHandle::Impl>(impl_, std::move(submission)));
+                }
+            },
+            impl_->executor);
+    }
+
+    struct LegacySubmission {
+        std::shared_ptr<Impl> engine;
+        std::unique_ptr<PreparedPrompt::Impl> prompt;
+        RequestOptions options;
+
+        GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
+            return engine->run_legacy(std::move(prompt), std::move(options), sink, cancellation);
+        }
+    } legacy{impl_, std::move(prompt.impl_), std::move(options)};
+
+    return GenerationHandle(std::make_unique<GenerationHandle::Impl>(impl_, std::move(legacy)));
+}
+
+GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options, OutputSink* sink,
+                                  const CancellationView& cancellation) {
+    return submit(std::move(prompt), std::move(options)).wait(sink, cancellation);
 }
 
 const EngineOptions& Engine::options() const {
@@ -170,7 +305,19 @@ LoadSummary Engine::load_summary() const {
 
 MemorySummary Engine::memory_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    std::scoped_lock lock(impl_->generation_mutex);
+    if (impl_->options.speculative.backend == SpeculativeBackend::None) {
+        return std::visit(
+            [](const auto& executor) -> MemorySummary {
+                using Executor = std::remove_cvref_t<decltype(executor)>;
+                if constexpr (std::is_same_v<Executor, std::monostate>) {
+                    throw std::logic_error("ordinary Engine executor is unavailable");
+                } else {
+                    return executor->memory_summary();
+                }
+            },
+            impl_->executor);
+    }
+    std::scoped_lock lock(impl_->legacy_generation_mutex);
     return std::visit(
         [](const auto& target_ptr) {
             if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
@@ -183,7 +330,18 @@ MemorySummary Engine::memory_summary() const {
 
 void Engine::reset_memory_peaks() noexcept {
     if (impl_ == nullptr) { return; }
-    std::unique_lock lock(impl_->generation_mutex, std::defer_lock);
+    if (impl_->options.speculative.backend == SpeculativeBackend::None) {
+        std::visit(
+            [](auto& executor) {
+                using Executor = std::remove_cvref_t<decltype(executor)>;
+                if constexpr (!std::is_same_v<Executor, std::monostate>) {
+                    executor->reset_memory_peaks();
+                }
+            },
+            impl_->executor);
+        return;
+    }
+    std::unique_lock lock(impl_->legacy_generation_mutex, std::defer_lock);
     try {
         lock.lock();
     } catch (...) { return; }

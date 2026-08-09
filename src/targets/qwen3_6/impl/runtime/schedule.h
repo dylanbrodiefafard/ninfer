@@ -46,6 +46,11 @@ struct State {
     ProposalHead proposal_head;
     Tensor* tail_hidden;
     Tensor* boundary_hidden;
+    std::int32_t linear_state_base                              = 0;
+    std::int32_t linear_state_capacity                          = 0;
+    const qwen3_6::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
+    qwen3_6::OrdinaryDecodeEgress* ordinary_host_egress         = nullptr;
+    Tensor* continuation_hidden_store                           = nullptr;
 };
 
 struct MtpGqaEnvelopes {
@@ -66,6 +71,15 @@ void configure_text_card(TextContext& card, const State& state);
 
 [[nodiscard]] bool prefill_text(State& state, std::span<const TokenId> ids,
                                 std::optional<std::uint32_t> snapshot_boundary, bool prepare_mtp);
+
+[[nodiscard]] PrefillChunkResult prefill_text_chunk(State& state, std::span<const TokenId> ids,
+                                                    std::optional<std::uint32_t> snapshot_boundary,
+                                                    bool finalize_at_end);
+
+[[nodiscard]] PrefillChunkResult
+prefill_multimodal_chunk(State& state, const PreparedPromptData& prompt,
+                         VisionPrefillSession& vision, std::uint32_t nominal_length,
+                         std::optional<std::uint32_t> snapshot_boundary, bool finalize_at_end);
 
 struct MultimodalPrefillResult {
     bool mtp_prepared                = false;
@@ -102,6 +116,16 @@ void warm_capture_ordinary_round(State& state, bool align_mtp, ops::GqaExecution
                                  const GraphPrepare& prepare, DecodeGraphDefinition& definition);
 void ordinary_round(State& state, bool align_mtp, ops::GqaExecutionEnvelope envelope,
                     DecodeGraphExecutable* executable);
+
+// Executes one exact-B ordinary decode traversal. All request rows enter through the stable
+// ordinary ingress, share one model schedule, publish continuation hidden by selector, and leave
+// through one compact egress transfer.
+void warm_capture_ordinary_decode_batch(State& state, std::int32_t batch_size,
+                                        ops::GqaExecutionEnvelope envelope,
+                                        const GraphPrepare& prepare,
+                                        DecodeGraphDefinition& definition);
+void ordinary_decode_batch(State& state, std::int32_t batch_size,
+                           ops::GqaExecutionEnvelope envelope, DecodeGraphExecutable* executable);
 
 // Executes one fixed-k MTP synchronization/proposal round around the common speculative
 // verification transaction. The number of licensed tokens and their values are written to

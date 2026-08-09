@@ -18,8 +18,12 @@
 
 namespace ninfer::serve {
 
+struct RequestLifetime;
+struct RequestCapacity;
+
 struct GenerationMetrics {
     double prepare_seconds = 0.0;
+    double ttft_seconds    = 0.0;
     double vision_seconds  = 0.0;
     double prefill_seconds = 0.0;
     double decode_seconds  = 0.0;
@@ -51,17 +55,19 @@ struct StreamSink {
     std::function<bool()> is_cancelled;
 };
 
-// A prepared prompt is tied to the Engine that produced it and is consumed by
-// run(). Protocol-only flags remain alongside it for response rendering.
+// Preparation ends by synchronously submitting the owning prompt to the Engine FIFO. The returned
+// request keeps its ingress/response lifetime reservation until the HTTP response is released and
+// is consumed exactly once by run().
 struct PreparedRequest {
-    ninfer::PreparedPrompt prompt;
-    ninfer::RequestOptions options;
+    ninfer::GenerationHandle generation;
+    ninfer::SamplingParameters sampling;
     double prepare_seconds           = 0.0;
     int prompt_tokens                = 0;
     bool include_usage               = false;
     bool tool_capable                = false;
     std::size_t tool_name_max_length = 64;
     bool enable_thinking             = true;
+    std::shared_ptr<RequestLifetime> lifetime;
 
     // Limit concurrent ownership of media preprocessing buffers. Text requests
     // do not use this permit.
@@ -81,14 +87,18 @@ public:
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req) const;
     [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req) const;
 
-    // Consumes prepared.prompt. A PreparedRequest is single-use.
-    GenerationOutcome run(PreparedRequest& prepared, const StreamSink* sink);
+    // Consumes prepared.generation. A PreparedRequest is single-use.
+    GenerationOutcome run(PreparedRequest& prepared, const StreamSink* sink,
+                          std::function<bool()> is_cancelled = {});
 
     void warmup();
 
 private:
+    [[nodiscard]] std::shared_ptr<RequestLifetime> acquire_request_lifetime() const;
+
     ServeOptions options_;
     std::unique_ptr<ninfer::Engine> engine_;
+    std::shared_ptr<RequestCapacity> request_capacity_;
     mutable std::mutex media_mutex_;
 };
 

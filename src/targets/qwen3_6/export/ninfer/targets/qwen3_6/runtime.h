@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 
 namespace ninfer {
 struct DeviceContext;
@@ -48,6 +49,7 @@ public:
     SequencePlan& operator=(const SequencePlan&) = delete;
 
     [[nodiscard]] std::uint32_t capacity() const noexcept;
+    [[nodiscard]] std::uint32_t max_concurrency() const noexcept;
     [[nodiscard]] std::size_t device_reservation_bytes() const noexcept;
     [[nodiscard]] std::size_t workspace_capacity_bytes() const noexcept;
     [[nodiscard]] std::size_t request_transient_capacity_bytes() const noexcept;
@@ -98,6 +100,29 @@ public:
     [[nodiscard]] runtime::BeginResult begin(PreparedPrompt&& prompt, RequestPlan<Variant>&& plan,
                                              runtime::TransientRegion transient);
     [[nodiscard]] runtime::GeneratedRound decode_round(runtime::RoundBudget budget);
+
+    // Engine-internal fixed-lane execution surface. The public Engine owns scheduling; Program
+    // owns the target state images and executes one immutable ordinary batch membership.
+    [[nodiscard]] RequestPlan<Variant> plan_request_for_lane(std::uint32_t lane,
+                                                             const PreparedPrompt& prompt,
+                                                             const ExecutionOptions& options);
+    [[nodiscard]] bool can_admit_lane(std::uint32_t lane,
+                                      const RequestPlan<Variant>& plan) const noexcept;
+    [[nodiscard]] bool
+    can_admit_lane_after_retained_eviction(std::uint32_t lane,
+                                           const RequestPlan<Variant>& plan) const noexcept;
+    [[nodiscard]] runtime::PrefillStepResult
+    start_ordinary_prefill_lane(std::uint32_t lane, PreparedPrompt&& prompt,
+                                RequestPlan<Variant>&& plan, runtime::TransientRegion transient);
+    [[nodiscard]] runtime::PrefillStepResult advance_ordinary_prefill_lane(std::uint32_t lane);
+    [[nodiscard]] runtime::BatchedGeneratedRound
+    decode_ordinary_batch(std::span<const std::uint32_t> lanes,
+                          std::span<const runtime::RoundBudget> budgets);
+    void resolve_pending_lane(std::uint32_t lane, std::uint32_t accepted_tokens, bool terminal);
+    void abort_lane(std::uint32_t lane) noexcept;
+    [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
+    void evict_retained_lane(std::uint32_t lane) noexcept;
+    [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
 
     void resolve_pending(std::uint32_t accepted_tokens, bool terminal);
     void finish_active();

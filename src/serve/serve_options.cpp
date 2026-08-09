@@ -56,7 +56,9 @@ KvCacheStorage parse_kv_dtype(const char* text) {
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
-           "[--model-id ID] [--max-context N] [--prefill-chunk N] [--device N] "
+           "[--model-id ID] [--max-context N] [--max-concurrency N] "
+           "[--max-pending-requests N] [--pending-timeout-ms N] "
+           "[--prefill-chunk N] [--device N] "
            "[--max-request-mib N] [--request-log-jsonl FILE] "
            "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
@@ -114,6 +116,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--max-context") {
             options.max_context = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-context"), "max-context"));
+        } else if (arg == "--max-concurrency") {
+            options.max_concurrency = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));
+        } else if (arg == "--max-pending-requests") {
+            options.max_pending_requests = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--max-pending-requests"), "max-pending-requests"));
+        } else if (arg == "--pending-timeout-ms") {
+            options.pending_timeout_ms = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--pending-timeout-ms"), "pending-timeout-ms"));
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
@@ -180,6 +191,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--port must be in [1,65535]");
     }
     if (options.max_context == 0) { throw std::invalid_argument("--max-context must be positive"); }
+    if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
+        throw std::invalid_argument("--max-concurrency must be in [1,8]");
+    }
+    if (options.max_pending_requests == 0) {
+        throw std::invalid_argument("--max-pending-requests must be positive");
+    }
+    if (options.pending_timeout_ms == 0) {
+        throw std::invalid_argument("--pending-timeout-ms must be positive");
+    }
     if (options.max_request_bytes == 0) {
         throw std::invalid_argument("--max-request-mib must be positive");
     }

@@ -165,20 +165,19 @@ void Variant::gdn_input_projection_snapshot(
     Tensor& conv_states, const Tensor& initial_slot, const Tensor& snapshot_base_slot,
     Tensor& query, Tensor& key, Tensor& value, Tensor& output_gate, qwen3_6::TextPhase,
     WorkspaceArena& workspace, cudaStream_t stream) {
-    Tensor output_gate_flat =
-        output_gate.view({TextConfig::value_dim, static_cast<int>(hidden.ne[1])});
+    Tensor output_gate_view = output_gate.view({TextConfig::value_dim, hidden.ne[1], hidden.ne[2]});
     if (const auto* split =
             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
         ops::gdn_input_proj_conv_snapshot(hidden, split->query_key, split->value_z, conv_weight,
                                           conv_states, Tensor{}, initial_slot, snapshot_base_slot,
-                                          query, key, value, output_gate_flat, workspace, stream);
+                                          query, key, value, output_gate_view, workspace, stream);
         return;
     }
     const Weight& fused =
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
     ops::gdn_input_proj_conv_snapshot(hidden, fused, conv_weight, conv_states, Tensor{},
                                       initial_slot, snapshot_base_slot, query, key, value,
-                                      output_gate_flat, text_policy(fused), workspace, stream);
+                                      output_gate_view, text_policy(fused), workspace, stream);
 }
 
 void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
@@ -288,15 +287,17 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
 }
 
 std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
-    WeightsProfile weights_profile, qwen3_6::TextPhase, std::int32_t first, std::int32_t last) {
+    WeightsProfile weights_profile, qwen3_6::TextPhase, std::int32_t batch_size, std::int32_t first,
+    std::int32_t last) {
     validate_token_interval(first, last);
     switch (weights_profile) {
     case WeightsProfile::GroupwiseInt:
         return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, 1, first, last);
+            TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch_size, first,
+            last);
     case WeightsProfile::Nvfp4:
         return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, 1, first, last);
+            QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, batch_size, first, last);
     }
     throw std::logic_error("invalid 27B weights profile");
 }

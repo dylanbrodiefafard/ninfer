@@ -42,6 +42,14 @@ std::size_t checked_mul(std::size_t a, std::size_t b, const char* label) {
     return a * b;
 }
 
+std::int32_t checked_i32(std::uint64_t value, const char* label) {
+    if (value == 0 ||
+        value > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::overflow_error(label);
+    }
+    return static_cast<std::int32_t>(value);
+}
+
 std::size_t align_up(std::size_t value, std::size_t alignment, const char* label) {
     const std::size_t padding = (alignment - value % alignment) % alignment;
     return checked_add(value, padding, label);
@@ -77,8 +85,11 @@ TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
 }
 
 PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
-    const std::int32_t linear_state_slots =
+    const std::int32_t slots_per_sequence =
         LinearStateSlots::required_slot_count(plan.draft_window);
+    const std::int32_t linear_state_slots =
+        checked_i32(static_cast<std::uint64_t>(slots_per_sequence) * plan.max_concurrency,
+                    "Linear Attention state slots exceed int32");
     const auto effective_prefill_chunk =
         static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));
     LayoutBuilder builder;
@@ -93,6 +104,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .kv_dtype              = plan.kv_dtype,
                      .kv_quant_group        = plan.kv_quant_group,
                      .enable_mtp            = plan.features.mtp(),
+                     .kv_table_rows         = static_cast<std::int32_t>(plan.max_concurrency),
                      .linear_attention =
                          {
                              .layers         = TextConfig::gdn_layers(),
@@ -120,7 +132,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             PagedKVPoolSpec full_pool{
                 .page_group_count      = full_pages,
                 .logical_page_capacity = full_pages,
-                .table_rows            = 1,
+                .table_rows            = static_cast<std::int32_t>(plan.max_concurrency),
                 .plane_order           = PagedKVPlaneOrder::HeadMajor,
                 .planes =
                     {
@@ -147,23 +159,32 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     }
 
     out.round = qwen3_6::begin_round_state_layout(
-        builder, qwen3_6::RoundStateSpec{.hidden       = TextConfig::hidden,
-                                         .output_rows  = TextConfig::output_rows,
-                                         .draft_window = plan.draft_window,
-                                         .enable_mtp   = plan.features.mtp()});
+        builder, qwen3_6::RoundStateSpec{.hidden         = TextConfig::hidden,
+                                         .output_rows    = TextConfig::output_rows,
+                                         .batch_capacity = plan.max_concurrency,
+                                         .draft_window   = plan.draft_window,
+                                         .enable_mtp     = plan.features.mtp()});
     out.prefill_hidden = add_tensor(
         builder, DType::BF16, {TextConfig::hidden, effective_prefill_chunk}, "step prefill hidden");
     qwen3_6::complete_round_state_layout(builder, out.round);
     const auto i32 = [&](std::size_t n, const char* label) {
         return add_tensor(builder, DType::I32, {static_cast<std::int32_t>(n)}, label);
     };
-    out.token_counts        = i32(TextConfig::token_domain, "sampling token counts");
+    out.token_counts =
+        add_tensor(builder, DType::I32,
+                   {TextConfig::token_domain, static_cast<std::int32_t>(plan.max_concurrency)},
+                   "sampling token counts");
     const auto config_words = static_cast<std::int32_t>(
         (sizeof(ops::SamplingConfig) + sizeof(std::int32_t) - 1) / sizeof(std::int32_t));
-    out.sampling_config = add_tensor(builder, DType::I32, {config_words}, "sampling config");
-    out.tail_hidden     = add_tensor(builder, DType::BF16, {TextConfig::hidden, 1}, "tail hidden");
-    out.boundary_hidden =
-        add_tensor(builder, DType::BF16, {TextConfig::hidden, 1}, "boundary hidden");
+    out.sampling_config = add_tensor(
+        builder, DType::I32, {config_words, static_cast<std::int32_t>(plan.max_concurrency)},
+        "sampling config");
+    out.tail_hidden = add_tensor(
+        builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(plan.max_concurrency)},
+        "tail hidden");
+    out.boundary_hidden = add_tensor(
+        builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(plan.max_concurrency)},
+        "boundary hidden");
     out.bytes = builder.finish(kArenaAlign, "persistent layout");
     out.kv_payload_bytes =
         out.decoder.kv_payload_bytes() + (out.dflash ? out.dflash->kv_payload_bytes() : 0);
@@ -197,26 +218,30 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     };
     const auto attention_stage = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                      std::int32_t last, qwen3_6::TextPhase phase,
-                                     ops::GqaExecutionEnvelope envelope) {
+                                     std::int32_t batch_size, std::int32_t min_width,
+                                     std::int32_t max_width, ops::GqaExecutionEnvelope envelope) {
         auto stage = layout.scope();
         (void)workspace_recipe::text_attention_projection<TextConfig>(layout, last);
         scratch(layout, Variant::attention_projection_workspace_capacity_bytes(plan.weights_profile,
                                                                                phase, first, last));
         (void)workspace_recipe::text_attention_results<TextConfig>(layout, last);
         scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
-                            TextConfig::query_heads, plan.kv_dtype, envelope, 1, first, last));
+                            TextConfig::query_heads, plan.kv_dtype, envelope, batch_size, min_width,
+                            max_width));
         scratch(layout, Variant::attention_output_projection_workspace_capacity_bytes(
                             plan.weights_profile, phase, first, last));
     };
     const auto gdn_stage = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
-                               std::int32_t last, qwen3_6::TextPhase phase, bool snapshot) {
+                               std::int32_t last, qwen3_6::TextPhase phase, bool snapshot,
+                               std::int32_t batch_size, std::int32_t min_width,
+                               std::int32_t max_width) {
         auto stage = layout.scope();
         (void)workspace_recipe::gdn_control<TextConfig>(layout, last);
         scratch(layout, Variant::gdn_norm_control_projection_workspace_capacity_bytes(first, last));
         (void)workspace_recipe::gdn_projection<TextConfig>(layout, last);
         if (snapshot) {
             scratch(layout, Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
-                                plan.weights_profile, phase, first, last));
+                                plan.weights_profile, phase, batch_size, min_width, max_width));
         } else {
             (void)workspace_recipe::gdn_prefill_conv<TextConfig>(layout, last);
             scratch(layout, Variant::gdn_input_projection_workspace_capacity_bytes(
@@ -241,16 +266,18 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     };
     const auto target_body = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                  std::int32_t last, qwen3_6::TextPhase phase, bool snapshot,
-                                 ops::GqaExecutionEnvelope envelope) {
-        attention_stage(layout, first, last, phase, envelope);
-        gdn_stage(layout, first, last, phase, snapshot);
+                                 std::int32_t batch_size, std::int32_t min_width,
+                                 std::int32_t max_width, ops::GqaExecutionEnvelope envelope) {
+        attention_stage(layout, first, last, phase, batch_size, min_width, max_width, envelope);
+        gdn_stage(layout, first, last, phase, snapshot, batch_size, min_width, max_width);
         post_mixer_stage(layout, first, last, phase);
     };
     const auto target_verify = [&](std::int32_t tokens, ops::GqaExecutionEnvelope envelope) {
         WorkspaceLayoutBuilder layout;
         matrix(layout, DType::I32, 1, tokens);
         matrix(layout, DType::BF16, TextConfig::hidden, tokens);
-        target_body(layout, tokens, tokens, qwen3_6::TextPhase::Verify, true, envelope);
+        target_body(layout, tokens, tokens, qwen3_6::TextPhase::Verify, true, 1, tokens, tokens,
+                    envelope);
         return finish(layout);
     };
 
@@ -315,19 +342,27 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     WorkspacePlan out;
     WorkspaceLayoutBuilder text_prefill;
     text_common_root(text_prefill, chunk);
-    target_body(text_prefill, 1, chunk, qwen3_6::TextPhase::Prefill, false, text_envelope);
+    target_body(text_prefill, 1, chunk, qwen3_6::TextPhase::Prefill, false, 1, 1, chunk,
+                text_envelope);
     scratch(text_prefill, ops::sampling_workspace_capacity_bytes(TextConfig::token_domain, 1, 1));
     out.text_prefill = finish(text_prefill);
 
-    const std::size_t verify_one = target_verify(1, text_envelope);
-    const std::size_t sample_one =
-        ops::sampling_workspace_capacity_bytes(TextConfig::token_domain, 1, 1);
-    out.ordinary_round = std::max(verify_one, sample_one);
+    for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
+         ++batch) {
+        WorkspaceLayoutBuilder ordinary;
+        matrix(ordinary, DType::BF16, TextConfig::hidden, batch);
+        target_body(ordinary, batch, batch, qwen3_6::TextPhase::Verify, true, batch, 1, 1,
+                    text_envelope);
+        scratch(ordinary,
+                ops::sampling_workspace_capacity_bytes(TextConfig::token_domain, batch, batch));
+        out.ordinary_round = std::max(out.ordinary_round, finish(ordinary));
+    }
 
     if (plan.features.mtp()) {
         WorkspaceLayoutBuilder mtp_prefill;
         text_common_root(mtp_prefill, chunk);
-        target_body(mtp_prefill, 1, chunk, qwen3_6::TextPhase::Prefill, false, text_envelope);
+        target_body(mtp_prefill, 1, chunk, qwen3_6::TextPhase::Prefill, false, 1, 1, chunk,
+                    text_envelope);
         matrix(mtp_prefill, DType::I32, 1, chunk);
         if (plan.features.vision) {
             matrix(mtp_prefill, DType::BF16, TextConfig::hidden, chunk);
@@ -434,6 +469,15 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
     if (options.prefill_chunk == 0 || options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
     }
+    if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
+        throw std::invalid_argument("max_concurrency must be in [1,8]");
+    }
+    const std::uint32_t context_pages =
+        1U + (options.max_context - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+    if (context_pages < options.max_concurrency) {
+        throw std::invalid_argument(
+            "max_context cannot provide one Paged KV page per concurrent request");
+    }
     switch (options.speculative.backend) {
     case SpeculativeBackend::None:
         if (options.speculative.draft_tokens != 0 ||
@@ -474,6 +518,7 @@ std::unique_ptr<SequencePlanImpl> plan_sequence_impl(DeviceContext& device,
     auto impl                 = std::make_unique<SequencePlanImpl>();
     impl->weights_profile     = weights_profile;
     impl->capacity            = options.max_context;
+    impl->max_concurrency     = options.max_concurrency;
     impl->prefill_chunk       = std::min(options.prefill_chunk, options.max_context);
     impl->draft_window        = options.speculative.draft_tokens;
     impl->speculative_backend = options.speculative.backend;
@@ -498,7 +543,10 @@ std::unique_ptr<SequencePlanImpl> plan_sequence_impl(DeviceContext& device,
         // Definitions remain per execution profile, but only one executable is instantiated for
         // each reachable node-topology class. These bounds cover the largest profile installed in
         // each class and the driver/module state materialized while qualifying all definitions.
-        impl->graph_allowance_bytes = 12ULL * kMiB;
+        impl->graph_allowance_bytes = impl->speculative_backend == SpeculativeBackend::None
+                                          ? checked_mul(12ULL * kMiB, impl->max_concurrency,
+                                                        "ordinary exact-b graph allowance")
+                                          : 12ULL * kMiB;
         if (impl->speculative_backend == SpeculativeBackend::Mtp) {
             impl->graph_allowance_bytes = checked_add(impl->graph_allowance_bytes, 12ULL * kMiB,
                                                       "ordinary aligned graph allowance");

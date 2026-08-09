@@ -2,17 +2,46 @@
 
 #include "core/layout.h"
 #include "core/tensor.h"
+#include "ninfer/ops/sampling.h"
+#include "ninfer/types.h"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 
 namespace ninfer::targets::qwen3_6 {
 
 struct RoundStateSpec {
-    std::int32_t hidden        = 0;
-    std::int32_t output_rows   = 0;
-    std::uint32_t draft_window = 0;
-    bool enable_mtp            = false;
+    std::int32_t hidden          = 0;
+    std::int32_t output_rows     = 0;
+    std::uint32_t batch_capacity = 1;
+    std::uint32_t draft_window   = 0;
+    bool enable_mtp              = false;
+};
+
+// Stable pinned/device transfer format for ordinary decode. The full fixed-size object is copied
+// once per round; only its exact-B prefixes are consumed by the model schedule.
+struct OrdinaryDecodeIngress {
+    std::array<TokenId, kMaximumConcurrency> tokens{};
+    std::array<std::int32_t, kMaximumConcurrency> cache_positions{};
+    std::array<std::int32_t, kMaximumConcurrency> rope_positions{};
+    std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
+    std::array<std::int32_t, kMaximumConcurrency> linear_state_read_slots{};
+    std::array<std::int32_t, kMaximumConcurrency> linear_state_snapshot_base_slots{};
+    std::array<std::int32_t, kMaximumConcurrency> continuation_slots{};
+    std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
+};
+
+struct OrdinaryDecodeEgress {
+    std::array<TokenId, kMaximumConcurrency> sampled_tokens{};
+};
+
+struct OrdinaryDecodeStateLayout {
+    LayoutRegion ingress;
+    LayoutRegion egress;
+    TensorRegion logits;
+    TensorRegion hidden;
 };
 
 struct SpeculativeRoundStateLayout {
@@ -34,6 +63,7 @@ struct MtpRoundStateLayout {
 
 struct RoundStateLayout {
     RoundStateSpec spec;
+    OrdinaryDecodeStateLayout ordinary;
     TensorRegion token;
     TensorRegion pos;
     TensorRegion rope_pos;
@@ -47,6 +77,26 @@ struct RoundStateLayout {
     SpeculativeRoundStateLayout speculative;
     std::optional<MtpRoundStateLayout> mtp;
     bool complete = false;
+};
+
+struct OrdinaryDecodeState {
+    DeviceSpan ingress;
+    DeviceSpan egress;
+    Tensor tokens;
+    Tensor cache_positions;
+    Tensor rope_positions;
+    Tensor text_kv_table_rows;
+    Tensor linear_state_read_slots;
+    Tensor linear_state_snapshot_base_slots;
+    Tensor continuation_slots;
+    const ops::SamplingConfig* sampling = nullptr;
+    Tensor sampled_tokens;
+    Tensor logits;
+    Tensor hidden;
+
+    OrdinaryDecodeState() = default;
+    OrdinaryDecodeState(DeviceSpan backing, const OrdinaryDecodeStateLayout& layout,
+                        std::uint32_t batch_capacity);
 };
 
 // The two planning calls expose one deliberate exact-target extension seam after verify_hidden.
@@ -80,6 +130,7 @@ struct MtpRoundState {
 };
 
 struct RoundState {
+    OrdinaryDecodeState ordinary;
     Tensor token;
     Tensor pos;
     Tensor rope_pos;

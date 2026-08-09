@@ -59,10 +59,17 @@ int main() {
     failures += check(implicit_backend_rejected, "--draft-tokens selected a backend implicitly");
 
     const ServeOptions configured =
-        parse({"ninfer-serve", "model.ninfer", "--no-prefix-reuse", "--vision"});
+        parse({"ninfer-serve", "model.ninfer", "--no-prefix-reuse", "--vision", "--max-concurrency",
+               "4", "--max-pending-requests", "12", "--pending-timeout-ms", "2500"});
     failures += check(!configured.allow_prefix_reuse,
                       "--no-prefix-reuse did not disable server prefix reuse");
     failures += check(configured.enable_vision, "--vision did not enable Vision");
+    failures +=
+        check(configured.max_concurrency == 4, "--max-concurrency did not reach serving options");
+    failures += check(configured.max_pending_requests == 12,
+                      "--max-pending-requests did not reach serving options");
+    failures += check(configured.pending_timeout_ms == 2500,
+                      "--pending-timeout-ms did not reach serving options");
 
     GenerationRequest request;
     request.max_tokens = 1;

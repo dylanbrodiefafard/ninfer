@@ -101,10 +101,9 @@ struct Variant {
     gdn_input_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
                                                   qwen3_6::TextPhase phase, std::int32_t first,
                                                   std::int32_t last);
-    [[nodiscard]] static std::size_t
-    gdn_input_projection_snapshot_workspace_capacity_bytes(WeightsProfile weights_profile,
-                                                           qwen3_6::TextPhase phase,
-                                                           std::int32_t first, std::int32_t last);
+    [[nodiscard]] static std::size_t gdn_input_projection_snapshot_workspace_capacity_bytes(
+        WeightsProfile weights_profile, qwen3_6::TextPhase phase, std::int32_t batch_size,
+        std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t
     gdn_output_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
                                                    qwen3_6::TextPhase phase, std::int32_t first,

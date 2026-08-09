@@ -119,17 +119,23 @@ request 当前位于哪个 slot 或 compact batch row，也不得影响同一 ba
 └───────────────────┬──────────────────────────────────┘
                     │ admission at a boundary
                     ▼
-┌──────────────── GPU Executor ──────────────────┐
-│ Slot Table                                     │
-│ Scheduler                                      │
-│ Batch Builder                                  │
-│                                                │
-│  PrefillChunk ─────┐                           │
-│                    ├──> Model Executor          │
-│  DecodeBatch[B] ───┘       │                   │
-│                             ▼                   │
-│                       round results             │
-└───────────────┬───────────────────┬─────────────┘
+┌──────────────────── GPU Executor ────────────────────┐
+│ Boundary Coordinator · Scheduler · Slot Table[C]     │
+│                         │                            │
+│          ┌──────────────┴──────────────┐             │
+│          ▼                             ▼             │
+│  PrefillChunk(one sequence)   RoundMembership[B]    │
+│          │                             │             │
+│          │                    Target Batch Assembler │
+│          │                             │             │
+│          └───────────┬─────────────────┘             │
+│                      ▼                               │
+│       shared Model Runtime + DecodeBatchFrame[C]     │
+│       weights · workspace · graph families           │
+│                      │                               │
+│                      ▼                               │
+│               per-row round results                  │
+└───────────────┬───────────────────┬──────────────────┘
                 │                   │ committed output
                 ▼                   ▼
 ┌─ Sequence-State Store prerequisite ─┐  Server Frontend
@@ -146,13 +152,24 @@ request 当前位于哪个 slot 或 compact batch row，也不得影响同一 ba
 | 组件 | 职责 |
 |---|---|
 | Server Frontend | 请求校验、有界 CPU preparation/pending work、取消输入和响应 I/O |
-| GPU Executor | admission、调度、状态提交和全部 GPU submission |
+| GPU Executor | admission、boundary processing、状态提交和全部 GPU submission |
 | Slot Table | 保存 admitted requests 的稳定控制状态 |
-| Batch Builder | 把全部 decode-ready requests 压紧为下一逻辑 batch |
-| Model Executor | 使用选定 graph/profile 执行一次 whole-batch model schedule |
+| Scheduler | 在 boundary 选择下一 `PrefillChunk` 或完整 active `DecodeRound` |
+| Target Batch Assembler | 把 round membership 转成 target 所需的 typed controls 和 state selectors |
+| Model Runtime | 持有唯一 resident model、共享 execution memory 和 graph assets，执行 whole-batch schedule |
+| DecodeBatchFrame | 一份最大容量为 `C` 的地址稳定 round staging；每轮只使用 exact-`B` prefix |
 | Sequence-State Store | 前置 storage substrate；拥有 per-sequence model state 和容量 |
 
 这些是责任和所有权边界，不要求采用同名的 C++ class。
+
+所有 product entrypoints 都向同一个 GPU Executor 提交 request；caller 或连接线程不直接驱动 model
+loop，也不独占一份 Model Runtime。`C` 个并发 request 共享同一份 weights、workspace、round frame 和
+graph families，而不是构造 `C` 个单请求 Program。
+
+Blocking `Engine::generate` 可以保留为 product facade，但其语义是提交一个 owning request record 并等待该
+request 完成，而不是在 caller thread 内运行完整 generation loop。一个 Engine-owned GPU worker 执行全局
+boundary loop；并发 callers 等待各自的 result/output queue。GPU worker 只追加 committed output events，
+不调用 network write 或可能阻塞的 `OutputSink`。
 
 ---
 
@@ -203,7 +220,8 @@ slot 是租给一个 admitted request 的稳定控制位置。它保存或引用
 
 - request identity 和 lifecycle state；
 - sampling、RNG、stop 和 generation-limit state；
-- shared pool 中 sequence state 的 handle；
+- per-request output session、usage、timing 和 speculative statistics；
+- shared pool 中 `SequenceState` 的 handle；
 - scheduler 所需的 prompt/decode progress；
 - cancellation 和 terminal flags。
 
@@ -219,9 +237,28 @@ slot 不拥有：
 复用。Network completion 不属于 slot lifetime。slot index 也不是 external request identity；旧请求的
 cancellation 或 completion 不能作用于之后的 occupant。
 
-### 4.3 Batch row
+固定大小且只在 active request lifetime 内存在的 device state，例如 sampling token counts，可以物理上按
+slot lane 预留；它在逻辑上仍属于当前 occupant，并在 slot recycling 时重建。可能在 slot release 后继续
+存在的 model continuation 则必须属于 `SequenceState`，不能依赖 slot storage。
 
-batch row 只存在于一个 decode round。每个 boundary，Batch Builder 都重新建立 compact mapping：
+### 4.3 SequenceState
+
+`SequenceState` 是 target 定义的一条可继续执行的 model state。一个 occupied slot 对它拥有唯一写权限，
+它至少包含或引用：
+
+- Main/backend KV allocations 及 committed frontiers；
+- Linear Attention 和其他 fixed model-state allocation；
+- target decode cursor，包括 current anchor、position/RoPE progress 和 committed state selectors；
+- continuation 所需的 hidden/checkpoint state；
+- prefix identity 和 target-defined reusable checkpoints。
+
+`SequenceState` 不包含 stop/output/transport state，不拥有 batch row、round activations、logits、shared
+workspace 或 graph。Prefix retention 转移的是这份 model continuation；新 request 的 sampling、RNG、stop
+和 output state 始终重新创建。
+
+### 4.4 Batch row
+
+batch row 只存在于一个 decode round。每个 boundary，Target Batch Assembler 都重新建立 compact mapping：
 
 ```text
 batch row -> slot -> sequence-state handle
@@ -429,7 +466,7 @@ DecodeRound(all decode-ready requests)
 
 完整 request 不是 scheduling unit。所有 GPU work 在一条 execution lane 上串行执行。
 
-Model Executor 拥有一份地址稳定的 shared workspace，由串行的 GPU units 复用，不按 request
+Model Runtime 拥有一份地址稳定的 shared workspace，由串行的 GPU units 复用，不按 request
 复制。Prefill owner 可在 Vision/Text phases 及多个 chunks 之间持有一份 request-transient lease；
 final prefill、cancellation 或 failure 后释放。
 
@@ -438,10 +475,11 @@ final prefill、cancellation 或 failure 后释放。
 当前 GPU unit 完成，或 GPU idle 时收到 control event，GPU Executor 执行一次 boundary：
 
 ```text
-1. commit the completed unit's per-request results
-2. mark finished/cancelled requests and release their slots/state
-3. admit FIFO requests while the admission rules allow it
-4. choose and launch one next GPU unit
+1. snapshot control events visible to this boundary
+2. resolve the completed unit's per-request results
+3. finish/cancel requests and release or retain their state
+4. admit FIFO requests while the admission rules allow it
+5. choose, prepare and launch one next GPU unit
 ```
 
 boundary 开始后到达的 event 留到下一 boundary。这保证一次 membership update 有限，持续 arrival 不能
@@ -485,41 +523,160 @@ unbounded prefill work。
 
 ### 7.5 Cancellation
 
-Cancellation 不打断 in-flight GPU unit。第一个观察到 cancellation 的 boundary：
+Cancellation 不打断 in-flight GPU unit。第一个观察到 cancellation 的 boundary 不再把该 request 放入
+后续 unit；若它参加了刚完成的 unit，则丢弃该行尚未 commit 的 result，释放其 model state 和 slot，并按
+serving contract 关闭 response output。Provisional KV/state writes 随整条 `SequenceState` 一起释放，不需要
+rollback，也不影响同一 round 的其他 rows。
 
-- 若 request 参加了刚完成的 unit，正常 commit 该 unit；
-- 后续 unit 不再包含该 request；
-- 释放它的 model state 和 slot；
-- 按 serving contract 关闭 response output。
-
-因此 cancellation 最多等待一个 membership 已固定的 GPU unit，再加一次 boundary processing。该策略
-避免 partial-round rollback，并保持 shared round 中各 row 相互独立。
+因此 cancellation 最多等待一个 membership 已固定的 GPU unit，再加一次 boundary processing。
 
 ---
 
 ## 8. Batched model execution
 
-### 8.1 Whole-model batch
+### 8.1 Runtime ownership
 
-logical batch size 为 `B` 时，一个 decode round 的执行形态为：
+Resident Model Runtime 是 model-instance object，不是 request object。它在 Engine lifetime 内唯一拥有：
+
+- immutable model weights 和 target schedule；
+- shared Sequence-State Store；
+- 一份 shared execution workspace；
+- 一份最大容量为 `C` 的 `DecodeBatchFrame`；
+- startup-captured graph definitions 和 topology executables。
+
+每个 request 的持久状态只存在于 slot control 和该 slot 当前拥有的 `SequenceState`。Model Runtime 不保存
+“current request”，也不为每个 slot 复制 workspace、round buffers 或 graph assets。
+
+一次 decode round 另外建立两个短生命周期对象：
+
+| 对象 | 位置与 lifetime | 内容与所有权 |
+|---|---|---|
+| `RoundMembership` | host；从 batch build 持续到该 round commit 完成 | immutable `B` 和 `row -> slot` mapping；保持 slot/state alive |
+| `DecodeBatchFrame` | host/device stable storage；由所有 rounds 串行复用 | typed input controls、state selectors、round activations 和 result staging；不拥有任何 sequence state |
+
+`RoundMembership` 不上传 request identity。Device schedule 只看到 target/Op 所需的 typed selectors；完成结果
+再由 host mapping 对应回原 slot。GPU work in-flight 期间，membership、相关 slot binding、state allocation 和
+frame ingress 都不可修改。
+
+### 8.2 DecodeBatchFrame
+
+`DecodeBatchFrame` 在 Engine startup 按 `C` 规划一次。每个 exact-`B` schedule 只取得相同 backing 的
+prefix views，不为 `B=1..C` 分别分配一套 round memory。`B` 之外的 stale rows 不会被 graph 读取，因此
+boundary 不需要清零 inactive tail。
+
+Ordinary decode 所需的 typed fields 至少包括：
 
 ```text
-B request descriptors
-  -> one batched embedding/input stage
-  -> one traversal of all model layers
-  -> one batched lm_head
-  -> one batched sampler
-  -> B per-request round results
+current_tokens[B]
+cache_positions[1,B]
+RoPE positions/deltas[per target contract, B]
+Main KV table rows[B] + optional backend KV table rows[B]
+Linear Attention read/snapshot selectors[B]
+continuation-state destination selectors[B]
+SamplingConfig[B] + logical sampling positions[B]
+sampled_tokens[B]
 ```
 
-Control code 可以遍历 lightweight row metadata，但不能为每个 request 分别调用一次完整 layer 或 model
-schedule。
+Hidden activations、mixer intermediates 和 logits 使用同一 shared frame/workspace 中的 exact-`B` views。
+`DecodeBatchFrame` 是 runtime 对这些 typed regions 的逻辑集合，不是传给所有 Ops 的通用 descriptor ABI；
+每个 Op 仍只接收自己的语义输入。Host/device control staging 可以一次传输整个固定容量 `C` 的小型
+SoA frame；model schedule 只读取 exact-`B` prefixes，不为 inactive tail 提交 model work。
 
-Batch formation 只把 current token/proposal activations 和 row descriptors 压紧到 batch 维度。Per-request
-KV/context、recurrent state、RNG 和 output ownership 保持独立，不拷贝、不拼接成一条
-sequence；每个 row 通过 descriptor 引用自己的 state view。
+Batch assembly 对不同数据采用不同处理：
 
-### 8.2 Operator contract
+| 数据 | 组批方式 |
+|---|---|
+| token、position、sampling config 等小型 controls | 按 compact row 写入连续 batch ingress |
+| KV payload 和 block tables | 保留在 shared paged pool，只写 per-row table-row selector |
+| Linear Attention / backend fixed state | 保留在 shared state pool，只写 target-defined slot/unit selector |
+| request stop、output 和 external identity | 只保留在 host slot，不进入 model graph |
+| activations、hidden、logits | 由一次 whole-batch schedule 在 shared execution memory 中产生 |
+
+不得 gather/copy KV 或 recurrent state 来制造连续 batch，也不得为每行构造 device-pointer array。Target
+需要跨 round 保留的最终 hidden 或其他 continuation image，必须在同一 batched schedule 内通过 typed
+destination selectors 发布到各自的 `SequenceState`，不能在 boundary 对每个 request 分别发起 D2D copy。
+
+### 8.3 Round preparation
+
+在 boundary 选中 `DecodeRound` 后，Target Batch Assembler 按以下顺序准备：
+
+```text
+all DECODE_READY slots
+        │ compact once
+        ▼
+immutable RoundMembership[B]
+        │
+        ├─ materialize each row's already-reserved one-round state growth
+        ├─ fill current token, exact positions and typed state selectors
+        ├─ fill per-row sampling inputs and continuation destinations
+        └─ select one whole-batch execution profile
+        ▼
+publish exact-B ingress -> launch
+```
+
+普通 round 的每个 member 都有一个有效 column，因此不产生 inactive rows 或 valid-column mask。
+Materialization 可以为不同 allocations 更新 block tables，但 pool/table-matrix base address 保持不变。所有
+rows 必须在 launch 前完成准备；不允许先启动部分 batch，再为另一行补充 state。
+
+Profile selection 使用整个 batch 的 bound，例如全部 rows 中最大的 visible-context frontier。Exact per-row
+positions 和 context lengths 仍作为 device data。若一个合法 active set 不能由单个 profile 表示，则该 route
+不满足并发 contract，不能把 rows 拆成 cohorts。
+
+Host 可以对 `B<=C` 的 metadata 做轻量循环，但 GPU ingress 必须是 batch-level publication；不得为每行发起
+独立的 scalar copy、transition kernel 或 model call。
+
+### 8.4 Ordinary round state transaction
+
+一个 `DECODE_READY` sequence 始终保存 target-defined committed cursor 和唯一 current decode anchor。以
+Qwen3.6 的 ordinary transition 为例：
+
+```text
+before:
+  target state valid for positions [0,p)
+  current anchor token is at position p
+
+execute:
+  process the B anchors at their respective positions
+  write each row's provisional KV/recurrent/continuation state
+  sample one next anchor per row
+
+commit for surviving row b:
+  state frontier  := p[b] + 1
+  current anchor  := sampled_tokens[b]
+  anchor position := p[b] + 1
+```
+
+Op 只写被本轮许可的 physical state，不拥有 committed frontier。Graph 内也不把 compact-row position 或
+selector 原地推进成“下一轮状态”；权威 cursor 由 `SequenceState` 在 boundary commit 时更新，下一轮再按新的
+row mapping 生成 controls。这样 row 可以自由移动，而不需要 vectorized scalar helpers 或持久 row-local
+state。
+
+Ordinary round 对每个未取消 row 恰好 license 一个 token。EOS、stop 或 generation limit 可以让该 token
+成为 terminal token，但不把同一 row 的 model state 与 output 截在不同 frontier。Cancellation 是唯一可以
+丢弃整行 provisional result 的 ordinary boundary outcome；该 `SequenceState` 随即释放。
+
+### 8.5 Whole-model execution
+
+logical batch size 为 `B` 时，一次 replay 的 model schedule 为：
+
+```text
+current_tokens[B]
+  -> one batched embedding/input stage
+  -> one traversal of all model layers
+  -> publish B continuation images
+  -> one batched lm_head
+  -> one batched sampler
+  -> sampled_tokens[B]
+```
+
+Ordinary column layout 等价于 `[D,1,B]`，column-independent projection/MoE/FFN routes 一次消费 aggregate
+`T=B`。Control code 可以遍历 lightweight row metadata，但不能为每个 request 分别调用一次 layer、model
+schedule、lm_head 或 sampler。
+
+Per-request KV/context、recurrent state、sampling state 和 output ownership 保持独立；batched execution
+合并的是当前 activation columns 和 weight-consuming work，不把多个 sequences 拼成一条 sequence。
+
+### 8.6 Operator contract
 
 | 算子族 | Batched execution 要求 |
 |---|---|
@@ -533,60 +690,100 @@ sequence；每个 row 通过 descriptor 引用自己的 state view。
 不同 context length、stop condition、sampling value 或 generation limit 不形成不同 model batch。需要
 不同 model topology 的 request option 必须在 Engine startup 时固定，否则作为 unsupported 拒绝。
 
-### 8.3 Per-request commit
+具体 compact layout、typed extents 和 selector ABI 由
+[Concurrent decode operator requirements](concurrent-decode-operators.md) 定义。
 
-Model execution 产生 per-row provisional result。下一 boundary 对每行独立 commit：
+### 8.7 Result resolution and commit
 
-- generated token 或 accepted token prefix；
-- 与结果对应的 KV 和 recurrent-state progress；
-- sampling/RNG 和 penalty-history progress；
-- usage 和 output events；
-- continue 或 terminal decision。
+Graph replay 后只回传 compact per-row result，例如 ordinary sampled token，不能回传 logits 或逐层状态。
+GPU Executor 等待一次 whole-round completion，然后通过 frozen `RoundMembership` 对每行独立 resolve：
 
-一行结束或接受较少 speculative tokens，不改变其他行的 commit result。
+```text
+row result
+  -> locate its still-owned slot through RoundMembership
+  -> apply cancellation / stop / output-limit policy
+  -> commit the exact licensed prefix to SequenceState
+  -> update request sampling, usage and owning output record
+  -> mark DECODE_READY again or MODEL_FINISHED
+```
 
-对每行而言，model-state progress、sampler/RNG progress、usage 和 owning output record 是一次逻辑
-transaction。对应 output event 只有在这些 state 全部 commit 后才能对 response path 可见。
+对每行而言，model-state frontier、target cursor、sampler/penalty progress、usage 和 owning output record 是
+一次逻辑 transaction。Output event 只有在这些 state 全部 commit 后才能对 response path 可见。一行结束、
+取消或在 speculative mode 中接受较短 prefix，不改变其他行的 commit result。
+
+全部 rows resolve 后，`RoundMembership` 销毁，frame 可以被下一 unit 覆盖。继续运行的 slots 在下一
+boundary 重新 compact；没有任何 row identity 从当前 frame 继承到下一 frame。
+
+### 8.8 B=1 and prefill
+
+`B=1` 使用完全相同的 membership、frame、whole-model schedule 和 commit transaction，不保留独立的
+request-local ordinary decode path。
+
+Prefill 仍是单 sequence unit。它独占自己的 `SequenceState`，但复用 Model Runtime 和 shared workspace；
+它不占有一个长期 `DecodeBatchFrame` row。Final prefill 建立完整 decode cursor 后，该 request 只在下一
+boundary 通过正常 batch assembly 加入 ordinary decode。
 
 ---
 
 ## 9. CUDA Graph model
 
-### 9.1 Decode graphs by logical batch size
+### 9.1 Exact-B graph definitions
 
-因为 `C` 较小且固定，Engine 为每个 logical batch size 捕获 exact decode graph：
+因为 `C` 较小且固定，Engine 在 startup 为每个 logical batch size 捕获 exact definition：
 
 ```text
-DecodeGraph[1]
-DecodeGraph[2]
+Definition[family, B=1, profile]
+Definition[family, B=2, profile]
 ...
-DecodeGraph[C]
+Definition[family, B=C, profile]
 ```
 
 `B=1` 是 first-class exact path。单请求不会运行永久 padding 到 `C` 行的 graph。
-若 §9.3 需要有限 whole-batch profiles，则每个 `B` 对应这些预先捕获的 profile graphs；
-上述记法省略 profile key。
+每个 definition 表示该 semantic family、exact `B` 和 whole-batch profile 的完整 decode round，绑定同一份
+shared frame、workspace 和 state-pool bases。它读取 typed controls 和 selectors，不读取 request/slot
+identity。
 
-每个 graph 表示 Engine 固定 model/decode mode 的一个完整 decode round。Graph 读取 stable descriptor，
-其中包含当前 compact row-to-state mapping、exact per-row position、context length 和 request semantics。
+Captured definition 和 replayable executable 不是一一对应。Exact `B` 是 executable 的结构键；同一
+`B` 内只有真实 CUDA node topology 不同才增加 executable：
+
+```text
+exact definitions[family,B,profile]
+          │ exact B + target-declared profile topology class
+          ▼
+executable[family,B,topology class]
+```
+
+不同 context profiles 若在同一 exact `B` 下具有可更新的 node topology，共享一个 executable，并在 profile
+变化时安装选中的 definition。不同 `B` 不执行 cross-B graph update；这避免 batch-dependent operator route、
+kernel 参数和 launch shape 触发 `cudaGraphExecUpdate` 不兼容。资源数量因此是 exact `B` 的有限集合，而不是
+`B × context profile` 的完整笛卡尔积。
 
 ### 9.2 Dynamic active set
 
-active set 改变时，只更新 descriptor content 并选择匹配的预捕获 graph：
+active set 改变时，runtime 发布新的 frame ingress 并选择匹配的预捕获 definition：
 
 ```text
-[A]       -> DecodeGraph[1]
-[A,B]     -> DecodeGraph[2]
-[B]       -> DecodeGraph[1]
-[B,C,D]   -> DecodeGraph[3]
+[A]       -> Definition[B=1]
+[A,B]     -> Definition[B=2]
+[B]       -> Definition[B=1]
+[B,C,D]   -> Definition[B=3]
 ```
 
-Graph 不按 request identity、slot subset 或 slot bitmask 建 key。Join、leave 和 slot reuse 不触发
-capture。
+Runtime 先选择 exact-`B` executable；若它当前安装的是同一 `B` 的另一个 context-profile definition，先执行
+whole-graph update，再 replay 一次。`B` 改变时直接选择另一个预实例化 executable。Active identity 改变但
+`B/profile` 不变时只更新 typed data，不更新 executable。Graph 不按 request identity、slot subset 或 slot
+bitmask 建 key，join、leave 和 slot reuse 不触发 capture。
+
+Installed-definition state 只由 GPU Executor 修改；update 和 replay 位于同一串行 execution lane。并发 callers
+不能直接 launch 或更新同一个 executable。
+
+Paged-KV allocation、Linear Attention state ownership 和 retained-state reuse 只改变 block-table content 或
+selector values。Graph 始终绑定 pool/table-matrix base，因此这些 ownership transitions 也不形成 graph
+key。
 
 ### 9.3 Context and prefill profiles
 
-Exact context length 是 runtime descriptor value。若 exact target 对不同 context range 需要少量不同
+Exact context length 是 typed runtime control value。若 exact target 对不同 context range 需要少量不同
 kernel topology，则除 `B` 外可使用启动时固定并捕获的有限 whole-batch profiles。Profile
 由 batch-level bound，例如 maximum row context-length bucket，选择一次；graph 仍以 exact per-row length 执行
 ragged work。
@@ -597,6 +794,37 @@ key。无法同时表示任意合法 per-row lengths 的 profile 不能作为 co
 
 Prefill 是 single-request work，可以使用 target-specific fixed execution profile。它不改变 decode-batch
 graph model，也不能在 serving 时触发会阻塞 active decode 的 graph capture。
+
+### 9.4 Stable execution memory
+
+所有 exact definitions 复用：
+
+- 一份按 `C` 规划的 `DecodeBatchFrame`；
+- 一份按所有 reachable phase/`B`/profile peak 取最大值的 workspace；
+- 同一组 model/state pool bases；
+- 一组地址稳定、按 `C` 规划的 pinned host ingress/result staging。
+
+Graph-enabled exact-`B` definition 包含开头的一次 batch-level control upload 和结尾的一次 batch-level
+result download。Staging object 可以按固定 `C` 大小传输；只有前 `B` 行具有本轮语义：
+
+```text
+fill pinned ingress rows [0,B)
+        -> optional already-reserved KV page/table materialization
+        -> one graph replay:
+             one H2D typed-control frame
+             whole-model batch schedule
+             one D2H result frame
+        -> one round completion wait
+```
+
+Cross-page materialization 发生在 replay 前的同一 execution lane，不改变 captured pool/table bases，也不形成
+graph key。Graph-off mode 按相同顺序 eager 提交这些动作。
+
+不得为每个 `B`、profile 或 captured definition 复制 logits、hidden、workspace 或 per-sequence state。
+Model/control ingress、forward 和 result egress 不存在 per-row CUDA submission；跨 page 时的 table
+publication 属于 state substrate materialization。Serving 期间不 capture、instantiate 或扩展 graph family。
+Startup graph allowance 必须计入全部 reachable exact-`B` definitions，以及每个 exact `B`、每个实际
+topology class 的一份 executable，不能沿用只覆盖 `B=1` definitions 的 reservation。
 
 ---
 
@@ -700,21 +928,45 @@ GPU: Decode[A]
 
 B 不执行单独的 decode forward，而是在 final prefill 后加入 A 的下一 logical batch。
 
-### 12.2 Active batch grows and shrinks
+### 12.2 Two rows assembled and committed
+
+假设 A、B 分别占用两个 slots，且持有完全不同的 context/state allocations：
 
 ```text
-ready requests          selected graph
+                         row 0 (A)        row 1 (B)
+current token               101              202
+cache position               41              900
+Text KV table row             5                1
+Linear state unit            12               28
+sampling state lane           0                2
+```
 
-[A]                     DecodeGraph[1]
-[A,B]                   DecodeGraph[2]
-[A,B,C]                 DecodeGraph[3]
-[B,C]       A finished  DecodeGraph[2]
-[B,C,D]     D joined    DecodeGraph[3]
+Batch Assembler 只把上述 controls/selectors 写入 frame。KV pages 和 Linear Attention state 仍留在 shared
+pools 的原位置。`Definition[B=2]` 对两列执行一次完整 model traversal，并返回：
+
+```text
+sampled_tokens = [303, 404]
+```
+
+Boundary 用 frozen mapping 把 303 交给 A、404 交给 B。若 A 继续而 B 的 404 是 terminal token，则两行都
+先提交各自正确的 model/output frontier，随后 B 的 slot/state 被释放或 retained。下一轮重新组批为 A 的
+`B=1` frame；A 的 KV row 和 Linear state unit 不因从 row 0/1 移动而改变。
+
+### 12.3 Active batch grows and shrinks
+
+```text
+ready requests          selected definition
+
+[A]                     Definition[B=1]
+[A,B]                   Definition[B=2]
+[A,B,C]                 Definition[B=3]
+[B,C]       A finished  Definition[B=2]
+[B,C,D]     D joined    Definition[B=3]
 ```
 
 request identity 和 occupied slot 都不影响 graph identity。
 
-### 12.3 Shared 128K context with two slots
+### 12.4 Shared 128K context with two slots
 
 假设相关 shared context capacity 为 128K units：
 

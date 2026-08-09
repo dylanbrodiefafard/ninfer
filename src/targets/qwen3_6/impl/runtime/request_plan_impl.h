@@ -53,11 +53,17 @@ std::size_t align_up_256(std::size_t value, const char* label) {
     return (value + mask) & ~mask;
 }
 
+std::uint32_t pages_for_tokens(std::uint32_t tokens) noexcept {
+    return 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+}
+
 } // namespace
 
 RequestPlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
                                           const ExecutionOptions& options) const {
-    if (lifecycle == Lifecycle::Active || lifecycle == Lifecycle::Pending) {
+    if (active_request().lifecycle == Lifecycle::Prefilling ||
+        active_request().lifecycle == Lifecycle::Active ||
+        active_request().lifecycle == Lifecycle::Pending) {
         throw std::logic_error("cannot plan a request while Program is active or pending");
     }
     if (prompt.token_ids.empty()) { throw std::invalid_argument("prompt must contain tokens"); }
@@ -97,23 +103,41 @@ RequestPlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     plan->summary.transient_alignment    = 1;
     plan->summary.transient_bytes        = 0;
     plan->sampling                       = translate_sampling(options.sampling);
+    const std::uint32_t reserved_context_tokens =
+        plan->summary.prompt_tokens + (plan->summary.effective_output_tokens == 0
+                                           ? 0U
+                                           : plan->summary.effective_output_tokens - 1U);
+    plan->text_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
+    if (speculative_backend != SpeculativeBackend::None) {
+        // Multi-row speculative execution is a later engine milestone. Preserve the existing B=1
+        // backend's complete-context reservation until that transaction is batched.
+        plan->text_kv_page_entitlement    = decoder->text_kv.pool().logical_page_capacity();
+        plan->backend_kv_page_entitlement = backend_kv_cache()->pool().logical_page_capacity();
+    }
 
     if (options.allow_prefix_reuse && prompt.identity.reusable &&
-        lifecycle == Lifecycle::Resident) {
-        const bool dflash_append_ready = speculative_backend != SpeculativeBackend::DFlash ||
-                                         (!pending_context_valid && dflash_context_frontier == E);
-        if (E != 0 && dflash_append_ready &&
-            qwen3_6::detail::prefix_matches(prompt, ledger, prefix_identity, E)) {
+        active_request().lifecycle == Lifecycle::Resident) {
+        const bool dflash_append_ready =
+            speculative_backend != SpeculativeBackend::DFlash ||
+            (!active_sequence().pending_context_valid &&
+             active_sequence().dflash_context_frontier == active_sequence().execution_frontier);
+        if (active_sequence().execution_frontier != 0 && dflash_append_ready &&
+            qwen3_6::detail::prefix_matches(prompt, active_sequence().ledger,
+                                            active_sequence().prefix_identity,
+                                            active_sequence().execution_frontier)) {
             plan->reuse      = ReusePath::AppendAtFrontier;
-            plan->reuse_base = E;
-        } else if (boundary.valid && boundary.boundary != 0 &&
+            plan->reuse_base = active_sequence().execution_frontier;
+        } else if (active_sequence().boundary.valid && active_sequence().boundary.boundary != 0 &&
                    (speculative_backend != SpeculativeBackend::DFlash ||
-                    (dflash_boundary_valid && dflash_boundary_frontier == boundary.boundary)) &&
-                   boundary.boundary < prompt.token_ids.size() &&
-                   qwen3_6::detail::prefix_matches(prompt, ledger, prefix_identity,
-                                                   boundary.boundary)) {
+                    (active_sequence().dflash_boundary_valid &&
+                     active_sequence().dflash_boundary_frontier ==
+                         active_sequence().boundary.boundary)) &&
+                   active_sequence().boundary.boundary < prompt.token_ids.size() &&
+                   qwen3_6::detail::prefix_matches(prompt, active_sequence().ledger,
+                                                   active_sequence().prefix_identity,
+                                                   active_sequence().boundary.boundary)) {
             plan->reuse      = ReusePath::RestoreBoundary;
-            plan->reuse_base = boundary.boundary;
+            plan->reuse_base = active_sequence().boundary.boundary;
         }
     }
 
@@ -124,14 +148,16 @@ RequestPlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     if (mtp_capacity) {
         if (plan->reuse == ReusePath::FullReset) {
             plan->prepare_mtp = true;
-        } else if (plan->reuse == ReusePath::AppendAtFrontier && tail_hidden_valid &&
-                   decoder->mtp_cache() != nullptr &&
-                   (plan->reuse_base == 0 || mtp_kv_valid >= plan->reuse_base - 1)) {
+        } else if (plan->reuse == ReusePath::AppendAtFrontier &&
+                   active_sequence().tail_hidden_valid && decoder->mtp_cache() != nullptr &&
+                   (plan->reuse_base == 0 ||
+                    active_sequence().mtp_kv_valid >= plan->reuse_base - 1)) {
             plan->prepare_mtp      = true;
             plan->needs_mtp_bridge = plan->reuse_base != 0;
         } else if (plan->reuse == ReusePath::RestoreBoundary && decoder->mtp_cache() != nullptr &&
-                   boundary.hidden_valid && boundary.mtp_prefix_valid &&
-                   mtp_kv_valid >= plan->reuse_base - 1) {
+                   active_sequence().boundary.hidden_valid &&
+                   active_sequence().boundary.mtp_prefix_valid &&
+                   active_sequence().mtp_kv_valid >= plan->reuse_base - 1) {
             plan->prepare_mtp      = true;
             plan->needs_mtp_bridge = true;
         }

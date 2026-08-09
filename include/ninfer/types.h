@@ -15,6 +15,8 @@ namespace ninfer {
 
 using TokenId = std::int32_t;
 
+inline constexpr std::uint32_t kMaximumConcurrency = 8;
+
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
     Int8Group64,
@@ -43,10 +45,13 @@ struct LoadProgress {
 
 struct EngineOptions {
     std::filesystem::path artifact_path;
-    int device                  = 0;
-    std::uint32_t max_context   = 2048;
-    std::uint32_t prefill_chunk = 1024;
-    KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
+    int device                         = 0;
+    std::uint32_t max_context          = 2048;
+    std::uint32_t max_concurrency      = 1;
+    std::uint32_t max_pending_requests = 16;
+    std::uint32_t pending_timeout_ms   = 30000;
+    std::uint32_t prefill_chunk        = 1024;
+    KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     bool use_cuda_graph = true;
@@ -151,6 +156,9 @@ struct PromptInput {
 enum class RequestErrorKind : std::uint8_t {
     ContextLengthExceeded,
     MediaBudgetExceeded,
+    Overloaded,
+    QueueTimeout,
+    Unavailable,
 };
 
 class RequestError final : public std::invalid_argument {
@@ -201,11 +209,12 @@ private:
 };
 
 struct GenerationTimings {
-    double prepare_seconds = 0.0;
-    double vision_seconds  = 0.0;
-    double prefill_seconds = 0.0;
-    double decode_seconds  = 0.0;
-    double total_seconds   = 0.0;
+    double prepare_seconds     = 0.0;
+    double first_token_seconds = 0.0;
+    double vision_seconds      = 0.0;
+    double prefill_seconds     = 0.0;
+    double decode_seconds      = 0.0;
+    double total_seconds       = 0.0;
 };
 
 struct SpeculativeStats {

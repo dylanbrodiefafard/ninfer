@@ -16,24 +16,41 @@ struct LinearStateSlots {
         return static_cast<std::int32_t>(draft_window) + 2;
     }
 
-    [[nodiscard]] static constexpr std::int32_t prefill_working_slot() noexcept { return 0; }
+    [[nodiscard]] static constexpr std::int32_t
+    prefill_working_slot(std::int32_t base = 0) noexcept {
+        return base;
+    }
 
-    [[nodiscard]] static constexpr std::int32_t verify_snapshot_base_slot() noexcept { return 0; }
+    [[nodiscard]] static constexpr std::int32_t
+    verify_snapshot_base_slot(std::int32_t base = 0) noexcept {
+        return base;
+    }
 
-    [[nodiscard]] static std::int32_t prefix_boundary_slot(std::int32_t slot_count) {
+    [[nodiscard]] static std::int32_t prefix_boundary_slot(std::int32_t base,
+                                                           std::int32_t slot_count) {
         if (slot_count < 2) {
             throw std::invalid_argument("Qwen3.6 Linear Attention requires a boundary slot");
         }
-        return slot_count - 1;
+        return base + slot_count - 1;
+    }
+
+    [[nodiscard]] static std::int32_t prefix_boundary_slot(std::int32_t slot_count) {
+        return prefix_boundary_slot(0, slot_count);
     }
 
     [[nodiscard]] static std::int32_t committed_snapshot_slot(std::uint32_t committed_extent,
+                                                              std::int32_t base,
                                                               std::int32_t slot_count) {
         if (committed_extent == 0 || committed_extent >= static_cast<std::uint32_t>(slot_count)) {
             throw std::out_of_range(
                 "Qwen3.6 committed Linear Attention extent exceeds snapshot slots");
         }
-        return verify_snapshot_base_slot() + static_cast<std::int32_t>(committed_extent) - 1;
+        return verify_snapshot_base_slot(base) + static_cast<std::int32_t>(committed_extent) - 1;
+    }
+
+    [[nodiscard]] static std::int32_t committed_snapshot_slot(std::uint32_t committed_extent,
+                                                              std::int32_t slot_count) {
+        return committed_snapshot_slot(committed_extent, 0, slot_count);
     }
 };
 

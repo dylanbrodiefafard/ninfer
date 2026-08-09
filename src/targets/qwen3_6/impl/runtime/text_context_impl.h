@@ -144,6 +144,21 @@ private:
     const ops::GqaExecutionEnvelope*& slot_;
 };
 
+template <class T>
+class ScopedValue {
+public:
+    ScopedValue(T& slot, T value) : slot_(slot), previous_(slot) { slot_ = value; }
+
+    ScopedValue(const ScopedValue&)            = delete;
+    ScopedValue& operator=(const ScopedValue&) = delete;
+
+    ~ScopedValue() { slot_ = previous_; }
+
+private:
+    T& slot_;
+    T previous_;
+};
+
 } // namespace
 
 void DFlashFeatureSink::begin(const Tensor& value) {
@@ -211,10 +226,19 @@ TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, Wor
     if (mtp_kv_.valid() && !io_.mtp) {
         throw std::invalid_argument("MTP TextContext requires MTP round state");
     }
+    set_linear_state_group(0, state_.slot_count());
     bind();
 }
 
 TextContext::~TextContext() = default;
+
+void TextContext::set_linear_state_group(std::int32_t base, std::int32_t capacity) {
+    if (base < 0 || capacity < 2 || base > state_.slot_count() - capacity) {
+        throw std::invalid_argument("TextContext Linear Attention state group is invalid");
+    }
+    linear_state_prefill_working_slot_ = LinearStateSlots::prefill_working_slot(base);
+    linear_state_boundary_slot_        = LinearStateSlots::prefix_boundary_slot(base, capacity);
+}
 
 void TextContext::bind() {
     using TargetBindings = LoadedModelData;
@@ -636,6 +660,50 @@ void TextContext::target_verify(const Tensor& ids, const Tensor& positions,
     target_verify_impl(ids, positions, envelope, sink);
 }
 
+void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
+                                        const Tensor& rope_positions, const Tensor& kv_table_rows,
+                                        const Tensor& linear_state_read_slots,
+                                        const Tensor& linear_state_snapshot_base_slots,
+                                        ops::GqaExecutionEnvelope envelope, Tensor& hidden,
+                                        Tensor& logits) {
+    const std::int32_t batch = ids.ne[0];
+    if (batch <= 0 || batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
+        throw std::invalid_argument("ordinary decode batch size must be in [1,8]");
+    }
+    require_tensor_shape(ids, DType::I32, {batch}, "ordinary decode ids");
+    require_tensor_shape(cache_positions, DType::I32, {batch}, "ordinary decode cache positions");
+    require_tensor_shape(rope_positions, DType::I32, {batch}, "ordinary decode RoPE positions");
+    require_tensor_shape(kv_table_rows, DType::I32, {batch}, "ordinary decode KV rows");
+    require_tensor_shape(linear_state_read_slots, DType::I32, {batch},
+                         "ordinary decode Linear Attention read slots");
+    require_tensor_shape(linear_state_snapshot_base_slots, DType::I32, {batch},
+                         "ordinary decode Linear Attention snapshot slots");
+    require_tensor_shape(hidden, DType::BF16, {kCfg.hidden, batch}, "ordinary decode hidden");
+    require_tensor_shape(logits, DType::BF16, {kCfg.vocab, batch}, "ordinary decode logits");
+
+    cudaStream_t stream = ctx_.stream;
+    work_.reset();
+    {
+        ScopedPositions cache_binding(active_cache_positions_, cache_positions);
+        ScopedPositions rope_binding(active_rope_positions_, rope_positions);
+        ScopedEnvelope envelope_binding(active_gqa_envelope_, envelope);
+        ScopedValue<const Tensor*> kv_binding(active_kv_table_rows_, &kv_table_rows);
+        ScopedValue<const Tensor*> read_binding(active_linear_state_read_slots_,
+                                                &linear_state_read_slots);
+        ScopedValue<const Tensor*> snapshot_binding(active_linear_state_snapshot_base_slots_,
+                                                    &linear_state_snapshot_base_slots);
+        ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
+
+        Tensor x = work_.alloc(DType::BF16, {kCfg.hidden, batch});
+        ops::embedding(ids, *embed_, x, stream);
+        NullTap tap;
+        run_layers(x, Phase::Verify, tap);
+        ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, hidden, stream);
+        ops::linear(hidden, *lm_head_, logits, stream);
+    }
+    work_.reset();
+}
+
 void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
@@ -670,8 +738,21 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     ops::rope(rope_positions, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
-    ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, io_.text_kv_table_row, kAttnScale,
-                       kv_.batch_layer_view(fidx), *active_gqa_envelope_, work_, a, s);
+    const Tensor& kv_table_rows =
+        active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
+    if (active_sequence_batch_ != 0) {
+        Tensor q_batch        = qn.view({kCfg.head_dim, kCfg.n_q, 1, active_sequence_batch_});
+        Tensor k_batch        = kn.view({kCfg.head_dim, kCfg.n_kv, 1, active_sequence_batch_});
+        Tensor v_batch        = v.view({kCfg.head_dim, kCfg.n_kv, 1, active_sequence_batch_});
+        Tensor a_batch        = a.view({kCfg.head_dim, kCfg.n_q, 1, active_sequence_batch_});
+        Tensor position_batch = cache_positions.view({1, active_sequence_batch_});
+        ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, Tensor{}, kv_table_rows,
+                           kAttnScale, kv_.batch_layer_view(fidx), *active_gqa_envelope_, work_,
+                           a_batch, s);
+    } else {
+        ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, kAttnScale,
+                           kv_.batch_layer_view(fidx), *active_gqa_envelope_, work_, a, s);
+    }
     ops::sigmoid_mul(gate, a, s);
 
     Variant::attention_output_projection(a.view({kCfg.q_size, T}), *w.o_proj, x, ph, work_, s);
@@ -694,10 +775,28 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor kc             = projection.key;
     Tensor vc             = projection.value;
     if (ph == Phase::Verify) {
-        Tensor& conv_states = state_.conv.at(static_cast<std::size_t>(gidx));
+        Tensor& conv_states          = state_.conv.at(static_cast<std::size_t>(gidx));
+        const Tensor& read_slots     = active_linear_state_read_slots_ != nullptr
+                                           ? *active_linear_state_read_slots_
+                                           : io_.linear_state_read_slot;
+        const Tensor& snapshot_slots = active_linear_state_snapshot_base_slots_ != nullptr
+                                           ? *active_linear_state_snapshot_base_slots_
+                                           : io_.linear_state_snapshot_base_slot;
+        Tensor projection_input      = h;
+        Tensor query_output          = qc;
+        Tensor key_output            = kc;
+        Tensor value_output          = vc;
+        Tensor gate_output           = z;
+        if (active_sequence_batch_ != 0) {
+            projection_input = h.view({kCfg.hidden, 1, active_sequence_batch_});
+            query_output     = qc.view({kCfg.key_dim, 1, active_sequence_batch_});
+            key_output       = kc.view({kCfg.key_dim, 1, active_sequence_batch_});
+            value_output     = vc.view({kCfg.value_dim, 1, active_sequence_batch_});
+            gate_output      = z.view({kCfg.value_dim, 1, active_sequence_batch_});
+        }
         Variant::gdn_input_projection_snapshot(
-            h, *w.projection, *w.conv1d, conv_states, io_.linear_state_read_slot,
-            io_.linear_state_snapshot_base_slot, qc, kc, vc, z, ph, work_, s);
+            projection_input, *w.projection, *w.conv1d, conv_states, read_slots, snapshot_slots,
+            query_output, key_output, value_output, gate_output, ph, work_, s);
     } else {
         const auto conv = workspace_recipe::gdn_prefill_conv<TextConfig>(work_, T);
         Tensor qkv      = conv.projected;
@@ -707,8 +806,8 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         // the running window to the target working slot (in-place when both roles select it).
         Tensor conv_in =
             state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_prefill_read_slot_);
-        Tensor conv_out = state_.conv_slot(static_cast<std::uint32_t>(gidx),
-                                           LinearStateSlots::prefill_working_slot());
+        Tensor conv_out =
+            state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_prefill_working_slot_);
         ops::causal_conv1d_silu(qkv, *w.conv1d, conv_in, conv_out, qkv_c, s);
         ops::extract_bf16_columns(qkv_c, 0, qc, s);
         ops::extract_bf16_columns(qkv_c, kCfg.key_dim, kc, s);
@@ -722,18 +821,38 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor o  = workspace_recipe::gdn_recurrent_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     if (ph == Phase::Verify) {
-        Tensor& recurrent_states = state_.recurrent.at(static_cast<std::size_t>(gidx));
-        ops::gated_delta_net_snapshot(q_recurrent, k_recurrent, vv, g, beta, kGdnScale,
-                                      /*normalize_qk=*/true, recurrent_states, Tensor{},
-                                      io_.linear_state_read_slot,
-                                      io_.linear_state_snapshot_base_slot, o, s);
+        Tensor& recurrent_states     = state_.recurrent.at(static_cast<std::size_t>(gidx));
+        const Tensor& read_slots     = active_linear_state_read_slots_ != nullptr
+                                           ? *active_linear_state_read_slots_
+                                           : io_.linear_state_read_slot;
+        const Tensor& snapshot_slots = active_linear_state_snapshot_base_slots_ != nullptr
+                                           ? *active_linear_state_snapshot_base_slots_
+                                           : io_.linear_state_snapshot_base_slot;
+        if (active_sequence_batch_ != 0) {
+            Tensor q_batch =
+                q_recurrent.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, 1, active_sequence_batch_});
+            Tensor k_batch =
+                k_recurrent.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, 1, active_sequence_batch_});
+            Tensor v_batch = vv.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, 1, active_sequence_batch_});
+            Tensor g_batch = g.view({kCfg.gdn_v_heads, 1, active_sequence_batch_});
+            Tensor beta_batch = beta.view({kCfg.gdn_v_heads, 1, active_sequence_batch_});
+            Tensor out_batch =
+                o.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, 1, active_sequence_batch_});
+            ops::gated_delta_net_snapshot(q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale,
+                                          /*normalize_qk=*/true, recurrent_states, Tensor{},
+                                          read_slots, snapshot_slots, out_batch, s);
+        } else {
+            ops::gated_delta_net_snapshot(q_recurrent, k_recurrent, vv, g, beta, kGdnScale,
+                                          /*normalize_qk=*/true, recurrent_states, Tensor{},
+                                          read_slots, snapshot_slots, o, s);
+        }
     } else {
         // Prefill reads the committed recurrent state from linear_state_prefill_read_slot_ and
         // writes the running state to the target working slot (in-place when both roles select it).
         Tensor recurrent_in  = state_.recurrent_slot(static_cast<std::uint32_t>(gidx),
                                                      linear_state_prefill_read_slot_);
         Tensor recurrent_out = state_.recurrent_slot(static_cast<std::uint32_t>(gidx),
-                                                     LinearStateSlots::prefill_working_slot());
+                                                     linear_state_prefill_working_slot_);
         ops::gated_delta_net(q_recurrent, k_recurrent, vv, g, beta, kGdnScale,
                              /*normalize_qk=*/true, work_, recurrent_in, recurrent_out, o, s);
     }
@@ -810,8 +929,9 @@ void TextContext::run_layers(Tensor& x, Phase ph) {
 }
 
 template <class Tap>
-void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill* multimodal,
-                               Tap& tap) {
+PrefillChunkResult TextContext::prefill_impl(std::span<const int> ids,
+                                             const MultimodalPrefill* multimodal, Tap& tap,
+                                             bool single_chunk, bool finalize_at_end) {
     if (ids.empty()) { throw std::invalid_argument("TextContext::prefill requires tokens"); }
     if (ids.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("TextContext::prefill token count exceeds int32");
@@ -824,7 +944,7 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
 
     if (multimodal != nullptr) {
         if (base != multimodal->begin ||
-            multimodal->token_ids.size() != static_cast<std::size_t>(base) + ids.size()) {
+            multimodal->token_ids.size() < static_cast<std::size_t>(base) + ids.size()) {
             throw std::invalid_argument("multimodal prefill suffix does not match its cache base");
         }
         if (multimodal->positions.size() != 3 * multimodal->token_ids.size()) {
@@ -850,7 +970,7 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
     // The committed Linear Attention state for the resident prefix lives in the read slot.
     // Chunk 0 reads it; every later chunk reads the target's prefill working slot. Resolved on the
     // host because prefill is eager.
-    std::int32_t initial_linear_state_slot = LinearStateSlots::prefill_working_slot();
+    std::int32_t initial_linear_state_slot = linear_state_prefill_working_slot_;
     CUDA_CHECK(cudaStreamSynchronize(s));
     CUDA_CHECK(cudaMemcpy(&initial_linear_state_slot, io_.linear_state_read_slot.data,
                           sizeof(initial_linear_state_slot), cudaMemcpyDeviceToHost));
@@ -869,7 +989,7 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
     const bool has_snapshot =
         snap_abs > base64 && snap_abs <= base64 + static_cast<std::int64_t>(T);
     const int snap_rel               = has_snapshot ? static_cast<int>(snap_abs - base64) : -1;
-    const std::int32_t boundary_slot = LinearStateSlots::prefix_boundary_slot(state_.slot_count());
+    const std::int32_t boundary_slot = linear_state_boundary_slot_;
 
     bool prepare_mtp_prompt = false;
     if (mtp_enabled() && io_.speculative.draft_tokens.data != nullptr) {
@@ -883,13 +1003,15 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
             static_cast<std::uint64_t>(base) + static_cast<std::uint64_t>(T) +
             2ULL * static_cast<std::uint64_t>(io_.speculative.draft_tokens.ne[0]);
         prepare_mtp_prompt =
+            finalize_at_end &&
             mtp_required_end <= static_cast<std::uint64_t>(mtp_kv_.max_context()) &&
             target_round_required_end <= static_cast<std::uint64_t>(kv_.max_context());
     }
     mtp_prompt_prepared_       = prepare_mtp_prompt;
     last_prefill_chunk_length_ = 0;
 
-    for (int t0 = 0; t0 < T;) {
+    int t0 = 0;
+    for (; t0 < T;) {
         int len = std::min(chunk, T - t0);
         // Cap the chunk so it ends exactly at the snapshot boundary. Because a capped chunk is
         // shorter than `chunk`, the loop must advance by the processed `len` (see the t0 += len at
@@ -908,13 +1030,13 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
                 multimodal->vision->prepare_chunk(prompt_t0, static_cast<std::uint32_t>(len));
             len = vision_chunk.length;
         }
-        const bool is_last = (t0 + len == T);
-        if (is_last) { last_prefill_chunk_length_ = static_cast<std::uint32_t>(len); }
+        const bool is_last         = finalize_at_end && (t0 + len == T);
+        last_prefill_chunk_length_ = static_cast<std::uint32_t>(len);
         nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                       static_cast<std::uint64_t>(len));
 
         linear_state_prefill_read_slot_ =
-            (t0 == 0) ? initial_linear_state_slot : LinearStateSlots::prefill_working_slot();
+            (t0 == 0) ? initial_linear_state_slot : linear_state_prefill_working_slot_;
 
         {
             std::vector<std::int32_t> local_scatter_indices;
@@ -1094,10 +1216,11 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
         // chunk ended exactly at the boundary (see the len cap above), so slot 0 is the state
         // there.
         if (snap_rel > 0 && t0 + len == snap_rel) {
-            state_.copy_slot(LinearStateSlots::prefill_working_slot(), boundary_slot, s);
+            state_.copy_slot(linear_state_prefill_working_slot_, boundary_slot, s);
         }
 
         t0 += len;
+        if (single_chunk) { break; }
     }
 
     // Consume the one-shot boundary request so a subsequent boundary-less prefill does not
@@ -1105,19 +1228,21 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
     prefill_snapshot_boundary_ = -1;
 
     // Prefill wrote the target working state; the first decode round reads that slot.
-    ops::set_i32_scalar(io_.linear_state_read_slot, LinearStateSlots::prefill_working_slot(), s);
+    ops::set_i32_scalar(io_.linear_state_read_slot, linear_state_prefill_working_slot_, s);
 
     ctx_.synchronize();
     work_.reset();
+    return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(t0),
+                              .finalized        = finalize_at_end && t0 == T};
 }
 
 void TextContext::prefill(std::span<const int> ids) {
     NullTap tap;
-    prefill_impl(ids, nullptr, tap);
+    (void)prefill_impl(ids, nullptr, tap, false, true);
 }
 
 void TextContext::prefill(std::span<const int> ids, DFlashFeatureSink& sink) {
-    prefill_impl(ids, nullptr, sink);
+    (void)prefill_impl(ids, nullptr, sink, false, true);
 }
 
 void TextContext::prefill(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
@@ -1128,7 +1253,26 @@ void TextContext::prefill(const qwen3_6::PreparedPromptData& input, std::uint32_
     const std::span<const int> tokens(input.token_ids);
     const MultimodalPrefill multimodal{tokens, input.positions, &vision, begin, input.rope_delta};
     NullTap tap;
-    prefill_impl(tokens.subspan(begin), &multimodal, tap);
+    (void)prefill_impl(tokens.subspan(begin), &multimodal, tap, false, true);
+}
+
+PrefillChunkResult TextContext::prefill_chunk(std::span<const int> ids, bool finalize_at_end) {
+    NullTap tap;
+    return prefill_impl(ids, nullptr, tap, true, finalize_at_end);
+}
+
+PrefillChunkResult TextContext::prefill_chunk(const qwen3_6::PreparedPromptData& input,
+                                              std::uint32_t begin, std::uint32_t nominal_length,
+                                              VisionPrefillSession& vision, bool finalize_at_end) {
+    if (begin >= input.token_ids.size() || nominal_length == 0 ||
+        nominal_length > input.token_ids.size() - begin) {
+        throw std::invalid_argument("multimodal prefill chunk is outside the prompt");
+    }
+    const std::span<const int> tokens(input.token_ids);
+    const MultimodalPrefill multimodal{tokens, input.positions, &vision, begin, input.rope_delta};
+    NullTap tap;
+    return prefill_impl(tokens.subspan(begin, nominal_length), &multimodal, tap, true,
+                        finalize_at_end);
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

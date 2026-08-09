@@ -22,9 +22,10 @@ struct ControllerResult {
     std::vector<TokenId> generated_token_ids;
     std::string content;
     std::string reasoning;
-    double prefill_seconds = 0.0;
-    double decode_seconds  = 0.0;
-    double total_seconds   = 0.0;
+    double prefill_seconds     = 0.0;
+    double decode_seconds      = 0.0;
+    double first_token_seconds = 0.0;
+    double total_seconds       = 0.0;
 };
 
 template <class Program, class PreparedPrompt, class OutputSession, class RequestMemory>
@@ -95,6 +96,10 @@ ControllerResult run_one(Program& program, PreparedPrompt prompt, OutputSession 
 
         auto deltas = output.commit_preview();
         budget.commit(decision.accepted_tokens);
+        if (result.first_token_seconds == 0.0 && decision.accepted_tokens != 0) {
+            result.first_token_seconds =
+                std::chrono::duration<double>(Clock::now() - total_start).count();
+        }
         publisher.publish(std::move(deltas));
 
         if (decision.finished()) { return finish_result(decision.finish_reason); }

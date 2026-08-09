@@ -114,6 +114,11 @@ struct NullTap {
     static constexpr bool enabled = false;
 };
 
+struct PrefillChunkResult {
+    std::uint32_t processed_tokens = 0;
+    bool finalized                 = false;
+};
+
 struct DFlashFeatureSink {
     static constexpr bool enabled = true;
     using PrefillConsumer         = std::function<void(const Tensor&, const Tensor&, bool)>;
@@ -159,6 +164,8 @@ public:
 
     void set_boundary_hidden_output(Tensor* output) noexcept { boundary_hidden_output_ = output; }
 
+    void set_linear_state_group(std::int32_t base, std::int32_t capacity);
+
     [[nodiscard]] const Weight* proposal_head() const noexcept { return proposal_head_; }
 
     [[nodiscard]] const std::int32_t* proposal_head_ids() const noexcept {
@@ -177,10 +184,19 @@ public:
     void prefill(std::span<const int> ids, DFlashFeatureSink& sink);
     void prefill(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
                  VisionPrefillSession& vision);
+    [[nodiscard]] PrefillChunkResult prefill_chunk(std::span<const int> ids, bool finalize_at_end);
+    [[nodiscard]] PrefillChunkResult
+    prefill_chunk(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
+                  std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);
     void target_verify(const Tensor& ids, const Tensor& positions,
                        ops::GqaExecutionEnvelope envelope);
     void target_verify(const Tensor& ids, const Tensor& positions,
                        ops::GqaExecutionEnvelope envelope, DFlashFeatureSink& sink);
+    void ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
+                               const Tensor& rope_positions, const Tensor& kv_table_rows,
+                               const Tensor& linear_state_read_slots,
+                               const Tensor& linear_state_snapshot_base_slots,
+                               ops::GqaExecutionEnvelope envelope, Tensor& hidden, Tensor& logits);
     void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                            ops::GqaExecutionEnvelope envelope, Tensor& mtp_hidden,
                            int logits_column, Tensor* logits, Tensor* draft_token,
@@ -228,7 +244,9 @@ private:
     };
 
     template <class Tap>
-    void prefill_impl(std::span<const int> ids, const MultimodalPrefill* multimodal, Tap& tap);
+    [[nodiscard]] PrefillChunkResult prefill_impl(std::span<const int> ids,
+                                                  const MultimodalPrefill* multimodal, Tap& tap,
+                                                  bool single_chunk, bool finalize_at_end);
     template <class Tap>
     void target_verify_impl(const Tensor& ids, const Tensor& positions,
                             ops::GqaExecutionEnvelope envelope, Tap& tap);
@@ -243,15 +261,21 @@ private:
     Tensor& prefill_hidden_;
     std::uint32_t prefill_chunk_;
     std::uint32_t text_kv_base_;
-    const Tensor* active_cache_positions_                 = nullptr;
-    const Tensor* active_rope_positions_                  = nullptr;
-    const ops::GqaExecutionEnvelope* active_gqa_envelope_ = nullptr;
-    std::int32_t rope_delta_                              = 0;
-    std::int32_t linear_state_prefill_read_slot_          = 0;
-    std::int64_t prefill_snapshot_boundary_               = -1;
-    Tensor* boundary_hidden_output_                       = nullptr;
-    bool mtp_prompt_prepared_                             = false;
-    std::uint32_t last_prefill_chunk_length_              = 0;
+    const Tensor* active_cache_positions_                  = nullptr;
+    const Tensor* active_rope_positions_                   = nullptr;
+    const Tensor* active_kv_table_rows_                    = nullptr;
+    const Tensor* active_linear_state_read_slots_          = nullptr;
+    const Tensor* active_linear_state_snapshot_base_slots_ = nullptr;
+    const ops::GqaExecutionEnvelope* active_gqa_envelope_  = nullptr;
+    std::int32_t active_sequence_batch_                    = 0;
+    std::int32_t rope_delta_                               = 0;
+    std::int32_t linear_state_prefill_read_slot_           = 0;
+    std::int32_t linear_state_prefill_working_slot_        = 0;
+    std::int32_t linear_state_boundary_slot_               = 0;
+    std::int64_t prefill_snapshot_boundary_                = -1;
+    Tensor* boundary_hidden_output_                        = nullptr;
+    bool mtp_prompt_prepared_                              = false;
+    std::uint32_t last_prefill_chunk_length_               = 0;
 
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;

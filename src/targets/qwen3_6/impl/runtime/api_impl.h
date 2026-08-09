@@ -30,6 +30,11 @@ std::uint32_t SequencePlan<Variant>::capacity() const noexcept {
 }
 
 template <>
+std::uint32_t SequencePlan<Variant>::max_concurrency() const noexcept {
+    return impl_ != nullptr ? impl_->max_concurrency : 0;
+}
+
+template <>
 std::size_t SequencePlan<Variant>::device_reservation_bytes() const noexcept {
     return impl_ != nullptr ? impl_->device_reservation_bytes : 0;
 }
@@ -83,6 +88,72 @@ runtime::BeginResult Program<Variant>::begin(PreparedPrompt&& prompt, RequestPla
 template <>
 runtime::GeneratedRound Program<Variant>::decode_round(runtime::RoundBudget budget) {
     return impl_->decode_round(budget);
+}
+
+template <>
+RequestPlan<Variant> Program<Variant>::plan_request_for_lane(std::uint32_t lane,
+                                                             const PreparedPrompt& prompt,
+                                                             const ExecutionOptions& options) {
+    return impl_->plan_request_for_lane(lane, PreparedPromptAccess::view(prompt), options);
+}
+
+template <>
+bool Program<Variant>::can_admit_lane(std::uint32_t lane,
+                                      const RequestPlan<Variant>& plan) const noexcept {
+    return impl_->can_admit_lane(lane, plan);
+}
+
+template <>
+bool Program<Variant>::can_admit_lane_after_retained_eviction(
+    std::uint32_t lane, const RequestPlan<Variant>& plan) const noexcept {
+    return impl_->can_admit_lane_after_retained_eviction(lane, plan);
+}
+
+template <>
+runtime::PrefillStepResult
+Program<Variant>::start_ordinary_prefill_lane(std::uint32_t lane, PreparedPrompt&& prompt,
+                                              RequestPlan<Variant>&& plan,
+                                              runtime::TransientRegion transient) {
+    return impl_->start_ordinary_prefill_lane(lane, PreparedPromptAccess::take(std::move(prompt)),
+                                              std::move(plan), transient);
+}
+
+template <>
+runtime::PrefillStepResult Program<Variant>::advance_ordinary_prefill_lane(std::uint32_t lane) {
+    return impl_->advance_ordinary_prefill_lane(lane);
+}
+
+template <>
+runtime::BatchedGeneratedRound
+Program<Variant>::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
+                                        std::span<const runtime::RoundBudget> budgets) {
+    return impl_->decode_ordinary_batch(lanes, budgets);
+}
+
+template <>
+void Program<Variant>::resolve_pending_lane(std::uint32_t lane, std::uint32_t accepted_tokens,
+                                            bool terminal) {
+    impl_->resolve_pending_lane(lane, accepted_tokens, terminal);
+}
+
+template <>
+void Program<Variant>::abort_lane(std::uint32_t lane) noexcept {
+    impl_->abort_lane(lane);
+}
+
+template <>
+bool Program<Variant>::has_retained_lane(std::uint32_t lane) const noexcept {
+    return impl_->has_retained_lane(lane);
+}
+
+template <>
+void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
+    impl_->evict_retained_lane(lane);
+}
+
+template <>
+GenerationTimings Program<Variant>::generation_timings_lane(std::uint32_t lane) const noexcept {
+    return impl_->generation_timings_lane(lane);
 }
 
 template <>

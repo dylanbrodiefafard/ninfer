@@ -44,9 +44,19 @@ struct GeneratedRound {
     std::span<const TokenId> tokens;
 };
 
+struct BatchedGeneratedRound {
+    std::span<const TokenId> tokens;
+};
+
 struct BeginResult {
     BeginSummary summary;
     GeneratedRound round;
+};
+
+struct PrefillStepResult {
+    BeginSummary summary;
+    GeneratedRound round;
+    bool complete = false;
 };
 
 struct GenerationSummary {

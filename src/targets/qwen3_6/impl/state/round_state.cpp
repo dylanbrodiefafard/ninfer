@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 
 namespace ninfer::targets::qwen3_6 {
 namespace {
@@ -29,6 +30,9 @@ void validate_spec(const RoundStateSpec& spec) {
     if (spec.enable_mtp && spec.draft_window == 0) {
         throw std::invalid_argument("RoundState cannot enable MTP with an empty draft window");
     }
+    if (spec.batch_capacity == 0 || spec.batch_capacity > kMaximumConcurrency) {
+        throw std::invalid_argument("RoundState batch capacity must be in [1,8]");
+    }
     (void)checked_i32(static_cast<std::uint64_t>(spec.draft_window) + 1ULL,
                       "RoundState draft window exceeds int32");
 }
@@ -40,7 +44,19 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
     const std::int32_t columns = checked_i32(static_cast<std::uint64_t>(spec.draft_window) + 1ULL,
                                              "RoundState columns exceed int32");
     RoundStateLayout layout;
-    layout.spec       = spec;
+    layout.spec = spec;
+    layout.ordinary.ingress =
+        builder.add(sizeof(OrdinaryDecodeIngress), 256, "ordinary decode ingress");
+    layout.ordinary.egress =
+        builder.add(sizeof(OrdinaryDecodeEgress), 256, "ordinary decode egress");
+    layout.ordinary.logits = add_tensor(
+        builder, DType::BF16,
+        {spec.output_rows, checked_i32(spec.batch_capacity, "RoundState batch capacity")},
+        "ordinary decode logits");
+    layout.ordinary.hidden =
+        add_tensor(builder, DType::BF16,
+                   {spec.hidden, checked_i32(spec.batch_capacity, "RoundState batch capacity")},
+                   "ordinary decode hidden");
     layout.token      = add_tensor(builder, DType::I32, {1}, "step token");
     layout.pos        = add_tensor(builder, DType::I32, {1}, "step position");
     layout.rope_pos   = add_tensor(builder, DType::I32, {1}, "step rope position");
@@ -51,6 +67,42 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
     layout.text_kv_table_row    = add_tensor(builder, DType::I32, {1}, "step Text KV table row");
     layout.backend_kv_table_row = add_tensor(builder, DType::I32, {1}, "step backend KV table row");
     return layout;
+}
+
+OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
+                                         const OrdinaryDecodeStateLayout& layout,
+                                         std::uint32_t batch_capacity) {
+    if (batch_capacity == 0 || batch_capacity > kMaximumConcurrency) {
+        throw std::invalid_argument("ordinary decode batch capacity must be in [1,8]");
+    }
+    static_assert(std::is_standard_layout_v<OrdinaryDecodeIngress>);
+    static_assert(std::is_standard_layout_v<OrdinaryDecodeEgress>);
+
+    ingress                   = layout.ingress.bind(backing);
+    egress                    = layout.egress.bind(backing);
+    const auto count          = static_cast<std::int32_t>(batch_capacity);
+    const auto ingress_tensor = [&](std::size_t offset, DType dtype) {
+        return Tensor(static_cast<unsigned char*>(ingress.data) + offset, dtype, {count});
+    };
+    tokens          = ingress_tensor(offsetof(OrdinaryDecodeIngress, tokens), DType::I32);
+    cache_positions = ingress_tensor(offsetof(OrdinaryDecodeIngress, cache_positions), DType::I32);
+    rope_positions  = ingress_tensor(offsetof(OrdinaryDecodeIngress, rope_positions), DType::I32);
+    text_kv_table_rows =
+        ingress_tensor(offsetof(OrdinaryDecodeIngress, text_kv_table_rows), DType::I32);
+    linear_state_read_slots =
+        ingress_tensor(offsetof(OrdinaryDecodeIngress, linear_state_read_slots), DType::I32);
+    linear_state_snapshot_base_slots = ingress_tensor(
+        offsetof(OrdinaryDecodeIngress, linear_state_snapshot_base_slots), DType::I32);
+    continuation_slots =
+        ingress_tensor(offsetof(OrdinaryDecodeIngress, continuation_slots), DType::I32);
+    sampling = reinterpret_cast<const ops::SamplingConfig*>(
+        static_cast<const unsigned char*>(ingress.data) +
+        offsetof(OrdinaryDecodeIngress, sampling));
+    sampled_tokens = Tensor(static_cast<unsigned char*>(egress.data) +
+                                offsetof(OrdinaryDecodeEgress, sampled_tokens),
+                            DType::I32, {count});
+    logits         = layout.logits.bind(backing);
+    hidden         = layout.hidden.bind(backing);
 }
 
 void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layout) {
@@ -103,13 +155,14 @@ MtpRoundState::MtpRoundState(DeviceSpan backing, const MtpRoundStateLayout& layo
 
 RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     if (!layout.complete) { throw std::invalid_argument("RoundState layout is incomplete"); }
-    token                           = layout.token.bind(backing);
-    pos                             = layout.pos.bind(backing);
-    rope_pos                        = layout.rope_pos.bind(backing);
-    rope_delta                      = layout.rope_delta.bind(backing);
-    logits                          = layout.logits.bind(backing);
-    verify_hidden                   = layout.verify_hidden.bind(backing);
-    text_kv_table_row               = layout.text_kv_table_row.bind(backing);
+    ordinary          = OrdinaryDecodeState(backing, layout.ordinary, layout.spec.batch_capacity);
+    token             = layout.token.bind(backing);
+    pos               = layout.pos.bind(backing);
+    rope_pos          = layout.rope_pos.bind(backing);
+    rope_delta        = layout.rope_delta.bind(backing);
+    logits            = layout.logits.bind(backing);
+    verify_hidden     = layout.verify_hidden.bind(backing);
+    text_kv_table_row = layout.text_kv_table_row.bind(backing);
     backend_kv_table_row            = layout.backend_kv_table_row.bind(backing);
     linear_state_read_slot          = layout.linear_state_read_slot.bind(backing);
     linear_state_snapshot_base_slot = layout.linear_state_snapshot_base_slot.bind(backing);

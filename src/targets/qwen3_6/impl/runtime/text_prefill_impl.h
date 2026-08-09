@@ -14,6 +14,7 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 
 void configure_text_card(TextContext& card, const State& state) {
     card.set_sampling(state.sampling);
+    card.set_linear_state_group(state.linear_state_base, state.linear_state_capacity);
     if (state.proposal_head == ProposalHead::Full) {
         card.set_proposal_head(nullptr, nullptr, 0);
         return;
@@ -49,6 +50,38 @@ bool prefill_text(State& state, std::span<const TokenId> ids,
         card.prefill(prompt);
     }
     return card.mtp_prompt_prepared();
+}
+
+PrefillChunkResult prefill_text_chunk(State& state, std::span<const TokenId> ids,
+                                      std::optional<std::uint32_t> snapshot_boundary,
+                                      bool finalize_at_end) {
+    if (state.dflash != nullptr || state.mtp_kv.valid()) {
+        throw std::logic_error("staged prefill is only defined for ordinary decoding");
+    }
+    TextContext card(state.device, state.model, state.work, state.text_kv, state.linear_attention,
+                     state.io, state.prefill_hidden, state.prefill_chunk, state.text_kv_base);
+    configure_text_card(card, state);
+    card.set_boundary_hidden_output(state.boundary_hidden);
+    card.set_prefill_snapshot_boundary(
+        snapshot_boundary ? static_cast<std::int64_t>(*snapshot_boundary) : -1);
+    return card.prefill_chunk(std::span<const int>(ids.data(), ids.size()), finalize_at_end);
+}
+
+PrefillChunkResult prefill_multimodal_chunk(State& state, const PreparedPromptData& prompt,
+                                            VisionPrefillSession& vision,
+                                            std::uint32_t nominal_length,
+                                            std::optional<std::uint32_t> snapshot_boundary,
+                                            bool finalize_at_end) {
+    if (state.dflash != nullptr || state.mtp_kv.valid()) {
+        throw std::logic_error("staged multimodal prefill is only defined for ordinary decoding");
+    }
+    TextContext card(state.device, state.model, state.work, state.text_kv, state.linear_attention,
+                     state.io, state.prefill_hidden, state.prefill_chunk, state.text_kv_base);
+    configure_text_card(card, state);
+    card.set_boundary_hidden_output(state.boundary_hidden);
+    card.set_prefill_snapshot_boundary(
+        snapshot_boundary ? static_cast<std::int64_t>(*snapshot_boundary) : -1);
+    return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision, finalize_at_end);
 }
 
 MultimodalPrefillResult prefill_multimodal(State& state, const PreparedPromptData& prompt,

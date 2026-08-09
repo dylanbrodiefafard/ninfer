@@ -72,16 +72,22 @@ schedule::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier, std::uint
     };
 }
 
-DecodeGraphProfile& select_graph_profile(DecodeGraphFamily& family, std::uint32_t frontier,
-                                         const char* label) {
-    const auto it = std::lower_bound(family.profiles.begin(), family.profiles.end(), frontier,
-                                     [](const DecodeGraphProfile& profile, std::uint32_t value) {
-                                         return profile.max_execution_frontier < value;
-                                     });
-    if (it == family.profiles.end() || frontier < it->min_execution_frontier) {
+DecodeGraphProfile& select_graph_profile(DecodeGraphFamily& family, std::uint32_t batch_size,
+                                         std::uint32_t frontier, const char* label) {
+    const auto it = std::find_if(
+        family.profiles.begin(), family.profiles.end(), [&](const DecodeGraphProfile& profile) {
+            return profile.batch_size == batch_size && profile.min_execution_frontier <= frontier &&
+                   frontier <= profile.max_execution_frontier;
+        });
+    if (it == family.profiles.end()) {
         throw std::logic_error(std::string(label) + " CUDA Graph coverage is incomplete");
     }
     return *it;
+}
+
+DecodeGraphProfile& select_graph_profile(DecodeGraphFamily& family, std::uint32_t frontier,
+                                         const char* label) {
+    return select_graph_profile(family, 1, frontier, label);
 }
 
 void validate_graph_profiles(const std::vector<GraphExecutionProfile>& profiles,
@@ -177,15 +183,17 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
 ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const SequencePlanImpl& plan,
                                  DeviceContext& device_in)
     : model(model_in), device(device_in), capacity(plan.capacity),
-      prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
-      speculative_backend(plan.speculative_backend), kv_dtype(plan.kv_dtype),
-      kv_quant_group(plan.kv_quant_group), proposal_head(plan.proposal_head),
-      vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
-      kv_payload_bytes(plan.persistent.kv_payload_bytes),
+      max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
+      draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
+      kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
+      proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
+      use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), workspace_storage.capacity()}),
-      round_host((static_cast<std::size_t>(draft_window) + 2ULL) * sizeof(std::int32_t)) {
+      round_host((static_cast<std::size_t>(draft_window) + 2ULL) * sizeof(std::int32_t)),
+      ordinary_host(sizeof(qwen3_6::OrdinaryDecodeIngress) +
+                    sizeof(qwen3_6::OrdinaryDecodeEgress)) {
     if (model.weights_arena == nullptr) {
         throw std::invalid_argument("Qwen3.6 model view has no owning weight arena");
     }
@@ -204,8 +212,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
     decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder);
-    if (plan.persistent.dflash) { dflash.emplace(backing, *plan.persistent.dflash); }
-    if (dflash.has_value() != plan.features.dflash()) {
+    if (plan.persistent.dflash) {
+        active_sequence().dflash.emplace(backing, *plan.persistent.dflash);
+    }
+    if (active_sequence().dflash.has_value() != plan.features.dflash()) {
         throw std::logic_error("DFlash state does not match the frozen sequence plan");
     }
 
@@ -213,20 +223,37 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     if (io.mtp.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
         throw std::logic_error("round-state MTP extension does not match the sequence plan");
     }
-    prefill_hidden  = plan.persistent.prefill_hidden.bind(backing);
-    token_counts    = plan.persistent.token_counts.bind(backing);
-    sampling_config = plan.persistent.sampling_config.bind(backing);
-    tail_hidden     = plan.persistent.tail_hidden.bind(backing);
-    boundary_hidden = plan.persistent.boundary_hidden.bind(backing);
+    prefill_hidden        = plan.persistent.prefill_hidden.bind(backing);
+    token_counts          = plan.persistent.token_counts.bind(backing);
+    sampling_config       = plan.persistent.sampling_config.bind(backing);
+    tail_hidden_store     = plan.persistent.tail_hidden.bind(backing);
+    boundary_hidden_store = plan.persistent.boundary_hidden.bind(backing);
+    const std::int32_t linear_slots_per_sequence =
+        LinearStateSlots::required_slot_count(draft_window);
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        SequenceState& sequence    = sequences[lane];
+        sequence.lane              = lane;
+        sequence.linear_state_base = static_cast<std::int32_t>(lane) * linear_slots_per_sequence;
+        sequence.linear_state_capacity = linear_slots_per_sequence;
+        sequence.current_linear_state_slot =
+            LinearStateSlots::prefill_working_slot(sequence.linear_state_base);
+        sequence.tail_hidden = tail_hidden_store.slice(1, static_cast<std::int32_t>(lane), 1);
+        sequence.boundary_hidden =
+            boundary_hidden_store.slice(1, static_cast<std::int32_t>(lane), 1);
+        sequence.ledger.reserve(static_cast<std::size_t>(capacity) + 1ULL);
+        sequence.prefix_identity.reserve(static_cast<std::size_t>(capacity) + 1ULL);
+    }
 
     set_device_i32(io.text_kv_table_row, 0);
     set_device_i32(io.backend_kv_table_row, 0);
 
-    host_count  = static_cast<std::int32_t*>(round_host.data());
-    host_tokens = reinterpret_cast<TokenId*>(host_count + 1);
-    ledger.reserve(static_cast<std::size_t>(capacity) + 1ULL);
-    prefix_identity.reserve(static_cast<std::size_t>(capacity) + 1ULL);
-
+    host_count            = static_cast<std::int32_t*>(round_host.data());
+    host_tokens           = reinterpret_cast<TokenId*>(host_count + 1);
+    ordinary_host_ingress = static_cast<qwen3_6::OrdinaryDecodeIngress*>(ordinary_host.data());
+    ordinary_host_egress  = reinterpret_cast<qwen3_6::OrdinaryDecodeEgress*>(
+        static_cast<unsigned char*>(ordinary_host.data()) + sizeof(qwen3_6::OrdinaryDecodeIngress));
+    *ordinary_host_ingress = {};
+    *ordinary_host_egress  = {};
     CUDA_CHECK(cudaMemsetAsync(io.speculative.produced_count.data, 0,
                                io.speculative.produced_count.bytes(), device.stream));
     CUDA_CHECK(cudaMemsetAsync(io.rope_delta.data, 0, io.rope_delta.bytes(), device.stream));
@@ -243,9 +270,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     CUDA_CHECK(
         cudaMemsetAsync(io.speculative.stats.data, 0, io.speculative.stats.bytes(), device.stream));
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
-    sampling_host = {};
-    CUDA_CHECK(cudaMemcpyAsync(sampling_config.data, &sampling_host, sizeof(sampling_host),
-                               cudaMemcpyHostToDevice, device.stream));
+    CUDA_CHECK(cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
     device.synchronize();
     prepare_graphs();
     work.reset();
@@ -257,63 +282,322 @@ ProgramImplCore::~ProgramImplCore() noexcept {
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
 }
 
+RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
+                                                   const PreparedPromptData& prompt,
+                                                   const ExecutionOptions& options) {
+    if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    active_lane_ = lane;
+    return plan_request(prompt, options);
+}
+
+bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept {
+    if (lane >= max_concurrency || plan.impl_ == nullptr) { return false; }
+    const RequestControl& request = requests[lane];
+    if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
+        request.lifecycle == Lifecycle::Pending) {
+        return false;
+    }
+    const SequenceState& sequence = sequences[lane];
+    const auto can_replace        = [](const PagedKVPool& pool, std::uint32_t old_pages,
+                                std::uint32_t new_pages) {
+        return old_pages <= pool.entitled_pages() && new_pages <= pool.logical_page_capacity() &&
+               new_pages <= pool.page_group_count() - (pool.entitled_pages() - old_pages);
+    };
+    const std::uint32_t old_text = sequence.kv ? sequence.kv->text.page_entitlement() : 0;
+    if (!can_replace(decoder->text_kv.pool(), old_text, plan.impl_->text_kv_page_entitlement)) {
+        return false;
+    }
+    const qwen3_6::PagedKVCache* backend = backend_kv_cache();
+    if (backend == nullptr) { return plan.impl_->backend_kv_page_entitlement == 0; }
+    const std::uint32_t old_backend =
+        sequence.kv && sequence.kv->backend ? sequence.kv->backend->page_entitlement() : 0;
+    return can_replace(backend->pool(), old_backend, plan.impl_->backend_kv_page_entitlement);
+}
+
+bool ProgramImplCore::can_admit_lane_after_retained_eviction(
+    std::uint32_t lane, const RequestPlan& plan) const noexcept {
+    if (lane >= max_concurrency || plan.impl_ == nullptr) { return false; }
+    const RequestControl& request = requests[lane];
+    if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
+        request.lifecycle == Lifecycle::Pending) {
+        return false;
+    }
+
+    std::uint32_t reclaimable_text    = 0;
+    std::uint32_t reclaimable_backend = 0;
+    for (std::uint32_t other = 0; other < max_concurrency; ++other) {
+        if (other == lane || requests[other].lifecycle != Lifecycle::Resident ||
+            !sequences[other].kv) {
+            continue;
+        }
+        reclaimable_text += sequences[other].kv->text.page_entitlement();
+        if (sequences[other].kv->backend) {
+            reclaimable_backend += sequences[other].kv->backend->page_entitlement();
+        }
+    }
+
+    const auto can_replace = [](const PagedKVPool& pool, std::uint32_t old_pages,
+                                std::uint32_t reclaimable_pages, std::uint32_t new_pages) {
+        if (old_pages > pool.entitled_pages() ||
+            reclaimable_pages > pool.entitled_pages() - old_pages ||
+            new_pages > pool.logical_page_capacity()) {
+            return false;
+        }
+        const std::uint32_t committed = pool.entitled_pages() - old_pages - reclaimable_pages;
+        return new_pages <= pool.page_group_count() - committed;
+    };
+
+    const SequenceState& sequence = sequences[lane];
+    const std::uint32_t old_text  = sequence.kv ? sequence.kv->text.page_entitlement() : 0;
+    if (!can_replace(decoder->text_kv.pool(), old_text, reclaimable_text,
+                     plan.impl_->text_kv_page_entitlement)) {
+        return false;
+    }
+
+    const qwen3_6::PagedKVCache* backend = backend_kv_cache();
+    if (backend == nullptr) { return plan.impl_->backend_kv_page_entitlement == 0; }
+    const std::uint32_t old_backend =
+        sequence.kv && sequence.kv->backend ? sequence.kv->backend->page_entitlement() : 0;
+    return can_replace(backend->pool(), old_backend, reclaimable_backend,
+                       plan.impl_->backend_kv_page_entitlement);
+}
+
+runtime::PrefillStepResult
+ProgramImplCore::start_ordinary_prefill_lane(std::uint32_t lane, PreparedPromptData&& prompt,
+                                             RequestPlan&& plan,
+                                             runtime::TransientRegion transient) {
+    if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    active_lane_ = lane;
+    if (speculative_backend != SpeculativeBackend::None) {
+        throw std::logic_error("staged ordinary prefill requires the ordinary backend");
+    }
+    if (plan.impl_ == nullptr) { throw std::invalid_argument("request plan is empty"); }
+    RequestPlanImpl& request_plan = *plan.impl_;
+    if (active_request().lifecycle == Lifecycle::Prefilling ||
+        active_request().lifecycle == Lifecycle::Active ||
+        active_request().lifecycle == Lifecycle::Pending) {
+        throw std::logic_error("ordinary prefill requires a free request lane");
+    }
+
+    const std::uint32_t prompt_tokens = static_cast<std::uint32_t>(prompt.token_ids.size());
+    if (prompt_tokens != request_plan.summary.prompt_tokens ||
+        (request_plan.vision.has_value() && !prompt.has_media())) {
+        throw std::invalid_argument("request plan does not describe the prepared prompt");
+    }
+    const bool suffix_has_visual = std::any_of(
+        prompt.token_types.begin() + static_cast<std::ptrdiff_t>(request_plan.reuse_base),
+        prompt.token_types.end(), [](std::uint8_t type) { return type != 0; });
+    if (suffix_has_visual != request_plan.vision.has_value()) {
+        throw std::invalid_argument("request plan does not describe the prompt suffix modality");
+    }
+    if (request_plan.summary.transient_bytes != 0 &&
+        (transient.data == nullptr || transient.size < request_plan.summary.transient_bytes ||
+         transient.alignment < request_plan.summary.transient_alignment)) {
+        throw std::invalid_argument("request transient region does not satisfy the plan");
+    }
+    if (request_plan.reuse != ReusePath::FullReset &&
+        (active_request().lifecycle != Lifecycle::Resident ||
+         !qwen3_6::detail::prefix_matches(prompt, active_sequence().ledger,
+                                          active_sequence().prefix_identity,
+                                          request_plan.reuse_base))) {
+        throw std::logic_error("planned resident prefix is no longer reusable");
+    }
+    if (request_plan.reuse == ReusePath::RestoreBoundary &&
+        (!active_sequence().boundary.valid ||
+         active_sequence().boundary.boundary != request_plan.reuse_base)) {
+        throw std::logic_error("planned sequence boundary checkpoint is unavailable");
+    }
+
+    const auto started         = Clock::now();
+    const std::uint32_t base   = request_plan.reuse_base;
+    active_request().lifecycle = Lifecycle::Invalid;
+    try {
+        if (request_plan.reuse == ReusePath::FullReset) {
+            active_sequence().kv.reset();
+            ordered_reset();
+            active_sequence().ledger.clear();
+            reserve_sequence_kv(request_plan.text_kv_page_entitlement, 0);
+        } else if (request_plan.reuse == ReusePath::AppendAtFrontier) {
+            if (!active_sequence().kv) {
+                throw std::logic_error("resident prefix has no KV allocation bundle");
+            }
+            trim_sequence_kv(base, 0);
+            resize_sequence_kv_entitlement(request_plan.text_kv_page_entitlement, 0);
+            if (active_sequence().text_kv_valid < base) {
+                throw std::logic_error("resident Text KV is shorter than the append frontier");
+            }
+            active_sequence().text_kv_valid = base;
+            active_sequence().ledger.resize(base);
+            set_device_i32(io.linear_state_read_slot, active_sequence().current_linear_state_slot);
+        } else {
+            if (!active_sequence().kv || active_sequence().text_kv_valid < base) {
+                throw std::logic_error("resident boundary has no complete KV allocation");
+            }
+            active_sequence().text_kv_valid = base;
+            trim_sequence_kv(base, 0);
+            resize_sequence_kv_entitlement(request_plan.text_kv_page_entitlement, 0);
+            decoder->linear_attention.copy_slot(
+                LinearStateSlots::prefix_boundary_slot(active_sequence().linear_state_base,
+                                                       active_sequence().linear_state_capacity),
+                LinearStateSlots::prefill_working_slot(active_sequence().linear_state_base),
+                device.stream);
+            active_sequence().current_linear_state_slot =
+                LinearStateSlots::prefill_working_slot(active_sequence().linear_state_base);
+            set_device_i32(io.linear_state_read_slot, active_sequence().current_linear_state_slot);
+            active_sequence().ledger.resize(base);
+        }
+
+        trim_sequence_kv(base, 0);
+        bind_sequence_kv();
+        materialize_sequence_kv(prompt_tokens, 0);
+        install_sampling(request_plan.sampling);
+        active_sequence().rope_delta = prompt.rope_delta;
+        set_device_i32(io.rope_delta, active_sequence().rope_delta);
+
+        active_sequence().boundary = {};
+        active_request().timings   = {};
+        active_request().pending   = {};
+        ++active_sequence().request_epoch;
+        active_sequence().drafts_ready          = false;
+        active_sequence().pending_context_valid = false;
+        active_sequence().ordinary_tail         = false;
+        active_sequence().tail_hidden_valid =
+            base == prompt_tokens && active_sequence().tail_hidden_valid;
+        active_sequence().ledger.assign(prompt.token_ids.begin(), prompt.token_ids.end());
+        active_sequence().prefix_identity.assign(prompt);
+
+        RequestControl::OrdinaryPrefill prefill{
+            .prompt            = std::move(prompt),
+            .vision_plan       = std::move(request_plan.vision),
+            .vision            = nullptr,
+            .transient         = transient,
+            .snapshot_boundary = request_plan.snapshot_boundary,
+            .base              = base,
+            .cursor            = base,
+            .prompt_tokens     = prompt_tokens,
+            .elapsed_seconds   = 0.0,
+        };
+        active_request().ordinary_prefill.emplace(std::move(prefill));
+        auto& staged = *active_request().ordinary_prefill;
+        if (staged.vision_plan) {
+            staged.vision = std::make_unique<schedule::VisionPrefillSession>(
+                device, model, work, staged.prompt, *staged.vision_plan, staged.transient);
+        }
+        staged.elapsed_seconds     = std::chrono::duration<double>(Clock::now() - started).count();
+        active_request().lifecycle = Lifecycle::Prefilling;
+        return advance_ordinary_prefill();
+    } catch (...) {
+        try {
+            device.synchronize();
+        } catch (...) {}
+        make_invalid();
+        throw;
+    }
+}
+
+runtime::PrefillStepResult ProgramImplCore::advance_ordinary_prefill_lane(std::uint32_t lane) {
+    if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    active_lane_ = lane;
+    return advance_ordinary_prefill();
+}
+
+void ProgramImplCore::resolve_pending_lane(std::uint32_t lane, std::uint32_t accepted_tokens,
+                                           bool terminal) {
+    if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    active_lane_ = lane;
+    resolve_pending(accepted_tokens, terminal);
+}
+
+void ProgramImplCore::abort_lane(std::uint32_t lane) noexcept {
+    if (lane >= max_concurrency) { return; }
+    active_lane_ = lane;
+    abort_request();
+}
+
+bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
+    return lane < max_concurrency && requests[lane].lifecycle == Lifecycle::Resident;
+}
+
+void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
+    if (!has_retained_lane(lane)) { return; }
+    active_lane_ = lane;
+    make_invalid();
+}
+
+GenerationTimings ProgramImplCore::generation_timings_lane(std::uint32_t lane) const noexcept {
+    return lane < max_concurrency ? requests[lane].timings : GenerationTimings{};
+}
+
 void ProgramImplCore::make_invalid() noexcept {
-    sequence_kv.reset();
-    lifecycle = Lifecycle::Invalid;
-    E         = 0;
-    S         = 0;
-    ledger.clear();
-    prefix_identity.clear();
-    current_linear_state_slot = LinearStateSlots::prefill_working_slot();
-    text_kv_valid             = 0;
-    mtp_kv_valid              = 0;
-    dflash_context_frontier   = 0;
-    dflash_proposal_frontier  = 0;
-    dflash_proposal_anchor    = 0;
-    dflash_proposal_epoch     = 0;
-    pending_context_base      = 0;
-    pending_context_count     = 0;
-    pending_context_valid     = false;
-    dflash_boundary_valid     = false;
-    dflash_boundary_frontier  = 0;
-    ordinary_tail             = false;
-    drafts_ready              = false;
-    tail_hidden_valid         = false;
-    boundary                  = {};
-    pending                   = {};
+    active_request().ordinary_prefill.reset();
+    active_sequence().kv.reset();
+    active_request().lifecycle           = Lifecycle::Invalid;
+    active_sequence().execution_frontier = 0;
+    active_sequence().ledger_frontier    = 0;
+    active_sequence().ledger.clear();
+    active_sequence().prefix_identity.clear();
+    active_sequence().current_linear_state_slot =
+        LinearStateSlots::prefill_working_slot(active_sequence().linear_state_base);
+    active_sequence().text_kv_valid            = 0;
+    active_sequence().mtp_kv_valid             = 0;
+    active_sequence().dflash_context_frontier  = 0;
+    active_sequence().dflash_proposal_frontier = 0;
+    active_sequence().dflash_proposal_anchor   = 0;
+    active_sequence().dflash_proposal_epoch    = 0;
+    active_sequence().pending_context_base     = 0;
+    active_sequence().pending_context_count    = 0;
+    active_sequence().pending_context_valid    = false;
+    active_sequence().dflash_boundary_valid    = false;
+    active_sequence().dflash_boundary_frontier = 0;
+    active_sequence().ordinary_tail            = false;
+    active_sequence().drafts_ready             = false;
+    active_sequence().tail_hidden_valid        = false;
+    active_sequence().boundary                 = {};
+    active_request().pending                   = {};
 }
 
 qwen3_6::PagedKVCache* ProgramImplCore::backend_kv_cache() noexcept {
     if (speculative_backend == SpeculativeBackend::Mtp) { return decoder->mtp_cache(); }
-    if (speculative_backend == SpeculativeBackend::DFlash && dflash) { return &dflash->full; }
+    if (speculative_backend == SpeculativeBackend::DFlash && active_sequence().dflash) {
+        return &active_sequence().dflash->full;
+    }
     return nullptr;
 }
 
 const qwen3_6::PagedKVCache* ProgramImplCore::backend_kv_cache() const noexcept {
     if (speculative_backend == SpeculativeBackend::Mtp) { return decoder->mtp_cache(); }
-    if (speculative_backend == SpeculativeBackend::DFlash && dflash) { return &dflash->full; }
+    if (speculative_backend == SpeculativeBackend::DFlash && active_sequence().dflash) {
+        return &active_sequence().dflash->full;
+    }
     return nullptr;
 }
 
 std::uint32_t ProgramImplCore::backend_kv_valid() const noexcept {
-    if (speculative_backend == SpeculativeBackend::Mtp) { return mtp_kv_valid; }
-    if (speculative_backend == SpeculativeBackend::DFlash) { return dflash_context_frontier; }
+    if (speculative_backend == SpeculativeBackend::Mtp) { return active_sequence().mtp_kv_valid; }
+    if (speculative_backend == SpeculativeBackend::DFlash) {
+        return active_sequence().dflash_context_frontier;
+    }
     return 0;
 }
 
-void ProgramImplCore::reserve_sequence_kv() {
-    if (sequence_kv) { throw std::logic_error("sequence already owns a KV allocation bundle"); }
+void ProgramImplCore::reserve_sequence_kv(std::uint32_t text_pages, std::uint32_t backend_pages) {
+    if (active_sequence().kv) {
+        throw std::logic_error("sequence already owns a KV allocation bundle");
+    }
+    if (text_pages == 0 || (backend_kv_cache() == nullptr) != (backend_pages == 0)) {
+        throw std::invalid_argument("KV allocation entitlement does not match the active backend");
+    }
 
     std::array<PagedKVReservation, 2> reservations{};
     std::size_t count     = 0;
     reservations[count++] = PagedKVReservation{
         .pool             = &decoder->text_kv.pool(),
-        .page_entitlement = decoder->text_kv.pool().logical_page_capacity(),
+        .page_entitlement = text_pages,
     };
     if (qwen3_6::PagedKVCache* backend = backend_kv_cache(); backend != nullptr) {
         reservations[count++] = PagedKVReservation{
             .pool             = &backend->pool(),
-            .page_entitlement = backend->pool().logical_page_capacity(),
+            .page_entitlement = backend_pages,
         };
     }
 
@@ -322,81 +606,120 @@ void ProgramImplCore::reserve_sequence_kv() {
     SequenceKVBundle bundle;
     bundle.text = std::move(allocations[0]);
     if (count == 2) { bundle.backend.emplace(std::move(allocations[1])); }
-    sequence_kv.emplace(std::move(bundle));
+    active_sequence().kv.emplace(std::move(bundle));
+}
+
+void ProgramImplCore::resize_sequence_kv_entitlement(std::uint32_t text_pages,
+                                                     std::uint32_t backend_pages) {
+    if (!active_sequence().kv || text_pages == 0 ||
+        (active_sequence().kv->backend.has_value() != (backend_pages != 0))) {
+        throw std::invalid_argument("KV resize entitlement does not match the sequence bundle");
+    }
+    std::array<PagedKVResize, 2> changes{};
+    std::size_t count = 0;
+    changes[count++]  = PagedKVResize{
+         .allocation       = &active_sequence().kv->text,
+         .mapped_pages     = active_sequence().kv->text.mapped_page_count(),
+         .page_entitlement = text_pages,
+    };
+    if (active_sequence().kv->backend) {
+        changes[count++] = PagedKVResize{
+            .allocation       = &*active_sequence().kv->backend,
+            .mapped_pages     = active_sequence().kv->backend->mapped_page_count(),
+            .page_entitlement = backend_pages,
+        };
+    }
+    resize_paged_kv_bundle(std::span<PagedKVResize>(changes.data(), count));
 }
 
 void ProgramImplCore::bind_sequence_kv() {
-    if (!sequence_kv || sequence_kv->text.bound_row() >= 0 ||
-        (sequence_kv->backend && sequence_kv->backend->bound_row() >= 0)) {
+    if (!active_sequence().kv || active_sequence().kv->text.bound_row() >= 0 ||
+        (active_sequence().kv->backend && active_sequence().kv->backend->bound_row() >= 0)) {
         throw std::logic_error("KV allocation bundle is unavailable or already bound");
     }
-    sequence_kv->text.bind_row(0, device.stream);
+    const std::int32_t row = static_cast<std::int32_t>(active_sequence().lane);
+    active_sequence().kv->text.bind_row(row, device.stream);
     try {
-        if (sequence_kv->backend) { sequence_kv->backend->bind_row(0, device.stream); }
-        set_device_i32(io.text_kv_table_row, sequence_kv->text.bound_row());
-        set_device_i32(io.backend_kv_table_row,
-                       sequence_kv->backend ? sequence_kv->backend->bound_row() : 0);
-    } catch (...) {
-        if (sequence_kv->backend && sequence_kv->backend->bound_row() >= 0) {
-            sequence_kv->backend->unbind_row();
+        if (active_sequence().kv->backend) {
+            active_sequence().kv->backend->bind_row(row, device.stream);
         }
-        sequence_kv->text.unbind_row();
+        set_device_i32(io.text_kv_table_row, active_sequence().kv->text.bound_row());
+        set_device_i32(io.backend_kv_table_row, active_sequence().kv->backend
+                                                    ? active_sequence().kv->backend->bound_row()
+                                                    : 0);
+    } catch (...) {
+        if (active_sequence().kv->backend && active_sequence().kv->backend->bound_row() >= 0) {
+            active_sequence().kv->backend->unbind_row();
+        }
+        active_sequence().kv->text.unbind_row();
         throw;
     }
 }
 
 void ProgramImplCore::unbind_sequence_kv() noexcept {
-    if (!sequence_kv) { return; }
-    if (sequence_kv->backend) { sequence_kv->backend->unbind_row(); }
-    sequence_kv->text.unbind_row();
+    if (!active_sequence().kv) { return; }
+    if (active_sequence().kv->backend) { active_sequence().kv->backend->unbind_row(); }
+    active_sequence().kv->text.unbind_row();
 }
 
 void ProgramImplCore::materialize_sequence_kv(std::uint32_t main_tokens,
                                               std::uint32_t backend_tokens) {
-    if (!sequence_kv || main_tokens > capacity || backend_tokens > capacity) {
+    if (!active_sequence().kv || main_tokens > capacity || backend_tokens > capacity) {
         throw std::logic_error("KV materialization request is outside the sequence bundle");
     }
-    if (backend_tokens != 0 && !sequence_kv->backend) {
+    if (backend_tokens != 0 && !active_sequence().kv->backend) {
         throw std::logic_error("backend KV materialization requested without an allocation");
     }
-    if (main_tokens > sequence_kv->text.mapped_token_capacity()) {
-        sequence_kv->text.materialize_tokens(main_tokens, device.stream);
+    if (main_tokens > active_sequence().kv->text.mapped_token_capacity()) {
+        active_sequence().kv->text.materialize_tokens(main_tokens, device.stream);
     }
-    if (backend_tokens != 0 && backend_tokens > sequence_kv->backend->mapped_token_capacity()) {
-        sequence_kv->backend->materialize_tokens(backend_tokens, device.stream);
+    if (backend_tokens != 0 &&
+        backend_tokens > active_sequence().kv->backend->mapped_token_capacity()) {
+        active_sequence().kv->backend->materialize_tokens(backend_tokens, device.stream);
     }
 }
 
 void ProgramImplCore::trim_sequence_kv(std::uint32_t main_tokens, std::uint32_t backend_tokens) {
-    if (!sequence_kv || main_tokens > capacity || backend_tokens > main_tokens) {
+    if (!active_sequence().kv || main_tokens > capacity || backend_tokens > main_tokens) {
         throw std::logic_error("KV trim request is outside the sequence bundle");
     }
-    if (backend_tokens != 0 && !sequence_kv->backend) {
+    if (backend_tokens != 0 && !active_sequence().kv->backend) {
         throw std::logic_error("backend KV trim requested without an allocation");
     }
-    sequence_kv->text.trim_tokens(main_tokens);
-    if (sequence_kv->backend) { sequence_kv->backend->trim_tokens(backend_tokens); }
+    active_sequence().kv->text.trim_tokens(main_tokens);
+    if (active_sequence().kv->backend) {
+        active_sequence().kv->backend->trim_tokens(backend_tokens);
+    }
+}
+
+void ProgramImplCore::release_sequence_growth_entitlement() noexcept {
+    if (!active_sequence().kv) { return; }
+    active_sequence().kv->text.cancel_unmapped_entitlement();
+    if (active_sequence().kv->backend) {
+        active_sequence().kv->backend->cancel_unmapped_entitlement();
+    }
 }
 
 qwen3_6::PagedKVCacheView ProgramImplCore::text_kv_view() const {
-    if (!sequence_kv) { throw std::logic_error("sequence has no KV allocation bundle"); }
-    return decoder->text_kv.execution_view(sequence_kv->text);
+    if (!active_sequence().kv) { throw std::logic_error("sequence has no KV allocation bundle"); }
+    return decoder->text_kv.execution_view(active_sequence().kv->text);
 }
 
 qwen3_6::PagedKVCacheView ProgramImplCore::mtp_kv_view() const {
     if (speculative_backend != SpeculativeBackend::Mtp) { return {}; }
-    if (decoder->mtp_cache() == nullptr || !sequence_kv || !sequence_kv->backend) {
+    if (decoder->mtp_cache() == nullptr || !active_sequence().kv ||
+        !active_sequence().kv->backend) {
         throw std::logic_error("sequence has no MTP KV allocation");
     }
-    return decoder->mtp_cache()->execution_view(*sequence_kv->backend);
+    return decoder->mtp_cache()->execution_view(*active_sequence().kv->backend);
 }
 
 qwen3_6::PagedKVCacheView ProgramImplCore::dflash_full_kv_view() const {
     if (speculative_backend != SpeculativeBackend::DFlash) { return {}; }
-    if (!dflash || !sequence_kv || !sequence_kv->backend) {
+    if (!active_sequence().dflash || !active_sequence().kv || !active_sequence().kv->backend) {
         throw std::logic_error("sequence has no DFlash Full KV allocation");
     }
-    return dflash->full_view(*sequence_kv->backend);
+    return active_sequence().dflash->full_view(*active_sequence().kv->backend);
 }
 
 void ProgramImplCore::set_device_i32(Tensor& tensor, std::int32_t value) {
@@ -405,39 +728,72 @@ void ProgramImplCore::set_device_i32(Tensor& tensor, std::int32_t value) {
 }
 
 void ProgramImplCore::ordered_reset() {
-    decoder->linear_attention.zero_slot(LinearStateSlots::prefill_working_slot(), device.stream);
+    decoder->linear_attention.zero_slot(
+        LinearStateSlots::prefill_working_slot(active_sequence().linear_state_base), device.stream);
     work.reset();
     set_device_i32(io.pos, 0);
     set_device_i32(io.rope_pos, 0);
     set_device_i32(io.rope_delta, 0);
     set_device_i32(io.speculative.accepted_drafts, 0);
-    set_device_i32(io.linear_state_read_slot, LinearStateSlots::prefill_working_slot());
-    set_device_i32(io.linear_state_snapshot_base_slot,
-                   LinearStateSlots::verify_snapshot_base_slot());
+    set_device_i32(io.linear_state_read_slot,
+                   LinearStateSlots::prefill_working_slot(active_sequence().linear_state_base));
+    set_device_i32(io.linear_state_snapshot_base_slot, LinearStateSlots::verify_snapshot_base_slot(
+                                                           active_sequence().linear_state_base));
     if (io.mtp) { set_device_i32(io.mtp->position, 0); }
-    current_linear_state_slot = LinearStateSlots::prefill_working_slot();
-    text_kv_valid             = 0;
-    mtp_kv_valid              = 0;
-    dflash_context_frontier   = 0;
-    dflash_proposal_frontier  = 0;
-    dflash_proposal_anchor    = 0;
-    dflash_proposal_epoch     = 0;
-    pending_context_base      = 0;
-    pending_context_count     = 0;
-    pending_context_valid     = false;
-    dflash_boundary_valid     = false;
-    dflash_boundary_frontier  = 0;
-    ordinary_tail             = false;
-    drafts_ready              = false;
-    if (dflash) { set_device_i32(dflash->commit_count, 0); }
+    active_sequence().current_linear_state_slot =
+        LinearStateSlots::prefill_working_slot(active_sequence().linear_state_base);
+    active_sequence().text_kv_valid            = 0;
+    active_sequence().mtp_kv_valid             = 0;
+    active_sequence().dflash_context_frontier  = 0;
+    active_sequence().dflash_proposal_frontier = 0;
+    active_sequence().dflash_proposal_anchor   = 0;
+    active_sequence().dflash_proposal_epoch    = 0;
+    active_sequence().pending_context_base     = 0;
+    active_sequence().pending_context_count    = 0;
+    active_sequence().pending_context_valid    = false;
+    active_sequence().dflash_boundary_valid    = false;
+    active_sequence().dflash_boundary_frontier = 0;
+    active_sequence().ordinary_tail            = false;
+    active_sequence().drafts_ready             = false;
+    if (active_sequence().dflash) { set_device_i32(active_sequence().dflash->commit_count, 0); }
 }
 
 void ProgramImplCore::prepare_graphs() {
     if (!use_cuda_graph) { return; }
 
-    reserve_sequence_kv();
-    bind_sequence_kv();
-    materialize_sequence_kv(capacity, backend_kv_cache() != nullptr ? capacity : 0);
+    std::vector<PagedKVAllocation> ordinary_capture_allocations;
+    qwen3_6::PagedKVCacheView capture_text_kv;
+    if (speculative_backend == SpeculativeBackend::None) {
+        PagedKVPool& pool = decoder->text_kv.pool();
+        if (pool.page_group_count() < max_concurrency) {
+            throw std::invalid_argument(
+                "max_context cannot provide one Paged KV page per concurrent request");
+        }
+        ordinary_capture_allocations.reserve(max_concurrency);
+        for (std::uint32_t row = 0; row < max_concurrency; ++row) {
+            ordinary_capture_allocations.push_back(pool.reserve(1));
+            PagedKVAllocation& allocation = ordinary_capture_allocations.back();
+            allocation.bind_row(static_cast<std::int32_t>(row), device.stream);
+            allocation.materialize_pages(1, device.stream);
+
+            // Capture profiles exercise arbitrary context envelopes. Repeating each row's private
+            // page across its temporary table keeps every dummy read/write address valid without
+            // reserving C full contexts solely for graph construction.
+            const std::int32_t page = allocation.page_ids().front();
+            std::vector<std::int32_t> repeated(pool.logical_page_capacity(), page);
+            Tensor table = pool.block_table_row(static_cast<std::int32_t>(row));
+            CUDA_CHECK(cudaMemcpyAsync(table.data, repeated.data(), table.bytes(),
+                                       cudaMemcpyHostToDevice, device.stream));
+        }
+        capture_text_kv = decoder->text_kv.execution_view(ordinary_capture_allocations.front());
+    } else {
+        reserve_sequence_kv(
+            decoder->text_kv.pool().logical_page_capacity(),
+            backend_kv_cache() != nullptr ? backend_kv_cache()->pool().logical_page_capacity() : 0);
+        bind_sequence_kv();
+        materialize_sequence_kv(capacity, backend_kv_cache() != nullptr ? capacity : 0);
+        capture_text_kv = text_kv_view();
+    }
 
     std::size_t free_before = 0;
     std::size_t total_bytes = 0;
@@ -483,79 +839,123 @@ void ProgramImplCore::prepare_graphs() {
     };
     initialize_paged_cache(decoder->text_kv);
     if (decoder->mtp_cache() != nullptr) { initialize_paged_cache(*decoder->mtp_cache()); }
-    if (dflash) {
-        initialize_cyclic_cache(dflash->local);
-        initialize_paged_cache(dflash->full);
-        CUDA_CHECK(cudaMemsetAsync(dflash->target_features.data, 0, dflash->target_features.bytes(),
+    if (active_sequence().dflash) {
+        initialize_cyclic_cache(active_sequence().dflash->local);
+        initialize_paged_cache(active_sequence().dflash->full);
+        CUDA_CHECK(cudaMemsetAsync(active_sequence().dflash->target_features.data, 0,
+                                   active_sequence().dflash->target_features.bytes(),
                                    device.stream));
-        CUDA_CHECK(cudaMemsetAsync(dflash->feature_positions.data, 0,
-                                   dflash->feature_positions.bytes(), device.stream));
+        CUDA_CHECK(cudaMemsetAsync(active_sequence().dflash->feature_positions.data, 0,
+                                   active_sequence().dflash->feature_positions.bytes(),
+                                   device.stream));
     }
     device.synchronize();
 
     const auto prepare_representative = [&](std::uint32_t frontier) {
         work.reset();
         clear_stable_controls();
-        decoder->linear_attention.zero_slot(LinearStateSlots::prefill_working_slot(),
-                                            device.stream);
+        const std::int32_t slots_per_sequence = LinearStateSlots::required_slot_count(draft_window);
+        for (std::uint32_t row = 0; row < max_concurrency; ++row) {
+            decoder->linear_attention.zero_slot(static_cast<std::int32_t>(row) * slots_per_sequence,
+                                                device.stream);
+        }
         set_device_i32(io.pos, checked_i32(frontier, "graph representative position"));
         set_device_i32(io.rope_pos, checked_i32(frontier, "graph representative rope position"));
         if (io.mtp) {
             set_device_i32(io.mtp->position,
                            checked_i32(frontier, "graph representative MTP position"));
         }
-        if (dflash) {
+        if (active_sequence().dflash) {
             set_device_i32(io.speculative.produced_count, 1);
             set_device_i32(io.speculative.target_positions,
                            checked_i32(frontier == 0 ? 0 : frontier - 1,
                                        "graph representative DFlash append position"));
         }
+        for (std::uint32_t row = 0; row < max_concurrency; ++row) {
+            ordinary_host_ingress->tokens[row] = 0;
+            ordinary_host_ingress->cache_positions[row] =
+                checked_i32(frontier, "graph representative ordinary position");
+            ordinary_host_ingress->rope_positions[row] =
+                checked_i32(frontier, "graph representative ordinary RoPE position");
+            ordinary_host_ingress->text_kv_table_rows[row] = static_cast<std::int32_t>(row);
+            const std::int32_t linear_base = static_cast<std::int32_t>(row) * slots_per_sequence;
+            ordinary_host_ingress->linear_state_read_slots[row]          = linear_base;
+            ordinary_host_ingress->linear_state_snapshot_base_slots[row] = linear_base;
+            ordinary_host_ingress->continuation_slots[row] = static_cast<std::int32_t>(row);
+            ordinary_host_ingress->sampling[row]           = {};
+        }
     };
     const auto state = [&](std::uint32_t frontier) {
-        return schedule::State{device,
-                               model,
-                               work,
-                               text_kv_view(),
-                               mtp_kv_view(),
-                               dflash_full_kv_view(),
-                               dflash ? &*dflash : nullptr,
-                               decoder->linear_attention,
-                               io,
-                               prefill_hidden,
-                               prefill_chunk,
-                               frontier,
-                               static_cast<const ops::SamplingConfig*>(sampling_config.data),
-                               proposal_head,
-                               &tail_hidden,
-                               &boundary_hidden};
+        return schedule::State{
+            device,
+            model,
+            work,
+            capture_text_kv,
+            mtp_kv_view(),
+            dflash_full_kv_view(),
+            active_sequence().dflash ? &*active_sequence().dflash : nullptr,
+            decoder->linear_attention,
+            io,
+            prefill_hidden,
+            prefill_chunk,
+            frontier,
+            static_cast<const ops::SamplingConfig*>(
+                sampling_config.slice(1, static_cast<std::int32_t>(active_sequence().lane), 1)
+                    .data),
+            proposal_head,
+            &active_sequence().tail_hidden,
+            &active_sequence().boundary_hidden,
+            active_sequence().linear_state_base,
+            active_sequence().linear_state_capacity,
+            ordinary_host_ingress,
+            ordinary_host_egress,
+            &tail_hidden_store};
     };
 
     const auto ordinary_profiles = ordinary_graph_profiles(capacity);
     validate_graph_profiles(ordinary_profiles, capacity - 1, "ordinary");
-    ordinary_graphs.profiles.reserve(ordinary_profiles.size());
+    const std::uint32_t ordinary_batch_limit =
+        speculative_backend == SpeculativeBackend::None ? max_concurrency : 1U;
+    ordinary_graphs.profiles.reserve(ordinary_profiles.size() * ordinary_batch_limit);
     if (decoder->mtp_cache() != nullptr) {
         ordinary_aligned_graphs.profiles.reserve(ordinary_profiles.size());
     }
-    for (const GraphExecutionProfile planned : ordinary_profiles) {
-        ordinary_graphs.profiles.emplace_back();
-        DecodeGraphProfile& profile        = ordinary_graphs.profiles.back();
-        profile.min_execution_frontier     = planned.min;
-        profile.max_execution_frontier     = planned.max;
-        profile.topology_class             = planned.topology_class;
-        const std::uint32_t representative = planned.min;
-        const ops::GqaExecutionEnvelope envelope{planned.min + 1, planned.max + 1};
-        const auto prepare = [&, representative] { prepare_representative(representative); };
+    for (std::uint32_t batch_size = 1; batch_size <= ordinary_batch_limit; ++batch_size) {
+        for (const GraphExecutionProfile planned : ordinary_profiles) {
+            ordinary_graphs.profiles.emplace_back();
+            DecodeGraphProfile& profile    = ordinary_graphs.profiles.back();
+            profile.batch_size             = batch_size;
+            profile.min_execution_frontier = planned.min;
+            profile.max_execution_frontier = planned.max;
+            profile.topology_class =
+                planned.topology_class * ordinary_batch_limit + (batch_size - 1U);
+            const std::uint32_t representative = planned.min;
+            const ops::GqaExecutionEnvelope envelope{planned.min + 1, planned.max + 1};
+            const auto prepare = [&, representative] { prepare_representative(representative); };
 
-        auto ordinary_state = state(representative);
-        schedule::warm_capture_ordinary_round(ordinary_state, false, envelope, prepare,
-                                              profile.definition);
-        if (decoder->mtp_cache() != nullptr) {
+            auto ordinary_state = state(representative);
+            if (speculative_backend == SpeculativeBackend::None) {
+                schedule::warm_capture_ordinary_decode_batch(ordinary_state,
+                                                             static_cast<std::int32_t>(batch_size),
+                                                             envelope, prepare, profile.definition);
+            } else {
+                schedule::warm_capture_ordinary_round(ordinary_state, false, envelope, prepare,
+                                                      profile.definition);
+            }
+        }
+    }
+    if (decoder->mtp_cache() != nullptr) {
+        for (const GraphExecutionProfile planned : ordinary_profiles) {
             ordinary_aligned_graphs.profiles.emplace_back();
             DecodeGraphProfile& aligned_profile    = ordinary_aligned_graphs.profiles.back();
+            aligned_profile.batch_size             = 1;
             aligned_profile.min_execution_frontier = planned.min;
             aligned_profile.max_execution_frontier = planned.max;
             aligned_profile.topology_class         = planned.topology_class;
-            auto aligned_state                     = state(representative);
+            const std::uint32_t representative     = planned.min;
+            const ops::GqaExecutionEnvelope envelope{planned.min + 1, planned.max + 1};
+            const auto prepare = [&, representative] { prepare_representative(representative); };
+            auto aligned_state = state(representative);
             schedule::warm_capture_ordinary_round(aligned_state, true, envelope, prepare,
                                                   aligned_profile.definition);
         }
@@ -656,30 +1056,43 @@ void ProgramImplCore::prepare_graphs() {
                                  " bytes, exceeding the planned allowance of " +
                                  std::to_string(graph_allowance_bytes) + " bytes");
     }
-    unbind_sequence_kv();
-    sequence_kv.reset();
+    if (speculative_backend == SpeculativeBackend::None) {
+        for (PagedKVAllocation& allocation : ordinary_capture_allocations) {
+            allocation.unbind_row();
+        }
+        ordinary_capture_allocations.clear();
+    } else {
+        unbind_sequence_kv();
+        active_sequence().kv.reset();
+    }
 }
 
 void ProgramImplCore::install_sampling(const ops::SamplingConfig& config) {
-    CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
+    Tensor counts = token_counts.slice(1, static_cast<std::int32_t>(active_sequence().lane), 1)
+                        .view({TextConfig::token_domain});
+    CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream));
     CUDA_CHECK(
         cudaMemsetAsync(io.speculative.stats.data, 0, io.speculative.stats.bytes(), device.stream));
-    sampling_host = config;
-    const bool penalties =
-        sampling_host.presence_penalty != 0.0F || sampling_host.frequency_penalty != 0.0F;
-    sampling_host.token_counts =
-        penalties ? static_cast<std::int32_t*>(token_counts.data) : nullptr;
-    CUDA_CHECK(cudaMemcpyAsync(sampling_config.data, &sampling_host, sizeof(sampling_host),
-                               cudaMemcpyHostToDevice, device.stream));
+    active_request().sampling_host = config;
+    const bool penalties           = active_request().sampling_host.presence_penalty != 0.0F ||
+                           active_request().sampling_host.frequency_penalty != 0.0F;
+    active_request().sampling_host.token_counts =
+        penalties ? static_cast<std::int32_t*>(counts.data) : nullptr;
+    Tensor config_lane =
+        sampling_config.slice(1, static_cast<std::int32_t>(active_sequence().lane), 1);
+    CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &active_request().sampling_host,
+                               sizeof(active_request().sampling_host), cudaMemcpyHostToDevice,
+                               device.stream));
 }
 
 void ProgramImplCore::copy_tail(const Tensor& source) {
     if (source.dtype != DType::BF16 || source.ne[0] != TextConfig::hidden || source.ne[1] != 1) {
         throw std::logic_error("target tail hidden has an invalid shape");
     }
-    CUDA_CHECK(cudaMemcpyAsync(tail_hidden.data, source.data, tail_hidden.bytes(),
-                               cudaMemcpyDeviceToDevice, device.stream));
-    tail_hidden_valid = true;
+    CUDA_CHECK(cudaMemcpyAsync(active_sequence().tail_hidden.data, source.data,
+                               active_sequence().tail_hidden.bytes(), cudaMemcpyDeviceToDevice,
+                               device.stream));
+    active_sequence().tail_hidden_valid = true;
 }
 
 void ProgramImplCore::copy_round_token() {
@@ -692,39 +1105,47 @@ void ProgramImplCore::mark_workspace_usage(std::size_t phase_bytes) noexcept {
 }
 
 void ProgramImplCore::flush_dflash_context_prefix(std::uint32_t count) {
-    if (!dflash || !pending_context_valid || dflash_context_frontier != pending_context_base ||
-        count == 0 || count > pending_context_count) {
+    if (!active_sequence().dflash || !active_sequence().pending_context_valid ||
+        active_sequence().dflash_context_frontier != active_sequence().pending_context_base ||
+        count == 0 || count > active_sequence().pending_context_count) {
         throw std::logic_error("DFlash context flush does not match the pending target features");
     }
-    const std::uint32_t context_end = pending_context_base + count;
-    materialize_sequence_kv(std::max(text_kv_valid, context_end), context_end);
-    schedule::State state{device,
-                          model,
-                          work,
-                          text_kv_view(),
-                          mtp_kv_view(),
-                          dflash_full_kv_view(),
-                          &*dflash,
-                          decoder->linear_attention,
-                          io,
-                          prefill_hidden,
-                          prefill_chunk,
-                          pending_context_base,
-                          static_cast<const ops::SamplingConfig*>(sampling_config.data),
-                          proposal_head,
-                          &tail_hidden,
-                          &boundary_hidden};
-    set_device_i32(dflash->commit_count, checked_i32(count, "DFlash context commit count"));
-    Tensor features  = dflash->target_features.slice(1, 0, static_cast<std::int32_t>(count));
-    Tensor positions = dflash->feature_positions.slice(0, 0, static_cast<std::int32_t>(count));
+    const std::uint32_t context_end = active_sequence().pending_context_base + count;
+    materialize_sequence_kv(std::max(active_sequence().text_kv_valid, context_end), context_end);
+    schedule::State state{
+        device,
+        model,
+        work,
+        text_kv_view(),
+        mtp_kv_view(),
+        dflash_full_kv_view(),
+        &*active_sequence().dflash,
+        decoder->linear_attention,
+        io,
+        prefill_hidden,
+        prefill_chunk,
+        active_sequence().pending_context_base,
+        static_cast<const ops::SamplingConfig*>(
+            sampling_config.slice(1, static_cast<std::int32_t>(active_sequence().lane), 1).data),
+        proposal_head,
+        &active_sequence().tail_hidden,
+        &active_sequence().boundary_hidden,
+        active_sequence().linear_state_base,
+        active_sequence().linear_state_capacity};
+    set_device_i32(active_sequence().dflash->commit_count,
+                   checked_i32(count, "DFlash context commit count"));
+    Tensor features =
+        active_sequence().dflash->target_features.slice(1, 0, static_cast<std::int32_t>(count));
+    Tensor positions =
+        active_sequence().dflash->feature_positions.slice(0, 0, static_cast<std::int32_t>(count));
     mark_workspace_usage(workspace_plan.dflash_context);
-    schedule::dflash_append_context(state, features, positions, dflash->commit_count,
-                                    {count, count});
+    schedule::dflash_append_context(state, features, positions,
+                                    active_sequence().dflash->commit_count, {count, count});
     device.synchronize();
-    dflash_context_frontier = pending_context_base + count;
-    pending_context_base    = 0;
-    pending_context_count   = 0;
-    pending_context_valid   = false;
+    active_sequence().dflash_context_frontier = active_sequence().pending_context_base + count;
+    active_sequence().pending_context_base    = 0;
+    active_sequence().pending_context_count   = 0;
+    active_sequence().pending_context_valid   = false;
 }
 
 void ProgramImplCore::validate_licensed_tokens(std::span<const TokenId> tokens) const {
@@ -735,11 +1156,167 @@ void ProgramImplCore::validate_licensed_tokens(std::span<const TokenId> tokens) 
     }
 }
 
+runtime::PrefillStepResult ProgramImplCore::advance_ordinary_prefill() {
+    if (speculative_backend != SpeculativeBackend::None ||
+        active_request().lifecycle != Lifecycle::Prefilling || !active_request().ordinary_prefill) {
+        throw std::logic_error("ordinary prefill step requires an active staged prefill");
+    }
+
+    RequestControl::OrdinaryPrefill& staged = *active_request().ordinary_prefill;
+    const runtime::BeginSummary summary{.prompt_tokens        = staged.prompt_tokens,
+                                        .reused_prompt_tokens = staged.base};
+    const auto started = Clock::now();
+    try {
+        if (staged.cursor < staged.prompt_tokens) {
+            const std::uint32_t nominal =
+                std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+            const bool final_candidate = staged.cursor + nominal == staged.prompt_tokens;
+            schedule::State schedule_state{
+                device,
+                model,
+                work,
+                text_kv_view(),
+                {},
+                {},
+                nullptr,
+                decoder->linear_attention,
+                io,
+                prefill_hidden,
+                prefill_chunk,
+                staged.cursor,
+                static_cast<const ops::SamplingConfig*>(
+                    sampling_config.slice(1, static_cast<std::int32_t>(active_sequence().lane), 1)
+                        .data),
+                proposal_head,
+                &active_sequence().tail_hidden,
+                &active_sequence().boundary_hidden,
+                active_sequence().linear_state_base,
+                active_sequence().linear_state_capacity,
+            };
+
+            mark_workspace_usage(workspace_plan.text_prefill);
+            schedule::PrefillChunkResult result;
+            if (staged.vision) {
+                mark_workspace_usage(workspace_plan.vision_encode);
+                result = schedule::prefill_multimodal_chunk(
+                    schedule_state, staged.prompt, *staged.vision, nominal,
+                    staged.snapshot_boundary, final_candidate);
+            } else {
+                const auto remaining = std::span<const TokenId>(staged.prompt.token_ids)
+                                           .subspan(staged.cursor, nominal);
+                result = schedule::prefill_text_chunk(schedule_state, remaining,
+                                                      staged.snapshot_boundary, final_candidate);
+            }
+            if (result.processed_tokens == 0 || result.processed_tokens > nominal) {
+                throw std::logic_error("ordinary prefill chunk made invalid progress");
+            }
+            staged.cursor += result.processed_tokens;
+            active_sequence().text_kv_valid = staged.cursor;
+            active_sequence().current_linear_state_slot =
+                LinearStateSlots::prefill_working_slot(active_sequence().linear_state_base);
+
+            if (!result.finalized) {
+                if (staged.cursor == staged.prompt_tokens) {
+                    throw std::logic_error("ordinary prefill reached the prompt without sampling");
+                }
+                staged.elapsed_seconds +=
+                    std::chrono::duration<double>(Clock::now() - started).count();
+                return runtime::PrefillStepResult{.summary = summary};
+            }
+            if (staged.cursor != staged.prompt_tokens) {
+                throw std::logic_error("ordinary prefill sampled before the prompt frontier");
+            }
+            copy_tail(
+                prefill_hidden.slice(1, static_cast<std::int32_t>(result.processed_tokens) - 1, 1));
+        } else {
+            mark_workspace_usage(workspace_plan.ordinary_round);
+            if (!active_sequence().tail_hidden_valid) {
+                throw std::logic_error("zero-suffix reuse has no target tail hidden");
+            }
+            schedule::State schedule_state{
+                device,
+                model,
+                work,
+                text_kv_view(),
+                {},
+                {},
+                nullptr,
+                decoder->linear_attention,
+                io,
+                prefill_hidden,
+                prefill_chunk,
+                staged.cursor,
+                static_cast<const ops::SamplingConfig*>(
+                    sampling_config.slice(1, static_cast<std::int32_t>(active_sequence().lane), 1)
+                        .data),
+                proposal_head,
+                &active_sequence().tail_hidden,
+                &active_sequence().boundary_hidden,
+                active_sequence().linear_state_base,
+                active_sequence().linear_state_capacity,
+            };
+            schedule::sample_from_hidden(schedule_state, active_sequence().tail_hidden,
+                                         checked_i32(staged.prompt_tokens, "sample position"),
+                                         ops::kSamplePurposePrefill);
+            set_device_i32(io.rope_pos, checked_i32(staged.prompt_tokens, "rope position") +
+                                            active_sequence().rope_delta);
+        }
+
+        copy_round_token();
+        device.synchronize();
+        staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
+        const double vision_seconds = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
+        const std::optional<std::uint32_t> snapshot_boundary = staged.snapshot_boundary;
+        const std::uint32_t prompt_tokens                    = staged.prompt_tokens;
+
+        validate_licensed_tokens(std::span<const TokenId>(host_tokens, 1));
+        if (active_sequence().ledger.size() != prompt_tokens) {
+            throw std::logic_error("candidate token ledger does not match prompt length");
+        }
+        active_sequence().ledger.push_back(host_tokens[0]);
+        active_sequence().prefix_identity.append_generated(1, active_sequence().rope_delta);
+        active_sequence().text_kv_valid         = prompt_tokens;
+        active_sequence().tail_hidden_valid     = true;
+        active_request().timings.vision_seconds = vision_seconds;
+        active_request().timings.prefill_seconds =
+            std::max(0.0, staged.elapsed_seconds - vision_seconds);
+        if (snapshot_boundary) {
+            active_sequence().boundary.valid        = true;
+            active_sequence().boundary.boundary     = *snapshot_boundary;
+            active_sequence().boundary.hidden_valid = true;
+        }
+
+        active_request().ordinary_prefill.reset();
+        active_request().pending   = PendingCandidate{.kind          = PendingKind::Begin,
+                                                      .base_E        = 0,
+                                                      .base_S        = 0,
+                                                      .prompt_tokens = prompt_tokens,
+                                                      .produced      = 1};
+        active_request().lifecycle = Lifecycle::Pending;
+        return runtime::PrefillStepResult{
+            .summary  = summary,
+            .round    = runtime::GeneratedRound{.tokens = std::span<const TokenId>(host_tokens, 1)},
+            .complete = true,
+        };
+    } catch (...) {
+        try {
+            device.synchronize();
+        } catch (...) {}
+        make_invalid();
+        throw;
+    }
+}
+
 runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, RequestPlan&& request_plan,
                                             runtime::TransientRegion transient) {
     if (request_plan.impl_ == nullptr) { throw std::invalid_argument("request plan is empty"); }
+    if (speculative_backend == SpeculativeBackend::None) {
+        throw std::logic_error("ordinary requests require the staged Engine execution path");
+    }
     const RequestPlanImpl& plan = *request_plan.impl_;
-    if (lifecycle == Lifecycle::Active || lifecycle == Lifecycle::Pending) {
+    if (active_request().lifecycle == Lifecycle::Prefilling ||
+        active_request().lifecycle == Lifecycle::Active ||
+        active_request().lifecycle == Lifecycle::Pending) {
         throw std::logic_error("begin requires Empty, Resident, or Invalid Program state");
     }
     const std::uint32_t prompt_tokens = static_cast<std::uint32_t>(prompt.token_ids.size());
@@ -759,13 +1336,15 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
         throw std::invalid_argument("request transient region does not satisfy the plan");
     }
     if (plan.reuse != ReusePath::FullReset) {
-        if (lifecycle != Lifecycle::Resident ||
-            !qwen3_6::detail::prefix_matches(prompt, ledger, prefix_identity, plan.reuse_base)) {
+        if (active_request().lifecycle != Lifecycle::Resident ||
+            !qwen3_6::detail::prefix_matches(prompt, active_sequence().ledger,
+                                             active_sequence().prefix_identity, plan.reuse_base)) {
             throw std::logic_error("planned resident prefix is no longer reusable");
         }
         if (plan.reuse == ReusePath::RestoreBoundary &&
-            (!boundary.valid || boundary.boundary != plan.reuse_base)) {
-            throw std::logic_error("planned boundary checkpoint is unavailable");
+            (!active_sequence().boundary.valid ||
+             active_sequence().boundary.boundary != plan.reuse_base)) {
+            throw std::logic_error("planned sequence-boundary checkpoint is unavailable");
         }
     }
 
@@ -777,57 +1356,69 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
 
     // From here on, the old identity is deliberately unreachable. Any failure takes the Program
     // to Invalid rather than attempting a mixed restore/reset fallback.
-    lifecycle = Lifecycle::Invalid;
+    active_request().lifecycle = Lifecycle::Invalid;
     try {
         if (plan.reuse == ReusePath::FullReset) {
-            sequence_kv.reset();
+            active_sequence().kv.reset();
             ordered_reset();
-            ledger.clear();
-            reserve_sequence_kv();
+            active_sequence().ledger.clear();
+            reserve_sequence_kv(plan.text_kv_page_entitlement, plan.backend_kv_page_entitlement);
         } else if (plan.reuse == ReusePath::AppendAtFrontier) {
-            if (!sequence_kv) {
+            if (!active_sequence().kv) {
                 throw std::logic_error("resident prefix has no KV allocation bundle");
             }
-            if (text_kv_valid < base) {
-                throw std::logic_error("resident Text KV is shorter than E");
+            trim_sequence_kv(base, backend_kv_valid());
+            resize_sequence_kv_entitlement(plan.text_kv_page_entitlement,
+                                           plan.backend_kv_page_entitlement);
+            if (active_sequence().text_kv_valid < base) {
+                throw std::logic_error("resident Text KV is shorter than the execution frontier");
             }
-            text_kv_valid = base;
-            ledger.resize(base);
-            set_device_i32(io.linear_state_read_slot, current_linear_state_slot);
-            if (dflash && (pending_context_valid || dflash_context_frontier != base)) {
+            active_sequence().text_kv_valid = base;
+            active_sequence().ledger.resize(base);
+            set_device_i32(io.linear_state_read_slot, active_sequence().current_linear_state_slot);
+            if (active_sequence().dflash && (active_sequence().pending_context_valid ||
+                                             active_sequence().dflash_context_frontier != base)) {
                 throw std::logic_error("resident DFlash context is not at the append frontier");
             }
         } else {
-            if (!sequence_kv) {
+            if (!active_sequence().kv) {
                 throw std::logic_error("resident boundary has no KV allocation bundle");
             }
-            if (text_kv_valid < base) {
-                throw std::logic_error("resident Text KV is shorter than boundary");
+            if (active_sequence().text_kv_valid < base) {
+                throw std::logic_error("resident Text KV is shorter than the boundary");
             }
-            text_kv_valid = base;
+            active_sequence().text_kv_valid = base;
+            trim_sequence_kv(base, backend_kv_valid());
+            resize_sequence_kv_entitlement(plan.text_kv_page_entitlement,
+                                           plan.backend_kv_page_entitlement);
             decoder->linear_attention.copy_slot(
-                LinearStateSlots::prefix_boundary_slot(decoder->linear_attention.slot_count()),
-                LinearStateSlots::prefill_working_slot(), device.stream);
-            current_linear_state_slot = LinearStateSlots::prefill_working_slot();
-            set_device_i32(io.linear_state_read_slot, current_linear_state_slot);
-            ledger.resize(base);
-            if (dflash) {
-                if (!dflash_boundary_valid || dflash_boundary_frontier != base) {
+                LinearStateSlots::prefix_boundary_slot(active_sequence().linear_state_base,
+                                                       active_sequence().linear_state_capacity),
+                LinearStateSlots::prefill_working_slot(active_sequence().linear_state_base),
+                device.stream);
+            active_sequence().current_linear_state_slot =
+                LinearStateSlots::prefill_working_slot(active_sequence().linear_state_base);
+            set_device_i32(io.linear_state_read_slot, active_sequence().current_linear_state_slot);
+            active_sequence().ledger.resize(base);
+            if (active_sequence().dflash) {
+                if (!active_sequence().dflash_boundary_valid ||
+                    active_sequence().dflash_boundary_frontier != base) {
                     throw std::logic_error("planned DFlash boundary checkpoint is unavailable");
                 }
-                dflash->restore_boundary(device.stream);
-                dflash_context_frontier = base;
+                active_sequence().dflash->restore_boundary(device.stream);
+                active_sequence().dflash_context_frontier = base;
             }
         }
 
         if (plan.prepare_mtp && base != 0) {
             const std::uint32_t mtp_base = base - 1;
-            if (decoder->mtp_cache() == nullptr || mtp_kv_valid < mtp_base) {
+            if (decoder->mtp_cache() == nullptr || active_sequence().mtp_kv_valid < mtp_base) {
                 throw std::logic_error("reusable MTP prefix is shorter than its bridge position");
             }
-            mtp_kv_valid = mtp_base;
-        } else if (speculative_backend == SpeculativeBackend::Mtp && sequence_kv->backend) {
-            mtp_kv_valid = 0;
+            active_sequence().mtp_kv_valid = mtp_base;
+        } else if (speculative_backend == SpeculativeBackend::Mtp &&
+                   active_sequence().kv->backend) {
+            active_sequence().mtp_kv_valid = 0;
         }
 
         trim_sequence_kv(base, backend_kv_valid());
@@ -841,22 +1432,22 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
         materialize_sequence_kv(prompt_tokens, backend_materialized);
 
         install_sampling(plan.sampling);
-        rope_delta = request_rope_delta;
-        set_device_i32(io.rope_delta, rope_delta);
+        active_sequence().rope_delta = request_rope_delta;
+        set_device_i32(io.rope_delta, active_sequence().rope_delta);
         // Invalidate the old checkpoint identity now that execution has started. The separately
-        // allocated boundary_hidden tensor is deliberately left untouched until a restore bridge
+        // allocated boundary-hidden tensor is deliberately left untouched until a restore bridge
         // consumes h[B-1] below.
-        boundary                 = {};
-        dflash_boundary_valid    = false;
-        dflash_boundary_frontier = 0;
-        timings                  = {};
-        ++request_epoch;
-        drafts_ready          = false;
-        pending_context_valid = false;
-        ordinary_tail         = false;
+        active_sequence().boundary                 = {};
+        active_sequence().dflash_boundary_valid    = false;
+        active_sequence().dflash_boundary_frontier = 0;
+        active_request().timings                   = {};
+        ++active_sequence().request_epoch;
+        active_sequence().drafts_ready          = false;
+        active_sequence().pending_context_valid = false;
+        active_sequence().ordinary_tail         = false;
 
-        ledger.assign(prompt.token_ids.begin(), prompt.token_ids.end());
-        prefix_identity.assign(prompt);
+        active_sequence().ledger.assign(prompt.token_ids.begin(), prompt.token_ids.end());
+        active_sequence().prefix_identity.assign(prompt);
 
         schedule::State schedule_state{
             device,
@@ -865,16 +1456,23 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
             text_kv_view(),
             mtp_kv_view(),
             dflash_full_kv_view(),
-            dflash ? &*dflash : nullptr,
+            active_sequence().dflash ? &*active_sequence().dflash : nullptr,
             decoder->linear_attention,
             io,
             prefill_hidden,
             prefill_chunk,
             base,
-            static_cast<const ops::SamplingConfig*>(sampling_config.data),
+            static_cast<const ops::SamplingConfig*>(
+                sampling_config.slice(1, static_cast<std::int32_t>(active_sequence().lane), 1)
+                    .data),
             proposal_head,
-            &tail_hidden,
-            &boundary_hidden};
+            &active_sequence().tail_hidden,
+            &active_sequence().boundary_hidden,
+            active_sequence().linear_state_base,
+            active_sequence().linear_state_capacity,
+            ordinary_host_ingress,
+            ordinary_host_egress,
+            &tail_hidden_store};
         bool mtp_prepared    = false;
         bool dflash_prepared = false;
 
@@ -884,13 +1482,14 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
             const TokenId token = prompt.token_ids[base];
             CUDA_CHECK(cudaMemcpyAsync(bridge_token.data, &token, sizeof(token),
                                        cudaMemcpyHostToDevice, device.stream));
-            const Tensor& bridge_hidden =
-                plan.reuse == ReusePath::RestoreBoundary ? boundary_hidden : tail_hidden;
-            const auto bridge_rope = prompt_rope_position(prompt, base - 1);
+            const Tensor& bridge_hidden = plan.reuse == ReusePath::RestoreBoundary
+                                              ? active_sequence().boundary_hidden
+                                              : active_sequence().tail_hidden;
+            const auto bridge_rope      = prompt_rope_position(prompt, base - 1);
             schedule::mtp_bridge_and_propose(schedule_state, bridge_token, bridge_hidden,
                                              checked_i32(base - 1, "bridge position"), bridge_rope,
                                              false);
-            mtp_kv_valid = base;
+            active_sequence().mtp_kv_valid = base;
         }
 
         if (plan.vision) {
@@ -899,33 +1498,37 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
                                                   : workspace_plan.text_prefill);
             std::optional<schedule::MtpBridgeInput> mtp_bridge;
             if (plan.needs_mtp_bridge) {
-                const Tensor& bridge_hidden =
-                    plan.reuse == ReusePath::RestoreBoundary ? boundary_hidden : tail_hidden;
-                mtp_bridge = schedule::MtpBridgeInput{
-                    .previous_hidden = &bridge_hidden,
-                    .position        = checked_i32(base - 1, "bridge position"),
-                    .rope_position   = prompt_rope_position(prompt, base - 1),
+                const Tensor& bridge_hidden = plan.reuse == ReusePath::RestoreBoundary
+                                                  ? active_sequence().boundary_hidden
+                                                  : active_sequence().tail_hidden;
+                mtp_bridge                  = schedule::MtpBridgeInput{
+                                     .previous_hidden = &bridge_hidden,
+                                     .position        = checked_i32(base - 1, "bridge position"),
+                                     .rope_position   = prompt_rope_position(prompt, base - 1),
                 };
             }
             const auto multimodal_start                    = Clock::now();
             const schedule::MultimodalPrefillResult result = schedule::prefill_multimodal(
                 schedule_state, prompt, *plan.vision, transient, snapshot_boundary,
                 plan.prepare_mtp, mtp_bridge ? &*mtp_bridge : nullptr);
-            if (mtp_bridge) { mtp_kv_valid = base; }
+            if (mtp_bridge) { active_sequence().mtp_kv_valid = base; }
             mtp_prepared = result.mtp_prepared;
             copy_tail(prefill_hidden.slice(1, static_cast<int>(result.final_chunk_tokens) - 1, 1));
             copy_round_token();
             device.synchronize();
             const double combined_seconds =
                 std::chrono::duration<double>(Clock::now() - multimodal_start).count();
-            timings.vision_seconds  = result.vision_seconds;
-            timings.prefill_seconds = std::max(0.0, combined_seconds - result.vision_seconds);
+            active_request().timings.vision_seconds = result.vision_seconds;
+            active_request().timings.prefill_seconds =
+                std::max(0.0, combined_seconds - result.vision_seconds);
         } else {
             const auto text_start = Clock::now();
             if (had_suffix) {
                 mark_workspace_usage(plan.prepare_mtp ? workspace_plan.mtp_prefill
                                                       : workspace_plan.text_prefill);
-                if (dflash) { mark_workspace_usage(workspace_plan.dflash_context); }
+                if (active_sequence().dflash) {
+                    mark_workspace_usage(workspace_plan.dflash_context);
+                }
                 mtp_prepared = schedule::prefill_text(
                     schedule_state, std::span<const TokenId>(prompt.token_ids).subspan(base),
                     snapshot_boundary, plan.prepare_mtp);
@@ -934,24 +1537,24 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
                 copy_tail(prefill_hidden.slice(1, static_cast<int>(final_length) - 1, 1));
             } else {
                 mark_workspace_usage(workspace_plan.ordinary_round);
-                if (!tail_hidden_valid) {
+                if (!active_sequence().tail_hidden_valid) {
                     throw std::logic_error("zero-suffix reuse has no target tail hidden");
                 }
-                schedule::sample_from_hidden(schedule_state, tail_hidden,
+                schedule::sample_from_hidden(schedule_state, active_sequence().tail_hidden,
                                              checked_i32(prompt_tokens, "sample position"),
                                              ops::kSamplePurposePrefill);
-                set_device_i32(io.rope_pos,
-                               checked_i32(prompt_tokens, "rope position") + rope_delta);
+                set_device_i32(io.rope_pos, checked_i32(prompt_tokens, "rope position") +
+                                                active_sequence().rope_delta);
                 if (plan.prepare_mtp) {
                     const auto bridge_rope = prompt_rope_position(prompt, prompt_tokens - 1);
                     schedule::mtp_bridge_and_propose(
-                        schedule_state, io.token, tail_hidden,
+                        schedule_state, io.token, active_sequence().tail_hidden,
                         checked_i32(prompt_tokens - 1, "bridge position"), bridge_rope, true);
                     mtp_prepared = true;
                 }
             }
-            if (dflash) {
-                dflash_context_frontier = prompt_tokens;
+            if (active_sequence().dflash) {
+                active_sequence().dflash_context_frontier = prompt_tokens;
                 if (plan.prepare_dflash) {
                     mark_workspace_usage(workspace_plan.dflash_proposal);
                     schedule::dflash_propose(
@@ -962,53 +1565,57 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
             }
             copy_round_token();
             device.synchronize();
-            timings.prefill_seconds =
+            active_request().timings.prefill_seconds =
                 std::chrono::duration<double>(Clock::now() - text_start).count();
         }
 
         validate_licensed_tokens(std::span<const TokenId>(host_tokens, 1));
-        if (ledger.size() != prompt_tokens) {
+        if (active_sequence().ledger.size() != prompt_tokens) {
             throw std::logic_error("candidate token ledger does not match prompt length");
         }
-        ledger.push_back(host_tokens[0]);
-        prefix_identity.append_generated(1, rope_delta);
-        text_kv_valid = prompt_tokens;
+        active_sequence().ledger.push_back(host_tokens[0]);
+        active_sequence().prefix_identity.append_generated(1, active_sequence().rope_delta);
+        active_sequence().text_kv_valid = prompt_tokens;
         // Target prefill leaves its recurrent state in slot 0. Exact-frontier reuse performs no
         // target work, so it must retain the MTP snapshot that was committed at the old frontier.
-        if (had_suffix) { current_linear_state_slot = LinearStateSlots::prefill_working_slot(); }
-        mtp_kv_valid = mtp_prepared ? prompt_tokens : 0;
-        drafts_ready = mtp_prepared || dflash_prepared;
-        if (dflash) {
-            if (dflash_context_frontier != prompt_tokens) {
+        if (had_suffix) {
+            active_sequence().current_linear_state_slot =
+                LinearStateSlots::prefill_working_slot(active_sequence().linear_state_base);
+        }
+        active_sequence().mtp_kv_valid = mtp_prepared ? prompt_tokens : 0;
+        active_sequence().drafts_ready = mtp_prepared || dflash_prepared;
+        if (active_sequence().dflash) {
+            if (active_sequence().dflash_context_frontier != prompt_tokens) {
                 throw std::logic_error("DFlash prefill did not reach the prompt frontier");
             }
-            dflash_proposal_frontier = dflash_prepared ? prompt_tokens : 0;
-            dflash_proposal_anchor   = dflash_prepared ? host_tokens[0] : 0;
-            dflash_proposal_epoch    = dflash_prepared ? request_epoch : 0;
-            ordinary_tail            = !dflash_prepared;
+            active_sequence().dflash_proposal_frontier = dflash_prepared ? prompt_tokens : 0;
+            active_sequence().dflash_proposal_anchor   = dflash_prepared ? host_tokens[0] : 0;
+            active_sequence().dflash_proposal_epoch =
+                dflash_prepared ? active_sequence().request_epoch : 0;
+            active_sequence().ordinary_tail = !dflash_prepared;
         }
-        tail_hidden_valid = true;
+        active_sequence().tail_hidden_valid = true;
         if (snapshot_boundary) {
-            boundary.valid            = true;
-            boundary.boundary         = *snapshot_boundary;
-            boundary.hidden_valid     = true;
-            boundary.mtp_prefix_valid = mtp_prepared;
-            if (dflash) {
-                dflash_boundary_valid    = true;
-                dflash_boundary_frontier = *snapshot_boundary;
+            active_sequence().boundary.valid            = true;
+            active_sequence().boundary.boundary         = *snapshot_boundary;
+            active_sequence().boundary.hidden_valid     = true;
+            active_sequence().boundary.mtp_prefix_valid = mtp_prepared;
+            if (active_sequence().dflash) {
+                active_sequence().dflash_boundary_valid    = true;
+                active_sequence().dflash_boundary_frontier = *snapshot_boundary;
             }
         }
 
-        pending   = PendingCandidate{.kind          = PendingKind::Begin,
-                                     .base_E        = 0,
-                                     .base_S        = 0,
-                                     .prompt_tokens = prompt_tokens,
-                                     .produced      = 1};
-        lifecycle = Lifecycle::Pending;
-        timings.prefill_seconds =
-            std::max(timings.prefill_seconds,
+        active_request().pending   = PendingCandidate{.kind          = PendingKind::Begin,
+                                                      .base_E        = 0,
+                                                      .base_S        = 0,
+                                                      .prompt_tokens = prompt_tokens,
+                                                      .produced      = 1};
+        active_request().lifecycle = Lifecycle::Pending;
+        active_request().timings.prefill_seconds =
+            std::max(active_request().timings.prefill_seconds,
                      std::chrono::duration<double>(Clock::now() - begin_start).count() -
-                         timings.vision_seconds);
+                         active_request().timings.vision_seconds);
         return runtime::BeginResult{
             .summary =
                 runtime::BeginSummary{.prompt_tokens = prompt_tokens, .reused_prompt_tokens = base},
@@ -1023,43 +1630,192 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
     }
 }
 
+runtime::BatchedGeneratedRound
+ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
+                                       std::span<const runtime::RoundBudget> budgets) {
+    if (speculative_backend != SpeculativeBackend::None) {
+        throw std::logic_error("ordinary batch execution requires the ordinary backend");
+    }
+    if (lanes.empty() || lanes.size() > max_concurrency || budgets.size() != lanes.size()) {
+        throw std::invalid_argument("ordinary batch membership is invalid");
+    }
+
+    std::uint32_t maximum_frontier = 0;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const std::uint32_t lane = lanes[row];
+        if (lane >= max_concurrency ||
+            std::find(lanes.begin(), lanes.begin() + static_cast<std::ptrdiff_t>(row), lane) !=
+                lanes.begin() + static_cast<std::ptrdiff_t>(row)) {
+            throw std::invalid_argument("ordinary batch contains an invalid or duplicate lane");
+        }
+        const SequenceState& sequence = sequences[lane];
+        const RequestControl& request = requests[lane];
+        if (request.lifecycle != Lifecycle::Active ||
+            budgets[row].generated_tokens_remaining == 0 || !sequence.kv ||
+            sequence.kv->text.bound_row() < 0 || sequence.execution_frontier >= capacity ||
+            sequence.ledger_frontier != sequence.execution_frontier + 1 ||
+            sequence.ledger.size() != sequence.ledger_frontier ||
+            sequence.prefix_identity.size() != sequence.ledger_frontier) {
+            throw std::logic_error("ordinary batch row is not decode-ready");
+        }
+        maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
+    }
+
+    const auto start = Clock::now();
+    try {
+        DecodeGraphExecutable* executable = nullptr;
+        ops::GqaExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
+        if (use_cuda_graph) {
+            DecodeGraphProfile& profile =
+                select_graph_profile(ordinary_graphs, static_cast<std::uint32_t>(lanes.size()),
+                                     maximum_frontier, "ordinary batch");
+            executable = &install_graph_profile(ordinary_graphs, profile, "ordinary batch");
+            envelope   = {profile.min_execution_frontier + 1, profile.max_execution_frontier + 1};
+        }
+
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            active_lane_                       = lanes[row];
+            SequenceState& sequence            = active_sequence();
+            const std::uint32_t frontier       = sequence.execution_frontier;
+            ordinary_host_ingress->tokens[row] = sequence.ledger.back();
+            ordinary_host_ingress->cache_positions[row] =
+                checked_i32(frontier, "ordinary batch position");
+            ordinary_host_ingress->rope_positions[row] =
+                checked_i32(frontier, "ordinary batch RoPE position") + sequence.rope_delta;
+            ordinary_host_ingress->text_kv_table_rows[row] = sequence.kv->text.bound_row();
+            ordinary_host_ingress->linear_state_read_slots[row] =
+                sequence.current_linear_state_slot;
+            ordinary_host_ingress->linear_state_snapshot_base_slots[row] =
+                LinearStateSlots::verify_snapshot_base_slot(sequence.linear_state_base);
+            ordinary_host_ingress->continuation_slots[row] =
+                static_cast<std::int32_t>(sequence.lane);
+            ordinary_host_ingress->sampling[row] = active_request().sampling_host;
+            materialize_sequence_kv(frontier + 1, 0);
+        }
+
+        active_lane_                  = lanes.front();
+        SequenceState& first_sequence = active_sequence();
+        schedule::State schedule_state{device,
+                                       model,
+                                       work,
+                                       decoder->text_kv.execution_view(first_sequence.kv->text),
+                                       {},
+                                       {},
+                                       nullptr,
+                                       decoder->linear_attention,
+                                       io,
+                                       prefill_hidden,
+                                       prefill_chunk,
+                                       0,
+                                       nullptr,
+                                       proposal_head,
+                                       &first_sequence.tail_hidden,
+                                       &first_sequence.boundary_hidden,
+                                       first_sequence.linear_state_base,
+                                       first_sequence.linear_state_capacity,
+                                       ordinary_host_ingress,
+                                       ordinary_host_egress,
+                                       &tail_hidden_store};
+
+        mark_workspace_usage(workspace_plan.ordinary_round);
+        schedule::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
+                                        envelope, executable);
+        device.synchronize();
+
+        const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            active_lane_               = lanes[row];
+            SequenceState& sequence    = active_sequence();
+            RequestControl& request    = active_request();
+            const std::uint32_t base_E = sequence.execution_frontier;
+            const std::uint32_t base_S = sequence.ledger_frontier;
+            const TokenId token        = ordinary_host_egress->sampled_tokens[row];
+            validate_licensed_tokens(std::span<const TokenId>(&token, 1));
+            sequence.text_kv_valid             = base_E + 1;
+            sequence.current_linear_state_slot = LinearStateSlots::committed_snapshot_slot(
+                1, sequence.linear_state_base, sequence.linear_state_capacity);
+            sequence.drafts_ready      = false;
+            sequence.tail_hidden_valid = true;
+            sequence.ledger.push_back(token);
+            sequence.prefix_identity.append_generated(1, sequence.rope_delta);
+            request.pending   = PendingCandidate{.kind          = PendingKind::Ordinary,
+                                                 .base_E        = base_E,
+                                                 .base_S        = base_S,
+                                                 .prompt_tokens = 0,
+                                                 .produced      = 1};
+            request.lifecycle = Lifecycle::Pending;
+            request.timings.decode_seconds += seconds;
+        }
+        return runtime::BatchedGeneratedRound{
+            .tokens = std::span<const TokenId>(ordinary_host_egress->sampled_tokens.data(),
+                                               lanes.size())};
+    } catch (...) {
+        try {
+            device.synchronize();
+        } catch (...) {}
+        for (const std::uint32_t lane : lanes) {
+            if (lane < max_concurrency) {
+                active_lane_ = lane;
+                make_invalid();
+            }
+        }
+        throw;
+    }
+}
+
 runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budget) {
-    if (lifecycle != Lifecycle::Active) {
+    if (speculative_backend == SpeculativeBackend::None) {
+        throw std::logic_error("ordinary requests require batched Engine execution");
+    }
+    if (active_request().lifecycle != Lifecycle::Active) {
         throw std::logic_error("decode_round requires Active Program state");
     }
     if (budget.generated_tokens_remaining == 0) {
         throw std::invalid_argument("decode round budget must be nonzero");
     }
-    if (E >= capacity) { throw std::out_of_range("Text execution context is full"); }
-    if (S != E + 1 || ledger.size() != S || prefix_identity.size() != S) {
+    if (active_sequence().execution_frontier >= capacity) {
+        throw std::out_of_range("Text execution context is full");
+    }
+    if (active_sequence().ledger_frontier != active_sequence().execution_frontier + 1 ||
+        active_sequence().ledger.size() != active_sequence().ledger_frontier ||
+        active_sequence().prefix_identity.size() != active_sequence().ledger_frontier) {
         throw std::logic_error("Active frontier is inconsistent");
     }
 
-    if (speculative_backend == SpeculativeBackend::Mtp && drafts_ready &&
-        (decoder->mtp_cache() == nullptr || mtp_kv_valid != E)) {
+    if (speculative_backend == SpeculativeBackend::Mtp && active_sequence().drafts_ready &&
+        (decoder->mtp_cache() == nullptr ||
+         active_sequence().mtp_kv_valid != active_sequence().execution_frontier)) {
         throw std::logic_error("MTP proposal does not match the Active execution frontier");
     }
     if (speculative_backend == SpeculativeBackend::DFlash) {
-        if (drafts_ready &&
-            (dflash_context_frontier != E || dflash_proposal_frontier != E ||
-             dflash_proposal_anchor != ledger.back() || dflash_proposal_epoch != request_epoch)) {
+        if (active_sequence().drafts_ready &&
+            (active_sequence().dflash_context_frontier != active_sequence().execution_frontier ||
+             active_sequence().dflash_proposal_frontier != active_sequence().execution_frontier ||
+             active_sequence().dflash_proposal_anchor != active_sequence().ledger.back() ||
+             active_sequence().dflash_proposal_epoch != active_sequence().request_epoch)) {
             throw std::logic_error("DFlash proposal does not match the Active execution frontier");
         }
-        if (pending_context_valid && (dflash_context_frontier != pending_context_base ||
-                                      pending_context_base + pending_context_count != E)) {
+        if (active_sequence().pending_context_valid &&
+            (active_sequence().dflash_context_frontier != active_sequence().pending_context_base ||
+             active_sequence().pending_context_base + active_sequence().pending_context_count !=
+                 active_sequence().execution_frontier)) {
             throw std::logic_error("pending DFlash context update has an invalid frontier");
         }
     }
-    const bool use_mtp = speculative_backend == SpeculativeBackend::Mtp && drafts_ready &&
-                         mtp_kv_valid == E &&
-                         budget.generated_tokens_remaining >= draft_window + 1 &&
-                         static_cast<std::uint64_t>(E) + 2ULL * draft_window <= capacity;
-    const bool use_dflash = speculative_backend == SpeculativeBackend::DFlash && !ordinary_tail &&
-                            (drafts_ready || pending_context_valid) &&
-                            budget.generated_tokens_remaining >= draft_window + 1 &&
-                            static_cast<std::uint64_t>(E) + draft_window + 1ULL <= capacity;
-    const std::uint32_t base_E = E;
-    const std::uint32_t base_S = S;
+    const bool use_mtp =
+        speculative_backend == SpeculativeBackend::Mtp && active_sequence().drafts_ready &&
+        active_sequence().mtp_kv_valid == active_sequence().execution_frontier &&
+        budget.generated_tokens_remaining >= draft_window + 1 &&
+        static_cast<std::uint64_t>(active_sequence().execution_frontier) + 2ULL * draft_window <=
+            capacity;
+    const bool use_dflash =
+        speculative_backend == SpeculativeBackend::DFlash && !active_sequence().ordinary_tail &&
+        (active_sequence().drafts_ready || active_sequence().pending_context_valid) &&
+        budget.generated_tokens_remaining >= draft_window + 1 &&
+        static_cast<std::uint64_t>(active_sequence().execution_frontier) + draft_window + 1ULL <=
+            capacity;
+    const std::uint32_t base_E = active_sequence().execution_frontier;
+    const std::uint32_t base_S = active_sequence().ledger_frontier;
     const nvtx::Name round_name =
         use_dflash ? nvtx::Name::DecodeDFlashRound
                    : (use_mtp ? nvtx::Name::DecodeMtpRound : nvtx::Name::DecodeOrdinaryRound);
@@ -1068,9 +1824,10 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
                    : (use_mtp ? nvtx::Category::Mtp : nvtx::Category::Decode);
     nvtx::ScopedRange round_range(round_name, round_category, base_E);
     try {
-        set_device_i32(io.linear_state_read_slot, current_linear_state_slot);
-        set_device_i32(io.linear_state_snapshot_base_slot,
-                       LinearStateSlots::verify_snapshot_base_slot());
+        set_device_i32(io.linear_state_read_slot, active_sequence().current_linear_state_slot);
+        set_device_i32(
+            io.linear_state_snapshot_base_slot,
+            LinearStateSlots::verify_snapshot_base_slot(active_sequence().linear_state_base));
         schedule::State schedule_state{
             device,
             model,
@@ -1078,16 +1835,23 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
             text_kv_view(),
             mtp_kv_view(),
             dflash_full_kv_view(),
-            dflash ? &*dflash : nullptr,
+            active_sequence().dflash ? &*active_sequence().dflash : nullptr,
             decoder->linear_attention,
             io,
             prefill_hidden,
             prefill_chunk,
             base_E,
-            static_cast<const ops::SamplingConfig*>(sampling_config.data),
+            static_cast<const ops::SamplingConfig*>(
+                sampling_config.slice(1, static_cast<std::int32_t>(active_sequence().lane), 1)
+                    .data),
             proposal_head,
-            &tail_hidden,
-            &boundary_hidden};
+            &active_sequence().tail_hidden,
+            &active_sequence().boundary_hidden,
+            active_sequence().linear_state_base,
+            active_sequence().linear_state_capacity,
+            ordinary_host_ingress,
+            ordinary_host_egress,
+            &tail_hidden_store};
 
         std::uint32_t produced = 1;
         std::uint32_t accepted = 0;
@@ -1132,17 +1896,18 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
                 static_cast<std::uint64_t>(base_E) + produced > capacity) {
                 throw std::runtime_error("MTP round exceeded its budget or context capacity");
             }
-            accepted                  = produced - 1;
-            kind                      = PendingKind::Speculative;
-            text_kv_valid             = base_E + produced;
-            current_linear_state_slot = LinearStateSlots::committed_snapshot_slot(
-                produced, decoder->linear_attention.slot_count());
-            mtp_kv_valid      = base_E + produced;
-            drafts_ready      = true;
-            tail_hidden_valid = true;
+            accepted                                    = produced - 1;
+            kind                                        = PendingKind::Speculative;
+            active_sequence().text_kv_valid             = base_E + produced;
+            active_sequence().current_linear_state_slot = LinearStateSlots::committed_snapshot_slot(
+                produced, active_sequence().linear_state_base,
+                active_sequence().linear_state_capacity);
+            active_sequence().mtp_kv_valid      = base_E + produced;
+            active_sequence().drafts_ready      = true;
+            active_sequence().tail_hidden_valid = true;
         } else if (use_dflash) {
             mark_workspace_usage(workspace_plan.dflash_round);
-            const bool steady                 = pending_context_valid;
+            const bool steady                 = active_sequence().pending_context_valid;
             DecodeGraphExecutable* executable = nullptr;
             auto envelopes                    = dflash_envelopes(base_E, base_E, draft_window);
             ops::GqaExecutionEnvelope target_envelope{base_E + draft_window + 1,
@@ -1188,44 +1953,46 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
                 static_cast<std::uint64_t>(base_E) + produced > capacity) {
                 throw std::runtime_error("DFlash round exceeded its budget or context capacity");
             }
-            accepted                  = produced - 1;
-            kind                      = PendingKind::Speculative;
-            text_kv_valid             = base_E + produced;
-            current_linear_state_slot = LinearStateSlots::committed_snapshot_slot(
-                produced, decoder->linear_attention.slot_count());
-            dflash_context_frontier  = base_E;
-            pending_context_base     = base_E;
-            pending_context_count    = produced;
-            pending_context_valid    = true;
-            dflash_proposal_frontier = 0;
-            dflash_proposal_anchor   = 0;
-            dflash_proposal_epoch    = 0;
-            drafts_ready             = false;
-            tail_hidden_valid        = true;
+            accepted                                    = produced - 1;
+            kind                                        = PendingKind::Speculative;
+            active_sequence().text_kv_valid             = base_E + produced;
+            active_sequence().current_linear_state_slot = LinearStateSlots::committed_snapshot_slot(
+                produced, active_sequence().linear_state_base,
+                active_sequence().linear_state_capacity);
+            active_sequence().dflash_context_frontier  = base_E;
+            active_sequence().pending_context_base     = base_E;
+            active_sequence().pending_context_count    = produced;
+            active_sequence().pending_context_valid    = true;
+            active_sequence().dflash_proposal_frontier = 0;
+            active_sequence().dflash_proposal_anchor   = 0;
+            active_sequence().dflash_proposal_epoch    = 0;
+            active_sequence().drafts_ready             = false;
+            active_sequence().tail_hidden_valid        = true;
         } else {
-            if (dflash && pending_context_valid) {
+            if (active_sequence().dflash && active_sequence().pending_context_valid) {
                 materialize_sequence_kv(base_E, base_E);
                 mark_workspace_usage(workspace_plan.dflash_context);
-                Tensor features = dflash->target_features.slice(
+                Tensor features = active_sequence().dflash->target_features.slice(
                     1, 0, static_cast<std::int32_t>(draft_window + 1));
-                Tensor positions = dflash->feature_positions.slice(
+                Tensor positions = active_sequence().dflash->feature_positions.slice(
                     0, 0, static_cast<std::int32_t>(draft_window + 1));
                 schedule::dflash_append_context(schedule_state, features, positions,
                                                 io.speculative.produced_count,
                                                 {1, draft_window + 1});
-                dflash_context_frontier = base_E;
-                pending_context_base    = 0;
-                pending_context_count   = 0;
-                pending_context_valid   = false;
+                active_sequence().dflash_context_frontier = base_E;
+                active_sequence().pending_context_base    = 0;
+                active_sequence().pending_context_count   = 0;
+                active_sequence().pending_context_valid   = false;
             }
-            const bool align_mtp = decoder->mtp_cache() != nullptr && mtp_kv_valid == base_E;
+            const bool align_mtp =
+                decoder->mtp_cache() != nullptr && active_sequence().mtp_kv_valid == base_E;
             mark_workspace_usage(workspace_plan.ordinary_round);
             DecodeGraphExecutable* executable = nullptr;
             ops::GqaExecutionEnvelope envelope{base_E + 1, base_E + 1};
             if (use_cuda_graph) {
                 DecodeGraphFamily& family   = align_mtp ? ordinary_aligned_graphs : ordinary_graphs;
                 const char* label           = align_mtp ? "ordinary aligned" : "ordinary";
-                DecodeGraphProfile& profile = select_graph_profile(family, base_E, label);
+                DecodeGraphProfile& profile = select_graph_profile(family, 1, base_E, label);
                 executable                  = &install_graph_profile(family, profile, label);
                 envelope = {profile.min_execution_frontier + 1, profile.max_execution_frontier + 1};
             }
@@ -1246,30 +2013,31 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
                                              nvtx::Category::Control, base_E);
                 device.synchronize();
             }
-            text_kv_valid             = base_E + 1;
-            current_linear_state_slot = LinearStateSlots::committed_snapshot_slot(
-                1, decoder->linear_attention.slot_count());
-            if (align_mtp) { mtp_kv_valid = base_E + 1; }
-            if (dflash) {
-                dflash_context_frontier  = base_E + 1;
-                dflash_proposal_frontier = 0;
-                dflash_proposal_anchor   = 0;
-                dflash_proposal_epoch    = 0;
-                ordinary_tail            = true;
+            active_sequence().text_kv_valid             = base_E + 1;
+            active_sequence().current_linear_state_slot = LinearStateSlots::committed_snapshot_slot(
+                1, active_sequence().linear_state_base, active_sequence().linear_state_capacity);
+            if (align_mtp) { active_sequence().mtp_kv_valid = base_E + 1; }
+            if (active_sequence().dflash) {
+                active_sequence().dflash_context_frontier  = base_E + 1;
+                active_sequence().dflash_proposal_frontier = 0;
+                active_sequence().dflash_proposal_anchor   = 0;
+                active_sequence().dflash_proposal_epoch    = 0;
+                active_sequence().ordinary_tail            = true;
             }
-            drafts_ready      = false;
-            tail_hidden_valid = true;
+            active_sequence().drafts_ready      = false;
+            active_sequence().tail_hidden_valid = true;
         }
 
         validate_licensed_tokens(std::span<const TokenId>(host_tokens, produced));
-        ledger.insert(ledger.end(), host_tokens, host_tokens + produced);
-        prefix_identity.append_generated(produced, rope_delta);
-        pending   = PendingCandidate{.kind          = kind,
-                                     .base_E        = base_E,
-                                     .base_S        = base_S,
-                                     .prompt_tokens = 0,
-                                     .produced      = produced};
-        lifecycle = Lifecycle::Pending;
+        active_sequence().ledger.insert(active_sequence().ledger.end(), host_tokens,
+                                        host_tokens + produced);
+        active_sequence().prefix_identity.append_generated(produced, active_sequence().rope_delta);
+        active_request().pending   = PendingCandidate{.kind          = kind,
+                                                      .base_E        = base_E,
+                                                      .base_S        = base_S,
+                                                      .prompt_tokens = 0,
+                                                      .produced      = produced};
+        active_request().lifecycle = Lifecycle::Pending;
         return runtime::GeneratedRound{.tokens = std::span<const TokenId>(host_tokens, produced)};
     } catch (...) {
         try {
@@ -1281,110 +2049,131 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
 }
 
 void ProgramImplCore::resolve_pending(std::uint32_t accepted_tokens, bool terminal) {
-    if (lifecycle != Lifecycle::Pending) {
+    if (active_request().lifecycle != Lifecycle::Pending) {
         throw std::logic_error("resolve_pending requires a pending generated round");
     }
-    if (accepted_tokens == 0 || accepted_tokens > pending.produced) {
+    if (accepted_tokens == 0 || accepted_tokens > active_request().pending.produced) {
         throw std::out_of_range("accepted prefix is outside the pending generated round");
     }
-    if (!terminal && accepted_tokens != pending.produced) {
+    if (!terminal && accepted_tokens != active_request().pending.produced) {
         throw std::logic_error("a continuing round must accept every licensed token");
     }
     if (terminal && speculative_backend == SpeculativeBackend::DFlash &&
-        pending.kind == PendingKind::Speculative) {
+        active_request().pending.kind == PendingKind::Speculative) {
         try {
             flush_dflash_context_prefix(accepted_tokens);
         } catch (...) {
             make_invalid();
             throw;
         }
-        drafts_ready             = false;
-        dflash_proposal_frontier = 0;
-        dflash_proposal_anchor   = 0;
-        dflash_proposal_epoch    = 0;
+        active_sequence().drafts_ready             = false;
+        active_sequence().dflash_proposal_frontier = 0;
+        active_sequence().dflash_proposal_anchor   = 0;
+        active_sequence().dflash_proposal_epoch    = 0;
     }
-    if (terminal && pending.kind == PendingKind::Speculative &&
-        accepted_tokens < pending.produced) {
+    if (terminal && active_request().pending.kind == PendingKind::Speculative &&
+        accepted_tokens < active_request().pending.produced) {
         // The output policy may stop inside a target-licensed speculative batch. Target
         // verification has already materialized KV, hidden, and one GDN snapshot for every returned
         // prefix, so commit the exact externally accepted frontier instead of discarding the
         // resident sequence. The next request lets the active drafter rebuild proposals from this
         // target state.
-        const std::uint32_t committed_E = pending.base_E + accepted_tokens;
-        const std::uint32_t committed_S = pending.base_S + accepted_tokens;
-        if (committed_S > ledger.size() || committed_S > prefix_identity.size()) {
-            throw std::logic_error("partial speculative terminal exceeds the provisional ledger");
+        const std::uint32_t committed_E = active_request().pending.base_E + accepted_tokens;
+        const std::uint32_t committed_S = active_request().pending.base_S + accepted_tokens;
+        if (committed_S > active_sequence().ledger.size() ||
+            committed_S > active_sequence().prefix_identity.size()) {
+            throw std::logic_error(
+                "partial speculative terminal exceeds the provisional sequence ledger");
         }
         copy_tail(io.verify_hidden.slice(1, static_cast<int>(accepted_tokens) - 1, 1));
-        ledger.resize(committed_S);
-        prefix_identity.truncate(committed_S);
-        E                         = committed_E;
-        S                         = committed_S;
-        current_linear_state_slot = LinearStateSlots::committed_snapshot_slot(
-            accepted_tokens, decoder->linear_attention.slot_count());
-        text_kv_valid = committed_E;
-        if (speculative_backend == SpeculativeBackend::Mtp) { mtp_kv_valid = committed_E; }
+        active_sequence().ledger.resize(committed_S);
+        active_sequence().prefix_identity.truncate(committed_S);
+        active_sequence().execution_frontier        = committed_E;
+        active_sequence().ledger_frontier           = committed_S;
+        active_sequence().current_linear_state_slot = LinearStateSlots::committed_snapshot_slot(
+            accepted_tokens, active_sequence().linear_state_base,
+            active_sequence().linear_state_capacity);
+        active_sequence().text_kv_valid = committed_E;
+        if (speculative_backend == SpeculativeBackend::Mtp) {
+            active_sequence().mtp_kv_valid = committed_E;
+        }
         set_device_i32(io.pos, checked_i32(committed_E, "partial speculative frontier"));
-        set_device_i32(io.rope_pos,
-                       checked_i32(committed_E, "partial speculative RoPE frontier") + rope_delta);
+        set_device_i32(io.rope_pos, checked_i32(committed_E, "partial speculative RoPE frontier") +
+                                        active_sequence().rope_delta);
         device.synchronize();
-        trim_sequence_kv(text_kv_valid, backend_kv_valid());
+        trim_sequence_kv(active_sequence().text_kv_valid, backend_kv_valid());
+        release_sequence_growth_entitlement();
         unbind_sequence_kv();
-        drafts_ready = false;
-        lifecycle    = Lifecycle::Resident;
-        pending      = {};
+        active_sequence().drafts_ready = false;
+        active_request().lifecycle     = Lifecycle::Resident;
+        active_request().pending       = {};
         return;
     }
-    if (accepted_tokens != pending.produced) {
+    if (accepted_tokens != active_request().pending.produced) {
         throw std::logic_error("a non-speculative terminal round must accept its only token");
     }
 
-    switch (pending.kind) {
+    switch (active_request().pending.kind) {
     case PendingKind::Begin:
-        E = pending.prompt_tokens;
-        S = pending.prompt_tokens + 1;
+        active_sequence().execution_frontier = active_request().pending.prompt_tokens;
+        active_sequence().ledger_frontier    = active_request().pending.prompt_tokens + 1;
         break;
     case PendingKind::Ordinary:
     case PendingKind::Speculative:
-        E = pending.base_E + pending.produced;
-        S = pending.base_S + pending.produced;
+        active_sequence().execution_frontier =
+            active_request().pending.base_E + active_request().pending.produced;
+        active_sequence().ledger_frontier =
+            active_request().pending.base_S + active_request().pending.produced;
         break;
     case PendingKind::None:
         throw std::logic_error("pending generated round has no candidate");
     }
-    if (S != E + 1 || ledger.size() != S || prefix_identity.size() != S) {
+    if (active_sequence().ledger_frontier != active_sequence().execution_frontier + 1 ||
+        active_sequence().ledger.size() != active_sequence().ledger_frontier ||
+        active_sequence().prefix_identity.size() != active_sequence().ledger_frontier) {
         throw std::logic_error("resolved round did not establish a valid frontier");
     }
-    trim_sequence_kv(text_kv_valid, backend_kv_valid());
-    if (terminal) { unbind_sequence_kv(); }
-    lifecycle = terminal ? Lifecycle::Resident : Lifecycle::Active;
-    pending   = {};
+    trim_sequence_kv(active_sequence().text_kv_valid, backend_kv_valid());
+    if (terminal) {
+        release_sequence_growth_entitlement();
+        unbind_sequence_kv();
+    }
+    active_request().lifecycle = terminal ? Lifecycle::Resident : Lifecycle::Active;
+    active_request().pending   = {};
 }
 
 void ProgramImplCore::finish_active() {
-    if (lifecycle != Lifecycle::Active) {
+    if (active_request().lifecycle != Lifecycle::Active) {
         throw std::logic_error("finish_active requires Active Program state");
     }
-    if (speculative_backend == SpeculativeBackend::DFlash && pending_context_valid) {
+    if (speculative_backend == SpeculativeBackend::DFlash &&
+        active_sequence().pending_context_valid) {
         try {
-            flush_dflash_context_prefix(pending_context_count);
+            flush_dflash_context_prefix(active_sequence().pending_context_count);
         } catch (...) {
             make_invalid();
             throw;
         }
     }
-    trim_sequence_kv(text_kv_valid, backend_kv_valid());
+    trim_sequence_kv(active_sequence().text_kv_valid, backend_kv_valid());
+    release_sequence_growth_entitlement();
     unbind_sequence_kv();
-    lifecycle = Lifecycle::Resident;
+    active_request().lifecycle = Lifecycle::Resident;
 }
 
 void ProgramImplCore::abort_request() noexcept {
-    if (lifecycle == Lifecycle::Empty || lifecycle == Lifecycle::Invalid) { return; }
+    if (active_request().lifecycle == Lifecycle::Empty ||
+        active_request().lifecycle == Lifecycle::Invalid) {
+        return;
+    }
     make_invalid();
 }
 
 std::uint32_t ProgramImplCore::materialized_tokens() const noexcept {
-    return lifecycle == Lifecycle::Active || lifecycle == Lifecycle::Resident ? E : 0;
+    return active_request().lifecycle == Lifecycle::Active ||
+                   active_request().lifecycle == Lifecycle::Resident
+               ? active_sequence().execution_frontier
+               : 0;
 }
 
 MemorySummary ProgramImplCore::memory_summary() const noexcept {

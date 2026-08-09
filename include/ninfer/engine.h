@@ -2,6 +2,7 @@
 
 #include "ninfer/types.h"
 
+#include <chrono>
 #include <memory>
 
 namespace ninfer {
@@ -28,6 +29,29 @@ private:
     friend class Engine;
 };
 
+class GenerationHandle {
+public:
+    GenerationHandle() noexcept;
+    ~GenerationHandle();
+
+    GenerationHandle(GenerationHandle&&) noexcept;
+    GenerationHandle& operator=(GenerationHandle&&) noexcept;
+
+    GenerationHandle(const GenerationHandle&)            = delete;
+    GenerationHandle& operator=(const GenerationHandle&) = delete;
+
+    [[nodiscard]] explicit operator bool() const noexcept;
+
+    GenerationResult wait(OutputSink* sink = nullptr, const CancellationView& cancellation = {});
+
+private:
+    class Impl;
+    explicit GenerationHandle(std::unique_ptr<Impl> impl) noexcept;
+    std::unique_ptr<Impl> impl_;
+
+    friend class Engine;
+};
+
 class Engine {
 public:
     explicit Engine(EngineOptions options);
@@ -47,6 +71,12 @@ public:
 
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input) const;
 
+    // Establishes queue membership synchronously. Destroying an unconsumed handle cancels its
+    // request; wait() owns result consumption and may run independently from GPU execution.
+    [[nodiscard]] GenerationHandle
+    submit(PreparedPrompt prompt, RequestOptions options,
+           std::chrono::steady_clock::time_point pending_deadline = {});
+
     GenerationResult generate(PreparedPrompt prompt, RequestOptions options,
                               OutputSink* sink                     = nullptr,
                               const CancellationView& cancellation = {});
@@ -58,7 +88,7 @@ public:
 
 private:
     class Impl;
-    std::unique_ptr<Impl> impl_;
+    std::shared_ptr<Impl> impl_;
 };
 
 } // namespace ninfer

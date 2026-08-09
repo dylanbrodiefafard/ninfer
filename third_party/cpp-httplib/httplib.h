@@ -633,6 +633,7 @@ struct Request {
   ResponseHandler response_handler;
   ContentReceiverWithProgress content_receiver;
   Progress progress;
+  std::function<bool()> is_connection_alive;
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
   const SSL *ssl = nullptr;
 #endif
@@ -683,6 +684,9 @@ struct Response {
   void set_content(const char *s, size_t n, const std::string &content_type);
   void set_content(const std::string &s, const std::string &content_type);
   void set_content(std::string &&s, const std::string &content_type);
+  void hold_resource(std::shared_ptr<void> resource) {
+    resource_guard_ = std::move(resource);
+  }
 
   void set_content_provider(
       size_t length, const std::string &content_type, ContentProvider provider,
@@ -719,6 +723,7 @@ struct Response {
   bool content_provider_success_ = false;
   std::string file_content_path_;
   std::string file_content_content_type_;
+  std::shared_ptr<void> resource_guard_;
 };
 
 class Stream {
@@ -7112,6 +7117,10 @@ Server::process_request(Stream &strm, const std::string &remote_addr,
   }
 
   if (setup_request) { setup_request(req); }
+
+  const auto request_socket = strm.socket();
+  req.is_connection_alive =
+      [request_socket] { return detail::is_socket_alive(request_socket); };
 
   if (req.get_header_value("Expect") == "100-continue") {
     int status = StatusCode::Continue_100;

@@ -215,7 +215,7 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     context.tool_choice                        = request.tool_choice;
     context.has_tool_history                   = request.has_tool_history();
     context.enable_thinking                    = prepared.enable_thinking;
-    context.sampling                           = prepared.options.execution.sampling;
+    context.sampling                           = prepared.sampling;
     return context;
 }
 
@@ -236,8 +236,7 @@ std::string format_request_start(const RequestLogContext& context) {
 std::string format_request_done(const RequestLogContext& context,
                                 const GenerationOutcome& outcome) {
     const GenerationMetrics& metrics = outcome.metrics;
-    const double ttft_ms =
-        (metrics.prepare_seconds + metrics.vision_seconds + metrics.prefill_seconds) * 1000.0;
+    const double ttft_ms             = metrics.ttft_seconds * 1000.0;
     // Prefill emits the first token; the remaining (gen - 1) come from decode.
     const double decode_tokens =
         outcome.completion_tokens > 0 ? static_cast<double>(outcome.completion_tokens - 1) : 0.0;
@@ -297,6 +296,9 @@ std::string format_server_start_json(const std::string& server_instance_id, std:
     record["engine"]   = Json{
           {"device", options.device},
           {"max_context", options.max_context},
+          {"max_concurrency", options.max_concurrency},
+          {"max_pending_requests", options.max_pending_requests},
+          {"pending_timeout_ms", options.pending_timeout_ms},
           {"prefill_chunk", options.prefill_chunk},
           {"kv_cache", kv_cache_name(options.kv_cache)},
           {"vision", options.enable_vision},

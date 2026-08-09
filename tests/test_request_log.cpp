@@ -126,14 +126,14 @@ int main() {
     request.messages.resize(2);
 
     PreparedRequest prepared;
-    prepared.enable_thinking                              = false;
-    prepared.options.execution.sampling.temperature       = 0.6F;
-    prepared.options.execution.sampling.top_p             = 0.95F;
-    prepared.options.execution.sampling.top_k             = 20;
-    prepared.options.execution.sampling.min_p             = 0.0F;
-    prepared.options.execution.sampling.presence_penalty  = 1.0F;
-    prepared.options.execution.sampling.frequency_penalty = 0.0F;
-    prepared.options.execution.sampling.seed              = 7632647173703958409ULL;
+    prepared.enable_thinking            = false;
+    prepared.sampling.temperature       = 0.6F;
+    prepared.sampling.top_p             = 0.95F;
+    prepared.sampling.top_k             = 20;
+    prepared.sampling.min_p             = 0.0F;
+    prepared.sampling.presence_penalty  = 1.0F;
+    prepared.sampling.frequency_penalty = 0.0F;
+    prepared.sampling.seed              = 7632647173703958409ULL;
 
     const RequestLogContext context =
         make_request_log_context(7, "openai_chat_completions", request, prepared);
