@@ -128,6 +128,8 @@ std::size_t PagedKVPool::plane_count() const noexcept { return planes_.size(); }
 
 const Tensor& PagedKVPool::plane(std::size_t index) const { return planes_.at(index); }
 
+const Tensor& PagedKVPool::block_tables() const noexcept { return block_tables_; }
+
 Tensor PagedKVPool::block_table_row(std::int32_t row) const {
     if (row < 0 || row >= table_row_count()) {
         throw std::out_of_range("Paged KV block-table row out of range");

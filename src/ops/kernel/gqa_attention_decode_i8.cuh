@@ -55,12 +55,14 @@ __device__ __forceinline__ void gqa_small_t_i8_store_swz(std::int8_t* tile, int 
 // dequantize V while producers execute QK. After both consume the code tile, the
 // next K/V tile is prefetched into the same arena while the current PV runs.
 template <typename Geometry, int TokenTile, int WarpsPerCta, int MinBlocksPerSm, int KeyBlock,
-          bool DynamicArena, typename CacheInput>
+          bool DynamicArena, bool MultiBatch, bool Masked, typename CacheInput>
 __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     void gqa_attention_decode_i8_tiled_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::int8_t* cache_k_i8,
         std::int8_t* cache_v_i8, __half* cache_k_scale, __half* cache_v_scale,
-        const std::int32_t* block_table, std::int32_t logical_capacity, float scale,
+        const std::int32_t* block_tables, const std::int32_t* valid_columns,
+        const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
+        std::int32_t column_begin, std::int32_t logical_capacity, float scale,
         __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
@@ -114,10 +116,34 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 
     const int kv_head     = static_cast<int>(blockIdx.x);
     const int split       = static_cast<int>(blockIdx.y);
+    const int batch       = MultiBatch ? static_cast<int>(blockIdx.z) : 0;
     const int split_count = static_cast<int>(gridDim.y);
     const int tid         = static_cast<int>(threadIdx.x);
     const int warp        = tid >> 5;
     const int lane        = tid & 31;
+
+    int valid_tokens = TokenTile;
+    if constexpr (Masked) {
+        const int remaining = valid_columns[batch] - column_begin;
+        valid_tokens        = remaining <= 0 ? 0 : (remaining < TokenTile ? remaining : TokenTile);
+    }
+    std::int64_t column_base = column_begin;
+    if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
+    q += static_cast<std::int64_t>(kGqaHeadDim) * Geometry::QHeads * column_base;
+    pos += column_base;
+    if constexpr (CacheInput::writes_cache) {
+        input.k += static_cast<std::int64_t>(kGqaHeadDim) * Geometry::KVHeads * column_base;
+        input.v += static_cast<std::int64_t>(kGqaHeadDim) * Geometry::KVHeads * column_base;
+    }
+    const int table_row = table_rows == nullptr ? 0 : table_rows[batch];
+    const std::int32_t* block_table =
+        block_tables + static_cast<std::int64_t>(table_row) * table_stride;
+    if constexpr (MultiBatch) {
+        partial_acc += static_cast<std::int64_t>(batch) * kGqaHeadDim * Geometry::QHeads *
+                       TokenTile * split_count;
+        partial_m += static_cast<std::int64_t>(batch) * Geometry::QHeads * TokenTile * split_count;
+        partial_l += static_cast<std::int64_t>(batch) * Geometry::QHeads * TokenTile * split_count;
+    }
 
     auto write_neutral = [&]() {
         for (int row = tid; row < RowCount; row += Threads) {
@@ -144,6 +170,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     };
 
     if (kv_head < 0 || kv_head >= Geometry::KVHeads || split_count <= 0) { return; }
+    if (valid_tokens == 0) {
+        write_neutral();
+        return;
+    }
 
     const std::int32_t first_pos = pos[0];
     const std::int32_t last_pos  = pos[TokenTile - 1];
@@ -178,7 +208,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 
     if constexpr (CacheInput::writes_cache) {
         // The owning split quantizes each current row before its cache tile is consumed.
-        for (int pair = warp; pair < TokenTile * Groups; pair += Wc) {
+        for (int pair = warp; pair < valid_tokens * Groups; pair += Wc) {
             const int token    = pair / Groups;
             const int grp      = pair - token * Groups;
             const int position = pos[token];

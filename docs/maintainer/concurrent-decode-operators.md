@@ -192,6 +192,12 @@ Persistent pool planes 和完整 block-table matrix 只传入一次；Op 使用 
 single-sequence view 或 device-pointer array，不得 gather KV 到连续临时缓存，也不得在 wrapper
 中循环调用 single-sequence Attention。
 
+`valid_columns` 是可选的 typed execution metadata：省略表示所有 rows 的 `W` columns 都有效，提供
+`I32[B]` 才启用逐行 valid-prefix masking。这个 dense/masked 选择属于 call/graph topology，不通过 host
+回读 device value 推断。Masked row 的 invalid position slots 重复该行最后一个 valid position；空行填 0。
+因此 ordinary `W=1` batch 使用 dense path，而异长 speculative target batch 仍在同一次 batched Op 中保持
+cache no-write 与 exact-zero output 语义。
+
 第一版不迁移：
 
 - `gqa_kv_append`；

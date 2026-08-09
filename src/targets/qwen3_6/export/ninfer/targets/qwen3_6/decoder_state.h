@@ -47,6 +47,7 @@ public:
 
     [[nodiscard]] std::uint32_t max_context() const noexcept;
     [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer) const;
+    [[nodiscard]] PagedKVBatchLayerView batch_layer_view(std::uint32_t layer) const;
 
 private:
     friend class PagedKVCache;
@@ -78,6 +79,7 @@ public:
 private:
     friend class PagedKVCacheView;
     [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, Tensor block_table) const;
+    [[nodiscard]] PagedKVBatchLayerView batch_layer_view(std::uint32_t layer) const;
 
     PagedKVPool pool_;
     std::uint32_t layers_      = 0;

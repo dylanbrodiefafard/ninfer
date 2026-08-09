@@ -82,6 +82,11 @@ PagedKVLayerView PagedKVCacheView::layer_view(std::uint32_t layer) const {
     return cache_->layer_view(layer, block_table_);
 }
 
+PagedKVBatchLayerView PagedKVCacheView::batch_layer_view(std::uint32_t layer) const {
+    if (cache_ == nullptr) { throw std::logic_error("Paged KV execution view is empty"); }
+    return cache_->batch_layer_view(layer);
+}
+
 PagedKVCacheView PagedKVCache::execution_view(const PagedKVAllocation& allocation) const {
     if (!allocation.belongs_to(pool_)) {
         throw std::invalid_argument("Paged KV allocation belongs to another cache pool");
@@ -100,6 +105,24 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
         .k_scale_pages = quantized ? pool_.plane(base + 2) : Tensor(),
         .v_scale_pages = quantized ? pool_.plane(base + 3) : Tensor(),
         .block_table   = block_table,
+        .head_dim      = head_dim_,
+        .num_kv_heads  = kv_heads_,
+        .dtype         = dtype_,
+        .quant_group   = quant_group_,
+    };
+}
+
+PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const {
+    if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
+    const bool quantized     = dtype_ == DType::I8;
+    const std::size_t stride = quantized ? 4ULL : 2ULL;
+    const std::size_t base   = static_cast<std::size_t>(layer) * stride;
+    return PagedKVBatchLayerView{
+        .k_pages       = pool_.plane(base),
+        .v_pages       = pool_.plane(base + 1),
+        .k_scale_pages = quantized ? pool_.plane(base + 2) : Tensor(),
+        .v_scale_pages = quantized ? pool_.plane(base + 3) : Tensor(),
+        .block_tables  = pool_.block_tables(),
         .head_dim      = head_dim_,
         .num_kv_heads  = kv_heads_,
         .dtype         = dtype_,

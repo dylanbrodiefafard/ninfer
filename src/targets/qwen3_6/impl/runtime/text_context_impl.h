@@ -336,8 +336,8 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     ops::rope(rope_positions, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
-    ops::gqa_attention(qn, kn, v, positions, kAttnScale, mtp_kv_.layer_view(0), envelope, work_, a,
-                       s);
+    ops::gqa_attention(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row, kAttnScale,
+                       mtp_kv_.batch_layer_view(0), envelope, work_, a, s);
     ops::sigmoid_mul(gate, a, s);
 
     const auto post = workspace_recipe::mtp_post_attention<TextConfig>(work_, T);
@@ -670,8 +670,8 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     ops::rope(rope_positions, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
-    ops::gqa_attention(qn, kn, v, cache_positions, kAttnScale, kv_.layer_view(fidx),
-                       *active_gqa_envelope_, work_, a, s);
+    ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, io_.text_kv_table_row, kAttnScale,
+                       kv_.batch_layer_view(fidx), *active_gqa_envelope_, work_, a, s);
     ops::sigmoid_mul(gate, a, s);
 
     Variant::attention_output_projection(a.view({kCfg.q_size, T}), *w.o_proj, x, ph, work_, s);

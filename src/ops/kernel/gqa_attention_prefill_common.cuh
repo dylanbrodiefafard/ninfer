@@ -25,11 +25,52 @@ inline constexpr int kGqaPrefillSmemBytes = (kGqaPrefillBr + 2 * kGqaPrefillBc) 
                                             kGqaPrefillHeadDim *
                                             static_cast<int>(sizeof(__nv_bfloat16));
 
+struct GqaPrefillDirectMetadata {
+    const std::int32_t* table;
+
+    __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const { return width; }
+
+    __device__ __forceinline__ const std::int32_t* block_table() const { return table; }
+};
+
+template <bool Masked>
+struct GqaPrefillBatchMetadata {
+    const std::int32_t* tables;
+    const std::int32_t* valid_columns;
+    const std::int32_t* table_rows;
+    std::int32_t table_stride;
+
+    __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const {
+        if constexpr (Masked) {
+            const std::int32_t valid = valid_columns[0];
+            return valid <= 0 ? 0 : (valid < width ? valid : width);
+        }
+        return width;
+    }
+
+    __device__ __forceinline__ const std::int32_t* block_table() const {
+        return tables + static_cast<std::int64_t>(table_rows[0]) * table_stride;
+    }
+};
+
 template <typename Geometry>
 __device__ __forceinline__ std::int64_t gqa_prefill_q_index(int q_head, int d, int token) {
     return static_cast<std::int64_t>(d) + static_cast<std::int64_t>(kGqaPrefillHeadDim) *
                                               (static_cast<std::int64_t>(q_head) +
                                                static_cast<std::int64_t>(Geometry::QHeads) * token);
+}
+
+template <typename Geometry>
+__device__ __forceinline__ void gqa_prefill_zero_output_rows(__nv_bfloat16* out, int q_head,
+                                                             int row_begin, int row_end, int tid,
+                                                             int threads) {
+    if (row_begin >= row_end) { return; }
+    const int elements = (row_end - row_begin) * kGqaPrefillHeadDim;
+    for (int element = tid; element < elements; element += threads) {
+        const int row = row_begin + element / kGqaPrefillHeadDim;
+        const int d   = element - (row - row_begin) * kGqaPrefillHeadDim;
+        out[gqa_prefill_q_index<Geometry>(q_head, d, row)] = __float2bfloat16(0.0f);
+    }
 }
 
 // XOR-swizzled b16 element address. INT8 operands use the same layout by packing

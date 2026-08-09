@@ -48,6 +48,8 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
     layout.logits = add_tensor(builder, DType::BF16, {spec.output_rows, columns}, "step logits");
     layout.verify_hidden =
         add_tensor(builder, DType::BF16, {spec.hidden, columns}, "step verify hidden");
+    layout.text_kv_table_row    = add_tensor(builder, DType::I32, {1}, "step Text KV table row");
+    layout.backend_kv_table_row = add_tensor(builder, DType::I32, {1}, "step backend KV table row");
     return layout;
 }
 
@@ -107,6 +109,8 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     rope_delta                      = layout.rope_delta.bind(backing);
     logits                          = layout.logits.bind(backing);
     verify_hidden                   = layout.verify_hidden.bind(backing);
+    text_kv_table_row               = layout.text_kv_table_row.bind(backing);
+    backend_kv_table_row            = layout.backend_kv_table_row.bind(backing);
     linear_state_read_slot          = layout.linear_state_read_slot.bind(backing);
     linear_state_snapshot_base_slot = layout.linear_state_snapshot_base_slot.bind(backing);
     speculative                     = SpeculativeRoundState(backing, layout.speculative);

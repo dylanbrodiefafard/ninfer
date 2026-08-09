@@ -219,6 +219,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     tail_hidden     = plan.persistent.tail_hidden.bind(backing);
     boundary_hidden = plan.persistent.boundary_hidden.bind(backing);
 
+    set_device_i32(io.text_kv_table_row, 0);
+    set_device_i32(io.backend_kv_table_row, 0);
+
     host_count  = static_cast<std::int32_t*>(round_host.data());
     host_tokens = reinterpret_cast<TokenId*>(host_count + 1);
     ledger.reserve(static_cast<std::size_t>(capacity) + 1ULL);
@@ -330,7 +333,13 @@ void ProgramImplCore::bind_sequence_kv() {
     sequence_kv->text.bind_row(0, device.stream);
     try {
         if (sequence_kv->backend) { sequence_kv->backend->bind_row(0, device.stream); }
+        set_device_i32(io.text_kv_table_row, sequence_kv->text.bound_row());
+        set_device_i32(io.backend_kv_table_row,
+                       sequence_kv->backend ? sequence_kv->backend->bound_row() : 0);
     } catch (...) {
+        if (sequence_kv->backend && sequence_kv->backend->bound_row() >= 0) {
+            sequence_kv->backend->unbind_row();
+        }
         sequence_kv->text.unbind_row();
         throw;
     }

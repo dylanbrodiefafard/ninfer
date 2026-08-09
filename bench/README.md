@@ -231,11 +231,23 @@ append-and-attend and cached-only. It covers the registered D256 H24/KV4 and H16
 with BF16 and INT8-G64 KV storage. Production dispatch receives the caller-visible execution
 envelope and owns all decode, prompt, Small-T, and split-KV choices.
 
+Append-and-attend accepts `--batch 1,2,4,8`; each ordinary `--context L` point gives every row the
+same context and all `W` columns are valid. One exact mixed profile uses `--row-contexts`,
+`--valid-columns`, and `--table-rows`, each with exactly `B` entries. Cached-only remains B=1.
+The timed call consumes the whole batch once; metadata copies and graph capture remain outside the
+interval. Uniform full-width profiles use the dense public contract; exact partial profiles use
+device-resident valid extents. Reported useful bytes/FLOPs sum only valid row work.
+
 ```bash
 cmake --build build --parallel --target ninfer_causal_softmax_attention_bench
 ./build/bench/ninfer_causal_softmax_attention_bench \
-  --entry both --geometry all --kv-dtype all \
+  --entry both --geometry all --kv-dtype all --batch 1 \
   --tokens 1,2,4,6,8,12,16 --context 0,128,2048,8192 \
+  --execution graph --cache cold --warmup 10 --repeat 61
+./build/bench/ninfer_causal_softmax_attention_bench \
+  --entry append --geometry d256-h16-kv2 --kv-dtype int8 \
+  --batch 3 --tokens 6 --row-contexts 127,2047,63 \
+  --valid-columns 6,3,0 --table-rows 2,0,1 \
   --execution graph --cache cold --warmup 10 --repeat 61
 ./build/bench/ninfer_causal_softmax_attention_bench \
   --entry cached --geometry d256-h16-kv2 --kv-dtype int8 \
@@ -514,12 +526,14 @@ individual routes are suitable for Nsight Compute capture:
 
 ## 35B dFlash causal Attention qualification
 
-The public causal benchmark covers exact verify widths `T=1..16`, both KV codecs, and the
-append-and-attend and already-cached entries for the D256 H16/KV2 geometry:
+The public causal benchmark covers exact verify widths `W=1..16`, both KV codecs, and the
+append-and-attend and already-cached entries for the D256 H16/KV2 geometry. Batched target
+qualification uses the append entry:
 
 ```bash
 ./build/bench/ninfer_causal_softmax_attention_bench \
   --entry append --geometry d256-h16-kv2 --kv-dtype bf16 \
+  --batch 1,2,4,8 \
   --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
   --context 128,1024,8192 --execution graph --cache cold
 ./build/bench/ninfer_causal_softmax_attention_bench \

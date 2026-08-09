@@ -32,6 +32,25 @@ struct PagedKVLayerView {
     std::int32_t quant_group  = 0;
 };
 
+/**
+ * Non-owning multi-sequence view consumed by batched growing-cache Ops.
+ *
+ * Physical planes and the complete block-table matrix are shared by every logical row in one
+ * invocation. block_tables is contiguous I32 [logical_pages, table_rows]; the consuming Op
+ * receives its per-row table selectors separately.
+ */
+struct PagedKVBatchLayerView {
+    Tensor k_pages;
+    Tensor v_pages;
+    Tensor k_scale_pages;
+    Tensor v_scale_pages;
+    Tensor block_tables;
+    std::int32_t head_dim     = 0;
+    std::int32_t num_kv_heads = 0;
+    DType dtype               = DType::BF16;
+    std::int32_t quant_group  = 0;
+};
+
 // A pool plane is storage-only. Consumers assign K/V/layer meaning to plane indices.
 struct PagedKVPlaneSpec {
     DType dtype                 = DType::BF16;
@@ -87,6 +106,7 @@ public:
     [[nodiscard]] std::int32_t table_row_count() const noexcept;
     [[nodiscard]] std::size_t plane_count() const noexcept;
     [[nodiscard]] const Tensor& plane(std::size_t index) const;
+    [[nodiscard]] const Tensor& block_tables() const noexcept;
     [[nodiscard]] Tensor block_table_row(std::int32_t row) const;
 
     [[nodiscard]] std::uint32_t entitled_pages() const noexcept;

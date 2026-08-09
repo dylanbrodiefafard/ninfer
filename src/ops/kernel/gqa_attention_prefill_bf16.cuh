@@ -21,25 +21,27 @@
 
 namespace ninfer::ops {
 
-template <typename Geometry>
+template <typename Geometry, typename Metadata>
 __global__ void gqa_attention_prefill_fill_bf16_kernel(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
-    const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ block_table,
-    __nv_bfloat16* __restrict__ cache_k, __nv_bfloat16* __restrict__ cache_v, std::int32_t tokens) {
+    const std::int32_t* __restrict__ positions, Metadata metadata,
+    __nv_bfloat16* __restrict__ cache_k, __nv_bfloat16* __restrict__ cache_v, std::int32_t width) {
     constexpr int VecElems = 8; // 8 bf16 == 16 B, matching the cache row alignment.
+    const int tokens       = metadata.valid_tokens(width);
     const std::int64_t idx = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::int64_t n =
         static_cast<std::int64_t>(tokens) * Geometry::KVHeads * (kGqaPrefillHeadDim / VecElems);
     if (idx >= n) { return; }
 
-    const int vec      = static_cast<int>(idx % (kGqaPrefillHeadDim / VecElems));
-    const int tmp      = static_cast<int>(idx / (kGqaPrefillHeadDim / VecElems));
-    const int kv_head  = tmp % Geometry::KVHeads;
-    const int token    = tmp / Geometry::KVHeads;
-    const int d        = vec * VecElems;
-    const int position = positions[0] + token;
-    const int lane     = static_cast<int>(threadIdx.x) & 31;
-    int physical_page  = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
+    const int vec                   = static_cast<int>(idx % (kGqaPrefillHeadDim / VecElems));
+    const int tmp                   = static_cast<int>(idx / (kGqaPrefillHeadDim / VecElems));
+    const int kv_head               = tmp % Geometry::KVHeads;
+    const int token                 = tmp / Geometry::KVHeads;
+    const int d                     = vec * VecElems;
+    const int position              = positions[0] + token;
+    const int lane                  = static_cast<int>(threadIdx.x) & 31;
+    const std::int32_t* block_table = metadata.block_table();
+    int physical_page               = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
     const std::int64_t src_off =
         static_cast<std::int64_t>(d) +
         static_cast<std::int64_t>(kGqaPrefillHeadDim) * (kv_head + Geometry::KVHeads * token);
@@ -97,14 +99,14 @@ __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const _
 // FlashAttention-2 forward, one CTA per (query 64-row block, query head). Grid is
 // (ceil(tokens/64), q_heads). seqlen_q = tokens, seqlen_k = base_pos + tokens, with
 // bottom-right causal alignment (query row i sees keys [0, base_pos + i]).
-template <typename Geometry>
+template <typename Geometry, typename Metadata>
 __launch_bounds__(kGqaPrefillThreads, 1) __global__
     void gqa_attention_prefill_bf16_kernel(const __nv_bfloat16* __restrict__ q,
                                            const __nv_bfloat16* __restrict__ cache_k,
                                            const __nv_bfloat16* __restrict__ cache_v,
-                                           const std::int32_t* __restrict__ block_table,
+                                           Metadata metadata,
                                            const std::int32_t* __restrict__ positions, float scale,
-                                           __nv_bfloat16* __restrict__ out, std::int32_t tokens) {
+                                           __nv_bfloat16* __restrict__ out, std::int32_t width) {
     constexpr int D             = kGqaPrefillHeadDim; // 256
     constexpr int Br            = kGqaPrefillBr;      // 64 query rows
     constexpr int Bc            = kGqaPrefillBc;      // 64 key cols
@@ -123,16 +125,22 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     __nv_bfloat16* k_s = q_s + Br * D; // [Bc, D] swizzled
     __nv_bfloat16* v_s = k_s + Bc * D; // [Bc, D] swizzled
 
-    const int q_block  = static_cast<int>(blockIdx.x);
-    const int q_head   = static_cast<int>(blockIdx.y);
-    const int tid      = static_cast<int>(threadIdx.x);
-    const int warp     = tid >> 5;
-    const int lane     = tid & 31;
-    const int q0       = q_block * Br;
-    const int kv_head  = q_head / Geometry::GroupSize;
-    const int base_pos = positions[0];
+    const int q_block = static_cast<int>(blockIdx.x);
+    const int q_head  = static_cast<int>(blockIdx.y);
+    const int tid     = static_cast<int>(threadIdx.x);
+    const int warp    = tid >> 5;
+    const int lane    = tid & 31;
+    const int q0      = q_block * Br;
+    const int kv_head = q_head / Geometry::GroupSize;
+    const int tokens  = metadata.valid_tokens(width);
 
-    if (q_head >= Geometry::QHeads || q0 >= tokens) { return; }
+    if (q_head >= Geometry::QHeads || q0 >= width) { return; }
+    if (q0 >= tokens) {
+        gqa_prefill_zero_output_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid, Threads);
+        return;
+    }
+    const int base_pos              = positions[0];
+    const std::int32_t* block_table = metadata.block_table();
 
     const int gid = lane >> 2;
     const int lid = lane & 3;
@@ -440,6 +448,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
                 pack_bf16x2(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
         }
     }
+    gqa_prefill_zero_output_rows<Geometry>(out, q_head, tokens, min(q0 + Br, width), tid, Threads);
 }
 
 } // namespace ninfer::ops

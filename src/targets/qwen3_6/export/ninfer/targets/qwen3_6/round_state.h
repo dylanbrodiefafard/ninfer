@@ -40,6 +40,8 @@ struct RoundStateLayout {
     TensorRegion rope_delta;
     TensorRegion logits;
     TensorRegion verify_hidden;
+    TensorRegion text_kv_table_row;
+    TensorRegion backend_kv_table_row;
     TensorRegion linear_state_read_slot;
     TensorRegion linear_state_snapshot_base_slot;
     SpeculativeRoundStateLayout speculative;
@@ -84,6 +86,8 @@ struct RoundState {
     Tensor rope_delta;
     Tensor logits;
     Tensor verify_hidden;
+    Tensor text_kv_table_row;
+    Tensor backend_kv_table_row;
     Tensor linear_state_read_slot;
     Tensor linear_state_snapshot_base_slot;
     SpeculativeRoundState speculative;

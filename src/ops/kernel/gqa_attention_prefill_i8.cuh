@@ -79,29 +79,34 @@ __device__ __forceinline__ int4 gqa_prefill_i8_dequant_f16x8(const std::int8_t* 
 
 // Eight independent quantization units per CTA; one warp owns one
 // (token, kv_head, 64-d group), with two dimensions per lane.
-template <typename Geometry>
-__launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_kernel(
-    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
-    const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ block_table,
-    std::int8_t* __restrict__ cache_k, std::int8_t* __restrict__ cache_v,
-    __half* __restrict__ scale_k, __half* __restrict__ scale_v, std::int32_t tokens) {
+template <typename Geometry, typename Metadata>
+__launch_bounds__(256) __global__
+    void gqa_attention_prefill_fill_i8_kernel(const __nv_bfloat16* __restrict__ k,
+                                              const __nv_bfloat16* __restrict__ v,
+                                              const std::int32_t* __restrict__ positions,
+                                              Metadata metadata, std::int8_t* __restrict__ cache_k,
+                                              std::int8_t* __restrict__ cache_v,
+                                              __half* __restrict__ scale_k,
+                                              __half* __restrict__ scale_v, std::int32_t width) {
     constexpr int Warps         = 8;
     constexpr unsigned FullMask = 0xffffffffu;
+    const int tokens            = metadata.valid_tokens(width);
     const int warp              = static_cast<int>(threadIdx.x) >> 5;
     const int lane              = static_cast<int>(threadIdx.x) & 31;
     const int unit              = static_cast<int>(blockIdx.x) * Warps + warp;
     const int units             = tokens * Geometry::KVHeads * kGqaPrefillI8Groups;
     if (unit >= units) { return; }
 
-    const int group    = unit % kGqaPrefillI8Groups;
-    const int tmp      = unit / kGqaPrefillI8Groups;
-    const int kv_head  = tmp % Geometry::KVHeads;
-    const int token    = tmp / Geometry::KVHeads;
-    const int position = positions[0] + token;
-    int page           = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
-    const int page_off = position & kPagedKVPageMask;
-    const int d0       = group * kGqaKvQuantGroup + lane;
-    const int d1       = d0 + 32;
+    const int group                 = unit % kGqaPrefillI8Groups;
+    const int tmp                   = unit / kGqaPrefillI8Groups;
+    const int kv_head               = tmp % Geometry::KVHeads;
+    const int token                 = tmp / Geometry::KVHeads;
+    const int position              = positions[0] + token;
+    const std::int32_t* block_table = metadata.block_table();
+    int page                        = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
+    const int page_off              = position & kPagedKVPageMask;
+    const int d0                    = group * kGqaKvQuantGroup + lane;
+    const int d1                    = d0 + 32;
 
     const std::int64_t src0 = gqa_kv_quant_src_index<Geometry>(kv_head, d0, token);
     const std::int64_t src1 = gqa_kv_quant_src_index<Geometry>(kv_head, d1, token);
@@ -139,14 +144,15 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_kernel(
 
 // Large appends are scheduled in absolute eight-token tiles. Eight divides P=64, so each CTA is
 // page-local while an unknown base offset costs at most one empty tail CTA in the launch envelope.
-template <typename Geometry>
+template <typename Geometry, typename Metadata>
 __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
-    const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ block_table,
+    const std::int32_t* __restrict__ positions, Metadata metadata,
     std::int8_t* __restrict__ cache_k, std::int8_t* __restrict__ cache_v,
-    __half* __restrict__ scale_k, __half* __restrict__ scale_v, std::int32_t tokens) {
+    __half* __restrict__ scale_k, __half* __restrict__ scale_v, std::int32_t width) {
     constexpr int TokensPerTile = 8;
     constexpr unsigned FullMask = 0xffffffffu;
+    const int tokens            = metadata.valid_tokens(width);
     const int warp              = static_cast<int>(threadIdx.x) >> 5;
     const int lane              = static_cast<int>(threadIdx.x) & 31;
     const int kv_head           = static_cast<int>(blockIdx.y);
@@ -159,7 +165,8 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel
     const int token_end         = min(tokens, tile_position + TokensPerTile - base_position);
     if (token_begin >= token_end) { return; }
 
-    int physical_page = lane == 0 ? block_table[logical_page] : 0;
+    const std::int32_t* block_table = metadata.block_table();
+    int physical_page               = lane == 0 ? block_table[logical_page] : 0;
 
     const int token  = token_begin + warp;
     const bool valid = token < token_end;
@@ -204,13 +211,13 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel
     }
 }
 
-template <typename Geometry>
+template <typename Geometry, typename Metadata>
 __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     const __nv_bfloat16* __restrict__ q, const std::int8_t* __restrict__ cache_k,
     const std::int8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
-    const __half* __restrict__ cache_v_scale, const std::int32_t* __restrict__ block_table,
+    const __half* __restrict__ cache_v_scale, Metadata metadata,
     const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
-    std::int32_t tokens) {
+    std::int32_t width) {
     constexpr int D             = kGqaPrefillHeadDim;
     constexpr int Br            = kGqaPrefillI8Br;
     constexpr int Bc            = kGqaPrefillI8Bc;
@@ -246,15 +253,22 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     __nv_bfloat16* q_b16 = reinterpret_cast<__nv_bfloat16*>(q_i8);
     __nv_bfloat16* k_b16 = reinterpret_cast<__nv_bfloat16*>(k_i8);
 
-    const int q_block  = static_cast<int>(blockIdx.x);
-    const int q_head   = static_cast<int>(blockIdx.y);
-    const int tid      = static_cast<int>(threadIdx.x);
-    const int warp     = tid >> 5;
-    const int lane     = tid & 31;
-    const int q0       = q_block * Br;
-    const int kv_head  = q_head / Geometry::GroupSize;
-    const int base_pos = positions[0];
-    if (q_head >= Geometry::QHeads || q0 >= tokens) { return; }
+    const int q_block = static_cast<int>(blockIdx.x);
+    const int q_head  = static_cast<int>(blockIdx.y);
+    const int tid     = static_cast<int>(threadIdx.x);
+    const int warp    = tid >> 5;
+    const int lane    = tid & 31;
+    const int q0      = q_block * Br;
+    const int kv_head = q_head / Geometry::GroupSize;
+    const int tokens  = metadata.valid_tokens(width);
+    if (q_head >= Geometry::QHeads || q0 >= width) { return; }
+    if (q0 >= tokens) {
+        gqa_prefill_zero_output_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid,
+                                               kGqaPrefillI8Threads);
+        return;
+    }
+    const int base_pos              = positions[0];
+    const std::int32_t* block_table = metadata.block_table();
 
     const int tile_rows     = min(Br, tokens - q0);
     const int max_query_abs = base_pos + q0 + tile_rows - 1;
@@ -584,6 +598,8 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                 pack_bf16x2(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
         }
     }
+    gqa_prefill_zero_output_rows<Geometry>(out, q_head, tokens, min(q0 + Br, width), tid,
+                                           kGqaPrefillI8Threads);
 }
 
 } // namespace ninfer::ops

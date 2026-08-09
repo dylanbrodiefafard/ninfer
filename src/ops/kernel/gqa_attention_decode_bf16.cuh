@@ -15,12 +15,14 @@
 
 namespace ninfer::ops {
 
-template <typename Geometry, int TokenTile, int WarpsPerCta, typename CacheInput>
+template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
+          typename CacheInput>
 __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, __nv_bfloat16* cache_k,
-    __nv_bfloat16* cache_v, const std::int32_t* block_table, std::int32_t tokens,
-    std::int32_t logical_capacity, float scale, __nv_bfloat16* partial_acc, float* partial_m,
-    float* partial_l) {
+    __nv_bfloat16* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
+    const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
+    std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
+    __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
     static_assert(TokenTile >= 1 && TokenTile <= 6);
     static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
 
@@ -49,11 +51,35 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
 
     const int kv_head     = static_cast<int>(blockIdx.x);
     const int split       = static_cast<int>(blockIdx.y);
+    const int batch       = MultiBatch ? static_cast<int>(blockIdx.z) : 0;
     const int split_count = static_cast<int>(gridDim.y);
     const int tid         = static_cast<int>(threadIdx.x);
     const int warp        = tid >> 5;
     const int lane        = tid & 31;
-    const int row_count   = tokens * Geometry::GroupSize;
+    int valid_tokens      = tokens;
+    if constexpr (Masked) {
+        const int remaining = valid_columns[batch] - column_begin;
+        valid_tokens        = remaining <= 0 ? 0 : (remaining < tokens ? remaining : tokens);
+    }
+    const int row_count = tokens * Geometry::GroupSize;
+
+    std::int64_t column_base = column_begin;
+    if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
+    q += static_cast<std::int64_t>(kGqaHeadDim) * Geometry::QHeads * column_base;
+    pos += column_base;
+    if constexpr (CacheInput::writes_cache) {
+        input.k += static_cast<std::int64_t>(kGqaHeadDim) * Geometry::KVHeads * column_base;
+        input.v += static_cast<std::int64_t>(kGqaHeadDim) * Geometry::KVHeads * column_base;
+    }
+    const int table_row = table_rows == nullptr ? 0 : table_rows[batch];
+    const std::int32_t* block_table =
+        block_tables + static_cast<std::int64_t>(table_row) * table_stride;
+    if constexpr (MultiBatch) {
+        partial_acc += static_cast<std::int64_t>(batch) * kGqaHeadDim * Geometry::QHeads * tokens *
+                       split_count;
+        partial_m += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
+        partial_l += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
+    }
 
     auto write_neutral = [&]() {
         for (int row = tid; row < row_count; row += Threads) {
@@ -81,6 +107,10 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
 
     if (kv_head < 0 || kv_head >= Geometry::KVHeads || tokens < 1 || tokens > TokenTile ||
         row_count > Br || split_count <= 0) {
+        return;
+    }
+    if (valid_tokens == 0) {
+        write_neutral();
         return;
     }
 
@@ -118,7 +148,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     if constexpr (CacheInput::writes_cache) {
         // The owning split writes each new row. Current attention reads those rows directly from
         // input below, so no split depends on another split's cache write.
-        for (int chunk = tid; chunk < tokens * (D / 8); chunk += Threads) {
+        for (int chunk = tid; chunk < valid_tokens * (D / 8); chunk += Threads) {
             const int token = chunk / (D / 8);
             const int d     = (chunk - token * (D / 8)) * 8;
             const int p_tok = pos[token];
@@ -199,7 +229,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
             if (key >= split_start && key < split_end) {
                 if constexpr (CacheInput::writes_cache) {
                     const int new_token = key - first_pos;
-                    const bool from_new = new_token >= 0 && new_token < tokens && key >= first_pos;
+                    const bool from_new =
+                        new_token >= 0 && new_token < valid_tokens && key >= first_pos;
                     if (from_new) {
                         const std::int64_t off = gqa_kv_new_index<Geometry>(kv_head, d, new_token);
                         ninfer::ops::cp_async<16>(k_dst, &input.k[off]);
