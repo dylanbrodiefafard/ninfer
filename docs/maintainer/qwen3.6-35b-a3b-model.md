@@ -913,16 +913,18 @@ The registered implementation maps these concerns as follows:
 | exact 2048-wide dimensions, 40-layer topology, limits, scales, and option facts | `src/targets/qwen3_6_35b_a3b/impl/config.h` |
 | exact 934-tensor/six-resource binding, conditional residency, and immutable Text/MTP/Vision/MoE/DFlash views | `src/targets/qwen3_6_35b_a3b/impl/load/` |
 | fused attention projection, fused staged GDN projection/control, sparse-MoE post-mixer leaves, leaf workspace, and graph frontier ranges | `src/targets/qwen3_6_35b_a3b/impl/variant.h`, `impl/variant.cpp` |
-| fixed Text/MTP/Vision execution, planning, Program lifecycle, workspace composition, prefix/state transactions, and graph mechanics | `src/targets/qwen3_6/impl/runtime/` |
+| fixed Text/MTP/Vision/DFlash execution, planning, Program lifecycle, workspace composition, prefix/state transactions, speculative verification/acceptance, and graph mechanics | `src/targets/qwen3_6/impl/runtime/` |
 | tokenizer, template, multimodal processing, and output decoding | `src/targets/qwen3_6/impl/frontend/` |
 | mathematical and explicit local-state Op contracts/implementations | `include/ninfer/ops/`, `src/ops/` |
 | exact artifact and converter | [`qwen3.6-35b-a3b-artifact.md`](qwen3.6-35b-a3b-artifact.md), `tools/convert/qwen3_6_35b_a3b/` |
 | artifact-native diagnostic reference | `tools/reference/qwen3_6_35b_a3b/` |
 
-The registered 35B binder validates the complete DFlash inventory and owns a target-private
-conditional materialization/model-view path. Public Engine construction currently leaves that
-weight group nonresident. The DFlash sections do not claim that scheduling, state, workspace, or
-execution exists.
+The registered 35B Public Engine conditionally materializes the DFlash companion when DFlash is the
+selected speculative backend. It runs through the same `.ninfer` Engine route as ordinary and MTP
+generation, is text-only, and is mutually exclusive with Vision and MTP. The family runtime owns
+its persistent state, workspace, proposal execution, context commit, target verification and
+acceptance, and CUDA Graph lifecycle. When DFlash is not selected, its weights and state remain
+nonresident.
 
 The Python reference is diagnostic evidence, not a generated-token golden. Each production Op path
 is checked against its independent mathematical oracle; equality between different numerical or

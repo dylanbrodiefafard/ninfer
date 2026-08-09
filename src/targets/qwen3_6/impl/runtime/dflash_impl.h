@@ -26,7 +26,8 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
 
 void require_dflash_state(const State& state) {
-    if (state.dflash == nullptr || !state.model.dflash.has_value()) {
+    if (state.dflash == nullptr || !state.dflash_full_kv.valid() ||
+        !state.model.dflash.has_value()) {
         throw std::logic_error("DFlash schedule requires DFlash weights and state");
     }
 }
@@ -126,7 +127,8 @@ void dflash_append_context_impl(State& state, const Tensor& features, const Tens
                     ops::set_i32_scalar(append_count, tokens, state.device.stream);
                 }
                 ops::kv_cache_append_prefix(key, value, positions, append_count, envelope,
-                                            state.dflash->full_layer(), state.device.stream);
+                                            state.dflash_full_kv.layer_view(0),
+                                            state.device.stream);
             }
         }
         state.work.reset();
@@ -190,10 +192,10 @@ void dflash_propose_impl(State& state, std::uint32_t k, DFlashEnvelopes envelope
                              state.dflash->local_layer(static_cast<std::uint32_t>(layer)),
                              envelopes.local, state.work, attention, state.device.stream);
                 } else {
-                    ops::bidirectional_gqa_attention(query, key, value, state.io.pos,
-                                                     Config::attention_scale,
-                                                     state.dflash->full_layer(), envelopes.full,
-                                                     state.work, attention, state.device.stream);
+                    ops::bidirectional_gqa_attention(
+                        query, key, value, state.io.pos, Config::attention_scale,
+                        state.dflash_full_kv.layer_view(0), envelopes.full, state.work, attention,
+                        state.device.stream);
                 }
                 ops::linear_add(attention.view({Config::query_size, block}),
                                 weight.attention_output, residual, state.work, state.device.stream);

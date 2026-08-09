@@ -83,14 +83,35 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     if constexpr (Variant::supports_dflash) {
         if (plan.features.dflash()) {
             DFlashPersistentLayout& dflash = out.dflash.emplace();
-            dflash.local =
-                plan_kv_cache(builder, DFlashConfig::local_layers, DFlashConfig::local_capacity,
-                              DFlashConfig::kv_heads, DFlashConfig::head_dim, DType::BF16);
-            dflash.boundary_local =
-                plan_kv_cache(builder, DFlashConfig::local_layers, DFlashConfig::local_capacity,
-                              DFlashConfig::kv_heads, DFlashConfig::head_dim, DType::BF16);
-            dflash.full         = plan_kv_cache(builder, 1, plan.capacity, DFlashConfig::kv_heads,
-                                                DFlashConfig::head_dim, DType::BF16);
+            dflash.local          = plan_cyclic_kv_cache(builder, DFlashConfig::local_layers,
+                                                         DFlashConfig::local_capacity,
+                                                         DFlashConfig::kv_heads, DFlashConfig::head_dim);
+            dflash.boundary_local = plan_cyclic_kv_cache(
+                builder, DFlashConfig::local_layers, DFlashConfig::local_capacity,
+                DFlashConfig::kv_heads, DFlashConfig::head_dim);
+            const std::uint32_t full_pages =
+                (plan.capacity + static_cast<std::uint32_t>(kPagedKVPageSize) - 1U) /
+                static_cast<std::uint32_t>(kPagedKVPageSize);
+            PagedKVPoolSpec full_pool{
+                .page_group_count      = full_pages,
+                .logical_page_capacity = full_pages,
+                .table_rows            = 1,
+                .plane_order           = PagedKVPlaneOrder::HeadMajor,
+                .planes =
+                    {
+                        {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
+                        {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
+                    },
+            };
+            dflash.full = qwen3_6::PagedKVCacheLayout{
+                .pool        = plan_paged_kv_pool(builder, full_pool),
+                .layers      = 1,
+                .max_context = plan.capacity,
+                .kv_heads    = DFlashConfig::kv_heads,
+                .head_dim    = DFlashConfig::head_dim,
+                .dtype       = DType::BF16,
+                .quant_group = 0,
+            };
             dflash.commit_count = add_tensor(builder, DType::I32, {1}, "DFlash exact commit count");
             dflash.target_features = add_tensor(
                 builder, DType::BF16, {DFlashConfig::feature_rows, effective_prefill_chunk},
@@ -436,7 +457,7 @@ std::unique_ptr<SequencePlanImpl> plan_sequence_impl(DeviceContext& device,
     impl->use_cuda_graph      = options.use_cuda_graph;
     impl->device              = options.device;
     impl->kv_dtype       = options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16 : DType::I8;
-    impl->kv_quant_group = impl->kv_dtype == DType::I8 ? kKvQuantGroup : 0;
+    impl->kv_quant_group = impl->kv_dtype == DType::I8 ? qwen3_6::kKvQuantGroup : 0;
     impl->persistent     = persistent_layout(*impl);
     impl->workspace      = build_workspace_plan(*impl);
     if (impl->features.vision) {

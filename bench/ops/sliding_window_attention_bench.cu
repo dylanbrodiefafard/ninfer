@@ -4,7 +4,7 @@
 #include "ninfer/ops/swa.h"
 
 #include "core/device.h"
-#include "core/kv_cache.h"
+#include "core/cyclic_kv_cache.h"
 #include "ninfer_bench_common.h"
 
 #include <cuda_profiler_api.h>
@@ -161,14 +161,10 @@ CyclicKVCacheLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v) {
     return {
         .k               = Tensor(k.p, DType::BF16, {kHeadDim, kWindow, kKvHeads}),
         .v               = Tensor(v.p, DType::BF16, {kHeadDim, kWindow, kKvHeads}),
-        .k_scale         = Tensor(),
-        .v_scale         = Tensor(),
         .capacity        = kWindow,
         .padded_capacity = kWindow,
         .num_kv_heads    = kKvHeads,
         .head_dim        = kHeadDim,
-        .dtype           = DType::BF16,
-        .quant_group     = 0,
     };
 }
 

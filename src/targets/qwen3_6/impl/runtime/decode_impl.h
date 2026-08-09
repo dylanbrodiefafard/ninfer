@@ -17,7 +17,7 @@ auto ordinary_body(State& state, bool align_mtp, ops::GqaExecutionEnvelope envel
         TextContext card(state.device, state.model, state.work, state.text_kv,
                          state.linear_attention, state.io, state.prefill_hidden,
                          state.prefill_chunk, state.text_kv_base,
-                         align_mtp ? state.mtp_kv : nullptr);
+                         align_mtp ? state.mtp_kv : qwen3_6::PagedKVCacheView());
         configure_text_card(card, state);
 
         Tensor verify_id = state.io.speculative.target_input_ids.slice(0, 0, 1);
@@ -48,7 +48,7 @@ auto ordinary_body(State& state, bool align_mtp, ops::GqaExecutionEnvelope envel
         ops::increment_i32_scalar(state.io.rope_pos, state.device.stream);
         ops::assign_i32_scalar(state.io.linear_state_snapshot_base_slot,
                                state.io.linear_state_read_slot, state.device.stream);
-        if (state.mtp_kv != nullptr || state.dflash != nullptr) {
+        if (state.mtp_kv.valid() || state.dflash != nullptr) {
             Tensor fallback_steps = state.io.speculative.stats.slice(0, 3, 1);
             ops::increment_i64_scalar(fallback_steps, state.device.stream);
         }

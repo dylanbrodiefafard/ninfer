@@ -59,30 +59,34 @@ detail::KVCacheAppendPrefixPlan validate_inputs(const Tensor& k, const Tensor& v
     return detail::kv_cache_append_prefix_resolve_plan(tokens, envelope);
 }
 
-void validate_linear_cache(const KVCacheLayerView& cache,
-                           KVCacheAppendPrefixExecutionEnvelope envelope) {
+void validate_paged_cache(const PagedKVLayerView& cache,
+                          KVCacheAppendPrefixExecutionEnvelope envelope) {
     if (cache.dtype != DType::BF16 || cache.quant_group != 0 || cache.num_kv_heads != kKVHeads ||
-        cache.head_dim != kHeadDim || cache.padded_context < cache.max_context ||
-        cache.padded_context >
-            static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
-        envelope.max_count > cache.max_context) {
-        throw std::invalid_argument("kv_cache_append_prefix: invalid linear cache");
+        cache.head_dim != kHeadDim || cache.k_pages.ne[2] <= 0 ||
+        cache.k_pages.ne[2] != cache.v_pages.ne[2] || cache.block_table.ne[0] <= 0 ||
+        envelope.max_count >
+            static_cast<std::uint32_t>(cache.block_table.ne[0]) * kPagedKVPageSize) {
+        throw std::invalid_argument("kv_cache_append_prefix: invalid paged cache");
     }
-    const auto padded = static_cast<std::int32_t>(cache.padded_context);
-    if (cache.k.dtype != DType::BF16 || cache.v.dtype != DType::BF16 || cache.k.ne[0] != kHeadDim ||
-        cache.k.ne[1] != padded || cache.k.ne[2] != kKVHeads || cache.k.ne[3] != 1 ||
-        cache.v.ne[0] != kHeadDim || cache.v.ne[1] != padded || cache.v.ne[2] != kKVHeads ||
-        cache.v.ne[3] != 1 || cache.k_scale.data != nullptr || cache.v_scale.data != nullptr) {
-        throw std::invalid_argument("kv_cache_append_prefix: invalid linear cache tensors");
+    const std::int32_t physical_pages = cache.k_pages.ne[2];
+    if (cache.k_pages.dtype != DType::BF16 || cache.v_pages.dtype != DType::BF16 ||
+        cache.k_pages.ne[0] != kHeadDim || cache.k_pages.ne[1] != kPagedKVPageSize ||
+        cache.k_pages.ne[3] != kKVHeads || cache.v_pages.ne[0] != kHeadDim ||
+        cache.v_pages.ne[1] != kPagedKVPageSize || cache.v_pages.ne[2] != physical_pages ||
+        cache.v_pages.ne[3] != kKVHeads || cache.k_scale_pages.data != nullptr ||
+        cache.v_scale_pages.data != nullptr || cache.block_table.dtype != DType::I32 ||
+        cache.block_table.ne[1] != 1 || cache.block_table.ne[2] != 1 ||
+        cache.block_table.ne[3] != 1) {
+        throw std::invalid_argument("kv_cache_append_prefix: invalid paged cache tensors");
     }
-    require_vector_aligned(cache.k, "cache k");
-    require_vector_aligned(cache.v, "cache v");
+    require_vector_aligned(cache.k_pages, "cache k pages");
+    require_vector_aligned(cache.v_pages, "cache v pages");
+    require_contiguous_nonnull(cache.block_table, "cache block table");
 }
 
 void validate_cyclic_cache(const CyclicKVCacheLayerView& cache,
                            KVCacheAppendPrefixExecutionEnvelope envelope) {
-    if (cache.dtype != DType::BF16 || cache.quant_group != 0 || cache.num_kv_heads != kKVHeads ||
-        cache.head_dim != kHeadDim || cache.capacity != kWindow ||
+    if (cache.num_kv_heads != kKVHeads || cache.head_dim != kHeadDim || cache.capacity != kWindow ||
         cache.padded_capacity < cache.capacity ||
         cache.padded_capacity >
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
@@ -93,7 +97,7 @@ void validate_cyclic_cache(const CyclicKVCacheLayerView& cache,
     if (cache.k.dtype != DType::BF16 || cache.v.dtype != DType::BF16 || cache.k.ne[0] != kHeadDim ||
         cache.k.ne[1] != padded || cache.k.ne[2] != kKVHeads || cache.k.ne[3] != 1 ||
         cache.v.ne[0] != kHeadDim || cache.v.ne[1] != padded || cache.v.ne[2] != kKVHeads ||
-        cache.v.ne[3] != 1 || cache.k_scale.data != nullptr || cache.v_scale.data != nullptr) {
+        cache.v.ne[3] != 1) {
         throw std::invalid_argument("kv_cache_append_prefix: invalid cyclic cache tensors");
     }
     require_vector_aligned(cache.k, "cache k");
@@ -104,10 +108,10 @@ void validate_cyclic_cache(const CyclicKVCacheLayerView& cache,
 
 void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& positions,
                             const Tensor& commit_count,
-                            KVCacheAppendPrefixExecutionEnvelope envelope, KVCacheLayerView cache,
+                            KVCacheAppendPrefixExecutionEnvelope envelope, PagedKVLayerView cache,
                             cudaStream_t stream) {
     const auto plan = validate_inputs(k, v, positions, commit_count, envelope);
-    validate_linear_cache(cache, envelope);
+    validate_paged_cache(cache, envelope);
     detail::kv_cache_append_prefix_launch(k, v, positions, commit_count, cache, plan, stream);
 }
 

@@ -180,6 +180,7 @@ ProgramImplCore::~ProgramImplCore() noexcept {
 }
 
 void ProgramImplCore::make_invalid() noexcept {
+    sequence_kv.reset();
     lifecycle = Lifecycle::Invalid;
     E         = 0;
     S         = 0;
@@ -202,6 +203,116 @@ void ProgramImplCore::make_invalid() noexcept {
     tail_hidden_valid         = false;
     boundary                  = {};
     pending                   = {};
+}
+
+qwen3_6::PagedKVCache* ProgramImplCore::backend_kv_cache() noexcept {
+    if (speculative_backend == SpeculativeBackend::Mtp) { return decoder->mtp_cache(); }
+    if (speculative_backend == SpeculativeBackend::DFlash && dflash) { return &dflash->full; }
+    return nullptr;
+}
+
+const qwen3_6::PagedKVCache* ProgramImplCore::backend_kv_cache() const noexcept {
+    if (speculative_backend == SpeculativeBackend::Mtp) { return decoder->mtp_cache(); }
+    if (speculative_backend == SpeculativeBackend::DFlash && dflash) { return &dflash->full; }
+    return nullptr;
+}
+
+std::uint32_t ProgramImplCore::backend_kv_valid() const noexcept {
+    if (speculative_backend == SpeculativeBackend::Mtp) { return mtp_kv_valid; }
+    if (speculative_backend == SpeculativeBackend::DFlash) { return dflash_context_frontier; }
+    return 0;
+}
+
+void ProgramImplCore::reserve_sequence_kv() {
+    if (sequence_kv) { throw std::logic_error("sequence already owns a KV allocation bundle"); }
+
+    std::array<PagedKVReservation, 2> reservations{};
+    std::size_t count     = 0;
+    reservations[count++] = PagedKVReservation{
+        .pool             = &decoder->text_kv.pool(),
+        .page_entitlement = decoder->text_kv.pool().logical_page_capacity(),
+    };
+    if (qwen3_6::PagedKVCache* backend = backend_kv_cache(); backend != nullptr) {
+        reservations[count++] = PagedKVReservation{
+            .pool             = &backend->pool(),
+            .page_entitlement = backend->pool().logical_page_capacity(),
+        };
+    }
+
+    std::vector<PagedKVAllocation> allocations =
+        reserve_paged_kv_bundle(std::span<const PagedKVReservation>(reservations.data(), count));
+    SequenceKVBundle bundle;
+    bundle.text = std::move(allocations[0]);
+    if (count == 2) { bundle.backend.emplace(std::move(allocations[1])); }
+    sequence_kv.emplace(std::move(bundle));
+}
+
+void ProgramImplCore::bind_sequence_kv() {
+    if (!sequence_kv || sequence_kv->text.bound_row() >= 0 ||
+        (sequence_kv->backend && sequence_kv->backend->bound_row() >= 0)) {
+        throw std::logic_error("KV allocation bundle is unavailable or already bound");
+    }
+    sequence_kv->text.bind_row(0, device.stream);
+    try {
+        if (sequence_kv->backend) { sequence_kv->backend->bind_row(0, device.stream); }
+    } catch (...) {
+        sequence_kv->text.unbind_row();
+        throw;
+    }
+}
+
+void ProgramImplCore::unbind_sequence_kv() noexcept {
+    if (!sequence_kv) { return; }
+    if (sequence_kv->backend) { sequence_kv->backend->unbind_row(); }
+    sequence_kv->text.unbind_row();
+}
+
+void ProgramImplCore::materialize_sequence_kv(std::uint32_t main_tokens,
+                                              std::uint32_t backend_tokens) {
+    if (!sequence_kv || main_tokens > capacity || backend_tokens > capacity) {
+        throw std::logic_error("KV materialization request is outside the sequence bundle");
+    }
+    if (backend_tokens != 0 && !sequence_kv->backend) {
+        throw std::logic_error("backend KV materialization requested without an allocation");
+    }
+    if (main_tokens > sequence_kv->text.mapped_token_capacity()) {
+        sequence_kv->text.materialize_tokens(main_tokens, device.stream);
+    }
+    if (backend_tokens != 0 && backend_tokens > sequence_kv->backend->mapped_token_capacity()) {
+        sequence_kv->backend->materialize_tokens(backend_tokens, device.stream);
+    }
+}
+
+void ProgramImplCore::trim_sequence_kv(std::uint32_t main_tokens, std::uint32_t backend_tokens) {
+    if (!sequence_kv || main_tokens > capacity || backend_tokens > main_tokens) {
+        throw std::logic_error("KV trim request is outside the sequence bundle");
+    }
+    if (backend_tokens != 0 && !sequence_kv->backend) {
+        throw std::logic_error("backend KV trim requested without an allocation");
+    }
+    sequence_kv->text.trim_tokens(main_tokens);
+    if (sequence_kv->backend) { sequence_kv->backend->trim_tokens(backend_tokens); }
+}
+
+qwen3_6::PagedKVCacheView ProgramImplCore::text_kv_view() const {
+    if (!sequence_kv) { throw std::logic_error("sequence has no KV allocation bundle"); }
+    return decoder->text_kv.execution_view(sequence_kv->text);
+}
+
+qwen3_6::PagedKVCacheView ProgramImplCore::mtp_kv_view() const {
+    if (speculative_backend != SpeculativeBackend::Mtp) { return {}; }
+    if (decoder->mtp_cache() == nullptr || !sequence_kv || !sequence_kv->backend) {
+        throw std::logic_error("sequence has no MTP KV allocation");
+    }
+    return decoder->mtp_cache()->execution_view(*sequence_kv->backend);
+}
+
+qwen3_6::PagedKVCacheView ProgramImplCore::dflash_full_kv_view() const {
+    if (speculative_backend != SpeculativeBackend::DFlash) { return {}; }
+    if (!dflash || !sequence_kv || !sequence_kv->backend) {
+        throw std::logic_error("sequence has no DFlash Full KV allocation");
+    }
+    return dflash->full_view(*sequence_kv->backend);
 }
 
 void ProgramImplCore::set_device_i32(Tensor& tensor, std::int32_t value) {
@@ -240,6 +351,10 @@ void ProgramImplCore::ordered_reset() {
 void ProgramImplCore::prepare_graphs() {
     if (!use_cuda_graph) { return; }
 
+    reserve_sequence_kv();
+    bind_sequence_kv();
+    materialize_sequence_kv(capacity, backend_kv_cache() != nullptr ? capacity : 0);
+
     std::size_t free_before = 0;
     std::size_t total_bytes = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_before, &total_bytes));
@@ -269,25 +384,24 @@ void ProgramImplCore::prepare_graphs() {
             CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
         }
     };
-    const auto initialize_cache = [&](KVCache& cache) {
-        for (Tensor& tensor : cache.k) {
-            CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
-        }
-        for (Tensor& tensor : cache.v) {
-            CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
-        }
-        for (Tensor& tensor : cache.k_scale) {
-            CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
-        }
-        for (Tensor& tensor : cache.v_scale) {
+    const auto initialize_paged_cache = [&](qwen3_6::PagedKVCache& cache) {
+        for (std::size_t plane = 0; plane < cache.pool().plane_count(); ++plane) {
+            const Tensor& tensor = cache.pool().plane(plane);
             CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
         }
     };
-    initialize_cache(decoder->text_kv);
-    if (decoder->mtp_cache() != nullptr) { initialize_cache(*decoder->mtp_cache()); }
+    const auto initialize_cyclic_cache = [&](CyclicKVCache& cache) {
+        for (std::uint32_t layer = 0; layer < cache.layer_count(); ++layer) {
+            const CyclicKVCacheLayerView view = cache.layer_view(layer);
+            CUDA_CHECK(cudaMemsetAsync(view.k.data, 0, view.k.bytes(), device.stream));
+            CUDA_CHECK(cudaMemsetAsync(view.v.data, 0, view.v.bytes(), device.stream));
+        }
+    };
+    initialize_paged_cache(decoder->text_kv);
+    if (decoder->mtp_cache() != nullptr) { initialize_paged_cache(*decoder->mtp_cache()); }
     if (dflash) {
-        initialize_cache(dflash->local);
-        initialize_cache(dflash->full);
+        initialize_cyclic_cache(dflash->local);
+        initialize_paged_cache(dflash->full);
         CUDA_CHECK(cudaMemsetAsync(dflash->target_features.data, 0, dflash->target_features.bytes(),
                                    device.stream));
         CUDA_CHECK(cudaMemsetAsync(dflash->feature_positions.data, 0,
@@ -317,8 +431,9 @@ void ProgramImplCore::prepare_graphs() {
         return schedule::State{device,
                                model,
                                work,
-                               decoder->text_kv,
-                               decoder->mtp_cache(),
+                               text_kv_view(),
+                               mtp_kv_view(),
+                               dflash_full_kv_view(),
                                dflash ? &*dflash : nullptr,
                                decoder->linear_attention,
                                io,
@@ -414,6 +529,8 @@ void ProgramImplCore::prepare_graphs() {
                                  " bytes, exceeding the planned allowance of " +
                                  std::to_string(graph_allowance_bytes) + " bytes");
     }
+    unbind_sequence_kv();
+    sequence_kv.reset();
 }
 
 void ProgramImplCore::install_sampling(const ops::SamplingConfig& config) {
@@ -452,11 +569,14 @@ void ProgramImplCore::flush_dflash_context_prefix(std::uint32_t count) {
         count == 0 || count > pending_context_count) {
         throw std::logic_error("DFlash context flush does not match the pending target features");
     }
+    const std::uint32_t context_end = pending_context_base + count;
+    materialize_sequence_kv(std::max(text_kv_valid, context_end), context_end);
     schedule::State state{device,
                           model,
                           work,
-                          decoder->text_kv,
-                          decoder->mtp_cache(),
+                          text_kv_view(),
+                          mtp_kv_view(),
+                          dflash_full_kv_view(),
                           &*dflash,
                           decoder->linear_attention,
                           io,
@@ -533,9 +653,14 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
     lifecycle = Lifecycle::Invalid;
     try {
         if (plan.reuse == ReusePath::FullReset) {
+            sequence_kv.reset();
             ordered_reset();
             ledger.clear();
+            reserve_sequence_kv();
         } else if (plan.reuse == ReusePath::AppendAtFrontier) {
+            if (!sequence_kv) {
+                throw std::logic_error("resident prefix has no KV allocation bundle");
+            }
             if (text_kv_valid < base) {
                 throw std::logic_error("resident Text KV is shorter than E");
             }
@@ -546,6 +671,9 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
                 throw std::logic_error("resident DFlash context is not at the append frontier");
             }
         } else {
+            if (!sequence_kv) {
+                throw std::logic_error("resident boundary has no KV allocation bundle");
+            }
             if (text_kv_valid < base) {
                 throw std::logic_error("resident Text KV is shorter than boundary");
             }
@@ -571,7 +699,19 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
                 throw std::logic_error("reusable MTP prefix is shorter than its bridge position");
             }
             mtp_kv_valid = mtp_base;
+        } else if (speculative_backend == SpeculativeBackend::Mtp && sequence_kv->backend) {
+            mtp_kv_valid = 0;
         }
+
+        trim_sequence_kv(base, backend_kv_valid());
+        bind_sequence_kv();
+        std::uint32_t backend_materialized = 0;
+        if (speculative_backend == SpeculativeBackend::Mtp && plan.prepare_mtp) {
+            backend_materialized = prompt_tokens + draft_window - 1U;
+        } else if (speculative_backend == SpeculativeBackend::DFlash) {
+            backend_materialized = prompt_tokens;
+        }
+        materialize_sequence_kv(prompt_tokens, backend_materialized);
 
         install_sampling(plan.sampling);
         rope_delta = request_rope_delta;
@@ -595,8 +735,9 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
             device,
             model,
             work,
-            decoder->text_kv,
-            decoder->mtp_cache(),
+            text_kv_view(),
+            mtp_kv_view(),
+            dflash_full_kv_view(),
             dflash ? &*dflash : nullptr,
             decoder->linear_attention,
             io,
@@ -807,8 +948,9 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
             device,
             model,
             work,
-            decoder->text_kv,
-            decoder->mtp_cache(),
+            text_kv_view(),
+            mtp_kv_view(),
+            dflash_full_kv_view(),
             dflash ? &*dflash : nullptr,
             decoder->linear_attention,
             io,
@@ -833,6 +975,12 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
                 envelopes                = mtp_gqa_envelopes(variant.min_execution_frontier,
                                                              variant.max_execution_frontier, draft_window);
             }
+            const std::uint32_t main_materialized = envelopes.target_verify.max_visible_keys;
+            const std::uint32_t backend_materialized =
+                draft_window > 1
+                    ? envelopes.ar[static_cast<std::size_t>(draft_window - 2)].max_visible_keys
+                    : envelopes.target_verify.max_visible_keys;
+            materialize_sequence_kv(main_materialized, backend_materialized);
             {
                 nvtx::ScopedRange submit_range(nvtx::Name::DecodeMtpSubmit, nvtx::Category::Mtp,
                                                base_E);
@@ -880,6 +1028,7 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
                 target_envelope             = {variant.min_execution_frontier + draft_window + 1,
                                                variant.max_execution_frontier + draft_window + 1};
             }
+            materialize_sequence_kv(target_envelope.max_visible_keys, envelopes.full.max_context);
             {
                 nvtx::ScopedRange submit_range(nvtx::Name::DecodeDFlashSubmit,
                                                nvtx::Category::DFlash, base_E);
@@ -926,6 +1075,7 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
             tail_hidden_valid        = true;
         } else {
             if (dflash && pending_context_valid) {
+                materialize_sequence_kv(base_E, base_E);
                 mark_workspace_usage(workspace_plan.dflash_context);
                 Tensor features = dflash->target_features.slice(
                     1, 0, static_cast<std::int32_t>(draft_window + 1));
@@ -949,6 +1099,11 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
                 graph    = align_mtp ? &variant.ordinary_aligned : &variant.ordinary;
                 envelope = {variant.min_execution_frontier + 1, variant.max_execution_frontier + 1};
             }
+            const std::uint32_t backend_materialized =
+                align_mtp || speculative_backend == SpeculativeBackend::DFlash
+                    ? envelope.max_visible_keys
+                    : 0;
+            materialize_sequence_kv(envelope.max_visible_keys, backend_materialized);
             {
                 nvtx::ScopedRange submit_range(nvtx::Name::DecodeOrdinarySubmit,
                                                nvtx::Category::Decode, base_E);
@@ -1043,6 +1198,8 @@ void ProgramImplCore::resolve_pending(std::uint32_t accepted_tokens, bool termin
         set_device_i32(io.rope_pos,
                        checked_i32(committed_E, "partial speculative RoPE frontier") + rope_delta);
         device.synchronize();
+        trim_sequence_kv(text_kv_valid, backend_kv_valid());
+        unbind_sequence_kv();
         drafts_ready = false;
         lifecycle    = Lifecycle::Resident;
         pending      = {};
@@ -1068,6 +1225,8 @@ void ProgramImplCore::resolve_pending(std::uint32_t accepted_tokens, bool termin
     if (S != E + 1 || ledger.size() != S || prefix_identity.size() != S) {
         throw std::logic_error("resolved round did not establish a valid frontier");
     }
+    trim_sequence_kv(text_kv_valid, backend_kv_valid());
+    if (terminal) { unbind_sequence_kv(); }
     lifecycle = terminal ? Lifecycle::Resident : Lifecycle::Active;
     pending   = {};
 }
@@ -1084,6 +1243,8 @@ void ProgramImplCore::finish_active() {
             throw;
         }
     }
+    trim_sequence_kv(text_kv_valid, backend_kv_valid());
+    unbind_sequence_kv();
     lifecycle = Lifecycle::Resident;
 }
 

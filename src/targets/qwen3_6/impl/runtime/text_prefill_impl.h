@@ -28,7 +28,7 @@ bool prefill_text(State& state, std::span<const TokenId> ids,
                   std::optional<std::uint32_t> snapshot_boundary, bool prepare_mtp) {
     TextContext card(state.device, state.model, state.work, state.text_kv, state.linear_attention,
                      state.io, state.prefill_hidden, state.prefill_chunk, state.text_kv_base,
-                     prepare_mtp ? state.mtp_kv : nullptr);
+                     prepare_mtp ? state.mtp_kv : qwen3_6::PagedKVCacheView());
     configure_text_card(card, state);
     card.set_boundary_hidden_output(state.boundary_hidden);
     card.set_prefill_snapshot_boundary(
@@ -58,7 +58,7 @@ MultimodalPrefillResult prefill_multimodal(State& state, const PreparedPromptDat
                                            bool prepare_mtp, const MtpBridgeInput* mtp_bridge) {
     TextContext card(state.device, state.model, state.work, state.text_kv, state.linear_attention,
                      state.io, state.prefill_hidden, state.prefill_chunk, state.text_kv_base,
-                     prepare_mtp ? state.mtp_kv : nullptr);
+                     prepare_mtp ? state.mtp_kv : qwen3_6::PagedKVCacheView());
     configure_text_card(card, state);
     card.set_boundary_hidden_output(state.boundary_hidden);
     card.set_prefill_snapshot_boundary(

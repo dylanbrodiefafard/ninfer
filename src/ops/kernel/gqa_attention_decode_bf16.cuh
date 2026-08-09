@@ -18,21 +18,23 @@ namespace ninfer::ops {
 template <typename Geometry, int TokenTile, int WarpsPerCta, typename CacheInput>
 __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, __nv_bfloat16* cache_k,
-    __nv_bfloat16* cache_v, std::int32_t tokens, std::int32_t padded_context,
-    std::int32_t max_context, float scale, __nv_bfloat16* partial_acc, float* partial_m,
+    __nv_bfloat16* cache_v, const std::int32_t* block_table, std::int32_t tokens,
+    std::int32_t logical_capacity, float scale, __nv_bfloat16* partial_acc, float* partial_m,
     float* partial_l) {
     static_assert(TokenTile >= 1 && TokenTile <= 6);
     static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
 
-    constexpr int Wc            = WarpsPerCta;
-    constexpr int Br            = Wc * 16;
-    constexpr int Bc            = 32;
-    constexpr int D             = kGqaHeadDim;
-    constexpr int Threads       = Wc * 32;
-    constexpr int QKNt          = Bc / 8;
-    constexpr int QKKs          = D / 16;
-    constexpr int PVNt          = D / 8;
-    constexpr int PVKs          = Bc / 16;
+    constexpr int Wc      = WarpsPerCta;
+    constexpr int Br      = Wc * 16;
+    constexpr int Bc      = 32;
+    constexpr int D       = kGqaHeadDim;
+    constexpr int Threads = Wc * 32;
+    constexpr int QKNt    = Bc / 8;
+    constexpr int QKKs    = D / 16;
+    constexpr int PVNt    = D / 8;
+    constexpr int PVKs    = Bc / 16;
+    // The GQA Op's 262144-key maximum envelope spans at most 49 pages in one 27B split.
+    constexpr int PageIds       = 64;
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
     constexpr int QkvRows       = 2 * Bc;
@@ -41,6 +43,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
 
     __shared__ __align__(16) __nv_bfloat16 qkv_s[QkvRows * D];
     __shared__ __align__(16) __nv_bfloat16 p_s[Wc * 16 * Bc];
+    __shared__ std::int32_t physical_pages_s[PageIds];
     __nv_bfloat16* k_s = qkv_s;
     __nv_bfloat16* v_s = qkv_s + Bc * D;
 
@@ -83,7 +86,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
 
     const std::int32_t first_pos = pos[0];
     const std::int32_t last_pos  = pos[tokens - 1];
-    if (first_pos < 0 || last_pos < 0 || last_pos >= max_context) {
+    if (first_pos < 0 || last_pos < 0 || last_pos >= logical_capacity) {
         write_neutral();
         return;
     }
@@ -93,13 +96,23 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         gqa_small_t_active_splits<Geometry, false>(window, split_count, TokenTile);
     if (split >= active_split_count) { return; }
 
-    const int kps         = div_up(window, active_split_count);
-    const int split_start = split * kps;
-    const int split_limit = split_start + kps;
+    const int logical_tiles = div_up(window, Bc);
+    const bool tile_split   = logical_tiles >= active_split_count;
+    const int units_per_split =
+        tile_split ? div_up(logical_tiles, active_split_count) : div_up(window, active_split_count);
+    const int split_start = split * units_per_split * (tile_split ? Bc : 1);
+    const int split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
     const int split_end   = (split_limit < window) ? split_limit : window;
     if (split_start >= split_end) {
         write_neutral();
         return;
+    }
+    const int first_tile = (split_start / Bc) * Bc;
+    const int key_blocks = div_up(split_end - first_tile, Bc);
+    const int first_page = first_tile >> kPagedKVPageShift;
+    const int page_count = ((split_end - 1) >> kPagedKVPageShift) - first_page + 1;
+    for (int page = tid; page < page_count; page += Threads) {
+        physical_pages_s[page] = block_table[first_page + page];
     }
 
     if constexpr (CacheInput::writes_cache) {
@@ -109,9 +122,14 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
             const int token = chunk / (D / 8);
             const int d     = (chunk - token * (D / 8)) * 8;
             const int p_tok = pos[token];
-            if (p_tok >= split_start && p_tok < split_end && p_tok >= 0 && p_tok < max_context) {
-                const std::int64_t new_off   = gqa_kv_new_index<Geometry>(kv_head, d, token);
-                const std::int64_t cache_off = gqa_cache_index(kv_head, d, p_tok, padded_context);
+            if (p_tok >= split_start && p_tok < split_end && p_tok >= 0 &&
+                p_tok < logical_capacity) {
+                const std::int64_t new_off = gqa_kv_new_index<Geometry>(kv_head, d, token);
+                const int lane             = tid & 31;
+                int physical_page = lane == 0 ? paged_kv_physical_page(block_table, p_tok) : 0;
+                physical_page     = __shfl_sync(FullMask, physical_page, 0);
+                const std::int64_t cache_off =
+                    gqa_cache_index<Geometry>(physical_page, kv_head, d, p_tok & kPagedKVPageMask);
                 store_vec(&cache_k[cache_off], load_vec<int4>(&input.k[new_off]));
                 store_vec(&cache_v[cache_off], load_vec<int4>(&input.v[new_off]));
             }
@@ -155,7 +173,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                     smem_addr(&qkv_s[arow * D + gqa_small_t_tc_swz(arow, acol)]));
     }
     __syncthreads();
-
+    int physical_page = physical_pages_s[0];
     float acc[PVNt][4];
 #pragma unroll
     for (int n = 0; n < PVNt; ++n) {
@@ -164,9 +182,11 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     }
     float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F, l0 = 0.0f, l1 = 0.0f;
 
-    const int key_blocks = div_up(split_end - split_start, Bc);
     for (int kb = 0; kb < key_blocks; ++kb) {
-        const int k0 = split_start + kb * Bc;
+        const int k0 = first_tile + kb * Bc;
+        if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
+            physical_page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
+        }
         // Stage the bf16 K/V key tile with one cp.async wave (16B/thread, high MLP).
         // Current-step tokens come from k_new/v_new; tail slots are zeroed.
 #pragma unroll 1
@@ -176,7 +196,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
             const int key        = k0 + key_l;
             __nv_bfloat16* k_dst = &k_s[key_l * D + gqa_small_t_tc_swz(key_l, d)];
             __nv_bfloat16* v_dst = &v_s[key_l * D + gqa_small_t_tc_swz(key_l, d)];
-            if (key < split_end) {
+            if (key >= split_start && key < split_end) {
                 if constexpr (CacheInput::writes_cache) {
                     const int new_token = key - first_pos;
                     const bool from_new = new_token >= 0 && new_token < tokens && key >= first_pos;
@@ -185,12 +205,14 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                         ninfer::ops::cp_async<16>(k_dst, &input.k[off]);
                         ninfer::ops::cp_async<16>(v_dst, &input.v[off]);
                     } else {
-                        const std::int64_t off = gqa_cache_index(kv_head, d, key, padded_context);
+                        const std::int64_t off = gqa_cache_index<Geometry>(
+                            physical_page, kv_head, d, key & kPagedKVPageMask);
                         ninfer::ops::cp_async<16>(k_dst, &cache_k[off]);
                         ninfer::ops::cp_async<16>(v_dst, &cache_v[off]);
                     }
                 } else {
-                    const std::int64_t off = gqa_cache_index(kv_head, d, key, padded_context);
+                    const std::int64_t off = gqa_cache_index<Geometry>(physical_page, kv_head, d,
+                                                                       key & kPagedKVPageMask);
                     ninfer::ops::cp_async<16>(k_dst, &cache_k[off]);
                     ninfer::ops::cp_async<16>(v_dst, &cache_v[off]);
                 }
@@ -234,20 +256,24 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
             const int col1 = col0 + 1;
             const int key0 = k0 + col0;
             const int key1 = col1 + k0;
-            score[nt][0]   = (row0 < row_count && key0 < split_end && key0 <= qabs0)
-                                 ? score[nt][0] * scale
-                                 : -CUDART_INF_F;
-            score[nt][1]   = (row0 < row_count && key1 < split_end && key1 <= qabs0)
-                                 ? score[nt][1] * scale
-                                 : -CUDART_INF_F;
-            score[nt][2]   = (row1 < row_count && key0 < split_end && key0 <= qabs1)
-                                 ? score[nt][2] * scale
-                                 : -CUDART_INF_F;
-            score[nt][3]   = (row1 < row_count && key1 < split_end && key1 <= qabs1)
-                                 ? score[nt][3] * scale
-                                 : -CUDART_INF_F;
-            bm0            = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
-            bm1            = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
+            score[nt][0] =
+                (row0 < row_count && key0 >= split_start && key0 < split_end && key0 <= qabs0)
+                    ? score[nt][0] * scale
+                    : -CUDART_INF_F;
+            score[nt][1] =
+                (row0 < row_count && key1 >= split_start && key1 < split_end && key1 <= qabs0)
+                    ? score[nt][1] * scale
+                    : -CUDART_INF_F;
+            score[nt][2] =
+                (row1 < row_count && key0 >= split_start && key0 < split_end && key0 <= qabs1)
+                    ? score[nt][2] * scale
+                    : -CUDART_INF_F;
+            score[nt][3] =
+                (row1 < row_count && key1 >= split_start && key1 < split_end && key1 <= qabs1)
+                    ? score[nt][3] * scale
+                    : -CUDART_INF_F;
+            bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
+            bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
         }
         bm0 = warp_max<4>(bm0, FullMask);
         bm1 = warp_max<4>(bm1, FullMask);

@@ -1,7 +1,7 @@
 #include "ninfer/ops/swa.h"
 
 #include "core/arena.h"
-#include "core/kv_cache.h"
+#include "core/cyclic_kv_cache.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -118,14 +118,10 @@ CyclicKVCacheLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v) {
     return {
         .k               = Tensor(k.p, DType::BF16, {kD, kWindow, kKVHeads}),
         .v               = Tensor(v.p, DType::BF16, {kD, kWindow, kKVHeads}),
-        .k_scale         = Tensor(),
-        .v_scale         = Tensor(),
         .capacity        = kWindow,
         .padded_capacity = kWindow,
         .num_kv_heads    = kKVHeads,
         .head_dim        = kD,
-        .dtype           = DType::BF16,
-        .quant_group     = 0,
     };
 }
 

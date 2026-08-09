@@ -10,7 +10,6 @@
 #include "core/weight.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/gqa_attention.h"
-#include "core/kv_cache.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 #include <ninfer/targets/qwen3_6/round_state.h>
@@ -137,9 +136,10 @@ class VisionPrefillSession;
 class TextContext {
 public:
     TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
-                KVCache& kv, LinearAttentionStatePool& state, qwen3_6::RoundState& io,
-                Tensor& prefill_hidden, std::uint32_t prefill_chunk, std::uint32_t text_kv_base,
-                KVCache* mtp_kv = nullptr);
+                qwen3_6::PagedKVCacheView kv, LinearAttentionStatePool& state,
+                qwen3_6::RoundState& io, Tensor& prefill_hidden, std::uint32_t prefill_chunk,
+                std::uint32_t text_kv_base,
+                qwen3_6::PagedKVCacheView mtp_kv = qwen3_6::PagedKVCacheView());
     ~TextContext();
 
     TextContext(const TextContext&)            = delete;
@@ -195,7 +195,7 @@ public:
 private:
     void bind();
 
-    [[nodiscard]] bool mtp_enabled() const noexcept { return mtp_kv_ != nullptr; }
+    [[nodiscard]] bool mtp_enabled() const noexcept { return mtp_kv_.valid(); }
 
     [[nodiscard]] const MtpW& mtp_weights() const;
     void attn_mix(const FullLayerW& weights, Tensor& x, int index, Phase phase);
@@ -236,8 +236,8 @@ private:
     DeviceContext& ctx_;
     const LoadedModelData& weights_;
     WorkspaceArena& work_;
-    KVCache& kv_;
-    KVCache* mtp_kv_;
+    qwen3_6::PagedKVCacheView kv_;
+    qwen3_6::PagedKVCacheView mtp_kv_;
     LinearAttentionStatePool& state_;
     qwen3_6::RoundState& io_;
     Tensor& prefill_hidden_;

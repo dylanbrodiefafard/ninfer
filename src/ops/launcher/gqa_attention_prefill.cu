@@ -14,10 +14,10 @@ namespace {
 
 template <typename Geometry>
 void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& positions,
-                                               float scale, const KVCacheLayerView& cache,
+                                               float scale, const PagedKVLayerView& cache,
                                                Tensor& out, cudaStream_t stream) {
-    const Tensor& cache_k = cache.k;
-    const Tensor& cache_v = cache.v;
+    const Tensor& cache_k = cache.k_pages;
+    const Tensor& cache_v = cache.v_pages;
     // Both dtype-specialized kernels exceed the default 48 KiB dynamic-smem ceiling.
     static const cudaError_t attr_bf16 =
         cudaFuncSetAttribute(gqa_attention_prefill_bf16_kernel<Geometry>,
@@ -28,13 +28,12 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                              cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillI8SmemBytes);
     CUDA_CHECK(attr_i8);
 
-    const auto tokens         = static_cast<std::int32_t>(q.ne[2]);
-    const auto padded_context = static_cast<std::int32_t>(cache.padded_context);
+    const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     if (cache.dtype == DType::I8) {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillI8Br)),
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
-        const Tensor& cache_k_scale = cache.k_scale;
-        const Tensor& cache_v_scale = cache.v_scale;
+        const Tensor& cache_k_scale = cache.k_scale_pages;
+        const Tensor& cache_v_scale = cache.v_scale_pages;
         gqa_attention_prefill_i8_kernel<Geometry>
             <<<attention_grid, kGqaPrefillI8Threads, kGqaPrefillI8SmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
@@ -42,8 +41,9 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                 static_cast<const std::int8_t*>(cache_v.data),
                 static_cast<const __half*>(cache_k_scale.data),
                 static_cast<const __half*>(cache_v_scale.data),
+                static_cast<const std::int32_t*>(cache.block_table.data),
                 static_cast<const std::int32_t*>(positions.data), scale,
-                static_cast<__nv_bfloat16*>(out.data), tokens, padded_context);
+                static_cast<__nv_bfloat16*>(out.data), tokens);
     } else {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
@@ -52,37 +52,58 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                 static_cast<const __nv_bfloat16*>(q.data),
                 static_cast<const __nv_bfloat16*>(cache_k.data),
                 static_cast<const __nv_bfloat16*>(cache_v.data),
+                static_cast<const std::int32_t*>(cache.block_table.data),
                 static_cast<const std::int32_t*>(positions.data), scale,
-                static_cast<__nv_bfloat16*>(out.data), tokens, padded_context);
+                static_cast<__nv_bfloat16*>(out.data), tokens);
     }
     CUDA_CHECK(cudaGetLastError());
 }
 
 template <typename Geometry>
 void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& positions,
-                              KVCacheLayerView cache, cudaStream_t stream) {
-    const auto tokens         = static_cast<std::int32_t>(k.ne[2]);
-    const auto padded_context = static_cast<std::int32_t>(cache.padded_context);
-    Tensor& cache_k           = cache.k;
-    Tensor& cache_v           = cache.v;
+                              PagedKVLayerView cache, cudaStream_t stream) {
+    const auto tokens = static_cast<std::int32_t>(k.ne[2]);
+    Tensor& cache_k   = cache.k_pages;
+    Tensor& cache_v   = cache.v_pages;
     if (cache.dtype == DType::I8) {
-        Tensor& cache_k_scale    = cache.k_scale;
-        Tensor& cache_v_scale    = cache.v_scale;
+        Tensor& cache_k_scale    = cache.k_scale_pages;
+        Tensor& cache_v_scale    = cache.v_scale_pages;
         constexpr int kFillBlock = 256;
-        constexpr int kFillWarps = kFillBlock / 32;
-        const std::int64_t fill_units =
-            static_cast<std::int64_t>(tokens) * Geometry::KVHeads * kGqaKvQuantGroups;
-        const int fill_grid =
-            static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(kFillWarps)));
-        gqa_attention_prefill_fill_i8_kernel<Geometry><<<fill_grid, kFillBlock, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
-            static_cast<const std::int32_t*>(positions.data),
-            static_cast<std::int8_t*>(cache_k.data), static_cast<std::int8_t*>(cache_v.data),
-            static_cast<__half*>(cache_k_scale.data), static_cast<__half*>(cache_v_scale.data),
-            tokens, padded_context);
+        if (tokens >= 128 && Geometry::KVHeads == 2) {
+            constexpr int kPageBlock     = 256;
+            constexpr int kTokensPerTile = 8;
+            const int max_tiles          = div_up(tokens + kTokensPerTile - 1, kTokensPerTile);
+            const dim3 fill_grid(static_cast<unsigned>(max_tiles),
+                                 static_cast<unsigned>(Geometry::KVHeads),
+                                 static_cast<unsigned>(kGqaKvQuantGroups));
+            gqa_attention_prefill_fill_i8_page_kernel<Geometry>
+                <<<fill_grid, kPageBlock, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(k.data),
+                    static_cast<const __nv_bfloat16*>(v.data),
+                    static_cast<const std::int32_t*>(positions.data),
+                    static_cast<const std::int32_t*>(cache.block_table.data),
+                    static_cast<std::int8_t*>(cache_k.data),
+                    static_cast<std::int8_t*>(cache_v.data),
+                    static_cast<__half*>(cache_k_scale.data),
+                    static_cast<__half*>(cache_v_scale.data), tokens);
+        } else {
+            constexpr int kFillWarps = kFillBlock / 32;
+            const std::int64_t fill_units =
+                static_cast<std::int64_t>(tokens) * Geometry::KVHeads * kGqaKvQuantGroups;
+            const int fill_grid =
+                static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(kFillWarps)));
+            gqa_attention_prefill_fill_i8_kernel<Geometry><<<fill_grid, kFillBlock, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(k.data),
+                static_cast<const __nv_bfloat16*>(v.data),
+                static_cast<const std::int32_t*>(positions.data),
+                static_cast<const std::int32_t*>(cache.block_table.data),
+                static_cast<std::int8_t*>(cache_k.data), static_cast<std::int8_t*>(cache_v.data),
+                static_cast<__half*>(cache_k_scale.data), static_cast<__half*>(cache_v_scale.data),
+                tokens);
+        }
         CUDA_CHECK(cudaGetLastError());
     } else {
-        constexpr int kBlock           = 256;
+        constexpr int kBlock           = Geometry::KVHeads == 4 ? 128 : 96;
         constexpr int kFillVecElems    = 8;
         const std::int64_t kv_elements = static_cast<std::int64_t>(tokens) * Geometry::KVHeads *
                                          (kGqaPrefillHeadDim / kFillVecElems);
@@ -91,8 +112,9 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
         gqa_attention_prefill_fill_bf16_kernel<Geometry><<<fill_grid, kBlock, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
             static_cast<const std::int32_t*>(positions.data),
+            static_cast<const std::int32_t*>(cache.block_table.data),
             static_cast<__nv_bfloat16*>(cache_k.data), static_cast<__nv_bfloat16*>(cache_v.data),
-            tokens, padded_context);
+            tokens);
         CUDA_CHECK(cudaGetLastError());
     }
 }
@@ -100,7 +122,7 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
 } // namespace
 
 void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positions, float scale,
-                                           const KVCacheLayerView& cache, Tensor& out,
+                                           const PagedKVLayerView& cache, Tensor& out,
                                            cudaStream_t stream) {
     if (q.ne[1] == Gqa27Geometry::QHeads) {
         gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(q, positions, scale, cache, out,
@@ -112,7 +134,7 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
 }
 
 void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
-                          KVCacheLayerView cache, cudaStream_t stream) {
+                          PagedKVLayerView cache, cudaStream_t stream) {
     if (k.ne[1] == Gqa27Geometry::KVHeads) {
         gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, stream);
         return;
@@ -121,7 +143,7 @@ void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positi
 }
 
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
-                                 const Tensor& positions, float scale, KVCacheLayerView cache,
+                                 const Tensor& positions, float scale, PagedKVLayerView cache,
                                  Tensor& out, cudaStream_t stream) {
     gqa_kv_append_launch(k, v, positions, cache, stream);
     gqa_attention_prompt_attention_launch(q, positions, scale, cache, out, stream);

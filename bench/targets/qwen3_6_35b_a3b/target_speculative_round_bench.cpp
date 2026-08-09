@@ -9,7 +9,6 @@
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
-#include "core/kv_cache.h"
 #include "core/layout.h"
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/speculative_round.h"
@@ -201,7 +200,7 @@ StateLayout plan_state(const Options& options, std::uint32_t maximum_k) {
             .kv_heads              = detail::TextConfig::kv_heads,
             .attention_head_dim    = detail::TextConfig::head_dim,
             .kv_dtype              = options.kv_dtype,
-            .kv_quant_group = options.kv_dtype == ninfer::DType::I8 ? ninfer::kKvQuantGroup : 0,
+            .kv_quant_group = options.kv_dtype == ninfer::DType::I8 ? family::kKvQuantGroup : 0,
             .enable_mtp     = false,
             .linear_attention =
                 {
@@ -411,6 +410,11 @@ int run(const Options& options) {
     ninfer::DeviceArena state_arena(layout.bytes);
     const ninfer::DeviceSpan backing{state_arena.base(), state_arena.capacity()};
     family::DecoderState decoder(backing, layout.decoder);
+    ninfer::PagedKVAllocation text_kv =
+        decoder.text_kv.pool().reserve(decoder.text_kv.pool().logical_page_capacity());
+    text_kv.bind_row(0, device.stream);
+    text_kv.materialize_tokens(capacity_options.max_context, device.stream);
+    const family::PagedKVCacheView text_kv_view = decoder.text_kv.execution_view(text_kv);
     family::RoundState round_storage(backing, layout.round);
     ninfer::Tensor prefill_hidden  = layout.prefill_hidden.bind(backing);
     ninfer::Tensor tail_hidden     = layout.tail_hidden.bind(backing);
@@ -434,9 +438,9 @@ int run(const Options& options) {
              runtime::LinearStateSlots::verify_snapshot_base_slot(), device.stream);
 
     {
-        runtime::schedule::TextContext prefill_card(
-            device, model.runtime, workspace, decoder.text_kv, decoder.linear_attention,
-            round_storage, prefill_hidden, options.prefill_chunk, 0, nullptr);
+        runtime::schedule::TextContext prefill_card(device, model.runtime, workspace, text_kv_view,
+                                                    decoder.linear_attention, round_storage,
+                                                    prefill_hidden, options.prefill_chunk, 0);
         prefill_card.set_sampling(
             static_cast<const ninfer::ops::SamplingConfig*>(sampling_span.data));
         const std::vector<ninfer::TokenId> prompt = prompt_tokens(options.context_tokens);
@@ -468,8 +472,9 @@ int run(const Options& options) {
             device,
             model.runtime,
             workspace,
-            decoder.text_kv,
-            nullptr,
+            text_kv_view,
+            family::PagedKVCacheView(),
+            family::PagedKVCacheView(),
             nullptr,
             decoder.linear_attention,
             io,
@@ -480,9 +485,9 @@ int run(const Options& options) {
             ninfer::ProposalHead::Full,
             &tail_hidden,
             &boundary_hidden};
-        runtime::schedule::TextContext card(device, model.runtime, workspace, decoder.text_kv,
+        runtime::schedule::TextContext card(device, model.runtime, workspace, text_kv_view,
                                             decoder.linear_attention, io, prefill_hidden,
-                                            options.prefill_chunk, options.context_tokens, nullptr);
+                                            options.prefill_chunk, options.context_tokens);
         card.set_sampling(static_cast<const ninfer::ops::SamplingConfig*>(sampling_span.data));
         const std::vector<std::int32_t> drafts =
             prepare_drafts(state, card, k, accepted, anchor, base_slot, envelope);

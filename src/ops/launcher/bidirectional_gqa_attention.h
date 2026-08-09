@@ -24,7 +24,7 @@ bidirectional_gqa_resolve_plan(std::int32_t tokens, GqaContextExecutionEnvelope 
 
 void bidirectional_gqa_attention_launch(const Tensor& q, const Tensor& query_k,
                                         const Tensor& query_v, const Tensor& context_length,
-                                        float scale, const KVCacheLayerView& context,
+                                        float scale, const PagedKVLayerView& context,
                                         const BidirectionalGqaPlan& plan, Tensor& partial_acc,
                                         Tensor& partial_m, Tensor& partial_l, Tensor& out,
                                         cudaStream_t stream);

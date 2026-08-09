@@ -10,6 +10,7 @@
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/kernel/gqa_attention_geometry.cuh"
+#include "ops/kernel/paged_kv_address.cuh"
 
 #include <cuda_bf16.h>
 #include <math_constants.h>
@@ -30,11 +31,11 @@ struct GqaCachedInput {
     static constexpr bool writes_cache = false;
 };
 
-__device__ __forceinline__ std::int64_t gqa_cache_index(int kv_head, int d, int position,
-                                                        int padded_context) {
-    return static_cast<std::int64_t>(d) + static_cast<std::int64_t>(kGqaHeadDim) *
-                                              (static_cast<std::int64_t>(position) +
-                                               static_cast<std::int64_t>(padded_context) * kv_head);
+template <typename Geometry>
+__device__ __forceinline__ std::int64_t gqa_cache_index(int physical_page, int kv_head, int d,
+                                                        int page_offset) {
+    return paged_kv_element_offset<kGqaHeadDim, Geometry::KVHeads>(physical_page, kv_head,
+                                                                   page_offset, d);
 }
 
 template <typename Geometry>

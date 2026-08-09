@@ -18,7 +18,8 @@ add_library(ninfer_core STATIC
   core/arena.cu
   core/device.cu
   core/dtype.cpp
-  core/kv_cache.cpp
+  core/cyclic_kv_cache.cpp
+  core/paged_kv_cache.cpp
   core/linear_attention_state.cpp
   core/layout.cpp
   core/tensor.cpp

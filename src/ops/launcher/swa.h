@@ -4,7 +4,7 @@
 
 namespace ninfer::ops::detail {
 
-inline constexpr std::int32_t kSwaMaxCandidateSplit = 128;
+inline constexpr std::int32_t kSwaMaxCandidateSplit = 32;
 
 enum class SwaRoute {
     Direct,
@@ -15,7 +15,6 @@ struct SwaPlan {
     SwaRoute route;
     std::int32_t tokens;
     std::int32_t warps;
-    std::int32_t key_block;
     std::int32_t split_capacity;
     std::int32_t max_context;
 };

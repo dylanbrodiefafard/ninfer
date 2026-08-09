@@ -7,7 +7,7 @@
 #include "ninfer/ops/bidirectional_gqa_attention.h"
 
 #include "core/device.h"
-#include "core/kv_cache.h"
+#include "core/paged_kv_cache.h"
 #include "ninfer_bench_common.h"
 
 #include <cuda_profiler_api.h>
@@ -160,23 +160,21 @@ Options parse_options(int argc, char** argv) {
     return options;
 }
 
-std::int32_t padded_context(std::int32_t context) {
-    return ((std::max(context, 1) + 127) / 128) * 128;
+std::int32_t paged_context(std::int32_t context) {
+    return ((std::max(context, 1) + kPagedKVPageSize - 1) / kPagedKVPageSize) * kPagedKVPageSize;
 }
 
-KVCacheLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v, std::int32_t context) {
-    const std::int32_t padded = padded_context(context);
+PagedKVLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v, DeviceBuffer& block_table,
+                                   std::int32_t context) {
+    const std::int32_t pages = paged_context(context) / kPagedKVPageSize;
     return {
-        .k              = Tensor(k.p, DType::BF16, {kHeadDim, padded, kKvHeads}),
-        .v              = Tensor(v.p, DType::BF16, {kHeadDim, padded, kKvHeads}),
-        .k_scale        = Tensor(),
-        .v_scale        = Tensor(),
-        .max_context    = static_cast<std::uint32_t>(std::max(context, 1)),
-        .padded_context = static_cast<std::uint32_t>(padded),
-        .num_kv_heads   = kKvHeads,
-        .head_dim       = kHeadDim,
-        .dtype          = DType::BF16,
-        .quant_group    = 0,
+        .k_pages      = Tensor(k.p, DType::BF16, {kHeadDim, kPagedKVPageSize, pages, kKvHeads}),
+        .v_pages      = Tensor(v.p, DType::BF16, {kHeadDim, kPagedKVPageSize, pages, kKvHeads}),
+        .block_table  = Tensor(block_table.p, DType::I32, {pages}),
+        .head_dim     = kHeadDim,
+        .num_kv_heads = kKvHeads,
+        .dtype        = DType::BF16,
+        .quant_group  = 0,
     };
 }
 
@@ -193,10 +191,12 @@ public:
           q_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kQueryHeads * tokens)),
           query_k_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kKvHeads * tokens)),
           query_v_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kKvHeads * tokens)),
-          context_k_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) *
-                                       padded_context(context) * kKvHeads * 2)),
-          context_v_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) *
-                                       padded_context(context) * kKvHeads * 2)),
+          context_k_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * paged_context(context) *
+                                       kKvHeads * 2)),
+          context_v_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * paged_context(context) *
+                                       kKvHeads * 2)),
+          block_table_(static_cast<std::size_t>(paged_context(context) / kPagedKVPageSize) *
+                       sizeof(std::int32_t)),
           context_length_(sizeof(std::int32_t)),
           output_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * kQueryHeads * tokens * 2)),
           workspace_bytes_(workspace_capacity(tokens, context)),
@@ -206,10 +206,17 @@ public:
           query_v_tensor_(query_v_.p, DType::BF16, {kHeadDim, kKvHeads, tokens}),
           length_tensor_(context_length_.p, DType::I32, {1}),
           output_tensor_(output_.p, DType::BF16, {kHeadDim, kQueryHeads, tokens}),
-          context_view_(make_context_view(context_k_, context_v_, context)),
+          context_view_(make_context_view(context_k_, context_v_, block_table_, context)),
           envelope_{static_cast<std::uint32_t>(context), static_cast<std::uint32_t>(context)} {
         CUDA_CHECK(
             cudaMemcpy(context_length_.p, &context_, sizeof(context_), cudaMemcpyHostToDevice));
+        std::vector<std::int32_t> table(
+            static_cast<std::size_t>(paged_context(context) / kPagedKVPageSize));
+        for (std::int32_t page = 0; page < static_cast<std::int32_t>(table.size()); ++page) {
+            table[static_cast<std::size_t>(page)] = page;
+        }
+        CUDA_CHECK(
+            cudaMemcpy(block_table_.p, table.data(), block_table_.bytes, cudaMemcpyHostToDevice));
     }
 
     void launch(cudaStream_t stream) {
@@ -228,6 +235,7 @@ private:
     DeviceBuffer query_v_;
     DeviceBuffer context_k_;
     DeviceBuffer context_v_;
+    DeviceBuffer block_table_;
     DeviceBuffer context_length_;
     DeviceBuffer output_;
     std::size_t workspace_bytes_;
@@ -237,7 +245,7 @@ private:
     Tensor query_v_tensor_;
     Tensor length_tensor_;
     Tensor output_tensor_;
-    KVCacheLayerView context_view_;
+    PagedKVLayerView context_view_;
     ops::GqaContextExecutionEnvelope envelope_;
 };
 

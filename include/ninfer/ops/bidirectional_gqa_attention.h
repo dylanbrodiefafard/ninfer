@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/arena.h"
-#include "core/kv_cache.h"
+#include "core/paged_kv_cache.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h>
@@ -33,8 +33,9 @@ struct GqaContextExecutionEnvelope {
  *   ideal[:,h,i] = sum_j prob[j] * value[:,kvh,j]
  *
  * q/out are contiguous BF16 [128,32,T]. query_k/query_v are contiguous BF16 [128,8,T].
- * context_length is a contiguous device I32 scalar L. context is a read-only linear BF16 cache
- * with logical shape [128,capacity,8], of which [0,L) is populated. scale is 1/sqrt(128).
+ * context_length is a contiguous device I32 scalar L. context is a read-only paged BF16 cache
+ * with head-major page planes [128,64,Nphysical,8], of which logical positions [0,L) are
+ * populated. scale is 1/sqrt(128).
  *
  * There is no causal triangle: every query row attends every other query K/V row. Context and
  * query K/V remain separate physical segments and every input/cache byte is unchanged. The oracle
@@ -43,13 +44,13 @@ struct GqaContextExecutionEnvelope {
  * criterion, not the oracle. out is the only observable mutation and is completely overwritten.
  * The current optimized implementation domain is T=1..16 on sm_120a.
  *
- * The caller guarantees min_context <= L <= max_context and L <= context.max_context. The
- * execution envelope may affect finite launch selection and workspace capacity, never the
- * admitted key set or numerical result.
+ * The caller guarantees min_context <= L <= max_context and that every logical page intersecting
+ * [0,L) is materialized. The execution envelope may affect finite launch selection and workspace
+ * capacity, never the admitted key set or numerical result.
  */
 void bidirectional_gqa_attention(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                                  const Tensor& context_length, float scale,
-                                 const KVCacheLayerView& context,
+                                 const PagedKVLayerView& context,
                                  GqaContextExecutionEnvelope envelope, WorkspaceArena& workspace,
                                  Tensor& out, cudaStream_t stream);
 

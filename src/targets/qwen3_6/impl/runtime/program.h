@@ -83,6 +83,11 @@ struct PrefixCheckpoint {
     bool mtp_prefix_valid  = false;
 };
 
+struct SequenceKVBundle {
+    PagedKVAllocation text;
+    std::optional<PagedKVAllocation> backend;
+};
+
 struct OrdinaryGraphVariant {
     std::uint32_t min_execution_frontier = 0;
     std::uint32_t max_execution_frontier = 0;
@@ -148,6 +153,7 @@ public:
     WorkspaceArena work;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
     std::optional<DFlashPersistentState> dflash;
+    std::optional<SequenceKVBundle> sequence_kv;
     qwen3_6::RoundState io;
     Tensor prefill_hidden;
     Tensor sampling_config;
@@ -202,6 +208,17 @@ private:
     void flush_dflash_context_prefix(std::uint32_t count);
     void validate_licensed_tokens(std::span<const TokenId> tokens) const;
     void mark_workspace_usage(std::size_t phase_bytes) noexcept;
+    void reserve_sequence_kv();
+    void bind_sequence_kv();
+    void unbind_sequence_kv() noexcept;
+    void materialize_sequence_kv(std::uint32_t main_tokens, std::uint32_t backend_tokens = 0);
+    void trim_sequence_kv(std::uint32_t main_tokens, std::uint32_t backend_tokens = 0);
+    [[nodiscard]] qwen3_6::PagedKVCache* backend_kv_cache() noexcept;
+    [[nodiscard]] const qwen3_6::PagedKVCache* backend_kv_cache() const noexcept;
+    [[nodiscard]] std::uint32_t backend_kv_valid() const noexcept;
+    [[nodiscard]] qwen3_6::PagedKVCacheView text_kv_view() const;
+    [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view() const;
+    [[nodiscard]] qwen3_6::PagedKVCacheView dflash_full_kv_view() const;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

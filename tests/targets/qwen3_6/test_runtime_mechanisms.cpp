@@ -47,7 +47,7 @@ q36::DecoderStateSpec decoder_spec(ninfer::DType dtype, bool mtp) {
         .kv_heads              = 2,
         .attention_head_dim    = 64,
         .kv_dtype              = dtype,
-        .kv_quant_group        = dtype == ninfer::DType::I8 ? ninfer::kKvQuantGroup : 0,
+        .kv_quant_group        = dtype == ninfer::DType::I8 ? q36::kKvQuantGroup : 0,
         .enable_mtp            = mtp,
         .linear_attention =
             {
@@ -68,9 +68,15 @@ void test_decoder_layout() {
     const q36::DecoderStateLayout bf16 =
         q36::plan_decoder_state(bf16_builder, decoder_spec(ninfer::DType::BF16, false));
     (void)bf16_builder.finish(256);
-    expect(bf16.text_kv.k.size() == 2 && bf16.text_kv.v.size() == 2, "Text KV layer planes");
-    expect(bf16.text_kv.padded_context == 256, "Text KV capacity padding");
-    expect(bf16.text_kv.k_scale.empty() && bf16.text_kv.v_scale.empty(),
+    expect(bf16.text_kv.pool.planes.size() == 4, "BF16 Text KV has K/V planes per layer");
+    expect(bf16.text_kv.pool.spec.page_group_count == 3 &&
+               bf16.text_kv.pool.spec.logical_page_capacity == 3 &&
+               bf16.text_kv.pool.spec.table_rows == 1,
+           "Text KV uses three P=64 pages and one execution row");
+    expect(std::all_of(bf16.text_kv.pool.planes.begin(), bf16.text_kv.pool.planes.end(),
+                       [](const ninfer::PagedKVPlaneLayout& plane) {
+                           return plane.spec.dtype == ninfer::DType::BF16;
+                       }),
            "BF16 KV has no scale planes");
     expect(!bf16.mtp_kv.has_value(), "disabled MTP omits KV storage");
     expect(bf16.linear_attention.conv.size() == 3 && bf16.linear_attention.recurrent.size() == 3,
@@ -82,11 +88,16 @@ void test_decoder_layout() {
     const q36::DecoderStateLayout int8 =
         q36::plan_decoder_state(int8_builder, decoder_spec(ninfer::DType::I8, true));
     (void)int8_builder.finish(256);
-    expect(int8.text_kv.k_scale.size() == 2 && int8.text_kv.v_scale.size() == 2,
-           "INT8 Text KV scale planes");
-    expect(int8.mtp_kv.has_value() && int8.mtp_kv->k.size() == 1, "enabled MTP has one KV layer");
-    expect(int8.mtp_kv && int8.mtp_kv->k_scale.size() == 1 && int8.mtp_kv->v_scale.size() == 1,
-           "INT8 MTP KV scale planes");
+    expect(int8.text_kv.pool.planes.size() == 8 &&
+               int8.text_kv.pool.planes[2].spec.dtype == ninfer::DType::FP16 &&
+               int8.text_kv.pool.planes[3].spec.dtype == ninfer::DType::FP16,
+           "INT8 Text KV has code and scale planes per layer");
+    expect(int8.mtp_kv.has_value() && int8.mtp_kv->layers == 1 &&
+               int8.mtp_kv->pool.planes.size() == 4,
+           "enabled MTP has one paged KV layer");
+    expect(int8.mtp_kv && int8.mtp_kv->pool.planes[2].spec.dtype == ninfer::DType::FP16 &&
+               int8.mtp_kv->pool.planes[3].spec.dtype == ninfer::DType::FP16,
+           "INT8 MTP KV has scale planes");
     expect(int8.kv_payload_bytes() == int8.text_kv.payload_bytes() + int8.mtp_kv->payload_bytes(),
            "INT8 Text/MTP KV payload accounting");
 }

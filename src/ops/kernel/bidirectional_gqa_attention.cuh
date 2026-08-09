@@ -43,7 +43,7 @@ __device__ __forceinline__ std::int64_t bidirectional_gqa_query_kv_index(int kv_
 }
 
 __device__ __forceinline__ std::int64_t
-bidirectional_gqa_context_index(int kv_head, int d, int position, int padded_context) {
+bidirectional_gqa_cyclic_context_index(int kv_head, int d, int position, int padded_context) {
     return static_cast<std::int64_t>(d) + static_cast<std::int64_t>(kBidirectionalGqaHeadDim) *
                                               (static_cast<std::int64_t>(position) +
                                                static_cast<std::int64_t>(padded_context) * kv_head);
@@ -78,18 +78,29 @@ template <bool CyclicSwa, int KeyBlock, int Threads>
 __device__ __forceinline__ void
 bidirectional_gqa_stage_tile(__nv_bfloat16* dst, const __nv_bfloat16* context,
                              const __nv_bfloat16* query, int key0, int valid_keys, bool query_tile,
-                             int kv_head, int padded_context, int tid) {
+                             int kv_head, int context_stride, int physical_page, int tid) {
     constexpr int VecsPerRow = kBidirectionalGqaHeadDim / 8;
+    constexpr int Page       = 64;
+    const std::int64_t paged_base =
+        static_cast<std::int64_t>(kBidirectionalGqaHeadDim) *
+        ((key0 & (Page - 1)) + Page * (physical_page + context_stride * kv_head));
     for (int chunk = tid; chunk < KeyBlock * VecsPerRow; chunk += Threads) {
-        const int row        = chunk / VecsPerRow;
-        const int d          = (chunk - row * VecsPerRow) * 8;
-        const bool live      = row < valid_keys;
-        int context_position = live ? key0 + row : 0;
-        if constexpr (CyclicSwa) { context_position &= kSwaWindow - 1; }
-        const std::int64_t src_index =
-            query_tile
-                ? bidirectional_gqa_query_kv_index(kv_head, d, live ? row : 0)
-                : bidirectional_gqa_context_index(kv_head, d, context_position, padded_context);
+        const int row      = chunk / VecsPerRow;
+        const int d        = (chunk - row * VecsPerRow) * 8;
+        const bool live    = row < valid_keys;
+        const int safe_row = live ? row : 0;
+        std::int64_t src_index;
+        if constexpr (CyclicSwa) {
+            const int context_position = (live ? key0 + row : 0) & (kSwaWindow - 1);
+            src_index = query_tile ? bidirectional_gqa_query_kv_index(kv_head, d, safe_row)
+                                   : bidirectional_gqa_cyclic_context_index(
+                                         kv_head, d, context_position, context_stride);
+        } else {
+            src_index = query_tile
+                            ? bidirectional_gqa_query_kv_index(kv_head, d, safe_row)
+                            : paged_base + d +
+                                  static_cast<std::int64_t>(kBidirectionalGqaHeadDim) * safe_row;
+        }
         const __nv_bfloat16* src = query_tile ? query + src_index : context + src_index;
         __nv_bfloat16* smem = &dst[row * kBidirectionalGqaHeadDim + bidirectional_gqa_swz(row, d)];
         cp_async_zfill<16, Cache::cg>(smem, src, live ? 16 : 0);
@@ -101,9 +112,9 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
     const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ context_state,
     const __nv_bfloat16* __restrict__ context_k, const __nv_bfloat16* __restrict__ context_v,
-    int padded_context, int max_context, int split_capacity, float scale,
-    __nv_bfloat16* __restrict__ partial_acc, float* __restrict__ partial_m,
-    float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
+    const std::int32_t* __restrict__ block_table, int context_stride, int max_context,
+    int split_capacity, float scale, __nv_bfloat16* __restrict__ partial_acc,
+    float* __restrict__ partial_m, float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
     static_assert(Tokens >= 1 && Tokens <= 16);
     static_assert(WarpsPerCta == (Tokens + 3) / 4);
     static_assert(KeyBlock == 32 || KeyBlock == 64);
@@ -147,6 +158,38 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
     const bool owns_query        = split == active_splits - 1;
     const int context_tile_count = tile_end - tile_begin;
     const int iterations         = context_tile_count + (owns_query ? 1 : 0);
+
+    int table_group       = -1;
+    int table_lane_page   = 0;
+    const auto paged_page = [&](int key0) {
+        const int logical_page = key0 >> 6;
+        if constexpr (Tokens == 4) {
+            const int group = logical_page & ~3;
+            if (group != table_group) {
+                const int table_index = group + lane;
+                if (lane < 4 && table_index < (max_context >> 6)) {
+                    table_lane_page = __ldg(block_table + table_index);
+                }
+                table_group = group;
+            }
+            return __shfl_sync(FullMask, table_lane_page, logical_page - group);
+        } else {
+            const int physical_page = lane == 0 ? __ldg(block_table + logical_page) : 0;
+            return __shfl_sync(FullMask, physical_page, 0);
+        }
+    };
+    if constexpr (!CyclicSwa && Tokens == 4) {
+        if (context_tile_count > 0) {
+            const int first_logical_page =
+                (context_start + static_cast<int>(tile_begin) * KeyBlock) >> 6;
+            const int first_group = first_logical_page & ~3;
+            const int table_index = first_group + lane;
+            if (lane < 4 && table_index < (max_context >> 6)) {
+                table_lane_page = __ldg(block_table + table_index);
+            }
+            table_group = first_group;
+        }
+    }
 
     extern __shared__ __align__(16) __nv_bfloat16 shared[];
     __nv_bfloat16* k_s = shared;
@@ -223,14 +266,22 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
             valid_keys = min(KeyBlock, length - key0);
         }
     };
+    const auto tile_page = [&](bool is_query, int key0) {
+        if constexpr (CyclicSwa) {
+            return 0;
+        } else {
+            return is_query ? 0 : paged_page(key0);
+        }
+    };
 
     bool current_is_query = false;
     int current_key0      = 0;
     int current_valid     = 0;
     tile_metadata(0, current_is_query, current_key0, current_valid);
+    int current_page = tile_page(current_is_query, current_key0);
     bidirectional_gqa_stage_tile<CyclicSwa, KeyBlock, Threads>(
         k_s, context_k, query_k, current_key0, current_valid, current_is_query, kv_head,
-        padded_context, tid);
+        context_stride, current_page, tid);
     cp_commit();
 
     for (int iteration = 0; iteration < iterations; ++iteration) {
@@ -239,7 +290,7 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
 
         bidirectional_gqa_stage_tile<CyclicSwa, KeyBlock, Threads>(
             v_s, context_v, query_v, current_key0, current_valid, current_is_query, kv_head,
-            padded_context, tid);
+            context_stride, current_page, tid);
         cp_commit();
 
         float score[QKNt][4];
@@ -264,11 +315,20 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
         bool next_is_query = false;
         int next_key0      = 0;
         int next_valid     = 0;
+        int next_page      = 0;
         if (iteration + 1 < iterations) {
             tile_metadata(iteration + 1, next_is_query, next_key0, next_valid);
+            if constexpr (CyclicSwa) {
+                next_page = tile_page(next_is_query, next_key0);
+            } else {
+                next_page =
+                    !next_is_query && !current_is_query && (next_key0 >> 6) == (current_key0 >> 6)
+                        ? current_page
+                        : tile_page(next_is_query, next_key0);
+            }
             bidirectional_gqa_stage_tile<CyclicSwa, KeyBlock, Threads>(
                 k_s, context_k, query_k, next_key0, next_valid, next_is_query, kv_head,
-                padded_context, tid);
+                context_stride, next_page, tid);
             cp_commit();
         }
 
@@ -375,6 +435,7 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
         current_is_query = next_is_query;
         current_key0     = next_key0;
         current_valid    = next_valid;
+        current_page     = next_page;
     }
 
     if constexpr (!DirectOutput) {
@@ -433,12 +494,12 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void bidirectional_gqa_split_p
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
     const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ context_length,
     const __nv_bfloat16* __restrict__ context_k, const __nv_bfloat16* __restrict__ context_v,
-    int padded_context, int max_context, int split_capacity, float scale,
-    __nv_bfloat16* __restrict__ partial_acc, float* __restrict__ partial_m,
-    float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
+    const std::int32_t* __restrict__ block_table, int physical_pages, int max_context,
+    int split_capacity, float scale, __nv_bfloat16* __restrict__ partial_acc,
+    float* __restrict__ partial_m, float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
     noncausal_gqa_split_partial_body<false, Tokens, WarpsPerCta, KeyBlock, DirectOutput>(
-        q, query_k, query_v, context_length, context_k, context_v, padded_context, max_context,
-        split_capacity, scale, partial_acc, partial_m, partial_l, out);
+        q, query_k, query_v, context_length, context_k, context_v, block_table, physical_pages,
+        max_context, split_capacity, scale, partial_acc, partial_m, partial_l, out);
 }
 
 template <int Tokens, int WarpsPerCta, int KeyBlock, bool DirectOutput>
@@ -450,7 +511,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void swa_split_partial_kernel(
     __nv_bfloat16* __restrict__ partial_acc, float* __restrict__ partial_m,
     float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
     noncausal_gqa_split_partial_body<true, Tokens, WarpsPerCta, KeyBlock, DirectOutput>(
-        q, query_k, query_v, positions, context_k, context_v, padded_context, max_context,
+        q, query_k, query_v, positions, context_k, context_v, nullptr, padded_context, max_context,
         split_capacity, scale, partial_acc, partial_m, partial_l, out);
 }
 

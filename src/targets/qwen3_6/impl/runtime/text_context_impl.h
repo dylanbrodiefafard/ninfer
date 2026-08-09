@@ -198,16 +198,17 @@ void DFlashFeatureSink::consume_prefill_chunk(std::int32_t tokens, bool boundary
 }
 
 TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
-                         KVCache& kv, LinearAttentionStatePool& state, qwen3_6::RoundState& io,
-                         Tensor& prefill_hidden, std::uint32_t prefill_chunk,
-                         std::uint32_t text_kv_base, KVCache* mtp_kv)
+                         qwen3_6::PagedKVCacheView kv, LinearAttentionStatePool& state,
+                         qwen3_6::RoundState& io, Tensor& prefill_hidden,
+                         std::uint32_t prefill_chunk, std::uint32_t text_kv_base,
+                         qwen3_6::PagedKVCacheView mtp_kv)
     : ctx_(ctx), weights_(weights), work_(work), kv_(kv), mtp_kv_(mtp_kv), state_(state), io_(io),
       prefill_hidden_(prefill_hidden), prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base) {
     if (prefill_chunk_ == 0 ||
         prefill_chunk_ > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("TextContext effective prefill chunk must fit positive int32");
     }
-    if (mtp_kv_ != nullptr && !io_.mtp) {
+    if (mtp_kv_.valid() && !io_.mtp) {
         throw std::invalid_argument("MTP TextContext requires MTP round state");
     }
     bind();
@@ -229,7 +230,7 @@ void TextContext::bind() {
                           proposal.head.n);
     }
 
-    if (mtp_kv_ != nullptr) {
+    if (mtp_kv_.valid()) {
         if (!weights_.mtp) {
             throw std::invalid_argument("MTP state was enabled without materialized MTP weights");
         }
@@ -274,7 +275,7 @@ void TextContext::bind() {
 }
 
 const MtpW& TextContext::mtp_weights() const {
-    if (mtp_kv_ == nullptr) { throw std::runtime_error("MTP draft weights are not enabled"); }
+    if (!mtp_kv_.valid()) { throw std::runtime_error("MTP draft weights are not enabled"); }
     return mtp_;
 }
 
@@ -335,7 +336,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     ops::rope(rope_positions, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
-    ops::gqa_attention(qn, kn, v, positions, kAttnScale, mtp_kv_->layer_view(0), envelope, work_, a,
+    ops::gqa_attention(qn, kn, v, positions, kAttnScale, mtp_kv_.layer_view(0), envelope, work_, a,
                        s);
     ops::sigmoid_mul(gate, a, s);
 
@@ -358,7 +359,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
 void TextContext::mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                                    const Tensor& rope_positions, ops::GqaExecutionEnvelope envelope,
                                    Tensor& mtp_hidden, const Tensor* input_embeddings) {
-    if (mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
+    if (!mtp_kv_.valid()) { throw std::runtime_error("MTP forward is not enabled"); }
     auto scratch_scope = work_.scope();
     Tensor x;
     Tensor ah;
@@ -371,7 +372,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                                     const Tensor& rope_positions,
                                     ops::GqaExecutionEnvelope envelope, bool final_chunk,
                                     Tensor* final_hidden, Tensor* logits, Tensor* draft_token) {
-    if (mtp_kv_ == nullptr) { throw std::runtime_error("MTP prefill is not enabled"); }
+    if (!mtp_kv_.valid()) { throw std::runtime_error("MTP prefill is not enabled"); }
     const int T = ids.ne[0];
     if (T <= 0 || static_cast<std::uint32_t>(T) > prefill_chunk_) {
         throw std::invalid_argument("MTP prefill chunk T must be in [1,prefill_chunk]");
@@ -420,7 +421,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         Tensor kn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_kv, T});
         ops::rmsnorm(k, *mtp_.k_norm, kCfg.rms_eps, true, kn, s);
         ops::rope(rope_positions, kCfg.rotary_dim, kCfg.rope_theta, kn, s);
-        ops::gqa_kv_append(kn, v, positions, mtp_kv_->layer_view(0), s);
+        ops::gqa_kv_append(kn, v, positions, mtp_kv_.layer_view(0), s);
 
         if (final_chunk) {
             const std::size_t column_bytes =
@@ -462,7 +463,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         ops::rope(last_rope_position, kCfg.rotary_dim, kCfg.rope_theta, qn, s);
 
         Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, 1});
-        ops::gqa_attention_cached(qn, last_position, kAttnScale, mtp_kv_->layer_view(0), envelope,
+        ops::gqa_attention_cached(qn, last_position, kAttnScale, mtp_kv_.layer_view(0), envelope,
                                   work_, a, s);
         ops::sigmoid_mul(gate, a, s);
 
@@ -504,7 +505,7 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
                                     Tensor& mtp_hidden, int logits_column, Tensor* logits,
                                     Tensor* draft_token, const Tensor* explicit_rope_positions,
                                     const Tensor* input_embeddings) {
-    if (mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
+    if (!mtp_kv_.valid()) { throw std::runtime_error("MTP forward is not enabled"); }
     const int T = ids.ne[0];
     if (T <= 0 || static_cast<std::uint32_t>(T) > prefill_chunk_) {
         throw std::invalid_argument("MTP batch T must be in [1,prefill_chunk]");
@@ -548,7 +549,7 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
 void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
                                       const Tensor& position, ops::GqaExecutionEnvelope envelope,
                                       Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token) {
-    if (mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
+    if (!mtp_kv_.valid()) { throw std::runtime_error("MTP forward is not enabled"); }
     require_tensor_shape(token, DType::I32, {1}, "MTP AR token");
     require_tensor_shape(position, DType::I32, {1}, "MTP AR position");
     require_tensor_shape(previous_hidden, DType::BF16, {kCfg.hidden, 1}, "MTP AR previous hidden");
@@ -568,7 +569,7 @@ void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
 void TextContext::mtp_sample_from_hidden_row(const Tensor& mtp_hidden, const Tensor& row,
                                              Tensor& out_hidden, Tensor& logits,
                                              Tensor& draft_token) {
-    if (mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
+    if (!mtp_kv_.valid()) { throw std::runtime_error("MTP forward is not enabled"); }
     if (mtp_hidden.dtype != DType::BF16 || mtp_hidden.ne[0] != kCfg.hidden ||
         mtp_hidden.ne[1] <= 0 || mtp_hidden.ne[2] != 1 || mtp_hidden.ne[3] != 1 ||
         !mtp_hidden.is_contiguous() || mtp_hidden.data == nullptr) {
@@ -882,8 +883,8 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
             static_cast<std::uint64_t>(base) + static_cast<std::uint64_t>(T) +
             2ULL * static_cast<std::uint64_t>(io_.speculative.draft_tokens.ne[0]);
         prepare_mtp_prompt =
-            mtp_required_end <= static_cast<std::uint64_t>(mtp_kv_->max_context) &&
-            target_round_required_end <= static_cast<std::uint64_t>(kv_.max_context);
+            mtp_required_end <= static_cast<std::uint64_t>(mtp_kv_.max_context()) &&
+            target_round_required_end <= static_cast<std::uint64_t>(kv_.max_context());
     }
     mtp_prompt_prepared_       = prepare_mtp_prompt;
     last_prefill_chunk_length_ = 0;

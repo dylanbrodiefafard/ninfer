@@ -12,7 +12,7 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 void mtp_bridge_and_propose(State& state, const Tensor& next_token, const Tensor& previous_hidden,
                             std::int32_t position, std::span<const std::int32_t> rope_position,
                             bool build_proposal, const Tensor* next_embedding) {
-    if (state.mtp_kv == nullptr || !state.io.mtp) {
+    if (!state.mtp_kv.valid() || !state.io.mtp) {
         throw std::logic_error("MTP bridge requires MTP storage");
     }
     if (rope_position.size() != 3) {
@@ -57,7 +57,7 @@ void mtp_bridge_and_propose(State& state, const Tensor& next_token, const Tensor
 }
 
 auto mtp_body(State& state, std::uint32_t k, MtpGqaEnvelopes envelopes) {
-    if (state.mtp_kv == nullptr || !state.io.mtp || k == 0 ||
+    if (!state.mtp_kv.valid() || !state.io.mtp || k == 0 ||
         k != static_cast<std::uint32_t>(state.io.speculative.draft_tokens.ne[0])) {
         throw std::logic_error("MTP round storage does not match its configured window");
     }

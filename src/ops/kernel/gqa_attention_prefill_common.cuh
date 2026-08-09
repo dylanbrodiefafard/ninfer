@@ -8,6 +8,7 @@
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/kernel/gqa_attention_geometry.cuh"
+#include "ops/kernel/paged_kv_address.cuh"
 
 #include <cuda_bf16.h>
 
@@ -23,13 +24,6 @@ inline constexpr int kGqaPrefillThreads   = 128;
 inline constexpr int kGqaPrefillSmemBytes = (kGqaPrefillBr + 2 * kGqaPrefillBc) *
                                             kGqaPrefillHeadDim *
                                             static_cast<int>(sizeof(__nv_bfloat16));
-
-__device__ __forceinline__ std::int64_t gqa_prefill_cache_index(int kv_head, int d, int position,
-                                                                int padded_context) {
-    return static_cast<std::int64_t>(d) + static_cast<std::int64_t>(kGqaPrefillHeadDim) *
-                                              (static_cast<std::int64_t>(position) +
-                                               static_cast<std::int64_t>(padded_context) * kv_head);
-}
 
 template <typename Geometry>
 __device__ __forceinline__ std::int64_t gqa_prefill_q_index(int q_head, int d, int token) {

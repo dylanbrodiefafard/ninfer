@@ -15,6 +15,7 @@ namespace ninfer::ops {
 namespace {
 
 constexpr std::int32_t kHeadDim                      = 256;
+constexpr std::int32_t kQuantGroup                   = 64;
 constexpr float kExpectedScale                       = 0.0625f;
 constexpr std::int32_t kSmallTChunkTokens            = 6;
 constexpr std::int32_t kMaximumVerifyTokens          = 16;
@@ -33,13 +34,6 @@ void require_kv_heads(std::int32_t kv_heads, const char* op) {
     }
 }
 
-std::int32_t checked_i32(std::uint32_t value, const char* op, const char* name) {
-    if (value > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
-        throw std::overflow_error(std::string(op) + ": " + name + " exceeds int32");
-    }
-    return static_cast<std::int32_t>(value);
-}
-
 void require_shape(const Tensor& tensor, std::int32_t n0, std::int32_t n1, std::int32_t n2,
                    std::int32_t n3, const char* op, const char* name) {
     if (tensor.ne[0] != n0 || tensor.ne[1] != n1 || tensor.ne[2] != n2 || tensor.ne[3] != n3) {
@@ -56,52 +50,68 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
     }
 }
 
-void validate_cache(const KVCacheLayerView& cache, std::int32_t kv_heads, const char* op) {
+std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_heads, const char* op) {
     if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8) ||
         cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
-    if (cache.max_context == 0 || cache.padded_context < cache.max_context) {
-        throw std::invalid_argument(std::string(op) + ": invalid KV cache capacity");
-    }
     if (cache.dtype == DType::BF16 && cache.quant_group != 0) {
         throw std::invalid_argument(std::string(op) + ": BF16 KV cache must not have quant_group");
     }
-    if (cache.dtype == DType::I8 && cache.quant_group != kKvQuantGroup) {
+    if (cache.dtype == DType::I8 && cache.quant_group != kQuantGroup) {
         throw std::invalid_argument(std::string(op) + ": I8 KV cache must use quant_group 64");
     }
 
-    const std::int32_t padded = checked_i32(cache.padded_context, op, "padded_context");
-    const DType code_dtype    = cache.dtype == DType::I8 ? DType::I8 : DType::BF16;
-    if (cache.k.dtype != code_dtype || cache.v.dtype != code_dtype) {
+    const std::int32_t physical_pages = cache.k_pages.ne[3];
+    const std::int32_t logical_pages  = cache.block_table.ne[0];
+    const std::int64_t capacity       = static_cast<std::int64_t>(logical_pages) * kPagedKVPageSize;
+    if (physical_pages <= 0 || logical_pages <= 0 ||
+        capacity > std::numeric_limits<std::int32_t>::max()) {
+        throw std::invalid_argument(std::string(op) + ": invalid KV cache capacity");
+    }
+
+    const DType code_dtype = cache.dtype == DType::I8 ? DType::I8 : DType::BF16;
+    if (cache.k_pages.dtype != code_dtype || cache.v_pages.dtype != code_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
     }
-    require_shape(cache.k, kHeadDim, padded, kv_heads, 1, op, "cache k");
-    require_shape(cache.v, kHeadDim, padded, kv_heads, 1, op, "cache v");
-    require_contiguous_nonnull(cache.k, op, "cache k");
-    require_contiguous_nonnull(cache.v, op, "cache v");
+    require_shape(cache.k_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+                  "cache k pages");
+    require_shape(cache.v_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+                  "cache v pages");
+    require_contiguous_nonnull(cache.k_pages, op, "cache k pages");
+    require_contiguous_nonnull(cache.v_pages, op, "cache v pages");
+    if (cache.block_table.dtype != DType::I32) {
+        throw std::invalid_argument(std::string(op) + ": block table must be I32");
+    }
+    require_shape(cache.block_table, logical_pages, 1, 1, 1, op, "block table");
+    require_contiguous_nonnull(cache.block_table, op, "block table");
 
     if (cache.dtype == DType::BF16) {
-        if (cache.k_scale.data != nullptr || cache.v_scale.data != nullptr) {
+        if (cache.k_scale_pages.data != nullptr || cache.v_scale_pages.data != nullptr) {
             throw std::invalid_argument(std::string(op) + ": BF16 KV cache must not have scales");
         }
-        return;
+        return static_cast<std::uint32_t>(capacity);
     }
 
-    constexpr std::int32_t groups = kHeadDim / kKvQuantGroup;
-    if (cache.k_scale.dtype != DType::FP16 || cache.v_scale.dtype != DType::FP16) {
+    constexpr std::int32_t groups = kHeadDim / kQuantGroup;
+    if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
     }
-    require_shape(cache.k_scale, groups, padded, kv_heads, 1, op, "cache k scale");
-    require_shape(cache.v_scale, groups, padded, kv_heads, 1, op, "cache v scale");
-    require_contiguous_nonnull(cache.k_scale, op, "cache k scale");
-    require_contiguous_nonnull(cache.v_scale, op, "cache v scale");
+    require_shape(cache.k_scale_pages, groups, kPagedKVPageSize, kv_heads, physical_pages, op,
+                  "cache k scale pages");
+    require_shape(cache.v_scale_pages, groups, kPagedKVPageSize, kv_heads, physical_pages, op,
+                  "cache v scale pages");
+    require_contiguous_nonnull(cache.k_scale_pages, op, "cache k scale pages");
+    require_contiguous_nonnull(cache.v_scale_pages, op, "cache v scale pages");
+    return static_cast<std::uint32_t>(capacity);
 }
 
-void validate_envelope(GqaExecutionEnvelope envelope, const KVCacheLayerView& cache,
+void validate_envelope(GqaExecutionEnvelope envelope, const PagedKVLayerView& cache,
                        std::int32_t tokens, const char* op) {
+    const std::uint32_t capacity = validate_cache(cache, cache.num_kv_heads, op);
     if (envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys ||
-        envelope.max_visible_keys > cache.max_context) {
+        envelope.max_visible_keys > kGqaAttentionMaximumVisibleKeys ||
+        envelope.max_visible_keys > capacity) {
         throw std::invalid_argument(std::string(op) + ": invalid execution envelope");
     }
     if (envelope.max_visible_keys < static_cast<std::uint32_t>(tokens)) {
@@ -110,7 +120,7 @@ void validate_envelope(GqaExecutionEnvelope envelope, const KVCacheLayerView& ca
 }
 
 void validate_attention_tensors(const Tensor& q, const Tensor& positions, const Tensor& out,
-                                const KVCacheLayerView& cache, GqaExecutionEnvelope envelope,
+                                const PagedKVLayerView& cache, GqaExecutionEnvelope envelope,
                                 float scale, const char* op) {
     if (q.dtype != DType::BF16 || out.dtype != DType::BF16) {
         throw std::invalid_argument(std::string(op) + ": q/out must be BF16");
@@ -131,7 +141,9 @@ void validate_attention_tensors(const Tensor& q, const Tensor& positions, const 
     require_contiguous_nonnull(q, op, "q");
     require_contiguous_nonnull(positions, op, "positions");
     require_contiguous_nonnull(out, op, "out");
-    validate_cache(cache, kv_heads, op);
+    if (cache.num_kv_heads != kv_heads) {
+        throw std::invalid_argument(std::string(op) + ": invalid KV cache head geometry");
+    }
     validate_envelope(envelope, cache, tokens, op);
 }
 
@@ -169,7 +181,7 @@ void for_each_small_t_chunk(const Tensor& q, const Tensor& positions, WorkspaceA
 }
 
 void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
-                            const Tensor& positions, float scale, KVCacheLayerView cache,
+                            const Tensor& positions, float scale, PagedKVLayerView cache,
                             GqaExecutionEnvelope envelope, WorkspaceArena& workspace, Tensor& out,
                             cudaStream_t stream) {
     for_each_small_t_chunk(
@@ -185,7 +197,7 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
 }
 
 void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions, float scale,
-                                   const KVCacheLayerView& cache, GqaExecutionEnvelope envelope,
+                                   const PagedKVLayerView& cache, GqaExecutionEnvelope envelope,
                                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
     for_each_small_t_chunk(
         q, positions, workspace, cache.dtype, envelope, out,
@@ -236,8 +248,7 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
     if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8) || min_tokens <= 0 ||
         max_tokens < min_tokens || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
-        envelope.max_visible_keys >
-            static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
+        envelope.max_visible_keys > kGqaAttentionMaximumVisibleKeys ||
         envelope.max_visible_keys < static_cast<std::uint32_t>(max_tokens)) {
         throw std::invalid_argument("gqa_attention workspace: invalid profile or interval");
     }
@@ -273,7 +284,7 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
 }
 
 void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
-                   float scale, KVCacheLayerView cache, GqaExecutionEnvelope envelope,
+                   float scale, PagedKVLayerView cache, GqaExecutionEnvelope envelope,
                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
     constexpr const char* op = "gqa_attention";
     validate_attention_tensors(q, positions, out, cache, envelope, scale, op);
@@ -306,7 +317,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
 }
 
 void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
-                   KVCacheLayerView cache, cudaStream_t stream) {
+                   PagedKVLayerView cache, cudaStream_t stream) {
     constexpr const char* op = "gqa_kv_append";
     if (k.dtype != DType::BF16 || v.dtype != DType::BF16) {
         throw std::invalid_argument("gqa_kv_append: k/v must be BF16");
@@ -324,15 +335,15 @@ void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
     require_contiguous_nonnull(k, op, "k");
     require_contiguous_nonnull(v, op, "v");
     require_contiguous_nonnull(positions, op, "positions");
-    validate_cache(cache, kv_heads, op);
-    if (static_cast<std::uint32_t>(tokens) > cache.max_context) {
+    const std::uint32_t capacity = validate_cache(cache, kv_heads, op);
+    if (static_cast<std::uint32_t>(tokens) > capacity) {
         throw std::invalid_argument("gqa_kv_append: T exceeds KV cache capacity");
     }
     detail::gqa_kv_append_launch(k, v, positions, cache, stream);
 }
 
 void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
-                          const KVCacheLayerView& cache, GqaExecutionEnvelope envelope,
+                          const PagedKVLayerView& cache, GqaExecutionEnvelope envelope,
                           WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
     constexpr const char* op = "gqa_attention_cached";
     validate_attention_tensors(q, positions, out, cache, envelope, scale, op);

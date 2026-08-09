@@ -36,8 +36,7 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
 }
 
 void validate_context(const CyclicKVCacheLayerView& context, const char* op) {
-    if (context.dtype != DType::BF16 || context.quant_group != 0 ||
-        context.num_kv_heads != kKVHeads || context.head_dim != kHeadDim ||
+    if (context.num_kv_heads != kKVHeads || context.head_dim != kHeadDim ||
         context.capacity != kWindow || context.padded_capacity < context.capacity) {
         throw std::invalid_argument(std::string(op) + ": invalid cyclic context");
     }
@@ -53,9 +52,6 @@ void validate_context(const CyclicKVCacheLayerView& context, const char* op) {
     require_shape(context.v, kHeadDim, padded, kKVHeads, 1, op, "context v");
     require_contiguous_nonnull(context.k, op, "context k");
     require_contiguous_nonnull(context.v, op, "context v");
-    if (context.k_scale.data != nullptr || context.v_scale.data != nullptr) {
-        throw std::invalid_argument(std::string(op) + ": BF16 context must not have scales");
-    }
 }
 
 struct PartialWorkspace {

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/kv_cache.h"
+#include "core/paged_kv_cache.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h> // cudaStream_t
@@ -9,6 +9,8 @@
 #include <cstdint>
 
 namespace ninfer::ops {
+
+inline constexpr std::uint32_t kGqaAttentionMaximumVisibleKeys = 262144;
 
 struct GqaExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;
@@ -65,7 +67,8 @@ struct GqaExecutionEnvelope {
  *
  * The registered geometries are `[256,24|4,T]` group 6 and `[256,16|2,T]` group 8. q/k/v/out
  * are contiguous BF16, positions is contiguous sequential I32 [T], and scale is 1/sqrt(256).
- * T may be any positive value that fits the declared cache and execution envelope.
+ * T may be any positive value that fits the declared cache and execution envelope. The execution
+ * envelope may expose at most kGqaAttentionMaximumVisibleKeys keys.
  * Cache storage is BF16 or INT8-G64 under the shared numerical contract above. The caller
  * guarantees that every row in the causal domain is populated and that `positions[T-1]+1` lies in
  * the declared execution envelope. The envelope is a host launch-resource promise; it does not
@@ -75,7 +78,7 @@ struct GqaExecutionEnvelope {
  * non-overlapping. The Op overwrites every addressed cache row but owns no persistent frontier.
  */
 void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
-                   float scale, KVCacheLayerView cache, GqaExecutionEnvelope envelope,
+                   float scale, PagedKVLayerView cache, GqaExecutionEnvelope envelope,
                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
 
 /**
@@ -84,7 +87,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
  * no unrelated cache row, receives no execution envelope, and owns no persistent frontier.
  */
 void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
-                   KVCacheLayerView cache, cudaStream_t stream);
+                   PagedKVLayerView cache, cudaStream_t stream);
 
 /**
  * A3: compute causal attention from an already populated cache without accepting new K/V or
@@ -93,7 +96,7 @@ void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
  * to A1. Caller workspace is reported by gqa_attention_workspace_capacity_bytes().
  */
 void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
-                          const KVCacheLayerView& cache, GqaExecutionEnvelope envelope,
+                          const PagedKVLayerView& cache, GqaExecutionEnvelope envelope,
                           WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops

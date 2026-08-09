@@ -11,7 +11,6 @@
 #include "core/decode_graph.h"
 #include "runtime/contract/transient_region.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
-#include "core/kv_cache.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
@@ -34,8 +33,9 @@ struct State {
     DeviceContext& device;
     const LoadedModelData& model;
     WorkspaceArena& work;
-    KVCache& text_kv;
-    KVCache* mtp_kv;
+    qwen3_6::PagedKVCacheView text_kv;
+    qwen3_6::PagedKVCacheView mtp_kv;
+    qwen3_6::PagedKVCacheView dflash_full_kv;
     DFlashPersistentState* dflash;
     LinearAttentionStatePool& linear_attention;
     qwen3_6::RoundState& io;

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/arena.h"
-#include "core/kv_cache.h"
+#include "core/cyclic_kv_cache.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h>

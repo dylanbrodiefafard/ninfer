@@ -1,6 +1,7 @@
 #pragma once
 
-#include "core/kv_cache.h"
+#include "core/cyclic_kv_cache.h"
+#include "core/paged_kv_cache.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h>
@@ -21,19 +22,22 @@ struct KVCacheAppendPrefixExecutionEnvelope {
 };
 
 /**
- * Op: append a device-selected exact K/V prefix to linear cache storage.
+ * Op: append a device-selected exact K/V prefix to paged growing cache storage.
  *
  * k/v are contiguous BF16 [128,8,T], positions is contiguous sequential device I32 [T], and
  * commit_count is a contiguous device I32 scalar. For every i in [0,commit_count), the Op copies
- * k/v[:, :, i] bit-for-bit into the linear cache row positions[i]. No cache byte for any rejected
- * i is written. Inputs are unchanged, and the Op neither decides nor publishes a frontier.
+ * k/v[:, :, i] bit-for-bit into logical cache position positions[i]. No cache byte for any
+ * rejected i is written. Inputs are unchanged, and the Op neither decides nor publishes a
+ * frontier. The paged K/V planes use the DFlash Full head-major order
+ * [128,64,Nphysical,8].
  *
  * The caller guarantees positive T, 0 <= commit_count <= T within the declared envelope, valid
- * sequential nonnegative positions, pairwise non-aliasing, and sufficient cache capacity.
+ * sequential nonnegative positions, pairwise non-aliasing, and materialized block-table entries
+ * for every position allowed by the envelope.
  */
 void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& positions,
                             const Tensor& commit_count,
-                            KVCacheAppendPrefixExecutionEnvelope envelope, KVCacheLayerView cache,
+                            KVCacheAppendPrefixExecutionEnvelope envelope, PagedKVLayerView cache,
                             cudaStream_t stream);
 
 /**

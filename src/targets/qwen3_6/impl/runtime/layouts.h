@@ -2,6 +2,7 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
+#include "core/cyclic_kv_cache.h"
 #include "core/dtype.h"
 #include "core/layout.h"
 #include "core/tensor.h"
@@ -19,9 +20,9 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 using TensorLayout = TensorRegion;
 
 struct DFlashPersistentLayout {
-    KVCacheLayout local;
-    KVCacheLayout boundary_local;
-    KVCacheLayout full;
+    CyclicKVCacheLayout local;
+    CyclicKVCacheLayout boundary_local;
+    qwen3_6::PagedKVCacheLayout full;
     TensorLayout commit_count;
     TensorLayout target_features;
     TensorLayout feature_positions;
