@@ -128,6 +128,7 @@ The artifact supports:
 - MTP speculative decoding with draft windows from one to five;
 - BF16 and INT8 group-64 KV cache;
 - CUDA Graph decode and compatible-prefix reuse;
+- startup-bounded small-scale concurrent serving with true batched decode;
 - the NInfer CLI;
 - OpenAI Chat Completions and Anthropic Messages serving.
 
@@ -193,9 +194,10 @@ These are single-sample results under the stated NInfer evaluation profile, not 
 
 - The artifact is accepted only by NInfer revision `bd265a3` or later and the matching registered
   target.
-- NInfer currently executes on one RTX 5090, one CUDA device, and one active request per Engine.
-- It does not provide continuous batching, multi-GPU execution, CPU/GPU offload, or distributed
-  serving.
+- NInfer executes on one RTX 5090 and one CUDA device, with a startup-fixed capacity of 1–8 active
+  requests per Engine.
+- It does not provide large-scale or preemptive continuous batching, priority/QoS scheduling,
+  multi-GPU execution, CPU/GPU offload, or distributed serving.
 - Context allocation is subject to GPU memory and the selected KV-cache type.
 - NInfer does not execute generated tool calls.
 

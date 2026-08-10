@@ -26,8 +26,6 @@ benchmark-report, and external protocol behavior. Repository verification princi
   and the opt-in real public-Engine route;
 - `test_ninfer_artifact_reader.cpp` — C++ framing, directory, encoded-size, payload-span, and
   geometry behavior against a self-contained C++ fixture;
-- `test_generation_controller.cpp` — accepted-prefix, cancellation, publication ordering, and
-  request-abort behavior in the common generated-token loop;
 - `test_request_memory.cpp` — startup-frozen request-transient capacity, stable address,
   activation alignment, rejection, and peak semantics;
 - `test_openai_schema.cpp`, `test_anthropic_schema.cpp`, and `test_tool_call_parser.cpp` — current

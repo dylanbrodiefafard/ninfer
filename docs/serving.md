@@ -11,6 +11,7 @@ Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
   --port 8080 \
   --model-id qwen3.6-27b \
   --max-context 16384 \
+  --max-concurrency 2 \
   --spec mtp --draft-tokens 3 \
   --lm-head-draft
 ```
@@ -154,7 +155,10 @@ curl http://127.0.0.1:8080/v1/models \
 | `--port N` | listen port | `8080` |
 | `--api-key KEY` | required bearer or `x-api-key` value | unset |
 | `--model-id ID` | public OpenAI model alias | `qwen3.6-27b` |
-| `--max-context N` | engine context capacity | `8192` |
+| `--max-context N` | per-sequence logical ceiling and shared Main Text KV page budget | `8192` |
+| `--max-concurrency N` | maximum admitted requests; valid range `1..8` | `1` |
+| `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
+| `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
 | `--device N` | CUDA device index | `0` |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
@@ -201,11 +205,10 @@ that server instance.
 | `request_done` | finish reason, prompt/completion/cache tokens, unrounded phase seconds, and complete speculative-decoding counters |
 | `request_error` | the resolved request configuration and generation error message |
 
-`request_done.timings_seconds` contains `prepare`, `vision`, `prefill`, `decode`, and `total` as
-full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
-`drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates and TTFT
-are intentionally derived downstream from raw token counts and seconds instead of being stored as
-rounded strings.
+`request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
+as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
+`drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
+derived downstream from raw token counts and seconds instead of rounded stderr strings.
 
 The JSONL file contains no generated response text and never records an API-key value; `argv`
 replaces that value with `<redacted>`. The existing stderr summaries remain available for operators
@@ -215,8 +218,31 @@ and token-count-only calls are not measurement requests and do not receive reque
 
 ## Execution behavior
 
-The server accepts concurrent HTTP connections, but model execution is serialized because one
-Engine owns one resident sequence. It does not perform continuous batching.
+The server owns one resident Engine with a startup-fixed capacity of `1..8` active generation
+requests. At each decode boundary, every decode-ready request is compacted into one batch and
+processed by one model traversal and, when graphs are enabled, one exact-batch CUDA Graph replay. A
+request joins that batch only after its single-request prefill finishes; when it completes or is
+cancelled, the next boundary rebuilds the batch without an empty row.
+
+`--max-pending-requests` bounds the requests waiting behind the active set. The total generation
+request lifetime capacity is `max_concurrency + max_pending_requests`, including requests still in
+CPU/media preparation and completed model results whose response has not yet been released. A full
+capacity returns HTTP 429 with code `server_overloaded`. The absolute
+`--pending-timeout-ms` deadline starts before preparation, covers media acquisition and Engine FIFO
+waiting, and returns HTTP 503 with code `request_queue_timeout` if admission does not occur in time.
+There is no admission ETA or unbounded overflow queue.
+
+Input memory is bounded by the outstanding-request count and the per-request
+`--max-request-mib` limit. Media requests additionally share one preparation permit, so a waiting
+media request retains the same cancellation and timeout deadline. Model output is bounded by the
+same finite request count and each request's effective output-token limit; output callbacks and
+network serialization run outside the GPU executor and do not delay formation of the next batch.
+
+`--max-context` is not divided evenly among active requests. It defines each sequence's logical
+ceiling and the shared Main Text KV page budget. Admission reserves the full prompt-plus-effective-
+output entitlement, so an admitted request can finish within its declared bound. A later request
+waits in FIFO order when the remaining shared pages cannot satisfy its complete entitlement; the
+Engine never admits it and later truncates an older request to recover capacity.
 
 Compatible resident prefixes are reused for both text and multimodal histories unless the server is
 started with `--no-prefix-reuse`. A multimodal hit requires matching token types, three-axis MRoPE

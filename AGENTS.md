@@ -109,19 +109,21 @@ a small set of explicitly registered checkpoint targets. The current product sup
 peer targets: `qwen3_6_27b` and `qwen3_6_35b_a3b`. The current implementation is compiled for
 `sm_120a` and tuned and measured on NVIDIA GeForce RTX 5090. Both targets execute Text, image/video
 Vision, MTP, prefix reuse, CLI, OpenAI/Anthropic serving, and measurement through the same public
-`.ninfer` Engine route.
+`.ninfer` Engine route; the 35B-A3B target additionally supports text-only DFlash.
 
-The current workload is one user, one active request, and one GPU. Continuous batching, additional
-checkpoint targets, and retargeting the implementation to another execution platform are outside
-the current product. This is a local, single-owner project. Registered models, generated artifacts,
-and the local workflow are trusted.
+The current workload is one GPU and one resident model instance with a startup-fixed one to eight
+active requests. The Engine forms one compact decode batch at every round boundary and uses bounded
+FIFO ingress with no request preemption. Large-scale or preemptive continuous batching, priority/QoS
+scheduling, additional checkpoint targets, and retargeting the implementation to another execution
+platform are outside the current product. This is a local, single-owner project. Registered models,
+generated artifacts, and the local workflow are trusted.
 Requirements derived from a different workload, trust model, or deployment model are out of scope
 until that product contract is explicitly changed.
 
 The two targets are peer compile-time Variants of one identity-free Qwen3.6 family runtime. The
 family owns the shared `SequencePlan<Variant>`, `RequestPlan<Variant>`, and `Program<Variant>`
-algorithms; frontend and output semantics; Text/Vision/MTP schedules; state transactions; workspace
-composition; and CUDA Graph capture/replay mechanics. Each exact package separately owns its
+algorithms; frontend and output semantics; Text/Vision/speculative schedules; state transactions;
+workspace composition; and CUDA Graph capture/replay mechanics. Each exact package separately owns its
 artifact identity and binding, immutable model view, dimensions/storage facts, three closed
 execution-leaf families, graph frontier data, and Program instance bytes. No mutable state or device
 allocation is shared between Programs, neither target is defined as a delta from the other, and
@@ -152,6 +154,10 @@ routing map, not a mandatory reading list:
 - `docs/cli.md`: CLI input, output, sampling, MTP, and runtime options;
 - `docs/serving.md`: OpenAI/Anthropic HTTP behavior;
 - `docs/performance.md`: published performance methodology and results;
+- `docs/maintainer/concurrent-inference-architecture.md`: bounded ingress, request/slot lifecycle,
+  scheduling, batched execution, CUDA Graph, and speculative-concurrency semantics;
+- `docs/maintainer/paged-kv-cache.md`: shared KV capacity, page ownership, retention, physical
+  layouts, and paged consumer contracts;
 - `docs/maintainer/artifact-container.md`, `storage-layouts.md`, and `tensor-formats.md`:
   generic `.ninfer` contracts;
 - `docs/maintainer/qwen3.6-27b-artifact.md` and `qwen3.6-35b-a3b-artifact.md`: exact target
@@ -185,15 +191,17 @@ them, but must update the corresponding active authorities and affected implemen
 - `src/targets/qwen3_6` owns only the Qwen3.6-family invariants shared by the 27B and 35B-A3B
   targets: tokenizer/template and output semantics, media preprocessing and MRoPE prompt
   construction, owning prepared-prompt/output-session types, semantic weight-view schemas, passive
-  Vision definitions, and the fixed planning/Program/Text/Vision/MTP/state/workspace/CUDA-Graph
-  algorithms. It has no target identity, registry entry, artifact binder, target leaf
+  Vision definitions, and the fixed
+  planning/Program/Text/Vision/speculative/state/workspace/CUDA-Graph algorithms. It has no target
+  identity, registry entry, artifact binder, target leaf
   implementation, or storage for a live Program instance.
 - `src/targets/<target_key>` owns the exact checkpoint package, storage profile, binder,
   `LoadedModel`, configuration, populated family model-view values and private leaf payloads,
   diagnostics, graph frontier values, and exactly three execution-leaf families: attention
   projection, GDN projection/control, and post-mixer. It aliases
-  and instantiates the family runtime types; it does not own a copied Program, Text/Vision/MTP
-  schedule, workspace composition, state transaction, or graph-capture algorithm. Leaf Ops remain
+  and instantiates the family runtime types; it does not own a copied Program,
+  Text/Vision/speculative schedule, workspace composition, state transaction, or graph-capture
+  algorithm. Leaf Ops remain
   implemented under `src/ops`.
 - `src/runtime` owns common contracts, generated-token transaction/publication policy, and the
   public Engine PIMPL. It does not own model mathematics or target state.

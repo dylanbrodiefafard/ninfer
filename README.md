@@ -25,7 +25,8 @@ MTP, prefix-reuse, CLI, and serving paths.
 Serving performance was measured on an RTX 5090 with INT8 group-64 KV cache, CUDA Graphs, a 1,024-
 token prefill chunk, and a maximum context of 262,144 tokens. Each reported fixture uses five fixed
 seeds after one warm-up. The two registered targets are reported independently and are not
-cross-target comparisons. The two 27B weight profiles are reported separately.
+cross-target comparisons. The two 27B weight profiles are reported separately. Requests in this
+published dataset were submitted serially; these numbers are not concurrent-batch throughput.
 
 **Qwen3.6-35B-A3B**
 
@@ -213,6 +214,7 @@ speculative-decoding statistics are written to stderr. See the [CLI guide](docs/
 ./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
   --model-id qwen3.6-27b \
   --max-context 16384 \
+  --max-concurrency 2 \
   --spec mtp --draft-tokens 3 \
   --lm-head-draft
 ```
@@ -239,6 +241,7 @@ Both registered model targets support:
 - text generation with thinking and non-thinking prompt modes;
 - image, multi-image, video, and mixed multimodal messages;
 - chunked prefill and CUDA Graph decode;
+- startup-bounded small-scale concurrent serving with true batched decode;
 - MTP speculative decoding with draft windows from one to five;
 - BF16 and INT8 group-64 KV cache;
 - greedy, temperature, top-k, top-p, min-p, and presence/frequency-penalty sampling;
@@ -246,15 +249,21 @@ Both registered model targets support:
 - OpenAI Chat Completions and Anthropic Messages, including streaming and usage accounting;
 - prompt-rendered function tools and parsed tool calls.
 
+The 35B-A3B target additionally supports text-only DFlash speculative decoding with draft windows
+from one to fifteen.
+
 ## Current limits
 
 - Only the two model targets listed above are accepted product targets.
 - Execution is specialized for one RTX 5090 and one CUDA device.
-- One Engine owns one resident sequence and runs one active request at a time.
-- Continuous batching, multi-GPU execution, CPU/GPU offload, and distributed serving are not
-  implemented.
-- Context capacity is configurable up to the registered models' native 262,144-token limit, subject
-  to GPU memory and KV-cache configuration.
+- One Engine owns one resident model and supports a startup-fixed capacity of 1–8 active requests.
+  Decode-ready requests are compacted at round boundaries and executed in one batched model
+  traversal.
+- NInfer does not provide large-scale or preemptive continuous batching, priority/QoS scheduling,
+  multi-GPU execution, CPU/GPU offload, or distributed serving.
+- `--max-context` is both the per-sequence logical ceiling and the shared Main Text KV page budget;
+  concurrent request reservations share that budget. It is configurable up to the registered
+  models' native 262,144-token limit, subject to GPU memory and KV-cache configuration.
 - Tool calls are parsed and returned to the client; NInfer does not execute tools.
 - The C++ headers are used by the in-tree applications and are not distributed as an installed SDK.
 
