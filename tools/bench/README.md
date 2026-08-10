@@ -109,6 +109,14 @@ Use `--resume` to skip completed JSON reports in an existing `--output-dir`, and
 for a minimal script/runner check. `--no-build` uses the binary supplied by `--bench` without
 building it.
 
+Each raw report must be `ninfer_bench_report` schema v11. The flattened summary and schema-v3 matrix
+manifest carry native names from the report: selected target, canonical `weights_id`, artifact,
+load/read/upload/staging values, Engine memory arenas including request transient and CUDA Graph
+allowance, per-test planned logical and allocator-observed workspace peaks, KV capacity and
+payload, configured proposal head and graph mode, phase timings and throughput, and speculative
+rounds/drafts/acceptance/fallbacks. The matrix manifest is descriptive and records the commands and
+selected local inputs; it does not make repository state part of report validity.
+
 `run_serve_corpus.py` runs both registered targets and both published MTP0/MTP3 suites when both
 artifacts are supplied. Pass one `--artifact` to select a single target and `--mode mtp0` or
 `--mode mtp3` to run only that suite. The 35B-A3B-only `--mode dflash7` route runs the same
@@ -117,11 +125,37 @@ decode corpus with DFlash block=8 (`k=7`) and the optimized proposal head. Add
 Its schema-v5 result and flattened summaries retain the canonical `weights_id` received from the
 schema-v6 serving startup record.
 
-Each raw report must be `ninfer_bench_report` schema v11. The flattened summary and schema-v3 matrix
-manifest carry native names from the report: selected target, canonical `weights_id`, artifact,
-load/read/upload/staging values, Engine memory arenas including request transient and CUDA Graph
-allowance, per-test planned logical and
-allocator-observed workspace peaks, KV capacity and payload, configured proposal head and graph
-mode, phase timings and throughput,
-and speculative rounds/drafts/acceptance/fallbacks. The matrix manifest is descriptive and records
-the commands and selected local inputs; it does not make repository state part of report validity.
+## Concurrent serving benchmark
+
+`run_serve_concurrency.py` measures two separate concurrency properties through real loopback
+Chat Completions requests:
+
+- `decode-saturation` submits one long-decode wave and uses only complete one-second intervals in
+  which every decode round has exactly the configured batch size. Ramp-up, prefill, and drain
+  intervals are excluded.
+- `corpus-makespan` runs the existing fixed mode-specific corpus with exactly `N` persistent client
+  workers. A worker submits the next FIFO request only after its current response completes, and
+  makespan ends when the final response has been read.
+
+Each concurrency point starts a fresh server because its execution graphs and memory plan are
+startup-fixed. Prefix reuse is disabled, startup and warmup are outside both measurements, and the
+runner writes per-point JSON, raw serving JSONL, and combined JSON/CSV/Markdown summaries.
+
+```bash
+python3 tools/bench/run_serve_concurrency.py \
+  --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
+  --mode mtp3 --suite decode-saturation \
+  --concurrency 1 --concurrency 2 --concurrency 4 \
+  --decode-tokens 8192 \
+  --output profiles/bench/concurrent-decode
+
+python3 tools/bench/run_serve_concurrency.py \
+  --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
+  --mode mtp3 --suite corpus-makespan \
+  --concurrency 1 --concurrency 2 \
+  --output profiles/bench/concurrent-corpus
+```
+
+Use `--kv-capacity auto` when the fixed corpus needs more shared KV than the default 262,144-token
+pool. A point is intentionally not resumable: combining fragments from separate server processes
+would not preserve either a steady interval or one continuous makespan.
