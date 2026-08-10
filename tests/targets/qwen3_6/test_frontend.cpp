@@ -507,6 +507,8 @@ int test_reasoning_split(const Frontend& frontend) {
                       "reasoning channel did not remove the close marker");
     failures += check(channel_text(output, ninfer::OutputChannel::Content) == "answer",
                       "content channel did not strip the post-thinking separator");
+    failures += check(session.reasoning_tokens() == 2,
+                      "reasoning token usage did not count accepted reasoning tokens exactly");
     return failures;
 }
 

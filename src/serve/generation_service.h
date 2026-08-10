@@ -46,6 +46,8 @@ struct GenerationOutcome {
     std::vector<ToolCall> tool_calls;
     int prompt_tokens                  = 0;
     int completion_tokens              = 0;
+    int reasoning_tokens               = 0;
+    std::size_t streamed_content_bytes = 0;
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
     GenerationMetrics metrics;
 };

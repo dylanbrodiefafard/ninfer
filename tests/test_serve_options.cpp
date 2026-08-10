@@ -40,6 +40,9 @@ int main() {
                       "default KV capacity does not follow max context");
     failures += check(defaults.speculative.backend == ninfer::SpeculativeBackend::None,
                       "speculative decoding is not disabled by default");
+    failures += check(defaults.response_store_max_records == kDefaultResponseStoreRecords &&
+                          defaults.response_store_max_bytes == kDefaultResponseStoreBytes,
+                      "Responses store defaults mismatch");
 
     const ServeOptions dflash = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash",
                                        "--draft-tokens", "15", "--lm-head-draft"});
@@ -83,6 +86,13 @@ int main() {
     failures += check(configured.log_stats_interval_ms == 0,
                       "--log-stats-interval-ms did not disable periodic reporting");
 
+    const ServeOptions response_store =
+        parse({"ninfer-serve", "model.ninfer", "--response-store-max-records", "42",
+               "--response-store-max-mib", "8"});
+    failures += check(response_store.response_store_max_records == 42 &&
+                          response_store.response_store_max_bytes == (8ULL << 20),
+                      "Responses store limits did not reach serving options");
+
     GenerationRequest request;
     request.max_tokens = 1;
     failures += check(to_request_options(request, defaults).execution.allow_prefix_reuse,
@@ -100,6 +110,9 @@ int main() {
               "serve help omits --log-stats-interval-ms");
     failures += check(serve_usage_text("ninfer-serve").find("--kv-capacity") != std::string::npos,
                       "serve help omits --kv-capacity");
+    failures += check(serve_usage_text("ninfer-serve").find("--response-store-max-mib") !=
+                          std::string::npos,
+                      "serve help omits Responses store limits");
 
     const ServeOptions inherited =
         parse({"ninfer-serve", "model.ninfer", "--max-context", "16384"});

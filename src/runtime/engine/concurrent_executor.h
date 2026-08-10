@@ -390,6 +390,7 @@ private:
         result.generated_token_ids     = std::move(request->generated);
         result.content                 = std::move(request->content);
         result.reasoning               = std::move(request->reasoning);
+        result.reasoning_tokens        = request->output.reasoning_tokens();
         result.finish_reason           = reason;
         result.timings.prepare_seconds = request->prepare_seconds;
         if (request->begin) { result.reused_prompt_tokens = request->begin->reused_prompt_tokens; }

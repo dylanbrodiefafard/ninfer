@@ -213,21 +213,36 @@ void check_preparation_control(Clock::time_point deadline,
 
 class ServiceOutputSink final : public ninfer::OutputSink {
 public:
-    ServiceOutputSink(const StreamSink& sink, bool hold_content)
-        : sink_(&sink), hold_content_(hold_content) {}
+    ServiceOutputSink(const StreamSink& sink, bool filter_tool_calls)
+        : sink_(&sink), filter_tool_calls_(filter_tool_calls) {}
 
     void publish(ninfer::OutputDelta delta) override {
         if (delta.text.empty()) { return; }
         if (delta.channel == ninfer::OutputChannel::Reasoning) {
             if (sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
-        } else if (!hold_content_ && sink_->on_content) {
-            sink_->on_content(delta.text);
+        } else {
+            std::string visible =
+                filter_tool_calls_ ? tool_filter_.feed(delta.text) : std::move(delta.text);
+            publish_content(visible);
         }
     }
 
+    std::size_t finish(bool is_tool_call_response) {
+        if (filter_tool_calls_) { publish_content(tool_filter_.finish(is_tool_call_response)); }
+        return content_bytes_;
+    }
+
 private:
+    void publish_content(const std::string& text) {
+        if (text.empty() || !sink_->on_content) { return; }
+        sink_->on_content(text);
+        content_bytes_ += text.size();
+    }
+
     const StreamSink* sink_ = nullptr;
-    bool hold_content_      = false;
+    bool filter_tool_calls_ = false;
+    ToolCallStreamFilter tool_filter_;
+    std::size_t content_bytes_ = 0;
 };
 
 } // namespace
@@ -413,6 +428,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.reasoning         = std::move(result.reasoning);
     outcome.prompt_tokens     = static_cast<int>(result.prompt.prompt_tokens);
     outcome.completion_tokens = static_cast<int>(result.generated_token_ids.size());
+    outcome.reasoning_tokens  = static_cast<int>(result.reasoning_tokens);
     outcome.finish_reason     = result.finish_reason;
 
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;
@@ -435,11 +451,16 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.speculative_accepted_per_position =
         std::move(result.speculative.accepted_per_position);
 
+    bool is_tool_call_response = false;
     if (prepared.tool_capable) {
         ParsedToolCallOutput parsed =
             parse_qwen_tool_call_output(outcome.text, prepared.tool_name_max_length);
-        outcome.text = std::move(parsed.content);
-        if (parsed.is_tool_call_response) { outcome.tool_calls = std::move(parsed.tool_calls); }
+        outcome.text          = std::move(parsed.content);
+        is_tool_call_response = parsed.is_tool_call_response;
+        if (is_tool_call_response) { outcome.tool_calls = std::move(parsed.tool_calls); }
+    }
+    if (output_sink) {
+        outcome.streamed_content_bytes = output_sink->finish(is_tool_call_response);
     }
     return outcome;
 }

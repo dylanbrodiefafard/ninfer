@@ -125,6 +125,12 @@ set_tests_properties(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test
 ninfer_add_test(ninfer_openai_schema_test
   SOURCES test_openai_schema.cpp
   LIBRARIES ninfer_serve)
+ninfer_add_test(ninfer_responses_schema_test
+  SOURCES test_responses_schema.cpp
+  LIBRARIES ninfer_serve)
+ninfer_add_test(ninfer_response_store_test
+  SOURCES test_response_store.cpp
+  LIBRARIES ninfer_serve)
 ninfer_add_test(ninfer_anthropic_schema_test
   SOURCES test_anthropic_schema.cpp
   LIBRARIES ninfer_serve)

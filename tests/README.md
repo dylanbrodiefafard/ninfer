@@ -28,8 +28,9 @@ benchmark-report, and external protocol behavior. Repository verification princi
   geometry behavior against a self-contained C++ fixture;
 - `test_request_memory.cpp` — startup-frozen request-transient capacity, stable address,
   activation alignment, rejection, and peak semantics;
-- `test_openai_schema.cpp`, `test_anthropic_schema.cpp`, and `test_tool_call_parser.cpp` — current
-  protocol translation and tool-call behavior;
+- `test_openai_schema.cpp`, `test_responses_schema.cpp`, `test_response_store.cpp`,
+  `test_anthropic_schema.cpp`, and `test_tool_call_parser.cpp` — current protocol translation,
+  Responses Item/state/SSE behavior, and incremental tool-call behavior;
 - `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v9 reports;
 - `test_bench_matrix.py` — schema-v9 report consumption by the Python matrix summarizer;
 - `test_serve_corpus.py` — serving request-log schema compatibility at the measurement consumer;
@@ -143,8 +144,8 @@ python3 -m tools.smoke.serve_contract \
 ```
 
 This smoke check is intentionally not a CTest: it needs the real artifact, a supported GPU, and a
-server process that remains alive while the client exercises OpenAI, Anthropic, streaming, and
-multimodal requests.
+server process that remains alive while the client exercises OpenAI Responses/Chat, Anthropic,
+state, streaming, and multimodal requests.
 
 ## What belongs here
 

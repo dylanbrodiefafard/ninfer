@@ -12,8 +12,10 @@ namespace ninfer::serve {
 
 // Protocol default when the client omits max_tokens. Engine independently
 // clamps the request to its effective context capacity.
-inline constexpr int kDefaultMaxTokens               = 8192;
-inline constexpr std::size_t kDefaultMaxRequestBytes = 384ULL << 20;
+inline constexpr int kDefaultMaxTokens                    = 8192;
+inline constexpr std::size_t kDefaultMaxRequestBytes      = 384ULL << 20;
+inline constexpr std::size_t kDefaultResponseStoreRecords = 1024;
+inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
 
 struct ServeOptions {
     bool help_requested = false;
@@ -23,16 +25,18 @@ struct ServeOptions {
     std::string api_key;                  // empty => no auth
     std::string model_id = "qwen3.6-27b"; // reported by /v1/models
     std::string request_log_jsonl;        // empty => structured request logging disabled
-    std::uint32_t max_context           = 8192;
-    KvCapacityPolicy kv_capacity        = KvCapacityPolicy::explicit_capacity(8192);
-    std::uint32_t max_concurrency       = 1;
-    std::uint32_t max_pending_requests  = 16;
-    std::uint32_t pending_timeout_ms    = 30000;
-    std::uint32_t prefill_chunk         = 1024;
-    std::uint32_t log_stats_interval_ms = 5000; // 0 disables periodic Engine throughput logs
-    std::size_t max_request_bytes       = kDefaultMaxRequestBytes;
-    int device                          = 0;
-    KvCacheStorage kv_cache             = KvCacheStorage::BFloat16;
+    std::uint32_t max_context              = 8192;
+    KvCapacityPolicy kv_capacity           = KvCapacityPolicy::explicit_capacity(8192);
+    std::uint32_t max_concurrency          = 1;
+    std::uint32_t max_pending_requests     = 16;
+    std::uint32_t pending_timeout_ms       = 30000;
+    std::uint32_t prefill_chunk            = 1024;
+    std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
+    std::size_t max_request_bytes          = kDefaultMaxRequestBytes;
+    std::size_t response_store_max_records = kDefaultResponseStoreRecords;
+    std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
+    int device                             = 0;
+    KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;

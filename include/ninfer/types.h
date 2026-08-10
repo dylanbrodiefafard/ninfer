@@ -281,6 +281,7 @@ struct GenerationResult {
     std::vector<TokenId> generated_token_ids;
     std::string content;
     std::string reasoning;
+    std::uint32_t reasoning_tokens     = 0;
     FinishReason finish_reason         = FinishReason::None;
     std::uint32_t reused_prompt_tokens = 0;
     GenerationTimings timings;

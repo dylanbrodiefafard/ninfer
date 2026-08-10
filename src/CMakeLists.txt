@@ -293,13 +293,16 @@ if(NINFER_BUILD_SERVE)
   # HTTP protocol/product adapter. No serving header is part of the public API.
   add_library(ninfer_serve STATIC
     serve/openai_schema.cpp
+    serve/responses_schema.cpp
     serve/anthropic_schema.cpp
+    serve/response_store.cpp
     serve/tool_call_parser.cpp
     serve/translate.cpp
     serve/console_log.cpp
     serve/generation_service.cpp
     serve/request_log.cpp
     serve/http_server.cpp
+    serve/responses_http.cpp
     serve/serve_options.cpp)
   ninfer_internal_includes(ninfer_serve)
   target_include_directories(ninfer_serve PRIVATE

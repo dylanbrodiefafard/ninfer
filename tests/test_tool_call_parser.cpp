@@ -116,6 +116,41 @@ int test_configured_name_limit() {
     return failures;
 }
 
+int test_incremental_filter_valid_tool() {
+    ninfer::serve::ToolCallStreamFilter filter;
+    std::string visible;
+    visible += filter.feed("Calling weather.  \n<tool_");
+    visible += filter.feed("call>\n<function=get_weather>");
+    visible += filter.feed("\n</function>\n</tool_call>");
+    visible += filter.finish(true);
+    int failures = 0;
+    failures += check(visible == "Calling weather.",
+                      "valid tool filter did not stream the trimmed content prefix");
+    failures +=
+        check(filter.emitted_bytes() == visible.size(), "valid tool filter byte count mismatch");
+    return failures;
+}
+
+int test_incremental_filter_fallback() {
+    const std::string original = "prefix  \n<tool_call>\n<function=broken>";
+    ninfer::serve::ToolCallStreamFilter malformed;
+    std::string restored;
+    restored += malformed.feed(original.substr(0, 10));
+    restored += malformed.feed(original.substr(10));
+    restored += malformed.finish(false);
+
+    ninfer::serve::ToolCallStreamFilter normal;
+    std::string ordinary;
+    ordinary += normal.feed("ordinary text  ");
+    ordinary += normal.finish(false);
+
+    int failures = 0;
+    failures += check(restored == original, "malformed tool filter fallback lost raw bytes");
+    failures +=
+        check(ordinary == "ordinary text  ", "ordinary filtered output lost trailing whitespace");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -125,6 +160,8 @@ int main() {
     failures += test_malformed_falls_back_to_text();
     failures += test_suffix_after_tool_falls_back_to_text();
     failures += test_configured_name_limit();
+    failures += test_incremental_filter_valid_tool();
+    failures += test_incremental_filter_fallback();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

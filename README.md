@@ -250,8 +250,9 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
-The server also implements Anthropic Messages, streaming, token counting, multimodal input, and
-function-tool request/response translation. See [HTTP serving](docs/serving.md).
+The server also implements OpenAI Responses Core (typed Items, semantic SSE, local continuation
+state, and function calls) plus Anthropic Messages, token counting, and multimodal input. See
+[HTTP serving](docs/serving.md).
 
 ## Capabilities
 
@@ -265,7 +266,8 @@ Both registered model targets support:
 - BF16 and INT8 group-64 KV cache;
 - greedy, temperature, top-k, top-p, min-p, and presence/frequency-penalty sampling;
 - compatible-prefix reuse;
-- OpenAI Chat Completions and Anthropic Messages, including streaming and usage accounting;
+- OpenAI Responses Core, OpenAI Chat Completions, and Anthropic Messages, including streaming and
+  usage accounting;
 - prompt-rendered function tools and parsed tool calls.
 
 The 35B-A3B target additionally supports text-only DFlash speculative decoding with draft windows

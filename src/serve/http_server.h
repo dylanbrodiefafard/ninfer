@@ -1,6 +1,7 @@
 #pragma once
 
 #include "serve/generation_service.h"
+#include "serve/response_store.h"
 #include "serve/request_log.h"
 #include "serve/serve_options.h"
 
@@ -32,6 +33,13 @@ private:
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res);
     void handle_messages(const httplib::Request& req, httplib::Response& res);
     void handle_count_tokens(const httplib::Request& req, httplib::Response& res);
+    void handle_responses(const httplib::Request& req, httplib::Response& res);
+    void handle_response_input_tokens(const httplib::Request& req, httplib::Response& res);
+    void handle_response_get(const httplib::Request& req, httplib::Response& res);
+    void handle_response_delete(const httplib::Request& req, httplib::Response& res);
+    void handle_response_input_items(const httplib::Request& req, httplib::Response& res);
+    void handle_response_cancel(const httplib::Request& req, httplib::Response& res);
+    void handle_response_compact(const httplib::Request& req, httplib::Response& res);
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
 
@@ -46,6 +54,7 @@ private:
 
     GenerationService* service_ = nullptr;
     ServeOptions options_;
+    ResponseStore response_store_;
     JsonlRequestLog request_jsonl_;
     httplib::Server server_;
     std::atomic<std::uint64_t> request_seq_{0};

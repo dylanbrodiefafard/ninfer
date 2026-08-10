@@ -15,6 +15,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace ninfer::serve {
@@ -93,10 +94,18 @@ bool report_has_activity(const ThroughputReport& report) {
            report.scheduler.waiting_requests != 0;
 }
 
+std::string_view unstreamed_content(const GenerationOutcome& outcome) {
+    if (outcome.streamed_content_bytes > outcome.text.size()) {
+        throw std::logic_error("streamed content exceeds terminal content");
+    }
+    return std::string_view(outcome.text).substr(outcome.streamed_content_bytes);
+}
+
 } // namespace
 
 HttpServer::HttpServer(ServeOptions options)
     : options_(std::move(options)),
+      response_store_(options_.response_store_max_records, options_.response_store_max_bytes),
       request_jsonl_(options_.request_log_jsonl, options_.artifact_path) {
     const std::size_t queued_requests =
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
@@ -192,7 +201,7 @@ void HttpServer::register_routes() {
         server_.set_default_headers(
             {{"Access-Control-Allow-Origin", "*"},
              {"Access-Control-Allow-Headers", "Authorization, Content-Type"},
-             {"Access-Control-Allow-Methods", "GET, POST, OPTIONS"}});
+             {"Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"}});
         // CORS preflight: browsers send OPTIONS with no credentials before the real
         // request; answer it without auth so the actual GET/POST can carry the key.
         server_.Options(R"(.*)",
@@ -254,6 +263,33 @@ void HttpServer::register_routes() {
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_chat_completions(req, res);
                  });
+    server_.Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_responses(req, res);
+    });
+    server_.Post("/v1/responses/input_tokens",
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_response_input_tokens(req, res);
+                 });
+    server_.Post("/v1/responses/compact",
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_response_compact(req, res);
+                 });
+    server_.Post(R"(/v1/responses/([^/]+)/cancel)",
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_response_cancel(req, res);
+                 });
+    server_.Get(R"(/v1/responses/([^/]+)/input_items)",
+                [this](const httplib::Request& req, httplib::Response& res) {
+                    handle_response_input_items(req, res);
+                });
+    server_.Get(R"(/v1/responses/([^/]+))",
+                [this](const httplib::Request& req, httplib::Response& res) {
+                    handle_response_get(req, res);
+                });
+    server_.Delete(R"(/v1/responses/([^/]+))",
+                   [this](const httplib::Request& req, httplib::Response& res) {
+                       handle_response_delete(req, res);
+                   });
     server_.Post("/v1/messages/count_tokens",
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_count_tokens(req, res);
@@ -386,10 +422,12 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
                 const GenerationOutcome outcome = service_->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
+                const std::string_view remaining = unstreamed_content(outcome);
                 if (!outcome.tool_calls.empty()) {
-                    if (!outcome.text.empty()) {
+                    if (!remaining.empty()) {
                         write_stream_item(sink, *stream,
-                                          make_chat_chunk_content(id, model, created, outcome.text,
+                                          make_chat_chunk_content(id, model, created,
+                                                                  std::string(remaining),
                                                                   include_usage));
                     }
                     write_stream_item(sink, *stream,
@@ -399,9 +437,10 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                         sink, *stream,
                         make_chat_chunk_final(id, model, created, "tool_calls", include_usage));
                 } else {
-                    if (tool_capable && !outcome.text.empty()) {
+                    if (tool_capable && !remaining.empty()) {
                         write_stream_item(sink, *stream,
-                                          make_chat_chunk_content(id, model, created, outcome.text,
+                                          make_chat_chunk_content(id, model, created,
+                                                                  std::string(remaining),
                                                                   include_usage));
                     }
                     write_stream_item(
@@ -598,6 +637,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
 
                 const GenerationOutcome outcome = service_->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
+                const std::string_view remaining = unstreamed_content(outcome);
 
                 if (thinking_open) {
                     write_stream_item(sink, *stream, make_content_block_stop(thinking_index));
@@ -609,11 +649,12 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 }
 
                 if (tool_capable) {
-                    if (!outcome.text.empty()) {
+                    if (!remaining.empty()) {
                         const int idx = next_index++;
                         write_stream_item(sink, *stream, make_content_block_start_text(idx));
-                        write_stream_item(sink, *stream,
-                                          make_content_block_delta_text(idx, outcome.text));
+                        write_stream_item(
+                            sink, *stream,
+                            make_content_block_delta_text(idx, std::string(remaining)));
                         write_stream_item(sink, *stream, make_content_block_stop(idx));
                     }
                     for (const ToolCall& call : outcome.tool_calls) {
