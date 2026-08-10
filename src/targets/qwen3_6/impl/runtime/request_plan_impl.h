@@ -59,13 +59,8 @@ std::uint32_t pages_for_tokens(std::uint32_t tokens) noexcept {
 
 } // namespace
 
-RequestPlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
-                                          const ExecutionOptions& options) const {
-    if (active_request().lifecycle == Lifecycle::Prefilling ||
-        active_request().lifecycle == Lifecycle::Active ||
-        active_request().lifecycle == Lifecycle::Pending) {
-        throw std::logic_error("cannot plan a request while Program is active or pending");
-    }
+RequestBasePlan ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
+                                                   const ExecutionOptions& options) {
     if (prompt.token_ids.empty()) { throw std::invalid_argument("prompt must contain tokens"); }
     if (prompt.token_ids.size() > capacity) {
         throw std::invalid_argument("prompt exceeds configured context capacity");
@@ -90,69 +85,126 @@ RequestPlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     }
     validate_sampling(options.sampling);
 
-    auto plan                             = std::make_unique<RequestPlanImpl>();
-    plan->summary.prompt_tokens           = static_cast<std::uint32_t>(prompt.token_ids.size());
-    plan->summary.requested_output_tokens = options.requested_output_tokens;
+    auto base                             = std::make_unique<RequestBasePlanImpl>();
+    base->summary.prompt_tokens           = static_cast<std::uint32_t>(prompt.token_ids.size());
+    base->summary.requested_output_tokens = options.requested_output_tokens;
     const std::uint32_t capacity_output =
-        capacity - plan->summary.prompt_tokens + static_cast<std::uint32_t>(1);
-    plan->summary.effective_output_tokens =
+        capacity - base->summary.prompt_tokens + static_cast<std::uint32_t>(1);
+    base->summary.effective_output_tokens =
         std::min(options.requested_output_tokens, capacity_output);
-    plan->summary.effective_limit_reason = options.requested_output_tokens <= capacity_output
+    base->summary.effective_limit_reason = options.requested_output_tokens <= capacity_output
                                                ? FinishReason::OutputLimit
                                                : FinishReason::ContextCapacity;
-    plan->summary.transient_alignment    = 1;
-    plan->summary.transient_bytes        = 0;
-    plan->sampling                       = translate_sampling(options.sampling);
+    base->summary.transient_alignment    = 1;
+    base->summary.transient_bytes        = 0;
+    base->sampling                       = translate_sampling(options.sampling);
+    base->allow_prefix_reuse             = options.allow_prefix_reuse;
     const std::uint32_t reserved_context_tokens =
-        plan->summary.prompt_tokens + (plan->summary.effective_output_tokens == 0
+        base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
                                            ? 0U
-                                           : plan->summary.effective_output_tokens - 1U);
-    plan->text_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
+                                           : base->summary.effective_output_tokens - 1U);
+    base->text_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
     if (speculative_backend == SpeculativeBackend::Mtp) {
         const std::uint32_t mtp_tokens    = static_cast<std::uint32_t>(std::min<std::uint64_t>(
             capacity, static_cast<std::uint64_t>(reserved_context_tokens) + draft_window - 1ULL));
-        plan->backend_kv_page_entitlement = pages_for_tokens(mtp_tokens);
+        base->backend_kv_page_entitlement = pages_for_tokens(mtp_tokens);
     } else if (speculative_backend == SpeculativeBackend::DFlash) {
-        plan->text_kv_page_entitlement    = decoder->text_kv.pool().logical_page_capacity();
-        plan->backend_kv_page_entitlement = backend_kv_cache()->pool().logical_page_capacity();
+        base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
     }
 
-    if (options.allow_prefix_reuse && prompt.identity.reusable &&
-        active_request().lifecycle == Lifecycle::Resident) {
+    if (prompt.has_media()) {
+        auto control =
+            std::make_shared<qwen3_6::VisionControl>(qwen3_6::build_vision_control(prompt));
+        std::size_t max_merged     = 0;
+        std::uint32_t previous_end = 0;
+        for (const qwen3_6::VisionItemControl& item : control->items) {
+            if (item.scatter_indices.empty()) {
+                throw std::invalid_argument("vision item has no Text consumer columns");
+            }
+            const auto first = static_cast<std::uint32_t>(item.scatter_indices.front());
+            const auto last  = static_cast<std::uint32_t>(item.scatter_indices.back());
+            const std::uint32_t begin =
+                speculative_backend == SpeculativeBackend::Mtp && first != 0 ? first - 1 : first;
+            const std::uint32_t end = last + 1;
+            if (begin < previous_end) {
+                throw std::invalid_argument("vision item consumer spans overlap");
+            }
+            if (end > base->summary.prompt_tokens) {
+                throw std::invalid_argument("vision item consumer span exceeds prompt");
+            }
+            if (schedule::VisionContext::workspace_bytes(item) > work.capacity()) {
+                throw std::invalid_argument("vision item exceeds the Program workspace envelope");
+            }
+            previous_end = end;
+            max_merged   = std::max(max_merged, item.merged_count);
+        }
+        const std::size_t output_elements =
+            checked_size_mul(static_cast<std::size_t>(VisionConfig::output_hidden), max_merged,
+                             "vision item output elements overflow size_t");
+        base->vision_transient_bytes =
+            align_up_256(checked_size_mul(output_elements, dtype_size(DType::BF16),
+                                          "vision item output bytes overflow size_t"),
+                         "vision item output alignment overflows size_t");
+        base->vision_control = std::move(control);
+    }
+
+    if (prompt.identity.assistant_content_boundary) {
+        const std::uint32_t candidate = *prompt.identity.assistant_content_boundary;
+        if (candidate <= base->summary.prompt_tokens) { base->snapshot_boundary = candidate; }
+    }
+    return RequestBasePlan(std::move(base));
+}
+
+RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
+                                                   const PreparedPromptData& prompt,
+                                                   const RequestBasePlan& base_plan) {
+    if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    const RequestControl& request = requests[lane];
+    const SequenceState& sequence = sequences[lane];
+    if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
+        request.lifecycle == Lifecycle::Pending) {
+        throw std::logic_error("cannot plan a request while Program is active or pending");
+    }
+    if (base_plan.impl_ == nullptr) { throw std::logic_error("request base plan is empty"); }
+    const RequestBasePlanImpl& base = *base_plan.impl_;
+
+    auto plan                         = std::make_unique<RequestPlanImpl>();
+    plan->summary                     = base.summary;
+    plan->sampling                    = base.sampling;
+    plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
+    plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
+
+    if (base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained) {
         const bool dflash_append_ready =
             speculative_backend != SpeculativeBackend::DFlash ||
-            (!active_sequence().pending_context_valid &&
-             active_sequence().dflash_context_frontier == active_sequence().execution_frontier);
-        if (active_sequence().execution_frontier != 0 && dflash_append_ready &&
-            qwen3_6::detail::prefix_matches(prompt, active_sequence().ledger,
-                                            active_sequence().prefix_identity,
-                                            active_sequence().execution_frontier)) {
+            sequence.dflash_context_frontier == sequence.execution_frontier;
+        if (sequence.execution_frontier != 0 && dflash_append_ready &&
+            qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
+                                            sequence.execution_frontier)) {
             plan->reuse      = ReusePath::AppendAtFrontier;
-            plan->reuse_base = active_sequence().execution_frontier;
-        } else if (active_sequence().boundary.valid && active_sequence().boundary.boundary != 0 &&
+            plan->reuse_base = sequence.execution_frontier;
+        } else if (sequence.boundary.valid && sequence.boundary.boundary != 0 &&
                    (speculative_backend != SpeculativeBackend::DFlash ||
-                    (active_sequence().dflash_boundary_valid &&
-                     active_sequence().dflash_boundary_frontier ==
-                         active_sequence().boundary.boundary)) &&
-                   active_sequence().boundary.boundary < prompt.token_ids.size() &&
-                   qwen3_6::detail::prefix_matches(prompt, active_sequence().ledger,
-                                                   active_sequence().prefix_identity,
-                                                   active_sequence().boundary.boundary)) {
+                    (sequence.dflash_boundary_valid &&
+                     sequence.dflash_boundary_frontier == sequence.boundary.boundary)) &&
+                   sequence.boundary.boundary < prompt.token_ids.size() &&
+                   qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
+                                                   sequence.prefix_identity,
+                                                   sequence.boundary.boundary)) {
             plan->reuse      = ReusePath::RestoreBoundary;
-            plan->reuse_base = active_sequence().boundary.boundary;
+            plan->reuse_base = sequence.boundary.boundary;
         }
     }
 
     if (speculative_backend == SpeculativeBackend::Mtp) {
         const bool append_ready =
-            plan->reuse == ReusePath::AppendAtFrontier && active_sequence().tail_hidden_valid &&
+            plan->reuse == ReusePath::AppendAtFrontier && sequence.tail_hidden_valid &&
             decoder->mtp_cache() != nullptr &&
-            (plan->reuse_base == 0 || active_sequence().mtp_kv_valid >= plan->reuse_base - 1);
-        const bool boundary_ready = plan->reuse == ReusePath::RestoreBoundary &&
-                                    decoder->mtp_cache() != nullptr &&
-                                    active_sequence().boundary.hidden_valid &&
-                                    active_sequence().boundary.mtp_prefix_valid &&
-                                    active_sequence().mtp_kv_valid >= plan->reuse_base - 1;
+            (plan->reuse_base == 0 || sequence.mtp_kv_valid >= plan->reuse_base - 1);
+        const bool boundary_ready =
+            plan->reuse == ReusePath::RestoreBoundary && decoder->mtp_cache() != nullptr &&
+            sequence.boundary.hidden_valid && sequence.boundary.mtp_prefix_valid &&
+            sequence.mtp_kv_valid >= plan->reuse_base - 1;
         if (plan->reuse != ReusePath::FullReset && !append_ready && !boundary_ready) {
             plan->reuse      = ReusePath::FullReset;
             plan->reuse_base = 0;
@@ -164,65 +216,38 @@ RequestPlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
         if (plan->reuse == ReusePath::FullReset) {
             plan->prepare_mtp = true;
         } else if (plan->reuse == ReusePath::AppendAtFrontier) {
-            plan->prepare_mtp      = true;
-            plan->needs_mtp_bridge = plan->reuse_base != 0;
+            plan->prepare_mtp = true;
+            plan->mtp_bridge  = plan->reuse_base < plan->summary.prompt_tokens
+                                    ? MtpBridgeMode::BeforeSuffix
+                                    : MtpBridgeMode::AfterExactHit;
         } else if (plan->reuse == ReusePath::RestoreBoundary) {
-            plan->prepare_mtp      = true;
-            plan->needs_mtp_bridge = true;
+            plan->prepare_mtp = true;
+            plan->mtp_bridge  = MtpBridgeMode::BeforeSuffix;
         }
     }
 
-    plan->prepare_dflash =
-        speculative_backend == SpeculativeBackend::DFlash &&
-        static_cast<std::uint64_t>(plan->summary.prompt_tokens) + draft_window + 1ULL <= capacity;
-
-    if (prompt.has_media()) {
+    if (base.vision_control != nullptr) {
         VisionPrefillPlan vision;
-        vision.control = qwen3_6::build_vision_control(prompt);
-        vision.uses.reserve(vision.control.items.size());
-        std::size_t max_merged     = 0;
-        std::uint32_t previous_end = 0;
-        for (std::size_t index = 0; index < vision.control.items.size(); ++index) {
-            const qwen3_6::VisionItemControl& item = vision.control.items[index];
-            if (item.scatter_indices.empty()) {
-                throw std::invalid_argument("vision item has no Text consumer columns");
-            }
+        vision.control = base.vision_control;
+        vision.uses.reserve(base.vision_control->items.size());
+        for (std::size_t index = 0; index < base.vision_control->items.size(); ++index) {
+            const qwen3_6::VisionItemControl& item = base.vision_control->items[index];
             const auto first          = static_cast<std::uint32_t>(item.scatter_indices.front());
             const auto last           = static_cast<std::uint32_t>(item.scatter_indices.back());
             const std::uint32_t begin = plan->prepare_mtp && first != 0 ? first - 1 : first;
             const std::uint32_t end   = last + 1;
             if (end <= plan->reuse_base) { continue; }
-            if (!vision.uses.empty() && begin < previous_end) {
-                throw std::invalid_argument("vision item consumer spans overlap");
-            }
-            if (end > plan->summary.prompt_tokens) {
-                throw std::invalid_argument("vision item consumer span exceeds prompt");
-            }
-            if (schedule::VisionContext::workspace_bytes(item) > work.capacity()) {
-                throw std::invalid_argument("vision item exceeds the Program workspace envelope");
-            }
             vision.uses.push_back(VisionUseSpan{begin, end, static_cast<std::uint32_t>(index)});
-            previous_end = end;
-            max_merged   = std::max(max_merged, item.merged_count);
         }
         if (!vision.uses.empty()) {
-            const std::size_t output_elements =
-                checked_size_mul(static_cast<std::size_t>(VisionConfig::output_hidden), max_merged,
-                                 "vision item output elements overflow size_t");
             plan->summary.transient_alignment = 256;
-            plan->summary.transient_bytes =
-                align_up_256(checked_size_mul(output_elements, dtype_size(DType::BF16),
-                                              "vision item output bytes overflow size_t"),
-                             "vision item output alignment overflows size_t");
-            plan->vision = std::move(vision);
+            plan->summary.transient_bytes     = base.vision_transient_bytes;
+            plan->vision                      = std::move(vision);
         }
     }
 
-    if (prompt.identity.assistant_content_boundary) {
-        const std::uint32_t candidate = *prompt.identity.assistant_content_boundary;
-        if (candidate > plan->reuse_base && candidate <= plan->summary.prompt_tokens) {
-            plan->snapshot_boundary = candidate;
-        }
+    if (base.snapshot_boundary && *base.snapshot_boundary > plan->reuse_base) {
+        plan->snapshot_boundary = base.snapshot_boundary;
     }
     return RequestPlan(std::move(plan));
 }

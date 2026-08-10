@@ -312,7 +312,7 @@ VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedMo
                                            runtime::TransientRegion transient)
     : device_(device), workspace_(workspace), prompt_(prompt), plan_(plan), transient_(transient),
       context_(device, model) {
-    if (plan_.control.items.empty() || plan_.uses.empty()) {
+    if (plan_.control == nullptr || plan_.control->items.empty() || plan_.uses.empty()) {
         throw std::invalid_argument("Vision prefill plan has no suffix item spans");
     }
     if (transient_.data == nullptr || transient_.alignment < kWorkspaceAlignment) {
@@ -346,11 +346,11 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
     if (active == nullptr) {
         return VisionChunk{static_cast<std::int32_t>(end - begin), nullptr, {}};
     }
-    if (active->item_index >= plan_.control.items.size() ||
+    if (active->item_index >= plan_.control->items.size() ||
         active->item_index >= prompt_.vision_items.size()) {
         throw std::logic_error("Vision prefill item index is out of range");
     }
-    const qwen3_6::VisionItemControl& control = plan_.control.items[active->item_index];
+    const qwen3_6::VisionItemControl& control = plan_.control->items[active->item_index];
     const qwen3_6::VisionItem& source         = prompt_.vision_items[active->item_index];
     if (source.modality != control.modality || source.grid.temporal != control.grid.temporal ||
         source.grid.height != control.grid.height || source.grid.width != control.grid.width ||

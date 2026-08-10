@@ -7,6 +7,7 @@
 #include "runtime/engine/request_memory.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -15,6 +16,7 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -33,6 +35,7 @@ struct Options {
     int repetitions                = 10;
     std::uint32_t context_tokens   = 128;
     std::uint32_t draft_tokens     = 15;
+    std::uint32_t batch_size       = 1;
     ninfer::ProposalHead proposal  = ninfer::ProposalHead::Optimized;
     bool use_cuda_graph            = true;
 };
@@ -41,6 +44,7 @@ void print_usage(const char* executable) {
     std::cout << "usage: " << executable
               << " [--artifact <model.ninfer>] [--device <id>] [--context <tokens>]"
                  " [--warmup <n>] [--reps <n>] [--draft-tokens <1..15>]"
+                 " [--batch <1..8>]"
                  " [--proposal-head full|optimized] [--no-cuda-graph]\n";
 }
 
@@ -75,6 +79,8 @@ Options parse_options(int argc, char** argv) {
             options.repetitions = std::stoi(value("--reps"));
         } else if (argument == "--draft-tokens") {
             options.draft_tokens = parse_u32(value("--draft-tokens"), "draft-tokens");
+        } else if (argument == "--batch") {
+            options.batch_size = parse_u32(value("--batch"), "batch");
         } else if (argument == "--proposal-head") {
             const std::string_view head(value("--proposal-head"));
             if (head == "full") {
@@ -104,6 +110,9 @@ Options parse_options(int argc, char** argv) {
     if (options.draft_tokens == 0 || options.draft_tokens > 15) {
         throw std::invalid_argument("--draft-tokens must be in [1,15]");
     }
+    if (options.batch_size == 0 || options.batch_size > ninfer::kMaximumConcurrency) {
+        throw std::invalid_argument("--batch must be in [1,8]");
+    }
     return options;
 }
 
@@ -123,17 +132,42 @@ struct RoundMeasurement {
 };
 
 RoundMeasurement measure_round(target::Package::Program& program, ninfer::DeviceContext& device,
-                               std::uint32_t draft_tokens) {
+                               std::uint32_t batch_size, std::uint32_t draft_tokens) {
+    std::array<std::uint32_t, ninfer::kMaximumConcurrency> lanes{};
+    std::array<ninfer::runtime::RoundBudget, ninfer::kMaximumConcurrency> budgets{};
+    for (std::uint32_t row = 0; row < batch_size; ++row) {
+        lanes[row]   = row;
+        budgets[row] = {.generated_tokens_remaining = draft_tokens + 1};
+    }
+    const auto lane_span = std::span<const std::uint32_t>(lanes.data(), batch_size);
+    const auto budget_span =
+        std::span<const ninfer::runtime::RoundBudget>(budgets.data(), batch_size);
     ninfer::CudaEventTimer timer(device);
     const auto wall_start = Clock::now();
     timer.start();
-    auto round = program.decode_round(
-        ninfer::runtime::RoundBudget{.generated_tokens_remaining = draft_tokens + 1});
+    const auto round   = program.decode_batch(lane_span, budget_span);
     const float gpu_ms = timer.stop_ms();
     const double wall_ms =
         std::chrono::duration<double, std::milli>(Clock::now() - wall_start).count();
-    const std::uint32_t licensed = static_cast<std::uint32_t>(round.tokens.size());
-    program.resolve_pending(licensed, false);
+    if (round.row_counts.size() != batch_size) {
+        throw std::runtime_error("DFlash benchmark round returned invalid row counts");
+    }
+    std::array<std::uint32_t, ninfer::kMaximumConcurrency> accepted{};
+    std::array<std::uint8_t, ninfer::kMaximumConcurrency> terminal{};
+    std::array<std::uint8_t, ninfer::kMaximumConcurrency> cancelled{};
+    std::uint32_t licensed = 0;
+    for (std::uint32_t row = 0; row < batch_size; ++row) {
+        const std::int32_t count = round.row_counts[row];
+        if (count <= 0 || count > static_cast<std::int32_t>(draft_tokens + 1U)) {
+            throw std::runtime_error("DFlash benchmark round returned an invalid row extent");
+        }
+        accepted[row] = static_cast<std::uint32_t>(count);
+        licensed += accepted[row];
+    }
+    program.resolve_pending_batch(lane_span,
+                                  std::span<const std::uint32_t>(accepted.data(), batch_size),
+                                  std::span<const std::uint8_t>(terminal.data(), batch_size),
+                                  std::span<const std::uint8_t>(cancelled.data(), batch_size));
     return {.gpu_ms = gpu_ms, .wall_ms = wall_ms, .licensed_tokens = licensed};
 }
 
@@ -150,8 +184,13 @@ int run(const Options& options) {
 
     const std::uint32_t measured_rounds =
         static_cast<std::uint32_t>(options.warmup + options.repetitions);
-    const std::uint64_t block    = options.draft_tokens + 1ULL;
-    const std::uint64_t capacity = options.context_tokens + (measured_rounds + 1ULL) * block;
+    const std::uint64_t block = options.draft_tokens + 1ULL;
+    const std::uint64_t per_request_capacity =
+        options.context_tokens + (measured_rounds + 1ULL) * block;
+    const std::uint64_t aligned_request_capacity = (per_request_capacity + 63ULL) & ~63ULL;
+    const std::uint64_t capacity                 = options.batch_size == 1
+                                                       ? per_request_capacity
+                                                       : aligned_request_capacity * options.batch_size;
     if (capacity > 262144) {
         throw std::invalid_argument("context and measured rounds exceed native capacity");
     }
@@ -166,48 +205,79 @@ int run(const Options& options) {
     engine.speculative.draft_tokens  = options.draft_tokens;
     engine.speculative.proposal_head = options.proposal;
     engine.use_cuda_graph            = options.use_cuda_graph;
+    engine.max_concurrency           = options.batch_size;
 
     ninfer::DeviceContext device(options.device);
     ninfer::artifact::Reader reader(options.artifact);
     const auto weights_profile = target::Package::resolve_weights(reader.identity());
     ninfer::artifact::Binder binder(reader);
     auto load_plan = target::Package::plan_load(binder, engine, weights_profile);
+    auto sequence  = target::Package::plan_sequence(device, engine, weights_profile);
+    const std::uint64_t weight_bytes   = load_plan.materialization().device_capacity_bytes;
+    const std::uint64_t sequence_bytes = sequence.device_reservation_bytes();
+    if (sequence_bytes > std::numeric_limits<std::uint64_t>::max() - weight_bytes) {
+        throw std::overflow_error("benchmark device-memory requirement overflows uint64");
+    }
+    const std::uint64_t required_bytes = weight_bytes + sequence_bytes;
+    std::size_t free_bytes             = 0;
+    std::size_t total_bytes            = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+    if (required_bytes > free_bytes) {
+        throw std::invalid_argument(
+            "benchmark configuration requires " + std::to_string(required_bytes) +
+            " bytes of device memory, but only " + std::to_string(free_bytes) + " bytes are free");
+    }
     auto materialized =
         ninfer::artifact::materialize(reader, load_plan.materialization(), device, nullptr);
     auto model =
         target::Package::construct_loaded_model(std::move(load_plan), std::move(materialized));
-    auto frontend = target::Package::make_frontend(*model);
-    auto prompt   = frontend.prepare_tokens(prompt_tokens(options.context_tokens), false);
-
-    auto sequence = target::Package::plan_sequence(device, engine, weights_profile);
+    auto frontend                      = target::Package::make_frontend(*model);
     const std::size_t request_capacity = sequence.request_transient_capacity_bytes();
     auto program = target::Package::create_program(*model, std::move(sequence), device);
     ninfer::runtime::RequestMemory request_memory(device, request_capacity);
     ninfer::ExecutionOptions execution;
     execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);
     execution.allow_prefix_reuse      = false;
-    auto request_plan                 = program->plan_request(prompt, execution);
-    request_memory.activate(request_plan.summary().transient_bytes,
-                            request_plan.summary().transient_alignment);
-    auto first =
-        program->begin(std::move(prompt), std::move(request_plan), request_memory.region());
-    request_memory.deactivate();
-    program->resolve_pending(static_cast<std::uint32_t>(first.round.tokens.size()), false);
+    for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
+        auto prompt       = frontend.prepare_tokens(prompt_tokens(options.context_tokens), false);
+        auto request_base = program->plan_request_base(prompt, execution);
+        auto request_plan = program->plan_request_for_lane(lane, prompt, request_base);
+        request_memory.activate(request_plan.summary().transient_bytes,
+                                request_plan.summary().transient_alignment);
+        auto prefill = program->start_prefill_lane(lane, std::move(prompt), std::move(request_plan),
+                                                   request_memory.region());
+        while (!prefill.complete) { prefill = program->advance_prefill_lane(lane); }
+        request_memory.deactivate();
+        if (prefill.round.tokens.size() != 1) {
+            throw std::runtime_error("benchmark seed prefill did not license exactly one token");
+        }
+        program->resolve_pending_lane(lane, 1, false);
+    }
 
     for (int iteration = 0; iteration < options.warmup; ++iteration) {
-        (void)measure_round(*program, device, options.draft_tokens);
+        (void)measure_round(*program, device, options.batch_size, options.draft_tokens);
     }
-    const ninfer::SpeculativeStats before = program->speculative_stats();
+    std::vector<ninfer::SpeculativeStats> before;
+    before.reserve(options.batch_size);
+    for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
+        before.push_back(program->speculative_stats_lane(lane));
+    }
 
     std::vector<RoundMeasurement> measurements;
     measurements.reserve(static_cast<std::size_t>(options.repetitions));
     for (int iteration = 0; iteration < options.repetitions; ++iteration) {
-        measurements.push_back(measure_round(*program, device, options.draft_tokens));
+        measurements.push_back(
+            measure_round(*program, device, options.batch_size, options.draft_tokens));
     }
-    const ninfer::SpeculativeStats after = program->speculative_stats();
-    if (after.rounds - before.rounds != static_cast<std::uint64_t>(options.repetitions) ||
-        after.fallback_steps != before.fallback_steps) {
-        throw std::runtime_error("benchmark left the complete DFlash round path");
+    std::vector<ninfer::SpeculativeStats> after;
+    after.reserve(options.batch_size);
+    for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
+        after.push_back(program->speculative_stats_lane(lane));
+        if (after.back().rounds - before[lane].rounds !=
+                static_cast<std::uint64_t>(options.repetitions) ||
+            after.back().fallback_steps != before[lane].fallback_steps) {
+            throw std::runtime_error("benchmark left the complete DFlash round path");
+        }
     }
 
     std::vector<float> gpu_ms;
@@ -219,18 +289,30 @@ int run(const Options& options) {
         licensed_tokens += measurement.licensed_tokens;
     }
     const auto [gpu_min, gpu_max] = std::minmax_element(gpu_ms.begin(), gpu_ms.end());
-    const std::uint64_t accepted  = after.accepted_tokens - before.accepted_tokens;
-    const std::uint64_t drafted   = after.drafted_tokens - before.drafted_tokens;
-    const double mean_gpu_ms      = mean(gpu_ms);
-    const double mean_wall_ms     = mean(wall_ms);
-    const double mean_licensed =
+    std::uint64_t accepted        = 0;
+    std::uint64_t drafted         = 0;
+    std::array<std::uint64_t, 15> accepted_per_position{};
+    for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
+        accepted += after[lane].accepted_tokens - before[lane].accepted_tokens;
+        drafted += after[lane].drafted_tokens - before[lane].drafted_tokens;
+        for (std::size_t position = 0; position < options.draft_tokens; ++position) {
+            accepted_per_position[position] += after[lane].accepted_per_position[position] -
+                                               before[lane].accepted_per_position[position];
+        }
+    }
+    const double mean_gpu_ms  = mean(gpu_ms);
+    const double mean_wall_ms = mean(wall_ms);
+    const double mean_licensed_per_batch =
         static_cast<double>(licensed_tokens) / static_cast<double>(options.repetitions);
+    const double mean_licensed_per_request =
+        mean_licensed_per_batch / static_cast<double>(options.batch_size);
 
-    std::cout << "format,ninfer_qwen3_6_35b_a3b_dflash_round_bench_v1\n";
+    std::cout << "format,ninfer_qwen3_6_35b_a3b_dflash_round_bench_v2\n";
     std::cout << "artifact," << options.artifact.string() << '\n';
     std::cout << "device," << device.props.name << '\n';
     std::cout << "context_tokens," << options.context_tokens << '\n';
     std::cout << "draft_tokens," << options.draft_tokens << '\n';
+    std::cout << "batch_size," << options.batch_size << '\n';
     std::cout << "proposal_head,"
               << (options.proposal == ninfer::ProposalHead::Optimized ? "optimized" : "full")
               << '\n';
@@ -241,16 +323,17 @@ int run(const Options& options) {
     std::cout << "steady_round_gpu_min_ms," << *gpu_min << '\n';
     std::cout << "steady_round_gpu_max_ms," << *gpu_max << '\n';
     std::cout << "steady_round_wall_mean_ms," << mean_wall_ms << '\n';
-    std::cout << "mean_licensed_tokens," << mean_licensed << '\n';
+    std::cout << "mean_licensed_tokens_per_batch," << mean_licensed_per_batch << '\n';
+    std::cout << "mean_licensed_tokens_per_request," << mean_licensed_per_request << '\n';
     std::cout << "drafted_tokens," << drafted << '\n';
     std::cout << "accepted_draft_tokens," << accepted << '\n';
     std::cout << "acceptance_rate,"
               << (drafted == 0 ? 0.0 : static_cast<double>(accepted) / drafted) << '\n';
-    std::cout << "published_tokens_per_second," << 1000.0 * mean_licensed / mean_wall_ms << '\n';
+    std::cout << "published_tokens_per_second," << 1000.0 * mean_licensed_per_batch / mean_wall_ms
+              << '\n';
     std::cout << "accepted_per_position";
-    for (std::size_t position = 0; position < after.accepted_per_position.size(); ++position) {
-        std::cout << ','
-                  << after.accepted_per_position[position] - before.accepted_per_position[position];
+    for (std::size_t position = 0; position < options.draft_tokens; ++position) {
+        std::cout << ',' << accepted_per_position[position];
     }
     std::cout << '\n';
     return 0;

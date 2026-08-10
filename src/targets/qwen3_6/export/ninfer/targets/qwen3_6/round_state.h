@@ -12,8 +12,10 @@
 
 namespace ninfer::targets::qwen3_6 {
 
-inline constexpr std::uint32_t kMtpDecodeMaximumDrafts = 5;
-inline constexpr std::uint32_t kMtpDecodeMaximumWidth  = kMtpDecodeMaximumDrafts + 1;
+inline constexpr std::uint32_t kMtpDecodeMaximumDrafts    = 5;
+inline constexpr std::uint32_t kMtpDecodeMaximumWidth     = kMtpDecodeMaximumDrafts + 1;
+inline constexpr std::uint32_t kDFlashDecodeMaximumDrafts = 15;
+inline constexpr std::uint32_t kDFlashDecodeMaximumWidth  = kDFlashDecodeMaximumDrafts + 1;
 
 struct RoundStateSpec {
     std::int32_t hidden          = 0;
@@ -21,6 +23,7 @@ struct RoundStateSpec {
     std::uint32_t batch_capacity = 1;
     std::uint32_t draft_window   = 0;
     bool enable_mtp              = false;
+    bool enable_dflash           = false;
 };
 
 // Stable pinned/device transfer format for ordinary decode. The full fixed-size object is copied
@@ -68,6 +71,28 @@ struct MtpDecodeEgress {
     std::array<std::int32_t, kMaximumConcurrency> next_extents{};
 };
 
+// Stable pinned/device transfer formats for one exact-B DFlash transaction. The proposal is
+// produced and verified in the same round, so no draft state crosses the round boundary.
+struct DFlashDecodeIngress {
+    std::array<TokenId, kMaximumConcurrency> anchors{};
+    std::array<std::int32_t, kMaximumConcurrency> execution_frontiers{};
+    std::array<std::int32_t, kMaximumConcurrency> context_frontiers{};
+    std::array<std::int32_t, kMaximumConcurrency> proposal_extents{};
+    std::array<std::int32_t, kMaximumConcurrency> target_valid_columns{};
+    std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
+    std::array<std::int32_t, kMaximumConcurrency> dflash_kv_table_rows{};
+    std::array<std::int32_t, kMaximumConcurrency> lanes{};
+    std::array<std::int32_t, kMaximumConcurrency> linear_state_read_slots{};
+    std::array<std::int32_t, kMaximumConcurrency> linear_state_snapshot_base_slots{};
+    std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
+};
+
+struct DFlashDecodeEgress {
+    std::array<TokenId, kMaximumConcurrency * kDFlashDecodeMaximumWidth> licensed_tokens{};
+    std::array<std::int32_t, kMaximumConcurrency> licensed_counts{};
+    std::array<std::int32_t, kMaximumConcurrency> accepted_drafts{};
+};
+
 struct OrdinaryDecodeStateLayout {
     LayoutRegion ingress;
     LayoutRegion egress;
@@ -75,20 +100,16 @@ struct OrdinaryDecodeStateLayout {
     TensorRegion hidden;
 };
 
-struct SpeculativeRoundStateLayout {
-    TensorRegion target_argmax;
-    TensorRegion draft_tokens;
-    TensorRegion current_proposal_extent;
-    TensorRegion round_tokens;
-    TensorRegion produced_count;
-    TensorRegion target_input_ids;
-    TensorRegion target_positions;
-    TensorRegion accepted_drafts;
-};
-
 struct MtpPrefillStateLayout {
     TensorRegion position;
     TensorRegion ar_hidden;
+    TensorRegion draft_tokens;
+    TensorRegion target_input_ids;
+    TensorRegion target_positions;
+};
+
+struct DFlashPrefillStateLayout {
+    TensorRegion produced_count;
 };
 
 struct MtpDecodeStateLayout {
@@ -100,6 +121,7 @@ struct MtpDecodeStateLayout {
     TensorRegion target_logits;
     TensorRegion target_hidden;
     TensorRegion target_continuation_hidden;
+    TensorRegion proposal_logits;
     TensorRegion alignment_ids;
     TensorRegion alignment_hidden;
     TensorRegion ar_hidden;
@@ -109,22 +131,37 @@ struct MtpDecodeStateLayout {
     TensorRegion ar_valid_columns;
 };
 
+struct DFlashDecodeStateLayout {
+    LayoutRegion ingress;
+    LayoutRegion egress;
+    TensorRegion proposal_ids;
+    TensorRegion proposal_positions;
+    TensorRegion append_positions;
+    TensorRegion append_counts;
+    TensorRegion draft_tokens;
+    TensorRegion verify_ids;
+    TensorRegion target_argmax;
+    TensorRegion target_logits;
+    TensorRegion target_hidden;
+    TensorRegion target_continuation_hidden;
+};
+
 struct RoundStateLayout {
     RoundStateSpec spec;
-    OrdinaryDecodeStateLayout ordinary;
+    std::optional<OrdinaryDecodeStateLayout> ordinary;
     TensorRegion token;
     TensorRegion pos;
     TensorRegion rope_pos;
     TensorRegion rope_delta;
     TensorRegion logits;
-    TensorRegion verify_hidden;
     TensorRegion text_kv_table_row;
     TensorRegion backend_kv_table_row;
     TensorRegion linear_state_read_slot;
     TensorRegion linear_state_snapshot_base_slot;
-    SpeculativeRoundStateLayout speculative;
     std::optional<MtpPrefillStateLayout> mtp;
+    std::optional<DFlashPrefillStateLayout> dflash_prefill;
     std::optional<MtpDecodeStateLayout> mtp_decode;
+    std::optional<DFlashDecodeStateLayout> dflash_decode;
     bool complete = false;
 };
 
@@ -148,33 +185,29 @@ struct OrdinaryDecodeState {
                         std::uint32_t batch_capacity);
 };
 
-// The two planning calls expose one deliberate exact-target extension seam after verify_hidden.
+// The two planning calls expose one deliberate exact-target extension seam after scalar logits.
 // This lets a target retain its schedule-sized prefill activation at the established physical
 // address without making that activation part of the family round contract.
 [[nodiscard]] RoundStateLayout begin_round_state_layout(LayoutBuilder& builder,
                                                         const RoundStateSpec& spec);
 void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layout);
 
-struct SpeculativeRoundState {
-    Tensor target_argmax;
-    Tensor draft_tokens;
-    Tensor current_proposal_extent;
-    Tensor round_tokens;
-    Tensor produced_count;
-    Tensor target_input_ids;
-    Tensor target_positions;
-    Tensor accepted_drafts;
-
-    SpeculativeRoundState() = default;
-    SpeculativeRoundState(DeviceSpan backing, const SpeculativeRoundStateLayout& layout);
-};
-
 struct MtpPrefillState {
     Tensor position;
     Tensor ar_hidden;
+    Tensor draft_tokens;
+    Tensor target_input_ids;
+    Tensor target_positions;
 
     MtpPrefillState() = default;
     MtpPrefillState(DeviceSpan backing, const MtpPrefillStateLayout& layout);
+};
+
+struct DFlashPrefillState {
+    Tensor produced_count;
+
+    DFlashPrefillState() = default;
+    DFlashPrefillState(DeviceSpan backing, const DFlashPrefillStateLayout& layout);
 };
 
 struct MtpDecodeState {
@@ -205,6 +238,7 @@ struct MtpDecodeState {
     Tensor target_logits;
     Tensor target_hidden;
     Tensor target_continuation_hidden;
+    Tensor proposal_logits;
     Tensor alignment_ids;
     Tensor alignment_hidden;
     Tensor ar_hidden;
@@ -218,21 +252,54 @@ struct MtpDecodeState {
                    std::uint32_t batch_capacity, std::uint32_t draft_window);
 };
 
+struct DFlashDecodeState {
+    DeviceSpan ingress;
+    DeviceSpan egress;
+    Tensor anchors;
+    Tensor execution_frontiers;
+    Tensor context_frontiers;
+    Tensor proposal_extents;
+    Tensor target_valid_columns;
+    Tensor text_kv_table_rows;
+    Tensor dflash_kv_table_rows;
+    Tensor lanes;
+    Tensor linear_state_read_slots;
+    Tensor linear_state_snapshot_base_slots;
+    const ops::SamplingConfig* sampling = nullptr;
+    Tensor licensed_tokens;
+    Tensor licensed_counts;
+    Tensor accepted_drafts;
+    Tensor proposal_ids;
+    Tensor proposal_positions;
+    Tensor append_positions;
+    Tensor append_counts;
+    Tensor draft_tokens;
+    Tensor verify_ids;
+    Tensor target_argmax;
+    Tensor target_logits;
+    Tensor target_hidden;
+    Tensor target_continuation_hidden;
+
+    DFlashDecodeState() = default;
+    DFlashDecodeState(DeviceSpan backing, const DFlashDecodeStateLayout& layout,
+                      std::uint32_t batch_capacity, std::uint32_t draft_window);
+};
+
 struct RoundState {
-    OrdinaryDecodeState ordinary;
+    std::optional<OrdinaryDecodeState> ordinary;
     Tensor token;
     Tensor pos;
     Tensor rope_pos;
     Tensor rope_delta;
     Tensor logits;
-    Tensor verify_hidden;
     Tensor text_kv_table_row;
     Tensor backend_kv_table_row;
     Tensor linear_state_read_slot;
     Tensor linear_state_snapshot_base_slot;
-    SpeculativeRoundState speculative;
     std::optional<MtpPrefillState> mtp;
+    std::optional<DFlashPrefillState> dflash_prefill;
     std::optional<MtpDecodeState> mtp_decode;
+    std::optional<DFlashDecodeState> dflash_decode;
 
     RoundState() = default;
     RoundState(DeviceSpan backing, const RoundStateLayout& layout);

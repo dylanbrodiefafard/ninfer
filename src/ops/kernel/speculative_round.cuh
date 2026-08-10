@@ -30,7 +30,9 @@ __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anc
         const int off = row * T + j;
         verify_ids[off] =
             j == 0 ? anchors[row] : (j <= extent ? drafts[row * k + j - 1] : anchors[row]);
-        positions[off] = base_positions[row] + (j <= extent ? j : extent);
+        if (positions != nullptr) {
+            positions[off] = base_positions[row] + (j <= extent ? j : extent);
+        }
     }
 }
 

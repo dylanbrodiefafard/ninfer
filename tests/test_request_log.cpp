@@ -152,6 +152,7 @@ int main() {
     outcome.completion_tokens                         = 1024;
     outcome.finish_reason                             = ninfer::FinishReason::OutputLimit;
     outcome.metrics.prepare_seconds                   = 0.1234567890123;
+    outcome.metrics.ttft_seconds                      = 0.3580246791357;
     outcome.metrics.vision_seconds                    = 0.0;
     outcome.metrics.prefill_seconds                   = 0.2345678901234;
     outcome.metrics.decode_seconds                    = 5.3456789012345;
@@ -172,6 +173,9 @@ int main() {
     failures += check(done.at("timings_seconds").at("decode").get<double>() ==
                           outcome.metrics.decode_seconds,
                       "decode time lost precision");
+    failures +=
+        check(done.at("timings_seconds").at("ttft").get<double>() == outcome.metrics.ttft_seconds,
+              "TTFT missing or lost precision");
     failures += check(done.at("speculative").at("backend") == "mtp", "speculative backend missing");
     failures +=
         check(done.at("speculative").at("draft_window") == 3, "speculative draft window missing");

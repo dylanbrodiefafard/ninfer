@@ -27,9 +27,10 @@ using GdnProjectionWeights           = typename Variant::GdnProjectionWeights;
 using VisionWeights                  = typename Variant::VisionWeights;
 using GraphExecutionProfile          = typename Variant::GraphExecutionProfile;
 
-using SequencePlan = qwen3_6::SequencePlan<Variant>;
-using RequestPlan  = qwen3_6::RequestPlan<Variant>;
-using Program      = qwen3_6::Program<Variant>;
+using SequencePlan    = qwen3_6::SequencePlan<Variant>;
+using RequestBasePlan = qwen3_6::RequestBasePlan<Variant>;
+using RequestPlan     = qwen3_6::RequestPlan<Variant>;
+using Program         = qwen3_6::Program<Variant>;
 
 inline constexpr float kAttentionScale                   = Variant::attention_scale;
 inline constexpr float kGdnScale                         = Variant::gdn_scale;
@@ -46,14 +47,10 @@ inline std::vector<GraphExecutionProfile> mtp_graph_profiles(std::uint32_t capac
     return Variant::mtp_graph_profiles(capacity, draft_window);
 }
 
-inline std::vector<GraphExecutionProfile>
-dflash_initial_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window) {
-    return Variant::dflash_initial_graph_profiles(capacity, draft_window);
-}
-
-inline std::vector<GraphExecutionProfile> dflash_steady_graph_profiles(std::uint32_t capacity,
-                                                                       std::uint32_t draft_window) {
-    return Variant::dflash_steady_graph_profiles(capacity, draft_window);
+inline std::vector<GraphExecutionProfile> dflash_graph_profiles(std::uint32_t capacity,
+                                                                std::uint32_t draft_window,
+                                                                std::uint32_t batch_size) {
+    return Variant::dflash_graph_profiles(capacity, draft_window, batch_size);
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

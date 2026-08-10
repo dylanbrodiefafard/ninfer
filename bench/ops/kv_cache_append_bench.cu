@@ -328,8 +328,8 @@ private:
     PagedKVLayerView cache_view_;
 };
 
-PagedKVLayerView make_prefix_paged_view(DeviceBuffer& k, DeviceBuffer& v,
-                                        DeviceBuffer& block_table) {
+PagedKVBatchLayerView make_prefix_paged_view(DeviceBuffer& k, DeviceBuffer& v,
+                                             DeviceBuffer& block_tables) {
     return {
         .k_pages = Tensor(
             k.p, DType::BF16,
@@ -337,7 +337,7 @@ PagedKVLayerView make_prefix_paged_view(DeviceBuffer& k, DeviceBuffer& v,
         .v_pages = Tensor(
             v.p, DType::BF16,
             {kPrefixHeadDim, kPagedKVPageSize, kRingCapacity / kPagedKVPageSize, kPrefixKvHeads}),
-        .block_table  = Tensor(block_table.p, DType::I32, {kRingCapacity / kPagedKVPageSize}),
+        .block_tables = Tensor(block_tables.p, DType::I32, {kRingCapacity / kPagedKVPageSize, 1}),
         .head_dim     = kPrefixHeadDim,
         .num_kv_heads = kPrefixKvHeads,
         .dtype        = DType::BF16,
@@ -347,12 +347,13 @@ PagedKVLayerView make_prefix_paged_view(DeviceBuffer& k, DeviceBuffer& v,
 
 CyclicKVCacheLayerView make_prefix_cyclic_view(DeviceBuffer& k, DeviceBuffer& v) {
     return {
-        .k        = Tensor(k.p, DType::BF16, {kPrefixHeadDim, kRingCapacity, kPrefixKvHeads}),
-        .v        = Tensor(v.p, DType::BF16, {kPrefixHeadDim, kRingCapacity, kPrefixKvHeads}),
+        .k        = Tensor(k.p, DType::BF16, {kPrefixHeadDim, kRingCapacity, kPrefixKvHeads, 1}),
+        .v        = Tensor(v.p, DType::BF16, {kPrefixHeadDim, kRingCapacity, kPrefixKvHeads, 1}),
         .capacity = kRingCapacity,
         .padded_capacity = kRingCapacity,
         .num_kv_heads    = kPrefixKvHeads,
         .head_dim        = kPrefixHeadDim,
+        .lane_capacity   = 1,
     };
 }
 
@@ -363,17 +364,18 @@ public:
           k_(bench::make_bf16(static_cast<std::size_t>(kPrefixHeadDim) * kPrefixKvHeads * tokens)),
           v_(bench::make_bf16(static_cast<std::size_t>(kPrefixHeadDim) * kPrefixKvHeads * tokens)),
           positions_(static_cast<std::size_t>(tokens) * sizeof(std::int32_t)),
-          commit_count_(sizeof(std::int32_t)),
+          commit_count_(sizeof(std::int32_t)), selector_(sizeof(std::int32_t)),
           cache_k_(bench::make_zeros(static_cast<std::size_t>(kPrefixHeadDim) * kRingCapacity *
                                      kPrefixKvHeads * 2)),
           cache_v_(bench::make_zeros(static_cast<std::size_t>(kPrefixHeadDim) * kRingCapacity *
                                      kPrefixKvHeads * 2)),
           block_table_(static_cast<std::size_t>(kRingCapacity / kPagedKVPageSize) *
                        sizeof(std::int32_t)),
-          k_tensor_(k_.p, DType::BF16, {kPrefixHeadDim, kPrefixKvHeads, tokens}),
-          v_tensor_(v_.p, DType::BF16, {kPrefixHeadDim, kPrefixKvHeads, tokens}),
-          positions_tensor_(positions_.p, DType::I32, {tokens}),
+          k_tensor_(k_.p, DType::BF16, {kPrefixHeadDim, kPrefixKvHeads, tokens, 1}),
+          v_tensor_(v_.p, DType::BF16, {kPrefixHeadDim, kPrefixKvHeads, tokens, 1}),
+          positions_tensor_(positions_.p, DType::I32, {tokens, 1}),
           count_tensor_(commit_count_.p, DType::I32, {1}),
+          selector_tensor_(selector_.p, DType::I32, {1}),
           paged_view_(make_prefix_paged_view(cache_k_, cache_v_, block_table_)),
           cyclic_view_(make_prefix_cyclic_view(cache_k_, cache_v_)),
           envelope_{0, static_cast<std::uint32_t>(tokens)} {
@@ -392,15 +394,17 @@ public:
                               cudaMemcpyHostToDevice));
         CUDA_CHECK(
             cudaMemcpy(commit_count_.p, &committed_, sizeof(committed_), cudaMemcpyHostToDevice));
+        const std::int32_t selector = 0;
+        CUDA_CHECK(cudaMemcpy(selector_.p, &selector, sizeof(selector), cudaMemcpyHostToDevice));
     }
 
     void launch(cudaStream_t stream) {
         if (cyclic_) {
             ops::kv_cache_append_prefix(k_tensor_, v_tensor_, positions_tensor_, count_tensor_,
-                                        envelope_, cyclic_view_, stream);
+                                        selector_tensor_, envelope_, cyclic_view_, stream);
         } else {
             ops::kv_cache_append_prefix(k_tensor_, v_tensor_, positions_tensor_, count_tensor_,
-                                        envelope_, paged_view_, stream);
+                                        selector_tensor_, envelope_, paged_view_, stream);
         }
     }
 
@@ -412,6 +416,7 @@ private:
     DeviceBuffer v_;
     DeviceBuffer positions_;
     DeviceBuffer commit_count_;
+    DeviceBuffer selector_;
     DeviceBuffer cache_k_;
     DeviceBuffer cache_v_;
     DeviceBuffer block_table_;
@@ -419,7 +424,8 @@ private:
     Tensor v_tensor_;
     Tensor positions_tensor_;
     Tensor count_tensor_;
-    PagedKVLayerView paged_view_;
+    Tensor selector_tensor_;
+    PagedKVBatchLayerView paged_view_;
     CyclicKVCacheLayerView cyclic_view_;
     ops::KVCacheAppendPrefixExecutionEnvelope envelope_;
 };

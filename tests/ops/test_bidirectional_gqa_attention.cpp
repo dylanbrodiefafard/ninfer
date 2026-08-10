@@ -181,12 +181,13 @@ void bidirectional_gqa_oracle(const std::vector<float>& q, const std::vector<flo
     }
 }
 
-PagedKVLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v, DeviceBuffer& block_table,
-                                   int logical_pages, int physical_pages) {
+PagedKVBatchLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v,
+                                        DeviceBuffer& block_tables, int logical_pages,
+                                        int physical_pages, int table_rows = 1) {
     return {
         .k_pages      = Tensor(k.p, DType::BF16, {kD, kPage, physical_pages, kKVHeads}),
         .v_pages      = Tensor(v.p, DType::BF16, {kD, kPage, physical_pages, kKVHeads}),
-        .block_table  = Tensor(block_table.p, DType::I32, {logical_pages}),
+        .block_tables = Tensor(block_tables.p, DType::I32, {logical_pages, table_rows}),
         .head_dim     = kD,
         .num_kv_heads = kKVHeads,
         .dtype        = DType::BF16,
@@ -279,23 +280,28 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     DeviceBuffer d_context_v = to_device(context_v_expected);
     DeviceBuffer d_table     = to_device(mapping);
     DeviceBuffer d_length    = to_device_i32(length_expected);
+    DeviceBuffer d_valid     = to_device_i32({tokens});
+    DeviceBuffer d_table_row = to_device_i32({0});
     GuardedDeviceBuffer d_out(q_count * sizeof(std::uint16_t));
     d_out.fill(0x7f);
 
-    Tensor q_tensor(d_q.p, DType::BF16, {kD, kQHeads, tokens});
-    Tensor query_k_tensor(d_query_k.p, DType::BF16, {kD, kKVHeads, tokens});
-    Tensor query_v_tensor(d_query_v.p, DType::BF16, {kD, kKVHeads, tokens});
+    Tensor q_tensor(d_q.p, DType::BF16, {kD, kQHeads, tokens, 1});
+    Tensor query_k_tensor(d_query_k.p, DType::BF16, {kD, kKVHeads, tokens, 1});
+    Tensor query_v_tensor(d_query_v.p, DType::BF16, {kD, kKVHeads, tokens, 1});
     Tensor length_tensor(d_length.p, DType::I32, {1});
-    Tensor out_tensor(d_out.data(), DType::BF16, {kD, kQHeads, tokens});
-    PagedKVLayerView context =
+    Tensor valid_tensor(d_valid.p, DType::I32, {1});
+    Tensor table_row_tensor(d_table_row.p, DType::I32, {1});
+    Tensor out_tensor(d_out.data(), DType::BF16, {kD, kQHeads, tokens, 1});
+    PagedKVBatchLayerView context =
         make_context_view(d_context_k, d_context_v, d_table, logical_pages, physical_pages);
     const ops::GqaContextExecutionEnvelope envelope{0, static_cast<std::uint32_t>(envelope_max)};
     const std::size_t workspace_bytes =
-        ops::bidirectional_gqa_attention_workspace_capacity_bytes(envelope, tokens, tokens);
+        ops::bidirectional_gqa_attention_workspace_capacity_bytes(envelope, tokens, tokens, 1);
     DeviceArena workspace(workspace_bytes);
 
     ops::bidirectional_gqa_attention(q_tensor, query_k_tensor, query_v_tensor, length_tensor,
-                                     kScale, context, envelope, workspace, out_tensor, nullptr);
+                                     valid_tensor, table_row_tensor, kScale, context, envelope,
+                                     workspace, out_tensor, nullptr);
     cuda_synchronize();
 
     std::string label = "bidirectional_gqa_attention T=" + std::to_string(tokens) +
@@ -389,17 +395,21 @@ int graph_mapping_replay_case() {
     DeviceBuffer d_context_v = to_device(bf16_bits(physical_v));
     DeviceBuffer d_table     = to_device<std::int32_t>({0, 1});
     DeviceBuffer d_length    = to_device_i32({context_length});
+    DeviceBuffer d_valid     = to_device_i32({tokens});
+    DeviceBuffer d_table_row = to_device_i32({0});
     GuardedDeviceBuffer d_out(q_count * sizeof(std::uint16_t));
-    Tensor q_tensor(d_q.p, DType::BF16, {kD, kQHeads, tokens});
-    Tensor query_k_tensor(d_query_k.p, DType::BF16, {kD, kKVHeads, tokens});
-    Tensor query_v_tensor(d_query_v.p, DType::BF16, {kD, kKVHeads, tokens});
+    Tensor q_tensor(d_q.p, DType::BF16, {kD, kQHeads, tokens, 1});
+    Tensor query_k_tensor(d_query_k.p, DType::BF16, {kD, kKVHeads, tokens, 1});
+    Tensor query_v_tensor(d_query_v.p, DType::BF16, {kD, kKVHeads, tokens, 1});
     Tensor length_tensor(d_length.p, DType::I32, {1});
-    Tensor out_tensor(d_out.data(), DType::BF16, {kD, kQHeads, tokens});
-    PagedKVLayerView context =
+    Tensor valid_tensor(d_valid.p, DType::I32, {1});
+    Tensor table_row_tensor(d_table_row.p, DType::I32, {1});
+    Tensor out_tensor(d_out.data(), DType::BF16, {kD, kQHeads, tokens, 1});
+    PagedKVBatchLayerView context =
         make_context_view(d_context_k, d_context_v, d_table, logical_pages, physical_pages);
     constexpr ops::GqaContextExecutionEnvelope envelope{0, context_length};
     DeviceArena workspace(
-        ops::bidirectional_gqa_attention_workspace_capacity_bytes(envelope, tokens, tokens));
+        ops::bidirectional_gqa_attention_workspace_capacity_bytes(envelope, tokens, tokens, 1));
 
     cudaStream_t stream        = nullptr;
     cudaGraph_t graph          = nullptr;
@@ -408,7 +418,8 @@ int graph_mapping_replay_case() {
     cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
                "begin bidirectional GQA capture");
     ops::bidirectional_gqa_attention(q_tensor, query_k_tensor, query_v_tensor, length_tensor,
-                                     kScale, context, envelope, workspace, out_tensor, stream);
+                                     valid_tensor, table_row_tensor, kScale, context, envelope,
+                                     workspace, out_tensor, stream);
     cuda_check(cudaStreamEndCapture(stream, &graph), "end bidirectional GQA capture");
     cuda_check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
                "instantiate bidirectional GQA graph");
@@ -435,6 +446,118 @@ int graph_mapping_replay_case() {
     return failures;
 }
 
+int batch_table_case() {
+    constexpr int tokens            = 2;
+    constexpr int batch             = 2;
+    constexpr int logical_pages     = 2;
+    constexpr int logical_capacity  = logical_pages * kPage;
+    constexpr int physical_pages    = 6;
+    const std::size_t row_q_count   = static_cast<std::size_t>(kD) * kQHeads * tokens;
+    const std::size_t row_kv_count  = static_cast<std::size_t>(kD) * kKVHeads * tokens;
+    const std::size_t logical_count = static_cast<std::size_t>(kD) * logical_capacity * kKVHeads;
+    const std::size_t physical_count =
+        static_cast<std::size_t>(kD) * kPage * kKVHeads * physical_pages;
+
+    std::vector<float> q(row_q_count * batch);
+    std::vector<float> query_k(row_kv_count * batch);
+    std::vector<float> query_v(row_kv_count * batch);
+    std::vector<float> logical_k(logical_count * batch);
+    std::vector<float> logical_v(logical_count * batch);
+    std::vector<float> physical_k(physical_count);
+    std::vector<float> physical_v(physical_count);
+    fill_uniform(q, 16001u, -0.35f, 0.35f);
+    fill_uniform(query_k, 17011u, -0.4f, 0.4f);
+    fill_uniform(query_v, 18013u, -0.8f, 0.8f);
+    fill_uniform(logical_k, 19001u, -0.4f, 0.4f);
+    fill_uniform(logical_v, 20011u, -0.8f, 0.8f);
+    fill_uniform(physical_k, 21001u, -0.9f, 0.9f);
+    fill_uniform(physical_v, 22003u, -0.9f, 0.9f);
+    round_to_bf16(q);
+    round_to_bf16(query_k);
+    round_to_bf16(query_v);
+    round_to_bf16(logical_k);
+    round_to_bf16(logical_v);
+    round_to_bf16(physical_k);
+    round_to_bf16(physical_v);
+
+    const std::vector<std::int32_t> block_tables{0, 2, 5, 3};
+    for (int row = 0; row < batch; ++row) {
+        const std::vector<float> row_k(
+            logical_k.begin() + static_cast<std::ptrdiff_t>(row * logical_count),
+            logical_k.begin() + static_cast<std::ptrdiff_t>((row + 1) * logical_count));
+        const std::vector<float> row_v(
+            logical_v.begin() + static_cast<std::ptrdiff_t>(row * logical_count),
+            logical_v.begin() + static_cast<std::ptrdiff_t>((row + 1) * logical_count));
+        const std::vector<std::int32_t> mapping(
+            block_tables.begin() + static_cast<std::ptrdiff_t>(row * logical_pages),
+            block_tables.begin() + static_cast<std::ptrdiff_t>((row + 1) * logical_pages));
+        scatter_context_mapping(physical_k, row_k, logical_capacity, logical_capacity, mapping,
+                                physical_pages);
+        scatter_context_mapping(physical_v, row_v, logical_capacity, logical_capacity, mapping,
+                                physical_pages);
+    }
+
+    const std::vector<std::int32_t> lengths{65, 1};
+    const std::vector<std::int32_t> valid{2, 1};
+    const std::vector<std::int32_t> table_rows{1, 0};
+    DeviceBuffer d_q          = to_device(bf16_bits(q));
+    DeviceBuffer d_query_k    = to_device(bf16_bits(query_k));
+    DeviceBuffer d_query_v    = to_device(bf16_bits(query_v));
+    DeviceBuffer d_context_k  = to_device(bf16_bits(physical_k));
+    DeviceBuffer d_context_v  = to_device(bf16_bits(physical_v));
+    DeviceBuffer d_tables     = to_device(block_tables);
+    DeviceBuffer d_lengths    = to_device(lengths);
+    DeviceBuffer d_valid      = to_device(valid);
+    DeviceBuffer d_table_rows = to_device(table_rows);
+    GuardedDeviceBuffer d_out(row_q_count * batch * sizeof(std::uint16_t));
+    d_out.fill(0x7f);
+
+    Tensor q_tensor(d_q.p, DType::BF16, {kD, kQHeads, tokens, batch});
+    Tensor query_k_tensor(d_query_k.p, DType::BF16, {kD, kKVHeads, tokens, batch});
+    Tensor query_v_tensor(d_query_v.p, DType::BF16, {kD, kKVHeads, tokens, batch});
+    Tensor length_tensor(d_lengths.p, DType::I32, {batch});
+    Tensor valid_tensor(d_valid.p, DType::I32, {batch});
+    Tensor table_row_tensor(d_table_rows.p, DType::I32, {batch});
+    Tensor out_tensor(d_out.data(), DType::BF16, {kD, kQHeads, tokens, batch});
+    auto context =
+        make_context_view(d_context_k, d_context_v, d_tables, logical_pages, physical_pages, batch);
+    constexpr ops::GqaContextExecutionEnvelope envelope{0, 65};
+
+    std::vector<std::uint16_t> expected(row_q_count * batch);
+    DeviceArena single_workspace(
+        ops::bidirectional_gqa_attention_workspace_capacity_bytes(envelope, tokens, tokens, 1));
+    for (int b = 0; b < batch; ++b) {
+        GuardedDeviceBuffer single_out(row_q_count * sizeof(std::uint16_t));
+        Tensor single_out_tensor(single_out.data(), DType::BF16, {kD, kQHeads, tokens, 1});
+        Tensor q_row       = q_tensor.slice(3, b, 1);
+        Tensor query_k_row = query_k_tensor.slice(3, b, 1);
+        Tensor query_v_row = query_v_tensor.slice(3, b, 1);
+        Tensor length_row  = length_tensor.slice(0, b, 1);
+        Tensor valid_row   = valid_tensor.slice(0, b, 1);
+        Tensor table_row   = table_row_tensor.slice(0, b, 1);
+        ops::bidirectional_gqa_attention(q_row, query_k_row, query_v_row, length_row, valid_row,
+                                         table_row, kScale, context, envelope, single_workspace,
+                                         single_out_tensor, nullptr);
+        cuda_synchronize();
+        const auto row = from_device<std::uint16_t>(single_out.data(), row_q_count);
+        std::copy(row.begin(), row.end(),
+                  expected.begin() + static_cast<std::ptrdiff_t>(b * row_q_count));
+    }
+
+    DeviceArena workspace(
+        ops::bidirectional_gqa_attention_workspace_capacity_bytes(envelope, tokens, tokens, batch));
+    ops::bidirectional_gqa_attention(q_tensor, query_k_tensor, query_v_tensor, length_tensor,
+                                     valid_tensor, table_row_tensor, kScale, context, envelope,
+                                     workspace, out_tensor, nullptr);
+    cuda_synchronize();
+
+    int failures =
+        verify_exact("bidirectional_gqa_attention B=2 mixed lengths and table rows",
+                     from_device<std::uint16_t>(d_out.data(), row_q_count * batch), expected);
+    failures += d_out.verify_guards("bidirectional GQA B=2 output guards");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -446,16 +569,16 @@ int main() {
     int failures = 0;
     constexpr ops::GqaContextExecutionEnvelope capacity_envelope{0, 196609};
     const std::size_t interval =
-        ops::bidirectional_gqa_attention_workspace_capacity_bytes(capacity_envelope, 1, 16);
+        ops::bidirectional_gqa_attention_workspace_capacity_bytes(capacity_envelope, 1, 16, 1);
     const std::size_t witness = std::max(
-        ops::bidirectional_gqa_attention_workspace_capacity_bytes(capacity_envelope, 8, 8),
-        ops::bidirectional_gqa_attention_workspace_capacity_bytes(capacity_envelope, 16, 16));
+        ops::bidirectional_gqa_attention_workspace_capacity_bytes(capacity_envelope, 8, 8, 1),
+        ops::bidirectional_gqa_attention_workspace_capacity_bytes(capacity_envelope, 16, 16, 1));
     if (interval != witness) {
         std::cerr << "bidirectional GQA interval capacity missed a token-band endpoint\n";
         ++failures;
     }
     try {
-        (void)ops::bidirectional_gqa_attention_workspace_capacity_bytes(capacity_envelope, 9, 8);
+        (void)ops::bidirectional_gqa_attention_workspace_capacity_bytes(capacity_envelope, 9, 8, 1);
         std::cerr << "bidirectional GQA accepted an invalid token interval\n";
         ++failures;
     } catch (const std::invalid_argument&) {}
@@ -469,6 +592,7 @@ int main() {
     failures += run_case(1, 4096, InputProfile::Random, -1, MappingPattern::Fragmented);
     failures += run_case(4, 0, InputProfile::QueryVisibility);
     failures += graph_mapping_replay_case();
+    failures += batch_table_case();
 
     if (failures != 0) {
         std::cerr << "bidirectional_gqa_attention failures=" << failures << '\n';

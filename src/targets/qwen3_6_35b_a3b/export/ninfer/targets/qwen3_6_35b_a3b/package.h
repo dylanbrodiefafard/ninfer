@@ -79,15 +79,16 @@ struct Package {
     static constexpr std::string_view model_id   = "qwen3.6-35b-a3b";
     static constexpr std::string_view target_key = "qwen3_6_35b_a3b";
 
-    using WeightsProfile = detail::WeightsProfile;
-    using LoadPlan       = detail::LoadPlan;
-    using LoadedModel    = detail::LoadedModel;
-    using Frontend       = detail::Frontend;
-    using PreparedPrompt = detail::PreparedPrompt;
-    using OutputSession  = detail::OutputSession;
-    using SequencePlan   = qwen3_6::SequencePlan<detail::Variant>;
-    using RequestPlan    = qwen3_6::RequestPlan<detail::Variant>;
-    using Program        = qwen3_6::Program<detail::Variant>;
+    using WeightsProfile  = detail::WeightsProfile;
+    using LoadPlan        = detail::LoadPlan;
+    using LoadedModel     = detail::LoadedModel;
+    using Frontend        = detail::Frontend;
+    using PreparedPrompt  = detail::PreparedPrompt;
+    using OutputSession   = detail::OutputSession;
+    using SequencePlan    = qwen3_6::SequencePlan<detail::Variant>;
+    using RequestBasePlan = qwen3_6::RequestBasePlan<detail::Variant>;
+    using RequestPlan     = qwen3_6::RequestPlan<detail::Variant>;
+    using Program         = qwen3_6::Program<detail::Variant>;
 
     [[nodiscard]] static WeightsProfile resolve_weights(const artifact::ArtifactIdentity& identity);
     [[nodiscard]] static LoadPlan plan_load(artifact::Binder& binder, const EngineOptions& options,

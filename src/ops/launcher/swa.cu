@@ -81,9 +81,10 @@ const char* swa_route_name(SwaRoute route) {
 }
 
 void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
-                const Tensor& positions, float scale, const CyclicKVCacheLayerView& context,
-                const SwaPlan& plan, Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
-                Tensor& out, cudaStream_t stream) {
+                const Tensor& positions, const Tensor& valid_columns, const Tensor& lanes,
+                float scale, const CyclicKVCacheLayerView& context, const SwaPlan& plan,
+                Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out,
+                cudaStream_t stream) {
     dispatch_tokens(q.ne[2], [&]<int Tokens, int Warps>() {
         const bool direct = plan.route == SwaRoute::Direct;
         if (plan.warps != Warps || plan.split_capacity < 1 ||
@@ -94,13 +95,15 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
         constexpr std::size_t SmemBytes =
             2u * KeyBlock * kBidirectionalGqaHeadDim * sizeof(__nv_bfloat16);
         if (direct) {
-            const dim3 direct_grid(kBidirectionalGqaKVHeads, 1, 1);
+            const dim3 direct_grid(kBidirectionalGqaKVHeads, 1, q.ne[3]);
             swa_split_partial_kernel<Tokens, Warps, KeyBlock, true>
                 <<<direct_grid, Warps * 32, SmemBytes, stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data),
                     static_cast<const __nv_bfloat16*>(query_k.data),
                     static_cast<const __nv_bfloat16*>(query_v.data),
                     static_cast<const std::int32_t*>(positions.data),
+                    static_cast<const std::int32_t*>(valid_columns.data),
+                    static_cast<const std::int32_t*>(lanes.data),
                     static_cast<const __nv_bfloat16*>(context.k.data),
                     static_cast<const __nv_bfloat16*>(context.v.data),
                     static_cast<int>(context.padded_capacity), plan.max_context, 1, scale,
@@ -111,13 +114,15 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
             return;
         }
 
-        const dim3 partial_grid(kBidirectionalGqaKVHeads, plan.split_capacity, 1);
+        const dim3 partial_grid(kBidirectionalGqaKVHeads, plan.split_capacity, q.ne[3]);
         swa_split_partial_kernel<Tokens, Warps, KeyBlock, false>
             <<<partial_grid, Warps * 32, SmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
                 static_cast<const __nv_bfloat16*>(query_k.data),
                 static_cast<const __nv_bfloat16*>(query_v.data),
                 static_cast<const std::int32_t*>(positions.data),
+                static_cast<const std::int32_t*>(valid_columns.data),
+                static_cast<const std::int32_t*>(lanes.data),
                 static_cast<const __nv_bfloat16*>(context.k.data),
                 static_cast<const __nv_bfloat16*>(context.v.data),
                 static_cast<int>(context.padded_capacity), plan.max_context, plan.split_capacity,
@@ -128,13 +133,14 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
 
         constexpr int ReduceWarps = 1;
         constexpr int ReduceRows  = kBidirectionalGqaQHeads * Tokens;
-        const dim3 reduce_grid((ReduceRows + ReduceWarps - 1) / ReduceWarps, 1, 1);
+        const dim3 reduce_grid((ReduceRows + ReduceWarps - 1) / ReduceWarps, 1, q.ne[3]);
         swa_reduce_kernel<Tokens, KeyBlock, ReduceWarps>
             <<<reduce_grid, ReduceWarps * 32, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(partial_acc.data),
                 static_cast<const float*>(partial_m.data),
                 static_cast<const float*>(partial_l.data),
-                static_cast<const std::int32_t*>(positions.data), plan.max_context,
+                static_cast<const std::int32_t*>(positions.data),
+                static_cast<const std::int32_t*>(valid_columns.data), plan.max_context,
                 plan.split_capacity, static_cast<__nv_bfloat16*>(out.data));
         CUDA_CHECK(cudaGetLastError());
     });

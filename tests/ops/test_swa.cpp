@@ -114,14 +114,15 @@ void swa_oracle(const std::vector<float>& q, const std::vector<float>& query_k,
     }
 }
 
-CyclicKVCacheLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v) {
+CyclicKVCacheLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v, int lane_capacity = 1) {
     return {
-        .k               = Tensor(k.p, DType::BF16, {kD, kWindow, kKVHeads}),
-        .v               = Tensor(v.p, DType::BF16, {kD, kWindow, kKVHeads}),
+        .k               = Tensor(k.p, DType::BF16, {kD, kWindow, kKVHeads, lane_capacity}),
+        .v               = Tensor(v.p, DType::BF16, {kD, kWindow, kKVHeads, lane_capacity}),
         .capacity        = kWindow,
         .padded_capacity = kWindow,
         .num_kv_heads    = kKVHeads,
         .head_dim        = kD,
+        .lane_capacity   = lane_capacity,
     };
 }
 
@@ -189,21 +190,26 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     DeviceBuffer d_context_k = to_device(context_k_expected);
     DeviceBuffer d_context_v = to_device(context_v_expected);
     DeviceBuffer d_positions = to_device_i32(positions);
+    DeviceBuffer d_valid     = to_device<std::int32_t>({tokens});
+    DeviceBuffer d_lane      = to_device<std::int32_t>({0});
     GuardedDeviceBuffer d_out(q_count * sizeof(std::uint16_t));
     d_out.fill(0x7f);
 
-    Tensor q_tensor(d_q.p, DType::BF16, {kD, kQHeads, tokens});
-    Tensor query_k_tensor(d_query_k.p, DType::BF16, {kD, kKVHeads, tokens});
-    Tensor query_v_tensor(d_query_v.p, DType::BF16, {kD, kKVHeads, tokens});
-    Tensor positions_tensor(d_positions.p, DType::I32, {tokens});
-    Tensor out_tensor(d_out.data(), DType::BF16, {kD, kQHeads, tokens});
+    Tensor q_tensor(d_q.p, DType::BF16, {kD, kQHeads, tokens, 1});
+    Tensor query_k_tensor(d_query_k.p, DType::BF16, {kD, kKVHeads, tokens, 1});
+    Tensor query_v_tensor(d_query_v.p, DType::BF16, {kD, kKVHeads, tokens, 1});
+    Tensor positions_tensor(d_positions.p, DType::I32, {tokens, 1});
+    Tensor valid_tensor(d_valid.p, DType::I32, {1});
+    Tensor lane_tensor(d_lane.p, DType::I32, {1});
+    Tensor out_tensor(d_out.data(), DType::BF16, {kD, kQHeads, tokens, 1});
     CyclicKVCacheLayerView context = make_context_view(d_context_k, d_context_v);
     const ops::SwaContextExecutionEnvelope envelope{0, static_cast<std::uint32_t>(envelope_max)};
-    const std::size_t workspace_bytes = ops::swa_workspace_capacity_bytes(envelope, tokens, tokens);
+    const std::size_t workspace_bytes =
+        ops::swa_workspace_capacity_bytes(envelope, tokens, tokens, 1);
     DeviceArena workspace(workspace_bytes);
 
-    ops::swa(q_tensor, query_k_tensor, query_v_tensor, positions_tensor, kScale, context, envelope,
-             workspace, out_tensor, nullptr);
+    ops::swa(q_tensor, query_k_tensor, query_v_tensor, positions_tensor, valid_tensor, lane_tensor,
+             kScale, context, envelope, workspace, out_tensor, nullptr);
     cuda_synchronize();
 
     std::string label = "swa T=" + std::to_string(tokens) + " L=" + std::to_string(context_length);
@@ -238,6 +244,84 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     return failures;
 }
 
+int run_batch_case() {
+    constexpr int tokens                 = 2;
+    constexpr int batch                  = 2;
+    const std::size_t row_q_count        = static_cast<std::size_t>(kD) * kQHeads * tokens;
+    const std::size_t row_kv_count       = static_cast<std::size_t>(kD) * kKVHeads * tokens;
+    const std::size_t lane_context_count = static_cast<std::size_t>(kD) * kWindow * kKVHeads;
+    std::vector<float> q(row_q_count * batch);
+    std::vector<float> query_k(row_kv_count * batch);
+    std::vector<float> query_v(row_kv_count * batch);
+    std::vector<float> context_k(lane_context_count * batch);
+    std::vector<float> context_v(lane_context_count * batch);
+    fill_uniform(q, 1709u, -0.35f, 0.35f);
+    fill_uniform(query_k, 1801u, -0.4f, 0.4f);
+    fill_uniform(query_v, 1907u, -0.8f, 0.8f);
+    fill_uniform(context_k, 2003u, -0.4f, 0.4f);
+    fill_uniform(context_v, 2111u, -0.8f, 0.8f);
+    round_to_bf16(q);
+    round_to_bf16(query_k);
+    round_to_bf16(query_v);
+    round_to_bf16(context_k);
+    round_to_bf16(context_v);
+
+    const std::vector<int> positions{4096, 4097, 65, 65};
+    const std::vector<std::int32_t> valid{2, 1};
+    const std::vector<std::int32_t> lanes{1, 0};
+
+    DeviceBuffer d_q         = to_device(bf16_bits(q));
+    DeviceBuffer d_query_k   = to_device(bf16_bits(query_k));
+    DeviceBuffer d_query_v   = to_device(bf16_bits(query_v));
+    DeviceBuffer d_context_k = to_device(bf16_bits(context_k));
+    DeviceBuffer d_context_v = to_device(bf16_bits(context_v));
+    DeviceBuffer d_positions = to_device_i32(positions);
+    DeviceBuffer d_valid     = to_device(valid);
+    DeviceBuffer d_lanes     = to_device(lanes);
+    GuardedDeviceBuffer d_out(row_q_count * batch * sizeof(std::uint16_t));
+    d_out.fill(0x7f);
+
+    Tensor q_tensor(d_q.p, DType::BF16, {kD, kQHeads, tokens, batch});
+    Tensor query_k_tensor(d_query_k.p, DType::BF16, {kD, kKVHeads, tokens, batch});
+    Tensor query_v_tensor(d_query_v.p, DType::BF16, {kD, kKVHeads, tokens, batch});
+    Tensor positions_tensor(d_positions.p, DType::I32, {tokens, batch});
+    Tensor valid_tensor(d_valid.p, DType::I32, {batch});
+    Tensor lanes_tensor(d_lanes.p, DType::I32, {batch});
+    Tensor out_tensor(d_out.data(), DType::BF16, {kD, kQHeads, tokens, batch});
+    constexpr ops::SwaContextExecutionEnvelope envelope{0, 4096};
+    DeviceArena workspace(ops::swa_workspace_capacity_bytes(envelope, tokens, tokens, batch));
+    auto context = make_context_view(d_context_k, d_context_v, batch);
+
+    std::vector<std::uint16_t> expected(row_q_count * batch);
+    DeviceArena single_workspace(ops::swa_workspace_capacity_bytes(envelope, tokens, tokens, 1));
+    for (int b = 0; b < batch; ++b) {
+        GuardedDeviceBuffer single_out(row_q_count * sizeof(std::uint16_t));
+        Tensor single_out_tensor(single_out.data(), DType::BF16, {kD, kQHeads, tokens, 1});
+        Tensor q_row         = q_tensor.slice(3, b, 1);
+        Tensor query_k_row   = query_k_tensor.slice(3, b, 1);
+        Tensor query_v_row   = query_v_tensor.slice(3, b, 1);
+        Tensor positions_row = positions_tensor.slice(1, b, 1);
+        Tensor valid_row     = valid_tensor.slice(0, b, 1);
+        Tensor lane_row      = lanes_tensor.slice(0, b, 1);
+        ops::swa(q_row, query_k_row, query_v_row, positions_row, valid_row, lane_row, kScale,
+                 context, envelope, single_workspace, single_out_tensor, nullptr);
+        cuda_synchronize();
+        const auto row = from_device<std::uint16_t>(single_out.data(), row_q_count);
+        std::copy(row.begin(), row.end(),
+                  expected.begin() + static_cast<std::ptrdiff_t>(b * row_q_count));
+    }
+
+    ops::swa(q_tensor, query_k_tensor, query_v_tensor, positions_tensor, valid_tensor, lanes_tensor,
+             kScale, context, envelope, workspace, out_tensor, nullptr);
+    cuda_synchronize();
+
+    int failures =
+        verify_exact("swa B=2 mixed lengths and lanes",
+                     from_device<std::uint16_t>(d_out.data(), row_q_count * batch), expected);
+    failures += d_out.verify_guards("swa B=2 output guards");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -248,14 +332,14 @@ int main() {
 
     int failures = 0;
     constexpr ops::SwaContextExecutionEnvelope capacity_envelope{0, 8194};
-    const std::size_t interval = ops::swa_workspace_capacity_bytes(capacity_envelope, 1, 16);
-    const std::size_t endpoint = ops::swa_workspace_capacity_bytes(capacity_envelope, 16, 16);
+    const std::size_t interval = ops::swa_workspace_capacity_bytes(capacity_envelope, 1, 16, 1);
+    const std::size_t endpoint = ops::swa_workspace_capacity_bytes(capacity_envelope, 16, 16, 1);
     if (interval != endpoint) {
         std::cerr << "swa interval capacity did not resolve to its monotonic endpoint\n";
         ++failures;
     }
     try {
-        (void)ops::swa_workspace_capacity_bytes(capacity_envelope, 0, 16);
+        (void)ops::swa_workspace_capacity_bytes(capacity_envelope, 0, 16, 1);
         std::cerr << "swa accepted an invalid token interval\n";
         ++failures;
     } catch (const std::invalid_argument&) {}
@@ -265,6 +349,7 @@ int main() {
     failures += run_case(16, 4096);
     failures += run_case(2, 4096, InputProfile::WindowBoundary);
     failures += run_case(2, 8194);
+    failures += run_batch_case();
 
     if (failures != 0) {
         std::cerr << "swa failures=" << failures << '\n';

@@ -89,6 +89,23 @@ void speculative_prepare_verify_inputs(const Tensor& anchors, const Tensor& draf
         anchors, drafts, base_positions, current_extents, verify_ids, positions, stream);
 }
 
+void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
+                                    const Tensor& current_extents, Tensor& verify_ids,
+                                    cudaStream_t stream) {
+    constexpr const char* op = "speculative_prepare_verify_ids";
+    const std::int32_t k     = drafts.ne[0];
+    const std::int32_t batch = drafts.ne[1];
+    if (k < 1 || batch < 1) {
+        throw std::invalid_argument("speculative_prepare_verify_ids: K and B must be positive");
+    }
+    require_vector(anchors, DType::I32, batch, op, "anchors");
+    require_matrix(drafts, DType::I32, k, batch, op, "drafts");
+    require_vector(current_extents, DType::I32, batch, op, "current_extents");
+    require_matrix(verify_ids, DType::I32, k + 1, batch, op, "verify_ids");
+    detail::speculative_prepare_verify_ids_launch(anchors, drafts, current_extents, verify_ids,
+                                                  stream);
+}
+
 void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor& logits,
                                       const Tensor& drafts, const Tensor& current_extents,
                                       Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,

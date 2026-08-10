@@ -33,6 +33,8 @@ struct SequencePlanImpl;
 template <class Variant>
 struct RequestPlanImpl;
 template <class Variant>
+struct RequestBasePlanImpl;
+template <class Variant>
 class ProgramImpl;
 } // namespace detail
 
@@ -67,6 +69,21 @@ public:
 };
 
 template <class Variant>
+class RequestBasePlan {
+public:
+    RequestBasePlan(RequestBasePlan&&) noexcept;
+    RequestBasePlan& operator=(RequestBasePlan&&) noexcept;
+    ~RequestBasePlan();
+
+    RequestBasePlan(const RequestBasePlan&)            = delete;
+    RequestBasePlan& operator=(const RequestBasePlan&) = delete;
+
+public:
+    explicit RequestBasePlan(std::unique_ptr<detail::RequestBasePlanImpl<Variant>> impl) noexcept;
+    std::unique_ptr<detail::RequestBasePlanImpl<Variant>> impl_;
+};
+
+template <class Variant>
 class RequestPlan {
 public:
     RequestPlan(RequestPlan&&) noexcept;
@@ -95,17 +112,13 @@ public:
     Program(Program&&)                 = delete;
     Program& operator=(Program&&)      = delete;
 
-    [[nodiscard]] RequestPlan<Variant> plan_request(const PreparedPrompt& prompt,
-                                                    const ExecutionOptions& options) const;
-    [[nodiscard]] runtime::BeginResult begin(PreparedPrompt&& prompt, RequestPlan<Variant>&& plan,
-                                             runtime::TransientRegion transient);
-    [[nodiscard]] runtime::GeneratedRound decode_round(runtime::RoundBudget budget);
-
     // Engine-internal fixed-lane execution surface. The public Engine owns scheduling; Program
     // owns target state images and executes one immutable decode batch membership.
+    [[nodiscard]] RequestBasePlan<Variant> plan_request_base(const PreparedPrompt& prompt,
+                                                             const ExecutionOptions& options);
     [[nodiscard]] RequestPlan<Variant> plan_request_for_lane(std::uint32_t lane,
                                                              const PreparedPrompt& prompt,
-                                                             const ExecutionOptions& options);
+                                                             const RequestBasePlan<Variant>& base);
     [[nodiscard]] bool can_admit_lane(std::uint32_t lane,
                                       const RequestPlan<Variant>& plan) const noexcept;
     [[nodiscard]] bool
@@ -130,14 +143,7 @@ public:
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
-    void resolve_pending(std::uint32_t accepted_tokens, bool terminal);
-    void finish_active();
-    void abort_request() noexcept;
-
-    [[nodiscard]] std::uint32_t materialized_tokens() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
-    [[nodiscard]] SpeculativeStats speculative_stats() const;
-    [[nodiscard]] GenerationTimings generation_timings() const noexcept;
     void reset_memory_peaks() noexcept;
 
 private:

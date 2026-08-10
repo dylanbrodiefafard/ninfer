@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -23,6 +24,26 @@
 
 namespace ninfer::product::media_acquire {
 namespace {
+
+using Clock = std::chrono::steady_clock;
+
+void check_control(const Policy& policy) {
+    if (policy.is_cancelled && policy.is_cancelled()) {
+        throw Error(ErrorKind::Cancelled, "media acquisition was cancelled");
+    }
+    if (policy.deadline != Clock::time_point{} && Clock::now() >= policy.deadline) {
+        throw Error(ErrorKind::DeadlineExceeded, "media acquisition exceeded request deadline");
+    }
+}
+
+long bounded_timeout_ms(const Policy& policy, int configured) {
+    if (policy.deadline == Clock::time_point{}) { return configured; }
+    check_control(policy);
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(policy.deadline - Clock::now())
+            .count();
+    return std::min<long>(configured, std::max<std::int64_t>(1, remaining));
+}
 
 std::vector<std::uint8_t> decode_base64(std::string_view text) {
     static constexpr std::array<std::int8_t, 256> table = [] {
@@ -158,6 +179,16 @@ struct CurlBuffer {
     std::size_t limit = 0;
 };
 
+int curl_progress(void* opaque, curl_off_t, curl_off_t, curl_off_t, curl_off_t) noexcept {
+    const auto& policy = *static_cast<const Policy*>(opaque);
+    try {
+        return (policy.is_cancelled && policy.is_cancelled()) ||
+                       (policy.deadline != Clock::time_point{} && Clock::now() >= policy.deadline)
+                   ? 1
+                   : 0;
+    } catch (...) { return 1; }
+}
+
 std::size_t curl_write(char* data, std::size_t size, std::size_t count, void* opaque) {
     auto& out = *static_cast<CurlBuffer*>(opaque);
     if (size != 0 && count > std::numeric_limits<std::size_t>::max() / size) { return 0; }
@@ -178,9 +209,11 @@ std::vector<std::uint8_t> fetch_url(std::string url, const Policy& policy) {
     });
 
     for (int redirect = 0; redirect <= policy.max_redirects; ++redirect) {
+        check_control(policy);
         const UrlParts parts = parse_url(url);
         const std::string ip = resolve_public(parts, policy.allow_private_network);
-        std::string resolve  = parts.host + ":" + parts.port + ":";
+        check_control(policy);
+        std::string resolve = parts.host + ":" + parts.port + ":";
         resolve += ip.find(':') == std::string::npos ? ip : "[" + ip + "]";
         curl_slist* resolve_list = curl_slist_append(nullptr, resolve.c_str());
         if (resolve_list == nullptr) { throw std::bad_alloc(); }
@@ -194,8 +227,10 @@ std::vector<std::uint8_t> fetch_url(std::string url, const Policy& policy) {
         curl_easy_setopt(curl.get(), CURLOPT_PROTOCOLS_STR, "http,https");
         curl_easy_setopt(curl.get(), CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
         curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 0L);
-        curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, policy.connect_timeout_ms);
-        curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, policy.timeout_ms);
+        curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS,
+                         bounded_timeout_ms(policy, policy.connect_timeout_ms));
+        curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS,
+                         bounded_timeout_ms(policy, policy.timeout_ms));
         curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
         curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYPEER, 1L);
         curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYHOST, 2L);
@@ -205,9 +240,13 @@ std::vector<std::uint8_t> fetch_url(std::string url, const Policy& policy) {
                          static_cast<curl_off_t>(policy.max_bytes));
         curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, curl_write);
         curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &buffer);
+        curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION, curl_progress);
+        curl_easy_setopt(curl.get(), CURLOPT_XFERINFODATA, &policy);
         curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "ninfer/vision");
         const CURLcode code = curl_easy_perform(curl.get());
         if (code != CURLE_OK) {
+            check_control(policy);
             if (code == CURLE_OPERATION_TIMEDOUT) {
                 throw Error(ErrorKind::RemoteTimeout,
                             "media URL fetch timed out: " + std::string(curl_easy_strerror(code)));
@@ -220,7 +259,10 @@ std::vector<std::uint8_t> fetch_url(std::string url, const Policy& policy) {
         }
         long status = 0;
         curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &status);
-        if (status >= 200 && status < 300) { return buffer.bytes; }
+        if (status >= 200 && status < 300) {
+            check_control(policy);
+            return buffer.bytes;
+        }
         if (status < 300 || status >= 400 || redirect == policy.max_redirects) {
             throw Error(ErrorKind::RemoteUnavailable,
                         "media URL returned HTTP " + std::to_string(status));
@@ -236,6 +278,7 @@ std::vector<std::uint8_t> fetch_url(std::string url, const Policy& policy) {
 }
 
 std::vector<std::uint8_t> read_path(const Source& source, const Policy& policy) {
+    check_control(policy);
     std::error_code ec;
     std::filesystem::path path = std::filesystem::weakly_canonical(source.value, ec);
     if (ec || !std::filesystem::is_regular_file(path, ec)) {
@@ -249,6 +292,7 @@ std::vector<std::uint8_t> read_path(const Source& source, const Policy& policy) 
         }
     }
     const std::uintmax_t size = std::filesystem::file_size(path, ec);
+    check_control(policy);
     if (ec) { throw std::invalid_argument("failed to inspect media file: " + source.value); }
     if (size > policy.max_bytes) {
         throw Error(ErrorKind::BudgetExceeded, "media file exceeds byte limit");
@@ -268,6 +312,7 @@ std::vector<std::uint8_t> read_path(const Source& source, const Policy& policy) 
                     static_cast<std::streamsize>(bytes.size()));
         if (!stream) { throw std::invalid_argument("failed to read media path: " + path.string()); }
     }
+    check_control(policy);
     return bytes;
 }
 
@@ -275,12 +320,15 @@ std::vector<std::uint8_t> read_path(const Source& source, const Policy& policy) 
 
 std::vector<std::uint8_t> acquire_bytes(const Source& source, const Policy& policy) {
     if (policy.max_bytes == 0) { throw std::invalid_argument("media byte limit must be positive"); }
+    check_control(policy);
     if (source.kind == SourceKind::Bytes) {
         if (source.bytes.empty()) { throw std::invalid_argument("media source is empty"); }
         if (source.bytes.size() > policy.max_bytes) {
             throw Error(ErrorKind::BudgetExceeded, "media bytes exceed byte limit");
         }
-        return source.bytes;
+        std::vector<std::uint8_t> bytes = source.bytes;
+        check_control(policy);
+        return bytes;
     }
     if (source.value.empty()) { throw std::invalid_argument("media source is empty"); }
 
@@ -301,6 +349,7 @@ std::vector<std::uint8_t> acquire_bytes(const Source& source, const Policy& poli
         }
         std::vector<std::uint8_t> bytes =
             decode_base64(std::string_view(source.value).substr(comma + 1));
+        check_control(policy);
         if (bytes.size() > policy.max_bytes) {
             throw Error(ErrorKind::BudgetExceeded, "media data exceeds byte limit");
         }

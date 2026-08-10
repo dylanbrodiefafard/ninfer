@@ -660,6 +660,29 @@ double PreparedPrompt::prepare_seconds() const noexcept {
 
 PreparedPrompt::operator bool() const noexcept { return data_ != nullptr; }
 
+PublishedOutput::PublishedOutput(PublishedOutput&& other) noexcept
+    : values_(std::move(other.values_)), size_(std::exchange(other.size_, 0)) {}
+
+PublishedOutput& PublishedOutput::operator=(PublishedOutput&& other) noexcept {
+    if (this != &other) {
+        values_ = std::move(other.values_);
+        size_   = std::exchange(other.size_, 0);
+    }
+    return *this;
+}
+
+void PublishedOutput::clear() noexcept {
+    for (std::size_t index = 0; index < size_; ++index) { values_[index] = {}; }
+    size_ = 0;
+}
+
+void PublishedOutput::push_back(OutputDelta value) {
+    if (size_ == values_.size()) {
+        throw std::logic_error("output decoder produced more than two channel transitions");
+    }
+    values_[size_++] = std::move(value);
+}
+
 OutputSession::OutputSession() noexcept                           = default;
 OutputSession::~OutputSession()                                   = default;
 OutputSession::OutputSession(OutputSession&&) noexcept            = default;
@@ -759,8 +782,8 @@ PublishedOutput OutputSession::commit_preview() noexcept {
     if (impl_ == nullptr || !impl_->preview_ready) { std::terminate(); }
     using std::swap;
     swap(impl_->state, impl_->preview_state);
-    PublishedOutput output;
-    output.swap(impl_->preview_output);
+    PublishedOutput output = std::move(impl_->preview_output);
+    impl_->preview_output.clear();
     impl_->preview_ready = false;
     return output;
 }

@@ -63,7 +63,10 @@ struct MediaInputPermit {
 
 namespace {
 
-using Clock = std::chrono::steady_clock;
+using Clock                              = std::chrono::steady_clock;
+constexpr std::size_t kMaximumMediaItems = 16;
+
+[[noreturn]] void throw_preparation_cancelled();
 
 [[noreturn]] void throw_media_error(const ninfer::product::media_acquire::Error& exception) {
     ApiError error;
@@ -76,12 +79,21 @@ using Clock = std::chrono::steady_clock;
         break;
     case ninfer::product::media_acquire::ErrorKind::RemoteUnavailable:
         error.status = 502;
+        error.type   = "server_error";
         error.code   = "media_fetch_failed";
         break;
     case ninfer::product::media_acquire::ErrorKind::RemoteTimeout:
         error.status = 504;
+        error.type   = "server_error";
         error.code   = "media_fetch_timeout";
         break;
+    case ninfer::product::media_acquire::ErrorKind::DeadlineExceeded:
+        error.status = 503;
+        error.type   = "server_error";
+        error.code   = "request_queue_timeout";
+        break;
+    case ninfer::product::media_acquire::ErrorKind::Cancelled:
+        throw_preparation_cancelled();
     }
     throw ApiException(std::move(error));
 }
@@ -105,17 +117,28 @@ using Clock = std::chrono::steady_clock;
     throw ApiException(std::move(error));
 }
 
-bool has_media(const GenerationRequest& request) {
+std::size_t media_item_count(const GenerationRequest& request) {
+    std::size_t count = 0;
     for (const ChatTurn& message : request.messages) {
         for (const ContentPart& part : message.content) {
-            if (part.kind == ContentKind::Image || part.kind == ContentKind::Video) { return true; }
+            if (part.kind == ContentKind::Image || part.kind == ContentKind::Video) { ++count; }
         }
     }
-    return false;
+    return count;
 }
 
-ninfer::OwnedMedia acquire_media(const ContentPart& part) {
+ninfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point deadline,
+                                 const std::function<bool()>& is_cancelled,
+                                 std::size_t& remaining_bytes) {
+    if (remaining_bytes == 0) {
+        throw_media_error(ninfer::product::media_acquire::Error(
+            ninfer::product::media_acquire::ErrorKind::BudgetExceeded,
+            "request media exceeds aggregate byte limit"));
+    }
     ninfer::product::media_acquire::Policy policy;
+    policy.max_bytes    = std::min(policy.max_bytes, remaining_bytes);
+    policy.deadline     = deadline;
+    policy.is_cancelled = is_cancelled;
     std::vector<std::uint8_t> source_bytes;
     try {
         source_bytes = ninfer::product::media_acquire::acquire_bytes(part.source, policy);
@@ -123,6 +146,7 @@ ninfer::OwnedMedia acquire_media(const ContentPart& part) {
         throw_media_error(exception);
     } catch (const std::invalid_argument& exception) { throw_invalid_input(exception); }
 
+    remaining_bytes -= source_bytes.size();
     ninfer::OwnedMedia media;
     media.kind =
         part.kind == ContentKind::Image ? ninfer::MediaKind::Image : ninfer::MediaKind::Video;
@@ -159,20 +183,32 @@ ninfer::OwnedMedia acquire_media(const ContentPart& part) {
     case ninfer::RequestErrorKind::Overloaded:
         error.param.clear();
         error.status = 429;
+        error.type   = "rate_limit_error";
         error.code   = "server_overloaded";
         break;
     case ninfer::RequestErrorKind::QueueTimeout:
         error.param.clear();
         error.status = 503;
+        error.type   = "server_error";
         error.code   = "request_queue_timeout";
         break;
     case ninfer::RequestErrorKind::Unavailable:
         error.param.clear();
         error.status = 503;
+        error.type   = "server_error";
         error.code   = "service_unavailable";
         break;
     }
     throw ApiException(std::move(error));
+}
+
+void check_preparation_control(Clock::time_point deadline,
+                               const std::function<bool()>& is_cancelled) {
+    if (is_cancelled && is_cancelled()) { throw_preparation_cancelled(); }
+    if (Clock::now() >= deadline) {
+        throw_request_error(ninfer::RequestError(RequestErrorKind::QueueTimeout,
+                                                 "inference request expired during preparation"));
+    }
 }
 
 class ServiceOutputSink final : public ninfer::OutputSink {
@@ -283,11 +319,16 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
     prepared.include_usage                 = request.include_usage;
     prepared.tool_capable                  = request.uses_tools() || request.has_tool_history();
     prepared.tool_name_max_length          = request.tool_name_max_length;
-    prepared.enable_thinking     = request.enable_thinking.value_or(options_.enable_thinking);
-    const bool request_has_media = has_media(request);
+    prepared.enable_thinking      = request.enable_thinking.value_or(options_.enable_thinking);
+    const std::size_t media_items = media_item_count(request);
+    const bool request_has_media  = media_items != 0;
     if (request_has_media && !options_.enable_vision) {
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");
+    }
+    if (media_items > kMaximumMediaItems) {
+        throw_request_error(ninfer::RequestError(RequestErrorKind::MediaBudgetExceeded,
+                                                 "request exceeds the 16-item media limit"));
     }
     prepared.lifetime = acquire_request_lifetime();
     HostInputLease host_input;
@@ -296,11 +337,15 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
     }
 
     try {
-        ninfer::PromptInput input = to_prompt_input(
-            request, options_, [](const ContentPart& part) { return acquire_media(part); });
-        if (is_cancelled && is_cancelled()) { throw_preparation_cancelled(); }
+        std::size_t remaining_media_bytes = options_.max_request_bytes;
+        ninfer::PromptInput input =
+            to_prompt_input(request, options_, [&](const ContentPart& part) {
+                return acquire_media(part, prepared.lifetime->deadline, is_cancelled,
+                                     remaining_media_bytes);
+            });
+        check_preparation_control(prepared.lifetime->deadline, is_cancelled);
         ninfer::PreparedPrompt prompt = engine_->prepare(std::move(input));
-        if (is_cancelled && is_cancelled()) { throw_preparation_cancelled(); }
+        check_preparation_control(prepared.lifetime->deadline, is_cancelled);
         prepared.prompt_tokens = static_cast<int>(prompt.summary().prompt_tokens);
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
@@ -314,22 +359,29 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
 
 int GenerationService::count_prompt_tokens(const GenerationRequest& request,
                                            std::function<bool()> is_cancelled) const {
-    const bool request_has_media = has_media(request);
+    const std::size_t media_items = media_item_count(request);
+    const bool request_has_media  = media_items != 0;
     if (request_has_media && !options_.enable_vision) {
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");
     }
-    HostInputLease host_input;
-    if (request_has_media) {
-        host_input = acquire_media_input(
-            Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms), is_cancelled);
+    if (media_items > kMaximumMediaItems) {
+        throw_request_error(ninfer::RequestError(RequestErrorKind::MediaBudgetExceeded,
+                                                 "request exceeds the 16-item media limit"));
     }
+    const Clock::time_point deadline =
+        Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms);
+    HostInputLease host_input;
+    if (request_has_media) { host_input = acquire_media_input(deadline, is_cancelled); }
     try {
-        ninfer::PromptInput input = to_prompt_input(
-            request, options_, [](const ContentPart& part) { return acquire_media(part); });
-        if (is_cancelled && is_cancelled()) { throw_preparation_cancelled(); }
+        std::size_t remaining_media_bytes = options_.max_request_bytes;
+        ninfer::PromptInput input =
+            to_prompt_input(request, options_, [&](const ContentPart& part) {
+                return acquire_media(part, deadline, is_cancelled, remaining_media_bytes);
+            });
+        check_preparation_control(deadline, is_cancelled);
         const int prompt_tokens = static_cast<int>(engine_->count_tokens(std::move(input)));
-        if (is_cancelled && is_cancelled()) { throw_preparation_cancelled(); }
+        check_preparation_control(deadline, is_cancelled);
         return prompt_tokens;
     } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
         throw_request_error(exception);

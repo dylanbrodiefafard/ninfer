@@ -123,8 +123,13 @@ struct DFlashFeatureSink {
     static constexpr bool enabled = true;
     using PrefillConsumer         = std::function<void(const Tensor&, const Tensor&, bool)>;
 
-    Tensor* features  = nullptr;
-    Tensor* positions = nullptr;
+    Tensor* features                  = nullptr;
+    Tensor* positions                 = nullptr;
+    Tensor* batch_features            = nullptr;
+    const Tensor* batch_lanes         = nullptr;
+    const Tensor* batch_valid_columns = nullptr;
+    std::int32_t batch_width          = 0;
+    std::int32_t batch_size           = 0;
     std::span<const int> layers;
     PrefillConsumer consume_prefill;
     std::uint32_t captured_mask = 0;
@@ -144,7 +149,9 @@ public:
                 qwen3_6::PagedKVCacheView kv, LinearAttentionStatePool& state,
                 qwen3_6::RoundState& io, Tensor& prefill_hidden, std::uint32_t prefill_chunk,
                 std::uint32_t text_kv_base,
-                qwen3_6::PagedKVCacheView mtp_kv = qwen3_6::PagedKVCacheView());
+                qwen3_6::PagedKVCacheView mtp_kv           = qwen3_6::PagedKVCacheView(),
+                const qwen3_6::PagedKVCache* batch_text_kv = nullptr,
+                const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr);
     ~TextContext();
 
     TextContext(const TextContext&)            = delete;
@@ -176,28 +183,17 @@ public:
 
     [[nodiscard]] int proposal_head_n() const noexcept { return proposal_head_n_; }
 
-    [[nodiscard]] bool mtp_prompt_prepared() const noexcept { return mtp_prompt_prepared_; }
-
-    [[nodiscard]] std::uint32_t last_prefill_chunk_length() const noexcept {
-        return last_prefill_chunk_length_;
-    }
-
-    void prefill(std::span<const int> ids);
-    void prefill(std::span<const int> ids, DFlashFeatureSink& sink);
-    void prefill(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
-                 VisionPrefillSession& vision);
-    [[nodiscard]] PrefillChunkResult prefill_chunk(std::span<const int> ids, bool finalize_at_end);
     [[nodiscard]] PrefillChunkResult prefill_chunk(std::span<const int> full_ids,
                                                    std::uint32_t begin,
                                                    std::uint32_t nominal_length,
                                                    bool finalize_at_end);
+    [[nodiscard]] PrefillChunkResult prefill_chunk(std::span<const int> full_ids,
+                                                   std::uint32_t begin,
+                                                   std::uint32_t nominal_length,
+                                                   bool finalize_at_end, DFlashFeatureSink& sink);
     [[nodiscard]] PrefillChunkResult
     prefill_chunk(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
                   std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);
-    void target_verify(const Tensor& ids, const Tensor& positions,
-                       ops::GqaExecutionEnvelope envelope);
-    void target_verify(const Tensor& ids, const Tensor& positions,
-                       ops::GqaExecutionEnvelope envelope, DFlashFeatureSink& sink);
     void ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
                                const Tensor& rope_positions, const Tensor& kv_table_rows,
                                const Tensor& linear_state_read_slots,
@@ -209,6 +205,12 @@ public:
                              const Tensor& linear_state_snapshot_base_slots,
                              ops::GqaExecutionEnvelope envelope, Tensor& hidden, Tensor& logits,
                              Tensor& target_tokens);
+    void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
+                             const Tensor& rope_positions, const Tensor& valid_columns,
+                             const Tensor& kv_table_rows, const Tensor& linear_state_read_slots,
+                             const Tensor& linear_state_snapshot_base_slots,
+                             ops::GqaExecutionEnvelope envelope, Tensor& hidden, Tensor& logits,
+                             Tensor& target_tokens, DFlashFeatureSink& sink);
     void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
                                   const Tensor& cache_positions, const Tensor& rope_positions,
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
@@ -225,7 +227,9 @@ public:
 private:
     void bind();
 
-    [[nodiscard]] bool mtp_enabled() const noexcept { return mtp_kv_.valid(); }
+    [[nodiscard]] bool mtp_enabled() const noexcept {
+        return mtp_kv_.valid() || batch_mtp_kv_ != nullptr;
+    }
 
     [[nodiscard]] const MtpW& mtp_weights() const;
     void attn_mix(const FullLayerW& weights, Tensor& x, int index, Phase phase);
@@ -234,6 +238,14 @@ private:
     void run_layers(Tensor& x, Phase phase);
     template <class Tap>
     void run_layers(Tensor& x, Phase phase, Tap& tap);
+    template <class Tap>
+    void target_verify_batch_impl(const Tensor& ids, const Tensor& cache_positions,
+                                  const Tensor& rope_positions, const Tensor& valid_columns,
+                                  const Tensor& kv_table_rows,
+                                  const Tensor& linear_state_read_slots,
+                                  const Tensor& linear_state_snapshot_base_slots,
+                                  ops::GqaExecutionEnvelope envelope, Tensor& hidden,
+                                  Tensor& logits, Tensor& target_tokens, Tap& tap);
 
     void mtp_forward_stem(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
                           Tensor& x, Tensor& ah);
@@ -263,19 +275,16 @@ private:
     };
 
     template <class Tap>
-    [[nodiscard]] PrefillChunkResult prefill_impl(std::span<const int> ids,
-                                                  const TextPrefill* text_prefill,
-                                                  const MultimodalPrefill* multimodal, Tap& tap,
-                                                  bool single_chunk, bool finalize_at_end);
-    template <class Tap>
-    void target_verify_impl(const Tensor& ids, const Tensor& positions,
-                            ops::GqaExecutionEnvelope envelope, Tap& tap);
-
+    [[nodiscard]] PrefillChunkResult
+    prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,
+                 const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end);
     DeviceContext& ctx_;
     const LoadedModelData& weights_;
     WorkspaceArena& work_;
     qwen3_6::PagedKVCacheView kv_;
     qwen3_6::PagedKVCacheView mtp_kv_;
+    const qwen3_6::PagedKVCache* batch_text_kv_ = nullptr;
+    const qwen3_6::PagedKVCache* batch_mtp_kv_  = nullptr;
     LinearAttentionStatePool& state_;
     qwen3_6::RoundState& io_;
     Tensor& prefill_hidden_;
@@ -297,8 +306,6 @@ private:
     std::int32_t linear_state_boundary_slot_               = 0;
     std::int64_t prefill_snapshot_boundary_                = -1;
     Tensor* boundary_hidden_output_                        = nullptr;
-    bool mtp_prompt_prepared_                              = false;
-    std::uint32_t last_prefill_chunk_length_               = 0;
     std::uint32_t mtp_proposal_extent_                     = 0;
 
     const Weight* embed_                        = nullptr;

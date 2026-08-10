@@ -7,9 +7,9 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 DFlashPersistentState::DFlashPersistentState(DeviceSpan backing,
                                              const DFlashPersistentLayout& layout)
     : local(backing, layout.local), boundary_local(backing, layout.boundary_local),
-      full(backing, layout.full), commit_count(layout.commit_count.bind(backing)),
-      target_features(layout.target_features.bind(backing)),
-      feature_positions(layout.feature_positions.bind(backing)) {
+      full(backing, layout.full), prefill_features(layout.prefill_features.bind(backing)),
+      prefill_positions(layout.prefill_positions.bind(backing)),
+      pending_features(layout.pending_features.bind(backing)) {
     if (local.layer_count() != DFlashConfig::local_layers ||
         boundary_local.layer_count() != DFlashConfig::local_layers ||
         local.capacity() != DFlashConfig::local_capacity ||
@@ -19,6 +19,8 @@ DFlashPersistentState::DFlashPersistentState(DeviceSpan backing,
         boundary_local.num_kv_heads() != DFlashConfig::kv_heads ||
         local.head_dim() != DFlashConfig::head_dim ||
         boundary_local.head_dim() != DFlashConfig::head_dim ||
+        local.lane_capacity() != boundary_local.lane_capacity() ||
+        local.lane_capacity() != full.pool().table_row_count() ||
         full.pool().plane(0).dtype != DType::BF16 ||
         full.pool().plane(0).ne[0] != DFlashConfig::head_dim ||
         full.pool().plane(0).ne[1] != kPagedKVPageSize ||
@@ -31,17 +33,16 @@ CyclicKVCacheLayerView DFlashPersistentState::local_layer(std::uint32_t layer) c
     return local.layer_view(layer);
 }
 
-qwen3_6::PagedKVCacheView
-DFlashPersistentState::full_view(const PagedKVAllocation& allocation) const {
-    return full.execution_view(allocation);
+PagedKVBatchLayerView DFlashPersistentState::full_batch_layer(std::uint32_t layer) const {
+    return full.batch_layer_view(layer);
 }
 
-void DFlashPersistentState::save_boundary(cudaStream_t stream) {
-    boundary_local.copy_from(local, stream);
+void DFlashPersistentState::save_boundary(std::int32_t lane, cudaStream_t stream) {
+    boundary_local.copy_lane_from(local, lane, stream);
 }
 
-void DFlashPersistentState::restore_boundary(cudaStream_t stream) {
-    local.copy_from(boundary_local, stream);
+void DFlashPersistentState::restore_boundary(std::int32_t lane, cudaStream_t stream) {
+    local.copy_lane_from(boundary_local, lane, stream);
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

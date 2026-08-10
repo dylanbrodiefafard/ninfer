@@ -31,6 +31,22 @@ void speculative_prepare_verify_inputs_launch(const Tensor& anchors, const Tenso
     CUDA_CHECK(cudaGetLastError());
 }
 
+void speculative_prepare_verify_ids_launch(const Tensor& anchors, const Tensor& drafts,
+                                           const Tensor& current_extents, Tensor& verify_ids,
+                                           cudaStream_t stream) {
+    constexpr int kBlock = 32;
+    const int k          = drafts.ne[0];
+    const int batch      = drafts.ne[1];
+    const dim3 grid(static_cast<unsigned int>(div_up(k + 1, kBlock)),
+                    static_cast<unsigned int>(batch));
+    speculative_prepare_verify_inputs_kernel<<<grid, kBlock, 0, stream>>>(
+        static_cast<const std::int32_t*>(anchors.data),
+        static_cast<const std::int32_t*>(drafts.data), nullptr,
+        static_cast<const std::int32_t*>(current_extents.data),
+        static_cast<std::int32_t*>(verify_ids.data), nullptr, k);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
                                              const Tensor& drafts, const Tensor& current_extents,
                                              Tensor& lengths, Tensor& anchors,

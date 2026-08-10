@@ -3,7 +3,9 @@
 #include "product/media_acquire/source.h"
 
 #include <cstddef>
+#include <chrono>
 #include <filesystem>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -15,6 +17,8 @@ enum class ErrorKind {
     BudgetExceeded,
     RemoteUnavailable,
     RemoteTimeout,
+    DeadlineExceeded,
+    Cancelled,
 };
 
 class Error final : public std::runtime_error {
@@ -36,6 +40,8 @@ struct Policy {
     bool allow_remote          = true;
     bool allow_private_network = false;
     std::filesystem::path media_root;
+    std::chrono::steady_clock::time_point deadline;
+    std::function<bool()> is_cancelled;
 };
 
 std::vector<std::uint8_t> acquire_bytes(const Source& source, const Policy& policy = {});

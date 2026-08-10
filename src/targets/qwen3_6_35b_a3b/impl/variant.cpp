@@ -34,11 +34,9 @@ graph_profiles_through(std::uint32_t max_frontier,
 
 std::vector<GraphExecutionProfile> dflash_base_profiles(std::uint32_t capacity,
                                                         std::uint32_t draft_window) {
-    if (draft_window == 0 || static_cast<std::uint64_t>(draft_window) + 1ULL > capacity) {
-        return {};
-    }
+    if (draft_window == 0 || capacity == 0) { return {}; }
     const std::uint32_t block        = draft_window + 1;
-    const std::uint32_t max_frontier = capacity - block;
+    const std::uint32_t max_frontier = capacity - 1;
     std::vector<std::uint32_t> ends{
         96U, 127U, 511U, 1023U, 2047U, 4095U, 8191U, 16383U, 32767U, 65536U, 131072U, 196608U,
     };
@@ -56,11 +54,13 @@ std::vector<GraphExecutionProfile> dflash_base_profiles(std::uint32_t capacity,
     return graph_profiles_through(max_frontier, ends);
 }
 
-bool dflash_target_uses_chunked_small_t(std::uint32_t draft_window, std::uint32_t max_frontier) {
+bool dflash_target_uses_chunked_small_t(std::uint32_t draft_window, std::uint32_t batch_size,
+                                        std::uint32_t max_visible_keys) {
     const std::uint32_t tokens = draft_window + 1;
     if (tokens <= 6) { return false; }
+    if (batch_size > 1) { return true; }
     const std::uint32_t prompt_visible_limit = tokens <= 12 ? 512U : 1024U;
-    return max_frontier + tokens > prompt_visible_limit;
+    return max_visible_keys > prompt_visible_limit;
 }
 
 void run_sparse_moe(const Tensor& hidden, const ops::SparseMoeWeights& weights, Tensor& residual,
@@ -100,23 +100,17 @@ std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t cap
     return graph_profiles_through(capacity - 1, ends);
 }
 
-std::vector<GraphExecutionProfile>
-Variant::dflash_initial_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window) {
+std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t capacity,
+                                                                  std::uint32_t draft_window,
+                                                                  std::uint32_t batch_size) {
     std::vector<GraphExecutionProfile> profiles = dflash_base_profiles(capacity, draft_window);
     for (GraphExecutionProfile& profile : profiles) {
-        profile.topology_class =
-            dflash_target_uses_chunked_small_t(draft_window, profile.max) ? 1U : 0U;
-    }
-    return profiles;
-}
-
-std::vector<GraphExecutionProfile>
-Variant::dflash_steady_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window) {
-    std::vector<GraphExecutionProfile> profiles = dflash_base_profiles(capacity, draft_window);
-    for (GraphExecutionProfile& profile : profiles) {
-        const bool split_swa      = profile.max > 96U;
-        const bool chunked_target = dflash_target_uses_chunked_small_t(draft_window, profile.max);
-        profile.topology_class    = (chunked_target ? 2U : 0U) | (split_swa ? 1U : 0U);
+        const std::uint32_t target_max = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+            capacity, static_cast<std::uint64_t>(profile.max) + draft_window + 1ULL));
+        const bool split_swa           = profile.max > 96U;
+        const bool chunked_target =
+            dflash_target_uses_chunked_small_t(draft_window, batch_size, target_max);
+        profile.topology_class = (chunked_target ? 2U : 0U) | (split_swa ? 1U : 0U);
     }
     return profiles;
 }

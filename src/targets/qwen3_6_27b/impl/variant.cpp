@@ -86,13 +86,8 @@ std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t cap
     return graph_profiles_through(capacity - 1, ends);
 }
 
-std::vector<GraphExecutionProfile> Variant::dflash_initial_graph_profiles(std::uint32_t,
-                                                                          std::uint32_t) {
-    return {};
-}
-
-std::vector<GraphExecutionProfile> Variant::dflash_steady_graph_profiles(std::uint32_t,
-                                                                         std::uint32_t) {
+std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t, std::uint32_t,
+                                                                  std::uint32_t) {
     return {};
 }
 

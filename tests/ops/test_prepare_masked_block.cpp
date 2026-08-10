@@ -36,6 +36,7 @@ int run_case(int block_size, std::int32_t anchor_value, std::int32_t length_valu
     const auto expected = masked_block_oracle(anchor_value, length_value, block_size);
     DeviceBuffer anchor = to_device<std::int32_t>({anchor_value});
     DeviceBuffer length = to_device<std::int32_t>({length_value});
+    DeviceBuffer valid  = to_device<std::int32_t>({block_size});
     GuardedDeviceBuffer ids(static_cast<std::size_t>(block_size) * sizeof(std::int32_t));
     GuardedDeviceBuffer positions(static_cast<std::size_t>(block_size) * sizeof(std::int32_t));
     ids.fill(0xcd);
@@ -43,13 +44,14 @@ int run_case(int block_size, std::int32_t anchor_value, std::int32_t length_valu
 
     Tensor anchor_tensor(anchor.p, DType::I32, {1});
     Tensor length_tensor(length.p, DType::I32, {1});
-    Tensor ids_tensor(ids.data(), DType::I32, {block_size});
-    Tensor positions_tensor(positions.data(), DType::I32, {block_size});
-    ops::prepare_masked_block(anchor_tensor, length_tensor, kMaskId, ids_tensor, positions_tensor,
-                              nullptr);
+    Tensor valid_tensor(valid.p, DType::I32, {1});
+    Tensor ids_tensor(ids.data(), DType::I32, {block_size, 1});
+    Tensor positions_tensor(positions.data(), DType::I32, {block_size, 1});
+    ops::prepare_masked_block(anchor_tensor, length_tensor, valid_tensor, kMaskId, ids_tensor,
+                              positions_tensor, nullptr);
     cuda_synchronize();
 
-    const std::string label = "prepare_masked_block B=" + std::to_string(block_size);
+    const std::string label = "prepare_masked_block W=" + std::to_string(block_size);
     int failures            = verify_exact(
         (label + " ids").c_str(),
         from_device<std::int32_t>(ids.data(), static_cast<std::size_t>(block_size)), expected.ids);
@@ -63,6 +65,49 @@ int run_case(int block_size, std::int32_t anchor_value, std::int32_t length_valu
                              from_device<std::int32_t>(length, 1), {length_value});
     failures += ids.verify_guards((label + " ids guards").c_str());
     failures += positions.verify_guards((label + " positions guards").c_str());
+    return failures;
+}
+
+int run_batch_case() {
+    constexpr std::int32_t width = 4;
+    constexpr std::int32_t batch = 2;
+    const std::vector<std::int32_t> anchors{9173, 100007};
+    const std::vector<std::int32_t> lengths{37, 900};
+    const std::vector<std::int32_t> valid{4, 2};
+    const std::vector<std::int32_t> expected_ids{
+        anchors[0], kMaskId, kMaskId, kMaskId, anchors[1], kMaskId, kMaskId, kMaskId,
+    };
+    const std::vector<std::int32_t> expected_positions{
+        37, 38, 39, 40, 900, 901, 901, 901,
+    };
+
+    DeviceBuffer device_anchors = to_device(anchors);
+    DeviceBuffer device_lengths = to_device(lengths);
+    DeviceBuffer device_valid   = to_device(valid);
+    GuardedDeviceBuffer ids(static_cast<std::size_t>(width * batch) * sizeof(std::int32_t));
+    GuardedDeviceBuffer positions(static_cast<std::size_t>(width * batch) * sizeof(std::int32_t));
+    ids.fill(0xcd);
+    positions.fill(0xef);
+
+    Tensor anchors_tensor(device_anchors.p, DType::I32, {batch});
+    Tensor lengths_tensor(device_lengths.p, DType::I32, {batch});
+    Tensor valid_tensor(device_valid.p, DType::I32, {batch});
+    Tensor ids_tensor(ids.data(), DType::I32, {width, batch});
+    Tensor positions_tensor(positions.data(), DType::I32, {width, batch});
+    ops::prepare_masked_block(anchors_tensor, lengths_tensor, valid_tensor, kMaskId, ids_tensor,
+                              positions_tensor, nullptr);
+    cuda_synchronize();
+
+    int failures =
+        verify_exact("prepare_masked_block B=2 ids",
+                     from_device<std::int32_t>(ids.data(), static_cast<std::size_t>(width * batch)),
+                     expected_ids);
+    failures += verify_exact(
+        "prepare_masked_block B=2 positions",
+        from_device<std::int32_t>(positions.data(), static_cast<std::size_t>(width * batch)),
+        expected_positions);
+    failures += ids.verify_guards("prepare_masked_block B=2 ids guards");
+    failures += positions.verify_guards("prepare_masked_block B=2 positions guards");
     return failures;
 }
 
@@ -80,6 +125,7 @@ int main() {
         failures += run_case(block_size, 100000 + block_size,
                              std::numeric_limits<std::int32_t>::max() - (block_size - 1));
     }
+    failures += run_batch_case();
 
     if (failures != 0) {
         std::cerr << "prepare_masked_block failures=" << failures << '\n';

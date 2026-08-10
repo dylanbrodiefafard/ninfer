@@ -159,19 +159,20 @@ Options parse_options(int argc, char** argv) {
 
 CyclicKVCacheLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v) {
     return {
-        .k               = Tensor(k.p, DType::BF16, {kHeadDim, kWindow, kKvHeads}),
-        .v               = Tensor(v.p, DType::BF16, {kHeadDim, kWindow, kKvHeads}),
+        .k               = Tensor(k.p, DType::BF16, {kHeadDim, kWindow, kKvHeads, 1}),
+        .v               = Tensor(v.p, DType::BF16, {kHeadDim, kWindow, kKvHeads, 1}),
         .capacity        = kWindow,
         .padded_capacity = kWindow,
         .num_kv_heads    = kKvHeads,
         .head_dim        = kHeadDim,
+        .lane_capacity   = 1,
     };
 }
 
 std::size_t workspace_capacity(std::int32_t tokens, std::int32_t context) {
     const ops::SwaContextExecutionEnvelope envelope{static_cast<std::uint32_t>(context),
                                                     static_cast<std::uint32_t>(context)};
-    return ops::swa_workspace_capacity_bytes(envelope, tokens, tokens);
+    return ops::swa_workspace_capacity_bytes(envelope, tokens, tokens, 1);
 }
 
 class Case {
@@ -182,6 +183,7 @@ public:
           query_k_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kKvHeads * tokens)),
           query_v_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kKvHeads * tokens)),
           positions_(static_cast<std::size_t>(tokens) * sizeof(std::int32_t)),
+          valid_(sizeof(std::int32_t)), lane_(sizeof(std::int32_t)),
           context_k_(
               bench::make_zeros(static_cast<std::size_t>(kHeadDim) * kWindow * kKvHeads * 2)),
           context_v_(
@@ -189,11 +191,12 @@ public:
           output_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * kQueryHeads * tokens * 2)),
           workspace_bytes_(workspace_capacity(tokens, context)),
           workspace_(std::max<std::size_t>(workspace_bytes_, 1)),
-          q_tensor_(q_.p, DType::BF16, {kHeadDim, kQueryHeads, tokens}),
-          query_k_tensor_(query_k_.p, DType::BF16, {kHeadDim, kKvHeads, tokens}),
-          query_v_tensor_(query_v_.p, DType::BF16, {kHeadDim, kKvHeads, tokens}),
-          positions_tensor_(positions_.p, DType::I32, {tokens}),
-          output_tensor_(output_.p, DType::BF16, {kHeadDim, kQueryHeads, tokens}),
+          q_tensor_(q_.p, DType::BF16, {kHeadDim, kQueryHeads, tokens, 1}),
+          query_k_tensor_(query_k_.p, DType::BF16, {kHeadDim, kKvHeads, tokens, 1}),
+          query_v_tensor_(query_v_.p, DType::BF16, {kHeadDim, kKvHeads, tokens, 1}),
+          positions_tensor_(positions_.p, DType::I32, {tokens, 1}),
+          valid_tensor_(valid_.p, DType::I32, {1}), lane_tensor_(lane_.p, DType::I32, {1}),
+          output_tensor_(output_.p, DType::BF16, {kHeadDim, kQueryHeads, tokens, 1}),
           context_view_(make_context_view(context_k_, context_v_)),
           envelope_{static_cast<std::uint32_t>(context), static_cast<std::uint32_t>(context)} {
         std::vector<std::int32_t> host_positions(static_cast<std::size_t>(tokens));
@@ -202,11 +205,15 @@ public:
         }
         CUDA_CHECK(cudaMemcpy(positions_.p, host_positions.data(), positions_.bytes,
                               cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(valid_.p, &tokens_, sizeof(tokens_), cudaMemcpyHostToDevice));
+        const std::int32_t lane = 0;
+        CUDA_CHECK(cudaMemcpy(lane_.p, &lane, sizeof(lane), cudaMemcpyHostToDevice));
     }
 
     void launch(cudaStream_t stream) {
-        ops::swa(q_tensor_, query_k_tensor_, query_v_tensor_, positions_tensor_, kScale,
-                 context_view_, envelope_, workspace_, output_tensor_, stream);
+        ops::swa(q_tensor_, query_k_tensor_, query_v_tensor_, positions_tensor_, valid_tensor_,
+                 lane_tensor_, kScale, context_view_, envelope_, workspace_, output_tensor_,
+                 stream);
     }
 
     [[nodiscard]] std::size_t workspace_bytes() const noexcept { return workspace_bytes_; }
@@ -218,6 +225,8 @@ private:
     DeviceBuffer query_k_;
     DeviceBuffer query_v_;
     DeviceBuffer positions_;
+    DeviceBuffer valid_;
+    DeviceBuffer lane_;
     DeviceBuffer context_k_;
     DeviceBuffer context_v_;
     DeviceBuffer output_;
@@ -227,6 +236,8 @@ private:
     Tensor query_k_tensor_;
     Tensor query_v_tensor_;
     Tensor positions_tensor_;
+    Tensor valid_tensor_;
+    Tensor lane_tensor_;
     Tensor output_tensor_;
     CyclicKVCacheLayerView context_view_;
     ops::SwaContextExecutionEnvelope envelope_;

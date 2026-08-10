@@ -13,15 +13,16 @@ namespace ninfer::targets::qwen3_6 {
 inline constexpr std::int32_t kKvQuantGroup = 64;
 
 struct DecoderStateSpec {
-    std::uint32_t full_attention_layers = 0;
-    std::uint32_t mtp_layers            = 0;
-    std::uint32_t capacity              = 0;
-    std::int32_t kv_heads               = 0;
-    std::int32_t attention_head_dim     = 0;
-    DType kv_dtype                      = DType::BF16;
-    std::int32_t kv_quant_group         = 0;
-    bool enable_mtp                     = false;
-    std::int32_t kv_table_rows          = 1;
+    std::uint32_t full_attention_layers    = 0;
+    std::uint32_t mtp_layers               = 0;
+    std::uint32_t capacity                 = 0;
+    std::int32_t kv_heads                  = 0;
+    std::int32_t attention_head_dim        = 0;
+    DType kv_dtype                         = DType::BF16;
+    std::int32_t kv_quant_group            = 0;
+    bool enable_mtp                        = false;
+    std::int32_t kv_table_rows             = 1;
+    std::uint32_t mtp_physical_page_groups = 0;
     LinearAttentionStatePoolSpec linear_attention;
 };
 
@@ -47,7 +48,6 @@ public:
 
     [[nodiscard]] std::uint32_t max_context() const noexcept;
     [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer) const;
-    [[nodiscard]] PagedKVBatchLayerView batch_layer_view(std::uint32_t layer) const;
 
 private:
     friend class PagedKVCache;
@@ -76,10 +76,11 @@ public:
 
     [[nodiscard]] PagedKVCacheView execution_view(const PagedKVAllocation& allocation) const;
 
+    [[nodiscard]] PagedKVBatchLayerView batch_layer_view(std::uint32_t layer) const;
+
 private:
     friend class PagedKVCacheView;
     [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, Tensor block_table) const;
-    [[nodiscard]] PagedKVBatchLayerView batch_layer_view(std::uint32_t layer) const;
 
     PagedKVPool pool_;
     std::uint32_t layers_      = 0;

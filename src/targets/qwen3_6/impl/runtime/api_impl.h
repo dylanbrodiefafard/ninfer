@@ -50,6 +50,18 @@ std::size_t SequencePlan<Variant>::request_transient_capacity_bytes() const noex
 }
 
 template <>
+RequestBasePlan<Variant>::RequestBasePlan(
+    std::unique_ptr<detail::RequestBasePlanImpl<Variant>> impl) noexcept
+    : impl_(std::move(impl)) {}
+
+template <>
+RequestBasePlan<Variant>::RequestBasePlan(RequestBasePlan&&) noexcept = default;
+template <>
+RequestBasePlan<Variant>& RequestBasePlan<Variant>::operator=(RequestBasePlan&&) noexcept = default;
+template <>
+RequestBasePlan<Variant>::~RequestBasePlan() = default;
+
+template <>
 RequestPlan<Variant>::RequestPlan(std::unique_ptr<detail::RequestPlanImpl<Variant>> impl) noexcept
     : impl_(std::move(impl)) {}
 
@@ -74,27 +86,16 @@ template <>
 Program<Variant>::~Program() noexcept = default;
 
 template <>
-RequestPlan<Variant> Program<Variant>::plan_request(const PreparedPrompt& prompt,
-                                                    const ExecutionOptions& options) const {
-    return impl_->plan_request(PreparedPromptAccess::view(prompt), options);
-}
-
-template <>
-runtime::BeginResult Program<Variant>::begin(PreparedPrompt&& prompt, RequestPlan<Variant>&& plan,
-                                             runtime::TransientRegion transient) {
-    return impl_->begin(PreparedPromptAccess::take(std::move(prompt)), std::move(plan), transient);
-}
-
-template <>
-runtime::GeneratedRound Program<Variant>::decode_round(runtime::RoundBudget budget) {
-    return impl_->decode_round(budget);
+RequestBasePlan<Variant> Program<Variant>::plan_request_base(const PreparedPrompt& prompt,
+                                                             const ExecutionOptions& options) {
+    return impl_->plan_request_base(PreparedPromptAccess::view(prompt), options);
 }
 
 template <>
 RequestPlan<Variant> Program<Variant>::plan_request_for_lane(std::uint32_t lane,
                                                              const PreparedPrompt& prompt,
-                                                             const ExecutionOptions& options) {
-    return impl_->plan_request_for_lane(lane, PreparedPromptAccess::view(prompt), options);
+                                                             const RequestBasePlan<Variant>& base) {
+    return impl_->plan_request_for_lane(lane, PreparedPromptAccess::view(prompt), base);
 }
 
 template <>
@@ -170,38 +171,8 @@ SpeculativeStats Program<Variant>::speculative_stats_lane(std::uint32_t lane) co
 }
 
 template <>
-void Program<Variant>::resolve_pending(std::uint32_t accepted_tokens, bool terminal) {
-    impl_->resolve_pending(accepted_tokens, terminal);
-}
-
-template <>
-void Program<Variant>::finish_active() {
-    impl_->finish_active();
-}
-
-template <>
-void Program<Variant>::abort_request() noexcept {
-    impl_->abort_request();
-}
-
-template <>
-std::uint32_t Program<Variant>::materialized_tokens() const noexcept {
-    return impl_->materialized_tokens();
-}
-
-template <>
 MemorySummary Program<Variant>::memory_summary() const noexcept {
     return impl_->memory_summary();
-}
-
-template <>
-SpeculativeStats Program<Variant>::speculative_stats() const {
-    return impl_->speculative_stats();
-}
-
-template <>
-GenerationTimings Program<Variant>::generation_timings() const noexcept {
-    return impl_->generation_timings();
 }
 
 template <>

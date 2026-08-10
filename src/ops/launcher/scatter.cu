@@ -32,4 +32,18 @@ void scatter_launch(const Tensor& src, const Tensor& indices, Tensor& dst, cudaS
     CUDA_CHECK(cudaGetLastError());
 }
 
+void scatter_bf16_batch_launch(const Tensor& source, const Tensor& lanes,
+                               const Tensor& valid_columns, Tensor& destination,
+                               cudaStream_t stream) {
+    constexpr int block = 128;
+    const dim3 grid(source.ne[1], source.ne[2], 1);
+    scatter_bf16_batch_kernel<<<grid, block, 0, stream>>>(
+        static_cast<const uint4*>(source.data), static_cast<const std::int32_t*>(lanes.data),
+        static_cast<const std::int32_t*>(valid_columns.data), static_cast<uint4*>(destination.data),
+        source.ne[0] / 8, source.ne[1],
+        destination.nb[1] / static_cast<std::int64_t>(sizeof(uint4)),
+        destination.nb[2] / static_cast<std::int64_t>(sizeof(uint4)));
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

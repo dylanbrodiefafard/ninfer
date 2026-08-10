@@ -352,12 +352,11 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
                                      {"completion_tokens", outcome.completion_tokens},
                                      {"prefix_cache_hit_tokens", outcome.metrics.prefix_cache_hit_tokens},
                                      {"tool_call_count", outcome.tool_calls.size()}};
-    record["timings_seconds"] = Json{{"prepare", outcome.metrics.prepare_seconds},
-                                     {"vision", outcome.metrics.vision_seconds},
-                                     {"prefill", outcome.metrics.prefill_seconds},
-                                     {"decode", outcome.metrics.decode_seconds},
-                                     {"total", outcome.metrics.total_seconds}};
-    record["speculative"]     = speculative_json(outcome.metrics);
+    record["timings_seconds"] = Json{
+        {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},
+        {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},
+        {"decode", outcome.metrics.decode_seconds},   {"total", outcome.metrics.total_seconds}};
+    record["speculative"] = speculative_json(outcome.metrics);
     return record.dump();
 }
 

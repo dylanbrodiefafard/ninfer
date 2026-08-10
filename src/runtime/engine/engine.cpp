@@ -2,10 +2,8 @@
 
 #include "core/device.h"
 #include "runtime/engine/concurrent_executor.h"
-#include "runtime/generation/generation_controller.h"
 #include "targets/registry.h"
 
-#include <mutex>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
@@ -102,19 +100,17 @@ public:
         auto constructed = targets::construct_target(options, device);
         active           = std::move(constructed.active);
         load             = std::move(constructed.load);
-        if (options.speculative.backend != SpeculativeBackend::DFlash) {
-            executor = std::visit(
-                [&](auto& target_ptr) -> Executor {
-                    using Instance =
-                        typename std::remove_reference_t<decltype(target_ptr)>::element_type;
-                    if constexpr (std::is_same_v<Instance, targets::Qwen3_6_27BInstance>) {
-                        return std::make_unique<Executor27>(*target_ptr, options);
-                    } else {
-                        return std::make_unique<Executor35>(*target_ptr, options);
-                    }
-                },
-                active);
-        }
+        executor         = std::visit(
+            [&](auto& target_ptr) -> Executor {
+                using Instance =
+                    typename std::remove_reference_t<decltype(target_ptr)>::element_type;
+                if constexpr (std::is_same_v<Instance, targets::Qwen3_6_27BInstance>) {
+                    return std::make_unique<Executor27>(*target_ptr, options);
+                } else {
+                    return std::make_unique<Executor35>(*target_ptr, options);
+                }
+            },
+            active);
     }
 
     ~Impl() noexcept {
@@ -124,56 +120,11 @@ public:
         } catch (...) {}
     }
 
-    GenerationResult run_dflash(std::unique_ptr<PreparedPrompt::Impl> prompt,
-                                RequestOptions request_options, HostInputLease host_input,
-                                OutputSink* sink, const CancellationView& cancellation) {
-        std::scoped_lock lock(dflash_generation_mutex);
-        return std::visit(
-            [&](auto& target_ptr) -> GenerationResult {
-                if (target_ptr == nullptr) {
-                    throw std::logic_error("Engine target is not active");
-                }
-                if (prompt->summary.prompt_tokens > target_ptr->capacity) {
-                    throw RequestError(RequestErrorKind::ContextLengthExceeded,
-                                       "prepared prompt exceeds Engine context capacity");
-                }
-                auto output = target_ptr->loaded->frontend.make_output_session(
-                    prompt->value, request_options.stop, request_options.output);
-                auto controller =
-                    runtime::run_one(*target_ptr->program, std::move(prompt->value),
-                                     std::move(output), target_ptr->request_memory, request_options,
-                                     cancellation, sink, std::move(host_input));
-
-                GenerationResult result;
-                result.prompt              = prompt->summary;
-                result.generated_token_ids = std::move(controller.generated_token_ids);
-                result.content             = std::move(controller.content);
-                result.reasoning           = std::move(controller.reasoning);
-                result.finish_reason       = controller.summary.finish_reason;
-                if (controller.summary.begin) {
-                    result.reused_prompt_tokens = controller.summary.begin->reused_prompt_tokens;
-                    result.timings              = target_ptr->program->generation_timings();
-                    result.speculative          = target_ptr->program->speculative_stats();
-                }
-                result.timings.prepare_seconds = prompt->prepare_seconds;
-                if (result.timings.prefill_seconds == 0.0) {
-                    result.timings.prefill_seconds = controller.prefill_seconds;
-                }
-                result.timings.decode_seconds = controller.decode_seconds;
-                result.timings.first_token_seconds =
-                    prompt->prepare_seconds + controller.first_token_seconds;
-                result.timings.total_seconds = prompt->prepare_seconds + controller.total_seconds;
-                return result;
-            },
-            active);
-    }
-
     EngineOptions options;
     DeviceContext device;
     targets::ActiveTarget active;
     LoadSummary load;
     Executor executor;
-    mutable std::mutex dflash_generation_mutex;
 };
 
 Engine::Engine(EngineOptions options) : impl_(std::make_shared<Impl>(std::move(options))) {}
@@ -274,36 +225,20 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             std::make_unique<GenerationHandle::Impl>(impl_, std::move(immediate)));
     }
 
-    if (impl_->options.speculative.backend != SpeculativeBackend::DFlash) {
-        return std::visit(
-            [&](auto& executor) -> GenerationHandle {
-                using Executor = std::remove_cvref_t<decltype(executor)>;
-                if constexpr (std::is_same_v<Executor, std::monostate>) {
-                    throw std::logic_error("concurrent Engine executor is unavailable");
-                } else {
-                    auto submission = executor->submit(
-                        std::move(prompt.impl_->value), prompt_summary, prepare_seconds,
-                        std::move(options), pending_deadline, std::move(host_input));
-                    return GenerationHandle(
-                        std::make_unique<GenerationHandle::Impl>(impl_, std::move(submission)));
-                }
-            },
-            impl_->executor);
-    }
-
-    struct DFlashSubmission {
-        std::shared_ptr<Impl> engine;
-        HostInputLease host_input;
-        std::unique_ptr<PreparedPrompt::Impl> prompt;
-        RequestOptions options;
-
-        GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
-            return engine->run_dflash(std::move(prompt), std::move(options), std::move(host_input),
-                                      sink, cancellation);
-        }
-    } dflash{impl_, std::move(host_input), std::move(prompt.impl_), std::move(options)};
-
-    return GenerationHandle(std::make_unique<GenerationHandle::Impl>(impl_, std::move(dflash)));
+    return std::visit(
+        [&](auto& executor) -> GenerationHandle {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                throw std::logic_error("concurrent Engine executor is unavailable");
+            } else {
+                auto submission = executor->submit(std::move(prompt.impl_->value), prompt_summary,
+                                                   prepare_seconds, std::move(options),
+                                                   pending_deadline, std::move(host_input));
+                return GenerationHandle(
+                    std::make_unique<GenerationHandle::Impl>(impl_, std::move(submission)));
+            }
+        },
+        impl_->executor);
 }
 
 GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options, OutputSink* sink,
@@ -323,54 +258,28 @@ LoadSummary Engine::load_summary() const {
 
 MemorySummary Engine::memory_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    if (impl_->options.speculative.backend != SpeculativeBackend::DFlash) {
-        return std::visit(
-            [](const auto& executor) -> MemorySummary {
-                using Executor = std::remove_cvref_t<decltype(executor)>;
-                if constexpr (std::is_same_v<Executor, std::monostate>) {
-                    throw std::logic_error("concurrent Engine executor is unavailable");
-                } else {
-                    return executor->memory_summary();
-                }
-            },
-            impl_->executor);
-    }
-    std::scoped_lock lock(impl_->dflash_generation_mutex);
     return std::visit(
-        [](const auto& target_ptr) {
-            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            MemorySummary out     = target_ptr->program->memory_summary();
-            out.request_transient = target_ptr->request_memory.summary();
-            return out;
+        [](const auto& executor) -> MemorySummary {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                throw std::logic_error("concurrent Engine executor is unavailable");
+            } else {
+                return executor->memory_summary();
+            }
         },
-        impl_->active);
+        impl_->executor);
 }
 
 void Engine::reset_memory_peaks() noexcept {
     if (impl_ == nullptr) { return; }
-    if (impl_->options.speculative.backend != SpeculativeBackend::DFlash) {
-        std::visit(
-            [](auto& executor) {
-                using Executor = std::remove_cvref_t<decltype(executor)>;
-                if constexpr (!std::is_same_v<Executor, std::monostate>) {
-                    executor->reset_memory_peaks();
-                }
-            },
-            impl_->executor);
-        return;
-    }
-    std::unique_lock lock(impl_->dflash_generation_mutex, std::defer_lock);
-    try {
-        lock.lock();
-    } catch (...) { return; }
     std::visit(
-        [](auto& target_ptr) {
-            if (target_ptr != nullptr) {
-                target_ptr->program->reset_memory_peaks();
-                target_ptr->request_memory.reset_peak();
+        [](auto& executor) {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (!std::is_same_v<Executor, std::monostate>) {
+                executor->reset_memory_peaks();
             }
         },
-        impl_->active);
+        impl_->executor);
 }
 
 } // namespace ninfer

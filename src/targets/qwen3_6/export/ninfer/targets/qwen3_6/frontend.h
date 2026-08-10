@@ -3,6 +3,7 @@
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -42,7 +43,40 @@ private:
     friend class PreparedPromptAccess;
 };
 
-using PublishedOutput = std::vector<OutputDelta>;
+class PublishedOutput {
+public:
+    using iterator       = std::array<OutputDelta, 2>::iterator;
+    using const_iterator = std::array<OutputDelta, 2>::const_iterator;
+
+    PublishedOutput()                                  = default;
+    PublishedOutput(const PublishedOutput&)            = default;
+    PublishedOutput& operator=(const PublishedOutput&) = default;
+    PublishedOutput(PublishedOutput&& other) noexcept;
+    PublishedOutput& operator=(PublishedOutput&& other) noexcept;
+
+    [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
+
+    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+
+    [[nodiscard]] iterator begin() noexcept { return values_.begin(); }
+
+    [[nodiscard]] const_iterator begin() const noexcept { return values_.begin(); }
+
+    [[nodiscard]] iterator end() noexcept { return values_.begin() + size_; }
+
+    [[nodiscard]] const_iterator end() const noexcept { return values_.begin() + size_; }
+
+    [[nodiscard]] OutputDelta& back() noexcept { return values_[size_ - 1]; }
+
+    [[nodiscard]] const OutputDelta& back() const noexcept { return values_[size_ - 1]; }
+
+    void clear() noexcept;
+    void push_back(OutputDelta value);
+
+private:
+    std::array<OutputDelta, 2> values_{};
+    std::size_t size_ = 0;
+};
 
 class OutputSession {
 public:

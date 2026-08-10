@@ -4,7 +4,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <optional>
 #include <span>
 
 namespace ninfer::runtime {
@@ -50,21 +49,11 @@ struct BatchedGeneratedRound {
     std::uint32_t row_stride = 1;
 };
 
-struct BeginResult {
-    BeginSummary summary;
-    GeneratedRound round;
-};
-
 struct PrefillStepResult {
     BeginSummary summary;
     GeneratedRound round;
     bool complete            = false;
     bool host_input_consumed = false;
-};
-
-struct GenerationSummary {
-    std::optional<BeginSummary> begin;
-    FinishReason finish_reason = FinishReason::None;
 };
 
 struct RoundBudget {

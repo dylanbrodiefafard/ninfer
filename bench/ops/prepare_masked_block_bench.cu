@@ -144,30 +144,36 @@ class Case {
 public:
     explicit Case(std::int32_t block_size)
         : block_size_(block_size), anchor_(sizeof(std::int32_t)), length_(sizeof(std::int32_t)),
+          valid_(sizeof(std::int32_t)),
           ids_(static_cast<std::size_t>(block_size) * sizeof(std::int32_t)),
           positions_(static_cast<std::size_t>(block_size) * sizeof(std::int32_t)),
           anchor_tensor_(anchor_.p, DType::I32, {1}), length_tensor_(length_.p, DType::I32, {1}),
-          ids_tensor_(ids_.p, DType::I32, {block_size}),
-          positions_tensor_(positions_.p, DType::I32, {block_size}) {
+          valid_tensor_(valid_.p, DType::I32, {1}),
+          ids_tensor_(ids_.p, DType::I32, {block_size, 1}),
+          positions_tensor_(positions_.p, DType::I32, {block_size, 1}) {
         const std::int32_t anchor = 42;
         const std::int32_t length = 4096;
+        const std::int32_t valid  = block_size;
         CUDA_CHECK(cudaMemcpy(anchor_.p, &anchor, sizeof(anchor), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(length_.p, &length, sizeof(length), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(valid_.p, &valid, sizeof(valid), cudaMemcpyHostToDevice));
     }
 
     void launch(cudaStream_t stream) {
-        ops::prepare_masked_block(anchor_tensor_, length_tensor_, kMaskId, ids_tensor_,
-                                  positions_tensor_, stream);
+        ops::prepare_masked_block(anchor_tensor_, length_tensor_, valid_tensor_, kMaskId,
+                                  ids_tensor_, positions_tensor_, stream);
     }
 
 private:
     std::int32_t block_size_;
     DeviceBuffer anchor_;
     DeviceBuffer length_;
+    DeviceBuffer valid_;
     DeviceBuffer ids_;
     DeviceBuffer positions_;
     Tensor anchor_tensor_;
     Tensor length_tensor_;
+    Tensor valid_tensor_;
     Tensor ids_tensor_;
     Tensor positions_tensor_;
 };

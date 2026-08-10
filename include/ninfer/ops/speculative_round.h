@@ -42,6 +42,15 @@ void speculative_prepare_verify_inputs(const Tensor& anchors, const Tensor& draf
                                        Tensor& verify_ids, Tensor& positions, cudaStream_t stream);
 
 /**
+ * Prepare only the target verification ids when the caller already owns the matching position
+ * matrix. Shapes and id semantics are identical to speculative_prepare_verify_inputs; the
+ * existing positions remain untouched.
+ */
+void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
+                                    const Tensor& current_extents, Tensor& verify_ids,
+                                    cudaStream_t stream);
+
+/**
  * Op: speculative_accept_greedy_drafts
  *
  * Algorithm:

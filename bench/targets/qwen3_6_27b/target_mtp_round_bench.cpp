@@ -155,7 +155,8 @@ int run(const Options& options) {
     ninfer::ExecutionOptions execution;
     execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);
     execution.allow_prefix_reuse      = false;
-    auto request_plan                 = program->plan_request_for_lane(0, prompt, execution);
+    auto request_base                 = program->plan_request_base(prompt, execution);
+    auto request_plan                 = program->plan_request_for_lane(0, prompt, request_base);
     request_memory.activate(request_plan.summary().transient_bytes,
                             request_plan.summary().transient_alignment);
     const auto first = program->start_prefill_lane(0, std::move(prompt), std::move(request_plan),

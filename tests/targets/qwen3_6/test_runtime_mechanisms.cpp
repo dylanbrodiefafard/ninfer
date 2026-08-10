@@ -41,14 +41,15 @@ void test_topology() {
 
 q36::DecoderStateSpec decoder_spec(ninfer::DType dtype, bool mtp) {
     return q36::DecoderStateSpec{
-        .full_attention_layers = 2,
-        .mtp_layers            = 1,
-        .capacity              = 129,
-        .kv_heads              = 2,
-        .attention_head_dim    = 64,
-        .kv_dtype              = dtype,
-        .kv_quant_group        = dtype == ninfer::DType::I8 ? q36::kKvQuantGroup : 0,
-        .enable_mtp            = mtp,
+        .full_attention_layers    = 2,
+        .mtp_layers               = 1,
+        .capacity                 = 129,
+        .kv_heads                 = 2,
+        .attention_head_dim       = 64,
+        .kv_dtype                 = dtype,
+        .kv_quant_group           = dtype == ninfer::DType::I8 ? q36::kKvQuantGroup : 0,
+        .enable_mtp               = mtp,
+        .mtp_physical_page_groups = mtp ? 4U : 0U,
         .linear_attention =
             {
                 .layers         = 3,
@@ -93,7 +94,9 @@ void test_decoder_layout() {
                int8.text_kv.pool.planes[3].spec.dtype == ninfer::DType::FP16,
            "INT8 Text KV has code and scale planes per layer");
     expect(int8.mtp_kv.has_value() && int8.mtp_kv->layers == 1 &&
-               int8.mtp_kv->pool.planes.size() == 4,
+               int8.mtp_kv->pool.planes.size() == 4 &&
+               int8.mtp_kv->pool.spec.page_group_count == 4 &&
+               int8.mtp_kv->pool.spec.logical_page_capacity == 3,
            "enabled MTP has one paged KV layer");
     expect(int8.mtp_kv && int8.mtp_kv->pool.planes[2].spec.dtype == ninfer::DType::FP16 &&
                int8.mtp_kv->pool.planes[3].spec.dtype == ninfer::DType::FP16,
@@ -112,14 +115,12 @@ void test_round_layout() {
     q36::complete_round_state_layout(builder, round);
     (void)builder.finish(256);
     expect(round.complete, "round layout completes");
-    expect(round.logits.shape[0] == 128 && round.logits.shape[1] == 6, "round logits shape");
-    expect(round.verify_hidden.shape[0] == 32 && round.verify_hidden.shape[1] == 6,
-           "round verification hidden shape");
-    expect(round.speculative.draft_tokens.shape[0] == 5 &&
-               round.speculative.round_tokens.shape[0] == 6,
-           "round speculative vector shapes");
-    expect(round.verify_hidden.region.offset < exact_prefill.region.offset &&
-               exact_prefill.region.offset < round.speculative.target_argmax.region.offset,
+    expect(round.logits.shape[0] == 128 && round.logits.shape[1] == 1, "round logits shape");
+    expect(round.mtp.has_value() && round.mtp->draft_tokens.shape[0] == 5 &&
+               round.mtp->target_input_ids.shape[0] == 6,
+           "MTP prefill scratch shapes");
+    expect(round.logits.region.offset < exact_prefill.region.offset &&
+               exact_prefill.region.offset < round.mtp->draft_tokens.region.offset,
            "exact prefill extension retains established round-region order");
     expect(round.mtp.has_value() && round.mtp->position.shape[0] == 1,
            "MTP prefill scratch is explicit");
@@ -128,17 +129,19 @@ void test_round_layout() {
            "MTP decode frame is explicit");
 
     ninfer::LayoutBuilder speculative_builder;
-    q36::RoundStateLayout speculative = q36::begin_round_state_layout(
+    q36::RoundStateLayout dflash = q36::begin_round_state_layout(
         speculative_builder,
         q36::RoundStateSpec{
-            .hidden = 32, .output_rows = 128, .draft_window = 15, .enable_mtp = false});
-    q36::complete_round_state_layout(speculative_builder, speculative);
+            .hidden = 32, .output_rows = 128, .draft_window = 15, .enable_dflash = true});
+    q36::complete_round_state_layout(speculative_builder, dflash);
     (void)speculative_builder.finish(256);
-    expect(speculative.logits.shape[1] == 16 &&
-               speculative.speculative.draft_tokens.shape[0] == 15 &&
-               speculative.speculative.current_proposal_extent.shape[0] == 1,
-           "K=15 shared speculative geometry");
-    expect(!speculative.mtp.has_value(), "shared speculative state does not imply MTP state");
+    expect(dflash.logits.shape[1] == 1 && dflash.dflash_prefill.has_value() &&
+               dflash.dflash_prefill->produced_count.shape[0] == 1 &&
+               dflash.dflash_decode.has_value() &&
+               dflash.dflash_decode->draft_tokens.shape[0] == 15,
+           "K=15 DFlash storage is backend-owned");
+    expect(!dflash.mtp.has_value() && !dflash.mtp_decode.has_value(),
+           "DFlash layout does not allocate MTP storage");
 }
 
 void test_mtp_alignment() {

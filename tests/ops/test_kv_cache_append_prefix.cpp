@@ -79,12 +79,12 @@ void append_oracle(std::vector<std::uint16_t>& cache_k, std::vector<std::uint16_
     }
 }
 
-PagedKVLayerView paged_view(GuardedDeviceBuffer& k, GuardedDeviceBuffer& v,
-                            DeviceBuffer& block_table) {
+PagedKVBatchLayerView paged_view(GuardedDeviceBuffer& k, GuardedDeviceBuffer& v,
+                                 DeviceBuffer& block_table, int table_rows = 1) {
     return {
         .k_pages      = Tensor(k.data(), DType::BF16, {kHeadDim, kPage, kPhysicalPages, kKVHeads}),
         .v_pages      = Tensor(v.data(), DType::BF16, {kHeadDim, kPage, kPhysicalPages, kKVHeads}),
-        .block_table  = Tensor(block_table.p, DType::I32, {kLogicalPages}),
+        .block_tables = Tensor(block_table.p, DType::I32, {kLogicalPages, table_rows}),
         .head_dim     = kHeadDim,
         .num_kv_heads = kKVHeads,
         .dtype        = DType::BF16,
@@ -92,14 +92,16 @@ PagedKVLayerView paged_view(GuardedDeviceBuffer& k, GuardedDeviceBuffer& v,
     };
 }
 
-CyclicKVCacheLayerView cyclic_view(GuardedDeviceBuffer& k, GuardedDeviceBuffer& v) {
+CyclicKVCacheLayerView cyclic_view(GuardedDeviceBuffer& k, GuardedDeviceBuffer& v,
+                                   int lane_capacity = 1) {
     return {
-        .k               = Tensor(k.data(), DType::BF16, {kHeadDim, kWindow, kKVHeads}),
-        .v               = Tensor(v.data(), DType::BF16, {kHeadDim, kWindow, kKVHeads}),
-        .capacity        = kWindow,
+        .k        = Tensor(k.data(), DType::BF16, {kHeadDim, kWindow, kKVHeads, lane_capacity}),
+        .v        = Tensor(v.data(), DType::BF16, {kHeadDim, kWindow, kKVHeads, lane_capacity}),
+        .capacity = kWindow,
         .padded_capacity = kWindow,
         .num_kv_heads    = kKVHeads,
         .head_dim        = kHeadDim,
+        .lane_capacity   = lane_capacity,
     };
 }
 
@@ -128,25 +130,27 @@ int run_case(int tokens, int commit_count, int first_position, bool cyclic,
     DeviceBuffer d_v         = to_device(host_v);
     DeviceBuffer d_positions = to_device(positions);
     DeviceBuffer d_count     = to_device<std::int32_t>({commit_count});
+    DeviceBuffer d_selector  = to_device<std::int32_t>({0});
     DeviceBuffer d_table     = cyclic ? DeviceBuffer(1) : to_device(mapping);
     GuardedDeviceBuffer cache_k(cache_count * sizeof(std::uint16_t));
     GuardedDeviceBuffer cache_v(cache_count * sizeof(std::uint16_t));
     cache_k.copy_from_host(initial_k.data(), cache_k.bytes());
     cache_v.copy_from_host(initial_v.data(), cache_v.bytes());
 
-    Tensor k(d_k.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
-    Tensor v(d_v.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
-    Tensor position_tensor(d_positions.p, DType::I32, {tokens});
+    Tensor k(d_k.p, DType::BF16, {kHeadDim, kKVHeads, tokens, 1});
+    Tensor v(d_v.p, DType::BF16, {kHeadDim, kKVHeads, tokens, 1});
+    Tensor position_tensor(d_positions.p, DType::I32, {tokens, 1});
     Tensor count_tensor(d_count.p, DType::I32, {1});
+    Tensor selector_tensor(d_selector.p, DType::I32, {1});
     const ops::KVCacheAppendPrefixExecutionEnvelope envelope{
         .min_count = static_cast<std::uint32_t>(min_count),
         .max_count = static_cast<std::uint32_t>(tokens),
     };
     if (cyclic) {
-        ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, envelope,
+        ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, selector_tensor, envelope,
                                     cyclic_view(cache_k, cache_v), nullptr);
     } else {
-        ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, envelope,
+        ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, selector_tensor, envelope,
                                     paged_view(cache_k, cache_v, d_table), nullptr);
     }
     cuda_synchronize();
@@ -189,12 +193,14 @@ int cyclic_graph_replay_case() {
     DeviceBuffer d_v         = to_device(host_v);
     DeviceBuffer d_positions = to_device(positions);
     DeviceBuffer d_count     = to_device<std::int32_t>({0});
+    DeviceBuffer d_lane      = to_device<std::int32_t>({0});
     GuardedDeviceBuffer cache_k(cache_count * sizeof(std::uint16_t));
     GuardedDeviceBuffer cache_v(cache_count * sizeof(std::uint16_t));
-    Tensor k(d_k.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
-    Tensor v(d_v.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
-    Tensor position_tensor(d_positions.p, DType::I32, {tokens});
+    Tensor k(d_k.p, DType::BF16, {kHeadDim, kKVHeads, tokens, 1});
+    Tensor v(d_v.p, DType::BF16, {kHeadDim, kKVHeads, tokens, 1});
+    Tensor position_tensor(d_positions.p, DType::I32, {tokens, 1});
     Tensor count_tensor(d_count.p, DType::I32, {1});
+    Tensor lane_tensor(d_lane.p, DType::I32, {1});
     auto cache = cyclic_view(cache_k, cache_v);
 
     cudaStream_t stream        = nullptr;
@@ -203,7 +209,8 @@ int cyclic_graph_replay_case() {
     cuda_check(cudaStreamCreate(&stream), "create kv append stream");
     cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
                "begin kv append capture");
-    ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, {0, tokens}, cache, stream);
+    ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, lane_tensor, {0, tokens},
+                                cache, stream);
     cuda_check(cudaStreamEndCapture(stream, &graph), "end kv append capture");
     cuda_check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
                "instantiate kv append graph");
@@ -262,13 +269,15 @@ int paged_graph_replay_case() {
     DeviceBuffer d_v         = to_device(host_v);
     DeviceBuffer d_positions = to_device(positions);
     DeviceBuffer d_count     = to_device<std::int32_t>({0});
+    DeviceBuffer d_row       = to_device<std::int32_t>({0});
     DeviceBuffer d_table     = to_device<std::int32_t>({0, 1, 2});
     GuardedDeviceBuffer cache_k(cache_count * sizeof(std::uint16_t));
     GuardedDeviceBuffer cache_v(cache_count * sizeof(std::uint16_t));
-    Tensor k(d_k.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
-    Tensor v(d_v.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
-    Tensor position_tensor(d_positions.p, DType::I32, {tokens});
+    Tensor k(d_k.p, DType::BF16, {kHeadDim, kKVHeads, tokens, 1});
+    Tensor v(d_v.p, DType::BF16, {kHeadDim, kKVHeads, tokens, 1});
+    Tensor position_tensor(d_positions.p, DType::I32, {tokens, 1});
     Tensor count_tensor(d_count.p, DType::I32, {1});
+    Tensor row_tensor(d_row.p, DType::I32, {1});
     auto cache = paged_view(cache_k, cache_v, d_table);
 
     cudaStream_t stream        = nullptr;
@@ -277,7 +286,8 @@ int paged_graph_replay_case() {
     cuda_check(cudaStreamCreate(&stream), "create paged kv append stream");
     cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
                "begin paged kv append capture");
-    ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, {0, tokens}, cache, stream);
+    ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, row_tensor, {0, tokens}, cache,
+                                stream);
     cuda_check(cudaStreamEndCapture(stream, &graph), "end paged kv append capture");
     cuda_check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
                "instantiate paged kv append graph");
@@ -323,6 +333,88 @@ int paged_graph_replay_case() {
     return failures;
 }
 
+int batch_selector_case(bool cyclic) {
+    constexpr int tokens = 3;
+    constexpr int batch  = 2;
+    const std::vector<std::int32_t> counts{1, 3};
+    const std::vector<std::int32_t> selectors{1, 0};
+    const std::vector<std::int32_t> positions =
+        cyclic ? std::vector<std::int32_t>{kWindow - 1, kWindow, kWindow + 1, 5, 6, 7}
+               : std::vector<std::int32_t>{63, 64, 65, 5, 6, 7};
+    const std::size_t row_input_count = static_cast<std::size_t>(kHeadDim) * kKVHeads * tokens;
+    const std::size_t lane_cache_count =
+        static_cast<std::size_t>(kHeadDim) * kKVHeads * (cyclic ? kWindow : kPage * kPhysicalPages);
+    const auto host_k    = patterned_bits(row_input_count * batch, 0x31415926u);
+    const auto host_v    = patterned_bits(row_input_count * batch, 0x27182818u);
+    const auto initial_k = patterned_bits(lane_cache_count * (cyclic ? batch : 1), 0x16180339u);
+    const auto initial_v = patterned_bits(lane_cache_count * (cyclic ? batch : 1), 0x57721566u);
+    const std::vector<std::int32_t> tables{0, 1, 2, 3, 4, 5};
+    auto expected_k = initial_k;
+    auto expected_v = initial_v;
+
+    for (int b = 0; b < batch; ++b) {
+        const std::vector<std::int32_t> mapping(
+            tables.begin() +
+                static_cast<std::ptrdiff_t>(selectors[static_cast<std::size_t>(b)] * kLogicalPages),
+            tables.begin() + static_cast<std::ptrdiff_t>(
+                                 (selectors[static_cast<std::size_t>(b)] + 1) * kLogicalPages));
+        for (int token = 0; token < counts[static_cast<std::size_t>(b)]; ++token) {
+            const int position = positions[static_cast<std::size_t>(b * tokens + token)];
+            for (int head = 0; head < kKVHeads; ++head) {
+                for (int d = 0; d < kHeadDim; ++d) {
+                    const std::size_t src =
+                        static_cast<std::size_t>(b) * row_input_count + input_index(d, head, token);
+                    const std::size_t dst =
+                        cyclic ? static_cast<std::size_t>(selectors[static_cast<std::size_t>(b)]) *
+                                         lane_cache_count +
+                                     cyclic_cache_index(d, head, position % kWindow)
+                               : paged_cache_index(d, head, position, mapping);
+                    expected_k[dst] = host_k[src];
+                    expected_v[dst] = host_v[src];
+                }
+            }
+        }
+    }
+
+    DeviceBuffer d_k         = to_device(host_k);
+    DeviceBuffer d_v         = to_device(host_v);
+    DeviceBuffer d_positions = to_device(positions);
+    DeviceBuffer d_counts    = to_device(counts);
+    DeviceBuffer d_selectors = to_device(selectors);
+    DeviceBuffer d_tables    = cyclic ? DeviceBuffer(1) : to_device(tables);
+    GuardedDeviceBuffer cache_k(initial_k.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer cache_v(initial_v.size() * sizeof(std::uint16_t));
+    cache_k.copy_from_host(initial_k.data(), cache_k.bytes());
+    cache_v.copy_from_host(initial_v.data(), cache_v.bytes());
+
+    Tensor k(d_k.p, DType::BF16, {kHeadDim, kKVHeads, tokens, batch});
+    Tensor v(d_v.p, DType::BF16, {kHeadDim, kKVHeads, tokens, batch});
+    Tensor position_tensor(d_positions.p, DType::I32, {tokens, batch});
+    Tensor count_tensor(d_counts.p, DType::I32, {batch});
+    Tensor selector_tensor(d_selectors.p, DType::I32, {batch});
+    constexpr ops::KVCacheAppendPrefixExecutionEnvelope envelope{0, tokens};
+    if (cyclic) {
+        ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, selector_tensor, envelope,
+                                    cyclic_view(cache_k, cache_v, batch), nullptr);
+    } else {
+        ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, selector_tensor, envelope,
+                                    paged_view(cache_k, cache_v, d_tables, batch), nullptr);
+    }
+    cuda_synchronize();
+
+    const std::string label =
+        std::string("kv_cache_append_prefix B=2 ") + (cyclic ? "cyclic lanes" : "paged rows");
+    int failures =
+        verify_exact((label + " k").c_str(),
+                     from_device<std::uint16_t>(cache_k.data(), expected_k.size()), expected_k);
+    failures +=
+        verify_exact((label + " v").c_str(),
+                     from_device<std::uint16_t>(cache_v.data(), expected_v.size()), expected_v);
+    failures += cache_k.verify_guards((label + " k guards").c_str());
+    failures += cache_v.verify_guards((label + " v guards").c_str());
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -342,6 +434,8 @@ int main() {
     failures += run_case(16, 16, 3 * kWindow - 8, true, {}, 16);
     failures += cyclic_graph_replay_case();
     failures += paged_graph_replay_case();
+    failures += batch_selector_case(true);
+    failures += batch_selector_case(false);
 
     if (failures != 0) {
         std::cerr << "kv_cache_append_prefix failures=" << failures << '\n';

@@ -13,7 +13,8 @@ std::uint32_t page_count(std::uint32_t capacity) {
 
 PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std::uint32_t capacity,
                               std::int32_t kv_heads, std::int32_t head_dim, DType dtype,
-                              std::int32_t quant_group, std::int32_t table_rows) {
+                              std::int32_t quant_group, std::int32_t table_rows,
+                              std::uint32_t physical_page_groups) {
     if (layers == 0 ||
         layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
@@ -25,9 +26,14 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
         throw std::invalid_argument("Paged KV cache dtype or quantization is invalid");
     }
 
+    const std::uint32_t logical_pages = page_count(capacity);
+    if (physical_page_groups < logical_pages) {
+        throw std::invalid_argument("Paged KV physical pages are below logical capacity");
+    }
+
     PagedKVPoolSpec pool_spec;
-    pool_spec.page_group_count      = page_count(capacity);
-    pool_spec.logical_page_capacity = pool_spec.page_group_count;
+    pool_spec.page_group_count      = physical_page_groups;
+    pool_spec.logical_page_capacity = logical_pages;
     pool_spec.table_rows            = table_rows;
     pool_spec.planes.reserve(static_cast<std::size_t>(layers) * (quantized ? 4ULL : 2ULL));
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
@@ -53,13 +59,14 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
 
 DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderStateSpec& spec) {
     DecoderStateLayout layout;
-    layout.text_kv =
-        plan_cache(builder, spec.full_attention_layers, spec.capacity, spec.kv_heads,
-                   spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group, spec.kv_table_rows);
+    const std::uint32_t context_pages = page_count(spec.capacity);
+    layout.text_kv = plan_cache(builder, spec.full_attention_layers, spec.capacity, spec.kv_heads,
+                                spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
+                                spec.kv_table_rows, context_pages);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
-                                   spec.kv_table_rows);
+                                   spec.kv_table_rows, spec.mtp_physical_page_groups);
     }
     layout.linear_attention = plan_linear_attention_state_pool(builder, spec.linear_attention);
     return layout;
@@ -80,11 +87,6 @@ std::uint32_t PagedKVCacheView::max_context() const noexcept {
 PagedKVLayerView PagedKVCacheView::layer_view(std::uint32_t layer) const {
     if (cache_ == nullptr) { throw std::logic_error("Paged KV execution view is empty"); }
     return cache_->layer_view(layer, block_table_);
-}
-
-PagedKVBatchLayerView PagedKVCacheView::batch_layer_view(std::uint32_t layer) const {
-    if (cache_ == nullptr) { throw std::logic_error("Paged KV execution view is empty"); }
-    return cache_->batch_layer_view(layer);
 }
 
 PagedKVCacheView PagedKVCache::execution_view(const PagedKVAllocation& allocation) const {

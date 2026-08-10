@@ -164,13 +164,13 @@ std::int32_t paged_context(std::int32_t context) {
     return ((std::max(context, 1) + kPagedKVPageSize - 1) / kPagedKVPageSize) * kPagedKVPageSize;
 }
 
-PagedKVLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v, DeviceBuffer& block_table,
-                                   std::int32_t context) {
+PagedKVBatchLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v,
+                                        DeviceBuffer& block_tables, std::int32_t context) {
     const std::int32_t pages = paged_context(context) / kPagedKVPageSize;
     return {
         .k_pages      = Tensor(k.p, DType::BF16, {kHeadDim, kPagedKVPageSize, pages, kKvHeads}),
         .v_pages      = Tensor(v.p, DType::BF16, {kHeadDim, kPagedKVPageSize, pages, kKvHeads}),
-        .block_table  = Tensor(block_table.p, DType::I32, {pages}),
+        .block_tables = Tensor(block_tables.p, DType::I32, {pages, 1}),
         .head_dim     = kHeadDim,
         .num_kv_heads = kKvHeads,
         .dtype        = DType::BF16,
@@ -181,7 +181,7 @@ PagedKVLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v, DeviceBuffe
 std::size_t workspace_capacity(std::int32_t tokens, std::int32_t context) {
     const ops::GqaContextExecutionEnvelope envelope{static_cast<std::uint32_t>(context),
                                                     static_cast<std::uint32_t>(context)};
-    return ops::bidirectional_gqa_attention_workspace_capacity_bytes(envelope, tokens, tokens);
+    return ops::bidirectional_gqa_attention_workspace_capacity_bytes(envelope, tokens, tokens, 1);
 }
 
 class Case {
@@ -197,19 +197,25 @@ public:
                                        kKvHeads * 2)),
           block_table_(static_cast<std::size_t>(paged_context(context) / kPagedKVPageSize) *
                        sizeof(std::int32_t)),
-          context_length_(sizeof(std::int32_t)),
+          context_length_(sizeof(std::int32_t)), valid_(sizeof(std::int32_t)),
+          table_row_(sizeof(std::int32_t)),
           output_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * kQueryHeads * tokens * 2)),
           workspace_bytes_(workspace_capacity(tokens, context)),
           workspace_(std::max<std::size_t>(workspace_bytes_, 1)),
-          q_tensor_(q_.p, DType::BF16, {kHeadDim, kQueryHeads, tokens}),
-          query_k_tensor_(query_k_.p, DType::BF16, {kHeadDim, kKvHeads, tokens}),
-          query_v_tensor_(query_v_.p, DType::BF16, {kHeadDim, kKvHeads, tokens}),
+          q_tensor_(q_.p, DType::BF16, {kHeadDim, kQueryHeads, tokens, 1}),
+          query_k_tensor_(query_k_.p, DType::BF16, {kHeadDim, kKvHeads, tokens, 1}),
+          query_v_tensor_(query_v_.p, DType::BF16, {kHeadDim, kKvHeads, tokens, 1}),
           length_tensor_(context_length_.p, DType::I32, {1}),
-          output_tensor_(output_.p, DType::BF16, {kHeadDim, kQueryHeads, tokens}),
+          valid_tensor_(valid_.p, DType::I32, {1}),
+          table_row_tensor_(table_row_.p, DType::I32, {1}),
+          output_tensor_(output_.p, DType::BF16, {kHeadDim, kQueryHeads, tokens, 1}),
           context_view_(make_context_view(context_k_, context_v_, block_table_, context)),
           envelope_{static_cast<std::uint32_t>(context), static_cast<std::uint32_t>(context)} {
         CUDA_CHECK(
             cudaMemcpy(context_length_.p, &context_, sizeof(context_), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(valid_.p, &tokens_, sizeof(tokens_), cudaMemcpyHostToDevice));
+        const std::int32_t table_row = 0;
+        CUDA_CHECK(cudaMemcpy(table_row_.p, &table_row, sizeof(table_row), cudaMemcpyHostToDevice));
         std::vector<std::int32_t> table(
             static_cast<std::size_t>(paged_context(context) / kPagedKVPageSize));
         for (std::int32_t page = 0; page < static_cast<std::int32_t>(table.size()); ++page) {
@@ -221,8 +227,9 @@ public:
 
     void launch(cudaStream_t stream) {
         ops::bidirectional_gqa_attention(q_tensor_, query_k_tensor_, query_v_tensor_,
-                                         length_tensor_, kScale, context_view_, envelope_,
-                                         workspace_, output_tensor_, stream);
+                                         length_tensor_, valid_tensor_, table_row_tensor_, kScale,
+                                         context_view_, envelope_, workspace_, output_tensor_,
+                                         stream);
     }
 
     [[nodiscard]] std::size_t workspace_bytes() const noexcept { return workspace_bytes_; }
@@ -237,6 +244,8 @@ private:
     DeviceBuffer context_v_;
     DeviceBuffer block_table_;
     DeviceBuffer context_length_;
+    DeviceBuffer valid_;
+    DeviceBuffer table_row_;
     DeviceBuffer output_;
     std::size_t workspace_bytes_;
     WorkspaceArena workspace_;
@@ -244,8 +253,10 @@ private:
     Tensor query_k_tensor_;
     Tensor query_v_tensor_;
     Tensor length_tensor_;
+    Tensor valid_tensor_;
+    Tensor table_row_tensor_;
     Tensor output_tensor_;
-    PagedKVLayerView context_view_;
+    PagedKVBatchLayerView context_view_;
     ops::GqaContextExecutionEnvelope envelope_;
 };
 

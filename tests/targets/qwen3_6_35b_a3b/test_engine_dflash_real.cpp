@@ -238,15 +238,25 @@ int main() {
     }
 
     {
-        ninfer::Engine full(dflash_engine_options(artifact, ninfer::ProposalHead::Full, 128));
-        const ninfer::GenerationResult result =
-            full.generate(full.prepare_tokens(prompt), greedy_options(17, false));
-        if (result.generated_token_ids.size() != 17 ||
-            !std::equal(result.generated_token_ids.begin(), result.generated_token_ids.end(),
-                        target_output.begin(), target_output.begin() + 17) ||
-            result.speculative.backend != ninfer::SpeculativeBackend::DFlash ||
-            result.speculative.rounds == 0) {
-            std::cerr << "full-head DFlash Graph route diverged from ordinary target output\n";
+        ninfer::EngineOptions options =
+            dflash_engine_options(artifact, ninfer::ProposalHead::Full, 128);
+        options.max_concurrency = 2;
+        ninfer::Engine full(std::move(options));
+        auto first  = full.submit(full.prepare_tokens(prompt), greedy_options(17, false));
+        auto second = full.submit(full.prepare_tokens(prompt), greedy_options(9, false));
+        const ninfer::GenerationResult first_result  = first.wait();
+        const ninfer::GenerationResult second_result = second.wait();
+        const auto valid = [&](const ninfer::GenerationResult& result, std::size_t count) {
+            return result.generated_token_ids.size() == count &&
+                   std::equal(result.generated_token_ids.begin(), result.generated_token_ids.end(),
+                              target_output.begin(),
+                              target_output.begin() + static_cast<std::ptrdiff_t>(count)) &&
+                   result.speculative.backend == ninfer::SpeculativeBackend::DFlash &&
+                   result.speculative.rounds != 0;
+        };
+        if (!valid(first_result, 17) || !valid(second_result, 9)) {
+            std::cerr << "concurrent full-head DFlash Graph route diverged from ordinary target "
+                         "output\n";
             return 1;
         }
     }
