@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -101,6 +102,29 @@ struct RequestOptions {
     ExecutionOptions execution;
     StopPolicy stop;
     OutputOptions output;
+};
+
+// Owns a bounded host-input reservation whose lifetime may cross from request preparation into
+// Engine execution. The concrete reservation is product-owned; Engine only releases it once the
+// target reports that the retained host payload is no longer needed.
+class HostInputLease {
+public:
+    HostInputLease() noexcept = default;
+
+    explicit HostInputLease(std::shared_ptr<void> owner) noexcept : owner_(std::move(owner)) {}
+
+    HostInputLease(HostInputLease&&) noexcept            = default;
+    HostInputLease& operator=(HostInputLease&&) noexcept = default;
+
+    HostInputLease(const HostInputLease&)            = delete;
+    HostInputLease& operator=(const HostInputLease&) = delete;
+
+    void reset() noexcept { owner_.reset(); }
+
+    [[nodiscard]] explicit operator bool() const noexcept { return owner_ != nullptr; }
+
+private:
+    std::shared_ptr<void> owner_;
 };
 
 enum class MediaKind : std::uint8_t {

@@ -75,7 +75,8 @@ public:
     // request; wait() owns result consumption and may run independently from GPU execution.
     [[nodiscard]] GenerationHandle
     submit(PreparedPrompt prompt, RequestOptions options,
-           std::chrono::steady_clock::time_point pending_deadline = {});
+           std::chrono::steady_clock::time_point pending_deadline = {},
+           HostInputLease host_input                              = {});
 
     GenerationResult generate(PreparedPrompt prompt, RequestOptions options,
                               OutputSink* sink                     = nullptr,

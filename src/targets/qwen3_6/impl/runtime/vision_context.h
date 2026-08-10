@@ -91,20 +91,24 @@ struct VisionChunk {
 class VisionPrefillSession {
 public:
     VisionPrefillSession(DeviceContext& device, const LoadedModelData& model,
-                         WorkspaceArena& workspace, const qwen3_6::PreparedPromptData& prompt,
+                         WorkspaceArena& workspace, qwen3_6::PreparedPromptData& prompt,
                          const VisionPrefillPlan& plan, runtime::TransientRegion transient);
 
     [[nodiscard]] VisionChunk prepare_chunk(std::uint32_t begin, std::uint32_t nominal_length);
+    [[nodiscard]] bool release_consumed_media_payload() noexcept;
     [[nodiscard]] double elapsed_seconds() const;
 
 private:
     DeviceContext& device_;
     WorkspaceArena& workspace_;
-    const qwen3_6::PreparedPromptData& prompt_;
+    qwen3_6::PreparedPromptData& prompt_;
     const VisionPrefillPlan& plan_;
     runtime::TransientRegion transient_;
     VisionContext context_;
     std::optional<std::uint32_t> active_item_;
+    std::uint32_t final_item_ = 0;
+    bool final_item_encoded_  = false;
+    bool payload_released_    = false;
     std::vector<CudaEventTimer> timers_;
 };
 

@@ -31,10 +31,23 @@ struct ControllerResult {
 template <class Program, class PreparedPrompt, class OutputSession, class RequestMemory>
 ControllerResult run_one(Program& program, PreparedPrompt prompt, OutputSession output,
                          RequestMemory& request_memory, const RequestOptions& options,
-                         const CancellationView& cancellation, OutputSink* sink) {
+                         const CancellationView& cancellation, OutputSink* sink,
+                         HostInputLease host_input = {}) {
     using Clock = std::chrono::steady_clock;
     nvtx::ScopedRange generate_range(nvtx::Name::Generate, nvtx::Category::Runtime);
     const auto total_start = Clock::now();
+
+    struct HostInputGuard {
+        PreparedPrompt* prompt;
+        HostInputLease* lease;
+
+        ~HostInputGuard() {
+            if (static_cast<bool>(*lease)) {
+                *prompt = PreparedPrompt{};
+                lease->reset();
+            }
+        }
+    } host_input_guard{&prompt, &host_input};
 
     ControllerResult result;
     OutputPublisher publisher(sink);
@@ -125,6 +138,7 @@ ControllerResult run_one(Program& program, PreparedPrompt prompt, OutputSession 
         nvtx::ScopedRange prefill_range(nvtx::Name::Prefill, nvtx::Category::Prefill);
         return program.begin(std::move(prompt), std::move(plan), request_memory.region());
     }();
+    host_input.reset();
     request_memory.deactivate();
     transient_guard.release();
     result.prefill_seconds = std::chrono::duration<double>(Clock::now() - prefill_start).count();

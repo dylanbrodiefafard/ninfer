@@ -84,7 +84,7 @@ PrefillChunkResult prefill_multimodal_chunk(State& state, const PreparedPromptDa
     return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision, finalize_at_end);
 }
 
-MultimodalPrefillResult prefill_multimodal(State& state, const PreparedPromptData& prompt,
+MultimodalPrefillResult prefill_multimodal(State& state, PreparedPromptData& prompt,
                                            const VisionPrefillPlan& plan,
                                            runtime::TransientRegion transient,
                                            std::optional<std::uint32_t> snapshot_boundary,

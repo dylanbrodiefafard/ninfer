@@ -56,7 +56,8 @@ struct BeginResult {
 struct PrefillStepResult {
     BeginSummary summary;
     GeneratedRound round;
-    bool complete = false;
+    bool complete            = false;
+    bool host_input_consumed = false;
 };
 
 struct GenerationSummary {

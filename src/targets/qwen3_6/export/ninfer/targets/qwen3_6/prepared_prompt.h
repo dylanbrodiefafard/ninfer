@@ -67,6 +67,8 @@ struct PreparedPromptData {
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;
 
     [[nodiscard]] bool has_media() const noexcept { return !vision_items.empty(); }
+
+    void release_media_payload() noexcept { std::vector<float>().swap(patches); }
 };
 
 class PreparedPromptAccess {

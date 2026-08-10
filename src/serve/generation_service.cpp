@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <condition_variable>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -36,6 +38,27 @@ struct RequestLifetime {
     std::shared_ptr<RequestCapacity> capacity;
     std::chrono::steady_clock::time_point started;
     std::chrono::steady_clock::time_point deadline;
+};
+
+struct MediaInputCapacity {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool occupied = false;
+};
+
+struct MediaInputPermit {
+    explicit MediaInputPermit(std::shared_ptr<MediaInputCapacity> owner)
+        : capacity(std::move(owner)) {}
+
+    ~MediaInputPermit() {
+        {
+            std::lock_guard lock(capacity->mutex);
+            capacity->occupied = false;
+        }
+        capacity->cv.notify_one();
+    }
+
+    std::shared_ptr<MediaInputCapacity> capacity;
 };
 
 namespace {
@@ -70,6 +93,15 @@ using Clock = std::chrono::steady_clock;
     error.param   = "messages";
     error.code    = code;
     error.message = exception.what();
+    throw ApiException(std::move(error));
+}
+
+[[noreturn]] void throw_preparation_cancelled() {
+    ApiError error;
+    error.status  = 499;
+    error.type    = "request_cancelled";
+    error.code    = "client_disconnected";
+    error.message = "client disconnected during media preparation";
     throw ApiException(std::move(error));
 }
 
@@ -182,6 +214,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
+    media_input_capacity_ = std::make_shared<MediaInputCapacity>();
 }
 
 std::shared_ptr<RequestLifetime> GenerationService::acquire_request_lifetime() const {
@@ -205,7 +238,45 @@ std::shared_ptr<RequestLifetime> GenerationService::acquire_request_lifetime() c
     }
 }
 
-PreparedRequest GenerationService::prepare(const GenerationRequest& request) const {
+HostInputLease
+GenerationService::acquire_media_input(Clock::time_point deadline,
+                                       const std::function<bool()>& is_cancelled) const {
+    std::unique_lock lock(media_input_capacity_->mutex);
+    while (media_input_capacity_->occupied) {
+        if (is_cancelled && is_cancelled()) { throw_preparation_cancelled(); }
+        const Clock::time_point now = Clock::now();
+        if (now >= deadline) {
+            throw_request_error(ninfer::RequestError(
+                RequestErrorKind::QueueTimeout,
+                "inference request expired while waiting for media preparation"));
+        }
+        media_input_capacity_->cv.wait_until(
+            lock, std::min(deadline, now + std::chrono::milliseconds(10)));
+    }
+    if (is_cancelled && is_cancelled()) { throw_preparation_cancelled(); }
+    if (Clock::now() >= deadline) {
+        throw_request_error(
+            ninfer::RequestError(RequestErrorKind::QueueTimeout,
+                                 "inference request expired while waiting for media preparation"));
+    }
+
+    media_input_capacity_->occupied = true;
+    lock.unlock();
+    try {
+        auto permit = std::make_shared<MediaInputPermit>(media_input_capacity_);
+        return HostInputLease(std::static_pointer_cast<void>(std::move(permit)));
+    } catch (...) {
+        {
+            std::lock_guard capacity_lock(media_input_capacity_->mutex);
+            media_input_capacity_->occupied = false;
+        }
+        media_input_capacity_->cv.notify_one();
+        throw;
+    }
+}
+
+PreparedRequest GenerationService::prepare(const GenerationRequest& request,
+                                           std::function<bool()> is_cancelled) const {
     PreparedRequest prepared;
     ninfer::RequestOptions request_options = to_request_options(request, options_);
     prepared.sampling                      = request_options.execution.sampling;
@@ -219,35 +290,47 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request) con
         throw_invalid_input(error, "vision_disabled");
     }
     prepared.lifetime = acquire_request_lifetime();
-    if (request_has_media) { prepared.media_permit = std::unique_lock<std::mutex>(media_mutex_); }
+    HostInputLease host_input;
+    if (request_has_media) {
+        host_input = acquire_media_input(prepared.lifetime->deadline, is_cancelled);
+    }
 
     try {
         ninfer::PromptInput input = to_prompt_input(
             request, options_, [](const ContentPart& part) { return acquire_media(part); });
+        if (is_cancelled && is_cancelled()) { throw_preparation_cancelled(); }
         ninfer::PreparedPrompt prompt = engine_->prepare(std::move(input));
-        prepared.prompt_tokens        = static_cast<int>(prompt.summary().prompt_tokens);
+        if (is_cancelled && is_cancelled()) { throw_preparation_cancelled(); }
+        prepared.prompt_tokens = static_cast<int>(prompt.summary().prompt_tokens);
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
         prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
-                                              prepared.lifetime->deadline);
+                                              prepared.lifetime->deadline, std::move(host_input));
     } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
         throw_request_error(exception);
     } catch (const std::invalid_argument& exception) { throw_invalid_input(exception); }
     return prepared;
 }
 
-int GenerationService::count_prompt_tokens(const GenerationRequest& request) const {
-    std::unique_lock<std::mutex> media_permit;
+int GenerationService::count_prompt_tokens(const GenerationRequest& request,
+                                           std::function<bool()> is_cancelled) const {
     const bool request_has_media = has_media(request);
     if (request_has_media && !options_.enable_vision) {
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");
     }
-    if (request_has_media) { media_permit = std::unique_lock<std::mutex>(media_mutex_); }
+    HostInputLease host_input;
+    if (request_has_media) {
+        host_input = acquire_media_input(
+            Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms), is_cancelled);
+    }
     try {
         ninfer::PromptInput input = to_prompt_input(
             request, options_, [](const ContentPart& part) { return acquire_media(part); });
-        return static_cast<int>(engine_->count_tokens(std::move(input)));
+        if (is_cancelled && is_cancelled()) { throw_preparation_cancelled(); }
+        const int prompt_tokens = static_cast<int>(engine_->count_tokens(std::move(input)));
+        if (is_cancelled && is_cancelled()) { throw_preparation_cancelled(); }
+        return prompt_tokens;
     } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
         throw_request_error(exception);
     } catch (const std::invalid_argument& exception) { throw_invalid_input(exception); }
@@ -272,8 +355,6 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     try {
         result = prepared.generation.wait(public_sink, cancellation);
     } catch (const ninfer::RequestError& exception) { throw_request_error(exception); }
-    if (prepared.media_permit.owns_lock()) { prepared.media_permit.unlock(); }
-
     GenerationOutcome outcome;
     outcome.text              = std::move(result.content);
     outcome.reasoning         = std::move(result.reasoning);

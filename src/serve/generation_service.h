@@ -8,11 +8,11 @@
 #include "serve/request.h"
 #include "serve/serve_options.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <vector>
 
@@ -20,6 +20,7 @@ namespace ninfer::serve {
 
 struct RequestLifetime;
 struct RequestCapacity;
+struct MediaInputCapacity;
 
 struct GenerationMetrics {
     double prepare_seconds = 0.0;
@@ -68,10 +69,6 @@ struct PreparedRequest {
     std::size_t tool_name_max_length = 64;
     bool enable_thinking             = true;
     std::shared_ptr<RequestLifetime> lifetime;
-
-    // Limit concurrent ownership of media preprocessing buffers. Text requests
-    // do not use this permit.
-    std::unique_lock<std::mutex> media_permit;
 };
 
 class GenerationService {
@@ -84,8 +81,10 @@ public:
 
     [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
 
-    [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req) const;
-    [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req) const;
+    [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,
+                                          std::function<bool()> is_cancelled = {}) const;
+    [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req,
+                                          std::function<bool()> is_cancelled = {}) const;
 
     // Consumes prepared.generation. A PreparedRequest is single-use.
     GenerationOutcome run(PreparedRequest& prepared, const StreamSink* sink,
@@ -95,11 +94,14 @@ public:
 
 private:
     [[nodiscard]] std::shared_ptr<RequestLifetime> acquire_request_lifetime() const;
+    [[nodiscard]] HostInputLease
+    acquire_media_input(std::chrono::steady_clock::time_point deadline,
+                        const std::function<bool()>& is_cancelled) const;
 
     ServeOptions options_;
     std::unique_ptr<ninfer::Engine> engine_;
     std::shared_ptr<RequestCapacity> request_capacity_;
-    mutable std::mutex media_mutex_;
+    std::shared_ptr<MediaInputCapacity> media_input_capacity_;
 };
 
 } // namespace ninfer::serve

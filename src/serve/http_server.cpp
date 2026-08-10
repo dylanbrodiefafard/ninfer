@@ -240,7 +240,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             error.message = "model '" + request.model + "' not found";
             throw ApiException(std::move(error));
         }
-        prepared = service_->prepare(request);
+        prepared = service_->prepare(
+            request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
     } catch (const ApiException& e) {
         write_error(res, e.error());
         return;
@@ -391,7 +392,8 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
         RequestLimits limits;
         limits.default_max_tokens       = options_.default_max_tokens;
         const GenerationRequest request = parse_messages_request(body, limits);
-        const int input_tokens          = service_->count_prompt_tokens(request);
+        const int input_tokens          = service_->count_prompt_tokens(
+            request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
         res.set_content(make_count_tokens_response(input_tokens), "application/json");
     } catch (const ApiException& e) {
         write_messages_error(res, e.error());
@@ -424,7 +426,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         // The Anthropic endpoint accepts any `model` string (Claude Code sends real
         // Claude model names) and echoes it back; it never 404s on model id.
         request  = parse_messages_request(body, limits);
-        prepared = service_->prepare(request);
+        prepared = service_->prepare(
+            request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
     } catch (const ApiException& e) {
         write_messages_error(res, e.error());
         return;

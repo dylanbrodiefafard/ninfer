@@ -162,10 +162,11 @@ struct RequestControl {
         std::unique_ptr<schedule::VisionPrefillSession> vision;
         runtime::TransientRegion transient;
         std::optional<std::uint32_t> snapshot_boundary;
-        std::uint32_t base          = 0;
-        std::uint32_t cursor        = 0;
-        std::uint32_t prompt_tokens = 0;
-        double elapsed_seconds      = 0.0;
+        std::uint32_t base               = 0;
+        std::uint32_t cursor             = 0;
+        std::uint32_t prompt_tokens      = 0;
+        double elapsed_seconds           = 0.0;
+        bool host_input_consumed_pending = false;
     };
 
     std::optional<OrdinaryPrefill> ordinary_prefill;

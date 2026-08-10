@@ -125,8 +125,8 @@ public:
     }
 
     GenerationResult run_legacy(std::unique_ptr<PreparedPrompt::Impl> prompt,
-                                RequestOptions request_options, OutputSink* sink,
-                                const CancellationView& cancellation) {
+                                RequestOptions request_options, HostInputLease host_input,
+                                OutputSink* sink, const CancellationView& cancellation) {
         std::scoped_lock lock(legacy_generation_mutex);
         return std::visit(
             [&](auto& target_ptr) -> GenerationResult {
@@ -139,9 +139,10 @@ public:
                 }
                 auto output = target_ptr->loaded->frontend.make_output_session(
                     prompt->value, request_options.stop, request_options.output);
-                auto controller = runtime::run_one(*target_ptr->program, std::move(prompt->value),
-                                                   std::move(output), target_ptr->request_memory,
-                                                   request_options, cancellation, sink);
+                auto controller =
+                    runtime::run_one(*target_ptr->program, std::move(prompt->value),
+                                     std::move(output), target_ptr->request_memory, request_options,
+                                     cancellation, sink, std::move(host_input));
 
                 GenerationResult result;
                 result.prompt              = prompt->summary;
@@ -230,9 +231,22 @@ std::uint32_t Engine::count_tokens(PromptInput input) const {
 }
 
 GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
-                                std::chrono::steady_clock::time_point pending_deadline) {
+                                std::chrono::steady_clock::time_point pending_deadline,
+                                HostInputLease host_input) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (prompt.impl_ == nullptr) { throw std::invalid_argument("PreparedPrompt is empty"); }
+
+    struct HostInputGuard {
+        PreparedPrompt* prompt;
+        HostInputLease* lease;
+
+        ~HostInputGuard() {
+            if (static_cast<bool>(*lease)) {
+                prompt->impl_.reset();
+                lease->reset();
+            }
+        }
+    } host_input_guard{&prompt, &host_input};
 
     const PromptSummary prompt_summary = prompt.impl_->summary;
     if (prompt_summary.prompt_tokens > impl_->options.max_context) {
@@ -254,6 +268,8 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
         immediate.result.finish_reason           = FinishReason::OutputLimit;
         immediate.result.timings.prepare_seconds = prepare_seconds;
         immediate.result.timings.total_seconds   = prepare_seconds;
+        prompt.impl_.reset();
+        host_input.reset();
         return GenerationHandle(
             std::make_unique<GenerationHandle::Impl>(impl_, std::move(immediate)));
     }
@@ -265,9 +281,9 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                 if constexpr (std::is_same_v<Executor, std::monostate>) {
                     throw std::logic_error("ordinary Engine executor is unavailable");
                 } else {
-                    auto submission =
-                        executor->submit(std::move(prompt.impl_->value), prompt_summary,
-                                         prepare_seconds, std::move(options), pending_deadline);
+                    auto submission = executor->submit(
+                        std::move(prompt.impl_->value), prompt_summary, prepare_seconds,
+                        std::move(options), pending_deadline, std::move(host_input));
                     return GenerationHandle(
                         std::make_unique<GenerationHandle::Impl>(impl_, std::move(submission)));
                 }
@@ -277,13 +293,15 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
 
     struct LegacySubmission {
         std::shared_ptr<Impl> engine;
+        HostInputLease host_input;
         std::unique_ptr<PreparedPrompt::Impl> prompt;
         RequestOptions options;
 
         GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
-            return engine->run_legacy(std::move(prompt), std::move(options), sink, cancellation);
+            return engine->run_legacy(std::move(prompt), std::move(options), std::move(host_input),
+                                      sink, cancellation);
         }
-    } legacy{impl_, std::move(prompt.impl_), std::move(options)};
+    } legacy{impl_, std::move(host_input), std::move(prompt.impl_), std::move(options)};
 
     return GenerationHandle(std::make_unique<GenerationHandle::Impl>(impl_, std::move(legacy)));
 }

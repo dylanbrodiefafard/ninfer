@@ -94,7 +94,7 @@ struct MtpBridgeInput {
 };
 
 [[nodiscard]] MultimodalPrefillResult
-prefill_multimodal(State& state, const PreparedPromptData& prompt, const VisionPrefillPlan& plan,
+prefill_multimodal(State& state, PreparedPromptData& prompt, const VisionPrefillPlan& plan,
                    runtime::TransientRegion transient,
                    std::optional<std::uint32_t> snapshot_boundary, bool prepare_mtp,
                    const MtpBridgeInput* mtp_bridge);

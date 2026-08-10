@@ -307,7 +307,7 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
 
 VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedModelData& model,
                                            WorkspaceArena& workspace,
-                                           const qwen3_6::PreparedPromptData& prompt,
+                                           qwen3_6::PreparedPromptData& prompt,
                                            const VisionPrefillPlan& plan,
                                            runtime::TransientRegion transient)
     : device_(device), workspace_(workspace), prompt_(prompt), plan_(plan), transient_(transient),
@@ -318,6 +318,7 @@ VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedMo
     if (transient_.data == nullptr || transient_.alignment < kWorkspaceAlignment) {
         throw std::invalid_argument("Vision item output transient is missing or misaligned");
     }
+    final_item_ = plan_.uses.back().item_index;
     timers_.reserve(plan_.uses.size());
 }
 
@@ -393,9 +394,17 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
             output, workspace_);
         timers_.back().record_stop();
         workspace_.reset();
-        active_item_ = active->item_index;
+        active_item_        = active->item_index;
+        final_item_encoded_ = active->item_index == final_item_;
     }
     return VisionChunk{static_cast<std::int32_t>(end - begin), &control, output};
+}
+
+bool VisionPrefillSession::release_consumed_media_payload() noexcept {
+    if (!final_item_encoded_ || payload_released_) { return false; }
+    prompt_.release_media_payload();
+    payload_released_ = true;
+    return true;
 }
 
 double VisionPrefillSession::elapsed_seconds() const {

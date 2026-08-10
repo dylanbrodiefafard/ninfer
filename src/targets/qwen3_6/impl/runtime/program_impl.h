@@ -466,16 +466,20 @@ ProgramImplCore::start_ordinary_prefill_lane(std::uint32_t lane, PreparedPromptD
         active_sequence().ledger.assign(prompt.token_ids.begin(), prompt.token_ids.end());
         active_sequence().prefix_identity.assign(prompt);
 
+        const bool host_input_consumed = prompt.has_media() && !request_plan.vision;
+        if (host_input_consumed) { prompt.release_media_payload(); }
+
         RequestControl::OrdinaryPrefill prefill{
-            .prompt            = std::move(prompt),
-            .vision_plan       = std::move(request_plan.vision),
-            .vision            = nullptr,
-            .transient         = transient,
-            .snapshot_boundary = request_plan.snapshot_boundary,
-            .base              = base,
-            .cursor            = base,
-            .prompt_tokens     = prompt_tokens,
-            .elapsed_seconds   = 0.0,
+            .prompt                      = std::move(prompt),
+            .vision_plan                 = std::move(request_plan.vision),
+            .vision                      = nullptr,
+            .transient                   = transient,
+            .snapshot_boundary           = request_plan.snapshot_boundary,
+            .base                        = base,
+            .cursor                      = base,
+            .prompt_tokens               = prompt_tokens,
+            .elapsed_seconds             = 0.0,
+            .host_input_consumed_pending = host_input_consumed,
         };
         active_request().ordinary_prefill.emplace(std::move(prefill));
         auto& staged = *active_request().ordinary_prefill;
@@ -1165,7 +1169,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_ordinary_prefill() {
     RequestControl::OrdinaryPrefill& staged = *active_request().ordinary_prefill;
     const runtime::BeginSummary summary{.prompt_tokens        = staged.prompt_tokens,
                                         .reused_prompt_tokens = staged.base};
-    const auto started = Clock::now();
+    bool host_input_consumed           = staged.host_input_consumed_pending;
+    staged.host_input_consumed_pending = false;
+    const auto started                 = Clock::now();
     try {
         if (staged.cursor < staged.prompt_tokens) {
             const std::uint32_t nominal =
@@ -1210,6 +1216,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_ordinary_prefill() {
             if (result.processed_tokens == 0 || result.processed_tokens > nominal) {
                 throw std::logic_error("ordinary prefill chunk made invalid progress");
             }
+            if (staged.vision && staged.vision->release_consumed_media_payload()) {
+                host_input_consumed = true;
+            }
             staged.cursor += result.processed_tokens;
             active_sequence().text_kv_valid = staged.cursor;
             active_sequence().current_linear_state_slot =
@@ -1221,7 +1230,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_ordinary_prefill() {
                 }
                 staged.elapsed_seconds +=
                     std::chrono::duration<double>(Clock::now() - started).count();
-                return runtime::PrefillStepResult{.summary = summary};
+                return runtime::PrefillStepResult{.summary             = summary,
+                                                  .host_input_consumed = host_input_consumed};
             }
             if (staged.cursor != staged.prompt_tokens) {
                 throw std::logic_error("ordinary prefill sampled before the prompt frontier");
@@ -1286,6 +1296,11 @@ runtime::PrefillStepResult ProgramImplCore::advance_ordinary_prefill() {
             active_sequence().boundary.hidden_valid = true;
         }
 
+        if (!staged.prompt.patches.empty()) {
+            staged.prompt.release_media_payload();
+            host_input_consumed = true;
+        }
+
         active_request().ordinary_prefill.reset();
         active_request().pending   = PendingCandidate{.kind          = PendingKind::Begin,
                                                       .base_E        = 0,
@@ -1297,6 +1312,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_ordinary_prefill() {
             .summary  = summary,
             .round    = runtime::GeneratedRound{.tokens = std::span<const TokenId>(host_tokens, 1)},
             .complete = true,
+            .host_input_consumed = host_input_consumed,
         };
     } catch (...) {
         try {
@@ -1568,6 +1584,8 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
             active_request().timings.prefill_seconds =
                 std::chrono::duration<double>(Clock::now() - text_start).count();
         }
+
+        if (prompt.has_media()) { prompt.release_media_payload(); }
 
         validate_licensed_tokens(std::span<const TokenId>(host_tokens, 1));
         if (active_sequence().ledger.size() != prompt_tokens) {
