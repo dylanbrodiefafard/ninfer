@@ -23,14 +23,15 @@ struct ServeOptions {
     std::string api_key;                  // empty => no auth
     std::string model_id = "qwen3.6-27b"; // reported by /v1/models
     std::string request_log_jsonl;        // empty => structured request logging disabled
-    std::uint32_t max_context          = 8192;
-    std::uint32_t max_concurrency      = 1;
-    std::uint32_t max_pending_requests = 16;
-    std::uint32_t pending_timeout_ms   = 30000;
-    std::uint32_t prefill_chunk        = 1024;
-    std::size_t max_request_bytes      = kDefaultMaxRequestBytes;
-    int device                         = 0;
-    KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    std::uint32_t max_context           = 8192;
+    std::uint32_t max_concurrency       = 1;
+    std::uint32_t max_pending_requests  = 16;
+    std::uint32_t pending_timeout_ms    = 30000;
+    std::uint32_t prefill_chunk         = 1024;
+    std::uint32_t log_stats_interval_ms = 5000; // 0 disables periodic Engine throughput logs
+    std::size_t max_request_bytes       = kDefaultMaxRequestBytes;
+    int device                          = 0;
+    KvCacheStorage kv_cache             = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;

@@ -17,7 +17,7 @@
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 4;
+inline constexpr int kRequestLogSchemaVersion        = 5;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct RequestLogContext {
@@ -47,6 +47,15 @@ struct ServerLogEnvironment {
     std::string cuda_driver_version;
 };
 
+struct ThroughputReport {
+    double interval_seconds               = 0.0;
+    std::uint64_t computed_prefill_tokens = 0;
+    std::uint64_t committed_decode_tokens = 0;
+    std::uint64_t decode_rounds           = 0;
+    std::uint64_t decode_row_rounds       = 0;
+    ninfer::RuntimeStats scheduler;
+};
+
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
                                            const GenerationRequest& request,
                                            const PreparedRequest& prepared);
@@ -55,6 +64,7 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
 std::string format_request_start(const RequestLogContext& context);
 std::string format_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
 std::string format_request_error(const RequestLogContext& context, const std::string& message);
+std::string format_throughput(const ThroughputReport& report);
 
 // Pure JSON formatters are public to repository tests. Each return value is one complete JSON
 // object without a trailing newline.
@@ -74,6 +84,8 @@ std::string format_request_done_json(const std::string& server_instance_id,
 std::string format_request_error_json(const std::string& server_instance_id,
                                       std::uint64_t timestamp_unix_ms,
                                       const RequestLogContext& context, const std::string& message);
+std::string format_throughput_json(const std::string& server_instance_id,
+                                   std::uint64_t timestamp_unix_ms, const ThroughputReport& report);
 
 ServerLogEnvironment query_server_log_environment(int device);
 
@@ -98,6 +110,7 @@ public:
     void write_request_start(const RequestLogContext& context);
     void write_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
     void write_request_error(const RequestLogContext& context, const std::string& message);
+    void write_throughput(const ThroughputReport& report);
 
 private:
     void append(std::string record);

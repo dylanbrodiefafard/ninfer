@@ -1,6 +1,7 @@
 #include "serve/http_server.h"
 
 #include "serve/anthropic_schema.h"
+#include "serve/console_log.h"
 #include "serve/openai_schema.h"
 #include "serve/request_log.h"
 #include "serve/translate.h"
@@ -8,8 +9,8 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <exception>
-#include <iostream>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -71,6 +72,27 @@ std::string sse_error_event(const ApiError& error) {
     return "data: " + make_error_body(error) + "\n\n";
 }
 
+ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
+                                        const ninfer::RuntimeStats& current,
+                                        double interval_seconds) {
+    return ThroughputReport{
+        .interval_seconds = interval_seconds,
+        .computed_prefill_tokens =
+            current.computed_prefill_tokens - previous.computed_prefill_tokens,
+        .committed_decode_tokens =
+            current.committed_decode_tokens - previous.committed_decode_tokens,
+        .decode_rounds     = current.decode_rounds - previous.decode_rounds,
+        .decode_row_rounds = current.decode_row_rounds - previous.decode_row_rounds,
+        .scheduler         = current,
+    };
+}
+
+bool report_has_activity(const ThroughputReport& report) {
+    return report.computed_prefill_tokens != 0 || report.committed_decode_tokens != 0 ||
+           report.decode_rounds != 0 || report.scheduler.running_requests != 0 ||
+           report.scheduler.waiting_requests != 0;
+}
+
 } // namespace
 
 HttpServer::HttpServer(ServeOptions options)
@@ -87,8 +109,7 @@ HttpServer::HttpServer(ServeOptions options)
 }
 
 void HttpServer::log_line(const std::string& line) {
-    std::lock_guard<std::mutex> lock(log_mutex_);
-    std::cerr << "ninfer-serve: " << line << '\n';
+    write_console_log(ConsoleLogLevel::Info, line);
 }
 
 void HttpServer::log_request_start(const RequestLogContext& context) {
@@ -105,6 +126,52 @@ void HttpServer::log_request_done(const RequestLogContext& context,
 void HttpServer::log_request_error(const RequestLogContext& context, const std::string& message) {
     log_line(format_request_error(context, message));
     request_jsonl_.write_request_error(context, message);
+}
+
+void HttpServer::log_throughput(const ThroughputReport& report) {
+    log_line(format_throughput(report));
+    request_jsonl_.write_throughput(report);
+}
+
+void HttpServer::run_stats_reporter() {
+    using Clock                     = std::chrono::steady_clock;
+    ninfer::RuntimeStats previous   = service_->runtime_stats();
+    Clock::time_point previous_time = Clock::now();
+    const auto interval             = std::chrono::milliseconds(options_.log_stats_interval_ms);
+
+    for (;;) {
+        {
+            std::unique_lock lock(stats_mutex_);
+            if (stats_cv_.wait_for(lock, interval, [this] { return stats_stopping_; })) { break; }
+        }
+
+        const ninfer::RuntimeStats current = service_->runtime_stats();
+        const Clock::time_point now        = Clock::now();
+        const ThroughputReport report      = make_throughput_report(
+            previous, current, std::chrono::duration<double>(now - previous_time).count());
+        if (report_has_activity(report)) { log_throughput(report); }
+        previous      = current;
+        previous_time = now;
+    }
+
+    const ninfer::RuntimeStats current = service_->runtime_stats();
+    const Clock::time_point now        = Clock::now();
+    const ThroughputReport tail        = make_throughput_report(
+        previous, current, std::chrono::duration<double>(now - previous_time).count());
+    if (tail.computed_prefill_tokens != 0 || tail.committed_decode_tokens != 0 ||
+        tail.decode_rounds != 0) {
+        log_throughput(tail);
+    }
+}
+
+void HttpServer::stop_stats_reporter() {
+    if (!stats_thread_.joinable()) { return; }
+    {
+        std::lock_guard lock(stats_mutex_);
+        stats_stopping_ = true;
+    }
+    stats_cv_.notify_one();
+    stats_thread_.join();
 }
 
 void HttpServer::register_routes() {
@@ -611,7 +678,18 @@ void HttpServer::attach(GenerationService& service) {
 
 bool HttpServer::listen() {
     if (service_ == nullptr) { throw std::logic_error("HTTP generation service is not attached"); }
-    return server_.listen_after_bind();
+    if (options_.log_stats_interval_ms != 0) {
+        stats_stopping_ = false;
+        stats_thread_   = std::thread([this] { run_stats_reporter(); });
+    }
+    try {
+        const bool result = server_.listen_after_bind();
+        stop_stats_reporter();
+        return result;
+    } catch (...) {
+        stop_stats_reporter();
+        throw;
+    }
 }
 
 void HttpServer::stop() { server_.stop(); }

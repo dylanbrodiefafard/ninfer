@@ -85,6 +85,7 @@ public:
     [[nodiscard]] const EngineOptions& options() const;
     [[nodiscard]] LoadSummary load_summary() const;
     [[nodiscard]] MemorySummary memory_summary() const;
+    [[nodiscard]] RuntimeStats runtime_stats() const;
     void reset_memory_peaks() noexcept;
 
 private:

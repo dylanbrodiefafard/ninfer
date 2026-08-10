@@ -1,6 +1,7 @@
 #include "serve/generation_service.h"
 
 #include "product/media_acquire/acquire.h"
+#include "serve/console_log.h"
 #include "serve/tool_call_parser.h"
 #include "serve/translate.h"
 
@@ -8,7 +9,6 @@
 #include <chrono>
 #include <cstddef>
 #include <condition_variable>
-#include <iostream>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -460,7 +460,8 @@ void GenerationService::warmup() {
         PreparedRequest prepared = prepare(request);
         run(prepared, nullptr);
     } catch (const std::exception& exception) {
-        std::cerr << "warmup failed (continuing): " << exception.what() << '\n';
+        write_console_log(ConsoleLogLevel::Warning,
+                          std::string("warmup failed (continuing): ") + exception.what());
     }
 }
 

@@ -82,7 +82,7 @@ WARMUP_FIXTURE = "text_smoke_zh"
 RUN_ARTIFACT_TYPE = "ninfer_serve_corpus_result"
 RUN_SCHEMA_VERSION = 5
 SERVER_LOG_ARTIFACT_TYPE = "ninfer_serve_request_log"
-SERVER_LOG_SCHEMA_VERSION = 4
+SERVER_LOG_SCHEMA_VERSION = 5
 STARTUP_TIMEOUT_SECONDS = 1800.0
 REQUEST_TIMEOUT_SECONDS = 24.0 * 60.0 * 60.0
 LOG_EVENT_TIMEOUT_SECONDS = 10.0
@@ -683,6 +683,8 @@ def server_command(
         "262144",
         "--prefill-chunk",
         "1024",
+        "--log-stats-interval-ms",
+        "0",
         "--device",
         str(device),
         "--request-log-jsonl",

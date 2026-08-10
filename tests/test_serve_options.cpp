@@ -33,6 +33,8 @@ int main() {
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
     failures += check(defaults.request_log_jsonl.empty(),
                       "request JSONL logging is not disabled by default");
+    failures += check(defaults.log_stats_interval_ms == 5000,
+                      "periodic throughput interval default mismatch");
     failures += check(defaults.speculative.backend == ninfer::SpeculativeBackend::None,
                       "speculative decoding is not disabled by default");
 
@@ -60,7 +62,8 @@ int main() {
 
     const ServeOptions configured =
         parse({"ninfer-serve", "model.ninfer", "--no-prefix-reuse", "--vision", "--max-concurrency",
-               "4", "--max-pending-requests", "12", "--pending-timeout-ms", "2500"});
+               "4", "--max-pending-requests", "12", "--pending-timeout-ms", "2500",
+               "--log-stats-interval-ms", "0"});
     failures += check(!configured.allow_prefix_reuse,
                       "--no-prefix-reuse did not disable server prefix reuse");
     failures += check(configured.enable_vision, "--vision did not enable Vision");
@@ -70,6 +73,8 @@ int main() {
                       "--max-pending-requests did not reach serving options");
     failures += check(configured.pending_timeout_ms == 2500,
                       "--pending-timeout-ms did not reach serving options");
+    failures += check(configured.log_stats_interval_ms == 0,
+                      "--log-stats-interval-ms did not disable periodic reporting");
 
     GenerationRequest request;
     request.max_tokens = 1;
@@ -83,6 +88,9 @@ int main() {
               "serve help omits --no-prefix-reuse");
     failures += check(serve_usage_text("ninfer-serve").find("--vision") != std::string::npos,
                       "serve help omits --vision");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--log-stats-interval-ms") != std::string::npos,
+              "serve help omits --log-stats-interval-ms");
 
     const ServeOptions logged = parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl",
                                        "requests.jsonl", "--api-key", "do-not-log"});

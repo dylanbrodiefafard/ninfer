@@ -1,3 +1,4 @@
+#include "serve/console_log.h"
 #include "serve/request_log.h"
 
 #include <nlohmann/json.hpp>
@@ -45,6 +46,7 @@ int main() {
     options.request_log_jsonl         = "requests.jsonl";
     options.max_context               = 262144;
     options.prefill_chunk             = 1024;
+    options.log_stats_interval_ms     = 2500;
     options.kv_cache                  = ninfer::KvCacheStorage::Int8Group64;
     options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens  = 3;
@@ -89,13 +91,15 @@ int main() {
         "serve-test", 1000, options, load, memory, environment, std::uint64_t{123456}));
     failures += check(server.at("artifact_type") == kRequestLogArtifactType,
                       "server record artifact type mismatch");
-    failures += check(server.at("schema_version") == 4, "server record schema mismatch");
+    failures += check(server.at("schema_version") == 5, "server record schema mismatch");
     failures += check(server.at("event") == "server_start", "server event mismatch");
     failures += check(server.at("artifact").at("target") == "qwen3_6_27b", "server target missing");
     failures += check(server.at("artifact").at("weights_id") == "groupwise-int",
                       "server weights id missing");
     failures += check(server.at("artifact").at("size_bytes") == 123456, "artifact size missing");
     failures += check(server.at("engine").at("max_context") == 262144, "max context missing");
+    failures +=
+        check(server.at("engine").at("log_stats_interval_ms") == 2500, "stats interval missing");
     failures += check(server.at("server").at("request_log_jsonl") == "requests.jsonl",
                       "request log path missing");
     failures += check(server.at("engine").at("kv_cache") == "int8-group64", "KV type missing");
@@ -157,7 +161,7 @@ int main() {
     outcome.metrics.prefill_seconds                   = 0.2345678901234;
     outcome.metrics.decode_seconds                    = 5.3456789012345;
     outcome.metrics.total_seconds                     = 5.7037035803702;
-    outcome.metrics.prefix_cache_hit_tokens           = 0;
+    outcome.metrics.prefix_cache_hit_tokens           = 101;
     outcome.metrics.speculative_backend               = ninfer::SpeculativeBackend::Mtp;
     outcome.metrics.speculative_draft_window          = 3;
     outcome.metrics.speculative_rounds                = 300;
@@ -170,6 +174,8 @@ int main() {
     failures +=
         check(done.at("result").at("finish_reason") == "output_limit", "finish reason missing");
     failures += check(done.at("result").at("prompt_tokens") == 401, "prompt tokens missing");
+    failures += check(done.at("result").at("computed_prefill_tokens") == 300,
+                      "computed prefill tokens missing");
     failures += check(done.at("timings_seconds").at("decode").get<double>() ==
                           outcome.metrics.decode_seconds,
                       "decode time lost precision");
@@ -193,6 +199,38 @@ int main() {
 
     failures += check(format_request_start(context).find("thinking=off") != std::string::npos,
                       "human request log omits resolved thinking mode");
+    failures += check(format_request_start(context).find("submitted") != std::string::npos,
+                      "human request log mislabels a submitted request");
+
+    ThroughputReport throughput;
+    throughput.interval_seconds                = 2.0;
+    throughput.computed_prefill_tokens         = 100;
+    throughput.committed_decode_tokens         = 40;
+    throughput.decode_rounds                   = 10;
+    throughput.decode_row_rounds               = 18;
+    throughput.scheduler.running_requests      = 2;
+    throughput.scheduler.prefilling_requests   = 1;
+    throughput.scheduler.decode_ready_requests = 1;
+    throughput.scheduler.waiting_requests      = 3;
+    const std::string human_throughput         = format_throughput(throughput);
+    failures += check(human_throughput.find("prefill=50.0tok/s") != std::string::npos &&
+                          human_throughput.find("decode=20.0tok/s") != std::string::npos &&
+                          human_throughput.find("avg_decode_batch=1.80") != std::string::npos,
+                      "human throughput report mismatch");
+    const Json throughput_json =
+        Json::parse(format_throughput_json("serve-test", 5000, throughput));
+    failures += check(throughput_json.at("event") == "throughput", "throughput event mismatch");
+    failures += check(throughput_json.at("tokens").at("computed_prefill") == 100 &&
+                          throughput_json.at("tokens").at("committed_decode") == 40,
+                      "throughput token deltas mismatch");
+    failures += check(throughput_json.at("decode_batch").at("average_size") == 1.8,
+                      "throughput batch average mismatch");
+
+    const std::string console_prefix =
+        format_console_log_prefix(std::chrono::system_clock::time_point{}, ConsoleLogLevel::Info);
+    failures += check(console_prefix.starts_with('[') &&
+                          console_prefix.ends_with("] [info] ninfer-serve: "),
+                      "console log prefix mismatch");
 
     const std::filesystem::path log_path =
         std::filesystem::temp_directory_path() /

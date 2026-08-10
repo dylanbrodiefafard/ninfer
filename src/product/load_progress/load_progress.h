@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <iosfwd>
 #include <string>
 #include <string_view>
@@ -19,6 +20,7 @@ enum class LoadProgressOutputMode : std::uint8_t {
 struct LoadProgressRendererOptions {
     LoadProgressOutputMode mode                    = LoadProgressOutputMode::Log;
     std::chrono::milliseconds min_refresh_interval = std::chrono::seconds(10);
+    std::function<std::string()> line_prefix;
 };
 
 [[nodiscard]] LoadProgressRendererOptions stderr_load_progress_options() noexcept;

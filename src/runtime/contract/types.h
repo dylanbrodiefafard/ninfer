@@ -52,8 +52,9 @@ struct BatchedGeneratedRound {
 struct PrefillStepResult {
     BeginSummary summary;
     GeneratedRound round;
-    bool complete            = false;
-    bool host_input_consumed = false;
+    std::uint32_t processed_prompt_tokens = 0;
+    bool complete                         = false;
+    bool host_input_consumed              = false;
 };
 
 struct RoundBudget {

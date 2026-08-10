@@ -1332,9 +1332,10 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
     RequestControl::Prefill& staged = *request.prefill;
     const runtime::BeginSummary summary{.prompt_tokens        = staged.prompt_tokens,
                                         .reused_prompt_tokens = staged.base};
-    bool host_input_consumed           = staged.host_input_consumed_pending;
-    staged.host_input_consumed_pending = false;
-    const auto started                 = Clock::now();
+    bool host_input_consumed              = staged.host_input_consumed_pending;
+    staged.host_input_consumed_pending    = false;
+    std::uint32_t processed_prompt_tokens = 0;
+    const auto started                    = Clock::now();
     try {
         schedule::PrefillContext schedule_state{
             {device, model, work, decoder->linear_attention, io, prefill_hidden, prefill_chunk,
@@ -1405,6 +1406,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (result.processed_tokens == 0 || result.processed_tokens > nominal) {
                 throw std::logic_error("ordinary prefill chunk made invalid progress");
             }
+            processed_prompt_tokens = result.processed_tokens;
             if (staged.vision && staged.vision->release_consumed_media_payload()) {
                 host_input_consumed = true;
             }
@@ -1423,7 +1425,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 }
                 staged.elapsed_seconds +=
                     std::chrono::duration<double>(Clock::now() - started).count();
-                return runtime::PrefillStepResult{.summary             = summary,
+                return runtime::PrefillStepResult{.summary = summary,
+                                                  .processed_prompt_tokens =
+                                                      processed_prompt_tokens,
                                                   .host_input_consumed = host_input_consumed};
             }
             if (staged.cursor != staged.prompt_tokens) {
@@ -1515,10 +1519,11 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                                              .produced      = 1};
         request.lifecycle = Lifecycle::Pending;
         return runtime::PrefillStepResult{
-            .summary  = summary,
-            .round    = runtime::GeneratedRound{.tokens = std::span<const TokenId>(host_tokens, 1)},
-            .complete = true,
-            .host_input_consumed = host_input_consumed,
+            .summary = summary,
+            .round   = runtime::GeneratedRound{.tokens = std::span<const TokenId>(host_tokens, 1)},
+            .processed_prompt_tokens = processed_prompt_tokens,
+            .complete                = true,
+            .host_input_consumed     = host_input_consumed,
         };
     } catch (...) {
         try {

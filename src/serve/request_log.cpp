@@ -1,13 +1,14 @@
 #include "serve/request_log.h"
 #include "product/speculative_options.h"
+#include "serve/console_log.h"
 
 #include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <iomanip>
-#include <iostream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -229,7 +230,7 @@ std::string format_request_start(const RequestLogContext& context) {
         << " tool_choice=" << tool_choice_name(context.tool_choice)
         << " tool_history=" << (context.has_tool_history ? "yes" : "no")
         << " thinking=" << (context.enable_thinking ? "on" : "off") << " sampler=["
-        << sampler_str(context.sampling) << "] \xE2\x86\x92 running";
+        << sampler_str(context.sampling) << "] \xE2\x86\x92 submitted";
     return out.str();
 }
 
@@ -240,6 +241,8 @@ std::string format_request_done(const RequestLogContext& context,
     // Prefill emits the first token; the remaining (gen - 1) come from decode.
     const double decode_tokens =
         outcome.completion_tokens > 0 ? static_cast<double>(outcome.completion_tokens - 1) : 0.0;
+    const double computed_prefill_tokens = static_cast<double>(
+        std::max(0, outcome.prompt_tokens - static_cast<int>(metrics.prefix_cache_hit_tokens)));
 
     std::ostringstream out;
     out << "[req " << context.id << "] done finish="
@@ -248,7 +251,7 @@ std::string format_request_done(const RequestLogContext& context,
     out << " prompt=" << outcome.prompt_tokens << " gen=" << outcome.completion_tokens
         << " cache=" << metrics.prefix_cache_hit_tokens << " ttft=" << std::fixed
         << std::setprecision(0) << ttft_ms << "ms"
-        << " prefill=" << rate(static_cast<double>(outcome.prompt_tokens), metrics.prefill_seconds)
+        << " prefill=" << rate(computed_prefill_tokens, metrics.prefill_seconds)
         << " decode=" << rate(decode_tokens, metrics.decode_seconds)
         << " wall=" << seconds_str(metrics.total_seconds)
         << " speculative=" << speculative_str(metrics);
@@ -258,6 +261,32 @@ std::string format_request_done(const RequestLogContext& context,
 std::string format_request_error(const RequestLogContext& context, const std::string& message) {
     std::ostringstream out;
     out << "[req " << context.id << "] error " << message;
+    return out.str();
+}
+
+std::string format_throughput(const ThroughputReport& report) {
+    const double prefill_rate =
+        report.interval_seconds > 0.0
+            ? static_cast<double>(report.computed_prefill_tokens) / report.interval_seconds
+            : 0.0;
+    const double decode_rate =
+        report.interval_seconds > 0.0
+            ? static_cast<double>(report.committed_decode_tokens) / report.interval_seconds
+            : 0.0;
+    std::ostringstream out;
+    out << "throughput interval=" << std::fixed << std::setprecision(3) << report.interval_seconds
+        << "s prefill=" << std::setprecision(1) << prefill_rate << "tok/s decode=" << decode_rate
+        << "tok/s running=" << report.scheduler.running_requests
+        << " prefilling=" << report.scheduler.prefilling_requests
+        << " decode_ready=" << report.scheduler.decode_ready_requests
+        << " waiting=" << report.scheduler.waiting_requests << " avg_decode_batch=";
+    if (report.decode_rounds == 0) {
+        out << "n/a";
+    } else {
+        out << std::setprecision(2)
+            << static_cast<double>(report.decode_row_rounds) /
+                   static_cast<double>(report.decode_rounds);
+    }
     return out.str();
 }
 
@@ -300,6 +329,7 @@ std::string format_server_start_json(const std::string& server_instance_id, std:
           {"max_pending_requests", options.max_pending_requests},
           {"pending_timeout_ms", options.pending_timeout_ms},
           {"prefill_chunk", options.prefill_chunk},
+          {"log_stats_interval_ms", options.log_stats_interval_ms},
           {"kv_cache", kv_cache_name(options.kv_cache)},
           {"vision", options.enable_vision},
           {"cuda_graph", options.use_cuda_graph},
@@ -345,13 +375,17 @@ std::string format_request_start_json(const std::string& server_instance_id,
 std::string format_request_done_json(const std::string& server_instance_id, std::uint64_t timestamp,
                                      const RequestLogContext& context,
                                      const GenerationOutcome& outcome) {
-    Json record               = event_base(server_instance_id, timestamp, "request_done");
-    record["request"]         = request_json(context);
-    record["result"]          = Json{{"finish_reason", finish_reason_name(outcome.finish_reason)},
-                                     {"prompt_tokens", outcome.prompt_tokens},
-                                     {"completion_tokens", outcome.completion_tokens},
-                                     {"prefix_cache_hit_tokens", outcome.metrics.prefix_cache_hit_tokens},
-                                     {"tool_call_count", outcome.tool_calls.size()}};
+    Json record       = event_base(server_instance_id, timestamp, "request_done");
+    record["request"] = request_json(context);
+    record["result"] =
+        Json{{"finish_reason", finish_reason_name(outcome.finish_reason)},
+             {"prompt_tokens", outcome.prompt_tokens},
+             {"completion_tokens", outcome.completion_tokens},
+             {"computed_prefill_tokens",
+              std::max(0, outcome.prompt_tokens -
+                              static_cast<int>(outcome.metrics.prefix_cache_hit_tokens))},
+             {"prefix_cache_hit_tokens", outcome.metrics.prefix_cache_hit_tokens},
+             {"tool_call_count", outcome.tool_calls.size()}};
     record["timings_seconds"] = Json{
         {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},
         {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},
@@ -366,6 +400,37 @@ std::string format_request_error_json(const std::string& server_instance_id,
     Json record       = event_base(server_instance_id, timestamp, "request_error");
     record["request"] = request_json(context);
     record["error"]   = Json{{"message", message}};
+    return record.dump();
+}
+
+std::string format_throughput_json(const std::string& server_instance_id, std::uint64_t timestamp,
+                                   const ThroughputReport& report) {
+    Json record = event_base(server_instance_id, timestamp, "throughput");
+    const double prefill_rate =
+        report.interval_seconds > 0.0
+            ? static_cast<double>(report.computed_prefill_tokens) / report.interval_seconds
+            : 0.0;
+    const double decode_rate =
+        report.interval_seconds > 0.0
+            ? static_cast<double>(report.committed_decode_tokens) / report.interval_seconds
+            : 0.0;
+    Json average_batch = nullptr;
+    if (report.decode_rounds != 0) {
+        average_batch = static_cast<double>(report.decode_row_rounds) /
+                        static_cast<double>(report.decode_rounds);
+    }
+    record["interval_seconds"] = report.interval_seconds;
+    record["tokens"]           = Json{{"computed_prefill", report.computed_prefill_tokens},
+                                      {"committed_decode", report.committed_decode_tokens}};
+    record["throughput_tokens_per_second"] =
+        Json{{"prefill", prefill_rate}, {"decode", decode_rate}};
+    record["scheduler"]    = Json{{"running", report.scheduler.running_requests},
+                                  {"prefilling", report.scheduler.prefilling_requests},
+                                  {"decode_ready", report.scheduler.decode_ready_requests},
+                                  {"waiting", report.scheduler.waiting_requests}};
+    record["decode_batch"] = Json{{"rounds", report.decode_rounds},
+                                  {"row_rounds", report.decode_row_rounds},
+                                  {"average_size", std::move(average_batch)}};
     return record.dump();
 }
 
@@ -437,6 +502,11 @@ void JsonlRequestLog::write_request_error(const RequestLogContext& context,
     append(format_request_error_json(server_instance_id_, unix_time_ms(), context, message));
 }
 
+void JsonlRequestLog::write_throughput(const ThroughputReport& report) {
+    if (!enabled()) { return; }
+    append(format_throughput_json(server_instance_id_, unix_time_ms(), report));
+}
+
 void JsonlRequestLog::append(std::string record) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (failed_) { return; }
@@ -444,7 +514,7 @@ void JsonlRequestLog::append(std::string record) {
     output_.flush();
     if (!output_) {
         failed_ = true;
-        std::cerr << "ninfer-serve: request JSONL logging failed for " << path_ << '\n';
+        write_console_log(ConsoleLogLevel::Error, "request JSONL logging failed for " + path_);
     }
 }
 

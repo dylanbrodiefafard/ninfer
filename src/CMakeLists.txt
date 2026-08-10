@@ -295,6 +295,7 @@ if(NINFER_BUILD_SERVE)
     serve/anthropic_schema.cpp
     serve/tool_call_parser.cpp
     serve/translate.cpp
+    serve/console_log.cpp
     serve/generation_service.cpp
     serve/request_log.cpp
     serve/http_server.cpp

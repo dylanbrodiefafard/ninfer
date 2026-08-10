@@ -120,8 +120,9 @@ void LoadProgressRenderer::update(std::string_view phase, std::uint64_t done, st
 
 void LoadProgressRenderer::render(std::uint64_t done, std::uint64_t total, Clock::time_point now,
                                   bool final) {
-    const double elapsed   = std::chrono::duration<double>(now - phase_started_).count();
-    const std::string line = format_line(phase_, done, total, elapsed);
+    const double elapsed     = std::chrono::duration<double>(now - phase_started_).count();
+    const std::string prefix = options_.line_prefix ? options_.line_prefix() : std::string{};
+    const std::string line   = prefix + format_line(phase_, done, total, elapsed);
 
     if (options_.mode == LoadProgressOutputMode::Interactive) {
         *output_ << '\r' << line;

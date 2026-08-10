@@ -7,9 +7,12 @@
 #include <httplib.h>
 
 #include <atomic>
+#include <condition_variable>
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <thread>
 
 namespace ninfer::serve {
 
@@ -32,19 +35,24 @@ private:
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
 
-    // Writes one console line ("ninfer-serve: <line>") under log_mutex_ so lines from
-    // the httplib thread pool and streaming worker threads never interleave.
+    // The process-wide console logger serializes lines from request and reporter threads.
     void log_line(const std::string& line);
     void log_request_start(const RequestLogContext& context);
     void log_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
     void log_request_error(const RequestLogContext& context, const std::string& message);
+    void log_throughput(const ThroughputReport& report);
+    void run_stats_reporter();
+    void stop_stats_reporter();
 
     GenerationService* service_ = nullptr;
     ServeOptions options_;
     JsonlRequestLog request_jsonl_;
     httplib::Server server_;
     std::atomic<std::uint64_t> request_seq_{0};
-    std::mutex log_mutex_;
+    std::mutex stats_mutex_;
+    std::condition_variable stats_cv_;
+    std::thread stats_thread_;
+    bool stats_stopping_ = false;
 };
 
 } // namespace ninfer::serve

@@ -160,6 +160,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
+| `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--device N` | CUDA device index | `0` |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
@@ -194,7 +195,7 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v4 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v5 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance.
 
@@ -202,8 +203,9 @@ that server instance.
 |---|---|
 | `server_start` | target/weights identity and artifact, resolved Engine and sampler configuration, weights/sequence/workspace/request-transient arenas, CUDA Graph allowance, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, thinking mode, output budget, stream/message/tool shape |
-| `request_done` | finish reason, prompt/completion/cache tokens, unrounded phase seconds, and complete speculative-decoding counters |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, unrounded phase seconds, and complete speculative-decoding counters |
 | `request_error` | the resolved request configuration and generation error message |
+| `throughput` | interval token deltas and rates, scheduler occupancy, and decode-round batch statistics |
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
@@ -212,9 +214,20 @@ derived downstream from raw token counts and seconds instead of rounded stderr s
 
 The JSONL file contains no generated response text and never records an API-key value; `argv`
 replaces that value with `<redacted>`. The existing stderr summaries remain available for operators
-but are rounded and are not the aggregation source. Structured request events cover successfully
+but are rounded and are not the aggregation source. Console lines use local
+`[YYYY-MM-DD HH:MM:SS.mmm] [level]` timestamps. Structured request events cover successfully
 prepared OpenAI/Anthropic generation requests and errors during their generation; schema rejection
 and token-count-only calls are not measurement requests and do not receive request IDs.
+
+By default the server also reports aggregate activity every five seconds. `prefill` counts prompt
+suffix tokens actually computed during the interval, excluding prefix-cache hits; `decode` counts
+tokens finally committed by decode rounds, excluding the first token produced by prefill. For MTP
+and DFlash this is the accepted committed output, not draft or rejected tokens.
+`avg_decode_batch` is decode row-rounds divided by decode rounds during the same interval. The
+`running`, `prefilling`, `decode_ready`, and `waiting` fields are the Engine scheduler snapshot at
+the end of the interval. Fully idle zero intervals are omitted. The JSONL `throughput` event keeps
+the raw token and round deltas as well as derived rates; downstream measurement should prefer those
+raw values.
 
 ## Execution behavior
 

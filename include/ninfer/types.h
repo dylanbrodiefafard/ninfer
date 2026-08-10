@@ -282,6 +282,22 @@ struct MemorySummary {
     std::size_t kv_payload_bytes             = 0;
 };
 
+// Monotonic execution counters plus one boundary-consistent scheduler snapshot. Consumers derive
+// interval throughput by subtracting two snapshots and dividing by their own monotonic wall time.
+struct RuntimeStats {
+    // Actual prompt tokens evaluated by prefill; resident prefix hits are excluded.
+    std::uint64_t computed_prefill_tokens = 0;
+    // Tokens committed by decode rounds; the first token emitted by prefill is excluded.
+    std::uint64_t committed_decode_tokens = 0;
+    // Decode batch executions and the sum of their batch sizes.
+    std::uint64_t decode_rounds         = 0;
+    std::uint64_t decode_row_rounds     = 0;
+    std::uint32_t running_requests      = 0;
+    std::uint32_t prefilling_requests   = 0;
+    std::uint32_t decode_ready_requests = 0;
+    std::uint32_t waiting_requests      = 0;
+};
+
 struct LoadSummary {
     std::string target;
     std::string weights_id;

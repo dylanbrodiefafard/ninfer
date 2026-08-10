@@ -164,6 +164,11 @@ public:
         return out;
     }
 
+    [[nodiscard]] RuntimeStats runtime_stats() const {
+        std::lock_guard lock(stats_mutex_);
+        return published_stats_;
+    }
+
     void reset_memory_peaks() noexcept {
         try {
             std::scoped_lock lock(execution_mutex_);
@@ -173,6 +178,22 @@ public:
     }
 
 private:
+    void publish_runtime_stats() {
+        RuntimeStats snapshot = cumulative_stats_;
+        {
+            std::lock_guard lock(queue_mutex_);
+            snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
+        }
+        snapshot.prefilling_requests = prefill_lane_.has_value() ? 1U : 0U;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (slots_[lane] == nullptr) { continue; }
+            ++snapshot.running_requests;
+            if (slots_[lane]->decode_ready) { ++snapshot.decode_ready_requests; }
+        }
+        std::lock_guard lock(stats_mutex_);
+        published_stats_ = snapshot;
+    }
+
     GenerationResult wait_for_request(std::shared_ptr<Request> request, OutputSink* sink,
                                       const CancellationView& cancellation) {
         struct ConsumerGuard {
@@ -443,6 +464,7 @@ private:
 
     void
     cancel_active_requests(const std::array<bool, kMaximumConcurrency>& cancelled_at_boundary) {
+        bool changed = false;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = slots_[lane];
             if (request == nullptr || !cancelled_at_boundary[lane]) { continue; }
@@ -453,7 +475,9 @@ private:
             }
             complete_cancelled(request);
             remove_completed_slot(lane);
+            changed = true;
         }
+        if (changed) { publish_runtime_stats(); }
     }
 
     [[nodiscard]] bool expire_pending_requests() {
@@ -483,6 +507,7 @@ private:
                                         RequestErrorKind::QueueTimeout,
                                         "inference request expired while waiting for admission")));
         }
+        if (!cancelled.empty() || !expired.empty()) { publish_runtime_stats(); }
         return have_pending;
     }
 
@@ -503,6 +528,7 @@ private:
 
     void resolve_prefill_step(const std::shared_ptr<Request>& request,
                               const PrefillStepResult& step, bool cancel_at_boundary) {
+        cumulative_stats_.computed_prefill_tokens += step.processed_prompt_tokens;
         if (step.host_input_consumed || step.complete) { request->host_input.reset(); }
         if (cancel_at_boundary) {
             if (!request->lane) { throw std::logic_error("cancelled prefill has no request lane"); }
@@ -543,6 +569,7 @@ private:
         const PrefillStepResult step  = instance_.program->advance_prefill_lane(lane);
         const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
         resolve_prefill_step(request, step, cancel_at_boundary);
+        publish_runtime_stats();
     }
 
     void plan_fifo_head(const std::shared_ptr<Request>& request) {
@@ -604,6 +631,7 @@ private:
             }
             invalidate_admission_plans();
             complete_error(request, std::current_exception());
+            publish_runtime_stats();
             return AdmissionProgress::ControlProgress;
         }
         if (Clock::now() >= request->deadline) {
@@ -615,6 +643,7 @@ private:
             complete_error(request, std::make_exception_ptr(RequestError(
                                         RequestErrorKind::QueueTimeout,
                                         "inference request expired while waiting for admission")));
+            publish_runtime_stats();
             return AdmissionProgress::ControlProgress;
         }
         if (request->cancelled.load(std::memory_order_acquire)) {
@@ -624,6 +653,7 @@ private:
             }
             invalidate_admission_plans();
             complete_cancelled(request);
+            publish_runtime_stats();
             return AdmissionProgress::ControlProgress;
         }
         if (!selected_lane) { return AdmissionProgress::None; }
@@ -655,6 +685,7 @@ private:
         }
         if (request->cancelled.load(std::memory_order_acquire)) {
             complete_cancelled(request);
+            publish_runtime_stats();
             return AdmissionProgress::ControlProgress;
         }
 
@@ -675,6 +706,7 @@ private:
                 prefill_lane_ = lane;
                 transient     = instance_.request_memory.region();
             }
+            publish_runtime_stats();
             target_started                = true;
             const PrefillStepResult first = instance_.program->start_prefill_lane(
                 lane, std::move(request->prompt), std::move(selected_plan), transient);
@@ -683,6 +715,7 @@ private:
             }
             const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
             resolve_prefill_step(request, first, cancel_at_boundary);
+            publish_runtime_stats();
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
             if (target_started) { instance_.program->abort_lane(lane); }
@@ -771,6 +804,12 @@ private:
                 remove_completed_slot(lane);
             }
         }
+        ++cumulative_stats_.decode_rounds;
+        cumulative_stats_.decode_row_rounds += lanes.size();
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            if (!cancelled[row]) { cumulative_stats_.committed_decode_tokens += accepted[row]; }
+        }
+        publish_runtime_stats();
     }
 
     void fail_all(std::exception_ptr error) noexcept {
@@ -794,6 +833,7 @@ private:
             }
         }
         for (const auto& request : pending) { complete_error(request, error); }
+        publish_runtime_stats();
     }
 
     void worker_loop() noexcept {
@@ -865,7 +905,8 @@ private:
     const std::chrono::milliseconds pending_timeout_;
 
     mutable std::mutex execution_mutex_;
-    std::mutex queue_mutex_;
+    mutable std::mutex queue_mutex_;
+    mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;
     std::deque<std::shared_ptr<Request>> pending_;
     std::size_t outstanding_ = 0;
@@ -874,6 +915,8 @@ private:
     std::shared_ptr<Request> planned_request_;
     std::optional<BasePlan> admission_base_plan_;
     std::array<std::optional<Plan>, kMaximumConcurrency> admission_plans_{};
+    RuntimeStats cumulative_stats_;
+    RuntimeStats published_stats_;
     bool stopping_ = false;
     bool failed_   = false;
     std::thread worker_;
