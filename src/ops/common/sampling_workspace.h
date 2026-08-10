@@ -102,7 +102,10 @@ inline SamplingWorkspaceLayout make_sampling_workspace_layout(std::int32_t token
     out.group_done = layout.add_tensor(DType::I32, {columns}, 256, "sampling group counters");
     out.speculative_finalize_count =
         layout.add_tensor(DType::I32, {1}, 256, "sampling speculative finalize counter");
-    out.bytes = layout.finish(1, "sampling workspace");
+    // Speculative acceptance replicates this complete layout once per batch row. Preserve the
+    // strongest member alignment in the row stride so every replicated partial-key array remains
+    // correctly aligned.
+    out.bytes = layout.finish(256, "sampling workspace");
     return out;
 }
 

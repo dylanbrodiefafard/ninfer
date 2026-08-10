@@ -274,6 +274,74 @@ int deterministic_sampling_case() {
                                token_counts, expected);
 }
 
+int batched_sampling_workspace_stride_case() {
+    constexpr int physical_rows = 257;
+    constexpr int token_domain  = 257;
+    constexpr int k             = 3;
+    constexpr int batch         = 2;
+    constexpr int columns       = k + 1;
+
+    const std::vector<std::int32_t> drafts{10, 11, 12, 30, 31, 32};
+    const std::vector<std::int32_t> winners{10, 20, 21, 22, 30, 31, 32, 33};
+    std::vector<std::uint16_t> logits(static_cast<std::size_t>(physical_rows) * columns * batch,
+                                      f32_to_bf16(-20.0f));
+    for (int row = 0; row < batch; ++row) {
+        for (int col = 0; col < columns; ++col) {
+            const std::size_t base =
+                (static_cast<std::size_t>(row) * columns + col) * physical_rows;
+            logits[base + static_cast<std::size_t>(winners[row * columns + col])] =
+                f32_to_bf16(20.0f);
+        }
+    }
+
+    DeviceBuffer d_targets = to_device(winners);
+    DeviceBuffer d_logits  = to_device(logits);
+    DeviceBuffer d_drafts  = to_device(drafts);
+    DeviceBuffer d_extents = to_device<std::int32_t>({k, k});
+    DeviceBuffer d_lengths = to_device<std::int32_t>({100, 200});
+    DeviceBuffer d_anchors = to_device<std::int32_t>({-1, -1});
+    DeviceBuffer d_licensed(static_cast<std::size_t>(columns) * batch * sizeof(std::int32_t));
+    DeviceBuffer d_counts(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
+    DeviceBuffer d_accepted(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
+
+    ops::SamplingConfig config{};
+    config.temperature = 1.0f;
+    config.top_k       = 1;
+    const std::vector<ops::SamplingConfig> configs{config, config};
+    DeviceBuffer d_configs = to_device(configs);
+
+    Tensor targets(d_targets.p, DType::I32, {columns, batch});
+    Tensor logits_tensor(d_logits.p, DType::BF16, {physical_rows, columns, batch});
+    Tensor draft_tensor(d_drafts.p, DType::I32, {k, batch});
+    Tensor extents(d_extents.p, DType::I32, {batch});
+    Tensor lengths(d_lengths.p, DType::I32, {batch});
+    Tensor anchors(d_anchors.p, DType::I32, {batch});
+    Tensor licensed(d_licensed.p, DType::I32, {columns, batch});
+    Tensor counts(d_counts.p, DType::I32, {batch});
+    Tensor accepted(d_accepted.p, DType::I32, {batch});
+    const std::size_t workspace_bytes =
+        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, batch,
+                                                                       batch);
+    WorkspaceArena workspace(workspace_bytes);
+    ops::speculative_accept_greedy_drafts(
+        targets, logits_tensor, draft_tensor, extents, lengths, anchors, licensed, counts, accepted,
+        token_domain, static_cast<const ops::SamplingConfig*>(d_configs.p), workspace, nullptr);
+    cuda_synchronize();
+
+    int failures = verify_exact("speculative sampling B=2 licensed",
+                                from_device<std::int32_t>(d_licensed, columns * batch),
+                                {10, 20, 0, 0, 30, 31, 32, 33});
+    failures += verify_exact("speculative sampling B=2 counts",
+                             from_device<std::int32_t>(d_counts, batch), {2, 4});
+    failures += verify_exact("speculative sampling B=2 accepted",
+                             from_device<std::int32_t>(d_accepted, batch), {1, 3});
+    failures += verify_exact("speculative sampling B=2 lengths",
+                             from_device<std::int32_t>(d_lengths, batch), {102, 204});
+    failures += verify_exact("speculative sampling B=2 anchors",
+                             from_device<std::int32_t>(d_anchors, batch), {20, 33});
+    return failures;
+}
+
 int select_hidden_case(int rows, int columns, int accepted_value) {
     std::vector<std::uint16_t> hidden(static_cast<std::size_t>(rows) * columns);
     for (int col = 0; col < columns; ++col) {
@@ -372,6 +440,7 @@ int main() {
     failures += greedy_accept_case(5, 5);
     failures += greedy_accept_case(15, 7, 257);
     failures += deterministic_sampling_case();
+    failures += batched_sampling_workspace_stride_case();
     failures += select_hidden_case(5120, 6, 0);
     failures += select_hidden_case(5120, 6, 5);
     failures += select_hidden_case(2048, 16, 7);
