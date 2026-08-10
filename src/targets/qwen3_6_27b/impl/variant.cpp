@@ -59,7 +59,7 @@ std::vector<GraphExecutionProfile> Variant::ordinary_graph_profiles(std::uint32_
 
 std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t capacity,
                                                                std::uint32_t draft_window) {
-    if (draft_window == 0 || 2ULL * draft_window > capacity) { return {}; }
+    if (draft_window == 0 || capacity == 0) { return {}; }
     // Bound the final AR window E+2K at split-policy transitions until the grid reaches its cap.
     std::vector<std::uint32_t> ends;
     const auto add_shifted = [&](std::uint32_t visible_end, std::uint32_t offset) {
@@ -83,7 +83,7 @@ std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t cap
     }
     std::sort(ends.begin(), ends.end());
     ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
-    return graph_profiles_through(capacity - 2 * draft_window, ends);
+    return graph_profiles_through(capacity - 1, ends);
 }
 
 std::vector<GraphExecutionProfile> Variant::dflash_initial_graph_profiles(std::uint32_t,
@@ -162,20 +162,21 @@ void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeig
 
 void Variant::gdn_input_projection_snapshot(
     const Tensor& hidden, const GdnProjectionWeights& weights, const Tensor& conv_weight,
-    Tensor& conv_states, const Tensor& initial_slot, const Tensor& snapshot_base_slot,
-    Tensor& query, Tensor& key, Tensor& value, Tensor& output_gate, qwen3_6::TextPhase,
-    WorkspaceArena& workspace, cudaStream_t stream) {
+    Tensor& conv_states, const Tensor& valid_columns, const Tensor& initial_slot,
+    const Tensor& snapshot_base_slot, Tensor& query, Tensor& key, Tensor& value,
+    Tensor& output_gate, qwen3_6::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
     Tensor output_gate_view = output_gate.view({TextConfig::value_dim, hidden.ne[1], hidden.ne[2]});
     if (const auto* split =
             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
         ops::gdn_input_proj_conv_snapshot(hidden, split->query_key, split->value_z, conv_weight,
-                                          conv_states, Tensor{}, initial_slot, snapshot_base_slot,
-                                          query, key, value, output_gate_view, workspace, stream);
+                                          conv_states, valid_columns, initial_slot,
+                                          snapshot_base_slot, query, key, value, output_gate_view,
+                                          workspace, stream);
         return;
     }
     const Weight& fused =
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
-    ops::gdn_input_proj_conv_snapshot(hidden, fused, conv_weight, conv_states, Tensor{},
+    ops::gdn_input_proj_conv_snapshot(hidden, fused, conv_weight, conv_states, valid_columns,
                                       initial_slot, snapshot_base_slot, query, key, value,
                                       output_gate_view, text_policy(fused), workspace, stream);
 }

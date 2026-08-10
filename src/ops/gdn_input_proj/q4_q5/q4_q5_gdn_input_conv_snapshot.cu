@@ -36,14 +36,16 @@ enum class PdlOrder {
 };
 
 GdnConvSnapshotEpilogue make_epilogue(const Tensor& conv_weight, Tensor& conv_states,
-                                      const Tensor& initial_slot, const Tensor& snapshot_base_slot,
-                                      Tensor& query, Tensor& key, Tensor& value,
-                                      int global_row_offset) {
+                                      const Tensor& valid_columns, const Tensor& initial_slot,
+                                      const Tensor& snapshot_base_slot, Tensor& query, Tensor& key,
+                                      Tensor& value, int global_row_offset) {
     return {
         static_cast<const __nv_bfloat16*>(conv_weight.data),
         static_cast<__nv_bfloat16*>(conv_states.data),
         static_cast<const std::int32_t*>(initial_slot.data),
         static_cast<const std::int32_t*>(snapshot_base_slot.data),
+        valid_columns.data == nullptr ? nullptr
+                                      : static_cast<const std::int32_t*>(valid_columns.data),
         static_cast<__nv_bfloat16*>(query.data),
         static_cast<__nv_bfloat16*>(key.data),
         static_cast<__nv_bfloat16*>(value.data),
@@ -292,14 +294,15 @@ void launch_small_t(const Tensor& x, const Weight& qk_weight, const Weight& valu
 
 template <PdlOrder Order>
 void launch_snapshot(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
-                     const Tensor& conv_weight, Tensor& conv_states, const Tensor& initial_slot,
-                     const Tensor& snapshot_base_slot, Tensor& query, Tensor& key, Tensor& value,
-                     Tensor& z, cudaStream_t stream) {
-    const GdnConvSnapshotEpilogue qk_epilogue = make_epilogue(
-        conv_weight, conv_states, initial_slot, snapshot_base_slot, query, key, value, 0);
+                     const Tensor& conv_weight, Tensor& conv_states, const Tensor& valid_columns,
+                     const Tensor& initial_slot, const Tensor& snapshot_base_slot, Tensor& query,
+                     Tensor& key, Tensor& value, Tensor& z, cudaStream_t stream) {
+    const GdnConvSnapshotEpilogue qk_epilogue =
+        make_epilogue(conv_weight, conv_states, valid_columns, initial_slot, snapshot_base_slot,
+                      query, key, value, 0);
     const GdnConvSnapshotEpilogue value_epilogue =
-        make_epilogue(conv_weight, conv_states, initial_slot, snapshot_base_slot, query, key, value,
-                      kValueOffset);
+        make_epilogue(conv_weight, conv_states, valid_columns, initial_slot, snapshot_base_slot,
+                      query, key, value, kValueOffset);
 
     switch (x.ne[1]) {
     case 1:
@@ -333,23 +336,25 @@ void launch_snapshot(const Tensor& x, const Weight& qk_weight, const Weight& val
 
 void q4_q5_gdn_input_conv_snapshot_launch(const Tensor& x, const Weight& qk_weight,
                                           const Weight& value_z_weight, const Tensor& conv_weight,
-                                          Tensor& conv_states, const Tensor& initial_slot,
+                                          Tensor& conv_states, const Tensor& valid_columns,
+                                          const Tensor& initial_slot,
                                           const Tensor& snapshot_base_slot, Tensor& query,
                                           Tensor& key, Tensor& value, Tensor& z,
                                           cudaStream_t stream) {
     if (x.ne[1] == 2) {
         launch_snapshot<PdlOrder::Q4ThenQ5>(x, qk_weight, value_z_weight, conv_weight, conv_states,
-                                            initial_slot, snapshot_base_slot, query, key, value, z,
-                                            stream);
+                                            valid_columns, initial_slot, snapshot_base_slot, query,
+                                            key, value, z, stream);
     } else {
         launch_snapshot<PdlOrder::Q5ThenQ4>(x, qk_weight, value_z_weight, conv_weight, conv_states,
-                                            initial_slot, snapshot_base_slot, query, key, value, z,
-                                            stream);
+                                            valid_columns, initial_slot, snapshot_base_slot, query,
+                                            key, value, z, stream);
     }
 }
 
 void q4_q5_gdn_input_t4_post_snapshot_launch(const Tensor& projected, const Tensor& conv_weight,
-                                             Tensor& conv_states, const Tensor& initial_slot,
+                                             Tensor& conv_states, const Tensor& valid_columns,
+                                             const Tensor& initial_slot,
                                              const Tensor& snapshot_base_slot, Tensor& query,
                                              Tensor& key, Tensor& value, cudaStream_t stream) {
     if (projected.ne[1] != 4) {
@@ -358,14 +363,16 @@ void q4_q5_gdn_input_t4_post_snapshot_launch(const Tensor& projected, const Tens
     constexpr int threads = 64;
     constexpr int blocks  = (kChannels + threads - 1) / threads;
     gdn_projected_conv_snapshot_kernel<kChannels, kQueryRows, kKeyRows, kValueRows, 4>
-        <<<blocks, threads, 0, stream>>>(static_cast<const __nv_bfloat16*>(projected.data),
-                                         static_cast<const __nv_bfloat16*>(conv_weight.data),
-                                         static_cast<__nv_bfloat16*>(conv_states.data),
-                                         static_cast<const std::int32_t*>(initial_slot.data),
-                                         static_cast<const std::int32_t*>(snapshot_base_slot.data),
-                                         static_cast<__nv_bfloat16*>(query.data),
-                                         static_cast<__nv_bfloat16*>(key.data),
-                                         static_cast<__nv_bfloat16*>(value.data));
+        <<<blocks, threads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(projected.data),
+            static_cast<const __nv_bfloat16*>(conv_weight.data),
+            static_cast<__nv_bfloat16*>(conv_states.data),
+            static_cast<const std::int32_t*>(initial_slot.data),
+            static_cast<const std::int32_t*>(snapshot_base_slot.data),
+            valid_columns.data == nullptr ? nullptr
+                                          : static_cast<const std::int32_t*>(valid_columns.data),
+            static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
+            static_cast<__nv_bfloat16*>(value.data));
     CUDA_CHECK(cudaGetLastError());
 }
 

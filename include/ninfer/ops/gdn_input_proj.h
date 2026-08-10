@@ -110,7 +110,7 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  *   [12288,5120], conv_weight [10240,4], conv_states [10240,3,Slots], query/key [2048,W,B],
  *   value/z [6144,W,B], and I32 selectors [B]. B=1 accepts every positive W; B=2..8 accepts
  *   W=1..16. `valid_columns` is empty for a dense invocation or I32 [B] for a mixed-width batch.
- *   A mixed-width batch has B>=2 and every valid extent lies in [1,W].
+ *   A mixed-width invocation has B>=1 and every valid extent lies in [1,W].
  *
  * Numeric:
  *   The oracle exact-decodes packed weights and evaluates projection, convolution, SiLU, z, and

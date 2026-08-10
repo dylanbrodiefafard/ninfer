@@ -51,6 +51,9 @@ struct State {
     const qwen3_6::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
     qwen3_6::OrdinaryDecodeEgress* ordinary_host_egress         = nullptr;
     Tensor* continuation_hidden_store                           = nullptr;
+    const qwen3_6::MtpDecodeIngress* mtp_host_ingress           = nullptr;
+    qwen3_6::MtpDecodeEgress* mtp_host_egress                   = nullptr;
+    std::uint32_t mtp_proposal_extent                           = 0;
 };
 
 struct MtpGqaEnvelopes {
@@ -73,6 +76,7 @@ void configure_text_card(TextContext& card, const State& state);
                                 std::optional<std::uint32_t> snapshot_boundary, bool prepare_mtp);
 
 [[nodiscard]] PrefillChunkResult prefill_text_chunk(State& state, std::span<const TokenId> ids,
+                                                    std::uint32_t nominal_length,
                                                     std::optional<std::uint32_t> snapshot_boundary,
                                                     bool finalize_at_end);
 
@@ -108,13 +112,15 @@ void speculative_verify_and_accept(State& state, TextContext& card, std::uint32_
 void mtp_bridge_and_propose(State& state, const Tensor& next_token, const Tensor& previous_hidden,
                             std::int32_t position, std::span<const std::int32_t> rope_position,
                             bool build_proposal, const Tensor* next_embedding = nullptr);
+void mtp_bridge_multimodal(State& state, const PreparedPromptData& prompt,
+                           VisionPrefillSession& vision, const MtpBridgeInput& bridge);
 
 // Executes an exact one-token target step through the verify schedule. The resulting target hidden
 // is in io.verify_hidden[:,0], the sampled token is in io.token, and the configured Linear
 // Attention snapshot destination is the resulting state.
-void warm_capture_ordinary_round(State& state, bool align_mtp, ops::GqaExecutionEnvelope envelope,
+void warm_capture_ordinary_round(State& state, ops::GqaExecutionEnvelope envelope,
                                  const GraphPrepare& prepare, DecodeGraphDefinition& definition);
-void ordinary_round(State& state, bool align_mtp, ops::GqaExecutionEnvelope envelope,
+void ordinary_round(State& state, ops::GqaExecutionEnvelope envelope,
                     DecodeGraphExecutable* executable);
 
 // Executes one exact-B ordinary decode traversal. All request rows enter through the stable
@@ -127,13 +133,13 @@ void warm_capture_ordinary_decode_batch(State& state, std::int32_t batch_size,
 void ordinary_decode_batch(State& state, std::int32_t batch_size,
                            ops::GqaExecutionEnvelope envelope, DecodeGraphExecutable* executable);
 
-// Executes one fixed-k MTP synchronization/proposal round around the common speculative
-// verification transaction. The number of licensed tokens and their values are written to
-// io.speculative.
-void warm_capture_mtp_round(State& state, std::uint32_t k, MtpGqaEnvelopes envelopes,
-                            const GraphPrepare& prepare, DecodeGraphDefinition& definition);
-void mtp_round(State& state, std::uint32_t k, MtpGqaEnvelopes envelopes,
-               DecodeGraphExecutable* executable);
+// Executes one exact-B MTP verification/alignment/proposal transaction. Each row may carry a
+// different current and next proposal extent while the model traversal remains batched.
+void warm_capture_mtp_decode_batch(State& state, std::int32_t batch_size, std::uint32_t k,
+                                   MtpGqaEnvelopes envelopes, const GraphPrepare& prepare,
+                                   DecodeGraphDefinition& definition);
+void mtp_decode_batch(State& state, std::int32_t batch_size, std::uint32_t k,
+                      MtpGqaEnvelopes envelopes, DecodeGraphExecutable* executable);
 
 [[nodiscard]] DFlashFeatureSink
 dflash_feature_sink(State& state, DFlashFeatureSink::PrefillConsumer consume_prefill = {});

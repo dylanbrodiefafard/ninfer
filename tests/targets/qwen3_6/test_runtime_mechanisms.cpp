@@ -121,8 +121,11 @@ void test_round_layout() {
     expect(round.verify_hidden.region.offset < exact_prefill.region.offset &&
                exact_prefill.region.offset < round.speculative.target_argmax.region.offset,
            "exact prefill extension retains established round-region order");
-    expect(round.mtp.has_value() && round.mtp->alignment_ids.shape[0] == 6,
-           "MTP round extension is explicit");
+    expect(round.mtp.has_value() && round.mtp->position.shape[0] == 1,
+           "MTP prefill scratch is explicit");
+    expect(round.mtp_decode.has_value() && round.mtp_decode->alignment_ids.shape[0] == 6 &&
+               round.mtp_decode->alignment_ids.shape[1] == 1,
+           "MTP decode frame is explicit");
 
     ninfer::LayoutBuilder speculative_builder;
     q36::RoundStateLayout speculative = q36::begin_round_state_layout(
@@ -133,7 +136,7 @@ void test_round_layout() {
     (void)speculative_builder.finish(256);
     expect(speculative.logits.shape[1] == 16 &&
                speculative.speculative.draft_tokens.shape[0] == 15 &&
-               speculative.speculative.stats.shape[0] == 19,
+               speculative.speculative.current_proposal_extent.shape[0] == 1,
            "K=15 shared speculative geometry");
     expect(!speculative.mtp.has_value(), "shared speculative state does not imply MTP state");
 }

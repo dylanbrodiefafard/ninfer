@@ -93,7 +93,7 @@ void require_snapshot_operands(const Tensor& conv_weight, const Tensor& conv_sta
         throw std::invalid_argument("gdn_input_proj_conv_snapshot: invalid state selector");
     }
     if (valid_columns.data != nullptr) {
-        if (geometry.batch == 1 || !valid_selector(valid_columns)) {
+        if (!valid_selector(valid_columns)) {
             throw std::invalid_argument("gdn_input_proj_conv_snapshot: invalid valid columns");
         }
     }
@@ -322,7 +322,7 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
                                      });
             return;
         }
-        detail::nvfp4_gdn_snapshot_dispatch(x, weight, conv_weight, conv_states,
+        detail::nvfp4_gdn_snapshot_dispatch(x, weight, conv_weight, conv_states, valid_columns,
                                             initial_state_slots, snapshot_base_slots, query, key,
                                             value, z, policy, workspace, stream);
         return;
@@ -357,15 +357,15 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
 
     const SnapshotRoute route = resolve_snapshot_route(false, geometry.width);
     if (route.w8_schedule == detail::W8GdnInputSnapshotScheduleId::DecodeFused) {
-        detail::w8_gdn_input_decode_conv_snapshot_launch(x, weight, conv_weight, conv_states,
-                                                         initial_state_slots, snapshot_base_slots,
-                                                         query, key, value, z, stream);
+        detail::w8_gdn_input_decode_conv_snapshot_launch(
+            x, weight, conv_weight, conv_states, valid_columns, initial_state_slots,
+            snapshot_base_slots, query, key, value, z, stream);
         return;
     }
     if (route.w8_schedule == detail::W8GdnInputSnapshotScheduleId::SplitKMmaFused) {
-        detail::w8_gdn_input_splitk_conv_snapshot_launch(x, weight, conv_weight, conv_states,
-                                                         initial_state_slots, snapshot_base_slots,
-                                                         query, key, value, z, stream);
+        detail::w8_gdn_input_splitk_conv_snapshot_launch(
+            x, weight, conv_weight, conv_states, valid_columns, initial_state_slots,
+            snapshot_base_slots, query, key, value, z, stream);
         return;
     }
 
@@ -373,7 +373,7 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
     SnapshotWorkspace scratch =
         allocate_snapshot_workspace(workspace, kChannels, geometry.width, route.workspace);
     gdn_input_proj(x, weight, scratch.projected, z, stream);
-    causal_conv1d_silu_snapshot(scratch.projected, conv_weight, conv_states, Tensor{},
+    causal_conv1d_silu_snapshot(scratch.projected, conv_weight, conv_states, valid_columns,
                                 initial_state_slots, snapshot_base_slots, scratch.convolved,
                                 stream);
     extract_bf16_columns(scratch.convolved, 0, query, stream);
@@ -538,8 +538,8 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
     const SnapshotRoute route = resolve_snapshot_route(true, geometry.width);
     if (route.workspace == SnapshotWorkspaceKind::None) {
         detail::q4_q5_gdn_input_conv_snapshot_launch(
-            x, qk_weight, value_z_weight, conv_weight, conv_states, initial_state_slots,
-            snapshot_base_slots, query, key, value, z, stream);
+            x, qk_weight, value_z_weight, conv_weight, conv_states, valid_columns,
+            initial_state_slots, snapshot_base_slots, query, key, value, z, stream);
         return;
     }
 
@@ -548,11 +548,11 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
         allocate_snapshot_workspace(ws, kChannels, geometry.width, route.workspace);
     gdn_input_proj(x, qk_weight, value_z_weight, scratch.projected, z, stream);
     if (route.workspace == SnapshotWorkspaceKind::Projected) {
-        detail::q4_q5_gdn_input_t4_post_snapshot_launch(scratch.projected, conv_weight, conv_states,
-                                                        initial_state_slots, snapshot_base_slots,
-                                                        query, key, value, stream);
+        detail::q4_q5_gdn_input_t4_post_snapshot_launch(
+            scratch.projected, conv_weight, conv_states, valid_columns, initial_state_slots,
+            snapshot_base_slots, query, key, value, stream);
     } else {
-        causal_conv1d_silu_snapshot(scratch.projected, conv_weight, conv_states, Tensor{},
+        causal_conv1d_silu_snapshot(scratch.projected, conv_weight, conv_states, valid_columns,
                                     initial_state_slots, snapshot_base_slots, scratch.convolved,
                                     stream);
         extract_bf16_columns(scratch.convolved, 0, query, stream);

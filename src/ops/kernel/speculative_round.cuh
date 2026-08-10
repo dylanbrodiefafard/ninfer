@@ -1,7 +1,7 @@
 #pragma once
 
 // Implements: include/ninfer/ops/speculative_round.h
-// Match: contiguous scalar/vector state and BF16 verification logits.
+// Match: contiguous request-major state and BF16 verification logits.
 // Algorithm assumptions: small vocabularies use one cooperative block; the
 // registered full-vocabulary stochastic route uses the sampling partial/group
 // pipeline and caller-owned workspace, while greedy commit remains one thread.
@@ -10,25 +10,52 @@
 
 #include <cuda_bf16.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace ninfer::ops {
 
-inline constexpr int kSpeculativeAcceptedPerPositionOffset = 4;
-
-__global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* token,
+__global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anchors,
                                                          const std::int32_t* drafts,
-                                                         const std::int32_t* length,
+                                                         const std::int32_t* base_positions,
+                                                         const std::int32_t* current_extents,
                                                          std::int32_t* verify_ids,
-                                                         std::int32_t* positions, std::int32_t T) {
-    for (int i = threadIdx.x; i < T; i += blockDim.x) {
-        verify_ids[i] = i == 0 ? *token : drafts[i - 1];
-        positions[i]  = *length + i;
+                                                         std::int32_t* positions, std::int32_t k) {
+    const int row = static_cast<int>(blockIdx.y);
+    const int T   = k + 1;
+    int extent    = current_extents[row];
+    extent        = extent < 0 ? 0 : (extent > k ? k : extent);
+    for (int j = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x; j < T;
+         j += blockDim.x * gridDim.x) {
+        const int off = row * T + j;
+        verify_ids[off] =
+            j == 0 ? anchors[row] : (j <= extent ? drafts[row * k + j - 1] : anchors[row]);
+        positions[off] = base_positions[row] + (j <= extent ? j : extent);
     }
 }
 
+template <typename T>
+__device__ inline T* speculative_workspace_offset(T* ptr, std::size_t byte_offset) {
+    return ptr == nullptr
+               ? nullptr
+               : reinterpret_cast<T*>(reinterpret_cast<unsigned char*>(ptr) + byte_offset);
+}
+
+__device__ inline SamplingWorkspace
+speculative_workspace_row(SamplingWorkspace workspace, std::size_t row_stride, std::int32_t row) {
+    const std::size_t offset = static_cast<std::size_t>(row) * row_stride;
+    workspace.partial_keys   = speculative_workspace_offset(workspace.partial_keys, offset);
+    workspace.dist_idx       = speculative_workspace_offset(workspace.dist_idx, offset);
+    workspace.dist_prob      = speculative_workspace_offset(workspace.dist_prob, offset);
+    workspace.dist_support   = speculative_workspace_offset(workspace.dist_support, offset);
+    workspace.group_done     = speculative_workspace_offset(workspace.group_done, offset);
+    workspace.speculative_finalize_count =
+        speculative_workspace_offset(workspace.speculative_finalize_count, offset);
+    return workspace;
+}
+
 // Commits the round's accepted tokens plus one correction/bonus token, then
-// advances the target length scalar and acceptance stats. The greedy branch
+// advances the target length. The greedy branch
 // (config temperature <= 0) is bit-identical to the original argmax accept: keep
 // the longest draft prefix whose target argmax matches, then take the target
 // argmax at the divergence column. The sampling branch (temperature > 0) runs
@@ -42,31 +69,37 @@ __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* tok
 // block cooperates on the per-column truncated-distribution build.
 __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_drafts_kernel(
     const std::int32_t* target_tokens, const __nv_bfloat16* logits, const std::int32_t* drafts,
-    std::int32_t* length, std::int32_t* token, std::int32_t* sampled_out, std::int32_t* num_sampled,
-    std::int32_t* accepted, std::int64_t* stats, const SamplingConfig* cfg_ptr,
-    std::int32_t token_domain, std::int32_t physical_rows, std::int32_t k) {
-    const int tid            = threadIdx.x;
-    const SamplingConfig cfg = *cfg_ptr;
+    const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
+    std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
+    const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
+    std::int32_t k) {
+    const int tid                   = threadIdx.x;
+    const int row                   = static_cast<int>(blockIdx.x);
+    const int cols                  = k + 1;
+    int extent                      = current_extents[row];
+    extent                          = extent < 0 ? 0 : (extent > k ? k : extent);
+    const SamplingConfig cfg        = configs[row];
+    const std::int32_t* row_targets = target_tokens + row * cols;
+    const std::int32_t* row_drafts  = drafts + row * k;
+    std::int32_t* row_tokens        = licensed_tokens + row * cols;
+    const __nv_bfloat16* row_logits =
+        logits + static_cast<std::int64_t>(row) * cols * physical_rows;
 
     if (!(cfg.temperature > 0.0f)) {
         if (tid == 0) {
             int a = 0;
-            while (a < k && target_tokens[a] == drafts[a]) { ++a; }
-            const int t_star = target_tokens[a];
+            while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
+            const int t_star = row_targets[a];
 
-            for (int i = 0; i <= k; ++i) { sampled_out[i] = 0; }
-            for (int i = 0; i < a; ++i) { sampled_out[i] = drafts[i]; }
-            sampled_out[a] = t_star;
+            for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
+            for (int i = 0; i < a; ++i) { row_tokens[i] = row_drafts[i]; }
+            row_tokens[a] = t_star;
 
-            const int produced = a + 1;
-            *num_sampled       = produced;
-            *accepted          = a;
-            *token             = t_star;
-            *length += produced;
-            stats[0] += k;
-            stats[1] += a;
-            stats[2] += 1;
-            for (int i = 0; i < a; ++i) { stats[kSpeculativeAcceptedPerPositionOffset + i] += 1; }
+            const int produced   = a + 1;
+            licensed_counts[row] = produced;
+            accepted[row]        = a;
+            anchors[row]         = t_star;
+            lengths[row] += produced;
         }
         return;
     }
@@ -87,32 +120,32 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     const int partial_blocks = div_up(token_domain, kSamplerPartialTileItems);
     const int group_count    = sampler_group_count(partial_blocks);
     // No-op when the scratch/group path owns this shape.
-    if (sampler_multiblock_ok(token_domain, k + 1, partial_blocks, group_count)) { return; }
+    if (sampler_multiblock_ok(token_domain, cols, partial_blocks, group_count)) { return; }
 
     if (tid == 0) {
         a_sh     = 0;
         done_sh  = 0;
         tstar_sh = 0;
-        L_sh     = *length;
+        L_sh     = lengths[row];
     }
     __syncthreads();
 
-    for (int i = 0; i <= k; ++i) {
+    for (int i = 0; i <= extent; ++i) {
         // Column i is only reached when drafts[0..i-1] were all accepted, so the
         // round-local penalty overlay for this column is exactly those i drafts.
         const std::int64_t base = static_cast<std::int64_t>(i) * physical_rows;
         if (token_domain <= kSamplerTileItems) {
-            sampling_build_truncated_small(logits, base, token_domain, cfg, red_val, red_idx,
-                                           cand_val, cand_idx, prob, &n_support, drafts, i);
+            sampling_build_truncated_small(row_logits, base, token_domain, cfg, red_val, red_idx,
+                                           cand_val, cand_idx, prob, &n_support, row_drafts, i);
         } else {
-            sampling_build_truncated_block_fast(logits, base, token_domain, cfg, merge_val,
+            sampling_build_truncated_block_fast(row_logits, base, token_domain, cfg, merge_val,
                                                 merge_idx, cand_val, cand_idx, prob, &n_support,
-                                                drafts, i);
+                                                row_drafts, i);
         }
         if (tid == 0 && done_sh == 0) {
             const int L = L_sh;
-            if (i < k) {
-                const int d = drafts[i];
+            if (i < extent) {
+                const int d = row_drafts[i];
                 float pd    = 0.0f;
                 for (int j = 0; j < n_support; ++j) {
                     if (cand_idx[j] == d) {
@@ -133,7 +166,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
             } else {
                 // Every draft accepted: bonus token from the last verify column.
                 const float u =
-                    sampling_uniform(cfg.seed, L + k + 1, kSamplePurposeSpeculativeBonus, 0u);
+                    sampling_uniform(cfg.seed, L + extent + 1, kSamplePurposeSpeculativeBonus, 0u);
                 tstar_sh = sampling_pick_from_support(cand_idx, prob, n_support, -1, u);
                 done_sh  = 1;
             }
@@ -147,32 +180,35 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
         const int tstar = tstar_sh;
         const int L     = L_sh;
 
-        for (int i = 0; i <= k; ++i) { sampled_out[i] = 0; }
-        for (int i = 0; i < a; ++i) { sampled_out[i] = drafts[i]; }
-        sampled_out[a] = tstar;
+        for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
+        for (int i = 0; i < a; ++i) { row_tokens[i] = row_drafts[i]; }
+        row_tokens[a] = tstar;
 
-        const int produced = a + 1;
-        *num_sampled       = produced;
-        *accepted          = a;
-        *token             = tstar;
-        *length            = L + produced;
-        stats[0] += k;
-        stats[1] += a;
-        stats[2] += 1;
-        for (int i = 0; i < a; ++i) { stats[kSpeculativeAcceptedPerPositionOffset + i] += 1; }
+        const int produced   = a + 1;
+        licensed_counts[row] = produced;
+        accepted[row]        = a;
+        anchors[row]         = tstar;
+        lengths[row]         = L + produced;
         if (cfg.token_counts != nullptr) {
-            for (int i = 0; i < produced; ++i) { atomicAdd(&cfg.token_counts[sampled_out[i]], 1); }
+            for (int i = 0; i < produced; ++i) { atomicAdd(&cfg.token_counts[row_tokens[i]], 1); }
         }
     }
 }
 
 __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_topk_kernel(
-    const __nv_bfloat16* logits, const std::int32_t* drafts, const SamplingConfig* cfg_ptr,
-    std::int32_t token_domain, std::int32_t physical_rows, SamplingWorkspace workspace) {
-    const int col            = static_cast<int>(blockIdx.y);
-    const int partial        = static_cast<int>(blockIdx.x);
-    const SamplingConfig cfg = *cfg_ptr;
+    const __nv_bfloat16* logits, const std::int32_t* drafts, const std::int32_t* current_extents,
+    const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
+    std::int32_t cols, std::int32_t k, SamplingWorkspace workspace,
+    std::size_t workspace_row_stride) {
+    const int row     = static_cast<int>(blockIdx.z);
+    const int col     = static_cast<int>(blockIdx.y);
+    const int partial = static_cast<int>(blockIdx.x);
+    int extent        = current_extents[row];
+    extent            = extent < 0 ? 0 : (extent > k ? k : extent);
+    if (col > extent) { return; }
+    const SamplingConfig cfg = configs[row];
     if (!(cfg.temperature > 0.0f) || token_domain <= kSamplerTileItems) { return; }
+    workspace = speculative_workspace_row(workspace, workspace_row_stride, row);
     if (partial == 0 && threadIdx.x == 0) {
         workspace.group_done[col] = 0;
         if (col == 0) { *workspace.speculative_finalize_count = 0; }
@@ -181,9 +217,10 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     __shared__ typename SamplingPartialSort::TempStorage sort_storage;
     unsigned long long keys[kSamplerItemsPerThread];
 
-    const int cap           = sampling_candidate_cap(cfg, token_domain);
-    const std::int64_t base = static_cast<std::int64_t>(col) * physical_rows;
-    const int tile_start    = partial * kSamplerPartialTileItems;
+    const int cap                  = sampling_candidate_cap(cfg, token_domain);
+    const std::int64_t base        = (static_cast<std::int64_t>(row) * cols + col) * physical_rows;
+    const std::int32_t* row_drafts = drafts + row * k;
+    const int tile_start           = partial * kSamplerPartialTileItems;
     // Column col's penalty overlay is the first `col` drafts (see accept loop);
     // applying it before top-k selection lets it change the candidate set, not
     // just the post-truncation probabilities.
@@ -191,9 +228,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     for (int item = 0; item < kSamplerItemsPerThread; ++item) {
         const int v = tile_start + item * blockDim.x + threadIdx.x;
         if (v < token_domain) {
-            const float x =
-                sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg, drafts, col);
-            keys[item] = sampling_sort_key(x, v);
+            const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg,
+                                                    row_drafts, col);
+            keys[item]    = sampling_sort_key(x, v);
         } else {
             keys[item] = 0ull;
         }
@@ -211,38 +248,44 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
 }
 
 __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group_finalize_kernel(
-    const std::int32_t* target_tokens, const std::int32_t* drafts, std::int32_t* length,
-    std::int32_t* token, std::int32_t* sampled_out, std::int32_t* num_sampled,
-    std::int32_t* accepted, std::int64_t* stats, const SamplingConfig* cfg_ptr,
-    std::int32_t token_domain, std::int32_t cols, std::int32_t partial_blocks,
-    std::int32_t group_count, SamplingWorkspace workspace) {
-    const int group          = static_cast<int>(blockIdx.x);
-    const int col            = static_cast<int>(blockIdx.y);
-    const int tid            = threadIdx.x;
-    const SamplingConfig cfg = *cfg_ptr;
+    const std::int32_t* target_tokens, const std::int32_t* drafts,
+    const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
+    std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
+    const SamplingConfig* configs, std::int32_t token_domain, std::int32_t cols,
+    std::int32_t partial_blocks, std::int32_t group_count, SamplingWorkspace workspace,
+    std::size_t workspace_row_stride) {
+    const int row   = static_cast<int>(blockIdx.z);
+    const int group = static_cast<int>(blockIdx.x);
+    const int col   = static_cast<int>(blockIdx.y);
+    const int tid   = threadIdx.x;
+    const int k     = cols - 1;
+    int extent      = current_extents[row];
+    extent          = extent < 0 ? 0 : (extent > k ? k : extent);
+    if (col > extent) { return; }
+    const SamplingConfig cfg        = configs[row];
+    const std::int32_t* row_targets = target_tokens + row * cols;
+    const std::int32_t* row_drafts  = drafts + row * k;
+    std::int32_t* row_tokens        = licensed_tokens + row * cols;
     if (token_domain <= kSamplerTileItems) { return; }
 
     if (!(cfg.temperature > 0.0f)) {
         if (tid == 0 && col == 0 && group == 0) {
-            const int k = cols - 1;
-            int a       = 0;
-            while (a < k && target_tokens[a] == drafts[a]) { ++a; }
-            const int t_star = target_tokens[a];
-            for (int i = 0; i <= k; ++i) { sampled_out[i] = 0; }
-            for (int i = 0; i < a; ++i) { sampled_out[i] = drafts[i]; }
-            sampled_out[a]     = t_star;
-            const int produced = a + 1;
-            *num_sampled       = produced;
-            *accepted          = a;
-            *token             = t_star;
-            *length += produced;
-            stats[0] += k;
-            stats[1] += a;
-            stats[2] += 1;
-            for (int i = 0; i < a; ++i) { stats[kSpeculativeAcceptedPerPositionOffset + i] += 1; }
+            int a = 0;
+            while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
+            const int t_star = row_targets[a];
+            for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
+            for (int i = 0; i < a; ++i) { row_tokens[i] = row_drafts[i]; }
+            row_tokens[a]        = t_star;
+            const int produced   = a + 1;
+            licensed_counts[row] = produced;
+            accepted[row]        = a;
+            anchors[row]         = t_star;
+            lengths[row] += produced;
         }
         return;
     }
+
+    workspace = speculative_workspace_row(workspace, workspace_row_stride, row);
 
     __shared__ typename SamplingGroupSort::TempStorage sort_storage;
     __shared__ float cand_val[kSamplerCandidateCap];
@@ -331,17 +374,16 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
         workspace.group_done[col] = 0;
         __threadfence();
         const int done_cols = atomicAdd(workspace.speculative_finalize_count, 1) + 1;
-        if (done_cols == cols) {
-            const int k = cols - 1;
-            const int L = *length;
+        if (done_cols == extent + 1) {
+            const int L = lengths[row];
             int a       = 0;
             int tstar   = 0;
-            for (int i = 0; i <= k; ++i) {
+            for (int i = 0; i <= extent; ++i) {
                 const int n            = workspace.dist_support[i];
                 const int* dist_idx    = workspace.dist_idx + sampling_dist_offset(i, 0);
                 const float* dist_prob = workspace.dist_prob + sampling_dist_offset(i, 0);
-                if (i < k) {
-                    const int d = drafts[i];
+                if (i < extent) {
+                    const int d = row_drafts[i];
                     float pd    = 0.0f;
                     for (int j = 0; j < n; ++j) {
                         if (dist_idx[j] == d) {
@@ -361,24 +403,20 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                     break;
                 }
                 const float u =
-                    sampling_uniform(cfg.seed, L + k + 1, kSamplePurposeSpeculativeBonus, 0u);
+                    sampling_uniform(cfg.seed, L + extent + 1, kSamplePurposeSpeculativeBonus, 0u);
                 tstar = sampling_pick_from_support(dist_idx, dist_prob, n, -1, u);
             }
-            for (int i = 0; i <= k; ++i) { sampled_out[i] = 0; }
-            for (int i = 0; i < a; ++i) { sampled_out[i] = drafts[i]; }
-            sampled_out[a]     = tstar;
-            const int produced = a + 1;
-            *num_sampled       = produced;
-            *accepted          = a;
-            *token             = tstar;
-            *length            = L + produced;
-            stats[0] += k;
-            stats[1] += a;
-            stats[2] += 1;
-            for (int i = 0; i < a; ++i) { stats[kSpeculativeAcceptedPerPositionOffset + i] += 1; }
+            for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
+            for (int i = 0; i < a; ++i) { row_tokens[i] = row_drafts[i]; }
+            row_tokens[a]        = tstar;
+            const int produced   = a + 1;
+            licensed_counts[row] = produced;
+            accepted[row]        = a;
+            anchors[row]         = tstar;
+            lengths[row]         = L + produced;
             if (cfg.token_counts != nullptr) {
                 for (int i = 0; i < produced; ++i) {
-                    atomicAdd(&cfg.token_counts[sampled_out[i]], 1);
+                    atomicAdd(&cfg.token_counts[row_tokens[i]], 1);
                 }
             }
             *workspace.speculative_finalize_count = 0;
@@ -387,14 +425,16 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
 }
 
 __global__ void speculative_select_accepted_hidden_kernel(const __nv_bfloat16* hidden,
-                                                          const std::int32_t* accepted,
+                                                          const std::int32_t* selectors,
                                                           __nv_bfloat16* out, std::int32_t rows,
                                                           std::int32_t cols) {
-    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    const int batch = static_cast<int>(blockIdx.y);
+    const int row   = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= rows) { return; }
-    const int col = *accepted;
+    const int col = selectors[batch];
     if (col < 0 || col >= cols) { return; }
-    out[row] = hidden[static_cast<std::int64_t>(col) * rows + row];
+    out[static_cast<std::int64_t>(batch) * rows + row] =
+        hidden[(static_cast<std::int64_t>(batch) * cols + col) * rows + row];
 }
 
 __global__ void proposal_remap_token_ids_kernel(std::int32_t* proposal_tokens,

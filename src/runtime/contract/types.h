@@ -46,6 +46,8 @@ struct GeneratedRound {
 
 struct BatchedGeneratedRound {
     std::span<const TokenId> tokens;
+    std::span<const std::int32_t> row_counts;
+    std::uint32_t row_stride = 1;
 };
 
 struct BeginResult {

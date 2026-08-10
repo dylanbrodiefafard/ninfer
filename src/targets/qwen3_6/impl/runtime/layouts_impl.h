@@ -384,10 +384,46 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         WorkspaceLayoutBuilder mtp_proposal;
         proposal_scratch(mtp_proposal, 1);
         const std::size_t accept = ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
-            TextConfig::token_domain, drafts, drafts);
+            TextConfig::token_domain, drafts, drafts, 1, 1);
         out.mtp_round = std::max({target_verify(verify, text_envelope), accept, finish(mtp_batch),
                                   finish(mtp_ar), finish(mtp_proposal)});
         out.ordinary_round = std::max(out.ordinary_round, finish(mtp_align));
+
+        for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
+             ++batch) {
+            const std::int32_t aggregate = batch * verify;
+            WorkspaceLayoutBuilder target;
+            matrix(target, DType::BF16, TextConfig::hidden, aggregate);
+            target_body(target, aggregate, aggregate, qwen3_6::TextPhase::Verify, true, batch,
+                        verify, verify, text_envelope);
+
+            const auto mtp_decode_core = [&](WorkspaceLayoutBuilder& layout, std::int32_t width) {
+                const std::int32_t tokens = batch * width;
+                auto core                 = layout.scope();
+                mtp_stem(layout, tokens, false);
+                (void)workspace_recipe::mtp_attention_projection<TextConfig>(layout, tokens);
+                scratch(layout,
+                        Variant::mtp_attention_projection_workspace_capacity_bytes(tokens, tokens));
+                (void)workspace_recipe::mtp_attention_results<TextConfig>(layout, tokens);
+                scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
+                                    TextConfig::query_heads, plan.kv_dtype, text_envelope, batch,
+                                    width, width));
+                (void)workspace_recipe::mtp_post_attention<TextConfig>(layout, tokens);
+                scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(tokens, tokens));
+            };
+
+            WorkspaceLayoutBuilder alignment;
+            mtp_decode_core(alignment, verify);
+            WorkspaceLayoutBuilder ar;
+            mtp_decode_core(ar, 1);
+            WorkspaceLayoutBuilder proposal;
+            proposal_scratch(proposal, batch);
+            const std::size_t batch_accept =
+                ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+                    TextConfig::token_domain, drafts, drafts, batch, batch);
+            out.mtp_round = std::max({out.mtp_round, finish(target), finish(alignment), finish(ar),
+                                      finish(proposal), batch_accept});
+        }
     }
 
     if (plan.features.dflash()) {
@@ -439,7 +475,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             out.dflash_proposal = dflash_proposal_capacity(verify);
             const std::size_t accept =
                 ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
-                    TextConfig::token_domain, drafts, drafts);
+                    TextConfig::token_domain, drafts, drafts, 1, 1);
             out.dflash_round   = std::max({target_verify(verify, text_envelope), accept,
                                            dflash_context_capacity(verify), out.dflash_proposal});
             out.ordinary_round = std::max(out.ordinary_round, dflash_context_capacity(1));
@@ -543,17 +579,12 @@ std::unique_ptr<SequencePlanImpl> plan_sequence_impl(DeviceContext& device,
         // Definitions remain per execution profile, but only one executable is instantiated for
         // each reachable node-topology class. These bounds cover the largest profile installed in
         // each class and the driver/module state materialized while qualifying all definitions.
-        impl->graph_allowance_bytes = impl->speculative_backend == SpeculativeBackend::None
-                                          ? checked_mul(12ULL * kMiB, impl->max_concurrency,
-                                                        "ordinary exact-b graph allowance")
-                                          : 12ULL * kMiB;
-        if (impl->speculative_backend == SpeculativeBackend::Mtp) {
-            impl->graph_allowance_bytes = checked_add(impl->graph_allowance_bytes, 12ULL * kMiB,
-                                                      "ordinary aligned graph allowance");
-        }
-        if (impl->speculative_backend == SpeculativeBackend::Mtp) {
+        if (impl->speculative_backend == SpeculativeBackend::None) {
+            impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
+                                                      "ordinary exact-b graph allowance");
+        } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
             const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
-            const std::size_t mtp_allowance = graph_topology_allowance(
+            const std::size_t per_batch_allowance = graph_topology_allowance(
                 profiles,
                 [&](GraphExecutionProfile profile) {
                     const std::uint64_t final_visible =
@@ -561,10 +592,11 @@ std::unique_ptr<SequencePlanImpl> plan_sequence_impl(DeviceContext& device,
                     return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
                 },
                 "MTP graph allowance");
-            impl->graph_allowance_bytes =
-                checked_add(impl->graph_allowance_bytes, mtp_allowance, "MTP graph allowance");
-        } else if (impl->speculative_backend == SpeculativeBackend::DFlash) {
-            const auto class_allowance = [&](const std::vector<GraphExecutionProfile>& profiles) {
+            impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
+                                                      "MTP exact-b graph allowance");
+        } else {
+            impl->graph_allowance_bytes = 12ULL * kMiB;
+            const auto class_allowance  = [&](const std::vector<GraphExecutionProfile>& profiles) {
                 return graph_topology_allowance(
                     profiles,
                     [&](GraphExecutionProfile profile) {

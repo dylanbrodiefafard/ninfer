@@ -16,13 +16,15 @@ void q4_q5_gdn_input_grouped_mma_launch(const Tensor& x, const Weight& qk_weight
 
 void q4_q5_gdn_input_conv_snapshot_launch(const Tensor& x, const Weight& qk_weight,
                                           const Weight& value_z_weight, const Tensor& conv_weight,
-                                          Tensor& conv_states, const Tensor& initial_slot,
+                                          Tensor& conv_states, const Tensor& valid_columns,
+                                          const Tensor& initial_slot,
                                           const Tensor& snapshot_base_slot, Tensor& query,
                                           Tensor& key, Tensor& value, Tensor& z,
                                           cudaStream_t stream);
 
 void q4_q5_gdn_input_t4_post_snapshot_launch(const Tensor& projected, const Tensor& conv_weight,
-                                             Tensor& conv_states, const Tensor& initial_slot,
+                                             Tensor& conv_states, const Tensor& valid_columns,
+                                             const Tensor& initial_slot,
                                              const Tensor& snapshot_base_slot, Tensor& query,
                                              Tensor& key, Tensor& value, cudaStream_t stream);
 

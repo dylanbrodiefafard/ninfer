@@ -15,7 +15,8 @@ template <int WarpsPerCta, int TokenTile>
 __global__ __launch_bounds__(WarpsPerCta * 32) void nvfp4_gdn_snapshot_post_kernel(
     const __nv_bfloat16* __restrict__ projected, const __nv_bfloat16* __restrict__ conv_weight,
     __nv_bfloat16* __restrict__ conv_states, const std::int32_t* __restrict__ initial_slot,
-    const std::int32_t* __restrict__ snapshot_base_slot, __nv_bfloat16* __restrict__ query,
+    const std::int32_t* __restrict__ snapshot_base_slot,
+    const std::int32_t* __restrict__ valid_columns, __nv_bfloat16* __restrict__ query,
     __nv_bfloat16* __restrict__ key, __nv_bfloat16* __restrict__ value,
     __nv_bfloat16* __restrict__ z, std::int32_t tokens) {
     static_assert((kNvfp4GdnSnapshotChannels % 32) == 0);
@@ -31,6 +32,8 @@ __global__ __launch_bounds__(WarpsPerCta * 32) void nvfp4_gdn_snapshot_post_kern
     const int lane                     = static_cast<int>(threadIdx.x) & 31;
     const int row                      = static_cast<int>(blockIdx.x) * 32 + lane;
     constexpr std::int64_t kSlotStride = static_cast<std::int64_t>(kNvfp4GdnSnapshotChannels) * 3;
+    std::int32_t valid                 = valid_columns == nullptr ? tokens : *valid_columns;
+    valid                              = valid < 0 ? 0 : (valid > tokens ? tokens : valid);
     if (warp == 0) {
         const std::int64_t initial_base = static_cast<std::int64_t>(*initial_slot) * kSlotStride;
 #pragma unroll
@@ -87,6 +90,15 @@ __global__ __launch_bounds__(WarpsPerCta * 32) void nvfp4_gdn_snapshot_post_kern
             if (token < tokens) {
                 const std::int64_t projected_base =
                     static_cast<std::int64_t>(token) * kNvfp4GdnSnapshotParentRows;
+                if (row < kNvfp4GdnSnapshotZRows) {
+                    z[static_cast<std::int64_t>(token) * kNvfp4GdnSnapshotZRows + row] =
+                        projected[projected_base + kNvfp4GdnSnapshotChannels + row];
+                }
+                if (token >= valid) {
+                    output[static_cast<std::int64_t>(token) * output_rows + output_row] =
+                        __float2bfloat16_rn(0.0F);
+                    continue;
+                }
                 const float p = __bfloat162float(projected[projected_base + row]);
                 float conv    = fmaf(w0, s0, 0.0F);
                 conv          = fmaf(w1, s1, conv);
@@ -103,11 +115,6 @@ __global__ __launch_bounds__(WarpsPerCta * 32) void nvfp4_gdn_snapshot_post_kern
                 conv_states[snapshot_base + 2LL * kNvfp4GdnSnapshotChannels + row] =
                     __float2bfloat16_rn(p);
 
-                if (row < kNvfp4GdnSnapshotZRows) {
-                    z[static_cast<std::int64_t>(token) * kNvfp4GdnSnapshotZRows + row] =
-                        projected[projected_base + kNvfp4GdnSnapshotChannels + row];
-                }
-
                 s0 = s1;
                 s1 = s2;
                 s2 = p;
@@ -119,9 +126,10 @@ __global__ __launch_bounds__(WarpsPerCta * 32) void nvfp4_gdn_snapshot_post_kern
 } // namespace
 
 void nvfp4_gdn_snapshot_post_launch(const Tensor& projected, const Tensor& conv_weight,
-                                    Tensor& conv_states, const Tensor& initial_slot,
-                                    const Tensor& snapshot_base_slot, Tensor& query, Tensor& key,
-                                    Tensor& value, Tensor& z, cudaStream_t stream) {
+                                    Tensor& conv_states, const Tensor& valid_columns,
+                                    const Tensor& initial_slot, const Tensor& snapshot_base_slot,
+                                    Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                    cudaStream_t stream) {
     constexpr int kWarpsPerCta = 32;
     constexpr int kTokenTile   = 8;
     constexpr int kBlocks      = kNvfp4GdnSnapshotChannels / 32;
@@ -132,6 +140,8 @@ void nvfp4_gdn_snapshot_post_launch(const Tensor& projected, const Tensor& conv_
             static_cast<__nv_bfloat16*>(conv_states.data),
             static_cast<const std::int32_t*>(initial_slot.data),
             static_cast<const std::int32_t*>(snapshot_base_slot.data),
+            valid_columns.data == nullptr ? nullptr
+                                          : static_cast<const std::int32_t*>(valid_columns.data),
             static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
             static_cast<__nv_bfloat16*>(value.data), static_cast<__nv_bfloat16*>(z.data),
             projected.ne[1]);

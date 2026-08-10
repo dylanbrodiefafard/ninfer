@@ -1,5 +1,7 @@
 #pragma once
 
+// Small fixed-capacity request scheduling and batched decode execution for None and MTP backends.
+
 #include "ninfer/types.h"
 #include "runtime/engine/request_memory.h"
 #include "runtime/generation/generation_budget.h"
@@ -25,7 +27,7 @@
 namespace ninfer::runtime {
 
 template <class Instance>
-class OrdinaryExecutor {
+class ConcurrentExecutor {
     struct Request;
 
 public:
@@ -34,19 +36,19 @@ public:
     using Plan    = typename Package::RequestPlan;
     using Clock   = std::chrono::steady_clock;
 
-    OrdinaryExecutor(Instance& instance, const EngineOptions& options)
+    ConcurrentExecutor(Instance& instance, const EngineOptions& options)
         : instance_(instance), max_concurrency_(options.max_concurrency),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
-            throw std::invalid_argument("ordinary executor bounds are invalid");
+            throw std::invalid_argument("concurrent executor bounds are invalid");
         }
         worker_ = std::thread([this] { worker_loop(); });
     }
 
-    ~OrdinaryExecutor() noexcept {
+    ~ConcurrentExecutor() noexcept {
         {
             std::lock_guard lock(queue_mutex_);
             stopping_ = true;
@@ -55,8 +57,8 @@ public:
         if (worker_.joinable()) { worker_.join(); }
     }
 
-    OrdinaryExecutor(const OrdinaryExecutor&)            = delete;
-    OrdinaryExecutor& operator=(const OrdinaryExecutor&) = delete;
+    ConcurrentExecutor(const ConcurrentExecutor&)            = delete;
+    ConcurrentExecutor& operator=(const ConcurrentExecutor&) = delete;
 
     class Submission {
     public:
@@ -83,14 +85,14 @@ public:
 
         GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
             if (owner_ == nullptr || request_ == nullptr) {
-                throw std::logic_error("ordinary submission is empty");
+                throw std::logic_error("concurrent submission is empty");
             }
-            OrdinaryExecutor* owner = std::exchange(owner_, nullptr);
+            ConcurrentExecutor* owner = std::exchange(owner_, nullptr);
             return owner->wait_for_request(std::exchange(request_, nullptr), sink, cancellation);
         }
 
     private:
-        Submission(OrdinaryExecutor& owner, std::shared_ptr<Request> request) noexcept
+        Submission(ConcurrentExecutor& owner, std::shared_ptr<Request> request) noexcept
             : owner_(&owner), request_(std::move(request)) {}
 
         void reset() noexcept {
@@ -100,10 +102,10 @@ public:
             owner_ = nullptr;
         }
 
-        OrdinaryExecutor* owner_ = nullptr;
+        ConcurrentExecutor* owner_ = nullptr;
         std::shared_ptr<Request> request_;
 
-        friend class OrdinaryExecutor;
+        friend class ConcurrentExecutor;
     };
 
     Submission submit(targets::qwen3_6::PreparedPrompt prompt, PromptSummary prompt_summary,
@@ -184,7 +186,7 @@ private:
     GenerationResult wait_for_request(std::shared_ptr<Request> request, OutputSink* sink,
                                       const CancellationView& cancellation) {
         struct ConsumerGuard {
-            OrdinaryExecutor* owner;
+            ConcurrentExecutor* owner;
             std::shared_ptr<Request> request;
 
             ~ConsumerGuard() { owner->release_consumer(request); }
@@ -349,6 +351,7 @@ private:
         if (request->lane) {
             result.timings = instance_.program->generation_timings_lane(*request->lane);
             result.timings.prepare_seconds = request->prepare_seconds;
+            result.speculative = instance_.program->speculative_stats_lane(*request->lane);
         }
         if (request->first_token) {
             result.timings.first_token_seconds =
@@ -389,7 +392,7 @@ private:
         const OutputDecision decision = request->output.preview(
             tokens, request->budget->remaining(), request->budget->limit_reason());
         if (decision.accepted_tokens != 1) {
-            throw std::logic_error("ordinary output policy did not accept its licensed token");
+            throw std::logic_error("prefill output policy did not accept its licensed token");
         }
         request->generated.push_back(token);
         instance_.program->resolve_pending_lane(lane, 1, decision.finished());
@@ -486,7 +489,7 @@ private:
         }
         request->begin = step.summary;
         if (step.round.tokens.size() != 1) {
-            throw std::logic_error("ordinary prefill did not license exactly one token");
+            throw std::logic_error("prefill did not license exactly one token");
         }
         if (resolve_round(request, step.round.tokens.front(), false)) {
             remove_completed_slot(*request->lane);
@@ -502,7 +505,7 @@ private:
         if (request == nullptr || request->decode_ready) {
             throw std::logic_error("staged prefill lane has invalid request state");
         }
-        const PrefillStepResult step = instance_.program->advance_ordinary_prefill_lane(lane);
+        const PrefillStepResult step = instance_.program->advance_prefill_lane(lane);
         resolve_prefill_step(request, step);
     }
 
@@ -646,7 +649,7 @@ private:
                 transient     = instance_.request_memory.region();
             }
             target_started                = true;
-            const PrefillStepResult first = instance_.program->start_ordinary_prefill_lane(
+            const PrefillStepResult first = instance_.program->start_prefill_lane(
                 lane, std::move(request->prompt), std::move(selected_plan), transient);
             if (!first.complete && (!prefill_lane_ || *prefill_lane_ != lane)) {
                 throw std::logic_error("partial prefill did not retain its execution owner");
@@ -673,15 +676,69 @@ private:
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             budgets[row] = slots_[lanes[row]]->budget->round_budget();
         }
-        const BatchedGeneratedRound round = instance_.program->decode_ordinary_batch(
+        const BatchedGeneratedRound round = instance_.program->decode_batch(
             lanes, std::span<const RoundBudget>(budgets.data(), lanes.size()));
-        if (round.tokens.size() != lanes.size()) {
-            throw std::logic_error("ordinary batch returned an invalid row count");
+        if (round.row_stride == 0 ||
+            (!round.row_counts.empty() && round.row_counts.size() != lanes.size()) ||
+            round.tokens.size() < static_cast<std::size_t>(round.row_stride) * lanes.size()) {
+            throw std::logic_error("decode batch returned an invalid ragged layout");
         }
+
+        std::array<std::uint32_t, kMaximumConcurrency> accepted{};
+        std::array<std::uint8_t, kMaximumConcurrency> terminal{};
+        std::array<std::uint8_t, kMaximumConcurrency> cancelled{};
+        std::array<FinishReason, kMaximumConcurrency> finish_reasons{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             const std::uint32_t lane = lanes[row];
             const auto request       = slots_[lane];
-            if (resolve_round(request, round.tokens[row], cancelled_at_boundary[lane])) {
+            const std::uint32_t count =
+                round.row_counts.empty() ? 1U : static_cast<std::uint32_t>(round.row_counts[row]);
+            if (count == 0 || count > round.row_stride) {
+                throw std::logic_error("decode batch returned an invalid licensed row extent");
+            }
+            const auto row_tokens =
+                round.tokens.subspan(row * round.row_stride, static_cast<std::size_t>(count));
+            if (cancelled_at_boundary[lane]) {
+                (void)request->output.preview_terminal(FinishReason::Cancelled);
+                accepted[row]       = 0;
+                terminal[row]       = 1;
+                cancelled[row]      = 1;
+                finish_reasons[row] = FinishReason::Cancelled;
+                continue;
+            }
+            const OutputDecision decision = request->output.preview(
+                row_tokens, request->budget->remaining(), request->budget->limit_reason());
+            if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
+                (!decision.finished() && decision.accepted_tokens != count)) {
+                throw std::logic_error("output policy returned an invalid licensed prefix");
+            }
+            accepted[row]       = decision.accepted_tokens;
+            terminal[row]       = decision.finished() ? 1 : 0;
+            finish_reasons[row] = decision.finish_reason;
+        }
+
+        instance_.program->resolve_pending_batch(
+            lanes, std::span<const std::uint32_t>(accepted.data(), lanes.size()),
+            std::span<const std::uint8_t>(terminal.data(), lanes.size()),
+            std::span<const std::uint8_t>(cancelled.data(), lanes.size()));
+
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            const std::uint32_t lane = lanes[row];
+            const auto request       = slots_[lane];
+            if (!cancelled[row]) {
+                const auto row_tokens = round.tokens.subspan(
+                    row * round.row_stride, static_cast<std::size_t>(accepted[row]));
+                request->generated.insert(request->generated.end(), row_tokens.begin(),
+                                          row_tokens.end());
+                request->budget->commit(accepted[row]);
+            }
+            auto published = request->output.commit_preview();
+            if (!request->first_token && accepted[row] != 0) {
+                request->first_token = Clock::now();
+            }
+            append_output(request, std::move(published));
+            if (terminal[row]) {
+                complete_success(request, finish_reasons[row]);
                 remove_completed_slot(lane);
             }
         }

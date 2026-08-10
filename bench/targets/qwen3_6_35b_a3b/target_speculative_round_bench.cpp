@@ -243,7 +243,6 @@ family::RoundState round_window(const family::RoundState& storage, std::uint32_t
     out.speculative.round_tokens     = storage.speculative.round_tokens.slice(0, 0, columns);
     out.speculative.target_input_ids = storage.speculative.target_input_ids.slice(0, 0, columns);
     out.speculative.target_positions = storage.speculative.target_positions.slice(0, 0, columns);
-    out.speculative.stats = storage.speculative.stats.slice(0, 0, static_cast<int>(4 + k));
     return out;
 }
 
@@ -290,10 +289,12 @@ std::vector<std::int32_t> prepare_drafts(runtime::schedule::State& state,
     const auto target_at = [&](std::uint32_t index) {
         reset_round_controls(state.io, anchor, static_cast<std::int32_t>(state.text_kv_base),
                              base_slot, state.device.stream);
+        copy_i32(state.io.speculative.current_proposal_extent, static_cast<std::int32_t>(k),
+                 state.device.stream);
         ninfer::ops::speculative_prepare_verify_inputs(
             state.io.token, state.io.speculative.draft_tokens, state.io.pos,
-            state.io.speculative.target_input_ids, state.io.speculative.target_positions,
-            state.device.stream);
+            state.io.speculative.current_proposal_extent, state.io.speculative.target_input_ids,
+            state.io.speculative.target_positions, state.device.stream);
         runtime::schedule::target_verify(card, state, state.io.speculative.target_input_ids,
                                          state.io.speculative.target_positions, envelope);
         std::int32_t target_token = 0;
@@ -428,8 +429,6 @@ int run(const Options& options) {
     ninfer::ops::SamplingConfig sampling{};
     CUDA_CHECK(cudaMemcpyAsync(sampling_span.data, &sampling, sizeof(sampling),
                                cudaMemcpyHostToDevice, device.stream));
-    CUDA_CHECK(cudaMemsetAsync(round_storage.speculative.stats.data, 0,
-                               round_storage.speculative.stats.bytes(), device.stream));
     decoder.linear_attention.zero_slot(runtime::LinearStateSlots::prefill_working_slot(),
                                        device.stream);
     copy_i32(round_storage.linear_state_read_slot,

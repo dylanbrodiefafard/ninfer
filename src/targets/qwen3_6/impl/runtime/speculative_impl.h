@@ -29,13 +29,15 @@ void speculative_verify_and_accept(State& state, TextContext& card, std::uint32_
         throw std::logic_error("speculative round requires target tail-hidden storage");
     }
 
+    ops::set_i32_scalar(spec.current_proposal_extent, static_cast<std::int32_t>(draft_window),
+                        state.device.stream);
     ops::speculative_prepare_verify_inputs(state.io.token, spec.draft_tokens, state.io.pos,
-                                           spec.target_input_ids, spec.target_positions,
-                                           state.device.stream);
+                                           spec.current_proposal_extent, spec.target_input_ids,
+                                           spec.target_positions, state.device.stream);
     target_verify(card, state, spec.target_input_ids, spec.target_positions, target_envelope);
     ops::speculative_accept_greedy_drafts(
-        spec.target_argmax, state.io.logits, spec.draft_tokens, state.io.pos, state.io.token,
-        spec.round_tokens, spec.produced_count, spec.accepted_drafts, spec.stats,
+        spec.target_argmax, state.io.logits, spec.draft_tokens, spec.current_proposal_extent,
+        state.io.pos, state.io.token, spec.round_tokens, spec.produced_count, spec.accepted_drafts,
         TextConfig::token_domain, state.sampling, state.work, state.device.stream);
     ops::add_i32_scalars(spec.accepted_drafts, state.io.linear_state_snapshot_base_slot,
                          state.io.linear_state_read_slot, state.device.stream);

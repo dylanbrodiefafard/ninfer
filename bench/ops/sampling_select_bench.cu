@@ -27,7 +27,6 @@ namespace {
 
 constexpr std::int32_t kPhysicalRows = 248320;
 constexpr std::int32_t kTokenDomain  = 248077;
-constexpr std::int32_t kStats        = 9;
 
 enum class Mode {
     Greedy,
@@ -140,12 +139,6 @@ DeviceBuffer make_i32(const std::vector<std::int32_t>& host) {
     return device;
 }
 
-DeviceBuffer make_i64_zero(std::size_t count) {
-    DeviceBuffer device(count * sizeof(std::int64_t));
-    CUDA_CHECK(cudaMemset(device.p, 0, device.bytes));
-    return device;
-}
-
 DeviceBuffer make_config(DeviceBuffer& counts, Mode mode, bool counts_active, int top_k) {
     ops::SamplingConfig config;
     config.temperature      = mode == Mode::Greedy ? 0.0f : 0.6f;
@@ -235,27 +228,27 @@ void run_mtp(DeviceBuffer& logits, DeviceBuffer& counts, int k, Mode mode, bool 
     DeviceBuffer sampled(static_cast<std::size_t>(k + 1) * sizeof(std::int32_t));
     DeviceBuffer num(sizeof(std::int32_t));
     DeviceBuffer accepted(sizeof(std::int32_t));
-    DeviceBuffer stats = make_i64_zero(kStats);
+    DeviceBuffer extent = make_i32({k});
 
     Tensor ttargets(targets.p, DType::I32, {k + 1});
     Tensor tlogits(logits.p, DType::BF16, {kPhysicalRows, k + 1});
     Tensor tdrafts(drafts.p, DType::I32, {k});
+    Tensor textent(extent.p, DType::I32, {1});
     Tensor tlength(length.p, DType::I32, {1});
     Tensor ttoken(token.p, DType::I32, {1});
     Tensor tsampled(sampled.p, DType::I32, {k + 1});
     Tensor tnum(num.p, DType::I32, {1});
     Tensor taccepted(accepted.p, DType::I32, {1});
-    Tensor tstats(stats.p, DType::I64, {kStats});
     WorkspaceArena workspace(
-        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(kTokenDomain, k, k));
+        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(kTokenDomain, k, k, 1, 1));
     const auto* config_ptr = static_cast<const ops::SamplingConfig*>(config.p);
 
     const double bytes  = mode == Mode::Greedy ? static_cast<double>((k + 1) * 4 + k * 4)
                                                : stochastic_payload_bytes(k + 1, counts_active);
     const Result result = bench_loop(
         [&](cudaStream_t stream) {
-            ops::speculative_accept_greedy_drafts(ttargets, tlogits, tdrafts, tlength, ttoken,
-                                                  tsampled, tnum, taccepted, tstats, kTokenDomain,
+            ops::speculative_accept_greedy_drafts(ttargets, tlogits, tdrafts, textent, tlength,
+                                                  ttoken, tsampled, tnum, taccepted, kTokenDomain,
                                                   config_ptr, workspace, stream);
         },
         bytes);

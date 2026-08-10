@@ -8,20 +8,16 @@ namespace ninfer::ops::detail {
 
 void w8_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                 cudaStream_t stream);
-void w8_gdn_input_decode_conv_snapshot_launch(const Tensor& x, const Weight& weight,
-                                              const Tensor& conv_weight, Tensor& conv_states,
-                                              const Tensor& initial_slot,
-                                              const Tensor& snapshot_base_slot, Tensor& query,
-                                              Tensor& key, Tensor& value, Tensor& z,
-                                              cudaStream_t stream);
+void w8_gdn_input_decode_conv_snapshot_launch(
+    const Tensor& x, const Weight& weight, const Tensor& conv_weight, Tensor& conv_states,
+    const Tensor& valid_columns, const Tensor& initial_slot, const Tensor& snapshot_base_slot,
+    Tensor& query, Tensor& key, Tensor& value, Tensor& z, cudaStream_t stream);
 void w8_gdn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                     cudaStream_t stream);
-void w8_gdn_input_splitk_conv_snapshot_launch(const Tensor& x, const Weight& weight,
-                                              const Tensor& conv_weight, Tensor& conv_states,
-                                              const Tensor& initial_slot,
-                                              const Tensor& snapshot_base_slot, Tensor& query,
-                                              Tensor& key, Tensor& value, Tensor& z,
-                                              cudaStream_t stream);
+void w8_gdn_input_splitk_conv_snapshot_launch(
+    const Tensor& x, const Weight& weight, const Tensor& conv_weight, Tensor& conv_states,
+    const Tensor& valid_columns, const Tensor& initial_slot, const Tensor& snapshot_base_slot,
+    Tensor& query, Tensor& key, Tensor& value, Tensor& z, cudaStream_t stream);
 void w8_gdn_input_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                       cudaStream_t stream);
 

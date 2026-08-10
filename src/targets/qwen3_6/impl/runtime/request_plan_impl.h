@@ -108,9 +108,11 @@ RequestPlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
                                            ? 0U
                                            : plan->summary.effective_output_tokens - 1U);
     plan->text_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
-    if (speculative_backend != SpeculativeBackend::None) {
-        // Multi-row speculative execution is a later engine milestone. Preserve the existing B=1
-        // backend's complete-context reservation until that transaction is batched.
+    if (speculative_backend == SpeculativeBackend::Mtp) {
+        const std::uint32_t mtp_tokens    = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+            capacity, static_cast<std::uint64_t>(reserved_context_tokens) + draft_window - 1ULL));
+        plan->backend_kv_page_entitlement = pages_for_tokens(mtp_tokens);
+    } else if (speculative_backend == SpeculativeBackend::DFlash) {
         plan->text_kv_page_entitlement    = decoder->text_kv.pool().logical_page_capacity();
         plan->backend_kv_page_entitlement = backend_kv_cache()->pool().logical_page_capacity();
     }
@@ -141,23 +143,30 @@ RequestPlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
         }
     }
 
+    if (speculative_backend == SpeculativeBackend::Mtp) {
+        const bool append_ready =
+            plan->reuse == ReusePath::AppendAtFrontier && active_sequence().tail_hidden_valid &&
+            decoder->mtp_cache() != nullptr &&
+            (plan->reuse_base == 0 || active_sequence().mtp_kv_valid >= plan->reuse_base - 1);
+        const bool boundary_ready = plan->reuse == ReusePath::RestoreBoundary &&
+                                    decoder->mtp_cache() != nullptr &&
+                                    active_sequence().boundary.hidden_valid &&
+                                    active_sequence().boundary.mtp_prefix_valid &&
+                                    active_sequence().mtp_kv_valid >= plan->reuse_base - 1;
+        if (plan->reuse != ReusePath::FullReset && !append_ready && !boundary_ready) {
+            plan->reuse      = ReusePath::FullReset;
+            plan->reuse_base = 0;
+        }
+    }
+
     plan->summary.reusable_prompt_tokens = plan->reuse_base;
-    const bool mtp_capacity =
-        speculative_backend == SpeculativeBackend::Mtp &&
-        static_cast<std::uint64_t>(plan->summary.prompt_tokens) + 2ULL * draft_window <= capacity;
-    if (mtp_capacity) {
+    if (speculative_backend == SpeculativeBackend::Mtp) {
         if (plan->reuse == ReusePath::FullReset) {
             plan->prepare_mtp = true;
-        } else if (plan->reuse == ReusePath::AppendAtFrontier &&
-                   active_sequence().tail_hidden_valid && decoder->mtp_cache() != nullptr &&
-                   (plan->reuse_base == 0 ||
-                    active_sequence().mtp_kv_valid >= plan->reuse_base - 1)) {
+        } else if (plan->reuse == ReusePath::AppendAtFrontier) {
             plan->prepare_mtp      = true;
             plan->needs_mtp_bridge = plan->reuse_base != 0;
-        } else if (plan->reuse == ReusePath::RestoreBoundary && decoder->mtp_cache() != nullptr &&
-                   active_sequence().boundary.hidden_valid &&
-                   active_sequence().boundary.mtp_prefix_valid &&
-                   active_sequence().mtp_kv_valid >= plan->reuse_base - 1) {
+        } else if (plan->reuse == ReusePath::RestoreBoundary) {
             plan->prepare_mtp      = true;
             plan->needs_mtp_bridge = true;
         }

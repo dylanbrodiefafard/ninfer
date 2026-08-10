@@ -65,11 +65,16 @@ enum class PendingKind : std::uint8_t {
 };
 
 struct PendingCandidate {
-    PendingKind kind            = PendingKind::None;
-    std::uint32_t base_E        = 0;
-    std::uint32_t base_S        = 0;
-    std::uint32_t prompt_tokens = 0;
-    std::uint32_t produced      = 0;
+    PendingKind kind                   = PendingKind::None;
+    std::uint32_t base_E               = 0;
+    std::uint32_t base_S               = 0;
+    std::uint32_t prompt_tokens        = 0;
+    std::uint32_t produced             = 0;
+    std::uint32_t proposal_extent      = 0;
+    std::uint32_t accepted_drafts      = 0;
+    std::uint32_t next_proposal_extent = 0;
+    std::uint32_t frame_row            = 0;
+    bool batch_frame                   = false;
 };
 
 enum class Lifecycle : std::uint8_t {
@@ -143,8 +148,10 @@ struct SequenceState {
     bool dflash_boundary_valid             = false;
     std::uint32_t dflash_boundary_frontier = 0;
     bool ordinary_tail                     = false;
-    bool drafts_ready                      = false;
-    bool tail_hidden_valid                 = false;
+    bool dflash_proposal_ready             = false;
+    std::array<TokenId, qwen3_6::kMtpDecodeMaximumDrafts> mtp_drafts{};
+    std::uint32_t mtp_draft_count = 0;
+    bool tail_hidden_valid        = false;
     PrefixCheckpoint boundary;
 };
 
@@ -155,8 +162,9 @@ struct RequestControl {
     PendingCandidate pending;
     ops::SamplingConfig sampling_host;
     GenerationTimings timings;
+    SpeculativeStats speculative_stats;
 
-    struct OrdinaryPrefill {
+    struct Prefill {
         PreparedPromptData prompt;
         std::optional<VisionPrefillPlan> vision_plan;
         std::unique_ptr<schedule::VisionPrefillSession> vision;
@@ -165,11 +173,16 @@ struct RequestControl {
         std::uint32_t base               = 0;
         std::uint32_t cursor             = 0;
         std::uint32_t prompt_tokens      = 0;
+        std::uint32_t initial_mtp_extent = 0;
         double elapsed_seconds           = 0.0;
         bool host_input_consumed_pending = false;
+        bool prepare_mtp                 = false;
+        bool needs_mtp_bridge            = false;
+        bool mtp_bridge_complete         = false;
+        bool mtp_bridge_uses_boundary    = false;
     };
 
-    std::optional<OrdinaryPrefill> ordinary_prefill;
+    std::optional<Prefill> prefill;
 };
 
 class ProgramImplCore {
@@ -191,18 +204,24 @@ public:
     [[nodiscard]] bool
     can_admit_lane_after_retained_eviction(std::uint32_t lane,
                                            const RequestPlan& plan) const noexcept;
-    [[nodiscard]] runtime::PrefillStepResult
-    start_ordinary_prefill_lane(std::uint32_t lane, PreparedPromptData&& prompt, RequestPlan&& plan,
-                                runtime::TransientRegion transient);
-    [[nodiscard]] runtime::PrefillStepResult advance_ordinary_prefill_lane(std::uint32_t lane);
+    [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
+                                                                PreparedPromptData&& prompt,
+                                                                RequestPlan&& plan,
+                                                                runtime::TransientRegion transient);
+    [[nodiscard]] runtime::PrefillStepResult advance_prefill_lane(std::uint32_t lane);
     [[nodiscard]] runtime::BatchedGeneratedRound
-    decode_ordinary_batch(std::span<const std::uint32_t> lanes,
-                          std::span<const runtime::RoundBudget> budgets);
+    decode_batch(std::span<const std::uint32_t> lanes,
+                 std::span<const runtime::RoundBudget> budgets);
     void resolve_pending_lane(std::uint32_t lane, std::uint32_t accepted_tokens, bool terminal);
+    void resolve_pending_batch(std::span<const std::uint32_t> lanes,
+                               std::span<const std::uint32_t> accepted_tokens,
+                               std::span<const std::uint8_t> terminal,
+                               std::span<const std::uint8_t> cancelled);
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
+    [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
     void resolve_pending(std::uint32_t accepted_tokens, bool terminal);
 
@@ -250,7 +269,6 @@ public:
     std::array<RequestControl, kMaximumConcurrency> requests;
 
     DecodeGraphFamily ordinary_graphs;
-    DecodeGraphFamily ordinary_aligned_graphs;
     DecodeGraphFamily mtp_graphs;
     DecodeGraphFamily dflash_initial_graphs;
     DecodeGraphFamily dflash_steady_graphs;
@@ -261,6 +279,9 @@ public:
     PinnedHostBuffer ordinary_host;
     qwen3_6::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
     qwen3_6::OrdinaryDecodeEgress* ordinary_host_egress   = nullptr;
+    PinnedHostBuffer mtp_host;
+    qwen3_6::MtpDecodeIngress* mtp_host_ingress = nullptr;
+    qwen3_6::MtpDecodeEgress* mtp_host_egress   = nullptr;
 
     std::size_t workspace_logical_peak_bytes = 0;
 
@@ -285,10 +306,18 @@ private:
     void set_device_i32(Tensor& tensor, std::int32_t value);
     void copy_tail(const Tensor& source);
     void copy_round_token();
-    [[nodiscard]] runtime::PrefillStepResult advance_ordinary_prefill();
+    void resolve_pending_impl(std::uint32_t accepted_tokens, bool terminal,
+                              bool correct_partial_hidden);
+    [[nodiscard]] runtime::PrefillStepResult advance_prefill();
     void flush_dflash_context_prefix(std::uint32_t count);
     void validate_licensed_tokens(std::span<const TokenId> tokens) const;
     void mark_workspace_usage(std::size_t phase_bytes) noexcept;
+    [[nodiscard]] runtime::BatchedGeneratedRound
+    decode_ordinary_batch(std::span<const std::uint32_t> lanes,
+                          std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] runtime::BatchedGeneratedRound
+    decode_mtp_batch(std::span<const std::uint32_t> lanes,
+                     std::span<const runtime::RoundBudget> budgets);
     void reserve_sequence_kv(std::uint32_t text_pages, std::uint32_t backend_pages);
     void resize_sequence_kv_entitlement(std::uint32_t text_pages, std::uint32_t backend_pages);
     void bind_sequence_kv();

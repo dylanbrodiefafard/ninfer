@@ -111,23 +111,31 @@ bool Program<Variant>::can_admit_lane_after_retained_eviction(
 
 template <>
 runtime::PrefillStepResult
-Program<Variant>::start_ordinary_prefill_lane(std::uint32_t lane, PreparedPrompt&& prompt,
-                                              RequestPlan<Variant>&& plan,
-                                              runtime::TransientRegion transient) {
-    return impl_->start_ordinary_prefill_lane(lane, PreparedPromptAccess::take(std::move(prompt)),
-                                              std::move(plan), transient);
+Program<Variant>::start_prefill_lane(std::uint32_t lane, PreparedPrompt&& prompt,
+                                     RequestPlan<Variant>&& plan,
+                                     runtime::TransientRegion transient) {
+    return impl_->start_prefill_lane(lane, PreparedPromptAccess::take(std::move(prompt)),
+                                     std::move(plan), transient);
 }
 
 template <>
-runtime::PrefillStepResult Program<Variant>::advance_ordinary_prefill_lane(std::uint32_t lane) {
-    return impl_->advance_ordinary_prefill_lane(lane);
+runtime::PrefillStepResult Program<Variant>::advance_prefill_lane(std::uint32_t lane) {
+    return impl_->advance_prefill_lane(lane);
 }
 
 template <>
 runtime::BatchedGeneratedRound
-Program<Variant>::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
-                                        std::span<const runtime::RoundBudget> budgets) {
-    return impl_->decode_ordinary_batch(lanes, budgets);
+Program<Variant>::decode_batch(std::span<const std::uint32_t> lanes,
+                               std::span<const runtime::RoundBudget> budgets) {
+    return impl_->decode_batch(lanes, budgets);
+}
+
+template <>
+void Program<Variant>::resolve_pending_batch(std::span<const std::uint32_t> lanes,
+                                             std::span<const std::uint32_t> accepted_tokens,
+                                             std::span<const std::uint8_t> terminal,
+                                             std::span<const std::uint8_t> cancelled) {
+    impl_->resolve_pending_batch(lanes, accepted_tokens, terminal, cancelled);
 }
 
 template <>
@@ -154,6 +162,11 @@ void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
 template <>
 GenerationTimings Program<Variant>::generation_timings_lane(std::uint32_t lane) const noexcept {
     return impl_->generation_timings_lane(lane);
+}
+
+template <>
+SpeculativeStats Program<Variant>::speculative_stats_lane(std::uint32_t lane) const noexcept {
+    return impl_->speculative_stats_lane(lane);
 }
 
 template <>

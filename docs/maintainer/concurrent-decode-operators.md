@@ -97,7 +97,8 @@ KV、Linear Attention、sampling、MTP 和 DFlash 全部字段的通用 `BatchDe
 GQA:               cache_positions[W,B], valid_columns[B], kv_table_rows[B]
 Linear Attention:  valid_columns[B], initial_state_slots[B], snapshot_base_slots[B]
 Sampler:           sampling_configs[B], logical_positions[B]
-Speculative:       proposal_extents[B], accepted_drafts[B], licensed_counts[B]
+Speculative:       current_proposal_extents[B], accepted_drafts[B], licensed_counts[B]
+MTP continuation:  next_proposal_extents[B]
 ```
 
 Op 不接收 request identity 或 request slot，也不推导 resource ownership。Homogeneous model state 的 pool
@@ -117,20 +118,26 @@ token-count reference 保持 sampling contract 的 typed state，不为形式统
 Speculative round 不存在一个可以被所有 Op 共用的“valid extent”。每行必须区分：
 
 ```text
-proposal_extent[b]   本轮实际允许的 draft 数，0..K
-target_extent[b]     target verification columns，proposal_extent[b] + 1
-accepted_drafts[b]   target 接受的 draft 数，0..proposal_extent[b]
-licensed_count[b]    target 许可产生的 token 数，accepted_drafts[b] + 1
-commit_count[b]      最终提交的 licensed prefix，0..licensed_count[b]
+current_proposal_extent[b]  本轮进入 target verification 的 draft 数，0..K
+target_extent[b]            target verification columns，current_proposal_extent[b] + 1
+accepted_drafts[b]          target 接受的 draft 数，0..current_proposal_extent[b]
+licensed_count[b]           target 许可产生的 token 数，accepted_drafts[b] + 1
+next_proposal_extent[b]     MTP 根据新 frontier/budget 为下一轮生成的 draft 数，0..K
+commit_count[b]             最终提交的 licensed prefix，0..licensed_count[b]
 ```
 
-ordinary round 等价于 `proposal_extent=0`、`target_extent=1`、`licensed_count=1`。持续运行的一行
+ordinary round 等价于 `current_proposal_extent=0`、`target_extent=1`、`licensed_count=1`。持续运行的一行
 必须提交全部 licensed tokens；terminal output policy 可以在 licensed prefix 中截断，cancellation
 可以丢弃该行的 provisional result。
 
+`current_proposal_extent` 在 launch 前已确定；`next_proposal_extent` 只能在 acceptance 得到
+`licensed_count` 后计算。二者不得合并为一个字段：MTP alignment 消费本轮 target extent，而后续
+autoregressive proposal steps 由 `next_proposal_extent` mask。下一轮把已生成的
+`next_proposal_extent` 作为新的 `current_proposal_extent`。
+
 每个 sequence-sensitive Op 只接收它的语义域所需的 extent。例如 target GQA 和 Linear
 Attention 使用 `target_extent`，MTP 第 `j` 个 autoregressive proposal step 使用
-`j < proposal_extent[b]`。Acceptance outcome 不能反过来改变已执行的 target extent。
+`j < next_proposal_extent[b]`。Acceptance outcome 不能反过来改变已执行的 target extent。
 
 Stateful target execution 可以为 `target_extent` 的每个 column 写入 provisional KV 和 snapshot，但不在 Op
 内推进 committed frontier。Round transaction 根据 `commit_count` 选择对应的 prefix/frontier；未选中的
@@ -149,9 +156,9 @@ mask。对 `[valid_extent[b],W)` 内的 invalid tail：
 - sampler、accept、hidden selection 和 output transaction 忽略 invalid columns；
 - invalid result 不得成为下一 round input 或 externally visible output。
 
-一行 `proposal_extent=0` 时，其 target extent 仍为 1，因而可在同一 speculative DecodeRound
-中完成 ordinary target progress。若整个 batch 的 proposal extents 都为零，Scheduler 可以选择
-ordinary graph；否则不为 zero/partial rows 建立 cohort。
+一行 `current_proposal_extent=0` 时，其 target extent 仍为 1，因而可在同一 speculative DecodeRound
+中完成 ordinary target progress。MTP 对 current/next proposal extent 的 zero、partial 和 full values
+始终选择同一个 exact-`B` graph family；任何情况都不为 extent 建立 cohort。
 
 ---
 
@@ -269,27 +276,26 @@ current token / length                 [B]
 draft tokens                           [K, B]
 target input ids / positions           [K+1, B]
 target logits                          [V, K+1, B]
-proposal extent / target extent        [B]
+current proposal extent / target extent [B]
 accepted drafts / licensed count       [B]
 round output tokens                    [K+1, B]
-request sampling and statistics state  per row
+request sampling/token-count state     per row
 ```
 
-Prepare 只在每行 `proposal_extent` 内构造有效 draft，target 只在该行 `target_extent`
-内建立 provisional state。Acceptance、correction/bonus sampling、penalty-history update、selected
-hidden 和统计更新逐行独立，并输出 `accepted_drafts` 和 `licensed_count`。不同
+Prepare 只在每行 `current_proposal_extent` 内构造有效 draft，target 只在该行 `target_extent`
+内建立 provisional state。Acceptance、correction/bonus sampling、penalty-history update 和 selected
+hidden transition 逐行独立，并输出 `accepted_drafts` 和 `licensed_count`。Request statistics 由 runtime
+根据这些 per-row result metadata 结算，不进入 Op persistent state。不同
 proposal 或 acceptance lengths 不触发 target replay、cohort 或 per-request model call。最终
 `commit_count` 属于 round transaction，不是 acceptance Op 的 resource-ownership authority。
 
 ### 4.5 MTP helpers
 
-必须迁移：
-
-- `mtp_prepare_alignment_ids`。
-
-它根据每行自己的 `accepted_drafts[b]` 构造 shifted alignment block。MTP 第 `j` 个
-autoregressive proposal position 仍对全部 active rows 执行一次 aggregate model step，但只有
-`j < proposal_extent[b]` 的行可以推进 MTP persistent state。
+现有 scalar `mtp_prepare_alignment_ids` 由 batched `mtp_prepare_next_round` 原子替换。该 Op 根据每行
+自己的 `accepted_drafts[b]` 构造 shifted alignment block，并根据 acceptance 后的新 frontier 与剩余
+budget 计算 `next_proposal_extent[b]` 和 MTP AR 起始 position。MTP 第 `j` 个 autoregressive proposal
+position 仍对全部 active rows 执行一次 aggregate model step，但只有
+`j < next_proposal_extent[b]` 的行可以推进 MTP persistent state。
 
 以下 Op 已是 column-independent transform，不增加 batch semantics：
 
@@ -338,7 +344,7 @@ state，不需要 phase cohort。
 - per-row `rope_delta`，包括 Vision-prepared Text + MTP；
 - per-row frontier advance；
 - Linear Attention committed snapshot selection；
-- MTP position、accepted-draft/licensed count 和 speculative statistics transition。
+- MTP position、accepted-draft/licensed count 和 speculative statistics result metadata。
 
 不要求把每个现有 scalar helper 机械复制成 vector overload。上述变化应由少量有明确 transaction
 ownership 的 rowwise preparation/commit Ops 承担；已经属于 speculative accept 的 state update 不再由
@@ -428,7 +434,7 @@ Sequence-sensitive Op 需要覆盖代表性 `B=1,2,8`，并至少验证：
 
 - 不同 context lengths、positions 和 physical page mappings；
 - rows 之间 KV、conv、recurrent、RNG 和 statistics 无串扰；
-- proposal extents 为 full、partial 和 zero，且 accepted/licensed/commit frontiers 不同；
+- current/next proposal extents 为 full、partial 和 zero，且 accepted/licensed/commit frontiers 不同；
 - compact row order 与 stable slot identity 不同；
 - `B=1` 与原数学 contract 一致。
 

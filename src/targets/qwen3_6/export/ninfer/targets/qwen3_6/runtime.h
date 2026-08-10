@@ -102,7 +102,7 @@ public:
     [[nodiscard]] runtime::GeneratedRound decode_round(runtime::RoundBudget budget);
 
     // Engine-internal fixed-lane execution surface. The public Engine owns scheduling; Program
-    // owns the target state images and executes one immutable ordinary batch membership.
+    // owns target state images and executes one immutable decode batch membership.
     [[nodiscard]] RequestPlan<Variant> plan_request_for_lane(std::uint32_t lane,
                                                              const PreparedPrompt& prompt,
                                                              const ExecutionOptions& options);
@@ -111,18 +111,24 @@ public:
     [[nodiscard]] bool
     can_admit_lane_after_retained_eviction(std::uint32_t lane,
                                            const RequestPlan<Variant>& plan) const noexcept;
-    [[nodiscard]] runtime::PrefillStepResult
-    start_ordinary_prefill_lane(std::uint32_t lane, PreparedPrompt&& prompt,
-                                RequestPlan<Variant>&& plan, runtime::TransientRegion transient);
-    [[nodiscard]] runtime::PrefillStepResult advance_ordinary_prefill_lane(std::uint32_t lane);
+    [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
+                                                                PreparedPrompt&& prompt,
+                                                                RequestPlan<Variant>&& plan,
+                                                                runtime::TransientRegion transient);
+    [[nodiscard]] runtime::PrefillStepResult advance_prefill_lane(std::uint32_t lane);
     [[nodiscard]] runtime::BatchedGeneratedRound
-    decode_ordinary_batch(std::span<const std::uint32_t> lanes,
-                          std::span<const runtime::RoundBudget> budgets);
+    decode_batch(std::span<const std::uint32_t> lanes,
+                 std::span<const runtime::RoundBudget> budgets);
     void resolve_pending_lane(std::uint32_t lane, std::uint32_t accepted_tokens, bool terminal);
+    void resolve_pending_batch(std::span<const std::uint32_t> lanes,
+                               std::span<const std::uint32_t> accepted_tokens,
+                               std::span<const std::uint8_t> terminal,
+                               std::span<const std::uint8_t> cancelled);
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
+    [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
     void resolve_pending(std::uint32_t accepted_tokens, bool terminal);
     void finish_active();

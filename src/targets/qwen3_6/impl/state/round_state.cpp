@@ -30,6 +30,9 @@ void validate_spec(const RoundStateSpec& spec) {
     if (spec.enable_mtp && spec.draft_window == 0) {
         throw std::invalid_argument("RoundState cannot enable MTP with an empty draft window");
     }
+    if (spec.enable_mtp && spec.draft_window > kMtpDecodeMaximumDrafts) {
+        throw std::invalid_argument("RoundState MTP draft window exceeds the decode frame domain");
+    }
     if (spec.batch_capacity == 0 || spec.batch_capacity > kMaximumConcurrency) {
         throw std::invalid_argument("RoundState batch capacity must be in [1,8]");
     }
@@ -113,28 +116,63 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
                     "RoundState columns exceed int32");
     const std::int32_t drafts = checked_i32(std::max<std::uint64_t>(1ULL, layout.spec.draft_window),
                                             "RoundState drafts exceed int32");
-    const std::int32_t stats_counters =
-        checked_i32(4ULL + layout.spec.draft_window, "RoundState stats exceed int32");
-    const auto i32 = [&](std::int32_t count, const char* label) {
+    const auto i32            = [&](std::int32_t count, const char* label) {
         return add_tensor(builder, DType::I32, {count}, label);
     };
-    layout.linear_state_read_slot          = i32(1, "step Linear Attention read slot");
-    layout.linear_state_snapshot_base_slot = i32(1, "step Linear Attention snapshot base slot");
-    layout.speculative.target_argmax       = i32(columns, "step target argmax");
-    layout.speculative.draft_tokens        = i32(drafts, "step draft tokens");
-    layout.speculative.round_tokens        = i32(columns, "step speculative round tokens");
-    layout.speculative.produced_count      = i32(1, "step speculative produced count");
-    layout.speculative.target_input_ids    = i32(columns, "step target input ids");
-    layout.speculative.target_positions    = i32(columns, "step target positions");
-    layout.speculative.accepted_drafts     = i32(1, "step accepted drafts");
-    layout.speculative.stats =
-        add_tensor(builder, DType::I64, {stats_counters}, "step speculative stats");
+    layout.linear_state_read_slot              = i32(1, "step Linear Attention read slot");
+    layout.linear_state_snapshot_base_slot     = i32(1, "step Linear Attention snapshot base slot");
+    layout.speculative.target_argmax           = i32(columns, "step target argmax");
+    layout.speculative.draft_tokens            = i32(drafts, "step draft tokens");
+    layout.speculative.current_proposal_extent = i32(1, "step current proposal extent");
+    layout.speculative.round_tokens            = i32(columns, "step speculative round tokens");
+    layout.speculative.produced_count          = i32(1, "step speculative produced count");
+    layout.speculative.target_input_ids        = i32(columns, "step target input ids");
+    layout.speculative.target_positions        = i32(columns, "step target positions");
+    layout.speculative.accepted_drafts         = i32(1, "step accepted drafts");
     if (layout.spec.enable_mtp) {
         layout.mtp.emplace();
-        layout.mtp->alignment_ids = i32(columns, "step MTP alignment ids");
-        layout.mtp->position      = i32(1, "step MTP autoregressive position");
-        layout.mtp->ar_hidden     = add_tensor(builder, DType::BF16, {layout.spec.hidden, 1},
-                                               "step MTP autoregressive hidden");
+        const auto ar_steps =
+            checked_i32(std::max<std::uint64_t>(1ULL, layout.spec.draft_window - 1ULL),
+                        "RoundState MTP AR steps exceed int32");
+        layout.mtp->position  = i32(1, "MTP prefill autoregressive position");
+        layout.mtp->ar_hidden = add_tensor(builder, DType::BF16, {layout.spec.hidden, 1},
+                                           "MTP prefill autoregressive hidden");
+
+        layout.mtp_decode.emplace();
+        MtpDecodeStateLayout& decode = *layout.mtp_decode;
+        decode.ingress = builder.add(sizeof(MtpDecodeIngress), kArenaAlign, "MTP decode ingress");
+        decode.egress  = builder.add(sizeof(MtpDecodeEgress), kArenaAlign, "MTP decode egress");
+        const auto batch =
+            checked_i32(layout.spec.batch_capacity, "RoundState MTP batch capacity exceeds int32");
+        decode.verify_ids =
+            add_tensor(builder, DType::I32, {columns, batch}, "MTP decode verify ids");
+        decode.target_positions =
+            add_tensor(builder, DType::I32, {columns, batch}, "MTP decode target positions");
+        decode.target_argmax =
+            add_tensor(builder, DType::I32, {columns, batch}, "MTP decode target argmax");
+        decode.target_logits =
+            add_tensor(builder, DType::BF16, {layout.spec.output_rows, columns, batch},
+                       "MTP decode target logits");
+        decode.target_hidden = add_tensor(
+            builder, DType::BF16, {layout.spec.hidden, columns, batch}, "MTP decode target hidden");
+        decode.target_continuation_hidden =
+            add_tensor(builder, DType::BF16, {layout.spec.hidden, batch},
+                       "MTP decode target continuation hidden");
+        decode.alignment_ids =
+            add_tensor(builder, DType::I32, {columns, batch}, "MTP decode alignment ids");
+        decode.alignment_hidden =
+            add_tensor(builder, DType::BF16, {layout.spec.hidden, columns, batch},
+                       "MTP decode alignment hidden");
+        decode.ar_hidden = add_tensor(builder, DType::BF16, {layout.spec.hidden, batch},
+                                      "MTP decode autoregressive hidden");
+        decode.next_hidden =
+            add_tensor(builder, DType::BF16, {layout.spec.hidden, batch}, "MTP decode next hidden");
+        decode.ar_positions      = add_tensor(builder, DType::I32, {batch, ar_steps},
+                                              "MTP decode autoregressive positions");
+        decode.ar_rope_positions = add_tensor(builder, DType::I32, {batch, ar_steps},
+                                              "MTP decode autoregressive rope positions");
+        decode.ar_valid_columns  = add_tensor(builder, DType::I32, {batch, ar_steps},
+                                              "MTP decode autoregressive valid columns");
     }
     layout.complete = true;
 }
@@ -143,15 +181,91 @@ SpeculativeRoundState::SpeculativeRoundState(DeviceSpan backing,
                                              const SpeculativeRoundStateLayout& layout)
     : target_argmax(layout.target_argmax.bind(backing)),
       draft_tokens(layout.draft_tokens.bind(backing)),
+      current_proposal_extent(layout.current_proposal_extent.bind(backing)),
       round_tokens(layout.round_tokens.bind(backing)),
       produced_count(layout.produced_count.bind(backing)),
       target_input_ids(layout.target_input_ids.bind(backing)),
       target_positions(layout.target_positions.bind(backing)),
-      accepted_drafts(layout.accepted_drafts.bind(backing)), stats(layout.stats.bind(backing)) {}
+      accepted_drafts(layout.accepted_drafts.bind(backing)) {}
 
-MtpRoundState::MtpRoundState(DeviceSpan backing, const MtpRoundStateLayout& layout)
-    : alignment_ids(layout.alignment_ids.bind(backing)), position(layout.position.bind(backing)),
-      ar_hidden(layout.ar_hidden.bind(backing)) {}
+MtpPrefillState::MtpPrefillState(DeviceSpan backing, const MtpPrefillStateLayout& layout)
+    : position(layout.position.bind(backing)), ar_hidden(layout.ar_hidden.bind(backing)) {}
+
+MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& layout,
+                               std::uint32_t batch_capacity, std::uint32_t draft_window) {
+    if (batch_capacity == 0 || batch_capacity > kMaximumConcurrency || draft_window == 0 ||
+        draft_window > kMtpDecodeMaximumDrafts) {
+        throw std::invalid_argument("MTP decode state dimensions are outside the supported domain");
+    }
+    static_assert(std::is_standard_layout_v<MtpDecodeIngress>);
+    static_assert(std::is_standard_layout_v<MtpDecodeEgress>);
+    const auto batch          = static_cast<std::int32_t>(batch_capacity);
+    const auto drafts         = static_cast<std::int32_t>(draft_window);
+    const auto width          = drafts + 1;
+    const auto steps          = std::max(drafts - 1, 1);
+    ingress                   = layout.ingress.bind(backing);
+    egress                    = layout.egress.bind(backing);
+    const auto ingress_tensor = [&](std::size_t offset, DType dtype,
+                                    std::initializer_list<std::int32_t> shape) {
+        return Tensor(static_cast<unsigned char*>(ingress.data) + offset, dtype, shape);
+    };
+    const auto egress_tensor = [&](std::size_t offset, DType dtype,
+                                   std::initializer_list<std::int32_t> shape) {
+        return Tensor(static_cast<unsigned char*>(egress.data) + offset, dtype, shape);
+    };
+    anchors = ingress_tensor(offsetof(MtpDecodeIngress, anchors), DType::I32, {batch});
+    base_frontiers =
+        ingress_tensor(offsetof(MtpDecodeIngress, base_frontiers), DType::I32, {batch});
+    remaining_budgets =
+        ingress_tensor(offsetof(MtpDecodeIngress, remaining_budgets), DType::I32, {batch});
+    current_extents =
+        ingress_tensor(offsetof(MtpDecodeIngress, current_extents), DType::I32, {batch});
+    target_valid_columns =
+        ingress_tensor(offsetof(MtpDecodeIngress, target_valid_columns), DType::I32, {batch});
+    current_drafts =
+        ingress_tensor(offsetof(MtpDecodeIngress, current_drafts), DType::I32, {drafts, batch});
+    target_rope_positions = ingress_tensor(offsetof(MtpDecodeIngress, target_rope_positions),
+                                           DType::I32, {width, batch});
+    text_kv_table_rows =
+        ingress_tensor(offsetof(MtpDecodeIngress, text_kv_table_rows), DType::I32, {batch});
+    mtp_kv_table_rows =
+        ingress_tensor(offsetof(MtpDecodeIngress, mtp_kv_table_rows), DType::I32, {batch});
+    linear_state_read_slots =
+        ingress_tensor(offsetof(MtpDecodeIngress, linear_state_read_slots), DType::I32, {batch});
+    linear_state_snapshot_base_slots = ingress_tensor(
+        offsetof(MtpDecodeIngress, linear_state_snapshot_base_slots), DType::I32, {batch});
+    continuation_slots =
+        ingress_tensor(offsetof(MtpDecodeIngress, continuation_slots), DType::I32, {batch});
+    rope_deltas = ingress_tensor(offsetof(MtpDecodeIngress, rope_deltas), DType::I32, {batch});
+    sampling    = reinterpret_cast<const ops::SamplingConfig*>(
+        static_cast<const unsigned char*>(ingress.data) + offsetof(MtpDecodeIngress, sampling));
+
+    licensed_tokens =
+        egress_tensor(offsetof(MtpDecodeEgress, licensed_tokens), DType::I32, {width, batch});
+    licensed_counts =
+        egress_tensor(offsetof(MtpDecodeEgress, licensed_counts), DType::I32, {batch});
+    accepted_drafts =
+        egress_tensor(offsetof(MtpDecodeEgress, accepted_drafts), DType::I32, {batch});
+    next_drafts =
+        egress_tensor(offsetof(MtpDecodeEgress, next_drafts), DType::I32, {batch, drafts});
+    next_extents     = egress_tensor(offsetof(MtpDecodeEgress, next_extents), DType::I32, {batch});
+    verify_ids       = layout.verify_ids.bind(backing);
+    target_positions = layout.target_positions.bind(backing);
+    target_argmax    = layout.target_argmax.bind(backing);
+    target_logits    = layout.target_logits.bind(backing);
+    target_hidden    = layout.target_hidden.bind(backing);
+    target_continuation_hidden = layout.target_continuation_hidden.bind(backing);
+    alignment_ids              = layout.alignment_ids.bind(backing);
+    alignment_hidden           = layout.alignment_hidden.bind(backing);
+    ar_hidden                  = layout.ar_hidden.bind(backing);
+    next_hidden                = layout.next_hidden.bind(backing);
+    ar_positions               = layout.ar_positions.bind(backing);
+    ar_rope_positions          = layout.ar_rope_positions.bind(backing);
+    ar_valid_columns           = layout.ar_valid_columns.bind(backing);
+    if (ar_positions.ne[0] != batch || ar_positions.ne[1] != steps) {
+        throw std::logic_error("MTP decode AR layout does not match its configured dimensions");
+    }
+}
 
 RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     if (!layout.complete) { throw std::invalid_argument("RoundState layout is incomplete"); }
@@ -168,6 +282,10 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     linear_state_snapshot_base_slot = layout.linear_state_snapshot_base_slot.bind(backing);
     speculative                     = SpeculativeRoundState(backing, layout.speculative);
     if (layout.mtp) { mtp.emplace(backing, *layout.mtp); }
+    if (layout.mtp_decode) {
+        mtp_decode.emplace(backing, *layout.mtp_decode, layout.spec.batch_capacity,
+                           layout.spec.draft_window);
+    }
 }
 
 } // namespace ninfer::targets::qwen3_6

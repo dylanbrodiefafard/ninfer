@@ -1,7 +1,7 @@
 #include "ninfer/engine.h"
 
 #include "core/device.h"
-#include "runtime/engine/ordinary_executor.h"
+#include "runtime/engine/concurrent_executor.h"
 #include "runtime/generation/generation_controller.h"
 #include "targets/registry.h"
 
@@ -92,8 +92,8 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
 
 class Engine::Impl {
 public:
-    using Executor27 = runtime::OrdinaryExecutor<targets::Qwen3_6_27BInstance>;
-    using Executor35 = runtime::OrdinaryExecutor<targets::Qwen3_6_35BA3BInstance>;
+    using Executor27 = runtime::ConcurrentExecutor<targets::Qwen3_6_27BInstance>;
+    using Executor35 = runtime::ConcurrentExecutor<targets::Qwen3_6_35BA3BInstance>;
     using Executor =
         std::variant<std::monostate, std::unique_ptr<Executor27>, std::unique_ptr<Executor35>>;
 
@@ -102,7 +102,7 @@ public:
         auto constructed = targets::construct_target(options, device);
         active           = std::move(constructed.active);
         load             = std::move(constructed.load);
-        if (options.speculative.backend == SpeculativeBackend::None) {
+        if (options.speculative.backend != SpeculativeBackend::DFlash) {
             executor = std::visit(
                 [&](auto& target_ptr) -> Executor {
                     using Instance =
@@ -124,10 +124,10 @@ public:
         } catch (...) {}
     }
 
-    GenerationResult run_legacy(std::unique_ptr<PreparedPrompt::Impl> prompt,
+    GenerationResult run_dflash(std::unique_ptr<PreparedPrompt::Impl> prompt,
                                 RequestOptions request_options, HostInputLease host_input,
                                 OutputSink* sink, const CancellationView& cancellation) {
-        std::scoped_lock lock(legacy_generation_mutex);
+        std::scoped_lock lock(dflash_generation_mutex);
         return std::visit(
             [&](auto& target_ptr) -> GenerationResult {
                 if (target_ptr == nullptr) {
@@ -173,7 +173,7 @@ public:
     targets::ActiveTarget active;
     LoadSummary load;
     Executor executor;
-    mutable std::mutex legacy_generation_mutex;
+    mutable std::mutex dflash_generation_mutex;
 };
 
 Engine::Engine(EngineOptions options) : impl_(std::make_shared<Impl>(std::move(options))) {}
@@ -274,12 +274,12 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             std::make_unique<GenerationHandle::Impl>(impl_, std::move(immediate)));
     }
 
-    if (impl_->options.speculative.backend == SpeculativeBackend::None) {
+    if (impl_->options.speculative.backend != SpeculativeBackend::DFlash) {
         return std::visit(
             [&](auto& executor) -> GenerationHandle {
                 using Executor = std::remove_cvref_t<decltype(executor)>;
                 if constexpr (std::is_same_v<Executor, std::monostate>) {
-                    throw std::logic_error("ordinary Engine executor is unavailable");
+                    throw std::logic_error("concurrent Engine executor is unavailable");
                 } else {
                     auto submission = executor->submit(
                         std::move(prompt.impl_->value), prompt_summary, prepare_seconds,
@@ -291,19 +291,19 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             impl_->executor);
     }
 
-    struct LegacySubmission {
+    struct DFlashSubmission {
         std::shared_ptr<Impl> engine;
         HostInputLease host_input;
         std::unique_ptr<PreparedPrompt::Impl> prompt;
         RequestOptions options;
 
         GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
-            return engine->run_legacy(std::move(prompt), std::move(options), std::move(host_input),
+            return engine->run_dflash(std::move(prompt), std::move(options), std::move(host_input),
                                       sink, cancellation);
         }
-    } legacy{impl_, std::move(host_input), std::move(prompt.impl_), std::move(options)};
+    } dflash{impl_, std::move(host_input), std::move(prompt.impl_), std::move(options)};
 
-    return GenerationHandle(std::make_unique<GenerationHandle::Impl>(impl_, std::move(legacy)));
+    return GenerationHandle(std::make_unique<GenerationHandle::Impl>(impl_, std::move(dflash)));
 }
 
 GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options, OutputSink* sink,
@@ -323,19 +323,19 @@ LoadSummary Engine::load_summary() const {
 
 MemorySummary Engine::memory_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    if (impl_->options.speculative.backend == SpeculativeBackend::None) {
+    if (impl_->options.speculative.backend != SpeculativeBackend::DFlash) {
         return std::visit(
             [](const auto& executor) -> MemorySummary {
                 using Executor = std::remove_cvref_t<decltype(executor)>;
                 if constexpr (std::is_same_v<Executor, std::monostate>) {
-                    throw std::logic_error("ordinary Engine executor is unavailable");
+                    throw std::logic_error("concurrent Engine executor is unavailable");
                 } else {
                     return executor->memory_summary();
                 }
             },
             impl_->executor);
     }
-    std::scoped_lock lock(impl_->legacy_generation_mutex);
+    std::scoped_lock lock(impl_->dflash_generation_mutex);
     return std::visit(
         [](const auto& target_ptr) {
             if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
@@ -348,7 +348,7 @@ MemorySummary Engine::memory_summary() const {
 
 void Engine::reset_memory_peaks() noexcept {
     if (impl_ == nullptr) { return; }
-    if (impl_->options.speculative.backend == SpeculativeBackend::None) {
+    if (impl_->options.speculative.backend != SpeculativeBackend::DFlash) {
         std::visit(
             [](auto& executor) {
                 using Executor = std::remove_cvref_t<decltype(executor)>;
@@ -359,7 +359,7 @@ void Engine::reset_memory_peaks() noexcept {
             impl_->executor);
         return;
     }
-    std::unique_lock lock(impl_->legacy_generation_mutex, std::defer_lock);
+    std::unique_lock lock(impl_->dflash_generation_mutex, std::defer_lock);
     try {
         lock.lock();
     } catch (...) { return; }

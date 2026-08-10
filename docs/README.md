@@ -37,10 +37,10 @@ additional user workflows or installed API documentation.
 
 Active implementation and architecture references:
 
-- [Single-request Decode CUDA Graph topology](maintainer/decode-cuda-graph-topology.md)
+- [Decode CUDA Graph topology](maintainer/decode-cuda-graph-topology.md)
 - [Small-scale concurrent inference architecture](maintainer/concurrent-inference-architecture.md)
 - [Concurrent decode operator requirements](maintainer/concurrent-decode-operators.md)
-- [Aggregate-column public Op transaction checklist](maintainer/aggregate-column-ops-checklist.md)
+- [Concurrent MTP execution](maintainer/concurrent-mtp-implementation.md)
 - [Paged KV context storage, ownership, and capacity model](maintainer/paged-kv-cache.md)
 - [Op admission, contracts, ownership, qualification, and performance rules](maintainer/op-development.md)
 - [Softmax Attention organization and migration contract](maintainer/softmax-attention.md)

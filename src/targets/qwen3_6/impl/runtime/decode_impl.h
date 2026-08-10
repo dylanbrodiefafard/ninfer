@@ -10,15 +10,11 @@
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
 
-auto ordinary_body(State& state, bool align_mtp, ops::GqaExecutionEnvelope envelope) {
-    auto record = [&state, align_mtp, envelope] {
-        if (align_mtp && !state.io.mtp) {
-            throw std::logic_error("MTP alignment requires MTP round state");
-        }
+auto ordinary_body(State& state, ops::GqaExecutionEnvelope envelope) {
+    auto record = [&state, envelope] {
         TextContext card(state.device, state.model, state.work, state.text_kv,
                          state.linear_attention, state.io, state.prefill_hidden,
-                         state.prefill_chunk, state.text_kv_base,
-                         align_mtp ? state.mtp_kv : qwen3_6::PagedKVCacheView());
+                         state.prefill_chunk, state.text_kv_base);
         configure_text_card(card, state);
 
         Tensor verify_id = state.io.speculative.target_input_ids.slice(0, 0, 1);
@@ -37,21 +33,10 @@ auto ordinary_body(State& state, bool align_mtp, ops::GqaExecutionEnvelope envel
         ops::sample(logits, state.io.token, TextConfig::token_domain, state.sampling, state.io.pos,
                     ops::kSamplePurposeDecode, state.work, state.device.stream);
 
-        if (align_mtp) {
-            Tensor hidden     = state.io.verify_hidden.slice(1, 0, 1);
-            Tensor mtp_hidden = state.io.mtp->ar_hidden;
-            card.mtp_forward_batch(state.io.token, hidden, position, envelope, mtp_hidden, -1,
-                                   nullptr, nullptr);
-        }
-
         ops::increment_i32_scalar(state.io.pos, state.device.stream);
         ops::increment_i32_scalar(state.io.rope_pos, state.device.stream);
         ops::assign_i32_scalar(state.io.linear_state_snapshot_base_slot,
                                state.io.linear_state_read_slot, state.device.stream);
-        if (state.mtp_kv.valid() || state.dflash != nullptr) {
-            Tensor fallback_steps = state.io.speculative.stats.slice(0, 3, 1);
-            ops::increment_i64_scalar(fallback_steps, state.device.stream);
-        }
     };
     return record;
 }
@@ -100,15 +85,15 @@ auto ordinary_batch_body(State& state, std::int32_t batch_size,
 
 } // namespace
 
-void warm_capture_ordinary_round(State& state, bool align_mtp, ops::GqaExecutionEnvelope envelope,
+void warm_capture_ordinary_round(State& state, ops::GqaExecutionEnvelope envelope,
                                  const GraphPrepare& prepare, DecodeGraphDefinition& definition) {
-    auto body = ordinary_body(state, align_mtp, envelope);
+    auto body = ordinary_body(state, envelope);
     warm_capture(state, definition, prepare, body);
 }
 
-void ordinary_round(State& state, bool align_mtp, ops::GqaExecutionEnvelope envelope,
+void ordinary_round(State& state, ops::GqaExecutionEnvelope envelope,
                     DecodeGraphExecutable* executable) {
-    auto body = ordinary_body(state, align_mtp, envelope);
+    auto body = ordinary_body(state, envelope);
     run_prepared(state, executable, body);
 }
 

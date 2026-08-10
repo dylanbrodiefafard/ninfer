@@ -16,6 +16,7 @@ struct GdnConvSnapshotEpilogue {
     __nv_bfloat16* conv_states;
     const std::int32_t* initial_slot;
     const std::int32_t* snapshot_base_slot;
+    const std::int32_t* valid_columns;
     __nv_bfloat16* query;
     __nv_bfloat16* key;
     __nv_bfloat16* value;
@@ -32,6 +33,8 @@ struct GdnConvSnapshotEpilogue {
         const std::int32_t row          = global_row_offset + local_row;
         const std::int64_t slot_stride  = static_cast<std::int64_t>(channels) * 3;
         const std::int64_t initial_base = static_cast<std::int64_t>(*initial_slot) * slot_stride;
+        std::int32_t valid              = valid_columns == nullptr ? Tokens : *valid_columns;
+        valid                           = valid < 0 ? 0 : (valid > Tokens ? Tokens : valid);
 
         float s0       = __bfloat162float(conv_states[initial_base + row]);
         float s1       = __bfloat162float(conv_states[initial_base + channels + row]);
@@ -43,6 +46,19 @@ struct GdnConvSnapshotEpilogue {
 
 #pragma unroll
         for (int token = 0; token < Tokens; ++token) {
+            if (token >= valid) {
+                if (row < query_rows) {
+                    query[static_cast<std::int64_t>(token) * query_rows + row] =
+                        __float2bfloat16_rn(0.0F);
+                } else if (row < query_rows + key_rows) {
+                    key[static_cast<std::int64_t>(token) * key_rows + row - query_rows] =
+                        __float2bfloat16_rn(0.0F);
+                } else {
+                    value[static_cast<std::int64_t>(token) * value_rows + row - query_rows -
+                          key_rows] = __float2bfloat16_rn(0.0F);
+                }
+                continue;
+            }
             const float p              = projected[token];
             float conv                 = fmaf(w0, s0, 0.0F);
             conv                       = fmaf(w1, s1, conv);
@@ -74,7 +90,8 @@ template <int Channels, int QueryRows, int KeyRows, int ValueRows, int Tokens>
 __launch_bounds__(64) __global__ void gdn_projected_conv_snapshot_kernel(
     const __nv_bfloat16* __restrict__ projected, const __nv_bfloat16* __restrict__ conv_weight,
     __nv_bfloat16* __restrict__ conv_states, const std::int32_t* __restrict__ initial_slot,
-    const std::int32_t* __restrict__ snapshot_base_slot, __nv_bfloat16* __restrict__ query,
+    const std::int32_t* __restrict__ snapshot_base_slot,
+    const std::int32_t* __restrict__ valid_columns, __nv_bfloat16* __restrict__ query,
     __nv_bfloat16* __restrict__ key, __nv_bfloat16* __restrict__ value) {
     static_assert(Channels == QueryRows + KeyRows + ValueRows && Tokens >= 1);
     const int row =
@@ -83,6 +100,8 @@ __launch_bounds__(64) __global__ void gdn_projected_conv_snapshot_kernel(
 
     constexpr std::int64_t slot_stride = static_cast<std::int64_t>(Channels) * 3;
     const std::int64_t initial_base    = static_cast<std::int64_t>(*initial_slot) * slot_stride;
+    std::int32_t valid                 = valid_columns == nullptr ? Tokens : *valid_columns;
+    valid                              = valid < 0 ? 0 : (valid > Tokens ? Tokens : valid);
     float s0                           = __bfloat162float(conv_states[initial_base + row]);
     float s1       = __bfloat162float(conv_states[initial_base + Channels + row]);
     float s2       = __bfloat162float(conv_states[initial_base + 2LL * Channels + row]);
@@ -93,6 +112,19 @@ __launch_bounds__(64) __global__ void gdn_projected_conv_snapshot_kernel(
 
 #pragma unroll
     for (int token = 0; token < Tokens; ++token) {
+        if (token >= valid) {
+            if (row < QueryRows) {
+                query[static_cast<std::int64_t>(token) * QueryRows + row] =
+                    __float2bfloat16_rn(0.0F);
+            } else if (row < QueryRows + KeyRows) {
+                key[static_cast<std::int64_t>(token) * KeyRows + row - QueryRows] =
+                    __float2bfloat16_rn(0.0F);
+            } else {
+                value[static_cast<std::int64_t>(token) * ValueRows + row - QueryRows - KeyRows] =
+                    __float2bfloat16_rn(0.0F);
+            }
+            continue;
+        }
         const float p =
             __bfloat162float(projected[static_cast<std::int64_t>(token) * Channels + row]);
         float conv                 = fmaf(w0, s0, 0.0F);

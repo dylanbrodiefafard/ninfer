@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -96,13 +97,19 @@ struct RoundMeasurement {
 
 RoundMeasurement measure_round(target::Package::Program& program, ninfer::DeviceContext& device,
                                std::uint32_t draft_tokens) {
+    constexpr std::array<std::uint32_t, 1> lanes{0};
+    const std::array<ninfer::runtime::RoundBudget, 1> budgets{
+        ninfer::runtime::RoundBudget{.generated_tokens_remaining = draft_tokens + 1}};
     ninfer::CudaEventTimer timer(device);
     timer.start();
-    auto round = program.decode_round(
-        ninfer::runtime::RoundBudget{.generated_tokens_remaining = draft_tokens + 1});
-    const float milliseconds     = timer.stop_ms();
-    const std::uint32_t licensed = static_cast<std::uint32_t>(round.tokens.size());
-    program.resolve_pending(licensed, false);
+    const auto round         = program.decode_batch(lanes, budgets);
+    const float milliseconds = timer.stop_ms();
+    const std::uint32_t licensed =
+        round.row_counts.empty() ? 1U : static_cast<std::uint32_t>(round.row_counts.front());
+    const std::array<std::uint32_t, 1> accepted{licensed};
+    constexpr std::array<std::uint8_t, 1> terminal{0};
+    constexpr std::array<std::uint8_t, 1> cancelled{0};
+    program.resolve_pending_batch(lanes, accepted, terminal, cancelled);
     return RoundMeasurement{.milliseconds = milliseconds, .licensed_tokens = licensed};
 }
 
@@ -148,15 +155,18 @@ int run(const Options& options) {
     ninfer::ExecutionOptions execution;
     execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);
     execution.allow_prefix_reuse      = false;
-    auto request_plan                 = program->plan_request(prompt, execution);
+    auto request_plan                 = program->plan_request_for_lane(0, prompt, execution);
     request_memory.activate(request_plan.summary().transient_bytes,
                             request_plan.summary().transient_alignment);
-    auto first =
-        program->begin(std::move(prompt), std::move(request_plan), request_memory.region());
+    const auto first = program->start_prefill_lane(0, std::move(prompt), std::move(request_plan),
+                                                   request_memory.region());
     request_memory.deactivate();
-    program->resolve_pending(static_cast<std::uint32_t>(first.round.tokens.size()), false);
+    if (!first.complete || first.round.tokens.size() != 1) {
+        throw std::runtime_error("benchmark seed prefill did not complete in one scheduling unit");
+    }
+    program->resolve_pending_lane(0, 1, false);
 
-    const std::uint64_t rounds_before = program->speculative_stats().rounds;
+    const std::uint64_t rounds_before = program->speculative_stats_lane(0).rounds;
     for (int iteration = 0; iteration < options.warmup; ++iteration) {
         (void)measure_round(*program, device, options.draft_tokens);
     }
@@ -166,7 +176,7 @@ int run(const Options& options) {
     for (int iteration = 0; iteration < options.repetitions; ++iteration) {
         measurements.push_back(measure_round(*program, device, options.draft_tokens));
     }
-    const ninfer::SpeculativeStats stats = program->speculative_stats();
+    const ninfer::SpeculativeStats stats = program->speculative_stats_lane(0);
     if (stats.rounds - rounds_before != measured_rounds || stats.fallback_steps != 0) {
         throw std::runtime_error("benchmark did not stay on the native MTP proposal/verify path");
     }

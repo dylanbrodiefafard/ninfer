@@ -164,6 +164,8 @@ public:
 
     void set_boundary_hidden_output(Tensor* output) noexcept { boundary_hidden_output_ = output; }
 
+    void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
+
     void set_linear_state_group(std::int32_t base, std::int32_t capacity);
 
     [[nodiscard]] const Weight* proposal_head() const noexcept { return proposal_head_; }
@@ -185,6 +187,10 @@ public:
     void prefill(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
                  VisionPrefillSession& vision);
     [[nodiscard]] PrefillChunkResult prefill_chunk(std::span<const int> ids, bool finalize_at_end);
+    [[nodiscard]] PrefillChunkResult prefill_chunk(std::span<const int> full_ids,
+                                                   std::uint32_t begin,
+                                                   std::uint32_t nominal_length,
+                                                   bool finalize_at_end);
     [[nodiscard]] PrefillChunkResult
     prefill_chunk(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
                   std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);
@@ -197,6 +203,17 @@ public:
                                const Tensor& linear_state_read_slots,
                                const Tensor& linear_state_snapshot_base_slots,
                                ops::GqaExecutionEnvelope envelope, Tensor& hidden, Tensor& logits);
+    void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
+                             const Tensor& rope_positions, const Tensor& valid_columns,
+                             const Tensor& kv_table_rows, const Tensor& linear_state_read_slots,
+                             const Tensor& linear_state_snapshot_base_slots,
+                             ops::GqaExecutionEnvelope envelope, Tensor& hidden, Tensor& logits,
+                             Tensor& target_tokens);
+    void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
+                                  const Tensor& cache_positions, const Tensor& rope_positions,
+                                  const Tensor& valid_columns, const Tensor& kv_table_rows,
+                                  ops::GqaExecutionEnvelope envelope, Tensor& mtp_hidden);
+    void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens);
     void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                            ops::GqaExecutionEnvelope envelope, Tensor& mtp_hidden,
                            int logits_column, Tensor* logits, Tensor* draft_token,
@@ -205,9 +222,6 @@ public:
     void mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
                              const Tensor& position, ops::GqaExecutionEnvelope envelope,
                              Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token);
-    void mtp_sample_from_hidden_row(const Tensor& mtp_hidden, const Tensor& row, Tensor& out_hidden,
-                                    Tensor& logits, Tensor& draft_token);
-
 private:
     void bind();
 
@@ -243,8 +257,14 @@ private:
         std::int32_t rope_delta      = 0;
     };
 
+    struct TextPrefill {
+        std::span<const int> token_ids;
+        std::uint32_t begin = 0;
+    };
+
     template <class Tap>
     [[nodiscard]] PrefillChunkResult prefill_impl(std::span<const int> ids,
+                                                  const TextPrefill* text_prefill,
                                                   const MultimodalPrefill* multimodal, Tap& tap,
                                                   bool single_chunk, bool finalize_at_end);
     template <class Tap>
@@ -266,8 +286,11 @@ private:
     const Tensor* active_kv_table_rows_                    = nullptr;
     const Tensor* active_linear_state_read_slots_          = nullptr;
     const Tensor* active_linear_state_snapshot_base_slots_ = nullptr;
+    const Tensor* active_valid_columns_                    = nullptr;
+    const Tensor* active_backend_kv_table_rows_            = nullptr;
     const ops::GqaExecutionEnvelope* active_gqa_envelope_  = nullptr;
     std::int32_t active_sequence_batch_                    = 0;
+    std::int32_t active_sequence_width_                    = 0;
     std::int32_t rope_delta_                               = 0;
     std::int32_t linear_state_prefill_read_slot_           = 0;
     std::int32_t linear_state_prefill_working_slot_        = 0;
@@ -276,6 +299,7 @@ private:
     Tensor* boundary_hidden_output_                        = nullptr;
     bool mtp_prompt_prepared_                              = false;
     std::uint32_t last_prefill_chunk_length_               = 0;
+    std::uint32_t mtp_proposal_extent_                     = 0;
 
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;

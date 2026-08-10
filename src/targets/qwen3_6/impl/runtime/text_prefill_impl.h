@@ -15,6 +15,7 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 void configure_text_card(TextContext& card, const State& state) {
     card.set_sampling(state.sampling);
     card.set_linear_state_group(state.linear_state_base, state.linear_state_capacity);
+    card.set_mtp_proposal_extent(state.mtp_proposal_extent);
     if (state.proposal_head == ProposalHead::Full) {
         card.set_proposal_head(nullptr, nullptr, 0);
         return;
@@ -53,18 +54,19 @@ bool prefill_text(State& state, std::span<const TokenId> ids,
 }
 
 PrefillChunkResult prefill_text_chunk(State& state, std::span<const TokenId> ids,
+                                      std::uint32_t nominal_length,
                                       std::optional<std::uint32_t> snapshot_boundary,
                                       bool finalize_at_end) {
-    if (state.dflash != nullptr || state.mtp_kv.valid()) {
-        throw std::logic_error("staged prefill is only defined for ordinary decoding");
-    }
+    if (state.dflash != nullptr) { throw std::logic_error("DFlash staged prefill is unavailable"); }
     TextContext card(state.device, state.model, state.work, state.text_kv, state.linear_attention,
-                     state.io, state.prefill_hidden, state.prefill_chunk, state.text_kv_base);
+                     state.io, state.prefill_hidden, state.prefill_chunk, state.text_kv_base,
+                     state.mtp_kv);
     configure_text_card(card, state);
     card.set_boundary_hidden_output(state.boundary_hidden);
     card.set_prefill_snapshot_boundary(
         snapshot_boundary ? static_cast<std::int64_t>(*snapshot_boundary) : -1);
-    return card.prefill_chunk(std::span<const int>(ids.data(), ids.size()), finalize_at_end);
+    return card.prefill_chunk(std::span<const int>(ids.data(), ids.size()), state.text_kv_base,
+                              nominal_length, finalize_at_end);
 }
 
 PrefillChunkResult prefill_multimodal_chunk(State& state, const PreparedPromptData& prompt,
@@ -72,16 +74,54 @@ PrefillChunkResult prefill_multimodal_chunk(State& state, const PreparedPromptDa
                                             std::uint32_t nominal_length,
                                             std::optional<std::uint32_t> snapshot_boundary,
                                             bool finalize_at_end) {
-    if (state.dflash != nullptr || state.mtp_kv.valid()) {
-        throw std::logic_error("staged multimodal prefill is only defined for ordinary decoding");
+    if (state.dflash != nullptr) {
+        throw std::logic_error("DFlash staged multimodal prefill is unavailable");
     }
     TextContext card(state.device, state.model, state.work, state.text_kv, state.linear_attention,
-                     state.io, state.prefill_hidden, state.prefill_chunk, state.text_kv_base);
+                     state.io, state.prefill_hidden, state.prefill_chunk, state.text_kv_base,
+                     state.mtp_kv);
     configure_text_card(card, state);
     card.set_boundary_hidden_output(state.boundary_hidden);
     card.set_prefill_snapshot_boundary(
         snapshot_boundary ? static_cast<std::int64_t>(*snapshot_boundary) : -1);
     return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision, finalize_at_end);
+}
+
+void mtp_bridge_multimodal(State& state, const PreparedPromptData& prompt,
+                           VisionPrefillSession& vision, const MtpBridgeInput& bridge) {
+    if (!state.mtp_kv.valid() || bridge.previous_hidden == nullptr || state.text_kv_base == 0 ||
+        bridge.position < 0 ||
+        static_cast<std::uint32_t>(bridge.position) + 1 != state.text_kv_base) {
+        throw std::logic_error("multimodal MTP bridge does not match the reusable frontier");
+    }
+
+    Tensor bridge_token = state.io.speculative.target_input_ids.slice(0, 0, 1);
+    const TokenId token = prompt.token_ids[state.text_kv_base];
+    CUDA_CHECK(cudaMemcpyAsync(bridge_token.data, &token, sizeof(token), cudaMemcpyHostToDevice,
+                               state.device.stream));
+
+    Tensor visual_embedding;
+    const Tensor* composed_embedding = nullptr;
+    if (prompt.token_types[state.text_kv_base] != 0) {
+        const VisionChunk chunk = vision.prepare_chunk(state.text_kv_base, 1);
+        if (chunk.control == nullptr) {
+            throw std::logic_error("visual MTP bridge has no encoded Vision item");
+        }
+        const auto& scatter = chunk.control->scatter_indices;
+        const auto column   = std::lower_bound(scatter.begin(), scatter.end(),
+                                               static_cast<std::int32_t>(state.text_kv_base));
+        if (column == scatter.end() || *column != static_cast<std::int32_t>(state.text_kv_base) ||
+            static_cast<std::uint8_t>(chunk.control->modality) !=
+                prompt.token_types[state.text_kv_base]) {
+            throw std::logic_error("visual MTP bridge does not match Vision scatter metadata");
+        }
+        visual_embedding =
+            chunk.embeddings.slice(1, static_cast<std::int32_t>(column - scatter.begin()), 1);
+        composed_embedding = &visual_embedding;
+    }
+
+    mtp_bridge_and_propose(state, bridge_token, *bridge.previous_hidden, bridge.position,
+                           bridge.rope_position, false, composed_embedding);
 }
 
 MultimodalPrefillResult prefill_multimodal(State& state, PreparedPromptData& prompt,
@@ -98,41 +138,8 @@ MultimodalPrefillResult prefill_multimodal(State& state, PreparedPromptData& pro
         snapshot_boundary ? static_cast<std::int64_t>(*snapshot_boundary) : -1);
     VisionPrefillSession vision(state.device, state.model, state.work, prompt, plan, transient);
     if (mtp_bridge != nullptr) {
-        if (!prepare_mtp || mtp_bridge->previous_hidden == nullptr || state.text_kv_base == 0 ||
-            mtp_bridge->position < 0 ||
-            static_cast<std::uint32_t>(mtp_bridge->position) + 1 != state.text_kv_base) {
-            throw std::logic_error("multimodal MTP bridge does not match the reusable frontier");
-        }
-
-        Tensor bridge_token = state.io.speculative.target_input_ids.slice(0, 0, 1);
-        const TokenId token = prompt.token_ids[state.text_kv_base];
-        CUDA_CHECK(cudaMemcpyAsync(bridge_token.data, &token, sizeof(token), cudaMemcpyHostToDevice,
-                                   state.device.stream));
-
-        Tensor visual_embedding;
-        const Tensor* composed_embedding = nullptr;
-        if (prompt.token_types[state.text_kv_base] != 0) {
-            const VisionChunk chunk = vision.prepare_chunk(state.text_kv_base, 1);
-            if (chunk.control == nullptr) {
-                throw std::logic_error("visual MTP bridge has no encoded Vision item");
-            }
-            const auto& scatter = chunk.control->scatter_indices;
-            const auto column   = std::lower_bound(scatter.begin(), scatter.end(),
-                                                   static_cast<std::int32_t>(state.text_kv_base));
-            if (column == scatter.end() ||
-                *column != static_cast<std::int32_t>(state.text_kv_base) ||
-                static_cast<std::uint8_t>(chunk.control->modality) !=
-                    prompt.token_types[state.text_kv_base]) {
-                throw std::logic_error("visual MTP bridge does not match Vision scatter metadata");
-            }
-            visual_embedding =
-                chunk.embeddings.slice(1, static_cast<std::int32_t>(column - scatter.begin()), 1);
-            composed_embedding = &visual_embedding;
-        }
-
-        mtp_bridge_and_propose(state, bridge_token, *mtp_bridge->previous_hidden,
-                               mtp_bridge->position, mtp_bridge->rope_position, false,
-                               composed_embedding);
+        if (!prepare_mtp) { throw std::logic_error("multimodal MTP bridge is disabled"); }
+        mtp_bridge_multimodal(state, prompt, vision, *mtp_bridge);
     }
     card.prefill(prompt, state.text_kv_base, vision);
     if (card.last_prefill_chunk_length() == 0) {
