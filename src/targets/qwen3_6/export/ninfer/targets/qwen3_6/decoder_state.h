@@ -13,16 +13,17 @@ namespace ninfer::targets::qwen3_6 {
 inline constexpr std::int32_t kKvQuantGroup = 64;
 
 struct DecoderStateSpec {
-    std::uint32_t full_attention_layers    = 0;
-    std::uint32_t mtp_layers               = 0;
-    std::uint32_t capacity                 = 0;
-    std::int32_t kv_heads                  = 0;
-    std::int32_t attention_head_dim        = 0;
-    DType kv_dtype                         = DType::BF16;
-    std::int32_t kv_quant_group            = 0;
-    bool enable_mtp                        = false;
-    std::int32_t kv_table_rows             = 1;
-    std::uint32_t mtp_physical_page_groups = 0;
+    std::uint32_t full_attention_layers     = 0;
+    std::uint32_t mtp_layers                = 0;
+    std::uint32_t capacity                  = 0;
+    std::int32_t kv_heads                   = 0;
+    std::int32_t attention_head_dim         = 0;
+    DType kv_dtype                          = DType::BF16;
+    std::int32_t kv_quant_group             = 0;
+    bool enable_mtp                         = false;
+    std::int32_t kv_table_rows              = 1;
+    std::uint32_t text_physical_page_groups = 0;
+    std::uint32_t mtp_physical_page_groups  = 0;
     LinearAttentionStatePoolSpec linear_attention;
 };
 

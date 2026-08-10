@@ -400,13 +400,15 @@ active used capacity
 ```
 
 Selected speculative backend 的物理 KV pool 虽与 Main Text pool 分离，但容量由同一个 target-specific
-profile 联合规划。设 `P` 为 page size，`M=ceil(max_context/P)`，`C=max_concurrency`。Main 与 DFlash
-各使用 `M` 个 physical page groups；MTP 使用
-`M + C*ceil((K-1)/P)` 个 physical groups，但每条 allocation 的 logical capacity 仍为 `M`。额外 groups
-只容纳多个 concurrent MTP rows 的 provisional lead，不扩大 request context。Active-priority retained
-eviction 后，任何满足 advertised Main pool contract 的 active entitlement set 都必须同时满足 backend
-reservation；backend 更早失败属于 startup sizing 或 accounting invariant violation，不是正常 admission
-backpressure。
+profile 联合规划。设 `S=max_context`、`K_main=kv_capacity`、`P` 为 page size、
+`L=ceil(S/P)`、`M=ceil(K_main/P)`、`C=max_concurrency`。Main 与 DFlash 各使用 `M` 个 physical page
+groups，每条 allocation 的 logical capacity 为 `L`；MTP 使用
+`M + C*ceil((K_draft-1)/P)` 个 physical groups，logical capacity 同样为 `L`，其中 `K_draft` 是
+speculative draft window。额外 groups 只容纳多个
+concurrent MTP rows 的 provisional lead，不扩大 request context。Startup 要求 `K_main>=S`、`M>=C`、
+`M<=C*L`。Active-priority retained eviction 后，任何满足 advertised Main pool contract 的 active
+entitlement set 都必须同时满足 backend reservation；backend 更早失败属于 startup sizing 或 accounting
+invariant violation，不是正常 admission backpressure。
 
 Prefill/decode 推进只把该 request 已有的 logical reservation 转换成 used capacity，不创建
 新的资源要求。Physical blocks 是提前划归还是按需绑定，属于 Sequence-State Store。

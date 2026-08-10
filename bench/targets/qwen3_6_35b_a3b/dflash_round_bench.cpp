@@ -191,14 +191,15 @@ int run(const Options& options) {
     const std::uint64_t capacity                 = options.batch_size == 1
                                                        ? per_request_capacity
                                                        : aligned_request_capacity * options.batch_size;
-    if (capacity > 262144) {
+    if (per_request_capacity > 262144 || capacity > std::numeric_limits<std::uint32_t>::max()) {
         throw std::invalid_argument("context and measured rounds exceed native capacity");
     }
 
     ninfer::EngineOptions engine;
     engine.artifact_path             = options.artifact;
     engine.device                    = options.device;
-    engine.max_context               = static_cast<std::uint32_t>(capacity);
+    engine.max_context               = static_cast<std::uint32_t>(per_request_capacity);
+    engine.kv_capacity               = static_cast<std::uint32_t>(capacity);
     engine.prefill_chunk             = 128;
     engine.kv_cache                  = ninfer::KvCacheStorage::BFloat16;
     engine.speculative.backend       = ninfer::SpeculativeBackend::DFlash;

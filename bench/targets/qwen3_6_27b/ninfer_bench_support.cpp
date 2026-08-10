@@ -641,6 +641,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "  \"memory\": {\n"
         << "    \"device\": " << env.memory.device << ",\n"
         << "    \"max_context\": " << env.memory.max_context << ",\n"
+        << "    \"kv_capacity\": " << env.memory.kv_capacity << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.memory.kv_cache) << "\",\n";
     append_arena_json(out, "weights", env.memory.weights, "    ", true);
     append_arena_json(out, "sequence", env.memory.sequence, "    ", true);

@@ -47,7 +47,8 @@ struct LoadProgress {
 struct EngineOptions {
     std::filesystem::path artifact_path;
     int device                         = 0;
-    std::uint32_t max_context          = 2048;
+    std::uint32_t max_context          = 2048; // Exact logical ceiling of each request.
+    std::uint32_t kv_capacity          = 2048; // Shared Main KV pool, in token positions.
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
@@ -272,6 +273,7 @@ struct ArenaMemorySummary {
 struct MemorySummary {
     int device                = 0;
     std::uint32_t max_context = 0;
+    std::uint32_t kv_capacity = 0; // Resolved page-aligned Main KV capacity.
     KvCacheStorage kv_cache   = KvCacheStorage::BFloat16;
     ArenaMemorySummary weights;
     ArenaMemorySummary sequence;

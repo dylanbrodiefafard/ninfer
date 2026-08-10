@@ -50,6 +50,11 @@ std::int32_t checked_i32(std::uint64_t value, const char* label) {
     return static_cast<std::int32_t>(value);
 }
 
+std::uint32_t page_count(std::uint32_t capacity) {
+    if (capacity == 0) { throw std::invalid_argument("Paged KV capacity must be positive"); }
+    return 1U + (capacity - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+}
+
 std::size_t align_up(std::size_t value, std::size_t alignment, const char* label) {
     const std::size_t padding = (alignment - value % alignment) % alignment;
     return checked_add(value, padding, label);
@@ -92,8 +97,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                     "Linear Attention state slots exceed int32");
     const auto effective_prefill_chunk =
         static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));
-    const std::uint32_t context_pages =
-        1U + (plan.capacity - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+    const std::uint32_t logical_pages  = page_count(plan.capacity);
+    const std::uint32_t physical_pages = page_count(plan.kv_capacity);
     const std::uint64_t mtp_extra_pages =
         plan.features.mtp()
             ? static_cast<std::uint64_t>(plan.max_concurrency) *
@@ -101,22 +106,23 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                    static_cast<std::uint32_t>(kPagedKVPageSize))
             : 0ULL;
     const std::uint32_t mtp_physical_pages = static_cast<std::uint32_t>(
-        checked_i32(static_cast<std::uint64_t>(context_pages) + mtp_extra_pages,
+        checked_i32(static_cast<std::uint64_t>(physical_pages) + mtp_extra_pages,
                     "MTP Paged KV physical pages exceed int32"));
     LayoutBuilder builder;
     PersistentLayout out;
     out.decoder = qwen3_6::plan_decoder_state(
         builder, qwen3_6::DecoderStateSpec{
-                     .full_attention_layers    = TextConfig::full_attention_layers(),
-                     .mtp_layers               = TextConfig::mtp_layers,
-                     .capacity                 = plan.capacity,
-                     .kv_heads                 = TextConfig::kv_heads,
-                     .attention_head_dim       = TextConfig::head_dim,
-                     .kv_dtype                 = plan.kv_dtype,
-                     .kv_quant_group           = plan.kv_quant_group,
-                     .enable_mtp               = plan.features.mtp(),
-                     .kv_table_rows            = static_cast<std::int32_t>(plan.max_concurrency),
-                     .mtp_physical_page_groups = mtp_physical_pages,
+                     .full_attention_layers     = TextConfig::full_attention_layers(),
+                     .mtp_layers                = TextConfig::mtp_layers,
+                     .capacity                  = plan.capacity,
+                     .kv_heads                  = TextConfig::kv_heads,
+                     .attention_head_dim        = TextConfig::head_dim,
+                     .kv_dtype                  = plan.kv_dtype,
+                     .kv_quant_group            = plan.kv_quant_group,
+                     .enable_mtp                = plan.features.mtp(),
+                     .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
+                     .text_physical_page_groups = physical_pages,
+                     .mtp_physical_page_groups  = mtp_physical_pages,
                      .linear_attention =
                          {
                              .layers         = TextConfig::gdn_layers(),
@@ -140,12 +146,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 builder, DFlashConfig::local_layers, DFlashConfig::local_capacity,
                 DFlashConfig::kv_heads, DFlashConfig::head_dim,
                 static_cast<std::int32_t>(plan.max_concurrency));
-            const std::uint32_t full_pages =
-                (plan.capacity + static_cast<std::uint32_t>(kPagedKVPageSize) - 1U) /
-                static_cast<std::uint32_t>(kPagedKVPageSize);
             PagedKVPoolSpec full_pool{
-                .page_group_count      = full_pages,
-                .logical_page_capacity = full_pages,
+                .page_group_count      = physical_pages,
+                .logical_page_capacity = logical_pages,
                 .table_rows            = static_cast<std::int32_t>(plan.max_concurrency),
                 .plane_order           = PagedKVPlaneOrder::HeadMajor,
                 .planes =
@@ -530,11 +533,19 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
-    const std::uint32_t context_pages =
-        1U + (options.max_context - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
-    if (context_pages < options.max_concurrency) {
+    if (options.kv_capacity == 0 || options.kv_capacity < options.max_context) {
+        throw std::invalid_argument("kv_capacity must be at least max_context");
+    }
+    const std::uint32_t logical_pages  = page_count(options.max_context);
+    const std::uint32_t physical_pages = page_count(options.kv_capacity);
+    if (physical_pages < options.max_concurrency) {
         throw std::invalid_argument(
-            "max_context cannot provide one Paged KV page per concurrent request");
+            "kv_capacity cannot provide one Paged KV page per concurrent request");
+    }
+    if (static_cast<std::uint64_t>(physical_pages) >
+        static_cast<std::uint64_t>(options.max_concurrency) * logical_pages) {
+        throw std::invalid_argument(
+            "kv_capacity exceeds the maximum usable capacity for max_context and max_concurrency");
     }
     switch (options.speculative.backend) {
     case SpeculativeBackend::None:
@@ -573,9 +584,13 @@ std::unique_ptr<SequencePlanImpl> plan_sequence_impl(DeviceContext& device,
                                                      WeightsProfile weights_profile) {
     validate_target_options(device, options);
 
-    auto impl                 = std::make_unique<SequencePlanImpl>();
-    impl->weights_profile     = weights_profile;
-    impl->capacity            = options.max_context;
+    auto impl             = std::make_unique<SequencePlanImpl>();
+    impl->weights_profile = weights_profile;
+    impl->capacity        = options.max_context;
+    impl->kv_capacity     = static_cast<std::uint32_t>(
+        checked_i32(static_cast<std::uint64_t>(page_count(options.kv_capacity)) *
+                            static_cast<std::uint32_t>(kPagedKVPageSize),
+                        "resolved Paged KV capacity exceeds int32"));
     impl->max_concurrency     = options.max_concurrency;
     impl->prefill_chunk       = std::min(options.prefill_chunk, options.max_context);
     impl->draft_window        = options.speculative.draft_tokens;

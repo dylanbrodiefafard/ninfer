@@ -40,7 +40,7 @@ CONTEXT_CORE = ((512, 512), (2048, 512), (8192, 512))
 CONTEXT_FULL_EXTRA = ((32768, 256), (65536, 128))
 PRIMARY_KS = (0, 3, 5)
 SWEEP_KS = (0, 1, 2, 3, 4, 5)
-REPORT_SCHEMA_VERSION = 10
+REPORT_SCHEMA_VERSION = 11
 REPORT_ARTIFACT_TYPE = "ninfer_bench_report"
 REPORT_TOOL = "ninfer_bench"
 
@@ -286,6 +286,7 @@ def report_rows(report_path: Path, case: BenchCase) -> list[dict[str, Any]]:
             "weights_id": load.get("weights_id"),
             "artifact_path": report.get("artifact", {}).get("path"),
             "max_context": config.get("max_context"),
+            "kv_capacity": memory.get("kv_capacity"),
             "prefill_chunk": config.get("prefill_chunk"),
             "kv_cache": config.get("kv_cache"),
             "mtp_draft_tokens": config.get("mtp_draft_tokens"),

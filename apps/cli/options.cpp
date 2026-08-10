@@ -63,7 +63,8 @@ KvCacheStorage parse_kv_cache(std::string_view text) {
 std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
-           "       [--max-context N] [--prefill-chunk N] [--max-new N] [--device N]\n"
+           "       [--max-context N] [--kv-capacity N] [--prefill-chunk N] [--max-new N]\n"
+           "       [--device N]\n"
            "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
@@ -86,7 +87,8 @@ Options parse_options(int argc, char** argv) {
         return options;
     }
     if (argc < 2) { throw std::invalid_argument(".ninfer model path is required"); }
-    options.artifact_path = argv[1];
+    options.artifact_path     = argv[1];
+    bool kv_capacity_explicit = false;
 
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -103,6 +105,9 @@ Options parse_options(int argc, char** argv) {
             options.max_new = parse_u32(value(arg), "max-new");
         } else if (arg == "--max-context") {
             options.max_context = parse_u32(value(arg), "max-context");
+        } else if (arg == "--kv-capacity") {
+            options.kv_capacity  = parse_u32(value(arg), "kv-capacity");
+            kv_capacity_explicit = true;
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {
@@ -167,6 +172,8 @@ Options parse_options(int argc, char** argv) {
         }
     }
 
+    if (!kv_capacity_explicit) { options.kv_capacity = options.max_context; }
+
     const bool has_prompt   = !options.prompt.empty();
     const bool has_messages = !options.messages_path.empty();
     if (has_prompt == has_messages) {
@@ -174,6 +181,9 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
+    }
+    if (options.kv_capacity < options.max_context) {
+        throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
     product::validate_speculative_cli_options(options.speculative);
     if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {

@@ -129,6 +129,7 @@ int run(const Options& options) {
                                                                   static_cast<std::uint64_t>(measured_rounds) *
                                                                       (options.draft_tokens + 1ULL) +
                                                                   2ULL * options.draft_tokens);
+    engine.kv_capacity               = engine.max_context;
     engine.prefill_chunk             = 128;
     engine.kv_cache                  = ninfer::KvCacheStorage::BFloat16;
     engine.speculative.backend       = ninfer::SpeculativeBackend::Mtp;

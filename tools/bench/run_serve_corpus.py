@@ -82,7 +82,7 @@ WARMUP_FIXTURE = "text_smoke_zh"
 RUN_ARTIFACT_TYPE = "ninfer_serve_corpus_result"
 RUN_SCHEMA_VERSION = 5
 SERVER_LOG_ARTIFACT_TYPE = "ninfer_serve_request_log"
-SERVER_LOG_SCHEMA_VERSION = 5
+SERVER_LOG_SCHEMA_VERSION = 6
 STARTUP_TIMEOUT_SECONDS = 1800.0
 REQUEST_TIMEOUT_SECONDS = 24.0 * 60.0 * 60.0
 LOG_EVENT_TIMEOUT_SECONDS = 10.0
@@ -458,6 +458,7 @@ def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> 
     actual = {
         "device": engine.get("device"),
         "max_context": engine.get("max_context"),
+        "kv_capacity": engine.get("kv_capacity"),
         "prefill_chunk": engine.get("prefill_chunk"),
         "kv_cache": engine.get("kv_cache"),
         "cuda_graph": engine.get("cuda_graph"),
@@ -469,6 +470,7 @@ def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> 
     expected = {
         "device": device,
         "max_context": 262144,
+        "kv_capacity": 262144,
         "prefill_chunk": 1024,
         "kv_cache": "int8-group64",
         "cuda_graph": True,

@@ -35,6 +35,8 @@ int main() {
                       "request JSONL logging is not disabled by default");
     failures += check(defaults.log_stats_interval_ms == 5000,
                       "periodic throughput interval default mismatch");
+    failures += check(defaults.kv_capacity == defaults.max_context,
+                      "default KV capacity does not follow max context");
     failures += check(defaults.speculative.backend == ninfer::SpeculativeBackend::None,
                       "speculative decoding is not disabled by default");
 
@@ -62,13 +64,15 @@ int main() {
 
     const ServeOptions configured =
         parse({"ninfer-serve", "model.ninfer", "--no-prefix-reuse", "--vision", "--max-concurrency",
-               "4", "--max-pending-requests", "12", "--pending-timeout-ms", "2500",
-               "--log-stats-interval-ms", "0"});
+               "4", "--max-pending-requests", "12", "--pending-timeout-ms", "2500", "--max-context",
+               "4096", "--kv-capacity", "8192", "--log-stats-interval-ms", "0"});
     failures += check(!configured.allow_prefix_reuse,
                       "--no-prefix-reuse did not disable server prefix reuse");
     failures += check(configured.enable_vision, "--vision did not enable Vision");
     failures +=
         check(configured.max_concurrency == 4, "--max-concurrency did not reach serving options");
+    failures += check(configured.max_context == 4096 && configured.kv_capacity == 8192,
+                      "context and KV capacity options were not kept distinct");
     failures += check(configured.max_pending_requests == 12,
                       "--max-pending-requests did not reach serving options");
     failures += check(configured.pending_timeout_ms == 2500,
@@ -91,6 +95,13 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--log-stats-interval-ms") != std::string::npos,
               "serve help omits --log-stats-interval-ms");
+    failures += check(serve_usage_text("ninfer-serve").find("--kv-capacity") != std::string::npos,
+                      "serve help omits --kv-capacity");
+
+    const ServeOptions inherited =
+        parse({"ninfer-serve", "model.ninfer", "--max-context", "16384"});
+    failures +=
+        check(inherited.kv_capacity == 16384, "omitted --kv-capacity did not follow --max-context");
 
     const ServeOptions logged = parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl",
                                        "requests.jsonl", "--api-key", "do-not-log"});

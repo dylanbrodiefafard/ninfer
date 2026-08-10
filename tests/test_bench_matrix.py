@@ -5,12 +5,12 @@ import json
 from tools.bench.run_ninfer_bench_matrix import BenchCase, report_rows
 
 
-def test_schema_v10_report_is_flattened_for_matrix_summary(tmp_path) -> None:
+def test_schema_v11_report_is_flattened_for_matrix_summary(tmp_path) -> None:
     report_path = tmp_path / "report.json"
     report_path.write_text(
         json.dumps(
             {
-                "schema_version": 10,
+                "schema_version": 11,
                 "artifact_type": "ninfer_bench_report",
                 "tool": "ninfer_bench",
                 "artifact": {"path": "model.ninfer"},
@@ -25,6 +25,7 @@ def test_schema_v10_report_is_flattened_for_matrix_summary(tmp_path) -> None:
                     "peak_staging_bytes": 134_217_728,
                 },
                 "memory": {
+                    "kv_capacity": 8192,
                     "kv_payload_bytes": 123_456,
                     "weights": {"capacity_bytes": 17_400_000_000},
                     "sequence": {"capacity_bytes": 2_000_000_000},
@@ -95,6 +96,7 @@ def test_schema_v10_report_is_flattened_for_matrix_summary(tmp_path) -> None:
         True,
     )
     assert row["decode_graph_prime_output_tokens"] == 13
+    assert row["kv_capacity"] == 8192
     assert row["host_to_device_bytes"] == 17_400_000_000
     assert row["workspace_capacity_bytes"] == 100_000_000
     assert row["request_transient_capacity_bytes"] == 50_000_000

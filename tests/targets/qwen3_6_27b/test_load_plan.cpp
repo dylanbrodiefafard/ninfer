@@ -175,6 +175,7 @@ int verify_profile_mismatch_rejection() {
     ninfer::DeviceContext device(0);
     ninfer::EngineOptions options;
     options.max_context    = 128;
+    options.kv_capacity    = 128;
     options.prefill_chunk  = 128;
     options.use_cuda_graph = false;
     auto sequence          = Package::plan_sequence(device, options, WeightsProfile::GroupwiseInt);

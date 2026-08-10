@@ -235,6 +235,7 @@ qb::BenchEnvironment sample_environment() {
                                              .resource_count       = 6};
     env.memory.device                     = 0;
     env.memory.max_context                = 4096;
+    env.memory.kv_capacity                = 8192;
     env.memory.kv_cache                   = ninfer::KvCacheStorage::Int8Group64;
     env.memory.weights                    = {17400000000ULL, 17400000000ULL, 17400000000ULL};
     env.memory.sequence                   = {2000000000ULL, 1900000000ULL, 1900000000ULL};
@@ -269,7 +270,7 @@ int test_report_contract() {
         return fail(std::string("invalid benchmark JSON: ") + error.what());
     }
 
-    failures += expect(report.at("schema_version") == 10, "report schema v10");
+    failures += expect(report.at("schema_version") == 11, "report schema v11");
     failures += expect(report.at("artifact_type") == "ninfer_bench_report", "report identity");
     failures += expect(report.at("artifact").at("path") == "model.ninfer", "artifact path");
     failures += expect(report.at("load").at("target") == "qwen3_6_27b", "load target");
@@ -277,6 +278,7 @@ int test_report_contract() {
     failures +=
         expect(report.at("load").at("host_to_device_bytes") == 17400000000ULL, "load H2D bytes");
     failures += expect(report.at("memory").at("kv_cache") == "int8-group64", "memory KV");
+    failures += expect(report.at("memory").at("kv_capacity") == 8192, "memory KV capacity");
     failures += expect(report.at("memory").at("workspace").at("capacity_bytes") == 100000000ULL,
                        "workspace capacity");
     failures +=

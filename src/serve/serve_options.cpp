@@ -56,7 +56,7 @@ KvCacheStorage parse_kv_dtype(const char* text) {
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
-           "[--model-id ID] [--max-context N] [--max-concurrency N] "
+           "[--model-id ID] [--max-context N] [--kv-capacity N] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
            "[--max-request-mib N] [--request-log-jsonl FILE] "
@@ -94,6 +94,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         redact_next = options.startup_argv.back() == "--api-key";
     }
     bool default_max_tokens_explicit = false;
+    bool kv_capacity_explicit        = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -117,6 +118,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--max-context") {
             options.max_context = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-context"), "max-context"));
+        } else if (arg == "--kv-capacity") {
+            options.kv_capacity = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kv-capacity"), "kv-capacity"));
+            kv_capacity_explicit = true;
         } else if (arg == "--max-concurrency") {
             options.max_concurrency = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));
@@ -191,10 +196,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             throw std::invalid_argument("unknown argument: " + arg);
         }
     }
+    if (!kv_capacity_explicit) { options.kv_capacity = options.max_context; }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");
     }
     if (options.max_context == 0) { throw std::invalid_argument("--max-context must be positive"); }
+    if (options.kv_capacity < options.max_context) {
+        throw std::invalid_argument("--kv-capacity must be at least --max-context");
+    }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("--max-concurrency must be in [1,8]");
     }

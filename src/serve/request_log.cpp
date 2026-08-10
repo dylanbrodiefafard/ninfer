@@ -325,6 +325,7 @@ std::string format_server_start_json(const std::string& server_instance_id, std:
     record["engine"]   = Json{
           {"device", options.device},
           {"max_context", options.max_context},
+          {"kv_capacity", memory.kv_capacity},
           {"max_concurrency", options.max_concurrency},
           {"max_pending_requests", options.max_pending_requests},
           {"pending_timeout_ms", options.pending_timeout_ms},

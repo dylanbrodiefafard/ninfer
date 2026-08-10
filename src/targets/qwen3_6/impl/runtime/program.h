@@ -229,6 +229,7 @@ public:
     const LoadedModelData& model;
     DeviceContext& device;
     const std::uint32_t capacity;
+    const std::uint32_t kv_capacity;
     const std::uint32_t max_concurrency;
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;

@@ -129,7 +129,8 @@ measured recommendation rather than a semantic limit.
 
 | Option | Meaning | Default |
 |---|---|---:|
-| `--max-context N` | allocated context capacity | `2048` |
+| `--max-context N` | per-sequence logical context ceiling | `2048` |
+| `--kv-capacity N` | shared Main Text KV pool capacity; omitted means `--max-context` | `2048` |
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
@@ -161,6 +162,9 @@ Both registered models have a native context limit of 262,144 tokens. The practi
 one RTX 5090 depends on the selected artifact, media workload, output budget, and KV-cache type.
 Use `--kv-dtype int8` for large context allocations. The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
+`--kv-capacity` controls the shared physical Main Text KV pool independently and is rounded up to
+the 64-token page size. The single-request CLI normally leaves it omitted so it follows
+`--max-context`; the distinction matters primarily to a concurrent Engine or server.
 
 At Engine startup NInfer reserves model weights, persistent sequence state, one phase-reused
 Program scratch arena, the maximum Vision request-transient buffer when Vision is enabled, and a

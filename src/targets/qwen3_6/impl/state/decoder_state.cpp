@@ -59,10 +59,9 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
 
 DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderStateSpec& spec) {
     DecoderStateLayout layout;
-    const std::uint32_t context_pages = page_count(spec.capacity);
     layout.text_kv = plan_cache(builder, spec.full_attention_layers, spec.capacity, spec.kv_heads,
                                 spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
-                                spec.kv_table_rows, context_pages);
+                                spec.kv_table_rows, spec.text_physical_page_groups);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,

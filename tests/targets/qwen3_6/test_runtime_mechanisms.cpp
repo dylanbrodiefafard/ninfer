@@ -41,15 +41,16 @@ void test_topology() {
 
 q36::DecoderStateSpec decoder_spec(ninfer::DType dtype, bool mtp) {
     return q36::DecoderStateSpec{
-        .full_attention_layers    = 2,
-        .mtp_layers               = 1,
-        .capacity                 = 129,
-        .kv_heads                 = 2,
-        .attention_head_dim       = 64,
-        .kv_dtype                 = dtype,
-        .kv_quant_group           = dtype == ninfer::DType::I8 ? q36::kKvQuantGroup : 0,
-        .enable_mtp               = mtp,
-        .mtp_physical_page_groups = mtp ? 4U : 0U,
+        .full_attention_layers     = 2,
+        .mtp_layers                = 1,
+        .capacity                  = 129,
+        .kv_heads                  = 2,
+        .attention_head_dim        = 64,
+        .kv_dtype                  = dtype,
+        .kv_quant_group            = dtype == ninfer::DType::I8 ? q36::kKvQuantGroup : 0,
+        .enable_mtp                = mtp,
+        .text_physical_page_groups = 5,
+        .mtp_physical_page_groups  = mtp ? 4U : 0U,
         .linear_attention =
             {
                 .layers         = 3,
@@ -70,10 +71,10 @@ void test_decoder_layout() {
         q36::plan_decoder_state(bf16_builder, decoder_spec(ninfer::DType::BF16, false));
     (void)bf16_builder.finish(256);
     expect(bf16.text_kv.pool.planes.size() == 4, "BF16 Text KV has K/V planes per layer");
-    expect(bf16.text_kv.pool.spec.page_group_count == 3 &&
+    expect(bf16.text_kv.pool.spec.page_group_count == 5 &&
                bf16.text_kv.pool.spec.logical_page_capacity == 3 &&
                bf16.text_kv.pool.spec.table_rows == 1,
-           "Text KV uses three P=64 pages and one execution row");
+           "Text KV separates five physical pages from three logical pages");
     expect(std::all_of(bf16.text_kv.pool.planes.begin(), bf16.text_kv.pool.planes.end(),
                        [](const ninfer::PagedKVPlaneLayout& plane) {
                            return plane.spec.dtype == ninfer::DType::BF16;

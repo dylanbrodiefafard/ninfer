@@ -11,6 +11,7 @@ Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
   --port 8080 \
   --model-id qwen3.6-27b \
   --max-context 16384 \
+  --kv-capacity 32768 \
   --max-concurrency 2 \
   --spec mtp --draft-tokens 3 \
   --lm-head-draft
@@ -155,7 +156,8 @@ curl http://127.0.0.1:8080/v1/models \
 | `--port N` | listen port | `8080` |
 | `--api-key KEY` | required bearer or `x-api-key` value | unset |
 | `--model-id ID` | public OpenAI model alias | `qwen3.6-27b` |
-| `--max-context N` | per-sequence logical ceiling and shared Main Text KV page budget | `8192` |
+| `--max-context N` | logical context ceiling of each sequence | `8192` |
+| `--kv-capacity N` | shared Main Text KV pool capacity; omitted means `--max-context` | `8192` |
 | `--max-concurrency N` | maximum admitted requests; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
@@ -251,11 +253,17 @@ media request retains the same cancellation and timeout deadline. Model output i
 same finite request count and each request's effective output-token limit; output callbacks and
 network serialization run outside the GPU executor and do not delay formation of the next batch.
 
-`--max-context` is not divided evenly among active requests. It defines each sequence's logical
-ceiling and the shared Main Text KV page budget. Admission reserves the full prompt-plus-effective-
-output entitlement, so an admitted request can finish within its declared bound. A later request
-waits in FIFO order when the remaining shared pages cannot satisfy its complete entitlement; the
-Engine never admits it and later truncates an older request to recover capacity.
+`--max-context` and `--kv-capacity` are independent limits. The former is each sequence's logical
+ceiling; the latter sizes the shared Main Text KV pool used by all active requests and retained
+prefixes. Both are rounded to 64-token pages internally, while a sequence can never cross the exact
+`--max-context` frontier. When `--kv-capacity` is omitted it follows `--max-context`, preserving one
+full-length request's capacity. The shared pool is not divided evenly among request lanes.
+
+Admission reserves the full prompt-plus-effective-output page entitlement, so an admitted request
+can finish within its declared bound. A later request waits in FIFO order when the remaining shared
+pages cannot satisfy its complete entitlement; the Engine never admits it and later truncates an
+older request to recover capacity. Startup rejects a KV pool smaller than one sequence, too small to
+provide one page per configured lane, or larger than all configured lanes could use.
 
 Compatible resident prefixes are reused for both text and multimodal histories unless the server is
 started with `--no-prefix-reuse`. A multimodal hit requires matching token types, three-axis MRoPE

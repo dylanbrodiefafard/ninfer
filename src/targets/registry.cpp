@@ -32,6 +32,12 @@ void validate_options(const EngineOptions& options) {
     if (options.max_context == 0) {
         throw std::invalid_argument("Engine max_context must be nonzero");
     }
+    if (options.kv_capacity == 0) {
+        throw std::invalid_argument("Engine kv_capacity must be nonzero");
+    }
+    if (options.kv_capacity < options.max_context) {
+        throw std::invalid_argument("Engine kv_capacity must be at least max_context");
+    }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
@@ -53,7 +59,7 @@ void validate_device_budget(std::uint64_t weight_bytes, std::size_t sequence_byt
                     "combined weight and sequence memory requirement overflows u64");
     if (required > free_bytes) {
         throw std::invalid_argument(
-            "model weights and requested context require " + std::to_string(required) +
+            "model weights and requested Engine capacity require " + std::to_string(required) +
             " bytes of device memory (weights " + std::to_string(weight_bytes) +
             ", sequence persistent/workspace/request transient/graphs " +
             std::to_string(sequence_bytes) + "), but only " + std::to_string(free_bytes) +

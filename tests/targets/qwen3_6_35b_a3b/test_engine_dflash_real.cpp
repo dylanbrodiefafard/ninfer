@@ -15,6 +15,7 @@ ninfer::EngineOptions ordinary_engine_options(const char* artifact) {
     ninfer::EngineOptions options;
     options.artifact_path  = artifact;
     options.max_context    = 128;
+    options.kv_capacity    = 128;
     options.prefill_chunk  = 128;
     options.kv_cache       = ninfer::KvCacheStorage::BFloat16;
     options.use_cuda_graph = false;
@@ -26,6 +27,7 @@ ninfer::EngineOptions dflash_engine_options(const char* artifact, ninfer::Propos
                                             std::uint32_t max_context) {
     ninfer::EngineOptions options     = ordinary_engine_options(artifact);
     options.max_context               = max_context;
+    options.kv_capacity               = max_context;
     options.speculative.backend       = ninfer::SpeculativeBackend::DFlash;
     options.speculative.draft_tokens  = 3;
     options.speculative.proposal_head = proposal;

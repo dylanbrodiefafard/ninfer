@@ -45,6 +45,7 @@ int main() {
     options.model_id                  = "qwen3.6-27b";
     options.request_log_jsonl         = "requests.jsonl";
     options.max_context               = 262144;
+    options.kv_capacity               = 524288;
     options.prefill_chunk             = 1024;
     options.log_stats_interval_ms     = 2500;
     options.kv_cache                  = ninfer::KvCacheStorage::Int8Group64;
@@ -68,6 +69,7 @@ int main() {
 
     ninfer::MemorySummary memory;
     memory.max_context                = 262144;
+    memory.kv_capacity                = 524288;
     memory.kv_cache                   = ninfer::KvCacheStorage::Int8Group64;
     memory.weights.capacity_bytes     = 100;
     memory.sequence.capacity_bytes    = 200;
@@ -91,13 +93,14 @@ int main() {
         "serve-test", 1000, options, load, memory, environment, std::uint64_t{123456}));
     failures += check(server.at("artifact_type") == kRequestLogArtifactType,
                       "server record artifact type mismatch");
-    failures += check(server.at("schema_version") == 5, "server record schema mismatch");
+    failures += check(server.at("schema_version") == 6, "server record schema mismatch");
     failures += check(server.at("event") == "server_start", "server event mismatch");
     failures += check(server.at("artifact").at("target") == "qwen3_6_27b", "server target missing");
     failures += check(server.at("artifact").at("weights_id") == "groupwise-int",
                       "server weights id missing");
     failures += check(server.at("artifact").at("size_bytes") == 123456, "artifact size missing");
     failures += check(server.at("engine").at("max_context") == 262144, "max context missing");
+    failures += check(server.at("engine").at("kv_capacity") == 524288, "KV capacity missing");
     failures +=
         check(server.at("engine").at("log_stats_interval_ms") == 2500, "stats interval missing");
     failures += check(server.at("server").at("request_log_jsonl") == "requests.jsonl",

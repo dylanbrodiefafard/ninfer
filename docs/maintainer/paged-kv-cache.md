@@ -92,27 +92,30 @@ KV pools。DFlash local cyclic KV 属于 fixed state，不在这个 pool set 中
 Engine 的 startup configuration 给出：
 
 ```text
-max_context                  单个 sequence 的逻辑上限，同时导出 shared Main pool capacity
+max_context                  单个 sequence 的逻辑上限 S
+kv_capacity                  shared Main pool 的容量输入 K_main
 max_concurrency              active sequence 上限
 selected speculative backend off、MTP 或 DFlash
 ```
 
 `max_concurrency` 只确定 control lanes、block-table rows 和 fixed per-sequence resources 的数量，不把 KV
-容量切成等份。`EngineOptions.max_context` 同时承担两个当前产品契约：任何单条 sequence 的 frontier 不得
-超过它；Main pool 的 shared physical page-group 数也由它导出。Backend capacity 不是独立用户配置，而由
-selected backend、`max_concurrency` 和 exact target frontier contract 唯一导出。
+容量切成等份。`EngineOptions.max_context` 只约束任何单条 sequence 的 frontier；
+`EngineOptions.kv_capacity` 只决定 Main pool 的 shared physical page-group 数。Backend capacity 不是独立
+用户配置，而由 Main capacity、selected backend、`max_concurrency` 和 exact target frontier contract
+唯一导出。
 
 Planner 将 Main contract 归一化为 physical page capacity：
 
 ```text
-M = ceil(max_context / P_main)
+L = ceil(S / P_main)
+M = ceil(K_main / P_main)
 Main physical page groups = M
-per-allocation logical page capacity = M
+per-allocation logical page capacity = L
 ```
 
-Engine 对外仍报告 configured `max_context`。最后一个 physical page 的 rounding tail 只属于 storage
-padding，不能让 sequence frontier 超过 `max_context`。Admission 以 page-group entitlement 计费，因此
-多个 requests 的 page-rounded entitlements 之和不能超过 `M`。
+Engine 对外同时报告 configured `max_context` 和 resolved `kv_capacity=M*P_main`。最后一个 physical page
+的 rounding tail 只属于 storage padding，不能让 sequence frontier 超过 `S`。Admission 以 page-group
+entitlement 计费，因此多个 active/retained requests 的 page-rounded entitlements 之和不能超过 `M`。
 
 内部使用 target-derived capacity vector：
 
@@ -123,11 +126,12 @@ KVCapacity = {
 }
 ```
 
-Main logical capacity 与 physical capacity 都是 `M` page groups。Backend 的 logical capacity 和 physical
-page-group count 必须分别描述：MTP 的额外 physical headroom 不能被解释为更大的 per-sequence logical
-context。Backend sizing 由 selected backend 的 fixed frontier relation 推导，不能从 main/backend
-bytes-per-token 比例推导，也不能独立配置。Startup 还要求 `M >= max_concurrency`，确保每个 active lane
-至少可以获得一页 Main entitlement。
+Main per-allocation logical capacity 是 `L`，physical capacity 是 `M` page groups。Backend 的 logical
+capacity 和 physical page-group count 必须分别描述：MTP 的额外 physical headroom 不能被解释为更大的
+per-sequence logical context。Backend sizing 由 selected backend 的 fixed frontier relation 推导，不能从
+main/backend bytes-per-token 比例推导，也不能独立配置。Startup 要求 raw `K_main >= S`、
+`M >= max_concurrency` 且 `M <= max_concurrency*L`；分别保证一个 request 可达到 `S`、每个 active lane
+至少可获得一页、且不接受 lanes 永远无法使用的 physical capacity。
 
 ### 3.3 Physical separation, coordinated capacity
 
@@ -152,24 +156,25 @@ bytes-per-token 比例推导，也不能独立配置。Startup 还要求 `M >= m
 范围，不能被解释为已提交状态。
 
 当前 registered targets 的 Main、MTP 和 DFlash Full pools 都使用 `P=64`。令
-`C=max_concurrency`，MTP draft window 为 `K`。Startup capacity profile 固定为：
+`C=max_concurrency`，MTP draft window 为 `K_draft`。Startup capacity profile 固定为：
 
 ```text
 speculative_backend = off:
-    Main physical=M, logical-per-allocation=M
+    Main physical=M, logical-per-allocation=L
     no backend growing pool
 
 speculative_backend = MTP:
-    Main physical=M, logical-per-allocation=M
-    MTP physical=M + C*ceil((K-1)/P), logical-per-allocation=M
+    Main physical=M, logical-per-allocation=L
+    MTP physical=M + C*ceil((K_draft-1)/P), logical-per-allocation=L
 
 speculative_backend = DFlash:
-    Main physical=M, logical-per-allocation=M
-    DFlash Full physical=M, logical-per-allocation=M
+    Main physical=M, logical-per-allocation=L
+    DFlash Full physical=M, logical-per-allocation=L
 ```
 
 MTP 的额外 physical groups 覆盖最多 `C` 条 concurrent rows 各自相对 Main entitlement 多出的
-`K-1` provisional positions；它不增加 block-table width，也不允许任一 allocation 超过 `M` logical pages。
+`K_draft-1` provisional positions；它不增加 block-table width，也不允许任一 allocation 超过 `L` logical
+pages。
 DFlash Full 不存在这类 provisional lead，因此不需要额外 headroom。
 
 两个 pools 不共享 physical pages；它们只是为相同数量的 logical 64-token groups 分别规划 typed
@@ -852,9 +857,9 @@ fixed unit；new admission 可以 claim 或先驱逐 retained entry，不能降�
 10. prefix hit 必须由完整 SequenceState 证明，KV token match 或 page match 本身不构成 hit；
 11. active pages 不因 compaction、retained eviction 或其他 request growth 被搬迁；
 12. admitted request 的合法最大 per-pool growth 必须始终被 reservation vector 覆盖；
-13. `KVCapacityProfile` 必须按 §3.3 从 `max_context`、`max_concurrency` 和 selected backend 唯一导出；
-    MTP physical headroom 不扩大 per-allocation logical capacity，backend 不得先于 Main entitlement
-    contract 耗尽；
+13. `KVCapacityProfile` 必须按 §3.2–§3.3 从 `max_context`、`kv_capacity`、`max_concurrency` 和 selected
+    backend 唯一导出；MTP physical headroom 不扩大 per-allocation logical capacity，backend 不得先于
+    Main entitlement contract 耗尽；
 14. 一个 pool allocation 的 logical block 在该 pool 全部 grouped planes 中使用同一个 page-group ID；
 15. active slot table row 只镜像 allocation mapping，不拥有 page payload 或 frontier；
 16. growing-cache Op 只消费 `PagedKVLayerView` 或 `PagedKVBatchLayerView`，不取得 allocator、request
@@ -917,14 +922,15 @@ PagedKVLayerView
 ├── v_pages           Tensor (route-closed physical axes)
 ├── k_scale_pages     optional Tensor (same pool order)
 ├── v_scale_pages     optional Tensor (same pool order)
-├── block_table       I32 Tensor [M]
+├── block_table       I32 Tensor [Nlogical]
 ├── head_dim          D
 ├── num_kv_heads      Hkv
 ├── dtype             BF16 or I8
 └── quant_group       0 or 64
 ```
 
-`P` 和 `Nphysical` 由 route 对 page tensors shape 的解释给出，logical capacity 为 `M*P`。当前所有注册
+`P` 和 `Nphysical` 由 route 对 page tensors shape 的解释给出，logical capacity 为
+`Nlogical*P`。当前所有注册
 growing routes 只接受 `P=64`；kernel 将其作为 compile-time fact，而不是在 inner loop 中执行 runtime
 division。Main/MTP causal routes 只接受 contiguous `[D,P,Hkv,Nphysical]` 及相同 order 的 scale
 planes；DFlash Full append/context routes 只接受 contiguous `[D,P,Nphysical,Hkv]`。Op 不接受 permuted、
@@ -949,7 +955,7 @@ Batched growing KV consumer 使用同一组 typed plane tensors 和完整 block-
 PagedKVBatchLayerView
 ├── k_pages / v_pages
 ├── optional k_scale_pages / v_scale_pages
-├── block_tables       I32 Tensor [M,C]
+├── block_tables       I32 Tensor [Nlogical,C]
 ├── head_dim / num_kv_heads
 └── dtype / quant_group
 
@@ -1070,11 +1076,11 @@ Wrapper 必须验证：
 - K/V page tensors 的 logical geometry 一致、`P=64`，并精确匹配该 route 在 §4.2 的 closed
   contiguous order；
 - physical page count、head geometry、dtype 和 optional scale planes 一致；
-- single view 的 block table 是 contiguous I32 `[M]`；batch view 的 table matrix 是 contiguous I32
-  `[M,C]`，row selectors 是 contiguous I32 `[B]`；
+- single view 的 block table 是 contiguous I32 `[Nlogical]`；batch view 的 table matrix 是 contiguous
+  I32 `[Nlogical,C]`，row selectors 是 contiguous I32 `[B]`；
 - BF16 cache 不携带 scale planes，INT8-G64 cache 的 scale shape 和 strides 完整；
-- causal `max_visible_keys <= M*P`；
-- DFlash `max_context <= M*P`；
+- causal `max_visible_keys <= Nlogical*P`；
+- DFlash `max_context <= Nlogical*P`；
 - input/output Tensor domain 与当前 entry 的已注册 geometry 一致。
 
 Wrapper 不读取 device positions、context length、commit count 或 page IDs。Caller 保证：
@@ -1363,10 +1369,12 @@ contiguous-KV reference 只记录当时的 `B=1` paging migration，不是当前
 
 以下是实现必须遵守的 architecture contract：
 
-- `EngineOptions.max_context` 同时是 per-sequence logical ceiling 和 shared Main pool sizing input；令
-  `M=ceil(max_context/64)`，Main 与 DFlash Full 的 physical/logical capacity 均为 `M` pages，MTP 的
-  per-allocation logical capacity 为 `M`、physical capacity 为
-  `M + max_concurrency*ceil((K-1)/64)` pages；startup 显存不足即拒绝配置；
+- `EngineOptions.max_context=S` 是 per-sequence logical ceiling，`EngineOptions.kv_capacity=K_main` 是
+  shared Main pool sizing input；令 `L=ceil(S/64)`、`M=ceil(K_main/64)`，Main 与 DFlash Full 的
+  per-allocation logical capacity 均为 `L`、physical capacity 均为 `M` pages，MTP 的 logical capacity
+  为 `L`、physical capacity 为 `M + max_concurrency*ceil((K_draft-1)/64)` pages，其中 `K_draft` 是
+  speculative draft window；startup 配置不满足
+  `K_main>=S`、`M>=max_concurrency`、`M<=max_concurrency*L` 或显存不足即拒绝；
 - growing KV 使用 homogeneous pools、pool-local I32 page-group IDs 和 allocation-owned ordered mapping；
 - 全部 registered growing pools 的 page size 为 `P=64`；
 - Main Text/MTP 的 K/V 与 code planes 固定为 contiguous page-major `[D,P,Hkv,Nphysical]`，INT8-G64
