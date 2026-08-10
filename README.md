@@ -22,11 +22,29 @@ MTP, prefix-reuse, CLI, and serving paths.
 
 ## Performance
 
-Serving performance was measured on an RTX 5090 with INT8 group-64 KV cache, CUDA Graphs, a 1,024-
-token prefill chunk, and a maximum context of 262,144 tokens. Each reported fixture uses five fixed
-seeds after one warm-up. The two registered targets are reported independently and are not
-cross-target comparisons. The two 27B weight profiles are reported separately. Requests in this
-published dataset were submitted serially; these numbers are not concurrent-batch throughput.
+### Concurrent MTP3 decode
+
+Saturated decode was measured on an RTX 5090 with INT8 group-64 KV cache, CUDA Graphs, MTP3, and
+one 8,192-token generation per active request. The values below are aggregate committed decode
+throughput from complete one-second intervals in which the actual decode batch remained equal to
+the configured concurrency. Each profile should be read independently.
+
+| Model profile | C=1 | C=2 | C=4 | C=8 | C8 / C1 |
+|---|---:|---:|---:|---:|---:|
+| Qwen3.6-27B `groupwise-int` | 185.8 tok/s | 247.0 tok/s | 309.5 tok/s | 535.0 tok/s | 2.88× |
+| Qwen3.6-27B `nvfp4` | 202.4 tok/s | 399.7 tok/s | 699.7 tok/s | 1,146.9 tok/s | 5.67× |
+| Qwen3.6-35B-A3B `groupwise-int` | 593.0 tok/s | 877.7 tok/s | 1,166.0 tok/s | 1,313.8 tok/s | 2.22× |
+
+At C=8, Qwen3.6-35B-A3B reaches **1,313.8 aggregate decode tok/s**. The 27B NVFP4 profile reaches
+**1,146.9 tok/s** and **5.67×** its C=1 throughput.
+
+### Single-request serving
+
+The single-request corpus was measured on the same GPU with INT8 group-64 KV cache, CUDA Graphs, a
+1,024-token prefill chunk, and a maximum context of 262,144 tokens. Each reported fixture uses five
+fixed seeds after one warm-up. The two registered targets are reported independently and are not
+cross-target comparisons. The two 27B weight profiles are reported separately. Requests were
+submitted serially to a persistent server.
 
 **Qwen3.6-35B-A3B**
 

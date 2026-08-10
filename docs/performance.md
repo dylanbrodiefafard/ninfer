@@ -2,6 +2,8 @@
 
 Tested Git revisions:
 
+- Concurrent MTP3 decode saturation for all three artifact profiles:
+  `26da9df7c1b3d3c04ea7bbd730271aa01d00742a`;
 - Qwen3.6-35B-A3B MTP3: `b1a220f028aa750f75bceb3522ac00bbaab7e42d`;
 - Qwen3.6-35B-A3B DFlash block=8 (`k=7`):
   `0dc94097e8ec5c5bcf59b9e13e9d1852f504eb61`;
@@ -14,13 +16,15 @@ Tested Git revisions:
 The serving measurements characterize the two registered NInfer targets independently on one
 NVIDIA GeForce RTX 5090. They cover long-context prefill and baseline decode with speculative
 decoding disabled, plus long-reasoning and cross-scenario decode with MTP and DFlash. The 27B
-results report its `groupwise-int` and `nvfp4` weight profiles separately.
+results report its `groupwise-int` and `nvfp4` weight profiles separately. The concurrent
+decode-saturation campaign measures the same three artifact profiles at C=1, 2, 4, and 8.
 
-All serving-performance requests were submitted serially to a persistent `ninfer-serve` process
-over the loopback OpenAI-compatible HTTP endpoint. Each reported performance fixture used five
-fixed seeds. Values are arithmetic mean ± sample standard deviation; warm-up requests are excluded.
+The single-request corpus requests were submitted serially to a persistent `ninfer-serve` process
+over the loopback OpenAI-compatible HTTP endpoint. Each reported corpus fixture used five fixed
+seeds. Values are arithmetic mean ± sample standard deviation; warm-up requests are excluded. The
+concurrent campaign has its own sustained-wave method below.
 
-## Serving performance method
+## Single-request serving performance method
 
 | Setting | Value |
 |---|---|
@@ -65,6 +69,57 @@ finish reason, and fixture-level structural requirements are audited separately 
 that exhausts its output budget or enters a repetition loop remains useful as a sustained-decode
 stress sample, but is not presented as a successfully completed task.
 
+## Concurrent MTP3 decode saturation
+
+The concurrent campaign uses the `long_decode_aime26_15` fixture with thinking enabled. The
+rendered prompt is 293 tokens, and every request has an 8,192-token output budget. For each
+concurrency C, the runner starts a fresh `ninfer-serve` process with `max_concurrency=C`, releases
+C non-stream requests together using distinct fixed seeds, and waits for every HTTP response.
+Startup and server warmup occur before the measured wave.
+
+All points use an RTX 5090, CUDA 13.1 compile/runtime, CUDA driver API 13.3, stochastic sampling
+(temperature 0.6, top-p 0.95, top-k 20, presence penalty 1.0), INT8 group-64 KV, a 1,024-token
+prefill chunk, CUDA Graphs, prefix reuse disabled, and
+`--spec mtp --draft-tokens 3 --lm-head-draft`. Each request has a 16,384-token context ceiling.
+`--kv-capacity auto` resolved to exactly `C * 16,384` tokens at every point.
+
+Saturated throughput uses only complete one-second server intervals satisfying all of the following:
+
+- computed prefill tokens are zero;
+- `running=C`, `prefilling=0`, and `decode_ready=C`;
+- at least one decode round completed;
+- every decode round had exactly C rows.
+
+Ramp-up, prefill, and drain intervals are excluded. The reported aggregate rate is:
+
+```text
+steady_decode_tok_s = sum(committed_decode_tokens) / sum(interval_seconds)
+```
+
+Wave makespan starts when the client threads are released and ends after the last complete HTTP
+response. MTP acceptance is aggregated over the complete wave. Each row below is one sustained
+wave rather than a repeated-sample mean.
+
+| Model profile | C | Steady (s) | Avg batch | Aggregate decode tok/s | MTP acceptance | Speedup vs. C1 | Wave makespan (s) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Qwen3.6-27B `groupwise-int` | 1 | 43.01 | 1.00 | 185.8 | 68.2% | 1.00× | 44.23 |
+| Qwen3.6-27B `groupwise-int` | 2 | 65.01 | 2.00 | 247.0 | 69.0% | 1.33× | 66.67 |
+| Qwen3.6-27B `groupwise-int` | 4 | 102.02 | 4.00 | 309.5 | 68.4% | 1.67× | 107.49 |
+| Qwen3.6-27B `groupwise-int` | 8 | 118.02 | 8.00 | 535.0 | 68.3% | 2.88× | 125.20 |
+| Qwen3.6-27B `nvfp4` | 1 | 39.01 | 1.00 | 202.4 | 69.3% | 1.00× | 40.46 |
+| Qwen3.6-27B `nvfp4` | 2 | 39.01 | 2.00 | 399.7 | 71.4% | 1.97× | 41.82 |
+| Qwen3.6-27B `nvfp4` | 4 | 44.01 | 4.00 | 699.7 | 69.3% | 3.46× | 47.92 |
+| Qwen3.6-27B `nvfp4` | 8 | 55.01 | 8.00 | 1,146.9 | 68.6% | 5.67× | 58.57 |
+| Qwen3.6-35B-A3B `groupwise-int` | 1 | 12.00 | 1.00 | 593.0 | 67.2% | 1.00× | 13.75 |
+| Qwen3.6-35B-A3B `groupwise-int` | 2 | 17.00 | 2.00 | 877.7 | 68.2% | 1.48× | 18.87 |
+| Qwen3.6-35B-A3B `groupwise-int` | 4 | 26.01 | 4.00 | 1,166.0 | 69.8% | 1.97× | 28.43 |
+| Qwen3.6-35B-A3B `groupwise-int` | 8 | 48.01 | 8.00 | 1,313.8 | 67.3% | 2.22× | 50.20 |
+
+All 45 requests reached their output limit, producing 368,640 completion tokens. The campaign
+contained 608 complete full-batch steady intervals and had no request, CUDA, or out-of-memory
+failure. At C=8, available device memory after startup was 2.66 GiB for 27B groupwise-int,
+2.18 GiB for 27B NVFP4, and 4.38 GiB for 35B-A3B.
+
 ## Reproduction
 
 Build `ninfer-serve` and prepare the registered `.ninfer` artifacts. The refreshed per-target
@@ -88,6 +143,34 @@ python3 tools/bench/run_serve_corpus.py \
   --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
   --mode mtp0 --mode mtp3 --sampling stochastic \
   --output profiles/bench/serve_corpus_27b_nvfp4_w8_20260731
+```
+
+The concurrent decode-saturation campaigns use:
+
+```bash
+python3 tools/bench/run_serve_concurrency.py \
+  --serve build/apps/ninfer-serve \
+  --artifact qwen3_6_27b=out/qwen3_6_27b.ninfer \
+  --mode mtp3 --suite decode-saturation \
+  --concurrency 1 --concurrency 2 --concurrency 4 --concurrency 8 \
+  --decode-tokens 8192 --max-context 16384 --kv-capacity auto \
+  --output profiles/bench/concurrent_decode_27b_mtp3_20260811
+
+python3 tools/bench/run_serve_concurrency.py \
+  --serve build/apps/ninfer-serve \
+  --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
+  --mode mtp3 --suite decode-saturation \
+  --concurrency 1 --concurrency 2 --concurrency 4 --concurrency 8 \
+  --decode-tokens 8192 --max-context 16384 --kv-capacity auto \
+  --output profiles/bench/concurrent_decode_27b_nvfp4_mtp3_20260811
+
+python3 tools/bench/run_serve_concurrency.py \
+  --serve build/apps/ninfer-serve \
+  --artifact qwen3_6_35b_a3b=out/qwen3_6_35b_a3b.ninfer \
+  --mode mtp3 --suite decode-saturation \
+  --concurrency 1 --concurrency 2 --concurrency 4 --concurrency 8 \
+  --decode-tokens 8192 --max-context 16384 --kv-capacity auto \
+  --output profiles/bench/concurrent_decode_35b_mtp3_20260811
 ```
 
 Use `--mode dflash7` for the corresponding DFlash block=8 campaign; add `--sampling greedy` for

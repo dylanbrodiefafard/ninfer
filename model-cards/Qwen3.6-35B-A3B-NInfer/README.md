@@ -155,11 +155,28 @@ The artifact supports:
 
 ## Performance
 
-The following single-GPU serving measurements were collected on an NVIDIA GeForce RTX 5090 with
+The single-request serving measurements below were collected on an NVIDIA GeForce RTX 5090 with
 CUDA 13.1. Requests were submitted serially to a persistent `ninfer-serve` process with CUDA Graph
-enabled, a 1,024-token prefill chunk, INT8 group-64 KV cache, and prefix reuse disabled. Each value
-is the arithmetic mean ± sample standard deviation over five fixed seeds; warm-up requests are
-excluded.
+enabled, a 1,024-token prefill chunk, INT8 group-64 KV cache, and prefix reuse disabled. Each
+single-request value is the arithmetic mean ± sample standard deviation over five fixed seeds;
+warm-up requests are excluded.
+
+### Concurrent MTP=3 decode saturation
+
+The concurrent campaign uses CUDA driver API 13.3 and one 293-token prompt followed by an
+8,192-token generation per active request. Each concurrency point starts a fresh server with MTP3,
+INT8 group-64 KV, CUDA Graphs, a 16,384-token per-request context limit, and prefix reuse disabled.
+Aggregate throughput includes only complete one-second intervals whose actual decode batch remains
+equal to C. Each row is one sustained wave.
+
+| C | Steady aggregate decode tok/s | Speedup vs. C1 | Wave makespan |
+|---:|---:|---:|---:|
+| 1 | 593.0 | 1.00× | 13.75 s |
+| 2 | 877.7 | 1.48× | 18.87 s |
+| 4 | 1,166.0 | 1.97× | 28.43 s |
+| 8 | 1,313.8 | 2.22× | 50.20 s |
+
+At C=8, the profile sustains **1,313.8 aggregate decode tok/s**.
 
 ### Long-context baseline (MTP disabled)
 
