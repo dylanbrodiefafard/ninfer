@@ -19,8 +19,8 @@ struct RouteSpec {
 
 constexpr std::array<RouteSpec, 18> kRoutes{{
     {1, 1, W8LinearSwiGluScheduleId::DecodePairR16},
-    {2, 32, W8LinearSwiGluScheduleId::SplitKMmaExactT},
-    {33, 64, W8LinearSwiGluScheduleId::MmaR32C64},
+    {2, 48, W8LinearSwiGluScheduleId::SplitKMmaExactT},
+    {49, 64, W8LinearSwiGluScheduleId::MmaR32C64},
     {65, 80, W8LinearSwiGluScheduleId::MmaR32C80},
     {81, 96, W8LinearSwiGluScheduleId::MmaR32C96},
     {97, 128, W8LinearSwiGluScheduleId::MmaR64C64},
@@ -61,7 +61,7 @@ const char* w8_linear_swiglu_schedule_name(W8LinearSwiGluScheduleId schedule) no
     case W8LinearSwiGluScheduleId::DecodePairR16:
         return "linear_swiglu.w8.decode.pair.r16";
     case W8LinearSwiGluScheduleId::SplitKMmaExactT:
-        return "linear_swiglu.w8.splitk.mma.pair.r8.exact_t";
+        return "linear_swiglu.w8.splitk.mma.pair.exact_t";
     case W8LinearSwiGluScheduleId::MmaR32C64:
         return "linear_swiglu.w8.mma.pair.r16.c64";
     case W8LinearSwiGluScheduleId::MmaR32C80:

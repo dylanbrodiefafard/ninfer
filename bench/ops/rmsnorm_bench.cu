@@ -54,7 +54,10 @@ constexpr Shape kShapes[] = {
     {"target_q35", 256, 16, true, false, false},
     {"target_k35", 256, 2, true, false, false},
     {"gated35", 128, 32, false, true, false},
+    {"gated27", 128, 48, false, true, false},
     {"hidden27", 5120, 1, true, false, false},
+    {"target_q27", 256, 24, true, false, false},
+    {"target_k27", 256, 4, true, false, false},
 };
 
 template <int Block, bool Gated>
@@ -315,7 +318,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr,
                          "usage: %s [--decode] [--prefill] "
                          "[--kind dflash_hidden|dflash_q|dflash_k|target_hidden35|target_q35|"
-                         "target_k35|gated35|hidden27 "
+                         "target_k35|gated35|gated27|hidden27|target_q27|target_k27 "
                          "(--tokens T|--t-sweep 1,2,...,1024)] "
                          "[--control|--candidate-b128|--candidate-b256|--candidate-b512|"
                          "--candidate-b1024] [--profile]\n",

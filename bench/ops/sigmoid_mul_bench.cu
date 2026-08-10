@@ -49,13 +49,13 @@ std::vector<int> parse_tokens(const char* raw) {
     return tokens;
 }
 
-void run(int tokens, bool control, int candidate_block) {
-    constexpr int d     = 4096;
+void run(int tokens, int heads, bool control, int candidate_block) {
+    const int d         = 256 * heads;
     const std::size_t n = static_cast<std::size_t>(d) * static_cast<std::size_t>(tokens);
     DeviceBuffer gate   = make_bf16(n);
     DeviceBuffer x      = make_bf16(n);
-    Tensor tgate(gate.p, DType::BF16, {256, 16, tokens});
-    Tensor tx(x.p, DType::BF16, {256, 16, tokens});
+    Tensor tgate(gate.p, DType::BF16, {256, heads, tokens});
+    Tensor tx(x.p, DType::BF16, {256, heads, tokens});
 
     const Result result = bench_loop(
         [&](cudaStream_t stream) {
@@ -79,7 +79,7 @@ void run(int tokens, bool control, int candidate_block) {
     const std::size_t grid =
         std::min<std::size_t>(4096, std::max<std::size_t>(1, (n / 8 + block - 1) / block));
     char tag[128];
-    std::snprintf(tag, sizeof(tag), "sigmoid_mul [256,16,%-2d] route=%s-b%d-g%zu", tokens,
+    std::snprintf(tag, sizeof(tag), "sigmoid_mul [256,%d,%-2d] route=%s-b%d-g%zu", heads, tokens,
                   control                ? "control"
                   : candidate_block == 0 ? "bf16x8"
                                          : "candidate",
@@ -99,9 +99,16 @@ int main(int argc, char** argv) {
     std::vector<int> tokens{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
     bool control        = false;
     int candidate_block = 0;
+    int heads           = 16;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--tokens") && i + 1 < argc) {
             tokens = parse_tokens(argv[++i]);
+        } else if (!std::strcmp(argv[i], "--heads") && i + 1 < argc) {
+            heads = std::atoi(argv[++i]);
+            if (heads != 16 && heads != 24) {
+                std::fprintf(stderr, "heads must be 16 or 24\n");
+                return 2;
+            }
         } else if (!std::strcmp(argv[i], "--control")) {
             control = true;
         } else if (!std::strcmp(argv[i], "--candidate-block") && i + 1 < argc) {
@@ -114,7 +121,8 @@ int main(int argc, char** argv) {
             }
         } else {
             std::fprintf(stderr,
-                         "usage: %s [--tokens T[,T...]] [--control] [--candidate-block B]\n",
+                         "usage: %s [--heads 16|24] [--tokens T[,T...]] [--control] "
+                         "[--candidate-block B]\n",
                          argv[0]);
             return 2;
         }
@@ -123,6 +131,6 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--control and --candidate-block are mutually exclusive\n");
         return 2;
     }
-    for (const int value : tokens) { run(value, control, candidate_block); }
+    for (const int value : tokens) { run(value, heads, control, candidate_block); }
     return 0;
 }

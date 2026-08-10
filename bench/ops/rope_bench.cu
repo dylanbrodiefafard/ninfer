@@ -484,6 +484,35 @@ void run_dflash(int tokens, bool control, int candidate_block, int candidate_hea
     print_result(label.c_str(), result);
 }
 
+void run_dflash_single_k(int tokens, bool control) {
+    const std::size_t elements = static_cast<std::size_t>(kDflashHeadDim) * kDflashKHeads * tokens;
+    DeviceBuffer positions     = make_text_positions(tokens, 1);
+    DeviceBuffer x             = make_bf16(elements);
+    Tensor tpos(positions.p, DType::I32, {tokens});
+    Tensor tx(x.p, DType::BF16, {kDflashHeadDim, kDflashKHeads, tokens});
+    const double bytes = 2.0 * static_cast<double>(kDflashKHeads * kDflashRotaryDim) * tokens *
+                         sizeof(__nv_bfloat16);
+    const Result result = bench_loop(
+        [&](cudaStream_t stream) {
+            if (control) {
+                rope_payload_control_kernel<ops::RopeKernelMode::DflashText1D, kDflashHeadDim,
+                                            kDflashRotaryDim, kDflashKHeads, 0>
+                    <<<tokens, kDflashKHeads * 32, 0, stream>>>(
+                        static_cast<const std::int32_t*>(tpos.data),
+                        static_cast<__nv_bfloat16*>(tx.data), nullptr, tokens,
+                        tx.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)), 0);
+                CUDA_CHECK(cudaGetLastError());
+            } else {
+                ops::rope(tpos, kDflashRotaryDim, kTextTheta, tx, stream);
+            }
+        },
+        bytes);
+    const std::string label =
+        std::string("rope ") + (control ? "control" : "text") +
+        " dflash single-k axes=1 route=fixed-b256 T=" + std::to_string(tokens);
+    print_result(label.c_str(), result);
+}
+
 void run_vision(int patches, bool control) {
     constexpr int hidden   = kVisionHeadDim * kVisionHeads;
     constexpr int qkv      = hidden * 3;
@@ -629,6 +658,9 @@ int main(int argc, char** argv) {
                     run_dflash(tokens, options.control, options.candidate_block,
                                options.candidate_heads, options.profile);
                 }
+            }
+            if (options.geometryDflash && options.axes1 && options.single_k) {
+                for (int tokens : options.tokens) { run_dflash_single_k(tokens, options.control); }
             }
             for (int axes : {1, 3}) {
                 if ((axes == 1 && !options.axes1) || (axes == 3 && !options.axes3)) { continue; }

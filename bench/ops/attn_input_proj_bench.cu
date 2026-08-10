@@ -275,10 +275,8 @@ void run_four_output(const Options& options, const char* format, QType qtype,
                      std::vector<Result>& results) {
     const std::int32_t min_tokens = *std::min_element(options.tokens.begin(), options.tokens.end());
     const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
-    const std::size_t workspace_bytes =
-        implicit_a16_entry ? 0
-                           : ops::attn_input_proj_workspace_capacity_bytes(
-                                 qtype, parent_rows, hidden, policy, min_tokens, max_tokens);
+    const std::size_t workspace_bytes = ops::attn_input_proj_workspace_capacity_bytes(
+        qtype, parent_rows, hidden, policy, min_tokens, max_tokens);
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 1));
     DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(hidden) * max_tokens);
     DeviceBuffer q(static_cast<std::size_t>(q_rows) * max_tokens * 2);

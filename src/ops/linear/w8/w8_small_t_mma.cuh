@@ -22,6 +22,8 @@ namespace ninfer::ops::detail {
 
 struct W8SmallTMmaStoreEpilogue {};
 
+struct W8SmallTMmaResidualEpilogue {};
+
 struct W8SmallTMmaIdentityRows {
     static constexpr int kOutputRowsPerCta = 16;
 
@@ -51,7 +53,8 @@ __device__ __forceinline__ unsigned w8_small_t_bf16_pair_from_s8(unsigned values
 }
 
 template <class Geometry, int ActiveCols, class Schedule, class Output,
-          class Epilogue = W8SmallTMmaStoreEpilogue, class RowPolicy = W8SmallTMmaIdentityRows>
+          class Epilogue = W8SmallTMmaStoreEpilogue, class RowPolicy = W8SmallTMmaIdentityRows,
+          bool DirectPairEpilogue = false>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
@@ -98,16 +101,27 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
     const int cta_row0 = static_cast<int>(blockIdx.x) * RowPolicy::kOutputRowsPerCta;
 
     const auto stage_x = [&](int group_k0) {
-        constexpr int kItemsPerSplit = ActiveCols * (kTileK / 8);
+        constexpr bool kPaddedStage =
+            Schedule::kActivationStage == W8SmallTMmaActivationStage::PaddedZero;
+        constexpr int kStageCols     = kPaddedStage ? kTileCols : ActiveCols;
+        constexpr int kItemsPerSplit = kStageCols * (kTileK / 8);
         for (int item = lane; item < kItemsPerSplit; item += 32) {
             const int col = item / (kTileK / 8);
             const int k8  = item - col * (kTileK / 8);
             auto* dst     = &b_shared[warp][col * kTileK + w8_small_t_swizzle_64(col, k8 * 8)];
-            cp_async<16, Schedule::kActivationCache>(
-                dst,
-                &x[static_cast<std::int64_t>(col) * kHidden + group_k0 + warp * kTileK + k8 * 8]);
+            if constexpr (!kPaddedStage || ActiveCols == kTileCols) {
+                cp_async<16, Schedule::kActivationCache>(
+                    dst, &x[static_cast<std::int64_t>(col) * kHidden + group_k0 + warp * kTileK +
+                            k8 * 8]);
+            } else {
+                const int source_col = col < ActiveCols ? col : 0;
+                cp_async_zfill<16, Schedule::kActivationCache>(
+                    dst,
+                    &x[static_cast<std::int64_t>(source_col) * kHidden + group_k0 + warp * kTileK +
+                       k8 * 8],
+                    col < ActiveCols ? 16 : 0);
+            }
         }
-        cp_commit();
     };
 
     const auto stage_codes = [&](int group_k0) {
@@ -136,7 +150,6 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
                                  2);
             }
         }
-        cp_commit();
     };
 
     const int b_rin     = lane & 7;
@@ -153,6 +166,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
 
     stage_codes(0);
     stage_x(0);
+    cp_commit();
     cp_wait<0>();
     __syncthreads();
 
@@ -234,6 +248,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
             __syncthreads();
             stage_codes(group_k0 + kGroupK);
             stage_x(group_k0 + kGroupK);
+            cp_commit();
             cp_wait<0>();
             __syncthreads();
         }
@@ -283,15 +298,25 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
                 sum.w += value.w;
             }
             const int col0 = ni * 8 + 2 * lid;
-            if constexpr (std::is_same_v<Epilogue, W8SmallTMmaStoreEpilogue>) {
+            if constexpr (std::is_same_v<Epilogue, W8SmallTMmaStoreEpilogue> ||
+                          std::is_same_v<Epilogue, W8SmallTMmaResidualEpilogue>) {
+                const auto store = [&](int row, int col, float value) {
+                    __nv_bfloat16* destination = output_tile.at(row, col);
+                    if constexpr (std::is_same_v<Epilogue, W8SmallTMmaResidualEpilogue>) {
+                        value += __bfloat162float(*destination);
+                    }
+                    *destination = __float2bfloat16_rn(value);
+                };
                 if (col0 < ActiveCols) {
-                    *output_tile.at(cta_row0 + gid, col0)     = __float2bfloat16_rn(sum.x);
-                    *output_tile.at(cta_row0 + gid + 8, col0) = __float2bfloat16_rn(sum.z);
+                    store(cta_row0 + gid, col0, sum.x);
+                    store(cta_row0 + gid + 8, col0, sum.z);
                 }
                 if (col0 + 1 < ActiveCols) {
-                    *output_tile.at(cta_row0 + gid, col0 + 1)     = __float2bfloat16_rn(sum.y);
-                    *output_tile.at(cta_row0 + gid + 8, col0 + 1) = __float2bfloat16_rn(sum.w);
+                    store(cta_row0 + gid, col0 + 1, sum.y);
+                    store(cta_row0 + gid + 8, col0 + 1, sum.w);
                 }
+            } else if constexpr (DirectPairEpilogue) {
+                epilogue.template store_pair<ActiveCols>(cta_row0 + gid, col0, sum);
             } else {
                 if (col0 < ActiveCols) {
                     projected[gid * kTileCols + col0]       = sum.x;
@@ -303,7 +328,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
                 }
             }
         }
-        if constexpr (!std::is_same_v<Epilogue, W8SmallTMmaStoreEpilogue>) {
+        if constexpr (!std::is_same_v<Epilogue, W8SmallTMmaStoreEpilogue> &&
+                      !std::is_same_v<Epilogue, W8SmallTMmaResidualEpilogue> &&
+                      !DirectPairEpilogue) {
             __syncwarp();
             if (lane < kRowsPerCta) {
                 float row_values[ActiveCols];

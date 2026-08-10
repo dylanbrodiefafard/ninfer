@@ -9,7 +9,6 @@
 #include "core/device.h"
 #include "ninfer_bench_common.h"
 #include "quantized_weight.cuh"
-#include "ops/launcher/argmax.h"
 #include "ops/linear/q6/q6_dispatch.h"
 
 #include <cuda_runtime.h>
@@ -36,7 +35,6 @@ constexpr float kRmsEps                 = 1.0e-6F;
 
 struct Options {
     std::vector<std::int32_t> t_sweep{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
-    int argmax_block       = 0;
     int warmup             = 5;
     int repeat             = 50;
     std::size_t flush_size = kDefaultFlushSize;
@@ -74,17 +72,13 @@ Options parse_options(int argc, char** argv) {
             options.warmup = std::stoi(std::string(next("--warmup value")));
         } else if (arg == "--repeat") {
             options.repeat = std::stoi(std::string(next("--repeat value")));
-        } else if (arg == "--argmax-block") {
-            const std::string_view value = next("--argmax-block value");
-            options.argmax_block         = value == "auto" ? 0 : std::stoi(std::string(value));
         } else if (arg == "--flush-mib") {
             const long mib = std::stol(std::string(next("--flush-mib value")));
             if (mib <= 0) { throw std::invalid_argument("--flush-mib must be positive"); }
             options.flush_size = static_cast<std::size_t>(mib) << 20;
         } else if (arg == "--help" || arg == "-h") {
             std::printf("Usage: %s [--t-sweep 1,2,...,16] "
-                        "[--warmup N] [--repeat N] "
-                        "[--argmax-block auto|128|256|384|512] [--flush-mib N]\n",
+                        "[--warmup N] [--repeat N] [--flush-mib N]\n",
                         argv[0]);
             std::exit(0);
         } else {
@@ -93,11 +87,6 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.warmup < 0 || options.repeat <= 0) {
         throw std::invalid_argument("--warmup must be nonnegative and --repeat positive");
-    }
-    if (options.argmax_block != 0 && (options.argmax_block <= 0 || options.argmax_block > 512 ||
-                                      options.argmax_block % 32 != 0)) {
-        throw std::invalid_argument(
-            "--argmax-block must be auto or a positive multiple of 32 no larger than 512");
     }
     return options;
 }
@@ -146,12 +135,7 @@ int run(const Options& options) {
         const auto body = [&](cudaStream_t body_stream) {
             ops::rmsnorm(x, norm_weight, kRmsEps, true, normalized, body_stream);
             ops::linear(normalized, head.weight, output, body_stream);
-            if (options.argmax_block == 0) {
-                ops::argmax(output, selected, kValidVocab, body_stream);
-            } else {
-                ops::detail::argmax_tiled_atomic_launch(output, selected, kValidVocab,
-                                                        options.argmax_block, body_stream);
-            }
+            ops::argmax(output, selected, kValidVocab, body_stream);
         };
 
         body(stream);
@@ -160,12 +144,8 @@ int run(const Options& options) {
         graph.capture(stream, body);
         const bench::ColdTiming timing =
             bench::measure_cold_graph(graph, flush, stream, options.warmup, options.repeat);
-        const std::string argmax_route = options.argmax_block == 0
-                                             ? "production-b512"
-                                             : "candidate-b" + std::to_string(options.argmax_block);
         std::printf("%4d %5zu %10.3f %10.3f %10.3f %-24s %s\n", t, graph.nodes(), timing.median_us,
-                    timing.min_us, timing.p95_us, q6_launch_name(head_launch),
-                    argmax_route.c_str());
+                    timing.min_us, timing.p95_us, q6_launch_name(head_launch), "public");
     }
 
     CUDA_CHECK(cudaStreamDestroy(stream));

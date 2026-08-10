@@ -1,7 +1,7 @@
 // Implements: include/ninfer/ops/argmax.h
 // Match: validated contiguous BF16 logits and I32 output.
 // Algorithm assumptions: one tile uses a direct reduction; larger domains use
-// zero-initialized atomic winners across 512-row tiles.
+// zero-initialized atomic winners across route-selected row tiles.
 #include "ops/launcher/argmax.h"
 
 #include "ops/common/math.h"
@@ -12,6 +12,30 @@
 #include <cstdint>
 
 namespace ninfer::ops::detail {
+namespace {
+
+constexpr std::int32_t kFullPhysicalRows      = 248320;
+constexpr std::int32_t kFullValidRows         = 248077;
+constexpr std::int32_t kShortlistRows         = 131072;
+constexpr std::int32_t kSmallAggregateColumns = 8;
+constexpr int kFullAggregateBlock             = 128;
+constexpr int kShortlistAggregateBlock        = 256;
+
+int tiled_block_for(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t t_count) {
+    if (t_count <= kSmallAggregateColumns) { return kArgmaxBlock; }
+    if (physical_rows == kFullPhysicalRows && valid_rows == kFullValidRows) {
+        return kFullAggregateBlock;
+    }
+    if (physical_rows == kShortlistRows && valid_rows == kShortlistRows) {
+        return kShortlistAggregateBlock;
+    }
+    return kArgmaxBlock;
+}
+
+void argmax_tiled_atomic_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
+                                int block, cudaStream_t stream);
+
+} // namespace
 
 void argmax_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
                    cudaStream_t stream) {
@@ -29,8 +53,11 @@ void argmax_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
         return;
     }
 
-    argmax_tiled_atomic_launch(logits, out, valid_rows, kArgmaxBlock, stream);
+    argmax_tiled_atomic_launch(logits, out, valid_rows,
+                               tiled_block_for(physical_rows, valid_rows, t_count), stream);
 }
+
+namespace {
 
 void argmax_tiled_atomic_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
                                 int block, cudaStream_t stream) {
@@ -52,4 +79,5 @@ void argmax_tiled_atomic_launch(const Tensor& logits, Tensor& out, std::int32_t 
     });
 }
 
+} // namespace
 } // namespace ninfer::ops::detail

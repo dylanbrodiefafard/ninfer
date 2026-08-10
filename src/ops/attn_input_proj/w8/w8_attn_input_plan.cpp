@@ -19,8 +19,8 @@ struct RouteSpec {
 
 constexpr std::array<RouteSpec, 4> kTargetRoutes{{
     {1, 1, W8AttnInputScheduleId::DecodeR8Direct},
-    {2, 16, W8AttnInputScheduleId::SplitKMmaDirect},
-    {17, 128, W8AttnInputScheduleId::MmaR32C128},
+    {2, 64, W8AttnInputScheduleId::SplitKMmaDirect},
+    {65, 128, W8AttnInputScheduleId::MmaR32C128},
     {129, kAnyCols, W8AttnInputScheduleId::MmaR64C128},
 }};
 

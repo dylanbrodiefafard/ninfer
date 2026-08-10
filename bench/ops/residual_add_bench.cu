@@ -8,6 +8,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 using namespace ninfer;
 using namespace ninfer::bench;
@@ -28,13 +31,29 @@ __global__ void residual_add_payload_control(const uint4* y, uint4* x, std::int6
     }
 }
 
-void run(int patches, bool control) {
-    constexpr int d     = 1152;
-    const std::size_t n = static_cast<std::size_t>(d) * static_cast<std::size_t>(patches);
+std::vector<int> parse_tokens(const char* raw) {
+    std::vector<int> result;
+    const std::string text(raw);
+    std::size_t begin = 0;
+    while (begin < text.size()) {
+        const std::size_t end  = text.find(',', begin);
+        const std::string item = text.substr(begin, end == std::string::npos ? end : end - begin);
+        const int value        = std::stoi(item);
+        if (value <= 0) { throw std::invalid_argument("tokens must be positive"); }
+        result.push_back(value);
+        if (end == std::string::npos) { break; }
+        begin = end + 1;
+    }
+    if (result.empty()) { throw std::invalid_argument("tokens must not be empty"); }
+    return result;
+}
+
+void run(int d, int tokens, bool control) {
+    const std::size_t n = static_cast<std::size_t>(d) * static_cast<std::size_t>(tokens);
     DeviceBuffer y      = make_bf16(n);
     DeviceBuffer x      = make_bf16(n);
-    Tensor ty(y.p, DType::BF16, {d, patches});
-    Tensor tx(x.p, DType::BF16, {d, patches});
+    Tensor ty(y.p, DType::BF16, {d, tokens});
+    Tensor tx(x.p, DType::BF16, {d, tokens});
 
     const Result result = bench_loop(
         [&](cudaStream_t stream) {
@@ -52,9 +71,9 @@ void run(int patches, bool control) {
         },
         static_cast<double>(n) * 6.0);
 
-    char tag[80];
-    std::snprintf(tag, sizeof(tag), "%s [1152,%-5d]", control ? "control" : "residual_add",
-                  patches);
+    char tag[96];
+    std::snprintf(tag, sizeof(tag), "%s [%d,%-5d]", control ? "control" : "residual_add", d,
+                  tokens);
     print_result(tag, result);
 }
 
@@ -67,27 +86,46 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    int selected_patches = 0;
-    bool control         = false;
+    int d = 1152;
+    std::vector<int> tokens;
+    bool control = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--patches") && i + 1 < argc) {
-            selected_patches = std::atoi(argv[++i]);
+            if (!tokens.empty()) {
+                std::fprintf(stderr, "--patches and --tokens are mutually exclusive\n");
+                return 2;
+            }
+            d      = 1152;
+            tokens = {std::atoi(argv[++i])};
+        } else if (!std::strcmp(argv[i], "--d") && i + 1 < argc) {
+            d = std::atoi(argv[++i]);
+            if (d != 1152 && d != 2048 && d != 5120) {
+                std::fprintf(stderr, "D must be 1152, 2048, or 5120\n");
+                return 2;
+            }
+        } else if (!std::strcmp(argv[i], "--tokens") && i + 1 < argc) {
+            if (!tokens.empty()) {
+                std::fprintf(stderr, "token extents were specified more than once\n");
+                return 2;
+            }
+            tokens = parse_tokens(argv[++i]);
         } else if (!std::strcmp(argv[i], "--control")) {
             control = true;
         } else {
-            std::fprintf(stderr, "usage: %s [--patches P] [--control]\n", argv[0]);
+            std::fprintf(stderr,
+                         "usage: %s [--d 1152|2048|5120] [--tokens T[,T...] | --patches P] "
+                         "[--control]\n",
+                         argv[0]);
             return 2;
         }
     }
-    if (selected_patches < 0 || (selected_patches > 0 && selected_patches % 4 != 0)) {
-        std::fprintf(stderr, "patches must be a positive multiple of 4\n");
-        return 2;
+    for (const int tokens_value : tokens) {
+        if (tokens_value <= 0) {
+            std::fprintf(stderr, "tokens must be positive\n");
+            return 2;
+        }
     }
-
-    if (selected_patches > 0) {
-        run(selected_patches, control);
-        return 0;
-    }
-    for (const int patches : {8, 256, 4096, 49152, 65536}) { run(patches, control); }
+    if (tokens.empty()) { tokens = {8, 256, 4096, 49152, 65536}; }
+    for (const int tokens_value : tokens) { run(d, tokens_value, control); }
     return 0;
 }

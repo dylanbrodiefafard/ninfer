@@ -155,9 +155,6 @@ Options parse_args(int argc, char** argv) {
     if (!opt.geometry35 && !opt.auto_route) {
         throw std::invalid_argument("fixed candidate screening is supported only for --35b");
     }
-    if (opt.norm_control && !opt.geometry35) {
-        throw std::invalid_argument("--norm-control requires --35b");
-    }
     if (opt.norm_control && !opt.auto_route && !opt.composed_norm_control) {
         throw std::invalid_argument("--norm-control supports only --candidate auto or composed");
     }
@@ -170,7 +167,8 @@ Options parse_args(int argc, char** argv) {
     return opt;
 }
 
-void run(const Options& opt, std::int32_t tokens, DeviceBuffer& flush) {
+void run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
+         DeviceBuffer& flush) {
     const std::int32_t heads  = opt.geometry35 ? 32 : 48;
     const std::int32_t hidden = opt.geometry35 ? 2048 : 5120;
     const std::size_t x_elems = static_cast<std::size_t>(hidden) * tokens;
@@ -199,23 +197,28 @@ void run(const Options& opt, std::int32_t tokens, DeviceBuffer& flush) {
     const Weight wb     = bf16_row_view(parent, heads, heads);
 
     const ops::detail::Bf16GdnGatingProblem problem{heads, hidden, tokens};
-    const auto plan      = opt.auto_route || opt.composed_norm_control
-                               ? ops::detail::bf16_gdn_gating_resolve_plan(problem)
-                               : ops::detail::bf16_gdn_gating_resolve_candidate(opt.candidate, problem);
-    const auto norm_plan = ops::detail::bf16_gdn_norm_gating_resolve_plan(problem);
-    const std::size_t workspace_bytes =
-        opt.norm_control
-            ? ops::gdn_norm_gating_proj_workspace_capacity_bytes(heads, hidden, tokens, tokens)
-            : std::max(plan.workspace_bytes, ops::gdn_gating_proj_workspace_capacity_bytes(
-                                                 heads, hidden, tokens, tokens));
+    const auto plan                   = opt.auto_route || opt.composed_norm_control
+                                            ? ops::detail::bf16_gdn_gating_resolve_plan(problem)
+                                            : ops::detail::bf16_gdn_gating_resolve_candidate(opt.candidate, problem);
+    const auto norm_plan              = ops::detail::bf16_gdn_norm_gating_resolve_plan(problem);
+    const std::size_t workspace_bytes = std::max(interval_capacity, plan.workspace_bytes);
     WorkspaceArena ws(std::max<std::size_t>(1, workspace_bytes));
     const auto launch = [&](cudaStream_t stream) {
         if (opt.norm_control && opt.composed_norm_control) {
             ops::rmsnorm(tx, tnorm_weight, 1.0e-6F, true, th, stream);
-            ops::gdn_gating_proj(th, parent, tA_log, tdt_bias, ws, tg, tbeta, stream);
+            if (opt.geometry35) {
+                ops::gdn_gating_proj(th, parent, tA_log, tdt_bias, ws, tg, tbeta, stream);
+            } else {
+                ops::gdn_gating_proj(th, wa, wb, tA_log, tdt_bias, ws, tg, tbeta, stream);
+            }
         } else if (opt.norm_control) {
-            ops::gdn_norm_gating_proj(tx, tnorm_weight, 1.0e-6F, parent, tA_log, tdt_bias, ws, th,
-                                      tg, tbeta, stream);
+            if (opt.geometry35) {
+                ops::gdn_norm_gating_proj(tx, tnorm_weight, 1.0e-6F, parent, tA_log, tdt_bias, ws,
+                                          th, tg, tbeta, stream);
+            } else {
+                ops::gdn_norm_gating_proj(tx, tnorm_weight, 1.0e-6F, wa, wb, tA_log, tdt_bias, ws,
+                                          th, tg, tbeta, stream);
+            }
         } else if (opt.auto_route) {
             if (opt.geometry35) {
                 ops::gdn_gating_proj(tx, parent, tA_log, tdt_bias, ws, tg, tbeta, stream);
@@ -239,9 +242,12 @@ void run(const Options& opt, std::int32_t tokens, DeviceBuffer& flush) {
     const double executed_flops  = 2.0 * 2.0 * static_cast<double>(heads) * hidden * executed_cols;
     const double useful_tflops   = useful_flops / sec / 1e12;
     const double executed_tflops = executed_flops / sec / 1e12;
-    const double useful_bytes =
+    double useful_bytes =
         static_cast<double>(weight_elems * sizeof(std::uint16_t) + x_elems * sizeof(std::uint16_t) +
                             2 * out_elems * sizeof(float) + 2 * heads * sizeof(float));
+    if (opt.norm_control) {
+        useful_bytes += static_cast<double>((hidden + x_elems) * sizeof(std::uint16_t));
+    }
     const double useful_gbs = useful_bytes / sec / 1e9;
 
     const char* route =
@@ -270,9 +276,19 @@ int main(int argc, char** argv) {
     try {
         const Options opt = parse_args(argc, argv);
         DeviceBuffer flush(opt.flush_bytes);
+        const std::int32_t heads      = opt.geometry35 ? 32 : 48;
+        const std::int32_t hidden     = opt.geometry35 ? 2048 : 5120;
+        const std::int32_t min_tokens = *std::min_element(opt.tokens.begin(), opt.tokens.end());
+        const std::int32_t max_tokens = *std::max_element(opt.tokens.begin(), opt.tokens.end());
+        const std::size_t interval_capacity =
+            opt.norm_control
+                ? ops::gdn_norm_gating_proj_workspace_capacity_bytes(heads, hidden, min_tokens,
+                                                                     max_tokens)
+                : ops::gdn_gating_proj_workspace_capacity_bytes(heads, hidden, min_tokens,
+                                                                max_tokens);
         std::printf("geometry,operation,T,route,median_us,min_us,p95_us,useful_tflops,"
                     "executed_tflops,useful_gbps,workspace_bytes\n");
-        for (const std::int32_t tokens : opt.tokens) { run(opt, tokens, flush); }
+        for (const std::int32_t tokens : opt.tokens) { run(opt, tokens, interval_capacity, flush); }
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "error: %s\n", error.what());

@@ -149,6 +149,7 @@ int main() {
 
     int failures = 0;
     failures += run_contiguous_case("silu_mul [17408,1]", 17408, 1, 101u);
+    failures += run_contiguous_case("silu_mul [17408,48]", 17408, 48, 102u);
     failures += run_strided_gate_up_case();
     failures += run_edge_case();
     std::cout << (failures ? "FAIL" : "OK") << " silu_mul\n";

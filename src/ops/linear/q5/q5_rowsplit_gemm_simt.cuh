@@ -151,7 +151,7 @@ q5_simt_consume_slab(const __nv_bfloat16* __restrict__ x0, std::int64_t xslab, s
 }
 
 template <class SC, int kTt, int kFullSlabs, int kStride, bool SplitOutput = false,
-          int SplitRow = 0>
+          int SplitRow = 0, bool AddResidual = false>
 __launch_bounds__(64, 16) __global__
     void q5_rowsplit_gemm_simt_split2_kernel(const __nv_bfloat16* __restrict__ x,
                                              const std::uint8_t* __restrict__ codes,
@@ -248,8 +248,10 @@ __launch_bounds__(64, 16) __global__
     __syncthreads();
 
     if (part == 0 && lane < kTt) {
-        const float sum                                = s_part[0][lane] + s_part[1][lane];
-        out[static_cast<std::int64_t>(lane) * n + row] = __float2bfloat16(sum);
+        const std::int64_t index = static_cast<std::int64_t>(lane) * n + row;
+        float sum                = s_part[0][lane] + s_part[1][lane];
+        if constexpr (AddResidual) { sum += __bfloat162float(out[index]); }
+        out[index] = __float2bfloat16(sum);
     }
 }
 

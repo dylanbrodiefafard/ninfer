@@ -4,8 +4,8 @@
 //
 // out[Rows, Cols] = W[Rows, K] * x[K, Cols]
 //
-// Each CTA owns a BlockRows x BlockCols output tile and advances K in one
-// 64-value quant group at a time. Raw Q6 code/high planes and FP16 scales are
+// Each CTA owns a BlockRows x BlockCols output tile and advances K in one or more
+// complete 64-value quant groups. Raw Q6 code/high planes and FP16 scales are
 // staged independently from the BF16 activation tile. Q6 values are decoded
 // to BF16 in shared memory, then consumed by m16n8k16 BF16 MMA with FP32
 // accumulation.
@@ -36,7 +36,8 @@ enum class Q6ScaleLoad {
 
 template <int BlockRows_, int BlockCols_, int BlockK_, int WarpRows_, int WarpCols_,
           int PipelineStages_, int LaunchBoundsMinBlocks_, Q6FragmentPipeline FragmentPipeline_,
-          Cache QuantCache_, Cache ActivationCache_, Q6ScaleLoad ScaleLoadMode_>
+          Cache QuantCache_, Cache ActivationCache_, Q6ScaleLoad ScaleLoadMode_,
+          int ActivationStages_ = PipelineStages_>
 struct Q6RowSplitMmaGemmSchedule {
     static constexpr int kBlockRows = BlockRows_;
     static constexpr int kBlockCols = BlockCols_;
@@ -50,6 +51,7 @@ struct Q6RowSplitMmaGemmSchedule {
     static constexpr Cache kQuantCache                    = QuantCache_;
     static constexpr Cache kActivationCache               = ActivationCache_;
     static constexpr Q6ScaleLoad kScaleLoadMode           = ScaleLoadMode_;
+    static constexpr int kActivationStages                = ActivationStages_;
 
     static constexpr int kWarpGridRows = kBlockRows / kWarpRows;
     static constexpr int kWarpGridCols = kBlockCols / kWarpCols;
@@ -64,20 +66,22 @@ struct Q6RowSplitMmaGemmSchedule {
 
     static constexpr int kSharedBytes =
         kBlockRows * kBlockK * static_cast<int>(sizeof(__nv_bfloat16)) +
-        kPipelineStages * kBlockCols * kBlockK * static_cast<int>(sizeof(__nv_bfloat16)) +
+        kActivationStages * kBlockCols * kBlockK * static_cast<int>(sizeof(__nv_bfloat16)) +
         kPipelineStages * kBlockRows * kGroupsPerK * Q6RowSplitStorage::kCodeBytesPerGroup +
         kPipelineStages * kBlockRows * kGroupsPerK * Q6RowSplitStorage::kHighBytesPerGroup +
         kPipelineStages * kBlockRows * kGroupsPerK * kScaleBytes;
 
     static_assert(kBlockRows > 0 && kBlockCols > 0);
-    static_assert(kBlockK == Q6RowSplitStorage::kGroupK,
-                  "Q6 MMA currently stages exactly one quant group per K tile");
+    static_assert(kBlockK % Q6RowSplitStorage::kGroupK == 0,
+                  "Q6 MMA K tile must contain complete quant groups");
     static_assert(kBlockRows % kWarpRows == 0 && kBlockCols % kWarpCols == 0,
                   "Q6 MMA block tile must divide into warp tiles");
     static_assert(kWarpRows % 16 == 0 && kWarpCols % 8 == 0,
                   "Q6 MMA warp tile must be composed of m16n8 MMA tiles");
-    static_assert(kPipelineStages >= 2 && kPipelineStages <= 8,
+    static_assert(kPipelineStages >= 1 && kPipelineStages <= 8,
                   "Q6 MMA cp.async pipeline depth must fit cp_wait");
+    static_assert(kActivationStages == 1 || kActivationStages == kPipelineStages,
+                  "Q6 MMA activation staging is single-buffered or follows the quant pipeline");
     static_assert(kLaunchBoundsMinBlocks >= 1);
     static_assert(kWarps >= 1 && kThreads <= 1024);
     static_assert(kSharedBytes <= 48 * 1024,
@@ -116,11 +120,12 @@ void q6_rowsplit_gemm_mma_kernel(
     constexpr int NT     = Schedule::kMmaCols;
     constexpr int KSUB   = Schedule::kMmaKSteps;
     constexpr int S      = Schedule::kPipelineStages;
+    constexpr int BS     = Schedule::kActivationStages;
     constexpr int GPB    = Schedule::kGroupsPerK;
     constexpr int SB     = Schedule::kScaleBytes;
 
     __shared__ __align__(16) __nv_bfloat16 As[BM * BK];
-    __shared__ __align__(16) __nv_bfloat16 Bs[S][BN * BK];
+    __shared__ __align__(16) __nv_bfloat16 Bs[BS][BN * BK];
     __shared__ __align__(16) std::uint8_t Cr[S][BM * GPB * Q6RowSplitStorage::kCodeBytesPerGroup];
     __shared__ __align__(16) std::uint8_t Hr[S][BM * GPB * Q6RowSplitStorage::kHighBytesPerGroup];
     __shared__ __align__(16) std::uint8_t Sr[S][BM * GPB * SB];
@@ -321,19 +326,39 @@ void q6_rowsplit_gemm_mma_kernel(
         }
     };
 
+    if constexpr (BS == S) {
 #pragma unroll
-    for (int stage = 0; stage < S; ++stage) {
-        if (stage < k_tiles) { stage_inputs(stage, stage); }
+        for (int stage = 0; stage < S; ++stage) {
+            if (stage < k_tiles) { stage_inputs(stage, stage); }
+            cp_commit();
+        }
+    } else {
+#pragma unroll
+        for (int stage = 0; stage < S; ++stage) {
+            if (stage < k_tiles) { stage_quant(stage, stage); }
+            cp_commit();
+        }
+        if (k_tiles > 0) { stage_activation(0, 0); }
         cp_commit();
     }
 
     for (int k_tile = 0; k_tile < k_tiles; ++k_tile) {
         const int stage = k_tile % S;
-        cp_wait<S - 1>();
+        if constexpr (BS == S) {
+            cp_wait<S - 1>();
+        } else {
+            cp_wait<0>();
+        }
         __syncthreads();
 
         decode_weight(stage, k_tile);
         __syncthreads();
+
+        if constexpr (BS == 1) {
+            const int prefetch_quant_tile = k_tile + S;
+            if (prefetch_quant_tile < k_tiles) { stage_quant(stage, prefetch_quant_tile); }
+            cp_commit();
+        }
 
         auto load_fragments = [&](int k_step, unsigned(&a_frag)[MT][4], unsigned(&b_frag)[NT][2]) {
 #pragma unroll
@@ -347,8 +372,9 @@ void q6_rowsplit_gemm_mma_kernel(
             for (int ni = 0; ni < NT; ++ni) {
                 const int row = warp_col * WN + ni * 8 + b_inner_row;
                 const int col = k_step + b_k_offset;
-                ldmatrix_x2(b_frag[ni][0], b_frag[ni][1],
-                            smem_addr(&Bs[stage][row * BK + q6_mma_swizzle_k64(row, col)]));
+                ldmatrix_x2(
+                    b_frag[ni][0], b_frag[ni][1],
+                    smem_addr(&Bs[BS == 1 ? 0 : stage][row * BK + q6_mma_swizzle_k64(row, col)]));
             }
         };
 
@@ -391,9 +417,15 @@ void q6_rowsplit_gemm_mma_kernel(
         }
 
         __syncthreads();
-        const int prefetch_tile = k_tile + S;
-        if (prefetch_tile < k_tiles) { stage_inputs(stage, prefetch_tile); }
-        cp_commit();
+        if constexpr (BS == S) {
+            const int prefetch_tile = k_tile + S;
+            if (prefetch_tile < k_tiles) { stage_inputs(stage, prefetch_tile); }
+            cp_commit();
+        } else {
+            const int next_tile = k_tile + 1;
+            if (next_tile < k_tiles) { stage_activation(0, next_tile); }
+            cp_commit();
+        }
     }
 
 #pragma unroll

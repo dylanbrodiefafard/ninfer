@@ -197,7 +197,7 @@ int main(int argc, char** argv) {
                                                                          candidate_stream);
                 });
             }
-            if (t >= 2 && t <= 32) {
+            if (t >= 2 && t <= 48) {
                 run("splitk_mma_exact_t", [&](cudaStream_t candidate_stream) {
                     ops::detail::w8_linear_swiglu_splitk_exact_t_launch(x, packed.weight, out,
                                                                         candidate_stream);

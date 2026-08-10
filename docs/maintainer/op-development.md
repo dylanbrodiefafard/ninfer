@@ -436,17 +436,25 @@ private launcher.
 
 Candidate comparison is task-local development work. A temporary sweep may call private launchers
 and encode the exact overlapping candidate domains needed for a decision. Measure candidates under
-the same inputs, cache, device, and timing conditions; record the selected winner or crossover once
-in production dispatch; verify final correctness and performance through the public Op; then delete
-the temporary controls and comparison-only entry points.
+the same inputs, cache, device, and timing conditions; put the selected winner or crossover in
+production dispatch; verify final correctness and performance through the public Op; then delete
+the losing candidates, temporary controls, and comparison-only entry points. The selected
+production implementation is not temporary merely because it originated in the sweep.
+
+An Op-scoped performance claim ends at the public Op boundary. Exact formats, layouts, shapes, and
+extents can be constructed directly by the Op benchmark; they do not authorize loading a model
+artifact or invoking a target, Program, Engine, or whole-round benchmark. Product-route evidence is
+required only when the requested deliverable explicitly makes an end-to-end claim and includes
+that product route in scope.
 
 For a performance change:
 
 1. establish correctness for the affected contract or route;
 2. measure the relevant Op and workload extent;
-3. check the affected product route when the claim or change can influence end-to-end inference;
-4. use whole-inference profiling when attribution is unresolved;
-5. use kernel profiling only after a specific kernel-level question is identified.
+3. when an explicitly scoped claim is end-to-end, measure the authorized public product route;
+4. for that end-to-end work, use whole-inference profiling only when attribution is unresolved;
+5. use kernel profiling only after a specific kernel-level question is identified and its answer
+   can change the Op implementation decision.
 
 Preserve only the context needed to interpret the result, as required by `AGENTS.md`.
 
@@ -467,8 +475,8 @@ For a new or changed device transformation:
 6. keep persistent state, graph lifecycle, and schedule policy outside the Op;
 7. qualify every affected public entry and reachable production profile directly against the
    independent oracle;
-8. measure the Op when performance changes and the product route when the material claim is
-   end-to-end;
+8. measure the Op when performance changes; measure a product route only for an explicitly scoped
+   end-to-end claim;
 9. integrate targets only through semantic contract headers and explicit operands;
 10. give every source and symbol one clear build and link owner.
 

@@ -106,7 +106,11 @@ int main() {
     int failures = 0;
     failures += run_case(248320, 248077, 1);
     failures += run_case(248320, 248077, 6);
+    failures += run_case(248320, 248077, 15);
+    failures += run_case(248320, 248077, 128);
     failures += run_case(131072, 131072, 1);
+    failures += run_case(131072, 131072, 15);
+    failures += run_case(131072, 131072, 120);
     std::cout << (failures ? "FAIL" : "OK") << " argmax\n";
     return failures ? 1 : 0;
 }

@@ -97,7 +97,9 @@ int main() {
 
     int failures = 0;
     failures += run_case("residual_add [5120,1]", 5120, 1, 101u);
+    failures += run_case("residual_add [5120,48]", 5120, 48, 102u);
     failures += run_case("residual_add [2048,17]", 2048, 17, 201u);
+    failures += run_case("residual_add [2048,48]", 2048, 48, 202u);
     failures += run_case("residual_add [1152,128]", 1152, 128, 301u);
     failures += run_cancellation_case();
     std::cout << (failures ? "FAIL" : "OK") << " residual_add\n";

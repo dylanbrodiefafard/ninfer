@@ -2,9 +2,9 @@
 
 // Implements: include/ninfer/ops/argmax.h
 // Match: contiguous BF16 [physical_rows,C], valid_rows <= physical_rows, with
-// the tuned route qualified for the 248077-row and 131072-row vocabularies.
-// Algorithm assumptions: one 512-thread CTA reduces each 512-row tile and an
-// atomic winner selects the exact value/lower-id maximum per column.
+// tuned routes qualified for the 248077-row and 131072-row vocabularies.
+// Algorithm assumptions: one CTA reduces each blockDim.x-row tile and an atomic
+// winner selects the exact value/lower-id maximum per column.
 
 #include <cuda_bf16.h>
 #include <cstdint>
@@ -13,10 +13,9 @@
 
 namespace ninfer::ops {
 
-// The registered vocabularies need enough resident warps for a single-column
-// decision. On RTX 5090, 512 threads gives the full-vocab grid 485 CTAs, almost
-// exactly one three-CTA/SM wave, while halving the atomic contenders of the old
-// 256-thread route.
+// Small-column execution uses 512 threads to reduce atomic contenders. Aggregate
+// execution dispatches registered vocab profiles to a smaller block so the much
+// larger 2-D grid exposes enough resident CTAs without oversized reductions.
 inline constexpr int kArgmaxBlock          = 512;
 inline constexpr int kArgmaxItemsPerThread = 1;
 

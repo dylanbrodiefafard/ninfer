@@ -19,20 +19,17 @@ struct RouteSpec {
 };
 
 constexpr std::array<RouteSpec, 5> kK4096Routes{{
-    {1, 8, W8LinearAddScheduleId::SimtR8C4},
-    {9, 16, W8LinearAddScheduleId::SplitKMmaExactT},
-    {17, 52, W8LinearAddScheduleId::SimtR8C4},
-    {53, 640, W8LinearAddScheduleId::MmaR32C128},
+    {1, 1, W8LinearAddScheduleId::SimtR8C4},
+    {2, 48, W8LinearAddScheduleId::SplitKMmaExactT},
+    {49, 128, W8LinearAddScheduleId::MediumSplitK},
+    {129, 640, W8LinearAddScheduleId::MmaR32C128},
     {641, kAnyCols, W8LinearAddScheduleId::MmaR64C128},
 }};
 
-constexpr std::array<RouteSpec, 36> kK6144Routes{{
+constexpr std::array<RouteSpec, 33> kK6144Routes{{
     {1, 1, W8LinearAddScheduleId::DecodeR16},
-    {2, 32, W8LinearAddScheduleId::SplitKMmaExactT},
-    {33, 65, W8LinearAddScheduleId::SplitKMma32PlusTail},
-    {66, 95, W8LinearAddScheduleId::MmaR32C64},
-    {96, 96, W8LinearAddScheduleId::MmaR32C96},
-    {97, 128, W8LinearAddScheduleId::MmaR32C64},
+    {2, 48, W8LinearAddScheduleId::SplitKMmaExactT},
+    {49, 128, W8LinearAddScheduleId::MediumSplitK},
     {129, 191, W8LinearAddScheduleId::MmaR32C128},
     {192, 192, W8LinearAddScheduleId::MmaR32C96},
     {193, 256, W8LinearAddScheduleId::MmaR32C128},
@@ -81,7 +78,7 @@ static_assert(routes_are_closed(kK4096Routes) && routes_are_closed(kK6144Routes)
 std::int32_t schedule_rows(W8LinearAddScheduleId schedule) {
     switch (schedule) {
     case W8LinearAddScheduleId::DecodeR16:
-    case W8LinearAddScheduleId::SplitKMma32PlusTail:
+    case W8LinearAddScheduleId::MediumSplitK:
         break;
     case W8LinearAddScheduleId::SimtR8C4:
         return 8;
@@ -118,7 +115,7 @@ bool use_full(W8LinearAddScheduleId schedule, const W8LinearAddProblem& problem)
 std::int32_t schedule_cols(W8LinearAddScheduleId schedule) {
     switch (schedule) {
     case W8LinearAddScheduleId::DecodeR16:
-    case W8LinearAddScheduleId::SplitKMma32PlusTail:
+    case W8LinearAddScheduleId::MediumSplitK:
         break;
     case W8LinearAddScheduleId::SimtR8C4:
         return 4;
@@ -154,8 +151,8 @@ const char* w8_linear_add_schedule_name(W8LinearAddScheduleId schedule) noexcept
         return "linear_add.w8.decode.r16.residual";
     case W8LinearAddScheduleId::SplitKMmaExactT:
         return "linear_add.w8.splitk8.mma.r16.exact_t.residual";
-    case W8LinearAddScheduleId::SplitKMma32PlusTail:
-        return "linear_add.w8.splitk8.mma.r16.exact32_plus_tail.residual";
+    case W8LinearAddScheduleId::MediumSplitK:
+        return "linear_add.w8.medium_splitk.residual";
     case W8LinearAddScheduleId::SimtR8C4:
         return "linear_add.w8.simt.r8.c4.slab1024.s2.code_ca.scale_pair32";
     case W8LinearAddScheduleId::MmaR32C64:
@@ -228,8 +225,8 @@ void w8_linear_add_execute_plan(const W8LinearAddPlan& plan, const Tensor& x, co
         w8_linear_add_splitk_mma_launch(x, w, residual_out, stream);
         return;
     }
-    if (plan.schedule == W8LinearAddScheduleId::SplitKMma32PlusTail) {
-        w8_linear_add_splitk_mma_composite_launch(x, w, residual_out, stream);
+    if (plan.schedule == W8LinearAddScheduleId::MediumSplitK) {
+        w8_linear_add_medium_splitk_launch(x, w, residual_out, stream);
         return;
     }
     const bool full = use_full(plan.schedule, problem);
@@ -239,7 +236,7 @@ void w8_linear_add_execute_plan(const W8LinearAddPlan& plan, const Tensor& x, co
             Tensor residual_slice = residual_out.slice(1, offset, count);
             switch (plan.schedule) {
             case W8LinearAddScheduleId::DecodeR16:
-            case W8LinearAddScheduleId::SplitKMma32PlusTail:
+            case W8LinearAddScheduleId::MediumSplitK:
                 break;
             case W8LinearAddScheduleId::SimtR8C4:
                 w8_linear_add_simt_r8_c4_launch(full, x_slice, w, residual_slice, stream);

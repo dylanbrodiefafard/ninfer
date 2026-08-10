@@ -23,18 +23,21 @@ namespace {
 // This criterion belongs to the complete A16 attention-input-projection Op.
 constexpr ReductionCriterion kAttnInputProjA16Tolerance{2.9e-3, 4.0e-3, 4.5e-3};
 constexpr ReductionCriterion kAttnInputProjA4Tolerance{0.16, 1.0 / 256.0, 0.16};
+// Retain the original seven grid points while stabilizing the distribution-level A4 criterion.
+constexpr std::int32_t kA4SampleRows = 31;
 
 int verify_output(std::string_view label, const GuardedBf16Tensor& output,
                   const quantized_weight::PackedWeight& weight, std::int32_t weight_row_offset,
                   std::int32_t output_rows, const std::vector<float>& activation,
                   std::int32_t hidden, std::int32_t tokens,
-                  const ReductionCriterion& criterion = kAttnInputProjA16Tolerance) {
+                  const ReductionCriterion& criterion = kAttnInputProjA16Tolerance,
+                  std::int32_t sample_count           = 7) {
     int failures = output.verify_guards(label);
     failures += output.verify_fully_written(label);
     const std::vector<double> actual =
-        gather_rows(output.values(), output_rows, 0, output_rows, tokens);
-    const std::vector<double> expected =
-        projection_oracle(weight, weight_row_offset, output_rows, activation, hidden, tokens);
+        gather_rows(output.values(), output_rows, 0, output_rows, tokens, sample_count);
+    const std::vector<double> expected = projection_oracle(
+        weight, weight_row_offset, output_rows, activation, hidden, tokens, sample_count);
     failures += compare(label, actual, expected, criterion);
     return failures;
 }
@@ -85,7 +88,7 @@ int run_q4_q5() {
         quantized_weight::make_patterned_weight(QType::Q5G64_F16S, kParent, kHidden, 107U));
 
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 16, 17}) {
+    for (const std::int32_t tokens : {1, 2, 16, 17, 21, 48}) {
         failures += run_q4_q5_case(query_key, gate_value, tokens);
     }
     return failures;
@@ -268,16 +271,17 @@ int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens,
     const bool a4                      = policy == ops::LinearPolicy::AllowA4;
     const ReductionCriterion& criterion =
         a4 ? kAttnInputProjA4Tolerance : kAttnInputProjA16Tolerance;
+    const std::int32_t sample_count = a4 ? kA4SampleRows : 7;
     const std::string suffix =
         std::string(" NVFP4 ") + (a4 ? "A4" : "A16") + " T=" + std::to_string(tokens);
     failures += verify_output("attn q" + suffix, query, parent.host, 0, kQRows, activation, kHidden,
-                              tokens, criterion);
+                              tokens, criterion, sample_count);
     failures += verify_output("attn k" + suffix, key, parent.host, kKeyBegin, kKvRows, activation,
-                              kHidden, tokens, criterion);
+                              kHidden, tokens, criterion, sample_count);
     failures += verify_output("attn gate" + suffix, gate, parent.host, kGateBegin, kQRows,
-                              activation, kHidden, tokens, criterion);
+                              activation, kHidden, tokens, criterion, sample_count);
     failures += verify_output("attn value" + suffix, value, parent.host, kValueBegin, kKvRows,
-                              activation, kHidden, tokens, criterion);
+                              activation, kHidden, tokens, criterion, sample_count);
     failures += verify_preserved("attn x" + suffix, device_activation, activation_bits);
     failures += parent.verify_preserved("attn parent" + suffix);
     return failures;
@@ -342,7 +346,7 @@ int run_w8_target() {
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::W8G32_F16S, 9216, kHidden, 211U));
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 17, 129}) {
+    for (const std::int32_t tokens : {1, 2, 17, 48, 64, 65, 129}) {
         failures += run_w8_target_case(parent, tokens);
     }
     return failures;

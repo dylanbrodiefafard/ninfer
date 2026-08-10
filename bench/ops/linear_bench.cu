@@ -135,29 +135,30 @@ struct PointGroup {
 
 struct Result {
     std::string labels;
-    const char* qtype_name     = "";
-    const char* policy_name    = "";
-    std::int32_t n             = 0;
-    std::int32_t k             = 0;
-    std::int32_t t             = 0;
-    std::uint64_t weight_bytes = 0;
-    std::uint64_t x_bytes      = 0;
-    std::uint64_t out_bytes    = 0;
-    std::uint64_t model_bytes  = 0;
-    double useful_flops        = 0.0;
-    double median_us           = 0.0;
-    double min_us              = 0.0;
-    double p95_us              = 0.0;
-    double effective_gbs       = 0.0;
-    double dram_spec_pct       = 0.0;
-    double sustained_read_pct  = 0.0;
-    double useful_tflops       = 0.0;
-    double memory_floor_us     = 0.0;
-    double memory_floor_pct    = 0.0;
-    double delta_pct           = std::numeric_limits<double>::quiet_NaN();
-    int warmup                 = 0;
-    int repeat                 = 0;
-    std::uint64_t flush_bytes  = 0;
+    const char* qtype_name         = "";
+    const char* policy_name        = "";
+    std::int32_t n                 = 0;
+    std::int32_t k                 = 0;
+    std::int32_t t                 = 0;
+    std::uint64_t weight_bytes     = 0;
+    std::uint64_t x_bytes          = 0;
+    std::uint64_t out_bytes        = 0;
+    std::uint64_t model_bytes      = 0;
+    double useful_flops            = 0.0;
+    double median_us               = 0.0;
+    double min_us                  = 0.0;
+    double p95_us                  = 0.0;
+    double effective_gbs           = 0.0;
+    double dram_spec_pct           = 0.0;
+    double sustained_read_pct      = 0.0;
+    double useful_tflops           = 0.0;
+    double memory_floor_us         = 0.0;
+    double memory_floor_pct        = 0.0;
+    double t1_linear_extrapolation = std::numeric_limits<double>::quiet_NaN();
+    double delta_pct               = std::numeric_limits<double>::quiet_NaN();
+    int warmup                     = 0;
+    int repeat                     = 0;
+    std::uint64_t flush_bytes      = 0;
 };
 
 struct LinearBenchWeight {
@@ -589,6 +590,7 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
 
     std::vector<Result> results;
     results.reserve(group.points.size());
+    double t1_median       = std::numeric_limits<double>::quiet_NaN();
     double previous_median = std::numeric_limits<double>::quiet_NaN();
 
     for (const BenchPoint& point : group.points) {
@@ -600,6 +602,11 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
         const bench::ColdTiming timing =
             bench::measure_cold_launch(launch, flush, stream, opt.warmup, opt.repeat);
         Result result = make_result(point, weight, timing, opt);
+        if (point.t == 1) { t1_median = result.median_us; }
+        if (std::isfinite(t1_median)) {
+            result.t1_linear_extrapolation =
+                static_cast<double>(point.t) * t1_median / result.median_us;
+        }
         if (point.sweep_point && std::isfinite(previous_median)) {
             result.delta_pct = (result.median_us / previous_median - 1.0) * 100.0;
         }
@@ -668,23 +675,29 @@ void print_header() {
 }
 
 void print_results(const std::vector<Result>& results) {
-    std::printf("%-44s %5s %3s %8s %8s %6s %11s %11s %11s %10s %7s %7s %10s %9s %8s\n", "label",
+    std::printf("%-44s %5s %3s %8s %8s %6s %11s %11s %11s %10s %7s %7s %10s %9s %9s %8s\n", "label",
                 "qt", "pol", "N", "K", "T", "median_us", "min_us", "p95_us", "eff_GB/s", "DRAM_%",
-                "READ_%", "TFLOP/s", "mem_%", "delta_%");
+                "READ_%", "TFLOP/s", "mem_%", "T1_lin_x", "delta_%");
     for (const Result& result : results) {
         const bool have_delta = std::isfinite(result.delta_pct);
         char delta[32];
+        char t1_linear[32];
         if (have_delta) {
             std::snprintf(delta, sizeof(delta), "%.2f", result.delta_pct);
         } else {
             std::snprintf(delta, sizeof(delta), "-");
         }
+        if (std::isfinite(result.t1_linear_extrapolation)) {
+            std::snprintf(t1_linear, sizeof(t1_linear), "%.2f", result.t1_linear_extrapolation);
+        } else {
+            std::snprintf(t1_linear, sizeof(t1_linear), "-");
+        }
         std::printf("%-44s %5s %3s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %7.2f "
-                    "%7.2f %10.2f %9.2f %8s\n",
+                    "%7.2f %10.2f %9.2f %9s %8s\n",
                     result.labels.c_str(), result.qtype_name, result.policy_name, result.n,
                     result.k, result.t, result.median_us, result.min_us, result.p95_us,
                     result.effective_gbs, result.dram_spec_pct, result.sustained_read_pct,
-                    result.useful_tflops, result.memory_floor_pct, delta);
+                    result.useful_tflops, result.memory_floor_pct, t1_linear, delta);
     }
 }
 
@@ -705,7 +718,7 @@ void write_csv(const std::filesystem::path& path, const std::vector<Result>& res
     out << "label,qtype,policy,N,K,T,weight_bytes,x_bytes,out_bytes,model_bytes,"
            "useful_flops,median_us,min_us,p95_us,effective_gbs,dram_spec_gbs,dram_spec_pct,"
            "sustained_read_gbs,sustained_read_pct,useful_tflops,memory_floor_us,memory_floor_pct,"
-           "delta_pct,"
+           "t1_linear_extrapolation,delta_pct,"
            "warmup,repeat,flush_bytes\n";
     for (const Result& result : results) {
         out << csv_quote(result.labels) << ',' << result.qtype_name << ',' << result.policy_name
@@ -716,6 +729,10 @@ void write_csv(const std::filesystem::path& path, const std::vector<Result>& res
             << result.dram_spec_pct << ',' << kRtx5090SustainedReadGBs << ','
             << result.sustained_read_pct << ',' << result.useful_tflops << ','
             << result.memory_floor_us << ',' << result.memory_floor_pct << ',';
+        if (std::isfinite(result.t1_linear_extrapolation)) {
+            out << result.t1_linear_extrapolation;
+        }
+        out << ',';
         if (std::isfinite(result.delta_pct)) { out << result.delta_pct; }
         out << ',' << result.warmup << ',' << result.repeat << ',' << result.flush_bytes << '\n';
     }

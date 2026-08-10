@@ -10,11 +10,13 @@ namespace ninfer::ops::detail {
 
 inline constexpr std::int32_t kBf16LinearAddSmallTMinTokens   = 2;
 inline constexpr std::int32_t kBf16LinearAddSmallTMaxTokens   = 32;
-inline constexpr std::int32_t kBf16LinearAddSmallTDispatchEnd = 26;
+inline constexpr std::int32_t kBf16LinearAddSmallTDispatchEnd = 4;
+inline constexpr std::int32_t kBf16LinearAddAggregateMmaEnd   = 48;
 
 enum class Bf16LinearAddScheduleId : std::uint8_t {
     Decode,
     SmallT,
+    AggregateMma,
     Mma,
 };
 
@@ -28,6 +30,8 @@ void bf16_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tensor
                                    cudaStream_t stream);
 void bf16_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                     cudaStream_t stream);
+void bf16_linear_add_aggregate_mma_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                          cudaStream_t stream);
 void bf16_linear_add_mma_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                 cudaStream_t stream);
 

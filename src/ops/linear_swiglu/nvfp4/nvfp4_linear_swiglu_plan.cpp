@@ -16,6 +16,7 @@ namespace {
 enum class Nvfp4LinearSwiGluRoute {
     DecodeFusedA16,
     SmallTFusedA16,
+    FusedW4A4,
     LinearW4A4Post,
     TmaFusedW4A4,
 };
@@ -34,6 +35,7 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     }
     if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
     if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
+    if (tokens <= 48) { return Nvfp4LinearSwiGluRoute::FusedW4A4; }
     if (tokens == kPrimaryT) { return Nvfp4LinearSwiGluRoute::TmaFusedW4A4; }
     return Nvfp4LinearSwiGluRoute::LinearW4A4Post;
 }
@@ -85,6 +87,9 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
     if (policy == LinearPolicy::A16Only || max_tokens <= 4) { return 0; }
 
     std::size_t maximum = 0;
+    if (min_tokens <= 48 && max_tokens >= 5) {
+        maximum = fused_workspace_bytes(std::min(max_tokens, 48));
+    }
     if (min_tokens <= kPrimaryT && max_tokens >= kPrimaryT) {
         maximum = fused_workspace_bytes(kPrimaryT);
     }
@@ -93,7 +98,7 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
     if (resolve_route(policy, last_baseline) == Nvfp4LinearSwiGluRoute::TmaFusedW4A4) {
         --last_baseline;
     }
-    if (last_baseline >= std::max(min_tokens, 5)) {
+    if (last_baseline >= std::max(min_tokens, 49)) {
         maximum = std::max(maximum, baseline_workspace_bytes(last_baseline));
     }
     return maximum;
@@ -108,6 +113,9 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
         return;
     case Nvfp4LinearSwiGluRoute::SmallTFusedA16:
         nvfp4_linear_swiglu_small_t_launch(x, weight, out, stream);
+        return;
+    case Nvfp4LinearSwiGluRoute::FusedW4A4:
+        nvfp4_linear_swiglu_w4a4_launch(x, weight, out, workspace, stream);
         return;
     case Nvfp4LinearSwiGluRoute::TmaFusedW4A4: {
         auto scope                       = workspace.scope();

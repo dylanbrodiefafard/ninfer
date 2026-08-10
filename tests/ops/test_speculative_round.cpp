@@ -390,6 +390,7 @@ int main() {
     failures += select_hidden_case(2048, 16, 7);
     failures += remap_case(1);
     failures += remap_case(15);
+    failures += remap_case(120);
 
     if (failures != 0) {
         std::cerr << "speculative_round failures=" << failures << '\n';

@@ -375,6 +375,10 @@ request boundary。
 5. `T_total>16` 时不因旧 single-request Verify profile 进入 unsupported 或明显不适合的 route；
 6. `B=1` 的现有 production route 不发生显著回退。
 
+其中 1、2、4、5、6 是 column-independent Op 自身的 qualification；3 属于后续 concurrent
+schedule integration。Op qualification 只需证明公开入口一次消费完整 `T_total`，不得为证明第 3 项而加载
+artifact 或调用 target、Program、Engine、DecodeRound。
+
 Route 可以随 `T_total` 选择 small-T、GEMM、MoE small-token 或其他已 qualification 的实现。Decode phase
 名称不应被解释为 `T=1`。
 
@@ -441,16 +445,24 @@ kernel 或逐请求 production calls 作为唯一 oracle。
 - registered short、medium 和 long context profiles；
 - 两个 target 的实际 weight formats 和启用的 speculative backend。
 
-必须确认：
+Column-independent Op 的证据止于公开 Op 边界：使用 synthetic fixture 构造精确 format、shape 和
+`T_total`，不加载 artifact，也不调用 target、Program、Engine 或 whole-round benchmark。最终判断使用与
+瓶颈相符的 useful bandwidth/`READ_%` 或 useful FLOP/s/`TC_%`。Linear 只测一个带正常
+warmup/repetition 的 `T=1` benchmark point，并计算 `T * median(T=1) / median(T)`；不得把顺序执行
+`T` 次 `T=1` launch 当作 comparison workload。
 
-- batched path 不产生 `B` 份 request-local model/Op launch sequence；
-- Linear/lm_head/projection 的 weight traffic 能服务多个 columns；
-- sequence-sensitive Op 的 batch metadata 和 indirect addressing 没有抵消主要 batch 收益；
-- ordinary `B=1` 与当前 production path 相比无显著回退；
-- `B>1` 的整轮结果优于顺序执行相同 requests，并满足并发架构的 whole-batch invariant。
+Column-independent Op qualification 必须确认：
 
-临时开发 benchmark 可以用于 route 选择；最终只保留保护 production Op contract 或稳定性能结论所需的
-工具，不保留候选 kernel、实验开关或重复 benchmark。
+- 一个公开 Op call 消费完整 `T_total`，wrapper 不按 column/request 展开；
+- Linear/lm_head/projection 的 weight traffic 能服务多个 columns，而不是隐藏 `B` 份独立 GEMV；
+- 公开 `B=1` Op route 与修改前相比无显著回退。
+
+后续明确包含 sequence-sensitive Op 或 concurrent Engine 的工作还必须确认 batch metadata 和 indirect
+addressing 没有抵消主要收益，并在整轮层面确认 `B>1` 优于顺序执行相同 requests、满足 whole-batch
+invariant。这些要求不是 column-independent Op qualification 的完成条件。
+
+临时开发 benchmark 可以调用 private launcher 用于 route 选择；胜出实现进入 production dispatch 并由
+公开 Op 复验。最终删除落选候选、实验开关和重复 benchmark，不删除已选中的 production 实现。
 
 ---
 

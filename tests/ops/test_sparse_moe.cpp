@@ -642,9 +642,9 @@ int main() {
     // These are public-behavior cases, not route assertions. They exercise decode (T=1), the
     // Small-T supported-domain edges, each profile's first prefill T, the wide-prefill boundary,
     // and one call crossing the 4096-token internal slice without observing any private plan.
-    constexpr std::array<std::int32_t, 6> kQ4Q5Tokens{{1, 2, 44, 45, 768, 4097}};
-    constexpr std::array<std::int32_t, 5> kQ4Q6Tokens{{1, 2, 44, 45, 768}};
-    constexpr std::array<std::int32_t, 5> kW8W8Tokens{{1, 2, 17, 18, 768}};
+    constexpr std::array<std::int32_t, 6> kQ4Q5Tokens{{1, 2, 46, 47, 768, 4097}};
+    constexpr std::array<std::int32_t, 5> kQ4Q6Tokens{{1, 2, 46, 47, 768}};
+    constexpr std::array<std::int32_t, 5> kW8W8Tokens{{1, 2, 19, 20, 768}};
     const std::array<CodecProfile, 3> profiles{{
         {"sparse_moe q4+q5 a16", QType::Q4G64_F16S, QType::Q5G64_F16S, kQ4Q5Tokens, true},
         {"sparse_moe q4+q6 a16", QType::Q4G64_F16S, QType::Q6G64_F16S, kQ4Q6Tokens, false},

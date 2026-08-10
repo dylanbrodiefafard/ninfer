@@ -84,6 +84,7 @@ int main() {
     failures += run_case("rmsnorm offset [2048,7]", {2048, 7}, true, 1103U);
     failures += run_case("rmsnorm offset [256,24,7]", {256, 24, 7}, true, 1104U);
     failures += run_case("rmsnorm offset [256,2,1]", {256, 2}, true, 1105U);
+    failures += run_case("rmsnorm offset [256,4,48]", {256, 4, 48}, true, 1106U);
     failures += run_case("rmsnorm plain [2048,1]", {2048, 1}, false, 1201U);
     failures += run_case("rmsnorm plain [2048,128]", {2048, 128}, false, 1202U);
     failures += run_case("rmsnorm plain [128,32,7]", {128, 32, 7}, false, 1203U);

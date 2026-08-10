@@ -11,9 +11,9 @@ int main() {
     try {
         // One public numerical case begins each materially distinct W8 implementation interval;
         // selected endpoints exercise exact-T and predicated tails without inspecting selectors.
-        constexpr std::array<std::int32_t, 20> kTokenCases{
-            1,   2,   32,  33,  65,  81,  97,  129, 193, 241,
-            256, 257, 265, 289, 321, 385, 449, 513, 560, 561,
+        constexpr std::array<std::int32_t, 25> kTokenCases{
+            1,   2,   6,   32,  33,  40,  41,  48,  49,  65,  81,  97,  129,
+            193, 241, 256, 257, 265, 289, 321, 385, 449, 513, 560, 561,
         };
         const int failures = run_profile(
             "LinearSwiGLU W8_A16",

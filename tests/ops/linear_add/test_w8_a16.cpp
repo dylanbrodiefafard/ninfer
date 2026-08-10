@@ -12,21 +12,21 @@ using ninfer::test::linear_add::WeightFormat;
 int w8_a16_conformance() {
     int failures = 0;
 
-    constexpr std::array<std::int32_t, 4> kK4096RouteStarts{9, 17, 53, 641};
-    constexpr std::array<std::int32_t, 5> kK4096RouteInteriors{4, 12, 32, 256, 1024};
+    constexpr std::array<std::int32_t, 4> kK4096RouteStarts{2, 49, 129, 641};
+    constexpr std::array<std::int32_t, 5> kK4096RouteInteriors{1, 24, 96, 256, 1024};
     failures += ninfer::test::linear_add::run_shape(
         "W8_A16 LinearAdd", WeightFormat::W8G32F16S,
         ShapeCase{2048, 4096, 419U, kK4096RouteStarts, kK4096RouteInteriors});
 
-    constexpr std::array<std::int32_t, 35> kK6144RouteStarts{
-        2,    33,   66,   96,   97,   129,  192,  193,  257,  385,  400,  401,
-        448,  449,  481,  641,  673,  705,  785,  897,  961,  1024, 1025, 1121,
-        1281, 1345, 1409, 1681, 1792, 1793, 1920, 1921, 2017, 2048, 2049,
+    constexpr std::array<std::int32_t, 32> kK6144RouteStarts{
+        2,    49,   129,  192,  193,  257,  385,  400,  401,  448,  449,
+        481,  641,  673,  705,  785,  897,  961,  1024, 1025, 1121, 1281,
+        1345, 1409, 1681, 1792, 1793, 1920, 1921, 2017, 2048, 2049,
     };
-    constexpr std::array<std::int32_t, 36> kK6144RouteInteriors{
-        1,    16,   48,   80,   96,   112,  160,  192,  224,  320,  392,  400,
-        424,  448,  464,  560,  656,  688,  744,  840,  928,  992,  1024, 1072,
-        1200, 1312, 1376, 1544, 1736, 1792, 1856, 1920, 1968, 2032, 2048, 4096,
+    constexpr std::array<std::int32_t, 33> kK6144RouteInteriors{
+        1,    24,   96,   160,  192,  224,  320,  392,  400,  424,  448,
+        464,  560,  656,  688,  744,  840,  928,  992,  1024, 1072, 1200,
+        1312, 1376, 1544, 1736, 1792, 1856, 1920, 1968, 2032, 2048, 4096,
     };
     failures += ninfer::test::linear_add::run_shape(
         "W8_A16 LinearAdd", WeightFormat::W8G32F16S,

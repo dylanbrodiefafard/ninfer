@@ -1,11 +1,7 @@
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 
-#include "ninfer/ops/linear.h"
-#include "ninfer/ops/residual_add.h"
-#include "core/layout.h"
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 
-#include <algorithm>
 #include <array>
 #include <limits>
 #include <stdexcept>
@@ -40,24 +36,37 @@ constexpr std::array<SupportSpec, 2> kSupports{{
     {5120, 17408, 17408},
 }};
 
-constexpr std::array<RouteSpec, 4> kRoutes{{
+constexpr std::array<RouteSpec, 6> kK6144Routes{{
     {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
-    {{2, 24}, Q5LinearAddScheduleId::Materialized},
-    {{25, 128}, Q5LinearAddScheduleId::MmaResidualR64C64},
+    {{2, 13}, Q5LinearAddScheduleId::Split2ExactResidual},
+    {{14, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
+    {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
+    {{49, 128}, Q5LinearAddScheduleId::MmaResidualR64C64},
     {{129, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
 }};
 
-constexpr bool catalog_is_closed() noexcept {
+constexpr std::array<RouteSpec, 6> kK17408Routes{{
+    {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
+    {{2, 16}, Q5LinearAddScheduleId::Split2ExactResidual},
+    {{17, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
+    {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
+    {{49, 128}, Q5LinearAddScheduleId::MmaResidualR64C64},
+    {{129, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
+}};
+
+template <std::size_t N>
+constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes) noexcept {
     std::int64_t expected = 1;
-    for (const RouteSpec& route : kRoutes) {
+    for (const RouteSpec& route : routes) {
         if (route.cols.first != expected || route.cols.last < route.cols.first) { return false; }
         expected = static_cast<std::int64_t>(route.cols.last) + 1;
     }
-    return kRoutes.back().cols.last == kAnyCols &&
+    return routes.back().cols.last == kAnyCols &&
            expected == static_cast<std::int64_t>(kAnyCols) + 1;
 }
 
-static_assert(catalog_is_closed(), "Q5 LinearAdd routes must be exact, contiguous, and closed");
+static_assert(catalog_is_closed(kK6144Routes) && catalog_is_closed(kK17408Routes),
+              "Q5 LinearAdd routes must be exact, contiguous, and closed");
 
 bool supported_shape(const Q5LinearAddProblem& problem) noexcept {
     for (const SupportSpec& support : kSupports) {
@@ -69,25 +78,18 @@ bool supported_shape(const Q5LinearAddProblem& problem) noexcept {
     return false;
 }
 
-template <class Allocator>
-Tensor allocate_materialized_workspace(Allocator& allocator, std::int32_t rows, std::int32_t cols) {
-    return allocator.alloc(DType::BF16, {rows, cols});
-}
-
-std::size_t materialized_workspace_bytes(std::int32_t rows, std::int32_t cols) {
-    WorkspaceLayoutBuilder layout;
-    (void)allocate_materialized_workspace(layout, rows, cols);
-    return layout.peak_bytes(1);
-}
-
 } // namespace
 
 const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept {
     switch (schedule) {
     case Q5LinearAddScheduleId::GemvResidual:
         return "linear_add.q5.gemv.residual";
-    case Q5LinearAddScheduleId::Materialized:
-        return "linear_add.q5.materialized";
+    case Q5LinearAddScheduleId::Split2ExactResidual:
+        return "linear_add.q5.simt.split2.exact.residual";
+    case Q5LinearAddScheduleId::MmaResidualR64C16:
+        return "linear_add.q5.mma.r64.c16.cta_collective_residual";
+    case Q5LinearAddScheduleId::MmaResidualR64C24:
+        return "linear_add.q5.mma.r64.c24.cta_collective_residual";
     case Q5LinearAddScheduleId::MmaResidualR64C64:
         return "linear_add.q5.mma.r64.c64.cta_collective_residual";
     case Q5LinearAddScheduleId::MmaResidualR64C128:
@@ -105,25 +107,13 @@ Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem) {
         throw std::invalid_argument("q5 linear_add: exact problem or column count is not admitted");
     }
 
-    for (const RouteSpec& route : kRoutes) {
-        if (!route.cols.contains(problem.cols)) { continue; }
-        Q5LinearAddPlan plan{
-            route.schedule,
-            0,
-        };
-        switch (route.schedule) {
-        case Q5LinearAddScheduleId::GemvResidual:
-            return plan;
-        case Q5LinearAddScheduleId::Materialized: {
-            plan.workspace_bytes = materialized_workspace_bytes(problem.rows, problem.cols);
-            return plan;
+    const auto resolve_from = [&](const auto& routes) -> Q5LinearAddPlan {
+        for (const RouteSpec& route : routes) {
+            if (route.cols.contains(problem.cols)) { return {route.schedule, 0}; }
         }
-        case Q5LinearAddScheduleId::MmaResidualR64C64:
-        case Q5LinearAddScheduleId::MmaResidualR64C128:
-            return plan;
-        }
-    }
-    throw std::logic_error("q5 linear_add: admitted problem has no covering route");
+        throw std::logic_error("q5 linear_add: admitted problem has no covering route");
+    };
+    return problem.k == 6144 ? resolve_from(kK6144Routes) : resolve_from(kK17408Routes);
 }
 
 std::size_t q5_linear_add_capacity_workspace_bytes(std::int32_t rows, std::int32_t k,
@@ -135,14 +125,7 @@ std::size_t q5_linear_add_capacity_workspace_bytes(std::int32_t rows, std::int32
     (void)q5_linear_add_resolve_plan({rows, k, padded_k, min_cols});
     (void)q5_linear_add_resolve_plan({rows, k, padded_k, max_cols});
 
-    std::size_t maximum = 0;
-    for (const RouteSpec& route : kRoutes) {
-        if (route.cols.last < min_cols || route.cols.first > max_cols) { continue; }
-        const std::int32_t endpoint = std::min(route.cols.last, max_cols);
-        maximum                     = std::max(
-            maximum, q5_linear_add_resolve_plan({rows, k, padded_k, endpoint}).workspace_bytes);
-    }
-    return maximum;
+    return 0;
 }
 
 void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, const Weight& w,
@@ -152,18 +135,21 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
     if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument("q5 linear_add: plan does not match the exact problem");
     }
+    (void)ws;
 
     switch (plan.schedule) {
     case Q5LinearAddScheduleId::GemvResidual:
         q5_linear_add_gemv_residual_launch(x, w, residual_out, stream);
         return;
-    case Q5LinearAddScheduleId::Materialized: {
-        auto scratch_scope = ws.scope();
-        Tensor projected   = allocate_materialized_workspace(ws, problem.rows, problem.cols);
-        linear(x, w, projected, stream);
-        residual_add(projected, residual_out, stream);
+    case Q5LinearAddScheduleId::Split2ExactResidual:
+        q5_linear_add_split2_exact_launch(x, w, residual_out, stream);
         return;
-    }
+    case Q5LinearAddScheduleId::MmaResidualR64C16:
+        q5_linear_add_mma_r64_c16_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::MmaResidualR64C24:
+        q5_linear_add_mma_r64_c24_launch(x, w, residual_out, stream);
+        return;
     case Q5LinearAddScheduleId::MmaResidualR64C64:
         q5_linear_add_mma_r64_c64_launch(x, w, residual_out, stream);
         return;

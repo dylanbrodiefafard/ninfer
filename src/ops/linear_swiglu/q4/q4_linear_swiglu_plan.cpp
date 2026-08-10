@@ -31,9 +31,12 @@ struct RouteSpec {
 
 constexpr Q4LinearSwiGluProblem kShape{34816, 17408, 5120, 5120, 1};
 
-constexpr std::array<RouteSpec, 7> kRoutes{{
+constexpr std::array<RouteSpec, 10> kRoutes{{
     {{1, 1}, Q4LinearSwiGluScheduleId::GemvPair},
-    {{2, 128}, Q4LinearSwiGluScheduleId::Materialized},
+    {{2, 32}, Q4LinearSwiGluScheduleId::SmallTExact},
+    {{33, 40}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C40},
+    {{41, 48}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C48},
+    {{49, 128}, Q4LinearSwiGluScheduleId::Materialized},
     {{129, 256}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
     {{257, 384}, Q4LinearSwiGluScheduleId::Materialized},
     {{385, 512}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
@@ -76,6 +79,12 @@ const char* q4_linear_swiglu_schedule_name(Q4LinearSwiGluScheduleId schedule) no
     switch (schedule) {
     case Q4LinearSwiGluScheduleId::GemvPair:
         return "linear_swiglu.q4.gemv.paired_rows";
+    case Q4LinearSwiGluScheduleId::SmallTExact:
+        return "linear_swiglu.q4.mma.small_t.exact";
+    case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C40:
+        return "linear_swiglu.q4.mma.split_half_pair.r32.c40";
+    case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C48:
+        return "linear_swiglu.q4.mma.split_half_pair.r32.c48";
     case Q4LinearSwiGluScheduleId::Materialized:
         return "linear_swiglu.q4.materialized";
     case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128:
@@ -102,6 +111,9 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
         };
         switch (route.schedule) {
         case Q4LinearSwiGluScheduleId::GemvPair:
+        case Q4LinearSwiGluScheduleId::SmallTExact:
+        case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C40:
+        case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C48:
             return plan;
         case Q4LinearSwiGluScheduleId::Materialized:
             plan.workspace_bytes = materialized_workspace_bytes(problem.gate_up_rows, problem.cols);
@@ -145,6 +157,15 @@ void q4_linear_swiglu_execute_plan(const Q4LinearSwiGluPlan& plan, const Tensor&
     switch (plan.schedule) {
     case Q4LinearSwiGluScheduleId::GemvPair:
         q4_linear_swiglu_gemv_pair_launch(x, w, out, stream);
+        return;
+    case Q4LinearSwiGluScheduleId::SmallTExact:
+        q4_linear_swiglu_small_t_exact_launch(x, w, out, stream);
+        return;
+    case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C40:
+        q4_linear_swiglu_mma_split_half_pair_r32_c40_launch(x, w, out, stream);
+        return;
+    case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C48:
+        q4_linear_swiglu_mma_split_half_pair_r32_c48_launch(x, w, out, stream);
         return;
     case Q4LinearSwiGluScheduleId::Materialized: {
         auto scratch_scope = ws.scope();

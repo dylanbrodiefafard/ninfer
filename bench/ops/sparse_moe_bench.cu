@@ -168,6 +168,45 @@ const char* execution_name(Execution execution) {
 
 const char* cache_name(CacheState cache) { return cache == CacheState::Cold ? "cold" : "warm"; }
 
+std::uint64_t packed_weight_bytes(QType qtype, std::int32_t rows, std::int32_t columns) {
+    const std::int32_t group   = qtype == QType::W8G32_F16S ? 32 : 64;
+    const std::uint64_t groups = static_cast<std::uint64_t>(rows) * columns / group;
+    const std::uint64_t low    = qtype == QType::W8G32_F16S
+                                     ? static_cast<std::uint64_t>(rows) * columns
+                                     : static_cast<std::uint64_t>(rows) * columns / 2;
+    const std::uint64_t high   = qtype == QType::Q5G64_F16S   ? groups * 8
+                                 : qtype == QType::Q6G64_F16S ? groups * 16
+                                                              : 0;
+    return low + high + groups * sizeof(std::uint16_t);
+}
+
+double unique_weight_bytes(const Result& result) {
+    const std::uint64_t fixed = static_cast<std::uint64_t>(kRouterRows) * kHidden * 2 +
+                                packed_weight_bytes(QType::W8G32_F16S, 1024, kHidden) +
+                                packed_weight_bytes(QType::W8G32_F16S, kHidden, kIntermediate);
+    const std::uint64_t per_expert =
+        packed_weight_bytes(gate_codec(result.codec), 1024, kHidden) +
+        packed_weight_bytes(down_codec(result.codec), kHidden, kIntermediate);
+    return static_cast<double>(fixed) +
+           static_cast<double>(result.unique_experts) * static_cast<double>(per_expert);
+}
+
+double logical_flops(std::int32_t tokens) {
+    const double router = 2.0 * kRouterRows * kHidden;
+    const double routed = kTopK * (2.0 * 1024 * kHidden + 2.0 * kHidden * kIntermediate);
+    const double shared = 2.0 * 1024 * kHidden + 2.0 * kHidden * kIntermediate;
+    return static_cast<double>(tokens) * (router + routed + shared);
+}
+
+double theoretical_memory_gbps(int device) {
+    int memory_clock_khz = 0;
+    int memory_bus_bits  = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&memory_clock_khz, cudaDevAttrMemoryClockRate, device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&memory_bus_bits, cudaDevAttrGlobalMemoryBusWidth, device));
+    return 2.0 * static_cast<double>(memory_clock_khz) * 1.0e3 *
+           (static_cast<double>(memory_bus_bits) / 8.0) / 1.0e9;
+}
+
 std::uint64_t parse_u64(std::string_view text, const char* label) {
     const std::string value(text);
     char* end                       = nullptr;
@@ -726,13 +765,19 @@ std::vector<Result> run_point(BenchmarkWeights& fixture, CodecProfile profile, s
     return results;
 }
 
-void print_result(const Result& result) {
+void print_result(const Result& result, double peak_memory_gbps) {
+    const double seconds               = result.stats.median_us * 1.0e-6;
+    const double useful_weight_gbps    = unique_weight_bytes(result) / seconds / 1.0e9;
+    const double useful_weight_percent = 100.0 * useful_weight_gbps / peak_memory_gbps;
+    const double tflops                = logical_flops(result.tokens) / seconds / 1.0e12;
     std::printf("%-6s T=%-5d %-11s U=%-3d ov=%4.1f %-12s %-4s "
-                "median=%8.3f us min=%8.3f us p95=%8.3f us workspace=%zu\n",
+                "median=%8.3f us min=%8.3f us p95=%8.3f us "
+                "unique_weight=%7.1f GB/s (%4.1f%% peak) logical=%6.2f TFLOP/s workspace=%zu\n",
                 codec_name(result.codec), result.tokens, distribution_name(result.distribution),
                 result.unique_experts, result.adjacent_overlap, execution_name(result.execution),
                 cache_name(result.cache), result.stats.median_us, result.stats.min_us,
-                result.stats.p95_us, result.workspace_bytes);
+                result.stats.p95_us, useful_weight_gbps, useful_weight_percent, tflops,
+                result.workspace_bytes);
 }
 
 void write_csv(const std::string& path, const std::vector<Result>& results, const Options& options,
@@ -746,16 +791,22 @@ void write_csv(const std::string& path, const std::vector<Result>& results, cons
     if (!stream) { throw std::runtime_error("failed to open CSV output"); }
     int runtime = 0;
     CUDA_CHECK(cudaRuntimeGetVersion(&runtime));
+    const double peak_memory_gbps = theoretical_memory_gbps(context.device);
     stream << "codec,tokens,distribution,seed,unique_experts,adjacent_overlap,execution,"
-              "timed_scope,cache,median_us,min_us,p95_us,workspace_bytes,warmup,repeat,"
+              "timed_scope,cache,median_us,min_us,p95_us,unique_weight_gbps,"
+              "unique_weight_peak_percent,logical_tflops,workspace_bytes,warmup,repeat,"
               "flush_bytes,build_type,gpu,cuda_runtime\n";
     for (const Result& result : results) {
+        const double seconds            = result.stats.median_us * 1.0e-6;
+        const double useful_weight_gbps = unique_weight_bytes(result) / seconds / 1.0e9;
         stream << codec_name(result.codec) << ',' << result.tokens << ','
                << distribution_name(result.distribution) << ',' << result.seed << ','
                << result.unique_experts << ',' << result.adjacent_overlap << ','
                << execution_name(result.execution) << ",full_sparse_moe_device_body,"
                << cache_name(result.cache) << ',' << result.stats.median_us << ','
-               << result.stats.min_us << ',' << result.stats.p95_us << ',' << result.workspace_bytes
+               << result.stats.min_us << ',' << result.stats.p95_us << ',' << useful_weight_gbps
+               << ',' << 100.0 * useful_weight_gbps / peak_memory_gbps << ','
+               << logical_flops(result.tokens) / seconds / 1.0e12 << ',' << result.workspace_bytes
                << ',' << options.warmup << ',' << options.repeat << ',' << options.flush_bytes
                << ','
 #ifdef NDEBUG
@@ -773,12 +824,13 @@ int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
         DeviceContext context;
+        const double peak_memory_gbps = theoretical_memory_gbps(context.device);
         std::printf("# gpu=%s sm=%d execution=%s timed_scope=full_sparse_moe_device_body "
-                    "cold_flush_mib=%llu\n",
+                    "cold_flush_mib=%llu theoretical_memory=%.1f GB/s\n",
                     context.props.name, context.sm(),
                     options.execution == Execution::Both ? "both"
                                                          : execution_name(options.execution),
-                    static_cast<unsigned long long>(options.flush_bytes >> 20));
+                    static_cast<unsigned long long>(options.flush_bytes >> 20), peak_memory_gbps);
 
         std::vector<Result> results;
         for (CodecProfile profile : selected_profiles(options.codec)) {
@@ -787,7 +839,7 @@ int main(int argc, char** argv) {
             for (std::int32_t tokens : selected_tokens(options.tokens)) {
                 std::vector<Result> point =
                     run_point(fixture, profile, tokens, options, context.stream);
-                for (const Result& result : point) { print_result(result); }
+                for (const Result& result : point) { print_result(result, peak_memory_gbps); }
                 results.insert(results.end(), std::make_move_iterator(point.begin()),
                                std::make_move_iterator(point.end()));
             }

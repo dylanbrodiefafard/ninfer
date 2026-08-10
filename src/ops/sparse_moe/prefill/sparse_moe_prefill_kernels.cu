@@ -8,7 +8,9 @@
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
 #include "ops/linear/q5/q5_rowsplit_storage.cuh"
 #include "ops/linear/q6/q6_rowsplit_storage.cuh"
+#include "ops/sparse_moe/decode/sparse_moe_decode.h"
 #include "ops/sparse_moe/sparse_moe_route.cuh"
+#include "ops/sparse_moe/small_t/sparse_moe_small_t.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -173,7 +175,7 @@ __global__ void sparse_moe_prefill_scan_kernel(const int* __restrict__ tile_coun
                                                int* __restrict__ route_job_experts,
                                                int* __restrict__ route_job_columns,
                                                int* __restrict__ route_job_count, int route_tiles,
-                                               int job_bn) {
+                                               int job_bn, int tokens, bool adaptive) {
     __shared__ int scan[kExperts];
     const int expert = static_cast<int>(threadIdx.x);
     int count        = 0;
@@ -217,14 +219,22 @@ __global__ void sparse_moe_prefill_scan_kernel(const int* __restrict__ tile_coun
         route_job_experts[job_begin + job] = expert;
         route_job_columns[job_begin + job] = job * job_bn;
     }
-    if (expert == kExperts - 1) { *route_job_count = scan[expert]; }
+    if (expert == kExperts - 1) {
+        const int jobs = scan[expert];
+        // Above 3.5 grouped jobs per token, fixed token work wins by avoiding sparse expert tiles.
+        *route_job_count = adaptive && jobs * 2 > 7 * tokens ? -jobs : jobs;
+    }
 }
 
-__global__ void sparse_moe_prefill_gather_kernel(const __nv_bfloat16* __restrict__ x,
-                                                 const int* __restrict__ ids,
-                                                 int* __restrict__ packed_index,
-                                                 const int* __restrict__ tile_bases,
-                                                 __nv_bfloat16* __restrict__ gathered) {
+template <bool Adaptive>
+__global__ void
+sparse_moe_prefill_gather_kernel(const __nv_bfloat16* __restrict__ x, const int* __restrict__ ids,
+                                 int* __restrict__ packed_index, const int* __restrict__ tile_bases,
+                                 __nv_bfloat16* __restrict__ gathered,
+                                 const int* __restrict__ route_job_count) {
+    if constexpr (Adaptive) {
+        if (*route_job_count < 0) { return; }
+    }
     const int assignment = static_cast<int>(blockIdx.x);
     const int token      = assignment / kTopK;
     const int expert     = ids[assignment];
@@ -450,19 +460,22 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
     }
 }
 
-template <bool Routed>
+template <bool Routed, bool Adaptive = false>
 __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_gate_up_kernel(
     const __nv_bfloat16* __restrict__ input, const int* __restrict__ expert_offsets,
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
-    __nv_bfloat16* __restrict__ activation, int tokens) {
+    __nv_bfloat16* __restrict__ activation, int tokens, const int* __restrict__ route_job_count) {
     __shared__ __align__(16) __nv_bfloat16 As[kExpertBM * kExpertBK];
     __shared__ __align__(16) __nv_bfloat16 Bs[kExpertStages][kExpertBN * kExpertBK];
     __shared__ __align__(16) std::uint8_t Cr[kExpertBM * kExpertBK];
     __shared__ __align__(16) std::uint8_t Sr[kExpertBM * 16];
 
-    const int tid      = static_cast<int>(threadIdx.x);
-    const int warp     = tid >> 5;
-    const int lane     = tid & 31;
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    if constexpr (Adaptive) {
+        if (*route_job_count < 0) { return; }
+    }
     const int expert   = Routed ? static_cast<int>(blockIdx.y) : 0;
     const int logical0 = static_cast<int>(blockIdx.x) * (kExpertBM / 2);
     const int begin    = Routed ? expert_offsets[expert] : static_cast<int>(blockIdx.y) * kExpertBN;
@@ -824,20 +837,24 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
     }
 }
 
-template <bool Routed>
+template <bool Routed, bool Adaptive = false>
 __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_down_kernel(
     const __nv_bfloat16* __restrict__ input, const int* __restrict__ expert_offsets,
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
     __nv_bfloat16* __restrict__ grouped_output, const float* __restrict__ routed_sum,
-    const float* __restrict__ shared_scale, __nv_bfloat16* __restrict__ destination, int tokens) {
+    const float* __restrict__ shared_scale, __nv_bfloat16* __restrict__ destination, int tokens,
+    const int* __restrict__ route_job_count) {
     __shared__ __align__(16) __nv_bfloat16 As[kExpertBM * kExpertBK];
     __shared__ __align__(16) __nv_bfloat16 Bs[kExpertStages][kExpertBN * kExpertBK];
     __shared__ __align__(16) std::uint8_t Cr[kExpertBM * kExpertBK];
     __shared__ __align__(16) std::uint8_t Sr[kExpertBM * 16];
 
-    const int tid    = static_cast<int>(threadIdx.x);
-    const int warp   = tid >> 5;
-    const int lane   = tid & 31;
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    if constexpr (Adaptive) {
+        if (*route_job_count < 0) { return; }
+    }
     const int expert = Routed ? static_cast<int>(blockIdx.y) : 0;
     const int row0   = static_cast<int>(blockIdx.x) * kExpertBM;
     const int begin  = Routed ? expert_offsets[expert] : static_cast<int>(blockIdx.y) * kExpertBN;
@@ -1023,10 +1040,15 @@ union alignas(16) SparseMoeBf16x8 {
     __nv_bfloat162 pair[4];
 };
 
+template <bool Adaptive>
 __global__ void sparse_moe_prefill_reduce_kernel(const __nv_bfloat16* __restrict__ grouped_output,
                                                  const int* __restrict__ packed_index,
                                                  const float* __restrict__ alpha,
-                                                 float* __restrict__ routed_sum) {
+                                                 float* __restrict__ routed_sum,
+                                                 const int* __restrict__ route_job_count) {
+    if constexpr (Adaptive) {
+        if (*route_job_count < 0) { return; }
+    }
     __shared__ int columns[kTopK];
     __shared__ float weights[kTopK];
     const int token = static_cast<int>(blockIdx.x);
@@ -1103,7 +1125,11 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         auto* output             = static_cast<__nv_bfloat16*>(output_slice.data);
         const int route_tiles =
             (tokens + kSparseMoeRouteTileTokens - 1) / kSparseMoeRouteTileTokens;
-        const int assignments = tokens * kTopK;
+        const int assignments   = tokens * kTopK;
+        const int adaptive_last = weights.routed_down.qtype == QType::Q5G64_F16S   ? 51
+                                  : weights.routed_down.qtype == QType::Q6G64_F16S ? 52
+                                                                                   : 0;
+        const bool adaptive     = tokens >= 47 && tokens <= adaptive_last;
 
         sparse_moe_prefill_router_mma_kernel<<<dim3((kRouterRows + kRouterBM - 1) / kRouterBM,
                                                     (tokens + kRouterBN - 1) / kRouterBN),
@@ -1119,11 +1145,23 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         const int route_job_bn = wide_plan ? 64 : 32;
         sparse_moe_prefill_scan_kernel<<<1, kExpertThreads, 0, stream>>>(
             tile_counts, tile_bases, offsets, route_job_experts, route_job_columns, route_job_count,
-            route_tiles, route_job_bn);
+            route_tiles, route_job_bn, tokens, adaptive);
         CUDA_CHECK(cudaGetLastError());
 
-        sparse_moe_prefill_gather_kernel<<<assignments, kExpertThreads, 0, stream>>>(
-            input, ids, packed_index, tile_bases, grouped_io);
+        if (adaptive) {
+            auto* adaptive_activations = reinterpret_cast<float*>(grouped_io);
+            sparse_moe_decode_launch_d3_small_t(input_slice, weights, ids, adaptive_activations,
+                                                tokens, SparseMoeSmallTD3Schedule::Paths3, stream,
+                                                route_job_count);
+            sparse_moe_decode_launch_d4_small_t(
+                weights, output_slice, ids, alpha, shared_scale, adaptive_activations, tokens,
+                SparseMoeSmallTD4Schedule::Rows4, stream, route_job_count);
+            sparse_moe_prefill_gather_kernel<true><<<assignments, kExpertThreads, 0, stream>>>(
+                input, ids, packed_index, tile_bases, grouped_io, route_job_count);
+        } else {
+            sparse_moe_prefill_gather_kernel<false><<<assignments, kExpertThreads, 0, stream>>>(
+                input, ids, packed_index, tile_bases, grouped_io, nullptr);
+        }
         CUDA_CHECK(cudaGetLastError());
 
         const dim3 routed_gate_grid(kIntermediate / (kExpertBM / 2), kExperts);
@@ -1143,16 +1181,25 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
             sparse_moe_prefill_w8_gate_up_kernel<true>
                 <<<routed_gate_grid, kExpertThreads, 0, stream>>>(
                     grouped_io, offsets, routed_gate_codes, routed_gate_scales, routed_activation,
-                    tokens);
+                    tokens, nullptr);
         } else {
             throw std::invalid_argument("sparse_moe prefill: unsupported gate/up codec");
         }
         CUDA_CHECK(cudaGetLastError());
 
-        sparse_moe_prefill_w8_gate_up_kernel<false>
-            <<<dim3(kIntermediate / (kExpertBM / 2), (tokens + kExpertBN - 1) / kExpertBN),
-               kExpertThreads, 0, stream>>>(input, nullptr, shared_gate_codes, shared_gate_scales,
-                                            shared_activation, tokens);
+        const dim3 shared_gate_grid(kIntermediate / (kExpertBM / 2),
+                                    (tokens + kExpertBN - 1) / kExpertBN);
+        if (adaptive) {
+            sparse_moe_prefill_w8_gate_up_kernel<false, true>
+                <<<shared_gate_grid, kExpertThreads, 0, stream>>>(
+                    input, nullptr, shared_gate_codes, shared_gate_scales, shared_activation,
+                    tokens, route_job_count);
+        } else {
+            sparse_moe_prefill_w8_gate_up_kernel<false, false>
+                <<<shared_gate_grid, kExpertThreads, 0, stream>>>(
+                    input, nullptr, shared_gate_codes, shared_gate_scales, shared_activation,
+                    tokens, nullptr);
+        }
         CUDA_CHECK(cudaGetLastError());
 
         const dim3 routed_down_grid(kHidden / kExpertBM, kExperts);
@@ -1191,21 +1238,34 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
             sparse_moe_prefill_w8_down_kernel<true>
                 <<<routed_down_grid, kExpertThreads, 0, stream>>>(
                     routed_activation, offsets, routed_down_codes, routed_down_scales, grouped_io,
-                    nullptr, nullptr, nullptr, tokens);
+                    nullptr, nullptr, nullptr, tokens, nullptr);
             break;
         default:
             throw std::invalid_argument("sparse_moe prefill: unsupported down codec");
         }
         CUDA_CHECK(cudaGetLastError());
 
-        sparse_moe_prefill_reduce_kernel<<<tokens, kExpertThreads, 0, stream>>>(
-            grouped_io, packed_index, alpha, routed_sum);
+        if (adaptive) {
+            sparse_moe_prefill_reduce_kernel<true><<<tokens, kExpertThreads, 0, stream>>>(
+                grouped_io, packed_index, alpha, routed_sum, route_job_count);
+        } else {
+            sparse_moe_prefill_reduce_kernel<false><<<tokens, kExpertThreads, 0, stream>>>(
+                grouped_io, packed_index, alpha, routed_sum, nullptr);
+        }
         CUDA_CHECK(cudaGetLastError());
 
-        sparse_moe_prefill_w8_down_kernel<false>
-            <<<dim3(kHidden / kExpertBM, (tokens + kExpertBN - 1) / kExpertBN), kExpertThreads, 0,
-               stream>>>(shared_activation, nullptr, shared_down_codes, shared_down_scales, nullptr,
-                         routed_sum, shared_scale, output, tokens);
+        const dim3 shared_down_grid(kHidden / kExpertBM, (tokens + kExpertBN - 1) / kExpertBN);
+        if (adaptive) {
+            sparse_moe_prefill_w8_down_kernel<false, true>
+                <<<shared_down_grid, kExpertThreads, 0, stream>>>(
+                    shared_activation, nullptr, shared_down_codes, shared_down_scales, nullptr,
+                    routed_sum, shared_scale, output, tokens, route_job_count);
+        } else {
+            sparse_moe_prefill_w8_down_kernel<false, false>
+                <<<shared_down_grid, kExpertThreads, 0, stream>>>(
+                    shared_activation, nullptr, shared_down_codes, shared_down_scales, nullptr,
+                    routed_sum, shared_scale, output, tokens, nullptr);
+        }
         CUDA_CHECK(cudaGetLastError());
     }
 }

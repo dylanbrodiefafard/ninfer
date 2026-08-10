@@ -12,9 +12,8 @@
 namespace ninfer::ops::detail {
 
 inline constexpr std::int32_t kSparseMoeSmallTMin = 2;
-// The fixed frontier covers the measured Q4+Q5 crossover. S2 assigns at most
-// 32 resident warps and lets them cover the remaining tokens in a second turn.
-inline constexpr std::int32_t kSparseMoeSmallTMax = 44;
+// The fixed kernel domain covers the largest codec-specific small-T frontier.
+inline constexpr std::int32_t kSparseMoeSmallTMax = 46;
 
 enum class SparseMoeSmallTD3Schedule : std::uint8_t {
     Paths1,

@@ -102,6 +102,48 @@ sparse_moe_small_t_s2_kernel(const float* __restrict__ partial_scores, int* __re
 }
 
 template <int Tokens>
+__global__ void sparse_moe_small_t_s2_two_batch_kernel(const float* __restrict__ partial_scores,
+                                                       int* __restrict__ token_ids,
+                                                       float* __restrict__ token_alpha,
+                                                       float* __restrict__ shared_scale) {
+    static_assert(Tokens >= 45 && Tokens <= kSparseMoeSmallTMax);
+    constexpr int kBatchTokens = 32;
+    __shared__ float scores[kBatchTokens][kRouterRows];
+    __shared__ float selected_logits[kBatchTokens][kTopK];
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    if (tid == 0) { pdl::trigger_dependents(); }
+    pdl::wait_for_dependencies();
+
+#pragma unroll
+    for (int token_begin = 0; token_begin < Tokens; token_begin += kBatchTokens) {
+        const int batch_tokens = min(kBatchTokens, Tokens - token_begin);
+        for (int index = tid; index < batch_tokens * kRouterRows; index += kBatchTokens * 32) {
+            const int token = index / kRouterRows;
+            const int row   = index - token * kRouterRows;
+            float sum       = 0.0f;
+#pragma unroll
+            for (int partition = 0; partition < kRouterPartitions; ++partition) {
+                sum +=
+                    partial_scores[((static_cast<std::int64_t>(token_begin + token) * kRouterRows +
+                                     row) *
+                                    kRouterPartitions) +
+                                   partition];
+            }
+            scores[token][row] = sum;
+        }
+        __syncthreads();
+        if (warp < batch_tokens) {
+            const int token = token_begin + warp;
+            sparse_moe_select_top8_warp(scores[warp], token_ids + token * kTopK,
+                                        token_alpha + token * kTopK, shared_scale + token,
+                                        selected_logits[warp]);
+        }
+        __syncthreads();
+    }
+}
+
+template <int Tokens>
 void launch_s1(const __nv_bfloat16* x, const __nv_bfloat16* router, float* partial_scores,
                cudaStream_t stream) {
     sparse_moe_small_t_s1_kernel<Tokens>
@@ -114,9 +156,15 @@ template <int Tokens>
 void launch_s2(const float* partial_scores, int* token_ids, float* token_alpha, float* shared_scale,
                cudaStream_t stream) {
     constexpr int kThreads = (Tokens < 32 ? Tokens : 32) * 32;
-    CUDA_CHECK(pdl::launch_dependent({dim3(1), dim3(kThreads), 0, stream},
-                                     sparse_moe_small_t_s2_kernel<Tokens>, partial_scores,
-                                     token_ids, token_alpha, shared_scale));
+    if constexpr (Tokens <= 44) {
+        CUDA_CHECK(pdl::launch_dependent({dim3(1), dim3(kThreads), 0, stream},
+                                         sparse_moe_small_t_s2_kernel<Tokens>, partial_scores,
+                                         token_ids, token_alpha, shared_scale));
+    } else {
+        CUDA_CHECK(pdl::launch_dependent({dim3(1), dim3(kThreads), 0, stream},
+                                         sparse_moe_small_t_s2_two_batch_kernel<Tokens>,
+                                         partial_scores, token_ids, token_alpha, shared_scale));
+    }
 }
 
 void launch_s3_tiled(const Tensor& x, const SparseMoeWeights& weights,
@@ -271,6 +319,12 @@ void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
         return;
     case 44:
         launch.template operator()<44>();
+        return;
+    case 45:
+        launch.template operator()<45>();
+        return;
+    case 46:
+        launch.template operator()<46>();
         return;
     default:
         throw std::invalid_argument("sparse_moe small-T: unsupported token count");

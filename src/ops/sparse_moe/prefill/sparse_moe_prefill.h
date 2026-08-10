@@ -11,12 +11,12 @@
 
 namespace ninfer::ops::detail {
 
-// RTX 5090 crossovers measured with the trace-like expert distribution. The
-// public workspace query starts at the earliest codec-specific crossover.
-inline constexpr std::int32_t kSparseMoePrefillWorkspaceMin = 18;
-inline constexpr std::int32_t kSparseMoePrefillQ4Q5Min      = 45;
-inline constexpr std::int32_t kSparseMoePrefillQ4Q6Min      = 45;
-inline constexpr std::int32_t kSparseMoePrefillW8W8Min      = 18;
+// RTX 5090 codec frontiers balance trace-like and independent expert distributions. The public
+// workspace query starts at the earliest codec-specific prefill route.
+inline constexpr std::int32_t kSparseMoePrefillWorkspaceMin = 20;
+inline constexpr std::int32_t kSparseMoePrefillQ4Q5Min      = 47;
+inline constexpr std::int32_t kSparseMoePrefillQ4Q6Min      = 47;
+inline constexpr std::int32_t kSparseMoePrefillW8W8Min      = 20;
 inline constexpr std::int32_t kSparseMoePrefillWideMin      = 768;
 inline constexpr std::int32_t kSparseMoePrefillSliceMax     = 4096;
 inline constexpr std::int32_t kSparseMoeRouteTileTokens     = 8;
@@ -41,6 +41,8 @@ struct SparseMoePrefillWorkspace {
     Tensor expert_offsets;
     Tensor route_job_experts;
     Tensor route_job_columns;
+    // A negative count selects the token-oriented adaptive route; its magnitude is the unused
+    // grouped-route job count. Nonnegative values select the normal grouped route.
     Tensor route_job_count;
 
     // The three large allocations are lifetime unions:

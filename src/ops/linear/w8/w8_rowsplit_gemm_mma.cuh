@@ -3,8 +3,8 @@
 // Dedicated Large-T W8G32 x BF16 Tensor Core GEMM.
 //
 // out[M,N] = W[M,K] * x[K,N], where W stores one signed int8 code per element
-// and one FP16 scale per 32 K elements. Raw codes and four K tiles' worth of
-// scales are staged with cp.async before dequantization into a swizzled BF16
+// and one FP16 scale per 32 K elements. Raw codes and eight quantization groups' scales are
+// staged with cp.async before dequantization into a swizzled BF16
 // shared tile; x uses a two-stage cp.async pipeline. Tensor Cores execute
 // m16n8k16 BF16 MMA with FP32 accumulation.
 
@@ -26,11 +26,12 @@ union alignas(16) W8Bf16x8Bits {
 
 static_assert(sizeof(W8Bf16x8Bits) == 16);
 
-template <int BM_, int BN_, int WM_, int WN_, int MIN_BLOCKS_, int STAGES_ = 2>
+template <int BM_, int BN_, int WM_, int WN_, int MIN_BLOCKS_, int STAGES_ = 2, int BK_ = 64,
+          int ACTIVATION_STAGES_ = STAGES_>
 struct W8RowSplitMmaGemmSchedule {
     static constexpr int BM                = BM_;
     static constexpr int BN                = BN_;
-    static constexpr int BK                = 64;
+    static constexpr int BK                = BK_;
     static constexpr int WM                = WM_;
     static constexpr int WN                = WN_;
     static constexpr int MIN_BLOCKS        = MIN_BLOCKS_;
@@ -42,14 +43,18 @@ struct W8RowSplitMmaGemmSchedule {
     static constexpr int NT                = WN / 8;
     static constexpr int KSUB              = BK / 16;
     static constexpr int STAGES            = STAGES_;
+    static constexpr int ACTIVATION_STAGES = ACTIVATION_STAGES_;
     static constexpr int SCALE_CACHE_BYTES = 16;
     static constexpr int SMEM_BYTES =
-        BM * BK * 2 + STAGES * BN * BK * 2 + BM * BK + BM * SCALE_CACHE_BYTES;
+        BM * BK * 2 + ACTIVATION_STAGES * BN * BK * 2 + BM * BK + BM * SCALE_CACHE_BYTES;
 
     static_assert(BM % WM == 0 && BN % WN == 0);
     static_assert(WM % 16 == 0 && WN % 8 == 0);
     static_assert(THREADS <= 1024);
+    static_assert(BK == 64 || BK == 128);
     static_assert(STAGES == 2, "W8G32 MMA uses a two-stage cp.async pipeline");
+    static_assert(ACTIVATION_STAGES == 1 || ACTIVATION_STAGES == STAGES,
+                  "W8G32 MMA activation staging is single-buffered or follows the pipeline");
     static_assert(SMEM_BYTES <= 48 * 1024);
 };
 
@@ -78,7 +83,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
                   "SwiGLU supports warp-local or shared-memory row pairing");
 
     __shared__ __align__(16) __nv_bfloat16 As[BM * BK];
-    __shared__ __align__(16) __nv_bfloat16 Bs[Cfg::STAGES][BN * BK];
+    __shared__ __align__(16) __nv_bfloat16 Bs[Cfg::ACTIVATION_STAGES][BN * BK];
     __shared__ __align__(16) std::uint8_t Cr[BM * BK];
     __shared__ __align__(16) std::uint8_t Sr[BM * Cfg::SCALE_CACHE_BYTES];
 
@@ -181,23 +186,29 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
         const int half                  = lane >> 4;
         const int half_lane             = lane & 15;
         for (int row_pair = warp * 2; row_pair < BM; row_pair += Cfg::WARPS * 2) {
-            const int row       = row_pair + half;
-            unsigned scale_pair = 0;
+            const int row = row_pair + half;
+            unsigned scale_pair0;
+            unsigned scale_pair1 = 0;
             if constexpr (GROUPS == 2) {
-                scale_pair = half_lane == 0
-                                 ? *reinterpret_cast<const std::uint32_t*>(
-                                       &Sr[row * Cfg::SCALE_CACHE_BYTES + scale_pair_offset])
-                                 : 0;
+                scale_pair0 = half_lane == 0
+                                  ? *reinterpret_cast<const std::uint32_t*>(
+                                        &Sr[row * Cfg::SCALE_CACHE_BYTES + scale_pair_offset])
+                                  : 0;
+                scale_pair0 = __shfl_sync(0xffffffffu, scale_pair0, half * 16);
             } else {
-                scale_pair = half_lane == 0
-                                 ? *reinterpret_cast<const std::uint16_t*>(
-                                       &Sr[row * Cfg::SCALE_CACHE_BYTES + scale_pair_offset])
-                                 : 0;
+                static_assert(GROUPS == 4);
+                const unsigned lane_scale_pair =
+                    half_lane < 2
+                        ? *reinterpret_cast<const std::uint32_t*>(
+                              &Sr[row * Cfg::SCALE_CACHE_BYTES + scale_pair_offset + half_lane * 4])
+                        : 0;
+                scale_pair0 = __shfl_sync(0xffffffffu, lane_scale_pair, half * 16);
+                scale_pair1 = __shfl_sync(0xffffffffu, lane_scale_pair, half * 16 + 1);
             }
-            scale_pair = __shfl_sync(0xffffffffu, scale_pair, half * 16);
 #pragma unroll
             for (int gg = 0; gg < GROUPS; ++gg) {
-                const unsigned scale_bits = (scale_pair >> (gg * 16)) & 0xffffu;
+                const unsigned scale_pair = gg < 2 ? scale_pair0 : scale_pair1;
+                const unsigned scale_bits = (scale_pair >> ((gg & 1) * 16)) & 0xffffu;
                 const float scale         = __half2float(__ushort_as_half(scale_bits));
                 const int col             = gg * 32 + half_lane * 2;
                 const std::uint16_t packed =
@@ -227,7 +238,9 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
 
         const int next = kt + 1;
         if (next < nkt) {
-            stage_x(next % Cfg::STAGES, next);
+            if constexpr (Cfg::ACTIVATION_STAGES == Cfg::STAGES) {
+                stage_x(next % Cfg::STAGES, next);
+            }
             stage_w(next);
             ninfer::ops::cp_commit();
         }
@@ -247,7 +260,8 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
                 const int br = wn * WN + ni * 8 + b_rin;
                 const int bc = ks * 16 + b_koff;
                 ldmatrix_x2(bf[slot][ni][0], bf[slot][ni][1],
-                            smem_addr(&Bs[stage][br * BK + w8g32_swz64(br, bc)]));
+                            smem_addr(&Bs[Cfg::ACTIVATION_STAGES == 1 ? 0 : stage]
+                                         [br * BK + w8g32_swz64(br, bc)]));
             }
         };
 
@@ -264,6 +278,14 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
                              af[slot][mi][0], af[slot][mi][1], af[slot][mi][2], af[slot][mi][3],
                              bf[slot][ni][0], bf[slot][ni][1]);
                 }
+            }
+        }
+
+        if constexpr (Cfg::ACTIVATION_STAGES == 1) {
+            if (next < nkt) {
+                __syncthreads();
+                stage_x(0, next);
+                ninfer::ops::cp_commit();
             }
         }
     }

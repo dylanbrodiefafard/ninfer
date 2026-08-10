@@ -10,8 +10,7 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     switch (k) {
     case 10240:
         if (n == 5120) {
-            if (t <= 4) { return launch_w8_simt_r8_c4; }
-            if (t <= 16) { return launch_w8_simt_r8_c8; }
+            if (t <= 48) { return launch_w8_small_t; }
             return launch_w8_mma_r64_c128;
         }
         break;
@@ -26,12 +25,15 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             if (t <= 16) { return launch_w8_simt_r8_c8; }
             return launch_w8_mma_r64_c128;
         case 14336:
+            if (t <= 48) { return launch_w8_small_t; }
+            return launch_w8_mma_r64_c128;
         case 34816:
-            if (t <= 4) { return launch_w8_simt_r8_c4; }
-            if (t <= 8) { return launch_w8_simt_r8_c8; }
+            if (t <= 40) { return launch_w8_small_t; }
+            if (t <= 48) { return launch_w8_mma_r64x16_c48_k128_a1; }
             return launch_w8_mma_r64_c128;
         case 248320:
-            if (t <= 32) { return launch_w8_small_t; }
+            if (t <= 33) { return launch_w8_small_t; }
+            if (t <= 48) { return launch_w8_mma_r64x16_c48_k128_a1; }
             if (t <= 64) { return launch_w8_mma_r32_c64; }
             return launch_w8_mma_r64_c128;
         default:
@@ -40,20 +42,19 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         break;
     case 6144:
         if (n == 5120) {
-            if (t <= 4) { return launch_w8_simt_r8_c4; }
-            if (t <= 16) { return launch_w8_simt_r8_c8; }
+            if (t <= 48) { return launch_w8_small_t; }
             return launch_w8_mma_r64_c128;
         }
         break;
     case 17408:
         if (n == 5120) {
-            if (t <= 4) { return launch_w8_simt_r8_c4; }
-            if (t <= 16) { return launch_w8_simt_r8_c8; }
+            if (t <= 48) { return launch_w8_small_t; }
             return launch_w8_mma_r64_c128;
         }
         break;
     case 4096:
         if (n == 2048) {
+            if (t <= 48) { return launch_w8_small_t; }
             if (t <= 56) { return launch_w8_simt_r8_c4; }
             if (t <= 895) { return launch_w8_mma_r32_c128; }
             return launch_w8_mma_r64_c128;
@@ -100,10 +101,8 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     case 16384:
         if (n != 2048) { break; }
         if (t == 1) { return launch_w8_decode_r4; }
-        if (t <= 32) { return launch_w8_exact_t_splitk; }
-        if (t <= 88) { return launch_w8_exact_t_composite; }
-        if (t <= 96) { return launch_w8_medium_splitk_c96; }
-        if (t <= 128) { return launch_w8_medium_splitk_c128; }
+        if (t <= 48) { return launch_w8_exact_t_splitk; }
+        if (t <= 128) { return launch_w8_dflash_medium; }
         if (t <= 144) { return launch_w8_medium_splitk_c144; }
         if (t <= 255) { return launch_w8_mma_r32_c128; }
         if (t <= 384) { return launch_w8_mma_r32_c64; }

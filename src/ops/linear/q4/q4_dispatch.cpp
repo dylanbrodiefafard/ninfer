@@ -39,6 +39,7 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             return launch_q4_mma_r64_c128;
         case 131072:
             if (t == 1) { return launch_q4_gemv_r4_w1_direct; }
+            if (t <= 8) { return launch_q4_draft_head_small_t; }
             return launch_q4_mma_r64_c128;
         default:
             break;
@@ -47,6 +48,20 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     case 2048:
         if (n == 131072) {
             if (t == 1) { return launch_q4_gemv_r4_w1_direct; }
+            if (t <= 20) { return launch_q4_draft_head_small_t; }
+            if (t <= 32) { return launch_q4_mma_r64_c32; }
+            if (t <= 48) { return launch_q4_mma_r64_c48; }
+            if (t <= 56) { return launch_q4_mma_r64_c56; }
+            if (t <= 63) { return launch_q4_mma_r64_c72; }
+            if (t == 64) { return launch_q4_mma_r64_c64_endpoint; }
+            if (t <= 72) { return launch_q4_mma_r64_c72; }
+            if (t <= 80) { return launch_q4_mma_r64_c80; }
+            if (t <= 96) { return launch_q4_mma_r64_c96; }
+            if (t <= 104) { return launch_q4_mma_r64_c104_bounded; }
+            if (t <= 111) { return launch_q4_mma_r64_c112_partial; }
+            if (t == 112) { return launch_q4_mma_r64_c112; }
+            if (t <= 119) { return launch_q4_mma_r64_c120_partial; }
+            if (t == 120) { return launch_q4_mma_r64_c120; }
             return launch_q4_mma_r64_c128;
         }
         break;

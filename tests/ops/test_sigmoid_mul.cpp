@@ -101,6 +101,7 @@ int main() {
 
     int failures = 0;
     failures += run_case("sigmoid_mul [6144,1]", 6144, 1, 101u);
+    failures += run_case("sigmoid_mul [6144,48]", 6144, 48, 102u);
     failures += run_case("sigmoid_mul [4096,17]", 4096, 17, 201u);
     failures += run_case("sigmoid_mul [4096,128]", 4096, 128, 301u);
     failures += run_edge_case();

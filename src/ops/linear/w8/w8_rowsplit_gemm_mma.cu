@@ -29,7 +29,7 @@ void launch_slice(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t st
 template <class Schedule>
 void launch_route(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     const bool full = (w.n % Schedule::BM) == 0 && (x.ne[1] % Schedule::BN) == 0 &&
-                      w.k == w.padded_shape[1] && (w.k % 64) == 0;
+                      w.k == w.padded_shape[1] && (w.k % Schedule::BK) == 0;
     for_each_token_slice(x.ne[1], Schedule::BN, [&](std::int32_t offset, std::int32_t count) {
         const Tensor x_slice = x.slice(1, offset, count);
         Tensor out_slice     = out.slice(1, offset, count);
@@ -68,19 +68,20 @@ void launch_exact_tail(W8Launch prefix_launch, const Tensor& x, const Weight& w,
     }
 }
 
-using MmaR32C64  = W8RowSplitMmaGemmSchedule<32, 64, 32, 16, 3>;
-using MmaR32C96  = W8RowSplitMmaGemmSchedule<32, 96, 32, 16, 2>;
-using MmaR32C128 = W8RowSplitMmaGemmSchedule<32, 128, 32, 16, 2>;
-using MmaR48C64  = W8RowSplitMmaGemmSchedule<48, 64, 48, 16, 3>;
-using MmaR48C96  = W8RowSplitMmaGemmSchedule<48, 96, 48, 16, 2>;
-using MmaR48C112 = W8RowSplitMmaGemmSchedule<48, 112, 48, 16, 2>;
-using MmaR48C128 = W8RowSplitMmaGemmSchedule<48, 128, 48, 16, 2>;
-using MmaR64C96  = W8RowSplitMmaGemmSchedule<64, 96, 64, 16, 2>;
-using MmaR64C112 = W8RowSplitMmaGemmSchedule<64, 112, 64, 16, 2>;
-using MmaR64C128 = W8RowSplitMmaGemmSchedule<64, 128, 64, 16, 2, 2>;
-using MmaR96C96  = W8RowSplitMmaGemmSchedule<96, 96, 48, 16, 2>;
-using MmaR128C64 = W8RowSplitMmaGemmSchedule<128, 64, 64, 16, 2>;
-using MmaR128C80 = W8RowSplitMmaGemmSchedule<128, 80, 64, 16, 2>;
+using MmaR32C64          = W8RowSplitMmaGemmSchedule<32, 64, 32, 16, 3>;
+using MmaR32C96          = W8RowSplitMmaGemmSchedule<32, 96, 32, 16, 2>;
+using MmaR32C128         = W8RowSplitMmaGemmSchedule<32, 128, 32, 16, 2>;
+using MmaR48C64          = W8RowSplitMmaGemmSchedule<48, 64, 48, 16, 3>;
+using MmaR48C96          = W8RowSplitMmaGemmSchedule<48, 96, 48, 16, 2>;
+using MmaR48C112         = W8RowSplitMmaGemmSchedule<48, 112, 48, 16, 2>;
+using MmaR48C128         = W8RowSplitMmaGemmSchedule<48, 128, 48, 16, 2>;
+using MmaR64C96          = W8RowSplitMmaGemmSchedule<64, 96, 64, 16, 2>;
+using MmaR64C112         = W8RowSplitMmaGemmSchedule<64, 112, 64, 16, 2>;
+using MmaR64C128         = W8RowSplitMmaGemmSchedule<64, 128, 64, 16, 2, 2>;
+using MmaR96C96          = W8RowSplitMmaGemmSchedule<96, 96, 48, 16, 2>;
+using MmaR128C64         = W8RowSplitMmaGemmSchedule<128, 64, 64, 16, 2>;
+using MmaR128C80         = W8RowSplitMmaGemmSchedule<128, 80, 64, 16, 2>;
+using MmaR64x16C48K128A1 = W8RowSplitMmaGemmSchedule<64, 48, 16, 24, 2, 2, 128, 1>;
 
 } // namespace
 
@@ -102,6 +103,7 @@ NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r64_c128, MmaR64C128)
 NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r96_c96, MmaR96C96)
 NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r128_c64, MmaR128C64)
 NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r128_c80, MmaR128C80)
+NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r64x16_c48_k128_a1, MmaR64x16C48K128A1)
 
 #undef NINFER_W8_MMA_LAUNCHER
 

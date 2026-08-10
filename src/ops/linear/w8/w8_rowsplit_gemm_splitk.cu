@@ -19,15 +19,24 @@ constexpr int kRows           = 2048;
 constexpr int kHidden         = 16384;
 constexpr int kRowsPerCta     = 16;
 constexpr int kFirstExactCols = 2;
-constexpr int kLastExactCols  = 32;
+constexpr int kLastExactCols  = 48;
 using ExactTLauncher          = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
 template <int ActiveCols>
 void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    constexpr int TileCols =
-        ActiveCols <= 8 ? 8 : (ActiveCols <= 16 ? 16 : (ActiveCols <= 24 ? 24 : 32));
-    using Geometry = W8LinearGeometry<kRows, kHidden>;
-    using Schedule = W8SmallTMmaDefaultSchedule<TileCols, ActiveCols>;
+    constexpr int TileCols  = ActiveCols <= 8    ? 8
+                              : ActiveCols <= 16 ? 16
+                              : ActiveCols <= 24 ? 24
+                              : ActiveCols <= 32 ? 32
+                              : ActiveCols <= 40 ? 40
+                                                 : 48;
+    constexpr int KWarps    = ActiveCols <= 36 ? 16 : 8;
+    constexpr int MinBlocks = KWarps == 16 ? 1 : 2;
+    constexpr auto ScaleAccess =
+        ActiveCols > 4 ? W8SmallTMmaScaleAccess::Shared : W8SmallTMmaScaleAccess::Direct;
+    constexpr auto ActivationCache = ActiveCols <= 36 || ActiveCols == 48 ? Cache::cg : Cache::ca;
+    using Geometry                 = W8LinearGeometry<kRows, kHidden>;
+    using Schedule = W8SmallTMmaSchedule<KWarps, TileCols, MinBlocks, ScaleAccess, ActivationCache>;
     static_assert((kRows % kRowsPerCta) == 0);
     const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), kRows};
     w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule>
@@ -67,7 +76,7 @@ void launch_medium(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t s
 void launch_w8_exact_t_splitk(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     require_problem(x, w, out);
     if (x.ne[1] < kFirstExactCols || x.ne[1] > kLastExactCols) {
-        throw std::invalid_argument("W8 exact-T split-K requires T=2..32");
+        throw std::invalid_argument("W8 exact-T split-K requires T=2..48");
     }
     kLaunchers[x.ne[1] - kFirstExactCols](x, w, out, stream);
     CUDA_CHECK(cudaGetLastError());
@@ -109,14 +118,35 @@ void launch_medium_route(const Tensor& x, const Weight& w, Tensor& out, cudaStre
     CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_w8_medium_splitk_c96(const Tensor& x, const Weight& w, Tensor& out,
-                                 cudaStream_t stream) {
-    launch_medium_route<96, 2, 6, 3>(x, w, out, stream);
-}
+void launch_w8_dflash_medium(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    require_problem(x, w, out);
+    const int t = x.ne[1];
+    if (t < 49 || t > 128) {
+        throw std::invalid_argument("W8 DFlash medium route requires T=49..128");
+    }
 
-void launch_w8_medium_splitk_c128(const Tensor& x, const Weight& w, Tensor& out,
-                                  cudaStream_t stream) {
-    launch_medium_route<128, 2, 4, 2>(x, w, out, stream);
+    if (t <= 64) {
+        launch_medium<64, 8, 4, 1>(x, w, out, stream);
+    } else if (t == 65) {
+        launch_medium<80, 8, 2, 1>(x, w, out, stream);
+    } else if (t <= 72) {
+        launch_medium<72, 8, 3, 1>(x, w, out, stream);
+    } else if (t <= 80) {
+        launch_medium<80, 8, 2, 1>(x, w, out, stream);
+    } else if (t <= 96) {
+        launch_medium<96, 4, 6, 1>(x, w, out, stream);
+    } else if (t <= 104) {
+        launch_medium<104, 4, 1, 1>(x, w, out, stream);
+    } else if (t <= 112) {
+        launch_medium<112, 4, 7, 1>(x, w, out, stream);
+    } else if (t <= 120) {
+        launch_medium<120, 4, 5, 1>(x, w, out, stream);
+    } else if (t <= 125) {
+        launch_medium<128, 4, 4, 1>(x, w, out, stream);
+    } else {
+        launch_medium<128, 4, 8, 1>(x, w, out, stream);
+    }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void launch_w8_medium_splitk_c144(const Tensor& x, const Weight& w, Tensor& out,

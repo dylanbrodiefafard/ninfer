@@ -28,10 +28,10 @@ using namespace ninfer;
 namespace {
 
 constexpr std::int32_t kRows      = 2048;
-constexpr std::int32_t kHidden    = 6144;
 constexpr std::size_t kFlushBytes = 256ULL << 20;
 
 struct Options {
+    std::int32_t hidden = 6144;
     std::vector<std::int32_t> t_sweep{
         1,   2,   3,   4,   5,   6,   7,   8,   9,   10,  11,  12,  13,  14,  15,  16,  17,
         24,  31,  32,  33,  48,  63,  64,  65,  80,  95,  96,  97,  112, 127, 128, 129, 160,
@@ -78,6 +78,8 @@ Options parse_options(int argc, char** argv) {
         };
         if (arg == "--t-sweep") {
             options.t_sweep = parse_t_sweep(next("--t-sweep value"));
+        } else if (arg == "--k") {
+            options.hidden = std::stoi(std::string(next("--k value")));
         } else if (arg == "--warmup") {
             options.warmup = std::stoi(std::string(next("--warmup value")));
         } else if (arg == "--repeat") {
@@ -89,7 +91,7 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--production-only") {
             options.production_only = true;
         } else if (arg == "--help" || arg == "-h") {
-            std::printf("Usage: %s [--t-sweep 1,2,...] [--warmup N] [--repeat N] "
+            std::printf("Usage: %s [--k 4096|6144] [--t-sweep 1,2,...] [--warmup N] [--repeat N] "
                         "[--csv-out PATH] [--profile] [--production-only]\n",
                         argv[0]);
             std::exit(0);
@@ -100,17 +102,20 @@ Options parse_options(int argc, char** argv) {
     if (options.warmup < 0 || options.repeat <= 0) {
         throw std::invalid_argument("--warmup must be nonnegative and --repeat positive");
     }
+    if (options.hidden != 4096 && options.hidden != 6144) {
+        throw std::invalid_argument("--k must be 4096 or 6144");
+    }
     if (options.profile && options.t_sweep.size() != 1) {
         throw std::invalid_argument("--profile requires exactly one T");
     }
     return options;
 }
 
-void append(std::vector<Result>& results, const char* path, std::int32_t t,
+void append(std::vector<Result>& results, const char* path, std::int32_t t, std::int32_t hidden,
             bench::ColdTiming timing, std::size_t weight_bytes) {
-    const double useful_flops = 2.0 * kRows * kHidden * static_cast<double>(t);
+    const double useful_flops = 2.0 * kRows * hidden * static_cast<double>(t);
     const double useful_bytes =
-        static_cast<double>(weight_bytes) + 2.0 * static_cast<double>((kHidden + 2 * kRows) * t);
+        static_cast<double>(weight_bytes) + 2.0 * static_cast<double>((hidden + 2 * kRows) * t);
     const double tflops = useful_flops / timing.median_us / 1.0e6;
     const double gbs    = useful_bytes / timing.median_us / 1.0e3;
     std::printf("T=%-4d %-32s median=%8.3f us  useful=%7.2f TFLOP/s %7.1f GB/s\n", t, path,
@@ -142,21 +147,27 @@ int main(int argc, char** argv) {
         const Options options = parse_options(argc, argv);
         const std::int32_t max_t =
             *std::max_element(options.t_sweep.begin(), options.t_sweep.end());
+        const std::int32_t min_t =
+            *std::min_element(options.t_sweep.begin(), options.t_sweep.end());
 
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         ninfer::DeviceBuffer flush(kFlushBytes);
-        ninfer::DeviceBuffer input    = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t);
+        ninfer::DeviceBuffer input =
+            bench::make_bf16(static_cast<std::size_t>(options.hidden) * max_t);
         ninfer::DeviceBuffer residual = bench::make_bf16(static_cast<std::size_t>(kRows) * max_t);
         bench::PackedQuantizedWeight packed = bench::make_row_split_weight(
-            QType::W8G32_F16S, kRows, kHidden, kHidden, {0x31, 0x00, 0x3c00});
-        WorkspaceArena workspace(1);
+            QType::W8G32_F16S, kRows, options.hidden, options.hidden, {0x31, 0x00, 0x3c00});
+        const std::size_t workspace_capacity = ops::linear_add_workspace_capacity_bytes(
+            QType::W8G32_F16S, kRows, options.hidden, min_t, max_t);
+        WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
         std::vector<Result> results;
 
         for (const std::int32_t t : options.t_sweep) {
-            Tensor x(input.p, DType::BF16, {kHidden, t});
+            Tensor x(input.p, DType::BF16, {options.hidden, t});
             Tensor out(residual.p, DType::BF16, {kRows, t});
-            const auto plan = ops::detail::w8_linear_add_resolve_plan({kRows, kHidden, kHidden, t});
+            const auto plan =
+                ops::detail::w8_linear_add_resolve_plan({kRows, options.hidden, options.hidden, t});
 
             if (options.profile) {
                 ops::linear_add(x, packed.weight, out, workspace, stream);
@@ -167,7 +178,7 @@ int main(int argc, char** argv) {
             }
 
             const auto run = [&](const char* path, auto&& launch) {
-                append(results, path, t,
+                append(results, path, t, options.hidden,
                        bench::measure_cold_launch(launch, flush, stream, options.warmup,
                                                   options.repeat),
                        packed.storage.bytes);
@@ -178,7 +189,7 @@ int main(int argc, char** argv) {
                 });
             if (options.production_only) { continue; }
 
-            if (t == 1) {
+            if (t == 1 && options.hidden == 6144) {
                 run("decode_r4", [&](cudaStream_t candidate_stream) {
                     ops::detail::w8_linear_add_decode_r4_launch(x, packed.weight, out,
                                                                 candidate_stream);
@@ -200,16 +211,10 @@ int main(int argc, char** argv) {
                 ops::detail::w8_linear_add_simt_r8_c8_launch(full_for(t, 8), x, packed.weight, out,
                                                              candidate_stream);
             });
-            if (t >= 2 && t <= 32) {
+            if (t >= 2 && t <= 48) {
                 run("splitk_mma_exact_t", [&](cudaStream_t candidate_stream) {
                     ops::detail::w8_linear_add_splitk_mma_launch(x, packed.weight, out,
                                                                  candidate_stream);
-                });
-            }
-            if (t >= 33 && t <= 65) {
-                run("splitk_mma_32_plus_tail", [&](cudaStream_t candidate_stream) {
-                    ops::detail::w8_linear_add_splitk_mma_composite_launch(x, packed.weight, out,
-                                                                           candidate_stream);
                 });
             }
 #define RUN_MMA(NAME, TILE_ROWS, TILE_COLS)                                                        \

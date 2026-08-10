@@ -87,6 +87,7 @@ int main() {
 
     int failures = 0;
     failures += run_case("gated_rmsnorm [128,48,1]", {128, 48}, 1401U);
+    failures += run_case("gated_rmsnorm [128,48,48]", {128, 48, 48}, 1406U);
     failures += run_case("gated_rmsnorm [128,32,7]", {128, 32, 7}, 1402U);
     failures += run_case("gated_rmsnorm [128,32,128]", {128, 32, 128}, 1403U);
     failures += run_case("gated_rmsnorm near-zero [128,32]", {128, 32}, 1404U, 1.0e-5F);
