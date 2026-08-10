@@ -157,7 +157,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--api-key KEY` | required bearer or `x-api-key` value | unset |
 | `--model-id ID` | public OpenAI model alias | `qwen3.6-27b` |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
-| `--kv-capacity N` | shared Main Text KV pool capacity; omitted means `--max-context` | `8192` |
+| `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
 | `--max-concurrency N` | maximum admitted requests; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
@@ -197,13 +197,13 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v5 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v6 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance.
 
 | Event | Contents |
 |---|---|
-| `server_start` | target/weights identity and artifact, resolved Engine and sampler configuration, weights/sequence/workspace/request-transient arenas, CUDA Graph allowance, CUDA/GPU environment, and redacted argv |
+| `server_start` | target/weights identity and artifact, resolved Engine and sampler configuration, weights/sequence/workspace/request-transient arenas, KV sizing ledger, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, thinking mode, output budget, stream/message/tool shape |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, unrounded phase seconds, and complete speculative-decoding counters |
 | `request_error` | the resolved request configuration and generation error message |
@@ -253,11 +253,21 @@ media request retains the same cancellation and timeout deadline. Model output i
 same finite request count and each request's effective output-token limit; output callbacks and
 network serialization run outside the GPU executor and do not delay formation of the next batch.
 
-`--max-context` and `--kv-capacity` are independent limits. The former is each sequence's logical
-ceiling; the latter sizes the shared Main Text KV pool used by all active requests and retained
-prefixes. Both are rounded to 64-token pages internally, while a sequence can never cross the exact
-`--max-context` frontier. When `--kv-capacity` is omitted it follows `--max-context`, preserving one
-full-length request's capacity. The shared pool is not divided evenly among request lanes.
+`--max-context` and the resolved `--kv-capacity` are independent limits. The former is each
+sequence's logical ceiling; the latter sizes the shared Main Text KV pool used by all active
+requests and retained prefixes. Both are represented with 64-token pages internally, while a
+sequence can never cross the exact `--max-context` frontier. `--kv-capacity N` requests an explicit
+capacity; `--kv-capacity auto` chooses the largest legal capacity that fits the memory remaining
+after weights are loaded while keeping 1 GiB of sizing headroom. When omitted it follows
+`--max-context`, preserving one full-length request's capacity. The shared pool is fixed at startup
+and is not divided evenly among request lanes.
+
+Automatic sizing evaluates the complete target runtime layout for the chosen concurrency, KV
+dtype, speculative backend, draft window, Vision setting, workspace, and CUDA Graph allowance. It
+uses a direct page-capacity calculation rather than allocation probing. Startup reports the policy,
+resolved capacity, runtime reservation, free memory after weights, automatic headroom, planned
+slack, actual free memory after complete startup, and observed Graph memory. An explicit capacity
+is never silently reduced, and neither policy permits request-time pool growth.
 
 Admission reserves the full prompt-plus-effective-output page entitlement, so an admitted request
 can finish within its declared bound. A later request waits in FIFO order when the remaining shared

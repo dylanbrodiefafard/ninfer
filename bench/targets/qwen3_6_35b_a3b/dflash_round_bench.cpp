@@ -4,6 +4,7 @@
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
 #include "core/device.h"
+#include "runtime/engine/kv_capacity.h"
 #include "runtime/engine/request_memory.h"
 
 #include <algorithm>
@@ -196,10 +197,11 @@ int run(const Options& options) {
     }
 
     ninfer::EngineOptions engine;
-    engine.artifact_path             = options.artifact;
-    engine.device                    = options.device;
-    engine.max_context               = static_cast<std::uint32_t>(per_request_capacity);
-    engine.kv_capacity               = static_cast<std::uint32_t>(capacity);
+    engine.artifact_path = options.artifact;
+    engine.device        = options.device;
+    engine.max_context   = static_cast<std::uint32_t>(per_request_capacity);
+    engine.kv_capacity =
+        ninfer::KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(capacity));
     engine.prefill_chunk             = 128;
     engine.kv_cache                  = ninfer::KvCacheStorage::BFloat16;
     engine.speculative.backend       = ninfer::SpeculativeBackend::DFlash;
@@ -212,8 +214,11 @@ int run(const Options& options) {
     ninfer::artifact::Reader reader(options.artifact);
     const auto weights_profile = target::Package::resolve_weights(reader.identity());
     ninfer::artifact::Binder binder(reader);
-    auto load_plan = target::Package::plan_load(binder, engine, weights_profile);
-    auto sequence  = target::Package::plan_sequence(device, engine, weights_profile);
+    auto load_plan        = target::Package::plan_load(binder, engine, weights_profile);
+    auto planner          = target::Package::make_sequence_planner(device, engine, weights_profile);
+    const auto resolution = ninfer::runtime::resolve_kv_capacity(
+        engine.kv_capacity, planner.capacity_curve(), std::numeric_limits<std::size_t>::max());
+    auto sequence                      = std::move(planner).finalize(resolution.main_page_groups);
     const std::uint64_t weight_bytes   = load_plan.materialization().device_capacity_bytes;
     const std::uint64_t sequence_bytes = sequence.device_reservation_bytes();
     if (sequence_bytes > std::numeric_limits<std::uint64_t>::max() - weight_bytes) {

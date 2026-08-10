@@ -45,7 +45,7 @@ int main() {
     options.model_id                  = "qwen3.6-27b";
     options.request_log_jsonl         = "requests.jsonl";
     options.max_context               = 262144;
-    options.kv_capacity               = 524288;
+    options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(524288);
     options.prefill_chunk             = 1024;
     options.log_stats_interval_ms     = 2500;
     options.kv_cache                  = ninfer::KvCacheStorage::Int8Group64;
@@ -68,15 +68,25 @@ int main() {
     load.resource_count       = 6;
 
     ninfer::MemorySummary memory;
-    memory.max_context                = 262144;
-    memory.kv_capacity                = 524288;
-    memory.kv_cache                   = ninfer::KvCacheStorage::Int8Group64;
-    memory.weights.capacity_bytes     = 100;
-    memory.sequence.capacity_bytes    = 200;
-    memory.workspace.capacity_bytes   = 300;
-    memory.request_transient          = {500, 0, 450};
-    memory.cuda_graph_allowance_bytes = 600;
-    memory.kv_payload_bytes           = 400;
+    memory.max_context                       = 262144;
+    memory.kv_capacity_mode                  = ninfer::KvCapacityMode::Explicit;
+    memory.kv_capacity                       = 524288;
+    memory.kv_capacity_page_groups           = 8192;
+    memory.kv_capacity_max_page_groups       = 16384;
+    memory.kv_cache                          = ninfer::KvCacheStorage::Int8Group64;
+    memory.weights.capacity_bytes            = 100;
+    memory.sequence.capacity_bytes           = 200;
+    memory.workspace.capacity_bytes          = 300;
+    memory.request_transient                 = {500, 0, 450};
+    memory.minimum_runtime_reservation_bytes = 1300;
+    memory.kv_capacity_increment_bytes       = 100;
+    memory.runtime_reservation_bytes         = 1600;
+    memory.available_after_weights_bytes     = 1700;
+    memory.available_after_startup_bytes     = 180;
+    memory.planned_slack_bytes               = 100;
+    memory.cuda_graph_allowance_bytes        = 600;
+    memory.cuda_graph_observed_bytes         = 550;
+    memory.kv_payload_bytes                  = 400;
 
     ServerLogEnvironment environment;
     environment.device                    = 0;
@@ -101,6 +111,10 @@ int main() {
     failures += check(server.at("artifact").at("size_bytes") == 123456, "artifact size missing");
     failures += check(server.at("engine").at("max_context") == 262144, "max context missing");
     failures += check(server.at("engine").at("kv_capacity") == 524288, "KV capacity missing");
+    failures += check(server.at("engine").at("kv_capacity_mode") == "explicit" &&
+                          server.at("engine").at("kv_capacity_page_groups") == 8192 &&
+                          server.at("engine").at("kv_capacity_max_page_groups") == 16384,
+                      "KV capacity resolution metadata missing");
     failures +=
         check(server.at("engine").at("log_stats_interval_ms") == 2500, "stats interval missing");
     failures += check(server.at("server").at("request_log_jsonl") == "requests.jsonl",
@@ -120,6 +134,13 @@ int main() {
                       "request transient memory missing");
     failures += check(server.at("memory").at("cuda_graph_allowance_bytes") == 600,
                       "CUDA Graph allowance missing");
+    failures += check(server.at("memory").at("runtime_reservation_bytes") == 1600 &&
+                          server.at("memory").at("available_after_weights_bytes") == 1700 &&
+                          server.at("memory").at("available_after_startup_bytes") == 180 &&
+                          server.at("memory").at("kv_capacity_headroom_bytes") == 0 &&
+                          server.at("memory").at("planned_slack_bytes") == 100 &&
+                          server.at("memory").at("cuda_graph_observed_bytes") == 550,
+                      "adaptive KV memory ledger missing");
     failures += check(server.dump().find("must-not-appear") == std::string::npos,
                       "server JSON leaked the API key");
     failures += check(server.at("argv").at(3) == "<redacted>",

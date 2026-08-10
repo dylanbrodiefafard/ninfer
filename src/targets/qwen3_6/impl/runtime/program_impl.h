@@ -1190,6 +1190,7 @@ void ProgramImplCore::prepare_graphs() {
     std::size_t free_after = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_after, &total_bytes));
     const std::size_t consumed = free_before > free_after ? free_before - free_after : 0;
+    graph_observed_bytes       = consumed;
     if (consumed > graph_allowance_bytes) {
         throw std::runtime_error("CUDA Graph warm/capture consumed " + std::to_string(consumed) +
                                  " bytes, exceeding the planned allowance of " +
@@ -2108,6 +2109,7 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.workspace = ArenaMemorySummary{workspace_storage.capacity(), work.used(), work.peak_used()};
     out.workspace_logical_peak_bytes = workspace_logical_peak_bytes;
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
+    out.cuda_graph_observed_bytes    = graph_observed_bytes;
     out.kv_payload_bytes             = kv_payload_bytes;
     return out;
 }

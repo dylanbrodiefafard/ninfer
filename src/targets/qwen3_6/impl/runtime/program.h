@@ -241,6 +241,7 @@ public:
     const bool use_cuda_graph;
     const std::size_t kv_payload_bytes;
     const std::size_t graph_allowance_bytes;
+    std::size_t graph_observed_bytes = 0;
     const WorkspacePlan workspace_plan;
 
     DeviceArena persistent;

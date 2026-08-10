@@ -86,6 +86,7 @@ struct Package {
     using Frontend        = detail::Frontend;
     using PreparedPrompt  = detail::PreparedPrompt;
     using OutputSession   = detail::OutputSession;
+    using SequencePlanner = qwen3_6::SequencePlanner<detail::Variant>;
     using SequencePlan    = qwen3_6::SequencePlan<detail::Variant>;
     using RequestBasePlan = qwen3_6::RequestBasePlan<detail::Variant>;
     using RequestPlan     = qwen3_6::RequestPlan<detail::Variant>;
@@ -97,9 +98,9 @@ struct Package {
     [[nodiscard]] static std::unique_ptr<LoadedModel>
     construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized);
     [[nodiscard]] static Frontend make_frontend(const LoadedModel& model);
-    [[nodiscard]] static SequencePlan plan_sequence(DeviceContext& device,
-                                                    const EngineOptions& options,
-                                                    WeightsProfile weights_profile);
+    [[nodiscard]] static SequencePlanner make_sequence_planner(DeviceContext& device,
+                                                               const EngineOptions& options,
+                                                               WeightsProfile weights_profile);
     [[nodiscard]] static std::unique_ptr<Program>
     create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device);
 };

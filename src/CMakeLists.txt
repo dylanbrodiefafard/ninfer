@@ -24,6 +24,7 @@ add_library(ninfer_core STATIC
   core/layout.cpp
   core/tensor.cpp
   core/decode_graph.cpp
+  runtime/engine/kv_capacity.cpp
   runtime/engine/public_types.cpp
   runtime/engine/request_memory.cpp)
 ninfer_internal_includes(ninfer_core)

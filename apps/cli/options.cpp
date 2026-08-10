@@ -58,12 +58,17 @@ KvCacheStorage parse_kv_cache(std::string_view text) {
     throw std::invalid_argument("invalid kv-dtype: " + std::string(text));
 }
 
+KvCapacityPolicy parse_kv_capacity(const char* text) {
+    if (std::string_view(text) == "auto") { return KvCapacityPolicy::automatic(); }
+    return KvCapacityPolicy::explicit_capacity(parse_u32(text, "kv-capacity"));
+}
+
 } // namespace
 
 std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
-           "       [--max-context N] [--kv-capacity N] [--prefill-chunk N] [--max-new N]\n"
+           "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
            "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N]\n"
            "       [--lm-head-draft]\n"
@@ -77,6 +82,9 @@ std::string usage_text(const char* argv0) {
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
+           "--kv-capacity auto leaves " +
+           std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
+           " MiB of sizing headroom.\n"
            "Sampling defaults: temperature 0.6, top-p 0.95, top-k 20, presence penalty 1.0.\n";
 }
 
@@ -106,7 +114,7 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--max-context") {
             options.max_context = parse_u32(value(arg), "max-context");
         } else if (arg == "--kv-capacity") {
-            options.kv_capacity  = parse_u32(value(arg), "kv-capacity");
+            options.kv_capacity  = parse_kv_capacity(value(arg));
             kv_capacity_explicit = true;
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
@@ -172,7 +180,9 @@ Options parse_options(int argc, char** argv) {
         }
     }
 
-    if (!kv_capacity_explicit) { options.kv_capacity = options.max_context; }
+    if (!kv_capacity_explicit) {
+        options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+    }
 
     const bool has_prompt   = !options.prompt.empty();
     const bool has_messages = !options.messages_path.empty();
@@ -182,7 +192,8 @@ Options parse_options(int argc, char** argv) {
     if (options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
-    if (options.kv_capacity < options.max_context) {
+    if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
+        options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
     product::validate_speculative_cli_options(options.speculative);

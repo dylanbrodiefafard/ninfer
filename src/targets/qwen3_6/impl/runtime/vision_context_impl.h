@@ -176,6 +176,18 @@ std::size_t VisionContext::workspace_bytes(const qwen3_6::VisionItemControl& ite
         .bytes;
 }
 
+std::size_t VisionContext::output_transient_bytes(std::size_t merged_tokens) {
+    if (merged_tokens == 0 ||
+        merged_tokens > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::invalid_argument("Vision output transient extent must fit positive int32");
+    }
+    LayoutBuilder layout;
+    (void)layout.add_tensor(
+        DType::BF16, {VisionScheduleConfig::out_hidden, static_cast<std::int32_t>(merged_tokens)},
+        kWorkspaceAlignment, "Vision item output transient");
+    return layout.finish(kWorkspaceAlignment, "Vision item output transient layout");
+}
+
 std::size_t VisionContext::workspace_capacity_bytes(std::uint32_t max_merged_tokens,
                                                     std::uint32_t max_segments) {
     if (max_merged_tokens == 0 || max_segments == 0) {

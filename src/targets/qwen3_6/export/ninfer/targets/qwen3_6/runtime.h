@@ -31,12 +31,17 @@ namespace detail {
 template <class Variant>
 struct SequencePlanImpl;
 template <class Variant>
+struct SequencePlannerImpl;
+template <class Variant>
 struct RequestPlanImpl;
 template <class Variant>
 struct RequestBasePlanImpl;
 template <class Variant>
 class ProgramImpl;
 } // namespace detail
+
+template <class Variant>
+class SequencePlanner;
 
 // These are the complete family execution types. Exact packages bind them to a private Variant;
 // target selection remains outside this layer and happens once in the closed Engine registry.
@@ -51,6 +56,7 @@ public:
     SequencePlan& operator=(const SequencePlan&) = delete;
 
     [[nodiscard]] std::uint32_t capacity() const noexcept;
+    [[nodiscard]] std::uint32_t kv_capacity() const noexcept;
     [[nodiscard]] std::uint32_t max_concurrency() const noexcept;
     [[nodiscard]] std::size_t device_reservation_bytes() const noexcept;
     [[nodiscard]] std::size_t workspace_capacity_bytes() const noexcept;
@@ -62,10 +68,31 @@ public:
     std::unique_ptr<detail::SequencePlanImpl<Variant>> impl_;
 
     template <class V>
-    friend SequencePlan<V> plan_sequence(DeviceContext&, const EngineOptions&,
-                                         typename V::WeightsProfile);
+    friend class SequencePlanner;
     template <class V>
     friend class detail::ProgramImpl;
+};
+
+template <class Variant>
+class SequencePlanner {
+public:
+    SequencePlanner(SequencePlanner&&) noexcept;
+    SequencePlanner& operator=(SequencePlanner&&) noexcept;
+    ~SequencePlanner();
+
+    SequencePlanner(const SequencePlanner&)            = delete;
+    SequencePlanner& operator=(const SequencePlanner&) = delete;
+
+    [[nodiscard]] const runtime::SequenceCapacityCurve& capacity_curve() const noexcept;
+    [[nodiscard]] SequencePlan<Variant> finalize(std::uint32_t main_page_groups) &&;
+
+public:
+    explicit SequencePlanner(std::unique_ptr<detail::SequencePlannerImpl<Variant>> impl) noexcept;
+    std::unique_ptr<detail::SequencePlannerImpl<Variant>> impl_;
+
+    template <class V>
+    friend SequencePlanner<V> make_sequence_planner(DeviceContext&, const EngineOptions&,
+                                                    typename V::WeightsProfile);
 };
 
 template <class Variant>
@@ -157,9 +184,9 @@ private:
 };
 
 template <class Variant>
-[[nodiscard]] SequencePlan<Variant> plan_sequence(DeviceContext& device,
-                                                  const EngineOptions& options,
-                                                  typename Variant::WeightsProfile weights_profile);
+[[nodiscard]] SequencePlanner<Variant>
+make_sequence_planner(DeviceContext& device, const EngineOptions& options,
+                      typename Variant::WeightsProfile weights_profile);
 
 template <class Variant>
 [[nodiscard]] std::unique_ptr<Program<Variant>>

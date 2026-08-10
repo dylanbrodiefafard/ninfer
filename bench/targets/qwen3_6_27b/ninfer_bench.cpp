@@ -147,12 +147,12 @@ int main(int argc, char** argv) {
             tests, options.max_context, options.mtp_draft_tokens, options.use_cuda_graph);
 
         ninfer::EngineOptions engine_options;
-        engine_options.artifact_path             = options.artifact_path;
-        engine_options.device                    = options.device;
-        engine_options.max_context               = max_context;
-        engine_options.kv_capacity               = max_context;
-        engine_options.prefill_chunk             = options.prefill_chunk;
-        engine_options.kv_cache                  = options.kv_cache;
+        engine_options.artifact_path = options.artifact_path;
+        engine_options.device        = options.device;
+        engine_options.max_context   = max_context;
+        engine_options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(max_context);
+        engine_options.prefill_chunk = options.prefill_chunk;
+        engine_options.kv_cache      = options.kv_cache;
         engine_options.speculative.backend       = options.mtp_draft_tokens == 0
                                                        ? ninfer::SpeculativeBackend::None
                                                        : ninfer::SpeculativeBackend::Mtp;

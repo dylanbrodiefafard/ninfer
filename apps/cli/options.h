@@ -16,11 +16,11 @@ struct Options {
     std::string prompt;
     std::filesystem::path messages_path;
 
-    std::uint32_t max_new       = 128;
-    std::uint32_t max_context   = 2048;
-    std::uint32_t kv_capacity   = 2048;
-    std::uint32_t prefill_chunk = 1024;
-    int device                  = 0;
+    std::uint32_t max_new        = 128;
+    std::uint32_t max_context    = 2048;
+    KvCapacityPolicy kv_capacity = KvCapacityPolicy::explicit_capacity(2048);
+    std::uint32_t prefill_chunk  = 1024;
+    int device                   = 0;
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;

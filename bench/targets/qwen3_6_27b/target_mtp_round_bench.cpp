@@ -4,6 +4,7 @@
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
 #include "core/device.h"
+#include "runtime/engine/kv_capacity.h"
 #include "runtime/engine/request_memory.h"
 
 #include <cuda_runtime.h>
@@ -15,6 +16,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -123,16 +125,16 @@ int run(const Options& options) {
     const std::uint32_t measured_rounds =
         static_cast<std::uint32_t>(options.warmup + options.repetitions);
     ninfer::EngineOptions engine;
-    engine.artifact_path             = options.artifact;
-    engine.device                    = options.device;
-    engine.max_context               = static_cast<std::uint32_t>(seed.size() + 64ULL +
-                                                                  static_cast<std::uint64_t>(measured_rounds) *
-                                                                      (options.draft_tokens + 1ULL) +
-                                                                  2ULL * options.draft_tokens);
-    engine.kv_capacity               = engine.max_context;
-    engine.prefill_chunk             = 128;
-    engine.kv_cache                  = ninfer::KvCacheStorage::BFloat16;
-    engine.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
+    engine.artifact_path       = options.artifact;
+    engine.device              = options.device;
+    engine.max_context         = static_cast<std::uint32_t>(seed.size() + 64ULL +
+                                                            static_cast<std::uint64_t>(measured_rounds) *
+                                                                (options.draft_tokens + 1ULL) +
+                                                            2ULL * options.draft_tokens);
+    engine.kv_capacity         = ninfer::KvCapacityPolicy::explicit_capacity(engine.max_context);
+    engine.prefill_chunk       = 128;
+    engine.kv_cache            = ninfer::KvCacheStorage::BFloat16;
+    engine.speculative.backend = ninfer::SpeculativeBackend::Mtp;
     engine.speculative.draft_tokens  = options.draft_tokens;
     engine.speculative.proposal_head = options.proposal;
     engine.use_cuda_graph            = options.use_cuda_graph;
@@ -149,7 +151,10 @@ int run(const Options& options) {
     auto frontend = target::Package::make_frontend(*model);
     auto prompt   = frontend.prepare_tokens(seed, false);
 
-    auto sequence = target::Package::plan_sequence(device, engine, weights_profile);
+    auto planner          = target::Package::make_sequence_planner(device, engine, weights_profile);
+    const auto resolution = ninfer::runtime::resolve_kv_capacity(
+        engine.kv_capacity, planner.capacity_curve(), std::numeric_limits<std::size_t>::max());
+    auto sequence                      = std::move(planner).finalize(resolution.main_page_groups);
     const std::size_t request_capacity = sequence.request_transient_capacity_bytes();
     auto program = target::Package::create_program(*model, std::move(sequence), device);
     ninfer::runtime::RequestMemory request_memory(device, request_capacity);

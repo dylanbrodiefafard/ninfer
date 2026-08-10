@@ -30,6 +30,11 @@ std::uint32_t SequencePlan<Variant>::capacity() const noexcept {
 }
 
 template <>
+std::uint32_t SequencePlan<Variant>::kv_capacity() const noexcept {
+    return impl_ != nullptr ? impl_->kv_capacity : 0;
+}
+
+template <>
 std::uint32_t SequencePlan<Variant>::max_concurrency() const noexcept {
     return impl_ != nullptr ? impl_->max_concurrency : 0;
 }
@@ -47,6 +52,31 @@ std::size_t SequencePlan<Variant>::workspace_capacity_bytes() const noexcept {
 template <>
 std::size_t SequencePlan<Variant>::request_transient_capacity_bytes() const noexcept {
     return impl_ != nullptr ? impl_->request_transient_capacity_bytes : 0;
+}
+
+template <>
+SequencePlanner<Variant>::SequencePlanner(
+    std::unique_ptr<detail::SequencePlannerImpl<Variant>> impl) noexcept
+    : impl_(std::move(impl)) {}
+
+template <>
+SequencePlanner<Variant>::SequencePlanner(SequencePlanner&&) noexcept = default;
+template <>
+SequencePlanner<Variant>& SequencePlanner<Variant>::operator=(SequencePlanner&&) noexcept = default;
+template <>
+SequencePlanner<Variant>::~SequencePlanner() = default;
+
+template <>
+const runtime::SequenceCapacityCurve& SequencePlanner<Variant>::capacity_curve() const noexcept {
+    static const runtime::SequenceCapacityCurve empty;
+    return impl_ != nullptr ? impl_->curve : empty;
+}
+
+template <>
+SequencePlan<Variant> SequencePlanner<Variant>::finalize(std::uint32_t main_page_groups) && {
+    if (impl_ == nullptr) { throw std::logic_error("sequence planner is empty"); }
+    return SequencePlan<Variant>(detail::NINFER_QWEN36_RUNTIME_NS::finalize_sequence_plan_impl(
+        std::move(impl_), main_page_groups));
 }
 
 template <>
@@ -181,10 +211,11 @@ void Program<Variant>::reset_memory_peaks() noexcept {
 }
 
 template <>
-SequencePlan<Variant> plan_sequence<Variant>(DeviceContext& device, const EngineOptions& options,
-                                             Variant::WeightsProfile weights_profile) {
-    return SequencePlan<Variant>(
-        detail::NINFER_QWEN36_RUNTIME_NS::plan_sequence_impl(device, options, weights_profile));
+SequencePlanner<Variant> make_sequence_planner<Variant>(DeviceContext& device,
+                                                        const EngineOptions& options,
+                                                        Variant::WeightsProfile weights_profile) {
+    return SequencePlanner<Variant>(detail::NINFER_QWEN36_RUNTIME_NS::make_sequence_planner_impl(
+        device, options, weights_profile));
 }
 
 template <>

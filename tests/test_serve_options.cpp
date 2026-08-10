@@ -35,7 +35,8 @@ int main() {
                       "request JSONL logging is not disabled by default");
     failures += check(defaults.log_stats_interval_ms == 5000,
                       "periodic throughput interval default mismatch");
-    failures += check(defaults.kv_capacity == defaults.max_context,
+    failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
+                          defaults.kv_capacity.explicit_tokens == defaults.max_context,
                       "default KV capacity does not follow max context");
     failures += check(defaults.speculative.backend == ninfer::SpeculativeBackend::None,
                       "speculative decoding is not disabled by default");
@@ -71,7 +72,9 @@ int main() {
     failures += check(configured.enable_vision, "--vision did not enable Vision");
     failures +=
         check(configured.max_concurrency == 4, "--max-concurrency did not reach serving options");
-    failures += check(configured.max_context == 4096 && configured.kv_capacity == 8192,
+    failures += check(configured.max_context == 4096 &&
+                          configured.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
+                          configured.kv_capacity.explicit_tokens == 8192,
                       "context and KV capacity options were not kept distinct");
     failures += check(configured.max_pending_requests == 12,
                       "--max-pending-requests did not reach serving options");
@@ -100,8 +103,16 @@ int main() {
 
     const ServeOptions inherited =
         parse({"ninfer-serve", "model.ninfer", "--max-context", "16384"});
-    failures +=
-        check(inherited.kv_capacity == 16384, "omitted --kv-capacity did not follow --max-context");
+    failures += check(inherited.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
+                          inherited.kv_capacity.explicit_tokens == 16384,
+                      "omitted --kv-capacity did not follow --max-context");
+
+    const ServeOptions automatic = parse({"ninfer-serve", "model.ninfer", "--kv-capacity", "auto"});
+    failures += check(automatic.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
+                          automatic.kv_capacity.explicit_tokens == 0 &&
+                          automatic.kv_capacity.automatic_headroom_bytes ==
+                              ninfer::kDefaultKvCapacityHeadroomBytes,
+                      "--kv-capacity auto did not select automatic sizing");
 
     const ServeOptions logged = parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl",
                                        "requests.jsonl", "--api-key", "do-not-log"});

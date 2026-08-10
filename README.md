@@ -214,7 +214,7 @@ speculative-decoding statistics are written to stderr. See the [CLI guide](docs/
 ./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
   --model-id qwen3.6-27b \
   --max-context 16384 \
-  --kv-capacity 32768 \
+  --kv-capacity auto \
   --max-concurrency 2 \
   --spec mtp --draft-tokens 3 \
   --lm-head-draft
@@ -263,10 +263,11 @@ from one to fifteen.
 - NInfer does not provide large-scale or preemptive continuous batching, priority/QoS scheduling,
   multi-GPU execution, CPU/GPU offload, or distributed serving.
 - `--max-context` is the logical ceiling of each sequence and is configurable up to the registered
-  models' native 262,144-token limit. `--kv-capacity` sizes the shared Main Text KV pool for all
-  active and retained sequences; it defaults to one `--max-context` worth of pages and is not
-  divided statically among request lanes. Both remain subject to GPU memory and KV-cache
-  configuration.
+  models' native 262,144-token limit. `--kv-capacity N` explicitly sizes the shared Main Text KV
+  pool for all active and retained sequences, while `--kv-capacity auto` selects the largest usable
+  capacity from the memory remaining after weights are loaded while preserving 1 GiB of sizing
+  headroom. Omission defaults to one `--max-context` worth of pages. The resolved pool is fixed at
+  startup and is not divided statically among request lanes.
 - Tool calls are parsed and returned to the client; NInfer does not execute tools.
 - The C++ headers are used by the in-tree applications and are not distributed as an installed SDK.
 

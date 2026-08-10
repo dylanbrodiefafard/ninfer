@@ -56,6 +56,21 @@ struct WorkspacePlan {
     std::size_t capacity       = 0;
 };
 
+struct SequencePlanningInputs {
+    WeightsProfile weights_profile;
+    std::uint32_t capacity                 = 0;
+    std::uint32_t max_concurrency          = 1;
+    std::uint32_t prefill_chunk            = 0;
+    std::uint32_t draft_window             = 0;
+    SpeculativeBackend speculative_backend = SpeculativeBackend::None;
+    DType kv_dtype                         = DType::BF16;
+    std::int32_t kv_quant_group            = 0;
+    ProposalHead proposal_head             = ProposalHead::Full;
+    StartupFeatures features;
+    bool use_cuda_graph = true;
+    int device          = 0;
+};
+
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
 
 namespace ninfer::targets::qwen3_6::detail {
@@ -65,6 +80,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     typename NINFER_QWEN36_VARIANT::WeightsProfile weights_profile;
     std::uint32_t capacity                 = 0;
     std::uint32_t kv_capacity              = 0;
+    std::uint32_t main_page_groups         = 0;
     std::uint32_t max_concurrency          = 1;
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
@@ -82,15 +98,24 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::size_t device_reservation_bytes         = 0;
 };
 
+template <>
+struct SequencePlannerImpl<NINFER_QWEN36_VARIANT> {
+    NINFER_QWEN36_RUNTIME_NS::SequencePlanningInputs inputs;
+    runtime::SequenceCapacityCurve curve;
+    std::unique_ptr<SequencePlanImpl<NINFER_QWEN36_VARIANT>> minimum;
+};
+
 } // namespace ninfer::targets::qwen3_6::detail
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 
 using SequencePlanImpl = qwen3_6::detail::SequencePlanImpl<Variant>;
 
-void validate_target_options(DeviceContext& device, const EngineOptions& options);
-[[nodiscard]] std::unique_ptr<SequencePlanImpl> plan_sequence_impl(DeviceContext& device,
-                                                                   const EngineOptions& options,
-                                                                   WeightsProfile weights_profile);
+[[nodiscard]] std::unique_ptr<qwen3_6::detail::SequencePlannerImpl<Variant>>
+make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
+                           WeightsProfile weights_profile);
+[[nodiscard]] std::unique_ptr<SequencePlanImpl>
+finalize_sequence_plan_impl(std::unique_ptr<qwen3_6::detail::SequencePlannerImpl<Variant>> planner,
+                            std::uint32_t main_page_groups);
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

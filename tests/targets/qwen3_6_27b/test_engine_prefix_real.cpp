@@ -13,7 +13,7 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     ninfer::EngineOptions options;
     options.artifact_path             = artifact;
     options.max_context               = 4096;
-    options.kv_capacity               = 4096;
+    options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(4096);
     options.prefill_chunk             = 1024;
     options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens  = 3;

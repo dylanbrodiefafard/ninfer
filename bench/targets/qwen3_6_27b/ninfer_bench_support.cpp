@@ -641,13 +641,31 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "  \"memory\": {\n"
         << "    \"device\": " << env.memory.device << ",\n"
         << "    \"max_context\": " << env.memory.max_context << ",\n"
+        << "    \"kv_capacity_mode\": \""
+        << (env.memory.kv_capacity_mode == KvCapacityMode::Automatic ? "auto" : "explicit")
+        << "\",\n"
         << "    \"kv_capacity\": " << env.memory.kv_capacity << ",\n"
+        << "    \"kv_capacity_page_groups\": " << env.memory.kv_capacity_page_groups << ",\n"
+        << "    \"kv_capacity_max_page_groups\": " << env.memory.kv_capacity_max_page_groups
+        << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.memory.kv_cache) << "\",\n";
     append_arena_json(out, "weights", env.memory.weights, "    ", true);
     append_arena_json(out, "sequence", env.memory.sequence, "    ", true);
     append_arena_json(out, "workspace", env.memory.workspace, "    ", true);
     append_arena_json(out, "request_transient", env.memory.request_transient, "    ", true);
-    out << "    \"cuda_graph_allowance_bytes\": " << env.memory.cuda_graph_allowance_bytes << ",\n"
+    out << "    \"minimum_runtime_reservation_bytes\": "
+        << env.memory.minimum_runtime_reservation_bytes << ",\n"
+        << "    \"kv_capacity_increment_bytes\": " << env.memory.kv_capacity_increment_bytes
+        << ",\n"
+        << "    \"runtime_reservation_bytes\": " << env.memory.runtime_reservation_bytes << ",\n"
+        << "    \"available_after_weights_bytes\": " << env.memory.available_after_weights_bytes
+        << ",\n"
+        << "    \"available_after_startup_bytes\": " << env.memory.available_after_startup_bytes
+        << ",\n"
+        << "    \"kv_capacity_headroom_bytes\": " << env.memory.kv_capacity_headroom_bytes << ",\n"
+        << "    \"planned_slack_bytes\": " << env.memory.planned_slack_bytes << ",\n"
+        << "    \"cuda_graph_allowance_bytes\": " << env.memory.cuda_graph_allowance_bytes << ",\n"
+        << "    \"cuda_graph_observed_bytes\": " << env.memory.cuda_graph_observed_bytes << ",\n"
         << "    \"kv_payload_bytes\": " << env.memory.kv_payload_bytes << "\n"
         << "  },\n"
         << "  \"config\": {\n"

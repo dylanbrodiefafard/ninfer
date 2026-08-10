@@ -93,25 +93,49 @@ Engine 的 startup configuration 给出：
 
 ```text
 max_context                  单个 sequence 的逻辑上限 S
-kv_capacity                  shared Main pool 的容量输入 K_main
+kv_capacity                  Explicit(K_main) 或 Automatic(R) 的 sizing policy
 max_concurrency              active sequence 上限
 selected speculative backend off、MTP 或 DFlash
 ```
 
 `max_concurrency` 只确定 control lanes、block-table rows 和 fixed per-sequence resources 的数量，不把 KV
 容量切成等份。`EngineOptions.max_context` 只约束任何单条 sequence 的 frontier；
-`EngineOptions.kv_capacity` 只决定 Main pool 的 shared physical page-group 数。Backend capacity 不是独立
-用户配置，而由 Main capacity、selected backend、`max_concurrency` 和 exact target frontier contract
-唯一导出。
+`EngineOptions.kv_capacity` 解析为 Main pool 的 shared physical page-group 数。Backend capacity 不是独立
+用户配置，而由 resolved Main capacity、selected backend、`max_concurrency` 和 exact target frontier
+contract 唯一导出。
 
 Planner 将 Main contract 归一化为 physical page capacity：
 
 ```text
-L = ceil(S / P_main)
-M = ceil(K_main / P_main)
+L     = ceil(S / P_main)
+M_min = max(L, max_concurrency)
+M_max = max_concurrency * L
+M     = resolved physical page groups in [M_min,M_max]
 Main physical page groups = M
 per-allocation logical page capacity = L
 ```
+
+Explicit policy 使用 `M=ceil(K_main/P_main)`。Automatic policy 带有必须保留的 device headroom `R`，在
+权重加载并同步后查询剩余显存 `F`。CLI/server 的 `R` 固定为 1 GiB；Engine policy 可以显式指定该值。
+Exact target 用同一个完整 physical candidate builder 得到：
+
+```text
+B(M)     = persistent + workspace + request transient + CUDA Graph allowance
+B_min    = B(M_min)
+B_step   = B(M_min+1) - B(M_min)
+M_auto   = min(M_max, M_min + floor((F-R-B_min)/B_step))
+```
+
+Automatic 要求 `F>=R+B_min`；当 `M_min=M_max` 时直接取该单点。未达到 `M_max` 时，最终
+`planned_slack=F-B(M)` 位于 `[R,R+B_step)`，从而不会把显存压到一个 page-group 以下的随机余量。
+`B(M)` 包含 Main 与 selected backend 的 coupled growing pools，且
+persistent 部分直接来自生产 `LayoutBuilder`，workspace 来自生产 schedule 的 capacity recipe；common
+resolver 不维护模型维度或 bytes-per-token 公式，也不做 allocation probing。最终 plan 再由同一 builder
+按 `M` 生成并核对 reservation curve。
+
+`R` 是 capacity solver 刻意不消费的 sizing headroom。CUDA allocator、context 和 module 的物理占用不全
+等同于 arena payload；因此 Instance 与 Graph 完整建立并同步后再次查询实际 free memory，并与 policy、
+planned slack 一起报告。默认 1 GiB 同时吸收这部分差值，并为同一 GPU 上后续的小额占用留下实际余量。
 
 Engine 对外同时报告 configured `max_context` 和 resolved `kv_capacity=M*P_main`。最后一个 physical page
 的 rounding tail 只属于 storage padding，不能让 sequence frontier 超过 `S`。Admission 以 page-group
@@ -129,9 +153,9 @@ KVCapacity = {
 Main per-allocation logical capacity 是 `L`，physical capacity 是 `M` page groups。Backend 的 logical
 capacity 和 physical page-group count 必须分别描述：MTP 的额外 physical headroom 不能被解释为更大的
 per-sequence logical context。Backend sizing 由 selected backend 的 fixed frontier relation 推导，不能从
-main/backend bytes-per-token 比例推导，也不能独立配置。Startup 要求 raw `K_main >= S`、
-`M >= max_concurrency` 且 `M <= max_concurrency*L`；分别保证一个 request 可达到 `S`、每个 active lane
-至少可获得一页、且不接受 lanes 永远无法使用的 physical capacity。
+main/backend bytes-per-token 比例推导，也不能独立配置。Explicit 要求 raw `K_main >= S`；两种 policy
+都要求 `M >= max_concurrency` 且 `M <= max_concurrency*L`，分别保证一个 request 可达到 `S`、每个
+active lane 至少可获得一页、且不接受 lanes 永远无法使用的 physical capacity。
 
 ### 3.3 Physical separation, coordinated capacity
 
@@ -184,10 +208,11 @@ materialize 若干 pages。任一 pool 都只需在自己的 entitlement 内取�
 重分配另一个 pool 的 typed capacity。
 
 因此，startup 必须在建立任一 pool 前完成全部 typed slabs、fixed state、workspace 和 driver allowance
-的显存验证；无法兑现 configured contract 时拒绝 Engine configuration，不静默降低 capacity，也不根据
-剩余显存机会性扩容。Retained eviction 后，若一个 request set 仍满足 Main entitlement contract，却无法
-取得必要 backend reservation，这是 sizing/accounting invariant violation；运行期按 Engine failure 处理，
-不能等待碰巧释放 backend pages。
+的显存规划。Explicit 无法兑现时拒绝 Engine configuration，不静默降低 capacity；Automatic 根据权重
+加载后的剩余显存只解析一次最大合法 `M`。最终 pool 建立后两种 policy 都不再扩容、重分配或重建
+Graph。Retained eviction 后，若一个 request set 仍满足 Main entitlement contract，却无法取得必要
+backend reservation，这是 sizing/accounting invariant violation；运行期按 Engine failure 处理，不能等待
+碰巧释放 backend pages。
 
 任一 pool 已 materialize 全部 entitlement 而另一个 pool 仍有 free pages，都不表示容量 sizing
 失败。空闲 pages 不能解释为另一种 payload，属于 coordinated profile 的 typed slack，不是外部碎片。
@@ -1369,12 +1394,15 @@ contiguous-KV reference 只记录当时的 `B=1` paging migration，不是当前
 
 以下是实现必须遵守的 architecture contract：
 
-- `EngineOptions.max_context=S` 是 per-sequence logical ceiling，`EngineOptions.kv_capacity=K_main` 是
-  shared Main pool sizing input；令 `L=ceil(S/64)`、`M=ceil(K_main/64)`，Main 与 DFlash Full 的
+- `EngineOptions.max_context=S` 是 per-sequence logical ceiling，`EngineOptions.kv_capacity` 是
+  `Explicit(K_main)` 或 `Automatic(R)`；令 `L=ceil(S/64)`、`M_min=max(L,max_concurrency)`、
+  `M_max=max_concurrency*L`，Explicit 取 `M=ceil(K_main/64)`，Automatic 根据完整 target physical
+  reservation curve 与权重加载后的空闲显存扣除 headroom `R` 后，直接求得区间内最大的 `M`；
+  CLI/server 的 `R` 为 1 GiB；Main 与 DFlash Full 的
   per-allocation logical capacity 均为 `L`、physical capacity 均为 `M` pages，MTP 的 logical capacity
   为 `L`、physical capacity 为 `M + max_concurrency*ceil((K_draft-1)/64)` pages，其中 `K_draft` 是
-  speculative draft window；startup 配置不满足
-  `K_main>=S`、`M>=max_concurrency`、`M<=max_concurrency*L` 或显存不足即拒绝；
+  speculative draft window；Explicit 不满足 `K_main>=S`、任一 policy 的 resolved
+  `M` 不在 `[M_min,M_max]`，或 minimum/runtime reservation 无法容纳时即拒绝；
 - growing KV 使用 homogeneous pools、pool-local I32 page-group IDs 和 allocation-owned ordered mapping；
 - 全部 registered growing pools 的 page size 为 `P=64`；
 - Main Text/MTP 的 K/V 与 code planes 固定为 contiguous page-major `[D,P,Hkv,Nphysical]`，INT8-G64

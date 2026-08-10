@@ -95,6 +95,10 @@ const char* kv_cache_name(ninfer::KvCacheStorage storage) {
     return storage == ninfer::KvCacheStorage::BFloat16 ? "bf16" : "int8-group64";
 }
 
+const char* kv_capacity_mode_name(ninfer::KvCapacityMode mode) {
+    return mode == ninfer::KvCapacityMode::Automatic ? "auto" : "explicit";
+}
+
 const char* proposal_head_name(ninfer::ProposalHead proposal) {
     return proposal == ninfer::ProposalHead::Optimized ? "optimized" : "full";
 }
@@ -325,7 +329,10 @@ std::string format_server_start_json(const std::string& server_instance_id, std:
     record["engine"]   = Json{
           {"device", options.device},
           {"max_context", options.max_context},
+          {"kv_capacity_mode", kv_capacity_mode_name(memory.kv_capacity_mode)},
           {"kv_capacity", memory.kv_capacity},
+          {"kv_capacity_page_groups", memory.kv_capacity_page_groups},
+          {"kv_capacity_max_page_groups", memory.kv_capacity_max_page_groups},
           {"max_concurrency", options.max_concurrency},
           {"max_pending_requests", options.max_pending_requests},
           {"pending_timeout_ms", options.pending_timeout_ms},
@@ -346,12 +353,21 @@ std::string format_server_start_json(const std::string& server_instance_id, std:
                                        {"frequency_penalty", options.sampling_frequency_penalty},
                                        {"seed", std::move(default_seed)},
                                        {"greedy", options.greedy}};
-    record["memory"]            = Json{{"weights", arena_json(memory.weights)},
-                                       {"sequence", arena_json(memory.sequence)},
-                                       {"workspace", arena_json(memory.workspace)},
-                                       {"request_transient", arena_json(memory.request_transient)},
-                                       {"cuda_graph_allowance_bytes", memory.cuda_graph_allowance_bytes},
-                                       {"kv_payload_bytes", memory.kv_payload_bytes}};
+    record["memory"] =
+        Json{{"weights", arena_json(memory.weights)},
+             {"sequence", arena_json(memory.sequence)},
+             {"workspace", arena_json(memory.workspace)},
+             {"request_transient", arena_json(memory.request_transient)},
+             {"minimum_runtime_reservation_bytes", memory.minimum_runtime_reservation_bytes},
+             {"kv_capacity_increment_bytes", memory.kv_capacity_increment_bytes},
+             {"runtime_reservation_bytes", memory.runtime_reservation_bytes},
+             {"available_after_weights_bytes", memory.available_after_weights_bytes},
+             {"available_after_startup_bytes", memory.available_after_startup_bytes},
+             {"kv_capacity_headroom_bytes", memory.kv_capacity_headroom_bytes},
+             {"planned_slack_bytes", memory.planned_slack_bytes},
+             {"cuda_graph_allowance_bytes", memory.cuda_graph_allowance_bytes},
+             {"cuda_graph_observed_bytes", memory.cuda_graph_observed_bytes},
+             {"kv_payload_bytes", memory.kv_payload_bytes}};
     record["environment"] =
         Json{{"device", environment.device},
              {"gpu_name", environment.gpu_name},

@@ -55,11 +55,6 @@ std::uint32_t page_count(std::uint32_t capacity) {
     return 1U + (capacity - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
 }
 
-std::size_t align_up(std::size_t value, std::size_t alignment, const char* label) {
-    const std::size_t padding = (alignment - value % alignment) % alignment;
-    return checked_add(value, padding, label);
-}
-
 template <class ProfileAllowance>
 std::size_t graph_topology_allowance(const std::vector<GraphExecutionProfile>& profiles,
                                      ProfileAllowance&& profile_allowance, const char* label) {
@@ -98,7 +93,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     const auto effective_prefill_chunk =
         static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));
     const std::uint32_t logical_pages  = page_count(plan.capacity);
-    const std::uint32_t physical_pages = page_count(plan.kv_capacity);
+    const std::uint32_t physical_pages = plan.main_page_groups;
     const std::uint64_t mtp_extra_pages =
         plan.features.mtp()
             ? static_cast<std::uint64_t>(plan.max_concurrency) *
@@ -521,8 +516,6 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     return out;
 }
 
-} // namespace
-
 void validate_target_options(DeviceContext& device, const EngineOptions& options) {
     if (options.max_context == 0 || options.max_context > Variant::maximum_context) {
         throw std::invalid_argument("max_context exceeds the variant native context capacity");
@@ -533,19 +526,29 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
-    if (options.kv_capacity == 0 || options.kv_capacity < options.max_context) {
-        throw std::invalid_argument("kv_capacity must be at least max_context");
+    const std::uint32_t logical_pages = page_count(options.max_context);
+    const std::uint32_t minimum_pages = std::max(logical_pages, options.max_concurrency);
+    const std::uint64_t maximum_pages64 =
+        static_cast<std::uint64_t>(options.max_concurrency) * logical_pages;
+    if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("maximum Main KV page count exceeds uint32");
     }
-    const std::uint32_t logical_pages  = page_count(options.max_context);
-    const std::uint32_t physical_pages = page_count(options.kv_capacity);
-    if (physical_pages < options.max_concurrency) {
-        throw std::invalid_argument(
-            "kv_capacity cannot provide one Paged KV page per concurrent request");
+    switch (options.kv_capacity.mode) {
+    case KvCapacityMode::Explicit: {
+        if (options.kv_capacity.explicit_tokens < options.max_context) {
+            throw std::invalid_argument("kv_capacity must be at least max_context");
+        }
+        const std::uint32_t requested_pages = page_count(options.kv_capacity.explicit_tokens);
+        if (requested_pages < minimum_pages || requested_pages > maximum_pages64) {
+            throw std::invalid_argument(
+                "kv_capacity is outside the usable range for max_context and max_concurrency");
+        }
+        break;
     }
-    if (static_cast<std::uint64_t>(physical_pages) >
-        static_cast<std::uint64_t>(options.max_concurrency) * logical_pages) {
-        throw std::invalid_argument(
-            "kv_capacity exceeds the maximum usable capacity for max_context and max_concurrency");
+    case KvCapacityMode::Automatic:
+        break;
+    default:
+        throw std::invalid_argument("unknown kv_capacity policy");
     }
     switch (options.speculative.backend) {
     case SpeculativeBackend::None:
@@ -579,38 +582,35 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
     }
 }
 
-std::unique_ptr<SequencePlanImpl> plan_sequence_impl(DeviceContext& device,
-                                                     const EngineOptions& options,
-                                                     WeightsProfile weights_profile) {
-    validate_target_options(device, options);
-
-    auto impl             = std::make_unique<SequencePlanImpl>();
-    impl->weights_profile = weights_profile;
-    impl->capacity        = options.max_context;
-    impl->kv_capacity     = static_cast<std::uint32_t>(
-        checked_i32(static_cast<std::uint64_t>(page_count(options.kv_capacity)) *
-                            static_cast<std::uint32_t>(kPagedKVPageSize),
-                        "resolved Paged KV capacity exceeds int32"));
-    impl->max_concurrency     = options.max_concurrency;
-    impl->prefill_chunk       = std::min(options.prefill_chunk, options.max_context);
-    impl->draft_window        = options.speculative.draft_tokens;
-    impl->speculative_backend = options.speculative.backend;
-    impl->proposal_head       = options.speculative.proposal_head;
-    impl->features            = qwen3_6::startup_features(options);
-    impl->use_cuda_graph      = options.use_cuda_graph;
-    impl->device              = options.device;
-    impl->kv_dtype       = options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16 : DType::I8;
-    impl->kv_quant_group = impl->kv_dtype == DType::I8 ? qwen3_6::kKvQuantGroup : 0;
-    impl->persistent     = persistent_layout(*impl);
-    impl->workspace      = build_workspace_plan(*impl);
+std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,
+                                                           std::uint32_t main_page_groups) {
+    if (main_page_groups == 0) {
+        throw std::invalid_argument("Main KV physical page count must be positive");
+    }
+    auto impl                 = std::make_unique<SequencePlanImpl>();
+    impl->weights_profile     = inputs.weights_profile;
+    impl->capacity            = inputs.capacity;
+    impl->main_page_groups    = main_page_groups;
+    impl->kv_capacity         = static_cast<std::uint32_t>(checked_i32(
+        static_cast<std::uint64_t>(main_page_groups) * static_cast<std::uint32_t>(kPagedKVPageSize),
+        "resolved Paged KV capacity exceeds int32"));
+    impl->max_concurrency     = inputs.max_concurrency;
+    impl->prefill_chunk       = inputs.prefill_chunk;
+    impl->draft_window        = inputs.draft_window;
+    impl->speculative_backend = inputs.speculative_backend;
+    impl->proposal_head       = inputs.proposal_head;
+    impl->features            = inputs.features;
+    impl->use_cuda_graph      = inputs.use_cuda_graph;
+    impl->device              = inputs.device;
+    impl->kv_dtype            = inputs.kv_dtype;
+    impl->kv_quant_group      = inputs.kv_quant_group;
+    impl->persistent          = persistent_layout(*impl);
+    impl->workspace           = build_workspace_plan(*impl);
     if (impl->features.vision) {
-        constexpr std::size_t kFrontendMergedLimit = 32768;
-        const std::size_t merged = std::min<std::size_t>(impl->capacity, kFrontendMergedLimit);
+        constexpr std::uint32_t kFrontendMergedLimit = 32768;
+        const std::uint32_t merged = std::min(impl->capacity, kFrontendMergedLimit);
         impl->request_transient_capacity_bytes =
-            align_up(checked_mul(checked_mul(static_cast<std::size_t>(VisionConfig::output_hidden),
-                                             merged, "request transient elements"),
-                                 dtype_size(DType::BF16), "request transient bytes"),
-                     kArenaAlign, "request transient alignment");
+            schedule::VisionContext::output_transient_bytes(merged);
     }
     if (impl->use_cuda_graph) {
         // Definitions remain per execution profile, but only one executable is instantiated for
@@ -660,6 +660,77 @@ std::unique_ptr<SequencePlanImpl> plan_sequence_impl(DeviceContext& device,
             impl->request_transient_capacity_bytes, "request transient reservation"),
         impl->graph_allowance_bytes, "sequence graph allowance");
     return impl;
+}
+
+} // namespace
+
+std::unique_ptr<qwen3_6::detail::SequencePlannerImpl<Variant>>
+make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
+                           WeightsProfile weights_profile) {
+    validate_target_options(device, options);
+
+    SequencePlanningInputs inputs{
+        .weights_profile     = weights_profile,
+        .capacity            = options.max_context,
+        .max_concurrency     = options.max_concurrency,
+        .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
+        .draft_window        = options.speculative.draft_tokens,
+        .speculative_backend = options.speculative.backend,
+        .kv_dtype       = options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16 : DType::I8,
+        .kv_quant_group = options.kv_cache == KvCacheStorage::BFloat16 ? 0 : qwen3_6::kKvQuantGroup,
+        .proposal_head  = options.speculative.proposal_head,
+        .features       = qwen3_6::startup_features(options),
+        .use_cuda_graph = options.use_cuda_graph,
+        .device         = options.device,
+    };
+    const std::uint32_t logical_pages = page_count(inputs.capacity);
+    const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
+    const std::uint64_t maximum_pages64 =
+        static_cast<std::uint64_t>(inputs.max_concurrency) * logical_pages;
+    if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("maximum Main KV page count exceeds uint32");
+    }
+    const auto maximum_pages = static_cast<std::uint32_t>(maximum_pages64);
+
+    auto planner     = std::make_unique<qwen3_6::detail::SequencePlannerImpl<Variant>>();
+    planner->inputs  = inputs;
+    planner->minimum = build_sequence_candidate(inputs, minimum_pages);
+    planner->curve   = runtime::SequenceCapacityCurve{
+          .main_page_tokens                     = static_cast<std::uint32_t>(kPagedKVPageSize),
+          .minimum_main_page_groups             = minimum_pages,
+          .maximum_main_page_groups             = maximum_pages,
+          .minimum_device_reservation_bytes     = planner->minimum->device_reservation_bytes,
+          .bytes_per_additional_main_page_group = 0,
+    };
+    if (minimum_pages < maximum_pages) {
+        auto adjacent = build_sequence_candidate(inputs, minimum_pages + 1U);
+        if (adjacent->device_reservation_bytes <= planner->minimum->device_reservation_bytes) {
+            throw std::logic_error("Qwen3.6 sequence layout has a nonpositive KV capacity stride");
+        }
+        planner->curve.bytes_per_additional_main_page_group =
+            adjacent->device_reservation_bytes - planner->minimum->device_reservation_bytes;
+    }
+    return planner;
+}
+
+std::unique_ptr<SequencePlanImpl>
+finalize_sequence_plan_impl(std::unique_ptr<qwen3_6::detail::SequencePlannerImpl<Variant>> planner,
+                            std::uint32_t main_page_groups) {
+    if (planner == nullptr || planner->minimum == nullptr) {
+        throw std::invalid_argument("Qwen3.6 sequence planner is empty");
+    }
+    const std::size_t expected = planner->curve.reservation_bytes(main_page_groups);
+    std::unique_ptr<SequencePlanImpl> plan;
+    if (main_page_groups == planner->curve.minimum_main_page_groups) {
+        plan = std::move(planner->minimum);
+    } else {
+        plan = build_sequence_candidate(planner->inputs, main_page_groups);
+    }
+    if (plan->device_reservation_bytes != expected) {
+        throw std::logic_error(
+            "Qwen3.6 physical sequence layout is not affine in Main KV page capacity");
+    }
+    return plan;
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

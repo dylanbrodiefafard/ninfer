@@ -10,6 +10,8 @@ namespace ninfer::runtime {
 
 using ::ninfer::ExecutionOptions;
 using ::ninfer::FinishReason;
+using ::ninfer::KvCapacityMode;
+using ::ninfer::KvCapacityPolicy;
 using ::ninfer::OutputChannel;
 using ::ninfer::RequestOptions;
 using ::ninfer::SamplingParameters;
@@ -59,6 +61,34 @@ struct PrefillStepResult {
 
 struct RoundBudget {
     std::uint32_t generated_tokens_remaining = 0;
+};
+
+// Target-produced affine reservation curve for one Main KV physical-capacity axis. The byte
+// values come from complete target physical layout plans, not from a model geometry formula in
+// the common runtime.
+struct SequenceCapacityCurve {
+    std::uint32_t main_page_tokens                   = 0;
+    std::uint32_t minimum_main_page_groups           = 0;
+    std::uint32_t maximum_main_page_groups           = 0;
+    std::size_t minimum_device_reservation_bytes     = 0;
+    std::size_t bytes_per_additional_main_page_group = 0;
+
+    [[nodiscard]] std::size_t reservation_bytes(std::uint32_t main_page_groups) const;
+    [[nodiscard]] std::uint32_t resolved_tokens(std::uint32_t main_page_groups) const;
+};
+
+struct KvCapacityResolution {
+    KvCapacityMode mode                              = KvCapacityMode::Explicit;
+    std::uint32_t main_page_groups                   = 0;
+    std::uint32_t maximum_main_page_groups           = 0;
+    std::uint32_t resolved_tokens                    = 0;
+    std::size_t minimum_runtime_reservation_bytes    = 0;
+    std::size_t bytes_per_additional_main_page_group = 0;
+    std::size_t runtime_reservation_bytes            = 0;
+    std::size_t available_after_weights_bytes        = 0;
+    std::size_t available_after_startup_bytes        = 0;
+    std::size_t automatic_headroom_bytes             = 0;
+    std::size_t planned_slack_bytes                  = 0;
 };
 
 } // namespace ninfer::runtime

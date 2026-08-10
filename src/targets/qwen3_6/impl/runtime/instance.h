@@ -28,6 +28,7 @@ using VisionWeights                  = typename Variant::VisionWeights;
 using GraphExecutionProfile          = typename Variant::GraphExecutionProfile;
 
 using SequencePlan    = qwen3_6::SequencePlan<Variant>;
+using SequencePlanner = qwen3_6::SequencePlanner<Variant>;
 using RequestBasePlan = qwen3_6::RequestBasePlan<Variant>;
 using RequestPlan     = qwen3_6::RequestPlan<Variant>;
 using Program         = qwen3_6::Program<Variant>;

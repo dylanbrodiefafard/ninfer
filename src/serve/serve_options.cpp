@@ -7,6 +7,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace ninfer::serve {
 namespace {
@@ -51,12 +52,19 @@ KvCacheStorage parse_kv_dtype(const char* text) {
     throw std::invalid_argument("invalid kv-dtype: " + value);
 }
 
+KvCapacityPolicy parse_kv_capacity(const char* text) {
+    if (std::string_view(text) == "auto") { return KvCapacityPolicy::automatic(); }
+    const int value = parse_nonnegative_int(text, "kv-capacity");
+    if (value == 0) { throw std::invalid_argument("--kv-capacity must be positive"); }
+    return KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(value));
+}
+
 } // namespace
 
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
-           "[--model-id ID] [--max-context N] [--kv-capacity N] [--max-concurrency N] "
+           "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
            "[--max-request-mib N] [--request-log-jsonl FILE] "
@@ -74,6 +82,9 @@ std::string serve_usage_text(const char* argv0) {
            "       --request-log-jsonl appends full-precision server/request records\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
+           "       --kv-capacity auto leaves " +
+           std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
+           " MiB of sizing headroom\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
            "       sampler defaults to Qwen3 thinking (temperature 0.6, top-p 0.95, "
            "top-k 20, presence-penalty 1.0); a request may override any field.\n"
@@ -119,8 +130,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.max_context = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-context"), "max-context"));
         } else if (arg == "--kv-capacity") {
-            options.kv_capacity = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--kv-capacity"), "kv-capacity"));
+            options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
             kv_capacity_explicit = true;
         } else if (arg == "--max-concurrency") {
             options.max_concurrency = static_cast<std::uint32_t>(
@@ -196,12 +206,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             throw std::invalid_argument("unknown argument: " + arg);
         }
     }
-    if (!kv_capacity_explicit) { options.kv_capacity = options.max_context; }
+    if (!kv_capacity_explicit) {
+        options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+    }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");
     }
     if (options.max_context == 0) { throw std::invalid_argument("--max-context must be positive"); }
-    if (options.kv_capacity < options.max_context) {
+    if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
+        options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {

@@ -72,9 +72,10 @@ Package::Frontend Package::make_frontend(const LoadedModel& model) {
                                   model.impl_->data.runtime.features.vision);
 }
 
-Package::SequencePlan Package::plan_sequence(DeviceContext& device, const EngineOptions& options,
-                                             WeightsProfile weights_profile) {
-    return qwen3_6::plan_sequence<detail::Variant>(device, options, weights_profile);
+Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
+                                                        const EngineOptions& options,
+                                                        WeightsProfile weights_profile) {
+    return qwen3_6::make_sequence_planner<detail::Variant>(device, options, weights_profile);
 }
 
 std::unique_ptr<Package::Program>

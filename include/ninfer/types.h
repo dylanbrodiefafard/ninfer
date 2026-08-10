@@ -23,6 +23,29 @@ enum class KvCacheStorage : std::uint8_t {
     Int8Group64,
 };
 
+enum class KvCapacityMode : std::uint8_t {
+    Explicit,
+    Automatic,
+};
+
+inline constexpr std::size_t kDefaultKvCapacityHeadroomBytes = 1024ULL * 1024ULL * 1024ULL;
+
+struct KvCapacityPolicy {
+    KvCapacityMode mode                  = KvCapacityMode::Explicit;
+    std::uint32_t explicit_tokens        = 2048;
+    std::size_t automatic_headroom_bytes = 0;
+
+    [[nodiscard]] static constexpr KvCapacityPolicy
+    explicit_capacity(std::uint32_t tokens) noexcept {
+        return KvCapacityPolicy{KvCapacityMode::Explicit, tokens, 0};
+    }
+
+    [[nodiscard]] static constexpr KvCapacityPolicy
+    automatic(std::size_t headroom_bytes = kDefaultKvCapacityHeadroomBytes) noexcept {
+        return KvCapacityPolicy{KvCapacityMode::Automatic, 0, headroom_bytes};
+    }
+};
+
 enum class ProposalHead : std::uint8_t {
     Full,
     Optimized,
@@ -48,7 +71,7 @@ struct EngineOptions {
     std::filesystem::path artifact_path;
     int device                         = 0;
     std::uint32_t max_context          = 2048; // Exact logical ceiling of each request.
-    std::uint32_t kv_capacity          = 2048; // Shared Main KV pool, in token positions.
+    KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
@@ -271,17 +294,28 @@ struct ArenaMemorySummary {
 };
 
 struct MemorySummary {
-    int device                = 0;
-    std::uint32_t max_context = 0;
-    std::uint32_t kv_capacity = 0; // Resolved page-aligned Main KV capacity.
-    KvCacheStorage kv_cache   = KvCacheStorage::BFloat16;
+    int device                                = 0;
+    std::uint32_t max_context                 = 0;
+    KvCapacityMode kv_capacity_mode           = KvCapacityMode::Explicit;
+    std::uint32_t kv_capacity                 = 0; // Resolved page-aligned Main KV capacity.
+    std::uint32_t kv_capacity_page_groups     = 0;
+    std::uint32_t kv_capacity_max_page_groups = 0;
+    KvCacheStorage kv_cache                   = KvCacheStorage::BFloat16;
     ArenaMemorySummary weights;
     ArenaMemorySummary sequence;
     ArenaMemorySummary workspace;
     ArenaMemorySummary request_transient;
-    std::size_t workspace_logical_peak_bytes = 0;
-    std::size_t cuda_graph_allowance_bytes   = 0;
-    std::size_t kv_payload_bytes             = 0;
+    std::size_t minimum_runtime_reservation_bytes = 0;
+    std::size_t kv_capacity_increment_bytes       = 0;
+    std::size_t runtime_reservation_bytes         = 0;
+    std::size_t available_after_weights_bytes     = 0;
+    std::size_t available_after_startup_bytes     = 0;
+    std::size_t kv_capacity_headroom_bytes        = 0;
+    std::size_t planned_slack_bytes               = 0;
+    std::size_t workspace_logical_peak_bytes      = 0;
+    std::size_t cuda_graph_allowance_bytes        = 0;
+    std::size_t cuda_graph_observed_bytes         = 0;
+    std::size_t kv_payload_bytes                  = 0;
 };
 
 // Monotonic execution counters plus one boundary-consistent scheduler snapshot. Consumers derive

@@ -38,21 +38,6 @@ ops::SamplingConfig translate_sampling(const SamplingParameters& source) {
     return out;
 }
 
-std::size_t checked_size_mul(std::size_t a, std::size_t b, const char* label) {
-    if (b != 0 && a > std::numeric_limits<std::size_t>::max() / b) {
-        throw std::overflow_error(label);
-    }
-    return a * b;
-}
-
-std::size_t align_up_256(std::size_t value, const char* label) {
-    constexpr std::size_t mask = 255;
-    if (value > std::numeric_limits<std::size_t>::max() - mask) {
-        throw std::overflow_error(label);
-    }
-    return (value + mask) & ~mask;
-}
-
 std::uint32_t pages_for_tokens(std::uint32_t tokens) noexcept {
     return 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
 }
@@ -138,14 +123,8 @@ RequestBasePlan ProgramImplCore::plan_request_base(const PreparedPromptData& pro
             previous_end = end;
             max_merged   = std::max(max_merged, item.merged_count);
         }
-        const std::size_t output_elements =
-            checked_size_mul(static_cast<std::size_t>(VisionConfig::output_hidden), max_merged,
-                             "vision item output elements overflow size_t");
-        base->vision_transient_bytes =
-            align_up_256(checked_size_mul(output_elements, dtype_size(DType::BF16),
-                                          "vision item output bytes overflow size_t"),
-                         "vision item output alignment overflows size_t");
-        base->vision_control = std::move(control);
+        base->vision_transient_bytes = schedule::VisionContext::output_transient_bytes(max_merged);
+        base->vision_control         = std::move(control);
     }
 
     if (prompt.identity.assistant_content_boundary) {
