@@ -411,7 +411,7 @@ def request_payload(model_id: str, fixture: Fixture, seed: int) -> dict[str, Any
     }
 
 
-def post_json(connection: http.client.HTTPConnection, payload: dict[str, Any]) -> dict[str, Any]:
+def send_json(connection: http.client.HTTPConnection, payload: dict[str, Any]) -> None:
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     try:
         connection.request(
@@ -425,6 +425,12 @@ def post_json(connection: http.client.HTTPConnection, payload: dict[str, Any]) -
                 "Connection": "keep-alive",
             },
         )
+    except (OSError, http.client.HTTPException) as exc:
+        raise CampaignError(f"HTTP request failed: {exc}") from exc
+
+
+def receive_json(connection: http.client.HTTPConnection) -> dict[str, Any]:
+    try:
         response = connection.getresponse()
         response_body = response.read()
     except (OSError, http.client.HTTPException) as exc:
@@ -439,6 +445,11 @@ def post_json(connection: http.client.HTTPConnection, payload: dict[str, Any]) -
     if not isinstance(parsed, dict):
         raise CampaignError("serving response is not a JSON object")
     return parsed
+
+
+def post_json(connection: http.client.HTTPConnection, payload: dict[str, Any]) -> dict[str, Any]:
+    send_json(connection, payload)
+    return receive_json(connection)
 
 
 def require_server_log_identity(event: dict[str, Any], event_name: str) -> None:

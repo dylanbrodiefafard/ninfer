@@ -11,6 +11,7 @@ import json
 import math
 import os
 import queue
+import random
 import shlex
 import sys
 import threading
@@ -40,9 +41,10 @@ SATURATION_SEEDS = (
     2718281828459045235,
     1618033988749894848,
 )
+CORPUS_ORDER_SEED = 20260811
 POINT_ARTIFACT_TYPE = "ninfer_serve_concurrency_bench_point"
 SUMMARY_ARTIFACT_TYPE = "ninfer_serve_concurrency_bench_summary"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @dataclasses.dataclass(frozen=True)
@@ -68,6 +70,7 @@ class Point:
 @dataclasses.dataclass(frozen=True)
 class Job:
     index: int
+    case_index: int
     fixture: corpus.Fixture
     seed: int
     max_tokens: int
@@ -216,6 +219,7 @@ def build_jobs(
         return [
             Job(
                 index=index,
+                case_index=index,
                 fixture=fixture,
                 seed=SATURATION_SEEDS[index],
                 max_tokens=decode_tokens,
@@ -224,11 +228,42 @@ def build_jobs(
         ]
 
     names = corpus.block_fixture_names(point.speculative_backend)
-    cases = [(name, seed) for name in names for seed in corpus.SEEDS]
-    return [
-        Job(index=index, fixture=fixtures[name], seed=seed, max_tokens=fixtures[name].max_new)
-        for index, (name, seed) in enumerate(cases)
+    cases = [
+        (fixture_index * len(corpus.SEEDS) + seed_index, name, seed)
+        for fixture_index, name in enumerate(names)
+        for seed_index, seed in enumerate(corpus.SEEDS)
     ]
+    random.Random(CORPUS_ORDER_SEED).shuffle(cases)
+    return [
+        Job(
+            index=index,
+            case_index=case_index,
+            fixture=fixtures[name],
+            seed=seed,
+            max_tokens=fixtures[name].max_new,
+        )
+        for index, (case_index, name, seed) in enumerate(cases)
+    ]
+
+
+def workload_order(point: Point) -> dict[str, Any]:
+    if point.suite == "corpus-makespan":
+        return {
+            "kind": "fixed_shuffle",
+            "seed": CORPUS_ORDER_SEED,
+            "dispatch": "ordered_http_send",
+        }
+    return {
+        "kind": "fixed_wave",
+        "dispatch": "concurrent_http_send",
+    }
+
+
+def workload_order_label(point: Point) -> str:
+    order = workload_order(point)
+    if "seed" in order:
+        return f"{order['kind']} seed={order['seed']}"
+    return str(order["kind"])
 
 
 def request_payload(point: Point, job: Job) -> dict[str, Any]:
@@ -363,10 +398,21 @@ def run_clients(
     start_event = threading.Event()
     failed = threading.Event()
     result_lock = threading.Lock()
+    ordered_dispatch = point.suite == "corpus-makespan"
+    dispatch_condition = threading.Condition()
+    next_dispatch_index = 0
     results: list[ClientResult] = []
     errors: list[Exception] = []
 
+    def record_failure(error: Exception) -> None:
+        with result_lock:
+            errors.append(error)
+        failed.set()
+        with dispatch_condition:
+            dispatch_condition.notify_all()
+
     def worker() -> None:
+        nonlocal next_dispatch_index
         connection = http.client.HTTPConnection(
             "127.0.0.1", port, timeout=corpus.REQUEST_TIMEOUT_SECONDS
         )
@@ -384,15 +430,27 @@ def run_clients(
                     job = pending.get_nowait()
                 except queue.Empty:
                     return
-                started_at = time.monotonic()
                 try:
-                    response = corpus.post_json(connection, request_payload(point, job))
+                    payload = request_payload(point, job)
+                    if ordered_dispatch:
+                        with dispatch_condition:
+                            dispatch_condition.wait_for(
+                                lambda: failed.is_set() or job.index == next_dispatch_index
+                            )
+                            if failed.is_set():
+                                return
+                            started_at = time.monotonic()
+                            corpus.send_json(connection, payload)
+                            next_dispatch_index += 1
+                            dispatch_condition.notify_all()
+                        response = corpus.receive_json(connection)
+                    else:
+                        started_at = time.monotonic()
+                        response = corpus.post_json(connection, payload)
                     finished_at = time.monotonic()
                     result = parse_client_response(job, response, started_at, finished_at)
                 except Exception as exc:
-                    with result_lock:
-                        errors.append(exc)
-                    failed.set()
+                    record_failure(exc)
                     return
                 with result_lock:
                     results.append(result)
@@ -567,6 +625,7 @@ def client_records(
     return [
         {
             "index": result.job.index,
+            "case_index": result.job.case_index,
             "fixture": result.job.fixture.name,
             "seed": result.job.seed,
             "requested_output_tokens": result.job.max_tokens,
@@ -654,6 +713,7 @@ def analyze_point(
         "draft_tokens": point.draft_tokens,
         "sampling_mode": point.sampling_mode,
         "suite": point.suite,
+        "workload_order": workload_order(point),
         "concurrency": point.concurrency,
         "request_count": len(results),
         "command": list(command),
@@ -684,7 +744,7 @@ def run_point(
     command = server_command(serve, point, server_log, args)
     print(
         f"start {point.target}/{point.speculative_mode}/{point.suite} "
-        f"C={point.concurrency} requests={len(jobs)}",
+        f"C={point.concurrency} requests={len(jobs)} order={workload_order_label(point)}",
         flush=True,
     )
 
@@ -764,6 +824,7 @@ SUMMARY_FIELDS = (
     "weights_id",
     "speculative_mode",
     "sampling_mode",
+    "corpus_order_seed",
     "concurrency",
     "request_count",
     "prompt_tokens",
@@ -787,6 +848,7 @@ def summary_row(report: dict[str, Any]) -> dict[str, Any]:
         "weights_id": report["weights_id"],
         "speculative_mode": report["speculative_mode"],
         "sampling_mode": report["sampling_mode"],
+        "corpus_order_seed": report.get("workload_order", {}).get("seed"),
         "concurrency": report["concurrency"],
         "request_count": report["request_count"],
         "prompt_tokens": report["totals"]["prompt_tokens"],
@@ -916,11 +978,16 @@ def write_summaries(reports: Sequence[dict[str, Any]], output_dir: Path) -> None
             )
         sections.append(f"{title}\n\n{table}")
 
+    corpus_order_note = ""
+    if any(report["suite"] == "corpus-makespan" for report in reports):
+        corpus_order_note = (
+            f" Corpus-makespan uses fixed shuffle seed {CORPUS_ORDER_SEED} and ordered HTTP sends."
+        )
     markdown = (
         "# Concurrent serving benchmark\n\n"
         "Saturated decode rates use only complete intervals whose decode batch equals the "
         "configured concurrency. Corpus makespan spans simultaneous client release through the "
-        "last complete HTTP response.\n\n"
+        f"last complete HTTP response.{corpus_order_note}\n\n"
         + "\n\n".join(sections)
         + "\n"
     )
@@ -948,7 +1015,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         for point in points:
             log_path = output_dir / "server" / f"{point.key}.jsonl"
             jobs = build_jobs(point, fixtures, args.decode_tokens)
-            print(f"# {point.key}: {len(jobs)} request(s)")
+            print(
+                f"# {point.key}: {len(jobs)} request(s), "
+                f"order={workload_order_label(point)}"
+            )
             print(shlex.join(server_command(serve, point, log_path, args)))
         return 0
 

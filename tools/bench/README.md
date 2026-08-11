@@ -133,13 +133,17 @@ Chat Completions requests:
 - `decode-saturation` submits one long-decode wave and uses only complete one-second intervals in
   which every decode round has exactly the configured batch size. Ramp-up, prefill, and drain
   intervals are excluded.
-- `corpus-makespan` runs the existing fixed mode-specific corpus with exactly `N` persistent client
-  workers. A worker submits the next FIFO request only after its current response completes, and
-  makespan ends when the final response has been read.
+- `corpus-makespan` shuffles the existing mode-specific corpus once with the fixed seed `20260811`,
+  then runs that same order with exactly `N` persistent client workers. A worker submits the next
+  request only after its current response completes, and makespan ends when the final response has
+  been read. Request bodies are sent in shuffled-order sequence while response waits remain fully
+  concurrent, removing client-thread arrival races without serializing inference.
 
 Each concurrency point starts a fresh server because its execution graphs and memory plan are
 startup-fixed. Prefix reuse is disabled, startup and warmup are outside both measurements, and the
 runner writes per-point JSON, raw serving JSONL, and combined JSON/CSV/Markdown summaries.
+The point report records the shuffle seed, dispatch method, shuffled position, and canonical corpus
+position for every request.
 
 ```bash
 python3 tools/bench/run_serve_concurrency.py \
