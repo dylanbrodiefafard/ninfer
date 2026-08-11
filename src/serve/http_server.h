@@ -28,6 +28,8 @@ public:
     bool listen();
     void stop();
 
+    [[nodiscard]] const std::string& public_model_id() const noexcept { return public_model_id_; }
+
 private:
     void register_routes();
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res);
@@ -54,6 +56,7 @@ private:
 
     GenerationService* service_ = nullptr;
     ServeOptions options_;
+    std::string public_model_id_;
     ResponseStore response_store_;
     JsonlRequestLog request_jsonl_;
     httplib::Server server_;

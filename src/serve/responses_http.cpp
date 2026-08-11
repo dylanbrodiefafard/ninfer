@@ -211,7 +211,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
         request                   = parse_responses_request(parse_json_body(req), limits);
-        validate_model(request.generation.model, options_.model_id);
+        validate_model(request.generation.model, public_model_id_);
         if (request.previous_response_id) {
             const std::shared_ptr<const StoredResponse> previous =
                 response_store_.get(*request.previous_response_id);
@@ -342,7 +342,7 @@ void HttpServer::handle_response_input_tokens(const httplib::Request& req, httpl
         limits.default_max_tokens = options_.default_max_tokens;
         ResponsesRequest request =
             parse_response_input_tokens_request(parse_json_body(req), limits);
-        validate_model(request.generation.model, options_.model_id);
+        validate_model(request.generation.model, public_model_id_);
         const int tokens =
             service_->count_prompt_tokens(request.generation, [&req] { return disconnected(req); });
         res.set_content(make_response_input_tokens_body(tokens), "application/json");

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::serve {
@@ -22,9 +23,9 @@ struct ServeOptions {
     std::string artifact_path;
     std::string host = "127.0.0.1";
     int port         = 8080;
-    std::string api_key;                  // empty => no auth
-    std::string model_id = "qwen3.6-27b"; // reported by /v1/models
-    std::string request_log_jsonl;        // empty => structured request logging disabled
+    std::string api_key;                          // empty => no auth
+    std::optional<std::string> model_id_override; // unset => artifact identity.model_id
+    std::string request_log_jsonl;                // empty => structured request logging disabled
     std::uint32_t max_context              = 8192;
     KvCapacityPolicy kv_capacity           = KvCapacityPolicy::explicit_capacity(8192);
     std::uint32_t max_concurrency          = 1;
@@ -65,6 +66,8 @@ struct ServeOptions {
 };
 
 ServeOptions parse_serve_options(int argc, char** argv);
+std::string resolve_public_model_id(const ServeOptions& options,
+                                    std::string_view artifact_model_id);
 std::string serve_usage_text(const char* argv0);
 
 } // namespace ninfer::serve

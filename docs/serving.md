@@ -9,7 +9,6 @@ Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
 ./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
   --host 127.0.0.1 \
   --port 8080 \
-  --model-id qwen3.6-27b \
   --max-context 16384 \
   --kv-capacity 32768 \
   --max-concurrency 2 \
@@ -17,17 +16,19 @@ Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
   --lm-head-draft
 ```
 
-For the 35B-A3B artifact, set both the artifact path and public model alias:
+For the 35B-A3B artifact, select its artifact path; the public model ID follows the container
+identity automatically:
 
 ```bash
 ./build/apps/ninfer-serve models/qwen3_6_35b_a3b.ninfer \
-  --model-id qwen3.6-35b-a3b \
   --max-context 16384 \
   --spec mtp --draft-tokens 3 \
   --lm-head-draft
 ```
 
-The default `--model-id` is `qwen3.6-27b`; it is an HTTP alias and does not select the artifact.
+When `--model-id` is omitted, the server advertises and accepts the loaded container's exact
+`identity.model_id`. An explicit `--model-id` remains a public HTTP alias override and does not
+select or alter the artifact.
 
 Vision is disabled by default: its weights, Vision scratch phase, and frozen request-transient
 buffer are not allocated, and media
@@ -80,8 +81,9 @@ The endpoint supports:
 - function tools, tool choices, assistant tool-call history, and tool-result messages;
 - the `enable_thinking` extension.
 
-The request `model` must equal `--model-id`. Reasoning is returned separately as
-`reasoning_content`; answer text remains in `content`.
+The request `model` must equal the public model ID: the artifact `identity.model_id` by default, or
+the explicit `--model-id` override. Reasoning is returned separately as `reasoning_content`; answer
+text remains in `content`.
 
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
 finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty
@@ -153,7 +155,7 @@ wire response contains typed `output` Items.
 
 | Field | NInfer Responses Core contract |
 |---|---|
-| `model` | required non-empty string; must equal `--model-id` |
+| `model` | required non-empty string; must equal the artifact-derived public model ID or explicit `--model-id` override |
 | `input` | required string or non-empty typed Item array |
 | `instructions` | optional string, inserted before the reconstructed conversation for this request only |
 | `previous_response_id` | optional ID of a retained local Response |
@@ -382,7 +384,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--host H` | listen address | `127.0.0.1` |
 | `--port N` | listen port | `8080` |
 | `--api-key KEY` | required bearer or `x-api-key` value | unset |
-| `--model-id ID` | public OpenAI model alias | `qwen3.6-27b` |
+| `--model-id ID` | override the public OpenAI model alias | artifact `identity.model_id` |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
 | `--max-concurrency N` | maximum admitted requests; valid range `1..8` | `1` |
@@ -422,7 +424,6 @@ is also rejected if it resolves to the model artifact.
 
 ```bash
 ./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
-  --model-id qwen3.6-27b \
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 

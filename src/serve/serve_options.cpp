@@ -81,6 +81,7 @@ std::string serve_usage_text(const char* argv0) {
            " when omitted\n"
            "       --max-request-mib defaults to 384 and is enforced before JSON parsing\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
+           "       --model-id overrides the artifact identity.model_id reported by the server\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
@@ -128,7 +129,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--api-key") {
             options.api_key = require_value("--api-key");
         } else if (arg == "--model-id") {
-            options.model_id = require_value("--model-id");
+            options.model_id_override = require_value("--model-id");
+            if (options.model_id_override->empty()) {
+                throw std::invalid_argument("--model-id must not be empty");
+            }
         } else if (arg == "--max-context") {
             options.max_context = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-context"), "max-context"));
@@ -259,6 +263,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
     }
     return options;
+}
+
+std::string resolve_public_model_id(const ServeOptions& options,
+                                    std::string_view artifact_model_id) {
+    if (options.model_id_override.has_value()) { return *options.model_id_override; }
+    if (artifact_model_id.empty()) {
+        throw std::logic_error("loaded artifact model_id must not be empty");
+    }
+    return std::string(artifact_model_id);
 }
 
 } // namespace ninfer::serve

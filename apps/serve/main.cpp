@@ -96,7 +96,7 @@ int main(int argc, char** argv) {
 
         std::ostringstream listening;
         listening << "listening on http://" << options.host << ':' << options.port
-                  << " (model id: " << options.model_id
+                  << " (model id: " << server.public_model_id()
                   << ", auth: " << (options.api_key.empty() ? "disabled" : "bearer") << ')';
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, listening.str());
 

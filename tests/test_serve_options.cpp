@@ -43,6 +43,23 @@ int main() {
     failures += check(defaults.response_store_max_records == kDefaultResponseStoreRecords &&
                           defaults.response_store_max_bytes == kDefaultResponseStoreBytes,
                       "Responses store defaults mismatch");
+    failures += check(!defaults.model_id_override.has_value(),
+                      "model id override is unexpectedly configured by default");
+    failures += check(resolve_public_model_id(defaults, "artifact-model") == "artifact-model",
+                      "artifact model id was not selected by default");
+
+    const ServeOptions model_alias =
+        parse({"ninfer-serve", "model.ninfer", "--model-id", "deployment-alias"});
+    failures +=
+        check(model_alias.model_id_override == "deployment-alias" &&
+                  resolve_public_model_id(model_alias, "artifact-model") == "deployment-alias",
+              "explicit model id did not override the artifact identity");
+
+    bool empty_model_id_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--model-id", ""});
+    } catch (const std::invalid_argument&) { empty_model_id_rejected = true; }
+    failures += check(empty_model_id_rejected, "empty --model-id was accepted");
 
     const ServeOptions dflash = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash",
                                        "--draft-tokens", "15", "--lm-head-draft"});
@@ -113,6 +130,9 @@ int main() {
     failures += check(serve_usage_text("ninfer-serve").find("--response-store-max-mib") !=
                           std::string::npos,
                       "serve help omits Responses store limits");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("identity.model_id") != std::string::npos,
+              "serve help omits the artifact-derived model id default");
 
     const ServeOptions inherited =
         parse({"ninfer-serve", "model.ninfer", "--max-context", "16384"});

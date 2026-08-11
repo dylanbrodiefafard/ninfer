@@ -337,6 +337,7 @@ struct RuntimeStats {
 
 struct LoadSummary {
     std::string target;
+    std::string model_id;
     std::string weights_id;
     double load_seconds                = 0.0;
     double upload_seconds              = 0.0;

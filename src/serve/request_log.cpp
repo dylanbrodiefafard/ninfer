@@ -295,7 +295,9 @@ std::string format_throughput(const ThroughputReport& report) {
 }
 
 std::string format_server_start_json(const std::string& server_instance_id, std::uint64_t timestamp,
-                                     const ServeOptions& options, const ninfer::LoadSummary& load,
+                                     const ServeOptions& options,
+                                     const std::string& public_model_id,
+                                     const ninfer::LoadSummary& load,
                                      const ninfer::MemorySummary& memory,
                                      const ServerLogEnvironment& environment,
                                      std::optional<std::uint64_t> artifact_size_bytes) {
@@ -308,7 +310,7 @@ std::string format_server_start_json(const std::string& server_instance_id, std:
 
     record["server"]   = Json{{"host", options.host},
                               {"port", options.port},
-                              {"public_model_id", options.model_id},
+                              {"public_model_id", public_model_id},
                               {"api_key_configured", !options.api_key.empty()},
                               {"cors_enabled", options.enable_cors},
                               {"max_request_bytes", options.max_request_bytes},
@@ -491,6 +493,7 @@ JsonlRequestLog::JsonlRequestLog(const std::string& path,
 }
 
 void JsonlRequestLog::write_server_start(const ServeOptions& options,
+                                         const std::string& public_model_id,
                                          const ninfer::LoadSummary& load,
                                          const ninfer::MemorySummary& memory) {
     if (!enabled()) { return; }
@@ -498,8 +501,9 @@ void JsonlRequestLog::write_server_start(const ServeOptions& options,
     const std::uintmax_t size = std::filesystem::file_size(options.artifact_path, error);
     const std::optional<std::uint64_t> artifact_size =
         error ? std::nullopt : std::optional<std::uint64_t>(size);
-    append(format_server_start_json(server_instance_id_, unix_time_ms(), options, load, memory,
-                                    query_server_log_environment(options.device), artifact_size));
+    append(format_server_start_json(server_instance_id_, unix_time_ms(), options, public_model_id,
+                                    load, memory, query_server_log_environment(options.device),
+                                    artifact_size));
 }
 
 void JsonlRequestLog::write_request_start(const RequestLogContext& context) {

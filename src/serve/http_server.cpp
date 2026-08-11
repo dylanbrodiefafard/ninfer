@@ -300,12 +300,12 @@ void HttpServer::register_routes() {
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
-    res.set_content(make_models_list(options_.model_id, unix_time_now()), "application/json");
+    res.set_content(make_models_list(public_model_id_, unix_time_now()), "application/json");
 }
 
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {
     const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
-    if (id != options_.model_id) {
+    if (id != public_model_id_) {
         ApiError error;
         error.status  = 404;
         error.type    = "invalid_request_error";
@@ -314,7 +314,7 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
         write_error(res, error);
         return;
     }
-    res.set_content(make_model_object(options_.model_id, unix_time_now()), "application/json");
+    res.set_content(make_model_object(public_model_id_, unix_time_now()), "application/json");
 }
 
 void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
@@ -335,7 +335,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
         request                   = parse_chat_completion_request(body, limits);
-        if (request.model != options_.model_id) {
+        if (request.model != public_model_id_) {
             ApiError error;
             error.status  = 404;
             error.type    = "invalid_request_error";
@@ -713,12 +713,17 @@ void HttpServer::attach(GenerationService& service) {
     if (service_ != nullptr) {
         throw std::logic_error("HTTP generation service is already attached");
     }
-    service_ = &service;
-    request_jsonl_.write_server_start(options_, service.load_summary(), service.memory_summary());
+    const ninfer::LoadSummary load = service.load_summary();
+    public_model_id_               = resolve_public_model_id(options_, load.model_id);
+    service_                       = &service;
+    request_jsonl_.write_server_start(options_, public_model_id_, load, service.memory_summary());
 }
 
 bool HttpServer::listen() {
     if (service_ == nullptr) { throw std::logic_error("HTTP generation service is not attached"); }
+    if (public_model_id_.empty()) {
+        throw std::logic_error("HTTP public model id is not resolved");
+    }
     if (options_.log_stats_interval_ms != 0) {
         stats_stopping_ = false;
         stats_thread_   = std::thread([this] { run_stats_reporter(); });

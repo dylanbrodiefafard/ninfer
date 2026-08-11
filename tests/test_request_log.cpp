@@ -42,7 +42,7 @@ int main() {
     options.host                      = "127.0.0.1";
     options.port                      = 8123;
     options.api_key                   = "must-not-appear";
-    options.model_id                  = "qwen3.6-27b";
+    options.model_id_override         = "deployment-alias";
     options.request_log_jsonl         = "requests.jsonl";
     options.max_context               = 262144;
     options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(524288);
@@ -58,6 +58,7 @@ int main() {
 
     ninfer::LoadSummary load;
     load.target               = "qwen3_6_27b";
+    load.model_id             = "qwen3.6-27b";
     load.weights_id           = "groupwise-int";
     load.load_seconds         = 1.234567890123;
     load.upload_seconds       = 0.345678901234;
@@ -99,12 +100,15 @@ int main() {
     environment.cuda_runtime_version      = "13.1";
     environment.cuda_driver_version       = "13.1";
 
-    const Json server = Json::parse(format_server_start_json(
-        "serve-test", 1000, options, load, memory, environment, std::uint64_t{123456}));
+    const Json server =
+        Json::parse(format_server_start_json("serve-test", 1000, options, "deployment-alias", load,
+                                             memory, environment, std::uint64_t{123456}));
     failures += check(server.at("artifact_type") == kRequestLogArtifactType,
                       "server record artifact type mismatch");
     failures += check(server.at("schema_version") == 6, "server record schema mismatch");
     failures += check(server.at("event") == "server_start", "server event mismatch");
+    failures += check(server.at("server").at("public_model_id") == "deployment-alias",
+                      "resolved public model id missing");
     failures += check(server.at("artifact").at("target") == "qwen3_6_27b", "server target missing");
     failures += check(server.at("artifact").at("weights_id") == "groupwise-int",
                       "server weights id missing");

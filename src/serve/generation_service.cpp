@@ -468,7 +468,6 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
 void GenerationService::warmup() {
     try {
         GenerationRequest request;
-        request.model = options_.model_id;
         ChatTurn turn;
         turn.role = "user";
         ContentPart content;

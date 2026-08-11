@@ -191,7 +191,7 @@ For the 27B NVFP4 accuracy run, start the model service with:
 
 ```bash
 build/apps/ninfer-serve out/qwen3_6_27b_nvfp4.ninfer \
-  --host 127.0.0.1 --port 18080 --model-id qwen3.6-27b \
+  --host 127.0.0.1 --port 18080 \
   --max-context 262144 --prefill-chunk 1024 --kv-dtype int8 \
   --spec mtp --draft-tokens 3 --lm-head-draft
 ```

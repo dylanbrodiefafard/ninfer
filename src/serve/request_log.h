@@ -70,6 +70,7 @@ std::string format_throughput(const ThroughputReport& report);
 // object without a trailing newline.
 std::string format_server_start_json(const std::string& server_instance_id,
                                      std::uint64_t timestamp_unix_ms, const ServeOptions& options,
+                                     const std::string& public_model_id,
                                      const ninfer::LoadSummary& load,
                                      const ninfer::MemorySummary& memory,
                                      const ServerLogEnvironment& environment,
@@ -105,8 +106,8 @@ public:
         return server_instance_id_;
     }
 
-    void write_server_start(const ServeOptions& options, const ninfer::LoadSummary& load,
-                            const ninfer::MemorySummary& memory);
+    void write_server_start(const ServeOptions& options, const std::string& public_model_id,
+                            const ninfer::LoadSummary& load, const ninfer::MemorySummary& memory);
     void write_request_start(const RequestLogContext& context);
     void write_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
     void write_request_error(const RequestLogContext& context, const std::string& message);

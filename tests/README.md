@@ -135,7 +135,7 @@ Run the serving contract manually after starting a resident server in another te
 
 ```bash
 ./build/apps/ninfer-serve out/qwen3_6_27b.ninfer \
-  --host 127.0.0.1 --port 18080 --model-id qwen3.6-27b
+  --host 127.0.0.1 --port 18080
 ```
 
 ```bash

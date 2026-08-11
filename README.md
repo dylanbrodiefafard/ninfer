@@ -143,8 +143,7 @@ docker run --rm \
   --volume "$PWD/models:/models:ro" \
   ninfer:local \
   ninfer-serve /models/qwen3_6_27b.ninfer \
-  --host 0.0.0.0 \
-  --model-id qwen3.6-27b
+  --host 0.0.0.0
 ```
 
 Run the CLI from the same image:
@@ -230,13 +229,15 @@ speculative-decoding statistics are written to stderr. See the [CLI guide](docs/
 
 ```bash
 ./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
-  --model-id qwen3.6-27b \
   --max-context 16384 \
   --kv-capacity auto \
   --max-concurrency 2 \
   --spec mtp --draft-tokens 3 \
   --lm-head-draft
 ```
+
+The public model ID defaults to the artifact's `identity.model_id`; use `--model-id` only to
+publish a deployment-specific alias.
 
 Then send an OpenAI-style request:
 
