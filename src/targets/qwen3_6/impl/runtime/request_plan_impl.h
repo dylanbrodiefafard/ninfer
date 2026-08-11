@@ -42,6 +42,19 @@ std::uint32_t pages_for_tokens(std::uint32_t tokens) noexcept {
     return 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
 }
 
+std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
+                                     std::uint32_t reuse_base, std::uint32_t prefill_chunk,
+                                     std::size_t prefill_splits) noexcept {
+    const std::uint32_t suffix = summary.prompt_tokens - reuse_base;
+    const std::uint64_t prefill_units =
+        suffix == 0
+            ? 1ULL
+            : 1ULL + (static_cast<std::uint64_t>(suffix) - 1ULL) / prefill_chunk + prefill_splits;
+    const std::uint64_t decode_units =
+        summary.effective_output_tokens == 0 ? 0ULL : summary.effective_output_tokens - 1ULL;
+    return prefill_units + decode_units;
+}
+
 } // namespace
 
 RequestBasePlan ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
@@ -96,7 +109,11 @@ RequestBasePlan ProgramImplCore::plan_request_base(const PreparedPromptData& pro
     } else if (speculative_backend == SpeculativeBackend::DFlash) {
         base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
     }
-
+    base->summary.admission = runtime::AdmissionResources{
+        .active_lanes     = 1,
+        .main_kv_pages    = base->text_kv_page_entitlement,
+        .backend_kv_pages = base->backend_kv_page_entitlement,
+    };
     if (prompt.has_media()) {
         auto control =
             std::make_shared<qwen3_6::VisionControl>(qwen3_6::build_vision_control(prompt));
@@ -131,6 +148,14 @@ RequestBasePlan ProgramImplCore::plan_request_base(const PreparedPromptData& pro
         const std::uint32_t candidate = *prompt.identity.assistant_content_boundary;
         if (candidate <= base->summary.prompt_tokens) { base->snapshot_boundary = candidate; }
     }
+    const std::size_t cold_prefill_splits =
+        (base->vision_control != nullptr ? base->vision_control->items.size() : 0ULL) +
+        (base->snapshot_boundary && *base->snapshot_boundary != 0 &&
+                 *base->snapshot_boundary < base->summary.prompt_tokens
+             ? 1ULL
+             : 0ULL);
+    base->summary.service_work_quanta =
+        projected_service_work(base->summary, 0, prefill_chunk, cold_prefill_splits);
     return RequestBasePlan(std::move(base));
 }
 
@@ -228,6 +253,12 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     if (base.snapshot_boundary && *base.snapshot_boundary > plan->reuse_base) {
         plan->snapshot_boundary = base.snapshot_boundary;
     }
+    const std::size_t prefill_splits =
+        (plan->vision ? plan->vision->uses.size() : 0ULL) +
+        (plan->snapshot_boundary && *plan->snapshot_boundary < plan->summary.prompt_tokens ? 1ULL
+                                                                                           : 0ULL);
+    plan->summary.service_work_quanta =
+        projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits);
     return RequestPlan(std::move(plan));
 }
 

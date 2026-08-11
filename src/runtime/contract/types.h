@@ -26,6 +26,14 @@ struct OutputDecision {
     [[nodiscard]] bool finished() const noexcept { return finish_reason != FinishReason::None; }
 };
 
+// Complete request-lifetime ownership in the three independently exhausted admission domains.
+// Values are already rounded to the physical allocation granularity by the target.
+struct AdmissionResources {
+    std::uint32_t active_lanes     = 0;
+    std::uint32_t main_kv_pages    = 0;
+    std::uint32_t backend_kv_pages = 0;
+};
+
 struct RequestPlanSummary {
     std::uint32_t prompt_tokens           = 0;
     std::uint32_t reusable_prompt_tokens  = 0;
@@ -34,6 +42,8 @@ struct RequestPlanSummary {
     FinishReason effective_limit_reason   = FinishReason::None;
     std::size_t transient_bytes           = 0;
     std::size_t transient_alignment       = 1;
+    AdmissionResources admission;
+    std::uint64_t service_work_quanta = 0;
 };
 
 struct BeginSummary {

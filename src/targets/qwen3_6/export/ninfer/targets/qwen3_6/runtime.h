@@ -105,6 +105,8 @@ public:
     RequestBasePlan(const RequestBasePlan&)            = delete;
     RequestBasePlan& operator=(const RequestBasePlan&) = delete;
 
+    [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
+
 public:
     explicit RequestBasePlan(std::unique_ptr<detail::RequestBasePlanImpl<Variant>> impl) noexcept;
     std::unique_ptr<detail::RequestBasePlanImpl<Variant>> impl_;
@@ -151,6 +153,7 @@ public:
     [[nodiscard]] bool
     can_admit_lane_after_retained_eviction(std::uint32_t lane,
                                            const RequestPlan<Variant>& plan) const noexcept;
+    [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
     [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
                                                                 PreparedPrompt&& prompt,
                                                                 RequestPlan<Variant>&& plan,

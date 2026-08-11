@@ -3,6 +3,7 @@
 // Small fixed-capacity request scheduling and batched decode execution for every backend.
 
 #include "ninfer/types.h"
+#include "runtime/engine/admission_policy.h"
 #include "runtime/engine/request_memory.h"
 #include "runtime/generation/generation_budget.h"
 #include "targets/qwen3_6/export/ninfer/targets/qwen3_6/frontend.h"
@@ -21,6 +22,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -42,10 +44,15 @@ public:
         : instance_(instance), max_concurrency_(options.max_concurrency),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
-          pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)) {
+          pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
+          admission_capacity_(instance.program->admission_capacity()) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("concurrent executor bounds are invalid");
+        }
+        if (admission_capacity_.active_lanes != max_concurrency_ ||
+            admission_capacity_.main_kv_pages == 0) {
+            throw std::logic_error("target admission capacity does not match the Engine");
         }
         worker_ = std::thread([this] { worker_loop(); });
     }
@@ -120,6 +127,7 @@ public:
                                "inference request expired before submission");
         }
 
+        std::uint64_t request_id = 0;
         {
             std::lock_guard lock(queue_mutex_);
             if (stopping_ || failed_) {
@@ -130,15 +138,16 @@ public:
                 throw RequestError(RequestErrorKind::Overloaded, "inference request queue is full");
             }
             ++outstanding_;
+            request_id = next_request_id_++;
         }
 
         std::shared_ptr<Request> request;
         try {
             auto output = instance_.loaded->frontend.make_output_session(prompt, options.stop,
                                                                          options.output);
-            request     = std::make_shared<Request>(std::move(prompt), std::move(output),
-                                                    prompt_summary, prepare_seconds, std::move(options),
-                                                    pending_deadline, submitted, std::move(host_input));
+            request = std::make_shared<Request>(request_id, std::move(prompt), std::move(output),
+                                                prompt_summary, prepare_seconds, std::move(options),
+                                                pending_deadline, submitted, std::move(host_input));
         } catch (...) {
             release_reserved_capacity();
             throw;
@@ -259,15 +268,16 @@ private:
     }
 
     struct Request {
-        Request(targets::qwen3_6::PreparedPrompt input,
+        Request(std::uint64_t request_identity, targets::qwen3_6::PreparedPrompt input,
                 targets::qwen3_6::OutputSession output_session, PromptSummary summary,
                 double frontend_seconds, RequestOptions request_options, Clock::time_point limit,
                 Clock::time_point submit_time, HostInputLease input_lease)
-            : host_input(std::move(input_lease)), prompt(std::move(input)),
+            : id(request_identity), host_input(std::move(input_lease)), prompt(std::move(input)),
               output(std::move(output_session)), prompt_summary(summary),
               prepare_seconds(frontend_seconds), options(std::move(request_options)),
               deadline(limit), submitted(submit_time) {}
 
+        const std::uint64_t id;
         HostInputLease host_input;
         targets::qwen3_6::PreparedPrompt prompt;
         targets::qwen3_6::OutputSession output;
@@ -285,6 +295,14 @@ private:
         std::optional<std::uint32_t> lane;
         std::atomic<bool> cancelled{false};
         bool decode_ready = false;
+
+        std::optional<BasePlan> base_plan;
+        std::array<std::optional<Plan>, kMaximumConcurrency> lane_plans{};
+        std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions{};
+        AdmissionResources admission_resources;
+        std::uint64_t remaining_service_work = 0;
+        std::uint64_t backfill_epoch         = 0;
+        BackfillClass backfill_class         = BackfillClass::None;
 
         std::mutex mutex;
         std::condition_variable cv;
@@ -312,10 +330,24 @@ private:
         }
     };
 
+    struct ActiveAdmissionSet {
+        std::array<ActiveAdmissionSnapshot, kMaximumConcurrency> requests{};
+        std::size_t size = 0;
+
+        [[nodiscard]] std::span<const ActiveAdmissionSnapshot> span() const noexcept {
+            return {requests.data(), size};
+        }
+    };
+
     enum class AdmissionProgress : std::uint8_t {
         None,
         ControlProgress,
         RanGpuUnit,
+    };
+
+    struct LaneChoice {
+        std::uint32_t lane  = 0;
+        bool evict_retained = false;
     };
 
     void append_output(const std::shared_ptr<Request>& request,
@@ -369,7 +401,13 @@ private:
         return release;
     }
 
+    void release_planning_state(const std::shared_ptr<Request>& request) noexcept {
+        request->base_plan.reset();
+        for (auto& plan : request->lane_plans) { plan.reset(); }
+    }
+
     void complete_error(const std::shared_ptr<Request>& request, std::exception_ptr error) {
+        release_planning_state(request);
         request->prompt = {};
         request->host_input.reset();
         {
@@ -383,6 +421,7 @@ private:
     }
 
     void complete_success(const std::shared_ptr<Request>& request, FinishReason reason) {
+        release_planning_state(request);
         request->prompt = {};
         request->host_input.reset();
         GenerationResult result;
@@ -453,15 +492,20 @@ private:
         return false;
     }
 
-    void invalidate_admission_plans() noexcept {
-        planned_request_.reset();
-        admission_base_plan_.reset();
-        for (auto& plan : admission_plans_) { plan.reset(); }
-    }
+    void invalidate_lane_plans(std::uint32_t lane) noexcept { ++lane_plan_versions_[lane]; }
 
     void remove_completed_slot(std::uint32_t lane) {
         slots_[lane].reset();
-        invalidate_admission_plans();
+        invalidate_lane_plans(lane);
+    }
+
+    void consume_service_work(const std::shared_ptr<Request>& request, std::uint64_t work) {
+        if (work == 0 || work > request->remaining_service_work) {
+            throw std::logic_error("request service projection consumed " + std::to_string(work) +
+                                   " quanta with " +
+                                   std::to_string(request->remaining_service_work) + " remaining");
+        }
+        request->remaining_service_work -= work;
     }
 
     [[nodiscard]] std::array<bool, kMaximumConcurrency> snapshot_cancellations() const noexcept {
@@ -512,7 +556,15 @@ private:
             }
             have_pending = !pending_.empty();
         }
-        if (!cancelled.empty() || !expired.empty()) { invalidate_admission_plans(); }
+        if (protection_) {
+            const auto removed_protected = [&](const std::shared_ptr<Request>& request) {
+                return request->id == protection_->head_request_id;
+            };
+            if (std::any_of(cancelled.begin(), cancelled.end(), removed_protected) ||
+                std::any_of(expired.begin(), expired.end(), removed_protected)) {
+                protection_.reset();
+            }
+        }
         for (const auto& request : cancelled) { complete_cancelled(request); }
         for (const auto& request : expired) {
             complete_error(request, std::make_exception_ptr(RequestError(
@@ -538,9 +590,30 @@ private:
         return membership;
     }
 
+    [[nodiscard]] ActiveAdmissionSet active_admission_set() const {
+        ActiveAdmissionSet active;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            const auto& request = slots_[lane];
+            if (request == nullptr) { continue; }
+            if (request->admission_resources.active_lanes == 0 ||
+                request->remaining_service_work == 0) {
+                throw std::logic_error("active request has no admission accounting");
+            }
+            active.requests[active.size++] = ActiveAdmissionSnapshot{
+                .request_id            = request->id,
+                .resources             = request->admission_resources,
+                .remaining_work_quanta = request->remaining_service_work,
+                .backfill_epoch        = request->backfill_epoch,
+                .backfill_class        = request->backfill_class,
+            };
+        }
+        return active;
+    }
+
     void resolve_prefill_step(const std::shared_ptr<Request>& request,
                               const PrefillStepResult& step, bool cancel_at_boundary) {
         cumulative_stats_.computed_prefill_tokens += step.processed_prompt_tokens;
+        consume_service_work(request, 1);
         if (step.host_input_consumed || step.complete) { request->host_input.reset(); }
         if (cancel_at_boundary) {
             if (!request->lane) { throw std::logic_error("cancelled prefill has no request lane"); }
@@ -584,132 +657,155 @@ private:
         publish_runtime_stats();
     }
 
-    void plan_fifo_head(const std::shared_ptr<Request>& request) {
-        if (planned_request_ == request) { return; }
-        invalidate_admission_plans();
-        planned_request_ = request;
-        admission_base_plan_.emplace(
-            instance_.program->plan_request_base(request->prompt, request->options.execution));
-        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-            if (slots_[lane] == nullptr) {
-                admission_plans_[lane].emplace(instance_.program->plan_request_for_lane(
-                    lane, request->prompt, *admission_base_plan_));
-            }
+    [[nodiscard]] std::vector<std::shared_ptr<Request>> pending_snapshot() const {
+        std::lock_guard lock(queue_mutex_);
+        return {pending_.begin(), pending_.end()};
+    }
+
+    [[nodiscard]] bool erase_pending(const std::shared_ptr<Request>& request) {
+        std::lock_guard lock(queue_mutex_);
+        const auto it = std::find(pending_.begin(), pending_.end(), request);
+        if (it == pending_.end()) { return false; }
+        pending_.erase(it);
+        return true;
+    }
+
+    void clear_protection_if_head(const std::shared_ptr<Request>& request) noexcept {
+        if (protection_ && protection_->head_request_id == request->id) { protection_.reset(); }
+    }
+
+    void ensure_base_plan(const std::shared_ptr<Request>& request) {
+        if (!request->base_plan) {
+            request->base_plan.emplace(
+                instance_.program->plan_request_base(request->prompt, request->options.execution));
+        }
+        const RequestPlanSummary& summary = request->base_plan->summary();
+        if (summary.admission.active_lanes != 1 || summary.service_work_quanta == 0) {
+            throw std::logic_error("target request plan has invalid admission accounting");
         }
     }
 
-    AdmissionProgress try_admit_one() {
-        std::shared_ptr<Request> request;
-        {
-            std::lock_guard lock(queue_mutex_);
-            if (pending_.empty()) { return AdmissionProgress::None; }
-            request = pending_.front();
+    void ensure_lane_plan(const std::shared_ptr<Request>& request, std::uint32_t lane) {
+        if (slots_[lane] != nullptr) { return; }
+        if (request->lane_plan_versions[lane] == lane_plan_versions_[lane] &&
+            request->lane_plans[lane]) {
+            return;
         }
-        if (request->cancelled.load(std::memory_order_acquire)) { return AdmissionProgress::None; }
+        request->lane_plans[lane].reset();
+        request->lane_plans[lane].emplace(
+            instance_.program->plan_request_for_lane(lane, request->prompt, *request->base_plan));
+        request->lane_plan_versions[lane] = lane_plan_versions_[lane];
+    }
 
-        std::optional<std::uint32_t> selected_lane;
+    [[nodiscard]] std::optional<LaneChoice>
+    find_admission_lane(const std::shared_ptr<Request>& request) {
+        std::optional<LaneChoice> selected;
         std::uint32_t selected_reuse = 0;
-        bool requires_eviction       = false;
-        try {
-            plan_fifo_head(request);
-            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-                if (!admission_plans_[lane]) { continue; }
-                const Plan& plan          = *admission_plans_[lane];
-                const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
-                if (instance_.program->can_admit_lane(lane, plan) &&
-                    (!selected_lane || reuse > selected_reuse)) {
-                    selected_lane  = lane;
-                    selected_reuse = reuse;
-                }
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (slots_[lane] != nullptr) { continue; }
+            ensure_lane_plan(request, lane);
+            const Plan& plan          = *request->lane_plans[lane];
+            const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
+            if (instance_.program->can_admit_lane(lane, plan) &&
+                (!selected || reuse > selected_reuse)) {
+                selected       = LaneChoice{.lane = lane};
+                selected_reuse = reuse;
             }
-
-            if (!selected_lane) {
-                for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-                    if (!admission_plans_[lane]) { continue; }
-                    const Plan& plan          = *admission_plans_[lane];
-                    const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
-                    if (instance_.program->can_admit_lane_after_retained_eviction(lane, plan) &&
-                        (!selected_lane || reuse > selected_reuse)) {
-                        selected_lane     = lane;
-                        selected_reuse    = reuse;
-                        requires_eviction = true;
-                    }
-                }
-            }
-        } catch (...) {
-            {
-                std::lock_guard lock(queue_mutex_);
-                if (!pending_.empty() && pending_.front() == request) { pending_.pop_front(); }
-            }
-            invalidate_admission_plans();
-            complete_error(request, std::current_exception());
-            publish_runtime_stats();
-            return AdmissionProgress::ControlProgress;
         }
-        if (Clock::now() >= request->deadline) {
-            {
-                std::lock_guard lock(queue_mutex_);
-                if (!pending_.empty() && pending_.front() == request) { pending_.pop_front(); }
+        if (selected) { return selected; }
+
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (slots_[lane] != nullptr) { continue; }
+            ensure_lane_plan(request, lane);
+            const Plan& plan          = *request->lane_plans[lane];
+            const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
+            if (instance_.program->can_admit_lane_after_retained_eviction(lane, plan) &&
+                (!selected || reuse > selected_reuse)) {
+                selected = LaneChoice{
+                    .lane           = lane,
+                    .evict_retained = true,
+                };
+                selected_reuse = reuse;
             }
-            invalidate_admission_plans();
-            complete_error(request, std::make_exception_ptr(RequestError(
-                                        RequestErrorKind::QueueTimeout,
-                                        "inference request expired while waiting for admission")));
-            publish_runtime_stats();
-            return AdmissionProgress::ControlProgress;
+        }
+        return selected;
+    }
+
+    [[nodiscard]] AdmissionProgress remove_pending_error(const std::shared_ptr<Request>& request,
+                                                         std::exception_ptr error) {
+        if (!erase_pending(request)) { return AdmissionProgress::None; }
+        clear_protection_if_head(request);
+        complete_error(request, std::move(error));
+        publish_runtime_stats();
+        return AdmissionProgress::ControlProgress;
+    }
+
+    [[nodiscard]] AdmissionProgress admit_planned_request(const std::shared_ptr<Request>& request,
+                                                          LaneChoice choice,
+                                                          BackfillClass backfill_class,
+                                                          std::uint64_t backfill_epoch) {
+        if (Clock::now() >= request->deadline) {
+            return remove_pending_error(
+                request, std::make_exception_ptr(RequestError(
+                             RequestErrorKind::QueueTimeout,
+                             "inference request expired while waiting for admission")));
         }
         if (request->cancelled.load(std::memory_order_acquire)) {
-            {
-                std::lock_guard lock(queue_mutex_);
-                if (!pending_.empty() && pending_.front() == request) { pending_.pop_front(); }
-            }
-            invalidate_admission_plans();
+            if (!erase_pending(request)) { return AdmissionProgress::None; }
+            clear_protection_if_head(request);
             complete_cancelled(request);
             publish_runtime_stats();
             return AdmissionProgress::ControlProgress;
         }
-        if (!selected_lane) { return AdmissionProgress::None; }
 
-        const std::uint32_t lane = *selected_lane;
-        if (requires_eviction) {
+        const std::uint32_t lane = choice.lane;
+        if (!request->lane_plans[lane]) {
+            throw std::logic_error("selected admission lane has no request plan");
+        }
+        if (choice.evict_retained) {
             for (std::uint32_t retained_lane = 0;
                  retained_lane < max_concurrency_ &&
-                 !instance_.program->can_admit_lane(lane, *admission_plans_[lane]);
+                 !instance_.program->can_admit_lane(lane, *request->lane_plans[lane]);
                  ++retained_lane) {
                 if (retained_lane != lane && slots_[retained_lane] == nullptr &&
                     instance_.program->has_retained_lane(retained_lane)) {
                     instance_.program->evict_retained_lane(retained_lane);
-                    admission_plans_[retained_lane].reset();
+                    invalidate_lane_plans(retained_lane);
                 }
             }
-            if (!instance_.program->can_admit_lane(lane, *admission_plans_[lane])) {
+            if (!instance_.program->can_admit_lane(lane, *request->lane_plans[lane])) {
                 throw std::logic_error("retained eviction did not make admission feasible");
             }
         }
 
-        Plan selected_plan = std::move(*admission_plans_[lane]);
-        invalidate_admission_plans();
-
-        {
-            std::lock_guard lock(queue_mutex_);
-            if (pending_.empty() || pending_.front() != request) { return AdmissionProgress::None; }
-            pending_.pop_front();
-        }
-        if (request->cancelled.load(std::memory_order_acquire)) {
-            complete_cancelled(request);
-            publish_runtime_stats();
-            return AdmissionProgress::ControlProgress;
-        }
+        Plan selected_plan = std::move(*request->lane_plans[lane]);
+        request->lane_plans[lane].reset();
+        if (!erase_pending(request)) { return AdmissionProgress::None; }
+        release_planning_state(request);
 
         const RequestPlanSummary summary = selected_plan.summary();
-        const bool needs_prefill         = summary.reusable_prompt_tokens < summary.prompt_tokens;
-        bool target_started              = false;
+        if (backfill_class == BackfillClass::Temporal) {
+            if (!protection_ || protection_->epoch_id != backfill_epoch ||
+                summary.service_work_quanta > protection_->temporal_credit) {
+                throw std::logic_error("temporal backfill lost its protected credit");
+            }
+            protection_->temporal_credit -= summary.service_work_quanta;
+        }
+        clear_protection_if_head(request);
+
+        const bool needs_prefill = summary.reusable_prompt_tokens < summary.prompt_tokens;
+        bool target_started      = false;
         try {
             request->budget.emplace(summary.effective_output_tokens,
                                     summary.effective_limit_reason);
             request->generated.reserve(summary.effective_output_tokens);
-            request->lane = lane;
-            slots_[lane]  = request;
+            request->lane                   = lane;
+            request->admission_resources    = summary.admission;
+            request->remaining_service_work = summary.service_work_quanta;
+            request->backfill_epoch         = backfill_epoch;
+            request->backfill_class         = backfill_class;
+            slots_[lane]                    = request;
+            invalidate_lane_plans(lane);
 
             TransientRegion transient;
             if (needs_prefill) {
@@ -736,11 +832,154 @@ private:
                 prefill_lane_.reset();
             }
             slots_[lane].reset();
-            invalidate_admission_plans();
+            invalidate_lane_plans(lane);
             complete_error(request, error);
             throw;
         }
         return AdmissionProgress::RanGpuUnit;
+    }
+
+    AdmissionProgress try_admit_one() {
+        bool control_progress = false;
+        for (;;) {
+            const std::vector<std::shared_ptr<Request>> queued = pending_snapshot();
+            if (queued.empty()) {
+                protection_.reset();
+                return control_progress ? AdmissionProgress::ControlProgress
+                                        : AdmissionProgress::None;
+            }
+            const std::shared_ptr<Request>& head = queued.front();
+            if (protection_ && protection_->head_request_id != head->id) { protection_.reset(); }
+            if (head->cancelled.load(std::memory_order_acquire)) {
+                if (erase_pending(head)) {
+                    clear_protection_if_head(head);
+                    complete_cancelled(head);
+                    publish_runtime_stats();
+                    control_progress = true;
+                }
+                continue;
+            }
+            if (Clock::now() >= head->deadline) {
+                (void)remove_pending_error(
+                    head, std::make_exception_ptr(RequestError(
+                              RequestErrorKind::QueueTimeout,
+                              "inference request expired while waiting for admission")));
+                control_progress = true;
+                continue;
+            }
+
+            try {
+                ensure_base_plan(head);
+            } catch (...) {
+                (void)remove_pending_error(head, std::current_exception());
+                control_progress = true;
+                continue;
+            }
+            const RequestPlanSummary& head_base = head->base_plan->summary();
+            if (!admission_resources_fit(head_base.admission, admission_capacity_)) {
+                (void)remove_pending_error(
+                    head, std::make_exception_ptr(RequestError(
+                              RequestErrorKind::ContextLengthExceeded,
+                              "request reservation exceeds Engine shared KV capacity")));
+                control_progress = true;
+                continue;
+            }
+
+            std::optional<LaneChoice> head_lane;
+            try {
+                head_lane = find_admission_lane(head);
+            } catch (...) {
+                (void)remove_pending_error(head, std::current_exception());
+                control_progress = true;
+                continue;
+            }
+            if (head_lane) {
+                return admit_planned_request(head, *head_lane, BackfillClass::None, 0);
+            }
+
+            const ActiveAdmissionSet active = active_admission_set();
+            if (active.size == 0) {
+                throw std::logic_error("exclusive-feasible request cannot enter an idle Engine");
+            }
+            if (!protection_) {
+                protection_.emplace(make_admission_protection(next_protection_epoch_++, head->id,
+                                                              head_base.admission, active.span(),
+                                                              admission_capacity_));
+            }
+            if (protected_head_safe_without_temporal(*protection_, active.span(),
+                                                     admission_capacity_)) {
+                protection_->phase = ProtectionPhase::Drain;
+            }
+            if (protection_->phase == ProtectionPhase::Drain) {
+                return control_progress ? AdmissionProgress::ControlProgress
+                                        : AdmissionProgress::None;
+            }
+
+            const std::uint64_t frontier_distance =
+                protection_frontier_distance(*protection_, active.span());
+            for (std::size_t i = 1; i < queued.size(); ++i) {
+                const std::shared_ptr<Request>& candidate = queued[i];
+                if (candidate->cancelled.load(std::memory_order_acquire)) {
+                    if (erase_pending(candidate)) {
+                        complete_cancelled(candidate);
+                        publish_runtime_stats();
+                        control_progress = true;
+                    }
+                    continue;
+                }
+                if (Clock::now() >= candidate->deadline) {
+                    (void)remove_pending_error(
+                        candidate, std::make_exception_ptr(RequestError(
+                                       RequestErrorKind::QueueTimeout,
+                                       "inference request expired while waiting for admission")));
+                    control_progress = true;
+                    continue;
+                }
+
+                try {
+                    ensure_base_plan(candidate);
+                } catch (...) {
+                    (void)remove_pending_error(candidate, std::current_exception());
+                    control_progress = true;
+                    continue;
+                }
+                const RequestPlanSummary& candidate_base = candidate->base_plan->summary();
+                if (!admission_resources_fit(candidate_base.admission, admission_capacity_)) {
+                    (void)remove_pending_error(
+                        candidate, std::make_exception_ptr(RequestError(
+                                       RequestErrorKind::ContextLengthExceeded,
+                                       "request reservation exceeds Engine shared KV capacity")));
+                    control_progress = true;
+                    continue;
+                }
+
+                std::optional<LaneChoice> candidate_lane;
+                try {
+                    candidate_lane = find_admission_lane(candidate);
+                } catch (...) {
+                    (void)remove_pending_error(candidate, std::current_exception());
+                    control_progress = true;
+                    continue;
+                }
+                if (!candidate_lane) { continue; }
+                const RequestPlanSummary& candidate_plan =
+                    candidate->lane_plans[candidate_lane->lane]->summary();
+
+                BackfillClass backfill = BackfillClass::None;
+                if (persistent_backfill_is_safe(*protection_, active.span(),
+                                                candidate_plan.admission, admission_capacity_)) {
+                    backfill = BackfillClass::Persistent;
+                } else if (candidate_plan.service_work_quanta <= frontier_distance &&
+                           candidate_plan.service_work_quanta <= protection_->temporal_credit) {
+                    backfill = BackfillClass::Temporal;
+                }
+                if (backfill != BackfillClass::None) {
+                    return admit_planned_request(candidate, *candidate_lane, backfill,
+                                                 protection_->epoch_id);
+                }
+            }
+            return control_progress ? AdmissionProgress::ControlProgress : AdmissionProgress::None;
+        }
     }
 
     void run_decode_round(const RoundMembership& membership) {
@@ -805,6 +1044,7 @@ private:
                 request->generated.insert(request->generated.end(), row_tokens.begin(),
                                           row_tokens.end());
                 request->budget->commit(accepted[row]);
+                consume_service_work(request, accepted[row]);
             }
             auto published = request->output.commit_preview();
             if (!request->first_token && accepted[row] != 0) {
@@ -836,7 +1076,7 @@ private:
             instance_.request_memory.deactivate();
             prefill_lane_.reset();
         }
-        invalidate_admission_plans();
+        protection_.reset();
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) {
                 instance_.program->abort_lane(lane);
@@ -915,18 +1155,20 @@ private:
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
+    const AdmissionResources admission_capacity_;
 
     mutable std::mutex execution_mutex_;
     mutable std::mutex queue_mutex_;
     mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;
     std::deque<std::shared_ptr<Request>> pending_;
-    std::size_t outstanding_ = 0;
+    std::size_t outstanding_       = 0;
+    std::uint64_t next_request_id_ = 1;
     std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
     std::optional<std::uint32_t> prefill_lane_;
-    std::shared_ptr<Request> planned_request_;
-    std::optional<BasePlan> admission_base_plan_;
-    std::array<std::optional<Plan>, kMaximumConcurrency> admission_plans_{};
+    std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions_{};
+    std::optional<AdmissionProtection> protection_;
+    std::uint64_t next_protection_epoch_ = 1;
     RuntimeStats cumulative_stats_;
     RuntimeStats published_stats_;
     bool stopping_ = false;

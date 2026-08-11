@@ -92,6 +92,12 @@ template <>
 RequestBasePlan<Variant>::~RequestBasePlan() = default;
 
 template <>
+const runtime::RequestPlanSummary& RequestBasePlan<Variant>::summary() const noexcept {
+    static const runtime::RequestPlanSummary empty;
+    return impl_ != nullptr ? impl_->summary : empty;
+}
+
+template <>
 RequestPlan<Variant>::RequestPlan(std::unique_ptr<detail::RequestPlanImpl<Variant>> impl) noexcept
     : impl_(std::move(impl)) {}
 
@@ -138,6 +144,11 @@ template <>
 bool Program<Variant>::can_admit_lane_after_retained_eviction(
     std::uint32_t lane, const RequestPlan<Variant>& plan) const noexcept {
     return impl_->can_admit_lane_after_retained_eviction(lane, plan);
+}
+
+template <>
+runtime::AdmissionResources Program<Variant>::admission_capacity() const noexcept {
+    return impl_->admission_capacity();
 }
 
 template <>

@@ -110,6 +110,17 @@ Owning result 的总上界来自“有限 request 数 × 每请求有限输出�
 Sampling、RNG、stop conditions、generation limit、usage 和 output state 属于 request。它们不得依赖
 request 当前位于哪个 slot 或 compact batch row，也不得影响同一 batch 的其他 requests。
 
+### 2.9 Protected, resource-aware admission
+
+Prepared request order 是 admission 的公平基线，但暂时无法取得完整资源承诺的 FIFO head 不得无条件
+封锁后续所有请求。Scheduler 可以用后续 request 回填当前未承诺的 lane/KV capacity，但必须先为最老的
+blocked head 建立唯一 protection epoch；later admission 不能破坏该 head 在 frozen incumbent releases 后的
+逐 pool 资源可行性，也不能通过持续 ingress 无限延长 temporal borrowing。
+
+Backfill 只改变 waiting request 的 admission order。它不取得 active request 已承诺但尚未 materialize 的
+资源，不产生 partial admission，不抢占已经 admitted 的 request，也不建立第二套 decode priority。所有
+backfilled decode-ready requests 仍进入同一个 maximal compact batch。
+
 ---
 
 ## 3. Overall architecture
@@ -119,7 +130,8 @@ request 当前位于哪个 slot 或 compact batch row，也不得影响同一 ba
                   │
                   ▼
 ┌──────────────── Server Frontend ─────────────────────┐
-│ validate · bounded CPU preparation · pending FIFO    │
+│ validate · bounded CPU preparation · ordered pending │
+│ queue · protected-head resource backfill             │
 │ finite count/per-request bytes/deadline · responses  │
 └───────────────────┬──────────────────────────────────┘
                     │ admission at a boundary
@@ -159,7 +171,7 @@ request 当前位于哪个 slot 或 compact batch row，也不得影响同一 ba
 | Server Frontend | 请求校验、有界 CPU preparation/pending work、取消输入和响应 I/O |
 | GPU Executor | admission、boundary processing、状态提交和全部 GPU submission |
 | Slot Table | 保存 admitted requests 的稳定控制状态 |
-| Scheduler | 在 boundary 选择下一 `PrefillChunk` 或完整 active `DecodeRound` |
+| Scheduler | 在 boundary 执行 protected-head admission，并选择下一 `PrefillChunk` 或完整 active `DecodeRound` |
 | Target Batch Assembler | 把 round membership 转成 target 所需的 typed controls 和 state selectors |
 | Model Runtime | 持有唯一 resident model、共享 execution memory 和 graph assets，执行 whole-batch schedule |
 | DecodeBatchFrame | 一份最大容量为 `C` 的地址稳定 round staging；每轮只使用 exact-`B` prefix |
@@ -308,54 +320,268 @@ queue；每请求输入上限与有限 outstanding count 共同约束 host input
 allocator。
 
 CPU preparation 产生 owning、immutable prompt representation。Prepared requests 按 preparation completion
-顺序进入 Engine admission FIFO，因此等待 media permit 的请求不占住 FIFO 队首。Queue timeout 从请求首次
-取得 request lifetime capacity 时开始，因而包含 media acquisition、prompt preparation 和 Engine FIFO
-waiting。
+顺序进入 Engine ordered admission queue，因此等待 media permit 的请求不占住 prepared queue 的首位。
+Queue timeout 从请求首次取得 request lifetime capacity 时开始，因而包含 media acquisition、prompt
+preparation 和 Engine admission waiting。
 
-### 5.2 Admission conditions
+该顺序是公平基线，不是绝对的 head-of-line barrier。只有 §5.3–§5.6 定义的 protected-head backfill 可以
+让 later request 先 admission；CPU preparation completion、prefix reuse 或请求内容本身不产生其他隐式
+priority。
 
-在 GPU boundary，Scheduler 检查 prepared FIFO 队首。只有同时满足以下条件才可 admission：
+### 5.2 Authoritative admission feasibility
 
-1. 存在 free control slot；
-2. request 对 Engine 固定的 model 和 execution mode 合法；
-3. 每类 state pool 都能承诺它的完整资源需求；
-4. 当前没有其他 prefill owner；每次 admission 都启动该 request 的 suffix-prefill 或 exact-hit
-   finalization path；
+Scheduler 不从 token 数或显存字节重新推导请求能否进入。Target/resource layer 为每个 prepared request
+给出已经按各 pool 物理粒度取整的 authoritative entitlement vector。逻辑上至少包含：
 
-Admission 是一次 atomic boundary transaction：prepared FIFO entry、optional retained-state claim、slot/lane
-和 fixed/growing state entitlement 要么全部取得并发布 admitted request，要么不改变任何 request-visible
-ownership。不允许请求带着部分 reservation 回到 queue。Owning request/result capacity 已在 ingress 时取得，
-不是第二种 admission resource。
+```text
+E(request) = {
+    active lane:                  1,
+    Main Text page groups:       E_main,
+    selected-backend page groups: E_backend,
+    other request-time units:    target-defined, if any
+}
+```
 
-Prepared requests 之间使用 strict FIFO。暂时受阻的队首不能被绕过。Retained checkpoint reuse 可以减少
-suffix prefill；current-frontier exact hit 可以跳过 suffix token processing，但二者都不能绕过更早的 FIFO
-entry 或现有 prefill owner。
+各维只能与同类容量逐维比较；Main/backend pages 不能按字节相加或互借，allocation 尾页 slack 也不是可用
+capacity。当前 fixed recurrent/backend backing 已按 `C` 份建立并随 physical lane 转移 ownership，因此由
+`active lane` 这一维表达，不把固定 backing 的显存字节再次计入动态 entitlement。Graph、workspace、round
+frame 和权重是 engine-fixed resources；owning result capacity 已在 ingress 时取得，也不属于本向量。
+
+一个 candidate 只有同时满足以下条件才具有当前 admission feasibility：
+
+1. 存在可用 control lane；
+2. request 对固定 model、frontend 和 selected execution backend 合法；
+3. active-priority retained eviction 后，每个 entitlement dimension 都能承诺 request 的完整生命周期需求；
+4. 当前没有其他 prefill owner；admission 会立即建立该 request 的 suffix-prefill 或 exact-hit finalization
+   ownership。
+
+Selected backend 的差异只体现在 target 给出的 typed entitlement；Scheduler 不为 ordinary、MTP 或 DFlash
+建立不同 queue policy。即使 startup sizing 保证 backend 不会早于 Main pool 成为正常 backpressure，
+admission 仍消费完整 authoritative vector，backend 提前失败属于 sizing/accounting invariant violation。
+
+Admission 是一次 atomic boundary transaction：prepared entry、optional retained-state claim、slot/lane 和
+全部 fixed/growing state entitlement 要么同时取得并发布 admitted request，要么不改变 request-visible
+ownership。Feasibility probe 和 protected-head shadow accounting 不分配 page、不 pin retained entry，也不
+给予 queued request 部分 ownership；最终仍由同一次 authoritative transaction 复核并提交。
+
+Request 必须先通过 exclusive feasibility：驱逐所有可驱逐 retained state、没有其他 active request 时，
+它能够独占 Engine admission。不能独占容纳的 request 永久拒绝，不能成为 protected head；如果没有 active
+request 而队首仍无法进入，则只能是 permanent rejection 或 resource-accounting failure，不能 idle 等待。
+
+### 5.3 Ordered queue and protected head
+
+每个 admission opportunity 先检查最老 prepared entry：
+
+```text
+oldest head is feasible now
+    -> admit head
+
+oldest head is permanently infeasible / cancelled / expired
+    -> remove it, then reconsider the new oldest entry
+
+oldest head is exclusively feasible but blocked by active lane/entitlement
+    -> protect this head and consider qualified backfill
+```
+
+若 head 的完整 lane/entitlement 已经可行、只因现有 one-prefill-owner 不能 admission，它保持 ordinary
+head waiting，不建立 protection epoch，也不扫描 later candidates；prefill owner 清除后的下一个合法
+admission turn 先重试该 head。Protection 只在没有 prefill owner、head 确实需要现有 active request 释放
+lane 或 entitlement 时建立，因此 frozen donor set 非空。
+
+同一时刻只保护一个最老 head。Protection 绑定稳定的 request generation identity，不绑定可回收的 lane、
+slot index 或 compact batch row。它只是一份 Scheduler shadow state，不为 waiting request 预占真实 pages、
+lane 或 retained continuation。
+
+Protection lifecycle 为：
+
+```text
+UNPROTECTED
+    │ oldest head is transiently blocked at an admission boundary
+    ▼
+PROTECTED_OPEN
+    │ protected resource opportunity has matured,
+    │ but head is still blocked by a temporal borrower/prefill owner
+    ▼
+PROTECTED_DRAIN
+```
+
+`PROTECTED_OPEN` 允许 §5.5 定义的 backfill。`PROTECTED_DRAIN` 禁止所有 later/backfill admission，只推进
+已经 admitted 的 bounded prefill/decode work，并在每个合法 admission turn 继续 first-retry protected head。
+Head 成功 admission、cancellation、queue timeout 或 permanent rejection 清除当前 protection；下一最老
+request 之后可以建立自己的 epoch，但不会继承旧 frontier、work credit 或 shadow ledger。多个 waiting
+大请求不建立嵌套 reservations。
+
+Queue deadline 在 protection 或被越过时不重置。Backfill 只保证正常 Engine progress 下不会因持续 later
+ingress 产生无限饥饿，不承诺 protected request 一定早于其 configured queue timeout admission。
+
+### 5.4 Frozen release frontier and persistent-safe backfill
+
+Protection 建立时，令：
+
+- `K` 为逐维 usable capacity；
+- `H` 为 protected head；
+- `A` 为此刻已经 admitted 的 frozen incumbent identities；
+- `D` 为 `A` 中预计最早完成、且其释放足以让 `H` admission 的最小有序前缀。
+
+Scheduler 按 §5.5 的 remaining-service projection 排列 `A`，逐个加入 donor，直到以下关系逐维成立：
+
+```text
+sum(E(a), a in A without D) + E(H) <= K
+```
+
+`D` 定义的是一组 incumbent completion/release events，不是对外承诺的 wall-clock ETA。它一经建立只能因
+incumbent 提前 completion/cancellation 而缩短；later admitted backfill 永远不能成为 donor，也不能把
+frontier 换成更晚的 active request。任何其他 incumbent 的提前释放如果已经让 `H` 可行，Scheduler 可以
+早于 frozen frontier admission `H`。
+
+设 `P` 为当前仍 active、被分类为 persistent-safe 的 backfill requests。它们必须始终满足累计 shadow
+invariant：
+
+```text
+sum(E(a), a in surviving members of A without D)
++ sum(E(p), p in P)
++ E(H)
+<= K
+```
+
+一个 candidate 只有同时 `fits-now` 且加入后仍满足该逐维关系，才能成为 persistent-safe backfill。必须
+累计核算所有仍存活的 `P`；不能让多个 candidate 分别与同一份初始 surplus 比较。Persistent-safe request
+完成后从 ledger 移除，其 surplus 可以被另一个 qualified request 使用；但任何 resource-release boundary
+若同时是 admission turn，都必须先重试 `H`，再考虑复用 surplus；否则只记录 release/maturity，并在下一
+合法 turn 先重试 `H`。
+
+这一 invariant 保证：即使所有 `P` 在 donor frontier 到达时仍然 active，`H` 也不会因它们失去所需 lane、
+Main pages 或 backend pages。它不保证 `H` 的 wall time 不受影响；backfill 的 bounded prefill 和更大的
+decode batch 仍会改变 incumbent round latency。
+
+Retained state 在 protection accounting 中是可驱逐 cache，而不是 queued ownership。`E(H)` 使用 cold
+admission 的完整 entitlement；不为 `H` pin matching lane/checkpoint。Incumbent 或 backfill completion 后
+产生的 retained state，在 active admission 需要时必须于同一 boundary 按 active-priority 语义驱逐，因此
+可以把其完整 active entitlement 视为可释放。不可驱逐的 engine-fixed occupancy 属于 `K` 之外的 baseline，
+不能伪装成 donor release。
+
+### 5.5 Service projection and bounded temporal borrowing
+
+总 entitlement 决定资源可行性，但不能单独代表 residence time。Scheduler 使用一份有限、单调、以统一
+正整数 scheduling-work quanta 表示的 service projection 来识别相对短的 work：
+
+```text
+service work = known Text/Vision suffix-prefill and finalization work
+             + effective remaining output reservation expressed as decode work
+```
+
+Output 部分使用声明的 finite effective output bound，不预测 prompt 内容、reasoning difficulty 或实际 EOS。
+Prefill 部分使用已经 bounded 的 target scheduling-unit profiles；短 output 不能抵消任意长的 Text/Vision
+prefill。当前 Qwen3.6 profile 以 externally scheduled prefill/finalization steps 的有限上界作为 prefill
+quanta，并把每个 effective remaining output token 计为一个 decode quantum；prompt snapshot 和 Vision item
+造成的已知 prefill split 在 planning 时计入。Selected speculative backend 可以影响 target 的统一 work
+projection，但不会在 Scheduler 中产生 MTP/DFlash policy branches。
+
+Projection 只服务以下两件事：选择 frozen incumbent donor order，以及约束 temporal borrowing。它不是
+completion ETA、内存安全依据或公平性证明。Active request 可以下一轮提前 EOS，speculative acceptance 和
+batch round latency也会变化；估计错误必须由 protection state 收口，而不是假定预测准确。
+
+令 `W_frontier` 为 epoch 建立时、frozen donors 并行持续推进到 required release event 的 projected
+remaining service distance。Protection 以它初始化一份正数、有限且不补充的 temporal credit：
+
+```text
+credit_initial = W_frontier
+credit_after_admission = credit_before_admission - service_work(candidate)
+```
+
+所有可 admission request 的 service work 至少为一个 quantum；即使 exact retained hit 没有 suffix token，
+仍有 finalization work。Credit 也使用相同离散单位，因此每次 temporal admission 至少扣除一个 unit，不存在
+无限递减但永不耗尽的序列。Candidate 若不能满足 persistent-safe invariant，但当前完整 entitlement 能够
+`fits-now`，只有同时满足以下条件才能临时借用 `H` 在 frontier 后需要的 critical capacity：
+
+1. candidate 的完整 service work 不超过当前 projected remaining distance，预计在 frozen frontier 前完成；
+2. 该 service work 不超过 remaining temporal credit；
+3. admission 后从 credit 中扣除 candidate 的完整 work，request 提前完成也不返还；
+4. protected opportunity 成熟后立即停止 temporal admission。
+
+这类 request 称为 temporal backfill；其完整 active footprint 仍进入当前 authoritative resource accounting，
+但不进入 persistent-safe ledger，因为 policy 预计它会在 frontier 前释放。Work credit 防止一个 32K 长
+request 与一个 2K 短 request 被当作相同的一次 bypass，也限制一个 epoch 内后来请求能够借入的累计服务
+工作。Credit 只减不增；new arrival 不能扩展 epoch。
+
+Scheduler 对 bounded pending snapshot 按 prepared order 扫描，选择最老的 qualified candidate。Qualification
+可能把较早但不安全/不够短的 entry 跳过，但不对整个 queue 永久执行 SJF、best-fit 或 knapsack。若所有
+request 都声明相同的巨大 default output bound，Scheduler 没有可靠证据判断实际难度；此时 temporal
+qualification 会自然保守，仍可使用可证明的 persistent-safe backfill，不能根据 prompt 内容猜测。
+
+### 5.6 Admission boundary and progress rules
+
+只有满足以下条件的 boundary 才是 admission turn：
+
+```text
+no prefill owner
+and (no decode-ready request or the completed GPU unit was a DecodeRound)
+```
+
+其他 boundary 可以处理 completion、cancellation、timeout 和 protection bookkeeping，但不能 commit head
+或 backfill admission。这个 gate 保证已有 decode-ready donors 在两次 admission 之间至少完成一次 progress
+round；final prefill/finalization 结束后不能立即连续 admission 另一个 request。
+
+一次 admission turn 最多成功 admission 一个 request。Cancellation、timeout 和 permanent-invalid entry 的
+清理不算 admission；Scheduler 可以在同一 frozen pending snapshot 中继续寻找新的 head/candidate，但同一
+资源状态下失败的 candidate 不在该 boundary 反复尝试。
+
+每次 admission opportunity 的顺序固定为：
+
+```text
+1. resolve completed GPU unit
+2. finish/cancel active requests and release-or-retain their state
+3. remove visible pending cancellation, timeout and permanent failures
+4. if this is an admission turn, retry the protected head or the oldest FIFO head
+5. on the same turn, if an open protected head remains blocked,
+   admit at most one qualified backfill
+6. choose and launch one next GPU unit
+```
+
+若 exact current accounting 已让 protected head 可行，它总是先于 later request admission。若 frozen donors
+已经释放，或当前非-temporal shadow resources 已足以容纳 `H`，但 `H` 仍被 temporal borrower 或现有
+prefill owner 阻塞，protection 立即进入 `PROTECTED_DRAIN`。Drain 不抢占 borrower；它禁止 later/backfill
+admission，但 protected head 仍在每个合法 turn 优先重试。Persistent-safe borrower 尚在 prefill 时也可能
+短暂阻止 head admission，但 one-prefill-owner work 有限且此期间不能再接纳其他请求。
+
+Frontier member completion/cancellation 只在其 state 于 boundary 真正释放后计为 release。该 boundary 若是
+admission turn 就立即 head-first retry；否则更新 maturity，并在下一合法 turn 先重试。Active request 的
+used/reserved 转换不改变其 entitlement；尚未 materialize 的 future reservation 不是 tail surplus。
+Backfill completion retention 也不能覆盖 head-first active-priority eviction。
+
+Protection 不改变 GPU progress policy：
+
+- 两次成功的 backfill admissions 之间，每个仍存活 frozen donor 至少参加一次 maximal `DecodeRound`；
+- 每个非 terminal row 的成功 decode/speculative round 至少 commit 一个 output token，否则直接 terminal；
+- 每个 `PrefillChunk` 推进正数的有限 prompt work，或完成 finalization；
+- 每个 request 有 finite output bound，每个 GPU unit 有 bounded execution extent。
+
+因此 frozen donors 在有限 rounds 内 release。Frontier 前能发生的 temporal admissions 也有限；frontier
+成熟后的 miss 进入 drain，已经 admitted 的 borrowers 最终 completion/cancellation 后释放资源。持续 ingress
+不能把 donor frontier 向后滚动，也不能形成资源 deadlock。该保证是 eventual progress，不是零 wall-time
+interference 或 admission ETA。
+
+### 5.7 Waiting outcomes and sustained ingress
 
 Admission 结果分为：
 
 | 条件 | 结果 |
 |---|---|
 | request 非法或超过 semantic limit | 永久拒绝 |
-| 即使没有其他 active request 也无法容纳 | 对当前 Engine configuration 拒绝 |
-| request lifetime capacity 已满 | 以 overload 拒绝 |
-| 独占时可容纳，但当前 slot 或资源不可用 | 保持 FIFO 等待 |
+| active-priority eviction 后独占也无法容纳 | 对当前 Engine configuration 拒绝 |
+| request lifetime capacity 已满 | ingress 以 overload 拒绝 |
+| 独占可容纳，但当前 slot/resource/prefill owner 不允许 admission | protected waiting 或 ordinary waiting |
+| qualified later request 使用当前可用 backfill opportunity | 先于 blocked head admission |
 | admission 前 queue timeout 到期 | 以 queue-timeout 结束 |
 | Engine 正在停止或不可用 | 以 unavailable 拒绝 |
 
 只有 admitted request 获得 GPU completion commitment。Queued request 只有 bounded waiting commitment，
-没有 execution commitment。
+没有 execution commitment或 admission ETA。它等待到 boundary admission、cancellation/disconnect、queue
+timeout 或 Engine shutdown/failure 中最先发生的事件。
 
-### 5.3 Waiting duration and sustained ingress
-
-NInfer 不承诺 admission ETA。Queued request 等待到以下任一事件最先发生：
-
-- 在 GPU boundary 成功 admission；
-- cancellation 或 client disconnect；
-- configured queue timeout；
-- Engine shutdown 或 failure。
-
-在 sustained ingress 下，有限 queue 填满后立即拒绝后续请求。已经 queued 或 admitted 的请求保持
-FIFO position 和 resource commitment；later arrival 不能增加它们的 GPU workload 或 memory reservation。
+在 sustained ingress 下，有限 queue 填满后立即拒绝后续请求。Later arrival 可以在 open protection epoch
+内通过同一 persistent-safe/temporal qualification backfill，但不能改变 protected identity、增加 temporal
+credit、成为当前 frontier donor，或增加任何 admitted request 的 workload/resource commitment。
 
 ---
 
@@ -389,6 +615,10 @@ prompt_tokens + effective_output_tokens - 1
 它按 page size 向上取整。DFlash Full backend 使用相同 entitlement；MTP backend 还覆盖最多 `K-1` 个
 provisional leading positions，并受单序列 `max_context` 截断。Prefix reuse 只改变已经 materialized 的部分和
 prefill work，不降低新 request 最终可达到的 entitlement。
+
+这些 target facts 经各 pool 的 page geometry 取整后形成 §5.2 的 authoritative admission vector。同一向量
+用于 actual reservation、protected frontier 和 persistent-safe shadow ledger；Scheduler 不维护第二套 token
+或 byte 估算公式。
 
 每一类 shared state resource 都必须始终满足：
 
@@ -480,7 +710,9 @@ reservation。Active admission 优先；cache occupancy 阻塞原本可行的 re
 retained entries。Planner 不复制或迁移 retained physical state，而是在 free lanes 中选择最大合法 reuse。
 只有在 slot/lane 和完整 entitlement 都已满足后才能 claim cache ownership。
 
-Prefix lookup 只改变 uncached prompt work 和 memory requirement，不改变 scheduling 或 batch formation。
+Prefix lookup 只改变 uncached prompt work 和 prospective reuse plan，不自行授予 queue priority。它可以保守地
+缩短 §5.5 的 service projection，但仍须通过相同 protected-head qualification；无论是否命中，最终 active
+request 都进入相同 prefill/decode schedule 和 compact batch formation。
 
 ---
 
@@ -509,12 +741,16 @@ final prefill、cancellation 或 failure 后释放。
 1. snapshot control events visible to this boundary
 2. resolve the completed unit's per-request results
 3. finish/cancel requests and release or retain their state
-4. apply the scheduler's admission opportunity to the FIFO head
-5. choose, prepare and launch one next GPU unit
+4. clean visible pending cancellation/timeout/permanent failures
+5. if this boundary is an admission turn, apply one head-first
+   protected admission/backfill opportunity
+6. choose, prepare and launch one next GPU unit
 ```
 
 boundary 开始后到达的 event 留到下一 boundary。这保证一次 membership update 有限，持续 arrival 不能
-无限延迟下一次 launch。
+无限延迟下一次 launch。Admission turn 的 gate、frozen pending snapshot 和 protection state 由 §5.6 定义；
+不满足 gate 的 boundary 只更新 control/resource state。清理多个无效 entries 不算多个 admissions，但一次
+boundary 最多发布一个新 admitted request。
 
 ### 7.3 Decode/prefill policy
 
@@ -539,11 +775,12 @@ DecodeRound -> PrefillChunk -> DecodeRound -> PrefillChunk -> ...
 
 没有 decode-ready request 时，prefill chunks 连续执行；没有 prefill owner 时，decode rounds 连续执行。
 
-当没有 prefill owner 而 FIFO 非空时，admission 本身占用下一次 prefill/finalization opportunity：GPU idle
-时可以立即 admission；已有 decode-ready rows 时，先完成一个 DecodeRound，再 admission 队首并执行它的
-first prefill/finalization unit。若该 unit 未完成，它成为唯一 prefill owner并进入上述交替；若它完成，request
-在下一 boundary 加入 decode batch。持续 ingress 因此不能在一个 boundary 连续 admission 多个 requests
-并延迟已经 ready 的 decode。
+当没有 prefill owner 而 ordered pending queue 非空时，§5 选中的 head 或 backfill request 占用下一次
+prefill/finalization opportunity：GPU idle 时可以立即 admission；已有 decode-ready rows 时，先完成一个
+DecodeRound，再 admission selected request 并执行它的 first prefill/finalization unit。若该 unit 未完成，
+它成为唯一 prefill owner并进入上述交替；若它完成，request 在下一 boundary 加入 decode batch。持续
+ingress 因此不能在两个 donor progress rounds 之间连续 admission 多个 requests，也不能无限延迟 frozen
+frontier 的 decode progress。
 
 Prefill chunk profile 限制插入两个 decode rounds 之间的 GPU 时间。其具体 token/media extent 是经过
 target 和 hardware qualification 的配置，不属于 scheduler semantic。Vision 和其他 prefill GPU phases
@@ -555,6 +792,8 @@ unbounded prefill work。
 - request 在 final prefill/finalization 完成后加入 active decode set；exact retained hit 只省略 suffix work，
   不绕过现有 prefill owner；
 - newly ready request 首次出现在下一个 boundary 构建的 batch；
+- protected-head policy 只影响 admission；backfill 一旦 decode-ready，不得为了保护 waiting head 而从
+  maximal batch 中排除；
 - EOS、stop 或 generation limit 在 completed round commit 后移除 request；
 - 每次 join/leave 后重新 compact batch rows；
 - empty slot 永不产生 empty row。
@@ -569,6 +808,10 @@ Provisional KV/state writes 随整条 `SequenceState` 一起释放，不需要 r
 rows。
 
 因此 cancellation 最多等待一个 membership 已固定的 GPU unit，再加一次 boundary processing。
+
+Waiting protected head 或 backfill candidate 的 cancellation 在 §7.2 control cleanup 中移除；protected head
+离队会原子清空 epoch，下一最老 entry 不继承 shadow state。Frozen donor 的 cancellation 只有在其 active
+state 真正释放后才缩短 frontier；若该 boundary 不是 admission turn，则在下一合法 turn 先触发 head retry。
 
 ---
 
@@ -1029,8 +1272,66 @@ A、B 可以同时 admission。随着 context 增长，reserved capacity 转换�
 `used + remaining reservation` 始终不超过 128K；可以到达边界，但不能越过边界。
 
 若 B 需要 `32K prompt + 32K output = 64K`，A 的 commitment 之后只剩 48K。B 保持在 pending
-FIFO，直到 A 释放容量或 B 的 queue timeout 到期。NInfer 不会先 admission B，再在接近 128K 时决定
-截断哪个 active request。
+queue 并成为 protected head，直到 A 释放容量、B 的 queue timeout 到期或其他 terminal event。NInfer
+不会先 admission B，再在接近 128K 时决定截断哪个 active request。
+
+若还有 later request C，它只有通过 §5 的完整向量核算后才能 backfill。以 Main capacity 单维说明，A 是
+B 的 frozen donor；A release 后为 B 留出的容量之外仍有 64K shadow surplus。只要 lane/backend 等其他维
+也成立，这给出 C 的 frontier-safe 上界；但 C 还必须满足当前 `fits-now`，此刻真实空闲只有 48K，因此
+C 当前最多取得 48K。即使 C 在 A 完成时仍 active，release boundary 仍先 admission B。若 C 需要借用 B
+的 critical capacity，则还必须满足 temporal work credit，并在 frontier miss 时触发 drain。
+
+### 12.5 Persistent-safe and temporal backfill
+
+以下例子只写 Main entitlement；实际决策同时逐维检查 lane 和 selected-backend pages。假设 capacity 为
+174K、`C>=4`：
+
+```text
+active A: 64K, projected to finish first
+active B: 64K
+free:     46K
+head H:  100K, exclusively feasible but blocked now
+```
+
+选择 `D={A}` 后，frontier accounting 为：
+
+```text
+B 64K + H 100K = 164K
+safe surplus = 10K
+```
+
+一个 8K candidate P 可以成为 persistent-safe backfill：
+
+```text
+B 64K + P 8K + H 100K = 172K <= 174K
+```
+
+即使 P 在 A release 时仍运行，H 也保有完整 entitlement。另一个 20K candidate T 当前可以放入剩余
+capacity，但不能加入 persistent-safe ledger；它只有在完整 prefill/decode service work 预计早于 A 的
+release frontier，且 epoch temporal credit 足够时才能作为 temporal backfill。
+
+```text
+Decode[A,B]
+  -> admit/fill P
+  -> Decode[A,B,P]
+  -> admit/fill T if temporally qualified
+  -> Decode[A,B,P,T] ...
+```
+
+如果 A 提前 EOS 而 T 尚未结束，Scheduler 不把这个估计错误解释为新的 backfill opportunity：
+
+```text
+A releases
+  -> retry H first
+  -> H is still blocked by T
+  -> PROTECTED_DRAIN
+  -> no new admission; existing P/T and B continue
+  -> T releases
+  -> admit H
+```
+
+若 T 已经及时结束，或其他 active request 的提前完成使 exact accounting 足够，H 在对应 boundary 直接
+admission。Later arrivals 从未成为 H 的 donor，也不能恢复已消费的 temporal credit。
 
 ---
 

@@ -375,6 +375,15 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
                        plan.impl_->backend_kv_page_entitlement);
 }
 
+runtime::AdmissionResources ProgramImplCore::admission_capacity() const noexcept {
+    const qwen3_6::PagedKVCache* backend = backend_kv_cache();
+    return runtime::AdmissionResources{
+        .active_lanes     = max_concurrency,
+        .main_kv_pages    = decoder->text_kv.pool().page_group_count(),
+        .backend_kv_pages = backend != nullptr ? backend->pool().page_group_count() : 0U,
+    };
+}
+
 runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lane,
                                                                PreparedPromptData&& prompt,
                                                                RequestPlan&& plan,
