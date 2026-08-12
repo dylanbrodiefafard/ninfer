@@ -40,18 +40,18 @@ At C=8, Qwen3.6-35B-A3B reaches **1,313.8 aggregate decode tok/s**. The 27B NVFP
 
 ### Single-request serving
 
-The single-request corpus was measured on the same GPU with INT8 group-64 KV cache, CUDA Graphs, a
-1,024-token prefill chunk, and a maximum context of 262,144 tokens. Each reported fixture uses five
-fixed seeds after one warm-up. The two registered targets are reported independently and are not
-cross-target comparisons. The two 27B weight profiles are reported separately. Requests were
-submitted serially to a persistent server.
+The single-request corpus was measured on the same GPU with INT8 group-64 KV cache, CUDA Graphs,
+and a 1,024-token prefill chunk. Each reported fixture uses five fixed seeds after server warm-up.
+The two registered targets are reported independently and are not cross-target comparisons. The
+two 27B weight profiles are reported separately. Requests were submitted serially to a persistent
+server.
 
 **Qwen3.6-35B-A3B**
 
 - MTP0 at a 7,680-token prompt: **15,544.3 prefill tok/s** and **271.1 decode tok/s**.
 - MTP0 at a 260,096-token prompt: **5,157.1 prefill tok/s** and **188.2 decode tok/s**.
-- MTP3 long reasoning: **584.0–695.1 decode tok/s** with **72.4–83.3% acceptance**.
-- MTP3 structured output: **714.3 decode tok/s**, **87.7% acceptance**, and **3.63 tokens/round**.
+- MTP3 long reasoning: **620.3–726.2 decode tok/s** with **72.7–82.8% acceptance**.
+- MTP3 structured output: **770.9 decode tok/s**, **89.1% acceptance**, and **3.67 tokens/round**.
 
 **Qwen3.6-27B (`groupwise-int`)**
 
@@ -64,10 +64,10 @@ submitted serially to a persistent server.
 
 - MTP0 at a 7,680-token prompt: **11,191.5 prefill tok/s** and **86.4 decode tok/s**.
 - MTP0 at a 260,096-token prompt: **2,510.6 prefill tok/s** and **59.9 decode tok/s**.
-- MTP3 long reasoning: **201.6–222.7 decode tok/s** with **74.7–80.8% acceptance**.
-- MTP3 structured output: **243.1 decode tok/s**, **90.2% acceptance**, and **3.71 tokens/round**.
+- MTP3 long reasoning: **213.1–231.0 decode tok/s** with **76.3–81.1% acceptance**.
+- MTP3 structured output: **252.2 decode tok/s**, **89.8% acceptance**, and **3.69 tokens/round**.
 - Against groupwise-int on the same corpus and runtime options: **3.48× the 7,680-token prefill
-  throughput**, **1.55× the 260,096-token prefill throughput**, and **25–28% higher MTP3 decode
+  throughput**, **1.55× the 260,096-token prefill throughput**, and **30–32% higher MTP3 decode
   throughput**.
 
 See [Performance](docs/performance.md) for the full methodology, variability, reproduction command,

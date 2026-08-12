@@ -156,10 +156,10 @@ The artifact supports:
 ## Performance
 
 The single-request serving measurements below were collected on an NVIDIA GeForce RTX 5090 with
-CUDA 13.1. Requests were submitted serially to a persistent `ninfer-serve` process with CUDA Graph
-enabled, a 1,024-token prefill chunk, INT8 group-64 KV cache, and prefix reuse disabled. Each
-single-request value is the arithmetic mean ± sample standard deviation over five fixed seeds;
-warm-up requests are excluded.
+CUDA 13.1 compile/runtime. The refreshed MTP3 measurements use CUDA driver API 13.3. Requests were
+submitted serially to a persistent `ninfer-serve` process with CUDA Graph enabled, a 1,024-token
+prefill chunk, INT8 group-64 KV cache, and prefix reuse disabled. Each single-request value is the
+arithmetic mean ± sample standard deviation over five fixed seeds; server warm-up is excluded.
 
 ### Concurrent MTP=3 decode saturation
 
@@ -193,9 +193,9 @@ Thinking was enabled and the output limit was 65,536 tokens.
 
 | AIME 2026 fixture | Completion tokens | Decode tok/s | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|---:|
-| Problem 1 | 7,933.0 ± 1,852.3 | 695.1 ± 17.7 | 83.3% ± 2.8% | 3.50 ± 0.08 |
-| Problem 15 | 65,536.0 ± 0.0 | 584.0 ± 10.6 | 72.4% ± 1.7% | 3.17 ± 0.05 |
-| Problem 30 | 61,743.6 ± 4,489.5 | 629.4 ± 15.7 | 79.6% ± 3.2% | 3.39 ± 0.10 |
+| Problem 1 | 8,223.0 ± 2,224.1 | 726.2 ± 22.9 | 82.8% ± 3.4% | 3.48 ± 0.10 |
+| Problem 15 | 65,536.0 ± 0.0 | 620.3 ± 8.1 | 72.7% ± 1.4% | 3.18 ± 0.04 |
+| Problem 30 | 52,977.8 ± 11,849.6 | 671.9 ± 8.8 | 80.1% ± 2.7% | 3.40 ± 0.08 |
 
 ### MTP=3 cross-scenario decode
 
@@ -204,31 +204,29 @@ disabled and the output limit was 4,096 tokens.
 
 | Category | Decode tok/s | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|
-| Code | 635.0 ± 24.2 | 71.8% ± 4.2% | 3.15 ± 0.13 |
-| Story | 434.9 ± 34.8 | 38.2% ± 5.9% | 2.15 ± 0.18 |
-| Translation | 598.6 ± 26.6 | 66.1% ± 4.5% | 2.98 ± 0.14 |
-| Structured output | 714.3 ± 36.2 | 87.7% ± 6.6% | 3.63 ± 0.20 |
+| Code | 657.6 ± 34.3 | 70.3% ± 5.5% | 3.11 ± 0.16 |
+| Story | 456.2 ± 36.6 | 38.0% ± 6.0% | 2.14 ± 0.18 |
+| Translation | 649.7 ± 33.0 | 67.6% ± 5.1% | 3.03 ± 0.15 |
+| Structured output | 770.9 ± 29.3 | 89.1% ± 4.9% | 3.67 ± 0.15 |
 
 ### DFlash block=8 (`k=7`) decode
 
-These stochastic-sampling measurements use the same fixtures, sampling parameters, output limits,
-and server configuration as MTP3. Different speculative backends consume random values
-differently, so this is a fixed-workload comparison rather than a token-identical output
-comparison.
+These stochastic-sampling measurements use the same fixtures, sampling parameters, and output
+limits as MTP3. Different speculative backends consume random values differently, so this is a
+fixed-workload comparison rather than a token-identical output comparison.
 
 | Workload | Decode tok/s | DFlash acceptance | DFlash tokens/round | Change vs. MTP3 |
 |---|---:|---:|---:|---:|
-| AIME 2026 problem 1 | 764.1 ± 55.6 | 65.2% ± 5.4% | 5.56 ± 0.38 | +9.9% |
-| AIME 2026 problem 15 | 584.0 ± 33.3 | 51.1% ± 3.7% | 4.58 ± 0.26 | 0.0% |
-| AIME 2026 problem 30 | 638.3 ± 15.8 | 56.4% ± 2.5% | 4.95 ± 0.17 | +1.4% |
-| Code | 562.3 ± 36.2 | 43.0% ± 3.7% | 4.01 ± 0.26 | -11.4% |
-| Story | 261.7 ± 51.1 | 12.1% ± 5.3% | 1.85 ± 0.37 | -39.8% |
-| Translation | 490.8 ± 62.6 | 34.8% ± 6.3% | 3.44 ± 0.44 | -18.0% |
-| Structured output | 786.4 ± 124.7 | 66.5% ± 13.5% | 5.66 ± 0.94 | +10.1% |
+| AIME 2026 problem 1 | 764.1 ± 55.6 | 65.2% ± 5.4% | 5.56 ± 0.38 | +5.2% |
+| AIME 2026 problem 15 | 584.0 ± 33.3 | 51.1% ± 3.7% | 4.58 ± 0.26 | -5.9% |
+| AIME 2026 problem 30 | 638.3 ± 15.8 | 56.4% ± 2.5% | 4.95 ± 0.17 | -5.0% |
+| Code | 562.3 ± 36.2 | 43.0% ± 3.7% | 4.01 ± 0.26 | -14.5% |
+| Story | 261.7 ± 51.1 | 12.1% ± 5.3% | 1.85 ± 0.37 | -42.6% |
+| Translation | 490.8 ± 62.6 | 34.8% ± 6.3% | 3.44 ± 0.44 | -24.5% |
+| Structured output | 786.4 ± 124.7 | 66.5% ± 13.5% | 5.66 ± 0.94 | +2.0% |
 
-DFlash throughput is acceptance-sensitive: block=8 leads on the measured long-reasoning and
-structured-output cases with sufficient acceptance, while MTP3 remains faster on the measured
-code, story, and translation categories.
+DFlash throughput is acceptance-sensitive: block=8 leads on AIME problem 1 and structured output,
+while MTP3 remains faster on the other measured long-reasoning and cross-scenario cases.
 
 See the
 [full methodology and results](https://github.com/Neroued/ninfer/blob/master/docs/performance.md),

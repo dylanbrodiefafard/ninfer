@@ -4,10 +4,13 @@ Tested Git revisions:
 
 - Concurrent MTP3 decode saturation for all three artifact profiles:
   `26da9df7c1b3d3c04ea7bbd730271aa01d00742a`;
-- Qwen3.6-35B-A3B MTP3: `b1a220f028aa750f75bceb3522ac00bbaab7e42d`;
+- Refreshed Qwen3.6-35B-A3B and Qwen3.6-27B NVFP4 MTP3:
+  `f4f21cc36bd1a83cbc046f668719d591dc9c1e2e`;
+- Qwen3.6-35B-A3B stored MTP3 response audit:
+  `b1a220f028aa750f75bceb3522ac00bbaab7e42d`;
 - Qwen3.6-35B-A3B DFlash block=8 (`k=7`):
   `0dc94097e8ec5c5bcf59b9e13e9d1852f504eb61`;
-- Qwen3.6-27B NVFP4 accuracy, MTP0, and MTP3:
+- Qwen3.6-27B NVFP4 accuracy and MTP0:
   `b3d4d0f50b868711c62432bbd68e746217a2f49a`;
 - Qwen3.6-27B groupwise-int MTP3: `5ea3242a206cdb0c4c1beaeb9d8a3048e6248423`;
 - Qwen3.6-35B-A3B MTP0 and Qwen3.6-27B groupwise-int MTP0:
@@ -21,8 +24,8 @@ decode-saturation campaign measures the same three artifact profiles at C=1, 2, 
 
 The single-request corpus requests were submitted serially to a persistent `ninfer-serve` process
 over the loopback OpenAI-compatible HTTP endpoint. Each reported corpus fixture used five fixed
-seeds. Values are arithmetic mean ± sample standard deviation; warm-up requests are excluded. The
-concurrent campaign has its own sustained-wave method below.
+seeds. Values are arithmetic mean ± sample standard deviation, and server warm-up completes before
+the measured requests. The concurrent campaign has its own sustained-wave method below.
 
 ## Single-request serving performance method
 
@@ -30,9 +33,9 @@ concurrent campaign has its own sustained-wave method below.
 |---|---|
 | GPU | NVIDIA GeForce RTX 5090, 32 GiB |
 | CUDA compile/runtime | 13.1 / 13.1 |
-| CUDA driver API | 13.1 for the groupwise-int and 35B campaigns; 13.3 for NVFP4 |
+| CUDA driver API | 13.3 for NVFP4 and refreshed 35B MTP3; 13.1 for the remaining single-request campaigns |
 | Request mode | One active request, `stream=false` |
-| Maximum context | 262,144 tokens |
+| Maximum context | 262,144 tokens; 131,072 for refreshed NVFP4 MTP3 |
 | Prefill chunk | 1,024 tokens |
 | KV cache | INT8 group-64 |
 | CUDA Graph | Enabled |
@@ -126,11 +129,12 @@ Build `ninfer-serve` and prepare the registered `.ninfer` artifacts. The refresh
 serving tables use:
 
 ```bash
-python3 tools/bench/run_serve_corpus.py \
+python3 tools/bench/run_serve_concurrency.py \
   --serve build/apps/ninfer-serve \
   --artifact qwen3_6_35b_a3b=out/qwen3_6_35b_a3b.ninfer \
-  --mode mtp3 \
-  --output profiles/bench/serve_corpus_35b_mtp3_20260724
+  --mode mtp3 --suite corpus-makespan --concurrency 1 \
+  --max-context 262144 --kv-capacity auto \
+  --output profiles/bench/concurrent_corpus_35b_mtp3_20260811
 
 python3 tools/bench/run_serve_corpus.py \
   --serve build/apps/ninfer-serve \
@@ -141,8 +145,15 @@ python3 tools/bench/run_serve_corpus.py \
 python3 tools/bench/run_serve_corpus.py \
   --serve build/apps/ninfer-serve \
   --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
-  --mode mtp0 --mode mtp3 --sampling stochastic \
+  --mode mtp0 --sampling stochastic \
   --output profiles/bench/serve_corpus_27b_nvfp4_w8_20260731
+
+python3 tools/bench/run_serve_concurrency.py \
+  --serve build/apps/ninfer-serve \
+  --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
+  --mode mtp3 --suite corpus-makespan --concurrency 1 \
+  --max-context 131072 --kv-capacity auto \
+  --output profiles/bench/concurrent_corpus_27b_nvfp4_mtp3_20260811
 ```
 
 The concurrent decode-saturation campaigns use:
@@ -219,9 +230,9 @@ PYTHONPATH=eval eval/.venv/bin/python -m ninfer_eval run \
 
 | Fixture | Samples | Completion tokens | Decode tok/s | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|---:|---:|
-| `long_decode_aime26_01` | 5 | 7,933.0 ± 1,852.3 | 695.1 ± 17.7 | 83.3% ± 2.8% | 3.50 ± 0.08 |
-| `long_decode_aime26_15` | 5 | 65,536.0 ± 0.0 | 584.0 ± 10.6 | 72.4% ± 1.7% | 3.17 ± 0.05 |
-| `long_decode_aime26_30` | 5 | 61,743.6 ± 4,489.5 | 629.4 ± 15.7 | 79.6% ± 3.2% | 3.39 ± 0.10 |
+| `long_decode_aime26_01` | 5 | 8,223.0 ± 2,224.1 | 726.2 ± 22.9 | 82.8% ± 3.4% | 3.48 ± 0.10 |
+| `long_decode_aime26_15` | 5 | 65,536.0 ± 0.0 | 620.3 ± 8.1 | 72.7% ± 1.4% | 3.18 ± 0.04 |
+| `long_decode_aime26_30` | 5 | 52,977.8 ± 11,849.6 | 671.9 ± 8.8 | 80.1% ± 2.7% | 3.40 ± 0.08 |
 
 ### MTP3 cross-scenario decode
 
@@ -229,16 +240,16 @@ Each category contains three fixtures and five seeds per fixture, for 15 samples
 
 | Category | Samples | Decode tok/s | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|---:|
-| Code | 15 | 635.0 ± 24.2 | 71.8% ± 4.2% | 3.15 ± 0.13 |
-| Story | 15 | 434.9 ± 34.8 | 38.2% ± 5.9% | 2.15 ± 0.18 |
-| Translation | 15 | 598.6 ± 26.6 | 66.1% ± 4.5% | 2.98 ± 0.14 |
-| Structured | 15 | 714.3 ± 36.2 | 87.7% ± 6.6% | 3.63 ± 0.20 |
+| Code | 15 | 657.6 ± 34.3 | 70.3% ± 5.5% | 3.11 ± 0.16 |
+| Story | 15 | 456.2 ± 36.6 | 38.0% ± 6.0% | 2.14 ± 0.18 |
+| Translation | 15 | 649.7 ± 33.0 | 67.6% ± 5.1% | 3.03 ± 0.15 |
+| Structured | 15 | 770.9 ± 29.3 | 89.1% ± 4.9% | 3.67 ± 0.15 |
 
 ### DFlash block=8 (`k=7`), stochastic sampling
 
-The fixtures, five seeds, sampling parameters, output limits, and server configuration are
-identical to MTP3. Different speculative backends consume random values differently, so this is a
-fixed-workload comparison rather than a token-identical paired-output comparison.
+The fixtures, five seeds, sampling parameters, and output limits are identical to MTP3. Different
+speculative backends consume random values differently, so this is a fixed-workload comparison
+rather than a token-identical paired-output comparison.
 
 #### Long-reasoning decode
 
@@ -261,13 +272,13 @@ fixed-workload comparison rather than a token-identical paired-output comparison
 
 | Workload | MTP3 tok/s | DFlash tok/s | DFlash change |
 |---|---:|---:|---:|
-| `long_decode_aime26_01` | 695.1 | 764.1 | +9.9% |
-| `long_decode_aime26_15` | 584.0 | 584.0 | 0.0% |
-| `long_decode_aime26_30` | 629.4 | 638.3 | +1.4% |
-| Code | 635.0 | 562.3 | -11.4% |
-| Story | 434.9 | 261.7 | -39.8% |
-| Translation | 598.6 | 490.8 | -18.0% |
-| Structured | 714.3 | 786.4 | +10.1% |
+| `long_decode_aime26_01` | 726.2 | 764.1 | +5.2% |
+| `long_decode_aime26_15` | 620.3 | 584.0 | -5.9% |
+| `long_decode_aime26_30` | 671.9 | 638.3 | -5.0% |
+| Code | 657.6 | 562.3 | -14.5% |
+| Story | 456.2 | 261.7 | -42.6% |
+| Translation | 649.7 | 490.8 | -24.5% |
+| Structured | 770.9 | 786.4 | +2.0% |
 
 ### DFlash block=8 (`k=7`), greedy sampling
 
@@ -309,7 +320,7 @@ retained to describe what was measured, but is excluded from performance compari
 
 ### Speculative-decode output audit
 
-The audit covers all 225 stored responses from the 35B-A3B MTP3 stochastic-sampler, DFlash
+The audit covers all 225 stored July responses from the 35B-A3B MTP3 stochastic-sampler, DFlash
 stochastic-sampler, and DFlash greedy campaigns. It checks termination, exact repetition, and
 fixture-specific mechanical constraints. AIME 1 was checked algebraically; the AIME 30 answer
 (`393`) was checked by independent enumeration. This audit does not attempt to assign a subjective
@@ -438,9 +449,9 @@ fixed-workload comparison rather than a token-identical output comparison.
 
 | Fixture | Samples | Completion tokens | Decode tok/s | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|---:|---:|
-| `long_decode_aime26_01` | 5 | 11,717.0 ± 476.7 | 222.7 ± 3.4 | 80.8% ± 1.8% | 3.43 ± 0.06 |
-| `long_decode_aime26_15` | 5 | 65,536.0 ± 0.0 | 201.6 ± 2.9 | 74.7% ± 1.5% | 3.24 ± 0.04 |
-| `long_decode_aime26_30` | 5 | 46,439.2 ± 3,719.0 | 216.3 ± 1.5 | 80.8% ± 0.9% | 3.42 ± 0.03 |
+| `long_decode_aime26_01` | 5 | 12,053.4 ± 820.9 | 231.0 ± 3.0 | 80.2% ± 1.2% | 3.41 ± 0.04 |
+| `long_decode_aime26_15` | 5 | 63,109.0 ± 5,426.9 | 213.1 ± 4.2 | 76.3% ± 2.0% | 3.29 ± 0.06 |
+| `long_decode_aime26_30` | 5 | 57,166.4 ± 9,204.9 | 223.3 ± 1.8 | 81.1% ± 1.5% | 3.43 ± 0.04 |
 
 #### MTP3 cross-scenario decode
 
@@ -448,10 +459,10 @@ Each category contains three fixtures and five seeds per fixture, for 15 samples
 
 | Category | Samples | Decode tok/s | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|---:|
-| Code | 15 | 211.7 ± 7.0 | 74.2% ± 3.6% | 3.23 ± 0.11 |
-| Story | 15 | 144.5 ± 10.5 | 40.0% ± 5.4% | 2.20 ± 0.16 |
-| Translation | 15 | 205.2 ± 13.9 | 70.4% ± 7.1% | 3.11 ± 0.21 |
-| Structured | 15 | 243.1 ± 15.3 | 90.2% ± 7.8% | 3.71 ± 0.24 |
+| Code | 15 | 220.3 ± 8.2 | 74.2% ± 4.0% | 3.23 ± 0.12 |
+| Story | 15 | 148.8 ± 11.6 | 39.2% ± 5.7% | 2.18 ± 0.17 |
+| Translation | 15 | 213.6 ± 12.2 | 70.5% ± 6.0% | 3.12 ± 0.18 |
+| Structured | 15 | 252.2 ± 16.3 | 89.8% ± 8.0% | 3.69 ± 0.24 |
 
 The baseline and speculative-decode suites intentionally measure different supported workloads.
 No per-scenario baseline/speculative speedup is reported.

@@ -154,7 +154,7 @@ The single-request serving measurements below were collected on an NVIDIA GeForc
 CUDA 13.1 compile/runtime and CUDA driver API 13.3. Requests were submitted serially to a persistent
 `ninfer-serve` process with CUDA Graph enabled, a 1,024-token prefill chunk, INT8 group-64 KV cache,
 and prefix reuse disabled. Each single-request value is the arithmetic mean ± sample standard
-deviation over five fixed seeds; warm-up requests are excluded.
+deviation over five fixed seeds; server warm-up completes before the measured requests.
 
 ### Concurrent MTP=3 decode saturation
 
@@ -191,9 +191,9 @@ Thinking was enabled and the output limit was 65,536 tokens.
 
 | AIME 2026 fixture | Completion tokens | Decode tok/s | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|---:|
-| Problem 1 | 11,717.0 ± 476.7 | 222.7 ± 3.4 | 80.8% ± 1.8% | 3.43 ± 0.06 |
-| Problem 15 | 65,536.0 ± 0.0 | 201.6 ± 2.9 | 74.7% ± 1.5% | 3.24 ± 0.04 |
-| Problem 30 | 46,439.2 ± 3,719.0 | 216.3 ± 1.5 | 80.8% ± 0.9% | 3.42 ± 0.03 |
+| Problem 1 | 12,053.4 ± 820.9 | 231.0 ± 3.0 | 80.2% ± 1.2% | 3.41 ± 0.04 |
+| Problem 15 | 63,109.0 ± 5,426.9 | 213.1 ± 4.2 | 76.3% ± 2.0% | 3.29 ± 0.06 |
+| Problem 30 | 57,166.4 ± 9,204.9 | 223.3 ± 1.8 | 81.1% ± 1.5% | 3.43 ± 0.04 |
 
 ### MTP=3 cross-scenario decode
 
@@ -202,10 +202,10 @@ disabled and the output limit was 4,096 tokens.
 
 | Category | Decode tok/s | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|
-| Code | 211.7 ± 7.0 | 74.2% ± 3.6% | 3.23 ± 0.11 |
-| Story | 144.5 ± 10.5 | 40.0% ± 5.4% | 2.20 ± 0.16 |
-| Translation | 205.2 ± 13.9 | 70.4% ± 7.1% | 3.11 ± 0.21 |
-| Structured output | 243.1 ± 15.3 | 90.2% ± 7.8% | 3.71 ± 0.24 |
+| Code | 220.3 ± 8.2 | 74.2% ± 4.0% | 3.23 ± 0.12 |
+| Story | 148.8 ± 11.6 | 39.2% ± 5.7% | 2.18 ± 0.17 |
+| Translation | 213.6 ± 12.2 | 70.5% ± 6.0% | 3.12 ± 0.18 |
+| Structured output | 252.2 ± 16.3 | 89.8% ± 8.0% | 3.69 ± 0.24 |
 
 See the
 [full methodology and results](https://github.com/Neroued/ninfer/blob/master/docs/performance.md),
