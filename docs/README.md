@@ -40,6 +40,8 @@ Active implementation and architecture references:
 - [Small-scale concurrent inference architecture](maintainer/concurrent-inference-architecture.md)
 - [Paged KV context storage, ownership, and capacity model](maintainer/paged-kv-cache.md)
 - [Op admission, contracts, ownership, qualification, and performance rules](maintainer/op-development.md)
+- [ReplaySSM GDN technical reference](maintainer/replayssm-gdn.md)
+- [ReplaySSM GDN implementation design](maintainer/replayssm-gdn-implementation.md)
 - [Softmax Attention organization and migration contract](maintainer/softmax-attention.md)
 - [Linear benchmark contract and registered suites](maintainer/linear-benchmark.md)
 - [Qwen3.6-27B artifact contracts, including NVFP4](maintainer/qwen3.6-27b-artifact.md)
