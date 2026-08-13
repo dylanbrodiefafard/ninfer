@@ -18,6 +18,7 @@ add_library(ninfer_core STATIC
   core/arena.cu
   core/device.cu
   core/dtype.cpp
+  core/gdn_replay_records.cpp
   core/cyclic_kv_cache.cpp
   core/paged_kv_cache.cpp
   core/linear_attention_state.cpp
@@ -91,6 +92,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/vision_pos_embed.cu
   # Gated DeltaNet Linear Attention core.
   ops/linear_attention/gated_delta_net/gated_delta_net.cpp
+  ops/linear_attention/gated_delta_net/replay.cpp
   ops/linear_attention/gated_delta_net/recurrent.cu
   ops/linear_attention/gated_delta_net/chunked/launch.cu
   ops/linear_attention/gated_delta_net/chunked/prepare_wy_wu.cu
@@ -124,6 +126,7 @@ add_library(ninfer_ops STATIC
   ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
   ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_conv_snapshot.cu
   ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.cpp
+  ops/gdn_input_proj/gdn_projected_conv.cu
   ops/gdn_input_proj/w8/w8_gdn_input_decode.cu
   ops/gdn_input_proj/w8/w8_gdn_input_gemm_mma.cu
   ops/gdn_input_proj/w8/w8_gdn_input_gemm_splitk.cu

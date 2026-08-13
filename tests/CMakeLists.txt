@@ -70,6 +70,9 @@ ninfer_add_test(ninfer_kv_cache_test
 ninfer_add_test(ninfer_state_store_test
   SOURCES test_state_store.cpp
   LIBRARIES ninfer_core)
+ninfer_add_test(ninfer_gdn_replay_records_test
+  SOURCES test_gdn_replay_records.cpp
+  LIBRARIES ninfer_core)
 set_tests_properties(
   ninfer_artifact_materialization_test
   ninfer_device_test
@@ -228,6 +231,15 @@ ninfer_add_op_test(ninfer_gdn_input_proj_test
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_gdn_input_proj_conv_snapshot_test
   SOURCES ops/test_gdn_input_proj_conv_snapshot.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_gdn_input_proj_conv_record_test
+  SOURCES ops/test_gdn_input_proj_conv_record.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_gated_delta_net_replay_record_test
+  SOURCES ops/test_gated_delta_net_replay_record.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_gdn_replay_fold_test
+  SOURCES ops/test_gdn_replay_fold.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_fused_linear_test(
   ninfer_linear_add_q5_a16_test
