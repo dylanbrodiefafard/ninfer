@@ -266,7 +266,7 @@ lane 的 backing 中，但不再存在 active request control，也不计入 act
 
 - Main/backend KV allocations 及 committed frontiers；
 - Linear Attention 和其他 fixed model-state allocation；
-- target decode cursor，包括 current anchor、position/RoPE progress 和 committed state selectors；
+- target decode cursor，包括 current anchor 和 position/RoPE progress；
 - continuation 所需的 hidden/checkpoint state；
 - prefix identity 和 target-defined reusable checkpoints。
 
@@ -275,6 +275,11 @@ workspace 或 graph。当前 fixed-state backing 是 lane-affine 的：retained 
 所有 free lanes 中寻找可复用 continuation，选中后在同一 lane 建立新的 request control；需要 active
 capacity 时可以先驱逐其他 free lanes 上的 retained state。新 request 的 sampling、RNG、stop 和 output
 state 始终重新创建。
+
+Qwen3.6 的 lane 是 Linear Attention state 的唯一 locator。`C=max_concurrency` 时，shared pool 固定使用
+`[0,C)` 作为各 lane 的 current committed state，使用 `[C,2C)` 作为各 lane 的 prefix-boundary
+checkpoint；一份 slot 同时选择全部 GDN layers 的 convolution history 和 recurrent state。Decode round
+不在 `SequenceState` 中维护随 speculative position 变化的 state selector。
 
 ### 4.4 Batch row
 
@@ -825,6 +830,7 @@ Resident Model Runtime 是 model-instance object，不是 request object。它�
 - shared Sequence-State Store；
 - 一份 shared execution workspace；
 - 一份最大容量为 `C` 的 `DecodeBatchFrame`；
+- speculative backend 启用时，一份容量为 `C`、宽度为 `draft_window+1` 的 all-layer ReplaySSM record arena；
 - startup-captured graph definitions 和 topology executables。
 
 每个 request 的持久状态只存在于 slot control 和该 slot 当前拥有的 `SequenceState`。Model Runtime 不保存
@@ -854,11 +860,14 @@ current_tokens[B]
 cache_positions[1,B]
 RoPE positions/deltas[per target contract, B]
 Main KV table rows[B] + optional backend KV table rows[B]
-Linear Attention read/snapshot selectors[B]
-continuation-state destination selectors[B]
+lanes[B]
 SamplingConfig[B] + logical sampling positions[B]
 sampled_tokens[B]
 ```
+
+`lanes[b]` 是 row `b` 的 stable execution lane。Qwen3.6 用它同时选择 Linear Attention current state 和
+continuation-hidden destination；speculative Fold 也从 frozen membership 取得同一个 lane。KV table row
+保持独立，因为它描述 paged allocation binding，不是 fixed-state ownership。
 
 Hidden activations、mixer intermediates 和 logits 使用同一 shared frame/workspace 中的 exact-`B` views。
 `DecodeBatchFrame` 是 runtime 对这些 typed regions 的逻辑集合，不是传给所有 Ops 的通用 descriptor ABI；
@@ -871,7 +880,7 @@ Batch assembly 对不同数据采用不同处理：
 |---|---|
 | token、position、sampling config 等小型 controls | 按 compact row 写入连续 batch ingress |
 | KV payload 和 block tables | 保留在 shared paged pool，只写 per-row table-row selector |
-| Linear Attention / backend fixed state | 保留在 shared state pool，只写 target-defined slot/unit selector |
+| Linear Attention / backend fixed state | 保留在 shared state pool，以 stable lane 或 backend-defined row 定位 |
 | request stop、output 和 external identity | 只保留在 host slot，不进入 model graph |
 | activations、hidden、logits | 由一次 whole-batch schedule 在 shared execution memory 中产生 |
 
@@ -938,6 +947,10 @@ Ordinary round 对每个未取消 row 恰好 license 一个 token。EOS、stop �
 成为 terminal token，但不把同一 row 的 model state 与 output 截在不同 frontier。Cancellation 是唯一可以
 丢弃整行 provisional result 的 ordinary boundary outcome；该 `SequenceState` 随即释放。
 
+Qwen3.6 ordinary GDN 以 `initial_state_slots=lanes`、`snapshot_base_slots=lanes` 调用已有 width-1 Snapshot
+leaf。该 leaf 在完整读取 row 的 initial checkpoint 后原地覆盖同一 current slot，因此不产生 speculative
+trajectory，也不需要额外 state slot。
+
 ### 8.5 Whole-model execution
 
 logical batch size 为 `B` 时，一次 replay 的 model schedule 为：
@@ -993,6 +1006,12 @@ row result
 对每行而言，model-state frontier、target cursor、sampler/penalty progress、usage 和 owning output record 是
 一次逻辑 transaction。Output event 只有在这些 state 全部 commit 后才能对 response path 可见。一行结束、
 取消或在 speculative mode 中接受较短 prefix，不改变其他行的 commit result。
+
+Speculative backend 的 target GDN 使用 ReplaySSM 时，GPU graph 只读 lane 的 current state 并写
+Program-owned raw records，不推进 committed GDN state。CPU output preview 得到每行最终提交长度后，
+`resolve_pending_batch` 先用原始 `B` 行执行一次 all-layer Fold，再完成必要的 hidden/backend correction，
+同步成功后才推进 host frontiers。取消行以 `commit_columns=0` 参与原始 row mapping，Fold 对该行严格
+no-op。Executor 只能在这个 commit tail 成功后提交 output preview 和发布 output event。
 
 全部 rows resolve 后，`RoundMembership` 销毁，frame 可以被下一 unit 覆盖。继续运行的 slots 在下一
 boundary 重新 compact；没有任何 row identity 从当前 frame 继承到下一 frame。
@@ -1156,6 +1175,18 @@ Engine capability 在 startup 时固定。MTP Engine 可以同时启用 Vision�
 verification、重放 model 或形成 acceptance cohort。Target model 始终是 output authority，只有 accepted
 target/backend state 可以 commit。
 
+Qwen3.6 的 MTP 与 DFlash 共用同一 target ReplaySSM transaction：target verify 按 compact row 把每层
+convolution/key/value/gate records 写入固定 arena，physical record row 恒等于本轮 batch row；CPU 得到
+最终 output prefix 后，一次 Fold 用 frozen `lanes[b]` 把 row `b` 提交到该 lane 的 current state。Rows
+不得因取消或不同 acceptance length 被压缩、重排。Record 位于 CUDA Graph 内，Fold 位于 CPU 决策后的
+eager commit tail；下一 GPU unit 必须等当前 records 被 Fold 消费后才能覆盖 arena。
+
+Target execution 完成到 Fold 结束期间，请求处于 Pending：authoritative execution/ledger frontiers、ledger
+内容和 prefix identity 仍停在 round base；licensed tokens 和 backend staging 只作为未发布候选存在。Fold、
+Text/backend KV trim、continuation hidden、proposal continuation 和 host frontier 必须提交同一个最终前缀。
+Continuing row 提交全部 licensed outputs；terminal row 可因 stop/EOS/output limit 提交严格前缀；取消行
+提交零列并释放 sequence。
+
 每行的 valid proposal extent 受 remaining output/context capacity 限制。Fixed proposal window 中未使用
 的位置被 mask，不能更新 request state 或 output。
 
@@ -1228,7 +1259,7 @@ B 不执行单独的 decode forward，而是在 final prefill 后加入 A 的下
 current token               101              202
 cache position               41              900
 Text KV table row             5                1
-Linear state unit            12               28
+stable lane                   0                2
 sampling state lane           0                2
 ```
 
@@ -1241,7 +1272,7 @@ sampled_tokens = [303, 404]
 
 Boundary 用 frozen mapping 把 303 交给 A、404 交给 B。若 A 继续而 B 的 404 是 terminal token，则两行都
 先提交各自正确的 model/output frontier，随后 B 的 slot/state 被释放或 retained。下一轮重新组批为 A 的
-`B=1` frame；A 的 KV row 和 Linear state unit 不因从 row 0/1 移动而改变。
+`B=1` frame；A 的 KV row 和 stable lane 不因 compact batch row 变化而改变。
 
 ### 12.3 Active batch grows and shrinks
 

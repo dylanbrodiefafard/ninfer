@@ -34,6 +34,7 @@ struct ExecutionCore {
     const LoadedModelData& model;
     WorkspaceArena& work;
     LinearAttentionStatePool& linear_attention;
+    const GdnReplayRecords* replay_records;
     qwen3_6::RoundState& io;
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
@@ -50,8 +51,8 @@ struct PrefillContext {
     std::uint32_t text_kv_base;
     const ops::SamplingConfig* sampling;
     Tensor* boundary_hidden;
-    std::int32_t linear_state_base                          = 0;
-    std::int32_t linear_state_capacity                      = 0;
+    std::int32_t current_state_slot                         = 0;
+    std::int32_t boundary_state_slot                        = 0;
     std::uint32_t mtp_proposal_extent                       = 0;
     const qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
 };
@@ -108,8 +109,7 @@ struct TargetVerifyFrameView {
     Tensor rope_positions;
     Tensor valid_columns;
     Tensor kv_table_rows;
-    Tensor linear_state_read_slots;
-    Tensor linear_state_snapshot_base_slots;
+    Tensor lanes;
     Tensor target_hidden;
     Tensor target_logits;
     Tensor target_tokens;
@@ -121,16 +121,16 @@ struct TargetVerifyFrameView {
     Tensor licensed_counts;
     Tensor accepted_drafts;
     Tensor selected_hidden;
-    Tensor continuation_lanes;
-    const ops::SamplingConfig* sampling = nullptr;
-    DFlashFeatureSink* feature_sink     = nullptr;
+    const GdnReplayRecords* replay_records = nullptr;
+    const ops::SamplingConfig* sampling    = nullptr;
+    DFlashFeatureSink* feature_sink        = nullptr;
 };
 
 using GraphPrepare = std::function<void()>;
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
-                         const ops::SamplingConfig* sampling, std::int32_t linear_state_base,
-                         std::int32_t linear_state_capacity, std::uint32_t mtp_proposal_extent);
+                         const ops::SamplingConfig* sampling, std::int32_t current_state_slot,
+                         std::int32_t boundary_state_slot, std::uint32_t mtp_proposal_extent);
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
                           ops::GqaExecutionEnvelope envelope);

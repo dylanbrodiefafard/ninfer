@@ -2,6 +2,7 @@
 #include "targets/qwen3_6/impl/runtime/program.h"
 
 #include "targets/qwen3_6/impl/runtime/schedule.h"
+#include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/speculative_round.h"
@@ -211,6 +212,12 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
     decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder);
+    if (plan.persistent.replay_records) {
+        replay_records.emplace(backing, *plan.persistent.replay_records);
+    }
+    if (replay_records.has_value() != (speculative_backend != SpeculativeBackend::None)) {
+        throw std::logic_error("ReplaySSM records do not match the sequence plan");
+    }
     if (plan.persistent.dflash) { dflash.emplace(backing, *plan.persistent.dflash); }
     if (dflash.has_value() != plan.features.dflash()) {
         throw std::logic_error("DFlash state does not match the frozen sequence plan");
@@ -237,16 +244,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     sampling_config       = plan.persistent.sampling_config.bind(backing);
     tail_hidden_store     = plan.persistent.tail_hidden.bind(backing);
     boundary_hidden_store = plan.persistent.boundary_hidden.bind(backing);
-    const std::int32_t linear_slots_per_sequence =
-        LinearStateSlots::required_slot_count(draft_window);
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
-        SequenceState& sequence    = sequences[lane];
-        sequence.lane              = lane;
-        sequence.linear_state_base = static_cast<std::int32_t>(lane) * linear_slots_per_sequence;
-        sequence.linear_state_capacity = linear_slots_per_sequence;
-        sequence.current_linear_state_slot =
-            LinearStateSlots::prefill_working_slot(sequence.linear_state_base);
-        sequence.tail_hidden = tail_hidden_store.slice(1, static_cast<std::int32_t>(lane), 1);
+        SequenceState& sequence = sequences[lane];
+        sequence.lane           = lane;
+        sequence.tail_hidden    = tail_hidden_store.slice(1, static_cast<std::int32_t>(lane), 1);
         sequence.boundary_hidden =
             boundary_hidden_store.slice(1, static_cast<std::int32_t>(lane), 1);
         sequence.ledger.reserve(static_cast<std::size_t>(capacity) + 1ULL);
@@ -285,10 +286,6 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                                    io.dflash_prefill->produced_count.bytes(), device.stream));
     }
     CUDA_CHECK(cudaMemsetAsync(io.rope_delta.data, 0, io.rope_delta.bytes(), device.stream));
-    CUDA_CHECK(cudaMemsetAsync(io.linear_state_read_slot.data, 0, io.linear_state_read_slot.bytes(),
-                               device.stream));
-    CUDA_CHECK(cudaMemsetAsync(io.linear_state_snapshot_base_slot.data, 0,
-                               io.linear_state_snapshot_base_slot.bytes(), device.stream));
     if (io.mtp) {
         CUDA_CHECK(
             cudaMemsetAsync(io.mtp->position.data, 0, io.mtp->position.bytes(), device.stream));
@@ -468,7 +465,6 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                                            request_plan.backend_kv_page_entitlement);
             sequence.text_kv_valid = base;
             sequence.ledger.resize(base);
-            set_device_i32(io.linear_state_read_slot, sequence.current_linear_state_slot);
         } else {
             if (!sequence.kv || sequence.text_kv_valid < base) {
                 throw std::logic_error("resident boundary has no complete KV allocation");
@@ -493,12 +489,9 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
                                            request_plan.backend_kv_page_entitlement);
             decoder->linear_attention.copy_slot(
-                LinearStateSlots::prefix_boundary_slot(sequence.linear_state_base,
-                                                       sequence.linear_state_capacity),
-                LinearStateSlots::prefill_working_slot(sequence.linear_state_base), device.stream);
-            sequence.current_linear_state_slot =
-                LinearStateSlots::prefill_working_slot(sequence.linear_state_base);
-            set_device_i32(io.linear_state_read_slot, sequence.current_linear_state_slot);
+                LinearStateSlots::boundary_state_slot(sequence.lane, max_concurrency),
+                LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                device.stream);
             sequence.ledger.resize(base);
         }
 
@@ -579,10 +572,12 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill_lane(std::uint32_t l
     return advance_prefill(sequences[lane], requests[lane]);
 }
 
-void ProgramImplCore::resolve_pending_lane(std::uint32_t lane, std::uint32_t accepted_tokens,
-                                           bool terminal) {
+void ProgramImplCore::resolve_prefill_lane(std::uint32_t lane, bool terminal) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
-    resolve_pending_impl(sequences[lane], requests[lane], accepted_tokens, terminal);
+    if (requests[lane].pending.kind != PendingKind::Begin) {
+        throw std::logic_error("resolve_prefill_lane requires a pending prefill token");
+    }
+    resolve_non_speculative_pending(sequences[lane], requests[lane], 1, terminal);
 }
 
 void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes,
@@ -594,88 +589,193 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
         throw std::invalid_argument("pending batch resolution has inconsistent membership");
     }
 
+    if (speculative_backend == SpeculativeBackend::None) {
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            const std::uint32_t lane = lanes[row];
+            if (lane >= max_concurrency || requests[lane].lifecycle != Lifecycle::Pending ||
+                requests[lane].pending.kind != PendingKind::Ordinary) {
+                throw std::logic_error("ordinary pending batch no longer matches Program state");
+            }
+            if (cancelled[row]) {
+                clear_lane(sequences[lane], requests[lane]);
+            } else {
+                resolve_non_speculative_pending(sequences[lane], requests[lane],
+                                                accepted_tokens[row], terminal[row] != 0);
+            }
+        }
+        return;
+    }
+
+    if (!replay_records) {
+        throw std::logic_error("speculative pending batch has no ReplaySSM records");
+    }
+
+    std::array<ops::GdnReplayFoldRow, kMaximumConcurrency> fold_rows{};
+    std::array<std::int32_t, kMaximumConcurrency> hidden_selectors{};
     bool needs_hidden_correction = false;
-    std::array<std::int32_t, kMaximumConcurrency> selectors{};
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
-        if (lane >= max_concurrency || requests[lane].lifecycle != Lifecycle::Pending) {
-            throw std::logic_error("pending batch membership no longer matches Program state");
+        if (lane >= max_concurrency || requests[lane].lifecycle != Lifecycle::Pending ||
+            requests[lane].pending.kind != PendingKind::Speculative) {
+            throw std::logic_error("speculative pending batch no longer matches Program state");
         }
         const PendingCandidate& pending = requests[lane].pending;
-        if (((speculative_backend == SpeculativeBackend::Mtp ||
-              speculative_backend == SpeculativeBackend::DFlash) &&
-             pending.kind != PendingKind::Speculative) ||
-            (speculative_backend == SpeculativeBackend::None &&
-             pending.kind != PendingKind::Ordinary)) {
-            throw std::logic_error("pending batch metadata does not match its decode backend");
+        const SequenceState& sequence   = sequences[lane];
+        if (sequence.execution_frontier != pending.base_E ||
+            sequence.ledger_frontier != pending.base_S ||
+            sequence.ledger.size() != pending.base_S ||
+            sequence.prefix_identity.size() != pending.base_S ||
+            sequence.text_kv_valid != pending.base_E ||
+            (speculative_backend == SpeculativeBackend::Mtp &&
+             sequence.mtp_kv_valid != pending.base_E) ||
+            (speculative_backend == SpeculativeBackend::DFlash &&
+             sequence.dflash_context_frontier != pending.base_E)) {
+            throw std::logic_error("speculative pending row is not at its recorded base");
         }
-        if (!cancelled[row] && terminal[row] && accepted_tokens[row] < pending.produced) {
-            if (accepted_tokens[row] == 0) {
-                throw std::logic_error(
-                    "terminal speculative row cannot commit an empty licensed prefix");
-            }
-            selectors[row]          = static_cast<std::int32_t>(accepted_tokens[row] - 1);
-            needs_hidden_correction = true;
-        } else {
-            selectors[row] = static_cast<std::int32_t>(pending.produced - 1U);
+        const std::uint32_t committed = cancelled[row] ? 0U : accepted_tokens[row];
+        if ((cancelled[row] && accepted_tokens[row] != 0) ||
+            (!cancelled[row] && (committed == 0 || committed > pending.produced ||
+                                 (!terminal[row] && committed != pending.produced)))) {
+            throw std::logic_error("speculative pending row has an invalid committed prefix");
         }
+        fold_rows[row] = ops::GdnReplayFoldRow{
+            .linear_state_slot = LinearStateSlots::current_state_slot(lane, max_concurrency),
+            .commit_columns    = static_cast<std::int32_t>(committed),
+        };
+        const bool partial_terminal =
+            !cancelled[row] && terminal[row] && committed < pending.produced;
+        hidden_selectors[row] =
+            static_cast<std::int32_t>(partial_terminal ? committed - 1U : pending.produced - 1U);
+        needs_hidden_correction = needs_hidden_correction || partial_terminal;
     }
 
-    if (needs_hidden_correction) {
-        const auto batch = static_cast<std::int32_t>(lanes.size());
-        Tensor selector_tensor;
-        Tensor hidden;
-        Tensor selected;
-        Tensor destinations;
-        if (speculative_backend == SpeculativeBackend::Mtp && io.mtp_decode) {
-            qwen3_6::MtpDecodeState& frame = *io.mtp_decode;
-            selector_tensor                = frame.current_extents.slice(0, 0, batch);
-            hidden                         = frame.target_hidden.slice(2, 0, batch);
-            selected                       = frame.target_continuation_hidden.slice(1, 0, batch);
-            destinations                   = frame.continuation_slots.slice(0, 0, batch);
-        } else if (speculative_backend == SpeculativeBackend::DFlash && io.dflash_decode) {
-            qwen3_6::DFlashDecodeState& frame = *io.dflash_decode;
-            selector_tensor                   = frame.proposal_extents.slice(0, 0, batch);
-            hidden                            = frame.target_hidden.slice(2, 0, batch);
-            selected                          = frame.target_continuation_hidden.slice(1, 0, batch);
-            destinations                      = frame.lanes.slice(0, 0, batch);
-        } else {
-            throw std::logic_error("partial batch correction has no speculative frame");
+    const auto tail_started = Clock::now();
+    try {
+        ops::gdn_replay_fold(*replay_records, decoder->linear_attention.all_layers_view(),
+                             std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
+                             device.stream);
+
+        if (needs_hidden_correction) {
+            const auto batch = static_cast<std::int32_t>(lanes.size());
+            Tensor selector_tensor;
+            Tensor hidden;
+            Tensor selected;
+            Tensor destinations;
+            if (speculative_backend == SpeculativeBackend::Mtp && io.mtp_decode) {
+                qwen3_6::MtpDecodeState& frame = *io.mtp_decode;
+                selector_tensor                = frame.current_extents.slice(0, 0, batch);
+                hidden                         = frame.target_hidden.slice(2, 0, batch);
+                selected     = frame.target_continuation_hidden.slice(1, 0, batch);
+                destinations = frame.lanes.slice(0, 0, batch);
+            } else if (speculative_backend == SpeculativeBackend::DFlash && io.dflash_decode) {
+                qwen3_6::DFlashDecodeState& frame = *io.dflash_decode;
+                selector_tensor                   = frame.proposal_extents.slice(0, 0, batch);
+                hidden                            = frame.target_hidden.slice(2, 0, batch);
+                selected     = frame.target_continuation_hidden.slice(1, 0, batch);
+                destinations = frame.lanes.slice(0, 0, batch);
+            } else {
+                throw std::logic_error("partial speculative commit has no target frame");
+            }
+            CUDA_CHECK(cudaMemcpyAsync(selector_tensor.data, hidden_selectors.data(),
+                                       lanes.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                                       device.stream));
+            ops::speculative_select_accepted_hidden(hidden, selector_tensor, selected,
+                                                    device.stream);
+            ops::scatter(selected, destinations, tail_hidden_store, device.stream);
         }
-        CUDA_CHECK(cudaMemcpyAsync(selector_tensor.data, selectors.data(), lanes.size_bytes(),
-                                   cudaMemcpyHostToDevice, device.stream));
-        ops::speculative_select_accepted_hidden(hidden, selector_tensor, selected, device.stream);
-        ops::scatter(selected, destinations, tail_hidden_store, device.stream);
+
+        if (speculative_backend == SpeculativeBackend::DFlash) {
+            std::array<std::uint32_t, kMaximumConcurrency> append_lanes{};
+            std::array<std::uint32_t, kMaximumConcurrency> append_starts{};
+            std::array<std::uint32_t, kMaximumConcurrency> append_counts{};
+            std::size_t append_size = 0;
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                if (!cancelled[row] && terminal[row]) {
+                    append_lanes[append_size]  = lanes[row];
+                    append_starts[append_size] = requests[lanes[row]].pending.base_E;
+                    append_counts[append_size] = accepted_tokens[row];
+                    ++append_size;
+                }
+            }
+            if (append_size != 0) {
+                enqueue_dflash_context_append(
+                    std::span<const std::uint32_t>(append_lanes.data(), append_size),
+                    std::span<const std::uint32_t>(append_starts.data(), append_size),
+                    std::span<const std::uint32_t>(append_counts.data(), append_size));
+            }
+        }
+
         device.synchronize();
+        work.reset();
+    } catch (...) {
+        try {
+            device.synchronize();
+        } catch (...) {}
+        work.reset();
+        for (const std::uint32_t lane : lanes) {
+            if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
+        }
+        throw;
     }
 
-    if (speculative_backend == SpeculativeBackend::DFlash) {
-        std::array<std::uint32_t, kMaximumConcurrency> flush_lanes{};
-        std::array<std::uint32_t, kMaximumConcurrency> flush_counts{};
-        std::size_t flush_size = 0;
+    const double tail_seconds = std::chrono::duration<double>(Clock::now() - tail_started).count();
+    const std::uint32_t width = draft_window + 1U;
+    try {
         for (std::size_t row = 0; row < lanes.size(); ++row) {
-            if (!cancelled[row] && terminal[row] &&
-                requests[lanes[row]].pending.kind == PendingKind::Speculative) {
-                flush_lanes[flush_size]  = lanes[row];
-                flush_counts[flush_size] = accepted_tokens[row];
-                ++flush_size;
+            SequenceState& sequence = sequences[lanes[row]];
+            RequestControl& request = requests[lanes[row]];
+            if (cancelled[row]) {
+                clear_lane(sequence, request);
+                continue;
             }
-        }
-        if (flush_size != 0) {
-            flush_dflash_context_batch(
-                std::span<const std::uint32_t>(flush_lanes.data(), flush_size),
-                std::span<const std::uint32_t>(flush_counts.data(), flush_size));
-        }
-    }
 
-    for (std::size_t row = 0; row < lanes.size(); ++row) {
-        SequenceState& sequence = sequences[lanes[row]];
-        RequestControl& request = requests[lanes[row]];
-        if (cancelled[row]) {
-            clear_lane(sequence, request);
-        } else {
-            resolve_pending_impl(sequence, request, accepted_tokens[row], terminal[row] != 0);
+            const PendingCandidate pending = request.pending;
+            const std::uint32_t committed  = accepted_tokens[row];
+            const TokenId* token_base =
+                speculative_backend == SpeculativeBackend::Mtp
+                    ? mtp_host_egress->licensed_tokens.data() + row * width
+                    : dflash_host_egress->licensed_tokens.data() + row * width;
+            sequence.ledger.insert(sequence.ledger.end(), token_base, token_base + committed);
+            sequence.prefix_identity.append_generated(committed, sequence.rope_delta);
+            sequence.execution_frontier = pending.base_E + committed;
+            sequence.ledger_frontier    = pending.base_S + committed;
+            sequence.text_kv_valid      = sequence.execution_frontier;
+            sequence.tail_hidden_valid  = true;
+
+            if (speculative_backend == SpeculativeBackend::Mtp) {
+                sequence.mtp_kv_valid = sequence.execution_frontier;
+                if (terminal[row]) {
+                    sequence.mtp_draft_count = 0;
+                } else {
+                    const std::int32_t next  = mtp_host_egress->next_extents[row];
+                    sequence.mtp_draft_count = static_cast<std::uint32_t>(next);
+                    for (std::uint32_t step = 0; step < sequence.mtp_draft_count; ++step) {
+                        sequence.mtp_drafts[step] =
+                            mtp_host_egress->next_drafts[step * max_concurrency + row];
+                    }
+                }
+            } else {
+                sequence.dflash_context_frontier =
+                    terminal[row] ? sequence.execution_frontier : pending.base_E;
+            }
+
+            trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+            if (terminal[row]) {
+                release_sequence_growth_entitlement(sequence);
+                unbind_sequence_kv(sequence);
+                sequence.retained = true;
+                request.lifecycle = Lifecycle::Complete;
+            } else {
+                request.lifecycle = Lifecycle::Active;
+            }
+            request.pending = {};
+            request.timings.decode_seconds += tail_seconds;
         }
+    } catch (...) {
+        for (const std::uint32_t lane : lanes) {
+            if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
+        }
+        throw;
     }
 }
 
@@ -709,8 +809,6 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.ledger_frontier    = 0;
     sequence.ledger.clear();
     sequence.prefix_identity.clear();
-    sequence.current_linear_state_slot =
-        LinearStateSlots::prefill_working_slot(sequence.linear_state_base);
     sequence.text_kv_valid            = 0;
     sequence.mtp_kv_valid             = 0;
     sequence.dflash_context_frontier  = 0;
@@ -876,18 +974,12 @@ void ProgramImplCore::set_device_i32(Tensor& tensor, std::int32_t value) {
 
 void ProgramImplCore::ordered_reset(SequenceState& sequence) {
     decoder->linear_attention.zero_slot(
-        LinearStateSlots::prefill_working_slot(sequence.linear_state_base), device.stream);
+        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency), device.stream);
     work.reset();
     set_device_i32(io.pos, 0);
     set_device_i32(io.rope_pos, 0);
     set_device_i32(io.rope_delta, 0);
-    set_device_i32(io.linear_state_read_slot,
-                   LinearStateSlots::prefill_working_slot(sequence.linear_state_base));
-    set_device_i32(io.linear_state_snapshot_base_slot,
-                   LinearStateSlots::verify_snapshot_base_slot(sequence.linear_state_base));
     if (io.mtp) { set_device_i32(io.mtp->position, 0); }
-    sequence.current_linear_state_slot =
-        LinearStateSlots::prefill_working_slot(sequence.linear_state_base);
     sequence.text_kv_valid            = 0;
     sequence.mtp_kv_valid             = 0;
     sequence.dflash_context_frontier  = 0;
@@ -944,8 +1036,6 @@ void ProgramImplCore::prepare_graphs() {
             io.pos,
             io.rope_pos,
             io.rope_delta,
-            io.linear_state_read_slot,
-            io.linear_state_snapshot_base_slot,
         };
         if (io.mtp) {
             controls.push_back(io.mtp->position);
@@ -989,10 +1079,9 @@ void ProgramImplCore::prepare_graphs() {
     const auto prepare_representative = [&](std::uint32_t frontier) {
         work.reset();
         clear_stable_controls();
-        const std::int32_t slots_per_sequence = LinearStateSlots::required_slot_count(draft_window);
         for (std::uint32_t row = 0; row < max_concurrency; ++row) {
-            decoder->linear_attention.zero_slot(static_cast<std::int32_t>(row) * slots_per_sequence,
-                                                device.stream);
+            decoder->linear_attention.zero_slot(
+                LinearStateSlots::current_state_slot(row, max_concurrency), device.stream);
         }
         set_device_i32(io.pos, checked_i32(frontier, "graph representative position"));
         set_device_i32(io.rope_pos, checked_i32(frontier, "graph representative rope position"));
@@ -1016,11 +1105,7 @@ void ProgramImplCore::prepare_graphs() {
                 dflash_host_ingress->text_kv_table_rows[row]   = static_cast<std::int32_t>(row);
                 dflash_host_ingress->dflash_kv_table_rows[row] = static_cast<std::int32_t>(row);
                 dflash_host_ingress->lanes[row]                = static_cast<std::int32_t>(row);
-                const std::int32_t linear_base =
-                    static_cast<std::int32_t>(row) * slots_per_sequence;
-                dflash_host_ingress->linear_state_read_slots[row]          = linear_base;
-                dflash_host_ingress->linear_state_snapshot_base_slots[row] = linear_base;
-                dflash_host_ingress->sampling[row]                         = {};
+                dflash_host_ingress->sampling[row]             = {};
             }
         }
         if (io.mtp_decode) {
@@ -1047,11 +1132,7 @@ void ProgramImplCore::prepare_graphs() {
                 }
                 mtp_host_ingress->text_kv_table_rows[row] = static_cast<std::int32_t>(row);
                 mtp_host_ingress->mtp_kv_table_rows[row]  = static_cast<std::int32_t>(row);
-                const std::int32_t linear_base =
-                    static_cast<std::int32_t>(row) * slots_per_sequence;
-                mtp_host_ingress->linear_state_read_slots[row]          = linear_base;
-                mtp_host_ingress->linear_state_snapshot_base_slots[row] = linear_base;
-                mtp_host_ingress->continuation_slots[row] = static_cast<std::int32_t>(row);
+                mtp_host_ingress->lanes[row]              = static_cast<std::int32_t>(row);
                 mtp_host_ingress->rope_deltas[row]        = 0;
                 mtp_host_ingress->sampling[row]           = {};
             }
@@ -1066,19 +1147,21 @@ void ProgramImplCore::prepare_graphs() {
                 ordinary_host_ingress->rope_positions[row] =
                     checked_i32(frontier, "graph representative ordinary RoPE position");
                 ordinary_host_ingress->text_kv_table_rows[row] = static_cast<std::int32_t>(row);
-                const std::int32_t linear_base =
-                    static_cast<std::int32_t>(row) * slots_per_sequence;
-                ordinary_host_ingress->linear_state_read_slots[row]          = linear_base;
-                ordinary_host_ingress->linear_state_snapshot_base_slots[row] = linear_base;
-                ordinary_host_ingress->continuation_slots[row] = static_cast<std::int32_t>(row);
+                ordinary_host_ingress->lanes[row]              = static_cast<std::int32_t>(row);
                 ordinary_host_ingress->sampling[row]           = {};
             }
         }
     };
     const auto execution_core = [&] {
-        return schedule::ExecutionCore{
-            device, model,          work,          decoder->linear_attention,
-            io,     prefill_hidden, prefill_chunk, proposal_head};
+        return schedule::ExecutionCore{device,
+                                       model,
+                                       work,
+                                       decoder->linear_attention,
+                                       replay_records ? &*replay_records : nullptr,
+                                       io,
+                                       prefill_hidden,
+                                       prefill_chunk,
+                                       proposal_head};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -1253,11 +1336,13 @@ void ProgramImplCore::mark_workspace_usage(std::size_t phase_bytes) noexcept {
     workspace_logical_peak_bytes = std::max(workspace_logical_peak_bytes, phase_bytes);
 }
 
-void ProgramImplCore::flush_dflash_context_batch(std::span<const std::uint32_t> lanes,
-                                                 std::span<const std::uint32_t> counts) {
+void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
+                                                    std::span<const std::uint32_t> starts,
+                                                    std::span<const std::uint32_t> counts) {
     if (speculative_backend != SpeculativeBackend::DFlash || !dflash || !io.dflash_decode ||
-        lanes.empty() || lanes.size() > max_concurrency || counts.size() != lanes.size()) {
-        throw std::logic_error("DFlash context flush has invalid membership");
+        lanes.empty() || lanes.size() > max_concurrency || starts.size() != lanes.size() ||
+        counts.size() != lanes.size()) {
+        throw std::logic_error("DFlash context append has invalid membership");
     }
 
     std::uint32_t minimum_count = draft_window + 1U;
@@ -1268,23 +1353,20 @@ void ProgramImplCore::flush_dflash_context_batch(std::span<const std::uint32_t> 
         if (lane >= max_concurrency || counts[row] == 0 || counts[row] > draft_window + 1U ||
             std::find(lanes.begin(), lanes.begin() + static_cast<std::ptrdiff_t>(row), lane) !=
                 lanes.begin() + static_cast<std::ptrdiff_t>(row)) {
-            throw std::logic_error("DFlash context flush contains an invalid row");
+            throw std::logic_error("DFlash context append contains an invalid row");
         }
-        SequenceState& sequence       = sequences[lane];
-        const RequestControl& request = requests[lane];
-        const std::uint32_t start     = sequence.dflash_context_frontier;
-        const std::uint32_t end       = start + counts[row];
+        SequenceState& sequence   = sequences[lane];
+        const std::uint32_t start = starts[row];
+        const std::uint64_t end64 = static_cast<std::uint64_t>(start) + counts[row];
+        const std::uint32_t end   = static_cast<std::uint32_t>(end64);
         if (!sequence.kv || !sequence.kv->backend || sequence.kv->text.bound_row() < 0 ||
-            sequence.kv->backend->bound_row() < 0 || end > capacity ||
-            (request.lifecycle == Lifecycle::Pending &&
-             (request.pending.kind != PendingKind::Speculative || request.pending.base_E != start ||
-              counts[row] > request.pending.produced))) {
-            throw std::logic_error("DFlash context flush does not match retained target features");
+            sequence.kv->backend->bound_row() < 0 || end64 > capacity) {
+            throw std::logic_error("DFlash context append is outside retained target storage");
         }
         dflash_host_ingress->context_frontiers[row] =
-            checked_i32(start, "DFlash flush context frontier");
+            checked_i32(start, "DFlash append context frontier");
         dflash_host_ingress->execution_frontiers[row] =
-            checked_i32(end, "DFlash flush target frontier");
+            checked_i32(end, "DFlash append target frontier");
         dflash_host_ingress->dflash_kv_table_rows[row] = sequence.kv->backend->bound_row();
         dflash_host_ingress->lanes[row]                = static_cast<std::int32_t>(lane);
         materialize_sequence_kv(sequence, std::max(sequence.text_kv_valid, end), end);
@@ -1298,8 +1380,8 @@ void ProgramImplCore::flush_dflash_context_batch(std::span<const std::uint32_t> 
                                device.stream));
     const auto batch     = static_cast<std::int32_t>(lanes.size());
     Tensor lane_tensor   = frame.lanes.slice(0, 0, batch);
-    Tensor starts        = frame.context_frontiers.slice(0, 0, batch);
-    Tensor ends          = frame.execution_frontiers.slice(0, 0, batch);
+    Tensor device_starts = frame.context_frontiers.slice(0, 0, batch);
+    Tensor device_ends   = frame.execution_frontiers.slice(0, 0, batch);
     Tensor table_rows    = frame.dflash_kv_table_rows.slice(0, 0, batch);
     Tensor positions     = frame.append_positions.slice(1, 0, batch);
     Tensor device_counts = frame.append_counts.slice(0, 0, batch);
@@ -1308,21 +1390,16 @@ void ProgramImplCore::flush_dflash_context_batch(std::span<const std::uint32_t> 
     Tensor features =
         work.alloc(DType::BF16, {DFlashConfig::feature_rows,
                                  static_cast<std::int32_t>(draft_window + 1U), batch});
-    ops::prepare_ragged_prefix(dflash->pending_features, lane_tensor, starts, ends, features,
-                               positions, device_counts, device.stream);
+    ops::prepare_ragged_prefix(dflash->pending_features, lane_tensor, device_starts, device_ends,
+                               features, positions, device_counts, device.stream);
 
-    schedule::DFlashAppendContext state{{device, model, work, decoder->linear_attention, io,
+    schedule::DFlashAppendContext state{{device, model, work, decoder->linear_attention,
+                                         replay_records ? &*replay_records : nullptr, io,
                                          prefill_hidden, prefill_chunk, proposal_head},
                                         *dflash};
     mark_workspace_usage(workspace_plan.dflash_context);
     schedule::dflash_append_context(state, features, positions, device_counts, lane_tensor,
                                     table_rows, {minimum_count, maximum_count});
-    device.synchronize();
-    work.reset();
-
-    for (std::size_t row = 0; row < lanes.size(); ++row) {
-        sequences[lanes[row]].dflash_context_frontier += counts[row];
-    }
 }
 
 void ProgramImplCore::validate_licensed_tokens(std::span<const TokenId> tokens) const {
@@ -1348,7 +1425,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
     const auto started                    = Clock::now();
     try {
         schedule::PrefillContext schedule_state{
-            {device, model, work, decoder->linear_attention, io, prefill_hidden, prefill_chunk,
+            {device, model, work, decoder->linear_attention,
+             replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
              proposal_head},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
@@ -1359,8 +1437,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             static_cast<const ops::SamplingConfig*>(
                 sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1).data),
             &sequence.boundary_hidden,
-            sequence.linear_state_base,
-            sequence.linear_state_capacity,
+            LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+            LinearStateSlots::boundary_state_slot(sequence.lane, max_concurrency),
             staged.initial_mtp_extent,
             dflash_host_ingress};
 
@@ -1426,8 +1504,6 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (speculative_backend == SpeculativeBackend::DFlash) {
                 sequence.dflash_context_frontier = staged.cursor;
             }
-            sequence.current_linear_state_slot =
-                LinearStateSlots::prefill_working_slot(sequence.linear_state_base);
 
             if (!result.finalized) {
                 if (staged.cursor == staged.prompt_tokens) {
@@ -1597,18 +1673,14 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             ordinary_host_ingress->rope_positions[row] =
                 checked_i32(frontier, "ordinary batch RoPE position") + sequence.rope_delta;
             ordinary_host_ingress->text_kv_table_rows[row] = sequence.kv->text.bound_row();
-            ordinary_host_ingress->linear_state_read_slots[row] =
-                sequence.current_linear_state_slot;
-            ordinary_host_ingress->linear_state_snapshot_base_slots[row] =
-                LinearStateSlots::verify_snapshot_base_slot(sequence.linear_state_base);
-            ordinary_host_ingress->continuation_slots[row] =
-                static_cast<std::int32_t>(sequence.lane);
+            ordinary_host_ingress->lanes[row]    = static_cast<std::int32_t>(sequence.lane);
             ordinary_host_ingress->sampling[row] = request.sampling_host;
             materialize_sequence_kv(sequence, frontier + 1, 0);
         }
 
         schedule::OrdinaryBatchContext schedule_state{
-            {device, model, work, decoder->linear_attention, io, prefill_hidden, prefill_chunk,
+            {device, model, work, decoder->linear_attention,
+             replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
              proposal_head},
             decoder->text_kv,
             *io.ordinary,
@@ -1629,9 +1701,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t base_S = sequence.ledger_frontier;
             const TokenId token        = ordinary_host_egress->sampled_tokens[row];
             validate_licensed_tokens(std::span<const TokenId>(&token, 1));
-            sequence.text_kv_valid             = base_E + 1;
-            sequence.current_linear_state_slot = LinearStateSlots::committed_snapshot_slot(
-                1, sequence.linear_state_base, sequence.linear_state_capacity);
+            sequence.text_kv_valid     = base_E + 1;
             sequence.tail_hidden_valid = true;
             sequence.ledger.push_back(token);
             sequence.prefix_identity.append_generated(1, sequence.rope_delta);
@@ -1731,12 +1801,9 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                 mtp_host_ingress->target_rope_positions[row * width + j] =
                     checked_i32(position, "MTP batch RoPE position") + sequence.rope_delta;
             }
-            mtp_host_ingress->text_kv_table_rows[row]      = sequence.kv->text.bound_row();
-            mtp_host_ingress->mtp_kv_table_rows[row]       = sequence.kv->backend->bound_row();
-            mtp_host_ingress->linear_state_read_slots[row] = sequence.current_linear_state_slot;
-            mtp_host_ingress->linear_state_snapshot_base_slots[row] =
-                LinearStateSlots::verify_snapshot_base_slot(sequence.linear_state_base);
-            mtp_host_ingress->continuation_slots[row] = static_cast<std::int32_t>(sequence.lane);
+            mtp_host_ingress->text_kv_table_rows[row] = sequence.kv->text.bound_row();
+            mtp_host_ingress->mtp_kv_table_rows[row]  = sequence.kv->backend->bound_row();
+            mtp_host_ingress->lanes[row]              = static_cast<std::int32_t>(sequence.lane);
             mtp_host_ingress->rope_deltas[row]        = sequence.rope_delta;
             mtp_host_ingress->sampling[row]           = request.sampling_host;
             materialize_sequence_kv(sequence, frontier + extent + 1,
@@ -1744,7 +1811,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         }
 
         schedule::MtpBatchContext schedule_state{{device, model, work, decoder->linear_attention,
-                                                  io, prefill_hidden, prefill_chunk, proposal_head},
+                                                  replay_records ? &*replay_records : nullptr, io,
+                                                  prefill_hidden, prefill_chunk, proposal_head},
                                                  decoder->text_kv,
                                                  *decoder->mtp_cache(),
                                                  *io.mtp_decode,
@@ -1791,20 +1859,6 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                         1;
                 }
             }
-            sequence.text_kv_valid             = base_E + static_cast<std::uint32_t>(count_i);
-            sequence.mtp_kv_valid              = sequence.text_kv_valid;
-            sequence.current_linear_state_slot = LinearStateSlots::committed_snapshot_slot(
-                static_cast<std::uint32_t>(accepted_i + 1), sequence.linear_state_base,
-                sequence.linear_state_capacity);
-            sequence.mtp_draft_count = static_cast<std::uint32_t>(next_i);
-            for (std::uint32_t step = 0; step < sequence.mtp_draft_count; ++step) {
-                sequence.mtp_drafts[step] =
-                    mtp_host_egress->next_drafts[step * max_concurrency + row];
-            }
-            sequence.tail_hidden_valid = true;
-            sequence.ledger.insert(sequence.ledger.end(), row_tokens.begin(), row_tokens.end());
-            sequence.prefix_identity.append_generated(static_cast<std::uint32_t>(count_i),
-                                                      sequence.rope_delta);
             request.pending = PendingCandidate{
                 .kind          = PendingKind::Speculative,
                 .base_E        = base_E,
@@ -1912,15 +1966,13 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             dflash_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1U);
             dflash_host_ingress->text_kv_table_rows[row]   = sequence.kv->text.bound_row();
             dflash_host_ingress->dflash_kv_table_rows[row] = sequence.kv->backend->bound_row();
-            dflash_host_ingress->lanes[row] = static_cast<std::int32_t>(sequence.lane);
-            dflash_host_ingress->linear_state_read_slots[row] = sequence.current_linear_state_slot;
-            dflash_host_ingress->linear_state_snapshot_base_slots[row] =
-                LinearStateSlots::verify_snapshot_base_slot(sequence.linear_state_base);
+            dflash_host_ingress->lanes[row]    = static_cast<std::int32_t>(sequence.lane);
             dflash_host_ingress->sampling[row] = request.sampling_host;
             materialize_sequence_kv(sequence, frontier + extent + 1U, frontier);
         }
 
         schedule::DFlashBatchContext schedule_state{{device, model, work, decoder->linear_attention,
+                                                     replay_records ? &*replay_records : nullptr,
                                                      io, prefill_hidden, prefill_chunk,
                                                      proposal_head},
                                                     decoder->text_kv,
@@ -1967,21 +2019,13 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         1;
                 }
             }
-            sequence.text_kv_valid             = base_E + static_cast<std::uint32_t>(count_i);
-            sequence.dflash_context_frontier   = base_E;
-            sequence.current_linear_state_slot = LinearStateSlots::committed_snapshot_slot(
-                static_cast<std::uint32_t>(count_i), sequence.linear_state_base,
-                sequence.linear_state_capacity);
-            sequence.tail_hidden_valid = true;
-            sequence.ledger.insert(sequence.ledger.end(), row_tokens.begin(), row_tokens.end());
-            sequence.prefix_identity.append_generated(static_cast<std::uint32_t>(count_i),
-                                                      sequence.rope_delta);
-            request.pending = PendingCandidate{
-                .kind          = PendingKind::Speculative,
-                .base_E        = base_E,
-                .base_S        = base_S,
-                .prompt_tokens = 0,
-                .produced      = static_cast<std::uint32_t>(count_i),
+            sequence.dflash_context_frontier = base_E;
+            request.pending                  = PendingCandidate{
+                                 .kind          = PendingKind::Speculative,
+                                 .base_E        = base_E,
+                                 .base_S        = base_S,
+                                 .prompt_tokens = 0,
+                                 .produced      = static_cast<std::uint32_t>(count_i),
             };
             request.lifecycle = Lifecycle::Pending;
             request.timings.decode_seconds += seconds;
@@ -2013,67 +2057,17 @@ ProgramImplCore::decode_batch(std::span<const std::uint32_t> lanes,
     return decode_dflash_batch(lanes, budgets);
 }
 
-void ProgramImplCore::resolve_pending_impl(SequenceState& sequence, RequestControl& request,
-                                           std::uint32_t accepted_tokens, bool terminal) {
+void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
+                                                      RequestControl& request,
+                                                      std::uint32_t accepted_tokens,
+                                                      bool terminal) {
     if (request.lifecycle != Lifecycle::Pending) {
-        throw std::logic_error("resolve_pending requires a pending generated round");
+        throw std::logic_error("pending resolution requires a pending generated round");
     }
-    if (accepted_tokens == 0 || accepted_tokens > request.pending.produced) {
-        throw std::out_of_range("accepted prefix is outside the pending generated round");
-    }
-    if (!terminal && accepted_tokens != request.pending.produced) {
-        throw std::logic_error("a continuing round must accept every licensed token");
-    }
-    if (terminal && speculative_backend == SpeculativeBackend::DFlash &&
-        request.pending.kind == PendingKind::Speculative) {
-        const std::uint32_t committed_context = request.pending.base_E + accepted_tokens;
-        if (sequence.dflash_context_frontier < committed_context) {
-            const std::array<std::uint32_t, 1> lane{sequence.lane};
-            const std::array<std::uint32_t, 1> count{committed_context -
-                                                     sequence.dflash_context_frontier};
-            try {
-                flush_dflash_context_batch(lane, count);
-            } catch (...) {
-                clear_lane(sequence, request);
-                throw;
-            }
-        }
-        if (sequence.dflash_context_frontier != committed_context) {
-            throw std::logic_error("terminal DFlash context did not reach its committed frontier");
-        }
-    }
-    if (terminal && request.pending.kind == PendingKind::Speculative &&
-        accepted_tokens < request.pending.produced) {
-        // The output policy may stop inside a target-licensed speculative batch. Target
-        // verification has already materialized KV, hidden, and one GDN snapshot for every returned
-        // prefix, so commit the exact externally accepted frontier instead of discarding the
-        // resident sequence. The next request lets the active drafter rebuild proposals from this
-        // target state.
-        const std::uint32_t committed_E = request.pending.base_E + accepted_tokens;
-        const std::uint32_t committed_S = request.pending.base_S + accepted_tokens;
-        if (committed_S > sequence.ledger.size() || committed_S > sequence.prefix_identity.size()) {
-            throw std::logic_error(
-                "partial speculative terminal exceeds the provisional sequence ledger");
-        }
-        sequence.ledger.resize(committed_S);
-        sequence.prefix_identity.truncate(committed_S);
-        sequence.execution_frontier        = committed_E;
-        sequence.ledger_frontier           = committed_S;
-        sequence.current_linear_state_slot = LinearStateSlots::committed_snapshot_slot(
-            accepted_tokens, sequence.linear_state_base, sequence.linear_state_capacity);
-        sequence.text_kv_valid = committed_E;
-        if (speculative_backend == SpeculativeBackend::Mtp) { sequence.mtp_kv_valid = committed_E; }
-        trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
-        release_sequence_growth_entitlement(sequence);
-        unbind_sequence_kv(sequence);
-        sequence.mtp_draft_count = 0;
-        sequence.retained        = true;
-        request.lifecycle        = Lifecycle::Complete;
-        request.pending          = {};
-        return;
-    }
-    if (accepted_tokens != request.pending.produced) {
-        throw std::logic_error("a non-speculative terminal round must accept its only token");
+    if ((request.pending.kind != PendingKind::Begin &&
+         request.pending.kind != PendingKind::Ordinary) ||
+        request.pending.produced != 1 || accepted_tokens != 1) {
+        throw std::logic_error("non-speculative pending round must commit its single token");
     }
 
     switch (request.pending.kind) {
@@ -2082,12 +2076,12 @@ void ProgramImplCore::resolve_pending_impl(SequenceState& sequence, RequestContr
         sequence.ledger_frontier    = request.pending.prompt_tokens + 1;
         break;
     case PendingKind::Ordinary:
-    case PendingKind::Speculative:
         sequence.execution_frontier = request.pending.base_E + request.pending.produced;
         sequence.ledger_frontier    = request.pending.base_S + request.pending.produced;
         break;
+    case PendingKind::Speculative:
     case PendingKind::None:
-        throw std::logic_error("pending generated round has no candidate");
+        throw std::logic_error("non-speculative pending round has an invalid kind");
     }
     if (sequence.ledger_frontier != sequence.execution_frontier + 1 ||
         sequence.ledger.size() != sequence.ledger_frontier ||

@@ -480,7 +480,7 @@ private:
             throw std::logic_error("prefill output policy did not accept its licensed token");
         }
         request->generated.push_back(token);
-        instance_.program->resolve_pending_lane(lane, 1, decision.finished());
+        instance_.program->resolve_prefill_lane(lane, decision.finished());
         request->budget->commit(1);
         auto published = request->output.commit_preview();
         if (!request->first_token) { request->first_token = Clock::now(); }

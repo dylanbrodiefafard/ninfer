@@ -36,10 +36,11 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
 } // namespace
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
-                         const ops::SamplingConfig* sampling, std::int32_t linear_state_base,
-                         std::int32_t linear_state_capacity, std::uint32_t mtp_proposal_extent) {
+                         const ops::SamplingConfig* sampling, std::int32_t current_state_slot,
+                         std::int32_t boundary_state_slot, std::uint32_t mtp_proposal_extent) {
     card.set_sampling(sampling);
-    card.set_linear_state_group(linear_state_base, linear_state_capacity);
+    card.set_linear_state_slots(current_state_slot, boundary_state_slot);
+    card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
     card.set_mtp_proposal_extent(mtp_proposal_extent);
     if (execution.proposal_head == ProposalHead::Full) {
         card.set_proposal_head(nullptr, nullptr, 0);
@@ -59,8 +60,8 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
-    configure_text_card(card, state.execution, state.sampling, state.linear_state_base,
-                        state.linear_state_capacity, state.mtp_proposal_extent);
+    configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
+                        state.boundary_state_slot, state.mtp_proposal_extent);
     card.set_boundary_hidden_output(state.boundary_hidden);
     card.set_prefill_snapshot_boundary(
         snapshot_boundary ? static_cast<std::int64_t>(*snapshot_boundary) : -1);
@@ -85,8 +86,8 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
-    configure_text_card(card, state.execution, state.sampling, state.linear_state_base,
-                        state.linear_state_capacity, state.mtp_proposal_extent);
+    configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
+                        state.boundary_state_slot, state.mtp_proposal_extent);
     card.set_boundary_hidden_output(state.boundary_hidden);
     card.set_prefill_snapshot_boundary(
         snapshot_boundary ? static_cast<std::int64_t>(*snapshot_boundary) : -1);

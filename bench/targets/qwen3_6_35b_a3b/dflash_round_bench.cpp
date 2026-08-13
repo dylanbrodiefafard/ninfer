@@ -146,10 +146,7 @@ RoundMeasurement measure_round(target::Package::Program& program, ninfer::Device
     ninfer::CudaEventTimer timer(device);
     const auto wall_start = Clock::now();
     timer.start();
-    const auto round   = program.decode_batch(lane_span, budget_span);
-    const float gpu_ms = timer.stop_ms();
-    const double wall_ms =
-        std::chrono::duration<double, std::milli>(Clock::now() - wall_start).count();
+    const auto round = program.decode_batch(lane_span, budget_span);
     if (round.row_counts.size() != batch_size) {
         throw std::runtime_error("DFlash benchmark round returned invalid row counts");
     }
@@ -169,6 +166,9 @@ RoundMeasurement measure_round(target::Package::Program& program, ninfer::Device
                                   std::span<const std::uint32_t>(accepted.data(), batch_size),
                                   std::span<const std::uint8_t>(terminal.data(), batch_size),
                                   std::span<const std::uint8_t>(cancelled.data(), batch_size));
+    const float gpu_ms = timer.stop_ms();
+    const double wall_ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - wall_start).count();
     return {.gpu_ms = gpu_ms, .wall_ms = wall_ms, .licensed_tokens = licensed};
 }
 
@@ -257,7 +257,7 @@ int run(const Options& options) {
         if (prefill.round.tokens.size() != 1) {
             throw std::runtime_error("benchmark seed prefill did not license exactly one token");
         }
-        program->resolve_pending_lane(lane, 1, false);
+        program->resolve_prefill_lane(lane, false);
     }
 
     for (int iteration = 0; iteration < options.warmup; ++iteration) {

@@ -3,6 +3,7 @@
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
 #include "core/arena.h"
+#include "core/gdn_replay_records.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
@@ -137,16 +138,13 @@ struct SequenceState {
     std::optional<SequenceKVBundle> kv;
     Tensor tail_hidden;
     Tensor boundary_hidden;
-    std::uint32_t lane                 = 0;
-    std::int32_t linear_state_base     = 0;
-    std::int32_t linear_state_capacity = 0;
+    std::uint32_t lane = 0;
 
     std::uint32_t execution_frontier = 0;
     std::uint32_t ledger_frontier    = 0;
     std::vector<TokenId> ledger;
     qwen3_6::detail::ResidentPrefixIdentity prefix_identity;
     std::int32_t rope_delta                = 0;
-    std::int32_t current_linear_state_slot = 0;
     std::uint32_t text_kv_valid            = 0;
     std::uint32_t mtp_kv_valid             = 0;
     std::uint32_t dflash_context_frontier  = 0;
@@ -212,7 +210,7 @@ public:
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_batch(std::span<const std::uint32_t> lanes,
                  std::span<const runtime::RoundBudget> budgets);
-    void resolve_pending_lane(std::uint32_t lane, std::uint32_t accepted_tokens, bool terminal);
+    void resolve_prefill_lane(std::uint32_t lane, bool terminal);
     void resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                std::span<const std::uint32_t> accepted_tokens,
                                std::span<const std::uint8_t> terminal,
@@ -249,6 +247,7 @@ public:
     DeviceArena workspace_storage;
     WorkspaceArena work;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
+    std::optional<GdnReplayRecords> replay_records;
     std::optional<DFlashPersistentState> dflash;
     qwen3_6::RoundState io;
     Tensor prefill_hidden;
@@ -287,12 +286,13 @@ private:
     void set_device_i32(Tensor& tensor, std::int32_t value);
     void copy_tail(SequenceState& sequence, const Tensor& source);
     void copy_round_token();
-    void resolve_pending_impl(SequenceState& sequence, RequestControl& request,
-                              std::uint32_t accepted_tokens, bool terminal);
+    void resolve_non_speculative_pending(SequenceState& sequence, RequestControl& request,
+                                         std::uint32_t accepted_tokens, bool terminal);
     [[nodiscard]] runtime::PrefillStepResult advance_prefill(SequenceState& sequence,
                                                              RequestControl& request);
-    void flush_dflash_context_batch(std::span<const std::uint32_t> lanes,
-                                    std::span<const std::uint32_t> counts);
+    void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
+                                       std::span<const std::uint32_t> starts,
+                                       std::span<const std::uint32_t> counts);
     void validate_licensed_tokens(std::span<const TokenId> tokens) const;
     void mark_workspace_usage(std::size_t phase_bytes) noexcept;
     [[nodiscard]] runtime::BatchedGeneratedRound

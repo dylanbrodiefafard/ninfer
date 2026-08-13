@@ -181,9 +181,8 @@ void Program<Variant>::resolve_pending_batch(std::span<const std::uint32_t> lane
 }
 
 template <>
-void Program<Variant>::resolve_pending_lane(std::uint32_t lane, std::uint32_t accepted_tokens,
-                                            bool terminal) {
-    impl_->resolve_pending_lane(lane, accepted_tokens, terminal);
+void Program<Variant>::resolve_prefill_lane(std::uint32_t lane, bool terminal) {
+    impl_->resolve_prefill_lane(lane, terminal);
 }
 
 template <>
