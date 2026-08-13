@@ -31,19 +31,30 @@ The executable `--help` output is the exact source for command-line option spell
 
 ## Maintainer references
 
-The files under [`maintainer/`](maintainer/) record the current artifact formats, exact model and
-artifact contracts, and Op-development rules used for ongoing project maintenance. They are not
-additional user workflows or installed API documentation.
+The active references under [`maintainer/`](maintainer/) record current architecture, model,
+artifact, and maintenance contracts. The one unfinished migration plan is labeled separately.
+These files are not additional user workflows or installed API documentation.
 
-Active implementation and architecture references:
+Runtime and Op references:
 
 - [Small-scale concurrent inference architecture](maintainer/concurrent-inference-architecture.md)
 - [Paged KV context storage, ownership, and capacity model](maintainer/paged-kv-cache.md)
 - [Op admission, contracts, ownership, qualification, and performance rules](maintainer/op-development.md)
 - [ReplaySSM GDN technical reference](maintainer/replayssm-gdn.md)
-- [ReplaySSM GDN implementation design](maintainer/replayssm-gdn-implementation.md)
-- [ReplaySSM GDN engine integration design](maintainer/replayssm-gdn-engine-integration.md)
-- [Qwen3.6 thinking preservation and turn-checkpoint semantics](maintainer/qwen3.6-thinking-preservation.md)
-- [Softmax Attention organization and migration contract](maintainer/softmax-attention.md)
 - [Linear benchmark contract and registered suites](maintainer/linear-benchmark.md)
+
+Artifact and model references:
+
+- [NInfer artifact container](maintainer/artifact-container.md)
+- [Persistent tensor numeric formats](maintainer/tensor-formats.md)
+- [Persistent storage layouts](maintainer/storage-layouts.md)
+- [Qwen3.6-27B model semantics](maintainer/qwen3.6-27b-model.md)
 - [Qwen3.6-27B artifact contracts, including NVFP4](maintainer/qwen3.6-27b-artifact.md)
+- [Qwen3.6-35B-A3B model semantics](maintainer/qwen3.6-35b-a3b-model.md)
+- [Qwen3.6-35B-A3B artifact contracts](maintainer/qwen3.6-35b-a3b-artifact.md)
+
+Pending migration plan:
+
+- [Softmax Attention organization and migration](maintainer/softmax-attention.md) describes the
+  single target state for an unfinished source and public-contract cutover; it is not the current
+  implementation map.
