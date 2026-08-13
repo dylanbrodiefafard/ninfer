@@ -1067,6 +1067,22 @@ Profile 在 capture 前按 configured context ceiling 截断，只有实际 reac
 executable。Backend-specific proposal shape 只有在真实改变 CUDA node topology 时才形成每个 exact `B`
 下的 topology class，不生成 ordinary-tail 或额外 `B=1` compatibility graph。
 
+Startup 对 graph family 的准备顺序固定为：
+
+1. 对启用的 semantic family，以 `B=1` 的首个 reachable profile 执行一次 eager round，使 CUDA code 和
+   library runtime 在 stream capture 前完成 lazy materialization；
+2. 捕获全部 exact-`B`/profile definitions。Capture 只记录 CUDA work，不执行 model round，也不承担
+   production 数值 qualification；
+3. 每个 topology executable 由其首个 definition 实例化。该 topology 的其余 definitions 逐个通过
+   `cudaGraphExecUpdate` 验证兼容性，并通过 `cudaGraphUpload` 完成 executable resource materialization；
+4. 每个 executable 只 replay 一次首个 definition 作为 startup smoke。遍历其余 profiles 后，以
+   update/upload 恢复首个 installed definition，不额外 replay。
+
+因此 startup 不为每个 definition 执行 eager warm，也不把每个 profile 的 update 当成 real-model replay
+qualification。完整算子与 route correctness 由独立测试和 real-artifact integration route 负责；production
+startup 只验证 graph inventory、update compatibility、resource materialization 和每个 executable 的一次
+可执行性。
+
 ### 9.2 Dynamic active set
 
 active set 改变时，runtime 发布新的 frame ingress 并选择匹配的预捕获 definition：
@@ -1134,6 +1150,12 @@ Model/control ingress、forward 和 result egress 不存在 per-row CUDA submiss
 publication 属于 state substrate materialization。Serving 期间不 capture、instantiate 或扩展 graph family。
 Startup graph allowance 必须计入全部 reachable exact-`B` definitions，以及每个 exact `B`、每个实际
 topology class 的一份 executable，不能沿用只覆盖 `B=1` definitions 的 reservation。
+
+Capture/smoke 使用的 temporary Paged-KV allocation 每个有效 row 只 materialize 一个 private physical
+page，并把该 page 重复发布到 temporary block-table row。准备一次 eager/smoke 时只清零 `[0,B)` 对应的
+temporary pages、fixed-state lanes 和 typed controls；definition capture 本身只 reset shared workspace 的
+host allocator。不得按 configured KV capacity 清零整个 physical pool，也不得为每个 definition 清零全部
+`C` 行 state。
 
 ---
 

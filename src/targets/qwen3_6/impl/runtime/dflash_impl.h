@@ -415,13 +415,12 @@ void dflash_append_context(PrefillContext& state, const Tensor& features, const 
                                  envelope);
 }
 
-void warm_capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size,
-                                      std::uint32_t k, DFlashEnvelopes envelopes,
-                                      ops::GqaExecutionEnvelope target_envelope,
-                                      const GraphPrepare& prepare,
-                                      DecodeGraphDefinition& definition) {
+void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size,
+                                 std::uint32_t k, DFlashEnvelopes envelopes,
+                                 ops::GqaExecutionEnvelope target_envelope,
+                                 DecodeGraphDefinition& definition) {
     auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope);
-    warm_capture(state, definition, prepare, body);
+    capture_graph(state, definition, body);
 }
 
 void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,

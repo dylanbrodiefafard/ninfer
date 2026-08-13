@@ -1237,6 +1237,11 @@ reserve entitlement already exists
 Graph capture不以page IDs、physical contiguity或retained owner为key。Mapping update必须先于consumer，
 in-flight期间禁止改写同一row；Op和kernel内部不调用allocator，也不等待host page fault。
 
+Startup graph construction为每个temporary row保留一个private page，并可将同一page ID重复写入该row的
+全部logical entries，以覆盖任意reachable context envelope。只有eager code warm和每个executable的一次
+smoke会真实访问这些pages；准备时只清零当前exact `B`对应的private pages。Definition capture和
+update/upload validation不执行consumer，不能因此扫描或清零整个physical pool。
+
 ### 17.8 Prohibited implementations
 
 以下实现即使功能正确也不接受：

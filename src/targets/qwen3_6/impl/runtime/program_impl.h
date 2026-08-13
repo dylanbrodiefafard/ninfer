@@ -139,30 +139,39 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
         topology.installed_profile = i;
     }
 
-    const auto replay_profile = [&](DecodeGraphTopology& topology, std::size_t profile_index) {
+    const auto install_and_upload = [&](DecodeGraphTopology& topology, std::size_t profile_index) {
         DecodeGraphProfile& profile = family.profiles[profile_index];
-        prepare(profile.min_execution_frontier);
-        device.synchronize();
         if (topology.installed_profile != profile_index) {
             topology.executable.update(profile.definition);
             topology.installed_profile = profile_index;
         }
-        topology.executable.launch(device.stream);
+        topology.executable.upload(device.stream);
         device.synchronize();
     };
 
     for (DecodeGraphTopology& topology : family.topologies) {
         std::optional<std::size_t> first_profile;
-        std::optional<std::size_t> last_profile;
         for (std::size_t i = 0; i < family.profiles.size(); ++i) {
             if (family.profiles[i].topology_class == topology.topology_class) {
-                if (!first_profile) { first_profile = i; }
-                last_profile = i;
-                replay_profile(topology, i);
+                if (!first_profile) {
+                    first_profile = i;
+                    install_and_upload(topology, i);
+
+                    DecodeGraphProfile& profile = family.profiles[i];
+                    prepare(profile.min_execution_frontier, profile.batch_size);
+                    device.synchronize();
+                    topology.executable.launch(device.stream);
+                    device.synchronize();
+                    continue;
+                }
+                install_and_upload(topology, i);
             }
         }
-        if (first_profile && last_profile && *first_profile != *last_profile) {
-            replay_profile(topology, *first_profile);
+        if (!first_profile) {
+            throw std::logic_error(std::string(label) + " CUDA Graph topology has no definitions");
+        }
+        if (topology.installed_profile != *first_profile) {
+            install_and_upload(topology, *first_profile);
         }
     }
 }
@@ -1033,6 +1042,7 @@ void ProgramImplCore::prepare_graphs() {
     } else if (speculative_backend == SpeculativeBackend::DFlash) {
         reserve_capture_rows(dflash->full, dflash_capture_allocations, "DFlash Full KV cache");
     }
+    device.synchronize();
 
     std::size_t free_before = 0;
     std::size_t total_bytes = 0;
@@ -1056,40 +1066,46 @@ void ProgramImplCore::prepare_graphs() {
             CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
         }
     };
-    const auto initialize_paged_cache = [&](qwen3_6::PagedKVCache& cache) {
-        for (std::size_t plane = 0; plane < cache.pool().plane_count(); ++plane) {
-            const Tensor& tensor = cache.pool().plane(plane);
-            CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
+    const auto zero_capture_pages = [&](qwen3_6::PagedKVCache& cache,
+                                        const std::vector<PagedKVAllocation>& allocations,
+                                        std::uint32_t batch_size) {
+        std::vector<std::int32_t> pages;
+        pages.reserve(batch_size);
+        for (std::uint32_t row = 0; row < batch_size; ++row) {
+            pages.push_back(allocations[row].page_ids().front());
         }
+        cache.pool().zero_pages(pages, device.stream);
     };
-    const auto initialize_cyclic_cache = [&](CyclicKVCache& cache) {
+    const auto zero_cyclic_lane = [&](CyclicKVCache& cache, std::uint32_t lane) {
         for (std::uint32_t layer = 0; layer < cache.layer_count(); ++layer) {
             const CyclicKVCacheLayerView view = cache.layer_view(layer);
-            CUDA_CHECK(cudaMemsetAsync(view.k.data, 0, view.k.bytes(), device.stream));
-            CUDA_CHECK(cudaMemsetAsync(view.v.data, 0, view.v.bytes(), device.stream));
+            const Tensor k                    = view.k.slice(3, static_cast<std::int32_t>(lane), 1);
+            const Tensor v                    = view.v.slice(3, static_cast<std::int32_t>(lane), 1);
+            CUDA_CHECK(cudaMemsetAsync(k.data, 0, k.bytes(), device.stream));
+            CUDA_CHECK(cudaMemsetAsync(v.data, 0, v.bytes(), device.stream));
         }
     };
-    initialize_paged_cache(decoder->text_kv);
-    if (decoder->mtp_cache() != nullptr) { initialize_paged_cache(*decoder->mtp_cache()); }
-    if (dflash) {
-        initialize_cyclic_cache(dflash->local);
-        initialize_cyclic_cache(dflash->turn_checkpoint_local);
-        initialize_paged_cache(dflash->full);
-        CUDA_CHECK(cudaMemsetAsync(dflash->prefill_features.data, 0,
-                                   dflash->prefill_features.bytes(), device.stream));
-        CUDA_CHECK(cudaMemsetAsync(dflash->prefill_positions.data, 0,
-                                   dflash->prefill_positions.bytes(), device.stream));
-        CUDA_CHECK(cudaMemsetAsync(dflash->pending_features.data, 0,
-                                   dflash->pending_features.bytes(), device.stream));
-    }
-    device.synchronize();
 
-    const auto prepare_representative = [&](std::uint32_t frontier) {
+    const auto prepare_representative = [&](std::uint32_t frontier, std::uint32_t batch_size) {
+        if (batch_size == 0 || batch_size > max_concurrency) {
+            throw std::logic_error("CUDA Graph representative batch is invalid");
+        }
         work.reset();
         clear_stable_controls();
-        for (std::uint32_t row = 0; row < max_concurrency; ++row) {
+        zero_capture_pages(decoder->text_kv, text_capture_allocations, batch_size);
+        if (decoder->mtp_cache() != nullptr) {
+            zero_capture_pages(*decoder->mtp_cache(), mtp_capture_allocations, batch_size);
+        }
+        if (dflash) { zero_capture_pages(dflash->full, dflash_capture_allocations, batch_size); }
+        for (std::uint32_t row = 0; row < batch_size; ++row) {
             decoder->linear_attention.zero_slot(
                 LinearStateSlots::current_state_slot(row, max_concurrency), device.stream);
+            if (dflash) {
+                zero_cyclic_lane(dflash->local, row);
+                const Tensor pending =
+                    dflash->pending_features.slice(2, static_cast<std::int32_t>(row), 1);
+                CUDA_CHECK(cudaMemsetAsync(pending.data, 0, pending.bytes(), device.stream));
+            }
         }
         set_device_i32(io.pos, checked_i32(frontier, "graph representative position"));
         set_device_i32(io.rope_pos, checked_i32(frontier, "graph representative rope position"));
@@ -1101,7 +1117,7 @@ void ProgramImplCore::prepare_graphs() {
             *dflash_host_ingress       = {};
             *dflash_host_egress        = {};
             const std::uint32_t extent = std::min(draft_window, capacity - frontier - 1U);
-            for (std::uint32_t row = 0; row < max_concurrency; ++row) {
+            for (std::uint32_t row = 0; row < batch_size; ++row) {
                 dflash_host_ingress->anchors[row] = 0;
                 dflash_host_ingress->execution_frontiers[row] =
                     checked_i32(frontier, "graph representative DFlash frontier");
@@ -1121,7 +1137,7 @@ void ProgramImplCore::prepare_graphs() {
             *mtp_host_egress           = {};
             const std::uint32_t extent = std::min(draft_window, capacity - frontier - 1U);
             const std::uint32_t width  = draft_window + 1U;
-            for (std::uint32_t row = 0; row < max_concurrency; ++row) {
+            for (std::uint32_t row = 0; row < batch_size; ++row) {
                 mtp_host_ingress->anchors[row] = 0;
                 mtp_host_ingress->base_frontiers[row] =
                     checked_i32(frontier, "graph representative MTP frontier");
@@ -1148,7 +1164,7 @@ void ProgramImplCore::prepare_graphs() {
         if (io.ordinary) {
             *ordinary_host_ingress = {};
             *ordinary_host_egress  = {};
-            for (std::uint32_t row = 0; row < max_concurrency; ++row) {
+            for (std::uint32_t row = 0; row < batch_size; ++row) {
                 ordinary_host_ingress->tokens[row] = 0;
                 ordinary_host_ingress->cache_positions[row] =
                     checked_i32(frontier, "graph representative ordinary position");
@@ -1176,6 +1192,16 @@ void ProgramImplCore::prepare_graphs() {
         const auto ordinary_profiles = ordinary_graph_profiles(capacity);
         validate_graph_profiles(ordinary_profiles, capacity - 1, "ordinary");
         const std::uint32_t ordinary_batch_limit = max_concurrency;
+        schedule::OrdinaryBatchContext ordinary_state{execution_core(),      decoder->text_kv,
+                                                      *io.ordinary,          *ordinary_host_ingress,
+                                                      *ordinary_host_egress, tail_hidden_store};
+        const GraphExecutionProfile code_warm = ordinary_profiles.front();
+        prepare_representative(code_warm.min, 1);
+        device.synchronize();
+        schedule::ordinary_decode_batch(ordinary_state, 1, {code_warm.min + 1, code_warm.max + 1},
+                                        nullptr);
+        device.synchronize();
+
         ordinary_graphs.profiles.reserve(ordinary_profiles.size() * ordinary_batch_limit);
         for (std::uint32_t batch_size = 1; batch_size <= ordinary_batch_limit; ++batch_size) {
             for (const GraphExecutionProfile planned : ordinary_profiles) {
@@ -1186,18 +1212,10 @@ void ProgramImplCore::prepare_graphs() {
                 profile.max_execution_frontier = planned.max;
                 profile.topology_class =
                     planned.topology_class * ordinary_batch_limit + (batch_size - 1U);
-                const std::uint32_t representative = planned.min;
                 const ops::GqaExecutionEnvelope envelope{planned.min + 1, planned.max + 1};
-                const auto prepare = [&, representative] {
-                    prepare_representative(representative);
-                };
-
-                schedule::OrdinaryBatchContext ordinary_state{
-                    execution_core(),       decoder->text_kv,      *io.ordinary,
-                    *ordinary_host_ingress, *ordinary_host_egress, tail_hidden_store};
-                schedule::warm_capture_ordinary_decode_batch(ordinary_state,
-                                                             static_cast<std::int32_t>(batch_size),
-                                                             envelope, prepare, profile.definition);
+                schedule::capture_ordinary_decode_batch(ordinary_state,
+                                                        static_cast<std::int32_t>(batch_size),
+                                                        envelope, profile.definition);
             }
         }
     }
@@ -1205,6 +1223,17 @@ void ProgramImplCore::prepare_graphs() {
     if (speculative_backend == SpeculativeBackend::Mtp) {
         const auto planned_profiles = mtp_graph_profiles(capacity, draft_window);
         validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
+        schedule::MtpBatchContext mtp_state{
+            execution_core(),  decoder->text_kv, *decoder->mtp_cache(), *io.mtp_decode,
+            *mtp_host_ingress, *mtp_host_egress, tail_hidden_store};
+        const GraphExecutionProfile code_warm = planned_profiles.front();
+        prepare_representative(code_warm.min, 1);
+        device.synchronize();
+        schedule::mtp_decode_batch(mtp_state, 1, draft_window,
+                                   mtp_gqa_envelopes(code_warm.max, draft_window, capacity),
+                                   nullptr);
+        device.synchronize();
+
         mtp_graphs.profiles.reserve(planned_profiles.size() * max_concurrency);
         for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
             for (const GraphExecutionProfile planned : planned_profiles) {
@@ -1215,23 +1244,29 @@ void ProgramImplCore::prepare_graphs() {
                 profile.max_execution_frontier = planned.max;
                 profile.topology_class =
                     planned.topology_class * max_concurrency + (batch_size - 1U);
-                const std::uint32_t representative = planned.min;
-                const auto prepare                 = [&, representative] {
-                    prepare_representative(representative);
-                };
-
-                schedule::MtpBatchContext mtp_state{
-                    execution_core(),  decoder->text_kv, *decoder->mtp_cache(), *io.mtp_decode,
-                    *mtp_host_ingress, *mtp_host_egress, tail_hidden_store};
-                schedule::warm_capture_mtp_decode_batch(
+                schedule::capture_mtp_decode_batch(
                     mtp_state, static_cast<std::int32_t>(batch_size), draft_window,
-                    mtp_gqa_envelopes(planned.max, draft_window, capacity), prepare,
-                    profile.definition);
+                    mtp_gqa_envelopes(planned.max, draft_window, capacity), profile.definition);
             }
         }
     }
     if (speculative_backend == SpeculativeBackend::DFlash) {
         const auto batch_one_profiles = dflash_graph_profiles(capacity, draft_window, 1);
+        validate_graph_profiles(batch_one_profiles, capacity - 1, "DFlash");
+        schedule::DFlashBatchContext dflash_state{
+            execution_core(),     decoder->text_kv,    *dflash,          *io.dflash_decode,
+            *dflash_host_ingress, *dflash_host_egress, tail_hidden_store};
+        const GraphExecutionProfile code_warm = batch_one_profiles.front();
+        const ops::GqaExecutionEnvelope code_warm_target{
+            1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                   capacity, static_cast<std::uint64_t>(code_warm.max) + draft_window + 1ULL))};
+        prepare_representative(code_warm.min, 1);
+        device.synchronize();
+        schedule::dflash_decode_batch(dflash_state, 1, draft_window,
+                                      dflash_envelopes(code_warm.min, code_warm.max, draft_window),
+                                      code_warm_target, nullptr);
+        device.synchronize();
+
         dflash_graphs.profiles.reserve(batch_one_profiles.size() * max_concurrency);
         for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
             const auto planned_profiles =
@@ -1246,22 +1281,15 @@ void ProgramImplCore::prepare_graphs() {
                 profile.max_execution_frontier = planned.max;
                 profile.topology_class =
                     planned.topology_class * max_concurrency + (batch_size - 1U);
-                const std::uint32_t representative = planned.min;
-                const auto prepare                 = [&, representative] {
-                    prepare_representative(representative);
-                };
                 const ops::GqaExecutionEnvelope target_envelope{
                     1,
                     static_cast<std::uint32_t>(std::min<std::uint64_t>(
                         capacity, static_cast<std::uint64_t>(planned.max) + draft_window + 1ULL))};
 
-                schedule::DFlashBatchContext dflash_state{
-                    execution_core(),     decoder->text_kv,    *dflash,          *io.dflash_decode,
-                    *dflash_host_ingress, *dflash_host_egress, tail_hidden_store};
-                schedule::warm_capture_dflash_decode_batch(
+                schedule::capture_dflash_decode_batch(
                     dflash_state, static_cast<std::int32_t>(batch_size), draft_window,
                     dflash_envelopes(planned.min, planned.max, draft_window), target_envelope,
-                    prepare, profile.definition);
+                    profile.definition);
             }
         }
     }
@@ -1284,6 +1312,23 @@ void ProgramImplCore::prepare_graphs() {
     for (Tensor& tensor : decoder->linear_attention.recurrent) {
         CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
     }
+    if (dflash) {
+        const auto zero_cyclic_cache = [&](CyclicKVCache& cache) {
+            for (std::uint32_t layer = 0; layer < cache.layer_count(); ++layer) {
+                const CyclicKVCacheLayerView view = cache.layer_view(layer);
+                CUDA_CHECK(cudaMemsetAsync(view.k.data, 0, view.k.bytes(), device.stream));
+                CUDA_CHECK(cudaMemsetAsync(view.v.data, 0, view.v.bytes(), device.stream));
+            }
+        };
+        zero_cyclic_cache(dflash->local);
+        zero_cyclic_cache(dflash->turn_checkpoint_local);
+        CUDA_CHECK(cudaMemsetAsync(dflash->prefill_features.data, 0,
+                                   dflash->prefill_features.bytes(), device.stream));
+        CUDA_CHECK(cudaMemsetAsync(dflash->prefill_positions.data, 0,
+                                   dflash->prefill_positions.bytes(), device.stream));
+        CUDA_CHECK(cudaMemsetAsync(dflash->pending_features.data, 0,
+                                   dflash->pending_features.bytes(), device.stream));
+    }
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
     device.synchronize();
 
@@ -1292,7 +1337,7 @@ void ProgramImplCore::prepare_graphs() {
     const std::size_t consumed = free_before > free_after ? free_before - free_after : 0;
     graph_observed_bytes       = consumed;
     if (consumed > graph_allowance_bytes) {
-        throw std::runtime_error("CUDA Graph warm/capture consumed " + std::to_string(consumed) +
+        throw std::runtime_error("CUDA Graph preparation consumed " + std::to_string(consumed) +
                                  " bytes, exceeding the planned allowance of " +
                                  std::to_string(graph_allowance_bytes) + " bytes");
     }

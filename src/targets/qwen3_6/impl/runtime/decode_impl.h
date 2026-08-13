@@ -48,12 +48,11 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
 
 } // namespace
 
-void warm_capture_ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
-                                        ops::GqaExecutionEnvelope envelope,
-                                        const GraphPrepare& prepare,
-                                        DecodeGraphDefinition& definition) {
+void capture_ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
+                                   ops::GqaExecutionEnvelope envelope,
+                                   DecodeGraphDefinition& definition) {
     auto body = ordinary_batch_body(state, batch_size, envelope);
-    warm_capture(state, definition, prepare, body);
+    capture_graph(state, definition, body);
 }
 
 void ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,

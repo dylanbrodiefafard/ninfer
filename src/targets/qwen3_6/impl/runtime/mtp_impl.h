@@ -182,11 +182,10 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
     };
 }
 
-void warm_capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                                   MtpGqaEnvelopes envelopes, const GraphPrepare& prepare,
-                                   DecodeGraphDefinition& definition) {
+void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
+                              MtpGqaEnvelopes envelopes, DecodeGraphDefinition& definition) {
     auto body = mtp_decode_batch_body(state, batch_size, k, envelopes);
-    warm_capture(state, definition, prepare, body);
+    capture_graph(state, definition, body);
 }
 
 void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,

@@ -126,8 +126,6 @@ struct TargetVerifyFrameView {
     DFlashFeatureSink* feature_sink        = nullptr;
 };
 
-using GraphPrepare = std::function<void()>;
-
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t current_state_slot,
                          std::int32_t turn_checkpoint_state_slot,
@@ -164,18 +162,16 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
 // Executes one exact-B ordinary decode traversal. All request rows enter through the stable
 // ordinary ingress, share one model schedule, publish continuation hidden by selector, and leave
 // through one compact egress transfer.
-void warm_capture_ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
-                                        ops::GqaExecutionEnvelope envelope,
-                                        const GraphPrepare& prepare,
-                                        DecodeGraphDefinition& definition);
+void capture_ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
+                                   ops::GqaExecutionEnvelope envelope,
+                                   DecodeGraphDefinition& definition);
 void ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
                            ops::GqaExecutionEnvelope envelope, DecodeGraphExecutable* executable);
 
 // Executes one exact-B MTP verification/alignment/proposal transaction. Each row may carry a
 // different current and next proposal extent while the model traversal remains batched.
-void warm_capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                                   MtpGqaEnvelopes envelopes, const GraphPrepare& prepare,
-                                   DecodeGraphDefinition& definition);
+void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
+                              MtpGqaEnvelopes envelopes, DecodeGraphDefinition& definition);
 void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                       MtpGqaEnvelopes envelopes, DecodeGraphExecutable* executable);
 
@@ -189,11 +185,10 @@ void dflash_append_context(PrefillContext& state, const Tensor& features, const 
                            const Tensor& commit_counts, const Tensor& lanes,
                            const Tensor& table_rows,
                            ops::KVCacheAppendPrefixExecutionEnvelope envelope);
-void warm_capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size,
-                                      std::uint32_t k, DFlashEnvelopes envelopes,
-                                      ops::GqaExecutionEnvelope target_envelope,
-                                      const GraphPrepare& prepare,
-                                      DecodeGraphDefinition& definition);
+void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size,
+                                 std::uint32_t k, DFlashEnvelopes envelopes,
+                                 ops::GqaExecutionEnvelope target_envelope,
+                                 DecodeGraphDefinition& definition);
 void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                          DFlashEnvelopes envelopes, ops::GqaExecutionEnvelope target_envelope,
                          DecodeGraphExecutable* executable);
