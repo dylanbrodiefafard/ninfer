@@ -228,7 +228,7 @@ admission；二者是 server-side phases，不需要扩展成更多 model-execut
 Intermediate prefill chunks 只推进 prompt state。Finalization unit 执行 target output selection并建立 decode
 anchor；如果立即命中 terminal condition，请求不进入 decode batch。Retained current frontier 正好覆盖完整
 prompt 时可以跳过 suffix prefill，但仍通过同一 finalization unit 从 retained tail state 产生下一 anchor，并在
-MTP 下完成 exact-hit bridge/proposal。命中已保存 boundary checkpoint 时则从该 checkpoint prefill 新 suffix。
+MTP 下完成 exact-hit bridge/proposal。命中已保存 turn checkpoint 时则从该 checkpoint prefill 新 suffix。
 单独的 KV match 不足以进入 `DECODE_READY`。
 
 ### 4.2 Slot
@@ -277,7 +277,7 @@ capacity 时可以先驱逐其他 free lanes 上的 retained state。新 request
 state 始终重新创建。
 
 Qwen3.6 的 lane 是 Linear Attention state 的唯一 locator。`C=max_concurrency` 时，shared pool 固定使用
-`[0,C)` 作为各 lane 的 current committed state，使用 `[C,2C)` 作为各 lane 的 prefix-boundary
+`[0,C)` 作为各 lane 的 current committed state，使用 `[C,2C)` 作为各 lane 的 turn-checkpoint
 checkpoint；一份 slot 同时选择全部 GDN layers 的 convolution history 和 recurrent state。Decode round
 不在 `SequenceState` 中维护随 speculative position 变化的 state selector。
 
@@ -690,8 +690,8 @@ block-table 和 allocator 的 contract 属于 Paged KV Context Store，不在本
 Retained prefix 是从已结束 request 中分离出来的、单一 owner 的 SequenceState。它留在原 physical lane，
 但该 lane 的 control slot 对 scheduler 是 free。Retained state 只发布 target 已保存完整 continuation state
 的 checkpoints。当前 Qwen3.6 retained state 可以发布 current
-resume frontier，以及一份有效时的 assistant-content boundary checkpoint。两者引用同一份 KV
-allocation；boundary checkpoint 额外保存对应的 recurrent、hidden、speculative-backend 和 position state，
+resume frontier，以及一份有效时的 turn checkpoint。两者引用同一份 KV allocation；turn checkpoint
+额外保存对应的 recurrent、hidden、speculative-backend 和 position state，
 不复制 KV payload。
 
 Admission 在同一 lane 成功时消费 retained entry，并把 SequenceState ownership 转移给新 request：
@@ -699,11 +699,11 @@ Admission 在同一 lane 成功时消费 retained entry，并把 SequenceState o
 - incoming prompt 在 current resume frontier 结束时，跳过 suffix token processing，经 finalization unit
   产生下一 anchor 后进入 `DECODE_READY`；
 - incoming prompt 完整包含 current resume frontier 并有后续 suffix 时，从该 frontier prefill suffix；
-- incoming prompt 匹配已保存 assistant-content boundary 并在其后有新 suffix 时，在 atomic admission
-  transaction 提交后把 growing allocations truncate 到 boundary、恢复完整 checkpoint，再 prefill suffix；
+- incoming prompt 匹配已保存 turn checkpoint 并在其后有新 suffix 时，在 atomic admission transaction
+  提交后把 growing allocations truncate 到 checkpoint frontier、恢复完整 checkpoint，再 prefill suffix；
 - common prefix 结束在没有 checkpoint 的任意其他位置时视为 cache miss。
 
-Boundary restore 保留包含 checkpoint 的部分尾页，释放其后的完整 pages。KV page 或 token prefix match
+Turn-checkpoint restore 保留包含 checkpoint 的部分尾页，释放其后的完整 pages。KV page 或 token prefix match
 本身不是 checkpoint；当前架构不支持 arbitrary longest-common-prefix reuse。
 
 一个 retained entry 同时只能被一个 active request 消费。多个 active requests 不共享同一份可写

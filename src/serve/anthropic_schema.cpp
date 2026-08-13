@@ -473,6 +473,12 @@ GenerationRequest parse_messages_request(const Json& body, const RequestLimits& 
     parse_stop_sequences(body, out);
     parse_sampling(body, out);
     parse_thinking(body, out);
+    if (body.contains("preserve_thinking") && !body.at("preserve_thinking").is_null()) {
+        if (!body.at("preserve_thinking").is_boolean()) {
+            bad_request("preserve_thinking must be a boolean or null", "preserve_thinking");
+        }
+        out.preserve_thinking = body.at("preserve_thinking").get<bool>();
+    }
 
     out.stream = get_bool(body, "stream", false);
 

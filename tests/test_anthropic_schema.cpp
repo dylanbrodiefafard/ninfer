@@ -55,7 +55,8 @@ ninfer::OwnedMedia fake_media(const ContentPart& part) {
 }
 
 ninfer::PromptInput translate(const GenerationRequest& req) {
-    return to_prompt_input(req, default_server(), fake_media);
+    const ServeOptions server = default_server();
+    return to_prompt_input(req, resolve_prompt_semantics(req, server), fake_media);
 }
 
 std::string joined_text(const ninfer::ChatMessage& message) {
@@ -369,6 +370,8 @@ int test_thinking_and_sampling() {
     failures += check(req.stop_strings.size() == 2 && req.stop_strings[0] == "STOP",
                       "stop_sequences parsed");
     failures += check(req.enable_thinking.has_value() && *req.enable_thinking, "thinking enabled");
+    failures += check(!req.preserve_thinking.has_value(),
+                      "Anthropic thinking.type unexpectedly enabled history preservation");
     const ninfer::RequestOptions options = to_request_options(req, default_server());
     failures +=
         check(options.execution.requested_output_tokens == 8, "max_tokens reaches Engine options");
@@ -393,6 +396,17 @@ int test_thinking_and_sampling() {
     const GenerationRequest areq = parse_messages_request(adaptive, default_limits());
     failures +=
         check(areq.enable_thinking.has_value() && *areq.enable_thinking, "adaptive -> thinking on");
+
+    Json preserve                 = body;
+    preserve["thinking"]          = Json{{"type", "disabled"}};
+    preserve["preserve_thinking"] = true;
+    const GenerationRequest preq  = parse_messages_request(preserve, default_limits());
+    failures += check(preq.enable_thinking == false && preq.preserve_thinking == true,
+                      "Anthropic preserve_thinking was not independent from thinking.type");
+    Json invalid                 = body;
+    invalid["preserve_thinking"] = "yes";
+    failures += check(throws_api([&] { (void)parse_messages_request(invalid, default_limits()); }),
+                      "Anthropic accepted non-boolean preserve_thinking");
     return failures;
 }
 

@@ -43,6 +43,7 @@ Active implementation and architecture references:
 - [ReplaySSM GDN technical reference](maintainer/replayssm-gdn.md)
 - [ReplaySSM GDN implementation design](maintainer/replayssm-gdn-implementation.md)
 - [ReplaySSM GDN engine integration design](maintainer/replayssm-gdn-engine-integration.md)
+- [Qwen3.6 thinking preservation and turn-checkpoint semantics](maintainer/qwen3.6-thinking-preservation.md)
 - [Softmax Attention organization and migration contract](maintainer/softmax-attention.md)
 - [Linear benchmark contract and registered suites](maintainer/linear-benchmark.md)
 - [Qwen3.6-27B artifact contracts, including NVFP4](maintainer/qwen3.6-27b-artifact.md)

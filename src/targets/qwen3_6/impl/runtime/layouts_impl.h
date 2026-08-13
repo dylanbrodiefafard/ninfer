@@ -149,11 +149,11 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     if constexpr (Variant::supports_dflash) {
         if (plan.features.dflash()) {
             DFlashPersistentLayout& dflash = out.dflash.emplace();
-            dflash.local          = plan_cyclic_kv_cache(builder, DFlashConfig::local_layers,
-                                                         DFlashConfig::local_capacity,
-                                                         DFlashConfig::kv_heads, DFlashConfig::head_dim,
-                                                         static_cast<std::int32_t>(plan.max_concurrency));
-            dflash.boundary_local = plan_cyclic_kv_cache(
+            dflash.local                 = plan_cyclic_kv_cache(builder, DFlashConfig::local_layers,
+                                                                DFlashConfig::local_capacity,
+                                                                DFlashConfig::kv_heads, DFlashConfig::head_dim,
+                                                                static_cast<std::int32_t>(plan.max_concurrency));
+            dflash.turn_checkpoint_local = plan_cyclic_kv_cache(
                 builder, DFlashConfig::local_layers, DFlashConfig::local_capacity,
                 DFlashConfig::kv_heads, DFlashConfig::head_dim,
                 static_cast<std::int32_t>(plan.max_concurrency));
@@ -215,9 +215,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.tail_hidden = add_tensor(
         builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(plan.max_concurrency)},
         "tail hidden");
-    out.boundary_hidden = add_tensor(
+    out.turn_checkpoint_hidden = add_tensor(
         builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(plan.max_concurrency)},
-        "boundary hidden");
+        "turn checkpoint hidden");
     out.bytes = builder.finish(kArenaAlign, "persistent layout");
     out.kv_payload_bytes =
         out.decoder.kv_payload_bytes() + (out.dflash ? out.dflash->kv_payload_bytes() : 0);

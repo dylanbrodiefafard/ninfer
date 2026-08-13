@@ -38,7 +38,7 @@ MTP 和 DFlash 只在 proposal 生成及其私有 companion state 上不同。�
 2. CPU 确定最终接受前缀后，一次 Fold 更新本轮全部 rows 和全部 GDN layers；
 3. MTP 与 DFlash 使用同一个 speculative target-state commit 路径；
 4. linear-attention state pool 固定为每个 lane 两份完整 state，不再随 draft window 增长；
-5. ordinary decode、prefill 和 prefix boundary 继续使用同一个 state pool；
+5. ordinary decode、prefill 和 turn checkpoint 继续使用同一个 state pool；
 6. committed GDN state、KV frontier、continuation hidden、backend continuation representation 和输出
    保持同一逻辑提交边界；
 7. CUDA Graph 捕获 Record，Fold 保持为 CPU 决策后的 eager kernel。
@@ -143,14 +143,14 @@ Program 的 linear-attention state pool 固定包含 `2*C` 个 absolute slots：
 | Absolute slot | 所有者与语义 |
 |---|---|
 | `[0,C)` | lane 的 current committed state |
-| `[C,2C)` | lane 的 prefix boundary checkpoint |
+| `[C,2C)` | lane 的 turn checkpoint |
 
 映射为：
 
 ~~~cpp
-current_state_slot(lane)  = lane;
-boundary_state_slot(lane) = max_concurrency + lane;
-state_slot_count          = 2 * max_concurrency;
+current_state_slot(lane)         = lane;
+turn_checkpoint_state_slot(lane) = max_concurrency + lane;
+state_slot_count                 = 2 * max_concurrency;
 ~~~
 
 一个 absolute slot 同时选择全部 GDN layers 的 BF16 causal-conv history 和 FP32 recurrent state。
@@ -169,7 +169,7 @@ boundary pool 不能降低必须保证的最大容量。
 
 ### 3.3 SequenceState
 
-`SequenceState::lane` 是 current/boundary slot 的唯一定位信息。以下 snapshot-era 字段删除：
+`SequenceState::lane` 是 current/turn-checkpoint slot 的唯一定位信息。以下 snapshot-era 字段删除：
 
 ~~~text
 linear_state_base
@@ -183,14 +183,14 @@ current_linear_state_slot
 |---|---|
 | Full reset | zero `current_state_slot(lane)` |
 | Prefill/append | 在 `current_state_slot(lane)` 原地推进 |
-| 保存 boundary | copy `current_state_slot(lane) -> boundary_state_slot(lane)` |
-| 恢复 boundary | copy `boundary_state_slot(lane) -> current_state_slot(lane)` |
+| 保存 turn checkpoint | copy `current_state_slot(lane) -> turn_checkpoint_state_slot(lane)` |
+| 恢复 turn checkpoint | copy `turn_checkpoint_state_slot(lane) -> current_state_slot(lane)` |
 | Ordinary decode | 在 `current_state_slot(lane)` 执行一个 transition |
 | Speculative verify | 只读 `current_state_slot(lane)`，写 Replay records |
 | Speculative resolve | Fold 到 `current_state_slot(lane)` |
 
-`clear_lane` 只使 current/boundary 的生命周期元数据失效；下一次 Full reset 在使用前清零 current slot。
-无效 boundary 的旧 bytes 不具有语义，也不需要主动清零。
+`clear_lane` 使 turn checkpoint 的生命周期元数据失效；下一次 Full reset 在使用前清零 current slot。
+无效 checkpoint 的旧 bytes 不具有语义，也不需要主动清零。
 
 ---
 
@@ -327,7 +327,8 @@ continuation_slots
 physical table-row binding 不是 linear-state slot contract。
 
 Prefill 不使用 DecodeBatchFrame。RoundState 中的 scalar `linear_state_read_slot` 和
-`linear_state_snapshot_base_slot` 同样删除；prefill 直接接收 host-known 的 current/boundary absolute slots。
+`linear_state_snapshot_base_slot` 同样删除；prefill 直接接收 host-known 的
+current/turn-checkpoint absolute slots。
 
 ---
 
@@ -365,17 +366,17 @@ read slot  = lane
 write slot = lane
 ~~~
 
-若 chunk 在请求的 prefix boundary 结束，则在该 chunk 的 GDN work 之后执行一次 all-layer slot copy：
+若 chunk 在请求的 turn-checkpoint frontier 结束，则在该 chunk 的 GDN work 之后执行一次 all-layer slot copy：
 
 ~~~text
 lane -> C + lane
 ~~~
 
-后续 chunk 继续在 `lane` 原地推进。RestoreBoundary 在 prefill 开始前先执行
+后续 chunk 继续在 `lane` 原地推进。RestoreTurnCheckpoint 在 prefill 开始前先执行
 `C+lane -> lane`，此后进入相同的 prefill 路径。
 
 TextContext 不再从 device scalar 回读 initial slot，也不再维护 request-local base/capacity group。Prefill
-配置只传入由 lane 推导出的 current/boundary slots。
+配置只传入由 lane 推导出的 current/turn-checkpoint slots。
 
 ### 6.3 Ordinary decode
 
@@ -636,18 +637,19 @@ ReplaySSM 不改变 prefix 选择规则，只改变 GDN checkpoint 的 physical 
 Retained sequence 的 current GDN state 已在 `slot=lane`，与 `execution_frontier` 对齐。Prefill suffix 直接在
 该 slot 原地继续。
 
-### 11.2 RestoreBoundary
+### 11.2 RestoreTurnCheckpoint
 
-当 request plan 选择已保存的 boundary：
+当 request plan 选择已保存的 turn checkpoint：
 
-1. 恢复 Text/backend KV 的既有 boundary 语义；
+1. 恢复 Text/backend KV 的既有 checkpoint frontier；
 2. copy GDN state `C+lane -> lane`；
-3. 恢复 boundary hidden；
-4. 把 committed frontiers 设置到 boundary；
+3. 恢复 turn-checkpoint hidden；
+4. 把 committed frontiers 设置到 checkpoint frontier；
 5. 后续 suffix prefill 在 `lane` 原地继续。
 
-Restore 后不交换 current/boundary 的角色。Source bytes 仍位于 `C+lane`；旧 boundary 的有效性元数据按
-现有 request lifecycle 消费，本次 request 在完成自己的 prefill 时可以按 prompt 规则建立新的 boundary。
+Restore 后不交换 current/turn-checkpoint 的角色，source bytes 仍位于 `C+lane`。`KeepExisting` 保留
+metadata 和 dedicated payload；`CaptureNew` 在旧 checkpoint 完成 restore 后使 metadata 失效，并仅在
+完整 prefill 成功后发布新的 frontier。Replay Fold 始终只写 current slot。
 
 ### 11.3 Partial speculative terminal
 
@@ -663,7 +665,7 @@ flush 都提交相同的 `base_E+m_b`。因此 retained sequence 可以从这个
 
 | 文件 | 修改 |
 |---|---|
-| `src/targets/qwen3_6/impl/runtime/linear_state_slots.h` | 定义 `2C` current/boundary plane mapping，删除 snapshot-position helpers |
+| `src/targets/qwen3_6/impl/runtime/linear_state_slots.h` | 定义 `2C` current/turn-checkpoint plane mapping，删除 snapshot-position helpers |
 | `src/targets/qwen3_6/impl/runtime/layouts.h` | `PersistentLayout` 增加可选 `GdnReplayRecordLayout` |
 | `src/targets/qwen3_6/impl/runtime/layouts_impl.h` | state pool 规划为 `2C`；spec backend 规划 exact-`C/T` records；workspace 按实际 GDN path 计算 |
 | `src/targets/qwen3_6/impl/runtime/program.h` | Program 绑定 records；SequenceState 删除 base/capacity/current cursor；增加公共 speculative resolve helper |
@@ -677,10 +679,10 @@ flush 都提交相同的 `base_E+m_b`。因此 retained sequence 可以从这个
 |---|---|
 | `src/targets/qwen3_6/export/ninfer/targets/qwen3_6/round_state.h` | 三种 ingress 统一 `lanes`；删除 read/snapshot selectors 和 prefill scalar selectors |
 | `src/targets/qwen3_6/impl/state/round_state.cpp` | 绑定新的 ingress/round layout |
-| `src/targets/qwen3_6/impl/runtime/schedule.h` | contexts 和 `TargetVerifyFrameView` 传递 lanes/records；prefill 传 current/boundary slots |
+| `src/targets/qwen3_6/impl/runtime/schedule.h` | contexts 和 `TargetVerifyFrameView` 传递 lanes/records；prefill 传 current/turn-checkpoint slots |
 | `src/targets/qwen3_6/impl/runtime/text_context.h` | 增加显式 GDN state action 和 Replay records binding |
 | `src/targets/qwen3_6/impl/runtime/text_context_impl.h` | prefill 原地、ordinary width-1 原地、spec Record 三条路径 |
-| `src/targets/qwen3_6/impl/runtime/text_prefill_impl.h` | 用 lane/current/boundary slot 约定替换 group base/capacity |
+| `src/targets/qwen3_6/impl/runtime/text_prefill_impl.h` | 用 lane/current/turn-checkpoint slot 约定替换 group base/capacity |
 | `src/targets/qwen3_6/impl/runtime/decode_impl.h` | ordinary decode 以统一 lanes 同时选择原地 GDN state 与 continuation hidden destination |
 | `src/targets/qwen3_6/impl/runtime/speculative_target_impl.h` | 公共 target verify 切换到 Record |
 | `src/targets/qwen3_6/impl/runtime/mtp_impl.h` | 删除 MTP snapshot selectors，传统一 lanes/records |
@@ -708,7 +710,7 @@ Record/Fold Ops、`GdnReplayRecords` 和 all-layer state view 已经完成，不
    收窄为 final-prefill resolve；
 7. 实现一次 Fold、batched hidden correction、enqueue-only DFlash terminal flush 和一次同步组成的公共
    commit tail；
-8. 切换 prefill/boundary/ordinary 到固定 current/boundary slots，删除 SequenceState snapshot cursor；
+8. 切换 prefill/checkpoint/ordinary 到固定 current/turn-checkpoint slots，删除 SequenceState snapshot cursor；
 9. 更新 graph representative preparation、memory accounting、tests 和 round benchmarks；
 10. 更新并发架构文档中的 DecodeBatchFrame、speculative transaction 和 linear-state slot 描述。
 
@@ -785,7 +787,7 @@ Engine 集成不建立一套旧 Program snapshot route 来重复这些数值测�
 - state pool slot count 对所有 backends 都是 `2*C`；
 - ordinary backend 不含 record arena；
 - MTP/DFlash record spec 精确等于配置的 `C` 和 `D+1`；
-- current/boundary slot mapping 和 copy/restore 语义。
+- current/turn-checkpoint slot mapping 和 copy/restore 语义。
 
 ### 15.3 Real Engine tests
 
@@ -796,7 +798,7 @@ Engine 集成不建立一套旧 Program snapshot route 来重复这些数值测�
 - valid extent 为 1 的零草稿 speculative round，提交一列 Record；
 - target-licensed batch 内的 partial terminal；
 - terminal 后从精确 frontier 做 prefix reuse；
-- boundary 保存、current state 继续推进、随后恢复 boundary；
+- turn checkpoint 保存、current state 继续推进、随后恢复；
 - `B>1` compact batch 在某个 lane 完成后形成非连续 lanes，并让 surviving rows 具有不同 commit lengths。
 
 最后一项直接保护 `record row b -> lanes[b]` 映射。Output、reused frontier 和后续 greedy continuation

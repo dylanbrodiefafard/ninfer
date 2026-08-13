@@ -15,7 +15,16 @@ namespace ninfer::serve {
 // target frontend sees it.
 using MediaAcquirer = std::function<ninfer::OwnedMedia(const ContentPart&)>;
 
-ninfer::PromptInput to_prompt_input(const GenerationRequest& req, const ServeOptions& server,
+struct ResolvedPromptSemantics {
+    bool enable_thinking   = true;
+    bool preserve_thinking = false;
+};
+
+ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& req,
+                                                 const ServeOptions& server);
+
+ninfer::PromptInput to_prompt_input(const GenerationRequest& req,
+                                    const ResolvedPromptSemantics& semantics,
                                     const MediaAcquirer& acquire_media);
 
 // Build public request options (output budget, thinking, stop policy, sampler). The

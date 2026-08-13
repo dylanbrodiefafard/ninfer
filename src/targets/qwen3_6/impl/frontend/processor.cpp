@@ -447,23 +447,33 @@ std::string placeholder(const VisionItem& item) {
     return out;
 }
 
-std::string expand_placeholders(std::string rendered, const std::vector<VisionItem>& items) {
+RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<VisionItem>& items) {
     std::size_t search = 0;
     for (const VisionItem& item : items) {
         const std::string_view needle    = item.modality == Modality::Image ? kImagePad : kVideoPad;
-        const std::size_t position       = rendered.find(needle, search);
+        const std::size_t position       = rendered.text.find(needle, search);
         const std::string_view other     = item.modality == Modality::Image ? kVideoPad : kImagePad;
-        const std::size_t other_position = rendered.find(other, search);
+        const std::size_t other_position = rendered.text.find(other, search);
         if (position == std::string::npos ||
             (other_position != std::string::npos && other_position < position)) {
             throw std::invalid_argument("chat media order does not match rendered placeholders");
         }
         const std::string replacement = placeholder(item);
-        rendered.replace(position, needle.size(), replacement);
+        if (rendered.turn_rewrite_byte_offset) {
+            const std::size_t boundary = *rendered.turn_rewrite_byte_offset;
+            const std::size_t end      = position + needle.size();
+            if (position < boundary && boundary < end) {
+                throw std::logic_error("turn rewrite boundary intersects a media placeholder");
+            }
+            if (end <= boundary) {
+                *rendered.turn_rewrite_byte_offset = boundary - needle.size() + replacement.size();
+            }
+        }
+        rendered.text.replace(position, needle.size(), replacement);
         search = position + replacement.size();
     }
-    if (rendered.find(kImagePad, search) != std::string::npos ||
-        rendered.find(kVideoPad, search) != std::string::npos) {
+    if (rendered.text.find(kImagePad, search) != std::string::npos ||
+        rendered.text.find(kVideoPad, search) != std::string::npos) {
         throw std::invalid_argument("rendered chat has unbound vision placeholders");
     }
     return rendered;
@@ -612,6 +622,26 @@ std::span<const std::int32_t> ProcessedInput::position_axis(int axis) const {
         static_cast<std::size_t>(axis) * input_ids.size(), input_ids.size());
 }
 
+EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered) {
+    EncodedChat encoded;
+    encoded.input_ids = tokenizer.encode(rendered.text);
+    if (!rendered.turn_rewrite_byte_offset) { return encoded; }
+    if (*rendered.turn_rewrite_byte_offset > rendered.text.size()) {
+        throw std::logic_error("turn rewrite byte offset exceeds rendered chat");
+    }
+    const std::vector<int> prefix = tokenizer.encode(
+        std::string_view(rendered.text).substr(0, *rendered.turn_rewrite_byte_offset));
+    if (prefix.empty() || prefix.size() >= encoded.input_ids.size() ||
+        !std::equal(prefix.begin(), prefix.end(), encoded.input_ids.begin())) {
+        throw std::logic_error("turn rewrite prefix is not an exact token prefix");
+    }
+    if (prefix.size() > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("turn rewrite token boundary exceeds uint32");
+    }
+    encoded.turn_rewrite_boundary = static_cast<std::uint32_t>(prefix.size());
+    return encoded;
+}
+
 Processor::Processor(const Tokenizer& tokenizer, ProcessorOptions options)
     : tokenizer_(tokenizer), options_(std::move(options)) {
     if (options_.max_media_items == 0 || options_.max_prompt_tokens == 0 ||
@@ -635,7 +665,7 @@ ProcessedInput Processor::process(const std::vector<ChatMessage>& messages,
         throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
                              "media item count exceeds processor budget");
     }
-    std::string rendered = render_chat(messages, std::move(render_options));
+    RenderedChat rendered = render_chat(messages, std::move(render_options));
     const media::decode::Policy policy{
         .max_bytes                  = options_.max_media_bytes,
         .max_decoded_pixels         = options_.max_decoded_pixels,
@@ -674,8 +704,10 @@ ProcessedInput Processor::process(const std::vector<ChatMessage>& messages,
         throw std::logic_error("preprocessed patch count does not match processor budget");
     }
 
-    rendered         = expand_placeholders(std::move(rendered), items);
-    output.input_ids = tokenizer_.encode(rendered);
+    rendered                     = expand_placeholders(std::move(rendered), items);
+    EncodedChat encoded          = encode_rendered_chat(tokenizer_, rendered);
+    output.input_ids             = std::move(encoded.input_ids);
+    output.turn_rewrite_boundary = encoded.turn_rewrite_boundary;
     output.token_types.resize(output.input_ids.size(), 0);
     for (std::size_t i = 0; i < output.input_ids.size(); ++i) {
         if (output.input_ids[i] == kImageToken) {

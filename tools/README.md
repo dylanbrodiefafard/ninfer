@@ -20,6 +20,7 @@ for the selected tool.
 | Compare 27B artifact/source Vision activations | [`parity/qwen3_6_27b/`](parity/qwen3_6_27b/README.md) |
 | Run benchmark matrices | [`bench/`](bench/README.md) |
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
+| Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |
 
 ## Artifact workflow
 
@@ -88,3 +89,11 @@ python3 -m tools.smoke.serve_contract \
 
 The client exercises OpenAI, Anthropic, streaming, usage, multimodal, and tool-call response
 surfaces against the resident process.
+
+For turn-checkpoint and thinking-history behavior, the managed smoke script launches a real server
+and consumes the repository fixture:
+
+```bash
+python3 tools/smoke/serve_thinking_preservation.py \
+  --artifact out/qwen3_6_27b.ninfer --backend mtp
+```

@@ -79,11 +79,18 @@ The endpoint supports:
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`;
 - function tools, tool choices, assistant tool-call history, and tool-result messages;
-- the `enable_thinking` extension.
+- the `enable_thinking` extension;
+- `chat_template_kwargs.preserve_thinking` and the top-level `preserve_thinking` alias.
 
 The request `model` must equal the public model ID: the artifact `identity.model_id` by default, or
 the explicit `--model-id` override. Reasoning is returned separately as `reasoning_content`; answer
 text remains in `content`.
+
+`enable_thinking` controls whether the new assistant turn may reason. `preserve_thinking` controls
+whether reasoning from closed assistant turns remains in later prompts. The latter defaults to the
+server setting, which is off unless `--preserve-thinking` is used. If both OpenAI spellings are
+present they must carry the same boolean value. Unknown non-null `chat_template_kwargs` are
+rejected.
 
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
 finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty
@@ -166,6 +173,8 @@ wire response contains typed `output` Items.
 | `top_p` | finite number in `[0,1]` |
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
 | `reasoning.effort` | `none` disables Qwen thinking; `medium` enables it; other effort levels are rejected because this checkpoint exposes a binary thinking mode |
+| `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
+| `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
 | `text.format` | omitted or `{"type":"text"}` only |
 | `tools` | flat Responses function definitions; see below |
 | `tool_choice` | `auto` or `none` |
@@ -298,6 +307,10 @@ Function definitions are request configuration rather than conversation Items an
 again on tool-result turns. The reconstructed prompt follows the ordinary Engine path, so resident
 prefix reuse applies naturally.
 
+A stored Response also retains its resolved `preserve_thinking` value. A child which omits the
+field inherits the parent value. An explicit different value creates a new semantic branch; prompt
+identity then determines whether the Engine restores a turn checkpoint or performs a full reset.
+
 Resource behavior:
 
 | Endpoint | Contract |
@@ -350,6 +363,8 @@ curl http://127.0.0.1:8080/v1/messages \
 The endpoint supports system text, user/assistant history, text and image blocks, thinking blocks,
 tool-use history, tool results, client-defined tools, non-streaming responses, and Anthropic SSE
 events. `thinking.type: "disabled"` disables thinking; other supported values enable it.
+The independent top-level `preserve_thinking` boolean controls closed-turn history and otherwise
+uses the server default.
 
 Anthropic's `model` field is treated as a response label and does not select the loaded artifact.
 
@@ -406,6 +421,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--no-thinking` | disable thinking by default | thinking on |
+| `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--cors` | permissive browser CORS headers | off |
 | `--greedy` | force exact argmax for all requests | off |
 
@@ -427,15 +443,15 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v6 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v7 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance.
 
 | Event | Contents |
 |---|---|
-| `server_start` | target/weights identity and artifact, resolved Engine and sampler configuration, weights/sequence/workspace/request-transient arenas, KV sizing ledger, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
-| `request_start` | protocol, resolved sampler and seed, thinking mode, output budget, stream/message/tool shape |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, unrounded phase seconds, and complete speculative-decoding counters |
+| `server_start` | target/weights identity and artifact, resolved Engine, thinking-history and sampler defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
+| `request_start` | protocol, resolved sampler and seed, thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, unrounded phase seconds, and complete speculative-decoding counters |
 | `request_error` | the resolved request configuration and generation error message |
 | `throughput` | interval token deltas and rates, scheduler occupancy, and decode-round batch statistics |
 
@@ -512,6 +528,13 @@ positions, encoded-media digest, grid, and consumer spans; changing an earlier i
 therefore resets the prefix instead of reusing placeholder-token KV. Media wholly inside a matched
 prefix skips Vision execution, while new suffix media is encoded normally. The completion log
 reports the reused token count as `cache=`.
+
+Qwen3.6 distinguishes `full_reset`, `append_frontier`, and `restore_turn_checkpoint`. A turn
+checkpoint includes the recurrent and selected speculative-backend continuation state required to
+recompute a rewritten suffix; matching KV tokens alone never authorize a partial hit. Stable
+`preserve_thinking=true` histories normally append, while stable `false` histories restore the
+previous open-turn checkpoint when a new user closes that turn. The JSONL completion record exposes
+the selected path as `prefix_reuse_path`.
 
 Speculative decoding is an engine option and does not change protocol output shapes, stop behavior,
 or usage accounting. If a stop truncates a multi-token MTP or DFlash round, the Engine commits the

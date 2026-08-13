@@ -330,14 +330,17 @@ GenerationService::acquire_media_input(Clock::time_point deadline,
 PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            std::function<bool()> is_cancelled) const {
     PreparedRequest prepared;
-    ninfer::RequestOptions request_options = to_request_options(request, options_);
-    prepared.sampling                      = request_options.execution.sampling;
-    prepared.include_usage                 = request.include_usage;
-    prepared.tool_capable                  = request.uses_tools() || request.has_tool_history();
-    prepared.tool_name_max_length          = request.tool_name_max_length;
-    prepared.enable_thinking      = request.enable_thinking.value_or(options_.enable_thinking);
-    const std::size_t media_items = media_item_count(request);
-    const bool request_has_media  = media_items != 0;
+    ninfer::RequestOptions request_options     = to_request_options(request, options_);
+    prepared.sampling                          = request_options.execution.sampling;
+    prepared.include_usage                     = request.include_usage;
+    prepared.tool_capable                      = request.uses_tools() || request.has_tool_history();
+    prepared.tool_name_max_length              = request.tool_name_max_length;
+    const ResolvedPromptSemantics semantics    = resolve_prompt_semantics(request, options_);
+    prepared.enable_thinking                   = semantics.enable_thinking;
+    prepared.preserve_thinking                 = semantics.preserve_thinking;
+    prepared.preserve_thinking_semantic_change = request.preserve_thinking_semantic_change;
+    const std::size_t media_items              = media_item_count(request);
+    const bool request_has_media               = media_items != 0;
     if (request_has_media && !options_.enable_vision) {
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");
@@ -355,7 +358,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
     try {
         std::size_t remaining_media_bytes = options_.max_request_bytes;
         ninfer::PromptInput input =
-            to_prompt_input(request, options_, [&](const ContentPart& part) {
+            to_prompt_input(request, semantics, [&](const ContentPart& part) {
                 return acquire_media(part, prepared.lifetime->deadline, is_cancelled,
                                      remaining_media_bytes);
             });
@@ -387,12 +390,13 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
     }
     const Clock::time_point deadline =
         Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms);
+    const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
     HostInputLease host_input;
     if (request_has_media) { host_input = acquire_media_input(deadline, is_cancelled); }
     try {
         std::size_t remaining_media_bytes = options_.max_request_bytes;
         ninfer::PromptInput input =
-            to_prompt_input(request, options_, [&](const ContentPart& part) {
+            to_prompt_input(request, semantics, [&](const ContentPart& part) {
                 return acquire_media(part, deadline, is_cancelled, remaining_media_bytes);
             });
         check_preparation_control(deadline, is_cancelled);
@@ -442,6 +446,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         prepared.prepare_seconds +
         std::max(0.0, result.timings.total_seconds - result.timings.prepare_seconds);
     outcome.metrics.prefix_cache_hit_tokens     = result.reused_prompt_tokens;
+    outcome.metrics.prefix_reuse_path           = result.prefix_reuse_path;
     outcome.metrics.speculative_backend         = result.speculative.backend;
     outcome.metrics.speculative_draft_window    = result.speculative.draft_window;
     outcome.metrics.speculative_rounds          = result.speculative.rounds;

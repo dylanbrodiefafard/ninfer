@@ -35,6 +35,18 @@ bool ends_with(const std::string& text, std::string_view suffix) {
            text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
+long last_real_user_query(const std::vector<ChatMessage>& messages) {
+    for (long i = static_cast<long>(messages.size()) - 1; i >= 0; --i) {
+        const ChatMessage& message = messages[static_cast<std::size_t>(i)];
+        if (message.role != "user") { continue; }
+        const std::string content = trim_ascii_whitespace(message.rendered_content());
+        if (!(starts_with(content, "<tool_response>") && ends_with(content, "</tool_response>"))) {
+            return i;
+        }
+    }
+    throw std::invalid_argument("no user query found in chat messages");
+}
+
 std::string lstrip_newlines(std::string text) {
     std::size_t begin = 0;
     while (begin < text.size() && text[begin] == '\n') { ++begin; }
@@ -208,7 +220,7 @@ std::string ChatMessage::rendered_content(bool add_vision_id, int* image_count,
     return out;
 }
 
-std::string render_chat(const std::vector<ChatMessage>& messages, ChatRenderOptions options) {
+RenderedChat render_chat(const std::vector<ChatMessage>& messages, ChatRenderOptions options) {
     if (messages.empty()) { throw std::invalid_argument("chat messages must not be empty"); }
 
     std::size_t num_sys = 0;
@@ -231,23 +243,8 @@ std::string render_chat(const std::vector<ChatMessage>& messages, ChatRenderOpti
         rendered += "<|im_end|>\n";
     }
 
-    // last_query_index = index of the last user message whose (trimmed) content is
-    // not a bare <tool_response>...</tool_response> wrapper. (jinja lines 76-86)
-    long last_query_index = static_cast<long>(messages.size()) - 1;
-    bool multi_step_tool  = true;
-    for (long i = static_cast<long>(messages.size()) - 1; i >= 0; --i) {
-        if (!multi_step_tool) { break; }
-        const ChatMessage& message = messages[static_cast<std::size_t>(i)];
-        if (message.role == "user") {
-            const std::string content = trim_ascii_whitespace(message.rendered_content());
-            if (!(starts_with(content, "<tool_response>") &&
-                  ends_with(content, "</tool_response>"))) {
-                multi_step_tool  = false;
-                last_query_index = i;
-            }
-        }
-    }
-    if (multi_step_tool) { throw std::invalid_argument("no user query found in chat messages"); }
+    const long last_query_index = last_real_user_query(messages);
+    std::optional<std::size_t> turn_rewrite_byte_offset;
 
     int image_count = 0;
     int video_count = 0;
@@ -294,6 +291,9 @@ std::string render_chat(const std::vector<ChatMessage>& messages, ChatRenderOpti
         const bool keep_thinking =
             options.preserve_thinking || (static_cast<long>(i) > last_query_index);
         rendered += "<|im_start|>assistant\n";
+        if (!turn_rewrite_byte_offset && static_cast<long>(i) > last_query_index) {
+            turn_rewrite_byte_offset = rendered.size();
+        }
         if (keep_thinking) {
             rendered += "<think>\n";
             rendered += reasoning;
@@ -316,13 +316,15 @@ std::string render_chat(const std::vector<ChatMessage>& messages, ChatRenderOpti
 
     if (options.add_generation_prompt) {
         rendered += "<|im_start|>assistant\n";
+        if (!turn_rewrite_byte_offset) { turn_rewrite_byte_offset = rendered.size(); }
         if (options.enable_thinking) {
             rendered += "<think>\n";
         } else {
             rendered += "<think>\n\n</think>\n\n";
         }
     }
-    return rendered;
+    return RenderedChat{.text                     = std::move(rendered),
+                        .turn_rewrite_byte_offset = turn_rewrite_byte_offset};
 }
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

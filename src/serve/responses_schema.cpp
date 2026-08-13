@@ -1,6 +1,7 @@
 #include "serve/responses_schema.h"
 
 #include "serve/generation_service.h"
+#include "serve/openai_schema.h"
 
 #include <algorithm>
 #include <array>
@@ -563,6 +564,7 @@ void validate_metadata(const Json& body, ResponsesRequest& out) {
 void reject_unknown_top_level(const Json& body) {
     static const std::unordered_set<std::string> allowed = {
         "background",
+        "chat_template_kwargs",
         "context_management",
         "conversation",
         "include",
@@ -575,6 +577,7 @@ void reject_unknown_top_level(const Json& body) {
         "moderation",
         "parallel_tool_calls",
         "previous_response_id",
+        "preserve_thinking",
         "prompt",
         "prompt_cache_key",
         "prompt_cache_options",
@@ -730,6 +733,7 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
     parse_tools(body, out);
     parse_tool_choice(body, out);
     parse_reasoning(body, out);
+    out.generation.preserve_thinking = parse_openai_preserve_thinking(body);
 
     if (const std::optional<double> temperature = optional_number(body, "temperature")) {
         if (*temperature < 0.0 || *temperature > 2.0) {
@@ -931,7 +935,8 @@ ResponsesRequest parse_response_input_tokens_request(const Json& body,
                                                      const RequestLimits& limits) {
     require_object(body);
     for (auto it = body.begin(); it != body.end(); ++it) {
-        if (it.key() != "model" && it.key() != "input") {
+        if (it.key() != "model" && it.key() != "input" && it.key() != "chat_template_kwargs" &&
+            it.key() != "preserve_thinking") {
             bad_request("unknown parameter: " + it.key(), it.key(), "unknown_parameter");
         }
     }
@@ -940,6 +945,15 @@ ResponsesRequest parse_response_input_tokens_request(const Json& body,
     parsed.stream            = false;
     parsed.generation.stream = false;
     return parsed;
+}
+
+void inherit_responses_preserve_thinking(ResponsesRequest& request, bool parent_value) {
+    if (request.generation.preserve_thinking) {
+        request.generation.preserve_thinking_semantic_change =
+            *request.generation.preserve_thinking != parent_value;
+        return;
+    }
+    request.generation.preserve_thinking = parent_value;
 }
 
 void compose_responses_generation_messages(ResponsesRequest& request,

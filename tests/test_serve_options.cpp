@@ -30,6 +30,8 @@ int main() {
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
+    failures +=
+        check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
     failures += check(defaults.request_log_jsonl.empty(),
                       "request JSONL logging is not disabled by default");
@@ -83,13 +85,15 @@ int main() {
     } catch (const std::invalid_argument&) { implicit_backend_rejected = true; }
     failures += check(implicit_backend_rejected, "--draft-tokens selected a backend implicitly");
 
-    const ServeOptions configured =
-        parse({"ninfer-serve", "model.ninfer", "--no-prefix-reuse", "--vision", "--max-concurrency",
-               "4", "--max-pending-requests", "12", "--pending-timeout-ms", "2500", "--max-context",
-               "4096", "--kv-capacity", "8192", "--log-stats-interval-ms", "0"});
+    const ServeOptions configured = parse(
+        {"ninfer-serve", "model.ninfer", "--no-prefix-reuse", "--vision", "--max-concurrency", "4",
+         "--max-pending-requests", "12", "--pending-timeout-ms", "2500", "--max-context", "4096",
+         "--kv-capacity", "8192", "--log-stats-interval-ms", "0", "--preserve-thinking"});
     failures += check(!configured.allow_prefix_reuse,
                       "--no-prefix-reuse did not disable server prefix reuse");
     failures += check(configured.enable_vision, "--vision did not enable Vision");
+    failures +=
+        check(configured.preserve_thinking, "--preserve-thinking did not reach serving options");
     failures +=
         check(configured.max_concurrency == 4, "--max-concurrency did not reach serving options");
     failures += check(configured.max_context == 4096 &&
@@ -116,10 +120,18 @@ int main() {
                       "default server policy did not reach Engine options");
     failures += check(!to_request_options(request, configured).execution.allow_prefix_reuse,
                       "disabled server policy did not reach Engine options");
+    failures += check(resolve_prompt_semantics(request, configured).preserve_thinking,
+                      "server preserve-thinking default was not resolved");
+    request.preserve_thinking = false;
+    failures += check(!resolve_prompt_semantics(request, configured).preserve_thinking,
+                      "request preserve-thinking override did not win");
 
     failures +=
         check(serve_usage_text("ninfer-serve").find("--no-prefix-reuse") != std::string::npos,
               "serve help omits --no-prefix-reuse");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--preserve-thinking") != std::string::npos,
+              "serve help omits --preserve-thinking");
     failures += check(serve_usage_text("ninfer-serve").find("--vision") != std::string::npos,
                       "serve help omits --vision");
     failures +=

@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -72,6 +74,11 @@ struct ChatRenderOptions {
     std::vector<std::string> tool_jsons;
 };
 
-std::string render_chat(const std::vector<ChatMessage>& messages, ChatRenderOptions options = {});
+struct RenderedChat {
+    std::string text;
+    std::optional<std::size_t> turn_rewrite_byte_offset;
+};
+
+RenderedChat render_chat(const std::vector<ChatMessage>& messages, ChatRenderOptions options = {});
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

@@ -89,7 +89,16 @@ std::string normalized_role(const std::string& role) {
 
 } // namespace
 
-ninfer::PromptInput to_prompt_input(const GenerationRequest& request, const ServeOptions& server,
+ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& request,
+                                                 const ServeOptions& server) {
+    return ResolvedPromptSemantics{
+        .enable_thinking   = request.enable_thinking.value_or(server.enable_thinking),
+        .preserve_thinking = request.preserve_thinking.value_or(server.preserve_thinking),
+    };
+}
+
+ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
+                                    const ResolvedPromptSemantics& semantics,
                                     const MediaAcquirer& acquire_media) {
     ninfer::PromptInput input;
     input.messages.reserve(request.messages.size());
@@ -137,8 +146,8 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request, const Serv
     }
 
     input.options.add_generation_prompt = true;
-    input.options.enable_thinking       = request.enable_thinking.value_or(server.enable_thinking);
-    input.options.preserve_thinking     = false;
+    input.options.enable_thinking       = semantics.enable_thinking;
+    input.options.preserve_thinking     = semantics.preserve_thinking;
     input.options.add_vision_id         = false;
     input.options.tool_jsons            = effective_tool_jsons(request);
     return input;

@@ -103,6 +103,18 @@ const char* proposal_head_name(ninfer::ProposalHead proposal) {
     return proposal == ninfer::ProposalHead::Optimized ? "optimized" : "full";
 }
 
+const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
+    switch (path) {
+    case ninfer::PrefixReusePath::FullReset:
+        return "full_reset";
+    case ninfer::PrefixReusePath::AppendAtFrontier:
+        return "append_frontier";
+    case ninfer::PrefixReusePath::RestoreTurnCheckpoint:
+        return "restore_turn_checkpoint";
+    }
+    return "unknown";
+}
+
 Json event_base(const std::string& server_instance_id, std::uint64_t timestamp, const char* event) {
     return Json{{"artifact_type", kRequestLogArtifactType},
                 {"schema_version", kRequestLogSchemaVersion},
@@ -134,6 +146,8 @@ Json request_json(const RequestLogContext& context) {
                 {"tool_choice", tool_choice_name(context.tool_choice)},
                 {"has_tool_history", context.has_tool_history},
                 {"enable_thinking", context.enable_thinking},
+                {"preserve_thinking", context.preserve_thinking},
+                {"preserve_thinking_semantic_change", context.preserve_thinking_semantic_change},
                 {"sampling", sampler_json(context.sampling)}};
 }
 
@@ -220,6 +234,8 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     context.tool_choice                        = request.tool_choice;
     context.has_tool_history                   = request.has_tool_history();
     context.enable_thinking                    = prepared.enable_thinking;
+    context.preserve_thinking                  = prepared.preserve_thinking;
+    context.preserve_thinking_semantic_change  = prepared.preserve_thinking_semantic_change;
     context.sampling                           = prepared.sampling;
     return context;
 }
@@ -233,8 +249,10 @@ std::string format_request_start(const RequestLogContext& context) {
         << " tools=" << context.tool_count
         << " tool_choice=" << tool_choice_name(context.tool_choice)
         << " tool_history=" << (context.has_tool_history ? "yes" : "no")
-        << " thinking=" << (context.enable_thinking ? "on" : "off") << " sampler=["
-        << sampler_str(context.sampling) << "] \xE2\x86\x92 submitted";
+        << " thinking=" << (context.enable_thinking ? "on" : "off")
+        << " preserve_thinking=" << (context.preserve_thinking ? "on" : "off")
+        << " preserve_change=" << (context.preserve_thinking_semantic_change ? "yes" : "no")
+        << " sampler=[" << sampler_str(context.sampling) << "] \xE2\x86\x92 submitted";
     return out.str();
 }
 
@@ -253,7 +271,8 @@ std::string format_request_done(const RequestLogContext& context,
         << (outcome.tool_calls.empty() ? finish_reason_name(outcome.finish_reason) : "tool_calls");
     if (!outcome.tool_calls.empty()) { out << " tool_calls=" << outcome.tool_calls.size(); }
     out << " prompt=" << outcome.prompt_tokens << " gen=" << outcome.completion_tokens
-        << " cache=" << metrics.prefix_cache_hit_tokens << " ttft=" << std::fixed
+        << " cache=" << metrics.prefix_cache_hit_tokens
+        << " reuse=" << prefix_reuse_path_name(metrics.prefix_reuse_path) << " ttft=" << std::fixed
         << std::setprecision(0) << ttft_ms << "ms"
         << " prefill=" << rate(computed_prefill_tokens, metrics.prefill_seconds)
         << " decode=" << rate(decode_tokens, metrics.decode_seconds)
@@ -316,7 +335,8 @@ std::string format_server_start_json(const std::string& server_instance_id, std:
                               {"max_request_bytes", options.max_request_bytes},
                               {"request_log_jsonl", options.request_log_jsonl},
                               {"default_output_tokens", options.default_max_tokens},
-                              {"default_thinking", options.enable_thinking}};
+                              {"default_thinking", options.enable_thinking},
+                              {"default_preserve_thinking", options.preserve_thinking}};
     record["artifact"] = Json{{"path", options.artifact_path},
                               {"size_bytes", std::move(artifact_size)},
                               {"target", load.target},
@@ -404,6 +424,7 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
               std::max(0, outcome.prompt_tokens -
                               static_cast<int>(outcome.metrics.prefix_cache_hit_tokens))},
              {"prefix_cache_hit_tokens", outcome.metrics.prefix_cache_hit_tokens},
+             {"prefix_reuse_path", prefix_reuse_path_name(outcome.metrics.prefix_reuse_path)},
              {"tool_call_count", outcome.tool_calls.size()}};
     record["timings_seconds"] = Json{
         {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},

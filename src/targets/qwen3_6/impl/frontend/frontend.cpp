@@ -294,20 +294,6 @@ void assign_text_positions(PreparedPromptData& prompt) {
     prompt.rope_delta = 0;
 }
 
-std::optional<std::uint32_t> assistant_boundary(const fi::Tokenizer& tokenizer,
-                                                const PromptOptions& options,
-                                                std::size_t prompt_tokens) {
-    if (!options.add_generation_prompt) { return std::nullopt; }
-    const std::string_view opener   = options.enable_thinking
-                                          ? std::string_view("<think>\n")
-                                          : std::string_view("<think>\n\n</think>\n\n");
-    const std::size_t opener_tokens = tokenizer.encode(opener).size();
-    if (opener_tokens > prompt_tokens) {
-        throw std::logic_error("generation-prompt opener exceeds rendered prompt");
-    }
-    return static_cast<std::uint32_t>(prompt_tokens - opener_tokens);
-}
-
 VisionItem convert_vision_item(fi::VisionItem item) {
     VisionItem result;
     result.modality =
@@ -855,20 +841,21 @@ PreparedPrompt Frontend::prepare(PromptInput input) const {
         for (fi::VisionItem& item : processed.vision_items) {
             result.vision_items.push_back(convert_vision_item(std::move(item)));
         }
-        result.prepare.media_items     = processed.stats.media_items;
-        result.prepare.raw_patches     = processed.stats.raw_patches;
-        result.prepare.vision_tokens   = processed.stats.vision_tokens;
-        result.prepare.attention_pairs = processed.stats.attention_pairs;
-        result.prepare.patch_bytes     = processed.stats.patch_bytes;
+        result.prepare.media_items            = processed.stats.media_items;
+        result.prepare.raw_patches            = processed.stats.raw_patches;
+        result.prepare.vision_tokens          = processed.stats.vision_tokens;
+        result.prepare.attention_pairs        = processed.stats.attention_pairs;
+        result.prepare.patch_bytes            = processed.stats.patch_bytes;
+        result.identity.turn_rewrite_boundary = processed.turn_rewrite_boundary;
     } else {
-        const std::string rendered = fi::render_chat(messages, render_options(options));
-        result.token_ids           = impl_->tokenizer->encode(rendered);
+        const fi::RenderedChat rendered = fi::render_chat(messages, render_options(options));
+        fi::EncodedChat encoded         = fi::encode_rendered_chat(*impl_->tokenizer, rendered);
+        result.token_ids                = std::move(encoded.input_ids);
+        result.identity.turn_rewrite_boundary = encoded.turn_rewrite_boundary;
         assign_text_positions(result);
     }
     (void)checked_token_count(result.token_ids.size());
-    result.identity.reusable = true;
-    result.identity.assistant_content_boundary =
-        assistant_boundary(*impl_->tokenizer, options, result.token_ids.size());
+    result.identity.reusable   = true;
     result.starts_in_reasoning = options.add_generation_prompt && options.enable_thinking;
     result.prepare.seconds     = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
@@ -884,8 +871,8 @@ std::uint32_t Frontend::count_tokens(PromptInput input) const {
         throw std::invalid_argument("Vision is disabled for this Engine");
     }
     if (!has_media) {
-        return checked_token_count(
-            impl_->tokenizer->encode(fi::render_chat(messages, render_options(options))).size());
+        const fi::RenderedChat rendered = fi::render_chat(messages, render_options(options));
+        return checked_token_count(impl_->tokenizer->encode(rendered.text).size());
     }
 
     fi::ProcessorOptions processor_options = impl_->processor;

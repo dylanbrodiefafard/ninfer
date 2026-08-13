@@ -72,7 +72,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
-           "[--lm-head-draft] [--no-thinking] [--cors] "
+           "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
@@ -90,6 +90,7 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
+           "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults to Qwen3 thinking (temperature 0.6, top-p 0.95, "
            "top-k 20, presence-penalty 1.0); a request may override any field.\n"
            "       --greedy forces temperature 0 (exact argmax).\n";
@@ -204,6 +205,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
+        } else if (arg == "--preserve-thinking") {
+            options.preserve_thinking = true;
         } else if (arg == "--cors") {
             options.enable_cors = true;
         } else if (arg == "--temperature") {

@@ -37,7 +37,8 @@ struct GenerationMetrics {
     std::uint64_t speculative_accepted_tokens = 0;
     std::uint64_t speculative_fallback_steps  = 0;
     std::vector<std::uint64_t> speculative_accepted_per_position;
-    std::uint32_t prefix_cache_hit_tokens = 0;
+    std::uint32_t prefix_cache_hit_tokens     = 0;
+    ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::FullReset;
 };
 
 struct GenerationOutcome {
@@ -64,12 +65,14 @@ struct StreamSink {
 struct PreparedRequest {
     ninfer::GenerationHandle generation;
     ninfer::SamplingParameters sampling;
-    double prepare_seconds           = 0.0;
-    int prompt_tokens                = 0;
-    bool include_usage               = false;
-    bool tool_capable                = false;
-    std::size_t tool_name_max_length = 64;
-    bool enable_thinking             = true;
+    double prepare_seconds                 = 0.0;
+    int prompt_tokens                      = 0;
+    bool include_usage                     = false;
+    bool tool_capable                      = false;
+    std::size_t tool_name_max_length       = 64;
+    bool enable_thinking                   = true;
+    bool preserve_thinking                 = false;
+    bool preserve_thinking_semantic_change = false;
     std::shared_ptr<RequestLifetime> lifetime;
 };
 

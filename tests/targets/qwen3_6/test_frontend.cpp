@@ -155,6 +155,11 @@ fi::ChatMessage chat_message(std::string role, std::string content) {
     return message;
 }
 
+std::string render_chat_text(std::vector<fi::ChatMessage> messages,
+                             fi::ChatRenderOptions options = {}) {
+    return fi::render_chat(messages, std::move(options)).text;
+}
+
 template <class Callable>
 bool throws_invalid_argument(Callable&& callable) {
     try {
@@ -208,19 +213,19 @@ int test_official_tokenizer_merge() {
 
 int test_official_chat_template() {
     int failures = 0;
-    failures += check(fi::render_chat({chat_message("user", "hello")}) ==
+    failures += check(render_chat_text({chat_message("user", "hello")}) ==
                           "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n",
                       "ordinary user prompt differs from the official template");
 
     fi::ChatRenderOptions no_generation;
     no_generation.add_generation_prompt = false;
     failures += check(
-        fi::render_chat({chat_message("system", "  be concise  "), chat_message("user", "hello")},
-                        no_generation) == "<|im_start|>system\nbe concise<|im_end|>\n"
-                                          "<|im_start|>user\nhello<|im_end|>\n",
+        render_chat_text({chat_message("system", "  be concise  "), chat_message("user", "hello")},
+                         no_generation) == "<|im_start|>system\nbe concise<|im_end|>\n"
+                                           "<|im_start|>user\nhello<|im_end|>\n",
         "leading system prompt differs from the official template");
-    failures += check(fi::render_chat({chat_message("system", ""), chat_message("user", "hello")},
-                                      no_generation) ==
+    failures += check(render_chat_text({chat_message("system", ""), chat_message("user", "hello")},
+                                       no_generation) ==
                           "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nhello<|im_end|>\n",
                       "empty leading system prompt differs from the official template");
 
@@ -228,7 +233,7 @@ int test_official_chat_template() {
     tool_assistant.tool_calls.push_back(
         {.id = "", .name = "f", .arguments_json = R"({"flag":true,"nested":{"x":[1,2]}})"});
     failures +=
-        check(fi::render_chat({chat_message("user", "hi"), tool_assistant}, no_generation) ==
+        check(render_chat_text({chat_message("user", "hi"), tool_assistant}, no_generation) ==
                   "<|im_start|>user\nhi<|im_end|>\n"
                   "<|im_start|>assistant\n<think>\n\n</think>\n\n"
                   "<tool_call>\n<function=f>\n<parameter=flag>\ntrue\n</parameter>\n"
@@ -239,22 +244,22 @@ int test_official_chat_template() {
     fi::ChatRenderOptions no_thinking;
     no_thinking.enable_thinking = false;
     failures += check(
-        fi::render_chat({chat_message("user", "q1"),
-                         chat_message("assistant", "<think>\nold thought\n</think>\n\nold answer"),
-                         chat_message("user", "q2")},
-                        no_thinking) == "<|im_start|>user\nq1<|im_end|>\n"
-                                        "<|im_start|>assistant\nold answer<|im_end|>\n"
-                                        "<|im_start|>user\nq2<|im_end|>\n"
-                                        "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        render_chat_text({chat_message("user", "q1"),
+                          chat_message("assistant", "<think>\nold thought\n</think>\n\nold answer"),
+                          chat_message("user", "q2")},
+                         no_thinking) == "<|im_start|>user\nq1<|im_end|>\n"
+                                         "<|im_start|>assistant\nold answer<|im_end|>\n"
+                                         "<|im_start|>user\nq2<|im_end|>\n"
+                                         "<|im_start|>assistant\n<think>\n\n</think>\n\n",
         "thinking history differs from the official template");
 
     fi::ChatMessage lookup = chat_message("assistant", "");
     lookup.tool_calls.push_back(
         {.id = "", .name = "lookup", .arguments_json = R"({"city":"Paris"})"});
     failures += check(
-        fi::render_chat({chat_message("user", "weather?"), lookup, chat_message("tool", "sunny"),
-                         chat_message("tool", "20C"), chat_message("user", "thanks")},
-                        no_generation) ==
+        render_chat_text({chat_message("user", "weather?"), lookup, chat_message("tool", "sunny"),
+                          chat_message("tool", "20C"), chat_message("user", "thanks")},
+                         no_generation) ==
             "<|im_start|>user\nweather?<|im_end|>\n"
             "<|im_start|>assistant\n<tool_call>\n<function=lookup>\n"
             "<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call><|im_end|>\n"
@@ -267,7 +272,7 @@ int test_official_chat_template() {
     tools.tool_jsons.push_back(
         R"({"type":"function","function":{"name":"f","description":"d","parameters":{"type":"object","properties":{"flag":{"type":"boolean"}}}}})");
     const std::string tools_rendered =
-        fi::render_chat({chat_message("system", "be exact"), chat_message("user", "hi")}, tools);
+        render_chat_text({chat_message("system", "be exact"), chat_message("user", "hi")}, tools);
     failures += check(
         tools_rendered.find("\n{\"type\": \"function\", \"function\": {\"name\": \"f\", "
                             "\"description\": \"d\", \"parameters\": {\"type\": \"object\", "
@@ -302,6 +307,58 @@ int test_official_chat_template() {
     return failures;
 }
 
+int test_turn_rewrite_trace() {
+    const std::string assistant_header = "<|im_start|>assistant\n";
+    fi::ChatMessage first              = chat_message("assistant", "");
+    first.reasoning_content            = "first thought";
+    first.parts.front().text           = "first answer";
+    fi::ChatMessage second             = chat_message("assistant", "");
+    second.reasoning_content           = "second thought";
+    second.parts.front().text          = "second answer";
+
+    const std::vector<fi::ChatMessage> tool_loop{chat_message("user", "question"), first,
+                                                 chat_message("tool", "result one"), second,
+                                                 chat_message("tool", "result two")};
+    const fi::RenderedChat open    = fi::render_chat(tool_loop);
+    const std::size_t first_header = open.text.find(assistant_header);
+    int failures =
+        check(first_header != std::string::npos && open.turn_rewrite_byte_offset &&
+                  *open.turn_rewrite_byte_offset == first_header + assistant_header.size(),
+              "tool loop did not retain its first assistant rewrite boundary");
+
+    fi::ChatRenderOptions preserve;
+    preserve.preserve_thinking       = true;
+    const fi::RenderedChat preserved = fi::render_chat(tool_loop, preserve);
+    failures += check(preserved.turn_rewrite_byte_offset == open.turn_rewrite_byte_offset,
+                      "preserve_thinking changed the turn rewrite boundary");
+
+    std::vector<fi::ChatMessage> next_turn = tool_loop;
+    next_turn.push_back(chat_message("user", "next question"));
+    const fi::RenderedChat next    = fi::render_chat(next_turn);
+    const std::size_t final_header = next.text.rfind(assistant_header);
+    failures += check(final_header != std::string::npos && next.turn_rewrite_byte_offset &&
+                          *next.turn_rewrite_byte_offset == final_header + assistant_header.size(),
+                      "new user turn did not move the rewrite boundary to its generation opener");
+
+    fi::ChatRenderOptions no_generation;
+    no_generation.add_generation_prompt = false;
+    const fi::RenderedChat no_assistant =
+        fi::render_chat({chat_message("user", "question")}, no_generation);
+    failures += check(!no_assistant.turn_rewrite_byte_offset,
+                      "boundary-less prompt unexpectedly published a rewrite boundary");
+
+    const fi::RenderedChat wrapped = fi::render_chat(
+        {chat_message("user", "question"), first,
+         chat_message("user", "<tool_response>compat result</tool_response>"), second},
+        no_generation);
+    const std::size_t wrapped_first = wrapped.text.find(assistant_header);
+    failures +=
+        check(wrapped.turn_rewrite_byte_offset &&
+                  *wrapped.turn_rewrite_byte_offset == wrapped_first + assistant_header.size(),
+              "bare tool-response wrapper incorrectly advanced the real user turn");
+    return failures;
+}
+
 int test_official_resource_guards() {
     FrontendResources stale_pad     = resources();
     nlohmann::json tokenizer_config = nlohmann::json::parse(stale_pad.tokenizer_config_json);
@@ -326,7 +383,7 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     const std::vector<ninfer::TokenId> expected{248045, 30, 0, 248046, 32, 248045, 31, 248068, 32};
     int failures =
         check(text_data.token_ids == expected, "text frontend did not render/tokenize chat");
-    failures += check(text_data.identity.assistant_content_boundary == 7 &&
+    failures += check(text_data.identity.turn_rewrite_boundary == 7 &&
                           text_data.starts_in_reasoning && !text_data.has_media(),
                       "text frontend did not preserve prefix/thinking identity");
     failures +=
@@ -370,7 +427,9 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     }
     failures += check(
         prepared_data.patches.size() == 16 * 1536 && prepared_data.prepare.raw_patches == 16 &&
-            prepared_data.prepare.vision_tokens == 4 && prepared_data.identity.reusable,
+            prepared_data.prepare.vision_tokens == 4 && prepared_data.identity.reusable &&
+            prepared_data.identity.turn_rewrite_boundary &&
+            *prepared_data.identity.turn_rewrite_boundary < prepared_data.token_ids.size(),
         "image frontend did not own the expected patch payload and identity");
     if (prepared_data.patches.size() == 16 * 1536) {
         failures += check(near(prepared_data.patches[0], -1.0F) &&
@@ -584,6 +643,7 @@ int main() {
     int failures                  = 0;
     failures += test_official_tokenizer_merge();
     failures += test_official_chat_template();
+    failures += test_turn_rewrite_trace();
     failures += test_official_resource_guards();
     failures += test_text_and_image_prepare(frontend);
     failures += test_video_prepare(frontend);

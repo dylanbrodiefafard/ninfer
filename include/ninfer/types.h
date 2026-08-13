@@ -276,6 +276,12 @@ struct SpeculativeStats {
     std::vector<std::uint64_t> accepted_per_position;
 };
 
+enum class PrefixReusePath : std::uint8_t {
+    FullReset,
+    AppendAtFrontier,
+    RestoreTurnCheckpoint,
+};
+
 struct GenerationResult {
     PromptSummary prompt;
     std::vector<TokenId> generated_token_ids;
@@ -284,6 +290,7 @@ struct GenerationResult {
     std::uint32_t reasoning_tokens     = 0;
     FinishReason finish_reason         = FinishReason::None;
     std::uint32_t reused_prompt_tokens = 0;
+    PrefixReusePath prefix_reuse_path  = PrefixReusePath::FullReset;
     GenerationTimings timings;
     SpeculativeStats speculative;
 };

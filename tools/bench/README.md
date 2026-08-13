@@ -123,7 +123,7 @@ artifacts are supplied. Pass one `--artifact` to select a single target and `--m
 decode corpus with DFlash block=8 (`k=7`) and the optimized proposal head. Add
 `--sampling greedy` to force exact argmax while retaining the same fixtures and repetition count.
 Its schema-v5 result and flattened summaries retain the canonical `weights_id` received from the
-schema-v6 serving startup record.
+schema-v7 serving startup record.
 
 ## Concurrent serving benchmark
 

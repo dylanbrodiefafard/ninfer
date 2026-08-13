@@ -101,6 +101,49 @@ int test_basic_request() {
     return failures;
 }
 
+int test_preserve_thinking_options_and_inheritance() {
+    const Json base = {{"model", "m"}, {"input", "hello"}};
+    int failures    = 0;
+
+    Json kwargs                    = base;
+    kwargs["chat_template_kwargs"] = Json{{"preserve_thinking", true}};
+    ResponsesRequest request       = parse_responses_request(kwargs, limits());
+    failures += check(request.generation.preserve_thinking == true,
+                      "Responses chat_template_kwargs preserve_thinking parsed");
+
+    ResponsesRequest inherited = parse_responses_request(base, limits());
+    inherit_responses_preserve_thinking(inherited, true);
+    failures += check(inherited.generation.preserve_thinking == true &&
+                          !inherited.generation.preserve_thinking_semantic_change,
+                      "Responses child did not inherit parent preserve_thinking");
+
+    ResponsesRequest unchanged = request;
+    inherit_responses_preserve_thinking(unchanged, true);
+    failures += check(!unchanged.generation.preserve_thinking_semantic_change,
+                      "equal explicit preserve value marked a semantic change");
+
+    Json explicit_false                 = base;
+    explicit_false["preserve_thinking"] = false;
+    ResponsesRequest changed            = parse_responses_request(explicit_false, limits());
+    inherit_responses_preserve_thinking(changed, true);
+    failures += check(changed.generation.preserve_thinking == false &&
+                          changed.generation.preserve_thinking_semantic_change,
+                      "explicit Responses preserve branch was not marked");
+
+    Json conflict                 = kwargs;
+    conflict["preserve_thinking"] = false;
+    failures += check(api_code([&] { (void)parse_responses_request(conflict, limits()); }) ==
+                          "conflicting_template_option",
+                      "Responses conflicting preserve values were accepted");
+
+    Json unknown                    = base;
+    unknown["chat_template_kwargs"] = Json{{"unknown", 1}};
+    failures += check(api_code([&] { (void)parse_responses_request(unknown, limits()); }) ==
+                          "chat_template_option_not_supported",
+                      "Responses unknown chat template option was accepted");
+    return failures;
+}
+
 int test_typed_items_and_tools() {
     const Json function = {{"type", "function"},
                            {"name", "weather"},
@@ -376,6 +419,7 @@ int test_input_tokens_schema() {
 int main() {
     int failures = 0;
     failures += test_basic_request();
+    failures += test_preserve_thinking_options_and_inheritance();
     failures += test_typed_items_and_tools();
     failures += test_explicit_rejections();
     failures += test_response_object();

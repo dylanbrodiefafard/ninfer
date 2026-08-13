@@ -53,7 +53,8 @@ ninfer::OwnedMedia fake_media(const ContentPart& part) {
 }
 
 ninfer::PromptInput translate(const GenerationRequest& req) {
-    return to_prompt_input(req, default_server(), fake_media);
+    const ServeOptions server = default_server();
+    return to_prompt_input(req, resolve_prompt_semantics(req, server), fake_media);
 }
 
 std::string joined_text(const ninfer::ChatMessage& message) {
@@ -91,6 +92,65 @@ int test_parse_string_content() {
     failures += check(!req.stream, "stream defaults false");
     failures += check(req.max_tokens == 512, "max_tokens default applied");
     failures += check(!req.max_tokens_set, "max_tokens_set false when defaulted");
+    return failures;
+}
+
+int test_preserve_thinking_options() {
+    const Json base = {
+        {"model", "m"},
+        {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})},
+    };
+    int failures = 0;
+
+    Json kwargs                    = base;
+    kwargs["chat_template_kwargs"] = Json{{"preserve_thinking", true}};
+    const GenerationRequest kwargs_request =
+        parse_chat_completion_request(kwargs, default_limits());
+    failures += check(kwargs_request.preserve_thinking == true,
+                      "chat_template_kwargs preserve_thinking parsed");
+    failures += check(translate(kwargs_request).options.preserve_thinking,
+                      "resolved preserve_thinking reached PromptInput");
+
+    Json alias                 = base;
+    alias["preserve_thinking"] = false;
+    failures +=
+        check(parse_chat_completion_request(alias, default_limits()).preserve_thinking == false,
+              "top-level preserve_thinking alias parsed");
+
+    Json same                 = kwargs;
+    same["preserve_thinking"] = true;
+    failures +=
+        check(parse_chat_completion_request(same, default_limits()).preserve_thinking == true,
+              "matching preserve_thinking values rejected");
+
+    Json nulls                    = base;
+    nulls["preserve_thinking"]    = nullptr;
+    nulls["chat_template_kwargs"] = Json{{"preserve_thinking", nullptr}, {"future", nullptr}};
+    failures +=
+        check(!parse_chat_completion_request(nulls, default_limits()).preserve_thinking.has_value(),
+              "null preserve_thinking did not remain omitted");
+
+    Json conflict                 = kwargs;
+    conflict["preserve_thinking"] = false;
+    failures +=
+        check(throws_api([&] { (void)parse_chat_completion_request(conflict, default_limits()); }),
+              "conflicting preserve_thinking values accepted");
+
+    Json bad_kwargs                    = base;
+    bad_kwargs["chat_template_kwargs"] = true;
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(bad_kwargs, default_limits()); }),
+        "non-object chat_template_kwargs accepted");
+    Json bad_value                    = base;
+    bad_value["chat_template_kwargs"] = Json{{"preserve_thinking", "yes"}};
+    failures +=
+        check(throws_api([&] { (void)parse_chat_completion_request(bad_value, default_limits()); }),
+              "non-boolean preserve_thinking accepted");
+    Json unknown                    = base;
+    unknown["chat_template_kwargs"] = Json{{"preserve_thinking", true}, {"foo", 1}};
+    failures +=
+        check(throws_api([&] { (void)parse_chat_completion_request(unknown, default_limits()); }),
+              "unknown non-null chat template option accepted");
     return failures;
 }
 
@@ -537,6 +597,7 @@ int test_finish_reason_wire() {
 int main() {
     int failures = 0;
     failures += test_parse_string_content();
+    failures += test_preserve_thinking_options();
     failures += test_parse_parts_and_flatten();
     failures += test_developer_role_mapped();
     failures += test_parse_media_in_translate();

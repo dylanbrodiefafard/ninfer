@@ -64,6 +64,8 @@ ResponsesRequest parse_response_input_tokens_request(const nlohmann::json& body,
 void compose_responses_generation_messages(ResponsesRequest& request,
                                            const std::vector<ChatTurn>& previous_context);
 
+void inherit_responses_preserve_thinking(ResponsesRequest& request, bool parent_value);
+
 BuiltResponse make_response_object(const std::string& id, std::int64_t created_at,
                                    const ResponsesRequest& request,
                                    const ResponsesRuntimeValues& runtime,
