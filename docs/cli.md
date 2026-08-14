@@ -2,6 +2,8 @@
 
 `build/apps/ninfer` runs one request against one registered `.ninfer` artifact. Build NInfer and
 download an artifact using the [project README](../README.md) before following this guide.
+The examples below use Qwen3.6-27B; `models/qwen3_8_27b.ninfer` uses the same CLI, MTP, and Vision
+options.
 
 ## Text input
 
@@ -158,8 +160,9 @@ Run `./build/apps/ninfer --help` for the exact option contract.
 
 ## Context and memory
 
-Both registered models have a native context limit of 262,144 tokens. The practical allocation on
-one RTX 5090 depends on the selected artifact, media workload, output budget, and KV-cache type.
+All three registered model IDs have a native context limit of 262,144 tokens. The practical
+allocation on one RTX 5090 depends on the selected artifact, media workload, output budget, and
+KV-cache type.
 Use `--kv-dtype int8` for large context allocations. The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
 `--kv-capacity N` controls the shared physical Main Text KV pool independently and is rounded up to

@@ -16,6 +16,9 @@ Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
   --lm-head-draft
 ```
 
+For Qwen3.8-27B, replace the artifact path with `models/qwen3_8_27b.ninfer`; without a
+`--model-id` override, its public model ID is `qwen3.8-27b`.
+
 For the 35B-A3B artifact, select its artifact path; the public model ID follows the container
 identity automatically:
 
@@ -121,10 +124,10 @@ OpenAI image and video sources may be HTTP(S) URLs or base64 data URLs.
 ## OpenAI Responses Core
 
 NInfer implements the typed-Item and semantic-event core of the OpenAI
-[Responses API](https://developers.openai.com/api/reference/resources/responses/overview). Both
-registered targets use this same adapter and Engine route. It is intentionally not advertised as
-full parity with OpenAI-hosted tools, durable cloud storage, background jobs, Conversations, or
-compaction.
+[Responses API](https://developers.openai.com/api/reference/resources/responses/overview). All
+registered artifact identities use this same adapter and Engine route. It is intentionally not
+advertised as full parity with OpenAI-hosted tools, durable cloud storage, background jobs,
+Conversations, or compaction.
 
 ### Create a Response
 
@@ -529,12 +532,12 @@ therefore resets the prefix instead of reusing placeholder-token KV. Media wholl
 prefix skips Vision execution, while new suffix media is encoded normally. The completion log
 reports the reused token count as `cache=`.
 
-Qwen3.6 distinguishes `full_reset`, `append_frontier`, and `restore_turn_checkpoint`. A turn
-checkpoint includes the recurrent and selected speculative-backend continuation state required to
-recompute a rewritten suffix; matching KV tokens alone never authorize a partial hit. Stable
-`preserve_thinking=true` histories normally append, while stable `false` histories restore the
-previous open-turn checkpoint when a new user closes that turn. The JSONL completion record exposes
-the selected path as `prefix_reuse_path`.
+The Qwen3.6-family runtime, including Qwen3.8-27B, distinguishes `full_reset`, `append_frontier`,
+and `restore_turn_checkpoint`. A turn checkpoint includes the recurrent and selected
+speculative-backend continuation state required to recompute a rewritten suffix; matching KV
+tokens alone never authorize a partial hit. Stable `preserve_thinking=true` histories normally
+append, while stable `false` histories restore the previous open-turn checkpoint when a new user
+closes that turn. The JSONL completion record exposes the selected path as `prefix_reuse_path`.
 
 Speculative decoding is an engine option and does not change protocol output shapes, stop behavior,
 or usage accounting. If a stop truncates a multi-token MTP or DFlash round, the Engine commits the
