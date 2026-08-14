@@ -1,7 +1,7 @@
 # NInfer documentation
 
-Start with the [project README](../README.md) to build NInfer, download one of the published
-artifacts for the two registered targets, and run the CLI or HTTP server.
+Start with the [project README](../README.md) to build NInfer, download a published artifact, and
+run the CLI or HTTP server.
 
 ## User guides
 
@@ -32,8 +32,8 @@ The executable `--help` output is the exact source for command-line option spell
 ## Maintainer references
 
 The active references under [`maintainer/`](maintainer/) record current architecture, model,
-artifact, and maintenance contracts. The one unfinished migration plan is labeled separately.
-These files are not additional user workflows or installed API documentation.
+artifact, and maintenance contracts. These files are not additional user workflows or installed
+API documentation.
 
 Runtime and Op references:
 
@@ -50,6 +50,7 @@ Artifact and model references:
 - [Persistent storage layouts](maintainer/storage-layouts.md)
 - [Qwen3.6-27B model semantics](maintainer/qwen3.6-27b-model.md)
 - [Qwen3.6-27B artifact contracts, including NVFP4](maintainer/qwen3.6-27b-artifact.md)
+- [Qwen3.8-27B artifact contract](maintainer/qwen3.8-27b-artifact.md)
 - [Qwen3.6-35B-A3B model semantics](maintainer/qwen3.6-35b-a3b-model.md)
 - [Qwen3.6-35B-A3B artifact contracts](maintainer/qwen3.6-35b-a3b-artifact.md)
 

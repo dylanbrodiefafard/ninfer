@@ -13,6 +13,7 @@ for the selected tool.
 | Task | Location |
 |---|---|
 | Build the 27B artifact | [`convert/qwen3_6_27b/`](convert/qwen3_6_27b/) |
+| Build the Qwen3.8-27B artifact | [`convert/qwen3_8_27b/`](convert/qwen3_8_27b/) |
 | Build the 35B-A3B artifact | [`convert/qwen3_6_35b_a3b/`](convert/qwen3_6_35b_a3b/) |
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
 | Run the 27B Python reference | [`reference/qwen3_6_27b/`](reference/qwen3_6_27b/README.md) |
@@ -31,6 +32,10 @@ artifact. The paths below are placeholders for the maintainer's local checkpoint
 python3 -m tools.convert.qwen3_6_27b.convert \
   --model /path/to/Qwen3.6-27B \
   --out out/qwen3_6_27b.ninfer
+
+python3 -m tools.convert.qwen3_8_27b.convert \
+  --model /path/to/Qwen3.8-27B \
+  --out out/qwen3_8_27b.ninfer
 
 python3 -m tools.convert.qwen3_6_35b_a3b.convert \
   --model /path/to/Qwen3.6-35B-A3B-base \

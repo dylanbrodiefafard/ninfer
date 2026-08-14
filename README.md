@@ -2,8 +2,8 @@
 
 > Selected checkpoints. Maximum single-GPU inference performance.
 
-NInfer is a from-scratch C++/CUDA inference engine for two exact Qwen3.6 checkpoints on a single
-NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a local CLI or
+NInfer is a from-scratch C++/CUDA inference engine for explicitly registered Qwen checkpoints on a
+single NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a local CLI or
 OpenAI-/Anthropic-compatible HTTP APIs.
 
 NInfer deliberately supports a closed set of model artifacts instead of acting as a general model
@@ -42,8 +42,8 @@ At C=8, Qwen3.6-35B-A3B reaches **1,313.8 aggregate decode tok/s**. The 27B NVFP
 
 The single-request corpus was measured on the same GPU with INT8 group-64 KV cache, CUDA Graphs,
 and a 1,024-token prefill chunk. Each reported fixture uses five fixed seeds after server warm-up.
-The two registered targets are reported independently and are not cross-target comparisons. The
-two 27B weight profiles are reported separately. Requests were submitted serially to a persistent
+The two measured targets are reported independently and are not cross-target comparisons. The two
+27B weight profiles are reported separately. Requests were submitted serially to a persistent
 server.
 
 **Qwen3.6-35B-A3B**
