@@ -3,6 +3,7 @@
 // Small fixed-capacity request scheduling and batched decode execution for every backend.
 
 #include "ninfer/types.h"
+#include "runtime/contract/types.h"
 #include "runtime/engine/admission_policy.h"
 #include "runtime/engine/request_memory.h"
 #include "runtime/generation/generation_budget.h"
@@ -116,7 +117,7 @@ public:
     };
 
     Submission submit(targets::qwen3_6::PreparedPrompt prompt, PromptSummary prompt_summary,
-                      double prepare_seconds, RequestOptions options,
+                      double prepare_seconds, ResolvedRequestOptions options,
                       Clock::time_point pending_deadline = {}, HostInputLease host_input = {}) {
         const Clock::time_point submitted = Clock::now();
         if (pending_deadline == Clock::time_point{}) {
@@ -270,8 +271,8 @@ private:
     struct Request {
         Request(std::uint64_t request_identity, targets::qwen3_6::PreparedPrompt input,
                 targets::qwen3_6::OutputSession output_session, PromptSummary summary,
-                double frontend_seconds, RequestOptions request_options, Clock::time_point limit,
-                Clock::time_point submit_time, HostInputLease input_lease)
+                double frontend_seconds, ResolvedRequestOptions request_options,
+                Clock::time_point limit, Clock::time_point submit_time, HostInputLease input_lease)
             : id(request_identity), host_input(std::move(input_lease)), prompt(std::move(input)),
               output(std::move(output_session)), prompt_summary(summary),
               prepare_seconds(frontend_seconds), options(std::move(request_options)),
@@ -283,7 +284,7 @@ private:
         targets::qwen3_6::OutputSession output;
         PromptSummary prompt_summary;
         double prepare_seconds = 0.0;
-        RequestOptions options;
+        ResolvedRequestOptions options;
         Clock::time_point deadline;
         Clock::time_point submitted;
         std::optional<Clock::time_point> first_token;

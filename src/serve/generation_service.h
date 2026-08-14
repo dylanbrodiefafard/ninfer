@@ -64,7 +64,7 @@ struct StreamSink {
 // is consumed exactly once by run().
 struct PreparedRequest {
     ninfer::GenerationHandle generation;
-    ninfer::SamplingParameters sampling;
+    ninfer::ResolvedSamplingParameters sampling;
     double prepare_seconds                 = 0.0;
     int prompt_tokens                      = 0;
     bool include_usage                     = false;
@@ -87,6 +87,10 @@ public:
     [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
 
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
+
+    [[nodiscard]] ninfer::ModelSamplingDefaults sampling_defaults() const {
+        return engine_->sampling_defaults();
+    }
 
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,
                                           std::function<bool()> is_cancelled = {}) const;

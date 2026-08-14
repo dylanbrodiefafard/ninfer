@@ -93,7 +93,8 @@ std::string usage_text(const char* argv0) {
            "--kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom.\n"
-           "Sampling defaults: temperature 0.6, top-p 0.95, top-k 20, presence penalty 1.0.\n";
+           "Sampling defaults come from the loaded model and thinking mode; flags override "
+           "individual fields.\n";
 }
 
 Options parse_options(int argc, char** argv) {
@@ -213,7 +214,7 @@ Options parse_options(int argc, char** argv) {
     if (!options.enable_thinking && options.reasoning_effort) {
         throw std::invalid_argument("--reasoning-effort cannot be combined with --no-thinking");
     }
-    if (options.greedy) { options.sampling = SamplingParameters{}; }
+    if (options.greedy) { options.sampling.temperature = 0.0F; }
     return options;
 }
 

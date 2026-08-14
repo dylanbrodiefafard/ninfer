@@ -146,13 +146,28 @@ measured recommendation rather than a semantic limit.
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
 | `--reasoning-effort low\|medium\|xhigh` | select an effort exposed by the loaded chat template | template default |
 | `--greedy` | exact argmax decoding | off |
-| `--temperature F` | sampling temperature | `0.6` |
-| `--top-p F` | nucleus threshold | `0.95` |
-| `--top-k N` | top-k threshold | `20` |
-| `--min-p F` | min-p threshold | `0` |
-| `--presence-penalty F` | presence penalty | `1.0` |
-| `--frequency-penalty F` | frequency penalty | `0` |
+| `--temperature F` | sampling temperature override | registered model/mode default |
+| `--top-p F` | nucleus-threshold override | registered model/mode default |
+| `--top-k N` | top-k-threshold override | registered model/mode default |
+| `--min-p F` | min-p-threshold override | registered model/mode default |
+| `--presence-penalty F` | presence-penalty override | registered model/mode default |
+| `--frequency-penalty F` | frequency-penalty override | registered model/mode default (`0`) |
 | `--seed N` | sampling seed | `0` |
+
+When a sampling flag is omitted, Engine selects the official general-task preset registered for
+the loaded model and the rendered prompt mode. The current presets are:
+
+| Model | Prompt mode | Temperature | Top-p | Top-k | Min-p | Presence penalty |
+|---|---|---:|---:|---:|---:|---:|
+| Qwen3.6-27B | thinking | `1.0` | `0.95` | `20` | `0` | `0` |
+| Qwen3.6-27B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
+| Qwen3.8-27B | thinking | `1.0` | `0.95` | `20` | `0` | `0` |
+| Qwen3.8-27B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
+| Qwen3.6-35B-A3B | thinking | `1.0` | `0.95` | `20` | `0` | `1.5` |
+| Qwen3.6-35B-A3B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
+
+Frequency penalty is `0` in every registered preset. Qwen's separate precise-coding recommendation
+is task-specific and is therefore an explicit override rather than an inferred Engine default.
 
 Repeat `--stop-token-id`, `--stop`, or `--reasoning-stop` to add stop conditions. Use
 `--raw-output` to expose the frontend's raw output stream and `--print-token-ids` to include

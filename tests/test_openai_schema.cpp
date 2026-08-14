@@ -512,10 +512,13 @@ int test_parse_sampling_carried() {
         check(req.sampling.logit_bias.count(5) == 1 && req.sampling.logit_bias.at(5) == -1.5,
               "logit_bias carried");
     const ninfer::RequestOptions options = to_request_options(req, default_server());
+    failures += check(options.execution.sampling.temperature == 0.7F,
+                      "temperature reaches Engine overrides");
+    failures += check(options.execution.sampling.top_p == 0.9F, "top_p reaches Engine overrides");
+    failures += check(options.execution.sampling.seed == 123u, "seed reaches Engine overrides");
     failures +=
-        check(options.execution.sampling.temperature == 0.7F, "temperature reaches Engine options");
-    failures += check(options.execution.sampling.top_p == 0.9F, "top_p reaches Engine options");
-    failures += check(options.execution.sampling.seed == 123u, "seed reaches Engine options");
+        check(!options.execution.sampling.top_k && !options.execution.sampling.presence_penalty,
+              "omitted request fields unexpectedly replaced model defaults");
     return failures;
 }
 

@@ -83,7 +83,45 @@ struct EngineOptions {
     LoadProgress load_progress;
 };
 
-struct SamplingParameters {
+enum class SamplingMode : std::uint8_t {
+    Thinking,
+    NonThinking,
+};
+
+// Immutable model-owned values used when a request does not override a sampling field. Seed is
+// deliberately excluded: it is an execution choice rather than a model recommendation.
+struct SamplingPreset {
+    float temperature       = 0.0F;
+    std::int32_t top_k      = 0;
+    float top_p             = 1.0F;
+    float min_p             = 0.0F;
+    float presence_penalty  = 0.0F;
+    float frequency_penalty = 0.0F;
+};
+
+struct ModelSamplingDefaults {
+    SamplingPreset thinking;
+    SamplingPreset non_thinking;
+
+    [[nodiscard]] constexpr const SamplingPreset& for_mode(SamplingMode mode) const noexcept {
+        return mode == SamplingMode::Thinking ? thinking : non_thinking;
+    }
+};
+
+// Public request-side overrides. std::nullopt means "use the registered model/mode default";
+// explicit zero remains a real override (including temperature=0 for exact argmax).
+struct SamplingOverrides {
+    std::optional<float> temperature;
+    std::optional<std::int32_t> top_k;
+    std::optional<float> top_p;
+    std::optional<float> min_p;
+    std::optional<float> presence_penalty;
+    std::optional<float> frequency_penalty;
+    std::optional<std::uint64_t> seed;
+};
+
+// Complete parameters after Engine resolution. Target runtimes consume only this type.
+struct ResolvedSamplingParameters {
     float temperature       = 0.0F;
     std::int32_t top_k      = 0;
     float top_p             = 1.0F;
@@ -112,7 +150,7 @@ struct StopPolicy {
 };
 
 struct ExecutionOptions {
-    SamplingParameters sampling;
+    SamplingOverrides sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
 };

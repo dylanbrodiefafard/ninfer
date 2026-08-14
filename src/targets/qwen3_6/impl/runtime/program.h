@@ -192,8 +192,9 @@ public:
                     DeviceContext& device);
     ~ProgramImplCore() noexcept;
 
-    [[nodiscard]] RequestBasePlan plan_request_base(const PreparedPromptData& prompt,
-                                                    const ExecutionOptions& options);
+    [[nodiscard]] RequestBasePlan
+    plan_request_base(const PreparedPromptData& prompt,
+                      const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] RequestPlan plan_request_for_lane(std::uint32_t lane,
                                                     const PreparedPromptData& prompt,
                                                     const RequestBasePlan& base);

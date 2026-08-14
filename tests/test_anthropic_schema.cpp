@@ -399,8 +399,9 @@ int test_thinking_and_sampling() {
         check(options.execution.requested_output_tokens == 8, "max_tokens reaches Engine options");
     failures += check(options.execution.sampling.temperature == 0.3F &&
                           options.execution.sampling.top_p == 0.8F &&
-                          options.execution.sampling.top_k == 40,
-                      "sampling reaches Engine options");
+                          options.execution.sampling.top_k == 40 &&
+                          !options.execution.sampling.presence_penalty,
+                      "sampling reaches Engine overrides without inventing omitted fields");
     failures += check(options.stop.strings.size() == 2 && options.stop.strings[0].text == "STOP" &&
                           options.stop.strings[1].text == "END",
                       "stop_sequences reach Engine options");

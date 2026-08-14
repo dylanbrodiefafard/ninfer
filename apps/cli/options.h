@@ -36,9 +36,8 @@ struct Options {
     std::vector<TokenId> stop_token_ids;
     std::vector<StopString> stop_strings;
 
-    // Qwen3 thinking defaults. --greedy replaces these with exact argmax.
-    SamplingParameters sampling{
-        .temperature = 0.6F, .top_k = 20, .top_p = 0.95F, .min_p = 0.0F, .presence_penalty = 1.0F};
+    // Omitted fields are resolved from the loaded model and rendered prompt mode by Engine.
+    SamplingOverrides sampling;
     bool greedy = false;
 };
 

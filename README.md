@@ -279,7 +279,8 @@ All three registered model IDs support:
 - startup-bounded small-scale concurrent serving with true batched decode;
 - MTP speculative decoding with draft windows from one to five;
 - BF16 and INT8 group-64 KV cache;
-- greedy, temperature, top-k, top-p, min-p, and presence/frequency-penalty sampling;
+- model- and thinking-mode-aware official sampling defaults, with explicit greedy, temperature,
+  top-k, top-p, min-p, and presence/frequency-penalty overrides;
 - compatible-prefix reuse;
 - OpenAI Responses Core, OpenAI Chat Completions, and Anthropic Messages, including streaming and
   usage accounting;

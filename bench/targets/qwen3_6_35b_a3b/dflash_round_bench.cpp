@@ -241,7 +241,7 @@ int run(const Options& options) {
     const std::size_t request_capacity = sequence.request_transient_capacity_bytes();
     auto program = target::Package::create_program(*model, std::move(sequence), device);
     ninfer::runtime::RequestMemory request_memory(device, request_capacity);
-    ninfer::ExecutionOptions execution;
+    ninfer::runtime::ResolvedExecutionOptions execution;
     execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);
     execution.allow_prefix_reuse      = false;
     for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {

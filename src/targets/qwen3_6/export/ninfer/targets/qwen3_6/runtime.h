@@ -143,8 +143,9 @@ public:
 
     // Engine-internal fixed-lane execution surface. The public Engine owns scheduling; Program
     // owns target state images and executes one immutable decode batch membership.
-    [[nodiscard]] RequestBasePlan<Variant> plan_request_base(const PreparedPrompt& prompt,
-                                                             const ExecutionOptions& options);
+    [[nodiscard]] RequestBasePlan<Variant>
+    plan_request_base(const PreparedPrompt& prompt,
+                      const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] RequestPlan<Variant> plan_request_for_lane(std::uint32_t lane,
                                                              const PreparedPrompt& prompt,
                                                              const RequestBasePlan<Variant>& base);

@@ -122,8 +122,9 @@ template <>
 Program<Variant>::~Program() noexcept = default;
 
 template <>
-RequestBasePlan<Variant> Program<Variant>::plan_request_base(const PreparedPrompt& prompt,
-                                                             const ExecutionOptions& options) {
+RequestBasePlan<Variant>
+Program<Variant>::plan_request_base(const PreparedPrompt& prompt,
+                                    const runtime::ResolvedExecutionOptions& options) {
     return impl_->plan_request_base(PreparedPromptAccess::view(prompt), options);
 }
 

@@ -441,11 +441,21 @@ curl http://127.0.0.1:8080/v1/models \
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--cors` | permissive browser CORS headers | off |
+| `--temperature F` | process-level temperature override | unset |
+| `--top-p F` | process-level top-p override | unset |
+| `--top-k N` | process-level top-k override | unset |
+| `--min-p F` | process-level min-p override | unset |
+| `--presence-penalty F` | process-level presence-penalty override | unset |
+| `--frequency-penalty F` | process-level frequency-penalty override | unset |
+| `--seed N` | fixed seed when a request omits one | fresh random seed per request |
 | `--greedy` | force exact argmax for all requests | off |
 
-Server sampling defaults are temperature `0.6`, top-p `0.95`, top-k `20`, presence penalty
-`1.0`, and frequency penalty `0`. Supported request fields override those defaults unless the
-server was started with `--greedy`.
+Engine selects sampling defaults from the loaded model and the request's resolved thinking mode.
+Qwen3.6-27B and Qwen3.8-27B use `1.0/0.95/20/0/0` for
+temperature/top-p/top-k/min-p/presence penalty in thinking mode and `0.7/0.80/20/0/1.5` in
+non-thinking mode. Qwen3.6-35B-A3B differs only in its thinking presence penalty, which is `1.5`.
+Frequency penalty is `0` for all registered presets. Process flags override registered values,
+request fields override process flags, and `--greedy` finally forces temperature `0`.
 
 Run `./build/apps/ninfer-serve --help` for the exact option contract.
 
@@ -461,13 +471,13 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v7 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v8 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance.
 
 | Event | Contents |
 |---|---|
-| `server_start` | target/weights identity and artifact, resolved Engine, thinking-history and sampler defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
+| `server_start` | target/weights identity and artifact, resolved Engine, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, unrounded phase seconds, and complete speculative-decoding counters |
 | `request_error` | the resolved request configuration and generation error message |

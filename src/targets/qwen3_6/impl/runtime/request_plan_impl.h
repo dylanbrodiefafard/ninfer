@@ -11,7 +11,7 @@
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 namespace {
 
-void validate_sampling(const SamplingParameters& sampling) {
+void validate_sampling(const ResolvedSamplingParameters& sampling) {
     if (!std::isfinite(sampling.temperature) || !std::isfinite(sampling.top_p) ||
         !std::isfinite(sampling.min_p) || !std::isfinite(sampling.presence_penalty) ||
         !std::isfinite(sampling.frequency_penalty)) {
@@ -25,7 +25,7 @@ void validate_sampling(const SamplingParameters& sampling) {
     }
 }
 
-ops::SamplingConfig translate_sampling(const SamplingParameters& source) {
+ops::SamplingConfig translate_sampling(const ResolvedSamplingParameters& source) {
     ops::SamplingConfig out;
     out.temperature       = source.temperature;
     out.top_k             = source.top_k;
@@ -57,8 +57,9 @@ std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
 
 } // namespace
 
-RequestBasePlan ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
-                                                   const ExecutionOptions& options) {
+RequestBasePlan
+ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
+                                   const runtime::ResolvedExecutionOptions& options) {
     if (prompt.token_ids.empty()) { throw std::invalid_argument("prompt must contain tokens"); }
     if (prompt.token_ids.size() > capacity) {
         throw std::invalid_argument("prompt exceeds configured context capacity");

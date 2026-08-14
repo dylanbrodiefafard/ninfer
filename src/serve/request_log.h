@@ -17,7 +17,7 @@
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 7;
+inline constexpr int kRequestLogSchemaVersion        = 8;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct RequestLogContext {
@@ -34,7 +34,7 @@ struct RequestLogContext {
     bool enable_thinking                   = true;
     bool preserve_thinking                 = false;
     bool preserve_thinking_semantic_change = false;
-    ninfer::SamplingParameters sampling;
+    ninfer::ResolvedSamplingParameters sampling;
 };
 
 struct ServerLogEnvironment {
@@ -72,6 +72,7 @@ std::string format_throughput(const ThroughputReport& report);
 // object without a trailing newline.
 std::string format_server_start_json(const std::string& server_instance_id,
                                      std::uint64_t timestamp_unix_ms, const ServeOptions& options,
+                                     const ninfer::ModelSamplingDefaults& sampling_defaults,
                                      const std::string& public_model_id,
                                      const ninfer::LoadSummary& load,
                                      const ninfer::MemorySummary& memory,
@@ -108,8 +109,10 @@ public:
         return server_instance_id_;
     }
 
-    void write_server_start(const ServeOptions& options, const std::string& public_model_id,
-                            const ninfer::LoadSummary& load, const ninfer::MemorySummary& memory);
+    void write_server_start(const ServeOptions& options,
+                            const ninfer::ModelSamplingDefaults& sampling_defaults,
+                            const std::string& public_model_id, const ninfer::LoadSummary& load,
+                            const ninfer::MemorySummary& memory);
     void write_request_start(const RequestLogContext& context);
     void write_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
     void write_request_error(const RequestLogContext& context, const std::string& message);

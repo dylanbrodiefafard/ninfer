@@ -38,24 +38,30 @@ int main() {
                       "request log accepted the model artifact as its output path");
 
     ServeOptions options;
-    options.artifact_path             = "/models/qwen3_6_27b.ninfer";
-    options.host                      = "127.0.0.1";
-    options.port                      = 8123;
-    options.api_key                   = "must-not-appear";
-    options.model_id_override         = "deployment-alias";
-    options.request_log_jsonl         = "requests.jsonl";
-    options.max_context               = 262144;
-    options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(524288);
-    options.prefill_chunk             = 1024;
-    options.log_stats_interval_ms     = 2500;
-    options.kv_cache                  = ninfer::KvCacheStorage::Int8Group64;
-    options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
-    options.speculative.draft_tokens  = 3;
-    options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
-    options.enable_vision             = false;
-    options.allow_prefix_reuse        = false;
-    options.preserve_thinking         = true;
+    options.artifact_path                  = "/models/qwen3_6_27b.ninfer";
+    options.host                           = "127.0.0.1";
+    options.port                           = 8123;
+    options.api_key                        = "must-not-appear";
+    options.model_id_override              = "deployment-alias";
+    options.request_log_jsonl              = "requests.jsonl";
+    options.max_context                    = 262144;
+    options.kv_capacity                    = ninfer::KvCapacityPolicy::explicit_capacity(524288);
+    options.prefill_chunk                  = 1024;
+    options.log_stats_interval_ms          = 2500;
+    options.kv_cache                       = ninfer::KvCacheStorage::Int8Group64;
+    options.speculative.backend            = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens       = 3;
+    options.speculative.proposal_head      = ninfer::ProposalHead::Optimized;
+    options.enable_vision                  = false;
+    options.allow_prefix_reuse             = false;
+    options.preserve_thinking              = true;
+    options.sampling_overrides.temperature = 0.6F;
     options.startup_argv = {"ninfer-serve", options.artifact_path, "--api-key", "<redacted>"};
+
+    const ninfer::ModelSamplingDefaults sampling_defaults{
+        .thinking     = {.temperature = 1.0F, .top_k = 20, .top_p = 0.95F},
+        .non_thinking = {.temperature = 0.7F, .top_k = 20, .top_p = 0.8F, .presence_penalty = 1.5F},
+    };
 
     ninfer::LoadSummary load;
     load.target               = "qwen3_6_27b";
@@ -101,9 +107,9 @@ int main() {
     environment.cuda_runtime_version      = "13.1";
     environment.cuda_driver_version       = "13.1";
 
-    const Json server =
-        Json::parse(format_server_start_json("serve-test", 1000, options, "deployment-alias", load,
-                                             memory, environment, std::uint64_t{123456}));
+    const Json server = Json::parse(
+        format_server_start_json("serve-test", 1000, options, sampling_defaults, "deployment-alias",
+                                 load, memory, environment, std::uint64_t{123456}));
     failures += check(server.at("artifact_type") == kRequestLogArtifactType,
                       "server record artifact type mismatch");
     failures += check(server.at("schema_version") == kRequestLogSchemaVersion,
@@ -135,6 +141,15 @@ int main() {
         check(server.at("engine").at("prefix_reuse") == false, "prefix-reuse state missing");
     failures += check(server.at("server").at("default_preserve_thinking") == true,
                       "server preserve-thinking default missing");
+    failures +=
+        check(server.at("sampling_defaults").at("thinking").at("temperature") == 1.0 &&
+                  server.at("sampling_defaults").at("non_thinking").at("presence_penalty") == 1.5,
+              "registered mode-specific sampling defaults missing");
+    failures += check(
+        server.at("sampling_defaults").at("server_overrides").at("temperature").get<float>() ==
+                0.6F &&
+            server.at("sampling_defaults").at("server_overrides").at("top_p").is_null(),
+        "server sampling overrides lost omission state");
     failures += check(server.at("environment").at("gpu_name") == "NVIDIA GeForce RTX 5090",
                       "GPU name missing");
     failures += check(server.at("memory").at("request_transient").at("capacity_bytes") == 500 &&
