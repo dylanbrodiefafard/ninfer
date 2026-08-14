@@ -11,10 +11,12 @@
 
 #include <nlohmann/json.hpp>
 
+#include <array>
 #include <cstddef>
 #include <functional>
 #include <iostream>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -37,6 +39,15 @@ bool throws_api(const std::function<void()>& f) {
     return false;
 }
 
+std::string api_code(const std::function<void()>& f) {
+    try {
+        f();
+    } catch (const ApiException& error) { return error.error().code; } catch (...) {
+        return "wrong_exception";
+    }
+    return {};
+}
+
 RequestLimits default_limits() {
     RequestLimits limits;
     limits.default_max_tokens = 512;
@@ -44,6 +55,16 @@ RequestLimits default_limits() {
 }
 
 ServeOptions default_server() { return ServeOptions{}; }
+
+ninfer::PromptCapabilities effort_capabilities() {
+    ninfer::PromptCapabilities capabilities;
+    capabilities.enable_thinking                 = true;
+    capabilities.reasoning_effort.low            = true;
+    capabilities.reasoning_effort.medium         = true;
+    capabilities.reasoning_effort.xhigh          = true;
+    capabilities.reasoning_effort.default_effort = ninfer::ReasoningEffort::XHigh;
+    return capabilities;
+}
 
 ninfer::OwnedMedia fake_media(const ContentPart& part) {
     ninfer::OwnedMedia media;
@@ -56,7 +77,8 @@ ninfer::OwnedMedia fake_media(const ContentPart& part) {
 
 ninfer::PromptInput translate(const GenerationRequest& req) {
     const ServeOptions server = default_server();
-    return to_prompt_input(req, resolve_prompt_semantics(req, server), fake_media);
+    return to_prompt_input(req, resolve_prompt_semantics(req, server, effort_capabilities()),
+                           fake_media);
 }
 
 std::string joined_text(const ninfer::ChatMessage& message) {
@@ -410,6 +432,68 @@ int test_thinking_and_sampling() {
     return failures;
 }
 
+int test_reasoning_effort() {
+    const Json base = {
+        {"model", "m"},
+        {"max_tokens", 8},
+        {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})},
+    };
+    int failures = 0;
+
+    for (const auto& [wire, expected] :
+         std::array<std::pair<const char*, RequestedReasoningEffort>, 5>{
+             {{"low", RequestedReasoningEffort::Low},
+              {"medium", RequestedReasoningEffort::Medium},
+              {"high", RequestedReasoningEffort::High},
+              {"xhigh", RequestedReasoningEffort::XHigh},
+              {"max", RequestedReasoningEffort::Max}}}) {
+        Json body                       = base;
+        body["output_config"]           = Json{{"effort", wire}};
+        const GenerationRequest request = parse_messages_request(body, default_limits());
+        failures += check(request.reasoning_effort == expected,
+                          std::string("Anthropic did not accept protocol effort ") + wire);
+    }
+
+    Json low                             = base;
+    low["output_config"]                 = Json{{"effort", "low"}};
+    const GenerationRequest low_request  = parse_messages_request(low, default_limits());
+    const ninfer::PromptInput low_prompt = translate(low_request);
+    failures += check(low_prompt.options.enable_thinking &&
+                          low_prompt.options.reasoning_effort == ninfer::ReasoningEffort::Low,
+                      "Anthropic low effort did not reach PromptInput");
+
+    Json high                            = base;
+    high["output_config"]                = Json{{"effort", "high"}};
+    const GenerationRequest high_request = parse_messages_request(high, default_limits());
+    failures += check(api_code([&] {
+                          (void)resolve_prompt_semantics(high_request, default_server(),
+                                                         effort_capabilities());
+                      }) == "reasoning_effort_not_supported",
+                      "Anthropic high effort bypassed template capability validation");
+
+    Json conflict        = low;
+    conflict["thinking"] = Json{{"type", "disabled"}};
+    const GenerationRequest conflicting_request =
+        parse_messages_request(conflict, default_limits());
+    failures += check(api_code([&] {
+                          (void)resolve_prompt_semantics(conflicting_request, default_server(),
+                                                         effort_capabilities());
+                      }) == "conflicting_template_option",
+                      "Anthropic disabled thinking and effort were accepted together");
+
+    Json invalid             = base;
+    invalid["output_config"] = Json{{"effort", "minimal"}};
+    failures += check(throws_api([&] { (void)parse_messages_request(invalid, default_limits()); }),
+                      "Anthropic accepted an effort outside its protocol vocabulary");
+    invalid["output_config"] = Json{{"effort", 1}};
+    failures += check(throws_api([&] { (void)parse_messages_request(invalid, default_limits()); }),
+                      "Anthropic accepted non-string output_config.effort");
+    invalid["output_config"] = Json{{"format", Json{{"type", "json_schema"}}}};
+    failures += check(throws_api([&] { (void)parse_messages_request(invalid, default_limits()); }),
+                      "unsupported Anthropic output_config option was ignored");
+    return failures;
+}
+
 int test_stop_reason_mapping() {
     int failures = 0;
     failures += check(std::string(messages_stop_reason(ninfer::FinishReason::OutputLimit, false)) ==
@@ -571,6 +655,7 @@ int main() {
     failures += test_tools_and_choice();
     failures += test_tool_use_result_roundtrip();
     failures += test_thinking_and_sampling();
+    failures += test_reasoning_effort();
     failures += test_stop_reason_mapping();
     failures += test_response_serialization();
     failures += test_streaming_events();

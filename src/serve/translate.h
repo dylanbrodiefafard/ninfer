@@ -16,12 +16,14 @@ namespace ninfer::serve {
 using MediaAcquirer = std::function<ninfer::OwnedMedia(const ContentPart&)>;
 
 struct ResolvedPromptSemantics {
-    bool enable_thinking   = true;
+    bool enable_thinking = true;
+    std::optional<ninfer::ReasoningEffort> reasoning_effort;
     bool preserve_thinking = false;
 };
 
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& req,
-                                                 const ServeOptions& server);
+                                                 const ServeOptions& server,
+                                                 const ninfer::PromptCapabilities& capabilities);
 
 ninfer::PromptInput to_prompt_input(const GenerationRequest& req,
                                     const ResolvedPromptSemantics& semantics,

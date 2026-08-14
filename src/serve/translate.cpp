@@ -23,6 +23,14 @@ std::uint64_t random_seed() {
     throw ApiException(std::move(error));
 }
 
+[[noreturn]] void invalid_prompt_option(std::string message, std::string param, std::string code) {
+    ApiError error;
+    error.message = std::move(message);
+    error.param   = std::move(param);
+    error.code    = std::move(code);
+    throw ApiException(std::move(error));
+}
+
 ninfer::SamplingParameters resolve_sampling(const SamplingParams& request,
                                             const ServeOptions& server) {
     ninfer::SamplingParameters sampling;
@@ -90,11 +98,59 @@ std::string normalized_role(const std::string& role) {
 } // namespace
 
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& request,
-                                                 const ServeOptions& server) {
-    return ResolvedPromptSemantics{
+                                                 const ServeOptions& server,
+                                                 const ninfer::PromptCapabilities& capabilities) {
+    ResolvedPromptSemantics result{
         .enable_thinking   = request.enable_thinking.value_or(server.enable_thinking),
+        .reasoning_effort  = std::nullopt,
         .preserve_thinking = request.preserve_thinking.value_or(server.preserve_thinking),
     };
+    if (!request.reasoning_effort) { return result; }
+
+    const RequestedReasoningEffort requested = *request.reasoning_effort;
+    const bool enables_thinking              = requested != RequestedReasoningEffort::None;
+    if (request.enable_thinking && *request.enable_thinking != enables_thinking) {
+        invalid_prompt_option("reasoning effort conflicts with enable_thinking",
+                              request.reasoning_effort_param, "conflicting_template_option");
+    }
+    result.enable_thinking = enables_thinking;
+
+    if (requested == RequestedReasoningEffort::None) {
+        if (!capabilities.enable_thinking) {
+            invalid_prompt_option("the loaded chat template cannot disable thinking",
+                                  request.reasoning_effort_param, "reasoning_effort_not_supported");
+        }
+        return result;
+    }
+
+    switch (requested) {
+    case RequestedReasoningEffort::Low:
+        result.reasoning_effort = ninfer::ReasoningEffort::Low;
+        break;
+    case RequestedReasoningEffort::Medium:
+        result.reasoning_effort = ninfer::ReasoningEffort::Medium;
+        break;
+    case RequestedReasoningEffort::XHigh:
+        result.reasoning_effort = ninfer::ReasoningEffort::XHigh;
+        break;
+    case RequestedReasoningEffort::Minimal:
+    case RequestedReasoningEffort::High:
+    case RequestedReasoningEffort::Max:
+        invalid_prompt_option("reasoning effort '" +
+                                  std::string(requested_reasoning_effort_name(requested)) +
+                                  "' is not supported by the loaded chat template",
+                              request.reasoning_effort_param, "reasoning_effort_not_supported");
+    case RequestedReasoningEffort::None:
+        break;
+    }
+
+    if (!capabilities.reasoning_effort.supports(*result.reasoning_effort)) {
+        invalid_prompt_option("reasoning effort '" +
+                                  std::string(requested_reasoning_effort_name(requested)) +
+                                  "' is not supported by the loaded chat template",
+                              request.reasoning_effort_param, "reasoning_effort_not_supported");
+    }
+    return result;
 }
 
 ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
@@ -147,6 +203,7 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
 
     input.options.add_generation_prompt = true;
     input.options.enable_thinking       = semantics.enable_thinking;
+    input.options.reasoning_effort      = semantics.reasoning_effort;
     input.options.preserve_thinking     = semantics.preserve_thinking;
     input.options.add_vision_id         = false;
     input.options.tool_jsons            = effective_tool_jsons(request);

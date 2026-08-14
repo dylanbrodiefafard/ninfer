@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -30,6 +31,7 @@ struct Options {
     bool raw_output      = false;
     bool print_token_ids = false;
     bool enable_thinking = true;
+    std::optional<ReasoningEffort> reasoning_effort;
 
     std::vector<TokenId> stop_token_ids;
     std::vector<StopString> stop_strings;

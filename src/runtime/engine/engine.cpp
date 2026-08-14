@@ -181,6 +181,16 @@ std::uint32_t Engine::count_tokens(PromptInput input) const {
         impl_->active);
 }
 
+PromptCapabilities Engine::prompt_capabilities() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& target_ptr) {
+            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
+            return target_ptr->loaded->frontend.prompt_capabilities();
+        },
+        impl_->active);
+}
+
 GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                                 std::chrono::steady_clock::time_point pending_deadline,
                                 HostInputLease host_input) {

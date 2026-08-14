@@ -111,13 +111,15 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
 
 class Processor {
 public:
-    explicit Processor(const Tokenizer& tokenizer, ProcessorOptions options = {});
+    Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& chat_template,
+              ProcessorOptions options = {});
 
     ProcessedInput process(const std::vector<ChatMessage>& messages,
                            ChatRenderOptions render_options = {}) const;
 
 private:
     const Tokenizer& tokenizer_;
+    const CompiledChatTemplate& chat_template_;
     ProcessorOptions options_;
 };
 

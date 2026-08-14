@@ -107,6 +107,7 @@ private:
 
     ServeOptions options_;
     std::unique_ptr<ninfer::Engine> engine_;
+    ninfer::PromptCapabilities prompt_capabilities_;
     std::shared_ptr<RequestCapacity> request_capacity_;
     std::shared_ptr<MediaInputCapacity> media_input_capacity_;
 };

@@ -510,6 +510,22 @@ std::optional<bool> parse_openai_preserve_thinking(const Json& body) {
     return template_value ? template_value : top_level;
 }
 
+void parse_openai_reasoning_effort(const Json& body, GenerationRequest& out) {
+    if (!body.contains("reasoning_effort") || body.at("reasoning_effort").is_null()) { return; }
+    if (!body.at("reasoning_effort").is_string()) {
+        bad_request("reasoning_effort must be a string or null", "reasoning_effort");
+    }
+    const std::string value = body.at("reasoning_effort").get<std::string>();
+    const std::optional<RequestedReasoningEffort> effort = parse_requested_reasoning_effort(value);
+    if (!effort) {
+        bad_request("reasoning_effort must be one of none, minimal, low, medium, high, xhigh, or "
+                    "max",
+                    "reasoning_effort");
+    }
+    out.reasoning_effort       = *effort;
+    out.reasoning_effort_param = "reasoning_effort";
+}
+
 GenerationRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits) {
     require_object(body);
     reject_unsupported_features(body);
@@ -534,6 +550,7 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     if (body.contains("enable_thinking") && !body.at("enable_thinking").is_null()) {
         out.enable_thinking = get_bool(body, "enable_thinking", false);
     }
+    parse_openai_reasoning_effort(body, out);
     out.preserve_thinking = parse_openai_preserve_thinking(body);
 
     std::optional<int> max_tokens = get_int(body, "max_completion_tokens");

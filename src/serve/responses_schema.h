@@ -32,9 +32,8 @@ struct ResponsesRequest {
     nlohmann::json metadata    = nlohmann::json::object();
     nlohmann::json tools       = nlohmann::json::array();
     nlohmann::json tool_choice = "auto";
-    std::optional<std::string> reasoning_effort;
-    bool store  = true;
-    bool stream = false;
+    bool store                 = true;
+    bool stream                = false;
 };
 
 struct ResponsesRuntimeValues {

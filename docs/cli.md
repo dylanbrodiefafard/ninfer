@@ -2,8 +2,6 @@
 
 `build/apps/ninfer` runs one request against one registered `.ninfer` artifact. Build NInfer and
 download an artifact using the [project README](../README.md) before following this guide.
-The examples below use Qwen3.6-27B; `models/qwen3_8_27b.ninfer` uses the same CLI, MTP, and Vision
-options.
 
 ## Text input
 
@@ -26,8 +24,11 @@ written to stderr, so stdout can be redirected independently:
   > answer.txt 2> run.log
 ```
 
-Thinking is enabled by default. Add `--no-thinking` for direct-response prompt rendering or
-`--greedy` for exact argmax decoding.
+Thinking is enabled by default. If the chat template embedded in the loaded artifact exposes
+reasoning effort, `--reasoning-effort low|medium|xhigh` selects it; omitting the option uses the
+template's default. An artifact whose template does not expose effort rejects the option. Add
+`--no-thinking` for direct-response prompt rendering; it cannot be combined with
+`--reasoning-effort`. `--greedy` selects exact argmax decoding independently.
 
 ## Startup memory profile
 
@@ -143,6 +144,7 @@ measured recommendation rather than a semantic limit.
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
+| `--reasoning-effort low\|medium\|xhigh` | select an effort exposed by the loaded chat template | template default |
 | `--greedy` | exact argmax decoding | off |
 | `--temperature F` | sampling temperature | `0.6` |
 | `--top-p F` | nucleus threshold | `0.95` |
@@ -160,7 +162,7 @@ Run `./build/apps/ninfer --help` for the exact option contract.
 
 ## Context and memory
 
-All three registered model IDs have a native context limit of 262,144 tokens. The practical
+The registered model IDs have a native context limit of 262,144 tokens. The practical
 allocation on one RTX 5090 depends on the selected artifact, media workload, output budget, and
 KV-cache type.
 Use `--kv-dtype int8` for large context allocations. The prepared prompt must fit

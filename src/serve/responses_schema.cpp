@@ -532,16 +532,15 @@ void parse_reasoning(const Json& body, ResponsesRequest& out) {
     if (!reasoning.at("effort").is_string()) {
         bad_request("reasoning.effort must be a string", "reasoning");
     }
-    const std::string effort = reasoning.at("effort").get<std::string>();
-    if (effort == "none") {
-        out.generation.enable_thinking = false;
-    } else if (effort == "medium") {
-        out.generation.enable_thinking = true;
-    } else {
-        bad_request("NInfer supports reasoning.effort 'none' or 'medium'", "reasoning",
-                    "reasoning_effort_not_supported");
+    const std::string value = reasoning.at("effort").get<std::string>();
+    const std::optional<RequestedReasoningEffort> effort = parse_requested_reasoning_effort(value);
+    if (!effort) {
+        bad_request("reasoning.effort must be one of none, minimal, low, medium, high, xhigh, or "
+                    "max",
+                    "reasoning");
     }
-    out.reasoning_effort = effort;
+    out.generation.reasoning_effort       = *effort;
+    out.generation.reasoning_effort_param = "reasoning.effort";
 }
 
 void validate_metadata(const Json& body, ResponsesRequest& out) {
@@ -801,7 +800,9 @@ struct ItemIds {
 Json response_common(const std::string& id, std::int64_t created_at,
                      const ResponsesRequest& request, const ResponsesRuntimeValues& runtime) {
     const Json reasoning = {
-        {"effort", request.reasoning_effort ? Json(*request.reasoning_effort) : Json(nullptr)},
+        {"effort", request.generation.reasoning_effort
+                       ? Json(requested_reasoning_effort_name(*request.generation.reasoning_effort))
+                       : Json(nullptr)},
         {"summary", nullptr}};
     return Json{
         {"id", id},

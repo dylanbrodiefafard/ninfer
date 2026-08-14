@@ -116,15 +116,19 @@ int main() {
 
     GenerationRequest request;
     request.max_tokens = 1;
+    ninfer::PromptCapabilities prompt_capabilities;
+    prompt_capabilities.enable_thinking = true;
     failures += check(to_request_options(request, defaults).execution.allow_prefix_reuse,
                       "default server policy did not reach Engine options");
     failures += check(!to_request_options(request, configured).execution.allow_prefix_reuse,
                       "disabled server policy did not reach Engine options");
-    failures += check(resolve_prompt_semantics(request, configured).preserve_thinking,
-                      "server preserve-thinking default was not resolved");
+    failures +=
+        check(resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,
+              "server preserve-thinking default was not resolved");
     request.preserve_thinking = false;
-    failures += check(!resolve_prompt_semantics(request, configured).preserve_thinking,
-                      "request preserve-thinking override did not win");
+    failures +=
+        check(!resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,
+              "request preserve-thinking override did not win");
 
     failures +=
         check(serve_usage_text("ninfer-serve").find("--no-prefix-reuse") != std::string::npos,

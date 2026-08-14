@@ -263,8 +263,9 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.use_cuda_graph       = options_.use_cuda_graph;
     engine_options.speculative          = options_.speculative;
     engine_options.load_progress        = std::move(load_progress);
-    engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
-    request_capacity_ = std::make_shared<RequestCapacity>(
+    engine_              = std::make_unique<ninfer::Engine>(std::move(engine_options));
+    prompt_capabilities_ = engine_->prompt_capabilities();
+    request_capacity_    = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
     media_input_capacity_ = std::make_shared<MediaInputCapacity>();
 }
@@ -330,12 +331,13 @@ GenerationService::acquire_media_input(Clock::time_point deadline,
 PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            std::function<bool()> is_cancelled) const {
     PreparedRequest prepared;
-    ninfer::RequestOptions request_options     = to_request_options(request, options_);
-    prepared.sampling                          = request_options.execution.sampling;
-    prepared.include_usage                     = request.include_usage;
-    prepared.tool_capable                      = request.uses_tools() || request.has_tool_history();
-    prepared.tool_name_max_length              = request.tool_name_max_length;
-    const ResolvedPromptSemantics semantics    = resolve_prompt_semantics(request, options_);
+    ninfer::RequestOptions request_options = to_request_options(request, options_);
+    prepared.sampling                      = request_options.execution.sampling;
+    prepared.include_usage                 = request.include_usage;
+    prepared.tool_capable                  = request.uses_tools() || request.has_tool_history();
+    prepared.tool_name_max_length          = request.tool_name_max_length;
+    const ResolvedPromptSemantics semantics =
+        resolve_prompt_semantics(request, options_, prompt_capabilities_);
     prepared.enable_thinking                   = semantics.enable_thinking;
     prepared.preserve_thinking                 = semantics.preserve_thinking;
     prepared.preserve_thinking_semantic_change = request.preserve_thinking_semantic_change;
@@ -390,7 +392,8 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
     }
     const Clock::time_point deadline =
         Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms);
-    const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
+    const ResolvedPromptSemantics semantics =
+        resolve_prompt_semantics(request, options_, prompt_capabilities_);
     HostInputLease host_input;
     if (request_has_media) { host_input = acquire_media_input(deadline, is_cancelled); }
     try {

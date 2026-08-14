@@ -1,5 +1,7 @@
 #pragma once
 
+#include <ninfer/types.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -69,8 +71,9 @@ struct ChatMessage {
 struct ChatRenderOptions {
     bool add_generation_prompt = true;
     bool enable_thinking       = true;
-    bool preserve_thinking     = false;
-    bool add_vision_id         = false;
+    std::optional<ReasoningEffort> reasoning_effort;
+    std::optional<bool> preserve_thinking;
+    bool add_vision_id = false;
     std::vector<std::string> tool_jsons;
 };
 
@@ -79,6 +82,24 @@ struct RenderedChat {
     std::optional<std::size_t> turn_rewrite_byte_offset;
 };
 
-RenderedChat render_chat(const std::vector<ChatMessage>& messages, ChatRenderOptions options = {});
+enum class ChatTemplateSemantics : std::uint8_t {
+    ThinkingToggle,
+    ReasoningEffort,
+};
+
+class CompiledChatTemplate {
+public:
+    [[nodiscard]] static CompiledChatTemplate resolve(std::string_view source);
+
+    [[nodiscard]] PromptCapabilities capabilities() const noexcept;
+    [[nodiscard]] RenderedChat render(const std::vector<ChatMessage>& messages,
+                                      ChatRenderOptions options = {}) const;
+
+private:
+    explicit CompiledChatTemplate(ChatTemplateSemantics semantics) noexcept
+        : semantics_(semantics) {}
+
+    ChatTemplateSemantics semantics_;
+};
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

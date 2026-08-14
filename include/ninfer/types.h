@@ -188,11 +188,42 @@ struct ChatMessage {
     std::string tool_call_id;
 };
 
+enum class ReasoningEffort : std::uint8_t {
+    Low,
+    Medium,
+    XHigh,
+};
+
+struct ReasoningEffortCapabilities {
+    bool low    = false;
+    bool medium = false;
+    bool xhigh  = false;
+    std::optional<ReasoningEffort> default_effort;
+
+    [[nodiscard]] constexpr bool supports(ReasoningEffort effort) const noexcept {
+        switch (effort) {
+        case ReasoningEffort::Low:
+            return low;
+        case ReasoningEffort::Medium:
+            return medium;
+        case ReasoningEffort::XHigh:
+            return xhigh;
+        }
+        return false;
+    }
+};
+
+struct PromptCapabilities {
+    bool enable_thinking = false;
+    ReasoningEffortCapabilities reasoning_effort;
+};
+
 struct PromptOptions {
     bool add_generation_prompt = true;
     bool enable_thinking       = true;
-    bool preserve_thinking     = false;
-    bool add_vision_id         = false;
+    std::optional<ReasoningEffort> reasoning_effort;
+    bool preserve_thinking = false;
+    bool add_vision_id     = false;
     std::vector<std::string> tool_jsons;
 };
 

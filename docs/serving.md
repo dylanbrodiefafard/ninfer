@@ -16,9 +16,6 @@ Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
   --lm-head-draft
 ```
 
-For Qwen3.8-27B, replace the artifact path with `models/qwen3_8_27b.ninfer`; without a
-`--model-id` override, its public model ID is `qwen3.8-27b`.
-
 For the 35B-A3B artifact, select its artifact path; the public model ID follows the container
 identity automatically:
 
@@ -82,6 +79,7 @@ The endpoint supports:
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`;
 - function tools, tool choices, assistant tool-call history, and tool-result messages;
+- the top-level `reasoning_effort` field;
 - the `enable_thinking` extension;
 - `chat_template_kwargs.preserve_thinking` and the top-level `preserve_thinking` alias.
 
@@ -89,11 +87,23 @@ The request `model` must equal the public model ID: the artifact `identity.model
 the explicit `--model-id` override. Reasoning is returned separately as `reasoning_content`; answer
 text remains in `content`.
 
-`enable_thinking` controls whether the new assistant turn may reason. `preserve_thinking` controls
-whether reasoning from closed assistant turns remains in later prompts. The latter defaults to the
-server setting, which is off unless `--preserve-thinking` is used. If both OpenAI spellings are
-present they must carry the same boolean value. Unknown non-null `chat_template_kwargs` are
-rejected.
+At startup, NInfer resolves prompt capabilities from the exact `frontend/chat_template.jinja`
+resource embedded in the loaded artifact. It does not infer them from the request's `model` field,
+the artifact identity, or a target profile. A recognized effort-capable template exposes `low`,
+`medium`, and `xhigh`; omitting effort uses that template's declared default. An explicit effort
+not exposed by the loaded template returns HTTP 400 with code
+`reasoning_effort_not_supported` before prompt preparation.
+
+For Chat Completions, `reasoning_effort: "none"` disables thinking. `low`, `medium`, and `xhigh`
+select the corresponding template effort when available. The other OpenAI protocol values
+`minimal`, `high`, and `max` are parsed but rejected when the loaded template does not expose them.
+`enable_thinking` controls the same new-turn thinking switch; a contradictory combination with
+`reasoning_effort` returns `conflicting_template_option`.
+
+`preserve_thinking` controls whether reasoning from closed assistant turns remains in later
+prompts. It defaults to the server setting, which is off unless `--preserve-thinking` is used. If
+both OpenAI spellings are present they must carry the same boolean value. Unknown non-null
+`chat_template_kwargs` are rejected.
 
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
 finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty
@@ -175,7 +185,7 @@ wire response contains typed `output` Items.
 | `temperature` | finite number in `[0,2]` |
 | `top_p` | finite number in `[0,1]` |
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
-| `reasoning.effort` | `none` disables Qwen thinking; `medium` enables it; other effort levels are rejected because this checkpoint exposes a binary thinking mode |
+| `reasoning.effort` | `none` disables thinking; `low`, `medium`, or `xhigh` selects an effort exposed by the loaded chat template; `minimal`, `high`, and `max` return `reasoning_effort_not_supported` for the registered templates |
 | `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
 | `text.format` | omitted or `{"type":"text"}` only |
@@ -369,6 +379,11 @@ events. `thinking.type: "disabled"` disables thinking; other supported values en
 The independent top-level `preserve_thinking` boolean controls closed-turn history and otherwise
 uses the server default.
 
+Anthropic `output_config.effort` accepts the protocol values `low`, `medium`, `high`, `xhigh`, and
+`max`. The value is then checked against the loaded chat template in the same way as the OpenAI
+endpoints; the registered effort-capable template exposes `low`, `medium`, and `xhigh`. Combining
+an effort with `thinking.type: "disabled"` is rejected as contradictory.
+
 Anthropic's `model` field is treated as a response label and does not select the loaded artifact.
 
 `POST /v1/messages/count_tokens` uses the artifact's tokenizer, chat template, and media expansion
@@ -532,12 +547,14 @@ therefore resets the prefix instead of reusing placeholder-token KV. Media wholl
 prefix skips Vision execution, while new suffix media is encoded normally. The completion log
 reports the reused token count as `cache=`.
 
-The Qwen3.6-family runtime, including Qwen3.8-27B, distinguishes `full_reset`, `append_frontier`,
-and `restore_turn_checkpoint`. A turn checkpoint includes the recurrent and selected
+The shared family runtime distinguishes `full_reset`, `append_frontier`, and
+`restore_turn_checkpoint`. A turn checkpoint includes the recurrent and selected
 speculative-backend continuation state required to recompute a rewritten suffix; matching KV
 tokens alone never authorize a partial hit. Stable `preserve_thinking=true` histories normally
 append, while stable `false` histories restore the previous open-turn checkpoint when a new user
 closes that turn. The JSONL completion record exposes the selected path as `prefix_reuse_path`.
+Changing reasoning effort changes the rendered prompt and therefore does not reuse a prefix whose
+effort instruction differs.
 
 Speculative decoding is an engine option and does not change protocol output shapes, stop behavior,
 or usage accounting. If a stop truncates a multi-token MTP or DFlash round, the Engine commits the

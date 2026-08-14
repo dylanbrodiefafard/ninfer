@@ -70,6 +70,7 @@ public:
                                                 bool allow_prefix_identity = true) const;
 
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input) const;
+    [[nodiscard]] PromptCapabilities prompt_capabilities() const;
 
     // Establishes queue membership synchronously. Destroying an unconsumed handle cancels its
     // request; wait() owns result consumption and may run independently from GPU execution.
