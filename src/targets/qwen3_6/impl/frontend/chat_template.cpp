@@ -350,8 +350,9 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         rendered += "<|im_end|>\n";
     }
 
-    const long last_query_index = last_real_user_query(messages);
-    std::optional<std::size_t> turn_rewrite_byte_offset;
+    const long last_query_index  = last_real_user_query(messages);
+    const bool preserve_thinking = options.preserve_thinking.value_or(effort_template);
+    std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
 
     int image_count = 0;
     int video_count = 0;
@@ -401,11 +402,11 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         }
         reasoning = trim_ascii_whitespace(reasoning);
 
-        const bool preserve_thinking = options.preserve_thinking.value_or(effort_template);
         const bool keep_thinking = preserve_thinking || (static_cast<long>(i) > last_query_index);
         rendered += "<|im_start|>assistant\n";
-        if (!turn_rewrite_byte_offset && static_cast<long>(i) > last_query_index) {
-            turn_rewrite_byte_offset = rendered.size();
+        if (!preserve_thinking && !rewrite_checkpoint && static_cast<long>(i) > last_query_index) {
+            rewrite_checkpoint = RewriteCheckpointByteSpec{
+                .kind = RewriteCheckpointKind::TurnClosure, .offset = rendered.size()};
         }
         if (keep_thinking) {
             rendered += "<think>\n";
@@ -429,15 +430,24 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
 
     if (options.add_generation_prompt) {
         rendered += "<|im_start|>assistant\n";
-        if (!turn_rewrite_byte_offset) { turn_rewrite_byte_offset = rendered.size(); }
+        if (!preserve_thinking && !rewrite_checkpoint) {
+            rewrite_checkpoint = RewriteCheckpointByteSpec{
+                .kind = RewriteCheckpointKind::TurnClosure, .offset = rendered.size()};
+        }
         if (options.enable_thinking) {
             rendered += "<think>\n";
         } else {
             rendered += "<think>\n\n</think>\n\n";
         }
+        if (preserve_thinking) {
+            // Response replay retains the deterministic generation prologue. This is the prompt
+            // frontier for both thinking modes, so capturing it does not split off a tiny final
+            // prefill unit. The complete rendered prefix is tokenized independently below.
+            rewrite_checkpoint = RewriteCheckpointByteSpec{
+                .kind = RewriteCheckpointKind::ResponseReplay, .offset = rendered.size()};
+        }
     }
-    return RenderedChat{.text                     = std::move(rendered),
-                        .turn_rewrite_byte_offset = turn_rewrite_byte_offset};
+    return RenderedChat{.text = std::move(rendered), .rewrite_checkpoint = rewrite_checkpoint};
 }
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

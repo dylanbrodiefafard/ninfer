@@ -95,8 +95,8 @@ python3 -m tools.smoke.serve_contract \
 The client exercises OpenAI, Anthropic, streaming, usage, multimodal, and tool-call response
 surfaces against the resident process.
 
-For turn-checkpoint and thinking-history behavior, the managed smoke script launches a real server
-and consumes the repository fixture:
+For typed rewrite-checkpoint and thinking-history behavior, the managed smoke script launches a
+real server and consumes the repository fixture:
 
 ```bash
 python3 tools/smoke/serve_thinking_preservation.py \

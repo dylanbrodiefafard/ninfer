@@ -145,16 +145,20 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         base->vision_control         = std::move(control);
     }
 
-    if (prompt.identity.turn_rewrite_boundary) {
-        const std::uint32_t candidate = *prompt.identity.turn_rewrite_boundary;
-        if (candidate == 0 || candidate >= base->summary.prompt_tokens) {
-            throw std::invalid_argument("turn rewrite boundary must lie inside the prompt");
+    if (prompt.identity.rewrite_checkpoint) {
+        const RewriteCheckpointSpec candidate = *prompt.identity.rewrite_checkpoint;
+        if (candidate.frontier == 0 || candidate.frontier > base->summary.prompt_tokens) {
+            throw std::invalid_argument(
+                "rewrite checkpoint frontier must lie at or inside the prompt frontier");
         }
-        base->turn_rewrite_boundary = candidate;
+        base->rewrite_checkpoint = candidate;
     }
     const std::size_t cold_prefill_splits =
         (base->vision_control != nullptr ? base->vision_control->items.size() : 0ULL) +
-        (base->turn_rewrite_boundary ? 1ULL : 0ULL);
+        (base->rewrite_checkpoint &&
+                 base->rewrite_checkpoint->frontier < base->summary.prompt_tokens
+             ? 1ULL
+             : 0ULL);
     base->summary.service_work_quanta =
         projected_service_work(base->summary, 0, prefill_chunk, cold_prefill_splits);
     return RequestBasePlan(std::move(base));
@@ -188,13 +192,13 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                                             sequence.execution_frontier)) {
             plan->reuse      = ReusePath::AppendAtFrontier;
             plan->reuse_base = sequence.execution_frontier;
-        } else if (sequence.turn_checkpoint.valid && sequence.turn_checkpoint.frontier != 0 &&
-                   sequence.turn_checkpoint.frontier < prompt.token_ids.size() &&
+        } else if (sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier != 0 &&
+                   sequence.rewrite_checkpoint.frontier <= prompt.token_ids.size() &&
                    qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
                                                    sequence.prefix_identity,
-                                                   sequence.turn_checkpoint.frontier)) {
-            plan->reuse      = ReusePath::RestoreTurnCheckpoint;
-            plan->reuse_base = sequence.turn_checkpoint.frontier;
+                                                   sequence.rewrite_checkpoint.frontier)) {
+            plan->reuse      = restore_path(sequence.rewrite_checkpoint.kind);
+            plan->reuse_base = sequence.rewrite_checkpoint.frontier;
         }
     }
 
@@ -203,8 +207,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             plan->reuse == ReusePath::AppendAtFrontier && sequence.tail_hidden_valid &&
             decoder->mtp_cache() != nullptr &&
             (plan->reuse_base == 0 || sequence.mtp_kv_valid >= plan->reuse_base - 1);
-        const bool checkpoint_ready = plan->reuse == ReusePath::RestoreTurnCheckpoint &&
-                                      decoder->mtp_cache() != nullptr &&
+        const bool checkpoint_ready = is_rewrite_checkpoint_restore(plan->reuse) &&
+                                      decoder->mtp_cache() != nullptr && plan->reuse_base != 0 &&
                                       sequence.mtp_kv_valid >= plan->reuse_base - 1;
         if (plan->reuse != ReusePath::FullReset && !append_ready && !checkpoint_ready) {
             plan->reuse      = ReusePath::FullReset;
@@ -212,7 +216,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         }
     }
 
-    if (plan->reuse == ReusePath::RestoreTurnCheckpoint &&
+    if (is_rewrite_checkpoint_restore(plan->reuse) &&
         speculative_backend == SpeculativeBackend::DFlash &&
         (!dflash || !sequence.kv || !sequence.kv->backend ||
          sequence.dflash_context_frontier < plan->reuse_base)) {
@@ -220,23 +224,26 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         plan->reuse_base = 0;
     }
 
-    const std::optional<std::uint32_t> desired = base.turn_rewrite_boundary;
-    const bool can_keep                        = desired && plan->reuse != ReusePath::FullReset &&
-                          sequence.turn_checkpoint.valid &&
-                          sequence.turn_checkpoint.frontier == *desired &&
-                          qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
-                                                          sequence.prefix_identity, *desired);
+    const std::optional<RewriteCheckpointSpec>& desired = base.rewrite_checkpoint;
+    const bool existing_checkpoint_matches =
+        desired && plan->reuse != ReusePath::FullReset && sequence.rewrite_checkpoint.valid &&
+        sequence.rewrite_checkpoint.frontier == desired->frontier &&
+        qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
+                                        desired->frontier);
     if (!desired) {
-        plan->turn_checkpoint_action = TurnCheckpointAction::Drop;
-    } else if (can_keep) {
-        plan->turn_checkpoint_action = TurnCheckpointAction::KeepExisting;
+        plan->rewrite_checkpoint_action = RewriteCheckpointAction::Drop;
+    } else if (existing_checkpoint_matches) {
+        plan->rewrite_checkpoint_action = sequence.rewrite_checkpoint.kind == desired->kind
+                                              ? RewriteCheckpointAction::KeepExisting
+                                              : RewriteCheckpointAction::ReclassifyExisting;
+    } else if (desired->frontier > plan->reuse_base) {
+        plan->rewrite_checkpoint_action  = RewriteCheckpointAction::CaptureNew;
+        plan->rewrite_checkpoint_capture = desired;
     } else {
-        if (*desired <= plan->reuse_base) {
-            plan->reuse      = ReusePath::FullReset;
-            plan->reuse_base = 0;
-        }
-        plan->turn_checkpoint_action           = TurnCheckpointAction::CaptureNew;
-        plan->turn_checkpoint_capture_frontier = desired;
+        // The selected continuation state is already past the desired boundary. It remains a
+        // valid hit; do not replay an otherwise reusable prefix merely to materialize an older
+        // auxiliary snapshot. A later request can still use the checkpoint currently retained.
+        plan->rewrite_checkpoint_action = RewriteCheckpointAction::DeferCapture;
     }
 
     plan->summary.reusable_prompt_tokens = plan->reuse_base;
@@ -248,9 +255,11 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             plan->mtp_bridge  = plan->reuse_base < plan->summary.prompt_tokens
                                     ? MtpBridgeMode::BeforeSuffix
                                     : MtpBridgeMode::AfterExactHit;
-        } else if (plan->reuse == ReusePath::RestoreTurnCheckpoint) {
+        } else if (is_rewrite_checkpoint_restore(plan->reuse)) {
             plan->prepare_mtp = true;
-            plan->mtp_bridge  = MtpBridgeMode::BeforeSuffix;
+            plan->mtp_bridge  = plan->reuse_base < plan->summary.prompt_tokens
+                                    ? MtpBridgeMode::BeforeSuffix
+                                    : MtpBridgeMode::AfterExactHit;
         }
     }
 
@@ -274,8 +283,12 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         }
     }
 
-    const std::size_t prefill_splits = (plan->vision ? plan->vision->uses.size() : 0ULL) +
-                                       (plan->turn_checkpoint_capture_frontier ? 1ULL : 0ULL);
+    const std::size_t prefill_splits =
+        (plan->vision ? plan->vision->uses.size() : 0ULL) +
+        (plan->rewrite_checkpoint_capture &&
+                 plan->rewrite_checkpoint_capture->frontier < plan->summary.prompt_tokens
+             ? 1ULL
+             : 0ULL);
     plan->summary.service_work_quanta =
         projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits);
     return RequestPlan(std::move(plan));

@@ -208,13 +208,13 @@ void DFlashFeatureSink::capture_positions(const Tensor& source, cudaStream_t str
                                cudaMemcpyDeviceToDevice, stream));
 }
 
-void DFlashFeatureSink::consume_prefill_chunk(std::int32_t tokens, bool turn_checkpoint) {
+void DFlashFeatureSink::consume_prefill_chunk(std::int32_t tokens, bool rewrite_checkpoint) {
     if (!consume_prefill || tokens != active_tokens) {
         throw std::logic_error("DFlash prefill feature consumer is unavailable");
     }
     Tensor feature_window  = features->slice(1, 0, tokens);
     Tensor position_window = positions->slice(0, 0, tokens);
-    consume_prefill(feature_window, position_window, turn_checkpoint);
+    consume_prefill(feature_window, position_window, rewrite_checkpoint);
 }
 
 TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
@@ -241,13 +241,13 @@ TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, Wor
 TextContext::~TextContext() = default;
 
 void TextContext::set_linear_state_slots(std::int32_t current_slot,
-                                         std::int32_t turn_checkpoint_slot) {
-    if (current_slot < 0 || current_slot >= state_.slot_count() || turn_checkpoint_slot < 0 ||
-        turn_checkpoint_slot >= state_.slot_count() || current_slot == turn_checkpoint_slot) {
+                                         std::int32_t rewrite_checkpoint_slot) {
+    if (current_slot < 0 || current_slot >= state_.slot_count() || rewrite_checkpoint_slot < 0 ||
+        rewrite_checkpoint_slot >= state_.slot_count() || current_slot == rewrite_checkpoint_slot) {
         throw std::invalid_argument("TextContext Linear Attention slots are invalid");
     }
-    linear_state_current_slot_         = current_slot;
-    linear_state_turn_checkpoint_slot_ = turn_checkpoint_slot;
+    linear_state_current_slot_            = current_slot;
+    linear_state_rewrite_checkpoint_slot_ = rewrite_checkpoint_slot;
 }
 
 void TextContext::set_gdn_state_action(GdnStateAction action,
@@ -1064,11 +1064,12 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     const int base_i = static_cast<int>(base);
 
     const std::int64_t base64         = static_cast<std::int64_t>(base);
-    const std::int64_t checkpoint_abs = prefill_turn_checkpoint_frontier_;
-    const bool has_turn_checkpoint =
+    const std::int64_t checkpoint_abs = prefill_rewrite_checkpoint_frontier_;
+    const bool has_rewrite_checkpoint =
         checkpoint_abs > base64 && checkpoint_abs <= base64 + static_cast<std::int64_t>(T);
-    const int checkpoint_rel = has_turn_checkpoint ? static_cast<int>(checkpoint_abs - base64) : -1;
-    const std::int32_t turn_checkpoint_slot = linear_state_turn_checkpoint_slot_;
+    const int checkpoint_rel =
+        has_rewrite_checkpoint ? static_cast<int>(checkpoint_abs - base64) : -1;
+    const std::int32_t rewrite_checkpoint_slot = linear_state_rewrite_checkpoint_slot_;
 
     const bool prepare_mtp_prompt = mtp_enabled() && io_.mtp.has_value();
     if (prepare_mtp_prompt &&
@@ -1265,12 +1266,13 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             }
 
             if (checkpoint_rel > 0 && t0 + len == checkpoint_rel &&
-                turn_checkpoint_hidden_output_ != nullptr) {
-                require_tensor_shape(*turn_checkpoint_hidden_output_, DType::BF16, {kCfg.hidden, 1},
-                                     "turn checkpoint hidden output");
-                const Tensor turn_hidden = xf.slice(1, len - 1, 1);
-                CUDA_CHECK(cudaMemcpyAsync(turn_checkpoint_hidden_output_->data, turn_hidden.data,
-                                           turn_hidden.bytes(), cudaMemcpyDeviceToDevice, s));
+                rewrite_checkpoint_hidden_output_ != nullptr) {
+                require_tensor_shape(*rewrite_checkpoint_hidden_output_, DType::BF16,
+                                     {kCfg.hidden, 1}, "rewrite checkpoint hidden output");
+                const Tensor checkpoint_hidden = xf.slice(1, len - 1, 1);
+                CUDA_CHECK(cudaMemcpyAsync(rewrite_checkpoint_hidden_output_->data,
+                                           checkpoint_hidden.data, checkpoint_hidden.bytes(),
+                                           cudaMemcpyDeviceToDevice, s));
             }
         }
 
@@ -1280,14 +1282,14 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         }
 
         if (checkpoint_rel > 0 && t0 + len == checkpoint_rel) {
-            state_.copy_slot(linear_state_current_slot_, turn_checkpoint_slot, s);
+            state_.copy_slot(linear_state_current_slot_, rewrite_checkpoint_slot, s);
         }
 
         t0 += len;
         break;
     }
 
-    prefill_turn_checkpoint_frontier_ = -1;
+    prefill_rewrite_checkpoint_frontier_ = -1;
 
     ctx_.synchronize();
     work_.reset();

@@ -248,17 +248,17 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     if (io.dflash_decode.has_value() != (speculative_backend == SpeculativeBackend::DFlash)) {
         throw std::logic_error("DFlash decode frame does not match the sequence plan");
     }
-    prefill_hidden               = plan.persistent.prefill_hidden.bind(backing);
-    token_counts                 = plan.persistent.token_counts.bind(backing);
-    sampling_config              = plan.persistent.sampling_config.bind(backing);
-    tail_hidden_store            = plan.persistent.tail_hidden.bind(backing);
-    turn_checkpoint_hidden_store = plan.persistent.turn_checkpoint_hidden.bind(backing);
+    prefill_hidden                  = plan.persistent.prefill_hidden.bind(backing);
+    token_counts                    = plan.persistent.token_counts.bind(backing);
+    sampling_config                 = plan.persistent.sampling_config.bind(backing);
+    tail_hidden_store               = plan.persistent.tail_hidden.bind(backing);
+    rewrite_checkpoint_hidden_store = plan.persistent.rewrite_checkpoint_hidden.bind(backing);
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
         SequenceState& sequence = sequences[lane];
         sequence.lane           = lane;
         sequence.tail_hidden    = tail_hidden_store.slice(1, static_cast<std::int32_t>(lane), 1);
-        sequence.turn_checkpoint_hidden =
-            turn_checkpoint_hidden_store.slice(1, static_cast<std::int32_t>(lane), 1);
+        sequence.rewrite_checkpoint_hidden =
+            rewrite_checkpoint_hidden_store.slice(1, static_cast<std::int32_t>(lane), 1);
         sequence.ledger.reserve(static_cast<std::size_t>(capacity) + 1ULL);
         sequence.prefix_identity.reserve(static_cast<std::size_t>(capacity) + 1ULL);
     }
@@ -409,6 +409,11 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         (request_plan.vision.has_value() && !prompt.has_media())) {
         throw std::invalid_argument("request plan does not describe the prepared prompt");
     }
+    if (prompt.identity.rewrite_checkpoint &&
+        (prompt.identity.rewrite_checkpoint->frontier == 0 ||
+         prompt.identity.rewrite_checkpoint->frontier > prompt_tokens)) {
+        throw std::invalid_argument("prepared prompt has an invalid rewrite checkpoint");
+    }
     const bool suffix_has_visual = std::any_of(
         prompt.token_types.begin() + static_cast<std::ptrdiff_t>(request_plan.reuse_base),
         prompt.token_types.end(), [](std::uint8_t type) { return type != 0; });
@@ -426,21 +431,48 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                                           request_plan.reuse_base))) {
         throw std::logic_error("planned resident prefix is no longer reusable");
     }
-    if (request_plan.reuse == ReusePath::RestoreTurnCheckpoint &&
-        (!sequence.turn_checkpoint.valid ||
-         sequence.turn_checkpoint.frontier != request_plan.reuse_base)) {
-        throw std::logic_error("planned turn checkpoint is unavailable");
+    if (is_rewrite_checkpoint_restore(request_plan.reuse) &&
+        (!sequence.rewrite_checkpoint.valid ||
+         sequence.rewrite_checkpoint.frontier != request_plan.reuse_base ||
+         request_plan.reuse != restore_path(sequence.rewrite_checkpoint.kind))) {
+        throw std::logic_error("planned rewrite checkpoint is unavailable");
     }
-    if (request_plan.turn_checkpoint_action == TurnCheckpointAction::KeepExisting &&
-        (!prompt.identity.turn_rewrite_boundary || !sequence.turn_checkpoint.valid ||
-         sequence.turn_checkpoint.frontier != *prompt.identity.turn_rewrite_boundary)) {
-        throw std::logic_error("planned turn checkpoint retention is unavailable");
+    if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::KeepExisting &&
+        (!prompt.identity.rewrite_checkpoint || !sequence.rewrite_checkpoint.valid ||
+         sequence.rewrite_checkpoint.kind != prompt.identity.rewrite_checkpoint->kind ||
+         sequence.rewrite_checkpoint.frontier != prompt.identity.rewrite_checkpoint->frontier ||
+         request_plan.reuse == ReusePath::FullReset ||
+         !qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
+                                          sequence.rewrite_checkpoint.frontier))) {
+        throw std::logic_error("planned rewrite checkpoint retention is unavailable");
     }
-    if (request_plan.turn_checkpoint_action == TurnCheckpointAction::CaptureNew &&
-        (!request_plan.turn_checkpoint_capture_frontier ||
-         *request_plan.turn_checkpoint_capture_frontier <= request_plan.reuse_base ||
-         *request_plan.turn_checkpoint_capture_frontier >= prompt_tokens)) {
-        throw std::logic_error("planned turn checkpoint capture frontier is invalid");
+    if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::ReclassifyExisting &&
+        (!prompt.identity.rewrite_checkpoint || !sequence.rewrite_checkpoint.valid ||
+         sequence.rewrite_checkpoint.kind == prompt.identity.rewrite_checkpoint->kind ||
+         sequence.rewrite_checkpoint.frontier != prompt.identity.rewrite_checkpoint->frontier ||
+         request_plan.reuse == ReusePath::FullReset ||
+         !qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
+                                          sequence.rewrite_checkpoint.frontier))) {
+        throw std::logic_error("planned rewrite checkpoint reclassification is unavailable");
+    }
+    if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew &&
+        (!request_plan.rewrite_checkpoint_capture || !prompt.identity.rewrite_checkpoint ||
+         request_plan.rewrite_checkpoint_capture->kind !=
+             prompt.identity.rewrite_checkpoint->kind ||
+         request_plan.rewrite_checkpoint_capture->frontier !=
+             prompt.identity.rewrite_checkpoint->frontier ||
+         request_plan.rewrite_checkpoint_capture->frontier <= request_plan.reuse_base ||
+         request_plan.rewrite_checkpoint_capture->frontier > prompt_tokens)) {
+        throw std::logic_error("planned rewrite checkpoint capture is invalid");
+    }
+    if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::Drop &&
+        prompt.identity.rewrite_checkpoint) {
+        throw std::logic_error("planned rewrite checkpoint drop does not describe the prompt");
+    }
+    if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::DeferCapture &&
+        (!prompt.identity.rewrite_checkpoint || request_plan.reuse == ReusePath::FullReset ||
+         prompt.identity.rewrite_checkpoint->frontier > request_plan.reuse_base)) {
+        throw std::logic_error("planned rewrite checkpoint deferral is invalid");
     }
 
     const auto started       = Clock::now();
@@ -486,34 +518,37 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                                            request_plan.backend_kv_page_entitlement);
             sequence.text_kv_valid = base;
             sequence.ledger.resize(base);
-        } else {
+        } else if (is_rewrite_checkpoint_restore(request_plan.reuse)) {
             if (!sequence.kv || sequence.text_kv_valid < base) {
-                throw std::logic_error("resident turn checkpoint has no complete KV allocation");
+                throw std::logic_error("resident rewrite checkpoint has no complete KV allocation");
             }
             sequence.text_kv_valid = base;
             if (speculative_backend == SpeculativeBackend::Mtp) {
                 const std::uint32_t mtp_base = base == 0 ? 0 : base - 1;
                 if (!request_plan.prepare_mtp || sequence.mtp_kv_valid < mtp_base) {
                     throw std::logic_error(
-                        "turn-checkpoint MTP KV is shorter than the bridge frontier");
+                        "rewrite-checkpoint MTP KV is shorter than the bridge frontier");
                 }
                 sequence.mtp_kv_valid = mtp_base;
             } else if (speculative_backend == SpeculativeBackend::DFlash) {
                 if (!dflash || !sequence.kv->backend || sequence.dflash_context_frontier < base) {
-                    throw std::logic_error("planned DFlash turn checkpoint is unavailable");
+                    throw std::logic_error("planned DFlash rewrite checkpoint is unavailable");
                 }
-                dflash->restore_turn_checkpoint(static_cast<std::int32_t>(sequence.lane),
-                                                device.stream);
+                dflash->restore_rewrite_checkpoint(static_cast<std::int32_t>(sequence.lane),
+                                                   device.stream);
                 sequence.dflash_context_frontier = base;
             }
             trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
             resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
                                            request_plan.backend_kv_page_entitlement);
             decoder->linear_attention.copy_slot(
-                LinearStateSlots::turn_checkpoint_state_slot(sequence.lane, max_concurrency),
+                LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency),
                 LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
                 device.stream);
+            if (base == prompt_tokens) { copy_tail(sequence, sequence.rewrite_checkpoint_hidden); }
             sequence.ledger.resize(base);
+        } else {
+            throw std::logic_error("request plan has an invalid prefix reuse path");
         }
 
         trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
@@ -529,8 +564,12 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         sequence.rope_delta = prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
 
-        if (request_plan.turn_checkpoint_action != TurnCheckpointAction::KeepExisting) {
-            sequence.turn_checkpoint = {};
+        if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::Drop ||
+            request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew) {
+            sequence.rewrite_checkpoint = {};
+        } else if (request_plan.rewrite_checkpoint_action ==
+                   RewriteCheckpointAction::ReclassifyExisting) {
+            sequence.rewrite_checkpoint.kind = prompt.identity.rewrite_checkpoint->kind;
         }
         request.timings            = {};
         request.pending            = {};
@@ -555,20 +594,20 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         if (host_input_consumed) { prompt.release_media_payload(); }
 
         RequestControl::Prefill prefill{
-            .prompt                           = std::move(prompt),
-            .vision_plan                      = std::move(request_plan.vision),
-            .vision                           = nullptr,
-            .transient                        = transient,
-            .turn_checkpoint_capture_frontier = request_plan.turn_checkpoint_capture_frontier,
-            .base                             = base,
-            .cursor                           = base,
-            .prompt_tokens                    = prompt_tokens,
-            .initial_mtp_extent               = initial_mtp_extent,
-            .elapsed_seconds                  = 0.0,
-            .host_input_consumed_pending      = host_input_consumed,
-            .prepare_mtp                      = request_plan.prepare_mtp,
-            .reuse                            = request_plan.reuse,
-            .mtp_bridge                       = request_plan.mtp_bridge,
+            .prompt                      = std::move(prompt),
+            .vision_plan                 = std::move(request_plan.vision),
+            .vision                      = nullptr,
+            .transient                   = transient,
+            .rewrite_checkpoint_capture  = request_plan.rewrite_checkpoint_capture,
+            .base                        = base,
+            .cursor                      = base,
+            .prompt_tokens               = prompt_tokens,
+            .initial_mtp_extent          = initial_mtp_extent,
+            .elapsed_seconds             = 0.0,
+            .host_input_consumed_pending = host_input_consumed,
+            .prepare_mtp                 = request_plan.prepare_mtp,
+            .reuse                       = request_plan.reuse,
+            .mtp_bridge                  = request_plan.mtp_bridge,
         };
         request.prefill.emplace(std::move(prefill));
         auto& staged = *request.prefill;
@@ -836,7 +875,7 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.mtp_draft_count         = 0;
     sequence.tail_hidden_valid       = false;
     sequence.retained                = false;
-    sequence.turn_checkpoint         = {};
+    sequence.rewrite_checkpoint      = {};
     request.pending                  = {};
 }
 
@@ -1321,7 +1360,7 @@ void ProgramImplCore::prepare_graphs() {
             }
         };
         zero_cyclic_cache(dflash->local);
-        zero_cyclic_cache(dflash->turn_checkpoint_local);
+        zero_cyclic_cache(dflash->rewrite_checkpoint_local);
         CUDA_CHECK(cudaMemsetAsync(dflash->prefill_features.data, 0,
                                    dflash->prefill_features.bytes(), device.stream));
         CUDA_CHECK(cudaMemsetAsync(dflash->prefill_positions.data, 0,
@@ -1490,9 +1529,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             staged.cursor,
             static_cast<const ops::SamplingConfig*>(
                 sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1).data),
-            &sequence.turn_checkpoint_hidden,
+            &sequence.rewrite_checkpoint_hidden,
             LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
-            LinearStateSlots::turn_checkpoint_state_slot(sequence.lane, max_concurrency),
+            LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency),
             staged.initial_mtp_extent,
             dflash_host_ingress};
 
@@ -1502,8 +1541,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 throw std::logic_error("staged MTP bridge is outside the reusable suffix");
             }
             mark_workspace_usage(workspace_plan.mtp_prefill);
-            const Tensor& previous_hidden = staged.reuse == ReusePath::RestoreTurnCheckpoint
-                                                ? sequence.turn_checkpoint_hidden
+            const Tensor& previous_hidden = is_rewrite_checkpoint_restore(staged.reuse)
+                                                ? sequence.rewrite_checkpoint_hidden
                                                 : sequence.tail_hidden;
             const schedule::MtpBridgeInput bridge{
                 .previous_hidden = &previous_hidden,
@@ -1535,15 +1574,19 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 mark_workspace_usage(workspace_plan.dflash_context);
             }
             schedule::PrefillChunkResult result;
+            const std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier =
+                staged.rewrite_checkpoint_capture
+                    ? std::optional<std::uint32_t>(staged.rewrite_checkpoint_capture->frontier)
+                    : std::nullopt;
             if (staged.vision) {
                 mark_workspace_usage(workspace_plan.vision_encode);
                 result = schedule::prefill_multimodal_chunk(
                     schedule_state, staged.prompt, *staged.vision, nominal,
-                    staged.turn_checkpoint_capture_frontier, final_candidate);
+                    rewrite_checkpoint_capture_frontier, final_candidate);
             } else {
                 result = schedule::prefill_text_chunk(
                     schedule_state, std::span<const TokenId>(staged.prompt.token_ids), nominal,
-                    staged.turn_checkpoint_capture_frontier, final_candidate);
+                    rewrite_checkpoint_capture_frontier, final_candidate);
             }
             if (result.processed_tokens == 0 || result.processed_tokens > nominal) {
                 throw std::logic_error("ordinary prefill chunk made invalid progress");
@@ -1611,8 +1654,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         device.synchronize();
         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
         const double vision_seconds = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
-        const std::optional<std::uint32_t> turn_checkpoint_capture_frontier =
-            staged.turn_checkpoint_capture_frontier;
+        const std::optional<RewriteCheckpointSpec> rewrite_checkpoint_capture =
+            staged.rewrite_checkpoint_capture;
         const std::uint32_t prompt_tokens = staged.prompt_tokens;
 
         validate_licensed_tokens(std::span<const TokenId>(host_tokens, 1));
@@ -1636,21 +1679,22 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         sequence.tail_hidden_valid      = true;
         request.timings.vision_seconds  = vision_seconds;
         request.timings.prefill_seconds = std::max(0.0, staged.elapsed_seconds - vision_seconds);
-        if (turn_checkpoint_capture_frontier) {
-            const std::uint32_t frontier = *turn_checkpoint_capture_frontier;
-            if (frontier == 0 || frontier >= prompt_tokens || sequence.text_kv_valid < frontier) {
-                throw std::logic_error("turn checkpoint was not materialized by Text prefill");
+        if (rewrite_checkpoint_capture) {
+            const std::uint32_t frontier = rewrite_checkpoint_capture->frontier;
+            if (frontier == 0 || frontier > prompt_tokens || sequence.text_kv_valid < frontier) {
+                throw std::logic_error("rewrite checkpoint was not materialized by Text prefill");
             }
             if (speculative_backend == SpeculativeBackend::Mtp &&
                 (!staged.prepare_mtp || sequence.mtp_kv_valid < frontier - 1)) {
-                throw std::logic_error("turn checkpoint has no complete MTP prefix");
+                throw std::logic_error("rewrite checkpoint has no complete MTP prefix");
             }
             if (speculative_backend == SpeculativeBackend::DFlash &&
                 (!dflash || !sequence.kv || !sequence.kv->backend ||
                  sequence.dflash_context_frontier < frontier)) {
-                throw std::logic_error("turn checkpoint has no complete DFlash prefix");
+                throw std::logic_error("rewrite checkpoint has no complete DFlash prefix");
             }
-            sequence.turn_checkpoint = TurnCheckpoint{.valid = true, .frontier = frontier};
+            sequence.rewrite_checkpoint = RewriteCheckpoint{
+                .valid = true, .kind = rewrite_checkpoint_capture->kind, .frontier = frontier};
         }
 
         if (!staged.prompt.patches.empty()) {

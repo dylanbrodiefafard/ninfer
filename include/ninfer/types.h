@@ -359,6 +359,7 @@ enum class PrefixReusePath : std::uint8_t {
     FullReset,
     AppendAtFrontier,
     RestoreTurnCheckpoint,
+    RestoreResponseCheckpoint,
 };
 
 struct GenerationResult {

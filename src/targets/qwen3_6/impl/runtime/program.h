@@ -25,14 +25,27 @@
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 
-using PreparedPromptData = qwen3_6::PreparedPromptData;
+using PreparedPromptData    = qwen3_6::PreparedPromptData;
+using RewriteCheckpointKind = qwen3_6::RewriteCheckpointKind;
+using RewriteCheckpointSpec = qwen3_6::RewriteCheckpointSpec;
 
 using ReusePath = ninfer::PrefixReusePath;
 
-enum class TurnCheckpointAction : std::uint8_t {
+[[nodiscard]] constexpr bool is_rewrite_checkpoint_restore(ReusePath path) noexcept {
+    return path == ReusePath::RestoreTurnCheckpoint || path == ReusePath::RestoreResponseCheckpoint;
+}
+
+[[nodiscard]] constexpr ReusePath restore_path(RewriteCheckpointKind kind) noexcept {
+    return kind == RewriteCheckpointKind::TurnClosure ? ReusePath::RestoreTurnCheckpoint
+                                                      : ReusePath::RestoreResponseCheckpoint;
+}
+
+enum class RewriteCheckpointAction : std::uint8_t {
     Drop,
     KeepExisting,
+    ReclassifyExisting,
     CaptureNew,
+    DeferCapture,
 };
 
 enum class MtpBridgeMode : std::uint8_t {
@@ -53,7 +66,7 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t backend_kv_page_entitlement = 0;
     std::shared_ptr<const qwen3_6::VisionControl> vision_control;
     std::size_t vision_transient_bytes = 0;
-    std::optional<std::uint32_t> turn_rewrite_boundary;
+    std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
     bool allow_prefix_reuse = false;
 };
 
@@ -66,9 +79,9 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
         NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode::None;
     bool prepare_mtp = false;
     std::optional<NINFER_QWEN36_RUNTIME_NS::VisionPrefillPlan> vision;
-    NINFER_QWEN36_RUNTIME_NS::TurnCheckpointAction turn_checkpoint_action =
-        NINFER_QWEN36_RUNTIME_NS::TurnCheckpointAction::Drop;
-    std::optional<std::uint32_t> turn_checkpoint_capture_frontier;
+    NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction rewrite_checkpoint_action =
+        NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction::Drop;
+    std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint_capture;
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
@@ -104,9 +117,10 @@ enum class Lifecycle : std::uint8_t {
     Complete,
 };
 
-struct TurnCheckpoint {
-    bool valid             = false;
-    std::uint32_t frontier = 0;
+struct RewriteCheckpoint {
+    bool valid                 = false;
+    RewriteCheckpointKind kind = RewriteCheckpointKind::TurnClosure;
+    std::uint32_t frontier     = 0;
 };
 
 struct SequenceKVBundle {
@@ -139,7 +153,7 @@ struct DecodeGraphFamily {
 struct SequenceState {
     std::optional<SequenceKVBundle> kv;
     Tensor tail_hidden;
-    Tensor turn_checkpoint_hidden;
+    Tensor rewrite_checkpoint_hidden;
     std::uint32_t lane = 0;
 
     std::uint32_t execution_frontier = 0;
@@ -154,7 +168,7 @@ struct SequenceState {
     std::uint32_t mtp_draft_count = 0;
     bool tail_hidden_valid        = false;
     bool retained                 = false;
-    TurnCheckpoint turn_checkpoint;
+    RewriteCheckpoint rewrite_checkpoint;
 };
 
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
@@ -171,7 +185,7 @@ struct RequestControl {
         std::optional<VisionPrefillPlan> vision_plan;
         std::unique_ptr<schedule::VisionPrefillSession> vision;
         runtime::TransientRegion transient;
-        std::optional<std::uint32_t> turn_checkpoint_capture_frontier;
+        std::optional<RewriteCheckpointSpec> rewrite_checkpoint_capture;
         std::uint32_t base               = 0;
         std::uint32_t cursor             = 0;
         std::uint32_t prompt_tokens      = 0;
@@ -255,7 +269,7 @@ public:
     Tensor sampling_config;
     Tensor token_counts;
     Tensor tail_hidden_store;
-    Tensor turn_checkpoint_hidden_store;
+    Tensor rewrite_checkpoint_hidden_store;
 
     std::array<SequenceState, kMaximumConcurrency> sequences;
     std::array<RequestControl, kMaximumConcurrency> requests;

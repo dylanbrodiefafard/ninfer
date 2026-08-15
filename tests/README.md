@@ -149,7 +149,8 @@ state, streaming, and multimodal requests.
 
 The thinking-preservation fixture starts and stops its own server, submits a fixed two-step tool
 history, compares restored and cold greedy output, compares stripped and preserved closed-turn
-prompt lengths, and verifies request-log reuse paths and Responses inheritance:
+prompt lengths, and verifies turn/response rewrite-checkpoint reuse paths plus Responses
+inheritance:
 
 ```bash
 python3 tools/smoke/serve_thinking_preservation.py \

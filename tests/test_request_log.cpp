@@ -231,6 +231,12 @@ int main() {
                       "computed prefill tokens missing");
     failures += check(done.at("result").at("prefix_reuse_path") == "restore_turn_checkpoint",
                       "prefix reuse path missing");
+    outcome.metrics.prefix_reuse_path = ninfer::PrefixReusePath::RestoreResponseCheckpoint;
+    const Json response_restore =
+        Json::parse(format_request_done_json("serve-test", 3001, context, outcome));
+    failures += check(response_restore.at("result").at("prefix_reuse_path") ==
+                          "restore_response_checkpoint",
+                      "response checkpoint reuse path missing");
     failures += check(done.at("timings_seconds").at("decode").get<double>() ==
                           outcome.metrics.decode_seconds,
                       "decode time lost precision");
@@ -257,9 +263,10 @@ int main() {
     failures +=
         check(format_request_start(context).find("preserve_thinking=on") != std::string::npos,
               "human request log omits preserve-thinking mode");
-    failures += check(format_request_done(context, outcome).find("reuse=restore_turn_checkpoint") !=
-                          std::string::npos,
-                      "human request log omits prefix reuse path");
+    failures +=
+        check(format_request_done(context, outcome).find("reuse=restore_response_checkpoint") !=
+                  std::string::npos,
+              "human request log omits response checkpoint reuse path");
     failures += check(format_request_start(context).find("submitted") != std::string::npos,
                       "human request log mislabels a submitted request");
 

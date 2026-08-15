@@ -155,6 +155,107 @@ int exercise_prefix(ninfer::Engine& engine) {
     return 0;
 }
 
+int exercise_rewrite_checkpoints(ninfer::Engine& engine) {
+    auto text_message = [](ninfer::ChatRole role, std::string text) {
+        ninfer::ChatMessage message;
+        message.role = role;
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        return message;
+    };
+    auto assistant_call = [&](std::string reasoning, std::string id, std::string key) {
+        ninfer::ChatMessage message = text_message(ninfer::ChatRole::Assistant, "");
+        message.reasoning_content   = std::move(reasoning);
+        message.tool_calls.push_back(ninfer::ToolCall{
+            .id = std::move(id), .name = "lookup", .arguments_json = "{\"key\":\"" + key + "\"}"});
+        return message;
+    };
+    auto input_with_history = [&](int completed_responses, bool preserve_thinking) {
+        ninfer::PromptInput input;
+        input.messages.push_back(text_message(
+            ninfer::ChatRole::User,
+            "Use the lookup results to determine the deterministic checkpoint value."));
+        if (completed_responses >= 1) {
+            input.messages.push_back(
+                assistant_call("The first lookup should be alpha.", "call_alpha", "alpha"));
+            ninfer::ChatMessage tool =
+                text_message(ninfer::ChatRole::Tool, "{\"value\":17,\"next\":\"beta\"}");
+            tool.tool_call_id = "call_alpha";
+            input.messages.push_back(std::move(tool));
+        }
+        if (completed_responses >= 2) {
+            input.messages.push_back(
+                assistant_call("The alpha result requests beta.", "call_beta", "beta"));
+            ninfer::ChatMessage tool = text_message(ninfer::ChatRole::Tool, "{\"value\":25}");
+            tool.tool_call_id        = "call_beta";
+            input.messages.push_back(std::move(tool));
+        }
+        input.options.preserve_thinking = preserve_thinking;
+        input.options.tool_jsons.push_back(
+            R"({"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}}})");
+        return input;
+    };
+    auto options = [](bool reuse) {
+        ninfer::RequestOptions result;
+        result.execution.requested_output_tokens = 4;
+        result.execution.sampling.temperature    = 0.0F;
+        result.execution.allow_prefix_reuse      = reuse;
+        result.stop.include_model_defaults       = false;
+        return result;
+    };
+
+    const ninfer::GenerationResult first =
+        engine.generate(engine.prepare(input_with_history(0, true)), options(false));
+    if (first.generated_token_ids.size() != 4 ||
+        first.prefix_reuse_path != ninfer::PrefixReusePath::FullReset) {
+        std::cerr << "response-checkpoint source request did not complete from a cold lane\n";
+        return 1;
+    }
+
+    const ninfer::GenerationResult exact_replay =
+        engine.generate(engine.prepare(input_with_history(0, false)), options(true));
+    if (exact_replay.generated_token_ids.size() != 4 ||
+        exact_replay.prefix_reuse_path != ninfer::PrefixReusePath::RestoreResponseCheckpoint ||
+        exact_replay.reused_prompt_tokens == 0) {
+        std::cerr << "prompt-frontier response checkpoint was not restored on an exact replay\n";
+        return 1;
+    }
+
+    const ninfer::GenerationResult first_replay =
+        engine.generate(engine.prepare(input_with_history(1, true)), options(true));
+    if (first_replay.generated_token_ids.size() != 4 ||
+        first_replay.prefix_reuse_path != ninfer::PrefixReusePath::RestoreResponseCheckpoint ||
+        first_replay.reused_prompt_tokens == 0) {
+        std::cerr << "normalized first response did not restore its response checkpoint: path="
+                  << static_cast<int>(first_replay.prefix_reuse_path)
+                  << " reused=" << first_replay.reused_prompt_tokens << '\n';
+        return 1;
+    }
+
+    const ninfer::GenerationResult second_replay =
+        engine.generate(engine.prepare(input_with_history(2, true)), options(true));
+    if (second_replay.generated_token_ids.size() != 4 ||
+        second_replay.prefix_reuse_path != ninfer::PrefixReusePath::RestoreResponseCheckpoint ||
+        second_replay.reused_prompt_tokens <= first_replay.reused_prompt_tokens) {
+        std::cerr << "rolling response checkpoint did not advance across the tool loop: first="
+                  << first_replay.reused_prompt_tokens
+                  << " second=" << second_replay.reused_prompt_tokens << '\n';
+        return 1;
+    }
+
+    const ninfer::GenerationResult mode_change =
+        engine.generate(engine.prepare(input_with_history(2, false)), options(true));
+    if (mode_change.generated_token_ids.size() != 4 ||
+        mode_change.prefix_reuse_path != ninfer::PrefixReusePath::RestoreResponseCheckpoint ||
+        mode_change.reused_prompt_tokens == 0) {
+        std::cerr << "preserve-thinking policy change discarded a compatible response checkpoint: "
+                  << "path=" << static_cast<int>(mode_change.prefix_reuse_path)
+                  << " reused=" << mode_change.reused_prompt_tokens << '\n';
+        return 1;
+    }
+    return 0;
+}
+
 int exercise_vision(ninfer::Engine& engine) {
     const auto image_bytes = gradient_ppm();
     auto image_part        = [](const std::vector<std::uint8_t>& bytes, std::string name) {
@@ -361,6 +462,7 @@ int exercise_artifact(const char* artifact) {
     if (const int result = exercise_registered_frontend(engine); result != 0) { return result; }
     if (const int result = exercise_full_prefill_chunk(engine); result != 0) { return result; }
     if (const int result = exercise_prefix(engine); result != 0) { return result; }
+    if (const int result = exercise_rewrite_checkpoints(engine); result != 0) { return result; }
     if (const int result = exercise_vision(engine); result != 0) { return result; }
     return 0;
 }

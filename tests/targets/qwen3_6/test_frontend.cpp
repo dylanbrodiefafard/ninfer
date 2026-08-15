@@ -407,10 +407,13 @@ int test_ordered_instruction_turns() {
                      chat_message(ninfer::ChatRole::System, "current diagnostics")});
     const std::string assistant_header = "<|im_start|>assistant\n";
     const std::size_t header           = generated.text.rfind(assistant_header);
-    failures += check(header != std::string::npos && generated.turn_rewrite_byte_offset &&
-                          *generated.turn_rewrite_byte_offset == header + assistant_header.size() &&
-                          generated.text.find("current diagnostics<|im_end|>\n", 0) < header,
-                      "late system was not included before the generation rewrite boundary");
+    failures +=
+        check(header != std::string::npos && generated.rewrite_checkpoint &&
+                  generated.rewrite_checkpoint->kind ==
+                      ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
+                  generated.rewrite_checkpoint->offset == header + assistant_header.size() &&
+                  generated.text.find("current diagnostics<|im_end|>\n", 0) < header,
+              "late system was not included before the generation rewrite boundary");
 
     fi::ChatMessage invalid = chat_message(ninfer::ChatRole::System, "diagnostics");
     invalid.tool_calls.push_back({.id = "call", .name = "f", .arguments_json = "{}"});
@@ -542,7 +545,7 @@ int test_reasoning_effort_chat_template() {
     return failures;
 }
 
-int test_turn_rewrite_trace() {
+int test_rewrite_checkpoint_trace() {
     const std::string assistant_header = "<|im_start|>assistant\n";
     fi::ChatMessage first              = chat_message(ninfer::ChatRole::Assistant, "");
     first.reasoning_content            = "first thought";
@@ -558,30 +561,55 @@ int test_turn_rewrite_trace() {
     const fi::RenderedChat open    = render_chat(tool_loop);
     const std::size_t first_header = open.text.find(assistant_header);
     int failures =
-        check(first_header != std::string::npos && open.turn_rewrite_byte_offset &&
-                  *open.turn_rewrite_byte_offset == first_header + assistant_header.size(),
-              "tool loop did not retain its first assistant rewrite boundary");
+        check(first_header != std::string::npos && open.rewrite_checkpoint &&
+                  open.rewrite_checkpoint->kind ==
+                      ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
+                  open.rewrite_checkpoint->offset == first_header + assistant_header.size(),
+              "tool loop did not retain its first assistant turn-closure boundary");
 
     fi::ChatRenderOptions preserve;
-    preserve.preserve_thinking       = true;
-    const fi::RenderedChat preserved = render_chat(tool_loop, preserve);
-    failures += check(preserved.turn_rewrite_byte_offset == open.turn_rewrite_byte_offset,
-                      "preserve_thinking changed the turn rewrite boundary");
+    preserve.preserve_thinking         = true;
+    const fi::RenderedChat preserved   = render_chat(tool_loop, preserve);
+    const std::size_t preserved_header = preserved.text.rfind(assistant_header);
+    failures += check(preserved_header != std::string::npos && preserved.rewrite_checkpoint &&
+                          preserved.rewrite_checkpoint->kind ==
+                              ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
+                          preserved.rewrite_checkpoint->offset == preserved.text.size() &&
+                          preserved.text.ends_with("<think>\n"),
+                      "preserve_thinking did not publish the complete generation prologue");
+
+    preserve.enable_thinking           = false;
+    const fi::RenderedChat nonthinking = render_chat(tool_loop, preserve);
+    failures += check(nonthinking.rewrite_checkpoint &&
+                          nonthinking.rewrite_checkpoint->kind ==
+                              ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
+                          nonthinking.rewrite_checkpoint->offset == nonthinking.text.size() &&
+                          nonthinking.text.ends_with("<think>\n\n</think>\n\n"),
+                      "non-thinking response replay did not retain its complete generation "
+                      "prologue");
 
     std::vector<fi::ChatMessage> next_turn = tool_loop;
     next_turn.push_back(chat_message(ninfer::ChatRole::User, "next question"));
     const fi::RenderedChat next    = render_chat(next_turn);
     const std::size_t final_header = next.text.rfind(assistant_header);
-    failures += check(final_header != std::string::npos && next.turn_rewrite_byte_offset &&
-                          *next.turn_rewrite_byte_offset == final_header + assistant_header.size(),
+    failures += check(final_header != std::string::npos && next.rewrite_checkpoint &&
+                          next.rewrite_checkpoint->kind ==
+                              ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
+                          next.rewrite_checkpoint->offset == final_header + assistant_header.size(),
                       "new user turn did not move the rewrite boundary to its generation opener");
 
     fi::ChatRenderOptions no_generation;
     no_generation.add_generation_prompt = false;
     const fi::RenderedChat no_assistant =
         render_chat({chat_message(ninfer::ChatRole::User, "question")}, no_generation);
-    failures += check(!no_assistant.turn_rewrite_byte_offset,
+    failures += check(!no_assistant.rewrite_checkpoint,
                       "boundary-less prompt unexpectedly published a rewrite boundary");
+
+    no_generation.preserve_thinking                     = true;
+    const fi::RenderedChat preserved_without_generation = render_chat(tool_loop, no_generation);
+    failures += check(!preserved_without_generation.rewrite_checkpoint,
+                      "response-replay boundary was published without a generation opener");
+    no_generation.preserve_thinking = false;
 
     const fi::RenderedChat wrapped = render_chat(
         {chat_message(ninfer::ChatRole::User, "question"), first,
@@ -590,8 +618,10 @@ int test_turn_rewrite_trace() {
         no_generation);
     const std::size_t wrapped_first = wrapped.text.find(assistant_header);
     failures +=
-        check(wrapped.turn_rewrite_byte_offset &&
-                  *wrapped.turn_rewrite_byte_offset == wrapped_first + assistant_header.size(),
+        check(wrapped.rewrite_checkpoint &&
+                  wrapped.rewrite_checkpoint->kind ==
+                      ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
+                  wrapped.rewrite_checkpoint->offset == wrapped_first + assistant_header.size(),
               "bare tool-response wrapper incorrectly advanced the real user turn");
     return failures;
 }
@@ -642,13 +672,51 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     const std::vector<ninfer::TokenId> expected{248045, 30, 0, 248046, 32, 248045, 31, 248068, 32};
     int failures =
         check(text_data.token_ids == expected, "text frontend did not render/tokenize chat");
-    failures += check(text_data.identity.turn_rewrite_boundary == 7 &&
+    failures += check(text_data.identity.rewrite_checkpoint &&
+                          text_data.identity.rewrite_checkpoint->kind ==
+                              ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
+                          text_data.identity.rewrite_checkpoint->frontier == 7 &&
                           text_data.starts_in_reasoning && !text_data.has_media(),
                       "text frontend did not preserve prefix/thinking identity");
     failures +=
         check(text_data.position_axis(0).back() == 8 && text_data.position_axis(1).back() == 8 &&
                   text_data.position_axis(2).back() == 8,
               "text frontend did not construct axis-major positions");
+
+    ninfer::ChatMessage preserved_message;
+    preserved_message.role = ninfer::ChatRole::User;
+    preserved_message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput preserved_input;
+    preserved_input.messages.push_back(std::move(preserved_message));
+    preserved_input.options.preserve_thinking = true;
+    const auto preserved_prompt               = frontend.prepare(std::move(preserved_input));
+    const auto& preserved_data                = FrontendFactory::inspect(preserved_prompt);
+    failures += check(preserved_data.identity.rewrite_checkpoint &&
+                          preserved_data.identity.rewrite_checkpoint->kind ==
+                              ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
+                          preserved_data.identity.rewrite_checkpoint->frontier ==
+                              preserved_data.token_ids.size(),
+                      "preserve-thinking prompt did not publish a prompt-frontier response "
+                      "checkpoint");
+
+    ninfer::ChatMessage nonthinking_message;
+    nonthinking_message.role = ninfer::ChatRole::User;
+    nonthinking_message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput nonthinking_input;
+    nonthinking_input.messages.push_back(std::move(nonthinking_message));
+    nonthinking_input.options.preserve_thinking = true;
+    nonthinking_input.options.enable_thinking   = false;
+    const auto nonthinking_prompt               = frontend.prepare(std::move(nonthinking_input));
+    const auto& nonthinking_data                = FrontendFactory::inspect(nonthinking_prompt);
+    failures += check(nonthinking_data.identity.rewrite_checkpoint &&
+                          nonthinking_data.identity.rewrite_checkpoint->kind ==
+                              ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
+                          nonthinking_data.identity.rewrite_checkpoint->frontier ==
+                              nonthinking_data.token_ids.size() &&
+                          !nonthinking_data.starts_in_reasoning,
+                      "non-thinking prompt did not publish a prompt-frontier response checkpoint");
 
     ninfer::MessagePart image;
     image.kind              = ninfer::MessagePartKind::Media;
@@ -687,8 +755,10 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     failures += check(
         prepared_data.patches.size() == 16 * 1536 && prepared_data.prepare.raw_patches == 16 &&
             prepared_data.prepare.vision_tokens == 4 && prepared_data.identity.reusable &&
-            prepared_data.identity.turn_rewrite_boundary &&
-            *prepared_data.identity.turn_rewrite_boundary < prepared_data.token_ids.size(),
+            prepared_data.identity.rewrite_checkpoint &&
+            prepared_data.identity.rewrite_checkpoint->kind ==
+                ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
+            prepared_data.identity.rewrite_checkpoint->frontier < prepared_data.token_ids.size(),
         "image frontend did not own the expected patch payload and identity");
     if (prepared_data.patches.size() == 16 * 1536) {
         failures += check(near(prepared_data.patches[0], -1.0F) &&
@@ -904,7 +974,7 @@ int main() {
     failures += test_official_chat_template();
     failures += test_ordered_instruction_turns();
     failures += test_reasoning_effort_chat_template();
-    failures += test_turn_rewrite_trace();
+    failures += test_rewrite_checkpoint_trace();
     failures += test_official_resource_guards();
     failures += test_text_and_image_prepare(frontend);
     failures += test_video_prepare(frontend);

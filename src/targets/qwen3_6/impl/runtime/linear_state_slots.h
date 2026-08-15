@@ -25,8 +25,8 @@ struct LinearStateSlots {
         return static_cast<std::int32_t>(lane);
     }
 
-    [[nodiscard]] static std::int32_t turn_checkpoint_state_slot(std::uint32_t lane,
-                                                                 std::uint32_t max_concurrency) {
+    [[nodiscard]] static std::int32_t rewrite_checkpoint_state_slot(std::uint32_t lane,
+                                                                    std::uint32_t max_concurrency) {
         return static_cast<std::int32_t>(max_concurrency) +
                current_state_slot(lane, max_concurrency);
     }

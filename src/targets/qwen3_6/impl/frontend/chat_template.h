@@ -1,5 +1,6 @@
 #pragma once
 
+#include <ninfer/targets/qwen3_6/prepared_prompt.h>
 #include <ninfer/types.h>
 
 #include <cstddef>
@@ -77,9 +78,14 @@ struct ChatRenderOptions {
     std::vector<std::string> tool_jsons;
 };
 
+struct RewriteCheckpointByteSpec {
+    RewriteCheckpointKind kind = RewriteCheckpointKind::TurnClosure;
+    std::size_t offset         = 0;
+};
+
 struct RenderedChat {
     std::string text;
-    std::optional<std::size_t> turn_rewrite_byte_offset;
+    std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
 };
 
 enum class ChatTemplateSemantics : std::uint8_t {

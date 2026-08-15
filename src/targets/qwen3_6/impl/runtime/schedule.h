@@ -50,9 +50,9 @@ struct PrefillContext {
     DFlashPersistentState* dflash;
     std::uint32_t text_kv_base;
     const ops::SamplingConfig* sampling;
-    Tensor* turn_checkpoint_hidden;
+    Tensor* rewrite_checkpoint_hidden;
     std::int32_t current_state_slot                         = 0;
-    std::int32_t turn_checkpoint_state_slot                 = 0;
+    std::int32_t rewrite_checkpoint_state_slot              = 0;
     std::uint32_t mtp_proposal_extent                       = 0;
     const qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
 };
@@ -128,7 +128,7 @@ struct TargetVerifyFrameView {
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t current_state_slot,
-                         std::int32_t turn_checkpoint_state_slot,
+                         std::int32_t rewrite_checkpoint_state_slot,
                          std::uint32_t mtp_proposal_extent);
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
@@ -136,12 +136,12 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
 
 [[nodiscard]] PrefillChunkResult prefill_text_chunk(
     PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,
-    std::optional<std::uint32_t> turn_checkpoint_capture_frontier, bool finalize_at_end);
+    std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier, bool finalize_at_end);
 
 [[nodiscard]] PrefillChunkResult
 prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
                          VisionPrefillSession& vision, std::uint32_t nominal_length,
-                         std::optional<std::uint32_t> turn_checkpoint_capture_frontier,
+                         std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier,
                          bool finalize_at_end);
 
 struct MtpBridgeInput {

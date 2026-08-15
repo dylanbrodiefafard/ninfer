@@ -331,7 +331,8 @@ prefix reuse applies naturally.
 
 A stored Response also retains its resolved `preserve_thinking` value. A child which omits the
 field inherits the parent value. An explicit different value creates a new semantic branch; prompt
-identity then determines whether the Engine restores a turn checkpoint or performs a full reset.
+rendering and identity still determine reuse. Changing the boolean alone never invalidates an exact
+current frontier or a complete matching rewrite checkpoint.
 
 Resource behavior:
 
@@ -572,14 +573,26 @@ therefore resets the prefix instead of reusing placeholder-token KV. Media wholl
 prefix skips Vision execution, while new suffix media is encoded normally. The completion log
 reports the reused token count as `cache=`.
 
-The shared family runtime distinguishes `full_reset`, `append_frontier`, and
-`restore_turn_checkpoint`. A turn checkpoint includes the recurrent and selected
-speculative-backend continuation state required to recompute a rewritten suffix; matching KV
-tokens alone never authorize a partial hit. Stable `preserve_thinking=true` histories normally
-append, while stable `false` histories restore the previous open-turn checkpoint when a new user
-closes that turn. The JSONL completion record exposes the selected path as `prefix_reuse_path`.
-Changing reasoning effort changes the rendered prompt and therefore does not reuse a prefix whose
-effort instruction differs.
+The shared family runtime distinguishes `full_reset`, `append_frontier`,
+`restore_turn_checkpoint`, and `restore_response_checkpoint`. Both checkpoint kinds include the
+recurrent, hidden, and selected speculative-backend continuation state required to recompute a
+rewritten suffix; matching KV tokens alone never authorize a partial hit. With stable
+`preserve_thinking=true`, the auxiliary checkpoint rolls to the prompt frontier after the current
+response's complete deterministic generation prologue. For thinking generation this includes
+`<think>\n`; for non-thinking generation it includes the complete empty thinking block. Capturing
+that frontier does not split a tiny trailing prologue into a separate prefill unit, and a normalized
+response which no longer matches the raw generated tokens replays only that response and its
+suffix. Stable `false` keeps the first assistant opener in the open turn so a newly closed turn can
+be recomputed without its reasoning.
+
+`preserve_thinking` selects where the next checkpoint should live; it is not a cache-compatibility
+bit. An exact current frontier or matching complete checkpoint remains reusable across a mode
+change. If the newly desired boundary is already behind the selected reuse frontier and no snapshot
+exists there, the Engine keeps the valid hit and defers installing that new checkpoint rather than
+forcing an eager full reset. A later request that diverges before every retained checkpoint then
+resets normally. The JSONL completion record exposes the checkpoint actually restored as
+`prefix_reuse_path`. Changing reasoning effort changes rendered tokens and therefore does not reuse
+a prefix whose effort instruction differs.
 
 An appended mid-conversation system message is an ordinary prompt suffix, so an unchanged prior
 history remains eligible for `append_frontier`. If the client modifies, removes, or moves a
