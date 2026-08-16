@@ -1208,16 +1208,20 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                         alignment_ids[static_cast<std::size_t>(mtp_window.shifted_embedding_begin) +
                                       static_cast<std::size_t>(j)];
                 }
-                if (mtp_window.final_column_uses_generated_token) {
-                    int next_token = 0;
-                    CUDA_CHECK(cudaStreamSynchronize(s));
-                    CUDA_CHECK(cudaMemcpy(&next_token, io_.token.data, sizeof(next_token),
-                                          cudaMemcpyDeviceToHost));
-                    mtp_ids_host[static_cast<std::size_t>(len - 1)] = next_token;
-                }
-
                 Tensor mtp_ids = work_.alloc(DType::I32, {len});
-                copy_i32(mtp_ids_host.data(), mtp_ids, s);
+                if (prompt_columns > 0) {
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        mtp_ids.data, mtp_ids_host.data(),
+                        static_cast<std::size_t>(prompt_columns) * sizeof(std::int32_t),
+                        cudaMemcpyHostToDevice, s));
+                }
+                if (mtp_window.final_column_uses_generated_token) {
+                    // Keep the sampled token on-device: a host sync here sat on the TTFT
+                    // critical path after every last prefill chunk with MTP enabled.
+                    Tensor last_id = mtp_ids.slice(0, len - 1, 1);
+                    CUDA_CHECK(cudaMemcpyAsync(last_id.data, io_.token.data, sizeof(std::int32_t),
+                                               cudaMemcpyDeviceToDevice, s));
+                }
                 Tensor mtp_input_embeddings;
                 const Tensor* mtp_input_embeddings_ptr = nullptr;
                 if (multimodal != nullptr) {
@@ -1245,18 +1249,23 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
                     Tensor ar_position = io_.mtp->position.slice(0, 0, 1);
                     ops::set_i32_scalar(ar_position, base_i + T, s);
+                    Tensor ar_a = io_.mtp->ar_hidden;
+                    Tensor ar_b = work_.alloc(DType::BF16, {kCfg.hidden, 1});
                     for (int i = 1; i < static_cast<int>(mtp_proposal_extent_); ++i) {
                         Tensor prev_token     = io_.mtp->draft_tokens.slice(0, i - 1, 1);
                         Tensor next_token     = io_.mtp->draft_tokens.slice(0, i, 1);
-                        Tensor next_hidden    = work_.alloc(DType::BF16, {kCfg.hidden, 1});
+                        const bool from_a     = (i % 2) == 1;
+                        Tensor& src_hidden    = from_a ? ar_a : ar_b;
+                        Tensor& dst_hidden    = from_a ? ar_b : ar_a;
                         const auto ar_visible = static_cast<std::uint32_t>(base_i + T + i);
                         const ops::GqaExecutionEnvelope ar_envelope{ar_visible, ar_visible};
-                        mtp_forward_ar_step(prev_token, io_.mtp->ar_hidden, ar_position,
-                                            ar_envelope, next_hidden, logits, next_token);
-                        CUDA_CHECK(cudaMemcpyAsync(io_.mtp->ar_hidden.data, next_hidden.data,
-                                                   io_.mtp->ar_hidden.bytes(),
-                                                   cudaMemcpyDeviceToDevice, s));
+                        mtp_forward_ar_step(prev_token, src_hidden, ar_position, ar_envelope,
+                                            dst_hidden, logits, next_token);
                         ops::increment_i32_scalar(ar_position, s);
+                    }
+                    if (((mtp_proposal_extent_ - 1) % 2) == 1) {
+                        CUDA_CHECK(cudaMemcpyAsync(ar_a.data, ar_b.data, ar_a.bytes(),
+                                                   cudaMemcpyDeviceToDevice, s));
                     }
                 } else {
                     mtp_prefill_chunk(mtp_ids, xf, mtp_input_embeddings_ptr, positions,
