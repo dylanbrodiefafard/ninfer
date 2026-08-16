@@ -7,6 +7,7 @@ function(ninfer_add_op_bench name)
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/src)
   target_link_libraries(${name} PRIVATE ninfer_ops)
+  # Benches keep -lineinfo even under Release for nsys/ncu correlation.
   target_compile_options(${name} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 endfunction()
 
@@ -41,6 +42,18 @@ ninfer_add_op_bench(ninfer_gdn_input_proj_conv_snapshot_bench
 ninfer_add_op_bench(ninfer_attn_input_proj_bench SOURCES ops/attn_input_proj_bench.cu)
 ninfer_add_op_bench(ninfer_w8_linear_swiglu_bench SOURCES ops/w8_linear_swiglu_bench.cu)
 ninfer_add_op_bench(ninfer_nvfp4_linear_swiglu_bench SOURCES ops/nvfp4_linear_swiglu_bench.cu)
+# Curated NVFP4 decode T=4 harnesses (ninfer/bench/PERF_LANDS.md). Superseded
+# sweeps live in ops/_archive/ and are not built.
+ninfer_add_op_bench(ninfer_nvfp4_swiglu_t4_explore_v5
+  SOURCES ops/nvfp4_swiglu_t4_explore_v5.cu)
+ninfer_add_op_bench(ninfer_nvfp4_mlp_down_t4_explore_v5
+  SOURCES ops/nvfp4_mlp_down_t4_explore_v5.cu)
+ninfer_add_op_bench(ninfer_nvfp4_mlp_pair_cache_v5
+  SOURCES ops/nvfp4_mlp_pair_cache_v5.cu)
+ninfer_add_op_bench(ninfer_nvfp4_mlp_pair_ncu_v5
+  SOURCES ops/nvfp4_mlp_pair_ncu_v5.cu)
+ninfer_add_op_bench(ninfer_nvfp4_swiglu_w4a4_tile_v5
+  SOURCES ops/nvfp4_swiglu_w4a4_tile_v5.cu)
 ninfer_add_op_bench(ninfer_q4_linear_swiglu_bench SOURCES ops/q4_linear_swiglu_bench.cu)
 ninfer_add_op_bench(ninfer_w8_linear_add_bench SOURCES ops/w8_linear_add_bench.cu)
 ninfer_add_op_bench(ninfer_q5_linear_add_bench SOURCES ops/q5_linear_add_bench.cu)
