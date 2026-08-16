@@ -68,11 +68,22 @@ void launch_gemm(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace workspace
     const Nvfp4SwiGluRows row_policy{};
     const Nvfp4SwiGluOutput output{static_cast<__nv_bfloat16*>(out.data)};
     const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
-    nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, Nvfp4SwiGluOutput,
-                          Nvfp4SwiGluRows, true><<<grid, Schedule::kThreads, 0, stream>>>(
-        activation, static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const std::uint8_t*>(weight.scales), tokens, alpha, Nvfp4IdentityEpilogue{},
-        output, row_policy);
+    // T<=4: L2::evict_first on weight cp.async so BF16 mid can stay hot for MLP-down.
+    if (tokens <= 4) {
+        nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, Nvfp4SwiGluOutput,
+                              Nvfp4SwiGluRows, true, Cache::EvictFirst>
+            <<<grid, Schedule::kThreads, 0, stream>>>(
+                activation, static_cast<const std::uint8_t*>(weight.qdata),
+                static_cast<const std::uint8_t*>(weight.scales), tokens, alpha,
+                Nvfp4IdentityEpilogue{}, output, row_policy);
+    } else {
+        nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, Nvfp4SwiGluOutput,
+                              Nvfp4SwiGluRows, true, Cache::cg>
+            <<<grid, Schedule::kThreads, 0, stream>>>(
+                activation, static_cast<const std::uint8_t*>(weight.qdata),
+                static_cast<const std::uint8_t*>(weight.scales), tokens, alpha,
+                Nvfp4IdentityEpilogue{}, output, row_policy);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

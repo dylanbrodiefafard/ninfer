@@ -5,7 +5,13 @@
 
 namespace ninfer::ops {
 
-enum class Cache { ca, cg };
+enum class Cache {
+    ca,
+    cg,
+    // cp.async.cg + L2::evict_first cache_hint (sm_90+ / sm_120). One-shot weight fills that
+    // should not displace a following consumer's working set (e.g. SwiGLU mid → MLP-down).
+    EvictFirst,
+};
 
 template <class V, class T>
 __device__ __forceinline__ V load_vec(const T* ptr) {
@@ -32,6 +38,23 @@ __device__ __forceinline__ unsigned smem_addr(const void* ptr) {
     return static_cast<unsigned>(__cvta_generic_to_shared(ptr));
 }
 
+__device__ __forceinline__ unsigned long long l2_evict_first_policy() {
+    unsigned long long pol;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(pol));
+    return pol;
+}
+
+__device__ __forceinline__ void cp_async_evict_first_16(void* smem_dst, const void* gmem_src,
+                                                       unsigned long long pol) {
+    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n"
+                 :
+                 : "r"(smem_addr(smem_dst)), "l"(gmem_src), "l"(pol));
+}
+
+// Defined in memory_evict.cu (single TU). Inlining createpolicy+cache_hint into large MMA
+// kernels makes ptxas 13.1/sm_120a emit LDGSTS desc[URx] without R2UR (illegal insn).
+__device__ void cp_async_evict_first_16_noinline(void* smem_dst, const void* gmem_src);
+
 template <int Bytes, Cache Policy = Cache::ca>
 __device__ __forceinline__ void cp_async(void* smem_dst, const void* gmem_src) {
     static_assert(Bytes == 4 || Bytes == 8 || Bytes == 16, "cp_async supports 4, 8, or 16 bytes");
@@ -40,11 +63,24 @@ __device__ __forceinline__ void cp_async(void* smem_dst, const void* gmem_src) {
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
                      :
                      : "r"(smem_addr(smem_dst)), "l"(gmem_src));
+    } else if constexpr (Policy == Cache::EvictFirst) {
+        static_assert(Bytes == 16, "cp.async L2::evict_first requires a 16-byte copy");
+        cp_async_evict_first_16_noinline(smem_dst, gmem_src);
     } else {
         asm volatile("cp.async.ca.shared.global [%0], [%1], %2;\n"
                      :
                      : "r"(smem_addr(smem_dst)), "l"(gmem_src), "n"(Bytes));
     }
+}
+
+// Synchronous streaming fill: ld.global.cs into regs, then plain shared store. Use when cp.async
+// cannot carry an L2 eviction hint (or as an A/B against EvictFirst).
+__device__ __forceinline__ void cp_sync_cs_16(void* smem_dst, const void* gmem_src) {
+    unsigned x, y, z, w;
+    asm volatile("ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(x), "=r"(y), "=r"(z), "=r"(w)
+                 : "l"(gmem_src));
+    *reinterpret_cast<uint4*>(smem_dst) = make_uint4(x, y, z, w);
 }
 
 template <int Bytes, Cache Policy = Cache::ca>
