@@ -11,8 +11,9 @@ enum class Nvfp4ScaleAccess : std::uint8_t {
 };
 
 enum class Nvfp4CodeCache : std::uint8_t {
-    Default,
-    Streaming,
+    Default,   // plain load (compiler / L1 eligible)
+    Streaming, // ld.global.cs — do not retain in L2 (weight one-shot)
+    L2Cached,  // ld.global.cg — bypass L1, keep in L2
 };
 
 enum class Nvfp4SmallTActivationAccess : std::uint8_t {
@@ -84,7 +85,7 @@ struct Nvfp4SmallTSchedule {
     static_assert(TokenTile > 0);
     static_assert(AccumulatorChains > 0 && (AccumulatorChains & (AccumulatorChains - 1)) == 0);
     static_assert(AccumulatorChains <= ValuesPerLane / 2);
-    static_assert(PhaseUnroll == 1 || PhaseUnroll == 2 || PhaseUnroll == 4);
+    static_assert(PhaseUnroll == 1 || PhaseUnroll == 2 || PhaseUnroll == 4 || PhaseUnroll == 10);
     static_assert(MinBlocksPerSm > 0);
 
     static constexpr int kWarpsPerCta       = WarpsPerCta;
@@ -207,6 +208,7 @@ struct Nvfp4LinearSmallTProductionSchedule<Nvfp4GdnInputGeometry, ActiveTokens> 
 
 // At N=5120, R1 needs the larger CTA only for the last three A16 token counts. The unoptimized
 // A16-only tail keeps the established generic schedule.
+// T=2..4: PhaseUnroll=4 is bit-exact; cold +10% / warm ~flat (geometry_sweep_v5).
 template <int ActiveTokens>
 struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual6144Geometry, ActiveTokens> {
     static_assert(ActiveTokens >= kNvfp4FirstSmallT);
@@ -214,13 +216,16 @@ struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual6144Geometry, ActiveToke
     static constexpr int kWarpsPerCta   = ActiveTokens <= 16 ? (ActiveTokens >= 14 ? 16 : 4) : 4;
     static constexpr int kValuesPerLane = ActiveTokens >= 17 && ActiveTokens <= 20 ? 8 : 16;
     static constexpr auto kActivationAccess = Nvfp4SmallTActivationAccess::TokenPacked;
+    static constexpr int kPhaseUnroll       = ActiveTokens <= 4 ? 4 : 1;
     using Type =
         Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, kValuesPerLane, ActiveTokens, 1, kActivationAccess,
-                            Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
+                            Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, kPhaseUnroll,
                             Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
 };
 
 // R2's longer K moves the stable four-to-sixteen-warp crossover to T=8.
+// T=2..4: PhaseUnroll=4 is bit-exact and wins both cold and warm microbench
+// (ninfer_nvfp4_mlp_down_t4_explore_v5).
 template <int ActiveTokens>
 struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual17408Geometry, ActiveTokens> {
     static_assert(ActiveTokens >= kNvfp4FirstSmallT);
@@ -228,9 +233,10 @@ struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual17408Geometry, ActiveTok
     static constexpr int kWarpsPerCta       = ActiveTokens <= 16 ? (ActiveTokens >= 8 ? 16 : 4) : 4;
     static constexpr int kValuesPerLane     = ActiveTokens >= 17 && ActiveTokens <= 20 ? 8 : 16;
     static constexpr auto kActivationAccess = Nvfp4SmallTActivationAccess::TokenPacked;
+    static constexpr int kPhaseUnroll       = ActiveTokens <= 4 ? 4 : 1;
     using Type =
         Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, kValuesPerLane, ActiveTokens, 1, kActivationAccess,
-                            Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
+                            Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, kPhaseUnroll,
                             Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
 };
 

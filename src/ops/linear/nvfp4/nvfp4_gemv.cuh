@@ -28,23 +28,46 @@ template <Nvfp4CodeCache Cache, int Values>
 __device__ __forceinline__ Nvfp4CodePack<Values> load_nvfp4_codes(const std::uint8_t* pointer) {
     if constexpr (Cache == Nvfp4CodeCache::Default) {
         return load_vec<Nvfp4CodePack<Values>>(pointer);
-    } else if constexpr (Values == 8) {
-        Nvfp4CodePack<Values> result;
-        asm volatile("ld.global.cg.u32 %0, [%1];\n" : "=r"(result.words[0]) : "l"(pointer));
-        return result;
-    } else if constexpr (Values == 16) {
-        Nvfp4CodePack<Values> result;
-        asm volatile("ld.global.cg.v2.u32 {%0, %1}, [%2];\n"
-                     : "=r"(result.words[0]), "=r"(result.words[1])
-                     : "l"(pointer));
-        return result;
+    } else if constexpr (Cache == Nvfp4CodeCache::Streaming) {
+        // One-shot weight traffic: leave L2 for activations / producer→consumer intermediates.
+        if constexpr (Values == 8) {
+            Nvfp4CodePack<Values> result;
+            asm volatile("ld.global.cs.u32 %0, [%1];\n" : "=r"(result.words[0]) : "l"(pointer));
+            return result;
+        } else if constexpr (Values == 16) {
+            Nvfp4CodePack<Values> result;
+            asm volatile("ld.global.cs.v2.u32 {%0, %1}, [%2];\n"
+                         : "=r"(result.words[0]), "=r"(result.words[1])
+                         : "l"(pointer));
+            return result;
+        } else {
+            Nvfp4CodePack<Values> result;
+            asm volatile("ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+                         : "=r"(result.words[0]), "=r"(result.words[1]), "=r"(result.words[2]),
+                           "=r"(result.words[3])
+                         : "l"(pointer));
+            return result;
+        }
     } else {
-        Nvfp4CodePack<Values> result;
-        asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];\n"
-                     : "=r"(result.words[0]), "=r"(result.words[1]), "=r"(result.words[2]),
-                       "=r"(result.words[3])
-                     : "l"(pointer));
-        return result;
+        // L2Cached
+        if constexpr (Values == 8) {
+            Nvfp4CodePack<Values> result;
+            asm volatile("ld.global.cg.u32 %0, [%1];\n" : "=r"(result.words[0]) : "l"(pointer));
+            return result;
+        } else if constexpr (Values == 16) {
+            Nvfp4CodePack<Values> result;
+            asm volatile("ld.global.cg.v2.u32 {%0, %1}, [%2];\n"
+                         : "=r"(result.words[0]), "=r"(result.words[1])
+                         : "l"(pointer));
+            return result;
+        } else {
+            Nvfp4CodePack<Values> result;
+            asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+                         : "=r"(result.words[0]), "=r"(result.words[1]), "=r"(result.words[2]),
+                           "=r"(result.words[3])
+                         : "l"(pointer));
+            return result;
+        }
     }
 }
 

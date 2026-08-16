@@ -199,8 +199,9 @@ __device__ __forceinline__ void compute_nvfp4_small_t_rows(
             }
         }
 
+        // Trailing barrier after the last phase is dead: nothing else reads shared.activation.
         if constexpr (Schedule::kActivationAccess == Nvfp4SmallTActivationAccess::SharedPhase) {
-            __syncthreads();
+            if (phase + 1 < kPhases) { __syncthreads(); }
         }
     }
 }

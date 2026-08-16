@@ -79,9 +79,13 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
     static constexpr auto kActivationAccess = ActiveTokens <= 4
                                                   ? Nvfp4SmallTActivationAccess::SharedPhase
                                                   : Nvfp4SmallTActivationAccess::TokenPacked;
-    static constexpr int kWarpsPerCta       = ActiveTokens >= 13 ? 16 : (ActiveTokens >= 5 ? 4 : 8);
+    // T<=4 MTP verify: ld.global.cs on weight codes leaves L2 for the BF16 intermediate that
+    // MLP-down reads next (pair microbench cs+def: ~+10% warm vs Default; solo SwiGLU loses).
+    static constexpr auto kCodeCache =
+        ActiveTokens <= 4 ? Nvfp4CodeCache::Streaming : Nvfp4CodeCache::Default;
+    static constexpr int kWarpsPerCta = ActiveTokens >= 13 ? 16 : (ActiveTokens >= 5 ? 4 : 8);
     using Schedule = Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, 16, ActiveTokens, 1, kActivationAccess,
-                                         Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
+                                         Nvfp4ScaleAccess::Direct, kCodeCache, 1,
                                          Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
     static_assert((kIntermediate % Schedule::kWarpsPerCta) == 0);
     constexpr int kBlocks = kIntermediate / Schedule::kWarpsPerCta;
