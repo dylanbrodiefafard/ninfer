@@ -52,18 +52,25 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
 
     Tensor ar_position = state.execution.io.mtp->position.slice(0, 0, 1);
     ops::set_i32_scalar(ar_position, position + 1, state.execution.device.stream);
+    // Ping-pong ar_hidden <-> scratch so MTP AR steps avoid a full-hidden D2D each round.
+    Tensor ar_a = state.execution.io.mtp->ar_hidden;
+    Tensor ar_b = state.execution.prefill_hidden.slice(1, 0, 1);
     for (int i = 1; i < static_cast<int>(state.mtp_proposal_extent); ++i) {
         Tensor previous_token = state.execution.io.mtp->draft_tokens.slice(0, i - 1, 1);
         Tensor next_draft     = state.execution.io.mtp->draft_tokens.slice(0, i, 1);
-        Tensor next_hidden    = state.execution.prefill_hidden.slice(1, i, 1);
+        const bool from_a     = (i % 2) == 1;
+        Tensor& src_hidden    = from_a ? ar_a : ar_b;
+        Tensor& dst_hidden    = from_a ? ar_b : ar_a;
         const auto visible    = static_cast<std::uint32_t>(position + i + 1);
         const ops::GqaExecutionEnvelope envelope{visible, visible};
-        card.mtp_forward_ar_step(previous_token, state.execution.io.mtp->ar_hidden, ar_position,
-                                 envelope, next_hidden, logits, next_draft);
-        CUDA_CHECK(cudaMemcpyAsync(state.execution.io.mtp->ar_hidden.data, next_hidden.data,
-                                   state.execution.io.mtp->ar_hidden.bytes(),
-                                   cudaMemcpyDeviceToDevice, state.execution.device.stream));
+        card.mtp_forward_ar_step(previous_token, src_hidden, ar_position, envelope, dst_hidden,
+                                 logits, next_draft);
         ops::increment_i32_scalar(ar_position, state.execution.device.stream);
+    }
+    // Odd step count ends in ar_b; keep the resident AR hidden in ar_a for the next round.
+    if (((state.mtp_proposal_extent - 1) % 2) == 1) {
+        CUDA_CHECK(cudaMemcpyAsync(ar_a.data, ar_b.data, ar_a.bytes(), cudaMemcpyDeviceToDevice,
+                                   state.execution.device.stream));
     }
 }
 
@@ -155,6 +162,8 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         Tensor proposal_logits = frame.proposal_logits.slice(1, 0, batch_size);
         Tensor draft0          = next_drafts.slice(1, 0, 1).view({batch_size});
         card.mtp_propose_batch(ar_hidden, proposal_logits, draft0);
+        // Alternate ar_hidden <-> next_hidden. For MTP3 (k=3) both AR steps are captured with
+        // fixed addresses and the final hidden already lands in ar_hidden — no D2D.
         for (std::uint32_t step = 0; step + 1 < k; ++step) {
             Tensor previous =
                 next_drafts.slice(1, static_cast<std::int32_t>(step), 1).view({batch_size});
@@ -166,12 +175,18 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                               .view({1, batch_size});
             Tensor valid =
                 ar_valid_columns.slice(1, static_cast<std::int32_t>(step), 1).view({batch_size});
-            Tensor previous_batch    = previous.view({1, batch_size});
-            Tensor hidden_batch      = ar_hidden.view({TextConfig::hidden, 1, batch_size});
-            Tensor next_hidden_batch = next_hidden.view({TextConfig::hidden, 1, batch_size});
-            card.mtp_forward_decode_batch(previous_batch, hidden_batch, position, rope, valid,
-                                          mtp_rows, envelopes.ar[step], next_hidden_batch);
-            card.mtp_propose_batch(next_hidden, proposal_logits, next);
+            Tensor previous_batch = previous.view({1, batch_size});
+            const bool from_ar    = (step % 2U) == 0U;
+            Tensor src_hidden =
+                (from_ar ? ar_hidden : next_hidden).view({TextConfig::hidden, 1, batch_size});
+            Tensor dst_hidden =
+                (from_ar ? next_hidden : ar_hidden).view({TextConfig::hidden, 1, batch_size});
+            Tensor& propose_hidden = from_ar ? next_hidden : ar_hidden;
+            card.mtp_forward_decode_batch(previous_batch, src_hidden, position, rope, valid,
+                                          mtp_rows, envelopes.ar[step], dst_hidden);
+            card.mtp_propose_batch(propose_hidden, proposal_logits, next);
+        }
+        if (((k - 1) % 2U) == 1U) {
             CUDA_CHECK(cudaMemcpyAsync(ar_hidden.data, next_hidden.data, ar_hidden.bytes(),
                                        cudaMemcpyDeviceToDevice, state.execution.device.stream));
         }
