@@ -103,6 +103,27 @@ std::string_view unstreamed_content(const GenerationOutcome& outcome) {
 
 } // namespace
 
+httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions& options,
+                                                              const httplib::Request& request,
+                                                              httplib::Response& response) {
+    if (response.status != 413 || !response.body.empty()) {
+        return httplib::Server::HandlerResponse::Unhandled;
+    }
+
+    ApiError error;
+    error.status  = 413;
+    error.type    = "invalid_request_error";
+    error.code    = "request_too_large";
+    error.message = "request body exceeds the configured payload limit of " +
+                    std::to_string(options.max_request_bytes) + " bytes";
+    if (request.path.rfind("/v1/messages", 0) == 0) {
+        write_messages_error(response, error);
+    } else {
+        write_error(response, error);
+    }
+    return httplib::Server::HandlerResponse::Handled;
+}
+
 HttpServer::HttpServer(ServeOptions options)
     : options_(std::move(options)),
       response_store_(options_.response_store_max_records, options_.response_store_max_bytes),
@@ -124,6 +145,11 @@ void HttpServer::log_line(const std::string& line) {
 void HttpServer::log_request_start(const RequestLogContext& context) {
     log_line(format_request_start(context));
     request_jsonl_.write_request_start(context);
+}
+
+void HttpServer::log_request_rejected(const RequestRejectionLogContext& context) {
+    log_line(format_request_rejected(context));
+    request_jsonl_.write_request_rejected(context);
 }
 
 void HttpServer::log_request_done(const RequestLogContext& context,
@@ -184,18 +210,8 @@ void HttpServer::stop_stats_reporter() {
 }
 
 void HttpServer::register_routes() {
-    server_.set_error_handler([](const httplib::Request& req, httplib::Response& res) {
-        if (res.status != 413) { return; }
-        ApiError error;
-        error.status  = 413;
-        error.type    = "invalid_request_error";
-        error.code    = "request_too_large";
-        error.message = "request body exceeds the configured payload limit";
-        if (req.path.rfind("/v1/messages", 0) == 0) {
-            write_messages_error(res, error);
-        } else {
-            write_error(res, error);
-        }
+    server_.set_error_handler([this](const httplib::Request& request, httplib::Response& response) {
+        return handle_unrendered_http_error(options_, request, response);
     });
     if (options_.enable_cors) {
         server_.set_default_headers(
@@ -330,7 +346,6 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     }
 
     GenerationRequest request;
-    PreparedRequest prepared;
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
@@ -343,10 +358,29 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             error.message = "model '" + request.model + "' not found";
             throw ApiException(std::move(error));
         }
+    } catch (const ApiException& e) {
+        write_error(res, e.error());
+        return;
+    }
+
+    const std::uint64_t req_id = ++request_seq_;
+    PreparedRequest prepared;
+    try {
         prepared = service_->prepare(
             request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
     } catch (const ApiException& e) {
+        log_request_rejected(make_request_rejection_log_context(req_id, "openai_chat_completions",
+                                                                request, e.error()));
         write_error(res, e.error());
+        return;
+    } catch (const std::exception& e) {
+        ApiError error;
+        error.status  = 500;
+        error.type    = "internal_error";
+        error.message = e.what();
+        log_request_rejected(
+            make_request_rejection_log_context(req_id, "openai_chat_completions", request, error));
+        write_error(res, error);
         return;
     }
 
@@ -354,7 +388,6 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     const std::int64_t created = unix_time_now();
     const std::string model    = request.model;
 
-    const std::uint64_t req_id = ++request_seq_;
     const RequestLogContext log_context =
         make_request_log_context(req_id, "openai_chat_completions", request, prepared);
     log_request_start(log_context);
@@ -525,15 +558,12 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     }
 
     GenerationRequest request;
-    PreparedRequest prepared;
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
         // The Anthropic endpoint accepts any `model` string (Claude Code sends real
         // Claude model names) and echoes it back; it never 404s on model id.
-        request  = parse_messages_request(body, limits);
-        prepared = service_->prepare(
-            request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
+        request = parse_messages_request(body, limits);
     } catch (const ApiException& e) {
         write_messages_error(res, e.error());
         return;
@@ -546,11 +576,31 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         return;
     }
 
+    const std::uint64_t req_id = ++request_seq_;
+    PreparedRequest prepared;
+    try {
+        prepared = service_->prepare(
+            request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
+    } catch (const ApiException& e) {
+        log_request_rejected(
+            make_request_rejection_log_context(req_id, "anthropic_messages", request, e.error()));
+        write_messages_error(res, e.error());
+        return;
+    } catch (const std::exception& e) {
+        ApiError error;
+        error.status  = 500;
+        error.type    = "internal_error";
+        error.message = e.what();
+        log_request_rejected(
+            make_request_rejection_log_context(req_id, "anthropic_messages", request, error));
+        write_messages_error(res, error);
+        return;
+    }
+
     const std::string id    = new_message_id();
     const std::string model = request.model; // echo the requested model
     const int input_tokens  = prepared.prompt_tokens;
 
-    const std::uint64_t req_id = ++request_seq_;
     const RequestLogContext log_context =
         make_request_log_context(req_id, "anthropic_messages", request, prepared);
     log_request_start(log_context);

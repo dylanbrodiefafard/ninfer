@@ -206,7 +206,6 @@ Json paginated_input_items(const httplib::Request& request, const std::vector<Js
 void HttpServer::handle_responses(const httplib::Request& req, httplib::Response& res) {
     ResponsesRequest request;
     ResponseContext previous_context;
-    PreparedRequest prepared;
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
@@ -222,7 +221,6 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             previous_context = previous->context;
         }
         compose_responses_generation_messages(request, flatten_response_context(previous_context));
-        prepared = service_->prepare(request.generation, [&req] { return disconnected(req); });
     } catch (const ApiException& exception) {
         write_error(res, responses_error(exception.error()));
         return;
@@ -231,9 +229,26 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         return;
     }
 
+    const std::uint64_t req_id = ++request_seq_;
+    PreparedRequest prepared;
+    try {
+        prepared = service_->prepare(request.generation, [&req] { return disconnected(req); });
+    } catch (const ApiException& exception) {
+        const ApiError error = responses_error(exception.error());
+        log_request_rejected(make_request_rejection_log_context(req_id, "openai_responses",
+                                                                request.generation, error));
+        write_error(res, error);
+        return;
+    } catch (const std::exception& exception) {
+        const ApiError error = internal_error(exception);
+        log_request_rejected(make_request_rejection_log_context(req_id, "openai_responses",
+                                                                request.generation, error));
+        write_error(res, error);
+        return;
+    }
+
     const std::string id       = new_response_id();
     const std::int64_t created = unix_time_now();
-    const std::uint64_t req_id = ++request_seq_;
     const RequestLogContext log_context =
         make_request_log_context(req_id, "openai_responses", request.generation, prepared);
     log_request_start(log_context);

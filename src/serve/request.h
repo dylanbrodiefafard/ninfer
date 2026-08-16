@@ -186,6 +186,16 @@ struct GenerationRequest {
         return !tools.empty() && tool_choice.mode != ToolChoiceMode::None;
     }
 
+    [[nodiscard]] std::size_t media_item_count() const noexcept {
+        std::size_t count = 0;
+        for (const ChatTurn& message : messages) {
+            for (const ContentPart& part : message.content) {
+                if (part.kind == ContentKind::Image || part.kind == ContentKind::Video) { ++count; }
+            }
+        }
+        return count;
+    }
+
     [[nodiscard]] bool has_tool_history() const noexcept {
         for (const ChatTurn& message : messages) {
             if (!message.tool_calls.empty() || message.role == ChatRole::Tool) { return true; }

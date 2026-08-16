@@ -17,7 +17,7 @@
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 8;
+inline constexpr int kRequestLogSchemaVersion        = 9;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct RequestLogContext {
@@ -35,6 +35,24 @@ struct RequestLogContext {
     bool preserve_thinking                 = false;
     bool preserve_thinking_semantic_change = false;
     ninfer::ResolvedSamplingParameters sampling;
+};
+
+// A parsed generation request that failed during synchronous preparation. It intentionally has a
+// separate shape from RequestLogContext: sampler and prompt semantics are not guaranteed to have
+// resolved when preparation rejects the request.
+struct RequestRejectionLogContext {
+    std::uint64_t id = 0;
+    std::string protocol;
+    std::string model;
+    bool stream                             = false;
+    std::size_t message_count               = 0;
+    std::size_t media_item_count            = 0;
+    int requested_output_tokens             = 0;
+    bool requested_output_tokens_client_set = false;
+    std::size_t tool_count                  = 0;
+    ToolChoice tool_choice;
+    bool has_tool_history = false;
+    ApiError error;
 };
 
 struct ServerLogEnvironment {
@@ -61,9 +79,14 @@ struct ThroughputReport {
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
                                            const GenerationRequest& request,
                                            const PreparedRequest& prepared);
+RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
+                                                              std::string protocol,
+                                                              const GenerationRequest& request,
+                                                              ApiError error);
 
 // Compact console records retained for operator visibility.
 std::string format_request_start(const RequestLogContext& context);
+std::string format_request_rejected(const RequestRejectionLogContext& context);
 std::string format_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
 std::string format_request_error(const RequestLogContext& context, const std::string& message);
 std::string format_throughput(const ThroughputReport& report);
@@ -81,6 +104,9 @@ std::string format_server_start_json(const std::string& server_instance_id,
 std::string format_request_start_json(const std::string& server_instance_id,
                                       std::uint64_t timestamp_unix_ms,
                                       const RequestLogContext& context);
+std::string format_request_rejected_json(const std::string& server_instance_id,
+                                         std::uint64_t timestamp_unix_ms,
+                                         const RequestRejectionLogContext& context);
 std::string format_request_done_json(const std::string& server_instance_id,
                                      std::uint64_t timestamp_unix_ms,
                                      const RequestLogContext& context,
@@ -114,6 +140,7 @@ public:
                             const std::string& public_model_id, const ninfer::LoadSummary& load,
                             const ninfer::MemorySummary& memory);
     void write_request_start(const RequestLogContext& context);
+    void write_request_rejected(const RequestRejectionLogContext& context);
     void write_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
     void write_request_error(const RequestLogContext& context, const std::string& message);
     void write_throughput(const ThroughputReport& report);

@@ -136,6 +136,18 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 OpenAI image and video sources may be HTTP(S) URLs or base64 data URLs.
 
+Text and media requests use one context contract. After chat-template rendering and media-token
+expansion, the complete prompt is admitted only against Engine `--max-context`; there is no
+separate 32K multimodal prompt ceiling. Media preprocessing retains independent resource limits
+for source bytes, decoded pixels, media-item count, raw patches, and Vision tokens.
+`attention_pairs` remains preparation diagnostics and is not an admission limit.
+
+An expanded prompt beyond `--max-context` returns HTTP 400 `context_length_exceeded`, including
+the prepared token count and configured context ceiling. A media preprocessing resource rejection
+returns HTTP 400 `media_budget_exceeded`. HTTP 413 `request_too_large` is reserved for a raw request
+body that exceeds `--max-request-mib` before JSON parsing; it is not used for model-context or media
+resource errors.
+
 ## OpenAI Responses Core
 
 NInfer implements the typed-Item and semantic-event core of the OpenAI
@@ -487,7 +499,7 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v8 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v9 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance.
 
@@ -495,6 +507,7 @@ that server instance.
 |---|---|
 | `server_start` | target/weights identity and artifact, resolved Engine, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
+| `request_rejected` | parsed request shape, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, unrounded phase seconds, and complete speculative-decoding counters |
 | `request_error` | the resolved request configuration and generation error message |
 | `throughput` | interval token deltas and rates, scheduler occupancy, and decode-round batch statistics |
@@ -507,10 +520,12 @@ derived downstream from raw token counts and seconds instead of rounded stderr s
 The JSONL file contains no generated response text and never records an API-key value; `argv`
 replaces that value with `<redacted>`. The existing stderr summaries remain available for operators
 but are rounded and are not the aggregation source. Console lines use local
-`[YYYY-MM-DD HH:MM:SS.mmm] [level]` timestamps. Structured request events cover successfully
-prepared OpenAI Responses, OpenAI Chat, and Anthropic generation requests and errors during their
-generation; schema rejection
-and token-count-only calls are not measurement requests and do not receive request IDs.
+`[YYYY-MM-DD HH:MM:SS.mmm] [level]` timestamps. OpenAI Responses, OpenAI Chat, and Anthropic
+generation requests receive a request ID when they enter synchronous preparation. Successful
+preparation produces `request_start`; a preparation failure produces `request_rejected` without a
+matching start. Later generation failures produce `request_error`. Schema/model validation
+rejections before preparation and token-count-only calls are not measurement requests and do not
+receive request IDs.
 
 By default the server also reports aggregate activity every five seconds. `prefill` counts prompt
 suffix tokens actually computed during the interval, excluding prefix-cache hits; `decode` counts

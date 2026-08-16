@@ -160,6 +160,41 @@ std::vector<std::uint8_t> gradient_ppm() {
     return ppm;
 }
 
+std::vector<std::uint8_t> block_ppm(int width, int height, std::uint8_t value) {
+    const std::string header =
+        "P6\n" + std::to_string(width) + ' ' + std::to_string(height) + "\n255\n";
+    std::vector<std::uint8_t> ppm;
+    ppm.reserve(header.size() +
+                static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3);
+    for (const char byte : header) {
+        ppm.push_back(static_cast<std::uint8_t>(static_cast<unsigned char>(byte)));
+    }
+    ppm.insert(ppm.end(), static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3,
+               value);
+    return ppm;
+}
+
+ninfer::PromptInput image_text_input(std::vector<std::uint8_t> bytes, std::string text,
+                                     std::string source_name) {
+    ninfer::MessagePart image;
+    image.kind              = ninfer::MessagePartKind::Media;
+    image.media.kind        = ninfer::MediaKind::Image;
+    image.media.bytes       = std::move(bytes);
+    image.media.media_type  = "image/x-portable-pixmap";
+    image.media.source_name = std::move(source_name);
+
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(std::move(image));
+    if (!text.empty()) {
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+    }
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    return input;
+}
+
 ninfer::PromptInput image_input() {
     ninfer::MessagePart image;
     image.kind              = ninfer::MessagePartKind::Media;
@@ -770,6 +805,35 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     return failures;
 }
 
+int test_multimodal_prompt_over_removed_32k_cap(const Frontend& frontend) {
+    const std::string long_text(40'000, 'x');
+    const std::uint32_t counted =
+        frontend.count_tokens(image_text_input(gradient_ppm(), long_text, "long-context.ppm"));
+    const auto prepared =
+        frontend.prepare(image_text_input(gradient_ppm(), long_text, "long-context.ppm"));
+    const auto& data = FrontendFactory::inspect(prepared);
+
+    int failures = check(counted > 32'768 && data.token_ids.size() == counted,
+                         "multimodal prompt retained the removed 32K frontend token cap");
+    failures += check(data.has_media() && data.vision_items.size() == 1,
+                      "long multimodal prompt lost its Vision item");
+    return failures;
+}
+
+int test_attention_pairs_are_diagnostic(const Frontend& frontend) {
+    constexpr std::uint64_t kRemovedAttentionPairLimit = 128ULL * 1024ULL * 1024ULL;
+    const auto prepared =
+        frontend.prepare(image_text_input(block_ppm(2048, 1536, 127), {}, "large-grid.ppm"));
+    const auto& data = FrontendFactory::inspect(prepared);
+
+    int failures = check(data.prepare.attention_pairs > kRemovedAttentionPairLimit,
+                         "test image did not exceed the removed attention-pair threshold");
+    failures += check(data.prepare.raw_patches == 12'288 && data.prepare.vision_tokens == 3'072 &&
+                          data.vision_items.size() == 1,
+                      "large image did not retain its expected Vision geometry");
+    return failures;
+}
+
 int test_video_prepare(const Frontend& frontend) {
     ninfer::MessagePart video;
     video.kind              = ninfer::MessagePartKind::Media;
@@ -977,6 +1041,8 @@ int main() {
     failures += test_rewrite_checkpoint_trace();
     failures += test_official_resource_guards();
     failures += test_text_and_image_prepare(frontend);
+    failures += test_multimodal_prompt_over_removed_32k_cap(frontend);
+    failures += test_attention_pairs_are_diagnostic(frontend);
     failures += test_video_prepare(frontend);
     failures += test_cross_round_stop(frontend);
     failures += test_same_token_stop_priority(frontend);

@@ -175,6 +175,7 @@ int main() {
     request.max_tokens     = 4096;
     request.max_tokens_set = true;
     request.messages.resize(2);
+    request.messages.front().content.push_back(ContentPart{.kind = ContentKind::Image});
 
     PreparedRequest prepared;
     prepared.enable_thinking                   = false;
@@ -202,6 +203,36 @@ int main() {
                       "resolved preserve-thinking metadata missing");
     failures += check(started.at("request").at("sampling").at("seed") == 7632647173703958409ULL,
                       "resolved seed missing");
+
+    ApiError preparation_error;
+    preparation_error.status = 400;
+    preparation_error.type   = "invalid_request_error";
+    preparation_error.param  = "messages";
+    preparation_error.code   = "context_length_exceeded";
+    preparation_error.message =
+        "prepared prompt has 270000 tokens, exceeding Engine max_context 262144";
+    const RequestRejectionLogContext rejected_context =
+        make_request_rejection_log_context(8, "anthropic_messages", request, preparation_error);
+    const Json rejected =
+        Json::parse(format_request_rejected_json("serve-test", 2500, rejected_context));
+    failures +=
+        check(rejected.at("event") == "request_rejected" && rejected.at("phase") == "prepare",
+              "preparation rejection event or phase mismatch");
+    failures += check(rejected.at("request").at("request_id") == 8 &&
+                          rejected.at("request").at("media_item_count") == 1 &&
+                          rejected.at("request").at("message_count") == 2,
+                      "preparation rejection request shape missing");
+    failures += check(rejected.at("error").at("status") == 400 &&
+                          rejected.at("error").at("code") == "context_length_exceeded" &&
+                          rejected.at("error").at("param") == "messages",
+                      "preparation rejection API error missing");
+    failures +=
+        check(format_request_rejected(rejected_context)
+                          .find("rejected phase=prepare protocol=anthropic_messages") !=
+                      std::string::npos &&
+                  format_request_rejected(rejected_context).find("code=context_length_exceeded") !=
+                      std::string::npos,
+              "human preparation rejection log is incomplete");
 
     GenerationOutcome outcome;
     outcome.prompt_tokens                       = 401;
@@ -311,22 +342,28 @@ int main() {
     }
     {
         JsonlRequestLog writer(log_path.string());
+        writer.write_request_rejected(rejected_context);
         writer.write_request_error(context, "generation failed");
     }
     std::ifstream input(log_path);
     std::string first_line;
     std::string second_line;
+    std::string third_line;
     std::string extra_line;
     std::getline(input, first_line);
     std::getline(input, second_line);
+    std::getline(input, third_line);
     std::getline(input, extra_line);
-    failures += check(!first_line.empty() && !second_line.empty() && extra_line.empty(),
+    failures += check(!first_line.empty() && !second_line.empty() && !third_line.empty() &&
+                          extra_line.empty(),
                       "JSONL writer did not append exactly one flushed line per event");
-    if (!first_line.empty() && !second_line.empty()) {
+    if (!first_line.empty() && !second_line.empty() && !third_line.empty()) {
         failures += check(Json::parse(first_line).at("event") == "request_start",
                           "first appended event mismatch");
-        failures += check(Json::parse(second_line).at("event") == "request_error",
+        failures += check(Json::parse(second_line).at("event") == "request_rejected",
                           "second appended event mismatch");
+        failures += check(Json::parse(third_line).at("event") == "request_error",
+                          "third appended event mismatch");
     }
     input.close();
     std::filesystem::remove(log_path);

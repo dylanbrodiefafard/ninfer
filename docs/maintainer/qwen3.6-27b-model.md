@@ -321,7 +321,10 @@ The native processor accepts structured text/image/video message parts. For each
 8. computes `rope_delta` for subsequent Text decode positions.
 
 Images repeat a frame to form the temporal pair. Videos are sampled at the configured rate and
-packed in temporal pairs. Media and compute budgets reject oversized work before Vision execution.
+packed in temporal pairs. Source bytes, decoded pixels, media count, raw patches, and Vision-token
+budgets reject oversized media work before Vision execution. The computed attention-pair count is
+diagnostic rather than an admission limit. The processor does not impose a separate prompt-token
+ceiling; Engine `max_context` admits the complete rendered text-plus-media prompt.
 
 ## 10. Vision tower
 

@@ -221,7 +221,7 @@ void append_patch(const std::vector<const media::decode::Image*>& frames, int gr
 }
 
 void add_budget(PreprocessStats& stats, const VisionItem& item);
-void enforce_budget(const PreprocessStats& stats, const ProcessorOptions& options);
+void enforce_media_resource_limits(const PreprocessStats& stats, const ProcessorOptions& options);
 
 Prepared prepare_image(const ChatPart& part, const ProcessorOptions& options,
                        const media::decode::Policy& policy, PreprocessStats& stats) {
@@ -234,7 +234,7 @@ Prepared prepare_image(const ChatPart& part, const ProcessorOptions& options,
     out.item.modality = Modality::Image;
     out.item.grid     = {1, gh, gw};
     add_budget(stats, out.item);
-    enforce_budget(stats, options);
+    enforce_media_resource_limits(stats, options);
     image = resize_bicubic(image, size);
     out.patches.reserve(static_cast<std::size_t>(gh) * gw * kPatchFeatures);
     const std::vector<const media::decode::Image*> frames{&image, &image};
@@ -267,7 +267,7 @@ Prepared prepare_video(const ChatPart& part, const ProcessorOptions& options,
     out.item.modality = Modality::Video;
     out.item.grid     = {gt, gh, gw};
     add_budget(stats, out.item);
-    enforce_budget(stats, options);
+    enforce_media_resource_limits(stats, options);
     for (media::decode::Image& frame : video.frames) { frame = resize_bicubic(frame, size); }
     if (pad_temporal) { video.frames.push_back(video.frames.back()); }
     out.item.timestamps.reserve(static_cast<std::size_t>(gt));
@@ -393,7 +393,7 @@ void add_budget(PreprocessStats& stats, const VisionItem& item) {
                                          "vision attention pairs");
 }
 
-void enforce_budget(const PreprocessStats& stats, const ProcessorOptions& options) {
+void enforce_media_resource_limits(const PreprocessStats& stats, const ProcessorOptions& options) {
     if (stats.media_items > options.max_media_items) {
         throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
                              "media item count exceeds processor budget");
@@ -405,14 +405,6 @@ void enforce_budget(const PreprocessStats& stats, const ProcessorOptions& option
     if (stats.vision_tokens > options.max_vision_tokens) {
         throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
                              "vision tokens exceed processor budget");
-    }
-    if (stats.attention_pairs > options.max_attention_pairs) {
-        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
-                             "vision attention pairs exceed processor budget");
-    }
-    if (stats.prompt_tokens > options.max_prompt_tokens) {
-        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
-                             "prompt tokens exceed processor budget");
     }
 }
 
@@ -550,12 +542,12 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
 Processor::Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& chat_template,
                      ProcessorOptions options)
     : tokenizer_(tokenizer), chat_template_(chat_template), options_(std::move(options)) {
-    if (options_.max_media_items == 0 || options_.max_prompt_tokens == 0 ||
-        options_.max_media_bytes == 0 || options_.max_decoded_pixels == 0 ||
-        options_.max_decoded_video_pixels == 0 || options_.image_min_pixels == 0 ||
-        options_.image_max_pixels < options_.image_min_pixels || options_.video_min_pixels == 0 ||
-        options_.video_max_pixels < options_.video_min_pixels || !(options_.video_fps > 0.0) ||
-        options_.video_min_frames <= 0 || options_.video_max_frames < options_.video_min_frames ||
+    if (options_.max_media_items == 0 || options_.max_media_bytes == 0 ||
+        options_.max_decoded_pixels == 0 || options_.max_decoded_video_pixels == 0 ||
+        options_.image_min_pixels == 0 || options_.image_max_pixels < options_.image_min_pixels ||
+        options_.video_min_pixels == 0 || options_.video_max_pixels < options_.video_min_pixels ||
+        !(options_.video_fps > 0.0) || options_.video_min_frames <= 0 ||
+        options_.video_max_frames < options_.video_min_frames ||
         options_.max_video_source_frames < options_.video_max_frames ||
         !(options_.max_video_duration_seconds > 0.0)) {
         throw std::invalid_argument("processor budgets must be positive");
@@ -623,7 +615,7 @@ ProcessedInput Processor::process(const std::vector<ChatMessage>& messages,
         }
     }
     stats.prompt_tokens = output.input_ids.size();
-    enforce_budget(stats, options_);
+    enforce_media_resource_limits(stats, options_);
 
     output.vision_items = std::move(items);
     stats.patch_bytes   = output.patches.size() * sizeof(float);

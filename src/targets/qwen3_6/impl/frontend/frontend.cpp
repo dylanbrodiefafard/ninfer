@@ -894,9 +894,7 @@ std::uint32_t Frontend::count_tokens(PromptInput input) const {
         return checked_token_count(impl_->tokenizer->encode(rendered.text).size());
     }
 
-    fi::ProcessorOptions processor_options = impl_->processor;
-    processor_options.max_prompt_tokens    = std::numeric_limits<std::size_t>::max();
-    fi::Processor processor(*impl_->tokenizer, impl_->chat_template, processor_options);
+    fi::Processor processor(*impl_->tokenizer, impl_->chat_template, impl_->processor);
     try {
         return checked_token_count(
             processor.process(messages, render_options(options)).input_ids.size());

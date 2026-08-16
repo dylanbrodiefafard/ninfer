@@ -656,7 +656,10 @@ The checkpoint processor accepts image and video media. For each media item it:
 The source processor config uses image pixel-count bounds 65,536 through 16,777,216 and video
 pixel-frame bounds 4,096 through 25,165,824. These are frontend work budgets rather than learned
 model dimensions. Before other limits, the resulting Vision-token count is
-`grid_t × grid_h × grid_w / 4`.
+`grid_t × grid_h × grid_w / 4`. Source bytes, decoded pixels, media count, raw patches, and
+Vision-token counts remain bounded; the attention-pair count is diagnostic rather than an
+admission limit. The processor has no separate prompt-token ceiling: Engine `max_context` admits
+the complete rendered text-plus-media prompt.
 
 ## 12. Vision tower
 

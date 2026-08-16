@@ -180,6 +180,31 @@ Json request_json(const RequestLogContext& context) {
                 {"sampling", sampler_json(context.sampling)}};
 }
 
+Json rejected_request_json(const RequestRejectionLogContext& context) {
+    return Json{{"request_id", context.id},
+                {"protocol", context.protocol},
+                {"model", context.model},
+                {"stream", context.stream},
+                {"message_count", context.message_count},
+                {"media_item_count", context.media_item_count},
+                {"requested_output_tokens", context.requested_output_tokens},
+                {"requested_output_tokens_source",
+                 context.requested_output_tokens_client_set ? "client" : "server_default"},
+                {"tool_count", context.tool_count},
+                {"tool_choice", tool_choice_name(context.tool_choice)},
+                {"has_tool_history", context.has_tool_history}};
+}
+
+Json error_json(const ApiError& error) {
+    Json code  = error.code.empty() ? Json(nullptr) : Json(error.code);
+    Json param = error.param.empty() ? Json(nullptr) : Json(error.param);
+    return Json{{"status", error.status},
+                {"type", error.type},
+                {"code", std::move(code)},
+                {"param", std::move(param)},
+                {"message", error.message}};
+}
+
 Json arena_json(const ninfer::ArenaMemorySummary& arena) {
     return Json{{"capacity_bytes", arena.capacity_bytes},
                 {"used_bytes", arena.used_bytes},
@@ -269,6 +294,26 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     return context;
 }
 
+RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
+                                                              std::string protocol,
+                                                              const GenerationRequest& request,
+                                                              ApiError error) {
+    RequestRejectionLogContext context;
+    context.id                                 = id;
+    context.protocol                           = std::move(protocol);
+    context.model                              = request.model;
+    context.stream                             = request.stream;
+    context.message_count                      = request.messages.size();
+    context.media_item_count                   = request.media_item_count();
+    context.requested_output_tokens            = request.max_tokens;
+    context.requested_output_tokens_client_set = request.max_tokens_set;
+    context.tool_count                         = request.tools.size();
+    context.tool_choice                        = request.tool_choice;
+    context.has_tool_history                   = request.has_tool_history();
+    context.error                              = std::move(error);
+    return context;
+}
+
 std::string format_request_start(const RequestLogContext& context) {
     std::ostringstream out;
     out << "[req " << context.id << "] " << context.protocol << ' '
@@ -282,6 +327,17 @@ std::string format_request_start(const RequestLogContext& context) {
         << " preserve_thinking=" << (context.preserve_thinking ? "on" : "off")
         << " preserve_change=" << (context.preserve_thinking_semantic_change ? "yes" : "no")
         << " sampler=[" << sampler_str(context.sampling) << "] \xE2\x86\x92 submitted";
+    return out.str();
+}
+
+std::string format_request_rejected(const RequestRejectionLogContext& context) {
+    std::ostringstream out;
+    out << "[req " << context.id << "] rejected phase=prepare protocol=" << context.protocol << ' '
+        << (context.stream ? "stream" : "non-stream") << " msgs=" << context.message_count
+        << " media=" << context.media_item_count << " tools=" << context.tool_count
+        << " status=" << context.error.status;
+    if (!context.error.code.empty()) { out << " code=" << context.error.code; }
+    out << " message=" << context.error.message;
     return out.str();
 }
 
@@ -434,6 +490,16 @@ std::string format_request_start_json(const std::string& server_instance_id,
     return record.dump();
 }
 
+std::string format_request_rejected_json(const std::string& server_instance_id,
+                                         std::uint64_t timestamp,
+                                         const RequestRejectionLogContext& context) {
+    Json record       = event_base(server_instance_id, timestamp, "request_rejected");
+    record["phase"]   = "prepare";
+    record["request"] = rejected_request_json(context);
+    record["error"]   = error_json(context.error);
+    return record.dump();
+}
+
 std::string format_request_done_json(const std::string& server_instance_id, std::uint64_t timestamp,
                                      const RequestLogContext& context,
                                      const GenerationOutcome& outcome) {
@@ -554,6 +620,11 @@ void JsonlRequestLog::write_server_start(const ServeOptions& options,
 void JsonlRequestLog::write_request_start(const RequestLogContext& context) {
     if (!enabled()) { return; }
     append(format_request_start_json(server_instance_id_, unix_time_ms(), context));
+}
+
+void JsonlRequestLog::write_request_rejected(const RequestRejectionLogContext& context) {
+    if (!enabled()) { return; }
+    append(format_request_rejected_json(server_instance_id_, unix_time_ms(), context));
 }
 
 void JsonlRequestLog::write_request_done(const RequestLogContext& context,

@@ -59,6 +59,9 @@ struct StreamSink {
     std::function<bool()> is_cancelled;
 };
 
+// Translate Engine request failures into the shared protocol-neutral HTTP error contract.
+ApiError request_error_to_api_error(const ninfer::RequestError& exception);
+
 // Preparation ends by synchronously submitting the owning prompt to the Engine FIFO. The returned
 // request keeps its ingress/response lifetime reservation until the HTTP response is released and
 // is consumed exactly once by run().

@@ -7,6 +7,7 @@
 #include "targets/registry.h"
 
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -24,6 +25,11 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     resolved.stop                              = std::move(options.stop);
     resolved.output                            = options.output;
     return resolved;
+}
+
+std::string context_capacity_error(std::uint32_t prompt_tokens, std::uint32_t max_context) {
+    return "prepared prompt has " + std::to_string(prompt_tokens) +
+           " tokens, exceeding Engine max_context " + std::to_string(max_context);
 }
 
 } // namespace
@@ -174,8 +180,9 @@ PreparedPrompt Engine::prepare(PromptInput input) const {
             auto prepared      = target_ptr->loaded->frontend.prepare(std::move(input));
             PromptSummary info = prepared.summary();
             if (info.prompt_tokens > target_ptr->capacity) {
-                throw RequestError(RequestErrorKind::ContextLengthExceeded,
-                                   "prepared prompt exceeds Engine context capacity");
+                throw RequestError(
+                    RequestErrorKind::ContextLengthExceeded,
+                    context_capacity_error(info.prompt_tokens, target_ptr->capacity));
             }
             const double seconds = prepared.prepare_seconds();
             return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
@@ -194,8 +201,9 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
                                                                              allow_prefix_identity);
             PromptSummary info = prepared.summary();
             if (info.prompt_tokens > target_ptr->capacity) {
-                throw RequestError(RequestErrorKind::ContextLengthExceeded,
-                                   "prepared prompt exceeds Engine context capacity");
+                throw RequestError(
+                    RequestErrorKind::ContextLengthExceeded,
+                    context_capacity_error(info.prompt_tokens, target_ptr->capacity));
             }
             const double seconds = prepared.prepare_seconds();
             return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
@@ -253,8 +261,9 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
 
     const PromptSummary prompt_summary = prompt.impl_->summary;
     if (prompt_summary.prompt_tokens > impl_->options.max_context) {
-        throw RequestError(RequestErrorKind::ContextLengthExceeded,
-                           "prepared prompt exceeds Engine context capacity");
+        throw RequestError(
+            RequestErrorKind::ContextLengthExceeded,
+            context_capacity_error(prompt_summary.prompt_tokens, impl_->options.max_context));
     }
     const double prepare_seconds = prompt.impl_->prepare_seconds;
     if (resolved_options.execution.requested_output_tokens == 0) {
