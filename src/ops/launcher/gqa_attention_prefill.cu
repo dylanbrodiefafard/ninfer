@@ -68,7 +68,10 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
         Tensor& cache_k_scale    = cache.k_scale_pages;
         Tensor& cache_v_scale    = cache.v_scale_pages;
         constexpr int kFillBlock = 256;
-        if (tokens >= 128 && Geometry::KVHeads == 2) {
+        // Page-tiled fill is Geometry-templated (Hkv in blockIdx.y). Enable for both
+        // Gqa35 (Hkv=2) and Gqa27/Qwen3.8 (Hkv=4); the prior Hkv==2 gate left 27B on the
+        // slower per-token warp fill for every INT8 prefill chunk.
+        if (tokens >= 128 && (Geometry::KVHeads == 2 || Geometry::KVHeads == 4)) {
             constexpr int kPageBlock     = 256;
             constexpr int kTokensPerTile = 8;
             const int max_tiles          = div_up(tokens + kTokensPerTile - 1, kTokensPerTile);
