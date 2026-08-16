@@ -366,14 +366,20 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             });
             log_request_done(log_context, outcome);
             const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+            const CompletionTimings timings = make_completion_timings(
+                outcome.prompt_tokens, outcome.completion_tokens, outcome.metrics.prefill_seconds,
+                outcome.metrics.decode_seconds,
+                static_cast<int>(outcome.metrics.speculative_draft_tokens),
+                static_cast<int>(outcome.metrics.speculative_accepted_tokens));
             std::string response_body;
             if (!outcome.tool_calls.empty()) {
                 response_body = make_chat_completion_tool_response(
-                    id, model, created, outcome.text, outcome.reasoning, outcome.tool_calls, usage);
+                    id, model, created, outcome.text, outcome.reasoning, outcome.tool_calls, usage,
+                    &timings);
             } else {
                 response_body = make_chat_completion_response(
                     id, model, created, outcome.text, outcome.reasoning,
-                    finish_reason_wire(outcome.finish_reason), usage);
+                    finish_reason_wire(outcome.finish_reason), usage, &timings);
             }
             set_owned_content(res, std::move(response_body), prepared.lifetime);
         } catch (const std::exception& e) {
@@ -422,6 +428,11 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
                 const GenerationOutcome outcome = service_->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
+                const CompletionTimings timings = make_completion_timings(
+                    outcome.prompt_tokens, outcome.completion_tokens,
+                    outcome.metrics.prefill_seconds, outcome.metrics.decode_seconds,
+                    static_cast<int>(outcome.metrics.speculative_draft_tokens),
+                    static_cast<int>(outcome.metrics.speculative_accepted_tokens));
                 const std::string_view remaining = unstreamed_content(outcome);
                 if (!outcome.tool_calls.empty()) {
                     if (!remaining.empty()) {
@@ -433,9 +444,11 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     write_stream_item(sink, *stream,
                                       make_chat_chunk_tool_calls(
                                           id, model, created, outcome.tool_calls, include_usage));
+                    const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
                     write_stream_item(
                         sink, *stream,
-                        make_chat_chunk_final(id, model, created, "tool_calls", include_usage));
+                        make_chat_chunk_final(id, model, created, "tool_calls", include_usage,
+                                              &timings, &usage));
                 } else {
                     if (tool_capable && !remaining.empty()) {
                         write_stream_item(sink, *stream,
@@ -443,16 +456,19 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                                                                   std::string(remaining),
                                                                   include_usage));
                     }
+                    const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
                     write_stream_item(
                         sink, *stream,
                         make_chat_chunk_final(id, model, created,
                                               finish_reason_wire(outcome.finish_reason),
-                                              include_usage));
+                                              include_usage, &timings, &usage));
                 }
-                if (include_usage) {
+                // Always emit usage+timings trailer (llama.cpp timings_per_token style) so
+                // Open WebUI/LiteLLM can populate the info bubble without include_usage.
+                {
                     const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
                     write_stream_item(sink, *stream,
-                                      make_chat_chunk_usage(id, model, created, usage));
+                                      make_chat_chunk_usage(id, model, created, usage, &timings));
                 }
                 write_stream_item(sink, *stream, sse_done());
                 sink.done();
