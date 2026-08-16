@@ -36,7 +36,13 @@ RUN apt-get update \
         libavutil58 \
         libcurl4t64 \
         libswscale7 \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    # Host driver supplies libcuda (e.g. 580.x). The image cuda-compat tree (590.x)
+    # wins ldconfig on this base and triggers cudaErrorCompatNotSupportedOnDevice
+    # on RTX 5090 / Blackwell. Prefer the injected host driver libraries.
+    && rm -rf /usr/local/cuda/compat /usr/local/cuda-13.1/compat /usr/local/cuda-13/compat \
+    && rm -f /etc/ld.so.conf.d/*compat*.conf \
+    && ldconfig
 
 COPY --from=build /build/apps/ninfer /usr/local/bin/ninfer
 COPY --from=build /build/apps/ninfer-serve /usr/local/bin/ninfer-serve
