@@ -58,7 +58,8 @@ constexpr ModelSamplingDefaults kQwen3_6Defaults{
 };
 
 constexpr ModelSamplingDefaults kQwen3_8Defaults{
-    .thinking     = {.temperature       = 1.0F,
+    // Align with LiteLLM remote-research serving (thinking): temp 0.6 / top_p 0.95 / top_k 20.
+    .thinking     = {.temperature       = 0.6F,
                      .top_k             = 20,
                      .top_p             = 0.95F,
                      .min_p             = 0.0F,
@@ -90,6 +91,12 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
         return WeightsProfile::GroupwiseIntW8Endpoints;
     }
     if (identity.model_id == model_id && identity.weights_id == "nvfp4") {
+        return WeightsProfile::Nvfp4;
+    }
+    // Qwen3.8 reuses the Qwen3.6 NVFP4 profile unchanged: that profile already
+    // holds the vocabulary endpoints in W8, which is the only place the two
+    // groupwise artifacts differ, so the object layouts are identical.
+    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4") {
         return WeightsProfile::Nvfp4;
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
