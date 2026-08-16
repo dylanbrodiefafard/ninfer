@@ -53,6 +53,20 @@ struct CompletionUsage {
     int completion_tokens = 0;
 };
 
+// llama.cpp-compatible timing block for Open WebUI / LiteLLM info bubbles.
+struct CompletionTimings {
+    int prompt_n                = 0;
+    double prompt_ms            = 0.0;
+    double prompt_per_token_ms  = 0.0;
+    double prompt_per_second    = 0.0;
+    int predicted_n             = 0;
+    double predicted_ms         = 0.0;
+    double predicted_per_token_ms = 0.0;
+    double predicted_per_second = 0.0;
+    int draft_n                 = 0;
+    int draft_n_accepted        = 0;
+};
+
 enum class ContentKind {
     Text,
     Image,

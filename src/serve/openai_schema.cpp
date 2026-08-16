@@ -1,6 +1,7 @@
 #include "serve/openai_schema.h"
 
 #include <array>
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
@@ -479,6 +480,79 @@ std::string sse_event(const Json& payload) { return "data: " + payload.dump() + 
 
 } // namespace
 
+namespace {
+
+Json timings_to_json(const CompletionTimings& timings) {
+    Json out = {{"prompt_n", timings.prompt_n},
+                {"prompt_ms", timings.prompt_ms},
+                {"prompt_per_token_ms", timings.prompt_per_token_ms},
+                {"prompt_per_second", timings.prompt_per_second},
+                {"predicted_n", timings.predicted_n},
+                {"predicted_ms", timings.predicted_ms},
+                {"predicted_per_token_ms", timings.predicted_per_token_ms},
+                {"predicted_per_second", timings.predicted_per_second}};
+    if (timings.draft_n > 0 || timings.draft_n_accepted > 0) {
+        out["draft_n"]          = timings.draft_n;
+        out["draft_n_accepted"] = timings.draft_n_accepted;
+    }
+    return out;
+}
+
+// Open WebUI merges top-level `timings` into usage and JSON-stringifies the result.
+// Direct clients see flat llama.cpp / Ollama fields. LiteLLM's stream path drops
+// top-level `timings` and rebuilds usage to token counts only — but it does
+// forward `prompt_tokens_details` from upstream chunks into the final usage
+// object, so nest the same rate fields there for the LiteLLM → OWUI path.
+Json usage_to_json(const CompletionUsage& usage, const CompletionTimings* timings) {
+    Json out = {{"prompt_tokens", usage.prompt_tokens},
+                {"completion_tokens", usage.completion_tokens},
+                {"total_tokens", usage.prompt_tokens + usage.completion_tokens}};
+    if (timings == nullptr) { return out; }
+    const Json t = timings_to_json(*timings);
+    for (auto it = t.begin(); it != t.end(); ++it) { out[it.key()] = it.value(); }
+    // Ollama-compatible aliases (durations in nanoseconds) for older OWUI tooltips.
+    out["prompt_eval_count"]    = timings->prompt_n;
+    out["eval_count"]           = timings->predicted_n;
+    out["prompt_eval_duration"] = static_cast<std::int64_t>(timings->prompt_ms * 1.0e6);
+    out["eval_duration"]        = static_cast<std::int64_t>(timings->predicted_ms * 1.0e6);
+    out["total_duration"] =
+        static_cast<std::int64_t>((timings->prompt_ms + timings->predicted_ms) * 1.0e6);
+    Json details = t;
+    details["prompt_eval_count"]    = out["prompt_eval_count"];
+    details["eval_count"]           = out["eval_count"];
+    details["prompt_eval_duration"] = out["prompt_eval_duration"];
+    details["eval_duration"]        = out["eval_duration"];
+    details["total_duration"]       = out["total_duration"];
+    out["prompt_tokens_details"]    = std::move(details);
+    return out;
+}
+
+} // namespace
+
+CompletionTimings make_completion_timings(int prompt_tokens, int completion_tokens,
+                                          double prefill_seconds, double decode_seconds,
+                                          int draft_n, int draft_n_accepted) {
+    CompletionTimings out;
+    out.prompt_n            = prompt_tokens;
+    out.prompt_ms           = prefill_seconds * 1000.0;
+    out.prompt_per_token_ms = prompt_tokens > 0 ? out.prompt_ms / prompt_tokens : 0.0;
+    out.prompt_per_second =
+        prefill_seconds > 0.0 ? static_cast<double>(prompt_tokens) / prefill_seconds : 0.0;
+    out.predicted_n  = completion_tokens;
+    out.predicted_ms = decode_seconds * 1000.0;
+    // Match NInfer/llama.cpp decode accounting: first token is attributed to prefill/TTFT.
+    const int decode_tokens =
+        completion_tokens > 1 ? completion_tokens - 1 : std::max(completion_tokens, 0);
+    out.predicted_per_token_ms =
+        decode_tokens > 0 ? out.predicted_ms / static_cast<double>(decode_tokens) : 0.0;
+    out.predicted_per_second = decode_seconds > 0.0 && decode_tokens > 0
+                                   ? static_cast<double>(decode_tokens) / decode_seconds
+                                   : 0.0;
+    out.draft_n          = draft_n;
+    out.draft_n_accepted = draft_n_accepted;
+    return out;
+}
+
 std::optional<bool> parse_openai_preserve_thinking(const Json& body) {
     std::optional<bool> top_level;
     if (body.contains("preserve_thinking") && !body.at("preserve_thinking").is_null()) {
@@ -495,7 +569,10 @@ std::optional<bool> parse_openai_preserve_thinking(const Json& body) {
             bad_request("chat_template_kwargs must be an object", "chat_template_kwargs");
         }
         for (auto it = kwargs.begin(); it != kwargs.end(); ++it) {
-            if (it.key() != "preserve_thinking" && !it.value().is_null()) {
+            // LiteLLM / Open WebUI commonly nest enable_thinking here (llama.cpp style).
+            // NInfer's native field is top-level enable_thinking; both are accepted.
+            if (it.key() != "preserve_thinking" && it.key() != "enable_thinking" &&
+                !it.value().is_null()) {
                 bad_request("chat_template_kwargs." + it.key() + " is not supported",
                             "chat_template_kwargs", "chat_template_option_not_supported");
             }
@@ -511,6 +588,34 @@ std::optional<bool> parse_openai_preserve_thinking(const Json& body) {
 
     if (top_level && template_value && *top_level != *template_value) {
         bad_request("conflicting preserve_thinking values", "preserve_thinking",
+                    "conflicting_template_option");
+    }
+    return template_value ? template_value : top_level;
+}
+
+std::optional<bool> parse_openai_enable_thinking(const Json& body) {
+    std::optional<bool> top_level;
+    if (body.contains("enable_thinking") && !body.at("enable_thinking").is_null()) {
+        if (!body.at("enable_thinking").is_boolean()) {
+            bad_request("enable_thinking must be a boolean or null", "enable_thinking");
+        }
+        top_level = body.at("enable_thinking").get<bool>();
+    }
+
+    std::optional<bool> template_value;
+    if (body.contains("chat_template_kwargs") && body.at("chat_template_kwargs").is_object()) {
+        const Json& kwargs = body.at("chat_template_kwargs");
+        if (kwargs.contains("enable_thinking") && !kwargs.at("enable_thinking").is_null()) {
+            if (!kwargs.at("enable_thinking").is_boolean()) {
+                bad_request("chat_template_kwargs.enable_thinking must be a boolean or null",
+                            "chat_template_kwargs");
+            }
+            template_value = kwargs.at("enable_thinking").get<bool>();
+        }
+    }
+
+    if (top_level && template_value && *top_level != *template_value) {
+        bad_request("conflicting enable_thinking values", "enable_thinking",
                     "conflicting_template_option");
     }
     return template_value ? template_value : top_level;
@@ -553,8 +658,8 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     if (body.contains("stream_options") && body.at("stream_options").is_object()) {
         out.include_usage = get_bool(body.at("stream_options"), "include_usage", false);
     }
-    if (body.contains("enable_thinking") && !body.at("enable_thinking").is_null()) {
-        out.enable_thinking = get_bool(body, "enable_thinking", false);
+    if (const std::optional<bool> enable_thinking = parse_openai_enable_thinking(body)) {
+        out.enable_thinking = *enable_thinking;
     }
     parse_openai_reasoning_effort(body, out);
     out.preserve_thinking = parse_openai_preserve_thinking(body);
@@ -575,10 +680,11 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
 std::string make_chat_completion_response(const std::string& id, const std::string& model,
                                           std::int64_t created, const std::string& content,
                                           const std::string& reasoning, const char* finish_reason,
-                                          const CompletionUsage& usage) {
+                                          const CompletionUsage& usage,
+                                          const CompletionTimings* timings) {
     Json message = {{"role", "assistant"}, {"content", content}};
     if (!reasoning.empty()) { message["reasoning_content"] = reasoning; }
-    const Json payload = {
+    Json payload = {
         {"id", id},
         {"object", "chat.completion"},
         {"created", created},
@@ -586,9 +692,8 @@ std::string make_chat_completion_response(const std::string& id, const std::stri
         {"choices",
          Json::array({Json{
              {"index", 0}, {"message", std::move(message)}, {"finish_reason", finish_reason}}})},
-        {"usage", Json{{"prompt_tokens", usage.prompt_tokens},
-                       {"completion_tokens", usage.completion_tokens},
-                       {"total_tokens", usage.prompt_tokens + usage.completion_tokens}}}};
+        {"usage", usage_to_json(usage, timings)}};
+    if (timings != nullptr) { payload["timings"] = timings_to_json(*timings); }
     return payload.dump();
 }
 
@@ -596,12 +701,13 @@ std::string make_chat_completion_tool_response(const std::string& id, const std:
                                                std::int64_t created, const std::string& content,
                                                const std::string& reasoning,
                                                const std::vector<ToolCall>& tool_calls,
-                                               const CompletionUsage& usage) {
+                                               const CompletionUsage& usage,
+                                               const CompletionTimings* timings) {
     Json message = {{"role", "assistant"},
                     {"content", content.empty() ? Json(nullptr) : Json(content)},
                     {"tool_calls", tool_calls_json(tool_calls, false)}};
     if (!reasoning.empty()) { message["reasoning_content"] = reasoning; }
-    const Json payload = {
+    Json payload = {
         {"id", id},
         {"object", "chat.completion"},
         {"created", created},
@@ -609,9 +715,8 @@ std::string make_chat_completion_tool_response(const std::string& id, const std:
         {"choices",
          Json::array({Json{
              {"index", 0}, {"message", std::move(message)}, {"finish_reason", "tool_calls"}}})},
-        {"usage", Json{{"prompt_tokens", usage.prompt_tokens},
-                       {"completion_tokens", usage.completion_tokens},
-                       {"total_tokens", usage.prompt_tokens + usage.completion_tokens}}}};
+        {"usage", usage_to_json(usage, timings)}};
+    if (timings != nullptr) { payload["timings"] = timings_to_json(*timings); }
     return payload.dump();
 }
 
@@ -661,21 +766,30 @@ std::string make_chat_chunk_tool_calls(const std::string& id, const std::string&
 
 std::string make_chat_chunk_final(const std::string& id, const std::string& model,
                                   std::int64_t created, const char* finish_reason,
-                                  bool include_usage) {
+                                  bool include_usage, const CompletionTimings* timings,
+                                  const CompletionUsage* usage) {
     Json payload       = base_chunk(id, model, created);
     payload["choices"] = Json::array(
         {Json{{"index", 0}, {"delta", Json::object()}, {"finish_reason", finish_reason}}});
-    if (include_usage) { payload["usage"] = nullptr; }
+    // Prefer attaching real usage on the finish chunk. LiteLLM strips mid-stream
+    // usage from the wire but keeps it on the in-memory chunk list, then rebuilds
+    // the final usage object — prompt_tokens_details survives that rebuild.
+    if (usage != nullptr) {
+        payload["usage"] = usage_to_json(*usage, timings);
+    } else if (include_usage) {
+        payload["usage"] = nullptr;
+    }
+    if (timings != nullptr) { payload["timings"] = timings_to_json(*timings); }
     return sse_event(payload);
 }
 
 std::string make_chat_chunk_usage(const std::string& id, const std::string& model,
-                                  std::int64_t created, const CompletionUsage& usage) {
+                                  std::int64_t created, const CompletionUsage& usage,
+                                  const CompletionTimings* timings) {
     Json payload       = base_chunk(id, model, created);
     payload["choices"] = Json::array();
-    payload["usage"]   = Json{{"prompt_tokens", usage.prompt_tokens},
-                              {"completion_tokens", usage.completion_tokens},
-                              {"total_tokens", usage.prompt_tokens + usage.completion_tokens}};
+    payload["usage"]   = usage_to_json(usage, timings);
+    if (timings != nullptr) { payload["timings"] = timings_to_json(*timings); }
     return sse_event(payload);
 }
 
