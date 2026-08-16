@@ -10,7 +10,10 @@ function(ninfer_cuda_archive target)
   set_target_properties(${target} PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-  target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+  # -lineinfo is for RelWithDebInfo / Debug (and benches). Release production
+  # builds (Dockerfile, hot-patch) omit it to avoid extra device debug metadata.
+  target_compile_options(${target} PRIVATE
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CONFIG:Release>>>:-lineinfo>)
 endfunction()
 
 # Device/tensor/layout/graph primitives and the model-independent request runtime.
@@ -54,7 +57,8 @@ ninfer_internal_includes(ninfer_nvfp4_tma)
 set_target_properties(ninfer_nvfp4_tma PROPERTIES
   CUDA_SEPARABLE_COMPILATION OFF
   CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
-target_compile_options(ninfer_nvfp4_tma PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+target_compile_options(ninfer_nvfp4_tma PRIVATE
+  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CONFIG:Release>>>:-lineinfo>)
 target_link_libraries(ninfer_nvfp4_tma PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
 
 # Shared mathematical Ops. The list is intentionally explicit: adding a
@@ -137,6 +141,7 @@ add_library(ninfer_ops STATIC
   ops/linear/bf16/bf16_gemm_mma.cu
   ops/linear/bf16/bf16_small_t.cu
   ops/linear/bf16/bf16_dispatch.cpp
+  ops/common/memory_evict.cu
   ops/linear/nvfp4/nvfp4_format.cpp
   ops/linear/nvfp4/nvfp4_gemv.cu
   ops/linear/nvfp4/nvfp4_small_t.cu

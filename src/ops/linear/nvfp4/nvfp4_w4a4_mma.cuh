@@ -132,23 +132,47 @@ stage_nvfp4_w4a4_activation(Nvfp4W4a4MaterializedActivation source,
     }
 }
 
-template <class Geometry, class Schedule, class RowPolicy>
+template <class Geometry, class Schedule, class RowPolicy, Cache WeightCache = Cache::cg>
 __device__ __forceinline__ void stage_nvfp4_w4a4_weight(const std::uint8_t* __restrict__ codes,
                                                         const std::uint8_t* __restrict__ scales,
                                                         Nvfp4W4a4SharedStorage<Schedule>& shared,
                                                         int stage, int k_tile, int row_begin,
                                                         RowPolicy row_policy) {
     constexpr int kCodeTasks = Schedule::kBlockN * Schedule::kSegmentsPerRow;
-    for (int task = static_cast<int>(threadIdx.x); task < kCodeTasks; task += Schedule::kThreads) {
-        const int row             = task / Schedule::kSegmentsPerRow;
-        const int logical_segment = task - row * Schedule::kSegmentsPerRow;
-        const int weight_row      = row_policy.weight_row(row_begin, row);
-        const int physical_byte   = nvfp4_w4a4_swizzled_byte<Schedule>(row, logical_segment * 16);
-        auto* destination = shared.b_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
-        const auto* input = codes +
-                            static_cast<std::int64_t>(weight_row) * Geometry::kCodeBytesPerRow +
-                            k_tile * Schedule::kCodeRowBytes + logical_segment * 16;
-        cp_async<16, Cache::cg>(destination, input);
+    if constexpr (WeightCache == Cache::EvictFirst) {
+        for (int task = static_cast<int>(threadIdx.x); task < kCodeTasks;
+             task += Schedule::kThreads) {
+            const int row             = task / Schedule::kSegmentsPerRow;
+            const int logical_segment = task - row * Schedule::kSegmentsPerRow;
+            const int weight_row      = row_policy.weight_row(row_begin, row);
+            const int physical_byte =
+                nvfp4_w4a4_swizzled_byte<Schedule>(row, logical_segment * 16);
+            auto* destination =
+                shared.b_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
+            const auto* input = codes +
+                                static_cast<std::int64_t>(weight_row) * Geometry::kCodeBytesPerRow +
+                                k_tile * Schedule::kCodeRowBytes + logical_segment * 16;
+            cp_async_evict_first_16_noinline(destination, input);
+        }
+    } else {
+        for (int task = static_cast<int>(threadIdx.x); task < kCodeTasks;
+             task += Schedule::kThreads) {
+            const int row             = task / Schedule::kSegmentsPerRow;
+            const int logical_segment = task - row * Schedule::kSegmentsPerRow;
+            const int weight_row      = row_policy.weight_row(row_begin, row);
+            const int physical_byte =
+                nvfp4_w4a4_swizzled_byte<Schedule>(row, logical_segment * 16);
+            auto* destination =
+                shared.b_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
+            const auto* input = codes +
+                                static_cast<std::int64_t>(weight_row) * Geometry::kCodeBytesPerRow +
+                                k_tile * Schedule::kCodeRowBytes + logical_segment * 16;
+            if constexpr (WeightCache == Cache::ca) {
+                cp_sync_cs_16(destination, input);
+            } else {
+                cp_async<16, Cache::cg>(destination, input);
+            }
+        }
     }
 
     if constexpr (RowPolicy::kContiguous) {
@@ -202,7 +226,8 @@ __device__ __forceinline__ void stage_nvfp4_w4a4_weight(const std::uint8_t* __re
 }
 
 template <class Geometry, class Schedule, class Epilogue, class OutputPolicy,
-          class RowPolicy = Nvfp4W4a4IdentityRows, bool PairRows = false>
+          class RowPolicy = Nvfp4W4a4IdentityRows, bool PairRows = false,
+          Cache WeightCache = Cache::cg>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4_mma_kernel(
     Nvfp4W4a4MaterializedActivation activation, const std::uint8_t* __restrict__ weight_codes,
@@ -225,8 +250,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
         if (stage < kKTiles) {
             stage_nvfp4_w4a4_activation<Geometry, Schedule>(activation, shared, stage, stage,
                                                             token_begin, tokens);
-            stage_nvfp4_w4a4_weight<Geometry, Schedule>(weight_codes, weight_scales, shared, stage,
-                                                        stage, row_begin, row_policy);
+            stage_nvfp4_w4a4_weight<Geometry, Schedule, RowPolicy, WeightCache>(
+                weight_codes, weight_scales, shared, stage, stage, row_begin, row_policy);
             cp_commit();
         }
     }
@@ -320,8 +345,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
         if (next_k_tile < kKTiles) {
             stage_nvfp4_w4a4_activation<Geometry, Schedule>(activation, shared, stage, next_k_tile,
                                                             token_begin, tokens);
-            stage_nvfp4_w4a4_weight<Geometry, Schedule>(weight_codes, weight_scales, shared, stage,
-                                                        next_k_tile, row_begin, row_policy);
+            stage_nvfp4_w4a4_weight<Geometry, Schedule, RowPolicy, WeightCache>(
+                weight_codes, weight_scales, shared, stage, next_k_tile, row_begin, row_policy);
         }
         cp_commit();
     }

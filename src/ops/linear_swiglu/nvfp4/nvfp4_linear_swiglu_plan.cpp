@@ -34,7 +34,8 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
         throw std::invalid_argument("nvfp4 linear_swiglu A16 is registered only through T=16");
     }
     if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
-    if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
+    // T=4 MTP: FusedW4A4 + weight L2::evict_first (OWUI A/B).
+    if (tokens <= 3) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
     if (tokens <= 48) { return Nvfp4LinearSwiGluRoute::FusedW4A4; }
     if (tokens == kPrimaryT) { return Nvfp4LinearSwiGluRoute::TmaFusedW4A4; }
     return Nvfp4LinearSwiGluRoute::LinearW4A4Post;
@@ -84,10 +85,10 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
     }
     (void)resolve_route(policy, min_tokens);
     (void)resolve_route(policy, max_tokens);
-    if (policy == LinearPolicy::A16Only || max_tokens <= 4) { return 0; }
+    if (policy == LinearPolicy::A16Only || max_tokens <= 3) { return 0; }
 
     std::size_t maximum = 0;
-    if (min_tokens <= 48 && max_tokens >= 5) {
+    if (min_tokens <= 48 && max_tokens >= 4) {
         maximum = fused_workspace_bytes(std::min(max_tokens, 48));
     }
     if (min_tokens <= kPrimaryT && max_tokens >= kPrimaryT) {
