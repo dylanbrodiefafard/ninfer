@@ -59,6 +59,9 @@ struct CompletionTimings {
     double prompt_ms            = 0.0;
     double prompt_per_token_ms  = 0.0;
     double prompt_per_second    = 0.0;
+    // Prefill throughput over the trailing window (<= 1s) of prefill: the steady-state rate.
+    double prefill_tail_tok_s      = 0.0;
+    double prefill_tail_window_s   = 0.0;
     int predicted_n             = 0;
     double predicted_ms         = 0.0;
     double predicted_per_token_ms = 0.0;

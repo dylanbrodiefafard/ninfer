@@ -27,6 +27,8 @@ struct GenerationMetrics {
     double ttft_seconds    = 0.0;
     double vision_seconds  = 0.0;
     double prefill_seconds = 0.0;
+    double prefill_tail_tok_s    = 0.0;
+    double prefill_tail_window_s = 0.0;
     double decode_seconds  = 0.0;
     double total_seconds   = 0.0;
 
