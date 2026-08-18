@@ -695,10 +695,11 @@ rewrite checkpoint。后者按捕获时的用途标记为 `TurnClosure` 或 `Res
 payload。
 
 Qwen frontend 从有效 `preserve_thinking` 语义发布 desired checkpoint：`false` 选择最后一个真实 user
-之后第一条 assistant opener 的末尾；`true` 选择本次完整 deterministic generation prologue 的末尾，
-即当前 prompt frontier。Thinking generation 包含 `<think>\n`，non-thinking generation 包含完整 empty
-thinking block。Boundary 先作为 byte offset 产生，再独立 tokenize 并验证为完整 prompt token prefix；
-schema adapter 不推断或改写这些 target-private 语义。
+之后第一条 assistant opener 的末尾；`true` 选择本次 deterministic generation prologue。Thinking
+generation 停在 `<think>` 之后、不含随后换行：`<think>\n` 不是后续空 thinking 闭合块
+`<think>\n\n</think>` 的 BPE 稳定 token 前缀（`\n` 为 198，`\n\n` 为 271）。Non-thinking generation
+仍取完整 empty thinking block，即当前 prompt frontier。Boundary 先作为 byte offset 产生，再独立
+tokenize 并验证为完整 prompt token prefix；schema adapter 不推断或改写这些 target-private 语义。
 
 Admission 在同一 lane 成功时消费 retained entry，并把 SequenceState ownership 转移给新 request：
 

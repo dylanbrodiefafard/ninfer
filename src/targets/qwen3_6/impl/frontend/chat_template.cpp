@@ -435,16 +435,21 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                 .kind = RewriteCheckpointKind::TurnClosure, .offset = rendered.size()};
         }
         if (options.enable_thinking) {
-            rendered += "<think>\n";
+            rendered += "<think>";
+            if (preserve_thinking) {
+                // After `<think>`, not after the trailing newline. `<think>\n` is not a BPE-stable
+                // prefix of a closed empty think block (`<think>\n\n</think>`): `\n` is token 198
+                // and `\n\n` is token 271, so a later reconstructed tool-call turn would miss.
+                rewrite_checkpoint = RewriteCheckpointByteSpec{
+                    .kind = RewriteCheckpointKind::ResponseReplay, .offset = rendered.size()};
+            }
+            rendered += "\n";
         } else {
             rendered += "<think>\n\n</think>\n\n";
-        }
-        if (preserve_thinking) {
-            // Response replay retains the deterministic generation prologue. This is the prompt
-            // frontier for both thinking modes, so capturing it does not split off a tiny final
-            // prefill unit. The complete rendered prefix is tokenized independently below.
-            rewrite_checkpoint = RewriteCheckpointByteSpec{
-                .kind = RewriteCheckpointKind::ResponseReplay, .offset = rendered.size()};
+            if (preserve_thinking) {
+                rewrite_checkpoint = RewriteCheckpointByteSpec{
+                    .kind = RewriteCheckpointKind::ResponseReplay, .offset = rendered.size()};
+            }
         }
     }
     return RenderedChat{.text = std::move(rendered), .rewrite_checkpoint = rewrite_checkpoint};

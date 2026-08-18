@@ -253,6 +253,26 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine) {
                   << " reused=" << mode_change.reused_prompt_tokens << '\n';
         return 1;
     }
+
+    const ninfer::GenerationResult empty_source =
+        engine.generate(engine.prepare(input_with_history(0, true)), options(false));
+    if (empty_source.generated_token_ids.size() != 4 ||
+        empty_source.prefix_reuse_path != ninfer::PrefixReusePath::FullReset) {
+        std::cerr << "empty-reasoning source request did not complete from a cold lane\n";
+        return 1;
+    }
+    ninfer::PromptInput empty_history = input_with_history(1, true);
+    empty_history.messages[1].reasoning_content.clear();
+    const ninfer::GenerationResult empty_replay =
+        engine.generate(engine.prepare(std::move(empty_history)), options(true));
+    if (empty_replay.generated_token_ids.size() != 4 ||
+        empty_replay.prefix_reuse_path != ninfer::PrefixReusePath::RestoreResponseCheckpoint ||
+        empty_replay.reused_prompt_tokens == 0) {
+        std::cerr << "empty-reasoning tool follow-up did not restore its response checkpoint: path="
+                  << static_cast<int>(empty_replay.prefix_reuse_path)
+                  << " reused=" << empty_replay.reused_prompt_tokens << '\n';
+        return 1;
+    }
     return 0;
 }
 
