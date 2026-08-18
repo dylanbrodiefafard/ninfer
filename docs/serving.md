@@ -114,7 +114,13 @@ both OpenAI spellings are present they must carry the same boolean value. Unknow
 
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
 finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty
-`choices` chunk contains completed usage.
+`choices` chunk contains completed usage. Non-stream responses and the stream usage/finish chunks
+also include a llama.cpp-style `timings` object, with the same rate fields flattened onto `usage`.
+Rate and millisecond fields are rounded to three decimal places. `reuse_source` reports prefix
+reuse as `none` (cache miss), `vram_resident`, or `host_ram`. When `--kv-ram-capacity` is enabled,
+those objects also include the live host-KV occupancy and copy times from the serve `[req] done`
+line: `kv_ram_used_bytes`, `kv_ram_entry_count`, `kv_ram_restores`, `kv_ram_evictions`,
+`kv_ram_drops`, `kv_ram_save_ms`, and `kv_ram_load_ms`. They are omitted when the RAM tier is off.
 
 ### Multimodal request
 

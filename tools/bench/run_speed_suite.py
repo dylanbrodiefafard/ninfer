@@ -194,7 +194,7 @@ def num(*values) -> float | None:
 
 def extract_metrics(resp: dict, extra: dict, streamed: bool) -> dict:
     usage = resp.get("usage") or {}
-    timings = resp.get("timings") or usage.get("prompt_tokens_details") or {}
+    timings = resp.get("timings") or {}
     draft_n = int(num(usage.get("draft_n"), timings.get("draft_n")) or 0)
     accepted = int(num(usage.get("draft_n_accepted"), timings.get("draft_n_accepted")) or 0)
     completion = int(num(usage.get("completion_tokens")) or 0)
