@@ -423,7 +423,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 outcome.prompt_tokens, outcome.completion_tokens, outcome.metrics.prefill_seconds,
                 outcome.metrics.decode_seconds,
                 static_cast<int>(outcome.metrics.speculative_draft_tokens),
-                static_cast<int>(outcome.metrics.speculative_accepted_tokens));
+                static_cast<int>(outcome.metrics.speculative_accepted_tokens),
+                outcome.metrics.prefill_tail_tok_s, outcome.metrics.prefill_tail_window_s);
             std::string response_body;
             if (!outcome.tool_calls.empty()) {
                 response_body = make_chat_completion_tool_response(
@@ -485,7 +486,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     outcome.prompt_tokens, outcome.completion_tokens,
                     outcome.metrics.prefill_seconds, outcome.metrics.decode_seconds,
                     static_cast<int>(outcome.metrics.speculative_draft_tokens),
-                    static_cast<int>(outcome.metrics.speculative_accepted_tokens));
+                    static_cast<int>(outcome.metrics.speculative_accepted_tokens),
+                    outcome.metrics.prefill_tail_tok_s, outcome.metrics.prefill_tail_window_s);
                 const std::string_view remaining = unstreamed_content(outcome);
                 if (!outcome.tool_calls.empty()) {
                     if (!remaining.empty()) {

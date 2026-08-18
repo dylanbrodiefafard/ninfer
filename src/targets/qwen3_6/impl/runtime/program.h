@@ -200,6 +200,11 @@ struct RequestControl {
         ReusePath reuse                  = ReusePath::FullReset;
         PrefixReuseSource reuse_source   = PrefixReuseSource::None;
         MtpBridgeMode mtp_bridge         = MtpBridgeMode::None;
+        // Per-chunk prefill step records (tokens processed, wall seconds) for the
+        // tail-window throughput metric. One entry per advance_prefill call; the
+        // finalizing call includes its sampling/bridge time.
+        std::vector<std::uint32_t> step_tokens;
+        std::vector<double> step_seconds;
     };
 
     std::optional<Prefill> prefill;

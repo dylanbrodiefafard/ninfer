@@ -29,7 +29,9 @@ std::optional<bool> parse_openai_enable_thinking(const nlohmann::json& body);
 [[nodiscard]] CompletionTimings make_completion_timings(int prompt_tokens, int completion_tokens,
                                                         double prefill_seconds,
                                                         double decode_seconds, int draft_n = 0,
-                                                        int draft_n_accepted = 0);
+                                                        int draft_n_accepted = 0,
+                                                        double prefill_tail_tok_s = 0.0,
+                                                        double prefill_tail_window_s = 0.0);
 
 // Non-streaming chat completion response body (JSON string). When `reasoning` is
 // non-empty it is attached as `message.reasoning_content` (the DeepSeek/vLLM-style
