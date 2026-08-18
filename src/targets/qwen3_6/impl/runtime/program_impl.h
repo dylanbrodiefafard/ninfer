@@ -620,7 +620,9 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         }
         staged.elapsed_seconds = std::chrono::duration<double>(Clock::now() - started).count();
         request.lifecycle      = Lifecycle::Prefilling;
-        return advance_prefill(sequence, request);
+        const runtime::PrefillStepResult first = advance_prefill(sequence, request);
+        sequence.use_tick                      = next_use_tick_++;
+        return first;
     } catch (...) {
         try {
             device.synchronize();
@@ -851,6 +853,10 @@ bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
     return lane < max_concurrency && sequences[lane].retained;
 }
 
+std::uint64_t ProgramImplCore::retained_use_tick(std::uint32_t lane) const noexcept {
+    return has_retained_lane(lane) ? sequences[lane].use_tick : 0;
+}
+
 void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
     if (!has_retained_lane(lane)) { return; }
     clear_lane(sequences[lane], requests[lane]);
@@ -1043,6 +1049,7 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.mtp_draft_count         = 0;
     sequence.tail_hidden_valid       = false;
     sequence.retained                = false;
+    sequence.use_tick                = 0;
     sequence.rewrite_checkpoint      = {};
     request.pending                  = {};
 }
