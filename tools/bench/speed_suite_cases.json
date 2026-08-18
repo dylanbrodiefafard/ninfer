@@ -70,9 +70,9 @@
    "id": "decode_nothink",
    "suite": "decode",
    "thinking": false,
-   "max_tokens": 512,
-   "prompt": "Explain how a paged KV cache works in a few sentences.",
-   "desc": "Small prompt, thinking off, long generation"
+   "max_tokens": 768,
+   "prompt": "Write a detailed explanation of how a paged KV cache works in a modern LLM inference engine. Cover the virtual-memory analogy, the block table, allocation and freeing, prefix sharing between requests, and how fragmentation is avoided. End with a short concrete example of how one request's KV is laid out across blocks.",
+   "desc": "Small prompt, thinking off, long generation (768 tokens; presence_penalty=1.5 legacy path)"
   },
   {
    "id": "context_128k",
