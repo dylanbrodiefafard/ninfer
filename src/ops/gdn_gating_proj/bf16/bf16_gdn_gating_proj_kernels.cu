@@ -6,6 +6,7 @@
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_gemm_mma.cuh"
 
 #include "core/device.h" // CUDA_CHECK
+#include <cooperative_groups.h>
 
 #include <cuda_bf16.h>
 
@@ -139,6 +140,123 @@ __global__ void bf16_gdn_gating_proj_small_t_reduce_kernel(const float* __restri
     const float sp               = softplus(acc_a + dt_bias[row]);
     g[out_index]                 = -expf(A_log[row]) * sp;
     beta[out_index]              = sigmoid(acc_b);
+}
+
+// Single cooperative kernel for the small-T route: the phase-1 work is exactly the split-10
+// partial GEMV, a grid barrier, then the first few blocks run the reduce + epilogue in place.
+// The per-output sum keeps the split-ascending order of the standalone reduce kernel, so the
+// fused route is bit-exact against the two-kernel route.
+template <int TokenTile, int KSlice, int RowsPerBlock>
+__global__ void bf16_gdn_gating_proj_small_t_fused_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ a_weight,
+    const __nv_bfloat16* __restrict__ b_weight, float* __restrict__ partial,
+    const float* __restrict__ A_log, const float* __restrict__ dt_bias, float* __restrict__ g,
+    float* __restrict__ beta, std::int32_t t) {
+    static_assert(TokenTile == kSmallTMax, "small-T token tile is fixed to 8");
+    static_assert(KSlice == kSmallTKSlice, "small-T K split is fixed to 512");
+    static_assert(RowsPerBlock == kSmallTRowsPerBlock, "small-T rows/block mismatch");
+    constexpr int kVecsPerCol = KSlice / 8;
+
+    __shared__ __align__(16) __nv_bfloat16 x_sh[TokenTile][KSlice];
+
+    const int lane   = static_cast<int>(threadIdx.x) & 31;
+    const int warp   = static_cast<int>(threadIdx.x) >> 5;
+    const int token0 = static_cast<int>(blockIdx.z) * TokenTile;
+    const bool active_tile = token0 < t;
+    const int ncols = min(TokenTile, t - token0);
+    const int split = static_cast<int>(blockIdx.y);
+    const int k0    = split * KSlice;
+    auto* x_sh_v    = reinterpret_cast<uint4*>(x_sh);
+
+    if (active_tile) {
+        for (int i = static_cast<int>(threadIdx.x); i < ncols * kVecsPerCol;
+             i += static_cast<int>(blockDim.x)) {
+            const int col = i / kVecsPerCol;
+            const int vec = i - col * kVecsPerCol;
+            x_sh_v[col * kVecsPerCol + vec] =
+                load_vec<uint4>(x + static_cast<std::int64_t>(token0 + col) * kK + k0 + vec * 8);
+        }
+    }
+    __syncthreads();
+
+    const int logical_row = static_cast<int>(blockIdx.x) * RowsPerBlock + warp;
+    if (active_tile && logical_row < kLogicalRows) {
+        const bool is_b = logical_row >= kN;
+        const int row   = is_b ? logical_row - kN : logical_row;
+        const __nv_bfloat16* wrow =
+            (is_b ? b_weight : a_weight) + static_cast<std::int64_t>(row) * kK + k0;
+
+        float acc[TokenTile];
+#pragma unroll
+        for (int tt = 0; tt < TokenTile; ++tt) { acc[tt] = 0.0f; }
+
+        for (int vec = lane; vec < kVecsPerCol; vec += 32) {
+            const uint4 wv   = load_vec<uint4>(wrow + vec * 8);
+            const float2 wf0 = bf16x2_bits_to_float2(wv.x);
+            const float2 wf1 = bf16x2_bits_to_float2(wv.y);
+            const float2 wf2 = bf16x2_bits_to_float2(wv.z);
+            const float2 wf3 = bf16x2_bits_to_float2(wv.w);
+
+#pragma unroll
+            for (int tt = 0; tt < TokenTile; ++tt) {
+                if (tt < ncols) {
+                    const uint4 xv   = x_sh_v[tt * kVecsPerCol + vec];
+                    const float2 xf0 = bf16x2_bits_to_float2(xv.x);
+                    const float2 xf1 = bf16x2_bits_to_float2(xv.y);
+                    const float2 xf2 = bf16x2_bits_to_float2(xv.z);
+                    const float2 xf3 = bf16x2_bits_to_float2(xv.w);
+                    acc[tt]          = fmaf(wf0.x, xf0.x, acc[tt]);
+                    acc[tt]          = fmaf(wf0.y, xf0.y, acc[tt]);
+                    acc[tt]          = fmaf(wf1.x, xf1.x, acc[tt]);
+                    acc[tt]          = fmaf(wf1.y, xf1.y, acc[tt]);
+                    acc[tt]          = fmaf(wf2.x, xf2.x, acc[tt]);
+                    acc[tt]          = fmaf(wf2.y, xf2.y, acc[tt]);
+                    acc[tt]          = fmaf(wf3.x, xf3.x, acc[tt]);
+                    acc[tt]          = fmaf(wf3.y, xf3.y, acc[tt]);
+                }
+            }
+        }
+
+#pragma unroll
+        for (int tt = 0; tt < TokenTile; ++tt) {
+            if (tt < ncols) {
+                float sum = warp_reduce_sum(acc[tt]);
+                if (lane == 0) {
+                    const int token      = token0 + tt;
+                    partial[(static_cast<std::int64_t>(split) * t + token) * kLogicalRows +
+                            logical_row] = sum;
+                }
+            }
+        }
+    }
+
+    cooperative_groups::this_grid().sync();
+
+    const int block_linear = (static_cast<int>(blockIdx.z) * static_cast<int>(gridDim.y) +
+                              static_cast<int>(blockIdx.y)) *
+                                 static_cast<int>(gridDim.x) +
+                             static_cast<int>(blockIdx.x);
+    const int grid_threads = static_cast<int>(gridDim.x) * static_cast<int>(gridDim.y) *
+                             static_cast<int>(gridDim.z) * static_cast<int>(blockDim.x);
+    const int elems        = kN * t;
+    for (int i = block_linear * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
+         i < elems; i += grid_threads) {
+        const int row   = i % kN;
+        const int token = i / kN;
+        float acc_a     = 0.0f;
+        float acc_b     = 0.0f;
+#pragma unroll
+        for (int split = 0; split < kSmallTSplits; ++split) {
+            const std::int64_t base = (static_cast<std::int64_t>(split) * t + token) * kLogicalRows;
+            acc_a += partial[base + row];
+            acc_b += partial[base + kN + row];
+        }
+
+        const std::int64_t out_index = static_cast<std::int64_t>(token) * kN + row;
+        const float sp               = softplus(acc_a + dt_bias[row]);
+        g[out_index]                 = -expf(A_log[row]) * sp;
+        beta[out_index]              = sigmoid(acc_b);
+    }
 }
 
 __global__ void bf16_gdn_gating_proj_gemv_kernel(const __nv_bfloat16* x,
@@ -377,6 +495,47 @@ void bf16_gdn_gating_proj_small_t_split10_launch(const Tensor& x, const Weight& 
         static_cast<const float*>(workspace), static_cast<const float*>(A_log.data),
         static_cast<const float*>(dt_bias.data), static_cast<float*>(g.data),
         static_cast<float*>(beta.data), t);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void bf16_gdn_gating_proj_small_t_fused_launch(const Tensor& x, const Weight& a_weight,
+                                               const Weight& b_weight, const Tensor& A_log,
+                                               const Tensor& dt_bias, void* workspace,
+                                               std::size_t workspace_bytes, Tensor& g,
+                                               Tensor& beta, cudaStream_t stream) {
+    require_shape(a_weight, "a_weight");
+    require_shape(b_weight, "b_weight");
+    const std::int32_t t       = x.ne[1];
+    const std::size_t required = static_cast<std::size_t>(kSmallTSplits) *
+                                 static_cast<std::size_t>(t) *
+                                 static_cast<std::size_t>(kLogicalRows) * sizeof(float);
+    if (workspace == nullptr || workspace_bytes < required) {
+        throw std::invalid_argument("gdn_gating_proj: small-T fused workspace is too small");
+    }
+
+    // The 27B grid is 24 row blocks x 10 K splits = 240 CTAs of 128 threads. The kernel needs
+    // 8 KiB of static shared memory and no dynamic shared memory, so 4+ CTAs/SM resident is the
+    // binding constraint; 240 CTAs fit 170 SMs with wide margin at any register count ptxas
+    // picks for 128-thread blocks.
+    dim3 block(kSmallTThreads);
+    dim3 grid(div_up(kLogicalRows, kSmallTRowsPerBlock), kSmallTSplits, div_up(t, kSmallTMax));
+    cudaLaunchConfig_t config{};
+    config.gridDim          = grid;
+    config.blockDim         = block;
+    config.stream           = stream;
+    cudaLaunchAttribute cooperative{};
+    cooperative.id              = cudaLaunchAttributeCooperative;
+    cooperative.val.cooperative = 1;
+    config.attrs                = &cooperative;
+    config.numAttrs             = 1;
+    CUDA_CHECK(cudaLaunchKernelEx(
+        &config,
+        bf16_gdn_gating_proj_small_t_fused_kernel<kSmallTMax, kSmallTKSlice, kSmallTRowsPerBlock>,
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const __nv_bfloat16*>(a_weight.qdata),
+        static_cast<const __nv_bfloat16*>(b_weight.qdata), static_cast<float*>(workspace),
+        static_cast<const float*>(A_log.data), static_cast<const float*>(dt_bias.data),
+        static_cast<float*>(g.data), static_cast<float*>(beta.data), t));
     CUDA_CHECK(cudaGetLastError());
 }
 
