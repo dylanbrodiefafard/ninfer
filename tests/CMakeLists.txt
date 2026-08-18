@@ -75,6 +75,26 @@ target_include_directories(ninfer_sampling_defaults_test PRIVATE
 ninfer_add_test(ninfer_kv_cache_test
   SOURCES test_kv_cache.cpp
   LIBRARIES ninfer_core)
+ninfer_add_test(ninfer_kv_ram_cache_test
+  SOURCES test_kv_ram_cache.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_kv_ram_cache_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+ninfer_add_test(ninfer_kv_ram_cache_perf_test
+  SOURCES test_kv_ram_cache_perf.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_kv_ram_cache_perf_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+ninfer_add_test(ninfer_kv_ram_cache_opt_test
+  SOURCES test_kv_ram_cache_opt.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_kv_ram_cache_opt_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+ninfer_add_test(ninfer_kv_ram_cache_large_test
+  SOURCES test_kv_ram_cache_large.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_kv_ram_cache_large_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 ninfer_add_test(ninfer_state_store_test
   SOURCES test_state_store.cpp
   LIBRARIES ninfer_core)
@@ -88,6 +108,10 @@ set_tests_properties(
   ninfer_arena_test
   ninfer_request_memory_test
   ninfer_kv_cache_test
+  ninfer_kv_ram_cache_test
+  ninfer_kv_ram_cache_perf_test
+  ninfer_kv_ram_cache_opt_test
+  ninfer_kv_ram_cache_large_test
   ninfer_state_store_test
   PROPERTIES SKIP_RETURN_CODE 77)
 # Family frontend and one opt-in real-artifact prefix/MTP integration test.
@@ -107,6 +131,10 @@ ninfer_add_test(ninfer_qwen3_6_27b_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_prefix_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_27b_prefix_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_6_27b_ram_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_ram_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_6_27b_ram_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_27b_load_plan_test
   SOURCES targets/qwen3_6_27b/test_load_plan.cpp
   NEEDS_SOURCE_DIR
@@ -120,6 +148,10 @@ ninfer_add_test(ninfer_qwen3_6_35b_a3b_real_test
   SOURCES targets/qwen3_6_35b_a3b/test_engine_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_35b_a3b_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_6_35b_a3b_ram_real_test
+  SOURCES targets/qwen3_6_35b_a3b/test_engine_ram_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_6_35b_a3b_ram_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_35b_a3b_dflash_real_test
   SOURCES targets/qwen3_6_35b_a3b/test_engine_dflash_real.cpp
   LIBRARIES ninfer_engine)
