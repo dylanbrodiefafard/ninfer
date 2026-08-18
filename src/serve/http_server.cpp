@@ -340,17 +340,10 @@ void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) 
 }
 
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {
-    const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
-    if (id != public_model_id_) {
-        ApiError error;
-        error.status  = 404;
-        error.type    = "invalid_request_error";
-        error.code    = "model_not_found";
-        error.message = "model '" + id + "' not found";
-        write_error(res, error);
-        return;
-    }
-    res.set_content(make_model_object(public_model_id_, unix_time_now()), "application/json");
+    const std::string id = req.matches.size() > 1 ? req.matches[1].str() : public_model_id_;
+    // Single-resident-model server: any requested identifier resolves to the one resident
+    // model (llama.cpp-compatible); the echoed id is the requested one.
+    res.set_content(make_model_object(id, unix_time_now()), "application/json");
 }
 
 void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
@@ -370,14 +363,10 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
         request                   = parse_chat_completion_request(body, limits);
-        if (request.model != public_model_id_) {
-            ApiError error;
-            error.status  = 404;
-            error.type    = "invalid_request_error";
-            error.code    = "model_not_found";
-            error.message = "model '" + request.model + "' not found";
-            throw ApiException(std::move(error));
-        }
+        // Single-resident-model server: the OpenAI `model` field is informational only. Any
+        // identifier is accepted, served by the one resident model, and echoed back on the
+        // wire (llama.cpp-compatible); it never selects a model. This lets front-ends (LiteLLM,
+        // Open WebUI) route aliases such as `remote-research` at the `coding` engine unchanged.
     } catch (const ApiException& e) {
         write_error(res, e.error());
         return;

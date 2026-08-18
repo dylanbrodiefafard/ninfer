@@ -83,8 +83,10 @@ The endpoint supports:
 - the `enable_thinking` extension;
 - `chat_template_kwargs.preserve_thinking` and the top-level `preserve_thinking` alias.
 
-The request `model` must equal the public model ID: the artifact `identity.model_id` by default, or
-the explicit `--model-id` override. Reasoning is returned separately as `reasoning_content`; answer
+The request `model` is informational: NInfer runs one resident model, so it serves that model
+regardless of the identifier and echoes the requested value back (llama.cpp-compatible). The
+advertised alias is the artifact `identity.model_id` by default, or the explicit `--model-id`
+override. Reasoning is returned separately as `reasoning_content`; answer
 text remains in `content`.
 
 Message roles retain their input order through schema translation. The Qwen family frontend maps
@@ -192,7 +194,7 @@ wire response contains typed `output` Items.
 
 | Field | NInfer Responses Core contract |
 |---|---|
-| `model` | required non-empty string; must equal the artifact-derived public model ID or explicit `--model-id` override |
+| `model` | required non-empty string; informational — served by the one resident model and echoed back |
 | `input` | required string or non-empty typed Item array |
 | `instructions` | optional string, inserted before the reconstructed conversation for this request only |
 | `previous_response_id` | optional ID of a retained local Response |
