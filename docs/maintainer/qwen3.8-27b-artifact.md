@@ -1,8 +1,8 @@
 # Qwen3.8-27B artifact contract
 
-This document defines the registered `qwen3.8-27b/groupwise-int` artifact: its identity,
-persistent inventory, conversion entry point, and Engine binding. Model mathematics, dimensions,
-frontend semantics, and state behavior are defined by
+This document defines the registered `qwen3.8-27b/groupwise-int` and `qwen3.8-27b/nvfp4`
+artifacts: identity, persistent inventory, conversion entry point, and Engine binding. Model
+mathematics, dimensions, frontend semantics, and state behavior are defined by
 [`qwen3.6-27b-model.md`](qwen3.6-27b-model.md).
 
 ## 1. Identity
@@ -75,9 +75,16 @@ The registered mapping is:
 ArtifactIdentity(qwen3.8-27b, groupwise-int)
     -> WeightsProfile::GroupwiseIntW8Endpoints
     -> target qwen3_8_27b
+
+ArtifactIdentity(qwen3.8-27b, nvfp4)
+    -> WeightsProfile::Nvfp4
+    -> target qwen3_8_27b
 ```
 
-The profile binds the embedding and output head as W8 and the Text body through the groupwise
-binding. Workspace selection follows the groupwise execution routes. The registry constructs the
-27B `LoadedModel`, `SequencePlan`, and `Program`, and reports
-`qwen3_8_27b/qwen3.8-27b/groupwise-int` in the load summary.
+The groupwise profile binds the embedding and output head as W8 and the Text body through the
+groupwise binding. Workspace selection follows the groupwise execution routes. The NVFP4 identity
+reuses the Qwen3.6-27B NVFP4 profile unchanged: that profile already stores the vocabulary
+endpoints as W8, which is the only groupwise difference between the two models, so the object
+layouts are identical. The registry constructs the 27B `LoadedModel`, `SequencePlan`, and
+`Program`, and reports `qwen3_8_27b/qwen3.8-27b/groupwise-int` or
+`qwen3_8_27b/qwen3.8-27b/nvfp4` in the load summary.
