@@ -41,6 +41,11 @@ using Stages4  = Nvfp4W4a4MmaSchedule<48, 64, 256, 3, 4, 4, 2>;
 using M16N64   = Nvfp4W4a4MmaSchedule<16, 64, 256, 1, 4, 2, 4>;
 using M16N32   = Nvfp4W4a4MmaSchedule<16, 32, 256, 1, 4, 2, 4>;
 using M32N64   = Nvfp4W4a4MmaSchedule<32, 64, 256, 2, 4, 2, 2>;
+// MinBlocksPerSm register-cap sweep on the production tile (384 thr/block):
+// 65536/(384*mb) -> m1 no cap, m3 caps ~56 regs (3 blocks/SM), m4 caps ~42 regs (4 blocks/SM).
+using M48N64m1 = Nvfp4W4a4MmaSchedule<48, 64, 256, 3, 4, 2, 1>;
+using M48N64m3 = Nvfp4W4a4MmaSchedule<48, 64, 256, 3, 4, 2, 3>;
+using M48N64m4 = Nvfp4W4a4MmaSchedule<48, 64, 256, 3, 4, 2, 4>;
 
 template <class Schedule>
 struct SwiGluRows {
@@ -80,7 +85,7 @@ struct SwiGluOutput {
     }
 };
 
-template <class Schedule>
+template <class Schedule, Cache WeightCache = Cache::cg>
 void launch_gemm(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace workspace,
                  cudaStream_t stream) {
     constexpr int kPairRows = Schedule::kBlockN / 2;
@@ -90,12 +95,12 @@ void launch_gemm(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace workspace
     const SwiGluOutput output{static_cast<__nv_bfloat16*>(out.data)};
     const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
     nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, SwiGluOutput,
-                          SwiGluRows<Schedule>, true, Cache::cg>
+                          SwiGluRows<Schedule>, true, WeightCache>
         <<<grid, Schedule::kThreads, 0, stream>>>(activation,
-                                                  static_cast<const std::uint8_t*>(weight.qdata),
-                                                  static_cast<const std::uint8_t*>(weight.scales),
-                                                  kT, alpha, Nvfp4IdentityEpilogue{}, output,
-                                                  row_policy);
+                                                   static_cast<const std::uint8_t*>(weight.qdata),
+                                                   static_cast<const std::uint8_t*>(weight.scales),
+                                                   kT, alpha, Nvfp4IdentityEpilogue{}, output,
+                                                   row_policy);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -170,6 +175,9 @@ int main() {
             {"M16N64_s2_cg", false, &launch_named<M16N64>},
             {"M16N32_s2_cg", false, &launch_named<M16N32>},
             {"M32N64_s2_cg", false, &launch_named<M32N64>},
+            {"M48N64_m1_cg", false, &launch_named<M48N64m1>},
+            {"M48N64_m3_cg", false, &launch_named<M48N64m3>},
+            {"M48N64_m4_cg", false, &launch_named<M48N64m4>},
         };
 
         std::printf("W4A4 SwiGLU T=4 tile/stage sweep  (DRAM floor %.1f us, %.0f MB)\n",

@@ -59,6 +59,32 @@ using SharedPh =
     Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::SharedPhase,
                         Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
                         Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
+// Register-cap sweep on the production schedule (PhaseUnroll=4, 128 thr): MinBlocksPerSm
+// caps regs at 65536/(128*mb) -> 4/5/6/8/10/12 blocks per SM (33/42/50/67/83/100% warp occ).
+using ProdMb4  =
+    Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::TokenPacked,
+                        Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 4,
+                        Nvfp4SmallTBlockOrder::RowsContiguous, 4>;
+using ProdMb5  =
+    Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::TokenPacked,
+                        Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 4,
+                        Nvfp4SmallTBlockOrder::RowsContiguous, 5>;
+using ProdMb6  =
+    Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::TokenPacked,
+                        Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 4,
+                        Nvfp4SmallTBlockOrder::RowsContiguous, 6>;
+using ProdMb8  =
+    Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::TokenPacked,
+                        Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 4,
+                        Nvfp4SmallTBlockOrder::RowsContiguous, 8>;
+using ProdMb10 =
+    Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::TokenPacked,
+                        Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 4,
+                        Nvfp4SmallTBlockOrder::RowsContiguous, 10>;
+using ProdMb12 =
+    Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::TokenPacked,
+                        Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 4,
+                        Nvfp4SmallTBlockOrder::RowsContiguous, 12>;
 
 using LaunchFn = void (*)(const __nv_bfloat16*, const std::uint8_t*, const std::uint8_t*, float,
                           __nv_bfloat16*, cudaStream_t);
@@ -82,6 +108,12 @@ const Candidate kCandidates[] = {
     {"chains2", &launch_sched<Chains2>},
     {"shared", &launch_sched<SharedPh>},
     {"ch2_u4", &launch_sched<Chains2Unroll4>},
+    {"mb4", &launch_sched<ProdMb4>},
+    {"mb5", &launch_sched<ProdMb5>},
+    {"mb6", &launch_sched<ProdMb6>},
+    {"mb8", &launch_sched<ProdMb8>},
+    {"mb10", &launch_sched<ProdMb10>},
+    {"mb12", &launch_sched<ProdMb12>},
 };
 
 struct Cmp {
