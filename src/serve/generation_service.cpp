@@ -444,6 +444,8 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         std::max(0.0, result.timings.first_token_seconds - result.timings.prepare_seconds);
     outcome.metrics.vision_seconds  = result.timings.vision_seconds;
     outcome.metrics.prefill_seconds = result.timings.prefill_seconds;
+    outcome.metrics.prefill_tail_tok_s    = result.timings.prefill_tail_tok_s;
+    outcome.metrics.prefill_tail_window_s = result.timings.prefill_tail_window_s;
     outcome.metrics.decode_seconds  = result.timings.decode_seconds;
     outcome.metrics.total_seconds =
         prepared.prepare_seconds +

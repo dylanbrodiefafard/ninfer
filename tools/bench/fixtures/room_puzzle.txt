@@ -1,0 +1,7 @@
+Imagine a 3x3 grid of rooms. You start in the Center room.  
+  
+1.  You move North, then East, then pick up a 'Gold Key'.  
+      
+2.  You move South twice, then West once. You drop the 'Gold Key' and pick up a 'Silver Map'.  
+      
+3.  You move North once and East once. Where are you currently located relative to your starting position, and what items are in which rooms? Trace your steps clearly.

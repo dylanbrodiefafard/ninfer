@@ -165,3 +165,46 @@ python3 tools/bench/run_serve_concurrency.py \
 Use `--kv-capacity auto` when the fixed corpus needs more shared KV than the default 262,144-token
 pool. A point is intentionally not resumable: combining fragments from separate server processes
 would not preserve either a steady interval or one continuous makespan.
+
+## Speed suite (live-serve scenario matrix)
+
+`run_speed_suite.py` is the **fast-iteration** tool: it hits the *already-running* serve
+(default `http://127.0.0.1:8081`) — no engine spawn, restart, or reconfiguration — and reports,
+per scenario, prefill tok/s, decode tok/s, time-to-first-token, end-to-end wall, MTP draft
+accept, and an output hash. Unlike the offline `ninfer_bench` matrix above, it measures the
+production serve path and is the right instrument for watching a branch while you edit kernels.
+
+Scenario matrix lives in [`speed_suite_cases.json`](speed_suite_cases.json); fixtures resolve
+relative to the repo root (NIAH / chat-history from `examples/cli/messages/`, the OWUI capture and
+room-puzzle prompt from `tools/bench/fixtures/`). Add your own realistic prompts there as inline
+`prompt` text or committed JSON/`prompt_file` fixtures. Prefill is reported two ways:
+`prefill_tok_s` (overall average: tokens / wall prefill time) and `prefill_tail_tok_s`
+(steady-state rate over the trailing ≤1 s of prefill — the number your kernel work moves; for
+long-context prefill the tail is slower than the average because attention cost grows with
+depth). Both come from the server's `timings` block; the tail requires the current engine build.
+
+```bash
+# Full base set (small ± thinking, multi-turn, tools, 8k/64k NIAH, decode). ~2 min.
+python3 tools/bench/run_speed_suite.py --label LABEL --runs 2 --warmup 1
+
+# Fast subset while iterating:  --suite smoke,small,multiturn
+# Long-context 128k point:      --include-slow
+# Production prefix-reuse-on:   --no-cache-bust   (on by default so identical prompts refetch)
+# Server-side TTFT only:        --no-stream
+```
+
+Outputs land under `profiles/bench/speed-suite/` (gitignored): a per-run JSON
+(`speed-suite-LABEL.json`, per-case aggregates) and a publishable one-row-per-case CSV
+(`speed-suite-LABEL.csv`) for the progress doc / cross-branch diff. Metrics read the server's
+llama.cpp-style `timings` block, so no extra instrumentation is needed.
+
+**Trials:** `--runs N` repeats each case N times *in one session* (mean/median/min/max reported).
+For *independent* trials — cold vs warm start, thermal drift, minutes apart, or a different
+branch/build — run the script N times with N `--label`s and aggregate the per-label JSONs; the
+two are different claims, so keep them separate.
+
+Baseline (RTX 5090, 2026-08-17, MTP3 + lm-head-draft, INT8 KV): prefill ~10.3–10.7k tok/s at
+6–8k context but ~5.9k average / **~3.6k steady-state tail** at 64k (attention cost grows with
+depth — the tail is the more actionable number, TTFT ~11s); decode ~162–180 thinking /
+~138–262 no-thinking. The 64k NIAH case is in the base set precisely because the long-context
+prefill regression it exposes is invisible at 8k.

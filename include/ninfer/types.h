@@ -342,6 +342,12 @@ struct GenerationTimings {
     double prefill_seconds     = 0.0;
     double decode_seconds      = 0.0;
     double total_seconds       = 0.0;
+    // Prefill throughput over the trailing window (<= 1s) of prefill execution, i.e. the
+    // steady-state rate once warm. Degenerates to the overall prefill average when the
+    // prefill is shorter than the window. 0 when prefill did not process prompt tokens
+    // (fully reused prefix).
+    double prefill_tail_tok_s     = 0.0;
+    double prefill_tail_window_s  = 0.0;
 };
 
 struct SpeculativeStats {

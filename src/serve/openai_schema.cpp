@@ -487,6 +487,8 @@ Json timings_to_json(const CompletionTimings& timings) {
                 {"prompt_ms", timings.prompt_ms},
                 {"prompt_per_token_ms", timings.prompt_per_token_ms},
                 {"prompt_per_second", timings.prompt_per_second},
+                {"prefill_tail_tok_s", timings.prefill_tail_tok_s},
+                {"prefill_tail_window_s", timings.prefill_tail_window_s},
                 {"predicted_n", timings.predicted_n},
                 {"predicted_ms", timings.predicted_ms},
                 {"predicted_per_token_ms", timings.predicted_per_token_ms},
@@ -531,13 +533,17 @@ Json usage_to_json(const CompletionUsage& usage, const CompletionTimings* timing
 
 CompletionTimings make_completion_timings(int prompt_tokens, int completion_tokens,
                                           double prefill_seconds, double decode_seconds,
-                                          int draft_n, int draft_n_accepted) {
+                                          int draft_n, int draft_n_accepted,
+                                          double prefill_tail_tok_s,
+                                          double prefill_tail_window_s) {
     CompletionTimings out;
     out.prompt_n            = prompt_tokens;
     out.prompt_ms           = prefill_seconds * 1000.0;
     out.prompt_per_token_ms = prompt_tokens > 0 ? out.prompt_ms / prompt_tokens : 0.0;
     out.prompt_per_second =
         prefill_seconds > 0.0 ? static_cast<double>(prompt_tokens) / prefill_seconds : 0.0;
+    out.prefill_tail_tok_s    = prefill_tail_tok_s;
+    out.prefill_tail_window_s = prefill_tail_window_s;
     out.predicted_n  = completion_tokens;
     out.predicted_ms = decode_seconds * 1000.0;
     // Match NInfer/llama.cpp decode accounting: first token is attributed to prefill/TTFT.

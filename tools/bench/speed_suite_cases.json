@@ -1,0 +1,87 @@
+{
+ "schema": 1,
+ "comment": "Speed-suite scenarios. Fixture refs are repo-root-relative (absolute paths also work; bare names fall back to tools/bench/fixtures/). A case body is one of: prompt (inline user text), prompt_file (text file), messages (full chat list), or fixture (chat-completion body or message-list JSON). 'slow' cases need --include-slow. NIAH 256k-char fixture (~270k tokens) exceeds the current 262k max-context; add it as a slow case once ctx is bumped.",
+ "cases": [
+  {
+   "id": "smoke",
+   "suite": "smoke",
+   "thinking": false,
+   "max_tokens": 8,
+   "prompt": "Reply with exactly: OK",
+   "desc": "Sanity: trivial prompt, thinking off, 8 tokens"
+  },
+  {
+   "id": "small_think",
+   "suite": "small",
+   "thinking": true,
+   "max_tokens": 512,
+   "prompt_file": "tools/bench/fixtures/room_puzzle.txt",
+   "desc": "~150-token room puzzle, thinking on, decode-heavy"
+  },
+  {
+   "id": "small_nothink",
+   "suite": "small",
+   "thinking": false,
+   "max_tokens": 256,
+   "prompt_file": "tools/bench/fixtures/room_puzzle.txt",
+   "desc": "Same room puzzle, thinking off"
+  },
+  {
+   "id": "multiturn_chat",
+   "suite": "multiturn",
+   "thinking": false,
+   "max_tokens": 128,
+   "fixture": "examples/cli/messages/text_chat_history.json",
+   "desc": "Committed 4-message chat-history fixture, thinking off"
+  },
+  {
+   "id": "tools_owui",
+   "suite": "tools",
+   "thinking": true,
+   "max_tokens": 512,
+   "fixture": "tools/bench/fixtures/owui_room_puzzle.json",
+   "desc": "OWUI-shaped system + 32 tools (~6k prompt tokens), thinking on"
+  },
+  {
+   "id": "context_8k",
+   "suite": "context",
+   "thinking": false,
+   "max_tokens": 64,
+   "fixture": "examples/cli/messages/long_niah_8k.json",
+   "desc": "8k-token NIAH fixture, thinking off, prefill-bound"
+  },
+  {
+   "id": "context_64k",
+   "suite": "context",
+   "thinking": false,
+   "max_tokens": 64,
+   "fixture": "examples/cli/messages/long_niah_64k.json",
+   "desc": "64k-token NIAH fixture (~64.5k prompt tokens), thinking off; long-context regression catch (base set)"
+  },
+  {
+   "id": "decode_think",
+   "suite": "decode",
+   "thinking": true,
+   "max_tokens": 1024,
+   "prompt": "Write a short haiku about a GPU doing matrix multiplications at 3am.",
+   "desc": "Small prompt, thinking on, long generation"
+  },
+  {
+   "id": "decode_nothink",
+   "suite": "decode",
+   "thinking": false,
+   "max_tokens": 512,
+   "prompt": "Explain how a paged KV cache works in a few sentences.",
+   "desc": "Small prompt, thinking off, long generation"
+  },
+  {
+   "id": "context_128k",
+   "suite": "context",
+   "thinking": false,
+   "max_tokens": 64,
+   "slow": true,
+   "fixture": "examples/cli/messages/long_niah_128k.json",
+   "desc": "128k-char NIAH fixture (~140k prompt tokens); --include-slow only"
+  }
+ ]
+}

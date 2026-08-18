@@ -1502,6 +1502,35 @@ void ProgramImplCore::validate_licensed_tokens(std::span<const TokenId> tokens) 
     }
 }
 
+// Throughput over the trailing window (<= 1s) of staged prefill step records: the
+// steady-state prefill rate once warm. When the whole prefill is shorter than the window,
+// the window degenerates to the full prefill (the overall average). Zero-token steps
+// (fully reused prefixes) contribute time but no tokens.
+static void prefill_tail_rate(const std::vector<std::uint32_t>& step_tokens,
+                              const std::vector<double>& step_seconds, double& tail_tok_s,
+                              double& tail_window_s) {
+    tail_tok_s = 0.0;
+    tail_window_s = 0.0;
+    if (step_tokens.empty() || step_tokens.size() != step_seconds.size()) { return; }
+    double total_seconds = 0.0;
+    for (const double seconds : step_seconds) { total_seconds += seconds; }
+    if (total_seconds <= 0.0) { return; }
+    const double window = std::min(1.0, total_seconds);
+    double window_elapsed = 0.0;
+    std::uint64_t window_tokens = 0;
+    for (std::size_t i = step_tokens.size(); i-- > 0;) {
+        const double seconds = step_seconds[i];
+        const double take    = std::min(seconds, window - window_elapsed);
+        if (take <= 0.0) { break; }
+        const double fraction = seconds > 0.0 ? take / seconds : 0.0;
+        window_tokens +=
+            static_cast<std::uint64_t>(static_cast<double>(step_tokens[i]) * fraction + 0.5);
+        window_elapsed += take;
+    }
+    tail_window_s = window_elapsed;
+    tail_tok_s = window_elapsed > 0.0 ? static_cast<double>(window_tokens) / window_elapsed : 0.0;
+}
+
 runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& sequence,
                                                             RequestControl& request) {
     if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) {
@@ -1606,8 +1635,11 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 if (staged.cursor == staged.prompt_tokens) {
                     throw std::logic_error("staged prefill reached the prompt without sampling");
                 }
-                staged.elapsed_seconds +=
+                const double step_seconds =
                     std::chrono::duration<double>(Clock::now() - started).count();
+                staged.elapsed_seconds += step_seconds;
+                staged.step_tokens.push_back(processed_prompt_tokens);
+                staged.step_seconds.push_back(step_seconds);
                 return runtime::PrefillStepResult{.summary = summary,
                                                   .processed_prompt_tokens =
                                                       processed_prompt_tokens,
@@ -1652,7 +1684,11 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                                        cudaMemcpyDeviceToHost, device.stream));
         }
         device.synchronize();
-        staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
+        const double final_step_seconds =
+            std::chrono::duration<double>(Clock::now() - started).count();
+        staged.elapsed_seconds += final_step_seconds;
+        staged.step_tokens.push_back(processed_prompt_tokens);
+        staged.step_seconds.push_back(final_step_seconds);
         const double vision_seconds = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
         const std::optional<RewriteCheckpointSpec> rewrite_checkpoint_capture =
             staged.rewrite_checkpoint_capture;
@@ -1679,6 +1715,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         sequence.tail_hidden_valid      = true;
         request.timings.vision_seconds  = vision_seconds;
         request.timings.prefill_seconds = std::max(0.0, staged.elapsed_seconds - vision_seconds);
+        prefill_tail_rate(staged.step_tokens, staged.step_seconds,
+                          request.timings.prefill_tail_tok_s,
+                          request.timings.prefill_tail_window_s);
         if (rewrite_checkpoint_capture) {
             const std::uint32_t frontier = rewrite_checkpoint_capture->frontier;
             if (frontier == 0 || frontier > prompt_tokens || sequence.text_kv_valid < frontier) {
