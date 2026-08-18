@@ -33,7 +33,10 @@ struct Options {
     bool norm_control          = false;
     bool auto_route            = true;
     bool composed_norm_control = false;
+    bool bitexact              = false;
     ops::detail::Bf16GdnGatingScheduleId candidate =
+        ops::detail::Bf16GdnGatingScheduleId::SimtWarpRowC4;
+    ops::detail::Bf16GdnGatingScheduleId bitexact_candidate =
         ops::detail::Bf16GdnGatingScheduleId::SimtWarpRowC4;
     std::vector<std::int32_t> tokens{1, 2, 4, 6, 8, 9, 16, 32, 64, 128, 256, 512, 1024};
     int warmup              = 8;
@@ -110,7 +113,14 @@ ops::detail::Bf16GdnGatingScheduleId parse_candidate(std::string_view raw) {
     if (raw == "mma-split4") { return S::MmaCooperativeSplit4; }
     if (raw == "mma-split2") { return S::MmaCooperativeSplit2; }
     if (raw == "mma-unsplit") { return S::MmaUnsplit; }
+    if (raw == "small-t-split10") { return S::SmallTSplit10; }
+    if (raw == "small-t-fused") { return S::SmallTFusedCooperative; }
     throw std::invalid_argument("unknown candidate: " + std::string(raw));
+}
+
+bool candidate_is_27b(const ops::detail::Bf16GdnGatingScheduleId candidate) {
+    using S = ops::detail::Bf16GdnGatingScheduleId;
+    return candidate == S::SmallTSplit10 || candidate == S::SmallTFusedCooperative;
 }
 
 Options parse_args(int argc, char** argv) {
@@ -131,6 +141,10 @@ Options parse_args(int argc, char** argv) {
             if (!opt.auto_route && !opt.composed_norm_control) {
                 opt.candidate = parse_candidate(raw);
             }
+        } else if (!std::strcmp(argv[i], "--bitexact")) {
+            const std::string_view raw = next("bitexact");
+            opt.bitexact               = true;
+            opt.bitexact_candidate     = parse_candidate(raw);
         } else if (!std::strcmp(argv[i], "-p") || !std::strcmp(argv[i], "--tokens")) {
             opt.tokens = parse_tokens(next("tokens"));
         } else if (!std::strcmp(argv[i], "--warmup")) {
@@ -144,7 +158,9 @@ Options parse_args(int argc, char** argv) {
         } else if (!std::strcmp(argv[i], "--help") || !std::strcmp(argv[i], "-h")) {
             std::printf("usage: %s [--35b] [--norm-control] "
                         "[--candidate auto|composed|simt-c4|simt-c8|mma-split32|"
-                        "mma-split16|mma-split8|mma-split4|mma-split2|mma-unsplit] "
+                        "mma-split16|mma-split8|mma-split4|mma-split2|mma-unsplit|"
+                        "small-t-split10|small-t-fused] "
+                        "[--bitexact <candidate>] "
                         "[-p 1,2,...] [--warmup N] [--repeat N] [--flush-mib N]\n",
                         argv[0]);
             std::exit(0);
@@ -152,8 +168,21 @@ Options parse_args(int argc, char** argv) {
             throw std::invalid_argument("unknown argument: " + std::string(argv[i]));
         }
     }
-    if (!opt.geometry35 && !opt.auto_route) {
-        throw std::invalid_argument("fixed candidate screening is supported only for --35b");
+    if (!opt.auto_route && !opt.composed_norm_control) {
+        if (opt.geometry35 && candidate_is_27b(opt.candidate)) {
+            throw std::invalid_argument("27B small-T candidates require the default 27B geometry");
+        }
+        if (!opt.geometry35 && !candidate_is_27b(opt.candidate)) {
+            throw std::invalid_argument("fixed candidate screening is supported only for --35b");
+        }
+    }
+    if (opt.bitexact) {
+        if (opt.geometry35 && candidate_is_27b(opt.bitexact_candidate)) {
+            throw std::invalid_argument("27B small-T bitexact checks require the default 27B geometry");
+        }
+        if (!opt.geometry35 && !candidate_is_27b(opt.bitexact_candidate)) {
+            throw std::invalid_argument("27B bitexact checks support only small-T candidates");
+        }
     }
     if (opt.norm_control && !opt.auto_route && !opt.composed_norm_control) {
         throw std::invalid_argument("--norm-control supports only --candidate auto or composed");
@@ -167,7 +196,7 @@ Options parse_args(int argc, char** argv) {
     return opt;
 }
 
-void run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
+bool run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
          DeviceBuffer& flush) {
     const std::int32_t heads  = opt.geometry35 ? 32 : 48;
     const std::int32_t hidden = opt.geometry35 ? 2048 : 5120;
@@ -250,19 +279,54 @@ void run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
     }
     const double useful_gbs = useful_bytes / sec / 1e9;
 
-    const char* route =
+const char* route =
         opt.norm_control
             ? (opt.composed_norm_control
                    ? "gdn_norm_gating_proj.bf16.composed_control"
                    : ops::detail::bf16_gdn_norm_gating_schedule_name(norm_plan.schedule))
             : ops::detail::bf16_gdn_gating_schedule_name(plan.schedule);
     const std::size_t reported_workspace = opt.norm_control && !opt.composed_norm_control
-                                               ? norm_plan.workspace_bytes
-                                               : plan.workspace_bytes;
-    std::printf("%s,%s,%d,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%zu\n", opt.geometry35 ? "35b" : "27b",
+                                                ? norm_plan.workspace_bytes
+                                                : plan.workspace_bytes;
+
+    char bitexact[16] = "-";
+    bool bitexact_ok  = true;
+    if (opt.bitexact) {
+        DeviceBuffer a_g     = make_zeros(out_elems * sizeof(float));
+        DeviceBuffer a_beta  = make_zeros(out_elems * sizeof(float));
+        DeviceBuffer b_g     = make_zeros(out_elems * sizeof(float));
+        DeviceBuffer b_beta  = make_zeros(out_elems * sizeof(float));
+        Tensor ta_g(a_g.p, DType::FP32, {heads, tokens});
+        Tensor ta_beta(a_beta.p, DType::FP32, {heads, tokens});
+        Tensor tb_g(b_g.p, DType::FP32, {heads, tokens});
+        Tensor tb_beta(b_beta.p, DType::FP32, {heads, tokens});
+        // Reference = the other small-T implementation, so the check is never a candidate
+        // compared against itself (the auto route now resolves to the fused kernel).
+        const ops::detail::Bf16GdnGatingScheduleId reference =
+            opt.bitexact_candidate == ops::detail::Bf16GdnGatingScheduleId::SmallTFusedCooperative
+                ? ops::detail::Bf16GdnGatingScheduleId::SmallTSplit10
+                : ops::detail::Bf16GdnGatingScheduleId::SmallTFusedCooperative;
+        ops::detail::bf16_gdn_gating_execute_candidate(reference, tx, wa, wb, tA_log, tdt_bias, ws,
+                                                       ta_g, ta_beta, 0);
+        ops::detail::bf16_gdn_gating_execute_candidate(opt.bitexact_candidate, tx, wa, wb, tA_log,
+                                                       tdt_bias, ws, tb_g, tb_beta, 0);
+        std::vector<float> ha(out_elems), hb(out_elems);
+        const std::size_t g_bytes = out_elems * sizeof(float);
+        a_g.copy_to_host(ha.data(), g_bytes);
+        b_g.copy_to_host(hb.data(), g_bytes);
+        const bool g_match = std::memcmp(ha.data(), hb.data(), g_bytes) == 0;
+        a_beta.copy_to_host(ha.data(), g_bytes);
+        b_beta.copy_to_host(hb.data(), g_bytes);
+        const bool beta_match = std::memcmp(ha.data(), hb.data(), g_bytes) == 0;
+        bitexact_ok = g_match && beta_match;
+        std::snprintf(bitexact, sizeof(bitexact), "%s", bitexact_ok ? "OK" : "MISMATCH");
+    }
+
+    std::printf("%s,%s,%d,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%zu,%s\n", opt.geometry35 ? "35b" : "27b",
                 opt.norm_control ? "norm_control" : "control", tokens, route, timing.median_us,
                 timing.min_us, timing.p95_us, useful_tflops, executed_tflops, useful_gbs,
-                reported_workspace);
+                reported_workspace, bitexact);
+    return bitexact_ok;
 }
 
 } // namespace
@@ -287,9 +351,12 @@ int main(int argc, char** argv) {
                 : ops::gdn_gating_proj_workspace_capacity_bytes(heads, hidden, min_tokens,
                                                                 max_tokens);
         std::printf("geometry,operation,T,route,median_us,min_us,p95_us,useful_tflops,"
-                    "executed_tflops,useful_gbps,workspace_bytes\n");
-        for (const std::int32_t tokens : opt.tokens) { run(opt, tokens, interval_capacity, flush); }
-        return 0;
+                    "executed_tflops,useful_gbps,workspace_bytes,bitexact\n");
+        bool all_ok = true;
+        for (const std::int32_t tokens : opt.tokens) {
+            all_ok = run(opt, tokens, interval_capacity, flush) && all_ok;
+        }
+        return all_ok ? 0 : 3;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "error: %s\n", error.what());
         return 2;
