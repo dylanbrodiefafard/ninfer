@@ -74,8 +74,11 @@ std::string make_chat_chunk_final(const std::string& id, const std::string& mode
                                   const CompletionUsage* usage = nullptr);
 // Dedicated usage chunk: `choices: []` with the request's token usage. Emitted
 // before [DONE] (and whenever include_usage is requested). Carries llama.cpp-style
-// timings so Open WebUI can populate its info bubble; also nests rates under
-// prompt_tokens_details so LiteLLM's stream usage rebuild still forwards them.
+// timings so Open WebUI can populate its info bubble, including `reuse_source`
+// (`none` / `vram_resident` / `host_ram`). When host KV RAM is enabled, the same
+// live occupancy and D2H/H2D copy times as the serve `[req] done` line are
+// included on `timings` and flattened onto `usage`. Rates and millisecond fields
+// are rounded to three decimal places.
 std::string make_chat_chunk_usage(const std::string& id, const std::string& model,
                                   std::int64_t created, const CompletionUsage& usage,
                                   const CompletionTimings* timings = nullptr);

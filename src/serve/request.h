@@ -68,6 +68,15 @@ struct CompletionTimings {
     double predicted_per_second = 0.0;
     int draft_n                 = 0;
     int draft_n_accepted        = 0;
+    ninfer::PrefixReuseSource prefix_reuse_source = ninfer::PrefixReuseSource::None;
+    std::size_t kv_ram_capacity_bytes = 0;
+    std::size_t kv_ram_used_bytes     = 0;
+    std::size_t kv_ram_entry_count    = 0;
+    std::uint64_t kv_ram_restores     = 0;
+    std::uint64_t kv_ram_evictions    = 0;
+    std::uint64_t kv_ram_drops        = 0;
+    double kv_ram_save_ms             = 0.0;
+    double kv_ram_load_ms             = 0.0;
 };
 
 enum class ContentKind {

@@ -550,6 +550,69 @@ int test_response_serialization() {
     failures += check(j.at("usage").at("prompt_tokens") == 10, "usage prompt_tokens");
     failures += check(j.at("usage").at("completion_tokens") == 3, "usage completion_tokens");
     failures += check(j.at("usage").at("total_tokens") == 13, "usage total_tokens");
+    failures += check(!j.at("usage").contains("prompt_tokens_details"),
+                      "usage without timings still has prompt_tokens_details");
+    failures += check(!j.contains("timings"), "timings present when omitted");
+
+    CompletionTimings timings = make_completion_timings(10, 3, 0.25, 1.0);
+    timings.kv_ram_capacity_bytes = 1048576;
+    timings.kv_ram_used_bytes     = 524288;
+    timings.kv_ram_entry_count    = 1;
+    timings.kv_ram_restores       = 2;
+    timings.kv_ram_evictions      = 0;
+    timings.kv_ram_drops          = 1;
+    timings.kv_ram_save_ms        = 8.0;
+    timings.kv_ram_load_ms        = 14.0;
+    timings.prefix_reuse_source   = ninfer::PrefixReuseSource::HostRam;
+    timings.prompt_per_second     = 12.34567;
+    const Json jt = Json::parse(
+        make_chat_completion_response("id-1", "m", 111, "hello world", "", "stop", usage, &timings));
+    const Json& usage_t   = jt.at("usage");
+    const Json& timings_t = jt.at("timings");
+    failures += check(!usage_t.contains("prompt_tokens_details"),
+                      "usage still nests prompt_tokens_details");
+    failures += check(usage_t.contains("prompt_ms"), "usage omitted flattened prompt_ms");
+    failures += check(usage_t.at("prompt_eval_count") == 10, "usage omitted prompt_eval_count");
+    failures += check(timings_t.at("reuse_source") == "host_ram", "timings reuse_source host_ram");
+    failures += check(usage_t.at("reuse_source") == "host_ram", "usage reuse_source host_ram");
+    failures += check(timings_t.at("prompt_per_second") == 12.346,
+                      "timings rates are not rounded to three decimals");
+    failures += check(usage_t.at("prompt_per_second") == 12.346,
+                      "usage rates are not rounded to three decimals");
+    failures += check(timings_t.at("kv_ram_used_bytes") == 524288, "timings kv_ram_used_bytes");
+    failures += check(timings_t.at("kv_ram_entry_count") == 1, "timings kv_ram_entry_count");
+    failures += check(timings_t.at("kv_ram_restores") == 2, "timings kv_ram_restores");
+    failures += check(timings_t.at("kv_ram_evictions") == 0, "timings kv_ram_evictions");
+    failures += check(timings_t.at("kv_ram_drops") == 1, "timings kv_ram_drops");
+    failures += check(timings_t.at("kv_ram_save_ms") == 8.0, "timings kv_ram_save_ms");
+    failures += check(timings_t.at("kv_ram_load_ms") == 14.0, "timings kv_ram_load_ms");
+    failures += check(!timings_t.contains("kv_ram_capacity_bytes"),
+                      "timings serializes pin capacity");
+    failures += check(usage_t.at("kv_ram_used_bytes") == 524288, "usage kv_ram_used_bytes");
+    failures += check(usage_t.at("kv_ram_entry_count") == 1, "usage kv_ram_entry_count");
+    failures += check(usage_t.at("kv_ram_restores") == 2, "usage kv_ram_restores");
+    failures += check(usage_t.at("kv_ram_evictions") == 0, "usage kv_ram_evictions");
+    failures += check(usage_t.at("kv_ram_drops") == 1, "usage kv_ram_drops");
+    failures += check(usage_t.at("kv_ram_save_ms") == 8.0, "usage kv_ram_save_ms");
+    failures += check(usage_t.at("kv_ram_load_ms") == 14.0, "usage kv_ram_load_ms");
+
+    CompletionTimings zero_timings = make_completion_timings(10, 3, 0.25, 1.0);
+    const Json jz = Json::parse(make_chat_completion_response(
+        "id-1", "m", 111, "hello world", "", "stop", usage, &zero_timings));
+    failures += check(!jz.at("usage").contains("kv_ram_used_bytes"),
+                      "usage emits KV RAM fields when the tier is off");
+    failures += check(!jz.at("timings").contains("kv_ram_used_bytes"),
+                      "timings emit KV RAM fields when the tier is off");
+    failures += check(jz.at("timings").at("reuse_source") == "none",
+                      "timings omit cache-miss reuse_source");
+    failures +=
+        check(jz.at("usage").at("reuse_source") == "none", "usage omits cache-miss reuse_source");
+
+    zero_timings.prefix_reuse_source = ninfer::PrefixReuseSource::VramResident;
+    const Json jv = Json::parse(make_chat_completion_response(
+        "id-1", "m", 111, "hello world", "", "stop", usage, &zero_timings));
+    failures += check(jv.at("timings").at("reuse_source") == "vram_resident",
+                      "timings reuse_source vram_resident");
 
     // Non-empty reasoning is attached as message.reasoning_content, content stays answer-only.
     const Json jr = Json::parse(make_chat_completion_response("id-2", "m", 111, "the answer",
@@ -639,6 +702,26 @@ int test_chunk_serialization() {
     failures +=
         check(usage_chunk.at("usage").at("prompt_tokens") == 2, "usage chunk prompt_tokens");
     failures += check(usage_chunk.at("usage").at("total_tokens") == 7, "usage chunk total");
+
+    CompletionTimings ram_timings = make_completion_timings(2, 5, 0.25, 1.0);
+    ram_timings.kv_ram_capacity_bytes = 1048576;
+    ram_timings.kv_ram_used_bytes     = 524288;
+    ram_timings.kv_ram_entry_count    = 1;
+    ram_timings.kv_ram_restores       = 2;
+    ram_timings.kv_ram_evictions      = 0;
+    ram_timings.kv_ram_drops          = 1;
+    ram_timings.kv_ram_save_ms        = 8.0;
+    ram_timings.kv_ram_load_ms        = 14.0;
+    ram_timings.prefix_reuse_source   = ninfer::PrefixReuseSource::VramResident;
+    const Json ram_chunk = parse_sse(make_chat_chunk_usage("id", "m", 1, usage, &ram_timings));
+    failures += check(!ram_chunk.at("usage").contains("prompt_tokens_details"),
+                      "usage chunk still nests prompt_tokens_details");
+    failures += check(ram_chunk.at("usage").at("kv_ram_used_bytes") == 524288,
+                      "usage chunk kv_ram_used_bytes");
+    failures += check(ram_chunk.at("timings").at("kv_ram_load_ms") == 14.0,
+                      "usage chunk timings kv_ram_load_ms");
+    failures += check(ram_chunk.at("usage").at("reuse_source") == "vram_resident",
+                      "usage chunk reuse_source");
 
     failures += check(sse_done() == "data: [DONE]\n\n", "done sentinel");
     return failures;

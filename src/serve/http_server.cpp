@@ -49,6 +49,25 @@ void set_owned_content(httplib::Response& response, std::string body,
     response.hold_resource(std::move(lifetime));
 }
 
+CompletionTimings completion_timings_from_outcome(const GenerationOutcome& outcome) {
+    CompletionTimings timings = make_completion_timings(
+        outcome.prompt_tokens, outcome.completion_tokens, outcome.metrics.prefill_seconds,
+        outcome.metrics.decode_seconds,
+        static_cast<int>(outcome.metrics.speculative_draft_tokens),
+        static_cast<int>(outcome.metrics.speculative_accepted_tokens),
+        outcome.metrics.prefill_tail_tok_s, outcome.metrics.prefill_tail_window_s);
+    timings.prefix_reuse_source   = outcome.metrics.prefix_reuse_source;
+    timings.kv_ram_capacity_bytes = outcome.metrics.kv_ram_capacity_bytes;
+    timings.kv_ram_used_bytes     = outcome.metrics.kv_ram_used_bytes;
+    timings.kv_ram_entry_count    = outcome.metrics.kv_ram_entry_count;
+    timings.kv_ram_restores       = outcome.metrics.kv_ram_restores;
+    timings.kv_ram_evictions      = outcome.metrics.kv_ram_evictions;
+    timings.kv_ram_drops          = outcome.metrics.kv_ram_drops;
+    timings.kv_ram_save_ms        = outcome.metrics.kv_ram_save_seconds * 1000.0;
+    timings.kv_ram_load_ms        = outcome.metrics.kv_ram_load_seconds * 1000.0;
+    return timings;
+}
+
 void write_error(httplib::Response& res, const ApiError& error) {
     res.status = error.status;
     res.set_content(make_error_body(error), "application/json");
@@ -411,12 +430,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             });
             log_request_done(log_context, outcome);
             const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
-            const CompletionTimings timings = make_completion_timings(
-                outcome.prompt_tokens, outcome.completion_tokens, outcome.metrics.prefill_seconds,
-                outcome.metrics.decode_seconds,
-                static_cast<int>(outcome.metrics.speculative_draft_tokens),
-                static_cast<int>(outcome.metrics.speculative_accepted_tokens),
-                outcome.metrics.prefill_tail_tok_s, outcome.metrics.prefill_tail_window_s);
+            const CompletionTimings timings = completion_timings_from_outcome(outcome);
             std::string response_body;
             if (!outcome.tool_calls.empty()) {
                 response_body = make_chat_completion_tool_response(
@@ -474,12 +488,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
                 const GenerationOutcome outcome = service_->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
-                const CompletionTimings timings = make_completion_timings(
-                    outcome.prompt_tokens, outcome.completion_tokens,
-                    outcome.metrics.prefill_seconds, outcome.metrics.decode_seconds,
-                    static_cast<int>(outcome.metrics.speculative_draft_tokens),
-                    static_cast<int>(outcome.metrics.speculative_accepted_tokens),
-                    outcome.metrics.prefill_tail_tok_s, outcome.metrics.prefill_tail_window_s);
+                const CompletionTimings timings = completion_timings_from_outcome(outcome);
                 const std::string_view remaining = unstreamed_content(outcome);
                 if (!outcome.tool_calls.empty()) {
                     if (!remaining.empty()) {

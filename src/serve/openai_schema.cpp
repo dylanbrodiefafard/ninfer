@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
@@ -478,33 +479,50 @@ Json tool_calls_json(const std::vector<ToolCall>& tool_calls, bool include_index
 
 std::string sse_event(const Json& payload) { return "data: " + payload.dump() + "\n\n"; }
 
-} // namespace
+double json_decimal3(double value) { return std::round(value * 1000.0) / 1000.0; }
 
-namespace {
+const char* prefix_reuse_source_name(ninfer::PrefixReuseSource source) {
+    switch (source) {
+    case ninfer::PrefixReuseSource::None:
+        return "none";
+    case ninfer::PrefixReuseSource::VramResident:
+        return "vram_resident";
+    case ninfer::PrefixReuseSource::HostRam:
+        return "host_ram";
+    }
+    return "unknown";
+}
 
 Json timings_to_json(const CompletionTimings& timings) {
     Json out = {{"prompt_n", timings.prompt_n},
-                {"prompt_ms", timings.prompt_ms},
-                {"prompt_per_token_ms", timings.prompt_per_token_ms},
-                {"prompt_per_second", timings.prompt_per_second},
-                {"prefill_tail_tok_s", timings.prefill_tail_tok_s},
-                {"prefill_tail_window_s", timings.prefill_tail_window_s},
+                {"prompt_ms", json_decimal3(timings.prompt_ms)},
+                {"prompt_per_token_ms", json_decimal3(timings.prompt_per_token_ms)},
+                {"prompt_per_second", json_decimal3(timings.prompt_per_second)},
+                {"prefill_tail_tok_s", json_decimal3(timings.prefill_tail_tok_s)},
+                {"prefill_tail_window_s", json_decimal3(timings.prefill_tail_window_s)},
                 {"predicted_n", timings.predicted_n},
-                {"predicted_ms", timings.predicted_ms},
-                {"predicted_per_token_ms", timings.predicted_per_token_ms},
-                {"predicted_per_second", timings.predicted_per_second}};
+                {"predicted_ms", json_decimal3(timings.predicted_ms)},
+                {"predicted_per_token_ms", json_decimal3(timings.predicted_per_token_ms)},
+                {"predicted_per_second", json_decimal3(timings.predicted_per_second)},
+                {"reuse_source", prefix_reuse_source_name(timings.prefix_reuse_source)}};
     if (timings.draft_n > 0 || timings.draft_n_accepted > 0) {
         out["draft_n"]          = timings.draft_n;
         out["draft_n_accepted"] = timings.draft_n_accepted;
+    }
+    if (timings.kv_ram_capacity_bytes != 0) {
+        out["kv_ram_used_bytes"]  = timings.kv_ram_used_bytes;
+        out["kv_ram_entry_count"] = timings.kv_ram_entry_count;
+        out["kv_ram_restores"]    = timings.kv_ram_restores;
+        out["kv_ram_evictions"]   = timings.kv_ram_evictions;
+        out["kv_ram_drops"]       = timings.kv_ram_drops;
+        out["kv_ram_save_ms"]     = json_decimal3(timings.kv_ram_save_ms);
+        out["kv_ram_load_ms"]     = json_decimal3(timings.kv_ram_load_ms);
     }
     return out;
 }
 
 // Open WebUI merges top-level `timings` into usage and JSON-stringifies the result.
-// Direct clients see flat llama.cpp / Ollama fields. LiteLLM's stream path drops
-// top-level `timings` and rebuilds usage to token counts only — but it does
-// forward `prompt_tokens_details` from upstream chunks into the final usage
-// object, so nest the same rate fields there for the LiteLLM → OWUI path.
+// Direct clients also see the llama.cpp / Ollama fields flattened onto `usage`.
 Json usage_to_json(const CompletionUsage& usage, const CompletionTimings* timings) {
     Json out = {{"prompt_tokens", usage.prompt_tokens},
                 {"completion_tokens", usage.completion_tokens},
@@ -519,13 +537,6 @@ Json usage_to_json(const CompletionUsage& usage, const CompletionTimings* timing
     out["eval_duration"]        = static_cast<std::int64_t>(timings->predicted_ms * 1.0e6);
     out["total_duration"] =
         static_cast<std::int64_t>((timings->prompt_ms + timings->predicted_ms) * 1.0e6);
-    Json details = t;
-    details["prompt_eval_count"]    = out["prompt_eval_count"];
-    details["eval_count"]           = out["eval_count"];
-    details["prompt_eval_duration"] = out["prompt_eval_duration"];
-    details["eval_duration"]        = out["eval_duration"];
-    details["total_duration"]       = out["total_duration"];
-    out["prompt_tokens_details"]    = std::move(details);
     return out;
 }
 
@@ -779,7 +790,7 @@ std::string make_chat_chunk_final(const std::string& id, const std::string& mode
         {Json{{"index", 0}, {"delta", Json::object()}, {"finish_reason", finish_reason}}});
     // Prefer attaching real usage on the finish chunk. LiteLLM strips mid-stream
     // usage from the wire but keeps it on the in-memory chunk list, then rebuilds
-    // the final usage object — prompt_tokens_details survives that rebuild.
+    // the final usage object from those stored chunks.
     if (usage != nullptr) {
         payload["usage"] = usage_to_json(*usage, timings);
     } else if (include_usage) {
