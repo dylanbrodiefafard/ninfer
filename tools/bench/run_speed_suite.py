@@ -213,6 +213,16 @@ def extract_metrics(resp: dict, extra: dict, streamed: bool) -> dict:
         "accept_rate": (accepted / draft_n) if draft_n > 0 else None,
         "stream": streamed,
     }
+    decode_tok_s = m["decode_tok_s"]
+    # Accept-rate-invariant kernel speed: each MTP verify round emits exactly one
+    # non-drafted token plus the accepted drafts, so rounds = completion - accepted.
+    # (cross-check: rounds * drafts_per_round ~= draft_n). Use this to compare
+    # kernel changes; raw decode_tok_s conflates kernel speed with accept rate.
+    m["verify_rounds_s"] = (
+        (completion - accepted) * decode_tok_s / completion
+        if decode_tok_s and completion > accepted
+        else None
+    )
     m.update(extra)
     if m.get("ttft_ms") is None and not streamed:
         # Server-side proxy for TTFT: first token leaves after prefill.
@@ -231,7 +241,7 @@ def extract_metrics(resp: dict, extra: dict, streamed: bool) -> dict:
     return m
 
 
-AGG_METRICS = ("prefill_tok_s", "prefill_tail_tok_s", "decode_tok_s", "ttft_ms", "wall_s")
+AGG_METRICS = ("prefill_tok_s", "prefill_tail_tok_s", "decode_tok_s", "verify_rounds_s", "ttft_ms", "wall_s")
 
 
 def aggregate(records: list[dict]) -> dict:
@@ -377,6 +387,7 @@ def main() -> int:
         "prefill_tail_tok_s_max", "prefill_tail_window_s_mean",
         "ttft_ms_mean", "ttft_ms_median", "ttft_ms_min", "ttft_ms_max",
         "decode_tok_s_mean", "decode_tok_s_median", "decode_tok_s_min", "decode_tok_s_max",
+        "verify_rounds_s_mean", "verify_rounds_s_median", "verify_rounds_s_min", "verify_rounds_s_max",
         "wall_s_mean", "wall_s_median", "wall_s_min", "wall_s_max",
         "accept_rate_mean", "output_sha",
     ]
@@ -401,7 +412,7 @@ def main() -> int:
             writer.writerow(row)
 
     print(f"\n{'case':<16} {'suite':<10} {'think':<5} {'prompt':>7} {'gen':>6} "
-          f"{'pre-t/s':>8} {'tail-t/s':>9} {'ttft-ms':>8} {'dec-t/s':>8} {'wall-s':>7} {'acc%':>6}")
+          f"{'pre-t/s':>8} {'tail-t/s':>9} {'ttft-ms':>8} {'dec-t/s':>8} {'rounds/s':>8} {'wall-s':>7} {'acc%':>6}")
     for record in report["cases"]:
         agg = record.get("aggregate")
         if not agg:
@@ -413,7 +424,7 @@ def main() -> int:
             f"{str(agg.get('prompt_tokens')):>7} {str(agg.get('completion_tokens')):>6} "
             f"{fmt(agg.get('prefill_tok_s_mean')):>8} {fmt(agg.get('prefill_tail_tok_s_mean')):>9} "
             f"{fmt(agg.get('ttft_ms_mean')):>8} "
-            f"{fmt(agg.get('decode_tok_s_mean')):>8} {fmt(agg.get('wall_s_mean'), 2):>7} "
+            f"{fmt(agg.get('decode_tok_s_mean')):>8} {fmt(agg.get('verify_rounds_s_mean')):>8} {fmt(agg.get('wall_s_mean'), 2):>7} "
             f"{('' if acc is None else f'{100*acc:.0f}'):>6}"
         )
     print(f"\njson: {json_path}\ncsv:  {csv_path}")
