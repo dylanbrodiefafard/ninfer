@@ -31,7 +31,7 @@ struct ServeOptions {
     std::uint32_t max_concurrency          = 1;
     std::uint32_t max_pending_requests     = 16;
     std::uint32_t pending_timeout_ms       = 30000;
-    std::uint32_t prefill_chunk            = 1024;
+    std::uint32_t prefill_chunk            = 4096;
     std::size_t kv_ram_capacity_bytes      = 0;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;

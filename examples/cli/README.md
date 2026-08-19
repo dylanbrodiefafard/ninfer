@@ -99,19 +99,19 @@ NInfer documentation and source excerpts, with four unique records placed across
 
 ```bash
 $CLI "$MODEL" --messages examples/cli/messages/long_8k.json \
-  --max-context 8192 --kv-dtype bf16 --prefill-chunk 1024 \
+  --max-context 8192 --kv-dtype bf16 --prefill-chunk 4096 \
   --no-thinking --greedy --max-new 64
 
 $CLI "$MODEL" --messages examples/cli/messages/long_64k.json \
-  --max-context 65536 --kv-dtype int8 --prefill-chunk 1024 \
+  --max-context 65536 --kv-dtype int8 --prefill-chunk 4096 \
   --no-thinking --greedy --max-new 64
 
 $CLI "$MODEL" --messages examples/cli/messages/long_128k.json \
-  --max-context 131072 --kv-dtype int8 --prefill-chunk 1024 \
+  --max-context 131072 --kv-dtype int8 --prefill-chunk 4096 \
   --no-thinking --greedy --max-new 64
 
 $CLI "$MODEL" --messages examples/cli/messages/long_256k.json \
-  --max-context 262144 --kv-dtype int8 --prefill-chunk 1024 \
+  --max-context 262144 --kv-dtype int8 --prefill-chunk 4096 \
   --no-thinking --greedy --max-new 64
 ```
 

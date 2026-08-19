@@ -173,7 +173,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         metavar="N|auto",
         help="shared Main KV capacity passed to ninfer-serve (default: 262144)",
     )
-    parser.add_argument("--prefill-chunk", type=int, default=1024)
+    parser.add_argument("--prefill-chunk", type=int, default=4096)
     parser.add_argument("--output", type=Path, required=True, help="benchmark output directory")
     parser.add_argument("--port", type=int, default=8080, help="loopback serving port")
     parser.add_argument("--device", type=int, default=0, help="CUDA device index")
