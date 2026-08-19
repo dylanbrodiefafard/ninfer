@@ -213,7 +213,7 @@ int main() {
 
     const auto prompt = text_prompt({1, 2, 3, 4});
     ninfer::targets::qwen3_6::detail::KVRamCache cache(std::max(image_bytes * 4, std::size_t{1} << 20));
-    if (capture_entry(cache, pool, source, prompt, ctx.stream, nullptr, nullptr) != 0) {
+    if (capture_entry(cache, pool, source, prompt, ctx.copy_stream, nullptr, nullptr) != 0) {
         return fail("perf capture failed");
     }
     auto dest = pool.reserve(kPages);
@@ -224,12 +224,12 @@ int main() {
     target.text           = &dest;
     target.text_pool      = &pool;
     target.text_dst_pages = kPages;
-    target.stream         = ctx.stream;
+    target.stream         = ctx.copy_stream;
     cache.claim(match->entry_id);
-    CUDA_CHECK(cudaEventRecord(start, ctx.stream));
+    CUDA_CHECK(cudaEventRecord(start, ctx.copy_stream));
     (void)cache.unpack_device(match->entry_id, target);
     cache.consume(match->entry_id);
-    CUDA_CHECK(cudaEventRecord(stop, ctx.stream));
+    CUDA_CHECK(cudaEventRecord(stop, ctx.copy_stream));
     CUDA_CHECK(cudaEventSynchronize(stop));
     const double restore_ms = elapsed_ms(start, stop);
     const double restore_gbs =
@@ -263,7 +263,7 @@ int main() {
                            cudaMemcpyHostToDevice));
     fill_logical_pages(pool, source, 22);
     ninfer::targets::qwen3_6::detail::KVRamCache gdn_cache(8ULL << 20);
-    if (capture_entry(gdn_cache, pool, source, prompt, ctx.stream, &gdn, &hidden) != 0) {
+    if (capture_entry(gdn_cache, pool, source, prompt, ctx.copy_stream, &gdn, &hidden) != 0) {
         return fail("GDN capture failed");
     }
     auto gdn_dest = pool.reserve(kPages);
@@ -281,7 +281,7 @@ int main() {
     gdn_target.gdn            = &gdn;
     gdn_target.gdn_current_slot = 1;
     gdn_target.tail_hidden    = &hidden_out;
-    gdn_target.stream         = ctx.stream;
+    gdn_target.stream         = ctx.copy_stream;
     gdn_cache.claim(gdn_match->entry_id);
     (void)gdn_cache.unpack_device(gdn_match->entry_id, gdn_target);
     gdn_cache.consume(gdn_match->entry_id);

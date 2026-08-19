@@ -354,6 +354,7 @@ private:
     enum class AdmissionProgress : std::uint8_t {
         None,
         ControlProgress,
+        CopyHold,
         RanGpuUnit,
     };
 
@@ -362,6 +363,28 @@ private:
         bool evict_retained     = false;
         std::uint64_t ram_entry_id = 0;
     };
+
+    struct CopyHold {
+        std::shared_ptr<Request> request;
+        std::uint32_t lane           = 0;
+        Plan plan;
+        bool ram_hit                 = false;
+        std::uint64_t ram_entry_id   = 0;
+        bool ram_claimed             = false;
+        bool ram_consumed            = false;
+        std::vector<std::uint32_t> victim_lanes;
+        bool victims_evicted         = false;
+        bool restored                = false;
+        bool needs_prefill           = false;
+    };
+
+    [[nodiscard]] static bool membership_contains(const RoundMembership& membership,
+                                                  std::uint32_t lane) noexcept {
+        for (std::size_t i = 0; i < membership.size; ++i) {
+            if (membership.lanes[i] == lane) { return true; }
+        }
+        return false;
+    }
 
     void append_output(const std::shared_ptr<Request>& request,
                        targets::qwen3_6::PublishedOutput output) {
@@ -545,6 +568,7 @@ private:
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = slots_[lane];
             if (request == nullptr || !cancelled_at_boundary[lane]) { continue; }
+            if (copy_hold_ && copy_hold_->lane == lane) { drain_copy_hold_before_abort(); }
             instance_.program->abort_lane(lane);
             if (prefill_lane_ && *prefill_lane_ == lane) {
                 instance_.request_memory.deactivate();
@@ -836,6 +860,119 @@ private:
         return AdmissionProgress::ControlProgress;
     }
 
+    void drain_copy_hold_before_abort() noexcept {
+        if (!copy_hold_) { return; }
+        try {
+            instance_.program->synchronize_all();
+        } catch (...) {}
+        try {
+            const auto copies = instance_.program->harvest_kv_ram_copy_seconds();
+            if (copy_hold_->request != nullptr) {
+                copy_hold_->request->kv_ram_save_seconds += copies.save;
+                copy_hold_->request->kv_ram_load_seconds += copies.load;
+            }
+        } catch (...) {}
+        if (copy_hold_->ram_claimed && !copy_hold_->ram_consumed) {
+            try {
+                instance_.program->release_ram_entry(copy_hold_->ram_entry_id);
+            } catch (...) {}
+            copy_hold_->ram_claimed = false;
+        }
+        if (!copy_hold_->victims_evicted) {
+            try {
+                for (const std::uint32_t victim : copy_hold_->victim_lanes) {
+                    instance_.program->evict_retained_lane(victim);
+                    invalidate_lane_plans(victim);
+                }
+            } catch (...) {}
+            copy_hold_->victims_evicted = true;
+        }
+        copy_hold_.reset();
+    }
+
+    [[nodiscard]] AdmissionProgress admit_complete(bool membership_empty) {
+        if (!copy_hold_) { throw std::logic_error("admit-complete requires copy-hold state"); }
+        CopyHold& hold = *copy_hold_;
+        const std::uint32_t lane               = hold.lane;
+        const std::shared_ptr<Request> request = hold.request;
+        const std::uint64_t ram_entry_id       = hold.ram_entry_id;
+        bool ram_claimed                       = hold.ram_claimed;
+        bool ram_consumed                      = hold.ram_consumed;
+        if (request == nullptr || slots_[lane] != request) {
+            throw std::logic_error("copy-hold request is not occupying its lane");
+        }
+
+        auto copies_ready = [&] { return instance_.program->kv_ram_copies_ready(); };
+
+        try {
+            if (!hold.victims_evicted) {
+                if (!copies_ready()) {
+                    if (!membership_empty) { return AdmissionProgress::CopyHold; }
+                    instance_.program->wait_kv_ram_copies();
+                }
+                for (const std::uint32_t victim : hold.victim_lanes) {
+                    instance_.program->evict_retained_lane(victim);
+                    invalidate_lane_plans(victim);
+                }
+                hold.victims_evicted = true;
+            }
+
+            if (hold.ram_hit && !hold.restored) {
+                instance_.program->restore_ram_entry(lane, hold.ram_entry_id, hold.plan);
+                hold.restored = true;
+            }
+
+            if (!copies_ready() && !membership_empty) { return AdmissionProgress::CopyHold; }
+
+            instance_.program->wait_kv_ram_copies_on_compute();
+
+            runtime::TransientRegion transient{};
+            if (hold.needs_prefill) {
+                const RequestPlanSummary summary = hold.plan.summary();
+                instance_.request_memory.activate(summary.transient_bytes,
+                                                  summary.transient_alignment);
+                prefill_lane_ = lane;
+                transient     = instance_.request_memory.region();
+            }
+            const PrefillStepResult first = instance_.program->start_prefill_lane(
+                lane, std::move(request->prompt), std::move(hold.plan), transient);
+            const auto copies = instance_.program->harvest_kv_ram_copy_seconds();
+            request->kv_ram_save_seconds += copies.save;
+            request->kv_ram_load_seconds += copies.load;
+            if (hold.ram_hit) {
+                instance_.program->consume_ram_entry(hold.ram_entry_id);
+                hold.ram_consumed = true;
+                ram_consumed      = true;
+            }
+            if (!first.complete && (!prefill_lane_ || *prefill_lane_ != lane)) {
+                throw std::logic_error("partial prefill did not retain its execution owner");
+            }
+            const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
+            copy_hold_.reset();
+            resolve_prefill_step(request, first, cancel_at_boundary);
+            publish_runtime_stats();
+            return AdmissionProgress::RanGpuUnit;
+        } catch (...) {
+            const std::exception_ptr error = std::current_exception();
+            if (copy_hold_) {
+                drain_copy_hold_before_abort();
+            } else if (ram_claimed && !ram_consumed) {
+                try {
+                    instance_.program->release_ram_entry(ram_entry_id);
+                } catch (...) {}
+            }
+            instance_.program->abort_lane(lane);
+            if (prefill_lane_ && *prefill_lane_ == lane) {
+                instance_.request_memory.deactivate();
+                prefill_lane_.reset();
+            }
+            slots_[lane].reset();
+            invalidate_lane_plans(lane);
+            complete_error(request, error);
+            throw;
+        }
+    }
+
     [[nodiscard]] AdmissionProgress admit_planned_request(const std::shared_ptr<Request>& request,
                                                           LaneChoice choice,
                                                           BackfillClass backfill_class,
@@ -866,30 +1003,35 @@ private:
         }
         Plan& winning_plan = ram_hit ? *request->ram_plan : *request->lane_plans[lane];
 
-        bool ram_claimed   = false;
-        bool ram_consumed  = false;
-        bool target_started = false;
-        if (ram_hit) {
-            instance_.program->claim_ram_entry(choice.ram_entry_id);
-            ram_claimed = true;
-        }
-
+        bool ram_claimed = false;
         auto release_ram_if_needed = [&]() {
-            if (ram_claimed && !ram_consumed) {
-                instance_.program->release_ram_entry(choice.ram_entry_id);
+            if (ram_claimed) {
+                try {
+                    instance_.program->release_ram_entry(choice.ram_entry_id);
+                } catch (...) {}
                 ram_claimed = false;
             }
         };
 
         try {
+            if (ram_hit) {
+                instance_.program->claim_ram_entry(choice.ram_entry_id);
+                ram_claimed = true;
+            }
+            std::vector<std::uint32_t> victims;
             if (choice.evict_retained) {
-                while (!instance_.program->can_admit_lane(lane, winning_plan)) {
+                while (!instance_.program->can_admit_lane_after_releasing(lane, winning_plan,
+                                                                          victims)) {
                     std::optional<std::uint32_t> victim;
                     std::uint64_t victim_tick = 0;
                     for (std::uint32_t retained_lane = 0; retained_lane < max_concurrency_;
                          ++retained_lane) {
                         if (retained_lane == lane || slots_[retained_lane] != nullptr ||
                             !instance_.program->has_retained_lane(retained_lane)) {
+                            continue;
+                        }
+                        if (std::find(victims.begin(), victims.end(), retained_lane) !=
+                            victims.end()) {
                             continue;
                         }
                         const std::uint64_t tick =
@@ -903,14 +1045,16 @@ private:
                         throw std::logic_error("retained eviction did not make admission feasible");
                     }
                     (void)instance_.program->capture_retained_lane(*victim);
-                    instance_.program->evict_retained_lane(*victim);
-                    invalidate_lane_plans(*victim);
+                    victims.push_back(*victim);
                 }
             }
 
-            if (!ram_hit && winning_plan.summary().reusable_prompt_tokens == 0 &&
-                instance_.program->has_retained_lane(lane)) {
+            if (instance_.program->has_retained_lane(lane) &&
+                (ram_hit || winning_plan.summary().reusable_prompt_tokens == 0)) {
                 (void)instance_.program->capture_retained_lane(lane);
+                if (std::find(victims.begin(), victims.end(), lane) == victims.end()) {
+                    victims.push_back(lane);
+                }
             }
 
             Plan selected_plan = std::move(winning_plan);
@@ -950,47 +1094,46 @@ private:
             slots_[lane]                    = request;
             invalidate_lane_plans(lane);
 
-            TransientRegion transient;
-            if (needs_prefill) {
-                instance_.request_memory.activate(summary.transient_bytes,
-                                                  summary.transient_alignment);
-                prefill_lane_ = lane;
-                transient     = instance_.request_memory.region();
-            }
+            copy_hold_.emplace(CopyHold{
+                .request         = request,
+                .lane            = lane,
+                .plan            = std::move(selected_plan),
+                .ram_hit         = ram_hit,
+                .ram_entry_id    = choice.ram_entry_id,
+                .ram_claimed     = ram_claimed,
+                .victim_lanes    = std::move(victims),
+                .needs_prefill   = needs_prefill,
+            });
+            ram_claimed = false;
             publish_runtime_stats();
-            if (ram_hit) {
-                instance_.program->restore_ram_entry(lane, choice.ram_entry_id, selected_plan);
-            }
-            target_started = true;
-            const PrefillStepResult first = instance_.program->start_prefill_lane(
-                lane, std::move(request->prompt), std::move(selected_plan), transient);
-            const auto copies = instance_.program->harvest_kv_ram_copy_seconds();
-            request->kv_ram_save_seconds = copies.save;
-            request->kv_ram_load_seconds = copies.load;
-            if (ram_hit) {
-                instance_.program->consume_ram_entry(choice.ram_entry_id);
-                ram_consumed = true;
-            }
-            if (!first.complete && (!prefill_lane_ || *prefill_lane_ != lane)) {
-                throw std::logic_error("partial prefill did not retain its execution owner");
-            }
-            const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
-            resolve_prefill_step(request, first, cancel_at_boundary);
-            publish_runtime_stats();
-            return AdmissionProgress::RanGpuUnit;
+
+            const bool idle = build_round_membership().empty();
+            if (idle) { return admit_complete(true); }
+            return AdmissionProgress::CopyHold;
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
-            const auto copies              = instance_.program->harvest_kv_ram_copy_seconds();
-            request->kv_ram_save_seconds += copies.save;
-            request->kv_ram_load_seconds += copies.load;
+            try {
+                instance_.program->synchronize_all();
+            } catch (...) {}
+            try {
+                const auto copies = instance_.program->harvest_kv_ram_copy_seconds();
+                request->kv_ram_save_seconds += copies.save;
+                request->kv_ram_load_seconds += copies.load;
+            } catch (...) {}
             release_ram_if_needed();
-            if (target_started) { instance_.program->abort_lane(lane); }
-            if (prefill_lane_ && *prefill_lane_ == lane) {
-                instance_.request_memory.deactivate();
-                prefill_lane_.reset();
+            const bool claimed = slots_[lane] == request;
+            if (copy_hold_ && copy_hold_->lane == lane) {
+                drain_copy_hold_before_abort();
             }
-            slots_[lane].reset();
-            invalidate_lane_plans(lane);
+            if (claimed) {
+                instance_.program->abort_lane(lane);
+                if (prefill_lane_ && *prefill_lane_ == lane) {
+                    instance_.request_memory.deactivate();
+                    prefill_lane_.reset();
+                }
+                slots_[lane].reset();
+                invalidate_lane_plans(lane);
+            }
             complete_error(request, error);
             throw;
         }
@@ -1223,6 +1366,7 @@ private:
     }
 
     void fail_all(std::exception_ptr error) noexcept {
+        std::scoped_lock execution_lock(execution_mutex_);
         std::vector<std::shared_ptr<Request>> pending;
         {
             std::lock_guard lock(queue_mutex_);
@@ -1230,6 +1374,7 @@ private:
             pending.assign(pending_.begin(), pending_.end());
             pending_.clear();
         }
+        drain_copy_hold_before_abort();
         if (prefill_lane_) {
             instance_.request_memory.deactivate();
             prefill_lane_.reset();
@@ -1275,6 +1420,31 @@ private:
                 cancel_active_requests(cancelled_at_boundary);
                 const RoundMembership membership = build_round_membership();
 
+                if (copy_hold_) {
+                    const bool held_in_membership =
+                        membership_contains(membership, copy_hold_->lane);
+                    if (held_in_membership) {
+                        throw std::logic_error(
+                            "copy-hold lane must not join decode membership before admit-complete");
+                    }
+                    if (!membership.empty() && !held_in_membership &&
+                        !instance_.program->kv_ram_copies_ready()) {
+                        run_decode_round(membership);
+                        previous_unit_was_decode = true;
+                    } else {
+                        const AdmissionProgress progress = admit_complete(membership.empty());
+                        if (progress == AdmissionProgress::RanGpuUnit) {
+                            previous_unit_was_decode = false;
+                        } else if (progress == AdmissionProgress::CopyHold &&
+                                   !membership.empty() &&
+                                   !membership_contains(membership, copy_hold_->lane)) {
+                            run_decode_round(membership);
+                            previous_unit_was_decode = true;
+                        }
+                    }
+                    continue;
+                }
+
                 if (prefill_lane_) {
                     if (!membership.empty() && !previous_unit_was_decode) {
                         run_decode_round(membership);
@@ -1289,6 +1459,10 @@ private:
                 if (have_pending && (membership.empty() || previous_unit_was_decode)) {
                     const AdmissionProgress progress = try_admit_one();
                     if (progress == AdmissionProgress::RanGpuUnit) {
+                        previous_unit_was_decode = false;
+                        continue;
+                    }
+                    if (progress == AdmissionProgress::CopyHold) {
                         previous_unit_was_decode = false;
                         continue;
                     }
@@ -1324,6 +1498,7 @@ private:
     std::uint64_t next_request_id_ = 1;
     std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
     std::optional<std::uint32_t> prefill_lane_;
+    std::optional<CopyHold> copy_hold_;
     std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions_{};
     std::optional<AdmissionProtection> protection_;
     std::uint64_t next_protection_epoch_ = 1;

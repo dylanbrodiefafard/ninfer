@@ -154,6 +154,13 @@ bool Program<Variant>::can_admit_lane_after_retained_eviction(
 }
 
 template <>
+bool Program<Variant>::can_admit_lane_after_releasing(
+    std::uint32_t lane, const RequestPlan<Variant>& plan,
+    std::span<const std::uint32_t> release_lanes) const noexcept {
+    return impl_->can_admit_lane_after_releasing(lane, plan, release_lanes);
+}
+
+template <>
 runtime::AdmissionResources Program<Variant>::admission_capacity() const noexcept {
     return impl_->admission_capacity();
 }
@@ -246,6 +253,26 @@ qwen3_6::detail::KvRamSnapshot Program<Variant>::kv_ram_snapshot() const noexcep
 template <>
 qwen3_6::detail::KvRamCopySeconds Program<Variant>::harvest_kv_ram_copy_seconds() {
     return impl_->harvest_kv_ram_copy_seconds();
+}
+
+template <>
+bool Program<Variant>::kv_ram_copies_ready() const {
+    return impl_->kv_ram_copies_ready();
+}
+
+template <>
+void Program<Variant>::wait_kv_ram_copies_on_compute() {
+    impl_->wait_kv_ram_copies_on_compute();
+}
+
+template <>
+void Program<Variant>::wait_kv_ram_copies() {
+    impl_->wait_kv_ram_copies();
+}
+
+template <>
+void Program<Variant>::synchronize_all() {
+    impl_->synchronize_all();
 }
 
 template <>

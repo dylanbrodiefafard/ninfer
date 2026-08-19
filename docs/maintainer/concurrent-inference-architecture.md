@@ -95,6 +95,11 @@ NInfer 不支持 preemption，因此 request 只有在其 prompt、声明的最�
 和下一轮 batch 的唯一修改者。CPU preparation、request ingress 和 output I/O 可以并行，但不能直接
 推进模型状态。
 
+RAM 第二层的 D2H/H2D 走独立的 copy engine（`DeviceContext::copy_stream`），不是 GPU scheduling
+unit，也不占用 compute owner。Copy 可以与**另一条** lane 的合法 compute unit 重叠；当前
+PrefillChunk / DecodeRound 正在读写的 pages 不得作为 copy source 或 destination。`device.stream`
+上的 `synchronize()` 只排空 compute，不排空 copy_stream。
+
 ### 2.7 Bounded ingress and output
 
 Engine 与 HTTP server 都把 generation request lifetime 数量限制为
@@ -357,8 +362,9 @@ frame 和权重是 engine-fixed resources；owning result capacity 已在 ingres
 1. 存在可用 control lane；
 2. request 对固定 model、frontend 和 selected execution backend 合法；
 3. active-priority retained eviction 后，每个 entitlement dimension 都能承诺 request 的完整生命周期需求；
-4. 当前没有其他 prefill owner；admission 会立即建立该 request 的 suffix-prefill 或 exact-hit finalization
-   ownership。
+4. 当前没有其他 prefill owner，也没有未完成的 copy-hold admission；admission 会立即建立该
+   request 的 suffix-prefill 或 exact-hit finalization ownership，或先进入 copy-hold 直到
+   相关 RAM copies 允许 `start_prefill_lane`。
 
 Selected backend 的差异只体现在 target 给出的 typed entitlement；Scheduler 不为 ordinary、MTP 或 DFlash
 建立不同 queue policy。即使 startup sizing 保证 backend 不会早于 Main pool 成为正常 backpressure，
@@ -520,8 +526,13 @@ qualification 会自然保守，仍可使用可证明的 persistent-safe backfil
 
 ```text
 no prefill owner
+and no copy-hold admission
 and (no decode-ready request or the completed GPU unit was a DecodeRound)
 ```
+
+copy-hold 与 prefill owner 一样独占 admission/prefill opportunity：它不是 GPU unit，但在 D2H/H2D
+完成并调用 `start_prefill_lane` 之前不得再 admission 第二个 request。held lane 不是 decode-ready，
+也不是 prefill owner。
 
 其他 boundary 可以处理 completion、cancellation、timeout 和 protection bookkeeping，但不能 commit head
 或 backfill admission。这个 gate 保证已有 decode-ready donors 在两次 admission 之间至少完成一次 progress
@@ -767,11 +778,18 @@ The executor captures at each admission site that is about to destroy a retained
    `max_concurrency=1` load path);
 3. a RAM restore that is about to cover a still-dirty target lane.
 
-That capture is a fresh D2H of the current prefix and becomes the new FIFO tail. A later RAM hit
-exclusive-claims the matching host entry (pinned entries are invisible to later `plan_match`).
-`capture` and `unpack` record a start CUDA event before the copies and a done event after them so
-CPU prefill setup can overlap restore H2D. Harvest of D2H/H2D elapsed happens after the first
-non-throwing `start_prefill_lane` and before consume. Consume then erases that entry wherever it
+Capture queues D2H on `copy_stream` and **holds the source pages mapped** until `copies_ready`.
+Admit is two-phase: bind records the request in its lane and any captured-but-not-evicted victims
+as copy-hold; other decode-ready lanes may run a DecodeRound while that D2H (and later restore
+H2D) is in flight. Admit-complete waits with `cudaEventQuery` (and `EventSynchronize` on copy
+only when membership is empty), then `evict_retained_lane` / `kv.reset()`, optional restore H2D,
+`wait_kv_ram_copies_on_compute` immediately before this lane's `start_prefill_lane`, and harvest.
+Harvest of D2H/H2D elapsed happens after that wait, not on an overlapping DecodeRound launch.
+If the held request is cancelled or fails before admit-complete, drain waits for those copies,
+harvests, releases an unused RAM claim, and `evict_retained_lane` on every captured victim so the
+D2H image is the only remaining copy. A later RAM hit exclusive-claims the matching host entry (pinned entries are invisible to later
+`plan_match`). `capture` and `unpack` record a start CUDA event before the copies and a done event
+after them so other-lane decode can overlap the DMA. Consume then erases that entry wherever it
 sits in the FIFO and retires the host block, including after an incomplete first chunk; a throw
 before consume releases the claim and leaves the host row in place. After consume the bundle lives
 only in VRAM until a later spill recaptures it. Occupancy `used`/`entries` (human `kv-ram=` / `n=`)
@@ -795,18 +813,21 @@ only frontier/checkpoint semantics.
 
 ### 7.1 GPU scheduling units
 
-Scheduler 只提交两类 GPU work：
+Scheduler 只提交两类 GPU compute work：
 
 ```text
 PrefillChunk(request)
 DecodeRound(all decode-ready requests)
 ```
 
-完整 request 不是 scheduling unit。所有 GPU work 在一条 execution lane 上串行执行。
+完整 request 不是 scheduling unit。所有 **compute** GPU work 在 `device.stream` 上串行执行。
+Host-RAM D2H/H2D 在 `copy_stream` 上，不是 scheduling unit，不得进入 CUDA Graph，也不得与当前
+compute unit 的 pages 别名。
 
 Model Runtime 拥有一份地址稳定的 shared workspace，由串行的 GPU units 复用，不按 request
 复制。Prefill owner 可在 Vision/Text phases 及多个 chunks 之间持有一份 request-transient lease；
-final prefill、cancellation 或 failure 后释放。
+final prefill、cancellation 或 failure 后释放。copy-hold 与 prefill owner 一样独占 admission
+opportunity，直到该 lane 的 copies 允许 `start_prefill_lane`。
 
 ### 7.2 Boundary processing
 
@@ -818,9 +839,15 @@ final prefill、cancellation 或 failure 后释放。
 3. finish/cancel requests and release or retain their state
 4. clean visible pending cancellation/timeout/permanent failures
 5. if this boundary is an admission turn, apply one head-first
-   protected admission/backfill opportunity
+   protected admission/backfill opportunity (bind may return copy-hold
+   without launching a GPU unit; complete starts this lane's prefill
+   only after the relevant copies are ready)
 6. choose, prepare and launch one next GPU unit
 ```
+
+copy-hold 在 admission-turn gate 之前检查：membership 非空且 copies 未就绪时先跑其他 lane 的
+DecodeRound（不 harvest、不 `EventSynchronize` copy）；membership 空则 `EventSynchronize` copy
+并 complete。Harvest 只在该 request 的 `start_prefill_lane` wait 之后。
 
 boundary 开始后到达的 event 留到下一 boundary。这保证一次 membership update 有限，持续 arrival 不能
 无限延迟下一次 launch。Admission turn 的 gate、frozen pending snapshot 和 protection state 由 §5.6 定义；

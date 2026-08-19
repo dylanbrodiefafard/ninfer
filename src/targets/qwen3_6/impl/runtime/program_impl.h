@@ -312,6 +312,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
 
 ProgramImplCore::~ProgramImplCore() noexcept {
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
+    if (device.copy_stream != nullptr) { (void)cudaStreamSynchronize(device.copy_stream); }
 }
 
 bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept {
@@ -351,6 +352,55 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
     std::uint32_t reclaimable_backend = 0;
     for (std::uint32_t other = 0; other < max_concurrency; ++other) {
         if (other == lane || !sequences[other].retained || !sequences[other].kv) { continue; }
+        reclaimable_text += sequences[other].kv->text.page_entitlement();
+        if (sequences[other].kv->backend) {
+            reclaimable_backend += sequences[other].kv->backend->page_entitlement();
+        }
+    }
+
+    const auto can_replace = [](const PagedKVPool& pool, std::uint32_t old_pages,
+                                std::uint32_t reclaimable_pages, std::uint32_t new_pages) {
+        if (old_pages > pool.entitled_pages() ||
+            reclaimable_pages > pool.entitled_pages() - old_pages ||
+            new_pages > pool.logical_page_capacity()) {
+            return false;
+        }
+        const std::uint32_t committed = pool.entitled_pages() - old_pages - reclaimable_pages;
+        return new_pages <= pool.page_group_count() - committed;
+    };
+
+    const SequenceState& sequence = sequences[lane];
+    const std::uint32_t old_text  = sequence.kv ? sequence.kv->text.page_entitlement() : 0;
+    if (!can_replace(decoder->text_kv.pool(), old_text, reclaimable_text,
+                     plan.impl_->text_kv_page_entitlement)) {
+        return false;
+    }
+
+    const qwen3_6::PagedKVCache* backend = backend_kv_cache();
+    if (backend == nullptr) { return plan.impl_->backend_kv_page_entitlement == 0; }
+    const std::uint32_t old_backend =
+        sequence.kv && sequence.kv->backend ? sequence.kv->backend->page_entitlement() : 0;
+    return can_replace(backend->pool(), old_backend, reclaimable_backend,
+                       plan.impl_->backend_kv_page_entitlement);
+}
+
+bool ProgramImplCore::can_admit_lane_after_releasing(
+    std::uint32_t lane, const RequestPlan& plan,
+    std::span<const std::uint32_t> release_lanes) const noexcept {
+    if (lane >= max_concurrency || plan.impl_ == nullptr) { return false; }
+    const RequestControl& request = requests[lane];
+    if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
+        request.lifecycle == Lifecycle::Pending) {
+        return false;
+    }
+
+    std::uint32_t reclaimable_text    = 0;
+    std::uint32_t reclaimable_backend = 0;
+    for (const std::uint32_t other : release_lanes) {
+        if (other == lane || other >= max_concurrency || !sequences[other].retained ||
+            !sequences[other].kv) {
+            continue;
+        }
         reclaimable_text += sequences[other].kv->text.page_entitlement();
         if (sequences[other].kv->backend) {
             reclaimable_backend += sequences[other].kv->backend->page_entitlement();
@@ -625,7 +675,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         return first;
     } catch (...) {
         try {
-            device.synchronize();
+            device.synchronize_all();
         } catch (...) {}
         clear_lane(sequence, request);
         throw;
@@ -774,7 +824,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
         work.reset();
     } catch (...) {
         try {
-            device.synchronize();
+            device.synchronize_all();
         } catch (...) {}
         work.reset();
         for (const std::uint32_t lane : lanes) {
@@ -837,6 +887,9 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
             request.timings.decode_seconds += tail_seconds;
         }
     } catch (...) {
+        try {
+            device.synchronize_all();
+        } catch (...) {}
         for (const std::uint32_t lane : lanes) {
             if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
         }
@@ -909,12 +962,13 @@ ProgramImplCore::ram_capture_source(const SequenceState& sequence) {
         }
         source.dflash_lane = static_cast<std::int32_t>(sequence.lane);
     }
-    source.stream = device.stream;
+    source.stream = device.copy_stream;
     return source;
 }
 
 bool ProgramImplCore::capture_retained_lane(std::uint32_t lane) {
     if (!kv_ram_cache_ || !has_retained_lane(lane)) { return true; }
+    device.order_copy_after_compute();
     return kv_ram_cache_->capture(ram_capture_source(sequences[lane]));
 }
 
@@ -935,12 +989,16 @@ void ProgramImplCore::restore_ram_entry(std::uint32_t lane, std::uint64_t entry_
         throw std::logic_error("RAM restore requires a free request lane");
     }
     try {
-        if (has_retained_lane(lane)) { (void)capture_retained_lane(lane); }
+        if (has_retained_lane(lane)) {
+            throw std::logic_error(
+                "RAM restore requires an empty lane; copy-hold must evict after D2H");
+        }
         sequence.kv.reset();
         sequence.retained           = false;
         sequence.mtp_draft_count    = 0;
         sequence.rewrite_checkpoint = {};
 
+        device.order_copy_after_compute();
         reserve_sequence_kv(sequence, request_plan.text_kv_page_entitlement,
                             request_plan.backend_kv_page_entitlement);
         const std::uint32_t text_pages = ninfer::pages_for_tokens(request_plan.reuse_base);
@@ -951,9 +1009,9 @@ void ProgramImplCore::restore_ram_entry(std::uint32_t lane, std::uint64_t entry_
         } else if (speculative_backend == SpeculativeBackend::DFlash) {
             backend_pages = ninfer::pages_for_tokens(request_plan.reuse_base);
         }
-        sequence.kv->text.materialize_pages(text_pages, device.stream);
+        sequence.kv->text.materialize_pages(text_pages, device.copy_stream);
         if (sequence.kv->backend) {
-            sequence.kv->backend->materialize_pages(backend_pages, device.stream);
+            sequence.kv->backend->materialize_pages(backend_pages, device.copy_stream);
         }
 
         qwen3_6::detail::RamRestoreTarget target;
@@ -976,7 +1034,7 @@ void ProgramImplCore::restore_ram_entry(std::uint32_t lane, std::uint64_t entry_
             target.dflash_checkpoint = &dflash->rewrite_checkpoint_local;
             target.dflash_lane       = static_cast<std::int32_t>(sequence.lane);
         }
-        target.stream = device.stream;
+        target.stream = device.copy_stream;
 
         qwen3_6::detail::RamRestoredHost host = kv_ram_cache_->unpack_device(entry_id, target);
         sequence.execution_frontier      = host.execution_frontier;
@@ -997,7 +1055,7 @@ void ProgramImplCore::restore_ram_entry(std::uint32_t lane, std::uint64_t entry_
         sequence.retained        = true;
     } catch (...) {
         try {
-            device.synchronize();
+            device.synchronize_all();
         } catch (...) {}
         clear_lane(sequence, request);
         throw;
@@ -1027,6 +1085,20 @@ qwen3_6::detail::KvRamCopySeconds ProgramImplCore::harvest_kv_ram_copy_seconds()
     return kv_ram_cache_ ? kv_ram_cache_->harvest_copy_seconds()
                          : qwen3_6::detail::KvRamCopySeconds{};
 }
+
+bool ProgramImplCore::kv_ram_copies_ready() const {
+    return !kv_ram_cache_ || kv_ram_cache_->pending_copies_ready();
+}
+
+void ProgramImplCore::wait_kv_ram_copies_on_compute() {
+    if (kv_ram_cache_) { kv_ram_cache_->wait_pending_copies_on_stream(device.stream); }
+}
+
+void ProgramImplCore::wait_kv_ram_copies() {
+    if (kv_ram_cache_) { kv_ram_cache_->wait_pending_copies(); }
+}
+
+void ProgramImplCore::synchronize_all() { device.synchronize_all(); }
 
 std::uint64_t ProgramImplCore::kv_ram_index_version() const noexcept {
     return kv_ram_cache_ ? kv_ram_cache_->index_version() : 0;
@@ -1938,7 +2010,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         };
     } catch (...) {
         try {
-            device.synchronize();
+            device.synchronize_all();
         } catch (...) {}
         clear_lane(sequence, request);
         throw;
@@ -2043,7 +2115,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                                                lanes.size())};
     } catch (...) {
         try {
-            device.synchronize();
+            device.synchronize_all();
         } catch (...) {}
         for (const std::uint32_t lane : lanes) {
             if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
@@ -2202,7 +2274,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             .row_stride = width};
     } catch (...) {
         try {
-            device.synchronize();
+            device.synchronize_all();
         } catch (...) {}
         for (const std::uint32_t lane : lanes) {
             if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
@@ -2363,7 +2435,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             .row_stride = width};
     } catch (...) {
         try {
-            device.synchronize();
+            device.synchronize_all();
         } catch (...) {}
         for (const std::uint32_t lane : lanes) {
             if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }

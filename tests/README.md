@@ -20,7 +20,7 @@ benchmark-report, and external protocol behavior. Repository verification princi
   alignment, Vision control, and family runtime mechanisms;
 - `targets/qwen3_6_27b/` — registered inventory, converter recipe, source verifier, artifact
   bindings, reference diagnostics, family Program/multimodal/MTP behavior, and the opt-in real-Engine
-  prefix test;
+  prefix and RAM-tier tests;
 - `targets/qwen3_6_35b_a3b/` — registered inventory/converter contracts, artifact-native diagnostic
   reference, MoE oracle, typed binding, selected-expert row access, 256K INT8 memory calculation,
   and the opt-in real public-Engine route;
@@ -108,8 +108,12 @@ artifact. The 35B-A3B reference binding test follows the same rule with
 `NINFER_QWEN3_6_35B_A3B_ARTIFACT` and `out/qwen3_6_35b_a3b.ninfer`. The remaining Python
 target tests still run without either artifact.
 
-The C++ prefix/MTP integration test is separately opt-in because it loads the full artifact and
-runs the real engine. The RAM-tier test covers capture sites 1–3, INT8 KV, MTP, oversize drop,
+The C++ prefix/MTP and RAM-tier integration tests are separately opt-in because they load a full
+artifact and run the real Engine. Point `NINFER_QWEN3_6_27B_WEIGHTS` and/or
+`NINFER_QWEN3_6_27B_NVFP4_WEIGHTS` at any Engine-loadable 27B-family `.ninfer` of that weight
+profile; the artifact identity selects the target. Qwen3.6-27B and Qwen3.8-27B both work, so
+`NINFER_QWEN3_6_27B_NVFP4_WEIGHTS` may be `out/qwen3_6_27b_nvfp4.ninfer` or
+`qwen3_8_27b_nvfp4.ninfer`. The RAM-tier test covers capture sites 1–3, INT8 KV, MTP, oversize drop,
 VRAM-wins-equal-reuse, longer-RAM-beats-shorter-VRAM, suffix prefill after RAM restore, RAM disabled, queued matcher,
 `allow_prefix_reuse=false`, rewrite-checkpoint restore, dirty-lane checkpoint restore, cancel-after-consume, consume-then-VRAM,
 overlapping `submit()` at `max_concurrency=2`, C=2/C=3 sequential FullReset onto an empty lane
@@ -121,12 +125,19 @@ one-entry spill drop of a dirty-lane occupant, Engine teardown after a RAM resto
 and the C=3 shared-pool analog (three 3-page chats, two 4-page continuations plus RAM suffix restore of the third, 2-page fits-now backfill, blocked 4-page tail, exact vs suffix reuse). `ninfer_admission_policy_test` locks the same 10-page leftover-2 / leftover-0 / no-lane arithmetic. `ninfer_kv_ram_cache_perf_test` and
 `ninfer_kv_ram_cache_opt_test` check host pack/unpack bandwidth against pinned memcpy, event
 overlapped restore, fragmented vs contiguous PageMajor runs, and GDN/hidden RAM round-trips.
-`ninfer_kv_ram_cache_large_test` moves a 27B-shaped GDN slot (~147 MiB) and a 64-plane ~100 MiB INT8 KV image both ways, including a two-slot GDN plus KV restore:
+`ninfer_kv_ram_cache_test` includes `test_copy_compute_stream_overlap`: a 32 MiB hidden D2H/H2D
+on `copy_stream` must still be in flight after a compute-only `cudaEventSynchronize` on
+`device.stream`. It also checks that `unpack_device` without an intervening harvest still reports
+both save and load elapsed, and that `consume` without harvest clears pending copy ids and folds
+D2H elapsed into save. `ninfer_device_test` checks `order_copy_after_compute`.
+`ninfer_kv_ram_cache_large_test` moves a 27B-shaped GDN slot (~147 MiB) and a
+64-plane ~100 MiB INT8 KV image both ways, including a two-slot GDN plus KV restore, and repeats
+that copy/compute overlap proof:
 
 ```bash
 NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_6_27b.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_prefix_real_test --output-on-failure
-NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_6_27b.ninfer \
+NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=/path/to/qwen3_8_27b_nvfp4.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_ram_real_test --output-on-failure
 NINFER_QWEN3_6_35B_A3B_WEIGHTS=$PWD/out/qwen3_6_35b_a3b.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_35b_a3b_ram_real_test --output-on-failure

@@ -55,7 +55,7 @@ Artifact and model references:
 - [Qwen3.6-35B-A3B model semantics](maintainer/qwen3.6-35b-a3b-model.md)
 - [Qwen3.6-35B-A3B artifact contracts](maintainer/qwen3.6-35b-a3b-artifact.md)
 
-Pending migration plan:
+Pending plans:
 
 - [Softmax Attention organization and migration](maintainer/softmax-attention.md) describes the
   single target state for an unfinished source and public-contract cutover; it is not the current
