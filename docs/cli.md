@@ -153,7 +153,7 @@ companions. Current C=1 measurements for Qwen3.8-27B NVFP4 DFlash2 are in
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `4096` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
-| `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
+| `--kv-dtype bf16\|int8\|nvfp4` | KV-cache storage | `bf16` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; 35B DFlash `1..15`; 3.8 DFlash2 `1..7` | unset |
 | `--lm-head-draft` | optimized proposal head | off |

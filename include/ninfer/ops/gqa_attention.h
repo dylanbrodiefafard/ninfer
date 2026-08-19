@@ -31,19 +31,30 @@ struct GqaExecutionEnvelope {
  *   code[i]    = s == 0 ? 0 : I8(clamp(RNE_even(FP32(x[i]) * inv), -127, 127))
  *   decode[i]  = FP32(code[i]) * s
  *
+ * NVFP4-G16 cache rows pack two E2M1 values per U8 along D (leading extent 128) and store one
+ * UE4M3 scale per contiguous 16-element group (leading extent 16). For BF16 source values x:
+ *
+ *   a          = max_i abs(FP32(x[i])) over the 16-wide group
+ *   scale_bits = E4M3_SATFINITE_RNE(a / 6)
+ *   s          = FP32(decode_e4m3(scale_bits))
+ *   code[i]    = s == 0 ? 0 : E2M1_SATFINITE_RNE(FP32(x[i]) / s)
+ *   decode[i]  = FP32(decode_e2m1(code[i])) * s
+ *
  * A1 and A2 produce identical code and scale bits. The common ideal attention oracle uses BF16 Q
- * and logical cache values (BF16 values for a BF16 cache, FP32 decode above for INT8-G64), then
- * evaluates score dot products, stable softmax, and value reduction in FP64. The BF16 Op output is
- * promoted to FP64 for comparison with that result.
+ * and logical cache values (BF16 values for a BF16 cache, FP32 decode above for INT8-G64, and
+ * decode_e2m1(code)*decode_e4m3(scale) for NVFP4-G16), then evaluates score dot products, stable
+ * softmax, and value reduction in FP64. The BF16 Op output is promoted to FP64 for comparison with
+ * that result.
  *
  * The registered INT8 implementation defines Q8-G64, paired with INT8-G64 K, as its native query
- * compute profile. Its profile-defined query quantization and any narrower staging do not replace
- * BF16 Q in the ideal oracle. BF16-cache and INT8-cache compute profiles therefore have separate
- * named numerical criteria owned by the GQA conformance test. Those envelopes apply to the
- * registered geometries, tested token extents, conformance matrix, and target-representative
- * activation range; they are not a universal error bound for arbitrary adversarial BF16 tensors.
- * A1 and A3 are each qualified directly against the ideal oracle. A1-versus-A3 parity is only an
- * additional consistency check.
+ * compute profile. The registered NVFP4 implementation defines Q-NVFP4-G16, paired with NVFP4-G16 K,
+ * as its native query compute profile using m16n8k64 hardware block scales. Those profile-defined
+ * query quantizations and any narrower staging do not replace BF16 Q in the ideal oracle. BF16-cache,
+ * INT8-cache, and NVFP4-cache compute profiles therefore have separate named numerical criteria
+ * owned by the GQA conformance test. Those envelopes apply to the registered geometries, tested
+ * token extents, conformance matrix, and target-representative activation range; they are not a
+ * universal error bound for arbitrary adversarial BF16 tensors. A1 and A3 are each qualified
+ * directly against the ideal oracle. A1-versus-A3 parity is only an additional consistency check.
  */
 
 /**
@@ -71,8 +82,8 @@ gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
  * kv_table_rows is contiguous I32 [B]. valid_columns is either contiguous I32 [B], or an empty
  * Tensor meaning every row has exactly W valid columns. This dense/masked choice is part of the
  * call topology; it is not inferred by copying device metadata to the host. B=1 accepts every
- * positive W in the current prefill/decode domain; B=2..8 accepts W=1..16. Cache storage is BF16
- * or INT8-G64 under the shared numerical contract above. PagedKVBatchLayerView supplies shared
+ * positive W in the current prefill/decode domain; B=2..8 accepts W=1..16. Cache storage is BF16,
+ * INT8-G64, or NVFP4-G16 under the shared numerical contract above. PagedKVBatchLayerView supplies shared
  * planes and the complete block-table matrix; kv_table_rows[b] selects one row for sequence b.
  *
  * In masked form, every row's valid columns are the prefix [0,valid_columns[b]); positions in that
@@ -94,7 +105,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
 
 /**
  * A2: perform only the cache-write part of A1. k/v are contiguous BF16 `[256,4|2,T]`, positions is
- * contiguous sequential I32 [T], and every addressed code and INT8 scale is overwritten. It reads
+ * contiguous sequential I32 [T], and every addressed code and quantized scale is overwritten. It reads
  * no unrelated cache row, receives no execution envelope, and owns no persistent frontier.
  */
 void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,

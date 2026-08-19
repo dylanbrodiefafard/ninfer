@@ -371,6 +371,10 @@ BF16 bytes/token
 INT8-G64 bytes/token
     = 2(K,V) * L * H * D
     + 2(K,V) * L * H * (D/64) * sizeof(FP16 scale)
+
+NVFP4-G16 bytes/token
+    = 2(K,V) * L * H * (D/2)
+    + 2(K,V) * L * H * (D/16) * sizeof(FP8 scale)
 ```
 
 一个 homogeneous pool 的 logical page-group payload 是其全部 grouped planes 的 bytes/token 之和乘以
@@ -608,12 +612,16 @@ blocks；其 Full pool 使用 §4.3 的 head-major page-run order。两者保留
 |---|---|---:|---:|---:|
 | 27B Main Text | BF16 | 65536 | 4.0000 MiB | 3.9375 MiB |
 | 27B Main Text | INT8-G64 | 33792 | 2.0625 MiB | 2.0303 MiB |
+| 27B Main Text | NVFP4-G16 | 18432 | 1.1250 MiB | 1.1074 MiB |
 | 35B-A3B Main Text | BF16 | 20480 | 1.2500 MiB | 1.2305 MiB |
 | 35B-A3B Main Text | INT8-G64 | 10560 | 0.6445 MiB | 0.6345 MiB |
+| 35B-A3B Main Text | NVFP4-G16 | 5760 | 0.3516 MiB | 0.3462 MiB |
 | 27B MTP | BF16 | 4096 | 0.2500 MiB | 0.2461 MiB |
 | 27B MTP | INT8-G64 | 2112 | 0.1289 MiB | 0.1269 MiB |
+| 27B MTP | NVFP4-G16 | 1152 | 0.0703 MiB | 0.0692 MiB |
 | 35B-A3B MTP | BF16 | 2048 | 0.1250 MiB | 0.1230 MiB |
 | 35B-A3B MTP | INT8-G64 | 1056 | 0.0645 MiB | 0.0634 MiB |
+| 35B-A3B MTP | NVFP4-G16 | 576 | 0.0352 MiB | 0.0346 MiB |
 | 35B-A3B DFlash Full | BF16 | 4096 | 0.2500 MiB | 0.2461 MiB |
 
 27B Main Text BF16 的 4 MiB page group 分布在全部 full-attention planes。单层单个 K 或 V plane

@@ -20,9 +20,12 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
         throw std::invalid_argument("Paged KV cache geometry is invalid");
     }
-    const bool quantized = dtype == DType::I8;
-    if ((!quantized && (dtype != DType::BF16 || quant_group != 0)) ||
-        (quantized && (quant_group != kKvQuantGroup || head_dim % quant_group != 0))) {
+    const bool int8  = dtype == DType::I8;
+    const bool nvfp4 = dtype == DType::U8;
+    if ((!int8 && !nvfp4 && (dtype != DType::BF16 || quant_group != 0)) ||
+        (int8 && (quant_group != kKvQuantGroup || head_dim % quant_group != 0)) ||
+        (nvfp4 && (quant_group != kKvNvfp4Group || head_dim % quant_group != 0 ||
+                   (head_dim % 2) != 0))) {
         throw std::invalid_argument("Paged KV cache dtype or quantization is invalid");
     }
 
@@ -35,13 +38,18 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     pool_spec.page_group_count      = physical_page_groups;
     pool_spec.logical_page_capacity = logical_pages;
     pool_spec.table_rows            = table_rows;
+    const bool quantized = int8 || nvfp4;
     pool_spec.planes.reserve(static_cast<std::size_t>(layers) * (quantized ? 4ULL : 2ULL));
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
-        pool_spec.planes.push_back({dtype, head_dim, kv_heads, 256});
-        pool_spec.planes.push_back({dtype, head_dim, kv_heads, 256});
-        if (quantized) {
+        const std::int32_t code_extent = nvfp4 ? head_dim / 2 : head_dim;
+        pool_spec.planes.push_back({dtype, code_extent, kv_heads, 256});
+        pool_spec.planes.push_back({dtype, code_extent, kv_heads, 256});
+        if (int8) {
             pool_spec.planes.push_back({DType::FP16, head_dim / quant_group, kv_heads, 256});
             pool_spec.planes.push_back({DType::FP16, head_dim / quant_group, kv_heads, 256});
+        } else if (nvfp4) {
+            pool_spec.planes.push_back({DType::FP8_E4M3FN, head_dim / quant_group, kv_heads, 256});
+            pool_spec.planes.push_back({DType::FP8_E4M3FN, head_dim / quant_group, kv_heads, 256});
         }
     }
     return PagedKVCacheLayout{
@@ -97,7 +105,7 @@ PagedKVCacheView PagedKVCache::execution_view(const PagedKVAllocation& allocatio
 
 PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_table) const {
     if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
-    const bool quantized     = dtype_ == DType::I8;
+    const bool quantized     = dtype_ == DType::I8 || dtype_ == DType::U8;
     const std::size_t stride = quantized ? 4ULL : 2ULL;
     const std::size_t base   = static_cast<std::size_t>(layer) * stride;
     return PagedKVLayerView{
@@ -115,7 +123,7 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
 
 PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const {
     if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
-    const bool quantized     = dtype_ == DType::I8;
+    const bool quantized     = dtype_ == DType::I8 || dtype_ == DType::U8;
     const std::size_t stride = quantized ? 4ULL : 2ULL;
     const std::size_t base   = static_cast<std::size_t>(layer) * stride;
     return PagedKVBatchLayerView{

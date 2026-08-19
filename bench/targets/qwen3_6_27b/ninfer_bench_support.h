@@ -15,7 +15,7 @@
 
 namespace ninfer::bench {
 
-inline constexpr int kSchemaVersion                   = 11;
+inline constexpr int kSchemaVersion                   = 12;
 inline constexpr std::string_view kArtifactType       = "ninfer_bench_report";
 inline constexpr std::string_view kDefaultCorpusPath  = "bench/fixtures/bench_corpus.ids";
 inline constexpr int kDecodeSeedTokens                = 1;
@@ -25,6 +25,7 @@ inline constexpr int kDefaultRepetitions              = 5;
 inline constexpr int kDefaultWarmup                   = 1;
 inline constexpr std::uint32_t kDefaultPrefillChunk   = 4096;
 inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
+inline constexpr std::uint32_t kKvPageTokens          = 64;
 inline constexpr std::uint32_t kMaxMtpDraftTokens     = 5;
 
 enum class TestKind { Prefill, Decode, PrefillDecode };
@@ -63,6 +64,7 @@ struct BenchOptions {
     std::optional<std::uint32_t> max_context;
     std::uint32_t prefill_chunk    = kDefaultPrefillChunk;
     KvCacheStorage kv_cache        = KvCacheStorage::BFloat16;
+    std::uint32_t concurrency      = 1;
     std::uint32_t mtp_draft_tokens = 0;
     ProposalHead proposal_head     = ProposalHead::Full;
     int device                     = 0;
@@ -81,6 +83,7 @@ struct RepTiming {
 
 struct TestResult {
     BenchTest test;
+    std::uint32_t concurrency                  = 1;
     std::vector<RepTiming> reps;
     std::size_t workspace_peak_bytes           = 0;
     std::size_t workspace_allocator_peak_bytes = 0;
@@ -106,6 +109,7 @@ struct BenchEnvironment {
     std::uint32_t max_context                      = 0;
     std::uint32_t prefill_chunk                    = kDefaultPrefillChunk;
     KvCacheStorage kv_cache                        = KvCacheStorage::BFloat16;
+    std::uint32_t concurrency                      = 1;
     std::uint32_t mtp_draft_tokens                 = 0;
     ProposalHead proposal_head                     = ProposalHead::Full;
     bool use_cuda_graph                            = true;
@@ -124,10 +128,12 @@ std::vector<BenchTest> expand_tests(const BenchOptions& options);
 std::uint32_t resolve_max_context(const std::vector<BenchTest>& tests,
                                   std::optional<std::uint32_t> override_max_context,
                                   std::uint32_t mtp_draft_tokens, bool use_cuda_graph);
+std::uint32_t concurrent_kv_capacity_tokens(std::uint32_t max_context, std::uint32_t concurrency);
 void validate_prompt_lengths(const std::vector<BenchTest>& tests, std::size_t corpus_tokens);
 
 std::vector<TokenId> load_corpus_ids(const std::string& path);
-std::vector<TokenId> prompt_slice(const std::vector<TokenId>& corpus, int n_prompt);
+std::vector<TokenId> prompt_slice(const std::vector<TokenId>& corpus, int n_prompt,
+                                  std::size_t offset = 0);
 std::string decode_path_name(bool use_cuda_graph, std::uint32_t mtp_draft_tokens);
 std::uint32_t decode_graph_prime_output_tokens(std::uint32_t mtp_draft_tokens);
 std::uint32_t decode_graph_prime_required_context(std::uint32_t mtp_draft_tokens);

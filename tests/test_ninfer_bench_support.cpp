@@ -103,6 +103,7 @@ int test_cli_contract() {
     failures += expect(parsed.max_context == std::optional<std::uint32_t>(4096), "max context");
     failures += expect(parsed.prefill_chunk == 128, "prefill chunk");
     failures += expect(parsed.kv_cache == ninfer::KvCacheStorage::Int8Group64, "INT8 KV");
+    failures += expect(parsed.concurrency == 1, "default concurrency");
     failures += expect(parsed.mtp_draft_tokens == 5, "MTP window");
     failures +=
         expect(parsed.proposal_head == ninfer::ProposalHead::Optimized, "optimized proposal head");
@@ -145,6 +146,20 @@ int test_cli_contract() {
                 {"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "fp8"});
         },
         "unsupported KV storage");
+    failures += expect(
+        parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "nvfp4"})
+            .kv_cache == ninfer::KvCacheStorage::Nvfp4,
+        "NVFP4 KV");
+    failures += expect_u32(
+        parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--concurrency", "2"})
+            .concurrency,
+        2, "concurrency 2");
+    failures += expect_throws<std::invalid_argument>(
+        [] {
+            (void)parse_for_test(
+                {"ninfer_bench", "--weights", "model.ninfer", "--concurrency", "9"});
+        },
+        "unsupported concurrency");
     return failures;
 }
 
@@ -176,6 +191,9 @@ int test_measurement_contract() {
     failures += expect_throws<std::invalid_argument>(
         [&] { (void)qb::resolve_max_context(matrix, std::optional<std::uint32_t>(2048), 5, true); },
         "undersized context");
+    failures += expect_u32(qb::concurrent_kv_capacity_tokens(50134, 2), 100352,
+                           "C=2 page-aligned Main KV");
+    failures += expect_u32(qb::concurrent_kv_capacity_tokens(64, 1), 64, "exact page C=1");
     return failures;
 }
 
@@ -270,7 +288,7 @@ int test_report_contract() {
         return fail(std::string("invalid benchmark JSON: ") + error.what());
     }
 
-    failures += expect(report.at("schema_version") == 11, "report schema v11");
+    failures += expect(report.at("schema_version") == 12, "report schema v12");
     failures += expect(report.at("artifact_type") == "ninfer_bench_report", "report identity");
     failures += expect(report.at("artifact").at("path") == "model.ninfer", "artifact path");
     failures += expect(report.at("load").at("target") == "qwen3_6_27b", "load target");
@@ -288,6 +306,7 @@ int test_report_contract() {
                        "CUDA Graph allowance");
     failures += expect(report.at("memory").at("kv_payload_bytes") == 123456ULL, "KV payload");
     failures += expect(report.at("config").at("proposal_head") == "optimized", "proposal head");
+    failures += expect(report.at("config").at("concurrency") == 1, "default concurrency in report");
     failures += expect(report.at("config").at("decode_graph_prime").at("output_tokens") == 13,
                        "graph prime output count");
 
@@ -308,6 +327,14 @@ int test_report_contract() {
                             "decode output throughput");
     failures += expect_near(tg.at("decode_engine_tok_s_mean").get<double>(), 7.5,
                             "decode engine throughput");
+
+    qb::TestResult concurrent               = sample_results()[1];
+    concurrent.concurrency                  = 2;
+    const qb::Stats concurrent_output       = qb::compute_stats(qb::decode_output_tok_s_series(concurrent));
+    const qb::Stats concurrent_engine       = qb::compute_stats(qb::decode_engine_tok_s_series(concurrent));
+    failures += expect_near(concurrent_output.mean, 9.0, "C=2 decode output throughput");
+    failures += expect_near(concurrent_engine.mean, 7.5, "C=2 decode engine throughput is not doubled");
+
     failures += expect(tg.at("speculative").at("rounds") == 1, "speculative rounds");
     failures += expect(tg.at("speculative").at("fallback_steps") == 3, "speculative fallbacks");
     failures += expect_near(tg.at("speculative").at("acceptance_rate").get<double>(), 1.0,

@@ -16,6 +16,8 @@ namespace {
 
 constexpr std::int32_t kHeadDim                      = 256;
 constexpr std::int32_t kQuantGroup                   = 64;
+constexpr std::int32_t kNvfp4Group                   = 16;
+constexpr std::int32_t kNvfp4CodeWidth               = 128;
 constexpr float kExpectedScale                       = 0.0625f;
 constexpr std::int32_t kSmallTChunkTokens            = 6;
 constexpr std::int32_t kMaximumVerifyTokens          = 16;
@@ -51,17 +53,54 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
     }
 }
 
-std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_heads, const char* op) {
-    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8) ||
-        cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
+bool supported_cache_dtype(DType dtype) {
+    return dtype == DType::BF16 || dtype == DType::I8 || dtype == DType::U8;
+}
+
+void validate_cache_dtype(DType dtype, std::int32_t quant_group, const char* op) {
+    if (!supported_cache_dtype(dtype)) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
-    if (cache.dtype == DType::BF16 && cache.quant_group != 0) {
+    if (dtype == DType::BF16 && quant_group != 0) {
         throw std::invalid_argument(std::string(op) + ": BF16 KV cache must not have quant_group");
     }
-    if (cache.dtype == DType::I8 && cache.quant_group != kQuantGroup) {
+    if (dtype == DType::I8 && quant_group != kQuantGroup) {
         throw std::invalid_argument(std::string(op) + ": I8 KV cache must use quant_group 64");
     }
+    if (dtype == DType::U8 && quant_group != kNvfp4Group) {
+        throw std::invalid_argument(std::string(op) + ": NVFP4 KV cache must use quant_group 16");
+    }
+}
+
+std::int32_t cache_code_leading(DType dtype) { return dtype == DType::U8 ? kNvfp4CodeWidth : kHeadDim; }
+
+DType cache_code_dtype(DType dtype) {
+    if (dtype == DType::I8) { return DType::I8; }
+    if (dtype == DType::U8) { return DType::U8; }
+    return DType::BF16;
+}
+
+void validate_scale_planes(const Tensor& k_scale, const Tensor& v_scale, DType dtype,
+                           std::int32_t kv_heads, std::int32_t physical_pages, const char* op) {
+    const std::int32_t groups = dtype == DType::U8 ? kHeadDim / kNvfp4Group : kHeadDim / kQuantGroup;
+    const DType scale_dtype   = dtype == DType::U8 ? DType::FP8_E4M3FN : DType::FP16;
+    if (k_scale.dtype != scale_dtype || v_scale.dtype != scale_dtype) {
+        throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
+    }
+    require_shape(k_scale, groups, kPagedKVPageSize, kv_heads, physical_pages, op,
+                  "cache k scale pages");
+    require_shape(v_scale, groups, kPagedKVPageSize, kv_heads, physical_pages, op,
+                  "cache v scale pages");
+    require_contiguous_nonnull(k_scale, op, "cache k scale pages");
+    require_contiguous_nonnull(v_scale, op, "cache v scale pages");
+}
+
+std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_heads, const char* op) {
+    if (!supported_cache_dtype(cache.dtype) || cache.num_kv_heads != kv_heads ||
+        cache.head_dim != kHeadDim) {
+        throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
+    }
+    validate_cache_dtype(cache.dtype, cache.quant_group, op);
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
     const std::int32_t logical_pages  = cache.block_table.ne[0];
@@ -71,13 +110,14 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
         throw std::invalid_argument(std::string(op) + ": invalid KV cache capacity");
     }
 
-    const DType code_dtype = cache.dtype == DType::I8 ? DType::I8 : DType::BF16;
+    const DType code_dtype       = cache_code_dtype(cache.dtype);
+    const std::int32_t code_lead = cache_code_leading(cache.dtype);
     if (cache.k_pages.dtype != code_dtype || cache.v_pages.dtype != code_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
     }
-    require_shape(cache.k_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.k_pages, code_lead, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache k pages");
-    require_shape(cache.v_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.v_pages, code_lead, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache v pages");
     require_contiguous_nonnull(cache.k_pages, op, "cache k pages");
     require_contiguous_nonnull(cache.v_pages, op, "cache v pages");
@@ -94,31 +134,18 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
         return static_cast<std::uint32_t>(capacity);
     }
 
-    constexpr std::int32_t groups = kHeadDim / kQuantGroup;
-    if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
-        throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
-    }
-    require_shape(cache.k_scale_pages, groups, kPagedKVPageSize, kv_heads, physical_pages, op,
-                  "cache k scale pages");
-    require_shape(cache.v_scale_pages, groups, kPagedKVPageSize, kv_heads, physical_pages, op,
-                  "cache v scale pages");
-    require_contiguous_nonnull(cache.k_scale_pages, op, "cache k scale pages");
-    require_contiguous_nonnull(cache.v_scale_pages, op, "cache v scale pages");
+    validate_scale_planes(cache.k_scale_pages, cache.v_scale_pages, cache.dtype, kv_heads,
+                          physical_pages, op);
     return static_cast<std::uint32_t>(capacity);
 }
 
 std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int32_t kv_heads,
                                    const char* op) {
-    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8) ||
-        cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
+    if (!supported_cache_dtype(cache.dtype) || cache.num_kv_heads != kv_heads ||
+        cache.head_dim != kHeadDim) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
-    if (cache.dtype == DType::BF16 && cache.quant_group != 0) {
-        throw std::invalid_argument(std::string(op) + ": BF16 KV cache must not have quant_group");
-    }
-    if (cache.dtype == DType::I8 && cache.quant_group != kQuantGroup) {
-        throw std::invalid_argument(std::string(op) + ": I8 KV cache must use quant_group 64");
-    }
+    validate_cache_dtype(cache.dtype, cache.quant_group, op);
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
     const std::int32_t logical_pages  = cache.block_tables.ne[0];
@@ -129,13 +156,14 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
         throw std::invalid_argument(std::string(op) + ": invalid KV cache capacity");
     }
 
-    const DType code_dtype = cache.dtype == DType::I8 ? DType::I8 : DType::BF16;
+    const DType code_dtype       = cache_code_dtype(cache.dtype);
+    const std::int32_t code_lead = cache_code_leading(cache.dtype);
     if (cache.k_pages.dtype != code_dtype || cache.v_pages.dtype != code_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
     }
-    require_shape(cache.k_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.k_pages, code_lead, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache k pages");
-    require_shape(cache.v_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.v_pages, code_lead, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache v pages");
     require_contiguous_nonnull(cache.k_pages, op, "cache k pages");
     require_contiguous_nonnull(cache.v_pages, op, "cache v pages");
@@ -152,16 +180,8 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
         return static_cast<std::uint32_t>(capacity);
     }
 
-    constexpr std::int32_t groups = kHeadDim / kQuantGroup;
-    if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
-        throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
-    }
-    require_shape(cache.k_scale_pages, groups, kPagedKVPageSize, kv_heads, physical_pages, op,
-                  "cache k scale pages");
-    require_shape(cache.v_scale_pages, groups, kPagedKVPageSize, kv_heads, physical_pages, op,
-                  "cache v scale pages");
-    require_contiguous_nonnull(cache.k_scale_pages, op, "cache k scale pages");
-    require_contiguous_nonnull(cache.v_scale_pages, op, "cache v scale pages");
+    validate_scale_planes(cache.k_scale_pages, cache.v_scale_pages, cache.dtype, kv_heads,
+                          physical_pages, op);
     return static_cast<std::uint32_t>(capacity);
 }
 
@@ -355,7 +375,7 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
                                                    std::int32_t batch_size, std::int32_t min_width,
                                                    std::int32_t max_width) {
     (void)kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
-    if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8) || batch_size <= 0 ||
+    if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8 && cache_dtype != DType::U8) || batch_size <= 0 ||
         batch_size > kMaximumBatchSize || min_width <= 0 || max_width < min_width ||
         (batch_size > 1 && max_width > kMaximumVerifyTokens) || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||

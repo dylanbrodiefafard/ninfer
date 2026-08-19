@@ -5,6 +5,7 @@
 #include "ops/kernel/gqa_attention_decode.cuh"
 #include "ops/kernel/gqa_attention_decode_bf16.cuh"
 #include "ops/kernel/gqa_attention_decode_i8.cuh"
+#include "ops/kernel/gqa_attention_decode_nvfp4.cuh"
 #include "core/device.h" // CUDA_CHECK
 #include "ninfer/ops/gqa_attention.h"
 
@@ -45,15 +46,16 @@ std::int32_t gqa_small_t_split_count(std::int32_t window, std::int32_t tokens, D
     // A 64-key default split just above a 32-key boundary makes the partial
     // kernel execute a nearly empty second tile. These short ranges instead
     // launch one 32-key tile per split; the larger CTAs keep the small grid busy.
-    if (kv_dtype == DType::I8 && tokens == 5 && window > 128 && window <= 512) {
+    const bool quantized = kv_dtype == DType::I8 || kv_dtype == DType::U8;
+    if (quantized && tokens == 5 && window > 128 && window <= 512) {
         return div_up(window, 32 / Geometry::DecodeSplitScale);
     }
-    if (kv_dtype == DType::I8 && tokens == 6 && window > 128 && window <= 160) {
+    if (quantized && tokens == 6 && window > 128 && window <= 160) {
         return div_up(window, 24 / Geometry::DecodeSplitScale);
     }
     // Bc=64 is one CTA/SM on these model shapes. Keep the 8K grid at or below
     // one 170-SM wave after accounting for the geometry's KV-head count.
-    if (kv_dtype == DType::I8 && tokens == 6 && window > 5000 && window <= 8198) {
+    if (quantized && tokens == 6 && window > 5000 && window <= 8198) {
         const std::int32_t splits   = div_up(window, 192 / Geometry::DecodeSplitScale);
         constexpr std::int32_t kMin = 4 * Geometry::DecodeSplitScale;
         constexpr std::int32_t kMax = 42 * Geometry::DecodeSplitScale;
@@ -199,6 +201,93 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
+void launch_tc_partial_nvfp4(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
+                             PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
+                             std::int32_t logical_capacity, std::int32_t implementation_window,
+                             std::int32_t splits, Tensor& partial_acc, Tensor& partial_m,
+                             Tensor& partial_l, cudaStream_t stream) {
+    Tensor& cache_k       = cache.k_pages;
+    Tensor& cache_v       = cache.v_pages;
+    Tensor& cache_k_scale = cache.k_scale_pages;
+    Tensor& cache_v_scale = cache.v_scale_pages;
+    auto launch = [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool DynamicArena>() {
+        const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
+        constexpr std::size_t kDynamicBytes =
+            DynamicArena
+                ? static_cast<std::size_t>(2 * KeyBlock * kGqaNvfp4CodeWidth +
+                                           2 * KeyBlock * kGqaHeadDim)
+                : 0u;
+        if constexpr (DynamicArena) {
+            static const cudaError_t attr = cudaFuncSetAttribute(
+                gqa_attention_decode_nvfp4_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
+                                                        MinBlocksPerSm, KeyBlock, DynamicArena,
+                                                        MultiBatch, Masked, CacheInput>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
+            CUDA_CHECK(attr);
+        }
+        gqa_attention_decode_nvfp4_tiled_kernel<Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm,
+                                                KeyBlock, DynamicArena, MultiBatch, Masked,
+                                                CacheInput>
+            <<<grid, WarpsPerCta * 32, kDynamicBytes, stream>>>(
+                static_cast<const __nv_bfloat16*>(q.data), input,
+                static_cast<const std::int32_t*>(pos.data), static_cast<std::uint8_t*>(cache_k.data),
+                static_cast<std::uint8_t*>(cache_v.data),
+                static_cast<std::uint8_t*>(cache_k_scale.data),
+                static_cast<std::uint8_t*>(cache_v_scale.data),
+                static_cast<const std::int32_t*>(cache.block_tables.data),
+                invocation.valid_columns == nullptr
+                    ? nullptr
+                    : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+                invocation.table_rows == nullptr
+                    ? nullptr
+                    : static_cast<const std::int32_t*>(invocation.table_rows->data),
+                cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
+                logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
+                static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+    };
+    if constexpr (TokenTile == 6) {
+        if (implementation_window > 128 && implementation_window <= 160) {
+            launch.template operator()<24, 1, 32, false>();
+        } else if (implementation_window <= 2054) {
+            launch.template operator()<12, 1, 32, false>();
+        } else if (implementation_window <= 8198) {
+            launch.template operator()<12, 1, 64, true>();
+        } else {
+            launch.template operator()<6, 2, 32, false>();
+        }
+    } else if constexpr (TokenTile == 5) {
+        if constexpr (Geometry::GroupSize == 6) {
+            if (implementation_window > 128 && implementation_window <= 512) {
+                launch.template operator()<32, 1, 32, false>();
+            } else if (implementation_window <= 1029) {
+                launch.template operator()<16, 1, 32, false>();
+            } else {
+                launch.template operator()<8, 2, 32, false>();
+            }
+        } else {
+            if (implementation_window > 128 && implementation_window <= 512) {
+                launch.template operator()<24, 1, 32, false>();
+            } else if (implementation_window <= 1029) {
+                launch.template operator()<24, 1, 32, false>();
+            } else if (implementation_window <= 4096) {
+                launch.template operator()<12, 1, 32, false>();
+            } else {
+                launch.template operator()<6, 2, 32, false>();
+            }
+        }
+    } else if constexpr (TokenTile == 4) {
+        if (implementation_window <= 1029) {
+            launch.template operator()<16, 1, 32, false>();
+        } else {
+            launch.template operator()<8, 2, 32, false>();
+        }
+    } else {
+        launch.template operator()<8, 2, 32, false>();
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
     return {
         .k_pages       = cache.k_pages,
@@ -219,7 +308,8 @@ bool gqa_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && tok
 
 std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                           DType cache_dtype, GqaExecutionEnvelope envelope) {
-    if (tokens < 1 || tokens > 6 || (cache_dtype != DType::BF16 && cache_dtype != DType::I8) ||
+    if (tokens < 1 || tokens > 6 ||
+        (cache_dtype != DType::BF16 && cache_dtype != DType::I8 && cache_dtype != DType::U8) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("gqa_attention split capacity: invalid profile");
     }
@@ -251,6 +341,10 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
         const auto launch_profile = [&]<bool MultiBatch, bool Masked>() {                          \
             if (cache.dtype == DType::I8) {                                                        \
                 launch_tc_partial_i8<Geometry, (TOKENS), MultiBatch, Masked>(                      \
+                    q, input, pos, scale, cache, invocation, logical_capacity,                     \
+                    implementation_window, splits, partial_acc, partial_m, partial_l, stream);     \
+            } else if (cache.dtype == DType::U8) {                                                 \
+                launch_tc_partial_nvfp4<Geometry, (TOKENS), MultiBatch, Masked>(                   \
                     q, input, pos, scale, cache, invocation, logical_capacity,                     \
                     implementation_window, splits, partial_acc, partial_m, partial_l, stream);     \
             } else {                                                                               \
@@ -336,7 +430,7 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
             launch_profile.template operator()<Int8, true, false>();
         }
     };
-    if (cache.dtype == DType::I8) {
+    if (cache.dtype == DType::I8 || cache.dtype == DType::U8) {
         launch_for_dtype.template operator()<true>();
     } else {
         launch_for_dtype.template operator()<false>();
