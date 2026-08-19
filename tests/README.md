@@ -143,6 +143,11 @@ NINFER_QWEN3_6_35B_A3B_WEIGHTS=$PWD/out/qwen3_6_35b_a3b.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_35b_a3b_ram_real_test --output-on-failure
 ```
 
+```bash
+NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_6_27b.ninfer \
+  ctest --test-dir build -R ninfer_serve_system_prepend_real_test --output-on-failure
+```
+
 Run the peer 35B-A3B route independently:
 
 ```bash
@@ -150,8 +155,8 @@ NINFER_QWEN3_6_35B_A3B_WEIGHTS=$PWD/out/qwen3_6_35b_a3b.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_35b_a3b_real_test --output-on-failure
 ```
 
-Without the corresponding variable CTest marks each C++ integration test as skipped. Neither test
-uses another numerical/execution path's generated tokens as a golden.
+Without the corresponding variable CTest marks each C++ integration test as skipped. These tests
+do not use another numerical/execution path's generated tokens as a golden.
 
 The capability-evaluation coordinator has its own environment and unittest entry point:
 

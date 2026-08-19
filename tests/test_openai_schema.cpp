@@ -14,6 +14,7 @@
 #include <functional>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace {
@@ -73,10 +74,10 @@ ninfer::OwnedMedia fake_media(const ContentPart& part) {
     return media;
 }
 
-ninfer::PromptInput translate(const GenerationRequest& req) {
+ninfer::PromptInput translate(const GenerationRequest& req, std::string_view system_prepend = {}) {
     const ServeOptions server = default_server();
     return to_prompt_input(req, resolve_prompt_semantics(req, server, effort_capabilities()),
-                           fake_media);
+                           fake_media, system_prepend);
 }
 
 std::string joined_text(const ninfer::ChatMessage& message) {
@@ -787,6 +788,123 @@ int test_finish_reason_wire() {
     return failures;
 }
 
+int test_system_prepend_merge() {
+    int failures = 0;
+
+    const GenerationRequest user_only = parse_chat_completion_request(
+        Json{{"model", "m"},
+             {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})}},
+        default_limits());
+    const ninfer::PromptInput inserted = translate(user_only, "P");
+    failures += check(inserted.messages.size() == 2, "user-only prepend message count");
+    failures += check(inserted.messages[0].role == ninfer::ChatRole::System &&
+                          joined_text(inserted.messages[0]) == "P",
+                      "user-only prepend did not insert a leading System");
+    failures += check(inserted.messages[1].role == ninfer::ChatRole::User &&
+                          joined_text(inserted.messages[1]) == "hello",
+                      "user-only prepend did not keep the original user turn");
+
+    const GenerationRequest leading_system = parse_chat_completion_request(
+        Json{{"model", "m"},
+             {"messages", Json::array({Json{{"role", "system"}, {"content", "Be brief."}},
+                                      Json{{"role", "user"}, {"content", "hello"}}})}},
+        default_limits());
+    const ninfer::PromptInput merged = translate(leading_system, "P");
+    failures += check(merged.messages.size() == 2, "leading system prepend message count");
+    failures += check(merged.messages[0].role == ninfer::ChatRole::System &&
+                          joined_text(merged.messages[0]) == "P\n\nBe brief.",
+                      "leading system text was not prepended");
+
+    const GenerationRequest empty_system = parse_chat_completion_request(
+        Json{{"model", "m"},
+             {"messages", Json::array({Json{{"role", "system"}, {"content", ""}},
+                                      Json{{"role", "user"}, {"content", "hello"}}})}},
+        default_limits());
+    const ninfer::PromptInput empty_merged = translate(empty_system, "P");
+    failures += check(empty_merged.messages[0].role == ninfer::ChatRole::System &&
+                          joined_text(empty_merged.messages[0]) == "P",
+                      "empty system prepend added a blank separator");
+
+    const GenerationRequest late_system = parse_chat_completion_request(
+        Json{{"model", "m"},
+             {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}},
+                                      Json{{"role", "system"}, {"content", "later"}}})}},
+        default_limits());
+    const ninfer::PromptInput late = translate(late_system, "P");
+    failures += check(late.messages.size() == 3, "late system prepend message count");
+    failures += check(late.messages[0].role == ninfer::ChatRole::System &&
+                          joined_text(late.messages[0]) == "P",
+                      "late system prepend did not insert a leading System");
+    failures += check(late.messages[1].role == ninfer::ChatRole::User &&
+                          joined_text(late.messages[1]) == "hello",
+                      "late system prepend moved the user turn");
+    failures += check(late.messages[2].role == ninfer::ChatRole::System &&
+                          joined_text(late.messages[2]) == "later",
+                      "late system turn was not left in place");
+
+    const GenerationRequest follow_up = parse_chat_completion_request(
+        Json{{"model", "m"},
+             {"messages", Json::array({Json{{"role", "system"}, {"content", "Be brief."}},
+                                      Json{{"role", "user"}, {"content", "q1"}},
+                                      Json{{"role", "assistant"}, {"content", "old"}},
+                                      Json{{"role", "user"}, {"content", "q2"}}})}},
+        default_limits());
+    const ninfer::PromptInput follow = translate(follow_up, "P");
+    failures += check(follow.messages[0].role == ninfer::ChatRole::System &&
+                          joined_text(follow.messages[0]).starts_with("P\n\nBe brief."),
+                      "follow-up prepend did not target the leading system");
+
+    const Json tool =
+        Json{{"type", "function"},
+             {"function",
+              Json{{"name", "get_weather"},
+                   {"description", "Fetch weather"},
+                   {"parameters", Json{{"type", "object"},
+                                       {"properties", Json{{"city", Json{{"type", "string"}}}}},
+                                       {"required", Json::array({"city"})}}},
+                   {"strict", true}}}};
+    const GenerationRequest with_tools = parse_chat_completion_request(
+        Json{{"model", "m"},
+             {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})},
+             {"tools", Json::array({tool})}},
+        default_limits());
+    const ninfer::PromptInput tooled = translate(with_tools, "P");
+    failures += check(!tooled.options.tool_jsons.empty(), "tools were dropped when prepending");
+    failures += check(tooled.messages[0].role == ninfer::ChatRole::System &&
+                          joined_text(tooled.messages[0]) == "P",
+                      "tools request prepend did not insert a leading System");
+
+    const GenerationRequest tool_history = parse_chat_completion_request(
+        Json{{"model", "m"},
+             {"messages",
+              Json::array(
+                  {Json{{"role", "user"}, {"content", "weather?"}},
+                   Json{{"role", "assistant"},
+                        {"content", nullptr},
+                        {"tool_calls",
+                         Json::array({Json{{"id", "call_1"},
+                                           {"type", "function"},
+                                           {"function", Json{{"name", "get_weather"},
+                                                             {"arguments", R"({"city":"Paris"})"}}}}})}},
+                   Json{{"role", "tool"},
+                        {"tool_call_id", "call_1"},
+                        {"content", R"({"temp":20})"}}})},
+             {"tools", Json::array({tool})}},
+        default_limits());
+    const ninfer::PromptInput looped = translate(tool_history, "P");
+    failures += check(!looped.options.tool_jsons.empty(), "tool-loop tools were dropped when prepending");
+    failures += check(looped.messages[0].role == ninfer::ChatRole::System &&
+                          joined_text(looped.messages[0]) == "P",
+                      "tool-loop prepend did not insert a leading System");
+    failures += check(looped.messages[2].tool_calls.size() == 1 &&
+                          looped.messages[2].tool_calls[0].name == "get_weather",
+                      "tool-loop assistant tool call was lost");
+    failures += check(looped.messages[3].role == ninfer::ChatRole::Tool &&
+                          joined_text(looped.messages[3]) == R"({"temp":20})",
+                      "tool-loop tool result was lost");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -808,6 +926,7 @@ int main() {
     failures += test_tool_chunk_serialization();
     failures += test_models_and_error();
     failures += test_finish_reason_wire();
+    failures += test_system_prepend_merge();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
