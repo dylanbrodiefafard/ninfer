@@ -186,6 +186,10 @@ ninfer_add_test(ninfer_tool_call_parser_test
 ninfer_add_test(ninfer_serve_options_test
   SOURCES test_serve_options.cpp
   LIBRARIES ninfer_serve)
+ninfer_add_test(ninfer_serve_system_prepend_real_test
+  SOURCES test_serve_system_prepend_real.cpp
+  LIBRARIES ninfer_serve ninfer_engine)
+set_tests_properties(ninfer_serve_system_prepend_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_request_log_test
   SOURCES test_request_log.cpp
   LIBRARIES ninfer_serve)

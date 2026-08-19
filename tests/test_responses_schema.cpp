@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <functional>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -41,6 +42,18 @@ ninfer::PromptCapabilities effort_capabilities() {
     capabilities.reasoning_effort.xhigh          = true;
     capabilities.reasoning_effort.default_effort = ninfer::ReasoningEffort::XHigh;
     return capabilities;
+}
+
+ninfer::OwnedMedia unused_media(const ContentPart&) {
+    throw std::logic_error("media acquisition was not expected");
+}
+
+std::string joined_text(const ninfer::ChatMessage& message) {
+    std::string text;
+    for (const ninfer::MessagePart& part : message.parts) {
+        if (part.kind == ninfer::MessagePartKind::Text) { text += part.text; }
+    }
+    return text;
 }
 
 bool throws_api(const std::function<void()>& fn) {
@@ -513,6 +526,59 @@ int test_input_tokens_schema() {
     return failures;
 }
 
+int test_system_prepend() {
+    int failures = 0;
+    ServeOptions server;
+
+    ResponsesRequest instructed =
+        parse_responses_request(Json{{"model", "m"},
+                                     {"input", "hello"},
+                                     {"instructions", "be concise"},
+                                     {"max_output_tokens", 32}},
+                                limits());
+    compose_responses_generation_messages(instructed, {});
+    failures += check(instructed.generation.messages[0].role == ninfer::ChatRole::Developer,
+                      "instructions did not compose as Developer");
+    const ninfer::PromptInput merged = to_prompt_input(
+        instructed.generation,
+        resolve_prompt_semantics(instructed.generation, server, effort_capabilities()),
+        unused_media, "P");
+    failures += check(merged.messages[0].role == ninfer::ChatRole::Developer &&
+                          joined_text(merged.messages[0]) == "P\n\nbe concise",
+                      "Responses instructions were not prepended as Developer");
+    failures += check(instructed.input_turns.size() == 1 &&
+                          instructed.input_turns[0].content[0].text == "hello",
+                      "Responses input_turns changed when prepending instructions");
+
+    ResponsesRequest follow =
+        parse_responses_request(Json{{"model", "m"}, {"input", "q2"}, {"max_output_tokens", 32}},
+                                limits());
+    ChatTurn previous_user;
+    previous_user.role = ninfer::ChatRole::User;
+    ContentPart q1;
+    q1.kind = ContentKind::Text;
+    q1.text = "q1";
+    previous_user.content.push_back(std::move(q1));
+    ChatTurn previous_assistant;
+    previous_assistant.role = ninfer::ChatRole::Assistant;
+    ContentPart old;
+    old.kind = ContentKind::Text;
+    old.text = "old";
+    previous_assistant.content.push_back(std::move(old));
+    compose_responses_generation_messages(follow, {previous_user, previous_assistant});
+    const ninfer::PromptInput inserted = to_prompt_input(
+        follow.generation, resolve_prompt_semantics(follow.generation, server, effort_capabilities()),
+        unused_media, "P");
+    failures += check(inserted.messages[0].role == ninfer::ChatRole::System &&
+                          joined_text(inserted.messages[0]) == "P",
+                      "Responses follow-up did not insert a leading System");
+    failures += check(follow.input_turns.size() == 1 &&
+                          follow.input_turns[0].role == ninfer::ChatRole::User &&
+                          follow.input_turns[0].content[0].text == "q2",
+                      "Responses follow-up input_turns were mutated");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -527,6 +593,7 @@ int main() {
     failures += test_sse_sequence();
     failures += test_sse_function_call();
     failures += test_input_tokens_schema();
+    failures += test_system_prepend();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
