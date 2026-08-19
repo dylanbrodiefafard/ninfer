@@ -63,6 +63,7 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
 
     cudaStream_t compute = nullptr;
     cudaStream_t load    = nullptr;
+    cudaStream_t copy    = nullptr;
     err                  = cudaStreamCreateWithFlags(&compute, cudaStreamNonBlocking);
     if (err != cudaSuccess) {
         throw std::runtime_error(
@@ -76,31 +77,43 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
             cuda_error_message("cudaStreamCreateWithFlags(load_stream) failed", err));
     }
 
+    err = cudaStreamCreateWithFlags(&copy, cudaStreamNonBlocking);
+    if (err != cudaSuccess) {
+        destroy_stream(load);
+        destroy_stream(compute);
+        throw std::runtime_error(
+            cuda_error_message("cudaStreamCreateWithFlags(copy_stream) failed", err));
+    }
+
     stream      = compute;
     load_stream = load;
+    copy_stream = copy;
 }
 
 DeviceContext::~DeviceContext() {
-    if (stream != nullptr || load_stream != nullptr) {
+    if (stream != nullptr || load_stream != nullptr || copy_stream != nullptr) {
         log_cuda_error("cudaSetDevice", cudaSetDevice(device));
     }
+    destroy_stream(copy_stream);
     destroy_stream(load_stream);
     destroy_stream(stream);
 }
 
 DeviceContext::DeviceContext(DeviceContext&& other) noexcept
     : device(other.device), stream(other.stream), load_stream(other.load_stream),
-      props(other.props) {
+      copy_stream(other.copy_stream), props(other.props) {
     other.stream      = nullptr;
     other.load_stream = nullptr;
+    other.copy_stream = nullptr;
 }
 
 DeviceContext& DeviceContext::operator=(DeviceContext&& other) noexcept {
     if (this == &other) { return *this; }
 
-    if (stream != nullptr || load_stream != nullptr) {
+    if (stream != nullptr || load_stream != nullptr || copy_stream != nullptr) {
         log_cuda_error("cudaSetDevice", cudaSetDevice(device));
     }
+    destroy_stream(copy_stream);
     destroy_stream(load_stream);
     destroy_stream(stream);
 
@@ -108,9 +121,11 @@ DeviceContext& DeviceContext::operator=(DeviceContext&& other) noexcept {
     props       = other.props;
     stream      = other.stream;
     load_stream = other.load_stream;
+    copy_stream = other.copy_stream;
 
     other.stream      = nullptr;
     other.load_stream = nullptr;
+    other.copy_stream = nullptr;
     return *this;
 }
 
@@ -119,6 +134,19 @@ int DeviceContext::sm() const noexcept { return props.major * 10 + props.minor; 
 std::size_t DeviceContext::total_vram() const noexcept { return props.totalGlobalMem; }
 
 void DeviceContext::synchronize() const { CUDA_CHECK(cudaStreamSynchronize(stream)); }
+
+void DeviceContext::synchronize_all() const {
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaStreamSynchronize(copy_stream));
+}
+
+void DeviceContext::order_copy_after_compute() const {
+    cudaEvent_t done = nullptr;
+    CUDA_CHECK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventRecord(done, stream));
+    CUDA_CHECK(cudaStreamWaitEvent(copy_stream, done, 0));
+    CUDA_CHECK(cudaEventDestroy(done));
+}
 
 CudaEventTimer::CudaEventTimer(const DeviceContext& ctx) : stream_(ctx.stream) {
     cudaError_t err = cudaSetDevice(ctx.device);

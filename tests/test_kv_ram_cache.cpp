@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -184,7 +185,7 @@ int round_trip_pool(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool,
         return 1;
     }
     ninfer::pack_paged_kv_allocation_to_host(source, pool, image, ctx.stream);
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     int failures = 0;
     if (pool.plane_order() == ninfer::PagedKVPlaneOrder::PageMajor) {
         failures += expect_host_page_major_layout(static_cast<const unsigned char*>(image), pool,
@@ -199,7 +200,7 @@ int round_trip_pool(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool,
     destination.materialize_pages(mapped);
     ninfer::unpack_paged_kv_allocation_from_host(destination, pool, image, captured, mapped,
                                                  ctx.stream);
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     failures += expect_logical_pages(pool, destination, seed, label);
     destination.release();
     return failures;
@@ -259,12 +260,45 @@ int capture_text_entry(ninfer::targets::qwen3_6::detail::KVRamCache& cache,
     return cache.capture(source) ? 0 : 1;
 }
 
+int capture_with_hidden(ninfer::targets::qwen3_6::detail::KVRamCache& cache,
+                        ninfer::PagedKVPool& pool, ninfer::PagedKVAllocation& alloc,
+                        const ninfer::targets::qwen3_6::PreparedPromptData& prompt,
+                        const ninfer::Tensor& hidden, cudaStream_t stream) {
+    ninfer::targets::qwen3_6::PreparedPromptData retained = prompt;
+    retained.token_ids.push_back(0);
+    retained.token_types.push_back(0);
+    const std::size_t tokens = retained.token_ids.size();
+    retained.positions.resize(3 * tokens);
+    for (int axis = 0; axis < 3; ++axis) {
+        for (std::size_t i = 0; i < tokens; ++i) {
+            retained.positions[static_cast<std::size_t>(axis) * tokens + i] =
+                static_cast<std::int32_t>(i);
+        }
+    }
+    ninfer::targets::qwen3_6::detail::ResidentPrefixIdentity identity;
+    identity.assign(retained);
+    ninfer::targets::qwen3_6::detail::RamCaptureSource source;
+    source.execution_frontier = static_cast<std::uint32_t>(prompt.token_ids.size());
+    source.ledger_frontier    = static_cast<std::uint32_t>(tokens);
+    source.text_kv_valid      = source.execution_frontier;
+    source.tail_hidden_valid  = true;
+    source.ledger             = retained.token_ids;
+    source.identity           = &identity;
+    source.hash_f             = ninfer::targets::qwen3_6::detail::prefix_hash_at(
+        retained.token_ids, identity, source.execution_frontier);
+    source.text        = &alloc;
+    source.text_pool   = &pool;
+    source.tail_hidden = &hidden;
+    source.stream      = stream;
+    return cache.capture(source) ? 0 : 1;
+}
+
 int test_kv_ram_index(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     namespace q36 = ninfer::targets::qwen3_6;
     int failures  = 0;
     auto alloc    = pool.reserve(2);
     alloc.materialize_pages(1, ctx.stream);
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
 
     const auto prompt_a = text_prompt({10, 11, 12, 13});
     const auto prompt_b = text_prompt({20, 21, 22, 23});
@@ -274,12 +308,12 @@ int test_kv_ram_index(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     const auto chain_c  = q36::detail::prefix_hash_chain(prompt_c);
 
     q36::detail::KVRamCache probe(8ULL << 20);
-    if (capture_text_entry(probe, pool, alloc, prompt_a, ctx.stream) != 0) {
+    if (capture_text_entry(probe, pool, alloc, prompt_a, ctx.copy_stream) != 0) {
         std::cerr << "RAM probe capture failed\n";
         alloc.release();
         return 1;
     }
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     const std::size_t entry_bytes = probe.snapshot().used_bytes;
     if (entry_bytes == 0) {
         std::cerr << "RAM probe capture used zero bytes\n";
@@ -288,26 +322,26 @@ int test_kv_ram_index(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     }
 
     q36::detail::KVRamCache oversize(4096);
-    if (capture_text_entry(oversize, pool, alloc, prompt_a, ctx.stream) == 0 ||
+    if (capture_text_entry(oversize, pool, alloc, prompt_a, ctx.copy_stream) == 0 ||
         oversize.snapshot().drops == 0) {
         std::cerr << "oversize capture did not drop\n";
         ++failures;
     }
 
     q36::detail::KVRamCache pinned(entry_bytes);
-    if (capture_text_entry(pinned, pool, alloc, prompt_a, ctx.stream) != 0) {
+    if (capture_text_entry(pinned, pool, alloc, prompt_a, ctx.copy_stream) != 0) {
         std::cerr << "single-entry RAM capture failed\n";
         alloc.release();
         return failures + 1;
     }
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     const auto pinned_match = pinned.plan_match(prompt_a, chain_a);
     if (!pinned_match) {
         std::cerr << "single-entry RAM capture did not match\n";
         ++failures;
     } else {
         pinned.claim(pinned_match->entry_id);
-        if (capture_text_entry(pinned, pool, alloc, prompt_b, ctx.stream) == 0 ||
+        if (capture_text_entry(pinned, pool, alloc, prompt_b, ctx.copy_stream) == 0 ||
             pinned.snapshot().drops == 0 || pinned.snapshot().entry_count != 1) {
             std::cerr << "claimed RAM entry did not survive a capture storm\n";
             ++failures;
@@ -330,13 +364,13 @@ int test_kv_ram_index(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     }
 
     q36::detail::KVRamCache cache(4ULL << 20);
-    if (capture_text_entry(cache, pool, alloc, prompt_a, ctx.stream) != 0 ||
-        capture_text_entry(cache, pool, alloc, prompt_b, ctx.stream) != 0) {
+    if (capture_text_entry(cache, pool, alloc, prompt_a, ctx.copy_stream) != 0 ||
+        capture_text_entry(cache, pool, alloc, prompt_b, ctx.copy_stream) != 0) {
         std::cerr << "RAM index capture failed\n";
         alloc.release();
         return failures + 1;
     }
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
 
     const auto match_a = cache.plan_match(prompt_a, chain_a);
     const auto match_b = cache.plan_match(prompt_b, chain_b);
@@ -366,12 +400,12 @@ int test_kv_ram_index(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     vision.token_types.assign(4, static_cast<std::uint8_t>(q36::PromptModality::Image));
     vision.vision_items.push_back(item);
     q36::detail::KVRamCache vision_cache(4ULL << 20);
-    if (capture_text_entry(vision_cache, pool, alloc, vision, ctx.stream) != 0) {
+    if (capture_text_entry(vision_cache, pool, alloc, vision, ctx.copy_stream) != 0) {
         std::cerr << "vision RAM capture failed\n";
         alloc.release();
         return failures + 1;
     }
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     const auto vision_match =
         vision_cache.plan_match(vision, q36::detail::prefix_hash_chain(vision));
     if (!vision_match) {
@@ -389,12 +423,12 @@ int test_kv_ram_index(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     }
 
     q36::detail::KVRamCache two(entry_bytes * 2 + 256);
-    if (capture_text_entry(two, pool, alloc, prompt_a, ctx.stream) != 0 ||
-        capture_text_entry(two, pool, alloc, prompt_b, ctx.stream) != 0) {
+    if (capture_text_entry(two, pool, alloc, prompt_a, ctx.copy_stream) != 0 ||
+        capture_text_entry(two, pool, alloc, prompt_b, ctx.copy_stream) != 0) {
         std::cerr << "two-entry RAM capture failed\n";
         ++failures;
     } else {
-        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+        ctx.synchronize_all();
         const auto keep = two.plan_match(prompt_a, chain_a);
         if (!keep) {
             std::cerr << "two-entry cache lost prompt A\n";
@@ -410,8 +444,8 @@ int test_kv_ram_index(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
                 std::cerr << "plan_match returned a claimed RAM entry\n";
                 ++failures;
             }
-            (void)capture_text_entry(two, pool, alloc, prompt_c, ctx.stream);
-            CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+            (void)capture_text_entry(two, pool, alloc, prompt_c, ctx.copy_stream);
+            ctx.synchronize_all();
             if (two.plan_match(prompt_a, chain_a) || two.plan_match(prompt_b, chain_b) ||
                 two.snapshot().entry_count != 2) {
                 std::cerr << "pinned FIFO eviction removed the claimed entry\n";
@@ -427,12 +461,12 @@ int test_kv_ram_index(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     }
 
     q36::detail::KVRamCache fifo(4ULL << 20);
-    if (capture_text_entry(fifo, pool, alloc, prompt_a, ctx.stream) != 0 ||
-        capture_text_entry(fifo, pool, alloc, prompt_a, ctx.stream) != 0) {
+    if (capture_text_entry(fifo, pool, alloc, prompt_a, ctx.copy_stream) != 0 ||
+        capture_text_entry(fifo, pool, alloc, prompt_a, ctx.copy_stream) != 0) {
         std::cerr << "duplicate RAM capture failed\n";
         ++failures;
     } else {
-        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+        ctx.synchronize_all();
         const auto oldest = fifo.plan_match(prompt_a, chain_a);
         if (!oldest || oldest->reuse_base != prompt_a.token_ids.size()) {
             std::cerr << "duplicate RAM captures did not match the captured frontier\n";
@@ -458,8 +492,8 @@ int test_kv_ram_index(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     }
 
     q36::detail::KVRamCache lengths(8ULL << 20);
-    if (capture_text_entry(lengths, pool, alloc, prompt_a, ctx.stream) != 0 ||
-        capture_text_entry(lengths, pool, alloc, longer, ctx.stream) != 0) {
+    if (capture_text_entry(lengths, pool, alloc, prompt_a, ctx.copy_stream) != 0 ||
+        capture_text_entry(lengths, pool, alloc, longer, ctx.copy_stream) != 0) {
         std::cerr << "different-length RAM capture failed\n";
         ++failures;
     } else {
@@ -472,7 +506,7 @@ int test_kv_ram_index(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
 
     auto checkpoint_prompt = text_prompt({10, 11, 12, 13});
     q36::detail::KVRamCache checkpoint(8ULL << 20);
-    if (capture_text_entry(checkpoint, pool, alloc, checkpoint_prompt, ctx.stream, 2) != 0) {
+    if (capture_text_entry(checkpoint, pool, alloc, checkpoint_prompt, ctx.copy_stream, 2) != 0) {
         std::cerr << "checkpoint RAM capture failed\n";
         ++failures;
     } else {
@@ -487,17 +521,17 @@ int test_kv_ram_index(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     }
 
     q36::detail::KVRamCache tight(entry_bytes + 256);
-    if (capture_text_entry(tight, pool, alloc, prompt_a, ctx.stream) != 0) {
+    if (capture_text_entry(tight, pool, alloc, prompt_a, ctx.copy_stream) != 0) {
         std::cerr << "tight FIFO first capture failed\n";
         ++failures;
     } else {
-        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+        ctx.synchronize_all();
         const auto evictions_before = tight.snapshot().evictions;
-        if (capture_text_entry(tight, pool, alloc, prompt_b, ctx.stream) != 0) {
+        if (capture_text_entry(tight, pool, alloc, prompt_b, ctx.copy_stream) != 0) {
             std::cerr << "tight FIFO second capture failed\n";
             ++failures;
         } else {
-            CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+            ctx.synchronize_all();
             if (tight.plan_match(prompt_a, chain_a) || !tight.plan_match(prompt_b, chain_b) ||
                 tight.snapshot().evictions <= evictions_before) {
                 std::cerr << "unpinned FIFO eviction did not drop the oldest entry\n";
@@ -516,11 +550,11 @@ int test_unpack_consume_and_drop(ninfer::DeviceContext& ctx, ninfer::PagedKVPool
     auto source   = pool.reserve(2);
     source.materialize_pages(2, ctx.stream);
     fill_logical_pages(pool, source, 13);
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
 
     const auto prompt = text_prompt({40, 41, 42, 43});
     q36::detail::KVRamCache cache(8ULL << 20);
-    if (capture_text_entry(cache, pool, source, prompt, ctx.stream) != 0) {
+    if (capture_text_entry(cache, pool, source, prompt, ctx.copy_stream) != 0) {
         std::cerr << "unpack-consume capture failed\n";
         source.release();
         return 1;
@@ -545,7 +579,7 @@ int test_unpack_consume_and_drop(ninfer::DeviceContext& ctx, ninfer::PagedKVPool
     full_target.text           = &full;
     full_target.text_pool      = &pool;
     full_target.text_dst_pages = 2;
-    full_target.stream         = ctx.stream;
+    full_target.stream         = ctx.copy_stream;
     cache.claim(match->entry_id);
     (void)cache.unpack_device(match->entry_id, full_target);
     const auto loaded = cache.harvest_copy_seconds();
@@ -565,9 +599,9 @@ int test_unpack_consume_and_drop(ninfer::DeviceContext& ctx, ninfer::PagedKVPool
     auto again = pool.reserve(2);
     again.materialize_pages(2, ctx.stream);
     fill_logical_pages(pool, again, 14);
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     q36::detail::KVRamCache prefix_cache(8ULL << 20);
-    if (capture_text_entry(prefix_cache, pool, again, prompt, ctx.stream) != 0) {
+    if (capture_text_entry(prefix_cache, pool, again, prompt, ctx.copy_stream) != 0) {
         std::cerr << "prefix-unpack capture failed\n";
         again.release();
         return failures + 1;
@@ -585,7 +619,7 @@ int test_unpack_consume_and_drop(ninfer::DeviceContext& ctx, ninfer::PagedKVPool
     prefix_target.text           = &prefix_dest;
     prefix_target.text_pool      = &pool;
     prefix_target.text_dst_pages = 1;
-    prefix_target.stream         = ctx.stream;
+    prefix_target.stream         = ctx.copy_stream;
     prefix_cache.claim(prefix_match->entry_id);
     (void)prefix_cache.unpack_device(prefix_match->entry_id, prefix_target);
     prefix_cache.consume(prefix_match->entry_id);
@@ -596,7 +630,7 @@ int test_unpack_consume_and_drop(ninfer::DeviceContext& ctx, ninfer::PagedKVPool
     auto tiny_source = pool.reserve(2);
     tiny_source.materialize_pages(2, ctx.stream);
     const auto drops_before = tiny.snapshot().drops;
-    if (capture_text_entry(tiny, pool, tiny_source, prompt, ctx.stream) == 0 ||
+    if (capture_text_entry(tiny, pool, tiny_source, prompt, ctx.copy_stream) == 0 ||
         tiny.snapshot().drops <= drops_before || tiny.snapshot().entry_count != 0) {
         std::cerr << "over-capacity capture did not drop\n";
         ++failures;
@@ -637,7 +671,7 @@ int test_frontier_beats_checkpoint(ninfer::DeviceContext& ctx, ninfer::PagedKVPo
     alloc.materialize_pages(1, ctx.stream);
     const auto prompt = text_prompt({10, 11, 12, 13});
     q36::detail::KVRamCache cache(8ULL << 20);
-    if (capture_text_entry(cache, pool, alloc, prompt, ctx.stream, 2) != 0) {
+    if (capture_text_entry(cache, pool, alloc, prompt, ctx.copy_stream, 2) != 0) {
         alloc.release();
         return fail("frontier-beats-checkpoint capture failed");
     }
@@ -659,21 +693,21 @@ int test_asymmetric_fifo(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) 
     auto small          = pool.reserve(1);
     small.materialize_pages(1, ctx.stream);
     q36::detail::KVRamCache probe(8ULL << 20);
-    if (capture_text_entry(probe, pool, small, prompt_a, ctx.stream) != 0) {
+    if (capture_text_entry(probe, pool, small, prompt_a, ctx.copy_stream) != 0) {
         small.release();
         return fail("asymmetric FIFO probe capture failed");
     }
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     const std::size_t small_bytes = probe.snapshot().used_bytes;
     auto large                    = pool.reserve(2);
     large.materialize_pages(2, ctx.stream);
     q36::detail::KVRamCache large_probe(8ULL << 20);
-    if (capture_text_entry(large_probe, pool, large, prompt_c, ctx.stream) != 0) {
+    if (capture_text_entry(large_probe, pool, large, prompt_c, ctx.copy_stream) != 0) {
         small.release();
         large.release();
         return fail("asymmetric FIFO large probe capture failed");
     }
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     const std::size_t large_bytes = large_probe.snapshot().used_bytes;
     if (large_bytes <= small_bytes) {
         small.release();
@@ -681,21 +715,21 @@ int test_asymmetric_fifo(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) 
         return fail("two-page capture was not larger than one-page capture");
     }
     q36::detail::KVRamCache cache(small_bytes * 2 + 256);
-    if (capture_text_entry(cache, pool, small, prompt_a, ctx.stream) != 0 ||
-        capture_text_entry(cache, pool, small, prompt_b, ctx.stream) != 0) {
+    if (capture_text_entry(cache, pool, small, prompt_a, ctx.copy_stream) != 0 ||
+        capture_text_entry(cache, pool, small, prompt_b, ctx.copy_stream) != 0) {
         small.release();
         large.release();
         return fail("asymmetric FIFO small captures failed");
     }
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     const auto evictions_before = cache.snapshot().evictions;
     const auto drops_before     = cache.snapshot().drops;
-    if (capture_text_entry(cache, pool, large, prompt_c, ctx.stream) != 0) {
+    if (capture_text_entry(cache, pool, large, prompt_c, ctx.copy_stream) != 0) {
         small.release();
         large.release();
         return fail("asymmetric FIFO large capture failed");
     }
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     int failures = 0;
     if (cache.snapshot().evictions < evictions_before + 2 || cache.snapshot().drops != drops_before ||
         cache.snapshot().entry_count != 1 ||
@@ -721,23 +755,23 @@ int test_fifo_consume_middle(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& po
     auto alloc          = pool.reserve(1);
     alloc.materialize_pages(1, ctx.stream);
     q36::detail::KVRamCache cache(8ULL << 20);
-    if (capture_text_entry(cache, pool, alloc, prompt_a, ctx.stream) != 0) {
+    if (capture_text_entry(cache, pool, alloc, prompt_a, ctx.copy_stream) != 0) {
         alloc.release();
         return fail("FIFO middle first capture failed");
     }
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     const std::size_t bytes_a = cache.snapshot().used_bytes;
-    if (capture_text_entry(cache, pool, alloc, prompt_b, ctx.stream) != 0) {
+    if (capture_text_entry(cache, pool, alloc, prompt_b, ctx.copy_stream) != 0) {
         alloc.release();
         return fail("FIFO middle second capture failed");
     }
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     const std::size_t bytes_ab = cache.snapshot().used_bytes;
-    if (capture_text_entry(cache, pool, alloc, prompt_c, ctx.stream) != 0) {
+    if (capture_text_entry(cache, pool, alloc, prompt_c, ctx.copy_stream) != 0) {
         alloc.release();
         return fail("FIFO middle third capture failed");
     }
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     const std::size_t bytes_abc = cache.snapshot().used_bytes;
     const std::size_t bytes_c   = bytes_abc - bytes_ab;
     const auto match_b          = cache.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b));
@@ -771,21 +805,21 @@ int test_fifo_evict_after_middle_consume(ninfer::DeviceContext& ctx, ninfer::Pag
     auto small          = pool.reserve(1);
     small.materialize_pages(1, ctx.stream);
     q36::detail::KVRamCache probe(8ULL << 20);
-    if (capture_text_entry(probe, pool, small, prompt_a, ctx.stream) != 0) {
+    if (capture_text_entry(probe, pool, small, prompt_a, ctx.copy_stream) != 0) {
         small.release();
         return fail("FIFO hole probe capture failed");
     }
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     const std::size_t small_bytes = probe.snapshot().used_bytes;
     auto large                    = pool.reserve(2);
     large.materialize_pages(2, ctx.stream);
     q36::detail::KVRamCache large_probe(8ULL << 20);
-    if (capture_text_entry(large_probe, pool, large, prompt_d, ctx.stream) != 0) {
+    if (capture_text_entry(large_probe, pool, large, prompt_d, ctx.copy_stream) != 0) {
         small.release();
         large.release();
         return fail("FIFO hole large probe capture failed");
     }
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     const std::size_t large_bytes = large_probe.snapshot().used_bytes;
     if (large_bytes <= small_bytes || large_bytes > small_bytes * 2) {
         small.release();
@@ -793,14 +827,14 @@ int test_fifo_evict_after_middle_consume(ninfer::DeviceContext& ctx, ninfer::Pag
         return fail("FIFO hole large capture does not force exactly one eviction after a hole");
     }
     q36::detail::KVRamCache cache(small_bytes * 3 + 256);
-    if (capture_text_entry(cache, pool, small, prompt_a, ctx.stream) != 0 ||
-        capture_text_entry(cache, pool, small, prompt_b, ctx.stream) != 0 ||
-        capture_text_entry(cache, pool, small, prompt_c, ctx.stream) != 0) {
+    if (capture_text_entry(cache, pool, small, prompt_a, ctx.copy_stream) != 0 ||
+        capture_text_entry(cache, pool, small, prompt_b, ctx.copy_stream) != 0 ||
+        capture_text_entry(cache, pool, small, prompt_c, ctx.copy_stream) != 0) {
         small.release();
         large.release();
         return fail("FIFO hole small captures failed");
     }
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     const auto match_b = cache.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b));
     if (!match_b) {
         small.release();
@@ -811,12 +845,12 @@ int test_fifo_evict_after_middle_consume(ninfer::DeviceContext& ctx, ninfer::Pag
     cache.consume(match_b->entry_id);
     const auto evictions_before = cache.snapshot().evictions;
     const auto drops_before     = cache.snapshot().drops;
-    if (capture_text_entry(cache, pool, large, prompt_d, ctx.stream) != 0) {
+    if (capture_text_entry(cache, pool, large, prompt_d, ctx.copy_stream) != 0) {
         small.release();
         large.release();
         return fail("FIFO hole large capture failed");
     }
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     int failures = 0;
     if (cache.snapshot().evictions != evictions_before + 1 || cache.snapshot().drops != drops_before ||
         cache.snapshot().entry_count != 2 ||
@@ -840,29 +874,30 @@ int test_prefix_unpack_preserves_tail(ninfer::DeviceContext& ctx, ninfer::PagedK
     auto source   = pool.reserve(2);
     source.materialize_pages(2, ctx.stream);
     fill_logical_pages(pool, source, 31);
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     const auto prompt = text_prompt({40, 41, 42, 43});
     q36::detail::KVRamCache cache(8ULL << 20);
-    if (capture_text_entry(cache, pool, source, prompt, ctx.stream) != 0) {
+    if (capture_text_entry(cache, pool, source, prompt, ctx.copy_stream) != 0) {
         source.release();
         return fail("prefix-tail capture failed");
     }
+    ctx.synchronize_all();
     source.release();
     const auto match = cache.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
     if (!match) { return fail("prefix-tail capture did not index"); }
     auto dest = pool.reserve(2);
     dest.materialize_pages(2, ctx.stream);
     fill_logical_pages(pool, dest, 99);
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     q36::detail::RamRestoreTarget target;
     target.text           = &dest;
     target.text_pool      = &pool;
     target.text_dst_pages = 1;
-    target.stream         = ctx.stream;
+    target.stream         = ctx.copy_stream;
     cache.claim(match->entry_id);
     (void)cache.unpack_device(match->entry_id, target);
     cache.consume(match->entry_id);
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     int failures = 0;
     failures += expect_logical_page(pool, dest, 0, 31, "prefix unpack page 0");
     failures += expect_logical_page(pool, dest, 1, 99, "prefix unpack must not write dest page 1");
@@ -878,14 +913,14 @@ int test_consume_reaps_for_next_capture(ninfer::DeviceContext& ctx, ninfer::Page
     const auto prompt_a = text_prompt({60, 61, 62, 63});
     const auto prompt_b = text_prompt({70, 71, 72, 73});
     q36::detail::KVRamCache probe(8ULL << 20);
-    if (capture_text_entry(probe, pool, source, prompt_a, ctx.stream) != 0) {
+    if (capture_text_entry(probe, pool, source, prompt_a, ctx.copy_stream) != 0) {
         source.release();
         return fail("consume-reap probe capture failed");
     }
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     const std::size_t entry_bytes = probe.snapshot().used_bytes;
     q36::detail::KVRamCache cache(entry_bytes + 256);
-    if (capture_text_entry(cache, pool, source, prompt_a, ctx.stream) != 0) {
+    if (capture_text_entry(cache, pool, source, prompt_a, ctx.copy_stream) != 0) {
         source.release();
         return fail("consume-reap first capture failed");
     }
@@ -900,13 +935,13 @@ int test_consume_reaps_for_next_capture(ninfer::DeviceContext& ctx, ninfer::Page
     target.text           = &dest;
     target.text_pool      = &pool;
     target.text_dst_pages = 2;
-    target.stream         = ctx.stream;
+    target.stream         = ctx.copy_stream;
     cache.claim(match->entry_id);
     (void)cache.unpack_device(match->entry_id, target);
     cache.consume(match->entry_id);
     const auto drops_before     = cache.snapshot().drops;
     const auto evictions_before = cache.snapshot().evictions;
-    if (capture_text_entry(cache, pool, source, prompt_b, ctx.stream) != 0) {
+    if (capture_text_entry(cache, pool, source, prompt_b, ctx.copy_stream) != 0) {
         source.release();
         dest.release();
         return fail("consume-reap second capture failed");
@@ -919,9 +954,319 @@ int test_consume_reaps_for_next_capture(ninfer::DeviceContext& ctx, ninfer::Page
         std::cerr << "consume did not return host budget to the next capture\n";
         ++failures;
     }
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     failures += expect_logical_pages(pool, dest, 61, "consume-reap dest after next capture");
     source.release();
+    dest.release();
+    return failures;
+}
+
+int test_copies_ready_query(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    q36::detail::KVRamCache empty(8ULL << 20);
+    if (!empty.copies_ready(0) || !empty.copies_ready(1)) {
+        return fail("missing RAM entry copies_ready should be true");
+    }
+    auto alloc = pool.reserve(2);
+    alloc.materialize_pages(1, ctx.stream);
+    ctx.synchronize_all();
+    const auto prompt = text_prompt({70, 71, 72, 73});
+    q36::detail::KVRamCache cache(8ULL << 20);
+    if (capture_text_entry(cache, pool, alloc, prompt, ctx.copy_stream) != 0) {
+        alloc.release();
+        return fail("copies_ready capture failed");
+    }
+    const auto match = cache.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    if (!match) {
+        alloc.release();
+        return fail("copies_ready capture did not match");
+    }
+    ctx.synchronize_all();
+    int failures = 0;
+    if (!cache.copies_ready(match->entry_id)) {
+        std::cerr << "captured RAM entry copies_ready was false after synchronize_all\n";
+        ++failures;
+    }
+    cache.claim(match->entry_id);
+    cache.consume(match->entry_id);
+    if (!cache.copies_ready(match->entry_id)) {
+        std::cerr << "retired RAM entry copies_ready should be true\n";
+        ++failures;
+    }
+    alloc.release();
+    return failures;
+}
+
+int test_copy_compute_stream_overlap(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    auto source   = pool.reserve(2);
+    source.materialize_pages(2, ctx.stream);
+    fill_logical_pages(pool, source, 77);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    constexpr std::size_t kBulkBytes = 32ULL << 20;
+    ninfer::DeviceBuffer bulk(kBulkBytes);
+    bulk.fill(0x5a);
+    ninfer::Tensor hidden(bulk.p, ninfer::DType::U8,
+                          {static_cast<std::int32_t>(kBulkBytes)});
+
+    const auto prompt = text_prompt({70, 71, 72, 73});
+    q36::PreparedPromptData retained = prompt;
+    retained.token_ids.push_back(0);
+    retained.token_types.push_back(0);
+    const std::size_t tokens = retained.token_ids.size();
+    retained.positions.resize(3 * tokens);
+    for (int axis = 0; axis < 3; ++axis) {
+        for (std::size_t i = 0; i < tokens; ++i) {
+            retained.positions[static_cast<std::size_t>(axis) * tokens + i] =
+                static_cast<std::int32_t>(i);
+        }
+    }
+    q36::detail::ResidentPrefixIdentity identity;
+    identity.assign(retained);
+    q36::detail::RamCaptureSource cap;
+    cap.execution_frontier = static_cast<std::uint32_t>(prompt.token_ids.size());
+    cap.ledger_frontier    = static_cast<std::uint32_t>(tokens);
+    cap.text_kv_valid      = cap.execution_frontier;
+    cap.tail_hidden_valid  = true;
+    cap.ledger             = retained.token_ids;
+    cap.identity           = &identity;
+    cap.hash_f             = q36::detail::prefix_hash_at(retained.token_ids, identity,
+                                                         cap.execution_frontier);
+    cap.text               = &source;
+    cap.text_pool          = &pool;
+    cap.tail_hidden        = &hidden;
+    cap.stream             = ctx.copy_stream;
+
+    q36::detail::KVRamCache cache(64ULL << 20);
+    if (!cache.capture(cap)) {
+        source.release();
+        return fail("copy/compute overlap capture failed");
+    }
+    const auto match = cache.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    if (!match) {
+        source.release();
+        return fail("copy/compute overlap capture did not index");
+    }
+
+    ninfer::DeviceBuffer scratch(256);
+    cudaEvent_t compute_done{};
+    CUDA_CHECK(cudaEventCreate(&compute_done));
+    CUDA_CHECK(cudaMemsetAsync(scratch.p, 0, 1, ctx.stream));
+    CUDA_CHECK(cudaEventRecord(compute_done, ctx.stream));
+    CUDA_CHECK(cudaEventSynchronize(compute_done));
+    if (cache.copies_ready(match->entry_id)) {
+        CUDA_CHECK(cudaEventDestroy(compute_done));
+        source.release();
+        return fail("capture D2H was drained by a compute-only wait; copies are on device.stream");
+    }
+    CUDA_CHECK(cudaEventDestroy(compute_done));
+
+    try {
+        auto extra = pool.reserve(static_cast<std::uint32_t>(pool.page_group_count()));
+        extra.release();
+        source.release();
+        return fail("in-flight capture still allowed a full-pool reserve");
+    } catch (const std::bad_alloc&) {}
+
+    ctx.synchronize_all();
+    if (!cache.copies_ready(match->entry_id)) {
+        source.release();
+        return fail("capture copies_ready stayed false after synchronize_all");
+    }
+    source.release();
+
+    auto dest = pool.reserve(2);
+    dest.materialize_pages(2, ctx.stream);
+    ninfer::DeviceBuffer hidden_out(kBulkBytes);
+    ninfer::Tensor hidden_out_t(hidden_out.p, ninfer::DType::U8,
+                                {static_cast<std::int32_t>(kBulkBytes)});
+    q36::detail::RamRestoreTarget target;
+    target.text           = &dest;
+    target.text_pool      = &pool;
+    target.text_dst_pages = 2;
+    target.tail_hidden    = &hidden_out_t;
+    target.stream         = ctx.copy_stream;
+    cache.claim(match->entry_id);
+    (void)cache.unpack_device(match->entry_id, target);
+
+    CUDA_CHECK(cudaEventCreate(&compute_done));
+    CUDA_CHECK(cudaMemsetAsync(scratch.p, 1, 1, ctx.stream));
+    CUDA_CHECK(cudaEventRecord(compute_done, ctx.stream));
+    CUDA_CHECK(cudaEventSynchronize(compute_done));
+    CUDA_CHECK(cudaEventDestroy(compute_done));
+    if (cache.copies_ready(match->entry_id)) {
+        dest.release();
+        return fail("restore H2D was drained by a compute-only wait; copies are on device.stream");
+    }
+    ctx.synchronize_all();
+    cache.consume(match->entry_id);
+    const int failures = expect_logical_pages(pool, dest, 77, "copy/compute overlap restore KV");
+    dest.release();
+    return failures;
+}
+
+int test_unpack_without_harvest_keeps_save_and_load(ninfer::DeviceContext& ctx,
+                                                    ninfer::PagedKVPool& pool) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    auto source   = pool.reserve(2);
+    source.materialize_pages(2, ctx.stream);
+    fill_logical_pages(pool, source, 33);
+    constexpr std::size_t kBulkBytes = 32ULL << 20;
+    ninfer::DeviceBuffer bulk(kBulkBytes);
+    bulk.fill(0x3c);
+    ninfer::Tensor hidden(bulk.p, ninfer::DType::U8, {static_cast<std::int32_t>(kBulkBytes)});
+    const auto prompt = text_prompt({33, 34, 35, 36});
+    q36::detail::KVRamCache cache(64ULL << 20);
+    if (capture_with_hidden(cache, pool, source, prompt, hidden, ctx.copy_stream) != 0) {
+        source.release();
+        return fail("save/load harvest capture failed");
+    }
+    const auto match = cache.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    if (!match) {
+        source.release();
+        return fail("save/load harvest capture did not index");
+    }
+    {
+        ninfer::DeviceBuffer scratch(256);
+        cudaEvent_t compute_done{};
+        CUDA_CHECK(cudaEventCreate(&compute_done));
+        CUDA_CHECK(cudaMemsetAsync(scratch.p, 0, 1, ctx.stream));
+        CUDA_CHECK(cudaEventRecord(compute_done, ctx.stream));
+        CUDA_CHECK(cudaEventSynchronize(compute_done));
+        CUDA_CHECK(cudaEventDestroy(compute_done));
+        if (cache.pending_copies_ready()) {
+            source.release();
+            return fail("pending_copies_ready was true during in-flight capture D2H");
+        }
+    }
+    source.release();
+    auto dest = pool.reserve(2);
+    dest.materialize_pages(2, ctx.stream);
+    ninfer::DeviceBuffer hidden_out(kBulkBytes);
+    ninfer::Tensor hidden_out_t(hidden_out.p, ninfer::DType::U8,
+                                {static_cast<std::int32_t>(kBulkBytes)});
+    q36::detail::RamRestoreTarget target;
+    target.text           = &dest;
+    target.text_pool      = &pool;
+    target.text_dst_pages = 2;
+    target.tail_hidden    = &hidden_out_t;
+    target.stream         = ctx.copy_stream;
+    cache.claim(match->entry_id);
+    (void)cache.unpack_device(match->entry_id, target);
+    const auto copies = cache.harvest_copy_seconds();
+    int failures      = 0;
+    if (copies.save <= 0.0) {
+        std::cerr << "unpack without prior harvest billed D2H as load or dropped it, save="
+                  << copies.save << " load=" << copies.load << '\n';
+        ++failures;
+    }
+    if (copies.load <= 0.0) {
+        std::cerr << "unpack without prior harvest dropped H2D load timing, save=" << copies.save
+                  << " load=" << copies.load << '\n';
+        ++failures;
+    }
+    cache.consume(match->entry_id);
+    ctx.synchronize_all();
+    failures += expect_logical_pages(pool, dest, 33, "unpack without prior harvest");
+    dest.release();
+    return failures;
+}
+
+int test_consume_without_harvest_clears_pending(ninfer::DeviceContext& ctx,
+                                                ninfer::PagedKVPool& pool) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    auto source   = pool.reserve(2);
+    source.materialize_pages(2, ctx.stream);
+    fill_logical_pages(pool, source, 34);
+    constexpr std::size_t kBulkBytes = 32ULL << 20;
+    ninfer::DeviceBuffer bulk(kBulkBytes);
+    bulk.fill(0x4d);
+    ninfer::Tensor hidden(bulk.p, ninfer::DType::U8, {static_cast<std::int32_t>(kBulkBytes)});
+    const auto prompt = text_prompt({44, 45, 46, 47});
+    q36::detail::KVRamCache cache(64ULL << 20);
+    if (capture_with_hidden(cache, pool, source, prompt, hidden, ctx.copy_stream) != 0) {
+        source.release();
+        return fail("consume-pending capture failed");
+    }
+    const auto match = cache.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    if (!match) {
+        source.release();
+        return fail("consume-pending capture did not index");
+    }
+    cache.claim(match->entry_id);
+    cache.consume(match->entry_id);
+    source.release();
+    if (cache.test_pending_copy_count() != 0) {
+        return fail("consume left a ghost id in pending_save_ids_ or pending_load_id_");
+    }
+    if (!cache.pending_copies_ready()) {
+        return fail("consume left pending copies unready after retiring the entry");
+    }
+    const auto copies = cache.harvest_copy_seconds();
+    if (copies.save <= 0.0 || copies.load != 0.0) {
+        std::cerr << "consume without harvest did not fold D2H into save, save=" << copies.save
+                  << " load=" << copies.load << '\n';
+        return 1;
+    }
+    if (cache.snapshot().save_seconds != copies.save || cache.snapshot().entry_count != 0) {
+        return fail("consume without harvest left stale snapshot save/entry accounting");
+    }
+    return 0;
+}
+
+int test_consume_after_unpack_folds_load(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    auto source   = pool.reserve(2);
+    source.materialize_pages(2, ctx.stream);
+    fill_logical_pages(pool, source, 35);
+    constexpr std::size_t kBulkBytes = 32ULL << 20;
+    ninfer::DeviceBuffer bulk(kBulkBytes);
+    bulk.fill(0x5e);
+    ninfer::Tensor hidden(bulk.p, ninfer::DType::U8, {static_cast<std::int32_t>(kBulkBytes)});
+    const auto prompt = text_prompt({55, 56, 57, 58});
+    q36::detail::KVRamCache cache(64ULL << 20);
+    if (capture_with_hidden(cache, pool, source, prompt, hidden, ctx.copy_stream) != 0) {
+        source.release();
+        return fail("consume-after-unpack capture failed");
+    }
+    const auto saved = cache.harvest_copy_seconds();
+    if (saved.save <= 0.0) {
+        source.release();
+        return fail("consume-after-unpack capture save was not harvested");
+    }
+    const auto match = cache.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    if (!match) {
+        source.release();
+        return fail("consume-after-unpack capture did not index");
+    }
+    source.release();
+    auto dest = pool.reserve(2);
+    dest.materialize_pages(2, ctx.stream);
+    ninfer::DeviceBuffer hidden_out(kBulkBytes);
+    ninfer::Tensor hidden_out_t(hidden_out.p, ninfer::DType::U8,
+                                {static_cast<std::int32_t>(kBulkBytes)});
+    q36::detail::RamRestoreTarget target;
+    target.text           = &dest;
+    target.text_pool      = &pool;
+    target.text_dst_pages = 2;
+    target.tail_hidden    = &hidden_out_t;
+    target.stream         = ctx.copy_stream;
+    cache.claim(match->entry_id);
+    (void)cache.unpack_device(match->entry_id, target);
+    cache.consume(match->entry_id);
+    if (cache.test_pending_copy_count() != 0) {
+        dest.release();
+        return fail("consume after unpack left a ghost pending copy id");
+    }
+    const auto loaded = cache.harvest_copy_seconds();
+    int failures      = 0;
+    if (loaded.save != 0.0 || loaded.load <= 0.0) {
+        std::cerr << "consume after unpack did not fold H2D into harvest load, save="
+                  << loaded.save << " load=" << loaded.load << '\n';
+        ++failures;
+    }
+    failures += expect_logical_pages(pool, dest, 35, "consume after unpack");
     dest.release();
     return failures;
 }
@@ -933,7 +1278,7 @@ int test_event_overlap_unpack(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& p
     fill_logical_pages(pool, source, 44);
     const auto prompt = text_prompt({50, 51, 52, 53});
     q36::detail::KVRamCache cache(8ULL << 20);
-    if (capture_text_entry(cache, pool, source, prompt, ctx.stream) != 0) {
+    if (capture_text_entry(cache, pool, source, prompt, ctx.copy_stream) != 0) {
         source.release();
         return fail("overlap capture failed");
     }
@@ -942,6 +1287,11 @@ int test_event_overlap_unpack(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& p
         source.release();
         return fail("overlap capture did not index before D2H completion");
     }
+    ctx.synchronize_all();
+    if (!cache.copies_ready(match->entry_id)) {
+        source.release();
+        return fail("overlap capture copies_done did not complete after synchronize_all");
+    }
     source.release();
     auto dest = pool.reserve(2);
     dest.materialize_pages(2, ctx.stream);
@@ -949,11 +1299,11 @@ int test_event_overlap_unpack(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& p
     target.text           = &dest;
     target.text_pool      = &pool;
     target.text_dst_pages = 2;
-    target.stream         = ctx.stream;
+    target.stream         = ctx.copy_stream;
     cache.claim(match->entry_id);
     (void)cache.unpack_device(match->entry_id, target);
     cache.consume(match->entry_id);
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     const int failures = expect_logical_pages(pool, dest, 44, "event-overlapped unpack");
     dest.release();
     return failures;
@@ -1003,12 +1353,12 @@ int test_irregular_page_major_runs(ninfer::DeviceContext& ctx) {
     ninfer::HostPinnedArena host(std::max<std::size_t>(image_bytes, 256));
     void* image = host.try_alloc(image_bytes, 256);
     ninfer::pack_paged_kv_allocation_to_host(source, pool, image, ctx.stream);
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     source.release();
     auto dest = pool.reserve(5);
     dest.materialize_pages(5, ctx.stream);
     ninfer::unpack_paged_kv_allocation_from_host(dest, pool, image, 5, 5, ctx.stream);
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     const int failures = expect_logical_pages(pool, dest, 73, "irregular PageMajor runs");
     dest.release();
     return failures;
@@ -1057,12 +1407,13 @@ int test_restore_throw_then_replay(ninfer::DeviceContext& ctx, ninfer::PagedKVPo
     cap.text_pool                 = &pool;
     cap.tail_hidden               = &hidden;
     cap.rewrite_checkpoint_hidden = &rewrite;
-    cap.stream                    = ctx.stream;
+    cap.stream                    = ctx.copy_stream;
     q36::detail::KVRamCache cache(8ULL << 20);
     if (!cache.capture(cap)) {
         source.release();
         return fail("throw-after-H2D capture failed");
     }
+    ctx.synchronize_all();
     source.release();
     auto dest = pool.reserve(2);
     dest.materialize_pages(2, ctx.stream);
@@ -1083,7 +1434,7 @@ int test_restore_throw_then_replay(ninfer::DeviceContext& ctx, ninfer::PagedKVPo
     bad.text_dst_pages            = 2;
     bad.tail_hidden               = &hidden_out;
     bad.rewrite_checkpoint_hidden = &rewrite_bad;
-    bad.stream                    = ctx.stream;
+    bad.stream                    = ctx.copy_stream;
     cache.claim(match->entry_id);
     bool threw = false;
     try {
@@ -1091,7 +1442,7 @@ int test_restore_throw_then_replay(ninfer::DeviceContext& ctx, ninfer::PagedKVPo
     } catch (const std::logic_error&) {
         threw = true;
     }
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     cache.release(match->entry_id);
     dest.release();
     if (!threw) { return fail("mismatched rewrite hidden did not throw after KV H2D"); }
@@ -1108,11 +1459,11 @@ int test_restore_throw_then_replay(ninfer::DeviceContext& ctx, ninfer::PagedKVPo
     ok.text_dst_pages            = 2;
     ok.tail_hidden               = &hidden_out;
     ok.rewrite_checkpoint_hidden = &rewrite_ok;
-    ok.stream                    = ctx.stream;
+    ok.stream                    = ctx.copy_stream;
     cache.claim(match->entry_id);
     const auto host = cache.unpack_device(match->entry_id, ok);
     cache.consume(match->entry_id);
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     int failures = 0;
     if (!host.rewrite_valid || host.rewrite_kind != q36::RewriteCheckpointKind::ResponseReplay ||
         host.rewrite_frontier != 2) {
@@ -1134,7 +1485,7 @@ int test_destructor_with_inflight_copies(ninfer::DeviceContext& ctx, ninfer::Pag
     dest.materialize_pages(2, ctx.stream);
     {
         q36::detail::KVRamCache cache(8ULL << 20);
-        if (capture_text_entry(cache, pool, source, prompt, ctx.stream) != 0) {
+        if (capture_text_entry(cache, pool, source, prompt, ctx.copy_stream) != 0) {
             source.release();
             dest.release();
             return fail("destructor-inflight capture failed");
@@ -1149,12 +1500,11 @@ int test_destructor_with_inflight_copies(ninfer::DeviceContext& ctx, ninfer::Pag
         target.text           = &dest;
         target.text_pool      = &pool;
         target.text_dst_pages = 2;
-        target.stream         = ctx.stream;
+        target.stream         = ctx.copy_stream;
         cache.claim(match->entry_id);
         (void)cache.unpack_device(match->entry_id, target);
-        cache.consume(match->entry_id);
     }
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     const int failures = expect_logical_pages(pool, dest, 91, "destructor drained in-flight H2D");
     source.release();
     dest.release();
@@ -1168,14 +1518,14 @@ int test_spill_drop_keeps_indexed_source(ninfer::DeviceContext& ctx, ninfer::Pag
     const auto prompt_a = text_prompt({11, 12, 13, 14});
     const auto prompt_b = text_prompt({21, 22, 23, 24});
     q36::detail::KVRamCache probe(8ULL << 20);
-    if (capture_text_entry(probe, pool, alloc, prompt_a, ctx.stream) != 0) {
+    if (capture_text_entry(probe, pool, alloc, prompt_a, ctx.copy_stream) != 0) {
         alloc.release();
         return fail("spill-drop probe capture failed");
     }
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
     const std::size_t entry_bytes = probe.snapshot().used_bytes;
     q36::detail::KVRamCache cache(entry_bytes + 256);
-    if (capture_text_entry(cache, pool, alloc, prompt_a, ctx.stream) != 0) {
+    if (capture_text_entry(cache, pool, alloc, prompt_a, ctx.copy_stream) != 0) {
         alloc.release();
         return fail("spill-drop first capture failed");
     }
@@ -1186,7 +1536,7 @@ int test_spill_drop_keeps_indexed_source(ninfer::DeviceContext& ctx, ninfer::Pag
     }
     cache.claim(first->entry_id);
     const auto drops_before = cache.snapshot().drops;
-    if (capture_text_entry(cache, pool, alloc, prompt_b, ctx.stream) == 0) {
+    if (capture_text_entry(cache, pool, alloc, prompt_b, ctx.copy_stream) == 0) {
         alloc.release();
         return fail("pinned one-entry budget captured a second bundle");
     }
@@ -1334,7 +1684,7 @@ int test_full_state_image(ninfer::DeviceContext& ctx) {
     source.dflash_local       = &dflash_local;
     source.dflash_checkpoint  = &dflash_ckpt;
     source.dflash_lane        = 0;
-    source.stream             = ctx.stream;
+    source.stream             = ctx.copy_stream;
     q36::detail::KVRamCache cache(16ULL << 20);
     if (!cache.capture(source)) { return fail("full-state capture failed"); }
 
@@ -1365,11 +1715,11 @@ int test_full_state_image(ninfer::DeviceContext& ctx) {
     target.dflash_local            = &dflash_local;
     target.dflash_checkpoint       = &dflash_ckpt;
     target.dflash_lane             = 1;
-    target.stream                  = ctx.stream;
+    target.stream                  = ctx.copy_stream;
     cache.claim(match->entry_id);
     const q36::detail::RamRestoredHost host = cache.unpack_device(match->entry_id, target);
     cache.consume(match->entry_id);
-    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    ctx.synchronize_all();
 
     int failures = 0;
     if (host.rope_delta != 7 || host.mtp_kv_valid != 3 || !host.backend_image_present ||
@@ -1494,12 +1844,12 @@ int main() {
         void* image = host.try_alloc(image_bytes, 256);
         ninfer::pack_paged_kv_allocation_to_host(consecutive_physical, paged_pool, image,
                                                  ctx.stream);
-        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+        ctx.synchronize_all();
         consecutive_physical.release();
         auto restored = paged_pool.reserve(4);
         restored.materialize_pages(4);
         ninfer::unpack_paged_kv_allocation_from_host(restored, paged_pool, image, 4, 4, ctx.stream);
-        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+        ctx.synchronize_all();
         failures += expect_logical_pages(paged_pool, restored, 9, "no zero_pages sort");
         restored.release();
     }
@@ -1514,13 +1864,13 @@ int main() {
         ninfer::HostPinnedArena host(std::max<std::size_t>(image_bytes, 256));
         void* image = host.try_alloc(image_bytes, 256);
         ninfer::pack_paged_kv_allocation_to_host(partial, paged_pool, image, ctx.stream);
-        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+        ctx.synchronize_all();
         partial.release();
         auto restored = paged_pool.reserve(3);
         restored.materialize_pages(2);
         ninfer::unpack_paged_kv_allocation_from_host(restored, paged_pool, image, captured, 2,
                                                      ctx.stream);
-        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+        ctx.synchronize_all();
         failures += expect_logical_pages(paged_pool, restored, 11, "partial tail page");
         restored.release();
     }
@@ -1564,9 +1914,9 @@ int main() {
         std::vector<unsigned char> conv_host(gdn.conv_host_image_bytes());
         std::vector<unsigned char> rec_host(gdn.recurrent_host_image_bytes());
         gdn.pack_slot_to_host(0, conv_host.data(), rec_host.data(), ctx.stream);
-        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+        ctx.synchronize_all();
         gdn.unpack_slot_from_host(2, conv_host.data(), rec_host.data(), ctx.stream);
-        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+        ctx.synchronize_all();
         std::vector<unsigned char> conv_out(conv.bytes());
         CUDA_CHECK(cudaMemcpy(conv_out.data(), gdn.conv_slot(0, 2).data, conv_out.size(),
                               cudaMemcpyDeviceToHost));
@@ -1598,9 +1948,9 @@ int main() {
                               cudaMemcpyHostToDevice));
         std::vector<unsigned char> host(cyclic.lane_host_bytes());
         cyclic.copy_lane_to_host(0, host.data(), ctx.stream);
-        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+        ctx.synchronize_all();
         cyclic.copy_lane_from_host(host.data(), 2, ctx.stream);
-        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+        ctx.synchronize_all();
         std::vector<unsigned char> k_out(k_pattern.size());
         CUDA_CHECK(cudaMemcpy(k_out.data(), cyclic.layer_view(0).k.slice(3, 2, 1).data, k_out.size(),
                               cudaMemcpyDeviceToHost));
@@ -1621,6 +1971,11 @@ int main() {
     failures += test_fifo_evict_after_middle_consume(ctx, paged_pool);
     failures += test_prefix_unpack_preserves_tail(ctx, paged_pool);
     failures += test_consume_reaps_for_next_capture(ctx, paged_pool);
+    failures += test_copies_ready_query(ctx, paged_pool);
+    failures += test_copy_compute_stream_overlap(ctx, paged_pool);
+    failures += test_unpack_without_harvest_keeps_save_and_load(ctx, paged_pool);
+    failures += test_consume_without_harvest_clears_pending(ctx, paged_pool);
+    failures += test_consume_after_unpack_folds_load(ctx, paged_pool);
     failures += test_event_overlap_unpack(ctx, paged_pool);
     failures += test_irregular_page_major_runs(ctx);
     failures += test_restore_throw_then_replay(ctx, paged_pool);

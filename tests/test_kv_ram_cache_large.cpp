@@ -403,9 +403,45 @@ int main() {
     rewrite_buf.fill(0xa2);
     ninfer::Tensor rewrite(rewrite_buf.p, ninfer::DType::U8, {10240});
     ninfer::targets::qwen3_6::detail::KVRamCache cache(1024ULL * 1024ULL * 1024ULL);
-    if (capture_bundle(cache, kv_pool, contiguous, gdn, hidden, rewrite, ctx.stream) != 0) {
+    if (capture_bundle(cache, kv_pool, contiguous, gdn, hidden, rewrite, ctx.copy_stream) != 0) {
         return fail("large SequenceState capture failed");
     }
+    const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
+    const auto match =
+        cache.plan_match(prompt, ninfer::targets::qwen3_6::detail::prefix_hash_chain(prompt));
+    if (!match) { return fail("large capture did not match"); }
+
+    ninfer::DeviceBuffer scratch(256);
+    cudaEvent_t compute_done{};
+    CUDA_CHECK(cudaEventCreate(&compute_done));
+    CUDA_CHECK(cudaMemsetAsync(scratch.p, 0, 1, ctx.stream));
+    CUDA_CHECK(cudaEventRecord(compute_done, ctx.stream));
+    CUDA_CHECK(cudaEventSynchronize(compute_done));
+    if (cache.copies_ready(match->entry_id)) {
+        return fail("capture D2H was drained by a compute-only wait; copies are on device.stream");
+    }
+    const auto source_ids = contiguous.page_ids();
+    auto extra            = kv_pool.reserve(kKvPages);
+    extra.materialize_pages(kKvPages, ctx.stream);
+    const auto extra_ids = extra.page_ids();
+    if (extra_ids.empty()) {
+        extra.release();
+        return fail("alias probe did not take_pages");
+    }
+    for (std::int32_t id : extra_ids) {
+        for (std::int32_t source_id : source_ids) {
+            if (id == source_id) {
+                extra.release();
+                return fail("in-flight capture source page id was reused by take_pages");
+            }
+        }
+    }
+    extra.release();
+    ctx.synchronize_all();
+    if (!cache.copies_ready(match->entry_id)) {
+        return fail("capture copies_ready stayed false after synchronize_all");
+    }
+
     gdn.zero_slot(0, ctx.stream);
     gdn.zero_slot(1, ctx.stream);
     auto dest = kv_pool.reserve(kKvPages);
@@ -416,10 +452,6 @@ int main() {
     ninfer::DeviceBuffer rewrite_out_buf(10240);
     rewrite_out_buf.fill(0);
     ninfer::Tensor rewrite_out(rewrite_out_buf.p, ninfer::DType::U8, {10240});
-    const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
-    const auto match =
-        cache.plan_match(prompt, ninfer::targets::qwen3_6::detail::prefix_hash_chain(prompt));
-    if (!match) { return fail("large capture did not match"); }
     ninfer::targets::qwen3_6::detail::RamRestoreTarget target;
     target.text                      = &dest;
     target.text_pool                 = &kv_pool;
@@ -429,13 +461,21 @@ int main() {
     target.gdn_checkpoint_slot       = 1;
     target.tail_hidden               = &hidden_out;
     target.rewrite_checkpoint_hidden = &rewrite_out;
-    target.stream                    = ctx.stream;
+    target.stream                    = ctx.copy_stream;
     cache.claim(match->entry_id);
-    CUDA_CHECK(cudaEventRecord(start, ctx.stream));
+    ctx.synchronize();
+    CUDA_CHECK(cudaEventRecord(start, ctx.copy_stream));
     (void)cache.unpack_device(match->entry_id, target);
-    cache.consume(match->entry_id);
-    CUDA_CHECK(cudaEventRecord(stop, ctx.stream));
+    CUDA_CHECK(cudaEventRecord(stop, ctx.copy_stream));
+    CUDA_CHECK(cudaMemsetAsync(scratch.p, 1, 1, ctx.stream));
+    CUDA_CHECK(cudaEventRecord(compute_done, ctx.stream));
+    CUDA_CHECK(cudaEventSynchronize(compute_done));
+    if (cache.copies_ready(match->entry_id)) {
+        return fail("restore H2D was drained by a compute-only wait; copies are on device.stream");
+    }
     CUDA_CHECK(cudaEventSynchronize(stop));
+    ctx.synchronize_all();
+    cache.consume(match->entry_id);
     const double restore_ms   = elapsed_ms(start, stop);
     const std::size_t payload = kv_bytes + 2 * gdn_slot_bytes;
     std::cerr << "kv_ram_large restore_two_gdn_slots_plus_kv=" << gbs(payload, restore_ms, 1)
@@ -455,6 +495,7 @@ int main() {
         return fail("large restore rewrite hidden mismatch");
     }
 
+    CUDA_CHECK(cudaEventDestroy(compute_done));
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
     contiguous.release();

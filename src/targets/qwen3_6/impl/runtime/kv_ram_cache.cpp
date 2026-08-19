@@ -360,6 +360,7 @@ void KVRamCache::destroy_record(std::uint64_t entry_id, bool count_eviction) {
     if (it->second.block != nullptr) { arena_.free(it->second.block); }
     records_.erase(it);
     fifo_.erase(std::remove(fifo_.begin(), fifo_.end(), entry_id), fifo_.end());
+    drop_pending_id(entry_id);
     if (count_eviction) { ++evictions_; }
     bump_version();
 }
@@ -398,6 +399,9 @@ KvRamCopySeconds KVRamCache::harvest_copy_seconds() {
     out.save += orphaned_save_seconds_;
     save_seconds_ += orphaned_save_seconds_;
     orphaned_save_seconds_ = 0;
+    out.load += orphaned_load_seconds_;
+    load_seconds_ += orphaned_load_seconds_;
+    orphaned_load_seconds_ = 0;
     for (std::uint64_t id : pending_save_ids_) {
         const auto it = records_.find(id);
         if (it == records_.end()) { continue; }
@@ -416,6 +420,47 @@ KvRamCopySeconds KVRamCache::harvest_copy_seconds() {
         pending_load_id_.reset();
     }
     return out;
+}
+
+bool KVRamCache::copies_ready(std::uint64_t entry_id) const {
+    const auto it = records_.find(entry_id);
+    if (it == records_.end() || it->second.copies_done == nullptr) { return true; }
+    const cudaError_t ready = cudaEventQuery(it->second.copies_done);
+    if (ready == cudaErrorNotReady) { return false; }
+    CUDA_CHECK(ready);
+    return true;
+}
+
+bool KVRamCache::pending_copies_ready() const {
+    for (std::uint64_t id : pending_save_ids_) {
+        if (!copies_ready(id)) { return false; }
+    }
+    if (pending_load_id_ && !copies_ready(*pending_load_id_)) { return false; }
+    return true;
+}
+
+void KVRamCache::wait_pending_copies_on_stream(cudaStream_t stream) {
+    for (std::uint64_t id : pending_save_ids_) {
+        const auto it = records_.find(id);
+        if (it == records_.end()) { continue; }
+        wait_copies_on_stream(it->second, stream);
+    }
+    if (pending_load_id_) {
+        const auto it = records_.find(*pending_load_id_);
+        if (it != records_.end()) { wait_copies_on_stream(it->second, stream); }
+    }
+}
+
+void KVRamCache::wait_pending_copies() {
+    for (std::uint64_t id : pending_save_ids_) {
+        const auto it = records_.find(id);
+        if (it == records_.end()) { continue; }
+        wait_copies(it->second);
+    }
+    if (pending_load_id_) {
+        const auto it = records_.find(*pending_load_id_);
+        if (it != records_.end()) { wait_copies(it->second); }
+    }
 }
 
 void KVRamCache::wait_copies(Record& record) {
@@ -475,6 +520,17 @@ void KVRamCache::evict_unpinned() {
     }
 }
 
+void KVRamCache::drop_pending_save(std::uint64_t entry_id) noexcept {
+    pending_save_ids_.erase(
+        std::remove(pending_save_ids_.begin(), pending_save_ids_.end(), entry_id),
+        pending_save_ids_.end());
+}
+
+void KVRamCache::drop_pending_id(std::uint64_t entry_id) noexcept {
+    drop_pending_save(entry_id);
+    if (pending_load_id_ && *pending_load_id_ == entry_id) { pending_load_id_.reset(); }
+}
+
 void KVRamCache::claim(std::uint64_t entry_id) {
     Record& record = require(entry_id);
     if (record.pinned) { throw std::logic_error("RAM cache entry is already claimed"); }
@@ -493,6 +549,18 @@ void KVRamCache::consume(std::uint64_t entry_id) {
     Record& record = require(entry_id);
     if (!record.pinned) { throw std::logic_error("RAM cache consume requires a claimed entry"); }
     ++restores_;
+    const double leftover = harvest_record(record);
+    if (pending_load_id_ && *pending_load_id_ == entry_id) {
+        orphaned_load_seconds_ += leftover;
+    } else {
+        orphaned_save_seconds_ += leftover;
+    }
+    drop_pending_id(entry_id);
+    if (record.copies_start != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(record.copies_start));
+        record.copies_start = nullptr;
+    }
+    record.copies_timed = false;
     retire_record(record);
     records_.erase(entry_id);
     fifo_.erase(std::remove(fifo_.begin(), fifo_.end(), entry_id), fifo_.end());
@@ -705,13 +773,17 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
             copies_launched = true;
         }
         if (source.gdn != nullptr) {
-            start_device_copies();
-            source.gdn->pack_slot_to_host(source.gdn_current_slot, raw + header.offset[4],
-                                          raw + header.offset[6], source.stream);
-            copies_launched = true;
-            if (source.rewrite_valid) {
+            if (lengths[4] != 0 || lengths[6] != 0) {
+                start_device_copies();
+                source.gdn->pack_slot_to_host(source.gdn_current_slot, raw + header.offset[4],
+                                              raw + header.offset[6], source.stream);
+                copies_launched = true;
+            }
+            if (source.rewrite_valid && (lengths[5] != 0 || lengths[7] != 0)) {
+                start_device_copies();
                 source.gdn->pack_slot_to_host(source.gdn_checkpoint_slot, raw + header.offset[5],
                                               raw + header.offset[7], source.stream);
+                copies_launched = true;
             }
         }
         if (source.tail_hidden != nullptr && lengths[8] != 0) {
@@ -755,9 +827,9 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
         record.block               = block;
         record.bytes               = header.entry_bytes;
         record.copies_start        = copies_start;
-        copies_start               = nullptr;
         const auto [it, inserted]  = records_.emplace(record.id, record);
         if (!inserted) { throw std::logic_error("RAM cache entry id already exists"); }
+        copies_start               = nullptr;
         live_id = record.id;
         fifo_.push_back(record.id);
         record_copies(it->second, source.stream);
@@ -823,6 +895,14 @@ RamRestoredHost KVRamCache::unpack_device(std::uint64_t entry_id, const RamResto
         header.tail_hidden_bytes != target.tail_hidden->bytes()) {
         throw std::logic_error("RAM entry hidden geometry mismatch");
     }
+    if (target.rewrite_checkpoint_hidden != nullptr &&
+        header.length[9] != 0 &&
+        header.length[9] != target.rewrite_checkpoint_hidden->bytes()) {
+        throw std::logic_error("RAM entry rewrite-checkpoint hidden geometry mismatch");
+    }
+
+    orphaned_save_seconds_ += harvest_record(record);
+    drop_pending_save(entry_id);
 
     begin_copies(record, target.stream);
     unpack_paged_kv_allocation_from_host(*target.text, *target.text_pool, raw + header.offset[2],
@@ -833,13 +913,13 @@ RamRestoredHost KVRamCache::unpack_device(std::uint64_t entry_id, const RamResto
                                              raw + header.offset[3], header.backend_mapped_pages,
                                              target.backend_dst_pages, target.stream);
     }
-    if (target.gdn != nullptr && header.length[4] != 0) {
+    if (target.gdn != nullptr && (header.length[4] != 0 || header.length[6] != 0)) {
         target.gdn->unpack_slot_from_host(target.gdn_current_slot, raw + header.offset[4],
                                           raw + header.offset[6], target.stream);
-        if (header.length[5] != 0) {
-            target.gdn->unpack_slot_from_host(target.gdn_checkpoint_slot, raw + header.offset[5],
-                                              raw + header.offset[7], target.stream);
-        }
+    }
+    if (target.gdn != nullptr && (header.length[5] != 0 || header.length[7] != 0)) {
+        target.gdn->unpack_slot_from_host(target.gdn_checkpoint_slot, raw + header.offset[5],
+                                          raw + header.offset[7], target.stream);
     }
     if (target.tail_hidden != nullptr && header.length[8] != 0) {
         CUDA_CHECK(cudaMemcpyAsync(target.tail_hidden->data, raw + header.offset[8],
@@ -847,9 +927,6 @@ RamRestoredHost KVRamCache::unpack_device(std::uint64_t entry_id, const RamResto
                                    cudaMemcpyHostToDevice, target.stream));
     }
     if (target.rewrite_checkpoint_hidden != nullptr && header.length[9] != 0) {
-        if (header.length[9] != target.rewrite_checkpoint_hidden->bytes()) {
-            throw std::logic_error("RAM entry rewrite-checkpoint hidden geometry mismatch");
-        }
         CUDA_CHECK(cudaMemcpyAsync(target.rewrite_checkpoint_hidden->data, raw + header.offset[9],
                                    static_cast<std::size_t>(header.length[9]),
                                    cudaMemcpyHostToDevice, target.stream));
@@ -875,6 +952,10 @@ void KVRamCache::test_tamper_identity_digest(std::uint64_t entry_id, std::uint8_
     identity.unpack(identity_bytes, static_cast<std::size_t>(header.length[1]));
     identity.test_tamper_content_digest(0, byte);
     identity.pack(identity_bytes);
+}
+
+std::size_t KVRamCache::test_pending_copy_count() const noexcept {
+    return pending_save_ids_.size() + (pending_load_id_ ? 1 : 0);
 }
 
 } // namespace ninfer::targets::qwen3_6::detail

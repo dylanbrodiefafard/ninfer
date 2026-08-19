@@ -15,7 +15,14 @@ target_key = qwen3_8_27b
 recipe_id  = qwen3_8_27b-v1
 ```
 
-The artifact contains Text, the optimized MTP draft head, MTP, Vision, and six frontend
+```text
+filename   = qwen3_8_27b_nvfp4.ninfer
+model_id   = qwen3.8-27b
+weights_id = nvfp4
+target_key = qwen3_8_27b
+```
+
+Each artifact contains Text, the optimized MTP draft head, MTP, Vision, and six frontend
 resources. The identity is read from the version-2 artifact directory; filenames and object counts
 do not select the target or weight profile.
 
@@ -88,3 +95,9 @@ endpoints as W8, which is the only groupwise difference between the two models, 
 layouts are identical. The registry constructs the 27B `LoadedModel`, `SequencePlan`, and
 `Program`, and reports `qwen3_8_27b/qwen3.8-27b/groupwise-int` or
 `qwen3_8_27b/qwen3.8-27b/nvfp4` in the load summary.
+
+The opt-in 27B live Engine tests (`ninfer_qwen3_6_27b_prefix_real_test`,
+`ninfer_qwen3_6_27b_ram_real_test`) load these identities when
+`NINFER_QWEN3_6_27B_WEIGHTS` or `NINFER_QWEN3_6_27B_NVFP4_WEIGHTS` points at the Qwen3.8
+`.ninfer` (`qwen3_8_27b.ninfer` or `qwen3_8_27b_nvfp4.ninfer`). The env names follow the shared
+27B package; they are not restricted to a Qwen3.6 filename.

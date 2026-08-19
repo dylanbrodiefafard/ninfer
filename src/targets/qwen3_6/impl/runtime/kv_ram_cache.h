@@ -127,10 +127,15 @@ public:
 
     [[nodiscard]] KvRamSnapshot snapshot() const noexcept;
     KvRamCopySeconds harvest_copy_seconds();
+    [[nodiscard]] bool copies_ready(std::uint64_t entry_id) const;
+    [[nodiscard]] bool pending_copies_ready() const;
+    void wait_pending_copies_on_stream(cudaStream_t stream);
+    void wait_pending_copies();
     [[nodiscard]] std::uint64_t index_version() const noexcept { return index_version_; }
     [[nodiscard]] std::uint64_t exact_comparisons() const noexcept { return exact_comparisons_; }
 
     void test_tamper_identity_digest(std::uint64_t entry_id, std::uint8_t byte);
+    [[nodiscard]] std::size_t test_pending_copy_count() const noexcept;
 
 private:
     enum class Section : std::uint8_t {
@@ -184,6 +189,8 @@ private:
     double harvest_record(Record& record);
     void retire_record(Record& record);
     void reap_retired(bool block);
+    void drop_pending_save(std::uint64_t entry_id) noexcept;
+    void drop_pending_id(std::uint64_t entry_id) noexcept;
     void bump_version() noexcept { ++index_version_; }
 
     struct RetiredCopy {
@@ -207,6 +214,7 @@ private:
     double save_seconds_             = 0;
     double load_seconds_             = 0;
     double orphaned_save_seconds_    = 0;
+    double orphaned_load_seconds_    = 0;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail

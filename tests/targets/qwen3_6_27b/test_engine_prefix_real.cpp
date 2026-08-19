@@ -471,8 +471,9 @@ int main() {
     const char* groupwise = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
     const char* nvfp4     = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
     if ((groupwise == nullptr || *groupwise == '\0') && (nvfp4 == nullptr || *nvfp4 == '\0')) {
-        std::cout << "skip: neither NINFER_QWEN3_6_27B_WEIGHTS nor "
-                     "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS is set\n";
+        std::cout << "skip: set NINFER_QWEN3_6_27B_WEIGHTS or "
+                     "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS to a qwen3.6-27b or "
+                     "qwen3.8-27b .ninfer\n";
         return 77;
     }
     if (groupwise != nullptr && *groupwise != '\0') {

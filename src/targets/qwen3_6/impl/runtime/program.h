@@ -228,6 +228,9 @@ public:
     [[nodiscard]] bool
     can_admit_lane_after_retained_eviction(std::uint32_t lane,
                                            const RequestPlan& plan) const noexcept;
+    [[nodiscard]] bool can_admit_lane_after_releasing(std::uint32_t lane, const RequestPlan& plan,
+                                                      std::span<const std::uint32_t> release_lanes)
+        const noexcept;
     [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
     [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
                                                                 PreparedPromptData&& prompt,
@@ -253,6 +256,10 @@ public:
     void consume_ram_entry(std::uint64_t entry_id);
     [[nodiscard]] qwen3_6::detail::KvRamSnapshot kv_ram_snapshot() const noexcept;
     qwen3_6::detail::KvRamCopySeconds harvest_kv_ram_copy_seconds();
+    [[nodiscard]] bool kv_ram_copies_ready() const;
+    void wait_kv_ram_copies_on_compute();
+    void wait_kv_ram_copies();
+    void synchronize_all();
     [[nodiscard]] std::uint64_t kv_ram_index_version() const noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;

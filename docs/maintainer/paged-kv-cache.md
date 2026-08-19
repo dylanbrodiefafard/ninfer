@@ -809,11 +809,14 @@ pages 返回各自 pool；随后各 pool 的 exact frontier 和 fixed continuati
 The optional pinned-host tier is an exclusive FIFO of completed retained SequenceState bundles
 that are not on a VRAM lane. Capture happens at the executor admission site that is about to
 destroy that bundle and appends a fresh D2H image at the FIFO tail. A capture that does not fit
-the host budget increments `drops` and the incoming request still proceeds. D2H completion is
-tracked with a per-entry CUDA event so the entry can be indexed before the copies drain. Restore writes the host image onto a new page mapping of the chosen free lane (an empty lane
+the host budget increments `drops` and the incoming request still proceeds. D2H/H2D run on
+`DeviceContext::copy_stream`. Source GPU pages stay mapped until that entry's `copies_done` is
+ready; unpack is not ordered behind block-table publish on the compute stream. Restore writes the
+host image onto a new page mapping of the chosen free lane (an empty lane
 first; a dirty lane only when none is empty, and among equal-reuse dirty lanes the
 least-recently-admitted retained bundle), records H2D completion on the same event, then
-start_prefill may overlap that copy on the CPU side. Capture and restore both require a selected
+`device.stream` waits on that event only immediately before this lane's `start_prefill_lane`.
+Capture and restore both require a selected
 free lane; a queued request that cannot admit does not dump in-flight or other retained GPU
 state. Consume erases the host entry wherever it sits
 in the FIFO and retires the block; capacity eviction destroys the oldest unpinned resident and

@@ -581,18 +581,43 @@ int exercise_site3_victim(const char* artifact) {
 }
 
 int exercise_suffix_prefill(const char* artifact) {
+    const auto keep = tokens_a();
+    std::vector<ninfer::TokenId> source_tokens;
+    std::vector<ninfer::TokenId> vram_tokens;
+    std::vector<ninfer::TokenId> history;
+    std::vector<ninfer::TokenId> continued;
+    {
+        ninfer::Engine vram_engine(ordinary_options(artifact, 1, 4096, kRamHitBytes));
+        if (const int rc = verify_ram_tier(vram_engine, kRamHitBytes); rc != 0) { return rc; }
+        const ninfer::GenerationResult source =
+            vram_engine.generate(vram_engine.prepare_tokens(keep), greedy(8, false));
+        if (source.generated_token_ids.size() != 8) {
+            return fail("suffix-prefill VRAM source did not complete");
+        }
+        source_tokens = source.generated_token_ids;
+        history       = resume_prefix(keep, source.generated_token_ids);
+        continued     = concat(history, {198, 198, 198, 198});
+        const ninfer::GenerationResult vram =
+            vram_engine.generate(vram_engine.prepare_tokens(continued), greedy(4, true));
+        if (const int rc =
+                expect_suffix_hit(vram, ninfer::PrefixReuseSource::VramResident,
+                                  static_cast<std::uint32_t>(history.size()),
+                                  static_cast<std::uint32_t>(continued.size()), "suffix VRAM");
+            rc != 0) {
+            return rc;
+        }
+        vram_tokens = vram.generated_token_ids;
+    }
+
     ninfer::Engine engine(ordinary_options(artifact, 1, 4096, kRamHitBytes));
     if (const int rc = verify_ram_tier(engine, kRamHitBytes); rc != 0) { return rc; }
-    const auto keep = tokens_a();
     const ninfer::GenerationResult first =
         engine.generate(engine.prepare_tokens(keep), greedy(8, false));
-    if (first.generated_token_ids.size() != 8) {
-        return fail("suffix-prefill source did not complete");
+    if (first.generated_token_ids != source_tokens) {
+        return fail("suffix-prefill RAM source did not match the VRAM source");
     }
     (void)engine.generate(engine.prepare_tokens(tokens_c()), greedy(4, false));
-    const std::vector<ninfer::TokenId> history = resume_prefix(keep, first.generated_token_ids);
-    const std::vector<ninfer::TokenId> continued = concat(history, {198, 198, 198, 198});
-    const auto restores_before                   = engine.runtime_stats().kv_ram_restores;
+    const auto restores_before = engine.runtime_stats().kv_ram_restores;
     const ninfer::GenerationResult hit =
         engine.generate(engine.prepare_tokens(continued), greedy(4, true));
     if (const int rc =
@@ -613,9 +638,12 @@ int exercise_suffix_prefill(const char* artifact) {
         engine.runtime_stats().kv_ram_captures <= captures_before) {
         return fail("next FullReset after suffix restore did not capture the restored lane");
     }
-    const ninfer::GenerationResult baseline =
-        engine.generate(engine.prepare_tokens(continued), greedy(4, false));
-    if (hit.generated_token_ids != baseline.generated_token_ids) {
+    if (hit.generated_token_ids != vram_tokens) {
+        std::cerr << "suffix RAM reuse changed greedy output vs VRAM continuation hit=";
+        for (ninfer::TokenId token : hit.generated_token_ids) { std::cerr << token << ' '; }
+        std::cerr << "vram=";
+        for (ninfer::TokenId token : vram_tokens) { std::cerr << token << ' '; }
+        std::cerr << "hit_load_ms=" << hit.kv_ram_load_seconds * 1e3 << '\n';
         return fail("suffix RAM reuse changed greedy output");
     }
     return 0;
@@ -1057,15 +1085,27 @@ int exercise_mtp(const char* artifact) {
         return rc;
     }
     const auto keep = tokens_d();
-    const ninfer::GenerationResult first =
+    const ninfer::GenerationResult source =
         engine.generate(engine.prepare_tokens(keep), greedy(8, false));
-    if (first.generated_token_ids.size() != 8) {
+    if (source.generated_token_ids.size() != 8) {
         return fail("MTP suffix source did not complete");
     }
-    (void)engine.generate(engine.prepare_tokens(tokens_e()), greedy(4, false));
-    const std::vector<ninfer::TokenId> history = resume_prefix(keep, first.generated_token_ids);
+    const std::vector<ninfer::TokenId> history = resume_prefix(keep, source.generated_token_ids);
     const std::vector<ninfer::TokenId> continued = concat(history, {198, 198, 198, 198});
-    const auto restores_before                   = engine.runtime_stats().kv_ram_restores;
+    const ninfer::GenerationResult vram =
+        engine.generate(engine.prepare_tokens(continued), greedy(4, true));
+    if (vram.prefix_reuse_source != ninfer::PrefixReuseSource::VramResident ||
+        vram.prefix_reuse_path == ninfer::PrefixReusePath::FullReset ||
+        vram.reused_prompt_tokens != history.size()) {
+        return fail("MTP suffix VRAM continuation did not reuse the resident prefix");
+    }
+    const ninfer::GenerationResult first =
+        engine.generate(engine.prepare_tokens(keep), greedy(8, false));
+    if (first.generated_token_ids != source.generated_token_ids) {
+        return fail("MTP suffix RAM source did not match the VRAM source");
+    }
+    (void)engine.generate(engine.prepare_tokens(tokens_e()), greedy(4, false));
+    const auto restores_before = engine.runtime_stats().kv_ram_restores;
     const ninfer::GenerationResult hit =
         engine.generate(engine.prepare_tokens(continued), greedy(4, true));
     if (hit.prefix_reuse_source != ninfer::PrefixReuseSource::HostRam ||
@@ -1080,9 +1120,7 @@ int exercise_mtp(const char* artifact) {
     if (engine.runtime_stats().kv_ram_restores != restores_before + 1) {
         return fail("MTP suffix RAM restore did not increment kv_ram_restores");
     }
-    const ninfer::GenerationResult baseline =
-        engine.generate(engine.prepare_tokens(continued), greedy(4, false));
-    if (hit.generated_token_ids != baseline.generated_token_ids) {
+    if (hit.generated_token_ids != vram.generated_token_ids) {
         return fail("MTP suffix RAM reuse changed greedy output");
     }
     return 0;
@@ -1436,8 +1474,9 @@ int main() {
     const char* groupwise = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
     const char* nvfp4     = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
     if ((groupwise == nullptr || *groupwise == '\0') && (nvfp4 == nullptr || *nvfp4 == '\0')) {
-        std::cout << "skip: neither NINFER_QWEN3_6_27B_WEIGHTS nor "
-                     "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS is set\n";
+        std::cout << "skip: set NINFER_QWEN3_6_27B_WEIGHTS or "
+                     "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS to a qwen3.6-27b or "
+                     "qwen3.8-27b .ninfer\n";
         return 77;
     }
     if (groupwise != nullptr && *groupwise != '\0') {

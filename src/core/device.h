@@ -14,6 +14,7 @@ struct DeviceContext {
     int device               = 0;
     cudaStream_t stream      = nullptr;
     cudaStream_t load_stream = nullptr;
+    cudaStream_t copy_stream = nullptr;
     cudaDeviceProp props{};
 
     explicit DeviceContext(int device_id = 0);
@@ -27,6 +28,8 @@ struct DeviceContext {
     int sm() const noexcept;
     std::size_t total_vram() const noexcept;
     void synchronize() const;
+    void synchronize_all() const;
+    void order_copy_after_compute() const;
 };
 
 class CudaEventTimer {

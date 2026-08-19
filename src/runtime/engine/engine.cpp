@@ -152,7 +152,7 @@ public:
     ~Impl() noexcept {
         executor.emplace<std::monostate>();
         try {
-            device.synchronize();
+            device.synchronize_all();
         } catch (...) {}
     }
 
