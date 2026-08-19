@@ -10,7 +10,9 @@
 
 namespace ninfer::targets::qwen3_6 {
 
-inline constexpr std::int32_t kKvQuantGroup = 64;
+inline constexpr std::int32_t kKvQuantGroup     = 64;
+inline constexpr std::int32_t kKvNvfp4Group     = 16;
+inline constexpr std::int32_t kKvNvfp4CodeWidth = 128;
 
 struct DecoderStateSpec {
     std::uint32_t full_attention_layers     = 0;

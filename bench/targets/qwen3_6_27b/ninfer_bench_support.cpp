@@ -51,7 +51,8 @@ std::uint32_t parse_u32(std::string_view text, const char* label, bool allow_zer
 KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "bf16") { return KvCacheStorage::BFloat16; }
     if (text == "int8") { return KvCacheStorage::Int8Group64; }
-    throw std::invalid_argument("--kv-dtype must be bf16 or int8");
+    if (text == "nvfp4") { return KvCacheStorage::Nvfp4; }
+    throw std::invalid_argument("--kv-dtype must be bf16, int8, or nvfp4");
 }
 
 std::vector<int> parse_int_list(std::string_view value, const char* label) {
@@ -270,7 +271,10 @@ std::string usage_text(std::string_view program) {
         << "  --max-ctx <tokens>          override auto-sized context capacity\n"
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
         << " (default: " << kDefaultPrefillChunk << ")\n"
-        << "  --kv-dtype <bf16|int8>      KV cache storage (default: bf16)\n"
+        << "  --kv-dtype <bf16|int8|nvfp4> KV cache storage (default: bf16)\n"
+        << "  --concurrency <1..8>        concurrent Engine lanes (default: 1);\n"
+        << "                              pp+tg at C>1 reports batched decode after a sequential\n"
+        << "                              prefix-reuse seed so prefill/decode do not interleave\n"
         << "  --mtp-draft-tokens <0..5>   speculative draft window (default: 0)\n"
         << "  --lm-head-draft             use the optimized proposal head; requires MTP\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
@@ -323,6 +327,11 @@ BenchOptions parse_args(int argc, char** argv) {
             options.prefill_chunk = parse_u32(value("--prefill-chunk"), "prefill-chunk");
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value("--kv-dtype"));
+        } else if (arg == "--concurrency") {
+            options.concurrency = parse_u32(value("--concurrency"), "concurrency");
+            if (options.concurrency > kMaximumConcurrency) {
+                throw std::invalid_argument("--concurrency must be in [1,8]");
+            }
         } else if (arg == "--mtp-draft-tokens") {
             options.mtp_draft_tokens =
                 parse_u32(value("--mtp-draft-tokens"), "mtp-draft-tokens", true);
@@ -421,14 +430,23 @@ std::uint32_t resolve_max_context(const std::vector<BenchTest>& tests,
     return override_max_context.value_or(required);
 }
 
+std::uint32_t concurrent_kv_capacity_tokens(std::uint32_t max_context, std::uint32_t concurrency) {
+    if (max_context == 0 || concurrency == 0) {
+        throw std::invalid_argument("concurrent KV capacity requires max_context and concurrency");
+    }
+    const std::uint64_t pages =
+        (static_cast<std::uint64_t>(max_context) + (kKvPageTokens - 1U)) / kKvPageTokens;
+    const std::uint64_t tokens = pages * kKvPageTokens * concurrency;
+    if (tokens > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("concurrent KV capacity exceeds uint32");
+    }
+    return static_cast<std::uint32_t>(tokens);
+}
+
 void validate_prompt_lengths(const std::vector<BenchTest>& tests, std::size_t corpus_tokens) {
+    (void)tests;
     if (corpus_tokens < static_cast<std::size_t>(kDecodeSeedTokens)) {
         throw std::invalid_argument("corpus is too small to seed decode tests");
-    }
-    for (const BenchTest& test : tests) {
-        if (test.has_prefill() && static_cast<std::size_t>(test.n_prompt) > corpus_tokens) {
-            throw std::invalid_argument(test.label + " exceeds the token-id corpus");
-        }
     }
 }
 
@@ -445,11 +463,17 @@ std::vector<TokenId> load_corpus_ids(const std::string& path) {
     return ids;
 }
 
-std::vector<TokenId> prompt_slice(const std::vector<TokenId>& corpus, int n_prompt) {
-    if (n_prompt <= 0 || static_cast<std::size_t>(n_prompt) > corpus.size()) {
+std::vector<TokenId> prompt_slice(const std::vector<TokenId>& corpus, int n_prompt,
+                                  std::size_t offset) {
+    if (n_prompt <= 0 || corpus.empty()) {
         throw std::invalid_argument("invalid prompt slice length: " + std::to_string(n_prompt));
     }
-    return {corpus.begin(), corpus.begin() + n_prompt};
+    std::vector<TokenId> out(static_cast<std::size_t>(n_prompt));
+    for (int i = 0; i < n_prompt; ++i) {
+        out[static_cast<std::size_t>(i)] =
+            corpus[(offset + static_cast<std::size_t>(i)) % corpus.size()];
+    }
+    return out;
 }
 
 std::string decode_path_name(bool use_cuda_graph, std::uint32_t mtp_draft_tokens) {
@@ -488,7 +512,8 @@ std::vector<double> prefill_tok_s_series(const TestResult& result) {
     if (!result.test.has_prefill()) { return out; }
     for (const RepTiming& rep : result.reps) {
         if (rep.timings.prefill_seconds > 0.0) {
-            out.push_back(static_cast<double>(result.test.n_prompt) / rep.timings.prefill_seconds);
+            out.push_back(static_cast<double>(result.test.n_prompt) * result.concurrency /
+                          rep.timings.prefill_seconds);
         }
     }
     return out;
@@ -499,7 +524,8 @@ std::vector<double> decode_output_tok_s_series(const TestResult& result) {
     if (!result.test.has_decode()) { return out; }
     for (const RepTiming& rep : result.reps) {
         if (rep.timings.decode_seconds > 0.0) {
-            out.push_back(static_cast<double>(result.test.n_gen) / rep.timings.decode_seconds);
+            out.push_back(static_cast<double>(result.test.n_gen) * result.concurrency /
+                          rep.timings.decode_seconds);
         }
     }
     return out;
@@ -565,7 +591,8 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << format_bytes(env.memory.kv_payload_bytes) << '\n'
         << "  corpus:     " << env.corpus_path << " (" << env.corpus_tokens << " tokens)\n"
         << "  config:     max_context=" << env.max_context << " prefill_chunk=" << env.prefill_chunk
-        << " kv_cache=" << kv_cache_name(env.kv_cache) << " mtp_k=" << env.mtp_draft_tokens
+        << " kv_cache=" << kv_cache_name(env.kv_cache) << " concurrency=" << env.concurrency
+        << " mtp_k=" << env.mtp_draft_tokens
         << " proposal_head=" << proposal_head_name(env.proposal_head)
         << " decode_path=" << decode_path_name(env.use_cuda_graph, env.mtp_draft_tokens)
         << " graph_prime="
@@ -672,6 +699,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"max_context\": " << env.max_context << ",\n"
         << "    \"prefill_chunk\": " << env.prefill_chunk << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
+        << "    \"concurrency\": " << env.concurrency << ",\n"
         << "    \"mtp_draft_tokens\": " << env.mtp_draft_tokens << ",\n"
         << "    \"proposal_head\": \"" << proposal_head_name(env.proposal_head) << "\",\n"
         << "    \"use_cuda_graph\": " << (env.use_cuda_graph ? "true" : "false") << ",\n"
@@ -820,6 +848,8 @@ std::string kv_cache_name(KvCacheStorage storage) {
         return "bf16";
     case KvCacheStorage::Int8Group64:
         return "int8-group64";
+    case KvCacheStorage::Nvfp4:
+        return "nvfp4";
     }
     return "unknown";
 }

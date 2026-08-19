@@ -109,7 +109,7 @@ Use `--resume` to skip completed JSON reports in an existing `--output-dir`, and
 for a minimal script/runner check. `--no-build` uses the binary supplied by `--bench` without
 building it.
 
-Each raw report must be `ninfer_bench_report` schema v11. The flattened summary and schema-v3 matrix
+Each raw report must be `ninfer_bench_report` schema v12. The flattened summary and schema-v3 matrix
 manifest carry native names from the report: selected target, canonical `weights_id`, artifact,
 load/read/upload/staging values, Engine memory arenas including request transient and CUDA Graph
 allowance, per-test planned logical and allocator-observed workspace peaks, KV capacity and
@@ -166,6 +166,20 @@ python3 tools/bench/run_serve_concurrency.py \
 Use `--kv-capacity auto` when the fixed corpus needs more shared KV than the default 262,144-token
 pool. A point is intentionally not resumable: combining fragments from separate server processes
 would not preserve either a steady interval or one continuous makespan.
+
+## NVFP4 KV context sweep
+
+`run_nvfp4_kv_context.py` drives `ninfer_bench` against `qwen3.8-27b/nvfp4` with MTP3 and the
+optimized proposal head. It compares INT8-G64 and NVFP4 KV:
+
+- C=1: combined `pp+tg` at 5k/20k/50k/100k/150k (prefill tok/s and decode tok/s)
+- C=2: combined `pp+tg` at 20k/50k, two Engine lanes, aggregate decode tok/s
+
+```bash
+python3 tools/bench/run_nvfp4_kv_context.py \
+  --weights out/qwen3_8_27b.ninfer \
+  --bench build/bench/ninfer_bench
+```
 
 ## Speed suite (live-serve scenario matrix)
 

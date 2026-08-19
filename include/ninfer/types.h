@@ -21,6 +21,7 @@ inline constexpr std::uint32_t kMaximumConcurrency = 8;
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
     Int8Group64,
+    Nvfp4,
 };
 
 enum class KvCapacityMode : std::uint8_t {

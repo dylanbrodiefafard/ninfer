@@ -788,8 +788,12 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
         .speculative_backend = options.speculative.backend,
-        .kv_dtype       = options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16 : DType::I8,
-        .kv_quant_group = options.kv_cache == KvCacheStorage::BFloat16 ? 0 : qwen3_6::kKvQuantGroup,
+        .kv_dtype       = options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16
+                        : options.kv_cache == KvCacheStorage::Nvfp4     ? DType::U8
+                                                                       : DType::I8,
+        .kv_quant_group = options.kv_cache == KvCacheStorage::BFloat16 ? 0
+                        : options.kv_cache == KvCacheStorage::Nvfp4     ? qwen3_6::kKvNvfp4Group
+                                                                       : qwen3_6::kKvQuantGroup,
         .proposal_head  = options.speculative.proposal_head,
         .features       = qwen3_6::startup_features(options),
         .use_cuda_graph = options.use_cuda_graph,

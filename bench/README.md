@@ -16,8 +16,9 @@ cmake --build build --parallel --target ninfer_bench
 ## Product benchmark
 
 The benchmark slices exact token counts from `bench/fixtures/bench_corpus.ids`, calls
-`Engine::prepare_tokens()`, then calls `Engine::generate()` once for each repetition. It does not
-have a private prefill/decode loop and does not call target implementation interfaces.
+`Engine::prepare_tokens()`, then calls `Engine::generate()` once for each repetition. Concurrent
+runs use `Engine::submit()` on `max_concurrency` lanes. It does not have a private prefill/decode
+loop and does not call target implementation interfaces.
 
 The matrix contains three independently measured test kinds:
 
@@ -29,10 +30,17 @@ The matrix contains three independently measured test kinds:
 - `pp{P}+tg{G}` uses the same `G+1` convention after a `P`-token prefill and reports both phase
   rates from the same generation call.
 
-All benchmark requests use raw output, disable model-default stops, and disable prefix reuse. This
-keeps the requested token count exact without adding another generation path. When CUDA Graph is
-enabled and the matrix contains decode work, one ordinary public generation request primes the
-decode graph before warmups and measured repetitions.
+All C=1 benchmark requests use raw output, disable model-default stops, and disable prefix reuse.
+This keeps the requested token count exact without adding another generation path. When CUDA Graph
+is enabled and the matrix contains decode work, one ordinary public generation request primes the
+decode graph before warmups and measured repetitions. `--concurrency N` also primes the N-lane
+decode graph.
+
+`--concurrency N` (1–8) sizes the Engine for N active lanes. Decode throughput is aggregate:
+`N * G / max(decode_seconds)` across lanes. For `pp+tg` at `N>1`, each lane first completes a
+sequential one-token seed with prefix reuse enabled, then the measured step overlaps the
+continuations. That isolates batched decode from the scheduler's prefill/decode interleave. C>1
+`pp+tg` therefore reports decode tok/s only.
 
 ## CLI
 
@@ -44,7 +52,7 @@ ninfer_bench --weights <artifact.ninfer>
           [-pg, --prompt-gen <P,G;P,G...>]
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
-          [--kv-dtype <bf16|int8>]
+          [--kv-dtype <bf16|int8|nvfp4>] [--concurrency <1..8>]
           [--mtp-draft-tokens <0..5>] [--lm-head-draft]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
@@ -60,9 +68,10 @@ Example:
   -p 512,2048 -n 128 -pg '2048,128' -r 5 --warmup 1
 ```
 
-`bf16` selects BF16 KV storage and `int8` selects INT8 group-64 KV storage. MTP is enabled with
-`--mtp-draft-tokens`; `--lm-head-draft` selects the optimized proposal head. CUDA Graph decode is
-enabled by default.
+`bf16` selects BF16 KV storage, `int8` selects INT8 group-64 KV storage, and `nvfp4` selects the
+NVFP4-G16 KV layout. MTP is enabled with `--mtp-draft-tokens`; `--lm-head-draft` selects the
+optimized proposal head. CUDA Graph decode is enabled by default. `--concurrency 2` is the
+batched-decode check: two Engine lanes, not HTTP.
 
 `--profile-measured` is a benchmark-only profiler boundary. It requires exactly one selected test
 and `-r 1`, synchronizes after warmup, and brackets only the measured repetition with

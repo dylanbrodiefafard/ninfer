@@ -47,7 +47,9 @@ q36::DecoderStateSpec decoder_spec(ninfer::DType dtype, bool mtp) {
         .kv_heads                  = 2,
         .attention_head_dim        = 64,
         .kv_dtype                  = dtype,
-        .kv_quant_group            = dtype == ninfer::DType::I8 ? q36::kKvQuantGroup : 0,
+        .kv_quant_group            = dtype == ninfer::DType::I8   ? q36::kKvQuantGroup
+                                     : dtype == ninfer::DType::U8 ? q36::kKvNvfp4Group
+                                                                  : 0,
         .enable_mtp                = mtp,
         .text_physical_page_groups = 5,
         .mtp_physical_page_groups  = mtp ? 4U : 0U,
@@ -104,6 +106,17 @@ void test_decoder_layout() {
            "INT8 MTP KV has scale planes");
     expect(int8.kv_payload_bytes() == int8.text_kv.payload_bytes() + int8.mtp_kv->payload_bytes(),
            "INT8 Text/MTP KV payload accounting");
+
+    ninfer::LayoutBuilder nvfp4_builder;
+    const q36::DecoderStateLayout nvfp4 =
+        q36::plan_decoder_state(nvfp4_builder, decoder_spec(ninfer::DType::U8, true));
+    (void)nvfp4_builder.finish(256);
+    expect(nvfp4.text_kv.pool.planes.size() == 8 &&
+               nvfp4.text_kv.pool.planes[0].spec.dtype == ninfer::DType::U8 &&
+               nvfp4.text_kv.pool.planes[0].spec.leading_extent == 32 &&
+               nvfp4.text_kv.pool.planes[2].spec.dtype == ninfer::DType::FP8_E4M3FN &&
+               nvfp4.text_kv.pool.planes[2].spec.leading_extent == 4,
+           "NVFP4 Text KV has packed code and UE4M3 scale planes");
 }
 
 void test_round_layout() {
