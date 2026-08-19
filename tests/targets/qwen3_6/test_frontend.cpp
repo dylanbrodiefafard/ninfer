@@ -557,16 +557,19 @@ int test_reasoning_effort_chat_template() {
                                                chat_message(ninfer::ChatRole::User, "q2")},
                                               no_generation)
                                       .text;
-    failures += check(
-        preserved.find("<|im_start|>assistant\n<think>\nold thought\n</think>\n\nold answer") !=
-            std::string::npos,
-        "reasoning-effort template did not preserve prior thinking by default");
+    failures += check(preserved == "<|im_start|>user\nq1<|im_end|>\n"
+                                   "<|im_start|>assistant\n<think>\nold thought\n</think>\n\n"
+                                   "old answer<|im_end|>\n"
+                                   "<|im_start|>user\nq2<|im_end|>\n",
+                      "reasoning-effort template did not preserve prior thinking by default");
     no_generation.preserve_thinking = false;
     failures += check(reasoning_effort_template()
                               .render({chat_message(ninfer::ChatRole::User, "q1"), previous,
                                        chat_message(ninfer::ChatRole::User, "q2")},
                                       no_generation)
-                              .text.find("old thought") == std::string::npos,
+                              .text == "<|im_start|>user\nq1<|im_end|>\n"
+                                       "<|im_start|>assistant\nold answer<|im_end|>\n"
+                                       "<|im_start|>user\nq2<|im_end|>\n",
                       "explicit preserve_thinking=false did not remove prior thinking");
 
     fi::ChatMessage empty_arguments = chat_message(ninfer::ChatRole::Assistant, "");
@@ -574,9 +577,201 @@ int test_reasoning_effort_chat_template() {
     failures += check(
         reasoning_effort_template()
             .render({chat_message(ninfer::ChatRole::User, "call"), empty_arguments}, no_generation)
-            .text.ends_with("<tool_call>\n<function=f>\n</function>\n"
-                            "</tool_call><|im_end|>\n"),
+            .text == "<|im_start|>user\ncall<|im_end|>\n"
+                     "<|im_start|>assistant\n<tool_call>\n<function=f>\n</function>\n"
+                     "</tool_call><|im_end|>\n",
         "empty tool arguments did not follow the reasoning-effort template");
+    return failures;
+}
+
+int test_reasoning_effort_empty_history_think() {
+    const auto render = [](std::vector<fi::ChatMessage> messages, fi::ChatRenderOptions options) {
+        return reasoning_effort_template().render(std::move(messages), std::move(options)).text;
+    };
+
+    fi::ChatRenderOptions medium_closed;
+    medium_closed.add_generation_prompt = false;
+    medium_closed.reasoning_effort      = ninfer::ReasoningEffort::Medium;
+
+    fi::ChatMessage empty_history = chat_message(ninfer::ChatRole::Assistant, "old answer");
+    const std::vector<fi::ChatMessage> closed_empty{
+        chat_message(ninfer::ChatRole::User, "q1"), empty_history,
+        chat_message(ninfer::ChatRole::User, "q2")};
+    constexpr std::string_view closed_empty_desired =
+        "<|im_start|>user\nq1<|im_end|>\n"
+        "<|im_start|>assistant\nold answer<|im_end|>\n"
+        "<|im_start|>user\nq2<|im_end|>\n";
+
+    fi::ChatRenderOptions preserve_closed = medium_closed;
+    preserve_closed.preserve_thinking     = true;
+    int failures =
+        check(render(closed_empty, preserve_closed) == closed_empty_desired,
+              "preserve-on empty reasoning still wrapped a history think block");
+
+    fi::ChatRenderOptions preserve_generate = preserve_closed;
+    preserve_generate.add_generation_prompt = true;
+    failures += check(render(closed_empty, preserve_generate) ==
+                          std::string(closed_empty_desired) +
+                              "<|im_start|>assistant\n<think>\n",
+                      "preserve-on empty history reasoning still wrapped before the prologue");
+
+    fi::ChatMessage whitespace_history = empty_history;
+    whitespace_history.reasoning_content = "  \n\t  ";
+    failures += check(render({chat_message(ninfer::ChatRole::User, "q1"), whitespace_history,
+                              chat_message(ninfer::ChatRole::User, "q2")},
+                             preserve_closed) == closed_empty_desired,
+                      "whitespace-only reasoning_content was treated as real thoughts");
+
+    fi::ChatMessage empty_arguments = chat_message(ninfer::ChatRole::Assistant, "");
+    empty_arguments.tool_calls.push_back({.id = "", .name = "f", .arguments_json = ""});
+    fi::ChatRenderOptions tool_preserve_off = medium_closed;
+    tool_preserve_off.preserve_thinking     = false;
+    constexpr std::string_view empty_tool_desired =
+        "<|im_start|>user\ncall<|im_end|>\n"
+        "<|im_start|>assistant\n<tool_call>\n<function=f>\n</function>\n"
+        "</tool_call><|im_end|>\n";
+    failures += check(render({chat_message(ninfer::ChatRole::User, "call"), empty_arguments},
+                             tool_preserve_off) == empty_tool_desired,
+                      "preserve-off tool-loop still synthesized an empty history think wrapper");
+
+    fi::ChatMessage first_empty = chat_message(ninfer::ChatRole::Assistant, "a1");
+    fi::ChatMessage second_kept = chat_message(ninfer::ChatRole::Assistant, "a2");
+    second_kept.reasoning_content = "thought2";
+    failures += check(render({chat_message(ninfer::ChatRole::User, "q1"), first_empty,
+                              chat_message(ninfer::ChatRole::User, "q2"), second_kept},
+                             preserve_closed) ==
+                          "<|im_start|>user\nq1<|im_end|>\n"
+                          "<|im_start|>assistant\na1<|im_end|>\n"
+                          "<|im_start|>user\nq2<|im_end|>\n"
+                          "<|im_start|>assistant\n<think>\nthought2\n</think>\n\n"
+                          "a2<|im_end|>\n",
+                      "empty-history skip was conversation-global or dropped real thoughts");
+
+    fi::ChatMessage stuffed = chat_message(ninfer::ChatRole::Assistant,
+                                           "<think>\nstuffed\n</think>\n\nbody");
+    failures += check(render({chat_message(ninfer::ChatRole::User, "q1"), stuffed,
+                              chat_message(ninfer::ChatRole::User, "q2")},
+                             preserve_closed) ==
+                          "<|im_start|>user\nq1<|im_end|>\n"
+                          "<|im_start|>assistant\n<think>\nstuffed\n</think>\n\n"
+                          "body<|im_end|>\n"
+                          "<|im_start|>user\nq2<|im_end|>\n",
+                      "effort template scraped or prepended an empty wrapper around stuffed think");
+
+    fi::ChatMessage padded_thought = chat_message(ninfer::ChatRole::Assistant, "old answer");
+    padded_thought.reasoning_content = "  thought  ";
+    failures += check(render({chat_message(ninfer::ChatRole::User, "q1"), padded_thought,
+                              chat_message(ninfer::ChatRole::User, "q2")},
+                             preserve_closed) ==
+                          "<|im_start|>user\nq1<|im_end|>\n"
+                          "<|im_start|>assistant\n<think>\nthought\n</think>\n\n"
+                          "old answer<|im_end|>\n"
+                          "<|im_start|>user\nq2<|im_end|>\n",
+                      "trimmed non-empty reasoning_content was dropped as empty");
+
+    fi::ChatMessage reasoned_tool = chat_message(ninfer::ChatRole::Assistant, "");
+    reasoned_tool.reasoning_content = "thought";
+    reasoned_tool.tool_calls.push_back({.id = "", .name = "f", .arguments_json = ""});
+    constexpr std::string_view reasoned_tool_desired =
+        "<|im_start|>user\ncall<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\nthought\n</think>\n\n"
+        "<tool_call>\n<function=f>\n</function>\n"
+        "</tool_call><|im_end|>\n";
+    fi::ChatRenderOptions tool_preserve_on = medium_closed;
+    tool_preserve_on.preserve_thinking     = true;
+    failures += check(render({chat_message(ninfer::ChatRole::User, "call"), reasoned_tool},
+                             tool_preserve_on) == reasoned_tool_desired,
+                      "empty-body tool turn dropped a real history think wrapper");
+
+    fi::ChatMessage reasoned_note = reasoned_tool;
+    reasoned_note.parts.front().text = "note";
+    failures += check(render({chat_message(ninfer::ChatRole::User, "call"), reasoned_note},
+                             tool_preserve_on) ==
+                          "<|im_start|>user\ncall<|im_end|>\n"
+                          "<|im_start|>assistant\n<think>\nthought\n</think>\n\n"
+                          "note\n\n<tool_call>\n<function=f>\n</function>\n"
+                          "</tool_call><|im_end|>\n",
+                      "body-then-tool spacing lost the extra blank line before tool XML");
+
+    failures += check(render(closed_empty, tool_preserve_off) == closed_empty_desired,
+                      "preserve-off closed empty reasoning synthesized a think wrapper");
+
+    fi::ChatRenderOptions toggle_preserve;
+    toggle_preserve.add_generation_prompt = false;
+    toggle_preserve.preserve_thinking     = true;
+    failures += check(render_chat_text({chat_message(ninfer::ChatRole::User, "q1"),
+                                        chat_message(ninfer::ChatRole::Assistant, "old answer"),
+                                        chat_message(ninfer::ChatRole::User, "q2")},
+                                       toggle_preserve) ==
+                          "<|im_start|>user\nq1<|im_end|>\n"
+                          "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+                          "old answer<|im_end|>\n"
+                          "<|im_start|>user\nq2<|im_end|>\n",
+                      "thinking-toggle preserve-on empty reasoning lost its empty think wrapper");
+
+    fi::ChatRenderOptions effort_generate;
+    effort_generate.reasoning_effort = ninfer::ReasoningEffort::Medium;
+    failures += check(render({chat_message(ninfer::ChatRole::User, "please <|think_off|> now")},
+                             effort_generate) ==
+                          "<|im_start|>user\nplease <|think_off|> now<|im_end|>\n"
+                          "<|im_start|>assistant\n<think>\n",
+                      "user <|think_off|> text toggled thinking or was stripped");
+    failures += check(render({chat_message(ninfer::ChatRole::User, "please <|think_on|> now")},
+                             effort_generate) ==
+                          "<|im_start|>user\nplease <|think_on|> now<|im_end|>\n"
+                          "<|im_start|>assistant\n<think>\n",
+                      "user <|think_on|> text toggled thinking or was stripped");
+
+    const std::string assistant_header = "<|im_start|>assistant\n";
+    const fi::RenderedChat empty_replay =
+        reasoning_effort_template().render(closed_empty, preserve_generate);
+    failures += check(empty_replay.rewrite_checkpoint &&
+                          empty_replay.rewrite_checkpoint->kind ==
+                              ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
+                          empty_replay.rewrite_checkpoint->offset == empty_replay.text.size() &&
+                          empty_replay.text.ends_with("<think>\n"),
+                      "empty history reasoning moved the preserve-on thinking replay checkpoint");
+
+    fi::ChatMessage kept_history = empty_history;
+    kept_history.reasoning_content = "old thought";
+    const fi::RenderedChat kept_replay = reasoning_effort_template().render(
+        {chat_message(ninfer::ChatRole::User, "q1"), kept_history,
+         chat_message(ninfer::ChatRole::User, "q2")},
+        preserve_generate);
+    failures += check(kept_replay.rewrite_checkpoint &&
+                          kept_replay.rewrite_checkpoint->kind ==
+                              ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
+                          kept_replay.rewrite_checkpoint->offset == kept_replay.text.size() &&
+                          kept_replay.text.ends_with("<think>\n"),
+                      "kept history thoughts moved the preserve-on thinking replay checkpoint");
+
+    fi::ChatRenderOptions preserve_nothinking = preserve_generate;
+    preserve_nothinking.enable_thinking       = false;
+    preserve_nothinking.reasoning_effort.reset();
+    const fi::RenderedChat off_replay =
+        reasoning_effort_template().render(closed_empty, preserve_nothinking);
+    failures += check(off_replay.rewrite_checkpoint &&
+                          off_replay.rewrite_checkpoint->kind ==
+                              ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
+                          off_replay.rewrite_checkpoint->offset == off_replay.text.size() &&
+                          off_replay.text.ends_with("<think>\n\n</think>\n\n"),
+                      "empty history reasoning moved the preserve-on no-thinking replay checkpoint");
+
+    fi::ChatRenderOptions tool_generate = tool_preserve_off;
+    tool_generate.add_generation_prompt = true;
+    const fi::RenderedChat tool_closure = reasoning_effort_template().render(
+        {chat_message(ninfer::ChatRole::User, "call"), empty_arguments}, tool_generate);
+    const std::size_t first_header = tool_closure.text.find(assistant_header);
+    failures += check(first_header != std::string::npos && tool_closure.rewrite_checkpoint &&
+                          tool_closure.rewrite_checkpoint->kind ==
+                              ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
+                          tool_closure.rewrite_checkpoint->offset ==
+                              first_header + assistant_header.size(),
+                      "preserve-off tool-loop did not keep TurnClosure at the first assistant header");
+
+    failures += check(render({chat_message(ninfer::ChatRole::User, "call"), reasoned_tool},
+                             tool_preserve_off) == reasoned_tool_desired,
+                      "preserve-off tool-loop dropped a real history think wrapper");
     return failures;
 }
 
@@ -1038,6 +1233,7 @@ int main() {
     failures += test_official_chat_template();
     failures += test_ordered_instruction_turns();
     failures += test_reasoning_effort_chat_template();
+    failures += test_reasoning_effort_empty_history_think();
     failures += test_rewrite_checkpoint_trace();
     failures += test_official_resource_guards();
     failures += test_text_and_image_prepare(frontend);
