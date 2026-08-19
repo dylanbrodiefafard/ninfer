@@ -7,6 +7,7 @@
 #include "serve/serve_options.h"
 
 #include <functional>
+#include <string_view>
 
 namespace ninfer::serve {
 
@@ -27,7 +28,8 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& req,
 
 ninfer::PromptInput to_prompt_input(const GenerationRequest& req,
                                     const ResolvedPromptSemantics& semantics,
-                                    const MediaAcquirer& acquire_media);
+                                    const MediaAcquirer& acquire_media,
+                                    std::string_view system_prepend = {});
 
 // Build public request options (output budget, thinking, stop policy, sampler). The
 // sampler is resolved from the request's SamplingParams over the server defaults;

@@ -2,6 +2,7 @@
 #include "serve/translate.h"
 
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -32,6 +33,8 @@ int main() {
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
+    failures += check(defaults.system_prepend.empty(),
+                      "system prepend is not empty by default");
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
     failures += check(defaults.request_log_jsonl.empty(),
                       "request JSONL logging is not disabled by default");
@@ -99,6 +102,17 @@ int main() {
     failures += check(configured.enable_vision, "--vision did not enable Vision");
     failures +=
         check(configured.preserve_thinking, "--preserve-thinking did not reach serving options");
+
+    const ServeOptions prepended =
+        parse({"ninfer-serve", "model.ninfer", "--system-prepend", "Stay terse."});
+    failures += check(prepended.system_prepend == "Stay terse.",
+                      "--system-prepend did not store the provided text");
+
+    bool empty_prepend_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--system-prepend", ""});
+    } catch (const std::invalid_argument&) { empty_prepend_rejected = true; }
+    failures += check(empty_prepend_rejected, "empty --system-prepend was accepted");
     failures +=
         check(configured.max_concurrency == 4, "--max-concurrency did not reach serving options");
     failures += check(configured.max_context == 4096 &&
@@ -162,6 +176,9 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--preserve-thinking") != std::string::npos,
               "serve help omits --preserve-thinking");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--system-prepend") != std::string::npos,
+              "serve help omits --system-prepend");
     failures += check(serve_usage_text("ninfer-serve").find("--vision") != std::string::npos,
                       "serve help omits --vision");
     failures +=

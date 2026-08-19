@@ -5,6 +5,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -99,6 +100,28 @@ std::vector<std::string> effective_tool_jsons(const GenerationRequest& request) 
     return tools;
 }
 
+void apply_leading_system_prepend(std::vector<ninfer::ChatMessage>& messages,
+                                  std::string_view chunk) {
+    if (chunk.empty()) { return; }
+    if (!messages.empty() && (messages[0].role == ninfer::ChatRole::System ||
+                              messages[0].role == ninfer::ChatRole::Developer)) {
+        std::string joined;
+        for (const ninfer::MessagePart& part : messages[0].parts) {
+            if (part.kind == ninfer::MessagePartKind::Text) { joined += part.text; }
+        }
+        ninfer::MessagePart leading;
+        leading.text = joined.empty() ? std::string(chunk) : std::string(chunk) + "\n\n";
+        messages[0].parts.insert(messages[0].parts.begin(), std::move(leading));
+        return;
+    }
+    ninfer::ChatMessage system;
+    system.role = ninfer::ChatRole::System;
+    ninfer::MessagePart text;
+    text.text = std::string(chunk);
+    system.parts.push_back(std::move(text));
+    messages.insert(messages.begin(), std::move(system));
+}
+
 } // namespace
 
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& request,
@@ -159,7 +182,8 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
 
 ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
                                     const ResolvedPromptSemantics& semantics,
-                                    const MediaAcquirer& acquire_media) {
+                                    const MediaAcquirer& acquire_media,
+                                    std::string_view system_prepend) {
     ninfer::PromptInput input;
     input.messages.reserve(request.messages.size());
     for (const ChatTurn& turn : request.messages) {
@@ -211,6 +235,7 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
     input.options.preserve_thinking     = semantics.preserve_thinking;
     input.options.add_vision_id         = false;
     input.options.tool_jsons            = effective_tool_jsons(request);
+    apply_leading_system_prepend(input.messages, system_prepend);
     return input;
 }
 

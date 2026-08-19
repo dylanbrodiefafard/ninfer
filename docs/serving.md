@@ -468,6 +468,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
+| `--system-prepend TEXT` | prepend TEXT to the leading system/developer instruction on every request; inserts a system turn if none exists | off |
 | `--cors` | permissive browser CORS headers | off |
 | `--temperature F` | process-level temperature override | unset |
 | `--top-p F` | process-level top-p override | unset |

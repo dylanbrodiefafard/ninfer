@@ -353,10 +353,12 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
     try {
         std::size_t remaining_media_bytes = options_.max_request_bytes;
         ninfer::PromptInput input =
-            to_prompt_input(request, semantics, [&](const ContentPart& part) {
-                return acquire_media(part, prepared.lifetime->deadline, is_cancelled,
-                                     remaining_media_bytes);
-            });
+            to_prompt_input(request, semantics,
+                            [&](const ContentPart& part) {
+                                return acquire_media(part, prepared.lifetime->deadline,
+                                                     is_cancelled, remaining_media_bytes);
+                            },
+                            options_.system_prepend);
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
         ninfer::PreparedPrompt prompt = engine_->prepare(std::move(input));
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
@@ -393,9 +395,12 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
     try {
         std::size_t remaining_media_bytes = options_.max_request_bytes;
         ninfer::PromptInput input =
-            to_prompt_input(request, semantics, [&](const ContentPart& part) {
-                return acquire_media(part, deadline, is_cancelled, remaining_media_bytes);
-            });
+            to_prompt_input(request, semantics,
+                            [&](const ContentPart& part) {
+                                return acquire_media(part, deadline, is_cancelled,
+                                                     remaining_media_bytes);
+                            },
+                            options_.system_prepend);
         check_preparation_control(deadline, is_cancelled);
         const int prompt_tokens = static_cast<int>(engine_->count_tokens(std::move(input)));
         check_preparation_control(deadline, is_cancelled);
