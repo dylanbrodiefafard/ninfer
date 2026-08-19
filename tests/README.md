@@ -143,6 +143,10 @@ NINFER_QWEN3_6_35B_A3B_WEIGHTS=$PWD/out/qwen3_6_35b_a3b.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_35b_a3b_ram_real_test --output-on-failure
 ```
 
+`--system-prepend` is applied on every request, including follow-ups, so the leading system
+tokens stay in the reusable prefix. `ninfer_serve_system_prepend_real_test` checks VRAM reuse on
+turn 2 and a host-RAM restore after an unrelated chat spills the first turn:
+
 ```bash
 NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_6_27b.ninfer \
   ctest --test-dir build -R ninfer_serve_system_prepend_real_test --output-on-failure

@@ -26,14 +26,15 @@ int check(bool condition, const std::string& message) { return condition ? 0 : f
 
 const char* kPrepend = "Server policy: answer in one sentence.";
 
-ninfer::EngineOptions engine_options(const char* artifact) {
+ninfer::EngineOptions engine_options(const char* artifact, std::size_t ram_bytes = 0) {
     ninfer::EngineOptions options;
-    options.artifact_path       = artifact;
-    options.max_context         = 4096;
-    options.kv_capacity         = ninfer::KvCapacityPolicy::explicit_capacity(4096);
-    options.prefill_chunk       = 1024;
-    options.enable_vision       = false;
-    options.speculative.backend = ninfer::SpeculativeBackend::None;
+    options.artifact_path         = artifact;
+    options.max_context           = 4096;
+    options.kv_capacity           = ninfer::KvCapacityPolicy::explicit_capacity(4096);
+    options.prefill_chunk         = 1024;
+    options.kv_ram_capacity_bytes = ram_bytes;
+    options.enable_vision         = false;
+    options.speculative.backend   = ninfer::SpeculativeBackend::None;
     return options;
 }
 
@@ -150,6 +151,8 @@ int exercise_artifact(const char* artifact) {
     const ninfer::PromptInput turn2         = translate(turn2_req, kPrepend);
     const ninfer::GenerationResult second   = engine.generate(engine.prepare(turn2), options);
     failures += require_eight_tokens(second, "turn 2");
+    failures += check(second.prefix_reuse_source == ninfer::PrefixReuseSource::VramResident,
+                      "turn 2 did not reuse the prepended prefix from VRAM");
     failures += check(second.reused_prompt_tokens > 0, "turn 2 did not reuse a prepended prefix");
     ninfer::PromptInput closed               = turn1;
     closed.options.add_generation_prompt     = false;
@@ -206,6 +209,63 @@ int exercise_artifact(const char* artifact) {
     return failures;
 }
 
+int exercise_ram_artifact(const char* artifact) {
+    constexpr std::size_t kRamBytes = 1024ULL * 1024ULL * 1024ULL;
+    ninfer::Engine engine(engine_options(artifact, kRamBytes));
+    if (engine.memory_summary().kv_ram_capacity_bytes != kRamBytes) {
+        return fail("RAM-tier prepend engine did not enable host KV capacity");
+    }
+    const ninfer::RequestOptions options = request_options();
+
+    const ninfer::PromptInput turn1 =
+        translate(request_from_turns({{ninfer::ChatRole::User, "q1"}}), kPrepend);
+    const ninfer::GenerationResult first = engine.generate(engine.prepare(turn1), options);
+    if (const int rc = require_eight_tokens(first, "RAM turn 1"); rc != 0) { return rc; }
+
+    const auto captures_before = engine.runtime_stats().kv_ram_captures;
+    const ninfer::PromptInput other =
+        translate(request_from_turns({{ninfer::ChatRole::User, "unrelated"}}), kPrepend);
+    const ninfer::GenerationResult evictor = engine.generate(engine.prepare(other), options);
+    if (const int rc = require_eight_tokens(evictor, "RAM evictor"); rc != 0) { return rc; }
+    if (evictor.prefix_reuse_path != ninfer::PrefixReusePath::FullReset ||
+        evictor.prefix_reuse_source != ninfer::PrefixReuseSource::None) {
+        return fail("RAM evictor reused the prepended first chat instead of spilling it");
+    }
+    if (engine.runtime_stats().kv_ram_captures <= captures_before) {
+        return fail("RAM evictor did not capture the prepended first chat");
+    }
+
+    GenerationRequest turn2_req = request_from_turns({
+        {ninfer::ChatRole::User, "q1"},
+        {ninfer::ChatRole::Assistant, first.content},
+        {ninfer::ChatRole::User, "q2"},
+    });
+    turn2_req.messages[1].reasoning_content = first.reasoning;
+    const ninfer::PromptInput turn2         = translate(turn2_req, kPrepend);
+    const auto restores_before              = engine.runtime_stats().kv_ram_restores;
+    const ninfer::GenerationResult second   = engine.generate(engine.prepare(turn2), options);
+    if (const int rc = require_eight_tokens(second, "RAM turn 2"); rc != 0) { return rc; }
+    if (second.prefix_reuse_source != ninfer::PrefixReuseSource::HostRam ||
+        second.reused_prompt_tokens == 0) {
+        std::cerr << "FAIL: RAM turn 2 reuse_source="
+                  << static_cast<int>(second.prefix_reuse_source) << " reused "
+                  << second.reused_prompt_tokens << '\n';
+        return 1;
+    }
+    if (engine.runtime_stats().kv_ram_restores != restores_before + 1) {
+        return fail("RAM turn 2 did not restore the prepended first chat from host KV");
+    }
+    ninfer::PromptInput closed           = turn1;
+    closed.options.add_generation_prompt = false;
+    const std::uint32_t closed_tokens    = engine.count_tokens(closed);
+    if (second.reused_prompt_tokens < closed_tokens) {
+        std::cerr << "FAIL: RAM turn 2 reused " << second.reused_prompt_tokens
+                  << " tokens, expected at least " << closed_tokens << '\n';
+        return 1;
+    }
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -217,8 +277,14 @@ int main() {
         return 77;
     }
     int failures = 0;
-    if (groupwise != nullptr && *groupwise != '\0') { failures += exercise_artifact(groupwise); }
-    if (nvfp4 != nullptr && *nvfp4 != '\0') { failures += exercise_artifact(nvfp4); }
+    if (groupwise != nullptr && *groupwise != '\0') {
+        failures += exercise_artifact(groupwise);
+        failures += exercise_ram_artifact(groupwise);
+    }
+    if (nvfp4 != nullptr && *nvfp4 != '\0') {
+        failures += exercise_artifact(nvfp4);
+        failures += exercise_ram_artifact(nvfp4);
+    }
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
