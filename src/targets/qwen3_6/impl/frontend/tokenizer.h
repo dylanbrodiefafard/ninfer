@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -39,6 +41,12 @@ public:
     explicit Tokenizer(TokenizerResources resources);
 
     std::vector<int> encode(std::string_view text, EncodeOptions options = {}) const;
+    struct EncodeResult {
+        std::vector<int> ids;
+        std::optional<std::uint32_t> checkpoint_frontier;
+    };
+    EncodeResult encode_with_checkpoint(std::string_view text, std::optional<std::size_t> checkpoint_byte,
+                                        EncodeOptions options = {}) const;
     std::string decode(std::span<const int> ids, DecodeOptions options = {}) const;
     std::string decode_token_bytes(int id, bool skip_special_tokens = false) const;
 
@@ -52,6 +60,7 @@ public:
 
 private:
     std::vector<std::string> id_to_token_;
+    std::vector<std::string> id_to_bytes_;
     std::vector<bool> valid_token_ids_;
     std::unordered_map<std::string, int> vocab_token_to_id_;
     std::unordered_map<std::string, int> bpe_merge_ranks_;
