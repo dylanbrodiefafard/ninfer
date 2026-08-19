@@ -10,13 +10,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
+#include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace ninfer::targets::qwen3_6::frontend_internal {
 namespace {
@@ -579,21 +583,70 @@ void append_bpe_ids(std::vector<int>& ids, std::string_view text, bool has_bpe_m
     const std::string normalized = uni::normalize_nfc(text);
     for (const std::string_view word : qwen_split_words(normalized)) {
         std::vector<std::string> symbols = byte_level_symbols(byte_level_encode(word));
-        while (symbols.size() > 1) {
-            int best_rank              = std::numeric_limits<int>::max();
-            std::size_t best_pair_left = symbols.size();
-            for (std::size_t i = 0; i + 1 < symbols.size(); ++i) {
-                const auto rank = merge_ranks.find(merge_pair_key(symbols[i], symbols[i + 1]));
-                if (rank != merge_ranks.end() && rank->second < best_rank) {
-                    best_rank      = rank->second;
-                    best_pair_left = i;
-                }
-            }
-            if (best_pair_left == symbols.size()) { break; }
-            symbols[best_pair_left] += symbols[best_pair_left + 1];
-            symbols.erase(symbols.begin() + static_cast<std::ptrdiff_t>(best_pair_left + 1));
+        const std::size_t n              = symbols.size();
+        if (n == 0) { continue; }
+        if (n == 1) {
+            append_symbol_id(ids, token_to_id, symbols[0]);
+            continue;
         }
-        for (const std::string& symbol : symbols) { append_symbol_id(ids, token_to_id, symbol); }
+
+        std::vector<int> prev(n);
+        std::vector<int> next(n);
+        std::vector<char> alive(n, 1);
+        std::vector<int> stamp(n, 0);
+        for (std::size_t i = 0; i < n; ++i) {
+            prev[i] = static_cast<int>(i) - 1;
+            next[i] = (i + 1 < n) ? static_cast<int>(i + 1) : -1;
+        }
+
+        const auto pair_rank = [&](int left) -> int {
+            if (left < 0) { return -1; }
+            const int right = next[static_cast<std::size_t>(left)];
+            if (right < 0 || !alive[static_cast<std::size_t>(left)] ||
+                !alive[static_cast<std::size_t>(right)]) {
+                return -1;
+            }
+            const auto rank =
+                merge_ranks.find(merge_pair_key(symbols[static_cast<std::size_t>(left)],
+                                                symbols[static_cast<std::size_t>(right)]));
+            return rank == merge_ranks.end() ? -1 : rank->second;
+        };
+
+        std::priority_queue<std::tuple<int, int, int>, std::vector<std::tuple<int, int, int>>,
+                            std::greater<std::tuple<int, int, int>>>
+            heap;
+        const auto push_pair = [&](int left) {
+            const int rank = pair_rank(left);
+            if (rank < 0) { return; }
+            heap.emplace(rank, left, stamp[static_cast<std::size_t>(left)]);
+        };
+        for (std::size_t i = 0; i + 1 < n; ++i) { push_pair(static_cast<int>(i)); }
+
+        while (!heap.empty()) {
+            const auto [rank, left, seen] = heap.top();
+            heap.pop();
+            if (stamp[static_cast<std::size_t>(left)] != seen || pair_rank(left) != rank) {
+                continue;
+            }
+            const int right    = next[static_cast<std::size_t>(left)];
+            const int neighbor = prev[static_cast<std::size_t>(left)];
+            symbols[static_cast<std::size_t>(left)] += symbols[static_cast<std::size_t>(right)];
+            alive[static_cast<std::size_t>(right)] = 0;
+            next[static_cast<std::size_t>(left)]   = next[static_cast<std::size_t>(right)];
+            if (next[static_cast<std::size_t>(right)] >= 0) {
+                prev[static_cast<std::size_t>(next[static_cast<std::size_t>(right)])] = left;
+            }
+            ++stamp[static_cast<std::size_t>(left)];
+            if (neighbor >= 0) { ++stamp[static_cast<std::size_t>(neighbor)]; }
+            push_pair(left);
+            push_pair(neighbor);
+        }
+
+        for (int i = 0; i >= 0; i = next[static_cast<std::size_t>(i)]) {
+            if (alive[static_cast<std::size_t>(i)]) {
+                append_symbol_id(ids, token_to_id, symbols[static_cast<std::size_t>(i)]);
+            }
+        }
     }
 }
 
@@ -631,17 +684,61 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
     bpe_merge_ranks_        = load_bpe_merge_ranks(model, tokenizer_label);
     has_bpe_merges_         = true;
     default_stop_token_ids_ = load_default_stop_token_ids(resources.generation_config_json);
+    id_to_bytes_.resize(id_to_token_.size());
+    static const std::unordered_map<std::uint32_t, char> byte_decoder = build_byte_level_decoder();
+    for (std::size_t index = 0; index < id_to_token_.size(); ++index) {
+        if (index >= valid_token_ids_.size() || !valid_token_ids_[index]) { continue; }
+        const int id                 = static_cast<int>(index);
+        const std::string& token     = id_to_token_[index];
+        if (is_added_token_id(added_tokens_, id)) {
+            id_to_bytes_[index] = token;
+            continue;
+        }
+        std::string bytes;
+        const std::vector<uni::CodepointSpan> codepoints =
+            uni::utf8_codepoints(token, "Tokenizer load token id " + std::to_string(id));
+        bytes.reserve(codepoints.size());
+        for (const uni::CodepointSpan& codepoint : codepoints) {
+            const auto byte = byte_decoder.find(static_cast<std::uint32_t>(codepoint.value));
+            if (byte == byte_decoder.end()) {
+                throw std::invalid_argument("Tokenizer load token id " + std::to_string(id) +
+                                            " contains a character outside the byte-level alphabet");
+            }
+            bytes.push_back(byte->second);
+        }
+        id_to_bytes_[index] = std::move(bytes);
+    }
 }
 
 std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options) const {
-    if (text.empty()) { return {}; }
-    if (!options.parse_added_tokens) {
-        std::vector<int> ids;
-        append_bpe_ids(ids, text, has_bpe_merges_, bpe_merge_ranks_, vocab_token_to_id_);
-        return ids;
+    return encode_with_checkpoint(text, std::nullopt, options).ids;
+}
+
+Tokenizer::EncodeResult Tokenizer::encode_with_checkpoint(std::string_view text,
+                                                          std::optional<std::size_t> checkpoint_byte,
+                                                          EncodeOptions options) const {
+    EncodeResult result;
+    if (text.empty()) {
+        if (checkpoint_byte && *checkpoint_byte == 0) { result.checkpoint_frontier = 0; }
+        return result;
     }
 
-    std::vector<int> ids;
+    auto capture = [&](std::size_t consumed) {
+        if (checkpoint_byte && *checkpoint_byte == consumed && !result.checkpoint_frontier) {
+            if (result.ids.size() > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::overflow_error("rewrite checkpoint token frontier exceeds uint32");
+            }
+            result.checkpoint_frontier = static_cast<std::uint32_t>(result.ids.size());
+        }
+    };
+    capture(0);
+
+    if (!options.parse_added_tokens) {
+        append_bpe_ids(result.ids, text, has_bpe_merges_, bpe_merge_ranks_, vocab_token_to_id_);
+        capture(text.size());
+        return result;
+    }
+
     std::size_t pos = 0;
     while (pos < text.size()) {
         std::size_t match_pos         = std::string_view::npos;
@@ -657,19 +754,24 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
         }
 
         if (match_token == nullptr) {
-            append_bpe_ids(ids, text.substr(pos), has_bpe_merges_, bpe_merge_ranks_,
+            append_bpe_ids(result.ids, text.substr(pos), has_bpe_merges_, bpe_merge_ranks_,
                            vocab_token_to_id_);
+            pos = text.size();
+            capture(pos);
             break;
         }
         if (match_pos > pos) {
-            append_bpe_ids(ids, text.substr(pos, match_pos - pos), has_bpe_merges_,
+            append_bpe_ids(result.ids, text.substr(pos, match_pos - pos), has_bpe_merges_,
                            bpe_merge_ranks_, vocab_token_to_id_);
+            pos = match_pos;
+            capture(pos);
         }
 
-        ids.push_back(match_token->id);
+        result.ids.push_back(match_token->id);
         pos = match_pos + match_token->content.size();
+        capture(pos);
     }
-    return ids;
+    return result;
 }
 
 std::string Tokenizer::decode(std::span<const int> ids, DecodeOptions options) const {
@@ -688,35 +790,18 @@ std::string Tokenizer::decode(std::span<const int> ids, DecodeOptions options) c
 }
 
 std::string Tokenizer::decode_token_bytes(int id, bool skip_special_tokens) const {
-    static const std::unordered_map<std::uint32_t, char> byte_decoder = build_byte_level_decoder();
-
     if (skip_special_tokens && is_special_token(id)) { return {}; }
     if (id < 0) {
         throw std::invalid_argument("Tokenizer::decode received negative token id " +
                                     std::to_string(id));
     }
     const auto index = static_cast<std::size_t>(id);
-    if (index >= id_to_token_.size() || index >= valid_token_ids_.size() ||
+    if (index >= id_to_bytes_.size() || index >= valid_token_ids_.size() ||
         !valid_token_ids_.at(index)) {
         throw std::out_of_range("Tokenizer::decode token id " + std::to_string(id) +
                                 " is outside loaded vocabulary");
     }
-
-    const std::string& token = id_to_token_.at(index);
-    if (is_added_token_id(added_tokens_, id)) { return token; }
-
-    std::string bytes;
-    const std::vector<uni::CodepointSpan> codepoints =
-        uni::utf8_codepoints(token, "Tokenizer::decode token id " + std::to_string(id));
-    for (const uni::CodepointSpan& codepoint : codepoints) {
-        const auto byte = byte_decoder.find(static_cast<std::uint32_t>(codepoint.value));
-        if (byte == byte_decoder.end()) {
-            throw std::invalid_argument("Tokenizer::decode token id " + std::to_string(id) +
-                                        " contains a character outside the byte-level alphabet");
-        }
-        bytes.push_back(byte->second);
-    }
-    return bytes;
+    return id_to_bytes_[index];
 }
 
 bool Tokenizer::is_special_token(int id) const noexcept {

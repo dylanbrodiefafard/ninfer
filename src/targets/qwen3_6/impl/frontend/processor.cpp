@@ -518,23 +518,37 @@ std::span<const std::int32_t> ProcessedInput::position_axis(int axis) const {
 
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered) {
     EncodedChat encoded;
-    encoded.input_ids = tokenizer.encode(rendered.text);
-    if (!rendered.rewrite_checkpoint) { return encoded; }
+    if (!rendered.rewrite_checkpoint) {
+        encoded.input_ids = tokenizer.encode(rendered.text);
+        return encoded;
+    }
     if (rendered.rewrite_checkpoint->offset > rendered.text.size()) {
         throw std::logic_error("rewrite checkpoint byte offset exceeds rendered chat");
     }
-    const std::vector<int> prefix = tokenizer.encode(
-        std::string_view(rendered.text).substr(0, rendered.rewrite_checkpoint->offset));
-    if (prefix.empty() || prefix.size() > encoded.input_ids.size() ||
-        !std::equal(prefix.begin(), prefix.end(), encoded.input_ids.begin())) {
-        throw std::logic_error("rewrite checkpoint is not an exact token prefix");
+    Tokenizer::EncodeResult encoded_text =
+        tokenizer.encode_with_checkpoint(rendered.text, rendered.rewrite_checkpoint->offset);
+    encoded.input_ids = std::move(encoded_text.ids);
+    std::uint32_t frontier = 0;
+    if (encoded_text.checkpoint_frontier) {
+        frontier = *encoded_text.checkpoint_frontier;
+    } else {
+        const std::vector<int> prefix = tokenizer.encode(
+            std::string_view(rendered.text).substr(0, rendered.rewrite_checkpoint->offset));
+        if (prefix.empty() || prefix.size() > encoded.input_ids.size() ||
+            !std::equal(prefix.begin(), prefix.end(), encoded.input_ids.begin())) {
+            throw std::logic_error("rewrite checkpoint is not an exact token prefix");
+        }
+        if (prefix.size() > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::overflow_error("rewrite checkpoint token frontier exceeds uint32");
+        }
+        frontier = static_cast<std::uint32_t>(prefix.size());
     }
-    if (prefix.size() > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::overflow_error("rewrite checkpoint token frontier exceeds uint32");
+    if (frontier == 0 || frontier > encoded.input_ids.size()) {
+        throw std::logic_error("rewrite checkpoint is not an exact token prefix");
     }
     encoded.rewrite_checkpoint = RewriteCheckpointSpec{
         .kind     = rendered.rewrite_checkpoint->kind,
-        .frontier = static_cast<std::uint32_t>(prefix.size()),
+        .frontier = frontier,
     };
     return encoded;
 }

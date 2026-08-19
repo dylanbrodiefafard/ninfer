@@ -28,6 +28,13 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# CMake's CUDA Release flags default to -O3 -DNDEBUG, but a leftover empty
+# CMAKE_CUDA_FLAGS_RELEASE cache entry disables that. Restore it.
+if(CMAKE_CUDA_FLAGS_RELEASE STREQUAL "")
+  set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING
+    "Flags used by the CUDA compiler during RELEASE builds." FORCE)
+endif()
+
 if(CMAKE_GENERATOR MATCHES "Ninja")
   set_property(GLOBAL PROPERTY JOB_POOLS cuda_link=1)
   set(CMAKE_JOB_POOL_LINK cuda_link)
