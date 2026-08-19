@@ -103,7 +103,7 @@ with context length.
 `T` denotes the Text/MTP token extent supplied to an Op. It is any positive tensor extent that
 fits the applicable storage or explicit state capacity. Decode (`T=1`), verification-sized calls,
 and prefill chunks are workload points and private implementation routes, not different Op domains.
-The configured prefill chunk controls target workspace and request decomposition; its default 1024
+The configured prefill chunk controls target workspace and request decomposition; its default 4096
 does not cap an Op's `T`.
 
 Vision uses different axes. `P` is the aggregate raw-patch count and must be a positive multiple of
