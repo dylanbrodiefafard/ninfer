@@ -182,7 +182,9 @@ room-puzzle prompt from `tools/bench/fixtures/`). Add your own realistic prompts
 `prefill_tok_s` (overall average: tokens / wall prefill time) and `prefill_tail_tok_s`
 (steady-state rate over the trailing ≤1 s of prefill — the number your kernel work moves; for
 long-context prefill the tail is slower than the average because attention cost grows with
-depth). Both come from the server's `timings` block; the tail requires the current engine build.
+depth). Both come from the server's `usage.prompt_tokens_details` block; the tail requires the
+current engine build. Prefill rates there cover the computed (non-reused) suffix only — a cached
+prefix is reported as `cached_tokens`, not counted into the rate.
 
 ```bash
 # Full base set (small ± thinking, multi-turn, tools, 8k/64k NIAH, decode). ~2 min.
@@ -197,7 +199,7 @@ python3 tools/bench/run_speed_suite.py --label LABEL --runs 2 --warmup 1
 Outputs land under `profiles/bench/speed-suite/` (gitignored): a per-run JSON
 (`speed-suite-LABEL.json`, per-case aggregates) and a publishable one-row-per-case CSV
 (`speed-suite-LABEL.csv`) for the progress doc / cross-branch diff. Metrics read the server's
-llama.cpp-style `timings` block, so no extra instrumentation is needed.
+`usage.prompt_tokens_details` block, so no extra instrumentation is needed.
 
 **Trials:** `--runs N` repeats each case N times *in one session* (mean/median/min/max reported).
 For *independent* trials — cold vs warm start, thermal drift, minutes apart, or a different

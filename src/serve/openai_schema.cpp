@@ -493,66 +493,76 @@ const char* prefix_reuse_source_name(ninfer::PrefixReuseSource source) {
     return "unknown";
 }
 
-Json timings_to_json(const CompletionTimings& timings) {
-    Json out = {{"prompt_n", timings.prompt_n},
-                {"prompt_ms", json_decimal3(timings.prompt_ms)},
-                {"prompt_per_token_ms", json_decimal3(timings.prompt_per_token_ms)},
-                {"prompt_per_second", json_decimal3(timings.prompt_per_second)},
-                {"prefill_tail_tok_s", json_decimal3(timings.prefill_tail_tok_s)},
-                {"prefill_tail_window_s", json_decimal3(timings.prefill_tail_window_s)},
-                {"predicted_n", timings.predicted_n},
-                {"predicted_ms", json_decimal3(timings.predicted_ms)},
-                {"predicted_per_token_ms", json_decimal3(timings.predicted_per_token_ms)},
-                {"predicted_per_second", json_decimal3(timings.predicted_per_second)},
-                {"reuse_source", prefix_reuse_source_name(timings.prefix_reuse_source)}};
-    if (timings.draft_n > 0 || timings.draft_n_accepted > 0) {
-        out["draft_n"]          = timings.draft_n;
-        out["draft_n_accepted"] = timings.draft_n_accepted;
-    }
-    if (timings.kv_ram_capacity_bytes != 0) {
-        out["kv_ram_used_bytes"]  = timings.kv_ram_used_bytes;
-        out["kv_ram_entry_count"] = timings.kv_ram_entry_count;
-        out["kv_ram_restores"]    = timings.kv_ram_restores;
-        out["kv_ram_evictions"]   = timings.kv_ram_evictions;
-        out["kv_ram_drops"]       = timings.kv_ram_drops;
-        out["kv_ram_save_ms"]     = json_decimal3(timings.kv_ram_save_ms);
-        out["kv_ram_load_ms"]     = json_decimal3(timings.kv_ram_load_ms);
-    }
-    return out;
-}
-
-// Open WebUI merges top-level `timings` into usage and JSON-stringifies the result.
-// Direct clients also see the llama.cpp / Ollama fields flattened onto `usage`.
 Json usage_to_json(const CompletionUsage& usage, const CompletionTimings* timings) {
     Json out = {{"prompt_tokens", usage.prompt_tokens},
                 {"completion_tokens", usage.completion_tokens},
                 {"total_tokens", usage.prompt_tokens + usage.completion_tokens}};
     if (timings == nullptr) { return out; }
-    const Json t = timings_to_json(*timings);
-    for (auto it = t.begin(); it != t.end(); ++it) { out[it.key()] = it.value(); }
-    // Ollama-compatible aliases (durations in nanoseconds) for older OWUI tooltips.
-    out["prompt_eval_count"]    = timings->prompt_n;
-    out["eval_count"]           = timings->predicted_n;
-    out["prompt_eval_duration"] = static_cast<std::int64_t>(timings->prompt_ms * 1.0e6);
-    out["eval_duration"]        = static_cast<std::int64_t>(timings->predicted_ms * 1.0e6);
-    out["total_duration"] =
-        static_cast<std::int64_t>((timings->prompt_ms + timings->predicted_ms) * 1.0e6);
+
+    // Downstream proxies normalize OpenAI usage (e.g. LiteLLM drops unknown top-level
+    // usage keys) but forward the standard details sub-objects, so every stat lives
+    // exactly once, here:
+    //  - prompt_tokens_details: the OpenAI-standard `cached_tokens` plus engine stats
+    //    under the `ninfer` vendor namespace (prefill/decode rates, KV RAM tier).
+    //  - completion_tokens_details: OpenAI-standard keys only, so they survive proxy
+    //    normalization (reasoning + speculative-decoding token breakdowns).
+    Json ptd = {{"cached_tokens", timings->prompt_reused_n}};
+    Json ninfer = {{"reuse_source", prefix_reuse_source_name(timings->prefix_reuse_source)},
+                   {"prefill",
+                    {{"ms", json_decimal3(timings->prompt_ms)},
+                     {"tok_s", json_decimal3(timings->prompt_per_second)},
+                     {"ms_per_token", json_decimal3(timings->prompt_per_token_ms)},
+                     {"tail_tok_s", json_decimal3(timings->prefill_tail_tok_s)},
+                     {"tail_window_s", json_decimal3(timings->prefill_tail_window_s)}}},
+                   {"decode",
+                    {{"ms", json_decimal3(timings->predicted_ms)},
+                     {"tok_s", json_decimal3(timings->predicted_per_second)},
+                     {"ms_per_token", json_decimal3(timings->predicted_per_token_ms)}}}};
+    if (timings->kv_ram_capacity_bytes != 0) {
+        // Host KV RAM tier: live engine-wide gauges at request end, this request's
+        // D2H/H2D copy time, and engine-lifetime cumulative counters.
+        ninfer["kv_ram"] = {{"used_bytes", timings->kv_ram_used_bytes},
+                            {"entry_count", timings->kv_ram_entry_count},
+                            {"save_ms", json_decimal3(timings->kv_ram_save_ms)},
+                            {"load_ms", json_decimal3(timings->kv_ram_load_ms)},
+                            {"lifetime",
+                             {{"captures", timings->kv_ram_captures},
+                              {"restores", timings->kv_ram_restores},
+                              {"evictions", timings->kv_ram_evictions},
+                              {"drops", timings->kv_ram_drops}}}};
+    }
+    ptd["ninfer"] = std::move(ninfer);
+    out["prompt_tokens_details"] = std::move(ptd);
+
+    Json ctd = {{"reasoning_tokens", timings->reasoning_tokens}};
+    if (timings->draft_n > 0) {
+        ctd["accepted_prediction_tokens"] = timings->draft_n_accepted;
+        ctd["rejected_prediction_tokens"] = std::max(0, timings->draft_n - timings->draft_n_accepted);
+    }
+    out["completion_tokens_details"] = std::move(ctd);
     return out;
 }
 
 } // namespace
 
 CompletionTimings make_completion_timings(int prompt_tokens, int completion_tokens,
-                                          double prefill_seconds, double decode_seconds,
-                                          int draft_n, int draft_n_accepted,
-                                          double prefill_tail_tok_s,
-                                          double prefill_tail_window_s) {
+                                           double prefill_seconds, double decode_seconds,
+                                           int draft_n, int draft_n_accepted,
+                                           double prefill_tail_tok_s,
+                                           double prefill_tail_window_s, int prompt_reused) {
     CompletionTimings out;
     out.prompt_n            = prompt_tokens;
+    out.prompt_reused_n     = std::max(0, std::min(prompt_reused, prompt_tokens));
     out.prompt_ms           = prefill_seconds * 1000.0;
-    out.prompt_per_token_ms = prompt_tokens > 0 ? out.prompt_ms / prompt_tokens : 0.0;
+    // Prefill rates cover the computed (non-reused) suffix only: a cached prefix is
+    // not re-prefilled, so counting it would inflate the rate by the reuse ratio.
+    const int computed_prompt_tokens = prompt_tokens - out.prompt_reused_n;
+    out.prompt_per_token_ms =
+        computed_prompt_tokens > 0 ? out.prompt_ms / computed_prompt_tokens : 0.0;
     out.prompt_per_second =
-        prefill_seconds > 0.0 ? static_cast<double>(prompt_tokens) / prefill_seconds : 0.0;
+        prefill_seconds > 0.0 && computed_prompt_tokens > 0
+            ? static_cast<double>(computed_prompt_tokens) / prefill_seconds
+            : 0.0;
     out.prefill_tail_tok_s    = prefill_tail_tok_s;
     out.prefill_tail_window_s = prefill_tail_window_s;
     out.predicted_n  = completion_tokens;
@@ -709,8 +719,7 @@ std::string make_chat_completion_response(const std::string& id, const std::stri
         {"choices",
          Json::array({Json{
              {"index", 0}, {"message", std::move(message)}, {"finish_reason", finish_reason}}})},
-        {"usage", usage_to_json(usage, timings)}};
-    if (timings != nullptr) { payload["timings"] = timings_to_json(*timings); }
+         {"usage", usage_to_json(usage, timings)}};
     return payload.dump();
 }
 
@@ -732,8 +741,7 @@ std::string make_chat_completion_tool_response(const std::string& id, const std:
         {"choices",
          Json::array({Json{
              {"index", 0}, {"message", std::move(message)}, {"finish_reason", "tool_calls"}}})},
-        {"usage", usage_to_json(usage, timings)}};
-    if (timings != nullptr) { payload["timings"] = timings_to_json(*timings); }
+         {"usage", usage_to_json(usage, timings)}};
     return payload.dump();
 }
 
@@ -796,7 +804,6 @@ std::string make_chat_chunk_final(const std::string& id, const std::string& mode
     } else if (include_usage) {
         payload["usage"] = nullptr;
     }
-    if (timings != nullptr) { payload["timings"] = timings_to_json(*timings); }
     return sse_event(payload);
 }
 
@@ -806,7 +813,6 @@ std::string make_chat_chunk_usage(const std::string& id, const std::string& mode
     Json payload       = base_chunk(id, model, created);
     payload["choices"] = Json::array();
     payload["usage"]   = usage_to_json(usage, timings);
-    if (timings != nullptr) { payload["timings"] = timings_to_json(*timings); }
     return sse_event(payload);
 }
 

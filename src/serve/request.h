@@ -56,6 +56,9 @@ struct CompletionUsage {
 // llama.cpp-compatible timing block for Open WebUI / LiteLLM info bubbles.
 struct CompletionTimings {
     int prompt_n                = 0;
+    // Prefix tokens served from prefix reuse (no recompute). Prefill rates below are
+    // computed over the non-reused suffix only, so cached prefixes do not inflate them.
+    int prompt_reused_n         = 0;
     double prompt_ms            = 0.0;
     double prompt_per_token_ms  = 0.0;
     double prompt_per_second    = 0.0;
@@ -68,10 +71,17 @@ struct CompletionTimings {
     double predicted_per_second = 0.0;
     int draft_n                 = 0;
     int draft_n_accepted        = 0;
+    // Reasoning (thinking) portion of the completion; 0 when thinking is off.
+    int reasoning_tokens        = 0;
     ninfer::PrefixReuseSource prefix_reuse_source = ninfer::PrefixReuseSource::None;
+    // Host KV RAM tier stats, all zero when the tier is off. used_bytes / entry_count
+    // are live engine-level gauges at request end; the *_total counters are
+    // engine-lifetime cumulative; save_ms / load_ms are this request's D2H/H2D copy
+    // time. capacity_bytes is the static pin budget (not serialized).
     std::size_t kv_ram_capacity_bytes = 0;
     std::size_t kv_ram_used_bytes     = 0;
     std::size_t kv_ram_entry_count    = 0;
+    std::uint64_t kv_ram_captures     = 0;
     std::uint64_t kv_ram_restores     = 0;
     std::uint64_t kv_ram_evictions    = 0;
     std::uint64_t kv_ram_drops        = 0;
