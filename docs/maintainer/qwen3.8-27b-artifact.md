@@ -23,8 +23,11 @@ target_key = qwen3_8_27b
 ```
 
 Each artifact contains Text, the optimized MTP draft head, MTP, Vision, and six frontend
-resources. The identity is read from the version-2 artifact directory; filenames and object counts
-do not select the target or weight profile.
+resources. A Qwen3.8-27B NVFP4 file may additionally append 66 DFlash2 objects under `dflash/`.
+Those objects are inventory-conditional: current MTP-only 3.8 files and all 3.6-27B files remain
+valid. `--spec dflash` requires the appended companion; `--spec mtp` on a reconverted file still
+works (DFlash tensors stay host-placed). The identity is read from the version-2 artifact
+directory; filenames and object counts do not select the target or weight profile.
 
 ## 2. Persistent inventory
 
@@ -54,6 +57,35 @@ projection uses Q6, and the registered MTP and Vision-merger matrices use W8. Di
 logical row views, and aliases are defined by
 `tools/convert/qwen3_8_27b/inventory.py`.
 
+Optional DFlash2 on the NVFP4 identity is defined by
+`tools/convert/qwen3_8_27b/inventory_dflash2.py` (66 tensors). W8 matrices use `W8G32_F16S`; the
+Q4 sibling uses `Q4G64_F16S` for the same `[N,K]` set. Direct tensors (norms, conv `base_kernel`,
+selector codebooks) stay BF16. Codebooks are stored as NInfer `(256, 248320)` rank-fastest.
+`base_kernel` is stored as `(5120, 2, 2)` in Hugging Face order without a permute.
+
+| Object | Logical shape | Format (W8 sibling) |
+|---|---|---|
+| `dflash/feature_projection` | `[5120, 25600]` | `W8G32_F16S` |
+| `dflash/context_norm` | `[5120]` | `BF16` |
+| `dflash/layers/{0..4}/input_norm` | `[5120]` | `BF16` |
+| `dflash/layers/{0..4}/attention/query_key_value` | `[6144, 5120]` | `W8G32_F16S` |
+| `dflash/layers/{0..4}/attention/query_norm` | `[128]` | `BF16` |
+| `dflash/layers/{0..4}/attention/key_norm` | `[128]` | `BF16` |
+| `dflash/layers/{0..4}/attention/output` | `[5120, 4096]` | `W8G32_F16S` |
+| `dflash/layers/{0..4}/attention_conv/base_kernel` | `[5120, 2, 2]` | `BF16` |
+| `dflash/layers/{0..4}/attention_conv/kernel_projection` | `[1280, 5120]` | `W8G32_F16S` |
+| `dflash/layers/{0..4}/post_attention_norm` | `[5120]` | `BF16` |
+| `dflash/layers/{0..4}/mlp/gate_up` | `[34816, 5120]` | `W8G32_F16S` |
+| `dflash/layers/{0..4}/mlp/down` | `[5120, 17408]` | `W8G32_F16S` |
+| `dflash/layers/{0..4}/mlp_conv/base_kernel` | `[5120, 2, 2]` | `BF16` |
+| `dflash/layers/{0..4}/mlp_conv/kernel_projection` | `[1280, 5120]` | `W8G32_F16S` |
+| `dflash/final_norm` | `[5120]` | `BF16` |
+| `dflash/selector/hidden_projection` | `[256, 5120]` | `W8G32_F16S` |
+| `dflash/selector/{predecessor,successor}_codebook` | `[256, 248320]` | `BF16` |
+
+Fused QKV row ranges are query `[0,4096)`, key `[4096,5120)`, value `[5120,6144)`. Gate/up on
+`mlp/gate_up` are `[0,17408)` and `[17408,34816)`.
+
 ## 3. Conversion
 
 The converter consumes the Qwen3.8-27B BF16 checkpoint and writes one complete artifact:
@@ -73,6 +105,21 @@ The converter owns and pins the official Qwen3.8 six-resource frontend profile. 
 Qwen3.6-27B profile, `tokenizer.json`, `tokenizer_config.json`, and `chat_template.jinja` have
 Qwen3.8-specific bytes; `generation_config.json`, `preprocessor_config.json`, and
 `video_preprocessor_config.json` are byte-identical.
+
+NVFP4 DFlash2 is an append onto an existing `qwen3.8-27b/nvfp4` file. It does not rewrite Text,
+MTP, or Vision bytes:
+
+```bash
+python3 -m tools.convert.qwen3_8_27b.convert_nvfp4 \
+  --base-artifact /path/to/qwen3_8_27b_nvfp4.ninfer \
+  --dflash-model /path/to/Qwen3.8-27B-DFlash2 \
+  --dflash-format w8 \
+  --out out/qwen3_8_27b_nvfp4_dflash_w8.ninfer
+```
+
+`--dflash-format q4` writes a sibling that differs only in DFlash2 matrix `QType`. The converter
+pins Hugging Face `z-lab/Qwen3.8-27B-DFlash2` revision `50307d4c4cde6860d4eee73e2547cd786fe8e8a4`
+and `z-lab/dflash` `model.py` commit `95c8aeca5e4b4c4f9c0c967c05ab89fa3ed24f4c`.
 
 ## 4. Engine binding
 
@@ -101,3 +148,8 @@ The opt-in 27B live Engine tests (`ninfer_qwen3_6_27b_prefix_real_test`,
 `NINFER_QWEN3_6_27B_WEIGHTS` or `NINFER_QWEN3_6_27B_NVFP4_WEIGHTS` points at the Qwen3.8
 `.ninfer` (`qwen3_8_27b.ninfer` or `qwen3_8_27b_nvfp4.ninfer`). The env names follow the shared
 27B package; they are not restricted to a Qwen3.6 filename.
+
+`ninfer_qwen3_8_27b_dflash_real_test` loads a reconverted NVFP4+DFlash2 file from
+`NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS`. It compares C=1 k=7 Graph DFlash2 greedy output to
+MTP k=3 greedy on the same artifact. NVFP4 target verify at `T>=4` uses W4A4 attention, so that
+path is not required to match ordinary `T=1` A16 decode.

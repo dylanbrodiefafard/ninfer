@@ -104,9 +104,24 @@ std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t cap
     return graph_profiles_through(capacity - 1, ends);
 }
 
-std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t, std::uint32_t,
+std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t capacity,
+                                                                  std::uint32_t draft_window,
                                                                   std::uint32_t) {
-    return {};
+    if (draft_window == 0 || capacity == 0) { return {}; }
+    const std::uint32_t block = draft_window + 1;
+    std::vector<std::uint32_t> ends;
+    const auto add_shifted = [&](std::uint32_t visible_end, std::uint32_t offset) {
+        if (visible_end >= offset) { ends.push_back(visible_end - offset); }
+    };
+    for (const std::uint32_t visible_end : {128U, 512U, 2048U, 4096U, 8198U, 16390U, 32768U}) {
+        add_shifted(visible_end, block);
+    }
+    for (const std::uint32_t ordinary_end : {127U, 511U, 2047U, 4095U, 8197U, 16389U, 32767U}) {
+        ends.push_back(ordinary_end);
+    }
+    std::sort(ends.begin(), ends.end());
+    ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
+    return graph_profiles_through(capacity - 1, ends);
 }
 
 void Variant::attention_projection(const Tensor& hidden,

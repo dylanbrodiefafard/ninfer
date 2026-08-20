@@ -22,6 +22,7 @@ constexpr int kPage          = 64;
 constexpr int kLogicalPages  = 3;
 constexpr int kPhysicalPages = 6;
 constexpr int kWindow        = 4096;
+constexpr int kWindow2048    = 2048;
 
 std::size_t input_index(int d, int head, int token) {
     return static_cast<std::size_t>(d) +
@@ -30,11 +31,11 @@ std::size_t input_index(int d, int head, int token) {
                 static_cast<std::size_t>(kKVHeads) * static_cast<std::size_t>(token));
 }
 
-std::size_t cyclic_cache_index(int d, int head, int slot) {
+std::size_t cyclic_cache_index(int d, int head, int slot, int window = kWindow) {
     return static_cast<std::size_t>(d) +
            static_cast<std::size_t>(kHeadDim) *
                (static_cast<std::size_t>(slot) +
-                static_cast<std::size_t>(kWindow) * static_cast<std::size_t>(head));
+                static_cast<std::size_t>(window) * static_cast<std::size_t>(head));
 }
 
 std::size_t paged_cache_index(int d, int head, int position,
@@ -63,14 +64,14 @@ void append_oracle(std::vector<std::uint16_t>& cache_k, std::vector<std::uint16_
                    const std::vector<std::uint16_t>& input_k,
                    const std::vector<std::uint16_t>& input_v,
                    const std::vector<std::int32_t>& positions, int commit_count, bool cyclic,
-                   const std::vector<std::int32_t>& mapping) {
+                   const std::vector<std::int32_t>& mapping, int window = kWindow) {
     for (int token = 0; token < commit_count; ++token) {
         const int position = positions[static_cast<std::size_t>(token)];
-        const int slot     = cyclic ? position % kWindow : 0;
+        const int slot     = cyclic ? position % window : 0;
         for (int head = 0; head < kKVHeads; ++head) {
             for (int d = 0; d < kHeadDim; ++d) {
                 const auto src = input_index(d, head, token);
-                const auto dst = cyclic ? cyclic_cache_index(d, head, slot)
+                const auto dst = cyclic ? cyclic_cache_index(d, head, slot, window)
                                         : paged_cache_index(d, head, position, mapping);
                 cache_k[dst]   = input_k[src];
                 cache_v[dst]   = input_v[src];
@@ -93,12 +94,12 @@ PagedKVBatchLayerView paged_view(GuardedDeviceBuffer& k, GuardedDeviceBuffer& v,
 }
 
 CyclicKVCacheLayerView cyclic_view(GuardedDeviceBuffer& k, GuardedDeviceBuffer& v,
-                                   int lane_capacity = 1) {
+                                   int lane_capacity = 1, int window = kWindow) {
     return {
-        .k        = Tensor(k.data(), DType::BF16, {kHeadDim, kWindow, kKVHeads, lane_capacity}),
-        .v        = Tensor(v.data(), DType::BF16, {kHeadDim, kWindow, kKVHeads, lane_capacity}),
-        .capacity = kWindow,
-        .padded_capacity = kWindow,
+        .k        = Tensor(k.data(), DType::BF16, {kHeadDim, window, kKVHeads, lane_capacity}),
+        .v        = Tensor(v.data(), DType::BF16, {kHeadDim, window, kKVHeads, lane_capacity}),
+        .capacity = static_cast<std::uint32_t>(window),
+        .padded_capacity = static_cast<std::uint32_t>(window),
         .num_kv_heads    = kKVHeads,
         .head_dim        = kHeadDim,
         .lane_capacity   = lane_capacity,
@@ -106,13 +107,13 @@ CyclicKVCacheLayerView cyclic_view(GuardedDeviceBuffer& k, GuardedDeviceBuffer& 
 }
 
 int run_case(int tokens, int commit_count, int first_position, bool cyclic,
-             std::vector<std::int32_t> mapping = {}, int min_count = 0) {
+             std::vector<std::int32_t> mapping = {}, int min_count = 0, int window = kWindow) {
     if (!cyclic && mapping.size() != kLogicalPages) {
         throw std::invalid_argument("paged prefix case requires a complete mapping");
     }
     const std::size_t input_count = static_cast<std::size_t>(kHeadDim) * kKVHeads * tokens;
     const std::size_t cache_count =
-        static_cast<std::size_t>(kHeadDim) * kKVHeads * (cyclic ? kWindow : kPage * kPhysicalPages);
+        static_cast<std::size_t>(kHeadDim) * kKVHeads * (cyclic ? window : kPage * kPhysicalPages);
     const auto host_k = patterned_bits(input_count, 0x10203040u + static_cast<unsigned>(tokens));
     const auto host_v =
         patterned_bits(input_count, 0x50607080u + static_cast<unsigned>(commit_count));
@@ -124,7 +125,8 @@ int run_case(int tokens, int commit_count, int first_position, bool cyclic,
     }
     auto expected_k = initial_k;
     auto expected_v = initial_v;
-    append_oracle(expected_k, expected_v, host_k, host_v, positions, commit_count, cyclic, mapping);
+    append_oracle(expected_k, expected_v, host_k, host_v, positions, commit_count, cyclic, mapping,
+                  window);
 
     DeviceBuffer d_k         = to_device(host_k);
     DeviceBuffer d_v         = to_device(host_v);
@@ -148,7 +150,7 @@ int run_case(int tokens, int commit_count, int first_position, bool cyclic,
     };
     if (cyclic) {
         ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, selector_tensor, envelope,
-                                    cyclic_view(cache_k, cache_v), nullptr);
+                                    cyclic_view(cache_k, cache_v, 1, window), nullptr);
     } else {
         ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, selector_tensor, envelope,
                                     paged_view(cache_k, cache_v, d_table), nullptr);
@@ -432,6 +434,8 @@ int main() {
     failures += run_case(1, 1, 2 * kWindow - 1, true);
     failures += run_case(16, 7, 2 * kWindow - 2, true);
     failures += run_case(16, 16, 3 * kWindow - 8, true, {}, 16);
+    failures += run_case(1, 1, 2 * kWindow2048 - 1, true, {}, 0, kWindow2048);
+    failures += run_case(16, 16, 3 * kWindow2048 - 8, true, {}, 16, kWindow2048);
     failures += cyclic_graph_replay_case();
     failures += paged_graph_replay_case();
     failures += batch_selector_case(true);

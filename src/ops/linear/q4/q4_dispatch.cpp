@@ -10,10 +10,20 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     switch (k) {
     case 5120:
         switch (n) {
+        case 256:
+            if (t == 1) { return launch_q4_gemv_r1_w8_direct; }
+            if (t <= 4) { return launch_q4_simt_r8_c4; }
+            if (t <= 16) { return launch_q4_simt_r8_c8; }
+            return launch_q4_mma_r64_c128;
         case 1024:
             if (t == 1) { return launch_q4_gemv_r1_w8_direct; }
             if (t <= 15) { return launch_q4_simt_r8_c4; }
             if (t == 16) { return launch_q4_simt_r8_c8; }
+            return launch_q4_mma_r64_c128;
+        case 1280:
+            if (t == 1) { return launch_q4_gemv_r1_w8_direct; }
+            if (t <= 4) { return launch_q4_simt_r8_c4; }
+            if (t <= 16) { return launch_q4_simt_r8_c8; }
             return launch_q4_mma_r64_c128;
         case 4096:
             if (t == 1) { return launch_q4_gemv_r1_w8_direct; }
@@ -43,6 +53,30 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             return launch_q4_mma_r64_c128;
         default:
             break;
+        }
+        break;
+    case 4096:
+        if (n == 5120) {
+            if (t == 1) { return launch_q4_gemv_r4_w1_direct; }
+            if (t <= 4) { return launch_q4_simt_r8_c4; }
+            if (t <= 16) { return launch_q4_simt_r8_c8; }
+            return launch_q4_mma_r64_c128;
+        }
+        break;
+    case 17408:
+        if (n == 5120) {
+            if (t == 1) { return launch_q4_gemv_r4_w1_direct; }
+            if (t <= 4) { return launch_q4_simt_r8_c4; }
+            if (t <= 16) { return launch_q4_simt_r8_c8; }
+            return launch_q4_mma_r64_c128;
+        }
+        break;
+    case 25600:
+        if (n == 5120) {
+            if (t == 1) { return launch_q4_gemv_r4_w1_direct; }
+            if (t <= 4) { return launch_q4_simt_r8_c4; }
+            if (t <= 16) { return launch_q4_simt_r8_c8; }
+            return launch_q4_mma_r64_c128;
         }
         break;
     case 2048:

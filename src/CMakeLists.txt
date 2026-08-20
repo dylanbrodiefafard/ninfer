@@ -88,6 +88,8 @@ add_library(ninfer_ops STATIC
   ops/launcher/rmsnorm.cu
   ops/launcher/rope.cu
   ops/launcher/sampling.cu
+  ops/launcher/grouped_dynamic_conv.cu
+  ops/launcher/dflash2_path_select.cu
   ops/launcher/scalar.cu
   ops/launcher/scatter.cu
   ops/launcher/sigmoid_gate_mul.cu
@@ -233,6 +235,8 @@ add_library(ninfer_ops STATIC
   ops/wrapper/rmsnorm.cpp
   ops/wrapper/rope.cpp
   ops/wrapper/sampling.cpp
+  ops/wrapper/grouped_dynamic_conv.cpp
+  ops/wrapper/dflash2_path_select.cpp
   ops/wrapper/scalar.cpp
   ops/wrapper/scatter.cpp
   ops/wrapper/sigmoid_mul.cpp

@@ -24,11 +24,14 @@ MANIFEST_PATH = REPO_ROOT / "examples/cli/manifest.json"
 TARGET_MODEL_IDS = {
     "qwen3_6_35b_a3b": "qwen3.6-35b-a3b",
     "qwen3_6_27b": "qwen3.6-27b",
+    "qwen3_8_27b": "qwen3.8-27b",
 }
 TARGET_ORDER = tuple(TARGET_MODEL_IDS)
 SPECULATIVE_MODES = {
     "mtp0": ("none", 0),
     "mtp3": ("mtp", 3),
+    "mtp4": ("mtp", 4),
+    "mtp5": ("mtp", 5),
     "dflash7": ("dflash", 7),
 }
 DEFAULT_MODES = ("mtp0", "mtp3")
@@ -82,7 +85,7 @@ WARMUP_FIXTURE = "text_smoke_zh"
 RUN_ARTIFACT_TYPE = "ninfer_serve_corpus_result"
 RUN_SCHEMA_VERSION = 5
 SERVER_LOG_ARTIFACT_TYPE = "ninfer_serve_request_log"
-SERVER_LOG_SCHEMA_VERSION = 9
+SERVER_LOG_SCHEMA_VERSION = 11
 STARTUP_TIMEOUT_SECONDS = 1800.0
 REQUEST_TIMEOUT_SECONDS = 24.0 * 60.0 * 60.0
 LOG_EVENT_TIMEOUT_SECONDS = 10.0
@@ -380,8 +383,10 @@ def build_specs(
     for target, artifact in artifacts:
         for mode_name in mode_names:
             backend, draft_tokens = SPECULATIVE_MODES[mode_name]
-            if backend == "dflash" and target != "qwen3_6_35b_a3b":
-                raise CampaignError("DFlash corpus measurements require the 35B-A3B target")
+            if backend == "dflash" and target not in {"qwen3_6_35b_a3b", "qwen3_8_27b"}:
+                raise CampaignError(
+                    "DFlash corpus measurements require the 35B-A3B or Qwen3.8-27B target"
+                )
             for fixture_name in block_fixture_names(backend):
                 for seed in SEEDS:
                     specs.append(

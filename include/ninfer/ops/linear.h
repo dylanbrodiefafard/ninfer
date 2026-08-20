@@ -61,9 +61,11 @@ enum class LinearPolicy : std::uint8_t {
  * internally; a valid encoding and alignment do not imply arbitrary N/K support. The current
  * NVFP4 problems `[N,K]` in `{[14336,5120], [16384,5120], [34816,5120],
  * [5120,6144], [5120,17408]}` accept every positive T. Text and MTP packed-weight problems accept
- * every positive column extent T. Registered Vision problems accept raw-patch P in
- * `{4,8,...,131072}` or merged-token V in `[1,32768]`; a matrix column does not inherently
- * represent a text token. FP32_CTRL is unsupported.
+ * every positive column extent T. Registered W8 problems `[5120,25600]`, `[5120,4096]`,
+ * `[1280,5120]`, and `[256,5120]`, and registered Q4 problems `[5120,25600]`, `[5120,4096]`,
+ * `[5120,17408]`, `[1280,5120]`, and `[256,5120]`, also accept every positive T. Registered Vision
+ * problems accept raw-patch P in `{4,8,...,131072}` or merged-token V in `[1,32768]`; a matrix
+ * column does not inherently represent a text token. FP32_CTRL is unsupported.
  *
  * @par Numerical contract
  * Test fixture code materializes the persistent weight as its logical FP32 dequantized matrix.
