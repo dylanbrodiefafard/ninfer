@@ -21,7 +21,8 @@ NVIDIA GeForce RTX 5090. They cover long-context prefill and baseline decode wit
 decoding disabled, plus long-reasoning and cross-scenario decode with MTP and DFlash. The 27B
 results report its `groupwise-int` and `nvfp4` weight profiles separately. The concurrent
 decode-saturation campaign measures the same three Qwen3.6 artifact profiles at C=1, 2, 4, and 8.
-Qwen3.8-27B is supported by current NInfer builds but is not included in this published campaign.
+A separate C=1 Qwen3.8-27B NVFP4 campaign below compares MTP0/3/5 with DFlash2 k=7 on the same
+frozen AIME command.
 
 The single-request corpus requests were submitted serially to a persistent `ninfer-serve` process
 over the loopback OpenAI-compatible HTTP endpoint. Each reported corpus fixture used five fixed
@@ -186,7 +187,44 @@ python3 tools/bench/run_serve_concurrency.py \
 ```
 
 Use `--mode dflash7` for the corresponding DFlash block=8 campaign; add `--sampling greedy` for
-the exact-argmax profile.
+the exact-argmax profile. Qwen3.8-27B NVFP4 DFlash2 uses the same flag on a reconverted artifact:
+
+```bash
+python3 tools/bench/run_serve_concurrency.py \
+  --serve build/apps/ninfer-serve \
+  --artifact qwen3_8_27b=out/qwen3_8_27b_nvfp4_dflash_w8.ninfer \
+  --mode dflash7 --mode mtp3 --mode mtp5 --mode mtp0 \
+  --sampling stochastic \
+  --temperature 0.6 --top-p 0.95 --top-k 20 --min-p 0 --presence-penalty 0 \
+  --concurrency 1 --suite decode-saturation \
+  --saturation-fixture long_decode_aime26_15 \
+  --decode-tokens 4096 --max-context 16384 --kv-capacity 16384 \
+  --output profiles/bench/qwen38_dflash2_c1_aime
+```
+
+## Qwen3.8-27B NVFP4 C=1 decode
+
+Same GPU, INT8 KV, graphs on, `--lm-head-draft`, seed `7632647173703958409`. The DFlash2 W8
+companion is appended on `out/qwen3_8_27b_nvfp4_dflash_w8.ninfer`; MTP points load that same file
+with DFlash host-placed. `long_decode_aime26_15` uses 4096 output tokens and max-context 16384.
+Story is `scenario_story_en_mystery` at 1024 output tokens.
+
+| Mode | Workload | Decode tok/s | Accept | Tokens/round |
+|---|---|---:|---:|---:|
+| MTP0 | AIME, stochastic | 86.0 | — | — |
+| MTP3 | AIME, stochastic | 184.7 | 51.9% | 2.56 |
+| MTP5 | AIME, stochastic | 195.9 | 41.1% | 3.06 |
+| DFlash2 k=7 W8 | AIME, stochastic | 126.7 | 27.5% | 2.92 |
+| MTP3 | AIME, greedy | 184.9 | 52.0% | 2.56 |
+| DFlash2 k=7 W8 | AIME, greedy | 132.0 | 29.1% | 3.04 |
+| MTP3 | story, stochastic | 163.5 | 41.9% | 2.26 |
+| DFlash2 k=7 W8 | story, stochastic | 115.7 | 21.6% | 2.51 |
+
+DFlash2 is a supported exclusive backend on this identity (`--spec dflash --draft-tokens 7
+--lm-head-draft`). These first C=1 points beat MTP0 (1.47× on stochastic AIME) and trail MTP3
+(0.69×) and MTP5 (0.65×). Greedy AIME and story show the same gap: DFlash2 accept is about
+22–29% versus MTP3 about 42–52%. That accept gap is the current speed target; it is not a reason
+to drop the backend.
 
 Omit `--mode` and supply the two measured Qwen3.6 groupwise-int artifacts to run the complete
 published Qwen3.6 MTP0/MTP3 campaign:

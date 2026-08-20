@@ -8,6 +8,7 @@
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/sampling.h"
@@ -15,6 +16,8 @@
 #include "ninfer/ops/gqa_attention.h"
 #include "ninfer/ops/bidirectional_gqa_attention.h"
 #include "ninfer/ops/swa.h"
+#include "ninfer/ops/grouped_dynamic_conv.h"
+#include "ninfer/ops/dflash2_path_select.h"
 
 #include <algorithm>
 #include <initializer_list>
@@ -157,26 +160,28 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 builder, DFlashConfig::local_layers, DFlashConfig::local_capacity,
                 DFlashConfig::kv_heads, DFlashConfig::head_dim,
                 static_cast<std::int32_t>(plan.max_concurrency));
-            PagedKVPoolSpec full_pool{
-                .page_group_count      = physical_pages,
-                .logical_page_capacity = logical_pages,
-                .table_rows            = static_cast<std::int32_t>(plan.max_concurrency),
-                .plane_order           = PagedKVPlaneOrder::HeadMajor,
-                .planes =
-                    {
-                        {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
-                        {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
-                    },
-            };
-            dflash.full = qwen3_6::PagedKVCacheLayout{
-                .pool        = plan_paged_kv_pool(builder, full_pool),
-                .layers      = 1,
-                .max_context = plan.capacity,
-                .kv_heads    = DFlashConfig::kv_heads,
-                .head_dim    = DFlashConfig::head_dim,
-                .dtype       = DType::BF16,
-                .quant_group = 0,
-            };
+            if constexpr (DFlashConfig::full_layers > 0) {
+                PagedKVPoolSpec full_pool{
+                    .page_group_count      = physical_pages,
+                    .logical_page_capacity = logical_pages,
+                    .table_rows            = static_cast<std::int32_t>(plan.max_concurrency),
+                    .plane_order           = PagedKVPlaneOrder::HeadMajor,
+                    .planes =
+                        {
+                            {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
+                            {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
+                        },
+                };
+                dflash.full = qwen3_6::PagedKVCacheLayout{
+                    .pool        = plan_paged_kv_pool(builder, full_pool),
+                    .layers      = 1,
+                    .max_context = plan.capacity,
+                    .kv_heads    = DFlashConfig::kv_heads,
+                    .head_dim    = DFlashConfig::head_dim,
+                    .dtype       = DType::BF16,
+                    .quant_group = 0,
+                };
+            }
             dflash.prefill_features = add_tensor(
                 builder, DType::BF16, {DFlashConfig::feature_rows, effective_prefill_chunk},
                 "DFlash prefill target features");
@@ -462,9 +467,33 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     matrix(layout, DType::BF16, DFlashConfig::feature_rows, tokens);
                 }
                 (void)workspace_recipe::dflash_context<DFlashConfig>(layout, tokens);
+                if constexpr (DFlashConfig::kind == qwen3_6::DFlashKind::DFlash2) {
+                    scratch(layout,
+                            std::max(ops::linear_workspace_capacity_bytes(
+                                         QType::W8G32_F16S, DFlashConfig::hidden,
+                                         DFlashConfig::feature_rows, ops::LinearPolicy::A16Only,
+                                         tokens, tokens),
+                                     ops::linear_workspace_capacity_bytes(
+                                         QType::Q4G64_F16S, DFlashConfig::hidden,
+                                         DFlashConfig::feature_rows, ops::LinearPolicy::A16Only,
+                                         tokens, tokens)));
+                }
                 {
                     auto layer = layout.scope();
                     (void)workspace_recipe::dflash_context_layer<DFlashConfig>(layout, tokens);
+                    if constexpr (DFlashConfig::kind == qwen3_6::DFlashKind::DFlash2) {
+                        scratch(layout,
+                                std::max(ops::linear_workspace_capacity_bytes(
+                                             QType::W8G32_F16S,
+                                             DFlashConfig::query_size + 2 * DFlashConfig::kv_size,
+                                             DFlashConfig::hidden, ops::LinearPolicy::A16Only,
+                                             tokens, tokens),
+                                         ops::linear_workspace_capacity_bytes(
+                                             QType::Q4G64_F16S,
+                                             DFlashConfig::query_size + 2 * DFlashConfig::kv_size,
+                                             DFlashConfig::hidden, ops::LinearPolicy::A16Only,
+                                             tokens, tokens)));
+                    }
                 }
                 return finish(layout);
             };
@@ -472,27 +501,67 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 WorkspaceLayoutBuilder layout;
                 const std::int32_t tokens = width * batch;
                 matrix(layout, DType::BF16, DFlashConfig::hidden, tokens);
-                {
-                    auto attention = layout.scope();
-                    (void)workspace_recipe::dflash_attention<DFlashConfig>(layout, tokens);
-                    scratch(layout,
-                            std::max(ops::swa_workspace_capacity_bytes({0, plan.capacity}, width,
-                                                                       width, batch),
-                                     ops::bidirectional_gqa_attention_workspace_capacity_bytes(
-                                         {0, plan.capacity}, width, width, batch)));
-                    scratch(layout, ops::linear_add_workspace_capacity_bytes(
-                                        QType::W8G32_F16S, DFlashConfig::hidden,
-                                        DFlashConfig::query_size, tokens, tokens));
-                }
-                {
-                    auto mlp = layout.scope();
-                    (void)workspace_recipe::dflash_mlp<DFlashConfig>(layout, tokens);
-                    scratch(layout, ops::linear_swiglu_workspace_capacity_bytes(
-                                        QType::W8G32_F16S, 2 * DFlashConfig::intermediate,
-                                        DFlashConfig::hidden, tokens, tokens));
-                    scratch(layout, ops::linear_add_workspace_capacity_bytes(
-                                        QType::W8G32_F16S, DFlashConfig::hidden,
-                                        DFlashConfig::intermediate, tokens, tokens));
+                if constexpr (DFlashConfig::kind == qwen3_6::DFlashKind::DFlash2) {
+                    const auto linear_scratch = [&](std::int32_t n, std::int32_t k) {
+                        return std::max(ops::linear_workspace_capacity_bytes(
+                                            QType::W8G32_F16S, n, k, ops::LinearPolicy::A16Only,
+                                            tokens, tokens),
+                                        ops::linear_workspace_capacity_bytes(
+                                            QType::Q4G64_F16S, n, k, ops::LinearPolicy::A16Only,
+                                            tokens, tokens));
+                    };
+                    {
+                        auto attention = layout.scope();
+                        (void)workspace_recipe::dflash_attention<DFlashConfig>(layout, tokens);
+                        scratch(layout, ops::swa_workspace_capacity_bytes(
+                                            {0, plan.capacity}, width, width, batch));
+                        scratch(layout, linear_scratch(DFlashConfig::query_size +
+                                                           2 * DFlashConfig::kv_size,
+                                                       DFlashConfig::hidden));
+                        scratch(layout,
+                                std::max(ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
+                                             QType::W8G32_F16S, width, width, batch),
+                                         ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
+                                             QType::Q4G64_F16S, width, width, batch)));
+                        scratch(layout, linear_scratch(DFlashConfig::hidden,
+                                                       DFlashConfig::query_size));
+                    }
+                    {
+                        auto mlp = layout.scope();
+                        (void)workspace_recipe::dflash_mlp<DFlashConfig>(layout, tokens);
+                        scratch(layout, linear_scratch(2 * DFlashConfig::intermediate,
+                                                       DFlashConfig::hidden));
+                        scratch(layout, linear_scratch(DFlashConfig::hidden,
+                                                       DFlashConfig::intermediate));
+                        scratch(layout,
+                                std::max(ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
+                                             QType::W8G32_F16S, width, width, batch),
+                                         ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
+                                             QType::Q4G64_F16S, width, width, batch)));
+                    }
+                } else {
+                    {
+                        auto attention = layout.scope();
+                        (void)workspace_recipe::dflash_attention<DFlashConfig>(layout, tokens);
+                        scratch(layout,
+                                std::max(ops::swa_workspace_capacity_bytes({0, plan.capacity},
+                                                                           width, width, batch),
+                                         ops::bidirectional_gqa_attention_workspace_capacity_bytes(
+                                             {0, plan.capacity}, width, width, batch)));
+                        scratch(layout, ops::linear_add_workspace_capacity_bytes(
+                                            QType::W8G32_F16S, DFlashConfig::hidden,
+                                            DFlashConfig::query_size, tokens, tokens));
+                    }
+                    {
+                        auto mlp = layout.scope();
+                        (void)workspace_recipe::dflash_mlp<DFlashConfig>(layout, tokens);
+                        scratch(layout, ops::linear_swiglu_workspace_capacity_bytes(
+                                            QType::W8G32_F16S, 2 * DFlashConfig::intermediate,
+                                            DFlashConfig::hidden, tokens, tokens));
+                        scratch(layout, ops::linear_add_workspace_capacity_bytes(
+                                            QType::W8G32_F16S, DFlashConfig::hidden,
+                                            DFlashConfig::intermediate, tokens, tokens));
+                    }
                 }
                 matrix(layout, DType::BF16, DFlashConfig::hidden, drafts * batch);
                 matrix(layout, DType::BF16, DFlashConfig::hidden, drafts * batch);
@@ -500,6 +569,27 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     matrix(layout, DType::BF16, Variant::draft_head_rows, drafts * batch);
                 } else {
                     matrix(layout, DType::BF16, TextConfig::output_rows, drafts * batch);
+                }
+                if constexpr (DFlashConfig::kind == qwen3_6::DFlashKind::DFlash2) {
+                    const std::int32_t logit_rows = plan.proposal_head == ProposalHead::Optimized
+                                                        ? Variant::draft_head_rows
+                                                        : TextConfig::output_rows;
+                    if (plan.proposal_head == ProposalHead::Optimized) {
+                        scratch(layout, ops::linear_workspace_capacity_bytes(
+                                            QType::Q4G64_F16S, logit_rows, DFlashConfig::hidden,
+                                            ops::LinearPolicy::A16Only, drafts * batch,
+                                            drafts * batch));
+                    } else {
+                        scratch(layout, ops::linear_workspace_capacity_bytes(
+                                            QType::W8G32_F16S, logit_rows, DFlashConfig::hidden,
+                                            ops::LinearPolicy::A16Only, drafts * batch,
+                                            drafts * batch));
+                    }
+                    scratch(layout,
+                            std::max(ops::dflash2_path_select_workspace_capacity_bytes(
+                                         QType::W8G32_F16S, drafts, drafts, batch),
+                                     ops::dflash2_path_select_workspace_capacity_bytes(
+                                         QType::Q4G64_F16S, drafts, drafts, batch)));
                 }
                 return finish(layout);
             };
@@ -589,7 +679,9 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         }
         if (options.speculative.draft_tokens == 0 ||
             options.speculative.draft_tokens > kMaximumDFlashDraftTokens) {
-            throw std::invalid_argument("DFlash draft window must be in [1,15]");
+            throw std::invalid_argument(
+                "DFlash draft window must be in [1," +
+                std::to_string(kMaximumDFlashDraftTokens) + "]");
         }
         if (options.enable_vision) {
             throw std::invalid_argument("DFlash and Vision cannot be enabled together");

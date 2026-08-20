@@ -212,7 +212,8 @@ disabled by default, so MTP/DFlash state and the optimized proposal head are not
 Vision is also disabled by default, so its weights, Vision scratch phase, and frozen
 request-transient allocation are omitted. Add `--vision` to the CLI or server process that must
 accept image or video input. Disabled capabilities cannot be enabled by a later request. DFlash is
-available only for the 35B-A3B target and is text-only.
+text-only: 35B-A3B DFlash v1, and Qwen3.8-27B NVFP4 DFlash2 when the artifact includes `dflash/`
+objects.
 
 ## Run the CLI
 
@@ -286,8 +287,9 @@ All three registered model IDs support:
   usage accounting;
 - prompt-rendered function tools and parsed tool calls.
 
-The 35B-A3B target additionally supports text-only DFlash speculative decoding with draft windows
-from one to fifteen.
+The 35B-A3B target additionally supports text-only DFlash v1 speculative decoding with draft
+windows from one to fifteen. Qwen3.8-27B NVFP4 additionally supports text-only DFlash2 with draft
+windows from one to seven when the artifact contains the companion objects.
 
 ## Current limits
 

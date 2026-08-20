@@ -109,7 +109,11 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
             capacity, static_cast<std::uint64_t>(reserved_context_tokens) + draft_window - 1ULL));
         base->backend_kv_page_entitlement = pages_for_tokens(mtp_tokens);
     } else if (speculative_backend == SpeculativeBackend::DFlash) {
-        base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
+        if constexpr (DFlashConfig::full_layers > 0) {
+            base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
+        } else {
+            base->backend_kv_page_entitlement = 0;
+        }
     }
     base->summary.admission = runtime::AdmissionResources{
         .active_lanes     = 1,
@@ -203,12 +207,17 @@ void ProgramImplCore::apply_reuse_decision(RequestPlanImpl& plan, const Resident
     }
 
     if (is_rewrite_checkpoint_restore(plan.reuse) &&
-        speculative_backend == SpeculativeBackend::DFlash &&
-        (!dflash ||
-         !qwen3_6::detail::dflash_rewrite_checkpoint_ready(
-             view.backend_image_present, view.dflash_context_frontier, plan.reuse_base))) {
-        plan.reuse      = ReusePath::FullReset;
-        plan.reuse_base = 0;
+        speculative_backend == SpeculativeBackend::DFlash) {
+        bool ready = dflash && view.dflash_context_frontier >= plan.reuse_base;
+        if constexpr (DFlashConfig::full_layers > 0) {
+            ready = ready && qwen3_6::detail::dflash_rewrite_checkpoint_ready(
+                                 view.backend_image_present, view.dflash_context_frontier,
+                                 plan.reuse_base);
+        }
+        if (!ready) {
+            plan.reuse      = ReusePath::FullReset;
+            plan.reuse_base = 0;
+        }
     }
 }
 

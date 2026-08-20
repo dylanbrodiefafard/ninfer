@@ -37,8 +37,8 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
 
 void validate_context(const CyclicKVCacheLayerView& context, const char* op) {
     if (context.num_kv_heads != kKVHeads || context.head_dim != kHeadDim ||
-        context.capacity != kWindow || context.padded_capacity < context.capacity ||
-        context.lane_capacity <= 0) {
+        (context.capacity != 2048 && context.capacity != static_cast<std::uint32_t>(kWindow)) ||
+        context.padded_capacity < context.capacity || context.lane_capacity <= 0) {
         throw std::invalid_argument(std::string(op) + ": invalid cyclic context");
     }
     if (context.padded_capacity >
@@ -82,7 +82,7 @@ std::size_t swa_workspace_capacity_bytes(SwaContextExecutionEnvelope envelope,
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("swa workspace: invalid envelope or token interval");
     }
-    const auto plan = detail::swa_resolve_plan(max_tokens, envelope);
+    const auto plan = detail::swa_resolve_plan(max_tokens, envelope, kWindow);
     WorkspaceLayoutBuilder layout;
     (void)allocate_workspace(layout, max_tokens, plan.split_capacity, batch_size);
     return layout.peak_bytes(1);
@@ -132,7 +132,8 @@ void swa(const Tensor& q, const Tensor& query_k, const Tensor& query_v, const Te
     }
 
     auto scope               = workspace.scope();
-    const auto plan          = detail::swa_resolve_plan(tokens, envelope);
+    const auto window        = static_cast<std::int32_t>(context.capacity);
+    const auto plan          = detail::swa_resolve_plan(tokens, envelope, window);
     PartialWorkspace partial = allocate_workspace(workspace, tokens, plan.split_capacity, batch);
     detail::swa_launch(q, query_k, query_v, positions, valid_columns, lanes, scale, context, plan,
                        partial.acc, partial.m, partial.l, out, stream);

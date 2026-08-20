@@ -78,6 +78,35 @@ struct DFlashWeights {
     Tensor final_norm;
 };
 
+struct DFlash2ConvWeights {
+    Tensor base_kernel;
+    Weight kernel_projection;
+};
+
+struct DFlash2LayerWeights {
+    Tensor input_norm;
+    Weight query_key_value;
+    Tensor query_norm;
+    Tensor key_norm;
+    Weight attention_output;
+    DFlash2ConvWeights attention_conv;
+    Tensor post_attention_norm;
+    Weight gate_up;
+    Weight down;
+    DFlash2ConvWeights mlp_conv;
+};
+
+template <std::size_t Layers>
+struct DFlash2Weights {
+    Weight feature_projection;
+    Tensor context_norm;
+    std::array<DFlash2LayerWeights, Layers> layers;
+    Tensor final_norm;
+    Weight hidden_projection;
+    Tensor predecessor_codebook;
+    Tensor successor_codebook;
+};
+
 template <class FullProjectionPayload, class GdnProjectionPayload, class MainPostMixerPayload,
           class MtpAttentionPayload, class MtpPostMixerPayload, class DFlashPayload,
           std::size_t FullAttentionLayers, std::size_t GdnLayers>

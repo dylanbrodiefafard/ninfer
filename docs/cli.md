@@ -35,8 +35,8 @@ template's default. An artifact whose template does not expose effort rejects th
 GPU residency is frozen when the Engine starts:
 
 - no `--spec` omits MTP/DFlash weights and state and the optimized proposal head;
-- `--spec mtp` loads only MTP, while `--spec dflash` loads only the 35B-A3B text-only DFlash
-  backend;
+- `--spec mtp` loads only MTP, while `--spec dflash` loads only the text-only DFlash backend
+  (35B-A3B DFlash v1, or Qwen3.8-27B DFlash2 when `dflash/` is present);
 - a speculative backend with the full proposal head omits the optimized proposal head;
 - Vision is disabled by default, omitting its weights, Vision scratch phase, and frozen
   request-transient allocation;
@@ -104,9 +104,9 @@ long-decode, and long-context inputs.
 
 ## Speculative decoding
 
-Speculative decoding is disabled by default. Select MTP with one to five draft positions, or the
-35B-A3B text-only DFlash backend with one to fifteen. `--lm-head-draft` selects the optimized
-proposal head and requires a selected backend:
+Speculative decoding is disabled by default. Select MTP with one to five draft positions, 35B-A3B
+text-only DFlash v1 with one to fifteen, or Qwen3.8-27B NVFP4 text-only DFlash2 with one to seven.
+`--lm-head-draft` selects the optimized proposal head and requires a selected backend:
 
 ```bash
 ./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
@@ -117,7 +117,7 @@ proposal head and requires a selected backend:
   --lm-head-draft
 ```
 
-For DFlash:
+For 35B-A3B DFlash v1:
 
 ```bash
 ./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
@@ -126,10 +126,22 @@ For DFlash:
   --spec dflash --draft-tokens 7 --lm-head-draft
 ```
 
-MTP and DFlash cannot be enabled together. The published [performance results](performance.md)
-use MTP with three draft tokens and DFlash with seven draft tokens (block length eight), both with
-the optimized proposal head. DFlash accepts up to fifteen draft tokens; seven is the current
-measured recommendation rather than a semantic limit.
+For Qwen3.8-27B DFlash2, the NVFP4 artifact must contain the appended `dflash/` objects:
+
+```bash
+./build/apps/ninfer out/qwen3_8_27b_nvfp4_dflash_w8.ninfer \
+  --prompt "Write a short explanation of speculative decoding." \
+  --max-context 16384 --max-new 512 \
+  --spec dflash --draft-tokens 7 --lm-head-draft
+```
+
+MTP and DFlash cannot be enabled together. `--spec dflash` on a 27B file without `dflash/` fails
+at bind. Current 3.8 MTP-only files and all 3.6-27B files stay valid MTP artifacts. The published
+[performance results](performance.md) use MTP with three draft tokens and DFlash with seven draft
+tokens (block length eight), both with the optimized proposal head. 35B DFlash v1 accepts up to
+fifteen draft tokens; 3.8 DFlash2 accepts up to seven. Seven is the product window for both
+companions. Current C=1 measurements for Qwen3.8-27B NVFP4 DFlash2 are in
+[performance.md](performance.md).
 
 ## Common options
 
@@ -143,7 +155,7 @@ measured recommendation rather than a semantic limit.
 | `--device N` | CUDA device index | `0` |
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
 | `--spec mtp\|dflash` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
+| `--draft-tokens N` | MTP `1..5`; 35B DFlash `1..15`; 3.8 DFlash2 `1..7` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |

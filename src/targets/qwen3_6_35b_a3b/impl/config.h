@@ -1,5 +1,6 @@
 #pragma once
 
+#include <ninfer/targets/qwen3_6/dflash_kind.h>
 #include <ninfer/targets/qwen3_6/frontend.h>
 #include <ninfer/targets/qwen3_6/hybrid_topology.h>
 #include <ninfer/targets/qwen3_6/vision.h>
@@ -70,8 +71,10 @@ struct VisionConfig : qwen3_6::VisionBackboneConfig {
 
 struct DFlashConfig {
     static constexpr bool supported        = true;
+    static constexpr qwen3_6::DFlashKind kind = qwen3_6::DFlashKind::V1;
     static constexpr int layers            = 6;
     static constexpr int local_layers      = 5;
+    static constexpr int full_layers       = 1;
     static constexpr int feature_layers    = 8;
     static constexpr int feature_rows      = feature_layers * TextConfig::hidden;
     static constexpr int hidden            = TextConfig::hidden;

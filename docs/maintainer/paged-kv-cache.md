@@ -78,10 +78,16 @@ MTP Engine:
     Main Text KV Pool
     MTP KV Pool
 
-DFlash Engine:
+DFlash Engine (35B-A3B v1):
     Main Text KV Pool
     DFlash Full-Context KV Pool
+
+DFlash Engine (Qwen3.8-27B DFlash2):
+    Main Text KV Pool
 ```
+
+Qwen3.8-27B DFlash2 sets `full_layers=0`: that Engine has only the Main Text growing pool. Its
+five SWA-2048 windows are DFlash local cyclic state, not a Full-Context pool.
 
 MTP 与 DFlash 是 engine-wide mutually exclusive backends，因此一个 Engine 当前最多包含两个 growing
 KV pools。DFlash local cyclic KV 属于 fixed state，不在这个 pool set 中。

@@ -6,6 +6,9 @@
 #include "core/arena.h"
 #include "core/layout.h"
 
+#include "ninfer/ops/grouped_dynamic_conv.h"
+#include <ninfer/targets/qwen3_6/dflash_kind.h>
+
 #include <cstdint>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::workspace_recipe {
@@ -226,15 +229,22 @@ struct DFlashContextLayerRoots {
     Tensor key_raw;
     Tensor value;
     Tensor key;
+    Tensor fused_qkv;
 };
 
 template <class Config, class Allocator>
 DFlashContextLayerRoots dflash_context_layer(Allocator& allocator, std::int32_t tokens) {
-    return {
+    DFlashContextLayerRoots out{
         matrix(allocator, DType::BF16, Config::kv_size, tokens),
         matrix(allocator, DType::BF16, Config::kv_size, tokens),
         matrix(allocator, DType::BF16, Config::kv_size, tokens),
+        {},
     };
+    if constexpr (Config::kind == qwen3_6::DFlashKind::DFlash2) {
+        out.fused_qkv =
+            matrix(allocator, DType::BF16, Config::query_size + 2 * Config::kv_size, tokens);
+    }
+    return out;
 }
 
 struct DFlashProposalRoots {
@@ -260,11 +270,15 @@ struct DFlashAttentionRoots {
     Tensor query;
     Tensor key;
     Tensor attention;
+    Tensor fused_qkv;
+    Tensor finish_dynamic;
+    Tensor delta;
+    Tensor prepared;
 };
 
 template <class Config, class Allocator>
 DFlashAttentionRoots dflash_attention(Allocator& allocator, std::int32_t tokens) {
-    return {
+    DFlashAttentionRoots out{
         matrix(allocator, DType::BF16, Config::hidden, tokens),
         matrix(allocator, DType::BF16, Config::query_size, tokens),
         matrix(allocator, DType::BF16, Config::kv_size, tokens),
@@ -272,20 +286,46 @@ DFlashAttentionRoots dflash_attention(Allocator& allocator, std::int32_t tokens)
         matrix(allocator, DType::BF16, Config::query_size, tokens),
         matrix(allocator, DType::BF16, Config::kv_size, tokens),
         matrix(allocator, DType::BF16, Config::query_size, tokens),
+        {},
+        {},
+        {},
+        {},
     };
+    if constexpr (Config::kind == qwen3_6::DFlashKind::DFlash2) {
+        out.fused_qkv =
+            matrix(allocator, DType::BF16, Config::query_size + 2 * Config::kv_size, tokens);
+        out.finish_dynamic =
+            allocator.alloc(DType::BF16, {ops::kGroupedDynamicConvGroups, 2, tokens});
+        out.delta     = matrix(allocator, DType::BF16, Config::hidden, tokens);
+        out.prepared  = matrix(allocator, DType::BF16, Config::hidden, tokens);
+    }
+    return out;
 }
 
 struct DFlashMlpRoots {
     Tensor hidden;
     Tensor intermediate;
+    Tensor gate_up;
+    Tensor finish_dynamic;
+    Tensor delta;
 };
 
 template <class Config, class Allocator>
 DFlashMlpRoots dflash_mlp(Allocator& allocator, std::int32_t tokens) {
-    return {
+    DFlashMlpRoots out{
         matrix(allocator, DType::BF16, Config::hidden, tokens),
         matrix(allocator, DType::BF16, Config::intermediate, tokens),
+        {},
+        {},
+        {},
     };
+    if constexpr (Config::kind == qwen3_6::DFlashKind::DFlash2) {
+        out.gate_up       = matrix(allocator, DType::BF16, 2 * Config::intermediate, tokens);
+        out.finish_dynamic =
+            allocator.alloc(DType::BF16, {ops::kGroupedDynamicConvGroups, 2, tokens});
+        out.delta = matrix(allocator, DType::BF16, Config::hidden, tokens);
+    }
+    return out;
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::workspace_recipe

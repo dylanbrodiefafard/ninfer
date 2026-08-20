@@ -8,12 +8,15 @@ semantics used by the registered target. Fixed dimensions are encoded in the tar
 ## 1. Model identity
 
 The target checkpoint is called Qwen3.6-27B in this project and uses the `qwen3_5` /
-`qwen3_5_text` architecture names in Hugging Face implementations. It is a dense multimodal model
-with three runtime components:
+`qwen3_5_text` architecture names in Hugging Face implementations. Qwen3.8-27B shares this Text,
+MTP, and Vision shape. It is a dense multimodal model with three runtime components:
 
 - a 64-layer hybrid Text decoder;
 - a one-layer MTP draft model;
 - a 27-layer Vision transformer and patch merger.
+
+Qwen3.8-27B NVFP4 may additionally bind an optional DFlash2 companion when `dflash/` objects are
+present. Qwen3.6-27B files do not.
 
 The implementation is fixed to this checkpoint shape. A different layer count, hidden size, head
 layout, or Vision tower is a different model implementation rather than a runtime configuration.
@@ -108,6 +111,44 @@ Vision uses different axes. `P` is the aggregate raw-patch count and must be a p
 processor/implementation envelope is `4<=P<=131072` and `1<=V<=32768`, with the frontend's media,
 attention-pair, and prompt budgets imposing any additional request-specific restriction. These
 Vision columns are not Text token `T` and are not expanded beyond that envelope.
+
+### 2.6 DFlash2 companion (Qwen3.8-27B)
+
+Qwen3.8-27B may carry an optional DFlash2 draft companion. Qwen3.6-27B files do not. The values
+below are from Hugging Face `z-lab/Qwen3.8-27B-DFlash2` revision
+`50307d4c4cde6860d4eee73e2547cd786fe8e8a4` and pinned `z-lab/dflash` `model.py`
+`95c8aeca5e4b4c4f9c0c967c05ab89fa3ed24f4c` (`DFlash2DraftModel`). This is not the 35B DFlash v1
+companion, not `z-lab/Qwen3.6-27B-DFlash`, and not a DSpark drafter.
+
+| Field | Value |
+|---|---:|
+| draft hidden layers | 5, all sliding |
+| hidden size | 5120 |
+| dense SwiGLU intermediate size | 17408 |
+| query heads | 32 |
+| KV heads | 8 |
+| head dimension | 128 |
+| Q width | 4096 |
+| K/V width | 1024 each |
+| attention scale | `1/sqrt(128)` |
+| SWA window | 2048 |
+| SWA inequality | `abs(q−k) < 2048` (both directions; `is_causal=false`) |
+| RMSNorm epsilon | `1e-6` |
+| RoPE theta | `1e7` (`rope_type=default`) |
+| native total block length | 8 |
+| parallel mask proposals per native block | 7 |
+| mask token | 248070 (tokenizer-addressable) |
+| target feature layers, zero-based | `5, 19, 33, 47, 61` |
+| feature concat width | `5 × 5120 = 25600` |
+| conv | kernel 2, group 16, two-tap dynamic |
+| selector | rank 256, unsorted top-16 |
+| full-context DFlash KV pool | none (`full_layers=0`) |
+
+The companion is five dense Qwen3 decoder blocks at 27B width, not a copy of the target's hybrid
+GDN/full-attention topology. It contains no embedding table, output head, Vision tower, GDN state,
+or projection bias. It reuses the target input embedding and independent target `lm_head` (or the
+`[131072,5120]` Q4 shortlist on the product `--lm-head-draft` path). Internal mask id 248070 is a
+legal tokenizer id used only as the padded query token; it is not a sampled draft.
 
 ## 3. Shared decoder layer skeleton
 
@@ -289,7 +330,41 @@ MTP embedding/head pair. At proposal sites the runtime may instead use the optio
 `[131072,5120]` Q4 shortlisted head and remap its row index to a real vocabulary id. Target
 verification always uses the full `lm_head`.
 
-## 8. Speculative round semantics
+## 8. DFlash2 block-diffusion draft model
+
+DFlash2 replaces repeated autoregressive draft steps with one masked-block forward. Prefill
+captures the five target residuals after completing layers `5, 19, 33, 47, 61` (Hugging Face
+`hidden_states[layer_id+1]`), projects them with `fc` + `hidden_norm`, and writes cyclic K/V for
+all five draft layers. Decode appends only newly committed target features. Rejected query K/V is
+not context. There is no growing DFlash Full pool.
+
+One propose block:
+
+1. Query rows are the anchor embedding plus seven MASK embeddings (id **248070**) at positions
+   `E .. E+7`. `input_embedding_scale` is 1.0.
+2. For each of the five layers, from pinned `Qwen3DFlashDecoderLayer`:
+   - `h = RMSNorm(residual, input_norm)`
+   - `h, attn_k1 = attention_conv.prepare(h)`
+   - Q = `q_proj(h)` then RMSNorm per head; K/V = `cat(proj(target_hidden), proj(h))` then K
+     RMSNorm; V unnormalized
+   - RoPE covers context-concat + query; Q uses the last `q_len` of cos/sin; K uses the full
+     concat. Cached context K is stored already RoPE'd.
+   - Symmetric SWA-2048 GQA, scale `1/sqrt(128)`, cyclic capacity 2048
+   - `o_proj` then `attention_conv.finish` on the 5120-d residual stream; residual add
+   - `h = RMSNorm(residual, post_attention_norm)`
+   - `h, mlp_k1 = mlp_conv.prepare(h)`; SiLU-GLU MLP; `mlp_conv.finish`; residual add
+3. Final RMSNorm → draft-head logits on the seven mask columns (not the anchor).
+4. Path selector: unsorted top-16 of those logits, then
+   `score = unary + ⟨pred_code(prev) ⊙ W_h h_t , succ_code(cand)⟩`. T=0 is argmax of those 16
+   scores; T>0 softmax-samples them at the Engine sampling temperature. `prev` starts as the
+   anchor id. `--lm-head-draft` runs top-16 on the shortlist and gathers codebooks by token id.
+5. The 27B target verifies the path with one causal forward of length 8. Family speculative
+   rejection sampling and ReplaySSM Fold are the same transaction as MTP.
+
+`GroupedDynamicCausalConv` is grouped size-16, kernel 2, left-padded (causal along the query
+block): `prepare` before the sublayer on the pre-norm hidden, `finish` on that sublayer's output.
+
+## 9. Speculative round semantics
 
 For `k` configured draft tokens, the runtime prepares a candidate window, runs target verification,
 and accepts only the prefix licensed by the target distribution.
@@ -297,17 +372,18 @@ and accepts only the prefix licensed by the target distribution.
 In greedy mode, each draft token is accepted while it equals the target argmax at that position. In
 sampling mode, proposal and target probabilities use the same processed distributions and the
 accept/reject correction preserves the target distribution. A bad draft therefore reduces
-acceptance and throughput; it must not change the distribution of emitted target tokens.
+acceptance and throughput; it must not change the distribution of emitted target tokens. MTP and
+DFlash2 share this contract; they differ only in how drafts are produced.
 
 Target verification writes candidate KV into provisioned but unpublished extents, reads each
 lane's current GDN checkpoint, and produces Program-owned ReplaySSM records without modifying any
 persistent GDN state. After the final per-row output prefix is known, one all-layer Fold replays
 exactly that prefix into the lane's current state. The same transaction trims rejected KV,
-commits continuation hidden/MTP state, and only then advances the authoritative frontier and
-publishes output. Near context capacity, the Engine falls back to the one-token target path when a
-complete safe round does not fit.
+commits continuation hidden/MTP or DFlash cyclic state, and only then advances the authoritative
+frontier and publishes output. Near context capacity, the Engine falls back to the one-token target
+path when a complete safe round does not fit.
 
-## 9. Vision preprocessing
+## 10. Vision preprocessing
 
 The native processor accepts structured text/image/video message parts. For each media item it:
 
@@ -326,7 +402,7 @@ budgets reject oversized media work before Vision execution. The computed attent
 diagnostic rather than an admission limit. The processor does not impose a separate prompt-token
 ceiling; Engine `max_context` admits the complete rendered text-plus-media prompt.
 
-## 10. Vision tower
+## 11. Vision tower
 
 Patch rows are converted to BF16 and projected into `[1152,P]`. The runtime adds a bilinearly
 interpolated learned 48×48 position table.
@@ -357,7 +433,7 @@ visual = fc2(GELU_exact(fc1(merged) + bias)) + bias    # [5120,V]
 The result replaces the matching placeholder embedding columns before Text prefill. Vision state is
 not retained for autoregressive decode.
 
-## 11. Multimodal positions
+## 12. Multimodal positions
 
 The family prepared prompt's `positions` value is axis-major `[3,T]` in temporal, height, width
 order.
@@ -372,7 +448,7 @@ The Text RoPE kernel consumes these positions during multimodal prefill and uses
 `rope_delta` during decode. This is why Vision can disappear after prefill while Text positions
 remain consistent.
 
-## 12. Precision and oracle boundaries
+## 13. Precision and oracle boundaries
 
 - activations are BF16 at public model/operator boundaries;
 - ordinary and Q/K norm oracles evaluate their reductions in FP32/FP64 and compare the declared
@@ -401,7 +477,7 @@ suite; they are not claimed as pointwise bounds for every arbitrary or adversari
 append-and-attend and A3 cached-only attention are each checked directly against the common ideal
 oracle. Equality between those different numerical paths is not a contract or acceptance test.
 
-## 13. State inventory
+## 14. State inventory
 
 Let `C=max_concurrency`.
 
@@ -411,7 +487,9 @@ Let `C=max_concurrency`.
 | MTP KV | 1 layer × context × 4 heads × 256 | active sequence when MTP enabled |
 | GDN convolution history | 48 layers × 10240 × 3 × `2C` BF16 | Program lifetime; current and turn-checkpoint slots |
 | GDN recurrent matrices | 48 layers × 48 heads × 128 × 128 × `2C` FP32 | Program lifetime; current and turn-checkpoint slots |
-| ReplaySSM records | 48 layers × `C` rows × `draft_window+1` convolution/key/value/gate columns | Program lifetime when MTP enabled; one pending round |
+| ReplaySSM records | 48 layers × `C` rows × `draft_window+1` convolution/key/value/gate columns | Program lifetime when MTP or DFlash enabled; one pending round |
+| DFlash2 local K/V | 5 layers × 2048 positions × 8 heads × 128 × 2 planes × `C` lanes | Program lifetime when DFlash enabled |
+| DFlash2 target features | prefill `[25600,P]` plus pending `[25600,draft_window+1,C]` BF16 | Program lifetime when DFlash enabled |
 | Continuation hidden | current and turn-checkpoint `[5120,C]` BF16 stores | Program lifetime |
 | Text step buffers | token, positions, logits, verify/draft/sampling tensors | Program lifetime |
 | Program scratch | Text/MTP/Vision phase temporaries | one phase in the shared workspace arena |
@@ -419,7 +497,9 @@ Let `C=max_concurrency`.
 
 KV memory grows with configured context. The fixed GDN state pool depends only on `C` and always has
 the two current/turn-checkpoint planes; it is independent of the speculative window. Enabling MTP
-adds the separate ReplaySSM arena, whose capacity is `C*(draft_window+1)` record columns per layer.
+or DFlash adds the separate ReplaySSM arena, whose capacity is `C*(draft_window+1)` record columns
+per GDN layer. DFlash2 adds five cyclic windows of capacity 2048 and does not allocate a growing
+DFlash Full pool.
 
 The Program freezes its feature set and memory plan at startup. The Qwen3.6 family builds named
 Text-prefill, ordinary-round, MTP-prefill, MTP-round, and Vision phase capacities from the
@@ -429,22 +509,23 @@ phases and scoped child Ops reuse it. Prefill allocations use
 `max_context`.
 
 Vision encoded output is not part of that arena: its separate request-transient allocation is
-reserved at startup and only an active prefix is exposed to a request. A zero MTP draft window has
-no MTP weight view, MTP KV cache, or optimized proposal head. With Vision disabled, it has no
+reserved at startup and only an active prefix is exposed to a request. A zero MTP draft window has no MTP weight view, MTP KV cache, or optimized proposal head. A DFlash
+Engine without `dflash/` objects fails at bind. With Vision disabled, it has no
 Vision weight view, Vision scratch phase, or request-transient allocation; media is rejected by the
 matching Frontend. CUDA Graph driver allowance is budgeted separately from both arenas. The
 complete artifact inventory is still validated before these resident views are published.
 
-## 14. Implementation map
+## 15. Implementation map
 
 | Model concern | Source |
 |---|---|
 | exact dimensions/layer counts and family hybrid-layer mapping | `src/targets/qwen3_6_27b/impl/config.h`, `src/targets/qwen3_6/export/ninfer/targets/qwen3_6/hybrid_topology.h` |
-| immutable Text/MTP/Vision bindings | `src/targets/qwen3_6_27b/impl/load/` |
+| immutable Text/MTP/Vision/DFlash2 bindings | `src/targets/qwen3_6_27b/impl/load/` |
 | split attention projection, staged GDN projection/control, dense post-mixer leaves, leaf workspace, and graph frontier ranges | `src/targets/qwen3_6_27b/impl/variant.h`, `impl/variant.cpp` |
 | Text/MTP/Vision execution, planning, Program lifecycle, workspace composition, prefix/state transactions, and graph mechanics | `src/targets/qwen3_6/impl/runtime/` |
 | tokenizer, template, multimodal processing, output decoder | `src/targets/qwen3_6/impl/frontend/` |
-| mathematical and explicit local-state Op contracts/implementations | `include/ninfer/ops/`, `src/ops/` |
+| DFlash2 SWA-2048, grouped dynamic conv, and path selector | `include/ninfer/ops/swa.h`, `include/ninfer/ops/grouped_dynamic_conv.h`, `include/ninfer/ops/dflash2_path_select.h` |
+| Qwen3.8 NVFP4 DFlash2 conversion | [`qwen3.8-27b-artifact.md`](qwen3.8-27b-artifact.md), `tools/convert/qwen3_8_27b/convert_nvfp4.py` |
 | growing GQA paged cache pools, allocations, and per-layer views | `src/core/paged_kv_cache.*` |
 | GDN layout/views/reset/copy and Text/MTP/GDN composition | `src/targets/qwen3_6/export/ninfer/targets/qwen3_6/decoder_state.h`, `src/targets/qwen3_6/impl/state/decoder_state.cpp` |
 | fixed all-layer GDN state pool, ReplaySSM record arena, and Fold contract | `src/core/linear_attention_state.*`, `src/core/gdn_replay_records.*`, `include/ninfer/ops/gdn_replay.h`, `src/ops/linear_attention/gated_delta_net/replay.cpp` |

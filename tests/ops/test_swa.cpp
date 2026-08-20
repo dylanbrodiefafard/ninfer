@@ -45,11 +45,11 @@ std::size_t query_kv_index(int d, int kv_head, int token) {
                 static_cast<std::size_t>(kKVHeads) * static_cast<std::size_t>(token));
 }
 
-std::size_t context_index(int d, int kv_head, int slot) {
+std::size_t context_index(int d, int kv_head, int slot, int window = kWindow) {
     return static_cast<std::size_t>(d) +
            static_cast<std::size_t>(kD) *
                (static_cast<std::size_t>(slot) +
-                static_cast<std::size_t>(kWindow) * static_cast<std::size_t>(kv_head));
+                static_cast<std::size_t>(window) * static_cast<std::size_t>(kv_head));
 }
 
 std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
@@ -61,14 +61,14 @@ std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
 void swa_oracle(const std::vector<float>& q, const std::vector<float>& query_k,
                 const std::vector<float>& query_v, const std::vector<float>& context_k,
                 const std::vector<float>& context_v, const std::vector<int>& positions,
-                int context_length, std::vector<double>& out) {
+                int context_length, std::vector<double>& out, int window = kWindow) {
     const int tokens = static_cast<int>(positions.size());
     out.assign(static_cast<std::size_t>(kD) * kQHeads * tokens, 0.0);
-    std::vector<double> scores(static_cast<std::size_t>(kWindow - 1 + tokens));
+    std::vector<double> scores(static_cast<std::size_t>(window - 1 + tokens));
 
     for (int token = 0; token < tokens; ++token) {
         const int query_position = positions[static_cast<std::size_t>(token)];
-        const int context_begin  = std::max(0, query_position - (kWindow - 1));
+        const int context_begin  = std::max(0, query_position - (window - 1));
         const int context_keys   = context_length - context_begin;
         const int key_count      = context_keys + tokens;
 
@@ -81,7 +81,7 @@ void swa_oracle(const std::vector<float>& q, const std::vector<float>& query_k,
                     const double k_value =
                         key < context_keys
                             ? static_cast<double>(context_k[context_index(
-                                  d, kv_head, (context_begin + key) & (kWindow - 1))])
+                                  d, kv_head, (context_begin + key) & (window - 1), window)])
                             : static_cast<double>(
                                   query_k[query_kv_index(d, kv_head, key - context_keys)]);
                     dot += static_cast<double>(q[q_index(d, q_head, token)]) * k_value;
@@ -103,7 +103,7 @@ void swa_oracle(const std::vector<float>& q, const std::vector<float>& query_k,
                     const double v_value =
                         key < context_keys
                             ? static_cast<double>(context_v[context_index(
-                                  d, kv_head, (context_begin + key) & (kWindow - 1))])
+                                  d, kv_head, (context_begin + key) & (window - 1), window)])
                             : static_cast<double>(
                                   query_v[query_kv_index(d, kv_head, key - context_keys)]);
                     numerator += scores[static_cast<std::size_t>(key)] * v_value;
@@ -114,12 +114,13 @@ void swa_oracle(const std::vector<float>& q, const std::vector<float>& query_k,
     }
 }
 
-CyclicKVCacheLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v, int lane_capacity = 1) {
+CyclicKVCacheLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v, int lane_capacity = 1,
+                                         int window = kWindow) {
     return {
-        .k               = Tensor(k.p, DType::BF16, {kD, kWindow, kKVHeads, lane_capacity}),
-        .v               = Tensor(v.p, DType::BF16, {kD, kWindow, kKVHeads, lane_capacity}),
-        .capacity        = kWindow,
-        .padded_capacity = kWindow,
+        .k               = Tensor(k.p, DType::BF16, {kD, window, kKVHeads, lane_capacity}),
+        .v               = Tensor(v.p, DType::BF16, {kD, window, kKVHeads, lane_capacity}),
+        .capacity        = static_cast<std::uint32_t>(window),
+        .padded_capacity = static_cast<std::uint32_t>(window),
         .num_kv_heads    = kKVHeads,
         .head_dim        = kD,
         .lane_capacity   = lane_capacity,
@@ -132,11 +133,11 @@ enum class InputProfile {
 };
 
 int run_case(int tokens, int context_length, InputProfile profile = InputProfile::Random,
-             int envelope_max = -1) {
+             int envelope_max = -1, int window = kWindow) {
     if (envelope_max < 0) envelope_max = context_length;
     const std::size_t q_count        = static_cast<std::size_t>(kD) * kQHeads * tokens;
     const std::size_t query_kv_count = static_cast<std::size_t>(kD) * kKVHeads * tokens;
-    const std::size_t context_count  = static_cast<std::size_t>(kD) * kWindow * kKVHeads;
+    const std::size_t context_count  = static_cast<std::size_t>(kD) * window * kKVHeads;
 
     std::vector<float> q(q_count);
     std::vector<float> query_k(query_kv_count);
@@ -158,8 +159,8 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
         std::fill(context_v.begin(), context_v.end(), 0.0f);
         for (int kv_head = 0; kv_head < kKVHeads; ++kv_head) {
             for (int d = 0; d < kD; ++d) {
-                context_v[context_index(d, kv_head, 0)]         = 512.0f;
-                context_v[context_index(d, kv_head, 1)]         = 256.0f;
+                context_v[context_index(d, kv_head, 0, window)] = 512.0f;
+                context_v[context_index(d, kv_head, 1, window)] = 256.0f;
                 query_v[query_kv_index(d, kv_head, tokens - 1)] = 1.0f;
             }
         }
@@ -176,7 +177,8 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
         positions[static_cast<std::size_t>(token)] = context_length + token;
     }
     std::vector<double> reference;
-    swa_oracle(q, query_k, query_v, context_k, context_v, positions, context_length, reference);
+    swa_oracle(q, query_k, query_v, context_k, context_v, positions, context_length, reference,
+               window);
 
     const auto q_expected         = bf16_bits(q);
     const auto query_k_expected   = bf16_bits(query_k);
@@ -202,7 +204,7 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     Tensor valid_tensor(d_valid.p, DType::I32, {1});
     Tensor lane_tensor(d_lane.p, DType::I32, {1});
     Tensor out_tensor(d_out.data(), DType::BF16, {kD, kQHeads, tokens, 1});
-    CyclicKVCacheLayerView context = make_context_view(d_context_k, d_context_v);
+    CyclicKVCacheLayerView context = make_context_view(d_context_k, d_context_v, 1, window);
     const ops::SwaContextExecutionEnvelope envelope{0, static_cast<std::uint32_t>(envelope_max)};
     const std::size_t workspace_bytes =
         ops::swa_workspace_capacity_bytes(envelope, tokens, tokens, 1);
@@ -213,6 +215,7 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     cuda_synchronize();
 
     std::string label = "swa T=" + std::to_string(tokens) + " L=" + std::to_string(context_length);
+    if (window != kWindow) label += " W=" + std::to_string(window);
     if (envelope_max != context_length) {
         label += " envelope=[0," + std::to_string(envelope_max) + "]";
     }
@@ -349,6 +352,8 @@ int main() {
     failures += run_case(16, 4096);
     failures += run_case(2, 4096, InputProfile::WindowBoundary);
     failures += run_case(2, 8194);
+    failures += run_case(16, 2048, InputProfile::Random, -1, 2048);
+    failures += run_case(2, 2048, InputProfile::WindowBoundary, -1, 2048);
     failures += run_batch_case();
 
     if (failures != 0) {
