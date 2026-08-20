@@ -2,6 +2,7 @@
 #include <ninfer/targets/qwen3_6/frontend_resources.h>
 
 #include "targets/qwen3_6/impl/frontend/chat_template.h"
+#include "targets/qwen3_6/impl/frontend/processor.h"
 #include "targets/qwen3_6/impl/frontend/test_access.h"
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
 
@@ -9,12 +10,16 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -70,12 +75,25 @@ const fi::CompiledChatTemplate& reasoning_effort_template() {
 }
 
 const fi::Tokenizer& official_tokenizer() {
-    static const std::string tokenizer_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
+    static const std::string tokenizer_dir = [] {
+        const char* env = std::getenv("NINFER_OFFICIAL_TOKENIZER_DIR");
+        const char* candidates[] = {
+            env,
+            "/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16",
+            "/ssdpool2nvme/local_llm/ninfer-dylan2/profiles/bench/official-tokenizer",
+        };
+        for (const char* dir : candidates) {
+            if (dir == nullptr || dir[0] == '\0') { continue; }
+            std::ifstream stream(std::string(dir) + "/tokenizer.json", std::ios::binary);
+            if (stream) { return std::string(dir); }
+        }
+        throw std::runtime_error("official tokenizer.json was not found");
+    }();
+    static const std::string tokenizer_json = read_file((tokenizer_dir + "/tokenizer.json").c_str());
     static const std::string tokenizer_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
+        read_file((tokenizer_dir + "/tokenizer_config.json").c_str());
     static const std::string generation_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+        read_file((tokenizer_dir + "/generation_config.json").c_str());
     static const fi::Tokenizer tokenizer({.tokenizer_json         = tokenizer_json,
                                           .tokenizer_config_json  = tokenizer_config_json,
                                           .generation_config_json = generation_config_json});
@@ -1225,7 +1243,149 @@ int test_disabled_vision() {
 
 } // namespace
 
+int run_encode_bench() {
+    const fi::Tokenizer& tokenizer = official_tokenizer();
+    const std::string paragraph =
+        "Write a concise systems explanation of paged KV cache reuse, speculative decoding, "
+        "and why host-side tokenization can hide under GPU prefill at 32k tokens. Include "
+        "ASCII punctuation, numbers 0123456789, and a few Chinese characters: 缓存复用。\n";
+
+    auto time_ms = [](auto fn, int repeats) {
+        (void)fn();
+        const auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < repeats; ++i) { (void)fn(); }
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        return std::chrono::duration<double, std::milli>(elapsed).count() / repeats;
+    };
+
+    auto json_object = [](std::string path, std::string content) {
+        nlohmann::json object = {{"path", std::move(path)}, {"content", std::move(content)}};
+        return object.dump();
+    };
+    auto blob = [](std::size_t bytes) {
+        std::string text;
+        text.reserve(bytes);
+        while (text.size() < bytes) {
+            text += "fn handle_request(slot: u32, tokens: &[u32]) { /* kv-page ";
+            text += std::to_string(text.size());
+            text += " */ }\n";
+        }
+        text.resize(bytes);
+        return text;
+    };
+    auto tool_schema = [](int count) {
+        std::vector<std::string> tools;
+        tools.reserve(static_cast<std::size_t>(count));
+        for (int i = 0; i < count; ++i) {
+            tools.push_back(nlohmann::json{{"type", "function"},
+                                           {"function",
+                                            {{"name", "read_file_" + std::to_string(i)},
+                                             {"description", "Read a workspace file"},
+                                             {"parameters",
+                                              {{"type", "object"},
+                                               {"properties",
+                                                {{"path", {{"type", "string"}}},
+                                                 {"content", {{"type", "string"}}}}},
+                                               {"required", nlohmann::json::array({"path"})}}}}}}
+                               .dump());
+        }
+        return tools;
+    };
+    auto plain_messages = [&](int target_tokens) {
+        const std::vector<int> unit_ids = tokenizer.encode(paragraph);
+        const int unit_n                = std::max(1, static_cast<int>(unit_ids.size()));
+        const int copies                = (target_tokens + unit_n - 1) / unit_n;
+        std::string body;
+        body.reserve(paragraph.size() * static_cast<std::size_t>(copies));
+        for (int i = 0; i < copies; ++i) { body += paragraph; }
+        return std::vector<fi::ChatMessage>{chat_message(ninfer::ChatRole::User, std::move(body))};
+    };
+    auto tool_messages = [&](int calls, std::size_t content_bytes, int history_turns) {
+        std::vector<fi::ChatMessage> messages;
+        messages.push_back(chat_message(ninfer::ChatRole::User, "Refactor the listed files."));
+        for (int turn = 0; turn < history_turns; ++turn) {
+            fi::ChatMessage assistant = chat_message(ninfer::ChatRole::Assistant, "");
+            assistant.tool_calls.reserve(static_cast<std::size_t>(calls));
+            for (int i = 0; i < calls; ++i) {
+                assistant.tool_calls.push_back(
+                    {.id             = "",
+                     .name           = "read_file_" + std::to_string(i),
+                     .arguments_json = json_object("src/mod_" + std::to_string(turn) + "_" +
+                                                       std::to_string(i) + ".rs",
+                                                   blob(content_bytes))});
+            }
+            messages.push_back(std::move(assistant));
+            for (int i = 0; i < calls; ++i) {
+                messages.push_back(chat_message(ninfer::ChatRole::Tool, blob(content_bytes / 4)));
+            }
+            messages.push_back(chat_message(ninfer::ChatRole::User, "Continue with the next batch."));
+        }
+        return messages;
+    };
+
+    struct Case {
+        const char* name;
+        std::vector<fi::ChatMessage> messages;
+        fi::ChatRenderOptions options;
+        int repeats;
+    };
+    std::vector<Case> cases;
+    fi::ChatRenderOptions with_tools;
+    with_tools.tool_jsons = tool_schema(16);
+    fi::ChatRenderOptions tools_100_opts;
+    tools_100_opts.tool_jsons = tool_schema(100);
+    cases.push_back({"plain_2k", plain_messages(2048), {}, 24});
+    cases.push_back({"plain_8k", plain_messages(8192), {}, 8});
+    cases.push_back({"plain_16k", plain_messages(16384), {}, 6});
+    cases.push_back({"plain_32k", plain_messages(32768), {}, 4});
+    cases.push_back({"large_tools", tool_messages(16, 4 * 1024, 1), with_tools, 6});
+    cases.push_back({"tools_100_parallel", tool_messages(100, 4 * 1024, 1), tools_100_opts, 4});
+    cases.push_back({"tools_100_turns", tool_messages(4, 4 * 1024, 25), tools_100_opts, 4});
+    cases.push_back({"massive_tools", tool_messages(32, 32 * 1024, 2), with_tools, 3});
+    cases.push_back({"tool_loop_history", tool_messages(4, 1024, 8), with_tools, 6});
+
+    std::cerr << std::fixed << std::setprecision(3);
+    std::cerr << "case tokens bytes render_ms encode_ms prepare_ms two_pass_ms decode_ms "
+                 "per_token_decode_ms checkpoint\n";
+    for (Case& test : cases) {
+        const double render_ms =
+            time_ms([&] { return render_chat(test.messages, test.options); }, test.repeats);
+        const fi::RenderedChat rendered = render_chat(test.messages, test.options);
+        const double encode_ms =
+            time_ms([&] { return fi::encode_rendered_chat(tokenizer, rendered); }, test.repeats);
+        if (!rendered.rewrite_checkpoint) {
+            std::cerr << test.name << " missing rewrite checkpoint\n";
+            return 1;
+        }
+        const std::size_t checkpoint = rendered.rewrite_checkpoint->offset;
+        const double full_ms = time_ms([&] { return tokenizer.encode(rendered.text); }, test.repeats);
+        const double prefix_ms = time_ms(
+            [&] {
+                return tokenizer.encode(std::string_view(rendered.text).substr(0, checkpoint));
+            },
+            test.repeats);
+        const fi::EncodedChat encoded = fi::encode_rendered_chat(tokenizer, rendered);
+        const double decode_ms =
+            time_ms([&] { return tokenizer.decode(encoded.input_ids); }, test.repeats);
+        const double per_token_ms = time_ms(
+            [&] {
+                std::string out;
+                out.reserve(rendered.text.size());
+                for (const int id : encoded.input_ids) { out += tokenizer.decode_token_bytes(id); }
+                return out;
+            },
+            test.repeats);
+        std::cerr << test.name << ' ' << encoded.input_ids.size() << ' ' << rendered.text.size()
+                  << ' ' << render_ms << ' ' << encode_ms << ' ' << (render_ms + encode_ms) << ' '
+                  << (full_ms + prefix_ms) << ' ' << decode_ms << ' ' << per_token_ms << ' '
+                  << (encoded.rewrite_checkpoint ? encoded.rewrite_checkpoint->frontier : 0)
+                  << '\n';
+    }
+    return 0;
+}
+
 int main() {
+    if (std::getenv("NINFER_BENCH_ENCODE") != nullptr) { return run_encode_bench(); }
     const FrontendResources owned = resources();
     const Frontend frontend       = FrontendFactory::create_component(owned);
     int failures                  = 0;

@@ -525,12 +525,12 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     if (rendered.rewrite_checkpoint->offset > rendered.text.size()) {
         throw std::logic_error("rewrite checkpoint byte offset exceeds rendered chat");
     }
-    Tokenizer::EncodeResult encoded_text =
-        tokenizer.encode_with_checkpoint(rendered.text, rendered.rewrite_checkpoint->offset);
-    encoded.input_ids = std::move(encoded_text.ids);
+    EncodedText tokens = tokenizer.encode(rendered.text, rendered.rewrite_checkpoint->offset);
+    encoded.input_ids  = std::move(tokens.ids);
     std::uint32_t frontier = 0;
-    if (encoded_text.checkpoint_frontier) {
-        frontier = *encoded_text.checkpoint_frontier;
+    if (tokens.prefix_tokens && *tokens.prefix_tokens != 0 &&
+        *tokens.prefix_tokens <= encoded.input_ids.size()) {
+        frontier = *tokens.prefix_tokens;
     } else {
         const std::vector<int> prefix = tokenizer.encode(
             std::string_view(rendered.text).substr(0, rendered.rewrite_checkpoint->offset));
@@ -542,9 +542,6 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
             throw std::overflow_error("rewrite checkpoint token frontier exceeds uint32");
         }
         frontier = static_cast<std::uint32_t>(prefix.size());
-    }
-    if (frontier == 0 || frontier > encoded.input_ids.size()) {
-        throw std::logic_error("rewrite checkpoint is not an exact token prefix");
     }
     encoded.rewrite_checkpoint = RewriteCheckpointSpec{
         .kind     = rendered.rewrite_checkpoint->kind,

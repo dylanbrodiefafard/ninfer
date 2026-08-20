@@ -466,6 +466,15 @@ void feed_channel(DecoderState& state, OutputChannel channel, std::string_view t
                   const StopPolicy& policy, PublishedOutput& emitted,
                   std::uint32_t committed_tokens, StopMatch* best_match) {
     if (text.empty()) { return; }
+    std::size_t string_stops = 0;
+    for (const StopString& stop : policy.strings) {
+        if (stop.channel == channel) { ++string_stops; }
+    }
+    if (string_stops == 0) {
+        append_delta(emitted, channel, std::string(text));
+        state.decoded_bytes += text.size();
+        return;
+    }
     std::string combined          = state.stop_pending[channel_index(channel)];
     const std::size_t old_pending = combined.size();
     combined.append(text);
@@ -549,15 +558,16 @@ void feed_decoded_text(DecoderState& state, std::string_view text, const StopPol
     state.think_marker_pending.erase(0, safe);
 }
 
-void feed_token_bytes(DecoderState& state, std::string bytes, const StopPolicy& policy,
+void feed_token_bytes(DecoderState& state, std::string_view bytes, const StopPolicy& policy,
                       PublishedOutput& emitted, std::uint32_t committed_tokens,
                       StopMatch* best_match) {
-    state.utf8_pending += bytes;
+    state.utf8_pending.append(bytes);
     const std::size_t valid = valid_utf8_prefix_size(state.utf8_pending);
     if (valid == 0) { return; }
-    const std::string text = state.utf8_pending.substr(0, valid);
-    state.utf8_pending.erase(0, valid);
+    const std::string_view text =
+        std::string_view(state.utf8_pending).substr(0, valid);
     feed_decoded_text(state, text, policy, emitted, committed_tokens, best_match);
+    state.utf8_pending.erase(0, valid);
 }
 
 void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput& emitted,
@@ -740,7 +750,7 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
         }
 
         StopMatch match;
-        const std::string bytes =
+        const std::string_view bytes =
             impl_->tokenizer->decode_token_bytes(token, !impl_->preserve_special);
         feed_token_bytes(impl_->preview_state, bytes, impl_->policy, impl_->preview_output, count,
                          &match);
