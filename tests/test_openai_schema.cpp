@@ -11,6 +11,8 @@
 
 #include <array>
 #include <cstddef>
+#include <chrono>
+#include <cstdlib>
 #include <functional>
 #include <iostream>
 #include <string>
@@ -942,7 +944,60 @@ int test_system_prepend_merge() {
 
 } // namespace
 
+int run_sse_bench() {
+    using ninfer::serve::make_chat_chunk_content;
+    const std::string id    = "chatcmpl-bench";
+    const std::string model = "qwen3.8-27b";
+    const std::string delta = " the";
+    auto nlohmann_chunk     = [&] {
+        nlohmann::json payload = {{"id", id},
+                                  {"object", "chat.completion.chunk"},
+                                  {"created", 1},
+                                  {"model", model},
+                                  {"choices", nlohmann::json::array(
+                                                 {nlohmann::json{{"index", 0},
+                                                                 {"delta", nlohmann::json{{"content", delta}}},
+                                                                 {"finish_reason", nullptr}}})}};
+        return std::string("data: ") + payload.dump() + "\n\n";
+    };
+    auto time_ns = [](auto fn, int repeats) {
+        (void)fn();
+        const auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < repeats; ++i) { (void)fn(); }
+        return std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start)
+                   .count() /
+               repeats;
+    };
+    constexpr int repeats = 50000;
+    const double old_ns   = time_ns(nlohmann_chunk, repeats);
+    const double new_ns =
+        time_ns([&] { return make_chat_chunk_content(id, model, 1, delta, false); }, repeats);
+    std::cerr << "sse_bench delta=\"" << delta << "\" nlohmann_ns=" << old_ns
+              << " handwritten_ns=" << new_ns << " speedup=" << (old_ns / new_ns) << '\n';
+    const std::string long_delta(256, 'x');
+    const double old_long = time_ns(
+        [&] {
+            nlohmann::json payload = {
+                {"id", id},
+                {"object", "chat.completion.chunk"},
+                {"created", 1},
+                {"model", model},
+                {"choices", nlohmann::json::array({nlohmann::json{
+                    {"index", 0},
+                    {"delta", nlohmann::json{{"content", long_delta}}},
+                    {"finish_reason", nullptr}}})}};
+            return std::string("data: ") + payload.dump() + "\n\n";
+        },
+        repeats);
+    const double new_long =
+        time_ns([&] { return make_chat_chunk_content(id, model, 1, long_delta, false); }, repeats);
+    std::cerr << "sse_bench delta_bytes=256 nlohmann_ns=" << old_long
+              << " handwritten_ns=" << new_long << " speedup=" << (old_long / new_long) << '\n';
+    return 0;
+}
+
 int main() {
+    if (std::getenv("NINFER_BENCH_SSE") != nullptr) { return run_sse_bench(); }
     int failures = 0;
     failures += test_parse_string_content();
     failures += test_preserve_thinking_options();

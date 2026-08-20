@@ -10,6 +10,7 @@
 #include <limits>
 #include <random>
 #include <string>
+#include <string_view>
 
 namespace ninfer::serve {
 namespace {
@@ -479,6 +480,64 @@ Json tool_calls_json(const std::vector<ToolCall>& tool_calls, bool include_index
 
 std::string sse_event(const Json& payload) { return "data: " + payload.dump() + "\n\n"; }
 
+void append_json_string(std::string& out, std::string_view text) {
+    for (const unsigned char c : text) {
+        switch (c) {
+        case '"':
+            out += "\\\"";
+            break;
+        case '\\':
+            out += "\\\\";
+            break;
+        case '\b':
+            out += "\\b";
+            break;
+        case '\f':
+            out += "\\f";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\t':
+            out += "\\t";
+            break;
+        default:
+            if (c < 0x20U) {
+                char buf[8];
+                std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                out += buf;
+            } else {
+                out.push_back(static_cast<char>(c));
+            }
+            break;
+        }
+    }
+}
+
+std::string make_delta_chunk(const std::string& id, const std::string& model, std::int64_t created,
+                             std::string_view delta_key, const std::string& delta_text,
+                             bool include_usage) {
+    std::string out;
+    out.reserve(128 + id.size() + model.size() + delta_text.size() * 2);
+    out += "data: {\"id\":\"";
+    append_json_string(out, id);
+    out += "\",\"object\":\"chat.completion.chunk\",\"created\":";
+    out += std::to_string(created);
+    out += ",\"model\":\"";
+    append_json_string(out, model);
+    out += "\",\"choices\":[{\"index\":0,\"delta\":{\"";
+    out += delta_key;
+    out += "\":\"";
+    append_json_string(out, delta_text);
+    out += "\"},\"finish_reason\":null}]";
+    if (include_usage) { out += ",\"usage\":null"; }
+    out += "}\n\n";
+    return out;
+}
+
 double json_decimal3(double value) { return std::round(value * 1000.0) / 1000.0; }
 
 const char* prefix_reuse_source_name(ninfer::PrefixReuseSource source) {
@@ -758,22 +817,13 @@ std::string make_chat_chunk_role(const std::string& id, const std::string& model
 std::string make_chat_chunk_reasoning(const std::string& id, const std::string& model,
                                       std::int64_t created, const std::string& delta_text,
                                       bool include_usage) {
-    Json payload       = base_chunk(id, model, created);
-    payload["choices"] = Json::array({Json{{"index", 0},
-                                           {"delta", Json{{"reasoning_content", delta_text}}},
-                                           {"finish_reason", nullptr}}});
-    if (include_usage) { payload["usage"] = nullptr; }
-    return sse_event(payload);
+    return make_delta_chunk(id, model, created, "reasoning_content", delta_text, include_usage);
 }
 
 std::string make_chat_chunk_content(const std::string& id, const std::string& model,
                                     std::int64_t created, const std::string& delta_text,
                                     bool include_usage) {
-    Json payload       = base_chunk(id, model, created);
-    payload["choices"] = Json::array(
-        {Json{{"index", 0}, {"delta", Json{{"content", delta_text}}}, {"finish_reason", nullptr}}});
-    if (include_usage) { payload["usage"] = nullptr; }
-    return sse_event(payload);
+    return make_delta_chunk(id, model, created, "content", delta_text, include_usage);
 }
 
 std::string make_chat_chunk_tool_calls(const std::string& id, const std::string& model,
