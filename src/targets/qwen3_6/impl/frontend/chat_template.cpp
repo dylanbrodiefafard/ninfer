@@ -6,6 +6,8 @@
 
 #include <array>
 #include <cctype>
+#include <cstdint>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -148,6 +150,265 @@ constexpr std::string_view kToolInstructions =
     "knowledge and do not tell the user about function calls\n"
     "</IMPORTANT>";
 
+struct JsonWalkError {};
+
+void skip_json_ws(std::string_view text, std::size_t& index) {
+    while (index < text.size()) {
+        const char byte = text[index];
+        if (byte != ' ' && byte != '\t' && byte != '\n' && byte != '\r') { return; }
+        ++index;
+    }
+}
+
+bool json_ident_continue(char byte) noexcept {
+    return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'z') ||
+           (byte >= 'A' && byte <= 'Z') || byte == '_';
+}
+
+std::uint32_t json_hex4(std::string_view text, std::size_t index) {
+    if (index + 4 > text.size()) { throw JsonWalkError{}; }
+    std::uint32_t value = 0;
+    for (std::size_t i = 0; i < 4; ++i) {
+        const char byte = text[index + i];
+        value <<= 4U;
+        if (byte >= '0' && byte <= '9') {
+            value |= static_cast<std::uint32_t>(byte - '0');
+        } else if (byte >= 'a' && byte <= 'f') {
+            value |= static_cast<std::uint32_t>(byte - 'a' + 10);
+        } else if (byte >= 'A' && byte <= 'F') {
+            value |= static_cast<std::uint32_t>(byte - 'A' + 10);
+        } else {
+            throw JsonWalkError{};
+        }
+    }
+    return value;
+}
+
+void append_utf8(std::string& out, std::uint32_t codepoint) {
+    if (codepoint < 0x80U) {
+        out.push_back(static_cast<char>(codepoint));
+    } else if (codepoint < 0x800U) {
+        out.push_back(static_cast<char>(0xC0U | (codepoint >> 6U)));
+        out.push_back(static_cast<char>(0x80U | (codepoint & 0x3FU)));
+    } else if (codepoint < 0x10000U) {
+        out.push_back(static_cast<char>(0xE0U | (codepoint >> 12U)));
+        out.push_back(static_cast<char>(0x80U | ((codepoint >> 6U) & 0x3FU)));
+        out.push_back(static_cast<char>(0x80U | (codepoint & 0x3FU)));
+    } else if (codepoint <= 0x10FFFFU) {
+        out.push_back(static_cast<char>(0xF0U | (codepoint >> 18U)));
+        out.push_back(static_cast<char>(0x80U | ((codepoint >> 12U) & 0x3FU)));
+        out.push_back(static_cast<char>(0x80U | ((codepoint >> 6U) & 0x3FU)));
+        out.push_back(static_cast<char>(0x80U | (codepoint & 0x3FU)));
+    } else {
+        throw JsonWalkError{};
+    }
+}
+
+void append_json_escaped(std::string& out, std::string_view text) {
+    out.push_back('"');
+    for (const unsigned char byte : text) {
+        switch (byte) {
+        case '"':
+            out += "\\\"";
+            break;
+        case '\\':
+            out += "\\\\";
+            break;
+        case '\b':
+            out += "\\b";
+            break;
+        case '\f':
+            out += "\\f";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\t':
+            out += "\\t";
+            break;
+        default:
+            if (byte < 0x20U) {
+                char buf[8];
+                std::snprintf(buf, sizeof(buf), "\\u%04x", byte);
+                out += buf;
+            } else {
+                out.push_back(static_cast<char>(byte));
+            }
+            break;
+        }
+    }
+    out.push_back('"');
+}
+
+std::string decode_json_string(std::string_view text, std::size_t& index) {
+    skip_json_ws(text, index);
+    if (index >= text.size() || text[index] != '"') { throw JsonWalkError{}; }
+    ++index;
+    std::string out;
+    while (index < text.size()) {
+        const unsigned char byte = static_cast<unsigned char>(text[index++]);
+        if (byte == '"') { return out; }
+        if (byte == '\\') {
+            if (index >= text.size()) { throw JsonWalkError{}; }
+            const char escape = text[index++];
+            switch (escape) {
+            case '"':
+            case '\\':
+            case '/':
+                out.push_back(escape);
+                break;
+            case 'b':
+                out.push_back('\b');
+                break;
+            case 'f':
+                out.push_back('\f');
+                break;
+            case 'n':
+                out.push_back('\n');
+                break;
+            case 'r':
+                out.push_back('\r');
+                break;
+            case 't':
+                out.push_back('\t');
+                break;
+            case 'u': {
+                std::uint32_t codepoint = json_hex4(text, index);
+                index += 4;
+                if (codepoint >= 0xD800U && codepoint <= 0xDBFFU) {
+                    if (index + 6 > text.size() || text[index] != '\\' || text[index + 1] != 'u') {
+                        throw JsonWalkError{};
+                    }
+                    index += 2;
+                    const std::uint32_t low = json_hex4(text, index);
+                    index += 4;
+                    if (low < 0xDC00U || low > 0xDFFFU) { throw JsonWalkError{}; }
+                    codepoint = 0x10000U + ((codepoint - 0xD800U) << 10U) + (low - 0xDC00U);
+                } else if (codepoint >= 0xDC00U && codepoint <= 0xDFFFU) {
+                    throw JsonWalkError{};
+                }
+                append_utf8(out, codepoint);
+                break;
+            }
+            default:
+                throw JsonWalkError{};
+            }
+        } else if (byte < 0x20U) {
+            throw JsonWalkError{};
+        } else {
+            out.push_back(static_cast<char>(byte));
+        }
+    }
+    throw JsonWalkError{};
+}
+
+void append_tojson_value(std::string& out, std::string_view text, std::size_t& index);
+
+void append_tojson_value(std::string& out, std::string_view text, std::size_t& index) {
+    skip_json_ws(text, index);
+    if (index >= text.size()) { throw JsonWalkError{}; }
+    const char byte = text[index];
+    if (byte == '"') {
+        const std::string decoded = decode_json_string(text, index);
+        append_json_escaped(out, decoded);
+        return;
+    }
+    if (byte == '{') {
+        ++index;
+        out.push_back('{');
+        skip_json_ws(text, index);
+        bool first = true;
+        while (index < text.size() && text[index] != '}') {
+            if (!first) {
+                if (text[index] != ',') { throw JsonWalkError{}; }
+                ++index;
+                skip_json_ws(text, index);
+                if (index < text.size() && text[index] == '}') { throw JsonWalkError{}; }
+                out += ", ";
+            }
+            first               = false;
+            const std::string key = decode_json_string(text, index);
+            append_json_escaped(out, key);
+            skip_json_ws(text, index);
+            if (index >= text.size() || text[index] != ':') { throw JsonWalkError{}; }
+            ++index;
+            out += ": ";
+            append_tojson_value(out, text, index);
+            skip_json_ws(text, index);
+        }
+        if (index >= text.size() || text[index] != '}') { throw JsonWalkError{}; }
+        ++index;
+        out.push_back('}');
+        return;
+    }
+    if (byte == '[') {
+        ++index;
+        out.push_back('[');
+        skip_json_ws(text, index);
+        bool first = true;
+        while (index < text.size() && text[index] != ']') {
+            if (!first) {
+                if (text[index] != ',') { throw JsonWalkError{}; }
+                ++index;
+                skip_json_ws(text, index);
+                if (index < text.size() && text[index] == ']') { throw JsonWalkError{}; }
+                out += ", ";
+            }
+            first = false;
+            append_tojson_value(out, text, index);
+            skip_json_ws(text, index);
+        }
+        if (index >= text.size() || text[index] != ']') { throw JsonWalkError{}; }
+        ++index;
+        out.push_back(']');
+        return;
+    }
+    if (text.compare(index, 4, "true") == 0 &&
+        (index + 4 == text.size() || !json_ident_continue(text[index + 4]))) {
+        out += "true";
+        index += 4;
+        return;
+    }
+    if (text.compare(index, 5, "false") == 0 &&
+        (index + 5 == text.size() || !json_ident_continue(text[index + 5]))) {
+        out += "false";
+        index += 5;
+        return;
+    }
+    if (text.compare(index, 4, "null") == 0 &&
+        (index + 4 == text.size() || !json_ident_continue(text[index + 4]))) {
+        out += "null";
+        index += 4;
+        return;
+    }
+    const std::size_t start = index;
+    if (text[index] == '-') { ++index; }
+    if (index >= text.size() || text[index] < '0' || text[index] > '9') { throw JsonWalkError{}; }
+    if (text[index] == '0') {
+        ++index;
+        if (index < text.size() && text[index] >= '0' && text[index] <= '9') {
+            throw JsonWalkError{};
+        }
+    } else {
+        while (index < text.size() && text[index] >= '0' && text[index] <= '9') { ++index; }
+    }
+    if (index < text.size() && text[index] == '.') {
+        ++index;
+        if (index >= text.size() || text[index] < '0' || text[index] > '9') { throw JsonWalkError{}; }
+        while (index < text.size() && text[index] >= '0' && text[index] <= '9') { ++index; }
+    }
+    if (index < text.size() && (text[index] == 'e' || text[index] == 'E')) {
+        ++index;
+        if (index < text.size() && (text[index] == '+' || text[index] == '-')) { ++index; }
+        if (index >= text.size() || text[index] < '0' || text[index] > '9') { throw JsonWalkError{}; }
+        while (index < text.size() && text[index] >= '0' && text[index] <= '9') { ++index; }
+    }
+    out.append(text.data() + start, index - start);
+}
+
 std::string tojson_text(const OrderedJson& value) {
     if (value.is_array()) {
         std::string rendered = "[";
@@ -173,33 +434,101 @@ std::string tojson_text(const OrderedJson& value) {
     return value.dump();
 }
 
+std::string tojson_text_from_json(std::string_view json) {
+    try {
+        std::size_t index = 0;
+        std::string out;
+        out.reserve(json.size() + json.size() / 8);
+        append_tojson_value(out, json, index);
+        skip_json_ws(json, index);
+        if (index != json.size()) { throw JsonWalkError{}; }
+        return out;
+    } catch (const JsonWalkError&) { return tojson_text(OrderedJson::parse(json)); }
+}
+
 std::string parameter_text(const OrderedJson& value) {
     if (value.is_string()) { return value.get<std::string>(); }
     return tojson_text(value);
+}
+
+std::string render_tool_call_from_json(const ToolCall& call) {
+    std::size_t index = 0;
+    skip_json_ws(call.arguments_json, index);
+    if (index >= call.arguments_json.size() || call.arguments_json[index] != '{') {
+        throw JsonWalkError{};
+    }
+    ++index;
+    std::string rendered;
+    rendered += "<tool_call>\n<function=";
+    rendered += call.name;
+    rendered += ">\n";
+    skip_json_ws(call.arguments_json, index);
+    bool first = true;
+    while (index < call.arguments_json.size() && call.arguments_json[index] != '}') {
+        if (!first) {
+            if (call.arguments_json[index] != ',') { throw JsonWalkError{}; }
+            ++index;
+            skip_json_ws(call.arguments_json, index);
+            if (index < call.arguments_json.size() && call.arguments_json[index] == '}') {
+                throw JsonWalkError{};
+            }
+        }
+        first = false;
+        const std::string key = decode_json_string(call.arguments_json, index);
+        skip_json_ws(call.arguments_json, index);
+        if (index >= call.arguments_json.size() || call.arguments_json[index] != ':') {
+            throw JsonWalkError{};
+        }
+        ++index;
+        skip_json_ws(call.arguments_json, index);
+        std::string value;
+        if (index < call.arguments_json.size() && call.arguments_json[index] == '"') {
+            value = decode_json_string(call.arguments_json, index);
+        } else {
+            append_tojson_value(value, call.arguments_json, index);
+        }
+        rendered += "<parameter=";
+        rendered += key;
+        rendered += ">\n";
+        rendered += value;
+        rendered += "\n</parameter>\n";
+        skip_json_ws(call.arguments_json, index);
+    }
+    if (index >= call.arguments_json.size() || call.arguments_json[index] != '}') {
+        throw JsonWalkError{};
+    }
+    ++index;
+    skip_json_ws(call.arguments_json, index);
+    if (index != call.arguments_json.size()) { throw JsonWalkError{}; }
+    rendered += "</function>\n</tool_call>";
+    return rendered;
 }
 
 std::string render_tool_call(const ToolCall& call, bool allow_empty_arguments) {
     if (allow_empty_arguments && call.arguments_json.empty()) {
         return "<tool_call>\n<function=" + call.name + ">\n</function>\n</tool_call>";
     }
-    OrderedJson args = OrderedJson::parse(call.arguments_json);
-    if (!args.is_object()) {
-        throw std::invalid_argument("tool call arguments must be a JSON object");
-    }
-
-    std::string rendered;
-    rendered += "<tool_call>\n<function=";
-    rendered += call.name;
-    rendered += ">\n";
-    for (auto it = args.begin(); it != args.end(); ++it) {
-        rendered += "<parameter=";
-        rendered += it.key();
+    try {
+        return render_tool_call_from_json(call);
+    } catch (const JsonWalkError&) {
+        OrderedJson args = OrderedJson::parse(call.arguments_json);
+        if (!args.is_object()) {
+            throw std::invalid_argument("tool call arguments must be a JSON object");
+        }
+        std::string rendered;
+        rendered += "<tool_call>\n<function=";
+        rendered += call.name;
         rendered += ">\n";
-        rendered += parameter_text(it.value());
-        rendered += "\n</parameter>\n";
+        for (auto it = args.begin(); it != args.end(); ++it) {
+            rendered += "<parameter=";
+            rendered += it.key();
+            rendered += ">\n";
+            rendered += parameter_text(it.value());
+            rendered += "\n</parameter>\n";
+        }
+        rendered += "</function>\n</tool_call>";
+        return rendered;
     }
-    rendered += "</function>\n</tool_call>";
-    return rendered;
 }
 
 std::string render_tools_system_block(const std::vector<std::string>& tool_jsons,
@@ -214,7 +543,7 @@ std::string render_tools_system_block(const std::vector<std::string>& tool_jsons
     rendered += "# Tools\n\nYou have access to the following functions:\n\n<tools>";
     for (const std::string& tool : tool_jsons) {
         rendered += "\n";
-        rendered += tojson_text(OrderedJson::parse(tool));
+        rendered += tojson_text_from_json(tool);
     }
     rendered += "\n</tools>";
     rendered += std::string(kToolInstructions);
