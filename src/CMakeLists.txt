@@ -86,6 +86,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/prepare_masked_block.cu
   ops/launcher/residual_add.cu
   ops/launcher/rmsnorm.cu
+  ops/launcher/residual_rmsnorm.cu
   ops/launcher/rope.cu
   ops/launcher/sampling.cu
   ops/launcher/grouped_dynamic_conv.cu
@@ -233,6 +234,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/prepare_masked_block.cpp
   ops/wrapper/residual_add.cpp
   ops/wrapper/rmsnorm.cpp
+  ops/wrapper/residual_rmsnorm.cpp
   ops/wrapper/rope.cpp
   ops/wrapper/sampling.cpp
   ops/wrapper/grouped_dynamic_conv.cpp

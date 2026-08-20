@@ -22,7 +22,7 @@
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/mtp_pack.h"
 #include "ninfer/ops/position.h"
-#include "ninfer/ops/residual_add.h"
+#include "ninfer/ops/residual_rmsnorm.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/scatter.h"
@@ -408,10 +408,9 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     const auto post = workspace_recipe::mtp_post_attention<TextConfig>(work_, T);
     Tensor o        = post.output;
     ops::linear(a.view({kCfg.q_size, T}), *mtp_.o_proj, o, s);
-    ops::residual_add(o, x, s);
 
     Tensor mh = post.post_mixer_hidden;
-    ops::rmsnorm(x, *mtp_.post_attn_norm, kCfg.rms_eps, true, mh, s);
+    ops::residual_rmsnorm(o, x, *mtp_.post_attn_norm, kCfg.rms_eps, mh, s);
 
     {
         auto post_mixer_scope = work_.scope();
@@ -535,10 +534,9 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
 
         Tensor o = work_.alloc(DType::BF16, {kCfg.hidden, 1});
         ops::linear(a.view({kCfg.q_size, 1}), *mtp_.o_proj, o, s);
-        ops::residual_add(o, x_last, s);
 
         Tensor mh = work_.alloc(DType::BF16, {kCfg.hidden, 1});
-        ops::rmsnorm(x_last, *mtp_.post_attn_norm, kCfg.rms_eps, true, mh, s);
+        ops::residual_rmsnorm(o, x_last, *mtp_.post_attn_norm, kCfg.rms_eps, mh, s);
         {
             auto post_mixer_scope = work_.scope();
             Variant::mtp_post_mixer(mh, mtp_.payload->post_mixer, x_last, work_, s);
