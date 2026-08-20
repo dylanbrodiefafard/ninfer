@@ -116,12 +116,22 @@ both OpenAI spellings are present they must carry the same boolean value. Unknow
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
 finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty
 `choices` chunk contains completed usage. Non-stream responses and the stream usage/finish chunks
-also include a llama.cpp-style `timings` object, with the same rate fields flattened onto `usage`.
-Rate and millisecond fields are rounded to three decimal places. `reuse_source` reports prefix
-reuse as `none` (cache miss), `vram_resident`, or `host_ram`. When `--kv-ram-capacity` is enabled,
-those objects also include the live host-KV occupancy and copy times from the serve `[req] done`
-line: `kv_ram_used_bytes`, `kv_ram_entry_count`, `kv_ram_restores`, `kv_ram_evictions`,
-`kv_ram_drops`, `kv_ram_save_ms`, and `kv_ram_load_ms`. They are omitted when the RAM tier is off.
+carry the per-request stats exactly once, in two OpenAI-standard details sub-objects (no top-level
+duplicates, no Ollama-compat aliases):
+
+- `usage.prompt_tokens_details` — OpenAI-standard `cached_tokens` (prompt tokens served from
+  prefix reuse, no recompute) plus engine stats under the `ninfer` namespace: `reuse_source`
+  (`none` / `vram_resident` / `host_ram`), `prefill` (`ms`, `tok_s`, `ms_per_token`, `tail_tok_s`,
+  `tail_window_s`) and `decode` (`ms`, `tok_s`, `ms_per_token`). Prefill rates cover the computed
+  (non-reused) suffix only. Rate and millisecond fields are rounded to three decimal places.
+- `usage.completion_tokens_details` — OpenAI-standard keys: `reasoning_tokens` (thinking portion,
+  0 when thinking is off) and, when speculation is active, `accepted_prediction_tokens` /
+  `rejected_prediction_tokens`.
+
+When `--kv-ram-capacity` is enabled, the `ninfer` namespace also carries a `kv_ram` object — the
+same live host-KV figures as the serve `[req] done` line: engine-wide gauges `used_bytes` /
+`entry_count`, this request's D2H/H2D `save_ms` / `load_ms`, and engine-lifetime cumulative
+`lifetime.{captures,restores,evictions,drops}`. It is omitted when the RAM tier is off.
 
 ### Multimodal request
 

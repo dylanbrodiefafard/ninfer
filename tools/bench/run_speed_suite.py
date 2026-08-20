@@ -5,11 +5,13 @@ Runs a scenario matrix (small/large prompts, thinking on/off, multi-turn,
 tools, context prefill, decode-heavy) against the running server and reports
 per-case prefill tok/s, decode tok/s, TTFT, and end-to-end wall time.
 
-Metrics come from the server's llama.cpp-style `timings` block:
-  prefill_tok_s  = timings.prompt_per_second
+Metrics come from the usage object's single-storage-location stats
+(usage.prompt_tokens_details.ninfer.* + completion_tokens_details):
+  prefill_tok_s  = ninfer.prefill.tok_s (computed non-reused suffix only)
+  prefill_tail_tok_s = ninfer.prefill.tail_tok_s (steady-state rate, trailing <=1s)
   ttft_ms        = client wall time to first content/reasoning delta (stream)
-                   or timings.prompt_ms (non-stream; server-side prefill time)
-  decode_tok_s   = timings.predicted_per_second
+                    or ninfer.prefill.ms (non-stream; server-side prefill time)
+  decode_tok_s   = ninfer.decode.tok_s
   e2e_s          = client wall time, request sent -> response complete
 
 Outputs (under --out-dir, default profiles/bench/speed-suite/):
@@ -194,20 +196,28 @@ def num(*values) -> float | None:
 
 def extract_metrics(resp: dict, extra: dict, streamed: bool) -> dict:
     usage = resp.get("usage") or {}
-    timings = resp.get("timings") or {}
-    draft_n = int(num(usage.get("draft_n"), timings.get("draft_n")) or 0)
-    accepted = int(num(usage.get("draft_n_accepted"), timings.get("draft_n_accepted")) or 0)
+    # Per-request stats live once, nested under usage.prompt_tokens_details.
+    # Engine stats sit under the `ninfer` vendor namespace; OpenAI-standard keys
+    # (cached_tokens, prediction tokens) sit at the top of the details sub-objects.
+    ptd = usage.get("prompt_tokens_details") or {}
+    ctd = usage.get("completion_tokens_details") or {}
+    ninfer = ptd.get("ninfer") or {}
+    prefill = ninfer.get("prefill") or {}
+    decode = ninfer.get("decode") or {}
+    accepted = int(num(ctd.get("accepted_prediction_tokens")) or 0)
+    rejected = int(num(ctd.get("rejected_prediction_tokens")) or 0)
+    draft_n = accepted + rejected
     completion = int(num(usage.get("completion_tokens")) or 0)
     m = {
-        "prompt_tokens": int(num(usage.get("prompt_tokens"), usage.get("prompt_n")) or 0),
+        "prompt_tokens": int(num(usage.get("prompt_tokens")) or 0),
+        "prompt_reused_tokens": int(num(ptd.get("cached_tokens")) or 0),
         "completion_tokens": completion,
-        "prefill_tok_s": num(usage.get("prompt_per_second"), timings.get("prompt_per_second")),
-        "prefill_tail_tok_s": num(usage.get("prefill_tail_tok_s"), timings.get("prefill_tail_tok_s")),
-        "prefill_tail_window_s": num(usage.get("prefill_tail_window_s"),
-                                     timings.get("prefill_tail_window_s")),
-        "decode_tok_s": num(usage.get("predicted_per_second"), timings.get("predicted_per_second")),
-        "prefill_ms": num(usage.get("prompt_ms"), timings.get("prompt_ms")),
-        "decode_ms": num(usage.get("predicted_ms"), timings.get("predicted_ms")),
+        "prefill_tok_s": num(prefill.get("tok_s")),
+        "prefill_tail_tok_s": num(prefill.get("tail_tok_s")),
+        "prefill_tail_window_s": num(prefill.get("tail_window_s")),
+        "decode_tok_s": num(decode.get("tok_s")),
+        "prefill_ms": num(prefill.get("ms")),
+        "decode_ms": num(decode.get("ms")),
         "draft_n": draft_n,
         "draft_n_accepted": accepted,
         "accept_rate": (accepted / draft_n) if draft_n > 0 else None,

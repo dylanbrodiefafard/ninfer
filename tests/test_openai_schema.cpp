@@ -552,13 +552,14 @@ int test_response_serialization() {
     failures += check(j.at("usage").at("completion_tokens") == 3, "usage completion_tokens");
     failures += check(j.at("usage").at("total_tokens") == 13, "usage total_tokens");
     failures += check(!j.at("usage").contains("prompt_tokens_details"),
-                      "usage without timings still has prompt_tokens_details");
-    failures += check(!j.contains("timings"), "timings present when omitted");
+                      "usage without timings has no prompt_tokens_details");
+    failures += check(!j.contains("timings"), "top-level timings field present");
 
     CompletionTimings timings = make_completion_timings(10, 3, 0.25, 1.0);
     timings.kv_ram_capacity_bytes = 1048576;
     timings.kv_ram_used_bytes     = 524288;
     timings.kv_ram_entry_count    = 1;
+    timings.kv_ram_captures       = 4;
     timings.kv_ram_restores       = 2;
     timings.kv_ram_evictions      = 0;
     timings.kv_ram_drops          = 1;
@@ -569,51 +570,83 @@ int test_response_serialization() {
     const Json jt = Json::parse(
         make_chat_completion_response("id-1", "m", 111, "hello world", "", "stop", usage, &timings));
     const Json& usage_t   = jt.at("usage");
-    const Json& timings_t = jt.at("timings");
-    failures += check(!usage_t.contains("prompt_tokens_details"),
-                      "usage still nests prompt_tokens_details");
-    failures += check(usage_t.contains("prompt_ms"), "usage omitted flattened prompt_ms");
-    failures += check(usage_t.at("prompt_eval_count") == 10, "usage omitted prompt_eval_count");
-    failures += check(timings_t.at("reuse_source") == "host_ram", "timings reuse_source host_ram");
-    failures += check(usage_t.at("reuse_source") == "host_ram", "usage reuse_source host_ram");
-    failures += check(timings_t.at("prompt_per_second") == 12.346,
-                      "timings rates are not rounded to three decimals");
-    failures += check(usage_t.at("prompt_per_second") == 12.346,
-                      "usage rates are not rounded to three decimals");
-    failures += check(timings_t.at("kv_ram_used_bytes") == 524288, "timings kv_ram_used_bytes");
-    failures += check(timings_t.at("kv_ram_entry_count") == 1, "timings kv_ram_entry_count");
-    failures += check(timings_t.at("kv_ram_restores") == 2, "timings kv_ram_restores");
-    failures += check(timings_t.at("kv_ram_evictions") == 0, "timings kv_ram_evictions");
-    failures += check(timings_t.at("kv_ram_drops") == 1, "timings kv_ram_drops");
-    failures += check(timings_t.at("kv_ram_save_ms") == 8.0, "timings kv_ram_save_ms");
-    failures += check(timings_t.at("kv_ram_load_ms") == 14.0, "timings kv_ram_load_ms");
-    failures += check(!timings_t.contains("kv_ram_capacity_bytes"),
-                      "timings serializes pin capacity");
-    failures += check(usage_t.at("kv_ram_used_bytes") == 524288, "usage kv_ram_used_bytes");
-    failures += check(usage_t.at("kv_ram_entry_count") == 1, "usage kv_ram_entry_count");
-    failures += check(usage_t.at("kv_ram_restores") == 2, "usage kv_ram_restores");
-    failures += check(usage_t.at("kv_ram_evictions") == 0, "usage kv_ram_evictions");
-    failures += check(usage_t.at("kv_ram_drops") == 1, "usage kv_ram_drops");
-    failures += check(usage_t.at("kv_ram_save_ms") == 8.0, "usage kv_ram_save_ms");
-    failures += check(usage_t.at("kv_ram_load_ms") == 14.0, "usage kv_ram_load_ms");
+    const Json& ptd       = usage_t.at("prompt_tokens_details");
+    const Json& ninfer_ptd = ptd.at("ninfer");
+    failures += check(usage_t.contains("prompt_tokens_details"),
+                      "usage does not nest prompt_tokens_details");
+    failures += check(!usage_t.contains("prompt_ms"), "usage duplicates stats at top level");
+    failures += check(!usage_t.contains("prompt_eval_count"), "usage still emits Ollama aliases");
+    failures += check(!usage_t.contains("reuse_source"), "usage duplicates reuse_source at top level");
+    failures += check(!jt.contains("timings"), "top-level timings still present");
+    failures += check(ptd.at("cached_tokens") == 0, "ptd cached_tokens zero on cache miss");
+    failures += check(ninfer_ptd.at("reuse_source") == "host_ram", "reuse_source host_ram");
+    failures += check(ninfer_ptd.at("prefill").at("ms") == 250.0, "prefill ms");
+    failures += check(ninfer_ptd.at("prefill").at("tok_s") == 12.346,
+                      "prefill rates are not rounded to three decimals");
+    failures += check(ninfer_ptd.at("decode").at("ms") == 1000.0, "decode ms");
+    // First completion token is attributed to prefill, so 3 completions = 2 decode tokens
+    // over 1.0s.
+    failures += check(ninfer_ptd.at("decode").at("tok_s") == 2.0, "decode tok_s");
+    const Json& kv_ram = ninfer_ptd.at("kv_ram");
+    failures += check(kv_ram.at("used_bytes") == 524288, "kv_ram used_bytes gauge");
+    failures += check(kv_ram.at("entry_count") == 1, "kv_ram entry_count gauge");
+    failures += check(kv_ram.at("save_ms") == 8.0, "kv_ram per-request save_ms");
+    failures += check(kv_ram.at("load_ms") == 14.0, "kv_ram per-request load_ms");
+    failures += check(kv_ram.at("lifetime").at("captures") == 4, "kv_ram lifetime captures");
+    failures += check(kv_ram.at("lifetime").at("restores") == 2, "kv_ram lifetime restores");
+    failures += check(kv_ram.at("lifetime").at("evictions") == 0, "kv_ram lifetime evictions");
+    failures += check(kv_ram.at("lifetime").at("drops") == 1, "kv_ram lifetime drops");
+    failures += check(!kv_ram.contains("capacity_bytes"), "kv_ram serializes pin capacity");
+
+    // completion_tokens_details carries only OpenAI-standard keys.
+    const Json& ctd = usage_t.at("completion_tokens_details");
+    failures += check(ctd.at("reasoning_tokens") == 0, "ctd reasoning_tokens zero");
+    failures += check(!ctd.contains("accepted_prediction_tokens"),
+                      "ctd emits prediction tokens without speculation");
 
     CompletionTimings zero_timings = make_completion_timings(10, 3, 0.25, 1.0);
     const Json jz = Json::parse(make_chat_completion_response(
         "id-1", "m", 111, "hello world", "", "stop", usage, &zero_timings));
-    failures += check(!jz.at("usage").contains("kv_ram_used_bytes"),
-                      "usage emits KV RAM fields when the tier is off");
-    failures += check(!jz.at("timings").contains("kv_ram_used_bytes"),
-                      "timings emit KV RAM fields when the tier is off");
-    failures += check(jz.at("timings").at("reuse_source") == "none",
-                      "timings omit cache-miss reuse_source");
-    failures +=
-        check(jz.at("usage").at("reuse_source") == "none", "usage omits cache-miss reuse_source");
+    failures += check(!jz.at("usage").at("prompt_tokens_details").at("ninfer").contains("kv_ram"),
+                      "usage emits the KV RAM block when the tier is off");
+    failures += check(jz.at("usage").at("prompt_tokens_details").at("ninfer").at("reuse_source") == "none",
+                      "reuse_source omitted on cache miss");
+    failures += check(!jz.at("usage").contains("reuse_source"),
+                      "usage duplicates reuse_source at top level");
 
     zero_timings.prefix_reuse_source = ninfer::PrefixReuseSource::VramResident;
     const Json jv = Json::parse(make_chat_completion_response(
         "id-1", "m", 111, "hello world", "", "stop", usage, &zero_timings));
-    failures += check(jv.at("timings").at("reuse_source") == "vram_resident",
-                      "timings reuse_source vram_resident");
+    failures += check(jv.at("usage").at("prompt_tokens_details").at("ninfer").at("reuse_source") ==
+                          "vram_resident",
+                      "reuse_source vram_resident");
+
+    // Prefill rates cover the non-reused suffix only: a 6-token cached prefix must not
+    // inflate prefill tok_s (4 computed tokens over 0.25s = 16, not 40).
+    CompletionTimings reused_timings =
+        make_completion_timings(10, 3, 0.25, 1.0, 0, 0, 0.0, 0.0, 6);
+    failures += check(reused_timings.prompt_reused_n == 6, "prompt_reused_n recorded");
+    failures +=
+        check(reused_timings.prompt_per_second == 16.0, "prompt_per_second uses computed tokens");
+    failures += check(reused_timings.prompt_per_token_ms == 62.5, "prompt_per_token_ms");
+    const Json jre = Json::parse(make_chat_completion_response(
+        "id-1", "m", 111, "hello world", "", "stop", usage, &reused_timings));
+    failures += check(jre.at("usage").at("prompt_tokens_details").at("cached_tokens") == 6,
+                      "cached_tokens serialized");
+    failures += check(jre.at("usage").at("prompt_tokens_details").at("ninfer")
+                         .at("prefill")
+                         .at("tok_s") == 16.0,
+                      "serialized prefill tok_s reflects computed suffix");
+
+    // Speculation + reasoning populate the OpenAI-standard completion details.
+    CompletionTimings spec_timings = make_completion_timings(10, 3, 0.25, 1.0, 8, 5);
+    spec_timings.reasoning_tokens = 2;
+    const Json jsp = Json::parse(make_chat_completion_response(
+        "id-1", "m", 111, "hello world", "", "stop", usage, &spec_timings));
+    const Json& ctd_sp = jsp.at("usage").at("completion_tokens_details");
+    failures += check(ctd_sp.at("reasoning_tokens") == 2, "ctd reasoning_tokens carried");
+    failures += check(ctd_sp.at("accepted_prediction_tokens") == 5, "ctd accepted prediction");
+    failures += check(ctd_sp.at("rejected_prediction_tokens") == 3, "ctd rejected prediction");
 
     // Non-empty reasoning is attached as message.reasoning_content, content stays answer-only.
     const Json jr = Json::parse(make_chat_completion_response("id-2", "m", 111, "the answer",
@@ -708,6 +741,7 @@ int test_chunk_serialization() {
     ram_timings.kv_ram_capacity_bytes = 1048576;
     ram_timings.kv_ram_used_bytes     = 524288;
     ram_timings.kv_ram_entry_count    = 1;
+    ram_timings.kv_ram_captures       = 3;
     ram_timings.kv_ram_restores       = 2;
     ram_timings.kv_ram_evictions      = 0;
     ram_timings.kv_ram_drops          = 1;
@@ -715,14 +749,15 @@ int test_chunk_serialization() {
     ram_timings.kv_ram_load_ms        = 14.0;
     ram_timings.prefix_reuse_source   = ninfer::PrefixReuseSource::VramResident;
     const Json ram_chunk = parse_sse(make_chat_chunk_usage("id", "m", 1, usage, &ram_timings));
-    failures += check(!ram_chunk.at("usage").contains("prompt_tokens_details"),
-                      "usage chunk still nests prompt_tokens_details");
-    failures += check(ram_chunk.at("usage").at("kv_ram_used_bytes") == 524288,
-                      "usage chunk kv_ram_used_bytes");
-    failures += check(ram_chunk.at("timings").at("kv_ram_load_ms") == 14.0,
-                      "usage chunk timings kv_ram_load_ms");
-    failures += check(ram_chunk.at("usage").at("reuse_source") == "vram_resident",
-                      "usage chunk reuse_source");
+    const Json& ram_ninfer = ram_chunk.at("usage").at("prompt_tokens_details").at("ninfer");
+    failures += check(ram_chunk.at("usage").contains("prompt_tokens_details"),
+                      "usage chunk does not nest prompt_tokens_details");
+    failures += check(!ram_chunk.at("usage").contains("kv_ram_used_bytes"),
+                      "usage chunk duplicates kv stats at top level");
+    failures += check(ram_ninfer.at("kv_ram").at("used_bytes") == 524288,
+                      "usage chunk kv_ram used_bytes");
+    failures += check(ram_ninfer.at("kv_ram").at("load_ms") == 14.0, "usage chunk kv_ram load_ms");
+    failures += check(ram_ninfer.at("reuse_source") == "vram_resident", "usage chunk reuse_source");
 
     failures += check(sse_done() == "data: [DONE]\n\n", "done sentinel");
     return failures;

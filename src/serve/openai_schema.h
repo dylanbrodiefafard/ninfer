@@ -27,16 +27,20 @@ std::optional<bool> parse_openai_preserve_thinking(const nlohmann::json& body);
 std::optional<bool> parse_openai_enable_thinking(const nlohmann::json& body);
 
 [[nodiscard]] CompletionTimings make_completion_timings(int prompt_tokens, int completion_tokens,
-                                                        double prefill_seconds,
-                                                        double decode_seconds, int draft_n = 0,
-                                                        int draft_n_accepted = 0,
-                                                        double prefill_tail_tok_s = 0.0,
-                                                        double prefill_tail_window_s = 0.0);
+                                                         double prefill_seconds,
+                                                         double decode_seconds, int draft_n = 0,
+                                                         int draft_n_accepted = 0,
+                                                         double prefill_tail_tok_s = 0.0,
+                                                         double prefill_tail_window_s = 0.0,
+                                                         int prompt_reused = 0);
 
 // Non-streaming chat completion response body (JSON string). When `reasoning` is
 // non-empty it is attached as `message.reasoning_content` (the DeepSeek/vLLM-style
 // convention consumed by Chatbox, Open WebUI, etc.), leaving `content` = answer.
-// Optional `timings` mirrors llama.cpp server fields used by Open WebUI's info bubble.
+// The usage object carries OpenAI-standard details sub-objects: `cached_tokens` and
+// engine stats under the `ninfer` namespace in `prompt_tokens_details` (prefill /
+// decode rates, KV-RAM tier stats), and reasoning / speculative-decoding token
+// counts in `completion_tokens_details`. Each stat is stored exactly once.
 std::string make_chat_completion_response(const std::string& id, const std::string& model,
                                           std::int64_t created, const std::string& content,
                                           const std::string& reasoning, const char* finish_reason,
@@ -73,12 +77,13 @@ std::string make_chat_chunk_final(const std::string& id, const std::string& mode
                                   const CompletionTimings* timings = nullptr,
                                   const CompletionUsage* usage = nullptr);
 // Dedicated usage chunk: `choices: []` with the request's token usage. Emitted
-// before [DONE] (and whenever include_usage is requested). Carries llama.cpp-style
-// timings so Open WebUI can populate its info bubble, including `reuse_source`
-// (`none` / `vram_resident` / `host_ram`). When host KV RAM is enabled, the same
-// live occupancy and D2H/H2D copy times as the serve `[req] done` line are
-// included on `timings` and flattened onto `usage`. Rates and millisecond fields
-// are rounded to three decimal places.
+// before [DONE] (and whenever include_usage is requested). Carries the usage object
+// described above: OpenAI-standard `prompt_tokens_details` (`cached_tokens`, `ninfer`
+// engine stats — prefill/decode rates, reuse source, and when host KV RAM is enabled
+// the same live occupancy, copy times, and lifetime counters as the serve `[req] done`
+// line) and OpenAI-standard `completion_tokens_details` (reasoning and speculative
+// prediction token counts). Rates and millisecond fields are rounded to three
+// decimal places.
 std::string make_chat_chunk_usage(const std::string& id, const std::string& model,
                                   std::int64_t created, const CompletionUsage& usage,
                                   const CompletionTimings* timings = nullptr);
