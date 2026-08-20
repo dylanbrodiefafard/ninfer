@@ -331,6 +331,7 @@ public:
     explicit CancellationView(std::function<bool()> requested);
 
     [[nodiscard]] bool requested() const;
+    [[nodiscard]] bool armed() const noexcept;
 
 private:
     std::function<bool()> requested_;
@@ -448,6 +449,9 @@ struct RuntimeStats {
     std::uint64_t kv_ram_drops          = 0;
     double kv_ram_save_seconds          = 0;
     double kv_ram_load_seconds          = 0;
+    std::size_t kv_ram_capacity_bytes   = 0;
+    std::size_t kv_ram_used_bytes       = 0;
+    std::size_t kv_ram_entry_count      = 0;
 };
 
 struct LoadSummary {

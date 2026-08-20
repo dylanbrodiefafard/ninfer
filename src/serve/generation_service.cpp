@@ -453,11 +453,10 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.prefix_cache_hit_tokens     = result.reused_prompt_tokens;
     outcome.metrics.prefix_reuse_path           = result.prefix_reuse_path;
     outcome.metrics.prefix_reuse_source         = result.prefix_reuse_source;
-    const ninfer::MemorySummary memory          = engine_->memory_summary();
     const ninfer::RuntimeStats stats            = engine_->runtime_stats();
-    outcome.metrics.kv_ram_capacity_bytes       = memory.kv_ram_capacity_bytes;
-    outcome.metrics.kv_ram_used_bytes           = memory.kv_ram_used_bytes;
-    outcome.metrics.kv_ram_entry_count          = memory.kv_ram_entry_count;
+    outcome.metrics.kv_ram_capacity_bytes       = stats.kv_ram_capacity_bytes;
+    outcome.metrics.kv_ram_used_bytes           = stats.kv_ram_used_bytes;
+    outcome.metrics.kv_ram_entry_count          = stats.kv_ram_entry_count;
     outcome.metrics.kv_ram_captures             = stats.kv_ram_captures;
     outcome.metrics.kv_ram_restores             = stats.kv_ram_restores;
     outcome.metrics.kv_ram_evictions            = stats.kv_ram_evictions;

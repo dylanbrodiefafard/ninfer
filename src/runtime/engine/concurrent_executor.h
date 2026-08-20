@@ -149,6 +149,8 @@ public:
             request = std::make_shared<Request>(request_id, std::move(prompt), std::move(output),
                                                 prompt_summary, prepare_seconds, std::move(options),
                                                 pending_deadline, submitted, std::move(host_input));
+            request->base_plan.emplace(
+                instance_.program->plan_request_base(request->prompt, request->options.execution));
         } catch (...) {
             release_reserved_capacity();
             throw;
@@ -211,13 +213,16 @@ private:
             ++snapshot.running_requests;
             if (slots_[lane]->decode_ready) { ++snapshot.decode_ready_requests; }
         }
-        const auto ram            = instance_.program->kv_ram_snapshot();
-        snapshot.kv_ram_captures      = ram.captures;
-        snapshot.kv_ram_restores      = ram.restores;
-        snapshot.kv_ram_evictions     = ram.evictions;
-        snapshot.kv_ram_drops         = ram.drops;
-        snapshot.kv_ram_save_seconds  = ram.save_seconds;
-        snapshot.kv_ram_load_seconds  = ram.load_seconds;
+        const auto ram                    = instance_.program->kv_ram_snapshot();
+        snapshot.kv_ram_captures          = ram.captures;
+        snapshot.kv_ram_restores          = ram.restores;
+        snapshot.kv_ram_evictions         = ram.evictions;
+        snapshot.kv_ram_drops             = ram.drops;
+        snapshot.kv_ram_save_seconds      = ram.save_seconds;
+        snapshot.kv_ram_load_seconds      = ram.load_seconds;
+        snapshot.kv_ram_capacity_bytes    = ram.capacity_bytes;
+        snapshot.kv_ram_used_bytes        = ram.used_bytes;
+        snapshot.kv_ram_entry_count       = ram.entry_count;
         std::lock_guard lock(stats_mutex_);
         published_stats_ = snapshot;
     }
@@ -238,8 +243,13 @@ private:
             bool done = false;
             {
                 std::unique_lock lock(request->mutex);
-                request->cv.wait_for(lock, std::chrono::milliseconds(10),
+                if (cancellation.armed()) {
+                    request->cv.wait_for(lock, std::chrono::milliseconds(10),
+                                         [&] { return request->done || !request->events.empty(); });
+                } else {
+                    request->cv.wait(lock,
                                      [&] { return request->done || !request->events.empty(); });
+                }
                 events.swap(request->events);
                 done = request->done;
             }
