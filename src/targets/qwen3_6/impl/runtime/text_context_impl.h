@@ -835,13 +835,16 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         Tensor a_batch        = a.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
+        // keep_frac=1.0: exact attention (keep all key tiles, no tile-skip). Sparse
+        // tile-skip (keep_frac<1) is opt-in via NINFER_KEEP_FRAC + the sage_pv k_mean plane.
         ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
                            kAttnScale, batch_text_kv_->batch_layer_view(fidx),
-                           *active_gqa_envelope_, work_, a_batch, s);
+                           *active_gqa_envelope_, work_, a_batch, s, 1.0f);
     } else {
+        // keep_frac=1.0: exact (keep all key tiles). See the batched call above.
         ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, kAttnScale,
-                           batch_text_kv_->batch_layer_view(fidx), *active_gqa_envelope_, work_, a,
-                           s);
+                            batch_text_kv_->batch_layer_view(fidx), *active_gqa_envelope_, work_, a,
+                            s, 1.0f);
     }
     ops::sigmoid_mul(gate, a, s);
 

@@ -422,8 +422,9 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
 
 void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
                    const Tensor& valid_columns, const Tensor& kv_table_rows, float scale,
-                   PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
-                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+                    PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
+                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
+                    float keep_frac) {
     constexpr const char* op = "gqa_attention";
     validate_batched_attention_tensors(q, positions, valid_columns, kv_table_rows, out, cache,
                                        envelope, scale, op);
@@ -457,7 +458,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
         return;
     }
     detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                        cache, out, stream);
+                                        cache, out, stream, keep_frac);
 }
 
 void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,

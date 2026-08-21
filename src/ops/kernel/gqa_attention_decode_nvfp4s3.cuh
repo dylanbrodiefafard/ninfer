@@ -581,16 +581,19 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             }
         } else {
             const int loader_tid = tid - ProducerThreads;
-            // Transpose the tile's V codes into d-major rows (32B used per row).
-#pragma unroll 1
-            for (int unit = loader_tid; unit < D * (Bc / 2); unit += VLoaderThreads) {
-                const int d  = unit % D;
-                const int kp = unit / D;
-                const std::uint8_t b0 = v_codes[2 * kp * CodeW + (d >> 1)];
-                const std::uint8_t b1 = v_codes[(2 * kp + 1) * CodeW + (d >> 1)];
+            // One loader thread per d-row: write a contiguous 32-byte v_t row so the
+            // store hits distinct SMEM banks. The original unit-strided store placed
+            // every lane's write on the same bank (32-way conflict).
+            for (int d = loader_tid; d < D; d += VLoaderThreads) {
+                const int dp = d >> 1;
                 const int sh = (d & 1) * 4;
-                v_t[d * P4Row + kp] = (static_cast<std::uint8_t>(((b1 >> sh) & 0x0Fu) << 4) |
-                                      static_cast<std::uint8_t>(b0 >> sh) & 0x0Fu);
+#pragma unroll 1
+                for (int kp = 0; kp < Bc / 2; ++kp) {
+                    const std::uint8_t b0 = v_codes[2 * kp * CodeW + dp];
+                    const std::uint8_t b1 = v_codes[(2 * kp + 1) * CodeW + dp];
+                    v_t[d * P4Row + kp]   = (static_cast<std::uint8_t>(((b1 >> sh) & 0x0Fu) << 4) |
+                                           static_cast<std::uint8_t>((b0 >> sh) & 0x0Fu));
+                }
             }
         }
         __syncthreads();

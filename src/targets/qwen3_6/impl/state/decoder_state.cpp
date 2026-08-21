@@ -50,6 +50,11 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
         } else if (nvfp4) {
             pool_spec.planes.push_back({DType::FP8_E4M3FN, head_dim / quant_group, kv_heads, 256});
             pool_spec.planes.push_back({DType::FP8_E4M3FN, head_dim / quant_group, kv_heads, 256});
+            if (sage_pv) {
+                // Per-page (64-key tile) dequantized K sum for the meansim tile proxy:
+                // d -> page_offset=d/4, leading=d%4 (4 floats). F32.
+                pool_spec.planes.push_back({DType::FP32, 4, kv_heads, 256});
+            }
         }
     }
     return PagedKVCacheLayout{
@@ -109,13 +114,18 @@ PagedKVCacheView PagedKVCache::execution_view(const PagedKVAllocation& allocatio
 PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_table) const {
     if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
     const bool quantized     = dtype_ == DType::I8 || dtype_ == DType::U8;
-    const std::size_t stride = quantized ? 4ULL : 2ULL;
+    // A sage (U8 + sage_pv) layer stores 5 planes (k, v, k_scale, v_scale, k_mean); other
+    // layouts store 4 (quantized) or 2 (BF16). The flat pool is laid out per layer, so the
+    // base offset must stride by the per-layer plane count, not a fixed 4.
+    const bool nvfp4_sage    = quantized && dtype_ == DType::U8 && sage_pv_;
+    const std::size_t stride = nvfp4_sage ? 5ULL : (quantized ? 4ULL : 2ULL);
     const std::size_t base   = static_cast<std::size_t>(layer) * stride;
     return PagedKVLayerView{
         .k_pages       = pool_.plane(base),
         .v_pages       = pool_.plane(base + 1),
         .k_scale_pages = quantized ? pool_.plane(base + 2) : Tensor(),
         .v_scale_pages = quantized ? pool_.plane(base + 3) : Tensor(),
+        .k_mean_pages  = nvfp4_sage ? pool_.plane(base + 4) : Tensor(),
         .block_table   = block_table,
         .head_dim      = head_dim_,
         .num_kv_heads  = kv_heads_,
@@ -128,13 +138,18 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
 PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const {
     if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
     const bool quantized     = dtype_ == DType::I8 || dtype_ == DType::U8;
-    const std::size_t stride = quantized ? 4ULL : 2ULL;
+    // A sage (U8 + sage_pv) layer stores 5 planes (k, v, k_scale, v_scale, k_mean); other
+    // layouts store 4 (quantized) or 2 (BF16). The flat pool is laid out per layer, so the
+    // base offset must stride by the per-layer plane count, not a fixed 4.
+    const bool nvfp4_sage    = quantized && dtype_ == DType::U8 && sage_pv_;
+    const std::size_t stride = nvfp4_sage ? 5ULL : (quantized ? 4ULL : 2ULL);
     const std::size_t base   = static_cast<std::size_t>(layer) * stride;
     return PagedKVBatchLayerView{
         .k_pages       = pool_.plane(base),
         .v_pages       = pool_.plane(base + 1),
         .k_scale_pages = quantized ? pool_.plane(base + 2) : Tensor(),
         .v_scale_pages = quantized ? pool_.plane(base + 3) : Tensor(),
+        .k_mean_pages  = nvfp4_sage ? pool_.plane(base + 4) : Tensor(),
         .block_tables  = pool_.block_tables(),
         .head_dim      = head_dim_,
         .num_kv_heads  = kv_heads_,

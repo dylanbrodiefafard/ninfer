@@ -115,7 +115,7 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_nvfp4s3_kernel
     const std::int32_t* __restrict__ positions, Metadata metadata,
     std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
     std::uint8_t* __restrict__ scale_k, std::uint8_t* __restrict__ scale_v,
-    std::int32_t width) {
+    float* __restrict__ k_mean, std::int32_t width) {
     constexpr int Groups  = kGqaNvfp4Groups;
     constexpr int DpPairs = kGqaNvfp4HeadDim / 2;
     const int tokens      = metadata.valid_tokens(width);
@@ -123,11 +123,17 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_nvfp4s3_kernel
     const int unit        = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + tid;
 
     const int k_units = tokens * Geometry::KVHeads * Groups;
+    // Meansim proxy: one thread per (page, kv_head, 16-d group) accumulates the
+    // dequantized K sum of the page's valid keys into k_mean (sum plane).
+    const int kmean_units = k_mean != nullptr
+                                ? (tokens + kPagedKVPageSize - 1) / kPagedKVPageSize *
+                                      Geometry::KVHeads * Groups
+                                : 0;
     // V: one thread per (cache 16-key block, kv_head, d pair); a token range touches at
     // most div_up(tokens, 16) + 1 cache blocks (first + last partial).
     const int v_blocks = (tokens + 15) / 16 + 1;
     const int v_units = v_blocks * Geometry::KVHeads * DpPairs;
-    if (unit >= k_units + v_units) { return; }
+    if (unit >= k_units + kmean_units + v_units) { return; }
 
     const std::int32_t* block_table = metadata.block_table();
     const int base_pos              = positions[0];
@@ -154,11 +160,42 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_nvfp4s3_kernel
         return;
     }
 
+    if (unit < k_units + kmean_units) {
+        // Meansim proxy sum unit.
+        const int mu      = unit - k_units;
+        const int grp     = mu % Groups;
+        const int tmp     = mu / Groups;
+        const int kv_head = tmp % Geometry::KVHeads;
+        const int page_l  = tmp / Geometry::KVHeads;
+        const int first_pos = base_pos + page_l * kPagedKVPageSize;
+        if (first_pos >= base_pos + tokens) { return; }
+        const std::int64_t mean_base =
+            paged_kv_element_offset<4, Geometry::KVHeads>(page_l, kv_head, grp * 4, 0);
+        const int d0     = grp * kGqaNvfp4Group;
+        const int last   = min(first_pos + kPagedKVPageSize, base_pos + tokens);
+        float sum[kGqaNvfp4Group];
+#pragma unroll
+        for (int i = 0; i < kGqaNvfp4Group; ++i) { sum[i] = 0.0f; }
+        for (int position = first_pos; position < last; ++position) {
+            const int token = position - base_pos;
+#pragma unroll
+            for (int i = 0; i < kGqaNvfp4Group; ++i) {
+                sum[i] += __bfloat162float(k[gqa_nvfp4_src_index<Geometry>(kv_head, d0 + i, token)]);
+            }
+        }
+        const float inv_n = 1.0f / static_cast<float>(last - first_pos);
+#pragma unroll
+        for (int i = 0; i < kGqaNvfp4Group; ++i) {
+            k_mean[mean_base + i] = sum[i] * inv_n;
+        }
+        return;
+    }
+
     // V: Sage-style d-major quantization. One thread per (cache 16-key block, kv_head,
     // d pair); the block's scale is running state (a new key either fits the block's
     // current max or bumps it, rescaling the block's earlier codes). Tokens of the
     // block are processed in order, so rescale reads are settled.
-    const int v_unit    = unit - k_units;
+    const int v_unit    = unit - k_units - kmean_units;
     const int blk       = v_unit / (Geometry::KVHeads * DpPairs);
     const int tmp       = v_unit % (Geometry::KVHeads * DpPairs);
     const int kv_head   = tmp / DpPairs;
@@ -227,9 +264,10 @@ template <typename Geometry, typename Metadata>
 __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
     const __nv_bfloat16* __restrict__ q, const std::uint8_t* __restrict__ cache_k,
     const std::uint8_t* __restrict__ cache_v, const std::uint8_t* __restrict__ cache_k_scale,
-    const std::uint8_t* __restrict__ cache_v_scale, Metadata metadata,
+    const std::uint8_t* __restrict__ cache_v_scale, const float* __restrict__ k_mean,
+    Metadata metadata,
     const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
-    std::int32_t width) {
+    std::int32_t width, float keep_frac) {
     constexpr int D             = kGqaPrefillHeadDim;
     constexpr int Br            = kGqaPrefillNvfp4s3Br;
     constexpr int Bc            = kGqaPrefillNvfp4s3Bc;
@@ -366,7 +404,104 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
     float running_l1     = 0.0f;
     const float scale_l2 = scale * Log2E;
 
-    for (int kb = 0; kb < key_blocks; ++kb) {
+    __shared__ float proxy_scores[4096];
+    __shared__ int keep_list[4096];
+    __shared__ int k_keep_count;
+    __shared__ float q_mean_s[kGqaPrefillHeadDim];
+    // keep_frac is the fraction of key tiles kept, in (0, 1]. approx only when actually
+    // skipping tiles (keep_frac<1) and the sage_pv k_mean proxy is present; keep_frac==1.0
+    // (keep all) takes the exact path with no proxy. keep_frac<=0 is invalid (caught at the
+    // launcher) and degrades to the exact path here as a defensive fallback.
+    const bool approx = keep_frac > 0.0f && keep_frac < 1.0f && k_mean != nullptr;
+    // Sinks/window are only consulted on the approx (tile-skip) path; gate them on approx so
+    // the exact path does not compute unused tile counts.
+    const int k_sinks  = approx ? max(1, (int)(key_blocks * keep_frac * 0.2f)) : 1;
+    const int k_window = approx ? max(1, (int)(key_blocks * keep_frac * 0.4f)) : 1;
+
+    if (!approx) {
+        // Exact path: keep every key tile.
+        if (warp == 0 && lid == 0) {
+            k_keep_count = 0;
+            for (int kb = 0; kb < key_blocks; ++kb) keep_list[k_keep_count++] = kb;
+        }
+    } else {
+        // SpargeAttn meansim gate (arXiv 2502.18137): rank tiles by
+        // mean(Q_block) . mean(K_tile) using the per-page dequantized K mean
+        // precomputed by the fill kernel (k_mean) -- zero K/V fetch, so the main
+        // loop below fetches only the kept tiles.
+        if (tid < D) {
+            const int d       = tid;
+            const int grp     = d / kGqaNvfp4Group;
+            const int byte_l  = d >> 1;
+            const bool hi_nib = (d & 1) != 0;
+            float acc         = 0.0f;
+            for (int row = 0; row < tile_rows; ++row) {
+                const int phys         = gqa_nvfp4_swizzle_byte(row, byte_l);
+                const std::uint8_t cb  = q_codes[row * CodeW + phys];
+                const std::uint8_t nib = hi_nib ? ((cb >> 4) & 0x0fu) : (cb & 0x0fu);
+                acc += gqa_s3_e2m1_value(nib) *
+                       detail::decode_nvfp4_e4m3(q_scale[row * Groups + grp]);
+            }
+            q_mean_s[d] = acc / static_cast<float>(tile_rows);
+        }
+        __syncthreads();
+        for (int kb = warp; kb < key_blocks; kb += kGqaPrefillNvfp4s3Warps) {
+            const int physical_page = block_table[kb];
+            float acc               = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int d = i * 32 + lane;
+                const std::int64_t off = paged_kv_element_offset<4, Geometry::KVHeads>(
+                    physical_page, kv_head, d >> 2, d & 3);
+                acc += q_mean_s[d] * k_mean[off];
+            }
+#pragma unroll
+            for (int r = 16; r; r >>= 1) { acc += __shfl_xor_sync(FullMask, acc, r); }
+            if (lane == 0) { proxy_scores[kb] = acc; }
+        }
+        __syncthreads();
+        // Keep set: top-k tiles by proxy score + attention sinks + sliding window.
+        if (warp == 0) {
+            if (lane == 0) { k_keep_count = 0; }
+            __syncwarp();
+            const int topk = min(static_cast<int>(keep_frac * key_blocks), key_blocks);
+            for (int sel = 0; sel < topk; ++sel) {
+                float best  = -CUDART_INF_F;
+                int best_kb = -1;
+                for (int kb = lane; kb < key_blocks; kb += 32) {
+                    if (proxy_scores[kb] > best) { best = proxy_scores[kb]; best_kb = kb; }
+                }
+#pragma unroll
+                for (int r = 16; r; r >>= 1) {
+                    const float ov = __shfl_xor_sync(FullMask, best, r);
+                    const int ok   = __shfl_xor_sync(FullMask, best_kb, r);
+                    if (ov > best || (ov == best && ok >= 0 && ok < best_kb)) {
+                        best    = ov;
+                        best_kb = ok;
+                    }
+                }
+                if (lane == 0) {
+                    keep_list[k_keep_count++] = best_kb;
+                    proxy_scores[best_kb]     = -CUDART_INF_F;
+                }
+                __syncwarp();
+            }
+            if (lane == 0) {
+                for (int kb = 0; kb < key_blocks; ++kb) {
+                    if ((kb < k_sinks || kb >= key_blocks - k_window) &&
+                        proxy_scores[kb] > -CUDART_INF_F) {
+                        proxy_scores[kb]          = -CUDART_INF_F;
+                        keep_list[k_keep_count++] = kb;
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
+    if (k_keep_count > 0) { issue_kv_tile(keep_list[0] * Bc); ninfer::ops::cp_wait<0>(); }
+    __syncthreads();
+    for (int ki = 0; ki < k_keep_count; ++ki) {
+        const int kb = keep_list[ki];
         const int k0 = kb * Bc;
         if (warp < ProducerWarps) {
             const int row_base = warp * 16;
@@ -541,22 +676,25 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
         } else if (warp < ProducerWarps + VWorkerWarps) {
             // Transpose V codes key-major -> d-major (v_t), feeding the PV B operand.
             const int worker_tid = tid - ProducerWarps * 32;
-            constexpr int VtUnits = D * (Bc / 2);
-#pragma unroll 1
-            for (int unit = worker_tid; unit < VtUnits; unit += WorkerThreads) {
-                const int d  = unit % D;
-                const int kp = unit / D;
-                const std::uint8_t b0 = v_codes[2 * kp * CodeW + (d >> 1)];
-                const std::uint8_t b1 = v_codes[(2 * kp + 1) * CodeW + (d >> 1)];
+            // One worker thread per d-row: write a contiguous 32-byte v_t row so the
+            // store hits distinct SMEM banks. The original unit-strided store placed
+            // every lane's write on the same bank (32-way conflict).
+            for (int d = worker_tid; d < D; d += WorkerThreads) {
+                const int dp = d >> 1;
                 const int sh = (d & 1) * 4;
-                v_t[d * P4Row + kp] = (static_cast<std::uint8_t>(((b1 >> sh) & 0x0Fu) << 4) |
-                                       static_cast<std::uint8_t>(b0 >> sh) & 0x0Fu);
+#pragma unroll 1
+                for (int kp = 0; kp < Bc / 2; ++kp) {
+                    const std::uint8_t b0 = v_codes[2 * kp * CodeW + dp];
+                    const std::uint8_t b1 = v_codes[(2 * kp + 1) * CodeW + dp];
+                    v_t[d * P4Row + kp]   = (static_cast<std::uint8_t>(((b1 >> sh) & 0x0Fu) << 4) |
+                                           static_cast<std::uint8_t>((b0 >> sh) & 0x0Fu));
+                }
             }
         }
         __syncthreads();
 
-        const bool has_next = kb + 1 < key_blocks;
-        if (has_next) { issue_kv_tile((kb + 1) * Bc); }
+        const bool has_next = ki + 1 < k_keep_count;
+        if (has_next) { issue_kv_tile(keep_list[ki + 1] * Bc); }
 
         const int row_tile = warp % kGqaPrefillNvfp4s3RowTiles;
         const int d_slice  = warp / kGqaPrefillNvfp4s3RowTiles;
