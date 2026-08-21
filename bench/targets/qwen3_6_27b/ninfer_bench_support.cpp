@@ -271,7 +271,8 @@ std::string usage_text(std::string_view program) {
         << "  --max-ctx <tokens>          override auto-sized context capacity\n"
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
         << " (default: " << kDefaultPrefillChunk << ")\n"
-        << "  --kv-dtype <bf16|int8|nvfp4> KV cache storage (default: bf16)\n"
+         << "  --kv-dtype <bf16|int8|nvfp4> KV cache storage (default: bf16)\n"
+         << "  --sage                    Sage3-style FP4-PV attention; requires --kv-dtype nvfp4\n"
         << "  --concurrency <1..8>        concurrent Engine lanes (default: 1);\n"
         << "                              pp+tg at C>1 reports batched decode after a sequential\n"
         << "                              prefix-reuse seed so prefill/decode do not interleave\n"
@@ -327,6 +328,8 @@ BenchOptions parse_args(int argc, char** argv) {
             options.prefill_chunk = parse_u32(value("--prefill-chunk"), "prefill-chunk");
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value("--kv-dtype"));
+        } else if (arg == "--sage") {
+            options.sage_attn = true;
         } else if (arg == "--concurrency") {
             options.concurrency = parse_u32(value("--concurrency"), "concurrency");
             if (options.concurrency > kMaximumConcurrency) {
@@ -366,6 +369,9 @@ BenchOptions parse_args(int argc, char** argv) {
     if (!saw_artifact) { throw std::invalid_argument("--weights is required"); }
     if (options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
+    }
+    if (options.sage_attn && options.kv_cache != KvCacheStorage::Nvfp4) {
+        throw std::invalid_argument("--sage requires --kv-dtype nvfp4");
     }
     if (options.proposal_head == ProposalHead::Optimized && options.mtp_draft_tokens == 0) {
         throw std::invalid_argument(
@@ -698,8 +704,9 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "  \"config\": {\n"
         << "    \"max_context\": " << env.max_context << ",\n"
         << "    \"prefill_chunk\": " << env.prefill_chunk << ",\n"
-        << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
-        << "    \"concurrency\": " << env.concurrency << ",\n"
+         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
+         << "    \"sage_attn\": " << (env.sage_attn ? "true" : "false") << ",\n"
+         << "    \"concurrency\": " << env.concurrency << ",\n"
         << "    \"mtp_draft_tokens\": " << env.mtp_draft_tokens << ",\n"
         << "    \"proposal_head\": \"" << proposal_head_name(env.proposal_head) << "\",\n"
         << "    \"use_cuda_graph\": " << (env.use_cuda_graph ? "true" : "false") << ",\n"

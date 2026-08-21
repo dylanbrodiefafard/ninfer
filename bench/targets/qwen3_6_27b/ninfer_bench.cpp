@@ -268,6 +268,7 @@ int main(int argc, char** argv) {
             ninfer::bench::concurrent_kv_capacity_tokens(max_context, options.concurrency));
         engine_options.prefill_chunk = options.prefill_chunk;
         engine_options.kv_cache      = options.kv_cache;
+        engine_options.sage_attn     = options.sage_attn;
         engine_options.speculative.backend       = options.mtp_draft_tokens == 0
                                                        ? ninfer::SpeculativeBackend::None
                                                        : ninfer::SpeculativeBackend::Mtp;
@@ -281,6 +282,7 @@ int main(int argc, char** argv) {
         env.max_context              = max_context;
         env.prefill_chunk            = options.prefill_chunk;
         env.kv_cache                 = options.kv_cache;
+        env.sage_attn                = options.sage_attn;
         env.concurrency              = options.concurrency;
         env.mtp_draft_tokens         = options.mtp_draft_tokens;
         env.proposal_head            = options.proposal_head;
@@ -296,7 +298,8 @@ int main(int argc, char** argv) {
 
         std::cerr << "[ninfer_bench] loading " << options.artifact_path
                   << " (max_context=" << max_context << ", concurrency=" << options.concurrency
-                  << ", kv_cache=" << ninfer::bench::kv_cache_name(options.kv_cache) << ")\n";
+                  << ", kv_cache=" << ninfer::bench::kv_cache_name(options.kv_cache)
+                  << (options.sage_attn ? ", sage_attn=1)\n" : ")\n");
         ninfer::Engine engine(std::move(engine_options));
         fill_cuda_environment(env, options.device);
         env.load   = engine.load_summary();

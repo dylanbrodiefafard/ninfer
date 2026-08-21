@@ -101,6 +101,9 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
     validate_cache_dtype(cache.dtype, cache.quant_group, op);
+    if (cache.sage_pv && cache.dtype != DType::U8) {
+        throw std::invalid_argument(std::string(op) + ": --sage (FP4-PV) requires NVFP4 KV storage");
+    }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
     const std::int32_t logical_pages  = cache.block_table.ne[0];
@@ -146,6 +149,9 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
     validate_cache_dtype(cache.dtype, cache.quant_group, op);
+    if (cache.sage_pv && cache.dtype != DType::U8) {
+        throw std::invalid_argument(std::string(op) + ": --sage (FP4-PV) requires NVFP4 KV storage");
+    }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
     const std::int32_t logical_pages  = cache.block_tables.ne[0];

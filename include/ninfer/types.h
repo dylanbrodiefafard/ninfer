@@ -79,6 +79,8 @@ struct EngineOptions {
     std::uint32_t prefill_chunk        = 4096;
     std::size_t kv_ram_capacity_bytes  = 0;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    // Sage3-style FP4-PV compute recipe (SageAttention3): only issuable with KvCacheStorage::Nvfp4.
+    bool sage_attn                     = false;
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     bool use_cuda_graph = true;
