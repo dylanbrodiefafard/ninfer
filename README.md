@@ -82,15 +82,19 @@ and per-fixture results.
 ## Evaluation
 
 Capability scores were measured through NInfer's OpenAI-compatible serving route with thinking
-enabled, MTP=3, and EvalScope 1.9.0 (0-shot, rule scoring, one sample per problem):
+enabled, MTP=3, and EvalScope 1.9.0 (0-shot, rule scoring, one sample per problem). Qwen3.6 rows
+used INT8 KV. Qwen3.8-27B NVFP4 reports both KV codecs on
+[Ostfralla/Qwen3.8-27B-NVFP4-NInfer](https://huggingface.co/Ostfralla/Qwen3.8-27B-NVFP4-NInfer).
 
-| Model profile | AIME 2025 | AIME 2026 | GPQA-Diamond |
-|---|---:|---:|---:|
-| [Qwen3.6-27B groupwise-int](model-cards/Qwen3.6-27B-NInfer/README.md) | 86.67% | 93.33% | 86.87% |
-| [Qwen3.6-27B NVFP4](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) | 93.33% | 93.33% | 84.34% |
-| [Qwen3.6-35B-A3B groupwise-int](model-cards/Qwen3.6-35B-A3B-NInfer/README.md) | 90.00% | 90.00% | 85.35% |
+| Model profile | KV | AIME 2025 | AIME 2026 | GPQA-Diamond |
+|---|---|---:|---:|---:|
+| [Qwen3.6-27B groupwise-int](model-cards/Qwen3.6-27B-NInfer/README.md) | INT8 | 86.67% | 93.33% | 86.87% |
+| [Qwen3.6-27B NVFP4](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) | INT8 | 93.33% | 93.33% | 84.34% |
+| [Qwen3.6-35B-A3B groupwise-int](model-cards/Qwen3.6-35B-A3B-NInfer/README.md) | INT8 | 90.00% | 90.00% | 85.35% |
+| [Qwen3.8-27B NVFP4](https://huggingface.co/Ostfralla/Qwen3.8-27B-NVFP4-NInfer) | INT8 | 100.00% | 96.67% | 89.90% |
+| [Qwen3.8-27B NVFP4](https://huggingface.co/Ostfralla/Qwen3.8-27B-NVFP4-NInfer) | NVFP4 | 93.33% | 100.00% | 92.42% |
 
-Qwen3.8-27B is supported but has not yet been added to this published evaluation campaign.
+Qwen3.8-27B `groupwise-int` is supported but is not in this evaluation campaign.
 
 These are single-sample results under that NInfer evaluation profile, not pass@k. See the model
 cards and [full performance document](docs/performance.md) for correct/total counts and evaluation
