@@ -30,6 +30,8 @@ struct PagedKVLayerView {
     std::int32_t num_kv_heads = 0;
     DType dtype               = DType::BF16;
     std::int32_t quant_group  = 0;
+    // Sage3-style FP4-PV compute recipe (NVFP4 storage only).
+    bool sage_pv               = false;
 };
 
 /**
@@ -49,6 +51,8 @@ struct PagedKVBatchLayerView {
     std::int32_t num_kv_heads = 0;
     DType dtype               = DType::BF16;
     std::int32_t quant_group  = 0;
+    // Sage3-style FP4-PV compute recipe (NVFP4 storage only).
+    bool sage_pv               = false;
 };
 
 // A pool plane is storage-only. Consumers assign K/V/layer meaning to plane indices.

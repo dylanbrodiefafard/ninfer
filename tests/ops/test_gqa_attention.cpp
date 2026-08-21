@@ -52,6 +52,19 @@ constexpr ReductionCriterion kAttentionNvfp4Criterion{
     /*gross_relative_to_max_reference*/ 8.0e-3,
 };
 
+// The sage (SageAttention3-style) route adds FP4 P-quantization on top of the NVFP4 cache.
+// The FP4 P-quant floor (rel_L2 between the P-quant-emulated host reference and the exact
+// host reference) is 0.053-0.059 across the conformance cases, and a correct kernel sits at
+// ~sqrt(2)*floor from the *independent* host emulation (independent e4m3/e2m1 rounding
+// events), i.e. ~0.075 rel_L2. The max-point (gross) error is correspondingly inflated by the
+// same independent-rounding distance (~0.19 worst case at max_ref~1.06). So this is NOT a tight
+// conformance bound; it is a "correct, no-residual-bug" gate set above the FP4-P floor.
+constexpr ReductionCriterion kAttentionNvfp4s3Criterion{
+    /*relative_l2*/ 9.0e-2,
+    /*gross_absolute*/ 8.0e-2,
+    /*gross_relative_to_max_reference*/ 1.6e-1,
+};
+
 struct Geometry {
     const char* name;
     std::int32_t q_heads;
@@ -183,6 +196,60 @@ std::size_t nvfp4_code_elements(const Geometry& geometry, std::int32_t padded_co
 std::size_t nvfp4_scale_elements(const Geometry& geometry, std::int32_t padded_context) {
     return static_cast<std::size_t>(kNvfp4Groups) * static_cast<std::size_t>(padded_context) *
            static_cast<std::size_t>(geometry.kv_heads);
+}
+
+// Sage (SageAttention3-style) V scale plane: one e4m3 per (d, 16-key block) in d-major
+// order within each page/head chunk of the NVFP4 scale plane (same 16-per-key extent):
+// device plane element (page, head) offset = d * 4 + key_block. The host vector is the
+// (position, leading) layout that scatter_paged maps to the device plane, so the (page, d,
+// key_block) slot lives at host position 64*page + (d*4+key_block)/16.
+std::size_t sage_v_scale_host_index(std::int32_t padded_context, std::int32_t head, std::int32_t page,
+                                    std::int32_t d, std::int32_t key_block) {
+    const std::int32_t e = d * 4 + key_block;
+    return static_cast<std::size_t>(16 * (64 * page + e / 16) + (e % 16)) +
+           static_cast<std::size_t>(kNvfp4Groups) * static_cast<std::int32_t>(padded_context) *
+           static_cast<std::int32_t>(head);
+}
+
+std::uint8_t encode_e2m1_rne(float value) {
+    return static_cast<std::uint8_t>(__nv_cvt_float_to_fp4(value, __NV_E2M1, cudaRoundNearest)) &
+           0x0fu;
+}
+
+std::uint8_t encode_e2m1_rne(float value);
+std::uint8_t encode_e4m3fn_rne(float value);
+double decode_e4m3fn_word(std::uint8_t word);
+
+// Quantize the 16-key block (page, key_block) for one d-pair in the sage layout: one e4m3
+// scale per d (over the 16 keys) and one e2m1 code per key at the NVFP4 code position.
+void encode_sage_v_dp(const Geometry& geometry, std::int32_t padded_context, std::int32_t head,
+                      std::int32_t page, std::int32_t key_block, std::int32_t dp,
+                      const std::vector<float>& logical_v, std::vector<std::uint8_t>& codes,
+                      std::vector<std::uint8_t>& scales) {
+    const std::int32_t d0 = dp * 2;
+    const std::int32_t key0 = page * kPagedKVPageSize + key_block * 16;
+    float max0 = 0.0f;
+    float max1 = 0.0f;
+    for (std::int32_t j = 0; j < 16; ++j) {
+        const std::size_t base = cache_index(geometry, padded_context, head, key0 + j, d0);
+        max0 = std::max(max0, std::abs(logical_v[base]));
+        max1 = std::max(max1, std::abs(logical_v[base + 1]));
+    }
+    const std::uint8_t sc0 = encode_e4m3fn_rne(max0 / 6.0f);
+    const std::uint8_t sc1 = encode_e4m3fn_rne(max1 / 6.0f);
+    const float dec0       = static_cast<float>(decode_e4m3fn_word(sc0));
+    const float dec1       = static_cast<float>(decode_e4m3fn_word(sc1));
+    scales[sage_v_scale_host_index(padded_context, head, page, d0, key_block)]      = sc0;
+    scales[sage_v_scale_host_index(padded_context, head, page, d0 + 1, key_block)]  = sc1;
+    for (std::int32_t j = 0; j < 16; ++j) {
+        const std::size_t base = cache_index(geometry, padded_context, head, key0 + j, d0);
+        const std::size_t code = nvfp4_code_index(geometry, padded_context, head, key0 + j, dp);
+        const float x          = dec0 == 0.0f ? 0.0f : logical_v[base] / dec0;
+        const float y          = dec1 == 0.0f ? 0.0f : logical_v[base + 1] / dec1;
+        codes[code] =
+            static_cast<std::uint8_t>((encode_e2m1_rne(x) & 0x0fu) |
+                                      (static_cast<std::uint32_t>(encode_e2m1_rne(y) & 0x0fu) << 4));
+    }
 }
 
 std::size_t scale_elements(const Geometry& geometry, std::int32_t padded_context) {
@@ -358,6 +425,7 @@ struct HostCache {
     DType dtype;
     std::int32_t max_context;
     std::int32_t logical_capacity;
+    bool sage = false;
     std::vector<std::uint16_t> k_bf16;
     std::vector<std::uint16_t> v_bf16;
     std::vector<std::int8_t> k_i8;
@@ -433,13 +501,14 @@ void encode_nvfp4_group(const std::vector<float>& source, std::size_t source_bas
 }
 
 HostCache make_cache(const Geometry& geometry, DType dtype, std::int32_t max_context,
-                     std::uint32_t seed) {
+                     std::uint32_t seed, bool sage = false) {
     const std::int32_t logical_capacity = align_up_page(max_context);
     const std::size_t elements          = cache_elements(geometry, logical_capacity);
     std::vector<float> logical_k        = make_bf16_values(elements, seed, -0.25f, 0.25f);
     std::vector<float> logical_v        = make_bf16_values(elements, seed + 1u, -1.0f, 1.0f);
 
     HostCache cache{geometry, dtype, max_context, logical_capacity};
+    cache.sage = sage;
     if (dtype == DType::BF16) {
         cache.k_bf16 = to_bf16_bits(logical_k);
         cache.v_bf16 = to_bf16_bits(logical_v);
@@ -450,6 +519,33 @@ HostCache make_cache(const Geometry& geometry, DType dtype, std::int32_t max_con
         cache.v_u8.assign(nvfp4_code_elements(geometry, logical_capacity), 0);
         cache.k_fp8.assign(nvfp4_scale_elements(geometry, logical_capacity), 0);
         cache.v_fp8.assign(nvfp4_scale_elements(geometry, logical_capacity), 0);
+        if (sage) {
+            // K stays in the NVFP4 per-key-group layout; V moves to the sage d-major
+            // per-(d, 16-key block) layout.
+            for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
+                for (std::int32_t position = 0; position < logical_capacity; ++position) {
+                    for (std::int32_t group = 0; group < kNvfp4Groups; ++group) {
+                        const std::int32_t d = group * kNvfp4Group;
+                        const std::size_t source =
+                            cache_index(geometry, logical_capacity, head, position, d);
+                        const std::size_t code =
+                            nvfp4_code_index(geometry, logical_capacity, head, position, group * 8);
+                        const std::size_t scale =
+                            nvfp4_scale_index(geometry, logical_capacity, head, position, group);
+                        encode_nvfp4_group(logical_k, source, cache.k_u8, code, cache.k_fp8, scale);
+                    }
+                }
+                for (std::int32_t page = 0; page < logical_capacity / kPagedKVPageSize; ++page) {
+                    for (std::int32_t key_block = 0; key_block < kPagedKVPageSize / 16; ++key_block) {
+                        for (std::int32_t dp = 0; dp < kNvfp4CodeWidth; ++dp) {
+                            encode_sage_v_dp(geometry, logical_capacity, head, page, key_block, dp,
+                                             logical_v, cache.v_u8, cache.v_fp8);
+                        }
+                    }
+                }
+            }
+            return cache;
+        }
         for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
             for (std::int32_t position = 0; position < logical_capacity; ++position) {
                 for (std::int32_t group = 0; group < kNvfp4Groups; ++group) {
@@ -509,12 +605,73 @@ void append_cache(HostCache& cache, const std::vector<float>& k, const std::vect
                     const std::int32_t d     = group * kNvfp4Group;
                     const std::size_t source = kv_input_index(geometry, head, d, token);
                     const std::size_t target =
-                        nvfp4_code_index(geometry, cache.logical_capacity, head, position,
-                                         group * 8);
+                        nvfp4_code_index(geometry, cache.logical_capacity, head, position, group * 8);
                     const std::size_t scale =
                         nvfp4_scale_index(geometry, cache.logical_capacity, head, position, group);
                     encode_nvfp4_group(k, source, cache.k_u8, target, cache.k_fp8, scale);
-                    encode_nvfp4_group(v, source, cache.v_u8, target, cache.v_fp8, scale);
+                    if (!cache.sage) {
+                        encode_nvfp4_group(v, source, cache.v_u8, target, cache.v_fp8, scale);
+                    }
+                }
+                if (cache.sage) {
+                    // Sage V fill: per-(d, 16-key block) running scale. A new key either fits
+                    // the block's current max or bumps it, in which case the block's earlier
+                    // codes are rescaled (the mma consumes one e4m3 scale per d per block).
+                    // The code byte holds (d0 low, d1 high); each d carries its own scale,
+                    // so rescale once per d-pair with per-nibble factors.
+                    const std::int32_t page = position / kPagedKVPageSize;
+                    const std::int32_t key_block = (position % kPagedKVPageSize) / 16;
+                    const std::int32_t block_key0 = page * kPagedKVPageSize + key_block * 16;
+                    for (std::int32_t dp = 0; dp < kNvfp4CodeWidth; ++dp) {
+                        const std::int32_t d0     = dp * 2;
+                        const float v0            = v[kv_input_index(geometry, head, d0, token)];
+                        const float v1            = v[kv_input_index(geometry, head, d0 + 1, token)];
+                        const std::size_t sc0_off =
+                            sage_v_scale_host_index(cache.logical_capacity, head, page, d0, key_block);
+                        const std::size_t sc1_off =
+                            sage_v_scale_host_index(cache.logical_capacity, head, page, d0 + 1, key_block);
+                        const float s_cur0        = static_cast<float>(decode_e4m3fn_word(cache.v_fp8[sc0_off]));
+                        const float s_cur1        = static_cast<float>(decode_e4m3fn_word(cache.v_fp8[sc1_off]));
+                        const float new_max0      = std::max(std::abs(v0), s_cur0 * 6.0f);
+                        const float new_max1      = std::max(std::abs(v1), s_cur1 * 6.0f);
+                        const bool bumped0        = new_max0 > s_cur0 * 6.0f && new_max0 > 0.0f;
+                        const bool bumped1        = new_max1 > s_cur1 * 6.0f && new_max1 > 0.0f;
+                        if (bumped0) { cache.v_fp8[sc0_off] = encode_e4m3fn_rne(new_max0 / 6.0f); }
+                        if (bumped1) { cache.v_fp8[sc1_off] = encode_e4m3fn_rne(new_max1 / 6.0f); }
+                        const float s0_final =
+                            static_cast<float>(decode_e4m3fn_word(cache.v_fp8[sc0_off]));
+                        const float s1_final =
+                            static_cast<float>(decode_e4m3fn_word(cache.v_fp8[sc1_off]));
+                        const float rescale0 =
+                            (bumped0 && s_cur0 > 0.0f && s0_final > 0.0f) ? s_cur0 / s0_final : 1.0f;
+                        const float rescale1 =
+                            (bumped1 && s_cur1 > 0.0f && s1_final > 0.0f) ? s_cur1 / s1_final : 1.0f;
+                        if (rescale0 != 1.0f || rescale1 != 1.0f) {
+                            for (std::int32_t i = block_key0; i < position; ++i) {
+                                const std::size_t code =
+                                    nvfp4_code_index(geometry, cache.logical_capacity, head, i, dp);
+                                const std::uint8_t byte = cache.v_u8[code];
+                                const float lo          = decode_e2m1_word(byte & 0x0fu) * rescale0;
+                                const float hi          = decode_e2m1_word((byte >> 4) & 0x0fu) * rescale1;
+                                cache.v_u8[code] = static_cast<std::uint8_t>(
+                                    (encode_e2m1_rne(lo) & 0x0fu) |
+                                    (static_cast<std::uint32_t>(encode_e2m1_rne(hi) & 0x0fu) << 4));
+                            }
+                        }
+                        const float c0 = (s0_final > 0.0f) ? v0 / s0_final : 0.0f;
+                        const float c1 = (s1_final > 0.0f) ? v1 / s1_final : 0.0f;
+                        if (std::getenv("SAGE_DUMP") != nullptr) {
+                            std::cerr << "SAGEAPPEND pos=" << position << " head=" << head
+                                      << " dp=" << dp << " v0=" << v0 << " v1=" << v1
+                                      << " s0=" << s0_final << " s1=" << s1_final
+                                      << " c0=" << c0 << " c1=" << c1 << '\n';
+                        }
+                        cache.v_u8[nvfp4_code_index(geometry, cache.logical_capacity, head,
+                                                     position, dp)] =
+                            static_cast<std::uint8_t>(
+                                (encode_e2m1_rne(c0) & 0x0fu) |
+                                (static_cast<std::uint32_t>(encode_e2m1_rne(c1) & 0x0fu) << 4));
+                    }
                 }
                 continue;
             }
@@ -543,7 +700,11 @@ double cache_value(const HostCache& cache, bool key, std::int32_t head, std::int
         const std::size_t packed =
             nvfp4_code_index(cache.geometry, cache.logical_capacity, head, position, d / 2);
         const std::size_t scale =
-            nvfp4_scale_index(cache.geometry, cache.logical_capacity, head, position, d / kNvfp4Group);
+            !key && cache.sage
+                ? sage_v_scale_host_index(cache.logical_capacity, head, position / kPagedKVPageSize,
+                                          d, (position % kPagedKVPageSize) / 16)
+                : nvfp4_scale_index(cache.geometry, cache.logical_capacity, head, position,
+                                    d / kNvfp4Group);
         const auto& codes  = key ? cache.k_u8 : cache.v_u8;
         const auto& scales = key ? cache.k_fp8 : cache.v_fp8;
         const std::uint8_t byte   = codes[packed];
@@ -557,6 +718,220 @@ double cache_value(const HostCache& cache, bool key, std::int32_t head, std::int
     const auto& scales  = key ? cache.k_scale : cache.v_scale;
     const float decoded = static_cast<float>(codes[code]) * f16_bits_to_f32(scales[scale]);
     return static_cast<double>(decoded);
+}
+
+std::vector<double> q_nvfp4_log(const Geometry& geometry, const std::vector<float>& q,
+                                 std::int32_t q_head, std::int32_t token) {
+    // Emulate the kernel's NVFP4 Q-quantization: the QK mma runs on FP4 tensor
+    // cores with per-16-d e4m3 scales + e2m1 codes (the same codec as the KV
+    // cache), returning the dequantized q values the tensor cores see.
+    std::vector<double> q_log(kHeadDim, 0.0);    for (std::int32_t grp = 0; grp < kHeadDim / kNvfp4Group; ++grp) {
+        float absmax = 0.0f;
+        for (std::int32_t i = 0; i < kNvfp4Group; ++i) {
+            const std::int32_t d = grp * kNvfp4Group + i;
+            absmax = std::max(absmax, std::abs(q[q_index(geometry, q_head, d, token)]));
+        }
+        const std::uint8_t scale_bits = encode_e4m3fn_rne(absmax / 6.0f);
+        const float stored_scale = static_cast<float>(decode_e4m3fn_word(scale_bits));
+        for (std::int32_t pair = 0; pair < kNvfp4Group / 2; ++pair) {
+            const std::int32_t d0 = grp * kNvfp4Group + 2 * pair;
+            const std::int32_t d1 = d0 + 1;
+            float x = 0.0f;
+            float y = 0.0f;
+            if (stored_scale != 0.0f) {
+                x = q[q_index(geometry, q_head, d0, token)] / stored_scale;
+                y = q[q_index(geometry, q_head, d1, token)] / stored_scale;
+            }
+            const float2 packed = {x, y};
+            const std::uint8_t code =
+                __nv_cvt_float2_to_fp4x2(packed, __NV_E2M1, cudaRoundNearest);
+            q_log[static_cast<std::size_t>(d0)] =
+                static_cast<double>(decode_e2m1_word(code & 0x0Fu)) * stored_scale;
+            q_log[static_cast<std::size_t>(d1)] =
+                static_cast<double>(decode_e2m1_word((code >> 4) & 0x0Fu)) * stored_scale;
+        }
+    }
+    return q_log;
+}
+
+// Step-exact emulation of the s3 kernel's online-softmax + FP4 P-quant loop in
+// double precision: the ONLY discretization is the e4m3/e2m1 RNE codec rounding
+// (matching the kernel's cvt). The running max updates per tile_keys keys (64
+// prefill / 32 decode) and each 16-key P-block within a tile shares that running
+// max — mirroring the kernel's S-argument exactly. A correct kernel must sit
+// within ~1e-4 of this (its extra error is fp32 exp2/divide/accumulate noise);
+// a residual of O(0.01+) localizes a real kernel bug.
+void sage_orc_pdump(const std::string& label, const std::vector<float>& q, const HostCache& cache,
+                    const std::vector<std::int32_t>& positions) {
+    if (std::getenv("S3_ORC_DUMP") == nullptr) { return; }
+    constexpr double kLog2E = 1.4426950408889634;
+    constexpr double kAmp   = 2688.0;
+    constexpr double kSMax  = 448.0;
+    static const double kPTableEmu[8] = {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0};
+    const Geometry& geometry = cache.geometry;
+    // CTA (q_head=0, q_block=0, kb=0) rows = the first 16 NEW tokens (local
+    // index 0..15) of q_head 0; first tile = keys 0..63 (S-arg = tile max).
+    for (std::int32_t t = 0; t < 16; ++t) {
+        const std::int32_t q_head    = 0;
+        const std::int32_t kv_head   = q_head / geometry.query_group();
+        const std::int32_t q_token   = t;  // local new-token index (q tensor layout)
+        const std::vector<double> q_log = q_nvfp4_log(geometry, q, q_head, q_token);
+        std::vector<double> score(64, 0.0);
+        double m_tile = -std::numeric_limits<double>::infinity();
+        for (std::int32_t k = 0; k < 64; ++k) {
+            double dot = 0.0;
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                dot += q_log[static_cast<std::size_t>(d)] * cache_value(cache, true, kv_head, k, d);
+            }
+            score[static_cast<std::size_t>(k)] = dot * static_cast<double>(kAttentionScale);
+            m_tile                             = std::max(m_tile, score[static_cast<std::size_t>(k)]);
+        }
+        char line[1024] = "";
+        std::snprintf(line, sizeof(line), "S3ORC %s h0 t%02d: m=%.4f s0=%.4f s15=%.4f s16=%.4f s63=%.4f q0=%.4f k0d0=%.4f |",
+                      label.c_str(), t, m_tile, score[0], score[15], score[16], score[63], q_log[0],
+                      cache_value(cache, true, kv_head, 0, 0));
+        std::fprintf(stderr, "%s", line);
+        for (std::int32_t nb = 0; nb < 4; ++nb) {
+            double block_max = -std::numeric_limits<double>::infinity();
+            for (std::int32_t k = 16 * nb; k < 16 * nb + 16; ++k) {
+                block_max = std::max(block_max, score[static_cast<std::size_t>(k)]);
+            }
+            double s_arg = 0.0;
+            if (block_max > -std::numeric_limits<double>::infinity()) {
+                s_arg = kSMax * std::exp2((block_max - m_tile) * kLog2E);
+            }
+            const uint8_t s_bits = static_cast<uint8_t>(encode_e4m3fn_rne(static_cast<float>(s_arg)));
+            const double dec_s   = decode_e4m3fn_word(s_bits);
+            uint8_t bytes[8];
+            for (std::int32_t j = 0; j < 8; ++j) {
+                double ratio0 = 0.0, ratio1 = 0.0;
+                const std::int32_t k0 = 16 * nb + 2 * j, k1 = k0 + 1;
+                if (score[static_cast<std::size_t>(k0)] > -1e300) {
+                    ratio0 = std::min(6.0, kAmp * std::exp2((score[static_cast<std::size_t>(k0)] - m_tile) * kLog2E) / dec_s);
+                }
+                if (score[static_cast<std::size_t>(k1)] > -1e300) {
+                    ratio1 = std::min(6.0, kAmp * std::exp2((score[static_cast<std::size_t>(k1)] - m_tile) * kLog2E) / dec_s);
+                }
+                const uint8_t c0 = encode_e2m1_rne(static_cast<float>(ratio0)) & 0x0Fu;
+                const uint8_t c1 = encode_e2m1_rne(static_cast<float>(ratio1)) & 0x0Fu;
+                bytes[j]         = static_cast<uint8_t>((c1 << 4) | c0);  // even key = low nibble
+            }
+            char seg[96] = "";
+            std::snprintf(seg, sizeof(seg), " b%d c=%02x%02x%02x%02x%02x%02x%02x%02x s=%02x", nb, bytes[0],
+                          bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                          s_bits);
+            std::fprintf(stderr, "%s", seg);
+        }
+        std::fprintf(stderr, "\n");
+    }
+}
+
+std::vector<double> sage_step_emulation(const std::vector<float>& q, const HostCache& cache,
+                                        const std::vector<std::int32_t>& positions,
+                                        std::int32_t tile_keys) {
+    constexpr double kLog2E = 1.4426950408889634;
+    constexpr double kAmp   = 2688.0;
+    constexpr double kSMax  = 448.0;
+    static const double kPTableEmu[8] = {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0};
+    const Geometry& geometry  = cache.geometry;
+    const std::int32_t tokens = static_cast<std::int32_t>(positions.size());
+    std::vector<double> output(static_cast<std::size_t>(kHeadDim) *
+                               static_cast<std::size_t>(geometry.q_heads) *
+                               static_cast<std::size_t>(tokens));
+
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        const std::int32_t visible = positions[static_cast<std::size_t>(token)] + 1;
+        for (std::int32_t q_head = 0; q_head < geometry.q_heads; ++q_head) {
+            const std::int32_t kv_head = q_head / geometry.query_group();
+            const std::vector<double> q_log = q_nvfp4_log(geometry, q, q_head, token);
+
+            std::vector<double> score(visible, 0.0);
+            double m_final              = -std::numeric_limits<double>::infinity();
+            for (std::int32_t position = 0; position < visible; ++position) {
+                double dot = 0.0;
+                for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                    dot += q_log[static_cast<std::size_t>(d)] *
+                           cache_value(cache, true, kv_head, position, d);
+                }
+                score[static_cast<std::size_t>(position)] =
+                    dot * static_cast<double>(kAttentionScale);
+                m_final = std::max(m_final, score[static_cast<std::size_t>(position)]);
+            }
+
+            // Per 16-key block: S-arg from the tile running max (kernel-faithful).
+            struct PBlock {
+                double dec_s;
+                double p[16];  // quantized, amplified, relative to the tile max
+            };
+            const std::int32_t blocks = (visible + 15) / 16;
+            std::vector<PBlock> pb(blocks);
+            double running_m = -std::numeric_limits<double>::infinity();
+            for (std::int32_t t0 = 0; t0 < visible; t0 += tile_keys) {
+                const std::int32_t t1 = std::min(t0 + tile_keys, visible);
+                for (std::int32_t k = t0; k < t1; ++k) {
+                    running_m = std::max(running_m, score[static_cast<std::size_t>(k)]);
+                }
+                for (std::int32_t b = t0; b < t1; b += 16) {
+                    const std::int32_t b1 = std::min(b + 16, visible);
+                    double block_max = 0.0;
+                    for (std::int32_t k = b; k < b1; ++k) {
+                        block_max = std::max(block_max, score[static_cast<std::size_t>(k)]);
+                    }
+                    const std::size_t bi = static_cast<std::size_t>(b / 16);
+                    if (block_max == -std::numeric_limits<double>::infinity()) {
+                        pb[bi].dec_s = 0.0;
+                        continue;
+                    }
+                    const double s_arg =
+                        std::min(kSMax, kSMax * std::exp2((block_max - running_m) * kLog2E));
+                    const std::uint8_t sc =
+                        s_arg == 0.0 ? 0 : encode_e4m3fn_rne(static_cast<float>(s_arg));
+                    pb[bi].dec_s = static_cast<double>(decode_e4m3fn_word(sc));
+                    for (std::int32_t k = b; k < b1; ++k) {
+                        const double p_amp = kAmp *
+                                             std::exp2(
+                                                 (score[static_cast<std::size_t>(k)] - running_m) *
+                                                     kLog2E);
+                        const double ratio =
+                            pb[bi].dec_s == 0.0 ? 0.0 : std::min(6.0, p_amp / pb[bi].dec_s);
+                        pb[bi].p[static_cast<std::size_t>(k - b)] =
+                            static_cast<double>(kPTableEmu[encode_e2m1_rne(
+                                static_cast<float>(ratio)) & 0x0Fu]);
+                    }
+                }
+            }
+
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                double acc = 0.0;
+                double l_sum = 0.0;
+                for (std::int32_t b = 0; b < blocks; ++b) {
+                    const std::int32_t b0 = 16 * b;
+                    const std::int32_t b1 = std::min(b0 + 16, visible);
+                    // Re-derive the tile running max for the rescale factor.
+                    const std::int32_t t0 = (b0 / tile_keys) * tile_keys;
+                    const std::int32_t t1 = std::min(t0 + tile_keys, visible);
+                    double nm_t = -std::numeric_limits<double>::infinity();
+                    for (std::int32_t k = t0; k < t1; ++k) {
+                        nm_t = std::max(nm_t, score[static_cast<std::size_t>(k)]);
+                    }
+                    const double rescale =
+                        std::exp2((nm_t - m_final) * kLog2E);  // 1 for t0 == m_final tile
+                    double pv = 0.0;
+                    for (std::int32_t k = b0; k < b1; ++k) {
+                        pv += pb[static_cast<std::size_t>(b)].p[static_cast<std::size_t>(k - b0)] *
+                              cache_value(cache, false, kv_head, k, d);
+                    }
+                    acc += rescale * pv * pb[static_cast<std::size_t>(b)].dec_s;
+                    for (std::int32_t k = b0; k < b1; ++k) {
+                        l_sum += std::exp2((score[static_cast<std::size_t>(k)] - m_final) * kLog2E);
+                    }
+                }
+                output[q_index(geometry, q_head, d, token)] =
+                    l_sum > 0.0 ? acc / (kAmp * l_sum) : 0.0;
+            }
+        }
+    }
+    return output;
 }
 
 std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache& cache,
@@ -616,10 +991,128 @@ std::vector<T> copy_from_guarded(const GuardedDeviceBuffer& buffer, std::size_t 
     return values;
 }
 
+// Sage (nvfp4s3) reference: exact softmax over the quantized K and Q — the QK
+// mma runs on FP4 tensor cores, so Q is emulated with the same NVFP4 codec as
+// the KV cache (per-16-d e4m3 scale + e2m1 codes) — then the kernel's FP4-PV
+// path emulated: P is quantized to e2m1 with a per-16-key e4m3 block scale
+// (S = e4m3(448*P_block_max), codes = 2688*P/S landing in [0,6]), V stays in
+// FP4 (e2m1 codes + per-(d,16-key) e4m3 scale). The 448*6 amplification cancels
+// in out = acc / L, mirroring the kernel's online-softmax invariant.
+std::vector<double> sage_ideal_attention(const std::vector<float>& q, const HostCache& cache,
+                                         const std::vector<std::int32_t>& positions) {
+    constexpr double kLog2E = 1.4426950408889634;
+    const Geometry& geometry  = cache.geometry;
+    const std::int32_t tokens = static_cast<std::int32_t>(positions.size());
+    std::vector<double> output(static_cast<std::size_t>(kHeadDim) *
+                               static_cast<std::size_t>(geometry.q_heads) *
+                               static_cast<std::size_t>(tokens));
+    constexpr double kAmp    = 2688.0;  // 448 * 6
+    constexpr double kSMax   = 448.0;   // e4m3 max finite
+    constexpr double kPTable[8] = {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0};
+
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        const std::int32_t visible = positions[static_cast<std::size_t>(token)] + 1;
+        for (std::int32_t q_head = 0; q_head < geometry.q_heads; ++q_head) {
+            const std::int32_t kv_head = q_head / geometry.query_group();
+            // Emulate the kernel's NVFP4 Q-quantization: the QK mma runs on FP4
+            // tensor cores with per-16-d e4m3 scales + e2m1 codes (the same codec
+            // as the KV cache), so the reference scores must use the quantized Q.
+            std::vector<double> q_log(kHeadDim, 0.0);
+            for (std::int32_t grp = 0; grp < kHeadDim / kNvfp4Group; ++grp) {
+                float absmax = 0.0f;
+                for (std::int32_t i = 0; i < kNvfp4Group; ++i) {
+                    const std::int32_t d = grp * kNvfp4Group + i;
+                    absmax = std::max(absmax, std::abs(q[q_index(geometry, q_head, d, token)]));
+                }
+                const std::uint8_t scale_bits = encode_e4m3fn_rne(absmax / 6.0f);
+                const float stored_scale = static_cast<float>(decode_e4m3fn_word(scale_bits));
+                for (std::int32_t pair = 0; pair < kNvfp4Group / 2; ++pair) {
+                    const std::int32_t d0 = grp * kNvfp4Group + 2 * pair;
+                    const std::int32_t d1 = d0 + 1;
+                    float x = 0.0f;
+                    float y = 0.0f;
+                    if (stored_scale != 0.0f) {
+                        x = q[q_index(geometry, q_head, d0, token)] / stored_scale;
+                        y = q[q_index(geometry, q_head, d1, token)] / stored_scale;
+                    }
+                    const float2 packed = {x, y};
+                    const std::uint8_t code =
+                        __nv_cvt_float2_to_fp4x2(packed, __NV_E2M1, cudaRoundNearest);
+                    q_log[static_cast<std::size_t>(d0)] =
+                        static_cast<double>(decode_e2m1_word(code & 0x0Fu)) * stored_scale;
+                    q_log[static_cast<std::size_t>(d1)] =
+                        static_cast<double>(decode_e2m1_word((code >> 4) & 0x0Fu)) * stored_scale;
+                }
+            }
+            std::vector<double> p(visible, 0.0);
+            double max_score          = -std::numeric_limits<double>::infinity();
+            for (std::int32_t position = 0; position < visible; ++position) {
+                double dot = 0.0;
+                for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                    dot += q_log[static_cast<std::size_t>(d)] *
+                           cache_value(cache, true, kv_head, position, d);
+                }
+                const double score = dot * static_cast<double>(kAttentionScale);
+                p[static_cast<std::size_t>(position)] = score;  // raw scores first
+                max_score                              = std::max(max_score, score);
+            }
+            double l_sum = 0.0;
+            for (std::int32_t position = 0; position < visible; ++position) {
+                p[static_cast<std::size_t>(position)] =
+                    (p[static_cast<std::size_t>(position)] == -std::numeric_limits<double>::infinity())
+                        ? 0.0
+                        : std::exp2(static_cast<double>(kLog2E) *
+                                     (p[static_cast<std::size_t>(position)] - max_score));
+                l_sum += p[static_cast<std::size_t>(position)];
+            }
+
+            std::vector<double> value(kHeadDim, 0.0);
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                double acc = 0.0;
+                for (std::int32_t kb = 0; kb < visible; kb += 16) {
+                    const std::int32_t k1        = std::min(kb + 16, visible);
+                    double block_max             = 0.0;
+                    for (std::int32_t k = kb; k < k1; ++k) block_max = std::max(block_max, p[static_cast<std::size_t>(k)]);
+                    const std::uint8_t sc =
+                        block_max == 0.0
+                            ? 0
+                            : encode_e4m3fn_rne(static_cast<float>(std::min(kSMax, kSMax * block_max)));
+                    const double s_dec = static_cast<double>(decode_e4m3fn_word(sc));
+                    const double v_dec = static_cast<double>(decode_e4m3fn_word(
+                        cache.v_fp8[sage_v_scale_host_index(cache.logical_capacity, kv_head,
+                                                             kb / kPagedKVPageSize, d,
+                                                             (kb % kPagedKVPageSize) / 16)]));
+                    double pv = 0.0;
+                    for (std::int32_t k = kb; k < k1; ++k) {
+                        const double p_p = s_dec == 0.0
+                                               ? 0.0
+                                               : std::min(6.0, kAmp * p[static_cast<std::size_t>(k)] / s_dec);
+                        const std::uint8_t p_code =
+                            static_cast<std::uint8_t>(encode_e2m1_rne(static_cast<float>(p_p)) & 0x0fu);
+                        const std::size_t v_code_idx =
+                            nvfp4_code_index(geometry, cache.logical_capacity, kv_head, k, d / 2);
+                        const std::uint8_t v_byte  = cache.v_u8[v_code_idx];
+                        const std::uint8_t v_nibble = (d & 1) == 0 ? (v_byte & 0x0fu) : (v_byte >> 4);
+                        pv += kPTable[p_code] * decode_e2m1_word(v_nibble);
+                    }
+                    acc += pv * s_dec * v_dec;
+                }
+                value[static_cast<std::size_t>(d)] = acc;
+            }
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                output[q_index(geometry, q_head, d, token)] =
+                    l_sum > 0.0 ? value[static_cast<std::size_t>(d)] / (kAmp * l_sum) : 0.0;
+            }
+        }
+    }
+    return output;
+}
+
 class DeviceCache {
 public:
     DeviceCache(const HostCache& cache, MappingPattern mapping)
-        : geometry_(cache.geometry), dtype_(cache.dtype), max_context_(cache.max_context),
+        : geometry_(cache.geometry), dtype_(cache.dtype), sage_(cache.sage),
+          max_context_(cache.max_context),
           logical_capacity_(cache.logical_capacity),
           logical_pages_(logical_capacity_ / kPagedKVPageSize),
           physical_pages_(physical_page_count(logical_pages_, mapping)),
@@ -715,6 +1208,7 @@ public:
                        {kNvfp4Groups, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
             result.quant_group = kNvfp4Group;
         }
+        result.sage_pv = sage_;
         return result;
     }
 
@@ -730,6 +1224,7 @@ public:
             .num_kv_heads  = direct.num_kv_heads,
             .dtype         = direct.dtype,
             .quant_group   = direct.quant_group,
+            .sage_pv       = direct.sage_pv,
         };
     }
 
@@ -791,6 +1286,7 @@ public:
 private:
     Geometry geometry_;
     DType dtype_;
+    bool sage_ = false;
     std::int32_t max_context_;
     std::int32_t logical_capacity_;
     std::int32_t logical_pages_;
@@ -1001,6 +1497,71 @@ int verify_cache(const std::string& label, const HostCache& got, const HostCache
         failures += verify_exact((label + " cache-v-code").c_str(), got.v_u8, expected.v_u8);
         failures += verify_exact((label + " cache-k-scale").c_str(), got.k_fp8, expected.k_fp8);
         failures += verify_exact((label + " cache-v-scale").c_str(), got.v_fp8, expected.v_fp8);
+        if (expected.sage && std::getenv("SAGE_DUMP") != nullptr) {
+            auto first_diff = [](const std::vector<std::uint8_t>& a,
+                                 const std::vector<std::uint8_t>& b) -> std::int64_t {
+                const std::size_t n = std::min(a.size(), b.size());
+                for (std::size_t i = 0; i < n; ++i) {
+                    if (a[i] != b[i]) { return static_cast<std::int64_t>(i); }
+                }
+                return -1;
+            };
+            const std::int64_t dc = first_diff(got.v_u8, expected.v_u8);
+            const std::int64_t ds = first_diff(got.v_fp8, expected.v_fp8);
+            const int cap = static_cast<int>(expected.logical_capacity);
+            const int heads = expected.geometry.kv_heads;
+            std::cerr << "SAGE_DUMP v-code diff " << dc << " v-scale diff " << ds << '\n';
+            if (dc >= 0) {
+                const int h = static_cast<int>(dc / (128 * cap));
+                const int rem = static_cast<int>(dc % (128 * cap));
+                const int p = rem / 128;
+                const int dp = rem % 128;
+                std::cerr << "  v-code head=" << h << " pos=" << p << " dp=" << dp
+                          << " device=" << static_cast<int>(got.v_u8[static_cast<std::size_t>(dc)])
+                          << " host=" << static_cast<int>(expected.v_u8[static_cast<std::size_t>(dc)])
+                          << '\n';
+                // Reconstruct the quantization inputs for this (head, dp): the 16-key block's
+                // scale (e4m3) and the host-side |v| lattice so the tie can be inspected.
+                const int kb = p / 16;
+                const std::size_t sd0 =
+                    sage_v_scale_host_index(expected.logical_capacity, h, p / kPagedKVPageSize, dp * 2, kb);
+                const std::size_t sd1 =
+                    sage_v_scale_host_index(expected.logical_capacity, h, p / kPagedKVPageSize, dp * 2 + 1, kb);
+                const float s0h = static_cast<float>(decode_e4m3fn_word(expected.v_fp8[sd0]));
+                const float s1h = static_cast<float>(decode_e4m3fn_word(expected.v_fp8[sd1]));
+                const float s0d = static_cast<float>(decode_e4m3fn_word(got.v_fp8[sd0]));
+                const float s1d = static_cast<float>(decode_e4m3fn_word(got.v_fp8[sd1]));
+                std::cerr << "  scale even-d host=" << s0h << " dev=" << s0d
+                          << "  odd-d host=" << s1h << " dev=" << s1d << "\n";
+            }
+            if (ds >= 0) {
+                const int h = static_cast<int>(ds / (16 * cap));
+                const int rem = static_cast<int>(ds % (16 * cap));
+                const int d   = rem / 4;
+                const int kb  = rem % 4;
+                std::cerr << "  v-scale head=" << h << " d=" << d << " kb=" << kb
+                          << " device=" << static_cast<int>(got.v_fp8[static_cast<std::size_t>(ds)])
+                          << " host=" << static_cast<int>(expected.v_fp8[static_cast<std::size_t>(ds)])
+                          << '\n';
+                // Per-key |v| reconstruction for this (head, d): the block's d-odd
+                // codes live in the high nibble of byte dp = d/2; |value| =
+                // code_val * scale. Print device vs host per key.
+                const int key0 = kb * 16;
+                const int dp   = d / 2;
+                std::cerr << "  per-key |v| (head=" << h << " d=" << d << ", device vs host): ";
+                for (int k = key0; k < key0 + 16; ++k) {
+                    const std::size_t cidx =
+                        static_cast<std::size_t>(h) * 128 * expected.logical_capacity +
+                        static_cast<std::size_t>(k) * 128 + dp;
+                    const unsigned db = got.v_u8[cidx] >> 4;
+                    const unsigned hb = expected.v_u8[cidx] >> 4;
+                    const float dscl = decode_e4m3fn_word(got.v_fp8[static_cast<std::size_t>(ds)]) / 6.0f * 6.0f; // scale*6 = max
+                    (void)dscl;
+                    std::cerr << k << ":[" << (db * 1) << "/" << (hb * 1) << "] ";
+                }
+                std::cerr << "  (e2m1 code vals; dev/host per key 48..63)\n";
+            }
+        }
     } else {
         failures += verify_exact((label + " cache-k-code").c_str(), got.k_i8, expected.k_i8);
         failures += verify_exact((label + " cache-v-code").c_str(), got.v_i8, expected.v_i8);
@@ -1032,9 +1593,11 @@ const char* cache_name(DType dtype) {
     return "int8-g64";
 }
 
-ReductionCriterion attention_criterion(DType dtype) {
+ReductionCriterion attention_criterion(DType dtype, bool sage = false) {
     if (dtype == DType::BF16) { return kAttentionBf16Criterion; }
-    if (dtype == DType::U8) { return kAttentionNvfp4Criterion; }
+    if (dtype == DType::U8) {
+        return sage ? kAttentionNvfp4s3Criterion : kAttentionNvfp4Criterion;
+    }
     return kAttentionInt8Criterion;
 }
 
@@ -1052,6 +1615,50 @@ std::vector<double> twin_cache_attention(const Geometry& geometry, DType twin_dt
     HostCache twin = make_cache(geometry, twin_dtype, max_context, cache_seed);
     if (append_k != nullptr) { append_cache(twin, *append_k, *append_v, positions); }
     return ideal_attention(q, twin, positions);
+}
+
+// FP4-P-quant floor diagnostic (gated by GQA_SAGE_FLOOR=1): for sage cases,
+// print the rel_L2 between the P-quant-emulated reference (sage_ideal_attention)
+// and the exact reference (ideal_attention) — that is the floor any FP4-PV
+// kernel must sit above — plus the device output's rel_L2 against the exact
+// reference. If device-vs-sage-ref ~= floor, the kernel is within the FP4-P
+// quantization floor and the residual is not a kernel bug.
+void sage_floor_report(const std::string& label, const std::vector<double>& actual,
+                      const std::vector<double>& sage_reference, const std::vector<float>& q,
+                      const HostCache& cache, const std::vector<std::int32_t>& positions) {
+    if (std::getenv("GQA_SAGE_FLOOR") == nullptr) { return; }
+    const std::vector<double> exact_reference = ideal_attention(q, cache, positions);
+    const std::int64_t n = static_cast<std::int64_t>(actual.size());
+    const double floor_l2 =
+        compute_reduction_stats(sage_reference.data(), exact_reference.data(), n).relative_l2;
+    const double dev_vs_exact =
+        compute_reduction_stats(actual.data(), exact_reference.data(), n).relative_l2;
+    const double dev_vs_sage =
+        compute_reduction_stats(actual.data(), sage_reference.data(), n).relative_l2;
+    // Step-exact audit: a correct kernel sits within ~1e-4 of the step emulation
+    // (tile 64 = prefill route, tile 32 = decode route); the other granularity
+    // differs only by the S-argument effect (small, bounded).
+    const std::vector<double> step_prefill = sage_step_emulation(q, cache, positions, 64);
+    const std::vector<double> step_decode = sage_step_emulation(q, cache, positions, 32);
+    const double dev_vs_step_prefill =
+        compute_reduction_stats(actual.data(), step_prefill.data(), n).relative_l2;
+    const double dev_vs_step_decode =
+        compute_reduction_stats(actual.data(), step_decode.data(), n).relative_l2;
+    // Host-only cross-check: if the step and closed-form emulations agree with each
+    // other (small), the device's distance from them is a real kernel bug; if the
+    // two emulations disagree at floor scale, one of them has a structural bug.
+    const double step64_vs_sage =
+        compute_reduction_stats(step_prefill.data(), sage_reference.data(), n).relative_l2;
+    const double step32_vs_sage =
+        compute_reduction_stats(step_decode.data(), sage_reference.data(), n).relative_l2;
+    const double step64_vs_exact =
+        compute_reduction_stats(step_prefill.data(), exact_reference.data(), n).relative_l2;
+    sage_orc_pdump(label, q, cache, positions);
+    std::cerr << label << " SAGE_FLOOR: floor=" << floor_l2 << " device_vs_exact=" << dev_vs_exact
+              << " device_vs_sage=" << dev_vs_sage << " dev_vs_step_pref64=" << dev_vs_step_prefill
+              << " dev_vs_step_dec32=" << dev_vs_step_decode << " step64_vs_sage=" << step64_vs_sage
+              << " step32_vs_sage=" << step32_vs_sage << " step64_vs_exact=" << step64_vs_exact
+              << " n=" << n << "\n";
 }
 
 int verify_nvfp4_kernel_inside_codec_gap(const std::string& label,
@@ -1128,7 +1735,8 @@ void inject_codec_edges(const Geometry& geometry, std::int32_t tokens, std::vect
 }
 
 int run_append_case(const Geometry& geometry, DType dtype, MappingPattern mapping,
-                    std::uint32_t seed, std::int32_t tokens = 3, std::int32_t base = 63) {
+                    std::uint32_t seed, std::int32_t tokens = 3, std::int32_t base = 63,
+                    bool sage = false) {
     const std::int32_t max_context = base + tokens + 4;
     const std::size_t elements =
         static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(geometry.kv_heads) * tokens;
@@ -1142,7 +1750,7 @@ int run_append_case(const Geometry& geometry, DType dtype, MappingPattern mappin
         positions[static_cast<std::size_t>(token)] = base + token;
     }
 
-    const HostCache initial = make_cache(geometry, dtype, max_context, seed + 10u);
+    const HostCache initial = make_cache(geometry, dtype, max_context, seed + 10u, sage);
     HostCache expected      = initial;
     append_cache(expected, k, v, positions);
     DeviceCache cache(initial, mapping);
@@ -1160,8 +1768,9 @@ int run_append_case(const Geometry& geometry, DType dtype, MappingPattern mappin
     ops::gqa_kv_append(tk, tv, tp, cache.view(), nullptr);
     cuda_synchronize();
 
-    const std::string label = std::string("gqa_kv_append ") + geometry.name + " " +
-                              cache_name(dtype) + " mapping=" + mapping_name(mapping);
+    const std::string label =
+        std::string("gqa_kv_append ") + geometry.name + " " + cache_name(dtype) +
+        (sage ? "(sage) " : " ") + "mapping=" + mapping_name(mapping);
     int failures = verify_cache(label, cache.snapshot(), expected);
     failures += verify_input(label + " k unchanged", dk, k_bits);
     failures += verify_input(label + " v unchanged", dv, v_bits);
@@ -1171,7 +1780,7 @@ int run_append_case(const Geometry& geometry, DType dtype, MappingPattern mappin
 }
 
 int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test_case,
-                MappingPattern mapping) {
+                MappingPattern mapping, bool sage = false) {
     const std::int32_t total       = test_case.base + test_case.tokens;
     const std::int32_t max_context = static_cast<std::int32_t>(
         std::max<std::uint32_t>(static_cast<std::uint32_t>(total + 3), test_case.envelope_max));
@@ -1184,25 +1793,78 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     std::vector<float> q = make_bf16_values(q_elements, test_case.seed, -0.25f, 0.25f);
     std::vector<float> k = make_bf16_values(kv_elements, test_case.seed + 1u, -0.25f, 0.25f);
     std::vector<float> v = make_bf16_values(kv_elements, test_case.seed + 2u, -1.0f, 1.0f);
+    if (sage && std::getenv("SAGE_DUMP") != nullptr) {
+        const std::int32_t heads = geometry.kv_heads;
+        for (std::int32_t t = 0; t < test_case.tokens; ++t) {
+            std::cerr << "A1_INPUT t=" << t;
+            for (std::int32_t h = 0; h < heads; ++h) {
+                const std::size_t i16 = kv_input_index(geometry, h, 16, t);
+                const std::size_t i17 = kv_input_index(geometry, h, 17, t);
+                const std::size_t i32 = kv_input_index(geometry, h, 32, t);
+                const std::size_t i33 = kv_input_index(geometry, h, 33, t);
+                const std::size_t i29 = kv_input_index(geometry, h, 29, t);
+                const std::size_t i30 = kv_input_index(geometry, h, 30, t);
+                const std::size_t i250 = kv_input_index(geometry, h, 250, t);
+                const std::size_t i251 = kv_input_index(geometry, h, 251, t);
+                std::cerr << " h" << h << " d16=" << v[i16] << " d17=" << v[i17]
+                          << " d29=" << v[i29] << " d30=" << v[i30]
+                          << " d32=" << v[i32] << " d33=" << v[i33]
+                          << " d250=" << v[i250] << " d251=" << v[i251];
+            }
+            std::cerr << '\n';
+        }
+    }
     inject_codec_edges(geometry, test_case.tokens, k, v);
     std::vector<std::int32_t> positions(static_cast<std::size_t>(test_case.tokens));
     for (std::int32_t token = 0; token < test_case.tokens; ++token) {
         positions[static_cast<std::size_t>(token)] = test_case.base + token;
     }
 
-    const HostCache initial = make_cache(geometry, dtype, max_context, test_case.seed + 10u);
+    const HostCache initial = make_cache(geometry, dtype, max_context, test_case.seed + 10u, sage);
     HostCache expected      = initial;
     append_cache(expected, k, v, positions);
-    const std::vector<double> reference = ideal_attention(q, expected, positions);
+    const std::vector<double> reference =
+        sage ? sage_ideal_attention(q, expected, positions)
+             : ideal_attention(q, expected, positions);
     const std::vector<double> int8_reference =
-        dtype == DType::U8 ? twin_cache_attention(geometry, DType::I8, max_context,
-                                                  test_case.seed + 10u, q, positions, &k, &v)
-                           : std::vector<double>{};
+        dtype == DType::U8 && !sage
+            ? twin_cache_attention(geometry, DType::I8, max_context, test_case.seed + 10u, q,
+                                   positions, &k, &v)
+            : std::vector<double>{};
     const std::vector<double> bf16_reference =
-        dtype == DType::U8 ? twin_cache_attention(geometry, DType::BF16, max_context,
-                                                  test_case.seed + 10u, q, positions, &k, &v)
-                           : std::vector<double>{};
+        dtype == DType::U8 && !sage
+            ? twin_cache_attention(geometry, DType::BF16, max_context, test_case.seed + 10u, q,
+                                   positions, &k, &v)
+            : std::vector<double>{};
     DeviceCache cache(initial, mapping);
+    if (sage && std::getenv("SAGE_DUMP") != nullptr) {
+        // Decisive: pre-fill device scale plane vs host make_cache state.
+        const auto pre = cache.snapshot();
+        const std::size_t ns = std::min(pre.v_fp8.size(), initial.v_fp8.size());
+        std::int64_t pre_diff = -1;
+        for (std::size_t i = 0; i < ns; ++i) {
+            if (pre.v_fp8[i] != initial.v_fp8[i]) { pre_diff = static_cast<std::int64_t>(i); break; }
+        }
+        std::cerr << "SAGE_PREFILL_DIFF scale " << pre_diff;
+        if (pre_diff >= 0) {
+            const int h = static_cast<int>(pre_diff / (16 * initial.logical_capacity));
+            const int rem = static_cast<int>(pre_diff % (16 * initial.logical_capacity));
+            std::cerr << " head=" << h << " d=" << rem / 4 << " kb=" << rem % 4
+                      << " device=" << static_cast<int>(pre.v_fp8[static_cast<std::size_t>(pre_diff)])
+                      << " host=" << static_cast<int>(initial.v_fp8[static_cast<std::size_t>(pre_diff)])
+                      << '\n';
+        } else {
+            std::cerr << " (none — initial state matches)\n";
+            const auto sc0 = [&](std::int32_t h, std::int32_t d, std::int32_t kb) {
+                const std::size_t off =
+                    static_cast<std::size_t>(h) * 16 * initial.logical_capacity + d * 4 + kb;
+                return static_cast<int>(initial.v_fp8[off]);
+            };
+            std::cerr << "  init scale h1d29kb3=" << sc0(1, 29, 3)
+                      << " h0d250kb3=" << sc0(0, 250, 3) << " h0d251kb3=" << sc0(0, 251, 3)
+                      << '\n';
+        }
+    }
 
     const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
     const std::vector<std::uint16_t> k_bits = to_bf16_bits(k);
@@ -1235,6 +1897,21 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
+    if (sage && std::getenv("SAGE_DUMP") != nullptr) {
+        // v-input buffer on device vs host at the t=0 (h1,d29) and (h0,d251) slots:
+        const auto dv_bits = copy_from_guarded<std::uint16_t>(dv, v_bits.size());
+        const auto idx = [&](std::int32_t h, std::int32_t d, std::int32_t t) {
+            return static_cast<std::size_t>(d) +
+                   static_cast<std::size_t>(256) *
+                       (static_cast<std::size_t>(h) +
+                        static_cast<std::size_t>(geometry.kv_heads) * static_cast<std::int32_t>(t));
+        };
+        const std::size_t iA = idx(1, 29, 0);
+        const std::size_t iB = idx(0, 251, 0);
+        std::cerr << "SAGE_DV dv[" << iA << "]=" << bf16_to_f32(dv_bits[iA])
+                  << " host=" << v[iA] << " dv[" << iB << "]=" << bf16_to_f32(dv_bits[iB])
+                  << " host=" << v[iB] << '\n';
+    }
     ops::gqa_attention(tq, tk, tv, tp, Tensor{}, ttable_row, kAttentionScale, cache.batch_view(),
                        envelope, workspace, tout, nullptr);
     cuda_synchronize();
@@ -1243,8 +1920,9 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     const std::vector<std::uint16_t> output_bits =
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
     const std::vector<double> actual = bf16_bits_to_double(output_bits);
-    int failures = verify_attention(label, actual, reference, attention_criterion(dtype));
-    if (dtype == DType::U8) {
+    int failures = verify_attention(label, actual, reference, attention_criterion(dtype, sage));
+    if (sage) { sage_floor_report(label, actual, reference, q, expected, positions); }
+    if (dtype == DType::U8 && !sage) {
         failures += verify_nvfp4_kernel_inside_codec_gap(label, actual, reference, int8_reference,
                                                          bf16_reference);
     }
@@ -1265,7 +1943,7 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
 }
 
 int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test_case,
-                MappingPattern mapping) {
+                MappingPattern mapping, bool sage = false) {
     const std::int32_t total       = test_case.base + test_case.tokens;
     const std::int32_t max_context = static_cast<std::int32_t>(
         std::max<std::uint32_t>(static_cast<std::uint32_t>(total + 3), test_case.envelope_max));
@@ -1278,16 +1956,21 @@ int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test
         positions[static_cast<std::size_t>(token)] = test_case.base + token;
     }
 
-    const HostCache cache_host = make_cache(geometry, dtype, max_context, test_case.seed + 10u);
-    const std::vector<double> reference = ideal_attention(q, cache_host, positions);
+    const HostCache cache_host =
+        make_cache(geometry, dtype, max_context, test_case.seed + 10u, sage);
+    const std::vector<double> reference =
+        sage ? sage_ideal_attention(q, cache_host, positions)
+             : ideal_attention(q, cache_host, positions);
     const std::vector<double> int8_reference =
-        dtype == DType::U8 ? twin_cache_attention(geometry, DType::I8, max_context,
-                                                  test_case.seed + 10u, q, positions)
-                           : std::vector<double>{};
+        dtype == DType::U8 && !sage
+            ? twin_cache_attention(geometry, DType::I8, max_context, test_case.seed + 10u, q,
+                                   positions)
+            : std::vector<double>{};
     const std::vector<double> bf16_reference =
-        dtype == DType::U8 ? twin_cache_attention(geometry, DType::BF16, max_context,
-                                                  test_case.seed + 10u, q, positions)
-                           : std::vector<double>{};
+        dtype == DType::U8 && !sage
+            ? twin_cache_attention(geometry, DType::BF16, max_context, test_case.seed + 10u, q,
+                                   positions)
+            : std::vector<double>{};
     DeviceCache cache(cache_host, mapping);
 
     const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
@@ -1313,13 +1996,13 @@ int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test
                               nullptr);
     cuda_synchronize();
 
-    const std::string label =
-        case_label("gqa_attention_cached", geometry, dtype, test_case, mapping);
+    const std::string label = case_label("gqa_attention_cached", geometry, dtype, test_case, mapping);
     const std::vector<std::uint16_t> output_bits =
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
     const std::vector<double> actual = bf16_bits_to_double(output_bits);
-    int failures = verify_attention(label, actual, reference, attention_criterion(dtype));
-    if (dtype == DType::U8) {
+    int failures = verify_attention(label, actual, reference, attention_criterion(dtype, sage));
+    if (sage) { sage_floor_report(label, actual, reference, q, cache_host, positions); }
+    if (dtype == DType::U8 && !sage) {
         failures += verify_nvfp4_kernel_inside_codec_gap(label, actual, reference, int8_reference,
                                                          bf16_reference);
     }
@@ -1548,38 +2231,42 @@ int run_batch_cases() {
 
 int run_geometry(const Geometry& geometry) {
     int failures = 0;
+    const bool sage_only = std::getenv("GQA_SAGE_ONLY") != nullptr;
     for (const DType dtype : {DType::BF16, DType::I8, DType::U8}) {
+        if (sage_only && dtype != DType::U8) { continue; }
         for (const MappingPattern mapping :
              {MappingPattern::Identity, MappingPattern::Offset, MappingPattern::Fragmented}) {
-            failures += run_append_case(geometry, dtype, mapping, 100u + geometry.q_heads);
-            failures += run_a1_case(geometry, dtype, {6, 61, 67, 190u}, mapping);
-            failures += run_a3_case(geometry, dtype, {1, 128, 129, 191u}, mapping);
+            if (!sage_only) {
+                failures += run_append_case(geometry, dtype, mapping, 100u + geometry.q_heads);
+                failures += run_a1_case(geometry, dtype, {6, 61, 67, 190u}, mapping);
+                failures += run_a3_case(geometry, dtype, {1, 128, 129, 191u}, mapping);
+            }
         }
-        if (dtype == DType::I8 || dtype == DType::U8) {
+        if ((dtype == DType::I8 || dtype == DType::U8) && !sage_only) {
             failures += run_append_case(geometry, dtype, MappingPattern::Fragmented,
                                         150u + geometry.q_heads, 129, 61);
         }
 
-        const AttentionCase a1_cases[] = {
+        if (!sage_only) {
+            const AttentionCase a1_cases[] = {
             {1, 0, 1, 201u},    {6, 17, 23, 202u},   {7, 17, 512, 203u},
             {17, 31, 48, 204u}, {66, 63, 129, 205u},
         };
-        for (const AttentionCase& test_case : a1_cases) {
-            failures += run_a1_case(geometry, dtype, test_case, MappingPattern::Identity);
+            for (const AttentionCase& test_case : a1_cases) {
+                failures += run_a1_case(geometry, dtype, test_case, MappingPattern::Identity);
+            }
+
+            const AttentionCase a3_cases[] = {
+                {1, 31, 32, 301u},
+                {7, 17, 512, 302u},
+                {17, 31, 48, 303u},
+            };
+            for (const AttentionCase& test_case : a3_cases) {
+                failures += run_a3_case(geometry, dtype, test_case, MappingPattern::Identity);
+            }
         }
 
-        const AttentionCase a3_cases[] = {
-            {1, 31, 32, 301u},
-            {7, 17, 512, 302u},
-            {17, 31, 48, 303u},
-        };
-        for (const AttentionCase& test_case : a3_cases) {
-            failures += run_a3_case(geometry, dtype, test_case, MappingPattern::Identity);
-        }
-
-        if (dtype == DType::U8) {
-            // Br=128 full query tiles and the unmasked K-tile shortcut (T=66 never
-            // filled a CTA). T=4 is the MTP decode tile, including occupancy-2.
+        if (dtype == DType::U8 && !sage_only) {
             failures +=
                 run_a1_case(geometry, dtype, {128, 64, 256, 210u}, MappingPattern::Identity);
             failures +=
@@ -1594,7 +2281,34 @@ int run_geometry(const Geometry& geometry) {
                 run_a3_case(geometry, dtype, {4, 2048, 4096, 312u}, MappingPattern::Fragmented);
         }
 
-        if (geometry.q_heads == 16) {
+        if (dtype == DType::U8) {
+            // Sage (SageAttention3-style FP4-PV) pass: d-major V-scale cache + FP4 PV GEMM.
+            // The fill case byte-checks the running-max rescale; A1 covers the prefill s3
+            // kernel (fill + attention); A3 T=4 covers the decode s3 partial (Bc=32 and the
+            // Bc=64 dynamic-arena tier).
+            failures += run_append_case(geometry, dtype, MappingPattern::Identity, 500u +
+                                                                                           geometry.q_heads,
+                                        3, 57, /*sage=*/true);
+            failures += run_append_case(geometry, dtype, MappingPattern::Identity, 501u +
+                                                                                           geometry.q_heads,
+                                        3, 121, /*sage=*/true);
+            failures += run_a1_case(geometry, dtype, {6, 55, 64, 510u}, MappingPattern::Identity,
+                                    /*sage=*/true);
+            failures += run_a1_case(geometry, dtype, {128, 64, 256, 511u}, MappingPattern::Identity,
+                                    /*sage=*/true);
+            failures +=
+                run_a3_case(geometry, dtype, {4, 512, 1024, 512u}, MappingPattern::Identity,
+                            /*sage=*/true);
+            failures +=
+                run_a3_case(geometry, dtype, {4, 2048, 4096, 513u}, MappingPattern::Identity,
+                            /*sage=*/true);
+            failures +=
+                run_a1_case(geometry, dtype, {12, 0, 64, 514u}, MappingPattern::Identity, true);
+            failures +=
+                run_a1_case(geometry, dtype, {128, 0, 128, 515u}, MappingPattern::Identity, true);
+        }
+
+        if (geometry.q_heads == 16 && !sage_only) {
             // Loose execution envelopes straddle the two registered host-resource frontiers.
             // Device positions, not these bounds, continue to define the oracle result.
             failures += run_a1_case(geometry, dtype, {7, 17, 513, 401u}, MappingPattern::Identity);
