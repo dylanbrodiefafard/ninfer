@@ -725,22 +725,17 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             schedule::VisionContext::output_transient_bytes(merged);
     }
     if (impl->use_cuda_graph) {
-        // Definitions remain per execution profile, but only one executable is instantiated for
-        // each reachable node-topology class. These bounds cover the largest profile installed in
-        // each class and the driver/module state materialized while qualifying all definitions.
+        // Allowance is per instantiated executable, not per context-bucket definition. Program
+        // folds exact B into topology_class. Ordinary/MTP planned profiles share class 0, so this
+        // is 12 MiB × C. DFlash may instantiate several classes per B; those still use 64 MiB each.
         if (impl->speculative_backend == SpeculativeBackend::None) {
             impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
                                                       "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
+            // Same 12 MiB executable bound as ordinary decode. Context buckets share class 0.
             const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
             const std::size_t per_batch_allowance = graph_topology_allowance(
-                profiles,
-                [&](GraphExecutionProfile profile) {
-                    const std::uint64_t final_visible = std::min<std::uint64_t>(
-                        impl->capacity,
-                        static_cast<std::uint64_t>(profile.max) + 2ULL * impl->draft_window);
-                    return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
-                },
+                profiles, [&](GraphExecutionProfile) { return 12ULL * kMiB; },
                 "MTP graph allowance");
             impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
                                                       "MTP exact-b graph allowance");
@@ -750,12 +745,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     dflash_graph_profiles(impl->capacity, impl->draft_window, batch_size);
                 return graph_topology_allowance(
                     profiles,
-                    [&](GraphExecutionProfile profile) {
-                        const std::uint64_t final_visible = std::min<std::uint64_t>(
-                            impl->capacity,
-                            static_cast<std::uint64_t>(profile.max) + impl->draft_window + 1ULL);
-                        return (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
-                    },
+                    [&](GraphExecutionProfile) { return 64ULL * kMiB; },
                     "DFlash graph allowance");
             };
             for (std::uint32_t batch_size = 1; batch_size <= impl->max_concurrency; ++batch_size) {
