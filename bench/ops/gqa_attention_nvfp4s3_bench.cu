@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <vector>
 
+
 using namespace ninfer;
 using namespace ninfer::ops;
 using namespace ninfer::bench;
@@ -41,11 +42,11 @@ constexpr int kCodeW       = kGqaNvfp4CodeWidth;  // 128 bytes/key
 constexpr int kGroups      = kGqaNvfp4Groups;     // 16 e4m3 scales/key
 constexpr int kPageSize  = kPagedKVPageSize;    // 64
 constexpr int kQueryWin  = 4096;                  // = production NINFER_PREFILL_CHUNK
-constexpr float kScale    = 0.08838834764831844f;  // 1/sqrt(head_dim)
+constexpr float kScale    = 0.0625f;  // 1/sqrt(head_dim) = 1/16
 
 // Owns the U8 cache planes + the PagedKVLayerView that the launchers consume.
 struct Nvfp4s3Cache {
-    DeviceBuffer k_pages, v_pages, k_scale, v_scale, block_table;
+    DeviceBuffer k_pages, v_pages, k_scale, v_scale, k_mean, block_table;
     PagedKVLayerView view;
     int logical_pages  = 0;
     int physical_pages = 0;
@@ -68,11 +69,13 @@ Nvfp4s3Cache make_cache(int context) {
     cache.v_pages = DeviceBuffer(code_bytes);
     cache.k_scale = DeviceBuffer(scale_bytes);
     cache.v_scale = DeviceBuffer(scale_bytes);
+    cache.k_mean  = DeviceBuffer(static_cast<std::size_t>(4) * kPageSize * kKVHeads * physical_pages * sizeof(float));
     cache.block_table = DeviceBuffer(table_bytes);
     cache.k_pages.fill(0);
     cache.v_pages.fill(0);
     cache.k_scale.fill(0);
     cache.v_scale.fill(0);
+    cache.k_mean.fill(0);
 
     std::vector<std::int32_t> h_table(logical_pages);
     for (int p = 0; p < logical_pages; ++p) h_table[p] = p;
@@ -83,6 +86,7 @@ Nvfp4s3Cache make_cache(int context) {
     cache.view.v_pages       = Tensor(cache.v_pages.p, DType::U8, {kCodeW, kPageSize, kKVHeads, physical_pages});
     cache.view.k_scale_pages = Tensor(cache.k_scale.p, DType::FP8_E4M3FN, {kGroups, kPageSize, kKVHeads, physical_pages});
     cache.view.v_scale_pages = Tensor(cache.v_scale.p, DType::FP8_E4M3FN, {kGroups, kPageSize, kKVHeads, physical_pages});
+    cache.view.k_mean_pages  = Tensor(cache.k_mean.p, DType::FP32, {4, kPageSize, kKVHeads, physical_pages});
     cache.view.block_table   = Tensor(cache.block_table.p, DType::I32, {logical_pages});
     cache.view.head_dim      = kHeadDim;
     cache.view.num_kv_heads = kKVHeads;
@@ -97,6 +101,17 @@ Nvfp4s3Cache make_cache(int context) {
 int main() {
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreate(&stream));
+
+    // keep_frac: fraction of key tiles kept, in (0, 1]. 1.0 = keep all (exact);
+    // keep_frac<1 enables sage_pv tile-skip (needs the k_mean plane).
+    float keep_frac = 1.0f;
+    if (const char* e = std::getenv("NINFER_KEEP_FRAC")) keep_frac = std::strtof(e, nullptr);
+    if (!(keep_frac > 0.0f && keep_frac <= 1.0f)) {
+        std::fprintf(stderr, "NINFER_KEEP_FRAC must be in (0, 1]; got %.3f; using 1.0 (keep all)\n",
+                    keep_frac);
+        keep_frac = 1.0f;
+    }
+    std::printf("keep_frac=%.3f\n", keep_frac);
 
     std::printf("ninfer gqa-attention nvfp4s3 bench (geom=27B q=%d kv=%d hdim=%d code=%d groups=%d window=%d)\n",
                  kQHeads, kKVHeads, kHeadDim, kCodeW, kGroups, kQueryWin);
@@ -138,9 +153,10 @@ int main() {
         Tensor pos_q_t = Tensor(pos_q.p, DType::I32, {kQueryWin});
         Tensor out_t = Tensor(out_buf.p, DType::BF16, {kHeadDim, kQHeads, kQueryWin});
         auto attn_launch = [&](cudaStream_t s) {
-            detail::gqa_attention_prompt_attention_launch(q_t, pos_q_t, kScale, cache.view, out_t, s);
+            detail::gqa_attention_prompt_attention_launch(q_t, pos_q_t, kScale, cache.view, out_t, s, keep_frac);
         };
         const ColdTiming attn = measure_launch(attn_launch, stream, 8, 64);
+
 
         // GB/s moved by the attention kernel: read the K+V codes + scales for `context` keys
         // (per query row) plus the q/out traffic. (Informational; ncu is the real gate.)

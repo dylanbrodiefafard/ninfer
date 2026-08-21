@@ -25,6 +25,9 @@ struct PagedKVLayerView {
     Tensor v_pages;
     Tensor k_scale_pages;
     Tensor v_scale_pages;
+    // Sage-style per-page (64-key tile) dequantized K sum for the meansim proxy
+    // [4][64][kv_heads][pages]; sum[d] = (page_offset=d/4)*4 + d%4. sage_pv only.
+    Tensor k_mean_pages;
     Tensor block_table;
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
@@ -46,6 +49,7 @@ struct PagedKVBatchLayerView {
     Tensor v_pages;
     Tensor k_scale_pages;
     Tensor v_scale_pages;
+    Tensor k_mean_pages;
     Tensor block_tables;
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;

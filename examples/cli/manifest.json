@@ -303,12 +303,44 @@
       }
     },
     {
+      "name": "long_niah_100k",
+      "messages": "messages/long_niah_100k.json",
+      "messages_sha256": "b3509749571314662c6eb485b593b9c78438165f64ee0034819c15118d930468",
+      "kind": "long_context_niah",
+      "thinking": false,
+      "prompt_tokens": 100989,
+      "needle_depth_percent": 50,
+      "max_context": 262144,
+      "max_new": 128,
+      "kv_dtype": "int8",
+      "oracle": {
+        "mode": "exact",
+        "stdout": "ORCHID=493817; COLOR=COBALT"
+      }
+    },
+    {
       "name": "long_niah_128k",
       "messages": "messages/long_niah_128k.json",
       "messages_sha256": "8dcece5215805293490baa0d8204d59a899d8bc3f9d010b0c142ed6624260a9a",
       "kind": "long_context_niah",
       "thinking": false,
       "prompt_tokens": 130048,
+      "needle_depth_percent": 50,
+      "max_context": 262144,
+      "max_new": 128,
+      "kv_dtype": "int8",
+      "oracle": {
+        "mode": "exact",
+        "stdout": "ORCHID=493817; COLOR=COBALT"
+      }
+    },
+    {
+      "name": "long_niah_150k",
+      "messages": "messages/long_niah_150k.json",
+      "messages_sha256": "4e4be08527b8f35123f24376e5f596aeb7f74b7608ac97c011f34a5024d275be",
+      "kind": "long_context_niah",
+      "thinking": false,
+      "prompt_tokens": 151473,
       "needle_depth_percent": 50,
       "max_context": 262144,
       "max_new": 128,

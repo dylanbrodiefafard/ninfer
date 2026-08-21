@@ -101,7 +101,10 @@ gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
 void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
                    const Tensor& valid_columns, const Tensor& kv_table_rows, float scale,
                    PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
-                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
+                    // keep_frac: fraction of key tiles kept, in (0, 1]. 1.0 = keep all (exact);
+                    // keep_frac<1 enables sage_pv tile-skip (needs the k_mean plane); <=0 invalid.
+                    float keep_frac = 1.0f);
 
 /**
  * A2: perform only the cache-write part of A1. k/v are contiguous BF16 `[256,4|2,T]`, positions is

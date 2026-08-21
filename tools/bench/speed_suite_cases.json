@@ -50,14 +50,22 @@
    "fixture": "examples/cli/messages/long_niah_8k.json",
    "desc": "8k-token NIAH fixture, thinking off, prefill-bound"
   },
-  {
-   "id": "context_64k",
-   "suite": "context",
-   "thinking": false,
-   "max_tokens": 64,
-   "fixture": "examples/cli/messages/long_niah_64k.json",
-   "desc": "64k-token NIAH fixture (~64.5k prompt tokens), thinking off; long-context regression catch (base set)"
-  },
+   {
+    "id": "context_64k",
+    "suite": "context",
+    "thinking": false,
+    "max_tokens": 64,
+    "fixture": "examples/cli/messages/long_niah_64k.json",
+    "desc": "64k-token NIAH fixture (~64.5k prompt tokens), thinking off; long-context regression catch (base set)"
+   },
+   {
+    "id": "context_100k",
+    "suite": "context",
+    "thinking": false,
+    "max_tokens": 64,
+    "fixture": "examples/cli/messages/long_niah_100k.json",
+    "desc": "~100k-token NIAH fixture (~101k prompt tokens), thinking off; mid-context regression catch (base set)"
+   },
   {
    "id": "decode_think",
    "suite": "decode",
@@ -74,14 +82,23 @@
    "prompt": "Write a detailed explanation of how a paged KV cache works in a modern LLM inference engine. Cover the virtual-memory analogy, the block table, allocation and freeing, prefix sharing between requests, and how fragmentation is avoided. End with a short concrete example of how one request's KV is laid out across blocks.",
    "desc": "Small prompt, thinking off, long generation (768 tokens; presence_penalty=1.5 legacy path)"
   },
-  {
-   "id": "context_128k",
-   "suite": "context",
-   "thinking": false,
-   "max_tokens": 64,
-   "slow": true,
-   "fixture": "examples/cli/messages/long_niah_128k.json",
-   "desc": "128k-char NIAH fixture (~140k prompt tokens); --include-slow only"
-  }
+   {
+    "id": "context_128k",
+    "suite": "context",
+    "thinking": false,
+    "max_tokens": 64,
+    "slow": true,
+    "fixture": "examples/cli/messages/long_niah_128k.json",
+    "desc": "128k-char NIAH fixture (~140k prompt tokens); --include-slow only"
+   },
+   {
+    "id": "context_150k",
+    "suite": "context",
+    "thinking": false,
+    "max_tokens": 64,
+    "slow": true,
+    "fixture": "examples/cli/messages/long_niah_150k.json",
+    "desc": "~150k-token NIAH fixture (~151k prompt tokens); --include-slow only"
+   }
  ]
 }
