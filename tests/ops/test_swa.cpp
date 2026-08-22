@@ -329,8 +329,8 @@ int run_batch_case() {
 
 int main() {
     if (cuda_unavailable()) {
-        std::cout << "SKIP: CUDA device unavailable\n";
-        return 77;
+        std::cerr << "FAIL: no usable CUDA device\n";
+        return 1;
     }
 
     int failures = 0;

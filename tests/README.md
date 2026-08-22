@@ -57,6 +57,9 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
+GPU tests fail if there is no usable CUDA device. CTest skip (`77`) is only for
+opt-in real-artifact Engine tests when the corresponding weights env is unset.
+
 Run a focused target for a localized change:
 
 ```bash

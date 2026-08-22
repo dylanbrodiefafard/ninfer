@@ -115,8 +115,8 @@ int run_batch_case() {
 
 int main() {
     if (cuda_unavailable()) {
-        std::cout << "prepare_masked_block: SKIP (CUDA unavailable)\n";
-        return 77;
+        std::cerr << "FAIL: no usable CUDA device\n";
+        return 1;
     }
 
     int failures = 0;
