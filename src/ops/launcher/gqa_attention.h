@@ -49,15 +49,17 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& position
                                          cudaStream_t stream);
 
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
-                                  const Tensor& positions, const Tensor& valid_columns,
-                                  const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
-                                  Tensor& out, cudaStream_t stream, float keep_frac = 1.0f);
+                                 const Tensor& positions, const Tensor& valid_columns,
+                                 const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
+                                 Tensor& out, cudaStream_t stream, float keep_frac = 1.0f,
+                                 GqaS3PrefillDump* dump = nullptr);
 
 void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                           PagedKVLayerView cache, cudaStream_t stream);
 
 void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positions, float scale,
-                                            const PagedKVLayerView& cache, Tensor& out,
-                                            cudaStream_t stream, float keep_frac = 1.0f);
+                                           const PagedKVLayerView& cache, Tensor& out,
+                                           cudaStream_t stream, float keep_frac = 1.0f,
+                                           GqaS3PrefillDump* dump = nullptr);
 
 } // namespace ninfer::ops::detail

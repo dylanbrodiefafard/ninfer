@@ -124,4 +124,41 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
                           const PagedKVLayerView& cache, GqaExecutionEnvelope envelope,
                           WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
 
+/**
+ * Dev/test side-band for the SageAttention3 (nvfp4s3) prefill kernel (the tools/kdev
+ * op-dump tooling). Not part of the production API: the production path never sees a
+ * non-null dump, so the pointers below are never dereferenced on it.
+ *
+ * The caller supplies device arrays sized for grid q_block 0 (q_block > 0 is not
+ * dumped), indexed [q_head][tile][...], with `max_tiles` = div_up(envelope_max, 64)
+ * (key tile Bc=64). All values are the kernel's named intermediates, captured at the
+ * stage where the kernel computes them, so a diff against the FP64 step-exact
+ * reference localizes the first divergent stage (QK score vs P-quant codes vs V
+ * scale vs online-softmax m/l vs PV acc) without editing the kernel.
+ */
+struct GqaS3PrefillDump {
+    int max_tiles; // [h][t] stride (>= the actual key-tile count)
+    float* score; // [h][t][128 rows][64 keys] raw QK dot (pre-scale); -INFINITY = causally masked key
+    std::uint8_t* p_code; // [h][t][128][64] e2m1 P-quant nibble (0..7); 0xFF = masked key
+    std::uint8_t* psf; // [h][t][128][4] e4m3 P-block scale byte (per 16-key block)
+    std::uint8_t* v_scale; // [h][t][256 d][4] e4m3 V-block scale byte (per (d, 16-key block))
+    std::uint8_t* v_t; // [h][t][256 d][32] transposed V-code B operand (per tile)
+    float* m; // [h][t][128] running max after the tile (raw score domain)
+    float* l; // [h][t][128] running L after the tile (amplified, tile frame)
+    float* acc; // [h][t][128][256] PV accumulator after the tile (tile frame, pre-normalize)
+    std::int32_t* keep_list; // [h][max_tiles] kept key-tile index (valid up to tile_count)
+    std::int32_t* tile_count; // [h] tiles actually processed
+};
+
+// Runs the same prompt fill + attention as gqa_attention (A1 Prompt route) and
+// writes the named s3 intermediates into `dump` on the Sage (U8 + sage_pv) cache.
+// Throws on the SmallT/ChunkedSmallT routes or on a non-sage cache, where the s3
+// prefill kernel does not run and the dump would silently stay empty.
+void gqa_attention_s3_dump(const Tensor& q, const Tensor& k, const Tensor& v,
+                           const Tensor& positions, const Tensor& valid_columns,
+                           const Tensor& kv_table_rows, float scale,
+                           PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
+                           WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
+                           float keep_frac, GqaS3PrefillDump& dump);
+
 } // namespace ninfer::ops
