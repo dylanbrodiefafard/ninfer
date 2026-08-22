@@ -510,4 +510,37 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
     detail::gqa_attention_prompt_attention_launch(q, positions, scale, cache, out, stream);
 }
 
+void gqa_attention_s3_dump(const Tensor& q, const Tensor& k, const Tensor& v,
+                           const Tensor& positions, const Tensor& valid_columns,
+                           const Tensor& kv_table_rows, float scale, PagedKVBatchLayerView cache,
+                           GqaExecutionEnvelope envelope, WorkspaceArena& workspace, Tensor& out,
+                           cudaStream_t stream, float keep_frac, GqaS3PrefillDump& dump) {
+    constexpr const char* op = "gqa_attention";
+    validate_batched_attention_tensors(q, positions, valid_columns, kv_table_rows, out, cache,
+                                       envelope, scale, op);
+    if (k.dtype != DType::BF16 || v.dtype != DType::BF16) {
+        throw std::invalid_argument("gqa_attention_s3_dump: k/v must be BF16");
+    }
+    const std::int32_t width    = q.ne[2];
+    const std::int32_t batch    = q.ne[3];
+    const std::int32_t kv_heads = kv_heads_for_q_heads(q.ne[1], op);
+    require_shape(k, kHeadDim, kv_heads, width, batch, op, "k");
+    require_shape(v, kHeadDim, kv_heads, width, batch, op, "v");
+    require_contiguous_nonnull(k, op, "k");
+    require_contiguous_nonnull(v, op, "v");
+    const detail::GqaAttentionRoute route =
+        detail::gqa_attention_resolve_route(q.ne[1], width, batch, envelope);
+    if (route != detail::GqaAttentionRoute::Prompt) {
+        throw std::invalid_argument(
+            "gqa_attention_s3_dump: the s3 prefill kernel only runs on the Prompt "
+            "route (T > 6); the dump would silently stay empty");
+    }
+    if (cache.dtype != DType::U8 || !cache.sage_pv) {
+        throw std::invalid_argument("gqa_attention_s3_dump: requires a Sage (U8 + sage_pv) cache");
+    }
+    auto scope = workspace.scope();
+    detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
+                                       cache, out, stream, keep_frac, &dump);
+}
+
 } // namespace ninfer::ops

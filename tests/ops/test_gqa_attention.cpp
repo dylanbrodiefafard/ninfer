@@ -12,9 +12,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <span>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -1198,6 +1203,15 @@ public:
             v_.copy_from_host(v_physical.data(), v_physical.size());
             k_scale_.copy_from_host(ks_physical.data(), ks_physical.size());
             v_scale_.copy_from_host(vs_physical.data(), vs_physical.size());
+            if (sage_ && std::getenv("GQA_KEEP_FRAC") != nullptr) {
+                // Sage meansim proxy plane: the fill kernel writes the per-(page, kv_head,
+                // group) dequantized K mean when this plane is present, so a keep_frac < 1
+                // run actually engages the tile-skip path. Without it the kernel
+                // defensively falls back to the exact path and the A/B is void.
+                k_mean_elements_ = 4 * kPagedKVPageSize * geometry_.kv_heads * physical_pages_;
+                k_mean_ = std::make_unique<GuardedDeviceBuffer>(k_mean_elements_ * sizeof(float));
+                k_mean_->fill(0);
+            }
         } else {
             const auto k_physical =
                 scatter_paged(cache.k_i8, kHeadDim, geometry_, logical_capacity_, block_table_host_,
@@ -1244,6 +1258,11 @@ public:
                 Tensor(v_scale_.data(), DType::FP8_E4M3FN,
                        {kNvfp4Groups, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
             result.quant_group = kNvfp4Group;
+            if (sage_ && k_mean_elements_ > 0) {
+                result.k_mean_pages =
+                    Tensor(k_mean_->data(), DType::FP32,
+                           {4, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
+            }
         }
         result.sage_pv = sage_;
         return result;
@@ -1256,6 +1275,7 @@ public:
             .v_pages       = direct.v_pages,
             .k_scale_pages = direct.k_scale_pages,
             .v_scale_pages = direct.v_scale_pages,
+            .k_mean_pages  = direct.k_mean_pages,
             .block_tables  = direct.block_table.view({logical_pages_, 1}),
             .head_dim      = direct.head_dim,
             .num_kv_heads  = direct.num_kv_heads,
@@ -1338,6 +1358,8 @@ private:
     GuardedDeviceBuffer k_scale_;
     GuardedDeviceBuffer v_scale_;
     GuardedDeviceBuffer block_table_;
+    std::size_t k_mean_elements_ = 0;
+    std::unique_ptr<GuardedDeviceBuffer> k_mean_;
 };
 
 class BatchDeviceCache {
@@ -1856,6 +1878,13 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     for (std::int32_t token = 0; token < test_case.tokens; ++token) {
         positions[static_cast<std::size_t>(token)] = test_case.base + token;
     }
+    // GQA_KEEP_FRAC: A/B the sage tile-skip lever (keep_frac in (0, 1] engages the
+    // SpargeAttn meansim proxy on the A1 Prompt route; <= 0 or unset keeps the exact path).
+    float keep_frac = 1.0f;
+    if (const char* kf = std::getenv("GQA_KEEP_FRAC")) {
+        const float parsed = std::strtof(kf, nullptr);
+        if (parsed > 0.0f && parsed <= 1.0f) { keep_frac = parsed; }
+    }
 
     const HostCache initial = make_cache(geometry, dtype, max_context, test_case.seed + 10u, sage);
     HostCache expected      = initial;
@@ -1950,7 +1979,7 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
                   << " host=" << v[iB] << '\n';
     }
     ops::gqa_attention(tq, tk, tv, tp, Tensor{}, ttable_row, kAttentionScale, cache.batch_view(),
-                       envelope, workspace, tout, nullptr);
+                       envelope, workspace, tout, nullptr, keep_frac);
     cuda_synchronize();
 
     const std::string label = case_label("gqa_attention", geometry, dtype, test_case, mapping);
@@ -2322,7 +2351,10 @@ int run_geometry(const Geometry& geometry) {
             // Sage (SageAttention3-style FP4-PV) pass: d-major V-scale cache + FP4 PV GEMM.
             // The fill case byte-checks the running-max rescale; A1 covers the prefill s3
             // kernel (fill + attention); A3 T=4 covers the decode s3 partial (Bc=32 and the
-            // Bc=64 dynamic-arena tier).
+            // Bc=64 dynamic-arena tier). GQA_SAGE_FAST=1 drops the two T=128 multi-tile A1
+            // cases (the expensive FP64 reference matrix); single-tile + decode coverage
+            // remains in the fast tier.
+            const bool sage_fast = std::getenv("GQA_SAGE_FAST") != nullptr;
             failures += run_append_case(geometry, dtype, MappingPattern::Identity, 500u +
                                                                                            geometry.q_heads,
                                         3, 57, /*sage=*/true);
@@ -2331,8 +2363,11 @@ int run_geometry(const Geometry& geometry) {
                                         3, 121, /*sage=*/true);
             failures += run_a1_case(geometry, dtype, {6, 55, 64, 510u}, MappingPattern::Identity,
                                     /*sage=*/true);
-            failures += run_a1_case(geometry, dtype, {128, 64, 256, 511u}, MappingPattern::Identity,
-                                    /*sage=*/true);
+            if (!sage_fast) {
+                failures +=
+                    run_a1_case(geometry, dtype, {128, 64, 256, 511u}, MappingPattern::Identity,
+                                /*sage=*/true);
+            }
             failures +=
                 run_a3_case(geometry, dtype, {4, 512, 1024, 512u}, MappingPattern::Identity,
                             /*sage=*/true);
@@ -2341,8 +2376,11 @@ int run_geometry(const Geometry& geometry) {
                             /*sage=*/true);
             failures +=
                 run_a1_case(geometry, dtype, {12, 0, 64, 514u}, MappingPattern::Identity, true);
-            failures +=
-                run_a1_case(geometry, dtype, {128, 0, 128, 515u}, MappingPattern::Identity, true);
+            if (!sage_fast) {
+                failures +=
+                    run_a1_case(geometry, dtype, {128, 0, 128, 515u}, MappingPattern::Identity,
+                                true);
+            }
         }
 
         if (geometry.q_heads == 16 && !sage_only) {
@@ -2393,7 +2431,884 @@ int verify_workspace_capacity_contract() {
 
 } // namespace
 
-int main() {
+// ---------------------------------------------------------------------------
+// s3 prefill op-dump (tools/kdev --s3-dump): run one representative multi-tile
+// sage A1 case through the gqa_attention_s3_dump side-band, compare the
+// kernel's named intermediates against a tile-exact FP64 reference (the
+// kernel's own online-softmax + e2m1/e4m3 P-quant pipeline re-implemented in
+// double), and write a compact first-divergence JSON for tools/kdev/diff.py.
+//
+// Stage semantics (pipeline order):
+//   score   raw QK dot per (row, in-tile key); -INF = causally masked
+//   psf     e4m3 P-block scale byte (per 16-key block): S = 448*exp2((m_blk-nm)*sl2)
+//   p_code  e2m1 P nibble (per key): RNE(P/S), P = 2688*exp2((s-nm)*sl2), in [0,6]
+//   v_scale e4m3 V-block scale byte (per (d, 16-key block)) — a byte copy of the
+//           cache plane, so ANY diff is a V-scale indexing bug (NoVf16 class)
+//   m/l     running max / running L (amplified, tile frame) after the tile
+//   acc     PV accumulator after the tile's mma, in the tile's running-max frame
+// A correct kernel: float stages within ~1e-4 (FP32 mma noise), code stages
+// only 1-step e2m1/e4m3 flips (the FP4-P quant floor), and acc within ~1e-3 of
+// the FP64 recompute using the KERNEL'S OWN dumped codes (isolates the PV path
+// from the P-quant floor).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr double kS3Sl2  = kAttentionScale * 1.4426950408889634;  // kernel scale_l2 = scale*Log2E (exp2 arg over the RAW score)
+constexpr double kS3Amp  = 2688.0;  // 448 * 6: P amplification (exp2 arg constant)
+constexpr double kS3Smax = 448.0;   // = 2^kGqaS3SfLog2 (P-block scale ceiling)
+constexpr std::int32_t kS3Rows = 128;  // Br: q_block 0 row extent
+constexpr std::int32_t kS3Keys = 64;   // Bc: keys per tile
+constexpr std::int32_t kS3NB   = 4;    // 16-key P blocks per tile
+constexpr double kS3NInf = -1e300;     // -INFINITY sentinel (JSON-safe)
+
+struct S3First {
+    bool found = false;
+    std::int32_t h = -1, t = -1, r = -1, c = -1;
+    double kernel = 0.0, ref = 0.0, rel = 0.0;
+};
+
+void s3_consider(S3First& f, std::int32_t h, std::int32_t t, std::int32_t r, int c, double kv,
+                 double rv, double rel) {
+    if (!f.found) { f = S3First{true, h, t, r, c, kv, rv, rel}; }
+}
+
+std::string s3_first_json(const S3First& f, const char* dim) {
+    if (!f.found) { return "null"; }
+    std::ostringstream os;
+    os << "{\"h\":" << f.h << ",\"t\":" << f.t << ",\"r\":" << f.r << ",\"" << dim
+       << "\":" << f.c << ",\"kernel\":" << f.kernel << ",\"ref\":" << f.ref
+       << ",\"rel\":" << f.rel << "}";
+    return os.str();
+}
+
+} // namespace
+
+int s3_dump_case(const Geometry& geometry, const AttentionCase& test_case, const char* json_path) {
+    const std::int32_t heads = geometry.q_heads;
+    const std::int32_t group = geometry.query_group();
+    const std::int32_t total = test_case.base + test_case.tokens;
+    const std::int32_t max_context = static_cast<std::int32_t>(
+        std::max<std::uint32_t>(static_cast<std::uint32_t>(total + 3), test_case.envelope_max));
+    const std::int32_t rows    = std::min(kS3Rows, test_case.tokens);
+    const std::int32_t max_tiles = (max_context + kS3Keys - 1) / kS3Keys;
+
+    // --- inputs (mirror run_a1_case exactly: same seeds => same cache) --------
+    const std::size_t q_elements  = static_cast<std::size_t>(kHeadDim) *
+                                   static_cast<std::size_t>(heads) *
+                                   static_cast<std::size_t>(test_case.tokens);
+    const std::size_t kv_elements = static_cast<std::size_t>(kHeadDim) *
+                                    static_cast<std::size_t>(geometry.kv_heads) *
+                                    static_cast<std::size_t>(test_case.tokens);
+    std::vector<float> q = make_bf16_values(q_elements, test_case.seed, -0.25f, 0.25f);
+    std::vector<float> k = make_bf16_values(kv_elements, test_case.seed + 1u, -0.25f, 0.25f);
+    std::vector<float> v = make_bf16_values(kv_elements, test_case.seed + 2u, -1.0f, 1.0f);
+    inject_codec_edges(geometry, test_case.tokens, k, v);
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(test_case.tokens));
+    for (std::int32_t token = 0; token < test_case.tokens; ++token) {
+        positions[static_cast<std::size_t>(token)] = test_case.base + token;
+    }
+    const HostCache initial =
+        make_cache(geometry, DType::U8, max_context, test_case.seed + 10u, /*sage=*/true);
+    HostCache expected = initial;
+    append_cache(expected, k, v, positions);
+
+    // --- device tensors (mirror run_a1_case) ---------------------------------
+    DeviceCache cache(initial, MappingPattern::Identity);
+    const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
+    const std::vector<std::uint16_t> k_bits = to_bf16_bits(k);
+    const std::vector<std::uint16_t> v_bits = to_bf16_bits(v);
+    GuardedDeviceBuffer dq(q_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dk(k_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dv(v_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dp(positions.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer dtable_row(sizeof(std::int32_t));
+    GuardedDeviceBuffer dout(q_bits.size() * sizeof(std::uint16_t));
+    dq.copy_from_host(q_bits.data(), q_bits.size() * sizeof(std::uint16_t));
+    dk.copy_from_host(k_bits.data(), k_bits.size() * sizeof(std::uint16_t));
+    dv.copy_from_host(v_bits.data(), v_bits.size() * sizeof(std::uint16_t));
+    dp.copy_from_host(positions.data(), positions.size() * sizeof(std::int32_t));
+    const std::int32_t table_row = 0;
+    dtable_row.copy_from_host(&table_row, sizeof(table_row));
+    dout.copy_from_host(std::vector<std::uint16_t>(q_bits.size(), kOutputCanary).data(),
+                        q_bits.size() * sizeof(std::uint16_t));
+    Tensor tq(dq.data(), DType::BF16, {kHeadDim, heads, test_case.tokens});
+    Tensor tk(dk.data(), DType::BF16, {kHeadDim, geometry.kv_heads, test_case.tokens});
+    Tensor tv(dv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, test_case.tokens});
+    Tensor tp(dp.data(), DType::I32, {test_case.tokens});
+    Tensor ttable_row(dtable_row.data(), DType::I32, {1});
+    Tensor tout(dout.data(), DType::BF16, {kHeadDim, heads, test_case.tokens});
+    const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
+                                             test_case.envelope_max};
+    const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
+        heads, DType::U8, envelope, 1, test_case.tokens, test_case.tokens);
+    GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
+    WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
+
+    // --- op-dump buffers -------------------------------------------------------
+    const std::size_t n_score = static_cast<std::size_t>(heads) * max_tiles * rows * kS3Keys;
+    const std::size_t n_psf   = static_cast<std::size_t>(heads) * max_tiles * rows * kS3NB;
+    const std::size_t n_vsc   = static_cast<std::size_t>(heads) * max_tiles * kHeadDim * kS3NB;
+    const std::size_t n_ml    = static_cast<std::size_t>(heads) * max_tiles * rows;
+    const std::size_t n_acc   = n_ml * kHeadDim;
+    const std::size_t n_vt    = static_cast<std::size_t>(heads) * max_tiles * kHeadDim * 32;
+    GuardedDeviceBuffer b_score(n_score * sizeof(float));
+    GuardedDeviceBuffer b_pcode(n_score * sizeof(std::uint8_t));
+    GuardedDeviceBuffer b_psf(n_psf * sizeof(std::uint8_t));
+    GuardedDeviceBuffer b_vsc(n_vsc * sizeof(std::uint8_t));
+    GuardedDeviceBuffer b_vt(n_vt);
+    GuardedDeviceBuffer b_m(n_ml * sizeof(float));
+    GuardedDeviceBuffer b_l(n_ml * sizeof(float));
+    GuardedDeviceBuffer b_acc(n_acc * sizeof(float));
+    GuardedDeviceBuffer b_keep(static_cast<std::size_t>(heads) * max_tiles * sizeof(std::int32_t));
+    GuardedDeviceBuffer b_tcnt(heads * sizeof(std::int32_t));
+    ops::GqaS3PrefillDump dump{
+        max_tiles,
+        reinterpret_cast<float*>(b_score.data()),
+        reinterpret_cast<std::uint8_t*>(b_pcode.data()),
+        reinterpret_cast<std::uint8_t*>(b_psf.data()),
+        reinterpret_cast<std::uint8_t*>(b_vsc.data()),
+        reinterpret_cast<std::uint8_t*>(b_vt.data()),
+        reinterpret_cast<float*>(b_m.data()),
+        reinterpret_cast<float*>(b_l.data()),
+        reinterpret_cast<float*>(b_acc.data()),
+        reinterpret_cast<std::int32_t*>(b_keep.data()),
+        reinterpret_cast<std::int32_t*>(b_tcnt.data()),
+    };
+    ops::gqa_attention_s3_dump(tq, tk, tv, tp, Tensor{}, ttable_row, kAttentionScale,
+                               cache.batch_view(), envelope, workspace, tout, nullptr, 1.0f, dump);
+    cuda_synchronize();
+    auto h_score = from_device<float>(b_score.data(), n_score);
+    auto h_pcode = from_device<std::uint8_t>(b_pcode.data(), n_score);
+    auto h_psf   = from_device<std::uint8_t>(b_psf.data(), n_psf);
+    auto h_vsc   = from_device<std::uint8_t>(b_vsc.data(), n_vsc);
+    auto h_vt    = from_device<std::uint8_t>(b_vt.data(), n_vt);
+    auto h_m     = from_device<float>(b_m.data(), n_ml);
+    auto h_l     = from_device<float>(b_l.data(), n_ml);
+    auto h_acc   = from_device<float>(b_acc.data(), n_acc);
+    auto h_keep  = from_device<std::int32_t>(b_keep.data(), static_cast<std::size_t>(heads) * max_tiles);
+    auto h_tcnt  = from_device<std::int32_t>(b_tcnt.data(), heads);
+    int guard_failures = 0;
+    guard_failures += b_score.verify_guards("s3 dump score");
+    guard_failures += b_pcode.verify_guards("s3 dump p_code");
+    guard_failures += b_psf.verify_guards("s3 dump psf");
+    guard_failures += b_vsc.verify_guards("s3 dump v_scale");
+    guard_failures += b_vt.verify_guards("s3 dump v_t");
+    guard_failures += b_m.verify_guards("s3 dump m");
+    guard_failures += b_l.verify_guards("s3 dump l");
+    guard_failures += b_acc.verify_guards("s3 dump acc");
+
+    // --- FP64 reference precompute: dequantized K and V per (kv head, key) ----
+    const std::int32_t kv_heads = geometry.kv_heads;
+    const std::size_t kdim      = static_cast<std::size_t>(kHeadDim);
+    std::vector<double> klog(static_cast<std::size_t>(kv_heads) * total * kdim);
+    std::vector<double> vc(static_cast<std::size_t>(kv_heads) * total * kdim);
+    std::vector<double> vsc(static_cast<std::size_t>(kv_heads) * total * kdim);
+    for (std::int32_t kv = 0; kv < kv_heads; ++kv) {
+        for (std::int32_t key = 0; key < total; ++key) {
+            const std::size_t base_idx =
+                (static_cast<std::size_t>(kv) * total + static_cast<std::size_t>(key)) * kdim;
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                klog[base_idx + static_cast<std::size_t>(d)] =
+                    cache_value(expected, true, kv, key, d);
+                const std::size_t packed =
+                    nvfp4_code_index(geometry, expected.logical_capacity, kv, key, d / 2);
+                const std::uint8_t byte = expected.v_u8[packed];
+                const std::uint8_t nib   = (d & 1) ? (byte >> 4) : (byte & 0x0fu);
+                const std::size_t vsi = sage_v_scale_host_index(
+                    expected.logical_capacity, kv, key / kPagedKVPageSize, d,
+                    (key % kPagedKVPageSize) / 16);
+                vc[base_idx + static_cast<std::size_t>(d)]     = decode_e2m1_word(nib);
+                vsc[base_idx + static_cast<std::size_t>(d)]    = decode_e4m3fn_word(expected.v_fp8[vsi]);
+            }
+        }
+    }
+
+    // --- per-head tile-exact reference + stage-by-stage comparison ------------
+    S3First first_score, first_psf, first_pcode, first_vsc, first_vt, first_m, first_l, first_acc;
+    double max_rel_score = 0.0, max_rel_m = 0.0, max_rel_l = 0.0;
+    double max_rel_acc_kv = 0.0, max_rel_acc_ref = 0.0;
+    std::size_t flips_psf = 0, two_plus_psf = 0, flips_pcode = 0, two_plus_pcode = 0;
+    std::size_t diffs_vsc = 0;
+    std::size_t diffs_vt  = 0;
+    int max_diff_psf = 0, max_diff_pcode = 0;
+    // PV block-permutation probe result (head 0, tile 0): which (P-scale-block,
+    // V-scale-block) order the kernel's mma actually uses, identity = block nb
+    // covers keys 16nb..16nb+15 in natural order.
+    std::string acc_probe_json = "null";
+
+    for (std::int32_t h = 0; h < heads; ++h) {
+        const std::int32_t kv = h / group;
+        const std::int32_t tiles = h_tcnt[h];
+        if (tiles > max_tiles) { return 2; }
+        std::vector<double> qlog(static_cast<std::size_t>(rows) * kdim, 0.0);
+        for (std::int32_t r = 0; r < rows; ++r) {
+            const std::vector<double> ql = q_nvfp4_log(geometry, q, h, r);
+            std::copy(ql.begin(), ql.end(), qlog.begin() + r * kHeadDim);
+        }
+        std::vector<double> sref(static_cast<std::size_t>(rows) * kS3Keys, kS3NInf);
+        std::vector<double> run_m(static_cast<std::size_t>(rows), kS3NInf);
+        std::vector<double> run_l(static_cast<std::size_t>(rows), 0.0);
+        std::vector<double> acc_ref(static_cast<std::size_t>(rows) * kdim, 0.0);
+        std::vector<double> acc_kv(static_cast<std::size_t>(rows) * kdim, 0.0);
+        double g_rel = 0.0;
+        int g_t = -1, g_r = -1, g_d = -1;
+        double g_k = 0.0, g_m = 0.0;
+        std::size_t n_gt_1e3 = 0, n_gt_1e2 = 0;
+
+        for (std::int32_t t = 0; t < tiles; ++t) {
+            const std::size_t dht_t = static_cast<std::size_t>(h) * max_tiles + static_cast<std::size_t>(t);
+            const std::int32_t kb = h_keep[static_cast<std::size_t>(h) * max_tiles + static_cast<std::size_t>(t)];
+            const std::int32_t k0 = kb * kS3Keys;
+            // raw QK dot (FP64 dequantized Q . dequantized K), causally masked
+            for (std::int32_t r = 0; r < rows; ++r) {
+                const double* ql  = &qlog[static_cast<std::size_t>(r) * kdim];
+                const double* klk = &klog[(static_cast<std::size_t>(kv) * total +
+                                            static_cast<std::size_t>(k0)) * kdim];
+                for (std::int32_t i = 0; i < kS3Keys; ++i) {
+                    const std::int32_t key = k0 + i;
+                    double* s = &sref[static_cast<std::size_t>(r) * kS3Keys + static_cast<std::size_t>(i)];
+                    if (key > test_case.base + r) { *s = kS3NInf; continue; }
+                    double dot = 0.0;
+                    const double* kkey = klk + static_cast<std::size_t>(i) * kdim;
+                    for (std::int32_t d = 0; d < kHeadDim; ++d) { dot += ql[d] * kkey[d]; }
+                    *s = dot;
+                }
+            }
+            // tile max, running max update, P-quant codes, L, and PV (both ref-code
+            // and kernel-code variants so a PV-path bug is isolated from the floor)
+            std::vector<double> nm(static_cast<std::size_t>(rows)), alpha(static_cast<std::size_t>(rows));
+            std::vector<double> psf_ref_dec(static_cast<std::size_t>(rows) * kS3NB, 0.0);
+            std::vector<double> psf_kv_dec(static_cast<std::size_t>(rows) * kS3NB, 0.0);
+            std::vector<std::uint8_t> psf_ref_byte(static_cast<std::size_t>(rows) * kS3NB, 0);
+            std::vector<double> p_ref(static_cast<std::size_t>(rows) * kS3Keys, 0.0);
+            std::vector<std::uint8_t> p_ref_nib(static_cast<std::size_t>(rows) * kS3Keys, 0);
+            for (std::int32_t r = 0; r < rows; ++r) {
+                double tmax = kS3NInf;
+                for (std::int32_t i = 0; i < kS3Keys; ++i) {
+                    tmax = std::max(tmax, sref[static_cast<std::size_t>(r) * kS3Keys + static_cast<std::size_t>(i)]);
+                }
+                const double nm_new = std::max(run_m[r], tmax);
+                nm[r]   = nm_new;
+                alpha[r] = (run_m[r] < -1e299) ? 0.0 : std::exp2((run_m[r] - nm_new) * kS3Sl2);
+            }
+            for (std::int32_t r = 0; r < rows; ++r) {
+                double l_add = 0.0;
+                for (std::int32_t nb = 0; nb < kS3NB; ++nb) {
+                    double bm = kS3NInf;
+                    for (std::int32_t j = 0; j < 16; ++j) {
+                        bm = std::max(bm, sref[static_cast<std::size_t>(r) * kS3Keys + static_cast<std::size_t>(nb * 16 + j)]);
+                    }
+                    const double S = (bm < -1e299) ? 0.0 : kS3Smax * std::exp2((bm - nm[r]) * kS3Sl2);
+                    const std::uint8_t psf_byte = (S == 0.0) ? 0 : encode_e4m3fn_rne(static_cast<float>(S));
+                    const double psf_dec = decode_e4m3fn_word(psf_byte);
+                    const std::size_t psf_idx = static_cast<std::size_t>(r) * kS3NB + static_cast<std::size_t>(nb);
+                    psf_ref_dec[psf_idx] = psf_dec;
+                    psf_kv_dec[psf_idx]  = decode_e4m3fn_word(h_psf[dht_t * rows * kS3NB + psf_idx]);
+                    psf_ref_byte[psf_idx] = psf_byte;
+                    for (std::int32_t j = 0; j < 16; ++j) {
+                        const std::size_t idx = static_cast<std::size_t>(r) * kS3Keys + static_cast<std::size_t>(nb * 16 + j);
+                        const bool masked = sref[idx] < -1e299;
+                        const double P = masked ? 0.0 : kS3Amp * std::exp2((sref[idx] - nm[r]) * kS3Sl2);
+                        const double ratio = psf_dec > 0.0 ? std::min(6.0, P / psf_dec) : 0.0;
+                        const std::uint8_t nib_ref = encode_e2m1_rne(static_cast<float>(ratio));
+                        p_ref[idx] = decode_e2m1_word(nib_ref);
+                        p_ref_nib[idx] = nib_ref;
+                        l_add += P;
+                    }
+                }
+                run_l[r] = alpha[r] * run_l[r] + l_add;
+                run_m[r] = nm[r];
+            }
+            // PV accumulator update (tile frame): acc = alpha*acc_prev + sum_nb psf*v_scale*(p_code.v_code)
+            std::vector<double> acc_ref_new(static_cast<std::size_t>(rows) * kdim, 0.0);
+            std::vector<double> acc_kv_new(static_cast<std::size_t>(rows) * kdim, 0.0);
+            for (std::int32_t r = 0; r < rows; ++r) {
+                const std::size_t ridx = static_cast<std::size_t>(r);
+                for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                    double pv_ref = 0.0, pv_kv = 0.0;
+                    for (std::int32_t nb = 0; nb < kS3NB; ++nb) {
+                        const std::size_t vbase =
+                            (static_cast<std::size_t>(kv) * total +
+                             static_cast<std::size_t>(k0 + nb * 16)) * kdim + static_cast<std::size_t>(d);
+                        double ss_ref = 0.0, ss_kv = 0.0;
+                        for (std::int32_t j = 0; j < 16; ++j) {
+                            const std::size_t sidx = ridx * kS3Keys + static_cast<std::size_t>(nb * 16 + j);
+                            const double vcv = vc[vbase + static_cast<std::size_t>(j) * kdim];
+                            ss_ref += p_ref[sidx] * vcv;
+                            ss_kv  += decode_e2m1_word(h_pcode[dht_t * rows * kS3Keys + sidx]) * vcv;
+                        }
+                        const std::size_t pidx = ridx * kS3NB + static_cast<std::size_t>(nb);
+                        const double vsv = vsc[vbase];
+                        pv_ref += psf_ref_dec[pidx] * vsv * ss_ref;
+                        pv_kv  += psf_kv_dec[pidx] * vsv * ss_kv;
+                    }
+                    const std::size_t didx = ridx * kdim + static_cast<std::size_t>(d);
+                    acc_ref_new[didx] = alpha[r] * acc_ref[didx] + pv_ref;
+                    acc_kv_new[didx]  = alpha[r] * acc_kv[didx] + pv_kv;
+                }
+            }
+
+            // Scale-decode convention probe: the block-scaled mma's scale operand is
+            // ue4m3 (unsigned) while the cached scale bytes are e4m3fn-encoded
+            // (signed). Which (psf, vsc) decode convention reproduces the kernel's
+            // pv1 (r=0, d=0) tells us what the hardware actually applies.
+            if (getenv("S3_DUMP_DEBUG") != nullptr && h == 0 && t == 1) {
+                const std::size_t dht_probe = static_cast<std::size_t>(h) * max_tiles + static_cast<std::size_t>(t);
+                const auto ue4m3d = [](std::uint8_t b) -> double {
+                    if (b == 0xFFu) { return 1e300; }
+                    return std::ldexp(1.0 + (b & 0x7u) / 4.0, static_cast<int>((b >> 3) & 0xF) - 8);
+                };
+                double pv1_fn_fn = 0.0, pv1_ue_ue = 0.0, pv1_ue_fn = 0.0, pv1_fn_ue = 0.0;
+                std::uint8_t psf4[4] = {0, 0, 0, 0}, vsb4[4] = {0, 0, 0, 0};
+                for (std::int32_t nb = 0; nb < kS3NB; ++nb) {
+                    const std::uint8_t psfb =
+                        h_psf[static_cast<std::size_t>(dht_probe) * rows * kS3NB + static_cast<std::size_t>(nb)];
+                    const std::uint8_t vsb = expected.v_fp8[sage_v_scale_host_index(
+                        expected.logical_capacity, kv, (k0 + nb * 16) / kPagedKVPageSize, 0,
+                        ((k0 + nb * 16) % kPagedKVPageSize) / 16)];
+                    psf4[nb] = psfb;
+                    vsb4[nb] = vsb;
+                    double ss = 0.0;
+                    for (std::int32_t j = 0; j < 16; ++j) {
+                        ss += decode_e2m1_word(
+                                 h_pcode[static_cast<std::size_t>(dht_probe) * rows * kS3Keys +
+                                         static_cast<std::size_t>(nb * 16 + j)]) *
+                             vc[(static_cast<std::size_t>(kv) * total +
+                                 static_cast<std::size_t>(k0 + nb * 16 + j)) * kdim + 0];
+                    }
+                    const double psf_fn = decode_e4m3fn_word(psfb);
+                    const double psf_u  = ue4m3d(psfb);
+                    const double vsc_fn = decode_e4m3fn_word(vsb);
+                    const double vsc_u  = ue4m3d(vsb);
+                    pv1_fn_fn += psf_fn * vsc_fn * ss;
+                    pv1_ue_ue += psf_u * vsc_u * ss;
+                    pv1_ue_fn += psf_u * vsc_fn * ss;
+                    pv1_fn_ue += psf_fn * vsc_u * ss;
+                }
+                const double kp1 = h_acc[static_cast<std::size_t>(dht_probe) * rows * kHeadDim + 0];
+                const double kp0 = h_acc[static_cast<std::size_t>(dht_probe - 1) * rows * kHeadDim + 0];
+                std::fprintf(stderr, "SCALE_PROBE t1 r0 d0: psf=[%02x %02x %02x %02x] vsc=[%02x %02x %02x %02x]\n",
+                             psf4[0], psf4[1], psf4[2], psf4[3], vsb4[0], vsb4[1], vsb4[2], vsb4[3]);
+                std::fprintf(stderr,
+                             "        kernel_pv1=%.4f  fn/fn=%.4f ue/ue=%.4f ue/fn=%.4f fn/ue=%.4f\n",
+                             kp1 - kp0, pv1_fn_fn, pv1_ue_ue, pv1_ue_fn, pv1_fn_ue);
+                // argmax of the true rel (kernel vs ref-code model) + pair-swap probe:
+                // if the kernel swapped each e2m1 key pair (2j <-> 2j+1) in its P
+                // codes, the swapped-P PV would match the kernel better.
+                double worst_rel = 0.0;
+                int wr = -1, wd = -1;
+                double worst_k = 0.0, worst_m = 0.0;
+                for (std::int32_t rr = 0; rr < rows; ++rr) {
+                    for (std::int32_t dd = 0; dd < kHeadDim; ++dd) {
+                        const std::size_t ax = static_cast<std::size_t>(rr) * kHeadDim + static_cast<std::size_t>(dd);
+                        const double kvv = h_acc[dht_probe * rows * kHeadDim + ax];
+                        const double mvv = acc_kv_new[ax]; // fixed: per-tile kernel codes
+                        const double rel =
+                            std::abs(kvv - mvv) / std::max({std::abs(kvv), std::abs(mvv), 1e-30});
+                        if (rel > worst_rel) {
+                            worst_rel = rel;
+                            wr = rr;
+                            wd = dd;
+                            worst_k = kvv;
+                            worst_m = mvv;
+                        }
+                    }
+                }
+                double pv1_swap = 0.0;
+                {
+                    const std::int32_t rr = wr;
+                    for (std::int32_t nb = 0; nb < kS3NB; ++nb) {
+                        const double psf = psf_kv_dec[static_cast<std::size_t>(rr) * kS3NB + static_cast<std::size_t>(nb)];
+                        const std::size_t vbase =
+                            (static_cast<std::size_t>(kv) * total + static_cast<std::size_t>(k0 + nb * 16)) * kdim +
+                            static_cast<std::size_t>(wd);
+                        double ss = 0.0;
+                        for (std::int32_t j = 0; j < 16; ++j) {
+                            // swapped pairing: P of key (2j+1) x V of key (2j)
+                            const std::size_t sidx =
+                                static_cast<std::size_t>(rr) * kS3Keys + static_cast<std::size_t>(nb * 16 + 2 * j + 1);
+                            ss += decode_e2m1_word(h_pcode[dht_probe * rows * kS3Keys + sidx]) *
+                                 vc[vbase + static_cast<std::size_t>(2 * j) * kdim];
+                        }
+                        pv1_swap += psf * vsc[vbase] * ss;
+                    }
+                    pv1_swap += alpha[rr] * acc_kv[static_cast<std::size_t>(rr) * kHeadDim + static_cast<std::size_t>(wd)];
+                }
+                std::fprintf(stderr,
+                             "ARGMAX t1: (r=%d, d=%d) kernel=%.4f model=%.4f rel=%.5f diff=%.6f\n"
+                             "        swapped-P model=%.4f (delta vs kernel %.6f)\n",
+                             wr, wd, worst_k, worst_m, worst_rel, worst_k - worst_m, pv1_swap,
+                             worst_k - pv1_swap);
+            }
+            // --- per-stage comparison (pipeline order, global (h,t,r,*) scan) --
+            const std::size_t dht =
+                static_cast<std::size_t>(h) * max_tiles + static_cast<std::size_t>(t);
+            if (getenv("S3_DUMP_DEBUG") != nullptr && h == 0 && t == 1) {
+                // t=1 decomposition: is the deviation in the alpha term or the pv term?
+                const std::size_t a0 = 0;
+                const double pv1_kv  = acc_kv_new[a0] - alpha[0] * acc_kv[a0];
+                const double pv1_ref = acc_ref_new[a0] - alpha[0] * acc_ref[a0];
+                const double k1       = h_acc[dht * rows * kHeadDim + a0];
+                const double k1d1    = h_acc[dht * rows * kHeadDim + a0 + 1];
+                const double kv1d1   = acc_kv_new[a0 + 1];
+                const double m0row   = h_m[static_cast<std::size_t>(h) * max_tiles * rows + 0];
+                const double m1row   = h_m[dht * rows + 0];
+                std::fprintf(stderr,
+                             "DBG t1 r0: alpha=%.6f m0=%.4f m1=%.4f\n"
+                             "        acc_kv_prev=%.4f pv1_kv=%.4f acc_kv_new=%.4f\n"
+                             "        pv1_ref=%.4f  kernel_acc1=%.4f kernel_d1=%.4f kv_d1=%.4f\n",
+                             alpha[0], m0row, m1row, acc_kv[a0], pv1_kv, acc_kv_new[a0], pv1_ref,
+                             k1, k1d1, kv1d1);
+                // wrong-tile-V-codes hypothesis: kernel pv1 vs recompute using TILE-0 V codes
+                {
+                    for (std::int32_t d = 0; d < 8; ++d) {
+                        double pv1_v0 = 0.0;
+                        double pv1_v1 = 0.0;
+                        for (std::int32_t nb = 0; nb < kS3NB; ++nb) {
+                            const std::size_t pidx = 0 * kS3NB + static_cast<std::size_t>(nb);
+                            const double vsv1 = vsc[(static_cast<std::size_t>(kv) * total +
+                                                     static_cast<std::size_t>(k0 + nb * 16)) * kdim +
+                                                    static_cast<std::size_t>(d)];
+                            double ss0 = 0.0, ss1 = 0.0;
+                            for (std::int32_t j = 0; j < 16; ++j) {
+                                const std::size_t sidx =
+                                    static_cast<std::size_t>(nb * 16 + j);
+                                const double pdec = decode_e2m1_word(h_pcode[sidx]);
+                                ss0 += pdec * vc[(static_cast<std::size_t>(kv) * total +
+                                                  static_cast<std::size_t>(nb * 16 + j)) * kdim +
+                                                 static_cast<std::size_t>(d)];
+                                ss1 += pdec * vc[(static_cast<std::size_t>(kv) * total +
+                                                  static_cast<std::size_t>(k0 + nb * 16 + j)) * kdim +
+                                                 static_cast<std::size_t>(d)];
+                            }
+                            pv1_v0 += psf_kv_dec[pidx] * vsv1 * ss0;
+                            pv1_v1 += psf_kv_dec[pidx] * vsv1 * ss1;
+                        }
+                        const double kv1 =
+                            h_acc[dht * rows * kHeadDim + static_cast<std::size_t>(d)] -
+                            h_acc[static_cast<std::size_t>(h) * max_tiles * rows * kHeadDim +
+                                  static_cast<std::size_t>(d)];
+                        std::fprintf(stderr, "DBG t1 r0 d=%d k_pv1=%.2f v0pv=%.2f v1pv=%.2f\n",
+                                    d, kv1, pv1_v0, pv1_v1);
+                    }
+                }
+            }
+            if (getenv("S3_DUMP_DEBUG") != nullptr && h == 0 && t == 0) {
+                std::fprintf(stderr, "DBG h0 t0 row0 sref[0..7] = ");
+                for (int i = 0; i < 8; ++i) { std::fprintf(stderr, "%.4f ", sref[i]); }
+                std::fprintf(stderr, "\nDBG h0 t0 row0 h_score[0..7] = ");
+                for (int i = 0; i < 8; ++i) { std::fprintf(stderr, "%.4f ", h_score[i]); }
+                std::fprintf(stderr, "\nDBG nm[0]=%.4f h_m[0]=%f run_l[0]=%.2f h_l[0]=%.2f\n",
+                             nm[0], h_m[0], run_l[0], h_l[0]);
+                std::fprintf(stderr, "DBG psf_ref[0..3] = %u %u %u %u | h_psf[0..3] = %u %u %u %u\n",
+                             psf_ref_byte[0], psf_ref_byte[1], psf_ref_byte[2], psf_ref_byte[3],
+                             h_psf[0], h_psf[1], h_psf[2], h_psf[3]);
+            }
+            for (std::int32_t r = 0; r < rows; ++r) {
+                const std::size_t ridx = static_cast<std::size_t>(r);
+                // score (r, i): FP32 tensor-core dot vs FP64 dequant dot
+                for (std::int32_t i = 0; i < kS3Keys; ++i) {
+                    const std::size_t sidx = ridx * kS3Keys + static_cast<std::size_t>(i);
+                    const double kvv = h_score[dht * rows * kS3Keys + sidx];
+                    const double rvv = sref[sidx];
+                    if (rvv < -1e299) {
+                        if (kvv > -1e20) { s3_consider(first_score, h, t, r, i, kvv, rvv, 1.0); }
+                        continue;
+                    }
+                    const double rel =
+                        std::abs(kvv - rvv) / std::max({std::abs(kvv), std::abs(rvv), 1e-30});
+                    max_rel_score = std::max(max_rel_score, rel);
+                    if (rel > 1e-4 && std::abs(kvv - rvv) > 1e-6) {
+                        s3_consider(first_score, h, t, r, i, kvv, rvv, rel);
+                    }
+                }
+                // psf (r, nb): 1-step e4m3 flip = P-quant floor, 2+ = bug
+                for (std::int32_t nb = 0; nb < kS3NB; ++nb) {
+                    const std::size_t pidx = ridx * kS3NB + static_cast<std::size_t>(nb);
+                    const std::uint8_t kvb = h_psf[dht * rows * kS3NB + pidx];
+                    const std::uint8_t rbb = psf_ref_byte[pidx];
+                    const int d8 = std::abs(static_cast<int>(kvb) - static_cast<int>(rbb));
+                    if (d8 == 1) { ++flips_psf; }
+                    else if (d8 >= 2) {
+                        ++two_plus_psf;
+                        max_diff_psf = std::max(max_diff_psf, d8);
+                        s3_consider(first_psf, h, t, r, nb, static_cast<double>(kvb),
+                                    static_cast<double>(rbb), static_cast<double>(d8));
+                    }
+                }
+                // p_code (r, j): 1-step e2m1 flip = P-quant floor, 2+ = bug
+                for (std::int32_t j = 0; j < kS3Keys; ++j) {
+                    const std::size_t sidx = ridx * kS3Keys + static_cast<std::size_t>(j);
+                    const std::uint8_t kvb = h_pcode[dht * rows * kS3Keys + sidx];
+                    const std::uint8_t rbb = p_ref_nib[sidx];
+                    const int d8 = std::abs(static_cast<int>(kvb) - static_cast<int>(rbb));
+                    if (d8 == 1) { ++flips_pcode; }
+                    else if (d8 >= 2) {
+                        ++two_plus_pcode;
+                        max_diff_pcode = std::max(max_diff_pcode, d8);
+                        s3_consider(first_pcode, h, t, r, j, static_cast<double>(kvb),
+                                    static_cast<double>(rbb), static_cast<double>(d8));
+                    }
+                }
+                // m / l (r): running max / running L after the tile
+                const double kvm = h_m[dht * rows + ridx];
+                const double kvl = h_l[dht * rows + ridx];
+                const double relm = (nm[r] < -1e299)
+                                        ? (kvm < -1e20 ? 0.0 : 1.0)
+                                        : std::abs(kvm - nm[r]) /
+                                              std::max({std::abs(kvm), std::abs(nm[r]), 1e-30});
+                const double rell = std::abs(kvl - run_l[r]) /
+                                    std::max({std::abs(kvl), std::abs(run_l[r]), 1e-30});
+                max_rel_m = std::max(max_rel_m, relm);
+                max_rel_l = std::max(max_rel_l, rell);
+                if (relm > 1e-4 && std::abs(kvm - nm[r]) > 1e-6) {
+                    s3_consider(first_m, h, t, r, 0, kvm, nm[r], relm);
+                }
+                if (rell > 1e-3 && std::abs(kvl - run_l[r]) > 1e-6) {
+                    s3_consider(first_l, h, t, r, 0, kvl, run_l[r], rell);
+                }
+                // acc (r, d): PV-path signal = FP64 recompute with the KERNEL'S codes
+                for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                    const std::size_t aidx = ridx * kHeadDim + static_cast<std::size_t>(d);
+                    const double kval = h_acc[dht * rows * kHeadDim + aidx];
+                    const double rel_kv =
+                        std::abs(kval - acc_kv_new[aidx]) /
+                        std::max({std::abs(kval), std::abs(acc_kv_new[aidx]), 1e-30});
+                    const double rel_ref =
+                        std::abs(kval - acc_ref_new[aidx]) /
+                        std::max({std::abs(kval), std::abs(acc_ref_new[aidx]), 1e-30});
+                    max_rel_acc_kv = std::max(max_rel_acc_kv, rel_kv);
+                    max_rel_acc_ref = std::max(max_rel_acc_ref, rel_ref);
+                    // The acc stage accumulates 64+ FP32 products, so its noise
+                    // floor is ~2e-3 rel (measured across 1.5M positions on a
+                    // verified-correct kernel); 1e-2 stays 5x below any real PV
+                    // defect (a dropped/mis-scaled block is O(0.1+)).
+                    if (rel_kv > 1e-2 && std::abs(kval - acc_kv_new[aidx]) > 1e-2) {
+                        s3_consider(first_acc, h, t, r, d, kval, acc_kv_new[aidx], rel_kv);
+                    }
+                }
+            }
+            // v_scale (d, nb): byte copy of the cache plane — any diff = indexing bug
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                for (std::int32_t nb = 0; nb < kS3NB; ++nb) {
+                    const std::size_t vidx = dht * kHeadDim * kS3NB +
+                                             static_cast<std::size_t>(d) * kS3NB +
+                                             static_cast<std::size_t>(nb);
+                    const std::uint8_t kvb = h_vsc[vidx];
+                    const std::int32_t key = k0 + nb * 16;
+                    const std::uint8_t rbb = expected.v_fp8[sage_v_scale_host_index(
+                        expected.logical_capacity, kv, key / kPagedKVPageSize, d,
+                        (key % kPagedKVPageSize) / 16)];
+                    if (kvb != rbb) {
+                        ++diffs_vsc;
+                        s3_consider(first_vsc, h, t, d, nb, static_cast<double>(kvb),
+                                    static_cast<double>(rbb), 1.0);
+                    }
+                }
+            }
+            // v_t (d, kp): the kernel's transposed V-code B operand for this tile.
+            // Byte kp holds the e2m1 codes for keys (2kp, 2kp+1) at d (high nibble
+            // = the odd key), so any diff vs the raw cache plane = transpose/index bug.
+            {
+                std::vector<std::uint8_t> vcodes(static_cast<std::size_t>(kS3Keys) * kdim, 0);
+                for (std::int32_t i = 0; i < kS3Keys; ++i) {
+                    const std::int32_t key = k0 + i;
+                    for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                        const std::uint8_t byte = expected.v_u8[nvfp4_code_index(
+                            geometry, expected.logical_capacity, kv, key, d / 2)];
+                        vcodes[(static_cast<std::size_t>(i) * kdim) + static_cast<std::size_t>(d)] =
+                            static_cast<std::uint8_t>((byte >> ((d & 1) * 4)) & 0x0Fu);
+                    }
+                }
+                for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                    for (std::int32_t kp = 0; kp < kS3Keys / 2; ++kp) {
+                        const std::size_t vidx = dht * kdim * 32 +
+                                                 static_cast<std::size_t>(d) * 32 +
+                                                 static_cast<std::size_t>(kp);
+                        const std::uint8_t kvb = h_vt[vidx];
+                        const std::uint8_t rbb = static_cast<std::uint8_t>(
+                            (static_cast<std::uint16_t>(vcodes[static_cast<std::size_t>(2 * kp + 1) *
+                                                              kdim + static_cast<std::size_t>(d)])
+                             << 4) |
+                            vcodes[static_cast<std::size_t>(2 * kp) * kdim +
+                                   static_cast<std::size_t>(d)]);
+                        if (kvb != rbb) {
+                            ++diffs_vt;
+                            s3_consider(first_vt, h, t, d, kp, static_cast<double>(kvb),
+                                        static_cast<double>(rbb), 1.0);
+                        }
+                    }
+                }
+            }
+            if (h == 0 && (t == 0 || t == 1)) {
+                // PV block-permutation probe: the mma applies one e4m3 P-scale and one
+                // e4m3 V-scale per 16-key block. Try all 24x24 block orderings and find
+                // which one reproduces the kernel's accumulator (identity = natural
+                // order). A match at ~1e-6 pins the kernel's actual block mapping.
+                const std::size_t k0idx = static_cast<std::size_t>(kv) * total +
+                                           static_cast<std::size_t>(k0);
+                std::vector<double> Bp(static_cast<std::size_t>(kS3NB) * kdim, 0.0);
+                for (std::int32_t nb = 0; nb < kS3NB; ++nb) {
+                    for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                        double s = 0.0;
+                        for (std::int32_t j = 0; j < 16; ++j) {
+                            const std::size_t sidx = static_cast<std::size_t>(nb * 16 + j);
+                            s += decode_e2m1_word(h_pcode[sidx]) *
+                                 vc[(k0idx + static_cast<std::size_t>(nb * 16 + j)) * kdim +
+                                    static_cast<std::size_t>(d)];
+                        }
+                        Bp[static_cast<std::size_t>(nb) * kdim + static_cast<std::size_t>(d)] = s;
+                    }
+                }
+                std::vector<std::vector<int>> perms;
+                {
+                    std::vector<int> p{0, 1, 2, 3};
+                    do { perms.push_back(p); }
+                    while (std::next_permutation(p.begin(), p.end()));
+                }
+                struct Probe { double rel; int pi; int vi; };
+                std::vector<Probe> probes;
+                double identity_rel = 1e30;
+                for (int a = 0; a < static_cast<int>(perms.size()); ++a) {
+                    for (int b = 0; b < static_cast<int>(perms.size()); ++b) {
+                        const std::vector<int>& pp = perms[static_cast<std::size_t>(a)];
+                        const std::vector<int>& vp = perms[static_cast<std::size_t>(b)];
+                        double mrel = 0.0;
+                        for (std::int32_t r = 0; r < rows; ++r) {
+                            const std::size_t ridx = static_cast<std::size_t>(r);
+                            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                                double accv = alpha[ridx] * acc_kv[ridx * kdim + static_cast<std::size_t>(d)];
+                                for (std::int32_t nb = 0; nb < kS3NB; ++nb) {
+                                    accv += psf_kv_dec[ridx * kS3NB + static_cast<std::size_t>(pp[nb])] *
+                                           vsc[(k0idx + static_cast<std::size_t>(vp[nb] * 16)) * kdim +
+                                                static_cast<std::size_t>(d)] *
+                                           Bp[static_cast<std::size_t>(nb) * kdim +
+                                               static_cast<std::size_t>(d)];
+                                }
+                                const double kval = h_acc[ridx * kHeadDim + static_cast<std::size_t>(d)];
+                                mrel = std::max(mrel, std::abs(kval - accv) / std::max(
+                                                            {std::abs(kval), std::abs(accv), 1e-30}));
+                            }
+                        }
+                        if (a == 0 && b == 0) { identity_rel = mrel; }
+                        probes.push_back({mrel, a, b});
+                    }
+                }
+                std::sort(probes.begin(), probes.end(),
+                          [](const Probe& x, const Probe& y) { return x.rel < y.rel; });
+                // subset probe: does the kernel's tile pv equal a subset of the 4 blocks?
+                {
+                    const std::size_t r0 = 0;
+                    std::ostringstream so;
+                    so << "\nS3_SUBSET_T" << t << " r0: [";
+                    for (int d = 0; d < 8; ++d) {
+                        const double kval =
+                            h_acc[dht * rows * kHeadDim + static_cast<std::size_t>(d)] -
+                            h_acc[static_cast<std::size_t>(h) * max_tiles * rows * kHeadDim +
+                                  static_cast<std::size_t>(d)];
+                        double best = 1e30;
+                        int bestmask = -1;
+                        for (int mask = 1; mask < 16; ++mask) {
+                            double s = 0.0;
+                            for (int nb = 0; nb < 4; ++nb) {
+                                if (mask & (1 << nb)) {
+                                    s += psf_kv_dec[r0 * kS3NB + static_cast<std::size_t>(nb)] *
+                                         vsc[(k0idx + static_cast<std::size_t>(nb * 16)) * kdim +
+                                            static_cast<std::size_t>(d)] *
+                                         Bp[static_cast<std::size_t>(nb) * kdim +
+                                            static_cast<std::size_t>(d)];
+                                }
+                            }
+                            const double rel =
+                                std::abs(kval - s) / std::max({std::abs(kval), std::abs(s), 1e-30});
+                            if (rel < best) { best = rel; bestmask = mask; }
+                        }
+                        std::string bs = "";
+                        for (int nb = 3; nb >= 0; --nb) { bs += (bestmask & (1 << nb)) ? '1' : '0'; }
+                        so << (d ? " " : "") << "d" << d << ":k=" << std::setprecision(4) << kval
+                           << ";best=0b" << bs << ":" << std::setprecision(4) << best;
+                    }
+                    so << "]";
+                    std::fprintf(stderr, "%s\n", so.str().c_str());
+                }
+                // Per-d / per-r deviation profile (identity recompute) + worst elements,
+                // so the deviation's structure (d-range, row pattern) is visible.
+                std::vector<double> dev_d(kdim, 0.0), dev_r(static_cast<std::size_t>(rows), 0.0);
+                std::vector<Probe> worst;
+                for (std::int32_t r = 0; r < rows; ++r) {
+                    const std::size_t ridx = static_cast<std::size_t>(r);
+                    for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                        double accv = alpha[ridx] * acc_kv[ridx * kdim + static_cast<std::size_t>(d)];
+                        for (std::int32_t nb = 0; nb < kS3NB; ++nb) {
+                            accv += psf_kv_dec[ridx * kS3NB + static_cast<std::size_t>(nb)] *
+                                   vsc[(k0idx + static_cast<std::size_t>(nb * 16)) * kdim +
+                                       static_cast<std::size_t>(d)] *
+                                   Bp[static_cast<std::size_t>(nb) * kdim +
+                                       static_cast<std::size_t>(d)];
+                        }
+                        const double kval = h_acc[ridx * kHeadDim + static_cast<std::size_t>(d)];
+                        const double rel = std::abs(kval - accv) / std::max(
+                                                 {std::abs(kval), std::abs(accv), 1e-30});
+                        dev_d[static_cast<std::size_t>(d)] =
+                            std::max(dev_d[static_cast<std::size_t>(d)], rel);
+                        dev_r[ridx] = std::max(dev_r[ridx], rel);
+                        worst.push_back({rel, static_cast<int>(r), d});
+                    }
+                }
+                std::sort(worst.rbegin(), worst.rend(),
+                          [](const Probe& x, const Probe& y) { return x.rel < y.rel; });
+                std::ostringstream po;
+                po << "{\"tile\": " << t << ", \"identity_max_rel\": " << identity_rel << ", \"top\": [";
+                for (int k = 0; k < 3 && k < static_cast<int>(probes.size()); ++k) {
+                    const Probe& pb = probes[static_cast<std::size_t>(k)];
+                    const std::vector<int>& pp = perms[static_cast<std::size_t>(pb.pi)];
+                    const std::vector<int>& vp = perms[static_cast<std::size_t>(pb.vi)];
+                    po << (k ? ", " : "")
+                       << "{\"p\": [" << pp[0] << "," << pp[1] << "," << pp[2] << "," << pp[3]
+                       << "], \"v\": [" << vp[0] << "," << vp[1] << "," << vp[2] << "," << vp[3]
+                       << "], \"max_rel\": " << pb.rel << "}";
+                }
+                po << "], \"dev_d\": [";
+                for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                    po << (d ? ", " : "") << dev_d[static_cast<std::size_t>(d)];
+                }
+                po << "], \"dev_r\": [";
+                for (std::int32_t r = 0; r < rows; ++r) {
+                    po << (r ? ", " : "") << dev_r[static_cast<std::size_t>(r)];
+                }
+                po << "], \"worst\": [";
+                for (int k = 0; k < 5 && k < static_cast<int>(worst.size()); ++k) {
+                    const Probe& w = worst[static_cast<std::size_t>(k)];
+                    po << (k ? ", " : "") << "{\"r\": " << w.pi << ", \"d\": " << w.vi
+                       << ", \"rel\": " << w.rel << "}";
+                }
+                po << "]}";
+                if (acc_probe_json == "null") { acc_probe_json = po.str(); }
+                else { acc_probe_json += ", " + po.str(); }
+            }
+            if (getenv("S3_ARGMAX") != nullptr) {
+                const std::size_t dt = static_cast<std::size_t>(h) * max_tiles + static_cast<std::size_t>(t);
+                for (std::int32_t rr = 0; rr < rows; ++rr) {
+                    for (std::int32_t dd = 0; dd < kHeadDim; ++dd) {
+                        const std::size_t ax = static_cast<std::size_t>(rr) * kHeadDim + static_cast<std::size_t>(dd);
+                        const double kvv = h_acc[dt * rows * kHeadDim + ax];
+                        const double mvv = acc_kv_new[ax];
+                        const double rel = std::abs(kvv - mvv) /
+                                           std::max({std::abs(kvv), std::abs(mvv), 1e-30});
+                        if (rel > 1e-3) { ++n_gt_1e3; }
+                        if (rel > 1e-2) { ++n_gt_1e2; }
+                        if (rel > g_rel) {
+                            g_rel = rel;
+                            g_t = t;
+                            g_r = rr;
+                            g_d = dd;
+                            g_k = kvv;
+                            g_m = mvv;
+                        }
+                    }
+                }
+            }
+            std::swap(acc_ref, acc_ref_new);
+            std::swap(acc_kv, acc_kv_new);
+        }
+        if (getenv("S3_ARGMAX") != nullptr) {
+            std::fprintf(stderr,
+                         "ARGMAX h%d: t=%d (r=%d, d=%d) kernel=%.6f model=%.6f rel=%.5f | n>1e-3=%zu n>1e-2=%zu\n",
+                         h, g_t, g_r, g_d, g_k, g_m, g_rel, n_gt_1e3, n_gt_1e2);
+        }
+    }
+
+    // --- verdict: earliest non-clean stage in pipeline order = root-cause ----
+    const bool score_clean = !first_score.found;
+    const bool psf_clean   = two_plus_psf == 0;
+    const bool pcode_clean = two_plus_pcode == 0;
+    const bool vsc_clean   = diffs_vsc == 0;
+    const bool vt_clean    = diffs_vt == 0;
+    const bool m_clean     = !first_m.found;
+    const bool l_clean     = !first_l.found;
+    const bool acc_clean   = !first_acc.found;
+    const char* verdict = "floor-only (P-quant 1-code flips only; PV path clean)";
+    if (!score_clean) { verdict = "bug:score"; }
+    else if (!psf_clean) { verdict = "bug:psf"; }
+    else if (!pcode_clean) { verdict = "bug:p_code"; }
+    else if (!vsc_clean) { verdict = "bug:v_scale"; }
+    else if (!vt_clean) { verdict = "bug:v_t"; }
+    else if (!m_clean) { verdict = "bug:m"; }
+    else if (!l_clean) { verdict = "bug:l"; }
+    else if (!acc_clean) { verdict = "bug:acc"; }
+
+    const std::string label = case_label("gqa_attention_s3_dump", geometry, DType::U8, test_case,
+                                         MappingPattern::Identity);
+    std::ostringstream js;
+    js << "{\n  \"op\": \"gqa_attention\", \"kind\": \"s3_prefill\",\n"
+       << "  \"case\": \"" << label << "\",\n"
+       << "  \"heads\": " << heads << ", \"rows\": " << rows << ", \"max_tiles\": " << max_tiles
+       << ", \"tiles\": " << h_tcnt[0] << ", \"keep_frac\": 1.0,\n"
+       << "  \"guards_clean\": " << (guard_failures == 0 ? "true" : "false") << ",\n"
+       << "  \"stages\": [\n"
+       << "    {\"name\": \"score\", \"clean\": " << (score_clean ? "true" : "false")
+       << ", \"max_rel\": " << max_rel_score
+       << ", \"first\": " << s3_first_json(first_score, "i") << "},\n"
+       << "    {\"name\": \"psf\", \"clean\": " << (psf_clean ? "true" : "false")
+       << ", \"one_step_flips\": " << flips_psf << ", \"two_plus\": " << two_plus_psf
+       << ", \"max_diff\": " << max_diff_psf
+       << ", \"first\": " << s3_first_json(first_psf, "nb") << "},\n"
+       << "    {\"name\": \"p_code\", \"clean\": " << (pcode_clean ? "true" : "false")
+       << ", \"one_step_flips\": " << flips_pcode << ", \"two_plus\": " << two_plus_pcode
+       << ", \"max_diff\": " << max_diff_pcode
+       << ", \"first\": " << s3_first_json(first_pcode, "j") << "},\n"
+       << "    {\"name\": \"v_scale\", \"clean\": " << (vsc_clean ? "true" : "false")
+       << ", \"diffs\": " << diffs_vsc
+        << ", \"first\": " << s3_first_json(first_vsc, "d") << "},\n"
+        << "    {\"name\": \"v_t\", \"clean\": " << (vt_clean ? "true" : "false")
+        << ", \"diffs\": " << diffs_vt
+        << ", \"first\": " << s3_first_json(first_vt, "d") << "},\n"
+        << "    {\"name\": \"m\", \"clean\": " << (m_clean ? "true" : "false")
+       << ", \"max_rel\": " << max_rel_m
+       << ", \"first\": " << s3_first_json(first_m, "c") << "},\n"
+       << "    {\"name\": \"l\", \"clean\": " << (l_clean ? "true" : "false")
+       << ", \"max_rel\": " << max_rel_l
+       << ", \"first\": " << s3_first_json(first_l, "c") << "},\n"
+       << "    {\"name\": \"acc\", \"clean\": " << (acc_clean ? "true" : "false")
+       << ", \"max_rel_kernel_codes\": " << max_rel_acc_kv
+       << ", \"max_rel_ref_codes\": " << max_rel_acc_ref
+        << ", \"first\": " << s3_first_json(first_acc, "d") << "}\n"
+        << "  ],\n"
+        << "  \"acc_probes\": [" << acc_probe_json << "],\n"
+        << "  \"verdict\": \"" << verdict << "\"\n}\n";
+    std::ofstream out(json_path);
+    if (!out) {
+        std::cerr << "S3_DUMP: cannot open " << json_path << " for write\n";
+        return 1;
+    }
+    out << js.str() << std::flush;
+    std::cout << "S3_DUMP " << label << "\n  verdict=" << verdict << "\n";
+    if (!score_clean) { std::cout << "  score diverges: " << s3_first_json(first_score, "i") << "\n"; }
+    if (!psf_clean) { std::cout << "  psf bug-diff: " << s3_first_json(first_psf, "nb") << "\n"; }
+    if (!pcode_clean) { std::cout << "  p_code bug-diff: " << s3_first_json(first_pcode, "j") << "\n"; }
+    if (!vsc_clean) { std::cout << "  v_scale diff: " << s3_first_json(first_vsc, "d") << "\n"; }
+    if (!vt_clean) { std::cout << "  v_t diff: " << s3_first_json(first_vt, "d") << "\n"; }
+    if (!m_clean) { std::cout << "  m diverges: " << s3_first_json(first_m, "c") << "\n"; }
+    if (!l_clean) { std::cout << "  l diverges: " << s3_first_json(first_l, "c") << "\n"; }
+    if (!acc_clean) { std::cout << "  acc (PV path) diverges: " << s3_first_json(first_acc, "d") << "\n"; }
+    if (guard_failures != 0) { std::cout << "  WARNING: " << guard_failures << " guard canaries failed\n"; }
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc > 2 && std::strcmp(argv[1], "--s3-dump") == 0) {
+        // tools/kdev: run the representative multi-tile sage A1 case (T=128, base=64
+        // -> 192 keys, 3 key tiles) through the s3 op-dump side-band.
+        if (cuda_unavailable()) {
+            std::cout << "SKIP: no usable CUDA device\n";
+            return 77;
+        }
+        const AttentionCase s3_case{128, 64, 256, 511u};
+        const int rc = s3_dump_case(kGeometries[0], s3_case, argv[2]);
+        std::cout << (rc == 0 ? "PASS" : "FAIL") << " gqa_attention s3-dump\n";
+        return rc;
+    }
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

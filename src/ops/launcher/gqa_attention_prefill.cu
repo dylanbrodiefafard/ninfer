@@ -17,9 +17,10 @@ namespace {
 
 template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& positions,
-                                                float scale, const CacheView& cache,
-                                                Metadata metadata, Tensor& out,
-                                                cudaStream_t stream, float keep_frac = 1.0f) {
+                                               float scale, const CacheView& cache,
+                                               Metadata metadata, Tensor& out,
+                                               cudaStream_t stream, float keep_frac = 1.0f,
+                                               GqaS3PrefillDump* dump = nullptr) {
     const Tensor& cache_k = cache.k_pages;
     const Tensor& cache_v = cache.v_pages;
     // Both dtype-specialized kernels exceed the default 48 KiB dynamic-smem ceiling.
@@ -56,7 +57,7 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                 static_cast<const std::uint8_t*>(cache_v_scale.data),
                 static_cast<const float*>(cache_k_mean.data), metadata,
                 static_cast<const std::int32_t*>(positions.data), scale,
-                 static_cast<__nv_bfloat16*>(out.data), tokens, keep_frac);
+                 static_cast<__nv_bfloat16*>(out.data), tokens, keep_frac, dump);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -233,16 +234,18 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
 
 void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positions, float scale,
                                            const PagedKVLayerView& cache, Tensor& out,
-                                           cudaStream_t stream, float keep_frac) {
+                                           cudaStream_t stream, float keep_frac,
+                                           GqaS3PrefillDump* dump) {
     const GqaPrefillDirectMetadata metadata{
         static_cast<const std::int32_t*>(cache.block_table.data)};
     if (q.ne[1] == Gqa27Geometry::QHeads) {
         gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(q, positions, scale, cache,
-                                                                 metadata, out, stream, keep_frac);
+                                                                  metadata, out, stream, keep_frac,
+                                                                  dump);
         return;
     }
     gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(q, positions, scale, cache, metadata,
-                                                             out, stream, keep_frac);
+                                                              out, stream, keep_frac, dump);
 }
 
 void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -258,8 +261,9 @@ void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positi
 
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                  const Tensor& positions, const Tensor& valid_columns,
-                                  const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
-                                  Tensor& out, cudaStream_t stream, float keep_frac) {
+                                 const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
+                                 Tensor& out, cudaStream_t stream, float keep_frac,
+                                 GqaS3PrefillDump* dump) {
     const auto launch = [&]<bool Masked>() {
         const GqaPrefillBatchMetadata<Masked> metadata{
             .tables = static_cast<const std::int32_t*>(cache.block_tables.data),
@@ -272,13 +276,13 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
             gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
             gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(q, positions, scale, cache,
                                                                       metadata, out, stream,
-                                                                      keep_frac);
+                                                                      keep_frac, dump);
             return;
         }
         gqa_kv_append_launch_for<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
         gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(q, positions, scale, cache,
                                                                   metadata, out, stream,
-                                                                  keep_frac);
+                                                                  keep_frac, dump);
     };
     if (valid_columns.data == nullptr) {
         launch.template operator()<false>();
