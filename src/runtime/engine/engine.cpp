@@ -307,6 +307,33 @@ GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options,
     return submit(std::move(prompt), std::move(options)).wait(sink, cancellation);
 }
 
+ScoreResult Engine::score(PreparedPrompt prompt, ScoreOptions options) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (prompt.impl_ == nullptr) { throw std::invalid_argument("PreparedPrompt is empty"); }
+    const PromptSummary prompt_summary = prompt.impl_->summary;
+    if (prompt_summary.prompt_tokens > impl_->options.max_context) {
+        throw RequestError(
+            RequestErrorKind::ContextLengthExceeded,
+            context_capacity_error(prompt_summary.prompt_tokens, impl_->options.max_context));
+    }
+    if (prompt_summary.prompt_tokens < 2) {
+        throw std::invalid_argument("score requires at least two prompt tokens");
+    }
+    if (options.schedule == ScoreSchedule::Decode && prompt_summary.prompt_tokens < 3) {
+        throw std::invalid_argument("decode score requires at least three prompt tokens");
+    }
+    return std::visit(
+        [&](auto& executor) -> ScoreResult {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                throw std::logic_error("concurrent Engine executor is unavailable");
+            } else {
+                return executor->score(std::move(prompt.impl_->value), options);
+            }
+        },
+        impl_->executor);
+}
+
 const EngineOptions& Engine::options() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return impl_->options;

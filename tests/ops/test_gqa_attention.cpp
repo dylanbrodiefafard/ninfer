@@ -2472,8 +2472,12 @@ int run_geometry(const Geometry& geometry) {
 
         if (!sage_only) {
             const AttentionCase a1_cases[] = {
-            {1, 0, 1, 201u},    {6, 17, 23, 202u},   {7, 17, 512, 203u},
-            {17, 31, 48, 204u}, {66, 63, 129, 205u},
+                {1, 0, 1, 201u},
+                {1, 63, 64, 206u},  // T=1 last token of page 0 (page size 64)
+                {1, 64, 65, 207u},  // T=1 first token of page 1
+                {1, 65, 66, 208u},  // T=1 one past the page boundary
+                {6, 17, 23, 202u},  {7, 17, 512, 203u},
+                {17, 31, 48, 204u}, {66, 63, 129, 205u},
         };
             for (const AttentionCase& test_case : a1_cases) {
                 failures += run_a1_case(geometry, dtype, test_case, MappingPattern::Identity);
@@ -3467,8 +3471,8 @@ int main(int argc, char** argv) {
         return rc;
     }
     if (cuda_unavailable()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
+        std::cerr << "FAIL: no usable CUDA device\n";
+        return 1;
     }
 
     int failures = 0;

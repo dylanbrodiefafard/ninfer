@@ -3,20 +3,30 @@
 
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "ninfer/ops/gdn_replay.h"
+#include "ninfer/ops/linear.h"
+#include "ninfer/ops/nll_from_logits.h"
+#include "targets/qwen3_6/impl/runtime/score_index.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/speculative_round.h"
+
+#include "core/arena.h"
+#include "core/device.h"
+#include "core/dtype.h"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 namespace {
@@ -2565,6 +2575,238 @@ void ProgramImplCore::reset_memory_peaks() noexcept {
     persistent.reset_peak();
     work.reset_peak();
     workspace_logical_peak_bytes = 0;
+}
+
+void ProgramImplCore::accumulate_prefill_nll(std::span<const TokenId> ids,
+                                             std::uint32_t chunk_begin,
+                                             std::uint32_t chunk_tokens, std::uint32_t skip,
+                                             ScoreResult& result) {
+    if (chunk_tokens == 0) { return; }
+    const std::uint32_t prompt_tokens = static_cast<std::uint32_t>(ids.size());
+    if (chunk_begin >= prompt_tokens) { return; }
+    const std::uint32_t available = std::min(chunk_tokens, prompt_tokens - chunk_begin);
+    if (prefill_hidden.dtype != DType::BF16 || prefill_hidden.ne[0] != TextConfig::hidden ||
+        prefill_hidden.ne[1] < static_cast<std::int32_t>(available)) {
+        throw std::logic_error("score prefill hidden does not match the chunk");
+    }
+
+    const std::vector<std::int32_t> targets =
+        prefill_chunk_targets(ids, chunk_begin, chunk_tokens, skip);
+    for (const std::int32_t target : targets) {
+        if (target < 0 || target >= TextConfig::token_domain) {
+            throw std::out_of_range("score target token is outside the checkpoint vocabulary");
+        }
+    }
+    if (targets.empty()) { return; }
+
+    const std::uint32_t first_scored = std::max(chunk_begin, skip);
+    const std::int32_t hidden_origin = static_cast<std::int32_t>(first_scored - chunk_begin);
+
+    constexpr std::int32_t kSlice = 64;
+    const auto scored             = static_cast<std::int32_t>(targets.size());
+    DeviceArena score_workspace(
+        static_cast<std::size_t>(TextConfig::output_rows) * static_cast<std::size_t>(kSlice) *
+            dtype_size(DType::BF16) +
+        static_cast<std::size_t>(kSlice) * (sizeof(std::int32_t) + sizeof(float)) + 4096);
+    std::vector<float> host_nll(static_cast<std::size_t>(kSlice));
+
+    for (std::int32_t begin = 0; begin < scored; begin += kSlice) {
+        const std::int32_t width = std::min(kSlice, scored - begin);
+        score_workspace.reset();
+        Tensor hidden        = prefill_hidden.slice(1, hidden_origin + begin, width);
+        Tensor logits        = score_workspace.alloc(DType::BF16, {TextConfig::output_rows, width});
+        Tensor target_tensor = score_workspace.alloc(DType::I32, {width});
+        Tensor nll           = score_workspace.alloc(DType::FP32, {width});
+        CUDA_CHECK(cudaMemcpyAsync(target_tensor.data, targets.data() + begin,
+                                   static_cast<std::size_t>(width) * sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice, device.stream));
+        ops::linear(hidden, model.output_head, logits, device.stream);
+        ops::nll_from_logits(logits, target_tensor, nll, TextConfig::token_domain, device.stream);
+        CUDA_CHECK(cudaMemcpyAsync(host_nll.data(), nll.data,
+                                   static_cast<std::size_t>(width) * sizeof(float),
+                                   cudaMemcpyDeviceToHost, device.stream));
+        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+        for (std::int32_t i = 0; i < width; ++i) {
+            record_score_nll(result, static_cast<double>(host_nll[static_cast<std::size_t>(i)]));
+        }
+    }
+}
+
+void ProgramImplCore::accumulate_decode_nll(const Tensor& logits, TokenId target,
+                                            ScoreResult& result, DeviceArena& score_workspace) {
+    if (target < 0 || target >= TextConfig::token_domain) {
+        throw std::out_of_range("score target token is outside the checkpoint vocabulary");
+    }
+    score_workspace.reset();
+    Tensor target_tensor = score_workspace.alloc(DType::I32, {1});
+    Tensor nll           = score_workspace.alloc(DType::FP32, {1});
+    const std::int32_t host_target = target;
+    CUDA_CHECK(cudaMemcpyAsync(target_tensor.data, &host_target, sizeof(host_target),
+                               cudaMemcpyHostToDevice, device.stream));
+    ops::nll_from_logits(logits, target_tensor, nll, TextConfig::token_domain, device.stream);
+    float host_nll = 0.0f;
+    CUDA_CHECK(cudaMemcpyAsync(&host_nll, nll.data, sizeof(host_nll), cudaMemcpyDeviceToHost,
+                               device.stream));
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    record_score_nll(result, static_cast<double>(host_nll));
+}
+
+void ProgramImplCore::run_prefill_score(PreparedPromptData&& prompt, RequestPlan&& plan,
+                                        runtime::TransientRegion transient,
+                                        std::span<const TokenId> ids, std::uint32_t skip,
+                                        ScoreResult& result) {
+    std::uint32_t cursor = 0;
+    try {
+        runtime::PrefillStepResult step =
+            start_prefill_lane(0, std::move(prompt), std::move(plan), transient);
+        if (step.processed_prompt_tokens > 0) {
+            accumulate_prefill_nll(ids, cursor, step.processed_prompt_tokens, skip, result);
+            cursor += step.processed_prompt_tokens;
+        }
+        while (!step.complete) {
+            step = advance_prefill_lane(0);
+            if (step.processed_prompt_tokens > 0) {
+                accumulate_prefill_nll(ids, cursor, step.processed_prompt_tokens, skip, result);
+                cursor += step.processed_prompt_tokens;
+            }
+        }
+        abort_lane(0);
+    } catch (...) {
+        abort_lane(0);
+        throw;
+    }
+}
+
+void ProgramImplCore::run_decode_score(PreparedPromptData&& prompt,
+                                       runtime::TransientRegion transient,
+                                       std::span<const TokenId> ids, std::uint32_t prefix,
+                                       ScoreResult& result) {
+    if (speculative_backend == SpeculativeBackend::DFlash) {
+        throw std::invalid_argument(
+            "decode score does not yet teacher-force DFlash; use ordinary or MTP");
+    }
+    if (prompt.has_media()) {
+        throw std::invalid_argument("decode score is text-only");
+    }
+    const auto n = static_cast<std::uint32_t>(ids.size());
+    if (prefix == 0 || prefix + 1 >= n || prefix > static_cast<std::uint32_t>(prompt.token_ids.size())) {
+        throw std::invalid_argument("decode score prefix is outside the prompt");
+    }
+
+    const std::size_t old_n = prompt.token_ids.size();
+    if (prompt.token_types.size() != old_n || prompt.positions.size() != 3 * old_n) {
+        throw std::invalid_argument("prepared prompt metadata does not match token count");
+    }
+    std::vector<std::int32_t> prefix_positions(static_cast<std::size_t>(prefix) * 3);
+    for (int axis = 0; axis < 3; ++axis) {
+        for (std::uint32_t i = 0; i < prefix; ++i) {
+            prefix_positions[static_cast<std::size_t>(axis) * prefix + i] =
+                prompt.positions[static_cast<std::size_t>(axis) * old_n + i];
+        }
+    }
+    prompt.token_ids.resize(prefix);
+    prompt.token_types.resize(prefix);
+    prompt.positions = std::move(prefix_positions);
+    prompt.identity.rewrite_checkpoint.reset();
+
+    DeviceArena score_workspace(4096);
+    runtime::ResolvedExecutionOptions execution;
+    execution.sampling.temperature    = 0.0F;
+    execution.requested_output_tokens = n - prefix;
+    execution.allow_prefix_reuse      = false;
+    RequestBasePlan base              = plan_request_base(prompt, execution);
+    RequestPlan plan                  = plan_request_for_lane(0, prompt, base);
+
+    try {
+        runtime::PrefillStepResult step =
+            start_prefill_lane(0, std::move(prompt), std::move(plan), transient);
+        while (!step.complete) { step = advance_prefill_lane(0); }
+        SequenceState& sequence = sequences[0];
+        if (sequence.ledger.size() != prefix + 1) {
+            throw std::logic_error("decode score prefix ledger is not prompt plus sampled token");
+        }
+        sequence.ledger.back() = ids[prefix];
+        if (speculative_backend == SpeculativeBackend::Mtp) {
+            sequence.mtp_draft_count = 0;
+        }
+        resolve_prefill_lane(0, false);
+
+        const std::array<std::uint32_t, 1> lanes{0};
+        const std::array<runtime::RoundBudget, 1> budgets{
+            runtime::RoundBudget{.generated_tokens_remaining = 1}};
+        const std::array<std::uint32_t, 1> accepted{1};
+        const std::array<std::uint8_t, 1> terminal{0};
+        const std::array<std::uint8_t, 1> cancelled{0};
+        for (std::uint32_t position = prefix; position + 1 < n; ++position) {
+            if (sequence.ledger.back() != ids[position]) {
+                throw std::logic_error("decode score ledger lost teacher-forced alignment");
+            }
+            Tensor logits;
+            if (speculative_backend == SpeculativeBackend::Mtp) {
+                (void)decode_mtp_batch(lanes, budgets);
+                if (!io.mtp_decode) {
+                    throw std::logic_error("MTP decode score has no target logits");
+                }
+                // T=1 target-verify column of [vocab, draft_window+1, batch].
+                logits = io.mtp_decode->target_logits.slice(2, 0, 1).slice(1, 0, 1);
+            } else {
+                (void)decode_ordinary_batch(lanes, budgets);
+                if (!io.ordinary) {
+                    throw std::logic_error("ordinary decode score has no logits");
+                }
+                logits = io.ordinary->logits.slice(1, 0, 1);
+            }
+            accumulate_decode_nll(logits, ids[position + 1], result, score_workspace);
+            if (speculative_backend == SpeculativeBackend::Mtp) {
+                // MTP resolve inserts licensed tokens; replace the committed token with gold
+                // and drop the model's next drafts so the following step stays T=1 verify.
+                resolve_pending_batch(lanes, accepted, terminal, cancelled);
+                sequence.ledger.back()   = ids[position + 1];
+                sequence.mtp_draft_count = 0;
+            } else {
+                sequence.ledger.back() = ids[position + 1];
+                resolve_pending_batch(lanes, accepted, terminal, cancelled);
+            }
+        }
+        abort_lane(0);
+    } catch (...) {
+        abort_lane(0);
+        throw;
+    }
+}
+
+ScoreResult ProgramImplCore::score(PreparedPromptData&& prompt, RequestPlan&& plan,
+                                   runtime::TransientRegion transient, ScoreOptions options) {
+    const auto started                   = Clock::now();
+    const std::uint32_t prompt_tokens    = static_cast<std::uint32_t>(prompt.token_ids.size());
+    const std::vector<TokenId> token_ids = prompt.token_ids;
+    if (prompt_tokens < 2) {
+        throw std::invalid_argument("score requires at least two prompt tokens");
+    }
+    const std::uint32_t skip = resolve_score_skip(prompt_tokens, options.skip_tokens);
+
+    ScoreResult result;
+    result.schedule      = options.schedule;
+    result.prompt_tokens = prompt_tokens;
+    result.skip_tokens   = skip;
+    if (prompt_tokens > skip + 1) {
+        result.token_nlls.reserve(prompt_tokens - skip - 1);
+    }
+    if (options.schedule == ScoreSchedule::Decode) {
+        const std::uint32_t prefix = resolve_decode_prefix(prompt_tokens, skip);
+        result.skip_tokens         = prefix;
+        run_decode_score(std::move(prompt), transient, token_ids, prefix, result);
+        (void)plan;
+    } else {
+        run_prefill_score(std::move(prompt), std::move(plan), transient, token_ids, skip, result);
+    }
+
+    result.score_seconds = std::chrono::duration<double>(Clock::now() - started).count();
+    if (result.tokens_scored > 0) {
+        result.mean_nll   = result.sum_nll / static_cast<double>(result.tokens_scored);
+        result.perplexity = std::exp(result.mean_nll);
+    }
+    return result;
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

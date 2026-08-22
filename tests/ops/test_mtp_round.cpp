@@ -128,8 +128,8 @@ int run_case(int k, const std::vector<std::int32_t>& accepted) {
 
 int main() {
     if (cuda_unavailable()) {
-        std::cout << "mtp_round: SKIP (CUDA unavailable)\n";
-        return 77;
+        std::cerr << "FAIL: no usable CUDA device\n";
+        return 1;
     }
 
     int failures = 0;

@@ -421,8 +421,8 @@ int batch_selector_case(bool cyclic) {
 
 int main() {
     if (cuda_unavailable()) {
-        std::cout << "kv_cache_append_prefix: SKIP (CUDA unavailable)\n";
-        return 77;
+        std::cerr << "FAIL: no usable CUDA device\n";
+        return 1;
     }
 
     int failures = 0;

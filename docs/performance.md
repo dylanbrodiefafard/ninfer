@@ -14,7 +14,9 @@ Tested Git revisions:
   `b3d4d0f50b868711c62432bbd68e746217a2f49a`;
 - Qwen3.6-27B groupwise-int MTP3: `5ea3242a206cdb0c4c1beaeb9d8a3048e6248423`;
 - Qwen3.6-35B-A3B MTP0 and Qwen3.6-27B groupwise-int MTP0:
-  `0795169393cab0f2c16246d4bac20dee735dc2a4`.
+  `0795169393cab0f2c16246d4bac20dee735dc2a4`;
+- Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
+  `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
 The serving measurements characterize the two measured Qwen3.6 model IDs independently on one
 NVIDIA GeForce RTX 5090. They cover long-context prefill and baseline decode with speculative
@@ -22,7 +24,9 @@ decoding disabled, plus long-reasoning and cross-scenario decode with MTP and DF
 results report its `groupwise-int` and `nvfp4` weight profiles separately. The concurrent
 decode-saturation campaign measures the same three Qwen3.6 artifact profiles at C=1, 2, 4, and 8.
 A separate C=1 Qwen3.8-27B NVFP4 campaign below compares MTP0/3/5 with DFlash2 k=7 on the same
-frozen AIME command.
+frozen AIME command. Qwen3.8-27B NVFP4 accuracy uses
+[Ostfralla/Qwen3.8-27B-NVFP4-NInfer](https://huggingface.co/Ostfralla/Qwen3.8-27B-NVFP4-NInfer)
+with INT8 and NVFP4 KV.
 
 The single-request corpus requests were submitted serially to a persistent `ninfer-serve` process
 over the loopback OpenAI-compatible HTTP endpoint. Each reported corpus fixture used five fixed
@@ -251,6 +255,58 @@ Then run the repository's full 27B reasoning suite in a separate shell:
 ```bash
 PYTHONPATH=eval eval/.venv/bin/python -m ninfer_eval run \
   --config eval/configs/qwen3_6_27b_reasoning.yaml \
+  --suite reasoning_full
+```
+
+## `qwen3_8_27b`
+
+### EvalScope reasoning accuracy
+
+The measured file is
+[`Ostfralla/Qwen3.8-27B-NVFP4-NInfer`](https://huggingface.co/Ostfralla/Qwen3.8-27B-NVFP4-NInfer)
+(`qwen3_8_27b_nvfp4.ninfer`, SHA-256
+`eaf8ad124256d0a0c1ebbbca442ca58eee4f97ab34a60a0b4d57e2b41e2c56d2`). That `nvfp4` weights identity
+was evaluated twice through NInfer's OpenAI-compatible serving route with thinking enabled, MTP=3,
+and a 262,144-token context limit. The two runs differ only in `--kv-dtype`. EvalScope 1.9.0 used
+0-shot prompts, rule-based scoring, and one sample per problem with temperature 0.6, top-p 0.95,
+top-k 20, presence penalty 1.0, and seed 42. All 258 samples completed and were scored for each KV
+codec.
+
+| KV | AIME 2025 | AIME 2026 | GPQA-Diamond |
+|---|---:|---:|---:|
+| `int8` | 100.00% (30 / 30) | 96.67% (29 / 30) | 89.90% (178 / 198) |
+| `nvfp4` | 93.33% (28 / 30) | 100.00% (30 / 30) | 92.42% (183 / 198) |
+
+These are single-sample results under the stated evaluation profile, not pass@k scores. Each
+benchmark remains independently reportable; no combined score is computed. Qwen3.8-27B
+`groupwise-int` was not part of this campaign.
+
+Download the measured artifact, start the model service with the matching `--kv-dtype`, and then
+run the 3.8 reasoning suite:
+
+```bash
+hf download Ostfralla/Qwen3.8-27B-NVFP4-NInfer \
+  qwen3_8_27b_nvfp4.ninfer \
+  --local-dir models
+```
+
+```bash
+build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+  --host 127.0.0.1 --port 18080 \
+  --max-context 262144 --prefill-chunk 1024 --kv-dtype int8 \
+  --spec mtp --draft-tokens 3 --lm-head-draft
+```
+
+```bash
+build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+  --host 127.0.0.1 --port 18080 \
+  --max-context 262144 --prefill-chunk 1024 --kv-dtype nvfp4 \
+  --spec mtp --draft-tokens 3 --lm-head-draft
+```
+
+```bash
+PYTHONPATH=eval eval/.venv/bin/python -m ninfer_eval run \
+  --config eval/configs/qwen3_8_27b_reasoning.yaml \
   --suite reasoning_full
 ```
 

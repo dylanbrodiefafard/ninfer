@@ -152,8 +152,8 @@ int dump_case(const char* label, const Shape& shape, std::uint32_t seed, float s
 
 int main(int argc, char** argv) {
     if (cuda_unavailable()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
+        std::cerr << "FAIL: no usable CUDA device\n";
+        return 1;
     }
 
     struct Case {

@@ -12,8 +12,8 @@ using namespace ninfer::test;
 
 int main() {
     if (cuda_unavailable()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
+        std::cerr << "FAIL: no usable CUDA device\n";
+        return 1;
     }
 
     constexpr std::int32_t d = targets::qwen3_6_27b::detail::TextConfig::hidden;

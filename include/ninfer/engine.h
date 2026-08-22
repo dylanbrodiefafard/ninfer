@@ -85,6 +85,10 @@ public:
                               OutputSink* sink                     = nullptr,
                               const CancellationView& cancellation = {});
 
+    // Teacher-forced next-token NLL over a prepared token sequence. Does not sample, decode,
+    // or change generate/serve graphs. Used only by the perplexity tool.
+    [[nodiscard]] ScoreResult score(PreparedPrompt prompt, ScoreOptions options = {});
+
     [[nodiscard]] const EngineOptions& options() const;
     [[nodiscard]] LoadSummary load_summary() const;
     [[nodiscard]] MemorySummary memory_summary() const;

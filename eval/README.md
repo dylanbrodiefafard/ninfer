@@ -27,6 +27,9 @@ Installing dependencies does not download the Qwen model or create a `.ninfer` a
 See [`configs/capability-suite.yaml`](configs/capability-suite.yaml) for the initial AIME25,
 AIME26, GPQA-Diamond, and BFCL-v4 suites, and [`configs/mock-suite.yaml`](configs/mock-suite.yaml)
 for a network-free example.
+[`configs/qwen3_6_27b_reasoning.yaml`](configs/qwen3_6_27b_reasoning.yaml) and
+[`configs/qwen3_8_27b_reasoning.yaml`](configs/qwen3_8_27b_reasoning.yaml) are the published
+AIME25, AIME26, and GPQA-Diamond reasoning suites for those 27B identities.
 
 [`configs/qwen3_6_35b_needle_haystack.yaml`](configs/qwen3_6_35b_needle_haystack.yaml)
 defines the 35B-A3B Needle-in-a-Haystack profiles separately: `standard` preserves EvalScope's
