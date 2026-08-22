@@ -3,6 +3,7 @@
 // ninfer::ops - L2Norm kernels over contiguous BF16 rows.
 
 #include "ops/common/warp.cuh"
+#include "ninfer/ops/l2norm.h"
 
 #include <cuda_bf16.h>
 
@@ -14,7 +15,7 @@ namespace ninfer::ops {
 template <int Block>
 __launch_bounds__(Block) __global__
     void l2norm_warp_bf16x2_kernel(const __nv_bfloat162* x, __nv_bfloat162* out, std::int32_t d,
-                                   std::int64_t rows, float eps) {
+                                   std::int64_t rows, float eps, L2NormDump* dump) {
     static_assert(Block % kWarpSize == 0);
     constexpr int kWarpsPerBlock   = Block / kWarpSize;
     constexpr int kMaxPairsPerLane = 4;
@@ -38,9 +39,13 @@ __launch_bounds__(Block) __global__
         }
     }
 
-    sum       = warp_reduce_sum(sum);
-    float inv = lane == 0 ? rsqrtf(sum + eps) : 0.0f;
-    inv       = __shfl_sync(kFullWarpMask, inv, 0);
+    sum = warp_reduce_sum(sum);
+    float inv = 0.0f;
+    if (lane == 0) {
+        inv = rsqrtf(sum + eps);
+        if (dump) { dump->sumsq[row] = sum; dump->inv_r[row] = inv; } // op_dump side-band
+    }
+    inv = __shfl_sync(kFullWarpMask, inv, 0);
 
 #pragma unroll
     for (int k = 0; k < kMaxPairsPerLane; ++k) {
@@ -55,7 +60,7 @@ __launch_bounds__(Block) __global__
 // Functional fallback for unaligned data and widths outside the aligned fast domain.
 __launch_bounds__(512) __global__
     void l2norm_generic_kernel(const __nv_bfloat16* x, __nv_bfloat16* out, std::int32_t d,
-                               std::int64_t rows, float eps) {
+                               std::int64_t rows, float eps, L2NormDump* dump) {
     constexpr int kRowsPerBlock = 512 / kWarpSize;
     const int lane              = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
     const int warp              = static_cast<int>(threadIdx.x) / kWarpSize;
@@ -69,9 +74,13 @@ __launch_bounds__(512) __global__
         sum += value * value;
     }
 
-    sum       = warp_reduce_sum(sum);
-    float inv = lane == 0 ? rsqrtf(sum + eps) : 0.0f;
-    inv       = __shfl_sync(kFullWarpMask, inv, 0);
+    sum = warp_reduce_sum(sum);
+    float inv = 0.0f;
+    if (lane == 0) {
+        inv = rsqrtf(sum + eps);
+        if (dump) { dump->sumsq[row] = sum; dump->inv_r[row] = inv; } // op_dump side-band
+    }
+    inv = __shfl_sync(kFullWarpMask, inv, 0);
     for (std::int64_t i = lane; i < static_cast<std::int64_t>(d); i += kWarpSize) {
         const std::int64_t index = base + i;
         out[index]               = __float2bfloat16_rn(__bfloat162float(x[index]) * inv);
