@@ -24,6 +24,7 @@
 #include "ops/kernel/gqa_attention_kv_nvfp4.cuh"
 
 #include <cuda_bf16.h>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <vector>
@@ -115,11 +116,13 @@ int main() {
 
     std::printf("ninfer gqa-attention nvfp4s3 bench (geom=27B q=%d kv=%d hdim=%d code=%d groups=%d window=%d)\n",
                  kQHeads, kKVHeads, kHeadDim, kCodeW, kGroups, kQueryWin);
-    std::printf("%-8s %12s %12s %14s %12s %10s\n", "context", "window", "fill(us)", "attn median(us)",
-                 "attn p95(us)", "attn GB/s");
+    print_device_caps("gqa-nvfp4s3-prefill");
+    std::printf("%-8s %8s %12s %14s %12s %10s %10s\n", "context", "window", "fill(us)", "attn median(us)",
+                 "attn p95(us)", "attn GB/s", "attn TF/s");
     std::printf("------------------------------------------------------------------------------\n");
 
-    const std::vector<int> contexts = {2048, 4096, 8192, 16384, 32768, 65536};
+    const std::vector<int> contexts = {128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
+                                       65536, 98304, 153600};
     for (int context : contexts) {
         Nvfp4s3Cache cache = make_cache(context);
 
@@ -141,17 +144,20 @@ int main() {
         const ColdTiming fill_timing = measure_launch(fill_launch, stream, 2, 8);
 
         // Query window at the tail of the context (the dominant prefill attention cost).
-        const std::size_t q_elems = static_cast<std::size_t>(kQueryWin) * kQHeads * kHeadDim;
+        // For contexts shorter than the production chunk the whole context is the
+        // query window (self-attention); otherwise the last chunk (kQueryWin) is.
+        const int window = std::min(kQueryWin, context);
+        const std::size_t q_elems = static_cast<std::size_t>(window) * kQHeads * kHeadDim;
         DeviceBuffer q_src = make_bf16(q_elems);
         DeviceBuffer out_buf = DeviceBuffer(static_cast<std::size_t>(q_elems) * 2);
-        std::vector<std::int32_t> h_pos_q(kQueryWin);
-        for (int i = 0; i < kQueryWin; ++i) h_pos_q[i] = (context - kQueryWin) + i;
-        DeviceBuffer pos_q(static_cast<std::size_t>(kQueryWin) * sizeof(std::int32_t));
-        pos_q.copy_from_host(h_pos_q.data(), static_cast<std::size_t>(kQueryWin) * sizeof(std::int32_t));
+        std::vector<std::int32_t> h_pos_q(window);
+        for (int i = 0; i < window; ++i) h_pos_q[i] = (context - window) + i;
+        DeviceBuffer pos_q(static_cast<std::size_t>(window) * sizeof(std::int32_t));
+        pos_q.copy_from_host(h_pos_q.data(), static_cast<std::size_t>(window) * sizeof(std::int32_t));
 
-        Tensor q_t = Tensor(q_src.p, DType::BF16, {kHeadDim, kQHeads, kQueryWin});
-        Tensor pos_q_t = Tensor(pos_q.p, DType::I32, {kQueryWin});
-        Tensor out_t = Tensor(out_buf.p, DType::BF16, {kHeadDim, kQHeads, kQueryWin});
+        Tensor q_t = Tensor(q_src.p, DType::BF16, {kHeadDim, kQHeads, window});
+        Tensor pos_q_t = Tensor(pos_q.p, DType::I32, {window});
+        Tensor out_t = Tensor(out_buf.p, DType::BF16, {kHeadDim, kQHeads, window});
         auto attn_launch = [&](cudaStream_t s) {
             detail::gqa_attention_prompt_attention_launch(q_t, pos_q_t, kScale, cache.view, out_t, s, keep_frac);
         };
@@ -163,9 +169,13 @@ int main() {
         const double bytes_moved =
             static_cast<double>(context) * (2 * (kCodeW + kGroups)) +  // K/V codes + scales
             2 * static_cast<double>(q_elems) * 2.0;  // q in + out (bf16)
-        std::printf("%-8d %8zu %12.1f %12.1f %14.1f %10.1f\n",
-                 context, static_cast<std::size_t>(kQueryWin), fill_timing.median_us,
-                 attn.median_us, attn.p95_us, bytes_moved / (attn.median_us * 1e-6) / 1e9);
+        // Useful tensor-core FLOPs: QK^T + PV mma over the full context for each
+        // query in the window (2 mma x 2 FLOP/MAC x QHeads x window x context x hdim).
+        const double useful_flops = 4.0 * static_cast<double>(kQHeads) * window * context * kHeadDim;
+        const double tflops = useful_flops / (attn.median_us * 1e-6) / 1.0e12;
+        std::printf("%-8d %8d %12.1f %12.1f %14.1f %10.1f %10.1f\n",
+                 context, window, fill_timing.median_us,
+                 attn.median_us, attn.p95_us, bytes_moved / (attn.median_us * 1e-6) / 1e9, tflops);
     }
     return 0;
 }

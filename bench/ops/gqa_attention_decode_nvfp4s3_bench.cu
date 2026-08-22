@@ -33,6 +33,7 @@
 #include "ops/kernel/gqa_attention_kv_nvfp4.cuh"
 
 #include <cuda_bf16.h>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <vector>
@@ -108,11 +109,13 @@ int main() {
 
     std::printf("ninfer gqa-decode nvfp4s3 bench (geom=27B q=%d kv=%d hdim=%d code=%d groups=%d)\n",
                  kQHeads, kKVHeads, kHeadDim, kCodeW, kGroups);
-    std::printf("%-8s %8s %12s %14s %12s %10s\n", "context", "tokens", "fill(us)", "dec median(us)",
-                 "dec p95(us)", "dec GB/s");
+    print_device_caps("gqa-nvfp4s3-decode");
+    std::printf("%-8s %6s %12s %14s %12s %10s %10s\n", "context", "tokens", "fill(us)", "dec median(us)",
+                 "dec p95(us)", "dec GB/s", "dec TF/s");
     std::printf("--------------------------------------------------------------------------------\n");
 
-    const std::vector<int> contexts = {2048, 4096, 8192, 16384, 32768, 65536};
+    const std::vector<int> contexts = {128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
+                                       65536, 98304, 153600};
     const std::vector<int> tokens_list = {1, 2, 4, 6};
     for (int context : contexts) {
         Nvfp4s3Cache cache = make_cache(context);
@@ -160,12 +163,15 @@ int main() {
 
             // GB/s moved by the decode kernel: read the K+V codes + scales for `context` keys
             // (per query token) and the tiny q/out traffic. (Informational; ncu is the real gate.)
-            const double bytes_moved =
-                static_cast<double>(context) * tokens * (2 * (kCodeW + kGroups)) +
-                2 * static_cast<double>(tokens) * kQHeads * kHeadDim * 2.0;  // q in + out (bf16)
-            std::printf("%-8d %8d %12.1f %12.1f %14.1f %10.1f\n",
-                         context, tokens, fill_timing.median_us,
-                         dec.median_us, dec.p95_us, bytes_moved / (dec.median_us * 1e-6) / 1e9);
+        const double bytes_moved =
+            static_cast<double>(context) * tokens * (2 * (kCodeW + kGroups)) +
+            2 * static_cast<double>(tokens) * kQHeads * kHeadDim * 2.0;  // q in + out (bf16)
+        // Useful tensor-core FLOPs: QK^T + PV mma (2 mma x 2 FLOP/MAC x QHeads x tokens x context x hdim).
+        const double useful_flops = 4.0 * static_cast<double>(kQHeads) * tokens * context * kHeadDim;
+        const double tflops = useful_flops / (dec.median_us * 1e-6) / 1.0e12;
+        std::printf("%-8d %6d %12.1f %12.1f %14.1f %10.1f %10.1f\n",
+                     context, tokens, fill_timing.median_us,
+                     dec.median_us, dec.p95_us, bytes_moved / (dec.median_us * 1e-6) / 1e9, tflops);
         }
     }
     return 0;
