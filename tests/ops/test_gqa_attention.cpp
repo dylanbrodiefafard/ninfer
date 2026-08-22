@@ -2542,6 +2542,14 @@ int run_geometry(const Geometry& geometry) {
                     run_a1_case(geometry, dtype, {128, 0, 128, 515u}, MappingPattern::Identity,
                                 true);
             }
+            // T=1 decode width (the production decode lane; PPL decode cells run T=1
+            // SmallT keep_frac=1.0 here): A1 append route at the Bc=32 tier (window 64
+            // exercises the <16,1,32> dispatch tier) and the cached route at the Bc=64
+            // dynamic-arena tier. GQA_KEEP_FRAC unset = exact sage (keep_frac 1.0).
+            failures += run_a1_case(geometry, dtype, {1, 63, 64, 516u}, MappingPattern::Identity,
+                                    /*sage=*/true);
+            failures += run_a3_case(geometry, dtype, {1, 2048, 4096, 517u},
+                                    MappingPattern::Identity, /*sage=*/true);
         }
 
         if (geometry.q_heads == 16 && !sage_only) {
