@@ -3,6 +3,7 @@
 #include "ninfer/ops/gqa_attention.h"
 #include "ops/op_tester.h"
 
+#include <cuda_fp16.h>
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
 
@@ -480,6 +481,13 @@ double decode_e4m3fn_word(std::uint8_t word) {
 
 std::uint8_t encode_e4m3fn_rne(float value) {
     return static_cast<std::uint8_t>(__nv_cvt_float_to_fp8(value, __NV_SATFINITE, __NV_E4M3));
+}
+
+// Round a host value to IEEE binary16 (f16, 11-bit significand) — the P element
+// at the "f16 width" of the P-width floor sweep (the near-exact upper bound).
+double f16_rne(double value) {
+    const __half half_value = __float2half_rn(static_cast<float>(value));
+    return static_cast<double>(static_cast<float>(half_value));
 }
 
 void encode_nvfp4_group(const std::vector<float>& source, std::size_t source_base,
@@ -1150,6 +1158,140 @@ std::vector<double> sage_ideal_attention(const std::vector<float>& q, const Host
     return output;
 }
 
+// P-element-width floor sweep. Holds Q and V at the kernel's NVFP4-e2m1 state and
+// varies ONLY the P element width: p_width 0 = e2m1 (the kernel, kernel-faithful
+// amplify + per-16-key e4m3 block scale), 1 = e4m3 (wider element + the same block
+// scale), 2 = f16 (near-exact upper bound). All P values are expressed in raw-softmax
+// units, so the three widths are directly comparable; the output is the PV against
+// the exact (unquantized) softmax denominator. Rel_L2 against ideal_attention is the
+// P-quant contribution to the total floor at that width.
+std::vector<double> sage_pwidth_reference(const std::vector<float>& q, const HostCache& cache,
+                                          const std::vector<std::int32_t>& positions, int p_width) {
+    constexpr double kLog2E = 1.4426950408889634;
+    constexpr double kAmp   = 2688.0;   // 448 * 6 (e2m1 amplify, cancels in the denominator)
+    constexpr double kSMax  = 448.0;   // e4m3 max finite
+    static const double kPTable[8] = {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0};
+    const Geometry& geometry  = cache.geometry;
+    const std::int32_t tokens = static_cast<std::int32_t>(positions.size());
+    std::vector<double> output(static_cast<std::size_t>(kHeadDim) *
+                               static_cast<std::size_t>(geometry.q_heads) *
+                               static_cast<std::size_t>(tokens));
+
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        const std::int32_t visible = positions[static_cast<std::size_t>(token)] + 1;
+        for (std::int32_t q_head = 0; q_head < geometry.q_heads; ++q_head) {
+            const std::int32_t kv_head = q_head / geometry.query_group();
+            // NVFP4 Q-quant (kernel state) — identical to sage_ideal_attention.
+            std::vector<double> q_log(kHeadDim, 0.0);
+            for (std::int32_t grp = 0; grp < kHeadDim / kNvfp4Group; ++grp) {
+                float absmax = 0.0f;
+                for (std::int32_t i = 0; i < kNvfp4Group; ++i) {
+                    const std::int32_t d = grp * kNvfp4Group + i;
+                    absmax = std::max(absmax, std::abs(q[q_index(geometry, q_head, d, token)]));
+                }
+                const std::uint8_t scale_bits = encode_e4m3fn_rne(absmax / 6.0f);
+                const float stored_scale = static_cast<float>(decode_e4m3fn_word(scale_bits));
+                for (std::int32_t pair = 0; pair < kNvfp4Group / 2; ++pair) {
+                    const std::int32_t d0 = grp * kNvfp4Group + 2 * pair;
+                    const std::int32_t d1 = d0 + 1;
+                    float x = 0.0f;
+                    float y = 0.0f;
+                    if (stored_scale != 0.0f) {
+                        x = q[q_index(geometry, q_head, d0, token)] / stored_scale;
+                        y = q[q_index(geometry, q_head, d1, token)] / stored_scale;
+                    }
+                    const float2 packed = {x, y};
+                    const std::uint8_t code =
+                        __nv_cvt_float2_to_fp4x2(packed, __NV_E2M1, cudaRoundNearest);
+                    q_log[static_cast<std::size_t>(d0)] =
+                        static_cast<double>(decode_e2m1_word(code & 0x0Fu)) * stored_scale;
+                    q_log[static_cast<std::size_t>(d1)] =
+                        static_cast<double>(decode_e2m1_word((code >> 4) & 0x0Fu)) * stored_scale;
+                }
+            }
+            // NVFP4 K scores + unnormalized softmax weights (the denominator stays exact).
+            std::vector<double> p(visible, 0.0);
+            double max_score          = -std::numeric_limits<double>::infinity();
+            for (std::int32_t position = 0; position < visible; ++position) {
+                double dot = 0.0;
+                for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                    dot += q_log[static_cast<std::size_t>(d)] *
+                           cache_value(cache, true, kv_head, position, d);
+                }
+                const double score = dot * static_cast<double>(kAttentionScale);
+                p[static_cast<std::size_t>(position)] = score;
+                max_score                              = std::max(max_score, score);
+            }
+            double l_sum = 0.0;
+            for (std::int32_t position = 0; position < visible; ++position) {
+                p[static_cast<std::size_t>(position)] =
+                    (p[static_cast<std::size_t>(position)] == -std::numeric_limits<double>::infinity())
+                        ? 0.0
+                        : std::exp2(kLog2E * (p[static_cast<std::size_t>(position)] - max_score));
+                l_sum += p[static_cast<std::size_t>(position)];
+            }
+            // PV with P at the requested width; Q/V held at NVFP4-e2m1.
+            std::vector<double> value(kHeadDim, 0.0);
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                double acc = 0.0;
+                for (std::int32_t kb = 0; kb < visible; kb += 16) {
+                    const std::int32_t k1 = std::min(kb + 16, visible);
+                    double block_max = 0.0;
+                    for (std::int32_t k = kb; k < k1; ++k)
+                        block_max = std::max(block_max, p[static_cast<std::size_t>(k)]);
+                    const double v_dec = static_cast<double>(decode_e4m3fn_word(
+                        cache.v_fp8[sage_v_scale_host_index(cache.logical_capacity, kv_head,
+                                                             kb / kPagedKVPageSize, d,
+                                                             (kb % kPagedKVPageSize) / 16)]));
+                    double pv = 0.0;
+                    for (std::int32_t k = kb; k < k1; ++k) {
+                        const double p_raw = p[static_cast<std::size_t>(k)];
+                        const std::size_t v_code_idx =
+                            nvfp4_code_index(geometry, cache.logical_capacity, kv_head, k, d / 2);
+                        const std::uint8_t v_byte   = cache.v_u8[v_code_idx];
+                        const std::uint8_t v_nibble = (d & 1) == 0 ? (v_byte & 0x0fu) : (v_byte >> 4);
+                        const double v_val = decode_e2m1_word(v_nibble) * v_dec;
+                        double p_val = 0.0;  // raw-softmax units (matches the exact p_raw)
+                        if (p_width == 1) {
+                            // e4m3 P: wider element, same per-16-key block-scale structure.
+                            if (block_max > 0.0) {
+                                const double p_scaled = p_raw * (kSMax / block_max);  // in [0,448]
+                                p_val =
+                                    decode_e4m3fn_word(encode_e4m3fn_rne(static_cast<float>(p_scaled))) *
+                                    (block_max / kSMax);
+                            }
+                        } else if (p_width == 2) {
+                            p_val = f16_rne(p_raw);  // f16 P: near-exact upper bound
+                        } else {
+                            // e2m1 P (kernel-faithful): amplify + per-16-key e4m3 block scale.
+                            const std::uint8_t sc = block_max == 0.0
+                                                        ? 0
+                                                        : encode_e4m3fn_rne(static_cast<float>(
+                                                              std::min(kSMax, kSMax * block_max)));
+                            const double s_dec = static_cast<double>(decode_e4m3fn_word(sc));
+                            if (s_dec > 0.0) {
+                                const double p_p = std::min(6.0, kAmp * p_raw / s_dec);
+                                const std::uint8_t p_code =
+                                    static_cast<std::uint8_t>(
+                                        encode_e2m1_rne(static_cast<float>(p_p)) & 0x0fu);
+                                p_val = kPTable[p_code] * s_dec / kAmp;
+                            }
+                        }
+                        pv += p_val * v_val;
+                    }
+                    acc += pv;
+                }
+                value[static_cast<std::size_t>(d)] = acc;
+            }
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                output[q_index(geometry, q_head, d, token)] =
+                    l_sum > 0.0 ? value[static_cast<std::size_t>(d)] / l_sum : 0.0;
+            }
+        }
+    }
+    return output;
+}
+
 class DeviceCache {
 public:
     DeviceCache(const HostCache& cache, MappingPattern mapping)
@@ -1712,12 +1854,27 @@ void sage_floor_report(const std::string& label, const std::vector<double>& actu
         compute_reduction_stats(step_decode.data(), sage_reference.data(), n).relative_l2;
     const double step64_vs_exact =
         compute_reduction_stats(step_prefill.data(), exact_reference.data(), n).relative_l2;
+    // P-element-width floor sweep (Q/V held at NVFP4-e2m1; only the P width varies):
+    // 0 = e2m1 (kernel, must ~= floor_l2), 1 = e4m3, 2 = f16 (near-exact bound).
+    const double pwidth_e2m1 =
+        compute_reduction_stats(sage_pwidth_reference(q, cache, positions, 0).data(),
+                                exact_reference.data(), n)
+            .relative_l2;
+    const double pwidth_e4m3 =
+        compute_reduction_stats(sage_pwidth_reference(q, cache, positions, 1).data(),
+                                exact_reference.data(), n)
+            .relative_l2;
+    const double pwidth_f16 =
+        compute_reduction_stats(sage_pwidth_reference(q, cache, positions, 2).data(),
+                                exact_reference.data(), n)
+            .relative_l2;
     sage_orc_pdump(label, q, cache, positions);
     std::cerr << label << " SAGE_FLOOR: floor=" << floor_l2 << " device_vs_exact=" << dev_vs_exact
               << " device_vs_sage=" << dev_vs_sage << " dev_vs_step_pref64=" << dev_vs_step_prefill
               << " dev_vs_step_dec32=" << dev_vs_step_decode << " step64_vs_sage=" << step64_vs_sage
               << " step32_vs_sage=" << step32_vs_sage << " step64_vs_exact=" << step64_vs_exact
-              << " n=" << n << "\n";
+              << " pwidth_e2m1=" << pwidth_e2m1 << " pwidth_e4m3=" << pwidth_e4m3
+              << " pwidth_f16=" << pwidth_f16 << " n=" << n << "\n";
 }
 
 int verify_nvfp4_kernel_inside_codec_gap(const std::string& label,

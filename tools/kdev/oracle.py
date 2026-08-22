@@ -23,9 +23,11 @@ def run_op_test(op, tier: str) -> dict:
     result = harness.run(cmd, check=False)
     output = result.output
     passed = result.ok and "FAIL" not in output.splitlines()[-1:]
-    # The binary's final line is the authoritative verdict.
+    # The binary's final line is the authoritative verdict. The gqa tests print
+    # "PASS ..." on success, l2norm prints "OK ..."; a failure prints the failing
+    # case verbatim (or a "FAIL ..." line). Accept either success prefix.
     last = output.strip().splitlines()[-1] if output.strip() else ""
-    passed = result.ok and last.startswith("OK")
+    passed = result.ok and (last.startswith("PASS") or last.startswith("OK"))
     stats = harness.parse_op_stats(output)
     # Reduce to the KPIs that matter (drop the raw rmse/rms noise, keep ratios).
     for record in stats:
