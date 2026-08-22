@@ -614,64 +614,10 @@ void append_cache(HostCache& cache, const std::vector<float>& k, const std::vect
                     }
                 }
                 if (cache.sage) {
-                    // Sage V fill: per-(d, 16-key block) running scale. A new key either fits
-                    // the block's current max or bumps it, in which case the block's earlier
-                    // codes are rescaled (the mma consumes one e4m3 scale per d per block).
-                    // The code byte holds (d0 low, d1 high); each d carries its own scale,
-                    // so rescale once per d-pair with per-nibble factors.
-                    const std::int32_t page = position / kPagedKVPageSize;
-                    const std::int32_t key_block = (position % kPagedKVPageSize) / 16;
-                    const std::int32_t block_key0 = page * kPagedKVPageSize + key_block * 16;
-                    for (std::int32_t dp = 0; dp < kNvfp4CodeWidth; ++dp) {
-                        const std::int32_t d0     = dp * 2;
-                        const float v0            = v[kv_input_index(geometry, head, d0, token)];
-                        const float v1            = v[kv_input_index(geometry, head, d0 + 1, token)];
-                        const std::size_t sc0_off =
-                            sage_v_scale_host_index(cache.logical_capacity, head, page, d0, key_block);
-                        const std::size_t sc1_off =
-                            sage_v_scale_host_index(cache.logical_capacity, head, page, d0 + 1, key_block);
-                        const float s_cur0        = static_cast<float>(decode_e4m3fn_word(cache.v_fp8[sc0_off]));
-                        const float s_cur1        = static_cast<float>(decode_e4m3fn_word(cache.v_fp8[sc1_off]));
-                        const float new_max0      = std::max(std::abs(v0), s_cur0 * 6.0f);
-                        const float new_max1      = std::max(std::abs(v1), s_cur1 * 6.0f);
-                        const bool bumped0        = new_max0 > s_cur0 * 6.0f && new_max0 > 0.0f;
-                        const bool bumped1        = new_max1 > s_cur1 * 6.0f && new_max1 > 0.0f;
-                        if (bumped0) { cache.v_fp8[sc0_off] = encode_e4m3fn_rne(new_max0 / 6.0f); }
-                        if (bumped1) { cache.v_fp8[sc1_off] = encode_e4m3fn_rne(new_max1 / 6.0f); }
-                        const float s0_final =
-                            static_cast<float>(decode_e4m3fn_word(cache.v_fp8[sc0_off]));
-                        const float s1_final =
-                            static_cast<float>(decode_e4m3fn_word(cache.v_fp8[sc1_off]));
-                        const float rescale0 =
-                            (bumped0 && s_cur0 > 0.0f && s0_final > 0.0f) ? s_cur0 / s0_final : 1.0f;
-                        const float rescale1 =
-                            (bumped1 && s_cur1 > 0.0f && s1_final > 0.0f) ? s_cur1 / s1_final : 1.0f;
-                        if (rescale0 != 1.0f || rescale1 != 1.0f) {
-                            for (std::int32_t i = block_key0; i < position; ++i) {
-                                const std::size_t code =
-                                    nvfp4_code_index(geometry, cache.logical_capacity, head, i, dp);
-                                const std::uint8_t byte = cache.v_u8[code];
-                                const float lo          = decode_e2m1_word(byte & 0x0fu) * rescale0;
-                                const float hi          = decode_e2m1_word((byte >> 4) & 0x0fu) * rescale1;
-                                cache.v_u8[code] = static_cast<std::uint8_t>(
-                                    (encode_e2m1_rne(lo) & 0x0fu) |
-                                    (static_cast<std::uint32_t>(encode_e2m1_rne(hi) & 0x0fu) << 4));
-                            }
-                        }
-                        const float c0 = (s0_final > 0.0f) ? v0 / s0_final : 0.0f;
-                        const float c1 = (s1_final > 0.0f) ? v1 / s1_final : 0.0f;
-                        if (std::getenv("SAGE_DUMP") != nullptr) {
-                            std::cerr << "SAGEAPPEND pos=" << position << " head=" << head
-                                      << " dp=" << dp << " v0=" << v0 << " v1=" << v1
-                                      << " s0=" << s0_final << " s1=" << s1_final
-                                      << " c0=" << c0 << " c1=" << c1 << '\n';
-                        }
-                        cache.v_u8[nvfp4_code_index(geometry, cache.logical_capacity, head,
-                                                     position, dp)] =
-                            static_cast<std::uint8_t>(
-                                (encode_e2m1_rne(c0) & 0x0fu) |
-                                (static_cast<std::uint32_t>(encode_e2m1_rne(c1) & 0x0fu) << 4));
-                    }
+                    // The sage V plane is filled single-shot per (d, 16-key block) after
+                    // the token loop (mirrors the fill kernel contract); the per-token
+                    // K encoding above already handled the sage K plane.
+                    continue;
                 }
                 continue;
             }
@@ -685,6 +631,97 @@ void append_cache(HostCache& cache, const std::vector<float>& k, const std::vect
                     scale_index(geometry, cache.logical_capacity, head, position, group);
                 encode_group(k, source, cache.k_i8, target, cache.k_scale, scale);
                 encode_group(v, source, cache.v_i8, target, cache.v_scale, scale);
+            }
+        }
+    }
+    if (cache.sage && cache.dtype == DType::U8 && !positions.empty()) {
+        // Sage V fill, single-shot per (d, 16-key block) -- mirrors the fill kernel
+    // contract exactly: the block scale is computed once as the max of (a) the
+    // in-range new keys' per-d max and (b) the stored scale's implied max (s*6);
+    // the new key codes are a single rounding at the final scale; the in-block
+    // prefix codes (written by earlier appends under the stored scale) are
+    // rescaled once with a single s_old/s_new ratio on a bump; out-of-range
+    // in-block keys are never touched.
+        const std::int32_t base = positions.front();
+        for (std::size_t i = 0; i < positions.size(); ++i) {
+            if (positions[static_cast<std::size_t>(i)] != base + static_cast<std::int32_t>(i)) {
+                std::cerr << "SAGE single-shot oracle: append_cache expects contiguous "
+                               "positions\n";
+                std::abort();
+            }
+        }
+        const std::int32_t count     = static_cast<std::int32_t>(positions.size());
+        const std::int32_t first_blk = base / 16;
+        const std::int32_t last_blk  = (base + count - 1) / 16;
+        const std::int32_t blocks_per_page = kPagedKVPageSize / 16;
+        for (std::int32_t blk = first_blk; blk <= last_blk; ++blk) {
+            const std::int32_t blk_key0      = blk * 16;
+            const std::int32_t inblock_begin = std::max(0, base - blk_key0);
+            const std::int32_t inblock_end   = std::min(16, base + count - blk_key0);
+            if (inblock_begin >= inblock_end) { continue; }
+            const std::int32_t page      = blk / blocks_per_page;
+            const std::int32_t key_block = blk % blocks_per_page;
+            for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
+                for (std::int32_t dp = 0; dp < kNvfp4CodeWidth; ++dp) {
+                    const std::int32_t d0 = dp * 2;
+                    const std::size_t sc0_off = sage_v_scale_host_index(
+                        cache.logical_capacity, head, page, d0, key_block);
+                    const std::size_t sc1_off =
+                        sage_v_scale_host_index(cache.logical_capacity, head, page, d0 + 1,
+                                               key_block);
+                    const std::uint8_t scale_byte0 = cache.v_fp8[sc0_off];
+                    const std::uint8_t scale_byte1 = cache.v_fp8[sc1_off];
+                    const float s_cur0 = static_cast<float>(decode_e4m3fn_word(scale_byte0));
+                    const float s_cur1 =
+                        static_cast<float>(decode_e4m3fn_word(scale_byte1));
+                    float v0s[16] = {0};
+                    float v1s[16] = {0};
+                    float m0 = 0.0f, m1 = 0.0f;
+                    for (std::int32_t ki = inblock_begin; ki < inblock_end; ++ki) {
+                        const std::int32_t token = blk_key0 + ki - base;
+                        v0s[ki] = v[kv_input_index(geometry, head, d0, token)];
+                        v1s[ki] = v[kv_input_index(geometry, head, d0 + 1, token)];
+                        m0 = std::max(m0, std::abs(v0s[ki]));
+                        m1 = std::max(m1, std::abs(v1s[ki]));
+                    }
+                    const float fin_max0 = std::max(m0, s_cur0 * 6.0f);
+                    const float fin_max1 = std::max(m1, s_cur1 * 6.0f);
+                    const std::uint8_t sc_new0 = encode_e4m3fn_rne(fin_max0 / 6.0f);
+                    const std::uint8_t sc_new1 = encode_e4m3fn_rne(fin_max1 / 6.0f);
+                    const float s_new0 = static_cast<float>(decode_e4m3fn_word(sc_new0));
+                    const float s_new1 = static_cast<float>(decode_e4m3fn_word(sc_new1));
+                    const bool bump0 = sc_new0 != scale_byte0;
+                    const bool bump1 = sc_new1 != scale_byte1;
+                    const float rescale0 =
+                        (bump0 && s_cur0 > 0.0f && s_new0 > 0.0f) ? s_cur0 / s_new0 : 1.0f;
+                    const float rescale1 =
+                        (bump1 && s_cur1 > 0.0f && s_new1 > 0.0f) ? s_cur1 / s_new1 : 1.0f;
+                    if (rescale0 != 1.0f || rescale1 != 1.0f) {
+                        for (std::int32_t ki = 0; ki < inblock_begin; ++ki) {
+                            const std::size_t code =
+                                nvfp4_code_index(geometry, cache.logical_capacity, head,
+                                                  blk_key0 + ki, dp);
+                            const std::uint8_t byte = cache.v_u8[code];
+                            const float lo =
+                                (float)decode_e2m1_word(byte & 0x0fu) * rescale0;
+                            const float hi =
+                                (float)decode_e2m1_word((byte >> 4) & 0x0fu) * rescale1;
+                            const float2 packed = {lo, hi};
+                            cache.v_u8[code] =
+                                __nv_cvt_float2_to_fp4x2(packed, __NV_E2M1, cudaRoundNearest);
+                        }
+                    }
+                    for (std::int32_t ki = inblock_begin; ki < inblock_end; ++ki) {
+                        const float c0 = (s_new0 > 0.0f) ? v0s[ki] / s_new0 : 0.0f;
+                        const float c1 = (s_new1 > 0.0f) ? v1s[ki] / s_new1 : 0.0f;
+                        const float2 packed = {c0, c1};
+                        cache.v_u8[nvfp4_code_index(geometry, cache.logical_capacity, head,
+                                                     blk_key0 + ki, dp)] =
+                            __nv_cvt_float2_to_fp4x2(packed, __NV_E2M1, cudaRoundNearest);
+                    }
+                    if (bump0) { cache.v_fp8[sc0_off] = sc_new0; }
+                    if (bump1) { cache.v_fp8[sc1_off] = sc_new1; }
+                }
             }
         }
     }

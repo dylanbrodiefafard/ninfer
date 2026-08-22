@@ -192,9 +192,20 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_nvfp4s3_kernel
     }
 
     // V: Sage-style d-major quantization. One thread per (cache 16-key block, kv_head,
-    // d pair); the block's scale is running state (a new key either fits the block's
-    // current max or bumps it, rescaling the block's earlier codes). Tokens of the
-    // block are processed in order, so rescale reads are settled.
+    // d pair). The block scale is per (d, 16-key block) and a thread owns its d-pair
+    // for the whole block, so the scale entry's 16-key max is a local reduction over
+    // the thread's own loads -- a cross-lane reduction would mix different d's (the
+    // wrong granularity) and buys nothing.
+    //
+    // A block may already hold live codes under the stored block scale (the decode/MTP
+    // prefix of a straddling block, or in-block keys this append does not cover). The
+    // stored scale implies that existing data's block max (s*6), so the final block
+    // scale is the max of (a) the new keys' max, reduced once in registers over the
+    // in-range keys, and (b) the stored scale's implied max. It is computed once; the
+    // new key codes are written under it in a single coalesced pass and the scale bytes
+    // are written only when the scale changed. There is no backward-looking rescale
+    // loop: out-of-range codes keep their bytes (their e2m1 values are unchanged when
+    // re-consumed under the bumped scale, to within one e2m1 ulp).
     const int v_unit    = unit - k_units - kmean_units;
     const int blk       = v_unit / (Geometry::KVHeads * DpPairs);
     const int tmp       = v_unit % (Geometry::KVHeads * DpPairs);
@@ -202,11 +213,10 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_nvfp4s3_kernel
     const int dp        = tmp % DpPairs;
     const int block_key0 = (base_pos / 16 + blk) * 16;
     if (block_key0 + 16 <= base_pos || block_key0 >= base_pos + tokens) { return; }
-    const int tok_begin = (base_pos > block_key0 ? base_pos : block_key0) - base_pos;
-    const int tok_end   = (base_pos + tokens < block_key0 + 16
-                               ? base_pos + tokens
-                               : block_key0 + 16) -
-                          base_pos;
+    const int inblock_begin = base_pos > block_key0 ? base_pos - block_key0 : 0;
+    const int inblock_end   = base_pos + tokens < block_key0 + 16
+                               ? base_pos + tokens - block_key0
+                              : 16;
     const int physical_page = block_table[block_key0 >> kPagedKVPageShift];
     const int page_off      = block_key0 & kPagedKVPageMask;
     const int key_block     = page_off >> 4;
@@ -214,49 +224,63 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_nvfp4s3_kernel
     const std::int64_t sc0_off = gqa_s3_v_scale_index<Geometry>(physical_page, kv_head, d0, key_block);
     const std::int64_t sc1_off =
         gqa_s3_v_scale_index<Geometry>(physical_page, kv_head, d0 + 1, key_block);
-    float s_cur0 = detail::decode_nvfp4_e4m3(scale_v[sc0_off]);
-    float s_cur1 = detail::decode_nvfp4_e4m3(scale_v[sc1_off]);
-    for (int t = tok_begin; t < tok_end; ++t) {
-        const int position = base_pos + t;
-        const std::int64_t src = gqa_nvfp4_src_index<Geometry>(kv_head, d0, t);
-        const float v0        = __bfloat162float(v[src]);
-        const float v1        = __bfloat162float(v[src + 1]);
-        const float prev_max0 = s_cur0 * 6.0f;
-        const float prev_max1 = s_cur1 * 6.0f;
-        const float new_max0  = fmaxf(fabsf(v0), prev_max0);
-        const float new_max1  = fmaxf(fabsf(v1), prev_max1);
-        const float s_prev0   = s_cur0;
-        const float s_prev1   = s_cur1;
-        if (new_max0 > prev_max0) {
-            scale_v[sc0_off] =
-                __nv_cvt_float_to_fp8(__fdiv_rn(new_max0, 6.0f), __NV_SATFINITE, __NV_E4M3);
-            s_cur0 = detail::decode_nvfp4_e4m3(scale_v[sc0_off]);
+
+    // Existing in-block keys (outside this append's range) hold live codes under the
+    // stored block scale; its implied block max (s*6) contributes to the block max.
+    const std::uint8_t scale_byte0 = scale_v[sc0_off];
+    const std::uint8_t scale_byte1 = scale_v[sc1_off];
+    const float s_cur0 = detail::decode_nvfp4_e4m3(scale_byte0);
+    const float s_cur1 = detail::decode_nvfp4_e4m3(scale_byte1);
+
+    // New (in-range) keys: register-resident; the per-d 16-key max reduced once.
+    // ki is the in-block index; in-range keys are [inblock_begin, inblock_end).
+    float v0s[16], v1s[16];
+    for (int ki = inblock_begin; ki < inblock_end; ++ki) {
+        const std::int64_t src =
+            gqa_nvfp4_src_index<Geometry>(kv_head, d0, block_key0 + ki - base_pos);
+        v0s[ki] = __bfloat162float(v[src]);
+        v1s[ki] = __bfloat162float(v[src + 1]);
+    }
+    float m0 = 0.0f, m1 = 0.0f;
+    for (int ki = inblock_begin; ki < inblock_end; ++ki) {
+        m0 = fmaxf(m0, fabsf(v0s[ki]));
+        m1 = fmaxf(m1, fabsf(v1s[ki]));
+    }
+    // Final block scale: new keys' max vs stored implied max, encoded once.
+    const float fin_max0 = fmaxf(m0, s_cur0 * 6.0f);
+    const float fin_max1 = fmaxf(m1, s_cur1 * 6.0f);
+    const std::uint8_t sc_new0 = __nv_cvt_float_to_fp8(__fdiv_rn(fin_max0, 6.0f), __NV_SATFINITE, __NV_E4M3);
+    const std::uint8_t sc_new1 = __nv_cvt_float_to_fp8(__fdiv_rn(fin_max1, 6.0f), __NV_SATFINITE, __NV_E4M3);
+    const float s_new0 = detail::decode_nvfp4_e4m3(sc_new0);
+    const float s_new1 = detail::decode_nvfp4_e4m3(sc_new1);
+
+    // A scale bump: the in-block prefix codes (ki < inblock_begin, written in earlier
+    // steps under the stored scale) must be brought to the new scale -- one bounded
+    // single-ratio pass (each prefix byte touched at most once per append; no
+    // backward-looking rescale loop). Out-of-range in-block keys are never touched.
+    const bool bump0 = sc_new0 != scale_byte0;
+    const bool bump1 = sc_new1 != scale_byte1;
+    const float rescale0 = (bump0 && s_cur0 > 0.0f && s_new0 > 0.0f) ? __fdiv_rn(s_cur0, s_new0) : 1.0f;
+    const float rescale1 = (bump1 && s_cur1 > 0.0f && s_new1 > 0.0f) ? __fdiv_rn(s_cur1, s_new1) : 1.0f;
+    if (rescale0 != 1.0f || rescale1 != 1.0f) {
+        for (int ki = 0; ki < inblock_begin; ++ki) {
+            const std::int64_t co =
+                gqa_nvfp4_code_index<Geometry>(physical_page, kv_head, dp, page_off + ki);
+            const std::uint8_t cb = cache_v[co];
+            const float d0v       = gqa_s3_e2m1_value(cb & 0x0fu);
+            const float d1v       = gqa_s3_e2m1_value((cb >> 4) & 0x0fu);
+            cache_v[co] = gqa_s3_cvt_e2m1x2(d0v * rescale0, d1v * rescale1);
         }
-        if (new_max1 > prev_max1) {
-            scale_v[sc1_off] =
-                __nv_cvt_float_to_fp8(__fdiv_rn(new_max1, 6.0f), __NV_SATFINITE, __NV_E4M3);
-            s_cur1 = detail::decode_nvfp4_e4m3(scale_v[sc1_off]);
-        }
-        const float rescale0 =
-            (new_max0 > prev_max0 && s_prev0 > 0.0f && s_cur0 > 0.0f) ? s_prev0 / s_cur0 : 1.0f;
-        const float rescale1 =
-            (new_max1 > prev_max1 && s_prev1 > 0.0f && s_cur1 > 0.0f) ? s_prev1 / s_cur1 : 1.0f;
-        if (rescale0 != 1.0f || rescale1 != 1.0f) {
-            for (int i = block_key0; i < position; ++i) {
-                const std::int64_t co = gqa_nvfp4_code_index<Geometry>(
-                    physical_page, kv_head, dp, i & kPagedKVPageMask);
-                const std::uint8_t byte = cache_v[co];
-                const float d0          = gqa_s3_e2m1_value(byte & 0x0fu);
-                const float d1          = gqa_s3_e2m1_value((byte >> 4) & 0x0fu);
-                cache_v[co] = gqa_s3_cvt_e2m1x2(d0 * rescale0, d1 * rescale1);
-            }
-        }
-        const float c0 = s_cur0 > 0.0f ? __fdiv_rn(v0, s_cur0) : 0.0f;
-        const float c1 = s_cur1 > 0.0f ? __fdiv_rn(v1, s_cur1) : 0.0f;
-        cache_v[gqa_nvfp4_code_index<Geometry>(physical_page, kv_head, dp,
-                                               page_off + (position - block_key0))] =
+    }
+    // New key codes under the final scale: single rounding, one coalesced pass.
+    for (int ki = inblock_begin; ki < inblock_end; ++ki) {
+        const float c0 = s_new0 > 0.0f ? __fdiv_rn(v0s[ki], s_new0) : 0.0f;
+        const float c1 = s_new1 > 0.0f ? __fdiv_rn(v1s[ki], s_new1) : 0.0f;
+        cache_v[gqa_nvfp4_code_index<Geometry>(physical_page, kv_head, dp, page_off + ki)] =
             gqa_s3_cvt_e2m1x2(c0, c1);
     }
+    if (bump0) { scale_v[sc0_off] = sc_new0; }
+    if (bump1) { scale_v[sc1_off] = sc_new1; }
 }
 
 template <typename Geometry, typename Metadata>
