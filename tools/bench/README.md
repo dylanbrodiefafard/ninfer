@@ -257,11 +257,13 @@ python3 tools/bench/run_niah_check.py --lengths 8k,64k,200k --positions start,q2
 
 **Gate semantics (read before interpreting matrix results).** The default check is the
 *exact-format* needle `ORCHID=493817; COLOR=COBALT` — it passes only if the model both
-retrieves the needle AND emits the exact answer form. Two levers:
-`run_niah_check.py --needle 493817` is a *recall-only* gate (the value must appear in the
-answer, format ignored — the pure recall signal), and `--runs N` repeats each cell for a
-per-cell pass rate (e.g. 5/5). The default gate is the light **mid-spine** (8k + 64k,
-fast); the matrix runs on demand.
+retrieves the needle AND emits the exact answer form. Two levers: `run_niah_check.py
+--needle 493817` is a *recall-only* gate (the value must appear in the answer, format
+ignored — the pure recall signal), and `--runs N` repeats each cell for a per-cell pass
+rate (e.g. 5/5). The console prints a `[FAIL] <case>: n/N runs failed to retrieve the
+needle` line per failing case plus a total failure count on the final verdict; per-cell
+retrieved/total and answer snippets are also in the JSON record. The default gate is the
+light **mid-spine** (8k + 64k, fast); the matrix runs on demand.
 
 Observed behavior (nvfp4s3 serve, RTX 5090, 2026-08-21 — a serve-dependent sampling
 snapshot, not a spec): the exact-format gate passes stably at 8k/64k/150k/200k mid, but
