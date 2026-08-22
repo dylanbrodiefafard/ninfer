@@ -455,6 +455,46 @@ struct RuntimeStats {
     std::size_t kv_ram_entry_count      = 0;
 };
 
+enum class ScoreSchedule : std::uint8_t {
+    Prefill,
+    Decode,
+};
+
+[[nodiscard]] inline const char* score_schedule_name(ScoreSchedule schedule) noexcept {
+    switch (schedule) {
+    case ScoreSchedule::Prefill:
+        return "prefill";
+    case ScoreSchedule::Decode:
+        return "decode";
+    }
+    return "unknown";
+}
+
+struct ScoreOptions {
+    ScoreSchedule schedule = ScoreSchedule::Prefill;
+    // nullopt: skip the first prompt_tokens/2 positions so scored tokens have KV context.
+    // 0: score every teacher-forced position except the last prompt token.
+    std::optional<std::uint32_t> skip_tokens;
+};
+
+// Teacher-forced NLL at or above this is reported as a terrible token (p <= exp(-10) ≈ 4.5e-5).
+inline constexpr double kScoreTerribleNll = 10.0;
+
+struct ScoreResult {
+    ScoreSchedule schedule      = ScoreSchedule::Prefill;
+    std::uint32_t prompt_tokens = 0;
+    std::uint32_t skip_tokens   = 0;
+    std::uint32_t tokens_scored = 0;
+    std::uint32_t non_finite    = 0;
+    std::uint32_t terrible_tokens = 0;
+    double sum_nll              = 0.0;
+    double mean_nll             = 0.0;
+    double max_nll              = 0.0;
+    double perplexity           = 0.0;
+    double score_seconds        = 0.0;
+    std::vector<float> token_nlls;
+};
+
 struct LoadSummary {
     std::string target;
     std::string model_id;

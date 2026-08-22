@@ -430,8 +430,8 @@ int verify_workspace_capacity_contract(const Geometry& geometry,
 
 int main() {
     if (cuda_unavailable()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
+        std::cerr << "FAIL: no usable CUDA device\n";
+        return 1;
     }
 
     int failures = 0;

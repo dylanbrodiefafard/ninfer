@@ -98,13 +98,13 @@ int main() {
         int device_count              = 0;
         const cudaError_t count_error = cudaGetDeviceCount(&device_count);
         if (cuda_unavailable(count_error)) {
-            std::cout << "SKIP: no usable CUDA device\n";
-            return 77;
+            std::cerr << "FAIL: no usable CUDA device\n";
+            return 1;
         }
         CUDA_CHECK(count_error);
         if (device_count == 0) {
-            std::cout << "SKIP: no CUDA devices\n";
-            return 77;
+            std::cerr << "FAIL: no usable CUDA device\n";
+            return 1;
         }
 
         ninfer::artifact::Binder binder(reader);

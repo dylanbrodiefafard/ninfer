@@ -30,7 +30,6 @@ endfunction()
 
 function(ninfer_add_op_test name)
   ninfer_add_test(${name} ${ARGN})
-  set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(${name} PRIVATE
       $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math>
@@ -101,19 +100,6 @@ ninfer_add_test(ninfer_state_store_test
 ninfer_add_test(ninfer_gdn_replay_records_test
   SOURCES test_gdn_replay_records.cpp
   LIBRARIES ninfer_core)
-set_tests_properties(
-  ninfer_artifact_materialization_test
-  ninfer_device_test
-  ninfer_decode_graph_test
-  ninfer_arena_test
-  ninfer_request_memory_test
-  ninfer_kv_cache_test
-  ninfer_kv_ram_cache_test
-  ninfer_kv_ram_cache_perf_test
-  ninfer_kv_ram_cache_opt_test
-  ninfer_kv_ram_cache_large_test
-  ninfer_state_store_test
-  PROPERTIES SKIP_RETURN_CODE 77)
 # Family frontend and one opt-in real-artifact prefix/MTP integration test.
 ninfer_add_test(ninfer_qwen3_6_frontend_test
   SOURCES targets/qwen3_6/test_frontend.cpp
@@ -127,6 +113,8 @@ ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
   LIBRARIES ninfer_engine ninfer_core)
 target_include_directories(ninfer_qwen3_6_runtime_mechanisms_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+ninfer_add_test(ninfer_qwen3_6_score_index_test
+  SOURCES targets/qwen3_6/test_score_index.cpp)
 ninfer_add_test(ninfer_qwen3_6_27b_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_prefix_real.cpp
   LIBRARIES ninfer_engine)
@@ -215,6 +203,7 @@ set(ninfer_op_tests
   gelu
   silu_mul
   residual_add
+  residual_rmsnorm
   sigmoid_mul
   rmsnorm
   gated_rmsnorm
@@ -224,6 +213,7 @@ set(ninfer_op_tests
   layer_norm
   embedding
   argmax
+  nll_from_logits
   gdn_gating
   gdn_gating_proj
   rope
@@ -258,6 +248,9 @@ ninfer_add_op_test(ninfer_kv_cache_append_prefix_test
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_prepare_masked_block_test
   SOURCES ops/test_prepare_masked_block.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_prepare_ragged_prefix_test
+  SOURCES ops/test_prepare_ragged_prefix.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_sparse_moe_test
   SOURCES ops/test_sparse_moe.cpp
@@ -333,7 +326,6 @@ ninfer_add_fused_linear_test(
 ninfer_add_test(ninfer_qwen3_6_27b_visual_scatter_test
   SOURCES targets/qwen3_6_27b/test_visual_scatter.cpp
   LIBRARIES ninfer_engine ninfer_core)
-set_tests_properties(ninfer_qwen3_6_27b_visual_scatter_test PROPERTIES SKIP_RETURN_CODE 77)
 
 # These tests deliberately compile against the exact target's internal contracts; the target does
 # not export impl/ to ordinary consumers.

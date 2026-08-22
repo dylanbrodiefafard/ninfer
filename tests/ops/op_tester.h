@@ -63,6 +63,13 @@ inline bool cuda_unavailable() {
     throw std::runtime_error(std::string("cudaGetDeviceCount: ") + cudaGetErrorString(e));
 }
 
+// GPU tests fail closed. Skipping a missing device hides a broken machine.
+[[nodiscard]] inline int require_cuda() {
+    if (!cuda_unavailable()) { return 0; }
+    std::cerr << "FAIL: no usable CUDA device\n";
+    return 1;
+}
+
 // --- bf16 <-> f32 (round-to-nearest-even) -----------------------------------
 inline float bf16_to_f32(std::uint16_t h) {
     std::uint32_t u = std::uint32_t(h) << 16;

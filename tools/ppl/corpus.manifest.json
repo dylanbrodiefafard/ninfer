@@ -1,0 +1,10 @@
+{
+  "artifact_type": "ninfer_ppl_corpus",
+  "schema_version": 1,
+  "weights": "/ssdpool2nvme/local_llm/models/qwen3.8-nvfp4-Osfralla-mtp-ninfer/qwen3_8_27b_nvfp4.ninfer",
+  "add_special_tokens": false,
+  "chat_template": false,
+  "tokens": 32768,
+  "ids_sha256": "aa1ba6d9932a4bcefdfd1c395bde73911daeba083c6b45d353a421dcd1eae077",
+  "source": "wikitext-2"
+}

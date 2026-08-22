@@ -178,8 +178,8 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
 
 int main() {
     if (ninfer::test::cuda_unavailable()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
+        std::cerr << "FAIL: no usable CUDA device\n";
+        return 1;
     }
     int failures = 0;
     failures += run_shape(5120, 6144, 811U);

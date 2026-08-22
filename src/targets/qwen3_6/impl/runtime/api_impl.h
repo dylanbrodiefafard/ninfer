@@ -301,6 +301,13 @@ void Program<Variant>::reset_memory_peaks() noexcept {
 }
 
 template <>
+ScoreResult Program<Variant>::score(PreparedPrompt&& prompt, RequestPlan<Variant>&& plan,
+                                    runtime::TransientRegion transient, ScoreOptions options) {
+    return impl_->score(PreparedPromptAccess::take(std::move(prompt)), std::move(plan), transient,
+                        options);
+}
+
+template <>
 SequencePlanner<Variant> make_sequence_planner<Variant>(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         Variant::WeightsProfile weights_profile) {

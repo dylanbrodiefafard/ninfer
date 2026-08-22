@@ -197,6 +197,10 @@ public:
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
 
+    // Teacher-forced NLL. Generate/serve do not call this.
+    [[nodiscard]] ScoreResult score(PreparedPrompt&& prompt, RequestPlan<Variant>&& plan,
+                                    runtime::TransientRegion transient, ScoreOptions options = {});
+
 private:
     explicit Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl) noexcept;
     std::unique_ptr<detail::ProgramImpl<Variant>> impl_;
