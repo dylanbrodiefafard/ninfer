@@ -66,6 +66,7 @@ target_link_libraries(ninfer_nvfp4_tma PRIVATE ninfer_core CUDA::cudart CUDA::cu
 add_library(ninfer_ops STATIC
   ops/launcher/add_bias.cu
   ops/launcher/argmax.cu
+  ops/launcher/nll_from_logits.cu
   ops/launcher/cast.cu
   ops/launcher/causal_conv1d.cu
   ops/launcher/embed_gather.cu
@@ -209,6 +210,7 @@ add_library(ninfer_ops STATIC
   ops/linear/linear.cpp
   ops/wrapper/add_bias.cpp
   ops/wrapper/argmax.cpp
+  ops/wrapper/nll_from_logits.cpp
   ops/wrapper/cast.cpp
   ops/wrapper/causal_conv1d_silu.cpp
   ops/wrapper/embedding.cpp

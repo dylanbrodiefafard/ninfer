@@ -83,8 +83,8 @@ int run_edge_case(ops::GeluMode mode, const char* label) {
 
 int main() {
     if (cuda_unavailable()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
+        std::cerr << "FAIL: no usable CUDA device\n";
+        return 1;
     }
 
     int failures = 0;

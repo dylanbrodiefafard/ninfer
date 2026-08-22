@@ -268,6 +268,9 @@ public:
 
     void reset_memory_peaks() noexcept;
 
+    [[nodiscard]] ScoreResult score(PreparedPromptData&& prompt, RequestPlan&& plan,
+                                    runtime::TransientRegion transient, ScoreOptions options);
+
     const LoadedModelData& model;
     DeviceContext& device;
     const std::uint32_t capacity;
@@ -384,6 +387,15 @@ private:
     void finish_request_plan(RequestPlanImpl& plan, const ResidentStateView* view,
                              const PreparedPromptData& prompt, const RequestBasePlanImpl& base);
     [[nodiscard]] qwen3_6::detail::RamCaptureSource ram_capture_source(const SequenceState& sequence);
+    void accumulate_prefill_nll(std::span<const TokenId> ids, std::uint32_t chunk_begin,
+                                std::uint32_t chunk_tokens, std::uint32_t skip, ScoreResult& result);
+    void accumulate_decode_nll(const Tensor& logits, TokenId target, ScoreResult& result,
+                               DeviceArena& score_workspace);
+    void run_prefill_score(PreparedPromptData&& prompt, RequestPlan&& plan,
+                           runtime::TransientRegion transient, std::span<const TokenId> ids,
+                           std::uint32_t skip, ScoreResult& result);
+    void run_decode_score(PreparedPromptData&& prompt, runtime::TransientRegion transient,
+                          std::span<const TokenId> ids, std::uint32_t prefix, ScoreResult& result);
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

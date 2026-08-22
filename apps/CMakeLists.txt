@@ -17,3 +17,10 @@ target_include_directories(ninfer-serve PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party
   ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
 target_link_libraries(ninfer-serve PRIVATE ninfer_serve ninfer_product_load_progress)
+
+add_executable(ninfer-ppl ppl/main.cpp)
+target_include_directories(ninfer-ppl PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/third_party)
+target_link_libraries(ninfer-ppl PRIVATE ninfer_engine ninfer_artifact)

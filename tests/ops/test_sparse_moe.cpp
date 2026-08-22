@@ -635,8 +635,8 @@ int run_profile(const CodecProfile& profile) {
 
 int main() {
     if (cuda_unavailable()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
+        std::cerr << "FAIL: no usable CUDA device\n";
+        return 1;
     }
 
     // These are public-behavior cases, not route assertions. They exercise decode (T=1), the

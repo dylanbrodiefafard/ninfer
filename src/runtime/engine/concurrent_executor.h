@@ -187,6 +187,46 @@ public:
         return out;
     }
 
+    [[nodiscard]] ScoreResult score(targets::qwen3_6::PreparedPrompt prompt,
+                                    ScoreOptions options = {}) {
+        std::scoped_lock execution_lock(execution_mutex_);
+        {
+            std::lock_guard lock(queue_mutex_);
+            if (stopping_ || failed_) {
+                throw RequestError(RequestErrorKind::Unavailable,
+                                   "inference engine is unavailable");
+            }
+            if (outstanding_ != 0 || copy_hold_ || prefill_lane_) {
+                throw RequestError(RequestErrorKind::Overloaded, "score requires an idle Engine");
+            }
+            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                if (slots_[lane] != nullptr) {
+                    throw RequestError(RequestErrorKind::Overloaded,
+                                       "score requires an idle Engine");
+                }
+            }
+        }
+
+        ResolvedExecutionOptions execution;
+        execution.sampling.temperature    = 0.0F;
+        execution.requested_output_tokens = std::max(1u, prompt.summary().prompt_tokens);
+        execution.allow_prefix_reuse      = false;
+        BasePlan base                     = instance_.program->plan_request_base(prompt, execution);
+        Plan plan                         = instance_.program->plan_request_for_lane(0, prompt, base);
+        const RequestPlanSummary summary = plan.summary();
+        instance_.request_memory.activate(summary.transient_bytes, summary.transient_alignment);
+        try {
+            ScoreResult result =
+                instance_.program->score(std::move(prompt), std::move(plan),
+                                         instance_.request_memory.region(), options);
+            instance_.request_memory.deactivate();
+            return result;
+        } catch (...) {
+            instance_.request_memory.deactivate();
+            throw;
+        }
+    }
+
     [[nodiscard]] RuntimeStats runtime_stats() const {
         std::lock_guard lock(stats_mutex_);
         return published_stats_;
