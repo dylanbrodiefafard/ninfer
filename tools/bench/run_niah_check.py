@@ -252,8 +252,17 @@ def main() -> int:
     rec_path = out_dir / f"niah-check-{args.label}-{record['ts']}.json"
     rec_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
     print(f"\nrecord -> {rec_path.relative_to(ROOT)}")
-    print("NIAH gate:", "PASS" if all_pass else "FAIL",
-          "(all cases must retrieve the needle in every run)")
+    failed_cases = [c for c in record["cases"] if not c["passed"]]
+    failed_runs = sum(c["total"] - c["retrieved"] for c in record["cases"])
+    total_runs = sum(c["total"] for c in record["cases"])
+    for c in failed_cases:
+        nfail = c["total"] - c["retrieved"]
+        print(f"  [FAIL] {c['label']}: {nfail}/{c['total']} runs failed to retrieve the needle")
+    verdict = "PASS" if all_pass else "FAIL"
+    print(f"NIAH gate: {verdict} "
+          f"({len(failed_cases)}/{len(record['cases'])} cases, "
+          f"{failed_runs}/{total_runs} runs failed; "
+          f"all cases must retrieve the needle in every run)")
     return 0 if all_pass else 1
 
 
