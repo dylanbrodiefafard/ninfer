@@ -763,11 +763,12 @@ __launch_bounds__(256) __global__ void gqa_attention_decode_fill_nvfp4s3_kernel(
         return;
     }
 
-    // V: one thread per (cache 16-key block, kv_head, d pair). The block's scale is
-    // running state (a new key either fits the block's current max or bumps it,
-    // rescaling the block's earlier codes); tokens of the block are processed in
-    // position order, so rescale reads are settled. A 16-key block never straddles a
-    // page (64 keys/page), so its whole state lives in one physical page.
+    // V: one thread per (cache 16-key block, kv_head, d pair). Single-shot contract:
+    // the new keys' unquantized values are loaded into registers, the per-d block max
+    // is reduced once, the block scale is computed once, and the codes are written in
+    // a single pass (a scale bump moves the block's prefix codes by a single-ratio
+    // one-shot pass). A 16-key block never straddles a page (64 keys/page), so its
+    // whole state lives in one physical page.
     const int v_unit  = rest - k_max;
     const int blk     = v_unit / (Geometry::KVHeads * DpPairs);
     const int tmp     = v_unit % (Geometry::KVHeads * DpPairs);
@@ -775,9 +776,9 @@ __launch_bounds__(256) __global__ void gqa_attention_decode_fill_nvfp4s3_kernel(
     const int dp      = tmp % DpPairs;
     const int block_key0 = (base_pos / 16 + blk) * 16;
     if (block_key0 + 16 <= base_pos || block_key0 >= base_pos + valid_tokens) { return; }
-    const int tok_begin = (base_pos > block_key0 ? base_pos : block_key0) - base_pos;
-    const int tok_end = (base_pos + valid_tokens < block_key0 + 16 ? base_pos + valid_tokens
-                                                                   : block_key0 + 16) - base_pos;
+    const int ib_begin = base_pos > block_key0 ? base_pos - block_key0 : 0;
+    const int ib_end =
+        (base_pos + valid_tokens < block_key0 + 16 ? base_pos + valid_tokens - block_key0 : 16);
     const int physical_page = block_table[block_key0 >> kPagedKVPageShift];
     const int page_off      = block_key0 & kPagedKVPageMask;
     const int key_block     = page_off >> 4;
@@ -786,50 +787,58 @@ __launch_bounds__(256) __global__ void gqa_attention_decode_fill_nvfp4s3_kernel(
         gqa_s3_v_scale_index<Geometry>(physical_page, kv_head, d0, key_block);
     const std::int64_t sc1_off =
         gqa_s3_v_scale_index<Geometry>(physical_page, kv_head, d0 + 1, key_block);
-    float s_cur0 = detail::decode_nvfp4_e4m3(scale_v[sc0_off]);
-    float s_cur1 = detail::decode_nvfp4_e4m3(scale_v[sc1_off]);
-    for (int t = tok_begin; t < tok_end; ++t) {
-        const int position = base_pos + t;
+    const std::uint8_t scale_byte0 = scale_v[sc0_off];
+    const std::uint8_t scale_byte1 = scale_v[sc1_off];
+    const float s_cur0 = detail::decode_nvfp4_e4m3(scale_byte0);
+    const float s_cur1 = detail::decode_nvfp4_e4m3(scale_byte1);
+    // New (in-range) keys: register-resident; the per-d block max reduced once.
+    float v0s[16], v1s[16];
+    float m0 = 0.0f, m1 = 0.0f;
+    for (int ki = ib_begin; ki < ib_end; ++ki) {
+        const int t = ki + block_key0 - base_pos;
         const std::int64_t src = gqa_kv_new_index<Geometry>(kv_head, d0, t);
-        const float v0          = __bfloat162float(vb[src]);
-        const float v1          = __bfloat162float(vb[src + 1]);
-        const float prev_max0   = s_cur0 * 6.0f;
-        const float prev_max1   = s_cur1 * 6.0f;
-        const float new_max0    = fmaxf(fabsf(v0), prev_max0);
-        const float new_max1    = fmaxf(fabsf(v1), prev_max1);
-        const float s_prev0     = s_cur0;
-        const float s_prev1     = s_cur1;
-        if (new_max0 > prev_max0) {
-            scale_v[sc0_off] =
-                __nv_cvt_float_to_fp8(__fdiv_rn(new_max0, 6.0f), __NV_SATFINITE, __NV_E4M3);
-            s_cur0 = detail::decode_nvfp4_e4m3(scale_v[sc0_off]);
+        v0s[ki] = __bfloat162float(vb[src]);
+        v1s[ki] = __bfloat162float(vb[src + 1]);
+        m0 = fmaxf(m0, fabsf(v0s[ki]));
+        m1 = fmaxf(m1, fabsf(v1s[ki]));
+    }
+    // Final block scale: new keys' max vs stored implied max, encoded once.
+    const float fin_max0 = fmaxf(m0, s_cur0 * 6.0f);
+    const float fin_max1 = fmaxf(m1, s_cur1 * 6.0f);
+    const std::uint8_t sc_new0 =
+        __nv_cvt_float_to_fp8(__fdiv_rn(fin_max0, 6.0f), __NV_SATFINITE, __NV_E4M3);
+    const std::uint8_t sc_new1 =
+        __nv_cvt_float_to_fp8(__fdiv_rn(fin_max1, 6.0f), __NV_SATFINITE, __NV_E4M3);
+    const float s_new0 = detail::decode_nvfp4_e4m3(sc_new0);
+    const float s_new1 = detail::decode_nvfp4_e4m3(sc_new1);
+    // A bump: the in-block prefix codes (written under the stored scale by an earlier
+    // step) move to the new scale by a single s_cur/s_new ratio, one-shot pass.
+    const bool bump0 = sc_new0 != scale_byte0;
+    const bool bump1 = sc_new1 != scale_byte1;
+    const float rescale0 =
+        (bump0 && s_cur0 > 0.0f && s_new0 > 0.0f) ? __fdiv_rn(s_cur0, s_new0) : 1.0f;
+    const float rescale1 =
+        (bump1 && s_cur1 > 0.0f && s_new1 > 0.0f) ? __fdiv_rn(s_cur1, s_new1) : 1.0f;
+    if (rescale0 != 1.0f || rescale1 != 1.0f) {
+        for (int ki = 0; ki < ib_begin; ++ki) {
+            const std::int64_t co = gqa_nvfp4_code_index<Geometry>(
+                physical_page, kv_head, dp, page_off + ki);
+            const std::uint8_t byte = cache_v[co];
+            const float d0v        = gqa_s3_e2m1_value(byte & 0x0fu);
+            const float d1          = gqa_s3_e2m1_value((byte >> 4) & 0x0fu);
+            cache_v[co] = gqa_s3_cvt_e2m1x2(d0v * rescale0, d1 * rescale1);
         }
-        if (new_max1 > prev_max1) {
-            scale_v[sc1_off] =
-                __nv_cvt_float_to_fp8(__fdiv_rn(new_max1, 6.0f), __NV_SATFINITE, __NV_E4M3);
-            s_cur1 = detail::decode_nvfp4_e4m3(scale_v[sc1_off]);
-        }
-        const float rescale0 =
-            (new_max0 > prev_max0 && s_prev0 > 0.0f && s_cur0 > 0.0f) ? s_prev0 / s_cur0 : 1.0f;
-        const float rescale1 =
-            (new_max1 > prev_max1 && s_prev1 > 0.0f && s_cur1 > 0.0f) ? s_prev1 / s_cur1 : 1.0f;
-        if (rescale0 != 1.0f || rescale1 != 1.0f) {
-            for (int i = block_key0; i < position; ++i) {
-                const std::int64_t co = gqa_nvfp4_code_index<Geometry>(
-                    physical_page, kv_head, dp, i & kPagedKVPageMask);
-                const std::uint8_t byte = cache_v[co];
-                const float d0          = gqa_s3_e2m1_value(byte & 0x0fu);
-                const float d1          = gqa_s3_e2m1_value((byte >> 4) & 0x0fu);
-                const std::uint8_t nb   = gqa_s3_cvt_e2m1x2(d0 * rescale0, d1 * rescale1);
-                cache_v[co] = nb;
-            }
-        }
-        const float c0 = s_cur0 > 0.0f ? __fdiv_rn(v0, s_cur0) : 0.0f;
-        const float c1 = s_cur1 > 0.0f ? __fdiv_rn(v1, s_cur1) : 0.0f;
-        cache_v[gqa_nvfp4_code_index<Geometry>(physical_page, kv_head, dp,
-                                               page_off + (position - block_key0))] =
+    }
+    // New key codes under the final scale: single rounding, one coalesced pass.
+    for (int ki = ib_begin; ki < ib_end; ++ki) {
+        const int t = ki + block_key0 - base_pos;
+        const float c0 = s_new0 > 0.0f ? __fdiv_rn(v0s[ki], s_new0) : 0.0f;
+        const float c1 = s_new1 > 0.0f ? __fdiv_rn(v1s[ki], s_new1) : 0.0f;
+        cache_v[gqa_nvfp4_code_index<Geometry>(physical_page, kv_head, dp, page_off + ki)] =
             gqa_s3_cvt_e2m1x2(c0, c1);
     }
+    if (bump0) { scale_v[sc0_off] = sc_new0; }
+    if (bump1) { scale_v[sc1_off] = sc_new1; }
 }
 
 } // namespace ninfer::ops
