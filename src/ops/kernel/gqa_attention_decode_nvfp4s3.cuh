@@ -351,8 +351,12 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             for (int kb = 0; kb < 4; ++kb) {
                 const int key = tile_k0 + kb * 16;
                 if (kb < PBlocks && key + 16 > split_start && key < split_end) {
-                    v_scales[d * 4 + kb] =
-                        cache_v_scale[gqa_s3_v_scale_index<Geometry>(physical_page, kv_head, d, kb)];
+                    // Tile-local kb -> in-page 16-key block: a Bc=32 tile may start
+                    // at in-page offset 32, where its kb 0,1 hold in-page blocks 2,3
+                    // (the plane is written per in-page block by the fill kernels).
+                    const int key_block = (key & kPagedKVPageMask) >> 4;
+                    v_scales[d * 4 + kb] = cache_v_scale[gqa_s3_v_scale_index<Geometry>(
+                        physical_page, kv_head, d, key_block)];
                 } else {
                     v_scales[d * 4 + kb] = 0;
                 }
