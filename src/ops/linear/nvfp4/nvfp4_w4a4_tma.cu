@@ -9,12 +9,36 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 namespace ninfer::ops::detail {
 namespace {
 
 using TmaM256N128   = Nvfp4W4a4TmaSchedule<256, 3, 1>;
 using TmaM256N128S2 = Nvfp4W4a4TmaSchedule<256, 2, 1>;
+// A/B candidates selected via NINFER_NVFP4_TMA_SCHEDULE (prod default = TmaM256N128):
+using TmaM128N128S2O1 = Nvfp4W4a4TmaSchedule<128, 2, 1>;
+using TmaM128N128S3O1 = Nvfp4W4a4TmaSchedule<128, 3, 1>;
+using TmaM128N128S4O1 = Nvfp4W4a4TmaSchedule<128, 4, 1>;
+using TmaM128N128S2O2 = Nvfp4W4a4TmaSchedule<128, 2, 2>;
+
+// Cached A/B selection of the TMA W4A4 schedule. 0 = production (TmaM256N128). Non-default
+// values are for the isolated A/B bench only; production always lands on 0.
+inline int nvfp4_tma_schedule_sel() {
+    static const int sel = [] {
+        const char* e = std::getenv("NINFER_NVFP4_TMA_SCHEDULE");
+        if (e == nullptr) { return 0; }
+        if (std::strcmp(e, "m256s3") == 0) { return 0; }
+        if (std::strcmp(e, "m256s2") == 0) { return 1; }
+        if (std::strcmp(e, "m128s2o1") == 0) { return 2; }
+        if (std::strcmp(e, "m128s3o1") == 0) { return 3; }
+        if (std::strcmp(e, "m128s4o1") == 0) { return 4; }
+        if (std::strcmp(e, "m128s2o2") == 0) { return 5; }
+        return 0;
+    }();
+    return sel;
+}
 
 constexpr std::int32_t kQueryRows  = 6144;
 constexpr std::int32_t kKeyRows    = 1024;
@@ -80,9 +104,43 @@ template <class Geometry>
 void launch_linear(const std::uint8_t* activation_codes, const std::uint8_t* activation_scales,
                    const std::uint8_t* weight_codes, const std::uint8_t* weight_scales,
                    __nv_bfloat16* output, std::int32_t tokens, float alpha, cudaStream_t stream) {
-    launch_tma<Geometry, TmaM256N128>(activation_codes, activation_scales, weight_codes,
-                                      weight_scales, tokens, alpha, Nvfp4IdentityEpilogue{},
-                                      Nvfp4ContiguousOutput{output, Geometry::kOutputRows}, stream);
+    switch (nvfp4_tma_schedule_sel()) {
+    case 1:
+        launch_tma<Geometry, TmaM256N128S2>(activation_codes, activation_scales, weight_codes,
+                                            weight_scales, tokens, alpha, Nvfp4IdentityEpilogue{},
+                                            Nvfp4ContiguousOutput{output, Geometry::kOutputRows},
+                                            stream);
+        return;
+    case 2:
+        launch_tma<Geometry, TmaM128N128S2O1>(activation_codes, activation_scales, weight_codes,
+                                               weight_scales, tokens, alpha, Nvfp4IdentityEpilogue{},
+                                               Nvfp4ContiguousOutput{output, Geometry::kOutputRows},
+                                               stream);
+        return;
+    case 3:
+        launch_tma<Geometry, TmaM128N128S3O1>(activation_codes, activation_scales, weight_codes,
+                                               weight_scales, tokens, alpha, Nvfp4IdentityEpilogue{},
+                                               Nvfp4ContiguousOutput{output, Geometry::kOutputRows},
+                                               stream);
+        return;
+    case 4:
+        launch_tma<Geometry, TmaM128N128S4O1>(activation_codes, activation_scales, weight_codes,
+                                               weight_scales, tokens, alpha, Nvfp4IdentityEpilogue{},
+                                               Nvfp4ContiguousOutput{output, Geometry::kOutputRows},
+                                               stream);
+        return;
+    case 5:
+        launch_tma<Geometry, TmaM128N128S2O2>(activation_codes, activation_scales, weight_codes,
+                                               weight_scales, tokens, alpha, Nvfp4IdentityEpilogue{},
+                                               Nvfp4ContiguousOutput{output, Geometry::kOutputRows},
+                                               stream);
+        return;
+    default:
+        launch_tma<Geometry, TmaM256N128>(activation_codes, activation_scales, weight_codes,
+                                          weight_scales, tokens, alpha, Nvfp4IdentityEpilogue{},
+                                          Nvfp4ContiguousOutput{output, Geometry::kOutputRows}, stream);
+        return;
+    }
 }
 
 } // namespace

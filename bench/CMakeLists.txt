@@ -43,6 +43,9 @@ ninfer_add_op_bench(ninfer_gdn_input_proj_conv_snapshot_bench
 ninfer_add_op_bench(ninfer_attn_input_proj_bench SOURCES ops/attn_input_proj_bench.cu)
 ninfer_add_op_bench(ninfer_w8_linear_swiglu_bench SOURCES ops/w8_linear_swiglu_bench.cu)
 ninfer_add_op_bench(ninfer_nvfp4_linear_swiglu_bench SOURCES ops/nvfp4_linear_swiglu_bench.cu)
+# Isolated TMA W4A4 (prefill) GEMM schedule A/B (occupancy/pipeline/BlockM). Drives the kernel
+# directly; conformance-gates each variant against the production m256s3 schedule.
+ninfer_add_op_bench(ninfer_nvfp4_tma_ab_bench SOURCES ops/nvfp4_tma_ab_bench.cu)
 # Curated NVFP4 decode T=4 harnesses (ninfer/bench/PERF_LANDS.md). Superseded
 # sweeps live in ops/_archive/ and are not built.
 ninfer_add_op_bench(ninfer_nvfp4_swiglu_t4_explore_v5

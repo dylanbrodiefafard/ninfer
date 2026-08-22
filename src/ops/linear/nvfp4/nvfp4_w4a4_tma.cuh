@@ -81,22 +81,27 @@ Nvfp4W4a4TmaDescriptors make_nvfp4_w4a4_tma_descriptors(const std::uint8_t* acti
     return descriptors;
 }
 
-template <int BlockM, int Stages, int MinBlocksPerSm>
+template <int BlockM, int Stages, int MinBlocksPerSm, int WarpsM = 4, int WarpsN = 2>
 struct Nvfp4W4a4TmaSchedule {
     static_assert(BlockM == 128 || BlockM == 256);
     static_assert(Stages >= 2 && Stages <= 4);
     static_assert(MinBlocksPerSm > 0);
+    static_assert((BlockM % WarpsM) == 0);
+    static_assert((BlockM / WarpsM) % 16 == 0);
+    static_assert((128 % WarpsN) == 0);
+    static_assert((128 / WarpsN) % 8 == 0);
 
     static constexpr int kBlockM           = BlockM;
     static constexpr int kBlockN           = 128;
     static constexpr int kBlockK           = 128;
     static constexpr int kStages           = Stages;
-    static constexpr int kWarpsM           = 4;
-    static constexpr int kWarpsN           = 2;
+    static constexpr int kWarpsM           = WarpsM;
+    static constexpr int kWarpsN           = WarpsN;
     static constexpr int kConsumerWarps    = kWarpsM * kWarpsN;
     static constexpr int kConsumerThreads  = kConsumerWarps * 32;
     static constexpr int kProducerThreads  = BlockM == 256 ? 128 : 32;
     static constexpr int kThreads          = kConsumerThreads + kProducerThreads;
+    static_assert(kThreads <= 1024, "CTA thread count exceeds the 1024/CTA hardware limit (e.g. 32 consumer warps)");
     static constexpr int kWarpM            = kBlockM / kWarpsM;
     static constexpr int kWarpN            = kBlockN / kWarpsN;
     static constexpr int kMmaM             = kWarpM / 16;
@@ -105,6 +110,15 @@ struct Nvfp4W4a4TmaSchedule {
     static constexpr int kScaleWordsPerRow = 4;
     static constexpr int kCodeRowBytes     = 64;
     static constexpr int kMinBlocksPerSm   = MinBlocksPerSm;
+    // setmaxnreg redistribution caps (SM120 = 65536 regs/SM). The producer warps are capped low
+    // and the freed registers are handed to the consumer warps. The consumer cap must scale with
+    // the consumer-warp count or the reallocation exceeds the SM register file and the CTAs never
+    // become resident (a silent mbarrier deadlock).
+    static constexpr int kProducerRegCap    = 40;
+    static constexpr int kConsumerRegCapRaw =
+        (65536 / kMinBlocksPerSm - kProducerThreads * kProducerRegCap) / kConsumerThreads;
+    static constexpr int kConsumerRegCapFloor = (kConsumerRegCapRaw / 8) * 8;  // setmaxnreg is a multiple of 8
+    static constexpr int kConsumerRegCap    = kConsumerRegCapFloor < 232 ? kConsumerRegCapFloor : 232;
 };
 
 template <class Schedule>
@@ -205,8 +219,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
     constexpr int kKTiles = Geometry::kInputRows / Schedule::kBlockK;
 
     if (threadIdx.x < Schedule::kProducerThreads) {
-        if constexpr (Schedule::kProducerThreads == 128) {
-            asm volatile("setmaxnreg.dec.sync.aligned.u32 40;" : : : "memory");
+        if constexpr (Schedule::kProducerThreads == 128 && Schedule::kConsumerThreads == 256) {
+            asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" :: "n"(Schedule::kProducerRegCap)
+                         : "memory");
         }
         if (threadIdx.x == 0) {
 #pragma unroll 1
@@ -239,8 +254,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
         return;
     }
 
-    if constexpr (Schedule::kProducerThreads == 128) {
-        asm volatile("setmaxnreg.inc.sync.aligned.u32 232;" : : : "memory");
+    if constexpr (Schedule::kProducerThreads == 128 && Schedule::kConsumerThreads == 256) {
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" :: "n"(Schedule::kConsumerRegCap)
+                     : "memory");
     }
     auto& tensors             = shared.scratch.tensors;
     const int consumer_thread = static_cast<int>(threadIdx.x) - Schedule::kProducerThreads;
