@@ -69,4 +69,34 @@ void l2norm(const Tensor& x, float eps, Tensor& out, cudaStream_t stream) {
     detail::l2norm_launch(x, eps, out, stream);
 }
 
+void l2norm_dump(const Tensor& x, float eps, Tensor& out, cudaStream_t stream, L2NormDump& dump) {
+    if (x.dtype != DType::BF16 || out.dtype != DType::BF16) {
+        throw std::invalid_argument("l2norm_dump: x/out must be BF16");
+    }
+    if (!(eps > 0.0f) || !std::isfinite(eps)) {
+        throw std::invalid_argument("l2norm_dump: eps must be positive and finite");
+    }
+    if (dump.sumsq == nullptr || dump.inv_r == nullptr) {
+        throw std::invalid_argument("l2norm_dump: dump buffers must be non-null");
+    }
+
+    const std::int64_t n = numel_allow_zero(x, "x");
+    (void)numel_allow_zero(out, "out");
+    require_same_shape(x, out);
+    if (n == 0) { return; }
+
+    const std::int64_t rows = n / x.ne[0];
+    if (rows > std::numeric_limits<int>::max()) {
+        throw std::overflow_error("l2norm_dump: row count exceeds CUDA grid limit");
+    }
+    if (!x.is_contiguous() || !out.is_contiguous()) {
+        throw std::invalid_argument("l2norm_dump: x/out must be contiguous");
+    }
+    if (x.data == nullptr || out.data == nullptr) {
+        throw std::invalid_argument("l2norm_dump: x/out data must be non-null");
+    }
+
+    detail::l2norm_dump(x, eps, out, stream, dump);
+}
+
 } // namespace ninfer::ops

@@ -11,7 +11,7 @@
 
 namespace ninfer::ops::detail {
 
-void l2norm_launch(const Tensor& x, float eps, Tensor& out, cudaStream_t stream) {
+void l2norm_run(const Tensor& x, float eps, Tensor& out, cudaStream_t stream, L2NormDump* dump) {
     const std::int32_t d = x.ne[0];
     if (d <= 0) { throw std::invalid_argument("l2norm: ne[0] must be positive"); }
     const std::int64_t rows = out.numel() / d;
@@ -30,7 +30,8 @@ void l2norm_launch(const Tensor& x, float eps, Tensor& out, cudaStream_t stream)
             static_cast<unsigned int>(div_up(rows, static_cast<std::int64_t>(kWarpsPerBlock)));
         l2norm_warp_bf16x2_kernel<kBlock>
             <<<blocks, kBlock, 0, stream>>>(static_cast<const __nv_bfloat162*>(x.data),
-                                            static_cast<__nv_bfloat162*>(out.data), d, rows, eps);
+                                             static_cast<__nv_bfloat162*>(out.data), d, rows, eps,
+                                             dump);
     } else {
         constexpr int kBlock        = 512;
         constexpr int kRowsPerBlock = kBlock / kWarpSize;
@@ -38,9 +39,17 @@ void l2norm_launch(const Tensor& x, float eps, Tensor& out, cudaStream_t stream)
             static_cast<unsigned int>(div_up(rows, static_cast<std::int64_t>(kRowsPerBlock)));
         l2norm_generic_kernel<<<blocks, kBlock, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<__nv_bfloat16*>(out.data), d,
-            rows, eps);
+            rows, eps, dump);
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+void l2norm_launch(const Tensor& x, float eps, Tensor& out, cudaStream_t stream) {
+    l2norm_run(x, eps, out, stream, nullptr);
+}
+
+void l2norm_dump(const Tensor& x, float eps, Tensor& out, cudaStream_t stream, L2NormDump& dump) {
+    l2norm_run(x, eps, out, stream, &dump);
 }
 
 } // namespace ninfer::ops::detail

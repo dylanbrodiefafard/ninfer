@@ -21,4 +21,14 @@ namespace ninfer::ops {
  */
 void l2norm(const Tensor& x, float eps, Tensor& out, cudaStream_t stream);
 
+// Dev/test side-band for the op_dump tooling (tools/kdev). Not part of the
+// production API: it exposes the per-row intermediates so a value can be checked
+// without editing the kernel. The caller supplies rows-sized device float arrays
+// (rows = numel / ne[0]); the kernel fills them when a non-null dump is given.
+struct L2NormDump {
+    float* sumsq; // [rows] sum of x[d]^2 over D, before eps
+    float* inv_r; // [rows] 1 / sqrt(sumsq + eps)
+};
+void l2norm_dump(const Tensor& x, float eps, Tensor& out, cudaStream_t stream, L2NormDump& dump);
+
 } // namespace ninfer::ops
