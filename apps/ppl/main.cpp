@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <fstream>
@@ -98,10 +99,11 @@ void write_token_nlls(const std::string& json_path, const std::vector<float>& va
 }
 
 void write_cell_json(const std::string& path, const std::string& scheme, const std::string& weights,
-                     const ninfer::LoadSummary& load, ninfer::KvCacheStorage kv_dtype,
-                     std::uint32_t prefill_chunk, bool use_cuda_graph,
-                     ninfer::SpeculativeBackend spec, std::uint32_t draft_tokens,
-                     const ninfer::ScoreResult& score) {
+                      const ninfer::LoadSummary& load, ninfer::KvCacheStorage kv_dtype,
+                      std::uint32_t prefill_chunk, bool use_cuda_graph,
+                      ninfer::SpeculativeBackend spec, std::uint32_t draft_tokens,
+                      bool sage_attn, std::optional<float> keep_frac,
+                      const ninfer::ScoreResult& score) {
     std::ostringstream body;
     body << std::setprecision(17);
     body << "{\n"
@@ -114,7 +116,9 @@ void write_cell_json(const std::string& path, const std::string& scheme, const s
          << "  \"spec\": " << json_escape(ninfer::product::speculative_backend_name(spec)) << ",\n"
          << "  \"draft_tokens\": " << draft_tokens << ",\n"
          << "  \"cuda_graph\": " << (use_cuda_graph ? "true" : "false") << ",\n"
-         << "  \"prefill_chunk\": " << prefill_chunk << ",\n"
+          << "  \"prefill_chunk\": " << prefill_chunk << ",\n"
+          << "  \"sage_attn\": " << (sage_attn ? "true" : "false") << ",\n"
+          << "  \"keep_frac\": " << keep_frac.value_or(1.0f) << ",\n"
          << "  \"skip_tokens\": " << score.skip_tokens << ",\n"
          << "  \"prompt_tokens\": " << score.prompt_tokens << ",\n"
          << "  \"tokens_scored\": " << score.tokens_scored << ",\n"
@@ -192,6 +196,8 @@ int main(int argc, char** argv) {
         std::uint32_t tokens            = 0;
         std::uint32_t prefill_chunk     = 4096;
         int device                      = 0;
+        bool sage_attn                  = false;
+        std::optional<float> keep_frac;
         bool help                       = false;
         bool encode                     = false;
         bool use_cuda_graph             = true;
@@ -215,6 +221,18 @@ int main(int argc, char** argv) {
                 scheme = value("--scheme");
             } else if (arg == "--kv-dtype") {
                 kv_dtype = parse_kv_dtype(value("--kv-dtype"));
+            } else if (arg == "--sage") {
+                sage_attn = true;
+            } else if (arg == "--keep-frac") {
+                const std::string keep_frac_raw = value("--keep-frac");
+                char* keep_frac_end              = nullptr;
+                const float keep_frac_parsed =
+                    std::strtof(keep_frac_raw.c_str(), &keep_frac_end);
+                if (keep_frac_end == keep_frac_raw.c_str() || *keep_frac_end != '\0' ||
+                    !(keep_frac_parsed > 0.0f && keep_frac_parsed <= 1.0f)) {
+                    throw std::invalid_argument("--keep-frac must be a float in (0, 1]");
+                }
+                keep_frac = keep_frac_parsed;
             } else if (arg == "--schedule") {
                 score_options.schedule = parse_schedule(value("--schedule"));
             } else if (arg == "--skip") {
@@ -245,6 +263,8 @@ int main(int argc, char** argv) {
                 << "       ninfer-ppl --encode --weights <artifact.ninfer> --text <file> --ids <out.ids>\n"
                 << "  --scheme <name>             cell name (default: kv-bf16)\n"
                 << "  --kv-dtype <bf16|int8|nvfp4>\n"
+                << "  --sage                  sage_attn FP4-PV recipe (requires --kv-dtype nvfp4)\n"
+                << "  --keep-frac <f>         key-tile keep fraction (0,1]; <1 requires --sage\n"
                 << "  --schedule <prefill|decode> default prefill (prompt-route GQA)\n"
                 << "  --skip <half|n>             warmup tokens not scored (default: half)\n"
                 << "  --spec <mtp|dflash>         load a speculative backend (decode score: mtp)\n"
@@ -274,6 +294,14 @@ int main(int argc, char** argv) {
                 "ninfer-ppl does not teacher-force DFlash; use --spec mtp or ordinary decode");
         }
         const std::vector<ninfer::TokenId> ids = load_ids(ids_path, tokens);
+        if (sage_attn && kv_dtype != ninfer::KvCacheStorage::Nvfp4) {
+            throw std::invalid_argument("--sage requires --kv-dtype nvfp4 (sage_pv k_mean plane)");
+        }
+        if (keep_frac && *keep_frac < 1.0f && !sage_attn) {
+            throw std::invalid_argument(
+                "--keep-frac < 1.0 enables the sage_pv tile-skip proxy and requires --sage "
+                "(nvfp4 KV); --keep-frac 1.0 is exact attention on any KV dtype");
+        }
         ninfer::EngineOptions options;
         options.artifact_path    = weights;
         options.device           = device;
@@ -282,15 +310,23 @@ int main(int argc, char** argv) {
         options.max_concurrency  = 1;
         options.prefill_chunk    = prefill_chunk;
         options.kv_cache         = kv_dtype;
+        options.sage_attn        = sage_attn;
         options.speculative      = speculative;
         options.enable_vision    = false;
         options.use_cuda_graph   = use_cuda_graph;
+
+        if (keep_frac) {
+            char keep_frac_env[32];
+            std::snprintf(keep_frac_env, sizeof(keep_frac_env), "%.10g", *keep_frac);
+            setenv("NINFER_KEEP_FRAC", keep_frac_env, 1);
+        }
 
         ninfer::Engine engine(std::move(options));
         ninfer::PreparedPrompt prompt = engine.prepare_tokens(ids, false);
         const ninfer::ScoreResult score = engine.score(std::move(prompt), score_options);
         write_cell_json(out_json, scheme, weights, engine.load_summary(), kv_dtype, prefill_chunk,
-                        use_cuda_graph, speculative.backend, speculative.draft_tokens, score);
+                        use_cuda_graph, speculative.backend, speculative.draft_tokens, sage_attn,
+                        keep_frac, score);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "ninfer-ppl: " << error.what() << '\n';

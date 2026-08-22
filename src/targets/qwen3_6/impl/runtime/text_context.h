@@ -311,6 +311,8 @@ private:
     std::int64_t prefill_rewrite_checkpoint_frontier_     = -1;
     Tensor* rewrite_checkpoint_hidden_output_             = nullptr;
     std::uint32_t mtp_proposal_extent_                    = 0;
+    // A1 keep_frac from NINFER_KEEP_FRAC ((0, 1]; 1.0 = exact); text-model attention only.
+    float keep_frac_                                       = 1.0f;
 
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;

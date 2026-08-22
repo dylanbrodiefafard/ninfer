@@ -26,7 +26,12 @@ SCHEMES: dict[str, Scheme] = {
     "kv-bf16": Scheme("kv-bf16", "bf16"),
     "kv-int8": Scheme("kv-int8", "int8"),
     "kv-nvfp4": Scheme("kv-nvfp4", "nvfp4"),
+    # Approx-attention treatments (sage recipe, NVFP4 KV only):
+    #   attn-sage: the sage_attn FP4-PV recipe, exact (all key tiles kept);
+    #   attn-topk: tile-skip, keep_frac of the key tiles kept (sage_pv k_mean proxy).
+    "attn-sage": Scheme("attn-sage", "nvfp4", ("--sage",)),
+    "attn-topk": Scheme("attn-topk", "nvfp4", ("--sage", "--keep-frac", "0.5")),
 }
 
 # Baseline first. Additional attention schemes append after the KV codecs.
-ORDER: tuple[str, ...] = ("kv-bf16", "kv-int8", "kv-nvfp4")
+ORDER: tuple[str, ...] = ("kv-bf16", "kv-int8", "kv-nvfp4", "attn-sage", "attn-topk")
