@@ -103,10 +103,18 @@ Nvfp4s3Cache make_cache(int context) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
+    // Optional one-shot mode: `bench <context> <tokens>` profiles a single cell
+    // (for NCU); default is the full sweep.
+    const std::vector<int> contexts =
+        (argc > 1) ? std::vector<int>{std::atoi(argv[1])}
+                   : std::vector<int>{128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
+                                      65536, 98304, 153600};
+    const std::vector<int> tokens_list =
+        (argc > 2) ? std::vector<int>{std::atoi(argv[2])} : std::vector<int>{1, 2, 4, 6};
     std::printf("ninfer gqa-decode nvfp4s3 bench (geom=27B q=%d kv=%d hdim=%d code=%d groups=%d)\n",
                  kQHeads, kKVHeads, kHeadDim, kCodeW, kGroups);
     print_device_caps("gqa-nvfp4s3-decode");
@@ -114,9 +122,6 @@ int main() {
                  "dec p95(us)", "dec GB/s", "dec TF/s");
     std::printf("--------------------------------------------------------------------------------\n");
 
-    const std::vector<int> contexts = {128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
-                                       65536, 98304, 153600};
-    const std::vector<int> tokens_list = {1, 2, 4, 6};
     for (int context : contexts) {
         Nvfp4s3Cache cache = make_cache(context);
 

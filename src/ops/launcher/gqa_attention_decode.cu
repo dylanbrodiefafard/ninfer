@@ -11,6 +11,7 @@
 #include "ninfer/ops/gqa_attention.h"
 
 #include <cstdint>
+#include <cstdlib> // NINFER_S3_STRICT_PV
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -325,29 +326,42 @@ void launch_tc_partial_nvfp4s3(const Tensor& q, CacheInput input, const Tensor& 
                     : static_cast<const std::int32_t*>(invocation.valid_columns->data));
         CUDA_CHECK(cudaGetLastError());
     }
-    auto launch = [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool DynamicArena>() {
+    // NINFER_S3_STRICT_PV=1: run the sage decode with strict (BF16) P/PV numerics
+    // on the sage cache layout (QK stays NVFP4) instead of the S3 FP4-PV recipe.
+    // Decode attention is memory-bound, so the FP4-PV rate win is not the wall;
+    // strict numerics removes the FP4-P-quant floor. Default: FP4-PV.
+    static const bool strict_pv = [] {
+        const char* e = std::getenv("NINFER_S3_STRICT_PV");
+        return e != nullptr && e[0] == '1';
+    }();
+    auto launch = [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool DynamicArena,
+                      bool Strict>() {
         const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
         constexpr int kBr    = ((TokenTile * Geometry::GroupSize + 15) / 16) * 16;
         constexpr int kP4Row = (KeyBlock == 64) ? 48 : 32;
         constexpr int kPBlk  = KeyBlock / 16;
         constexpr std::size_t kDynamicBytes =
             DynamicArena
-                ? static_cast<std::size_t>(2 * KeyBlock * kGqaNvfp4CodeWidth + kBr * kP4Row +
-                                           kBr * kPBlk + kGqaHeadDim * kP4Row + kGqaHeadDim * 4 +
-                                           KeyBlock * kGqaNvfp4Groups)
+                ? (Strict
+                        ? static_cast<std::size_t>(4 * KeyBlock * kGqaNvfp4CodeWidth +
+                                                    2 * kGqaHeadDim * 4 + KeyBlock * kGqaNvfp4Groups +
+                                                    kBr * KeyBlock * 2)
+                        : static_cast<std::size_t>(2 * KeyBlock * kGqaNvfp4CodeWidth +
+                                                   kBr * kP4Row + kBr * kPBlk + kGqaHeadDim * kP4Row +
+                                                   kGqaHeadDim * 4 + KeyBlock * kGqaNvfp4Groups))
                 : 0u;
         if constexpr (DynamicArena) {
             static const cudaError_t attr = cudaFuncSetAttribute(
                 gqa_attention_decode_nvfp4s3_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
-                                                            MinBlocksPerSm, KeyBlock, DynamicArena,
-                                                            MultiBatch, Masked, CacheInput,
-                                                            false>,
+                                                           MinBlocksPerSm, KeyBlock, DynamicArena,
+                                                           MultiBatch, Masked, CacheInput,
+                                                           false, Strict>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
             CUDA_CHECK(attr);
         }
         gqa_attention_decode_nvfp4s3_tiled_kernel<Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm,
                                                    KeyBlock, DynamicArena, MultiBatch, Masked,
-                                                   CacheInput, false>
+                                                   CacheInput, false, Strict>
             <<<grid, WarpsPerCta * 32, kDynamicBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data), input,
                 static_cast<const std::int32_t*>(pos.data),
@@ -365,44 +379,52 @@ void launch_tc_partial_nvfp4s3(const Tensor& q, CacheInput input, const Tensor& 
                 logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
     };
+    auto launch_tier = [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool DynamicArena>() {
+        if (strict_pv) {
+            launch.template operator()<WarpsPerCta, MinBlocksPerSm, KeyBlock, DynamicArena, true>();
+        } else {
+            launch.template operator()<WarpsPerCta, MinBlocksPerSm, KeyBlock, DynamicArena,
+                                       false>();
+        }
+    };
     if constexpr (TokenTile == 6) {
         if (implementation_window > 128 && implementation_window <= 160) {
-            launch.template operator()<24, 1, 32, false>();
+            launch_tier.template operator()<24, 1, 32, false>();
         } else if (implementation_window <= 2054) {
-            launch.template operator()<12, 1, 32, false>();
+            launch_tier.template operator()<12, 1, 32, false>();
         } else if (implementation_window <= 8198) {
-            launch.template operator()<12, 1, 64, true>();
+            launch_tier.template operator()<12, 1, 64, true>();
         } else {
-            launch.template operator()<6, 2, 32, false>();
+            launch_tier.template operator()<6, 2, 32, false>();
         }
     } else if constexpr (TokenTile == 5) {
         if constexpr (Geometry::GroupSize == 6) {
             if (implementation_window > 128 && implementation_window <= 512) {
-                launch.template operator()<32, 1, 32, false>();
+                launch_tier.template operator()<32, 1, 32, false>();
             } else if (implementation_window <= 1029) {
-                launch.template operator()<16, 1, 32, false>();
+                launch_tier.template operator()<16, 1, 32, false>();
             } else {
-                launch.template operator()<8, 2, 32, false>();
+                launch_tier.template operator()<8, 2, 32, false>();
             }
         } else {
             if (implementation_window > 128 && implementation_window <= 512) {
-                launch.template operator()<24, 1, 32, false>();
+                launch_tier.template operator()<24, 1, 32, false>();
             } else if (implementation_window <= 1029) {
-                launch.template operator()<24, 1, 32, false>();
+                launch_tier.template operator()<24, 1, 32, false>();
             } else if (implementation_window <= 4096) {
-                launch.template operator()<12, 1, 32, false>();
+                launch_tier.template operator()<12, 1, 32, false>();
             } else {
-                launch.template operator()<6, 2, 32, false>();
+                launch_tier.template operator()<6, 2, 32, false>();
             }
         }
     } else if constexpr (TokenTile == 4) {
         if (implementation_window <= 1029) {
-            launch.template operator()<16, 1, 32, false>();
+            launch_tier.template operator()<16, 1, 32, false>();
         } else {
-            launch.template operator()<8, 2, 32, false>();
+            launch_tier.template operator()<8, 2, 32, false>();
         }
     } else {
-        launch.template operator()<8, 2, 32, false>();
+        launch_tier.template operator()<8, 2, 32, false>();
     }
     CUDA_CHECK(cudaGetLastError());
 }
