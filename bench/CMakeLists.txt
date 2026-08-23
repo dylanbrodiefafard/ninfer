@@ -69,6 +69,8 @@ ninfer_add_op_bench(ninfer_context_softmax_attention_bench
   SOURCES ops/context_softmax_attention_bench.cu)
 ninfer_add_op_bench(ninfer_gqa_attention_nvfp4s3_bench
   SOURCES ops/gqa_attention_nvfp4s3_bench.cu)
+ninfer_add_op_bench(ninfer_gqa_attention_nvfp4s3_tma_bench
+  SOURCES ops/gqa_attention_nvfp4s3_tma_bench.cu)
 ninfer_add_op_bench(ninfer_gqa_attention_decode_nvfp4s3_bench
   SOURCES ops/gqa_attention_decode_nvfp4s3_bench.cu)
 ninfer_add_op_bench(ninfer_gqa_attention_decode_nvfp4_bench

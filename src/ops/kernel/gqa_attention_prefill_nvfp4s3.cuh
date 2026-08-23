@@ -298,7 +298,8 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
     const std::uint8_t* __restrict__ cache_v_scale, const float* __restrict__ k_mean,
     Metadata metadata,
     const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
-    std::int32_t width, float keep_frac, GqaS3PrefillDump* dump) {
+    std::int32_t width, float keep_frac, GqaS3PrefillDump* dump,
+    std::uint32_t* dbg_regs = nullptr, std::uint8_t* dbg_q = nullptr) {
     constexpr int D             = kGqaPrefillHeadDim;
     constexpr int Br            = kGqaPrefillNvfp4s3Br;
     constexpr int Bc            = kGqaPrefillNvfp4s3Bc;
@@ -375,6 +376,12 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
         q_scale[row * Groups + grp]                                         = sc;
     }
     __syncthreads();
+    // Debug: capture the fully-written Q codes + Q scale smem for host A/B.
+    if (dbg_q != nullptr && q_head == 0 && q_block == 0) {
+        for (int i = tid; i < Br * CodeW; i += kGqaPrefillNvfp4s3Threads) dbg_q[i] = q_codes[i];
+        for (int i = tid; i < Br * Groups; i += kGqaPrefillNvfp4s3Threads)
+            dbg_q[kGqaPrefillNvfp4s3QBytes + i] = q_scale[i];
+    }
 
     auto issue_kv_tile = [&](int tile_k0, std::uint8_t* vs_stage) {
         const int physical_page = block_table[tile_k0 >> kPagedKVPageShift];
@@ -584,6 +591,17 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
                     }
                     mma_nvfp4_e4m3(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af[0],
                                    af[1], af[2], af[3], bf[0], bf[1], sfa, sfb);
+                    if (dbg_regs != nullptr && warp == 0 && k64 == 0 && nt == 0 &&
+                        q_head == 0 && q_block == 0) {
+                        dbg_regs[lane * 8 + 0] = af[0];
+                        dbg_regs[lane * 8 + 1] = af[1];
+                        dbg_regs[lane * 8 + 2] = af[2];
+                        dbg_regs[lane * 8 + 3] = af[3];
+                        dbg_regs[lane * 8 + 4] = bf[0];
+                        dbg_regs[lane * 8 + 5] = bf[1];
+                        dbg_regs[lane * 8 + 6] = sfa;
+                        dbg_regs[lane * 8 + 7] = sfb;
+                    }
                 }
             }
 
