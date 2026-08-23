@@ -31,7 +31,11 @@ SCHEMES: dict[str, Scheme] = {
     #   attn-topk: tile-skip, keep_frac of the key tiles kept (sage_pv k_mean proxy).
     "attn-sage": Scheme("attn-sage", "nvfp4", ("--sage",)),
     "attn-topk": Scheme("attn-topk", "nvfp4", ("--sage", "--keep-frac", "0.5")),
+    # attn-tma: same numerics as attn-sage, but the S3 (nvfp4s3) prefill kernel runs
+    # through the TMA + mbarrier pipeline (NINFER_S3_TMA=1, exact attention only).
+    "attn-tma": Scheme("attn-tma", "nvfp4", ("--sage", "--s3-tma")),
 }
 
 # Baseline first. Additional attention schemes append after the KV codecs.
-ORDER: tuple[str, ...] = ("kv-bf16", "kv-int8", "kv-nvfp4", "attn-sage", "attn-topk")
+ORDER: tuple[str, ...] = (
+    "kv-bf16", "kv-int8", "kv-nvfp4", "attn-sage", "attn-topk", "attn-tma")
