@@ -1078,7 +1078,6 @@ __launch_bounds__(256) __global__ void gqa_attention_decode_fill_nvfp4s3_kernel(
     }
     // New key codes under the final scale: single rounding, one coalesced pass.
     for (int ki = ib_begin; ki < ib_end; ++ki) {
-        const int t = ki + block_key0 - base_pos;
         const float c0 = s_new0 > 0.0f ? __fdiv_rn(v0s[ki], s_new0) : 0.0f;
         const float c1 = s_new1 > 0.0f ? __fdiv_rn(v1s[ki], s_new1) : 0.0f;
         cache_v[gqa_nvfp4_code_index<Geometry>(physical_page, kv_head, dp, page_off + ki)] =
