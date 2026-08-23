@@ -1794,10 +1794,21 @@ const char* cache_name(DType dtype) {
     return "int8-g64";
 }
 
-ReductionCriterion attention_criterion(DType dtype, bool sage = false) {
+// NINFER_S3_STRICT_PV=1: the kernel runs strict (BF16) P/PV numerics on the sage
+// cache, so the conformance reference must be the exact dequantized ideal, not the S3
+// recipe emulation (whose FP4-P floor sits ~0.05 rel_L2 away from it).
+bool s3_strict_pv() {
+    const char* e = std::getenv("NINFER_S3_STRICT_PV");
+    return e != nullptr && e[0] == '1';
+}
+
+ReductionCriterion attention_criterion(DType dtype, bool sage = false, bool strict_pv = false) {
     if (dtype == DType::BF16) { return kAttentionBf16Criterion; }
     if (dtype == DType::U8) {
-        return sage ? kAttentionNvfp4s3Criterion : kAttentionNvfp4Criterion;
+        // Strict (BF16) P/PV on the sage cache is exact-NVFP4-precision numerics, so
+        // it is gated at the exact-NVFP4 bar instead of the S3 FP4-P floor bar.
+        if (sage && !strict_pv) { return kAttentionNvfp4s3Criterion; }
+        return kAttentionNvfp4Criterion;
     }
     return kAttentionInt8Criterion;
 }
@@ -2046,9 +2057,14 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     const HostCache initial = make_cache(geometry, dtype, max_context, test_case.seed + 10u, sage);
     HostCache expected      = initial;
     append_cache(expected, k, v, positions);
+    // Strict P/PV (NINFER_S3_STRICT_PV=1) is only wired into the small-T (decode,
+    // tokens <= 6) route; prefill-routed sage cases keep the S3 FP4-PV recipe, so the
+    // strict reference/criterion apply to the decode cases only.
+    const bool strict_pv = s3_strict_pv() && test_case.tokens <= 6;
     const std::vector<double> reference =
-        sage ? sage_ideal_attention(q, expected, positions)
-             : ideal_attention(q, expected, positions);
+        (sage && !strict_pv)
+            ? sage_ideal_attention(q, expected, positions)
+            : ideal_attention(q, expected, positions);
     const std::vector<double> int8_reference =
         dtype == DType::U8 && !sage
             ? twin_cache_attention(geometry, DType::I8, max_context, test_case.seed + 10u, q,
@@ -2143,7 +2159,8 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     const std::vector<std::uint16_t> output_bits =
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
     const std::vector<double> actual = bf16_bits_to_double(output_bits);
-    int failures = verify_attention(label, actual, reference, attention_criterion(dtype, sage));
+    int failures =
+        verify_attention(label, actual, reference, attention_criterion(dtype, sage, strict_pv));
     if (sage) { sage_floor_report(label, actual, reference, q, expected, positions); }
     if (dtype == DType::U8 && !sage) {
         failures += verify_nvfp4_kernel_inside_codec_gap(label, actual, reference, int8_reference,
@@ -2181,9 +2198,11 @@ int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test
 
     const HostCache cache_host =
         make_cache(geometry, dtype, max_context, test_case.seed + 10u, sage);
+    const bool strict_pv = s3_strict_pv() && test_case.tokens <= 6;
     const std::vector<double> reference =
-        sage ? sage_ideal_attention(q, cache_host, positions)
-             : ideal_attention(q, cache_host, positions);
+        (sage && !strict_pv)
+            ? sage_ideal_attention(q, cache_host, positions)
+            : ideal_attention(q, cache_host, positions);
     const std::vector<double> int8_reference =
         dtype == DType::U8 && !sage
             ? twin_cache_attention(geometry, DType::I8, max_context, test_case.seed + 10u, q,
@@ -2223,7 +2242,8 @@ int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     const std::vector<std::uint16_t> output_bits =
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
     const std::vector<double> actual = bf16_bits_to_double(output_bits);
-    int failures = verify_attention(label, actual, reference, attention_criterion(dtype, sage));
+    int failures =
+        verify_attention(label, actual, reference, attention_criterion(dtype, sage, strict_pv));
     if (sage) { sage_floor_report(label, actual, reference, q, cache_host, positions); }
     if (dtype == DType::U8 && !sage) {
         failures += verify_nvfp4_kernel_inside_codec_gap(label, actual, reference, int8_reference,
