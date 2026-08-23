@@ -102,8 +102,8 @@ void write_cell_json(const std::string& path, const std::string& scheme, const s
                       const ninfer::LoadSummary& load, ninfer::KvCacheStorage kv_dtype,
                       std::uint32_t prefill_chunk, bool use_cuda_graph,
                       ninfer::SpeculativeBackend spec, std::uint32_t draft_tokens,
-                      bool sage_attn, std::optional<float> keep_frac,
-                      const ninfer::ScoreResult& score) {
+                       bool sage_attn, std::optional<float> keep_frac, bool s3_tma,
+                       const ninfer::ScoreResult& score) {
     std::ostringstream body;
     body << std::setprecision(17);
     body << "{\n"
@@ -117,8 +117,9 @@ void write_cell_json(const std::string& path, const std::string& scheme, const s
          << "  \"draft_tokens\": " << draft_tokens << ",\n"
          << "  \"cuda_graph\": " << (use_cuda_graph ? "true" : "false") << ",\n"
           << "  \"prefill_chunk\": " << prefill_chunk << ",\n"
-          << "  \"sage_attn\": " << (sage_attn ? "true" : "false") << ",\n"
-          << "  \"keep_frac\": " << keep_frac.value_or(1.0f) << ",\n"
+           << "  \"sage_attn\": " << (sage_attn ? "true" : "false") << ",\n"
+           << "  \"s3_tma\": " << (s3_tma ? "true" : "false") << ",\n"
+           << "  \"keep_frac\": " << keep_frac.value_or(1.0f) << ",\n"
          << "  \"skip_tokens\": " << score.skip_tokens << ",\n"
          << "  \"prompt_tokens\": " << score.prompt_tokens << ",\n"
          << "  \"tokens_scored\": " << score.tokens_scored << ",\n"
@@ -197,6 +198,7 @@ int main(int argc, char** argv) {
         std::uint32_t prefill_chunk     = 4096;
         int device                      = 0;
         bool sage_attn                  = false;
+        bool s3_tma                     = false;
         std::optional<float> keep_frac;
         bool help                       = false;
         bool encode                     = false;
@@ -223,6 +225,8 @@ int main(int argc, char** argv) {
                 kv_dtype = parse_kv_dtype(value("--kv-dtype"));
             } else if (arg == "--sage") {
                 sage_attn = true;
+            } else if (arg == "--s3-tma") {
+                s3_tma = true;
             } else if (arg == "--keep-frac") {
                 const std::string keep_frac_raw = value("--keep-frac");
                 char* keep_frac_end              = nullptr;
@@ -263,8 +267,9 @@ int main(int argc, char** argv) {
                 << "       ninfer-ppl --encode --weights <artifact.ninfer> --text <file> --ids <out.ids>\n"
                 << "  --scheme <name>             cell name (default: kv-bf16)\n"
                 << "  --kv-dtype <bf16|int8|nvfp4>\n"
-                << "  --sage                  sage_attn FP4-PV recipe (requires --kv-dtype nvfp4)\n"
-                << "  --keep-frac <f>         key-tile keep fraction (0,1]; <1 requires --sage\n"
+                 << "  --sage                  sage_attn FP4-PV recipe (requires --kv-dtype nvfp4)\n"
+                 << "  --s3-tma                run the S3 prefill kernel via TMA + mbarrier (NINFER_S3_TMA; requires --sage, keep_frac 1.0)\n"
+                 << "  --keep-frac <f>         key-tile keep fraction (0,1]; <1 requires --sage\n"
                 << "  --schedule <prefill|decode> default prefill (prompt-route GQA)\n"
                 << "  --skip <half|n>             warmup tokens not scored (default: half)\n"
                 << "  --spec <mtp|dflash>         load a speculative backend (decode score: mtp)\n"
@@ -297,6 +302,16 @@ int main(int argc, char** argv) {
         if (sage_attn && kv_dtype != ninfer::KvCacheStorage::Nvfp4) {
             throw std::invalid_argument("--sage requires --kv-dtype nvfp4 (sage_pv k_mean plane)");
         }
+        if (s3_tma && !sage_attn) {
+            throw std::invalid_argument(
+                "--s3-tma routes the S3 (nvfp4s3) prefill kernel through TMA and requires --sage "
+                "(--kv-dtype nvfp4)");
+        }
+        if (s3_tma && keep_frac && *keep_frac < 1.0f) {
+            throw std::invalid_argument(
+                "--s3-tma only implements exact attention (keep_frac 1.0); tile-skip "
+                "(keep_frac < 1) stays on the cp.async kernel");
+        }
         if (keep_frac && *keep_frac < 1.0f && !sage_attn) {
             throw std::invalid_argument(
                 "--keep-frac < 1.0 enables the sage_pv tile-skip proxy and requires --sage "
@@ -320,13 +335,16 @@ int main(int argc, char** argv) {
             std::snprintf(keep_frac_env, sizeof(keep_frac_env), "%.10g", *keep_frac);
             setenv("NINFER_KEEP_FRAC", keep_frac_env, 1);
         }
+        if (s3_tma) {
+            setenv("NINFER_S3_TMA", "1", 1);
+        }
 
         ninfer::Engine engine(std::move(options));
         ninfer::PreparedPrompt prompt = engine.prepare_tokens(ids, false);
         const ninfer::ScoreResult score = engine.score(std::move(prompt), score_options);
         write_cell_json(out_json, scheme, weights, engine.load_summary(), kv_dtype, prefill_chunk,
                         use_cuda_graph, speculative.backend, speculative.draft_tokens, sage_attn,
-                        keep_frac, score);
+                        keep_frac, s3_tma, score);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "ninfer-ppl: " << error.what() << '\n';
