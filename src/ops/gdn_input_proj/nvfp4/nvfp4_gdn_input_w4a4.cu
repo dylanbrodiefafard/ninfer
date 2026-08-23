@@ -25,11 +25,24 @@ void launch_gemm(const Weight& weight, Tensor& qkv, Tensor& z, Nvfp4W4a4Workspac
                     (tokens + Schedule::kBlockM - 1) / Schedule::kBlockM);
     const Nvfp4W4a4MaterializedActivation activation{workspace.codes, workspace.scales};
     const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
-    nvfp4_w4a4_mma_kernel<Geometry, Schedule><<<grid, Schedule::kThreads, 0, stream>>>(
-        activation, static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const std::uint8_t*>(weight.scales), tokens, alpha, Nvfp4IdentityEpilogue{},
-        Nvfp4GdnInputOutput{static_cast<__nv_bfloat16*>(qkv.data),
-                            static_cast<__nv_bfloat16*>(z.data)});
+    const Nvfp4GdnInputOutput output{static_cast<__nv_bfloat16*>(qkv.data),
+                                     static_cast<__nv_bfloat16*>(z.data)};
+    // T<=4 (one-shot verify/decode weight stream): mark the weight cp.async L2::evict_first so
+    // the streaming GEMV weights don't pollute the L2 set of downstream re-read consumers (see
+    // Cache::EvictFirst). Larger T re-reads weight tiles across M-blocks -> keep cg.
+    if (tokens <= 4) {
+        nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, Nvfp4GdnInputOutput,
+                              Nvfp4W4a4IdentityRows, false, Cache::EvictFirst>
+            <<<grid, Schedule::kThreads, 0, stream>>>(
+                activation, static_cast<const std::uint8_t*>(weight.qdata),
+                static_cast<const std::uint8_t*>(weight.scales), tokens, alpha,
+                Nvfp4IdentityEpilogue{}, output);
+    } else {
+        nvfp4_w4a4_mma_kernel<Geometry, Schedule><<<grid, Schedule::kThreads, 0, stream>>>(
+            activation, static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales), tokens, alpha, Nvfp4IdentityEpilogue{},
+            output);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

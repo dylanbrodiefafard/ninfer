@@ -5,11 +5,35 @@
 
 namespace ninfer::ops {
 
+// L2 cache-policy selectors for the cp.async weight/activation fills in the NVFP4 GEMV/GEMM
+// kernels (see cp_async / cp_async_zfill below).
+//
+//   ca — plain cp.async (no L2 hint; 4/8/16-byte fills).
+//   cg — cp.async.cg (16-byte fill; the default for streaming weight fills).
+//   EvictFirst — cp.async.cg plus an L2::evict_first cache_hint (sm_90+ / sm_120).
+//
+// WHEN TO USE EvictFirst, and why: it marks the L2 lines filled by the weight stream so the
+// hardware evicts them first, keeping that streaming traffic OUT of the L2 working set. That
+// is the right call for ONE-SHOT weight fills: in the small-T GEMV (T<=4, the MTP verify /
+// decode round) each weight byte is read exactly once (a single M-block, no cross-tile
+// re-read), so retaining it in L2 is worthless — and actively harmful, because the 10s-100s
+// of MB of streamed weights would otherwise displace the small working set that a *following*
+// consumer re-reads in the same round (SwiGLU's BF16 mid for MLP-down, or attention KV / GDN
+// state). Marking the stream evict-first frees that L2 for the data that is actually reused.
+// Shipped evidence: the SwiGLU T<=4 path (nvfp4_linear_swiglu_w4a4.cu) earns a -15%
+// (swiglu+down) pair win from exactly this hint.
+//
+// WHEN NOT TO USE it (the con, why every call site scopes it to T<=4): for large-T (prefill)
+// GEMM the same weight tile is re-read across many M-blocks, so L2 retention of the weights
+// IS valuable and evict-first REGRESSES. Every site therefore applies EvictFirst only when
+// `tokens <= 4` and falls back to Cache::cg otherwise.
+//
+// Implementation note: the evict-first fill routes through cp_async_evict_first_16_noinline
+// (memory_evict.cu); inlining createpolicy.fractional + the cache_hint directly into the big
+// MMA kernels makes ptxas 13.1 on sm_120a emit an illegal LDGSTS-desc form.
 enum class Cache {
     ca,
     cg,
-    // cp.async.cg + L2::evict_first cache_hint (sm_90+ / sm_120). One-shot weight fills that
-    // should not displace a following consumer's working set (e.g. SwiGLU mid → MLP-down).
     EvictFirst,
 };
 
