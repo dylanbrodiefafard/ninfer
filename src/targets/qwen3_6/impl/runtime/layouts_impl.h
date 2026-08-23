@@ -26,6 +26,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <cstdlib>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 namespace {
@@ -256,17 +257,28 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             layout, tokens, plan.features.vision ? 3 : 0, plan.features.vision ? tokens : 0);
     };
     const auto attention_stage = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
-                                     std::int32_t last, qwen3_6::TextPhase phase,
-                                     std::int32_t batch_size, std::int32_t min_width,
-                                     std::int32_t max_width, ops::GqaExecutionEnvelope envelope) {
+                                      std::int32_t last, qwen3_6::TextPhase phase,
+                                      std::int32_t batch_size, std::int32_t min_width,
+                                      std::int32_t max_width, ops::GqaExecutionEnvelope envelope) {
         auto stage = layout.scope();
         (void)workspace_recipe::text_attention_projection<TextConfig>(layout, last);
         scratch(layout, Variant::attention_projection_workspace_capacity_bytes(plan.weights_profile,
                                                                                phase, first, last));
         (void)workspace_recipe::text_attention_results<TextConfig>(layout, last);
+        // The sparge-decode tile-skip (NINFER_KEEP_FRAC < 1) adds a rank keep-set
+        // scratch to the W=1 sage stage; size the layout from the same env the
+        // runtime reads (one source of truth, both read at process start).
+        float layout_keep_frac = 1.0f;
+        if (const char* keep_frac_env = std::getenv("NINFER_KEEP_FRAC")) {
+            char* keep_frac_end = nullptr;
+            const float parsed = std::strtof(keep_frac_env, &keep_frac_end);
+            if (keep_frac_end != keep_frac_env && parsed > 0.0f && parsed <= 1.0f) {
+                layout_keep_frac = parsed;
+            }
+        }
         scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
-                            TextConfig::query_heads, plan.kv_dtype, envelope, batch_size, min_width,
-                            max_width));
+                            TextConfig::query_heads, plan.kv_dtype, envelope, batch_size,
+                            min_width, max_width, layout_keep_frac));
         scratch(layout, Variant::attention_output_projection_workspace_capacity_bytes(
                             plan.weights_profile, phase, first, last));
     };

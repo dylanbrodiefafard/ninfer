@@ -32,6 +32,8 @@
 
 #include <math_constants.h>
 
+#include <cfloat>
+
 namespace ninfer::ops {
 
 // Dequantize 8 V values (4 e2m1 code bytes, low nibble = even d) with the S3 d-major
@@ -66,9 +68,327 @@ __device__ __forceinline__ float gqa_s3_e2m1_value_alu(std::uint8_t code) {
     return (code & 0x08u) ? -mag : mag;
 }
 
+// Sparge-decode tile-skip rank kernel: one CTA per (kv_head, batch row) for a
+// T=1 step. Ranks the window's Bc-key tiles with the meansim proxy
+//
+//   score(kb) = sum_d q_mean[d] * k_mean[page(kb), kv_head, d]
+//
+// (q_mean = the average of the kv group's BF16 query heads for this step;
+// k_mean = the per-page dequantized K-mean plane the fill kernel writes - the
+// same plane the prefill s3 rank uses), and emits a per-(kv_head, batch) keep
+// list plus per-split prefix offsets so the partial kernel fetches only the
+// kept tiles (K/V DRAM traffic cut by ~(1 - keep_frac)). The keep set is the
+// top keep_frac fraction by (score desc, tile asc) plus attention sinks (the
+// first tiles) and a recency window (the last tiles) - the prefill rank's
+// coefficients. The selection is a 64-bin histogram with a deterministic
+// tile-ascending tie-break inside the threshold bin, so a host oracle can
+// rebuild the exact keep set from a dump.
+template <typename Geometry, int Bc, bool MultiBatch>
+__launch_bounds__(256) __global__
+void gqa_attention_decode_rank_nvfp4s3_kernel(
+    const __nv_bfloat16* q, const std::int32_t* pos, const std::int32_t* block_tables,
+    const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
+    std::int32_t column_begin, std::int32_t splits, float keep_frac, const float* k_mean,
+    std::int32_t* keep_tiles, std::int32_t* keep_count, std::int32_t* split_off,
+    std::int32_t n_pow2, std::int32_t keep_stride) {
+    constexpr int D         = kGqaHeadDim;
+    constexpr int Warps     = 8;
+    constexpr int MemberCap = 256; // threshold-bin members beyond this keep the whole bin
+    const int kv_head       = static_cast<int>(blockIdx.x);
+    const int batch         = MultiBatch ? static_cast<int>(blockIdx.z) : 0;
+    const int tid           = static_cast<int>(threadIdx.x);
+    const int warp          = tid >> 5;
+    const int lane          = tid & 31;
+
+    const std::int32_t* block_table = block_tables;
+    std::int64_t column_base        = column_begin;
+    if constexpr (MultiBatch) {
+        block_table =
+            block_tables + static_cast<std::int64_t>(table_rows[batch]) * table_stride;
+        column_base += static_cast<std::int64_t>(batch) * full_width;
+    }
+    q += static_cast<std::int64_t>(D) * Geometry::QHeads * column_base;
+
+    const int row = batch * Geometry::KVHeads + kv_head;
+    std::int32_t* keep_list_row = keep_tiles + static_cast<std::int64_t>(row) * keep_stride;
+    std::int32_t* off_row       = split_off + static_cast<std::int64_t>(row) * (splits + 1);
+
+    const int window     = (pos[column_base] >= 0) ? (static_cast<int>(pos[column_base]) + 1) : 0;
+    const int active     = gqa_small_t_active_splits<Geometry, true>(window, splits, 1);
+    const int tiles      = div_up(window, Bc);
+    const int flag_words = (n_pow2 + 31) / 32;
+    const int per_warp   = (n_pow2 + Warps - 1) / Warps;
+
+    // Dynamic smem (launcher-sized, all below the consumer 99KB cap): per-warp
+    // tile scores, per-warp 64-bin histograms, keep flags, per-32-tile
+    // popcount prefix, q_mean, bin edges, the threshold-bin member list, and
+    // the small cross-warp scratch.
+    extern __shared__ std::uint8_t rank_smem[];
+    float* warp_score = reinterpret_cast<float*>(rank_smem);
+    int* warp_hist    = reinterpret_cast<int*>(warp_score + std::size_t(Warps) * per_warp);
+    std::uint32_t* flags     = reinterpret_cast<std::uint32_t*>(warp_hist + Warps * 64);
+    std::uint32_t* word_pref = reinterpret_cast<std::uint32_t*>(flags + flag_words);
+    float* q_mean_s          = reinterpret_cast<float*>(word_pref + flag_words);
+    float* bin_edge          = q_mean_s + D;
+    int* member_list         = reinterpret_cast<int*>(bin_edge + 65);
+    __shared__ int warp_cnt[Warps];
+    __shared__ float warp_min[Warps], warp_max[Warps];
+    __shared__ int global_hist[64];
+    __shared__ int thr_bin_s, needed_s;
+    __shared__ int rank_total_s;
+
+    const auto write_neutral = [&] {
+        keep_count[row] = 0;
+        for (std::int32_t s = tid; s <= splits; s += 256) { off_row[s] = 0; }
+    };
+    if (window <= 0 || tiles == 0) { write_neutral(); return; }
+
+    // q_mean[d] = the average of the group's BF16 query heads (T=1 step).
+    if (tid < D) {
+        float acc = 0.0f;
+        for (int g = 0; g < Geometry::GroupSize; ++g) {
+            acc += __bfloat162float(q[gqa_q_index<Geometry>(kv_head * Geometry::GroupSize + g,
+                                                            tid, 0)]);
+        }
+        q_mean_s[tid] = acc / static_cast<float>(Geometry::GroupSize);
+    }
+    if (tid < Warps * 64) { warp_hist[tid] = 0; }
+    if (tid < Warps) { warp_min[tid] = FLT_MAX; warp_max[tid] = -FLT_MAX; }
+    __syncthreads();
+
+    // Phase 1: per-tile proxy scores, one warp per tile, 8 d's per lane
+    // (warp-local dot + shfl reduce; each warp only touches its own smem
+    // slots, so no cross-warp barrier is needed inside the loop).
+    for (int it = 0; it < per_warp; ++it) {
+        const int kb = warp + it * Warps;
+        if (kb >= tiles) { break; }
+        const std::int64_t base = paged_kv_element_offset<4, Geometry::KVHeads>(
+            block_table[(kb * Bc) >> kPagedKVPageShift], kv_head, 0, 0);
+        const float* km = k_mean + base;
+        float acc       = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int d = lane * 8 + j;
+            acc += q_mean_s[d] * km[(d >> 2) * 4 + (d & 3)];
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) { acc += __shfl_down_sync(0xffffffffu, acc, o); }
+        if (lane == 0) {
+            warp_score[static_cast<std::size_t>(warp) * per_warp + it] = acc;
+            warp_min[warp] = fminf(warp_min[warp], acc);
+            warp_max[warp] = fmaxf(warp_max[warp], acc);
+        }
+    }
+    __syncthreads();
+
+    // CTA-wide score range -> 64 deterministic bin edges.
+    if (warp == 0) {
+        float lo = (lane < Warps) ? warp_min[lane] : 0.0f;
+        float hi = (lane < Warps) ? warp_max[lane] : 0.0f;
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1) {
+            lo = fmin(lo, __shfl_xor_sync(0xffffffffu, lo, o));
+            hi = fmax(hi, __shfl_xor_sync(0xffffffffu, hi, o));
+        }
+        if (lane == 0) { warp_min[0] = lo; warp_max[0] = hi; }
+    }
+    __syncthreads();
+    const float lo_all = warp_min[0];
+    const float range  = warp_max[0] - lo_all;
+    if (tid <= 64) {
+        bin_edge[tid] = (range > 0.0f)
+                            ? (lo_all + range * static_cast<float>(tid) / 64.0f)
+                            : (lo_all + static_cast<float>(tid));
+    }
+    __syncthreads();
+
+    // Per-tile coarse bin (deterministic; re-derived from the stored score so
+    // no k_mean bytes are re-read).
+    const auto tile_bin = [&](int kb) {
+        const float s =
+            warp_score[static_cast<std::size_t>(kb % Warps) * per_warp + kb / Warps];
+        if (range <= 0.0f) { return 0; }
+        const int b = static_cast<int>((s - lo_all) / range * 64.0f);
+        return (b > 63) ? 63 : b;
+    };
+
+    // Phase 2: per-warp histogram (warp-local atomics) + threshold bin.
+    for (int it = 0; it < per_warp; ++it) {
+        const int kb = warp + it * Warps;
+        if (kb >= tiles) { break; }
+        atomicAdd(&warp_hist[warp * 64 + tile_bin(kb)], 1);
+    }
+    __syncthreads();
+    if (tid < 64) {
+        int acc = 0;
+        for (int w = 0; w < Warps; ++w) { acc += warp_hist[w * 64 + tid]; }
+        global_hist[tid] = acc;
+    }
+    __syncthreads();
+    const int topk =
+        (static_cast<int>(static_cast<std::size_t>(tiles) * keep_frac) < 1) ? 1
+                                                                           : (static_cast<int>(static_cast<std::size_t>(tiles) *
+                                                                                          keep_frac));
+    if (tid == 0) {
+        int cum = 0;
+        thr_bin_s = 0;
+        needed_s  = 0;
+        for (int b = 63; b >= 0; --b) {
+            const int next = cum + global_hist[b];
+            if (next >= topk) { thr_bin_s = b; needed_s = topk - cum; break; }
+            cum = next;
+        }
+    }
+    __syncthreads();
+    const int thr_bin = thr_bin_s;
+    const int needed  = needed_s;
+
+    // Phase 3: keep flags - every tile strictly above the threshold bin, plus
+    // the first `needed` members of the threshold bin in tile-ascending order
+    // (the lane-strided pass preserves the global tile order), plus the forced
+    // sinks (first tiles) and recency window (last tiles).
+    for (std::size_t i = 0; i < flag_words; ++i) { flags[i] = 0u; }
+    __syncthreads();
+    for (int kb = tid; kb < tiles; kb += 256) {
+        if (tile_bin(kb) > thr_bin) { atomicOr(&flags[kb >> 5], 1u << (kb & 31)); }
+    }
+    __syncthreads();
+    if (warp == 0) {
+        int member_rank = 0;
+        for (int kb = lane; kb < tiles; kb += 32) {
+            if (tile_bin(kb) != thr_bin) { continue; }
+            if (member_rank < MemberCap) { member_list[member_rank] = kb; }
+            if (member_rank < needed) { atomicOr(&flags[kb >> 5], 1u << (kb & 31)); }
+            ++member_rank;
+        }
+        // Beyond the cap the whole bin is kept (a deterministic over-keep in
+        // the degenerate near-tie case; keeping more only moves toward exact).
+        if (member_rank > MemberCap) {
+            for (int kb = lane; kb < tiles; kb += 32) {
+                if (tile_bin(kb) == thr_bin) { atomicOr(&flags[kb >> 5], 1u << (kb & 31)); }
+            }
+        }
+    }
+    __syncthreads();
+    const int sinks =
+        (static_cast<int>(static_cast<std::size_t>(tiles) * keep_frac * 0.2f) < 1) ? 1
+                                                                                  : (static_cast<int>(static_cast<std::size_t>(tiles) *
+                                                                                              keep_frac * 0.2f));
+    const int win =
+        (static_cast<int>(static_cast<std::size_t>(tiles) * keep_frac * 0.4f) < 1) ? 1
+                                                                                  : (static_cast<int>(static_cast<std::size_t>(tiles) *
+                                                                                              keep_frac * 0.4f));
+    if (warp == 0) {
+        for (int kb = lane; kb < tiles; kb += 32) {
+            if (kb < sinks || kb >= tiles - win) {
+                atomicOr(&flags[kb >> 5], 1u << (kb & 31));
+            }
+        }
+    }
+    __syncthreads();
+
+    // Phase 4: keep count + keep list (thread-major deterministic order; the
+    // partial pipeline only needs a stable per-CTA order).
+    // Contiguous tile chunks per thread so the keep list is in ascending-tile
+    // order (the split_off boundaries below are tile-index based, so the list
+    // must be tile-sorted for each split's slice to hold exactly its kept tiles).
+    const int chunk = (tiles + 255) / 256;
+    const int kb_lo = tid * chunk;
+    const int kb_hi = (kb_lo + chunk < tiles) ? (kb_lo + chunk) : tiles;
+    int local_n = 0;
+    for (int kb = kb_lo; kb < kb_hi; ++kb) {
+        if ((flags[kb >> 5] >> (kb & 31)) & 1u) { ++local_n; }
+    }
+    int excl = 0;
+    {
+        int inc = local_n;
+#pragma unroll
+        for (int o = 1; o <= 16; o <<= 1) {
+            const int t = __shfl_up_sync(0xffffffffu, inc, o);
+            inc += (lane >= o) ? t : 0;
+        }
+        excl = inc - local_n;
+    }
+    {
+        int wtot = local_n;
+#pragma unroll
+        for (int o = 16; o; o >>= 1) { wtot += __shfl_down_sync(0xffffffffu, wtot, o); }
+        if (lane == 0) { warp_cnt[warp] = wtot; }
+    }
+    __syncthreads();
+    int base = 0;
+#pragma unroll
+    for (int w = 0; w < warp; ++w) { base += warp_cnt[w]; }
+    {
+        int i2 = 0;
+        for (int kb = kb_lo; kb < kb_hi; ++kb) {
+            if ((flags[kb >> 5] >> (kb & 31)) & 1u) {
+                keep_list_row[base + excl + i2++] = kb;
+            }
+        }
+    }
+    if (tid == 0) {
+        int total = 0;
+        for (int w = 0; w < Warps; ++w) { total += warp_cnt[w]; }
+        keep_count[row] = total;
+    }
+    __syncthreads();
+
+    // Phase 5: per-split keep prefixes. The split layout mirrors the partial
+    // kernel (gqa_small_t_active_splits + its units_per_split choice): split s
+    // processes the whole tiles covering its key range [s*units, s*units+units)
+    // (tile-aligned in tile-split mode, floor-to-tile otherwise).
+    const bool tile_split      = tiles >= active;
+    const int units_per_split  = tile_split ? div_up(tiles, active) : div_up(window, active);
+    for (std::size_t i = 0; i < flag_words; ++i) {
+        word_pref[i] = (i * 32 < tiles) ? __popc(flags[i]) : 0u;
+    }
+    if (tid == 0) {
+        std::uint32_t run = 0;
+        const int words = (tiles + 31) / 32;
+        for (int i = 0; i < words; ++i) {
+            const std::uint32_t p = word_pref[i];
+            word_pref[i]         = run;
+            run += p;
+        }
+        for (int i = words; i < flag_words; ++i) { word_pref[i] = run; }
+        rank_total_s = static_cast<int>(run);
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        for (std::int32_t s = lane; s <= active; s += 32) {
+            const int first_tile =
+                tile_split ? (s * units_per_split) : (s * units_per_split) / Bc;
+            int kept_before = 0;
+            if (first_tile < tiles) {
+                const int w   = first_tile >> 5;
+                const int rem = first_tile & 31;
+                kept_before   = static_cast<int>(word_pref[w]);
+                if (rem != 0) { kept_before += __popc(flags[w] & ((1u << rem) - 1u)); }
+            } else {
+                kept_before = rank_total_s;
+            }
+            off_row[s] = kept_before;
+        }
+        if (lane == 0) {
+            off_row[active] = rank_total_s;
+        }
+    }
+}
+
+// Dynamic-smem size for the rank kernel (must match its extern __shared__ layout).
+inline std::size_t gqa_s3_decode_rank_smem_bytes(std::int32_t n_pow2) {
+    const std::size_t flag_words = (static_cast<std::size_t>(n_pow2) + 31) / 32;
+    const std::size_t per_warp  = (static_cast<std::size_t>(n_pow2) + 7) / 8;
+    return 8 * per_warp * 4 /*warp_score*/ + 8 * 64 * 4 /*warp_hist*/ +
+           flag_words * 4 /*flags*/ + flag_words * 4 /*word_pref*/ + 256 * 4 /*q_mean*/ +
+           65 * 4 /*bin_edge*/ + 256 * 4 /*member_list*/;
+}
+
 template <typename Geometry, int TokenTile, int WarpsPerCta, int MinBlocksPerSm, int KeyBlock,
           bool DynamicArena, bool MultiBatch, bool Masked, typename CacheInput,
-          bool FusedFill = true, bool StrictPV = false>
+          bool FusedFill = true, bool StrictPV = false, bool TileSkip = false>
 __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     void gqa_attention_decode_nvfp4s3_tiled_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos,
@@ -77,7 +397,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const std::int32_t* valid_columns, const std::int32_t* table_rows,
         std::int32_t table_stride, std::int32_t full_width, std::int32_t column_begin,
         std::int32_t logical_capacity, float scale, __nv_bfloat16* partial_acc, float* partial_m,
-        float* partial_l) {
+        float* partial_l,
+        const std::int32_t* keep_tiles, const std::int32_t* split_off, std::int32_t max_keep) {
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles             = (RowCount + 15) / 16;
@@ -231,6 +552,23 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     const int active_split_count =
         gqa_small_t_active_splits<Geometry, true>(window, split_count, TokenTile);
     if (split >= active_split_count) { return; }
+
+    // Sparge decode (TileSkip): the rank kernel has already computed the
+    // per-(kv_head, batch) keep set; this split walks only its kept tiles
+    // (list-order slice [off_cur, off_next)). A split with no kept tiles
+    // writes a neutral partial and returns.
+    std::int64_t skip_base = 0;
+    int off_cur = 0, off_next = 0;
+    if constexpr (TileSkip) {
+        skip_base = static_cast<std::int64_t>(batch * Geometry::KVHeads + kv_head);
+        const std::int32_t* off_row = split_off + skip_base * (split_count + 1);
+        off_cur  = off_row[split];
+        off_next = off_row[split + 1];
+        if (off_cur == off_next) {
+            write_neutral();
+            return;
+        }
+    }
 
     const int logical_tiles = div_up(window, Bc);
     const bool tile_split   = logical_tiles >= active_split_count;
@@ -392,7 +730,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     auto issue_kv_tile = [&](int tile_k0, int physical_page, int buf) {
         for (int key_l = tid; key_l < Bc; key_l += Threads) {
             const int key = tile_k0 + key_l;
-            if (key >= split_start && key < split_end) {
+            if ((TileSkip || (key >= split_start && key < split_end))) {
                 const std::int64_t off = gqa_nvfp4_scale_index<Geometry>(
                     physical_page, kv_head, 0, key & kPagedKVPageMask);
                 ninfer::ops::cp_async<16>(&k_scale_s[key_l * Groups], &cache_k_scale[off]);
@@ -411,7 +749,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             // offset is a compile-time zero on the FP4 path.
             const std::size_t vbuf_off = StrictPV ? static_cast<std::size_t>(buf) * Bc * CodeW : 0;
             std::uint8_t* v_dst   = &v_codes[vbuf_off + key_l * CodeW + logical];
-            if (key >= split_start && key < split_end) {
+            if ((TileSkip || (key >= split_start && key < split_end))) {
                 const std::int64_t off = gqa_nvfp4_code_index<Geometry>(
                     physical_page, kv_head, logical, key & kPagedKVPageMask);
                 ninfer::ops::cp_async<16>(k_dst, &cache_k[off]);
@@ -442,7 +780,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 for (int kb = 0; kb < 4; ++kb) {
                     const int key = tile_k0 + kb * 16;
                     std::uint8_t* row = plane + kb * D + d0;
-                    if (kb < PBlocks && key + 16 > split_start && key < split_end) {
+                    if (kb < PBlocks && (TileSkip || (key + 16 > split_start && key < split_end))) {
                         // Tile-local kb -> in-page 16-key block: a Bc=32 tile may
                         // start at in-page offset 32, where its kb 0,1 hold
                         // in-page blocks 2,3 (the plane is written per in-page
@@ -471,7 +809,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 #pragma unroll
                 for (int kb = 0; kb < 4; ++kb) {
                     const int key = tile_k0 + kb * 16;
-                    if (kb < PBlocks && key + 16 > split_start && key < split_end) {
+                    if (kb < PBlocks && (TileSkip || (key + 16 > split_start && key < split_end))) {
                         const int key_block = (key & kPagedKVPageMask) >> 4;
                         v_scales[d * 4 + kb] =
                             cache_v_scale[gqa_s3_v_scale_index<Geometry>(
@@ -485,13 +823,23 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         ninfer::ops::cp_commit();
     };
 
-    int physical_page = physical_pages_s[0];
-    issue_kv_tile(first_tile, physical_page, 0);
+    int physical_page;
+    if constexpr (TileSkip) {
+        const int gkb = keep_tiles[skip_base * max_keep + off_cur];
+        physical_page = physical_pages_s[(gkb * Bc >> kPagedKVPageShift) - first_page];
+    } else {
+        physical_page = physical_pages_s[0];
+    }
+    issue_kv_tile(TileSkip ? (keep_tiles[skip_base * max_keep + off_cur] * Bc) : first_tile,
+                  physical_page, 0);
     ninfer::ops::cp_wait<0>();
     __syncthreads();
 
-    for (int kb = 0; kb < key_blocks; ++kb) {
-        const int k0 = first_tile + kb * Bc;
+    const int tile_last = TileSkip ? (off_next - off_cur - 1) : (key_blocks - 1);
+    for (int kb = 0; kb <= tile_last; ++kb) {
+        const int k0 = TileSkip
+                           ? (keep_tiles[skip_base * max_keep + off_cur + kb] * Bc)
+                           : (first_tile + kb * Bc);
 
         if (warp < RowTiles) {
             const int producer_row_base = warp * 16;
@@ -553,19 +901,19 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                     const int col0 = nt * 8 + 2 * lid;
                     const int key0 = k0 + col0;
                     const int key1 = key0 + 1;
-                    score[nt][0] = (row0 < RowCount && key0 >= split_start && key0 < split_end &&
+                    score[nt][0] = (row0 < RowCount && (TileSkip || (key0 >= split_start && key0 < split_end)) &&
                                     key0 <= qabs0)
                                        ? score[nt][0] * scale
                                        : -CUDART_INF_F;
-                    score[nt][1] = (row0 < RowCount && key1 >= split_start && key1 < split_end &&
+                    score[nt][1] = (row0 < RowCount && (TileSkip || (key1 >= split_start && key1 < split_end)) &&
                                     key1 <= qabs0)
                                        ? score[nt][1] * scale
                                        : -CUDART_INF_F;
-                    score[nt][2] = (row1 < RowCount && key0 >= split_start && key0 < split_end &&
+                    score[nt][2] = (row1 < RowCount && (TileSkip || (key0 >= split_start && key0 < split_end)) &&
                                     key0 <= qabs1)
                                        ? score[nt][2] * scale
                                        : -CUDART_INF_F;
-                    score[nt][3] = (row1 < RowCount && key1 >= split_start && key1 < split_end &&
+                    score[nt][3] = (row1 < RowCount && (TileSkip || (key1 >= split_start && key1 < split_end)) &&
                                     key1 <= qabs1)
                                        ? score[nt][3] * scale
                                        : -CUDART_INF_F;
@@ -630,35 +978,35 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int key1 = key0 + 1;
                 const int key2 = k0 + (nt + 1) * 8 + 2 * lid;
                 const int key3 = key2 + 1;
-                score[nt][0]   = (row0 < RowCount && key0 >= split_start && key0 < split_end &&
+                score[nt][0]   = (row0 < RowCount && (TileSkip || (key0 >= split_start && key0 < split_end)) &&
                                   key0 <= qabs0)
                                      ? score[nt][0] * scale
                                      : -CUDART_INF_F;
-                score[nt][1]   = (row0 < RowCount && key1 >= split_start && key1 < split_end &&
+                score[nt][1]   = (row0 < RowCount && (TileSkip || (key1 >= split_start && key1 < split_end)) &&
                                   key1 <= qabs0)
                                      ? score[nt][1] * scale
                                      : -CUDART_INF_F;
-                score[nt + 1][0] = (row0 < RowCount && key2 >= split_start && key2 < split_end &&
+                score[nt + 1][0] = (row0 < RowCount && (TileSkip || (key2 >= split_start && key2 < split_end)) &&
                                     key2 <= qabs0)
                                         ? score[nt + 1][0] * scale
                                         : -CUDART_INF_F;
-                score[nt + 1][1] = (row0 < RowCount && key3 >= split_start && key3 < split_end &&
+                score[nt + 1][1] = (row0 < RowCount && (TileSkip || (key3 >= split_start && key3 < split_end)) &&
                                     key3 <= qabs0)
                                         ? score[nt + 1][1] * scale
                                         : -CUDART_INF_F;
-                score[nt][2]   = (row1 < RowCount && key0 >= split_start && key0 < split_end &&
+                score[nt][2]   = (row1 < RowCount && (TileSkip || (key0 >= split_start && key0 < split_end)) &&
                                   key0 <= qabs1)
                                      ? score[nt][2] * scale
                                      : -CUDART_INF_F;
-                score[nt][3]   = (row1 < RowCount && key1 >= split_start && key1 < split_end &&
+                score[nt][3]   = (row1 < RowCount && (TileSkip || (key1 >= split_start && key1 < split_end)) &&
                                   key1 <= qabs1)
                                      ? score[nt][3] * scale
                                      : -CUDART_INF_F;
-                score[nt + 1][2] = (row1 < RowCount && key2 >= split_start && key2 < split_end &&
+                score[nt + 1][2] = (row1 < RowCount && (TileSkip || (key2 >= split_start && key2 < split_end)) &&
                                     key2 <= qabs1)
                                         ? score[nt + 1][2] * scale
                                         : -CUDART_INF_F;
-                score[nt + 1][3] = (row1 < RowCount && key3 >= split_start && key3 < split_end &&
+                score[nt + 1][3] = (row1 < RowCount && (TileSkip || (key3 >= split_start && key3 < split_end)) &&
                                     key3 <= qabs1)
                                         ? score[nt + 1][3] * scale
                                         : -CUDART_INF_F;
@@ -804,11 +1152,20 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         }
         __syncthreads();
 
-        const bool has_next = kb + 1 < key_blocks;
+        const bool has_next =
+            TileSkip ? (off_cur + kb + 1 < off_next) : (kb + 1 < key_blocks);
         if (has_next) {
-            const int next_k0 = k0 + Bc;
-            if ((next_k0 & kPagedKVPageMask) == 0) {
-                physical_page = physical_pages_s[(next_k0 >> kPagedKVPageShift) - first_page];
+            const int next_k0 =
+                TileSkip ? (keep_tiles[skip_base * max_keep + off_cur + kb + 1] * Bc) : (k0 + Bc);
+            if constexpr (TileSkip) {
+                // The keep-list order is not monotonic in key index, so the page
+                // is looked up per entry (the contiguous path only updates it on
+                // page boundaries).
+                physical_page =
+                    physical_pages_s[(next_k0 >> kPagedKVPageShift) - first_page];
+            } else if ((next_k0 & kPagedKVPageMask) == 0) {
+                physical_page =
+                    physical_pages_s[(next_k0 >> kPagedKVPageShift) - first_page];
             }
             issue_kv_tile(next_k0, physical_page, (kb + 1) & 1);
         }

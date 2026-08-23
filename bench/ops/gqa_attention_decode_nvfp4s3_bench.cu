@@ -54,7 +54,7 @@ constexpr float kScale   = 0.0625f;  // 1/sqrt(head_dim) = 1/16
 
 // Owns the U8 cache planes + the PagedKVLayerView that the launchers consume.
 struct Nvfp4s3Cache {
-    DeviceBuffer k_pages, v_pages, k_scale, v_scale, block_table;
+    DeviceBuffer k_pages, v_pages, k_scale, v_scale, block_table, k_mean;
     PagedKVLayerView view;
     int logical_pages  = 0;
     int physical_pages = 0;
@@ -87,12 +87,28 @@ Nvfp4s3Cache make_cache(int context) {
     for (int p = 0; p < logical_pages; ++p) h_table[p] = p;
     cache.block_table.copy_from_host(h_table.data(), table_bytes);
 
+    // Sage meansim proxy plane (the rank kernel's input): [4][64][kv_heads][pages].
+    // A deterministic per-page gradient gives the rank a real scattered keep set
+    // (the perf A/B only needs a valid keep fraction, not physically-true K sums).
+    const std::size_t kmean_elems =
+        4u * kPageSize * kKVHeads * physical_pages;
+    cache.k_mean = DeviceBuffer(kmean_elems * sizeof(float));
+    std::vector<float> h_kmean(kmean_elems);
+    for (std::size_t p = 0; p < physical_pages; ++p) {
+        const float v = static_cast<float>(p % 97);
+        for (std::size_t i = 0; i < 4u * kPageSize * kKVHeads; ++i) {
+            h_kmean[p * (4u * kPageSize * kKVHeads) + i] = v;
+        }
+    }
+    cache.k_mean.copy_from_host(h_kmean.data(), kmean_elems * sizeof(float));
+
     cache.view = PagedKVLayerView{};
     cache.view.k_pages       = Tensor(cache.k_pages.p, DType::U8, {kCodeW, kPageSize, kKVHeads, physical_pages});
     cache.view.v_pages       = Tensor(cache.v_pages.p, DType::U8, {kCodeW, kPageSize, kKVHeads, physical_pages});
     cache.view.k_scale_pages = Tensor(cache.k_scale.p, DType::FP8_E4M3FN, {kGroups, kPageSize, kKVHeads, physical_pages});
     cache.view.v_scale_pages = Tensor(cache.v_scale.p, DType::FP8_E4M3FN, {kGroups, kPageSize, kKVHeads, physical_pages});
     cache.view.block_table   = Tensor(cache.block_table.p, DType::I32, {logical_pages});
+    cache.view.k_mean_pages  = Tensor(cache.k_mean.p, DType::FP32, {4, kPageSize, kKVHeads, physical_pages});
     cache.view.head_dim      = kHeadDim;
     cache.view.num_kv_heads  = kKVHeads;
     cache.view.dtype         = DType::U8;
@@ -115,8 +131,11 @@ int main(int argc, char** argv) {
                                       65536, 98304, 153600};
     const std::vector<int> tokens_list =
         (argc > 2) ? std::vector<int>{std::atoi(argv[2])} : std::vector<int>{1, 2, 4, 6};
-    std::printf("ninfer gqa-decode nvfp4s3 bench (geom=27B q=%d kv=%d hdim=%d code=%d groups=%d)\n",
-                 kQHeads, kKVHeads, kHeadDim, kCodeW, kGroups);
+    // keep_frac: the sparge-decode tile-skip fraction (1.0 = exact/no-skip, the default).
+    // Only engages on the T=1 cached step; width > 1 (MTP verify) ignores it.
+    const float keep_frac = (argc > 3) ? static_cast<float>(std::atof(argv[3])) : 1.0f;
+    std::printf("ninfer gqa-decode nvfp4s3 bench (geom=27B q=%d kv=%d hdim=%d code=%d groups=%d keep_frac=%.2f)\n",
+                 kQHeads, kKVHeads, kHeadDim, kCodeW, kGroups, keep_frac);
     print_device_caps("gqa-nvfp4s3-decode");
     std::printf("%-8s %6s %12s %14s %12s %10s %10s\n", "context", "tokens", "fill(us)", "dec median(us)",
                  "dec p95(us)", "dec GB/s", "dec TF/s");
@@ -157,19 +176,23 @@ int main(int argc, char** argv) {
             const GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(context),
                                                  static_cast<std::uint32_t>(context)};
             const std::size_t ws_bytes = gqa_attention_workspace_capacity_bytes(
-                kQHeads, DType::U8, envelope, 1, tokens, tokens);
+                kQHeads, DType::U8, envelope, 1, tokens, tokens, keep_frac);
             DeviceBuffer ws(std::max<std::size_t>(ws_bytes, 256));
             WorkspaceArena arena{DeviceSpan{ws.p, ws.bytes}};
 
             auto dec_launch = [&](cudaStream_t s) {
-                gqa_attention_cached(q_t, pos_q_t, kScale, cache.view, envelope, arena, out_t, s);
+                gqa_attention_cached(q_t, pos_q_t, kScale, cache.view, envelope, arena, out_t, s,
+                                     keep_frac);
             };
             const ColdTiming dec = measure_launch(dec_launch, stream, 8, 64);
 
             // GB/s moved by the decode kernel: read the K+V codes + scales for `context` keys
             // (per query token) and the tiny q/out traffic. (Informational; ncu is the real gate.)
+        // The tile-skip loads only the kept tiles' K/V (keep_frac of them); q/out are
+        // unaffected (the rank also streams the small k_mean plane, negligible here).
+        const double kv_frac = (keep_frac < 1.0f) ? static_cast<double>(keep_frac) : 1.0;
         const double bytes_moved =
-            static_cast<double>(context) * tokens * (2 * (kCodeW + kGroups)) +
+            static_cast<double>(context) * tokens * (2 * (kCodeW + kGroups)) * kv_frac +
             2 * static_cast<double>(tokens) * kQHeads * kHeadDim * 2.0;  // q in + out (bf16)
         // Useful tensor-core FLOPs: QK^T + PV mma (2 mma x 2 FLOP/MAC x QHeads x tokens x context x hdim).
         const double useful_flops = 4.0 * static_cast<double>(kQHeads) * tokens * context * kHeadDim;
