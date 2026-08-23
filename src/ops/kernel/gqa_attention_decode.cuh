@@ -7,6 +7,7 @@
 // only what both share: layout constants, device helpers, and the split reducer.
 
 #include "ops/common/math.cuh"
+#include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/kernel/gqa_attention_geometry.cuh"
@@ -174,88 +175,150 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
 
     if constexpr (MultiBatch) {
         const std::int64_t partial_acc_row = static_cast<std::int64_t>(batch) * kGqaHeadDim *
-                                             Geometry::QHeads * tokens * split_count;
+                                              Geometry::QHeads * tokens * split_count;
         const std::int64_t partial_stat_row =
             static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
         partial_acc += partial_acc_row;
-        partial_m += partial_stat_row;
-        partial_l += partial_stat_row;
+        partial_m   += partial_stat_row;
+        partial_l   += partial_stat_row;
     }
 
     const int window = last_pos + 1;
     const int active_split_count =
         gqa_small_t_active_splits<Geometry, Int8>(window, split_count, tokens);
 
-    __shared__ float reduce[256];
+    // Staged reduce: bulk-stage this block's partial column (the DChunk x active-splits
+    // acc slice + the m/l stat vectors) into dynamic smem with cp.async, then run the
+    // m/l/acc tree over smem. The prior design ran three serial chains of global
+    // loads (one per pass over the active splits); at 85-170 splits x 96-576 blocks
+    // on 170 SMs that was latency-bound (long_scoreboard). Staging is a fully
+    // parallel bulk copy; the smem chain removes global-load latency from the serial
+    // path. The staged values are bit-identical to the direct loads, so the numerics
+    // (and the 4-way quarter sum order) are unchanged.
+    //
+    // Dynamic smem (launcher-sized): [m_s (active x f32) | l_s (active x f32) |
+    // 16B pad | acc_s (split-major [s][DChunk] bf16)], so the 16B staging chunks are
+    // 1:1 copies of the global rows (d is fastest in the workspace, 16B-aligned).
+    extern __shared__ std::uint8_t smem_raw[];
+    float* m_s = reinterpret_cast<float*>(smem_raw);
+    float* l_s = m_s + split_count;
+    __nv_bfloat16* acc_s =
+        reinterpret_cast<__nv_bfloat16*>((reinterpret_cast<std::uintptr_t>(l_s + split_count) + 15) &
+                                          ~std::uintptr_t(15));
 
-    float local_m = -CUDART_INF_F;
-    for (int split = tid; split < active_split_count; split += blockDim.x) {
-        local_m = fmaxf(local_m,
-                        partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)]);
+    const std::int64_t acc_base = gqa_partial_acc_index<Geometry>(q_head, d_start, token, 0, tokens);
+    const std::int64_t stat_base =
+        gqa_partial_stat_index<Geometry>(q_head, token, 0, tokens);
+    const std::int64_t acc_step =
+        static_cast<std::int64_t>(tokens) * Geometry::QHeads * kGqaHeadDim;  // bf16 elems/split
+    const std::int64_t stat_step =
+        static_cast<std::int64_t>(tokens) * Geometry::QHeads;  // f32 elems/split
+    constexpr int kAccChunks = DChunk * 2 / 16;  // 16B chunks per split row
+    const int acc_chunks = active_split_count * kAccChunks;
+    for (int c = tid; c < acc_chunks; c += 256) {
+        const int s = c / kAccChunks;
+        const int i = c - s * kAccChunks;
+        cp_async<16>(&acc_s[s * DChunk + 8 * i], partial_acc + acc_base + acc_step * s + 8 * i);
     }
-    reduce[tid] = local_m;
+    for (int s = tid; s < active_split_count; s += 256) {
+        cp_async<4>(&m_s[s], partial_m + stat_base + stat_step * s);
+        cp_async<4>(&l_s[s], partial_l + stat_base + stat_step * s);
+    }
+    cp_commit();
+    cp_wait<0>();
     __syncthreads();
 
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) { reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]); }
-        __syncthreads();
+    __shared__ float reduce[256];
+
+    // 4-way split parallelism: the 256 threads map onto DChunk d-lanes with
+    // tpd = 256/DChunk threads per d, each owning a quarter of the split range
+    // (the old code left 256-active_split threads idle and ran pass 3 fully
+    // serial across all 85 splits per d). Exact decompositions: max and sum
+    // both split cleanly across disjoint quarters; the quad results combine in
+    // shared memory (the quarter lanes are DChunk/tpd warps apart, no shfl).
+    const int d_local = tid % DChunk;
+    const int tpd     = 256 / DChunk;
+    const int qn      = tpd < 4 ? tpd : 4;
+    const int q       = tid / DChunk;
+    const int S4      = (active_split_count + qn - 1) / qn;
+    const int s0      = q * S4;
+    const int s1      = s0 + S4 < active_split_count ? s0 + S4 : active_split_count;
+
+    float local_m = -CUDART_INF_F;
+    for (int split = s0; split < s1; ++split) {
+        local_m = fmaxf(local_m, m_s[split]);
     }
+    reduce[d_local * tpd + q] = local_m;
+    __syncthreads();
+    if (tid < DChunk) {
+        float gmax = reduce[tid * tpd];
+#pragma unroll
+        for (int i = 1; i < tpd; ++i) { gmax = fmaxf(gmax, reduce[tid * tpd + i]); }
+        reduce[tid] = gmax;
+    }
+    __syncthreads();
+    // The per-(q_head, token, split) stats are d-independent, so every d-group
+    // computed the same quarter max; the group result (reduce[0]) is the head
+    // max. No cross-d tree: summing/maxing across the d-groups would replicate
+    // the identical value DChunk times.
     const float head_m = reduce[0];
     __syncthreads();
 
     if (head_m == -CUDART_INF_F) {
-        const int d = d_start + tid;
-        if (tid < DChunk && d < kGqaHeadDim) {
+        if (q == 0) {
+            const int d = d_start + d_local;
             out[gqa_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(0.0f);
         }
         return;
     }
 
     float local_l = 0.0f;
-    for (int split = tid; split < active_split_count; split += blockDim.x) {
-        const float tile_l =
-            partial_l[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)];
+    for (int split = s0; split < s1; ++split) {
+        const float tile_l = l_s[split];
         if (tile_l > 0.0f) {
-            local_l +=
-                tile_l *
-                expf(partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)] -
-                     head_m);
+            local_l += tile_l * expf(m_s[split] - head_m);
         }
     }
-    reduce[tid] = local_l;
+    reduce[d_local * tpd + q] = local_l;
     __syncthreads();
-
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) { reduce[tid] += reduce[tid + stride]; }
-        __syncthreads();
+    if (tid < DChunk) {
+        float gsum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < tpd; ++i) { gsum += reduce[tid * tpd + i]; }
+        reduce[tid] = gsum;
     }
+    __syncthreads();
+    // Each d-group holds the full (quarter-summed) l of its (q_head, token); the
+    // value is d-independent, so any group's result is the head sum.
     const float head_l = reduce[0];
 
-    const int d = d_start + tid;
-    if (tid >= DChunk || d >= kGqaHeadDim) { return; }
+    const int d = d_start + d_local;
+    if (d >= kGqaHeadDim) { return; }
 
-    float numerator = 0.0f;
+    float numerator_q = 0.0f;
     if (head_l > 0.0f) {
-        for (int split = 0; split < active_split_count; ++split) {
-            const float tile_l =
-                partial_l[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)];
+        for (int split = s0; split < s1; ++split) {
+            const float tile_l = l_s[split];
             if (tile_l <= 0.0f) { continue; }
-            const float weight = expf(
-                partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)] - head_m);
-            numerator +=
-                __bfloat162float(
-                    partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens)]) *
-                weight;
+            numerator_q +=
+                __bfloat162float(acc_s[split * DChunk + d_local]) * expf(m_s[split] - head_m);
         }
     }
-    bool valid = true;
-    if constexpr (Masked) {
-        int absolute_column = token;
-        if constexpr (Offset) { absolute_column += column_begin; }
-        valid = absolute_column < valid_columns[batch];
+    reduce[d_local * tpd + q] = numerator_q;
+    __syncthreads();
+    if (q == 0) {
+        float numerator = 0.0f;
+#pragma unroll
+        for (int i = 0; i < tpd; ++i) { numerator += reduce[d_local * tpd + i]; }
+        bool valid = true;
+        if constexpr (Masked) {
+            int absolute_column = token;
+            if constexpr (Offset) { absolute_column += column_begin; }
+            valid = absolute_column < valid_columns[batch];
+        }
+        const float value = (valid && head_l > 0.0f) ? numerator / head_l : 0.0f;
+        out[gqa_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(value);
     }
-    const float value = (valid && head_l > 0.0f) ? numerator / head_l : 0.0f;
-    out[gqa_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(value);
 }
 
 } // namespace ninfer::ops

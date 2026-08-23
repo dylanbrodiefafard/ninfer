@@ -473,7 +473,7 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                                       cudaStream_t stream) {
     const auto logical_capacity      = static_cast<std::int32_t>(envelope.max_visible_keys);
     const auto implementation_window = static_cast<std::int32_t>(envelope.max_visible_keys);
-    const auto splits =
+    const std::int32_t splits =
         gqa_small_t_launch_capacity<Geometry>(envelope, invocation.width, cache.dtype);
 
     // BF16 keeps its row-tile warp count; INT8 selects its producer/consumer
@@ -540,22 +540,53 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
 #undef NINFER_GQA_SMALL_T_DISPATCH
 
     constexpr int kReduceBlock = 256;
-    constexpr int kDChunk      = 64;
-    const dim3 reduce_grid(Geometry::QHeads, div_up(kGqaHeadDim, kDChunk),
+    // NINFER_SMALL_T_REDUCE_DCHUNK: override the reduce's d-chunk (default 64).
+    // A smaller DChunk spawns QHeads x (256/DChunk) x width blocks (vs 96 at 64)
+    // and widens the in-block quarters to 256/DChunk, raising occupancy so the
+    // long-scoreboard global-load latency is hidden. Numerics are unchanged in
+    // expectation (m/l stats are d-independent; only the acc sum order moves).
+    static const int reduce_dchunk = [] {
+        const char* e = std::getenv("NINFER_SMALL_T_REDUCE_DCHUNK");
+        if (e == nullptr) { return 64; }
+        const int v = std::atoi(e);
+        return (v == 8 || v == 16 || v == 32 || v == 64) ? v : 64;
+    }();
+    const dim3 reduce_grid(Geometry::QHeads, div_up(kGqaHeadDim, reduce_dchunk),
                            invocation.width * invocation.batch_size);
     const auto launch_reduce = [&]<bool Int8, bool MultiBatch, bool Masked, bool Offset>() {
-        gqa_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8, MultiBatch, Masked,
-                                                   Offset>
-            <<<reduce_grid, kReduceBlock, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(partial_acc.data),
-                static_cast<const float*>(partial_m.data),
-                static_cast<const float*>(partial_l.data),
-                static_cast<const std::int32_t*>(pos.data),
-                invocation.valid_columns == nullptr
-                    ? nullptr
-                    : static_cast<const std::int32_t*>(invocation.valid_columns->data),
-                invocation.width, invocation.full_width, invocation.column_begin,
-                invocation.batch_size, splits, static_cast<__nv_bfloat16*>(out.data));
+        const auto launch_for_dchunk = [&]<int DChunk>() {
+            // Staged-reduce dynamic smem: m_s + l_s (4B per split), a 16B pad for
+            // the 16B-aligned acc_s base, and the split-major acc_s (DChunk bf16
+            // per split) sized for the capacity.
+            const std::size_t reduce_smem_bytes =
+                2 * sizeof(float) * splits + 16 + static_cast<std::size_t>(DChunk) * 2 * splits;
+            gqa_attention_small_t_reduce_output_kernel<Geometry, DChunk, Int8, MultiBatch, Masked,
+                                                       Offset>
+                <<<reduce_grid, kReduceBlock, reduce_smem_bytes, stream>>>
+                    (static_cast<const __nv_bfloat16*>(partial_acc.data),
+                     static_cast<const float*>(partial_m.data),
+                     static_cast<const float*>(partial_l.data),
+                     static_cast<const std::int32_t*>(pos.data),
+                     invocation.valid_columns == nullptr
+                         ? nullptr
+                         : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+                     invocation.width, invocation.full_width, invocation.column_begin,
+                     invocation.batch_size, splits, static_cast<__nv_bfloat16*>(out.data));
+        };
+        switch (reduce_dchunk) {
+        case 8:
+            launch_for_dchunk.template operator()<8>();
+            break;
+        case 16:
+            launch_for_dchunk.template operator()<16>();
+            break;
+        case 32:
+            launch_for_dchunk.template operator()<32>();
+            break;
+        default:
+            launch_for_dchunk.template operator()<64>();
+            break;
+        }
     };
     const bool masked         = invocation.valid_columns != nullptr;
     const auto launch_profile = [&]<bool Int8, bool MultiBatch, bool Masked>() {
