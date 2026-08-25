@@ -1,16 +1,33 @@
 """Append DFlash2 onto a Qwen3.8-27B NVFP4 `.ninfer` by copying the live artifact.
 
-Canonical invocation on this machine (no BF16/NVFP4 safetensor sources)::
+`--dflash-model` is a local checkout of Hugging Face `z-lab/Qwen3.8-27B-DFlash2`
+revision `50307d4c4cde6860d4eee73e2547cd786fe8e8a4` (`config.json` +
+`model.safetensors`). The base file must already be `qwen3.8-27b/nvfp4` with no
+`dflash/` objects.
+
+Product Engine companion (NVFP4 matrices + BF16 selector codebooks)::
+
+    hf download Ostfralla/Qwen3.8-27B-NVFP4-NInfer \
+      qwen3_8_27b_nvfp4.ninfer \
+      --local-dir models
+
+    hf download z-lab/Qwen3.8-27B-DFlash2 \
+      --revision 50307d4c4cde6860d4eee73e2547cd786fe8e8a4 \
+      --local-dir /path/to/Qwen3.8-27B-DFlash2
 
     python3 -m tools.convert.qwen3_8_27b.convert_nvfp4 \
-      --base-artifact /path/to/qwen3_8_27b_nvfp4.ninfer \
+      --base-artifact models/qwen3_8_27b_nvfp4.ninfer \
       --dflash-model /path/to/Qwen3.8-27B-DFlash2 \
-      --dflash-format w8 \
-      --out out/qwen3_8_27b_nvfp4_dflash_w8.ninfer
+      --dflash-format nvfp4 \
+      --out out/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
+      --device cuda
 
 The Text/MTP/Vision object bytes stay identical and in the same order. DFlash2
-objects are appended after Vision. `--dflash-format q4` emits a sibling that
-differs only in DFlash2 matrix QType.
+objects are appended after Vision. `--dflash-format w8` / `q4` emit siblings that
+differ only in DFlash2 matrix QType. `--dflash-codebook nvfp4` requires
+`--dflash-format nvfp4` and stores selector codebooks as NVFP4 `[248320, 256]`
+weights; the default codebook is BF16 `[256, 248320]` rank-fastest and is the
+speed path.
 """
 
 from __future__ import annotations
@@ -34,6 +51,7 @@ from tools.artifact.container import (
     TensorSpec as ArtifactTensorSpec,
 )
 from tools.artifact.layouts import encode_direct
+from tools.convert.common.nvfp4_quantize import ENCODER_PROFILE, encode_nvfp4_from_bf16
 from tools.convert.common.quantize import pick_device
 from tools.convert.common.safetensors import ShardReader
 from tools.convert.qwen3_6.common import conversion as family_conversion
@@ -80,6 +98,7 @@ class ConversionPreflight:
     base_artifact: Path
     dflash_model: Path
     dflash_format: str
+    codebook_format: str
     identity: ArtifactIdentity
     dflash_specs: tuple[TensorSpec, ...]
     dflash_config: dict[str, object]
@@ -203,14 +222,34 @@ def _materialize_dflash2(
         raise ValueError(f"unhandled DFlash2 object: {name}") from exc
 
 
+def _encode_dflash_payload(
+    tensor: torch.Tensor, spec: TensorSpec, device: torch.device
+) -> bytes:
+    if spec.format == dflash2.NVFP4:
+        source = tensor.to(device=device)
+        expected = tuple(int(dim) for dim in spec.shape)
+        if tuple(int(dim) for dim in source.shape) != expected:
+            if source.numel() != int(torch.tensor(expected).prod().item()):
+                raise ValueError(
+                    f"NVFP4 source shape {tuple(source.shape)} does not match {expected}"
+                )
+            source = source.contiguous().view(*expected)
+        return encode_nvfp4_from_bf16(source, spec.shape)
+    return family_conversion.encode_tensor_payload(tensor, spec, device)
+
+
 def preflight_conversion(
     base_artifact: str | Path,
     dflash_model_dir: str | Path,
     dflash_format: str,
+    codebook_format: str,
 ) -> ConversionPreflight:
     base = Path(base_artifact)
     dflash_model = Path(dflash_model_dir)
-    dflash2.dflash2_matrix_format(dflash_format)
+    codebook_numeric = (
+        dflash2.NVFP4 if codebook_format == "nvfp4" else dflash2.BF16
+    )
+    dflash2.build_dflash2_specs(dflash_format, codebook_format=codebook_numeric)
     with Artifact.open(base) as src:
         _require_qwen38_nvfp4(src.identity)
         if any(obj.name.startswith("dflash/") for obj in src.objects):
@@ -219,6 +258,7 @@ def preflight_conversion(
     config = family_conversion.load_json(dflash_model / "config.json")
     summary = validate_dflash2_config(config)
     summary["dflash_format"] = dflash_format
+    summary["dflash_codebook"] = codebook_format
     safetensors = dflash_model / "model.safetensors"
     if not safetensors.is_file():
         raise ValueError(f"{safetensors}: DFlash2 companion is missing")
@@ -226,8 +266,11 @@ def preflight_conversion(
         base_artifact=base,
         dflash_model=dflash_model,
         dflash_format=dflash_format,
+        codebook_format=codebook_format,
         identity=identity,
-        dflash_specs=dflash2.build_dflash2_specs(dflash_format),
+        dflash_specs=dflash2.build_dflash2_specs(
+            dflash_format, codebook_format=codebook_numeric
+        ),
         dflash_config=summary,
     )
 
@@ -238,18 +281,21 @@ def convert(
     out_path: str | Path,
     *,
     dflash_format: str = "w8",
+    codebook_format: str = "bf16",
     device: str | torch.device = "cuda",
 ) -> Path:
     started = time.perf_counter()
     output = Path(out_path)
     resolved_device = pick_device(device)
-    preflight = preflight_conversion(base_artifact, dflash_model_dir, dflash_format)
+    preflight = preflight_conversion(
+        base_artifact, dflash_model_dir, dflash_format, codebook_format
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
 
     print(
         f"preflight complete: copy {preflight.base_artifact} + "
-        f"{len(preflight.dflash_specs)} DFlash2 {dflash_format} objects, "
-        f"device={resolved_device}",
+        f"{len(preflight.dflash_specs)} DFlash2 {dflash_format} "
+        f"codebook={codebook_format} objects, device={resolved_device}",
         flush=True,
     )
 
@@ -265,9 +311,7 @@ def convert(
             copied = len(src.objects)
             for offset, spec in enumerate(preflight.dflash_specs, start=1):
                 tensor = _materialize_dflash2(spec, reader)
-                payload = family_conversion.encode_tensor_payload(
-                    tensor, spec, resolved_device
-                )
+                payload = _encode_dflash_payload(tensor, spec, resolved_device)
                 del tensor
                 writer.write(spec.name, payload)
                 del payload
@@ -291,6 +335,8 @@ def convert(
                 "model_py_commit": dflash2.DFLASH2_MODEL_PY_COMMIT,
                 "model_path": str(preflight.dflash_model.resolve()),
                 "format": dflash_format,
+                "codebook": codebook_format,
+                "nvfp4_encoder": ENCODER_PROFILE if dflash_format == "nvfp4" else None,
             },
         },
         "dflash_config": preflight.dflash_config,
@@ -314,7 +360,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-artifact", required=True, type=Path)
     parser.add_argument("--dflash-model", required=True, type=Path)
-    parser.add_argument("--dflash-format", choices=("w8", "q4"), default="w8")
+    parser.add_argument("--dflash-format", choices=("w8", "q4", "nvfp4"), default="w8")
+    parser.add_argument("--dflash-codebook", choices=("bf16", "nvfp4"), default="bf16")
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
@@ -323,6 +370,7 @@ def main() -> None:
         args.dflash_model,
         args.out,
         dflash_format=args.dflash_format,
+        codebook_format=args.dflash_codebook,
         device=args.device,
     )
 

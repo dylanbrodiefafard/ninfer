@@ -122,4 +122,32 @@ void proposal_remap_token_ids_launch(Tensor& proposal_tokens, const std::int32_t
     CUDA_CHECK(cudaGetLastError());
 }
 
+void speculative_accept_tree_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
+                                           const Tensor& verify_ids, const Tensor& parent_index,
+                                           const Tensor& valid_columns,
+                                           const Tensor& current_extents, Tensor& lengths,
+                                           Tensor& anchors, Tensor& licensed_tokens,
+                                           Tensor& licensed_counts, Tensor& accepted,
+                                           Tensor& accepted_column, Tensor& fold_path,
+                                           std::int32_t token_domain, const SamplingConfig* configs,
+                                           cudaStream_t stream) {
+    const std::int32_t batch = verify_ids.ne[1];
+    const std::int32_t width = verify_ids.ne[0];
+    speculative_accept_tree_drafts_kernel<<<static_cast<unsigned int>(batch), kSamplerBlock, 0,
+                                            stream>>>(
+        static_cast<const std::int32_t*>(target_tokens.data),
+        static_cast<const __nv_bfloat16*>(logits.data),
+        static_cast<const std::int32_t*>(verify_ids.data),
+        static_cast<const std::int32_t*>(parent_index.data),
+        static_cast<const std::int32_t*>(valid_columns.data),
+        static_cast<const std::int32_t*>(current_extents.data),
+        static_cast<std::int32_t*>(lengths.data), static_cast<std::int32_t*>(anchors.data),
+        static_cast<std::int32_t*>(licensed_tokens.data),
+        static_cast<std::int32_t*>(licensed_counts.data),
+        static_cast<std::int32_t*>(accepted.data),
+        static_cast<std::int32_t*>(accepted_column.data),
+        static_cast<std::int32_t*>(fold_path.data), configs, token_domain, logits.ne[0], width);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

@@ -105,6 +105,8 @@ struct DFlash2Weights {
     Weight hidden_projection;
     Tensor predecessor_codebook;
     Tensor successor_codebook;
+    Weight predecessor_codebook_nvfp4;
+    Weight successor_codebook_nvfp4;
 };
 
 template <class FullProjectionPayload, class GdnProjectionPayload, class MainPostMixerPayload,

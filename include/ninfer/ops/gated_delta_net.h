@@ -95,12 +95,24 @@ void gated_delta_net_snapshot(const Tensor& q, const Tensor& k, const Tensor& v,
  * [2,Hv,T,B] receive bit-preserving copies of raw k, v, and {g,beta}. The invalid record suffix is
  * unchanged, while the invalid out suffix is exact BF16 zero. Inputs, state, records, and out are
  * pairwise non-overlapping.
+ *
+ * `parent_index` is null or empty for sequential packed time: S_j = F(S_{j-1}, x_j) from the
+ * checkpoint slot. When non-null it is contiguous I32 [T,B], or [T] when B=1, and the recurrence
+ * is the tree rule S_j = F(S_parent[j], x_j). parent_index[0,b] is -1 and names the checkpoint
+ * slot; every other valid column j has parent in [0,j). Packed order is not time. With a
+ * workspace sized by gated_delta_net_replay_record_workspace_capacity_bytes(), parent tiles live
+ * in HBM and the record kernel uses the 4-warp sequential tile geometry. Without workspace the
+ * 1-warp shared-memory tile is used. Sequential record allocates no arena workspace.
  */
+[[nodiscard]] std::size_t gated_delta_net_replay_record_workspace_capacity_bytes(
+    std::int32_t value_heads, std::int32_t batch, std::int32_t width);
+
 void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
                                    const Tensor& ssm_states, const Tensor& valid_columns,
                                    const Tensor& initial_state_slots, Tensor& key_record,
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
-                                   cudaStream_t stream);
+                                   cudaStream_t stream, const Tensor* parent_index = nullptr,
+                                   WorkspaceArena* workspace = nullptr);
 
 } // namespace ninfer::ops

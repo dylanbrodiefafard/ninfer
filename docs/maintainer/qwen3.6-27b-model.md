@@ -354,12 +354,23 @@ One propose block:
    - `h = RMSNorm(residual, post_attention_norm)`
    - `h, mlp_k1 = mlp_conv.prepare(h)`; SiLU-GLU MLP; `mlp_conv.finish`; residual add
 3. Final RMSNorm → draft-head logits on the seven mask columns (not the anchor).
-4. Path selector: unsorted top-16 of those logits, then
-   `score = unary + ⟨pred_code(prev) ⊙ W_h h_t , succ_code(cand)⟩`. T=0 is argmax of those 16
-   scores; T>0 softmax-samples them at the Engine sampling temperature. `prev` starts as the
-   anchor id. `--lm-head-draft` runs top-16 on the shortlist and gathers codebooks by token id.
-5. The 27B target verifies the path with one causal forward of length 8. Family speculative
-   rejection sampling and ReplaySSM Fold are the same transaction as MTP.
+4. Tree selector (`dflash2_tree_select`): unsorted top-16 of those logits, then greedy Markov
+   `score = unary + ⟨pred_code(prev) ⊙ W_h h_t , succ_code(cand)⟩` with no sampling temperature.
+   Frontier width is **k=2** (beam, not a complete binary tree). The selector expands up to 15
+   nodes (anchor + 2 per depth for T=7), then keeps the BFS prefix of **W** nodes so both
+   children at early depths stay in the packed window when W allows it. Default **W** is
+   k-dependent: k=4 uses chain verify of width 5; k=5 uses chain W=6 (one GQA SmallT
+   tile); k=7 uses packed-tree W=12. `--dflash-verify-width N` overrides that default
+   (`k=4 --dflash-verify-width 6` is packed-tree W=6). Unused columns copy the last live
+   node and are excluded by `valid_columns`. Cache
+   slots are `E+j` (unique); RoPE uses `E+depth` (siblings share). `--lm-head-draft` runs top-16 on
+   the shortlist and gathers codebooks by token id. `--draft-tokens` remains the masked-block size
+   (max 11), not packed `N`.
+5. The 27B target verifies the packed tree with one causal forward of width W. GQA uses the
+   ancestor mask; GDN record/conv follows `parent_index`. Accept is greedy SpecInfer (or
+   membership sampling): walk to a child matching the target token, else emit a correction.
+   ReplaySSM Fold and KV/feature compact follow the accepted packed path, then trim to sequential
+   `E .. E+m-1`. 35B DFlash v1 stays a chain.
 
 `GroupedDynamicCausalConv` is grouped size-16, kernel 2, left-padded (causal along the query
 block): `prepare` before the sublayer on the pre-norm hidden, `finish` on that sublayer's output.
@@ -369,19 +380,23 @@ block): `prepare` before the sublayer on the pre-norm hidden, `finish` on that s
 For `k` configured draft tokens, the runtime prepares a candidate window, runs target verification,
 and accepts only the prefix licensed by the target distribution.
 
-In greedy mode, each draft token is accepted while it equals the target argmax at that position. In
-sampling mode, proposal and target probabilities use the same processed distributions and the
-accept/reject correction preserves the target distribution. A bad draft therefore reduces
-acceptance and throughput; it must not change the distribution of emitted target tokens. MTP and
-DFlash2 share this contract; they differ only in how drafts are produced.
+In greedy mode, MTP accepts the longest draft prefix matching the target argmax. DFlash2 packed-tree
+verify walks from the packed root to a child whose token equals that argmax (SpecInfer), stopping
+after at most the per-row draft budget (`proposal_extents`); a miss or exhausted budget emits the
+argmax as the correction. In sampling mode, MTP uses chain rejection sampling; DFlash2
+samples from the truncated target distribution at the current node and continues only when that
+token is a child. A bad draft therefore reduces acceptance and throughput; it must not change the
+distribution of emitted target tokens. MTP and DFlash2 share the published-token contract; they
+differ in how drafts are produced and how GQA/GDN see the candidate window.
 
-Target verification writes candidate KV into provisioned but unpublished extents, reads each
-lane's current GDN checkpoint, and produces Program-owned ReplaySSM records without modifying any
-persistent GDN state. After the final per-row output prefix is known, one all-layer Fold replays
-exactly that prefix into the lane's current state. The same transaction trims rejected KV,
-commits continuation hidden/MTP or DFlash cyclic state, and only then advances the authoritative
-frontier and publishes output. Near context capacity, the Engine falls back to the one-token target
-path when a complete safe round does not fit.
+Target verification writes candidate KV into provisioned but unpublished extents. Packed-tree GQA
+writes at unique cache slots `E+j` with an ancestor mask; GDN records follow `parent_index` from
+the checkpoint. After the final per-row output prefix is known, one all-layer Fold replays the
+accepted packed path into the lane's current state. The same transaction compacts accepted-path KV
+and DFlash features onto sequential `E .. E+m-1`, trims rejected KV, commits continuation
+hidden/MTP or DFlash cyclic state, and only then advances the authoritative frontier and publishes
+output. Near context capacity, the Engine falls back to the one-token target path when a complete
+safe round does not fit.
 
 ## 10. Vision preprocessing
 
@@ -487,9 +502,9 @@ Let `C=max_concurrency`.
 | MTP KV | 1 layer × context × 4 heads × 256 | active sequence when MTP enabled |
 | GDN convolution history | 48 layers × 10240 × 3 × `2C` BF16 | Program lifetime; current and turn-checkpoint slots |
 | GDN recurrent matrices | 48 layers × 48 heads × 128 × 128 × `2C` FP32 | Program lifetime; current and turn-checkpoint slots |
-| ReplaySSM records | 48 layers × `C` rows × `draft_window+1` convolution/key/value/gate columns | Program lifetime when MTP or DFlash enabled; one pending round |
+| ReplaySSM records | 48 layers × `C` rows × `dflash_verify_width` (12 for DFlash2 tree, else `draft_window+1`) convolution/key/value/gate columns | Program lifetime when MTP or DFlash enabled; one pending round |
 | DFlash2 local K/V | 5 layers × 2048 positions × 8 heads × 128 × 2 planes × `C` lanes | Program lifetime when DFlash enabled |
-| DFlash2 target features | prefill `[25600,P]` plus pending `[25600,draft_window+1,C]` BF16 | Program lifetime when DFlash enabled |
+| DFlash2 target features | prefill `[25600,P]` plus pending `[25600,12,C]` BF16 | Program lifetime when DFlash enabled |
 | Continuation hidden | current and turn-checkpoint `[5120,C]` BF16 stores | Program lifetime |
 | Text step buffers | token, positions, logits, verify/draft/sampling tensors | Program lifetime |
 | Program scratch | Text/MTP/Vision phase temporaries | one phase in the shared workspace arena |
@@ -497,8 +512,8 @@ Let `C=max_concurrency`.
 
 KV memory grows with configured context. The fixed GDN state pool depends only on `C` and always has
 the two current/turn-checkpoint planes; it is independent of the speculative window. Enabling MTP
-or DFlash adds the separate ReplaySSM arena, whose capacity is `C*(draft_window+1)` record columns
-per GDN layer. DFlash2 adds five cyclic windows of capacity 2048 and does not allocate a growing
+or DFlash adds the separate ReplaySSM arena, whose capacity is `C*dflash_verify_width` record columns
+per GDN layer (12 for DFlash2 packed-tree verify). DFlash2 adds five cyclic windows of capacity 2048 and does not allocate a growing
 DFlash Full pool.
 
 The Program freezes its feature set and memory plan at startup. The Qwen3.6 family builds named

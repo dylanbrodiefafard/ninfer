@@ -233,6 +233,92 @@ int greedy_accept_case(int k, int accepted_count, int token_domain = 64) {
                                ops::SamplingConfig{}, token_counts, expected);
 }
 
+int greedy_tree_extent_case(int extent, int expected_accepted) {
+    constexpr int kWidth        = 4;
+    constexpr int kTokenDomain  = 64;
+    constexpr int kInitialLen   = 40;
+    const std::vector<std::int32_t> parent{-1, 0, 0, 1};
+    const std::vector<std::int32_t> verify_ids{7, 10, 11, 12};
+    const std::vector<std::int32_t> targets{10, 99, 0, 0};
+    std::vector<std::uint16_t> logits(static_cast<std::size_t>(kTokenDomain) * kWidth, 0x3f00u);
+    std::vector<std::int32_t> token_counts(kTokenDomain, 0);
+
+    DeviceBuffer d_targets   = to_device(targets);
+    DeviceBuffer d_logits    = to_device(logits);
+    DeviceBuffer d_ids       = to_device(verify_ids);
+    DeviceBuffer d_parent    = to_device(parent);
+    DeviceBuffer d_valid     = to_device<std::int32_t>({kWidth});
+    DeviceBuffer d_extent    = to_device<std::int32_t>({extent});
+    DeviceBuffer d_counts    = to_device(token_counts);
+    ops::SamplingConfig config{};
+    config.token_counts      = static_cast<std::int32_t*>(d_counts.p);
+    DeviceBuffer d_config    = device_config(config);
+
+    GuardedDeviceBuffer d_length(sizeof(std::int32_t));
+    GuardedDeviceBuffer d_anchors(sizeof(std::int32_t));
+    GuardedDeviceBuffer d_licensed(static_cast<std::size_t>(kWidth) * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_lic_count(sizeof(std::int32_t));
+    GuardedDeviceBuffer d_accepted(sizeof(std::int32_t));
+    GuardedDeviceBuffer d_column(sizeof(std::int32_t));
+    GuardedDeviceBuffer d_path(static_cast<std::size_t>(kWidth) * sizeof(std::int32_t));
+    initialize(d_length, std::vector<std::int32_t>{kInitialLen});
+    initialize(d_anchors, std::vector<std::int32_t>{-1});
+    d_licensed.fill(0x9d);
+    initialize(d_lic_count, std::vector<std::int32_t>{-1});
+    initialize(d_accepted, std::vector<std::int32_t>{-1});
+    initialize(d_column, std::vector<std::int32_t>{-1});
+    d_path.fill(0x9d);
+
+    Tensor target_t(d_targets.p, DType::I32, {kWidth, 1});
+    Tensor logits_t(d_logits.p, DType::BF16, {kTokenDomain, kWidth, 1});
+    Tensor ids_t(d_ids.p, DType::I32, {kWidth, 1});
+    Tensor parent_t(d_parent.p, DType::I32, {kWidth, 1});
+    Tensor valid_t(d_valid.p, DType::I32, {1});
+    Tensor extent_t(d_extent.p, DType::I32, {1});
+    Tensor length_t(d_length.data(), DType::I32, {1});
+    Tensor anchors_t(d_anchors.data(), DType::I32, {1});
+    Tensor licensed_t(d_licensed.data(), DType::I32, {kWidth, 1});
+    Tensor lic_count_t(d_lic_count.data(), DType::I32, {1});
+    Tensor accepted_t(d_accepted.data(), DType::I32, {1});
+    Tensor column_t(d_column.data(), DType::I32, {1});
+    Tensor path_t(d_path.data(), DType::I32, {kWidth, 1});
+    WorkspaceArena workspace(256);
+    ops::speculative_accept_tree_drafts(
+        target_t, logits_t, ids_t, parent_t, valid_t, extent_t, length_t, anchors_t, licensed_t,
+        lic_count_t, accepted_t, column_t, path_t, kTokenDomain,
+        static_cast<const ops::SamplingConfig*>(d_config.p), workspace, nullptr);
+    cuda_synchronize();
+
+    const std::string label =
+        "tree greedy extent=" + std::to_string(extent) + " A=" + std::to_string(expected_accepted);
+    const std::int32_t bonus = expected_accepted == 0 ? 10 : 99;
+    std::vector<std::int32_t> want_lic(kWidth, 0);
+    std::vector<std::int32_t> want_path(kWidth, 0);
+    if (expected_accepted == 1) {
+        want_lic[0]  = 10;
+        want_lic[1]  = 99;
+        want_path[0] = 0;
+        want_path[1] = 1;
+    } else {
+        want_lic[0]  = 10;
+        want_path[0] = 0;
+    }
+    int failures = verify_exact((label + " accepted").c_str(), read<std::int32_t>(d_accepted, 1),
+                                {expected_accepted});
+    failures += verify_exact((label + " licensed count").c_str(), read<std::int32_t>(d_lic_count, 1),
+                             {expected_accepted + 1});
+    failures +=
+        verify_exact((label + " licensed").c_str(), read<std::int32_t>(d_licensed, kWidth), want_lic);
+    failures += verify_exact((label + " path").c_str(), read<std::int32_t>(d_path, kWidth), want_path);
+    failures += verify_exact((label + " column").c_str(), read<std::int32_t>(d_column, 1),
+                             {expected_accepted});
+    failures +=
+        verify_exact((label + " bonus").c_str(), read<std::int32_t>(d_anchors, 1), {bonus});
+    failures += verify_exact((label + " length").c_str(), read<std::int32_t>(d_length, 1),
+                             {kInitialLen + expected_accepted + 1});
+    return failures;
+}
+
 int deterministic_sampling_case() {
     constexpr int physical_rows = 248320;
     constexpr int token_domain  = 248077;
@@ -439,6 +525,8 @@ int main() {
     failures += greedy_accept_case(5, 2);
     failures += greedy_accept_case(5, 5);
     failures += greedy_accept_case(15, 7, 257);
+    failures += greedy_tree_extent_case(7, 1);
+    failures += greedy_tree_extent_case(0, 0);
     failures += deterministic_sampling_case();
     failures += batched_sampling_workspace_stride_case();
     failures += select_hidden_case(5120, 6, 0);

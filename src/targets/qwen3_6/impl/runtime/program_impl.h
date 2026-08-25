@@ -1,8 +1,10 @@
+#include "targets/qwen3_6/impl/runtime/dflash_candidate_stats.h"
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
 
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "ninfer/ops/gdn_replay.h"
+#include "ninfer/ops/gqa_attention.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/nll_from_logits.h"
 #include "targets/qwen3_6/impl/runtime/score_index.h"
@@ -192,7 +194,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                                  DeviceContext& device_in)
     : model(model_in), device(device_in), capacity(plan.capacity), kv_capacity(plan.kv_capacity),
       max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
-      draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
+      draft_window(plan.draft_window), dflash_verify_width(plan.dflash_verify_width),
+      speculative_backend(plan.speculative_backend),
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
@@ -779,10 +782,23 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
             .linear_state_slot = LinearStateSlots::current_state_slot(lane, max_concurrency),
             .commit_columns    = static_cast<std::int32_t>(committed),
         };
+        const bool tree_fold = speculative_backend == SpeculativeBackend::DFlash &&
+                               dflash_uses_tree_verify(draft_window, dflash_verify_width);
+        if (tree_fold && committed > 0) {
+            fold_rows[row].path_length = static_cast<std::int32_t>(committed);
+            for (std::uint32_t i = 0; i < committed; ++i) {
+                fold_rows[row].path[i] = dflash_host_egress->fold_path
+                    [row * dflash_verify_width + i];
+            }
+        }
         const bool partial_terminal =
             !cancelled[row] && terminal[row] && committed < pending.produced;
-        hidden_selectors[row] =
-            static_cast<std::int32_t>(partial_terminal ? committed - 1U : pending.produced - 1U);
+        if (tree_fold && committed > 0) {
+            hidden_selectors[row] = fold_rows[row].path[committed - 1U];
+        } else {
+            hidden_selectors[row] = static_cast<std::int32_t>(
+                partial_terminal ? committed - 1U : pending.produced - 1U);
+        }
         needs_hidden_correction = needs_hidden_correction || partial_terminal;
     }
 
@@ -821,7 +837,45 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
             ops::scatter(selected, destinations, tail_hidden_store, device.stream);
         }
 
-        if (speculative_backend == SpeculativeBackend::DFlash) {
+        if (speculative_backend == SpeculativeBackend::DFlash && io.dflash_decode) {
+            if (dflash_uses_tree_verify(draft_window, dflash_verify_width)) {
+                qwen3_6::DFlashDecodeState& frame = *io.dflash_decode;
+                const auto batch = static_cast<std::int32_t>(lanes.size());
+                Tensor compact_counts = frame.append_counts.slice(0, 0, batch);
+                std::array<std::int32_t, kMaximumConcurrency> host_counts{};
+                for (std::size_t row = 0; row < lanes.size(); ++row) {
+                    host_counts[row] =
+                        cancelled[row] ? 0 : static_cast<std::int32_t>(accepted_tokens[row]);
+                }
+                CUDA_CHECK(cudaMemcpyAsync(compact_counts.data, host_counts.data(),
+                                           lanes.size() * sizeof(std::int32_t),
+                                           cudaMemcpyHostToDevice, device.stream));
+                Tensor kv_rows = frame.text_kv_table_rows.slice(0, 0, batch);
+                Tensor prefix  = frame.execution_frontiers.slice(0, 0, batch);
+                const std::int32_t verify_w =
+                    static_cast<std::int32_t>(dflash_verify_width);
+                bool identity_path = true;
+                for (std::size_t row = 0; row < lanes.size() && identity_path; ++row) {
+                    if (cancelled[row] || accepted_tokens[row] == 0) { continue; }
+                    const std::int32_t committed = static_cast<std::int32_t>(accepted_tokens[row]);
+                    for (std::int32_t i = 0; i < committed; ++i) {
+                        if (fold_rows[row].path[i] != i) {
+                            identity_path = false;
+                            break;
+                        }
+                    }
+                }
+                if (!identity_path) {
+                    Tensor path   = frame.fold_path.slice(0, 0, verify_w).slice(1, 0, batch);
+                    Tensor lane_t = frame.lanes.slice(0, 0, batch);
+                    for (std::uint32_t layer = 0; layer < decoder->text_kv.layers(); ++layer) {
+                        ops::gqa_kv_compact_path(decoder->text_kv.batch_layer_view(layer), kv_rows,
+                                                 prefix, path, compact_counts, device.stream);
+                    }
+                    ops::gather_bf16_path(dflash->pending_features, lane_t, path, compact_counts,
+                                          device.stream);
+                }
+            }
             std::array<std::uint32_t, kMaximumConcurrency> append_lanes{};
             std::array<std::uint32_t, kMaximumConcurrency> append_starts{};
             std::array<std::uint32_t, kMaximumConcurrency> append_counts{};
@@ -856,7 +910,9 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
     }
 
     const double tail_seconds = std::chrono::duration<double>(Clock::now() - tail_started).count();
-    const std::uint32_t width = draft_window + 1U;
+    const std::uint32_t width =
+        speculative_backend == SpeculativeBackend::DFlash ? dflash_verify_width
+                                                          : draft_window + 1U;
     try {
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence = sequences[lanes[row]];
@@ -1575,7 +1631,8 @@ void ProgramImplCore::prepare_graphs() {
         }
     }
     if (speculative_backend == SpeculativeBackend::DFlash) {
-        const auto batch_one_profiles = dflash_graph_profiles(capacity, draft_window, 1);
+        const auto batch_one_profiles =
+            dflash_graph_profiles(capacity, draft_window, 1, dflash_verify_width);
         validate_graph_profiles(batch_one_profiles, capacity - 1, "DFlash");
         schedule::DFlashBatchContext dflash_state{
             execution_core(),     decoder->text_kv,    *dflash,          *io.dflash_decode,
@@ -1583,10 +1640,11 @@ void ProgramImplCore::prepare_graphs() {
         const GraphExecutionProfile code_warm = batch_one_profiles.front();
         const ops::GqaExecutionEnvelope code_warm_target{
             1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                   capacity, static_cast<std::uint64_t>(code_warm.max) + draft_window + 1ULL))};
+                   capacity, static_cast<std::uint64_t>(code_warm.max) +
+                                 dflash_verify_width))};
         prepare_representative(code_warm.min, 1);
         device.synchronize();
-        schedule::dflash_decode_batch(dflash_state, 1, draft_window,
+        schedule::dflash_decode_batch(dflash_state, 1, draft_window, dflash_verify_width,
                                       dflash_envelopes(code_warm.min, code_warm.max, draft_window),
                                       code_warm_target, nullptr);
         device.synchronize();
@@ -1595,7 +1653,8 @@ void ProgramImplCore::prepare_graphs() {
         for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
             const auto planned_profiles =
                 batch_size == 1 ? batch_one_profiles
-                                : dflash_graph_profiles(capacity, draft_window, batch_size);
+                                : dflash_graph_profiles(capacity, draft_window, batch_size,
+                                                         dflash_verify_width);
             validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
             for (const GraphExecutionProfile planned : planned_profiles) {
                 dflash_graphs.profiles.emplace_back();
@@ -1608,12 +1667,13 @@ void ProgramImplCore::prepare_graphs() {
                 const ops::GqaExecutionEnvelope target_envelope{
                     1,
                     static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                        capacity, static_cast<std::uint64_t>(planned.max) + draft_window + 1ULL))};
+                        capacity, static_cast<std::uint64_t>(planned.max) +
+                                      dflash_verify_width))};
 
                 schedule::capture_dflash_decode_batch(
                     dflash_state, static_cast<std::int32_t>(batch_size), draft_window,
-                    dflash_envelopes(planned.min, planned.max, draft_window), target_envelope,
-                    profile.definition);
+                    dflash_verify_width, dflash_envelopes(planned.min, planned.max, draft_window),
+                    target_envelope, profile.definition);
             }
         }
     }
@@ -1772,7 +1832,8 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
     work.reset();
     Tensor features =
         work.alloc(DType::BF16, {DFlashConfig::feature_rows,
-                                 static_cast<std::int32_t>(draft_window + 1U), batch});
+                                 static_cast<std::int32_t>(dflash_verify_width),
+                                 batch});
     ops::prepare_ragged_prefix(dflash->pending_features, lane_tensor, device_starts, device_ends,
                                features, positions, device_counts, device.stream);
 
@@ -2337,7 +2398,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         throw std::invalid_argument("DFlash batch membership is invalid");
     }
 
-    const std::uint32_t width           = draft_window + 1U;
+    const std::uint32_t width           = dflash_verify_width;
     std::uint32_t maximum_frontier      = 0;
     std::uint32_t maximum_target_tokens = 1;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -2371,7 +2432,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             std::min({draft_window, max_by_budget, capacity - sequence.execution_frontier - 1U});
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
         maximum_target_tokens =
-            std::max(maximum_target_tokens, sequence.execution_frontier + extent + 1U);
+            std::max(maximum_target_tokens,
+                     sequence.execution_frontier + dflash_verify_width);
     }
 
     const auto started = Clock::now();
@@ -2389,7 +2451,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             target_envelope = {
                 1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
                        capacity, static_cast<std::uint64_t>(profile.max_execution_frontier) +
-                                     draft_window + 1ULL))};
+                                     dflash_verify_width))};
         }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -2413,8 +2475,10 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 sequence.kv->backend ? sequence.kv->backend->bound_row() : 0;
             dflash_host_ingress->lanes[row]    = static_cast<std::int32_t>(sequence.lane);
             dflash_host_ingress->sampling[row] = request.sampling_host;
-            materialize_sequence_kv(sequence, frontier + extent + 1U,
-                                    DFlashConfig::full_layers > 0 ? frontier : 0U);
+            materialize_sequence_kv(
+                sequence,
+                std::min(capacity, frontier + dflash_verify_width),
+                DFlashConfig::full_layers > 0 ? frontier : 0U);
         }
 
         schedule::DFlashBatchContext schedule_state{{device, model, work, decoder->linear_attention,
@@ -2430,8 +2494,31 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
 
         mark_workspace_usage(workspace_plan.dflash_round);
         schedule::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                      draft_window, envelopes, target_envelope, executable);
+                                      draft_window, dflash_verify_width, envelopes, target_envelope,
+                                      executable);
         device.synchronize();
+        if (ninfer::targets::qwen3_6::detail::dflash_candidate_stats_enabled() &&
+            io.dflash_decode.has_value()) {
+            qwen3_6::DFlashDecodeState& frame = *io.dflash_decode;
+            const int w = static_cast<int>(width);
+            const int b = static_cast<int>(lanes.size());
+            std::vector<std::int32_t> ids(static_cast<std::size_t>(w) * static_cast<std::size_t>(b));
+            std::vector<std::int32_t> pars(
+                static_cast<std::size_t>(w) * static_cast<std::size_t>(b));
+            CUDA_CHECK(cudaMemcpy(ids.data(), frame.verify_ids.data,
+                                  ids.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(pars.data(), frame.parent_index.data,
+                                  pars.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
+            for (int row = 0; row < b; ++row) {
+                const int count = dflash_host_egress->licensed_counts[static_cast<std::size_t>(row)];
+                ninfer::targets::qwen3_6::detail::dflash_candidate_stats::record_round(
+                    ids.data() + static_cast<std::size_t>(row) * static_cast<std::size_t>(w),
+                    pars.data() + static_cast<std::size_t>(row) * static_cast<std::size_t>(w),
+                    dflash_host_egress->licensed_tokens.data() +
+                        static_cast<std::size_t>(row) * static_cast<std::size_t>(w),
+                    count, w, static_cast<int>(draft_window));
+            }
+        }
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {

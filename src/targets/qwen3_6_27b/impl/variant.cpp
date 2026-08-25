@@ -106,9 +106,10 @@ std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t cap
 
 std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t capacity,
                                                                   std::uint32_t draft_window,
-                                                                  std::uint32_t) {
+                                                                  std::uint32_t,
+                                                                  std::uint32_t verify_width) {
     if (draft_window == 0 || capacity == 0) { return {}; }
-    const std::uint32_t block = draft_window + 1;
+    const std::uint32_t block = verify_width != 0 ? verify_width : draft_window + 1;
     std::vector<std::uint32_t> ends;
     const auto add_shifted = [&](std::uint32_t visible_end, std::uint32_t offset) {
         if (visible_end >= offset) { ends.push_back(visible_end - offset); }
@@ -214,7 +215,8 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
                                           const Tensor& valid_columns, const Tensor& initial_slots,
                                           Tensor& conv_record, Tensor& query, Tensor& key,
                                           Tensor& value, Tensor& output_gate, qwen3_6::TextPhase,
-                                          WorkspaceArena& workspace, cudaStream_t stream) {
+                                          WorkspaceArena& workspace, cudaStream_t stream,
+                                          const Tensor* parent_index) {
     auto workspace_scope     = workspace.scope();
     const DeviceSpan storage = workspace.alloc_bytes(gdn_record_workspace_bytes(hidden, weights));
     WorkspaceArena leaf_workspace(storage);
@@ -224,14 +226,14 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
         ops::gdn_input_proj_conv_record(hidden, split->query_key, split->value_z, conv_weight,
                                         conv_states, valid_columns, initial_slots, conv_record,
                                         query, key, value, output_gate_view, leaf_workspace,
-                                        stream);
+                                        stream, parent_index);
         return;
     }
     const Weight& fused =
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
     ops::gdn_input_proj_conv_record(hidden, fused, conv_weight, conv_states, valid_columns,
                                     initial_slots, conv_record, query, key, value, output_gate_view,
-                                    text_policy(fused), leaf_workspace, stream);
+                                    text_policy(fused), leaf_workspace, stream, parent_index);
 }
 
 void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,

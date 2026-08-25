@@ -985,21 +985,43 @@ std::vector<double> sage_step_emulation(const std::vector<float>& q, const HostC
 }
 
 std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache& cache,
-                                    const std::vector<std::int32_t>& positions) {
+                                    const std::vector<std::int32_t>& positions,
+                                    const std::vector<std::int32_t>& ancestor_mask = {},
+                                    std::int32_t prefix_length                     = 0) {
     const Geometry& geometry  = cache.geometry;
     const std::int32_t tokens = static_cast<std::int32_t>(positions.size());
+    const bool tree           = !ancestor_mask.empty();
     std::vector<double> output(static_cast<std::size_t>(kHeadDim) *
                                static_cast<std::size_t>(geometry.q_heads) *
                                static_cast<std::size_t>(tokens));
 
     std::vector<double> scores(static_cast<std::size_t>(positions.back()) + 1);
     std::vector<double> probabilities(scores.size());
+    std::vector<std::int32_t> allowed;
+    allowed.reserve(scores.size());
     for (std::int32_t token = 0; token < tokens; ++token) {
         const std::int32_t visible = positions[static_cast<std::size_t>(token)] + 1;
+        allowed.clear();
+        for (std::int32_t position = 0; position < visible; ++position) {
+            if (tree && position >= prefix_length) {
+                const std::int32_t packed = position - prefix_length;
+                if (packed < 0 || packed >= tokens ||
+                    (ancestor_mask[static_cast<std::size_t>(token)] & (1 << packed)) == 0) {
+                    continue;
+                }
+            }
+            allowed.push_back(position);
+        }
         for (std::int32_t q_head = 0; q_head < geometry.q_heads; ++q_head) {
             const std::int32_t kv_head = q_head / geometry.query_group();
-            double max_score           = -std::numeric_limits<double>::infinity();
-            for (std::int32_t position = 0; position < visible; ++position) {
+            if (allowed.empty()) {
+                for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                    output[q_index(geometry, q_head, d, token)] = 0.0;
+                }
+                continue;
+            }
+            double max_score = -std::numeric_limits<double>::infinity();
+            for (const std::int32_t position : allowed) {
                 double dot = 0.0;
                 for (std::int32_t d = 0; d < kHeadDim; ++d) {
                     dot += static_cast<double>(q[q_index(geometry, q_head, d, token)]) *
@@ -1011,19 +1033,19 @@ std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache
             }
 
             double sum = 0.0;
-            for (std::int32_t position = 0; position < visible; ++position) {
+            for (const std::int32_t position : allowed) {
                 const double probability =
                     std::exp(scores[static_cast<std::size_t>(position)] - max_score);
                 probabilities[static_cast<std::size_t>(position)] = probability;
                 sum += probability;
             }
-            for (std::int32_t position = 0; position < visible; ++position) {
+            for (const std::int32_t position : allowed) {
                 probabilities[static_cast<std::size_t>(position)] /= sum;
             }
 
             for (std::int32_t d = 0; d < kHeadDim; ++d) {
                 double value = 0.0;
-                for (std::int32_t position = 0; position < visible; ++position) {
+                for (const std::int32_t position : allowed) {
                     value += probabilities[static_cast<std::size_t>(position)] *
                              cache_value(cache, false, kv_head, position, d);
                 }
@@ -2749,6 +2771,109 @@ int run_batch_case(const Geometry& geometry, DType dtype, const BatchAttentionCa
     return failures;
 }
 
+std::vector<std::int32_t> ancestor_mask_from_parent(const std::vector<std::int32_t>& parent) {
+    std::vector<std::int32_t> mask(parent.size(), 0);
+    for (std::size_t j = 0; j < parent.size(); ++j) {
+        mask[j] = 1 << static_cast<int>(j);
+        if (parent[j] >= 0) { mask[j] |= mask[static_cast<std::size_t>(parent[j])]; }
+    }
+    return mask;
+}
+
+int run_tree_verify_case(const Geometry& geometry, DType dtype) {
+    constexpr std::int32_t kWidth          = 4;
+    constexpr std::int32_t kPrefix         = 61;
+    constexpr std::uint32_t kSeed          = 611u;
+    const std::int32_t total               = kPrefix + kWidth;
+    const std::int32_t max_context         = total + 3;
+    const std::vector<std::int32_t> parent = {-1, 0, 0, 1};
+    const std::vector<std::int32_t> ancestor_mask = ancestor_mask_from_parent(parent);
+    const std::size_t q_elements =
+        static_cast<std::size_t>(kHeadDim) * geometry.q_heads * kWidth;
+    const std::size_t kv_elements =
+        static_cast<std::size_t>(kHeadDim) * geometry.kv_heads * kWidth;
+    std::vector<float> q = make_bf16_values(q_elements, kSeed, -0.25f, 0.25f);
+    std::vector<float> k = make_bf16_values(kv_elements, kSeed + 1u, -0.25f, 0.25f);
+    std::vector<float> v = make_bf16_values(kv_elements, kSeed + 2u, -1.0f, 1.0f);
+    inject_codec_edges(geometry, kWidth, k, v);
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(kWidth));
+    for (std::int32_t token = 0; token < kWidth; ++token) {
+        positions[static_cast<std::size_t>(token)] = kPrefix + token;
+    }
+    const std::int32_t prefix_length = kPrefix;
+
+    const HostCache initial = make_cache(geometry, dtype, max_context, kSeed + 10u);
+    HostCache expected      = initial;
+    append_cache(expected, k, v, positions);
+    const std::vector<double> reference =
+        ideal_attention(q, expected, positions, ancestor_mask, prefix_length);
+    DeviceCache cache(initial, MappingPattern::Identity);
+
+    const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
+    const std::vector<std::uint16_t> k_bits = to_bf16_bits(k);
+    const std::vector<std::uint16_t> v_bits = to_bf16_bits(v);
+    GuardedDeviceBuffer dq(q_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dk(k_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dv(v_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dp(positions.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer dmask(ancestor_mask.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer dprefix(sizeof(std::int32_t));
+    GuardedDeviceBuffer dtable_row(sizeof(std::int32_t));
+    GuardedDeviceBuffer dout(q_bits.size() * sizeof(std::uint16_t));
+    dq.copy_from_host(q_bits.data(), q_bits.size() * sizeof(std::uint16_t));
+    dk.copy_from_host(k_bits.data(), k_bits.size() * sizeof(std::uint16_t));
+    dv.copy_from_host(v_bits.data(), v_bits.size() * sizeof(std::uint16_t));
+    dp.copy_from_host(positions.data(), positions.size() * sizeof(std::int32_t));
+    dmask.copy_from_host(ancestor_mask.data(), ancestor_mask.size() * sizeof(std::int32_t));
+    dprefix.copy_from_host(&prefix_length, sizeof(prefix_length));
+    const std::int32_t table_row = 0;
+    dtable_row.copy_from_host(&table_row, sizeof(table_row));
+    std::vector<std::uint16_t> output_canary(q_bits.size(), kOutputCanary);
+    dout.copy_from_host(output_canary.data(), output_canary.size() * sizeof(std::uint16_t));
+
+    Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, kWidth});
+    Tensor tk(dk.data(), DType::BF16, {kHeadDim, geometry.kv_heads, kWidth});
+    Tensor tv(dv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, kWidth});
+    Tensor tp(dp.data(), DType::I32, {kWidth});
+    Tensor tmask(dmask.data(), DType::I32, {kWidth});
+    Tensor tprefix(dprefix.data(), DType::I32, {1});
+    Tensor ttable_row(dtable_row.data(), DType::I32, {1});
+    Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, kWidth});
+    const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
+                                             static_cast<std::uint32_t>(total)};
+    const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
+        geometry.q_heads, dtype, envelope, 1, kWidth, kWidth, 1.0f, true);
+    GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
+    WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
+
+    ops::gqa_attention(tq, tk, tv, tp, Tensor{}, ttable_row, kAttentionScale, cache.batch_view(),
+                       envelope, workspace, tout, nullptr, 1.0f, tmask, tprefix);
+    cuda_synchronize();
+
+    const std::string label = std::string("gqa_attention tree-verify ") + geometry.name + " " +
+                              cache_name(dtype) + " W=4 prefix=61 siblings";
+    const std::vector<std::uint16_t> output_bits =
+        copy_from_guarded<std::uint16_t>(dout, q_bits.size());
+    int failures = verify_attention(label, bf16_bits_to_double(output_bits), reference,
+                                    attention_criterion(dtype));
+    failures += verify_cache(label, cache.snapshot(), expected);
+    failures += verify_input(label + " q unchanged", dq, q_bits);
+    failures += verify_input(label + " k unchanged", dk, k_bits);
+    failures += verify_input(label + " v unchanged", dv, v_bits);
+    failures += verify_positions(label + " positions unchanged", dp, positions);
+    failures += verify_positions(label + " ancestor mask unchanged", dmask, ancestor_mask);
+    failures += verify_positions(label + " prefix lengths unchanged", dprefix, {prefix_length});
+    failures += verify_positions(label + " table row unchanged", dtable_row, {table_row});
+    failures += dout.verify_guards((label + " output").c_str());
+    failures += workspace_buffer.verify_guards((label + " workspace").c_str());
+    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+        std::cerr << label << ": workspace query/execution high-water mismatch\n";
+        ++failures;
+    }
+    failures += cache.verify_guards(label);
+    return failures;
+}
+
 int run_batch_cases() {
     int failures = 0;
     failures += run_batch_case(kGeometries[0], DType::I8,
@@ -2767,6 +2892,9 @@ int run_batch_cases() {
     failures +=
         run_batch_case(kGeometries[0], DType::I8,
                        {6, {61, 127, 511}, {6, 3, 0}, {2, 0, 1}, MappingPattern::Fragmented, 503u});
+    failures += run_batch_case(
+        kGeometries[0], DType::BF16,
+        {5, {16, 16, 16}, {5, 5, 5}, {0, 1, 2}, MappingPattern::Identity, 505u});
     failures += run_batch_case(kGeometries[1], DType::BF16,
                                {16, {49, 2041}, {16, 7}, {1, 0}, MappingPattern::Identity, 504u});
     return failures;
@@ -3804,6 +3932,15 @@ int main(int argc, char** argv) {
         std::cout << (rc == 0 ? "PASS" : "FAIL") << " gqa_attention s3-dump\n";
         return rc;
     }
+    if (argc > 1 && std::strcmp(argv[1], "--batch-only") == 0) {
+        if (cuda_unavailable()) {
+            std::cerr << "FAIL: no usable CUDA device\n";
+            return 1;
+        }
+        const int failures = run_batch_cases();
+        std::cout << (failures == 0 ? "PASS" : "FAIL") << " gqa_attention batch cases\n";
+        return failures == 0 ? 0 : 1;
+    }
     if (cuda_unavailable()) {
         std::cerr << "FAIL: no usable CUDA device\n";
         return 1;
@@ -3813,6 +3950,11 @@ int main(int argc, char** argv) {
     failures += verify_workspace_capacity_contract();
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
     failures += run_batch_cases();
+    for (const Geometry& geometry : kGeometries) {
+        for (const DType dtype : {DType::BF16, DType::I8}) {
+            failures += run_tree_verify_case(geometry, dtype);
+        }
+    }
     std::cout << (failures == 0 ? "PASS" : "FAIL")
               << " gqa_attention public-contract correctness\n";
     return failures == 0 ? 0 : 1;

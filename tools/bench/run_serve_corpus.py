@@ -28,11 +28,17 @@ TARGET_MODEL_IDS = {
 }
 TARGET_ORDER = tuple(TARGET_MODEL_IDS)
 SPECULATIVE_MODES = {
-    "mtp0": ("none", 0),
-    "mtp3": ("mtp", 3),
-    "mtp4": ("mtp", 4),
-    "mtp5": ("mtp", 5),
-    "dflash7": ("dflash", 7),
+    "mtp0": ("none", 0, 0),
+    "mtp1": ("mtp", 1, 0),
+    "mtp2": ("mtp", 2, 0),
+    "mtp3": ("mtp", 3, 0),
+    "mtp4": ("mtp", 4, 0),
+    "mtp5": ("mtp", 5, 0),
+    "dflash4": ("dflash", 4, 0),
+    "dflash4w6": ("dflash", 4, 6),
+    "dflash5": ("dflash", 5, 0),
+    "dflash7": ("dflash", 7, 0),
+    "dflash11": ("dflash", 11, 0),
 }
 DEFAULT_MODES = ("mtp0", "mtp3")
 SAMPLING_MODES = ("stochastic", "greedy")
@@ -82,6 +88,12 @@ SCENARIO_FIXTURES = {
 }
 
 WARMUP_FIXTURE = "text_smoke_zh"
+KV_DTYPES = ("int8", "nvfp4", "bf16")
+KV_CACHE_LOG_NAMES = {
+    "int8": "int8-group64",
+    "nvfp4": "nvfp4",
+    "bf16": "bf16",
+}
 RUN_ARTIFACT_TYPE = "ninfer_serve_corpus_result"
 RUN_SCHEMA_VERSION = 5
 SERVER_LOG_ARTIFACT_TYPE = "ninfer_serve_request_log"
@@ -109,6 +121,7 @@ class RunSpec:
     speculative_mode: str
     speculative_backend: str
     draft_tokens: int
+    dflash_verify_width: int
     sampling_mode: str
     fixture: Fixture
     seed: int
@@ -290,10 +303,29 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="benchmark only this mode; repeat to select multiple (default: mtp0 and mtp3)",
     )
     parser.add_argument(
+        "--fixture",
+        action="append",
+        dest="fixtures",
+        help="benchmark only this fixture; repeat to select multiple",
+    )
+    parser.add_argument(
+        "--seed",
+        action="append",
+        dest="seeds",
+        type=int,
+        help="benchmark only this seed; repeat to select multiple (default: all five campaign seeds)",
+    )
+    parser.add_argument(
         "--sampling",
         choices=SAMPLING_MODES,
         default="stochastic",
         help="sampling profile for all requests (default: stochastic)",
+    )
+    parser.add_argument(
+        "--kv-dtype",
+        choices=KV_DTYPES,
+        default="nvfp4",
+        help="KV cache storage passed to ninfer-serve (default: nvfp4)",
     )
     parser.add_argument("--output", type=Path, required=True, help="campaign output directory")
     parser.add_argument("--port", type=int, default=8080, help="loopback serving port")
@@ -378,17 +410,33 @@ def build_specs(
     fixtures: dict[str, Fixture],
     mode_names: Sequence[str],
     sampling_mode: str,
+    fixture_filter: Sequence[str] | None = None,
+    seed_filter: Sequence[int] | None = None,
 ) -> list[RunSpec]:
     specs: list[RunSpec] = []
+    seeds = tuple(SEEDS)
+    if seed_filter:
+        unknown = [seed for seed in seed_filter if seed not in SEEDS]
+        if unknown:
+            raise CampaignError(f"seed filter {unknown} is outside the campaign seed list")
+        seeds = tuple(seed for seed in SEEDS if seed in set(seed_filter))
     for target, artifact in artifacts:
         for mode_name in mode_names:
-            backend, draft_tokens = SPECULATIVE_MODES[mode_name]
+            backend, draft_tokens, verify_width = SPECULATIVE_MODES[mode_name]
             if backend == "dflash" and target not in {"qwen3_6_35b_a3b", "qwen3_8_27b"}:
                 raise CampaignError(
                     "DFlash corpus measurements require the 35B-A3B or Qwen3.8-27B target"
                 )
-            for fixture_name in block_fixture_names(backend):
-                for seed in SEEDS:
+            selected = block_fixture_names(backend)
+            if fixture_filter:
+                unknown = [name for name in fixture_filter if name not in selected]
+                if unknown:
+                    raise CampaignError(
+                        f"fixture filter {unknown} is outside {backend} campaign membership"
+                    )
+                selected = tuple(name for name in selected if name in set(fixture_filter))
+            for fixture_name in selected:
+                for seed in seeds:
                     specs.append(
                         RunSpec(
                             target=target,
@@ -397,6 +445,7 @@ def build_specs(
                             speculative_mode=mode_name,
                             speculative_backend=backend,
                             draft_tokens=draft_tokens,
+                            dflash_verify_width=verify_width,
                             sampling_mode=sampling_mode,
                             fixture=fixtures[fixture_name],
                             seed=seed,
@@ -468,7 +517,9 @@ def require_server_log_identity(event: dict[str, Any], event_name: str) -> None:
         raise CampaignError(f"unexpected serving log identity {identity!r}; expected {expected!r}")
 
 
-def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> tuple[str, str]:
+def validate_server_start(
+    event: dict[str, Any], spec: RunSpec, device: int, kv_dtype: str
+) -> tuple[str, str]:
     require_server_log_identity(event, "server_start")
     engine = event.get("engine", {})
     actual = {
@@ -488,7 +539,7 @@ def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> 
         "max_context": 262144,
         "kv_capacity": 262144,
         "prefill_chunk": 1024,
-        "kv_cache": "int8-group64",
+        "kv_cache": KV_CACHE_LOG_NAMES[kv_dtype],
         "cuda_graph": True,
         "prefix_reuse": False,
         "speculative_backend": spec.speculative_backend,
@@ -687,6 +738,7 @@ def server_command(
     server_log: Path,
     port: int,
     device: int,
+    kv_dtype: str,
 ) -> list[str]:
     command = [
         str(serve),
@@ -708,7 +760,7 @@ def server_command(
         "--request-log-jsonl",
         str(server_log),
         "--kv-dtype",
-        "int8",
+        kv_dtype,
         "--no-prefix-reuse",
     ]
     if spec.speculative_backend != "none":
@@ -721,6 +773,8 @@ def server_command(
                 "--lm-head-draft",
             ]
         )
+        if spec.dflash_verify_width:
+            command.extend(["--dflash-verify-width", str(spec.dflash_verify_width)])
     if spec.sampling_mode == "greedy":
         command.append("--greedy")
     else:
@@ -756,6 +810,7 @@ def run_block(
     records: dict[tuple[str, str, str, str, int], dict[str, Any]],
     completed_before_block: int,
     total: int,
+    kv_dtype: str,
 ) -> None:
     first = block_specs[0]
     server_log = (
@@ -763,7 +818,7 @@ def run_block(
         / "server"
         / f"{first.target}_{first.speculative_mode}_{first.sampling_mode}.jsonl"
     )
-    command = server_command(serve, first, server_log, port, device)
+    command = server_command(serve, first, server_log, port, device, kv_dtype)
     print(
         f"start {first.target}/{first.speculative_mode}: "
         f"{len(block_specs)} missing request(s)",
@@ -771,7 +826,9 @@ def run_block(
     )
     with RunningServer(command, "127.0.0.1", port, server_log) as server:
         server_start = server.wait_until_ready()
-        server_instance_id, weights_id = validate_server_start(server_start, first, device)
+        server_instance_id, weights_id = validate_server_start(
+            server_start, first, device, kv_dtype
+        )
 
         connection = http.client.HTTPConnection(
             "127.0.0.1", port, timeout=REQUEST_TIMEOUT_SECONDS
@@ -833,9 +890,11 @@ def select_records(
     fixtures: Sequence[str],
 ) -> list[dict[str, Any]]:
     return [
-        records[(target, speculative_mode, sampling_mode, fixture, seed)]
+        record
         for fixture in fixtures
         for seed in SEEDS
+        if (record := records.get((target, speculative_mode, sampling_mode, fixture, seed)))
+        is not None
     ]
 
 
@@ -919,12 +978,15 @@ def build_summary_rows(
     mode_names: Sequence[str],
     sampling_mode: str,
 ) -> list[dict[str, Any]]:
+    present = {key[3] for key in records}
     rows: list[dict[str, Any]] = []
     for target in target_order:
         for mode_name in mode_names:
-            backend, _ = SPECULATIVE_MODES[mode_name]
+            backend, _, _ = SPECULATIVE_MODES[mode_name]
             if backend == "none":
                 for fixture in NIAH_FIXTURES:
+                    if fixture not in present:
+                        continue
                     rows.append(
                         summary_row(
                             "context_profile",
@@ -941,6 +1003,8 @@ def build_summary_rows(
                 continue
 
             for fixture in LONG_DECODE_FIXTURES:
+                if fixture not in present:
+                    continue
                 rows.append(
                     summary_row(
                         "long_decode",
@@ -956,7 +1020,10 @@ def build_summary_rows(
                 )
 
             for category, fixture_names in SCENARIO_FIXTURES.items():
-                for fixture in fixture_names:
+                category_present = tuple(name for name in fixture_names if name in present)
+                if not category_present:
+                    continue
+                for fixture in category_present:
                     rows.append(
                         summary_row(
                             "scenario_fixture",
@@ -980,7 +1047,7 @@ def build_summary_rows(
                         mode_name,
                         sampling_mode,
                         select_records(
-                            records, target, mode_name, sampling_mode, fixture_names
+                            records, target, mode_name, sampling_mode, category_present
                         ),
                     )
                 )
@@ -1023,8 +1090,16 @@ def mode_display_name(mode_name: str) -> str:
         return "MTP0"
     if mode_name == "mtp3":
         return "MTP3"
+    if mode_name == "dflash4":
+        return "DFlash k=4 W=5 chain"
+    if mode_name == "dflash4w6":
+        return "DFlash k=4 W=6 tree"
+    if mode_name == "dflash5":
+        return "DFlash k=5 W=6 chain"
     if mode_name == "dflash7":
-        return "DFlash block=8 (k=7)"
+        return "DFlash k=7 W=12 tree"
+    if mode_name == "dflash11":
+        return "DFlash k=11 W=12 chain"
     raise CampaignError(f"unsupported summary mode: {mode_name}")
 
 
@@ -1164,7 +1239,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if len(mode_names) != len(set(mode_names)):
         raise CampaignError("duplicate --mode value")
     fixtures = load_fixtures()
-    specs = build_specs(artifacts, fixtures, mode_names, args.sampling)
+    specs = build_specs(
+        artifacts, fixtures, mode_names, args.sampling, args.fixtures, args.seeds
+    )
     expected_specs = {spec.key: spec for spec in specs}
     total = len(expected_specs)
 
@@ -1198,6 +1275,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     records,
                     len(records),
                     total,
+                    args.kv_dtype,
                 )
 
     missing = set(expected_specs) - set(records)

@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
-from tools.convert.qwen3_6.common.inventory import BF16, Q4, W8, TensorSpec, tensor_spec
+from tools.convert.qwen3_6.common.inventory import (
+    BF16,
+    Q4,
+    W8,
+    TensorSpec,
+    tensor_spec,
+)
+
+NVFP4 = "NVFP4"
+BLOCK_SCALE_LAYOUT = "blockscale-k16-m128x4-v1"
 
 
 DFLASH2_LAYERS = tuple(range(5))
@@ -22,20 +31,37 @@ DFLASH2_REPOSITORY = "z-lab/Qwen3.8-27B-DFlash2"
 DFLASH2_REVISION = "50307d4c4cde6860d4eee73e2547cd786fe8e8a4"
 DFLASH2_MODEL_PY_COMMIT = "95c8aeca5e4b4c4f9c0c967c05ab89fa3ed24f4c"
 
-_FORMATS = {"w8": W8, "q4": Q4}
+_FORMATS = {"w8": W8, "q4": Q4, "nvfp4": NVFP4}
 
 
 def dflash2_matrix_format(dflash_format: str) -> str:
     try:
         return _FORMATS[dflash_format]
     except KeyError as exc:
-        raise ValueError("dflash format must be w8 or q4") from exc
+        raise ValueError("dflash format must be w8, q4, or nvfp4") from exc
 
 
-def build_dflash2_specs(dflash_format: str = "w8") -> tuple[TensorSpec, ...]:
+def dflash2_spec(name: str, shape: tuple[int, ...], numeric_format: str) -> TensorSpec:
+    if numeric_format == NVFP4:
+        return TensorSpec(name, shape, NVFP4, BLOCK_SCALE_LAYOUT)
+    return tensor_spec(name, shape, numeric_format)
+
+
+def build_dflash2_specs(
+    dflash_format: str = "w8", *, codebook_format: str = BF16
+) -> tuple[TensorSpec, ...]:
     matrix = dflash2_matrix_format(dflash_format)
+    if codebook_format not in (BF16, NVFP4):
+        raise ValueError("dflash codebook format must be BF16 or NVFP4")
+    if codebook_format == NVFP4 and matrix != NVFP4:
+        raise ValueError("NVFP4 DFlash2 codebooks require --dflash-format nvfp4")
+    codebook_shape = (
+        (DFLASH2_VOCAB, DFLASH2_SELECTOR_RANK)
+        if codebook_format == NVFP4
+        else (DFLASH2_SELECTOR_RANK, DFLASH2_VOCAB)
+    )
     specs: list[TensorSpec] = [
-        tensor_spec(
+        dflash2_spec(
             "dflash/feature_projection",
             (DFLASH2_HIDDEN, DFLASH2_FEATURE_ROWS),
             matrix,
@@ -47,14 +73,14 @@ def build_dflash2_specs(dflash_format: str = "w8") -> tuple[TensorSpec, ...]:
         specs.extend(
             (
                 tensor_spec(prefix + "input_norm", (DFLASH2_HIDDEN,), BF16),
-                tensor_spec(
+                dflash2_spec(
                     prefix + "attention/query_key_value",
                     (DFLASH2_QKV_ROWS, DFLASH2_HIDDEN),
                     matrix,
                 ),
                 tensor_spec(prefix + "attention/query_norm", (128,), BF16),
                 tensor_spec(prefix + "attention/key_norm", (128,), BF16),
-                tensor_spec(
+                dflash2_spec(
                     prefix + "attention/output",
                     (DFLASH2_HIDDEN, DFLASH2_QUERY_SIZE),
                     matrix,
@@ -64,18 +90,18 @@ def build_dflash2_specs(dflash_format: str = "w8") -> tuple[TensorSpec, ...]:
                     (DFLASH2_HIDDEN, 2, 2),
                     BF16,
                 ),
-                tensor_spec(
+                dflash2_spec(
                     prefix + "attention_conv/kernel_projection",
                     (DFLASH2_CONV_PROJ_ROWS, DFLASH2_HIDDEN),
                     matrix,
                 ),
                 tensor_spec(prefix + "post_attention_norm", (DFLASH2_HIDDEN,), BF16),
-                tensor_spec(
+                dflash2_spec(
                     prefix + "mlp/gate_up",
                     (DFLASH2_GATE_UP_ROWS, DFLASH2_HIDDEN),
                     matrix,
                 ),
-                tensor_spec(
+                dflash2_spec(
                     prefix + "mlp/down",
                     (DFLASH2_HIDDEN, DFLASH2_INTERMEDIATE),
                     matrix,
@@ -85,7 +111,7 @@ def build_dflash2_specs(dflash_format: str = "w8") -> tuple[TensorSpec, ...]:
                     (DFLASH2_HIDDEN, 2, 2),
                     BF16,
                 ),
-                tensor_spec(
+                dflash2_spec(
                     prefix + "mlp_conv/kernel_projection",
                     (DFLASH2_CONV_PROJ_ROWS, DFLASH2_HIDDEN),
                     matrix,
@@ -95,20 +121,20 @@ def build_dflash2_specs(dflash_format: str = "w8") -> tuple[TensorSpec, ...]:
     specs.extend(
         (
             tensor_spec("dflash/final_norm", (DFLASH2_HIDDEN,), BF16),
-            tensor_spec(
+            dflash2_spec(
                 "dflash/selector/hidden_projection",
                 (DFLASH2_SELECTOR_RANK, DFLASH2_HIDDEN),
                 matrix,
             ),
-            tensor_spec(
+            dflash2_spec(
                 "dflash/selector/predecessor_codebook",
-                (DFLASH2_SELECTOR_RANK, DFLASH2_VOCAB),
-                BF16,
+                codebook_shape,
+                codebook_format,
             ),
-            tensor_spec(
+            dflash2_spec(
                 "dflash/selector/successor_codebook",
-                (DFLASH2_SELECTOR_RANK, DFLASH2_VOCAB),
-                BF16,
+                codebook_shape,
+                codebook_format,
             ),
         )
     )

@@ -448,4 +448,156 @@ __global__ void proposal_remap_token_ids_kernel(std::int32_t* proposal_tokens,
     if (idx >= 0 && idx < n) { proposal_tokens[i] = id_map[idx]; }
 }
 
+__device__ inline int speculative_tree_child_for_token(const std::int32_t* parent_index,
+                                                       const std::int32_t* verify_ids, int node,
+                                                       int token, int valid) {
+    for (int c = node + 1; c < valid; ++c) {
+        if (parent_index[c] == node && verify_ids[c] == token) { return c; }
+    }
+    return -1;
+}
+
+__launch_bounds__(kSamplerBlock) __global__ void speculative_accept_tree_drafts_kernel(
+    const std::int32_t* target_tokens, const __nv_bfloat16* logits, const std::int32_t* verify_ids,
+    const std::int32_t* parent_index, const std::int32_t* valid_columns,
+    const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
+    std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
+    std::int32_t* accepted_column, std::int32_t* fold_path, const SamplingConfig* configs,
+    std::int32_t token_domain, std::int32_t physical_rows, std::int32_t width) {
+    const int tid            = threadIdx.x;
+    const int row            = static_cast<int>(blockIdx.x);
+    int valid                = valid_columns[row];
+    valid                    = valid < 1 ? 1 : (valid > width ? width : valid);
+    int extent               = current_extents[row];
+    extent                   = extent < 0 ? 0 : (extent > width - 1 ? width - 1 : extent);
+    const SamplingConfig cfg = configs[row];
+    const std::int32_t* ids  = verify_ids + row * width;
+    const std::int32_t* pars = parent_index + row * width;
+    const std::int32_t* ttok = target_tokens + row * width;
+    std::int32_t* lic        = licensed_tokens + row * width;
+    std::int32_t* path       = fold_path + row * width;
+    const __nv_bfloat16* row_logits =
+        logits + static_cast<std::int64_t>(row) * width * physical_rows;
+
+    if (!(cfg.temperature > 0.0f)) {
+        if (tid == 0) {
+            for (int i = 0; i < width; ++i) {
+                lic[i]  = 0;
+                path[i] = 0;
+            }
+            int node = 0;
+            int a    = 0;
+            path[0]  = 0;
+            while (a < extent) {
+                const int predicted = ttok[node];
+                const int child =
+                    speculative_tree_child_for_token(pars, ids, node, predicted, valid);
+                if (child < 0) {
+                    lic[a]                = predicted;
+                    licensed_counts[row]  = a + 1;
+                    accepted[row]         = a;
+                    accepted_column[row]  = node;
+                    anchors[row]          = predicted;
+                    lengths[row] += a + 1;
+                    return;
+                }
+                lic[a]      = predicted;
+                node        = child;
+                path[a + 1] = child;
+                ++a;
+            }
+            lic[a]               = ttok[node];
+            licensed_counts[row] = a + 1;
+            accepted[row]        = a;
+            accepted_column[row] = node;
+            anchors[row]         = ttok[node];
+            lengths[row] += a + 1;
+        }
+        return;
+    }
+
+    __shared__ float red_val[kSamplerBlock];
+    __shared__ int red_idx[kSamplerBlock];
+    __shared__ float cand_val[kSamplerCandidateCap];
+    __shared__ int cand_idx[kSamplerCandidateCap];
+    __shared__ float prob[kSamplerCandidateCap];
+    __shared__ float merge_val[kSamplerBlock * kSamplerFastCandidates];
+    __shared__ int merge_idx[kSamplerBlock * kSamplerFastCandidates];
+    __shared__ int n_support;
+    __shared__ int node_sh;
+    __shared__ int a_sh;
+    __shared__ int done_sh;
+    __shared__ int tstar_sh;
+    __shared__ int L_sh;
+    __shared__ int path_sh[16];
+    __shared__ int lic_sh[16];
+
+    if (tid == 0) {
+        node_sh  = 0;
+        a_sh     = 0;
+        done_sh  = 0;
+        tstar_sh = 0;
+        L_sh     = lengths[row];
+        path_sh[0] = 0;
+        for (int i = 0; i < width; ++i) {
+            lic_sh[i] = 0;
+        }
+    }
+    __syncthreads();
+
+    for (int step = 0; step <= extent; ++step) {
+        const int node            = node_sh;
+        const std::int64_t base =
+            static_cast<std::int64_t>(node) * physical_rows;
+        if (token_domain <= kSamplerTileItems) {
+            sampling_build_truncated_small(row_logits, base, token_domain, cfg, red_val, red_idx,
+                                           cand_val, cand_idx, prob, &n_support, lic_sh, a_sh);
+        } else {
+            sampling_build_truncated_block_fast(row_logits, base, token_domain, cfg, merge_val,
+                                                merge_idx, cand_val, cand_idx, prob, &n_support,
+                                                lic_sh, a_sh);
+        }
+        if (tid == 0 && done_sh == 0) {
+            const int L = L_sh;
+            const float u =
+                sampling_uniform(cfg.seed, L + a_sh + 1, kSamplePurposeSpeculativeAccept, 0u);
+            const int sampled = sampling_pick_from_support(cand_idx, prob, n_support, -1, u);
+            const int child =
+                step < extent ? speculative_tree_child_for_token(pars, ids, node, sampled, valid)
+                              : -1;
+            if (child >= 0) {
+                lic_sh[a_sh]      = sampled;
+                path_sh[a_sh + 1] = child;
+                node_sh           = child;
+                ++a_sh;
+            } else {
+                tstar_sh = sampled;
+                done_sh  = 1;
+            }
+        }
+        __syncthreads();
+        if (done_sh) { break; }
+    }
+
+    if (tid == 0) {
+        if (done_sh == 0) {
+            tstar_sh = ttok[node_sh];
+        }
+        const int a     = a_sh;
+        const int tstar = tstar_sh;
+        for (int i = 0; i < width; ++i) {
+            lic[i]  = 0;
+            path[i] = 0;
+        }
+        for (int i = 0; i < a; ++i) { lic[i] = lic_sh[i]; }
+        lic[a] = tstar;
+        for (int i = 0; i <= a; ++i) { path[i] = path_sh[i]; }
+        licensed_counts[row] = a + 1;
+        accepted[row]        = a;
+        accepted_column[row] = node_sh;
+        anchors[row]         = tstar;
+        lengths[row] += a + 1;
+    }
+}
+
 } // namespace ninfer::ops

@@ -119,6 +119,27 @@ __device__ __forceinline__ int gqa_small_t_active_splits(int window, int launch_
     return splits < launch_capacity ? splits : launch_capacity;
 }
 
+__device__ __forceinline__ bool gqa_key_in_causal_split(int row, int row_count, int key,
+                                                        int split_start, int split_end, int qabs) {
+    return row < row_count && key >= split_start && key < split_end && key <= qabs;
+}
+
+template <bool TreeMasked>
+__device__ __forceinline__ bool gqa_tree_allows_key(int key, int prefix_length, int packed_width,
+                                                    int ancestor_bits) {
+    if constexpr (!TreeMasked) {
+        (void)key;
+        (void)prefix_length;
+        (void)packed_width;
+        (void)ancestor_bits;
+        return true;
+    }
+    if (key < prefix_length) { return true; }
+    const int packed = key - prefix_length;
+    return packed >= 0 && packed < packed_width &&
+           ((static_cast<unsigned>(ancestor_bits) >> packed) & 1u) != 0u;
+}
+
 __device__ __forceinline__ int gqa_small_t_tc_swz(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
 }

@@ -69,7 +69,7 @@ constexpr ModelSamplingDefaults kQwen3_8Defaults{
                      .top_k             = 20,
                      .top_p             = 0.80F,
                      .min_p             = 0.0F,
-                     .presence_penalty  = 1.5F,
+                     .presence_penalty  = 0.0F,
                      .frequency_penalty = 0.0F},
 };
 

@@ -37,6 +37,21 @@ python3 -m tools.convert.qwen3_8_27b.convert \
   --model /path/to/Qwen3.8-27B \
   --out out/qwen3_8_27b.ninfer
 
+# Optional DFlash2 append onto an existing qwen3.8-27b/nvfp4 file (not the
+# Qwen3.8-27B Text checkpoint). NVFP4 draft matrices + BF16 selector codebooks.
+hf download Ostfralla/Qwen3.8-27B-NVFP4-NInfer \
+  qwen3_8_27b_nvfp4.ninfer \
+  --local-dir models
+hf download z-lab/Qwen3.8-27B-DFlash2 \
+  --revision 50307d4c4cde6860d4eee73e2547cd786fe8e8a4 \
+  --local-dir /path/to/Qwen3.8-27B-DFlash2
+python3 -m tools.convert.qwen3_8_27b.convert_nvfp4 \
+  --base-artifact models/qwen3_8_27b_nvfp4.ninfer \
+  --dflash-model /path/to/Qwen3.8-27B-DFlash2 \
+  --dflash-format nvfp4 \
+  --out out/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
+  --device cuda
+
 python3 -m tools.convert.qwen3_6_35b_a3b.convert \
   --model /path/to/Qwen3.6-35B-A3B-base \
   --dflash-model /path/to/Qwen3.6-35B-A3B-DFlash \

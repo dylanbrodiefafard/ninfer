@@ -418,9 +418,10 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
             binder.find("dflash/feature_projection"));
         if (descriptor == nullptr ||
             (descriptor->format != NumericFormat::W8G32_F16S &&
-             descriptor->format != NumericFormat::Q4G64_F16S)) {
+             descriptor->format != NumericFormat::Q4G64_F16S &&
+             descriptor->format != NumericFormat::NVFP4)) {
             throw artifact::ArtifactError(
-                "dflash/feature_projection must be W8G32_F16S or Q4G64_F16S");
+                "dflash/feature_projection must be W8G32_F16S, Q4G64_F16S, or NVFP4");
         }
         const NumericFormat matrix_format = descriptor->format;
         const artifact::TensorPlacement dflash_placement =
@@ -429,9 +430,31 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         DFlash2Plan& dflash = out.dflash.emplace();
         const auto bind_matrix = [&](std::string_view name,
                                      std::initializer_list<std::uint64_t> shape) {
-            return WeightPlan{.object = artifact::bind_tensor(binder, name, matrix_format, shape,
-                                                              dflash_placement),
-                              .format = matrix_format};
+            if (matrix_format != NumericFormat::NVFP4) {
+                return WeightPlan{.object = artifact::bind_tensor(binder, name, matrix_format, shape,
+                                                                  dflash_placement),
+                                  .format = matrix_format};
+            }
+            if (shape.size() != 2) {
+                throw std::logic_error("DFlash NVFP4 matrix must be rank-2");
+            }
+            auto cursor                              = shape.begin();
+            const std::uint64_t rows                 = *cursor++;
+            const std::uint64_t columns              = *cursor;
+            const std::array<std::uint64_t, 2> dims  = {rows, columns};
+            const artifact::ObjectHandle parent      = artifact::bind_tensor(
+                binder, name, NumericFormat::NVFP4, shape, dflash_placement);
+            const artifact::BlockScaleGeometry geometry =
+                artifact::block_scale_geometry(NumericFormat::NVFP4, dims);
+            const std::uint32_t weight_bits =
+                read_u32_le(binder.payload(parent).data, geometry.weight_divisor_offset, name);
+            require_positive_finite(weight_bits, name);
+            constexpr float kA16InputDivisor = 1.0F;
+            return WeightPlan{
+                .object                    = parent,
+                .format                    = NumericFormat::NVFP4,
+                .weight_scale_divisor_bits = weight_bits,
+                .input_scale_divisor_bits  = std::bit_cast<std::uint32_t>(kA16InputDivisor)};
         };
         const auto bind_bf16 = [&](std::string_view name,
                                    std::initializer_list<std::uint64_t> shape) {
@@ -461,10 +484,21 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         }
         dflash.final_norm        = bind_bf16("dflash/final_norm", {5120});
         dflash.hidden_projection = bind_matrix("dflash/selector/hidden_projection", {256, 5120});
-        dflash.predecessor_codebook =
-            bind_bf16("dflash/selector/predecessor_codebook", {256, 248320});
-        dflash.successor_codebook =
-            bind_bf16("dflash/selector/successor_codebook", {256, 248320});
+        const auto* codebook_descriptor = std::get_if<artifact::TensorDescriptor>(
+            binder.find("dflash/selector/predecessor_codebook"));
+        dflash.codebook_nvfp4 =
+            codebook_descriptor != nullptr && codebook_descriptor->format == NumericFormat::NVFP4;
+        if (dflash.codebook_nvfp4) {
+            dflash.predecessor_codebook_nvfp4 =
+                bind_matrix("dflash/selector/predecessor_codebook", {248320, 256});
+            dflash.successor_codebook_nvfp4 =
+                bind_matrix("dflash/selector/successor_codebook", {248320, 256});
+        } else {
+            dflash.predecessor_codebook =
+                bind_bf16("dflash/selector/predecessor_codebook", {256, 248320});
+            dflash.successor_codebook =
+                bind_bf16("dflash/selector/successor_codebook", {256, 248320});
+        }
     }
 
     load_plan.materialization = binder.finish();
@@ -617,10 +651,17 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             artifact::materialized_tensor(backing, source.final_norm, NumericFormat::BF16, {5120});
         target.hidden_projection =
             materialized_weight(backing, source.hidden_projection, 256, 5120);
-        target.predecessor_codebook = artifact::materialized_tensor(
-            backing, source.predecessor_codebook, NumericFormat::BF16, {256, 248320});
-        target.successor_codebook = artifact::materialized_tensor(
-            backing, source.successor_codebook, NumericFormat::BF16, {256, 248320});
+        if (source.codebook_nvfp4) {
+            target.predecessor_codebook_nvfp4 =
+                materialized_weight(backing, source.predecessor_codebook_nvfp4, 248320, 256);
+            target.successor_codebook_nvfp4 =
+                materialized_weight(backing, source.successor_codebook_nvfp4, 248320, 256);
+        } else {
+            target.predecessor_codebook = artifact::materialized_tensor(
+                backing, source.predecessor_codebook, NumericFormat::BF16, {256, 248320});
+            target.successor_codebook = artifact::materialized_tensor(
+                backing, source.successor_codebook, NumericFormat::BF16, {256, 248320});
+        }
     }
 }
 

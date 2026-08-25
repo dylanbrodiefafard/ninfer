@@ -140,7 +140,14 @@ void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
     case Nvfp4Problem::Residual17408:
         launch_problem<Nvfp4Residual17408Geometry>(weight, out, workspace, tokens, stream);
         return;
+    case Nvfp4Problem::DflashFeature:
+    case Nvfp4Problem::DflashQkv:
+    case Nvfp4Problem::DflashAttnOut:
+    case Nvfp4Problem::DflashConvProj:
+    case Nvfp4Problem::DflashSelector:
+        break;
     }
+    throw std::invalid_argument("nvfp4 W4A4 linear: DFlash2 problems are A16-only");
 }
 
 } // namespace ninfer::ops::detail

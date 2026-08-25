@@ -63,7 +63,7 @@ struct BenchOptions {
     int warmup      = kDefaultWarmup;
     std::optional<std::uint32_t> max_context;
     std::uint32_t prefill_chunk    = kDefaultPrefillChunk;
-    KvCacheStorage kv_cache        = KvCacheStorage::BFloat16;
+    KvCacheStorage kv_cache        = KvCacheStorage::Nvfp4;
     bool sage_attn                 = false;
     std::uint32_t concurrency      = 1;
     std::uint32_t mtp_draft_tokens = 0;
@@ -109,7 +109,7 @@ struct BenchEnvironment {
 
     std::uint32_t max_context                      = 0;
     std::uint32_t prefill_chunk                    = kDefaultPrefillChunk;
-    KvCacheStorage kv_cache                        = KvCacheStorage::BFloat16;
+    KvCacheStorage kv_cache                        = KvCacheStorage::Nvfp4;
     bool sage_attn                                 = false;
     std::uint32_t concurrency                      = 1;
     std::uint32_t mtp_draft_tokens                 = 0;

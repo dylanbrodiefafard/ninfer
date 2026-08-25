@@ -139,8 +139,8 @@ MTP and DFlash cannot be enabled together. `--spec dflash` on a 27B file without
 at bind. Current 3.8 MTP-only files and all 3.6-27B files stay valid MTP artifacts. The published
 [performance results](performance.md) use MTP with three draft tokens and DFlash with seven draft
 tokens (block length eight), both with the optimized proposal head. 35B DFlash v1 accepts up to
-fifteen draft tokens; 3.8 DFlash2 accepts up to seven. Seven is the product window for both
-companions. Current C=1 measurements for Qwen3.8-27B NVFP4 DFlash2 are in
+fifteen draft tokens; 3.8 DFlash2 accepts up to eleven. Seven is the default tree window; eleven
+runs Spark two-block (7 MASK + 4 MASK) chain verify. Current C=1 measurements for Qwen3.8-27B NVFP4 DFlash2 are in
 [performance.md](performance.md).
 
 ## Common options
@@ -153,9 +153,10 @@ companions. Current C=1 measurements for Qwen3.8-27B NVFP4 DFlash2 are in
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `4096` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
-| `--kv-dtype bf16\|int8\|nvfp4` | KV-cache storage | `bf16` |
+| `--kv-dtype bf16\|int8\|nvfp4` | KV-cache storage | `nvfp4` |
 | `--spec mtp\|dflash` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; 35B DFlash `1..15`; 3.8 DFlash2 `1..7` | unset |
+| `--draft-tokens N` | MTP `1..5`; 35B DFlash `1..15`; 3.8 DFlash2 `1..11` | unset |
+| `--dflash-verify-width N` | DFlash packed/chain verify width `2..16`; omit for the k-dependent default | auto |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
@@ -177,8 +178,8 @@ the loaded model and the rendered prompt mode. The current presets are:
 |---|---|---:|---:|---:|---:|---:|
 | Qwen3.6-27B | thinking | `1.0` | `0.95` | `20` | `0` | `0` |
 | Qwen3.6-27B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
-| Qwen3.8-27B | thinking | `1.0` | `0.95` | `20` | `0` | `0` |
-| Qwen3.8-27B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
+| Qwen3.8-27B | thinking | `0.6` | `0.95` | `20` | `0` | `0` |
+| Qwen3.8-27B | non-thinking | `0.7` | `0.80` | `20` | `0` | `0` |
 | Qwen3.6-35B-A3B | thinking | `1.0` | `0.95` | `20` | `0` | `1.5` |
 | Qwen3.6-35B-A3B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
 
@@ -196,7 +197,8 @@ Run `./build/apps/ninfer --help` for the exact option contract.
 The registered model IDs have a native context limit of 262,144 tokens. The practical
 allocation on one RTX 5090 depends on the selected artifact, media workload, output budget, and
 KV-cache type.
-Use `--kv-dtype int8` for large context allocations. The prepared prompt must fit
+Default KV storage is NVFP4. Use `--kv-dtype bf16` for uncompressed KV; `--kv-dtype int8`
+remains a capacity alternative. The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
 `--kv-capacity N` controls the shared physical Main Text KV pool independently and is rounded up to
 the 64-token page size. `--kv-capacity auto` loads the selected weights, measures the remaining GPU

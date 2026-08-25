@@ -18,12 +18,15 @@ inline constexpr std::uint32_t kDFlashDecodeMaximumDrafts = 15;
 inline constexpr std::uint32_t kDFlashDecodeMaximumWidth  = kDFlashDecodeMaximumDrafts + 1;
 
 struct RoundStateSpec {
-    std::int32_t hidden          = 0;
-    std::int32_t output_rows     = 0;
-    std::uint32_t batch_capacity = 1;
-    std::uint32_t draft_window   = 0;
-    bool enable_mtp              = false;
-    bool enable_dflash           = false;
+    std::int32_t hidden            = 0;
+    std::int32_t output_rows       = 0;
+    std::uint32_t batch_capacity   = 1;
+    std::uint32_t draft_window     = 0;
+    // Packed DFlash verify width. 0 means draft_window+1 (chain). Tree verify sets this to the
+    // packed N, which may be smaller than the expand width.
+    std::uint32_t dflash_verify_width = 0;
+    bool enable_mtp                = false;
+    bool enable_dflash             = false;
 };
 
 // Stable pinned/device transfer format for ordinary decode. The full fixed-size object is copied
@@ -85,6 +88,8 @@ struct DFlashDecodeEgress {
     std::array<TokenId, kMaximumConcurrency * kDFlashDecodeMaximumWidth> licensed_tokens{};
     std::array<std::int32_t, kMaximumConcurrency> licensed_counts{};
     std::array<std::int32_t, kMaximumConcurrency> accepted_drafts{};
+    std::array<std::int32_t, kMaximumConcurrency> accepted_column{};
+    std::array<std::int32_t, kMaximumConcurrency * kDFlashDecodeMaximumWidth> fold_path{};
 };
 
 struct OrdinaryDecodeStateLayout {
@@ -134,6 +139,9 @@ struct DFlashDecodeStateLayout {
     TensorRegion append_counts;
     TensorRegion draft_tokens;
     TensorRegion verify_ids;
+    TensorRegion parent_index;
+    TensorRegion ancestor_mask;
+    TensorRegion cache_positions;
     TensorRegion target_argmax;
     TensorRegion target_logits;
     TensorRegion target_hidden;
@@ -261,6 +269,11 @@ struct DFlashDecodeState {
     Tensor append_counts;
     Tensor draft_tokens;
     Tensor verify_ids;
+    Tensor parent_index;
+    Tensor ancestor_mask;
+    Tensor cache_positions;
+    Tensor accepted_column;
+    Tensor fold_path;
     Tensor target_argmax;
     Tensor target_logits;
     Tensor target_hidden;

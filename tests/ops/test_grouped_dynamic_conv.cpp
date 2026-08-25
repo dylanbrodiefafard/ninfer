@@ -1,7 +1,9 @@
 #include "ninfer/ops/grouped_dynamic_conv.h"
 
 #include "ops/direct_bf16_weight.h"
+#include "ops/input_projection_test_common.h"
 #include "ops/op_tester.h"
+#include "ops/quantized_weight.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -210,6 +212,72 @@ int run_finish_case(const char* label, std::int32_t tokens, std::int32_t batch,
     return failures;
 }
 
+int run_nvfp4_prepare_case(const char* label, std::int32_t tokens) {
+    quantized_weight::PatternedWeightOptions options;
+    options.weight_scale_divisor = 0.125F;
+    options.input_scale_divisor  = 1.0F;
+    input_projection::DevicePackedWeight device_weight(quantized_weight::make_patterned_weight(
+        QType::NVFP4, kProj, kD, 77u, options));
+
+    std::vector<float> hidden(static_cast<std::size_t>(kD) * tokens);
+    std::vector<float> base(static_cast<std::size_t>(kD) * 4);
+    fill_uniform(hidden, 81u, -1.0f, 1.0f);
+    fill_uniform(base, 83u, -0.5f, 0.5f);
+    round_to_bf16(hidden);
+    round_to_bf16(base);
+
+    std::vector<double> proj(static_cast<std::size_t>(kProj) * tokens, 0.0);
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        std::vector<float> column(static_cast<std::size_t>(kD));
+        for (std::int32_t d = 0; d < kD; ++d) {
+            column[static_cast<std::size_t>(d)] = hidden[hid_index(d, t, 0, tokens)];
+        }
+        for (std::int32_t n = 0; n < kProj; ++n) {
+            proj[static_cast<std::size_t>(t) * kProj + n] =
+                quantized_weight::dot_fp64(device_weight.host, n, column.data(), kD);
+        }
+    }
+    std::vector<double> prepare_dyn;
+    std::vector<double> finish_dyn;
+    split_projection(proj, tokens, 1, 0, prepare_dyn);
+    split_projection(proj, tokens, 1, 1, finish_dyn);
+    std::vector<double> expected_prepared;
+    convolve_oracle(hidden, base, prepare_dyn, tokens, 1, 0, expected_prepared);
+
+    const auto hidden_bits = encode_bf16(hidden);
+    const auto base_bits   = encode_bf16(base);
+    GuardedDeviceBuffer device_hidden(hidden_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_base(base_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_prepared(hidden_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_finish(finish_dyn.size() * sizeof(std::uint16_t));
+    device_hidden.copy_from_host(hidden_bits.data(), device_hidden.bytes());
+    device_base.copy_from_host(base_bits.data(), device_base.bytes());
+    device_prepared.fill(0xcd);
+    device_finish.fill(0xcd);
+
+    Tensor hidden_t(device_hidden.data(), DType::BF16, {kD, tokens});
+    Tensor base_t(device_base.data(), DType::BF16, {kD, 2, 2});
+    Tensor prepared_t(device_prepared.data(), DType::BF16, {kD, tokens});
+    Tensor finish_t(device_finish.data(), DType::BF16, {kG, 2, tokens});
+    const std::size_t workspace_bytes =
+        ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(QType::NVFP4, tokens, tokens, 1);
+    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+    ops::grouped_dynamic_conv_prepare(hidden_t, base_t, device_weight.view(), prepared_t, finish_t,
+                                      workspace, nullptr);
+    cuda_synchronize();
+
+    int failures = verify_reduction(label, from_device_bf16(device_prepared.data(), hidden.size()),
+                                    expected_prepared, prepare_criterion());
+    const std::string finish_label = std::string(label) + " finish_dynamic";
+    failures += verify_reduction(finish_label.c_str(),
+                                 from_device_bf16(device_finish.data(), finish_dyn.size()),
+                                 finish_dyn, prepare_criterion());
+    failures += device_hidden.verify_guards("grouped_dynamic_conv NVFP4 hidden");
+    failures += device_prepared.verify_guards("grouped_dynamic_conv NVFP4 prepared");
+    failures += device_weight.verify_preserved("grouped_dynamic_conv NVFP4 projection");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -224,6 +292,9 @@ int main() {
     failures += run_finish_case("grouped_dynamic_conv_finish T=4 B=2", 4, 2, 103u);
     failures += run_prepare_case("grouped_dynamic_conv_prepare T=8", 8, 1, 201u);
     failures += run_prepare_case("grouped_dynamic_conv_prepare T=1", 1, 1, 202u);
+    failures += run_nvfp4_prepare_case("grouped_dynamic_conv NVFP4 prepare T=1", 1);
+    failures += run_nvfp4_prepare_case("grouped_dynamic_conv NVFP4 prepare T=5", 5);
+    failures += run_nvfp4_prepare_case("grouped_dynamic_conv NVFP4 prepare T=8", 8);
     std::cout << (failures ? "FAIL" : "OK") << " grouped_dynamic_conv\n";
     return failures ? 1 : 0;
 }

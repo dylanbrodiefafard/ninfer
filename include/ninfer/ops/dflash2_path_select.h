@@ -18,6 +18,9 @@ inline constexpr std::int32_t kDflash2PathSelectShortlistRows  = 131072;
 inline constexpr std::int32_t kDflash2PathSelectMaxBatch       = 8;
 inline constexpr std::int32_t kDflash2PathSelectMaxWidthWhenBatched = 16;
 inline constexpr int kDflash2PathSelectRngPurpose              = 16;
+inline constexpr std::int32_t kDflash2TreeFrontier             = 2;
+inline constexpr std::int32_t kDflash2TreeExpandWidth          = 16;
+inline constexpr std::int32_t kDflash2VerifyWidth              = 12;
 
 /**
  * Op: dflash2_path_select
@@ -36,18 +39,19 @@ inline constexpr int kDflash2PathSelectRngPurpose              = 16;
  *     score[t,b,c] = unary[c]
  *       + sum_{r=0}^{255} (pred_code[r, prev[t-1,b]] * h[r,t,b]) * succ_code[r, candidates[c]].
  *
- *   If temperature <= 0, path[t,b] is the candidate token with the greatest score; equal scores
- *   select the lower token id. If temperature > 0, the 16 scores are softmax-normalized after
- *   dividing by temperature and one candidate is drawn by inverse-CDF using the counter-based
- *   uniform
+ *   temperatures and seeds are host arrays of length B. If temperatures[b] <= 0, path[t,b] is
+ *   the candidate token with the greatest score; equal scores select the lower token id. If
+ *   temperatures[b] > 0, the 16 scores are softmax-normalized after dividing by
+ *   temperatures[b] and one candidate is drawn by inverse-CDF using the counter-based uniform
  *
- *     u = splitmix64(seed, t, b, purpose=16) in [0,1).
+ *     u = splitmix64(seeds[b], t, b, purpose=16) in [0,1).
  *
  *   Then prev[t,b] = path[t,b]. Candidate order does not affect the selected token.
  *
  * Logical shapes:
  *   logits is contiguous BF16 [V,T] or [V,T,B] with V>=16. hidden is contiguous BF16 [5120,T] or
- *   [5120,T,B]. pred_code and succ_code are contiguous BF16 [256, codebook_rows] (rank fastest).
+ *   [5120,T,B]. pred_code and succ_code are contiguous BF16 [256, codebook_rows] (rank fastest)
+ *   when the NVFP4 codebook weights are null.
  *   When logit_token_ids is null, codebook_rows >= V (identity: logit row is the token id).
  *   When logit_token_ids is non-null it is contiguous I32 [V] mapping each logit row to a token
  *   id; codebook_rows >= 248320 and is not required to be >= V. Product uses codebook_rows=248320
@@ -57,13 +61,17 @@ inline constexpr int kDflash2PathSelectRngPurpose              = 16;
  *
  * Supported domain:
  *   hidden_projection is BF16_CTRL Contiguous [256,5120], or a Linear-registered Q4G64_F16S /
- *   W8G32_F16S RowSplit problem of that logical shape. The Q4/W8 route calls ops::linear.
+ *   W8G32_F16S RowSplit / NVFP4 BlockScale problem of that logical shape. The Q4/W8/NVFP4 route
+ *   calls ops::linear.
+ *
+ *   pred_code and succ_code are contiguous BF16 [256, codebook_rows] (rank fastest), or NVFP4
+ *   BlockScale weights of logical shape [codebook_rows, 256] passed as pred_nvfp4/succ_nvfp4.
  *
  * Numeric:
  *   Top-k and greedy path ids are exact functions of the represented BF16 logits/scores. The
  *   score formula is evaluated by the oracle in FP64 from represented inputs and the logical FP32
- *   dequantized W_h. Stochastic draws are a function of (seed, t, b, purpose); the Op does not
- *   promise a particular host RNG bitstream as a public numeric output.
+ *   dequantized W_h. Stochastic draws are a function of (seeds[b], t, b, purpose); the Op does
+ *   not promise a particular host RNG bitstream as a public numeric output.
  *
  * Effects:
  *   Writes all of path. Inputs are unchanged. path must not alias logits, hidden, codebooks,
@@ -71,7 +79,7 @@ inline constexpr int kDflash2PathSelectRngPurpose              = 16;
  *
  * Workspace:
  *   Caller-owned transient storage sized by dflash2_path_select_workspace_capacity_bytes() holds
- *   the [256,T*B] hidden projection and any Linear child scratch.
+ *   the [256,T*B] hidden projection, per-column top-16 scratch, and any Linear child scratch.
  */
 [[nodiscard]] std::size_t dflash2_path_select_workspace_capacity_bytes(QType qtype,
                                                                        std::int32_t min_tokens,
@@ -80,8 +88,34 @@ inline constexpr int kDflash2PathSelectRngPurpose              = 16;
 
 void dflash2_path_select(const Tensor& logits, const Tensor& hidden,
                          const Weight& hidden_projection, const Tensor& pred_code,
-                         const Tensor& succ_code, const Tensor& anchors, float temperature,
-                         unsigned long long seed, Tensor& path, WorkspaceArena& workspace,
-                         cudaStream_t stream, const Tensor* logit_token_ids = nullptr);
+                         const Tensor& succ_code, const Tensor& anchors,
+                         const float* temperatures, const unsigned long long* seeds, Tensor& path,
+                         WorkspaceArena& workspace, cudaStream_t stream,
+                         const Tensor* logit_token_ids = nullptr,
+                         const Weight* pred_nvfp4 = nullptr, const Weight* succ_nvfp4 = nullptr);
+
+/**
+ * Op: dflash2_tree_select
+ *
+ * Builds a packed parent-conditioned draft tree from the same DFlash2 shortlist scores as
+ * dflash2_path_select, without sampling. Ranking is always greedy on the Markov score. Block
+ * size T is logits.ne[1]. The selector expands a kDflash2TreeFrontier-wide beam up to
+ * kDflash2TreeExpandWidth nodes, then keeps the BFS prefix of W nodes where W is
+ * verify_ids.ne[0] (complete early depths, one truncated last depth). Column 0 is the
+ * anchor. Unused columns copy the last live node and are excluded by valid_columns.
+ * Product k=7 uses kDflash2VerifyWidth=12; k=4/5 tree A/B uses W=6.
+ *
+ * cache_positions[j,b] = frontiers[b] + j. rope_positions[j,b] = frontiers[b] + depth[j].
+ * ancestor_mask[j,b] bit i is set iff packed column i is an ancestor of j, including j.
+ * parent_index[0,b] = -1; every other valid column has parent in [0, j).
+ */
+void dflash2_tree_select(const Tensor& logits, const Tensor& hidden,
+                         const Weight& hidden_projection, const Tensor& pred_code,
+                         const Tensor& succ_code, const Tensor& anchors, const Tensor& frontiers,
+                         Tensor& verify_ids, Tensor& parent_index, Tensor& cache_positions,
+                         Tensor& rope_positions, Tensor& ancestor_mask, Tensor& valid_columns,
+                         WorkspaceArena& workspace, cudaStream_t stream,
+                         const Tensor* logit_token_ids = nullptr,
+                         const Weight* pred_nvfp4 = nullptr, const Weight* succ_nvfp4 = nullptr);
 
 } // namespace ninfer::ops

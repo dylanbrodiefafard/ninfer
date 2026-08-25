@@ -38,7 +38,7 @@ struct ServeOptions {
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;
-    KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
+    KvCacheStorage kv_cache                = KvCacheStorage::Nvfp4;
     bool sage_attn                         = false; // Sage3-style FP4-PV (requires Nvfp4 KV)
     SpeculativeOptions speculative;
     bool enable_vision      = false;

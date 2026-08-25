@@ -65,4 +65,29 @@ __global__ void scatter_bf16_batch_kernel(const uint4* __restrict__ source,
     }
 }
 
+__global__ void gather_bf16_path_kernel(uint4* __restrict__ features,
+                                        const std::int32_t* __restrict__ lanes,
+                                        const std::int32_t* __restrict__ path,
+                                        const std::int32_t* __restrict__ counts,
+                                        std::int32_t vectors_per_column, std::int32_t width) {
+    const std::int32_t batch = static_cast<std::int32_t>(blockIdx.x);
+    const std::int32_t count = counts[batch];
+    const std::int32_t lane  = lanes[batch];
+    const std::int32_t* row  = path + static_cast<std::int64_t>(batch) * width;
+    for (std::int32_t i = 0; i < count; ++i) {
+        const std::int32_t src = row[i];
+        if (src != i) {
+            const std::int64_t src_base =
+                (static_cast<std::int64_t>(lane) * width + src) * vectors_per_column;
+            const std::int64_t dst_base =
+                (static_cast<std::int64_t>(lane) * width + i) * vectors_per_column;
+            for (std::int32_t vector = static_cast<std::int32_t>(threadIdx.x);
+                 vector < vectors_per_column; vector += static_cast<std::int32_t>(blockDim.x)) {
+                features[dst_base + vector] = features[src_base + vector];
+            }
+        }
+        __syncthreads();
+    }
+}
+
 } // namespace ninfer::ops

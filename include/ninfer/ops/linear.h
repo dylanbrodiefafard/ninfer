@@ -60,7 +60,9 @@ enum class LinearPolicy : std::uint8_t {
  * Each format owns a finite registry of exact physical weight problems and selects its kernel
  * internally; a valid encoding and alignment do not imply arbitrary N/K support. The current
  * NVFP4 problems `[N,K]` in `{[14336,5120], [16384,5120], [34816,5120],
- * [5120,6144], [5120,17408]}` accept every positive T. Text and MTP packed-weight problems accept
+ * [5120,6144], [5120,17408], [5120,25600], [6144,5120], [5120,4096],
+ * [1280,5120], [256,5120]}` accept every positive T. The five DFlash2-only
+ * geometries are A16-only; AllowA4 still resolves them to A16. Text and MTP packed-weight problems accept
  * every positive column extent T. Registered W8 problems `[5120,25600]`, `[5120,4096]`,
  * `[1280,5120]`, and `[256,5120]`, and registered Q4 problems `[5120,25600]`, `[5120,4096]`,
  * `[5120,17408]`, `[1280,5120]`, and `[256,5120]`, also accept every positive T. Registered Vision

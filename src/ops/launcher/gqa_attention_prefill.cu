@@ -8,9 +8,12 @@
 #include "ops/kernel/gqa_attention_prefill_i8.cuh"
 #include "ops/kernel/gqa_attention_prefill_nvfp4.cuh"
 #include "ops/kernel/gqa_attention_prefill_nvfp4s3.cuh"
+#include "ops/kernel/gqa_kv_compact.cuh"
 #include "core/device.h" // CUDA_CHECK
 
 #include <chrono>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cstdint>
 #include <cstdio> // NINFER_S3_TMA_TRACE, NINFER_S3_TMA_WATCH
 #include <cstdlib> // NINFER_S3_TMA, NINFER_TMA_STAGES
@@ -503,6 +506,37 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
     } else {
         launch.template operator()<true>();
     }
+}
+
+void gqa_kv_compact_path_launch(PagedKVBatchLayerView cache, const Tensor& kv_table_rows,
+                                const Tensor& prefix_lengths, const Tensor& path,
+                                const Tensor& counts, cudaStream_t stream) {
+    const std::int32_t batch         = counts.ne[0];
+    const std::int32_t logical_pages = cache.block_tables.ne[0];
+    const std::int32_t width         = path.ne[0];
+    const auto launch = [&]<typename Geometry, typename Code, bool HasScale>() {
+        gqa_kv_compact_path_kernel<Geometry, Code, HasScale><<<batch, 256, 0, stream>>>(
+            static_cast<Code*>(cache.k_pages.data), static_cast<Code*>(cache.v_pages.data),
+            HasScale ? static_cast<__half*>(cache.k_scale_pages.data) : nullptr,
+            HasScale ? static_cast<__half*>(cache.v_scale_pages.data) : nullptr,
+            static_cast<const std::int32_t*>(cache.block_tables.data),
+            static_cast<const std::int32_t*>(kv_table_rows.data),
+            static_cast<const std::int32_t*>(prefix_lengths.data),
+            static_cast<const std::int32_t*>(path.data),
+            static_cast<const std::int32_t*>(counts.data), logical_pages, width);
+    };
+    if (cache.num_kv_heads == Gqa27Geometry::KVHeads) {
+        if (cache.dtype == DType::I8) {
+            launch.template operator()<Gqa27Geometry, std::int8_t, true>();
+        } else {
+            launch.template operator()<Gqa27Geometry, __nv_bfloat16, false>();
+        }
+    } else if (cache.dtype == DType::I8) {
+        launch.template operator()<Gqa35Geometry, std::int8_t, true>();
+    } else {
+        launch.template operator()<Gqa35Geometry, __nv_bfloat16, false>();
+    }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace ninfer::ops::detail

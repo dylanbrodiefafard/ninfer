@@ -279,6 +279,28 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
     }
 }
 
+void validate_tree_verify(const Tensor& ancestor_mask, const Tensor& prefix_lengths,
+                          std::int32_t width, std::int32_t batch, const char* op) {
+    const bool tree   = ancestor_mask.data != nullptr;
+    const bool prefix = prefix_lengths.data != nullptr;
+    if (tree != prefix) {
+        throw std::invalid_argument(std::string(op) +
+                                    ": ancestor_mask and prefix_lengths must both be empty or both "
+                                    "be populated");
+    }
+    if (!tree) { return; }
+    if (width > kMaximumVerifyTokens) {
+        throw std::invalid_argument(std::string(op) + ": tree verify requires W<=16");
+    }
+    if (ancestor_mask.dtype != DType::I32 || prefix_lengths.dtype != DType::I32) {
+        throw std::invalid_argument(std::string(op) + ": tree verify metadata must be I32");
+    }
+    require_shape(ancestor_mask, width, batch, 1, 1, op, "ancestor mask");
+    require_shape(prefix_lengths, batch, 1, 1, 1, op, "prefix lengths");
+    require_contiguous_nonnull(ancestor_mask, op, "ancestor mask");
+    require_contiguous_nonnull(prefix_lengths, op, "prefix lengths");
+}
+
 struct SmallTWorkspace {
     Tensor acc;
     Tensor m;
@@ -317,7 +339,8 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
                             const Tensor& positions, const Tensor& valid_columns,
                             const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
                             GqaExecutionEnvelope envelope, WorkspaceArena& workspace, Tensor& out,
-                            cudaStream_t stream) {
+                            cudaStream_t stream, const Tensor& ancestor_mask,
+                            const Tensor& prefix_lengths) {
     for (std::int32_t begin = 0; begin < q.ne[2]; begin += kSmallTChunkTokens) {
         const std::int32_t count = std::min(kSmallTChunkTokens, q.ne[2] - begin);
         auto chunk_scope         = workspace.scope();
@@ -327,7 +350,7 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
             allocate_small_t_workspace(workspace, q.ne[1], count, splits, q.ne[3]);
         detail::gqa_attention_small_t_launch(q, k, v, positions, valid_columns, table_rows, scale,
                                              cache, envelope, begin, count, partial.acc, partial.m,
-                                             partial.l, out, stream);
+                                             partial.l, out, stream, ancestor_mask, prefix_lengths);
     }
 }
 
@@ -350,7 +373,11 @@ namespace detail {
 
 GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t width,
                                               std::int32_t batch_size,
-                                              GqaExecutionEnvelope envelope) {
+                                              GqaExecutionEnvelope envelope, bool tree_verify) {
+    if (tree_verify) {
+        if (width >= 1 && width <= kSmallTChunkTokens) { return GqaAttentionRoute::SmallT; }
+        return GqaAttentionRoute::ChunkedSmallT;
+    }
     if (width >= 1 && width <= kSmallTChunkTokens) { return GqaAttentionRoute::SmallT; }
     if (batch_size > 1) { return GqaAttentionRoute::ChunkedSmallT; }
     const std::uint32_t prompt_visible_keys =
@@ -377,13 +404,15 @@ const char* gqa_attention_route_name(GqaAttentionRoute route) {
 } // namespace detail
 
 std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
-                                                    GqaExecutionEnvelope envelope,
-                                                    std::int32_t batch_size, std::int32_t min_width,
-                                                    std::int32_t max_width, float keep_frac) {
+                                                   GqaExecutionEnvelope envelope,
+                                                   std::int32_t batch_size, std::int32_t min_width,
+                                                   std::int32_t max_width, float keep_frac,
+                                                   bool tree_verify) {
     (void)kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
     if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8 && cache_dtype != DType::U8) || batch_size <= 0 ||
         batch_size > kMaximumBatchSize || min_width <= 0 || max_width < min_width ||
-        (batch_size > 1 && max_width > kMaximumVerifyTokens) || envelope.min_visible_keys == 0 ||
+        (batch_size > 1 && max_width > kMaximumVerifyTokens) ||
+        (tree_verify && max_width > kMaximumVerifyTokens) || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
         envelope.max_visible_keys > kGqaAttentionMaximumVisibleKeys ||
         envelope.max_visible_keys < static_cast<std::uint32_t>(max_width)) {
@@ -412,7 +441,7 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
     };
     const auto exact_capacity = [&](std::int32_t width) {
         const detail::GqaAttentionRoute route =
-            detail::gqa_attention_resolve_route(q_heads, width, batch_size, envelope);
+            detail::gqa_attention_resolve_route(q_heads, width, batch_size, envelope, tree_verify);
         if (route == detail::GqaAttentionRoute::Prompt) { return std::size_t{0}; }
         if (route == detail::GqaAttentionRoute::SmallT) { return chunk_capacity(width); }
         std::size_t maximum = 0;
@@ -435,9 +464,9 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
 
 void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
                    const Tensor& valid_columns, const Tensor& kv_table_rows, float scale,
-                    PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
-                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
-                    float keep_frac) {
+                   PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
+                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream, float keep_frac,
+                   const Tensor& ancestor_mask, const Tensor& prefix_lengths) {
     constexpr const char* op = "gqa_attention";
     validate_batched_attention_tensors(q, positions, valid_columns, kv_table_rows, out, cache,
                                        envelope, scale, op);
@@ -451,13 +480,15 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     require_shape(v, kHeadDim, kv_heads, width, batch, op, "v");
     require_contiguous_nonnull(k, op, "k");
     require_contiguous_nonnull(v, op, "v");
+    validate_tree_verify(ancestor_mask, prefix_lengths, width, batch, op);
+    const bool tree_verify = ancestor_mask.data != nullptr;
 
     auto scope = workspace.scope();
     const detail::GqaAttentionRoute route =
-        detail::gqa_attention_resolve_route(q.ne[1], width, batch, envelope);
+        detail::gqa_attention_resolve_route(q.ne[1], width, batch, envelope, tree_verify);
     if (route == detail::GqaAttentionRoute::ChunkedSmallT) {
         launch_chunked_small_t(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
-                               envelope, workspace, out, stream);
+                               envelope, workspace, out, stream, ancestor_mask, prefix_lengths);
         return;
     }
     if (route == detail::GqaAttentionRoute::SmallT) {
@@ -480,7 +511,8 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
         }
         detail::gqa_attention_small_t_launch(q, k, v, positions, valid_columns, kv_table_rows,
                                              scale, cache, envelope, 0, width, partial.acc,
-                                             partial.m, partial.l, out, stream, keep_frac, keep);
+                                             partial.m, partial.l, out, stream, ancestor_mask,
+                                             prefix_lengths, keep_frac, keep);
         return;
     }
     detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
@@ -511,6 +543,28 @@ void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
         throw std::invalid_argument("gqa_kv_append: T exceeds KV cache capacity");
     }
     detail::gqa_kv_append_launch(k, v, positions, cache, stream);
+}
+
+void gqa_kv_compact_path(PagedKVBatchLayerView cache, const Tensor& kv_table_rows,
+                         const Tensor& prefix_lengths, const Tensor& path, const Tensor& counts,
+                         cudaStream_t stream) {
+    constexpr const char* op = "gqa_kv_compact_path";
+    const std::int32_t batch = counts.ne[0];
+    const std::int32_t width = path.ne[0];
+    if (batch <= 0 || width <= 0 || path.ne[1] != batch) {
+        throw std::invalid_argument("gqa_kv_compact_path: path must be I32 [W,B]");
+    }
+    if (kv_table_rows.dtype != DType::I32 || prefix_lengths.dtype != DType::I32 ||
+        path.dtype != DType::I32 || counts.dtype != DType::I32 || kv_table_rows.ne[0] != batch ||
+        prefix_lengths.ne[0] != batch) {
+        throw std::invalid_argument("gqa_kv_compact_path: selector vectors must be I32 [B]");
+    }
+    validate_batch_cache(cache, cache.num_kv_heads, op);
+    require_contiguous_nonnull(kv_table_rows, op, "kv table rows");
+    require_contiguous_nonnull(prefix_lengths, op, "prefix lengths");
+    require_contiguous_nonnull(path, op, "path");
+    require_contiguous_nonnull(counts, op, "counts");
+    detail::gqa_kv_compact_path_launch(cache, kv_table_rows, prefix_lengths, path, counts, stream);
 }
 
 void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,

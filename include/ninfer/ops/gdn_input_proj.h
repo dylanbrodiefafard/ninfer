@@ -193,6 +193,11 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
  * state-pool view, and initial_state_slots contains absolute slots in [0,S). Source state is not
  * modified. Only the valid prefix of conv_record is semantically defined.
  *
+ * `parent_index` is null or empty for sequential packed time. When non-null it is the same I32
+ * [T,B] (or [T] when B=1) parent tensor used by gated_delta_net_replay_record: token 0 loads the
+ * checkpoint history, every other valid token j loads the width-three history saved after its
+ * parent, and the kernel saves the post-convolution history for j so siblings can share a parent.
+ *
  * The two-parent form registers Q4 q/k [4096,5120] and the Q5 value/z parent [12288,5120]. All
  * tensor operands, outputs, conv_record, source state, and live workspace must be disjoint.
  */
@@ -201,7 +206,8 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                                 const Tensor& conv_states, const Tensor& valid_columns,
                                 const Tensor& initial_state_slots, Tensor& conv_record,
                                 Tensor& query, Tensor& key, Tensor& value, Tensor& z,
-                                WorkspaceArena& workspace, cudaStream_t stream);
+                                WorkspaceArena& workspace, cudaStream_t stream,
+                                const Tensor* parent_index = nullptr);
 
 /**
  * Single-parent record-producing form. Registered parents are W8G32_F16S [12288,2048] and NVFP4
@@ -212,13 +218,14 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
                                 const Tensor& valid_columns, const Tensor& initial_state_slots,
                                 Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                 Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
-                                cudaStream_t stream);
+                                cudaStream_t stream, const Tensor* parent_index = nullptr);
 
 /** Applies the A16-only single-parent record-producing form. */
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,
                                 const Tensor& conv_weight, const Tensor& conv_states,
                                 const Tensor& valid_columns, const Tensor& initial_state_slots,
                                 Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
-                                Tensor& z, WorkspaceArena& workspace, cudaStream_t stream);
+                                Tensor& z, WorkspaceArena& workspace, cudaStream_t stream,
+                                const Tensor* parent_index = nullptr);
 
 } // namespace ninfer::ops

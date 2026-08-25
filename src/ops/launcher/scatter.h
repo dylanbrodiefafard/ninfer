@@ -10,4 +10,6 @@ void scatter_launch(const Tensor& src, const Tensor& indices, Tensor& dst, cudaS
 void scatter_bf16_batch_launch(const Tensor& source, const Tensor& lanes,
                                const Tensor& valid_columns, Tensor& destination,
                                cudaStream_t stream);
+void gather_bf16_path_launch(Tensor& features, const Tensor& lanes, const Tensor& path,
+                             const Tensor& counts, cudaStream_t stream);
 } // namespace ninfer::ops::detail

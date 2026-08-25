@@ -24,7 +24,7 @@ struct Options {
     std::uint32_t prefill_chunk  = 4096;
     int device                   = 0;
 
-    KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
+    KvCacheStorage kv_cache = KvCacheStorage::Nvfp4;
     bool sage_attn = false;
     SpeculativeOptions speculative;
     bool enable_vision  = false;

@@ -49,8 +49,8 @@ inline constexpr std::int32_t kGroupedDynamicConvMaxWidthWhenBatched = 16;
  *
  * Supported domain:
  *   Activations and base_kernel are BF16. kernel_projection is BF16_CTRL Contiguous [1280,D], or
- *   a Linear-registered Q4G64_F16S / W8G32_F16S RowSplit problem of the same logical shape. The
- *   Q4/W8 route calls ops::linear; it is valid only for Linear-registered [1280,5120] problems.
+ *   a Linear-registered Q4G64_F16S / W8G32_F16S RowSplit / NVFP4 BlockScale problem of the same
+ *   logical shape. The Q4/W8/NVFP4 route calls ops::linear.
  *
  * Numeric:
  *   The oracle evaluates the complete formula in FP64 from the represented BF16 activations and

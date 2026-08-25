@@ -87,7 +87,7 @@ std::int32_t gqa_small_t_launch_capacity(GqaExecutionEnvelope envelope, std::int
 }
 
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
-          typename CacheInput>
+          bool TreeMasked, typename CacheInput>
 void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
                             PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
                             std::int32_t logical_capacity, std::int32_t splits, Tensor& partial_acc,
@@ -98,24 +98,33 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
     Tensor& cache_v = cache.v_pages;
     // bf16 kernel uses only static smem (no dynamic staging).
     gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, TokenTile, WarpsPerCta, MultiBatch,
-                                                 Masked, CacheInput><<<grid, kBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(q.data), input,
-        static_cast<const std::int32_t*>(pos.data), static_cast<__nv_bfloat16*>(cache_k.data),
-        static_cast<__nv_bfloat16*>(cache_v.data),
-        static_cast<const std::int32_t*>(cache.block_tables.data),
-        invocation.valid_columns == nullptr
-            ? nullptr
-            : static_cast<const std::int32_t*>(invocation.valid_columns->data),
-        invocation.table_rows == nullptr
-            ? nullptr
-            : static_cast<const std::int32_t*>(invocation.table_rows->data),
-        cache.block_tables.ne[0], invocation.width, invocation.full_width, invocation.column_begin,
-        logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
-        static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+                                                 Masked, TreeMasked, CacheInput>
+        <<<grid, kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data), input,
+            static_cast<const std::int32_t*>(pos.data), static_cast<__nv_bfloat16*>(cache_k.data),
+            static_cast<__nv_bfloat16*>(cache_v.data),
+            static_cast<const std::int32_t*>(cache.block_tables.data),
+            invocation.valid_columns == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+            invocation.ancestor_mask == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.ancestor_mask->data),
+            invocation.prefix_lengths == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.prefix_lengths->data),
+            invocation.table_rows == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.table_rows->data),
+            cache.block_tables.ne[0], invocation.width, invocation.full_width,
+            invocation.column_begin, logical_capacity, scale,
+            static_cast<__nv_bfloat16*>(partial_acc.data), static_cast<float*>(partial_m.data),
+            static_cast<float*>(partial_l.data));
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
+template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, bool TreeMasked,
+          typename CacheInput>
 void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
                           PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
                           std::int32_t logical_capacity, std::int32_t implementation_window,
@@ -133,12 +142,13 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
             static const cudaError_t attr = cudaFuncSetAttribute(
                 gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
                                                      MinBlocksPerSm, KeyBlock, DynamicArena,
-                                                     MultiBatch, Masked, CacheInput>,
+                                                     MultiBatch, Masked, TreeMasked, CacheInput>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
             CUDA_CHECK(attr);
         }
         gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm,
-                                             KeyBlock, DynamicArena, MultiBatch, Masked, CacheInput>
+                                             KeyBlock, DynamicArena, MultiBatch, Masked, TreeMasked,
+                                             CacheInput>
             <<<grid, WarpsPerCta * 32, kDynamicBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data), input,
                 static_cast<const std::int32_t*>(pos.data), static_cast<std::int8_t*>(cache_k.data),
@@ -148,6 +158,12 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                 invocation.valid_columns == nullptr
                     ? nullptr
                     : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+                invocation.ancestor_mask == nullptr
+                    ? nullptr
+                    : static_cast<const std::int32_t*>(invocation.ancestor_mask->data),
+                invocation.prefix_lengths == nullptr
+                    ? nullptr
+                    : static_cast<const std::int32_t*>(invocation.prefix_lengths->data),
                 invocation.table_rows == nullptr
                     ? nullptr
                     : static_cast<const std::int32_t*>(invocation.table_rows->data),
@@ -541,9 +557,9 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     // geometry inside launch_tc_partial_i8.
 #define NINFER_GQA_SMALL_T_DISPATCH(TOKENS, WARPS)                                                 \
     do {                                                                                           \
-        const auto launch_profile = [&]<bool MultiBatch, bool Masked>() {                          \
+        const auto launch_profile = [&]<bool MultiBatch, bool Masked, bool TreeMasked>() {         \
             if (cache.dtype == DType::I8) {                                                        \
-                launch_tc_partial_i8<Geometry, (TOKENS), MultiBatch, Masked>(                      \
+                launch_tc_partial_i8<Geometry, (TOKENS), MultiBatch, Masked, TreeMasked>(          \
                     q, input, pos, scale, cache, invocation, logical_capacity,                     \
                     implementation_window, splits, partial_acc, partial_m, partial_l, stream);     \
             } else if (cache.dtype == DType::U8) {                                                 \
@@ -558,22 +574,31 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                         implementation_window, splits, partial_acc, partial_m, partial_l, stream);   \
                 }                                                                                     \
             } else {                                                                               \
-                launch_tc_partial_bf16<Geometry, (TOKENS), (WARPS), MultiBatch, Masked>(           \
+                launch_tc_partial_bf16<Geometry, (TOKENS), (WARPS), MultiBatch, Masked,            \
+                                       TreeMasked>(                                                \
                     q, input, pos, scale, cache, invocation, logical_capacity, splits,             \
                     partial_acc, partial_m, partial_l, stream);                                    \
             }                                                                                      \
         };                                                                                         \
         const bool masked = invocation.valid_columns != nullptr;                                   \
-        if (invocation.batch_size == 1) {                                                          \
-            if (masked) {                                                                          \
-                launch_profile.template operator()<false, true>();                                 \
+        const bool tree   = invocation.ancestor_mask != nullptr;                                   \
+        const auto launch_batch = [&]<bool TreeMasked>() {                                         \
+            if (invocation.batch_size == 1) {                                                      \
+                if (masked) {                                                                      \
+                    launch_profile.template operator()<false, true, TreeMasked>();                 \
+                } else {                                                                           \
+                    launch_profile.template operator()<false, false, TreeMasked>();                \
+                }                                                                                  \
+            } else if (masked) {                                                                   \
+                launch_profile.template operator()<true, true, TreeMasked>();                      \
             } else {                                                                               \
-                launch_profile.template operator()<false, false>();                                \
+                launch_profile.template operator()<true, false, TreeMasked>();                     \
             }                                                                                      \
-        } else if (masked) {                                                                       \
-            launch_profile.template operator()<true, true>();                                      \
+        };                                                                                         \
+        if (tree) {                                                                                \
+            launch_batch.template operator()<true>();                                              \
         } else {                                                                                   \
-            launch_profile.template operator()<true, false>();                                     \
+            launch_batch.template operator()<false>();                                             \
         }                                                                                          \
     } while (0)
 
@@ -680,22 +705,25 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
 }
 
 void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor& v,
-                                   const Tensor& pos, const Tensor& valid_columns,
-                                   const Tensor& table_rows, float scale,
-                                   PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
-                                   std::int32_t column_begin, std::int32_t width,
-                                   Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
-                                   Tensor& out, cudaStream_t stream, float keep_frac,
-                                   const GqaSmallTKeepScratch& keep) {
+                                  const Tensor& pos, const Tensor& valid_columns,
+                                  const Tensor& table_rows, float scale,
+                                  PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
+                                  std::int32_t column_begin, std::int32_t width,
+                                  Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
+                                  Tensor& out, cudaStream_t stream, const Tensor& ancestor_mask,
+                                  const Tensor& prefix_lengths, float keep_frac,
+                                  const GqaSmallTKeepScratch& keep) {
     const GqaAppendInput input{static_cast<const __nv_bfloat16*>(k.data),
                                static_cast<const __nv_bfloat16*>(v.data)};
     const GqaSmallTInvocation invocation{
-        .valid_columns = valid_columns.data == nullptr ? nullptr : &valid_columns,
-        .table_rows    = &table_rows,
-        .full_width    = q.ne[2],
-        .column_begin  = column_begin,
-        .width         = width,
-        .batch_size    = q.ne[3],
+        .valid_columns  = valid_columns.data == nullptr ? nullptr : &valid_columns,
+        .table_rows     = &table_rows,
+        .ancestor_mask  = ancestor_mask.data == nullptr ? nullptr : &ancestor_mask,
+        .prefix_lengths = prefix_lengths.data == nullptr ? nullptr : &prefix_lengths,
+        .full_width     = q.ne[2],
+        .column_begin   = column_begin,
+        .width          = width,
+        .batch_size     = q.ne[3],
     };
     if (q.ne[1] == Gqa27Geometry::QHeads) {
         gqa_attention_small_t_launch_for<Gqa27Geometry>(q, input, pos, scale, cache, invocation,

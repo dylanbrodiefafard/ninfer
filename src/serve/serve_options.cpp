@@ -88,6 +88,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-request-mib N] [--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|nvfp4] [--sage] [--spec mtp|dflash --draft-tokens N] "
+           "[--dflash-verify-width N] "
            "[--default-max-tokens N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--system-prepend TEXT] "
@@ -218,6 +219,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
+        } else if (arg == "--dflash-verify-width") {
+            options.speculative.dflash_verify_width = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--dflash-verify-width"),
+                                      "dflash-verify-width"));
         } else if (arg == "--default-max-tokens") {
             options.default_max_tokens =
                 parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");

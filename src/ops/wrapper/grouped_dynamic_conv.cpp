@@ -75,7 +75,7 @@ void require_disjoint(const Tensor& a, const Tensor& b, const char* message) {
 }
 
 bool is_quantized_projection(QType qtype) {
-    return qtype == QType::Q4G64_F16S || qtype == QType::W8G32_F16S;
+    return qtype == QType::Q4G64_F16S || qtype == QType::W8G32_F16S || qtype == QType::NVFP4;
 }
 
 void require_projection_weight(const Weight& weight) {
@@ -91,9 +91,11 @@ void require_projection_weight(const Weight& weight) {
         }
         return;
     }
-    if (!is_quantized_projection(weight.qtype) || weight.layout != QuantLayout::RowSplit) {
+    if (!is_quantized_projection(weight.qtype) ||
+        (weight.qtype != QType::NVFP4 && weight.layout != QuantLayout::RowSplit) ||
+        (weight.qtype == QType::NVFP4 && weight.layout != QuantLayout::BlockScaleK16M128x4)) {
         throw std::invalid_argument(
-            "grouped_dynamic_conv: kernel_projection must be BF16_CTRL or Q4/W8 row-split");
+            "grouped_dynamic_conv: kernel_projection must be BF16_CTRL, Q4/W8 row-split, or NVFP4");
     }
 }
 

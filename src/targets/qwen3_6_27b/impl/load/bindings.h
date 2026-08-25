@@ -121,6 +121,9 @@ struct DFlash2Plan {
     WeightPlan hidden_projection;
     artifact::ObjectHandle predecessor_codebook;
     artifact::ObjectHandle successor_codebook;
+    WeightPlan predecessor_codebook_nvfp4;
+    WeightPlan successor_codebook_nvfp4;
+    bool codebook_nvfp4 = false;
 };
 
 struct BindingPlan {

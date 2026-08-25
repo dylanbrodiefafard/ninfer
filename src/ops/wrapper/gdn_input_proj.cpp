@@ -137,6 +137,23 @@ void require_record_operands(const Tensor& conv_weight, const Tensor& conv_state
     }
 }
 
+bool parent_index_active(const Tensor* parent_index) {
+    return parent_index != nullptr && parent_index->data != nullptr;
+}
+
+void require_record_parent_index(const Tensor* parent_index, ConvGeometry geometry) {
+    if (!parent_index_active(parent_index)) { return; }
+    const Tensor& tensor           = *parent_index;
+    const bool batched             = tensor.ne[0] == geometry.width && tensor.ne[1] == geometry.batch &&
+                         tensor.ne[2] == 1 && tensor.ne[3] == 1;
+    const bool dense_single = geometry.batch == 1 && tensor.ne[0] == geometry.width &&
+                              tensor.ne[1] == 1 && tensor.ne[2] == 1 && tensor.ne[3] == 1;
+    if (tensor.dtype != DType::I32 || !tensor.is_contiguous() || !aligned_to(tensor.data, 4) ||
+        (!batched && !dense_single)) {
+        throw std::invalid_argument("gdn_input_proj_conv_record: invalid parent_index");
+    }
+}
+
 bool overlaps_range(const Tensor& tensor, const void* base, std::size_t bytes) {
     if (tensor.data == nullptr || base == nullptr || bytes == 0) { return false; }
     const auto tensor_begin = reinterpret_cast<std::uintptr_t>(tensor.data);
@@ -148,14 +165,17 @@ void require_record_nonoverlap(const Tensor& x, const Tensor& conv_weight,
                                const Tensor& conv_states, const Tensor& valid_columns,
                                const Tensor& initial_state_slots, const Tensor& conv_record,
                                const Tensor& query, const Tensor& key, const Tensor& value,
-                               const Tensor& z, const WorkspaceArena& workspace) {
-    const std::array<const Tensor*, 10> tensors{
+                               const Tensor& z, const WorkspaceArena& workspace,
+                               const Tensor* parent_index = nullptr) {
+    const std::array<const Tensor*, 11> tensors{
         &x,           &conv_weight, &conv_states, &valid_columns, &initial_state_slots,
-        &conv_record, &query,       &key,         &value,         &z};
+        &conv_record, &query,       &key,         &value,         &z,
+        parent_index_active(parent_index) ? parent_index : nullptr};
     for (std::size_t lhs = 0; lhs < tensors.size(); ++lhs) {
-        if (tensors[lhs]->data == nullptr) { continue; }
+        if (tensors[lhs] == nullptr || tensors[lhs]->data == nullptr) { continue; }
         for (std::size_t rhs = lhs + 1; rhs < tensors.size(); ++rhs) {
-            if (tensors[rhs]->data != nullptr && overlaps(*tensors[lhs], *tensors[rhs])) {
+            if (tensors[rhs] != nullptr && tensors[rhs]->data != nullptr &&
+                overlaps(*tensors[lhs], *tensors[rhs])) {
                 throw std::invalid_argument(
                     "gdn_input_proj_conv_record: tensor operands must not overlap");
             }
@@ -324,14 +344,15 @@ void compose_record(const Tensor& x, const Tensor& conv_weight, const Tensor& co
                     const Tensor& valid_columns, const Tensor& initial_state_slots,
                     Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                     ConvGeometry geometry, WorkspaceArena& workspace, cudaStream_t stream,
-                    Project&& project) {
+                    Project&& project, const Tensor* parent_index = nullptr) {
     auto scope         = workspace.scope();
     Tensor x_flat      = flatten_columns(x, x.ne[0], geometry);
     Tensor record_flat = flatten_columns(conv_record, conv_record.ne[0], geometry);
     Tensor z_flat      = flatten_columns(z, z.ne[0], geometry);
     project(x_flat, record_flat, z_flat);
     detail::gdn_projected_conv_record_launch(conv_record, conv_weight, conv_states, valid_columns,
-                                             initial_state_slots, query, key, value, stream);
+                                             initial_state_slots, query, key, value, stream,
+                                             parent_index);
 }
 
 void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
@@ -445,7 +466,7 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
                                    const Tensor& initial_state_slots, Tensor& conv_record,
                                    Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                    LinearPolicy policy, WorkspaceArena& workspace,
-                                   cudaStream_t stream) {
+                                   cudaStream_t stream, const Tensor* parent_index) {
     validate_policy(policy);
 
     if (weight.qtype == QType::NVFP4) {
@@ -478,17 +499,21 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
         require_conv_tensor(z, kZRows, geometry.width, geometry.batch, "gdn_input_proj_conv_record",
                             "z");
         require_record_nonoverlap(x, conv_weight, conv_states, valid_columns, initial_state_slots,
-                                  conv_record, query, key, value, z, workspace);
+                                  conv_record, query, key, value, z, workspace, parent_index);
+        require_record_parent_index(parent_index, geometry);
 
+        const bool tree = parent_index_active(parent_index);
         const detail::Nvfp4GdnConvPlan plan =
             detail::nvfp4_gdn_conv_resolve_plan(policy, geometry.width, geometry.batch);
-        if (plan.schedule == detail::Nvfp4GdnConvScheduleId::Materialized && geometry.batch > 1) {
+        if (tree ||
+            (plan.schedule == detail::Nvfp4GdnConvScheduleId::Materialized && geometry.batch > 1)) {
             compose_record(x, conv_weight, conv_states, valid_columns, initial_state_slots,
                            conv_record, query, key, value, z, geometry, workspace, stream,
                            [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
                                gdn_input_proj(x_flat, weight, record_flat, z_flat, policy,
                                               workspace, stream);
-                           });
+                           },
+                           parent_index);
             return;
         }
         if (plan.schedule == detail::Nvfp4GdnConvScheduleId::SmallTFusedA16) {
@@ -529,14 +554,16 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
     require_conv_tensor(z, kZRows, geometry.width, geometry.batch, "gdn_input_proj_conv_record",
                         "z");
     require_record_nonoverlap(x, conv_weight, conv_states, valid_columns, initial_state_slots,
-                              conv_record, query, key, value, z, workspace);
+                              conv_record, query, key, value, z, workspace, parent_index);
+    require_record_parent_index(parent_index, geometry);
 
-    if (geometry.batch > 1) {
+    if (parent_index_active(parent_index) || geometry.batch > 1) {
         compose_record(x, conv_weight, conv_states, valid_columns, initial_state_slots, conv_record,
                        query, key, value, z, geometry, workspace, stream,
                        [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
                            gdn_input_proj(x_flat, weight, record_flat, z_flat, stream);
-                       });
+                       },
+                       parent_index);
         return;
     }
     const detail::W8GdnInputConvPlan plan = resolve_w8_conv_plan(geometry.width, geometry.batch);
@@ -778,7 +805,8 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                                 const Tensor& conv_states, const Tensor& valid_columns,
                                 const Tensor& initial_state_slots, Tensor& conv_record,
                                 Tensor& query, Tensor& key, Tensor& value, Tensor& z,
-                                WorkspaceArena& workspace, cudaStream_t stream) {
+                                WorkspaceArena& workspace, cudaStream_t stream,
+                                const Tensor* parent_index) {
     constexpr std::int32_t kHidden     = 5120;
     constexpr std::int32_t kQueryRows  = 2048;
     constexpr std::int32_t kKeyRows    = 2048;
@@ -802,11 +830,13 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
     require_conv_tensor(z, kZRows, geometry.width, geometry.batch, "gdn_input_proj_conv_record",
                         "z");
     require_record_nonoverlap(x, conv_weight, conv_states, valid_columns, initial_state_slots,
-                              conv_record, query, key, value, z, workspace);
+                              conv_record, query, key, value, z, workspace, parent_index);
+    require_record_parent_index(parent_index, geometry);
 
+    const bool tree                         = parent_index_active(parent_index);
     const detail::Q4Q5GdnInputConvPlan plan =
         resolve_q4_q5_conv_plan(geometry.width, geometry.batch);
-    if (plan.schedule == detail::Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused) {
+    if (!tree && plan.schedule == detail::Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused) {
         detail::q4_q5_gdn_input_conv_record_launch(x, qk_weight, value_z_weight, conv_weight,
                                                    conv_states, valid_columns, initial_state_slots,
                                                    conv_record, query, key, value, z, stream);
@@ -817,7 +847,8 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                    [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
                        gdn_input_proj(x_flat, qk_weight, value_z_weight, record_flat, z_flat,
                                       stream);
-                   });
+                   },
+                   parent_index);
 }
 
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value_z_weight,
@@ -847,20 +878,21 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
                                 const Tensor& valid_columns, const Tensor& initial_state_slots,
                                 Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                 Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
-                                cudaStream_t stream) {
+                                cudaStream_t stream, const Tensor* parent_index) {
     dispatch_single_parent_record(x, query_key_value_z_weight, conv_weight, conv_states,
                                   valid_columns, initial_state_slots, conv_record, query, key,
-                                  value, z, policy, workspace, stream);
+                                  value, z, policy, workspace, stream, parent_index);
 }
 
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,
                                 const Tensor& conv_weight, const Tensor& conv_states,
                                 const Tensor& valid_columns, const Tensor& initial_state_slots,
                                 Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
-                                Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
+                                Tensor& z, WorkspaceArena& workspace, cudaStream_t stream,
+                                const Tensor* parent_index) {
     dispatch_single_parent_record(x, query_key_value_z_weight, conv_weight, conv_states,
                                   valid_columns, initial_state_slots, conv_record, query, key,
-                                  value, z, LinearPolicy::A16Only, workspace, stream);
+                                  value, z, LinearPolicy::A16Only, workspace, stream, parent_index);
 }
 
 } // namespace ninfer::ops

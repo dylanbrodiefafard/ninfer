@@ -57,6 +57,26 @@ void scatter_bf16_batch(const Tensor& source, const Tensor& lanes, const Tensor&
     detail::scatter_bf16_batch_launch(source, lanes, valid_columns, destination, stream);
 }
 
+void gather_bf16_path(Tensor& features, const Tensor& lanes, const Tensor& path,
+                      const Tensor& counts, cudaStream_t stream) {
+    const std::int32_t width = path.ne[0];
+    const std::int32_t batch = path.ne[1];
+    if (features.dtype != DType::BF16 || lanes.dtype != DType::I32 || path.dtype != DType::I32 ||
+        counts.dtype != DType::I32 || features.ne[0] <= 0 || (features.ne[0] % 8) != 0 ||
+        width <= 0 || batch <= 0 || features.ne[1] != width || features.ne[2] <= 0 ||
+        features.ne[3] != 1 || lanes.ne[0] != batch || counts.ne[0] != batch || path.ne[2] != 1 ||
+        path.ne[3] != 1) {
+        throw std::invalid_argument("gather_bf16_path: invalid [D,W,C] / [W,B] geometry");
+    }
+    if (!features.is_contiguous() || !lanes.is_contiguous() || !path.is_contiguous() ||
+        !counts.is_contiguous() || features.data == nullptr || lanes.data == nullptr ||
+        path.data == nullptr || counts.data == nullptr ||
+        (reinterpret_cast<std::uintptr_t>(features.data) & 15U) != 0U) {
+        throw std::invalid_argument("gather_bf16_path: tensors must be contiguous and aligned");
+    }
+    detail::gather_bf16_path_launch(features, lanes, path, counts, stream);
+}
+
 void extract_bf16_columns(const Tensor& source, std::int32_t source_column, Tensor& destination,
                           cudaStream_t stream) {
     if (source.dtype != DType::BF16 || destination.dtype != DType::BF16) {
