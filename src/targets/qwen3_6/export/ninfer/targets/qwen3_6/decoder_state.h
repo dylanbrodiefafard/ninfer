@@ -23,6 +23,8 @@ struct DecoderStateSpec {
     DType kv_dtype                          = DType::BF16;
     std::int32_t kv_quant_group             = 0;
     bool sage_attn                           = false;
+    // Allocate the k_mean page-stats plane on NVFP4 caches (independent of sage_pv).
+    float keep_frac                          = 1.0f;
     bool enable_mtp                         = false;
     std::int32_t kv_table_rows              = 1;
     std::uint32_t text_physical_page_groups = 0;
@@ -39,6 +41,7 @@ struct PagedKVCacheLayout {
     DType dtype               = DType::BF16;
     std::int32_t quant_group  = 0;
     bool sage_pv              = false;
+    bool k_mean               = false;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept { return pool.payload_bytes(); }
 };
@@ -95,6 +98,7 @@ private:
     DType dtype_               = DType::BF16;
     std::int32_t quant_group_  = 0;
     bool sage_pv_             = false;
+    bool k_mean_              = false;
 };
 
 struct DecoderStateLayout {

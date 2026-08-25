@@ -283,6 +283,9 @@ public:
     const DType kv_dtype;
     const std::int32_t kv_quant_group;
     const ProposalHead proposal_head;
+    const float keep_frac;
+    const float xattn_tau;
+    const std::int32_t xattn_min_len;
     const bool vision_enabled;
     const bool use_cuda_graph;
     const std::size_t kv_payload_bytes;

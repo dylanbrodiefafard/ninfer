@@ -42,12 +42,12 @@ Add an op to `registry.py` (test/bench targets + argv lists). Currently:
 ## Sage (nvfp4s3) quality mode — bug vs floor vs tile-skip
 
 The SageAttention3 route has three loss hypotheses for any PPL regression:
-the intrinsic **FP4 P-quant floor** (always on), **tile-skip** (`keep_frac<1`),
+the intrinsic **FP4 P-quant floor** (always on)
 and a **kernel bug**. `--sage` separates them with the conformance test's own
 oracles (`GQA_SAGE_ONLY=1` + `GQA_SAGE_FLOOR=1`), parsed per case:
 
 ```
-python3 -m tools.kdev gqa_attention --sage [--fast] [--keep-frac 0.2] [--bench]
+python3 -m tools.kdev gqa_attention --sage [--fast] [--bench]
 ```
 
 Per case it reports:
@@ -62,9 +62,8 @@ Readings (2026-08-22, git@24c2368): prefill multi-tile A1 cases run at
 0.071-0.082 (>=1x floor). Single-tile A1 cases (keys<=64) are `no-signal`
 (the step64 emulation is bit-identical to the closed form there, so its
 residual is the expected independent-rounding distance, not a bug candidate).
-`--keep-frac X` allocates the sage `k_mean` proxy plane in the test (without
-it the kernel silently falls back to the exact path) and runs the bench with
-`NINFER_KEEP_FRAC=X`; tile-skip loss reads as device_vs_exact - floor.
+`--keep-frac` is the exact-NVFP4 Sparge skip (`ninfer-ppl --kv-dtype nvfp4 --keep-frac`);
+it is not a Sage3 lever and cannot be combined with `--sage`.
 
 Stage-localization of a deviation: `S3_ORC_DUMP=1` (the test's env, not a
 kdev flag yet) per-block-dumps the prefill kernel's P-quant stages (score,

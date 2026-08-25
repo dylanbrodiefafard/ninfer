@@ -25,8 +25,9 @@ struct PagedKVLayerView {
     Tensor v_pages;
     Tensor k_scale_pages;
     Tensor v_scale_pages;
-    // Sage-style per-page (64-key tile) dequantized K sum for the meansim proxy
-    // [4][64][kv_heads][pages]; sum[d] = (page_offset=d/4)*4 + d%4. sage_pv only.
+    // Per-page (64-key tile) dequantized K mean for the Sparge meansim proxy
+    // [4][64][kv_heads][pages]; sum[d] = (page_offset=d/4)*4 + d%4. Present when
+    // sage_pv or keep_frac<1 on NVFP4; unused by XAttention.
     Tensor k_mean_pages;
     Tensor block_table;
     std::int32_t head_dim     = 0;

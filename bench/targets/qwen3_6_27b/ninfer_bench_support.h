@@ -65,6 +65,8 @@ struct BenchOptions {
     std::uint32_t prefill_chunk    = kDefaultPrefillChunk;
     KvCacheStorage kv_cache        = KvCacheStorage::Nvfp4;
     bool sage_attn                 = false;
+    float keep_frac                = 1.0f;
+    float xattn_tau                = 1.0f;
     std::uint32_t concurrency      = 1;
     std::uint32_t mtp_draft_tokens = 0;
     ProposalHead proposal_head     = ProposalHead::Full;
@@ -111,6 +113,8 @@ struct BenchEnvironment {
     std::uint32_t prefill_chunk                    = kDefaultPrefillChunk;
     KvCacheStorage kv_cache                        = KvCacheStorage::Nvfp4;
     bool sage_attn                                 = false;
+    float keep_frac                                = 1.0f;
+    float xattn_tau                                = 1.0f;
     std::uint32_t concurrency                      = 1;
     std::uint32_t mtp_draft_tokens                 = 0;
     ProposalHead proposal_head                     = ProposalHead::Full;

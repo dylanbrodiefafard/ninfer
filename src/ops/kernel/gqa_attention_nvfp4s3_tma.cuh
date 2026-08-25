@@ -7,13 +7,14 @@
 // migrated to TMA.)
 
 #include "ops/kernel/gqa_attention_kv_nvfp4.cuh"
+#include "ops/kernel/gqa_attention_nvfp4s3_common.cuh"
 #include "ops/kernel/gqa_attention_prefill_common.cuh"
-#include "ops/kernel/gqa_attention_prefill_nvfp4s3.cuh"
 #include "ninfer/ops/gqa_attention.h"
 
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <math_constants.h>
 
 #include <cstdint>
 #include <cstring>

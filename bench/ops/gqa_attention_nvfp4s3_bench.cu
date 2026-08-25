@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 
@@ -103,16 +104,8 @@ int main() {
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
-    // keep_frac: fraction of key tiles kept, in (0, 1]. 1.0 = keep all (exact);
-    // keep_frac<1 enables sage_pv tile-skip (needs the k_mean plane).
-    float keep_frac = 1.0f;
-    if (const char* e = std::getenv("NINFER_KEEP_FRAC")) keep_frac = std::strtof(e, nullptr);
-    if (!(keep_frac > 0.0f && keep_frac <= 1.0f)) {
-        std::fprintf(stderr, "NINFER_KEEP_FRAC must be in (0, 1]; got %.3f; using 1.0 (keep all)\n",
-                    keep_frac);
-        keep_frac = 1.0f;
-    }
-    std::printf("keep_frac=%.3f\n", keep_frac);
+    // S3 is exact-only; tile-skip lives on the exact-NVFP4 sparse kernel.
+    constexpr float keep_frac = 1.0f;
 
     std::printf("ninfer gqa-attention nvfp4s3 bench (geom=27B q=%d kv=%d hdim=%d code=%d groups=%d window=%d)\n",
                  kQHeads, kKVHeads, kHeadDim, kCodeW, kGroups, kQueryWin);
@@ -121,8 +114,21 @@ int main() {
                  "attn p95(us)", "attn GB/s", "attn TF/s");
     std::printf("------------------------------------------------------------------------------\n");
 
-    const std::vector<int> contexts = {128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
-                                       65536, 98304, 153600};
+    const std::vector<int> all_contexts = {128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
+                                           65536, 98304, 153600};
+    std::vector<int> contexts = all_contexts;
+    if (const char* e = std::getenv("NINFER_BENCH_MAX_CTX")) {
+        const int cap = std::atoi(e);
+        contexts.erase(std::remove_if(contexts.begin(), contexts.end(),
+                                      [cap](int c) { return c > cap; }),
+                       contexts.end());
+    }
+    if (const char* e = std::getenv("NINFER_BENCH_MIN_CTX")) {
+        const int floor = std::atoi(e);
+        contexts.erase(std::remove_if(contexts.begin(), contexts.end(),
+                                      [floor](int c) { return c < floor; }),
+                       contexts.end());
+    }
     for (int context : contexts) {
         Nvfp4s3Cache cache = make_cache(context);
 

@@ -169,6 +169,12 @@ public:
         proposal_head_n_   = count;
     }
 
+    void set_prefill_skip(float keep_frac, float xattn_tau, std::int32_t xattn_min_len) noexcept {
+        keep_frac_       = keep_frac;
+        xattn_tau_       = xattn_tau;
+        xattn_min_len_   = xattn_min_len;
+    }
+
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
 
     void set_prefill_rewrite_checkpoint_frontier(std::int64_t position) noexcept {
@@ -316,8 +322,11 @@ private:
     std::int64_t prefill_rewrite_checkpoint_frontier_     = -1;
     Tensor* rewrite_checkpoint_hidden_output_             = nullptr;
     std::uint32_t mtp_proposal_extent_                    = 0;
-    // A1 keep_frac from NINFER_KEEP_FRAC ((0, 1]; 1.0 = exact); text-model attention only.
+    // Prefill tile-skip: keep_frac (Sparge) and xattn_tau (XAttention). Decode/SmallT
+    // ignore these (forced dense). Defaults are exact attention.
     float keep_frac_                                       = 1.0f;
+    float xattn_tau_                                       = 1.0f;
+    std::int32_t xattn_min_len_                            = 8192;
 
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;

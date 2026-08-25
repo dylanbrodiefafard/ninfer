@@ -17,6 +17,8 @@ struct GqaExecutionEnvelope {
     std::uint32_t max_visible_keys = 0;
 };
 
+struct GqaS3PrefillDump;
+
 /**
  * Shared numerical contract for A1/A2/A3.
  *
@@ -61,10 +63,11 @@ struct GqaExecutionEnvelope {
  * Returns the transient arena capacity required for every W in the inclusive interval at one
  * exact logical batch size. Head geometry, cache dtype, and execution envelope are the fixed
  * implementation profile. Invalid profiles or intervals throw; a legal B=1 prompt route may
- * return zero. keep_frac < 1.0 (the sparge-decode tile-skip, W=1 sage-cached steps) adds the
- * rank keep-set scratch to the SmallT stage; the default 1.0 is exact (zero added).
- * tree_verify=true reserves decode small-T / chunked-small-T scratch for packed-tree A1,
- * including B=1 W=7..16 where ordinary causal A1 would use the Prompt route.
+ * return zero. Prefill tile-skip does not add workspace (keep lists live in kernel smem).
+ * keep_frac < 1.0 on a sage U8 cache still sizes the sparge-decode tile-skip scratch for W=1
+ * cached SmallT; the default 1.0 is exact (zero added). tree_verify=true reserves decode
+ * small-T / chunked-small-T scratch for packed-tree A1, including B=1 W=7..16 where ordinary
+ * causal A1 would use the Prompt route.
  */
 [[nodiscard]] std::size_t
 gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
@@ -77,7 +80,7 @@ gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
  * Vb=W when valid_columns is empty and Vb=valid_columns[b] otherwise. For row b, query head h,
  * kvh=floor(h/group), 0<=j<Vb, p=positions[j,b], and that row's populated cache history [0,p]:
  *
- *   score[x]      = scale * dot(q[:,h,j,b], K_cache[b][:,x,kvh]), 0 <= x <= p
+ *   score[x]      = scale * dot(q[:,h,j,b], K_cache[b][:,x,kvh]),  0 <= x <= p
  *   probability   = softmax_x(score)
  *   ideal[:,h,j,b] = sum_x probability[x] * V_cache[b][:,x,kvh].
  *
@@ -102,6 +105,12 @@ gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
  * suballocations are pairwise non-overlapping. The Op overwrites every addressed cache row but
  * owns no persistent frontier, allocation, request identity, or commit authority.
  *
+ * Prefill tile-skip on exact NVFP4 (Prompt route, T>6): keep_frac in (0,1] is Sparge meansim
+ * (1.0 = dense). xattn_tau in (0,1] is XAttention mass threshold (1.0 = dense). The two are
+ * mutually exclusive when both are < 1. Both require NVFP4 without sage_pv. SmallT/cached
+ * routes ignore skip flags. dump is a test side-band (keep_list / tile_count); production
+ * passes nullptr.
+ *
  * Packed-tree verify is off when ancestor_mask and prefix_lengths are empty. When both are
  * populated, A1 still writes K/V at positions[j,b] but query j attends key x iff x <=
  * positions[j,b] and either x < prefix_lengths[b] or packed = x - prefix_lengths[b] is in [0, W)
@@ -111,16 +120,15 @@ gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
  * rather than E + depth; RoPE remains the caller's pre-Op responsibility. Tree verify uses the
  * decode small-T route at W=1..16 (chunked for W>6), including B=1; it is not a Prompt-kernel
  * path. gqa_attention_workspace_capacity_bytes(..., tree_verify=true) reserves that decode
- * scratch. Ordinary MTP/causal calls omit both tensors and keep the existing signature.
+ * scratch. Ordinary MTP/causal calls omit both tensors.
  */
 void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
                    const Tensor& valid_columns, const Tensor& kv_table_rows, float scale,
                    PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
-                   // keep_frac: fraction of key tiles kept, in (0, 1]. 1.0 = keep all (exact);
-                   // keep_frac<1 enables sage_pv tile-skip (needs the k_mean plane); <=0 invalid.
-                   float keep_frac = 1.0f, const Tensor& ancestor_mask = {},
-                   const Tensor& prefix_lengths = {});
+                   float keep_frac = 1.0f, float xattn_tau = 1.0f,
+                   std::int32_t xattn_min_len = 8192, GqaS3PrefillDump* dump = nullptr,
+                   const Tensor& ancestor_mask = {}, const Tensor& prefix_lengths = {});
 
 /**
  * A2: perform only the cache-write part of A1. k/v are contiguous BF16 `[256,4|2,T]`, positions is

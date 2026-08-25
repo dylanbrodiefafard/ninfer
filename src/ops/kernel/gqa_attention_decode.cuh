@@ -164,6 +164,7 @@ __device__ __forceinline__ void gqa_small_t_tc_row_to_qt(int row, int tokens, in
     q_head            = kv_head * Geometry::GroupSize + local_q;
 }
 
+#ifndef NINFER_GQA_DECODE_SKIP_REDUCE_KERNEL
 template <typename Geometry, int DChunk, bool Int8, bool MultiBatch, bool Masked, bool Offset>
 __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kernel(
     const __nv_bfloat16* partial_acc, const float* partial_m, const float* partial_l,
@@ -341,5 +342,6 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
         out[gqa_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(value);
     }
 }
+#endif // NINFER_GQA_DECODE_SKIP_REDUCE_KERNEL
 
 } // namespace ninfer::ops

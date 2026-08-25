@@ -273,6 +273,8 @@ std::string usage_text(std::string_view program) {
         << " (default: " << kDefaultPrefillChunk << ")\n"
          << "  --kv-dtype <bf16|int8|nvfp4> KV cache storage (default: nvfp4)\n"
          << "  --sage                    Sage3-style FP4-PV attention; requires --kv-dtype nvfp4\n"
+         << "  --keep-frac <f>           Sparge keep fraction (0,1] on exact NVFP4; forbids --sage\n"
+         << "  --xattn-tau <f>           XAttention mass threshold (0,1] on exact NVFP4\n"
         << "  --concurrency <1..8>        concurrent Engine lanes (default: 1);\n"
         << "                              pp+tg at C>1 reports batched decode after a sequential\n"
         << "                              prefix-reuse seed so prefill/decode do not interleave\n"
@@ -330,6 +332,10 @@ BenchOptions parse_args(int argc, char** argv) {
             options.kv_cache = parse_kv_cache(value("--kv-dtype"));
         } else if (arg == "--sage") {
             options.sage_attn = true;
+        } else if (arg == "--keep-frac") {
+            options.keep_frac = parse_unit_interval_flag(value("--keep-frac").c_str(), "--keep-frac");
+        } else if (arg == "--xattn-tau") {
+            options.xattn_tau = parse_unit_interval_flag(value("--xattn-tau").c_str(), "--xattn-tau");
         } else if (arg == "--concurrency") {
             options.concurrency = parse_u32(value("--concurrency"), "concurrency");
             if (options.concurrency > kMaximumConcurrency) {
@@ -373,6 +379,8 @@ BenchOptions parse_args(int argc, char** argv) {
     if (options.sage_attn && options.kv_cache != KvCacheStorage::Nvfp4) {
         throw std::invalid_argument("--sage requires --kv-dtype nvfp4");
     }
+    validate_sparse_attn_flags(options.kv_cache, options.sage_attn, options.keep_frac,
+                               options.xattn_tau);
     if (options.proposal_head == ProposalHead::Optimized && options.mtp_draft_tokens == 0) {
         throw std::invalid_argument(
             "--lm-head-draft requires --mtp-draft-tokens greater than zero");
@@ -706,6 +714,8 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"prefill_chunk\": " << env.prefill_chunk << ",\n"
          << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
          << "    \"sage_attn\": " << (env.sage_attn ? "true" : "false") << ",\n"
+         << "    \"keep_frac\": " << env.keep_frac << ",\n"
+         << "    \"xattn_tau\": " << env.xattn_tau << ",\n"
          << "    \"concurrency\": " << env.concurrency << ",\n"
         << "    \"mtp_draft_tokens\": " << env.mtp_draft_tokens << ",\n"
         << "    \"proposal_head\": \"" << proposal_head_name(env.proposal_head) << "\",\n"

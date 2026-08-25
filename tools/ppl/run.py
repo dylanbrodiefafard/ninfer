@@ -33,6 +33,8 @@ SHORT_SKIP = 1
 REPO = Path(__file__).resolve().parents[2]
 SCHEDULES = ("prefill", "decode")
 TERRIBLE_NLL = 10.0
+DEFAULT_DRAFT_TOKENS = 3
+MTP_EXTRA_DRAFT_TOKENS = 4
 
 
 def default_ppl_bin() -> Path:
@@ -133,6 +135,40 @@ def paired_nll_stats(prefill: list[float], decode: list[float]) -> dict | None:
     }
 
 
+def nll_std_se(nlls: list[float]) -> dict | None:
+    """Per-token NLL spread: sample std and its SE (std/sqrt(n))."""
+    n = len(nlls)
+    if n < 2:
+        return None
+    mean = sum(nlls) / n
+    var = sum((x - mean) ** 2 for x in nlls) / (n - 1)
+    std = math.sqrt(var)
+    return {"nll_std": std, "nll_se": std / math.sqrt(n), "nll_tokens": n}
+
+
+def paired_delta_se(cell_nlls: list[float], base_nlls: list[float]) -> float | None:
+    """SE of the per-token paired delta (cell_i - base_i) vs the group baseline.
+
+    Both cells score the same positions of the same corpus, so index-aligned
+    per-token deltas are the paired estimator: their mean equals
+    cell.mean_nll - baseline.mean_nll exactly, and std/sqrt(n) is the delta's
+    1-sigma. Much tighter than the independent-mean SEs of the two cells.
+    """
+    n = min(len(cell_nlls), len(base_nlls))
+    if n < 2:
+        return None
+    deltas = [cell_nlls[i] - base_nlls[i] for i in range(n)]
+    mean = sum(deltas) / n
+    var = sum((x - mean) ** 2 for x in deltas) / (n - 1)
+    return math.sqrt(var) / math.sqrt(n)
+
+
+def attach_nll_stats(cell: dict, nlls: list[float]) -> None:
+    stats = nll_std_se(nlls)
+    if stats:
+        cell.update(stats)
+
+
 def run_cell(
     ppl_bin: Path,
     weights: Path,
@@ -194,7 +230,9 @@ def cell_ok(cell: dict) -> bool:
     )
 
 
-def apply_baseline(cell: dict, baseline_nll: float | None, gates: dict[str, float], name: str) -> tuple[float | None, bool]:
+def apply_baseline(cell: dict, cell_nlls: list[float], baseline_nll: float | None,
+                   gates: dict[str, float], name: str,
+                   base_nlls: list[float] | None) -> tuple[float | None, bool]:
     failed = False
     if name == BASELINE and baseline_nll is None:
         baseline_nll = cell["mean_nll"]
@@ -206,6 +244,12 @@ def apply_baseline(cell: dict, baseline_nll: float | None, gates: dict[str, floa
     if baseline_nll is None:
         raise SystemExit("baseline scheme did not produce mean_nll")
     cell["delta_mean_nll"] = cell["mean_nll"] - baseline_nll
+    if base_nlls:
+        delta_se = paired_delta_se(cell_nlls, base_nlls)
+        cell["delta_nll_se"] = delta_se
+        cell["in_noise"] = (
+            delta_se is not None and abs(cell["delta_mean_nll"]) <= 2.0 * delta_se
+        )
     if name in gates:
         cell["gate"] = gates[name]
         cell["pass"] = cell_ok(cell) and cell["delta_mean_nll"] <= gates[name]
@@ -226,13 +270,20 @@ def write_markdown(path: Path, payload: dict) -> None:
         f"- cuda graphs: on unless a cell sets cuda_graph=false",
         f"- terrible token: nll >= {TERRIBLE_NLL}",
         f"- baseline: `{payload['baseline']}` per (length, schedule, spec)",
+        f"- decode spec: {payload.get('spec', '-')} (draft {payload.get('draft_tokens', '-')}) "
+        f"unless a cell sets spec=none; prefill lane is spec-free",
         "",
-        "| length | schedule | scheme | spec | graph | skip | scored | mean_nll | max_nll | terrible | ppl | Δ mean_nll | gate |",
-        "|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|",
+        "| length | schedule | scheme | spec | graph | skip | scored | mean_nll | max_nll | terrible | ppl | Δ mean_nll | Δ 1σ | σ nll | noise | gate |",
+        "|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|",
     ]
     for cell in payload["cells"]:
         delta = cell.get("delta_mean_nll")
         delta_text = "-" if delta is None else f"{delta:.6f}"
+        delta_se = cell.get("delta_nll_se")
+        se_text = "-" if delta_se is None else f"{delta_se:.6f}"
+        nll_std = cell.get("nll_std")
+        std_text = "-" if nll_std is None else f"{nll_std:.3f}"
+        noise_text = "yes" if cell.get("in_noise") else ""
         gate = cell.get("gate")
         if gate is None:
             gate_text = "report"
@@ -243,7 +294,8 @@ def write_markdown(path: Path, payload: dict) -> None:
             f"| {cell.get('prompt_tokens', '')} | {cell.get('schedule', '')} | `{cell['scheme']}` | "
             f"{cell.get('spec', 'none')} | {graph} | {cell.get('skip_tokens', '')} | "
             f"{cell['tokens_scored']} | {cell['mean_nll']:.6f} | {cell.get('max_nll', 0):.4f} | "
-            f"{cell.get('terrible_tokens', 0)} | {cell['ppl']:.4f} | {delta_text} | {gate_text} |"
+            f"{cell.get('terrible_tokens', 0)} | {cell['ppl']:.4f} | {delta_text} | {se_text} | "
+            f"{std_text} | {noise_text} | {gate_text} |"
         )
     if payload.get("parity"):
         lines.extend(["", "## BF16 prefill vs decode |Δnll|", ""])
@@ -252,6 +304,15 @@ def write_markdown(path: Path, payload: dict) -> None:
                 f"- {row['tokens']} tokens: mean |Δ|={row['mean_abs_delta_nll']:.6f}, "
                 f"max |Δ|={row['max_abs_delta_nll']:.6f}"
             )
+    lines.extend(
+        [
+            "",
+            "_Noise columns: `σ nll` is the per-token NLL std for the cell; `Δ 1σ` is the SE of "
+            "the per-token paired Δnll vs the group's bf16 baseline (index-aligned tokens, from "
+            "the .nllf32 sidecars). `noise` marks |Δ| ≤ 2·Δ1σ — the delta is not resolved above "
+            "the per-token noise floor._",
+        ]
+    )
     lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -274,7 +335,14 @@ def main() -> int:
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--ppl-bin", type=Path, default=default_ppl_bin())
     parser.add_argument("--no-extras", action="store_true", help="skip mid-page, short-context, graphs-off, mtp")
-    parser.add_argument("--no-mtp", action="store_true", help="skip MTP decode cells")
+    parser.add_argument("--spec", default="mtp", choices=("mtp", "none"),
+                        help="speculative backend for decode-lane cells (default: mtp, "
+                             "matching production serve; prefill-lane cells are spec-free)")
+    parser.add_argument("--draft-tokens", type=int, default=DEFAULT_DRAFT_TOKENS,
+                        help=f"MTP draft tokens for decode-lane cells (default: "
+                             f"{DEFAULT_DRAFT_TOKENS})")
+    parser.add_argument("--no-mtp", action="store_true",
+                        help="run the decode lane spec-free (legacy behavior) and skip the MTP extras")
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
     if args.long:
@@ -286,6 +354,8 @@ def main() -> int:
     schemes = select_schemes(None if args.schemes is None else args.schemes.split(","))
     schedules = select_schedules(args.schedule)
     gates = parse_gates(args.gate)
+    spec = "none" if args.no_mtp else args.spec
+    draft_tokens = args.draft_tokens
     if not args.ppl_bin.is_file():
         raise SystemExit(f"ninfer-ppl not found: {args.ppl_bin} (build apps/ninfer-ppl)")
     if not args.weights.is_file():
@@ -303,18 +373,34 @@ def main() -> int:
         nonlocal failed
         for schedule in schedules:
             baseline_nll = None
+            base_nlls: list[float] = []
+            # The decode lane scores under the production MTP spec; the prefill lane is
+            # spec-free (MTP is not consulted by chunked prompt scoring).
+            spec_extra = (
+                ["--spec", "mtp", "--draft-tokens", str(draft_tokens)]
+                if spec == "mtp" and schedule == "decode" else []
+            )
             for name in schemes:
                 cell_path = out_dir / f"{tokens}.{schedule}.{name}.json"
                 cell = run_cell(
                     args.ppl_bin, args.weights, args.ids, name, schedule, args.skip,
-                    tokens, args.prefill_chunk, args.device, cell_path, [],
+                    tokens, args.prefill_chunk, args.device, cell_path, list(spec_extra),
                 )
-                baseline_nll, cell_failed = apply_baseline(cell, baseline_nll, gates, name)
+                nlls = load_nlls(cell_path)
+                attach_nll_stats(cell, nlls)
+                if name == BASELINE:
+                    base_nlls = nlls
+                baseline_nll, cell_failed = apply_baseline(
+                    cell, nlls, baseline_nll, gates, name,
+                    base_nlls if name != BASELINE else None)
                 failed = failed or cell_failed
                 cells.append(cell)
 
     def score_8k_extras() -> None:
         nonlocal failed
+        decode_extra = (
+            ["--spec", "mtp", "--draft-tokens", str(draft_tokens)] if spec == "mtp" else []
+        )
         extras = [
             ("midpage", str(MID_PAGE_SKIP), DEFAULT_TOKENS, []),
             ("short", str(SHORT_SKIP), SHORT_TOKENS, []),
@@ -324,25 +410,37 @@ def main() -> int:
             cell_path = out_dir / f"{tokens}.decode.kv-bf16.{label}.json"
             cell = run_cell(
                 args.ppl_bin, args.weights, args.ids, BASELINE, "decode", skip,
-                tokens, args.prefill_chunk, args.device, cell_path, extra,
+                tokens, args.prefill_chunk, args.device, cell_path,
+                list(decode_extra) + list(extra),
             )
+            nlls = load_nlls(cell_path)
+            attach_nll_stats(cell, nlls)
             cell["delta_mean_nll"] = None
             cell["gate"] = None
             cell["pass"] = cell_ok(cell)
             failed = failed or not cell["pass"]
             cells.append(cell)
 
-        if args.no_mtp:
+        # The draft-length probe only adds information when the main matrix does not
+        # already run this draft length (default draft 3 -> probe 4).
+        if spec != "mtp" or draft_tokens == MTP_EXTRA_DRAFT_TOKENS:
             return
         mtp_baseline = None
+        mtp_base_nlls: list[float] = []
         for name in schemes:
             cell_path = out_dir / f"{DEFAULT_TOKENS}.decode.{name}.mtp.json"
             cell = run_cell(
                 args.ppl_bin, args.weights, args.ids, name, "decode", args.skip,
                 DEFAULT_TOKENS, args.prefill_chunk, args.device, cell_path,
-                ["--spec", "mtp", "--draft-tokens", "4"],
+                ["--spec", "mtp", "--draft-tokens", str(MTP_EXTRA_DRAFT_TOKENS)],
             )
-            mtp_baseline, cell_failed = apply_baseline(cell, mtp_baseline, gates, name)
+            nlls = load_nlls(cell_path)
+            attach_nll_stats(cell, nlls)
+            if name == BASELINE:
+                mtp_base_nlls = nlls
+            mtp_baseline, cell_failed = apply_baseline(
+                cell, nlls, mtp_baseline, gates, name,
+                mtp_base_nlls if name != BASELINE else None)
             failed = failed or cell_failed
             cells.append(cell)
 
@@ -373,6 +471,8 @@ def main() -> int:
         "skip": args.skip,
         "prefill_chunk": args.prefill_chunk,
         "schedules": schedules,
+        "spec": spec,
+        "draft_tokens": draft_tokens,
         "baseline": BASELINE,
         "gates": gates,
         "terrible_nll": TERRIBLE_NLL,

@@ -10,7 +10,7 @@
 // is a one-shot setup).
 //
 // Usage: ninfer_gqa_attention_nvfp4s3_tma_bench
-// Env: NINFER_KEEP_FRAC (default 1.0 = keep all), NINFER_TMA_STAGES (default 2).
+// Env: NINFER_TMA_STAGES (default 2). S3 is exact-only; tile-skip is not on this kernel.
 
 #include "ops/launcher/gqa_attention.h"
 #include "core/device.h"
@@ -440,9 +440,7 @@ int main() {
 
     const bool debug_map = std::getenv("NINFER_TMA_DEBUG") != nullptr;
 
-    float keep_frac = 1.0f;
-    if (const char* e = std::getenv("NINFER_KEEP_FRAC")) keep_frac = std::strtof(e, nullptr);
-    if (!(keep_frac > 0.0f && keep_frac <= 1.0f)) keep_frac = 1.0f;
+    constexpr float keep_frac = 1.0f;
     int stages = 2;
     if (const char* e = std::getenv("NINFER_TMA_STAGES")) stages = std::strtol(e, nullptr, 10);
     std::printf("keep_frac=%.3f tma_stages=%d\n", keep_frac, stages);

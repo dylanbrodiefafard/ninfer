@@ -40,6 +40,8 @@ struct ServeOptions {
     int device                             = 0;
     KvCacheStorage kv_cache                = KvCacheStorage::Nvfp4;
     bool sage_attn                         = false; // Sage3-style FP4-PV (requires Nvfp4 KV)
+    float keep_frac                        = 1.0f;
+    float xattn_tau                        = 1.0f;
     SpeculativeOptions speculative;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;

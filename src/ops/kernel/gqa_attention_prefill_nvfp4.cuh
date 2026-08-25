@@ -135,6 +135,41 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_nvfp4_page_ker
     scale_v[gqa_nvfp4_scale_index<Geometry>(physical_page, kv_head, grp, page_off)] = v_sc;
 }
 
+// Per-page dequantized K mean for Sparge meansim. Indexed by physical page:
+// k_mean[d] lives at paged_kv_element_offset<4,KVHeads>(page, kv_head, d>>2, d&3).
+template <typename Geometry, typename Metadata>
+__launch_bounds__(256) __global__ void gqa_attention_prefill_kmean_nvfp4_kernel(
+    const std::uint8_t* __restrict__ cache_k, const std::uint8_t* __restrict__ scale_k,
+    Metadata metadata, const std::int32_t* __restrict__ positions, float* __restrict__ k_mean,
+    std::int32_t width) {
+    const int tokens = metadata.valid_tokens(width);
+    const int d      = static_cast<int>(threadIdx.x);
+    if (d >= kGqaPrefillHeadDim) { return; }
+    const int kv_head  = static_cast<int>(blockIdx.y);
+    const int page_l   = static_cast<int>(blockIdx.x);
+    const int base_pos = positions[0];
+    const int first_page = base_pos >> kPagedKVPageShift;
+    const int page       = first_page + page_l;
+    const int page_lo    = page << kPagedKVPageShift;
+    const int lo         = max(page_lo, base_pos);
+    const int hi         = min(page_lo + kPagedKVPageSize, base_pos + tokens);
+    if (lo >= hi) { return; }
+    const std::int32_t* block_table = metadata.block_table();
+    const int physical_page         = paged_kv_physical_page(block_table, page_lo);
+    float sum                       = 0.0f;
+    for (int pos = lo; pos < hi; ++pos) {
+        const int page_off = pos & kPagedKVPageMask;
+        const std::uint8_t packed =
+            cache_k[gqa_nvfp4_code_index<Geometry>(physical_page, kv_head, d >> 1, page_off)];
+        const float2 pair = detail::decode_nvfp4_e2m1x2(packed);
+        const float s     = detail::decode_nvfp4_e4m3(
+            scale_k[gqa_nvfp4_scale_index<Geometry>(physical_page, kv_head, d >> 4, page_off)]);
+        sum += ((d & 1) != 0 ? pair.y : pair.x) * s;
+    }
+    k_mean[paged_kv_element_offset<4, Geometry::KVHeads>(physical_page, kv_head, d >> 2, d & 3)] =
+        sum / static_cast<float>(hi - lo);
+}
+
 template <typename Geometry, typename Metadata>
 // Occupancy-1: 16 warps × 128 regs = 65536. 512-thread CTA cannot exceed 128.
 __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_kernel(

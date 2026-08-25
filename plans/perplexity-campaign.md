@@ -24,10 +24,13 @@ Default `python3 tools/ppl/run.py`:
    `kv-nvfp4`.
 2. **CUDA graphs on** (Engine production default). `ninfer-ppl` used to force
    them off; that is no longer the case.
-3. 8k extras (review): BF16 decode **mid-page skip 4128** (page size 64; default
-   half-skip 4096 is page-aligned), BF16 decode **`--skip 1`** on 257 tokens,
-   BF16 decode **graphs off** vs the graphs-on 8k cell, and **MTP T=1
-   target-verify** decode × three KV dtypes (`--spec mtp --draft-tokens 4`).
+3. The decode lane runs under **MTP T=1 target-verify** by default
+   (`--spec mtp --draft-tokens 3`, the production serve spec); `--no-mtp`
+   reverts to spec-free decode. 8k extras (review): BF16 decode **mid-page
+   skip 4128** (page size 64; default half-skip 4096 is page-aligned), BF16
+   decode **`--skip 1`** on 257 tokens, BF16 decode **graphs off** vs the
+   graphs-on 8k cell, and a **draft-4 probe** (`--spec mtp --draft-tokens 4`)
+   unless the default draft length is already 4.
 4. Sidecar `{cell}.nllf32` plus `max_nll` / `terrible_tokens` (nll ≥ 10,
    p ≤ ~4.5e-5). BF16 prefill vs decode reports mean/max `|Δnll|`.
 

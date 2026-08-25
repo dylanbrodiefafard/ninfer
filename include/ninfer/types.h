@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -83,11 +84,51 @@ struct EngineOptions {
     KvCacheStorage kv_cache            = KvCacheStorage::Nvfp4;
     // Sage3-style FP4-PV compute recipe (SageAttention3): only issuable with KvCacheStorage::Nvfp4.
     bool sage_attn                     = false;
+    // Prefill tile-skip on exact NVFP4 (not Sage3). 1.0 = dense. Mutually exclusive
+    // with xattn_tau < 1. Requires kv_cache == Nvfp4 and sage_attn == false.
+    float keep_frac = 1.0f;
+    // XAttention mass threshold τ on exact NVFP4 prefill. 1.0 = dense. Mutually
+    // exclusive with keep_frac < 1. Requires kv_cache == Nvfp4 and sage_attn == false.
+    float xattn_tau = 1.0f;
+    // Skip XAttention ranking below this cached length; short prefixes stay dense.
+    std::int32_t xattn_min_len = 8192;
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     bool use_cuda_graph = true;
     LoadProgress load_progress;
 };
+
+inline constexpr std::int32_t kDefaultXattnMinLen = 8192;
+
+inline float parse_unit_interval_flag(const char* raw, const char* flag) {
+    char* end = nullptr;
+    const float parsed = std::strtof(raw, &end);
+    if (end == raw || *end != '\0' || !(parsed > 0.0f && parsed <= 1.0f)) {
+        throw std::invalid_argument(std::string(flag) + " must be a float in (0, 1]");
+    }
+    return parsed;
+}
+
+inline void validate_sparse_attn_flags(KvCacheStorage kv_cache, bool sage_attn, float keep_frac,
+                                       float xattn_tau) {
+    if (!(keep_frac > 0.0f && keep_frac <= 1.0f)) {
+        throw std::invalid_argument("--keep-frac must be a float in (0, 1]");
+    }
+    if (!(xattn_tau > 0.0f && xattn_tau <= 1.0f)) {
+        throw std::invalid_argument("--xattn-tau must be a float in (0, 1]");
+    }
+    if (keep_frac < 1.0f && xattn_tau < 1.0f) {
+        throw std::invalid_argument("--keep-frac and --xattn-tau are mutually exclusive");
+    }
+    if (sage_attn && (keep_frac < 1.0f || xattn_tau < 1.0f)) {
+        throw std::invalid_argument(
+            "--sage is exact-S3 only; --keep-frac / --xattn-tau require --kv-dtype nvfp4 without "
+            "--sage");
+    }
+    if ((keep_frac < 1.0f || xattn_tau < 1.0f) && kv_cache != KvCacheStorage::Nvfp4) {
+        throw std::invalid_argument("--keep-frac / --xattn-tau require --kv-dtype nvfp4");
+    }
+}
 
 enum class SamplingMode : std::uint8_t {
     Thinking,

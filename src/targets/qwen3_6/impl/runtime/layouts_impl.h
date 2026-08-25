@@ -26,7 +26,8 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include <cstdlib>
+
+#include "ninfer/types.h"
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 namespace {
@@ -122,6 +123,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .kv_dtype                  = plan.kv_dtype,
                      .kv_quant_group            = plan.kv_quant_group,
                      .sage_attn                 = plan.sage_attn,
+                     .keep_frac                 = plan.keep_frac,
                      .enable_mtp                = plan.features.mtp(),
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
                      .text_physical_page_groups = physical_pages,
@@ -275,20 +277,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         scratch(layout, Variant::attention_projection_workspace_capacity_bytes(plan.weights_profile,
                                                                                phase, first, last));
         (void)workspace_recipe::text_attention_results<TextConfig>(layout, last);
-        // The sparge-decode tile-skip (NINFER_KEEP_FRAC < 1) adds a rank keep-set
-        // scratch to the W=1 sage stage; size the layout from the same env the
-        // runtime reads (one source of truth, both read at process start).
-        float layout_keep_frac = 1.0f;
-        if (const char* keep_frac_env = std::getenv("NINFER_KEEP_FRAC")) {
-            char* keep_frac_end = nullptr;
-            const float parsed = std::strtof(keep_frac_env, &keep_frac_end);
-            if (keep_frac_end != keep_frac_env && parsed > 0.0f && parsed <= 1.0f) {
-                layout_keep_frac = parsed;
-            }
-        }
         scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
                             TextConfig::query_heads, plan.kv_dtype, envelope, batch_size, min_width,
-                            max_width, layout_keep_frac, tree_verify));
+                            max_width, plan.keep_frac, tree_verify));
         scratch(layout, Variant::attention_output_projection_workspace_capacity_bytes(
                             plan.weights_profile, phase, first, last));
     };
@@ -791,6 +782,11 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
     if (device.sm() != 120) {
         throw std::invalid_argument("Qwen3.6 family runtime requires compute capability 12.0");
     }
+    if (options.xattn_min_len < 0) {
+        throw std::invalid_argument("xattn_min_len must be non-negative");
+    }
+    validate_sparse_attn_flags(options.kv_cache, options.sage_attn, options.keep_frac,
+                               options.xattn_tau);
 }
 
 std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,
@@ -820,6 +816,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->kv_dtype            = inputs.kv_dtype;
     impl->kv_quant_group      = inputs.kv_quant_group;
     impl->sage_attn           = inputs.sage_attn;
+    impl->keep_frac           = inputs.keep_frac;
+    impl->xattn_tau           = inputs.xattn_tau;
+    impl->xattn_min_len       = inputs.xattn_min_len;
     impl->kv_ram_capacity_bytes = inputs.kv_ram_capacity_bytes;
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
@@ -897,6 +896,9 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                         : options.kv_cache == KvCacheStorage::Nvfp4     ? qwen3_6::kKvNvfp4Group
                                                                         : qwen3_6::kKvQuantGroup,
         .sage_attn      = options.sage_attn,
+        .keep_frac      = options.keep_frac,
+        .xattn_tau      = options.xattn_tau,
+        .xattn_min_len  = options.xattn_min_len,
         .proposal_head  = options.speculative.proposal_head,
         .features       = qwen3_6::startup_features(options),
         .use_cuda_graph = options.use_cuda_graph,

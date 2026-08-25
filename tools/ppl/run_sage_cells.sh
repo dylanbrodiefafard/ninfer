@@ -40,12 +40,12 @@ run_cell kv-bf16-baseline kv-bf16 bf16 --schedule prefill
 run_cell kv-nvfp4 kv-nvfp4 nvfp4 --schedule prefill
 # Sage recipe, exact attention (keep_frac defaults to 1.0; no tile-skip).
 run_cell attn-sage attn-sage nvfp4 --sage --schedule prefill
-# Control: explicit --keep-frac 1.0 must match attn-sage exactly.
-run_cell attn-sage-keepfrac1.0 attn-sage nvfp4 --sage --keep-frac 1.0 --schedule prefill
-# Tile-skip: keep 50% of key tiles (approximate; NLL expected to rise vs attn-sage).
-run_cell attn-topk-keepfrac50 attn-topk nvfp4 --sage --keep-frac 0.5 --schedule prefill
-# Tile-skip: keep 20% of key tiles (more aggressive; NLL expected to rise further).
-run_cell attn-topk-keepfrac20 attn-topk nvfp4 --sage --keep-frac 0.2 --schedule prefill
+# Control: explicit --keep-frac 1.0 must match kv-nvfp4 exactly (dense).
+run_cell attn-dense-keepfrac1.0 kv-nvfp4 nvfp4 --keep-frac 1.0 --schedule prefill
+# Tile-skip on exact NVFP4 (no --sage).
+run_cell attn-topk-keepfrac50 attn-topk nvfp4 --keep-frac 0.5 --schedule prefill
+run_cell attn-topk-keepfrac20 attn-topk nvfp4 --keep-frac 0.2 --schedule prefill
+run_cell attn-xattn-tau90 attn-xattn nvfp4 --xattn-tau 0.9 --schedule prefill
 
 echo
 echo "=== DECODE lane (sparsity skipped: codec + exact-sage only)"

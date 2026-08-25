@@ -26,6 +26,8 @@ struct Options {
 
     KvCacheStorage kv_cache = KvCacheStorage::Nvfp4;
     bool sage_attn = false;
+    float keep_frac = 1.0f;
+    float xattn_tau = 1.0f;
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     bool use_cuda_graph = true;

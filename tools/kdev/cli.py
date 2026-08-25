@@ -36,7 +36,7 @@ def main(argv=None) -> int:
     parser.add_argument("--s3-dump", action="store_true",
                         help="s3 prefill op-dump: per-stage intermediate localization (score/psf/p_code/v_scale/m/l/acc)")
     parser.add_argument("--keep-frac", type=float, default=None,
-                        help="sage A/B: run the tile-skip lever (0<keep_frac<=1; bench uses NINFER_KEEP_FRAC)")
+                        help="rejected with --sage; exact-NVFP4 Sparge skip lives in ninfer-ppl --keep-frac")
     args = parser.parse_args(argv)
 
     try:
@@ -48,6 +48,9 @@ def main(argv=None) -> int:
     if args.sage:
         if not op.sage:
             print(f"op '{op.name}' has no sage mode (only gqa_attention)")
+            return 2
+        if args.keep_frac is not None:
+            print("--keep-frac is exact-NVFP4 Sparge; it cannot be combined with --sage")
             return 2
         if not _build(op, need_bench=args.bench):
             return 2

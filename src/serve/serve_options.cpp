@@ -87,7 +87,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
            "[--max-request-mib N] [--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8|nvfp4] [--sage] [--spec mtp|dflash --draft-tokens N] "
+           "[--kv-dtype bf16|int8|nvfp4] [--sage] [--keep-frac F] [--xattn-tau F] "
+           "[--spec mtp|dflash --draft-tokens N] "
            "[--dflash-verify-width N] "
            "[--default-max-tokens N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
@@ -213,6 +214,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--sage") {
             options.sage_attn = true;
+        } else if (arg == "--keep-frac") {
+            options.keep_frac = parse_unit_interval_flag(require_value("--keep-frac"), "--keep-frac");
+        } else if (arg == "--xattn-tau") {
+            options.xattn_tau = parse_unit_interval_flag(require_value("--xattn-tau"), "--xattn-tau");
         } else if (arg == "--spec") {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));
@@ -282,6 +287,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.sage_attn && options.kv_cache != KvCacheStorage::Nvfp4) {
         throw std::invalid_argument("--sage requires --kv-dtype nvfp4");
     }
+    validate_sparse_attn_flags(options.kv_cache, options.sage_attn, options.keep_frac,
+                               options.xattn_tau);
     if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");

@@ -432,7 +432,8 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
         if (keep_frac < 1.0f && cache_dtype == DType::U8 && width == 1) {
             const std::int32_t kv_rows  =
                 batch_size * kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
-            const std::int32_t max_keep = (static_cast<std::int32_t>(envelope.max_visible_keys) + 31) / 32;
+            const std::int32_t max_keep =
+                (static_cast<std::int32_t>(envelope.max_visible_keys) + 31) / 32;
             (void)layout.alloc(DType::I32, {kv_rows, max_keep});
             (void)layout.alloc(DType::I32, {kv_rows});
             (void)layout.alloc(DType::I32, {kv_rows, splits + 1});
@@ -466,8 +467,32 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
                    const Tensor& valid_columns, const Tensor& kv_table_rows, float scale,
                    PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream, float keep_frac,
+                   float xattn_tau, std::int32_t xattn_min_len, GqaS3PrefillDump* dump,
                    const Tensor& ancestor_mask, const Tensor& prefix_lengths) {
     constexpr const char* op = "gqa_attention";
+    if (!(keep_frac > 0.0f && keep_frac <= 1.0f)) {
+        throw std::invalid_argument("gqa_attention: keep_frac must be in (0, 1]");
+    }
+    if (!(xattn_tau > 0.0f && xattn_tau <= 1.0f)) {
+        throw std::invalid_argument("gqa_attention: xattn_tau must be in (0, 1]");
+    }
+    if (keep_frac < 1.0f && xattn_tau < 1.0f) {
+        throw std::invalid_argument("gqa_attention: keep_frac and xattn_tau are mutually exclusive");
+    }
+    if (cache.sage_pv && (keep_frac < 1.0f || xattn_tau < 1.0f)) {
+        throw std::invalid_argument(
+            "gqa_attention: sage_pv is exact-S3 only; keep_frac / xattn_tau require NVFP4 without "
+            "sage");
+    }
+    if ((keep_frac < 1.0f || xattn_tau < 1.0f) && cache.dtype != DType::U8) {
+        throw std::invalid_argument("gqa_attention: keep_frac / xattn_tau require NVFP4 KV");
+    }
+    if (xattn_min_len < 0) {
+        throw std::invalid_argument("gqa_attention: xattn_min_len must be non-negative");
+    }
+    if (keep_frac < 1.0f && cache.k_mean_pages.data == nullptr) {
+        throw std::invalid_argument("gqa_attention: keep_frac<1 requires the k_mean plane");
+    }
     validate_batched_attention_tensors(q, positions, valid_columns, kv_table_rows, out, cache,
                                        envelope, scale, op);
     if (k.dtype != DType::BF16 || v.dtype != DType::BF16) {
@@ -496,27 +521,16 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
             detail::gqa_attention_split_capacity(q.ne[1], width, cache.dtype, envelope);
         SmallTWorkspace partial =
             allocate_small_t_workspace(workspace, q.ne[1], width, splits, batch);
-        // Sparge-decode tile skip: the scratch exists only when the skip can
-        // actually engage (keep_frac < 1, the sage k_mean plane, a T=1 step);
-        // the launcher treats an empty scratch as exact decode.
-        detail::GqaSmallTKeepScratch keep;
-        if (keep_frac < 1.0f && cache.sage_pv && cache.k_mean_pages.data != nullptr &&
-            width == 1) {
-            const std::int32_t kv_rows = batch * kv_heads;
-            const std::int32_t max_keep = (envelope.max_visible_keys + 31) / 32;
-            keep.keep_tiles = workspace.alloc(DType::I32, {kv_rows, max_keep});
-            keep.keep_count = workspace.alloc(DType::I32, {kv_rows});
-            keep.split_off  = workspace.alloc(DType::I32, {kv_rows, splits + 1});
-            keep.max_keep   = max_keep;
-        }
+        // Decode/SmallT is always exact. Prefill skip flags on the card are ignored.
         detail::gqa_attention_small_t_launch(q, k, v, positions, valid_columns, kv_table_rows,
                                              scale, cache, envelope, 0, width, partial.acc,
                                              partial.m, partial.l, out, stream, ancestor_mask,
-                                             prefix_lengths, keep_frac, keep);
+                                             prefix_lengths, 1.0f, {});
         return;
     }
     detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                        cache, out, stream, keep_frac);
+                                        cache, out, stream, keep_frac, xattn_tau, xattn_min_len,
+                                        dump);
 }
 
 void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -588,22 +602,9 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q.ne[1], q.ne[2], cache.dtype, envelope);
         SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.ne[1], q.ne[2], splits);
-        // Sparge-decode tile skip: the scratch exists only when the skip can
-        // actually engage (keep_frac < 1, the sage k_mean plane, a T=1 step);
-        // the launcher treats an empty scratch as exact decode.
-        detail::GqaSmallTKeepScratch keep;
-        if (keep_frac < 1.0f && cache.sage_pv && cache.k_mean_pages.data != nullptr &&
-            q.ne[2] == 1) {
-            const std::int32_t kv_rows = kv_heads_for_q_heads(q.ne[1], op); // batch 1
-            const std::int32_t max_keep = (envelope.max_visible_keys + 31) / 32;
-            keep.keep_tiles = workspace.alloc(DType::I32, {kv_rows, max_keep});
-            keep.keep_count = workspace.alloc(DType::I32, {kv_rows});
-            keep.split_off  = workspace.alloc(DType::I32, {kv_rows, splits + 1});
-            keep.max_keep   = max_keep;
-        }
         detail::gqa_attention_cached_small_t_launch(q, positions, scale, cache, envelope,
                                                     partial.acc, partial.m, partial.l, out,
-                                                    stream, keep_frac, keep, rank_dump);
+                                                    stream, 1.0f, {}, rank_dump);
         return;
     }
     detail::gqa_attention_prompt_attention_launch(q, positions, scale, cache, out, stream);
@@ -639,7 +640,7 @@ void gqa_attention_s3_dump(const Tensor& q, const Tensor& k, const Tensor& v,
     }
     auto scope = workspace.scope();
     detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                       cache, out, stream, keep_frac, &dump);
+                                       cache, out, stream, keep_frac, 1.0f, 8192, &dump);
 }
 
 } // namespace ninfer::ops
