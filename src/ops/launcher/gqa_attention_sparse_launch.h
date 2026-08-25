@@ -15,6 +15,9 @@ template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_sparse_prefill_attention_launch(const Tensor& q, const Tensor& positions, float scale,
                                           const CacheView& cache, Metadata metadata, Tensor& out,
                                           cudaStream_t stream, float keep_frac, float xattn_tau,
-                                          std::int32_t xattn_min_len, GqaS3PrefillDump* dump);
+                                          std::int32_t xattn_min_len, GqaS3PrefillDump* dump,
+                                          void* xattn_scratch = nullptr,
+                                          GqaExecutionEnvelope envelope = {
+                                              1, kGqaAttentionMaximumVisibleKeys});
 
 } // namespace ninfer::ops::detail

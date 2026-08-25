@@ -213,7 +213,8 @@ int main(int argc, char** argv) {
                 dcount.copy_to_host(hcount.data(), hcount.size() * sizeof(std::int32_t));
                 const int qabs = (context - window) + std::min(window, 128) - 1;
                 keep_d         = qabs / kPageSize + 1;
-                keep_n         = hcount[0];
+                for (int h = 0; h < kQHeads; ++h) { keep_n += hcount[static_cast<std::size_t>(h)]; }
+                keep_d *= kQHeads;
             }
 
             const double bytes_moved =
@@ -226,7 +227,7 @@ int main(int argc, char** argv) {
                         fill_timing.median_us, attn.median_us, attn.p95_us,
                         bytes_moved / (attn.median_us * 1e-6) / 1e9, tflops);
             if (keep_d > 0) {
-                std::printf("  keep %d/%d (%.1f%%)", keep_n, keep_d,
+                std::printf("  keep q0 %d/%d (%.1f%%)", keep_n, keep_d,
                             100.0 * static_cast<double>(keep_n) / static_cast<double>(keep_d));
             }
             std::printf("\n");

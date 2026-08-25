@@ -63,8 +63,10 @@ struct GqaS3PrefillDump;
  * Returns the transient arena capacity required for every W in the inclusive interval at one
  * exact logical batch size. Head geometry, cache dtype, and execution envelope are the fixed
  * implementation profile. Invalid profiles or intervals throw; a legal B=1 prompt route may
- * return zero. Prefill tile-skip does not add workspace (keep lists live in kernel smem).
- * keep_frac < 1.0 on a sage U8 cache still sizes the sparge-decode tile-skip scratch for W=1
+ * return zero. Prefill Sparge keep-lists live in kernel smem. XAttention ranker
+ * scratch (packed-K / logits / mass / keep) is sized here when xattn_tau < 1 on
+ * a U8 Prompt route; it is allocated from the caller workspace. keep_frac < 1.0
+ * on a sage U8 cache still sizes the sparge-decode tile-skip scratch for W=1
  * cached SmallT; the default 1.0 is exact (zero added). tree_verify=true reserves decode
  * small-T / chunked-small-T scratch for packed-tree A1, including B=1 W=7..16 where ordinary
  * causal A1 would use the Prompt route.
@@ -73,7 +75,8 @@ struct GqaS3PrefillDump;
 gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
                                        GqaExecutionEnvelope envelope, std::int32_t batch_size,
                                        std::int32_t min_width, std::int32_t max_width,
-                                       float keep_frac = 1.0f, bool tree_verify = false);
+                                       float keep_frac = 1.0f, bool tree_verify = false,
+                                       float xattn_tau = 1.0f);
 
 /**
  * A1: append K/V for B independent sequences and compute causal grouped-query attention. Let

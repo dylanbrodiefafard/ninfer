@@ -151,7 +151,10 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_kmean_nvfp4_kernel(
     const int first_page = base_pos >> kPagedKVPageShift;
     const int page       = first_page + page_l;
     const int page_lo    = page << kPagedKVPageShift;
-    const int lo         = max(page_lo, base_pos);
+    // Full-page mean over keys already in cache, not only this fill window. A
+    // straddled first page or a 1-token append would otherwise collapse the
+    // Sparge q_mean·k_mean proxy onto a partial-page sample.
+    const int lo         = page_lo;
     const int hi         = min(page_lo + kPagedKVPageSize, base_pos + tokens);
     if (lo >= hi) { return; }
     const std::int32_t* block_table = metadata.block_table();

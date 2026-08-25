@@ -2,7 +2,9 @@
 #include "ninfer/ops/gqa_attention.h"
 
 #include "core/layout.h"
+#include "ops/common/math.h"
 #include "ops/launcher/gqa_attention.h"
+#include "ops/launcher/gqa_xattn_scratch.h"
 
 #include <algorithm>
 #include <cmath>
@@ -407,7 +409,7 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
                                                    GqaExecutionEnvelope envelope,
                                                    std::int32_t batch_size, std::int32_t min_width,
                                                    std::int32_t max_width, float keep_frac,
-                                                   bool tree_verify) {
+                                                   bool tree_verify, float xattn_tau) {
     (void)kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
     if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8 && cache_dtype != DType::U8) || batch_size <= 0 ||
         batch_size > kMaximumBatchSize || min_width <= 0 || max_width < min_width ||
@@ -443,7 +445,19 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
     const auto exact_capacity = [&](std::int32_t width) {
         const detail::GqaAttentionRoute route =
             detail::gqa_attention_resolve_route(q_heads, width, batch_size, envelope, tree_verify);
-        if (route == detail::GqaAttentionRoute::Prompt) { return std::size_t{0}; }
+        if (route == detail::GqaAttentionRoute::Prompt) {
+            if (xattn_tau > 0.0f && xattn_tau < 1.0f && cache_dtype == DType::U8) {
+                WorkspaceLayoutBuilder layout;
+                const std::int32_t kv_heads =
+                    kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
+                const int n_br = div_up(width, kGqaXattnPrefillBr);
+                const int n_kb = gqa_xattn_n_kb(kGqaXattnRankTiles, envelope.max_visible_keys);
+                (void)layout.alloc_bytes(
+                    gqa_xattn_scratch_bytes(q_heads, kv_heads, n_br, n_kb));
+                return layout.peak_bytes(1);
+            }
+            return std::size_t{0};
+        }
         if (route == detail::GqaAttentionRoute::SmallT) { return chunk_capacity(width); }
         std::size_t maximum = 0;
         for (std::int32_t begin = 0; begin < width; begin += kSmallTChunkTokens) {
@@ -459,6 +473,12 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
         for (std::int32_t width = min_width; width <= last; ++width) {
             maximum = std::max(maximum, exact_capacity(width));
         }
+    }
+    // Prompt widths historically needed no arena. XAttention ranker scratch
+    // grows with W (n_br) and the envelope (n_kb), so the interval peak must
+    // include the largest Prompt width, not only W<=16 SmallT/ChunkedSmallT.
+    if (max_width > kMaximumVerifyTokens) {
+        maximum = std::max(maximum, exact_capacity(max_width));
     }
     return maximum;
 }
@@ -528,9 +548,19 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
                                              prefix_lengths, 1.0f, {});
         return;
     }
+    void* xattn_scratch = nullptr;
+    if (xattn_tau < 1.0f && cache.dtype == DType::U8 &&
+        envelope.max_visible_keys >= static_cast<std::uint32_t>(xattn_min_len)) {
+        const int n_br = div_up(width, kGqaXattnPrefillBr);
+        const int n_kb = gqa_xattn_n_kb(static_cast<int>(cache.block_tables.ne[0]),
+                                        envelope.max_visible_keys);
+        xattn_scratch = workspace
+                            .alloc_bytes(gqa_xattn_scratch_bytes(q.ne[1], kv_heads, n_br, n_kb))
+                            .data;
+    }
     detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
                                         cache, out, stream, keep_frac, xattn_tau, xattn_min_len,
-                                        dump);
+                                        dump, xattn_scratch, envelope);
 }
 
 void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
