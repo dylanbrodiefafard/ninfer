@@ -279,7 +279,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         (void)workspace_recipe::text_attention_results<TextConfig>(layout, last);
         scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
                             TextConfig::query_heads, plan.kv_dtype, envelope, batch_size, min_width,
-                            max_width, plan.keep_frac, tree_verify));
+                            max_width, plan.keep_frac, tree_verify, plan.xattn_tau));
         scratch(layout, Variant::attention_output_projection_workspace_capacity_bytes(
                             plan.weights_profile, phase, first, last));
     };

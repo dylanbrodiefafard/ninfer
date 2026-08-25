@@ -31,7 +31,10 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                                                 std::int32_t xattn_min_len = 8192,
                                                 GqaS3PrefillDump* dump = nullptr,
                                                 std::uint32_t* dbg_regs = nullptr,
-                                                std::uint8_t* dbg_q = nullptr) {
+                                                std::uint8_t* dbg_q = nullptr,
+                                                void* xattn_scratch = nullptr,
+                                                GqaExecutionEnvelope envelope = {
+                                                    1, kGqaAttentionMaximumVisibleKeys}) {
     const Tensor& cache_k = cache.k_pages;
     const Tensor& cache_v = cache.v_pages;
     // Both dtype-specialized kernels exceed the default 48 KiB dynamic-smem ceiling.
@@ -65,10 +68,15 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
     }
     if (cache.dtype == DType::U8 &&
         (keep_frac < 1.0f || xattn_tau < 1.0f || dump != nullptr)) {
-        gqa_sparse_prefill_attention_launch<Geometry>(q, positions, scale, cache, metadata, out,
-                                                       stream, keep_frac, xattn_tau, xattn_min_len,
-                                                       dump);
-        return;
+        const bool skip_xattn_to_dense =
+            xattn_tau < 1.0f && !(keep_frac < 1.0f) &&
+            envelope.max_visible_keys < static_cast<std::uint32_t>(xattn_min_len);
+        if (!skip_xattn_to_dense) {
+            gqa_sparse_prefill_attention_launch<Geometry>(
+                q, positions, scale, cache, metadata, out, stream, keep_frac, xattn_tau,
+                xattn_min_len, dump, xattn_scratch, envelope);
+            return;
+        }
     }
     if (cache.dtype == DType::I8) {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillI8Br)),
@@ -231,18 +239,19 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
                                            const PagedKVLayerView& cache, Tensor& out,
                                            cudaStream_t stream, float keep_frac, float xattn_tau,
                                            std::int32_t xattn_min_len, GqaS3PrefillDump* dump,
-                                           std::uint32_t* dbg_regs, std::uint8_t* dbg_q) {
+                                           std::uint32_t* dbg_regs, std::uint8_t* dbg_q,
+                                           void* xattn_scratch, GqaExecutionEnvelope envelope) {
     const GqaPrefillDirectMetadata metadata{
         static_cast<const std::int32_t*>(cache.block_table.data)};
     if (q.ne[1] == Gqa27Geometry::QHeads) {
         gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(
             q, positions, scale, cache, metadata, out, stream, keep_frac, xattn_tau, xattn_min_len,
-            dump, dbg_regs, dbg_q);
+            dump, dbg_regs, dbg_q, xattn_scratch, envelope);
         return;
     }
     gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(
         q, positions, scale, cache, metadata, out, stream, keep_frac, xattn_tau, xattn_min_len,
-        dump, dbg_regs, dbg_q);
+        dump, dbg_regs, dbg_q, xattn_scratch, envelope);
 }
 
 void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -261,7 +270,8 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
                                  const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
                                  Tensor& out, cudaStream_t stream, float keep_frac,
                                  float xattn_tau, std::int32_t xattn_min_len,
-                                 GqaS3PrefillDump* dump) {
+                                 GqaS3PrefillDump* dump, void* xattn_scratch,
+                                 GqaExecutionEnvelope envelope) {
     const auto launch = [&]<bool Masked>() {
         const GqaPrefillBatchMetadata<Masked> metadata{
             .tables = static_cast<const std::int32_t*>(cache.block_tables.data),
@@ -274,13 +284,13 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
             gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
             gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(
                 q, positions, scale, cache, metadata, out, stream, keep_frac, xattn_tau,
-                xattn_min_len, dump);
+                xattn_min_len, dump, nullptr, nullptr, xattn_scratch, envelope);
             return;
         }
         gqa_kv_append_launch_for<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
         gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(
             q, positions, scale, cache, metadata, out, stream, keep_frac, xattn_tau, xattn_min_len,
-            dump);
+            dump, nullptr, nullptr, xattn_scratch, envelope);
     };
     if (valid_columns.data == nullptr) {
         launch.template operator()<false>();

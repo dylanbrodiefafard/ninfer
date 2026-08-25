@@ -70,7 +70,9 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
                                  const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
                                  Tensor& out, cudaStream_t stream, float keep_frac = 1.0f,
                                  float xattn_tau = 1.0f, std::int32_t xattn_min_len = 8192,
-                                 GqaS3PrefillDump* dump = nullptr);
+                                 GqaS3PrefillDump* dump = nullptr, void* xattn_scratch = nullptr,
+                                 GqaExecutionEnvelope envelope = {
+                                     1, kGqaAttentionMaximumVisibleKeys});
 
 void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                           PagedKVLayerView cache, cudaStream_t stream);
@@ -86,6 +88,9 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
                                            std::int32_t xattn_min_len = 8192,
                                            GqaS3PrefillDump* dump = nullptr,
                                            std::uint32_t* dbg_regs = nullptr,
-                                           std::uint8_t* dbg_q = nullptr);
+                                           std::uint8_t* dbg_q = nullptr,
+                                           void* xattn_scratch = nullptr,
+                                           GqaExecutionEnvelope envelope = {
+                                               1, kGqaAttentionMaximumVisibleKeys});
 
 } // namespace ninfer::ops::detail

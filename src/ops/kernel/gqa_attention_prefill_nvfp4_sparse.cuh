@@ -7,12 +7,14 @@
 // XAttention ranking is a prepass (not fused into the MMA CTA). Pack K once to
 // bf16 [kv_head, j, s, d], then score the official inverse reshape on one B=128
 // plane per MMA CTA: A[i,j] = sum_s Q[15-s+i*16]·K[s+j*16] / (√d·S). find_blocks
-// softmaxes over L/S, block-sums into Bc=64, greedy mass ≥ τ, force tile 0 and
-// the last visible tile. Remainder Q-blocks with <S rows still score one partial
+// softmaxes over L/S, block-sums into Bc=64, greedy mass ≥ τ, then force tile 0,
+// both local (diagonal) Bc=64 tiles of the B=128 query block, and the last
+// visible tile. Remainder Q-blocks with <S rows still score one partial
 // i-row (skip q_rel >= q_rows) instead of sink-only.
 
 #include "ops/kernel/gqa_attention_kv_nvfp4.cuh"
 #include "ops/kernel/gqa_attention_prefill_common.cuh"
+#include "ops/launcher/gqa_xattn_scratch.h"
 #include "ninfer/ops/gqa_attention.h"
 
 #include <cuda_bf16.h>
@@ -58,9 +60,9 @@ inline constexpr int kGqaPrefillNvfp4KeepBytes =
     static_cast<int>(sizeof(int));
 inline constexpr int kGqaPrefillNvfp4SmemBytes = 101376;
 
-inline constexpr int kXAttnStride = 16;
+inline constexpr int kXAttnStride = kGqaXattnStride;
 inline constexpr int kXAttnBlock  = kGqaPrefillNvfp4Br; // paper B=128, one greedy plane per MMA CTA
-inline constexpr int kXAttnIRows  = kXAttnBlock / kXAttnStride;
+inline constexpr int kXAttnIRows  = kGqaXattnIRows;
 inline constexpr int kXAttnSplits = 32;
 inline constexpr int kXAttnScoreWarps   = 4;
 inline constexpr int kXAttnScoreThreads = kXAttnScoreWarps * 32;
@@ -73,6 +75,10 @@ inline constexpr int kXAttnKSmemBytes =
 inline constexpr int kXAttnScoreSmemBytes = kXAttnQSmemBytes + kXAttnKSmemBytes;
 
 static_assert(kXAttnBlock == kGqaPrefillNvfp4Br);
+static_assert(kGqaPrefillNvfp4Br == kGqaXattnPrefillBr);
+static_assert(kGqaPrefillNvfp4Bc == kGqaXattnPrefillBc);
+static_assert(kGqaPrefillHeadDim == kGqaXattnHeadDim);
+static_assert(kGqaPrefillNvfp4RankTiles == kGqaXattnRankTiles);
 static_assert(kXAttnIRows == 8);
 static_assert(kXAttnScoreSmemBytes <= 101376);
 
@@ -88,19 +94,6 @@ struct GqaXattnScratchView {
     int keep_stride;
     int q_heads;
 };
-
-inline std::size_t gqa_xattn_scratch_bytes(int q_heads, int kv_heads, int n_br, int n_kb) {
-    const int n_j = n_kb * (kGqaPrefillNvfp4Bc / kXAttnStride);
-    auto align256 = [](std::size_t x) { return (x + 255u) & ~std::size_t{255}; };
-    std::size_t b = 0;
-    b = align256(b) + sizeof(__nv_bfloat16) * static_cast<std::size_t>(kv_heads) * n_j *
-                          kXAttnStride * kGqaPrefillHeadDim;
-    b = align256(b) + sizeof(float) * static_cast<std::size_t>(q_heads) * n_br * kXAttnIRows * n_j;
-    b = align256(b) + sizeof(float) * static_cast<std::size_t>(q_heads) * n_br * n_kb;
-    b = align256(b) + sizeof(std::uint16_t) * static_cast<std::size_t>(q_heads) * n_br * n_kb;
-    b = align256(b) + sizeof(int) * static_cast<std::size_t>(q_heads) * n_br;
-    return b;
-}
 
 inline GqaXattnScratchView gqa_xattn_bind_scratch(void* p, int q_heads, int kv_heads, int n_br,
                                                  int n_kb) {
@@ -603,7 +596,9 @@ __global__ void gqa_xattn_finish_kernel(Metadata metadata, const std::int32_t* _
             mark[kb] = 1;
             kept += s;
         }
+        const int local_lo    = (base_pos + q0) / Bc;
         mark[0]               = 1;
+        mark[min(local_lo, key_blocks - 1)] = 1;
         mark[key_blocks - 1]  = 1;
         int n                 = 0;
         for (int kb = 0; kb < key_blocks; ++kb) {

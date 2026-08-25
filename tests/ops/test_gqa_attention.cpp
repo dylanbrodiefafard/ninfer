@@ -1672,7 +1672,34 @@ public:
                 // k_mean is allocated for sage fill and for Sparge-on-exact-NVFP4.
                 k_mean_elements_ = 4 * kPagedKVPageSize * geometry_.kv_heads * physical_pages_;
                 k_mean_ = std::make_unique<GuardedDeviceBuffer>(k_mean_elements_ * sizeof(float));
-                k_mean_->fill(0);
+                if (cache.k_mean && !sage_) {
+                    std::vector<float> host_mean(k_mean_elements_, 0.0f);
+                    const std::int32_t logical_pages = logical_capacity_ / kPagedKVPageSize;
+                    for (std::int32_t page = 0; page < logical_pages; ++page) {
+                        const std::int32_t physical =
+                            block_table_host_[static_cast<std::size_t>(page)];
+                        for (std::int32_t head = 0; head < geometry_.kv_heads; ++head) {
+                            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                                double sum = 0.0;
+                                for (std::int32_t off = 0; off < kPagedKVPageSize; ++off) {
+                                    sum += cache_value(cache, true, head,
+                                                       page * kPagedKVPageSize + off, d);
+                                }
+                                const std::size_t idx =
+                                    static_cast<std::size_t>(d & 3) +
+                                    4ull * (static_cast<std::size_t>(d >> 2) +
+                                            64ull * (static_cast<std::size_t>(head) +
+                                                     static_cast<std::size_t>(geometry_.kv_heads) *
+                                                         static_cast<std::size_t>(physical)));
+                                host_mean[idx] =
+                                    static_cast<float>(sum / static_cast<double>(kPagedKVPageSize));
+                            }
+                        }
+                    }
+                    k_mean_->copy_from_host(host_mean.data(), host_mean.size() * sizeof(float));
+                } else {
+                    k_mean_->fill(0);
+                }
             }
         } else {
             const auto k_physical =
@@ -2557,7 +2584,7 @@ std::vector<float> nvfp4_page_k_mean(const HostCache& cache, std::int32_t kv_hea
 
 std::vector<char> sparge_keep_list(const std::vector<float>& q, const HostCache& cache,
                                    std::int32_t q_head, std::int32_t q0, std::int32_t tile_rows,
-                                   std::int32_t base_pos, float keep_frac) {
+                                   std::int32_t base_pos, std::int32_t tokens, float keep_frac) {
     const Geometry& geometry = cache.geometry;
     const std::int32_t kv_head = q_head / geometry.query_group();
     const std::int32_t max_query_abs = base_pos + q0 + tile_rows - 1;
@@ -2572,10 +2599,14 @@ std::vector<char> sparge_keep_list(const std::vector<float>& q, const HostCache&
     const float inv_rows = 1.0f / static_cast<float>(tile_rows);
     for (float& v : q_mean) { v *= inv_rows; }
     std::vector<float> scores(static_cast<std::size_t>(key_blocks), 0.0f);
+    const std::int32_t populated = base_pos + tokens;
     for (std::int32_t kb = 0; kb < key_blocks; ++kb) {
-        const std::int32_t page_end = std::min((kb + 1) * kSkipBc - 1, max_query_abs);
-        const std::int32_t nkeys    = page_end - kb * kSkipBc + 1;
-        const auto km               = nvfp4_page_k_mean(cache, kv_head, kb, nkeys);
+        // Page-level k_mean matches the fill kernel: mean over [page_lo,
+        // min(page_lo+64, populated)), not the causal keys of this q-block.
+        const std::int32_t page_lo = kb * kSkipBc;
+        const std::int32_t nkeys   = std::max(0, std::min(page_lo + kSkipBc, populated) - page_lo);
+        if (nkeys <= 0) { continue; }
+        const auto km              = nvfp4_page_k_mean(cache, kv_head, kb, nkeys);
         float acc                   = 0.0f;
         for (std::int32_t d = 0; d < kHeadDim; ++d) {
             acc += q_mean[static_cast<std::size_t>(d)] * km[static_cast<std::size_t>(d)];
@@ -2840,6 +2871,9 @@ std::vector<char> xattn_keep_list(const std::vector<float>& q, const HostCache& 
     if (scores.empty()) {
         mark[0]                                    = 1;
         mark[static_cast<std::size_t>(key_blocks - 1)] = 1;
+        const int local_lo =
+            std::min((base_pos + q0) / kSkipBc, key_blocks - 1);
+        mark[static_cast<std::size_t>(local_lo)] = 1;
         return mark;
     }
     float z = 0.0f;
@@ -2847,6 +2881,8 @@ std::vector<char> xattn_keep_list(const std::vector<float>& q, const HostCache& 
     const float inv_z = z > 0.0f ? 1.0f / z : 0.0f;
     for (float& s : scores) { s *= inv_z; }
     xattn_or_greedy_keep(mark, std::move(scores), tau);
+    const int local_lo = std::min((base_pos + q0) / kSkipBc, key_blocks - 1);
+    mark[static_cast<std::size_t>(local_lo)] = 1;
     return mark;
 }
 
@@ -2986,7 +3022,8 @@ int run_a1_skip_case(const Geometry& geometry, const AttentionCase& test_case, f
     const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
                                              test_case.envelope_max};
     const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
-        geometry.q_heads, DType::U8, envelope, 1, test_case.tokens, test_case.tokens);
+        geometry.q_heads, DType::U8, envelope, 1, test_case.tokens, test_case.tokens, keep_frac,
+        false, xattn_tau);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
     ops::GqaS3PrefillDump dump{};
@@ -3008,20 +3045,28 @@ int run_a1_skip_case(const Geometry& geometry, const AttentionCase& test_case, f
     const auto keep_host =
         copy_from_guarded<std::int32_t>(dkeep, static_cast<std::size_t>(geometry.q_heads) * max_tiles);
     const auto count_host = copy_from_guarded<std::int32_t>(dcount, geometry.q_heads);
+    const bool xattn_identity =
+        xattn_tau < 1.0f && keep_frac >= 1.0f &&
+        test_case.envelope_max < static_cast<std::uint32_t>(xattn_min_len);
 
     const std::int32_t n_q_blocks = (test_case.tokens + kSkipBr - 1) / kSkipBr;
     std::vector<std::vector<std::vector<char>>> keep(
         static_cast<std::size_t>(geometry.q_heads),
         std::vector<std::vector<char>>(static_cast<std::size_t>(n_q_blocks)));
     int failures = 0;
+    int local_forced = 0;
+    int local_added  = 0;
+    int keep_n_sum   = 0;
+    int keep_d_sum   = 0;
     for (std::int32_t q_head = 0; q_head < geometry.q_heads; ++q_head) {
         for (std::int32_t qb = 0; qb < n_q_blocks; ++qb) {
             const std::int32_t q0        = qb * kSkipBr;
             const std::int32_t tile_rows = std::min(kSkipBr, test_case.tokens - q0);
             if (keep_frac < 1.0f) {
                 keep[static_cast<std::size_t>(q_head)][static_cast<std::size_t>(qb)] =
-                    sparge_keep_list(q, expected, q_head, q0, tile_rows, test_case.base, keep_frac);
-            } else if (xattn_tau < 1.0f) {
+                    sparge_keep_list(q, expected, q_head, q0, tile_rows, test_case.base,
+                                     test_case.tokens, keep_frac);
+            } else if (xattn_tau < 1.0f && !xattn_identity) {
                 keep[static_cast<std::size_t>(q_head)][static_cast<std::size_t>(qb)] =
                     xattn_keep_list(q, expected, q_head, q0, tile_rows, test_case.base, xattn_tau);
             } else {
@@ -3030,7 +3075,25 @@ int run_a1_skip_case(const Geometry& geometry, const AttentionCase& test_case, f
                 keep[static_cast<std::size_t>(q_head)][static_cast<std::size_t>(qb)].assign(
                     static_cast<std::size_t>(key_blocks), 1);
             }
+            const std::vector<char>& mark =
+                keep[static_cast<std::size_t>(q_head)][static_cast<std::size_t>(qb)];
+            const int key_blocks = static_cast<int>(mark.size());
+            if (key_blocks <= 0) { continue; }
+            const int local_lo = std::min((test_case.base + q0) / kSkipBc, key_blocks - 1);
+            keep_d_sum += key_blocks;
+            for (char m : mark) { keep_n_sum += m ? 1 : 0; }
+            if (xattn_tau < 1.0f && !xattn_identity) {
+                if (!mark[static_cast<std::size_t>(local_lo)]) {
+                    std::cerr << label << " q" << q_head << " qb" << qb << " missing local tile "
+                              << local_lo << '\n';
+                    ++failures;
+                }
+                ++local_forced;
+                const bool is_sink_or_last = local_lo == 0 || local_lo == key_blocks - 1;
+                if (!is_sink_or_last) { ++local_added; }
+            }
         }
+        if (xattn_identity) { continue; }
         // Dump covers q_block 0 only.
         const std::vector<char>& mark0 = keep[static_cast<std::size_t>(q_head)][0];
         std::int32_t host_n            = 0;
@@ -3053,6 +3116,11 @@ int run_a1_skip_case(const Geometry& geometry, const AttentionCase& test_case, f
                 ++i;
             }
         }
+    }
+    if (xattn_tau < 1.0f && plant == XattnPlant::None) {
+        std::cout << label << " keep " << keep_n_sum << "/" << keep_d_sum
+                  << " local-tile force slots=" << local_forced << " interior-local=" << local_added
+                  << (xattn_identity ? " identity-dense\n" : "\n");
     }
 
     if (plant != XattnPlant::None && xattn_tau < 1.0f) {
@@ -3106,7 +3174,7 @@ int run_a1_skip_case(const Geometry& geometry, const AttentionCase& test_case, f
             }
             if (!kept(kXattnPlantHotKb) || kept(1) || kept(2) || kept(4) || kept(5)) {
                 std::cerr << label << " paper-plant keep-set should keep tile " << kXattnPlantHotKb
-                          << " and drop 1/2/4/5 (0 and last are force-kept); kept=";
+                          << " and drop 1/2/4/5 (0, local diagonal, and last are force-kept); kept=";
                 for (int kb = 0; kb < static_cast<int>(mark0.size()); ++kb) {
                     if (mark0[static_cast<std::size_t>(kb)]) { std::cerr << ' ' << kb; }
                 }
@@ -3121,10 +3189,31 @@ int run_a1_skip_case(const Geometry& geometry, const AttentionCase& test_case, f
 
     const std::vector<std::uint16_t> output_bits =
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
+    const std::vector<double> actual    = bf16_bits_to_double(output_bits);
+    const std::vector<double> reference = ideal_attention_kept_qblocks(q, expected, positions, keep);
+    const ReductionCriterion nvfp4_crit = attention_criterion(DType::U8, false);
     if (plant == XattnPlant::None) {
-        const std::vector<double> actual    = bf16_bits_to_double(output_bits);
-        const std::vector<double> reference = ideal_attention_kept_qblocks(q, expected, positions, keep);
-        failures += verify_attention(label, actual, reference, attention_criterion(DType::U8, false));
+        failures += verify_attention(label, actual, reference, nvfp4_crit);
+    } else {
+        // amp=32 plants sit outside the NVFP4 criterion's representative range on
+        // the planted KV group. Unplanted heads still catch an MMA / keep-apply bug.
+        std::vector<double> got_u;
+        std::vector<double> ref_u;
+        const std::int32_t planted_group = geometry.query_group();
+        got_u.reserve(static_cast<std::size_t>(kHeadDim) *
+                      static_cast<std::size_t>(geometry.q_heads - planted_group) *
+                      static_cast<std::size_t>(test_case.tokens));
+        ref_u.reserve(got_u.capacity());
+        for (std::int32_t token = 0; token < test_case.tokens; ++token) {
+            for (std::int32_t q_head = planted_group; q_head < geometry.q_heads; ++q_head) {
+                for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                    const std::size_t idx = q_index(geometry, q_head, d, token);
+                    got_u.push_back(actual[idx]);
+                    ref_u.push_back(reference[idx]);
+                }
+            }
+        }
+        failures += verify_attention(label + " unplanted-heads", got_u, ref_u, nvfp4_crit);
     }
     failures += verify_cache(label, cache.snapshot(), expected);
     failures += dout.verify_guards((label + " output").c_str());
@@ -3688,7 +3777,9 @@ int run_geometry(const Geometry& geometry) {
                 // base=384 cases below actually drop tiles.
                 failures += run_a1_skip_case(geometry, {128, 0, 256, 530u}, 1.0f, 1.0f, 0);
                 failures += run_a1_skip_case(geometry, {512, 0, 512, 531u}, 0.5f, 1.0f, 0);
+                failures += run_a1_skip_case(geometry, {300, 100, 512, 533u}, 0.5f, 1.0f, 0);
                 failures += run_a1_skip_case(geometry, {512, 0, 512, 532u}, 1.0f, 0.9f, 0);
+                failures += run_a1_skip_case(geometry, {128, 0, 128, 551u}, 1.0f, 0.9f, 8192);
                 failures += run_a1_skip_case(geometry, {128, 384, 512, 540u}, 1.0f, 0.9f, 0,
                                              XattnPlant::V1Antidiag);
                 failures += run_a1_skip_case(geometry, {128, 384, 512, 541u}, 1.0f, 0.9f, 0,
@@ -3740,6 +3831,35 @@ int verify_workspace_capacity_contract() {
         std::cerr << "gqa_attention accepted an envelope outside the launcher domain\n";
         ++failures;
     } catch (const std::invalid_argument&) {}
+    {
+        constexpr ops::GqaExecutionEnvelope xenv{128, 512};
+        const std::size_t dense = ops::gqa_attention_workspace_capacity_bytes(
+            16, DType::U8, xenv, 1, 128, 128);
+        const std::size_t xattn = ops::gqa_attention_workspace_capacity_bytes(
+            16, DType::U8, xenv, 1, 128, 128, 1.0f, false, 0.9f);
+        if (xattn <= dense) {
+            std::cerr << "gqa_attention xattn_tau workspace was not accounted (dense=" << dense
+                      << " xattn=" << xattn << ")\n";
+            ++failures;
+        }
+        const std::size_t bf16_xattn = ops::gqa_attention_workspace_capacity_bytes(
+            16, DType::BF16, xenv, 1, 128, 128, 1.0f, false, 0.9f);
+        const std::size_t bf16_dense = ops::gqa_attention_workspace_capacity_bytes(
+            16, DType::BF16, xenv, 1, 128, 128);
+        if (bf16_xattn != bf16_dense) {
+            std::cerr << "gqa_attention xattn_tau added workspace on a non-NVFP4 cache\n";
+            ++failures;
+        }
+        const std::size_t prompt_xattn = ops::gqa_attention_workspace_capacity_bytes(
+            24, DType::U8, {1, 512}, 1, 128, 128, 1.0f, false, 0.9f);
+        const std::size_t interval_xattn = ops::gqa_attention_workspace_capacity_bytes(
+            24, DType::U8, {1, 512}, 1, 1, 128, 1.0f, false, 0.9f);
+        if (interval_xattn < prompt_xattn) {
+            std::cerr << "gqa_attention xattn_tau [1,128] interval missed Prompt scratch (interval="
+                      << interval_xattn << " prompt=" << prompt_xattn << ")\n";
+            ++failures;
+        }
+    }
     return failures;
 }
 
@@ -4624,9 +4744,12 @@ int main(int argc, char** argv) {
             std::cerr << "FAIL: no usable CUDA device\n";
             return 1;
         }
-        int failures = 0;
+        int failures = verify_workspace_capacity_contract();
         for (const Geometry& geometry : kGeometries) {
             failures += run_a1_skip_case(geometry, {512, 0, 512, 532u}, 1.0f, 0.9f, 0);
+            failures += run_a1_skip_case(geometry, {128, 0, 128, 551u}, 1.0f, 0.9f, 8192);
+            failures += run_a1_skip_case(geometry, {512, 0, 512, 531u}, 0.5f, 1.0f, 0);
+            failures += run_a1_skip_case(geometry, {300, 100, 512, 533u}, 0.5f, 1.0f, 0);
             failures += run_a1_skip_case(geometry, {128, 384, 512, 540u}, 1.0f, 0.9f, 0,
                                          XattnPlant::V1Antidiag);
             failures += run_a1_skip_case(geometry, {128, 384, 512, 541u}, 1.0f, 0.9f, 0,

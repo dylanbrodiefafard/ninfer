@@ -154,7 +154,8 @@ template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_sparse_prefill_attention_launch(const Tensor& q, const Tensor& positions, float scale,
                                           const CacheView& cache, Metadata metadata, Tensor& out,
                                           cudaStream_t stream, float keep_frac, float xattn_tau,
-                                          std::int32_t xattn_min_len, GqaS3PrefillDump* dump) {
+                                          std::int32_t xattn_min_len, GqaS3PrefillDump* dump,
+                                          void* xattn_scratch, GqaExecutionEnvelope envelope) {
     const Tensor& cache_k       = cache.k_pages;
     const Tensor& cache_v       = cache.v_pages;
     const Tensor& cache_k_scale = cache.k_scale_pages;
@@ -185,8 +186,8 @@ void gqa_sparse_prefill_attention_launch(const Tensor& q, const Tensor& position
         const int q_heads  = Geometry::QHeads;
         const int kv_heads = Geometry::KVHeads;
         const int n_br     = div_up(tokens, kGqaPrefillNvfp4Br);
-        const int n_kb     = std::max(1, std::min(kGqaPrefillNvfp4RankTiles,
-                                              gqa_xattn_logical_pages(cache)));
+        const int n_kb =
+            gqa_xattn_n_kb(gqa_xattn_logical_pages(cache), envelope.max_visible_keys);
         const int n_split  = std::max(1, std::min(kXAttnSplits, n_kb));
         const int score_smem = gqa_xattn_score_smem_bytes();
         static const cudaError_t score_attr = cudaFuncSetAttribute(
@@ -200,7 +201,8 @@ void gqa_sparse_prefill_attention_launch(const Tensor& q, const Tensor& position
         CUDA_CHECK(finish_attr);
 
         const std::size_t bytes = gqa_xattn_scratch_bytes(q_heads, kv_heads, n_br, n_kb);
-        scratch = gqa_xattn_bind_scratch(xattn_ensure_scratch(bytes), q_heads, kv_heads, n_br, n_kb);
+        void* scratch_mem = xattn_scratch != nullptr ? xattn_scratch : xattn_ensure_scratch(bytes);
+        scratch = gqa_xattn_bind_scratch(scratch_mem, q_heads, kv_heads, n_br, n_kb);
 
         const dim3 pack_grid(static_cast<unsigned>(kv_heads), static_cast<unsigned>(n_kb), 1u);
         gqa_xattn_pack_kernel<Geometry, Metadata>
@@ -273,7 +275,7 @@ void gqa_sparse_prefill_attention_launch(const Tensor& q, const Tensor& position
 #define NINFER_SPARSE_PREFILL_INSTANTIATE(Geom, View, Meta)                                        \
     template void gqa_sparse_prefill_attention_launch<Geom, View, Meta>(                           \
         const Tensor&, const Tensor&, float, const View&, Meta, Tensor&, cudaStream_t, float,      \
-        float, std::int32_t, GqaS3PrefillDump*)
+        float, std::int32_t, GqaS3PrefillDump*, void*, GqaExecutionEnvelope)
 
 NINFER_SPARSE_PREFILL_INSTANTIATE(Gqa27Geometry, PagedKVLayerView, GqaPrefillDirectMetadata);
 NINFER_SPARSE_PREFILL_INSTANTIATE(Gqa35Geometry, PagedKVLayerView, GqaPrefillDirectMetadata);
