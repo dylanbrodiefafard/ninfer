@@ -15,15 +15,19 @@
 // the final out = acc / L. The constants below are taken verbatim from the S3 sm120
 // kernel (sageattn3/blackwell/softmax_fused.h).
 //
+// SmoothQ (Sage3 preprocess_qkv): each CTA subtracts its Br-row Q mean before
+// NVFP4 Q-quant, then adds q_mean·K_hat onto the QK scores so softmax sees
+// Q·K_hat rather than (Q-mean)·K_hat. K is page-centered at fill
+// (`k -= k.mean` over keys in the append that share a 64-key page).
+//
 // Cache layout (NVFP4 storage, --sage only): K is quantized exactly as the prod
-// NVFP4 fill (per key, 16-d groups). V is quantized along the d axis: one UE4M3
+// NVFP4 fill (per key, 16-d groups) after page-mean centering. V is quantized along the d axis: one UE4M3
 // scale per (d, 16-key block) in the v_scale plane, laid out d-major
 // [page][kv_head][d 256][key_block 4] (same 1024 B per page-head as the prod
 // per-key plane; only the index mapping and the code normalization differ). The
 // v code plane keeps the prod per-key [key][128 B] layout.
 
-#include "ops/kernel/gqa_attention_kv_nvfp4.cuh"
-#include "ops/kernel/gqa_attention_prefill_common.cuh"
+#include "ops/kernel/gqa_attention_nvfp4s3_common.cuh"
 #include "ninfer/ops/gqa_attention.h"
 
 #include <cuda_bf16.h>
@@ -33,88 +37,6 @@
 #include <cstdint>
 
 namespace ninfer::ops {
-
-// S3 constant folding: P is amplified by 448*6 inside the exp2 (the constant is
-// added to the -max term in log2 domain); the per-16-key block scale then maps the
-// amplified block max into e4m3, and P/scale lands in [0, 6] (e2m1 range).
-inline constexpr float kGqaS3Fp8ScaleLog2 = -11.392317422778762f; // log2f(1.f / (448 * 6))
-inline constexpr float kGqaS3Fp4ScaleLog2 = -2.584962500721156f;  // log2f(1.f / 6.f)
-inline constexpr float kGqaS3PvAmpLog2    = -kGqaS3Fp8ScaleLog2;  // log2f(448 * 6)
-inline constexpr float kGqaS3SfLog2 = -kGqaS3Fp8ScaleLog2 + kGqaS3Fp4ScaleLog2; // log2f(448)
-
-inline constexpr int kGqaPrefillNvfp4s3Warps     = 16;
-inline constexpr int kGqaPrefillNvfp4s3Threads    = kGqaPrefillNvfp4s3Warps * 32;
-inline constexpr int kGqaPrefillNvfp4s3Br         = 128;
-inline constexpr int kGqaPrefillNvfp4s3Bc         = 64;
-inline constexpr int kGqaPrefillNvfp4s3Groups     = kGqaNvfp4Groups;
-inline constexpr int kGqaPrefillNvfp4s3CodeW      = kGqaNvfp4CodeWidth;
-inline constexpr int kGqaPrefillNvfp4s3RowTiles   = kGqaPrefillNvfp4s3Br / 16;
-inline constexpr int kGqaPrefillNvfp4s3DConsumers =
-    kGqaPrefillNvfp4s3Warps / kGqaPrefillNvfp4s3RowTiles;
-// P codes: [128 rows][48 B rows, 32 B used]. 48 B stride keeps 16 B ldmatrix
-// windows aligned with no swizzle.
-inline constexpr int kGqaPrefillNvfp4s3P4RowBytes = 48;
-inline constexpr int kGqaPrefillNvfp4s3P4Bytes    = kGqaPrefillNvfp4s3Br * kGqaPrefillNvfp4s3P4RowBytes;
-// P per-16-key block scales: [128 rows][4 e4m3].
-inline constexpr int kGqaPrefillNvfp4s3PsfBytes   = kGqaPrefillNvfp4s3Br * 4;
-// V codes transposed to d-major: [256 d rows][48 B rows, 32 B used].
-inline constexpr int kGqaPrefillNvfp4s3VtBytes     = kGqaPrefillHeadDim * kGqaPrefillNvfp4s3P4RowBytes;
-// V per-(d, 16-key) block scales (d-major PV SFB operand): [256 d rows][4 e4m3].
-inline constexpr int kGqaPrefillNvfp4s3VsfBytes    = kGqaPrefillHeadDim * 4;
-
-inline constexpr int kGqaPrefillNvfp4s3QBytes      = kGqaPrefillNvfp4s3Br * kGqaPrefillNvfp4s3CodeW;
-inline constexpr int kGqaPrefillNvfp4s3QScaleBytes = kGqaPrefillNvfp4s3Br * kGqaPrefillNvfp4s3Groups;
-inline constexpr int kGqaPrefillNvfp4s3KBytes      = kGqaPrefillNvfp4s3Bc * kGqaPrefillNvfp4s3CodeW;
-inline constexpr int kGqaPrefillNvfp4s3VBytes      = kGqaPrefillNvfp4s3Bc * kGqaPrefillNvfp4s3CodeW;
-inline constexpr int kGqaPrefillNvfp4s3KScaleBytes = kGqaPrefillNvfp4s3Bc * kGqaPrefillNvfp4s3Groups;
-// V-block scale plane is double-buffered (tile parity): the next tile's cp.async
-// is issued while the current tile's PV mma is still reading its SFB plane, so a
-// single buffer races (the async load can land mid-mma). One 1024 B stage each.
-inline constexpr int kGqaPrefillNvfp4s3VsfStages = 2;
-inline constexpr int kGqaPrefillNvfp4s3StatsBytes  =
-    2 * kGqaPrefillNvfp4s3Br * static_cast<int>(sizeof(float));
-inline constexpr int kGqaPrefillNvfp4s3SmemBytes =
-    kGqaPrefillNvfp4s3QBytes + kGqaPrefillNvfp4s3QScaleBytes + kGqaPrefillNvfp4s3KBytes +
-    kGqaPrefillNvfp4s3VBytes + kGqaPrefillNvfp4s3P4Bytes + kGqaPrefillNvfp4s3PsfBytes +
-    kGqaPrefillNvfp4s3VtBytes +
-    kGqaPrefillNvfp4s3VsfBytes * kGqaPrefillNvfp4s3VsfStages + kGqaPrefillNvfp4s3KScaleBytes +
-    kGqaPrefillNvfp4s3VsfBytes + kGqaPrefillNvfp4s3StatsBytes;
-
-static_assert(kGqaPrefillNvfp4s3Groups == 16);
-static_assert(kGqaPrefillNvfp4s3DConsumers == 2);
-static_assert(kGqaPrefillNvfp4s3SmemBytes == 58880);
-
-// Sage V scale plane: d-major [page][kv_head][d 256][key_block 4] (1024 B per
-// page-head, same size as the prod per-key plane).
-template <typename Geometry>
-__device__ __forceinline__ std::int64_t gqa_s3_v_scale_index(int physical_page, int kv_head,
-                                                             int d, int key_block) {
-    return paged_kv_element_offset<kGqaNvfp4Groups, Geometry::KVHeads>(physical_page, kv_head, 0, 0) +
-           static_cast<std::int64_t>(d) * 4 + key_block;
-}
-
-// Pack two floats into one e2m1x2 byte (low nibble = first operand).
-__device__ __forceinline__ std::uint8_t gqa_s3_cvt_e2m1x2(float lo, float hi) {
-    unsigned tmp;
-    asm volatile(
-        "{\n"
-        " .reg .b8 b;\n"
-        " cvt.rn.satfinite.e2m1x2.f32 b, %2, %1;\n"
-        " mov.b32 %0, {b, b, b, b};\n"
-        "}"
-        : "=r"(tmp)
-        : "f"(lo), "f"(hi));
-    return static_cast<std::uint8_t>(tmp);
-}
-
-// Per-nibble e2m1 decode (software). Avoids the hardware cvt.rn.f16x2.e2m1x2 path
-// (__nv_fp4x2_e2m1 -> float2), which on sm_120a swaps the two halves when both
-// nibbles are negative. Matches the host decode_e2m1_word table exactly.
-__device__ __forceinline__ float gqa_s3_e2m1_value(std::uint8_t code) {
-    static const float kGqaS3E2m1Mags[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
-    const float mag = kGqaS3E2m1Mags[code & 0x07u];
-    return (code & 0x08u) ? -mag : mag;
-}
 
 template <typename Geometry, typename Metadata>
 __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_nvfp4s3_kernel(
@@ -146,7 +68,7 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_nvfp4s3_kernel
     const int base_pos              = positions[0];
 
     if (unit < k_units) {
-        // K: prod NVFP4 quantization (per key, 16-d groups), unchanged.
+        // K: Sage3 page-mean centering then NVFP4 (per key, 16-d groups).
         const int grp     = unit % Groups;
         const int tmp     = unit / Groups;
         const int kv_head = tmp % Geometry::KVHeads;
@@ -154,11 +76,10 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_nvfp4s3_kernel
         const int position        = base_pos + token;
         const int physical_page    = paged_kv_physical_page(block_table, position);
         const int page_off         = position & kPagedKVPageMask;
-        const int d0               = grp * kGqaNvfp4Group;
         std::uint32_t lo = 0, hi = 0;
         std::uint8_t sc = 0;
-        gqa_nvfp4_quantize_bf16x16(
-            &k[gqa_nvfp4_src_index<Geometry>(kv_head, d0, token)], lo, hi, sc);
+        gqa_s3_quantize_centered_k_contig<Geometry>(k, kv_head, token, base_pos, tokens, grp, lo, hi,
+                                                    sc);
         const std::int64_t code =
             gqa_nvfp4_code_index<Geometry>(physical_page, kv_head, grp * 8, page_off);
         *reinterpret_cast<std::uint32_t*>(cache_k + code)     = lo;
@@ -290,9 +211,8 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_nvfp4s3_kernel
     if (bump1) { scale_v[sc1_off] = sc_new1; }
 }
 
-template <typename Geometry, typename Metadata>
-// Occupancy-1: 16 warps × 128 regs = 65536. 512-thread CTA cannot exceed 128.
-__global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
+template <typename Geometry, typename Metadata, int BrT, int WarpsT, bool ExactT>
+__device__ __forceinline__ void gqa_attention_prefill_nvfp4s3_device(
     const __nv_bfloat16* __restrict__ q, const std::uint8_t* __restrict__ cache_k,
     const std::uint8_t* __restrict__ cache_v, const std::uint8_t* __restrict__ cache_k_scale,
     const std::uint8_t* __restrict__ cache_v_scale, const float* __restrict__ k_mean,
@@ -300,36 +220,48 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
     const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
     std::int32_t width, float keep_frac, GqaS3PrefillDump* dump,
     std::uint32_t* dbg_regs = nullptr, std::uint8_t* dbg_q = nullptr) {
+    using Tile = GqaPrefillNvfp4s3Tile<BrT, WarpsT>;
     constexpr int D             = kGqaPrefillHeadDim;
-    constexpr int Br            = kGqaPrefillNvfp4s3Br;
+    constexpr int Br            = Tile::Br;
     constexpr int Bc            = kGqaPrefillNvfp4s3Bc;
     constexpr int Groups        = kGqaPrefillNvfp4s3Groups;
     constexpr int CodeW         = kGqaPrefillNvfp4s3CodeW;
     constexpr int P4Row         = kGqaPrefillNvfp4s3P4RowBytes;
+    constexpr int Threads       = Tile::Threads;
     constexpr int QKNt          = Bc / 8;
+    // Exact (occ2) path: all 8 warps run QK+P-quant. Two warps share a 16-row
+    // tile by splitting the 64 keys (nt 0-3 / 4-7). NCU on the 4+4 producer/
+    // transpose split showed ~31% of issue time parked at the CTA barrier —
+    // the transpose is cheap and the 4 worker warps wait on softmax/P-quant.
+    constexpr int NtLocal       = ExactT ? QKNt / 2 : QKNt;
+    constexpr int NbLocal       = ExactT ? 2 : 4;
     constexpr int K64s          = kGqaNvfp4K64;
-    constexpr int PVNtPerWarp   = D / (kGqaPrefillNvfp4s3DConsumers * 8);
-    constexpr int ProducerWarps = kGqaPrefillNvfp4s3RowTiles;
-    constexpr int VWorkerWarps  = kGqaPrefillNvfp4s3Warps - ProducerWarps;
+    constexpr int PVNtPerWarp   = D / (Tile::DConsumers * 8);
+    constexpr int ProducerWarps = Tile::RowTiles;
+    constexpr int VWorkerWarps  = Tile::Warps - ProducerWarps;
     constexpr int WorkerThreads = VWorkerWarps * 32;
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
 
     static_assert(PVNtPerWarp == 16);
+    static_assert(Tile::DConsumers == 2);
 
     extern __shared__ __align__(16) unsigned char smem_raw[];
     std::uint8_t* q_codes = smem_raw;
-    std::uint8_t* q_scale = q_codes + kGqaPrefillNvfp4s3QBytes;
-    std::uint8_t* k_codes = q_scale + kGqaPrefillNvfp4s3QScaleBytes;
+    std::uint8_t* q_scale = q_codes + Tile::QBytes;
+    std::uint8_t* k_codes = q_scale + Tile::QScaleBytes;
     std::uint8_t* v_codes = k_codes + kGqaPrefillNvfp4s3KBytes;
     std::uint8_t* p4      = v_codes + kGqaPrefillNvfp4s3VBytes;
-    std::uint8_t* psf     = p4 + kGqaPrefillNvfp4s3P4Bytes;
-    std::uint8_t* v_t     = psf + kGqaPrefillNvfp4s3PsfBytes;
+    std::uint8_t* psf     = p4 + Tile::P4Bytes;
+    std::uint8_t* v_t     = psf + Tile::PsfBytes;
     std::uint8_t* v_scales   = v_t + kGqaPrefillNvfp4s3VtBytes;
     std::uint8_t* v_scales_b = v_scales + kGqaPrefillNvfp4s3VsfBytes;
     std::uint8_t* k_scale_s  = v_scales_b + kGqaPrefillNvfp4s3VsfBytes;
     float* alpha_s          = reinterpret_cast<float*>(k_scale_s + kGqaPrefillNvfp4s3KScaleBytes);
     float* final_l_s        = alpha_s + Br;
+
+    __shared__ float q_smooth_mean[kGqaPrefillHeadDim];
+    __shared__ float k_smooth_delta[kGqaPrefillNvfp4s3Bc];
 
     const int q_block = static_cast<int>(blockIdx.x);
     const int q_head  = static_cast<int>(blockIdx.y);
@@ -346,7 +278,7 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
     if (q_head >= Geometry::QHeads || q0 >= width) { return; }
     if (q0 >= tokens) {
         gqa_prefill_zero_output_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid,
-                                               kGqaPrefillNvfp4s3Threads);
+                                               Threads);
         return;
     }
     const int base_pos              = positions[0];
@@ -356,19 +288,34 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
     const int max_query_abs = base_pos + q0 + tile_rows - 1;
     const int key_blocks    = max_query_abs / Bc + 1;
 
-    for (int i = tid; i < Br * CodeW; i += kGqaPrefillNvfp4s3Threads) { q_codes[i] = 0; }
-    for (int i = tid; i < Br * Groups; i += kGqaPrefillNvfp4s3Threads) { q_scale[i] = 0; }
+    for (int i = tid; i < Br * CodeW; i += Threads) { q_codes[i] = 0; }
+    for (int i = tid; i < Br * Groups; i += Threads) { q_scale[i] = 0; }
     __syncthreads();
 
-    for (int unit = tid; unit < Br * Groups; unit += kGqaPrefillNvfp4s3Threads) {
+    // SmoothQ: mean over this CTA's Q rows (Sage3 group-mean; GROUP_SIZE analog is Br).
+    for (int d = tid; d < D; d += Threads) {
+        float s = 0.0f;
+        for (int r = 0; r < tile_rows; ++r) {
+            s += __bfloat162float(q[gqa_prefill_q_index<Geometry>(q_head, d, q0 + r)]);
+        }
+        q_smooth_mean[d] = tile_rows > 0 ? s / static_cast<float>(tile_rows) : 0.0f;
+    }
+    __syncthreads();
+
+    for (int unit = tid; unit < Br * Groups; unit += Threads) {
         const int row = unit / Groups;
         const int grp = unit - row * Groups;
         std::uint32_t lo = 0, hi = 0;
         std::uint8_t sc = 0;
         if (row < tile_rows) {
-            gqa_nvfp4_quantize_bf16x16(
-                &q[gqa_prefill_q_index<Geometry>(q_head, grp * kGqaNvfp4Group, q0 + row)], lo, hi,
-                sc);
+            float adj[kGqaNvfp4Group];
+            const int d0 = grp * kGqaNvfp4Group;
+#pragma unroll
+            for (int i = 0; i < kGqaNvfp4Group; ++i) {
+                adj[i] = __bfloat162float(q[gqa_prefill_q_index<Geometry>(q_head, d0 + i, q0 + row)]) -
+                         q_smooth_mean[d0 + i];
+            }
+            gqa_nvfp4_quantize_f32x16(adj, lo, hi, sc);
         }
         const int phys = gqa_nvfp4_swizzle_byte(row, grp * 8);
         *reinterpret_cast<std::uint32_t*>(q_codes + row * CodeW + phys)     = lo;
@@ -378,14 +325,14 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
     __syncthreads();
     // Debug: capture the fully-written Q codes + Q scale smem for host A/B.
     if (dbg_q != nullptr && q_head == 0 && q_block == 0) {
-        for (int i = tid; i < Br * CodeW; i += kGqaPrefillNvfp4s3Threads) dbg_q[i] = q_codes[i];
-        for (int i = tid; i < Br * Groups; i += kGqaPrefillNvfp4s3Threads)
-            dbg_q[kGqaPrefillNvfp4s3QBytes + i] = q_scale[i];
+        for (int i = tid; i < Br * CodeW; i += Threads) dbg_q[i] = q_codes[i];
+        for (int i = tid; i < Br * Groups; i += Threads)
+            dbg_q[Tile::QBytes + i] = q_scale[i];
     }
 
     auto issue_kv_tile = [&](int tile_k0, std::uint8_t* vs_stage) {
         const int physical_page = block_table[tile_k0 >> kPagedKVPageShift];
-        for (int key_l = tid; key_l < Bc; key_l += kGqaPrefillNvfp4s3Threads) {
+        for (int key_l = tid; key_l < Bc; key_l += Threads) {
             const int key = tile_k0 + key_l;
             if (key <= max_query_abs) {
                 const std::int64_t off =
@@ -395,7 +342,7 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
                 store_vec(&k_scale_s[key_l * Groups], make_int4(0, 0, 0, 0));
             }
         }
-        for (int chunk = tid; chunk < Bc * (CodeW / 16); chunk += kGqaPrefillNvfp4s3Threads) {
+        for (int chunk = tid; chunk < Bc * (CodeW / 16); chunk += Threads) {
             const int key_l   = chunk / (CodeW / 16);
             const int seg     = chunk - key_l * (CodeW / 16);
             const int logical = seg * 16;
@@ -413,7 +360,7 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
                 store_vec(vd, make_int4(0, 0, 0, 0));
             }
         }
-        for (int d = tid; d < D; d += kGqaPrefillNvfp4s3Threads) {
+        for (int d = tid; d < D; d += Threads) {
             // One aligned 4B copy of the whole kb row (kb 1..3 offsets are not 4B aligned).
             // vs_stage is the parity slot for the tile being issued (see v_scales_b).
             const std::int64_t off = gqa_s3_v_scale_index<Geometry>(physical_page, kv_head, d, 0);
@@ -421,10 +368,6 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
         }
         ninfer::ops::cp_commit();
     };
-
-    issue_kv_tile(0, v_scales);
-    ninfer::ops::cp_wait<0>();
-    __syncthreads();
 
     const int gid           = lane >> 2;
     const int lid           = lane & 3;
@@ -448,6 +391,9 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
     float running_l1     = 0.0f;
     const float scale_l2 = scale * Log2E;
 
+    int n_tiles = key_blocks;
+    const int* keep_list_ptr = nullptr;
+    if constexpr (!ExactT) {
     __shared__ float proxy_scores[4096];
     __shared__ int keep_list[4096];
     __shared__ int k_keep_count;
@@ -489,7 +435,7 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
             q_mean_s[d] = acc / static_cast<float>(tile_rows);
         }
         __syncthreads();
-        for (int kb = warp; kb < key_blocks; kb += kGqaPrefillNvfp4s3Warps) {
+        for (int kb = warp; kb < key_blocks; kb += Tile::Warps) {
             const int physical_page = block_table[kb];
             float acc               = 0.0f;
 #pragma unroll
@@ -547,16 +493,47 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
         for (int i = 0; i < ncopy; ++i) { dump->keep_list[q_head * dump->max_tiles + i] = keep_list[i]; }
         dump->tile_count[q_head] = k_keep_count;
     }
-    if (k_keep_count > 0) { issue_kv_tile(keep_list[0] * Bc, v_scales); ninfer::ops::cp_wait<0>(); }
+    n_tiles = k_keep_count;
+    keep_list_ptr = keep_list;
+    } // if constexpr (!ExactT)
+    if (n_tiles > 0) {
+        const int first_kb = ExactT ? 0 : keep_list_ptr[0];
+        issue_kv_tile(first_kb * Bc, v_scales);
+        ninfer::ops::cp_wait<0>();
+    }
     __syncthreads();
-    for (int ki = 0; ki < k_keep_count; ++ki) {
-        const int kb = keep_list[ki];
+    for (int ki = 0; ki < n_tiles; ++ki) {
+        const int kb = ExactT ? ki : keep_list_ptr[ki];
         const int k0 = kb * Bc;
-        if (warp < ProducerWarps) {
-            const int row_base = warp * 16;
-            float score[QKNt][4];
+        // SmoothQ restore: k_delta[key] = q_mean · K_hat[key] (same addend for every
+        // row in this Br tile). All threads participate so the skip-list producer
+        // warps and the occ2 split-N warps see a settled plane before QK.
+        if (tid < Bc) { k_smooth_delta[tid] = 0.0f; }
+        __syncthreads();
+        {
+            const int nslice = Threads / Bc;
+            const int d_per  = D / nslice;
+            const int key_l  = tid & (Bc - 1);
+            const int d0     = (tid / Bc) * d_per;
+            float p          = 0.0f;
+            if (k0 + key_l <= max_query_abs) {
+                for (int i = 0; i < d_per; ++i) {
+                    p += q_smooth_mean[d0 + i] *
+                         gqa_s3_k_smem_dequant(k_codes, k_scale_s, key_l, d0 + i);
+                }
+            }
+            atomicAdd(&k_smooth_delta[key_l], p);
+        }
+        __syncthreads();
+        const bool do_qk = ExactT || (warp < ProducerWarps);
+        if (do_qk) {
+            const int k_half   = ExactT ? warp / Tile::RowTiles : 0;
+            const int row_base = ExactT ? (warp % Tile::RowTiles) * 16 : warp * 16;
+            const int nt_base  = k_half * NtLocal;
+            const int nb_base  = k_half * NbLocal;
+            float score[NtLocal][4];
 #pragma unroll
-            for (int nt = 0; nt < QKNt; ++nt) {
+            for (int nt = 0; nt < NtLocal; ++nt) {
                 score[nt][0] = score[nt][1] = score[nt][2] = score[nt][3] = 0.0f;
             }
 
@@ -577,13 +554,14 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
                         &q_scale[scale_row * Groups + k64 * 4]);
                 }
 #pragma unroll
-                for (int nt = 0; nt < QKNt; ++nt) {
-                    const int brow       = nt * 8 + b_row_offset;
+                for (int nt = 0; nt < NtLocal; ++nt) {
+                    const int nt_g       = nt + nt_base;
+                    const int brow       = nt_g * 8 + b_row_offset;
                     const int b_logical  = k64 * 32 + b_column_byte;
                     const int b_physical = gqa_nvfp4_swizzle_byte(brow, b_logical);
                     unsigned bf[2];
                     ldmatrix_x2(bf[0], bf[1], smem_addr(k_codes + brow * CodeW + b_physical));
-                    const int b_scale_row = nt * 8 + sfb_row;
+                    const int b_scale_row = nt_g * 8 + sfb_row;
                     unsigned sfb          = 0;
                     if ((lane & 3) == 0) {
                         sfb = *reinterpret_cast<const unsigned*>(
@@ -605,6 +583,15 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
                 }
             }
 
+#pragma unroll
+            for (int nt = 0; nt < NtLocal; ++nt) {
+                const int k0l = (nt + nt_base) * 8 + 2 * lid;
+                score[nt][0] += k_smooth_delta[k0l];
+                score[nt][1] += k_smooth_delta[k0l + 1];
+                score[nt][2] += k_smooth_delta[k0l];
+                score[nt][3] += k_smooth_delta[k0l + 1];
+            }
+
             const int row0             = row_base + gid;
             const int row1             = row0 + 8;
             const int qabs0            = row0 < tile_rows ? base_pos + q0 + row0 : -1;
@@ -612,15 +599,16 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
             const bool full_score_tile = q0 + Br <= tokens && k0 + Bc - 1 <= base_pos + q0;
             // Per-16-key raw-score maxima: block nb covers nt 2nb/2nb+1, 8 lanes
             // (2 nt × 4 lid) hold its 16 scores; reduce across the 4 lid lanes.
-            float bm0_blk[4], bm1_blk[4];
+            float bm0_blk[NbLocal], bm1_blk[NbLocal];
 #pragma unroll
-            for (int nb = 0; nb < 4; ++nb) {
+            for (int nb = 0; nb < NbLocal; ++nb) {
                 float m0 = -CUDART_INF_F;
                 float m1 = -CUDART_INF_F;
 #pragma unroll
                 for (int nt = 2 * nb; nt < 2 * nb + 2; ++nt) {
+                    const int nt_g = nt + nt_base;
                     if (!full_score_tile) {
-                        const int key0 = k0 + nt * 8 + 2 * lid;
+                        const int key0 = k0 + nt_g * 8 + 2 * lid;
                         const int key1 = key0 + 1;
                         if (key0 > qabs0) { score[nt][0] = -CUDART_INF_F; }
                         if (key1 > qabs0) { score[nt][1] = -CUDART_INF_F; }
@@ -637,8 +625,8 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
                 // Raw (post-causal-mask) QK dot per (row, in-tile key): lane holds
                 // (row0,row1) x (key, key+1) per nt. -INF marks causally masked keys.
                 float* ds = &dump->score[(dht + ki) * static_cast<std::int64_t>(Br) * Bc];
-                for (int nt = 0; nt < QKNt; ++nt) {
-                    const int key_l = nt * 8 + 2 * lid;
+                for (int nt = 0; nt < NtLocal; ++nt) {
+                    const int key_l = (nt + nt_base) * 8 + 2 * lid;
                     ds[static_cast<std::int64_t>(row0) * Bc + key_l]       = score[nt][0];
                     ds[static_cast<std::int64_t>(row0) * Bc + key_l + 1]   = score[nt][1];
                     ds[static_cast<std::int64_t>(row1) * Bc + key_l]       = score[nt][2];
@@ -648,9 +636,21 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
             float bm0 = -CUDART_INF_F;
             float bm1 = -CUDART_INF_F;
 #pragma unroll
-            for (int nb = 0; nb < 4; ++nb) {
+            for (int nb = 0; nb < NbLocal; ++nb) {
                 bm0 = fmaxf(bm0, bm0_blk[nb]);
                 bm1 = fmaxf(bm1, bm1_blk[nb]);
+            }
+            if constexpr (ExactT) {
+                // Partner warp holds the other 32 keys of this 16-row tile. v_t is
+                // unused until the transpose below, so it hosts the max/L scratch.
+                float* half_m = reinterpret_cast<float*>(v_t);
+                if (lid == 0) {
+                    half_m[k_half * Br + row0] = bm0;
+                    half_m[k_half * Br + row1] = bm1;
+                }
+                __syncthreads();
+                bm0 = fmaxf(bm0, half_m[(k_half ^ 1) * Br + row0]);
+                bm1 = fmaxf(bm1, half_m[(k_half ^ 1) * Br + row1]);
             }
 
             const float nm0        = fmaxf(running_m0, bm0);
@@ -666,7 +666,8 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
             float bl0              = 0.0f;
             float bl1              = 0.0f;
 #pragma unroll
-            for (int nb = 0; nb < 4; ++nb) {
+            for (int nb = 0; nb < NbLocal; ++nb) {
+                const int nb_g = nb + nb_base;
                 // Per-16-key P block scale (S3): S = 448 * exp2((m_blk - nm) * scale_l2),
                 // encoded to e4m3; P codes = P / S land in [0, 6] (e2m1 range).
                 const float sf0f = bm0_blk[nb] == -CUDART_INF_F
@@ -726,16 +727,28 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
                 const float qb1 = dec1 > 0.0f ? __fdiv_rn(pb1, dec1) : 0.0f;
                 const float qb2 = dec1 > 0.0f ? __fdiv_rn(pb2, dec1) : 0.0f;
                 const float qb3 = dec1 > 0.0f ? __fdiv_rn(pb3, dec1) : 0.0f;
-                p4[row0 * P4Row + nb * 8 + lid] = gqa_s3_cvt_e2m1x2(qa0, qa1);
-                p4[row0 * P4Row + nb * 8 + 4 + lid] = gqa_s3_cvt_e2m1x2(qa2, qa3);
-                p4[row1 * P4Row + nb * 8 + lid] = gqa_s3_cvt_e2m1x2(qb0, qb1);
-                p4[row1 * P4Row + nb * 8 + 4 + lid] = gqa_s3_cvt_e2m1x2(qb2, qb3);
+                p4[row0 * P4Row + nb_g * 8 + lid] = gqa_s3_cvt_e2m1x2(qa0, qa1);
+                p4[row0 * P4Row + nb_g * 8 + 4 + lid] = gqa_s3_cvt_e2m1x2(qa2, qa3);
+                p4[row1 * P4Row + nb_g * 8 + lid] = gqa_s3_cvt_e2m1x2(qb0, qb1);
+                p4[row1 * P4Row + nb_g * 8 + 4 + lid] = gqa_s3_cvt_e2m1x2(qb2, qb3);
                 if (lid == 0) {
-                    psf[row0 * 4 + nb] = sc0;
-                    psf[row1 * 4 + nb] = sc1;
+                    psf[row0 * 4 + nb_g] = sc0;
+                    psf[row1 * 4 + nb_g] = sc1;
                 }
             }
-            if (do_dump && lane < 16) {
+            bl0        = warp_sum<4>(bl0, FullMask);
+            bl1        = warp_sum<4>(bl1, FullMask);
+            if constexpr (ExactT) {
+                float* half_l = reinterpret_cast<float*>(v_t);
+                if (lid == 0) {
+                    half_l[k_half * Br + row0] = bl0;
+                    half_l[k_half * Br + row1] = bl1;
+                }
+                __syncthreads();
+                bl0 += half_l[(k_half ^ 1) * Br + row0];
+                bl1 += half_l[(k_half ^ 1) * Br + row1];
+            }
+            if (do_dump && (!ExactT || k_half == 0) && lane < 16) {
                 // e2m1 P codes + e4m3 P-block scales for this tile's 16 rows. p4 byte j
                 // holds keys (2j, 2j+1) (low nibble = key 2j); p4/psf are reused per tile,
                 // so the copy must land before the next iteration's producer phase.
@@ -752,13 +765,11 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
                                          static_cast<std::int64_t>(drow) * 4],
                              psf + drow * 4, 4);
             }
-            bl0        = warp_sum<4>(bl0, FullMask);
-            bl1        = warp_sum<4>(bl1, FullMask);
             running_l0 = __fmaf_rn(running_l0, alpha0, bl0);
             running_l1 = __fmaf_rn(running_l1, alpha1, bl1);
             running_m0 = nm0;
             running_m1 = nm1;
-            if (do_dump && lid == 0) {
+            if (do_dump && lid == 0 && (!ExactT || k_half == 0)) {
                 const std::int64_t ml = (dht + ki) * Br;
                 dump->m[ml + row0] = running_m0;
                 dump->l[ml + row0] = running_l0;
@@ -769,21 +780,43 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
                 alpha_s[row0] = alpha0;
                 alpha_s[row1] = alpha1;
             }
+        }
+        if constexpr (ExactT) {
+            // All 8 warps nibble-transpose V after QK. Cheap vs softmax; serial so
+            // every warp stays on the QK/P-quant critical path.
+            for (int d = tid; d < D; d += Threads) {
+                const int dp = d >> 1;
+                const int sh = (d & 1) * 4;
+#pragma unroll
+                for (int kp = 0; kp < Bc / 2; kp += 4) {
+                    std::uint32_t packed = 0;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const std::uint8_t b0 = v_codes[(2 * (kp + i)) * CodeW + dp];
+                        const std::uint8_t b1 = v_codes[(2 * (kp + i) + 1) * CodeW + dp];
+                        const std::uint8_t byte =
+                            static_cast<std::uint8_t>(((b1 >> sh) & 0x0Fu) << 4) |
+                            static_cast<std::uint8_t>((b0 >> sh) & 0x0Fu);
+                        packed |= static_cast<std::uint32_t>(byte) << (i * 8);
+                    }
+                    *reinterpret_cast<std::uint32_t*>(&v_t[d * P4Row + kp]) = packed;
+                }
+            }
         } else if (warp < ProducerWarps + VWorkerWarps) {
             // Transpose V codes key-major -> d-major (v_t), feeding the PV B operand.
             const int worker_tid = tid - ProducerWarps * 32;
-            // One worker thread per d-row: write a contiguous 32-byte v_t row so the
-            // store hits distinct SMEM banks. The original unit-strided store placed
-            // every lane's write on the same bank (32-way conflict).
             for (int d = worker_tid; d < D; d += WorkerThreads) {
                 const int dp = d >> 1;
                 const int sh = (d & 1) * 4;
+                // One worker thread per d-row: write a contiguous 32-byte v_t
+                // row so the store hits distinct SMEM banks.
 #pragma unroll 1
                 for (int kp = 0; kp < Bc / 2; ++kp) {
                     const std::uint8_t b0 = v_codes[2 * kp * CodeW + dp];
                     const std::uint8_t b1 = v_codes[(2 * kp + 1) * CodeW + dp];
-                    v_t[d * P4Row + kp]   = (static_cast<std::uint8_t>(((b1 >> sh) & 0x0Fu) << 4) |
-                                           static_cast<std::uint8_t>((b0 >> sh) & 0x0Fu));
+                    v_t[d * P4Row + kp] =
+                        static_cast<std::uint8_t>(((b1 >> sh) & 0x0Fu) << 4) |
+                        static_cast<std::uint8_t>((b0 >> sh) & 0x0Fu);
                 }
             }
         }
@@ -803,16 +836,19 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
                          vs_cur + tid * 4, 4);
         }
 
-        const bool has_next = ki + 1 < k_keep_count;
+        const bool has_next = ki + 1 < n_tiles;
         // Issue the next tile's async load now (pipelined overlap with this tile's
         // PV mma): it targets the opposite v_scales parity slot (vs_next), and every
         // read of the shared single-buffered planes (q/k codes, k scales, v_codes)
         // finished before the __syncthreads() above, so the in-flight load cannot
         // clobber any plane the current tile still reads.
-        if (has_next) { issue_kv_tile(keep_list[ki + 1] * Bc, vs_next); }
+        if (has_next) {
+            const int next_kb = ExactT ? ki + 1 : keep_list_ptr[ki + 1];
+            issue_kv_tile(next_kb * Bc, vs_next);
+        }
 
-        const int row_tile = warp % kGqaPrefillNvfp4s3RowTiles;
-        const int d_slice  = warp / kGqaPrefillNvfp4s3RowTiles;
+        const int row_tile = warp % Tile::RowTiles;
+        const int d_slice  = warp / Tile::RowTiles;
         const int row_base = row_tile * 16;
         const float alpha0 = alpha_s[row_base + gid];
         const float alpha1 = alpha_s[row_base + gid + 8];
@@ -873,7 +909,7 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
         __syncthreads();
         }
 
-    if (warp < ProducerWarps && lid == 0) {
+    if (warp < Tile::RowTiles && lid == 0) {
         const int row0  = warp * 16 + gid;
         const int row1  = row0 + 8;
         final_l_s[row0] = running_l0;
@@ -881,8 +917,8 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
     }
     __syncthreads();
 
-    const int row_tile = warp % kGqaPrefillNvfp4s3RowTiles;
-    const int d_slice  = warp / kGqaPrefillNvfp4s3RowTiles;
+    const int row_tile = warp % Tile::RowTiles;
+    const int d_slice  = warp / Tile::RowTiles;
     const int row_base = row_tile * 16;
     const int row0     = row_base + gid;
     const int row1     = row0 + 8;
@@ -902,6 +938,38 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
                 pack_bf16x2(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
         }
     }
+}
+
+template <typename Geometry, typename Metadata>
+__global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4s3_kernel(
+    const __nv_bfloat16* __restrict__ q, const std::uint8_t* __restrict__ cache_k,
+    const std::uint8_t* __restrict__ cache_v, const std::uint8_t* __restrict__ cache_k_scale,
+    const std::uint8_t* __restrict__ cache_v_scale, const float* __restrict__ k_mean,
+    Metadata metadata,
+    const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
+    std::int32_t width, float keep_frac, GqaS3PrefillDump* dump,
+    std::uint32_t* dbg_regs = nullptr, std::uint8_t* dbg_q = nullptr) {
+    // Exact tiles only: Sparge/XAttention skip lives on the exact-NVFP4 sibling
+    // kernel. Passing ExactT=true drops the meansim keep-list path.
+    gqa_attention_prefill_nvfp4s3_device<Geometry, Metadata, kGqaPrefillNvfp4s3Br,
+                                         kGqaPrefillNvfp4s3Warps, true>(
+        q, cache_k, cache_v, cache_k_scale, cache_v_scale, k_mean, metadata, positions, scale, out,
+        width, keep_frac, dump, dbg_regs, dbg_q);
+}
+
+template <typename Geometry, typename Metadata>
+__global__ __launch_bounds__(GqaPrefillNvfp4s3Occ2::Threads, 2) void gqa_attention_prefill_nvfp4s3_occ2_kernel(
+    const __nv_bfloat16* __restrict__ q, const std::uint8_t* __restrict__ cache_k,
+    const std::uint8_t* __restrict__ cache_v, const std::uint8_t* __restrict__ cache_k_scale,
+    const std::uint8_t* __restrict__ cache_v_scale, const float* __restrict__ k_mean,
+    Metadata metadata,
+    const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
+    std::int32_t width, float keep_frac, GqaS3PrefillDump* dump,
+    std::uint32_t* dbg_regs = nullptr, std::uint8_t* dbg_q = nullptr) {
+    gqa_attention_prefill_nvfp4s3_device<Geometry, Metadata, GqaPrefillNvfp4s3Occ2::Br,
+                                         GqaPrefillNvfp4s3Occ2::Warps, true>(
+        q, cache_k, cache_v, cache_k_scale, cache_v_scale, k_mean, metadata, positions, scale, out,
+        width, keep_frac, dump, dbg_regs, dbg_q);
 }
 
 } // namespace ninfer::ops

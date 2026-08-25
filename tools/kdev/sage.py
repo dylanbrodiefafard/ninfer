@@ -18,13 +18,10 @@ Env knobs (all set by this module; the test has no CLI for them):
   GQA_SAGE_ONLY=1    run only the sage (U8 nvfp4s3) cases
   GQA_SAGE_FLOOR=1   print the per-case SAGE_FLOOR decomposition
   GQA_SAGE_FAST=1    drop the two T=128 multi-tile A1 cases (fast tier)
-  GQA_KEEP_FRAC=x    A/B the tile-skip lever: the test allocates the sage k_mean
-                     proxy plane and the A1 Prompt route engages tile-skip; the
-                     bench runs with NINFER_KEEP_FRAC=x. keep_frac<1 measures
-                     tile-skip loss as device_vs_exact - floor.
+  GQA_KEEP_FRAC=x    unused in sage mode (tile-skip is exact-NVFP4, not S3)
 
 Usage:
-    python3 -m tools.kdev gqa_attention --sage [--fast] [--keep-frac 0.2] [--bench]
+    python3 -m tools.kdev gqa_attention --sage [--fast] [--bench]
 """
 
 from __future__ import annotations
@@ -125,9 +122,7 @@ def run_sage(op_name: str, fast: bool = False, keep_frac: float | None = None,
     if fast:
         env["GQA_SAGE_FAST"] = "1"
     if keep_frac is not None:
-        if not (0.0 < keep_frac <= 1.0):
-            raise SystemExit(f"keep_frac must be in (0, 1]; got {keep_frac}")
-        env["GQA_KEEP_FRAC"] = f"{keep_frac:g}"
+        raise SystemExit("--keep-frac cannot be combined with sage quality mode")
 
     result = harness.run(f"cd {harness.BUILD} && {harness.test_binary(op)}",
                          env=env, check=False, timeout=1800.0)
@@ -169,7 +164,7 @@ def run_sage(op_name: str, fast: bool = False, keep_frac: float | None = None,
     }
 
     if run_bench:
-        bench_env = {"NINFER_KEEP_FRAC": f"{keep_frac:g}"} if keep_frac is not None else None
+        bench_env = None
         bench_result = harness.run(f"cd {harness.BUILD} && {harness.bench_binary(op)}",
                                    env=bench_env, check=False, timeout=1800.0)
         points = [

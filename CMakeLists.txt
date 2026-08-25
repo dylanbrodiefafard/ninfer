@@ -40,6 +40,17 @@ if(CMAKE_GENERATOR MATCHES "Ninja")
   set(CMAKE_JOB_POOL_LINK cuda_link)
 endif()
 
+# cicc is single-threaded unless nvcc --split-compile is set. --threads is a
+# no-op for our single sm_120a arch. 0 = all host CPUs (nvcc docs). Fat GQA
+# launchers are also split into their own TUs so ninja can run several cicc
+# processes. Override with -DNINFER_NVCC_THREADS=OFF to disable.
+set(NINFER_NVCC_THREADS 0 CACHE STRING "nvcc --split-compile (0 = nproc, OFF = disable)")
+if(NINFER_NVCC_THREADS STREQUAL "OFF")
+  # disabled
+elseif(NINFER_NVCC_THREADS GREATER_EQUAL 0)
+  add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:--split-compile;${NINFER_NVCC_THREADS}>")
+endif()
+
 if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.1)
   message(FATAL_ERROR
     "NInfer requires CUDA 13.1 or newer; found CUDA compiler "

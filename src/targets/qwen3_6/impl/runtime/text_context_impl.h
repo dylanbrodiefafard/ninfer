@@ -257,14 +257,6 @@ TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, Wor
     if (mtp_enabled() && !io_.mtp_decode && !io_.mtp) {
         throw std::invalid_argument("MTP TextContext requires MTP round state");
     }
-    if (const char* keep_frac_env = std::getenv("NINFER_KEEP_FRAC")) {
-        char* keep_frac_end = nullptr;
-        const float keep_frac_parsed = std::strtof(keep_frac_env, &keep_frac_end);
-        if (keep_frac_end == keep_frac_env || keep_frac_parsed <= 0.0f || keep_frac_parsed > 1.0f) {
-            throw std::invalid_argument("NINFER_KEEP_FRAC must be in (0, 1]");
-        }
-        keep_frac_ = keep_frac_parsed;
-    }
     set_linear_state_slots(0, state_.slot_count() > 1 ? 1 : 0);
     bind();
 }
@@ -890,21 +882,18 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         Tensor a_batch        = a.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
-        // keep_frac_ defaults to 1.0: exact attention (keep all key tiles, no tile-skip).
-        // NINFER_KEEP_FRAC < 1 enables the sage_pv tile-skip (needs the k_mean plane).
         const Tensor ancestor_mask =
             active_ancestor_mask_ != nullptr ? *active_ancestor_mask_ : Tensor{};
         const Tensor prefix_lengths =
             active_prefix_lengths_ != nullptr ? *active_prefix_lengths_ : Tensor{};
         ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
                            kAttnScale, batch_text_kv_->batch_layer_view(fidx),
-                           *active_gqa_envelope_, work_, a_batch, s, keep_frac_, ancestor_mask,
-                           prefix_lengths);
+                           *active_gqa_envelope_, work_, a_batch, s, keep_frac_, xattn_tau_,
+                           xattn_min_len_, nullptr, ancestor_mask, prefix_lengths);
     } else {
-        // keep_frac_ as above (exact at the default 1.0).
         ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, kAttnScale,
                             batch_text_kv_->batch_layer_view(fidx), *active_gqa_envelope_, work_, a,
-                            s, keep_frac_);
+                            s, keep_frac_, xattn_tau_, xattn_min_len_);
     }
     ops::sigmoid_mul(gate, a, s);
 

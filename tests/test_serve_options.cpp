@@ -267,6 +267,33 @@ int main() {
     failures += check(!secret_present, "startup argv retained the API key");
     failures += check(redaction_present, "startup argv omitted the API-key redaction marker");
 
+    failures += check(serve_usage_text("ninfer-serve").find("--keep-frac") != std::string::npos,
+                      "serve help omits --keep-frac");
+    failures += check(serve_usage_text("ninfer-serve").find("--xattn-tau") != std::string::npos,
+                      "serve help omits --xattn-tau");
+    {
+        const ServeOptions skip = parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "nvfp4",
+                                         "--keep-frac", "0.5"});
+        failures += check(skip.keep_frac == 0.5f, "--keep-frac 0.5 did not parse");
+        failures += check(skip.xattn_tau == 1.0f, "xattn_tau default is not 1.0");
+    }
+    {
+        bool rejected = false;
+        try {
+            parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "nvfp4", "--sage", "--keep-frac",
+                   "0.5"});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "--sage --keep-frac 0.5 must be rejected");
+    }
+    {
+        bool rejected = false;
+        try {
+            parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "nvfp4", "--keep-frac", "0.5",
+                   "--xattn-tau", "0.9"});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "--keep-frac and --xattn-tau must be mutually exclusive");
+    }
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

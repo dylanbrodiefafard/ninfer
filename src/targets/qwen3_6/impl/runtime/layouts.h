@@ -70,6 +70,9 @@ struct SequencePlanningInputs {
     DType kv_dtype                         = DType::BF16;
     std::int32_t kv_quant_group            = 0;
     bool sage_attn                         = false;
+    float keep_frac                        = 1.0f;
+    float xattn_tau                        = 1.0f;
+    std::int32_t xattn_min_len             = 8192;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;
@@ -95,6 +98,9 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     DType kv_dtype                         = DType::BF16;
     std::int32_t kv_quant_group            = 0;
     bool sage_attn                         = false;
+    float keep_frac                        = 1.0f;
+    float xattn_tau                        = 1.0f;
+    std::int32_t xattn_min_len             = 8192;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;

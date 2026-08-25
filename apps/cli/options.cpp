@@ -95,7 +95,8 @@ std::string usage_text(const char* argv0) {
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--kv-ram-capacity off|N] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
-           "       [--kv-dtype bf16|int8|nvfp4] [--sage] [--spec mtp|dflash --draft-tokens N]\n"
+           "       [--kv-dtype bf16|int8|nvfp4] [--sage] [--keep-frac F] [--xattn-tau F]\n"
+           "       [--spec mtp|dflash --draft-tokens N]\n"
            "       [--dflash-verify-width N] [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -154,6 +155,10 @@ Options parse_options(int argc, char** argv) {
             options.kv_cache = parse_kv_cache(value(arg));
         } else if (arg == "--sage") {
             options.sage_attn = true;
+        } else if (arg == "--keep-frac") {
+            options.keep_frac = parse_unit_interval_flag(value(arg), "--keep-frac");
+        } else if (arg == "--xattn-tau") {
+            options.xattn_tau = parse_unit_interval_flag(value(arg), "--xattn-tau");
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
         } else if (arg == "--draft-tokens") {
@@ -236,6 +241,8 @@ Options parse_options(int argc, char** argv) {
     if (options.sage_attn && options.kv_cache != KvCacheStorage::Nvfp4) {
         throw std::invalid_argument("--sage requires --kv-dtype nvfp4");
     }
+    validate_sparse_attn_flags(options.kv_cache, options.sage_attn, options.keep_frac,
+                               options.xattn_tau);
     product::validate_speculative_cli_options(options.speculative);
     if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
         throw std::invalid_argument("--spec dflash cannot be combined with --vision");

@@ -197,7 +197,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       draft_window(plan.draft_window), dflash_verify_width(plan.dflash_verify_width),
       speculative_backend(plan.speculative_backend),
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
-      proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
+      proposal_head(plan.proposal_head), keep_frac(plan.keep_frac), xattn_tau(plan.xattn_tau),
+      xattn_min_len(plan.xattn_min_len), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       kv_ram_capacity_bytes(plan.kv_ram_capacity_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
@@ -1565,7 +1566,10 @@ void ProgramImplCore::prepare_graphs() {
                                        io,
                                        prefill_hidden,
                                        prefill_chunk,
-                                       proposal_head};
+                                       proposal_head,
+                                       keep_frac,
+                                       xattn_tau,
+                                       xattn_min_len};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -1839,7 +1843,8 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
 
     schedule::DFlashAppendContext state{{device, model, work, decoder->linear_attention,
                                          replay_records ? &*replay_records : nullptr, io,
-                                         prefill_hidden, prefill_chunk, proposal_head},
+                                         prefill_hidden, prefill_chunk, proposal_head, keep_frac,
+                                         xattn_tau, xattn_min_len},
                                         *dflash};
     mark_workspace_usage(workspace_plan.dflash_context);
     schedule::dflash_append_context(state, features, positions, device_counts, lane_tensor,
@@ -1902,7 +1907,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         schedule::PrefillContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, keep_frac, xattn_tau, xattn_min_len},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
@@ -2183,7 +2188,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         schedule::OrdinaryBatchContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, keep_frac, xattn_tau, xattn_min_len},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
@@ -2314,7 +2319,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
         schedule::MtpBatchContext schedule_state{{device, model, work, decoder->linear_attention,
                                                   replay_records ? &*replay_records : nullptr, io,
-                                                  prefill_hidden, prefill_chunk, proposal_head},
+                                                  prefill_hidden, prefill_chunk, proposal_head,
+                                                  keep_frac, xattn_tau, xattn_min_len},
                                                  decoder->text_kv,
                                                  *decoder->mtp_cache(),
                                                  *io.mtp_decode,
@@ -2484,7 +2490,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         schedule::DFlashBatchContext schedule_state{{device, model, work, decoder->linear_attention,
                                                      replay_records ? &*replay_records : nullptr,
                                                      io, prefill_hidden, prefill_chunk,
-                                                     proposal_head},
+                                                     proposal_head, keep_frac, xattn_tau,
+                                                     xattn_min_len},
                                                     decoder->text_kv,
                                                     *dflash,
                                                     *io.dflash_decode,

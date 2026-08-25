@@ -21,10 +21,13 @@ CUDA graphs default **on**, matching production decode. `--no-cuda-graph` is the
 eager pair. Each cell writes `max_nll`, `terrible_tokens` (nll ≥ 10), and a
 `{cell}.nllf32` sidecar so mean PPL cannot hide a handful of exploding tokens.
 
-`--spec mtp --draft-tokens 4` loads MTP and scores T=1 target-verify (drafts
-cleared after the prefix). It is not a draft-accept-rate test. `--spec dflash`
-is admitted on `--schedule prefill` only (target teacher-force with DFlash
-feature capture loaded). DFlash decode score is rejected.
+Decode-lane cells run under the production MTP spec by default: `--spec mtp
+--draft-tokens 3` loads MTP and scores T=1 target-verify (drafts cleared after
+the prefix). It is not a draft-accept-rate test. `--no-mtp` (or `--spec none`)
+reverts to spec-free decode; `--draft-tokens N` overrides the draft length.
+Prefill-lane cells are always spec-free for MTP. `--spec dflash` is admitted on
+`--schedule prefill` only (target teacher-force with DFlash feature capture
+loaded). DFlash decode score is rejected.
 
 ## Run
 
@@ -42,8 +45,8 @@ python3 tools/ppl/run.py \
 First run bakes WikiText-2 with `ninfer-ppl --encode` (the tokenizer inside the
 `.ninfer` file). The script prints the output directory, which contains
 `results.json` and `results.md`. `--tokens N` scores only that length; `--long`
-is 32k only. `--no-extras` drops the 8k extra cells; `--no-mtp` keeps the other
-extras.
+is 32k only. `--no-extras` drops the 8k extra cells; `--no-mtp` runs the decode
+lane spec-free (legacy behavior) and skips the MTP extras.
 
 Decode is much slower (one T=1 step per scored token):
 
@@ -60,6 +63,24 @@ python3 tools/ppl/run.py --gate kv-int8=0.02 --gate kv-nvfp4=0.05
 
 Without `--gate`, deltas are reported and the process still exits 0 unless a cell has
 non-finite NLL. A non-finite BF16 baseline also fails.
+
+## Noise columns
+
+Each cell's `{cell}.nllf32` sidecar (per-token NLLs, float32 LE, written by
+`ninfer-ppl` next to the cell JSON) feeds the noise stats in `results.json` /
+`results.md`:
+
+- `nll_std` / `nll_se` — per-token NLL std for the cell and its SE (std/√n).
+- `delta_nll_se` — SE of the per-token **paired** Δnll vs the group's bf16
+  baseline (same corpus positions, index-aligned; the paired mean equals the
+  `Δ mean_nll` column exactly).
+- `in_noise` — |Δ| ≤ 2·Δ1σ: the delta is not resolved above the per-token
+  noise floor (rendered as `noise: yes` in the table).
+
+The paired SE is far tighter than the SE of the two independent means — what
+makes "wash or real?" answerable at the 1e-3 level. Keep the `.nllf32`
+sidecars when copying results elsewhere; without them the noise columns are
+blank.
 
 ## Add an attention scheme
 

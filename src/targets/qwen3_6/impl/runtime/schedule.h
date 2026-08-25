@@ -39,6 +39,11 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
+    // No defaults: an omitted member value-initializes to 0 and gqa_attention
+    // rejects keep_frac. Prefill must pass ProgramImplCore's skip knobs.
+    float keep_frac;
+    float xattn_tau;
+    std::int32_t xattn_min_len;
 };
 
 struct PrefillContext {

@@ -92,4 +92,29 @@ __device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloa
     return result;
 }
 
+__device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_f32x16(const float* source) {
+    float2 values[8];
+    float max_abs = 0.0F;
+#pragma unroll
+    for (int pair = 0; pair < 8; ++pair) {
+        values[pair] = make_float2(source[2 * pair], source[2 * pair + 1]);
+        max_abs      = fmaxf(max_abs, fabsf(values[pair].x));
+        max_abs      = fmaxf(max_abs, fabsf(values[pair].y));
+    }
+
+    Nvfp4QuantizedK16 result{};
+    const float scale_unencoded = __fdiv_rn(max_abs, 6.0F);
+    result.scale                = __nv_cvt_float_to_fp8(scale_unencoded, __NV_SATFINITE, __NV_E4M3);
+    if (result.scale == 0) { return result; }
+
+    const float decoded_scale = decode_nvfp4_e4m3(result.scale);
+#pragma unroll
+    for (int pair = 0; pair < 8; ++pair) {
+        values[pair].x = __fdiv_rn(values[pair].x, decoded_scale);
+        values[pair].y = __fdiv_rn(values[pair].y, decoded_scale);
+    }
+    pack_nvfp4_e2m1x16(values, result.codes_lo, result.codes_hi);
+    return result;
+}
+
 } // namespace ninfer::ops::detail

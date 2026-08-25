@@ -269,6 +269,8 @@ int main(int argc, char** argv) {
         engine_options.prefill_chunk = options.prefill_chunk;
         engine_options.kv_cache      = options.kv_cache;
         engine_options.sage_attn     = options.sage_attn;
+        engine_options.keep_frac     = options.keep_frac;
+        engine_options.xattn_tau     = options.xattn_tau;
         engine_options.speculative.backend       = options.mtp_draft_tokens == 0
                                                        ? ninfer::SpeculativeBackend::None
                                                        : ninfer::SpeculativeBackend::Mtp;
@@ -283,6 +285,8 @@ int main(int argc, char** argv) {
         env.prefill_chunk            = options.prefill_chunk;
         env.kv_cache                 = options.kv_cache;
         env.sage_attn                = options.sage_attn;
+        env.keep_frac                = options.keep_frac;
+        env.xattn_tau                = options.xattn_tau;
         env.concurrency              = options.concurrency;
         env.mtp_draft_tokens         = options.mtp_draft_tokens;
         env.proposal_head            = options.proposal_head;

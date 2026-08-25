@@ -69,6 +69,7 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
                                  const Tensor& positions, const Tensor& valid_columns,
                                  const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
                                  Tensor& out, cudaStream_t stream, float keep_frac = 1.0f,
+                                 float xattn_tau = 1.0f, std::int32_t xattn_min_len = 8192,
                                  GqaS3PrefillDump* dump = nullptr);
 
 void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -81,6 +82,8 @@ void gqa_kv_compact_path_launch(PagedKVBatchLayerView cache, const Tensor& kv_ta
 void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positions, float scale,
                                            const PagedKVLayerView& cache, Tensor& out,
                                            cudaStream_t stream, float keep_frac = 1.0f,
+                                           float xattn_tau = 1.0f,
+                                           std::int32_t xattn_min_len = 8192,
                                            GqaS3PrefillDump* dump = nullptr,
                                            std::uint32_t* dbg_regs = nullptr,
                                            std::uint8_t* dbg_q = nullptr);
