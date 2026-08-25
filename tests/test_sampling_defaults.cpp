@@ -66,13 +66,17 @@ int main() {
         .min_p            = 0.0F,
         .presence_penalty = 1.5F,
     };
+    const ninfer::SamplingPreset qwen3_8_thinking{
+        .temperature = 0.6F, .top_k = 20, .top_p = 0.95F, .min_p = 0.0F};
+    const ninfer::SamplingPreset qwen3_8_non_thinking{
+        .temperature = 0.7F, .top_k = 20, .top_p = 0.8F, .min_p = 0.0F};
 
     failures += check(same_preset(qwen3_6.thinking, dense_thinking),
                       "Qwen3.6-27B thinking defaults mismatch");
     failures += check(same_preset(qwen3_6.non_thinking, dense_non_thinking),
                       "Qwen3.6-27B non-thinking defaults mismatch");
-    failures += check(same_preset(qwen3_8.thinking, dense_thinking) &&
-                          same_preset(qwen3_8.non_thinking, dense_non_thinking),
+    failures += check(same_preset(qwen3_8.thinking, qwen3_8_thinking) &&
+                          same_preset(qwen3_8.non_thinking, qwen3_8_non_thinking),
                       "Qwen3.8-27B defaults mismatch");
     failures += check(same_preset(qwen3_6_35.thinking, moe_thinking) &&
                           same_preset(qwen3_6_35.non_thinking, dense_non_thinking),
@@ -84,11 +88,11 @@ int main() {
         qwen3_8, ninfer::SamplingMode::Thinking, ninfer::SamplingOverrides{});
     const ninfer::ResolvedSamplingParameters non_thinking = ninfer::runtime::resolve_sampling(
         qwen3_8, ninfer::SamplingMode::NonThinking, ninfer::SamplingOverrides{});
-    failures += check(thinking.temperature == 1.0F && thinking.top_p == 0.95F &&
+    failures += check(thinking.temperature == 0.6F && thinking.top_p == 0.95F &&
                           thinking.presence_penalty == 0.0F && thinking.seed == 0,
                       "omitted overrides did not select Qwen3.8 thinking defaults");
     failures += check(non_thinking.temperature == 0.7F && non_thinking.top_p == 0.8F &&
-                          non_thinking.presence_penalty == 1.5F,
+                          non_thinking.presence_penalty == 0.0F,
                       "omitted overrides did not select Qwen3.8 non-thinking defaults");
 
     ninfer::SamplingOverrides overrides;

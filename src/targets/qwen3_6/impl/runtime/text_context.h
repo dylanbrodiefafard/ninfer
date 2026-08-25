@@ -183,6 +183,8 @@ public:
 
     void set_linear_state_slots(std::int32_t current_slot, std::int32_t rewrite_checkpoint_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
+    void set_tree_verify(const Tensor* parent_index, const Tensor* ancestor_mask,
+                         const Tensor* prefix_lengths);
 
     [[nodiscard]] const Weight* proposal_head() const noexcept { return proposal_head_; }
 
@@ -299,6 +301,9 @@ private:
     const Tensor* active_kv_table_rows_                   = nullptr;
     const Tensor* active_linear_state_slots_              = nullptr;
     const Tensor* active_valid_columns_                   = nullptr;
+    const Tensor* active_parent_index_                    = nullptr;
+    const Tensor* active_ancestor_mask_                   = nullptr;
+    const Tensor* active_prefix_lengths_                  = nullptr;
     const Tensor* active_backend_kv_table_rows_           = nullptr;
     const ops::GqaExecutionEnvelope* active_gqa_envelope_ = nullptr;
     std::int32_t active_sequence_batch_                   = 0;

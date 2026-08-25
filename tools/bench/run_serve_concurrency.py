@@ -178,6 +178,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8080, help="loopback serving port")
     parser.add_argument("--device", type=int, default=0, help="CUDA device index")
     parser.add_argument(
+        "--proposal-head",
+        choices=("optimized", "full"),
+        default="optimized",
+        help="DFlash/MTP proposal head: optimized (--lm-head-draft) or full vocab (default: optimized)",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true", help="print point commands and request counts only"
     )
     return parser.parse_args(argv)
@@ -374,9 +380,10 @@ def server_command(
                 point.speculative_backend,
                 "--draft-tokens",
                 str(point.draft_tokens),
-                "--lm-head-draft",
             ]
         )
+        if getattr(args, "proposal_head", "optimized") == "optimized":
+            command.append("--lm-head-draft")
     if point.sampling_mode == "greedy":
         command.append("--greedy")
     else:
@@ -419,7 +426,7 @@ def validate_server_start(
         "prefix_reuse": False,
         "speculative_backend": point.speculative_backend,
         "speculative_draft_window": point.draft_tokens,
-        "proposal_head": "optimized" if point.draft_tokens else "full",
+        "proposal_head": getattr(args, "proposal_head", "optimized") if point.draft_tokens else "full",
     }
     actual = {name: engine.get(name) for name in expected}
     if actual != expected:

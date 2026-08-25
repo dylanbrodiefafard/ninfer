@@ -71,6 +71,28 @@ void require_tensor_shape(const Tensor& t, DType dtype, std::initializer_list<st
     if (t.data == nullptr) { throw std::invalid_argument(std::string(label) + " data is null"); }
 }
 
+// Batched verify packs sequences as [rows, width*batch]. NVFP4 and SmallT routes are selected
+// from aggregate T, so C=3 k=4 (T=15) would take residual W4A4 while C=1 (T=5) stays A16, and
+// the output head would use a different SmallT specialization. Launch those column-independent
+// projections at T=width so each request matches C=1 of the same k.
+bool packed_sequence_tiles(std::int32_t batch, std::int32_t width, std::int32_t tokens) {
+    return batch > 1 && width > 1 && tokens == width * batch;
+}
+
+template <typename Fn>
+void for_each_packed_sequence_tile_pair(std::int32_t batch, std::int32_t width, Tensor& a,
+                                        Tensor& b, Fn&& fn) {
+    if (!packed_sequence_tiles(batch, width, a.ne[1]) || a.ne[1] != b.ne[1]) {
+        fn(a, b);
+        return;
+    }
+    for (std::int32_t i = 0; i < batch; ++i) {
+        Tensor a_tile = a.slice(1, i * width, width);
+        Tensor b_tile = b.slice(1, i * width, width);
+        fn(a_tile, b_tile);
+    }
+}
+
 void require_tensor_window(const Tensor& t, DType dtype, std::int32_t rows, std::int32_t cols,
                            const char* label) {
     if (cols <= 0) { throw std::invalid_argument(std::string(label) + " cols must be positive"); }
@@ -266,6 +288,13 @@ void TextContext::set_gdn_state_action(GdnStateAction action,
     }
     gdn_state_action_ = action;
     replay_records_   = replay_records;
+}
+
+void TextContext::set_tree_verify(const Tensor* parent_index, const Tensor* ancestor_mask,
+                                  const Tensor* prefix_lengths) {
+    active_parent_index_   = parent_index;
+    active_ancestor_mask_  = ancestor_mask;
+    active_prefix_lengths_ = prefix_lengths;
 }
 
 void TextContext::bind() {
@@ -731,7 +760,10 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_logits = logits.view({kCfg.vocab, columns});
         Tensor flat_tokens = target_tokens.view({columns});
         ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
-        ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
+        for_each_packed_sequence_tile_pair(
+            batch, width, flat_hidden, flat_logits, [&](Tensor& hidden_tile, Tensor& logits_tile) {
+                ops::linear(hidden_tile, *lm_head_, logits_tile, stream);
+            });
         ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
     }
     work_.reset();
@@ -815,8 +847,22 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     Tensor gate_flat = gate.view({kCfg.q_size, T});
     Tensor k_flat    = k.view({kCfg.kv_size, T});
     Tensor v_flat    = v.view({kCfg.kv_size, T});
-    Variant::attention_projection(h, *w.projection, q_flat, gate_flat, k_flat, v_flat, ph, work_,
-                                  s);
+    if (packed_sequence_tiles(active_sequence_batch_, active_sequence_width_, T)) {
+        const std::int32_t width = active_sequence_width_;
+        for (std::int32_t b = 0; b < active_sequence_batch_; ++b) {
+            const std::int32_t col = b * width;
+            Tensor h_tile          = h.slice(1, col, width);
+            Tensor q_tile          = q_flat.slice(1, col, width);
+            Tensor gate_tile       = gate_flat.slice(1, col, width);
+            Tensor k_tile          = k_flat.slice(1, col, width);
+            Tensor v_tile          = v_flat.slice(1, col, width);
+            Variant::attention_projection(h_tile, *w.projection, q_tile, gate_tile, k_tile, v_tile,
+                                          ph, work_, s);
+        }
+    } else {
+        Variant::attention_projection(h, *w.projection, q_flat, gate_flat, k_flat, v_flat, ph,
+                                      work_, s);
+    }
 
     const auto results = workspace_recipe::text_attention_results<TextConfig>(work_, T);
     Tensor qn          = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, T});
@@ -846,9 +892,14 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         // keep_frac_ defaults to 1.0: exact attention (keep all key tiles, no tile-skip).
         // NINFER_KEEP_FRAC < 1 enables the sage_pv tile-skip (needs the k_mean plane).
+        const Tensor ancestor_mask =
+            active_ancestor_mask_ != nullptr ? *active_ancestor_mask_ : Tensor{};
+        const Tensor prefix_lengths =
+            active_prefix_lengths_ != nullptr ? *active_prefix_lengths_ : Tensor{};
         ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
-                            kAttnScale, batch_text_kv_->batch_layer_view(fidx),
-                            *active_gqa_envelope_, work_, a_batch, s, keep_frac_);
+                           kAttnScale, batch_text_kv_->batch_layer_view(fidx),
+                           *active_gqa_envelope_, work_, a_batch, s, keep_frac_, ancestor_mask,
+                           prefix_lengths);
     } else {
         // keep_frac_ as above (exact at the default 1.0).
         ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, kAttnScale,
@@ -857,7 +908,13 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     }
     ops::sigmoid_mul(gate, a, s);
 
-    Variant::attention_output_projection(a.view({kCfg.q_size, T}), *w.o_proj, x, ph, work_, s);
+    Tensor a_flat = a.view({kCfg.q_size, T});
+    for_each_packed_sequence_tile_pair(
+        active_sequence_batch_, active_sequence_width_, a_flat, x,
+        [&](Tensor& attention_tile, Tensor& residual_tile) {
+            Variant::attention_output_projection(attention_tile, *w.o_proj, residual_tile, ph,
+                                                 work_, s);
+        });
 }
 
 void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
@@ -868,8 +925,21 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor h           = control.hidden;
     Tensor g           = control.g;
     Tensor beta        = control.beta;
-    Variant::gdn_norm_control_projection(x, *w.input_norm, kCfg.rms_eps, *w.projection, h, g, beta,
-                                         work_, s);
+    if (packed_sequence_tiles(active_sequence_batch_, active_sequence_width_, T)) {
+        const std::int32_t width = active_sequence_width_;
+        for (std::int32_t b = 0; b < active_sequence_batch_; ++b) {
+            const std::int32_t col = b * width;
+            Tensor x_tile          = x.slice(1, col, width);
+            Tensor h_tile          = h.slice(1, col, width);
+            Tensor g_tile          = g.slice(1, col, width);
+            Tensor beta_tile       = beta.slice(1, col, width);
+            Variant::gdn_norm_control_projection(x_tile, *w.input_norm, kCfg.rms_eps, *w.projection,
+                                                 h_tile, g_tile, beta_tile, work_, s);
+        }
+    } else {
+        Variant::gdn_norm_control_projection(x, *w.input_norm, kCfg.rms_eps, *w.projection, h, g,
+                                             beta, work_, s);
+    }
 
     const auto projection = workspace_recipe::gdn_projection<TextConfig>(work_, T);
     Tensor z              = projection.output_gate.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
@@ -900,7 +970,8 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
             Variant::gdn_input_projection_record(projection_input, *w.projection, *w.conv1d,
                                                  conv_states, valid, *active_linear_state_slots_,
                                                  records.conv, query_output, key_output,
-                                                 value_output, gate_output, ph, work_, s);
+                                                 value_output, gate_output, ph, work_, s,
+                                                 active_parent_index_);
         } else {
             Variant::gdn_input_projection_snapshot(
                 projection_input, *w.projection, *w.conv1d, conv_states, valid,
@@ -944,7 +1015,8 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
             ops::gated_delta_net_replay_record(q_batch, k_batch, v_batch, g_batch, beta_batch,
                                                kGdnScale, recurrent_states, valid,
                                                *active_linear_state_slots_, records.key,
-                                               records.value, records.gate, out_batch, s);
+                                               records.value, records.gate, out_batch, s,
+                                               active_parent_index_, &work_);
         } else {
             ops::gated_delta_net_snapshot(q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale,
                                           /*normalize_qk=*/true, recurrent_states, valid,
@@ -962,7 +1034,12 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s);
 
-    Variant::gdn_output_projection(on.view({kCfg.value_dim, T}), *w.out_proj, x, ph, work_, s);
+    Tensor on_flat = on.view({kCfg.value_dim, T});
+    for_each_packed_sequence_tile_pair(
+        active_sequence_batch_, active_sequence_width_, on_flat, x,
+        [&](Tensor& output_tile, Tensor& residual_tile) {
+            Variant::gdn_output_projection(output_tile, *w.out_proj, residual_tile, ph, work_, s);
+        });
 }
 
 void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph) {
@@ -971,7 +1048,11 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
     Tensor h       = workspace_recipe::post_mixer_hidden<TextConfig>(work_, T);
     ops::rmsnorm(x, *post_norm, kCfg.rms_eps, true, h, s);
 
-    Variant::post_mixer(h, *m.payload, x, ph, work_, s);
+    for_each_packed_sequence_tile_pair(
+        active_sequence_batch_, active_sequence_width_, h, x,
+        [&](Tensor& hidden_tile, Tensor& residual_tile) {
+            Variant::post_mixer(hidden_tile, *m.payload, residual_tile, ph, work_, s);
+        });
 }
 
 template <class Tap>

@@ -41,6 +41,14 @@ void validate_spec(const RoundStateSpec& spec) {
         throw std::invalid_argument(
             "RoundState DFlash draft window exceeds the decode frame domain");
     }
+    if (spec.enable_dflash) {
+        const std::uint32_t verify_width =
+            spec.dflash_verify_width == 0 ? spec.draft_window + 1U : spec.dflash_verify_width;
+        if (verify_width < 2 || verify_width > kDFlashDecodeMaximumWidth) {
+            throw std::invalid_argument(
+                "RoundState DFlash verify width exceeds the decode frame domain");
+        }
+    }
     if (spec.batch_capacity == 0 || spec.batch_capacity > kMaximumConcurrency) {
         throw std::invalid_argument("RoundState batch capacity must be in [1,8]");
     }
@@ -179,24 +187,35 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
             builder.add(sizeof(DFlashDecodeEgress), kArenaAlign, "DFlash decode egress");
         const auto batch = checked_i32(layout.spec.batch_capacity,
                                        "RoundState DFlash batch capacity exceeds int32");
+        const std::uint32_t resolved_width =
+            layout.spec.dflash_verify_width == 0 ? layout.spec.draft_window + 1U
+                                                : layout.spec.dflash_verify_width;
+        const auto dflash_width = checked_i32(resolved_width,
+                                              "RoundState DFlash verify width exceeds int32");
         decode.proposal_ids =
-            add_tensor(builder, DType::I32, {columns, batch}, "DFlash proposal ids");
+            add_tensor(builder, DType::I32, {dflash_width, batch}, "DFlash proposal ids");
         decode.proposal_positions =
-            add_tensor(builder, DType::I32, {columns, batch}, "DFlash proposal positions");
+            add_tensor(builder, DType::I32, {dflash_width, batch}, "DFlash proposal positions");
         decode.append_positions =
-            add_tensor(builder, DType::I32, {columns, batch}, "DFlash append positions");
+            add_tensor(builder, DType::I32, {dflash_width, batch}, "DFlash append positions");
         decode.append_counts = add_tensor(builder, DType::I32, {batch}, "DFlash append counts");
         decode.draft_tokens =
-            add_tensor(builder, DType::I32, {columns - 1, batch}, "DFlash proposal draft tokens");
+            add_tensor(builder, DType::I32, {dflash_width - 1, batch}, "DFlash proposal draft tokens");
         decode.verify_ids =
-            add_tensor(builder, DType::I32, {columns, batch}, "DFlash target verify ids");
+            add_tensor(builder, DType::I32, {dflash_width, batch}, "DFlash target verify ids");
+        decode.parent_index =
+            add_tensor(builder, DType::I32, {dflash_width, batch}, "DFlash tree parent index");
+        decode.ancestor_mask =
+            add_tensor(builder, DType::I32, {dflash_width, batch}, "DFlash tree ancestor mask");
+        decode.cache_positions =
+            add_tensor(builder, DType::I32, {dflash_width, batch}, "DFlash tree cache positions");
         decode.target_argmax =
-            add_tensor(builder, DType::I32, {columns, batch}, "DFlash target argmax");
+            add_tensor(builder, DType::I32, {dflash_width, batch}, "DFlash target argmax");
         decode.target_logits =
-            add_tensor(builder, DType::BF16, {layout.spec.output_rows, columns, batch},
+            add_tensor(builder, DType::BF16, {layout.spec.output_rows, dflash_width, batch},
                        "DFlash target logits");
         decode.target_hidden = add_tensor(
-            builder, DType::BF16, {layout.spec.hidden, columns, batch}, "DFlash target hidden");
+            builder, DType::BF16, {layout.spec.hidden, dflash_width, batch}, "DFlash target hidden");
         decode.target_continuation_hidden = add_tensor(
             builder, DType::BF16, {layout.spec.hidden, batch}, "DFlash target continuation hidden");
     }
@@ -295,7 +314,13 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     static_assert(std::is_standard_layout_v<DFlashDecodeEgress>);
     const auto batch          = static_cast<std::int32_t>(batch_capacity);
     const auto drafts         = static_cast<std::int32_t>(draft_window);
-    const auto width          = drafts + 1;
+    const auto width          = layout.verify_ids.shape[0];
+    if (width < 2 || width > static_cast<std::int32_t>(kDFlashDecodeMaximumWidth) ||
+        drafts < 1 || drafts > width - 1) {
+        throw std::invalid_argument(
+            "DFlash decode state verify width does not match the draft window");
+    }
+    (void)drafts;
     ingress                   = layout.ingress.bind(backing);
     egress                    = layout.egress.bind(backing);
     const auto ingress_tensor = [&](std::size_t offset, DType dtype,
@@ -328,12 +353,18 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
         egress_tensor(offsetof(DFlashDecodeEgress, licensed_counts), DType::I32, {batch});
     accepted_drafts =
         egress_tensor(offsetof(DFlashDecodeEgress, accepted_drafts), DType::I32, {batch});
+    accepted_column =
+        egress_tensor(offsetof(DFlashDecodeEgress, accepted_column), DType::I32, {batch});
+    fold_path = egress_tensor(offsetof(DFlashDecodeEgress, fold_path), DType::I32, {width, batch});
     proposal_ids               = layout.proposal_ids.bind(backing);
     proposal_positions         = layout.proposal_positions.bind(backing);
     append_positions           = layout.append_positions.bind(backing);
     append_counts              = layout.append_counts.bind(backing);
     draft_tokens               = layout.draft_tokens.bind(backing);
     verify_ids                 = layout.verify_ids.bind(backing);
+    parent_index               = layout.parent_index.bind(backing);
+    ancestor_mask              = layout.ancestor_mask.bind(backing);
+    cache_positions            = layout.cache_positions.bind(backing);
     target_argmax              = layout.target_argmax.bind(backing);
     target_logits              = layout.target_logits.bind(backing);
     target_hidden              = layout.target_hidden.bind(backing);

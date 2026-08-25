@@ -150,6 +150,10 @@ int test_cli_contract() {
         parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "nvfp4"})
             .kv_cache == ninfer::KvCacheStorage::Nvfp4,
         "NVFP4 KV");
+    failures += expect(
+        parse_for_test({"ninfer_bench", "--weights", "model.ninfer"}).kv_cache ==
+            ninfer::KvCacheStorage::Nvfp4,
+        "default KV is NVFP4");
     failures += expect_u32(
         parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--concurrency", "2"})
             .concurrency,

@@ -79,6 +79,21 @@ int main() {
                       "--draft-tokens did not preserve the DFlash window");
     failures += check(dflash.speculative.proposal_head == ninfer::ProposalHead::Optimized,
                       "--lm-head-draft did not select the optimized proposal head");
+    failures += check(dflash.speculative.dflash_verify_width == 0,
+                      "DFlash verify width default is not auto");
+
+    const ServeOptions dflash_w6 =
+        parse({"ninfer-serve", "model.ninfer", "--spec", "dflash", "--draft-tokens", "4",
+               "--dflash-verify-width", "6"});
+    failures += check(dflash_w6.speculative.dflash_verify_width == 6,
+                      "--dflash-verify-width did not preserve the packed width");
+
+    bool dflash_width_without_spec_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--dflash-verify-width", "6"});
+    } catch (const std::invalid_argument&) { dflash_width_without_spec_rejected = true; }
+    failures += check(dflash_width_without_spec_rejected,
+                      "--dflash-verify-width was accepted without --spec dflash");
 
     bool dflash_vision_rejected = false;
     try {

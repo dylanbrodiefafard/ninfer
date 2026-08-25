@@ -46,4 +46,14 @@ void scatter_bf16_batch_launch(const Tensor& source, const Tensor& lanes,
     CUDA_CHECK(cudaGetLastError());
 }
 
+void gather_bf16_path_launch(Tensor& features, const Tensor& lanes, const Tensor& path,
+                             const Tensor& counts, cudaStream_t stream) {
+    constexpr int block = 128;
+    gather_bf16_path_kernel<<<counts.ne[0], block, 0, stream>>>(
+        static_cast<uint4*>(features.data), static_cast<const std::int32_t*>(lanes.data),
+        static_cast<const std::int32_t*>(path.data), static_cast<const std::int32_t*>(counts.data),
+        features.ne[0] / 8, path.ne[0]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

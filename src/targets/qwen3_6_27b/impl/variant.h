@@ -69,7 +69,8 @@ struct Variant {
         const Tensor& hidden, const GdnProjectionWeights& weights, const Tensor& conv_weight,
         const Tensor& conv_states, const Tensor& valid_columns, const Tensor& initial_slots,
         Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value, Tensor& output_gate,
-        qwen3_6::TextPhase phase, WorkspaceArena& workspace, cudaStream_t stream);
+        qwen3_6::TextPhase phase, WorkspaceArena& workspace, cudaStream_t stream,
+        const Tensor* parent_index = nullptr);
     static void gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
                                       qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                                       cudaStream_t stream);
@@ -124,7 +125,7 @@ struct Variant {
     mtp_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window);
     [[nodiscard]] static std::vector<GraphExecutionProfile>
     dflash_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window,
-                          std::uint32_t batch_size);
+                          std::uint32_t batch_size, std::uint32_t verify_width);
 };
 
 } // namespace ninfer::targets::qwen3_6_27b::detail

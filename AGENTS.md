@@ -256,10 +256,15 @@ route is checked directly against the same oracle with a criterion appropriate t
 implementation profile; pairwise implementation parity is supplementary evidence only.
 
 Where relevant to the changed behavior, account for numeric-format decode, BF16 fusion order, FP32
-GDN state, BF16/INT8 KV, MTP accept/commit state, arena lifetime, and CUDA Graph address stability.
-This is a risk map, not a checklist for every numerical task.
+GDN state, BF16/INT8/NVFP4 KV, MTP accept/commit state, arena lifetime, and CUDA Graph address
+stability. This is a risk map, not a checklist for every numerical task.
 
 ## Performance work
+
+CLI, serve, Engine A/Bs, and decode-speed work use the Engine default `--kv-dtype nvfp4` unless
+the task is numerical identity, a long-context capacity comparison, or an explicit dtype A/B.
+Pass `--kv-dtype bf16` when uncompressed KV is the contract. Qwen3.8-27B DFlash2 speed work
+keeps BF16 selector codebooks with NVFP4 draft matrices; NVFP4 codebooks are not the speed path.
 
 Define a performance claim at the level where it matters: operator, schedule, request phase, or
 end-to-end inference. Measure that level directly when practical. An isolated microbenchmark can
@@ -313,6 +318,7 @@ These are conventional project resources, not a checklist of resources every tas
 | normal build | `build/` |
 | profiler output | `profiles/ncu/`, `profiles/nsys/`, `profiles/bench/` |
 | hardware/toolchain | RTX 5090, `sm_120a`, CUDA 13.1 |
+| KV for speed / Engine A/Bs | `--kv-dtype nvfp4` |
 
 Use the selected Python 3.11 interpreter explicitly. Do not install or upgrade dependencies unless
 the task requires it. Never select an artifact by glob, modification time, or an unqualified

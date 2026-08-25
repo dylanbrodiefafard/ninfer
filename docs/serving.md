@@ -478,9 +478,10 @@ curl http://127.0.0.1:8080/v1/models \
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
-| `--kv-dtype bf16\|int8\|nvfp4` | KV-cache storage | `bf16` |
+| `--kv-dtype bf16\|int8\|nvfp4` | KV-cache storage | `nvfp4` |
 | `--spec mtp\|dflash` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; 35B DFlash `1..15`; 3.8 DFlash2 `1..7` | unset |
+| `--draft-tokens N` | MTP `1..5`; 35B DFlash `1..15`; 3.8 DFlash2 `1..11` | unset |
+| `--dflash-verify-width N` | DFlash packed/chain verify width `2..16`; omit for the k-dependent default | auto |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--vision` | enable media input and load Vision GPU allocations | off |
@@ -500,11 +501,12 @@ curl http://127.0.0.1:8080/v1/models \
 | `--greedy` | force exact argmax for all requests | off |
 
 Engine selects sampling defaults from the loaded model and the request's resolved thinking mode.
-Qwen3.6-27B and Qwen3.8-27B use `1.0/0.95/20/0/0` for
-temperature/top-p/top-k/min-p/presence penalty in thinking mode and `0.7/0.80/20/0/1.5` in
-non-thinking mode. Qwen3.6-35B-A3B differs only in its thinking presence penalty, which is `1.5`.
-Frequency penalty is `0` for all registered presets. Process flags override registered values,
-request fields override process flags, and `--greedy` finally forces temperature `0`.
+Qwen3.6-27B uses `1.0/0.95/20/0/0` for temperature/top-p/top-k/min-p/presence penalty in thinking
+mode and `0.7/0.80/20/0/1.5` in non-thinking mode. Qwen3.8-27B uses presence penalty `0` in both
+modes (`0.6/0.95/20/0/0` thinking, `0.7/0.80/20/0/0` non-thinking). Qwen3.6-35B-A3B uses
+`1.0/0.95/20/0/1.5` in thinking mode and `0.7/0.80/20/0/1.5` in non-thinking mode. Frequency
+penalty is `0` for all registered presets. Process flags override registered values, request
+fields override process flags, and `--greedy` finally forces temperature `0`.
 
 Run `./build/apps/ninfer-serve --help` for the exact option contract.
 

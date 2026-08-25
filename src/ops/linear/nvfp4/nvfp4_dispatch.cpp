@@ -37,6 +37,12 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
     case Nvfp4Problem::Residual6144:
     case Nvfp4Problem::Residual17408:
         return tokens >= 8 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
+    case Nvfp4Problem::DflashFeature:
+    case Nvfp4Problem::DflashQkv:
+    case Nvfp4Problem::DflashAttnOut:
+    case Nvfp4Problem::DflashConvProj:
+    case Nvfp4Problem::DflashSelector:
+        return Nvfp4LinearRoute::A16;
     }
     throw std::logic_error("unreachable NVFP4 linear problem");
 }

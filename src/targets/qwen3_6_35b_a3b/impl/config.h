@@ -91,6 +91,11 @@ struct DFlashConfig {
     static constexpr float attention_scale = 0.08838834764831845F;
     static constexpr std::array<int, feature_layers> target_feature_layers{1,  6,  11, 16,
                                                                            22, 27, 32, 37};
+    static constexpr bool tree_verify  = false;
+    static constexpr int tree_frontier = 1;
+    static constexpr int verify_width  = 0;
+    static constexpr int unmask_refine = 0;
+    static constexpr int two_block_first = 0;
 };
 
 inline constexpr float kAttentionScale                   = 0.0625F;

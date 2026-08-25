@@ -98,7 +98,8 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
                             const Tensor& beta, float scale, const Tensor& states,
                             const Tensor& valid_columns, const Tensor& initial_slots,
                             const Tensor& key_record, const Tensor& value_record,
-                            const Tensor& gate_record, const Tensor& out) {
+                            const Tensor& gate_record, const Tensor& out,
+                            const Tensor* parent_index) {
     constexpr const char* kOp      = "gated_delta_net_replay_record";
     const std::int32_t qk_heads    = q.ne[1];
     const std::int32_t value_heads = v.ne[1];
@@ -131,7 +132,20 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     require_tensor(out, DType::BF16, {kStateDim, value_heads, width, rows}, 2, kOp, "out");
     require_scale(scale, kOp);
 
-    const std::array<const Tensor*, 12> tensors{&q,
+    const bool tree = parent_index != nullptr && parent_index->data != nullptr;
+    if (tree) {
+        const bool batched = parent_index->ne[0] == width && parent_index->ne[1] == rows &&
+                             parent_index->ne[2] == 1 && parent_index->ne[3] == 1;
+        const bool dense_single = rows == 1 && parent_index->ne[0] == width &&
+                                  parent_index->ne[1] == 1 && parent_index->ne[2] == 1 &&
+                                  parent_index->ne[3] == 1;
+        if (parent_index->dtype != DType::I32 || !parent_index->is_contiguous() ||
+            !aligned_to(parent_index->data, 4) || (!batched && !dense_single)) {
+            throw std::invalid_argument(std::string(kOp) + ": invalid parent_index");
+        }
+    }
+
+    const std::array<const Tensor*, 13> tensors{&q,
                                                 &k,
                                                 &v,
                                                 &g,
@@ -142,11 +156,14 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
                                                 &key_record,
                                                 &value_record,
                                                 &gate_record,
-                                                &out};
+                                                &out,
+                                                tree ? parent_index : nullptr};
     std::vector<MemoryRange> ranges;
     ranges.reserve(tensors.size());
     for (const Tensor* tensor : tensors) {
-        if (tensor->data != nullptr) { ranges.push_back(tensor_range(*tensor, kOp)); }
+        if (tensor != nullptr && tensor->data != nullptr) {
+            ranges.push_back(tensor_range(*tensor, kOp));
+        }
     }
     require_pairwise_disjoint(ranges, "gated_delta_net_replay_record: tensors must not overlap");
 }
@@ -273,12 +290,28 @@ validate_fold_rows(const GdnReplayRecords& records, LinearAttentionStateAllLayer
         if (rows[row].commit_columns < 0 || rows[row].commit_columns > records.spec.width) {
             throw std::invalid_argument("gdn_replay_fold: commit extent is out of range");
         }
+        if (rows[row].path_length > records.spec.width || rows[row].path_length > 16) {
+            throw std::invalid_argument("gdn_replay_fold: path length is out of range");
+        }
+        if (rows[row].path_length > 0) {
+            for (std::int32_t step = 0; step < rows[row].path_length; ++step) {
+                if (rows[row].path[static_cast<std::size_t>(step)] < 0 ||
+                    rows[row].path[static_cast<std::size_t>(step)] >= records.spec.width) {
+                    throw std::invalid_argument("gdn_replay_fold: path index is out of range");
+                }
+            }
+        }
         for (std::size_t previous = 0; previous < row; ++previous) {
             if (rows[previous].linear_state_slot == rows[row].linear_state_slot) {
                 throw std::invalid_argument("gdn_replay_fold: active state slots must be distinct");
             }
         }
-        packed.row[row] = {rows[row].linear_state_slot, rows[row].commit_columns};
+        packed.row[row].linear_state_slot = rows[row].linear_state_slot;
+        packed.row[row].commit_columns    = rows[row].commit_columns;
+        packed.row[row].path_length       = rows[row].path_length;
+        for (std::int32_t step = 0; step < 16; ++step) {
+            packed.row[row].path[step] = rows[row].path[static_cast<std::size_t>(step)];
+        }
     }
     return packed;
 }
@@ -290,12 +323,49 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                                    const Tensor& ssm_states, const Tensor& valid_columns,
                                    const Tensor& initial_state_slots, Tensor& key_record,
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
-                                   cudaStream_t stream) {
+                                   cudaStream_t stream, const Tensor* parent_index,
+                                   WorkspaceArena* workspace) {
     validate_replay_record(q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots,
-                           key_record, value_record, gate_record, out);
+                           key_record, value_record, gate_record, out, parent_index);
+    const std::int32_t* parent_ptr =
+        (parent_index != nullptr && parent_index->data != nullptr)
+            ? static_cast<const std::int32_t*>(parent_index->data)
+            : nullptr;
+    float* column_scratch = nullptr;
+    if (parent_ptr != nullptr && workspace != nullptr) {
+        const std::size_t need = gated_delta_net_replay_record_workspace_capacity_bytes(
+            v.ne[1], q.ne[3], q.ne[2]);
+        column_scratch = static_cast<float*>(workspace->alloc_bytes(need).data);
+    }
     detail::gated_delta_net::launch_recurrent_record(q, k, v, g, beta, scale, ssm_states,
                                                      valid_columns, initial_state_slots, key_record,
-                                                     value_record, gate_record, out, stream);
+                                                     value_record, gate_record, out, stream,
+                                                     parent_ptr, column_scratch);
+}
+
+std::size_t gated_delta_net_replay_record_workspace_capacity_bytes(std::int32_t value_heads,
+                                                                   std::int32_t batch,
+                                                                   std::int32_t width) {
+    if (value_heads <= 0 || batch <= 0 || width <= 0) {
+        throw std::invalid_argument(
+            "gated_delta_net_replay_record workspace: invalid heads/batch/width");
+    }
+    const std::size_t hv = static_cast<std::size_t>(value_heads);
+    const std::size_t b  = static_cast<std::size_t>(batch);
+    const std::size_t w  = static_cast<std::size_t>(width);
+    constexpr std::size_t kState = static_cast<std::size_t>(kStateDim);
+    if (hv > std::numeric_limits<std::size_t>::max() / b) {
+        throw std::overflow_error("gated_delta_net_replay_record workspace overflow");
+    }
+    const std::size_t hv_b = hv * b;
+    if (w > std::numeric_limits<std::size_t>::max() / (kState * kState * sizeof(float))) {
+        throw std::overflow_error("gated_delta_net_replay_record workspace overflow");
+    }
+    const std::size_t per_head = w * kState * kState * sizeof(float);
+    if (hv_b > std::numeric_limits<std::size_t>::max() / per_head) {
+        throw std::overflow_error("gated_delta_net_replay_record workspace overflow");
+    }
+    return hv_b * per_head;
 }
 
 void gdn_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,

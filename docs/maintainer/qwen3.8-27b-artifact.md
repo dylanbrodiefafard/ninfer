@@ -59,8 +59,10 @@ logical row views, and aliases are defined by
 
 Optional DFlash2 on the NVFP4 identity is defined by
 `tools/convert/qwen3_8_27b/inventory_dflash2.py` (66 tensors). W8 matrices use `W8G32_F16S`; the
-Q4 sibling uses `Q4G64_F16S` for the same `[N,K]` set. Direct tensors (norms, conv `base_kernel`,
-selector codebooks) stay BF16. Codebooks are stored as NInfer `(256, 248320)` rank-fastest.
+Q4 sibling uses `Q4G64_F16S` for the same `[N,K]` set. The product NVFP4 sibling uses `NVFP4`
+`blockscale-k16-m128x4-v1` for those matrices. Direct tensors (norms, conv `base_kernel`) stay
+BF16. Default selector codebooks are BF16 NInfer `(256, 248320)` rank-fastest; `--dflash-codebook nvfp4`
+stores them as NVFP4 weights of logical shape `[248320, 256]` (token = row, rank = K).
 `base_kernel` is stored as `(5120, 2, 2)` in Hugging Face order without a permute.
 
 | Object | Logical shape | Format (W8 sibling) |
@@ -106,20 +108,48 @@ Qwen3.6-27B profile, `tokenizer.json`, `tokenizer_config.json`, and `chat_templa
 Qwen3.8-specific bytes; `generation_config.json`, `preprocessor_config.json`, and
 `video_preprocessor_config.json` are byte-identical.
 
-NVFP4 DFlash2 is an append onto an existing `qwen3.8-27b/nvfp4` file. It does not rewrite Text,
-MTP, or Vision bytes:
+DFlash2 is not quantized from the Qwen3.8-27B Text checkpoint. It is an append of the Hugging Face
+DFlash2 companion onto an existing `qwen3.8-27b/nvfp4` `.ninfer`. The append does not rewrite
+Text, MTP, or Vision bytes. The directory passed to `--dflash-model` must contain that companion's
+`config.json` and `model.safetensors`.
+
+Download a base artifact that has no `dflash/` objects (published Ostfralla NVFP4, or any other
+`qwen3.8-27b/nvfp4` file):
+
+```bash
+hf download Ostfralla/Qwen3.8-27B-NVFP4-NInfer \
+  qwen3_8_27b_nvfp4.ninfer \
+  --local-dir models
+```
+
+Download the pinned DFlash2 companion:
+
+```bash
+hf download z-lab/Qwen3.8-27B-DFlash2 \
+  --revision 50307d4c4cde6860d4eee73e2547cd786fe8e8a4 \
+  --local-dir /path/to/Qwen3.8-27B-DFlash2
+```
+
+Product Engine path (NVFP4 matrices + BF16 selector codebooks):
 
 ```bash
 python3 -m tools.convert.qwen3_8_27b.convert_nvfp4 \
-  --base-artifact /path/to/qwen3_8_27b_nvfp4.ninfer \
+  --base-artifact models/qwen3_8_27b_nvfp4.ninfer \
   --dflash-model /path/to/Qwen3.8-27B-DFlash2 \
-  --dflash-format w8 \
-  --out out/qwen3_8_27b_nvfp4_dflash_w8.ninfer
+  --dflash-format nvfp4 \
+  --out out/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
+  --device cuda
 ```
 
-`--dflash-format q4` writes a sibling that differs only in DFlash2 matrix `QType`. The converter
-pins Hugging Face `z-lab/Qwen3.8-27B-DFlash2` revision `50307d4c4cde6860d4eee73e2547cd786fe8e8a4`
-and `z-lab/dflash` `model.py` commit `95c8aeca5e4b4c4f9c0c967c05ab89fa3ed24f4c`.
+`--dflash-format w8` or `q4` writes a sibling that differs only in DFlash2 matrix `QType`.
+`--dflash-codebook nvfp4` is optional, requires `--dflash-format nvfp4`, and is not the speed
+path (~174 MiB saved, no tok/s win on k=5 greedy). The default codebook is BF16.
+`--dflash-format nvfp4` uses the append-only encoder profile `DFLASH2_NVFP4_MAXABS_TWOLEVEL_V2`
+(one positive FP32 `d_w` in the A16 Linear contract `W = e2m1 * e4m3 / d_w`, E4M3FN per-K16
+scales, E2M1 codes). NVFP4 DFlash2 Linear geometries are A16-only. The converter pins Hugging Face
+`z-lab/Qwen3.8-27B-DFlash2` revision `50307d4c4cde6860d4eee73e2547cd786fe8e8a4`. The algorithm pin
+for `z-lab/dflash` `model.py` is `95c8aeca5e4b4c4f9c0c967c05ab89fa3ed24f4c` and is not a conversion
+input.
 
 ## 4. Engine binding
 
@@ -150,6 +180,10 @@ The opt-in 27B live Engine tests (`ninfer_qwen3_6_27b_prefix_real_test`,
 27B package; they are not restricted to a Qwen3.6 filename.
 
 `ninfer_qwen3_8_27b_dflash_real_test` loads a reconverted NVFP4+DFlash2 file from
-`NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS`. It compares C=1 k=7 Graph DFlash2 greedy output to
-MTP k=3 greedy on the same artifact. NVFP4 target verify at `T>=4` uses W4A4 attention, so that
-path is not required to match ordinary `T=1` A16 decode.
+`NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS`. Overlapping C=3 Graph DFlash2 greedy on three
+distinct prompts must match C=1 DFlash of the same k for product k=4 and k=5 chain.
+Those chain widths are T=5/T=6 SmallT, so they are not required to match MTP k=3
+token-for-token. Packed verify launches Linear/LinearAdd/SwiGLU at per-sequence T=W so
+NVFP4 residual and output-head routes match C=1 rather than packed T=W×B. NVFP4 target
+verify at `T>=4` uses W4A4 attention, so no DFlash path is required to match ordinary
+`T=1` A16 decode.

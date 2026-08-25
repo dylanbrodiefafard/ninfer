@@ -121,6 +121,12 @@ struct TargetVerifyFrameView {
     Tensor licensed_counts;
     Tensor accepted_drafts;
     Tensor selected_hidden;
+    Tensor parent_index;
+    Tensor ancestor_mask;
+    Tensor prefix_lengths;
+    Tensor accepted_column;
+    Tensor fold_path;
+    bool tree_verify = false;
     const GdnReplayRecords* replay_records = nullptr;
     const ops::SamplingConfig* sampling    = nullptr;
     DFlashFeatureSink* feature_sink        = nullptr;
@@ -186,11 +192,13 @@ void dflash_append_context(PrefillContext& state, const Tensor& features, const 
                            const Tensor& table_rows,
                            ops::KVCacheAppendPrefixExecutionEnvelope envelope);
 void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size,
-                                 std::uint32_t k, DFlashEnvelopes envelopes,
+                                 std::uint32_t k, std::uint32_t verify_width,
+                                 DFlashEnvelopes envelopes,
                                  ops::GqaExecutionEnvelope target_envelope,
                                  DecodeGraphDefinition& definition);
 void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                         DFlashEnvelopes envelopes, ops::GqaExecutionEnvelope target_envelope,
+                         std::uint32_t verify_width, DFlashEnvelopes envelopes,
+                         ops::GqaExecutionEnvelope target_envelope,
                          DecodeGraphExecutable* executable);
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

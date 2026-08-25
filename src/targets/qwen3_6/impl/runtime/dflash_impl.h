@@ -1,3 +1,4 @@
+#include "targets/qwen3_6/impl/runtime/dflash_candidate_stats.h"
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
@@ -28,6 +29,7 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstddef>
 #include <stdexcept>
 #include <utility>
@@ -60,8 +62,22 @@ void copy_fused_row_range(const Tensor& fused, std::int32_t row0, Tensor& out,
         static_cast<std::size_t>(fused.ne[1]), cudaMemcpyDeviceToDevice, stream));
 }
 
+// [W,B] I32 with W fastest. A width prefix of a wider round-state panel is strided at B>1.
+void copy_i32_panel(Tensor& dst, const Tensor& src, cudaStream_t stream) {
+    if (dst.data == src.data) { return; }
+    CUDA_CHECK(cudaMemcpy2DAsync(
+        dst.data, static_cast<std::size_t>(dst.nb[1]), src.data,
+        static_cast<std::size_t>(src.nb[1]),
+        static_cast<std::size_t>(src.ne[0]) * sizeof(std::int32_t),
+        static_cast<std::size_t>(src.ne[1]), cudaMemcpyDeviceToDevice, stream));
+}
+
 ops::LinearPolicy dflash_weight_policy(QType qtype) {
     return qtype == QType::NVFP4 ? ops::LinearPolicy::AllowA4 : ops::LinearPolicy::A16Only;
+}
+
+const Weight* dflash2_nvfp4_codebook(const Weight& weight) {
+    return weight.qdata != nullptr ? &weight : nullptr;
 }
 
 template <class V>
@@ -149,8 +165,8 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
         if constexpr (Config::kind == qwen3_6::DFlashKind::DFlash2) {
             ops::linear(features.view({Config::feature_rows, columns}),
                         state.execution.model.dflash->feature_projection, projected,
-                        ops::LinearPolicy::A16Only, state.execution.work,
-                        state.execution.device.stream);
+                        dflash_weight_policy(state.execution.model.dflash->feature_projection.qtype),
+                        state.execution.work, state.execution.device.stream);
         } else {
             ops::linear(features.view({Config::feature_rows, columns}),
                         state.execution.model.dflash->feature_projection, projected,
@@ -184,8 +200,8 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
             if constexpr (Config::kind == qwen3_6::DFlashKind::DFlash2) {
                 [&](const auto& layer_weight) {
                     ops::linear(layer_context, layer_weight.query_key_value, layer_roots.fused_qkv,
-                                ops::LinearPolicy::A16Only, state.execution.work,
-                                state.execution.device.stream);
+                                dflash_weight_policy(layer_weight.query_key_value.qtype),
+                                state.execution.work, state.execution.device.stream);
                     copy_fused_row_range(layer_roots.fused_qkv, Config::query_size, key_flat,
                                          state.execution.device.stream);
                     copy_fused_row_range(layer_roots.fused_qkv,
@@ -224,26 +240,53 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
 
 template <class V>
 void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& frame,
-                        std::int32_t batch_size, std::uint32_t k, DFlashEnvelopes envelopes) {
+                        std::int32_t batch_size, std::uint32_t k, DFlashEnvelopes envelopes,
+                        [[maybe_unused]] std::uint32_t verify_width) {
     if constexpr (!V::supports_dflash) {
         throw std::logic_error("DFlash proposal is unavailable for this target");
     } else {
-        using Config               = typename V::DFlashConfig;
-        const std::int32_t width   = static_cast<std::int32_t>(k) + 1;
-        const std::int32_t columns = width * batch_size;
-        Tensor anchors             = frame.anchors.slice(0, 0, batch_size);
-        Tensor frontiers           = frame.execution_frontiers.slice(0, 0, batch_size);
-        Tensor valid_columns       = frame.target_valid_columns.slice(0, 0, batch_size);
-        Tensor lanes               = frame.lanes.slice(0, 0, batch_size);
-        Tensor full_rows           = frame.dflash_kv_table_rows.slice(0, 0, batch_size);
-        Tensor ids                 = frame.proposal_ids.slice(1, 0, batch_size);
-        Tensor positions           = frame.proposal_positions.slice(1, 0, batch_size);
-        Tensor drafts              = frame.draft_tokens.slice(1, 0, batch_size);
+        using Config                     = typename V::DFlashConfig;
+        const std::int32_t full_width    = static_cast<std::int32_t>(k) + 1;
+        std::int32_t width               = full_width;
+        std::int32_t columns             = width * batch_size;
+        Tensor anchors                   = frame.anchors.slice(0, 0, batch_size);
+        Tensor frontiers                 = frame.execution_frontiers.slice(0, 0, batch_size);
+        Tensor valid_full                = frame.target_valid_columns.slice(0, 0, batch_size);
+        Tensor valid_columns             = valid_full;
+        Tensor lanes                     = frame.lanes.slice(0, 0, batch_size);
+        Tensor full_rows                 = frame.dflash_kv_table_rows.slice(0, 0, batch_size);
+        Tensor ids_view = frame.proposal_ids.slice(0, 0, full_width).slice(1, 0, batch_size);
+        Tensor pos_view =
+            frame.proposal_positions.slice(0, 0, full_width).slice(1, 0, batch_size);
+        Tensor drafts_view = frame.draft_tokens.slice(0, 0, static_cast<std::int32_t>(k))
+                                 .slice(1, 0, batch_size);
+        const bool two_block =
+            Config::two_block_first > 0 &&
+            static_cast<int>(k) > Config::two_block_first;
 
         state.execution.work.reset();
-        ops::prepare_masked_block(anchors, frontiers, valid_columns, Config::mask_token, ids,
-                                  positions, state.execution.device.stream);
-        Tensor residual = state.execution.work.alloc(DType::BF16, {Config::hidden, columns});
+        // Tree verify allocates W=12; k=7 propose uses W=8. The width prefix is not
+        // contiguous at B>1, and prepare_masked_block / embedding / path_select require it.
+        Tensor ids_full =
+            ids_view.is_contiguous()
+                ? ids_view
+                : state.execution.work.alloc(DType::I32, {full_width, batch_size});
+        Tensor pos_full =
+            pos_view.is_contiguous()
+                ? pos_view
+                : state.execution.work.alloc(DType::I32, {full_width, batch_size});
+        Tensor drafts =
+            drafts_view.is_contiguous()
+                ? drafts_view
+                : state.execution.work.alloc(DType::I32, {static_cast<std::int32_t>(k), batch_size});
+        Tensor ids       = ids_full;
+        Tensor positions = pos_full;
+        ops::prepare_masked_block(anchors, frontiers, valid_full, Config::mask_token, ids_full,
+                                  pos_full, state.execution.device.stream);
+        Tensor residual_full =
+            state.execution.work.alloc(DType::BF16, {Config::hidden, full_width * batch_size});
+        Tensor residual = residual_full;
+        const auto run_embed_layers = [&] {
         ops::embedding(ids.view({columns}), state.execution.model.token_embedding, residual,
                        state.execution.device.stream);
 
@@ -270,8 +313,8 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                         weight.attention_conv.kernel_projection, prepared_batch, finish_dynamic,
                         state.execution.work, state.execution.device.stream);
                     ops::linear(roots.prepared, weight.query_key_value, roots.fused_qkv,
-                                ops::LinearPolicy::A16Only, state.execution.work,
-                                state.execution.device.stream);
+                                dflash_weight_policy(weight.query_key_value.qtype),
+                                state.execution.work, state.execution.device.stream);
                     Tensor query_flat = roots.query_raw.view({Config::query_size, columns});
                     Tensor key_flat   = roots.key_raw.view({Config::kv_size, columns});
                     Tensor value_flat = roots.value.view({Config::kv_size, columns});
@@ -310,7 +353,8 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                              envelopes.local, state.execution.work, attention_batch,
                              state.execution.device.stream);
                     ops::linear(roots.attention.view({Config::query_size, columns}),
-                                weight.attention_output, roots.delta, ops::LinearPolicy::A16Only,
+                                weight.attention_output, roots.delta,
+                                dflash_weight_policy(weight.attention_output.qtype),
                                 state.execution.work, state.execution.device.stream);
                     Tensor delta_batch = roots.delta.view({Config::hidden, width, batch_size});
                     Tensor finished_batch =
@@ -336,15 +380,15 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                         prepared_batch, finish_dynamic, state.execution.work,
                         state.execution.device.stream);
                     ops::linear(roots.delta, weight.gate_up, roots.gate_up,
-                                ops::LinearPolicy::A16Only, state.execution.work,
-                                state.execution.device.stream);
+                                dflash_weight_policy(weight.gate_up.qtype),
+                                state.execution.work, state.execution.device.stream);
                     ops::silu_mul(roots.gate_up.slice(0, 0, Config::intermediate),
                                   roots.gate_up.slice(0, Config::intermediate,
                                                       Config::intermediate),
                                   roots.intermediate, state.execution.device.stream);
                     ops::linear(roots.intermediate, weight.down, roots.delta,
-                                ops::LinearPolicy::A16Only, state.execution.work,
-                                state.execution.device.stream);
+                                dflash_weight_policy(weight.down.qtype),
+                                state.execution.work, state.execution.device.stream);
                     Tensor mlp_in  = roots.delta.view({Config::hidden, width, batch_size});
                     Tensor mlp_out = roots.hidden.view({Config::hidden, width, batch_size});
                     ops::grouped_dynamic_conv_finish(mlp_in, weight.mlp_conv.base_kernel,
@@ -421,7 +465,164 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
             }
             }(*state.execution.model.dflash);
         }
+        };
+        if (two_block) {
+            const std::int32_t split       = Config::two_block_first;
+            const std::int32_t first_width = split + 1;
+            width                          = first_width;
+            columns                        = first_width * batch_size;
+            Tensor ids_first =
+                state.execution.work.alloc(DType::I32, {first_width, batch_size});
+            Tensor pos_first =
+                state.execution.work.alloc(DType::I32, {first_width, batch_size});
+            Tensor valid_first = state.execution.work.alloc(DType::I32, {batch_size});
+            for (std::int32_t b = 0; b < batch_size; ++b) {
+                Tensor slot = valid_first.slice(0, b, 1);
+                ops::set_i32_scalar(slot, first_width, state.execution.device.stream);
+            }
+            CUDA_CHECK(cudaMemcpy2DAsync(
+                ids_first.data, static_cast<std::size_t>(first_width) * sizeof(std::int32_t),
+                ids_full.data, static_cast<std::size_t>(full_width) * sizeof(std::int32_t),
+                static_cast<std::size_t>(first_width) * sizeof(std::int32_t),
+                static_cast<std::size_t>(batch_size), cudaMemcpyDeviceToDevice,
+                state.execution.device.stream));
+            CUDA_CHECK(cudaMemcpy2DAsync(
+                pos_first.data, static_cast<std::size_t>(first_width) * sizeof(std::int32_t),
+                pos_full.data, static_cast<std::size_t>(full_width) * sizeof(std::int32_t),
+                static_cast<std::size_t>(first_width) * sizeof(std::int32_t),
+                static_cast<std::size_t>(batch_size), cudaMemcpyDeviceToDevice,
+                state.execution.device.stream));
+            ids            = ids_first;
+            positions      = pos_first;
+            valid_columns  = valid_first;
+            residual       = residual_full.slice(1, 0, columns);
+        }
+        run_embed_layers();
 
+        if (two_block) {
+            if constexpr (Config::kind != qwen3_6::DFlashKind::DFlash2) {
+                throw std::logic_error("two-block DFlash propose requires DFlash2");
+            } else {
+            [&](const auto& dflash) {
+            const std::int32_t split  = Config::two_block_first;
+            const std::int32_t suffix = static_cast<std::int32_t>(k) - split;
+            std::array<float, kMaximumConcurrency> temperatures{};
+            std::array<unsigned long long, kMaximumConcurrency> seeds{};
+            for (std::int32_t b = 0; b < batch_size; ++b) {
+                temperatures[static_cast<std::size_t>(b)] =
+                    state.host_ingress.sampling[static_cast<std::size_t>(b)].temperature;
+                seeds[static_cast<std::size_t>(b)] =
+                    state.host_ingress.sampling[static_cast<std::size_t>(b)].seed;
+            }
+            const std::size_t element_bytes = dtype_size(DType::BF16);
+            const auto emit_path = [&](const Tensor& residual_in, std::int32_t src_width,
+                                       std::int32_t pack_k, std::int32_t col0,
+                                       const Tensor& path_anchors, const unsigned long long* path_seeds,
+                                       Tensor& path_out) {
+                Tensor packed = state.execution.work.alloc(
+                    DType::BF16, {Config::hidden, pack_k * batch_size});
+                Tensor proposal_hidden = state.execution.work.alloc(
+                    DType::BF16, {Config::hidden, pack_k * batch_size});
+                const std::size_t row_bytes =
+                    static_cast<std::size_t>(Config::hidden) * static_cast<std::size_t>(pack_k) *
+                    element_bytes;
+                const std::size_t source_pitch =
+                    static_cast<std::size_t>(Config::hidden) * static_cast<std::size_t>(src_width) *
+                    element_bytes;
+                const auto* src = static_cast<const std::byte*>(residual_in.data) +
+                                  static_cast<std::size_t>(Config::hidden) *
+                                      static_cast<std::size_t>(col0) * element_bytes;
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    packed.data, row_bytes, src, source_pitch, row_bytes,
+                    static_cast<std::size_t>(batch_size), cudaMemcpyDeviceToDevice,
+                    state.execution.device.stream));
+                ops::rmsnorm(packed, state.execution.model.dflash->final_norm, Config::rms_epsilon,
+                             false, proposal_hidden, state.execution.device.stream);
+                Tensor hidden_batch =
+                    proposal_hidden.view({Config::hidden, pack_k, batch_size});
+                const auto run_select = [&](const Tensor& logits_batch,
+                                            const Tensor* logit_token_ids) {
+                    ops::dflash2_path_select(logits_batch, hidden_batch, dflash.hidden_projection,
+                                             dflash.predecessor_codebook, dflash.successor_codebook,
+                                             path_anchors, temperatures.data(), path_seeds, path_out,
+                                             state.execution.work, state.execution.device.stream,
+                                             logit_token_ids,
+                                             dflash2_nvfp4_codebook(dflash.predecessor_codebook_nvfp4),
+                                             dflash2_nvfp4_codebook(dflash.successor_codebook_nvfp4));
+                };
+                if (state.execution.proposal_head == ProposalHead::Full) {
+                    Tensor logits = state.execution.work.alloc(
+                        DType::BF16, {TextConfig::output_rows, pack_k * batch_size});
+                    ops::linear(proposal_hidden, state.execution.model.output_head, logits,
+                                dflash_weight_policy(state.execution.model.output_head.qtype),
+                                state.execution.work, state.execution.device.stream);
+                    Tensor logits_batch =
+                        logits.view({TextConfig::output_rows, pack_k, batch_size});
+                    run_select(logits_batch, nullptr);
+                } else {
+                    if (!state.execution.model.optimized_proposal.has_value()) {
+                        throw std::logic_error("optimized DFlash proposal head is unavailable");
+                    }
+                    const auto& proposal = *state.execution.model.optimized_proposal;
+                    Tensor logits        = state.execution.work.alloc(
+                        DType::BF16, {V::draft_head_rows, pack_k * batch_size});
+                    ops::linear(proposal_hidden, proposal.head, logits,
+                                dflash_weight_policy(proposal.head.qtype), state.execution.work,
+                                state.execution.device.stream);
+                    Tensor logits_batch =
+                        logits.view({V::draft_head_rows, pack_k, batch_size});
+                    run_select(logits_batch, &proposal.token_ids);
+                }
+            };
+            Tensor path_first =
+                state.execution.work.alloc(DType::I32, {split, batch_size});
+            emit_path(residual, width, split, 1, anchors, seeds.data(), path_first);
+            CUDA_CHECK(cudaMemcpy2DAsync(
+                drafts.data, static_cast<std::size_t>(k) * sizeof(std::int32_t), path_first.data,
+                static_cast<std::size_t>(split) * sizeof(std::int32_t),
+                static_cast<std::size_t>(split) * sizeof(std::int32_t),
+                static_cast<std::size_t>(batch_size), cudaMemcpyDeviceToDevice,
+                state.execution.device.stream));
+            auto* idp = static_cast<std::int32_t*>(ids_full.data);
+            auto* pth = static_cast<std::int32_t*>(path_first.data);
+            for (std::int32_t b = 0; b < batch_size; ++b) {
+                for (std::int32_t u = 0; u < split; ++u) {
+                    CUDA_CHECK(cudaMemcpyAsync(idp + (1 + u) + full_width * b, pth + u + split * b,
+                                               sizeof(std::int32_t), cudaMemcpyDeviceToDevice,
+                                               state.execution.device.stream));
+                }
+            }
+            width         = full_width;
+            columns       = full_width * batch_size;
+            ids           = ids_full;
+            positions     = pos_full;
+            valid_columns = valid_full;
+            residual      = residual_full;
+            run_embed_layers();
+            Tensor path_suffix =
+                state.execution.work.alloc(DType::I32, {suffix, batch_size});
+            Tensor anchors2 = state.execution.work.alloc(DType::I32, {batch_size});
+            for (std::int32_t b = 0; b < batch_size; ++b) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    static_cast<std::int32_t*>(anchors2.data) + b, pth + (split - 1) + split * b,
+                    sizeof(std::int32_t), cudaMemcpyDeviceToDevice, state.execution.device.stream));
+            }
+            std::array<unsigned long long, kMaximumConcurrency> suffix_seeds = seeds;
+            for (std::int32_t b = 0; b < batch_size; ++b) {
+                suffix_seeds[static_cast<std::size_t>(b)] ^= 0x9E3779B97F4A7C15ull;
+            }
+            emit_path(residual, width, suffix, 1 + split, anchors2, suffix_seeds.data(),
+                      path_suffix);
+            CUDA_CHECK(cudaMemcpy2DAsync(
+                static_cast<std::int32_t*>(drafts.data) + split,
+                static_cast<std::size_t>(k) * sizeof(std::int32_t), path_suffix.data,
+                static_cast<std::size_t>(suffix) * sizeof(std::int32_t),
+                static_cast<std::size_t>(suffix) * sizeof(std::int32_t),
+                static_cast<std::size_t>(batch_size), cudaMemcpyDeviceToDevice,
+                state.execution.device.stream));
+            }(*state.execution.model.dflash);
+            }
+        } else {
         Tensor packed = state.execution.work.alloc(
             DType::BF16, {Config::hidden, static_cast<std::int32_t>(k) * batch_size});
         const std::size_t element_bytes = dtype_size(DType::BF16);
@@ -431,20 +632,125 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
             static_cast<std::size_t>(Config::hidden) * width * element_bytes;
         const auto* source = static_cast<const std::byte*>(residual.data) +
                              static_cast<std::size_t>(Config::hidden) * element_bytes;
+        Tensor proposal_hidden = state.execution.work.alloc(
+            DType::BF16, {Config::hidden, static_cast<std::int32_t>(k) * batch_size});
+        const auto pack_proposal = [&] {
         CUDA_CHECK(cudaMemcpy2DAsync(packed.data, row_bytes, source, source_pitch, row_bytes,
                                      static_cast<std::size_t>(batch_size), cudaMemcpyDeviceToDevice,
                                      state.execution.device.stream));
-        Tensor proposal_hidden = state.execution.work.alloc(
-            DType::BF16, {Config::hidden, static_cast<std::int32_t>(k) * batch_size});
         ops::rmsnorm(packed, state.execution.model.dflash->final_norm, Config::rms_epsilon, false,
                      proposal_hidden, state.execution.device.stream);
+        };
+        pack_proposal();
+        ninfer::targets::qwen3_6::detail::dflash_candidate_stats::capture_activation(
+            "proposal_hidden", proposal_hidden, state.execution.device.stream);
+        ninfer::targets::qwen3_6::detail::dflash_candidate_stats::capture_activation(
+            "dflash_residual", residual, state.execution.device.stream);
         Tensor flat_drafts = drafts.view({static_cast<std::int32_t>(k) * batch_size});
         if constexpr (Config::kind == qwen3_6::DFlashKind::DFlash2) {
             [&](const auto& dflash) {
-            const float temperature = state.host_ingress.sampling[0].temperature;
-            const unsigned long long seed = state.host_ingress.sampling[0].seed;
             Tensor hidden_batch =
                 proposal_hidden.view({Config::hidden, static_cast<std::int32_t>(k), batch_size});
+            const auto select = [&](const Tensor& logits_batch, const Tensor* logit_token_ids) {
+                if (dflash_uses_tree_verify(k, verify_width)) {
+                    const auto verify_w = static_cast<std::int32_t>(verify_width);
+                    Tensor verify_ids =
+                        frame.verify_ids.slice(0, 0, verify_w).slice(1, 0, batch_size);
+                    Tensor parent_index =
+                        frame.parent_index.slice(0, 0, verify_w).slice(1, 0, batch_size);
+                    Tensor cache_positions =
+                        frame.cache_positions.slice(0, 0, verify_w).slice(1, 0, batch_size);
+                    Tensor rope_positions =
+                        frame.proposal_positions.slice(0, 0, verify_w).slice(1, 0, batch_size);
+                    Tensor ancestor_mask =
+                        frame.ancestor_mask.slice(0, 0, verify_w).slice(1, 0, batch_size);
+                    Tensor live_columns = frame.target_valid_columns.slice(0, 0, batch_size);
+                    ops::dflash2_tree_select(logits_batch, hidden_batch, dflash.hidden_projection,
+                                             dflash.predecessor_codebook, dflash.successor_codebook,
+                                             anchors, frontiers, verify_ids, parent_index,
+                                             cache_positions, rope_positions, ancestor_mask,
+                                             live_columns, state.execution.work,
+                                             state.execution.device.stream, logit_token_ids,
+                                             dflash2_nvfp4_codebook(dflash.predecessor_codebook_nvfp4),
+                                             dflash2_nvfp4_codebook(dflash.successor_codebook_nvfp4));
+                } else {
+                    std::array<float, kMaximumConcurrency> temperatures{};
+                    std::array<unsigned long long, kMaximumConcurrency> seeds{};
+                    for (std::int32_t b = 0; b < batch_size; ++b) {
+                        temperatures[static_cast<std::size_t>(b)] =
+                            state.host_ingress.sampling[static_cast<std::size_t>(b)].temperature;
+                        seeds[static_cast<std::size_t>(b)] =
+                            state.host_ingress.sampling[static_cast<std::size_t>(b)].seed;
+                    }
+                    ops::dflash2_path_select(logits_batch, hidden_batch, dflash.hidden_projection,
+                                             dflash.predecessor_codebook, dflash.successor_codebook,
+                                             anchors, temperatures.data(), seeds.data(), drafts,
+                                             state.execution.work, state.execution.device.stream,
+                                             logit_token_ids,
+                                             dflash2_nvfp4_codebook(dflash.predecessor_codebook_nvfp4),
+                                             dflash2_nvfp4_codebook(dflash.successor_codebook_nvfp4));
+                }
+            };
+            const auto refine_unmask = [&](Tensor& logits, const auto& head,
+                                           ops::LinearPolicy policy,
+                                           const Tensor* logit_token_ids) {
+                if constexpr (Config::unmask_refine <= 0) { return; }
+                constexpr int prefix = Config::unmask_refine;
+                if (prefix <= 0 || prefix >= static_cast<int>(k)) { return; }
+                Tensor stash_logits = state.execution.work.alloc(
+                    DType::BF16, {logits.ne[0], logits.ne[1]});
+                Tensor stash_hidden = state.execution.work.alloc(
+                    DType::BF16, {proposal_hidden.ne[0], proposal_hidden.ne[1]});
+                CUDA_CHECK(cudaMemcpyAsync(stash_logits.data, logits.data, logits.bytes(),
+                                           cudaMemcpyDeviceToDevice,
+                                           state.execution.device.stream));
+                CUDA_CHECK(cudaMemcpyAsync(stash_hidden.data, proposal_hidden.data,
+                                           proposal_hidden.bytes(), cudaMemcpyDeviceToDevice,
+                                           state.execution.device.stream));
+                Tensor logits_for_path =
+                    logits.view({logits.ne[0], static_cast<std::int32_t>(k), batch_size});
+                std::array<float, kMaximumConcurrency> greedy_temperatures{};
+                std::array<unsigned long long, kMaximumConcurrency> greedy_seeds{};
+                ops::dflash2_path_select(logits_for_path, hidden_batch, dflash.hidden_projection,
+                                         dflash.predecessor_codebook, dflash.successor_codebook,
+                                         anchors, greedy_temperatures.data(), greedy_seeds.data(),
+                                         drafts, state.execution.work,
+                                         state.execution.device.stream, logit_token_ids,
+                                         dflash2_nvfp4_codebook(dflash.predecessor_codebook_nvfp4),
+                                         dflash2_nvfp4_codebook(dflash.successor_codebook_nvfp4));
+                auto* idp = static_cast<std::int32_t*>(ids.data);
+                auto* drp = static_cast<std::int32_t*>(drafts.data);
+                const int width_i = width;
+                const int k_i     = static_cast<int>(k);
+                for (int b = 0; b < batch_size; ++b) {
+                    for (int u = 0; u < prefix; ++u) {
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            idp + (1 + u) + width_i * b, drp + u + k_i * b, sizeof(std::int32_t),
+                            cudaMemcpyDeviceToDevice, state.execution.device.stream));
+                    }
+                }
+                run_embed_layers();
+                pack_proposal();
+                ops::linear(proposal_hidden, head, logits, policy, state.execution.work,
+                            state.execution.device.stream);
+                const std::size_t logit_col =
+                    static_cast<std::size_t>(logits.ne[0]) * sizeof(std::uint16_t);
+                const std::size_t hid_col =
+                    static_cast<std::size_t>(Config::hidden) * sizeof(std::uint16_t);
+                for (int b = 0; b < batch_size; ++b) {
+                    for (int u = 0; u < prefix; ++u) {
+                        const std::size_t col = static_cast<std::size_t>(u + k_i * b);
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            static_cast<std::byte*>(logits.data) + col * logit_col,
+                            static_cast<std::byte*>(stash_logits.data) + col * logit_col,
+                            logit_col, cudaMemcpyDeviceToDevice, state.execution.device.stream));
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            static_cast<std::byte*>(proposal_hidden.data) + col * hid_col,
+                            static_cast<std::byte*>(stash_hidden.data) + col * hid_col, hid_col,
+                            cudaMemcpyDeviceToDevice, state.execution.device.stream));
+                    }
+                }
+            };
             if (state.execution.proposal_head == ProposalHead::Full) {
                 Tensor logits = state.execution.work.alloc(
                     DType::BF16,
@@ -454,10 +760,12 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                             state.execution.work, state.execution.device.stream);
                 Tensor logits_batch = logits.view(
                     {TextConfig::output_rows, static_cast<std::int32_t>(k), batch_size});
-                ops::dflash2_path_select(logits_batch, hidden_batch, dflash.hidden_projection,
-                                         dflash.predecessor_codebook, dflash.successor_codebook,
-                                         anchors, temperature, seed, drafts, state.execution.work,
-                                         state.execution.device.stream);
+                refine_unmask(logits, state.execution.model.output_head,
+                              dflash_weight_policy(state.execution.model.output_head.qtype),
+                              nullptr);
+                ninfer::targets::qwen3_6::detail::dflash_candidate_stats::capture_logits(
+                    logits, nullptr, static_cast<int>(k), state.execution.device.stream);
+                select(logits_batch, nullptr);
             } else {
                 if (!state.execution.model.optimized_proposal.has_value()) {
                     throw std::logic_error("optimized DFlash proposal head is unavailable");
@@ -470,10 +778,12 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                             state.execution.device.stream);
                 Tensor logits_batch =
                     logits.view({V::draft_head_rows, static_cast<std::int32_t>(k), batch_size});
-                ops::dflash2_path_select(logits_batch, hidden_batch, dflash.hidden_projection,
-                                         dflash.predecessor_codebook, dflash.successor_codebook,
-                                         anchors, temperature, seed, drafts, state.execution.work,
-                                         state.execution.device.stream, &proposal.token_ids);
+                refine_unmask(logits, proposal.head, dflash_weight_policy(proposal.head.qtype),
+                              &proposal.token_ids);
+                ninfer::targets::qwen3_6::detail::dflash_candidate_stats::capture_logits(
+                    logits, &proposal.token_ids, static_cast<int>(k),
+                    state.execution.device.stream);
+                select(logits_batch, &proposal.token_ids);
             }
             (void)flat_drafts;
             }(*state.execution.model.dflash);
@@ -497,20 +807,24 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                                           static_cast<const std::int32_t*>(proposal.token_ids.data),
                                           V::draft_head_rows, state.execution.device.stream);
         }
+        }
+        copy_i32_panel(ids_view, ids_full, state.execution.device.stream);
+        copy_i32_panel(pos_view, pos_full, state.execution.device.stream);
+        copy_i32_panel(drafts_view, drafts, state.execution.device.stream);
         state.execution.work.reset();
     }
 }
 
 auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                              DFlashEnvelopes envelopes,
+                              std::uint32_t verify_width, DFlashEnvelopes envelopes,
                               ops::GqaExecutionEnvelope target_envelope) {
-    return [&state, batch_size, k, envelopes, target_envelope] {
+    return [&state, batch_size, k, verify_width, envelopes, target_envelope] {
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
-            k == 0 || k > kDFlashDecodeMaximumDrafts) {
+            k == 0 || k > kDFlashDecodeMaximumDrafts || verify_width < 2) {
             throw std::logic_error("DFlash decode batch state is incomplete");
         }
         qwen3_6::DFlashDecodeState& frame = state.frame;
-        const std::int32_t width          = static_cast<std::int32_t>(k) + 1;
+        const auto vw                     = static_cast<std::int32_t>(verify_width);
         CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
                                    sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice,
                                    state.execution.device.stream));
@@ -523,61 +837,85 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         Tensor text_rows        = frame.text_kv_table_rows.slice(0, 0, batch_size);
         Tensor dflash_rows      = frame.dflash_kv_table_rows.slice(0, 0, batch_size);
         Tensor lanes            = frame.lanes.slice(0, 0, batch_size);
-        Tensor append_positions = frame.append_positions.slice(1, 0, batch_size);
+        Tensor append_positions =
+            frame.append_positions.slice(0, 0, vw).slice(1, 0, batch_size);
         Tensor append_counts    = frame.append_counts.slice(0, 0, batch_size);
-        Tensor drafts           = frame.draft_tokens.slice(1, 0, batch_size);
-        Tensor verify_ids       = frame.verify_ids.slice(1, 0, batch_size);
-        Tensor target_positions = frame.proposal_positions.slice(1, 0, batch_size);
-        Tensor target_tokens    = frame.target_argmax.slice(1, 0, batch_size);
-        Tensor target_logits    = frame.target_logits.slice(2, 0, batch_size);
-        Tensor target_hidden    = frame.target_hidden.slice(2, 0, batch_size);
+        Tensor drafts           = frame.draft_tokens.slice(0, 0, static_cast<std::int32_t>(k))
+                            .slice(1, 0, batch_size);
+        Tensor verify_ids       = frame.verify_ids.slice(0, 0, vw).slice(1, 0, batch_size);
+        [[maybe_unused]] Tensor parent_index =
+            frame.parent_index.slice(0, 0, vw).slice(1, 0, batch_size);
+        [[maybe_unused]] Tensor ancestor_mask =
+            frame.ancestor_mask.slice(0, 0, vw).slice(1, 0, batch_size);
+        Tensor cache_positions =
+            frame.cache_positions.slice(0, 0, vw).slice(1, 0, batch_size);
+        Tensor rope_positions =
+            frame.proposal_positions.slice(0, 0, vw).slice(1, 0, batch_size);
+        Tensor target_tokens    = frame.target_argmax.slice(0, 0, vw).slice(1, 0, batch_size);
+        Tensor target_logits    = frame.target_logits.slice(1, 0, vw).slice(2, 0, batch_size);
+        Tensor target_hidden    = frame.target_hidden.slice(1, 0, vw).slice(2, 0, batch_size);
         Tensor selected_hidden  = frame.target_continuation_hidden.slice(1, 0, batch_size);
-        Tensor licensed_tokens  = frame.licensed_tokens.slice(1, 0, batch_size);
+        Tensor licensed_tokens  = frame.licensed_tokens.slice(0, 0, vw).slice(1, 0, batch_size);
         Tensor licensed_counts  = frame.licensed_counts.slice(0, 0, batch_size);
         Tensor accepted         = frame.accepted_drafts.slice(0, 0, batch_size);
+        [[maybe_unused]] Tensor accepted_column  = frame.accepted_column.slice(0, 0, batch_size);
+        [[maybe_unused]] Tensor fold_path        = frame.fold_path.slice(0, 0, vw).slice(1, 0, batch_size);
 
         state.execution.work.reset();
         Tensor compact_features = state.execution.work.alloc(
-            DType::BF16, {Variant::DFlashConfig::feature_rows, width, batch_size});
+            DType::BF16, {Variant::DFlashConfig::feature_rows, vw, batch_size});
         ops::prepare_ragged_prefix(dflash_state(state).pending_features, lanes, context_starts,
                                    frontiers, compact_features, append_positions, append_counts,
                                    state.execution.device.stream);
         append_context_impl<Variant>(state, compact_features, append_positions, append_counts,
                                      lanes, dflash_rows, envelopes.append);
 
-        propose_batch_impl<Variant>(state, frame, batch_size, k, envelopes);
-        ops::speculative_prepare_verify_ids(anchors, drafts, extents, verify_ids,
-                                            state.execution.device.stream);
+        propose_batch_impl<Variant>(state, frame, batch_size, k, envelopes, verify_width);
+        const bool use_tree = dflash_uses_tree_verify(k, verify_width);
+        if (!use_tree) {
+            ops::speculative_prepare_verify_ids(anchors, drafts, extents, verify_ids,
+                                                state.execution.device.stream);
+        }
 
         TextContext card(state.execution.device, state.execution.model, state.execution.work, {},
                          state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache);
         DFlashFeatureSink sink =
-            batch_feature_sink_impl<Variant>(state, lanes, valid_columns, width, batch_size);
-        target_verify_accept(state.execution, state.continuation_hidden_store, card,
-                             TargetVerifyFrameView{
-                                 .ids             = verify_ids,
-                                 .cache_positions = target_positions,
-                                 .rope_positions  = target_positions,
-                                 .valid_columns   = valid_columns,
-                                 .kv_table_rows   = text_rows,
-                                 .lanes           = lanes,
-                                 .target_hidden   = target_hidden,
-                                 .target_logits   = target_logits,
-                                 .target_tokens   = target_tokens,
-                                 .drafts          = drafts,
-                                 .current_extents = extents,
-                                 .frontiers       = frontiers,
-                                 .anchors         = anchors,
-                                 .licensed_tokens = licensed_tokens,
-                                 .licensed_counts = licensed_counts,
-                                 .accepted_drafts = accepted,
-                                 .selected_hidden = selected_hidden,
-                                 .replay_records  = state.execution.replay_records,
-                                 .sampling        = frame.sampling,
-                                 .feature_sink    = &sink,
-                             },
+            batch_feature_sink_impl<Variant>(state, lanes, valid_columns, vw, batch_size);
+        TargetVerifyFrameView verify_frame{
+            .ids             = verify_ids,
+            .cache_positions = cache_positions,
+            .rope_positions  = rope_positions,
+            .valid_columns   = valid_columns,
+            .kv_table_rows   = text_rows,
+            .lanes           = lanes,
+            .target_hidden   = target_hidden,
+            .target_logits   = target_logits,
+            .target_tokens   = target_tokens,
+            .drafts          = drafts,
+            .current_extents = extents,
+            .frontiers       = frontiers,
+            .anchors         = anchors,
+            .licensed_tokens = licensed_tokens,
+            .licensed_counts = licensed_counts,
+            .accepted_drafts = accepted,
+            .selected_hidden = selected_hidden,
+            .replay_records  = state.execution.replay_records,
+            .sampling        = frame.sampling,
+            .feature_sink    = &sink,
+        };
+        if (use_tree) {
+            verify_frame.parent_index    = parent_index;
+            verify_frame.ancestor_mask   = ancestor_mask;
+            verify_frame.prefix_lengths  = frontiers;
+            verify_frame.accepted_column = accepted_column;
+            verify_frame.fold_path       = fold_path;
+            verify_frame.tree_verify     = true;
+        } else {
+            verify_frame.cache_positions = rope_positions;
+        }
+        target_verify_accept(state.execution, state.continuation_hidden_store, card, verify_frame,
                              target_envelope);
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
                                    sizeof(qwen3_6::DFlashDecodeEgress), cudaMemcpyDeviceToHost,
@@ -609,17 +947,21 @@ void dflash_append_context(PrefillContext& state, const Tensor& features, const 
 }
 
 void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size,
-                                 std::uint32_t k, DFlashEnvelopes envelopes,
+                                 std::uint32_t k, std::uint32_t verify_width,
+                                 DFlashEnvelopes envelopes,
                                  ops::GqaExecutionEnvelope target_envelope,
                                  DecodeGraphDefinition& definition) {
-    auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope);
+    auto body = dflash_decode_batch_body(state, batch_size, k, verify_width, envelopes,
+                                         target_envelope);
     capture_graph(state, definition, body);
 }
 
 void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                         DFlashEnvelopes envelopes, ops::GqaExecutionEnvelope target_envelope,
+                         std::uint32_t verify_width, DFlashEnvelopes envelopes,
+                         ops::GqaExecutionEnvelope target_envelope,
                          DecodeGraphExecutable* executable) {
-    auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope);
+    auto body = dflash_decode_batch_body(state, batch_size, k, verify_width, envelopes,
+                                         target_envelope);
     run_prepared(state, executable, body);
 }
 

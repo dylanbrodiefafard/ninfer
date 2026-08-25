@@ -148,6 +148,49 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
         licensed_counts, accepted, token_domain, configs, scratch, stream);
 }
 
+void speculative_accept_tree_drafts(const Tensor& target_tokens, const Tensor& logits,
+                                    const Tensor& verify_ids, const Tensor& parent_index,
+                                    const Tensor& valid_columns, const Tensor& current_extents,
+                                    Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
+                                    Tensor& licensed_counts, Tensor& accepted,
+                                    Tensor& accepted_column, Tensor& fold_path,
+                                    std::int32_t token_domain, const SamplingConfig* configs,
+                                    WorkspaceArena& workspace, cudaStream_t stream) {
+    constexpr const char* op = "speculative_accept_tree_drafts";
+    const std::int32_t width = verify_ids.ne[0];
+    const std::int32_t batch = verify_ids.ne[1];
+    if (width < 2 || batch < 1) {
+        throw std::invalid_argument("speculative_accept_tree_drafts: W and B must be positive");
+    }
+    (void)workspace;
+    if (configs == nullptr) {
+        throw std::invalid_argument("speculative_accept_tree_drafts: configs must be non-null");
+    }
+    require_matrix(target_tokens, DType::I32, width, batch, op, "target_tokens");
+    require_matrix(verify_ids, DType::I32, width, batch, op, "verify_ids");
+    require_matrix(parent_index, DType::I32, width, batch, op, "parent_index");
+    require_vector(valid_columns, DType::I32, batch, op, "valid_columns");
+    require_vector(current_extents, DType::I32, batch, op, "current_extents");
+    require_vector(lengths, DType::I32, batch, op, "lengths");
+    require_vector(anchors, DType::I32, batch, op, "anchors");
+    require_matrix(licensed_tokens, DType::I32, width, batch, op, "licensed_tokens");
+    require_vector(licensed_counts, DType::I32, batch, op, "licensed_counts");
+    require_vector(accepted, DType::I32, batch, op, "accepted");
+    require_vector(accepted_column, DType::I32, batch, op, "accepted_column");
+    require_matrix(fold_path, DType::I32, width, batch, op, "fold_path");
+    require_dtype(logits, DType::BF16, op, "logits");
+    if (logits.ne[0] <= 0 || logits.ne[1] != width || logits.ne[2] != batch || logits.ne[3] != 1) {
+        throw std::invalid_argument("speculative_accept_tree_drafts: logits must be [V,W,B]");
+    }
+    if (token_domain <= 0 || token_domain > logits.ne[0]) {
+        throw std::invalid_argument("speculative_accept_tree_drafts: token_domain out of range");
+    }
+    detail::speculative_accept_tree_drafts_launch(
+        target_tokens, logits, verify_ids, parent_index, valid_columns, current_extents, lengths,
+        anchors, licensed_tokens, licensed_counts, accepted, accepted_column, fold_path,
+        token_domain, configs, stream);
+}
+
 void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& selectors, Tensor& out,
                                         cudaStream_t stream) {
     constexpr const char* op = "speculative_select_accepted_hidden";

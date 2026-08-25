@@ -271,7 +271,7 @@ std::string usage_text(std::string_view program) {
         << "  --max-ctx <tokens>          override auto-sized context capacity\n"
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
         << " (default: " << kDefaultPrefillChunk << ")\n"
-         << "  --kv-dtype <bf16|int8|nvfp4> KV cache storage (default: bf16)\n"
+         << "  --kv-dtype <bf16|int8|nvfp4> KV cache storage (default: nvfp4)\n"
          << "  --sage                    Sage3-style FP4-PV attention; requires --kv-dtype nvfp4\n"
         << "  --concurrency <1..8>        concurrent Engine lanes (default: 1);\n"
         << "                              pp+tg at C>1 reports batched decode after a sequential\n"

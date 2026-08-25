@@ -63,12 +63,14 @@ struct GqaExecutionEnvelope {
  * implementation profile. Invalid profiles or intervals throw; a legal B=1 prompt route may
  * return zero. keep_frac < 1.0 (the sparge-decode tile-skip, W=1 sage-cached steps) adds the
  * rank keep-set scratch to the SmallT stage; the default 1.0 is exact (zero added).
+ * tree_verify=true reserves decode small-T / chunked-small-T scratch for packed-tree A1,
+ * including B=1 W=7..16 where ordinary causal A1 would use the Prompt route.
  */
 [[nodiscard]] std::size_t
 gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
-                                        GqaExecutionEnvelope envelope, std::int32_t batch_size,
-                                        std::int32_t min_width, std::int32_t max_width,
-                                        float keep_frac = 1.0f);
+                                       GqaExecutionEnvelope envelope, std::int32_t batch_size,
+                                       std::int32_t min_width, std::int32_t max_width,
+                                       float keep_frac = 1.0f, bool tree_verify = false);
 
 /**
  * A1: append K/V for B independent sequences and compute causal grouped-query attention. Let
@@ -99,14 +101,26 @@ gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
  * q/k/v/positions/valid_columns/kv_table_rows/out, every cache plane/table, and live workspace
  * suballocations are pairwise non-overlapping. The Op overwrites every addressed cache row but
  * owns no persistent frontier, allocation, request identity, or commit authority.
+ *
+ * Packed-tree verify is off when ancestor_mask and prefix_lengths are empty. When both are
+ * populated, A1 still writes K/V at positions[j,b] but query j attends key x iff x <=
+ * positions[j,b] and either x < prefix_lengths[b] or packed = x - prefix_lengths[b] is in [0, W)
+ * and bit packed of ancestor_mask[j,b] is set. ancestor_mask is contiguous I32 [W,B];
+ * prefix_lengths is contiguous I32 [B]. Bit i of ancestor_mask[j] means packed column i is an
+ * ancestor of j, including j itself. The caller assigns unique cache slots positions[j,b] = E + j
+ * rather than E + depth; RoPE remains the caller's pre-Op responsibility. Tree verify uses the
+ * decode small-T route at W=1..16 (chunked for W>6), including B=1; it is not a Prompt-kernel
+ * path. gqa_attention_workspace_capacity_bytes(..., tree_verify=true) reserves that decode
+ * scratch. Ordinary MTP/causal calls omit both tensors and keep the existing signature.
  */
 void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
                    const Tensor& valid_columns, const Tensor& kv_table_rows, float scale,
                    PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
-                    // keep_frac: fraction of key tiles kept, in (0, 1]. 1.0 = keep all (exact);
-                    // keep_frac<1 enables sage_pv tile-skip (needs the k_mean plane); <=0 invalid.
-                    float keep_frac = 1.0f);
+                   // keep_frac: fraction of key tiles kept, in (0, 1]. 1.0 = keep all (exact);
+                   // keep_frac<1 enables sage_pv tile-skip (needs the k_mean plane); <=0 invalid.
+                   float keep_frac = 1.0f, const Tensor& ancestor_mask = {},
+                   const Tensor& prefix_lengths = {});
 
 /**
  * A2: perform only the cache-write part of A1. k/v are contiguous BF16 `[256,4|2,T]`, positions is
@@ -115,6 +129,16 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
  */
 void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
                    PagedKVLayerView cache, cudaStream_t stream);
+
+/**
+ * Compact packed-tree KV slots onto a sequential prefix. For each row b and i < counts[b], token
+ * prefix_lengths[b] + path[i,b] is copied onto prefix_lengths[b] + i. path is strictly increasing
+ * packed indices, so the copy is safe in increasing i. kv_table_rows, prefix_lengths, and counts
+ * are I32 [B]; path is I32 [W,B]. The cache view is the same batched GQA layer consumed by A1.
+ */
+void gqa_kv_compact_path(PagedKVBatchLayerView cache, const Tensor& kv_table_rows,
+                         const Tensor& prefix_lengths, const Tensor& path, const Tensor& counts,
+                         cudaStream_t stream);
 
 /**
  * Dev/test side-band for the sparge-decode tile-skip rank (the tools/kdev

@@ -5,11 +5,13 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 using namespace ninfer;
@@ -328,7 +330,135 @@ int run_nvfp4() {
     failures += run(4, 1, {}, ops::LinearPolicy::AllowA4, 1641U);
     failures += run(16, 1, {13}, ops::LinearPolicy::AllowA4, 1651U);
     failures += run(6, 3, {6, 4, 1}, ops::LinearPolicy::AllowA4, 1661U);
+    failures += run(5, 3, {5, 5, 5}, ops::LinearPolicy::AllowA4, 1666U);
     failures += parent.verify_preserved("NVFP4 record parent weight");
+    return failures;
+}
+
+int run_parent_index_tree() {
+    constexpr std::int32_t kHidden    = 5120;
+    constexpr std::int32_t kValueRows = 6144;
+    constexpr std::int32_t kZRows     = 6144;
+    constexpr std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
+    constexpr std::int32_t kTreeWidth = 3;
+    constexpr std::int32_t kSeqWidth  = 2;
+    constexpr std::int32_t kBatch     = 2;
+    constexpr std::int32_t kSlots     = 4;
+    constexpr std::int32_t kInitial   = 3;
+
+    DevicePackedWeight qk(
+        quantized_weight::make_patterned_weight(QType::Q4G64_F16S, 4096, kHidden, 1701U));
+    DevicePackedWeight value_z(
+        quantized_weight::make_patterned_weight(QType::Q5G64_F16S, 12288, kHidden, 1703U));
+
+    const std::vector<float> activation =
+        make_bf16_activation(kHidden, kTreeWidth * kBatch, 1711U);
+    const std::vector<std::uint16_t> conv_weight_bits =
+        make_bf16_bits(static_cast<std::size_t>(kChannels) * 4, 1713U, -0.02F, 0.02F);
+    const std::vector<std::uint16_t> state_before =
+        make_bf16_bits(static_cast<std::size_t>(kChannels) * 3 * kSlots, 1715U, -0.05F, 0.05F);
+    const std::vector<std::int32_t> initial_slots(static_cast<std::size_t>(kBatch), kInitial);
+    std::vector<std::int32_t> parent_host(static_cast<std::size_t>(kTreeWidth * kBatch));
+    for (std::int32_t batch = 0; batch < kBatch; ++batch) {
+        parent_host[static_cast<std::size_t>(batch * kTreeWidth + 0)] = -1;
+        parent_host[static_cast<std::size_t>(batch * kTreeWidth + 1)] = 0;
+        parent_host[static_cast<std::size_t>(batch * kTreeWidth + 2)] = 0;
+    }
+
+    const auto pack_pair = [&](std::int32_t second) {
+        std::vector<float> packed(static_cast<std::size_t>(kHidden) * kSeqWidth * kBatch);
+        for (std::int32_t batch = 0; batch < kBatch; ++batch) {
+            const std::array<std::int32_t, 2> tokens{0, second};
+            for (std::int32_t dst = 0; dst < kSeqWidth; ++dst) {
+                const std::int32_t src = tokens[static_cast<std::size_t>(dst)];
+                const std::size_t src_base =
+                    static_cast<std::size_t>((batch * kTreeWidth + src) * kHidden);
+                const std::size_t dst_base =
+                    static_cast<std::size_t>((batch * kSeqWidth + dst) * kHidden);
+                std::copy_n(activation.begin() + static_cast<std::ptrdiff_t>(src_base), kHidden,
+                            packed.begin() + static_cast<std::ptrdiff_t>(dst_base));
+            }
+        }
+        return packed;
+    };
+
+    const auto launch_record = [&](const std::vector<float>& x_host, std::int32_t width,
+                                   const Tensor* parent) {
+        DeviceBuffer device_x           = to_device_bf16(x_host);
+        DeviceBuffer device_conv_weight = to_device(conv_weight_bits);
+        DeviceBuffer device_state       = to_device(state_before);
+        DeviceBuffer device_initial     = to_device(initial_slots);
+        DeviceBuffer device_parent;
+        if (parent != nullptr) { device_parent = to_device(parent_host); }
+        GuardedBf16Tensor query(kQueryRows, width * kBatch);
+        GuardedBf16Tensor key(kKeyRows, width * kBatch);
+        GuardedBf16Tensor value(kValueRows, width * kBatch);
+        GuardedBf16Tensor z(kZRows, width * kBatch);
+        GuardedBf16Tensor conv_record(kChannels, width * kBatch);
+        Tensor x(device_x.p, DType::BF16, {kHidden, width, kBatch});
+        Tensor conv_weight(device_conv_weight.p, DType::BF16, {kChannels, 4});
+        Tensor state(device_state.p, DType::BF16, {kChannels, 3, kSlots});
+        Tensor valid;
+        Tensor initial(device_initial.p, DType::I32, {kBatch});
+        Tensor q(query.data(), DType::BF16, {kQueryRows, width, kBatch});
+        Tensor k(key.data(), DType::BF16, {kKeyRows, width, kBatch});
+        Tensor v(value.data(), DType::BF16, {kValueRows, width, kBatch});
+        Tensor z_view(z.data(), DType::BF16, {kZRows, width, kBatch});
+        Tensor record(conv_record.data(), DType::BF16, {kChannels, width, kBatch});
+        Tensor parent_tensor;
+        const Tensor* parent_arg = nullptr;
+        if (parent != nullptr) {
+            parent_tensor = Tensor(device_parent.p, DType::I32, {width, kBatch});
+            parent_arg    = &parent_tensor;
+        }
+        const std::size_t bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+            kQueryRows, kKeyRows, kValueRows, kBatch, width, width);
+        WorkspaceArena workspace(std::max<std::size_t>(256, bytes));
+        ops::gdn_input_proj_conv_record(x, qk.view(), value_z.view(), conv_weight, state, valid,
+                                        initial, record, q, k, v, z_view, workspace, nullptr,
+                                        parent_arg);
+        cuda_synchronize();
+        return std::tuple{query.bits(), key.bits(), value.bits(), z.bits(), conv_record.bits()};
+    };
+
+    Tensor dummy;
+    const auto [tree_q, tree_k, tree_v, tree_z, tree_record] =
+        launch_record(activation, kTreeWidth, &dummy);
+    const auto [seq0_q, seq0_k, seq0_v, seq0_z, seq0_record] =
+        launch_record(pack_pair(1), kSeqWidth, nullptr);
+    const auto [seq1_q, seq1_k, seq1_v, seq1_z, seq1_record] =
+        launch_record(pack_pair(2), kSeqWidth, nullptr);
+
+    const auto compare = [&](std::string_view label, const std::vector<std::uint16_t>& tree_bits,
+                             const std::vector<std::uint16_t>& seq_bits, std::int32_t rows,
+                             std::int32_t tree_col, std::int32_t seq_col) {
+        for (std::int32_t batch = 0; batch < kBatch; ++batch) {
+            const std::size_t tree_base =
+                static_cast<std::size_t>((batch * kTreeWidth + tree_col) * rows);
+            const std::size_t seq_base =
+                static_cast<std::size_t>((batch * kSeqWidth + seq_col) * rows);
+            if (!std::equal(tree_bits.begin() + static_cast<std::ptrdiff_t>(tree_base),
+                            tree_bits.begin() + static_cast<std::ptrdiff_t>(tree_base + rows),
+                            seq_bits.begin() + static_cast<std::ptrdiff_t>(seq_base))) {
+                std::cerr << "parent-index conv " << label << " mismatch\n";
+                return 1;
+            }
+        }
+        return 0;
+    };
+
+    int failures = 0;
+    failures += compare("query child 0", tree_q, seq0_q, kQueryRows, 1, 1);
+    failures += compare("query child 1", tree_q, seq1_q, kQueryRows, 2, 1);
+    failures += compare("key child 0", tree_k, seq0_k, kKeyRows, 1, 1);
+    failures += compare("key child 1", tree_k, seq1_k, kKeyRows, 2, 1);
+    failures += compare("value child 0", tree_v, seq0_v, kValueRows, 1, 1);
+    failures += compare("value child 1", tree_v, seq1_v, kValueRows, 2, 1);
+    failures += compare("query parent", tree_q, seq0_q, kQueryRows, 0, 0);
+    failures += compare("conv record child 0", tree_record, seq0_record, kChannels, 1, 1);
+    failures += compare("conv record child 1", tree_record, seq1_record, kChannels, 2, 1);
+    failures += qk.verify_preserved("Q4 parent-index qk weight");
+    failures += value_z.verify_preserved("Q5 parent-index value/z weight");
     return failures;
 }
 
@@ -344,6 +474,7 @@ int main() {
     failures += run_q4_q5();
     failures += run_w8();
     failures += run_nvfp4();
+    failures += run_parent_index_tree();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_record\n";
     return failures == 0 ? 0 : 1;
 }

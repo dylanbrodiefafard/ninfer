@@ -29,19 +29,27 @@ namespace ninfer::product {
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
     switch (options.backend) {
     case SpeculativeBackend::None:
-        if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full) {
+        if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full ||
+            options.dflash_verify_width != 0) {
             throw std::invalid_argument(
-                "--draft-tokens and --lm-head-draft require --spec mtp|dflash");
+                "--draft-tokens, --lm-head-draft, and --dflash-verify-width require --spec mtp|dflash");
         }
         return;
     case SpeculativeBackend::Mtp:
         if (options.draft_tokens == 0 || options.draft_tokens > 5) {
             throw std::invalid_argument("--spec mtp requires --draft-tokens in [1,5]");
         }
+        if (options.dflash_verify_width != 0) {
+            throw std::invalid_argument("--dflash-verify-width requires --spec dflash");
+        }
         return;
     case SpeculativeBackend::DFlash:
         if (options.draft_tokens == 0 || options.draft_tokens > 15) {
             throw std::invalid_argument("--spec dflash requires --draft-tokens in [1,15]");
+        }
+        if (options.dflash_verify_width != 0 &&
+            (options.dflash_verify_width < 2 || options.dflash_verify_width > 16)) {
+            throw std::invalid_argument("--dflash-verify-width must be in [2,16]");
         }
         return;
     }

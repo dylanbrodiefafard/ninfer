@@ -94,6 +94,30 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       WorkspaceArena& workspace, cudaStream_t stream);
 
 /**
+ * Op: speculative_accept_tree_drafts
+ *
+ * Greedy: from packed column 0, walk to the unique child whose token equals the target argmax;
+ * otherwise emit that argmax as the correction. Sampling: at node u sample x from the truncated
+ * target distribution; if x is a child of u, accept and continue, else emit x as correction.
+ * Walks at most current_extents[b] accepted hops (same budget as chain verify). fold_path lists
+ * packed columns of the processed path including the root; accepted_column is the last processed
+ * packed index (hidden selector). licensed_tokens are time-ordered accepted child ids plus the
+ * correction. accepted is the accepted draft count.
+ *
+ * verify_ids/parent_index/fold_path/licensed_tokens are I32 [W,B]. target_tokens is I32 [W,B].
+ * logits is BF16 [physical_rows,W,B]. current_extents/valid_columns and the other vectors are
+ * I32 [B]. W is the packed verify width (product k=7 uses 12).
+ */
+void speculative_accept_tree_drafts(const Tensor& target_tokens, const Tensor& logits,
+                                    const Tensor& verify_ids, const Tensor& parent_index,
+                                    const Tensor& valid_columns, const Tensor& current_extents,
+                                    Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
+                                    Tensor& licensed_counts, Tensor& accepted,
+                                    Tensor& accepted_column, Tensor& fold_path,
+                                    std::int32_t token_domain, const SamplingConfig* configs,
+                                    WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
  * Op: speculative_select_accepted_hidden
  *
  * Math / indexing:

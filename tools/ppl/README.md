@@ -22,7 +22,9 @@ eager pair. Each cell writes `max_nll`, `terrible_tokens` (nll ≥ 10), and a
 `{cell}.nllf32` sidecar so mean PPL cannot hide a handful of exploding tokens.
 
 `--spec mtp --draft-tokens 4` loads MTP and scores T=1 target-verify (drafts
-cleared after the prefix). It is not a draft-accept-rate test. DFlash is rejected.
+cleared after the prefix). It is not a draft-accept-rate test. `--spec dflash`
+is admitted on `--schedule prefill` only (target teacher-force with DFlash
+feature capture loaded). DFlash decode score is rejected.
 
 ## Run
 

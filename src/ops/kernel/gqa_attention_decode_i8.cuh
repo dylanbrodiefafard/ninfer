@@ -55,12 +55,13 @@ __device__ __forceinline__ void gqa_small_t_i8_store_swz(std::int8_t* tile, int 
 // dequantize V while producers execute QK. After both consume the code tile, the
 // next K/V tile is prefetched into the same arena while the current PV runs.
 template <typename Geometry, int TokenTile, int WarpsPerCta, int MinBlocksPerSm, int KeyBlock,
-          bool DynamicArena, bool MultiBatch, bool Masked, typename CacheInput>
+          bool DynamicArena, bool MultiBatch, bool Masked, bool TreeMasked, typename CacheInput>
 __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     void gqa_attention_decode_i8_tiled_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::int8_t* cache_k_i8,
         std::int8_t* cache_v_i8, __half* cache_k_scale, __half* cache_v_scale,
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
+        const std::int32_t* ancestor_mask, const std::int32_t* prefix_lengths,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t column_begin, std::int32_t logical_capacity, float scale,
         __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
@@ -131,6 +132,12 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
     q += static_cast<std::int64_t>(kGqaHeadDim) * Geometry::QHeads * column_base;
     pos += column_base;
+    if constexpr (TreeMasked) {
+        ancestor_mask += column_base;
+    } else {
+        (void)ancestor_mask;
+        (void)prefix_lengths;
+    }
     if constexpr (CacheInput::writes_cache) {
         input.k += static_cast<std::int64_t>(kGqaHeadDim) * Geometry::KVHeads * column_base;
         input.v += static_cast<std::int64_t>(kGqaHeadDim) * Geometry::KVHeads * column_base;
@@ -422,6 +429,14 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             gqa_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head1, token1);
             const int qabs0 = (row0 < RowCount) ? pos[token0] : -1;
             const int qabs1 = (row1 < RowCount) ? pos[token1] : -1;
+            int prefix_length = 0;
+            int bits0         = 0;
+            int bits1         = 0;
+            if constexpr (TreeMasked) {
+                prefix_length = prefix_lengths[batch];
+                bits0         = (row0 < RowCount) ? ancestor_mask[token0] : 0;
+                bits1         = (row1 < RowCount) ? ancestor_mask[token1] : 0;
+            }
             float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
@@ -430,19 +445,23 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int key0 = k0 + col0;
                 const int key1 = k0 + col1;
                 score[nt][0] =
-                    (row0 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs0)
+                    (gqa_key_in_causal_split(row0, RowCount, key0, split_start, split_end, qabs0) &&
+                     gqa_tree_allows_key<TreeMasked>(key0, prefix_length, full_width, bits0))
                         ? score[nt][0] * scale
                         : -CUDART_INF_F;
                 score[nt][1] =
-                    (row0 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs0)
+                    (gqa_key_in_causal_split(row0, RowCount, key1, split_start, split_end, qabs0) &&
+                     gqa_tree_allows_key<TreeMasked>(key1, prefix_length, full_width, bits0))
                         ? score[nt][1] * scale
                         : -CUDART_INF_F;
                 score[nt][2] =
-                    (row1 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs1)
+                    (gqa_key_in_causal_split(row1, RowCount, key0, split_start, split_end, qabs1) &&
+                     gqa_tree_allows_key<TreeMasked>(key0, prefix_length, full_width, bits1))
                         ? score[nt][2] * scale
                         : -CUDART_INF_F;
                 score[nt][3] =
-                    (row1 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs1)
+                    (gqa_key_in_causal_split(row1, RowCount, key1, split_start, split_end, qabs1) &&
+                     gqa_tree_allows_key<TreeMasked>(key1, prefix_length, full_width, bits1))
                         ? score[nt][3] * scale
                         : -CUDART_INF_F;
                 bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));

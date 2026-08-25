@@ -49,6 +49,21 @@ void launch_nvfp4_decode(const Tensor& x, const Weight& weight, Tensor& out, cud
     case Nvfp4Problem::Residual17408:
         launch_exact<Nvfp4Residual17408Geometry>(x, weight, out, stream);
         return;
+    case Nvfp4Problem::DflashFeature:
+        launch_exact<Nvfp4DflashFeatureGeometry>(x, weight, out, stream);
+        return;
+    case Nvfp4Problem::DflashQkv:
+        launch_exact<Nvfp4DflashQkvGeometry>(x, weight, out, stream);
+        return;
+    case Nvfp4Problem::DflashAttnOut:
+        launch_exact<Nvfp4DflashAttnOutGeometry>(x, weight, out, stream);
+        return;
+    case Nvfp4Problem::DflashConvProj:
+        launch_exact<Nvfp4DflashConvProjGeometry>(x, weight, out, stream);
+        return;
+    case Nvfp4Problem::DflashSelector:
+        launch_exact<Nvfp4DflashSelectorGeometry>(x, weight, out, stream);
+        return;
     }
 }
 

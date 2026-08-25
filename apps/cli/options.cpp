@@ -96,7 +96,7 @@ std::string usage_text(const char* argv0) {
            "       [--max-context N] [--kv-capacity N|auto] [--kv-ram-capacity off|N] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
            "       [--kv-dtype bf16|int8|nvfp4] [--sage] [--spec mtp|dflash --draft-tokens N]\n"
-           "       [--lm-head-draft]\n"
+           "       [--dflash-verify-width N] [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
@@ -158,6 +158,9 @@ Options parse_options(int argc, char** argv) {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
+        } else if (arg == "--dflash-verify-width") {
+            options.speculative.dflash_verify_width =
+                parse_u32(value(arg), "dflash-verify-width");
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--raw-output") {

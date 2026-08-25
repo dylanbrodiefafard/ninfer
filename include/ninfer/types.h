@@ -62,6 +62,8 @@ struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
+    // Packed/chain DFlash verify width. 0 selects the k-dependent default.
+    std::uint32_t dflash_verify_width = 0;
 };
 
 struct LoadProgress {
@@ -78,7 +80,7 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 4096;
     std::size_t kv_ram_capacity_bytes  = 0;
-    KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    KvCacheStorage kv_cache            = KvCacheStorage::Nvfp4;
     // Sage3-style FP4-PV compute recipe (SageAttention3): only issuable with KvCacheStorage::Nvfp4.
     bool sage_attn                     = false;
     SpeculativeOptions speculative;
@@ -409,7 +411,7 @@ struct MemorySummary {
     std::uint32_t kv_capacity                 = 0; // Resolved page-aligned Main KV capacity.
     std::uint32_t kv_capacity_page_groups     = 0;
     std::uint32_t kv_capacity_max_page_groups = 0;
-    KvCacheStorage kv_cache                   = KvCacheStorage::BFloat16;
+    KvCacheStorage kv_cache                   = KvCacheStorage::Nvfp4;
     ArenaMemorySummary weights;
     ArenaMemorySummary sequence;
     ArenaMemorySummary workspace;

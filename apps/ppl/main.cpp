@@ -191,7 +191,7 @@ int main(int argc, char** argv) {
         std::string text_path;
         std::string scheme = "kv-bf16";
         std::string out_json;
-        ninfer::KvCacheStorage kv_dtype = ninfer::KvCacheStorage::BFloat16;
+        ninfer::KvCacheStorage kv_dtype = ninfer::KvCacheStorage::Nvfp4;
         ninfer::ScoreOptions score_options;
         ninfer::SpeculativeOptions speculative;
         std::uint32_t tokens            = 0;
@@ -245,6 +245,9 @@ int main(int argc, char** argv) {
                 speculative.backend = ninfer::product::parse_speculative_backend(value("--spec"));
             } else if (arg == "--draft-tokens") {
                 speculative.draft_tokens = static_cast<std::uint32_t>(std::stoul(value("--draft-tokens")));
+            } else if (arg == "--dflash-verify-width") {
+                speculative.dflash_verify_width =
+                    static_cast<std::uint32_t>(std::stoul(value("--dflash-verify-width")));
             } else if (arg == "--cuda-graph") {
                 use_cuda_graph = true;
             } else if (arg == "--no-cuda-graph") {
@@ -266,14 +269,16 @@ int main(int argc, char** argv) {
                 << "Usage: ninfer-ppl --weights <artifact.ninfer> --ids <corpus.ids> [options]\n"
                 << "       ninfer-ppl --encode --weights <artifact.ninfer> --text <file> --ids <out.ids>\n"
                 << "  --scheme <name>             cell name (default: kv-bf16)\n"
-                << "  --kv-dtype <bf16|int8|nvfp4>\n"
+                << "  --kv-dtype <bf16|int8|nvfp4>  default: nvfp4\n"
                  << "  --sage                  sage_attn FP4-PV recipe (requires --kv-dtype nvfp4)\n"
                  << "  --s3-tma                run the S3 prefill kernel via TMA + mbarrier (NINFER_S3_TMA; requires --sage, keep_frac 1.0)\n"
                  << "  --keep-frac <f>         key-tile keep fraction (0,1]; <1 requires --sage\n"
                 << "  --schedule <prefill|decode> default prefill (prompt-route GQA)\n"
                 << "  --skip <half|n>             warmup tokens not scored (default: half)\n"
-                << "  --spec <mtp|dflash>         load a speculative backend (decode score: mtp)\n"
+                << "  --spec <mtp|dflash>         load a speculative backend (decode score: mtp;\n"
+                << "                              DFlash is prefill-only teacher-force)\n"
                 << "  --draft-tokens <n>          required with --spec mtp|dflash\n"
+                << "  --dflash-verify-width <n>   optional DFlash packed/chain verify width\n"
                 << "  --cuda-graph / --no-cuda-graph  default: graphs on (production decode)\n"
                 << "  --tokens <n>                score/encode the first n ids (default: all)\n"
                 << "  --prefill-chunk <n>         default 4096\n"
@@ -294,9 +299,10 @@ int main(int argc, char** argv) {
         }
 
         ninfer::product::validate_speculative_cli_options(speculative);
-        if (speculative.backend == ninfer::SpeculativeBackend::DFlash) {
+        if (speculative.backend == ninfer::SpeculativeBackend::DFlash &&
+            score_options.schedule == ninfer::ScoreSchedule::Decode) {
             throw std::invalid_argument(
-                "ninfer-ppl does not teacher-force DFlash; use --spec mtp or ordinary decode");
+                "ninfer-ppl does not teacher-force DFlash decode; use --schedule prefill");
         }
         const std::vector<ninfer::TokenId> ids = load_ids(ids_path, tokens);
         if (sage_attn && kv_dtype != ninfer::KvCacheStorage::Nvfp4) {

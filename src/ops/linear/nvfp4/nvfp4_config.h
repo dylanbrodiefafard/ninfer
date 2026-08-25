@@ -111,6 +111,11 @@ using Nvfp4GdnInputGeometry      = Nvfp4GemvGeometry<16384, 5120>;
 using Nvfp4MlpGateUpGeometry     = Nvfp4GemvGeometry<34816, 5120>;
 using Nvfp4Residual6144Geometry  = Nvfp4GemvGeometry<5120, 6144>;
 using Nvfp4Residual17408Geometry = Nvfp4GemvGeometry<5120, 17408>;
+using Nvfp4DflashFeatureGeometry = Nvfp4GemvGeometry<5120, 25600>;
+using Nvfp4DflashQkvGeometry     = Nvfp4GemvGeometry<6144, 5120>;
+using Nvfp4DflashAttnOutGeometry = Nvfp4GemvGeometry<5120, 4096>;
+using Nvfp4DflashConvProjGeometry = Nvfp4GemvGeometry<1280, 5120>;
+using Nvfp4DflashSelectorGeometry = Nvfp4GemvGeometry<256, 5120>;
 
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
 using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;
@@ -122,7 +127,18 @@ enum class Nvfp4Problem : std::uint8_t {
     MlpGateUp,
     Residual6144,
     Residual17408,
+    DflashFeature,
+    DflashQkv,
+    DflashAttnOut,
+    DflashConvProj,
+    DflashSelector,
 };
+
+inline constexpr bool is_nvfp4_dflash_a16_problem(Nvfp4Problem problem) {
+    return problem == Nvfp4Problem::DflashFeature || problem == Nvfp4Problem::DflashQkv ||
+           problem == Nvfp4Problem::DflashAttnOut || problem == Nvfp4Problem::DflashConvProj ||
+           problem == Nvfp4Problem::DflashSelector;
+}
 
 inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
     return (output_rows == Nvfp4AttnInputGeometry::kOutputRows &&
@@ -134,7 +150,17 @@ inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int
            (output_rows == Nvfp4Residual6144Geometry::kOutputRows &&
             input_rows == Nvfp4Residual6144Geometry::kInputRows) ||
            (output_rows == Nvfp4Residual17408Geometry::kOutputRows &&
-            input_rows == Nvfp4Residual17408Geometry::kInputRows);
+            input_rows == Nvfp4Residual17408Geometry::kInputRows) ||
+           (output_rows == Nvfp4DflashFeatureGeometry::kOutputRows &&
+            input_rows == Nvfp4DflashFeatureGeometry::kInputRows) ||
+           (output_rows == Nvfp4DflashQkvGeometry::kOutputRows &&
+            input_rows == Nvfp4DflashQkvGeometry::kInputRows) ||
+           (output_rows == Nvfp4DflashAttnOutGeometry::kOutputRows &&
+            input_rows == Nvfp4DflashAttnOutGeometry::kInputRows) ||
+           (output_rows == Nvfp4DflashConvProjGeometry::kOutputRows &&
+            input_rows == Nvfp4DflashConvProjGeometry::kInputRows) ||
+           (output_rows == Nvfp4DflashSelectorGeometry::kOutputRows &&
+            input_rows == Nvfp4DflashSelectorGeometry::kInputRows);
 }
 
 inline Nvfp4Problem resolve_nvfp4_problem(std::int32_t output_rows, std::int32_t input_rows) {
@@ -157,6 +183,26 @@ inline Nvfp4Problem resolve_nvfp4_problem(std::int32_t output_rows, std::int32_t
     if (output_rows == Nvfp4Residual17408Geometry::kOutputRows &&
         input_rows == Nvfp4Residual17408Geometry::kInputRows) {
         return Nvfp4Problem::Residual17408;
+    }
+    if (output_rows == Nvfp4DflashFeatureGeometry::kOutputRows &&
+        input_rows == Nvfp4DflashFeatureGeometry::kInputRows) {
+        return Nvfp4Problem::DflashFeature;
+    }
+    if (output_rows == Nvfp4DflashQkvGeometry::kOutputRows &&
+        input_rows == Nvfp4DflashQkvGeometry::kInputRows) {
+        return Nvfp4Problem::DflashQkv;
+    }
+    if (output_rows == Nvfp4DflashAttnOutGeometry::kOutputRows &&
+        input_rows == Nvfp4DflashAttnOutGeometry::kInputRows) {
+        return Nvfp4Problem::DflashAttnOut;
+    }
+    if (output_rows == Nvfp4DflashConvProjGeometry::kOutputRows &&
+        input_rows == Nvfp4DflashConvProjGeometry::kInputRows) {
+        return Nvfp4Problem::DflashConvProj;
+    }
+    if (output_rows == Nvfp4DflashSelectorGeometry::kOutputRows &&
+        input_rows == Nvfp4DflashSelectorGeometry::kInputRows) {
+        return Nvfp4Problem::DflashSelector;
     }
     throw std::invalid_argument("unsupported NVFP4 problem");
 }

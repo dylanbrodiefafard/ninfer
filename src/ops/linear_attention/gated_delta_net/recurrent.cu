@@ -12,9 +12,9 @@
 namespace ninfer::ops::detail::gated_delta_net {
 namespace {
 
-static_assert(sizeof(GdnReplayFoldKernelRow) == 8);
+static_assert(sizeof(GdnReplayFoldKernelRow) == 80);
 static_assert(alignof(GdnReplayFoldKernelRow) == 8);
-static_assert(sizeof(GdnReplayFoldKernelRows) == 64);
+static_assert(sizeof(GdnReplayFoldKernelRows) == 640);
 static_assert(alignof(GdnReplayFoldKernelRows) == 16);
 static_assert(std::is_trivially_copyable_v<GdnReplayFoldKernelRows>);
 
@@ -84,20 +84,22 @@ void launch_recurrent_snapshot_fixed(const Tensor& q, const Tensor& k, const Ten
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <bool Masked>
-void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
+template <bool Masked, bool ParentIndexed, int NumWarps>
+void launch_recurrent_record_warps(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
                                    const Tensor& ssm_states, const Tensor& valid_columns,
-                                   const Tensor& initial_state_slots, Tensor& key_record,
+                                   const Tensor& initial_state_slots,
+                                   const std::int32_t* parent_index, Tensor& key_record,
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
-                                   cudaStream_t stream) {
-    const auto heads = head_map::of(q.ne[1], v.ne[1]);
+                                   cudaStream_t stream, float* column_scratch) {
+    constexpr int kDv = NumWarps * kDvPerWarp;
+    const auto heads  = head_map::of(q.ne[1], v.ne[1]);
     const dim3 grid(static_cast<unsigned>(v.ne[1]), static_cast<unsigned>(q.ne[3]),
-                    static_cast<unsigned>(kStateDim / kBlockDv));
-    const dim3 block(kWarpSize, kNumWarps, 1);
+                    static_cast<unsigned>(kStateDim / kDv));
+    const dim3 block(kWarpSize, NumWarps, 1);
     const std::int64_t state_slot_stride =
         static_cast<std::int64_t>(kStateDim) * kStateDim * ssm_states.ne[2];
-    const RecordAccess<Masked> access{
+    const RecordAccess<Masked, ParentIndexed, NumWarps> access{
         static_cast<const __nv_bfloat16*>(q.data),
         static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data),
@@ -106,6 +108,7 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
         static_cast<const float*>(ssm_states.data),
         Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
         static_cast<const std::int32_t*>(initial_state_slots.data),
+        parent_index,
         static_cast<__nv_bfloat16*>(key_record.data),
         static_cast<__nv_bfloat16*>(value_record.data),
         reinterpret_cast<uint2*>(gate_record.data),
@@ -114,9 +117,42 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
         q.ne[2],
         state_slot_stride,
         scale,
+        column_scratch,
     };
-    recurrent_record_kernel<Masked><<<grid, block, 0, stream>>>(access);
+    if constexpr (ParentIndexed && NumWarps == kTreeNumWarps) {
+        const std::size_t smem =
+            static_cast<std::size_t>(q.ne[2]) * kDv * kStateDim * sizeof(float);
+        recurrent_record_kernel<Masked, true, NumWarps><<<grid, block, smem, stream>>>(access);
+    } else {
+        recurrent_record_kernel<Masked, ParentIndexed, NumWarps>
+            <<<grid, block, 0, stream>>>(access);
+    }
     CUDA_CHECK(cudaGetLastError());
+}
+
+template <bool Masked, bool ParentIndexed>
+void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
+                                   const Tensor& g, const Tensor& beta, float scale,
+                                   const Tensor& ssm_states, const Tensor& valid_columns,
+                                   const Tensor& initial_state_slots,
+                                   const std::int32_t* parent_index, Tensor& key_record,
+                                   Tensor& value_record, Tensor& gate_record, Tensor& out,
+                                   cudaStream_t stream, float* column_scratch) {
+    if constexpr (ParentIndexed) {
+        if (column_scratch != nullptr) {
+            launch_recurrent_record_warps<Masked, true, kNumWarps>(
+                q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots,
+                parent_index, key_record, value_record, gate_record, out, stream, column_scratch);
+        } else {
+            launch_recurrent_record_warps<Masked, true, kTreeNumWarps>(
+                q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots,
+                parent_index, key_record, value_record, gate_record, out, stream, nullptr);
+        }
+    } else {
+        launch_recurrent_record_warps<Masked, false, kNumWarps>(
+            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, parent_index,
+            key_record, value_record, gate_record, out, stream, nullptr);
+    }
 }
 
 template <class Geometry>
@@ -215,15 +251,33 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
                              const Tensor& beta, float scale, const Tensor& ssm_states,
                              const Tensor& valid_columns, const Tensor& initial_state_slots,
                              Tensor& key_record, Tensor& value_record, Tensor& gate_record,
-                             Tensor& out, cudaStream_t stream) {
-    if (valid_columns.data == nullptr) {
-        launch_recurrent_record_fixed<false>(q, k, v, g, beta, scale, ssm_states, valid_columns,
-                                             initial_state_slots, key_record, value_record,
-                                             gate_record, out, stream);
+                             Tensor& out, cudaStream_t stream, const std::int32_t* parent_index,
+                             float* column_scratch) {
+    const bool masked = valid_columns.data != nullptr;
+    if (parent_index == nullptr) {
+        if (!masked) {
+            launch_recurrent_record_fixed<false, false>(q, k, v, g, beta, scale, ssm_states,
+                                                        valid_columns, initial_state_slots,
+                                                        parent_index, key_record, value_record,
+                                                        gate_record, out, stream, nullptr);
+        } else {
+            launch_recurrent_record_fixed<true, false>(q, k, v, g, beta, scale, ssm_states,
+                                                       valid_columns, initial_state_slots,
+                                                       parent_index, key_record, value_record,
+                                                       gate_record, out, stream, nullptr);
+        }
+        return;
+    }
+    if (!masked) {
+        launch_recurrent_record_fixed<false, true>(q, k, v, g, beta, scale, ssm_states,
+                                                   valid_columns, initial_state_slots, parent_index,
+                                                   key_record, value_record, gate_record, out,
+                                                   stream, column_scratch);
     } else {
-        launch_recurrent_record_fixed<true>(q, k, v, g, beta, scale, ssm_states, valid_columns,
-                                            initial_state_slots, key_record, value_record,
-                                            gate_record, out, stream);
+        launch_recurrent_record_fixed<true, true>(q, k, v, g, beta, scale, ssm_states, valid_columns,
+                                                  initial_state_slots, parent_index, key_record,
+                                                  value_record, gate_record, out, stream,
+                                                  column_scratch);
     }
 }
 

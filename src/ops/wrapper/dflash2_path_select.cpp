@@ -4,6 +4,8 @@
 #include "ninfer/ops/linear.h"
 #include "ops/launcher/dflash2_path_select.h"
 
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -16,7 +18,7 @@ bool aligned_to(const void* pointer, std::uintptr_t alignment) {
 }
 
 bool is_quantized_projection(QType qtype) {
-    return qtype == QType::Q4G64_F16S || qtype == QType::W8G32_F16S;
+    return qtype == QType::Q4G64_F16S || qtype == QType::W8G32_F16S || qtype == QType::NVFP4;
 }
 
 void require_sequence_extent(std::int32_t tokens, std::int32_t batch, const char* op) {
@@ -61,6 +63,26 @@ void require_codebook(const Tensor& codebook, std::int32_t min_rows, const char*
     }
 }
 
+void require_nvfp4_codebook(const Weight& codebook, std::int32_t min_rows, const char* label) {
+    if (codebook.qtype != QType::NVFP4 || codebook.layout != QuantLayout::BlockScaleK16M128x4 ||
+        codebook.k != kDflash2PathSelectRank || codebook.n < min_rows || (codebook.n % 128) != 0 ||
+        codebook.qdata == nullptr || codebook.scales == nullptr ||
+        !std::isfinite(codebook.weight_scale_divisor) || codebook.weight_scale_divisor <= 0.0F) {
+        throw std::invalid_argument(std::string("dflash2_path_select: ") + label +
+                                    " NVFP4 codebook must be [codebook_rows,256] with rows>=min");
+    }
+}
+
+const Weight* resolved_nvfp4_codebook(const Weight* nvfp4, const Tensor& bf16,
+                                      std::int32_t min_rows, const char* label) {
+    if (nvfp4 != nullptr) {
+        require_nvfp4_codebook(*nvfp4, min_rows, label);
+        return nvfp4;
+    }
+    require_codebook(bf16, min_rows, label);
+    return nullptr;
+}
+
 void require_logit_token_ids(const Tensor& token_ids, std::int32_t vocab) {
     if (token_ids.dtype != DType::I32 || !token_ids.is_contiguous() || token_ids.data == nullptr) {
         throw std::invalid_argument("dflash2_path_select: logit_token_ids must be contiguous I32");
@@ -102,15 +124,57 @@ void require_projection_weight(const Weight& weight) {
         }
         return;
     }
-    if (!is_quantized_projection(weight.qtype) || weight.layout != QuantLayout::RowSplit) {
+    if (!is_quantized_projection(weight.qtype) ||
+        (weight.qtype != QType::NVFP4 && weight.layout != QuantLayout::RowSplit) ||
+        (weight.qtype == QType::NVFP4 && weight.layout != QuantLayout::BlockScaleK16M128x4)) {
         throw std::invalid_argument(
-            "dflash2_path_select: hidden_projection must be BF16_CTRL or Q4/W8 row-split");
+            "dflash2_path_select: hidden_projection must be BF16_CTRL, Q4/W8 row-split, or NVFP4");
     }
 }
 
 std::size_t hidden_proj_bytes(std::int32_t tokens, std::int32_t batch) {
     return static_cast<std::size_t>(kDflash2PathSelectRank) * static_cast<std::size_t>(tokens) *
            static_cast<std::size_t>(batch) * sizeof(std::uint16_t);
+}
+
+constexpr int kTopkSplits = 32;
+
+std::size_t align_workspace(std::size_t bytes) {
+    constexpr std::size_t kAlign = 256;
+    return (bytes + kAlign - 1) & ~(kAlign - 1);
+}
+
+std::size_t topk_scratch_bytes(std::int32_t tokens, std::int32_t batch) {
+    const std::size_t columns = static_cast<std::size_t>(tokens) * static_cast<std::size_t>(batch);
+    const std::size_t split =
+        columns * static_cast<std::size_t>(kTopkSplits) * kDflash2PathSelectTopK;
+    const std::size_t merged = columns * kDflash2PathSelectTopK;
+    return (split + merged) * (sizeof(float) + sizeof(std::int32_t));
+}
+
+struct TopkScratch {
+    float* split_val;
+    int* split_idx;
+    float* cand_val;
+    int* cand_idx;
+};
+
+TopkScratch alloc_topk_scratch(WorkspaceArena& workspace, std::int32_t tokens,
+                               std::int32_t batch) {
+    const std::size_t columns = static_cast<std::size_t>(tokens) * static_cast<std::size_t>(batch);
+    const std::size_t split =
+        columns * static_cast<std::size_t>(kTopkSplits) * kDflash2PathSelectTopK;
+    const std::size_t merged = columns * kDflash2PathSelectTopK;
+    auto* bytes = static_cast<std::byte*>(workspace.alloc_bytes(topk_scratch_bytes(tokens, batch)).data);
+    TopkScratch out{};
+    out.split_val = reinterpret_cast<float*>(bytes);
+    bytes += split * sizeof(float);
+    out.split_idx = reinterpret_cast<int*>(bytes);
+    bytes += split * sizeof(std::int32_t);
+    out.cand_val = reinterpret_cast<float*>(bytes);
+    bytes += merged * sizeof(float);
+    out.cand_idx = reinterpret_cast<int*>(bytes);
+    return out;
 }
 
 } // namespace
@@ -123,7 +187,8 @@ std::size_t dflash2_path_select_workspace_capacity_bytes(QType qtype, std::int32
         (batch > 1 && max_tokens > kDflash2PathSelectMaxWidthWhenBatched)) {
         throw std::invalid_argument("dflash2_path_select workspace: invalid token/batch interval");
     }
-    std::size_t bytes = hidden_proj_bytes(max_tokens, batch);
+    std::size_t bytes = align_workspace(hidden_proj_bytes(max_tokens, batch)) +
+                        align_workspace(topk_scratch_bytes(max_tokens, batch));
     if (qtype == QType::BF16_CTRL) { return bytes; }
     if (!is_quantized_projection(qtype)) {
         throw std::invalid_argument("dflash2_path_select workspace: unsupported projection qtype");
@@ -136,9 +201,11 @@ std::size_t dflash2_path_select_workspace_capacity_bytes(QType qtype, std::int32
 
 void dflash2_path_select(const Tensor& logits, const Tensor& hidden,
                          const Weight& hidden_projection, const Tensor& pred_code,
-                         const Tensor& succ_code, const Tensor& anchors, float temperature,
-                         unsigned long long seed, Tensor& path, WorkspaceArena& workspace,
-                         cudaStream_t stream, const Tensor* logit_token_ids) {
+                         const Tensor& succ_code, const Tensor& anchors,
+                         const float* temperatures, const unsigned long long* seeds, Tensor& path,
+                         WorkspaceArena& workspace, cudaStream_t stream,
+                         const Tensor* logit_token_ids, const Weight* pred_nvfp4,
+                         const Weight* succ_nvfp4) {
     require_logits(logits);
     const std::int32_t vocab  = logits.ne[0];
     const std::int32_t tokens = logits.ne[1];
@@ -146,12 +213,23 @@ void dflash2_path_select(const Tensor& logits, const Tensor& hidden,
     require_hidden(hidden, tokens, batch);
     const std::int32_t min_codebook_rows =
         logit_token_ids != nullptr ? kDflash2PathSelectCodebookRows : vocab;
-    require_codebook(pred_code, min_codebook_rows, "pred_code");
-    require_codebook(succ_code, min_codebook_rows, "succ_code");
-    if (pred_code.ne[1] != succ_code.ne[1]) {
+    const Weight* pred_q =
+        resolved_nvfp4_codebook(pred_nvfp4, pred_code, min_codebook_rows, "pred_code");
+    const Weight* succ_q =
+        resolved_nvfp4_codebook(succ_nvfp4, succ_code, min_codebook_rows, "succ_code");
+    if ((pred_q == nullptr) != (succ_q == nullptr)) {
+        throw std::invalid_argument("dflash2_path_select: codebook formats must match");
+    }
+    if (pred_q == nullptr && pred_code.ne[1] != succ_code.ne[1]) {
+        throw std::invalid_argument("dflash2_path_select: codebook row counts must match");
+    }
+    if (pred_q != nullptr && pred_q->n != succ_q->n) {
         throw std::invalid_argument("dflash2_path_select: codebook row counts must match");
     }
     if (logit_token_ids != nullptr) { require_logit_token_ids(*logit_token_ids, vocab); }
+    if (temperatures == nullptr || seeds == nullptr) {
+        throw std::invalid_argument("dflash2_path_select: temperatures and seeds are required");
+    }
     require_anchors(anchors, batch);
     require_path(path, tokens, batch);
     require_projection_weight(hidden_projection);
@@ -175,8 +253,95 @@ void dflash2_path_select(const Tensor& logits, const Tensor& hidden,
     } else {
         ops::linear(hidden_flat, hidden_projection, hidden_proj, stream);
     }
-    detail::dflash2_path_select_launch(logits, hidden_proj, pred_code, succ_code, anchors, path,
-                                       temperature, seed, stream, logit_token_ids);
+    const TopkScratch topk = alloc_topk_scratch(workspace, tokens, batch);
+    detail::dflash2_column_topk_launch(logits, topk.split_val, topk.split_idx, topk.cand_val,
+                                       topk.cand_idx, logit_token_ids, stream);
+    detail::dflash2_path_select_launch(topk.cand_val, topk.cand_idx, hidden_proj,
+                                       pred_q == nullptr ? &pred_code : nullptr,
+                                       succ_q == nullptr ? &succ_code : nullptr, pred_q, succ_q,
+                                       anchors, path, tokens, batch, temperatures, seeds, stream);
+}
+
+void dflash2_tree_select(const Tensor& logits, const Tensor& hidden,
+                         const Weight& hidden_projection, const Tensor& pred_code,
+                         const Tensor& succ_code, const Tensor& anchors, const Tensor& frontiers,
+                         Tensor& verify_ids, Tensor& parent_index, Tensor& cache_positions,
+                         Tensor& rope_positions, Tensor& ancestor_mask, Tensor& valid_columns,
+                         WorkspaceArena& workspace, cudaStream_t stream,
+                         const Tensor* logit_token_ids, const Weight* pred_nvfp4,
+                         const Weight* succ_nvfp4) {
+    require_logits(logits);
+    const std::int32_t vocab  = logits.ne[0];
+    const std::int32_t tokens = logits.ne[1];
+    const std::int32_t batch  = logits.ne[2];
+    require_hidden(hidden, tokens, batch);
+    const std::int32_t min_codebook_rows =
+        logit_token_ids != nullptr ? kDflash2PathSelectCodebookRows : vocab;
+    const Weight* pred_q =
+        resolved_nvfp4_codebook(pred_nvfp4, pred_code, min_codebook_rows, "pred_code");
+    const Weight* succ_q =
+        resolved_nvfp4_codebook(succ_nvfp4, succ_code, min_codebook_rows, "succ_code");
+    if ((pred_q == nullptr) != (succ_q == nullptr)) {
+        throw std::invalid_argument("dflash2_tree_select: codebook formats must match");
+    }
+    if (pred_q == nullptr && pred_code.ne[1] != succ_code.ne[1]) {
+        throw std::invalid_argument("dflash2_tree_select: codebook row counts must match");
+    }
+    if (pred_q != nullptr && pred_q->n != succ_q->n) {
+        throw std::invalid_argument("dflash2_tree_select: codebook row counts must match");
+    }
+    if (logit_token_ids != nullptr) { require_logit_token_ids(*logit_token_ids, vocab); }
+    require_anchors(anchors, batch);
+    require_anchors(frontiers, batch);
+    require_projection_weight(hidden_projection);
+    const std::int32_t width = verify_ids.ne[0];
+    if (width < 2 || width > kDflash2TreeExpandWidth) {
+        throw std::invalid_argument("dflash2_tree_select: W must be in [2,16]");
+    }
+    auto require_wb = [&](const Tensor& tensor, const char* name, DType dtype) {
+        if (tensor.dtype != dtype || !tensor.is_contiguous() || tensor.data == nullptr) {
+            throw std::invalid_argument(std::string("dflash2_tree_select: ") + name +
+                                        " must be contiguous");
+        }
+        if (tensor.ne[0] != width || tensor.ne[1] != batch || tensor.ne[2] != 1 ||
+            tensor.ne[3] != 1) {
+            throw std::invalid_argument(std::string("dflash2_tree_select: ") + name +
+                                        " must be [W,B]");
+        }
+    };
+    require_wb(verify_ids, "verify_ids", DType::I32);
+    require_wb(parent_index, "parent_index", DType::I32);
+    require_wb(cache_positions, "cache_positions", DType::I32);
+    require_wb(rope_positions, "rope_positions", DType::I32);
+    require_wb(ancestor_mask, "ancestor_mask", DType::I32);
+    if (valid_columns.dtype != DType::I32 || !valid_columns.is_contiguous() ||
+        valid_columns.data == nullptr || valid_columns.ne[0] != batch ||
+        valid_columns.ne[1] != 1 || valid_columns.ne[2] != 1 || valid_columns.ne[3] != 1) {
+        throw std::invalid_argument("dflash2_tree_select: valid_columns must be I32 [B]");
+    }
+    if (1 + kDflash2TreeFrontier * tokens > kDflash2TreeExpandWidth) {
+        throw std::invalid_argument("dflash2_tree_select: T is too large for the packed tree");
+    }
+
+    auto scratch_scope         = workspace.scope();
+    const DeviceSpan proj_span = workspace.alloc_bytes(hidden_proj_bytes(tokens, batch));
+    Tensor hidden_proj(proj_span.data, DType::BF16, {kDflash2PathSelectRank, tokens * batch});
+    Tensor hidden_flat = hidden.view({kDflash2PathSelectHidden, tokens * batch});
+    if (hidden_projection.qtype == QType::BF16_CTRL) {
+        detail::dflash2_path_select_bf16_gemv_launch(hidden_flat, hidden_projection, hidden_proj,
+                                                     stream);
+    } else {
+        ops::linear(hidden_flat, hidden_projection, hidden_proj, stream);
+    }
+    const TopkScratch topk = alloc_topk_scratch(workspace, tokens, batch);
+    detail::dflash2_column_topk_launch(logits, topk.split_val, topk.split_idx, topk.cand_val,
+                                       topk.cand_idx, logit_token_ids, stream);
+    detail::dflash2_tree_select_launch(topk.cand_val, topk.cand_idx, hidden_proj,
+                                       pred_q == nullptr ? &pred_code : nullptr,
+                                       succ_q == nullptr ? &succ_code : nullptr, pred_q, succ_q,
+                                       anchors, frontiers, verify_ids, parent_index,
+                                       cache_positions, rope_positions, ancestor_mask,
+                                       valid_columns, tokens, batch, width, stream);
 }
 
 } // namespace ninfer::ops

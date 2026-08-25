@@ -48,6 +48,20 @@ void scatter_bf16_batch(const Tensor& source, const Tensor& lanes, const Tensor&
                         Tensor& destination, cudaStream_t stream);
 
 /**
+ * Gather packed-tree feature columns onto a sequential prefix in lane-owned storage.
+ *
+ * features is contiguous [D,W,C], path is [W,B], lanes and counts are I32 [B]. D is divisible by
+ * eight. For each b and i < counts[b]:
+ *
+ *   features[:, i, lanes[b]] = features[:, path[i,b], lanes[b]]
+ *
+ * path[i,b] is in [0,W) and path is strictly increasing, so the copy is safe in increasing i.
+ * Columns i >= counts[b] are unchanged.
+ */
+void gather_bf16_path(Tensor& features, const Tensor& lanes, const Tensor& path,
+                      const Tensor& counts, cudaStream_t stream);
+
+/**
  * Op: extract_bf16_columns
  *
  * Math / indexing:

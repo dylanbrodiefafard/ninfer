@@ -21,26 +21,79 @@ void dflash2_path_select_bf16_gemv_launch(const Tensor& x, const Weight& weight,
     CUDA_CHECK(cudaGetLastError());
 }
 
-void dflash2_path_select_launch(const Tensor& logits, const Tensor& hidden_proj,
-                                const Tensor& pred_code, const Tensor& succ_code,
-                                const Tensor& anchors, Tensor& path, float temperature,
-                                unsigned long long seed, cudaStream_t stream,
-                                const Tensor* logit_token_ids) {
-    const std::int32_t vocab          = logits.ne[0];
-    const std::int32_t tokens         = logits.ne[1];
-    const std::int32_t batch          = logits.ne[2];
-    const std::int32_t codebook_rows  = pred_code.ne[1];
-    dflash2_path_select_kernel<<<static_cast<unsigned int>(batch), kDflash2PathSelectBlock, 0,
-                                 stream>>>(
-        static_cast<const __nv_bfloat16*>(logits.data),
-        static_cast<const __nv_bfloat16*>(hidden_proj.data),
-        static_cast<const __nv_bfloat16*>(pred_code.data),
-        static_cast<const __nv_bfloat16*>(succ_code.data),
-        static_cast<const std::int32_t*>(anchors.data),
+void dflash2_column_topk_launch(const Tensor& logits, float* split_val, int* split_idx,
+                                float* cand_val, int* cand_idx, const Tensor* logit_token_ids,
+                                cudaStream_t stream) {
+    const std::int32_t vocab  = logits.ne[0];
+    const std::int32_t tokens = logits.ne[1];
+    const std::int32_t batch  = logits.ne[2];
+    const dim3 split_grid(static_cast<unsigned int>(kDflash2PathSelectTopkSplits),
+                          static_cast<unsigned int>(tokens), static_cast<unsigned int>(batch));
+    dflash2_column_topk_split_kernel<<<split_grid, kDflash2PathSelectBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(logits.data), split_val, split_idx, vocab, tokens, batch);
+    CUDA_CHECK(cudaGetLastError());
+    const dim3 merge_grid(static_cast<unsigned int>(tokens), static_cast<unsigned int>(batch));
+    dflash2_column_topk_merge_kernel<<<merge_grid, kDflash2PathSelectBlock, 0, stream>>>(
+        split_val, split_idx, cand_val, cand_idx,
         logit_token_ids != nullptr ? static_cast<const std::int32_t*>(logit_token_ids->data)
                                    : nullptr,
-        static_cast<std::int32_t*>(path.data), vocab, tokens, batch, codebook_rows, temperature,
-        seed);
+        vocab, tokens, batch);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+Dflash2CodebookDevice codebook_device(const Tensor* bf16, const Weight* nvfp4) {
+    Dflash2CodebookDevice out{};
+    if (nvfp4 != nullptr) {
+        out.nvfp4_codes  = static_cast<const std::uint8_t*>(nvfp4->qdata);
+        out.nvfp4_scales = static_cast<const std::uint8_t*>(nvfp4->scales);
+        out.inv_dw       = 1.0F / nvfp4->weight_scale_divisor;
+        return out;
+    }
+    out.bf16 = static_cast<const __nv_bfloat16*>(bf16->data);
+    return out;
+}
+
+void dflash2_path_select_launch(const float* cand_val, const int* cand_idx,
+                                const Tensor& hidden_proj, const Tensor* pred_bf16,
+                                const Tensor* succ_bf16, const Weight* pred_nvfp4,
+                                const Weight* succ_nvfp4, const Tensor& anchors, Tensor& path,
+                                std::int32_t tokens, std::int32_t batch,
+                                const float* temperatures, const unsigned long long* seeds,
+                                cudaStream_t stream) {
+    Dflash2PathSelectSampling sampling{};
+    for (std::int32_t b = 0; b < batch; ++b) {
+        sampling.temperature[b] = temperatures[b];
+        sampling.seed[b]        = seeds[b];
+    }
+    dflash2_path_select_kernel<<<static_cast<unsigned int>(batch), kDflash2PathSelectBlock, 0,
+                                 stream>>>(
+        cand_val, cand_idx, static_cast<const __nv_bfloat16*>(hidden_proj.data),
+        codebook_device(pred_bf16, pred_nvfp4), codebook_device(succ_bf16, succ_nvfp4),
+        static_cast<const std::int32_t*>(anchors.data), static_cast<std::int32_t*>(path.data),
+        tokens, batch, sampling);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void dflash2_tree_select_launch(const float* cand_val, const int* cand_idx,
+                                const Tensor& hidden_proj, const Tensor* pred_bf16,
+                                const Tensor* succ_bf16, const Weight* pred_nvfp4,
+                                const Weight* succ_nvfp4, const Tensor& anchors,
+                                const Tensor& frontiers, Tensor& verify_ids, Tensor& parent_index,
+                                Tensor& cache_positions, Tensor& rope_positions,
+                                Tensor& ancestor_mask, Tensor& valid_columns, std::int32_t tokens,
+                                std::int32_t batch, std::int32_t out_width, cudaStream_t stream) {
+    dflash2_tree_select_kernel<<<static_cast<unsigned int>(batch), kDflash2PathSelectBlock, 0,
+                                 stream>>>(
+        cand_val, cand_idx, static_cast<const __nv_bfloat16*>(hidden_proj.data),
+        codebook_device(pred_bf16, pred_nvfp4), codebook_device(succ_bf16, succ_nvfp4),
+        static_cast<const std::int32_t*>(anchors.data),
+        static_cast<const std::int32_t*>(frontiers.data),
+        static_cast<std::int32_t*>(verify_ids.data),
+        static_cast<std::int32_t*>(parent_index.data),
+        static_cast<std::int32_t*>(cache_positions.data),
+        static_cast<std::int32_t*>(rope_positions.data),
+        static_cast<std::int32_t*>(ancestor_mask.data),
+        static_cast<std::int32_t*>(valid_columns.data), tokens, batch, out_width);
     CUDA_CHECK(cudaGetLastError());
 }
 
