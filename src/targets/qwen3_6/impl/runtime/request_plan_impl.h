@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -186,70 +187,49 @@ void ProgramImplCore::apply_reuse_decision(RequestPlanImpl& plan, const Resident
         view.identity == nullptr) {
         return;
     }
-    const bool dflash_append_ready =
-        speculative_backend != SpeculativeBackend::DFlash ||
-        view.dflash_context_frontier == view.execution_frontier;
-    const bool current_matches =
-        view.execution_frontier != 0 && dflash_append_ready &&
-        qwen3_6::detail::prefix_matches(prompt, *view.ledger, *view.identity,
-                                        view.execution_frontier);
-    bool rewrite_matches               = false;
-    ReusePath rewrite_path             = ReusePath::FullReset;
-    std::uint32_t rewrite_frontier     = 0;
-    std::vector<qwen3_6::detail::PrefillReuseHead> matching_heads;
-    if (!current_matches) {
-        const auto chain    = qwen3_6::detail::prefix_hash_chain(prompt);
-        const auto hash_ok  = [&](std::uint32_t frontier, qwen3_6::detail::PrefixHash128 hash) {
-            return frontier != 0 && frontier <= prompt.token_ids.size() &&
-                   frontier < chain.size() && chain[frontier] == hash &&
-                   qwen3_6::detail::prefix_matches(prompt, *view.ledger, *view.identity, frontier);
-        };
-        if (view.rewrite_checkpoint.valid && view.rewrite_checkpoint.frontier != 0 &&
-            view.rewrite_checkpoint.frontier <= view.ledger->size() &&
-            view.rewrite_checkpoint.frontier <= view.identity->size()) {
-            const qwen3_6::detail::PrefixHash128 hash = qwen3_6::detail::prefix_hash_at(
-                *view.ledger, *view.identity, view.rewrite_checkpoint.frontier);
-            if (hash_ok(view.rewrite_checkpoint.frontier, hash)) {
-                rewrite_matches  = true;
-                rewrite_frontier = view.rewrite_checkpoint.frontier;
-                rewrite_path     = restore_path(view.rewrite_checkpoint.kind);
-            }
-        }
-        matching_heads.reserve(view.context_checkpoints.size());
-        for (const ContextCheckpointIndex& head : view.context_checkpoints) {
-            if (hash_ok(head.frontier, head.hash)) {
-                matching_heads.push_back(
-                    qwen3_6::detail::PrefillReuseHead{head.frontier, head.kind});
-            }
-        }
+    std::vector<qwen3_6::detail::ContextCheckpointRef> heads;
+    heads.reserve(view.context_checkpoints.size());
+    for (const ContextCheckpointIndex& head : view.context_checkpoints) {
+        heads.push_back(qwen3_6::detail::ContextCheckpointRef{
+            .frontier = head.frontier, .hash = head.hash, .kind = head.kind});
     }
-    const qwen3_6::detail::PrefillReuseSelection selected =
-        qwen3_6::detail::select_resident_prefill_reuse(
-            current_matches, view.execution_frontier, rewrite_matches, rewrite_frontier,
-            rewrite_path, matching_heads);
+    const qwen3_6::detail::ResidentReuseState state = {
+        .ledger                  = view.ledger,
+        .identity                = view.identity,
+        .execution_frontier      = view.execution_frontier,
+        .rewrite_valid           = view.rewrite_checkpoint.valid,
+        .rewrite_kind            = view.rewrite_checkpoint.kind,
+        .rewrite_frontier        = view.rewrite_checkpoint.frontier,
+        .mtp_kv_valid            = view.mtp_kv_valid,
+        .dflash_context_frontier = view.dflash_context_frontier,
+        .tail_hidden_valid       = view.tail_hidden_valid,
+        .backend_image_present   = view.backend_image_present,
+        .context_checkpoints     = std::move(heads),
+    };
+    const bool mtp_cache_present = decoder->mtp_cache() != nullptr;
+    const auto selected = qwen3_6::detail::decide_resident_reuse(
+        state, prompt, speculative_backend, mtp_cache_present,
+        dflash.has_value(), DFlashConfig::full_layers > 0);
     plan.reuse      = selected.path;
     plan.reuse_base = selected.frontier;
 
-    if (speculative_backend == SpeculativeBackend::Mtp &&
-        !qwen3_6::detail::mtp_prefix_reuse_ready(plan.reuse, plan.reuse_base, view.mtp_kv_valid,
-                                                 view.tail_hidden_valid,
-                                                 decoder->mtp_cache() != nullptr)) {
-        plan.reuse      = ReusePath::FullReset;
-        plan.reuse_base = 0;
-    }
-
-    if (is_rewrite_checkpoint_restore(plan.reuse) &&
-        speculative_backend == SpeculativeBackend::DFlash) {
-        bool ready = dflash && view.dflash_context_frontier >= plan.reuse_base;
-        if constexpr (DFlashConfig::full_layers > 0) {
-            ready = ready && qwen3_6::detail::dflash_rewrite_checkpoint_ready(
-                                 view.backend_image_present, view.dflash_context_frontier,
-                                 plan.reuse_base);
-        }
-        if (!ready) {
-            plan.reuse      = ReusePath::FullReset;
-            plan.reuse_base = 0;
-        }
+    // Unexpected-state diagnostic: the resident execution frontier matches the prompt, so a
+    // healthy MTP lane should append; the MTP continuation state instead says it cannot. This
+    // is the checkpoint/FullReset-fallback case the append gate was added for, so surface it
+    // rather than let the fallback happen silently.
+    if (speculative_backend == ninfer::SpeculativeBackend::Mtp && state.execution_frontier != 0 &&
+        qwen3_6::detail::prefix_matches(prompt, *state.ledger, *state.identity,
+                                       state.execution_frontier) &&
+        !qwen3_6::detail::mtp_prefix_reuse_ready(ninfer::PrefixReusePath::AppendAtFrontier,
+                                                  state.execution_frontier, state.mtp_kv_valid,
+                                                  state.tail_hidden_valid, mtp_cache_present)) {
+        std::fprintf(stderr,
+                     "[ninfer ERROR] qwen3_6 MTP prefix-reuse: execution frontier %u matches "
+                     "the prompt but MTP append is not ready (tail_hidden_valid=%d "
+                     "mtp_kv_valid=%u mtp_cache=%d); using %s@%u instead of append_frontier\n",
+                     state.execution_frontier, state.tail_hidden_valid ? 1 : 0, state.mtp_kv_valid,
+                     mtp_cache_present ? 1 : 0,
+                     qwen3_6::detail::reuse_path_name(selected.path), selected.frontier);
     }
 }
 

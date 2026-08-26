@@ -44,8 +44,7 @@ using ReusePath = ninfer::PrefixReusePath;
 }
 
 [[nodiscard]] constexpr ReusePath restore_path(RewriteCheckpointKind kind) noexcept {
-    return kind == RewriteCheckpointKind::TurnClosure ? ReusePath::RestoreTurnCheckpoint
-                                                      : ReusePath::RestoreResponseCheckpoint;
+    return qwen3_6::detail::rewrite_restore_path(kind);
 }
 
 enum class RewriteCheckpointAction : std::uint8_t {
