@@ -75,47 +75,9 @@ __device__ __forceinline__ void gqa_nvfp4_quantize_f32x16(const float* source,
     scale                                  = packed.scale;
 }
 
-// SageAttention3 K-centering: subtract the per-page mean (over keys in this
-// append that land in the same 64-key page) before NVFP4 quantize so the FP4
-// codes spend their range on the residual, not the DC. Matches preprocess
-// `k -= k.mean(dim=-2)` on a paged cache. n<2 is left uncentered: a lone key
-// minus itself is zero and would erase the new decode token.
-template <typename Geometry>
-__device__ __forceinline__ void gqa_s3_quantize_centered_k_contig(const __nv_bfloat16* k,
-                                                                  int kv_head, int token,
-                                                                  int base_pos, int tokens, int grp,
-                                                                  std::uint32_t& codes_lo,
-                                                                  std::uint32_t& codes_hi,
-                                                                  std::uint8_t& scale) {
-    const int position   = base_pos + token;
-    const int page_first = position & ~kPagedKVPageMask;
-    const int lo         = max(page_first, base_pos);
-    const int hi         = min(page_first + kPagedKVPageSize, base_pos + tokens);
-    const int n          = max(hi - lo, 1);
-    const int d0         = grp * kGqaNvfp4Group;
-    if (n < 2) {
-        gqa_nvfp4_quantize_bf16x16(&k[gqa_nvfp4_src_index<Geometry>(kv_head, d0, token)], codes_lo,
-                                   codes_hi, scale);
-        return;
-    }
-    float mean[kGqaNvfp4Group];
-#pragma unroll
-    for (int i = 0; i < kGqaNvfp4Group; ++i) { mean[i] = 0.0f; }
-    for (int t = lo - base_pos; t < hi - base_pos; ++t) {
-#pragma unroll
-        for (int i = 0; i < kGqaNvfp4Group; ++i) {
-            mean[i] += __bfloat162float(k[gqa_nvfp4_src_index<Geometry>(kv_head, d0 + i, t)]);
-        }
-    }
-    const float inv = 1.0f / static_cast<float>(n);
-    float adj[kGqaNvfp4Group];
-#pragma unroll
-    for (int i = 0; i < kGqaNvfp4Group; ++i) {
-        adj[i] = __bfloat162float(__float2bfloat16(
-            __bfloat162float(k[gqa_nvfp4_src_index<Geometry>(kv_head, d0 + i, token)]) -
-            mean[i] * inv));
-    }
-    gqa_nvfp4_quantize_f32x16(adj, codes_lo, codes_hi, scale);
-}
+// Sage3's K smooth is a single sequence-global mean (`k -= k.mean(dim=seq)`),
+// which is softmax-invariant. A per-page mean is not: each 64-key tile gets a
+// different DC and Q·(K - mean_page) changes the softmax. Do not add a paged
+// K-centering helper here — fill uses gqa_nvfp4_quantize_bf16x16.
 
 } // namespace ninfer::ops
