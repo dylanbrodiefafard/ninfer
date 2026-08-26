@@ -128,13 +128,14 @@ std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t 
 void Variant::attention_projection(const Tensor& hidden,
                                    const FullAttentionProjectionWeights& weights, Tensor& query,
                                    Tensor& gate, Tensor& key, Tensor& value, qwen3_6::TextPhase,
-                                   WorkspaceArena&, cudaStream_t stream) {
+                                   WorkspaceArena&, cudaStream_t stream, std::int32_t) {
     ops::attn_input_proj(hidden, weights.query_key_gate_value, query, gate, key, value, stream);
 }
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
                                           Tensor& residual, qwen3_6::TextPhase,
-                                          WorkspaceArena& workspace, cudaStream_t stream) {
+                                          WorkspaceArena& workspace, cudaStream_t stream,
+                                          std::int32_t) {
     ops::linear_add(attention, weight, residual, workspace, stream);
 }
 
@@ -202,7 +203,7 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
 
 void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
                                     qwen3_6::TextPhase, WorkspaceArena& workspace,
-                                    cudaStream_t stream) {
+                                    cudaStream_t stream, std::int32_t) {
     ops::linear_add(hidden, weight, residual, workspace, stream);
 }
 
@@ -215,7 +216,8 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
 }
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
-                         qwen3_6::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
+                         qwen3_6::TextPhase, WorkspaceArena& workspace, cudaStream_t stream,
+                         std::int32_t) {
     run_sparse_moe(hidden, weights.op, residual, workspace, stream);
 }
 

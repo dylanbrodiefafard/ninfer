@@ -43,14 +43,18 @@ struct Variant {
     dflash_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window,
                           std::uint32_t batch_size, std::uint32_t verify_width);
 
+    // route_tokens is the C=1 width of a packed verify round (0 when not batched packed
+    // verify). The 35B-A3B package is all-A16: every route below is T-family-stable, so the
+    // parameter is accepted for the family interface and ignored.
     static void attention_projection(const Tensor& hidden,
                                      const FullAttentionProjectionWeights& weights, Tensor& query,
                                      Tensor& gate, Tensor& key, Tensor& value,
                                      qwen3_6::TextPhase phase, WorkspaceArena& workspace,
-                                     cudaStream_t stream);
+                                     cudaStream_t stream, std::int32_t route_tokens = 0);
     static void attention_output_projection(const Tensor& attention, const Weight& weight,
                                             Tensor& residual, qwen3_6::TextPhase phase,
-                                            WorkspaceArena& workspace, cudaStream_t stream);
+                                            WorkspaceArena& workspace, cudaStream_t stream,
+                                            std::int32_t route_tokens = 0);
     static void mtp_attention_projection(const Tensor& hidden,
                                          const MtpAttentionProjectionWeights& weights,
                                          Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
@@ -79,14 +83,14 @@ struct Variant {
         const Tensor* parent_index = nullptr);
     static void gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
                                       qwen3_6::TextPhase phase, WorkspaceArena& workspace,
-                                      cudaStream_t stream);
+                                      cudaStream_t stream, std::int32_t route_tokens = 0);
     static void gdn_norm_control_projection(const Tensor& residual, const Tensor& norm_weight,
                                             float eps, const GdnProjectionWeights& weights,
                                             Tensor& hidden, Tensor& g, Tensor& beta,
                                             WorkspaceArena& workspace, cudaStream_t stream);
     static void post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                            qwen3_6::TextPhase phase, WorkspaceArena& workspace,
-                           cudaStream_t stream);
+                           cudaStream_t stream, std::int32_t route_tokens = 0);
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
 
