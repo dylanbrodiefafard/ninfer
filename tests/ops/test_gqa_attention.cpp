@@ -2508,9 +2508,11 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
 constexpr int kSkipBr = 128;
 constexpr int kSkipBc = 64;
 constexpr int kXAttnBlock = 128;
+constexpr int kXAttnFindB = 128;
 constexpr int kXAttnV1Block = 64;
 constexpr int kXAttnStride = 16;
 constexpr int kXAttnIRows = kXAttnBlock / kXAttnStride;
+constexpr int kXAttnPagesPerFind = kXAttnFindB / kSkipBc;
 
 std::vector<float> nvfp4_page_k_mean(const HostCache& cache, std::int32_t kv_head,
                                      std::int32_t page, std::int32_t nkeys) {
@@ -2709,9 +2711,9 @@ std::vector<float> xattn_v1_plane_logits(const std::vector<float>& q, const Host
 }
 
 // Official select_mode="inverse" (Xattention.py): pack S slices along head dim,
-// softmax over the L/S axis, sum into Bc=64 tiles (4 reshaped cols/tile). One
-// B=128 query plane per MMA CTA. Remainder tiles with <S rows still score a
-// partial i-row.
+// softmax over the L/S axis, block-sum into 64-key pages (4 reshaped cols/page).
+// find_blocks (below) pairs those pages into paper B=128. One B=128 query plane
+// per MMA CTA. Remainder tiles with <S rows still score a partial i-row.
 std::vector<float> xattn_paper_plane_mass(const std::vector<float>& q, const HostCache& cache,
                                           std::int32_t q_head, std::int32_t q0,
                                           std::int32_t tile_rows, std::int32_t base_pos) {
@@ -2806,28 +2808,52 @@ void xattn_or_greedy_keep(std::vector<char>& mark, std::vector<float> probs, flo
     mark[static_cast<std::size_t>(kb_lim - 1)]      = 1;
 }
 
+void xattn_keep_find_block(std::vector<char>& mark, int block, int key_pages) {
+    const int p0 = block * kXAttnPagesPerFind;
+    if (p0 < key_pages) { mark[static_cast<std::size_t>(p0)] = 1; }
+    if (p0 + 1 < key_pages) { mark[static_cast<std::size_t>(p0 + 1)] = 1; }
+}
+
 std::vector<char> xattn_keep_list(const std::vector<float>& q, const HostCache& cache,
                                   std::int32_t q_head, std::int32_t q0, std::int32_t tile_rows,
                                   std::int32_t base_pos, float tau) {
     const std::int32_t max_query_abs = base_pos + q0 + tile_rows - 1;
     const std::int32_t key_blocks    = max_query_abs / kSkipBc + 1;
     std::vector<char> mark(static_cast<std::size_t>(key_blocks), 0);
-    std::vector<float> scores = xattn_paper_plane_mass(q, cache, q_head, q0, tile_rows, base_pos);
-    if (scores.empty()) {
-        mark[0]                                    = 1;
-        mark[static_cast<std::size_t>(key_blocks - 1)] = 1;
-        const int local_lo =
-            std::min((base_pos + q0) / kSkipBc, key_blocks - 1);
-        mark[static_cast<std::size_t>(local_lo)] = 1;
+    const int n_blocks = (key_blocks + kXAttnPagesPerFind - 1) / kXAttnPagesPerFind;
+    std::vector<float> page_mass =
+        xattn_paper_plane_mass(q, cache, q_head, q0, tile_rows, base_pos);
+    if (page_mass.empty() || n_blocks <= 0) {
+        xattn_keep_find_block(mark, 0, key_blocks);
+        const int last_b = n_blocks > 0 ? n_blocks - 1 : 0;
+        xattn_keep_find_block(mark, last_b, key_blocks);
+        xattn_keep_find_block(mark, std::min((base_pos + q0) / kXAttnFindB, last_b), key_blocks);
         return mark;
     }
+    std::vector<float> block_mass(static_cast<std::size_t>(n_blocks), 0.0f);
+    for (int b = 0; b < n_blocks; ++b) {
+        const int p0 = b * kXAttnPagesPerFind;
+        float m      = p0 < static_cast<int>(page_mass.size())
+                           ? page_mass[static_cast<std::size_t>(p0)]
+                           : 0.0f;
+        if (p0 + 1 < key_blocks && p0 + 1 < static_cast<int>(page_mass.size())) {
+            m += page_mass[static_cast<std::size_t>(p0 + 1)];
+        }
+        block_mass[static_cast<std::size_t>(b)] = m;
+    }
     float z = 0.0f;
-    for (float s : scores) { z += s; }
+    for (float s : block_mass) { z += s; }
     const float inv_z = z > 0.0f ? 1.0f / z : 0.0f;
-    for (float& s : scores) { s *= inv_z; }
-    xattn_or_greedy_keep(mark, std::move(scores), tau);
-    const int local_lo = std::min((base_pos + q0) / kSkipBc, key_blocks - 1);
-    mark[static_cast<std::size_t>(local_lo)] = 1;
+    for (float& s : block_mass) { s *= inv_z; }
+    std::vector<char> block_mark(static_cast<std::size_t>(n_blocks), 0);
+    xattn_or_greedy_keep(block_mark, std::move(block_mass), tau);
+    for (int b = 0; b < n_blocks; ++b) {
+        if (block_mark[static_cast<std::size_t>(b)]) {
+            xattn_keep_find_block(mark, b, key_blocks);
+        }
+    }
+    const int local_b = std::min((base_pos + q0) / kXAttnFindB, n_blocks - 1);
+    xattn_keep_find_block(mark, local_b, key_blocks);
     return mark;
 }
 
@@ -3025,16 +3051,21 @@ int run_a1_skip_case(const Geometry& geometry, const AttentionCase& test_case, f
             const int key_blocks = static_cast<int>(mark.size());
             if (key_blocks <= 0) { continue; }
             const int local_lo = std::min((test_case.base + q0) / kSkipBc, key_blocks - 1);
+            const int local_b  = (test_case.base + q0) / kXAttnFindB;
+            const int local_p0 = local_b * kXAttnPagesPerFind;
             keep_d_sum += key_blocks;
             for (char m : mark) { keep_n_sum += m ? 1 : 0; }
             if (xattn_tau < 1.0f && !xattn_identity) {
-                if (!mark[static_cast<std::size_t>(local_lo)]) {
-                    std::cerr << label << " q" << q_head << " qb" << qb << " missing local tile "
-                              << local_lo << '\n';
+                if (!mark[static_cast<std::size_t>(local_lo)] ||
+                    (local_p0 + 1 < key_blocks &&
+                     !mark[static_cast<std::size_t>(local_p0 + 1)])) {
+                    std::cerr << label << " q" << q_head << " qb" << qb
+                              << " missing local B=128 pages " << local_p0 << "/" << local_p0 + 1
+                              << '\n';
                     ++failures;
                 }
                 ++local_forced;
-                const bool is_sink_or_last = local_lo == 0 || local_lo == key_blocks - 1;
+                const bool is_sink_or_last = local_p0 == 0 || local_p0 + 1 >= key_blocks - 1;
                 if (!is_sink_or_last) { ++local_added; }
             }
         }
@@ -3117,9 +3148,9 @@ int run_a1_skip_case(const Geometry& geometry, const AttentionCase& test_case, f
                           << v1_hot << '\n';
                 ++failures;
             }
-            if (!kept(kXattnPlantHotKb) || kept(1) || kept(2) || kept(4) || kept(5)) {
-                std::cerr << label << " paper-plant keep-set should keep tile " << kXattnPlantHotKb
-                          << " and drop 1/2/4/5 (0, local diagonal, and last are force-kept); kept=";
+            if (!kept(kXattnPlantHotKb) || !kept(2) || kept(4) || kept(5)) {
+                std::cerr << label << " paper-plant B=128 keep-set should keep pages 2-3 (hot "
+                          << "block) and drop 4/5; sink 0-1 and local/last 6-7 are force-kept; kept=";
                 for (int kb = 0; kb < static_cast<int>(mark0.size()); ++kb) {
                     if (mark0[static_cast<std::size_t>(kb)]) { std::cerr << ' ' << kb; }
                 }

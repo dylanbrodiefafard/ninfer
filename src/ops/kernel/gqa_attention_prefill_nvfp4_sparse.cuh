@@ -7,10 +7,13 @@
 // XAttention ranking is a prepass (not fused into the MMA CTA). Pack K once to
 // bf16 [kv_head, j, s, d], then score the official inverse reshape on one B=128
 // plane per MMA CTA: A[i,j] = sum_s Q[15-s+i*16]·K[s+j*16] / (√d·S). find_blocks
-// softmaxes over L/S, block-sums into Bc=64, greedy mass ≥ τ, then force tile 0,
-// both local (diagonal) Bc=64 tiles of the B=128 query block, and the last
-// visible tile. Remainder Q-blocks with <S rows still score one partial
-// i-row (skip q_rel >= q_rows) instead of sink-only.
+// softmaxes over L/S, block-sums into paper B=128 (two Bc=64 pages), greedy
+// mass ≥ τ, then expands each kept block to its pages. Force-keep is paper
+// find_blocks_chunked: key block 0, the local diagonal B=128 block, and the
+// last visible B=128 block. Remainder Q-blocks with <S rows still score one partial
+// i-row (skip q_rel >= q_rows) instead of sink-only. Scoring is the paper
+// inverse-stride GEMM C[8, n_j] = Qflat[8, S·d] @ packed[n_j, S·d]ᵀ on tensor
+// cores (M padded to 16).
 
 #include "ops/kernel/gqa_attention_kv_nvfp4.cuh"
 #include "ops/kernel/gqa_attention_prefill_common.cuh"
@@ -63,23 +66,37 @@ inline constexpr int kGqaPrefillNvfp4SmemBytes = 101376;
 inline constexpr int kXAttnStride = kGqaXattnStride;
 inline constexpr int kXAttnBlock  = kGqaPrefillNvfp4Br; // paper B=128, one greedy plane per MMA CTA
 inline constexpr int kXAttnIRows  = kGqaXattnIRows;
-inline constexpr int kXAttnSplits = 32;
-inline constexpr int kXAttnScoreWarps   = 4;
+// Pack is one 64-key page: four warps write the four inverse-stride columns.
+inline constexpr int kXAttnPackWarps   = 4;
+inline constexpr int kXAttnPackThreads = kXAttnPackWarps * 32;
+// Inverse-stride GEMM tile: C[8, BN] += A[8, BK] @ B[BN, BK]ᵀ with M padded to 16.
+// 20 KiB smem → several CTAs/SM. Grid z walks n_j / BN.
+inline constexpr int kXAttnScoreBM      = 16;
+inline constexpr int kXAttnScoreBN      = 64;
+inline constexpr int kXAttnScoreBK      = 64;
+inline constexpr int kXAttnScoreK       = kXAttnStride * kGqaPrefillHeadDim;
+inline constexpr int kXAttnScoreStages  = 2;
+inline constexpr int kXAttnScoreWarpsN  = 4;
+inline constexpr int kXAttnScoreWarps   = kXAttnScoreWarpsN;
 inline constexpr int kXAttnScoreThreads = kXAttnScoreWarps * 32;
+inline constexpr int kXAttnScoreWN      = kXAttnScoreBN / kXAttnScoreWarpsN;
 inline constexpr int kXAttnPageCodeBytes  = kGqaPrefillNvfp4Bc * kGqaNvfp4CodeWidth;
 inline constexpr int kXAttnPageScaleBytes = kGqaPrefillNvfp4Bc * kGqaNvfp4Groups;
-inline constexpr int kXAttnQSmemBytes =
-    kXAttnBlock * kGqaPrefillHeadDim * static_cast<int>(sizeof(__nv_bfloat16));
-inline constexpr int kXAttnKSmemBytes =
-    kXAttnScoreWarps * kXAttnStride * kGqaPrefillHeadDim * static_cast<int>(sizeof(__nv_bfloat16));
-inline constexpr int kXAttnScoreSmemBytes = kXAttnQSmemBytes + kXAttnKSmemBytes;
+inline constexpr int kXAttnScoreSmemBytes =
+    kXAttnScoreStages * (kXAttnScoreBM + kXAttnScoreBN) * kXAttnScoreBK *
+    static_cast<int>(sizeof(__nv_bfloat16));
 
 static_assert(kXAttnBlock == kGqaPrefillNvfp4Br);
 static_assert(kGqaPrefillNvfp4Br == kGqaXattnPrefillBr);
 static_assert(kGqaPrefillNvfp4Bc == kGqaXattnPrefillBc);
+static_assert(kGqaXattnFindB == 2 * kGqaXattnPrefillBc);
 static_assert(kGqaPrefillHeadDim == kGqaXattnHeadDim);
 static_assert(kGqaPrefillNvfp4RankTiles == kGqaXattnRankTiles);
 static_assert(kXAttnIRows == 8);
+static_assert(kXAttnScoreK == 4096);
+static_assert(kXAttnScoreK % kXAttnScoreBK == 0);
+static_assert(kXAttnScoreBN % kXAttnScoreWN == 0);
+static_assert(kXAttnScoreWN % 8 == 0);
 static_assert(kXAttnScoreSmemBytes <= 101376);
 
 struct GqaXattnScratchView {
@@ -220,10 +237,15 @@ __device__ __forceinline__ std::int64_t gqa_xattn_packed_row(int kv_head, int n_
            static_cast<std::int64_t>(s) * kGqaPrefillHeadDim;
 }
 
+// 64-wide XOR swizzle matching bf16_gemm_mma (ldmatrix-friendly).
+__device__ __forceinline__ int gqa_xattn_gemm_swz(int row, int col) {
+    return (col & ~63) + ((((col & 63) >> 3) ^ (row & 7)) << 3) + (col & 7);
+}
+
 // Dequant each NVFP4 K page once into packed bf16 [kv_head, j, s, d]. Grid is
 // (kv_head, kb); four warps write the four inverse-stride columns of the page.
 template <typename Geometry, typename Metadata>
-__global__ __launch_bounds__(kXAttnScoreThreads, 8) void gqa_xattn_pack_kernel(
+__global__ __launch_bounds__(kXAttnPackThreads, 8) void gqa_xattn_pack_kernel(
     const std::uint8_t* __restrict__ cache_k, const std::uint8_t* __restrict__ cache_k_scale,
     Metadata metadata, const std::int32_t* __restrict__ positions, std::int32_t width,
     std::int32_t xattn_min_len, int n_kb_cap, int n_j_cap, __nv_bfloat16* __restrict__ packed) {
@@ -251,7 +273,7 @@ __global__ __launch_bounds__(kXAttnScoreThreads, 8) void gqa_xattn_pack_kernel(
 
     const std::int32_t* block_table = metadata.block_table();
     const int physical_page         = block_table[kb];
-    for (int key_l = tid; key_l < Bc; key_l += kXAttnScoreThreads) {
+    for (int key_l = tid; key_l < Bc; key_l += kXAttnPackThreads) {
         const int key = tile_k0 + key_l;
         if (key <= max_query_abs) {
             const std::int64_t off =
@@ -261,7 +283,7 @@ __global__ __launch_bounds__(kXAttnScoreThreads, 8) void gqa_xattn_pack_kernel(
             store_vec(&k_scale[key_l * Groups], make_int4(0, 0, 0, 0));
         }
     }
-    for (int chunk = tid; chunk < Bc * (CodeW / 16); chunk += kXAttnScoreThreads) {
+    for (int chunk = tid; chunk < Bc * (CodeW / 16); chunk += kXAttnPackThreads) {
         const int key_l   = chunk / (CodeW / 16);
         const int seg     = chunk - key_l * (CodeW / 16);
         const int logical = seg * 16;
@@ -298,28 +320,38 @@ __global__ __launch_bounds__(kXAttnScoreThreads, 8) void gqa_xattn_pack_kernel(
     }
 }
 
-// Packed-K inverse-stride estimate. Grid is (q_head, br, K-split). Four warps
-// CUDA-core four j-columns; 8 i-rows of one B=128 plane stay in smem.
+// Inverse-stride GEMM: C[i, j] = sum_s Q[15-s+i·S] · packed[j, s] / (√d · S).
+// Grid is (q_head, br, n_j / BN). Same math as the CUDA-core estimate; tensor-core
+// m16n8k16 with M padded to 16.
 template <typename Geometry, typename Metadata>
-__global__ __launch_bounds__(kXAttnScoreThreads, 1) void gqa_xattn_score_kernel(
+__global__ __launch_bounds__(kXAttnScoreThreads, 4) void gqa_xattn_score_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ packed, Metadata metadata,
     const std::int32_t* __restrict__ positions, float scale, std::int32_t width,
-    std::int32_t xattn_min_len, int n_br, int n_j_cap, int n_split, float* __restrict__ logits) {
-    constexpr int D             = kGqaPrefillHeadDim;
-    constexpr int VecPerRow     = D / 8;
-    constexpr int QRowStride    = D * Geometry::QHeads;
-    constexpr unsigned FullMask = 0xffffffffu;
+    std::int32_t xattn_min_len, int n_br, int n_j_cap, float* __restrict__ logits) {
+    constexpr int D          = kGqaPrefillHeadDim;
+    constexpr int QRowStride = D * Geometry::QHeads;
+    constexpr int BM         = kXAttnScoreBM;
+    constexpr int BN         = kXAttnScoreBN;
+    constexpr int BK         = kXAttnScoreBK;
+    constexpr int K          = kXAttnScoreK;
+    constexpr int S          = kXAttnScoreStages;
+    constexpr int WN         = kXAttnScoreWN;
+    constexpr int NT         = WN / 8;
+    constexpr int KSUB       = BK / 16;
+    constexpr int THREADS    = kXAttnScoreThreads;
+    constexpr int kTiles     = K / BK;
 
     extern __shared__ __align__(16) unsigned char xattn_score_smem[];
-    __nv_bfloat16* q_s = reinterpret_cast<__nv_bfloat16*>(xattn_score_smem);
-    __nv_bfloat16* k_s = q_s + kXAttnBlock * D;
+    auto* As = reinterpret_cast<__nv_bfloat16*>(xattn_score_smem);
+    auto* Bs = As + S * BM * BK;
 
     const int q_head = static_cast<int>(blockIdx.x);
     const int br     = static_cast<int>(blockIdx.y);
-    const int split  = static_cast<int>(blockIdx.z);
+    const int tile_n = static_cast<int>(blockIdx.z);
     const int tid    = static_cast<int>(threadIdx.x);
     const int warp   = tid >> 5;
     const int lane   = tid & 31;
+    const int wn     = warp;
     const int tokens = metadata.valid_tokens(width);
     if (q_head >= Geometry::QHeads || br >= n_br || tokens <= 0) { return; }
 
@@ -336,99 +368,130 @@ __global__ __launch_bounds__(kXAttnScoreThreads, 1) void gqa_xattn_score_kernel(
 
     const int q_abs_max = base_pos + q_start + q_rows - 1;
     const int n_j       = min(n_j_cap, q_abs_max / kXAttnStride + 1);
-    const int n_groups  = (n_j + kXAttnScoreWarps - 1) / kXAttnScoreWarps;
-    const int g0        = (n_groups * split) / n_split;
-    const int g1        = (n_groups * (split + 1)) / n_split;
-    if (g0 >= g1) { return; }
+    const int n0        = tile_n * BN;
+    if (n0 >= n_j) { return; }
 
-    const float inv_s = scale / static_cast<float>(kXAttnStride);
+    const int gid          = lane >> 2;
+    const int lid          = lane & 3;
+    const int a_matrix     = lane >> 3;
+    const int a_inner_row  = lane & 7;
+    const int a_row_offset = a_inner_row + ((a_matrix & 1) << 3);
+    const int a_col_offset = (a_matrix >> 1) << 3;
+    const int b_inner_row  = lane & 7;
+    const int b_k_offset   = ((lane >> 3) & 1) << 3;
 
-    {
-        const __nv_bfloat16* q_block = q + gqa_prefill_q_index<Geometry>(q_head, 0, q_start);
-        if (q_start + kXAttnBlock <= tokens) {
-            for (int chunk = tid; chunk < kXAttnBlock * VecPerRow; chunk += kXAttnScoreThreads) {
-                const int row = chunk >> 5;
-                const int d   = (chunk & 31) << 3;
-                cp_async<16, Cache::cg>(&q_s[row * D + d], &q_block[row * QRowStride + d]);
+    const __nv_bfloat16* q_block = q + gqa_prefill_q_index<Geometry>(q_head, 0, q_start);
+    const __nv_bfloat16* b_base  = packed + gqa_xattn_packed_row(kv_head, n_j_cap, 0, 0);
+    const float inv_s            = scale / static_cast<float>(kXAttnStride);
+
+    float accum[NT][4] = {};
+
+    auto stage_inputs = [&](int stage, int k_tile) {
+        const int k0  = k_tile * BK;
+        auto* a_stage = As + stage * BM * BK;
+        auto* b_stage = Bs + stage * BN * BK;
+        for (int item = tid; item < BM * (BK / 8); item += THREADS) {
+            const int row = item / (BK / 8);
+            const int kk  = (item - row * (BK / 8)) * 8;
+            auto* dst     = &a_stage[row * BK + gqa_xattn_gemm_swz(row, kk)];
+            if (row >= n_i) {
+                store_vec(dst, make_int4(0, 0, 0, 0));
+                continue;
             }
-        } else {
-            for (int chunk = tid; chunk < kXAttnBlock * VecPerRow; chunk += kXAttnScoreThreads) {
-                const int row = chunk >> 5;
-                const int d   = (chunk & 31) << 3;
-                __nv_bfloat16* p = &q_s[row * D + d];
-                if (row < q_rows) {
-                    cp_async<16, Cache::cg>(p, &q_block[row * QRowStride + d]);
-                } else {
-                    store_vec(p, make_int4(0, 0, 0, 0));
-                }
+            const int k     = k0 + kk;
+            const int s     = k >> 8;
+            const int d     = k & 255;
+            const int q_rel = (kXAttnStride - 1 - s) + row * kXAttnStride;
+            if (q_rel < q_rows) {
+                cp_async<16, Cache::cg>(dst, &q_block[q_rel * QRowStride + d]);
+            } else {
+                store_vec(dst, make_int4(0, 0, 0, 0));
             }
         }
+        for (int item = tid; item < BN * (BK / 8); item += THREADS) {
+            const int col = item / (BK / 8);
+            const int kk  = (item - col * (BK / 8)) * 8;
+            auto* dst     = &b_stage[col * BK + gqa_xattn_gemm_swz(col, kk)];
+            const int j   = n0 + col;
+            if (j < n_j) {
+                cp_async<16, Cache::cg>(dst, &b_base[static_cast<std::int64_t>(j) * K + k0 + kk]);
+            } else {
+                store_vec(dst, make_int4(0, 0, 0, 0));
+            }
+        }
+    };
+
+#pragma unroll
+    for (int stage = 0; stage < S; ++stage) {
+        stage_inputs(stage, stage);
         ninfer::ops::cp_commit();
-        ninfer::ops::cp_wait<0>();
     }
-    __syncthreads();
 
-    for (int g = g0; g < g1; ++g) {
-        const int j = g * kXAttnScoreWarps + warp;
-        __nv_bfloat16* k_warp = k_s + warp * kXAttnStride * D;
-        if (j < n_j) {
-            const __nv_bfloat16* src = packed + gqa_xattn_packed_row(kv_head, n_j_cap, j, 0);
-            for (int chunk = lane; chunk < kXAttnStride * VecPerRow; chunk += 32) {
-                const int s = chunk >> 5;
-                const int d = (chunk & 31) << 3;
-                cp_async<16, Cache::cg>(&k_warp[s * D + d], &src[s * D + d]);
-            }
+#pragma unroll 1
+    for (int k_tile = 0; k_tile < kTiles; ++k_tile) {
+        const int stage = k_tile % S;
+        if (k_tile + S <= kTiles) {
+            ninfer::ops::cp_wait<S - 1>();
         } else {
-            for (int chunk = lane; chunk < kXAttnStride * VecPerRow; chunk += 32) {
-                const int s = chunk >> 5;
-                const int d = (chunk & 31) << 3;
-                store_vec(&k_warp[s * D + d], make_int4(0, 0, 0, 0));
-            }
+            ninfer::ops::cp_wait<0>();
         }
-        ninfer::ops::cp_commit();
-        ninfer::ops::cp_wait<0>();
+        __syncthreads();
 
-        float acc[8];
+        unsigned a_frag[2][4];
+        unsigned b_frag[2][NT][2];
+        auto load_frags = [&](int k_step, unsigned(&a)[4], unsigned(&b)[NT][2]) {
+            const int arow = a_row_offset;
+            const int acol = k_step * 16 + a_col_offset;
+            ldmatrix_x4(a[0], a[1], a[2], a[3],
+                        smem_addr(&As[stage * BM * BK + arow * BK + gqa_xattn_gemm_swz(arow, acol)]));
 #pragma unroll
-        for (int i = 0; i < 8; ++i) { acc[i] = 0.0f; }
+            for (int ni = 0; ni < NT; ++ni) {
+                const int brow = wn * WN + ni * 8 + b_inner_row;
+                const int bcol = k_step * 16 + b_k_offset;
+                ldmatrix_x2(b[ni][0], b[ni][1],
+                            smem_addr(
+                                &Bs[stage * BN * BK + brow * BK + gqa_xattn_gemm_swz(brow, bcol)]));
+            }
+        };
+        load_frags(0, a_frag[0], b_frag[0]);
 #pragma unroll
-        for (int s = 0; s < kXAttnStride; ++s) {
-            const int q0              = kXAttnStride - 1 - s;
-            const __nv_bfloat16* krow = k_warp + s * D;
+        for (int k_step = 0; k_step < KSUB; ++k_step) {
+            const int slot = k_step & 1;
+            if (k_step + 1 < KSUB) { load_frags(k_step + 1, a_frag[slot ^ 1], b_frag[slot ^ 1]); }
 #pragma unroll
-            for (int d2 = lane; d2 < (D / 2); d2 += 32) {
-                const int d = d2 << 1;
-                const __nv_bfloat162 kv = *reinterpret_cast<const __nv_bfloat162*>(&krow[d]);
-                const float kx          = __bfloat162float(kv.x);
-                const float ky          = __bfloat162float(kv.y);
-#pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    const int q_rel = q0 + i * kXAttnStride;
-                    const __nv_bfloat162 qv =
-                        *reinterpret_cast<const __nv_bfloat162*>(&q_s[q_rel * D + d]);
-                    acc[i] += __bfloat162float(qv.x) * kx + __bfloat162float(qv.y) * ky;
-                }
+            for (int ni = 0; ni < NT; ++ni) {
+                mma_bf16(accum[ni][0], accum[ni][1], accum[ni][2], accum[ni][3], a_frag[slot][0],
+                         a_frag[slot][1], a_frag[slot][2], a_frag[slot][3], b_frag[slot][ni][0],
+                         b_frag[slot][ni][1]);
             }
         }
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            float p = acc[i];
-#pragma unroll
-            for (int r = 16; r; r >>= 1) { p += __shfl_xor_sync(FullMask, p, r); }
-            acc[i] = p * inv_s;
+
+        __syncthreads();
+        const int next = k_tile + S;
+        if (next < kTiles) {
+            stage_inputs(stage, next);
+            ninfer::ops::cp_commit();
         }
-        if (lane == 0 && j < n_j) {
+    }
+
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                float logit = -CUDART_INF_F;
-                if (i < n_i) {
-                    const int k_abs_max_j = j * kXAttnStride + (kXAttnStride - 1);
-                    const int q_abs_max_i =
-                        base_pos + q_start + min(i * kXAttnStride + (kXAttnStride - 1), q_rows - 1);
-                    if (k_abs_max_j <= q_abs_max_i) { logit = acc[i]; }
-                }
-                logits[gqa_xattn_logit_index(q_head, n_br, br, i, n_j_cap, j)] = logit;
+    for (int ni = 0; ni < NT; ++ni) {
+        const int j0 = n0 + wn * WN + ni * 8 + 2 * lid;
+        const int j1 = j0 + 1;
+        const int i  = gid;
+#pragma unroll
+        for (int t = 0; t < 2; ++t) {
+            const int j     = t == 0 ? j0 : j1;
+            const float raw = t == 0 ? accum[ni][0] : accum[ni][1];
+            if (j >= n_j) { continue; }
+            float logit = -CUDART_INF_F;
+            if (i < n_i) {
+                const int k_abs_max_j = j * kXAttnStride + (kXAttnStride - 1);
+                const int q_abs_max_i =
+                    base_pos + q_start + min(i * kXAttnStride + (kXAttnStride - 1), q_rows - 1);
+                if (k_abs_max_j <= q_abs_max_i) { logit = raw * inv_s; }
             }
+            logits[gqa_xattn_logit_index(q_head, n_br, br, i, n_j_cap, j)] = logit;
         }
     }
 }
@@ -564,20 +627,26 @@ __global__ void gqa_xattn_finish_kernel(Metadata metadata, const std::int32_t* _
     for (int kb = tid; kb < key_blocks; kb += kGqaPrefillNvfp4Threads) { mark[kb] = 0; }
     __syncthreads();
 
+    constexpr int PagesPerFind = kGqaXattnFindB / Bc;
+    const int n_blocks         = (key_blocks + PagesPerFind - 1) / PagesPerFind;
     if (tid == 0) {
         float z = 0.0f;
-        for (int kb = 0; kb < key_blocks; ++kb) {
-            scores[kb] = mass[gqa_xattn_mass_index(q_head, n_br, br, n_kb_cap, kb)];
-            z += scores[kb];
+        for (int b = 0; b < n_blocks; ++b) {
+            const int p0 = b * PagesPerFind;
+            float m      = mass[gqa_xattn_mass_index(q_head, n_br, br, n_kb_cap, p0)];
+            if (p0 + 1 < key_blocks) {
+                m += mass[gqa_xattn_mass_index(q_head, n_br, br, n_kb_cap, p0 + 1)];
+            }
+            scores[b] = m;
+            z += m;
         }
         const float inv_z = z > 0.0f ? 1.0f / z : 0.0f;
-        for (int kb = 0; kb < key_blocks; ++kb) { scores[kb] *= inv_z; }
+        for (int b = 0; b < n_blocks; ++b) { scores[b] *= inv_z; }
     }
     __syncthreads();
-    const int nsort = key_blocks <= 256 ? 256 : key_blocks <= 512 ? 512 : key_blocks <= 2048 ? 2048
-                                                                                            : 4096;
+    const int nsort = n_blocks <= 256 ? 256 : n_blocks <= 512 ? 512 : n_blocks <= 2048 ? 2048 : 4096;
     for (int i = tid; i < nsort; i += kGqaPrefillNvfp4Threads) {
-        if (i < key_blocks) {
+        if (i < n_blocks) {
             sort_ids[i] = i;
         } else {
             scores[i]   = -CUDART_INF_F;
@@ -590,17 +659,22 @@ __global__ void gqa_xattn_finish_kernel(Metadata metadata, const std::int32_t* _
         float kept = 0.0f;
         for (int i = 0; i < nsort; ++i) {
             if (kept >= xattn_tau) { break; }
-            const int kb  = sort_ids[i];
+            const int b   = sort_ids[i];
             const float s = scores[i];
-            if (kb < 0 || s <= 0.0f) { break; }
-            mark[kb] = 1;
+            if (b < 0 || s <= 0.0f) { break; }
+            const int p0 = b * PagesPerFind;
+            mark[p0]     = 1;
+            if (p0 + 1 < key_blocks) { mark[p0 + 1] = 1; }
             kept += s;
         }
-        const int local_lo    = (base_pos + q0) / Bc;
-        mark[0]               = 1;
-        mark[min(local_lo, key_blocks - 1)] = 1;
-        mark[key_blocks - 1]  = 1;
-        int n                 = 0;
+        const int forced[3] = {0, min((base_pos + q0) / kGqaXattnFindB, n_blocks - 1),
+                               n_blocks - 1};
+        for (int f = 0; f < 3; ++f) {
+            const int p0 = forced[f] * PagesPerFind;
+            mark[p0]     = 1;
+            if (p0 + 1 < key_blocks) { mark[p0 + 1] = 1; }
+        }
+        int n = 0;
         for (int kb = 0; kb < key_blocks; ++kb) {
             if (mark[kb]) { dst[n++] = static_cast<std::uint16_t>(kb); }
         }

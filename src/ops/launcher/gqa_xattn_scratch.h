@@ -11,6 +11,9 @@ namespace ninfer::ops {
 
 inline constexpr int kGqaXattnPrefillBr  = 128;
 inline constexpr int kGqaXattnPrefillBc  = 64;
+// Paper find_blocks B. MMA still walks 64-token pages; each kept block expands
+// to two consecutive pages (or one remainder page).
+inline constexpr int kGqaXattnFindB      = 128;
 inline constexpr int kGqaXattnStride     = 16;
 inline constexpr int kGqaXattnIRows      = kGqaXattnPrefillBr / kGqaXattnStride;
 inline constexpr int kGqaXattnHeadDim    = 256;

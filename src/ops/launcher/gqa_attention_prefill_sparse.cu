@@ -188,12 +188,10 @@ void gqa_sparse_prefill_attention_launch(const Tensor& q, const Tensor& position
         const int n_br     = div_up(tokens, kGqaPrefillNvfp4Br);
         const int n_kb =
             gqa_xattn_n_kb(gqa_xattn_logical_pages(cache), envelope.max_visible_keys);
-        const int n_split  = std::max(1, std::min(kXAttnSplits, n_kb));
         const int score_smem = gqa_xattn_score_smem_bytes();
         static const cudaError_t score_attr = cudaFuncSetAttribute(
             gqa_xattn_score_kernel<Geometry, Metadata>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            std::max(score_smem, kGqaPrefillNvfp4SmemBytes));
+            cudaFuncAttributeMaxDynamicSharedMemorySize, score_smem);
         CUDA_CHECK(score_attr);
         static const cudaError_t finish_attr = cudaFuncSetAttribute(
             gqa_xattn_finish_kernel<Geometry, Metadata>,
@@ -206,7 +204,7 @@ void gqa_sparse_prefill_attention_launch(const Tensor& q, const Tensor& position
 
         const dim3 pack_grid(static_cast<unsigned>(kv_heads), static_cast<unsigned>(n_kb), 1u);
         gqa_xattn_pack_kernel<Geometry, Metadata>
-            <<<pack_grid, kXAttnScoreThreads, 0, stream>>>(
+            <<<pack_grid, kXAttnPackThreads, 0, stream>>>(
                 static_cast<const std::uint8_t*>(cache_k.data),
                 static_cast<const std::uint8_t*>(cache_k_scale.data), metadata,
                 static_cast<const std::int32_t*>(positions.data), tokens, xattn_min_len, n_kb,
@@ -214,12 +212,13 @@ void gqa_sparse_prefill_attention_launch(const Tensor& q, const Tensor& position
         CUDA_CHECK(cudaGetLastError());
 
         const dim3 score_grid(static_cast<unsigned>(q_heads), static_cast<unsigned>(n_br),
-                              static_cast<unsigned>(n_split));
+                              static_cast<unsigned>(std::max(1, (scratch.n_j + kXAttnScoreBN - 1) /
+                                                                   kXAttnScoreBN)));
         gqa_xattn_score_kernel<Geometry, Metadata>
             <<<score_grid, kXAttnScoreThreads, static_cast<std::size_t>(score_smem), stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data), scratch.packed, metadata,
                 static_cast<const std::int32_t*>(positions.data), scale, tokens, xattn_min_len,
-                n_br, scratch.n_j, n_split, scratch.logits);
+                n_br, scratch.n_j, scratch.logits);
         CUDA_CHECK(cudaGetLastError());
 
         const dim3 mass_grid(static_cast<unsigned>(q_heads), static_cast<unsigned>(n_br), 1u);
