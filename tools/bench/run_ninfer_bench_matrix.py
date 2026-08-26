@@ -64,7 +64,7 @@ def pair_list(values: Iterable[tuple[int, int]]) -> str:
 
 
 def mtp_args(k: int) -> tuple[str, ...]:
-    args = ("--mtp-draft-tokens", str(k))
+    args = ("--spec", "mtp", "--draft-tokens", str(k))
     return (*args, "--lm-head-draft") if k > 0 else args
 
 
@@ -289,7 +289,9 @@ def report_rows(report_path: Path, case: BenchCase) -> list[dict[str, Any]]:
             "kv_capacity": memory.get("kv_capacity"),
             "prefill_chunk": config.get("prefill_chunk"),
             "kv_cache": config.get("kv_cache"),
-            "mtp_draft_tokens": config.get("mtp_draft_tokens"),
+            "spec": config.get("spec"),
+            "draft_tokens": config.get("draft_tokens"),
+            "dflash_verify_width": config.get("dflash_verify_width"),
             "proposal_head": config.get("proposal_head"),
             "decode_path": config.get("decode_path"),
             "decode_graph_primed": config.get("decode_graph_prime", {}).get("primed"),

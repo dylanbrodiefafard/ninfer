@@ -51,14 +51,14 @@ SHARED_CELLS = {"kv-bf16"}
 
 # Speed-bench cases for ninfer_bench (same arg style as run_ninfer_bench_matrix.py).
 SPEED_CASES_CORE: list[tuple[str, str, list[str]]] = [
-    ("prefill", "prefill_p8192_k3", ["-p", "8192", "--mtp-draft-tokens", "3", "--lm-head-draft"]),
-    ("decode", "tg64_k3", ["-n", "64", "--mtp-draft-tokens", "3", "--lm-head-draft"]),
+    ("prefill", "prefill_p8192_k3", ["-p", "8192", "--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft"]),
+    ("decode", "tg64_k3", ["-n", "64", "--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft"]),
     ("ctx", "ctx_p8192_g64_k3",
-     ["-pg", "8192,64", "--max-ctx", "8256", "--mtp-draft-tokens", "3", "--lm-head-draft"]),
+     ["-pg", "8192,64", "--max-ctx", "8256", "--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft"]),
 ]
 SPEED_CASES_SMOKE: list[tuple[str, str, list[str]]] = [
-    ("prefill", "prefill_p1024_k3", ["-p", "1024", "--mtp-draft-tokens", "3", "--lm-head-draft"]),
-    ("decode", "tg16_k3", ["-n", "16", "--mtp-draft-tokens", "3", "--lm-head-draft"]),
+    ("prefill", "prefill_p1024_k3", ["-p", "1024", "--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft"]),
+    ("decode", "tg16_k3", ["-n", "16", "--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft"]),
 ]
 
 WEIGHTS_CANDIDATES = [

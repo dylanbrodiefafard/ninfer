@@ -15,7 +15,7 @@
 
 namespace ninfer::bench {
 
-inline constexpr int kSchemaVersion                   = 12;
+inline constexpr int kSchemaVersion                   = 13;
 inline constexpr std::string_view kArtifactType       = "ninfer_bench_report";
 inline constexpr std::string_view kDefaultCorpusPath  = "bench/fixtures/bench_corpus.ids";
 inline constexpr int kDecodeSeedTokens                = 1;
@@ -27,6 +27,8 @@ inline constexpr std::uint32_t kDefaultPrefillChunk   = 4096;
 inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
 inline constexpr std::uint32_t kKvPageTokens          = 64;
 inline constexpr std::uint32_t kMaxMtpDraftTokens     = 5;
+inline constexpr std::uint32_t kMaxDFlashDraftTokens  = 15;
+inline constexpr std::uint32_t kMaxDFlashVerifyWidth  = 16;
 
 enum class TestKind { Prefill, Decode, PrefillDecode };
 
@@ -48,7 +50,7 @@ struct BenchTest {
     }
 
     [[nodiscard]] std::uint32_t requested_output_tokens() const;
-    [[nodiscard]] std::uint32_t required_context(std::uint32_t mtp_draft_tokens) const;
+    [[nodiscard]] std::uint32_t required_context(const SpeculativeOptions& spec) const;
 };
 
 enum class OutputFormat { Table, Json, Csv };
@@ -68,8 +70,10 @@ struct BenchOptions {
     float keep_frac                = 1.0f;
     float xattn_tau                = 1.0f;
     std::uint32_t concurrency      = 1;
-    std::uint32_t mtp_draft_tokens = 0;
-    ProposalHead proposal_head     = ProposalHead::Full;
+    SpeculativeBackend spec_backend    = SpeculativeBackend::Mtp;
+    std::uint32_t draft_tokens         = 0;
+    std::uint32_t dflash_verify_width  = 0;
+    ProposalHead proposal_head         = ProposalHead::Full;
     int device                     = 0;
     bool use_cuda_graph            = true;
     bool profile_measured          = false;
@@ -116,8 +120,10 @@ struct BenchEnvironment {
     float keep_frac                                = 1.0f;
     float xattn_tau                                = 1.0f;
     std::uint32_t concurrency                      = 1;
-    std::uint32_t mtp_draft_tokens                 = 0;
-    ProposalHead proposal_head                     = ProposalHead::Full;
+    SpeculativeBackend speculative_backend         = SpeculativeBackend::None;
+    std::uint32_t draft_tokens                      = 0;
+    std::uint32_t dflash_verify_width               = 0;
+    ProposalHead proposal_head                      = ProposalHead::Full;
     bool use_cuda_graph                            = true;
     bool decode_graph_primed                       = false;
     std::uint32_t decode_graph_prime_output_tokens = 0;
@@ -133,16 +139,17 @@ std::string usage_text(std::string_view program);
 std::vector<BenchTest> expand_tests(const BenchOptions& options);
 std::uint32_t resolve_max_context(const std::vector<BenchTest>& tests,
                                   std::optional<std::uint32_t> override_max_context,
-                                  std::uint32_t mtp_draft_tokens, bool use_cuda_graph);
+                                  const SpeculativeOptions& spec, bool use_cuda_graph);
 std::uint32_t concurrent_kv_capacity_tokens(std::uint32_t max_context, std::uint32_t concurrency);
 void validate_prompt_lengths(const std::vector<BenchTest>& tests, std::size_t corpus_tokens);
 
 std::vector<TokenId> load_corpus_ids(const std::string& path);
 std::vector<TokenId> prompt_slice(const std::vector<TokenId>& corpus, int n_prompt,
                                   std::size_t offset = 0);
-std::string decode_path_name(bool use_cuda_graph, std::uint32_t mtp_draft_tokens);
-std::uint32_t decode_graph_prime_output_tokens(std::uint32_t mtp_draft_tokens);
-std::uint32_t decode_graph_prime_required_context(std::uint32_t mtp_draft_tokens);
+std::string decode_path_name(bool use_cuda_graph, const SpeculativeOptions& spec);
+std::uint32_t decode_graph_prime_output_tokens(const SpeculativeOptions& spec);
+std::uint32_t decode_graph_prime_required_context(const SpeculativeOptions& spec);
+std::string speculative_backend_name(SpeculativeBackend backend);
 
 Stats compute_stats(const std::vector<double>& values);
 std::vector<double> prefill_tok_s_series(const TestResult& result);

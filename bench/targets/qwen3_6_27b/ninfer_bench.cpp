@@ -256,8 +256,11 @@ int main(int argc, char** argv) {
                 "--profile-measured requires exactly one benchmark test and -r 1");
         }
         ninfer::bench::validate_prompt_lengths(tests, corpus.size());
+        const ninfer::SpeculativeOptions spec_options{
+            options.spec_backend, options.draft_tokens, options.proposal_head,
+            options.dflash_verify_width};
         const std::uint32_t max_context = ninfer::bench::resolve_max_context(
-            tests, options.max_context, options.mtp_draft_tokens, options.use_cuda_graph);
+            tests, options.max_context, spec_options, options.use_cuda_graph);
 
         ninfer::EngineOptions engine_options;
         engine_options.artifact_path = options.artifact_path;
@@ -271,11 +274,12 @@ int main(int argc, char** argv) {
         engine_options.sage_attn     = options.sage_attn;
         engine_options.keep_frac     = options.keep_frac;
         engine_options.xattn_tau     = options.xattn_tau;
-        engine_options.speculative.backend       = options.mtp_draft_tokens == 0
+        engine_options.speculative.backend       = options.draft_tokens == 0
                                                        ? ninfer::SpeculativeBackend::None
-                                                       : ninfer::SpeculativeBackend::Mtp;
-        engine_options.speculative.draft_tokens  = options.mtp_draft_tokens;
+                                                       : options.spec_backend;
+        engine_options.speculative.draft_tokens  = options.draft_tokens;
         engine_options.speculative.proposal_head = options.proposal_head;
+        engine_options.speculative.dflash_verify_width = options.dflash_verify_width;
         engine_options.use_cuda_graph            = options.use_cuda_graph;
 
         ninfer::bench::BenchEnvironment env;
@@ -288,7 +292,11 @@ int main(int argc, char** argv) {
         env.keep_frac                = options.keep_frac;
         env.xattn_tau                = options.xattn_tau;
         env.concurrency              = options.concurrency;
-        env.mtp_draft_tokens         = options.mtp_draft_tokens;
+        env.speculative_backend      = options.draft_tokens == 0
+                                           ? ninfer::SpeculativeBackend::None
+                                           : options.spec_backend;
+        env.draft_tokens             = options.draft_tokens;
+        env.dflash_verify_width      = options.dflash_verify_width;
         env.proposal_head            = options.proposal_head;
         env.use_cuda_graph           = options.use_cuda_graph;
         env.repetitions              = options.repetitions;
@@ -297,7 +305,7 @@ int main(int argc, char** argv) {
         env.corpus_tokens            = corpus.size();
         if (options.use_cuda_graph && has_decode_tests(tests)) {
             env.decode_graph_prime_output_tokens =
-                ninfer::bench::decode_graph_prime_output_tokens(options.mtp_draft_tokens);
+                ninfer::bench::decode_graph_prime_output_tokens(spec_options);
         }
 
         std::cerr << "[ninfer_bench] loading " << options.artifact_path
