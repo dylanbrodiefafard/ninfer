@@ -81,8 +81,14 @@ int main() {
 
     const cudaStream_t original_stream = ctx.stream;
     const cudaStream_t original_copy   = ctx.copy_stream;
+    const cudaEvent_t original_event   = ctx.copy_order_event;
+    if (original_event == nullptr) {
+        ++failures;
+        std::cerr << "DeviceContext did not create copy_order_event\n";
+    }
     ninfer::DeviceContext moved(std::move(ctx));
-    if (ctx.stream != nullptr || ctx.load_stream != nullptr || ctx.copy_stream != nullptr) {
+    if (ctx.stream != nullptr || ctx.load_stream != nullptr || ctx.copy_stream != nullptr ||
+        ctx.copy_order_event != nullptr) {
         ++failures;
         std::cerr << "move construction did not null source streams\n";
     }
@@ -93,6 +99,10 @@ int main() {
     if (moved.copy_stream != original_copy) {
         ++failures;
         std::cerr << "move construction did not transfer copy stream\n";
+    }
+    if (moved.copy_order_event != original_event) {
+        ++failures;
+        std::cerr << "move construction did not transfer copy-order event\n";
     }
     failures += check_context(moved, "moved");
 
