@@ -121,9 +121,19 @@ duplicates, no Ollama-compat aliases):
 
 - `usage.prompt_tokens_details` — OpenAI-standard `cached_tokens` (prompt tokens served from
   prefix reuse, no recompute) plus engine stats under the `ninfer` namespace: `reuse_source`
-  (`none` / `vram_resident` / `host_ram`), `prefill` (`ms`, `tok_s`, `ms_per_token`, `tail_tok_s`,
+  (`none` / `vram_resident` / `host_ram`), `prefix_reuse_path` (`full_reset` / `append_frontier` /
+  `restore_turn_checkpoint` / `restore_response_checkpoint` / `restore_context_checkpoint` /
+  `restore_turn_rollback`),
+  `context_checkpoint` (`restored_tokens` / `captured_tokens`), `prefill` (`ms`, `tok_s`, `ms_per_token`, `tail_tok_s`,
   `tail_window_s`) and `decode` (`ms`, `tok_s`, `ms_per_token`). Prefill rates cover the computed
   (non-reused) suffix only. Rate and millisecond fields are rounded to three decimal places.
+  `cached_tokens` is the reused prefix length for any reuse path. `reuse_source` is where that
+  prefix lived (`vram_resident` vs `host_ram`). `context_checkpoint.restored_tokens` is the
+  absolute staged-checkpoint head frontier this request restored (the same length as
+  `cached_tokens` on `restore_context_checkpoint` / `restore_turn_rollback`). It is 0 when
+  the path is not one of those two. `context_checkpoint.captured_tokens` is the absolute
+  advertised ladder freeze or turn-rollback pin this request wrote, 0 if it did not freeze
+  or pin.
 - `usage.completion_tokens_details` — OpenAI-standard keys: `reasoning_tokens` (thinking portion,
   0 when thinking is off) and, when speculation is active, `accepted_prediction_tokens` /
   `rejected_prediction_tokens`.
@@ -522,7 +532,7 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v11 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v15 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance.
 
@@ -531,13 +541,15 @@ that server instance.
 | `server_start` | target/weights identity and artifact, resolved Engine, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, pinned-host KV RAM capacity/occupancy, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, `reuse_source` (`none` / `vram_resident` / `host_ram`), unrounded phase seconds including `kv_ram_save` / `kv_ram_load`, and complete speculative-decoding counters |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, `reuse_source` (`none` / `vram_resident` / `host_ram`), `context_checkpoint` (`restored_tokens` / `captured_tokens`), unrounded phase seconds including `kv_ram_save` / `kv_ram_load`, and complete speculative-decoding counters |
 | `request_error` | the resolved request configuration and generation error message |
 | `throughput` | interval token deltas and rates, scheduler occupancy, interval `timings_seconds.kv_ram_save` / `kv_ram_load`, and decode-round batch statistics |
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, `total`,
 `kv_ram_save`, and `kv_ram_load` as full-precision JSON numbers. `kv_ram_save` / `kv_ram_load` are
-CUDA D2H/H2D elapsed for that request's admission spills and RAM restore. Throughput events repeat
+CUDA event elapsed for that request's RAM-tier FIFO D2H capture and H2D unpack (KV plus GDN images
+in the same copy span). They are not admission wait. Live-lane context-checkpoint freeze D2H and a
+VRAM-resident restore that unpacks already-pinned lane GDN are not included. Throughput events repeat
 those two keys as interval sums. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
 derived downstream from raw token counts and seconds instead of rounded stderr strings.
@@ -592,7 +604,9 @@ capacity; `--kv-capacity auto` chooses the largest legal capacity that fits the 
 after weights are loaded while keeping 1 GiB of sizing headroom. When omitted it follows
 `--max-context`, preserving one full-length request's capacity. The shared pool is fixed at startup
 and is not divided evenly among request lanes. `--kv-ram-capacity` is a separate pinned-host budget
-in MiB for completed prefix bundles and does not change GPU pool sizing.
+in MiB for completed prefix bundles and does not change GPU pool sizing. One long MTP chat with five
+context-checkpoint heads is about 6 GiB in that FIFO; `off` still keeps same-lane GDN rollback on
+the live pinned log, but other-lane restore after eviction needs the FIFO.
 
 Automatic sizing evaluates the complete target runtime layout for the chosen concurrency, KV
 dtype, speculative backend, draft window, Vision setting, workspace, and CUDA Graph allowance. It
@@ -618,16 +632,29 @@ older request to recover capacity. Startup rejects a KV pool smaller than one se
 provide one page per configured lane, or larger than all configured lanes could use.
 
 Compatible resident prefixes are reused for both text and multimodal histories unless the server is
-started with `--no-prefix-reuse`. A multimodal hit requires matching token types, three-axis MRoPE
+started with `--no-prefix-reuse`, which also disables prefill context-checkpoint capture. A multimodal hit requires matching token types, three-axis MRoPE
 positions, encoded-media digest, grid, and consumer spans; changing an earlier image or video
 therefore resets the prefix instead of reusing placeholder-token KV. Media wholly inside a matched
 prefix skips Vision execution, while new suffix media is encoded normally. The completion log
-reports the reused token count as `cache=`.
+reports the reused token count as `cache=`. When a prefill context-checkpoint head is restored or
+this request freezes one, the same line also carries `context_ckpt=restored:F` and/or
+`captured:F`, the absolute head frontiers.
 
 The shared family runtime distinguishes `full_reset`, `append_frontier`,
-`restore_turn_checkpoint`, and `restore_response_checkpoint`. Both checkpoint kinds include the
+`restore_turn_checkpoint`, `restore_response_checkpoint`, `restore_context_checkpoint`, and
+`restore_turn_rollback`. Both
+rewrite checkpoint kinds include the
 recurrent, hidden, and selected speculative-backend continuation state required to recompute a
-rewritten suffix; matching KV tokens alone never authorize a partial hit. With stable
+rewritten suffix; matching KV tokens alone never authorize a partial hit. MTP or DFlash prefill may also
+freeze current GDN at committed chunk ends that have reached a context mark (24576, 36864, 53248,
+77824, 102400, 151552); a later prompt that matches that prefix restores GDN into current and hidden into
+`tail_hidden` as `restore_context_checkpoint`. DFlash2 also restores that lane's cyclic local K/V
+and `dflash_context_frontier`. Slot `2C` is the Engine-wide GDN image for that
+freeze and for the automatic turn-rollback pin: on `append_frontier` occupy with `E>0` and a
+real suffix (`prompt_tokens > E`), current GDN and `tail_hidden` are copied to `2C` before suffix
+prefill so a later edit of the last user turn can restore that completed `E` as
+`restore_turn_rollback`. Ladder freeze borrows `2C` and reloads the rollback image afterward.
+Same last user regenerate still hits rewrite (`TurnClosure` is longer than rollback `E`). With stable
 `preserve_thinking=true`, the auxiliary checkpoint rolls to the prompt frontier after the current
 response's complete deterministic generation prologue. For thinking generation this includes
 `<think>\n`; for non-thinking generation it includes the complete empty thinking block. Capturing
@@ -642,7 +669,10 @@ change. If the newly desired boundary is already behind the selected reuse front
 exists there, the Engine keeps the valid hit and defers installing that new checkpoint rather than
 forcing an eager full reset. A later request that diverges before every retained checkpoint then
 resets normally. The JSONL completion record exposes the checkpoint actually restored as
-`prefix_reuse_path`. Changing reasoning effort changes rendered tokens and therefore does not reuse
+`prefix_reuse_path`, the reused length as `prefix_cache_hit_tokens`, and this request's
+absolute staged-checkpoint head frontiers as `context_checkpoint.restored_tokens` /
+`captured_tokens`. Changing reasoning effort
+changes rendered tokens and therefore does not reuse
 a prefix whose effort instruction differs.
 
 An appended mid-conversation system message is an ordinary prompt suffix, so an unchanged prior

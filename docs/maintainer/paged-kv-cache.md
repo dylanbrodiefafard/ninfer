@@ -764,7 +764,16 @@ Cancellation 在第一个观察到它的 GPU boundary release bundle；不修改
 Qwen3.6 retained sequence 包含：
 
 - current resume frontier；
-- 一份有效时的 typed rewrite checkpoint，其 kind 为 `TurnClosure` 或 `ResponseReplay`。
+- 一份有效时的 typed rewrite checkpoint，其 kind 为 `TurnClosure` 或 `ResponseReplay`；
+- MTP 或 DFlash 下的 prefill context-checkpoint ladder：每次 committed prefill chunk 结束时，若
+  `valid_frontier` 已达到下一 mark（24576 / 36864 / 53248 / 77824 / 102400 / 151552）且该 frontier 的
+  Vision item 完整，则冻结当时的 current GDN 与该 chunk 最后一列 hidden。DFlash 同时冻结该 lane
+  的 cyclic local K/V；restore 写回 cyclic 并设 `dflash_context_frontier=F`。Advertised frontier `F`
+  是该 chunk 末尾，不是 raw mark。不把 4096 chunk 拆到 mark 上。
+- MTP 或 DFlash 下的 turn-rollback head：`append_frontier` occupy 且 `prompt_tokens > E` 时，在 suffix
+  prefill 之前把 current GDN 与 `tail_hidden` 钉在该完成 `E`（DFlash 同样钉 cyclic）。每个 chat 至多一个；下一 append
+  替换。exact-hit（`prompt_tokens == E`）不写。编辑最后一条 user 消息走
+  `restore_turn_rollback`；同一 last user 再生成仍走更长的 rewrite `TurnClosure`。
 
 每个 checkpoint 都必须同时描述：
 
@@ -774,8 +783,10 @@ Qwen3.6 retained sequence 包含：
 - position/model-continuation metadata；
 - 与上述状态一致的 prefix identity。
 
-Current resume frontier 和 rewrite checkpoint 引用同一个 exclusively owned KV bundle；checkpoint 不是第二份
-KV allocation。Incoming prompt 的复用路径为：
+Current resume frontier、rewrite checkpoint 和 ladder heads 引用同一个 exclusively owned KV
+bundle；checkpoint 不是第二份 KV allocation。Ladder GDN 在 live lane 上是 SequenceState 的 host
+log（按该 lane 的 ledger 做 `prefix_matches`），不是 `KVRamCache::plan_match` 里的 GDN-only 行。
+Incoming prompt 的复用路径为：
 
 - prompt 正好结束在 current resume frontier，且 decode anchor 完整时，直接成为 decode-ready；
 - prompt 完整包含 current resume frontier 并有 suffix 时，从该 frontier prefill suffix；
@@ -783,15 +794,24 @@ KV allocation。Incoming prompt 的复用路径为：
   finalization；
 - prompt 匹配已保存 rewrite checkpoint 并在其后有新 suffix 时，claim bundle、truncate 到 checkpoint
   frontier、恢复 checkpoint，再 prefill suffix；
+- prompt 匹配一条 ladder head 于 `F` 时，走 `restore_context_checkpoint`：把该 head 的 GDN 装入
+  current、hidden 装入 `tail_hidden`（不写 rewrite hidden），trim KV 到 `F`，保留 `frontier<=F`
+  的 heads（含 `F` 本身），丢掉 `frontier>F` 的 heads 以及 `rewrite.frontier>F` 的 VRAM rewrite；
+  DFlash 同时从该 head 恢复 cyclic 并设 `dflash_context_frontier=F`；
+- prompt 匹配 turn-rollback head 于上一完成 `E` 时，走 `restore_turn_rollback`：同一套完整
+  checkpoint 配方（GDN→current，hidden→`tail_hidden`，MTP `mtp_kv_valid=E-1`，DFlash cyclic 与
+  `dflash_context_frontier=E`）。VRAM D2D `2C→current`
+  仅当 staging identity 仍是该 head；否则 unpack host。Ladder freeze 借 `2C` 后必须装回 rollback；
 - common prefix 结束在没有完整 checkpoint 的任意其他位置时，cache miss。
 
-`TurnClosure` / `ResponseReplay` 只记录快照的捕获用途，不改变 payload 的数学内容和 page ownership。
-只要完整 prefix identity 匹配，runtime 可以跨当前 desired kind 恢复已有快照，并按实际快照 kind 报告
-restore path。新 desired frontier 已落在 selected reuse frontier 之前且没有对应快照时，不回退 page
-allocation 来强制重算；本次保留既有快照并延迟新 capture。
+Planner 先试 current frontier；否则在 rewrite 与该 bundle 上的 ladder / turn-rollback heads 中取最长完整
+checkpoint；否则 full reset。`TurnClosure` / `ResponseReplay` 只记录快照的捕获用途，不改变 payload
+的数学内容和 page ownership。只要完整 prefix identity 匹配，runtime 可以跨当前 desired kind 恢复已有
+快照，并按实际快照 kind 报告 restore path。新 desired frontier 已落在 selected reuse frontier
+之前且没有对应快照时，不回退 page allocation 来强制重算；本次保留既有快照并延迟新 capture。
 
 最后一种情况不是 page-size limitation。缺少的是对应 Linear Attention/backend continuation state，而不是
-KV page。
+KV page。Decode-only 越过 mark、prefill 从未在该 chunk 结束冻结时，没有 ladder head。
 
 ### 10.2 Non-page-aligned frontier
 
@@ -842,6 +862,13 @@ print CUDA D2H `save=` and H2D `load=` elapsed harvested after the first non-thr
 densely and neither stores nor sorts physical page IDs. A RAM hit still requires a complete
 SequenceState proof; active pages are not moved because of RAM capture/restore. Capacity is fixed
 in MiB by `--kv-ram-capacity`, default off; a failed `cudaHostAlloc` fails Engine construction.
+One long MTP or DFlash bundle with six ladder heads is about 6 GiB (Main+backend KV plus current/rewrite GDN plus
+moved live heads, including DFlash cyclic). `--kv-ram-capacity off` still keeps the live-lane pinned GDN log for same-lane
+rollback; other-lane restore after eviction remains a miss without the FIFO. Eviction of a retained
+bundle is the existing KV dump plus those ladder heads **moved** (not aliased) into the same FIFO
+entry. A middle-head hit unpacks that head's GDN+hidden (and DFlash cyclic) into current/`tail_hidden` and KV
+`dst_extent` Main `pages_for_tokens(F)` / MTP `pages_for_tokens(F-1)` / DFlash Full `pages_for_tokens(F)`. Host RAM is not a second GPU
+working set.
 
 ---
 
@@ -886,7 +913,9 @@ KV Store 不理解 proposal、verify 或 acceptance，也不推导 Main Text、M
 ### 12.1 Fixed cyclic physical contract
 
 DFlash local sliding-window 和 boundary-local snapshot 使用同一个 closed cyclic layout，但拥有彼此独立的
-storage。当前 registered target 对每个 local layer 固定为：
+storage。Context-checkpoint freeze 另有一份 Engine-wide 1-lane staging window（同 geometry，
+`lane_capacity=1`）：pin/freeze 先把 live lane D2D 进该 window，再从它 D2H；suffix 只改 live local。
+当前 registered target 对每个 local layer 固定为：
 
 ```text
 capacity        = 4096

@@ -456,6 +456,10 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.prefix_cache_hit_tokens     = result.reused_prompt_tokens;
     outcome.metrics.prefix_reuse_path           = result.prefix_reuse_path;
     outcome.metrics.prefix_reuse_source         = result.prefix_reuse_source;
+    outcome.metrics.captured_context_checkpoint_tokens =
+        result.captured_context_checkpoint_tokens;
+    outcome.metrics.restored_context_checkpoint_tokens =
+        result.restored_context_checkpoint_tokens;
     const ninfer::RuntimeStats stats            = engine_->runtime_stats();
     outcome.metrics.kv_ram_capacity_bytes       = stats.kv_ram_capacity_bytes;
     outcome.metrics.kv_ram_used_bytes           = stats.kv_ram_used_bytes;

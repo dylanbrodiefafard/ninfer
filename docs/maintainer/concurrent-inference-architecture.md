@@ -97,7 +97,10 @@ NInfer 不支持 preemption，因此 request 只有在其 prompt、声明的最�
 
 RAM 第二层的 D2H/H2D 走独立的 copy engine（`DeviceContext::copy_stream`），不是 GPU scheduling
 unit，也不占用 compute owner。Copy 可以与**另一条** lane 的合法 compute unit 重叠；当前
-PrefillChunk / DecodeRound 正在读写的 pages 不得作为 copy source 或 destination。`device.stream`
+PrefillChunk / DecodeRound 正在读写的 pages 不得作为 copy source 或 destination。MTP prefill
+context-checkpoint 冻结是例外：staging GDN（slot `2C`，与 lane current 不相交）以及 staging hidden
+的 D2H 可以与**同一条** lane 的下一 prefill chunk 重叠。冻结期间 `2C` 从 turn-rollback occupant
+借出，pack 后 H2D 把 rollback 装回；`occupied=false` 必须发生在 clobber D2D 之前。`device.stream`
 上的 `synchronize()` 只排空 compute，不排空 copy_stream。
 
 ### 2.7 Bounded ingress and output
@@ -283,7 +286,10 @@ state 始终重新创建。
 
 Qwen3.6 的 lane 是 Linear Attention state 的唯一 locator。`C=max_concurrency` 时，shared pool 固定使用
 `[0,C)` 作为各 lane 的 current committed state，使用 `[C,2C)` 作为各 lane 的 rewrite-checkpoint
-state；一份 slot 同时选择全部 GDN layers 的 convolution history 和 recurrent state。Decode round
+state；MTP 或 DFlash 引擎额外保留 slot `2C` 作为 Engine-wide GDN：默认热 occupant 是 turn-rollback（append
+occupy 在 suffix prefill 之前把 current+`tail_hidden` 钉在上一完成 `E`），ladder freeze 借走后再
+装回。它不是 rewrite slot。一份 slot 同时选择全部 GDN layers 的 convolution history
+和 recurrent state。Decode round
 不在 `SequenceState` 中维护随 speculative position 变化的 state selector。
 
 ### 4.4 Batch row
@@ -700,10 +706,11 @@ block-table 和 allocator 的 contract 属于 Paged KV Context Store，不在本
 
 Retained prefix 是从已结束 request 中分离出来的、单一 owner 的 SequenceState。它留在原 physical lane，
 但该 lane 的 control slot 对 scheduler 是 free。Retained state 只发布 target 已保存完整 continuation state
-的 checkpoints。当前 Qwen3.6 retained state 可以发布 current resume frontier，以及一份有效时的 typed
-rewrite checkpoint。后者按捕获时的用途标记为 `TurnClosure` 或 `ResponseReplay`；两种 kind 互斥复用同一
-份物理 payload，并额外保存对应的 recurrent、hidden、speculative-backend 和 position state，不复制 KV
-payload。
+的 checkpoints。当前 Qwen3.6 retained state 可以发布 current resume frontier，一份有效时的 typed
+rewrite checkpoint，以及 MTP 或 DFlash 下 live-lane 上的 prefill context-checkpoint ladder heads。Rewrite 按捕获时的
+用途标记为 `TurnClosure` 或 `ResponseReplay`；两种 kind 互斥复用同一份物理 payload，并额外保存对应的
+recurrent、hidden、speculative-backend 和 position state，不复制 KV payload。Ladder head 冻结的是
+committed prefill chunk 末尾的 current GDN 与该 chunk 最后一列 hidden；KV 仍是同一 bundle 的前缀。
 
 Qwen frontend 从有效 `preserve_thinking` 语义发布 desired checkpoint：`false` 选择最后一个真实 user
 之后第一条 assistant opener 的末尾；`true` 选择本次完整 deterministic generation prologue 的末尾，
@@ -720,15 +727,23 @@ Admission 在同一 lane 成功时消费 retained entry，并把 SequenceState o
   finalization unit 产生下一 anchor；
 - incoming prompt 匹配已保存 rewrite checkpoint 并在其后有新 suffix 时，在 atomic admission transaction
   提交后把 growing allocations truncate 到 checkpoint frontier、恢复完整 checkpoint，再 prefill suffix；
+- incoming prompt 匹配一条 prefill context-checkpoint head 于 `F` 时，走 `restore_context_checkpoint`
+  或 `restore_turn_rollback`（由 head kind 决定）：
+  trim 到 `F`，把该 head 的 GDN 装入 current、hidden 装入 `tail_hidden`，MTP 设 `mtp_kv_valid=F-1`
+  再走既有 bridge；DFlash 把该 head 的 cyclic local 写回该 lane 并设 `dflash_context_frontier=F`。
+  不是 `append_frontier`，也不读 rewrite hidden；
 - common prefix 结束在没有 checkpoint 的任意其他位置时视为 cache miss。
 
 Rewrite-checkpoint restore 保留包含 checkpoint 的部分尾页，释放其后的完整 pages。KV page 或 token prefix match
 本身不是 checkpoint；当前架构不支持 arbitrary longest-common-prefix reuse。
 
 Checkpoint kind 不是 reuse compatibility bit。Planner 总是先按 token、position、media identity 和完整
-continuation state 尝试 current frontier，再尝试已有 rewrite checkpoint；即使本次
+continuation state 尝试 current frontier，再在 rewrite 与该 bundle 的 ladder heads 中取最长完整
+checkpoint；即使本次
 `preserve_thinking` 选择了另一种 desired kind，匹配的旧快照仍可恢复，`prefix_reuse_path` 报告实际恢复的
-kind。若 desired boundary 位于本次待 prefill suffix 中，则在跨过它时覆盖物理 slot；若它已经位于 selected
+kind。Planner 在 rewrite 与 ladder/turn-rollback heads 中取最长完整 checkpoint；current matching `E`
+仍赢 append；same-`F` rewrite 赢 rollback/ladder。`append_frontier` 且 `prompt_tokens > E` 时钉
+turn-rollback 于该 `E`（exact-hit 不钉）。若 desired boundary 位于本次待 prefill suffix 中，则在跨过它时覆盖物理 slot；若它已经位于 selected
 reuse frontier 之前且该位置没有快照，则本次保留合法 reuse 并延迟新 checkpoint，而不是为建立辅助快照
 主动 full reset。只有 incoming prefix 不匹配任何完整 checkpoint 时才 full reset。
 
@@ -756,8 +771,19 @@ request 都进入相同 prefill/decode schedule 和 compact batch formation。
 ### 6.5 Host RAM second tier
 
 `--kv-ram-capacity` enables a startup-fixed pinned-host budget that stores **already completed**
-prefix bundles only. The default is `off`. It does not change GPU pool capacity, active-set
+prefix bundles, plus any live ladder GDN heads moved into that same FIFO image at eviction. The
+default is `off`. It does not change GPU pool capacity, active-set
 accounting, or CUDA Graph addresses, and it does not move an in-flight request off the GPU.
+
+MTP 或 DFlash prefill may freeze current GDN into an Engine-wide staging slot during an in-flight prefill
+(after the Program prefill step compute-syncs that chunk). That freeze borrows slot `2C` from the
+turn-rollback occupant: `occupied=false` before the clobber D2D, pack the ladder head, then H2D
+rollback GDN and hidden back. DFlash also D2Ds that lane's cyclic local into a 1-lane Engine-wide
+staging window before the same `d2d_done` fence; host-pack D2H reads that frozen window, not live
+local. The freeze is not a RAM capture; D2H of
+staging GDN and cyclic onto the live-lane host log may overlap the next chunk on the same lane. KV pages of the
+in-flight unit stay off `copy_stream`. `--no-prefix-reuse` disables ladder capture, turn-rollback
+pin, and restore.
 
 The host tier is an exclusive FIFO of chats that are not on a VRAM lane. A new capture appends at
 the tail. Capacity pressure evicts the oldest unpinned host entry until the new image fits; if it

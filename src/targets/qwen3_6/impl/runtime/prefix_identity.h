@@ -56,6 +56,9 @@ private:
     std::vector<VisionItem> vision_items_;
 };
 
+[[nodiscard]] bool prefix_items_complete_at(const std::vector<VisionItem>& items,
+                                            std::size_t tokens);
+
 [[nodiscard]] bool prefix_matches(const PreparedPromptData& prompt,
                                   const std::vector<TokenId>& resident_tokens,
                                   const ResidentPrefixIdentity& resident_identity,

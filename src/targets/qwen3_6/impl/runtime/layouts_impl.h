@@ -96,8 +96,9 @@ TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
 }
 
 PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
+    const bool context_checkpoint_staging = plan.features.mtp() || plan.features.dflash();
     const std::int32_t linear_state_slots =
-        LinearStateSlots::state_slot_count(plan.max_concurrency);
+        LinearStateSlots::state_slot_count(plan.max_concurrency, context_checkpoint_staging);
     const auto effective_prefill_chunk =
         static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));
     const std::uint32_t logical_pages  = page_count(plan.capacity);
@@ -166,6 +167,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 builder, DFlashConfig::local_layers, DFlashConfig::local_capacity,
                 DFlashConfig::kv_heads, DFlashConfig::head_dim,
                 static_cast<std::int32_t>(plan.max_concurrency));
+            dflash.staging_local = plan_cyclic_kv_cache(
+                builder, DFlashConfig::local_layers, DFlashConfig::local_capacity,
+                DFlashConfig::kv_heads, DFlashConfig::head_dim, 1);
             if constexpr (DFlashConfig::full_layers > 0) {
                 PagedKVPoolSpec full_pool{
                     .page_group_count      = physical_pages,
@@ -232,6 +236,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.rewrite_checkpoint_hidden = add_tensor(
         builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(plan.max_concurrency)},
         "rewrite checkpoint hidden");
+    if (context_checkpoint_staging) {
+        out.staging_hidden = add_tensor(builder, DType::BF16, {TextConfig::hidden, 1},
+                                        "context checkpoint staging hidden");
+    }
     out.bytes = builder.finish(kArenaAlign, "persistent layout");
     out.kv_payload_bytes =
         out.decoder.kv_payload_bytes() + (out.dflash ? out.dflash->kv_payload_bytes() : 0);

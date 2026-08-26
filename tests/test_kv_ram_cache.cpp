@@ -1794,6 +1794,2351 @@ int test_full_state_image(ninfer::DeviceContext& ctx) {
     return failures;
 }
 
+int test_context_checkpoint_middle_head(ninfer::DeviceContext& ctx) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    auto text_plan =
+        plan_paged_cache(4, 4, 2,
+                         {{ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::FP16, 1, 2},
+                          {ninfer::DType::FP16, 1, 2}});
+    ninfer::DeviceArena text_arena(text_plan.bytes);
+    ninfer::PagedKVPool text_pool({text_arena.base(), text_arena.capacity()}, text_plan.layout);
+    ninfer::LayoutBuilder gdn_builder;
+    const auto gdn_layout = ninfer::plan_linear_attention_state_pool(
+        gdn_builder, {.layers         = 3,
+                      .conv_channels  = 8,
+                      .conv_width     = 4,
+                      .value_heads    = 2,
+                      .value_head_dim = 4,
+                      .key_head_dim   = 3,
+                      .slot_count     = 4,
+                      .conv_dtype     = ninfer::DType::BF16});
+    ninfer::DeviceArena gdn_arena(gdn_builder.finish(256));
+    ninfer::LinearAttentionStatePool gdn({gdn_arena.base(), gdn_arena.capacity()}, gdn_layout);
+
+    auto text = text_pool.reserve(2);
+    text.materialize_pages(2, ctx.stream);
+    fill_logical_pages(text_pool, text, 7);
+
+    std::vector<unsigned char> conv_exec(gdn.conv_host_image_bytes(), 0xe1);
+    std::vector<unsigned char> rec_exec(gdn.recurrent_host_image_bytes(), 0xe2);
+    std::vector<unsigned char> conv_rewrite(gdn.conv_host_image_bytes(), 0xc1);
+    std::vector<unsigned char> rec_rewrite(gdn.recurrent_host_image_bytes(), 0xc2);
+    for (std::uint32_t layer = 0; layer < gdn.layer_count(); ++layer) {
+        CUDA_CHECK(cudaMemcpy(gdn.conv_slot(layer, 0).data, conv_exec.data(), gdn.conv_slot_bytes(),
+                               cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(gdn.recurrent_slot(layer, 0).data, rec_exec.data(),
+                               gdn.recurrent_slot_bytes(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(gdn.conv_slot(layer, 1).data, conv_rewrite.data(),
+                               gdn.conv_slot_bytes(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(gdn.recurrent_slot(layer, 1).data, rec_rewrite.data(),
+                               gdn.recurrent_slot_bytes(), cudaMemcpyHostToDevice));
+    }
+
+    ninfer::DeviceBuffer hidden_buf(128);
+    hidden_buf.fill(0xa1);
+    ninfer::Tensor hidden(hidden_buf.p, ninfer::DType::U8, {128});
+    ninfer::DeviceBuffer rewrite_buf(128);
+    rewrite_buf.fill(0xa2);
+    ninfer::Tensor rewrite(rewrite_buf.p, ninfer::DType::U8, {128});
+
+    const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
+    q36::PreparedPromptData retained = prompt;
+    retained.token_ids.push_back(0);
+    retained.token_types.push_back(0);
+    const std::size_t tokens = retained.token_ids.size();
+    retained.positions.resize(3 * tokens);
+    for (int axis = 0; axis < 3; ++axis) {
+        for (std::size_t i = 0; i < tokens; ++i) {
+            retained.positions[static_cast<std::size_t>(axis) * tokens + i] =
+                static_cast<std::int32_t>(i);
+        }
+    }
+    q36::detail::ResidentPrefixIdentity identity;
+    identity.assign(retained);
+
+    std::vector<unsigned char> conv_f2(gdn.conv_host_image_bytes(), 0x21);
+    std::vector<unsigned char> rec_f2(gdn.recurrent_host_image_bytes(), 0x22);
+    std::vector<unsigned char> hid_f2(128, 0xb2);
+    std::vector<unsigned char> conv_f4(gdn.conv_host_image_bytes(), 0x41);
+    std::vector<unsigned char> rec_f4(gdn.recurrent_host_image_bytes(), 0x42);
+    std::vector<unsigned char> hid_f4(128, 0xb4);
+    std::vector<unsigned char> conv_f6(gdn.conv_host_image_bytes(), 0x61);
+    std::vector<unsigned char> rec_f6(gdn.recurrent_host_image_bytes(), 0x62);
+    std::vector<unsigned char> hid_f6(128, 0xb6);
+    const auto head_at = [&](std::uint32_t frontier, const void* conv, const void* rec,
+                             const void* hid) {
+        q36::detail::RamLadderHead head;
+        head.frontier        = frontier;
+        head.hash            = q36::detail::prefix_hash_at(retained.token_ids, identity, frontier);
+        head.conv            = conv;
+        head.recurrent       = rec;
+        head.hidden          = hid;
+        head.conv_bytes      = conv_f4.size();
+        head.recurrent_bytes = rec_f4.size();
+        head.hidden_bytes    = hid_f4.size();
+        return head;
+    };
+
+    q36::detail::RamCaptureSource source;
+    source.execution_frontier = static_cast<std::uint32_t>(prompt.token_ids.size());
+    source.ledger_frontier    = static_cast<std::uint32_t>(tokens);
+    source.rope_delta         = 7;
+    source.text_kv_valid      = source.execution_frontier;
+    source.mtp_kv_valid       = source.execution_frontier;
+    source.tail_hidden_valid  = true;
+    source.rewrite_valid      = true;
+    source.rewrite_kind       = q36::RewriteCheckpointKind::TurnClosure;
+    source.rewrite_frontier   = 6;
+    source.hash_c_valid       = true;
+    source.ledger             = retained.token_ids;
+    source.identity           = &identity;
+    source.hash_f             = q36::detail::prefix_hash_at(retained.token_ids, identity,
+                                                            source.execution_frontier);
+    source.hash_c             = q36::detail::prefix_hash_at(retained.token_ids, identity, 6);
+    source.text               = &text;
+    source.text_pool          = &text_pool;
+    source.gdn                = &gdn;
+    source.gdn_current_slot   = 0;
+    source.gdn_checkpoint_slot = 1;
+    source.tail_hidden        = &hidden;
+    source.rewrite_checkpoint_hidden = &rewrite;
+    source.ladder_heads       = {head_at(2, conv_f2.data(), rec_f2.data(), hid_f2.data()),
+                                 head_at(4, conv_f4.data(), rec_f4.data(), hid_f4.data()),
+                                 head_at(6, conv_f6.data(), rec_f6.data(), hid_f6.data())};
+    source.stream             = ctx.copy_stream;
+    CUDA_CHECK(cudaDeviceSynchronize());
+    q36::detail::KVRamCache cache(16ULL << 20);
+    if (!cache.capture(source)) { return fail("context-checkpoint capture failed"); }
+
+    const auto prefix_f2 = text_prompt({1, 2});
+    const auto prefix_f4 = text_prompt({1, 2, 3, 4});
+    const auto prefix_f6 = text_prompt({1, 2, 3, 4, 5, 6});
+    const auto match    = cache.plan_match(prefix_f4, q36::detail::prefix_hash_chain(prefix_f4));
+    const auto match_f2 = cache.plan_match(prefix_f2, q36::detail::prefix_hash_chain(prefix_f2));
+    const auto match_f6 = cache.plan_match(prefix_f6, q36::detail::prefix_hash_chain(prefix_f6));
+    if (!match || match->reuse != ninfer::PrefixReusePath::RestoreContextCheckpoint ||
+        match->reuse_base != 4) {
+        std::cerr << "four-token prefix did not select ladder head F=4 (shorter than rewrite F=6)\n";
+        text.release();
+        return 1;
+    }
+    if (!match_f2 || match_f2->reuse != ninfer::PrefixReusePath::RestoreContextCheckpoint ||
+        match_f2->reuse_base != 2 || match_f2->entry_id != match->entry_id) {
+        std::cerr << "shortest ladder prefix did not match head F=2\n";
+        text.release();
+        return 1;
+    }
+    if (!match_f6 || match_f6->reuse != ninfer::PrefixReusePath::RestoreTurnCheckpoint ||
+        match_f6->reuse_base != 6 || match_f6->entry_id != match->entry_id) {
+        std::cerr << "six-token prefix did not keep rewrite on a same-frontier tie with ladder F=6\n";
+        text.release();
+        return 1;
+    }
+
+    auto text_dest = text_pool.reserve(2);
+    text_dest.materialize_pages(2, ctx.stream);
+    ninfer::DeviceBuffer hidden_out_buf(128);
+    hidden_out_buf.fill(0);
+    ninfer::Tensor hidden_out(hidden_out_buf.p, ninfer::DType::U8, {128});
+    ninfer::DeviceBuffer rewrite_out_buf(128);
+    rewrite_out_buf.fill(0xee);
+    ninfer::Tensor rewrite_out(rewrite_out_buf.p, ninfer::DType::U8, {128});
+    for (std::uint32_t layer = 0; layer < gdn.layer_count(); ++layer) {
+        CUDA_CHECK(cudaMemset(gdn.conv_slot(layer, 2).data, 0, gdn.conv_slot(layer, 2).bytes()));
+        CUDA_CHECK(
+            cudaMemset(gdn.recurrent_slot(layer, 2).data, 0, gdn.recurrent_slot(layer, 2).bytes()));
+        CUDA_CHECK(cudaMemset(gdn.conv_slot(layer, 3).data, 0xee, gdn.conv_slot(layer, 3).bytes()));
+        CUDA_CHECK(cudaMemset(gdn.recurrent_slot(layer, 3).data, 0xee,
+                              gdn.recurrent_slot(layer, 3).bytes()));
+    }
+
+    q36::detail::RamRestoreTarget target;
+    target.text                    = &text_dest;
+    target.text_pool               = &text_pool;
+    target.text_dst_pages          = ninfer::pages_for_tokens(match->reuse_base);
+    target.gdn                     = &gdn;
+    target.gdn_current_slot        = 2;
+    target.gdn_checkpoint_slot     = 3;
+    target.tail_hidden             = &hidden_out;
+    target.rewrite_checkpoint_hidden = &rewrite_out;
+    target.reuse                   = match->reuse;
+    target.reuse_base              = match->reuse_base;
+    target.stream                  = ctx.copy_stream;
+    cache.claim(match->entry_id);
+    const q36::detail::RamRestoredHost host = cache.unpack_device(match->entry_id, target);
+    ctx.synchronize_all();
+
+    int failures = 0;
+    if (host.ladders.size() != 3) {
+        std::cerr << "RAM image dropped ladder heads instead of keeping F and neighbors\n";
+        ++failures;
+    } else {
+        const bool keep_eq =
+            host.ladders[0].frontier == 2 && host.ladders[1].frontier == 4 &&
+            host.ladders[2].frontier == 6;
+        if (!keep_eq) {
+            std::cerr << "RAM image ladder frontiers are not 2/4/6\n";
+            ++failures;
+        }
+    }
+
+    std::vector<unsigned char> conv_packed(gdn.conv_host_image_bytes(), 0);
+    std::vector<unsigned char> rec_packed(gdn.recurrent_host_image_bytes(), 0);
+    gdn.pack_slot_to_host(2, conv_packed.data(), rec_packed.data(), ctx.copy_stream);
+    ctx.synchronize_all();
+    if (conv_packed != conv_f4 || rec_packed != rec_f4) {
+        std::cerr << "middle-head unpack did not install that head's GDN into current\n";
+        ++failures;
+    }
+    gdn.pack_slot_to_host(3, conv_packed.data(), rec_packed.data(), ctx.copy_stream);
+    ctx.synchronize_all();
+    if (conv_packed != std::vector<unsigned char>(conv_packed.size(), 0xee) ||
+        rec_packed != std::vector<unsigned char>(rec_packed.size(), 0xee)) {
+        std::cerr << "middle-head unpack loaded rewrite GDN sitting ahead of F\n";
+        ++failures;
+    }
+    std::vector<unsigned char> hidden_host(128);
+    CUDA_CHECK(cudaMemcpy(hidden_host.data(), hidden_out.data, hidden_host.size(),
+                           cudaMemcpyDeviceToHost));
+    if (hidden_host != hid_f4) {
+        std::cerr << "middle-head unpack did not install that head's hidden into tail_hidden\n";
+        ++failures;
+    }
+    CUDA_CHECK(cudaMemcpy(hidden_host.data(), rewrite_out.data, hidden_host.size(),
+                           cudaMemcpyDeviceToHost));
+    if (hidden_host != std::vector<unsigned char>(128, 0xee)) {
+        std::cerr << "middle-head unpack wrote rewrite_checkpoint_hidden\n";
+        ++failures;
+    }
+
+    auto unpack_head = [&](std::uint32_t frontier, const std::vector<unsigned char>& conv_expect,
+                           const std::vector<unsigned char>& rec_expect,
+                           const std::vector<unsigned char>& hid_expect, bool expect_rewrite) {
+        CUDA_CHECK(cudaMemset(hidden_out.data, 0, hidden_out.bytes()));
+        CUDA_CHECK(cudaMemset(rewrite_out.data, 0xee, rewrite_out.bytes()));
+        for (std::uint32_t layer = 0; layer < gdn.layer_count(); ++layer) {
+            CUDA_CHECK(cudaMemset(gdn.conv_slot(layer, 2).data, 0, gdn.conv_slot(layer, 2).bytes()));
+            CUDA_CHECK(cudaMemset(gdn.recurrent_slot(layer, 2).data, 0,
+                                  gdn.recurrent_slot(layer, 2).bytes()));
+            CUDA_CHECK(
+                cudaMemset(gdn.conv_slot(layer, 3).data, 0xee, gdn.conv_slot(layer, 3).bytes()));
+            CUDA_CHECK(cudaMemset(gdn.recurrent_slot(layer, 3).data, 0xee,
+                                  gdn.recurrent_slot(layer, 3).bytes()));
+        }
+        target.reuse_base     = frontier;
+        target.text_dst_pages = ninfer::pages_for_tokens(frontier);
+        (void)cache.unpack_device(match->entry_id, target);
+        ctx.synchronize_all();
+        gdn.pack_slot_to_host(2, conv_packed.data(), rec_packed.data(), ctx.copy_stream);
+        ctx.synchronize_all();
+        if (conv_packed != conv_expect || rec_packed != rec_expect) {
+            std::cerr << "unpack of ladder F=" << frontier << " installed the wrong GDN\n";
+            ++failures;
+        }
+        CUDA_CHECK(cudaMemcpy(hidden_host.data(), hidden_out.data, hidden_host.size(),
+                               cudaMemcpyDeviceToHost));
+        if (hidden_host != hid_expect) {
+            std::cerr << "unpack of ladder F=" << frontier << " installed the wrong hidden\n";
+            ++failures;
+        }
+        gdn.pack_slot_to_host(3, conv_packed.data(), rec_packed.data(), ctx.copy_stream);
+        ctx.synchronize_all();
+        const std::vector<unsigned char> rewrite_conv_fill(conv_packed.size(), 0xee);
+        const std::vector<unsigned char> rewrite_rec_fill(rec_packed.size(), 0xee);
+        if (expect_rewrite) {
+            if (conv_packed != conv_rewrite || rec_packed != rec_rewrite) {
+                std::cerr << "unpack of ladder F=" << frontier
+                          << " did not restore rewrite GDN at or before F\n";
+                ++failures;
+            }
+            CUDA_CHECK(cudaMemcpy(hidden_host.data(), rewrite_out.data, hidden_host.size(),
+                                   cudaMemcpyDeviceToHost));
+            if (hidden_host != std::vector<unsigned char>(128, 0xa2)) {
+                std::cerr << "unpack of ladder F=" << frontier
+                          << " did not restore rewrite hidden at or before F\n";
+                ++failures;
+            }
+        } else if (conv_packed != rewrite_conv_fill || rec_packed != rewrite_rec_fill) {
+            std::cerr << "unpack of ladder F=" << frontier
+                      << " loaded rewrite GDN sitting ahead of F\n";
+            ++failures;
+        }
+    };
+    unpack_head(2, conv_f2, rec_f2, hid_f2, false);
+    unpack_head(6, conv_f6, rec_f6, hid_f6, true);
+    cache.consume(match->entry_id);
+
+    text.release();
+    text_dest.release();
+    return failures;
+}
+
+int test_context_checkpoint_two_ram_entries(ninfer::DeviceContext& ctx) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    auto text_plan =
+        plan_paged_cache(6, 6, 2,
+                         {{ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::FP16, 1, 2},
+                          {ninfer::DType::FP16, 1, 2}});
+    ninfer::DeviceArena text_arena(text_plan.bytes);
+    ninfer::PagedKVPool text_pool({text_arena.base(), text_arena.capacity()}, text_plan.layout);
+    ninfer::LayoutBuilder gdn_builder;
+    const auto gdn_layout = ninfer::plan_linear_attention_state_pool(
+        gdn_builder, {.layers         = 2,
+                      .conv_channels  = 4,
+                      .conv_width     = 2,
+                      .value_heads    = 2,
+                      .value_head_dim = 2,
+                      .key_head_dim   = 2,
+                      .slot_count     = 4,
+                      .conv_dtype     = ninfer::DType::BF16});
+    ninfer::DeviceArena gdn_arena(gdn_builder.finish(256));
+    ninfer::LinearAttentionStatePool gdn({gdn_arena.base(), gdn_arena.capacity()}, gdn_layout);
+
+    auto text_a = text_pool.reserve(2);
+    auto text_b = text_pool.reserve(2);
+    text_a.materialize_pages(2, ctx.stream);
+    text_b.materialize_pages(2, ctx.stream);
+    fill_logical_pages(text_pool, text_a, 1);
+    fill_logical_pages(text_pool, text_b, 2);
+
+    const auto make_retained = [](std::vector<ninfer::TokenId> tokens) {
+        auto prompt = text_prompt(std::move(tokens));
+        q36::PreparedPromptData retained = prompt;
+        retained.token_ids.push_back(0);
+        retained.token_types.push_back(0);
+        const std::size_t n = retained.token_ids.size();
+        retained.positions.resize(3 * n);
+        for (int axis = 0; axis < 3; ++axis) {
+            for (std::size_t i = 0; i < n; ++i) {
+                retained.positions[static_cast<std::size_t>(axis) * n + i] =
+                    static_cast<std::int32_t>(i);
+            }
+        }
+        return retained;
+    };
+    q36::PreparedPromptData retained_a = make_retained({1, 2, 3, 4});
+    q36::PreparedPromptData retained_b = make_retained({9, 8, 7, 6});
+    q36::detail::ResidentPrefixIdentity identity_a;
+    q36::detail::ResidentPrefixIdentity identity_b;
+    identity_a.assign(retained_a);
+    identity_b.assign(retained_b);
+
+    std::vector<unsigned char> conv_a(gdn.conv_host_image_bytes(), 0xa1);
+    std::vector<unsigned char> rec_a(gdn.recurrent_host_image_bytes(), 0xa2);
+    std::vector<unsigned char> hid_a(32, 0xa3);
+    std::vector<unsigned char> conv_b(gdn.conv_host_image_bytes(), 0xb1);
+    std::vector<unsigned char> rec_b(gdn.recurrent_host_image_bytes(), 0xb2);
+    std::vector<unsigned char> hid_b(32, 0xb3);
+    const auto head = [](std::uint32_t frontier, q36::detail::PrefixHash128 hash, const void* conv,
+                         const void* rec, const void* hid, std::size_t conv_n, std::size_t rec_n,
+                         std::size_t hid_n) {
+        q36::detail::RamLadderHead out;
+        out.frontier        = frontier;
+        out.hash            = hash;
+        out.conv            = conv;
+        out.recurrent       = rec;
+        out.hidden          = hid;
+        out.conv_bytes      = conv_n;
+        out.recurrent_bytes = rec_n;
+        out.hidden_bytes    = hid_n;
+        return out;
+    };
+
+    ninfer::DeviceBuffer hidden_a_buf(32);
+    hidden_a_buf.fill(0xa3);
+    ninfer::Tensor hidden_a(hidden_a_buf.p, ninfer::DType::U8, {32});
+    ninfer::DeviceBuffer hidden_b_buf(32);
+    hidden_b_buf.fill(0xb3);
+    ninfer::Tensor hidden_b(hidden_b_buf.p, ninfer::DType::U8, {32});
+
+    auto capture = [&](q36::PreparedPromptData& retained, q36::detail::ResidentPrefixIdentity& id,
+                       ninfer::PagedKVAllocation& text, ninfer::Tensor& hidden,
+                       std::vector<q36::detail::RamLadderHead> ladders) {
+        q36::detail::RamCaptureSource source;
+        source.execution_frontier = static_cast<std::uint32_t>(retained.token_ids.size() - 1);
+        source.ledger_frontier    = static_cast<std::uint32_t>(retained.token_ids.size());
+        source.text_kv_valid      = source.execution_frontier;
+        source.tail_hidden_valid  = true;
+        source.ledger             = retained.token_ids;
+        source.identity           = &id;
+        source.hash_f             = q36::detail::prefix_hash_at(retained.token_ids, id,
+                                                                source.execution_frontier);
+        source.text               = &text;
+        source.text_pool          = &text_pool;
+        source.gdn                = &gdn;
+        source.gdn_current_slot   = 0;
+        source.tail_hidden        = &hidden;
+        source.ladder_heads       = std::move(ladders);
+        source.stream             = ctx.copy_stream;
+        return source;
+    };
+
+    q36::detail::KVRamCache cache(16ULL << 20);
+    auto source_a = capture(retained_a, identity_a, text_a, hidden_a,
+                            {head(2, q36::detail::prefix_hash_at(retained_a.token_ids, identity_a, 2),
+                                  conv_a.data(), rec_a.data(), hid_a.data(), conv_a.size(),
+                                  rec_a.size(), hid_a.size())});
+    if (!cache.capture(source_a)) {
+        text_a.release();
+        text_b.release();
+        return fail("two-entry capture A failed");
+    }
+    auto source_b = capture(retained_b, identity_b, text_b, hidden_b,
+                            {head(2, q36::detail::prefix_hash_at(retained_b.token_ids, identity_b, 2),
+                                  conv_b.data(), rec_b.data(), hid_b.data(), conv_b.size(),
+                                  rec_b.size(), hid_b.size())});
+    if (!cache.capture(source_b)) {
+        text_a.release();
+        text_b.release();
+        return fail("two-entry capture B failed");
+    }
+    ctx.synchronize_all();
+
+    const auto prefix_a = text_prompt({1, 2});
+    const auto prefix_b = text_prompt({9, 8});
+    const auto match_a  = cache.plan_match(prefix_a, q36::detail::prefix_hash_chain(prefix_a));
+    const auto match_b  = cache.plan_match(prefix_b, q36::detail::prefix_hash_chain(prefix_b));
+    if (!match_a || !match_b || match_a->entry_id == match_b->entry_id ||
+        match_a->reuse_base != 2 || match_b->reuse_base != 2 ||
+        match_a->reuse != ninfer::PrefixReusePath::RestoreContextCheckpoint ||
+        match_b->reuse != ninfer::PrefixReusePath::RestoreContextCheckpoint) {
+        text_a.release();
+        text_b.release();
+        std::cerr << "two RAM entries did not match as distinct ladder heads\n";
+        return 1;
+    }
+
+    auto text_dest = text_pool.reserve(2);
+    text_dest.materialize_pages(2, ctx.stream);
+    ninfer::DeviceBuffer hidden_out_buf(32);
+    hidden_out_buf.fill(0);
+    ninfer::Tensor hidden_out(hidden_out_buf.p, ninfer::DType::U8, {32});
+    std::vector<unsigned char> conv_packed(gdn.conv_host_image_bytes(), 0);
+    std::vector<unsigned char> rec_packed(gdn.recurrent_host_image_bytes(), 0);
+    std::vector<unsigned char> hidden_host(32, 0);
+
+    auto unpack_entry = [&](const q36::detail::RamMatch& match,
+                            const std::vector<unsigned char>& conv_expect,
+                            const std::vector<unsigned char>& rec_expect,
+                            const std::vector<unsigned char>& hid_expect, const char* label) {
+        for (std::uint32_t layer = 0; layer < gdn.layer_count(); ++layer) {
+            CUDA_CHECK(cudaMemset(gdn.conv_slot(layer, 2).data, 0, gdn.conv_slot(layer, 2).bytes()));
+            CUDA_CHECK(cudaMemset(gdn.recurrent_slot(layer, 2).data, 0,
+                                  gdn.recurrent_slot(layer, 2).bytes()));
+        }
+        CUDA_CHECK(cudaMemset(hidden_out.data, 0, hidden_out.bytes()));
+        q36::detail::RamRestoreTarget target;
+        target.text             = &text_dest;
+        target.text_pool        = &text_pool;
+        target.text_dst_pages   = ninfer::pages_for_tokens(match.reuse_base);
+        target.gdn              = &gdn;
+        target.gdn_current_slot = 2;
+        target.tail_hidden      = &hidden_out;
+        target.reuse            = match.reuse;
+        target.reuse_base       = match.reuse_base;
+        target.stream           = ctx.copy_stream;
+        cache.claim(match.entry_id);
+        (void)cache.unpack_device(match.entry_id, target);
+        cache.consume(match.entry_id);
+        ctx.synchronize_all();
+        gdn.pack_slot_to_host(2, conv_packed.data(), rec_packed.data(), ctx.copy_stream);
+        ctx.synchronize_all();
+        int local = 0;
+        if (conv_packed != conv_expect || rec_packed != rec_expect) {
+            std::cerr << label << " unpacked the other entry's GDN\n";
+            local = 1;
+        }
+        CUDA_CHECK(cudaMemcpy(hidden_host.data(), hidden_out.data, hidden_host.size(),
+                               cudaMemcpyDeviceToHost));
+        if (hidden_host != hid_expect) {
+            std::cerr << label << " unpacked the other entry's hidden\n";
+            local = 1;
+        }
+        return local;
+    };
+
+    int failures = 0;
+    failures += unpack_entry(*match_a, conv_a, rec_a, hid_a, "entry A");
+    failures += unpack_entry(*match_b, conv_b, rec_b, hid_b, "entry B");
+    text_a.release();
+    text_b.release();
+    text_dest.release();
+    return failures;
+}
+
+int test_context_checkpoint_ladder_beats_rewrite(ninfer::DeviceContext& ctx) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    auto text_plan =
+        plan_paged_cache(4, 4, 2,
+                         {{ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::FP16, 1, 2},
+                          {ninfer::DType::FP16, 1, 2}});
+    ninfer::DeviceArena text_arena(text_plan.bytes);
+    ninfer::PagedKVPool text_pool({text_arena.base(), text_arena.capacity()}, text_plan.layout);
+    auto text = text_pool.reserve(2);
+    text.materialize_pages(2, ctx.stream);
+    fill_logical_pages(text_pool, text, 5);
+
+    const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8, 9});
+    q36::PreparedPromptData retained = prompt;
+    retained.token_ids.push_back(0);
+    retained.token_types.push_back(0);
+    const std::size_t tokens = retained.token_ids.size();
+    retained.positions.resize(3 * tokens);
+    for (int axis = 0; axis < 3; ++axis) {
+        for (std::size_t i = 0; i < tokens; ++i) {
+            retained.positions[static_cast<std::size_t>(axis) * tokens + i] =
+                static_cast<std::int32_t>(i);
+        }
+    }
+    q36::detail::ResidentPrefixIdentity identity;
+    identity.assign(retained);
+
+    std::vector<unsigned char> conv(64, 0x11);
+    std::vector<unsigned char> rec(64, 0x22);
+    std::vector<unsigned char> hid(32, 0x33);
+    q36::detail::RamLadderHead ladder;
+    ladder.frontier        = 8;
+    ladder.hash            = q36::detail::prefix_hash_at(retained.token_ids, identity, 8);
+    ladder.conv            = conv.data();
+    ladder.recurrent       = rec.data();
+    ladder.hidden          = hid.data();
+    ladder.conv_bytes      = conv.size();
+    ladder.recurrent_bytes = rec.size();
+    ladder.hidden_bytes    = hid.size();
+
+    q36::detail::RamCaptureSource source;
+    source.execution_frontier = static_cast<std::uint32_t>(prompt.token_ids.size());
+    source.ledger_frontier    = static_cast<std::uint32_t>(tokens);
+    source.text_kv_valid      = source.execution_frontier;
+    source.tail_hidden_valid  = true;
+    source.rewrite_valid      = true;
+    source.rewrite_kind       = q36::RewriteCheckpointKind::TurnClosure;
+    source.rewrite_frontier   = 4;
+    source.hash_c_valid       = true;
+    source.ledger             = retained.token_ids;
+    source.identity           = &identity;
+    source.hash_f             = q36::detail::prefix_hash_at(retained.token_ids, identity,
+                                                            source.execution_frontier);
+    source.hash_c             = q36::detail::prefix_hash_at(retained.token_ids, identity, 4);
+    source.text               = &text;
+    source.text_pool          = &text_pool;
+    source.ladder_heads       = {ladder};
+    source.stream             = ctx.copy_stream;
+    q36::detail::KVRamCache cache(16ULL << 20);
+    if (!cache.capture(source)) {
+        text.release();
+        return fail("ladder-beats-rewrite capture failed");
+    }
+
+    const auto prefix = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
+    const auto match  = cache.plan_match(prefix, q36::detail::prefix_hash_chain(prefix));
+    text.release();
+    if (!match || match->reuse != ninfer::PrefixReusePath::RestoreContextCheckpoint ||
+        match->reuse_base != 8) {
+        std::cerr << "longer ladder head did not beat shorter rewrite in plan_match\n";
+        return 1;
+    }
+    return 0;
+}
+
+int test_context_checkpoint_equal_execution_is_append(ninfer::DeviceContext& ctx) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    auto text_plan =
+        plan_paged_cache(4, 4, 2,
+                         {{ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::FP16, 1, 2},
+                          {ninfer::DType::FP16, 1, 2}});
+    ninfer::DeviceArena text_arena(text_plan.bytes);
+    ninfer::PagedKVPool text_pool({text_arena.base(), text_arena.capacity()}, text_plan.layout);
+    auto text = text_pool.reserve(2);
+    text.materialize_pages(2, ctx.stream);
+    fill_logical_pages(text_pool, text, 5);
+
+    const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
+    q36::PreparedPromptData retained = prompt;
+    retained.token_ids.push_back(0);
+    retained.token_types.push_back(0);
+    const std::size_t tokens = retained.token_ids.size();
+    retained.positions.resize(3 * tokens);
+    for (int axis = 0; axis < 3; ++axis) {
+        for (std::size_t i = 0; i < tokens; ++i) {
+            retained.positions[static_cast<std::size_t>(axis) * tokens + i] =
+                static_cast<std::int32_t>(i);
+        }
+    }
+    q36::detail::ResidentPrefixIdentity identity;
+    identity.assign(retained);
+
+    std::vector<unsigned char> conv(64, 0x11);
+    std::vector<unsigned char> rec(64, 0x22);
+    std::vector<unsigned char> hid(32, 0x33);
+    q36::detail::RamLadderHead ladder;
+    ladder.frontier        = 8;
+    ladder.hash            = q36::detail::prefix_hash_at(retained.token_ids, identity, 8);
+    ladder.conv            = conv.data();
+    ladder.recurrent       = rec.data();
+    ladder.hidden          = hid.data();
+    ladder.conv_bytes      = conv.size();
+    ladder.recurrent_bytes = rec.size();
+    ladder.hidden_bytes    = hid.size();
+
+    q36::detail::RamCaptureSource source;
+    source.execution_frontier = static_cast<std::uint32_t>(prompt.token_ids.size());
+    source.ledger_frontier    = static_cast<std::uint32_t>(tokens);
+    source.text_kv_valid      = source.execution_frontier;
+    source.tail_hidden_valid  = true;
+    source.rewrite_valid      = true;
+    source.rewrite_kind       = q36::RewriteCheckpointKind::TurnClosure;
+    source.rewrite_frontier   = 4;
+    source.hash_c_valid       = true;
+    source.ledger             = retained.token_ids;
+    source.identity           = &identity;
+    source.hash_f             = q36::detail::prefix_hash_at(retained.token_ids, identity,
+                                                            source.execution_frontier);
+    source.hash_c             = q36::detail::prefix_hash_at(retained.token_ids, identity, 4);
+    source.text               = &text;
+    source.text_pool          = &text_pool;
+    source.ladder_heads       = {ladder};
+    source.stream             = ctx.copy_stream;
+    q36::detail::KVRamCache cache(16ULL << 20);
+    if (!cache.capture(source)) {
+        text.release();
+        return fail("equal-execution capture failed");
+    }
+
+    const auto prefix = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
+    const auto match  = cache.plan_match(prefix, q36::detail::prefix_hash_chain(prefix));
+    text.release();
+    if (!match || match->reuse != ninfer::PrefixReusePath::AppendAtFrontier ||
+        match->reuse_base != 8) {
+        std::cerr << "E==F RAM match did not keep AppendAtFrontier over the ladder head\n";
+        return 1;
+    }
+    return 0;
+}
+
+int test_context_checkpoint_hash_mismatch(ninfer::DeviceContext& ctx) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    auto text_plan =
+        plan_paged_cache(4, 4, 2,
+                         {{ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::FP16, 1, 2},
+                          {ninfer::DType::FP16, 1, 2}});
+    ninfer::DeviceArena text_arena(text_plan.bytes);
+    ninfer::PagedKVPool text_pool({text_arena.base(), text_arena.capacity()}, text_plan.layout);
+    auto text = text_pool.reserve(2);
+    text.materialize_pages(2, ctx.stream);
+
+    const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
+    q36::PreparedPromptData retained = prompt;
+    retained.token_ids.push_back(0);
+    retained.token_types.push_back(0);
+    const std::size_t tokens = retained.token_ids.size();
+    retained.positions.resize(3 * tokens);
+    for (int axis = 0; axis < 3; ++axis) {
+        for (std::size_t i = 0; i < tokens; ++i) {
+            retained.positions[static_cast<std::size_t>(axis) * tokens + i] =
+                static_cast<std::int32_t>(i);
+        }
+    }
+    q36::detail::ResidentPrefixIdentity identity;
+    identity.assign(retained);
+
+    std::vector<unsigned char> conv(64, 0x11);
+    std::vector<unsigned char> rec(64, 0x22);
+    std::vector<unsigned char> hid(32, 0x33);
+    q36::detail::RamLadderHead ladder;
+    ladder.frontier        = 4;
+    ladder.hash            = q36::detail::prefix_hash_at(retained.token_ids, identity, 4);
+    ladder.conv            = conv.data();
+    ladder.recurrent       = rec.data();
+    ladder.hidden          = hid.data();
+    ladder.conv_bytes      = conv.size();
+    ladder.recurrent_bytes = rec.size();
+    ladder.hidden_bytes    = hid.size();
+
+    q36::detail::RamCaptureSource source;
+    source.execution_frontier = static_cast<std::uint32_t>(prompt.token_ids.size());
+    source.ledger_frontier    = static_cast<std::uint32_t>(tokens);
+    source.text_kv_valid      = source.execution_frontier;
+    source.tail_hidden_valid  = true;
+    source.ledger             = retained.token_ids;
+    source.identity           = &identity;
+    source.hash_f             = q36::detail::prefix_hash_at(retained.token_ids, identity,
+                                                            source.execution_frontier);
+    source.text               = &text;
+    source.text_pool          = &text_pool;
+    source.ladder_heads       = {ladder};
+    source.stream             = ctx.copy_stream;
+    q36::detail::KVRamCache cache(16ULL << 20);
+    if (!cache.capture(source)) {
+        text.release();
+        return fail("hash-mismatch capture failed");
+    }
+
+    auto mutated = text_prompt({1, 2, 3, 99});
+    const auto miss = cache.plan_match(mutated, q36::detail::prefix_hash_chain(mutated));
+    text.release();
+    if (miss) {
+        std::cerr << "hash mismatch at ladder F still produced a RAM hit\n";
+        return 1;
+    }
+    return 0;
+}
+
+int test_context_checkpoint_rollback_recapture(ninfer::DeviceContext& ctx) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    auto text_plan =
+        plan_paged_cache(4, 4, 2,
+                         {{ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::FP16, 1, 2},
+                          {ninfer::DType::FP16, 1, 2}});
+    ninfer::DeviceArena text_arena(text_plan.bytes);
+    ninfer::PagedKVPool text_pool({text_arena.base(), text_arena.capacity()}, text_plan.layout);
+    auto text = text_pool.reserve(2);
+    text.materialize_pages(2, ctx.stream);
+    fill_logical_pages(text_pool, text, 9);
+
+    const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
+    q36::PreparedPromptData retained = prompt;
+    retained.token_ids.push_back(0);
+    retained.token_types.push_back(0);
+    const std::size_t tokens = retained.token_ids.size();
+    retained.positions.resize(3 * tokens);
+    for (int axis = 0; axis < 3; ++axis) {
+        for (std::size_t i = 0; i < tokens; ++i) {
+            retained.positions[static_cast<std::size_t>(axis) * tokens + i] =
+                static_cast<std::int32_t>(i);
+        }
+    }
+    q36::detail::ResidentPrefixIdentity identity;
+    identity.assign(retained);
+
+    std::vector<unsigned char> conv2(64, 0x21), rec2(64, 0x22), hid2(32, 0xb2);
+    std::vector<unsigned char> conv4(64, 0x41), rec4(64, 0x42), hid4(32, 0xb4);
+    std::vector<unsigned char> conv6(64, 0x61), rec6(64, 0x62), hid6(32, 0xb6);
+    const auto head_at = [&](std::uint32_t frontier, const void* conv, const void* rec,
+                             const void* hid) {
+        q36::detail::RamLadderHead head;
+        head.frontier        = frontier;
+        head.hash            = q36::detail::prefix_hash_at(retained.token_ids, identity, frontier);
+        head.conv            = conv;
+        head.recurrent       = rec;
+        head.hidden          = hid;
+        head.conv_bytes      = conv4.size();
+        head.recurrent_bytes = rec4.size();
+        head.hidden_bytes    = hid4.size();
+        return head;
+    };
+
+    auto fill_source = [&](std::vector<q36::detail::RamLadderHead> heads) {
+        q36::detail::RamCaptureSource source;
+        source.execution_frontier = static_cast<std::uint32_t>(prompt.token_ids.size());
+        source.ledger_frontier    = static_cast<std::uint32_t>(tokens);
+        source.text_kv_valid      = source.execution_frontier;
+        source.tail_hidden_valid  = false;
+        source.ledger             = retained.token_ids;
+        source.identity           = &identity;
+        source.hash_f             = q36::detail::prefix_hash_at(retained.token_ids, identity,
+                                                                source.execution_frontier);
+        source.text               = &text;
+        source.text_pool          = &text_pool;
+        source.ladder_heads       = std::move(heads);
+        source.stream             = ctx.copy_stream;
+        return source;
+    };
+
+    q36::detail::KVRamCache cache(16ULL << 20);
+    auto fat = fill_source({head_at(2, conv2.data(), rec2.data(), hid2.data()),
+                            head_at(4, conv4.data(), rec4.data(), hid4.data()),
+                            head_at(6, conv6.data(), rec6.data(), hid6.data())});
+    if (!cache.capture(fat)) {
+        text.release();
+        return fail("rollback fat capture failed");
+    }
+    const auto prefix6 = text_prompt({1, 2, 3, 4, 5, 6});
+    const auto hit6    = cache.plan_match(prefix6, q36::detail::prefix_hash_chain(prefix6));
+    if (!hit6 || hit6->reuse_base != 6) {
+        text.release();
+        return fail("fat RAM image did not index all three GDN heads");
+    }
+    const auto prefix4 = text_prompt({1, 2, 3, 4});
+    const auto hit4    = cache.plan_match(prefix4, q36::detail::prefix_hash_chain(prefix4));
+    if (!hit4 || hit4->reuse != ninfer::PrefixReusePath::RestoreContextCheckpoint ||
+        hit4->reuse_base != 4) {
+        text.release();
+        return fail("fat RAM image did not independently index the middle GDN head");
+    }
+    cache.claim(hit4->entry_id);
+    cache.consume(hit4->entry_id);
+
+    auto trimmed = fill_source({head_at(2, conv2.data(), rec2.data(), hid2.data()),
+                                head_at(4, conv4.data(), rec4.data(), hid4.data())});
+    if (!cache.capture(trimmed)) {
+        text.release();
+        return fail("rollback recapture of remaining heads failed");
+    }
+    const auto after = cache.plan_match(prefix6, q36::detail::prefix_hash_chain(prefix6));
+    text.release();
+    if (!after || after->reuse != ninfer::PrefixReusePath::RestoreContextCheckpoint ||
+        after->reuse_base != 4) {
+        std::cerr << "recapture after rollback still served an infeasible F=6 GDN head\n";
+        return 1;
+    }
+    const auto still4 = cache.plan_match(prefix4, q36::detail::prefix_hash_chain(prefix4));
+    if (!still4 || still4->reuse_base != 4) {
+        std::cerr << "recapture after rollback dropped the still-hittable F=4 GDN head\n";
+        return 1;
+    }
+    return 0;
+}
+
+int test_context_checkpoint_consume_waits_copies(ninfer::DeviceContext& ctx) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    auto text_plan =
+        plan_paged_cache(4, 4, 2,
+                         {{ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::FP16, 1, 2},
+                          {ninfer::DType::FP16, 1, 2}});
+    ninfer::DeviceArena text_arena(text_plan.bytes);
+    ninfer::PagedKVPool text_pool({text_arena.base(), text_arena.capacity()}, text_plan.layout);
+    auto text = text_pool.reserve(2);
+    text.materialize_pages(2, ctx.stream);
+    fill_logical_pages(text_pool, text, 9);
+
+    constexpr std::size_t kBulkBytes = 32ULL << 20;
+    ninfer::DeviceBuffer bulk(kBulkBytes);
+    bulk.fill(0x5a);
+    ninfer::Tensor hidden(bulk.p, ninfer::DType::U8, {static_cast<std::int32_t>(kBulkBytes)});
+
+    const auto prompt = text_prompt({1, 2, 3, 4});
+    q36::PreparedPromptData retained = prompt;
+    retained.token_ids.push_back(0);
+    retained.token_types.push_back(0);
+    const std::size_t tokens = retained.token_ids.size();
+    retained.positions.resize(3 * tokens);
+    for (int axis = 0; axis < 3; ++axis) {
+        for (std::size_t i = 0; i < tokens; ++i) {
+            retained.positions[static_cast<std::size_t>(axis) * tokens + i] =
+                static_cast<std::int32_t>(i);
+        }
+    }
+    q36::detail::ResidentPrefixIdentity identity;
+    identity.assign(retained);
+
+    std::vector<unsigned char> conv(64, 0x21);
+    std::vector<unsigned char> rec(64, 0x22);
+    std::vector<unsigned char> hid(32, 0x23);
+    const auto head_at = [&](std::uint32_t frontier) {
+        q36::detail::RamLadderHead head;
+        head.frontier        = frontier;
+        head.hash            = q36::detail::prefix_hash_at(retained.token_ids, identity, frontier);
+        head.conv            = conv.data();
+        head.recurrent       = rec.data();
+        head.hidden          = hid.data();
+        head.conv_bytes      = conv.size();
+        head.recurrent_bytes = rec.size();
+        head.hidden_bytes    = hid.size();
+        return head;
+    };
+
+    q36::detail::RamCaptureSource source;
+    source.execution_frontier = static_cast<std::uint32_t>(prompt.token_ids.size());
+    source.ledger_frontier    = static_cast<std::uint32_t>(tokens);
+    source.text_kv_valid      = source.execution_frontier;
+    source.tail_hidden_valid  = true;
+    source.ledger             = retained.token_ids;
+    source.identity           = &identity;
+    source.hash_f             = q36::detail::prefix_hash_at(retained.token_ids, identity,
+                                                            source.execution_frontier);
+    source.text               = &text;
+    source.text_pool          = &text_pool;
+    source.tail_hidden        = &hidden;
+    source.ladder_heads       = {head_at(2), head_at(4)};
+    source.stream             = ctx.copy_stream;
+    q36::detail::KVRamCache cache(64ULL << 20);
+    if (!cache.capture(source)) {
+        text.release();
+        return fail("consume-wait capture failed");
+    }
+    const auto match = cache.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    if (!match) {
+        text.release();
+        return fail("consume-wait capture did not index");
+    }
+
+    cache.claim(match->entry_id);
+    cache.consume(match->entry_id);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaGetLastError());
+    if (!cache.copies_ready(match->entry_id)) {
+        text.release();
+        return fail("consume did not wait copies_done before freeing the ladder image");
+    }
+    text.release();
+    return 0;
+}
+
+int test_context_checkpoint_catch_up_frontier(ninfer::DeviceContext& ctx) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    auto text_plan =
+        plan_paged_cache(4, 4, 2,
+                         {{ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::FP16, 1, 2},
+                          {ninfer::DType::FP16, 1, 2}});
+    ninfer::DeviceArena text_arena(text_plan.bytes);
+    ninfer::PagedKVPool text_pool({text_arena.base(), text_arena.capacity()}, text_plan.layout);
+    ninfer::LayoutBuilder gdn_builder;
+    const auto gdn_layout = ninfer::plan_linear_attention_state_pool(
+        gdn_builder, {.layers         = 2,
+                      .conv_channels  = 4,
+                      .conv_width     = 2,
+                      .value_heads    = 2,
+                      .value_head_dim = 2,
+                      .key_head_dim   = 2,
+                      .slot_count     = 4,
+                      .conv_dtype     = ninfer::DType::BF16});
+    ninfer::DeviceArena gdn_arena(gdn_builder.finish(256));
+    ninfer::LinearAttentionStatePool gdn({gdn_arena.base(), gdn_arena.capacity()}, gdn_layout);
+
+    auto text = text_pool.reserve(2);
+    text.materialize_pages(2, ctx.stream);
+    fill_logical_pages(text_pool, text, 3);
+
+    std::vector<unsigned char> conv_live(gdn.conv_host_image_bytes(), 0xe1);
+    std::vector<unsigned char> rec_live(gdn.recurrent_host_image_bytes(), 0xe2);
+    std::vector<unsigned char> conv_head(gdn.conv_host_image_bytes(), 0x51);
+    std::vector<unsigned char> rec_head(gdn.recurrent_host_image_bytes(), 0x52);
+    std::vector<unsigned char> hid_head(32, 0x53);
+    for (std::uint32_t layer = 0; layer < gdn.layer_count(); ++layer) {
+        CUDA_CHECK(cudaMemcpy(gdn.conv_slot(layer, 0).data, conv_live.data(), gdn.conv_slot_bytes(),
+                               cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(gdn.recurrent_slot(layer, 0).data, rec_live.data(),
+                               gdn.recurrent_slot_bytes(), cudaMemcpyHostToDevice));
+    }
+
+    ninfer::DeviceBuffer hidden_buf(32);
+    hidden_buf.fill(0xa1);
+    ninfer::Tensor hidden(hidden_buf.p, ninfer::DType::U8, {32});
+
+    const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
+    q36::PreparedPromptData retained = prompt;
+    retained.token_ids.push_back(0);
+    retained.token_types.push_back(0);
+    const std::size_t tokens = retained.token_ids.size();
+    retained.positions.resize(3 * tokens);
+    for (int axis = 0; axis < 3; ++axis) {
+        for (std::size_t i = 0; i < tokens; ++i) {
+            retained.positions[static_cast<std::size_t>(axis) * tokens + i] =
+                static_cast<std::int32_t>(i);
+        }
+    }
+    q36::detail::ResidentPrefixIdentity identity;
+    identity.assign(retained);
+
+    q36::detail::RamLadderHead ladder;
+    ladder.frontier        = 5;
+    ladder.hash            = q36::detail::prefix_hash_at(retained.token_ids, identity, 5);
+    ladder.conv            = conv_head.data();
+    ladder.recurrent       = rec_head.data();
+    ladder.hidden          = hid_head.data();
+    ladder.conv_bytes      = conv_head.size();
+    ladder.recurrent_bytes = rec_head.size();
+    ladder.hidden_bytes    = hid_head.size();
+
+    q36::detail::RamCaptureSource source;
+    source.execution_frontier = static_cast<std::uint32_t>(prompt.token_ids.size());
+    source.ledger_frontier    = static_cast<std::uint32_t>(tokens);
+    source.text_kv_valid      = source.execution_frontier;
+    source.mtp_kv_valid       = source.execution_frontier;
+    source.tail_hidden_valid  = true;
+    source.ledger             = retained.token_ids;
+    source.identity           = &identity;
+    source.hash_f             = q36::detail::prefix_hash_at(retained.token_ids, identity,
+                                                            source.execution_frontier);
+    source.text               = &text;
+    source.text_pool          = &text_pool;
+    source.gdn                = &gdn;
+    source.gdn_current_slot   = 0;
+    source.tail_hidden        = &hidden;
+    source.ladder_heads       = {ladder};
+    source.stream             = ctx.copy_stream;
+    CUDA_CHECK(cudaDeviceSynchronize());
+    q36::detail::KVRamCache cache(16ULL << 20);
+    if (!cache.capture(source)) {
+        text.release();
+        return fail("catch-up frontier capture failed");
+    }
+
+    const auto prefix = text_prompt({1, 2, 3, 4, 5});
+    const auto match  = cache.plan_match(prefix, q36::detail::prefix_hash_chain(prefix));
+    if (!match || match->reuse != ninfer::PrefixReusePath::RestoreContextCheckpoint ||
+        match->reuse_base != 5) {
+        text.release();
+        std::cerr << "off-grid ladder F=5 did not match\n";
+        return 1;
+    }
+
+    auto text_dest = text_pool.reserve(2);
+    text_dest.materialize_pages(2, ctx.stream);
+    ninfer::DeviceBuffer hidden_out_buf(32);
+    hidden_out_buf.fill(0);
+    ninfer::Tensor hidden_out(hidden_out_buf.p, ninfer::DType::U8, {32});
+    for (std::uint32_t layer = 0; layer < gdn.layer_count(); ++layer) {
+        CUDA_CHECK(cudaMemset(gdn.conv_slot(layer, 2).data, 0, gdn.conv_slot(layer, 2).bytes()));
+        CUDA_CHECK(
+            cudaMemset(gdn.recurrent_slot(layer, 2).data, 0, gdn.recurrent_slot(layer, 2).bytes()));
+    }
+    q36::detail::RamRestoreTarget target;
+    target.text           = &text_dest;
+    target.text_pool      = &text_pool;
+    target.text_dst_pages = ninfer::pages_for_tokens(match->reuse_base);
+    target.gdn            = &gdn;
+    target.gdn_current_slot = 2;
+    target.tail_hidden    = &hidden_out;
+    target.reuse          = match->reuse;
+    target.reuse_base     = match->reuse_base;
+    target.stream         = ctx.copy_stream;
+    cache.claim(match->entry_id);
+    (void)cache.unpack_device(match->entry_id, target);
+    ctx.synchronize_all();
+
+    std::vector<unsigned char> conv_packed(gdn.conv_host_image_bytes(), 0);
+    std::vector<unsigned char> rec_packed(gdn.recurrent_host_image_bytes(), 0);
+    gdn.pack_slot_to_host(2, conv_packed.data(), rec_packed.data(), ctx.copy_stream);
+    ctx.synchronize_all();
+    int failures = 0;
+    if (conv_packed != conv_head || rec_packed != rec_head) {
+        std::cerr << "catch-up unpack installed dump current GDN instead of the F=5 head\n";
+        ++failures;
+    }
+    std::vector<unsigned char> hidden_host(32);
+    CUDA_CHECK(cudaMemcpy(hidden_host.data(), hidden_out.data, hidden_host.size(),
+                           cudaMemcpyDeviceToHost));
+    if (hidden_host != hid_head) {
+        std::cerr << "catch-up unpack installed the wrong hidden\n";
+        ++failures;
+    }
+    cache.consume(match->entry_id);
+    text.release();
+    text_dest.release();
+    return failures;
+}
+
+int test_turn_rollback_kind_roundtrip(ninfer::DeviceContext& ctx) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    auto text_plan =
+        plan_paged_cache(4, 4, 2,
+                         {{ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::FP16, 1, 2},
+                          {ninfer::DType::FP16, 1, 2}});
+    ninfer::DeviceArena text_arena(text_plan.bytes);
+    ninfer::PagedKVPool text_pool({text_arena.base(), text_arena.capacity()}, text_plan.layout);
+    ninfer::LayoutBuilder gdn_builder;
+    const auto gdn_layout = ninfer::plan_linear_attention_state_pool(
+        gdn_builder, {.layers         = 3,
+                      .conv_channels  = 8,
+                      .conv_width     = 4,
+                      .value_heads    = 2,
+                      .value_head_dim = 4,
+                      .key_head_dim   = 3,
+                      .slot_count     = 4,
+                      .conv_dtype     = ninfer::DType::BF16});
+    ninfer::DeviceArena gdn_arena(gdn_builder.finish(256));
+    ninfer::LinearAttentionStatePool gdn({gdn_arena.base(), gdn_arena.capacity()}, gdn_layout);
+
+    auto text = text_pool.reserve(2);
+    text.materialize_pages(2, ctx.stream);
+    fill_logical_pages(text_pool, text, 7);
+
+    std::vector<unsigned char> conv_exec(gdn.conv_host_image_bytes(), 0xaa);
+    std::vector<unsigned char> rec_exec(gdn.recurrent_host_image_bytes(), 0xab);
+    std::vector<unsigned char> conv_head(gdn.conv_host_image_bytes(), 0x41);
+    std::vector<unsigned char> rec_head(gdn.recurrent_host_image_bytes(), 0x42);
+    std::vector<unsigned char> hid_head(128, 0x43);
+    for (std::uint32_t layer = 0; layer < gdn.layer_count(); ++layer) {
+        CUDA_CHECK(cudaMemcpy(gdn.conv_slot(layer, 0).data, conv_exec.data(), gdn.conv_slot_bytes(),
+                               cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(gdn.recurrent_slot(layer, 0).data, rec_exec.data(),
+                               gdn.recurrent_slot_bytes(), cudaMemcpyHostToDevice));
+    }
+    ninfer::DeviceBuffer hidden_buf(128);
+    hidden_buf.fill(0xaa);
+    ninfer::Tensor hidden(hidden_buf.p, ninfer::DType::U8, {128});
+
+    const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
+    q36::PreparedPromptData retained = prompt;
+    retained.token_ids.push_back(0);
+    retained.token_types.push_back(0);
+    const std::size_t tokens = retained.token_ids.size();
+    retained.positions.resize(3 * tokens);
+    for (int axis = 0; axis < 3; ++axis) {
+        for (std::size_t i = 0; i < tokens; ++i) {
+            retained.positions[static_cast<std::size_t>(axis) * tokens + i] =
+                static_cast<std::int32_t>(i);
+        }
+    }
+    q36::detail::ResidentPrefixIdentity identity;
+    identity.assign(retained);
+
+    q36::detail::RamLadderHead rollback;
+    rollback.frontier        = 4;
+    rollback.hash            = q36::detail::prefix_hash_at(retained.token_ids, identity, 4);
+    rollback.kind            = q36::detail::ContextCheckpointKind::TurnRollback;
+    rollback.conv            = conv_head.data();
+    rollback.recurrent       = rec_head.data();
+    rollback.hidden          = hid_head.data();
+    rollback.conv_bytes      = conv_head.size();
+    rollback.recurrent_bytes = rec_head.size();
+    rollback.hidden_bytes    = hid_head.size();
+
+    q36::detail::RamCaptureSource source;
+    source.execution_frontier = static_cast<std::uint32_t>(prompt.token_ids.size());
+    source.ledger_frontier    = static_cast<std::uint32_t>(tokens);
+    source.text_kv_valid      = source.execution_frontier;
+    source.mtp_kv_valid       = source.execution_frontier;
+    source.tail_hidden_valid  = true;
+    source.rewrite_valid      = true;
+    source.rewrite_kind       = q36::RewriteCheckpointKind::TurnClosure;
+    source.rewrite_frontier   = 2;
+    source.hash_c_valid       = true;
+    source.ledger             = retained.token_ids;
+    source.identity           = &identity;
+    source.hash_f             = q36::detail::prefix_hash_at(retained.token_ids, identity,
+                                                            source.execution_frontier);
+    source.hash_c             = q36::detail::prefix_hash_at(retained.token_ids, identity, 2);
+    source.text               = &text;
+    source.text_pool          = &text_pool;
+    source.gdn                = &gdn;
+    source.gdn_current_slot   = 0;
+    source.gdn_checkpoint_slot = 1;
+    source.tail_hidden        = &hidden;
+    source.ladder_heads       = {rollback};
+    source.stream             = ctx.copy_stream;
+    CUDA_CHECK(cudaDeviceSynchronize());
+    q36::detail::KVRamCache cache(16ULL << 20);
+    if (!cache.capture(source)) {
+        text.release();
+        return fail("turn-rollback kind capture failed");
+    }
+
+    const auto prefix = text_prompt({1, 2, 3, 4});
+    const auto match  = cache.plan_match(prefix, q36::detail::prefix_hash_chain(prefix));
+    if (!match || match->reuse != ninfer::PrefixReusePath::RestoreTurnRollback ||
+        match->reuse_base != 4) {
+        text.release();
+        std::cerr << "turn-rollback RAM head did not report RestoreTurnRollback\n";
+        return 1;
+    }
+    const q36::detail::RamRestoredHost loaded = cache.load_host(match->entry_id);
+    if (loaded.ladders.size() != 1 ||
+        loaded.ladders[0].kind != q36::detail::ContextCheckpointKind::TurnRollback) {
+        text.release();
+        std::cerr << "RAM image dropped turn_rollback kind\n";
+        return 1;
+    }
+
+    auto text_dest = text_pool.reserve(2);
+    text_dest.materialize_pages(2, ctx.stream);
+    ninfer::DeviceBuffer hidden_out_buf(128);
+    hidden_out_buf.fill(0);
+    ninfer::Tensor hidden_out(hidden_out_buf.p, ninfer::DType::U8, {128});
+    for (std::uint32_t layer = 0; layer < gdn.layer_count(); ++layer) {
+        CUDA_CHECK(cudaMemset(gdn.conv_slot(layer, 2).data, 0xee, gdn.conv_slot(layer, 2).bytes()));
+        CUDA_CHECK(
+            cudaMemset(gdn.recurrent_slot(layer, 2).data, 0xee, gdn.recurrent_slot(layer, 2).bytes()));
+    }
+    q36::detail::RamRestoreTarget target;
+    target.text             = &text_dest;
+    target.text_pool        = &text_pool;
+    target.text_dst_pages   = ninfer::pages_for_tokens(match->reuse_base);
+    target.gdn              = &gdn;
+    target.gdn_current_slot = 2;
+    target.gdn_checkpoint_slot = 3;
+    target.tail_hidden      = &hidden_out;
+    target.reuse            = match->reuse;
+    target.reuse_base       = match->reuse_base;
+    target.stream           = ctx.copy_stream;
+    cache.claim(match->entry_id);
+    (void)cache.unpack_device(match->entry_id, target);
+    ctx.synchronize_all();
+
+    std::vector<unsigned char> conv_packed(gdn.conv_host_image_bytes(), 0);
+    std::vector<unsigned char> rec_packed(gdn.recurrent_host_image_bytes(), 0);
+    gdn.pack_slot_to_host(2, conv_packed.data(), rec_packed.data(), ctx.copy_stream);
+    ctx.synchronize_all();
+    int failures = 0;
+    if (conv_packed != conv_head || rec_packed != rec_head) {
+        std::cerr << "RestoreTurnRollback unpacked eviction current GDN instead of the head\n";
+        ++failures;
+    }
+    std::vector<unsigned char> hidden_host(128);
+    CUDA_CHECK(cudaMemcpy(hidden_host.data(), hidden_out.data, hidden_host.size(),
+                           cudaMemcpyDeviceToHost));
+    if (hidden_host != hid_head) {
+        std::cerr << "RestoreTurnRollback unpacked eviction hidden instead of the head\n";
+        ++failures;
+    }
+    text.release();
+    text_dest.release();
+    return failures;
+}
+
+int test_mixed_checkpoint_gdn_isolation(ninfer::DeviceContext& ctx) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    auto text_plan =
+        plan_paged_cache(4, 4, 2,
+                         {{ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::FP16, 1, 2},
+                          {ninfer::DType::FP16, 1, 2}});
+    ninfer::DeviceArena text_arena(text_plan.bytes);
+    ninfer::PagedKVPool text_pool({text_arena.base(), text_arena.capacity()}, text_plan.layout);
+    ninfer::LayoutBuilder gdn_builder;
+    const auto gdn_layout = ninfer::plan_linear_attention_state_pool(
+        gdn_builder, {.layers         = 3,
+                      .conv_channels  = 8,
+                      .conv_width     = 4,
+                      .value_heads    = 2,
+                      .value_head_dim = 4,
+                      .key_head_dim   = 3,
+                      .slot_count     = 4,
+                      .conv_dtype     = ninfer::DType::BF16});
+    ninfer::DeviceArena gdn_arena(gdn_builder.finish(256));
+    ninfer::LinearAttentionStatePool gdn({gdn_arena.base(), gdn_arena.capacity()}, gdn_layout);
+
+    auto text = text_pool.reserve(2);
+    text.materialize_pages(2, ctx.stream);
+    fill_logical_pages(text_pool, text, 7);
+
+    std::vector<unsigned char> conv_cur(gdn.conv_host_image_bytes(), 0xaa);
+    std::vector<unsigned char> rec_cur(gdn.recurrent_host_image_bytes(), 0xab);
+    std::vector<unsigned char> conv_rw(gdn.conv_host_image_bytes(), 0xbb);
+    std::vector<unsigned char> rec_rw(gdn.recurrent_host_image_bytes(), 0xbc);
+    std::vector<unsigned char> conv_rb(gdn.conv_host_image_bytes(), 0x41);
+    std::vector<unsigned char> rec_rb(gdn.recurrent_host_image_bytes(), 0x42);
+    std::vector<unsigned char> hid_rb(128, 0x43);
+    std::vector<unsigned char> conv_ld(gdn.conv_host_image_bytes(), 0x51);
+    std::vector<unsigned char> rec_ld(gdn.recurrent_host_image_bytes(), 0x52);
+    std::vector<unsigned char> hid_ld(128, 0x53);
+    gdn.unpack_slot_from_host(0, conv_cur.data(), rec_cur.data(), ctx.stream);
+    gdn.unpack_slot_from_host(1, conv_rw.data(), rec_rw.data(), ctx.stream);
+    ninfer::DeviceBuffer hidden_buf(128);
+    hidden_buf.fill(0xa1);
+    ninfer::Tensor hidden(hidden_buf.p, ninfer::DType::U8, {128});
+    ninfer::DeviceBuffer rewrite_buf(128);
+    rewrite_buf.fill(0xa2);
+    ninfer::Tensor rewrite(rewrite_buf.p, ninfer::DType::U8, {128});
+
+    const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
+    q36::PreparedPromptData retained = prompt;
+    retained.token_ids.push_back(0);
+    retained.token_types.push_back(0);
+    const std::size_t tokens = retained.token_ids.size();
+    retained.positions.resize(3 * tokens);
+    for (int axis = 0; axis < 3; ++axis) {
+        for (std::size_t i = 0; i < tokens; ++i) {
+            retained.positions[static_cast<std::size_t>(axis) * tokens + i] =
+                static_cast<std::int32_t>(i);
+        }
+    }
+    q36::detail::ResidentPrefixIdentity identity;
+    identity.assign(retained);
+
+    q36::detail::RamLadderHead rollback;
+    rollback.frontier        = 4;
+    rollback.hash            = q36::detail::prefix_hash_at(retained.token_ids, identity, 4);
+    rollback.kind            = q36::detail::ContextCheckpointKind::TurnRollback;
+    rollback.conv            = conv_rb.data();
+    rollback.recurrent       = rec_rb.data();
+    rollback.hidden          = hid_rb.data();
+    rollback.conv_bytes      = conv_rb.size();
+    rollback.recurrent_bytes = rec_rb.size();
+    rollback.hidden_bytes    = hid_rb.size();
+    q36::detail::RamLadderHead ladder;
+    ladder.frontier        = 6;
+    ladder.hash            = q36::detail::prefix_hash_at(retained.token_ids, identity, 6);
+    ladder.kind            = q36::detail::ContextCheckpointKind::Ladder;
+    ladder.conv            = conv_ld.data();
+    ladder.recurrent       = rec_ld.data();
+    ladder.hidden          = hid_ld.data();
+    ladder.conv_bytes      = conv_ld.size();
+    ladder.recurrent_bytes = rec_ld.size();
+    ladder.hidden_bytes    = hid_ld.size();
+
+    q36::detail::RamCaptureSource source;
+    source.execution_frontier      = static_cast<std::uint32_t>(prompt.token_ids.size());
+    source.ledger_frontier         = static_cast<std::uint32_t>(tokens);
+    source.text_kv_valid           = source.execution_frontier;
+    source.mtp_kv_valid            = source.execution_frontier;
+    source.tail_hidden_valid       = true;
+    source.rewrite_valid           = true;
+    source.rewrite_kind            = q36::RewriteCheckpointKind::TurnClosure;
+    source.rewrite_frontier        = 2;
+    source.hash_c_valid            = true;
+    source.ledger                  = retained.token_ids;
+    source.identity                = &identity;
+    source.hash_f                  = q36::detail::prefix_hash_at(retained.token_ids, identity,
+                                                                source.execution_frontier);
+    source.hash_c                  = q36::detail::prefix_hash_at(retained.token_ids, identity, 2);
+    source.text                    = &text;
+    source.text_pool               = &text_pool;
+    source.gdn                     = &gdn;
+    source.gdn_current_slot        = 0;
+    source.gdn_checkpoint_slot     = 1;
+    source.tail_hidden             = &hidden;
+    source.rewrite_checkpoint_hidden = &rewrite;
+    source.ladder_heads            = {rollback, ladder};
+    source.stream                  = ctx.copy_stream;
+    CUDA_CHECK(cudaDeviceSynchronize());
+    q36::detail::KVRamCache cache(16ULL << 20);
+    if (!cache.capture(source)) {
+        text.release();
+        return fail("mixed checkpoint capture failed");
+    }
+
+    const auto prefix4 = text_prompt({1, 2, 3, 4});
+    const auto prefix6 = text_prompt({1, 2, 3, 4, 5, 6});
+    const auto prefix8 = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
+    const auto match4  = cache.plan_match(prefix4, q36::detail::prefix_hash_chain(prefix4));
+    const auto match6  = cache.plan_match(prefix6, q36::detail::prefix_hash_chain(prefix6));
+    const auto match8  = cache.plan_match(prefix8, q36::detail::prefix_hash_chain(prefix8));
+    if (!match4 || match4->reuse != ninfer::PrefixReusePath::RestoreTurnRollback ||
+        match4->reuse_base != 4) {
+        text.release();
+        std::cerr << "mixed image prefix4 did not select RestoreTurnRollback\n";
+        return 1;
+    }
+    if (!match6 || match6->reuse != ninfer::PrefixReusePath::RestoreContextCheckpoint ||
+        match6->reuse_base != 6 || match6->entry_id != match4->entry_id) {
+        text.release();
+        std::cerr << "mixed image prefix6 did not select the longer ladder head on the same entry\n";
+        return 1;
+    }
+    if (!match8 || match8->reuse != ninfer::PrefixReusePath::AppendAtFrontier ||
+        match8->reuse_base != 8 || match8->entry_id != match4->entry_id) {
+        text.release();
+        std::cerr << "fully paged chat did not select AppendAtFrontier at eviction E\n";
+        return 1;
+    }
+    int failures = 0;
+    const q36::detail::RamRestoredHost loaded = cache.load_host(match4->entry_id);
+    if (loaded.ladders.size() != 2 || loaded.ladders[0].hash != rollback.hash ||
+        loaded.ladders[1].hash != ladder.hash) {
+        std::cerr << "RAM ledger hashes for mixed heads do not match prefix_hash_at\n";
+        ++failures;
+    }
+
+    auto text_dest = text_pool.reserve(2);
+    text_dest.materialize_pages(2, ctx.stream);
+    ninfer::DeviceBuffer hidden_out_buf(128);
+    hidden_out_buf.fill(0);
+    ninfer::Tensor hidden_out(hidden_out_buf.p, ninfer::DType::U8, {128});
+    std::vector<unsigned char> conv_wipe(gdn.conv_host_image_bytes(), 0xee);
+    std::vector<unsigned char> rec_wipe(gdn.recurrent_host_image_bytes(), 0xee);
+    auto wipe_dest = [&] {
+        hidden_out_buf.fill(0);
+        gdn.unpack_slot_from_host(2, conv_wipe.data(), rec_wipe.data(), ctx.stream);
+        gdn.unpack_slot_from_host(3, conv_wipe.data(), rec_wipe.data(), ctx.stream);
+        ctx.synchronize_all();
+    };
+    auto packed_slot = [&](std::int32_t slot) {
+        std::vector<unsigned char> conv(gdn.conv_host_image_bytes(), 0);
+        std::vector<unsigned char> rec(gdn.recurrent_host_image_bytes(), 0);
+        gdn.pack_slot_to_host(slot, conv.data(), rec.data(), ctx.copy_stream);
+        ctx.synchronize_all();
+        return std::pair(std::move(conv), std::move(rec));
+    };
+
+    wipe_dest();
+    std::vector<unsigned char> conv_poison(gdn.conv_host_image_bytes(), 0x99);
+    std::vector<unsigned char> rec_poison(gdn.recurrent_host_image_bytes(), 0x99);
+    gdn.unpack_slot_from_host(0, conv_poison.data(), rec_poison.data(), ctx.stream);
+    ctx.synchronize_all();
+    q36::detail::RamRestoreTarget target;
+    target.text                = &text_dest;
+    target.text_pool           = &text_pool;
+    target.text_dst_pages      = ninfer::pages_for_tokens(4);
+    target.gdn                 = &gdn;
+    target.gdn_current_slot    = 2;
+    target.gdn_checkpoint_slot = 3;
+    target.tail_hidden         = &hidden_out;
+    target.reuse               = ninfer::PrefixReusePath::RestoreTurnRollback;
+    target.reuse_base          = 4;
+    target.stream              = ctx.copy_stream;
+    cache.claim(match4->entry_id);
+    (void)cache.unpack_device(match4->entry_id, target);
+    ctx.synchronize_all();
+    auto [conv_now, rec_now] = packed_slot(2);
+    auto [conv_ckpt, rec_ckpt] = packed_slot(3);
+    auto [conv_left, rec_left] = packed_slot(0);
+    if (conv_now != conv_rb || rec_now != rec_rb) {
+        std::cerr << "rollback unpack installed current/rewrite/ladder GDN into current\n";
+        ++failures;
+    }
+    if (conv_left != conv_poison || rec_left != rec_poison) {
+        std::cerr << "rollback unpack clobbered leftover current/2C GDN\n";
+        ++failures;
+    }
+    if (conv_ckpt != conv_rw || rec_ckpt != rec_rw) {
+        std::cerr << "rollback unpack dropped rewrite GDN that sits at F<=E\n";
+        ++failures;
+    }
+    std::vector<unsigned char> hidden_host(128);
+    CUDA_CHECK(cudaMemcpy(hidden_host.data(), hidden_out.data, hidden_host.size(),
+                           cudaMemcpyDeviceToHost));
+    if (hidden_host != hid_rb) {
+        std::cerr << "rollback unpack installed eviction/ladder hidden\n";
+        ++failures;
+    }
+
+    wipe_dest();
+    target.reuse      = ninfer::PrefixReusePath::RestoreContextCheckpoint;
+    target.reuse_base = 6;
+    target.text_dst_pages = ninfer::pages_for_tokens(6);
+    (void)cache.unpack_device(match4->entry_id, target);
+    ctx.synchronize_all();
+    auto [conv_ld_got, rec_ld_got] = packed_slot(2);
+    if (conv_ld_got != conv_ld || rec_ld_got != rec_ld) {
+        std::cerr << "ladder unpack installed current/rollback GDN instead of the F=6 head\n";
+        ++failures;
+    }
+    CUDA_CHECK(cudaMemcpy(hidden_host.data(), hidden_out.data, hidden_host.size(),
+                           cudaMemcpyDeviceToHost));
+    if (hidden_host != hid_ld) {
+        std::cerr << "ladder unpack installed the wrong hidden\n";
+        ++failures;
+    }
+
+    bool kind_mismatch = false;
+    try {
+        target.reuse      = ninfer::PrefixReusePath::RestoreTurnRollback;
+        target.reuse_base = 6;
+        (void)cache.unpack_device(match4->entry_id, target);
+    } catch (const std::logic_error&) { kind_mismatch = true; }
+    if (!kind_mismatch) {
+        std::cerr << "unpack accepted RestoreTurnRollback at a ladder frontier\n";
+        ++failures;
+    }
+
+    wipe_dest();
+    gdn.unpack_slot_from_host(0, conv_poison.data(), rec_poison.data(), ctx.stream);
+    ctx.synchronize_all();
+    target.reuse          = ninfer::PrefixReusePath::AppendAtFrontier;
+    target.reuse_base     = 8;
+    target.text_dst_pages = ninfer::pages_for_tokens(8);
+    (void)cache.unpack_device(match4->entry_id, target);
+    ctx.synchronize_all();
+    auto [conv_e, rec_e]           = packed_slot(2);
+    auto [conv_left_e, rec_left_e] = packed_slot(0);
+    if (conv_e != conv_cur || rec_e != rec_cur) {
+        std::cerr << "AppendAtFrontier unpacked a checkpoint GDN instead of eviction current\n";
+        ++failures;
+    }
+    if (conv_left_e != conv_poison || rec_left_e != rec_poison) {
+        std::cerr << "AppendAtFrontier clobbered leftover current/2C GDN\n";
+        ++failures;
+    }
+    CUDA_CHECK(cudaMemcpy(hidden_host.data(), hidden_out.data, hidden_host.size(),
+                           cudaMemcpyDeviceToHost));
+    std::vector<unsigned char> hid_cur(128, 0xa1);
+    if (hidden_host != hid_cur) {
+        std::cerr << "AppendAtFrontier unpacked a checkpoint hidden instead of eviction hidden\n";
+        ++failures;
+    }
+
+    cache.consume(match4->entry_id);
+    text.release();
+    text_dest.release();
+    return failures;
+}
+
+int test_context_checkpoint_dflash_cyclic_isolation(ninfer::DeviceContext& ctx) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    auto text_plan =
+        plan_paged_cache(4, 4, 2,
+                         {{ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::FP16, 1, 2},
+                          {ninfer::DType::FP16, 1, 2}});
+    ninfer::DeviceArena text_arena(text_plan.bytes);
+    ninfer::PagedKVPool text_pool({text_arena.base(), text_arena.capacity()}, text_plan.layout);
+    ninfer::LayoutBuilder gdn_builder;
+    const auto gdn_layout = ninfer::plan_linear_attention_state_pool(
+        gdn_builder, {.layers         = 2,
+                      .conv_channels  = 8,
+                      .conv_width     = 4,
+                      .value_heads    = 2,
+                      .value_head_dim = 4,
+                      .key_head_dim   = 3,
+                      .slot_count     = 4,
+                      .conv_dtype     = ninfer::DType::BF16});
+    ninfer::DeviceArena gdn_arena(gdn_builder.finish(256));
+    ninfer::LinearAttentionStatePool gdn({gdn_arena.base(), gdn_arena.capacity()}, gdn_layout);
+    ninfer::LayoutBuilder cyclic_builder;
+    const auto cyclic_layout = ninfer::plan_cyclic_kv_cache(cyclic_builder, 2, 16, 2, 8, 2);
+    ninfer::DeviceArena cyclic_arena(cyclic_builder.finish(256));
+    ninfer::CyclicKVCache dflash_local({cyclic_arena.base(), cyclic_arena.capacity()},
+                                       cyclic_layout);
+
+    auto text = text_pool.reserve(2);
+    text.materialize_pages(2, ctx.stream);
+    fill_logical_pages(text_pool, text, 7);
+
+    std::vector<unsigned char> conv_cur(gdn.conv_host_image_bytes(), 0xaa);
+    std::vector<unsigned char> rec_cur(gdn.recurrent_host_image_bytes(), 0xab);
+    std::vector<unsigned char> conv_ld(gdn.conv_host_image_bytes(), 0x51);
+    std::vector<unsigned char> rec_ld(gdn.recurrent_host_image_bytes(), 0x52);
+    std::vector<unsigned char> hid_ld(128, 0x53);
+    gdn.unpack_slot_from_host(0, conv_cur.data(), rec_cur.data(), ctx.stream);
+
+    ninfer::CyclicKVCacheLayerView local_view = dflash_local.layer_view(0);
+    std::vector<unsigned char> k_evict(local_view.k.slice(3, 0, 1).bytes(), 0x3c);
+    std::vector<unsigned char> v_evict(local_view.v.slice(3, 0, 1).bytes(), 0x3d);
+    CUDA_CHECK(cudaMemcpy(local_view.k.slice(3, 0, 1).data, k_evict.data(), k_evict.size(),
+                           cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(local_view.v.slice(3, 0, 1).data, v_evict.data(), v_evict.size(),
+                           cudaMemcpyHostToDevice));
+    std::vector<unsigned char> cyclic_head(dflash_local.lane_host_bytes(), 0xa5);
+
+    ninfer::DeviceBuffer hidden_buf(128);
+    hidden_buf.fill(0xa1);
+    ninfer::Tensor hidden(hidden_buf.p, ninfer::DType::U8, {128});
+
+    const auto prompt = text_prompt({1, 2, 3, 4, 5, 6});
+    q36::PreparedPromptData retained = prompt;
+    retained.token_ids.push_back(0);
+    retained.token_types.push_back(0);
+    const std::size_t tokens = retained.token_ids.size();
+    retained.positions.resize(3 * tokens);
+    for (int axis = 0; axis < 3; ++axis) {
+        for (std::size_t i = 0; i < tokens; ++i) {
+            retained.positions[static_cast<std::size_t>(axis) * tokens + i] =
+                static_cast<std::int32_t>(i);
+        }
+    }
+    q36::detail::ResidentPrefixIdentity identity;
+    identity.assign(retained);
+
+    q36::detail::RamLadderHead ladder;
+    ladder.frontier        = 4;
+    ladder.hash            = q36::detail::prefix_hash_at(retained.token_ids, identity, 4);
+    ladder.kind            = q36::detail::ContextCheckpointKind::Ladder;
+    ladder.conv            = conv_ld.data();
+    ladder.recurrent       = rec_ld.data();
+    ladder.hidden          = hid_ld.data();
+    ladder.dflash          = cyclic_head.data();
+    ladder.conv_bytes      = conv_ld.size();
+    ladder.recurrent_bytes = rec_ld.size();
+    ladder.hidden_bytes    = hid_ld.size();
+    ladder.dflash_bytes    = cyclic_head.size();
+
+    q36::detail::RamCaptureSource source;
+    source.execution_frontier     = static_cast<std::uint32_t>(prompt.token_ids.size());
+    source.ledger_frontier        = static_cast<std::uint32_t>(tokens);
+    source.text_kv_valid          = source.execution_frontier;
+    source.dflash_context_frontier = source.execution_frontier;
+    source.tail_hidden_valid      = true;
+    source.ledger                 = retained.token_ids;
+    source.identity               = &identity;
+    source.hash_f                 = q36::detail::prefix_hash_at(retained.token_ids, identity,
+                                                               source.execution_frontier);
+    source.text                   = &text;
+    source.text_pool              = &text_pool;
+    source.gdn                    = &gdn;
+    source.gdn_current_slot       = 0;
+    source.tail_hidden            = &hidden;
+    source.ladder_heads           = {ladder};
+    source.dflash_local           = &dflash_local;
+    source.dflash_lane            = 0;
+    source.stream                 = ctx.copy_stream;
+    CUDA_CHECK(cudaDeviceSynchronize());
+    q36::detail::KVRamCache cache(16ULL << 20);
+    if (!cache.capture(source)) {
+        text.release();
+        return fail("DFlash cyclic checkpoint capture failed");
+    }
+
+    const auto prefix4 = text_prompt({1, 2, 3, 4});
+    const auto match   = cache.plan_match(prefix4, q36::detail::prefix_hash_chain(prefix4));
+    if (!match || match->reuse != ninfer::PrefixReusePath::RestoreContextCheckpoint ||
+        match->reuse_base != 4) {
+        text.release();
+        return fail("DFlash cyclic checkpoint did not select ladder F=4");
+    }
+
+    auto text_dest = text_pool.reserve(2);
+    text_dest.materialize_pages(2, ctx.stream);
+    ninfer::DeviceBuffer hidden_out_buf(128);
+    hidden_out_buf.fill(0);
+    ninfer::Tensor hidden_out(hidden_out_buf.p, ninfer::DType::U8, {128});
+    std::vector<unsigned char> k_poison(local_view.k.slice(3, 1, 1).bytes(), 0x11);
+    std::vector<unsigned char> v_poison(local_view.v.slice(3, 1, 1).bytes(), 0x12);
+    CUDA_CHECK(cudaMemcpy(dflash_local.layer_view(0).k.slice(3, 1, 1).data, k_poison.data(),
+                           k_poison.size(), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dflash_local.layer_view(0).v.slice(3, 1, 1).data, v_poison.data(),
+                           v_poison.size(), cudaMemcpyHostToDevice));
+    ctx.synchronize_all();
+
+    q36::detail::RamRestoreTarget target;
+    target.text             = &text_dest;
+    target.text_pool        = &text_pool;
+    target.text_dst_pages   = ninfer::pages_for_tokens(4);
+    target.gdn              = &gdn;
+    target.gdn_current_slot = 2;
+    target.tail_hidden      = &hidden_out;
+    target.reuse            = ninfer::PrefixReusePath::RestoreContextCheckpoint;
+    target.reuse_base       = 4;
+    target.dflash_local     = &dflash_local;
+    target.dflash_lane      = 1;
+    target.stream           = ctx.copy_stream;
+    cache.claim(match->entry_id);
+    (void)cache.unpack_device(match->entry_id, target);
+    ctx.synchronize_all();
+
+    int failures = 0;
+    std::vector<unsigned char> restored(dflash_local.lane_host_bytes(), 0);
+    dflash_local.copy_lane_to_host(1, restored.data(), ctx.stream);
+    ctx.synchronize_all();
+    if (restored != cyclic_head) {
+        std::cerr << "staged DFlash restore unpacked eviction cyclic instead of the head\n";
+        ++failures;
+    }
+    std::vector<unsigned char> evict_k(k_evict.size(), 0);
+    CUDA_CHECK(cudaMemcpy(evict_k.data(), dflash_local.layer_view(0).k.slice(3, 0, 1).data,
+                           evict_k.size(), cudaMemcpyDeviceToHost));
+    if (evict_k != k_evict) {
+        std::cerr << "staged DFlash restore clobbered the eviction source lane\n";
+        ++failures;
+    }
+
+    cache.consume(match->entry_id);
+    text.release();
+    text_dest.release();
+    return failures;
+}
+
+int test_same_f_rewrite_beats_ram_rollback(ninfer::DeviceContext& ctx) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    auto text_plan =
+        plan_paged_cache(4, 4, 2,
+                         {{ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::FP16, 1, 2},
+                          {ninfer::DType::FP16, 1, 2}});
+    ninfer::DeviceArena text_arena(text_plan.bytes);
+    ninfer::PagedKVPool text_pool({text_arena.base(), text_arena.capacity()}, text_plan.layout);
+    auto text = text_pool.reserve(2);
+    text.materialize_pages(2, ctx.stream);
+    fill_logical_pages(text_pool, text, 5);
+
+    const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
+    q36::PreparedPromptData retained = prompt;
+    retained.token_ids.push_back(0);
+    retained.token_types.push_back(0);
+    const std::size_t tokens = retained.token_ids.size();
+    retained.positions.resize(3 * tokens);
+    for (int axis = 0; axis < 3; ++axis) {
+        for (std::size_t i = 0; i < tokens; ++i) {
+            retained.positions[static_cast<std::size_t>(axis) * tokens + i] =
+                static_cast<std::int32_t>(i);
+        }
+    }
+    q36::detail::ResidentPrefixIdentity identity;
+    identity.assign(retained);
+
+    std::vector<unsigned char> conv(64, 0x41);
+    std::vector<unsigned char> rec(64, 0x42);
+    std::vector<unsigned char> hid(32, 0x43);
+    q36::detail::RamLadderHead rollback;
+    rollback.frontier        = 4;
+    rollback.hash            = q36::detail::prefix_hash_at(retained.token_ids, identity, 4);
+    rollback.kind            = q36::detail::ContextCheckpointKind::TurnRollback;
+    rollback.conv            = conv.data();
+    rollback.recurrent       = rec.data();
+    rollback.hidden          = hid.data();
+    rollback.conv_bytes      = conv.size();
+    rollback.recurrent_bytes = rec.size();
+    rollback.hidden_bytes    = hid.size();
+
+    q36::detail::RamCaptureSource source;
+    source.execution_frontier = static_cast<std::uint32_t>(prompt.token_ids.size());
+    source.ledger_frontier    = static_cast<std::uint32_t>(tokens);
+    source.text_kv_valid      = source.execution_frontier;
+    source.tail_hidden_valid  = true;
+    source.rewrite_valid      = true;
+    source.rewrite_kind       = q36::RewriteCheckpointKind::TurnClosure;
+    source.rewrite_frontier   = 4;
+    source.hash_c_valid       = true;
+    source.ledger             = retained.token_ids;
+    source.identity           = &identity;
+    source.hash_f             = q36::detail::prefix_hash_at(retained.token_ids, identity,
+                                                            source.execution_frontier);
+    source.hash_c             = q36::detail::prefix_hash_at(retained.token_ids, identity, 4);
+    source.text               = &text;
+    source.text_pool          = &text_pool;
+    source.ladder_heads       = {rollback};
+    source.stream             = ctx.copy_stream;
+    q36::detail::KVRamCache cache(16ULL << 20);
+    if (!cache.capture(source)) {
+        text.release();
+        return fail("same-F rewrite vs rollback capture failed");
+    }
+
+    const auto prefix = text_prompt({1, 2, 3, 4});
+    const auto match  = cache.plan_match(prefix, q36::detail::prefix_hash_chain(prefix));
+    text.release();
+    if (!match || match->reuse != ninfer::PrefixReusePath::RestoreTurnCheckpoint ||
+        match->reuse_base != 4) {
+        std::cerr << "same-F rewrite vs rollback selected "
+                  << (match ? static_cast<int>(match->reuse) : -1) << " base="
+                  << (match ? match->reuse_base : 0)
+                  << ", expected RestoreTurnCheckpoint at 4\n";
+        return 1;
+    }
+    return 0;
+}
+
+int test_rollback_skips_ahead_rewrite_gdn(ninfer::DeviceContext& ctx) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    auto text_plan =
+        plan_paged_cache(4, 4, 2,
+                         {{ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::FP16, 1, 2},
+                          {ninfer::DType::FP16, 1, 2}});
+    ninfer::DeviceArena text_arena(text_plan.bytes);
+    ninfer::PagedKVPool text_pool({text_arena.base(), text_arena.capacity()}, text_plan.layout);
+    ninfer::LayoutBuilder gdn_builder;
+    const auto gdn_layout = ninfer::plan_linear_attention_state_pool(
+        gdn_builder, {.layers         = 3,
+                      .conv_channels  = 8,
+                      .conv_width     = 4,
+                      .value_heads    = 2,
+                      .value_head_dim = 4,
+                      .key_head_dim   = 3,
+                      .slot_count     = 4,
+                      .conv_dtype     = ninfer::DType::BF16});
+    ninfer::DeviceArena gdn_arena(gdn_builder.finish(256));
+    ninfer::LinearAttentionStatePool gdn({gdn_arena.base(), gdn_arena.capacity()}, gdn_layout);
+
+    auto text = text_pool.reserve(2);
+    text.materialize_pages(2, ctx.stream);
+    fill_logical_pages(text_pool, text, 7);
+
+    std::vector<unsigned char> conv_cur(gdn.conv_host_image_bytes(), 0xaa);
+    std::vector<unsigned char> rec_cur(gdn.recurrent_host_image_bytes(), 0xab);
+    std::vector<unsigned char> conv_rw(gdn.conv_host_image_bytes(), 0xbb);
+    std::vector<unsigned char> rec_rw(gdn.recurrent_host_image_bytes(), 0xbc);
+    std::vector<unsigned char> conv_rb(gdn.conv_host_image_bytes(), 0x41);
+    std::vector<unsigned char> rec_rb(gdn.recurrent_host_image_bytes(), 0x42);
+    std::vector<unsigned char> hid_rb(128, 0x43);
+    std::vector<unsigned char> conv_poison(gdn.conv_host_image_bytes(), 0x77);
+    std::vector<unsigned char> rec_poison(gdn.recurrent_host_image_bytes(), 0x77);
+    gdn.unpack_slot_from_host(0, conv_cur.data(), rec_cur.data(), ctx.stream);
+    gdn.unpack_slot_from_host(1, conv_rw.data(), rec_rw.data(), ctx.stream);
+    ninfer::DeviceBuffer hidden_buf(128);
+    hidden_buf.fill(0xa1);
+    ninfer::Tensor hidden(hidden_buf.p, ninfer::DType::U8, {128});
+    ninfer::DeviceBuffer rewrite_buf(128);
+    rewrite_buf.fill(0xa2);
+    ninfer::Tensor rewrite(rewrite_buf.p, ninfer::DType::U8, {128});
+
+    const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
+    q36::PreparedPromptData retained = prompt;
+    retained.token_ids.push_back(0);
+    retained.token_types.push_back(0);
+    const std::size_t tokens = retained.token_ids.size();
+    retained.positions.resize(3 * tokens);
+    for (int axis = 0; axis < 3; ++axis) {
+        for (std::size_t i = 0; i < tokens; ++i) {
+            retained.positions[static_cast<std::size_t>(axis) * tokens + i] =
+                static_cast<std::int32_t>(i);
+        }
+    }
+    q36::detail::ResidentPrefixIdentity identity;
+    identity.assign(retained);
+
+    q36::detail::RamLadderHead rollback;
+    rollback.frontier        = 4;
+    rollback.hash            = q36::detail::prefix_hash_at(retained.token_ids, identity, 4);
+    rollback.kind            = q36::detail::ContextCheckpointKind::TurnRollback;
+    rollback.conv            = conv_rb.data();
+    rollback.recurrent       = rec_rb.data();
+    rollback.hidden          = hid_rb.data();
+    rollback.conv_bytes      = conv_rb.size();
+    rollback.recurrent_bytes = rec_rb.size();
+    rollback.hidden_bytes    = hid_rb.size();
+
+    q36::detail::RamCaptureSource source;
+    source.execution_frontier        = static_cast<std::uint32_t>(prompt.token_ids.size());
+    source.ledger_frontier           = static_cast<std::uint32_t>(tokens);
+    source.text_kv_valid             = source.execution_frontier;
+    source.mtp_kv_valid              = source.execution_frontier;
+    source.tail_hidden_valid         = true;
+    source.rewrite_valid             = true;
+    source.rewrite_kind              = q36::RewriteCheckpointKind::TurnClosure;
+    source.rewrite_frontier          = 8;
+    source.hash_c_valid              = true;
+    source.ledger                    = retained.token_ids;
+    source.identity                  = &identity;
+    source.hash_f                    = q36::detail::prefix_hash_at(retained.token_ids, identity,
+                                                                   source.execution_frontier);
+    source.hash_c                    = q36::detail::prefix_hash_at(retained.token_ids, identity, 8);
+    source.text                      = &text;
+    source.text_pool                 = &text_pool;
+    source.gdn                       = &gdn;
+    source.gdn_current_slot          = 0;
+    source.gdn_checkpoint_slot       = 1;
+    source.tail_hidden               = &hidden;
+    source.rewrite_checkpoint_hidden = &rewrite;
+    source.ladder_heads              = {rollback};
+    source.stream                    = ctx.copy_stream;
+    CUDA_CHECK(cudaDeviceSynchronize());
+    q36::detail::KVRamCache cache(16ULL << 20);
+    if (!cache.capture(source)) {
+        text.release();
+        return fail("rewrite-ahead capture failed");
+    }
+
+    const auto prefix4 = text_prompt({1, 2, 3, 4});
+    const auto match4  = cache.plan_match(prefix4, q36::detail::prefix_hash_chain(prefix4));
+    if (!match4 || match4->reuse != ninfer::PrefixReusePath::RestoreTurnRollback ||
+        match4->reuse_base != 4) {
+        text.release();
+        std::cerr << "rewrite-ahead prefix4 did not select RestoreTurnRollback\n";
+        return 1;
+    }
+
+    auto text_dest = text_pool.reserve(2);
+    text_dest.materialize_pages(2, ctx.stream);
+    ninfer::DeviceBuffer hidden_out_buf(128);
+    hidden_out_buf.fill(0);
+    ninfer::Tensor hidden_out(hidden_out_buf.p, ninfer::DType::U8, {128});
+    gdn.unpack_slot_from_host(2, conv_poison.data(), rec_poison.data(), ctx.stream);
+    gdn.unpack_slot_from_host(3, conv_poison.data(), rec_poison.data(), ctx.stream);
+    ctx.synchronize_all();
+    q36::detail::RamRestoreTarget target;
+    target.text                = &text_dest;
+    target.text_pool           = &text_pool;
+    target.text_dst_pages      = ninfer::pages_for_tokens(4);
+    target.gdn                 = &gdn;
+    target.gdn_current_slot    = 2;
+    target.gdn_checkpoint_slot = 3;
+    target.tail_hidden         = &hidden_out;
+    target.reuse               = ninfer::PrefixReusePath::RestoreTurnRollback;
+    target.reuse_base          = 4;
+    target.stream              = ctx.copy_stream;
+    cache.claim(match4->entry_id);
+    (void)cache.unpack_device(match4->entry_id, target);
+    ctx.synchronize_all();
+
+    auto packed_slot = [&](std::int32_t slot) {
+        std::vector<unsigned char> conv(gdn.conv_host_image_bytes(), 0);
+        std::vector<unsigned char> rec(gdn.recurrent_host_image_bytes(), 0);
+        gdn.pack_slot_to_host(slot, conv.data(), rec.data(), ctx.copy_stream);
+        ctx.synchronize_all();
+        return std::pair(std::move(conv), std::move(rec));
+    };
+    int failures = 0;
+    auto [conv_now, rec_now]   = packed_slot(2);
+    auto [conv_ckpt, rec_ckpt] = packed_slot(3);
+    if (conv_now != conv_rb || rec_now != rec_rb) {
+        std::cerr << "rewrite-ahead rollback unpack missed the head GDN\n";
+        ++failures;
+    }
+    if (conv_ckpt != conv_poison || rec_ckpt != rec_poison) {
+        std::cerr << "rollback unpack installed rewrite GDN that sits ahead of E\n";
+        ++failures;
+    }
+    cache.consume(match4->entry_id);
+    text.release();
+    text_dest.release();
+    return failures;
+}
+
+int test_c2_lane1_rollback_slot_isolation(ninfer::DeviceContext& ctx) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    auto text_plan =
+        plan_paged_cache(4, 4, 2,
+                         {{ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::FP16, 1, 2},
+                          {ninfer::DType::FP16, 1, 2}});
+    ninfer::DeviceArena text_arena(text_plan.bytes);
+    ninfer::PagedKVPool text_pool({text_arena.base(), text_arena.capacity()}, text_plan.layout);
+    ninfer::LayoutBuilder gdn_builder;
+    const auto gdn_layout = ninfer::plan_linear_attention_state_pool(
+        gdn_builder, {.layers         = 3,
+                      .conv_channels  = 8,
+                      .conv_width     = 4,
+                      .value_heads    = 2,
+                      .value_head_dim = 4,
+                      .key_head_dim   = 3,
+                      .slot_count     = 5,
+                      .conv_dtype     = ninfer::DType::BF16});
+    ninfer::DeviceArena gdn_arena(gdn_builder.finish(256));
+    ninfer::LinearAttentionStatePool gdn({gdn_arena.base(), gdn_arena.capacity()}, gdn_layout);
+
+    auto text = text_pool.reserve(2);
+    text.materialize_pages(2, ctx.stream);
+    fill_logical_pages(text_pool, text, 7);
+
+    std::vector<unsigned char> conv_cur(gdn.conv_host_image_bytes(), 0xaa);
+    std::vector<unsigned char> rec_cur(gdn.recurrent_host_image_bytes(), 0xab);
+    std::vector<unsigned char> conv_rw(gdn.conv_host_image_bytes(), 0xbb);
+    std::vector<unsigned char> rec_rw(gdn.recurrent_host_image_bytes(), 0xbc);
+    std::vector<unsigned char> conv_rb(gdn.conv_host_image_bytes(), 0x41);
+    std::vector<unsigned char> rec_rb(gdn.recurrent_host_image_bytes(), 0x42);
+    std::vector<unsigned char> hid_rb(128, 0x43);
+    std::vector<unsigned char> conv_p0(gdn.conv_host_image_bytes(), 0x70);
+    std::vector<unsigned char> rec_p0(gdn.recurrent_host_image_bytes(), 0x70);
+    std::vector<unsigned char> conv_p2(gdn.conv_host_image_bytes(), 0x72);
+    std::vector<unsigned char> rec_p2(gdn.recurrent_host_image_bytes(), 0x72);
+    std::vector<unsigned char> conv_p4(gdn.conv_host_image_bytes(), 0x74);
+    std::vector<unsigned char> rec_p4(gdn.recurrent_host_image_bytes(), 0x74);
+    gdn.unpack_slot_from_host(0, conv_cur.data(), rec_cur.data(), ctx.stream);
+    gdn.unpack_slot_from_host(1, conv_rw.data(), rec_rw.data(), ctx.stream);
+    ninfer::DeviceBuffer hidden_buf(128);
+    hidden_buf.fill(0xa1);
+    ninfer::Tensor hidden(hidden_buf.p, ninfer::DType::U8, {128});
+    ninfer::DeviceBuffer rewrite_buf(128);
+    rewrite_buf.fill(0xa2);
+    ninfer::Tensor rewrite(rewrite_buf.p, ninfer::DType::U8, {128});
+
+    const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
+    q36::PreparedPromptData retained = prompt;
+    retained.token_ids.push_back(0);
+    retained.token_types.push_back(0);
+    const std::size_t tokens = retained.token_ids.size();
+    retained.positions.resize(3 * tokens);
+    for (int axis = 0; axis < 3; ++axis) {
+        for (std::size_t i = 0; i < tokens; ++i) {
+            retained.positions[static_cast<std::size_t>(axis) * tokens + i] =
+                static_cast<std::int32_t>(i);
+        }
+    }
+    q36::detail::ResidentPrefixIdentity identity;
+    identity.assign(retained);
+
+    q36::detail::RamLadderHead rollback;
+    rollback.frontier        = 4;
+    rollback.hash            = q36::detail::prefix_hash_at(retained.token_ids, identity, 4);
+    rollback.kind            = q36::detail::ContextCheckpointKind::TurnRollback;
+    rollback.conv            = conv_rb.data();
+    rollback.recurrent       = rec_rb.data();
+    rollback.hidden          = hid_rb.data();
+    rollback.conv_bytes      = conv_rb.size();
+    rollback.recurrent_bytes = rec_rb.size();
+    rollback.hidden_bytes    = hid_rb.size();
+
+    q36::detail::RamCaptureSource source;
+    source.execution_frontier        = static_cast<std::uint32_t>(prompt.token_ids.size());
+    source.ledger_frontier           = static_cast<std::uint32_t>(tokens);
+    source.text_kv_valid             = source.execution_frontier;
+    source.mtp_kv_valid              = source.execution_frontier;
+    source.tail_hidden_valid         = true;
+    source.rewrite_valid             = true;
+    source.rewrite_kind              = q36::RewriteCheckpointKind::TurnClosure;
+    source.rewrite_frontier          = 2;
+    source.hash_c_valid              = true;
+    source.ledger                    = retained.token_ids;
+    source.identity                  = &identity;
+    source.hash_f                    = q36::detail::prefix_hash_at(retained.token_ids, identity,
+                                                                   source.execution_frontier);
+    source.hash_c                    = q36::detail::prefix_hash_at(retained.token_ids, identity, 2);
+    source.text                      = &text;
+    source.text_pool                 = &text_pool;
+    source.gdn                       = &gdn;
+    source.gdn_current_slot          = 0;
+    source.gdn_checkpoint_slot       = 1;
+    source.tail_hidden               = &hidden;
+    source.rewrite_checkpoint_hidden = &rewrite;
+    source.ladder_heads              = {rollback};
+    source.stream                    = ctx.copy_stream;
+    CUDA_CHECK(cudaDeviceSynchronize());
+    q36::detail::KVRamCache cache(16ULL << 20);
+    if (!cache.capture(source)) {
+        text.release();
+        return fail("C=2 lane-1 capture failed");
+    }
+
+    const auto prefix4 = text_prompt({1, 2, 3, 4});
+    const auto match4  = cache.plan_match(prefix4, q36::detail::prefix_hash_chain(prefix4));
+    if (!match4 || match4->reuse != ninfer::PrefixReusePath::RestoreTurnRollback) {
+        text.release();
+        return fail("C=2 lane-1 capture did not match RestoreTurnRollback");
+    }
+
+    auto text_dest = text_pool.reserve(2);
+    text_dest.materialize_pages(2, ctx.stream);
+    ninfer::DeviceBuffer hidden_out_buf(128);
+    hidden_out_buf.fill(0);
+    ninfer::Tensor hidden_out(hidden_out_buf.p, ninfer::DType::U8, {128});
+    gdn.unpack_slot_from_host(0, conv_p0.data(), rec_p0.data(), ctx.stream);
+    gdn.unpack_slot_from_host(1, conv_p0.data(), rec_p0.data(), ctx.stream);
+    gdn.unpack_slot_from_host(2, conv_p2.data(), rec_p2.data(), ctx.stream);
+    gdn.unpack_slot_from_host(3, conv_p2.data(), rec_p2.data(), ctx.stream);
+    gdn.unpack_slot_from_host(4, conv_p4.data(), rec_p4.data(), ctx.stream);
+    ctx.synchronize_all();
+    q36::detail::RamRestoreTarget target;
+    target.text                = &text_dest;
+    target.text_pool           = &text_pool;
+    target.text_dst_pages      = ninfer::pages_for_tokens(4);
+    target.gdn                 = &gdn;
+    target.gdn_current_slot    = 1;
+    target.gdn_checkpoint_slot = 3;
+    target.tail_hidden         = &hidden_out;
+    target.reuse               = ninfer::PrefixReusePath::RestoreTurnRollback;
+    target.reuse_base          = 4;
+    target.stream              = ctx.copy_stream;
+    cache.claim(match4->entry_id);
+    (void)cache.unpack_device(match4->entry_id, target);
+    ctx.synchronize_all();
+
+    auto packed_slot = [&](std::int32_t slot) {
+        std::vector<unsigned char> conv(gdn.conv_host_image_bytes(), 0);
+        std::vector<unsigned char> rec(gdn.recurrent_host_image_bytes(), 0);
+        gdn.pack_slot_to_host(slot, conv.data(), rec.data(), ctx.copy_stream);
+        ctx.synchronize_all();
+        return std::pair(std::move(conv), std::move(rec));
+    };
+    int failures = 0;
+    auto [conv_l0, rec_l0] = packed_slot(0);
+    auto [conv_l1, rec_l1] = packed_slot(1);
+    auto [conv_r0, rec_r0] = packed_slot(2);
+    auto [conv_r1, rec_r1] = packed_slot(3);
+    auto [conv_st, rec_st] = packed_slot(4);
+    if (conv_l1 != conv_rb || rec_l1 != rec_rb) {
+        std::cerr << "C=2 lane-1 rollback did not land in slot 1\n";
+        ++failures;
+    }
+    if (conv_r1 != conv_rw || rec_r1 != rec_rw) {
+        std::cerr << "C=2 lane-1 rollback dropped rewrite GDN at F<=E from slot C+1\n";
+        ++failures;
+    }
+    if (conv_l0 != conv_p0 || rec_l0 != rec_p0) {
+        std::cerr << "C=2 lane-1 rollback clobbered lane 0 current GDN\n";
+        ++failures;
+    }
+    if (conv_r0 != conv_p2 || rec_r0 != rec_p2) {
+        std::cerr << "C=2 lane-1 rollback clobbered lane 0 rewrite GDN\n";
+        ++failures;
+    }
+    if (conv_st != conv_p4 || rec_st != rec_p4) {
+        std::cerr << "C=2 lane-1 rollback clobbered staging slot 2C\n";
+        ++failures;
+    }
+    cache.consume(match4->entry_id);
+    text.release();
+    text_dest.release();
+    return failures;
+}
+
+int test_rollback_head_gdn_geometry_mismatch(ninfer::DeviceContext& ctx) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    auto text_plan =
+        plan_paged_cache(4, 4, 2,
+                         {{ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::FP16, 1, 2},
+                          {ninfer::DType::FP16, 1, 2}});
+    ninfer::DeviceArena text_arena(text_plan.bytes);
+    ninfer::PagedKVPool text_pool({text_arena.base(), text_arena.capacity()}, text_plan.layout);
+    ninfer::LayoutBuilder gdn_builder;
+    const auto gdn_layout = ninfer::plan_linear_attention_state_pool(
+        gdn_builder, {.layers         = 2,
+                      .conv_channels  = 4,
+                      .conv_width     = 2,
+                      .value_heads    = 2,
+                      .value_head_dim = 2,
+                      .key_head_dim   = 2,
+                      .slot_count     = 4,
+                      .conv_dtype     = ninfer::DType::BF16});
+    ninfer::DeviceArena gdn_arena(gdn_builder.finish(256));
+    ninfer::LinearAttentionStatePool gdn({gdn_arena.base(), gdn_arena.capacity()}, gdn_layout);
+
+    auto text = text_pool.reserve(2);
+    text.materialize_pages(2, ctx.stream);
+    fill_logical_pages(text_pool, text, 5);
+    std::vector<unsigned char> conv_cur(gdn.conv_host_image_bytes(), 0xaa);
+    std::vector<unsigned char> rec_cur(gdn.recurrent_host_image_bytes(), 0xab);
+    gdn.unpack_slot_from_host(0, conv_cur.data(), rec_cur.data(), ctx.stream);
+    ninfer::DeviceBuffer hidden_buf(128);
+    hidden_buf.fill(0xa1);
+    ninfer::Tensor hidden(hidden_buf.p, ninfer::DType::U8, {128});
+
+    const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
+    q36::PreparedPromptData retained = prompt;
+    retained.token_ids.push_back(0);
+    retained.token_types.push_back(0);
+    const std::size_t tokens = retained.token_ids.size();
+    retained.positions.resize(3 * tokens);
+    for (int axis = 0; axis < 3; ++axis) {
+        for (std::size_t i = 0; i < tokens; ++i) {
+            retained.positions[static_cast<std::size_t>(axis) * tokens + i] =
+                static_cast<std::int32_t>(i);
+        }
+    }
+    q36::detail::ResidentPrefixIdentity identity;
+    identity.assign(retained);
+
+    std::vector<unsigned char> conv_short(1, 0x41);
+    std::vector<unsigned char> rec_ok(gdn.recurrent_host_image_bytes(), 0x42);
+    std::vector<unsigned char> hid(128, 0x43);
+    q36::detail::RamLadderHead rollback;
+    rollback.frontier        = 4;
+    rollback.hash            = q36::detail::prefix_hash_at(retained.token_ids, identity, 4);
+    rollback.kind            = q36::detail::ContextCheckpointKind::TurnRollback;
+    rollback.conv            = conv_short.data();
+    rollback.recurrent       = rec_ok.data();
+    rollback.hidden          = hid.data();
+    rollback.conv_bytes      = conv_short.size();
+    rollback.recurrent_bytes = rec_ok.size();
+    rollback.hidden_bytes    = hid.size();
+
+    q36::detail::RamCaptureSource source;
+    source.execution_frontier = static_cast<std::uint32_t>(prompt.token_ids.size());
+    source.ledger_frontier    = static_cast<std::uint32_t>(tokens);
+    source.text_kv_valid      = source.execution_frontier;
+    source.tail_hidden_valid  = true;
+    source.ledger             = retained.token_ids;
+    source.identity           = &identity;
+    source.hash_f             = q36::detail::prefix_hash_at(retained.token_ids, identity,
+                                                            source.execution_frontier);
+    source.text               = &text;
+    source.text_pool          = &text_pool;
+    source.gdn                = &gdn;
+    source.gdn_current_slot   = 0;
+    source.tail_hidden        = &hidden;
+    source.ladder_heads       = {rollback};
+    source.stream             = ctx.copy_stream;
+    CUDA_CHECK(cudaDeviceSynchronize());
+    q36::detail::KVRamCache cache(16ULL << 20);
+    if (!cache.capture(source)) {
+        text.release();
+        return fail("short-head GDN capture failed");
+    }
+
+    const auto prefix4 = text_prompt({1, 2, 3, 4});
+    const auto match4  = cache.plan_match(prefix4, q36::detail::prefix_hash_chain(prefix4));
+    if (!match4) {
+        text.release();
+        return fail("short-head GDN capture did not match");
+    }
+    auto text_dest = text_pool.reserve(2);
+    text_dest.materialize_pages(2, ctx.stream);
+    ninfer::DeviceBuffer hidden_out_buf(128);
+    hidden_out_buf.fill(0);
+    ninfer::Tensor hidden_out(hidden_out_buf.p, ninfer::DType::U8, {128});
+    q36::detail::RamRestoreTarget target;
+    target.text             = &text_dest;
+    target.text_pool        = &text_pool;
+    target.text_dst_pages   = ninfer::pages_for_tokens(4);
+    target.gdn              = &gdn;
+    target.gdn_current_slot = 2;
+    target.tail_hidden      = &hidden_out;
+    target.reuse            = ninfer::PrefixReusePath::RestoreTurnRollback;
+    target.reuse_base       = 4;
+    target.stream           = ctx.copy_stream;
+    cache.claim(match4->entry_id);
+    bool threw = false;
+    try {
+        (void)cache.unpack_device(match4->entry_id, target);
+    } catch (const std::logic_error&) { threw = true; }
+    cache.consume(match4->entry_id);
+    text.release();
+    text_dest.release();
+    if (!threw) {
+        std::cerr << "undersize rollback GDN image did not throw on unpack\n";
+        return 1;
+    }
+    return 0;
+}
+
+int test_context_checkpoint_same_f_fifo_first_wins(ninfer::DeviceContext& ctx) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    auto text_plan =
+        plan_paged_cache(6, 6, 2,
+                         {{ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::I8, 16, 2},
+                          {ninfer::DType::FP16, 1, 2},
+                          {ninfer::DType::FP16, 1, 2}});
+    ninfer::DeviceArena text_arena(text_plan.bytes);
+    ninfer::PagedKVPool text_pool({text_arena.base(), text_arena.capacity()}, text_plan.layout);
+    ninfer::LayoutBuilder gdn_builder;
+    const auto gdn_layout = ninfer::plan_linear_attention_state_pool(
+        gdn_builder, {.layers         = 2,
+                      .conv_channels  = 4,
+                      .conv_width     = 2,
+                      .value_heads    = 2,
+                      .value_head_dim = 2,
+                      .key_head_dim   = 2,
+                      .slot_count     = 4,
+                      .conv_dtype     = ninfer::DType::BF16});
+    ninfer::DeviceArena gdn_arena(gdn_builder.finish(256));
+    ninfer::LinearAttentionStatePool gdn({gdn_arena.base(), gdn_arena.capacity()}, gdn_layout);
+
+    auto text_a = text_pool.reserve(2);
+    auto text_b = text_pool.reserve(2);
+    text_a.materialize_pages(2, ctx.stream);
+    text_b.materialize_pages(2, ctx.stream);
+    fill_logical_pages(text_pool, text_a, 1);
+    fill_logical_pages(text_pool, text_b, 2);
+
+    auto make_retained = []() {
+        auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
+        q36::PreparedPromptData retained = prompt;
+        retained.token_ids.push_back(0);
+        retained.token_types.push_back(0);
+        const std::size_t n = retained.token_ids.size();
+        retained.positions.resize(3 * n);
+        for (int axis = 0; axis < 3; ++axis) {
+            for (std::size_t i = 0; i < n; ++i) {
+                retained.positions[static_cast<std::size_t>(axis) * n + i] =
+                    static_cast<std::int32_t>(i);
+            }
+        }
+        return retained;
+    };
+    q36::PreparedPromptData retained_a = make_retained();
+    q36::PreparedPromptData retained_b = make_retained();
+    q36::detail::ResidentPrefixIdentity identity_a;
+    q36::detail::ResidentPrefixIdentity identity_b;
+    identity_a.assign(retained_a);
+    identity_b.assign(retained_b);
+
+    std::vector<unsigned char> conv_a(gdn.conv_host_image_bytes(), 0xa1);
+    std::vector<unsigned char> rec_a(gdn.recurrent_host_image_bytes(), 0xa2);
+    std::vector<unsigned char> hid_a(32, 0xa3);
+    std::vector<unsigned char> conv_b(gdn.conv_host_image_bytes(), 0xb1);
+    std::vector<unsigned char> rec_b(gdn.recurrent_host_image_bytes(), 0xb2);
+    std::vector<unsigned char> hid_b(32, 0xb3);
+
+    ninfer::DeviceBuffer hidden_a_buf(32);
+    hidden_a_buf.fill(0xa3);
+    ninfer::Tensor hidden_a(hidden_a_buf.p, ninfer::DType::U8, {32});
+    ninfer::DeviceBuffer hidden_b_buf(32);
+    hidden_b_buf.fill(0xb3);
+    ninfer::Tensor hidden_b(hidden_b_buf.p, ninfer::DType::U8, {32});
+
+    const auto capture = [&](q36::PreparedPromptData& retained,
+                             q36::detail::ResidentPrefixIdentity& identity,
+                             ninfer::PagedKVAllocation& text, ninfer::Tensor& hidden,
+                             const std::vector<unsigned char>& conv,
+                             const std::vector<unsigned char>& rec,
+                             const std::vector<unsigned char>& hid) {
+        q36::detail::RamLadderHead head;
+        head.frontier        = 4;
+        head.hash            = q36::detail::prefix_hash_at(retained.token_ids, identity, 4);
+        head.conv            = conv.data();
+        head.recurrent       = rec.data();
+        head.hidden          = hid.data();
+        head.conv_bytes      = conv.size();
+        head.recurrent_bytes = rec.size();
+        head.hidden_bytes    = hid.size();
+        q36::detail::RamCaptureSource source;
+        source.execution_frontier = 8;
+        source.ledger_frontier    = static_cast<std::uint32_t>(retained.token_ids.size());
+        source.text_kv_valid      = 8;
+        source.tail_hidden_valid  = true;
+        source.ledger             = retained.token_ids;
+        source.identity           = &identity;
+        source.hash_f             = q36::detail::prefix_hash_at(retained.token_ids, identity, 8);
+        source.text               = &text;
+        source.text_pool          = &text_pool;
+        source.gdn                = &gdn;
+        source.gdn_current_slot   = 0;
+        source.tail_hidden        = &hidden;
+        source.ladder_heads       = {head};
+        source.stream             = ctx.copy_stream;
+        return source;
+    };
+
+    q36::detail::KVRamCache cache(16ULL << 20);
+    auto source_a = capture(retained_a, identity_a, text_a, hidden_a, conv_a, rec_a, hid_a);
+    if (!cache.capture(source_a)) {
+        text_a.release();
+        text_b.release();
+        return fail("same-F FIFO first capture failed");
+    }
+    auto source_b = capture(retained_b, identity_b, text_b, hidden_b, conv_b, rec_b, hid_b);
+    if (!cache.capture(source_b)) {
+        text_a.release();
+        text_b.release();
+        return fail("same-F FIFO second capture failed");
+    }
+    ctx.synchronize_all();
+
+    const auto prefix = text_prompt({1, 2, 3, 4});
+    const auto match  = cache.plan_match(prefix, q36::detail::prefix_hash_chain(prefix));
+    if (!match || match->reuse != ninfer::PrefixReusePath::RestoreContextCheckpoint ||
+        match->reuse_base != 4) {
+        text_a.release();
+        text_b.release();
+        std::cerr << "same-F FIFO did not match a ladder head at F=4\n";
+        return 1;
+    }
+
+    auto text_dest = text_pool.reserve(2);
+    text_dest.materialize_pages(2, ctx.stream);
+    ninfer::DeviceBuffer hidden_out_buf(32);
+    hidden_out_buf.fill(0);
+    ninfer::Tensor hidden_out(hidden_out_buf.p, ninfer::DType::U8, {32});
+    for (std::uint32_t layer = 0; layer < gdn.layer_count(); ++layer) {
+        CUDA_CHECK(cudaMemset(gdn.conv_slot(layer, 2).data, 0, gdn.conv_slot(layer, 2).bytes()));
+        CUDA_CHECK(
+            cudaMemset(gdn.recurrent_slot(layer, 2).data, 0, gdn.recurrent_slot(layer, 2).bytes()));
+    }
+    q36::detail::RamRestoreTarget target;
+    target.text             = &text_dest;
+    target.text_pool        = &text_pool;
+    target.text_dst_pages   = ninfer::pages_for_tokens(match->reuse_base);
+    target.gdn              = &gdn;
+    target.gdn_current_slot = 2;
+    target.tail_hidden      = &hidden_out;
+    target.reuse            = match->reuse;
+    target.reuse_base       = match->reuse_base;
+    target.stream           = ctx.copy_stream;
+    cache.claim(match->entry_id);
+    (void)cache.unpack_device(match->entry_id, target);
+    ctx.synchronize_all();
+
+    std::vector<unsigned char> conv_packed(gdn.conv_host_image_bytes(), 0);
+    std::vector<unsigned char> rec_packed(gdn.recurrent_host_image_bytes(), 0);
+    gdn.pack_slot_to_host(2, conv_packed.data(), rec_packed.data(), ctx.copy_stream);
+    ctx.synchronize_all();
+    int failures = 0;
+    if (conv_packed != conv_a || rec_packed != rec_a) {
+        std::cerr << "same-F FIFO unpacked the later entry instead of the first\n";
+        ++failures;
+    }
+    std::vector<unsigned char> hidden_host(32);
+    CUDA_CHECK(cudaMemcpy(hidden_host.data(), hidden_out.data, hidden_host.size(),
+                           cudaMemcpyDeviceToHost));
+    if (hidden_host != hid_a) {
+        std::cerr << "same-F FIFO unpacked the later hidden instead of the first\n";
+        ++failures;
+    }
+    cache.consume(match->entry_id);
+    text_a.release();
+    text_b.release();
+    text_dest.release();
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -1982,6 +4327,22 @@ int main() {
     failures += test_destructor_with_inflight_copies(ctx, paged_pool);
     failures += test_spill_drop_keeps_indexed_source(ctx, paged_pool);
     failures += test_full_state_image(ctx);
+    failures += test_context_checkpoint_middle_head(ctx);
+    failures += test_context_checkpoint_two_ram_entries(ctx);
+    failures += test_context_checkpoint_ladder_beats_rewrite(ctx);
+    failures += test_context_checkpoint_equal_execution_is_append(ctx);
+    failures += test_context_checkpoint_hash_mismatch(ctx);
+    failures += test_context_checkpoint_rollback_recapture(ctx);
+    failures += test_context_checkpoint_consume_waits_copies(ctx);
+    failures += test_context_checkpoint_catch_up_frontier(ctx);
+    failures += test_turn_rollback_kind_roundtrip(ctx);
+    failures += test_mixed_checkpoint_gdn_isolation(ctx);
+    failures += test_context_checkpoint_dflash_cyclic_isolation(ctx);
+    failures += test_same_f_rewrite_beats_ram_rollback(ctx);
+    failures += test_rollback_skips_ahead_rewrite_gdn(ctx);
+    failures += test_c2_lane1_rollback_slot_isolation(ctx);
+    failures += test_rollback_head_gdn_geometry_mismatch(ctx);
+    failures += test_context_checkpoint_same_f_fifo_first_wins(ctx);
 
     return failures == 0 ? 0 : fail("kv ram cache core test failed");
 }

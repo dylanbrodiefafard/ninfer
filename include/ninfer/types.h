@@ -414,6 +414,8 @@ enum class PrefixReusePath : std::uint8_t {
     AppendAtFrontier,
     RestoreTurnCheckpoint,
     RestoreResponseCheckpoint,
+    RestoreContextCheckpoint,
+    RestoreTurnRollback,
 };
 
 enum class PrefixReuseSource : std::uint8_t {
@@ -432,6 +434,12 @@ struct GenerationResult {
     std::uint32_t reused_prompt_tokens = 0;
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::FullReset;
     PrefixReuseSource prefix_reuse_source = PrefixReuseSource::None;
+    // Absolute staged-checkpoint head frontiers this request restored or wrote;
+    // 0 if none. restored is the matching ladder or turn-rollback F (the same
+    // length as reused_prompt_tokens on those paths). captured is the advertised
+    // ladder freeze or occupy-append rollback pin written this request.
+    std::uint32_t captured_context_checkpoint_tokens = 0;
+    std::uint32_t restored_context_checkpoint_tokens = 0;
     // CUDA D2H/H2D elapsed for this request's admission spills and RAM restore.
     double kv_ram_save_seconds = 0;
     double kv_ram_load_seconds = 0;

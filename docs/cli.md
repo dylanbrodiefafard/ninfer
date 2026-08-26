@@ -211,14 +211,22 @@ CLI normally leaves the option omitted so it follows
 `--kv-ram-capacity N` is a separate pinned-host budget in MiB for completed prefix bundles. It is
 not a token capacity, does not enlarge the GPU pool, and defaults to `off`. `N` must be a positive
 decimal integer; `0` is rejected. Construction fails if the host pin cannot be allocated.
-Host RAM is an exclusive FIFO: a bundle lives in VRAM or in this budget, not both. Startup still
+Host RAM is an exclusive FIFO: a bundle lives in VRAM or in this budget, not both. One long MTP
+or DFlash bundle with five context-checkpoint heads is about 6 GiB (Main+backend KV plus GDN and
+DFlash cyclic heads); size the
+budget accordingly. `off` still captures live-lane GDN to ordinary pinned buffers so same-lane
+rollback works; other-lane restore after eviction remains a miss. Startup still
 prints capacity plus `used`/`entries`. Serve `[req] done` and throughput lines print live
 host-resident `kv-ram=` used bytes plus `n=` / `restores=` / `evicts=` / `drops=` / `save=` /
 `load=`. `kv-ram=` / `n=` exclude a chat after consume following a restore onto a KV lane; a later
-spill recaptures it as a new FIFO tail. `save=` / `load=` are CUDA D2H/H2D elapsed for that request
-or the throughput interval; `restores=` / `evicts=` / `drops=` are lifetime counters on both lines.
+spill recaptures it as a new FIFO tail. `save=` / `load=` are CUDA event elapsed for that request's
+RAM-tier D2H capture and H2D unpack of the FIFO bundle (Main+backend KV, rewrite GDN, and any ladder
+GDN/cyclic images in the same copy span). They are not admission wait, and they do not include live-lane
+context-checkpoint freeze D2H or a VRAM-resident restore that unpacks already-pinned lane GDN.
+`restores=` / `evicts=` / `drops=` are lifetime counters on both lines.
 CLI `KV RAM events` prints lifetime captures/restores/evicts/drops plus that request's `save=` /
-`load=`. Exact byte values remain on the Engine API and in the JSONL request log; set
+`load=`. The generation summary also prints `prefix reuse path`, `prefix reuse source`, and
+`context checkpoint` (`restored:F` / `captured:F` absolute ladder or turn-rollback head frontiers). Exact byte values remain on the Engine API and in the JSONL request log; set
 `NINFER_KV_RAM_LOG_BYTES=1` to print those same byte counts on the human lines. A new capture may
 still need to reap or evict while logged occupancy looks low, because a just-consumed copy can
 occupy the pin until its CUDA event completes.

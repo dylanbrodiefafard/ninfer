@@ -67,6 +67,7 @@ struct LinearAttentionStatePool {
     [[nodiscard]] std::size_t recurrent_host_image_bytes() const noexcept;
 
     void copy_slot(std::int32_t src, std::int32_t dst, cudaStream_t stream = nullptr);
+    void copy_slot_2d(std::int32_t src, std::int32_t dst, cudaStream_t stream = nullptr);
     void zero_slot(std::int32_t slot, cudaStream_t stream = nullptr);
     void pack_slot_to_host(std::int32_t slot, void* conv_dst, void* recurrent_dst,
                            cudaStream_t stream) const;

@@ -623,6 +623,10 @@ int test_response_serialization() {
     failures += check(resp.at("stop_sequence").is_null(), "stop_sequence null");
     failures += check(resp.at("usage").at("input_tokens") == 7, "input_tokens");
     failures += check(resp.at("usage").at("output_tokens") == 3, "output_tokens");
+    failures += check(resp.at("usage").size() == 2 && !resp.at("usage").contains("ninfer") &&
+                          !resp.at("usage").contains("prompt_tokens_details") &&
+                          !resp.at("usage").contains("context_checkpoint"),
+                      "Anthropic usage stays input/output tokens only");
     const Json& content = resp.at("content");
     failures += check(content.size() == 3, "thinking + text + tool_use blocks");
     failures += check(content.at(0).at("type") == "thinking" &&

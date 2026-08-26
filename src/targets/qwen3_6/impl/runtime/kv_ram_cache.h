@@ -4,6 +4,7 @@
 #include "core/cyclic_kv_cache.h"
 #include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
+#include "targets/qwen3_6/impl/runtime/context_checkpoint.h"
 #include "targets/qwen3_6/impl/runtime/kv_ram_snapshot.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 
@@ -21,6 +22,40 @@
 #include <cuda_runtime_api.h>
 
 namespace ninfer::targets::qwen3_6::detail {
+
+struct RamLadderHead {
+    std::uint32_t frontier = 0;
+    PrefixHash128 hash{};
+    ContextCheckpointKind kind = ContextCheckpointKind::Ladder;
+    const void* conv       = nullptr;
+    const void* recurrent  = nullptr;
+    const void* hidden     = nullptr;
+    const void* dflash     = nullptr;
+    std::size_t conv_bytes      = 0;
+    std::size_t recurrent_bytes = 0;
+    std::size_t hidden_bytes    = 0;
+    std::size_t dflash_bytes    = 0;
+};
+
+struct RamLadderIndex {
+    std::uint32_t frontier = 0;
+    PrefixHash128 hash{};
+    ContextCheckpointKind kind = ContextCheckpointKind::Ladder;
+};
+
+struct RamLadderImage {
+    std::uint32_t frontier = 0;
+    PrefixHash128 hash{};
+    ContextCheckpointKind kind = ContextCheckpointKind::Ladder;
+    const void* conv       = nullptr;
+    const void* recurrent  = nullptr;
+    const void* hidden     = nullptr;
+    const void* dflash     = nullptr;
+    std::size_t conv_bytes      = 0;
+    std::size_t recurrent_bytes = 0;
+    std::size_t hidden_bytes    = 0;
+    std::size_t dflash_bytes    = 0;
+};
 
 struct RamCaptureSource {
     std::uint32_t execution_frontier      = 0;
@@ -52,6 +87,8 @@ struct RamCaptureSource {
     const Tensor* tail_hidden                = nullptr;
     const Tensor* rewrite_checkpoint_hidden  = nullptr;
 
+    std::vector<RamLadderHead> ladder_heads;
+
     const CyclicKVCache* dflash_local      = nullptr;
     const CyclicKVCache* dflash_checkpoint = nullptr;
     std::int32_t dflash_lane               = 0;
@@ -74,6 +111,9 @@ struct RamRestoreTarget {
     Tensor* tail_hidden               = nullptr;
     Tensor* rewrite_checkpoint_hidden = nullptr;
 
+    PrefixReusePath reuse    = PrefixReusePath::FullReset;
+    std::uint32_t reuse_base = 0;
+
     CyclicKVCache* dflash_local      = nullptr;
     CyclicKVCache* dflash_checkpoint = nullptr;
     std::int32_t dflash_lane         = 0;
@@ -95,6 +135,8 @@ struct RamRestoredHost {
     bool backend_image_present            = false;
     std::vector<TokenId> ledger;
     ResidentPrefixIdentity identity;
+    std::vector<RamLadderIndex> ladders;
+    std::vector<RamLadderImage> ladder_images;
 };
 
 struct RamMatch {
@@ -163,6 +205,7 @@ private:
         std::uint32_t checkpoint_frontier = 0;
         bool checkpoint_valid          = false;
         PrefixReusePath checkpoint_path = PrefixReusePath::RestoreTurnCheckpoint;
+        std::vector<RamLadderIndex> ladders;
         void* block                    = nullptr;
         std::size_t bytes              = 0;
         bool pinned                    = false;
