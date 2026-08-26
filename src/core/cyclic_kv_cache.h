@@ -68,8 +68,11 @@ public:
 
     [[nodiscard]] std::size_t lane_host_bytes() const noexcept;
 
-    // Copies one lane's complete fixed state. Source and destination must have identical layouts.
+    // Copies one lane's complete fixed state. The same-lane overload requires identical layouts.
+    // The source/dest-lane overload allows a different lane_capacity (Engine-wide 1-lane staging).
     void copy_lane_from(const CyclicKVCache& source, std::int32_t lane, cudaStream_t stream);
+    void copy_lane_from(const CyclicKVCache& source, std::int32_t source_lane,
+                        std::int32_t dest_lane, cudaStream_t stream);
     void copy_lane_to_host(std::int32_t lane, void* dst, cudaStream_t stream) const;
     void copy_lane_from_host(const void* src, std::int32_t lane, cudaStream_t stream);
 

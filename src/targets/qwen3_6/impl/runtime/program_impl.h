@@ -268,6 +268,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     sampling_config                 = plan.persistent.sampling_config.bind(backing);
     tail_hidden_store               = plan.persistent.tail_hidden.bind(backing);
     rewrite_checkpoint_hidden_store = plan.persistent.rewrite_checkpoint_hidden.bind(backing);
+    if (plan.persistent.staging_hidden) {
+        staging_hidden = plan.persistent.staging_hidden->bind(backing);
+    }
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
         SequenceState& sequence = sequences[lane];
         sequence.lane           = lane;
@@ -325,6 +328,18 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
 }
 
 ProgramImplCore::~ProgramImplCore() noexcept {
+    fence_staging_copies();
+    if (staging_.d2d_done != nullptr) {
+        (void)cudaEventDestroy(staging_.d2d_done);
+        staging_.d2d_done = nullptr;
+    }
+    if (staging_.copies_done != nullptr) {
+        (void)cudaEventDestroy(staging_.copies_done);
+        staging_.copies_done = nullptr;
+    }
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        clear_context_checkpoints(sequences[lane]);
+    }
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
     if (device.copy_stream != nullptr) { (void)cudaStreamSynchronize(device.copy_stream); }
 }
@@ -463,6 +478,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     SequenceState& sequence = sequences[lane];
     RequestControl& request = requests[lane];
+    request.captured_context_checkpoint_tokens = 0;
+    request.restored_context_checkpoint_tokens = 0;
     if (plan.impl_ == nullptr) { throw std::invalid_argument("request plan is empty"); }
     RequestPlanImpl& request_plan = *plan.impl_;
     if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
@@ -502,6 +519,22 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
          sequence.rewrite_checkpoint.frontier != request_plan.reuse_base ||
          request_plan.reuse != restore_path(sequence.rewrite_checkpoint.kind))) {
         throw std::logic_error("planned rewrite checkpoint is unavailable");
+    }
+    if (qwen3_6::detail::is_staged_checkpoint_restore(request_plan.reuse)) {
+        const auto head = std::find_if(
+            sequence.context_checkpoints.begin(), sequence.context_checkpoints.end(),
+            [&](const ContextCheckpointHead& candidate) {
+                return candidate.frontier == request_plan.reuse_base;
+            });
+        const bool want_rollback =
+            request_plan.reuse == ReusePath::RestoreTurnRollback;
+        if (head == sequence.context_checkpoints.end() ||
+            (head->kind == qwen3_6::detail::ContextCheckpointKind::TurnRollback) !=
+                want_rollback ||
+            !qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
+                                             request_plan.reuse_base)) {
+            throw std::logic_error("planned context checkpoint is unavailable");
+        }
     }
     if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::KeepExisting &&
         (!prompt.identity.rewrite_checkpoint || !sequence.rewrite_checkpoint.valid ||
@@ -556,6 +589,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     try {
         if (request_plan.reuse == ReusePath::FullReset) {
             sequence.kv.reset();
+            clear_context_checkpoints(sequence);
             ordered_reset(sequence);
             sequence.ledger.clear();
             sequence.text_kv_valid = 0;
@@ -584,6 +618,9 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                                            request_plan.backend_kv_page_entitlement);
             sequence.text_kv_valid = base;
             sequence.ledger.resize(base);
+            drop_context_checkpoints_after(sequence, base);
+            maybe_capture_turn_rollback(sequence, request, prompt, base, prompt_tokens,
+                                        request_plan.capture_context_checkpoints);
         } else if (is_rewrite_checkpoint_restore(request_plan.reuse)) {
             if (!sequence.kv || sequence.text_kv_valid < base) {
                 throw std::logic_error("resident rewrite checkpoint has no complete KV allocation");
@@ -618,6 +655,42 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 device.stream);
             if (base == prompt_tokens) { copy_tail(sequence, sequence.rewrite_checkpoint_hidden); }
             sequence.ledger.resize(base);
+            drop_context_checkpoints_after(sequence, base);
+        } else if (qwen3_6::detail::is_staged_checkpoint_restore(request_plan.reuse)) {
+            if (!sequence.kv || sequence.text_kv_valid < base) {
+                throw std::logic_error(
+                    "resident context checkpoint has no complete KV allocation");
+            }
+            sequence.text_kv_valid = base;
+            if (speculative_backend == SpeculativeBackend::Mtp) {
+                const std::uint32_t mtp_base = base == 0 ? 0 : base - 1;
+                if (!request_plan.prepare_mtp || sequence.mtp_kv_valid < mtp_base) {
+                    throw std::logic_error(
+                        "context-checkpoint MTP KV is shorter than the bridge frontier");
+                }
+                sequence.mtp_kv_valid = mtp_base;
+            } else if (speculative_backend == SpeculativeBackend::DFlash) {
+                if (!dflash || sequence.dflash_context_frontier < base) {
+                    throw std::logic_error("planned DFlash context checkpoint is unavailable");
+                }
+                if constexpr (DFlashConfig::full_layers > 0) {
+                    if (!sequence.kv->backend) {
+                        throw std::logic_error("planned DFlash context checkpoint is unavailable");
+                    }
+                }
+                sequence.dflash_context_frontier = base;
+            }
+            trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
+            resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
+                                           request_plan.backend_kv_page_entitlement);
+            restore_context_checkpoint_state(sequence, base);
+            if (qwen3_6::detail::occupy_drops_rewrite_ahead_of_restore(
+                    request_plan.reuse, sequence.rewrite_checkpoint.valid,
+                    sequence.rewrite_checkpoint.frontier, base)) {
+                sequence.rewrite_checkpoint = {};
+            }
+            sequence.ledger.resize(base);
+            drop_context_checkpoints_after(sequence, base);
         } else {
             throw std::logic_error("request plan has an invalid prefix reuse path");
         }
@@ -645,6 +718,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         }
         request.timings            = {};
         request.pending            = {};
+        request.restored_context_checkpoint_tokens =
+            qwen3_6::detail::is_staged_checkpoint_restore(request_plan.reuse) ? base : 0;
         sequence.mtp_draft_count   = 0;
         sequence.tail_hidden_valid = base == prompt_tokens && sequence.tail_hidden_valid;
         sequence.ledger.assign(prompt.token_ids.begin(), prompt.token_ids.end());
@@ -687,6 +762,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             .reuse                       = request_plan.reuse,
             .reuse_source                = request_plan.reuse_source,
             .mtp_bridge                  = request_plan.mtp_bridge,
+            .capture_context_checkpoints = request_plan.capture_context_checkpoints,
         };
         request.prefill.emplace(std::move(prefill));
         auto& staged = *request.prefill;
@@ -1034,6 +1110,31 @@ ProgramImplCore::ram_capture_source(const SequenceState& sequence) {
     if (sequence.rewrite_checkpoint.valid) {
         source.rewrite_checkpoint_hidden = &sequence.rewrite_checkpoint_hidden;
     }
+    source.ladder_heads.reserve(sequence.context_checkpoints.size());
+    for (const ContextCheckpointHead& head : sequence.context_checkpoints) {
+        head.wait_copies();
+        RamLadderHead view;
+        view.frontier = head.frontier;
+        view.hash     = head.hash;
+        view.kind     = head.kind;
+        if (head.conv) {
+            view.conv       = head.conv->data();
+            view.conv_bytes = head.conv->size();
+        }
+        if (head.recurrent) {
+            view.recurrent       = head.recurrent->data();
+            view.recurrent_bytes = head.recurrent->size();
+        }
+        if (head.hidden) {
+            view.hidden       = head.hidden->data();
+            view.hidden_bytes = head.hidden->size();
+        }
+        if (head.dflash) {
+            view.dflash       = head.dflash->data();
+            view.dflash_bytes = head.dflash->size();
+        }
+        source.ladder_heads.push_back(view);
+    }
     if (dflash) {
         source.dflash_local = &dflash->local;
         if (sequence.rewrite_checkpoint.valid) {
@@ -1049,6 +1150,358 @@ bool ProgramImplCore::capture_retained_lane(std::uint32_t lane) {
     if (!kv_ram_cache_ || !has_retained_lane(lane)) { return true; }
     device.order_copy_after_compute();
     return kv_ram_cache_->capture(ram_capture_source(sequences[lane]));
+}
+
+void ProgramImplCore::fence_staging_copies() noexcept {
+    if (staging_.d2d_done != nullptr) {
+        (void)cudaEventSynchronize(staging_.d2d_done);
+    }
+    if (staging_.copies_done != nullptr) {
+        (void)cudaEventSynchronize(staging_.copies_done);
+    }
+}
+
+void ProgramImplCore::unoccupy_staging() noexcept {
+    staging_.occupied = false;
+    staging_.lane     = 0;
+    staging_.frontier = 0;
+    staging_.hash     = {};
+    staging_.kind     = qwen3_6::detail::ContextCheckpointKind::Ladder;
+}
+
+void ProgramImplCore::reload_turn_rollback_into_staging(std::uint32_t lane,
+                                                        qwen3_6::detail::PrefixHash128 hash,
+                                                        std::uint32_t frontier) {
+    if (lane >= max_concurrency || staging_hidden.data == nullptr) {
+        unoccupy_staging();
+        return;
+    }
+    SequenceState& owner = sequences[lane];
+    const auto head      = std::find_if(
+        owner.context_checkpoints.begin(), owner.context_checkpoints.end(),
+        [&](const ContextCheckpointHead& candidate) {
+            return candidate.kind == qwen3_6::detail::ContextCheckpointKind::TurnRollback &&
+                   candidate.frontier == frontier && candidate.hash == hash;
+        });
+    if (head == owner.context_checkpoints.end() || !head->conv || !head->recurrent ||
+        !head->hidden) {
+        unoccupy_staging();
+        return;
+    }
+    head->wait_copies();
+    if (staging_.d2d_done != nullptr) {
+        CUDA_CHECK(cudaStreamWaitEvent(device.copy_stream, staging_.d2d_done, 0));
+    }
+    const std::int32_t staging = LinearStateSlots::staging_state_slot(max_concurrency);
+    decoder->linear_attention.unpack_slot_from_host(staging, head->conv->data(),
+                                                    head->recurrent->data(), device.copy_stream);
+    CUDA_CHECK(cudaMemcpyAsync(staging_hidden.data, head->hidden->data(), staging_hidden.bytes(),
+                               cudaMemcpyHostToDevice, device.copy_stream));
+    if (staging_.copies_done == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&staging_.copies_done, cudaEventDisableTiming));
+    }
+    CUDA_CHECK(cudaEventRecord(staging_.copies_done, device.copy_stream));
+    staging_.occupied = true;
+    staging_.lane     = lane;
+    staging_.frontier = frontier;
+    staging_.hash     = hash;
+    staging_.kind     = qwen3_6::detail::ContextCheckpointKind::TurnRollback;
+}
+
+bool ProgramImplCore::staging_holds(std::uint32_t lane, qwen3_6::detail::PrefixHash128 hash,
+                                    std::uint32_t frontier) const noexcept {
+    return qwen3_6::detail::staging_holds_restore_identity(
+        staging_.occupied, staging_.lane, staging_.hash, staging_.frontier, lane, hash, frontier);
+}
+
+void ProgramImplCore::clear_context_checkpoints(SequenceState& sequence) noexcept {
+    sequence.context_checkpoints.clear();
+    sequence.next_context_mark = qwen3_6::detail::kPrefillContextMarks.front();
+}
+
+void ProgramImplCore::drop_context_checkpoints_after(SequenceState& sequence,
+                                                     std::uint32_t frontier) noexcept {
+    auto& heads = sequence.context_checkpoints;
+    heads.erase(std::remove_if(heads.begin(), heads.end(),
+                               [frontier](const ContextCheckpointHead& head) {
+                                   return !qwen3_6::detail::retain_context_checkpoint_head(
+                                       head.frontier, frontier);
+                               }),
+                heads.end());
+    const auto next = qwen3_6::detail::next_prefill_context_mark(frontier);
+    sequence.next_context_mark = next.value_or(0);
+}
+
+void ProgramImplCore::install_ram_context_checkpoints(
+    SequenceState& sequence, const qwen3_6::detail::RamRestoredHost& host) {
+    std::vector<ContextCheckpointHead> heads;
+    heads.reserve(host.ladder_images.size());
+    for (const qwen3_6::detail::RamLadderImage& image : host.ladder_images) {
+        ContextCheckpointHead head;
+        head.frontier = image.frontier;
+        head.hash     = image.hash;
+        head.kind     = image.kind;
+        if (image.conv_bytes != 0) {
+            head.conv.emplace(image.conv_bytes);
+            std::memcpy(head.conv->data(), image.conv, image.conv_bytes);
+        }
+        if (image.recurrent_bytes != 0) {
+            head.recurrent.emplace(image.recurrent_bytes);
+            std::memcpy(head.recurrent->data(), image.recurrent, image.recurrent_bytes);
+        }
+        if (image.hidden_bytes != 0) {
+            head.hidden.emplace(image.hidden_bytes);
+            std::memcpy(head.hidden->data(), image.hidden, image.hidden_bytes);
+        }
+        if (image.dflash_bytes != 0) {
+            head.dflash.emplace(image.dflash_bytes);
+            std::memcpy(head.dflash->data(), image.dflash, image.dflash_bytes);
+        }
+        heads.push_back(std::move(head));
+    }
+    clear_context_checkpoints(sequence);
+    sequence.context_checkpoints = std::move(heads);
+}
+
+bool ProgramImplCore::captures_context_checkpoints() const noexcept {
+    return speculative_backend == SpeculativeBackend::Mtp ||
+           speculative_backend == SpeculativeBackend::DFlash;
+}
+
+void ProgramImplCore::snapshot_dflash_cyclic_to_staging(std::int32_t lane) {
+    if (speculative_backend != SpeculativeBackend::DFlash) { return; }
+    if (!dflash) {
+        throw std::logic_error("context checkpoint DFlash cyclic image is incomplete");
+    }
+    dflash->staging_local.copy_lane_from(dflash->local, lane, 0, device.stream);
+}
+
+void ProgramImplCore::pack_dflash_cyclic_to_head(ContextCheckpointHead& head) {
+    if (speculative_backend != SpeculativeBackend::DFlash) { return; }
+    if (!dflash || !head.dflash) {
+        throw std::logic_error("context checkpoint DFlash cyclic image is incomplete");
+    }
+    dflash->staging_local.copy_lane_to_host(0, head.dflash->data(), device.copy_stream);
+}
+
+void ProgramImplCore::restore_dflash_cyclic_from_head(SequenceState& sequence,
+                                                      const ContextCheckpointHead& head) {
+    if (speculative_backend != SpeculativeBackend::DFlash) { return; }
+    if (!dflash) { throw std::logic_error("context checkpoint restore requires DFlash state"); }
+    head.wait_copies();
+    if (!head.dflash || head.dflash->size() != dflash->local.lane_host_bytes()) {
+        throw std::logic_error("context checkpoint DFlash cyclic image is incomplete");
+    }
+    dflash->local.copy_lane_from_host(head.dflash->data(), static_cast<std::int32_t>(sequence.lane),
+                                      device.stream);
+    sequence.dflash_context_frontier = head.frontier;
+}
+
+void ProgramImplCore::restore_context_checkpoint_state(SequenceState& sequence,
+                                                       std::uint32_t base) {
+    const auto head = std::find_if(
+        sequence.context_checkpoints.begin(), sequence.context_checkpoints.end(),
+        [base](const ContextCheckpointHead& candidate) { return candidate.frontier == base; });
+    if (head == sequence.context_checkpoints.end()) {
+        throw std::logic_error("context checkpoint head is missing at restore");
+    }
+    const std::int32_t current =
+        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
+    if (qwen3_6::detail::restore_may_d2d_staging(
+            staging_holds(sequence.lane, head->hash, base),
+            static_cast<bool>(head->conv) && static_cast<bool>(head->recurrent)) &&
+        staging_.kind == head->kind && staging_hidden.data != nullptr) {
+        if (staging_.copies_done != nullptr) {
+            CUDA_CHECK(cudaStreamWaitEvent(device.stream, staging_.copies_done, 0));
+        }
+        decoder->linear_attention.copy_slot_2d(
+            LinearStateSlots::staging_state_slot(max_concurrency), current, device.stream);
+        copy_tail(sequence, staging_hidden);
+        restore_dflash_cyclic_from_head(sequence, *head);
+        return;
+    }
+    head->wait_copies();
+    if (!head->conv || !head->recurrent) {
+        throw std::logic_error("context checkpoint GDN image is incomplete");
+    }
+    decoder->linear_attention.unpack_slot_from_host(current, head->conv->data(),
+                                                    head->recurrent->data(), device.stream);
+    if (head->hidden) {
+        CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, head->hidden->data(),
+                                   sequence.tail_hidden.bytes(), cudaMemcpyHostToDevice,
+                                   device.stream));
+        sequence.tail_hidden_valid = true;
+    }
+    restore_dflash_cyclic_from_head(sequence, *head);
+}
+
+void ProgramImplCore::maybe_capture_turn_rollback(SequenceState& sequence, RequestControl& request,
+                                                  const PreparedPromptData& prompt,
+                                                  std::uint32_t base, std::uint32_t prompt_tokens,
+                                                  bool capture_enabled) {
+    const bool enabled = capture_enabled && captures_context_checkpoints() &&
+                         staging_hidden.data != nullptr;
+    const bool already =
+        std::any_of(sequence.context_checkpoints.begin(), sequence.context_checkpoints.end(),
+                    [base](const ContextCheckpointHead& head) { return head.frontier == base; });
+    if (!qwen3_6::detail::should_capture_turn_rollback(
+            ReusePath::AppendAtFrontier, base, prompt_tokens, enabled, sequence.tail_hidden_valid,
+            already,
+            qwen3_6::detail::prefix_items_complete_at(prompt.vision_items, base))) {
+        return;
+    }
+    if (sequence.ledger.size() < base || sequence.tail_hidden.data == nullptr) { return; }
+
+    const qwen3_6::detail::PrefixHash128 hash =
+        qwen3_6::detail::prefix_hash_at(sequence.ledger, sequence.prefix_identity, base);
+    ContextCheckpointHead head;
+    head.frontier = base;
+    head.hash     = hash;
+    head.kind     = qwen3_6::detail::ContextCheckpointKind::TurnRollback;
+    try {
+        head.conv.emplace(decoder->linear_attention.conv_host_image_bytes());
+        head.recurrent.emplace(decoder->linear_attention.recurrent_host_image_bytes());
+        head.hidden.emplace(staging_hidden.bytes());
+        if (dflash) { head.dflash.emplace(dflash->local.lane_host_bytes()); }
+    } catch (...) {
+        return;
+    }
+
+    auto& heads = sequence.context_checkpoints;
+    heads.erase(std::remove_if(heads.begin(), heads.end(),
+                               [](const ContextCheckpointHead& existing) {
+                                   return existing.kind ==
+                                          qwen3_6::detail::ContextCheckpointKind::TurnRollback;
+                               }),
+                heads.end());
+
+    fence_staging_copies();
+    unoccupy_staging();
+    const std::int32_t current =
+        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
+    const std::int32_t staging = LinearStateSlots::staging_state_slot(max_concurrency);
+    decoder->linear_attention.copy_slot_2d(current, staging, device.stream);
+    CUDA_CHECK(cudaMemcpyAsync(staging_hidden.data, sequence.tail_hidden.data,
+                               staging_hidden.bytes(), cudaMemcpyDeviceToDevice, device.stream));
+    snapshot_dflash_cyclic_to_staging(static_cast<std::int32_t>(sequence.lane));
+    if (staging_.d2d_done == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&staging_.d2d_done, cudaEventDisableTiming));
+    }
+    CUDA_CHECK(cudaEventRecord(staging_.d2d_done, device.stream));
+    staging_.occupied = true;
+    staging_.lane     = sequence.lane;
+    staging_.frontier = base;
+    staging_.hash     = hash;
+    staging_.kind     = qwen3_6::detail::ContextCheckpointKind::TurnRollback;
+    CUDA_CHECK(cudaEventCreateWithFlags(&head.copies_done, cudaEventDisableTiming));
+    CUDA_CHECK(cudaStreamWaitEvent(device.copy_stream, staging_.d2d_done, 0));
+    decoder->linear_attention.pack_slot_to_host(staging, head.conv->data(), head.recurrent->data(),
+                                                device.copy_stream);
+    CUDA_CHECK(cudaMemcpyAsync(head.hidden->data(), staging_hidden.data, staging_hidden.bytes(),
+                               cudaMemcpyDeviceToHost, device.copy_stream));
+    pack_dflash_cyclic_to_head(head);
+    CUDA_CHECK(cudaEventRecord(head.copies_done, device.copy_stream));
+    if (staging_.copies_done == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&staging_.copies_done, cudaEventDisableTiming));
+    }
+    CUDA_CHECK(cudaEventRecord(staging_.copies_done, device.copy_stream));
+    heads.push_back(std::move(head));
+    request.captured_context_checkpoint_tokens = base;
+}
+
+void ProgramImplCore::maybe_freeze_context_checkpoint(SequenceState& sequence,
+                                                      RequestControl& request,
+                                                      std::uint32_t chunk_tokens) {
+    if (!request.prefill) { return; }
+    RequestControl::Prefill& staged = *request.prefill;
+    const std::uint32_t frontier    = staged.cursor;
+    const bool capture_enabled =
+        staged.capture_context_checkpoints && captures_context_checkpoints() &&
+        staging_hidden.data != nullptr && chunk_tokens != 0;
+    const bool already =
+        std::any_of(sequence.context_checkpoints.begin(), sequence.context_checkpoints.end(),
+                    [frontier](const ContextCheckpointHead& head) {
+                        return head.frontier == frontier;
+                    });
+    if (!qwen3_6::detail::should_freeze_prefill_context_checkpoint(
+            true, capture_enabled, frontier, sequence.next_context_mark, already,
+            qwen3_6::detail::prefix_items_complete_at(staged.prompt.vision_items, frontier))) {
+        return;
+    }
+    if (sequence.ledger.size() < frontier) { return; }
+
+    const qwen3_6::detail::PrefixHash128 hash = qwen3_6::detail::prefix_hash_at(
+        sequence.ledger, sequence.prefix_identity, frontier);
+    ContextCheckpointHead head;
+    head.frontier = qwen3_6::detail::advertised_context_checkpoint_frontier(frontier);
+    head.hash     = hash;
+    head.kind     = qwen3_6::detail::ContextCheckpointKind::Ladder;
+    try {
+        head.conv.emplace(decoder->linear_attention.conv_host_image_bytes());
+        head.recurrent.emplace(decoder->linear_attention.recurrent_host_image_bytes());
+        head.hidden.emplace(staging_hidden.bytes());
+        if (dflash) { head.dflash.emplace(dflash->local.lane_host_bytes()); }
+    } catch (...) {
+        return;
+    }
+
+    fence_staging_copies();
+    const bool reload_rollback =
+        staging_.occupied &&
+        staging_.kind == qwen3_6::detail::ContextCheckpointKind::TurnRollback;
+    const std::uint32_t saved_lane     = staging_.lane;
+    const std::uint32_t saved_frontier = staging_.frontier;
+    const qwen3_6::detail::PrefixHash128 saved_hash = staging_.hash;
+    if (reload_rollback && saved_lane < max_concurrency) {
+        for (const ContextCheckpointHead& existing : sequences[saved_lane].context_checkpoints) {
+            if (existing.kind == qwen3_6::detail::ContextCheckpointKind::TurnRollback &&
+                existing.frontier == saved_frontier && existing.hash == saved_hash) {
+                existing.wait_copies();
+                break;
+            }
+        }
+    }
+    unoccupy_staging();
+
+    const std::int32_t current =
+        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
+    const std::int32_t staging = LinearStateSlots::staging_state_slot(max_concurrency);
+    decoder->linear_attention.copy_slot_2d(current, staging, device.stream);
+    const Tensor last_hidden =
+        prefill_hidden.slice(1, static_cast<std::int32_t>(chunk_tokens) - 1, 1);
+    CUDA_CHECK(cudaMemcpyAsync(staging_hidden.data, last_hidden.data, staging_hidden.bytes(),
+                               cudaMemcpyDeviceToDevice, device.stream));
+    snapshot_dflash_cyclic_to_staging(static_cast<std::int32_t>(sequence.lane));
+    if (staging_.d2d_done == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&staging_.d2d_done, cudaEventDisableTiming));
+    }
+    CUDA_CHECK(cudaEventRecord(staging_.d2d_done, device.stream));
+    if (!reload_rollback) {
+        staging_.occupied = true;
+        staging_.lane     = sequence.lane;
+        staging_.frontier = head.frontier;
+        staging_.hash     = hash;
+        staging_.kind     = qwen3_6::detail::ContextCheckpointKind::Ladder;
+    }
+    CUDA_CHECK(cudaEventCreateWithFlags(&head.copies_done, cudaEventDisableTiming));
+    CUDA_CHECK(cudaStreamWaitEvent(device.copy_stream, staging_.d2d_done, 0));
+    decoder->linear_attention.pack_slot_to_host(staging, head.conv->data(), head.recurrent->data(),
+                                                device.copy_stream);
+    CUDA_CHECK(cudaMemcpyAsync(head.hidden->data(), staging_hidden.data, staging_hidden.bytes(),
+                               cudaMemcpyDeviceToHost, device.copy_stream));
+    pack_dflash_cyclic_to_head(head);
+    CUDA_CHECK(cudaEventRecord(head.copies_done, device.copy_stream));
+    if (staging_.copies_done == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&staging_.copies_done, cudaEventDisableTiming));
+    }
+    CUDA_CHECK(cudaEventRecord(staging_.copies_done, device.copy_stream));
+    sequence.context_checkpoints.push_back(std::move(head));
+    request.captured_context_checkpoint_tokens = sequence.context_checkpoints.back().frontier;
+    sequence.next_context_mark =
+        qwen3_6::detail::next_prefill_context_mark(frontier).value_or(0);
+    if (reload_rollback) {
+        reload_turn_rollback_into_staging(saved_lane, saved_hash, saved_frontier);
+    }
 }
 
 void ProgramImplCore::restore_ram_entry(std::uint32_t lane, std::uint64_t entry_id,
@@ -1108,6 +1561,8 @@ void ProgramImplCore::restore_ram_entry(std::uint32_t lane, std::uint64_t entry_
             LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency);
         target.tail_hidden               = &sequence.tail_hidden;
         target.rewrite_checkpoint_hidden = &sequence.rewrite_checkpoint_hidden;
+        target.reuse                     = request_plan.reuse;
+        target.reuse_base                = request_plan.reuse_base;
         if (dflash) {
             target.dflash_local      = &dflash->local;
             target.dflash_checkpoint = &dflash->rewrite_checkpoint_local;
@@ -1132,6 +1587,18 @@ void ProgramImplCore::restore_ram_entry(std::uint32_t lane, std::uint64_t entry_
         sequence.prefix_identity = std::move(host.identity);
         sequence.mtp_draft_count = 0;
         sequence.retained        = true;
+        install_ram_context_checkpoints(sequence, host);
+        if (qwen3_6::detail::is_staged_checkpoint_restore(request_plan.reuse)) {
+            sequence.tail_hidden_valid = true;
+            if (speculative_backend == SpeculativeBackend::DFlash) {
+                sequence.dflash_context_frontier = request_plan.reuse_base;
+            }
+            if (qwen3_6::detail::occupy_drops_rewrite_ahead_of_restore(
+                    request_plan.reuse, sequence.rewrite_checkpoint.valid,
+                    sequence.rewrite_checkpoint.frontier, request_plan.reuse_base)) {
+                sequence.rewrite_checkpoint = {};
+            }
+        }
     } catch (...) {
         try {
             device.synchronize_all();
@@ -1191,7 +1658,18 @@ SpeculativeStats ProgramImplCore::speculative_stats_lane(std::uint32_t lane) con
     return lane < max_concurrency ? requests[lane].speculative_stats : SpeculativeStats{};
 }
 
+std::uint32_t
+ProgramImplCore::captured_context_checkpoint_tokens_lane(std::uint32_t lane) const noexcept {
+    return lane < max_concurrency ? requests[lane].captured_context_checkpoint_tokens : 0;
+}
+
+std::uint32_t
+ProgramImplCore::restored_context_checkpoint_tokens_lane(std::uint32_t lane) const noexcept {
+    return lane < max_concurrency ? requests[lane].restored_context_checkpoint_tokens : 0;
+}
+
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
+    if (staging_.occupied && staging_.lane == sequence.lane) { unoccupy_staging(); }
     request.prefill.reset();
     sequence.kv.reset();
     request.lifecycle           = Lifecycle::Empty;
@@ -1207,6 +1685,8 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.retained                = false;
     sequence.use_tick                = 0;
     sequence.rewrite_checkpoint      = {};
+    sequence.next_context_mark       = qwen3_6::detail::kPrefillContextMarks.front();
+    clear_context_checkpoints(sequence);
     request.pending                  = {};
 }
 
@@ -1928,9 +2408,10 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 throw std::logic_error("staged MTP bridge is outside the reusable suffix");
             }
             mark_workspace_usage(workspace_plan.mtp_prefill);
-            const Tensor& previous_hidden = is_rewrite_checkpoint_restore(staged.reuse)
-                                                ? sequence.rewrite_checkpoint_hidden
-                                                : sequence.tail_hidden;
+            const Tensor& previous_hidden =
+                qwen3_6::detail::mtp_bridge_reads_rewrite_hidden(staged.reuse)
+                    ? sequence.rewrite_checkpoint_hidden
+                    : sequence.tail_hidden;
             const schedule::MtpBridgeInput bridge{
                 .previous_hidden = &previous_hidden,
                 .position        = checked_i32(staged.base - 1, "MTP bridge position"),
@@ -1988,6 +2469,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (speculative_backend == SpeculativeBackend::DFlash) {
                 sequence.dflash_context_frontier = staged.cursor;
             }
+            maybe_freeze_context_checkpoint(sequence, request, result.processed_tokens);
 
             if (!result.finalized) {
                 if (staged.cursor == staged.prompt_tokens) {

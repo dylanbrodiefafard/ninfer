@@ -1,4 +1,5 @@
 #include "options.h"
+#include "product/context_checkpoint_format.h"
 #include "product/load_progress/load_progress.h"
 #include "product/prompt_input/prompt_input.h"
 
@@ -133,6 +134,42 @@ std::string format_kv_capacity_mode(ninfer::KvCapacityMode mode) {
     return mode == ninfer::KvCapacityMode::Automatic ? "auto" : "explicit";
 }
 
+std::string format_prefix_reuse_path(ninfer::PrefixReusePath path) {
+    switch (path) {
+    case ninfer::PrefixReusePath::FullReset:
+        return "full_reset";
+    case ninfer::PrefixReusePath::AppendAtFrontier:
+        return "append_frontier";
+    case ninfer::PrefixReusePath::RestoreTurnCheckpoint:
+        return "restore_turn_checkpoint";
+    case ninfer::PrefixReusePath::RestoreResponseCheckpoint:
+        return "restore_response_checkpoint";
+    case ninfer::PrefixReusePath::RestoreContextCheckpoint:
+        return "restore_context_checkpoint";
+    case ninfer::PrefixReusePath::RestoreTurnRollback:
+        return "restore_turn_rollback";
+    }
+    return "unknown";
+}
+
+std::string format_prefix_reuse_source(ninfer::PrefixReuseSource source) {
+    switch (source) {
+    case ninfer::PrefixReuseSource::None:
+        return "none";
+    case ninfer::PrefixReuseSource::VramResident:
+        return "vram_resident";
+    case ninfer::PrefixReuseSource::HostRam:
+        return "host_ram";
+    }
+    return "unknown";
+}
+
+std::string format_context_checkpoint(const ninfer::GenerationResult& result) {
+    return ninfer::product::format_context_checkpoint_frontiers(
+        result.restored_context_checkpoint_tokens, result.captured_context_checkpoint_tokens, ' ',
+        "none");
+}
+
 void print_stage(std::string_view group, std::string_view detail, double seconds) {
     std::cerr << std::left << std::setw(12) << group << std::setw(26) << detail << std::right
               << std::setw(12) << format_seconds(seconds) << '\n';
@@ -202,6 +239,9 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("finish reason", format_finish(result.finish_reason));
     print_metric("prompt tokens", std::to_string(result.prompt.prompt_tokens));
     print_metric("reused prompt tokens", std::to_string(result.reused_prompt_tokens));
+    print_metric("prefix reuse path", format_prefix_reuse_path(result.prefix_reuse_path));
+    print_metric("prefix reuse source", format_prefix_reuse_source(result.prefix_reuse_source));
+    print_metric("context checkpoint", format_context_checkpoint(result));
     print_metric("generated tokens", std::to_string(generated));
     print_metric("model elapsed", format_seconds(model_seconds));
     print_metric("prefill speed", format_rate(static_cast<double>(result.prompt.prompt_tokens),

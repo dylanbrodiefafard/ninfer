@@ -291,6 +291,18 @@ SpeculativeStats Program<Variant>::speculative_stats_lane(std::uint32_t lane) co
 }
 
 template <>
+std::uint32_t
+Program<Variant>::captured_context_checkpoint_tokens_lane(std::uint32_t lane) const noexcept {
+    return impl_->captured_context_checkpoint_tokens_lane(lane);
+}
+
+template <>
+std::uint32_t
+Program<Variant>::restored_context_checkpoint_tokens_lane(std::uint32_t lane) const noexcept {
+    return impl_->restored_context_checkpoint_tokens_lane(lane);
+}
+
+template <>
 MemorySummary Program<Variant>::memory_summary() const noexcept {
     return impl_->memory_summary();
 }

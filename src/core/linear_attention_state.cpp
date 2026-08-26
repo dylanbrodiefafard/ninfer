@@ -211,6 +211,13 @@ void LinearAttentionStatePool::copy_slot(std::int32_t src, std::int32_t dst, cud
     }
 }
 
+void LinearAttentionStatePool::copy_slot_2d(std::int32_t src, std::int32_t dst,
+                                            cudaStream_t stream) {
+    // cudaMemcpy2D D2D treats height*pitch as the bounding box, which includes
+    // the sibling slot in the same layer tensor, so in-pool src/dst overlap.
+    copy_slot(src, dst, stream);
+}
+
 void LinearAttentionStatePool::zero_slot(std::int32_t slot, cudaStream_t stream) {
     validate_layer_slot(*this, 0, slot, "LinearAttentionStatePool zero_slot");
     for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {

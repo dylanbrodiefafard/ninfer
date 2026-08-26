@@ -8,6 +8,7 @@ DFlashPersistentState::DFlashPersistentState(DeviceSpan backing,
                                              const DFlashPersistentLayout& layout)
     : local(backing, layout.local),
       rewrite_checkpoint_local(backing, layout.rewrite_checkpoint_local),
+      staging_local(backing, layout.staging_local),
       prefill_features(layout.prefill_features.bind(backing)),
       prefill_positions(layout.prefill_positions.bind(backing)),
       pending_features(layout.pending_features.bind(backing)) {
@@ -15,13 +16,18 @@ DFlashPersistentState::DFlashPersistentState(DeviceSpan backing,
     const bool local_ok =
         local.layer_count() == DFlashConfig::local_layers &&
         rewrite_checkpoint_local.layer_count() == DFlashConfig::local_layers &&
+        staging_local.layer_count() == DFlashConfig::local_layers &&
         local.capacity() == DFlashConfig::local_capacity &&
         rewrite_checkpoint_local.capacity() == DFlashConfig::local_capacity &&
+        staging_local.capacity() == DFlashConfig::local_capacity &&
         local.num_kv_heads() == DFlashConfig::kv_heads &&
         rewrite_checkpoint_local.num_kv_heads() == DFlashConfig::kv_heads &&
+        staging_local.num_kv_heads() == DFlashConfig::kv_heads &&
         local.head_dim() == DFlashConfig::head_dim &&
         rewrite_checkpoint_local.head_dim() == DFlashConfig::head_dim &&
-        local.lane_capacity() == rewrite_checkpoint_local.lane_capacity();
+        staging_local.head_dim() == DFlashConfig::head_dim &&
+        local.lane_capacity() == rewrite_checkpoint_local.lane_capacity() &&
+        staging_local.lane_capacity() == 1;
     if (!local_ok) {
         throw std::invalid_argument("DFlash persistent cache layout is invalid");
     }

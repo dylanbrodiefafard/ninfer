@@ -329,9 +329,13 @@ on = plain_rmsnorm(o, gdn_norm) * SiLU(z)  # [32,128,T]
 y  = out_projection(on)                    # [2048,T]
 ```
 
-For `C=max_concurrency`, the Program reserves exactly `2C` complete all-layer GDN state slots:
+For `C=max_concurrency`, the Program reserves `2C` complete all-layer GDN state slots when speculation
+is off, and `2C+1` when MTP or DFlash is on:
 `[0,C)` holds each lane's current convolution/recurrent state and `[C,2C)` holds its turn
-checkpoint. Prefill may use a parallel chunked delta-rule algorithm and decode a recurrent
+checkpoint. MTP or DFlash adds Engine-wide slot `2C` (hot turn-rollback occupant, borrowed by
+prefill context-checkpoint freeze) and a separate `[2048,1]` staging hidden; DFlash checkpoint
+heads snapshot cyclic through a 1-lane Engine-wide staging window so suffix prefill can mutate live
+local. Prefill may use a parallel chunked delta-rule algorithm and decode a recurrent
 algorithm. MTP/DFlash verification leaves these slots unchanged and writes a separate
 Program-owned ReplaySSM arena; one all-layer Fold later applies the committed record prefix to the
 current slot. Prefix reuse copies or restores the dedicated turn checkpoint and never creates a
@@ -775,12 +779,12 @@ The Program-owned memory classes are:
 |---|---|---:|---|
 | Text GQA K and V | 10 layers × context × 2 heads × 256 × 2 planes | 5.0 GiB BF16 | active sequence |
 | MTP K and V | 1 layer × context × 2 heads × 256 × 2 planes | 0.5 GiB BF16 | active sequence when MTP enabled |
-| DFlash current and turn-checkpoint local K/V | 2 copies × 5 layers × 4096 positions × 8 heads × 128 × 2 planes × `C` lanes | about 160 MiB × `C` BF16 | Program lifetime when DFlash enabled |
+| DFlash current and turn-checkpoint local K/V | 2 copies × 5 layers × 4096 positions × 8 heads × 128 × 2 planes × `C` lanes, plus one 1-lane checkpoint staging window | about 160 MiB × `C` BF16 plus 80 MiB staging | Program lifetime when DFlash enabled |
 | DFlash full context K and V | 1 layer × context × 8 heads × 128 × 2 planes | 1.0 GiB BF16 | active sequence when DFlash enabled |
-| GDN convolution history | 30 layers × 8192 channels × 3 columns × `2C` | 1.406 MiB × `2C` BF16 | Program lifetime; current and turn-checkpoint slots |
-| GDN recurrent matrices | 30 layers × 32 heads × 128 × 128 × `2C` | 60 MiB × `2C` FP32 | Program lifetime; current and turn-checkpoint slots |
+| GDN convolution history | 30 layers × 8192 channels × 3 columns × `2C`, plus one staging slot when MTP or DFlash is on | 1.406 MiB × `2C` BF16 | Program lifetime; current, turn-checkpoint, and checkpoint staging slots |
+| GDN recurrent matrices | 30 layers × 32 heads × 128 × 128 × `2C`, plus one staging slot when MTP or DFlash is on | 60 MiB × `2C` FP32 | Program lifetime; current, turn-checkpoint, and checkpoint staging slots |
 | ReplaySSM records | 30 layers × `C` rows × `draft_window+1` convolution/key/value/gate columns | backend/window dependent | Program lifetime with MTP or DFlash; one pending round |
-| Continuation hidden | current and turn-checkpoint `[2048,C]` BF16 stores | 8 KiB × `C` BF16 | Program lifetime |
+| Continuation hidden | current and turn-checkpoint `[2048,C]` BF16 stores; MTP/DFlash staging `[2048,1]` | 8 KiB × `C` BF16 | Program lifetime |
 | DFlash prefill target features/positions | `[16384,P]` BF16 plus `[P]` I32 | about 32 KiB × `P` | Program lifetime; one prefill unit |
 | DFlash pending target features | `[16384,draft_window+1,C]` BF16 | window dependent | Program lifetime; one pending round |
 | multimodal continuation | `rope_delta` and logical positions | negligible | active sequence |
@@ -790,7 +794,8 @@ The Program-owned memory classes are:
 
 Payload estimates exclude allocator alignment and paging metadata; the table separately identifies
 Program scratch and request transient because they are independently frozen allocations.
-The GDN pool always contains exactly the `2C` current/turn-checkpoint slots and is independent of
+The GDN pool contains the `2C` current/turn-checkpoint slots and, when MTP or DFlash is on, one staging slot.
+It is independent of
 the speculative window. Enabling MTP or DFlash adds the separate ReplaySSM arena, which scales with
 `C*(draft_window+1)` rather than full state images. Target full-attention KV, MTP KV, and the final
 DFlash layer's context KV grow with configured context; GDN state and the first five DFlash context

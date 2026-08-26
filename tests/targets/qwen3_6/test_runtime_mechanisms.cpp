@@ -5,11 +5,20 @@
 #include <ninfer/targets/qwen3_6/round_state.h>
 #include <ninfer/targets/qwen3_6/vision_control.h>
 
+#include "targets/qwen3_6/impl/runtime/context_checkpoint.h"
+#define NINFER_QWEN36_RUNTIME_NS mechanism_slots
+#include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
+#undef NINFER_QWEN36_RUNTIME_NS
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 
+#include <ninfer/types.h>
+
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <iostream>
+#include <optional>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -306,6 +315,18 @@ void test_prefix_hash_and_dflash_gate() {
         expect(q36::detail::prefix_hash_at(original.token_ids, resident, count) == chain[count],
                "prefix_hash_at matches prefix_hash_chain");
     }
+    {
+        const std::size_t e = std::min<std::size_t>(2, original.token_ids.size());
+        const auto hash_e   = q36::detail::prefix_hash_at(original.token_ids, resident, e);
+        std::vector<ninfer::TokenId> longer = original.token_ids;
+        q36::PreparedPromptData assigned    = original;
+        append_text_token(assigned, 99, 99);
+        longer.push_back(99);
+        resident.assign(assigned);
+        expect(q36::detail::prefix_hash_at(longer, resident, e) == hash_e,
+               "occupy ledger.assign of a longer prompt keeps the hash at rollback E");
+        resident.assign(original);
+    }
 
     q36::PreparedPromptData changed_token = original;
     changed_token.token_ids.back() += 1;
@@ -337,6 +358,443 @@ void test_prefix_hash_and_dflash_gate() {
            "short DFlash context frontier FullResets a checkpoint view");
 }
 
+void test_prefill_context_marks() {
+    using Path = ninfer::PrefixReusePath;
+    expect(q36::detail::kPrefillContextMarks.size() == 6, "product ladder has six marks");
+    expect(q36::detail::kPrefillContextMarks[0] == 24576, "mark 24576");
+    expect(q36::detail::kPrefillContextMarks[1] == 36864, "mark 36864");
+    expect(q36::detail::kPrefillContextMarks[2] == 53248, "mark 53248");
+    expect(q36::detail::kPrefillContextMarks[3] == 77824, "mark 77824");
+    expect(q36::detail::kPrefillContextMarks[4] == 102400, "mark 102400");
+    expect(q36::detail::kPrefillContextMarks[5] == 151552, "mark 151552");
+    for (const std::uint32_t mark : q36::detail::kPrefillContextMarks) {
+        expect(mark % 4096u == 0, "context marks are 4096-aligned chunk ends");
+        expect(mark != 24000 && mark != 36000 && mark != 52000 && mark != 76000 && mark != 100000 &&
+                   mark != 10240 && mark != 25000 && mark != 50000 && mark != 80000 &&
+                   mark != 120000 && mark != 150000,
+               "advertised F is never the raw named size");
+    }
+    for (std::size_t i = 0; i < q36::detail::kPrefillContextMarks.size(); ++i) {
+        const std::uint32_t mark = q36::detail::kPrefillContextMarks[i];
+        expect(q36::detail::next_prefill_context_mark(mark - 1) == mark, "next mark just before");
+        if (i + 1 < q36::detail::kPrefillContextMarks.size()) {
+            const std::uint32_t following = q36::detail::kPrefillContextMarks[i + 1];
+            expect(q36::detail::next_prefill_context_mark(mark) == following, "next mark at freeze");
+            expect(q36::detail::next_prefill_context_mark(mark + 1) == following,
+                   "next mark just after freeze");
+        } else {
+            expect(!q36::detail::next_prefill_context_mark(mark).has_value(), "no mark after last");
+            expect(!q36::detail::next_prefill_context_mark(mark + 1).has_value(),
+                   "no mark past last");
+        }
+    }
+    expect(q36::detail::next_prefill_context_mark(0) == 24576, "next mark from 0");
+    expect(q36::detail::next_prefill_context_mark(4096) == 24576,
+           "chunk end 4096 still waits for first mark");
+    expect(q36::detail::next_prefill_context_mark(12288) == 24576,
+           "chunk end 12288 still waits for first mark");
+    expect(q36::detail::next_prefill_context_mark(25000) == 36864,
+           "off-grid F still uses next mark");
+
+    expect(!q36::detail::should_freeze_prefill_context_checkpoint(true, true, 4096, 12288, false,
+                                                                 true),
+           "chunk end 4096 does not freeze");
+    expect(!q36::detail::should_freeze_prefill_context_checkpoint(true, true, 8192, 12288, false,
+                                                                 true),
+           "chunk end 8192 does not freeze");
+    expect(!q36::detail::should_freeze_prefill_context_checkpoint(true, true, 10240, 12288, false,
+                                                                 true),
+           "raw named size 10240 is not a freeze coordinate");
+    expect(q36::detail::should_freeze_prefill_context_checkpoint(true, true, 12288, 12288, false,
+                                                                true),
+           "chunk end 12288 freezes");
+    expect(!q36::detail::should_freeze_prefill_context_checkpoint(true, true, 12288, 12288, true,
+                                                                 true),
+           "already-captured F does not freeze again");
+    expect(!q36::detail::should_freeze_prefill_context_checkpoint(true, true, 200000, 0, false,
+                                                                 true),
+           "no freeze after the last mark");
+    expect(q36::detail::newly_frozen_context_checkpoint_tokens(12288, 0) == 12288,
+           "first freeze reports coverage from 0");
+    expect(q36::detail::newly_frozen_context_checkpoint_tokens(24576, 12288) == 12288,
+           "second freeze reports only the new rung");
+    expect(q36::detail::newly_frozen_context_checkpoint_tokens(24576, 0) == 24576,
+           "two marks in one request report coverage from 0");
+    expect(q36::detail::newly_frozen_context_checkpoint_tokens(16384, 0) == 16384,
+           "catch-up freeze reports the advertised chunk end");
+    expect(q36::detail::newly_frozen_context_checkpoint_tokens(12288, 12288) == 0,
+           "same frontier is not newly frozen");
+    expect(q36::detail::advertised_context_checkpoint_frontier(16000) == 16000,
+           "catch-up advertised F is the later chunk end");
+
+    const std::uint32_t catch_up_first = 8000u + 4096u;
+    expect(catch_up_first == 12096 &&
+               !q36::detail::should_freeze_prefill_context_checkpoint(true, true, catch_up_first,
+                                                                     12288, false, true),
+           "resume 8000 first 4096 chunk ends at 12096 and does not freeze");
+    expect(q36::detail::should_freeze_prefill_context_checkpoint(true, true, 16000, 12288, false,
+                                                                true) &&
+               q36::detail::advertised_context_checkpoint_frontier(16000) == 16000,
+           "resume 8000 then prefill to 16000 freezes 16000 not 12288");
+    expect(q36::detail::should_freeze_prefill_context_checkpoint(true, true, 8192u + 4096u, 12288,
+                                                                false, true) &&
+               q36::detail::advertised_context_checkpoint_frontier(12288) == 12288,
+           "resume 8192 first chunk end 12288 freezes 12288");
+
+    expect(!q36::detail::should_freeze_prefill_context_checkpoint(false, true, 15000, 12288, false,
+                                                                 true),
+           "decode-only past 12288 does not freeze");
+    expect(!q36::detail::should_freeze_prefill_context_checkpoint(true, false, 12288, 12288, false,
+                                                                 true),
+           "capture-disabled prefill does not freeze");
+
+    expect(q36::detail::capture_prefill_context_checkpoints(true, true),
+           "MTP or DFlash + prefix reuse captures");
+    expect(!q36::detail::capture_prefill_context_checkpoints(false, true),
+           "--no-prefix-reuse skips capture");
+    expect(!q36::detail::capture_prefill_context_checkpoints(true, false),
+           "ordinary does not capture");
+    expect(!q36::detail::capture_prefill_context_checkpoints(false, false),
+           "reuse-off and ordinary does not capture");
+
+    expect(q36::detail::retain_context_checkpoint_head(12288, 12288), "keep head at restore F");
+    expect(q36::detail::retain_context_checkpoint_head(8192, 12288), "keep heads before F");
+    expect(!q36::detail::retain_context_checkpoint_head(24576, 12288), "drop heads after F");
+
+    q36::PreparedPromptData prompt;
+    prompt.token_ids   = {1, 2, 3, 4};
+    prompt.token_types = {0, 0, 0, 0};
+    prompt.positions   = {0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3};
+    expect(q36::detail::prefix_items_complete_at(prompt.vision_items, 4),
+           "text-only frontier is complete");
+    q36::PreparedPromptData vision = identity_prompt();
+    expect(!q36::detail::prefix_items_complete_at(vision.vision_items, 2),
+           "frontier that splits a vision item is not capturable");
+    expect(q36::detail::prefix_items_complete_at(vision.vision_items, 3),
+           "frontier after a complete vision item is capturable");
+    expect(!q36::detail::should_freeze_prefill_context_checkpoint(
+               true, true, 12288, 12288, false,
+               q36::detail::prefix_items_complete_at(vision.vision_items, 2)),
+           "maybe_freeze must not capture when prefix_items_complete_at is false");
+    expect(q36::detail::should_freeze_prefill_context_checkpoint(
+               true, true, 12288, 12288, false,
+               q36::detail::prefix_items_complete_at(prompt.vision_items, 4)),
+           "maybe_freeze captures when prefix items are complete at F");
+
+    const std::array<std::uint32_t, 1> ladders_13k{12288u};
+    const auto rewrite_loses = q36::detail::select_resident_prefill_reuse(
+        false, 13000, true, 8000, Path::RestoreTurnCheckpoint, ladders_13k);
+    expect(rewrite_loses.path == Path::RestoreContextCheckpoint && rewrite_loses.frontier == 12288,
+           "rewrite at 8000 loses to ladder 12288 on a 13k matching prompt");
+    const auto current_wins = q36::detail::select_resident_prefill_reuse(
+        true, 13000, true, 8000, Path::RestoreTurnCheckpoint, ladders_13k);
+    expect(current_wins.path == Path::AppendAtFrontier && current_wins.frontier == 13000,
+           "current frontier still wins if it matches");
+    const auto e_eq_f = q36::detail::select_resident_prefill_reuse(
+        true, 12288, true, 8000, Path::RestoreTurnCheckpoint, ladders_13k);
+    expect(e_eq_f.path == Path::AppendAtFrontier && e_eq_f.frontier == 12288,
+           "E==F still-resident match is AppendAtFrontier, not ladder restore");
+    const std::array<std::uint32_t, 1> tie{8000u};
+    const auto equal_f = q36::detail::select_resident_prefill_reuse(
+        false, 13000, true, 8000, Path::RestoreTurnCheckpoint, tie);
+    expect(equal_f.path == Path::RestoreTurnCheckpoint && equal_f.frontier == 8000,
+           "rewrite wins a tie at the same F as a ladder head");
+    const auto nothing = q36::detail::select_resident_prefill_reuse(
+        false, 0, false, 0, Path::FullReset, std::span<const std::uint32_t>{});
+    expect(nothing.path == Path::FullReset && nothing.frontier == 0,
+           "no matching head is FullReset");
+
+    expect(q36::detail::is_complete_checkpoint_restore(Path::RestoreContextCheckpoint),
+           "RestoreContextCheckpoint is a complete checkpoint restore");
+    expect(!q36::detail::is_rewrite_checkpoint_restore(Path::RestoreContextCheckpoint),
+           "RestoreContextCheckpoint is not a rewrite restore");
+    expect(q36::detail::mtp_complete_checkpoint_ready(Path::RestoreContextCheckpoint, 12288, 12287),
+           "RestoreContextCheckpoint with mtp_kv_valid >= F-1 is not forced to FullReset");
+    expect(!q36::detail::mtp_complete_checkpoint_ready(Path::RestoreContextCheckpoint, 12288, 12286),
+           "short MTP KV is not checkpoint-ready");
+    expect(!q36::detail::mtp_bridge_reads_rewrite_hidden(Path::RestoreContextCheckpoint),
+           "context restore installs/reads tail_hidden not rewrite hidden");
+    expect(q36::detail::mtp_bridge_reads_rewrite_hidden(Path::RestoreTurnCheckpoint),
+           "rewrite restore still reads rewrite hidden");
+
+    q36::detail::PrefixHash128 hash_a{.lo = 1, .hi = 2};
+    q36::detail::PrefixHash128 hash_b{.lo = 3, .hi = 4};
+    expect(q36::detail::staging_holds_restore_identity(true, 0, hash_a, 12288, 0, hash_a, 12288),
+           "staging D2D requires matching lane+hash+F");
+    expect(!q36::detail::staging_holds_restore_identity(true, 1, hash_a, 12288, 0, hash_a, 12288),
+           "wrong staging lane must not D2D");
+    expect(!q36::detail::staging_holds_restore_identity(true, 0, hash_b, 12288, 0, hash_a, 12288),
+           "wrong staging hash must not D2D");
+    expect(!q36::detail::staging_holds_restore_identity(true, 0, hash_a, 24576, 0, hash_a, 12288),
+           "wrong staging F must not D2D");
+    expect(!q36::detail::staging_holds_restore_identity(false, 0, hash_a, 12288, 0, hash_a, 12288),
+           "empty staging must not D2D");
+
+    expect(q36::detail::occupy_drops_rewrite_ahead_of_restore(Path::RestoreContextCheckpoint, true,
+                                                             15000, 12288),
+           "occupy drops rewrite when rewrite.frontier > restore F");
+    expect(!q36::detail::occupy_drops_rewrite_ahead_of_restore(Path::RestoreContextCheckpoint, true,
+                                                              8000, 12288),
+           "occupy keeps rewrite when rewrite.frontier <= restore F");
+    expect(!q36::detail::occupy_drops_rewrite_ahead_of_restore(Path::AppendAtFrontier, true, 15000,
+                                                              12288),
+           "append occupy does not drop rewrite via the restore helper");
+    expect(q36::detail::occupy_clears_context_checkpoints(Path::FullReset),
+           "FullReset clears ladder heads");
+    expect(!q36::detail::occupy_clears_context_checkpoints(Path::AppendAtFrontier),
+           "AppendAtFrontier does not clear the ladder");
+    expect(q36::detail::occupy_keeps_context_checkpoint_head(Path::AppendAtFrontier, 12288, 13000),
+           "AppendAtFrontier keeps heads with frontier <= new base");
+    expect(!q36::detail::occupy_keeps_context_checkpoint_head(Path::AppendAtFrontier, 24576, 13000),
+           "AppendAtFrontier drops heads with frontier > new base");
+    expect(!q36::detail::occupy_keeps_context_checkpoint_head(Path::FullReset, 12288, 0),
+           "FullReset keeps no ladder heads");
+    expect(q36::detail::occupy_keeps_context_checkpoint_head(Path::RestoreContextCheckpoint, 12288,
+                                                            12288),
+           "restore keeps the head at F");
+    expect(!q36::detail::occupy_keeps_context_checkpoint_head(Path::RestoreContextCheckpoint, 24576,
+                                                             12288),
+           "restore drops heads after F");
+    expect(q36::detail::occupy_keeps_context_checkpoint_head(Path::RestoreTurnCheckpoint, 12288,
+                                                            13000),
+           "rewrite occupy keeps ladder heads with frontier <= new base");
+    expect(!q36::detail::occupy_keeps_context_checkpoint_head(Path::RestoreTurnCheckpoint, 24576,
+                                                             13000),
+           "rewrite occupy drops ladder heads after the new base");
+    expect(q36::detail::next_prefill_context_mark(24576) == 36864,
+           "rollback to first mark recaptures the second");
+    expect(q36::detail::next_prefill_context_mark(26000) == 36864,
+           "catch-up head between marks still recaptures the second");
+
+    expect(q36::detail::should_freeze_prefill_context_checkpoint(true, true, 24576, 24576, false,
+                                                                true),
+           "product first mark 24576 freezes at that chunk end");
+    expect(!q36::detail::should_freeze_prefill_context_checkpoint(true, true, 24384, 24576, false,
+                                                                 true),
+           "chunk end 24384 still waits for 24576");
+    expect(q36::detail::should_freeze_prefill_context_checkpoint(true, true, 25000, 24576, false,
+                                                                true) &&
+               q36::detail::advertised_context_checkpoint_frontier(25000) == 25000,
+           "catch-up past 24576 freezes the later chunk end");
+    expect(q36::detail::newly_frozen_context_checkpoint_tokens(36864, 24576) == 12288,
+           "second product mark reports only the new rung");
+    expect(q36::detail::newly_frozen_context_checkpoint_tokens(36864, 0) == 36864,
+           "two product marks in one request report coverage from 0");
+
+    const std::array<std::uint32_t, 3> occupy_heads{8192u, 24576u, 36864u};
+    std::vector<std::uint32_t> kept;
+    for (const std::uint32_t frontier : occupy_heads) {
+        if (q36::detail::retain_context_checkpoint_head(frontier, 24576)) {
+            kept.push_back(frontier);
+        }
+    }
+    expect(kept.size() == 2 && kept[0] == 8192 && kept[1] == 24576,
+           "occupy drop keeps heads at or before restore F");
+    expect(q36::detail::next_prefill_context_mark(24576) == 36864,
+           "occupy restore to 24576 recaptures 36864 next");
+    expect(q36::detail::occupy_keeps_context_checkpoint_head(Path::RestoreContextCheckpoint, 8192,
+                                                            24576) ==
+               q36::detail::retain_context_checkpoint_head(8192, 24576),
+           "occupy keep-helper matches retain for restore");
+    expect(q36::detail::occupy_keeps_context_checkpoint_head(Path::FullReset, 24576, 0) == false,
+           "FullReset occupy keeps no heads");
+
+    expect(q36::detail::mtp_prefix_reuse_ready(Path::FullReset, 0, 0, false, false),
+           "FullReset does not require MTP reuse readiness");
+    expect(q36::detail::mtp_prefix_reuse_ready(Path::RestoreContextCheckpoint, 24576, 24575, false,
+                                              true),
+           "checkpoint restore with mtp_kv_valid == F-1 is ready");
+    expect(!q36::detail::mtp_prefix_reuse_ready(Path::RestoreContextCheckpoint, 24576, 24574, true,
+                                               true),
+           "checkpoint restore with mtp_kv_valid == F-2 FullResets");
+    expect(!q36::detail::mtp_prefix_reuse_ready(Path::RestoreTurnCheckpoint, 24576, 24574, true,
+                                               true),
+           "turn restore with mtp_kv_valid == F-2 FullResets");
+    expect(q36::detail::mtp_prefix_reuse_ready(Path::RestoreResponseCheckpoint, 24576, 24575, true,
+                                              true),
+           "response restore with mtp_kv_valid == F-1 is ready");
+    expect(!q36::detail::mtp_prefix_reuse_ready(Path::RestoreContextCheckpoint, 24576, 24575, true,
+                                               false),
+           "checkpoint restore without an MTP cache FullResets");
+    expect(q36::detail::mtp_prefix_reuse_ready(Path::AppendAtFrontier, 24576, 24575, true, true),
+           "append with tail_hidden and F-1 MTP KV is ready");
+    expect(!q36::detail::mtp_prefix_reuse_ready(Path::AppendAtFrontier, 24576, 24575, false, true),
+           "append without tail_hidden FullResets");
+
+    expect(q36::detail::is_staged_checkpoint_restore(Path::RestoreTurnRollback),
+           "RestoreTurnRollback is a staged complete-checkpoint restore");
+    expect(q36::detail::is_complete_checkpoint_restore(Path::RestoreTurnRollback),
+           "RestoreTurnRollback is a complete checkpoint restore");
+    expect(!q36::detail::is_rewrite_checkpoint_restore(Path::RestoreTurnRollback),
+           "RestoreTurnRollback is not a rewrite restore");
+    expect(q36::detail::mtp_complete_checkpoint_ready(Path::RestoreTurnRollback, 1000, 999),
+           "RestoreTurnRollback with mtp_kv_valid >= F-1 is ready");
+    expect(!q36::detail::mtp_complete_checkpoint_ready(Path::RestoreTurnRollback, 1000, 998),
+           "RestoreTurnRollback with mtp_kv_valid == F-2 FullResets");
+    expect(q36::detail::mtp_prefix_reuse_ready(Path::RestoreTurnRollback, 1000, 999, false, true),
+           "mtp_prefix_reuse_ready accepts RestoreTurnRollback at F-1");
+    expect(!q36::detail::mtp_prefix_reuse_ready(Path::RestoreTurnRollback, 1000, 998, true, true),
+           "mtp_prefix_reuse_ready FullResets RestoreTurnRollback at F-2");
+    expect(!q36::detail::mtp_bridge_reads_rewrite_hidden(Path::RestoreTurnRollback),
+           "turn-rollback restore reads tail_hidden not rewrite hidden");
+    expect(q36::detail::occupy_drops_rewrite_ahead_of_restore(Path::RestoreTurnRollback, true, 1500,
+                                                             1000),
+           "rollback occupy drops rewrite ahead of E");
+    expect(!q36::detail::occupy_drops_rewrite_ahead_of_restore(Path::RestoreTurnRollback, true, 800,
+                                                              1000),
+           "rollback occupy keeps rewrite at or before E");
+    expect(q36::detail::occupy_keeps_context_checkpoint_head(Path::RestoreTurnRollback, 1000, 1000),
+           "rollback restore keeps the head at E");
+    expect(!q36::detail::occupy_keeps_context_checkpoint_head(Path::RestoreTurnRollback, 24576,
+                                                             1000),
+           "rollback restore drops heads after E");
+
+    using Kind = q36::detail::ContextCheckpointKind;
+    expect(q36::detail::should_capture_turn_rollback(Path::AppendAtFrontier, 1000, 1200, true, true,
+                                                     false, true),
+           "append with prompt_tokens > E pins rollback");
+    expect(!q36::detail::should_capture_turn_rollback(Path::AppendAtFrontier, 1000, 1000, true, true,
+                                                      false, true),
+           "exact-hit append does not replace an older rollback pin");
+    expect(!q36::detail::should_capture_turn_rollback(Path::AppendAtFrontier, 0, 100, true, true,
+                                                      false, true),
+           "first-visit E==0 does not pin rollback");
+    expect(!q36::detail::should_capture_turn_rollback(Path::RestoreTurnRollback, 1000, 1200, true,
+                                                      true, false, true),
+           "restore occupy does not recapture rollback");
+    expect(!q36::detail::should_capture_turn_rollback(Path::AppendAtFrontier, 1000, 1200, true, true,
+                                                      true, true),
+           "skip pin when any head already sits at E");
+    expect(!q36::detail::should_capture_turn_rollback(Path::AppendAtFrontier, 1000, 1200, false, true,
+                                                      false, true),
+           "MTP-off / reuse-off does not pin rollback");
+    expect(!q36::detail::should_capture_turn_rollback(Path::AppendAtFrontier, 1000, 1200, true, false,
+                                                      false, true),
+           "invalid tail_hidden does not pin rollback");
+    expect(!q36::detail::should_capture_turn_rollback(Path::AppendAtFrontier, 1000, 1200, true, true,
+                                                      false, false),
+           "incomplete Vision item at E skips the rollback pin");
+
+    const std::array<q36::detail::PrefillReuseHead, 1> rollback_e1{
+        q36::detail::PrefillReuseHead{1000u, Kind::TurnRollback}};
+    const auto current_beats_rollback = q36::detail::select_resident_prefill_reuse(
+        true, 2000, true, 800, Path::RestoreTurnCheckpoint, rollback_e1);
+    expect(current_beats_rollback.path == Path::AppendAtFrontier &&
+               current_beats_rollback.frontier == 2000,
+           "current matching E still wins against rollback");
+    const auto rewrite_longer_than_rollback = q36::detail::select_resident_prefill_reuse(
+        false, 2000, true, 1500, Path::RestoreTurnCheckpoint, rollback_e1);
+    expect(rewrite_longer_than_rollback.path == Path::RestoreTurnCheckpoint &&
+               rewrite_longer_than_rollback.frontier == 1500,
+           "regenerate: rewrite longer than rollback wins");
+    const auto rollback_longer_than_rewrite = q36::detail::select_resident_prefill_reuse(
+        false, 2000, true, 800, Path::RestoreTurnCheckpoint, rollback_e1);
+    expect(rollback_longer_than_rewrite.path == Path::RestoreTurnRollback &&
+               rollback_longer_than_rewrite.frontier == 1000,
+           "edit last user: rollback longer than rewrite wins");
+    const auto edit_misses_rewrite = q36::detail::select_resident_prefill_reuse(
+        false, 2000, false, 1500, Path::RestoreTurnCheckpoint, rollback_e1);
+    expect(edit_misses_rewrite.path == Path::RestoreTurnRollback &&
+               edit_misses_rewrite.frontier == 1000,
+           "edit last user: unmatched rewrite falls through to rollback E");
+    const std::array<q36::detail::PrefillReuseHead, 1> rollback_tie{
+        q36::detail::PrefillReuseHead{800u, Kind::TurnRollback}};
+    const auto rewrite_tie_rollback = q36::detail::select_resident_prefill_reuse(
+        false, 2000, true, 800, Path::RestoreTurnCheckpoint, rollback_tie);
+    expect(rewrite_tie_rollback.path == Path::RestoreTurnCheckpoint &&
+               rewrite_tie_rollback.frontier == 800,
+           "same-F rewrite vs rollback keeps rewrite");
+    expect(q36::detail::reuse_path_for_context_checkpoint_kind(Kind::TurnRollback) ==
+               Path::RestoreTurnRollback,
+           "turn_rollback kind reports restore_turn_rollback not restore_context_checkpoint");
+    expect(q36::detail::reuse_path_for_context_checkpoint_kind(Kind::Ladder) ==
+               Path::RestoreContextCheckpoint,
+           "ladder kind still reports restore_context_checkpoint");
+    expect(q36::detail::reuse_path_for_context_checkpoint_kind(Kind::OnDemand) ==
+               Path::RestoreContextCheckpoint,
+           "reserved OnDemand kind is not RestoreTurnRollback");
+    expect(!q36::detail::should_capture_turn_rollback(Path::FullReset, 1000, 1200, true, true, false,
+                                                      true),
+           "FullReset occupy does not pin rollback");
+    expect(!q36::detail::should_capture_turn_rollback(Path::RestoreContextCheckpoint, 1000, 1200,
+                                                      true, true, false, true),
+           "ladder restore occupy does not pin rollback");
+    expect(!q36::detail::should_capture_turn_rollback(Path::RestoreTurnCheckpoint, 1000, 1200, true,
+                                                      true, false, true),
+           "rewrite restore occupy does not pin rollback");
+    expect(q36::detail::occupy_keeps_context_checkpoint_head(Path::RestoreTurnRollback, 800, 1000),
+           "rollback restore keeps a shorter ladder under E");
+    expect(q36::detail::occupy_clears_context_checkpoints(Path::FullReset),
+           "FullReset drops every context-checkpoint head");
+    expect(!q36::detail::occupy_clears_context_checkpoints(Path::RestoreTurnRollback),
+           "rollback restore does not FullReset the head list");
+    const std::array<q36::detail::PrefillReuseHead, 2> two_rollbacks{
+        q36::detail::PrefillReuseHead{800u, Kind::TurnRollback},
+        q36::detail::PrefillReuseHead{1000u, Kind::TurnRollback}};
+    const auto longest_rollback = q36::detail::select_resident_prefill_reuse(
+        false, 2000, false, 0, Path::RestoreTurnCheckpoint, two_rollbacks);
+    expect(longest_rollback.path == Path::RestoreTurnRollback &&
+               longest_rollback.frontier == 1000,
+           "longest matching rollback head wins");
+    const std::array<q36::detail::PrefillReuseHead, 2> rollback_and_ladder{
+        q36::detail::PrefillReuseHead{1000u, Kind::TurnRollback},
+        q36::detail::PrefillReuseHead{24576u, Kind::Ladder}};
+    const auto ladder_over_rollback = q36::detail::select_resident_prefill_reuse(
+        false, 30000, false, 0, Path::RestoreTurnCheckpoint, rollback_and_ladder);
+    expect(ladder_over_rollback.path == Path::RestoreContextCheckpoint &&
+               ladder_over_rollback.frontier == 24576,
+           "longer ladder beats shorter rollback");
+    const auto prefix_hits_rollback_not_ladder = q36::detail::select_resident_prefill_reuse(
+        false, 30000, false, 0, Path::RestoreTurnCheckpoint, rollback_e1);
+    expect(prefix_hits_rollback_not_ladder.path == Path::RestoreTurnRollback &&
+               prefix_hits_rollback_not_ladder.frontier == 1000,
+           "prefix that misses the ladder still hits rollback E");
+
+    expect(q36::detail::restore_may_d2d_staging(true, true),
+           "staging D2D requires a published host head");
+    expect(!q36::detail::restore_may_d2d_staging(true, false),
+           "occupied staging without a head must not D2D");
+    expect(!q36::detail::restore_may_d2d_staging(false, true),
+           "host unpack when staging identity does not match");
+
+    const std::array<std::uint32_t, 2> two_ladders{24576u, 36864u};
+    const auto longest = q36::detail::select_resident_prefill_reuse(
+        false, 40000, true, 8000, Path::RestoreTurnCheckpoint, two_ladders);
+    expect(longest.path == Path::RestoreContextCheckpoint && longest.frontier == 36864,
+           "longest ladder head beats shorter rewrite");
+    const std::array<std::uint32_t, 1> short_ladder{24576u};
+    const auto rewrite_longer = q36::detail::select_resident_prefill_reuse(
+        false, 40000, true, 36864, Path::RestoreTurnCheckpoint, short_ladder);
+    expect(rewrite_longer.path == Path::RestoreTurnCheckpoint && rewrite_longer.frontier == 36864,
+           "longer rewrite beats shorter ladder");
+    const std::array<std::uint32_t, 1> same_f{24576u};
+    const auto rewrite_tie = q36::detail::select_resident_prefill_reuse(
+        false, 30000, true, 24576, Path::RestoreTurnCheckpoint, same_f);
+    expect(rewrite_tie.path == Path::RestoreTurnCheckpoint && rewrite_tie.frontier == 24576,
+           "rewrite wins a product-mark same-F tie");
+    const auto response_tie = q36::detail::select_resident_prefill_reuse(
+        false, 30000, true, 24576, Path::RestoreResponseCheckpoint, same_f);
+    expect(response_tie.path == Path::RestoreResponseCheckpoint &&
+               response_tie.frontier == 24576,
+           "response rewrite also wins a same-F ladder tie");
+
+    using Slots = q36::detail::mechanism_slots::LinearStateSlots;
+    expect(Slots::state_slot_count(1, true) == 3, "C=1 MTP/DFlash GDN pool is 2C+1");
+    expect(Slots::staging_state_slot(1) == 2, "C=1 staging is slot 2C");
+    expect(Slots::current_state_slot(0, 1) == 0, "C=1 current is slot 0");
+    expect(Slots::rewrite_checkpoint_state_slot(0, 1) == 1, "C=1 rewrite is slot C");
+    expect(Slots::state_slot_count(1, false) == 2, "ordinary GDN pool is 2C, no staging");
+    expect(Slots::state_slot_count(2, true) == 5, "C=2 MTP/DFlash GDN pool is 2C+1");
+    expect(Slots::staging_state_slot(2) == 4, "C=2 staging is slot 2C");
+    expect(Slots::current_state_slot(1, 2) == 1, "C=2 lane 1 current is slot 1");
+    expect(Slots::rewrite_checkpoint_state_slot(1, 2) == 3, "C=2 lane 1 rewrite is slot C+1");
+    expect(Slots::state_slot_count(8, true) == 17, "C=8 MTP/DFlash GDN pool is 2C+1");
+    expect(Slots::staging_state_slot(8) == 16, "C=8 staging is slot 2C");
+    expect(Slots::current_state_slot(7, 8) == 7, "C=8 last-lane current is slot 7");
+    expect(Slots::rewrite_checkpoint_state_slot(7, 8) == 15, "C=8 last-lane rewrite is slot C+7");
+    expect(Slots::staging_state_slot(3) == 6, "C=3 staging is slot 2C");
+}
+
 } // namespace
 
 int main() {
@@ -347,6 +805,7 @@ int main() {
     test_vision_control();
     test_prefix_identity();
     test_prefix_hash_and_dflash_gate();
+    test_prefill_context_marks();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;

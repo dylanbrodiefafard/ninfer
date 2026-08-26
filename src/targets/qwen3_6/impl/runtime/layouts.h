@@ -23,6 +23,7 @@ using TensorLayout = TensorRegion;
 struct DFlashPersistentLayout {
     CyclicKVCacheLayout local;
     CyclicKVCacheLayout rewrite_checkpoint_local;
+    CyclicKVCacheLayout staging_local;
     std::optional<qwen3_6::PagedKVCacheLayout> full;
     TensorLayout prefill_features;
     TensorLayout prefill_positions;
@@ -30,7 +31,7 @@ struct DFlashPersistentLayout {
 
     [[nodiscard]] std::size_t kv_payload_bytes() const noexcept {
         return local.payload_bytes() + rewrite_checkpoint_local.payload_bytes() +
-               (full ? full->payload_bytes() : 0);
+               staging_local.payload_bytes() + (full ? full->payload_bytes() : 0);
     }
 };
 
@@ -44,6 +45,7 @@ struct PersistentLayout {
     TensorLayout sampling_config;
     TensorLayout tail_hidden;
     TensorLayout rewrite_checkpoint_hidden;
+    std::optional<TensorLayout> staging_hidden;
     std::size_t bytes            = 0;
     std::size_t kv_payload_bytes = 0;
 };

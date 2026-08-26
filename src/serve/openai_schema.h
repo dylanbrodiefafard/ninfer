@@ -39,7 +39,7 @@ std::optional<bool> parse_openai_enable_thinking(const nlohmann::json& body);
 // convention consumed by Chatbox, Open WebUI, etc.), leaving `content` = answer.
 // The usage object carries OpenAI-standard details sub-objects: `cached_tokens` and
 // engine stats under the `ninfer` namespace in `prompt_tokens_details` (prefill /
-// decode rates, KV-RAM tier stats), and reasoning / speculative-decoding token
+// decode rates, KV-RAM tier stats, context checkpoint), and reasoning / speculative-decoding token
 // counts in `completion_tokens_details`. Each stat is stored exactly once.
 std::string make_chat_completion_response(const std::string& id, const std::string& model,
                                           std::int64_t created, const std::string& content,
@@ -79,7 +79,7 @@ std::string make_chat_chunk_final(const std::string& id, const std::string& mode
 // Dedicated usage chunk: `choices: []` with the request's token usage. Emitted
 // before [DONE] (and whenever include_usage is requested). Carries the usage object
 // described above: OpenAI-standard `prompt_tokens_details` (`cached_tokens`, `ninfer`
-// engine stats — prefill/decode rates, reuse source, and when host KV RAM is enabled
+// engine stats — prefill/decode rates, reuse source, prefix_reuse_path, context_checkpoint, and when host KV RAM is enabled
 // the same live occupancy, copy times, and lifetime counters as the serve `[req] done`
 // line) and OpenAI-standard `completion_tokens_details` (reasoning and speculative
 // prediction token counts). Rates and millisecond fields are rounded to three

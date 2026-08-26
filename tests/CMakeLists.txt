@@ -123,6 +123,10 @@ ninfer_add_test(ninfer_qwen3_6_27b_ram_real_test
   SOURCES targets/qwen3_6_27b/test_engine_ram_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_27b_ram_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_6_27b_context_checkpoint_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_context_checkpoint_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_6_27b_context_checkpoint_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_8_27b_dflash_real_test
   SOURCES targets/qwen3_6_27b/test_engine_dflash_real.cpp
   LIBRARIES ninfer_engine)

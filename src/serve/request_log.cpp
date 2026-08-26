@@ -1,4 +1,5 @@
 #include "serve/request_log.h"
+#include "product/context_checkpoint_format.h"
 #include "product/speculative_options.h"
 #include "serve/console_log.h"
 
@@ -134,8 +135,23 @@ const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
         return "restore_turn_checkpoint";
     case ninfer::PrefixReusePath::RestoreResponseCheckpoint:
         return "restore_response_checkpoint";
+    case ninfer::PrefixReusePath::RestoreContextCheckpoint:
+        return "restore_context_checkpoint";
+    case ninfer::PrefixReusePath::RestoreTurnRollback:
+        return "restore_turn_rollback";
     }
     return "unknown";
+}
+
+Json context_checkpoint_json(std::uint32_t restored, std::uint32_t captured) {
+    return Json{{"restored_tokens", restored}, {"captured_tokens", captured}};
+}
+
+std::string format_context_checkpoint(std::uint32_t restored, std::uint32_t captured) {
+    const std::string body =
+        ninfer::product::format_context_checkpoint_frontiers(restored, captured, ',');
+    if (body.empty()) { return {}; }
+    return " context_ckpt=" + body;
 }
 
 Json event_base(const std::string& server_instance_id, std::uint64_t timestamp, const char* event) {
@@ -395,7 +411,9 @@ std::string format_request_done(const RequestLogContext& context,
     out << " prompt=" << outcome.prompt_tokens << " gen=" << outcome.completion_tokens
         << " cache=" << metrics.prefix_cache_hit_tokens
         << " reuse=" << prefix_reuse_path_name(metrics.prefix_reuse_path)
-        << " reuse_source=" << prefix_reuse_source_name(metrics.prefix_reuse_source);
+        << " reuse_source=" << prefix_reuse_source_name(metrics.prefix_reuse_source)
+        << format_context_checkpoint(metrics.restored_context_checkpoint_tokens,
+                                     metrics.captured_context_checkpoint_tokens);
     if (metrics.kv_ram_capacity_bytes != 0) {
         ninfer::MemorySummary occupancy;
         occupancy.kv_ram_capacity_bytes = metrics.kv_ram_capacity_bytes;
@@ -601,6 +619,9 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
              {"prefix_cache_hit_tokens", outcome.metrics.prefix_cache_hit_tokens},
              {"prefix_reuse_path", prefix_reuse_path_name(outcome.metrics.prefix_reuse_path)},
              {"reuse_source", prefix_reuse_source_name(outcome.metrics.prefix_reuse_source)},
+             {"context_checkpoint",
+              context_checkpoint_json(outcome.metrics.restored_context_checkpoint_tokens,
+                                      outcome.metrics.captured_context_checkpoint_tokens)},
              {"kv_ram_capacity_bytes", outcome.metrics.kv_ram_capacity_bytes},
              {"kv_ram_used_bytes", outcome.metrics.kv_ram_used_bytes},
              {"kv_ram_entry_count", outcome.metrics.kv_ram_entry_count},

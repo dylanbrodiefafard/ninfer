@@ -582,6 +582,8 @@ int test_response_serialization() {
     failures += check(!jt.contains("timings"), "top-level timings still present");
     failures += check(ptd.at("cached_tokens") == 0, "ptd cached_tokens zero on cache miss");
     failures += check(ninfer_ptd.at("reuse_source") == "host_ram", "reuse_source host_ram");
+    failures += check(ninfer_ptd.at("prefix_reuse_path") == "full_reset",
+                      "prefix_reuse_path defaults to full_reset");
     failures += check(ninfer_ptd.at("prefill").at("ms") == 250.0, "prefill ms");
     failures += check(ninfer_ptd.at("prefill").at("tok_s") == 12.346,
                       "prefill rates are not rounded to three decimals");
@@ -617,11 +619,84 @@ int test_response_serialization() {
                       "usage duplicates reuse_source at top level");
 
     zero_timings.prefix_reuse_source = ninfer::PrefixReuseSource::VramResident;
+    zero_timings.prefix_reuse_path   = ninfer::PrefixReusePath::RestoreTurnCheckpoint;
+    zero_timings.prompt_reused_n     = 4;
+    const Json jturn = Json::parse(make_chat_completion_response(
+        "id-1", "m", 111, "hello world", "", "stop", usage, &zero_timings));
+    failures += check(jturn.at("usage").at("prompt_tokens_details").at("cached_tokens") == 4,
+                      "turn restore still reports cached_tokens");
+    failures += check(jturn.at("usage").at("prompt_tokens_details").at("ninfer")
+                          .at("context_checkpoint")
+                          .at("restored_tokens") == 0,
+                      "turn restore must not copy cached_tokens into restored_tokens");
+
+    zero_timings.prefix_reuse_path = ninfer::PrefixReusePath::RestoreContextCheckpoint;
+    zero_timings.prompt_reused_n   = 0;
     const Json jv = Json::parse(make_chat_completion_response(
         "id-1", "m", 111, "hello world", "", "stop", usage, &zero_timings));
     failures += check(jv.at("usage").at("prompt_tokens_details").at("ninfer").at("reuse_source") ==
                           "vram_resident",
                       "reuse_source vram_resident");
+    failures += check(jv.at("usage").at("prompt_tokens_details").at("ninfer").at("prefix_reuse_path") ==
+                          "restore_context_checkpoint",
+                      "prefix_reuse_path restore_context_checkpoint");
+    zero_timings.prefix_reuse_path = ninfer::PrefixReusePath::RestoreTurnRollback;
+    const Json jrollback = Json::parse(make_chat_completion_response(
+        "id-1", "m", 111, "hello world", "", "stop", usage, &zero_timings));
+    failures += check(jrollback.at("usage").at("prompt_tokens_details").at("ninfer")
+                          .at("prefix_reuse_path") == "restore_turn_rollback",
+                      "prefix_reuse_path restore_turn_rollback");
+    zero_timings.prefix_reuse_path = ninfer::PrefixReusePath::RestoreContextCheckpoint;
+    failures += check(jv.at("usage").at("prompt_tokens_details").at("ninfer").at("context_checkpoint")
+                          .at("restored_tokens") == 0,
+                      "context_checkpoint restored_tokens without cached_tokens");
+    zero_timings.prompt_reused_n                    = 36864;
+    zero_timings.restored_context_checkpoint_tokens = 36864;
+    zero_timings.captured_context_checkpoint_tokens = 0;
+    const Json jspan = Json::parse(make_chat_completion_response(
+        "id-1", "m", 111, "hello world", "", "stop", usage, &zero_timings));
+    failures += check(jspan.at("usage").at("prompt_tokens_details").at("cached_tokens") == 36864,
+                      "cached_tokens remains the full reused prefix");
+    failures += check(jspan.at("usage").at("prompt_tokens_details").at("ninfer").at("context_checkpoint")
+                          .at("restored_tokens") == 36864,
+                      "restored_tokens is the restored head frontier");
+    failures += check(jspan.at("usage").at("prompt_tokens_details").at("ninfer").at("context_checkpoint")
+                          .at("captured_tokens") == 0,
+                      "restore-only request reports captured_tokens 0");
+    failures += check(jspan.at("usage").at("prompt_tokens_details").at("cached_tokens").get<int>() ==
+                          jspan.at("usage")
+                              .at("prompt_tokens_details")
+                              .at("ninfer")
+                              .at("context_checkpoint")
+                              .at("restored_tokens")
+                              .get<int>(),
+                      "restored_tokens matches cached_tokens on a staged restore");
+    zero_timings.prompt_reused_n                    = 0;
+    zero_timings.restored_context_checkpoint_tokens = 0;
+    zero_timings.captured_context_checkpoint_tokens = 24576;
+    const Json jmade = Json::parse(make_chat_completion_response(
+        "id-1", "m", 111, "hello world", "", "stop", usage, &zero_timings));
+    failures += check(jmade.at("usage").at("prompt_tokens_details").at("cached_tokens") == 0,
+                      "freeze-only cached_tokens stays 0");
+    failures += check(jmade.at("usage").at("prompt_tokens_details").at("ninfer").at("context_checkpoint")
+                          .at("captured_tokens") == 24576,
+                      "captured_tokens is this request's freeze frontier");
+    failures += check(jmade.at("usage").at("prompt_tokens_details").at("ninfer").at("context_checkpoint")
+                          .at("restored_tokens") == 0,
+                      "freeze-only restored_tokens stays 0");
+    zero_timings.prompt_reused_n                    = 36864;
+    zero_timings.restored_context_checkpoint_tokens = 36864;
+    zero_timings.captured_context_checkpoint_tokens = 102400;
+    const Json jboth = Json::parse(make_chat_completion_response(
+        "id-1", "m", 111, "hello world", "", "stop", usage, &zero_timings));
+    failures += check(jboth.at("usage").at("prompt_tokens_details").at("cached_tokens") == 36864,
+                      "combined cached_tokens stays the full reused prefix");
+    failures += check(jboth.at("usage").at("prompt_tokens_details").at("ninfer").at("context_checkpoint")
+                          .at("restored_tokens") == 36864,
+                      "combined restored_tokens is the restore frontier");
+    failures += check(jboth.at("usage").at("prompt_tokens_details").at("ninfer").at("context_checkpoint")
+                          .at("captured_tokens") == 102400,
+                      "combined captured_tokens is the freeze frontier");
 
     // Prefill rates cover the non-reused suffix only: a 6-token cached prefix must not
     // inflate prefill tok_s (4 computed tokens over 0.25s = 16, not 40).
@@ -760,6 +835,37 @@ int test_chunk_serialization() {
                       "usage chunk kv_ram used_bytes");
     failures += check(ram_ninfer.at("kv_ram").at("load_ms") == 14.0, "usage chunk kv_ram load_ms");
     failures += check(ram_ninfer.at("reuse_source") == "vram_resident", "usage chunk reuse_source");
+
+    CompletionTimings ckpt_timings = make_completion_timings(2, 5, 0.25, 1.0);
+    ckpt_timings.prefix_reuse_source                = ninfer::PrefixReuseSource::HostRam;
+    ckpt_timings.prefix_reuse_path                  = ninfer::PrefixReusePath::RestoreContextCheckpoint;
+    ckpt_timings.prompt_reused_n                    = 36864;
+    ckpt_timings.restored_context_checkpoint_tokens = 36864;
+    ckpt_timings.captured_context_checkpoint_tokens = 102400;
+    const Json ckpt_chunk =
+        parse_sse(make_chat_chunk_usage("id", "m", 1, usage, &ckpt_timings));
+    const Json& ckpt_ninfer = ckpt_chunk.at("usage").at("prompt_tokens_details").at("ninfer");
+    failures += check(ckpt_chunk.at("usage").at("prompt_tokens_details").at("cached_tokens") == 36864,
+                      "stream usage chunk cached_tokens is the full reused prefix");
+    failures += check(ckpt_ninfer.at("prefix_reuse_path") == "restore_context_checkpoint",
+                      "stream usage chunk prefix_reuse_path");
+    failures += check(ckpt_ninfer.at("context_checkpoint").at("restored_tokens") == 36864,
+                      "stream usage chunk restored_tokens is the restored head frontier");
+    failures += check(ckpt_ninfer.at("context_checkpoint").at("captured_tokens") == 102400,
+                      "stream usage chunk captured_tokens is the freeze frontier");
+    failures += check(ckpt_chunk.at("usage").at("prompt_tokens_details").at("cached_tokens").get<int>() ==
+                          ckpt_ninfer.at("context_checkpoint").at("restored_tokens").get<int>(),
+                      "stream usage chunk restored_tokens matches cached_tokens");
+    const Json finish_ckpt = parse_sse(
+        make_chat_chunk_final("id", "m", 1, "stop", true, &ckpt_timings, &usage));
+    failures += check(finish_ckpt.at("usage").at("prompt_tokens_details").at("ninfer")
+                          .at("context_checkpoint")
+                          .at("restored_tokens") == 36864,
+                      "finish-with-usage chunk restored_tokens");
+    failures += check(finish_ckpt.at("usage").at("prompt_tokens_details").at("ninfer")
+                          .at("context_checkpoint")
+                          .at("captured_tokens") == 102400,
+                      "finish-with-usage chunk captured_tokens");
 
     failures += check(sse_done() == "data: [DONE]\n\n", "done sentinel");
     return failures;

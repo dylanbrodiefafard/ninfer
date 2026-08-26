@@ -57,7 +57,12 @@ CompletionTimings completion_timings_from_outcome(const GenerationOutcome& outco
         static_cast<int>(outcome.metrics.speculative_accepted_tokens),
         outcome.metrics.prefill_tail_tok_s, outcome.metrics.prefill_tail_window_s,
         outcome.metrics.prefix_cache_hit_tokens);
+    timings.prefix_reuse_path     = outcome.metrics.prefix_reuse_path;
     timings.prefix_reuse_source   = outcome.metrics.prefix_reuse_source;
+    timings.captured_context_checkpoint_tokens =
+        outcome.metrics.captured_context_checkpoint_tokens;
+    timings.restored_context_checkpoint_tokens =
+        outcome.metrics.restored_context_checkpoint_tokens;
     timings.reasoning_tokens      = outcome.reasoning_tokens;
     timings.kv_ram_capacity_bytes = outcome.metrics.kv_ram_capacity_bytes;
     timings.kv_ram_used_bytes     = outcome.metrics.kv_ram_used_bytes;

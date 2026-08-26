@@ -552,6 +552,24 @@ const char* prefix_reuse_source_name(ninfer::PrefixReuseSource source) {
     return "unknown";
 }
 
+const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
+    switch (path) {
+    case ninfer::PrefixReusePath::FullReset:
+        return "full_reset";
+    case ninfer::PrefixReusePath::AppendAtFrontier:
+        return "append_frontier";
+    case ninfer::PrefixReusePath::RestoreTurnCheckpoint:
+        return "restore_turn_checkpoint";
+    case ninfer::PrefixReusePath::RestoreResponseCheckpoint:
+        return "restore_response_checkpoint";
+    case ninfer::PrefixReusePath::RestoreContextCheckpoint:
+        return "restore_context_checkpoint";
+    case ninfer::PrefixReusePath::RestoreTurnRollback:
+        return "restore_turn_rollback";
+    }
+    return "unknown";
+}
+
 Json usage_to_json(const CompletionUsage& usage, const CompletionTimings* timings) {
     Json out = {{"prompt_tokens", usage.prompt_tokens},
                 {"completion_tokens", usage.completion_tokens},
@@ -561,12 +579,19 @@ Json usage_to_json(const CompletionUsage& usage, const CompletionTimings* timing
     // Downstream proxies normalize OpenAI usage (e.g. LiteLLM drops unknown top-level
     // usage keys) but forward the standard details sub-objects, so every stat lives
     // exactly once, here:
-    //  - prompt_tokens_details: the OpenAI-standard `cached_tokens` plus engine stats
-    //    under the `ninfer` vendor namespace (prefill/decode rates, KV RAM tier).
+//  - prompt_tokens_details: the OpenAI-standard `cached_tokens` plus engine stats
+    //    under the `ninfer` vendor namespace (prefill/decode rates, reuse source,
+    //    prefix_reuse_path, context_checkpoint restored/captured head frontiers, KV RAM tier).
     //  - completion_tokens_details: OpenAI-standard keys only, so they survive proxy
     //    normalization (reasoning + speculative-decoding token breakdowns).
     Json ptd = {{"cached_tokens", timings->prompt_reused_n}};
     Json ninfer = {{"reuse_source", prefix_reuse_source_name(timings->prefix_reuse_source)},
+                   {"prefix_reuse_path", prefix_reuse_path_name(timings->prefix_reuse_path)},
+                   {"context_checkpoint",
+                    {{"restored_tokens",
+                      static_cast<int>(timings->restored_context_checkpoint_tokens)},
+                     {"captured_tokens",
+                      static_cast<int>(timings->captured_context_checkpoint_tokens)}}},
                    {"prefill",
                     {{"ms", json_decimal3(timings->prompt_ms)},
                      {"tok_s", json_decimal3(timings->prompt_per_second)},

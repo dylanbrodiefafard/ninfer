@@ -285,6 +285,11 @@ bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size
     return true;
 }
 
+bool prefix_items_complete_at(const std::vector<VisionItem>& items, std::size_t tokens) {
+    std::size_t count = 0;
+    return prefix_item_count(items, tokens, &count);
+}
+
 bool prefix_matches(const PreparedPromptData& prompt, const std::vector<TokenId>& resident_tokens,
                     const ResidentPrefixIdentity& resident_identity, std::size_t count) {
     if (count > prompt.token_ids.size() || count > resident_tokens.size()) { return false; }

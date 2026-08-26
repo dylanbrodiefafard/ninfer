@@ -1,5 +1,6 @@
 #include "serve/console_log.h"
 #include "serve/request_log.h"
+#include "product/context_checkpoint_format.h"
 
 #include <nlohmann/json.hpp>
 
@@ -114,7 +115,7 @@ int main() {
                       "server record artifact type mismatch");
     failures += check(server.at("schema_version") == kRequestLogSchemaVersion,
                       "server record schema mismatch");
-    failures += check(kRequestLogSchemaVersion == 11, "request-log schema is not version 11");
+    failures += check(kRequestLogSchemaVersion == 15, "request-log schema is not version 15");
     failures += check(server.at("event") == "server_start", "server event mismatch");
     failures += check(server.at("server").at("public_model_id") == "deployment-alias",
                       "resolved public model id missing");
@@ -280,6 +281,10 @@ int main() {
                       "computed prefill tokens missing");
     failures += check(done.at("result").at("prefix_reuse_path") == "restore_turn_checkpoint",
                       "prefix reuse path missing");
+    failures += check(done.at("result").at("context_checkpoint").at("restored_tokens") == 0,
+                      "turn-checkpoint reuse must not report restored_tokens");
+    failures += check(done.at("result").at("context_checkpoint").at("captured_tokens") == 0,
+                      "request_done captured_tokens should be 0 without a freeze");
     failures += check(done.at("result").at("reuse_source") == "none",
                       "reuse_source missing from request_done");
     outcome.metrics.prefix_reuse_source = ninfer::PrefixReuseSource::HostRam;
@@ -326,6 +331,112 @@ int main() {
     failures += check(response_restore.at("result").at("prefix_reuse_path") ==
                           "restore_response_checkpoint",
                       "response checkpoint reuse path missing");
+    failures +=
+        check(format_request_done(context, outcome).find("reuse=restore_response_checkpoint") !=
+                  std::string::npos,
+              "human request log omits response checkpoint reuse path");
+    outcome.metrics.prefix_reuse_path = ninfer::PrefixReusePath::RestoreContextCheckpoint;
+    outcome.metrics.prefix_cache_hit_tokens            = 36864;
+    outcome.metrics.restored_context_checkpoint_tokens = 36864;
+    outcome.metrics.captured_context_checkpoint_tokens = 0;
+    const Json context_restore =
+        Json::parse(format_request_done_json("serve-test", 3005, context, outcome));
+    failures += check(context_restore.at("result").at("prefix_reuse_path") ==
+                          "restore_context_checkpoint",
+                      "context checkpoint reuse path missing");
+    failures +=
+        check(format_request_done(context, outcome).find("reuse=restore_context_checkpoint") !=
+                  std::string::npos,
+              "human request log omits context checkpoint reuse path");
+    failures += check(context_restore.at("result").at("prefix_cache_hit_tokens") == 36864,
+                      "request_done cache tokens should stay the full reused prefix");
+    failures += check(context_restore.at("result").at("context_checkpoint").at("restored_tokens") ==
+                          36864,
+                      "request_done restored_tokens should be the restored head frontier");
+    failures += check(context_restore.at("result").at("context_checkpoint").at("captured_tokens") ==
+                          0,
+                      "request_done captured_tokens should be 0 without a freeze");
+    outcome.metrics.prefix_reuse_path = ninfer::PrefixReusePath::RestoreTurnRollback;
+    outcome.metrics.prefix_cache_hit_tokens            = 1000;
+    outcome.metrics.restored_context_checkpoint_tokens = 1000;
+    outcome.metrics.captured_context_checkpoint_tokens = 0;
+    const Json rollback_restore =
+        Json::parse(format_request_done_json("serve-test", 3006, context, outcome));
+    failures += check(rollback_restore.at("result").at("prefix_reuse_path") ==
+                          "restore_turn_rollback",
+                      "turn-rollback reuse path missing");
+    failures +=
+        check(format_request_done(context, outcome).find("reuse=restore_turn_rollback") !=
+                  std::string::npos,
+              "human request log omits turn-rollback reuse path");
+    outcome.metrics.prefix_reuse_path = ninfer::PrefixReusePath::RestoreContextCheckpoint;
+    outcome.metrics.prefix_cache_hit_tokens            = 36864;
+    outcome.metrics.restored_context_checkpoint_tokens = 36864;
+    outcome.metrics.captured_context_checkpoint_tokens = 0;
+    failures += check(context_restore.at("result").at("prefix_cache_hit_tokens").get<int>() ==
+                          context_restore.at("result")
+                              .at("context_checkpoint")
+                              .at("restored_tokens")
+                              .get<int>(),
+                      "request_done restored_tokens is the restored head frontier");
+    failures +=
+        check(format_request_done(context, outcome).find("cache=36864") != std::string::npos &&
+                  format_request_done(context, outcome).find("context_ckpt=restored:36864") !=
+                      std::string::npos &&
+                  format_request_done(context, outcome).find("captured:") == std::string::npos,
+              "human request log omits restore-only restored: frontier");
+    outcome.metrics.prefix_cache_hit_tokens            = 0;
+    outcome.metrics.restored_context_checkpoint_tokens = 0;
+    outcome.metrics.captured_context_checkpoint_tokens = 24576;
+    const Json context_made =
+        Json::parse(format_request_done_json("serve-test", 3006, context, outcome));
+    failures += check(context_made.at("result").at("context_checkpoint").at("captured_tokens") ==
+                          24576,
+                      "request_done omitted captured context-checkpoint tokens");
+    failures += check(context_made.at("result").at("context_checkpoint").at("restored_tokens") == 0,
+                      "freeze-only request_done restored_tokens should be 0");
+    failures +=
+        check(format_request_done(context, outcome).find("context_ckpt=captured:24576") !=
+                  std::string::npos &&
+                  format_request_done(context, outcome).find("context_ckpt=restored:") ==
+                      std::string::npos,
+              "human request log omits freeze-only captured:");
+    outcome.metrics.prefix_cache_hit_tokens            = 36864;
+    outcome.metrics.restored_context_checkpoint_tokens = 36864;
+    outcome.metrics.captured_context_checkpoint_tokens = 102400;
+    const Json context_both =
+        Json::parse(format_request_done_json("serve-test", 3007, context, outcome));
+    failures += check(context_both.at("result").at("context_checkpoint").at("restored_tokens") ==
+                          36864,
+                      "combined request_done restored_tokens");
+    failures += check(context_both.at("result").at("context_checkpoint").at("captured_tokens") ==
+                          102400,
+                      "combined request_done captured_tokens");
+    failures += check(context_both.at("result").at("prefix_cache_hit_tokens") == 36864,
+                      "combined request_done cache tokens stay the full reused prefix");
+    failures +=
+        check(format_request_done(context, outcome).find("context_ckpt=restored:36864,captured:102400") !=
+                  std::string::npos,
+              "human request log omits combined restored/captured frontiers");
+    failures += check(ninfer::product::format_context_checkpoint_frontiers(0, 0, ' ') == "",
+                      "CLI/serve frontier formatter empty when both are 0");
+    failures +=
+        check(ninfer::product::format_context_checkpoint_frontiers(0, 0, ' ', "none") == "none",
+              "CLI frontier formatter prints none when both are 0");
+    failures +=
+        check(ninfer::product::format_context_checkpoint_frontiers(36864, 0, ' ') ==
+                  "restored:36864",
+              "CLI restore-only is space-separated restored:");
+    failures +=
+        check(ninfer::product::format_context_checkpoint_frontiers(0, 24576, ' ') ==
+                  "captured:24576",
+              "CLI freeze-only is space-separated captured:");
+    failures += check(ninfer::product::format_context_checkpoint_frontiers(36864, 102400, ' ') ==
+                          "restored:36864 captured:102400",
+                      "CLI combined restored/captured is space-separated");
+    failures += check(ninfer::product::format_context_checkpoint_frontiers(36864, 102400, ',') ==
+                          "restored:36864,captured:102400",
+                      "serve combined restored/captured is comma-separated");
     failures += check(done.at("timings_seconds").at("decode").get<double>() ==
                           outcome.metrics.decode_seconds,
                       "decode time lost precision");
@@ -352,10 +463,6 @@ int main() {
     failures +=
         check(format_request_start(context).find("preserve_thinking=on") != std::string::npos,
               "human request log omits preserve-thinking mode");
-    failures +=
-        check(format_request_done(context, outcome).find("reuse=restore_response_checkpoint") !=
-                  std::string::npos,
-              "human request log omits response checkpoint reuse path");
     failures += check(format_request_done(context, outcome).find("reuse_source=vram_resident") !=
                           std::string::npos,
                       "human request log omits reuse_source");

@@ -193,6 +193,10 @@ public:
     [[nodiscard]] std::uint64_t kv_ram_index_version() const noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
+    [[nodiscard]] std::uint32_t
+    captured_context_checkpoint_tokens_lane(std::uint32_t lane) const noexcept;
+    [[nodiscard]] std::uint32_t
+    restored_context_checkpoint_tokens_lane(std::uint32_t lane) const noexcept;
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;

@@ -77,12 +77,15 @@ ninfer::LinearAttentionStatePoolSpec gdn_27b_spec(std::int32_t slots) {
             .conv_dtype     = ninfer::DType::BF16};
 }
 
-void fill_slot(ninfer::LinearAttentionStatePool& gdn, std::int32_t slot, unsigned char seed) {
+void fill_slot(ninfer::LinearAttentionStatePool& gdn, std::int32_t slot, unsigned char seed,
+               cudaStream_t stream) {
     for (std::uint32_t layer = 0; layer < gdn.layer_count(); ++layer) {
         const ninfer::Tensor conv = gdn.conv_slot(layer, slot);
         const ninfer::Tensor rec  = gdn.recurrent_slot(layer, slot);
-        CUDA_CHECK(cudaMemset(conv.data, seed + static_cast<unsigned char>(layer), conv.bytes()));
-        CUDA_CHECK(cudaMemset(rec.data, seed + 17U + static_cast<unsigned char>(layer), rec.bytes()));
+        CUDA_CHECK(cudaMemsetAsync(conv.data, seed + static_cast<unsigned char>(layer), conv.bytes(),
+                                   stream));
+        CUDA_CHECK(cudaMemsetAsync(rec.data, seed + 17U + static_cast<unsigned char>(layer),
+                                   rec.bytes(), stream));
     }
 }
 
@@ -100,7 +103,9 @@ int expect_slot(ninfer::LinearAttentionStatePool& gdn, std::int32_t slot, unsign
         const unsigned char rec_byte  = seed + 17U + static_cast<unsigned char>(layer);
         for (unsigned char b : conv_host) {
             if (b != conv_byte) {
-                std::cerr << label << " GDN conv layer " << layer << " mismatch\n";
+                std::cerr << label << " GDN conv layer " << layer << " mismatch (got 0x"
+                          << std::hex << static_cast<int>(b) << ", expected 0x"
+                          << static_cast<int>(conv_byte) << std::dec << ")\n";
                 return 1;
             }
         }
@@ -225,7 +230,7 @@ int main() {
     CUDA_CHECK(cudaEventCreate(&stop));
 
     ninfer::LayoutBuilder gdn_builder;
-    const auto gdn_layout = ninfer::plan_linear_attention_state_pool(gdn_builder, gdn_27b_spec(2));
+    const auto gdn_layout = ninfer::plan_linear_attention_state_pool(gdn_builder, gdn_27b_spec(3));
     ninfer::DeviceArena gdn_arena(gdn_builder.finish(256));
     ninfer::LinearAttentionStatePool gdn({gdn_arena.base(), gdn_arena.capacity()}, gdn_layout);
     const std::size_t gdn_slot_bytes =
@@ -239,7 +244,7 @@ int main() {
     auto* conv_dst = static_cast<unsigned char*>(gdn_host);
     auto* rec_dst  = conv_dst + gdn.conv_host_image_bytes();
 
-    fill_slot(gdn, 0, 0x31);
+    fill_slot(gdn, 0, 0x31, ctx.stream);
     ninfer::DeviceBuffer gdn_bulk(gdn_slot_bytes);
     for (int i = 0; i < kWarmup; ++i) {
         CUDA_CHECK(cudaMemcpyAsync(gdn_host, gdn_bulk.p, gdn_slot_bytes, cudaMemcpyDeviceToHost,
@@ -287,6 +292,63 @@ int main() {
     const double gdn_d2d_ms = elapsed_ms(start, stop) / kIters;
     std::cerr << "kv_ram_large gdn27_copy_slot=" << gdn_d2d_ms << " ms ("
               << gbs(gdn_slot_bytes, gdn_d2d_ms, 1) << " GB/s D2D)\n";
+
+    fill_slot(gdn, 0, 0x51, ctx.stream);
+    fill_slot(gdn, 1, 0x00, ctx.stream);
+    fill_slot(gdn, 2, 0x77, ctx.stream);
+    gdn.copy_slot_2d(0, 1, ctx.stream);
+    cudaEvent_t d2d_done = nullptr;
+    CUDA_CHECK(cudaEventCreateWithFlags(&d2d_done, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventRecord(d2d_done, ctx.stream));
+    for (std::uint32_t layer = 0; layer < gdn.layer_count(); ++layer) {
+        const ninfer::Tensor conv = gdn.conv_slot(layer, 0);
+        const ninfer::Tensor rec  = gdn.recurrent_slot(layer, 0);
+        CUDA_CHECK(cudaMemsetAsync(conv.data, static_cast<int>(0x52 + layer), conv.bytes(),
+                                   ctx.stream));
+        CUDA_CHECK(cudaMemsetAsync(rec.data, static_cast<int>(0x52 + 17U + layer), rec.bytes(),
+                                   ctx.stream));
+    }
+    CUDA_CHECK(cudaStreamWaitEvent(ctx.copy_stream, d2d_done, 0));
+    gdn.pack_slot_to_host(1, conv_dst, rec_dst, ctx.copy_stream);
+    ctx.synchronize_all();
+    CUDA_CHECK(cudaEventDestroy(d2d_done));
+    if (expect_slot(gdn, 1, 0x51, "48-layer staging survived next-prefill overwrite") != 0) {
+        return 1;
+    }
+    if (expect_slot(gdn, 0, 0x52, "48-layer current is next prefill") != 0) { return 1; }
+    if (expect_slot(gdn, 2, 0x77, "48-layer sibling slot survived in-pool copy_slot_2d") != 0) {
+        return 1;
+    }
+
+    fill_slot(gdn, 0, 0x61, ctx.stream);
+    gdn.copy_slot_2d(0, 1, ctx.stream);
+    CUDA_CHECK(cudaEventCreateWithFlags(&d2d_done, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventRecord(d2d_done, ctx.stream));
+    CUDA_CHECK(cudaStreamWaitEvent(ctx.copy_stream, d2d_done, 0));
+    gdn.pack_slot_to_host(1, conv_dst, rec_dst, ctx.copy_stream);
+    cudaEvent_t copies_done = nullptr;
+    CUDA_CHECK(cudaEventCreateWithFlags(&copies_done, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventRecord(copies_done, ctx.copy_stream));
+    CUDA_CHECK(cudaEventSynchronize(copies_done));
+    CUDA_CHECK(cudaEventDestroy(copies_done));
+    CUDA_CHECK(cudaEventDestroy(d2d_done));
+    if (expect_slot(gdn, 1, 0x61, "48-layer staging survived full-pack abort wait") != 0) {
+        return 1;
+    }
+    {
+        const std::size_t layer0 = gdn.conv_slot_bytes();
+        for (std::size_t i = 0; i < layer0; ++i) {
+            if (conv_dst[i] != 0x61) {
+                return fail("48-layer abort wait left an incomplete host GDN pack");
+            }
+        }
+    }
+    fill_slot(gdn, 0, 0x62, ctx.stream);
+    gdn.copy_slot_2d(0, 1, ctx.stream);
+    ctx.synchronize_all();
+    if (expect_slot(gdn, 1, 0x62, "48-layer staging reused after full-pack abort wait") != 0) {
+        return 1;
+    }
 
     ninfer::LayoutBuilder kv_builder;
     auto kv_layout = ninfer::plan_paged_kv_pool(kv_builder, {.page_group_count      = kKvPages * 2,
@@ -394,8 +456,9 @@ int main() {
         return fail("contiguous 100 MiB KV pack/unpack fell below pinned memcpy floor");
     }
 
-    fill_slot(gdn, 0, 0x44);
-    fill_slot(gdn, 1, 0x45);
+    fill_slot(gdn, 0, 0x44, ctx.stream);
+    fill_slot(gdn, 1, 0x45, ctx.stream);
+    ctx.synchronize_all();
     ninfer::DeviceBuffer hidden_buf(10240);
     hidden_buf.fill(0xa1);
     ninfer::Tensor hidden(hidden_buf.p, ninfer::DType::U8, {10240});

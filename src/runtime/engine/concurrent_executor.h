@@ -525,6 +525,12 @@ private:
             result.prefix_reuse_path      = request->begin->prefix_reuse_path;
             result.prefix_reuse_source    = request->begin->prefix_reuse_source;
         }
+        if (request->lane) {
+            result.captured_context_checkpoint_tokens =
+                instance_.program->captured_context_checkpoint_tokens_lane(*request->lane);
+            result.restored_context_checkpoint_tokens =
+                instance_.program->restored_context_checkpoint_tokens_lane(*request->lane);
+        }
         result.kv_ram_save_seconds = request->kv_ram_save_seconds;
         result.kv_ram_load_seconds = request->kv_ram_load_seconds;
         if (request->lane) {

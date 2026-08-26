@@ -42,6 +42,8 @@ struct GenerationMetrics {
     std::uint32_t prefix_cache_hit_tokens     = 0;
     ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::FullReset;
     ninfer::PrefixReuseSource prefix_reuse_source = ninfer::PrefixReuseSource::None;
+    std::uint32_t captured_context_checkpoint_tokens = 0;
+    std::uint32_t restored_context_checkpoint_tokens = 0;
     std::size_t kv_ram_capacity_bytes = 0;
     std::size_t kv_ram_used_bytes     = 0;
     std::size_t kv_ram_entry_count    = 0;

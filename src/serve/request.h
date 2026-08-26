@@ -73,7 +73,10 @@ struct CompletionTimings {
     int draft_n_accepted        = 0;
     // Reasoning (thinking) portion of the completion; 0 when thinking is off.
     int reasoning_tokens        = 0;
+    ninfer::PrefixReusePath prefix_reuse_path     = ninfer::PrefixReusePath::FullReset;
     ninfer::PrefixReuseSource prefix_reuse_source = ninfer::PrefixReuseSource::None;
+    std::uint32_t captured_context_checkpoint_tokens = 0;
+    std::uint32_t restored_context_checkpoint_tokens = 0;
     // Host KV RAM tier stats, all zero when the tier is off. used_bytes / entry_count
     // are live engine-level gauges at request end; the *_total counters are
     // engine-lifetime cumulative; save_ms / load_ms are this request's D2H/H2D copy

@@ -3,11 +3,13 @@
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
 #include "core/arena.h"
+#include "core/device.h"
 #include "core/gdn_replay_records.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
+#include "targets/qwen3_6/impl/runtime/context_checkpoint.h"
 #include "targets/qwen3_6/impl/runtime/kv_ram_cache.h"
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
@@ -22,6 +24,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
@@ -33,7 +36,11 @@ using RewriteCheckpointSpec = qwen3_6::RewriteCheckpointSpec;
 using ReusePath = ninfer::PrefixReusePath;
 
 [[nodiscard]] constexpr bool is_rewrite_checkpoint_restore(ReusePath path) noexcept {
-    return path == ReusePath::RestoreTurnCheckpoint || path == ReusePath::RestoreResponseCheckpoint;
+    return qwen3_6::detail::is_rewrite_checkpoint_restore(path);
+}
+
+[[nodiscard]] constexpr bool is_complete_checkpoint_restore(ReusePath path) noexcept {
+    return qwen3_6::detail::is_complete_checkpoint_restore(path);
 }
 
 [[nodiscard]] constexpr ReusePath restore_path(RewriteCheckpointKind kind) noexcept {
@@ -88,6 +95,7 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t backend_kv_page_entitlement = 0;
     PrefixReuseSource reuse_source            = PrefixReuseSource::None;
     std::uint64_t ram_entry_id                = 0;
+    bool capture_context_checkpoints          = false;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail
@@ -124,6 +132,61 @@ struct RewriteCheckpoint {
     bool valid                 = false;
     RewriteCheckpointKind kind = RewriteCheckpointKind::TurnClosure;
     std::uint32_t frontier     = 0;
+};
+
+struct ContextCheckpointHead {
+    std::uint32_t frontier = 0;
+    qwen3_6::detail::PrefixHash128 hash{};
+    qwen3_6::detail::ContextCheckpointKind kind = qwen3_6::detail::ContextCheckpointKind::Ladder;
+    std::optional<PinnedHostBuffer> conv;
+    std::optional<PinnedHostBuffer> recurrent;
+    std::optional<PinnedHostBuffer> hidden;
+    std::optional<PinnedHostBuffer> dflash;
+    cudaEvent_t copies_done = nullptr;
+
+    ContextCheckpointHead() = default;
+    ContextCheckpointHead(const ContextCheckpointHead&)            = delete;
+    ContextCheckpointHead& operator=(const ContextCheckpointHead&) = delete;
+    ContextCheckpointHead(ContextCheckpointHead&& other) noexcept { *this = std::move(other); }
+    ContextCheckpointHead& operator=(ContextCheckpointHead&& other) noexcept {
+        if (this == &other) { return *this; }
+        release();
+        frontier     = other.frontier;
+        hash         = other.hash;
+        kind         = other.kind;
+        conv         = std::move(other.conv);
+        recurrent    = std::move(other.recurrent);
+        hidden       = std::move(other.hidden);
+        dflash       = std::move(other.dflash);
+        copies_done  = other.copies_done;
+        other.copies_done = nullptr;
+        other.frontier    = 0;
+        other.kind        = qwen3_6::detail::ContextCheckpointKind::Ladder;
+        return *this;
+    }
+    ~ContextCheckpointHead() { release(); }
+
+    void wait_copies() const {
+        if (copies_done != nullptr) { CUDA_CHECK(cudaEventSynchronize(copies_done)); }
+    }
+
+    void release() noexcept {
+        if (copies_done != nullptr) {
+            (void)cudaEventSynchronize(copies_done);
+            (void)cudaEventDestroy(copies_done);
+            copies_done = nullptr;
+        }
+        conv.reset();
+        recurrent.reset();
+        hidden.reset();
+        dflash.reset();
+    }
+};
+
+struct ContextCheckpointIndex {
+    std::uint32_t frontier = 0;
+    qwen3_6::detail::PrefixHash128 hash{};
+    qwen3_6::detail::ContextCheckpointKind kind = qwen3_6::detail::ContextCheckpointKind::Ladder;
 };
 
 struct SequenceKVBundle {
@@ -173,6 +236,8 @@ struct SequenceState {
     bool retained                 = false;
     std::uint64_t use_tick        = 0;
     RewriteCheckpoint rewrite_checkpoint;
+    std::vector<ContextCheckpointHead> context_checkpoints;
+    std::uint32_t next_context_mark = qwen3_6::detail::kPrefillContextMarks.front();
 };
 
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
@@ -183,6 +248,13 @@ struct RequestControl {
     ops::SamplingConfig sampling_host;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
+
+    // Absolute staged-checkpoint head frontiers; 0 if none. Survive prefill.reset()
+    // and abort_lane/clear_lane so completion can still read them. captured is the
+    // advertised freeze or rollback pin written this request; restored is the
+    // matching head F on a staged restore.
+    std::uint32_t captured_context_checkpoint_tokens = 0;
+    std::uint32_t restored_context_checkpoint_tokens = 0;
 
     struct Prefill {
         PreparedPromptData prompt;
@@ -200,6 +272,7 @@ struct RequestControl {
         ReusePath reuse                  = ReusePath::FullReset;
         PrefixReuseSource reuse_source   = PrefixReuseSource::None;
         MtpBridgeMode mtp_bridge         = MtpBridgeMode::None;
+        bool capture_context_checkpoints = false;
         // Per-chunk prefill step records (tokens processed, wall seconds) for the
         // tail-window throughput metric. One entry per advance_prefill call; the
         // finalizing call includes its sampling/bridge time.
@@ -263,6 +336,10 @@ public:
     [[nodiscard]] std::uint64_t kv_ram_index_version() const noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
+    [[nodiscard]] std::uint32_t
+    captured_context_checkpoint_tokens_lane(std::uint32_t lane) const noexcept;
+    [[nodiscard]] std::uint32_t
+    restored_context_checkpoint_tokens_lane(std::uint32_t lane) const noexcept;
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
 
@@ -306,6 +383,7 @@ public:
     Tensor token_counts;
     Tensor tail_hidden_store;
     Tensor rewrite_checkpoint_hidden_store;
+    Tensor staging_hidden;
 
     std::array<SequenceState, kMaximumConcurrency> sequences;
     std::array<RequestControl, kMaximumConcurrency> requests;
@@ -384,6 +462,7 @@ private:
         std::uint32_t dflash_context_frontier = 0;
         bool tail_hidden_valid                = false;
         bool backend_image_present            = false;
+        std::vector<ContextCheckpointIndex> context_checkpoints;
     };
 
     void apply_reuse_decision(RequestPlanImpl& plan, const ResidentStateView& view,
@@ -400,6 +479,38 @@ private:
                            std::uint32_t skip, ScoreResult& result);
     void run_decode_score(PreparedPromptData&& prompt, runtime::TransientRegion transient,
                           std::span<const TokenId> ids, std::uint32_t prefix, ScoreResult& result);
+    void maybe_freeze_context_checkpoint(SequenceState& sequence, RequestControl& request,
+                                         std::uint32_t chunk_tokens);
+    void maybe_capture_turn_rollback(SequenceState& sequence, RequestControl& request,
+                                     const PreparedPromptData& prompt, std::uint32_t base,
+                                     std::uint32_t prompt_tokens, bool capture_enabled);
+    void restore_context_checkpoint_state(SequenceState& sequence, std::uint32_t base);
+    void restore_dflash_cyclic_from_head(SequenceState& sequence, const ContextCheckpointHead& head);
+    void snapshot_dflash_cyclic_to_staging(std::int32_t lane);
+    void pack_dflash_cyclic_to_head(ContextCheckpointHead& head);
+    void drop_context_checkpoints_after(SequenceState& sequence, std::uint32_t frontier) noexcept;
+    void clear_context_checkpoints(SequenceState& sequence) noexcept;
+    void install_ram_context_checkpoints(SequenceState& sequence,
+                                         const qwen3_6::detail::RamRestoredHost& host);
+    [[nodiscard]] bool staging_holds(std::uint32_t lane, qwen3_6::detail::PrefixHash128 hash,
+                                     std::uint32_t frontier) const noexcept;
+    [[nodiscard]] bool captures_context_checkpoints() const noexcept;
+    void fence_staging_copies() noexcept;
+    void unoccupy_staging() noexcept;
+    void reload_turn_rollback_into_staging(std::uint32_t lane, qwen3_6::detail::PrefixHash128 hash,
+                                           std::uint32_t frontier);
+
+    struct ContextCheckpointStaging {
+        bool occupied             = false;
+        std::uint32_t lane        = 0;
+        std::uint32_t frontier    = 0;
+        qwen3_6::detail::PrefixHash128 hash{};
+        qwen3_6::detail::ContextCheckpointKind kind =
+            qwen3_6::detail::ContextCheckpointKind::Ladder;
+        cudaEvent_t d2d_done    = nullptr;
+        cudaEvent_t copies_done = nullptr;
+    };
+    ContextCheckpointStaging staging_;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
