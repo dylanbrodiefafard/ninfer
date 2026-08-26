@@ -356,13 +356,6 @@ std::vector<std::uint16_t> to_bf16_bits(const std::vector<float>& values) {
     return bits;
 }
 
-// Residual after Sage3 K-centering, rounded the same way the fill kernel does
-// (`__float2bfloat16` on device). Custom host RNE disagreed with CUDA on some
-// 35B seeds.
-float sage_center_residual(float key, float mean) {
-    return __bfloat162float(__float2bfloat16(key - mean));
-}
-
 std::vector<double> bf16_bits_to_double(const std::vector<std::uint16_t>& bits) {
     std::vector<double> values(bits.size());
     for (std::size_t i = 0; i < bits.size(); ++i) {
@@ -574,39 +567,20 @@ HostCache make_cache(const Geometry& geometry, DType dtype, std::int32_t max_con
         cache.k_fp8.assign(nvfp4_scale_elements(geometry, logical_capacity), 0);
         cache.v_fp8.assign(nvfp4_scale_elements(geometry, logical_capacity), 0);
         if (sage) {
-            // K stays in the NVFP4 per-key-group layout; V moves to the sage d-major
-            // per-(d, 16-key block) layout.
+            // K stays in the production NVFP4 per-key-group layout (uncentered:
+            // Sage3's sequence-global k.mean is softmax-invariant; per-page mean
+            // is not). V moves to the sage d-major per-(d, 16-key block) layout.
             for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
-                for (std::int32_t page = 0; page < logical_capacity / kPagedKVPageSize; ++page) {
-                    const std::int32_t page_first = page * kPagedKVPageSize;
+                for (std::int32_t position = 0; position < logical_capacity; ++position) {
                     for (std::int32_t group = 0; group < kNvfp4Groups; ++group) {
                         const std::int32_t d = group * kNvfp4Group;
-                        float mean[kNvfp4Group];
-                        for (std::int32_t i = 0; i < kNvfp4Group; ++i) { mean[i] = 0.0f; }
-                        for (std::int32_t p = 0; p < kPagedKVPageSize; ++p) {
-                            const std::size_t source = cache_index(
-                                geometry, logical_capacity, head, page_first + p, d);
-                            for (std::int32_t i = 0; i < kNvfp4Group; ++i) {
-                                mean[i] += logical_k[source + static_cast<std::size_t>(i)];
-                            }
-                        }
-                        const float inv = 1.0f / static_cast<float>(kPagedKVPageSize);
-                        for (std::int32_t i = 0; i < kNvfp4Group; ++i) { mean[i] *= inv; }
-                        for (std::int32_t p = 0; p < kPagedKVPageSize; ++p) {
-                            const std::int32_t position = page_first + p;
-                            const std::size_t source =
-                                cache_index(geometry, logical_capacity, head, position, d);
-                            const std::size_t code = nvfp4_code_index(geometry, logical_capacity,
-                                                                      head, position, group * 8);
-                            const std::size_t scale = nvfp4_scale_index(geometry, logical_capacity,
-                                                                       head, position, group);
-                            float adj[kNvfp4Group];
-                            for (std::int32_t i = 0; i < kNvfp4Group; ++i) {
-                                adj[i] = sage_center_residual(
-                                    logical_k[source + static_cast<std::size_t>(i)], mean[i]);
-                            }
-                            encode_nvfp4_from_f32(adj, cache.k_u8, code, cache.k_fp8, scale);
-                        }
+                        const std::size_t source =
+                            cache_index(geometry, logical_capacity, head, position, d);
+                        const std::size_t code = nvfp4_code_index(geometry, logical_capacity, head,
+                                                                  position, group * 8);
+                        const std::size_t scale =
+                            nvfp4_scale_index(geometry, logical_capacity, head, position, group);
+                        encode_nvfp4_group(logical_k, source, cache.k_u8, code, cache.k_fp8, scale);
                     }
                 }
                 for (std::int32_t page = 0; page < logical_capacity / kPagedKVPageSize; ++page) {
@@ -682,36 +656,7 @@ void append_cache(HostCache& cache, const std::vector<float>& k, const std::vect
                         nvfp4_code_index(geometry, cache.logical_capacity, head, position, group * 8);
                     const std::size_t scale =
                         nvfp4_scale_index(geometry, cache.logical_capacity, head, position, group);
-                    if (cache.sage) {
-                        const std::int32_t page_first = position & ~(kPagedKVPageSize - 1);
-                        const std::int32_t base       = positions.front();
-                        const std::int32_t count = static_cast<std::int32_t>(positions.size());
-                        const std::int32_t lo = std::max(page_first, base);
-                        const std::int32_t hi = std::min(page_first + kPagedKVPageSize, base + count);
-                        const std::int32_t n  = hi - lo;
-                        if (n >= 2) {
-                            float mean[kNvfp4Group];
-                            for (std::int32_t i = 0; i < kNvfp4Group; ++i) { mean[i] = 0.0f; }
-                            for (std::int32_t p = lo; p < hi; ++p) {
-                                const std::int32_t t = p - base;
-                                const std::size_t src = kv_input_index(geometry, head, d, t);
-                                for (std::int32_t i = 0; i < kNvfp4Group; ++i) {
-                                    mean[i] += k[src + static_cast<std::size_t>(i)];
-                                }
-                            }
-                            const float inv = 1.0f / static_cast<float>(n);
-                            float adj[kNvfp4Group];
-                            for (std::int32_t i = 0; i < kNvfp4Group; ++i) {
-                                adj[i] = sage_center_residual(
-                                    k[source + static_cast<std::size_t>(i)], mean[i] * inv);
-                            }
-                            encode_nvfp4_from_f32(adj, cache.k_u8, target, cache.k_fp8, scale);
-                        } else {
-                            encode_nvfp4_group(k, source, cache.k_u8, target, cache.k_fp8, scale);
-                        }
-                    } else {
-                        encode_nvfp4_group(k, source, cache.k_u8, target, cache.k_fp8, scale);
-                    }
+                    encode_nvfp4_group(k, source, cache.k_u8, target, cache.k_fp8, scale);
                     if (!cache.sage) {
                         encode_nvfp4_group(v, source, cache.v_u8, target, cache.v_fp8, scale);
                     }
@@ -3769,8 +3714,8 @@ int run_geometry(const Geometry& geometry) {
                                     /*sage=*/true);
             failures += run_a3_case(geometry, dtype, {1, 2048, 4096, 517u},
                                     MappingPattern::Identity, /*sage=*/true);
+            failures += run_sage_skip_rejected(geometry);
             if (!sage_only) {
-                failures += run_sage_skip_rejected(geometry);
                 // Prompt skip on exact NVFP4. T=512 / base=0 dump is q_block 0, which
                 // only sees two causal K-tiles — both force-kept (sink + last). That
                 // checks kernel==v1 keep-list identity, not ranking. The planted

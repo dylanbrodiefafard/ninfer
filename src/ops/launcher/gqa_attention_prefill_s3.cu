@@ -16,6 +16,8 @@ namespace ninfer::ops::detail {
 
 namespace {
 
+// Production sage prefill: occupancy-2 cp.async kernel (Br=64, SmoothQ).
+// NINFER_S3_TMA=1 is opt-in only (no SmoothQ; SM120 TMA descriptor-by-value IMA).
 inline bool gqa_s3_occ2_enabled() {
     static const bool enabled = [] {
         const char* e = std::getenv("NINFER_S3_OCC2");

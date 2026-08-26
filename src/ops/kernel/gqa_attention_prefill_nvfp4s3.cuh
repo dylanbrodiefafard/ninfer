@@ -17,11 +17,16 @@
 //
 // SmoothQ (Sage3 preprocess_qkv): each CTA subtracts its Br-row Q mean before
 // NVFP4 Q-quant, then adds q_mean·K_hat onto the QK scores so softmax sees
-// Q·K_hat rather than (Q-mean)·K_hat. K is page-centered at fill
-// (`k -= k.mean` over keys in the append that share a 64-key page).
+// Q·K_hat rather than (Q-mean)·K_hat.
+//
+// K is NOT page-centered. Sage3's `k -= k.mean(dim=seq)` is a single sequence-
+// global mean, which is softmax-invariant (Q·(K-c) = Q·K - Q·c, constant per
+// row). A per-page mean is a different c per 64-key tile and wrecks softmax
+// (8k PPL 10.86 vs kv-nvfp4 6.70, 2026-08-25). Incremental paged fill cannot
+// cheaply keep a global mean constant, so K stays the production NVFP4 quant.
 //
 // Cache layout (NVFP4 storage, --sage only): K is quantized exactly as the prod
-// NVFP4 fill (per key, 16-d groups) after page-mean centering. V is quantized along the d axis: one UE4M3
+// NVFP4 fill (per key, 16-d groups). V is quantized along the d axis: one UE4M3
 // scale per (d, 16-key block) in the v_scale plane, laid out d-major
 // [page][kv_head][d 256][key_block 4] (same 1024 B per page-head as the prod
 // per-key plane; only the index mapping and the code normalization differ). The
@@ -68,7 +73,8 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_nvfp4s3_kernel
     const int base_pos              = positions[0];
 
     if (unit < k_units) {
-        // K: Sage3 page-mean centering then NVFP4 (per key, 16-d groups).
+        // K: production NVFP4 (per key, 16-d groups). Do not per-page-center:
+        // that is not Sage3's global mean and is not softmax-invariant.
         const int grp     = unit % Groups;
         const int tmp     = unit / Groups;
         const int kv_head = tmp % Geometry::KVHeads;
@@ -76,10 +82,11 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_nvfp4s3_kernel
         const int position        = base_pos + token;
         const int physical_page    = paged_kv_physical_page(block_table, position);
         const int page_off         = position & kPagedKVPageMask;
+        const int d0               = grp * kGqaNvfp4Group;
         std::uint32_t lo = 0, hi = 0;
         std::uint8_t sc = 0;
-        gqa_s3_quantize_centered_k_contig<Geometry>(k, kv_head, token, base_pos, tokens, grp, lo, hi,
-                                                    sc);
+        gqa_nvfp4_quantize_bf16x16(&k[gqa_nvfp4_src_index<Geometry>(kv_head, d0, token)], lo, hi,
+                                   sc);
         const std::int64_t code =
             gqa_nvfp4_code_index<Geometry>(physical_page, kv_head, grp * 8, page_off);
         *reinterpret_cast<std::uint32_t*>(cache_k + code)     = lo;

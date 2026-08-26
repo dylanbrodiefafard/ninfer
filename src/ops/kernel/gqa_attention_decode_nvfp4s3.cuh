@@ -598,10 +598,11 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             if (position < split_start || position >= split_end) { continue; }
             const int physical_page = paged_kv_physical_page(block_table, position);
             const int page_offset   = position & kPagedKVPageMask;
+            const int d0            = grp * kGqaNvfp4Group;
             std::uint32_t k_lo = 0, k_hi = 0;
             std::uint8_t k_sc = 0;
-            gqa_s3_quantize_centered_k_contig<Geometry>(input.k, kv_head, token, pos[0],
-                                                        valid_tokens, grp, k_lo, k_hi, k_sc);
+            gqa_nvfp4_quantize_bf16x16(&input.k[gqa_kv_new_index<Geometry>(kv_head, d0, token)],
+                                       k_lo, k_hi, k_sc);
             const std::int64_t code =
                 gqa_nvfp4_code_index<Geometry>(physical_page, kv_head, grp * 8, page_offset);
             *reinterpret_cast<std::uint32_t*>(cache_k + code)     = k_lo;
@@ -1354,10 +1355,10 @@ __launch_bounds__(256) __global__ void gqa_attention_decode_fill_nvfp4s3_kernel(
         const int position      = base_pos + token;
         const int physical_page = paged_kv_physical_page(block_table, position);
         const int page_off      = position & kPagedKVPageMask;
+        const int d0            = grp * kGqaNvfp4Group;
         std::uint32_t lo = 0, hi = 0;
         std::uint8_t sc = 0;
-        gqa_s3_quantize_centered_k_contig<Geometry>(kb, kv_head, token, base_pos, valid_tokens, grp,
-                                                    lo, hi, sc);
+        gqa_nvfp4_quantize_bf16x16(&kb[gqa_kv_new_index<Geometry>(kv_head, d0, token)], lo, hi, sc);
         const std::int64_t code =
             gqa_nvfp4_code_index<Geometry>(physical_page, kv_head, grp * 8, page_off);
         *reinterpret_cast<std::uint32_t*>(cache_k + code)     = lo;
