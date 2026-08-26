@@ -15,6 +15,7 @@ struct DeviceContext {
     cudaStream_t stream      = nullptr;
     cudaStream_t load_stream = nullptr;
     cudaStream_t copy_stream = nullptr;
+    cudaEvent_t copy_order_event = nullptr;
     cudaDeviceProp props{};
 
     explicit DeviceContext(int device_id = 0);
