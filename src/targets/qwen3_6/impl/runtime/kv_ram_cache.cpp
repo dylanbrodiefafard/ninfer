@@ -419,7 +419,9 @@ void KVRamCache::begin_copies(Record& record, cudaStream_t stream) {
 }
 
 void KVRamCache::record_copies(Record& record, cudaStream_t stream) {
-    if (record.copies_done == nullptr) { CUDA_CHECK(cudaEventCreate(&record.copies_done)); }
+    if (record.copies_done == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&record.copies_done, cudaEventBlockingSync));
+    }
     CUDA_CHECK(cudaEventRecord(record.copies_done, stream));
     record.copies_timed = record.copies_start != nullptr;
 }
