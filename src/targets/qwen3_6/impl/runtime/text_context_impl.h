@@ -71,26 +71,13 @@ void require_tensor_shape(const Tensor& t, DType dtype, std::initializer_list<st
     if (t.data == nullptr) { throw std::invalid_argument(std::string(label) + " data is null"); }
 }
 
-// Batched verify packs sequences as [rows, width*batch]. NVFP4 and SmallT routes are selected
-// from aggregate T, so C=3 k=4 (T=15) would take residual W4A4 while C=1 (T=5) stays A16, and
-// the output head would use a different SmallT specialization. Launch those column-independent
-// projections at T=width so each request matches C=1 of the same k.
-bool packed_sequence_tiles(std::int32_t batch, std::int32_t width, std::int32_t tokens) {
-    return batch > 1 && width > 1 && tokens == width * batch;
-}
-
-template <typename Fn>
-void for_each_packed_sequence_tile_pair(std::int32_t batch, std::int32_t width, Tensor& a,
-                                        Tensor& b, Fn&& fn) {
-    if (!packed_sequence_tiles(batch, width, a.ne[1]) || a.ne[1] != b.ne[1]) {
-        fn(a, b);
-        return;
-    }
-    for (std::int32_t i = 0; i < batch; ++i) {
-        Tensor a_tile = a.slice(1, i * width, width);
-        Tensor b_tile = b.slice(1, i * width, width);
-        fn(a_tile, b_tile);
-    }
+// Batched verify packs sequences as [rows, width*batch] and traverses every column-independent
+// projection once over the aggregate T=width*batch, per the concurrent contract. NVFP4 W4A4
+// routes are selected from that aggregate T, so a C>1 round can cross a W4A4 threshold the C=1
+// (T=width) round does not. The family hands the C=1 width to the leaves that own T-dependent
+// routes so the target package can pin the C=1 quantization family at the aggregate launch.
+std::int32_t packed_route_tokens(std::int32_t batch, std::int32_t width) {
+    return (batch > 1 && width > 1) ? width : 0;
 }
 
 void require_tensor_window(const Tensor& t, DType dtype, std::int32_t rows, std::int32_t cols,
@@ -752,10 +739,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_logits = logits.view({kCfg.vocab, columns});
         Tensor flat_tokens = target_tokens.view({columns});
         ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
-        for_each_packed_sequence_tile_pair(
-            batch, width, flat_hidden, flat_logits, [&](Tensor& hidden_tile, Tensor& logits_tile) {
-                ops::linear(hidden_tile, *lm_head_, logits_tile, stream);
-            });
+        ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
         ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
     }
     work_.reset();
@@ -839,22 +823,10 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     Tensor gate_flat = gate.view({kCfg.q_size, T});
     Tensor k_flat    = k.view({kCfg.kv_size, T});
     Tensor v_flat    = v.view({kCfg.kv_size, T});
-    if (packed_sequence_tiles(active_sequence_batch_, active_sequence_width_, T)) {
-        const std::int32_t width = active_sequence_width_;
-        for (std::int32_t b = 0; b < active_sequence_batch_; ++b) {
-            const std::int32_t col = b * width;
-            Tensor h_tile          = h.slice(1, col, width);
-            Tensor q_tile          = q_flat.slice(1, col, width);
-            Tensor gate_tile       = gate_flat.slice(1, col, width);
-            Tensor k_tile          = k_flat.slice(1, col, width);
-            Tensor v_tile          = v_flat.slice(1, col, width);
-            Variant::attention_projection(h_tile, *w.projection, q_tile, gate_tile, k_tile, v_tile,
-                                          ph, work_, s);
-        }
-    } else {
-        Variant::attention_projection(h, *w.projection, q_flat, gate_flat, k_flat, v_flat, ph,
-                                      work_, s);
-    }
+    const std::int32_t route_tokens =
+        packed_route_tokens(active_sequence_batch_, active_sequence_width_);
+    Variant::attention_projection(h, *w.projection, q_flat, gate_flat, k_flat, v_flat, ph, work_, s,
+                                 route_tokens);
 
     const auto results = workspace_recipe::text_attention_results<TextConfig>(work_, T);
     Tensor qn          = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, T});
@@ -898,12 +870,7 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     ops::sigmoid_mul(gate, a, s);
 
     Tensor a_flat = a.view({kCfg.q_size, T});
-    for_each_packed_sequence_tile_pair(
-        active_sequence_batch_, active_sequence_width_, a_flat, x,
-        [&](Tensor& attention_tile, Tensor& residual_tile) {
-            Variant::attention_output_projection(attention_tile, *w.o_proj, residual_tile, ph,
-                                                 work_, s);
-        });
+    Variant::attention_output_projection(a_flat, *w.o_proj, x, ph, work_, s, route_tokens);
 }
 
 void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
@@ -914,21 +881,8 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor h           = control.hidden;
     Tensor g           = control.g;
     Tensor beta        = control.beta;
-    if (packed_sequence_tiles(active_sequence_batch_, active_sequence_width_, T)) {
-        const std::int32_t width = active_sequence_width_;
-        for (std::int32_t b = 0; b < active_sequence_batch_; ++b) {
-            const std::int32_t col = b * width;
-            Tensor x_tile          = x.slice(1, col, width);
-            Tensor h_tile          = h.slice(1, col, width);
-            Tensor g_tile          = g.slice(1, col, width);
-            Tensor beta_tile       = beta.slice(1, col, width);
-            Variant::gdn_norm_control_projection(x_tile, *w.input_norm, kCfg.rms_eps, *w.projection,
-                                                 h_tile, g_tile, beta_tile, work_, s);
-        }
-    } else {
-        Variant::gdn_norm_control_projection(x, *w.input_norm, kCfg.rms_eps, *w.projection, h, g,
-                                             beta, work_, s);
-    }
+    Variant::gdn_norm_control_projection(x, *w.input_norm, kCfg.rms_eps, *w.projection, h, g, beta,
+                                         work_, s);
 
     const auto projection = workspace_recipe::gdn_projection<TextConfig>(work_, T);
     Tensor z              = projection.output_gate.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
@@ -1024,11 +978,9 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s);
 
     Tensor on_flat = on.view({kCfg.value_dim, T});
-    for_each_packed_sequence_tile_pair(
-        active_sequence_batch_, active_sequence_width_, on_flat, x,
-        [&](Tensor& output_tile, Tensor& residual_tile) {
-            Variant::gdn_output_projection(output_tile, *w.out_proj, residual_tile, ph, work_, s);
-        });
+    Variant::gdn_output_projection(on_flat, *w.out_proj, x, ph, work_, s,
+                                   packed_route_tokens(active_sequence_batch_,
+                                                       active_sequence_width_));
 }
 
 void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph) {
@@ -1037,11 +989,8 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
     Tensor h       = workspace_recipe::post_mixer_hidden<TextConfig>(work_, T);
     ops::rmsnorm(x, *post_norm, kCfg.rms_eps, true, h, s);
 
-    for_each_packed_sequence_tile_pair(
-        active_sequence_batch_, active_sequence_width_, h, x,
-        [&](Tensor& hidden_tile, Tensor& residual_tile) {
-            Variant::post_mixer(hidden_tile, *m.payload, residual_tile, ph, work_, s);
-        });
+    Variant::post_mixer(h, *m.payload, x, ph, work_, s,
+                        packed_route_tokens(active_sequence_batch_, active_sequence_width_));
 }
 
 template <class Tap>
