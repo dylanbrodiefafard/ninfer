@@ -797,6 +797,183 @@ void test_prefill_context_marks() {
 
 } // namespace
 
+// Plain text prompt of `tokens` tokens, no media, identity position axes.
+q36::PreparedPromptData text_prompt(std::uint32_t tokens) {
+    q36::PreparedPromptData prompt;
+    std::vector<std::int32_t> positions;
+    positions.reserve(3 * static_cast<std::size_t>(tokens));
+    for (std::uint32_t i = 0; i < tokens; ++i) {
+        prompt.token_ids.push_back(static_cast<ninfer::TokenId>(10 + static_cast<int>(i)));
+        prompt.token_types.push_back(0);
+    }
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        for (std::uint32_t i = 0; i < tokens; ++i) {
+            positions.push_back(static_cast<std::int32_t>(i));
+        }
+    }
+    prompt.positions = std::move(positions);
+    return prompt;
+}
+
+// Multi-turn resident state: the prompt extends a 4-token prefix with two new tokens; the
+// resident ledger/identity retain the prefix at execution frontier 4.
+struct ResidentReuseFixture {
+    q36::PreparedPromptData prompt;
+    std::vector<ninfer::TokenId> ledger;
+    q36::detail::ResidentPrefixIdentity identity;
+    q36::detail::ResidentReuseState state;
+
+    ResidentReuseFixture()
+        : prompt(text_prompt(6)),
+          ledger(text_prompt(4).token_ids),
+          state{&ledger, &identity, 4, false, q36::RewriteCheckpointKind::TurnClosure, 0, 0, 0,
+                false, false, {}} {
+        identity.assign(text_prompt(4));
+    }
+};
+
+q36::detail::PrefillReuseSelection decide(const q36::detail::ResidentReuseState& state,
+                                          const q36::PreparedPromptData& prompt,
+                                          ninfer::SpeculativeBackend backend,
+                                          bool mtp_cache = true, bool dflash = false,
+                                          bool dflash_full_layers = false) {
+    return q36::detail::decide_resident_reuse(state, prompt, backend, mtp_cache, dflash,
+                                               dflash_full_layers);
+}
+
+void test_resident_reuse_decision() {
+    using Path    = ninfer::PrefixReusePath;
+    using Kind    = q36::RewriteCheckpointKind;
+    using Backend = ninfer::SpeculativeBackend;
+    ResidentReuseFixture fixture;
+    const auto& prompt  = fixture.prompt;
+    auto state          = fixture.state;
+
+    // A ready MTP append at the frontier beats a matching checkpoint.
+    state.tail_hidden_valid = true;
+    state.mtp_kv_valid      = 3;
+    state.rewrite_valid     = true;
+    state.rewrite_frontier  = 4;
+    {
+        const auto sel = decide(state, prompt, Backend::Mtp);
+        expect(sel.path == Path::AppendAtFrontier && sel.frontier == 4,
+               "ready MTP append at the frontier beats the checkpoint");
+    }
+
+    // The reported bug: append is not ready (tail hidden lost) but a matching rewrite
+    // checkpoint at the same frontier exists. The decision must fall through to the
+    // checkpoint instead of forcing a FullReset.
+    state.tail_hidden_valid = false;
+    {
+        const auto sel = decide(state, prompt, Backend::Mtp);
+        expect(sel.path == Path::RestoreTurnCheckpoint && sel.frontier == 4,
+               "unready MTP append falls through to a matching rewrite checkpoint");
+    }
+
+    // An older checkpoint is selected when it is the longest head MTP KV covers.
+    state.rewrite_frontier = 2;
+    state.mtp_kv_valid     = 1;
+    {
+        const auto sel = decide(state, prompt, Backend::Mtp);
+        expect(sel.path == Path::RestoreTurnCheckpoint && sel.frontier == 2,
+               "older rewrite checkpoint with sufficient MTP KV is selected");
+    }
+
+    // MTP KV shorter than the checkpoint frontier forces FullReset.
+    state.mtp_kv_valid = 0;
+    {
+        const auto sel = decide(state, prompt, Backend::Mtp);
+        expect(sel.path == Path::FullReset && sel.frontier == 0,
+               "checkpoint restore with MTP KV shorter than F-1 FullResets");
+    }
+
+    // Without an MTP cache no reuse path is selectable.
+    state          = fixture.state;
+    state.rewrite_valid     = true;
+    state.rewrite_frontier  = 4;
+    state.mtp_kv_valid      = 3;
+    state.tail_hidden_valid = true;
+    {
+        const auto sel = decide(state, prompt, Backend::Mtp, /*mtp_cache=*/false);
+        expect(sel.path == Path::FullReset, "missing MTP cache FullResets every reuse path");
+    }
+
+    // A staged head longer than the rewrite frontier wins; kind maps to its restore path.
+    state          = fixture.state;
+    state.rewrite_valid    = true;
+    state.rewrite_frontier = 2;
+    state.mtp_kv_valid     = 3;
+    state.context_checkpoints = {
+        {4, q36::detail::prefix_hash_at(fixture.ledger, fixture.identity, 4),
+         q36::detail::ContextCheckpointKind::Ladder}};
+    {
+        const auto sel = decide(state, prompt, Backend::Mtp);
+        expect(sel.path == Path::RestoreContextCheckpoint && sel.frontier == 4,
+               "matching staged head beats a shorter rewrite checkpoint");
+    }
+
+    // The checkpoint kind determines the restore path.
+    state          = fixture.state;
+    state.rewrite_valid    = true;
+    state.rewrite_kind     = Kind::ResponseReplay;
+    state.rewrite_frontier = 4;
+    state.mtp_kv_valid     = 3;
+    {
+        const auto sel = decide(state, prompt, Backend::Mtp);
+        expect(sel.path == Path::RestoreResponseCheckpoint && sel.frontier == 4,
+               "ResponseReplay rewrite replays through the response restore path");
+    }
+
+    // DFlash gates the append on its context frontier; a short context still FullResets a
+    // selected rewrite restore even with the backend image present.
+    state          = fixture.state;
+    state.rewrite_valid           = true;
+    state.rewrite_frontier        = 4;
+    state.dflash_context_frontier = 3;
+    state.backend_image_present   = true;
+    {
+        const auto sel = decide(state, prompt, Backend::DFlash, true, /*dflash=*/true, true);
+        expect(sel.path == Path::FullReset,
+               "short DFlash context FullResets a rewrite restore");
+    }
+
+    // A context between the rewrite frontier and the execution frontier keeps the restore.
+    state.rewrite_frontier = 2;
+    {
+        const auto sel = decide(state, prompt, Backend::DFlash, true, /*dflash=*/true, true);
+        expect(sel.path == Path::RestoreTurnCheckpoint && sel.frontier == 2,
+               "DFlash context past the rewrite frontier keeps the restore");
+    }
+
+    state          = fixture.state;
+    state.rewrite_valid           = true;
+    state.rewrite_frontier        = 2;
+    state.dflash_context_frontier = 2;
+    {
+        const auto sel = decide(state, prompt, Backend::DFlash, true, /*dflash=*/true, false);
+        expect(sel.path == Path::RestoreTurnCheckpoint && sel.frontier == 2,
+               "without full layers the DFlash tail check skips the backend image");
+    }
+
+    // A checkpoint frontier beyond the prompt is not a candidate.
+    state          = fixture.state;
+    state.rewrite_valid    = true;
+    state.rewrite_frontier = 8;
+    {
+        const auto sel = decide(state, prompt, Backend::Mtp);
+        expect(sel.path == Path::FullReset, "rewrite frontier beyond the prompt is ignored");
+    }
+
+    // An unmatched frontier with no checkpoint is a FullReset.
+    state          = fixture.state;
+    fixture.ledger.resize(3);
+    {
+        const auto sel = decide(state, prompt, Backend::Mtp);
+        expect(sel.path == Path::FullReset,
+               "unmatched frontier with no checkpoint FullResets");
+    }
+}
+
 int main() {
     test_topology();
     test_decoder_layout();
@@ -806,6 +983,7 @@ int main() {
     test_prefix_identity();
     test_prefix_hash_and_dflash_gate();
     test_prefill_context_marks();
+    test_resident_reuse_decision();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;
