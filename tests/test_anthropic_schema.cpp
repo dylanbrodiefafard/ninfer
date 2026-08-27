@@ -312,6 +312,14 @@ int test_missing_and_bad_fields() {
                                    {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
     const GenerationRequest req = parse_messages_request(no_max, default_limits());
     failures += check(req.max_tokens == 512 && !req.max_tokens_set, "max_tokens default applied");
+
+    Json ninfer = {{"model", "m"},
+                   {"max_tokens", 8},
+                   {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
+                   {"ninfer", Json{{"capture_context_checkpoint", true}}}};
+    const GenerationRequest ignored = parse_messages_request(ninfer, default_limits());
+    failures += check(!ignored.capture_context_checkpoint,
+                      "Anthropic ninfer object does not pin");
     return failures;
 }
 

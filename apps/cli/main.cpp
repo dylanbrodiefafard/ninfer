@@ -337,6 +337,7 @@ int main(int argc, char** argv) {
         ninfer::RequestOptions request;
         request.execution.sampling                = cli.sampling;
         request.execution.requested_output_tokens = cli.max_new;
+        request.execution.capture_context_checkpoint = cli.capture_context_checkpoint;
         request.stop.token_ids                    = cli.stop_token_ids;
         request.stop.strings                      = cli.stop_strings;
         request.output.raw                        = cli.raw_output;
@@ -350,6 +351,7 @@ int main(int argc, char** argv) {
         engine_options.max_context    = cli.max_context;
         engine_options.kv_capacity    = cli.kv_capacity;
         engine_options.kv_ram_capacity_bytes = cli.kv_ram_capacity_bytes;
+        engine_options.context_checkpoint_marks = cli.context_checkpoint_marks;
         engine_options.prefill_chunk  = cli.prefill_chunk;
         engine_options.kv_cache       = cli.kv_cache;
         engine_options.sage_attn      = cli.sage_attn;

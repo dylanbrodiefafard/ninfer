@@ -92,6 +92,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--dflash-verify-width N] "
            "[--default-max-tokens N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
+           "[--context-checkpoints off|a,b,c] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--system-prepend TEXT] "
            "[--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
@@ -112,6 +113,9 @@ std::string serve_usage_text(const char* argv0) {
            " MiB of sizing headroom\n"
            "       --kv-ram-capacity sets pinned host KV prefix-cache capacity in MiB (default off)\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
+           "       --context-checkpoints off disables the automatic prefill ladder; a,b,c replaces "
+           "the default marks (requires --spec mtp or dflash). Marks at or above --max-context "
+           "stay unused. Advertised freeze F is the committed chunk end at or past the mark.\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       --system-prepend prepends TEXT to the leading system/developer instruction on "
            "every request (inserts a system turn if missing)\n"
@@ -238,6 +242,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
+        } else if (arg == "--context-checkpoints") {
+            options.context_checkpoint_marks =
+                parse_context_checkpoint_marks_flag(require_value("--context-checkpoints"));
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {

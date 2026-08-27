@@ -767,13 +767,15 @@ Qwen3.6 retained sequence 包含：
 - current resume frontier；
 - 一份有效时的 typed rewrite checkpoint，其 kind 为 `TurnClosure` 或 `ResponseReplay`；
 - MTP 或 DFlash 下的 prefill context-checkpoint ladder：每次 committed prefill chunk 结束时，若
-  `valid_frontier` 已达到下一 mark（24576 / 36864 / 53248 / 77824 / 102400 / 151552）且该 frontier 的
+  `valid_frontier` 已达到下一 mark（默认 24576 / 36864 / 53248 / 77824 / 102400 / 151552，可由
+  `--context-checkpoints off|a,b,c` 替换）且该 frontier 的
   Vision item 完整，则冻结当时的 current GDN 与该 chunk 最后一列 hidden。DFlash 同时冻结该 lane
   的 cyclic local K/V；restore 写回 cyclic 并设 `dflash_context_frontier=F`。Advertised frontier `F`
   是该 chunk 末尾，不是 raw mark。不把 4096 chunk 拆到 mark 上。
 - MTP 或 DFlash 下的 turn-rollback head：`append_frontier` occupy 且 `prompt_tokens > E` 时，在 suffix
   prefill 之前把 current GDN 与 `tail_hidden` 钉在该完成 `E`（DFlash 同样钉 cyclic）。每个 chat 至多一个；下一 append
-  替换。exact-hit（`prompt_tokens == E`）不写。编辑最后一条 user 消息走
+  替换。exact-hit（`prompt_tokens == E`）默认不写；`capture_context_checkpoint` 为 true 且该 `E`
+  尚无任何 context-checkpoint head 时写入同一 slot。编辑最后一条 user 消息走
   `restore_turn_rollback`；同一 last user 再生成仍走更长的 rewrite `TurnClosure`。
 
 每个 checkpoint 都必须同时描述：

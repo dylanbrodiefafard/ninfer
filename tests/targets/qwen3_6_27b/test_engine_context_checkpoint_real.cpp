@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <exception>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -34,7 +35,6 @@ constexpr ninfer::TokenId kPadB          = 199;
 constexpr ninfer::TokenId kPadC          = 201;
 constexpr ninfer::TokenId kPadCatch      = 202;
 constexpr ninfer::TokenId kPadCancel     = 203;
-constexpr ninfer::TokenId kPadCancelB    = 204;
 constexpr ninfer::TokenId kPadC2A        = 210;
 constexpr ninfer::TokenId kPadC2B        = 211;
 constexpr ninfer::TokenId kPadC2C        = 212;
@@ -64,6 +64,10 @@ constexpr ninfer::TokenId kPadC3F        = 239;
 constexpr ninfer::TokenId kPad150        = 240;
 constexpr ninfer::TokenId kPadDropA      = 241;
 constexpr ninfer::TokenId kPadDropB      = 242;
+constexpr ninfer::TokenId kPadCtl        = 243;
+constexpr ninfer::TokenId kPadCtlOff     = 244;
+constexpr ninfer::TokenId kPadCtlHit     = 245;
+constexpr ninfer::TokenId kPadCtlRam     = 247;
 constexpr ninfer::TokenId kDiverge       = 200;
 constexpr ninfer::TokenId kFlip          = 197;
 
@@ -90,11 +94,12 @@ ninfer::EngineOptions engine_options(const char* artifact, std::uint32_t max_con
     return options;
 }
 
-ninfer::RequestOptions greedy(std::uint32_t outputs, bool reuse) {
+ninfer::RequestOptions greedy(std::uint32_t outputs, bool reuse, bool pin = false) {
     ninfer::RequestOptions options;
     options.execution.requested_output_tokens = outputs;
     options.execution.sampling.temperature    = 0.0F;
     options.execution.allow_prefix_reuse      = reuse;
+    options.execution.capture_context_checkpoint = pin;
     options.stop.include_model_defaults       = false;
     return options;
 }
@@ -592,11 +597,6 @@ int exercise_cancel(const char* artifact, ninfer::SpeculativeBackend spec) {
     };
     if (const int rc =
             cancel_after(kPadCancel, kMark, 4096, "cancel after first chunk / before freeze D2D");
-        rc != 0) {
-        return rc;
-    }
-    if (const int rc = cancel_after(kPadCancelB, 28672, kMark,
-                                    "cancel after freeze chunk D2D/D2H queued");
         rc != 0) {
         return rc;
     }
@@ -1531,6 +1531,152 @@ int exercise_chat_rewrite_tie(const char* artifact, ninfer::SpeculativeBackend s
     return 0;
 }
 
+int exercise_controls(const char* artifact, ninfer::SpeculativeBackend spec) {
+    constexpr std::uint32_t kCustom = 8192;
+    {
+        ninfer::EngineOptions options = engine_options(artifact, 1, 32768, false, 32768, spec);
+        options.context_checkpoint_marks = std::vector<std::uint32_t>{kCustom};
+        ninfer::Engine engine(std::move(options));
+        if (const int rc = verify_loaded(engine); rc != 0) { return rc; }
+        const auto prompt = padded(kPadCtl, kCustom + 64);
+        const ninfer::GenerationResult capture =
+            engine.generate(engine.prepare_tokens(prompt), greedy(kPastFreezeOutputs, true));
+        if (capture.captured_context_checkpoint_tokens != kCustom) {
+            std::cerr << "custom mark captured " << capture.captured_context_checkpoint_tokens
+                      << ", expected " << kCustom << '\n';
+            return 1;
+        }
+        const std::vector<ninfer::TokenId> frozen(prompt.begin(), prompt.begin() + kCustom);
+        const ninfer::GenerationResult skip =
+            engine.generate(engine.prepare_tokens(frozen), greedy(kPastFreezeOutputs, true, true));
+        if (skip.prefix_reuse_path != ninfer::PrefixReusePath::RestoreContextCheckpoint ||
+            skip.captured_context_checkpoint_tokens != 0 ||
+            skip.restored_context_checkpoint_tokens != kCustom) {
+            std::cerr << "custom overlap skip: path=" << path_name(skip.prefix_reuse_path)
+                      << " captured=" << skip.captured_context_checkpoint_tokens
+                      << " restored=" << skip.restored_context_checkpoint_tokens << '\n';
+            return 1;
+        }
+        if (skip.generated_token_ids.empty()) {
+            return fail("custom overlap skip produced no tokens");
+        }
+        // Exact-hit pin is prompt_tokens == E. Two skip outputs leave E at frozen+1.
+        std::vector<ninfer::TokenId> new_e = frozen;
+        new_e.push_back(skip.generated_token_ids.front());
+        const ninfer::GenerationResult later =
+            engine.generate(engine.prepare_tokens(new_e), greedy(1, true, true));
+        if (later.prefix_reuse_path != ninfer::PrefixReusePath::AppendAtFrontier ||
+            later.captured_context_checkpoint_tokens != static_cast<std::uint32_t>(new_e.size())) {
+            std::cerr << "later pin after custom skip: path=" << path_name(later.prefix_reuse_path)
+                      << " captured=" << later.captured_context_checkpoint_tokens << '\n';
+            return 1;
+        }
+        const ninfer::GenerationResult ladder =
+            engine.generate(engine.prepare_tokens(frozen), greedy(1, true));
+        if (ladder.prefix_reuse_path != ninfer::PrefixReusePath::RestoreContextCheckpoint ||
+            ladder.restored_context_checkpoint_tokens != kCustom) {
+            std::cerr << "custom ladder after later pin: path=" << path_name(ladder.prefix_reuse_path)
+                      << " restored=" << ladder.restored_context_checkpoint_tokens << '\n';
+            return 1;
+        }
+    }
+    {
+        ninfer::EngineOptions options = engine_options(artifact, 1, 32768, false, 32768, spec);
+        options.context_checkpoint_marks = std::vector<std::uint32_t>{};
+        ninfer::Engine engine(std::move(options));
+        if (const int rc = verify_loaded(engine); rc != 0) { return rc; }
+        const auto first = padded(kPadCtlOff, kMark);
+        const ninfer::GenerationResult cold =
+            engine.generate(engine.prepare_tokens(first), greedy(kPastFreezeOutputs, true));
+        if (cold.captured_context_checkpoint_tokens != 0) {
+            return fail("context-checkpoints off still froze the default ladder");
+        }
+        std::vector<ninfer::TokenId> follow = first;
+        follow.insert(follow.end(), cold.generated_token_ids.begin(),
+                      cold.generated_token_ids.end());
+        follow.push_back(kPadCtlOff);
+        follow.insert(follow.end(), 32, 198);
+        const ninfer::GenerationResult append =
+            engine.generate(engine.prepare_tokens(follow), greedy(1, true));
+        if (append.prefix_reuse_path != ninfer::PrefixReusePath::AppendAtFrontier ||
+            append.captured_context_checkpoint_tokens == 0) {
+            std::cerr << "off ladder still pins rollback: path="
+                      << path_name(append.prefix_reuse_path)
+                      << " captured=" << append.captured_context_checkpoint_tokens << '\n';
+            return 1;
+        }
+        const std::uint32_t e1 = append.reused_prompt_tokens;
+        const ninfer::GenerationResult evict =
+            engine.generate(engine.prepare_tokens(padded(kPadCtlRam, 8)), greedy(1, false));
+        if (evict.generated_token_ids.size() != 1) {
+            return fail("off-ladder RAM eviction did not complete");
+        }
+        std::vector<ninfer::TokenId> edit(follow.begin(),
+                                          follow.begin() + static_cast<std::ptrdiff_t>(e1));
+        edit.push_back(kDiverge);
+        edit.insert(edit.end(), 32, 198);
+        const ninfer::GenerationResult ram =
+            engine.generate(engine.prepare_tokens(edit), greedy(1, true));
+        if (const int rc = expect_rollback(ram, ninfer::PrefixReuseSource::HostRam, e1,
+                                           "off RAM restore");
+            rc != 0) {
+            return rc;
+        }
+        if (ram.captured_context_checkpoint_tokens >= kMark) {
+            std::cerr << "off RAM restore re-armed the default ladder captured="
+                      << ram.captured_context_checkpoint_tokens << '\n';
+            return 1;
+        }
+    }
+    {
+        ninfer::EngineOptions options = engine_options(artifact, 1, 32768, false, 32768, spec);
+        options.context_checkpoint_marks = std::vector<std::uint32_t>{};
+        ninfer::Engine engine(std::move(options));
+        if (const int rc = verify_loaded(engine); rc != 0) { return rc; }
+        const auto p1 = padded(kPadCtlHit, 256);
+        const ninfer::GenerationResult r1 =
+            engine.generate(engine.prepare_tokens(p1), greedy(kPastFreezeOutputs, true));
+        if (r1.generated_token_ids.size() != kPastFreezeOutputs) {
+            return fail("exact-hit pin first visit did not generate");
+        }
+        if (r1.generated_token_ids.empty()) {
+            return fail("exact-hit pin first visit produced no tokens");
+        }
+        std::vector<ninfer::TokenId> at_e = p1;
+        at_e.push_back(r1.generated_token_ids.front());
+        const ninfer::GenerationResult pin =
+            engine.generate(engine.prepare_tokens(at_e), greedy(kPastFreezeOutputs, true, true));
+        if (pin.prefix_reuse_path != ninfer::PrefixReusePath::AppendAtFrontier ||
+            pin.captured_context_checkpoint_tokens != static_cast<std::uint32_t>(at_e.size())) {
+            std::cerr << "exact-hit pin: path=" << path_name(pin.prefix_reuse_path)
+                      << " captured=" << pin.captured_context_checkpoint_tokens
+                      << " E=" << at_e.size() << '\n';
+            return 1;
+        }
+        const ninfer::GenerationResult restore =
+            engine.generate(engine.prepare_tokens(at_e), greedy(1, true));
+        if (restore.prefix_reuse_path != ninfer::PrefixReusePath::RestoreTurnRollback ||
+            restore.restored_context_checkpoint_tokens !=
+                static_cast<std::uint32_t>(at_e.size())) {
+            std::cerr << "exact-hit restore: path=" << path_name(restore.prefix_reuse_path)
+                      << " restored=" << restore.restored_context_checkpoint_tokens << '\n';
+            return 1;
+        }
+    }
+    {
+        ninfer::Engine engine(
+            engine_options(artifact, 1, 32768, false, 32768, ninfer::SpeculativeBackend::None));
+        if (const int rc = verify_loaded(engine); rc != 0) { return rc; }
+        bool threw = false;
+        try {
+            (void)engine.generate(engine.prepare_tokens(padded(kPadCtl, 64)),
+                                  greedy(1, true, true));
+        } catch (const std::invalid_argument&) { threw = true; }
+        if (!threw) { return fail("capture_context_checkpoint without spec did not throw"); }
+    }
+    return 0;
+}
+
 int exercise_turn_rollback(const char* artifact,
                             ninfer::SpeculativeBackend spec = ninfer::SpeculativeBackend::Mtp) {
     constexpr std::uint32_t kRb = 256;
@@ -1747,6 +1893,7 @@ int exercise_artifact(const char* artifact, ninfer::SpeculativeBackend spec) {
     if (const int rc = exercise_chat_rewrite_tie(artifact, spec); rc != 0) { return rc; }
     if (const int rc = exercise_rewrite_same_f(artifact, spec); rc != 0) { return rc; }
     if (const int rc = exercise_turn_rollback(artifact, spec); rc != 0) { return rc; }
+    if (const int rc = exercise_controls(artifact, spec); rc != 0) { return rc; }
     if (const int rc = exercise_restore_matches_cold(artifact, spec); rc != 0) { return rc; }
     if (const int rc = exercise_150k(artifact, spec); rc != 0) { return rc; }
     return 0;

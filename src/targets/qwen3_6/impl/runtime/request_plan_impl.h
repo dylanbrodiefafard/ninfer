@@ -100,6 +100,13 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->summary.transient_bytes        = 0;
     base->sampling                       = translate_sampling(options.sampling);
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
+    base->capture_context_checkpoint     = options.capture_context_checkpoint;
+    if (options.capture_context_checkpoint &&
+        !ninfer::context_checkpoint_capture_available(options.allow_prefix_reuse,
+                                                      speculative_backend)) {
+        throw std::invalid_argument(
+            "capture_context_checkpoint requires prefix reuse and a speculative backend");
+    }
     const std::uint32_t reserved_context_tokens =
         base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
                                            ? 0U
@@ -288,6 +295,7 @@ void ProgramImplCore::finish_request_plan(RequestPlanImpl& plan, const ResidentS
     plan.capture_context_checkpoints = qwen3_6::detail::capture_prefill_context_checkpoints(
         base.allow_prefix_reuse, speculative_backend == SpeculativeBackend::Mtp ||
                                      speculative_backend == SpeculativeBackend::DFlash);
+    plan.capture_context_checkpoint = base.capture_context_checkpoint;
 
     if (base.vision_control != nullptr) {
         VisionPrefillPlan vision;

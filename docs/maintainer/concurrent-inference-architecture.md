@@ -743,7 +743,8 @@ checkpoint；即使本次
 `preserve_thinking` 选择了另一种 desired kind，匹配的旧快照仍可恢复，`prefix_reuse_path` 报告实际恢复的
 kind。Planner 在 rewrite 与 ladder/turn-rollback heads 中取最长完整 checkpoint；current matching `E`
 仍赢 append；same-`F` rewrite 赢 rollback/ladder。`append_frontier` 且 `prompt_tokens > E` 时钉
-turn-rollback 于该 `E`（exact-hit 不钉）。若 desired boundary 位于本次待 prefill suffix 中，则在跨过它时覆盖物理 slot；若它已经位于 selected
+turn-rollback 于该 `E`。exact-hit 默认不钉；请求 `capture_context_checkpoint` 且该 `E` 尚无 head 时写入同一
+slot。若 desired boundary 位于本次待 prefill suffix 中，则在跨过它时覆盖物理 slot；若它已经位于 selected
 reuse frontier 之前且该位置没有快照，则本次保留合法 reuse 并延迟新 checkpoint，而不是为建立辅助快照
 主动 full reset。只有 incoming prefix 不匹配任何完整 checkpoint 时才 full reset。
 

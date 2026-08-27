@@ -1,6 +1,7 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
+#include "targets/qwen3_6/impl/runtime/context_checkpoint.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
@@ -799,6 +800,8 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
     }
     validate_sparse_attn_flags(options.kv_cache, options.sage_attn, options.keep_frac,
                                options.xattn_tau);
+    qwen3_6::detail::validate_configured_context_checkpoint_marks(options.context_checkpoint_marks,
+                                                                  options.speculative.backend);
 }
 
 std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,
@@ -832,6 +835,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->xattn_tau           = inputs.xattn_tau;
     impl->xattn_min_len       = inputs.xattn_min_len;
     impl->kv_ram_capacity_bytes = inputs.kv_ram_capacity_bytes;
+    impl->context_checkpoint_marks = inputs.context_checkpoint_marks;
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->features.vision) {
@@ -916,6 +920,8 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .use_cuda_graph = options.use_cuda_graph,
         .device         = options.device,
         .kv_ram_capacity_bytes = options.kv_ram_capacity_bytes,
+        .context_checkpoint_marks =
+            qwen3_6::detail::resolved_prefill_context_marks(options.context_checkpoint_marks),
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);

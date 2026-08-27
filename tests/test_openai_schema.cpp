@@ -120,6 +120,41 @@ int test_parse_string_content() {
     return failures;
 }
 
+int test_ninfer_capture_object() {
+    const Json base = {{"model", "m"},
+                       {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})}};
+    int failures    = 0;
+    failures += check(!parse_chat_completion_request(base, default_limits()).capture_context_checkpoint,
+                      "omitted ninfer does not pin");
+    Json pin          = base;
+    pin["ninfer"]     = Json{{"capture_context_checkpoint", true}};
+    const GenerationRequest pinned = parse_chat_completion_request(pin, default_limits());
+    failures += check(pinned.capture_context_checkpoint, "ninfer capture flag parsed");
+    failures +=
+        check(to_request_options(pinned, default_server()).execution.capture_context_checkpoint,
+              "ninfer capture flag reached ExecutionOptions");
+    Json unknown      = base;
+    unknown["ninfer"] = Json{{"capture_context_checkpoint", true}, {"foo", 1}};
+    failures += check(api_code([&] { (void)parse_chat_completion_request(unknown, default_limits()); }) ==
+                          "ninfer_option_not_supported",
+                      "unknown ninfer key rejected");
+    Json not_bool      = base;
+    not_bool["ninfer"] = Json{{"capture_context_checkpoint", 1}};
+    failures += check(throws_api([&] { (void)parse_chat_completion_request(not_bool, default_limits()); }),
+                      "non-bool capture flag rejected");
+    Json not_object      = base;
+    not_object["ninfer"] = true;
+    failures +=
+        check(throws_api([&] { (void)parse_chat_completion_request(not_object, default_limits()); }),
+              "non-object ninfer rejected");
+    Json ninfer_null      = base;
+    ninfer_null["ninfer"] = nullptr;
+    failures +=
+        check(throws_api([&] { (void)parse_chat_completion_request(ninfer_null, default_limits()); }),
+              "Chat ninfer null is rejected");
+    return failures;
+}
+
 int test_preserve_thinking_options() {
     const Json base = {
         {"model", "m"},
@@ -1106,6 +1141,7 @@ int main() {
     if (std::getenv("NINFER_BENCH_SSE") != nullptr) { return run_sse_bench(); }
     int failures = 0;
     failures += test_parse_string_content();
+    failures += test_ninfer_capture_object();
     failures += test_preserve_thinking_options();
     failures += test_reasoning_effort();
     failures += test_parse_parts_and_flatten();

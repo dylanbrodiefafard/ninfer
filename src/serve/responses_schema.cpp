@@ -604,6 +604,7 @@ void reject_unknown_top_level(const Json& body) {
         "top_p",
         "truncation",
         "user",
+        "ninfer",
     };
     for (auto it = body.begin(); it != body.end(); ++it) {
         if (!allowed.contains(it.key())) {
@@ -742,6 +743,9 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
     parse_tool_choice(body, out);
     parse_reasoning(body, out);
     out.generation.preserve_thinking = parse_openai_preserve_thinking(body);
+    if (body.contains("ninfer") && !body.at("ninfer").is_null()) {
+        apply_ninfer_object(body.at("ninfer"), out.generation);
+    }
 
     if (const std::optional<double> temperature = optional_number(body, "temperature")) {
         if (*temperature < 0.0 || *temperature > 2.0) {
@@ -945,6 +949,12 @@ ResponsesRequest parse_response_input_tokens_request(const Json& body,
                                                      const RequestLimits& limits) {
     require_object(body);
     for (auto it = body.begin(); it != body.end(); ++it) {
+        if (it.key() == "ninfer") {
+            if (!it.value().is_null()) {
+                bad_request("ninfer is not supported on input token count", "ninfer");
+            }
+            continue;
+        }
         if (it.key() != "model" && it.key() != "input" && it.key() != "chat_template_kwargs" &&
             it.key() != "preserve_thinking") {
             bad_request("unknown parameter: " + it.key(), it.key(), "unknown_parameter");

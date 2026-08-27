@@ -196,6 +196,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
       draft_window(plan.draft_window), dflash_verify_width(plan.dflash_verify_width),
       speculative_backend(plan.speculative_backend),
+      context_marks(plan.context_checkpoint_marks),
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
       proposal_head(plan.proposal_head), keep_frac(plan.keep_frac), xattn_tau(plan.xattn_tau),
       xattn_min_len(plan.xattn_min_len), vision_enabled(plan.features.vision),
@@ -279,6 +280,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             rewrite_checkpoint_hidden_store.slice(1, static_cast<std::int32_t>(lane), 1);
         sequence.ledger.reserve(static_cast<std::size_t>(capacity) + 1ULL);
         sequence.prefix_identity.reserve(static_cast<std::size_t>(capacity) + 1ULL);
+        sequence.next_context_mark =
+            qwen3_6::detail::first_prefill_context_mark(context_marks);
     }
 
     set_device_i32(io.text_kv_table_row, 0);
@@ -619,8 +622,9 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             sequence.text_kv_valid = base;
             sequence.ledger.resize(base);
             drop_context_checkpoints_after(sequence, base);
-            maybe_capture_turn_rollback(sequence, request, prompt, base, prompt_tokens,
-                                        request_plan.capture_context_checkpoints);
+            maybe_capture_turn_rollback(sequence, request, prompt, request_plan.reuse, base,
+                                        prompt_tokens, request_plan.capture_context_checkpoints,
+                                        request_plan.capture_context_checkpoint);
         } else if (is_rewrite_checkpoint_restore(request_plan.reuse)) {
             if (!sequence.kv || sequence.text_kv_valid < base) {
                 throw std::logic_error("resident rewrite checkpoint has no complete KV allocation");
@@ -656,6 +660,9 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             if (base == prompt_tokens) { copy_tail(sequence, sequence.rewrite_checkpoint_hidden); }
             sequence.ledger.resize(base);
             drop_context_checkpoints_after(sequence, base);
+            maybe_capture_turn_rollback(sequence, request, prompt, request_plan.reuse, base,
+                                        prompt_tokens, request_plan.capture_context_checkpoints,
+                                        request_plan.capture_context_checkpoint);
         } else if (qwen3_6::detail::is_staged_checkpoint_restore(request_plan.reuse)) {
             if (!sequence.kv || sequence.text_kv_valid < base) {
                 throw std::logic_error(
@@ -691,6 +698,9 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             }
             sequence.ledger.resize(base);
             drop_context_checkpoints_after(sequence, base);
+            maybe_capture_turn_rollback(sequence, request, prompt, request_plan.reuse, base,
+                                        prompt_tokens, request_plan.capture_context_checkpoints,
+                                        request_plan.capture_context_checkpoint);
         } else {
             throw std::logic_error("request plan has an invalid prefix reuse path");
         }
@@ -1317,7 +1327,7 @@ bool ProgramImplCore::staging_holds(std::uint32_t lane, qwen3_6::detail::PrefixH
 
 void ProgramImplCore::clear_context_checkpoints(SequenceState& sequence) noexcept {
     sequence.context_checkpoints.clear();
-    sequence.next_context_mark = qwen3_6::detail::kPrefillContextMarks.front();
+    sequence.next_context_mark = qwen3_6::detail::first_prefill_context_mark(context_marks);
 }
 
 void ProgramImplCore::drop_context_checkpoints_after(SequenceState& sequence,
@@ -1329,7 +1339,7 @@ void ProgramImplCore::drop_context_checkpoints_after(SequenceState& sequence,
                                        head.frontier, frontier);
                                }),
                 heads.end());
-    const auto next = qwen3_6::detail::next_prefill_context_mark(frontier);
+    const auto next = qwen3_6::detail::next_prefill_context_mark(frontier, context_marks);
     sequence.next_context_mark = next.value_or(0);
 }
 
@@ -1437,18 +1447,22 @@ void ProgramImplCore::restore_context_checkpoint_state(SequenceState& sequence,
 }
 
 void ProgramImplCore::maybe_capture_turn_rollback(SequenceState& sequence, RequestControl& request,
-                                                  const PreparedPromptData& prompt,
+                                                  const PreparedPromptData& prompt, ReusePath reuse,
                                                   std::uint32_t base, std::uint32_t prompt_tokens,
-                                                  bool capture_enabled) {
+                                                  bool capture_enabled, bool request_pin) {
     const bool enabled = capture_enabled && captures_context_checkpoints() &&
                          staging_hidden.data != nullptr;
     const bool already =
         std::any_of(sequence.context_checkpoints.begin(), sequence.context_checkpoints.end(),
                     [base](const ContextCheckpointHead& head) { return head.frontier == base; });
-    if (!qwen3_6::detail::should_capture_turn_rollback(
-            ReusePath::AppendAtFrontier, base, prompt_tokens, enabled, sequence.tail_hidden_valid,
-            already,
-            qwen3_6::detail::prefix_items_complete_at(prompt.vision_items, base))) {
+    const bool complete =
+        qwen3_6::detail::prefix_items_complete_at(prompt.vision_items, base);
+    if (!qwen3_6::detail::should_capture_turn_rollback(reuse, base, prompt_tokens, enabled,
+                                                       sequence.tail_hidden_valid, already,
+                                                       complete) &&
+        !qwen3_6::detail::should_capture_exact_hit_pin(request_pin, base, prompt_tokens, enabled,
+                                                       sequence.tail_hidden_valid, already,
+                                                       complete)) {
         return;
     }
     if (sequence.ledger.size() < base || sequence.tail_hidden.data == nullptr) { return; }
@@ -1599,7 +1613,7 @@ void ProgramImplCore::maybe_freeze_context_checkpoint(SequenceState& sequence,
     sequence.context_checkpoints.push_back(std::move(head));
     request.captured_context_checkpoint_tokens = sequence.context_checkpoints.back().frontier;
     sequence.next_context_mark =
-        qwen3_6::detail::next_prefill_context_mark(frontier).value_or(0);
+        qwen3_6::detail::next_prefill_context_mark(frontier, context_marks).value_or(0);
     if (reload_rollback) {
         reload_turn_rollback_into_staging(saved_lane, saved_hash, saved_frontier);
     }
@@ -1786,7 +1800,6 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.retained                = false;
     sequence.use_tick                = 0;
     sequence.rewrite_checkpoint      = {};
-    sequence.next_context_mark       = qwen3_6::detail::kPrefillContextMarks.front();
     clear_context_checkpoints(sequence);
     request.pending                  = {};
 }

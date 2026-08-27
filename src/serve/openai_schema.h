@@ -23,6 +23,8 @@ namespace ninfer::serve {
 GenerationRequest parse_chat_completion_request(const nlohmann::json& body,
                                                 const RequestLimits& limits);
 
+void apply_ninfer_object(const nlohmann::json& ninfer, GenerationRequest& out);
+
 std::optional<bool> parse_openai_preserve_thinking(const nlohmann::json& body);
 std::optional<bool> parse_openai_enable_thinking(const nlohmann::json& body);
 

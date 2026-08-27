@@ -83,6 +83,7 @@ The endpoint supports:
 - the top-level `reasoning_effort` field;
 - the `enable_thinking` extension;
 - `chat_template_kwargs.preserve_thinking` and the top-level `preserve_thinking` alias.
+- the vendor `ninfer` object (`capture_context_checkpoint`).
 
 The request `model` is informational: NInfer runs one resident model, so it serves that model
 regardless of the identifier and echoes the requested value back (llama.cpp-compatible). The
@@ -112,6 +113,22 @@ select the corresponding template effort when available. The other OpenAI protoc
 prompts. It defaults to the server setting, which is off unless `--preserve-thinking` is used. If
 both OpenAI spellings are present they must carry the same boolean value. Unknown non-null
 `chat_template_kwargs` are rejected.
+
+Chat Completions and Responses accept a strict vendor object:
+
+```json
+{ "ninfer": { "capture_context_checkpoint": true } }
+```
+
+Unknown keys inside `ninfer` return HTTP 400. `true` snapshots the chat’s current resume
+frontier `E` on an exact-hit / decode-only request into the one-slot turn-rollback head
+(the same slot automatic occupy-append already writes). A later `true` at a new `E` replaces
+that pin; ladder heads stay. If a ladder or rollback head already sits at this `E`, the
+request succeeds with `captured_tokens = 0` and does not fill the rollback slot. A brand-new
+chat (`E == 0`) is the same quiet no-op. `true` on a server started without `--spec mtp|dflash`
+or with `--no-prefix-reuse` returns HTTP 400 `context_checkpoint_unavailable` before the
+request is enqueued. Anthropic Messages does not accept this object.
+`POST /v1/responses/input_tokens` allows `ninfer` only when omitted or JSON `null`.
 
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
 finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty
@@ -497,6 +514,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
+| `--context-checkpoints off\|a,b,c` | disable the automatic prefill ladder, or replace the default marks. Custom lists require `--spec mtp` or `--spec dflash`. Marks at or above `--max-context` stay unused. Advertised freeze `F` is the committed chunk end at or past the mark. | default ladder |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--system-prepend TEXT` | prepend TEXT to the leading system/developer instruction on every request; inserts a system turn if none exists | off |
@@ -632,7 +650,10 @@ older request to recover capacity. Startup rejects a KV pool smaller than one se
 provide one page per configured lane, or larger than all configured lanes could use.
 
 Compatible resident prefixes are reused for both text and multimodal histories unless the server is
-started with `--no-prefix-reuse`, which also disables prefill context-checkpoint capture. A multimodal hit requires matching token types, three-axis MRoPE
+started with `--no-prefix-reuse`, which also disables prefill context-checkpoint capture and the
+turn-rollback pin. `--context-checkpoints off` disables only the automatic ladder; occupy-append
+rollback and exact-hit `ninfer.capture_context_checkpoint` still pin when MTP/DFlash and prefix
+reuse are on. A multimodal hit requires matching token types, three-axis MRoPE
 positions, encoded-media digest, grid, and consumer spans; changing an earlier image or video
 therefore resets the prefix instead of reusing placeholder-token KV. Media wholly inside a matched
 prefix skips Vision execution, while new suffix media is encoded normally. The completion log
@@ -646,14 +667,18 @@ The shared family runtime distinguishes `full_reset`, `append_frontier`,
 rewrite checkpoint kinds include the
 recurrent, hidden, and selected speculative-backend continuation state required to recompute a
 rewritten suffix; matching KV tokens alone never authorize a partial hit. MTP or DFlash prefill may also
-freeze current GDN at committed chunk ends that have reached a context mark (24576, 36864, 53248,
-77824, 102400, 151552); a later prompt that matches that prefix restores GDN into current and hidden into
+freeze current GDN at committed chunk ends that have reached a context mark (default 24576, 36864,
+53248, 77824, 102400, 151552, or `--context-checkpoints a,b,c`); a later prompt that matches that prefix restores GDN into current and hidden into
 `tail_hidden` as `restore_context_checkpoint`. DFlash2 also restores that lane's cyclic local K/V
 and `dflash_context_frontier`. Slot `2C` is the Engine-wide GDN image for that
-freeze and for the automatic turn-rollback pin: on `append_frontier` occupy with `E>0` and a
+freeze and for the turn-rollback pin: on `append_frontier` occupy with `E>0` and a
 real suffix (`prompt_tokens > E`), current GDN and `tail_hidden` are copied to `2C` before suffix
 prefill so a later edit of the last user turn can restore that completed `E` as
-`restore_turn_rollback`. Ladder freeze borrows `2C` and reloads the rollback image afterward.
+`restore_turn_rollback`. The same slot is written on an exact-hit / decode-only request
+(`prompt_tokens == E`) when `ninfer.capture_context_checkpoint` is true, unless a context-checkpoint
+head already sits at that `E` (skip, `captured_tokens = 0`; the rollback slot stays empty until a
+later `true` at a new `E`). A later exact-hit `true` replaces the one rollback pin and leaves
+ladder heads. Ladder freeze borrows `2C` and reloads the rollback image afterward.
 Same last user regenerate still hits rewrite (`TurnClosure` is longer than rollback `E`). With stable
 `preserve_thinking=true`, the auxiliary checkpoint rolls to the prompt frontier after the current
 response's complete deterministic generation prologue. For thinking generation this includes

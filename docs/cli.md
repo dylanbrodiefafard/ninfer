@@ -160,6 +160,8 @@ runs Spark two-block (7 MASK + 4 MASK) chain verify. Current C=1 measurements fo
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
+| `--context-checkpoints off\|a,b,c` | disable the automatic prefill ladder, or replace the default marks (24576, 36864, 53248, 77824, 102400, 151552). Custom lists require `--spec mtp` or `--spec dflash`. Marks at or above `--max-context` stay unused. Advertised freeze `F` is the committed chunk end at or past the mark, not the raw named size. | default ladder |
+| `--capture-context-checkpoint` | pin the current resume frontier `E` on an exact-hit / decode-only request (the same one-slot turn-rollback head automatic occupy-append already writes). A fresh one-shot run has `E == 0`, so this is a no-op unless a retained lane already exists in the process. | off |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
 | `--reasoning-effort low\|medium\|xhigh` | select an effort exposed by the loaded chat template | template default |
 | `--greedy` | exact argmax decoding | off |
@@ -226,7 +228,7 @@ context-checkpoint freeze D2H or a VRAM-resident restore that unpacks already-pi
 `restores=` / `evicts=` / `drops=` are lifetime counters on both lines.
 CLI `KV RAM events` prints lifetime captures/restores/evicts/drops plus that request's `save=` /
 `load=`. The generation summary also prints `prefix reuse path`, `prefix reuse source`, and
-`context checkpoint` (`restored:F` / `captured:F` absolute ladder or turn-rollback head frontiers). Exact byte values remain on the Engine API and in the JSONL request log; set
+`context checkpoint` (`restored:F` / `captured:F` absolute ladder or turn-rollback head frontiers). Exact-hit `--capture-context-checkpoint` uses the same `captured:F` field. Exact byte values remain on the Engine API and in the JSONL request log; set
 `NINFER_KV_RAM_LOG_BYTES=1` to print those same byte counts on the human lines. A new capture may
 still need to reap or evict while logged occupancy looks low, because a just-consumed copy can
 occupy the pin until its CUDA event completes.
