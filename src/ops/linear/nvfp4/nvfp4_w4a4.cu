@@ -115,6 +115,9 @@ void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4
     case Nvfp4Activation17408Geometry::kInputRows:
         launch_quantize_exact<Nvfp4Activation17408Geometry>(x, weight, workspace, stream);
         return;
+    case Nvfp4Activation10240Geometry::kInputRows:
+        launch_quantize_exact<Nvfp4Activation10240Geometry>(x, weight, workspace, stream);
+        return;
     default:
         throw std::invalid_argument("nvfp4 W4A4 quantize: unsupported K");
     }
@@ -139,6 +142,9 @@ void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
         return;
     case Nvfp4Problem::Residual17408:
         launch_problem<Nvfp4Residual17408Geometry>(weight, out, workspace, tokens, stream);
+        return;
+    case Nvfp4Problem::MtpFc:
+        launch_problem<Nvfp4MtpFcGeometry>(weight, out, workspace, tokens, stream);
         return;
     case Nvfp4Problem::DflashFeature:
     case Nvfp4Problem::DflashQkv:

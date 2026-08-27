@@ -29,8 +29,8 @@ void launch_sched(const __nv_bfloat16* x, const std::uint8_t* codes, const std::
     constexpr int kTokenTiles = (kT + Schedule::kTokenTile - 1) / Schedule::kTokenTile;
     constexpr int kBlocks     = (Geometry::kOutputRows / Schedule::kRowsPerCta) * kTokenTiles;
     nvfp4_small_t_kernel<Geometry, kT, Schedule>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(x, codes, scales, inverse,
-                                                    Nvfp4IdentityEpilogue{},
+        <<<kBlocks, Schedule::kThreads, 0, stream>>>(Nvfp4PackedActivation<Geometry>{x}, codes,
+                                                    scales, inverse, Nvfp4IdentityEpilogue{},
                                                     Nvfp4ContiguousOutput{out, Geometry::kOutputRows});
     CUDA_CHECK(cudaGetLastError());
 }

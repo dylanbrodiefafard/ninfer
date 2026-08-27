@@ -116,9 +116,11 @@ using Nvfp4DflashQkvGeometry     = Nvfp4GemvGeometry<6144, 5120>;
 using Nvfp4DflashAttnOutGeometry = Nvfp4GemvGeometry<5120, 4096>;
 using Nvfp4DflashConvProjGeometry = Nvfp4GemvGeometry<1280, 5120>;
 using Nvfp4DflashSelectorGeometry = Nvfp4GemvGeometry<256, 5120>;
+using Nvfp4MtpFcGeometry         = Nvfp4GemvGeometry<5120, 10240>;
 
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
 using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;
+using Nvfp4Activation10240Geometry = Nvfp4ActivationGeometry<10240>;
 using Nvfp4Activation17408Geometry = Nvfp4ActivationGeometry<17408>;
 
 enum class Nvfp4Problem : std::uint8_t {
@@ -132,9 +134,10 @@ enum class Nvfp4Problem : std::uint8_t {
     DflashAttnOut,
     DflashConvProj,
     DflashSelector,
+    MtpFc,
 };
 
-inline constexpr bool is_nvfp4_dflash_a16_problem(Nvfp4Problem problem) {
+inline constexpr bool is_nvfp4_a16_only_problem(Nvfp4Problem problem) {
     return problem == Nvfp4Problem::DflashFeature || problem == Nvfp4Problem::DflashQkv ||
            problem == Nvfp4Problem::DflashAttnOut || problem == Nvfp4Problem::DflashConvProj ||
            problem == Nvfp4Problem::DflashSelector;
@@ -160,7 +163,9 @@ inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int
            (output_rows == Nvfp4DflashConvProjGeometry::kOutputRows &&
             input_rows == Nvfp4DflashConvProjGeometry::kInputRows) ||
            (output_rows == Nvfp4DflashSelectorGeometry::kOutputRows &&
-            input_rows == Nvfp4DflashSelectorGeometry::kInputRows);
+            input_rows == Nvfp4DflashSelectorGeometry::kInputRows) ||
+           (output_rows == Nvfp4MtpFcGeometry::kOutputRows &&
+            input_rows == Nvfp4MtpFcGeometry::kInputRows);
 }
 
 inline Nvfp4Problem resolve_nvfp4_problem(std::int32_t output_rows, std::int32_t input_rows) {
@@ -204,6 +209,10 @@ inline Nvfp4Problem resolve_nvfp4_problem(std::int32_t output_rows, std::int32_t
         input_rows == Nvfp4DflashSelectorGeometry::kInputRows) {
         return Nvfp4Problem::DflashSelector;
     }
+    if (output_rows == Nvfp4MtpFcGeometry::kOutputRows &&
+        input_rows == Nvfp4MtpFcGeometry::kInputRows) {
+        return Nvfp4Problem::MtpFc;
+    }
     throw std::invalid_argument("unsupported NVFP4 problem");
 }
 
@@ -212,6 +221,14 @@ template <class Geometry>
 struct Nvfp4LinearDecodeProductionSchedule {
     using Type =
         Nvfp4GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
+};
+
+// MTP fc [5120,10240] T=1 AR: N is residual-class. Four-warp CTAs match the measured SmallT
+// occupancy for this N (the generic 8-warp decode schedule is the wide-N AttnInput winner).
+template <>
+struct Nvfp4LinearDecodeProductionSchedule<Nvfp4MtpFcGeometry> {
+    using Type =
+        Nvfp4GemvSchedule<4, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
 };
 
 inline constexpr std::int32_t kNvfp4FirstSmallT = 2;
@@ -280,6 +297,23 @@ struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual17408Geometry, ActiveTok
     static constexpr int kValuesPerLane     = ActiveTokens >= 17 && ActiveTokens <= 20 ? 8 : 16;
     static constexpr auto kActivationAccess = Nvfp4SmallTActivationAccess::TokenPacked;
     static constexpr int kPhaseUnroll       = ActiveTokens <= 4 ? 4 : 1;
+    using Type =
+        Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, kValuesPerLane, ActiveTokens, 1, kActivationAccess,
+                            Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, kPhaseUnroll,
+                            Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
+};
+
+// MTP fc [5120,10240]: K sits between Residual6144 and Residual17408. Use TokenPacked +
+// PhaseUnroll=4 across the A16 alignment range T=2..7 (W4A4 starts at T=8). 16-warp at T≥8
+// remains the A16Only tail.
+template <int ActiveTokens>
+struct Nvfp4LinearSmallTProductionSchedule<Nvfp4MtpFcGeometry, ActiveTokens> {
+    static_assert(ActiveTokens >= kNvfp4FirstSmallT);
+    static_assert(ActiveTokens <= kNvfp4LastSmallT);
+    static constexpr int kWarpsPerCta       = ActiveTokens <= 16 ? (ActiveTokens >= 8 ? 16 : 4) : 4;
+    static constexpr int kValuesPerLane     = ActiveTokens >= 17 && ActiveTokens <= 20 ? 8 : 16;
+    static constexpr auto kActivationAccess = Nvfp4SmallTActivationAccess::TokenPacked;
+    static constexpr int kPhaseUnroll       = ActiveTokens <= 7 ? 4 : 1;
     using Type =
         Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, kValuesPerLane, ActiveTokens, 1, kActivationAccess,
                             Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, kPhaseUnroll,

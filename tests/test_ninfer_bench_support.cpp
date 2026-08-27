@@ -81,7 +81,9 @@ int test_cli_contract() {
         "128",
         "--kv-dtype",
         "int8",
-        "--mtp-draft-tokens",
+        "--spec",
+        "mtp",
+        "--draft-tokens",
         "5",
         "--lm-head-draft",
         "--device",
@@ -104,7 +106,8 @@ int test_cli_contract() {
     failures += expect(parsed.prefill_chunk == 128, "prefill chunk");
     failures += expect(parsed.kv_cache == ninfer::KvCacheStorage::Int8Group64, "INT8 KV");
     failures += expect(parsed.concurrency == 1, "default concurrency");
-    failures += expect(parsed.mtp_draft_tokens == 5, "MTP window");
+    failures += expect(parsed.spec_backend == ninfer::SpeculativeBackend::Mtp, "MTP backend");
+    failures += expect(parsed.draft_tokens == 5, "MTP window");
     failures +=
         expect(parsed.proposal_head == ninfer::ProposalHead::Optimized, "optimized proposal head");
     failures += expect(parsed.device == 1 && !parsed.use_cuda_graph, "device and graph settings");
@@ -131,7 +134,7 @@ int test_cli_contract() {
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(
-                {"ninfer_bench", "--weights", "model.ninfer", "--mtp-draft-tokens", "6"});
+                {"ninfer_bench", "--weights", "model.ninfer", "--draft-tokens", "6"});
         },
         "unsupported MTP window");
     failures += expect_throws<std::invalid_argument>(
@@ -177,23 +180,29 @@ int test_measurement_contract() {
     failures += expect_u32(tg.requested_output_tokens(), 129, "tg begin plus G outputs");
     failures +=
         expect_u32(combined.requested_output_tokens(), 129, "combined begin plus G outputs");
-    failures += expect_u32(pp.required_context(0), 512, "pp context");
-    failures += expect_u32(pp.required_context(5), 522, "MTP pp context");
-    failures += expect_u32(tg.required_context(0), 129, "tg context");
-    failures += expect_u32(tg.required_context(5), 139, "MTP tg context");
-    failures += expect_u32(combined.required_context(5), 2186, "MTP combined context");
-    failures += expect_u32(qb::decode_graph_prime_output_tokens(5), 13, "MTP graph-prime outputs");
+    const ninfer::SpeculativeOptions none{};
+    const ninfer::SpeculativeOptions mtp5{.backend      = ninfer::SpeculativeBackend::Mtp,
+                                         .draft_tokens = 5};
+    failures += expect_u32(pp.required_context(none), 512, "pp context");
+    failures += expect_u32(pp.required_context(mtp5), 522, "MTP pp context");
+    failures += expect_u32(tg.required_context(none), 129, "tg context");
+    failures += expect_u32(tg.required_context(mtp5), 139, "MTP tg context");
+    failures += expect_u32(combined.required_context(mtp5), 2186, "MTP combined context");
     failures +=
-        expect_u32(qb::decode_graph_prime_required_context(5), 23, "MTP graph-prime context");
+        expect_u32(qb::decode_graph_prime_output_tokens(mtp5), 13, "MTP graph-prime outputs");
+    failures +=
+        expect_u32(qb::decode_graph_prime_required_context(mtp5), 23, "MTP graph-prime context");
 
     const std::vector<qb::BenchTest> matrix = {pp, tg, combined};
     failures +=
-        expect_u32(qb::resolve_max_context(matrix, std::nullopt, 5, true), 2186, "auto context");
+        expect_u32(qb::resolve_max_context(matrix, std::nullopt, mtp5, true), 2186, "auto context");
     failures +=
-        expect_u32(qb::resolve_max_context(matrix, std::optional<std::uint32_t>(4096), 5, true),
+        expect_u32(qb::resolve_max_context(matrix, std::optional<std::uint32_t>(4096), mtp5, true),
                    4096, "explicit context");
     failures += expect_throws<std::invalid_argument>(
-        [&] { (void)qb::resolve_max_context(matrix, std::optional<std::uint32_t>(2048), 5, true); },
+        [&] {
+            (void)qb::resolve_max_context(matrix, std::optional<std::uint32_t>(2048), mtp5, true);
+        },
         "undersized context");
     failures += expect_u32(qb::concurrent_kv_capacity_tokens(50134, 2), 100352,
                            "C=2 page-aligned Main KV");
@@ -268,7 +277,8 @@ qb::BenchEnvironment sample_environment() {
     env.max_context                       = 4096;
     env.prefill_chunk                     = 1024;
     env.kv_cache                          = ninfer::KvCacheStorage::Int8Group64;
-    env.mtp_draft_tokens                  = 5;
+    env.speculative_backend               = ninfer::SpeculativeBackend::Mtp;
+    env.draft_tokens                      = 5;
     env.proposal_head                     = ninfer::ProposalHead::Optimized;
     env.use_cuda_graph                    = true;
     env.decode_graph_primed               = true;
@@ -287,12 +297,12 @@ int test_report_contract() {
     Json report;
     try {
         report = Json::parse(qb::format_json(
-            env, "ninfer_bench --weights model.ninfer --mtp-draft-tokens 5", results));
+            env, "ninfer_bench --weights model.ninfer --spec mtp --draft-tokens 5", results));
     } catch (const nlohmann::json::exception& error) {
         return fail(std::string("invalid benchmark JSON: ") + error.what());
     }
 
-    failures += expect(report.at("schema_version") == 12, "report schema v12");
+    failures += expect(report.at("schema_version") == 13, "report schema v13");
     failures += expect(report.at("artifact_type") == "ninfer_bench_report", "report identity");
     failures += expect(report.at("artifact").at("path") == "model.ninfer", "artifact path");
     failures += expect(report.at("load").at("target") == "qwen3_6_27b", "load target");
@@ -309,6 +319,8 @@ int test_report_contract() {
     failures += expect(report.at("memory").at("cuda_graph_allowance_bytes") == 150000000ULL,
                        "CUDA Graph allowance");
     failures += expect(report.at("memory").at("kv_payload_bytes") == 123456ULL, "KV payload");
+    failures += expect(report.at("config").at("spec") == "mtp", "spec backend");
+    failures += expect(report.at("config").at("draft_tokens") == 5, "draft tokens");
     failures += expect(report.at("config").at("proposal_head") == "optimized", "proposal head");
     failures += expect(report.at("config").at("concurrency") == 1, "default concurrency in report");
     failures += expect(report.at("config").at("decode_graph_prime").at("output_tokens") == 13,

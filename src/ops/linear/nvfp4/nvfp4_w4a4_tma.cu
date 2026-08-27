@@ -173,6 +173,10 @@ void launch_nvfp4_w4a4_tma_linear(Nvfp4Problem problem, const std::uint8_t* acti
         launch_linear<Nvfp4Residual17408Geometry>(activation_codes, activation_scales, weight_codes,
                                                   weight_scales, output, tokens, alpha, stream);
         return;
+    case Nvfp4Problem::MtpFc:
+        launch_linear<Nvfp4MtpFcGeometry>(activation_codes, activation_scales, weight_codes,
+                                          weight_scales, output, tokens, alpha, stream);
+        return;
     case Nvfp4Problem::DflashFeature:
     case Nvfp4Problem::DflashQkv:
     case Nvfp4Problem::DflashAttnOut:
@@ -238,6 +242,7 @@ void launch_nvfp4_w4a4_tma_linear_add(Nvfp4Problem problem, const std::uint8_t* 
     case Nvfp4Problem::DflashAttnOut:
     case Nvfp4Problem::DflashConvProj:
     case Nvfp4Problem::DflashSelector:
+    case Nvfp4Problem::MtpFc:
         return;
     }
 }

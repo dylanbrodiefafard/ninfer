@@ -136,7 +136,7 @@ __global__ __launch_bounds__(256, 1) void kernel_prod(
     int gate_row = 0, lane = 0, warp = 0, rows[2];
     resolve_rows(gate_row, rows, lane, warp);
     float acc[2][kT][1] = {};
-    compute_nvfp4_small_t_rows<Geometry, kT, Schedule>(x, codes, scales, shared, inverse, rows,
+    compute_nvfp4_small_t_rows<Geometry, kT, Schedule>(Nvfp4PackedActivation<Geometry>{x}, codes, scales, shared, inverse, rows,
                                                        warp * 2, 0, 0, lane, acc);
     float flat[2][kT];
 #pragma unroll
@@ -267,7 +267,7 @@ __global__ __launch_bounds__(256, 1) void kernel_shared_cs_u10(
     int gate_row = 0, lane = 0, warp = 0, rows[2];
     resolve_rows(gate_row, rows, lane, warp);
     float acc[2][kT][1] = {};
-    compute_nvfp4_small_t_rows<Geometry, kT, SchedSharedCsU10>(x, codes, scales, shared, inverse,
+    compute_nvfp4_small_t_rows<Geometry, kT, SchedSharedCsU10>(Nvfp4PackedActivation<Geometry>{x}, codes, scales, shared, inverse,
                                                                rows, warp * 2, 0, 0, lane, acc);
     float flat[2][kT];
 #pragma unroll
@@ -284,7 +284,7 @@ __global__ __launch_bounds__(256, 1) void kernel_shared_u10(
     int gate_row = 0, lane = 0, warp = 0, rows[2];
     resolve_rows(gate_row, rows, lane, warp);
     float acc[2][kT][1] = {};
-    compute_nvfp4_small_t_rows<Geometry, kT, SchedSharedU10>(x, codes, scales, shared, inverse,
+    compute_nvfp4_small_t_rows<Geometry, kT, SchedSharedU10>(Nvfp4PackedActivation<Geometry>{x}, codes, scales, shared, inverse,
                                                              rows, warp * 2, 0, 0, lane, acc);
     float flat[2][kT];
 #pragma unroll
@@ -327,7 +327,7 @@ __global__ __launch_bounds__(256, 1) void kernel_tok_stream(
     int gate_row = 0, lane = 0, warp = 0, rows[2];
     resolve_rows(gate_row, rows, lane, warp);
     float acc[2][kT][1] = {};
-    compute_nvfp4_small_t_rows<Geometry, kT, SchedStream>(x, codes, scales, shared, inverse, rows,
+    compute_nvfp4_small_t_rows<Geometry, kT, SchedStream>(Nvfp4PackedActivation<Geometry>{x}, codes, scales, shared, inverse, rows,
                                                           warp * 2, 0, 0, lane, acc);
     float flat[2][kT];
 #pragma unroll
@@ -344,7 +344,7 @@ __global__ __launch_bounds__(256, 1) void kernel_shared_cs(
     int gate_row = 0, lane = 0, warp = 0, rows[2];
     resolve_rows(gate_row, rows, lane, warp);
     float acc[2][kT][1] = {};
-    compute_nvfp4_small_t_rows<Geometry, kT, SchedSharedCs>(x, codes, scales, shared, inverse, rows,
+    compute_nvfp4_small_t_rows<Geometry, kT, SchedSharedCs>(Nvfp4PackedActivation<Geometry>{x}, codes, scales, shared, inverse, rows,
                                                             warp * 2, 0, 0, lane, acc);
     float flat[2][kT];
 #pragma unroll
@@ -361,7 +361,7 @@ __global__ __launch_bounds__(256, 1) void kernel_shared_cs_u4(
     int gate_row = 0, lane = 0, warp = 0, rows[2];
     resolve_rows(gate_row, rows, lane, warp);
     float acc[2][kT][1] = {};
-    compute_nvfp4_small_t_rows<Geometry, kT, SchedSharedCsU4>(x, codes, scales, shared, inverse,
+    compute_nvfp4_small_t_rows<Geometry, kT, SchedSharedCsU4>(Nvfp4PackedActivation<Geometry>{x}, codes, scales, shared, inverse,
                                                               rows, warp * 2, 0, 0, lane, acc);
     float flat[2][kT];
 #pragma unroll
@@ -378,7 +378,7 @@ __global__ __launch_bounds__(256, 1) void kernel_shared_u4(
     int gate_row = 0, lane = 0, warp = 0, rows[2];
     resolve_rows(gate_row, rows, lane, warp);
     float acc[2][kT][1] = {};
-    compute_nvfp4_small_t_rows<Geometry, kT, SchedSharedU4>(x, codes, scales, shared, inverse, rows,
+    compute_nvfp4_small_t_rows<Geometry, kT, SchedSharedU4>(Nvfp4PackedActivation<Geometry>{x}, codes, scales, shared, inverse, rows,
                                                             warp * 2, 0, 0, lane, acc);
     float flat[2][kT];
 #pragma unroll
@@ -410,7 +410,7 @@ __global__ __launch_bounds__(256, 2) void kernel_prod_occ2(
     int gate_row = 0, lane = 0, warp = 0, rows[2];
     resolve_rows(gate_row, rows, lane, warp);
     float acc[2][kT][1] = {};
-    compute_nvfp4_small_t_rows<Geometry, kT, Schedule>(x, codes, scales, shared, inverse, rows,
+    compute_nvfp4_small_t_rows<Geometry, kT, Schedule>(Nvfp4PackedActivation<Geometry>{x}, codes, scales, shared, inverse, rows,
                                                        warp * 2, 0, 0, lane, acc);
     float flat[2][kT];
 #pragma unroll

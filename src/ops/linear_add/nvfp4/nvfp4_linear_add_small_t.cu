@@ -24,7 +24,7 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& residual, cudaS
     auto* output              = static_cast<__nv_bfloat16*>(residual.data);
     nvfp4_small_t_kernel<Geometry, ActiveTokens, Schedule>
         <<<kBlocks, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
+            Nvfp4PackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data)},
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), inverse,
             Nvfp4AddResidualEpilogue{output, Geometry::kOutputRows},
@@ -67,6 +67,7 @@ void nvfp4_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tens
     case Nvfp4Problem::DflashAttnOut:
     case Nvfp4Problem::DflashConvProj:
     case Nvfp4Problem::DflashSelector:
+    case Nvfp4Problem::MtpFc:
         break;
     }
     throw std::invalid_argument("nvfp4 linear_add: unsupported problem");

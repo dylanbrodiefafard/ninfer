@@ -57,6 +57,12 @@ projection uses Q6, and the registered MTP and Vision-merger matrices use W8. Di
 logical row views, and aliases are defined by
 `tools/convert/qwen3_8_27b/inventory.py`.
 
+On the NVFP4 identity the five MTP parents may be either that registered W8 layout or
+`NVFP4` `blockscale-k16-m128x4-v1` (same `[N,K]`). Heads stay W8/Q4. The Engine binder accepts
+either encoding. `tools/convert/qwen3_8_27b/convert_mtp_nvfp4.py` quantizes those five parents
+from `Qwen/Qwen3.8-27B` BF16 with encoder `DFLASH2_NVFP4_MAXABS_TWOLEVEL_V2` and leaves Text,
+Vision, and heads unchanged.
+
 Optional DFlash2 on the NVFP4 identity is defined by
 `tools/convert/qwen3_8_27b/inventory_dflash2.py` (66 tensors). W8 matrices use `W8G32_F16S`; the
 Q4 sibling uses `Q4G64_F16S` for the same `[N,K]` set. The product NVFP4 sibling uses `NVFP4`
@@ -151,6 +157,22 @@ scales, E2M1 codes). NVFP4 DFlash2 Linear geometries are A16-only. The converter
 for `z-lab/dflash` `model.py` is `95c8aeca5e4b4c4f9c0c967c05ab89fa3ed24f4c` and is not a conversion
 input.
 
+Rewrite the five MTP Linear parents from `Qwen/Qwen3.8-27B` BF16 onto an existing
+`qwen3.8-27b/nvfp4` shell (Ostfralla or any other file without those parents already
+consumed as the BF16 source). Text, Vision, and heads are copied unchanged:
+
+```bash
+python3 -m tools.convert.qwen3_8_27b.convert_mtp_nvfp4 \
+  --base-artifact /path/to/qwen3_8_27b_nvfp4.ninfer \
+  --model /path/to/Qwen3.8-27B \
+  --out /ssdpool2nvme/local_llm/models/qwen3.8-nvfp4-mtp-nvfp4-from-bf16/qwen3_8_27b_nvfp4.ninfer \
+  --device cuda
+```
+
+The BF16 checkout must include the MTP sources (`mtp.fc.weight` and the layer-0
+attention/MLP weights). Hugging Face revision `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`
+places them in `model-00018-of-00018.safetensors`.
+
 ## 4. Engine binding
 
 The registered mapping is:
@@ -169,7 +191,7 @@ The groupwise profile binds the embedding and output head as W8 and the Text bod
 groupwise binding. Workspace selection follows the groupwise execution routes. The NVFP4 identity
 reuses the Qwen3.6-27B NVFP4 profile unchanged: that profile already stores the vocabulary
 endpoints as W8, which is the only groupwise difference between the two models, so the object
-layouts are identical. The registry constructs the 27B `LoadedModel`, `SequencePlan`, and
+layouts are identical. MTP matrices on that identity bind as W8 or NVFP4. The registry constructs the 27B `LoadedModel`, `SequencePlan`, and
 `Program`, and reports `qwen3_8_27b/qwen3.8-27b/groupwise-int` or
 `qwen3_8_27b/qwen3.8-27b/nvfp4` in the load summary.
 

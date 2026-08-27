@@ -116,7 +116,11 @@ artifact and run the real Engine. Point `NINFER_QWEN3_6_27B_WEIGHTS` and/or
 `NINFER_QWEN3_6_27B_NVFP4_WEIGHTS` at any Engine-loadable 27B-family `.ninfer` of that weight
 profile; the artifact identity selects the target. Qwen3.6-27B and Qwen3.8-27B both work, so
 `NINFER_QWEN3_6_27B_NVFP4_WEIGHTS` may be `out/qwen3_6_27b_nvfp4.ninfer` or
-`qwen3_8_27b_nvfp4.ninfer`. The RAM-tier test covers capture sites 1–3, INT8 KV, MTP, oversize drop,
+`qwen3_8_27b_nvfp4.ninfer`. `ninfer_qwen3_8_27b_mtp_nvfp4_real_test` additionally requires
+`NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS` (BF16-sourced NVFP4 MTP). C=1 greedy MTP must emit 24
+tokens with speculative rounds; overlapping C=2 and C=3 must complete the requested
+lengths with MTP decode (packed MTP verify is not C=1-token-identical). k=3 and k=5.
+The RAM-tier test covers capture sites 1–3, INT8 KV, MTP, oversize drop,
 VRAM-wins-equal-reuse, longer-RAM-beats-shorter-VRAM, suffix prefill after RAM restore, RAM disabled, queued matcher,
 `allow_prefix_reuse=false`, rewrite-checkpoint restore, dirty-lane checkpoint restore, cancel-after-consume, consume-then-VRAM,
 overlapping `submit()` at `max_concurrency=2`, C=2/C=3 sequential FullReset onto an empty lane
@@ -148,6 +152,8 @@ NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS=$PWD/out/qwen3_8_27b_nvfp4_dflash_w8.nin
   ctest --test-dir build -R ninfer_qwen3_6_27b_context_checkpoint_real_test --output-on-failure
 NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS=$PWD/out/qwen3_8_27b_nvfp4_dflash_w8.ninfer \
   ctest --test-dir build -R ninfer_qwen3_8_27b_dflash_real_test --output-on-failure
+NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS=/ssdpool2nvme/local_llm/models/qwen3.8-nvfp4-mtp-nvfp4-from-bf16/qwen3_8_27b_nvfp4.ninfer \
+  ctest --test-dir build -R ninfer_qwen3_8_27b_mtp_nvfp4_real_test --output-on-failure
 NINFER_QWEN3_6_35B_A3B_WEIGHTS=$PWD/out/qwen3_6_35b_a3b.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_35b_a3b_ram_real_test --output-on-failure
 ```

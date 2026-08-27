@@ -131,6 +131,10 @@ ninfer_add_test(ninfer_qwen3_8_27b_dflash_real_test
   SOURCES targets/qwen3_6_27b/test_engine_dflash_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_8_27b_dflash_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_8_27b_mtp_nvfp4_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_mtp_nvfp4_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_8_27b_mtp_nvfp4_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_27b_load_plan_test
   SOURCES targets/qwen3_6_27b/test_load_plan.cpp
   NEEDS_SOURCE_DIR
@@ -262,6 +266,7 @@ ninfer_add_op_test(ninfer_sparse_moe_test
 ninfer_add_op_test(ninfer_mtp_pack_test
   SOURCES ops/test_mtp_pack.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_linear_test(ninfer_mtp_fc_test ops/test_mtp_fc.cpp)
 ninfer_add_op_test(ninfer_mtp_round_test
   SOURCES ops/test_mtp_round.cpp
   LIBRARIES ninfer_ops)

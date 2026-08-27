@@ -55,7 +55,8 @@ void nvfp4_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tenso
     constexpr int kBlocks              = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const float inverse_weight_divisor = 1.0F / weight.weight_scale_divisor;
     nvfp4_gemv_kernel<Geometry, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+        Nvfp4PackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data)},
+        static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), inverse_weight_divisor,
         Nvfp4IdentityEpilogue{}, output);
     CUDA_CHECK(cudaGetLastError());

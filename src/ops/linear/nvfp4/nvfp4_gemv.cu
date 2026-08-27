@@ -24,7 +24,8 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
     constexpr int kBlocks              = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const float inverse_weight_divisor = 1.0F / weight.weight_scale_divisor;
     nvfp4_gemv_kernel<Geometry, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+        Nvfp4PackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data)},
+        static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), inverse_weight_divisor,
         Nvfp4IdentityEpilogue{}, output);
     CUDA_CHECK(cudaGetLastError());
@@ -64,7 +65,36 @@ void launch_nvfp4_decode(const Tensor& x, const Weight& weight, Tensor& out, cud
     case Nvfp4Problem::DflashSelector:
         launch_exact<Nvfp4DflashSelectorGeometry>(x, weight, out, stream);
         return;
+    case Nvfp4Problem::MtpFc:
+        launch_exact<Nvfp4MtpFcGeometry>(x, weight, out, stream);
+        return;
     }
+}
+
+void launch_nvfp4_decode_splitk(const Tensor& embedding, const Tensor& hidden, const Weight& weight,
+                                Tensor& out, cudaStream_t stream) {
+    using Geometry = Nvfp4MtpFcGeometry;
+    using Schedule = typename Nvfp4LinearDecodeProductionSchedule<Geometry>::Type;
+    if (embedding.ne[0] != Geometry::kInputRows / 2 || embedding.ne[1] != 1 ||
+        hidden.ne[0] != Geometry::kInputRows / 2 || hidden.ne[1] != 1 ||
+        out.ne[0] != Geometry::kOutputRows || out.ne[1] != 1 ||
+        weight.n != Geometry::kOutputRows || weight.k != Geometry::kInputRows) {
+        throw std::invalid_argument("nvfp4 mtp_fc decode: invalid exact problem");
+    }
+    constexpr int kValuesPerPhase = 32 * Schedule::kValuesPerLane;
+    static_assert((Geometry::kInputRows / 2) % kValuesPerPhase == 0);
+
+    const Nvfp4ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data),
+                                       Geometry::kOutputRows};
+    constexpr int kBlocks              = Geometry::kOutputRows / Schedule::kRowsPerCta;
+    const float inverse_weight_divisor = 1.0F / weight.weight_scale_divisor;
+    nvfp4_gemv_kernel<Geometry, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
+        Nvfp4SplitKActivation<Geometry>{static_cast<const __nv_bfloat16*>(embedding.data),
+                                        static_cast<const __nv_bfloat16*>(hidden.data)},
+        static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), inverse_weight_divisor,
+        Nvfp4IdentityEpilogue{}, output);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace ninfer::ops::detail

@@ -65,8 +65,9 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         m_tile * 128 + (flat_pair >> 2) + (flat_pair & 3) * 32;
     const int parent_rows[2] = {gate_row, gate_row + kInter};
     float accumulators[2][kT][1] = {};
-    compute_nvfp4_small_t_rows<GateUp, kT, Schedule>(x, codes, scales, shared, inverse, parent_rows,
-                                                     warp * 2, 0, 0, lane, accumulators);
+    compute_nvfp4_small_t_rows<GateUp, kT, Schedule>(
+        Nvfp4PackedActivation<GateUp>{x}, codes, scales, shared, inverse, parent_rows, warp * 2, 0,
+        0, lane, accumulators);
 #pragma unroll
     for (int token = 0; token < kT; ++token) {
         float gate = accumulators[0][token][0];
@@ -94,7 +95,8 @@ void launch_down(const __nv_bfloat16* x, const std::uint8_t* c, const std::uint8
     constexpr int kTokenTiles = (kT + Schedule::kTokenTile - 1) / Schedule::kTokenTile;
     constexpr int kBlocks     = (Down::kOutputRows / Schedule::kRowsPerCta) * kTokenTiles;
     nvfp4_small_t_kernel<Down, kT, Schedule>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(x, c, s, inv, Nvfp4IdentityEpilogue{},
+        <<<kBlocks, Schedule::kThreads, 0, stream>>>(Nvfp4PackedActivation<Down>{x}, c, s, inv,
+                                                    Nvfp4IdentityEpilogue{},
                                                     Nvfp4ContiguousOutput{o, Down::kOutputRows});
     CUDA_CHECK(cudaGetLastError());
 }

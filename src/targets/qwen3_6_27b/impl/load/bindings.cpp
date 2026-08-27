@@ -130,6 +130,43 @@ Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
     return out;
 }
 
+WeightPlan bind_mtp_matrix(artifact::Binder& binder, std::string_view name,
+                           std::initializer_list<std::uint64_t> shape,
+                           artifact::TensorPlacement placement) {
+    const auto* descriptor = std::get_if<artifact::TensorDescriptor>(binder.find(name));
+    if (descriptor == nullptr) {
+        throw artifact::ArtifactError(std::string(name) + " is missing");
+    }
+    if (descriptor->format == NumericFormat::W8G32_F16S) {
+        return WeightPlan{.object = artifact::bind_tensor(binder, name, NumericFormat::W8G32_F16S,
+                                                          shape, placement),
+                          .format = NumericFormat::W8G32_F16S};
+    }
+    if (descriptor->format != NumericFormat::NVFP4) {
+        throw artifact::ArtifactError(std::string(name) + " must be W8G32_F16S or NVFP4");
+    }
+    if (shape.size() != 2) { throw std::logic_error("MTP NVFP4 matrix must be rank-2"); }
+    auto cursor                             = shape.begin();
+    const std::uint64_t rows                = *cursor++;
+    const std::uint64_t columns             = *cursor;
+    const std::array<std::uint64_t, 2> dims = {rows, columns};
+    const artifact::ObjectHandle parent =
+        artifact::bind_tensor(binder, name, NumericFormat::NVFP4, shape, placement);
+    const artifact::BlockScaleGeometry geometry =
+        artifact::block_scale_geometry(NumericFormat::NVFP4, dims);
+    const std::uint32_t weight_bits =
+        read_u32_le(binder.payload(parent).data, geometry.weight_divisor_offset, name);
+    require_positive_finite(weight_bits, name);
+    // Path-C MTP has no site d_x object. 3.5 is the uncalibrated activation divisor used by NVFP4
+    // Op tests so W4A4 E4M3 scales sit in range; A16 ignores it.
+    constexpr float kUncalibratedNvfp4InputDivisor = 3.5F;
+    return WeightPlan{
+        .object                    = parent,
+        .format                    = NumericFormat::NVFP4,
+        .weight_scale_divisor_bits = weight_bits,
+        .input_scale_divisor_bits  = std::bit_cast<std::uint32_t>(kUncalibratedNvfp4InputDivisor)};
+}
+
 Weight row_view(const Weight& block, std::int32_t row_begin, std::int32_t row_count) {
     if (row_begin < 0 || row_count <= 0 || row_begin + row_count > block.n ||
         block.layout != QuantLayout::RowSplit) {
@@ -372,29 +409,27 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     const artifact::TensorPlacement mtp_placement = features.mtp()
                                                         ? artifact::TensorPlacement::Device
                                                         : artifact::TensorPlacement::ValidateOnly;
-    const auto bind_mtp                           = [&](std::string_view name, NumericFormat format,
+    const auto bind_mtp = [&](std::string_view name, NumericFormat format,
                               std::initializer_list<std::uint64_t> shape) {
         return artifact::bind_tensor(binder, name, format, shape, mtp_placement);
     };
     out.mtp.input_projection =
-        bind_mtp("mtp/input_projection", NumericFormat::W8G32_F16S, {5120, 10240});
-    out.mtp.embedding_norm       = bind_mtp("mtp/embedding_norm", NumericFormat::BF16, {5120});
-    out.mtp.hidden_norm          = bind_mtp("mtp/hidden_norm", NumericFormat::BF16, {5120});
-    out.mtp.input_norm           = bind_mtp("mtp/layer/input_norm", NumericFormat::BF16, {5120});
-    out.mtp.query_key_gate_value = bind_mtp("mtp/layer/attention/query_key_gate_value",
-                                            NumericFormat::W8G32_F16S, {14336, 5120});
+        bind_mtp_matrix(binder, "mtp/input_projection", {5120, 10240}, mtp_placement);
+    out.mtp.embedding_norm = bind_mtp("mtp/embedding_norm", NumericFormat::BF16, {5120});
+    out.mtp.hidden_norm    = bind_mtp("mtp/hidden_norm", NumericFormat::BF16, {5120});
+    out.mtp.input_norm     = bind_mtp("mtp/layer/input_norm", NumericFormat::BF16, {5120});
+    out.mtp.query_key_gate_value = bind_mtp_matrix(
+        binder, "mtp/layer/attention/query_key_gate_value", {14336, 5120}, mtp_placement);
     out.mtp.query_norm = bind_mtp("mtp/layer/attention/query_norm", NumericFormat::BF16, {256});
     out.mtp.key_norm   = bind_mtp("mtp/layer/attention/key_norm", NumericFormat::BF16, {256});
     out.mtp.output =
-        bind_mtp("mtp/layer/attention/output", NumericFormat::W8G32_F16S, {5120, 6144});
+        bind_mtp_matrix(binder, "mtp/layer/attention/output", {5120, 6144}, mtp_placement);
     out.mtp.post_attention_norm =
         bind_mtp("mtp/layer/post_attention_norm", NumericFormat::BF16, {5120});
-    out.mtp.mlp.gate_up = WeightPlan{
-        .object = bind_mtp("mtp/layer/mlp/gate_up", NumericFormat::W8G32_F16S, {34816, 5120}),
-        .format = NumericFormat::W8G32_F16S};
-    out.mtp.mlp.down = WeightPlan{
-        .object = bind_mtp("mtp/layer/mlp/down", NumericFormat::W8G32_F16S, {5120, 17408}),
-        .format = NumericFormat::W8G32_F16S};
+    out.mtp.mlp.gate_up =
+        bind_mtp_matrix(binder, "mtp/layer/mlp/gate_up", {34816, 5120}, mtp_placement);
+    out.mtp.mlp.down =
+        bind_mtp_matrix(binder, "mtp/layer/mlp/down", {5120, 17408}, mtp_placement);
     out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {5120});
 
     const artifact::TensorPlacement vision_placement =
@@ -574,26 +609,26 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
 
     if (plan.features.mtp()) {
         auto& mtp            = runtime.mtp.emplace();
-        mtp.input_projection = artifact::materialized_weight(
-            backing, plan.mtp.input_projection, NumericFormat::W8G32_F16S, 5120, 10240);
+        mtp.input_projection = materialized_weight(backing, plan.mtp.input_projection, 5120, 10240);
         mtp.embedding_norm   = artifact::materialized_tensor(backing, plan.mtp.embedding_norm,
                                                              NumericFormat::BF16, {5120});
         mtp.hidden_norm      = artifact::materialized_tensor(backing, plan.mtp.hidden_norm,
                                                              NumericFormat::BF16, {5120});
         mtp.input_norm       = artifact::materialized_tensor(backing, plan.mtp.input_norm,
                                                              NumericFormat::BF16, {5120});
-        mtp.attention.packed = artifact::materialized_weight(
-            backing, plan.mtp.query_key_gate_value, NumericFormat::W8G32_F16S, 14336, 5120);
-        mtp.attention.query       = row_view(mtp.attention.packed, 0, 6144);
-        mtp.attention.key         = row_view(mtp.attention.packed, 6144, 1024);
-        mtp.attention.output_gate = row_view(mtp.attention.packed, 7168, 6144);
-        mtp.attention.value       = row_view(mtp.attention.packed, 13312, 1024);
+        mtp.attention.packed =
+            materialized_weight(backing, plan.mtp.query_key_gate_value, 14336, 5120);
+        if (mtp.attention.packed.layout == QuantLayout::RowSplit) {
+            mtp.attention.query       = row_view(mtp.attention.packed, 0, 6144);
+            mtp.attention.key         = row_view(mtp.attention.packed, 6144, 1024);
+            mtp.attention.output_gate = row_view(mtp.attention.packed, 7168, 6144);
+            mtp.attention.value       = row_view(mtp.attention.packed, 13312, 1024);
+        }
         mtp.query_norm =
             artifact::materialized_tensor(backing, plan.mtp.query_norm, NumericFormat::BF16, {256});
         mtp.key_norm =
             artifact::materialized_tensor(backing, plan.mtp.key_norm, NumericFormat::BF16, {256});
-        mtp.output              = artifact::materialized_weight(backing, plan.mtp.output,
-                                                                NumericFormat::W8G32_F16S, 5120, 6144);
+        mtp.output = materialized_weight(backing, plan.mtp.output, 5120, 6144);
         mtp.post_attention_norm = artifact::materialized_tensor(
             backing, plan.mtp.post_attention_norm, NumericFormat::BF16, {5120});
         mtp.post_mixer = load_mlp(plan.mtp.mlp, backing);

@@ -18,7 +18,8 @@ void nvfp4_gdn_snapshot_decode_launch(const Tensor& x, const Weight& weight,
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const float inverse   = 1.0F / weight.weight_scale_divisor;
     nvfp4_gemv_kernel<Geometry, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+        Nvfp4PackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data)},
+        static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), inverse, Nvfp4IdentityEpilogue{},
         make_nvfp4_gdn_conv_output<1>(
             conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z,

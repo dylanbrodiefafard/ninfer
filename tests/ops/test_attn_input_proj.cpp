@@ -297,10 +297,11 @@ int run_nvfp4_target() {
         quantized_weight::make_patterned_weight(QType::NVFP4, kParentRows, kHidden, 331U, options));
 
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 4, 8, 16, 20, 32, 33}) {
+    for (const std::int32_t tokens : {1, 2, 4, 6, 8, 16, 20, 32, 33}) {
         failures += run_nvfp4_target_case(parent, tokens);
     }
     failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA4);
+    failures += run_nvfp4_target_case(parent, 6, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_target_case(parent, 17, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_target_case(parent, 1024, ops::LinearPolicy::AllowA4);
     return failures;

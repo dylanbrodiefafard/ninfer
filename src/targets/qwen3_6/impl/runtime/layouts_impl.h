@@ -351,6 +351,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto mtp_stem = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
                               bool preembedded) {
         (void)workspace_recipe::mtp_stem<TextConfig>(layout, tokens, !preembedded);
+        scratch(layout, Variant::mtp_fc_workspace_capacity_bytes(tokens, tokens));
     };
     const auto mtp_full_core = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
                                    ops::GqaExecutionEnvelope envelope) {
@@ -362,6 +363,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
                             TextConfig::query_heads, plan.kv_dtype, envelope, 1, tokens, tokens));
         (void)workspace_recipe::mtp_post_attention<TextConfig>(layout, tokens);
+        scratch(layout, Variant::mtp_attention_output_workspace_capacity_bytes(tokens, tokens));
         scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(tokens, tokens));
     };
     const auto mtp_full_call = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
@@ -395,7 +397,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         matrix(layout, DType::BF16, TextConfig::query_size, 1);
         scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
                             TextConfig::query_heads, plan.kv_dtype, text_envelope, 1, 1, 1));
-        matrix(layout, DType::BF16, TextConfig::hidden, 1);
+        scratch(layout, Variant::mtp_attention_output_workspace_capacity_bytes(1, 1));
         matrix(layout, DType::BF16, TextConfig::hidden, 1);
         scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(1, 1));
         proposal_scratch(layout, 1);
@@ -470,6 +472,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                     TextConfig::query_heads, plan.kv_dtype, text_envelope, batch,
                                     width, width));
                 (void)workspace_recipe::mtp_post_attention<TextConfig>(layout, tokens);
+                scratch(layout,
+                        Variant::mtp_attention_output_workspace_capacity_bytes(tokens, tokens));
                 scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(tokens, tokens));
             };
 
