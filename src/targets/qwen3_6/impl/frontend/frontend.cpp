@@ -4,6 +4,7 @@
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include "targets/qwen3_6/impl/frontend/chat_template.h"
+#include "targets/qwen3_6/impl/frontend/encoded_history_cache.h"
 #include "targets/qwen3_6/impl/frontend/processor.h"
 #include "targets/qwen3_6/impl/frontend/test_access.h"
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
@@ -308,6 +309,50 @@ void assign_text_positions(PreparedPromptData& prompt) {
         }
     }
     prompt.rope_delta = 0;
+}
+
+std::unique_ptr<PreparedPromptData> make_text_prompt_data(fi::EncodedChat encoded,
+                                                          const PromptOptions& options,
+                                                          Clock::time_point start) {
+    auto prepared              = std::make_unique<PreparedPromptData>();
+    PreparedPromptData& result = *prepared;
+    result.token_ids.assign(encoded.input_ids.begin(), encoded.input_ids.end());
+    result.identity.rewrite_checkpoint = std::move(encoded.rewrite_checkpoint);
+    assign_text_positions(result);
+    (void)checked_token_count(result.token_ids.size());
+    result.identity.reusable   = true;
+    result.starts_in_reasoning = options.add_generation_prompt && options.enable_thinking;
+    result.prepare.seconds     = std::chrono::duration<double>(Clock::now() - start).count();
+    return prepared;
+}
+
+VisionItem convert_vision_item(fi::VisionItem item);
+
+std::unique_ptr<PreparedPromptData> make_media_prompt_data(fi::ProcessedInput processed,
+                                                           const PromptOptions& options,
+                                                           Clock::time_point start) {
+    auto prepared              = std::make_unique<PreparedPromptData>();
+    PreparedPromptData& result = *prepared;
+    result.token_ids.assign(processed.input_ids.begin(), processed.input_ids.end());
+    result.token_types = std::move(processed.token_types);
+    result.positions   = std::move(processed.positions);
+    result.rope_delta  = processed.rope_delta;
+    result.patches     = std::move(processed.patches);
+    result.vision_items.reserve(processed.vision_items.size());
+    for (fi::VisionItem& item : processed.vision_items) {
+        result.vision_items.push_back(convert_vision_item(std::move(item)));
+    }
+    result.prepare.media_items         = processed.stats.media_items;
+    result.prepare.raw_patches         = processed.stats.raw_patches;
+    result.prepare.vision_tokens       = processed.stats.vision_tokens;
+    result.prepare.attention_pairs     = processed.stats.attention_pairs;
+    result.prepare.patch_bytes         = processed.stats.patch_bytes;
+    result.identity.rewrite_checkpoint = processed.rewrite_checkpoint;
+    (void)checked_token_count(result.token_ids.size());
+    result.identity.reusable   = true;
+    result.starts_in_reasoning = options.add_generation_prompt && options.enable_thinking;
+    result.prepare.seconds     = std::chrono::duration<double>(Clock::now() - start).count();
+    return prepared;
 }
 
 VisionItem convert_vision_item(fi::VisionItem item) {
@@ -851,42 +896,18 @@ PreparedPrompt Frontend::prepare(PromptInput input) const {
         throw std::invalid_argument("Vision is disabled for this Engine");
     }
 
-    auto prepared              = std::make_unique<PreparedPromptData>();
-    PreparedPromptData& result = *prepared;
     if (has_media) {
         fi::Processor processor(*impl_->tokenizer, impl_->chat_template, impl_->processor);
         fi::ProcessedInput processed;
         try {
             processed = processor.process(messages, render_options(options));
         } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
-        result.token_ids.assign(processed.input_ids.begin(), processed.input_ids.end());
-        result.token_types = std::move(processed.token_types);
-        result.positions   = std::move(processed.positions);
-        result.rope_delta  = processed.rope_delta;
-        result.patches     = std::move(processed.patches);
-        result.vision_items.reserve(processed.vision_items.size());
-        for (fi::VisionItem& item : processed.vision_items) {
-            result.vision_items.push_back(convert_vision_item(std::move(item)));
-        }
-        result.prepare.media_items         = processed.stats.media_items;
-        result.prepare.raw_patches         = processed.stats.raw_patches;
-        result.prepare.vision_tokens       = processed.stats.vision_tokens;
-        result.prepare.attention_pairs     = processed.stats.attention_pairs;
-        result.prepare.patch_bytes         = processed.stats.patch_bytes;
-        result.identity.rewrite_checkpoint = processed.rewrite_checkpoint;
-    } else {
-        const fi::RenderedChat rendered =
-            impl_->chat_template.render(messages, render_options(options));
-        fi::EncodedChat encoded            = fi::encode_rendered_chat(*impl_->tokenizer, rendered);
-        result.token_ids                   = std::move(encoded.input_ids);
-        result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
-        assign_text_positions(result);
+        return PreparedPrompt(make_media_prompt_data(std::move(processed), options, start));
     }
-    (void)checked_token_count(result.token_ids.size());
-    result.identity.reusable   = true;
-    result.starts_in_reasoning = options.add_generation_prompt && options.enable_thinking;
-    result.prepare.seconds     = std::chrono::duration<double>(Clock::now() - start).count();
-    return PreparedPrompt(std::move(prepared));
+    const fi::RenderedChat rendered =
+        impl_->chat_template.render(messages, render_options(options));
+    fi::EncodedChat encoded = fi::encode_rendered_chat(*impl_->tokenizer, rendered);
+    return PreparedPrompt(make_text_prompt_data(std::move(encoded), options, start));
 }
 
 std::uint32_t Frontend::count_tokens(PromptInput input) const {
@@ -945,5 +966,57 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }
+
+PreparedPrompt EncodedHistoryPrepare::prepare(const Frontend& frontend, PromptInput input,
+                                              frontend_internal::EncodedHistoryCache& cache) {
+    const auto start                      = Clock::now();
+    const PromptOptions options           = input.options;
+    std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
+    const bool has_media =
+        std::any_of(messages.begin(), messages.end(),
+                    [](const fi::ChatMessage& message) { return message.has_media(); });
+    if (has_media && !frontend.impl_->vision_enabled) {
+        throw std::invalid_argument("Vision is disabled for this Engine");
+    }
+    if (has_media) {
+        fi::last_host_encode_observation = {};
+        fi::Processor processor(*frontend.impl_->tokenizer, frontend.impl_->chat_template,
+                                frontend.impl_->processor);
+        fi::ProcessedInput processed;
+        try {
+            processed = processor.process(messages, render_options(options));
+        } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
+        return PreparedPrompt(make_media_prompt_data(std::move(processed), options, start));
+    }
+    fi::EncodedChat encoded =
+        fi::encode_chat_with_cache(*frontend.impl_->tokenizer, frontend.impl_->chat_template,
+                                   messages, render_options(options), cache);
+    return PreparedPrompt(make_text_prompt_data(std::move(encoded), options, start));
+}
+
+std::uint32_t EncodedHistoryPrepare::count_tokens(const Frontend& frontend, PromptInput input,
+                                                  frontend_internal::EncodedHistoryCache& cache) {
+    const PromptOptions options           = input.options;
+    std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
+    const bool has_media =
+        std::any_of(messages.begin(), messages.end(),
+                    [](const fi::ChatMessage& message) { return message.has_media(); });
+    if (has_media && !frontend.impl_->vision_enabled) {
+        throw std::invalid_argument("Vision is disabled for this Engine");
+    }
+    if (!has_media) {
+        const fi::EncodedChat encoded =
+            fi::encode_chat_with_cache(*frontend.impl_->tokenizer, frontend.impl_->chat_template,
+                                       messages, render_options(options), cache);
+        return checked_token_count(encoded.input_ids.size());
+    }
+    fi::last_host_encode_observation = {};
+    fi::Processor processor(*frontend.impl_->tokenizer, frontend.impl_->chat_template,
+                            frontend.impl_->processor);
+    try {
+        return checked_token_count(
+            processor.process(messages, render_options(options)).input_ids.size());
+    } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
+}
 
 } // namespace ninfer::targets::qwen3_6

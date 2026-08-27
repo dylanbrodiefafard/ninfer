@@ -1334,12 +1334,16 @@ int run_encode_bench() {
     with_tools.tool_jsons = tool_schema(16);
     fi::ChatRenderOptions tools_100_opts;
     tools_100_opts.tool_jsons = tool_schema(100);
+    fi::ChatRenderOptions tools_200_opts;
+    tools_200_opts.tool_jsons = tool_schema(200);
     cases.push_back({"plain_2k", plain_messages(2048), {}, 24});
     cases.push_back({"plain_8k", plain_messages(8192), {}, 8});
     cases.push_back({"plain_16k", plain_messages(16384), {}, 6});
     cases.push_back({"plain_32k", plain_messages(32768), {}, 4});
+    cases.push_back({"plain_150k", plain_messages(150000), {}, 3});
     cases.push_back({"large_tools", tool_messages(16, 4 * 1024, 1), with_tools, 6});
     cases.push_back({"tools_100_parallel", tool_messages(100, 4 * 1024, 1), tools_100_opts, 4});
+    cases.push_back({"tools_200_150k", tool_messages(200, 1536, 1), tools_200_opts, 3});
     cases.push_back({"tools_100_turns", tool_messages(4, 4 * 1024, 25), tools_100_opts, 4});
     cases.push_back({"massive_tools", tool_messages(32, 32 * 1024, 2), with_tools, 3});
     cases.push_back({"tool_loop_history", tool_messages(4, 1024, 8), with_tools, 6});

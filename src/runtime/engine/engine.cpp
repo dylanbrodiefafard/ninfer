@@ -4,6 +4,7 @@
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/concurrent_executor.h"
+#include "targets/qwen3_6/impl/frontend/encoded_history_cache.h"
 #include "targets/registry.h"
 
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
@@ -169,6 +170,7 @@ public:
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
     Executor executor;
+    mutable targets::qwen3_6::frontend_internal::EncodedHistoryCache host_encode_cache;
 };
 
 Engine::Engine(EngineOptions options) : impl_(std::make_shared<Impl>(std::move(options))) {}
@@ -184,7 +186,8 @@ PreparedPrompt Engine::prepare(PromptInput input) const {
     return std::visit(
         [&](const auto& target_ptr) -> PreparedPrompt {
             if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            auto prepared      = target_ptr->loaded->frontend.prepare(std::move(input));
+            auto prepared = targets::qwen3_6::EncodedHistoryPrepare::prepare(
+                target_ptr->loaded->frontend, std::move(input), impl_->host_encode_cache);
             PromptSummary info = prepared.summary();
             if (info.prompt_tokens > target_ptr->capacity) {
                 throw RequestError(
@@ -224,7 +227,8 @@ std::uint32_t Engine::count_tokens(PromptInput input) const {
     return std::visit(
         [&](const auto& target_ptr) {
             if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            return target_ptr->loaded->frontend.count_tokens(std::move(input));
+            return targets::qwen3_6::EncodedHistoryPrepare::count_tokens(
+                target_ptr->loaded->frontend, std::move(input), impl_->host_encode_cache);
         },
         impl_->active);
 }

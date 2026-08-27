@@ -19,6 +19,7 @@ struct PreparedPromptData;
 class Frontend;
 class FrontendTestAccess;
 class PreparedPromptAccess;
+class EncodedHistoryPrepare;
 
 class PreparedPrompt {
 public:
@@ -41,6 +42,7 @@ private:
     friend class Frontend;
     friend class FrontendTestAccess;
     friend class PreparedPromptAccess;
+    friend class EncodedHistoryPrepare;
 };
 
 class PublishedOutput {
@@ -127,6 +129,7 @@ private:
     std::shared_ptr<const Impl> impl_;
 
     friend class FrontendTestAccess;
+    friend class EncodedHistoryPrepare;
     friend Frontend make_frontend(const FrontendResources& resources, bool vision_enabled);
 };
 

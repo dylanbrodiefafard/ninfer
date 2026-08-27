@@ -902,8 +902,57 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
     default_stop_token_ids_ = load_default_stop_token_ids(resources.generation_config_json);
 }
 
+std::optional<std::pair<std::size_t, int>>
+Tokenizer::find_leftmost_added(std::string_view text, std::size_t pos) const {
+    for (std::size_t i = pos; i < text.size(); ++i) {
+        if (added_start_bytes_[static_cast<unsigned char>(text[i])] == 0) { continue; }
+        int node             = 0;
+        int best             = -1;
+        std::size_t best_len = 0;
+        for (std::size_t j = i; j < text.size(); ++j) {
+            const int child =
+                added_trie_[static_cast<std::size_t>(node)].next[static_cast<unsigned char>(
+                    text[j])];
+            if (child < 0) { break; }
+            node                  = child;
+            const int token_index = added_trie_[static_cast<std::size_t>(node)].token_index;
+            if (token_index >= 0 && (best < 0 || token_index < best)) {
+                best     = token_index;
+                best_len = j - i + 1;
+            }
+        }
+        if (best >= 0) {
+            (void)best_len;
+            return std::pair<std::size_t, int>{i, best};
+        }
+    }
+    return std::nullopt;
+}
+
 std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options) const {
     return encode(text, std::nullopt, options).ids;
+}
+
+bool Tokenizer::is_encode_loop_pos(std::string_view text, std::size_t n,
+                                   EncodeOptions options) const {
+    if (n == 0 || n == text.size()) { return true; }
+    if (n > text.size()) { return false; }
+    if (!options.parse_added_tokens) { return false; }
+    std::size_t pos = 0;
+    while (pos < text.size()) {
+        const auto match = find_leftmost_added(text, pos);
+        if (!match) { return false; }
+        const std::size_t match_pos = match->first;
+        const int match_index       = match->second;
+        if (match_pos > pos) {
+            if (n == match_pos) { return true; }
+            if (n < match_pos) { return false; }
+        }
+        pos = match_pos + added_tokens_[static_cast<std::size_t>(match_index)].content.size();
+        if (n == pos) { return true; }
+        if (n < pos) { return false; }
+    }
+    return false;
 }
 
 EncodedText Tokenizer::encode(std::string_view text, std::optional<std::size_t> prefix_byte_end,
@@ -925,39 +974,15 @@ EncodedText Tokenizer::encode(std::string_view text, std::optional<std::size_t> 
 
     std::size_t pos = 0;
     while (pos < text.size()) {
-        std::size_t match_pos = std::string_view::npos;
-        int match_index       = -1;
-        for (std::size_t i = pos; i < text.size(); ++i) {
-            if (added_start_bytes_[static_cast<unsigned char>(text[i])] == 0) { continue; }
-            int node      = 0;
-            int best      = -1;
-            std::size_t best_len = 0;
-            for (std::size_t j = i; j < text.size(); ++j) {
-                const int child =
-                    added_trie_[static_cast<std::size_t>(node)].next[static_cast<unsigned char>(
-                        text[j])];
-                if (child < 0) { break; }
-                node = child;
-                const int token_index = added_trie_[static_cast<std::size_t>(node)].token_index;
-                if (token_index >= 0 && (best < 0 || token_index < best)) {
-                    best     = token_index;
-                    best_len = j - i + 1;
-                }
-            }
-            if (best >= 0) {
-                match_pos   = i;
-                match_index = best;
-                (void)best_len;
-                break;
-            }
-        }
-
-        if (match_index < 0) {
+        const auto match = find_leftmost_added(text, pos);
+        if (!match) {
             append_bpe_ids(encoded.ids, text.substr(pos), has_bpe_merges_, bpe_pair_table_,
                            byte_to_intern_id_, intern_emit_ids_);
             mark_prefix(text.size());
             break;
         }
+        const std::size_t match_pos   = match->first;
+        const int match_index         = match->second;
         const AddedToken& match_token = added_tokens_[static_cast<std::size_t>(match_index)];
         if (match_pos > pos) {
             append_bpe_ids(encoded.ids, text.substr(pos, match_pos - pos), has_bpe_merges_,
