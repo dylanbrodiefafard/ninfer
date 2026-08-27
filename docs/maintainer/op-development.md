@@ -28,7 +28,9 @@ The remaining authorities are:
 - [`bench/README.md`](../../bench/README.md) — benchmark executables, command lines, fixtures, and
   measurement behavior;
 - family-specific maintainer references — current family design that cannot be expressed in its
-  contract header.
+  contract header;
+- [`kernel-iteration.md`](kernel-iteration.md) — Layer 0–3 kernel speed procedure (`tools.kdev bound`,
+  `mma`, public-Op sweep, production path).
 
 Do not add current source inventories, target geometry tables, private route thresholds, one-time
 migration steps, profiler command lines, or test-tool output schemas here. A family reference may
@@ -446,6 +448,11 @@ extents can be constructed directly by the Op benchmark; they do not authorize l
 artifact or invoking a target, Program, Engine, or whole-round benchmark. Product-route evidence is
 required only when the requested deliverable explicitly makes an end-to-end claim and includes
 that product route in scope.
+
+Kernel implementation for speed follows [`kernel-iteration.md`](kernel-iteration.md) before a
+candidate is written: bound classifier, SM120 legality, parameter sweep inside one family, then
+the public Op. Candidate comparison remains task-local and must still delete losers as required
+below.
 
 For a performance change:
 

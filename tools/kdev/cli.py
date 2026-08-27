@@ -1,9 +1,33 @@
-"""CLI entry point: python3 -m tools.kdev <op> [--fast|--full] [--bench] [--profile] [--san] [--json]."""
+"""CLI entry point.
+
+Layer 0–3:
+    python3 -m tools.kdev bound ...
+    python3 -m tools.kdev recipe
+    python3 -m tools.kdev mma
+
+Op loop:
+    python3 -m tools.kdev <op> [--fast|--full] [--bench] [--profile] [--san] [--json]
+"""
 
 import argparse
 import json
+import sys
 
-from . import bench, harness, oracle, profile, registry, san, sage, verdict
+from . import bench, bound, harness, mma, oracle, profile, recipe, registry, san, sage, verdict
+
+_USAGE = """\
+usage: python3 -m tools.kdev <command>
+
+Kernel iteration (docs/maintainer/kernel-iteration.md):
+  bound     Layer-0 Linear bound classifier (host, no GPU)
+  recipe    print the gate card an agent must fill before writing CUDA
+  mma       Layer-1 MMA issue-rate probe (writes profiles/kdev/mma_issue.json)
+  diff      first-divergence localization: python3 -m tools.kdev.diff <op>
+
+Op loop:
+  python3 -m tools.kdev <op> [--fast|--full] [--bench] [--profile] [--san] [--json]
+  registered ops: {ops}
+"""
 
 
 def _build(op, need_bench: bool) -> bool:
@@ -20,7 +44,7 @@ def _build(op, need_bench: bool) -> bool:
     return True
 
 
-def main(argv=None) -> int:
+def _run_op(argv) -> int:
     parser = argparse.ArgumentParser(prog="kdev", description=__doc__)
     parser.add_argument("op", help=f"op name (registered: {', '.join(registry.names())})")
     parser.add_argument("--fast", action="store_true", help="run only the cheapest case (default)")
@@ -103,8 +127,21 @@ def main(argv=None) -> int:
         print(verdict.render(v))
         print(f"       verdict: {path}")
 
-    # Non-zero on oracle failure so this is usable as a CI gate too.
     return 0 if v["oracle"]["passed"] else 1
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if not argv or argv[0] in ("-h", "--help"):
+        print(_USAGE.format(ops=", ".join(registry.names())).rstrip())
+        return 0
+    if argv[0] == "bound":
+        return bound.main(argv[1:])
+    if argv[0] == "recipe":
+        return recipe.main(argv[1:])
+    if argv[0] == "mma":
+        return mma.main(argv[1:])
+    return _run_op(argv)
 
 
 if __name__ == "__main__":

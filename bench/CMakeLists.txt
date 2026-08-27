@@ -88,6 +88,13 @@ ninfer_add_op_bench(ninfer_linear_pair_bench SOURCES ops/linear_pair_bench.cu)
 ninfer_add_op_bench(ninfer_mtp_pack_bench SOURCES ops/mtp_pack_bench.cu)
 ninfer_add_op_bench(ninfer_proposal_remap_bench SOURCES ops/proposal_remap_bench.cu)
 
+# Hardware calibration probe, not an Op bench. Times register-only production MMA
+# atoms so tools/kdev bound can set t_issue. See docs/maintainer/kernel-iteration.md.
+add_executable(ninfer_mma_issue_probe ${PROJECT_SOURCE_DIR}/tools/mma_issue_probe.cu)
+target_include_directories(ninfer_mma_issue_probe PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(ninfer_mma_issue_probe PRIVATE CUDA::cudart)
+target_compile_options(ninfer_mma_issue_probe PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+
 # End-to-end product benchmark: public Engine API and native .ninfer artifacts only.
 add_executable(ninfer_bench targets/qwen3_6_27b/ninfer_bench.cpp targets/qwen3_6_27b/ninfer_bench_support.cpp)
 target_include_directories(ninfer_bench PRIVATE

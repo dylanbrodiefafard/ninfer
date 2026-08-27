@@ -1,15 +1,38 @@
-# tools/kdev — fast-signal kernel dev control plane
+# tools/kdev — kernel iteration control plane
 
-One command drives the low-noise debug/test/profile loop for an NInfer op:
+Layer 0–3 procedure: [`docs/maintainer/kernel-iteration.md`](../../docs/maintainer/kernel-iteration.md).
+Print the gate card:
+
+```
+python3 -m tools.kdev recipe
+```
+
+## Layer 0 — bound (host)
+
+```
+python3 -m tools.kdev bound --preset attn_in --t 1 --idea occupancy
+python3 -m tools.kdev bound --n 14336 --k 5120 --t 1024 --qtype nvfp4 --json
+python3 -m tools.kdev bound --self-test
+```
+
+Exit 2 means refuse. Do not write CUDA.
+
+## Layer 1 — MMA issue roof
+
+```
+python3 -m tools.kdev mma
+```
+
+Writes `profiles/kdev/mma_issue.json`. Bound reads it for `t_issue`.
+
+## Layers 2–3 — Op loop
 
 ```
 python3 -m tools.kdev <op> [--fast|--full] [--bench] [--profile] [--san] [--json]
-python3 -m tools.kdev.diff <op>            # first-divergence localization (side-band)
+python3 -m tools.kdev.diff <op>
 ```
 
-## What it does
-
-Every run, in the shared dev (builder) container (the host stays free of the CUDA
+Every Op run, in the shared dev (builder) container (the host stays free of the CUDA
 toolchain):
 
 1. **Incremental build** of the op's test + bench targets (ccache + a persistent
@@ -27,7 +50,8 @@ toolchain):
    (no silent "fast-but-wrong").
 
 Artifacts land in `profiles/kdev/<op>/` (gitignore-able): `<ts>.json`,
-`trend.jsonl`, `ncu_<ts>.txt`, `last_dump.json`.
+`trend.jsonl`, `ncu_<ts>.txt`, `last_dump.json`. MMA calibration is
+`profiles/kdev/mma_issue.json`.
 
 ## Ops
 
@@ -100,8 +124,8 @@ container) sets up the `ninfer-builder` dev home: ccache, the CUDA-compat strip
 
 ## Process discipline baked in
 
-Fast tests (tiny shapes) → profiler-guided iteration → **tracked** measurements
-(`trend.jsonl`: op, tier, git short, build, KPI, µs, ts) → **rollback rails**
+Bound classifier → legal SM120 family → fast tests (tiny shapes) → profiler-guided
+iteration → **tracked** measurements (`trend.jsonl`) → **rollback rails**
 (the dev container is isolated from the live serve; git + the
 `local/ninfer:5090-rollback-*` tag pattern) → **no silent fast-but-wrong** (the
 oracle must pass before a bench number is reported).
