@@ -59,6 +59,12 @@ struct Variant {
     static void mtp_q_gate_projection(const Tensor& hidden,
                                       const MtpAttentionProjectionWeights& weights, Tensor& query,
                                       Tensor& gate, WorkspaceArena& workspace, cudaStream_t stream);
+    static void mtp_fc(const Tensor& embedding_norm, const Tensor& hidden_norm, const Weight& weight,
+                       Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream,
+                       std::int32_t route_tokens = 0);
+    static void mtp_attention_output(const Tensor& attention, const Weight& weight,
+                                     Tensor& residual, WorkspaceArena& workspace,
+                                     cudaStream_t stream, std::int32_t route_tokens = 0);
     static void gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
                                      Tensor& qkv, Tensor& output_gate, qwen3_6::TextPhase phase,
                                      WorkspaceArena& workspace, cudaStream_t stream);
@@ -86,13 +92,18 @@ struct Variant {
                            qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                            cudaStream_t stream, std::int32_t route_tokens = 0);
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
-                               Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
+                               Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream,
+                               std::int32_t route_tokens = 0);
     [[nodiscard]] static std::size_t
     mtp_attention_projection_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t mtp_kv_projection_workspace_capacity_bytes(std::int32_t first,
                                                                                 std::int32_t last);
     [[nodiscard]] static std::size_t
     mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
+    [[nodiscard]] static std::size_t mtp_fc_workspace_capacity_bytes(std::int32_t first,
+                                                                     std::int32_t last);
+    [[nodiscard]] static std::size_t
+    mtp_attention_output_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t
     attention_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
                                                   qwen3_6::TextPhase phase, std::int32_t first,

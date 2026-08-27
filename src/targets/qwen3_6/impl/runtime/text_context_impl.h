@@ -20,9 +20,7 @@
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/linear_swiglu.h"
-#include "ninfer/ops/mtp_pack.h"
 #include "ninfer/ops/position.h"
-#include "ninfer/ops/residual_rmsnorm.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/scatter.h"
@@ -365,11 +363,9 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
     ops::rmsnorm(emb, *mtp_.pre_fc_norm_embedding, kCfg.rms_eps, true, e, s);
     ops::rmsnorm(flat_hidden, *mtp_.pre_fc_norm_hidden, kCfg.rms_eps, true, h, s);
 
-    Tensor fc_in = roots.packed_input;
-    ops::mtp_pack_fc_input(e, h, fc_in, s);
-
     x = roots.residual;
-    ops::linear(fc_in, *mtp_.fc, x, s);
+    Variant::mtp_fc(e, h, *mtp_.fc, x, work_, s,
+                    packed_route_tokens(active_sequence_batch_, active_sequence_width_));
 
     ah = roots.attention_hidden;
     ops::rmsnorm(x, *mtp_.input_norm, kCfg.rms_eps, true, ah, s);
@@ -423,15 +419,18 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     ops::sigmoid_mul(gate, a, s);
 
     const auto post = workspace_recipe::mtp_post_attention<TextConfig>(work_, T);
-    Tensor o        = post.output;
-    ops::linear(a.view({kCfg.q_size, T}), *mtp_.o_proj, o, s);
+    Variant::mtp_attention_output(a.view({kCfg.q_size, T}), *mtp_.o_proj, x, work_, s,
+                                 packed_route_tokens(active_sequence_batch_,
+                                                     active_sequence_width_));
 
     Tensor mh = post.post_mixer_hidden;
-    ops::residual_rmsnorm(o, x, *mtp_.post_attn_norm, kCfg.rms_eps, mh, s);
+    ops::rmsnorm(x, *mtp_.post_attn_norm, kCfg.rms_eps, true, mh, s);
 
     {
         auto post_mixer_scope = work_.scope();
-        Variant::mtp_post_mixer(mh, mtp_.payload->post_mixer, x, work_, s);
+            Variant::mtp_post_mixer(mh, mtp_.payload->post_mixer, x, work_, s,
+                                    packed_route_tokens(active_sequence_batch_,
+                                                        active_sequence_width_));
     }
 
     Tensor flat_mtp_hidden = mtp_hidden.view({kCfg.hidden, T});
@@ -549,11 +548,9 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                                   work_, a, s);
         ops::sigmoid_mul(gate, a, s);
 
-        Tensor o = work_.alloc(DType::BF16, {kCfg.hidden, 1});
-        ops::linear(a.view({kCfg.q_size, 1}), *mtp_.o_proj, o, s);
-
+        Variant::mtp_attention_output(a.view({kCfg.q_size, 1}), *mtp_.o_proj, x_last, work_, s);
         Tensor mh = work_.alloc(DType::BF16, {kCfg.hidden, 1});
-        ops::residual_rmsnorm(o, x_last, *mtp_.post_attn_norm, kCfg.rms_eps, mh, s);
+        ops::rmsnorm(x_last, *mtp_.post_attn_norm, kCfg.rms_eps, true, mh, s);
         {
             auto post_mixer_scope = work_.scope();
             Variant::mtp_post_mixer(mh, mtp_.payload->post_mixer, x_last, work_, s);

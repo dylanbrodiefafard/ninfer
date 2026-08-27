@@ -7,6 +7,7 @@
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ninfer/ops/mtp_fc.h"
 #include "ninfer/ops/mtp_pack.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/silu_mul.h"
@@ -101,6 +102,40 @@ std::size_t gdn_snapshot_workspace_bytes(const Tensor& hidden,
             QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, batch, width, width));
 }
 
+void mtp_split_packed_attention(const Tensor& hidden, const Weight& packed, Tensor& query,
+                                Tensor& gate, Tensor& key, Tensor& value,
+                                WorkspaceArena& workspace, cudaStream_t stream) {
+    if (packed.qtype == QType::NVFP4) {
+        ops::attn_input_proj(hidden, packed, query, gate, key, value, text_policy(packed),
+                             workspace, stream);
+        return;
+    }
+    auto scope     = workspace.scope();
+    const int cols = hidden.ne[1];
+    Tensor attn_in = workspace.alloc(DType::BF16, {TextConfig::mtp_attention_input_rows, cols});
+    ops::linear(hidden, packed, attn_in, stream);
+    Tensor query_heads = query.view({TextConfig::head_dim, TextConfig::query_heads, cols});
+    Tensor key_heads   = key.view({TextConfig::head_dim, TextConfig::kv_heads, cols});
+    Tensor gate_heads  = gate.view({TextConfig::head_dim, TextConfig::query_heads, cols});
+    Tensor value_heads = value.view({TextConfig::head_dim, TextConfig::kv_heads, cols});
+    ops::mtp_split_attn_in(attn_in, query_heads, key_heads, gate_heads, value_heads, stream);
+}
+
+std::size_t mtp_packed_attention_workspace_bytes(std::int32_t first, std::int32_t last) {
+    WorkspaceLayoutBuilder layout;
+    {
+        auto w8 = layout.scope();
+        (void)layout.alloc(DType::BF16, {TextConfig::mtp_attention_input_rows, last});
+    }
+    {
+        auto nvfp4 = layout.scope();
+        (void)layout.alloc_bytes(ops::attn_input_proj_workspace_capacity_bytes(
+            QType::NVFP4, TextConfig::mtp_attention_input_rows, TextConfig::hidden,
+            kNvfp4TextPolicy, first, last));
+    }
+    return layout.peak_bytes(1);
+}
+
 } // namespace
 
 std::vector<GraphExecutionProfile> Variant::ordinary_graph_profiles(std::uint32_t capacity) {
@@ -188,27 +223,74 @@ void Variant::mtp_attention_projection(const Tensor& hidden,
                                        const MtpAttentionProjectionWeights& weights, Tensor& query,
                                        Tensor& gate, Tensor& key, Tensor& value,
                                        WorkspaceArena& workspace, cudaStream_t stream) {
-    auto scope     = workspace.scope();
-    const int cols = hidden.ne[1];
-    Tensor packed  = workspace.alloc(DType::BF16, {TextConfig::mtp_attention_input_rows, cols});
-    ops::linear(hidden, weights.packed, packed, stream);
-    Tensor query_heads = query.view({TextConfig::head_dim, TextConfig::query_heads, cols});
-    Tensor key_heads   = key.view({TextConfig::head_dim, TextConfig::kv_heads, cols});
-    Tensor gate_heads  = gate.view({TextConfig::head_dim, TextConfig::query_heads, cols});
-    Tensor value_heads = value.view({TextConfig::head_dim, TextConfig::kv_heads, cols});
-    ops::mtp_split_attn_in(packed, query_heads, key_heads, gate_heads, value_heads, stream);
+    mtp_split_packed_attention(hidden, weights.packed, query, gate, key, value, workspace, stream);
 }
 
 void Variant::mtp_kv_projection(const Tensor& hidden, const MtpAttentionProjectionWeights& weights,
-                                Tensor& key, Tensor& value, WorkspaceArena&, cudaStream_t stream) {
-    ops::linear_pair(hidden, weights.key, weights.value, key, value, stream);
+                                Tensor& key, Tensor& value, WorkspaceArena& workspace,
+                                cudaStream_t stream) {
+    if (weights.packed.layout == QuantLayout::RowSplit) {
+        ops::linear_pair(hidden, weights.key, weights.value, key, value, stream);
+        return;
+    }
+    auto scope         = workspace.scope();
+    const int cols     = hidden.ne[1];
+    Tensor query       = workspace.alloc(DType::BF16, {TextConfig::query_size, cols});
+    Tensor output_gate = workspace.alloc(DType::BF16, {TextConfig::query_size, cols});
+    mtp_split_packed_attention(hidden, weights.packed, query, output_gate, key, value, workspace,
+                               stream);
 }
 
 void Variant::mtp_q_gate_projection(const Tensor& hidden,
                                     const MtpAttentionProjectionWeights& weights, Tensor& query,
-                                    Tensor& gate, WorkspaceArena&, cudaStream_t stream) {
-    ops::linear(hidden, weights.query, query, stream);
-    ops::linear(hidden, weights.output_gate, gate, stream);
+                                    Tensor& gate, WorkspaceArena& workspace, cudaStream_t stream) {
+    if (weights.packed.layout == QuantLayout::RowSplit) {
+        ops::linear(hidden, weights.query, query, stream);
+        ops::linear(hidden, weights.output_gate, gate, stream);
+        return;
+    }
+    auto scope     = workspace.scope();
+    const int cols = hidden.ne[1];
+    Tensor key     = workspace.alloc(DType::BF16, {TextConfig::kv_size, cols});
+    Tensor value   = workspace.alloc(DType::BF16, {TextConfig::kv_size, cols});
+    mtp_split_packed_attention(hidden, weights.packed, query, gate, key, value, workspace, stream);
+}
+
+void Variant::mtp_fc(const Tensor& embedding_norm, const Tensor& hidden_norm, const Weight& weight,
+                     Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream,
+                     std::int32_t route_tokens) {
+    const int cols = embedding_norm.ne[1];
+    const std::int32_t family_tokens = route_tokens > 0 ? route_tokens : cols;
+    // Packed C>1 alignment is T=width*B. Pin the C=1 width so fused A16 vs pack+W4A4
+    // does not flip vs C=1 (same contract as packed target verify).
+    if (weight.qtype == QType::NVFP4 && family_tokens < 8) {
+        ops::mtp_fc(embedding_norm, hidden_norm, weight, residual, stream);
+        return;
+    }
+    auto scope          = workspace.scope();
+    Tensor packed_input = workspace.alloc(DType::BF16, {TextConfig::mtp_input_rows, cols});
+    ops::mtp_pack_fc_input(embedding_norm, hidden_norm, packed_input, stream);
+    if (weight.qtype == QType::NVFP4) {
+        ops::linear(packed_input, weight, residual, text_policy(weight), workspace, stream);
+        return;
+    }
+    ops::linear(packed_input, weight, residual, stream);
+}
+
+void Variant::mtp_attention_output(const Tensor& attention, const Weight& weight, Tensor& residual,
+                                   WorkspaceArena& workspace, cudaStream_t stream,
+                                   std::int32_t route_tokens) {
+    if (weight.qtype == QType::NVFP4) {
+        ops::linear_add(attention, weight, residual,
+                        pinned_route_policy(weight, route_tokens, kNvfp4ResidualW4a4Tokens),
+                        workspace, stream);
+        return;
+    }
+    auto scope     = workspace.scope();
+    const int cols = attention.ne[1];
+    Tensor delta   = workspace.alloc(DType::BF16, {TextConfig::hidden, cols});
+    ops::linear(attention, weight, delta, stream);
+    ops::residual_add(delta, residual, stream);
 }
 
 void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
@@ -313,9 +395,21 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
 }
 
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
-                             Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream) {
+                             Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream,
+                             std::int32_t route_tokens) {
     auto scope     = workspace.scope();
     const int cols = hidden.ne[1];
+    if (weights.gate_up.qtype == QType::NVFP4) {
+        Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, cols});
+        const std::int32_t swiglu_route = cols <= kNvfp4SwiGluMaxA16Tokens ? route_tokens : 0;
+        ops::linear_swiglu(hidden, weights.gate_up, activation,
+                           pinned_route_policy(weights.gate_up, swiglu_route, kNvfp4SwiGluW4a4Tokens),
+                           workspace, stream);
+        ops::linear_add(activation, weights.down, residual,
+                        pinned_route_policy(weights.down, route_tokens, kNvfp4ResidualW4a4Tokens),
+                        workspace, stream);
+        return;
+    }
     Tensor gate_up = workspace.alloc(DType::BF16, {TextConfig::mtp_mlp_gate_up_rows, cols});
     ops::linear(hidden, weights.gate_up, gate_up, stream);
     Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, cols});
@@ -330,21 +424,53 @@ void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& we
 std::size_t Variant::mtp_attention_projection_workspace_capacity_bytes(std::int32_t first,
                                                                        std::int32_t last) {
     validate_token_interval(first, last);
-    WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::BF16, {TextConfig::mtp_attention_input_rows, last});
-    return layout.peak_bytes(1);
+    return mtp_packed_attention_workspace_bytes(first, last);
 }
 
 std::size_t Variant::mtp_kv_projection_workspace_capacity_bytes(std::int32_t first,
                                                                 std::int32_t last) {
     validate_token_interval(first, last);
-    return 0;
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc(DType::BF16, {TextConfig::query_size, last});
+    (void)layout.alloc(DType::BF16, {TextConfig::query_size, last});
+    (void)layout.alloc_bytes(mtp_packed_attention_workspace_bytes(first, last));
+    return layout.peak_bytes(1);
 }
 
 std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t first,
                                                                     std::int32_t last) {
     validate_token_interval(first, last);
-    return 0;
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc(DType::BF16, {TextConfig::kv_size, last});
+    (void)layout.alloc(DType::BF16, {TextConfig::kv_size, last});
+    (void)layout.alloc_bytes(mtp_packed_attention_workspace_bytes(first, last));
+    return layout.peak_bytes(1);
+}
+
+std::size_t Variant::mtp_fc_workspace_capacity_bytes(std::int32_t first, std::int32_t last) {
+    validate_token_interval(first, last);
+    // W8 and NVFP4 T≥8 pack into [10240,T] then Linear. NVFP4 T<8 is fused and needs no
+    // scratch; oversizing that interval with packed_input is required so W8 MTP (always pack)
+    // is not captured against a 0-byte arena.
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc(DType::BF16, {TextConfig::mtp_input_rows, last});
+    if (last >= 8) {
+        (void)layout.alloc_bytes(ops::linear_workspace_capacity_bytes(
+            QType::NVFP4, TextConfig::hidden, TextConfig::mtp_input_rows, kNvfp4TextPolicy, first,
+            last));
+    }
+    return layout.peak_bytes(1);
+}
+
+std::size_t Variant::mtp_attention_output_workspace_capacity_bytes(std::int32_t first,
+                                                                   std::int32_t last) {
+    validate_token_interval(first, last);
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc(DType::BF16, {TextConfig::hidden, last});
+    return std::max(layout.peak_bytes(1),
+                    ops::linear_add_workspace_capacity_bytes(
+                        QType::NVFP4, TextConfig::hidden, TextConfig::query_size, kNvfp4TextPolicy,
+                        first, last));
 }
 
 std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
@@ -501,9 +627,28 @@ std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
                                                              std::int32_t last) {
     validate_token_interval(first, last);
     WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::BF16, {TextConfig::mtp_mlp_gate_up_rows, last});
-    (void)layout.alloc(DType::BF16, {TextConfig::intermediate, last});
-    (void)layout.alloc(DType::BF16, {TextConfig::hidden, last});
+    {
+        auto w8 = layout.scope();
+        (void)layout.alloc(DType::BF16, {TextConfig::mtp_mlp_gate_up_rows, last});
+        (void)layout.alloc(DType::BF16, {TextConfig::intermediate, last});
+        (void)layout.alloc(DType::BF16, {TextConfig::hidden, last});
+    }
+    {
+        auto nvfp4 = layout.scope();
+        (void)layout.alloc(DType::BF16, {TextConfig::intermediate, last});
+        {
+            auto swiglu = layout.scope();
+            (void)layout.alloc_bytes(ops::linear_swiglu_workspace_capacity_bytes(
+                QType::NVFP4, TextConfig::mtp_mlp_gate_up_rows, TextConfig::hidden,
+                kNvfp4TextPolicy, first, last));
+        }
+        {
+            auto down = layout.scope();
+            (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
+                QType::NVFP4, TextConfig::hidden, TextConfig::intermediate, kNvfp4TextPolicy, first,
+                last));
+        }
+    }
     return layout.peak_bytes(1);
 }
 

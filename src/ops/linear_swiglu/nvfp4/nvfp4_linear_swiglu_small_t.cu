@@ -51,8 +51,8 @@ __global__ __launch_bounds__(
     float accumulators[Schedule::kRowsPerWarp][Schedule::kTokenTile][Schedule::kAccumulatorChains] =
         {};
     compute_nvfp4_small_t_rows<Geometry, ActiveTokens, Schedule>(
-        x, codes, scales, shared, inverse_weight_divisor, parent_rows,
-        warp * Schedule::kRowsPerWarp, 0, 0, lane, accumulators);
+        Nvfp4PackedActivation<Geometry>{x}, codes, scales, shared, inverse_weight_divisor,
+        parent_rows, warp * Schedule::kRowsPerWarp, 0, 0, lane, accumulators);
 
 #pragma unroll
     for (int token = 0; token < ActiveTokens; ++token) {

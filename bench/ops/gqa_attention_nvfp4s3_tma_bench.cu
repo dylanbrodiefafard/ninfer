@@ -606,7 +606,7 @@ int main() {
             DeviceBuffer qdump_base(kQDumpBytes);
             DeviceBuffer qdump_tma(kQDumpBytes);
             detail::gqa_attention_prompt_attention_launch(q_t, pos_q_t, kScale, cache.view,
-                                                          out_ref_t, stream, keep_frac,
+                                                          out_ref_t, stream, keep_frac, 1.0f, 8192,
                                                           &dump_base.d,
                                                           static_cast<std::uint32_t*>(regs_base.p),
                                                           static_cast<std::uint8_t*>(qdump_base.p));

@@ -168,9 +168,50 @@ __device__ __forceinline__ void load_nvfp4_coefficients(
     }
 }
 
-template <class Geometry, class Schedule>
+template <class Geometry>
+struct Nvfp4PackedActivation {
+    const __nv_bfloat16* x;
+
+    __device__ __forceinline__ const __nv_bfloat16* values(int token, int value_begin) const {
+        return x + static_cast<std::int64_t>(token) * Geometry::kInputRows + value_begin;
+    }
+
+    __device__ __forceinline__ float2 load_pair(int token, int pair_index) const {
+        const auto* pairs = reinterpret_cast<const std::uint32_t*>(
+            x + static_cast<std::int64_t>(token) * Geometry::kInputRows);
+        return bf16x2_bits_to_float2(pairs[pair_index]);
+    }
+};
+
+template <class Geometry>
+struct Nvfp4SplitKActivation {
+    static_assert((Geometry::kInputRows % 2) == 0);
+    static constexpr int kHalf = Geometry::kInputRows / 2;
+
+    const __nv_bfloat16* first;
+    const __nv_bfloat16* second;
+
+    __device__ __forceinline__ const __nv_bfloat16* values(int token, int value_begin) const {
+        const bool lower      = value_begin < kHalf;
+        const auto* source    = lower ? first : second;
+        const int local_begin = lower ? value_begin : value_begin - kHalf;
+        return source + static_cast<std::int64_t>(token) * kHalf + local_begin;
+    }
+
+    __device__ __forceinline__ float2 load_pair(int token, int pair_index) const {
+        constexpr int kHalfPairs = kHalf / 2;
+        const bool lower         = pair_index < kHalfPairs;
+        const auto* source       = lower ? first : second;
+        const int local_pair     = lower ? pair_index : pair_index - kHalfPairs;
+        const auto* pairs        = reinterpret_cast<const std::uint32_t*>(
+            source + static_cast<std::int64_t>(token) * kHalf);
+        return bf16x2_bits_to_float2(pairs[local_pair]);
+    }
+};
+
+template <class Geometry, class Schedule, class Activation>
 __device__ __forceinline__ void
-compute_nvfp4_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+compute_nvfp4_rows(Activation activation, const std::uint8_t* __restrict__ codes,
                    const std::uint8_t* __restrict__ scales,
                    const Nvfp4GemvSharedStorage<Geometry, Schedule>& shared,
                    float inverse_weight_divisor, const int (&parent_rows)[Schedule::kRowsPerWarp],
@@ -181,7 +222,6 @@ compute_nvfp4_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __re
     constexpr int kGroupsPerLane =
         Schedule::kValuesPerLane < 16 ? 1 : Schedule::kValuesPerLane / 16;
     static_assert((Geometry::kInputRows % kValuesPerPhase) == 0);
-    const auto* activation_pairs = reinterpret_cast<const std::uint32_t*>(x);
 
 #pragma unroll
     for (int phase = 0; phase < kPhases; ++phase) {
@@ -203,8 +243,8 @@ compute_nvfp4_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __re
         for (int pair = 0; pair < Schedule::kPairsPerLane; ++pair) {
             const int activation_index =
                 phase * (kValuesPerPhase / 2) + lane * Schedule::kPairsPerLane + pair;
-            const float2 activation = bf16x2_bits_to_float2(activation_pairs[activation_index]);
-            const int group         = ((lane * Schedule::kValuesPerLane & 15) + pair * 2) / 16;
+            const float2 activation_value = activation.load_pair(0, activation_index);
+            const int group               = ((lane * Schedule::kValuesPerLane & 15) + pair * 2) / 16;
 #pragma unroll
             for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
                 const std::uint32_t word  = row_codes[local_row].words[pair / 4];
@@ -213,19 +253,19 @@ compute_nvfp4_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __re
                 const float coefficient   = coefficients[local_row][group];
                 constexpr int kChainMask  = Schedule::kAccumulatorChains - 1;
                 accumulators[local_row][(2 * pair) & kChainMask] =
-                    fmaf(code.x * coefficient, activation.x,
+                    fmaf(code.x * coefficient, activation_value.x,
                          accumulators[local_row][(2 * pair) & kChainMask]);
                 accumulators[local_row][(2 * pair + 1) & kChainMask] =
-                    fmaf(code.y * coefficient, activation.y,
+                    fmaf(code.y * coefficient, activation_value.y,
                          accumulators[local_row][(2 * pair + 1) & kChainMask]);
             }
         }
     }
 }
 
-template <class Geometry, class Schedule, class Epilogue, class Output>
+template <class Geometry, class Schedule, class Epilogue, class Output, class Activation>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_gemv_kernel(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    Activation activation, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, float inverse_weight_divisor, Epilogue epilogue,
     Output output) {
     static_assert((Geometry::kOutputRows % 128) == 0);
@@ -252,8 +292,9 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     }
 
     float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
-    compute_nvfp4_rows<Geometry, Schedule>(x, codes, scales, shared, inverse_weight_divisor,
-                                           parent_rows, flat_row0, lane, accumulators);
+    compute_nvfp4_rows<Geometry, Schedule>(activation, codes, scales, shared,
+                                           inverse_weight_divisor, parent_rows, flat_row0, lane,
+                                           accumulators);
 
 #pragma unroll
     for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {

@@ -232,6 +232,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/linear_add.cpp
   ops/wrapper/linear_pair.cpp
   ops/wrapper/linear_swiglu.cpp
+  ops/wrapper/mtp_fc.cpp
   ops/wrapper/mtp_pack.cpp
   ops/wrapper/mtp_round.cpp
   ops/wrapper/speculative_round.cpp

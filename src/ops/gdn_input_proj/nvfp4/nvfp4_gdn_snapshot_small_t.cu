@@ -34,7 +34,7 @@ void launch_exact(const Tensor& x, const Weight& weight, const Tensor& conv_weig
                          Nvfp4GdnConvOutput<ActiveTokens, Publish>,
                          Nvfp4SmallTFinalization::RowVector>
         <<<kBlocks, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
+            Nvfp4PackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data)},
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), inverse, Nvfp4IdentityEpilogue{},
             make_nvfp4_gdn_conv_output<ActiveTokens>(conv_weight, conv_states, valid_columns,

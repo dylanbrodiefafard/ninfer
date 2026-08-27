@@ -50,9 +50,9 @@ load_nvfp4_activation_pack(const __nv_bfloat16* pointer) {
     return result;
 }
 
-template <class Geometry, int ActiveTokens, class Schedule>
+template <class Geometry, int ActiveTokens, class Schedule, class Activation>
 __device__ __forceinline__ void compute_nvfp4_small_t_rows(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    Activation activation, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales,
     Nvfp4SmallTSharedStorage<Geometry, ActiveTokens, Schedule>& shared,
     float inverse_weight_divisor, const int (&parent_rows)[Schedule::kRowsPerWarp], int flat_row0,
@@ -79,9 +79,8 @@ __device__ __forceinline__ void compute_nvfp4_small_t_rows(
                 const int local_pack  = task - local_token * kPacksPerToken;
                 const int token       = token0 + local_token;
                 if (token < ActiveTokens) {
-                    const __nv_bfloat16* source =
-                        x + static_cast<std::int64_t>(token) * Geometry::kInputRows +
-                        phase * kValuesPerPhase + local_pack * 8;
+                    const __nv_bfloat16* source = activation.values(
+                        token, phase * kValuesPerPhase + local_pack * 8);
                     destination[task] = load_vec<uint4>(source);
                 }
             }
@@ -105,7 +104,7 @@ __device__ __forceinline__ void compute_nvfp4_small_t_rows(
         }
 
         if constexpr (Schedule::kActivationAccess == Nvfp4SmallTActivationAccess::TokenPacked) {
-            Nvfp4ActivationPack<Schedule::kValuesPerLane> activation[Schedule::kTokenTile];
+            Nvfp4ActivationPack<Schedule::kValuesPerLane> staged[Schedule::kTokenTile];
 #pragma unroll
             for (int local_token = 0; local_token < Schedule::kTokenTile; ++local_token) {
                 const int token = token0 + local_token;
@@ -113,8 +112,8 @@ __device__ __forceinline__ void compute_nvfp4_small_t_rows(
                     const int value_begin = phase * kValuesPerPhase +
                                             warp_in_row * kValuesPerWarpPhase +
                                             lane * Schedule::kValuesPerLane;
-                    activation[local_token] = load_nvfp4_activation_pack<Schedule::kValuesPerLane>(
-                        x + static_cast<std::int64_t>(token) * Geometry::kInputRows + value_begin);
+                    staged[local_token] = load_nvfp4_activation_pack<Schedule::kValuesPerLane>(
+                        activation.values(token, value_begin));
                 }
             }
 
@@ -135,7 +134,7 @@ __device__ __forceinline__ void compute_nvfp4_small_t_rows(
                     const int token = token0 + local_token;
                     if (token < ActiveTokens) {
                         const float2 activation_value =
-                            bf16x2_bits_to_float2(activation[local_token].words[pair]);
+                            bf16x2_bits_to_float2(staged[local_token].words[pair]);
                         constexpr int kChainMask = Schedule::kAccumulatorChains - 1;
 #pragma unroll
                         for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
@@ -179,9 +178,7 @@ __device__ __forceinline__ void compute_nvfp4_small_t_rows(
                                                    lane * Schedule::kPairsPerLane + pair;
                             activation_value = bf16x2_bits_to_float2(activation_pairs[local_pair]);
                         } else {
-                            const auto* activation_pairs = reinterpret_cast<const std::uint32_t*>(
-                                x + static_cast<std::int64_t>(token) * Geometry::kInputRows);
-                            activation_value = bf16x2_bits_to_float2(activation_pairs[pair_index]);
+                            activation_value = activation.load_pair(token, pair_index);
                         }
                         constexpr int kChainMask = Schedule::kAccumulatorChains - 1;
 #pragma unroll
@@ -207,10 +204,11 @@ __device__ __forceinline__ void compute_nvfp4_small_t_rows(
 }
 
 template <class Geometry, int ActiveTokens, class Schedule, class Epilogue, class OutputPolicy,
-          Nvfp4SmallTFinalization Finalization = Nvfp4SmallTFinalization::Elementwise>
+          Nvfp4SmallTFinalization Finalization = Nvfp4SmallTFinalization::Elementwise,
+          class Activation                    = Nvfp4PackedActivation<Geometry>>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_small_t_kernel(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    Activation activation, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, float inverse_weight_divisor, Epilogue epilogue,
     OutputPolicy output) {
     static_assert(ActiveTokens >= 2);
@@ -257,7 +255,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_smal
     float accumulators[Schedule::kRowsPerWarp][Schedule::kTokenTile][Schedule::kAccumulatorChains] =
         {};
     compute_nvfp4_small_t_rows<Geometry, ActiveTokens, Schedule>(
-        x, codes, scales, shared, inverse_weight_divisor, parent_rows, flat_row0, token0,
+        activation, codes, scales, shared, inverse_weight_divisor, parent_rows, flat_row0, token0,
         warp_in_row, lane, accumulators);
 
     if constexpr (Finalization == Nvfp4SmallTFinalization::RowVector) {

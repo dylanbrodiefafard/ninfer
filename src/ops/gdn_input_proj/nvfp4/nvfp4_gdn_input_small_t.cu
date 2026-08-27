@@ -24,7 +24,7 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
     const float inverse       = 1.0F / weight.weight_scale_divisor;
     nvfp4_small_t_kernel<Geometry, ActiveTokens, Schedule>
         <<<kBlocks, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
+            Nvfp4PackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data)},
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), inverse, Nvfp4IdentityEpilogue{},
             Nvfp4GdnInputOutput{static_cast<__nv_bfloat16*>(qkv.data),

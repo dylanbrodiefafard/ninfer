@@ -330,6 +330,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True, help="campaign output directory")
     parser.add_argument("--port", type=int, default=8080, help="loopback serving port")
     parser.add_argument("--device", type=int, default=0, help="CUDA device index")
+    parser.add_argument(
+        "--lm-head-draft",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="pass --lm-head-draft to ninfer-serve for speculative modes (default: on)",
+    )
     return parser.parse_args(argv)
 
 
@@ -518,7 +524,11 @@ def require_server_log_identity(event: dict[str, Any], event_name: str) -> None:
 
 
 def validate_server_start(
-    event: dict[str, Any], spec: RunSpec, device: int, kv_dtype: str
+    event: dict[str, Any],
+    spec: RunSpec,
+    device: int,
+    kv_dtype: str,
+    lm_head_draft: bool = True,
 ) -> tuple[str, str]:
     require_server_log_identity(event, "server_start")
     engine = event.get("engine", {})
@@ -544,7 +554,7 @@ def validate_server_start(
         "prefix_reuse": False,
         "speculative_backend": spec.speculative_backend,
         "speculative_draft_window": spec.draft_tokens,
-        "proposal_head": "optimized" if spec.draft_tokens else "full",
+        "proposal_head": "optimized" if spec.draft_tokens and lm_head_draft else "full",
     }
     if actual != expected:
         raise CampaignError(f"server_start Engine configuration mismatch: {actual!r}")
@@ -739,6 +749,7 @@ def server_command(
     port: int,
     device: int,
     kv_dtype: str,
+    lm_head_draft: bool = True,
 ) -> list[str]:
     command = [
         str(serve),
@@ -770,9 +781,10 @@ def server_command(
                 spec.speculative_backend,
                 "--draft-tokens",
                 str(spec.draft_tokens),
-                "--lm-head-draft",
             ]
         )
+        if lm_head_draft:
+            command.append("--lm-head-draft")
         if spec.dflash_verify_width:
             command.extend(["--dflash-verify-width", str(spec.dflash_verify_width)])
     if spec.sampling_mode == "greedy":
@@ -811,6 +823,7 @@ def run_block(
     completed_before_block: int,
     total: int,
     kv_dtype: str,
+    lm_head_draft: bool = True,
 ) -> None:
     first = block_specs[0]
     server_log = (
@@ -818,7 +831,9 @@ def run_block(
         / "server"
         / f"{first.target}_{first.speculative_mode}_{first.sampling_mode}.jsonl"
     )
-    command = server_command(serve, first, server_log, port, device, kv_dtype)
+    command = server_command(
+        serve, first, server_log, port, device, kv_dtype, lm_head_draft
+    )
     print(
         f"start {first.target}/{first.speculative_mode}: "
         f"{len(block_specs)} missing request(s)",
@@ -827,7 +842,7 @@ def run_block(
     with RunningServer(command, "127.0.0.1", port, server_log) as server:
         server_start = server.wait_until_ready()
         server_instance_id, weights_id = validate_server_start(
-            server_start, first, device, kv_dtype
+            server_start, first, device, kv_dtype, lm_head_draft
         )
 
         connection = http.client.HTTPConnection(
@@ -1086,10 +1101,13 @@ def markdown_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str
 
 
 def mode_display_name(mode_name: str) -> str:
-    if mode_name == "mtp0":
+    if mode_name not in SPECULATIVE_MODES:
+        raise CampaignError(f"unsupported summary mode: {mode_name}")
+    backend, draft_tokens, verify_width = SPECULATIVE_MODES[mode_name]
+    if backend == "none":
         return "MTP0"
-    if mode_name == "mtp3":
-        return "MTP3"
+    if backend == "mtp":
+        return f"MTP{draft_tokens}"
     if mode_name == "dflash4":
         return "DFlash k=4 W=5 chain"
     if mode_name == "dflash4w6":
@@ -1276,6 +1294,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     len(records),
                     total,
                     args.kv_dtype,
+                    args.lm_head_draft,
                 )
 
     missing = set(expected_specs) - set(records)

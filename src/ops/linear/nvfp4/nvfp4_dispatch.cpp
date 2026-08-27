@@ -43,6 +43,9 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
     case Nvfp4Problem::DflashConvProj:
     case Nvfp4Problem::DflashSelector:
         return Nvfp4LinearRoute::A16;
+    case Nvfp4Problem::MtpFc:
+        // Residual-class N=5120. AttnInput's T≥4 W4A4 is M32N64 with 4 live rows of 32.
+        return tokens >= 8 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
     }
     throw std::logic_error("unreachable NVFP4 linear problem");
 }
@@ -96,6 +99,31 @@ void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPo
     auto scope                       = workspace->scope();
     const Nvfp4W4a4Workspace scratch = allocate_nvfp4_w4a4_workspace(*workspace, x.ne[1], weight.k);
     launch_nvfp4_w4a4(x, weight, out, scratch, stream);
+}
+
+void launch_nvfp4_mtp_fc_splitk(const Tensor& embedding, const Tensor& hidden, const Weight& weight,
+                                Tensor& out, cudaStream_t stream) {
+    constexpr std::int32_t kChunk = kNvfp4LastSmallT;
+    const std::int32_t tokens     = embedding.ne[1];
+    const std::int32_t half_k     = weight.k / 2;
+    for (std::int32_t token_begin = 0; token_begin < tokens; token_begin += kChunk) {
+        const std::int32_t active = std::min(kChunk, tokens - token_begin);
+        auto* emb = static_cast<std::uint8_t*>(embedding.data) +
+                    static_cast<std::int64_t>(token_begin) * half_k * sizeof(std::uint16_t);
+        auto* hid = static_cast<std::uint8_t*>(hidden.data) +
+                    static_cast<std::int64_t>(token_begin) * half_k * sizeof(std::uint16_t);
+        auto* output = static_cast<std::uint8_t*>(out.data) +
+                       static_cast<std::int64_t>(token_begin) * weight.n * sizeof(std::uint16_t);
+        Tensor embedding_chunk(emb, DType::BF16, {half_k, active});
+        Tensor hidden_chunk(hid, DType::BF16, {half_k, active});
+        Tensor output_chunk(output, DType::BF16, {weight.n, active});
+        if (active == 1) {
+            launch_nvfp4_decode_splitk(embedding_chunk, hidden_chunk, weight, output_chunk, stream);
+        } else {
+            launch_nvfp4_small_t_splitk(embedding_chunk, hidden_chunk, weight, output_chunk,
+                                        stream);
+        }
+    }
 }
 
 } // namespace ninfer::ops::detail

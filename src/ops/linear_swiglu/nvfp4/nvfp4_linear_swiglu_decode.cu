@@ -45,9 +45,9 @@ __global__ __launch_bounds__(
     const int parent_rows[Schedule::kRowsPerWarp] = {gate_row, gate_row + kIntermediate};
 
     float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
-    compute_nvfp4_rows<Geometry, Schedule>(x, codes, scales, shared, inverse_weight_divisor,
-                                           parent_rows, warp * Schedule::kRowsPerWarp, lane,
-                                           accumulators);
+    compute_nvfp4_rows<Geometry, Schedule>(Nvfp4PackedActivation<Geometry>{x}, codes, scales, shared,
+                                           inverse_weight_divisor, parent_rows,
+                                           warp * Schedule::kRowsPerWarp, lane, accumulators);
 
     float gate = 0.0F;
     float up   = 0.0F;

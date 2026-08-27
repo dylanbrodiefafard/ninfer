@@ -82,14 +82,14 @@ struct TextLayerPlan {
 };
 
 struct MtpPlan {
-    artifact::ObjectHandle input_projection;
+    WeightPlan input_projection;
     artifact::ObjectHandle embedding_norm;
     artifact::ObjectHandle hidden_norm;
     artifact::ObjectHandle input_norm;
-    artifact::ObjectHandle query_key_gate_value;
+    WeightPlan query_key_gate_value;
     artifact::ObjectHandle query_norm;
     artifact::ObjectHandle key_norm;
-    artifact::ObjectHandle output;
+    WeightPlan output;
     artifact::ObjectHandle post_attention_norm;
     MlpPlan mlp;
     artifact::ObjectHandle final_norm;

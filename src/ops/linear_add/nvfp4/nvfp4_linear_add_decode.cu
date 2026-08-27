@@ -15,7 +15,8 @@ void launch(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_
     const float inverse   = 1.0F / weight.weight_scale_divisor;
     auto* output          = static_cast<__nv_bfloat16*>(residual.data);
     nvfp4_gemv_kernel<Geometry, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+        Nvfp4PackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data)},
+        static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), inverse,
         Nvfp4AddResidualEpilogue{output, Geometry::kOutputRows},
         Nvfp4ContiguousOutput{output, Geometry::kOutputRows});
@@ -41,6 +42,7 @@ void nvfp4_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tenso
     case Nvfp4Problem::DflashAttnOut:
     case Nvfp4Problem::DflashConvProj:
     case Nvfp4Problem::DflashSelector:
+    case Nvfp4Problem::MtpFc:
         break;
     }
     throw std::invalid_argument("nvfp4 linear_add: unsupported problem");

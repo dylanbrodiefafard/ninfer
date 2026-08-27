@@ -3,7 +3,9 @@
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
+#include "ninfer/ops/mtp_pack.h"
 #include "ninfer/ops/sparse_moe.h"
 
 #include <algorithm>
@@ -166,6 +168,21 @@ void Variant::mtp_q_gate_projection(const Tensor& hidden,
     ops::attn_input_proj(hidden, weights.query_key_gate_value, query, gate, key, value, stream);
 }
 
+void Variant::mtp_fc(const Tensor& embedding_norm, const Tensor& hidden_norm, const Weight& weight,
+                     Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream,
+                     std::int32_t) {
+    auto scope          = workspace.scope();
+    const int cols      = embedding_norm.ne[1];
+    Tensor packed_input = workspace.alloc(DType::BF16, {TextConfig::mtp_input_rows, cols});
+    ops::mtp_pack_fc_input(embedding_norm, hidden_norm, packed_input, stream);
+    ops::linear(packed_input, weight, residual, stream);
+}
+
+void Variant::mtp_attention_output(const Tensor& attention, const Weight& weight, Tensor& residual,
+                                   WorkspaceArena& workspace, cudaStream_t stream, std::int32_t) {
+    ops::linear_add(attention, weight, residual, workspace, stream);
+}
+
 void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
                                    Tensor& qkv, Tensor& output_gate, qwen3_6::TextPhase,
                                    WorkspaceArena&, cudaStream_t stream) {
@@ -222,7 +239,8 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
 }
 
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
-                             Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream) {
+                             Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream,
+                             std::int32_t) {
     run_sparse_moe(hidden, weights.op, residual, workspace, stream);
 }
 
@@ -248,6 +266,21 @@ std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t
     (void)layout.alloc(DType::BF16, {TextConfig::kv_size, last});
     (void)layout.alloc(DType::BF16, {TextConfig::kv_size, last});
     return layout.peak_bytes(1);
+}
+
+std::size_t Variant::mtp_fc_workspace_capacity_bytes(std::int32_t first, std::int32_t last) {
+    validate_token_interval(first, last);
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc(DType::BF16, {TextConfig::mtp_input_rows, last});
+    return layout.peak_bytes(1);
+}
+
+std::size_t Variant::mtp_attention_output_workspace_capacity_bytes(std::int32_t first,
+                                                                   std::int32_t last) {
+    validate_token_interval(first, last);
+    return ops::linear_add_workspace_capacity_bytes(QType::W8G32_F16S, TextConfig::hidden,
+                                                    TextConfig::query_size,
+                                                    ops::LinearPolicy::A16Only, first, last);
 }
 
 std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfile,
