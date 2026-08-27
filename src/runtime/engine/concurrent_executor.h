@@ -567,7 +567,7 @@ private:
         const std::uint32_t lane = *request->lane;
         if (cancel_at_boundary) {
             (void)request->output.preview_terminal(FinishReason::Cancelled);
-            instance_.program->abort_lane(lane);
+            instance_.program->resolve_prefill_lane(lane, true);
             append_output(request, request->output.commit_preview());
             complete_success(request, FinishReason::Cancelled);
             return true;
@@ -625,7 +625,11 @@ private:
             const auto& request = slots_[lane];
             if (request == nullptr || !cancelled_at_boundary[lane]) { continue; }
             if (copy_hold_ && copy_hold_->lane == lane) { drain_copy_hold_before_abort(); }
-            instance_.program->abort_lane(lane);
+            if (request->decode_ready) {
+                instance_.program->retain_lane(lane);
+            } else if (!instance_.program->revert_cancelled_prefill_lane(lane)) {
+                instance_.program->abort_lane(lane);
+            }
             if (prefill_lane_ && *prefill_lane_ == lane) {
                 instance_.request_memory.deactivate();
                 prefill_lane_.reset();
@@ -723,7 +727,11 @@ private:
                 instance_.request_memory.deactivate();
                 prefill_lane_.reset();
             }
-            instance_.program->abort_lane(lane);
+            if (step.complete) {
+                instance_.program->resolve_prefill_lane(lane, true);
+            } else if (!instance_.program->revert_cancelled_prefill_lane(lane)) {
+                instance_.program->abort_lane(lane);
+            }
             complete_cancelled(request);
             remove_completed_slot(lane);
             return;

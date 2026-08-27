@@ -318,6 +318,8 @@ public:
                                std::span<const std::uint8_t> terminal,
                                std::span<const std::uint8_t> cancelled);
     void abort_lane(std::uint32_t lane) noexcept;
+    void retain_lane(std::uint32_t lane);
+    [[nodiscard]] bool revert_cancelled_prefill_lane(std::uint32_t lane);
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] std::uint64_t retained_use_tick(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
@@ -409,6 +411,7 @@ public:
 
 private:
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
+    void retain_committed_sequence(SequenceState& sequence, RequestControl& request);
     void ordered_reset(SequenceState& sequence);
     void prepare_graphs();
     void install_sampling(SequenceState& sequence, RequestControl& request,

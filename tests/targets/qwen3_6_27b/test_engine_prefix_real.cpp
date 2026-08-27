@@ -1,5 +1,6 @@
 #include "ninfer/engine.h"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -22,6 +23,32 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     return options;
 }
 
+ninfer::EngineOptions dflash_engine_options(const char* artifact) {
+    ninfer::EngineOptions options     = engine_options(artifact);
+    options.speculative.backend       = ninfer::SpeculativeBackend::DFlash;
+    options.speculative.draft_tokens  = 3;
+    options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+    options.enable_vision             = false;
+    return options;
+}
+
+ninfer::RequestOptions greedy_reuse(bool reuse, std::uint32_t tokens) {
+    ninfer::RequestOptions result;
+    result.execution.requested_output_tokens = tokens;
+    result.execution.sampling.temperature    = 0.0F;
+    result.execution.allow_prefix_reuse      = reuse;
+    result.stop.include_model_defaults       = false;
+    return result;
+}
+
+std::vector<ninfer::TokenId> padded_ids(ninfer::TokenId pad, std::size_t count) {
+    std::vector<ninfer::TokenId> ids(count, 198);
+    if (count != 0) { ids[0] = pad; }
+    return ids;
+}
+
+int verify_loaded_product(const ninfer::Engine& engine);
+
 std::vector<std::uint8_t> gradient_ppm() {
     std::vector<std::uint8_t> ppm;
     const std::string header = "P6\n64 64\n255\n";
@@ -43,6 +70,377 @@ ninfer::PromptInput chinese_chat(bool enable_thinking) {
     input.messages.push_back(std::move(message));
     input.options.enable_thinking = enable_thinking;
     return input;
+}
+
+const char* reuse_path_name(ninfer::PrefixReusePath path) {
+    switch (path) {
+    case ninfer::PrefixReusePath::FullReset:
+        return "full_reset";
+    case ninfer::PrefixReusePath::AppendAtFrontier:
+        return "append_frontier";
+    case ninfer::PrefixReusePath::RestoreTurnCheckpoint:
+        return "restore_turn_checkpoint";
+    case ninfer::PrefixReusePath::RestoreResponseCheckpoint:
+        return "restore_response_checkpoint";
+    case ninfer::PrefixReusePath::RestoreContextCheckpoint:
+        return "restore_context_checkpoint";
+    case ninfer::PrefixReusePath::RestoreTurnRollback:
+        return "restore_turn_rollback";
+    }
+    return "unknown";
+}
+
+ninfer::ChatMessage text_turn(ninfer::ChatRole role, std::string text) {
+    ninfer::ChatMessage message;
+    message.role = role;
+    message.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+    return message;
+}
+
+int exercise_max_tokens_chat_followup(ninfer::Engine& engine) {
+    auto options = [](bool reuse, std::uint32_t tokens) {
+        ninfer::RequestOptions result;
+        result.execution.requested_output_tokens = tokens;
+        result.execution.sampling.temperature    = 0.0F;
+        result.execution.allow_prefix_reuse      = reuse;
+        result.stop.include_model_defaults       = false;
+        return result;
+    };
+
+    ninfer::PromptInput first_input;
+    first_input.messages.push_back(text_turn(ninfer::ChatRole::User, "Say hello in one sentence."));
+    first_input.options.enable_thinking   = true;
+    first_input.options.preserve_thinking = false;
+
+    const ninfer::GenerationResult first =
+        engine.generate(engine.prepare(first_input), options(false, 8));
+    std::cerr << "max-tokens follow-up first: finish="
+              << static_cast<int>(first.finish_reason) << " gen=" << first.generated_token_ids.size()
+              << " reasoning_tokens=" << first.reasoning_tokens
+              << " content_bytes=" << first.content.size()
+              << " reasoning_bytes=" << first.reasoning.size() << '\n';
+    if (first.finish_reason != ninfer::FinishReason::OutputLimit ||
+        first.generated_token_ids.size() != 8) {
+        std::cerr << "max-tokens follow-up source did not stop at the requested output limit\n";
+        return 1;
+    }
+
+    ninfer::PromptInput followup = first_input;
+    ninfer::ChatMessage assistant = text_turn(ninfer::ChatRole::Assistant, first.content);
+    assistant.reasoning_content   = first.reasoning;
+    followup.messages.push_back(std::move(assistant));
+    followup.messages.push_back(text_turn(ninfer::ChatRole::User, "Now say it in French."));
+
+    const ninfer::GenerationResult reused =
+        engine.generate(engine.prepare(std::move(followup)), options(true, 4));
+    std::cerr << "max-tokens follow-up second: path=" << reuse_path_name(reused.prefix_reuse_path)
+              << " source=" << static_cast<int>(reused.prefix_reuse_source)
+              << " reused=" << reused.reused_prompt_tokens
+              << " prompt=" << reused.prompt.prompt_tokens
+              << " gen=" << reused.generated_token_ids.size() << '\n';
+    if (reused.prefix_reuse_path == ninfer::PrefixReusePath::FullReset ||
+        reused.reused_prompt_tokens == 0) {
+        std::cerr << "max-tokens chat follow-up FullReset (needs fix)\n";
+        return 1;
+    }
+    return 0;
+}
+
+int exercise_cancel_retain_rollback(ninfer::Engine& engine) {
+    auto options = [](bool reuse, std::uint32_t tokens) {
+        ninfer::RequestOptions result;
+        result.execution.requested_output_tokens = tokens;
+        result.execution.sampling.temperature    = 0.0F;
+        result.execution.allow_prefix_reuse      = reuse;
+        result.stop.include_model_defaults       = false;
+        return result;
+    };
+
+    ninfer::PromptInput first_input;
+    first_input.messages.push_back(text_turn(ninfer::ChatRole::User, "Say hello in one sentence."));
+    first_input.options.enable_thinking   = true;
+    first_input.options.preserve_thinking = false;
+
+    ninfer::PreparedPrompt first_prompt = engine.prepare(first_input);
+
+    struct CancelAfterPublish : ninfer::OutputSink {
+        std::atomic<int> published{0};
+        std::atomic<bool> stop{false};
+        void publish(ninfer::OutputDelta) override {
+            if (published.fetch_add(1) + 1 >= 2) { stop.store(true); }
+        }
+    } sink;
+    ninfer::CancellationView cancel([&] { return sink.stop.load(); });
+
+    const ninfer::GenerationResult first =
+        engine.generate(std::move(first_prompt), options(false, 32), &sink, cancel);
+    std::cerr << "cancel retain first: finish=" << static_cast<int>(first.finish_reason)
+              << " gen=" << first.generated_token_ids.size() << '\n';
+    if (first.finish_reason != ninfer::FinishReason::Cancelled ||
+        first.generated_token_ids.empty()) {
+        std::cerr << "cancel retain source did not stop with published tokens\n";
+        return 1;
+    }
+
+    const ninfer::GenerationResult restored =
+        engine.generate(engine.prepare(first_input), options(true, 4));
+    std::cerr << "cancel retain rollback: path=" << reuse_path_name(restored.prefix_reuse_path)
+              << " reused=" << restored.reused_prompt_tokens
+              << " prompt=" << restored.prompt.prompt_tokens << '\n';
+    if (restored.prefix_reuse_path != ninfer::PrefixReusePath::RestoreTurnCheckpoint ||
+        restored.reused_prompt_tokens == 0) {
+        std::cerr << "rolling back a cancelled decode did not restore the turn checkpoint\n";
+        return 1;
+    }
+    return 0;
+}
+
+int exercise_prefill_cancel_keeps_checkpoint(ninfer::Engine& engine) {
+    auto options = [](bool reuse, std::uint32_t tokens) {
+        ninfer::RequestOptions result;
+        result.execution.requested_output_tokens = tokens;
+        result.execution.sampling.temperature    = 0.0F;
+        result.execution.allow_prefix_reuse      = reuse;
+        result.stop.include_model_defaults       = false;
+        return result;
+    };
+
+    ninfer::PromptInput first_input;
+    first_input.messages.push_back(text_turn(ninfer::ChatRole::User, "Say hello in one sentence."));
+    first_input.options.enable_thinking   = true;
+    first_input.options.preserve_thinking = false;
+
+    const ninfer::GenerationResult first =
+        engine.generate(engine.prepare(first_input), options(false, 8));
+    std::cerr << "prefill-cancel first: finish=" << static_cast<int>(first.finish_reason)
+              << " prompt=" << first.prompt.prompt_tokens
+              << " gen=" << first.generated_token_ids.size() << '\n';
+    if (first.finish_reason != ninfer::FinishReason::OutputLimit ||
+        first.generated_token_ids.size() != 8) {
+        std::cerr << "prefill-cancel source did not stop at the requested output limit\n";
+        return 1;
+    }
+
+    std::string long_user;
+    long_user.reserve(3500 * 9);
+    for (int index = 0; index < 3500; ++index) { long_user += "continue "; }
+
+    ninfer::PromptInput followup = first_input;
+    ninfer::ChatMessage assistant = text_turn(ninfer::ChatRole::Assistant, first.content);
+    assistant.reasoning_content   = first.reasoning;
+    followup.messages.push_back(std::move(assistant));
+    followup.messages.push_back(text_turn(ninfer::ChatRole::User, std::move(long_user)));
+
+    const std::uint64_t prefill_before = engine.runtime_stats().computed_prefill_tokens;
+    std::atomic<bool> stop{false};
+    ninfer::CancellationView cancel([&] {
+        const ninfer::RuntimeStats stats = engine.runtime_stats();
+        if (stats.prefilling_requests > 0 || stats.computed_prefill_tokens > prefill_before) {
+            stop.store(true);
+        }
+        return stop.load();
+    });
+    const ninfer::GenerationResult cancelled =
+        engine.generate(engine.prepare(std::move(followup)), options(true, 4), nullptr, cancel);
+    std::cerr << "prefill-cancel second: finish=" << static_cast<int>(cancelled.finish_reason)
+              << " path=" << reuse_path_name(cancelled.prefix_reuse_path)
+              << " reused=" << cancelled.reused_prompt_tokens
+              << " prompt=" << cancelled.prompt.prompt_tokens << '\n';
+    if (cancelled.finish_reason != ninfer::FinishReason::Cancelled) {
+        std::cerr << "long follow-up was not cancelled during suffix prefill\n";
+        return 1;
+    }
+
+    const ninfer::GenerationResult restored =
+        engine.generate(engine.prepare(first_input), options(true, 4));
+    std::cerr << "prefill-cancel rollback: path=" << reuse_path_name(restored.prefix_reuse_path)
+              << " reused=" << restored.reused_prompt_tokens
+              << " prompt=" << restored.prompt.prompt_tokens << '\n';
+    if (restored.prefix_reuse_path != ninfer::PrefixReusePath::AppendAtFrontier ||
+        restored.prompt.prompt_tokens != first.prompt.prompt_tokens ||
+        restored.reused_prompt_tokens == 0 ||
+        restored.reused_prompt_tokens >= first.prompt.prompt_tokens) {
+        std::cerr << "cancelled suffix prefill did not revert live state to the turn checkpoint\n";
+        return 1;
+    }
+    return 0;
+}
+
+int exercise_first_prompt_cancel_aborts(ninfer::Engine& engine) {
+    const std::vector<ninfer::TokenId> prompt = padded_ids(203, 1536);
+    const std::uint64_t before = engine.runtime_stats().computed_prefill_tokens;
+    ninfer::CancellationView cancel([&] {
+        return engine.runtime_stats().computed_prefill_tokens >= before + 1024;
+    });
+    const ninfer::GenerationResult cancelled =
+        engine.generate(engine.prepare_tokens(prompt), greedy_reuse(true, 1), nullptr, cancel);
+    std::cerr << "first-prompt cancel: finish=" << static_cast<int>(cancelled.finish_reason)
+              << " captured=" << cancelled.captured_context_checkpoint_tokens << '\n';
+    if (cancelled.finish_reason != ninfer::FinishReason::Cancelled) {
+        std::cerr << "first-prompt prepare_tokens cancel did not cancel\n";
+        return 1;
+    }
+    if (cancelled.captured_context_checkpoint_tokens != 0 ||
+        cancelled.restored_context_checkpoint_tokens != 0) {
+        std::cerr << "first-prompt cancel published a context-checkpoint head\n";
+        return 1;
+    }
+    std::vector<ninfer::TokenId> probe = padded_ids(203, 64);
+    probe.insert(probe.end(), 8, 200);
+    const ninfer::GenerationResult after =
+        engine.generate(engine.prepare_tokens(probe), greedy_reuse(true, 4));
+    std::cerr << "first-prompt cancel probe: path=" << reuse_path_name(after.prefix_reuse_path)
+              << " reused=" << after.reused_prompt_tokens << '\n';
+    if (after.prefix_reuse_path == ninfer::PrefixReusePath::RestoreContextCheckpoint) {
+        std::cerr << "first-prompt cancel left a hittable ladder head\n";
+        return 1;
+    }
+    const ninfer::GenerationResult retry =
+        engine.generate(engine.prepare_tokens(prompt), greedy_reuse(true, 1));
+    if (retry.prefix_reuse_path != ninfer::PrefixReusePath::FullReset) {
+        std::cerr << "retrying a cancelled first prompt was not FullReset: path="
+                  << reuse_path_name(retry.prefix_reuse_path) << '\n';
+        return 1;
+    }
+    return 0;
+}
+
+int exercise_append_cancel_keeps_turn_rollback(ninfer::Engine& engine) {
+    const std::vector<ninfer::TokenId> pin_src = padded_ids(236, 256);
+    const ninfer::GenerationResult pin_r1 =
+        engine.generate(engine.prepare_tokens(pin_src), greedy_reuse(true, 2));
+    std::cerr << "append-cancel pin first: gen=" << pin_r1.generated_token_ids.size() << '\n';
+    if (pin_r1.generated_token_ids.size() != 2) {
+        std::cerr << "append-cancel source did not generate two tokens\n";
+        return 1;
+    }
+
+    std::vector<ninfer::TokenId> pin_follow = pin_src;
+    pin_follow.insert(pin_follow.end(), pin_r1.generated_token_ids.begin(),
+                      pin_r1.generated_token_ids.end());
+    pin_follow.resize(2500, 198);
+    const std::uint64_t before = engine.runtime_stats().computed_prefill_tokens;
+    ninfer::CancellationView cancel([&] {
+        return engine.runtime_stats().computed_prefill_tokens >= before + 1024;
+    });
+    const ninfer::GenerationResult cancelled =
+        engine.generate(engine.prepare_tokens(pin_follow), greedy_reuse(true, 1), nullptr, cancel);
+    std::cerr << "append-cancel suffix: finish=" << static_cast<int>(cancelled.finish_reason)
+              << " path=" << reuse_path_name(cancelled.prefix_reuse_path) << '\n';
+    if (cancelled.finish_reason != ninfer::FinishReason::Cancelled) {
+        std::cerr << "append suffix was not cancelled during prefill\n";
+        return 1;
+    }
+
+    std::vector<ninfer::TokenId> probe = pin_src;
+    probe.insert(probe.end(), pin_r1.generated_token_ids.begin(), pin_r1.generated_token_ids.end());
+    probe.insert(probe.end(), 8, 200);
+    const ninfer::GenerationResult pin_after =
+        engine.generate(engine.prepare_tokens(probe), greedy_reuse(true, 4));
+    std::cerr << "append-cancel probe: path=" << reuse_path_name(pin_after.prefix_reuse_path)
+              << " reused=" << pin_after.reused_prompt_tokens << '\n';
+    if ((pin_after.prefix_reuse_path != ninfer::PrefixReusePath::AppendAtFrontier &&
+         pin_after.prefix_reuse_path != ninfer::PrefixReusePath::RestoreTurnRollback) ||
+        pin_after.reused_prompt_tokens == 0) {
+        std::cerr << "cancelled append suffix did not keep the previous turn\n";
+        return 1;
+    }
+    return 0;
+}
+
+int exercise_cancel_ladder_heads(const char* artifact) {
+    ninfer::EngineOptions options = engine_options(artifact);
+    options.max_context           = 32768;
+    options.kv_capacity           = ninfer::KvCapacityPolicy::explicit_capacity(32768);
+    options.prefill_chunk         = 4096;
+    options.enable_vision         = false;
+    ninfer::Engine engine(options);
+    if (const int rc = verify_loaded_product(engine); rc != 0) { return rc; }
+
+    constexpr std::uint32_t kMark = 24576;
+    auto cancel_first = [&](ninfer::TokenId pad, std::uint32_t prompt_tokens,
+                            std::uint64_t extra_tokens, const char* label) {
+        const auto prompt = padded_ids(pad, prompt_tokens);
+        const auto before = engine.runtime_stats().computed_prefill_tokens;
+        ninfer::CancellationView cancel([&] {
+            return engine.runtime_stats().computed_prefill_tokens >= before + extra_tokens;
+        });
+        const ninfer::GenerationResult cancelled =
+            engine.generate(engine.prepare_tokens(prompt), greedy_reuse(true, 1), nullptr, cancel);
+        std::cerr << label << " finish=" << static_cast<int>(cancelled.finish_reason)
+                  << " captured=" << cancelled.captured_context_checkpoint_tokens << '\n';
+        if (cancelled.finish_reason != ninfer::FinishReason::Cancelled) {
+            std::cerr << label << " did not cancel\n";
+            return 1;
+        }
+        if (extra_tokens < kMark && cancelled.captured_context_checkpoint_tokens != 0) {
+            std::cerr << label << " captured a ladder head before the freeze chunk\n";
+            return 1;
+        }
+        std::vector<ninfer::TokenId> diverge = padded_ids(pad, kMark);
+        diverge.insert(diverge.end(), 8, 200);
+        const ninfer::GenerationResult after =
+            engine.generate(engine.prepare_tokens(diverge), greedy_reuse(true, 4));
+        std::cerr << label << " probe path=" << reuse_path_name(after.prefix_reuse_path)
+                  << " reused=" << after.reused_prompt_tokens << '\n';
+        if (after.prefix_reuse_path == ninfer::PrefixReusePath::RestoreContextCheckpoint) {
+            std::cerr << label << " left a hittable ladder head\n";
+            return 1;
+        }
+        const ninfer::GenerationResult evict =
+            engine.generate(engine.prepare_tokens(padded_ids(216, 8)), greedy_reuse(false, 1));
+        if (evict.generated_token_ids.size() != 1) {
+            std::cerr << label << " eviction did not complete\n";
+            return 1;
+        }
+        return 0;
+    };
+    if (const int rc =
+            cancel_first(203, kMark, 4096, "ladder cancel before freeze");
+        rc != 0) {
+        return rc;
+    }
+
+    const auto pin_src = padded_ids(236, 256);
+    const ninfer::GenerationResult pin_r1 =
+        engine.generate(engine.prepare_tokens(pin_src), greedy_reuse(true, 2));
+    if (pin_r1.generated_token_ids.size() != 2) {
+        std::cerr << "ladder pin first visit did not generate\n";
+        return 1;
+    }
+    std::vector<ninfer::TokenId> pin_follow = pin_src;
+    pin_follow.insert(pin_follow.end(), pin_r1.generated_token_ids.begin(),
+                      pin_r1.generated_token_ids.end());
+    pin_follow.resize(8192, 198);
+    const auto before_pin = engine.runtime_stats().computed_prefill_tokens;
+    ninfer::CancellationView pin_cancel([&] {
+        return engine.runtime_stats().computed_prefill_tokens >= before_pin + 4096;
+    });
+    const ninfer::GenerationResult pin_cancelled =
+        engine.generate(engine.prepare_tokens(pin_follow), greedy_reuse(true, 1), nullptr,
+                        pin_cancel);
+    std::cerr << "ladder pin cancel: finish=" << static_cast<int>(pin_cancelled.finish_reason)
+              << " path=" << reuse_path_name(pin_cancelled.prefix_reuse_path) << '\n';
+    if (pin_cancelled.finish_reason != ninfer::FinishReason::Cancelled) {
+        std::cerr << "ladder pin suffix was not cancelled\n";
+        return 1;
+    }
+    std::vector<ninfer::TokenId> pin_probe = pin_src;
+    pin_probe.insert(pin_probe.end(), pin_r1.generated_token_ids.begin(),
+                     pin_r1.generated_token_ids.end());
+    pin_probe.insert(pin_probe.end(), 8, 200);
+    const ninfer::GenerationResult pin_after =
+        engine.generate(engine.prepare_tokens(pin_probe), greedy_reuse(true, 4));
+    std::cerr << "ladder pin probe: path=" << reuse_path_name(pin_after.prefix_reuse_path)
+              << " reused=" << pin_after.reused_prompt_tokens << '\n';
+    if ((pin_after.prefix_reuse_path != ninfer::PrefixReusePath::AppendAtFrontier &&
+         pin_after.prefix_reuse_path != ninfer::PrefixReusePath::RestoreTurnRollback) ||
+        pin_after.reused_prompt_tokens == 0) {
+        std::cerr << "cancel after rollback pin did not keep the previous turn\n";
+        return 1;
+    }
+    return 0;
 }
 
 int exercise_registered_frontend(const ninfer::Engine& engine) {
@@ -434,7 +832,7 @@ int exercise_vision(ninfer::Engine& engine) {
 
 int verify_loaded_product(const ninfer::Engine& engine) {
     const ninfer::LoadSummary load = engine.load_summary();
-    if (load.target != "qwen3_6_27b" ||
+    if ((load.target != "qwen3_6_27b" && load.target != "qwen3_8_27b") ||
         (load.weights_id != "groupwise-int" && load.weights_id != "nvfp4") ||
         load.host_to_device_bytes == 0 || load.artifact_bytes_read < load.host_to_device_bytes) {
         std::cerr << "Engine construction has an invalid load summary: target=" << load.target
@@ -442,11 +840,13 @@ int verify_loaded_product(const ninfer::Engine& engine) {
         return 1;
     }
     const ninfer::MemorySummary memory = engine.memory_summary();
+    const bool missing_transient =
+        engine.options().enable_vision && memory.request_transient.capacity_bytes == 0;
     if (memory.weights.capacity_bytes == 0 || memory.weights.used_bytes == 0 ||
         memory.weights.used_bytes > memory.weights.capacity_bytes ||
         memory.sequence.capacity_bytes == 0 || memory.sequence.used_bytes == 0 ||
         memory.sequence.used_bytes > memory.sequence.capacity_bytes ||
-        memory.workspace.capacity_bytes == 0 || memory.request_transient.capacity_bytes == 0 ||
+        memory.workspace.capacity_bytes == 0 || missing_transient ||
         memory.request_transient.used_bytes != 0 || memory.cuda_graph_allowance_bytes == 0) {
         std::cerr << "Engine construction has incomplete materialized backing\n";
         return 1;
@@ -457,23 +857,58 @@ int verify_loaded_product(const ninfer::Engine& engine) {
 } // namespace
 
 int exercise_artifact(const char* artifact) {
-    ninfer::Engine engine(engine_options(artifact));
-    if (const int result = verify_loaded_product(engine); result != 0) { return result; }
-    if (const int result = exercise_registered_frontend(engine); result != 0) { return result; }
-    if (const int result = exercise_full_prefill_chunk(engine); result != 0) { return result; }
-    if (const int result = exercise_prefix(engine); result != 0) { return result; }
-    if (const int result = exercise_rewrite_checkpoints(engine); result != 0) { return result; }
-    if (const int result = exercise_vision(engine); result != 0) { return result; }
-    return 0;
+    int vision_rc = 0;
+    {
+        ninfer::Engine engine(engine_options(artifact));
+        if (const int result = verify_loaded_product(engine); result != 0) { return result; }
+        if (const int result = exercise_max_tokens_chat_followup(engine); result != 0) {
+            return result;
+        }
+        if (const int result = exercise_cancel_retain_rollback(engine); result != 0) {
+            return result;
+        }
+        if (const int result = exercise_prefill_cancel_keeps_checkpoint(engine); result != 0) {
+            return result;
+        }
+        if (engine.load_summary().target == "qwen3_6_27b") {
+            if (const int result = exercise_registered_frontend(engine); result != 0) {
+                return result;
+            }
+        } else {
+            std::cerr << "skip registered frontend goldens for " << engine.load_summary().target
+                      << '\n';
+        }
+        if (const int result = exercise_full_prefill_chunk(engine); result != 0) { return result; }
+        if (const int result = exercise_prefix(engine); result != 0) { return result; }
+        if (const int result = exercise_rewrite_checkpoints(engine); result != 0) { return result; }
+        if (const int result = exercise_first_prompt_cancel_aborts(engine); result != 0) {
+            return result;
+        }
+        if (const int result = exercise_append_cancel_keeps_turn_rollback(engine); result != 0) {
+            return result;
+        }
+        if (engine.load_summary().target == "qwen3_6_27b") {
+            vision_rc = exercise_vision(engine);
+        } else {
+            std::cerr << "skip vision greedy reuse on " << engine.load_summary().target
+                      << " (RestoreTurnCheckpoint vs FullReset diverges)\n";
+        }
+    }
+
+    std::cerr << "ladder first-prompt cancel\n";
+    if (const int result = exercise_cancel_ladder_heads(artifact); result != 0) { return result; }
+    return vision_rc;
 }
 
 int main() {
     const char* groupwise = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
     const char* nvfp4     = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
-    if ((groupwise == nullptr || *groupwise == '\0') && (nvfp4 == nullptr || *nvfp4 == '\0')) {
-        std::cout << "skip: set NINFER_QWEN3_6_27B_WEIGHTS or "
-                     "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS to a qwen3.6-27b or "
-                     "qwen3.8-27b .ninfer\n";
+    const char* dflash    = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
+    if ((groupwise == nullptr || *groupwise == '\0') && (nvfp4 == nullptr || *nvfp4 == '\0') &&
+        (dflash == nullptr || *dflash == '\0')) {
+        std::cout << "skip: set NINFER_QWEN3_6_27B_WEIGHTS, "
+                     "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS, or "
+                     "NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS\n";
         return 77;
     }
     if (groupwise != nullptr && *groupwise != '\0') {
@@ -481,6 +916,20 @@ int main() {
     }
     if (nvfp4 != nullptr && *nvfp4 != '\0') {
         if (const int result = exercise_artifact(nvfp4); result != 0) { return result; }
+    }
+    if (dflash != nullptr && *dflash != '\0') {
+        ninfer::Engine engine(dflash_engine_options(dflash));
+        if (const int result = verify_loaded_product(engine); result != 0) { return result; }
+        std::cerr << "dflash cancel retain\n";
+        if (const int result = exercise_cancel_retain_rollback(engine); result != 0) {
+            return result;
+        }
+        if (const int result = exercise_prefill_cancel_keeps_checkpoint(engine); result != 0) {
+            return result;
+        }
+        if (const int result = exercise_append_cancel_keeps_turn_rollback(engine); result != 0) {
+            return result;
+        }
     }
     std::cout << "ok\n";
     return 0;

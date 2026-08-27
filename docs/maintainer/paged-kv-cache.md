@@ -752,7 +752,8 @@ release:
 完整 bundle 才能进入 Prefix Cache。不完整状态释放整个 bundle，不能发布 target-only reusable entry。
 
 Slot 和 device table rows 随后可以复用。Network response lifetime 不延长 KV ownership。
-Cancellation 在第一个观察到它的 GPU boundary release bundle；不修改 in-flight round mappings。
+Cancellation 在第一个观察到它的 GPU boundary 按 §7.5 释放或 retain bundle；不修改 in-flight round
+mappings。
 
 ---
 
@@ -995,7 +996,7 @@ fixed unit；new admission 可以 claim 或先驱逐 retained entry，不能降�
 | 只有更短 token prefix match，但该位置没有 checkpoint | cache miss |
 | retained occupancy 阻塞 admission | Prefix Cache eviction 完整 entry 后重试 atomic admission |
 | retained eviction 后，request set 满足 main contract 但 backend reservation 失败 | startup sizing 或 accounting invariant violation；不是正常等待条件 |
-| request cancellation | in-flight unit 完成后的 boundary release bundle |
+| request cancellation | 未完成 prefill 回滚到 occupy base 上的 turn-rollback/ladder head，否则 rewrite checkpoint，丢掉其后的 staged heads 并 retain；occupy base 为 0 且没有 rewrite 时释放 bundle（含 staged heads）；speculative in-flight decode 丢掉本 unit 的 provisional result 并以 `commit_columns=0` fold 后 retain 已 commit 的 frontier；已 commit 的 decode/prefill frontier 与 OutputLimit 一样 retain，并保留该 frontier 及之前的 context-checkpoint heads |
 | admitted request materialize 时无 free page | reservation-accounting violation，作为 Engine failure |
 | 一个 request 使用 main pool 大部分容量 | 合法，只要其他 per-pool entitlements 仍满足 invariants |
 

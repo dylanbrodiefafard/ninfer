@@ -205,6 +205,16 @@ void Program<Variant>::abort_lane(std::uint32_t lane) noexcept {
 }
 
 template <>
+void Program<Variant>::retain_lane(std::uint32_t lane) {
+    impl_->retain_lane(lane);
+}
+
+template <>
+bool Program<Variant>::revert_cancelled_prefill_lane(std::uint32_t lane) {
+    return impl_->revert_cancelled_prefill_lane(lane);
+}
+
+template <>
 bool Program<Variant>::has_retained_lane(std::uint32_t lane) const noexcept {
     return impl_->has_retained_lane(lane);
 }
