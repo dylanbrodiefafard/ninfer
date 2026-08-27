@@ -68,6 +68,11 @@ public:
     std::vector<int> encode(std::string_view text, EncodeOptions options = {}) const;
     EncodedText encode(std::string_view text, std::optional<std::size_t> prefix_byte_end,
                        EncodeOptions options = {}) const;
+    // True iff `n` is a mark_prefix site of encode(text): 0, each added-token
+    // match_pos, each post-match pos (advanced by content.size(), not best_len),
+    // or text.size() after leftover BPE. Interior gap/special cuts are false.
+    [[nodiscard]] bool is_encode_loop_pos(std::string_view text, std::size_t n,
+                                          EncodeOptions options = {}) const;
     std::string decode(std::span<const int> ids, DecodeOptions options = {}) const;
     std::string_view decode_token_bytes(int id, bool skip_special_tokens = false) const;
 
@@ -80,6 +85,9 @@ public:
     [[nodiscard]] bool has_exact_token_domain(std::size_t size) const noexcept;
 
 private:
+    [[nodiscard]] std::optional<std::pair<std::size_t, int>>
+    find_leftmost_added(std::string_view text, std::size_t pos) const;
+
     std::vector<std::string> id_to_token_;
     std::vector<std::string> id_to_decoded_bytes_;
     std::vector<std::uint8_t> valid_token_ids_;
