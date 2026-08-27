@@ -113,13 +113,14 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
                                            : base->summary.effective_output_tokens - 1U);
     std::uint32_t main_kv_tokens = reserved_context_tokens;
     if (speculative_backend == SpeculativeBackend::DFlash) {
-        if (dflash_uses_tree_verify(draft_window, dflash_verify_width)) {
-            // Packed-tree verify writes unique cache slots E+0..E+W-1 every round, including
-            // short last rounds, so Main KV entitlement must cover the verify window.
-            main_kv_tokens = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                capacity, static_cast<std::uint64_t>(reserved_context_tokens) +
-                              dflash_verify_width));
-        }
+        // Decode always materializes up to execution_frontier + dflash_verify_width (see
+        // decode_dflash_batch). Tree verify needs that headroom for unique packed slots;
+        // chain verify (e.g. live k=5 W=6) still materializes the same extent, so Main KV
+        // entitlement must cover verify_width in both modes or the last rounds / short
+        // max_tokens requests throw "materialize extent is outside entitlement" and poison
+        // the executor.
+        main_kv_tokens = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+            capacity, static_cast<std::uint64_t>(reserved_context_tokens) + dflash_verify_width));
     }
     base->text_kv_page_entitlement = pages_for_tokens(main_kv_tokens);
     if (speculative_backend == SpeculativeBackend::Mtp) {
