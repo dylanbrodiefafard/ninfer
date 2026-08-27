@@ -102,6 +102,36 @@ int check_speculative(const ninfer::GenerationResult& result, const char* label)
     return 0;
 }
 
+// Regression: live serve uses k=5 W=6 (chain verify). Decode materializes frontier+W while
+// entitlement used to omit W for non-tree mode, so short max_tokens on a page-aligned prompt
+// threw "Paged KV materialize extent is outside entitlement" and poisoned the executor.
+int exercise_chain_verify_short_output_entitlement(const char* artifact) {
+    ninfer::EngineOptions options =
+        speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 5, 1);
+    options.speculative.dflash_verify_width = 6;
+    options.kv_cache                        = ninfer::KvCacheStorage::Nvfp4;
+    options.max_context                     = 256;
+    options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(256);
+    ninfer::Engine engine(options);
+    if (const int result = check_dflash_load(engine); result != 0) { return result; }
+
+    // reserved_context = 60 + 5 - 1 = 64 (exact page). Without verify-width headroom,
+    // first decode materialize(60+6) needs a second page and throws.
+    std::vector<ninfer::TokenId> prompt(60, 198);
+    prompt[0] = 248045;
+    const ninfer::GenerationResult result =
+        engine.generate(engine.prepare_tokens(prompt), greedy_options(5));
+    if (result.finish_reason != ninfer::FinishReason::OutputLimit ||
+        result.generated_token_ids.size() != 5) {
+        std::cerr << "chain-verify short-output entitlement: finish="
+                  << static_cast<int>(result.finish_reason)
+                  << " gen=" << result.generated_token_ids.size() << '\n';
+        return 1;
+    }
+    if (check_speculative(result, "chain-verify short-output entitlement") != 0) { return 1; }
+    return 0;
+}
+
 int greedy_oracle(ninfer::Engine& engine, const std::vector<ninfer::TokenId>& prompt,
                   std::vector<ninfer::TokenId>& oracle, const char* label) {
     const ninfer::GenerationResult seq =
@@ -153,6 +183,11 @@ int main() {
     if (artifact == nullptr || *artifact == '\0') {
         std::cout << "skip: NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS is not set\n";
         return 77;
+    }
+
+    std::cerr << "dflash_real: chain-verify short-output Main KV entitlement\n";
+    if (const int result = exercise_chain_verify_short_output_entitlement(artifact); result != 0) {
+        return result;
     }
 
     // NVFP4 AllowA4 verify at T>=4 uses W4A4 attention; ordinary T=1 decode stays A16.

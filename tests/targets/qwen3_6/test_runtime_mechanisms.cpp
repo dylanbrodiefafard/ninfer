@@ -1,4 +1,5 @@
 #include "core/layout.h"
+#include "core/paged_kv_cache.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include <ninfer/targets/qwen3_6/hybrid_topology.h>
 #include <ninfer/targets/qwen3_6/mtp_alignment.h>
@@ -1037,6 +1038,20 @@ void test_resident_reuse_decision() {
     }
 }
 
+void test_dflash_chain_verify_kv_headroom() {
+    // Live serve: --draft-tokens 5 --dflash-verify-width 6 is chain verify (not packed tree).
+    // decode_dflash_batch still materializes execution_frontier + W every round. If Main KV
+    // entitlement only covers reserved_context (= prompt+output-1), a page-boundary reserved
+    // length makes pages_for_tokens(reserved+W) exceed entitlement and throws
+    // "Paged KV materialize extent is outside entitlement", poisoning the executor.
+    constexpr std::uint32_t kPage = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
+    constexpr std::uint32_t kVerifyWidth = 6;
+    const std::uint32_t reserved         = kPage; // exact page boundary
+    expect(ninfer::pages_for_tokens(reserved) == 1, "reserved context fits one KV page");
+    expect(ninfer::pages_for_tokens(reserved + kVerifyWidth) == 2,
+           "frontier+W materialize needs verify-width headroom in Main KV entitlement");
+}
+
 int main() {
     test_topology();
     test_decoder_layout();
@@ -1047,6 +1062,7 @@ int main() {
     test_prefix_hash_and_dflash_gate();
     test_prefill_context_marks();
     test_resident_reuse_decision();
+    test_dflash_chain_verify_kv_headroom();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;

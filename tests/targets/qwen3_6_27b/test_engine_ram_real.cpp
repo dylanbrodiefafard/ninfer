@@ -486,6 +486,91 @@ int exercise_cancel_retain_ram(ninfer::Engine& engine) {
     return 0;
 }
 
+// Regression: cancelled suffix prefill used to retain ledger_frontier == execution_frontier,
+// so the next admit's RAM capture threw and poisoned the executor (503 forever).
+int exercise_prefill_cancel_capture_ram(ninfer::Engine& engine) {
+    auto options = [](bool reuse, std::uint32_t tokens) {
+        ninfer::RequestOptions result;
+        result.execution.requested_output_tokens = tokens;
+        result.execution.sampling.temperature    = 0.0F;
+        result.execution.allow_prefix_reuse      = reuse;
+        result.stop.include_model_defaults       = false;
+        return result;
+    };
+    auto text_turn = [](ninfer::ChatRole role, std::string text) {
+        ninfer::ChatMessage message;
+        message.role = role;
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        return message;
+    };
+
+    ninfer::PromptInput first_input;
+    first_input.messages.push_back(text_turn(ninfer::ChatRole::User, "Say hello in one sentence."));
+    first_input.options.enable_thinking   = true;
+    first_input.options.preserve_thinking = false;
+
+    const ninfer::GenerationResult first =
+        engine.generate(engine.prepare(first_input), options(false, 8));
+    if (first.finish_reason != ninfer::FinishReason::OutputLimit ||
+        first.generated_token_ids.size() != 8) {
+        return fail("prefill-cancel capture source did not stop at the output limit");
+    }
+
+    std::string long_user;
+    long_user.reserve(3500 * 9);
+    for (int index = 0; index < 3500; ++index) { long_user += "continue "; }
+
+    ninfer::PromptInput followup = first_input;
+    ninfer::ChatMessage assistant = text_turn(ninfer::ChatRole::Assistant, first.content);
+    assistant.reasoning_content   = first.reasoning;
+    followup.messages.push_back(std::move(assistant));
+    followup.messages.push_back(text_turn(ninfer::ChatRole::User, std::move(long_user)));
+
+    const std::uint64_t prefill_before = engine.runtime_stats().computed_prefill_tokens;
+    std::atomic<bool> stop{false};
+    ninfer::CancellationView cancel([&] {
+        if (engine.runtime_stats().prefilling_requests > 0 ||
+            engine.runtime_stats().computed_prefill_tokens > prefill_before) {
+            stop.store(true);
+        }
+        return stop.load();
+    });
+    const ninfer::GenerationResult cancelled =
+        engine.generate(engine.prepare(std::move(followup)), options(true, 4), nullptr, cancel);
+    if (cancelled.finish_reason != ninfer::FinishReason::Cancelled) {
+        return fail("prefill-cancel capture follow-up was not cancelled during suffix prefill");
+    }
+
+    const auto captures_before = engine.runtime_stats().kv_ram_captures;
+    // Force the reverted retained lane into host RAM — this is where the inconsistent
+    // ledger_frontier used to throw and poison the concurrent executor.
+    const ninfer::GenerationResult evictor =
+        engine.generate(engine.prepare_tokens(tokens_c()), options(false, 4));
+    if (evictor.generated_token_ids.size() != 4 ||
+        evictor.prefix_reuse_path != ninfer::PrefixReusePath::FullReset) {
+        return fail("prefill-cancel capture evictor did not FullReset");
+    }
+    if (engine.runtime_stats().kv_ram_captures <= captures_before) {
+        return fail("prefill-cancel capture evictor did not capture the reverted lane");
+    }
+
+    // Engine must still accept work after the capture (no executor poison).
+    const ninfer::GenerationResult probe =
+        engine.generate(engine.prepare_tokens(tokens_d()), options(false, 2));
+    if (probe.generated_token_ids.size() != 2) {
+        return fail("prefill-cancel capture left the engine unable to serve later requests");
+    }
+
+    const ninfer::GenerationResult restored =
+        engine.generate(engine.prepare(first_input), options(true, 4));
+    if (restored.prefix_reuse_path == ninfer::PrefixReusePath::FullReset ||
+        restored.reused_prompt_tokens == 0) {
+        return fail("prefill-cancel capture did not leave a reusable prefix after RAM spill");
+    }
+    return 0;
+}
+
 int exercise_site1(const char* artifact) {
     ninfer::Engine engine(ordinary_options(artifact, 2, 256, kRamHitBytes));
     if (const int rc = verify_ram_tier(engine, kRamHitBytes); rc != 0) { return rc; }
@@ -1465,6 +1550,8 @@ int exercise_artifact(const char* artifact) {
         if (const int rc = exercise_negative(engine); rc != 0) { return rc; }
         if (const int rc = exercise_checkpoint(engine); rc != 0) { return rc; }
         if (const int rc = exercise_partial_prefill(engine); rc != 0) { return rc; }
+        std::cerr << "ram_real: prefill-cancel retain then RAM capture\n";
+        if (const int rc = exercise_prefill_cancel_capture_ram(engine); rc != 0) { return rc; }
         std::cerr << "ram_real: cancel-retain dump/restore\n";
         if (const int rc = exercise_cancel_retain_ram(engine); rc != 0) { return rc; }
     }

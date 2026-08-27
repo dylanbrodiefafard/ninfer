@@ -1150,10 +1150,20 @@ bool ProgramImplCore::revert_cancelled_prefill_lane(std::uint32_t lane) {
         if (speculative_backend == SpeculativeBackend::Mtp) {
             sequence.mtp_kv_valid = frontier == 0 ? 0 : frontier - 1;
         }
-        sequence.ledger.resize(frontier);
-        sequence.prefix_identity.truncate(frontier);
+        // Checkpoint frontiers are execution frontiers (text_kv_valid). RAM capture requires
+        // ledger_frontier == execution_frontier + 1 == ledger.size(), matching a committed
+        // Active sequence — keep one trailing ledger slot past the restored frontier.
+        if (sequence.ledger.size() > frontier) {
+            sequence.ledger.resize(frontier + 1);
+            sequence.prefix_identity.truncate(frontier + 1);
+        } else {
+            const TokenId pad = frontier == 0 ? TokenId{0} : sequence.ledger[frontier - 1];
+            sequence.ledger.push_back(pad);
+            sequence.prefix_identity.truncate(frontier);
+            sequence.prefix_identity.append_generated(1, sequence.rope_delta);
+        }
         sequence.execution_frontier = frontier;
-        sequence.ledger_frontier    = frontier;
+        sequence.ledger_frontier    = frontier + 1;
         drop_context_checkpoints_after(sequence, frontier);
         if (staging_.occupied && staging_.lane == sequence.lane) { unoccupy_staging(); }
         device.synchronize();
