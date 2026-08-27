@@ -31,12 +31,13 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
     case Nvfp4Problem::AttnInput:
         return tokens >= 4 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
     case Nvfp4Problem::GdnInput:
-        return Nvfp4LinearRoute::W4A4;
+        return tokens >= 3 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
     case Nvfp4Problem::MlpGateUp:
-        return tokens >= 5 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
+        return tokens >= 2 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
     case Nvfp4Problem::Residual6144:
+        return tokens >= 5 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
     case Nvfp4Problem::Residual17408:
-        return tokens >= 8 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
+        return tokens >= 3 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
     case Nvfp4Problem::DflashFeature:
     case Nvfp4Problem::DflashQkv:
     case Nvfp4Problem::DflashAttnOut:
