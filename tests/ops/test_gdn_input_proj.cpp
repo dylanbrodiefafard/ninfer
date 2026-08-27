@@ -215,7 +215,8 @@ int run_nvfp4() {
     int failures = 0;
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only);
     failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::A16Only);
-    for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 18, 24, 36, 1024}) {
+    for (const std::int32_t tokens :
+         {1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 18, 24, 36, 1024, 2048, 4096}) {
         failures += run_nvfp4_case(parent, tokens, ops::LinearPolicy::AllowA4);
     }
     return failures;

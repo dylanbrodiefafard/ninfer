@@ -211,7 +211,8 @@ void gqa_sparse_prefill_attention_launch(const Tensor& q, const Tensor& position
                 scratch.n_j, scratch.packed);
         CUDA_CHECK(cudaGetLastError());
 
-        const dim3 score_grid(static_cast<unsigned>(q_heads), static_cast<unsigned>(n_br),
+        const dim3 score_grid(static_cast<unsigned>(q_heads),
+                              static_cast<unsigned>(div_up(n_br, kXAttnScoreBrPerCta)),
                               static_cast<unsigned>(std::max(1, (scratch.n_j + kXAttnScoreBN - 1) /
                                                                    kXAttnScoreBN)));
         gqa_xattn_score_kernel<Geometry, Metadata>

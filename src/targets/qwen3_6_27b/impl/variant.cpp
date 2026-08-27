@@ -258,11 +258,9 @@ void Variant::mtp_fc(const Tensor& embedding_norm, const Tensor& hidden_norm, co
 
 void Variant::mtp_attention_output(const Tensor& attention, const Weight& weight, Tensor& residual,
                                    WorkspaceArena& workspace, cudaStream_t stream,
-                                   std::int32_t route_tokens) {
+                                   std::int32_t) {
     if (weight.qtype == QType::NVFP4) {
-        ops::linear_add(attention, weight, residual,
-                        pinned_route_policy(weight, route_tokens, kNvfp4ResidualW4a4Tokens),
-                        workspace, stream);
+        ops::linear_add(attention, weight, residual, text_policy(weight), workspace, stream);
         return;
     }
     auto scope     = workspace.scope();
@@ -367,18 +365,15 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
 
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                              Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream,
-                             std::int32_t route_tokens) {
+                             std::int32_t) {
     auto scope     = workspace.scope();
     const int cols = hidden.ne[1];
     if (weights.gate_up.qtype == QType::NVFP4) {
         Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, cols});
-        const std::int32_t swiglu_route = cols <= kNvfp4SwiGluMaxA16Tokens ? route_tokens : 0;
-        ops::linear_swiglu(hidden, weights.gate_up, activation,
-                           pinned_route_policy(weights.gate_up, swiglu_route, kNvfp4SwiGluW4a4Tokens),
+        ops::linear_swiglu(hidden, weights.gate_up, activation, text_policy(weights.gate_up),
                            workspace, stream);
-        ops::linear_add(activation, weights.down, residual,
-                        pinned_route_policy(weights.down, route_tokens, kNvfp4ResidualW4a4Tokens),
-                        workspace, stream);
+        ops::linear_add(activation, weights.down, residual, text_policy(weights.down), workspace,
+                        stream);
         return;
     }
     Tensor gate_up = workspace.alloc(DType::BF16, {TextConfig::mtp_mlp_gate_up_rows, cols});

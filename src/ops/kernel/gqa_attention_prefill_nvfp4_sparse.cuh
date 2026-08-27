@@ -4,9 +4,9 @@
 // gqa_attention_prefill_nvfp4.cuh; the K iterator walks a keep_list produced by
 // Sparge meansim (keep_frac, in-CTA) or XAttention (xattn_tau, separate select).
 //
-// XAttention ranking is a prepass (not fused into the MMA CTA). Pack K once to
-// bf16 [kv_head, j, s, d], then score the official inverse reshape on one B=128
-// plane per MMA CTA: A[i,j] = sum_s Q[15-s+i*16]·K[s+j*16] / (√d·S). find_blocks
+// XAttention ranking is a prepass (not fused into the attention CTA). Pack K once to
+// bf16 [kv_head, j, s, d], then score the official inverse reshape for eight B=128
+// planes per score CTA: A[i,j] = sum_s Q[15-s+i*16]·K[s+j*16] / (√d·S). find_blocks
 // softmaxes over L/S, block-sums into paper B=128 (two Bc=64 pages), greedy
 // mass ≥ τ, then expands each kept block to its pages. Force-keep is paper
 // find_blocks_chunked: key block 0, the local diagonal B=128 block, and the
@@ -69,17 +69,19 @@ inline constexpr int kXAttnIRows  = kGqaXattnIRows;
 // Pack is one 64-key page: four warps write the four inverse-stride columns.
 inline constexpr int kXAttnPackWarps   = 4;
 inline constexpr int kXAttnPackThreads = kXAttnPackWarps * 32;
-// Inverse-stride GEMM tile: C[8, BN] += A[8, BK] @ B[BN, BK]ᵀ with M padded to 16.
-// 20 KiB smem → several CTAs/SM. Grid z walks n_j / BN.
-inline constexpr int kXAttnScoreBM      = 16;
-inline constexpr int kXAttnScoreBN      = 64;
+// Eight inverse-stride planes fill four m16n8 MMAs while sharing each B tile.
+// The 48 KiB double buffer admits two CTAs/SM; grid z walks n_j / BN.
+inline constexpr int kXAttnScoreBM      = 64;
+inline constexpr int kXAttnScoreBN      = 128;
 inline constexpr int kXAttnScoreBK      = 64;
 inline constexpr int kXAttnScoreK       = kXAttnStride * kGqaPrefillHeadDim;
 inline constexpr int kXAttnScoreStages  = 2;
-inline constexpr int kXAttnScoreWarpsN  = 4;
+inline constexpr int kXAttnScoreWarpsN  = 8;
 inline constexpr int kXAttnScoreWarps   = kXAttnScoreWarpsN;
 inline constexpr int kXAttnScoreThreads = kXAttnScoreWarps * 32;
-inline constexpr int kXAttnScoreWN      = kXAttnScoreBN / kXAttnScoreWarpsN;
+inline constexpr int kXAttnScoreWN       = kXAttnScoreBN / kXAttnScoreWarpsN;
+inline constexpr int kXAttnScoreBrPerCta = 8;
+inline constexpr int kXAttnScoreMmaM     = kXAttnScoreBM / 16;
 inline constexpr int kXAttnPageCodeBytes  = kGqaPrefillNvfp4Bc * kGqaNvfp4CodeWidth;
 inline constexpr int kXAttnPageScaleBytes = kGqaPrefillNvfp4Bc * kGqaNvfp4Groups;
 inline constexpr int kXAttnScoreSmemBytes =
@@ -93,6 +95,8 @@ static_assert(kGqaXattnFindB == 2 * kGqaXattnPrefillBc);
 static_assert(kGqaPrefillHeadDim == kGqaXattnHeadDim);
 static_assert(kGqaPrefillNvfp4RankTiles == kGqaXattnRankTiles);
 static_assert(kXAttnIRows == 8);
+static_assert(kXAttnScoreBM == kXAttnScoreBrPerCta * kXAttnIRows);
+static_assert(kXAttnScoreMmaM == kXAttnScoreBrPerCta / 2);
 static_assert(kXAttnScoreK == 4096);
 static_assert(kXAttnScoreK % kXAttnScoreBK == 0);
 static_assert(kXAttnScoreBN % kXAttnScoreWN == 0);
@@ -321,15 +325,13 @@ __global__ __launch_bounds__(kXAttnPackThreads, 8) void gqa_xattn_pack_kernel(
 }
 
 // Inverse-stride GEMM: C[i, j] = sum_s Q[15-s+i·S] · packed[j, s] / (√d · S).
-// Grid is (q_head, br, n_j / BN). Same math as the CUDA-core estimate; tensor-core
-// m16n8k16 with M padded to 16.
+// Grid is (q_head, groups-of-eight br, n_j / BN). Each pair of B=128 planes fills
+// both halves of one m16n8k16 MMA and shares the packed-K tile across the group.
 template <typename Geometry, typename Metadata>
-__global__ __launch_bounds__(kXAttnScoreThreads, 4) void gqa_xattn_score_kernel(
+__global__ __launch_bounds__(kXAttnScoreThreads, 2) void gqa_xattn_score_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ packed, Metadata metadata,
     const std::int32_t* __restrict__ positions, float scale, std::int32_t width,
     std::int32_t xattn_min_len, int n_br, int n_j_cap, float* __restrict__ logits) {
-    constexpr int D          = kGqaPrefillHeadDim;
-    constexpr int QRowStride = D * Geometry::QHeads;
     constexpr int BM         = kXAttnScoreBM;
     constexpr int BN         = kXAttnScoreBN;
     constexpr int BK         = kXAttnScoreBK;
@@ -345,30 +347,29 @@ __global__ __launch_bounds__(kXAttnScoreThreads, 4) void gqa_xattn_score_kernel(
     auto* As = reinterpret_cast<__nv_bfloat16*>(xattn_score_smem);
     auto* Bs = As + S * BM * BK;
 
-    const int q_head = static_cast<int>(blockIdx.x);
-    const int br     = static_cast<int>(blockIdx.y);
-    const int tile_n = static_cast<int>(blockIdx.z);
-    const int tid    = static_cast<int>(threadIdx.x);
-    const int warp   = tid >> 5;
-    const int lane   = tid & 31;
-    const int wn     = warp;
-    const int tokens = metadata.valid_tokens(width);
-    if (q_head >= Geometry::QHeads || br >= n_br || tokens <= 0) { return; }
+    const int q_head  = static_cast<int>(blockIdx.x);
+    const int br_base = static_cast<int>(blockIdx.y) * kXAttnScoreBrPerCta;
+    const int tile_n  = static_cast<int>(blockIdx.z);
+    const int tid     = static_cast<int>(threadIdx.x);
+    const int warp    = tid >> 5;
+    const int lane    = tid & 31;
+    const int wn      = warp;
+    const int tokens  = metadata.valid_tokens(width);
+    if (q_head >= Geometry::QHeads || br_base >= n_br || tokens <= 0) { return; }
 
     const int kv_head       = q_head / Geometry::GroupSize;
     const int base_pos      = positions[0];
     const int max_query_abs = base_pos + tokens - 1;
     if (max_query_abs + 1 < xattn_min_len) { return; }
 
-    const int q_start = br * kXAttnBlock;
+    const int q_start = br_base * kXAttnBlock;
     if (q_start >= tokens) { return; }
-    const int q_rows = min(kXAttnBlock, tokens - q_start);
-    const int n_i    = gqa_xattn_n_i_rows(q_rows);
-    if (n_i <= 0) { return; }
-
-    const int q_abs_max = base_pos + q_start + q_rows - 1;
-    const int n_j       = min(n_j_cap, q_abs_max / kXAttnStride + 1);
-    const int n0        = tile_n * BN;
+    const int br_last      = min(br_base + kXAttnScoreBrPerCta - 1, n_br - 1);
+    const int q_start_last = br_last * kXAttnBlock;
+    const int q_rows_last  = min(kXAttnBlock, tokens - q_start_last);
+    const int q_abs_max    = base_pos + q_start_last + q_rows_last - 1;
+    const int n_j = min(n_j_cap, q_abs_max / kXAttnStride + 1);
+    const int n0  = tile_n * BN;
     if (n0 >= n_j) { return; }
 
     const int gid          = lane >> 2;
@@ -380,11 +381,10 @@ __global__ __launch_bounds__(kXAttnScoreThreads, 4) void gqa_xattn_score_kernel(
     const int b_inner_row  = lane & 7;
     const int b_k_offset   = ((lane >> 3) & 1) << 3;
 
-    const __nv_bfloat16* q_block = q + gqa_prefill_q_index<Geometry>(q_head, 0, q_start);
     const __nv_bfloat16* b_base  = packed + gqa_xattn_packed_row(kv_head, n_j_cap, 0, 0);
     const float inv_s            = scale / static_cast<float>(kXAttnStride);
 
-    float accum[NT][4] = {};
+    float accum[kXAttnScoreMmaM][NT][4] = {};
 
     auto stage_inputs = [&](int stage, int k_tile) {
         const int k0  = k_tile * BK;
@@ -394,16 +394,24 @@ __global__ __launch_bounds__(kXAttnScoreThreads, 4) void gqa_xattn_score_kernel(
             const int row = item / (BK / 8);
             const int kk  = (item - row * (BK / 8)) * 8;
             auto* dst     = &a_stage[row * BK + gqa_xattn_gemm_swz(row, kk)];
-            if (row >= n_i) {
+            const int br_delta = row / kXAttnIRows;
+            const int i        = row - br_delta * kXAttnIRows;
+            const int br       = br_base + br_delta;
+            const int q_start  = br * kXAttnBlock;
+            const int q_rows =
+                br < n_br && q_start < tokens ? min(kXAttnBlock, tokens - q_start) : 0;
+            const int n_i = gqa_xattn_n_i_rows(q_rows);
+            if (i >= n_i) {
                 store_vec(dst, make_int4(0, 0, 0, 0));
                 continue;
             }
             const int k     = k0 + kk;
             const int s     = k >> 8;
             const int d     = k & 255;
-            const int q_rel = (kXAttnStride - 1 - s) + row * kXAttnStride;
+            const int q_rel = (kXAttnStride - 1 - s) + i * kXAttnStride;
             if (q_rel < q_rows) {
-                cp_async<16, Cache::cg>(dst, &q_block[q_rel * QRowStride + d]);
+                cp_async<16, Cache::cg>(
+                    dst, &q[gqa_prefill_q_index<Geometry>(q_head, d, q_start + q_rel)]);
             } else {
                 store_vec(dst, make_int4(0, 0, 0, 0));
             }
@@ -437,13 +445,19 @@ __global__ __launch_bounds__(kXAttnScoreThreads, 4) void gqa_xattn_score_kernel(
         }
         __syncthreads();
 
-        unsigned a_frag[2][4];
+        unsigned a_frag[2][kXAttnScoreMmaM][4];
         unsigned b_frag[2][NT][2];
-        auto load_frags = [&](int k_step, unsigned(&a)[4], unsigned(&b)[NT][2]) {
-            const int arow = a_row_offset;
+        auto load_frags = [&](int k_step, unsigned(&a)[kXAttnScoreMmaM][4],
+                              unsigned(&b)[NT][2]) {
             const int acol = k_step * 16 + a_col_offset;
-            ldmatrix_x4(a[0], a[1], a[2], a[3],
-                        smem_addr(&As[stage * BM * BK + arow * BK + gqa_xattn_gemm_swz(arow, acol)]));
+#pragma unroll
+            for (int mma_m = 0; mma_m < kXAttnScoreMmaM; ++mma_m) {
+                const int arow = mma_m * 16 + a_row_offset;
+                ldmatrix_x4(
+                    a[mma_m][0], a[mma_m][1], a[mma_m][2], a[mma_m][3],
+                    smem_addr(&As[stage * BM * BK + arow * BK +
+                                  gqa_xattn_gemm_swz(arow, acol)]));
+            }
 #pragma unroll
             for (int ni = 0; ni < NT; ++ni) {
                 const int brow = wn * WN + ni * 8 + b_inner_row;
@@ -459,10 +473,15 @@ __global__ __launch_bounds__(kXAttnScoreThreads, 4) void gqa_xattn_score_kernel(
             const int slot = k_step & 1;
             if (k_step + 1 < KSUB) { load_frags(k_step + 1, a_frag[slot ^ 1], b_frag[slot ^ 1]); }
 #pragma unroll
-            for (int ni = 0; ni < NT; ++ni) {
-                mma_bf16(accum[ni][0], accum[ni][1], accum[ni][2], accum[ni][3], a_frag[slot][0],
-                         a_frag[slot][1], a_frag[slot][2], a_frag[slot][3], b_frag[slot][ni][0],
-                         b_frag[slot][ni][1]);
+            for (int mma_m = 0; mma_m < kXAttnScoreMmaM; ++mma_m) {
+#pragma unroll
+                for (int ni = 0; ni < NT; ++ni) {
+                    mma_bf16(accum[mma_m][ni][0], accum[mma_m][ni][1],
+                             accum[mma_m][ni][2], accum[mma_m][ni][3],
+                             a_frag[slot][mma_m][0], a_frag[slot][mma_m][1],
+                             a_frag[slot][mma_m][2], a_frag[slot][mma_m][3],
+                             b_frag[slot][ni][0], b_frag[slot][ni][1]);
+                }
             }
         }
 
@@ -478,20 +497,32 @@ __global__ __launch_bounds__(kXAttnScoreThreads, 4) void gqa_xattn_score_kernel(
     for (int ni = 0; ni < NT; ++ni) {
         const int j0 = n0 + wn * WN + ni * 8 + 2 * lid;
         const int j1 = j0 + 1;
-        const int i  = gid;
 #pragma unroll
-        for (int t = 0; t < 2; ++t) {
-            const int j     = t == 0 ? j0 : j1;
-            const float raw = t == 0 ? accum[ni][0] : accum[ni][1];
-            if (j >= n_j) { continue; }
-            float logit = -CUDART_INF_F;
-            if (i < n_i) {
-                const int k_abs_max_j = j * kXAttnStride + (kXAttnStride - 1);
-                const int q_abs_max_i =
-                    base_pos + q_start + min(i * kXAttnStride + (kXAttnStride - 1), q_rows - 1);
-                if (k_abs_max_j <= q_abs_max_i) { logit = raw * inv_s; }
+        for (int br_delta = 0; br_delta < kXAttnScoreBrPerCta; ++br_delta) {
+            const int br      = br_base + br_delta;
+            const int q_start = br * kXAttnBlock;
+            const int q_rows =
+                br < n_br && q_start < tokens ? min(kXAttnBlock, tokens - q_start) : 0;
+            const int n_i = gqa_xattn_n_i_rows(q_rows);
+            if (br >= n_br || q_rows <= 0) { continue; }
+            const int mma_m = br_delta / 2;
+            const int half  = br_delta & 1;
+#pragma unroll
+            for (int t = 0; t < 2; ++t) {
+                const int j = t == 0 ? j0 : j1;
+                const int accumulator = 2 * half + t;
+                const float raw       = accum[mma_m][ni][accumulator];
+                if (j >= n_j) { continue; }
+                float logit = -CUDART_INF_F;
+                if (gid < n_i) {
+                    const int k_abs_max_j = j * kXAttnStride + (kXAttnStride - 1);
+                    const int q_abs_max_i =
+                        base_pos + q_start +
+                        min(gid * kXAttnStride + (kXAttnStride - 1), q_rows - 1);
+                    if (k_abs_max_j <= q_abs_max_i) { logit = raw * inv_s; }
+                }
+                logits[gqa_xattn_logit_index(q_head, n_br, br, gid, n_j_cap, j)] = logit;
             }
-            logits[gqa_xattn_logit_index(q_head, n_br, br, i, n_j_cap, j)] = logit;
         }
     }
 }
