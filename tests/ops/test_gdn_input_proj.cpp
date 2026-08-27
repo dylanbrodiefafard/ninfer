@@ -19,6 +19,7 @@ namespace {
 // This criterion belongs to the complete A16 GDN-input-projection Op.
 constexpr ReductionCriterion kGdnInputProjA16Tolerance{3.0e-3, 4.0e-3, 3.5e-3};
 constexpr ReductionCriterion kGdnInputProjA4Tolerance{0.16, 4.0e-3, 0.16};
+constexpr std::int32_t kGdnInputProjA4SampleRows = 31;
 
 int verify_output_range(std::string_view label, const GuardedBf16Tensor& output,
                         std::int32_t full_rows, std::int32_t output_row_offset,
@@ -124,9 +125,10 @@ int verify_output_range_sampled(std::string_view label, const GuardedBf16Tensor&
                                 const quantized_weight::PackedWeight& weight,
                                 std::int32_t weight_row_offset,
                                 const std::vector<float>& activation, std::int32_t hidden,
-                                std::int32_t tokens, const ReductionCriterion& criterion) {
+                                std::int32_t tokens, const ReductionCriterion& criterion,
+                                std::int32_t sample_count) {
     const std::vector<double> values     = output.values();
-    const std::vector<std::int32_t> rows = sampled_rows(output_rows);
+    const std::vector<std::int32_t> rows = sampled_rows(output_rows, sample_count);
     std::vector<std::int32_t> selected_tokens;
     for (const std::int32_t token :
          {0, 1, tokens / 4, tokens / 2, (3 * tokens) / 4, tokens - 2, tokens - 1}) {
@@ -174,6 +176,7 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
 
     const bool a4                       = policy == ops::LinearPolicy::AllowA4;
     const ReductionCriterion& criterion = a4 ? kGdnInputProjA4Tolerance : kGdnInputProjA16Tolerance;
+    const std::int32_t sample_count     = a4 ? kGdnInputProjA4SampleRows : 7;
     const std::string suffix =
         std::string(" NVFP4 ") + (a4 ? "A4" : "A16") + " T=" + std::to_string(tokens);
     int failures = qkv.verify_guards("gdn qkv" + suffix);
@@ -181,15 +184,17 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     failures += qkv.verify_fully_written("gdn qkv" + suffix);
     failures += z.verify_fully_written("gdn z" + suffix);
     failures += verify_output_range_sampled("gdn query" + suffix, qkv, kQkvRows, 0, 2048,
-                                            parent.host, 0, activation, kHidden, tokens, criterion);
+                                            parent.host, 0, activation, kHidden, tokens, criterion,
+                                            sample_count);
     failures +=
         verify_output_range_sampled("gdn key" + suffix, qkv, kQkvRows, 2048, 2048, parent.host,
-                                    2048, activation, kHidden, tokens, criterion);
+                                    2048, activation, kHidden, tokens, criterion, sample_count);
     failures +=
         verify_output_range_sampled("gdn value" + suffix, qkv, kQkvRows, 4096, 6144, parent.host,
-                                    4096, activation, kHidden, tokens, criterion);
+                                    4096, activation, kHidden, tokens, criterion, sample_count);
     failures += verify_output_range_sampled("gdn z" + suffix, z, kZRows, 0, kZRows, parent.host,
-                                            kQkvRows, activation, kHidden, tokens, criterion);
+                                            kQkvRows, activation, kHidden, tokens, criterion,
+                                            sample_count);
     if (workspace.peak_used() != capacity) {
         std::cerr << "gdn workspace" << suffix << ": query/execution high-water mismatch\n";
         ++failures;
@@ -210,10 +215,9 @@ int run_nvfp4() {
     int failures = 0;
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only);
     failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::A16Only);
-    failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::AllowA4);
-    failures += run_nvfp4_case(parent, 2, ops::LinearPolicy::AllowA4);
-    failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4);
-    failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4);
+    for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 18, 24, 36, 1024}) {
+        failures += run_nvfp4_case(parent, tokens, ops::LinearPolicy::AllowA4);
+    }
     return failures;
 }
 

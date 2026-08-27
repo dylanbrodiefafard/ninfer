@@ -50,24 +50,6 @@ ops::LinearPolicy text_policy(const Weight& weight) {
     return weight.qtype == QType::NVFP4 ? kNvfp4TextPolicy : ops::LinearPolicy::A16Only;
 }
 
-// Packed verify (C>1) launches each column-independent projection once over the aggregate
-// T=width*batch activations. NVFP4 W4A4 routes are selected from that aggregate T, so a C>1
-// round can cross a W4A4 threshold the C=1 (T=width) round does not. The family runtime hands
-// the C=1 width as route_tokens (0 = route by the actual T); this reproduces the C=1
-// quantization family at the single aggregate launch. The W4A4 thresholds follow the NVFP4 plans
-// (ops/linear/nvfp4/nvfp4_dispatch.cpp and ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp).
-constexpr std::int32_t kNvfp4AttnInputW4a4Tokens = 4; // AttnInput: W4A4 at T>=4
-constexpr std::int32_t kNvfp4ResidualW4a4Tokens  = 8; // Residual6144/17408: W4A4 at T>=8
-constexpr std::int32_t kNvfp4SwiGluW4a4Tokens    = 4; // Fused SwiGLU: W4A4 at T>=4
-constexpr std::int32_t kNvfp4SwiGluMaxA16Tokens  = 16; // Fused SwiGLU A16 is registered to T=16
-
-ops::LinearPolicy pinned_route_policy(const Weight& weight, std::int32_t route_tokens,
-                                     std::int32_t w4a4_tokens) {
-    const ops::LinearPolicy base = text_policy(weight);
-    if (base != ops::LinearPolicy::AllowA4 || route_tokens <= 0) { return base; }
-    return route_tokens < w4a4_tokens ? ops::LinearPolicy::A16Only : base;
-}
-
 constexpr std::size_t kMinimumLeafWorkspaceBytes = 1;
 
 std::size_t gdn_record_workspace_bytes(const Tensor& hidden,
@@ -198,25 +180,22 @@ void Variant::attention_projection(const Tensor& hidden,
                                    const FullAttentionProjectionWeights& weights, Tensor& query,
                                    Tensor& gate, Tensor& key, Tensor& value, qwen3_6::TextPhase,
                                    WorkspaceArena& workspace, cudaStream_t stream,
-                                   std::int32_t route_tokens) {
+                                   std::int32_t) {
     if (const auto* split = std::get_if<SplitAttentionProjectionPayload>(&weights)) {
         ops::attn_input_proj(hidden, split->query_key, split->gate_value, query, gate, key, value,
                              stream);
         return;
     }
     const Weight& fused = std::get<FusedAttentionProjectionPayload>(weights).query_key_gate_value;
-    ops::attn_input_proj(hidden, fused, query, gate, key, value,
-                         pinned_route_policy(fused, route_tokens, kNvfp4AttnInputW4a4Tokens),
-                         workspace, stream);
+    ops::attn_input_proj(hidden, fused, query, gate, key, value, text_policy(fused), workspace,
+                         stream);
 }
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
                                           Tensor& residual, qwen3_6::TextPhase,
                                           WorkspaceArena& workspace, cudaStream_t stream,
-                                          std::int32_t route_tokens) {
-    ops::linear_add(attention, weight, residual,
-                    pinned_route_policy(weight, route_tokens, kNvfp4ResidualW4a4Tokens), workspace,
-                    stream);
+                                          std::int32_t) {
+    ops::linear_add(attention, weight, residual, text_policy(weight), workspace, stream);
 }
 
 void Variant::mtp_attention_projection(const Tensor& hidden,
@@ -362,10 +341,8 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
 
 void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
                                     qwen3_6::TextPhase, WorkspaceArena& workspace,
-                                    cudaStream_t stream, std::int32_t route_tokens) {
-    ops::linear_add(hidden, weight, residual,
-                    pinned_route_policy(weight, route_tokens, kNvfp4ResidualW4a4Tokens), workspace,
-                    stream);
+                                    cudaStream_t stream, std::int32_t) {
+    ops::linear_add(hidden, weight, residual, text_policy(weight), workspace, stream);
 }
 
 void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& norm_weight,
@@ -379,19 +356,13 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          qwen3_6::TextPhase, WorkspaceArena& workspace, cudaStream_t stream,
-                         std::int32_t route_tokens) {
+                         std::int32_t) {
     auto scope        = workspace.scope();
     Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
-    // The SwiGLU A16 route is registered only through T=16; pin it only where it exists.
-    const std::int32_t swiglu_route =
-        hidden.ne[1] <= kNvfp4SwiGluMaxA16Tokens ? route_tokens : 0;
     ops::linear_swiglu(hidden, weights.gate_up, activation,
-                       pinned_route_policy(weights.gate_up, swiglu_route,
-                                           kNvfp4SwiGluW4a4Tokens),
-                       workspace, stream);
-    ops::linear_add(activation, weights.down, residual,
-                    pinned_route_policy(weights.down, route_tokens, kNvfp4ResidualW4a4Tokens),
-                    workspace, stream);
+                       text_policy(weights.gate_up), workspace, stream);
+    ops::linear_add(activation, weights.down, residual, text_policy(weights.down), workspace,
+                    stream);
 }
 
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,

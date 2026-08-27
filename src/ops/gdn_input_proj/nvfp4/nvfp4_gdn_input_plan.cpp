@@ -17,7 +17,9 @@ enum class Nvfp4GdnInputRoute : std::uint8_t {
 Nvfp4GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 gdn_input_proj: T must be positive"); }
     if (policy == LinearPolicy::A16Only) { return Nvfp4GdnInputRoute::A16; }
-    if (policy == LinearPolicy::AllowA4) { return Nvfp4GdnInputRoute::W4A4; }
+    if (policy == LinearPolicy::AllowA4) {
+        return tokens >= 3 ? Nvfp4GdnInputRoute::W4A4 : Nvfp4GdnInputRoute::A16;
+    }
     throw std::invalid_argument("nvfp4 gdn_input_proj: unsupported policy");
 }
 

@@ -11,9 +11,10 @@ namespace {
 
 using Geometry = Nvfp4GdnInputGeometry;
 
-using M32N64                      = Nvfp4W4a4MmaSchedule<32, 64, 256, 2, 4, 2, 2>;
+using M32N64                      = Nvfp4W4a4MmaSchedule<32, 64, 256, 2, 4, 4, 1>;
 using M32N128                     = Nvfp4W4a4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
 using M64N128                     = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
+using M64N128S3                   = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 3, 1>;
 using M128N128Pipelined           = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
 using M128N128Resident            = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
 constexpr std::int32_t kTmaBlockM = 256;
@@ -27,22 +28,11 @@ void launch_gemm(const Weight& weight, Tensor& qkv, Tensor& z, Nvfp4W4a4Workspac
     const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
     const Nvfp4GdnInputOutput output{static_cast<__nv_bfloat16*>(qkv.data),
                                      static_cast<__nv_bfloat16*>(z.data)};
-    // T<=4 (one-shot verify/decode weight stream): mark the weight cp.async L2::evict_first so
-    // the streaming GEMV weights don't pollute the L2 set of downstream re-read consumers (see
-    // Cache::EvictFirst). Larger T re-reads weight tiles across M-blocks -> keep cg.
-    if (tokens <= 4) {
-        nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, Nvfp4GdnInputOutput,
-                              Nvfp4W4a4IdentityRows, false, Cache::EvictFirst>
-            <<<grid, Schedule::kThreads, 0, stream>>>(
-                activation, static_cast<const std::uint8_t*>(weight.qdata),
-                static_cast<const std::uint8_t*>(weight.scales), tokens, alpha,
-                Nvfp4IdentityEpilogue{}, output);
-    } else {
-        nvfp4_w4a4_mma_kernel<Geometry, Schedule><<<grid, Schedule::kThreads, 0, stream>>>(
+    nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, Nvfp4GdnInputOutput>
+        <<<grid, Schedule::kThreads, 0, stream>>>(
             activation, static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), tokens, alpha, Nvfp4IdentityEpilogue{},
-            output);
-    }
+            static_cast<const std::uint8_t*>(weight.scales), tokens, alpha,
+            Nvfp4IdentityEpilogue{}, output);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -58,8 +48,10 @@ void nvfp4_gdn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& 
             workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(qkv.data),
             static_cast<__nv_bfloat16*>(z.data), tokens, alpha, stream);
-    } else if (tokens <= 64) {
+    } else if (tokens <= 32) {
         launch_gemm<M32N64>(weight, qkv, z, workspace, tokens, stream);
+    } else if (tokens <= 64) {
+        launch_gemm<M64N128S3>(weight, qkv, z, workspace, tokens, stream);
     } else if (tokens <= 96) {
         launch_gemm<M32N128>(weight, qkv, z, workspace, tokens, stream);
     } else if (tokens <= 128) {

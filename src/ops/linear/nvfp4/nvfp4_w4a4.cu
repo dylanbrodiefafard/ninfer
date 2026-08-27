@@ -13,9 +13,12 @@
 namespace ninfer::ops::detail {
 namespace {
 
-using M32N64                      = Nvfp4W4a4MmaSchedule<32, 64, 256, 2, 4, 2, 2>;
+using M32N64S3                    = Nvfp4W4a4MmaSchedule<32, 64, 256, 2, 4, 3, 2>;
+using M32N64S4                    = Nvfp4W4a4MmaSchedule<32, 64, 256, 2, 4, 4, 1>;
 using M32N128                     = Nvfp4W4a4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
+using M64N64                      = Nvfp4W4a4MmaSchedule<64, 64, 256, 4, 2, 2, 1>;
 using M64N128                     = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
+using M64N128S3                   = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 3, 1>;
 using M128N128Pipelined           = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
 using M128N128Resident            = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
 constexpr std::int32_t kTmaBlockM = 256;
@@ -29,22 +32,10 @@ void launch_gemm(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace workspace
     const Nvfp4ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data),
                                        Geometry::kOutputRows};
     const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
-    // T<=4 (one-shot verify/decode weight stream): mark the weight cp.async L2::evict_first so
-    // the streaming GEMV weights don't pollute the L2 set of downstream re-read consumers (see
-    // Cache::EvictFirst). Larger T re-reads weight tiles across M-blocks -> keep cg.
-    if (tokens <= 4) {
-        nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, Nvfp4ContiguousOutput,
-                              Nvfp4W4a4IdentityRows, false, Cache::EvictFirst>
-            <<<grid, Schedule::kThreads, 0, stream>>>(
-                activation, static_cast<const std::uint8_t*>(weight.qdata),
-                static_cast<const std::uint8_t*>(weight.scales), tokens, alpha,
-                Nvfp4IdentityEpilogue{}, output);
-    } else {
-        nvfp4_w4a4_mma_kernel<Geometry, Schedule><<<grid, Schedule::kThreads, 0, stream>>>(
-            activation, static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), tokens, alpha, Nvfp4IdentityEpilogue{},
-            output);
-    }
+    nvfp4_w4a4_mma_kernel<Geometry, Schedule><<<grid, Schedule::kThreads, 0, stream>>>(
+        activation, static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), tokens, alpha, Nvfp4IdentityEpilogue{},
+        output);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -73,8 +64,24 @@ void launch_problem(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace worksp
             workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(out.data),
             tokens, alpha, stream);
+    } else if (tokens <= 32) {
+        if constexpr (std::is_same_v<Geometry, Nvfp4AttnInputGeometry>) {
+            launch_gemm<Geometry, M32N64S3>(weight, out, workspace, tokens, stream);
+        } else if constexpr (std::is_same_v<Geometry, Nvfp4MlpGateUpGeometry>) {
+            launch_gemm<Geometry, M32N128>(weight, out, workspace, tokens, stream);
+        } else {
+            launch_gemm<Geometry, M32N64S4>(weight, out, workspace, tokens, stream);
+        }
     } else if (tokens <= 64) {
-        launch_gemm<Geometry, M32N64>(weight, out, workspace, tokens, stream);
+        if constexpr (std::is_same_v<Geometry, Nvfp4AttnInputGeometry>) {
+            launch_gemm<Geometry, M64N64>(weight, out, workspace, tokens, stream);
+        } else if constexpr (std::is_same_v<Geometry, Nvfp4GdnInputGeometry>) {
+            launch_gemm<Geometry, M64N128S3>(weight, out, workspace, tokens, stream);
+        } else if constexpr (std::is_same_v<Geometry, Nvfp4MlpGateUpGeometry>) {
+            launch_gemm<Geometry, M64N128>(weight, out, workspace, tokens, stream);
+        } else {
+            launch_gemm<Geometry, M32N64S4>(weight, out, workspace, tokens, stream);
+        }
     } else if (tokens <= 96) {
         launch_gemm<Geometry, M32N128>(weight, out, workspace, tokens, stream);
     } else if (tokens <= 128) {
