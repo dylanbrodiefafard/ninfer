@@ -362,6 +362,20 @@ int test_explicit_rejections() {
     failures += check(api_code([&] { (void)parse_responses_request(too_small, limits()); }) ==
                           "invalid_value",
                       "OpenAI minimum max_output_tokens enforced");
+
+    Json pin          = base;
+    pin["ninfer"]     = Json{{"capture_context_checkpoint", true}};
+    failures += check(parse_responses_request(pin, limits()).generation.capture_context_checkpoint,
+                      "Responses ninfer capture flag parsed");
+    Json ninfer_null          = base;
+    ninfer_null["ninfer"]     = nullptr;
+    failures += check(!parse_responses_request(ninfer_null, limits()).generation.capture_context_checkpoint,
+                      "Responses ninfer null is omit");
+    Json unknown_ninfer          = base;
+    unknown_ninfer["ninfer"]     = Json{{"capture_context_checkpoint", true}, {"foo", 1}};
+    failures += check(api_code([&] { (void)parse_responses_request(unknown_ninfer, limits()); }) ==
+                          "ninfer_option_not_supported",
+                      "Responses unknown ninfer key rejected");
     return failures;
 }
 
@@ -523,6 +537,19 @@ int test_input_tokens_schema() {
                       limits());
               }) == "unknown_parameter",
               "input_tokens accepts only model and input");
+    failures += check(!parse_response_input_tokens_request(
+                              Json{{"model", "qwen3.6-27b"}, {"input", "hello"}, {"ninfer", nullptr}},
+                              limits())
+                              .generation.capture_context_checkpoint,
+                      "input_tokens allows ninfer null");
+    failures += check(throws_api([&] {
+                          (void)parse_response_input_tokens_request(
+                              Json{{"model", "qwen3.6-27b"},
+                                   {"input", "hello"},
+                                   {"ninfer", Json{{"capture_context_checkpoint", true}}}},
+                              limits());
+                      }),
+                      "input_tokens rejects ninfer object");
     return failures;
 }
 

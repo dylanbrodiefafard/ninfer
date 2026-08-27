@@ -103,7 +103,8 @@ std::string usage_text(const char* argv0) {
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking]\n"
            "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
-           "       [--no-cuda-graph]\n"
+           "       [--vision] [--no-cuda-graph] [--capture-context-checkpoint]\n"
+           "       [--context-checkpoints off|a,b,c]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
@@ -113,6 +114,10 @@ std::string usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom.\n"
            "--kv-ram-capacity sets pinned host KV prefix-cache capacity in MiB (default off).\n"
+           "--context-checkpoints off disables the automatic prefill ladder; a comma list "
+           "replaces the default marks and requires --spec mtp or dflash.\n"
+           "--capture-context-checkpoint pins the current resume frontier on an exact-hit "
+           "(no-op on a fresh one-shot run).\n"
            "Sampling defaults come from the loaded model and thinking mode; flags override "
            "individual fields.\n";
 }
@@ -180,6 +185,10 @@ Options parse_options(int argc, char** argv) {
             options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--capture-context-checkpoint") {
+            options.capture_context_checkpoint = true;
+        } else if (arg == "--context-checkpoints") {
+            options.context_checkpoint_marks = parse_context_checkpoint_marks_flag(value(arg));
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {

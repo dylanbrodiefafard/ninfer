@@ -61,6 +61,23 @@ struct MediaInputPermit {
     std::shared_ptr<MediaInputCapacity> capacity;
 };
 
+void reject_unavailable_context_checkpoint_capture(bool capture_requested,
+                                                   bool allow_prefix_reuse,
+                                                   ninfer::SpeculativeBackend spec) {
+    if (!capture_requested ||
+        ninfer::context_checkpoint_capture_available(allow_prefix_reuse, spec)) {
+        return;
+    }
+    ApiError error;
+    error.status  = 400;
+    error.type    = "invalid_request_error";
+    error.code    = "context_checkpoint_unavailable";
+    error.param   = "ninfer.capture_context_checkpoint";
+    error.message =
+        "capture_context_checkpoint requires prefix reuse and --spec mtp or dflash";
+    throw ApiException(std::move(error));
+}
+
 ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
     ApiError error;
     error.param   = "messages";
@@ -249,6 +266,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.max_context          = options_.max_context;
     engine_options.kv_capacity          = options_.kv_capacity;
     engine_options.kv_ram_capacity_bytes = options_.kv_ram_capacity_bytes;
+    engine_options.context_checkpoint_marks = options_.context_checkpoint_marks;
     engine_options.max_concurrency      = options_.max_concurrency;
     engine_options.max_pending_requests = options_.max_pending_requests;
     engine_options.pending_timeout_ms   = options_.pending_timeout_ms;
@@ -328,6 +346,9 @@ GenerationService::acquire_media_input(Clock::time_point deadline,
 
 PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            std::function<bool()> is_cancelled) const {
+    reject_unavailable_context_checkpoint_capture(request.capture_context_checkpoint,
+                                                  options_.allow_prefix_reuse,
+                                                  options_.speculative.backend);
     PreparedRequest prepared;
     ninfer::RequestOptions request_options = to_request_options(request, options_);
     prepared.include_usage                 = request.include_usage;

@@ -2,6 +2,7 @@
 #include "serve/translate.h"
 
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -114,6 +115,35 @@ int main() {
          "--kv-capacity", "8192", "--log-stats-interval-ms", "0", "--preserve-thinking"});
     failures += check(!configured.allow_prefix_reuse,
                       "--no-prefix-reuse did not disable server prefix reuse");
+    const ServeOptions off_marks =
+        parse({"ninfer-serve", "model.ninfer", "--context-checkpoints", "off"});
+    failures += check(off_marks.context_checkpoint_marks.has_value() &&
+                          off_marks.context_checkpoint_marks->empty(),
+                      "--context-checkpoints off did not disable the ladder");
+    const ServeOptions custom_marks =
+        parse({"ninfer-serve", "model.ninfer", "--context-checkpoints", "8192,16384"});
+    failures += check(custom_marks.context_checkpoint_marks ==
+                          std::optional<std::vector<std::uint32_t>>(std::vector<std::uint32_t>{8192u, 16384u}),
+                      "--context-checkpoints custom list was not parsed");
+    bool bad_marks = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--context-checkpoints", "16384,8192"});
+    } catch (const std::invalid_argument&) { bad_marks = true; }
+    failures += check(bad_marks, "non-increasing context-checkpoints was accepted");
+    bool zero_mark = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--context-checkpoints", "0"});
+    } catch (const std::invalid_argument&) { zero_mark = true; }
+    failures += check(zero_mark, "zero context-checkpoint mark was accepted");
+    bool too_many = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--context-checkpoints",
+                     "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17"});
+    } catch (const std::invalid_argument&) { too_many = true; }
+    failures += check(too_many, "17 context-checkpoint marks were accepted");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--context-checkpoints") != std::string::npos,
+              "serve help omits --context-checkpoints");
     failures += check(configured.enable_vision, "--vision did not enable Vision");
     failures +=
         check(configured.preserve_thinking, "--preserve-thinking did not reach serving options");
@@ -169,6 +199,11 @@ int main() {
                       "default server policy did not reach Engine options");
     failures += check(!to_request_options(request, configured).execution.allow_prefix_reuse,
                       "disabled server policy did not reach Engine options");
+    request.capture_context_checkpoint = true;
+    failures +=
+        check(to_request_options(request, defaults).execution.capture_context_checkpoint,
+              "request capture_context_checkpoint did not reach Engine options");
+    request.capture_context_checkpoint = false;
     const ninfer::RequestOptions inherited_sampling = to_request_options(request, sampling);
     failures += check(inherited_sampling.execution.sampling.temperature == 0.0F &&
                           inherited_sampling.execution.sampling.top_p == 0.9F &&

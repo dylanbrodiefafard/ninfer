@@ -25,6 +25,7 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
         runtime::resolve_sampling(defaults, mode, options.execution.sampling);
     resolved.execution.requested_output_tokens = options.execution.requested_output_tokens;
     resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
+    resolved.execution.capture_context_checkpoint = options.execution.capture_context_checkpoint;
     resolved.stop                              = std::move(options.stop);
     resolved.output                            = options.output;
     return resolved;
@@ -277,6 +278,12 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             context_capacity_error(prompt_summary.prompt_tokens, impl_->options.max_context));
     }
     const double prepare_seconds = prompt.impl_->prepare_seconds;
+    if (resolved_options.execution.capture_context_checkpoint &&
+        !context_checkpoint_capture_available(resolved_options.execution.allow_prefix_reuse,
+                                              impl_->options.speculative.backend)) {
+        throw std::invalid_argument(
+            "capture_context_checkpoint requires prefix reuse and a speculative backend");
+    }
     if (resolved_options.execution.requested_output_tokens == 0) {
         struct ImmediateSubmission {
             GenerationResult result;

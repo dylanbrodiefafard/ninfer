@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::detail {
@@ -36,11 +37,50 @@ inline constexpr std::array<std::uint32_t, 6> kPrefillContextMarks = {
     24576u, 36864u, 53248u, 77824u, 102400u, 151552u};
 
 [[nodiscard]] constexpr std::optional<std::uint32_t>
-next_prefill_context_mark(std::uint32_t frontier) noexcept {
-    for (const std::uint32_t mark : kPrefillContextMarks) {
+next_prefill_context_mark(std::uint32_t frontier, std::span<const std::uint32_t> marks) noexcept {
+    for (const std::uint32_t mark : marks) {
         if (mark > frontier) { return mark; }
     }
     return std::nullopt;
+}
+
+[[nodiscard]] constexpr std::optional<std::uint32_t>
+next_prefill_context_mark(std::uint32_t frontier) noexcept {
+    return next_prefill_context_mark(frontier, kPrefillContextMarks);
+}
+
+[[nodiscard]] constexpr std::uint32_t
+first_prefill_context_mark(std::span<const std::uint32_t> marks) noexcept {
+    return marks.empty() ? 0 : marks.front();
+}
+
+[[nodiscard]] inline std::vector<std::uint32_t> resolved_prefill_context_marks(
+    const std::optional<std::vector<std::uint32_t>>& configured) {
+    if (!configured) {
+        return {kPrefillContextMarks.begin(), kPrefillContextMarks.end()};
+    }
+    return *configured;
+}
+
+inline void validate_configured_context_checkpoint_marks(
+    const std::optional<std::vector<std::uint32_t>>& configured, ninfer::SpeculativeBackend spec) {
+    if (!configured) { return; }
+    const std::vector<std::uint32_t>& marks = *configured;
+    if (marks.size() > ninfer::kMaxContextCheckpointMarks) {
+        throw std::invalid_argument("context-checkpoint mark table accepts at most 16 marks");
+    }
+    std::uint32_t previous = 0;
+    for (const std::uint32_t mark : marks) {
+        if (mark == 0 || mark <= previous) {
+            throw std::invalid_argument(
+                "context-checkpoint marks must be strictly increasing and greater than 0");
+        }
+        previous = mark;
+    }
+    if (!marks.empty() && spec == SpeculativeBackend::None) {
+        throw std::invalid_argument(
+            "custom context-checkpoint marks require speculative backend mtp or dflash");
+    }
 }
 
 // Prefill ladder capture follows `--no-prefix-reuse` and requires MTP or DFlash.
@@ -108,6 +148,22 @@ advertised_context_checkpoint_frontier(std::uint32_t chunk_end) noexcept {
     bool prefix_items_complete) noexcept {
     if (reuse != ninfer::PrefixReusePath::AppendAtFrontier) { return false; }
     if (execution_frontier == 0 || prompt_tokens <= execution_frontier) { return false; }
+    if (!capture_enabled || !tail_hidden_valid || already_has_head_at_e || !prefix_items_complete) {
+        return false;
+    }
+    return true;
+}
+
+// Occupy-time exact-hit / decode-only pin. Independent of reuse path; does not
+// replace should_capture_turn_rollback (auto still requires AppendAtFrontier
+// and prompt_tokens > E).
+[[nodiscard]] constexpr bool should_capture_exact_hit_pin(
+    bool request_pin, std::uint32_t execution_frontier, std::uint32_t prompt_tokens,
+    bool capture_enabled, bool tail_hidden_valid, bool already_has_head_at_e,
+    bool prefix_items_complete) noexcept {
+    if (!request_pin || execution_frontier == 0 || prompt_tokens != execution_frontier) {
+        return false;
+    }
     if (!capture_enabled || !tail_hidden_valid || already_has_head_at_e || !prefix_items_complete) {
         return false;
     }

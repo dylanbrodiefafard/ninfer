@@ -1,5 +1,6 @@
 #pragma once
 
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -10,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -18,6 +20,41 @@ namespace ninfer {
 using TokenId = std::int32_t;
 
 inline constexpr std::uint32_t kMaximumConcurrency = 8;
+inline constexpr std::size_t kMaxContextCheckpointMarks = 16;
+
+[[nodiscard]] inline std::vector<std::uint32_t>
+parse_context_checkpoint_marks_flag(std::string_view raw,
+                                    const char* flag = "--context-checkpoints") {
+    if (raw == "off") { return {}; }
+    if (raw.empty()) {
+        throw std::invalid_argument(std::string(flag) + " must be off or a comma-separated list");
+    }
+    std::vector<std::uint32_t> marks;
+    std::size_t begin = 0;
+    while (true) {
+        const std::size_t comma = raw.find(',', begin);
+        const std::string_view token =
+            comma == std::string_view::npos ? raw.substr(begin) : raw.substr(begin, comma - begin);
+        if (token.empty()) {
+            throw std::invalid_argument(std::string(flag) + " contains an empty mark");
+        }
+        std::uint32_t value = 0;
+        const auto parsed   = std::from_chars(token.data(), token.data() + token.size(), value);
+        if (parsed.ec != std::errc{} || parsed.ptr != token.data() + token.size() || value == 0) {
+            throw std::invalid_argument(std::string(flag) + " marks must be positive integers");
+        }
+        if (!marks.empty() && value <= marks.back()) {
+            throw std::invalid_argument(std::string(flag) + " marks must be strictly increasing");
+        }
+        if (marks.size() >= kMaxContextCheckpointMarks) {
+            throw std::invalid_argument(std::string(flag) + " accepts at most 16 marks");
+        }
+        marks.push_back(value);
+        if (comma == std::string_view::npos) { break; }
+        begin = comma + 1;
+    }
+    return marks;
+}
 
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
@@ -59,6 +96,11 @@ enum class SpeculativeBackend : std::uint8_t {
     DFlash,
 };
 
+[[nodiscard]] constexpr bool context_checkpoint_capture_available(
+    bool allow_prefix_reuse, SpeculativeBackend spec) noexcept {
+    return allow_prefix_reuse && spec != SpeculativeBackend::None;
+}
+
 struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     std::uint32_t draft_tokens = 0;
@@ -81,6 +123,8 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 4096;
     std::size_t kv_ram_capacity_bytes  = 0;
+    // nullopt = default prefill ladder; empty = disable automatic ladder (`off`).
+    std::optional<std::vector<std::uint32_t>> context_checkpoint_marks;
     KvCacheStorage kv_cache            = KvCacheStorage::Nvfp4;
     // Sage3-style FP4-PV compute recipe (SageAttention3): only issuable with KvCacheStorage::Nvfp4.
     bool sage_attn                     = false;
@@ -200,6 +244,7 @@ struct ExecutionOptions {
     SamplingOverrides sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
+    bool capture_context_checkpoint       = false;
 };
 
 struct OutputOptions {
@@ -437,7 +482,8 @@ struct GenerationResult {
     // Absolute staged-checkpoint head frontiers this request restored or wrote;
     // 0 if none. restored is the matching ladder or turn-rollback F (the same
     // length as reused_prompt_tokens on those paths). captured is the advertised
-    // ladder freeze or occupy-append rollback pin written this request.
+    // ladder freeze, occupy-append rollback pin, or exact-hit request pin written
+    // this request.
     std::uint32_t captured_context_checkpoint_tokens = 0;
     std::uint32_t restored_context_checkpoint_tokens = 0;
     // CUDA D2H/H2D elapsed for this request's admission spills and RAM restore.

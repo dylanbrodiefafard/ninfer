@@ -76,6 +76,13 @@ struct StreamSink {
 // Translate Engine request failures into the shared protocol-neutral HTTP error contract.
 ApiError request_error_to_api_error(const ninfer::RequestError& exception);
 
+// HTTP 400 owner for capture_context_checkpoint on a server that cannot pin.
+// Throws before Engine submit. No-op when capture is not requested, or when
+// prefix reuse and a speculative backend are both available.
+void reject_unavailable_context_checkpoint_capture(bool capture_requested,
+                                                   bool allow_prefix_reuse,
+                                                   ninfer::SpeculativeBackend spec);
+
 // Preparation ends by synchronously submitting the owning prompt to the Engine FIFO. The returned
 // request keeps its ingress/response lifetime reservation until the HTTP response is released and
 // is consumed exactly once by run().

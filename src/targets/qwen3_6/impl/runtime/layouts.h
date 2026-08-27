@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 
@@ -80,6 +81,7 @@ struct SequencePlanningInputs {
     bool use_cuda_graph = true;
     int device          = 0;
     std::size_t kv_ram_capacity_bytes = 0;
+    std::vector<std::uint32_t> context_checkpoint_marks;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
@@ -108,6 +110,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     bool use_cuda_graph = true;
     int device          = 0;
     std::size_t kv_ram_capacity_bytes = 0;
+    std::vector<std::uint32_t> context_checkpoint_marks;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;
     std::size_t request_transient_capacity_bytes = 0;

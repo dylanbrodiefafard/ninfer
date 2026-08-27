@@ -19,6 +19,7 @@
 #include <iostream>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -457,6 +458,44 @@ void test_prefill_context_marks() {
     expect(!q36::detail::capture_prefill_context_checkpoints(false, false),
            "reuse-off and ordinary does not capture");
 
+    const std::array<std::uint32_t, 2> custom{8192u, 16384u};
+    expect(q36::detail::next_prefill_context_mark(8000, custom) == 8192u, "custom next mark");
+    expect(q36::detail::next_prefill_context_mark(8192, custom) == 16384u, "custom mark at freeze");
+    expect(!q36::detail::next_prefill_context_mark(16384, custom).has_value(),
+           "custom table exhausted");
+    expect(!q36::detail::next_prefill_context_mark(0, std::span<const std::uint32_t>{}).has_value(),
+           "off table has no next mark");
+    expect(q36::detail::next_prefill_context_mark(30000) == 36864u,
+           "rollback-only restore at 30000 does not re-arm 24576");
+    expect(!q36::detail::next_prefill_context_mark(30000, std::span<const std::uint32_t>{}).has_value(),
+           "off table after restore at 30000 stays inert");
+    expect(q36::detail::retain_context_checkpoint_head(24576, 30000) &&
+               q36::detail::next_prefill_context_mark(30000) == 36864u,
+           "drop_after occupy frontier 30000 keeps a 24576 ladder head but latches 36864");
+    expect(!q36::detail::should_freeze_prefill_context_checkpoint(true, true, 32768, 151552, false,
+                                                                 true),
+           "mark at or past max_context stays inert");
+    q36::detail::validate_configured_context_checkpoint_marks(
+        std::vector<std::uint32_t>{151552u}, ninfer::SpeculativeBackend::Mtp);
+    expect(q36::detail::first_prefill_context_mark({}) == 0, "off table first mark is 0");
+    expect(q36::detail::first_prefill_context_mark(custom) == 8192u, "custom first mark");
+    expect(q36::detail::resolved_prefill_context_marks(std::nullopt).size() == 6,
+           "omitted table is the product default");
+    expect(q36::detail::resolved_prefill_context_marks(std::vector<std::uint32_t>{}).empty(),
+           "empty configured table is off");
+    q36::detail::validate_configured_context_checkpoint_marks(std::nullopt,
+                                                              ninfer::SpeculativeBackend::None);
+    q36::detail::validate_configured_context_checkpoint_marks(std::vector<std::uint32_t>{},
+                                                              ninfer::SpeculativeBackend::None);
+    bool custom_without_spec = false;
+    try {
+        q36::detail::validate_configured_context_checkpoint_marks(
+            std::vector<std::uint32_t>{8192u}, ninfer::SpeculativeBackend::None);
+    } catch (const std::invalid_argument&) { custom_without_spec = true; }
+    expect(custom_without_spec, "custom marks without spec are rejected");
+    q36::detail::validate_configured_context_checkpoint_marks(std::vector<std::uint32_t>{8192u},
+                                                              ninfer::SpeculativeBackend::Mtp);
+
     expect(q36::detail::retain_context_checkpoint_head(12288, 12288), "keep head at restore F");
     expect(q36::detail::retain_context_checkpoint_head(8192, 12288), "keep heads before F");
     expect(!q36::detail::retain_context_checkpoint_head(24576, 12288), "drop heads after F");
@@ -656,6 +695,30 @@ void test_prefill_context_marks() {
     expect(!q36::detail::should_capture_turn_rollback(Path::AppendAtFrontier, 1000, 1000, true, true,
                                                       false, true),
            "exact-hit append does not replace an older rollback pin");
+    expect(q36::detail::should_capture_exact_hit_pin(true, 1000, 1000, true, true, false, true),
+           "exact-hit flag pins at E");
+    expect(!q36::detail::should_capture_turn_rollback(Path::RestoreTurnCheckpoint, 1000, 1000, true,
+                                                      true, false, true),
+           "rewrite exact-hit does not auto-pin");
+    expect(!q36::detail::should_capture_turn_rollback(Path::RestoreTurnCheckpoint, 1000, 1200, true,
+                                                      true, false, true),
+           "rewrite suffix does not auto-pin");
+    expect(!q36::detail::should_capture_turn_rollback(Path::RestoreContextCheckpoint, 1000, 1000,
+                                                      true, true, false, true),
+           "staged exact-hit does not auto-pin");
+    expect(!q36::detail::should_capture_turn_rollback(Path::RestoreTurnRollback, 1000, 1000, true,
+                                                      true, false, true),
+           "rollback exact-hit does not auto-pin");
+    expect(!q36::detail::should_capture_exact_hit_pin(false, 1000, 1000, true, true, false, true),
+           "exact-hit without flag does not pin");
+    expect(!q36::detail::should_capture_exact_hit_pin(true, 0, 0, true, true, false, true),
+           "exact-hit E==0 does not pin");
+    expect(!q36::detail::should_capture_exact_hit_pin(true, 1000, 1200, true, true, false, true),
+           "flag does not pin a suffix occupy");
+    expect(!q36::detail::should_capture_exact_hit_pin(true, 1000, 1000, true, true, true, true),
+           "exact-hit skips when a head already sits at E");
+    expect(!q36::detail::should_capture_exact_hit_pin(true, 1000, 1000, false, true, false, true),
+           "exact-hit without capture gate does not pin");
     expect(!q36::detail::should_capture_turn_rollback(Path::AppendAtFrontier, 0, 100, true, true,
                                                       false, true),
            "first-visit E==0 does not pin rollback");

@@ -75,6 +75,7 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::size_t vision_transient_bytes = 0;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
     bool allow_prefix_reuse = false;
+    bool capture_context_checkpoint = false;
 };
 
 template <>
@@ -95,6 +96,7 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     PrefixReuseSource reuse_source            = PrefixReuseSource::None;
     std::uint64_t ram_entry_id                = 0;
     bool capture_context_checkpoints          = false;
+    bool capture_context_checkpoint           = false;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail
@@ -236,7 +238,7 @@ struct SequenceState {
     std::uint64_t use_tick        = 0;
     RewriteCheckpoint rewrite_checkpoint;
     std::vector<ContextCheckpointHead> context_checkpoints;
-    std::uint32_t next_context_mark = qwen3_6::detail::kPrefillContextMarks.front();
+    std::uint32_t next_context_mark = 0;
 };
 
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
@@ -358,6 +360,7 @@ public:
     const std::uint32_t draft_window;
     const std::uint32_t dflash_verify_width;
     const SpeculativeBackend speculative_backend;
+    const std::vector<std::uint32_t> context_marks;
     const DType kv_dtype;
     const std::int32_t kv_quant_group;
     const ProposalHead proposal_head;
@@ -484,8 +487,9 @@ private:
     void maybe_freeze_context_checkpoint(SequenceState& sequence, RequestControl& request,
                                          std::uint32_t chunk_tokens);
     void maybe_capture_turn_rollback(SequenceState& sequence, RequestControl& request,
-                                     const PreparedPromptData& prompt, std::uint32_t base,
-                                     std::uint32_t prompt_tokens, bool capture_enabled);
+                                     const PreparedPromptData& prompt, ReusePath reuse,
+                                     std::uint32_t base, std::uint32_t prompt_tokens,
+                                     bool capture_enabled, bool request_pin);
     void restore_context_checkpoint_state(SequenceState& sequence, std::uint32_t base);
     void restore_dflash_cyclic_from_head(SequenceState& sequence, const ContextCheckpointHead& head);
     void snapshot_dflash_cyclic_to_staging(std::int32_t lane);

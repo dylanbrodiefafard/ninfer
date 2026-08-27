@@ -748,6 +748,21 @@ void parse_openai_reasoning_effort(const Json& body, GenerationRequest& out) {
     out.reasoning_effort_param = "reasoning_effort";
 }
 
+void apply_ninfer_object(const Json& ninfer, GenerationRequest& out) {
+    if (!ninfer.is_object()) { bad_request("ninfer must be an object", "ninfer"); }
+    for (auto it = ninfer.begin(); it != ninfer.end(); ++it) {
+        if (it.key() != "capture_context_checkpoint") {
+            bad_request("ninfer." + it.key() + " is not supported", "ninfer",
+                        "ninfer_option_not_supported");
+        }
+    }
+    if (!ninfer.contains("capture_context_checkpoint")) { return; }
+    if (!ninfer.at("capture_context_checkpoint").is_boolean()) {
+        bad_request("ninfer.capture_context_checkpoint must be a boolean", "ninfer");
+    }
+    out.capture_context_checkpoint = ninfer.at("capture_context_checkpoint").get<bool>();
+}
+
 GenerationRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits) {
     require_object(body);
     reject_unsupported_features(body);
@@ -774,6 +789,7 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     }
     parse_openai_reasoning_effort(body, out);
     out.preserve_thinking = parse_openai_preserve_thinking(body);
+    if (body.contains("ninfer")) { apply_ninfer_object(body.at("ninfer"), out); }
 
     std::optional<int> max_tokens = get_int(body, "max_completion_tokens");
     if (!max_tokens) { max_tokens = get_int(body, "max_tokens"); }
