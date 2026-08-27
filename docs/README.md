@@ -41,6 +41,7 @@ Runtime and Op references:
 - [Small-scale concurrent inference architecture](maintainer/concurrent-inference-architecture.md)
 - [Paged KV context storage, ownership, and capacity model](maintainer/paged-kv-cache.md)
 - [Op admission, contracts, ownership, qualification, and performance rules](maintainer/op-development.md)
+- [Kernel iteration layers 0–3](maintainer/kernel-iteration.md)
 - [Performance enhancements that did not move tok/s](maintainer/performance_enhancements.md)
 - [DFlash2 packed-tree verify speed](maintainer/dflash2-tree-speed.md)
 - [ReplaySSM GDN technical reference](maintainer/replayssm-gdn.md)

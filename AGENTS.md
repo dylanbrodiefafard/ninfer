@@ -170,6 +170,8 @@ routing map, not a mandatory reading list:
   dimensions, and state semantics;
 - `docs/maintainer/op-development.md`: Op admission, contracts, implementation ownership,
   qualification, and performance evidence rules;
+- `docs/maintainer/kernel-iteration.md`: Layer 0–3 CUDA speed procedure (`tools.kdev bound` /
+  `mma` / Op sweep / production path);
 - `include/ninfer/engine.h` and `include/ninfer/types.h`: in-tree C++ product interface.
 
 Do not survey unrelated references for completeness. Read additional documents only when they
@@ -265,6 +267,12 @@ CLI, serve, Engine A/Bs, and decode-speed work use the Engine default `--kv-dtyp
 the task is numerical identity, a long-context capacity comparison, or an explicit dtype A/B.
 Pass `--kv-dtype bf16` when uncompressed KV is the contract. Qwen3.8-27B DFlash2 speed work
 keeps BF16 selector codebooks with NVFP4 draft matrices; NVFP4 codebooks are not the speed path.
+
+Kernel speed work follows [`docs/maintainer/kernel-iteration.md`](docs/maintainer/kernel-iteration.md).
+Before writing or changing a CUDA kernel for performance, run `python3 -m tools.kdev recipe` and
+`python3 -m tools.kdev bound` at the exact `(N,K,T,qtype)` and named idea class. Do not implement
+an idea the classifier refuses. Calibrate `t_issue` with `python3 -m tools.kdev mma` when the
+bound needs an MMA issue roof.
 
 Define a performance claim at the level where it matters: operator, schedule, request phase, or
 end-to-end inference. Measure that level directly when practical. An isolated microbenchmark can

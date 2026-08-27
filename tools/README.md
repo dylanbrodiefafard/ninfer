@@ -19,6 +19,7 @@ for the selected tool.
 | Run the 27B Python reference | [`reference/qwen3_6_27b/`](reference/qwen3_6_27b/README.md) |
 | Run the 35B-A3B Python reference | [`reference/qwen3_6_35b_a3b/`](reference/qwen3_6_35b_a3b/README.md) |
 | Compare 27B artifact/source Vision activations | [`parity/qwen3_6_27b/`](parity/qwen3_6_27b/README.md) |
+| Kernel iteration (bound / MMA probe / Op loop) | [`kdev/`](kdev/README.md) |
 | Run benchmark matrices | [`bench/`](bench/README.md) |
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
 | Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |
