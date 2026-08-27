@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <memory>
+#include <span>
 
 namespace ninfer {
 
@@ -19,6 +20,7 @@ public:
     PreparedPrompt& operator=(const PreparedPrompt&) = delete;
 
     [[nodiscard]] const PromptSummary& summary() const noexcept;
+    [[nodiscard]] std::span<const TokenId> token_ids() const;
     [[nodiscard]] explicit operator bool() const noexcept;
 
 private:

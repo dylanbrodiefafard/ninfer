@@ -443,6 +443,49 @@ int exercise_partial_prefill(ninfer::Engine& engine) {
     return 0;
 }
 
+int exercise_cancel_retain_ram(ninfer::Engine& engine) {
+    const auto keep = tokens_a();
+    struct CancelAfterPublish : ninfer::OutputSink {
+        std::atomic<int> published{0};
+        std::atomic<bool> stop{false};
+        void publish(ninfer::OutputDelta) override {
+            if (published.fetch_add(1) + 1 >= 2) { stop.store(true); }
+        }
+    } sink;
+    ninfer::CancellationView cancel([&] { return sink.stop.load(); });
+    const ninfer::GenerationResult first =
+        engine.generate(engine.prepare_tokens(keep), greedy(32, false), &sink, cancel);
+    if (first.finish_reason != ninfer::FinishReason::Cancelled ||
+        first.generated_token_ids.empty()) {
+        return fail("cancel-retain RAM source did not stop with published tokens");
+    }
+
+    const auto captures_before = engine.runtime_stats().kv_ram_captures;
+    const ninfer::GenerationResult evictor =
+        engine.generate(engine.prepare_tokens(tokens_c()), greedy(4, false));
+    if (evictor.generated_token_ids.size() != 4 ||
+        evictor.prefix_reuse_path != ninfer::PrefixReusePath::FullReset) {
+        return fail("cancel-retain RAM evictor did not FullReset");
+    }
+    if (engine.runtime_stats().kv_ram_captures <= captures_before) {
+        return fail("cancel-retain RAM evictor did not capture the cancelled chat");
+    }
+
+    const std::vector<ninfer::TokenId> history = resume_prefix(keep, first.generated_token_ids);
+    const auto restores_before                 = engine.runtime_stats().kv_ram_restores;
+    const ninfer::GenerationResult hit =
+        engine.generate(engine.prepare_tokens(history), greedy(4, true));
+    if (const int rc =
+            expect_ram_hit(hit, static_cast<std::uint32_t>(history.size()), "cancel-retain RAM");
+        rc != 0) {
+        return rc;
+    }
+    if (engine.runtime_stats().kv_ram_restores != restores_before + 1) {
+        return fail("cancel-retain RAM hit did not restore the cancelled chat");
+    }
+    return 0;
+}
+
 int exercise_site1(const char* artifact) {
     ninfer::Engine engine(ordinary_options(artifact, 2, 256, kRamHitBytes));
     if (const int rc = verify_ram_tier(engine, kRamHitBytes); rc != 0) { return rc; }
@@ -1422,6 +1465,8 @@ int exercise_artifact(const char* artifact) {
         if (const int rc = exercise_negative(engine); rc != 0) { return rc; }
         if (const int rc = exercise_checkpoint(engine); rc != 0) { return rc; }
         if (const int rc = exercise_partial_prefill(engine); rc != 0) { return rc; }
+        std::cerr << "ram_real: cancel-retain dump/restore\n";
+        if (const int rc = exercise_cancel_retain_ram(engine); rc != 0) { return rc; }
     }
     std::cerr << "ram_real: exclusive FIFO occupancy\n";
     if (const int rc = exercise_exclusive_occupancy(artifact); rc != 0) { return rc; }

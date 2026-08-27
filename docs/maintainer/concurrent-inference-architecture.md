@@ -931,9 +931,14 @@ unbounded prefill work。
 Cancellation 不打断 in-flight GPU unit。Boundary 在 launch 前观察一次 cancellation，已取消的 request 不
 进入下一 membership。Unit 返回后、任何 per-row output preview/commit 之前，再对 frozen membership 取得
 一次 row-aligned cancellation snapshot；这份 snapshot 在整次 resolve 中不变。此时取消的 row 丢弃本 unit
-尚未 commit 的 result，释放其 model state 和 slot，并按 serving contract 关闭 response output。
-Provisional KV/state writes 随整条 `SequenceState` 一起释放，不需要 rollback，也不影响同一 round 的其他
-rows。
+尚未 commit 的 result，并按 serving contract 关闭 response output。已 commit 的 continuation
+（KV、GDN current、rewrite checkpoint、ledger、以及该 frontier 及之前的 context-checkpoint
+heads）按与 `OutputLimit` 相同的边界 retain，供后续 prefix reuse。未完成的 suffix prefill 回滚到 occupy
+base：该处若有 turn-rollback 或 ladder head 则 restore 该 head；否则若仍持有 rewrite checkpoint 则回滚到
+它。回滚后丢掉其后的 staged heads，并释放该 lane 的 staging occupancy，然后 retain。occupy base 为 0 且
+没有 rewrite 时释放整条 `SequenceState`（含 staged heads）。Speculative in-flight 行以
+`commit_columns=0` fold 后 retain 在 unit 前的 committed frontier。error/shutdown
+仍释放整条 `SequenceState`。Provisional writes 不影响同一 round 的其他 rows。
 
 因此 cancellation 最多等待一个 membership 已固定的 GPU unit，再加一次 boundary processing。
 
@@ -1134,7 +1139,8 @@ Speculative backend 的 target GDN 使用 ReplaySSM 时，GPU graph 只读 lane 
 Program-owned raw records，不推进 committed GDN state。CPU output preview 得到每行最终提交长度后，
 `resolve_pending_batch` 先用原始 `B` 行执行一次 all-layer Fold，再完成必要的 hidden/backend correction，
 同步成功后才推进 host frontiers。取消行以 `commit_columns=0` 参与原始 row mapping，Fold 对该行严格
-no-op。Executor 只能在这个 commit tail 成功后提交 output preview 和发布 output event。
+no-op，随后 retain 该行已 commit 的 continuation，而不是释放 bundle。Executor 只能在这个 commit tail
+成功后提交 output preview 和发布 output event。
 
 全部 rows resolve 后，`RoundMembership` 销毁，frame 可以被下一 unit 覆盖。继续运行的 slots 在下一
 boundary 重新 compact；没有任何 row identity 从当前 frame 继承到下一 frame。

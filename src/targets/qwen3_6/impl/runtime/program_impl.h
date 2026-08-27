@@ -709,8 +709,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         sequence.rope_delta = prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
 
-        if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::Drop ||
-            request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew) {
+        if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::Drop) {
             sequence.rewrite_checkpoint = {};
         } else if (request_plan.rewrite_checkpoint_action ==
                    RewriteCheckpointAction::ReclassifyExisting) {
@@ -995,7 +994,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
             SequenceState& sequence = sequences[lanes[row]];
             RequestControl& request = requests[lanes[row]];
             if (cancelled[row]) {
-                clear_lane(sequence, request);
+                retain_committed_sequence(sequence, request);
                 continue;
             }
 
@@ -1055,6 +1054,108 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
 void ProgramImplCore::abort_lane(std::uint32_t lane) noexcept {
     if (lane >= max_concurrency) { return; }
     clear_lane(sequences[lane], requests[lane]);
+}
+
+void ProgramImplCore::retain_committed_sequence(SequenceState& sequence, RequestControl& request) {
+    if (!sequence.kv) {
+        throw std::logic_error("cannot retain a lane with no KV allocation bundle");
+    }
+    request.prefill.reset();
+    request.pending          = {};
+    sequence.mtp_draft_count = 0;
+    trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+    release_sequence_growth_entitlement(sequence);
+    unbind_sequence_kv(sequence);
+    sequence.retained = true;
+    request.lifecycle = Lifecycle::Complete;
+}
+
+void ProgramImplCore::retain_lane(std::uint32_t lane) {
+    if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    SequenceState& sequence = sequences[lane];
+    RequestControl& request = requests[lane];
+    if (request.lifecycle != Lifecycle::Active) {
+        throw std::logic_error("retain_lane requires a committed Active sequence");
+    }
+    retain_committed_sequence(sequence, request);
+}
+
+bool ProgramImplCore::revert_cancelled_prefill_lane(std::uint32_t lane) {
+    if (lane >= max_concurrency) { return false; }
+    SequenceState& sequence = sequences[lane];
+    RequestControl& request = requests[lane];
+    if (request.lifecycle != Lifecycle::Prefilling || !sequence.kv) { return false; }
+
+    const auto in_bounds = [&](std::uint32_t frontier) {
+        return frontier != 0 && frontier <= sequence.ledger.size() &&
+               frontier <= sequence.prefix_identity.size();
+    };
+    const auto head_at = [&](std::uint32_t frontier) {
+        return std::find_if(
+            sequence.context_checkpoints.begin(), sequence.context_checkpoints.end(),
+            [frontier](const ContextCheckpointHead& head) { return head.frontier == frontier; });
+    };
+    const bool rewrite_ok =
+        sequence.rewrite_checkpoint.valid && in_bounds(sequence.rewrite_checkpoint.frontier);
+
+    std::uint32_t frontier              = 0;
+    bool restore_staged                 = false;
+    ninfer::PrefixReusePath staged_path = ninfer::PrefixReusePath::RestoreTurnRollback;
+    if (request.prefill) {
+        const std::uint32_t base = request.prefill->base;
+        if (in_bounds(base)) {
+            if (rewrite_ok && sequence.rewrite_checkpoint.frontier == base) {
+                frontier = base;
+            } else if (const auto head = head_at(base); head != sequence.context_checkpoints.end()) {
+                frontier       = base;
+                restore_staged = true;
+                staged_path    = qwen3_6::detail::reuse_path_for_context_checkpoint_kind(head->kind);
+            }
+        }
+    }
+    if (frontier == 0 && rewrite_ok) { frontier = sequence.rewrite_checkpoint.frontier; }
+    if (frontier == 0) { return false; }
+
+    try {
+        if (restore_staged) {
+            restore_context_checkpoint_state(sequence, frontier);
+            if (qwen3_6::detail::occupy_drops_rewrite_ahead_of_restore(
+                    staged_path, sequence.rewrite_checkpoint.valid,
+                    sequence.rewrite_checkpoint.frontier, frontier)) {
+                sequence.rewrite_checkpoint = {};
+            }
+        } else {
+            decoder->linear_attention.copy_slot(
+                LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency),
+                LinearStateSlots::current_state_slot(sequence.lane, max_concurrency), device.stream);
+            copy_tail(sequence, sequence.rewrite_checkpoint_hidden);
+            if (speculative_backend == SpeculativeBackend::DFlash) {
+                if (!dflash) { throw std::logic_error("DFlash rewrite checkpoint is unavailable"); }
+                dflash->restore_rewrite_checkpoint(static_cast<std::int32_t>(sequence.lane),
+                                                   device.stream);
+                sequence.dflash_context_frontier = frontier;
+            }
+        }
+        sequence.text_kv_valid = frontier;
+        if (speculative_backend == SpeculativeBackend::Mtp) {
+            sequence.mtp_kv_valid = frontier == 0 ? 0 : frontier - 1;
+        }
+        sequence.ledger.resize(frontier);
+        sequence.prefix_identity.truncate(frontier);
+        sequence.execution_frontier = frontier;
+        sequence.ledger_frontier    = frontier;
+        drop_context_checkpoints_after(sequence, frontier);
+        if (staging_.occupied && staging_.lane == sequence.lane) { unoccupy_staging(); }
+        device.synchronize();
+        retain_committed_sequence(sequence, request);
+        return true;
+    } catch (...) {
+        try {
+            device.synchronize_all();
+        } catch (...) {}
+        clear_lane(sequence, request);
+        return false;
+    }
 }
 
 bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
@@ -2468,6 +2569,14 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
             if (speculative_backend == SpeculativeBackend::DFlash) {
                 sequence.dflash_context_frontier = staged.cursor;
+            }
+            if (staged.rewrite_checkpoint_capture &&
+                staged.cursor >= staged.rewrite_checkpoint_capture->frontier) {
+                sequence.rewrite_checkpoint = RewriteCheckpoint{
+                    .valid    = true,
+                    .kind     = staged.rewrite_checkpoint_capture->kind,
+                    .frontier = staged.rewrite_checkpoint_capture->frontier,
+                };
             }
             maybe_freeze_context_checkpoint(sequence, request, result.processed_tokens);
 

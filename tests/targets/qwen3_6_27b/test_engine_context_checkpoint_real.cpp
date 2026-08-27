@@ -622,17 +622,19 @@ int exercise_cancel(const char* artifact, ninfer::SpeculativeBackend spec) {
                   << static_cast<int>(pin_cancelled.finish_reason) << ", expected Cancelled\n";
         return 1;
     }
-    const std::uint32_t pin_e =
-        pin_cancelled.reused_prompt_tokens == 0
-            ? static_cast<std::uint32_t>(pin_src.size())
-            : pin_cancelled.reused_prompt_tokens;
-    std::vector<ninfer::TokenId> pin_probe(
-        pin_follow.begin(), pin_follow.begin() + static_cast<std::ptrdiff_t>(pin_e));
+    std::vector<ninfer::TokenId> pin_probe = pin_src;
+    pin_probe.insert(pin_probe.end(), pin_r1.generated_token_ids.begin(),
+                     pin_r1.generated_token_ids.end());
     pin_probe.insert(pin_probe.end(), 8, kDiverge);
     const ninfer::GenerationResult pin_after =
         engine.generate(engine.prepare_tokens(pin_probe), greedy(4, true));
-    if (pin_after.prefix_reuse_path == ninfer::PrefixReusePath::RestoreTurnRollback) {
-        return fail("cancel after rollback pin left a hittable 2C/host rollback identity");
+    if ((pin_after.prefix_reuse_path != ninfer::PrefixReusePath::AppendAtFrontier &&
+         pin_after.prefix_reuse_path != ninfer::PrefixReusePath::RestoreTurnRollback) ||
+        pin_after.reused_prompt_tokens == 0) {
+        std::cerr << "cancel after rollback pin did not keep the previous turn: path="
+                  << path_name(pin_after.prefix_reuse_path)
+                  << " reused=" << pin_after.reused_prompt_tokens << '\n';
+        return 1;
     }
     return 0;
 }

@@ -6,6 +6,8 @@
 #include "runtime/engine/concurrent_executor.h"
 #include "targets/registry.h"
 
+#include <ninfer/targets/qwen3_6/prepared_prompt.h>
+
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -57,6 +59,11 @@ PreparedPrompt::PreparedPrompt(std::unique_ptr<Impl> impl) noexcept : impl_(std:
 const PromptSummary& PreparedPrompt::summary() const noexcept {
     static const PromptSummary empty;
     return impl_ != nullptr ? impl_->summary : empty;
+}
+
+std::span<const TokenId> PreparedPrompt::token_ids() const {
+    if (impl_ == nullptr) { return {}; }
+    return targets::qwen3_6::PreparedPromptAccess::view(impl_->value).token_ids;
 }
 
 PreparedPrompt::operator bool() const noexcept { return impl_ != nullptr; }
