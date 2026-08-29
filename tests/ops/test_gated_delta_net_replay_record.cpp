@@ -490,6 +490,7 @@ int main() {
     failures += run_case(48, 6, 8, {6, 4, 3, 2, 1, 5, 6, 2}, 1741U);
     failures += run_tree_case(32, 1751U);
     failures += run_tree_case(48, 1761U);
+    failures += run_tree_chain_matches_sequential(48, 12, 1766U);
     failures += run_tree_chain_matches_sequential(48, 16, 1771U);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net_replay_record\n";
     return failures == 0 ? 0 : 1;

@@ -24,7 +24,8 @@ decoding disabled, plus long-reasoning and cross-scenario decode with MTP and DF
 results report its `groupwise-int` and `nvfp4` weight profiles separately. The concurrent
 decode-saturation campaign measures the same three Qwen3.6 artifact profiles at C=1, 2, 4, and 8.
 A separate C=1 Qwen3.8-27B NVFP4 campaign below compares MTP0/3/5 with DFlash2 k=7 on the same
-frozen AIME command. Qwen3.8-27B NVFP4 accuracy uses
+frozen AIME command (INT8 KV). A later NVFP4-KV DFlash2 campaign measures isolated CLI C=1 and
+serve C=1/2/3 after fused batched GDN conv-record. Qwen3.8-27B NVFP4 accuracy uses
 [Ostfralla/Qwen3.8-27B-NVFP4-NInfer](https://huggingface.co/Ostfralla/Qwen3.8-27B-NVFP4-NInfer)
 with INT8 and NVFP4 KV.
 
@@ -191,7 +192,8 @@ python3 tools/bench/run_serve_concurrency.py \
 ```
 
 Use `--mode dflash7` for the corresponding DFlash block=8 campaign; add `--sampling greedy` for
-the exact-argmax profile. Qwen3.8-27B NVFP4 DFlash2 uses the same flag on a reconverted artifact:
+the exact-argmax profile. Qwen3.8-27B NVFP4 DFlash2 uses the same flag on a reconverted artifact.
+INT8-KV C=1 (the table below) and NVFP4-KV C=1/2/3 (the fused-GDN campaign after it):
 
 ```bash
 python3 tools/bench/run_serve_concurrency.py \
@@ -204,6 +206,19 @@ python3 tools/bench/run_serve_concurrency.py \
   --saturation-fixture long_decode_aime26_15 \
   --decode-tokens 4096 --max-context 16384 --kv-capacity 16384 \
   --output profiles/bench/qwen38_dflash2_c1_aime
+
+python3 tools/bench/run_serve_concurrency.py \
+  --serve build/apps/ninfer-serve \
+  --artifact qwen3_8_27b=out/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
+  --mode dflash4 --mode dflash7 \
+  --sampling stochastic \
+  --temperature 0.6 --top-p 0.95 --top-k 20 --min-p 0 --presence-penalty 0 \
+  --concurrency 1 --concurrency 2 --concurrency 3 \
+  --suite decode-saturation \
+  --saturation-fixture long_decode_aime26_15 \
+  --decode-tokens 4096 --max-context 16384 --kv-capacity auto \
+  --kv-dtype nvfp4 --prefill-chunk 4096 \
+  --output profiles/bench/qwen38_dflash2_fused_batch_aime_20260829
 ```
 
 ## Qwen3.8-27B NVFP4 C=1 decode
@@ -225,10 +240,41 @@ Story is `scenario_story_en_mystery` at 1024 output tokens.
 | DFlash2 k=7 W8 | story, stochastic | 115.7 | 21.6% | 2.51 |
 
 DFlash2 is a supported exclusive backend on this identity (`--spec dflash --draft-tokens 7
---lm-head-draft`). These first C=1 points beat MTP0 (1.47× on stochastic AIME) and trail MTP3
-(0.69×) and MTP5 (0.65×). Greedy AIME and story show the same gap: DFlash2 accept is about
-22–29% versus MTP3 about 42–52%. That accept gap is the current speed target; it is not a reason
-to drop the backend.
+--lm-head-draft`; verify is the paper-accurate chain W=8). These first C=1 INT8-KV points beat
+MTP0 (1.47× on stochastic AIME) and trail MTP3 (0.69×) and MTP5 (0.65×). Greedy AIME and story
+show the same gap: DFlash2 accept is about 22–29% versus MTP3 about 42–52%. That accept gap is
+the current speed target; it is not a reason to drop the backend.
+
+Isolated CLI NVFP4-KV AIME (`long_decode_aime26_15`, 4096 tokens, seed `7632647173703958409`,
+presence penalty 0, `--lm-head-draft`) after fused batched GDN conv-record (2026-08-29):
+
+| Mode | Decode tok/s | Accept | Tokens/round | Rounds |
+|---|---:|---:|---:|---:|
+| chain k=4 W=5 | 162.18 | 46.57% | 2.86 | 1431 |
+| chain k=7 W=8 | 142.52 | 31.61% | 3.21 | 1275 |
+
+k=4 remains the RTX 5090 speed recommendation: cheaper W=5 verify, not more tokens per round.
+An earlier same-day W4A4 packed-verify CLI snapshot was faster at C=1 (k=4 **194.48** /
+k=7 **166.82**) with higher k=4 accept (50.26%). That snapshot is retained in
+[dflash2-tree-speed.md](maintainer/dflash2-tree-speed.md); it predates the C>1 fused GDN path.
+
+Serve C=1/2/3 on the same AIME fixture, NVFP4 KV, graphs, `--lm-head-draft`, presence penalty 0.
+Headline tok/s is aggregate `decode_tokens / wave_makespan` (GPU throughput). Per-request
+`(completion-1)/decode_seconds` is the isolation metric. All 12 serve requests hit the 4096 output
+limit. Logs: `profiles/bench/qwen38_dflash2_fused_batch_aime_20260829/`.
+
+| Mode | C | Aggregate tok/s | Per-request tok/s | Accept | Tokens/round | Makespan (s) | vs C=1 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| chain k=4 W=5 | 1 | 162.1 | 162.6 | 46.6% | 2.86 | 25.26 | 1.00× |
+| chain k=4 W=5 | 2 | 262.0 | 133.0 | 45.5% | 2.82 | 31.26 | 1.62× |
+| chain k=4 W=5 | 3 | 324.4 | 112.1 | 47.3% | 2.89 | 37.87 | 2.00× |
+| chain k=7 W=8 | 1 | 143.0 | 143.4 | 31.6% | 3.21 | 28.63 | 1.00× |
+| chain k=7 W=8 | 2 | 230.8 | 121.3 | 29.7% | 3.08 | 35.49 | 1.61× |
+| chain k=7 W=8 | 3 | 302.0 | 103.1 | 29.6% | 3.07 | 40.68 | 2.11× |
+
+C=3 k=4 is **324 aggregate tok/s** on this 27B NVFP4 DFlash2 path. Per-request rate falls as
+the GPU is shared; isolation still matches C=1 DFlash. k=4 wins both C=1 and C=3 aggregate
+on this fixture.
 
 Omit `--mode` and supply the two measured Qwen3.6 groupwise-int artifacts to run the complete
 published Qwen3.6 MTP0/MTP3 campaign:

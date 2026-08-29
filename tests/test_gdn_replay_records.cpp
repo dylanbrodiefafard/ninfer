@@ -115,6 +115,13 @@ int main() {
         static_cast<std::byte*>(layer2.key.data) - static_cast<std::byte*>(records.key.data) ==
             static_cast<std::ptrdiff_t>(2 * spec.record_capacity * records.key.nb[3]),
         "layer key slice offset differs");
+    const auto layer2_row1 = records.layer(2, 1, 2);
+    failures += expect_shape(layer2_row1.conv, 256, 4, 2, 1, "layer row_begin conv slice");
+    failures += expect(
+        static_cast<std::byte*>(layer2_row1.conv.data) - static_cast<std::byte*>(records.conv.data) ==
+            static_cast<std::ptrdiff_t>((2 * spec.record_capacity + 1) * records.conv.nb[2]),
+        "layer row_begin conv slice offset differs");
+    failures += expect_throw([&] { (void)records.layer(0, 4, 2); }, "row window past capacity");
     failures += expect_throw([&] { (void)records.layer(-1, 1); }, "negative layer");
     failures += expect_throw([&] { (void)records.layer(3, 1); }, "past-end layer");
     failures += expect_throw([&] { (void)records.layer(0, 0); }, "zero active rows");

@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/sampling.h"
 
 #include <cuda_runtime.h>
 
@@ -39,14 +40,20 @@ inline constexpr std::int32_t kDflash2VerifyWidth              = 12;
  *     score[t,b,c] = unary[c]
  *       + sum_{r=0}^{255} (pred_code[r, prev[t-1,b]] * h[r,t,b]) * succ_code[r, candidates[c]].
  *
- *   temperatures and seeds are host arrays of length B. If temperatures[b] <= 0, path[t,b] is
- *   the candidate token with the greatest score; equal scores select the lower token id. If
- *   temperatures[b] > 0, the 16 scores are softmax-normalized after dividing by
- *   temperatures[b] and one candidate is drawn by inverse-CDF using the counter-based uniform
+ *   configs is a device-resident SamplingConfig[B] (same buffer the round copies into ingress).
+ *   If configs[b].temperature <= 0, path[t,b] is the candidate with the greatest score; equal
+ *   scores select the lower token id. If temperature > 0, the 16 scores are softmax-normalized
+ *   after dividing by temperature and one candidate is drawn by inverse-CDF using
  *
- *     u = splitmix64(seeds[b], t, b, purpose=16) in [0,1).
+ *     u = splitmix64(configs[b].seed ^ seed_xor,
+ *                    logical_positions[b] + position_offset + t + 1,
+ *                    purpose=16) in [0,1).
  *
  *   Then prev[t,b] = path[t,b]. Candidate order does not affect the selected token.
+ *   An internal force_greedy call may override temperature for an intermediate refinement pass.
+ *   When selector_ids / selector_q are non-null they receive the 16 candidate token ids and
+ *   the proposal distribution q: one-hot at the greedy pick, else the 16-way softmax. Chain
+ *   Leviathan accept uses this q; null selectors leave q implicit one-hot at path[t,b].
  *
  * Logical shapes:
  *   logits is contiguous BF16 [V,T] or [V,T,B] with V>=16. hidden is contiguous BF16 [5120,T] or
@@ -55,8 +62,11 @@ inline constexpr std::int32_t kDflash2VerifyWidth              = 12;
  *   When logit_token_ids is null, codebook_rows >= V (identity: logit row is the token id).
  *   When logit_token_ids is non-null it is contiguous I32 [V] mapping each logit row to a token
  *   id; codebook_rows >= 248320 and is not required to be >= V. Product uses codebook_rows=248320
- *   and V in {131072, 248320}. anchors is contiguous I32 [B], or a scalar I32 for B=1. path is
- *   contiguous I32 [T] or [T,B]. Every anchor and every selected token id is in [0, codebook_rows).
+ *   and V in {131072, 248320}. anchors and logical_positions are contiguous I32 [B], or scalars
+ *   for B=1. logical_positions[b] is the current anchor position. path is contiguous I32 [T] or
+ *   [T,B]. selector_ids is contiguous I32 [16,T] or [16,T,B] and
+ *   selector_q is contiguous FP32 of the same shape; both null or both non-null. Every anchor
+ *   and every selected token id is in [0, codebook_rows).
  *   T is any positive value at B=1; B=2..8 admits T=1..16.
  *
  * Supported domain:
@@ -70,12 +80,13 @@ inline constexpr std::int32_t kDflash2VerifyWidth              = 12;
  * Numeric:
  *   Top-k and greedy path ids are exact functions of the represented BF16 logits/scores. The
  *   score formula is evaluated by the oracle in FP64 from represented inputs and the logical FP32
- *   dequantized W_h. Stochastic draws are a function of (seeds[b], t, b, purpose); the Op does
+ *   dequantized W_h. Stochastic draws are a function of (seeds[b], logical position, purpose); the Op does
  *   not promise a particular host RNG bitstream as a public numeric output.
  *
  * Effects:
- *   Writes all of path. Inputs are unchanged. path must not alias logits, hidden, codebooks,
- *   anchors, or any projection-weight plane.
+ *   Writes all of path. When selector tensors are provided, writes all of them. Inputs are
+ *   unchanged. path must not alias logits, hidden, codebooks, anchors, selector tensors, or
+ *   any projection-weight plane.
  *
  * Workspace:
  *   Caller-owned transient storage sized by dflash2_path_select_workspace_capacity_bytes() holds
@@ -89,10 +100,13 @@ inline constexpr std::int32_t kDflash2VerifyWidth              = 12;
 void dflash2_path_select(const Tensor& logits, const Tensor& hidden,
                          const Weight& hidden_projection, const Tensor& pred_code,
                          const Tensor& succ_code, const Tensor& anchors,
-                         const float* temperatures, const unsigned long long* seeds, Tensor& path,
-                         WorkspaceArena& workspace, cudaStream_t stream,
-                         const Tensor* logit_token_ids = nullptr,
-                         const Weight* pred_nvfp4 = nullptr, const Weight* succ_nvfp4 = nullptr);
+                         const Tensor& logical_positions,
+                         const SamplingConfig* configs, Tensor& path, WorkspaceArena& workspace,
+                         cudaStream_t stream, const Tensor* logit_token_ids = nullptr,
+                         const Weight* pred_nvfp4 = nullptr, const Weight* succ_nvfp4 = nullptr,
+                         Tensor* selector_ids = nullptr, Tensor* selector_q = nullptr,
+                         unsigned long long seed_xor = 0, std::int32_t position_offset = 0,
+                         bool force_greedy = false);
 
 /**
  * Op: dflash2_tree_select

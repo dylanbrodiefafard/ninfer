@@ -5,6 +5,7 @@
 #include "ops/launcher/speculative_round.h"
 
 #include "ops/common/math.h"
+#include "ops/common/sampling_workspace.h"
 #include "ops/kernel/speculative_round.cuh"
 #include "core/device.h"
 
@@ -53,10 +54,17 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
                                              Tensor& licensed_tokens, Tensor& licensed_counts,
                                              Tensor& accepted, std::int32_t token_domain,
                                              const SamplingConfig* configs, DeviceSpan workspace,
-                                             cudaStream_t stream) {
+                                             cudaStream_t stream, const Tensor* selector_ids,
+                                             const Tensor* selector_q) {
     const std::int32_t physical_rows     = logits.ne[0];
     const std::int32_t cols              = drafts.ne[0] + 1;
     const std::int32_t batch             = drafts.ne[1];
+    const std::int32_t selector_k =
+        selector_ids != nullptr ? selector_ids->ne[0] : 0;
+    const std::int32_t* selector_id_ptr =
+        selector_ids != nullptr ? static_cast<const std::int32_t*>(selector_ids->data) : nullptr;
+    const float* selector_q_ptr =
+        selector_q != nullptr ? static_cast<const float*>(selector_q->data) : nullptr;
     const SamplingWorkspaceLayout layout = make_sampling_workspace_layout(token_domain, cols);
     if (!layout.multiblock) {
         speculative_accept_greedy_drafts_kernel<<<batch, kSamplerBlock, 0, stream>>>(
@@ -68,7 +76,7 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
             static_cast<std::int32_t*>(licensed_tokens.data),
             static_cast<std::int32_t*>(licensed_counts.data),
             static_cast<std::int32_t*>(accepted.data), configs, token_domain, physical_rows,
-            drafts.ne[0]);
+            drafts.ne[0], selector_id_ptr, selector_q_ptr, selector_k);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -81,7 +89,7 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
         static_cast<const __nv_bfloat16*>(logits.data),
         static_cast<const std::int32_t*>(drafts.data),
         static_cast<const std::int32_t*>(current_extents.data), configs, token_domain,
-        physical_rows, cols, drafts.ne[0], scratch, layout.bytes);
+        physical_rows, cols, drafts.ne[0], scratch, layout.bytes, nullptr, nullptr, nullptr);
     CUDA_CHECK(cudaGetLastError());
     const dim3 batched_group_grid(static_cast<unsigned int>(groups),
                                   static_cast<unsigned int>(cols),
@@ -94,7 +102,8 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
         static_cast<std::int32_t*>(lengths.data), static_cast<std::int32_t*>(anchors.data),
         static_cast<std::int32_t*>(licensed_tokens.data),
         static_cast<std::int32_t*>(licensed_counts.data), static_cast<std::int32_t*>(accepted.data),
-        configs, token_domain, cols, partial_blocks, groups, scratch, layout.bytes);
+        configs, token_domain, cols, partial_blocks, groups, scratch, layout.bytes, selector_id_ptr,
+        selector_q_ptr, selector_k, nullptr, nullptr, nullptr, nullptr, nullptr);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -130,23 +139,59 @@ void speculative_accept_tree_drafts_launch(const Tensor& target_tokens, const Te
                                            Tensor& licensed_counts, Tensor& accepted,
                                            Tensor& accepted_column, Tensor& fold_path,
                                            std::int32_t token_domain, const SamplingConfig* configs,
-                                           cudaStream_t stream) {
-    const std::int32_t batch = verify_ids.ne[1];
-    const std::int32_t width = verify_ids.ne[0];
-    speculative_accept_tree_drafts_kernel<<<static_cast<unsigned int>(batch), kSamplerBlock, 0,
-                                            stream>>>(
-        static_cast<const std::int32_t*>(target_tokens.data),
-        static_cast<const __nv_bfloat16*>(logits.data),
+                                           DeviceSpan workspace, cudaStream_t stream) {
+    const std::int32_t batch         = verify_ids.ne[1];
+    const std::int32_t width         = verify_ids.ne[0];
+    const std::int32_t physical_rows = logits.ne[0];
+    const SamplingWorkspaceLayout layout = make_sampling_workspace_layout(token_domain, width);
+    if (!layout.multiblock) {
+        speculative_accept_tree_drafts_kernel<<<static_cast<unsigned int>(batch), kSamplerBlock, 0,
+                                                stream>>>(
+            static_cast<const std::int32_t*>(target_tokens.data),
+            static_cast<const __nv_bfloat16*>(logits.data),
+            static_cast<const std::int32_t*>(verify_ids.data),
+            static_cast<const std::int32_t*>(parent_index.data),
+            static_cast<const std::int32_t*>(valid_columns.data),
+            static_cast<const std::int32_t*>(current_extents.data),
+            static_cast<std::int32_t*>(lengths.data), static_cast<std::int32_t*>(anchors.data),
+            static_cast<std::int32_t*>(licensed_tokens.data),
+            static_cast<std::int32_t*>(licensed_counts.data),
+            static_cast<std::int32_t*>(accepted.data),
+            static_cast<std::int32_t*>(accepted_column.data),
+            static_cast<std::int32_t*>(fold_path.data), configs, token_domain, physical_rows,
+            width);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    const std::int32_t partial_blocks = div_up(token_domain, kSamplerPartialTileItems);
+    const std::int32_t groups         = sampler_group_count(partial_blocks);
+    const SamplingWorkspace scratch   = layout.bind(workspace);
+    const dim3 partial_grid(static_cast<unsigned int>(partial_blocks),
+                            static_cast<unsigned int>(width), static_cast<unsigned int>(batch));
+    speculative_sampling_partial_topk_kernel<<<partial_grid, kSamplerBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(logits.data), nullptr,
+        static_cast<const std::int32_t*>(current_extents.data), configs, token_domain,
+        physical_rows, width, width - 1, scratch, layout.bytes,
         static_cast<const std::int32_t*>(verify_ids.data),
         static_cast<const std::int32_t*>(parent_index.data),
-        static_cast<const std::int32_t*>(valid_columns.data),
+        static_cast<const std::int32_t*>(valid_columns.data));
+    CUDA_CHECK(cudaGetLastError());
+    const dim3 batched_group_grid(static_cast<unsigned int>(groups),
+                                  static_cast<unsigned int>(width),
+                                  static_cast<unsigned int>(batch));
+    speculative_sampling_group_finalize_kernel<<<batched_group_grid, kSamplerGroupBlock, 0,
+                                                 stream>>>(
+        static_cast<const std::int32_t*>(target_tokens.data), nullptr,
         static_cast<const std::int32_t*>(current_extents.data),
         static_cast<std::int32_t*>(lengths.data), static_cast<std::int32_t*>(anchors.data),
         static_cast<std::int32_t*>(licensed_tokens.data),
-        static_cast<std::int32_t*>(licensed_counts.data),
-        static_cast<std::int32_t*>(accepted.data),
+        static_cast<std::int32_t*>(licensed_counts.data), static_cast<std::int32_t*>(accepted.data),
+        configs, token_domain, width, partial_blocks, groups, scratch, layout.bytes, nullptr,
+        nullptr, 0, static_cast<const std::int32_t*>(verify_ids.data),
+        static_cast<const std::int32_t*>(parent_index.data),
+        static_cast<const std::int32_t*>(valid_columns.data),
         static_cast<std::int32_t*>(accepted_column.data),
-        static_cast<std::int32_t*>(fold_path.data), configs, token_domain, logits.ne[0], width);
+        static_cast<std::int32_t*>(fold_path.data));
     CUDA_CHECK(cudaGetLastError());
 }
 

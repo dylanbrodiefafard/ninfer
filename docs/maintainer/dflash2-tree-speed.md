@@ -1,4 +1,4 @@
-# DFlash2 packed-tree verify speed
+# DFlash2 verify speed
 
 Investigation and A/B for Qwen3.8-27B NVFP4 DFlash2 on RTX 5090 (`sm_120a`). Published serving
 numbers stay in [performance.md](../performance.md) until a new campaign is recorded there.
@@ -8,13 +8,17 @@ Artifact: `/ssdpool2nvme/local_llm/ninfer-sandbox/out/qwen3_8_27b_nvfp4_dflash_w
 New speed and Engine A/Bs use `--kv-dtype nvfp4`. The tok/s tables below were measured with INT8
 group-64 unless a row says otherwise. Product companion is NVFP4 draft matrices + BF16 selector
 codebooks; NVFP4 codebooks save ~174 MiB and are not a decode tok/s win. CUDA Graphs,
-`--lm-head-draft`, AIME seed `7632647173703958409`. Serve tok/s is `request_done` `decode=` (not
-harness `steady_interval`).
+`--lm-head-draft`, AIME seed `7632647173703958409`. C=1 serve tok/s is `request_done` `decode=`
+(not harness `steady_interval`). C>1 headline tok/s is aggregate `decode_tokens / wave_makespan`.
 
-## Product path
+## Outcome
 
-27B DFlash2 target verify is a packed tree: beam-2, BFS prefix of **12** columns,
-`DFlashConfig::tree_verify = true`. 35B DFlash v1 and MTP stay chain. There is no CLI `--tree-k`.
+The packed-tree experiment is no longer the product path. The paper-accurate chain won the final
+RTX 5090 speed comparison on both AIME and story and avoids the tree-only replay/compaction surface.
+Qwen3.8 DFlash2 now requires `W=k+1`; k=4/W=5 is the speed recommendation and k=7/W=8 is the
+native-block option. After fused batched NVFP4 GDN conv-record, C>1 isolation holds and AIME
+C=3 k=4 reaches **324 aggregate tok/s** (NVFP4 KV). The sections below retain the evidence
+that led to the chain cutover.
 
 Tree GDN record uses 4-warp parent tiles in HBM when the ReplaySSM workspace is sized for it;
 tests without that workspace keep the 1-warp shared-memory tile. Path/tree select scans the
@@ -52,7 +56,7 @@ Spark/vLLM DFlash2 is two sequential MASK blocks, then one target verify of the 
 chain. DGX Spark numbers (K=16, 124–135 tok/s) are on a slow box; 5090 should beat them. NInfer
 caps verify at W=12 (two GQA tiles), so the practical split is **7+4 = 11 drafts**.
 
-`--draft-tokens 7` stays the packed-tree product path. `--draft-tokens 11` runs: first DFlash
+The historical `--draft-tokens 7` packed-tree experiment ran one block. `--draft-tokens 11` runs:
 forward with 7 MASK columns, path-select a chain of 7, unmask those ids, second DFlash forward
 with 4 new MASK columns, path-select the suffix (parent = last token of block 1), then chain
 verify of W=12. SWA is already bidirectional. Default `--lm-head-draft` stays on.
@@ -328,7 +332,92 @@ The block shortlist is column-t of the parallel DFlash draft, not a parent-condi
 draft distribution. Closing the remaining ~18–21% absent hops needs a different drafter
 (or parent-conditioned candidates), not another greedy reshape of this beam.
 
-Reports: `profiles/bench/qwen38_dflash2_d1h_aime/`, `qwen38_dflash2_k3_aime/`,
+Official DFlash2 `draft_sample_method: "probabilistic"` is wired for **chain**
+propose (`W=k+1`): `dflash2_path_select` writes the 16-way selector q, and
+`speculative_accept_greedy_drafts` runs Leviathan `min(1, p/q)` with residual
+`max(0, p-q)`. Null q stays one-hot.
+k=11 two-block already uses this q.
+
+CUDA-graph capture used a dummy `SamplingConfig{}` (temperature 0) and passed those
+host scalars as path-select kernel parameters, so replay always drafted greedy /
+one-hot q while accept still saw the request temperature. Path-select now reads
+the device ingress `SamplingConfig` the graph already copies each round.
+
+Isolated CLI C=1, `--kv-dtype nvfp4`, graphs, `--lm-head-draft`, seed
+`7632647173703958409`, presence penalty 0, artifact
+`/models/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`. AIME `long_decode_aime26_15`.
+Temperature 0.6, top-p 0.95, top-k 20, min-p 0. CLI metric is `decode speed`
+(`(generated-1) / decode_seconds`).
+
+Native-block chain: `--spec dflash --draft-tokens 7 --lm-head-draft` (W=8). RTX 5090 speed path:
+`--spec dflash --draft-tokens 4 --lm-head-draft` (W=5, one SmallT tile).
+
+512-token prefix after the graph-q fix, sequential tree accept (historical; not
+re-run 2026-08-29):
+
+| Config | tokens | tok/s | accept | tok/round |
+|---|---:|---:|---:|---:|
+| tree k=7 W=12 | 512 | 139.39 | 33.33% | 3.32 |
+| chain+q k=7 W=8 | 512 | 201.41 | 37.42% | 3.60 |
+
+Full 4096 after W4A4 packed verify + sage V-fill hybrid (2026-08-29). Prior accept-pipeline
+cutover row in parentheses:
+
+| Config | tokens | tok/s | accept | tok/round | rounds |
+|---|---:|---:|---:|---:|---:|
+| chain+q k=4 W=5 | 4096 | **194.48** | 50.26% | 3.01 | 1360 |
+| **tree k=7 W=12** | 4096 | **164.95** (was 166.51) | **32.88%** (was 29.87%) | **3.30** (was 3.09) | 1240 (was 1325) |
+| chain+q k=7 W=8 | 4096 | 166.82 (was 143.34) | 32.23% (was 28.24%) | 3.25 (was 2.98) | 1258 (was 1376) |
+
+k=4 W=5 is chain (`W=k+1`). It is the tok/s winner on this fixture because each round is a W=5
+verify (one SmallT tile); tok/round is *lower* than k=7 (3.01 vs 3.30). Accept % is not comparable
+across k (drafted = k × rounds). Among k=7 rows, tree wins accept by 0.65 pp but loses tok/s. A
+matched story run also favored chain k=7 (**147.45 vs 144.54 tok/s**); k=4 reached **160.10
+tok/s**. All three AIME rows hit the 4096 output limit. Logs:
+`profiles/bench/qwen38_dflash2_nvfp4_aime_20260829/` and local
+`dflash-story-{tree,chain,k4}.stderr` reports.
+
+## Batched fused GDN (C>1 isolation, 2026-08-29)
+
+NVFP4 C>1 verify no longer flattens GDN conv-record to `T=W×B` compose (W4A4 GEMM + BF16
+conv). That path flipped greedy column 0 versus C=1 fused SmallT+FP32. The speed path is one
+fused SmallT launch at `T=W` per row (`grid.x=B`). Op guard:
+`run_nvfp4_batched_matches_serial_fused` (B=3 W=8, B=3 W=5, mixed valid). Engine isolation
+`ninfer_qwen3_8_27b_dflash_real_test` k=7 C=3 Graph DFlash still matches saved C=1 DFlash.
+
+Isolated CLI C=1, NVFP4 KV, same AIME command as the W4A4 table
+(`/models/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`, seed `7632647173703958409`, presence
+penalty 0, `--lm-head-draft`, 4096 decode):
+
+| Config | tokens | tok/s | accept | tok/round | rounds |
+|---|---:|---:|---:|---:|---:|
+| chain k=4 W=5 | 4096 | **162.18** | 46.57% | 2.86 | 1431 |
+| chain k=7 W=8 | 4096 | 142.52 | 31.61% | 3.21 | 1275 |
+
+C=1 on this tree is below the W4A4 snapshot above (194.48 / 166.82). k=4 accept also moved
+(50.26% → 46.57%) at the same seed. k=4 still wins C=1 tok/s.
+
+Serve C=1/2/3, same fixture, NVFP4 KV, `--kv-capacity auto`, presence penalty 0. Aggregate
+tok/s is `decode_tokens / wave_makespan`. Per-request is mean `(completion-1)/decode_seconds`.
+1-second full-batch steady intervals did not fire (stats window spanned the whole wave);
+headline numbers use the request_done aggregate. Logs:
+`profiles/bench/qwen38_dflash2_fused_batch_aime_20260829/`.
+
+| Mode | C | Aggregate tok/s | Per-request tok/s | Accept | tok/round | Makespan (s) | vs C=1 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| chain k=4 W=5 | 1 | 162.1 | 162.6 | 46.6% | 2.86 | 25.26 | 1.00× |
+| chain k=4 W=5 | 2 | 262.0 | 133.0 | 45.5% | 2.82 | 31.26 | 1.62× |
+| chain k=4 W=5 | 3 | **324.4** | 112.1 | 47.3% | 2.89 | 37.87 | 2.00× |
+| chain k=7 W=8 | 1 | 143.0 | 143.4 | 31.6% | 3.21 | 28.63 | 1.00× |
+| chain k=7 W=8 | 2 | 230.8 | 121.3 | 29.7% | 3.08 | 35.49 | 1.61× |
+| chain k=7 W=8 | 3 | 302.0 | 103.1 | 29.6% | 3.07 | 40.68 | 2.11× |
+
+C=3 k=4 is **324 aggregate tok/s**. Isolation holds; per-request rate is the shared-SM cost of
+the compact decode batch, not a quality loss.
+
+Reports: `profiles/bench/qwen38_dflash2_nvfp4_aime_20260829/`,
+`qwen38_dflash2_fused_batch_aime_20260829/`,
+`qwen38_dflash2_d1h_aime/`, `qwen38_dflash2_k3_aime/`,
 `qwen38_dflash2_k32_aime/`, `qwen38_dflash2_unary_aime/`,
 `qwen38_dflash2_markov_sample_aime/`, `qwen38_dflash2_markov_t03_aime/`,
 `qwen38_dflash2_markov_t02_clean_aime/`, `qwen38_dflash2_markov_t02_story/`,
@@ -344,6 +433,9 @@ Reports: `profiles/bench/qwen38_dflash2_d1h_aime/`, `qwen38_dflash2_k3_aime/`,
 - Shortlist K=32 (33.5% / 147.8 tok/s).
 - Unary child ranking (27.8%).
 - Markov softmax child sampling at T=0.6 / 0.3 (story also loses at T=0.2).
+- Flatten NVFP4 GDN conv-record to `T=W×B` compose for C>1 (W4A4 GEMM + BF16 conv). It
+  flips greedy column 0 versus C=1 fused SmallT+FP32. Keep one fused SmallT launch at `T=W`
+  per row (`grid.x=B`).
 - Forced binary after depth 1 (29.2%).
 - Native T=12 INT8 GQA tile under the current `RowTiles<=3` kernel.
 - GDN 4-slot parent-tile smem cache (32 KiB; wash vs 2-slot).

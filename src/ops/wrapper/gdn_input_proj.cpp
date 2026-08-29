@@ -115,6 +115,39 @@ Tensor flatten_columns(const Tensor& tensor, std::int32_t rows, ConvGeometry geo
     return Tensor(tensor.data, tensor.dtype, {rows, geometry.aggregate_columns});
 }
 
+Tensor packed_row(const Tensor& tensor, std::int32_t batch_index) {
+    return tensor.slice(2, batch_index, 1);
+}
+
+Tensor selector_row(const Tensor& selector, std::int32_t batch_index) {
+    if (selector.data == nullptr) { return Tensor{}; }
+    return selector.slice(0, batch_index, 1);
+}
+
+bool parent_index_active(const Tensor* parent_index);
+
+// T=1 NVFP4 snapshot GEMV uses blockIdx.y as the token, so B>1 cannot share that
+// axis. SmallT T=2..16 launches one fused grid (x=batch) instead of this loop.
+void nvfp4_snapshot_decode_rows(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
+                                Tensor& conv_states, const Tensor& valid_columns,
+                                const Tensor& initial_state_slots, const Tensor& snapshot_base_slots,
+                                Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream,
+                                ConvGeometry geometry) {
+    for (std::int32_t batch_index = 0; batch_index < geometry.batch; ++batch_index) {
+        const Tensor valid_b = selector_row(valid_columns, batch_index);
+        Tensor query_b       = packed_row(query, batch_index);
+        Tensor key_b         = packed_row(key, batch_index);
+        Tensor value_b       = packed_row(value, batch_index);
+        Tensor z_b           = packed_row(z, batch_index);
+        detail::nvfp4_gdn_snapshot_dispatch(
+            packed_row(x, batch_index), weight, conv_weight, conv_states, valid_b,
+            initial_state_slots.slice(0, batch_index, 1),
+            snapshot_base_slots.slice(0, batch_index, 1), query_b, key_b, value_b, z_b, policy,
+            workspace, stream);
+    }
+}
+
 void require_record_operands(const Tensor& conv_weight, const Tensor& conv_states,
                              const Tensor& valid_columns, const Tensor& initial_state_slots,
                              std::int32_t channels, ConvGeometry geometry) {
@@ -387,19 +420,21 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
                             "gdn_input_proj_conv_snapshot", "value");
         require_conv_tensor(z, kZRows, geometry.width, geometry.batch,
                             "gdn_input_proj_conv_snapshot", "z");
-        const detail::Nvfp4GdnConvPlan plan =
-            detail::nvfp4_gdn_conv_resolve_plan(policy, geometry.width, geometry.batch);
         if (geometry.batch > 1) {
-            if (plan.schedule != detail::Nvfp4GdnConvScheduleId::Materialized) {
-                throw std::logic_error("batched NVFP4 GDN conv selected a fused schedule");
+            const detail::Nvfp4GdnConvPlan plan =
+                detail::nvfp4_gdn_conv_resolve_plan(policy, geometry.width, geometry.batch);
+            if (plan.schedule == detail::Nvfp4GdnConvScheduleId::Materialized) {
+                throw std::logic_error("batched NVFP4 GDN snapshot has no Materialized route");
             }
-            compose_batched_snapshot(x, conv_weight, conv_states, valid_columns,
-                                     initial_state_slots, snapshot_base_slots, query, key, value, z,
-                                     kQueryRows, kKeyRows, kValueRows, geometry, workspace, stream,
-                                     [&](const Tensor& x_flat, Tensor& projected, Tensor& z_flat) {
-                                         gdn_input_proj(x_flat, weight, projected, z_flat, policy,
-                                                        workspace, stream);
-                                     });
+            if (plan.schedule == detail::Nvfp4GdnConvScheduleId::DecodeFusedA16) {
+                nvfp4_snapshot_decode_rows(x, weight, conv_weight, conv_states, valid_columns,
+                                           initial_state_slots, snapshot_base_slots, query, key,
+                                           value, z, policy, workspace, stream, geometry);
+                return;
+            }
+            detail::nvfp4_gdn_snapshot_dispatch(x, weight, conv_weight, conv_states, valid_columns,
+                                                initial_state_slots, snapshot_base_slots, query,
+                                                key, value, z, policy, workspace, stream);
             return;
         }
         detail::nvfp4_gdn_snapshot_dispatch(x, weight, conv_weight, conv_states, valid_columns,
@@ -502,11 +537,20 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
                                   conv_record, query, key, value, z, workspace, parent_index);
         require_record_parent_index(parent_index, geometry);
 
+        // Packed T=2..16 uses one SmallT fused GEMM+FP32 conv launch (grid.x=B when
+        // B>1). Flattened compose-record (W4A4 + BF16 conv) flips greedy column 0.
         const bool tree = parent_index_active(parent_index);
         const detail::Nvfp4GdnConvPlan plan =
             detail::nvfp4_gdn_conv_resolve_plan(policy, geometry.width, geometry.batch);
-        if (tree ||
-            (plan.schedule == detail::Nvfp4GdnConvScheduleId::Materialized && geometry.batch > 1)) {
+        if (plan.schedule == detail::Nvfp4GdnConvScheduleId::SmallTFusedA16) {
+            const std::int32_t* parent_ptr =
+                tree ? static_cast<const std::int32_t*>(parent_index->data) : nullptr;
+            detail::nvfp4_gdn_record_small_t_launch(x, weight, conv_weight, conv_states,
+                                                    valid_columns, initial_state_slots, conv_record,
+                                                    query, key, value, z, stream, parent_ptr);
+            return;
+        }
+        if (tree) {
             compose_record(x, conv_weight, conv_states, valid_columns, initial_state_slots,
                            conv_record, query, key, value, z, geometry, workspace, stream,
                            [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
@@ -514,12 +558,6 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
                                               workspace, stream);
                            },
                            parent_index);
-            return;
-        }
-        if (plan.schedule == detail::Nvfp4GdnConvScheduleId::SmallTFusedA16) {
-            detail::nvfp4_gdn_record_small_t_launch(x, weight, conv_weight, conv_states,
-                                                    valid_columns, initial_state_slots, conv_record,
-                                                    query, key, value, z, stream);
             return;
         }
 
@@ -685,18 +723,9 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
             "gdn_input_proj_conv_snapshot workspace: unsupported single-parent profile");
     }
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
-    if (batch_size == 1) {
-        return detail::nvfp4_gdn_snapshot_workspace_capacity_bytes(policy, min_width, max_width);
-    }
-
     (void)detail::nvfp4_gdn_conv_resolve_plan(policy, min_width, batch_size);
     (void)detail::nvfp4_gdn_conv_resolve_plan(policy, max_width, batch_size);
-
-    constexpr std::int32_t kChannels       = 10240;
-    const std::int32_t aggregate_columns   = batch_size * max_width;
-    const std::size_t projection_workspace = gdn_input_proj_workspace_capacity_bytes(
-        parent_qtype, parent_rows, input_rows, policy, batch_size * min_width, aggregate_columns);
-    return composed_snapshot_capacity(kChannels, aggregate_columns, projection_workspace);
+    return detail::nvfp4_gdn_snapshot_workspace_capacity_bytes(policy, min_width, max_width);
 }
 
 std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
@@ -733,16 +762,15 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
         detail::nvfp4_gdn_conv_resolve_plan(policy, min_width, batch_size);
     const detail::Nvfp4GdnConvPlan maximum_plan =
         detail::nvfp4_gdn_conv_resolve_plan(policy, max_width, batch_size);
-    if (batch_size == 1) {
-        if (minimum_plan.schedule == detail::Nvfp4GdnConvScheduleId::DecodeFusedA16) {
-            throw std::logic_error("ReplaySSM record planner admitted NVFP4 decode");
-        }
-        if (maximum_plan.schedule == detail::Nvfp4GdnConvScheduleId::SmallTFusedA16) { return 0; }
-        return detail::nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy::AllowA4,
-                                                                std::max(min_width, 4), max_width);
+    if (minimum_plan.schedule == detail::Nvfp4GdnConvScheduleId::DecodeFusedA16) {
+        throw std::logic_error("ReplaySSM record planner admitted NVFP4 decode");
     }
-    return detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, batch_size * min_width,
-                                                            batch_size * max_width);
+    if (maximum_plan.schedule == detail::Nvfp4GdnConvScheduleId::SmallTFusedA16) { return 0; }
+    if (batch_size > 1) {
+        throw std::logic_error("batched NVFP4 conv-record has no Materialized route");
+    }
+    return detail::nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy::AllowA4,
+                                                            std::max(min_width, 4), max_width);
 }
 
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,

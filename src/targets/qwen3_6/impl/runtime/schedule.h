@@ -131,6 +131,8 @@ struct TargetVerifyFrameView {
     Tensor prefix_lengths;
     Tensor accepted_column;
     Tensor fold_path;
+    Tensor draft_selector_ids;
+    Tensor draft_selector_q;
     bool tree_verify = false;
     const GdnReplayRecords* replay_records = nullptr;
     const ops::SamplingConfig* sampling    = nullptr;

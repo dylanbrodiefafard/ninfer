@@ -8,6 +8,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace ninfer;
@@ -123,7 +124,9 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
                         const std::vector<std::int32_t>& drafts, std::int32_t initial_length,
                         int token_domain, ops::SamplingConfig config,
                         const std::vector<std::int32_t>& initial_token_counts,
-                        const AcceptExpected& expected) {
+                        const AcceptExpected& expected,
+                        const std::vector<std::int32_t>* selector_ids = nullptr,
+                        const std::vector<float>* selector_q = nullptr) {
     const int k              = static_cast<int>(drafts.size());
     DeviceBuffer d_targets   = to_device(target_tokens);
     DeviceBuffer d_logits    = to_device(logits_bits);
@@ -154,12 +157,28 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
     Tensor sampled(d_sampled.data(), DType::I32, {k + 1});
     Tensor num_sampled(d_num.data(), DType::I32, {1});
     Tensor accepted(d_accepted.data(), DType::I32, {1});
+    DeviceBuffer d_sel_ids;
+    DeviceBuffer d_sel_q;
+    Tensor sel_ids_t;
+    Tensor sel_q_t;
+    const Tensor* sel_ids_arg = nullptr;
+    const Tensor* sel_q_arg   = nullptr;
+    if (selector_ids != nullptr && selector_q != nullptr) {
+        const int cap = static_cast<int>(selector_ids->size() / static_cast<std::size_t>(k));
+        d_sel_ids     = to_device(*selector_ids);
+        d_sel_q       = to_device(*selector_q);
+        sel_ids_t     = Tensor(d_sel_ids.p, DType::I32, {cap, k});
+        sel_q_t       = Tensor(d_sel_q.p, DType::FP32, {cap, k});
+        sel_ids_arg   = &sel_ids_t;
+        sel_q_arg     = &sel_q_t;
+    }
     const std::size_t workspace_bytes =
         ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, 1, 1);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
     ops::speculative_accept_greedy_drafts(
         targets, logits, draft_tensor, extent, length, token, sampled, num_sampled, accepted,
-        token_domain, static_cast<const ops::SamplingConfig*>(d_config.p), workspace, nullptr);
+        token_domain, static_cast<const ops::SamplingConfig*>(d_config.p), workspace, nullptr,
+        sel_ids_arg, sel_q_arg);
     cuda_synchronize();
 
     int failures = verify_exact((label + " sampled").c_str(), read<std::int32_t>(d_sampled, k + 1),
@@ -319,6 +338,193 @@ int greedy_tree_extent_case(int extent, int expected_accepted) {
     return failures;
 }
 
+std::vector<std::uint16_t> peaked_column_logits(int physical_rows, int width,
+                                                const std::vector<std::int32_t>& peak_by_col) {
+    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * static_cast<std::size_t>(width),
+                              -20.0f);
+    for (int col = 0; col < width; ++col) {
+        const int tok = peak_by_col[static_cast<std::size_t>(col)];
+        if (tok >= 0 && tok < physical_rows) {
+            logits[static_cast<std::size_t>(col) * static_cast<std::size_t>(physical_rows) +
+                   static_cast<std::size_t>(tok)] = 20.0f;
+        }
+    }
+    round_to_bf16(logits);
+    std::vector<std::uint16_t> bits(logits.size());
+    for (std::size_t i = 0; i < logits.size(); ++i) { bits[i] = f32_to_bf16(logits[i]); }
+    return bits;
+}
+
+int execute_tree_case(const std::string& label, int token_domain, int physical_rows, int width,
+                      const std::vector<std::int32_t>& parent, const std::vector<std::int32_t>& ids,
+                      const std::vector<std::int32_t>& targets, const std::vector<std::uint16_t>& logits,
+                      int extent, int valid, const ops::SamplingConfig& config_in,
+                      const std::vector<std::int32_t>& initial_counts,
+                      const std::vector<std::int32_t>& want_lic, int want_accepted,
+                      int want_column, const std::vector<std::int32_t>& want_path,
+                      int initial_length = 40) {
+    DeviceBuffer d_targets = to_device(targets);
+    DeviceBuffer d_logits  = to_device(logits);
+    DeviceBuffer d_ids     = to_device(ids);
+    DeviceBuffer d_parent  = to_device(parent);
+    DeviceBuffer d_valid   = to_device<std::int32_t>({valid});
+    DeviceBuffer d_extent  = to_device<std::int32_t>({extent});
+    DeviceBuffer d_counts  = to_device(initial_counts);
+    ops::SamplingConfig config = config_in;
+    config.token_counts        = static_cast<std::int32_t*>(d_counts.p);
+    DeviceBuffer d_config      = device_config(config);
+
+    GuardedDeviceBuffer d_length(sizeof(std::int32_t));
+    GuardedDeviceBuffer d_anchors(sizeof(std::int32_t));
+    GuardedDeviceBuffer d_licensed(static_cast<std::size_t>(width) * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_lic_count(sizeof(std::int32_t));
+    GuardedDeviceBuffer d_accepted(sizeof(std::int32_t));
+    GuardedDeviceBuffer d_column(sizeof(std::int32_t));
+    GuardedDeviceBuffer d_path(static_cast<std::size_t>(width) * sizeof(std::int32_t));
+    initialize(d_length, std::vector<std::int32_t>{initial_length});
+    initialize(d_anchors, std::vector<std::int32_t>{-1});
+    d_licensed.fill(0x9d);
+    initialize(d_lic_count, std::vector<std::int32_t>{-1});
+    initialize(d_accepted, std::vector<std::int32_t>{-1});
+    initialize(d_column, std::vector<std::int32_t>{-1});
+    d_path.fill(0x9d);
+
+    Tensor target_t(d_targets.p, DType::I32, {width, 1});
+    Tensor logits_t(d_logits.p, DType::BF16, {physical_rows, width, 1});
+    Tensor ids_t(d_ids.p, DType::I32, {width, 1});
+    Tensor parent_t(d_parent.p, DType::I32, {width, 1});
+    Tensor valid_t(d_valid.p, DType::I32, {1});
+    Tensor extent_t(d_extent.p, DType::I32, {1});
+    Tensor length_t(d_length.data(), DType::I32, {1});
+    Tensor anchors_t(d_anchors.data(), DType::I32, {1});
+    Tensor licensed_t(d_licensed.data(), DType::I32, {width, 1});
+    Tensor lic_count_t(d_lic_count.data(), DType::I32, {1});
+    Tensor accepted_t(d_accepted.data(), DType::I32, {1});
+    Tensor column_t(d_column.data(), DType::I32, {1});
+    Tensor path_t(d_path.data(), DType::I32, {width, 1});
+    const std::size_t workspace_bytes =
+        ops::speculative_accept_tree_drafts_workspace_capacity_bytes(token_domain, width, width, 1,
+                                                                     1);
+    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+    ops::speculative_accept_tree_drafts(
+        target_t, logits_t, ids_t, parent_t, valid_t, extent_t, length_t, anchors_t, licensed_t,
+        lic_count_t, accepted_t, column_t, path_t, token_domain,
+        static_cast<const ops::SamplingConfig*>(d_config.p), workspace, nullptr);
+    cuda_synchronize();
+
+    int failures = verify_exact((label + " accepted").c_str(), read<std::int32_t>(d_accepted, 1),
+                                {want_accepted});
+    failures += verify_exact((label + " licensed count").c_str(), read<std::int32_t>(d_lic_count, 1),
+                             {want_accepted + 1});
+    failures +=
+        verify_exact((label + " licensed").c_str(), read<std::int32_t>(d_licensed, width), want_lic);
+    failures += verify_exact((label + " path").c_str(), read<std::int32_t>(d_path, width), want_path);
+    failures += verify_exact((label + " column").c_str(), read<std::int32_t>(d_column, 1),
+                             {want_column});
+    failures += verify_exact((label + " anchor").c_str(), read<std::int32_t>(d_anchors, 1),
+                             {want_lic[static_cast<std::size_t>(want_accepted)]});
+    failures += verify_exact((label + " length").c_str(), read<std::int32_t>(d_length, 1),
+                             {initial_length + want_accepted + 1});
+    auto expected_counts = initial_counts;
+    if (config.temperature > 0.0f) {
+        for (int i = 0; i <= want_accepted; ++i) {
+            ++expected_counts[static_cast<std::size_t>(want_lic[static_cast<std::size_t>(i)])];
+        }
+    }
+    failures += verify_exact((label + " token counts").c_str(),
+                             from_device<std::int32_t>(d_counts, expected_counts.size()),
+                             expected_counts);
+    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+        std::cerr << label << ": workspace query/execution high-water mismatch\n";
+        ++failures;
+    }
+    return failures;
+}
+
+int greedy_tree_second_child_case(int token_domain) {
+    constexpr int kWidth = 4;
+    const std::vector<std::int32_t> parent{-1, 0, 0, 1};
+    const std::vector<std::int32_t> verify_ids{7, 10, 11, 12};
+    const std::vector<std::int32_t> targets{11, 99, 50, 0};
+    const auto logits = peaked_column_logits(token_domain, kWidth, {11, 99, 50, 0});
+    std::vector<std::int32_t> counts(static_cast<std::size_t>(token_domain), 0);
+    std::vector<std::int32_t> want_lic{11, 50, 0, 0};
+    std::vector<std::int32_t> want_path{0, 2, 0, 0};
+    return execute_tree_case("tree greedy second child V=" + std::to_string(token_domain),
+                             token_domain, token_domain, kWidth, parent, verify_ids, targets,
+                             logits, 7, kWidth, ops::SamplingConfig{}, counts, want_lic, 1, 2,
+                             want_path);
+}
+
+int tree_sampling_membership_cases(int token_domain) {
+    constexpr int kWidth = 4;
+    const std::vector<std::int32_t> parent{-1, 0, 0, 1};
+    const std::vector<std::int32_t> verify_ids{7, 10, 11, 12};
+    const std::vector<std::int32_t> targets{0, 0, 0, 0};
+    ops::SamplingConfig cfg{};
+    cfg.temperature = 1.0f;
+    cfg.top_k       = 1;
+    cfg.seed        = 1ull;
+    std::vector<std::int32_t> counts(static_cast<std::size_t>(token_domain), 0);
+    counts[10] = 3;
+    counts[11] = 4;
+    counts[5]  = 9;
+    counts[50] = 1;
+    const std::string tag = " V=" + std::to_string(token_domain);
+
+    int failures = 0;
+    {
+        const auto logits = peaked_column_logits(token_domain, kWidth, {10, 50, 0, 0});
+        std::vector<std::int32_t> want_lic{10, 50, 0, 0};
+        std::vector<std::int32_t> want_path{0, 1, 0, 0};
+        failures += execute_tree_case("tree sampling first child" + tag, token_domain, token_domain,
+                                      kWidth, parent, verify_ids, targets, logits, 7, kWidth, cfg,
+                                      counts, want_lic, 1, 1, want_path);
+    }
+    {
+        const auto logits = peaked_column_logits(token_domain, kWidth, {11, 0, 50, 0});
+        std::vector<std::int32_t> want_lic{11, 50, 0, 0};
+        std::vector<std::int32_t> want_path{0, 2, 0, 0};
+        failures += execute_tree_case("tree sampling second child" + tag, token_domain, token_domain,
+                                      kWidth, parent, verify_ids, targets, logits, 7, kWidth, cfg,
+                                      counts, want_lic, 1, 2, want_path);
+    }
+    {
+        const auto logits = peaked_column_logits(token_domain, kWidth, {5, 0, 0, 0});
+        std::vector<std::int32_t> want_lic{5, 0, 0, 0};
+        std::vector<std::int32_t> want_path{0, 0, 0, 0};
+        failures += execute_tree_case("tree sampling miss child" + tag, token_domain, token_domain,
+                                      kWidth, parent, verify_ids, targets, logits, 7, kWidth, cfg,
+                                      counts, want_lic, 0, 0, want_path);
+    }
+    return failures;
+}
+
+int tree_sampling_presence_overlay_case(int token_domain) {
+    constexpr int kWidth = 2;
+    const std::vector<std::int32_t> parent{-1, 0};
+    const std::vector<std::int32_t> verify_ids{0, 10};
+    const std::vector<std::int32_t> targets{0, 0};
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * kWidth, -20.0f);
+    logits[10] = 20.0f;
+    logits[static_cast<std::size_t>(token_domain) + 10] = 20.0f;
+    logits[static_cast<std::size_t>(token_domain) + 20] = 20.0f;
+    round_to_bf16(logits);
+    std::vector<std::uint16_t> bits(logits.size());
+    for (std::size_t i = 0; i < logits.size(); ++i) { bits[i] = f32_to_bf16(logits[i]); }
+    ops::SamplingConfig cfg{};
+    cfg.temperature      = 1.0f;
+    cfg.top_k            = 1;
+    cfg.presence_penalty = 100.0f;
+    cfg.seed             = 1ull;
+    std::vector<std::int32_t> counts(static_cast<std::size_t>(token_domain), 0);
+    std::vector<std::int32_t> want_lic{10, 20};
+    std::vector<std::int32_t> want_path{0, 1};
+    return execute_tree_case("tree sampling presence overlay V=" + std::to_string(token_domain),
+                             token_domain, token_domain, kWidth, parent, verify_ids, targets, bits,
+                             1, kWidth, cfg, counts, want_lic, 1, 1, want_path);
+}
+
 int deterministic_sampling_case() {
     constexpr int physical_rows = 248320;
     constexpr int token_domain  = 248077;
@@ -428,6 +634,276 @@ int batched_sampling_workspace_stride_case() {
     return failures;
 }
 
+std::pair<std::vector<std::int32_t>, std::vector<float>>
+make_chain_selector(const std::vector<std::int32_t>& drafts, float q_draft, int cap = 16) {
+    const int k = static_cast<int>(drafts.size());
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(cap) * static_cast<std::size_t>(k));
+    std::vector<float> q(static_cast<std::size_t>(cap) * static_cast<std::size_t>(k), 0.0f);
+    for (int i = 0; i < k; ++i) {
+        const std::size_t base                    = static_cast<std::size_t>(cap) * i;
+        ids[base]                                 = drafts[static_cast<std::size_t>(i)];
+        q[base]                                   = q_draft;
+        for (int c = 1; c < cap; ++c) {
+            ids[base + static_cast<std::size_t>(c)] = 2000 + c + 32 * i;
+        }
+    }
+    return {ids, q};
+}
+
+int greedy_ignores_selector_case() {
+    constexpr int k            = 5;
+    constexpr int accepted     = 2;
+    constexpr int token_domain = 64;
+    std::vector<std::int32_t> targets(static_cast<std::size_t>(k + 1));
+    std::vector<std::int32_t> drafts(static_cast<std::size_t>(k));
+    for (int i = 0; i <= k; ++i) {
+        targets[static_cast<std::size_t>(i)] = 3 + 2 * i;
+        if (i < k) { drafts[static_cast<std::size_t>(i)] = targets[static_cast<std::size_t>(i)]; }
+    }
+    drafts[static_cast<std::size_t>(accepted)] =
+        targets[static_cast<std::size_t>(accepted)] + 1;
+    const std::int32_t initial_length = 200 + k;
+    const auto expected               = accept_state_oracle(
+        drafts, accepted, targets[static_cast<std::size_t>(accepted)], initial_length);
+    std::vector<std::uint16_t> logits(static_cast<std::size_t>(token_domain) * (k + 1));
+    for (std::size_t i = 0; i < logits.size(); ++i) {
+        logits[i] = static_cast<std::uint16_t>(0x3f00u + (i % 127u));
+    }
+    std::vector<std::int32_t> token_counts(token_domain);
+    for (int i = 0; i < token_domain; ++i) { token_counts[static_cast<std::size_t>(i)] = i % 5; }
+    const auto [ids, q] = make_chain_selector(drafts, 0.0f);
+    return execute_accept_case("speculative greedy ignores selector q", targets, logits,
+                               token_domain, drafts, initial_length, token_domain,
+                               ops::SamplingConfig{}, token_counts, expected, &ids, &q);
+}
+
+int onehot_selector_matches_null_case() {
+    constexpr int physical_rows = 248320;
+    constexpr int token_domain  = 248077;
+    constexpr int k             = 5;
+    constexpr int accepted      = 2;
+    const std::vector<std::int32_t> drafts{17, 7919, 65537, 131071, 200003};
+    std::vector<std::int32_t> targets(static_cast<std::size_t>(k + 1));
+    for (int i = 0; i <= k; ++i) { targets[static_cast<std::size_t>(i)] = 101 + i; }
+    constexpr std::int32_t correction = 150001;
+
+    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * (k + 1), -20.0f);
+    for (int col = 0; col <= k; ++col) {
+        const std::size_t base = static_cast<std::size_t>(col) * physical_rows;
+        const int winner =
+            col < accepted ? drafts[static_cast<std::size_t>(col)] : correction + col - accepted;
+        logits[base + static_cast<std::size_t>(winner)] = 20.0f;
+        logits[base + token_domain]                     = 100.0f;
+        logits[base + physical_rows - 1]                = 200.0f;
+    }
+    round_to_bf16(logits);
+    std::vector<std::uint16_t> logits_bits(logits.size());
+    for (std::size_t i = 0; i < logits.size(); ++i) { logits_bits[i] = f32_to_bf16(logits[i]); }
+
+    const std::int32_t initial_length = 4093;
+    const auto expected = accept_state_oracle(drafts, accepted, correction, initial_length);
+    std::vector<std::int32_t> token_counts(token_domain, 0);
+    token_counts[static_cast<std::size_t>(drafts[0])]  = 3;
+    token_counts[static_cast<std::size_t>(drafts[1])]  = 5;
+    token_counts[static_cast<std::size_t>(correction)] = 7;
+
+    ops::SamplingConfig config{};
+    config.temperature = 1.0f;
+    config.top_k       = 1;
+    config.top_p       = 0.9f;
+    config.min_p       = 0.5f;
+    config.seed        = 0x123456789abcdef0ull;
+    const auto [ids, q] = make_chain_selector(drafts, 1.0f);
+    return execute_accept_case("speculative sampling one-hot selector q", targets, logits_bits,
+                               physical_rows, drafts, initial_length, token_domain, config,
+                               token_counts, expected, &ids, &q);
+}
+
+int zero_q_rejects_and_corrects_case(int token_domain) {
+    constexpr int k = 1;
+    const std::vector<std::int32_t> drafts{7};
+    const std::vector<std::int32_t> targets{3, 11};
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * (k + 1), -20.0f);
+    logits[3]                                = 20.0f;
+    logits[static_cast<std::size_t>(token_domain) + 11] = 20.0f;
+    round_to_bf16(logits);
+    std::vector<std::uint16_t> logits_bits(logits.size());
+    for (std::size_t i = 0; i < logits.size(); ++i) { logits_bits[i] = f32_to_bf16(logits[i]); }
+    const std::int32_t initial_length = 40;
+    const auto expected               = accept_state_oracle(drafts, 0, 3, initial_length);
+    std::vector<std::int32_t> token_counts(token_domain, 0);
+    ops::SamplingConfig config{};
+    config.temperature  = 1.0f;
+    config.top_k        = 1;
+    config.seed         = 1ull;
+    const auto [ids, q] = make_chain_selector(drafts, 0.0f);
+    return execute_accept_case("speculative sampling q(d)=0 rejects and corrects V=" +
+                                   std::to_string(token_domain),
+                               targets, logits_bits, token_domain, drafts, initial_length,
+                               token_domain, config, token_counts, expected, &ids, &q);
+}
+
+int fractional_q_accepts_when_p_covers_q() {
+    constexpr int token_domain = 64;
+    constexpr int k            = 1;
+    const std::vector<std::int32_t> drafts{7};
+    const std::vector<std::int32_t> targets{7, 11};
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * (k + 1), -20.0f);
+    logits[7]                                          = 20.0f;
+    logits[static_cast<std::size_t>(token_domain) + 11] = 20.0f;
+    round_to_bf16(logits);
+    std::vector<std::uint16_t> logits_bits(logits.size());
+    for (std::size_t i = 0; i < logits.size(); ++i) { logits_bits[i] = f32_to_bf16(logits[i]); }
+    const std::int32_t initial_length = 40;
+    const auto expected               = accept_state_oracle(drafts, 1, 11, initial_length);
+    std::vector<std::int32_t> token_counts(token_domain, 0);
+    ops::SamplingConfig config{};
+    config.temperature  = 1.0f;
+    config.top_k        = 1;
+    config.seed         = 7ull;
+    const auto [ids, q] = make_chain_selector(drafts, 0.5f);
+    return execute_accept_case("speculative sampling q=0.5 p=1 accepts", targets, logits_bits,
+                               token_domain, drafts, initial_length, token_domain, config,
+                               token_counts, expected, &ids, &q);
+}
+
+int fractional_q_rejects_when_p_is_zero() {
+    constexpr int token_domain = 64;
+    constexpr int k            = 1;
+    const std::vector<std::int32_t> drafts{7};
+    const std::vector<std::int32_t> targets{3, 11};
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * (k + 1), -20.0f);
+    logits[3]                                          = 20.0f;
+    logits[static_cast<std::size_t>(token_domain) + 11] = 20.0f;
+    round_to_bf16(logits);
+    std::vector<std::uint16_t> logits_bits(logits.size());
+    for (std::size_t i = 0; i < logits.size(); ++i) { logits_bits[i] = f32_to_bf16(logits[i]); }
+    const std::int32_t initial_length = 40;
+    const auto expected               = accept_state_oracle(drafts, 0, 3, initial_length);
+    std::vector<std::int32_t> token_counts(token_domain, 0);
+    ops::SamplingConfig config{};
+    config.temperature  = 1.0f;
+    config.top_k        = 1;
+    config.seed         = 7ull;
+    const auto [ids, q] = make_chain_selector(drafts, 0.5f);
+    return execute_accept_case("speculative sampling q=0.5 p=0 rejects", targets, logits_bits,
+                               token_domain, drafts, initial_length, token_domain, config,
+                               token_counts, expected, &ids, &q);
+}
+
+int residual_p_minus_q_prefers_uncovered_mass() {
+    constexpr int token_domain = 64;
+    constexpr int k            = 1;
+    const std::vector<std::int32_t> drafts{7};
+    const std::vector<std::int32_t> targets{3, 11};
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * (k + 1), -20.0f);
+    logits[3]  = 20.0f;
+    logits[11] = 20.0f;
+    logits[static_cast<std::size_t>(token_domain) + 11] = 20.0f;
+    round_to_bf16(logits);
+    std::vector<std::uint16_t> logits_bits(logits.size());
+    for (std::size_t i = 0; i < logits.size(); ++i) { logits_bits[i] = f32_to_bf16(logits[i]); }
+    const std::int32_t initial_length = 40;
+    const auto expected               = accept_state_oracle(drafts, 0, 11, initial_length);
+    std::vector<std::int32_t> token_counts(token_domain, 0);
+    ops::SamplingConfig config{};
+    config.temperature = 1.0f;
+    config.top_k       = 3;
+    config.seed        = 7ull;
+    constexpr int cap  = 16;
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(cap) * k, 0);
+    std::vector<float> q(static_cast<std::size_t>(cap) * k, 0.0f);
+    ids[0] = 7;
+    q[0]   = 0.5f;
+    ids[1] = 3;
+    q[1]   = 0.5f;
+    ids[2] = 11;
+    q[2]   = 0.0f;
+    return execute_accept_case("speculative sampling residual p-q picks uncovered token", targets,
+                               logits_bits, token_domain, drafts, initial_length, token_domain,
+                               config, token_counts, expected, &ids, &q);
+}
+
+int batched_selector_row_isolation_case() {
+    constexpr int token_domain = 64;
+    constexpr int k            = 1;
+    constexpr int batch        = 2;
+    constexpr int columns      = k + 1;
+    constexpr int cap          = 16;
+    const std::vector<std::int32_t> drafts{7, 9};
+    const std::vector<std::int32_t> targets{7, 11, 3, 11};
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * columns * batch, -20.0f);
+    logits[7]                                                                = 20.0f;
+    logits[static_cast<std::size_t>(token_domain) + 11]                       = 20.0f;
+    logits[static_cast<std::size_t>(columns) * token_domain + 3]              = 20.0f;
+    logits[static_cast<std::size_t>(columns) * token_domain + token_domain + 11] = 20.0f;
+    round_to_bf16(logits);
+    std::vector<std::uint16_t> logits_bits(logits.size());
+    for (std::size_t i = 0; i < logits.size(); ++i) { logits_bits[i] = f32_to_bf16(logits[i]); }
+
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(cap) * k * batch, 0);
+    std::vector<float> q(static_cast<std::size_t>(cap) * k * batch, 0.0f);
+    ids[0]      = 7;
+    q[0]        = 0.5f;
+    ids[cap]    = 9;
+    q[cap]      = 0.5f;
+
+    DeviceBuffer d_targets = to_device(targets);
+    DeviceBuffer d_logits  = to_device(logits_bits);
+    DeviceBuffer d_drafts  = to_device(drafts);
+    DeviceBuffer d_extents = to_device<std::int32_t>({k, k});
+    DeviceBuffer d_lengths = to_device<std::int32_t>({40, 80});
+    DeviceBuffer d_anchors = to_device<std::int32_t>({-1, -1});
+    DeviceBuffer d_licensed(static_cast<std::size_t>(columns) * batch * sizeof(std::int32_t));
+    DeviceBuffer d_counts(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
+    DeviceBuffer d_accepted(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
+    DeviceBuffer d_sel_ids = to_device(ids);
+    DeviceBuffer d_sel_q   = to_device(q);
+    std::vector<std::int32_t> token_counts(token_domain, 0);
+    DeviceBuffer d_token_counts = to_device(token_counts);
+    ops::SamplingConfig config{};
+    config.temperature  = 1.0f;
+    config.top_k        = 1;
+    config.seed         = 7ull;
+    config.token_counts = static_cast<std::int32_t*>(d_token_counts.p);
+    const std::vector<ops::SamplingConfig> configs{config, config};
+    DeviceBuffer d_configs = to_device(configs);
+
+    Tensor targets_t(d_targets.p, DType::I32, {columns, batch});
+    Tensor logits_t(d_logits.p, DType::BF16, {token_domain, columns, batch});
+    Tensor draft_t(d_drafts.p, DType::I32, {k, batch});
+    Tensor extents(d_extents.p, DType::I32, {batch});
+    Tensor lengths(d_lengths.p, DType::I32, {batch});
+    Tensor anchors(d_anchors.p, DType::I32, {batch});
+    Tensor licensed(d_licensed.p, DType::I32, {columns, batch});
+    Tensor lic_counts(d_counts.p, DType::I32, {batch});
+    Tensor accepted(d_accepted.p, DType::I32, {batch});
+    Tensor sel_ids_t(d_sel_ids.p, DType::I32, {cap, k, batch});
+    Tensor sel_q_t(d_sel_q.p, DType::FP32, {cap, k, batch});
+    const std::size_t workspace_bytes =
+        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, batch,
+                                                                       batch);
+    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+    ops::speculative_accept_greedy_drafts(
+        targets_t, logits_t, draft_t, extents, lengths, anchors, licensed, lic_counts, accepted,
+        token_domain, static_cast<const ops::SamplingConfig*>(d_configs.p), workspace, nullptr,
+        &sel_ids_t, &sel_q_t);
+    cuda_synchronize();
+
+    int failures = verify_exact("batched selector licensed",
+                                from_device<std::int32_t>(d_licensed, columns * batch),
+                                {7, 11, 3, 0});
+    failures += verify_exact("batched selector accepted",
+                             from_device<std::int32_t>(d_accepted, batch), {1, 0});
+    failures += verify_exact("batched selector counts", from_device<std::int32_t>(d_counts, batch),
+                             {2, 1});
+    failures += verify_exact("batched selector lengths",
+                             from_device<std::int32_t>(d_lengths, batch), {42, 81});
+    failures += verify_exact("batched selector anchors",
+                             from_device<std::int32_t>(d_anchors, batch), {11, 3});
+    return failures;
+}
+
 int select_hidden_case(int rows, int columns, int accepted_value) {
     std::vector<std::uint16_t> hidden(static_cast<std::size_t>(rows) * columns);
     for (int col = 0; col < columns; ++col) {
@@ -520,6 +996,20 @@ int main() {
         std::cerr << "speculative accept workspace accepted an invalid draft interval\n";
         ++failures;
     } catch (const std::invalid_argument&) {}
+    const std::size_t tree12 =
+        ops::speculative_accept_tree_drafts_workspace_capacity_bytes(257, 12, 12, 1, 1);
+    if (tree12 == 0 || tree12 != ops::sampling_workspace_capacity_bytes(257, 12, 12) ||
+        ops::speculative_accept_tree_drafts_workspace_capacity_bytes(257, 12, 12, 1, 2) !=
+            2 * tree12 ||
+        ops::speculative_accept_tree_drafts_workspace_capacity_bytes(64, 4, 4, 1, 1) != 0) {
+        std::cerr << "speculative tree accept workspace did not close over packed width\n";
+        ++failures;
+    }
+    try {
+        (void)ops::speculative_accept_tree_drafts_workspace_capacity_bytes(257, 1, 12, 1, 1);
+        std::cerr << "speculative tree accept workspace accepted W<2\n";
+        ++failures;
+    } catch (const std::invalid_argument&) {}
     for (const int k : {1, 5, 15}) failures += prepare_verify_case(k);
     failures += greedy_accept_case(1, 0);
     failures += greedy_accept_case(5, 2);
@@ -527,6 +1017,12 @@ int main() {
     failures += greedy_accept_case(15, 7, 257);
     failures += greedy_tree_extent_case(7, 1);
     failures += greedy_tree_extent_case(0, 0);
+    failures += greedy_tree_second_child_case(64);
+    failures += greedy_tree_second_child_case(257);
+    failures += tree_sampling_membership_cases(64);
+    failures += tree_sampling_membership_cases(257);
+    failures += tree_sampling_presence_overlay_case(64);
+    failures += tree_sampling_presence_overlay_case(257);
     failures += deterministic_sampling_case();
     failures += batched_sampling_workspace_stride_case();
     failures += select_hidden_case(5120, 6, 0);
@@ -535,6 +1031,14 @@ int main() {
     failures += remap_case(1);
     failures += remap_case(15);
     failures += remap_case(120);
+    failures += greedy_ignores_selector_case();
+    failures += onehot_selector_matches_null_case();
+    failures += zero_q_rejects_and_corrects_case(64);
+    failures += zero_q_rejects_and_corrects_case(257);
+    failures += fractional_q_accepts_when_p_covers_q();
+    failures += fractional_q_rejects_when_p_is_zero();
+    failures += residual_p_minus_q_prefers_uncovered_mass();
+    failures += batched_selector_row_isolation_case();
 
     if (failures != 0) {
         std::cerr << "speculative_round failures=" << failures << '\n';

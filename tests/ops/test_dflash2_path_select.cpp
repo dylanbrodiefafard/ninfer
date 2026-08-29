@@ -109,12 +109,24 @@ void call_path_select(const Tensor& logits, const Tensor& hidden, const Weight& 
                       std::int32_t batch, float temperature, unsigned long long seed, Tensor& path,
                       WorkspaceArena& workspace, cudaStream_t stream,
                       const Tensor* logit_token_ids = nullptr, const Weight* pred_nvfp4 = nullptr,
-                      const Weight* succ_nvfp4 = nullptr) {
-    std::vector<float> temperatures(static_cast<std::size_t>(batch), temperature);
-    std::vector<unsigned long long> seeds(static_cast<std::size_t>(batch), seed);
-    ops::dflash2_path_select(logits, hidden, weight, pred, succ, anchors, temperatures.data(),
-                             seeds.data(), path, workspace, stream, logit_token_ids, pred_nvfp4,
-                             succ_nvfp4);
+                      const Weight* succ_nvfp4 = nullptr, Tensor* selector_ids = nullptr,
+                      Tensor* selector_q = nullptr, bool force_greedy = false) {
+    std::vector<ops::SamplingConfig> configs(static_cast<std::size_t>(batch));
+    for (std::int32_t b = 0; b < batch; ++b) {
+        configs[static_cast<std::size_t>(b)].temperature = temperature;
+        configs[static_cast<std::size_t>(b)].seed        = seed;
+    }
+    GuardedDeviceBuffer device_configs(configs.size() * sizeof(ops::SamplingConfig));
+    device_configs.copy_from_host(configs.data(), device_configs.bytes());
+    std::vector<std::int32_t> logical_positions(static_cast<std::size_t>(batch), 100);
+    GuardedDeviceBuffer device_positions(logical_positions.size() * sizeof(std::int32_t));
+    device_positions.copy_from_host(logical_positions.data(), device_positions.bytes());
+    Tensor positions(device_positions.data(), DType::I32, {batch});
+    ops::dflash2_path_select(logits, hidden, weight, pred, succ, anchors, positions,
+                             reinterpret_cast<const ops::SamplingConfig*>(device_configs.data()),
+                             path, workspace, stream, logit_token_ids, pred_nvfp4, succ_nvfp4,
+                             selector_ids, selector_q, 0, 0, force_greedy);
+    cuda_synchronize();
 }
 
 int run_greedy_case(const char* label, std::int32_t vocab, std::int32_t tokens, std::int32_t batch,
@@ -154,12 +166,18 @@ int run_greedy_case(const char* label, std::int32_t vocab, std::int32_t tokens, 
     GuardedDeviceBuffer device_succ(succ_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer device_anchors(anchors.size() * sizeof(std::int32_t));
     GuardedDeviceBuffer device_path(static_cast<std::size_t>(tokens) * batch * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_sel_ids(
+        static_cast<std::size_t>(kTopK) * tokens * batch * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_sel_q(
+        static_cast<std::size_t>(kTopK) * tokens * batch * sizeof(float));
     device_logits.copy_from_host(logit_bits.data(), device_logits.bytes());
     device_hidden.copy_from_host(hidden_bits.data(), device_hidden.bytes());
     device_pred.copy_from_host(pred_bits.data(), device_pred.bytes());
     device_succ.copy_from_host(succ_bits.data(), device_succ.bytes());
     device_anchors.copy_from_host(anchors.data(), device_anchors.bytes());
     device_path.fill(0xcd);
+    device_sel_ids.fill(0xcd);
+    device_sel_q.fill(0xcd);
 
     Tensor logits_t =
         batch == 1 ? Tensor(device_logits.data(), DType::BF16, {vocab, tokens})
@@ -172,19 +190,59 @@ int run_greedy_case(const char* label, std::int32_t vocab, std::int32_t tokens, 
     Tensor anchors_t(device_anchors.data(), DType::I32, {batch});
     Tensor path_t = batch == 1 ? Tensor(device_path.data(), DType::I32, {tokens})
                                : Tensor(device_path.data(), DType::I32, {tokens, batch});
+    Tensor sel_ids_t =
+        batch == 1 ? Tensor(device_sel_ids.data(), DType::I32, {kTopK, tokens})
+                   : Tensor(device_sel_ids.data(), DType::I32, {kTopK, tokens, batch});
+    Tensor sel_q_t = batch == 1 ? Tensor(device_sel_q.data(), DType::FP32, {kTopK, tokens})
+                                : Tensor(device_sel_q.data(), DType::FP32, {kTopK, tokens, batch});
 
     const std::size_t workspace_bytes = ops::dflash2_path_select_workspace_capacity_bytes(
         QType::BF16_CTRL, tokens, tokens, batch);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
     call_path_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t, batch,
-                     0.0f, 0ull, path_t, workspace, nullptr);
+                     0.6f, 0ull, path_t, workspace, nullptr, nullptr, nullptr, nullptr, &sel_ids_t,
+                     &sel_q_t, true);
     cuda_synchronize();
 
     int failures = verify_exact(label, from_device<std::int32_t>(device_path.data(),
                                                                static_cast<std::size_t>(tokens) *
                                                                    batch),
                                 expected);
+    const auto got_ids =
+        from_device<std::int32_t>(device_sel_ids.data(),
+                                  static_cast<std::size_t>(kTopK) * tokens * batch);
+    const auto got_q =
+        from_device<float>(device_sel_q.data(), static_cast<std::size_t>(kTopK) * tokens * batch);
+    for (std::int32_t b = 0; b < batch; ++b) {
+        for (std::int32_t t = 0; t < tokens; ++t) {
+            const std::size_t hop =
+                (static_cast<std::size_t>(b) * tokens + t) * static_cast<std::size_t>(kTopK);
+            const int chosen = expected[static_cast<std::size_t>(t) +
+                                        static_cast<std::size_t>(b) * tokens];
+            float qsum       = 0.0f;
+            int hot          = 0;
+            bool matched     = false;
+            for (std::int32_t c = 0; c < kTopK; ++c) {
+                const float qv = got_q[hop + static_cast<std::size_t>(c)];
+                qsum += qv;
+                if (qv == 1.0f) {
+                    ++hot;
+                    if (got_ids[hop + static_cast<std::size_t>(c)] == chosen) { matched = true; }
+                } else if (qv != 0.0f) {
+                    std::cerr << label << ": greedy selector_q not one-hot at t=" << t << "\n";
+                    ++failures;
+                }
+            }
+            if (hot != 1 || !matched || qsum != 1.0f) {
+                std::cerr << label << ": greedy selector did not one-hot the path token t=" << t
+                          << "\n";
+                ++failures;
+            }
+        }
+    }
     failures += device_path.verify_guards("dflash2_path_select path");
+    failures += device_sel_ids.verify_guards("dflash2_path_select selector_ids");
+    failures += device_sel_q.verify_guards("dflash2_path_select selector_q");
     failures += device_weight.verify_preserved("dflash2_path_select weight");
     return failures;
 }
@@ -246,6 +304,160 @@ int run_stochastic_support_case() {
         }
     }
     return 0;
+}
+
+int run_stochastic_batch_row_invariance_case() {
+    constexpr std::int32_t vocab  = 32;
+    constexpr std::int32_t tokens = 2;
+    constexpr std::int32_t batch  = 2;
+    HostWeight host_weight        = make_patterned(kRank, kHidden, 13u);
+    DeviceWeight device_weight(std::move(host_weight));
+
+    std::vector<float> logits(static_cast<std::size_t>(vocab) * tokens * batch, -12.0f);
+    std::vector<float> hidden(static_cast<std::size_t>(kHidden) * tokens * batch, 0.0f);
+    std::vector<float> pred(static_cast<std::size_t>(kRank) * vocab, 0.0f);
+    std::vector<float> succ(static_cast<std::size_t>(kRank) * vocab, 0.0f);
+    for (std::int32_t b = 0; b < batch; ++b) {
+        for (std::int32_t t = 0; t < tokens; ++t) {
+            const std::size_t base = static_cast<std::size_t>(b * tokens + t) * vocab;
+            for (std::int32_t c = 0; c < kTopK; ++c) {
+                logits[base + static_cast<std::size_t>(c)] =
+                    8.0f - 0.05f * static_cast<float>(c);
+            }
+        }
+    }
+    round_to_bf16(logits);
+    round_to_bf16(hidden);
+
+    const auto logit_bits  = encode_bf16(logits);
+    const auto hidden_bits = encode_bf16(hidden);
+    const auto pred_bits   = encode_bf16(pred);
+    const auto succ_bits   = encode_bf16(succ);
+    GuardedDeviceBuffer device_logits(logit_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_hidden(hidden_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_pred(pred_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_succ(succ_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_anchors(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_path(static_cast<std::size_t>(tokens) * batch *
+                                    sizeof(std::int32_t));
+    const std::array<std::int32_t, batch> anchors{3, 3};
+    device_logits.copy_from_host(logit_bits.data(), device_logits.bytes());
+    device_hidden.copy_from_host(hidden_bits.data(), device_hidden.bytes());
+    device_pred.copy_from_host(pred_bits.data(), device_pred.bytes());
+    device_succ.copy_from_host(succ_bits.data(), device_succ.bytes());
+    device_anchors.copy_from_host(anchors.data(), device_anchors.bytes());
+    device_path.fill(0xcd);
+
+    Tensor logits_t(device_logits.data(), DType::BF16, {vocab, tokens, batch});
+    Tensor hidden_t(device_hidden.data(), DType::BF16, {kHidden, tokens, batch});
+    Tensor pred_t(device_pred.data(), DType::BF16, {kRank, vocab});
+    Tensor succ_t(device_succ.data(), DType::BF16, {kRank, vocab});
+    Tensor anchors_t(device_anchors.data(), DType::I32, {batch});
+    Tensor path_t(device_path.data(), DType::I32, {tokens, batch});
+    WorkspaceArena workspace(std::max<std::size_t>(
+        256, ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens,
+                                                               batch)));
+    call_path_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t, batch,
+                     0.6f, 42ull, path_t, workspace, nullptr);
+
+    const auto got = from_device<std::int32_t>(device_path.data(),
+                                                static_cast<std::size_t>(tokens) * batch);
+    if (!std::equal(got.begin(), got.begin() + tokens, got.begin() + tokens)) {
+        std::cerr << "dflash2_path_select stochastic result depends on compact batch row\n";
+        return 1;
+    }
+    return 0;
+}
+
+int run_stochastic_selector_q_case() {
+    constexpr std::int32_t vocab  = 32;
+    constexpr std::int32_t tokens = 2;
+    HostWeight host_weight        = make_patterned(kRank, kHidden, 9u);
+    DeviceWeight device_weight(std::move(host_weight));
+
+    std::vector<float> logits(static_cast<std::size_t>(vocab) * tokens, -12.0f);
+    std::vector<float> hidden(static_cast<std::size_t>(kHidden) * tokens, 0.0f);
+    std::vector<float> pred(static_cast<std::size_t>(kRank) * vocab, 0.0f);
+    std::vector<float> succ(static_cast<std::size_t>(kRank) * vocab, 0.0f);
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        for (std::int32_t c = 0; c < kTopK; ++c) {
+            logits[static_cast<std::size_t>(t) * vocab + c] = 8.0f - 0.05f * static_cast<float>(c);
+        }
+    }
+    round_to_bf16(logits);
+    round_to_bf16(hidden);
+    const std::int32_t anchor = 3;
+
+    const auto logit_bits  = encode_bf16(logits);
+    const auto hidden_bits = encode_bf16(hidden);
+    const auto pred_bits   = encode_bf16(pred);
+    const auto succ_bits   = encode_bf16(succ);
+    GuardedDeviceBuffer device_logits(logit_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_hidden(hidden_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_pred(pred_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_succ(succ_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_anchors(sizeof(std::int32_t));
+    GuardedDeviceBuffer device_path(static_cast<std::size_t>(tokens) * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_sel_ids(static_cast<std::size_t>(kTopK) * tokens *
+                                       sizeof(std::int32_t));
+    GuardedDeviceBuffer device_sel_q(static_cast<std::size_t>(kTopK) * tokens * sizeof(float));
+    device_logits.copy_from_host(logit_bits.data(), device_logits.bytes());
+    device_hidden.copy_from_host(hidden_bits.data(), device_hidden.bytes());
+    device_pred.copy_from_host(pred_bits.data(), device_pred.bytes());
+    device_succ.copy_from_host(succ_bits.data(), device_succ.bytes());
+    device_anchors.copy_from_host(&anchor, sizeof(anchor));
+    device_path.fill(0xcd);
+    device_sel_ids.fill(0xcd);
+    device_sel_q.fill(0xcd);
+
+    Tensor logits_t(device_logits.data(), DType::BF16, {vocab, tokens});
+    Tensor hidden_t(device_hidden.data(), DType::BF16, {kHidden, tokens});
+    Tensor pred_t(device_pred.data(), DType::BF16, {kRank, vocab});
+    Tensor succ_t(device_succ.data(), DType::BF16, {kRank, vocab});
+    Tensor anchors_t(device_anchors.data(), DType::I32, {1});
+    Tensor path_t(device_path.data(), DType::I32, {tokens});
+    Tensor sel_ids_t(device_sel_ids.data(), DType::I32, {kTopK, tokens});
+    Tensor sel_q_t(device_sel_q.data(), DType::FP32, {kTopK, tokens});
+    WorkspaceArena workspace(std::max<std::size_t>(
+        256, ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, 1)));
+    call_path_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t, 1, 0.6f,
+                     42ull, path_t, workspace, nullptr, nullptr, nullptr, nullptr, &sel_ids_t,
+                     &sel_q_t);
+    cuda_synchronize();
+
+    const auto path =
+        from_device<std::int32_t>(device_path.data(), static_cast<std::size_t>(tokens));
+    const auto ids =
+        from_device<std::int32_t>(device_sel_ids.data(), static_cast<std::size_t>(kTopK) * tokens);
+    const auto q =
+        from_device<float>(device_sel_q.data(), static_cast<std::size_t>(kTopK) * tokens);
+    int failures = 0;
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        const std::size_t hop = static_cast<std::size_t>(t) * kTopK;
+        float qsum            = 0.0f;
+        int hot               = 0;
+        int mass_n            = 0;
+        bool path_in_list     = false;
+        float path_q          = 0.0f;
+        for (std::int32_t c = 0; c < kTopK; ++c) {
+            const float qv = q[hop + static_cast<std::size_t>(c)];
+            qsum += qv;
+            if (qv == 1.0f) { ++hot; }
+            if (qv > 1.0e-6f) { ++mass_n; }
+            if (ids[hop + static_cast<std::size_t>(c)] == path[static_cast<std::size_t>(t)]) {
+                path_in_list = true;
+                path_q       = qv;
+            }
+        }
+        if (std::abs(qsum - 1.0f) > 1.0e-5f || hot == 1 || mass_n < 2 || !path_in_list ||
+            path_q <= 0.0f) {
+            std::cerr << "dflash2_path_select stochastic q: hop " << t << " qsum=" << qsum
+                      << " hot=" << hot << " mass_n=" << mass_n << " path_q=" << path_q << "\n";
+            ++failures;
+        }
+    }
+    failures += device_sel_q.verify_guards("dflash2_path_select stochastic selector_q");
+    return failures;
 }
 
 int run_shortlist_remap_case() {
@@ -704,14 +916,25 @@ int run_mixed_temperature_batch_case() {
     Tensor pred_t(device_pred.data(), DType::BF16, {kRank, vocab});
     Tensor succ_t(device_succ.data(), DType::BF16, {kRank, vocab});
     Tensor anchors_t(device_anchors.data(), DType::I32, {batch});
+    const std::array<std::int32_t, 2> logical_positions{100, 200};
+    GuardedDeviceBuffer device_positions(logical_positions.size() * sizeof(std::int32_t));
+    device_positions.copy_from_host(logical_positions.data(), device_positions.bytes());
+    Tensor positions_t(device_positions.data(), DType::I32, {batch});
     Tensor path_t(device_path.data(), DType::I32, {tokens, batch});
-    const float temperatures[2]              = {0.7f, 0.0f};
-    const unsigned long long seeds[2]        = {42ull, 0ull};
+    std::vector<ops::SamplingConfig> configs(2);
+    configs[0].temperature = 0.7f;
+    configs[0].seed        = 42ull;
+    configs[1].temperature = 0.0f;
+    configs[1].seed        = 0ull;
+    GuardedDeviceBuffer device_configs(configs.size() * sizeof(ops::SamplingConfig));
+    device_configs.copy_from_host(configs.data(), device_configs.bytes());
     WorkspaceArena workspace(std::max<std::size_t>(
         256, ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens,
                                                                batch)));
     ops::dflash2_path_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t,
-                             temperatures, seeds, path_t, workspace, nullptr);
+                              positions_t,
+                              reinterpret_cast<const ops::SamplingConfig*>(device_configs.data()),
+                             path_t, workspace, nullptr);
     cuda_synchronize();
 
     const auto got = from_device<std::int32_t>(device_path.data(),
@@ -1098,13 +1321,16 @@ int main() {
     }
 
     int failures = 0;
-    failures += run_greedy_case("dflash2_path_select greedy T=2 V=256", 256, 2, 1, 11u);
+    failures +=
+        run_greedy_case("dflash2_path_select forced-greedy refinement T=2 V=256", 256, 2, 1, 11u);
     failures += run_greedy_case("dflash2_path_select greedy T=1 V=64", 64, 1, 1, 13u);
     failures += run_greedy_case("dflash2_path_select greedy T=4 B=2 V=64", 64, 4, 2, 17u);
     failures += run_greedy_case("dflash2_path_select greedy T=5 B=2 V=64", 64, 5, 2, 19u);
     failures += run_greedy_case("dflash2_path_select greedy T=4 B=3 V=64", 64, 4, 3, 23u);
     failures += run_greedy_case("dflash2_path_select greedy T=5 B=3 V=64", 64, 5, 3, 29u);
     failures += run_stochastic_support_case();
+    failures += run_stochastic_batch_row_invariance_case();
+    failures += run_stochastic_selector_q_case();
     failures += run_mixed_temperature_batch_case();
     failures += run_shortlist_remap_case();
     failures += run_nan_logits_shortlist_case();

@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <utility>
 
 namespace ninfer::ops::detail {
@@ -17,28 +18,49 @@ using Launch       = void (*)(const Tensor&, const Weight&, const Tensor&, Tenso
                         cudaStream_t);
 using RecordLaunch = void (*)(const Tensor&, const Weight&, const Tensor&, const Tensor&,
                               const Tensor&, const Tensor&, Tensor&, Tensor&, Tensor&, Tensor&,
-                              Tensor&, cudaStream_t);
+                              Tensor&, const std::int32_t*, cudaStream_t);
 
-template <int ActiveTokens, class Publish>
+// Packed T=2..16 GDN conv uses the SmallT production schedule (token-parallel GEMM) with
+// FP32 projected-conv in the epilogue. B>1 is one launch (grid.x = B, T=W per row), not a
+// host loop and not flatten-to-B*W compose: the latter's W4A4+BF16 conv flips greedy col 0.
+template <int ActiveTokens, bool Tree, class Publish>
 void launch_exact(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
                   const Tensor& conv_states, const Tensor& valid_columns,
                   const Tensor& initial_slot, Tensor& query, Tensor& key, Tensor& value, Tensor& z,
-                  Publish publish, cudaStream_t stream) {
+                  Publish publish, cudaStream_t stream,
+                  const std::int32_t* parent_index = nullptr) {
     using Geometry = Nvfp4GdnInputGeometry;
     using Schedule = typename Nvfp4LinearSmallTProductionSchedule<Geometry, ActiveTokens>::Type;
     static_assert(Schedule::kTokenTile == ActiveTokens);
+    static_assert(Schedule::kWarpsPerRow == 1);
 
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const float inverse   = 1.0F / weight.weight_scale_divisor;
-    nvfp4_small_t_kernel<Geometry, ActiveTokens, Schedule, Nvfp4IdentityEpilogue,
-                         Nvfp4GdnConvOutput<ActiveTokens, Publish>,
-                         Nvfp4SmallTFinalization::RowVector>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
-            Nvfp4PackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data)},
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), inverse, Nvfp4IdentityEpilogue{},
-            make_nvfp4_gdn_conv_output<ActiveTokens>(conv_weight, conv_states, valid_columns,
-                                                     initial_slot, query, key, value, z, publish));
+    const int batch       = x.ne[2] > 1 ? x.ne[2] : 1;
+    const auto output     = make_nvfp4_gdn_conv_output<ActiveTokens, Tree>(
+        conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z, publish,
+        parent_index);
+    if (batch > 1) {
+        nvfp4_small_t_kernel<Geometry, ActiveTokens, Schedule, Nvfp4IdentityEpilogue,
+                             Nvfp4GdnConvOutput<ActiveTokens, Publish, Tree>,
+                             Nvfp4SmallTFinalization::RowVector,
+                             Nvfp4BatchedPackedActivation<Geometry>>
+            <<<dim3(batch, kBlocks), Schedule::kThreads, 0, stream>>>(
+                Nvfp4BatchedPackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data),
+                                                       ActiveTokens},
+                static_cast<const std::uint8_t*>(weight.qdata),
+                static_cast<const std::uint8_t*>(weight.scales), inverse, Nvfp4IdentityEpilogue{},
+                output);
+    } else {
+        nvfp4_small_t_kernel<Geometry, ActiveTokens, Schedule, Nvfp4IdentityEpilogue,
+                             Nvfp4GdnConvOutput<ActiveTokens, Publish, Tree>,
+                             Nvfp4SmallTFinalization::RowVector>
+            <<<kBlocks, Schedule::kThreads, 0, stream>>>(
+                Nvfp4PackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data)},
+                static_cast<const std::uint8_t*>(weight.qdata),
+                static_cast<const std::uint8_t*>(weight.scales), inverse, Nvfp4IdentityEpilogue{},
+                output);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -48,7 +70,7 @@ void launch_snapshot_exact(const Tensor& x, const Weight& weight, const Tensor& 
                            const Tensor& initial_slot, const Tensor& snapshot_base_slot,
                            Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                            cudaStream_t stream) {
-    launch_exact<ActiveTokens>(
+    launch_exact<ActiveTokens, false>(
         x, weight, conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z,
         SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data),
                                static_cast<const std::int32_t*>(snapshot_base_slot.data),
@@ -60,12 +82,18 @@ template <int ActiveTokens>
 void launch_record_exact(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
                          const Tensor& conv_states, const Tensor& valid_columns,
                          const Tensor& initial_slot, Tensor& conv_record, Tensor& query,
-                         Tensor& key, Tensor& value, Tensor& z, cudaStream_t stream) {
-    launch_exact<ActiveTokens>(x, weight, conv_weight, conv_states, valid_columns, initial_slot,
-                               query, key, value, z,
-                               RecordColumnPublish{static_cast<__nv_bfloat16*>(conv_record.data),
-                                                   kNvfp4GdnChannels, ActiveTokens},
-                               stream);
+                         Tensor& key, Tensor& value, Tensor& z, const std::int32_t* parent_index,
+                         cudaStream_t stream) {
+    const RecordColumnPublish publish{static_cast<__nv_bfloat16*>(conv_record.data),
+                                      kNvfp4GdnChannels, ActiveTokens};
+    if (parent_index == nullptr) {
+        launch_exact<ActiveTokens, false>(x, weight, conv_weight, conv_states, valid_columns,
+                                          initial_slot, query, key, value, z, publish, stream);
+        return;
+    }
+    launch_exact<ActiveTokens, true>(x, weight, conv_weight, conv_states, valid_columns,
+                                     initial_slot, query, key, value, z, publish, stream,
+                                     parent_index);
 }
 
 template <std::size_t... Offsets>
@@ -100,10 +128,11 @@ void nvfp4_gdn_record_small_t_launch(const Tensor& x, const Weight& weight,
                                      const Tensor& conv_weight, const Tensor& conv_states,
                                      const Tensor& valid_columns, const Tensor& initial_slot,
                                      Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
-                                     Tensor& z, cudaStream_t stream) {
+                                     Tensor& z, cudaStream_t stream,
+                                     const std::int32_t* parent_index) {
     const std::size_t index = static_cast<std::size_t>(x.ne[1] - kNvfp4FirstSmallT);
     kRecordLaunchers[index](x, weight, conv_weight, conv_states, valid_columns, initial_slot,
-                            conv_record, query, key, value, z, stream);
+                            conv_record, query, key, value, z, parent_index, stream);
 }
 
 } // namespace ninfer::ops::detail

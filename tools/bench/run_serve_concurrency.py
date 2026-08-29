@@ -184,6 +184,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="DFlash/MTP proposal head: optimized (--lm-head-draft) or full vocab (default: optimized)",
     )
     parser.add_argument(
+        "--kv-dtype",
+        choices=corpus.KV_DTYPES,
+        default="int8",
+        help="KV cache storage (default: int8, published concurrent method)",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true", help="print point commands and request counts only"
     )
     return parser.parse_args(argv)
@@ -224,7 +230,7 @@ def build_points(
     points: list[Point] = []
     for target, artifact in artifacts:
         for mode_name in mode_names:
-            backend, draft_tokens = corpus.SPECULATIVE_MODES[mode_name]
+            backend, draft_tokens, _verify_width = corpus.SPECULATIVE_MODES[mode_name]
             if backend == "dflash" and target not in {"qwen3_6_35b_a3b", "qwen3_8_27b"}:
                 raise corpus.CampaignError(
                     "DFlash measurements require the 35B-A3B or Qwen3.8-27B target"
@@ -370,7 +376,7 @@ def server_command(
         "--request-log-jsonl",
         str(server_log),
         "--kv-dtype",
-        "int8",
+        args.kv_dtype,
         "--no-prefix-reuse",
     ]
     if point.speculative_backend != "none":
@@ -421,7 +427,7 @@ def validate_server_start(
         "pending_timeout_ms": PENDING_TIMEOUT_MS,
         "prefill_chunk": args.prefill_chunk,
         "log_stats_interval_ms": STATS_INTERVAL_MS,
-        "kv_cache": "int8-group64",
+        "kv_cache": corpus.KV_CACHE_LOG_NAMES[args.kv_dtype],
         "cuda_graph": True,
         "prefix_reuse": False,
         "speculative_backend": point.speculative_backend,
@@ -926,6 +932,15 @@ def run_point(
     return report
 
 
+def decode_saturation_tok_s(report: dict[str, Any]) -> float:
+    steady = report["metrics"]["steady"]
+    if steady.get("source") == "request_done":
+        aggregate = steady.get("aggregate_decode_tokens_per_second")
+        if aggregate is not None:
+            return float(aggregate)
+    return float(steady["decode_tokens_per_second"])
+
+
 def add_speedups(reports: Sequence[dict[str, Any]]) -> None:
     baselines: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
     for report in reports:
@@ -951,8 +966,8 @@ def add_speedups(reports: Sequence[dict[str, Any]]) -> None:
         if baseline is None:
             continue
         if report["suite"] == "decode-saturation":
-            current = float(report["metrics"]["steady"]["decode_tokens_per_second"])
-            reference = float(baseline["metrics"]["steady"]["decode_tokens_per_second"])
+            current = decode_saturation_tok_s(report)
+            reference = decode_saturation_tok_s(baseline)
             report["speedup_vs_c1"] = current / reference
         else:
             current = float(report["metrics"]["makespan_seconds"])
@@ -1007,10 +1022,10 @@ def summary_row(report: dict[str, Any]) -> dict[str, Any]:
     }
     if report["suite"] == "decode-saturation":
         row["average_decode_batch"] = report["metrics"]["steady"]["average_decode_batch"]
+        if row["average_decode_batch"] is None:
+            row["average_decode_batch"] = report["decode_batch"]["average_size"]
         row["steady_seconds"] = report["metrics"]["steady"]["seconds"]
-        row["steady_decode_tokens_per_second"] = report["metrics"]["steady"][
-            "decode_tokens_per_second"
-        ]
+        row["steady_decode_tokens_per_second"] = decode_saturation_tok_s(report)
         row["makespan_seconds"] = report["metrics"]["wave_makespan_seconds"]
     else:
         row["makespan_seconds"] = report["metrics"]["makespan_seconds"]

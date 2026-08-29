@@ -867,6 +867,10 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
         fold_rows[row] = ops::GdnReplayFoldRow{
             .linear_state_slot = LinearStateSlots::current_state_slot(lane, max_concurrency),
             .commit_columns    = static_cast<std::int32_t>(committed),
+            // A negative path length selects the ordinary chain prefix. Zero is a
+            // valid tree path length, so value-initialization would otherwise make
+            // every non-tree DFlash commit fold no GDN columns at all.
+            .path_length       = -1,
         };
         const bool tree_fold = speculative_backend == SpeculativeBackend::DFlash &&
                                dflash_uses_tree_verify(draft_window, dflash_verify_width);
@@ -938,6 +942,17 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                                            cudaMemcpyHostToDevice, device.stream));
                 Tensor kv_rows = frame.text_kv_table_rows.slice(0, 0, batch);
                 Tensor prefix  = frame.execution_frontiers.slice(0, 0, batch);
+                // Tree accept mutates `execution_frontiers` as sampler `lengths`
+                // (E += committed). Compact copies packed slots E+path[i] → E+i,
+                // so the prefix must stay the verify-time window base.
+                std::array<std::int32_t, kMaximumConcurrency> host_prefix{};
+                for (std::size_t row = 0; row < lanes.size(); ++row) {
+                    host_prefix[row] =
+                        checked_i32(requests[lanes[row]].pending.base_E, "DFlash compact prefix");
+                }
+                CUDA_CHECK(cudaMemcpyAsync(prefix.data, host_prefix.data(),
+                                           lanes.size() * sizeof(std::int32_t),
+                                           cudaMemcpyHostToDevice, device.stream));
                 const std::int32_t verify_w =
                     static_cast<std::int32_t>(dflash_verify_width);
                 bool identity_path = true;
@@ -2277,7 +2292,8 @@ void ProgramImplCore::prepare_graphs() {
                     static_cast<std::uint32_t>(std::min<std::uint64_t>(
                         capacity, static_cast<std::uint64_t>(planned.max) +
                                       dflash_verify_width))};
-
+                prepare_representative(planned.min, batch_size);
+                device.synchronize();
                 schedule::capture_dflash_decode_batch(
                     dflash_state, static_cast<std::int32_t>(batch_size), draft_window,
                     dflash_verify_width, dflash_envelopes(planned.min, planned.max, draft_window),
@@ -3060,7 +3076,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
     try {
         DecodeGraphExecutable* executable   = nullptr;
         schedule::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier, draft_window);
-        ops::GqaExecutionEnvelope target_envelope{1, maximum_target_tokens};
+        ops::GqaExecutionEnvelope target_envelope{maximum_frontier + 1, maximum_target_tokens};
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(dflash_graphs, static_cast<std::uint32_t>(lanes.size()),
@@ -3083,6 +3099,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                     : 0U;
             const std::uint32_t extent =
                 std::min({draft_window, max_by_budget, capacity - frontier - 1U});
+            if (row == 0) { *dflash_host_ingress = {}; }
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
             dflash_host_ingress->execution_frontiers[row] =
                 checked_i32(frontier, "DFlash batch frontier");

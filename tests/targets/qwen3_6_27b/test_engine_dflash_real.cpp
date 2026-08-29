@@ -5,7 +5,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <iostream>
+#include <new>
 #include <string>
 #include <utility>
 #include <vector>
@@ -15,10 +17,10 @@ namespace {
 ninfer::EngineOptions base_engine_options(const char* artifact) {
     ninfer::EngineOptions options;
     options.artifact_path  = artifact;
-    options.max_context    = 256;
-    options.kv_capacity    = ninfer::KvCapacityPolicy::explicit_capacity(256);
+    options.max_context    = 512;
+    options.kv_capacity    = ninfer::KvCapacityPolicy::explicit_capacity(512);
     options.prefill_chunk  = 128;
-    options.kv_cache       = ninfer::KvCacheStorage::BFloat16;
+    options.kv_cache       = ninfer::KvCacheStorage::Nvfp4;
     options.use_cuda_graph = true;
     options.enable_vision  = false;
     return options;
@@ -60,7 +62,7 @@ void dump_speculative(const char* tag, const ninfer::SpeculativeStats& stats) {
 }
 
 int report_mismatch(const char* label, const ninfer::GenerationResult& result,
-                    const std::vector<ninfer::TokenId>& want) {
+                    const std::vector<ninfer::TokenId>& want, const char* want_name) {
     const auto mismatch =
         std::mismatch(result.generated_token_ids.begin(), result.generated_token_ids.end(),
                       want.begin(), want.end());
@@ -68,18 +70,66 @@ int report_mismatch(const char* label, const ninfer::GenerationResult& result,
               << static_cast<std::size_t>(mismatch.first - result.generated_token_ids.begin())
               << ": dflash="
               << (mismatch.first == result.generated_token_ids.end() ? -1 : *mismatch.first)
-              << " oracle=" << (mismatch.second == want.end() ? -1 : *mismatch.second) << '\n';
+              << ' ' << want_name << '='
+              << (mismatch.second == want.end() ? -1 : *mismatch.second) << '\n';
     dump_tokens("  got   ", result.generated_token_ids);
-    dump_tokens("  oracle", want);
+    std::cerr << "  " << want_name << " [" << want.size() << "]:";
+    for (ninfer::TokenId token : want) { std::cerr << ' ' << token; }
+    std::cerr << '\n';
     dump_speculative("  spec  ", result.speculative);
     return 1;
 }
 
-bool prefix_matches(const std::vector<ninfer::TokenId>& got,
-                    const std::vector<ninfer::TokenId>& baseline, std::size_t count) {
-    return got.size() == count &&
-           std::equal(got.begin(), got.end(), baseline.begin(),
-                      baseline.begin() + static_cast<std::ptrdiff_t>(count));
+std::size_t match_prefix_length(const std::vector<ninfer::TokenId>& got,
+                                const std::vector<ninfer::TokenId>& want) {
+    const auto mismatch =
+        std::mismatch(got.begin(), got.end(), want.begin(), want.end());
+    return static_cast<std::size_t>(mismatch.first - got.begin());
+}
+
+bool relax_oracle() { return std::getenv("NINFER_DFLASH_TEST_RELAX_ORACLE") != nullptr; }
+
+int check_speculative(const ninfer::GenerationResult& result, const char* label);
+
+enum class OracleKind { TargetOnly, C1DFlash };
+
+// Target-only: packed/T=1 numerical identity. First token must agree. A later greedy
+// flip fails the default run; NINFER_DFLASH_TEST_RELAX_ORACLE=1 prints it and continues.
+// C=1 DFlash: overlapping C>1 must match sequential C=1 of the same k. Never relaxed —
+// that comparison is row isolation, not packed-versus-T=1 drift. Flattening NVFP4
+// GDN conv-record to T=W*B compose (W4A4 GEMM + BF16 conv) flipped greedy col 0 vs
+// C=1 fused SmallT+FP32; the Op guard is run_nvfp4_batched_matches_serial_fused.
+int check_tokens(const char* label, const ninfer::GenerationResult& result,
+                 const std::vector<ninfer::TokenId>& want, OracleKind kind) {
+    const char* want_name = kind == OracleKind::TargetOnly ? "target-only" : "C=1 DFlash";
+    if (check_speculative(result, label) != 0) { return 1; }
+    if (result.generated_token_ids.size() != want.size()) {
+        std::cerr << label << " generated " << result.generated_token_ids.size()
+                  << " tokens, " << want_name << ' ' << want.size() << '\n';
+        dump_tokens("  got   ", result.generated_token_ids);
+        std::cerr << "  " << want_name << " [" << want.size() << "]:";
+        for (ninfer::TokenId token : want) { std::cerr << ' ' << token; }
+        std::cerr << '\n';
+        return 1;
+    }
+    const std::size_t matched = match_prefix_length(result.generated_token_ids, want);
+    if (matched < want.size()) { (void)report_mismatch(label, result, want, want_name); }
+    if (matched == 0) {
+        std::cerr << label << " first generated token disagrees with " << want_name << '\n';
+        return 1;
+    }
+    if (result.speculative.drafted_tokens > 0 && result.speculative.accepted_tokens == 0) {
+        std::cerr << label << " drafted tokens but accepted none\n";
+        return 1;
+    }
+    const bool allow_relax = kind == OracleKind::TargetOnly && relax_oracle();
+    if (matched != want.size() && !allow_relax) { return 1; }
+    if (matched < want.size()) {
+        std::cerr << label << " greedy match " << matched << '/' << want.size()
+                  << " vs " << want_name
+                  << " (NINFER_DFLASH_TEST_RELAX_ORACLE=1 continuing)\n";
+    }
+    return 0;
 }
 
 int check_dflash_load(const ninfer::Engine& engine) {
@@ -112,6 +162,9 @@ int exercise_chain_verify_short_output_entitlement(const char* artifact) {
     options.kv_cache                        = ninfer::KvCacheStorage::Nvfp4;
     options.max_context                     = 256;
     options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(256);
+    if (std::getenv("NINFER_DFLASH_TEST_NO_GRAPH") != nullptr) {
+        options.use_cuda_graph = false;
+    }
     ninfer::Engine engine(options);
     if (const int result = check_dflash_load(engine); result != 0) { return result; }
 
@@ -133,7 +186,8 @@ int exercise_chain_verify_short_output_entitlement(const char* artifact) {
 }
 
 int greedy_oracle(ninfer::Engine& engine, const std::vector<ninfer::TokenId>& prompt,
-                  std::vector<ninfer::TokenId>& oracle, const char* label) {
+                  std::vector<ninfer::TokenId>& oracle, const char* label,
+                  ninfer::GenerationResult* result_out = nullptr) {
     const ninfer::GenerationResult seq =
         engine.generate(engine.prepare_tokens(prompt), greedy_options(24));
     if (seq.generated_token_ids.size() != 24 || check_speculative(seq, label) != 0) {
@@ -141,35 +195,55 @@ int greedy_oracle(ninfer::Engine& engine, const std::vector<ninfer::TokenId>& pr
         return 1;
     }
     oracle = seq.generated_token_ids;
+    if (result_out != nullptr) { *result_out = seq; }
     return 0;
+}
+
+std::vector<ninfer::TokenId> token_prefix(const std::vector<ninfer::TokenId>& tokens,
+                                          std::uint32_t length, const char* label) {
+    if (tokens.size() < length) {
+        std::cerr << label << " oracle has " << tokens.size() << " tokens, need " << length
+                  << '\n';
+        return {};
+    }
+    return std::vector<ninfer::TokenId>(tokens.begin(), tokens.begin() + length);
 }
 
 int run_overlapping_c3(ninfer::Engine& engine,
                        const std::array<std::vector<ninfer::TokenId>, 3>& prompts,
-                       const std::array<std::vector<ninfer::TokenId>, 3>& oracles,
+                       const std::array<std::vector<ninfer::TokenId>, 3>& dflash_oracles,
+                       const std::array<std::vector<ninfer::TokenId>, 3>& target_oracles,
                        const char* label) {
+    // Per-row isolation: each overlapping request must match sequential C=1 DFlash of the
+    // same k. Target-only is a second oracle; a packed/T=1 greedy flip is not row mixing.
     constexpr std::array<std::uint32_t, 3> lengths{19, 13, 7};
     auto a = engine.submit(engine.prepare_tokens(prompts[0]), greedy_options(lengths[0]));
     auto b = engine.submit(engine.prepare_tokens(prompts[1]), greedy_options(lengths[1]));
     auto c = engine.submit(engine.prepare_tokens(prompts[2]), greedy_options(lengths[2]));
-    const std::array<ninfer::GenerationResult, 3> results{a.wait(), b.wait(), c.wait()};
+    std::array<ninfer::GenerationResult, 3> results;
+    try {
+        results = {a.wait(), b.wait(), c.wait()};
+    } catch (const std::exception& error) {
+        std::cerr << label << " concurrent speculative verify threw: " << error.what() << '\n';
+        return 1;
+    }
     const char* names[] = {"A", "B", "C"};
     int failed          = 0;
     for (std::size_t i = 0; i < 3; ++i) {
-        if (!prefix_matches(results[i].generated_token_ids, oracles[i], lengths[i]) ||
-            check_speculative(results[i], label) != 0) {
-            std::cerr << label << " request " << names[i]
-                      << " diverged from the C=1 greedy oracle\n";
-            dump_tokens((std::string(label) + " oracle " + names[i]).c_str(),
-                        std::vector<ninfer::TokenId>(oracles[i].begin(),
-                                                     oracles[i].begin() + lengths[i]));
-            dump_tokens((std::string(label) + " got    " + names[i]).c_str(),
-                        results[i].generated_token_ids);
-            dump_speculative((std::string(label) + " spec   " + names[i]).c_str(),
-                             results[i].speculative);
-            report_mismatch(label, results[i],
-                            std::vector<ninfer::TokenId>(oracles[i].begin(),
-                                                         oracles[i].begin() + lengths[i]));
+        const std::string request = std::string(label) + " request " + names[i];
+        const std::string dflash_label = request + " C=1 DFlash";
+        const std::string target_label = request + " target-only";
+        const std::vector<ninfer::TokenId> dflash_want =
+            token_prefix(dflash_oracles[i], lengths[i], dflash_label.c_str());
+        const std::vector<ninfer::TokenId> target_want =
+            token_prefix(target_oracles[i], lengths[i], target_label.c_str());
+        if (dflash_want.empty() || target_want.empty()) { return 1; }
+        const std::string vs_dflash = request + " vs C=1 DFlash";
+        const std::string vs_target = request + " vs target-only";
+        if (check_tokens(vs_dflash.c_str(), results[i], dflash_want, OracleKind::C1DFlash) != 0) {
+            failed = 1;
+        }
+        if (check_tokens(vs_target.c_str(), results[i], target_want, OracleKind::TargetOnly) != 0) {
             failed = 1;
         }
     }
@@ -185,14 +259,17 @@ int main() {
         return 77;
     }
 
-    std::cerr << "dflash_real: chain-verify short-output Main KV entitlement\n";
-    if (const int result = exercise_chain_verify_short_output_entitlement(artifact); result != 0) {
-        return result;
+    if (std::getenv("NINFER_DFLASH_TEST_SKIP_ENTITLEMENT") == nullptr) {
+        std::cerr << "dflash_real: chain-verify short-output Main KV entitlement\n";
+        if (const int result = exercise_chain_verify_short_output_entitlement(artifact);
+            result != 0) {
+            return result;
+        }
     }
 
-    // NVFP4 AllowA4 verify at T>=4 uses W4A4 attention; ordinary T=1 decode stays A16.
-    // Product k=4/k=5 chain is T=5/T=6 SmallT. Overlapping Graph C=3 is checked against
-    // C=1 DFlash of the same k, not against MTP k=3 (T=4).
+    // Chain W=k+1 uses packed SmallT / W4A4 at T=W. Ordinary decode stays T=1 GEMV.
+    // C=1 vs target-only can flip a later greedy token (k=4 prompt 0 token 21).
+    // C>1 must still match saved C=1 DFlash of the same k (row isolation).
     const std::array<std::vector<ninfer::TokenId>, 3> prompts{
         std::vector<ninfer::TokenId>{
             248045, 846,    198, 109266, 3709,  96220, 117443, 97913,
@@ -209,28 +286,110 @@ int main() {
     };
 
     auto run_k = [&](std::uint32_t draft_tokens, const char* label) -> int {
-        ninfer::Engine engine(speculative_engine_options(
-            artifact, ninfer::SpeculativeBackend::DFlash, draft_tokens, 3));
-        if (const int result = check_dflash_load(engine); result != 0) { return result; }
-        std::array<std::vector<ninfer::TokenId>, 3> oracles;
-        for (std::size_t i = 0; i < 3; ++i) {
-            if (const int result = greedy_oracle(engine, prompts[i], oracles[i], label);
-                result != 0) {
-                return result;
+        std::array<std::vector<ninfer::TokenId>, 3> target_oracles;
+        const char* only_prompt = std::getenv("NINFER_DFLASH_TEST_ONLY_PROMPT");
+        {
+            // A DFlash self-comparison can miss a verifier that consistently commits the
+            // wrong token. Compare against the same artifact with speculative decoding disabled.
+            ninfer::Engine baseline(base_engine_options(artifact));
+            for (std::size_t i = 0; i < prompts.size(); ++i) {
+                if (only_prompt != nullptr && std::string(only_prompt) != std::to_string(i)) {
+                    continue;
+                }
+                const ninfer::GenerationResult result =
+                    baseline.generate(baseline.prepare_tokens(prompts[i]), greedy_options(24));
+                if (result.generated_token_ids.size() != 24) {
+                    std::cerr << label << " baseline did not generate 24 tokens\n";
+                    return 1;
+                }
+                target_oracles[i] = result.generated_token_ids;
             }
         }
-        if (oracles[0] == oracles[1] || oracles[0] == oracles[2] || oracles[1] == oracles[2]) {
-            std::cerr << label << " C=1 oracles are not distinct across the three prompts\n";
-            return 1;
+
+        ninfer::EngineOptions dflash_options =
+            speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, draft_tokens, 3);
+        if (std::getenv("NINFER_DFLASH_TEST_MAX1") != nullptr) {
+            dflash_options.max_concurrency = 1;
         }
-        if (const int result = run_overlapping_c3(engine, prompts, oracles, label); result != 0) {
-            return result;
+        if (std::getenv("NINFER_DFLASH_TEST_NO_GRAPH") != nullptr) {
+            dflash_options.use_cuda_graph = false;
+        }
+        if (std::getenv("NINFER_DFLASH_TEST_FULL_HEAD") != nullptr) {
+            dflash_options.speculative.proposal_head = ninfer::ProposalHead::Full;
+        }
+        if (std::getenv("NINFER_DFLASH_TEST_CHAIN") != nullptr) {
+            dflash_options.speculative.dflash_verify_width = draft_tokens + 1;
+        }
+        if (const char* verify_width = std::getenv("NINFER_DFLASH_TEST_VERIFY_WIDTH")) {
+            dflash_options.speculative.dflash_verify_width =
+                static_cast<std::uint32_t>(std::atoi(verify_width));
+        }
+        try {
+            ninfer::Engine engine(dflash_options);
+            if (const int result = check_dflash_load(engine); result != 0) { return result; }
+            std::array<std::vector<ninfer::TokenId>, 3> dflash_oracles;
+            int failed = 0;
+            for (std::size_t i = 0; i < 3; ++i) {
+                if (only_prompt != nullptr &&
+                    std::string(only_prompt) != std::to_string(i)) {
+                    continue;
+                }
+                ninfer::GenerationResult dflash_result;
+                if (const int result = greedy_oracle(engine, prompts[i], dflash_oracles[i], label,
+                                                     &dflash_result);
+                    result != 0) {
+                    return result;
+                }
+                // Packed/T=1 identity. Do not return here: C>1 isolation still uses
+                // the saved C=1 DFlash tokens even when a later greedy token flips.
+                const std::string vs_target =
+                    std::string(label) + " prompt " + std::to_string(i) + " vs target-only";
+                if (check_tokens(vs_target.c_str(), dflash_result, target_oracles[i],
+                                 OracleKind::TargetOnly) != 0) {
+                    failed = 1;
+                }
+            }
+            if (only_prompt == nullptr && (target_oracles[0] == target_oracles[1] ||
+                                           target_oracles[0] == target_oracles[2] ||
+                                           target_oracles[1] == target_oracles[2])) {
+                std::cerr << label
+                          << " target-only oracles are not distinct across the three prompts\n";
+                return 1;
+            }
+            if (only_prompt == nullptr && (dflash_oracles[0] == dflash_oracles[1] ||
+                                           dflash_oracles[0] == dflash_oracles[2] ||
+                                           dflash_oracles[1] == dflash_oracles[2])) {
+                std::cerr << label
+                          << " C=1 DFlash oracles are not distinct across the three prompts\n";
+                return 1;
+            }
+            if (only_prompt == nullptr && dflash_options.max_concurrency >= 3 &&
+                run_overlapping_c3(engine, prompts, dflash_oracles, target_oracles, label) != 0) {
+                failed = 1;
+            }
+            if (failed != 0) { return failed; }
+        } catch (const std::bad_alloc&) {
+            std::cerr << label << " engine std::bad_alloc (k=" << draft_tokens
+                      << " max_conc=" << dflash_options.max_concurrency
+                      << " graph=" << dflash_options.use_cuda_graph << ")\n";
+            return 1;
         }
         std::cout << "ok " << label << '\n' << std::flush;
         return 0;
     };
 
-    if (const int result = run_k(4, "DFlash2 k=4 chain C=3"); result != 0) { return result; }
-    if (const int result = run_k(5, "DFlash2 k=5 chain C=3"); result != 0) { return result; }
+    const char* only_k = std::getenv("NINFER_DFLASH_TEST_ONLY_K");
+    if (only_k == nullptr || std::string(only_k) == "7") {
+        if (const int result = run_k(7, "DFlash2 k=7 chain C=3"); result != 0) { return result; }
+    }
+    if (only_k == nullptr || std::string(only_k) == "1") {
+        if (const int result = run_k(1, "DFlash2 k=1 chain C=3"); result != 0) { return result; }
+    }
+    if (only_k == nullptr || std::string(only_k) == "4") {
+        if (const int result = run_k(4, "DFlash2 k=4 chain C=3"); result != 0) { return result; }
+    }
+    if (only_k == nullptr || std::string(only_k) == "5") {
+        if (const int result = run_k(5, "DFlash2 k=5 chain C=3"); result != 0) { return result; }
+    }
     return 0;
 }

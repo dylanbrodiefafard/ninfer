@@ -174,7 +174,7 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     ops::gdn_input_proj(x, parent.view(), qkv_output, z_output, policy, workspace, nullptr);
     cuda_synchronize();
 
-    const bool a4                       = policy == ops::LinearPolicy::AllowA4;
+    const bool a4                       = policy == ops::LinearPolicy::AllowA4 && tokens >= 3;
     const ReductionCriterion& criterion = a4 ? kGdnInputProjA4Tolerance : kGdnInputProjA16Tolerance;
     const std::int32_t sample_count     = a4 ? kGdnInputProjA4SampleRows : 7;
     const std::string suffix =
@@ -204,6 +204,45 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     return failures;
 }
 
+int run_nvfp4_packed_column0(DevicePackedWeight& parent, std::int32_t tokens) {
+    constexpr std::int32_t kHidden  = 5120;
+    constexpr std::int32_t kQkvRows = 10240;
+    constexpr std::int32_t kZRows   = 6144;
+    constexpr std::int32_t kRows    = kQkvRows + kZRows;
+    const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 601U + tokens);
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    DeviceBuffer device_activation                   = to_device(activation_bits);
+    GuardedBf16Tensor packed_qkv(kQkvRows, tokens);
+    GuardedBf16Tensor packed_z(kZRows, tokens);
+    GuardedBf16Tensor decode_qkv(kQkvRows, 1);
+    GuardedBf16Tensor decode_z(kZRows, 1);
+    Tensor packed_x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor decode_x(device_activation.p, DType::BF16, {kHidden, 1});
+    Tensor pqkv = packed_qkv.tensor();
+    Tensor pz   = packed_z.tensor();
+    Tensor dqkv = decode_qkv.tensor();
+    Tensor dz   = decode_z.tensor();
+    const std::size_t packed_capacity = ops::gdn_input_proj_workspace_capacity_bytes(
+        QType::NVFP4, kRows, kHidden, ops::LinearPolicy::AllowA4, tokens, tokens);
+    const std::size_t decode_capacity = ops::gdn_input_proj_workspace_capacity_bytes(
+        QType::NVFP4, kRows, kHidden, ops::LinearPolicy::A16Only, 1, 1);
+    WorkspaceArena packed_workspace(std::max<std::size_t>(packed_capacity, 256));
+    WorkspaceArena decode_workspace(std::max<std::size_t>(decode_capacity, 256));
+    ops::gdn_input_proj(packed_x, parent.view(), pqkv, pz, ops::LinearPolicy::AllowA4,
+                        packed_workspace, nullptr);
+    ops::gdn_input_proj(decode_x, parent.view(), dqkv, dz, ops::LinearPolicy::A16Only,
+                        decode_workspace, nullptr);
+    cuda_synchronize();
+    const std::string suffix =
+        std::string(" NVFP4 A4 packed-col0 T=") + std::to_string(tokens);
+    int failures = 0;
+    failures += compare_column0("gdn qkv" + suffix, packed_qkv, decode_qkv, kQkvRows,
+                                kGdnInputProjA16Tolerance);
+    failures +=
+        compare_column0("gdn z" + suffix, packed_z, decode_z, kZRows, kGdnInputProjA16Tolerance);
+    return failures;
+}
+
 int run_nvfp4() {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kRows   = 16384;
@@ -218,6 +257,9 @@ int run_nvfp4() {
     for (const std::int32_t tokens :
          {1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 18, 24, 36, 1024, 2048, 4096}) {
         failures += run_nvfp4_case(parent, tokens, ops::LinearPolicy::AllowA4);
+    }
+    for (const std::int32_t tokens : {2}) {
+        failures += run_nvfp4_packed_column0(parent, tokens);
     }
     return failures;
 }

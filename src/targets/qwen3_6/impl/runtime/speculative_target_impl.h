@@ -45,12 +45,13 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                                                 frame.selected_hidden, execution.device.stream);
         card.set_tree_verify(nullptr, nullptr, nullptr);
     } else {
-        ops::speculative_accept_greedy_drafts(frame.target_tokens, frame.target_logits, frame.drafts,
-                                              frame.current_extents, frame.frontiers, frame.anchors,
-                                              frame.licensed_tokens, frame.licensed_counts,
-                                              frame.accepted_drafts, TextConfig::token_domain,
-                                              frame.sampling, execution.work,
-                                              execution.device.stream);
+        ops::speculative_accept_greedy_drafts(
+            frame.target_tokens, frame.target_logits, frame.drafts, frame.current_extents,
+            frame.frontiers, frame.anchors, frame.licensed_tokens, frame.licensed_counts,
+            frame.accepted_drafts, TextConfig::token_domain, frame.sampling, execution.work,
+            execution.device.stream,
+            frame.draft_selector_ids.data != nullptr ? &frame.draft_selector_ids : nullptr,
+            frame.draft_selector_q.data != nullptr ? &frame.draft_selector_q : nullptr);
         ops::speculative_select_accepted_hidden(frame.target_hidden, frame.accepted_drafts,
                                                 frame.selected_hidden, execution.device.stream);
     }

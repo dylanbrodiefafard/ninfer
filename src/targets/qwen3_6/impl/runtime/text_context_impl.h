@@ -711,6 +711,18 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
     require_tensor_shape(logits, DType::BF16, {kCfg.vocab, width, batch},
                          "target verify batch logits");
     require_tensor_shape(target_tokens, DType::I32, {width, batch}, "target verify batch tokens");
+    if (active_parent_index_ != nullptr && active_parent_index_->data != nullptr) {
+        require_tensor_shape(*active_parent_index_, DType::I32, {width, batch},
+                             "target verify batch parent index");
+    }
+    if (active_ancestor_mask_ != nullptr && active_ancestor_mask_->data != nullptr) {
+        require_tensor_shape(*active_ancestor_mask_, DType::I32, {width, batch},
+                             "target verify batch ancestor mask");
+    }
+    if (active_prefix_lengths_ != nullptr && active_prefix_lengths_->data != nullptr) {
+        require_tensor_shape(*active_prefix_lengths_, DType::I32, {batch},
+                             "target verify batch prefix lengths");
+    }
 
     cudaStream_t stream = ctx_.stream;
     work_.reset();
@@ -906,7 +918,8 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
             if (replay_records_ == nullptr) {
                 throw std::logic_error("Replay-record GDN has no record storage");
             }
-            GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
+            GdnReplayRecordLayer records =
+                replay_records_->layer(gidx, 0, active_sequence_batch_);
             Variant::gdn_input_projection_record(projection_input, *w.projection, *w.conv1d,
                                                  conv_states, valid, *active_linear_state_slots_,
                                                  records.conv, query_output, key_output,
@@ -951,7 +964,12 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
             o.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
-            GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
+            GdnReplayRecordLayer records =
+                replay_records_->layer(gidx, 0, active_sequence_batch_);
+            // Nested like the workspace plan: fold scratch pops before
+            // gdn_normalized_output. Same-stream launch keeps the pointer live
+            // until this kernel completes.
+            auto fold_scope = work_.scope();
             ops::gated_delta_net_replay_record(q_batch, k_batch, v_batch, g_batch, beta_batch,
                                                kGdnScale, recurrent_states, valid,
                                                *active_linear_state_slots_, records.key,

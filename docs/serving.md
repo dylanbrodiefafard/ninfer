@@ -37,7 +37,9 @@ server must accept image or video input. Speculative residency is likewise froze
 `--spec mtp|dflash` and `--draft-tokens`; omitting `--spec` loads neither backend.
 `--lm-head-draft` additionally loads the optimized proposal head. DFlash is text-only (35B-A3B
 DFlash v1, or Qwen3.8-27B DFlash2 when `dflash/` is present) and cannot be combined with
-`--vision`. A later request cannot enable a capability omitted at startup.
+`--vision`. On Qwen3.8-27B, DFlash2 uses paper-accurate chain verify (`W=k+1`); on RTX 5090,
+`--spec dflash --draft-tokens 4 --lm-head-draft` is the measured speed recommendation.
+A later request cannot enable a capability omitted at startup.
 
 ## Endpoints
 
@@ -508,7 +510,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--kv-dtype bf16\|int8\|nvfp4` | KV-cache storage | `nvfp4` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; 35B DFlash `1..15`; 3.8 DFlash2 `1..11` | unset |
-| `--dflash-verify-width N` | DFlash packed/chain verify width `2..16`; omit for the k-dependent default | auto |
+| `--dflash-verify-width N` | DFlash verify width `2..16`; chain-only targets require `W=k+1`, which is also the default | auto |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--vision` | enable media input and load Vision GPU allocations | off |

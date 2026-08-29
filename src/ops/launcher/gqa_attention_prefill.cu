@@ -305,27 +305,41 @@ void gqa_kv_compact_path_launch(PagedKVBatchLayerView cache, const Tensor& kv_ta
     const std::int32_t batch         = counts.ne[0];
     const std::int32_t logical_pages = cache.block_tables.ne[0];
     const std::int32_t width         = path.ne[0];
-    const auto launch = [&]<typename Geometry, typename Code, bool HasScale>() {
-        gqa_kv_compact_path_kernel<Geometry, Code, HasScale><<<batch, 256, 0, stream>>>(
-            static_cast<Code*>(cache.k_pages.data), static_cast<Code*>(cache.v_pages.data),
-            HasScale ? static_cast<__half*>(cache.k_scale_pages.data) : nullptr,
-            HasScale ? static_cast<__half*>(cache.v_scale_pages.data) : nullptr,
-            static_cast<const std::int32_t*>(cache.block_tables.data),
-            static_cast<const std::int32_t*>(kv_table_rows.data),
-            static_cast<const std::int32_t*>(prefix_lengths.data),
-            static_cast<const std::int32_t*>(path.data),
-            static_cast<const std::int32_t*>(counts.data), logical_pages, width);
+    if (cache.dtype != DType::BF16 && cache.dtype != DType::I8 && cache.dtype != DType::U8) {
+        throw std::invalid_argument("gqa_kv_compact_path: unsupported cache dtype");
+    }
+    const auto launch = [&]<typename Geometry, typename Code, int CodeLeading, typename Scale,
+                            int ScaleLeading, bool HasScale>() {
+        gqa_kv_compact_path_kernel<Geometry, Code, CodeLeading, Scale, ScaleLeading, HasScale>
+            <<<batch, 256, 0, stream>>>(
+                static_cast<Code*>(cache.k_pages.data), static_cast<Code*>(cache.v_pages.data),
+                HasScale ? static_cast<Scale*>(cache.k_scale_pages.data) : nullptr,
+                HasScale ? static_cast<Scale*>(cache.v_scale_pages.data) : nullptr,
+                static_cast<const std::int32_t*>(cache.block_tables.data),
+                static_cast<const std::int32_t*>(kv_table_rows.data),
+                static_cast<const std::int32_t*>(prefix_lengths.data),
+                static_cast<const std::int32_t*>(path.data),
+                static_cast<const std::int32_t*>(counts.data), logical_pages, width);
+    };
+    const auto launch_geometry = [&]<typename Geometry>() {
+        if (cache.dtype == DType::U8) {
+            // NVFP4: 128 code bytes + 16 e4m3 groups per token, not the BF16/I8 256-wide layout.
+            launch.template operator()<Geometry, std::uint8_t, kGqaNvfp4CodeWidth, std::uint8_t,
+                                       kGqaNvfp4Groups, true>();
+        } else if (cache.dtype == DType::I8) {
+            launch.template operator()<Geometry, std::int8_t, kGqaCompactHeadDim, __half,
+                                       kGqaKvQuantGroups, true>();
+        } else {
+            launch.template operator()<Geometry, __nv_bfloat16, kGqaCompactHeadDim, std::uint8_t, 1,
+                                       false>();
+        }
     };
     if (cache.num_kv_heads == Gqa27Geometry::KVHeads) {
-        if (cache.dtype == DType::I8) {
-            launch.template operator()<Gqa27Geometry, std::int8_t, true>();
-        } else {
-            launch.template operator()<Gqa27Geometry, __nv_bfloat16, false>();
-        }
-    } else if (cache.dtype == DType::I8) {
-        launch.template operator()<Gqa35Geometry, std::int8_t, true>();
+        launch_geometry.template operator()<Gqa27Geometry>();
+    } else if (cache.num_kv_heads == Gqa35Geometry::KVHeads) {
+        launch_geometry.template operator()<Gqa35Geometry>();
     } else {
-        launch.template operator()<Gqa35Geometry, __nv_bfloat16, false>();
+        throw std::invalid_argument("gqa_kv_compact_path: unsupported KV head geometry");
     }
     CUDA_CHECK(cudaGetLastError());
 }

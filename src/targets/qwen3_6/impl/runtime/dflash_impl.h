@@ -72,6 +72,23 @@ void copy_i32_panel(Tensor& dst, const Tensor& src, cudaStream_t stream) {
         static_cast<std::size_t>(src.ne[1]), cudaMemcpyDeviceToDevice, stream));
 }
 
+// [C,K,B] with C fastest. Copies src hops into dst starting at hop0.
+void copy_selector_hops(Tensor& dst, const Tensor& src, std::int32_t hop0, cudaStream_t stream) {
+    if (src.ne[0] != dst.ne[0] || src.ne[2] != dst.ne[2] || hop0 < 0 ||
+        hop0 + src.ne[1] > dst.ne[1]) {
+        throw std::logic_error("DFlash selector copy shape mismatch");
+    }
+    if (dst.data == src.data && hop0 == 0) { return; }
+    const std::size_t elem = dtype_size(src.dtype);
+    auto* dst_bytes        = static_cast<std::byte*>(dst.data) +
+                      static_cast<std::size_t>(hop0) * static_cast<std::size_t>(dst.nb[1]);
+    CUDA_CHECK(cudaMemcpy2DAsync(
+        dst_bytes, static_cast<std::size_t>(dst.nb[2]), src.data,
+        static_cast<std::size_t>(src.nb[2]),
+        static_cast<std::size_t>(src.ne[0]) * static_cast<std::size_t>(src.ne[1]) * elem,
+        static_cast<std::size_t>(src.ne[2]), cudaMemcpyDeviceToDevice, stream));
+}
+
 ops::LinearPolicy dflash_weight_policy(QType qtype) {
     return qtype == QType::NVFP4 ? ops::LinearPolicy::AllowA4 : ops::LinearPolicy::A16Only;
 }
@@ -260,6 +277,11 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
             frame.proposal_positions.slice(0, 0, full_width).slice(1, 0, batch_size);
         Tensor drafts_view = frame.draft_tokens.slice(0, 0, static_cast<std::int32_t>(k))
                                  .slice(1, 0, batch_size);
+        constexpr int kSel = ops::kDflash2PathSelectTopK;
+        Tensor sel_ids_view =
+            frame.selector_ids.slice(1, 0, static_cast<std::int32_t>(k)).slice(2, 0, batch_size);
+        Tensor sel_q_view =
+            frame.selector_q.slice(1, 0, static_cast<std::int32_t>(k)).slice(2, 0, batch_size);
         const bool two_block =
             Config::two_block_first > 0 &&
             static_cast<int>(k) > Config::two_block_first;
@@ -506,19 +528,12 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
             [&](const auto& dflash) {
             const std::int32_t split  = Config::two_block_first;
             const std::int32_t suffix = static_cast<std::int32_t>(k) - split;
-            std::array<float, kMaximumConcurrency> temperatures{};
-            std::array<unsigned long long, kMaximumConcurrency> seeds{};
-            for (std::int32_t b = 0; b < batch_size; ++b) {
-                temperatures[static_cast<std::size_t>(b)] =
-                    state.host_ingress.sampling[static_cast<std::size_t>(b)].temperature;
-                seeds[static_cast<std::size_t>(b)] =
-                    state.host_ingress.sampling[static_cast<std::size_t>(b)].seed;
-            }
             const std::size_t element_bytes = dtype_size(DType::BF16);
             const auto emit_path = [&](const Tensor& residual_in, std::int32_t src_width,
                                        std::int32_t pack_k, std::int32_t col0,
-                                       const Tensor& path_anchors, const unsigned long long* path_seeds,
-                                       Tensor& path_out) {
+                                       const Tensor& path_anchors, std::int32_t position_offset,
+                                       unsigned long long seed_xor, Tensor& path_out,
+                                       Tensor* selector_ids, Tensor* selector_q) {
                 Tensor packed = state.execution.work.alloc(
                     DType::BF16, {Config::hidden, pack_k * batch_size});
                 Tensor proposal_hidden = state.execution.work.alloc(
@@ -544,11 +559,12 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                                             const Tensor* logit_token_ids) {
                     ops::dflash2_path_select(logits_batch, hidden_batch, dflash.hidden_projection,
                                              dflash.predecessor_codebook, dflash.successor_codebook,
-                                             path_anchors, temperatures.data(), path_seeds, path_out,
+                                             path_anchors, frontiers, frame.sampling, path_out,
                                              state.execution.work, state.execution.device.stream,
                                              logit_token_ids,
                                              dflash2_nvfp4_codebook(dflash.predecessor_codebook_nvfp4),
-                                             dflash2_nvfp4_codebook(dflash.successor_codebook_nvfp4));
+                                             dflash2_nvfp4_codebook(dflash.successor_codebook_nvfp4),
+                                             selector_ids, selector_q, seed_xor, position_offset);
                 };
                 if (state.execution.proposal_head == ProposalHead::Full) {
                     Tensor logits = state.execution.work.alloc(
@@ -576,13 +592,20 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
             };
             Tensor path_first =
                 state.execution.work.alloc(DType::I32, {split, batch_size});
-            emit_path(residual, width, split, 1, anchors, seeds.data(), path_first);
+            Tensor sel_ids_first =
+                state.execution.work.alloc(DType::I32, {kSel, split, batch_size});
+            Tensor sel_q_first =
+                state.execution.work.alloc(DType::FP32, {kSel, split, batch_size});
+            emit_path(residual, width, split, 1, anchors, 0, 0ull, path_first, &sel_ids_first,
+                      &sel_q_first);
             CUDA_CHECK(cudaMemcpy2DAsync(
                 drafts.data, static_cast<std::size_t>(k) * sizeof(std::int32_t), path_first.data,
                 static_cast<std::size_t>(split) * sizeof(std::int32_t),
                 static_cast<std::size_t>(split) * sizeof(std::int32_t),
                 static_cast<std::size_t>(batch_size), cudaMemcpyDeviceToDevice,
                 state.execution.device.stream));
+            copy_selector_hops(sel_ids_view, sel_ids_first, 0, state.execution.device.stream);
+            copy_selector_hops(sel_q_view, sel_q_first, 0, state.execution.device.stream);
             auto* idp = static_cast<std::int32_t*>(ids_full.data);
             auto* pth = static_cast<std::int32_t*>(path_first.data);
             for (std::int32_t b = 0; b < batch_size; ++b) {
@@ -601,18 +624,18 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
             run_embed_layers();
             Tensor path_suffix =
                 state.execution.work.alloc(DType::I32, {suffix, batch_size});
+            Tensor sel_ids_suffix =
+                state.execution.work.alloc(DType::I32, {kSel, suffix, batch_size});
+            Tensor sel_q_suffix =
+                state.execution.work.alloc(DType::FP32, {kSel, suffix, batch_size});
             Tensor anchors2 = state.execution.work.alloc(DType::I32, {batch_size});
             for (std::int32_t b = 0; b < batch_size; ++b) {
                 CUDA_CHECK(cudaMemcpyAsync(
                     static_cast<std::int32_t*>(anchors2.data) + b, pth + (split - 1) + split * b,
                     sizeof(std::int32_t), cudaMemcpyDeviceToDevice, state.execution.device.stream));
             }
-            std::array<unsigned long long, kMaximumConcurrency> suffix_seeds = seeds;
-            for (std::int32_t b = 0; b < batch_size; ++b) {
-                suffix_seeds[static_cast<std::size_t>(b)] ^= 0x9E3779B97F4A7C15ull;
-            }
-            emit_path(residual, width, suffix, 1 + split, anchors2, suffix_seeds.data(),
-                      path_suffix);
+            emit_path(residual, width, suffix, 1 + split, anchors2, split,
+                       0x9E3779B97F4A7C15ull, path_suffix, &sel_ids_suffix, &sel_q_suffix);
             CUDA_CHECK(cudaMemcpy2DAsync(
                 static_cast<std::int32_t*>(drafts.data) + split,
                 static_cast<std::size_t>(k) * sizeof(std::int32_t), path_suffix.data,
@@ -620,6 +643,8 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                 static_cast<std::size_t>(suffix) * sizeof(std::int32_t),
                 static_cast<std::size_t>(batch_size), cudaMemcpyDeviceToDevice,
                 state.execution.device.stream));
+            copy_selector_hops(sel_ids_view, sel_ids_suffix, split, state.execution.device.stream);
+            copy_selector_hops(sel_q_view, sel_q_suffix, split, state.execution.device.stream);
             }(*state.execution.model.dflash);
             }
         } else {
@@ -651,6 +676,16 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
             [&](const auto& dflash) {
             Tensor hidden_batch =
                 proposal_hidden.view({Config::hidden, static_cast<std::int32_t>(k), batch_size});
+            Tensor sel_ids =
+                sel_ids_view.is_contiguous()
+                    ? sel_ids_view
+                    : state.execution.work.alloc(
+                          DType::I32, {kSel, static_cast<std::int32_t>(k), batch_size});
+            Tensor sel_q =
+                sel_q_view.is_contiguous()
+                    ? sel_q_view
+                    : state.execution.work.alloc(
+                          DType::FP32, {kSel, static_cast<std::int32_t>(k), batch_size});
             const auto select = [&](const Tensor& logits_batch, const Tensor* logit_token_ids) {
                 if (dflash_uses_tree_verify(k, verify_width)) {
                     const auto verify_w = static_cast<std::int32_t>(verify_width);
@@ -674,21 +709,14 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                                              dflash2_nvfp4_codebook(dflash.predecessor_codebook_nvfp4),
                                              dflash2_nvfp4_codebook(dflash.successor_codebook_nvfp4));
                 } else {
-                    std::array<float, kMaximumConcurrency> temperatures{};
-                    std::array<unsigned long long, kMaximumConcurrency> seeds{};
-                    for (std::int32_t b = 0; b < batch_size; ++b) {
-                        temperatures[static_cast<std::size_t>(b)] =
-                            state.host_ingress.sampling[static_cast<std::size_t>(b)].temperature;
-                        seeds[static_cast<std::size_t>(b)] =
-                            state.host_ingress.sampling[static_cast<std::size_t>(b)].seed;
-                    }
                     ops::dflash2_path_select(logits_batch, hidden_batch, dflash.hidden_projection,
                                              dflash.predecessor_codebook, dflash.successor_codebook,
-                                             anchors, temperatures.data(), seeds.data(), drafts,
+                                             anchors, frontiers, frame.sampling, drafts,
                                              state.execution.work, state.execution.device.stream,
                                              logit_token_ids,
                                              dflash2_nvfp4_codebook(dflash.predecessor_codebook_nvfp4),
-                                             dflash2_nvfp4_codebook(dflash.successor_codebook_nvfp4));
+                                             dflash2_nvfp4_codebook(dflash.successor_codebook_nvfp4),
+                                             &sel_ids, &sel_q);
                 }
             };
             const auto refine_unmask = [&](Tensor& logits, const auto& head,
@@ -709,15 +737,14 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                                            state.execution.device.stream));
                 Tensor logits_for_path =
                     logits.view({logits.ne[0], static_cast<std::int32_t>(k), batch_size});
-                std::array<float, kMaximumConcurrency> greedy_temperatures{};
-                std::array<unsigned long long, kMaximumConcurrency> greedy_seeds{};
                 ops::dflash2_path_select(logits_for_path, hidden_batch, dflash.hidden_projection,
                                          dflash.predecessor_codebook, dflash.successor_codebook,
-                                         anchors, greedy_temperatures.data(), greedy_seeds.data(),
-                                         drafts, state.execution.work,
+                                         anchors, frontiers, frame.sampling, drafts,
+                                         state.execution.work,
                                          state.execution.device.stream, logit_token_ids,
                                          dflash2_nvfp4_codebook(dflash.predecessor_codebook_nvfp4),
-                                         dflash2_nvfp4_codebook(dflash.successor_codebook_nvfp4));
+                                         dflash2_nvfp4_codebook(dflash.successor_codebook_nvfp4),
+                                         nullptr, nullptr, 0, 0, true);
                 auto* idp = static_cast<std::int32_t*>(ids.data);
                 auto* drp = static_cast<std::int32_t*>(drafts.data);
                 const int width_i = width;
@@ -785,6 +812,8 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                     state.execution.device.stream);
                 select(logits_batch, &proposal.token_ids);
             }
+            copy_selector_hops(sel_ids_view, sel_ids, 0, state.execution.device.stream);
+            copy_selector_hops(sel_q_view, sel_q, 0, state.execution.device.stream);
             (void)flat_drafts;
             }(*state.execution.model.dflash);
         } else if (state.execution.proposal_head == ProposalHead::Full) {
@@ -842,6 +871,10 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         Tensor append_counts    = frame.append_counts.slice(0, 0, batch_size);
         Tensor drafts           = frame.draft_tokens.slice(0, 0, static_cast<std::int32_t>(k))
                             .slice(1, 0, batch_size);
+        Tensor selector_ids =
+            frame.selector_ids.slice(1, 0, static_cast<std::int32_t>(k)).slice(2, 0, batch_size);
+        Tensor selector_q =
+            frame.selector_q.slice(1, 0, static_cast<std::int32_t>(k)).slice(2, 0, batch_size);
         Tensor verify_ids       = frame.verify_ids.slice(0, 0, vw).slice(1, 0, batch_size);
         [[maybe_unused]] Tensor parent_index =
             frame.parent_index.slice(0, 0, vw).slice(1, 0, batch_size);
@@ -873,8 +906,11 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         propose_batch_impl<Variant>(state, frame, batch_size, k, envelopes, verify_width);
         const bool use_tree = dflash_uses_tree_verify(k, verify_width);
         if (!use_tree) {
-            ops::speculative_prepare_verify_ids(anchors, drafts, extents, verify_ids,
-                                                state.execution.device.stream);
+            // Chain verify writes ids only unless positions are filled here. Tree select
+            // writes cache_positions = E+j; without this, GQA attends/writes at garbage
+            // slots and column 0 diverges from ordinary decode.
+            ops::speculative_prepare_verify_inputs(anchors, drafts, frontiers, extents, verify_ids,
+                                                   cache_positions, state.execution.device.stream);
         }
 
         TextContext card(state.execution.device, state.execution.model, state.execution.work, {},
@@ -913,7 +949,22 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             verify_frame.fold_path       = fold_path;
             verify_frame.tree_verify     = true;
         } else {
-            verify_frame.cache_positions = rope_positions;
+            if constexpr (Variant::DFlashConfig::kind == qwen3_6::DFlashKind::DFlash2) {
+                if (!selector_ids.is_contiguous() || !selector_q.is_contiguous()) {
+                    Tensor compact_ids = state.execution.work.alloc(
+                        DType::I32, {ops::kDflash2PathSelectTopK, static_cast<std::int32_t>(k),
+                                     batch_size});
+                    Tensor compact_q = state.execution.work.alloc(
+                        DType::FP32, {ops::kDflash2PathSelectTopK, static_cast<std::int32_t>(k),
+                                      batch_size});
+                    copy_selector_hops(compact_ids, selector_ids, 0, state.execution.device.stream);
+                    copy_selector_hops(compact_q, selector_q, 0, state.execution.device.stream);
+                    selector_ids = compact_ids;
+                    selector_q   = compact_q;
+                }
+                verify_frame.draft_selector_ids = selector_ids;
+                verify_frame.draft_selector_q   = selector_q;
+            }
         }
         target_verify_accept(state.execution, state.continuation_hidden_store, card, verify_frame,
                              target_envelope);

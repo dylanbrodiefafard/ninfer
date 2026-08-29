@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "ninfer/ops/sampling.h"
 
 #include <cuda_runtime.h>
 
@@ -16,10 +17,13 @@ void dflash2_column_topk_launch(const Tensor& logits, float* split_val, int* spl
 void dflash2_path_select_launch(const float* cand_val, const int* cand_idx,
                                 const Tensor& hidden_proj, const Tensor* pred_bf16,
                                 const Tensor* succ_bf16, const Weight* pred_nvfp4,
-                                const Weight* succ_nvfp4, const Tensor& anchors, Tensor& path,
+                                const Weight* succ_nvfp4, const Tensor& anchors,
+                                const Tensor& logical_positions, Tensor& path,
                                 std::int32_t tokens, std::int32_t batch,
-                                const float* temperatures, const unsigned long long* seeds,
-                                cudaStream_t stream);
+                                const SamplingConfig* configs, cudaStream_t stream,
+                                Tensor* selector_ids = nullptr, Tensor* selector_q = nullptr,
+                                unsigned long long seed_xor = 0,
+                                std::int32_t position_offset = 0, bool force_greedy = false);
 void dflash2_tree_select_launch(const float* cand_val, const int* cand_idx,
                                 const Tensor& hidden_proj, const Tensor* pred_bf16,
                                 const Tensor* succ_bf16, const Weight* pred_nvfp4,

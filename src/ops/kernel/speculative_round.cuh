@@ -56,17 +56,117 @@ speculative_workspace_row(SamplingWorkspace workspace, std::size_t row_stride, s
     return workspace;
 }
 
+// Optional chain-draft q shortlist for hop `i` of row `row`. Layout is [C,K,B]
+// with C fastest. Null ids means one-hot q at the drafted token.
+__device__ __forceinline__ void speculative_chain_hop_q(const std::int32_t* selector_ids,
+                                                        const float* selector_q, int selector_k,
+                                                        int hop, int row, int k,
+                                                        const int*& hop_ids, const float*& hop_q) {
+    hop_ids = nullptr;
+    hop_q   = nullptr;
+    if (selector_ids == nullptr || selector_q == nullptr || selector_k <= 0) { return; }
+    const int base = selector_k * (hop + row * k);
+    hop_ids        = selector_ids + base;
+    hop_q          = selector_q + base;
+}
+
+__device__ inline int speculative_tree_child_for_token(const std::int32_t* parent_index,
+                                                       const std::int32_t* verify_ids, int node,
+                                                       int token, int valid) {
+    for (int c = node + 1; c < valid; ++c) {
+        if (parent_index[c] == node && verify_ids[c] == token) { return c; }
+    }
+    return -1;
+}
+
+// Tokens already committed on the packed path from root to `node`, excluding the
+// root (the old anchor). Same overlay the sequential tree walk builds in lic_sh.
+__device__ inline int speculative_tree_path_overlay(const std::int32_t* ids,
+                                                    const std::int32_t* pars, int node,
+                                                    int* overlay) {
+    int stack[kSamplerMaxColumns];
+    int n = 0;
+    int cur = node;
+    while (cur > 0 && n < kSamplerMaxColumns) {
+        stack[n++] = cur;
+        cur        = pars[cur];
+        if (cur < 0) { break; }
+    }
+    for (int i = 0; i < n; ++i) { overlay[i] = ids[stack[n - 1 - i]]; }
+    return n;
+}
+
+__device__ inline void speculative_tree_greedy_commit(
+    const std::int32_t* ttok, const std::int32_t* ids, const std::int32_t* pars, std::int32_t* lic,
+    std::int32_t* path, int valid, int extent, int width, int row, std::int32_t* licensed_counts,
+    std::int32_t* accepted, std::int32_t* accepted_column, std::int32_t* anchors,
+    std::int32_t* lengths) {
+    for (int i = 0; i < width; ++i) {
+        lic[i]  = 0;
+        path[i] = 0;
+    }
+    int node = 0;
+    int a    = 0;
+    path[0]  = 0;
+    while (a < extent) {
+        const int predicted = ttok[node];
+        const int child = speculative_tree_child_for_token(pars, ids, node, predicted, valid);
+        if (child < 0) {
+            lic[a]               = predicted;
+            licensed_counts[row] = a + 1;
+            accepted[row]        = a;
+            accepted_column[row] = node;
+            anchors[row]         = predicted;
+            lengths[row] += a + 1;
+            return;
+        }
+        lic[a]      = predicted;
+        node        = child;
+        path[a + 1] = child;
+        ++a;
+    }
+    lic[a]               = ttok[node];
+    licensed_counts[row] = a + 1;
+    accepted[row]        = a;
+    accepted_column[row] = node;
+    anchors[row]         = ttok[node];
+    lengths[row] += a + 1;
+}
+
+__device__ inline void speculative_tree_sampling_commit(
+    std::int32_t* lic, std::int32_t* path, int width, int row, const int* lic_src,
+    const int* path_src, int a, int tstar, int node, std::int32_t* licensed_counts,
+    std::int32_t* accepted, std::int32_t* accepted_column, std::int32_t* anchors,
+    std::int32_t* lengths, int L, const SamplingConfig& cfg) {
+    for (int i = 0; i < width; ++i) {
+        lic[i]  = 0;
+        path[i] = 0;
+    }
+    for (int i = 0; i < a; ++i) { lic[i] = lic_src[i]; }
+    lic[a] = tstar;
+    for (int i = 0; i <= a; ++i) { path[i] = path_src[i]; }
+    const int produced   = a + 1;
+    licensed_counts[row] = produced;
+    accepted[row]        = a;
+    accepted_column[row] = node;
+    anchors[row]         = tstar;
+    lengths[row]         = L + produced;
+    if (cfg.token_counts != nullptr) {
+        for (int i = 0; i < produced; ++i) { atomicAdd(&cfg.token_counts[lic[i]], 1); }
+    }
+}
+
 // Commits the round's accepted tokens plus one correction/bonus token, then
 // advances the target length. The greedy branch
 // (config temperature <= 0) is bit-identical to the original argmax accept: keep
 // the longest draft prefix whose target argmax matches, then take the target
 // argmax at the divergence column. The sampling branch (temperature > 0) runs
-// distribution-correct speculative rejection sampling over the verify logits with
-// a one-hot (greedy) draft: accept drafts[i] with probability p_i(drafts[i]) under
-// the truncated target distribution, resample from the masked residual on the
-// first rejection, and draw a bonus from the last column when every draft accepts.
-// The draft-proposal path stays greedy, so q is one-hot and the accept test
-// collapses to `u < p_i(drafts[i])`. Launch with a single block of kSamplerBlock
+// Leviathan speculative rejection sampling over the verify logits: accept
+// drafts[i] with probability min(1, p_i(d)/q_i(d)) under the truncated target
+// distribution, resample from max(0, p-q) on the first rejection, and draw a
+// bonus from the last column when every draft accepts. Null selector q is the
+// one-hot (greedy draft) convention, so the accept test collapses to `u < p(d)`
+// and the residual excludes d. Launch with a single block of kSamplerBlock
 // threads; only thread 0 performs the sequential accept/commit while the whole
 // block cooperates on the per-column truncated-distribution build.
 __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_drafts_kernel(
@@ -74,7 +174,8 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
     std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
-    std::int32_t k) {
+    std::int32_t k, const std::int32_t* selector_ids, const float* selector_q,
+    std::int32_t selector_k) {
     const int tid                   = threadIdx.x;
     const int row                   = static_cast<int>(blockIdx.x);
     const int cols                  = k + 1;
@@ -155,14 +256,26 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
                         break;
                     }
                 }
+                const int* hop_ids  = nullptr;
+                const float* hop_q  = nullptr;
+                speculative_chain_hop_q(selector_ids, selector_q, selector_k, i, row, k, hop_ids,
+                                        hop_q);
+                const float qd =
+                    sampling_selector_q(hop_ids, hop_q, selector_k > 0 ? selector_k : 0, d);
                 const float u =
                     sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeSpeculativeAccept, 0u);
-                if (u < pd) {
+                // A draft with zero proposal mass cannot be accepted. This should not occur
+                // when the selector is produced by DFlash2, but rejecting it keeps a stale or
+                // mismatched selector from turning an invalid proposal into an unconditional
+                // target-token acceptance; the residual then falls back to p.
+                const bool take = qd > 0.0f && u < fminf(1.0f, pd / qd);
+                if (take) {
                     a_sh = i + 1; // accept drafts[i], keep verifying
                 } else {
                     const float ur = sampling_uniform(cfg.seed, L + i + 1,
                                                       kSamplePurposeSpeculativeCorrection, 0u);
-                    tstar_sh       = sampling_pick_from_support(cand_idx, prob, n_support, d, ur);
+                    tstar_sh       = sampling_pick_from_p_minus_q(cand_idx, prob, n_support, hop_ids,
+                                                                  hop_q, selector_k, d, ur);
                     done_sh        = 1;
                 }
             } else {
@@ -201,13 +314,21 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     const __nv_bfloat16* logits, const std::int32_t* drafts, const std::int32_t* current_extents,
     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
     std::int32_t cols, std::int32_t k, SamplingWorkspace workspace,
-    std::size_t workspace_row_stride) {
+    std::size_t workspace_row_stride, const std::int32_t* verify_ids,
+    const std::int32_t* parent_index, const std::int32_t* valid_columns) {
     const int row     = static_cast<int>(blockIdx.z);
     const int col     = static_cast<int>(blockIdx.y);
     const int partial = static_cast<int>(blockIdx.x);
+    const bool tree   = parent_index != nullptr;
     int extent        = current_extents[row];
     extent            = extent < 0 ? 0 : (extent > k ? k : extent);
-    if (col > extent) { return; }
+    if (tree) {
+        int valid = valid_columns[row];
+        valid     = valid < 1 ? 1 : (valid > cols ? cols : valid);
+        if (col >= valid) { return; }
+    } else if (col > extent) {
+        return;
+    }
     const SamplingConfig cfg = configs[row];
     if (!(cfg.temperature > 0.0f) || token_domain <= kSamplerTileItems) { return; }
     workspace = speculative_workspace_row(workspace, workspace_row_stride, row);
@@ -219,19 +340,29 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     __shared__ typename SamplingPartialSort::TempStorage sort_storage;
     unsigned long long keys[kSamplerItemsPerThread];
 
-    const int cap                  = sampling_candidate_cap(cfg, token_domain);
-    const std::int64_t base        = (static_cast<std::int64_t>(row) * cols + col) * physical_rows;
-    const std::int32_t* row_drafts = drafts + row * k;
-    const int tile_start           = partial * kSamplerPartialTileItems;
-    // Column col's penalty overlay is the first `col` drafts (see accept loop);
-    // applying it before top-k selection lets it change the candidate set, not
-    // just the post-truncation probabilities.
+    const int cap           = sampling_candidate_cap(cfg, token_domain);
+    const std::int64_t base = (static_cast<std::int64_t>(row) * cols + col) * physical_rows;
+    int overlay_buf[kSamplerMaxColumns];
+    const std::int32_t* overlay = nullptr;
+    int overlay_len             = 0;
+    if (tree) {
+        overlay_len = speculative_tree_path_overlay(verify_ids + row * cols,
+                                                    parent_index + row * cols, col, overlay_buf);
+        overlay     = overlay_buf;
+    } else {
+        overlay     = drafts + row * k;
+        overlay_len = col;
+    }
+    const int tile_start = partial * kSamplerPartialTileItems;
+    // Chain: overlay is drafts[0..col). Tree: overlay is the packed path tokens
+    // from root to this node (excluding the anchor). Applied before top-k so
+    // penalties can change the candidate set, not just post-truncation mass.
 #pragma unroll
     for (int item = 0; item < kSamplerItemsPerThread; ++item) {
         const int v = tile_start + item * blockDim.x + threadIdx.x;
         if (v < token_domain) {
             const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg,
-                                                    row_drafts, col);
+                                                    overlay, overlay_len);
             keys[item]    = sampling_sort_key(x, v);
         } else {
             keys[item] = 0ull;
@@ -255,34 +386,53 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t cols,
     std::int32_t partial_blocks, std::int32_t group_count, SamplingWorkspace workspace,
-    std::size_t workspace_row_stride) {
+    std::size_t workspace_row_stride, const std::int32_t* selector_ids, const float* selector_q,
+    std::int32_t selector_k, const std::int32_t* verify_ids, const std::int32_t* parent_index,
+    const std::int32_t* valid_columns, std::int32_t* accepted_column, std::int32_t* fold_path) {
     const int row   = static_cast<int>(blockIdx.z);
     const int group = static_cast<int>(blockIdx.x);
     const int col   = static_cast<int>(blockIdx.y);
     const int tid   = threadIdx.x;
     const int k     = cols - 1;
+    const bool tree = parent_index != nullptr;
     int extent      = current_extents[row];
     extent          = extent < 0 ? 0 : (extent > k ? k : extent);
-    if (col > extent) { return; }
+    int valid       = cols;
+    if (tree) {
+        valid = valid_columns[row];
+        valid = valid < 1 ? 1 : (valid > cols ? cols : valid);
+        if (col >= valid) { return; }
+    } else if (col > extent) {
+        return;
+    }
     const SamplingConfig cfg        = configs[row];
     const std::int32_t* row_targets = target_tokens + row * cols;
-    const std::int32_t* row_drafts  = drafts + row * k;
+    const std::int32_t* row_drafts  = drafts != nullptr ? drafts + row * k : nullptr;
     std::int32_t* row_tokens        = licensed_tokens + row * cols;
+    const std::int32_t* ids         = tree ? verify_ids + row * cols : nullptr;
+    const std::int32_t* pars        = tree ? parent_index + row * cols : nullptr;
+    std::int32_t* path              = tree ? fold_path + row * cols : nullptr;
     if (token_domain <= kSamplerTileItems) { return; }
 
     if (!(cfg.temperature > 0.0f)) {
         if (tid == 0 && col == 0 && group == 0) {
-            int a = 0;
-            while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
-            const int t_star = row_targets[a];
-            for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
-            for (int i = 0; i < a; ++i) { row_tokens[i] = row_drafts[i]; }
-            row_tokens[a]        = t_star;
-            const int produced   = a + 1;
-            licensed_counts[row] = produced;
-            accepted[row]        = a;
-            anchors[row]         = t_star;
-            lengths[row] += produced;
+            if (tree) {
+                speculative_tree_greedy_commit(row_targets, ids, pars, row_tokens, path, valid,
+                                               extent, cols, row, licensed_counts, accepted,
+                                               accepted_column, anchors, lengths);
+            } else {
+                int a = 0;
+                while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
+                const int t_star = row_targets[a];
+                for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
+                for (int i = 0; i < a; ++i) { row_tokens[i] = row_drafts[i]; }
+                row_tokens[a]        = t_star;
+                const int produced   = a + 1;
+                licensed_counts[row] = produced;
+                accepted[row]        = a;
+                anchors[row]         = t_star;
+                lengths[row] += produced;
+            }
         }
         return;
     }
@@ -376,10 +526,42 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
         workspace.group_done[col] = 0;
         __threadfence();
         const int done_cols = atomicAdd(workspace.speculative_finalize_count, 1) + 1;
-        if (done_cols == extent + 1) {
+        const int need_cols = tree ? valid : (extent + 1);
+        if (done_cols == need_cols) {
             const int L = lengths[row];
-            int a       = 0;
-            int tstar   = 0;
+            if (tree) {
+                int path_local[kSamplerMaxColumns];
+                int lic_local[kSamplerMaxColumns];
+                int node  = 0;
+                int a     = 0;
+                int tstar = 0;
+                path_local[0] = 0;
+                for (int step = 0; step <= extent; ++step) {
+                    const int n            = workspace.dist_support[node];
+                    const int* dist_idx    = workspace.dist_idx + sampling_dist_offset(node, 0);
+                    const float* dist_prob = workspace.dist_prob + sampling_dist_offset(node, 0);
+                    const float u          = sampling_uniform(
+                        cfg.seed, L + a + 1, kSamplePurposeSpeculativeAccept, 0u);
+                    const int sampled = sampling_pick_from_support(dist_idx, dist_prob, n, -1, u);
+                    const int child   = step < extent ? speculative_tree_child_for_token(
+                                                          pars, ids, node, sampled, valid)
+                                                      : -1;
+                    if (child >= 0) {
+                        lic_local[a]      = sampled;
+                        path_local[a + 1] = child;
+                        node              = child;
+                        ++a;
+                    } else {
+                        tstar = sampled;
+                        break;
+                    }
+                }
+                speculative_tree_sampling_commit(row_tokens, path, cols, row, lic_local, path_local,
+                                                 a, tstar, node, licensed_counts, accepted,
+                                                 accepted_column, anchors, lengths, L, cfg);
+            } else {
+            int a     = 0;
+            int tstar = 0;
             for (int i = 0; i <= extent; ++i) {
                 const int n            = workspace.dist_support[i];
                 const int* dist_idx    = workspace.dist_idx + sampling_dist_offset(i, 0);
@@ -393,15 +575,24 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                             break;
                         }
                     }
+                    const int* hop_ids = nullptr;
+                    const float* hop_q = nullptr;
+                    speculative_chain_hop_q(selector_ids, selector_q, selector_k, i, row, k,
+                                            hop_ids, hop_q);
+                    const float qd =
+                        sampling_selector_q(hop_ids, hop_q, selector_k > 0 ? selector_k : 0, d);
                     const float u =
                         sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeSpeculativeAccept, 0u);
-                    if (u < pd) {
+                    // A zero-q draft is outside the proposal support and must be corrected.
+                    const bool take = qd > 0.0f && u < fminf(1.0f, pd / qd);
+                    if (take) {
                         a = i + 1;
                         continue;
                     }
                     const float ur = sampling_uniform(cfg.seed, L + i + 1,
                                                       kSamplePurposeSpeculativeCorrection, 0u);
-                    tstar          = sampling_pick_from_support(dist_idx, dist_prob, n, d, ur);
+                    tstar          = sampling_pick_from_p_minus_q(dist_idx, dist_prob, n, hop_ids,
+                                                                  hop_q, selector_k, d, ur);
                     break;
                 }
                 const float u =
@@ -420,6 +611,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                 for (int i = 0; i < produced; ++i) {
                     atomicAdd(&cfg.token_counts[row_tokens[i]], 1);
                 }
+            }
             }
             *workspace.speculative_finalize_count = 0;
         }
@@ -448,15 +640,6 @@ __global__ void proposal_remap_token_ids_kernel(std::int32_t* proposal_tokens,
     if (idx >= 0 && idx < n) { proposal_tokens[i] = id_map[idx]; }
 }
 
-__device__ inline int speculative_tree_child_for_token(const std::int32_t* parent_index,
-                                                       const std::int32_t* verify_ids, int node,
-                                                       int token, int valid) {
-    for (int c = node + 1; c < valid; ++c) {
-        if (parent_index[c] == node && verify_ids[c] == token) { return c; }
-    }
-    return -1;
-}
-
 __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_tree_drafts_kernel(
     const std::int32_t* target_tokens, const __nv_bfloat16* logits, const std::int32_t* verify_ids,
     const std::int32_t* parent_index, const std::int32_t* valid_columns,
@@ -481,40 +664,16 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_tree_drafts_
 
     if (!(cfg.temperature > 0.0f)) {
         if (tid == 0) {
-            for (int i = 0; i < width; ++i) {
-                lic[i]  = 0;
-                path[i] = 0;
-            }
-            int node = 0;
-            int a    = 0;
-            path[0]  = 0;
-            while (a < extent) {
-                const int predicted = ttok[node];
-                const int child =
-                    speculative_tree_child_for_token(pars, ids, node, predicted, valid);
-                if (child < 0) {
-                    lic[a]                = predicted;
-                    licensed_counts[row]  = a + 1;
-                    accepted[row]         = a;
-                    accepted_column[row]  = node;
-                    anchors[row]          = predicted;
-                    lengths[row] += a + 1;
-                    return;
-                }
-                lic[a]      = predicted;
-                node        = child;
-                path[a + 1] = child;
-                ++a;
-            }
-            lic[a]               = ttok[node];
-            licensed_counts[row] = a + 1;
-            accepted[row]        = a;
-            accepted_column[row] = node;
-            anchors[row]         = ttok[node];
-            lengths[row] += a + 1;
+            speculative_tree_greedy_commit(ttok, ids, pars, lic, path, valid, extent, width, row,
+                                           licensed_counts, accepted, accepted_column, anchors,
+                                           lengths);
         }
         return;
     }
+
+    const int partial_blocks = div_up(token_domain, kSamplerPartialTileItems);
+    const int group_count    = sampler_group_count(partial_blocks);
+    if (sampler_multiblock_ok(token_domain, width, partial_blocks, group_count)) { return; }
 
     __shared__ float red_val[kSamplerBlock];
     __shared__ int red_idx[kSamplerBlock];
@@ -529,8 +688,8 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_tree_drafts_
     __shared__ int done_sh;
     __shared__ int tstar_sh;
     __shared__ int L_sh;
-    __shared__ int path_sh[16];
-    __shared__ int lic_sh[16];
+    __shared__ int path_sh[kSamplerMaxColumns];
+    __shared__ int lic_sh[kSamplerMaxColumns];
 
     if (tid == 0) {
         node_sh  = 0;
@@ -580,23 +739,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_tree_drafts_
     }
 
     if (tid == 0) {
-        if (done_sh == 0) {
-            tstar_sh = ttok[node_sh];
-        }
-        const int a     = a_sh;
-        const int tstar = tstar_sh;
-        for (int i = 0; i < width; ++i) {
-            lic[i]  = 0;
-            path[i] = 0;
-        }
-        for (int i = 0; i < a; ++i) { lic[i] = lic_sh[i]; }
-        lic[a] = tstar;
-        for (int i = 0; i <= a; ++i) { path[i] = path_sh[i]; }
-        licensed_counts[row] = a + 1;
-        accepted[row]        = a;
-        accepted_column[row] = node_sh;
-        anchors[row]         = tstar;
-        lengths[row] += a + 1;
+        speculative_tree_sampling_commit(lic, path, width, row, lic_sh, path_sh, a_sh, tstar_sh,
+                                         node_sh, licensed_counts, accepted, accepted_column,
+                                         anchors, lengths, L_sh, cfg);
     }
 }
 

@@ -219,7 +219,8 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
+template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, bool TreeMasked,
+          typename CacheInput>
 void launch_tc_partial_nvfp4(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
                              PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
                              std::int32_t logical_capacity, std::int32_t implementation_window,
@@ -240,13 +241,13 @@ void launch_tc_partial_nvfp4(const Tensor& q, CacheInput input, const Tensor& po
             static const cudaError_t attr = cudaFuncSetAttribute(
                 gqa_attention_decode_nvfp4_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
                                                         MinBlocksPerSm, KeyBlock, DynamicArena,
-                                                        MultiBatch, Masked, CacheInput>,
+                                                        MultiBatch, Masked, TreeMasked, CacheInput>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
             CUDA_CHECK(attr);
         }
         gqa_attention_decode_nvfp4_tiled_kernel<Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm,
                                                 KeyBlock, DynamicArena, MultiBatch, Masked,
-                                                CacheInput>
+                                                TreeMasked, CacheInput>
             <<<grid, WarpsPerCta * 32, kDynamicBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data), input,
                 static_cast<const std::int32_t*>(pos.data), static_cast<std::uint8_t*>(cache_k.data),
@@ -257,6 +258,12 @@ void launch_tc_partial_nvfp4(const Tensor& q, CacheInput input, const Tensor& po
                 invocation.valid_columns == nullptr
                     ? nullptr
                     : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+                invocation.ancestor_mask == nullptr
+                    ? nullptr
+                    : static_cast<const std::int32_t*>(invocation.ancestor_mask->data),
+                invocation.prefix_lengths == nullptr
+                    ? nullptr
+                    : static_cast<const std::int32_t*>(invocation.prefix_lengths->data),
                 invocation.table_rows == nullptr
                     ? nullptr
                     : static_cast<const std::int32_t*>(invocation.table_rows->data),
@@ -375,7 +382,7 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                         implementation_window, splits, partial_acc, partial_m, partial_l, stream,     \
                         keep_frac, keep.keep_tiles, keep.keep_count, keep.split_off, keep.max_keep); \
                 } else {                                                                             \
-                    launch_tc_partial_nvfp4<Geometry, (TOKENS), MultiBatch, Masked>(                  \
+                    launch_tc_partial_nvfp4<Geometry, (TOKENS), MultiBatch, Masked, TreeMasked>(      \
                         q, input, pos, scale, cache, invocation, logical_capacity,                   \
                         implementation_window, splits, partial_acc, partial_m, partial_l, stream);   \
                 }                                                                                     \

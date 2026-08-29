@@ -683,13 +683,15 @@ void append_cache(HostCache& cache, const std::vector<float>& k, const std::vect
         }
     }
     if (cache.sage && cache.dtype == DType::U8 && !positions.empty()) {
-        // Sage V fill, single-shot per (d, 16-key block) -- mirrors the fill kernel
-    // contract exactly: the block scale is computed once as the max of (a) the
-    // in-range new keys' per-d max and (b) the stored scale's implied max (s*6);
-    // the new key codes are a single rounding at the final scale; the in-block
-    // prefix codes (written by earlier appends under the stored scale) are
-    // rescaled once with a single s_old/s_new ratio on a bump; out-of-range
-    // in-block keys are never touched.
+        // Sage V fill, single-shot per (d, 16-key block) -- mirrors the decode
+        // fill kernel hybrid: inblock_begin==0 (append owns the block's first
+        // slot, no stored prefix) takes the whole-pack per-d max of in-range
+        // keys vs stored implied max (s*6); inblock_begin>0 (append starts
+        // mid-block) takes only the first packed key vs stored implied max so
+        // later siblings cannot rescale column 0 before packed verify attends.
+        // New key codes are a single rounding at the final scale; in-block
+        // prefix codes rescale once with s_old/s_new on a bump; out-of-range
+        // in-block keys are never touched.
         const std::int32_t base = positions.front();
         for (std::size_t i = 0; i < positions.size(); ++i) {
             if (positions[static_cast<std::size_t>(i)] != base + static_cast<std::int32_t>(i)) {
@@ -729,8 +731,15 @@ void append_cache(HostCache& cache, const std::vector<float>& k, const std::vect
                         const std::int32_t token = blk_key0 + ki - base;
                         v0s[ki] = v[kv_input_index(geometry, head, d0, token)];
                         v1s[ki] = v[kv_input_index(geometry, head, d0 + 1, token)];
-                        m0 = std::max(m0, std::abs(v0s[ki]));
-                        m1 = std::max(m1, std::abs(v1s[ki]));
+                    }
+                    if (inblock_begin == 0) {
+                        for (std::int32_t ki = 0; ki < inblock_end; ++ki) {
+                            m0 = std::max(m0, std::abs(v0s[ki]));
+                            m1 = std::max(m1, std::abs(v1s[ki]));
+                        }
+                    } else {
+                        m0 = std::abs(v0s[inblock_begin]);
+                        m1 = std::abs(v1s[inblock_begin]);
                     }
                     const float fin_max0 = std::max(m0, s_cur0 * 6.0f);
                     const float fin_max1 = std::max(m1, s_cur1 * 6.0f);
@@ -3526,24 +3535,44 @@ std::vector<std::int32_t> ancestor_mask_from_parent(const std::vector<std::int32
     return mask;
 }
 
-int run_tree_verify_case(const Geometry& geometry, DType dtype) {
-    constexpr std::int32_t kWidth          = 4;
+std::vector<std::int32_t> chain_tree_parent(std::int32_t width) {
+    std::vector<std::int32_t> parent(static_cast<std::size_t>(width), -1);
+    for (std::int32_t token = 1; token < width; ++token) {
+        parent[static_cast<std::size_t>(token)] = token - 1;
+    }
+    return parent;
+}
+
+// Every packed column after 0 is a child of the root. Cache slots are still
+// unique E+j, so causal-only attention attends to siblings; ancestor_mask must
+// hide them. W=12 puts those siblings in the second SmallT chunk (column 6).
+std::vector<std::int32_t> star_tree_parent(std::int32_t width) {
+    std::vector<std::int32_t> parent(static_cast<std::size_t>(width), 0);
+    if (width > 0) { parent[0] = -1; }
+    return parent;
+}
+
+int run_tree_verify_case(const Geometry& geometry, DType dtype, std::int32_t width,
+                         const std::vector<std::int32_t>& parent, const char* topology) {
     constexpr std::int32_t kPrefix         = 61;
     constexpr std::uint32_t kSeed          = 611u;
-    const std::int32_t total               = kPrefix + kWidth;
+    const std::int32_t total               = kPrefix + width;
     const std::int32_t max_context         = total + 3;
-    const std::vector<std::int32_t> parent = {-1, 0, 0, 1};
+    if (static_cast<std::int32_t>(parent.size()) != width) {
+        std::cerr << "gqa_attention tree-verify: parent width mismatch\n";
+        return 1;
+    }
     const std::vector<std::int32_t> ancestor_mask = ancestor_mask_from_parent(parent);
     const std::size_t q_elements =
-        static_cast<std::size_t>(kHeadDim) * geometry.q_heads * kWidth;
+        static_cast<std::size_t>(kHeadDim) * geometry.q_heads * width;
     const std::size_t kv_elements =
-        static_cast<std::size_t>(kHeadDim) * geometry.kv_heads * kWidth;
+        static_cast<std::size_t>(kHeadDim) * geometry.kv_heads * width;
     std::vector<float> q = make_bf16_values(q_elements, kSeed, -0.25f, 0.25f);
     std::vector<float> k = make_bf16_values(kv_elements, kSeed + 1u, -0.25f, 0.25f);
     std::vector<float> v = make_bf16_values(kv_elements, kSeed + 2u, -1.0f, 1.0f);
-    inject_codec_edges(geometry, kWidth, k, v);
-    std::vector<std::int32_t> positions(static_cast<std::size_t>(kWidth));
-    for (std::int32_t token = 0; token < kWidth; ++token) {
+    inject_codec_edges(geometry, width, k, v);
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(width));
+    for (std::int32_t token = 0; token < width; ++token) {
         positions[static_cast<std::size_t>(token)] = kPrefix + token;
     }
     const std::int32_t prefix_length = kPrefix;
@@ -3577,18 +3606,18 @@ int run_tree_verify_case(const Geometry& geometry, DType dtype) {
     std::vector<std::uint16_t> output_canary(q_bits.size(), kOutputCanary);
     dout.copy_from_host(output_canary.data(), output_canary.size() * sizeof(std::uint16_t));
 
-    Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, kWidth});
-    Tensor tk(dk.data(), DType::BF16, {kHeadDim, geometry.kv_heads, kWidth});
-    Tensor tv(dv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, kWidth});
-    Tensor tp(dp.data(), DType::I32, {kWidth});
-    Tensor tmask(dmask.data(), DType::I32, {kWidth});
+    Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, width});
+    Tensor tk(dk.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width});
+    Tensor tv(dv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width});
+    Tensor tp(dp.data(), DType::I32, {width});
+    Tensor tmask(dmask.data(), DType::I32, {width});
     Tensor tprefix(dprefix.data(), DType::I32, {1});
     Tensor ttable_row(dtable_row.data(), DType::I32, {1});
-    Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, kWidth});
+    Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, width});
     const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
                                              static_cast<std::uint32_t>(total)};
     const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
-        geometry.q_heads, dtype, envelope, 1, kWidth, kWidth, 1.0f, true);
+        geometry.q_heads, dtype, envelope, 1, width, width, 1.0f, true);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
@@ -3598,7 +3627,8 @@ int run_tree_verify_case(const Geometry& geometry, DType dtype) {
     cuda_synchronize();
 
     const std::string label = std::string("gqa_attention tree-verify ") + geometry.name + " " +
-                              cache_name(dtype) + " W=4 prefix=61 siblings";
+                              cache_name(dtype) + " W=" + std::to_string(width) +
+                              " prefix=61 " + topology;
     const std::vector<std::uint16_t> output_bits =
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
     int failures = verify_attention(label, bf16_bits_to_double(output_bits), reference,
@@ -3618,6 +3648,265 @@ int run_tree_verify_case(const Geometry& geometry, DType dtype) {
         ++failures;
     }
     failures += cache.verify_guards(label);
+    return failures;
+}
+
+int cache_position_mismatch(const HostCache& got, std::int32_t got_pos, const HostCache& want,
+                            std::int32_t want_pos) {
+    if (got.dtype != want.dtype || got.logical_capacity != want.logical_capacity ||
+        got.geometry.kv_heads != want.geometry.kv_heads) {
+        return 1;
+    }
+    const Geometry& geometry           = got.geometry;
+    const std::int32_t logical_capacity = got.logical_capacity;
+    for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
+        if (got.dtype == DType::U8) {
+            for (std::int32_t byte = 0; byte < kNvfp4CodeWidth; ++byte) {
+                if (got.k_u8[nvfp4_code_index(geometry, logical_capacity, head, got_pos, byte)] !=
+                        want.k_u8[nvfp4_code_index(geometry, logical_capacity, head, want_pos,
+                                                   byte)] ||
+                    got.v_u8[nvfp4_code_index(geometry, logical_capacity, head, got_pos, byte)] !=
+                        want.v_u8[nvfp4_code_index(geometry, logical_capacity, head, want_pos,
+                                                   byte)]) {
+                    return 1;
+                }
+            }
+            for (std::int32_t group = 0; group < kNvfp4Groups; ++group) {
+                if (got.k_fp8[nvfp4_scale_index(geometry, logical_capacity, head, got_pos, group)] !=
+                        want.k_fp8[nvfp4_scale_index(geometry, logical_capacity, head, want_pos,
+                                                     group)] ||
+                    got.v_fp8[nvfp4_scale_index(geometry, logical_capacity, head, got_pos, group)] !=
+                        want.v_fp8[nvfp4_scale_index(geometry, logical_capacity, head, want_pos,
+                                                     group)]) {
+                    return 1;
+                }
+            }
+            continue;
+        }
+        if (got.dtype == DType::I8) {
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                if (got.k_i8[cache_index(geometry, logical_capacity, head, got_pos, d)] !=
+                        want.k_i8[cache_index(geometry, logical_capacity, head, want_pos, d)] ||
+                    got.v_i8[cache_index(geometry, logical_capacity, head, got_pos, d)] !=
+                        want.v_i8[cache_index(geometry, logical_capacity, head, want_pos, d)]) {
+                    return 1;
+                }
+            }
+            for (std::int32_t group = 0; group < kQuantGroups; ++group) {
+                if (got.k_scale[scale_index(geometry, logical_capacity, head, got_pos, group)] !=
+                        want.k_scale[scale_index(geometry, logical_capacity, head, want_pos,
+                                                 group)] ||
+                    got.v_scale[scale_index(geometry, logical_capacity, head, got_pos, group)] !=
+                        want.v_scale[scale_index(geometry, logical_capacity, head, want_pos,
+                                                 group)]) {
+                    return 1;
+                }
+            }
+            continue;
+        }
+        for (std::int32_t d = 0; d < kHeadDim; ++d) {
+            if (got.k_bf16[cache_index(geometry, logical_capacity, head, got_pos, d)] !=
+                    want.k_bf16[cache_index(geometry, logical_capacity, head, want_pos, d)] ||
+                got.v_bf16[cache_index(geometry, logical_capacity, head, got_pos, d)] !=
+                    want.v_bf16[cache_index(geometry, logical_capacity, head, want_pos, d)]) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+int run_kv_compact_path_case(const Geometry& geometry, DType dtype, bool identity,
+                             std::vector<std::int32_t> branch = {0, 3, 7},
+                             std::int32_t prefix = 61) {
+    constexpr std::int32_t kWidth  = 12;
+    constexpr std::uint32_t kSeed  = 701u;
+    const std::int32_t kPrefix     = prefix;
+    const std::int32_t count       = identity ? kWidth : static_cast<std::int32_t>(branch.size());
+    std::vector<std::int32_t> path(static_cast<std::size_t>(kWidth), 0);
+    if (identity) {
+        for (std::int32_t i = 0; i < kWidth; ++i) { path[static_cast<std::size_t>(i)] = i; }
+    } else {
+        for (std::size_t i = 0; i < branch.size(); ++i) { path[i] = branch[i]; }
+    }
+    const std::int32_t total       = kPrefix + kWidth;
+    const std::int32_t max_context = total + 3;
+    const std::size_t kv_elements =
+        static_cast<std::size_t>(kHeadDim) * geometry.kv_heads * kWidth;
+    std::vector<float> k = make_bf16_values(kv_elements, kSeed, -0.25f, 0.25f);
+    std::vector<float> v = make_bf16_values(kv_elements, kSeed + 1u, -1.0f, 1.0f);
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(kWidth));
+    for (std::int32_t token = 0; token < kWidth; ++token) {
+        positions[static_cast<std::size_t>(token)] = kPrefix + token;
+    }
+
+    HostCache populated = make_cache(geometry, dtype, max_context, kSeed + 10u);
+    append_cache(populated, k, v, positions);
+    DeviceCache cache(populated, MappingPattern::Identity);
+    const HostCache before = cache.snapshot();
+
+    GuardedDeviceBuffer dpath(path.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer dprefix(sizeof(std::int32_t));
+    GuardedDeviceBuffer dcount(sizeof(std::int32_t));
+    GuardedDeviceBuffer drow(sizeof(std::int32_t));
+    dpath.copy_from_host(path.data(), path.size() * sizeof(std::int32_t));
+    dprefix.copy_from_host(&kPrefix, sizeof(kPrefix));
+    dcount.copy_from_host(&count, sizeof(count));
+    const std::int32_t table_row = 0;
+    drow.copy_from_host(&table_row, sizeof(table_row));
+    Tensor tpath(dpath.data(), DType::I32, {kWidth, 1});
+    Tensor tprefix(dprefix.data(), DType::I32, {1});
+    Tensor tcount(dcount.data(), DType::I32, {1});
+    Tensor trow(drow.data(), DType::I32, {1});
+    ops::gqa_kv_compact_path(cache.batch_view(), trow, tprefix, tpath, tcount, nullptr);
+    cuda_synchronize();
+    const HostCache after = cache.snapshot();
+
+    const std::string label = std::string("gqa_kv_compact_path ") + geometry.name + " " +
+                              cache_name(dtype) + (identity ? " identity" : " branch") + " W=12";
+    int failures = 0;
+    for (std::int32_t i = 0; i < count; ++i) {
+        const std::int32_t src = kPrefix + path[static_cast<std::size_t>(i)];
+        const std::int32_t dst = kPrefix + i;
+        if (cache_position_mismatch(after, dst, before, src) != 0) {
+            std::cerr << label << ": dest " << dst << " does not match source " << src << "\n";
+            ++failures;
+            break;
+        }
+    }
+    for (std::int32_t pos = 0; pos < populated.logical_capacity; ++pos) {
+        if (pos >= kPrefix && pos < kPrefix + count) { continue; }
+        if (cache_position_mismatch(after, pos, before, pos) != 0) {
+            std::cerr << label << ": clobbered position " << pos << "\n";
+            ++failures;
+            break;
+        }
+    }
+    failures += cache.verify_guards(label);
+    return failures;
+}
+
+int run_kv_compact_path_cases() {
+    int failures = 0;
+    for (const Geometry& geometry : kGeometries) {
+        for (const DType dtype : {DType::BF16, DType::I8, DType::U8}) {
+            failures += run_kv_compact_path_case(geometry, dtype, true);
+            failures += run_kv_compact_path_case(geometry, dtype, false);
+            failures += run_kv_compact_path_case(geometry, dtype, false, {0, 1, 3, 5}, 16);
+        }
+    }
+    return failures;
+}
+
+int run_tree_column0_matches_decode(const Geometry& geometry, DType dtype, std::int32_t prefix,
+                                    std::int32_t width) {
+    constexpr std::uint32_t kSeed = 811u;
+    const std::vector<std::int32_t> parent = chain_tree_parent(width);
+    const std::vector<std::int32_t> ancestor_mask = ancestor_mask_from_parent(parent);
+    const std::int32_t total                      = prefix + width;
+    const std::int32_t max_context                = total + 3;
+    const std::size_t q_elements =
+        static_cast<std::size_t>(kHeadDim) * geometry.q_heads * width;
+    const std::size_t kv_elements =
+        static_cast<std::size_t>(kHeadDim) * geometry.kv_heads * width;
+    std::vector<float> q = make_bf16_values(q_elements, kSeed, -0.25f, 0.25f);
+    std::vector<float> k = make_bf16_values(kv_elements, kSeed + 1u, -0.25f, 0.25f);
+    std::vector<float> v = make_bf16_values(kv_elements, kSeed + 2u, -1.0f, 1.0f);
+    inject_codec_edges(geometry, width, k, v);
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(width));
+    for (std::int32_t token = 0; token < width; ++token) {
+        positions[static_cast<std::size_t>(token)] = prefix + token;
+    }
+    const std::vector<std::int32_t> decode_positions{prefix};
+
+    const HostCache initial = make_cache(geometry, dtype, max_context, kSeed + 10u);
+    DeviceCache tree_cache(initial, MappingPattern::Identity);
+    DeviceCache decode_cache(initial, MappingPattern::Identity);
+
+    const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
+    const std::vector<std::uint16_t> k_bits = to_bf16_bits(k);
+    const std::vector<std::uint16_t> v_bits = to_bf16_bits(v);
+    GuardedDeviceBuffer dq(q_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dk(k_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dv(v_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dp(positions.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer dp1(sizeof(std::int32_t));
+    GuardedDeviceBuffer dmask(ancestor_mask.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer dprefix(sizeof(std::int32_t));
+    GuardedDeviceBuffer dtable_row(sizeof(std::int32_t));
+    GuardedDeviceBuffer dout(q_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dout1(static_cast<std::size_t>(kHeadDim) * geometry.q_heads *
+                              sizeof(std::uint16_t));
+    dq.copy_from_host(q_bits.data(), q_bits.size() * sizeof(std::uint16_t));
+    dk.copy_from_host(k_bits.data(), k_bits.size() * sizeof(std::uint16_t));
+    dv.copy_from_host(v_bits.data(), v_bits.size() * sizeof(std::uint16_t));
+    dp.copy_from_host(positions.data(), positions.size() * sizeof(std::int32_t));
+    dp1.copy_from_host(decode_positions.data(), sizeof(std::int32_t));
+    dmask.copy_from_host(ancestor_mask.data(), ancestor_mask.size() * sizeof(std::int32_t));
+    dprefix.copy_from_host(&prefix, sizeof(prefix));
+    const std::int32_t table_row = 0;
+    dtable_row.copy_from_host(&table_row, sizeof(table_row));
+    std::vector<std::uint16_t> output_canary(q_bits.size(), kOutputCanary);
+    dout.copy_from_host(output_canary.data(), output_canary.size() * sizeof(std::uint16_t));
+    dout1.fill(0xff);
+
+    Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, width});
+    Tensor tk(dk.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width});
+    Tensor tv(dv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width});
+    Tensor tq1(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, 1});
+    Tensor tk1(dk.data(), DType::BF16, {kHeadDim, geometry.kv_heads, 1});
+    Tensor tv1(dv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, 1});
+    Tensor tp(dp.data(), DType::I32, {width});
+    Tensor tp1(dp1.data(), DType::I32, {1});
+    Tensor tmask(dmask.data(), DType::I32, {width});
+    Tensor tprefix(dprefix.data(), DType::I32, {1});
+    Tensor ttable_row(dtable_row.data(), DType::I32, {1});
+    Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, width});
+    Tensor tout1(dout1.data(), DType::BF16, {kHeadDim, geometry.q_heads, 1});
+    const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
+                                             static_cast<std::uint32_t>(total)};
+    const std::size_t tree_bytes = ops::gqa_attention_workspace_capacity_bytes(
+        geometry.q_heads, dtype, envelope, 1, width, width, 1.0f, true);
+    const std::size_t decode_bytes = ops::gqa_attention_workspace_capacity_bytes(
+        geometry.q_heads, dtype, envelope, 1, 1, 1, 1.0f, false);
+    GuardedDeviceBuffer tree_workspace(std::max<std::size_t>(tree_bytes, 256));
+    GuardedDeviceBuffer decode_workspace(std::max<std::size_t>(decode_bytes, 256));
+    WorkspaceArena tree_ws(DeviceSpan{tree_workspace.data(), tree_workspace.bytes()});
+    WorkspaceArena decode_ws(DeviceSpan{decode_workspace.data(), decode_workspace.bytes()});
+
+    ops::gqa_attention(tq, tk, tv, tp, Tensor{}, ttable_row, kAttentionScale,
+                       tree_cache.batch_view(), envelope, tree_ws, tout, nullptr, 1.0f, 1.0f, 8192,
+                       nullptr, tmask, tprefix);
+    ops::gqa_attention(tq1, tk1, tv1, tp1, Tensor{}, ttable_row, kAttentionScale,
+                       decode_cache.batch_view(), envelope, decode_ws, tout1, nullptr);
+    cuda_synchronize();
+
+    const std::string label = std::string("gqa_attention tree col0 vs T=1 ") + geometry.name + " " +
+                              cache_name(dtype) + " W=" + std::to_string(width) +
+                              " prefix=" + std::to_string(prefix);
+    const std::vector<double> tree_out =
+        bf16_bits_to_double(copy_from_guarded<std::uint16_t>(dout, q_bits.size()));
+    const std::vector<double> decode_out = bf16_bits_to_double(
+        copy_from_guarded<std::uint16_t>(dout1, static_cast<std::size_t>(kHeadDim) * geometry.q_heads));
+    const std::size_t col0 = static_cast<std::size_t>(kHeadDim) * geometry.q_heads;
+    return verify_attention(label, std::vector<double>(tree_out.begin(), tree_out.begin() + static_cast<std::ptrdiff_t>(col0)),
+                            decode_out, attention_criterion(dtype));
+}
+
+int run_tree_verify_cases() {
+    int failures = 0;
+    for (const Geometry& geometry : kGeometries) {
+        for (const DType dtype : {DType::BF16, DType::I8, DType::U8}) {
+            failures += run_tree_verify_case(geometry, dtype, 4, chain_tree_parent(4), "chain");
+            failures += run_tree_verify_case(geometry, dtype, 4, star_tree_parent(4), "star");
+            failures += run_tree_verify_case(geometry, dtype, 12, chain_tree_parent(12), "chain");
+            failures += run_tree_verify_case(geometry, dtype, 12, star_tree_parent(12), "star");
+            if (dtype == DType::U8) {
+                failures += run_tree_column0_matches_decode(geometry, dtype, 16, 12);
+                failures += run_tree_column0_matches_decode(geometry, dtype, 24, 12);
+            }
+        }
+    }
     return failures;
 }
 
@@ -3718,6 +4007,11 @@ int run_geometry(const Geometry& geometry) {
                                                                                            geometry.q_heads,
                                         3, 121, /*sage=*/true);
             failures += run_a1_case(geometry, dtype, {6, 55, 64, 510u}, MappingPattern::Identity,
+                                    /*sage=*/true);
+            // Decode-width (T<=6) pack that owns the 16-key block's first slot:
+            // hybrid must take the whole-pack max (inject_codec_edges plants
+            // v=+1 on the last packed key). Distinct from {6,55,64} mid-block.
+            failures += run_a1_case(geometry, dtype, {6, 48, 64, 518u}, MappingPattern::Identity,
                                     /*sage=*/true);
             if (!sage_fast) {
                 failures +=
@@ -4756,6 +5050,15 @@ int main(int argc, char** argv) {
         std::cout << (failures == 0 ? "PASS" : "FAIL") << " gqa_attention batch cases\n";
         return failures == 0 ? 0 : 1;
     }
+    if (argc > 1 && std::strcmp(argv[1], "--tree-only") == 0) {
+        if (cuda_unavailable()) {
+            std::cerr << "FAIL: no usable CUDA device\n";
+            return 1;
+        }
+        const int failures = run_tree_verify_cases() + run_kv_compact_path_cases();
+        std::cout << (failures == 0 ? "PASS" : "FAIL") << " gqa_attention tree-verify\n";
+        return failures == 0 ? 0 : 1;
+    }
     if (cuda_unavailable()) {
         std::cerr << "FAIL: no usable CUDA device\n";
         return 1;
@@ -4765,11 +5068,8 @@ int main(int argc, char** argv) {
     failures += verify_workspace_capacity_contract();
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
     failures += run_batch_cases();
-    for (const Geometry& geometry : kGeometries) {
-        for (const DType dtype : {DType::BF16, DType::I8}) {
-            failures += run_tree_verify_case(geometry, dtype);
-        }
-    }
+    failures += run_tree_verify_cases();
+    failures += run_kv_compact_path_cases();
     std::cout << (failures == 0 ? "PASS" : "FAIL")
               << " gqa_attention public-contract correctness\n";
     return failures == 0 ? 0 : 1;

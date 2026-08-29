@@ -24,6 +24,8 @@ struct Nvfp4GdnConvPlan {
 Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t tokens,
                                              std::int32_t batch_size);
 
+[[nodiscard]] std::size_t nvfp4_gdn_decode_columns_workspace_bytes();
+
 [[nodiscard]] std::size_t nvfp4_gdn_snapshot_workspace_capacity_bytes(LinearPolicy policy,
                                                                       std::int32_t min_tokens,
                                                                       std::int32_t max_tokens);
@@ -33,6 +35,25 @@ void nvfp4_gdn_snapshot_decode_launch(const Tensor& x, const Weight& weight,
                                       const Tensor& valid_columns, const Tensor& initial_slot,
                                       const Tensor& snapshot_base_slot, Tensor& query, Tensor& key,
                                       Tensor& value, Tensor& z, cudaStream_t stream);
+
+void nvfp4_gdn_record_decode_launch(const Tensor& x, const Weight& weight,
+                                    const Tensor& conv_weight, const Tensor& conv_states,
+                                    const Tensor& valid_columns, const Tensor& initial_slot,
+                                    Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
+                                    Tensor& z, cudaStream_t stream);
+
+void nvfp4_gdn_snapshot_decode_columns(const Tensor& x, const Weight& weight,
+                                       const Tensor& conv_weight, Tensor& conv_states,
+                                       const Tensor& valid_columns, const Tensor& initial_slot,
+                                       const Tensor& snapshot_base_slot, Tensor& query, Tensor& key,
+                                       Tensor& value, Tensor& z, WorkspaceArena& workspace,
+                                       cudaStream_t stream);
+
+void nvfp4_gdn_record_decode_columns(const Tensor& x, const Weight& weight,
+                                     const Tensor& conv_weight, const Tensor& conv_states,
+                                     const Tensor& valid_columns, const Tensor& initial_slot,
+                                     Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
+                                     Tensor& z, WorkspaceArena& workspace, cudaStream_t stream);
 
 void nvfp4_gdn_snapshot_small_t_launch(const Tensor& x, const Weight& weight,
                                        const Tensor& conv_weight, Tensor& conv_states,
@@ -44,7 +65,8 @@ void nvfp4_gdn_record_small_t_launch(const Tensor& x, const Weight& weight,
                                      const Tensor& conv_weight, const Tensor& conv_states,
                                      const Tensor& valid_columns, const Tensor& initial_slot,
                                      Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
-                                     Tensor& z, cudaStream_t stream);
+                                     Tensor& z, cudaStream_t stream,
+                                     const std::int32_t* parent_index = nullptr);
 
 void nvfp4_gdn_snapshot_post_launch(const Tensor& projected, const Tensor& conv_weight,
                                     Tensor& conv_states, const Tensor& valid_columns,

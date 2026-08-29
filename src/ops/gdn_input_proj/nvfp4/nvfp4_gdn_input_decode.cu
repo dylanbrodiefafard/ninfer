@@ -14,7 +14,8 @@ void nvfp4_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor
 
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const float inverse   = 1.0F / weight.weight_scale_divisor;
-    nvfp4_gemv_kernel<Geometry, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
+    nvfp4_gemv_kernel<Geometry, Schedule>
+        <<<dim3(kBlocks, x.ne[1]), Schedule::kThreads, 0, stream>>>(
         Nvfp4PackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data)},
         static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), inverse, Nvfp4IdentityEpilogue{},
