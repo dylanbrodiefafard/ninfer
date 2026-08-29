@@ -6,6 +6,8 @@
 
 #include <cuda_bf16.h>
 
+#include <cstdint>
+
 namespace ninfer::ops::detail {
 namespace {
 
@@ -15,7 +17,7 @@ struct Nvfp4AttentionInputOutput {
     __nv_bfloat16* gate;
     __nv_bfloat16* value;
 
-    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t,
+    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
                                           float result) const {
         constexpr std::int32_t kQueryRows  = 6144;
         constexpr std::int32_t kKeyRows    = 1024;
@@ -26,13 +28,15 @@ struct Nvfp4AttentionInputOutput {
 
         const __nv_bfloat16 result_bf16 = __float2bfloat16_rn(result);
         if (parent_row < kKeyBegin) {
-            query[parent_row] = result_bf16;
+            query[static_cast<std::int64_t>(token) * kQueryRows + parent_row] = result_bf16;
         } else if (parent_row < kGateBegin) {
-            key[parent_row - kKeyBegin] = result_bf16;
+            key[static_cast<std::int64_t>(token) * kKeyRows + parent_row - kKeyBegin] = result_bf16;
         } else if (parent_row < kValueBegin) {
-            gate[parent_row - kGateBegin] = result_bf16;
+            gate[static_cast<std::int64_t>(token) * kGateRows + parent_row - kGateBegin] =
+                result_bf16;
         } else {
-            value[parent_row - kValueBegin] = result_bf16;
+            value[static_cast<std::int64_t>(token) * kKeyRows + parent_row - kValueBegin] =
+                result_bf16;
         }
     }
 };
@@ -54,7 +58,8 @@ void nvfp4_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tenso
     };
     constexpr int kBlocks              = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const float inverse_weight_divisor = 1.0F / weight.weight_scale_divisor;
-    nvfp4_gemv_kernel<Geometry, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
+    nvfp4_gemv_kernel<Geometry, Schedule>
+        <<<dim3(kBlocks, x.ne[1]), Schedule::kThreads, 0, stream>>>(
         Nvfp4PackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data)},
         static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), inverse_weight_divisor,

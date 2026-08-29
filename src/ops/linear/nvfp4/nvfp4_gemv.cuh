@@ -183,6 +183,20 @@ struct Nvfp4PackedActivation {
     }
 };
 
+// GDN fused conv B>1: grid is dim3(batch, row_blocks) so blockIdx.x is the request
+// row and consecutive CTAs share output-row weights. Linear SmallT stays 1D.
+template <class Geometry>
+struct Nvfp4BatchedPackedActivation {
+    const __nv_bfloat16* x;
+    int width;
+
+    __device__ __forceinline__ const __nv_bfloat16* values(int token, int value_begin) const {
+        const int batch = static_cast<int>(blockIdx.x);
+        return x + (static_cast<std::int64_t>(batch) * width + token) * Geometry::kInputRows +
+               value_begin;
+    }
+};
+
 template <class Geometry>
 struct Nvfp4SplitKActivation {
     static_assert((Geometry::kInputRows % 2) == 0);
@@ -215,7 +229,7 @@ compute_nvfp4_rows(Activation activation, const std::uint8_t* __restrict__ codes
                    const std::uint8_t* __restrict__ scales,
                    const Nvfp4GemvSharedStorage<Geometry, Schedule>& shared,
                    float inverse_weight_divisor, const int (&parent_rows)[Schedule::kRowsPerWarp],
-                   int flat_row0, int lane,
+                   int flat_row0, int lane, int token,
                    float (&accumulators)[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains]) {
     constexpr int kValuesPerPhase = 32 * Schedule::kValuesPerLane;
     constexpr int kPhases         = Geometry::kInputRows / kValuesPerPhase;
@@ -243,7 +257,7 @@ compute_nvfp4_rows(Activation activation, const std::uint8_t* __restrict__ codes
         for (int pair = 0; pair < Schedule::kPairsPerLane; ++pair) {
             const int activation_index =
                 phase * (kValuesPerPhase / 2) + lane * Schedule::kPairsPerLane + pair;
-            const float2 activation_value = activation.load_pair(0, activation_index);
+            const float2 activation_value = activation.load_pair(token, activation_index);
             const int group               = ((lane * Schedule::kValuesPerLane & 15) + pair * 2) / 16;
 #pragma unroll
             for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
@@ -279,6 +293,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     const int rmod_base        = cta_in_tile * (Schedule::kRowsPerCta / 4);
     stage_nvfp4_scales<Geometry, Schedule>(scales, shared, m_tile, rmod_base);
 
+    const int token     = static_cast<int>(blockIdx.y);
     const int lane      = static_cast<int>(threadIdx.x) & 31;
     const int warp      = static_cast<int>(threadIdx.x) >> 5;
     const int flat_row0 = warp * Schedule::kRowsPerWarp;
@@ -294,7 +309,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
     compute_nvfp4_rows<Geometry, Schedule>(activation, codes, scales, shared,
                                            inverse_weight_divisor, parent_rows, flat_row0, lane,
-                                           accumulators);
+                                           token, accumulators);
 
 #pragma unroll
     for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
@@ -306,7 +321,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         total = warp_reduce_sum(total);
         if (lane == 0) {
             const int parent_row = parent_rows[local_row];
-            output.store(parent_row, 0, epilogue.apply(parent_row, 0, total));
+            output.store(parent_row, token, epilogue.apply(parent_row, token, total));
         }
     }
 }

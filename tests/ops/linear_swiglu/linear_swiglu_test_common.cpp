@@ -314,4 +314,91 @@ int run_profile(std::string_view label, const Profile& profile,
     return failures;
 }
 
+int run_column0_matches_decode(std::string_view label, const Profile& profile,
+                               std::span<const std::int32_t> packed_widths) {
+    validate_profile(profile);
+    if (packed_widths.empty()) {
+        throw std::invalid_argument("linear_swiglu test: no packed widths");
+    }
+    if (!cuda_available()) {
+        std::cerr << "FAIL: no usable CUDA device\n";
+        return 1;
+    }
+    for (std::size_t index = 0; index < packed_widths.size(); ++index) {
+        if (packed_widths[index] < 2 ||
+            (index != 0 && packed_widths[index] <= packed_widths[index - 1])) {
+            throw std::invalid_argument(
+                "linear_swiglu test: packed widths must be >= 2 and increasing");
+        }
+    }
+    const std::int32_t maximum_tokens = packed_widths.back();
+
+    quantized_weight::PatternedWeightOptions weight_options;
+    if (profile.qtype == QType::NVFP4) {
+        weight_options.weight_scale_divisor = 0.125F;
+        weight_options.input_scale_divisor  = 3.5F;
+    }
+    quantized_weight::PackedWeight host_weight = quantized_weight::make_patterned_weight(
+        profile.qtype, profile.gate_up_rows, profile.input_rows, profile.seed, weight_options);
+    const std::vector<std::uint16_t> host_activation = make_activation(profile, maximum_tokens);
+
+    test::GuardedDeviceBuffer device_weight(host_weight.payload.size());
+    device_weight.copy_from_host(host_weight.payload.data(), host_weight.payload.size());
+    const Weight weight = host_weight.device_weight(device_weight.data());
+
+    test::GuardedDeviceBuffer device_activation(host_activation.size() * sizeof(std::uint16_t));
+    device_activation.copy_from_host(host_activation.data(),
+                                     host_activation.size() * sizeof(std::uint16_t));
+
+    const ops::LinearPolicy packed_policy = profile.activation_compute == ActivationCompute::A4
+                                                ? ops::LinearPolicy::AllowA4
+                                                : ops::LinearPolicy::A16Only;
+    const std::size_t decode_elements =
+        checked_elements(profile.output_rows, 1, "decode output size");
+    test::GuardedDeviceBuffer decode_output(decode_elements * sizeof(std::uint16_t));
+    decode_output.fill(0xff);
+    Tensor decode_x(device_activation.data(), DType::BF16, {profile.input_rows, 1});
+    Tensor decode_y(decode_output.data(), DType::BF16, {profile.output_rows, 1});
+    const std::size_t decode_ws = ops::linear_swiglu_workspace_capacity_bytes(
+        profile.qtype, profile.gate_up_rows, profile.input_rows, ops::LinearPolicy::A16Only, 1, 1);
+    WorkspaceArena decode_workspace(std::max<std::size_t>(decode_ws, 256));
+    ops::linear_swiglu(decode_x, weight, decode_y, ops::LinearPolicy::A16Only, decode_workspace,
+                       nullptr);
+    test::cuda_check(cudaDeviceSynchronize(), "synchronize LinearSwiGLU decode");
+    const std::vector<double> decode = read_bf16_output(decode_output, decode_elements);
+
+    const std::size_t packed_ws           = ops::linear_swiglu_workspace_capacity_bytes(
+        profile.qtype, profile.gate_up_rows, profile.input_rows, packed_policy, 1, maximum_tokens);
+    WorkspaceArena packed_workspace(std::max<std::size_t>(packed_ws, 256));
+
+    int failures = 0;
+    failures += decode_output.verify_guards(std::string(label) + " decode");
+    for (const std::int32_t tokens : packed_widths) {
+        const std::size_t output_elements =
+            checked_elements(profile.output_rows, tokens, "packed output size");
+        test::GuardedDeviceBuffer output(output_elements * sizeof(std::uint16_t));
+        output.fill(0xff);
+        Tensor x(device_activation.data(), DType::BF16, {profile.input_rows, tokens});
+        Tensor destination(output.data(), DType::BF16, {profile.output_rows, tokens});
+        packed_workspace.reset();
+        packed_workspace.reset_peak();
+        const std::string case_label =
+            std::string(label) + " T=" + std::to_string(tokens) + " col0";
+        try {
+            ops::linear_swiglu(x, weight, destination, packed_policy, packed_workspace, nullptr);
+            test::cuda_check(cudaDeviceSynchronize(), "synchronize LinearSwiGLU packed");
+        } catch (const std::exception& error) {
+            std::cerr << case_label << ": unexpected exception: " << error.what() << '\n';
+            ++failures;
+            continue;
+        }
+        failures += output.verify_guards(case_label);
+        const std::vector<double> packed = read_bf16_output(output, output_elements);
+        failures += compare_output(case_label, std::vector<double>(packed.begin(), packed.begin() +
+                                                                                       decode_elements),
+                                   decode.data(), ActivationCompute::A16);
+    }
+    return failures;
+}
+
 } // namespace ninfer::test::linear_swiglu

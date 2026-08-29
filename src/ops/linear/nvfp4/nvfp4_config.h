@@ -233,6 +233,17 @@ struct Nvfp4LinearDecodeProductionSchedule<Nvfp4MtpFcGeometry> {
 
 inline constexpr std::int32_t kNvfp4FirstSmallT = 2;
 inline constexpr std::int32_t kNvfp4LastSmallT  = 32;
+// Production AllowA4 W4A4 cutovers (RTX 5090). T=1 stays GEMV: the W4A4 MMA tile is
+// BlockM=32 and T=1 residual is not a legal decode path (2× vs the A4 oracle).
+inline constexpr std::int32_t kNvfp4FirstW4a4AttnInput     = 4;
+inline constexpr std::int32_t kNvfp4FirstW4a4GdnInput      = 3;
+inline constexpr std::int32_t kNvfp4FirstW4a4MlpGateUp     = 2;
+inline constexpr std::int32_t kNvfp4FirstW4a4Residual6144  = 5;
+inline constexpr std::int32_t kNvfp4FirstW4a4Residual17408 = 3;
+inline constexpr std::int32_t kNvfp4FirstW4a4MtpFc         = 8;
+// Tree/chain verify is W<=16. Fused GDN conv stays A16 SmallT on that range (parent-indexed
+// FP32 epilogue), including C>1 (one launch, grid.x=B). W4A4 Materialized compose is prefill.
+inline constexpr std::int32_t kNvfp4LastPackedGdnConvSmallT = 16;
 
 // RTX 5090 cold-cache winners for contiguous Linear output. T=2..4 amortizes activation loads
 // through shared staging; T=5..32 keeps one packed activation tile per warp. The warp-count changes
@@ -258,15 +269,18 @@ template <int ActiveTokens>
 struct Nvfp4LinearSmallTProductionSchedule<Nvfp4GdnInputGeometry, ActiveTokens> {
     static_assert(ActiveTokens >= kNvfp4FirstSmallT);
     static_assert(ActiveTokens <= kNvfp4LastSmallT);
-    static constexpr int kWarpsPerCta       = 4;
+    // Same 8-warp / StagedRaw reduction as T=1 GDN GEMV. 4 accumulator chains match
+    // decode through packed verify (T<=16); the A16-only tail keeps one chain.
+    static constexpr int kWarpsPerCta       = 8;
     static constexpr int kValuesPerLane     = ActiveTokens >= 17 && ActiveTokens <= 20 ? 8 : 16;
+    static constexpr int kAccumulatorChains = ActiveTokens <= 16 ? 4 : 1;
     static constexpr auto kActivationAccess = ActiveTokens == 2
                                                   ? Nvfp4SmallTActivationAccess::SharedPhase
                                                   : Nvfp4SmallTActivationAccess::TokenPacked;
     using Type =
-        Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, kValuesPerLane, ActiveTokens, 1, kActivationAccess,
-                            Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                            Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
+        Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, kValuesPerLane, ActiveTokens, kAccumulatorChains,
+                            kActivationAccess, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default,
+                            1, Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
 };
 
 // At N=5120, R1 needs the larger CTA only for the last three A16 token counts. The unoptimized
@@ -304,8 +318,8 @@ struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual17408Geometry, ActiveTok
 };
 
 // MTP fc [5120,10240]: K sits between Residual6144 and Residual17408. Use TokenPacked +
-// PhaseUnroll=4 across the A16 alignment range T=2..7 (W4A4 starts at T=8). 16-warp at T≥8
-// remains the A16Only tail.
+// PhaseUnroll=4 across T=2..7. 16-warp at T≥8 remains the A16Only tail. AllowA4 W4A4
+// for this geometry still starts at T=8 (M32N64 needs 8 live rows of the 32-wide tile).
 template <int ActiveTokens>
 struct Nvfp4LinearSmallTProductionSchedule<Nvfp4MtpFcGeometry, ActiveTokens> {
     static_assert(ActiveTokens >= kNvfp4FirstSmallT);

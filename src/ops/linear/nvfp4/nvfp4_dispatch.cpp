@@ -29,15 +29,17 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
 
     switch (resolve_nvfp4_problem(output_rows, input_rows)) {
     case Nvfp4Problem::AttnInput:
-        return tokens >= 4 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
+        return tokens >= kNvfp4FirstW4a4AttnInput ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
     case Nvfp4Problem::GdnInput:
-        return tokens >= 3 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
+        return tokens >= kNvfp4FirstW4a4GdnInput ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
     case Nvfp4Problem::MlpGateUp:
-        return tokens >= 2 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
+        return tokens >= kNvfp4FirstW4a4MlpGateUp ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
     case Nvfp4Problem::Residual6144:
-        return tokens >= 5 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
+        return tokens >= kNvfp4FirstW4a4Residual6144 ? Nvfp4LinearRoute::W4A4
+                                                     : Nvfp4LinearRoute::A16;
     case Nvfp4Problem::Residual17408:
-        return tokens >= 3 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
+        return tokens >= kNvfp4FirstW4a4Residual17408 ? Nvfp4LinearRoute::W4A4
+                                                      : Nvfp4LinearRoute::A16;
     case Nvfp4Problem::DflashFeature:
     case Nvfp4Problem::DflashQkv:
     case Nvfp4Problem::DflashAttnOut:
@@ -45,8 +47,7 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
     case Nvfp4Problem::DflashSelector:
         return Nvfp4LinearRoute::A16;
     case Nvfp4Problem::MtpFc:
-        // Residual-class N=5120. AttnInput's T≥4 W4A4 is M32N64 with 4 live rows of 32.
-        return tokens >= 8 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
+        return tokens >= kNvfp4FirstW4a4MtpFc ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
     }
     throw std::logic_error("unreachable NVFP4 linear problem");
 }

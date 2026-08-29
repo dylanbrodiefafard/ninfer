@@ -15,6 +15,7 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -382,6 +383,69 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
             std::cerr << label << ": linear modified its persistent weight\n";
             ++failures;
         }
+    }
+    return failures;
+}
+
+int run_packed_column0_matches_decode(std::string_view label, WeightGenerator generator,
+                                      std::int32_t n, std::int32_t k, std::uint32_t seed,
+                                      ops::LinearPolicy packed_policy,
+                                      std::span<const std::int32_t> packed_widths) {
+    if (packed_widths.empty()) {
+        throw std::invalid_argument("linear test: no packed widths");
+    }
+    for (std::size_t index = 0; index < packed_widths.size(); ++index) {
+        if (packed_widths[index] < 2 ||
+            (index != 0 && packed_widths[index] <= packed_widths[index - 1])) {
+            throw std::invalid_argument("linear test: packed widths must be >= 2 and increasing");
+        }
+    }
+    const std::int32_t maximum_tokens = packed_widths.back();
+    quantized_weight::PackedWeight host_weight = generator(n, k, seed);
+    const std::vector<std::uint16_t> activation_bits =
+        make_activation(k, maximum_tokens, seed + 1U, ActivationCompute::A16);
+
+    DeviceBuffer device_activation(activation_bits.size() * sizeof(std::uint16_t));
+    device_activation.copy_from_host(activation_bits.data(), device_activation.bytes);
+    DeviceBuffer device_weight(host_weight.payload.size());
+    device_weight.copy_from_host(host_weight.payload.data(), device_weight.bytes);
+    const Weight weight = host_weight.device_weight(device_weight.p);
+
+    GuardedOutput decode_output(checked_elements(n, 1, "decode output"));
+    Tensor decode_x(device_activation.p, DType::BF16, {k, 1});
+    Tensor decode_y(decode_output.data(), DType::BF16, {n, 1});
+    const std::size_t decode_capacity =
+        ops::linear_workspace_capacity_bytes(weight.qtype, n, k, ops::LinearPolicy::A16Only, 1, 1);
+    DeviceArena decode_workspace(std::max<std::size_t>(decode_capacity, 256));
+    ops::linear(decode_x, weight, decode_y, ops::LinearPolicy::A16Only, decode_workspace, nullptr);
+    cuda_check(cudaDeviceSynchronize(), "synchronize linear decode");
+    const std::vector<double> decode =
+        test::from_device_bf16(decode_output.data(), static_cast<std::size_t>(n));
+
+    int failures = 0;
+    failures += decode_output.verify_guards(std::string(label) + " decode");
+    for (const std::int32_t tokens : packed_widths) {
+        GuardedOutput output(checked_elements(n, tokens, "packed output"));
+        Tensor x(device_activation.p, DType::BF16, {k, tokens});
+        Tensor destination(output.data(), DType::BF16, {n, tokens});
+        const std::size_t packed_capacity = ops::linear_workspace_capacity_bytes(
+            weight.qtype, n, k, packed_policy, tokens, tokens);
+        DeviceArena packed_workspace(std::max<std::size_t>(packed_capacity, 256));
+        const std::string case_label =
+            std::string(label) + " T=" + std::to_string(tokens) + " col0";
+        try {
+            ops::linear(x, weight, destination, packed_policy, packed_workspace, nullptr);
+            cuda_check(cudaDeviceSynchronize(), "synchronize linear packed");
+        } catch (const std::exception& error) {
+            std::cerr << case_label << ": unexpected exception: " << error.what() << '\n';
+            ++failures;
+            continue;
+        }
+        failures += output.verify_guards(case_label);
+        const std::vector<double> packed =
+            test::from_device_bf16(output.data(), static_cast<std::size_t>(n) * tokens);
+        failures += compare_output(case_label, std::span<const double>(packed.data(), n), decode,
+                                   ActivationCompute::A16);
     }
     return failures;
 }

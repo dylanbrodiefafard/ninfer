@@ -14,7 +14,8 @@ void launch(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const float inverse   = 1.0F / weight.weight_scale_divisor;
     auto* output          = static_cast<__nv_bfloat16*>(residual.data);
-    nvfp4_gemv_kernel<Geometry, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
+    nvfp4_gemv_kernel<Geometry, Schedule>
+        <<<dim3(kBlocks, x.ne[1]), Schedule::kThreads, 0, stream>>>(
         Nvfp4PackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data)},
         static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), inverse,
