@@ -53,6 +53,10 @@ __device__ __forceinline__ float block_reduce_sum(float x, float* sums) {
 
     x = threadIdx.x < Warps ? sums[lane] : 0.0f;
     if (warp == 0) { x = warp_reduce_sum<Warps>(x); }
+    // Callers (packed GDN GEMV) reuse `sums` in a token loop. Without this barrier, warps
+    // that skipped the second reduce can overwrite `sums[warp]` for token t+1 while warp 0
+    // is still reading token t.
+    __syncthreads();
     return x;
 }
 

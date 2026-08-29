@@ -219,7 +219,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_smal
 
     constexpr int kRowBlocks  = Geometry::kOutputRows / Schedule::kRowsPerCta;
     constexpr int kTokenTiles = (ActiveTokens + Schedule::kTokenTile - 1) / Schedule::kTokenTile;
-    const int linear_block    = static_cast<int>(blockIdx.x);
+    // 1D Linear grids keep blockIdx.x as the row/token tile. GDN fused B>1 launches
+    // dim3(batch, tiles) so the tile index is y and consecutive x are requests.
+    const int linear_block =
+        gridDim.y > 1 ? static_cast<int>(blockIdx.y) : static_cast<int>(blockIdx.x);
     int row_block;
     int token_tile;
     if constexpr (Schedule::kBlockOrder == Nvfp4SmallTBlockOrder::RowsContiguous) {

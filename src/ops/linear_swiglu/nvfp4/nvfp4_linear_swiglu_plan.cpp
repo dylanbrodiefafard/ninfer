@@ -88,10 +88,10 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
     }
     (void)resolve_route(policy, min_tokens);
     (void)resolve_route(policy, max_tokens);
-    if (policy == LinearPolicy::A16Only || max_tokens == 1) { return 0; }
+    if (policy == LinearPolicy::A16Only || max_tokens < kNvfp4FirstW4a4MlpGateUp) { return 0; }
 
     std::size_t maximum = 0;
-    if (min_tokens <= 48 && max_tokens >= 2) {
+    if (min_tokens <= 48 && max_tokens >= kNvfp4FirstW4a4MlpGateUp) {
         maximum = fused_workspace_bytes(std::min(max_tokens, 48));
     }
     const std::int32_t last_tma = max_tokens - (max_tokens % kTmaBlockM);

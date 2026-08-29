@@ -163,6 +163,42 @@ inline int compare(std::string_view label, const std::vector<double>& actual,
     return verify_reduction(std::string(label).c_str(), actual, expected, criterion);
 }
 
+inline int compare_column0(std::string_view label, const GuardedBf16Tensor& packed,
+                           const GuardedBf16Tensor& decode, std::int32_t rows,
+                           const ReductionCriterion& criterion) {
+    const std::vector<double> packed_vals = packed.values();
+    const std::vector<double> decode_vals = decode.values();
+    if (decode_vals.size() != static_cast<std::size_t>(rows) ||
+        packed_vals.size() < static_cast<std::size_t>(rows)) {
+        std::cerr << label << ": column-0 size mismatch packed=" << packed_vals.size()
+                  << " decode=" << decode_vals.size() << " rows=" << rows << '\n';
+        return 1;
+    }
+    return compare(label, std::vector<double>(packed_vals.begin(), packed_vals.begin() + rows),
+                   decode_vals, criterion);
+}
+
+inline int compare_packed_column_to_decode(std::string_view label, const GuardedBf16Tensor& packed,
+                                           std::int32_t packed_column,
+                                           const GuardedBf16Tensor& decode, std::int32_t rows,
+                                           const ReductionCriterion& criterion) {
+    const std::vector<double> packed_vals = packed.values();
+    const std::vector<double> decode_vals = decode.values();
+    const std::size_t offset =
+        static_cast<std::size_t>(packed_column) * static_cast<std::size_t>(rows);
+    const std::size_t need = offset + static_cast<std::size_t>(rows);
+    if (decode_vals.size() != static_cast<std::size_t>(rows) || packed_vals.size() < need) {
+        std::cerr << label << ": column " << packed_column
+                  << " size mismatch packed=" << packed_vals.size() << " decode=" << decode_vals.size()
+                  << " rows=" << rows << '\n';
+        return 1;
+    }
+    return compare(label,
+                   std::vector<double>(packed_vals.begin() + static_cast<std::ptrdiff_t>(offset),
+                                       packed_vals.begin() + static_cast<std::ptrdiff_t>(need)),
+                   decode_vals, criterion);
+}
+
 inline int verify_preserved(std::string_view label, const DeviceBuffer& device,
                             std::span<const std::uint16_t> before) {
     const std::vector<std::uint16_t> after = from_device<std::uint16_t>(device, before.size());

@@ -268,7 +268,7 @@ int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens,
     constexpr std::int32_t kGateBegin  = kKeyBegin + kKvRows;
     constexpr std::int32_t kValueBegin = kGateBegin + kQRows;
     int failures                       = 0;
-    const bool a4                      = policy == ops::LinearPolicy::AllowA4;
+    const bool a4                      = policy == ops::LinearPolicy::AllowA4 && tokens >= 4;
     const ReductionCriterion& criterion =
         a4 ? kAttnInputProjA4Tolerance : kAttnInputProjA16Tolerance;
     const std::int32_t sample_count = a4 ? kA4SampleRows : 7;
@@ -284,6 +284,60 @@ int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens,
                               activation, kHidden, tokens, criterion, sample_count);
     failures += verify_preserved("attn x" + suffix, device_activation, activation_bits);
     failures += parent.verify_preserved("attn parent" + suffix);
+    return failures;
+}
+
+int run_nvfp4_packed_column0(DevicePackedWeight& parent, std::int32_t tokens) {
+    constexpr std::int32_t kHidden = 5120;
+    constexpr std::int32_t kQRows  = 6144;
+    constexpr std::int32_t kKvRows = 1024;
+    const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 337U + tokens);
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    DeviceBuffer device_activation                   = to_device(activation_bits);
+
+    GuardedBf16Tensor packed_q(kQRows, tokens);
+    GuardedBf16Tensor packed_gate(kQRows, tokens);
+    GuardedBf16Tensor packed_key(kKvRows, tokens);
+    GuardedBf16Tensor packed_value(kKvRows, tokens);
+    GuardedBf16Tensor decode_q(kQRows, 1);
+    GuardedBf16Tensor decode_gate(kQRows, 1);
+    GuardedBf16Tensor decode_key(kKvRows, 1);
+    GuardedBf16Tensor decode_value(kKvRows, 1);
+
+    Tensor packed_x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor decode_x(device_activation.p, DType::BF16, {kHidden, 1});
+    Tensor pq = packed_q.tensor();
+    Tensor pg = packed_gate.tensor();
+    Tensor pk = packed_key.tensor();
+    Tensor pv = packed_value.tensor();
+    Tensor dq = decode_q.tensor();
+    Tensor dg = decode_gate.tensor();
+    Tensor dk = decode_key.tensor();
+    Tensor dv = decode_value.tensor();
+
+    const std::size_t packed_capacity = ops::attn_input_proj_workspace_capacity_bytes(
+        QType::NVFP4, 14336, kHidden, ops::LinearPolicy::AllowA4, tokens, tokens);
+    const std::size_t decode_capacity = ops::attn_input_proj_workspace_capacity_bytes(
+        QType::NVFP4, 14336, kHidden, ops::LinearPolicy::A16Only, 1, 1);
+    DeviceArena packed_workspace(std::max<std::size_t>(packed_capacity, 256));
+    DeviceArena decode_workspace(std::max<std::size_t>(decode_capacity, 256));
+    ops::attn_input_proj(packed_x, parent.view(), pq, pg, pk, pv, ops::LinearPolicy::AllowA4,
+                         packed_workspace, nullptr);
+    ops::attn_input_proj(decode_x, parent.view(), dq, dg, dk, dv, ops::LinearPolicy::A16Only,
+                         decode_workspace, nullptr);
+    cuda_synchronize();
+
+    const std::string suffix =
+        std::string(" NVFP4 A4 packed-col0 T=") + std::to_string(tokens);
+    int failures = 0;
+    failures += compare_column0("attn q" + suffix, packed_q, decode_q, kQRows,
+                                kAttnInputProjA16Tolerance);
+    failures += compare_column0("attn gate" + suffix, packed_gate, decode_gate, kQRows,
+                                kAttnInputProjA16Tolerance);
+    failures += compare_column0("attn k" + suffix, packed_key, decode_key, kKvRows,
+                                kAttnInputProjA16Tolerance);
+    failures += compare_column0("attn value" + suffix, packed_value, decode_value, kKvRows,
+                                kAttnInputProjA16Tolerance);
     return failures;
 }
 
@@ -303,6 +357,9 @@ int run_nvfp4_target() {
     for (const std::int32_t tokens :
          {1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 18, 24, 36, 1024, 2048, 4096}) {
         failures += run_nvfp4_target_case(parent, tokens, ops::LinearPolicy::AllowA4);
+    }
+    for (const std::int32_t tokens : {2}) {
+        failures += run_nvfp4_packed_column0(parent, tokens);
     }
     return failures;
 }

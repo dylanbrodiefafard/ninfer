@@ -25,4 +25,8 @@ struct Profile {
 int run_profile(std::string_view label, const Profile& profile,
                 std::span<const std::int32_t> token_cases);
 
+// Packed width column 0 vs T=1 A16 decode on the same weights and token-0 activation.
+int run_column0_matches_decode(std::string_view label, const Profile& profile,
+                               std::span<const std::int32_t> packed_widths);
+
 } // namespace ninfer::test::linear_swiglu

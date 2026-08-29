@@ -139,7 +139,9 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         ops::linear_add(x, weight, residual, invocation.policy, workspace, nullptr);
         cuda_check(cudaDeviceSynchronize(), "synchronize NVFP4 linear_add");
 
-        const bool a4           = invocation.policy == ops::LinearPolicy::AllowA4;
+        const bool a4 = invocation.policy == ops::LinearPolicy::AllowA4 &&
+                        ((k == 6144 && invocation.tokens >= 5) ||
+                         (k == 17408 && invocation.tokens >= 3));
         const std::string label = "NVFP4 linear_add [" + std::to_string(n) + "," +
                                   std::to_string(k) + "] " + (a4 ? "A4" : "A16") +
                                   " T=" + std::to_string(invocation.tokens);
@@ -187,6 +189,57 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
     return failures;
 }
 
+int run_packed_column0(std::int32_t n, std::int32_t k, std::uint32_t seed) {
+    quantized_weight::PatternedWeightOptions options;
+    options.weight_scale_divisor = 0.125F;
+    options.input_scale_divisor  = 3.5F;
+    quantized_weight::PackedWeight host_weight =
+        quantized_weight::make_patterned_weight(QType::NVFP4, n, k, seed, options);
+    constexpr std::int32_t kMaxT                      = 16;
+    const std::vector<std::uint16_t> activation       = make_activation(k, kMaxT, seed + 1U);
+    const std::vector<std::uint16_t> initial_residual = make_residual(n, kMaxT, seed + 2U);
+
+    GuardedDeviceBuffer device_activation(activation.size() * sizeof(std::uint16_t));
+    device_activation.copy_from_host(activation.data(), device_activation.bytes());
+    GuardedDeviceBuffer device_weight(host_weight.payload.size());
+    device_weight.copy_from_host(host_weight.payload.data(), host_weight.payload.size());
+    const Weight weight = host_weight.device_weight(device_weight.data());
+
+    GuardedDeviceBuffer decode(static_cast<std::size_t>(n) * sizeof(std::uint16_t));
+    decode.copy_from_host(initial_residual.data(), decode.bytes());
+    Tensor decode_x(device_activation.data(), DType::BF16, {k, 1});
+    Tensor decode_y(decode.data(), DType::BF16, {n, 1});
+    const std::size_t decode_capacity = ops::linear_add_workspace_capacity_bytes(
+        QType::NVFP4, n, k, ops::LinearPolicy::A16Only, 1, 1);
+    WorkspaceArena decode_workspace(std::max<std::size_t>(decode_capacity, 256));
+    ops::linear_add(decode_x, weight, decode_y, ops::LinearPolicy::A16Only, decode_workspace,
+                    nullptr);
+    cuda_check(cudaDeviceSynchronize(), "synchronize NVFP4 linear_add decode");
+    const std::vector<double> decode_vals =
+        from_device_bf16(decode.data(), static_cast<std::size_t>(n));
+
+    int failures = decode.verify_guards("NVFP4 linear_add packed-col0 decode");
+    for (const std::int32_t tokens : {2}) {
+        const std::size_t output_words = static_cast<std::size_t>(n) * tokens;
+        GuardedDeviceBuffer output(output_words * sizeof(std::uint16_t));
+        output.copy_from_host(initial_residual.data(), output.bytes());
+        Tensor x(device_activation.data(), DType::BF16, {k, tokens});
+        Tensor residual(output.data(), DType::BF16, {n, tokens});
+        const std::size_t capacity = ops::linear_add_workspace_capacity_bytes(
+            QType::NVFP4, n, k, ops::LinearPolicy::AllowA4, tokens, tokens);
+        WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
+        ops::linear_add(x, weight, residual, ops::LinearPolicy::AllowA4, workspace, nullptr);
+        cuda_check(cudaDeviceSynchronize(), "synchronize NVFP4 linear_add packed");
+        const std::string label = "NVFP4 linear_add packed-col0 [" + std::to_string(n) + "," +
+                                  std::to_string(k) + "] T=" + std::to_string(tokens);
+        failures += output.verify_guards(label);
+        const std::vector<double> packed = from_device_bf16(output.data(), output_words);
+        failures += verify_reduction(label, std::span<const double>(packed.data(), n), decode_vals,
+                                     kA16Tolerance);
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -197,6 +250,8 @@ int main() {
     int failures = 0;
     failures += run_shape(5120, 6144, 811U);
     failures += run_shape(5120, 17408, 821U);
+    failures += run_packed_column0(5120, 6144, 811U);
+    failures += run_packed_column0(5120, 17408, 821U);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " NVFP4 linear_add\n";
     return failures == 0 ? 0 : 1;
 }

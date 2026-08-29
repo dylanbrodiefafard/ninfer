@@ -62,4 +62,9 @@ bool cuda_available();
 int run_shape(std::string_view label, ActivationCompute activation_compute,
               WeightGenerator generator, const ShapeCase& shape);
 
+int run_packed_column0_matches_decode(std::string_view label, WeightGenerator generator,
+                                      std::int32_t n, std::int32_t k, std::uint32_t seed,
+                                      ops::LinearPolicy packed_policy,
+                                      std::span<const std::int32_t> packed_widths);
+
 } // namespace ninfer::test::linear
