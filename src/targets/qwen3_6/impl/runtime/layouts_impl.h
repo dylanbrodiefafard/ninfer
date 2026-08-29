@@ -314,6 +314,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         (void)workspace_recipe::gdn_recurrent_output<TextConfig>(layout, last);
         if (path == GdnWorkspacePath::ReplayRecord) {
             if (dflash_tree) {
+                // Nested: gdn_mix scopes the fold alloc before gdn_normalized_output.
                 scratch(layout, ops::gated_delta_net_replay_record_workspace_capacity_bytes(
                                     TextConfig::gdn_value_heads, batch_size, max_width));
             }
@@ -647,6 +648,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                           QType::Q4G64_F16S, drafts, drafts, batch),
                                       ops::dflash2_path_select_workspace_capacity_bytes(
                                           QType::NVFP4, drafts, drafts, batch)}));
+                    scratch(layout,
+                            static_cast<std::size_t>(ops::kDflash2PathSelectTopK) *
+                                static_cast<std::size_t>(drafts) * static_cast<std::size_t>(batch) *
+                                (sizeof(std::int32_t) + sizeof(float)));
                     if constexpr (DFlashConfig::two_block_first > 0) {
                         const auto linear_scratch = [&](std::int32_t n, std::int32_t k) {
                             return std::max({ops::linear_workspace_capacity_bytes(
@@ -706,9 +711,13 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 target_body(target, aggregate, aggregate, qwen3_6::TextPhase::Verify,
                             GdnWorkspacePath::ReplayRecord, batch, dflash_verify, dflash_verify,
                             text_envelope, dflash_tree);
-                const std::size_t accept =
+                const std::size_t chain_accept =
                     ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
                         TextConfig::token_domain, drafts, drafts, batch, batch);
+                const std::size_t tree_accept =
+                    ops::speculative_accept_tree_drafts_workspace_capacity_bytes(
+                        TextConfig::token_domain, dflash_verify, dflash_verify, batch, batch);
+                const std::size_t accept   = std::max(chain_accept, tree_accept);
                 const std::size_t proposal = dflash_proposal_capacity(verify, batch);
                 out.dflash_round           = std::max({out.dflash_round, finish(target), accept,
                                                        dflash_context_capacity(aggregate, true), proposal});
@@ -789,6 +798,13 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         }
         if (options.enable_vision) {
             throw std::invalid_argument("DFlash and Vision cannot be enabled together");
+        }
+        if constexpr (!DFlashConfig::tree_verify) {
+            if (options.speculative.dflash_verify_width != 0 &&
+                options.speculative.dflash_verify_width != options.speculative.draft_tokens + 1U) {
+                throw std::invalid_argument(
+                    "this DFlash target requires verify width equal to draft_tokens + 1");
+            }
         }
         break;
     }

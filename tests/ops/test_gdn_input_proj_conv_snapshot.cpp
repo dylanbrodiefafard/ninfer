@@ -735,7 +735,7 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
                 parent.host, row, activation.data() + static_cast<std::size_t>(token) * kHidden,
                 kHidden);
         });
-    const bool a4 = policy == ops::LinearPolicy::AllowA4 && tokens >= 4;
+    const bool a4 = policy == ops::LinearPolicy::AllowA4 && tokens >= 17;
     const ReductionCriterion& criterion =
         a4 ? kGdnInputProjConvSnapshotA4Tolerance : kGdnInputProjConvSnapshotA16Tolerance;
     const std::string suffix =
@@ -785,6 +785,8 @@ int run_nvfp4() {
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only, 2);
     failures += run_nvfp4_case(parent, 3, ops::LinearPolicy::AllowA4, 4);
     failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::AllowA4, 5);
+    failures += run_nvfp4_case(parent, 8, ops::LinearPolicy::AllowA4, 9);
+    failures += run_nvfp4_case(parent, 12, ops::LinearPolicy::AllowA4, 13);
     failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4, 0);
     failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4, 1025);
     constexpr std::int32_t kValueRows = 6144;
@@ -798,7 +800,7 @@ int run_nvfp4() {
         QType::NVFP4, kRows, kHidden, ops::LinearPolicy::AllowA4, kBatch, kWidth, kWidth);
     failures += run_batched_case(
         "NVFP4 A4 B=3 W=6 masked", kHidden, kValueRows, kZRows, kWidth, kBatch, valid_columns,
-        conv_weight, workspace_bytes, kGdnInputProjConvSnapshotA4Tolerance,
+        conv_weight, workspace_bytes, kGdnInputProjConvSnapshotA16Tolerance,
         [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
             return quantized_weight::dot_fp64(
                 parent.host, row,
@@ -847,15 +849,15 @@ int main() {
         std::cerr << "W8 snapshot interval did not preserve its zero/nonzero route boundary\n";
         ++failures;
     }
-    const std::size_t nvfp4_a4_4 = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 4, 4);
+    const std::size_t nvfp4_a4_17 = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+        QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 17, 17);
     if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
             QType::NVFP4, 16384, 5120, ops::LinearPolicy::A16Only, 1, 1, 16) != 0 ||
         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 1, 3) != 0 ||
-        nvfp4_a4_4 == 0 ||
+            QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 1, 16) != 0 ||
+        nvfp4_a4_17 == 0 ||
         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 1, 4) != nvfp4_a4_4) {
+            QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 1, 17) != nvfp4_a4_17) {
         std::cerr << "NVFP4 snapshot interval did not preserve its A16/A4 route boundary\n";
         ++failures;
     }

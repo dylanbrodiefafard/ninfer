@@ -21,6 +21,13 @@
 // max, the earlier codes of the block are rescaled (code * S_old/S_new) and
 // re-quantized to E2M1.
 //
+// Packed-append hybrid (decode fill): whole-pack max of in-range keys when the
+// append starts at the 16-key block's first slot (no in-block stored prefix, so
+// nothing to rescale; better quantization). First packed key only vs stored
+// implied max when the append starts mid-block — later siblings must not raise
+// the scale (and rescale column 0's prefix) before packed verify attends; T=1
+// decode never sees those siblings. Prefill fill stays whole-pack always.
+//
 // Numerics follow S3 (arXiv 2505.11594): P is amplified by 448*6 inside the
 // softmax (constant folded into the exp2), the per-16-key block scale maps the
 // amplified block max into e4m3 (max 448), codes land in [0, 6] (full e2m1 range),
@@ -610,21 +617,46 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             cache_k_scale[gqa_nvfp4_scale_index<Geometry>(physical_page, kv_head, grp,
                                                            page_offset)] = k_sc;
         }
-        // V side (S3 d-major layout): the 16-key block scale is cross-key state, so
-        // tokens are processed in order (a new key joins an existing block and may
-        // raise its max). Each launch's new keys fall inside one split's tail range,
-        // so the per-token sync below keeps the rescale reads settled.
+        // V side (S3 d-major layout): same hybrid as the standalone fill kernel.
+        // Pack starts at the block's first key: bump from the whole-pack max of
+        // packed keys in this block. Pack starts mid-block: only the first packed
+        // key may bump (later siblings must not rescale column 0). Later packed
+        // keys in the same block never bump.
         for (int token = 0; token < valid_tokens; ++token) {
             const int position = pos[token];
             if (position < split_start || position >= split_end) { continue; }
             const int physical_page = paged_kv_physical_page(block_table, position);
             const int page_offset   = position & kPagedKVPageMask;
             const int kb            = page_offset >> 4;
+            const int block_start   = position - (page_offset & 15);
+            const bool pack_owns_block_start = (page_offset & 15) == 0;
+            bool first_packed_in_block = true;
+            for (int earlier = 0; earlier < token; ++earlier) {
+                const int earlier_pos = pos[earlier];
+                if (earlier_pos >= block_start && earlier_pos < block_start + 16) {
+                    first_packed_in_block = false;
+                    break;
+                }
+            }
             for (int dp = tid; dp < D / 2; dp += Threads) {
                 const int d0            = dp * 2;
                 const std::int64_t vidx  = gqa_kv_new_index<Geometry>(kv_head, d0, token);
                 const float v0          = __bfloat162float(input.v[vidx]);
                 const float v1          = __bfloat162float(input.v[vidx + 1]);
+                float bump_src0 = fabsf(v0);
+                float bump_src1 = fabsf(v1);
+                if (pack_owns_block_start && first_packed_in_block) {
+                    for (int later = token + 1; later < valid_tokens; ++later) {
+                        const int later_pos = pos[later];
+                        if (later_pos < block_start || later_pos >= block_start + 16) {
+                            continue;
+                        }
+                        const std::int64_t lidx =
+                            gqa_kv_new_index<Geometry>(kv_head, d0, later);
+                        bump_src0 = fmaxf(bump_src0, fabsf(__bfloat162float(input.v[lidx])));
+                        bump_src1 = fmaxf(bump_src1, fabsf(__bfloat162float(input.v[lidx + 1])));
+                    }
+                }
                 // The code byte holds (d0 low, d1 high) and each d carries its own running
                 // block scale, so rescale once per d-pair with per-nibble factors.
                 const std::int64_t sc0_off =
@@ -633,16 +665,18 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                     gqa_s3_v_scale_index<Geometry>(physical_page, kv_head, d0 + 1, kb);
                 const float s_cur0       = detail::decode_nvfp4_e4m3(cache_v_scale[sc0_off]);
                 const float s_cur1       = detail::decode_nvfp4_e4m3(cache_v_scale[sc1_off]);
-                const bool bumped0       = fmaxf(fabsf(v0), s_cur0 * 6.0f) > s_cur0 * 6.0f;
-                const bool bumped1       = fmaxf(fabsf(v1), s_cur1 * 6.0f) > s_cur1 * 6.0f;
+                const bool bumped0 =
+                    first_packed_in_block && fmaxf(bump_src0, s_cur0 * 6.0f) > s_cur0 * 6.0f;
+                const bool bumped1 =
+                    first_packed_in_block && fmaxf(bump_src1, s_cur1 * 6.0f) > s_cur1 * 6.0f;
                 if (bumped0) {
                     cache_v_scale[sc0_off] =
-                        __nv_cvt_float_to_fp8(fmaxf(fabsf(v0), s_cur0 * 6.0f) / 6.0f,
+                        __nv_cvt_float_to_fp8(fmaxf(bump_src0, s_cur0 * 6.0f) / 6.0f,
                                               __NV_SATFINITE, __NV_E4M3);
                 }
                 if (bumped1) {
                     cache_v_scale[sc1_off] =
-                        __nv_cvt_float_to_fp8(fmaxf(fabsf(v1), s_cur1 * 6.0f) / 6.0f,
+                        __nv_cvt_float_to_fp8(fmaxf(bump_src1, s_cur1 * 6.0f) / 6.0f,
                                               __NV_SATFINITE, __NV_E4M3);
                 }
                 const float s0_final     = detail::decode_nvfp4_e4m3(cache_v_scale[sc0_off]);
@@ -1328,12 +1362,15 @@ __launch_bounds__(256) __global__ void gqa_attention_decode_fill_nvfp4s3_kernel(
     const int rest = MultiBatch ? unit - batch * per_batch : unit;
 
     const int column_base = column_begin + (MultiBatch ? batch * full_width : 0);
+    // valid_columns[b] is the per-row live width, not a packed column index.
+    // column_base is packed (column_begin + b*full_width); comparing the two
+    // skipped fill for every b>=1 whenever live width <= b*W (always, for W>=1).
     const int valid_tokens =
         Masked
-            ? (valid_columns[batch] <= column_base
+            ? (valid_columns[batch] <= column_begin
                    ? 0
-                   : (valid_columns[batch] - column_base < TokenTile
-                          ? valid_columns[batch] - column_base
+                   : (valid_columns[batch] - column_begin < TokenTile
+                          ? valid_columns[batch] - column_begin
                           : TokenTile))
             : TokenTile;
     if (valid_tokens <= 0) { return; }
@@ -1395,16 +1432,29 @@ __launch_bounds__(256) __global__ void gqa_attention_decode_fill_nvfp4s3_kernel(
     const std::uint8_t scale_byte1 = scale_v[sc1_off];
     const float s_cur0 = detail::decode_nvfp4_e4m3(scale_byte0);
     const float s_cur1 = detail::decode_nvfp4_e4m3(scale_byte1);
-    // New (in-range) keys: register-resident; the per-d block max reduced once.
+    // New (in-range) keys: register-resident. Hybrid block max:
+    // ib_begin==0 (append owns the block's first slot): whole-pack max of the
+    // in-range keys — no stored prefix to rescale, better e2m1 range.
+    // ib_begin>0 (append starts mid-block): first packed key only vs stored
+    // implied max. Packed verify writes W keys then attends; a later sibling
+    // must not raise the scale (and rescale column 0) before attention. T=1
+    // decode never sees those siblings.
     float v0s[16], v1s[16];
-    float m0 = 0.0f, m1 = 0.0f;
     for (int ki = ib_begin; ki < ib_end; ++ki) {
         const int t = ki + block_key0 - base_pos;
         const std::int64_t src = gqa_kv_new_index<Geometry>(kv_head, d0, t);
         v0s[ki] = __bfloat162float(vb[src]);
         v1s[ki] = __bfloat162float(vb[src + 1]);
-        m0 = fmaxf(m0, fabsf(v0s[ki]));
-        m1 = fmaxf(m1, fabsf(v1s[ki]));
+    }
+    float m0 = 0.0f, m1 = 0.0f;
+    if (ib_begin == 0) {
+        for (int ki = 0; ki < ib_end; ++ki) {
+            m0 = fmaxf(m0, fabsf(v0s[ki]));
+            m1 = fmaxf(m1, fabsf(v1s[ki]));
+        }
+    } else {
+        m0 = fabsf(v0s[ib_begin]);
+        m1 = fabsf(v1s[ib_begin]);
     }
     // Final block scale: new keys' max vs stored implied max, encoded once.
     const float fin_max0 = fmaxf(m0, s_cur0 * 6.0f);

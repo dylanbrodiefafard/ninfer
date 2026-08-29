@@ -4,6 +4,7 @@
 #include "ops/gdn_input_proj/gdn_conv.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_runtime.h>
 
 #include <cstdint>
 
@@ -17,21 +18,24 @@ inline constexpr std::int32_t kNvfp4GdnChannels =
 inline constexpr std::int32_t kNvfp4GdnZRows      = 6144;
 inline constexpr std::int32_t kNvfp4GdnParentRows = kNvfp4GdnChannels + kNvfp4GdnZRows;
 
-template <int Tokens, class Publish>
+template <int Tokens, class Publish, bool Tree = false>
 struct Nvfp4GdnConvOutput {
-    GdnConvEpilogue<Publish> conv;
+    GdnConvEpilogue<Publish, Tree> conv;
     __nv_bfloat16* z;
 
     __device__ __forceinline__ void store_row(std::int32_t parent_row,
                                               const float (&projected)[Tokens]) const {
+        const int batch = gridDim.y > 1 ? static_cast<int>(blockIdx.x) : conv.batch_row;
         if (parent_row < kNvfp4GdnChannels) {
-            conv.store(parent_row, projected);
+            auto epilogue      = conv;
+            epilogue.batch_row = batch;
+            epilogue.store(parent_row, projected);
             return;
         }
 #pragma unroll
         for (int token = 0; token < Tokens; ++token) {
-            z[static_cast<std::int64_t>(token) * kNvfp4GdnZRows + parent_row - kNvfp4GdnChannels] =
-                __float2bfloat16_rn(projected[token]);
+            z[(static_cast<std::int64_t>(batch) * Tokens + token) * kNvfp4GdnZRows + parent_row -
+              kNvfp4GdnChannels] = __float2bfloat16_rn(projected[token]);
         }
     }
 
@@ -44,32 +48,61 @@ struct Nvfp4GdnConvOutput {
     }
 };
 
-template <int Tokens, class Publish>
-Nvfp4GdnConvOutput<Tokens, Publish>
+template <int Tokens, bool Tree = false, class Publish>
+Nvfp4GdnConvOutput<Tokens, Publish, Tree>
 make_nvfp4_gdn_conv_output(const Tensor& conv_weight, const Tensor& conv_states,
                            const Tensor& valid_columns, const Tensor& initial_slot, Tensor& query,
-                           Tensor& key, Tensor& value, Tensor& z, Publish publish) {
-    return {
-        {
-            static_cast<const __nv_bfloat16*>(conv_weight.data),
-            static_cast<const __nv_bfloat16*>(conv_states.data),
-            static_cast<const std::int32_t*>(initial_slot.data),
-            valid_columns.data == nullptr ? nullptr
-                                          : static_cast<const std::int32_t*>(valid_columns.data),
-            static_cast<__nv_bfloat16*>(query.data),
-            static_cast<__nv_bfloat16*>(key.data),
-            static_cast<__nv_bfloat16*>(value.data),
-            kNvfp4GdnChannels,
-            kNvfp4GdnQueryRows,
-            kNvfp4GdnKeyRows,
-            kNvfp4GdnValueRows,
-            0,
-            Tokens,
-            0,
-            publish,
-        },
-        static_cast<__nv_bfloat16*>(z.data),
-    };
+                           Tensor& key, Tensor& value, Tensor& z, Publish publish,
+                           const std::int32_t* parent_index = nullptr) {
+    if constexpr (Tree) {
+        return {
+            {
+                static_cast<const __nv_bfloat16*>(conv_weight.data),
+                static_cast<const __nv_bfloat16*>(conv_states.data),
+                static_cast<const std::int32_t*>(initial_slot.data),
+                valid_columns.data == nullptr
+                    ? nullptr
+                    : static_cast<const std::int32_t*>(valid_columns.data),
+                static_cast<__nv_bfloat16*>(query.data),
+                static_cast<__nv_bfloat16*>(key.data),
+                static_cast<__nv_bfloat16*>(value.data),
+                kNvfp4GdnChannels,
+                kNvfp4GdnQueryRows,
+                kNvfp4GdnKeyRows,
+                kNvfp4GdnValueRows,
+                0,
+                Tokens,
+                0,
+                publish,
+                parent_index,
+            },
+            static_cast<__nv_bfloat16*>(z.data),
+        };
+    } else {
+        (void)parent_index;
+        return {
+            {
+                static_cast<const __nv_bfloat16*>(conv_weight.data),
+                static_cast<const __nv_bfloat16*>(conv_states.data),
+                static_cast<const std::int32_t*>(initial_slot.data),
+                valid_columns.data == nullptr
+                    ? nullptr
+                    : static_cast<const std::int32_t*>(valid_columns.data),
+                static_cast<__nv_bfloat16*>(query.data),
+                static_cast<__nv_bfloat16*>(key.data),
+                static_cast<__nv_bfloat16*>(value.data),
+                kNvfp4GdnChannels,
+                kNvfp4GdnQueryRows,
+                kNvfp4GdnKeyRows,
+                kNvfp4GdnValueRows,
+                0,
+                Tokens,
+                0,
+                publish,
+            },
+            static_cast<__nv_bfloat16*>(z.data),
+        };
+    }
 }
 
 } // namespace ninfer::ops::detail

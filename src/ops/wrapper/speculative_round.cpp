@@ -1,5 +1,6 @@
 #include "ninfer/ops/speculative_round.h"
 #include "ops/launcher/speculative_round.h"
+#include "ops/common/sampling_workspace.h"
 
 #include <algorithm>
 #include <limits>
@@ -49,6 +50,17 @@ void require_matrix(const Tensor& t, DType dtype, std::int32_t rows, std::int32_
     }
 }
 
+void require_selector_q(const Tensor& ids, const Tensor& q, std::int32_t k, std::int32_t batch,
+                        const char* op) {
+    require_dtype(ids, DType::I32, op, "selector_ids");
+    require_dtype(q, DType::FP32, op, "selector_q");
+    if (ids.ne[0] < 1 || ids.ne[0] != q.ne[0] || ids.ne[1] != k || q.ne[1] != k ||
+        ids.ne[2] != batch || q.ne[2] != batch || ids.ne[3] != 1 || q.ne[3] != 1) {
+        throw std::invalid_argument(std::string(op) +
+                                    ": selector_ids/q must be [C,K,B] with matching C>=1");
+    }
+}
+
 } // namespace
 
 std::size_t speculative_accept_greedy_drafts_workspace_capacity_bytes(std::int32_t token_domain,
@@ -65,6 +77,24 @@ std::size_t speculative_accept_greedy_drafts_workspace_capacity_bytes(std::int32
     if (row_bytes != 0 &&
         static_cast<std::size_t>(max_batch) > std::numeric_limits<std::size_t>::max() / row_bytes) {
         throw std::overflow_error("speculative accept workspace capacity overflows size_t");
+    }
+    return row_bytes * static_cast<std::size_t>(max_batch);
+}
+
+std::size_t speculative_accept_tree_drafts_workspace_capacity_bytes(std::int32_t token_domain,
+                                                                    std::int32_t min_width,
+                                                                    std::int32_t max_width,
+                                                                    std::int32_t min_batch,
+                                                                    std::int32_t max_batch) {
+    if (token_domain <= 0 || min_width < 2 || max_width < min_width || min_batch <= 0 ||
+        max_batch < min_batch || max_width > kSamplerMaxColumns) {
+        throw std::invalid_argument("speculative tree accept workspace: invalid width interval");
+    }
+    const std::size_t row_bytes =
+        sampling_workspace_capacity_bytes(token_domain, min_width, max_width);
+    if (row_bytes != 0 &&
+        static_cast<std::size_t>(max_batch) > std::numeric_limits<std::size_t>::max() / row_bytes) {
+        throw std::overflow_error("speculative tree accept workspace capacity overflows size_t");
     }
     return row_bytes * static_cast<std::size_t>(max_batch);
 }
@@ -111,7 +141,8 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
                                       Tensor& licensed_counts, Tensor& accepted,
                                       std::int32_t token_domain, const SamplingConfig* configs,
-                                      WorkspaceArena& workspace, cudaStream_t stream) {
+                                      WorkspaceArena& workspace, cudaStream_t stream,
+                                      const Tensor* selector_ids, const Tensor* selector_q) {
     constexpr const char* op = "speculative_accept_greedy_drafts";
     const std::int32_t k     = drafts.ne[0];
     const std::int32_t batch = drafts.ne[1];
@@ -136,6 +167,11 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
     require_matrix(licensed_tokens, DType::I32, k + 1, batch, op, "licensed_tokens");
     require_vector(licensed_counts, DType::I32, batch, op, "licensed_counts");
     require_vector(accepted, DType::I32, batch, op, "accepted");
+    if ((selector_ids == nullptr) != (selector_q == nullptr)) {
+        throw std::invalid_argument(
+            "speculative_accept_greedy_drafts: selector_ids and selector_q must both be null or both set");
+    }
+    if (selector_ids != nullptr) { require_selector_q(*selector_ids, *selector_q, k, batch, op); }
     if (configs == nullptr) {
         throw std::invalid_argument("speculative_accept_greedy_drafts: configs must be non-null");
     }
@@ -145,7 +181,8 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
     const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
     detail::speculative_accept_greedy_drafts_launch(
         target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
-        licensed_counts, accepted, token_domain, configs, scratch, stream);
+        licensed_counts, accepted, token_domain, configs, scratch, stream, selector_ids,
+        selector_q);
 }
 
 void speculative_accept_tree_drafts(const Tensor& target_tokens, const Tensor& logits,
@@ -159,10 +196,10 @@ void speculative_accept_tree_drafts(const Tensor& target_tokens, const Tensor& l
     constexpr const char* op = "speculative_accept_tree_drafts";
     const std::int32_t width = verify_ids.ne[0];
     const std::int32_t batch = verify_ids.ne[1];
-    if (width < 2 || batch < 1) {
-        throw std::invalid_argument("speculative_accept_tree_drafts: W and B must be positive");
+    if (width < 2 || width > kSamplerMaxColumns || batch < 1) {
+        throw std::invalid_argument(
+            "speculative_accept_tree_drafts: W must be in [2,16] and B must be positive");
     }
-    (void)workspace;
     if (configs == nullptr) {
         throw std::invalid_argument("speculative_accept_tree_drafts: configs must be non-null");
     }
@@ -185,10 +222,15 @@ void speculative_accept_tree_drafts(const Tensor& target_tokens, const Tensor& l
     if (token_domain <= 0 || token_domain > logits.ne[0]) {
         throw std::invalid_argument("speculative_accept_tree_drafts: token_domain out of range");
     }
+    auto scratch_scope = workspace.scope();
+    const std::size_t bytes =
+        speculative_accept_tree_drafts_workspace_capacity_bytes(token_domain, width, width, batch,
+                                                                batch);
+    const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
     detail::speculative_accept_tree_drafts_launch(
         target_tokens, logits, verify_ids, parent_index, valid_columns, current_extents, lengths,
         anchors, licensed_tokens, licensed_counts, accepted, accepted_column, fold_path,
-        token_domain, configs, stream);
+        token_domain, configs, scratch, stream);
 }
 
 void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& selectors, Tensor& out,

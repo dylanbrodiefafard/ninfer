@@ -93,9 +93,8 @@ struct DFlashConfig {
     static constexpr float rope_theta      = 1.0e7F;
     static constexpr float attention_scale = 0.08838834764831845F;
     static constexpr std::array<int, feature_layers> target_feature_layers{5, 19, 33, 47, 61};
-    static constexpr bool tree_verify      = true;
-    static constexpr int tree_frontier     = 2;
-    static constexpr int verify_width      = 12;
+    static constexpr bool tree_verify      = false;
+    static constexpr int verify_width      = 0;
     // 1 was A/B'd: greedy 128-tok 4.10 tok/round / 211 tok/s vs keep 4.23 / 239. Leave off.
     static constexpr int unmask_refine     = 0;
     // Spark two-block: first forward is this many MASK columns; remainder are a second block.

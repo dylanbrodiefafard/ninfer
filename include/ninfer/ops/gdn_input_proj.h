@@ -87,9 +87,9 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
 
 /**
  * Returns the transient capacity for the [16384,5120] NVFP4 snapshot profile. `batch_size` is exact
- * and the query covers every W in the inclusive width interval. B=1 preserves the existing fused
- * snapshot resolver. B=2..8 covers aggregate gdn_input_proj workspace plus one projected BF16
- * plane.
+ * and the query covers every W in the inclusive width interval. NVFP4 B=1 and B=2..8 (W<=16)
+ * use the fused snapshot resolver (one launch; grid.x=B when B>1, T=1 still loops GEMV)
+ * and need no transient plane.
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
@@ -141,7 +141,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
  * Single-parent form of gdn_input_proj_conv_snapshot. Registered parents are W8G32_F16S RowSplit
  * [12288,2048] and NVFP4 BlockScaleK16M128x4 [16384,5120], both in q/k/value/z row order. W8
  * admits A16Only. For dense B=1, NVFP4 A16Only is registered through W=16 and AllowA4 for every
- * positive W; B>1 uses the aggregate projection policy directly over B*W columns.
+ * positive W. B=2..8, W=2..16 uses that same fused snapshot in one launch (T=1 loops GEMV).
  */
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value_z_weight,
                                   const Tensor& conv_weight, Tensor& conv_states,
@@ -197,6 +197,8 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
  * [T,B] (or [T] when B=1) parent tensor used by gated_delta_net_replay_record: token 0 loads the
  * checkpoint history, every other valid token j loads the width-three history saved after its
  * parent, and the kernel saves the post-convolution history for j so siblings can share a parent.
+ * NVFP4 T=2..16 keeps fused SmallT GEMM+conv in one launch (grid.x=B when B>1) so column 0
+ * does not take the BF16 compose-record roundtrip.
  *
  * The two-parent form registers Q4 q/k [4096,5120] and the Q5 value/z parent [12288,5120]. All
  * tensor operands, outputs, conv_record, source state, and live workspace must be disjoint.

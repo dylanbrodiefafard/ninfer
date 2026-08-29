@@ -145,7 +145,8 @@ void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
  * Compact packed-tree KV slots onto a sequential prefix. For each row b and i < counts[b], token
  * prefix_lengths[b] + path[i,b] is copied onto prefix_lengths[b] + i. path is strictly increasing
  * packed indices, so the copy is safe in increasing i. kv_table_rows, prefix_lengths, and counts
- * are I32 [B]; path is I32 [W,B]. The cache view is the same batched GQA layer consumed by A1.
+ * are I32 [B]; path is I32 [W,B]. The cache view is the same batched GQA layer consumed by A1
+ * (BF16, INT8-G64, or NVFP4-G16). NVFP4 copies the 128-byte E2M1 codes and 16 e4m3 scales.
  */
 void gqa_kv_compact_path(PagedKVBatchLayerView cache, const Tensor& kv_table_rows,
                          const Tensor& prefix_lengths, const Tensor& path, const Tensor& counts,

@@ -44,7 +44,7 @@ Runtime and Op references:
 - [Kernel iteration layers 0–3](maintainer/kernel-iteration.md)
 - [NVFP4 decode-band Linear mapping (RTX 5090)](maintainer/nvfp4-decode-linear.md)
 - [Performance enhancements that did not move tok/s](maintainer/performance_enhancements.md)
-- [DFlash2 packed-tree verify speed](maintainer/dflash2-tree-speed.md)
+- [DFlash2 chain verify speed and historical tree A/Bs](maintainer/dflash2-tree-speed.md)
 - [ReplaySSM GDN technical reference](maintainer/replayssm-gdn.md)
 - [Linear benchmark contract and registered suites](maintainer/linear-benchmark.md)
 

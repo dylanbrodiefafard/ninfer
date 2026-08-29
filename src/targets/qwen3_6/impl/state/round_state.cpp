@@ -1,4 +1,5 @@
 #include <ninfer/targets/qwen3_6/round_state.h>
+#include "ninfer/ops/dflash2_path_select.h"
 
 #include <algorithm>
 #include <limits>
@@ -201,6 +202,14 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
         decode.append_counts = add_tensor(builder, DType::I32, {batch}, "DFlash append counts");
         decode.draft_tokens =
             add_tensor(builder, DType::I32, {dflash_width - 1, batch}, "DFlash proposal draft tokens");
+        decode.selector_ids =
+            add_tensor(builder, DType::I32,
+                       {ops::kDflash2PathSelectTopK, dflash_width - 1, batch},
+                       "DFlash chain selector ids");
+        decode.selector_q =
+            add_tensor(builder, DType::FP32,
+                       {ops::kDflash2PathSelectTopK, dflash_width - 1, batch},
+                       "DFlash chain selector q");
         decode.verify_ids =
             add_tensor(builder, DType::I32, {dflash_width, batch}, "DFlash target verify ids");
         decode.parent_index =
@@ -361,6 +370,8 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     append_positions           = layout.append_positions.bind(backing);
     append_counts              = layout.append_counts.bind(backing);
     draft_tokens               = layout.draft_tokens.bind(backing);
+    selector_ids               = layout.selector_ids.bind(backing);
+    selector_q                 = layout.selector_q.bind(backing);
     verify_ids                 = layout.verify_ids.bind(backing);
     parent_index               = layout.parent_index.bind(backing);
     ancestor_mask              = layout.ancestor_mask.bind(backing);

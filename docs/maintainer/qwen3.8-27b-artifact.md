@@ -202,10 +202,17 @@ The opt-in 27B live Engine tests (`ninfer_qwen3_6_27b_prefix_real_test`,
 27B package; they are not restricted to a Qwen3.6 filename.
 
 `ninfer_qwen3_8_27b_dflash_real_test` loads a reconverted NVFP4+DFlash2 file from
-`NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS`. Overlapping C=3 Graph DFlash2 greedy on three
-distinct prompts must match C=1 DFlash of the same k for product k=4 and k=5 chain.
-Those chain widths are T=5/T=6 SmallT, so they are not required to match MTP k=3
-token-for-token. Packed verify launches Linear/LinearAdd/SwiGLU at per-sequence T=W so
-NVFP4 residual and output-head routes match C=1 rather than packed T=W×B. NVFP4 target
+`NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS`. Sequential C=1 DFlash tokens are saved and used
+as the C>1 oracle: overlapping C=3 Graph DFlash2 greedy on three distinct prompts must
+match C=1 DFlash of the same k (row isolation). The same C=1 and C>1 strings are also
+compared against target-only T=1 decode. A later packed/T=1 greedy flip is not treated as
+row mixing; `NINFER_DFLASH_TEST_RELAX_ORACLE=1` continues past that T=1 mismatch. Product
+k=4 and k=5 chain widths are T=5/T=6 SmallT, so they are not required to match MTP k=3
+token-for-token. NVFP4 GDN conv-record stays fused SmallT at `T=W` per row (one launch,
+`grid.x=B` when `B>1`). Flattening that site to `T=W×B` compose (W4A4 GEMM + BF16 conv)
+flipped greedy column 0 versus C=1; `run_nvfp4_batched_matches_serial_fused` guards the
+identity. Linear/MLP/lm_head remain one aggregate launch: `packed_route_tokens` returns the
+C=1 width so those sites do not flip A16↔W4A4 versus sequential DFlash. Per-row KV table
+rows, Linear-Attention slots, and ReplaySSM records remain `layer(g, 0, B)`. NVFP4 target
 verify at `T>=4` uses W4A4 attention, so no DFlash path is required to match ordinary
 `T=1` A16 decode.

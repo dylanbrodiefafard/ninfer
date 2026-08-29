@@ -28,11 +28,13 @@ struct RouteSpec {
 
 constexpr std::array<RouteSpec, 6> k27Routes{{
     {{1, 1}, Bf16GdnGatingScheduleId::GemvPairedRows},
-    {{2, 8}, Bf16GdnGatingScheduleId::SmallTFusedCooperative},
+    // Product DFlash2 verify is T=12. MMA split-8 at T=9.. was a different reduction than
+    // T=1 GEMV and flipped greedy tokens; packed GEMV through T=16 keeps one launch.
+    {{2, 16}, Bf16GdnGatingScheduleId::SmallTFusedCooperative},
     // As token tiles double, halve SplitK. This keeps the cooperative grid near 192 CTAs instead
     // of making T a launch limit. Once the unsplit grid has enough independent work, it also
     // removes the cooperative-residency constraint.
-    {{9, 1024}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
+    {{17, 1024}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
     {{1025, 2048}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
     {{2049, 4096}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
     {{4097, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
@@ -95,8 +97,10 @@ std::int32_t mma_tile_cols(const Bf16GdnGatingProblem& problem) noexcept {
 std::int32_t schedule_split_k(Bf16GdnGatingScheduleId schedule) {
     switch (schedule) {
     case Bf16GdnGatingScheduleId::SmallTSplit10:
-    case Bf16GdnGatingScheduleId::SmallTFusedCooperative:
         return 10;
+    case Bf16GdnGatingScheduleId::SmallTFusedCooperative:
+        // Packed GEMV: same K-reduction as T=1, no split-K partials.
+        return 1;
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
         return 32;
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
@@ -150,8 +154,9 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
         case Bf16GdnGatingScheduleId::GemvPairedRows:
             return problem.cols == 1;
         case Bf16GdnGatingScheduleId::SmallTSplit10:
-        case Bf16GdnGatingScheduleId::SmallTFusedCooperative:
             return problem.cols >= 2 && problem.cols <= 8;
+        case Bf16GdnGatingScheduleId::SmallTFusedCooperative:
+            return problem.cols >= 2 && problem.cols <= 16;
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:

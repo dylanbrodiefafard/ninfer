@@ -2,6 +2,7 @@
 
 #include "core/layout.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
+#include "ops/linear/nvfp4/nvfp4_config.h"
 
 #include <stdexcept>
 
@@ -33,15 +34,22 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
     if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
         throw std::invalid_argument("nvfp4 gdn conv admits only A16 or A4");
     }
-    if (batch_size > 1) { return {Nvfp4GdnConvScheduleId::Materialized}; }
+    // Width selects the fused kernel. B>1 is the same T=W SmallT+FP32 kernel in one
+    // launch (grid.x=B). Do not flatten to B*W (W4A4 GEMM + BF16 conv).
+    if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
+    if (tokens <= kNvfp4LastPackedGdnConvSmallT) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
     if (policy == LinearPolicy::A16Only) {
-        if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
-        if (tokens <= 16) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
         throw std::invalid_argument("nvfp4 gdn conv A16 is registered only through T=16");
     }
-    if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
-    if (tokens <= 3) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
     return {Nvfp4GdnConvScheduleId::Materialized};
+}
+
+std::size_t nvfp4_gdn_decode_columns_workspace_bytes() {
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc(DType::BF16, {2048 + 2048 + 6144, 3, 1});
+    (void)layout.alloc(DType::I32, {1});
+    (void)layout.alloc(DType::I32, {1});
+    return layout.peak_bytes(1);
 }
 
 std::size_t nvfp4_gdn_snapshot_workspace_capacity_bytes(LinearPolicy policy,

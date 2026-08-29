@@ -134,13 +134,13 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_nvfp4s3_kernel
     //
     // A block may already hold live codes under the stored block scale (the decode/MTP
     // prefix of a straddling block, or in-block keys this append does not cover). The
-    // stored scale implies that existing data's block max (s*6), so the final block
-    // scale is the max of (a) the new keys' max, reduced once in registers over the
-    // in-range keys, and (b) the stored scale's implied max. It is computed once; the
-    // new key codes are written under it in a single coalesced pass and the scale bytes
-    // are written only when the scale changed. There is no backward-looking rescale
-    // loop: out-of-range codes keep their bytes (their e2m1 values are unchanged when
-    // re-consumed under the bumped scale, to within one e2m1 ulp).
+    // stored scale implies that existing data's block max (s*6). Hybrid with decode
+    // fill: when this append owns the block's first slot, the new-key max is the
+    // whole-pack reduction; when it starts mid-block, only the first packed key
+    // contributes (later siblings must not rescale the stored prefix). The final
+    // scale is that new-key max vs stored implied max, computed once; new key codes
+    // are written under it in a single coalesced pass and the scale bytes are written
+    // only when the scale changed. Out-of-range in-block keys are never touched.
     const int v_unit    = unit - k_units - kmean_units;
     const int blk       = v_unit / (Geometry::KVHeads * DpPairs);
     const int tmp       = v_unit % (Geometry::KVHeads * DpPairs);
@@ -167,8 +167,11 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_nvfp4s3_kernel
     const float s_cur0 = detail::decode_nvfp4_e4m3(scale_byte0);
     const float s_cur1 = detail::decode_nvfp4_e4m3(scale_byte1);
 
-    // New (in-range) keys: register-resident; the per-d 16-key max reduced once.
-    // ki is the in-block index; in-range keys are [inblock_begin, inblock_end).
+    // New (in-range) keys: register-resident. Same hybrid as decode fill:
+    // inblock_begin==0 (append owns the block's first slot): whole-pack max of
+    // in-range keys. inblock_begin>0 (append starts mid-block): first packed
+    // key only vs stored implied max, so later siblings cannot rescale a
+    // stored prefix (chunked prefill / kv_append / packed verify).
     float v0s[16], v1s[16];
     for (int ki = inblock_begin; ki < inblock_end; ++ki) {
         const std::int64_t src =
@@ -177,9 +180,14 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_nvfp4s3_kernel
         v1s[ki] = __bfloat162float(v[src + 1]);
     }
     float m0 = 0.0f, m1 = 0.0f;
-    for (int ki = inblock_begin; ki < inblock_end; ++ki) {
-        m0 = fmaxf(m0, fabsf(v0s[ki]));
-        m1 = fmaxf(m1, fabsf(v1s[ki]));
+    if (inblock_begin == 0) {
+        for (int ki = 0; ki < inblock_end; ++ki) {
+            m0 = fmaxf(m0, fabsf(v0s[ki]));
+            m1 = fmaxf(m1, fabsf(v1s[ki]));
+        }
+    } else {
+        m0 = fabsf(v0s[inblock_begin]);
+        m1 = fabsf(v1s[inblock_begin]);
     }
     // Final block scale: new keys' max vs stored implied max, encoded once.
     const float fin_max0 = fmaxf(m0, s_cur0 * 6.0f);

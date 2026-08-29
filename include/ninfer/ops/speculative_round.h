@@ -15,6 +15,12 @@ namespace ninfer::ops {
     std::int32_t token_domain, std::int32_t min_drafts, std::int32_t max_drafts,
     std::int32_t min_batch, std::int32_t max_batch);
 
+// Caller-owned transient capacity for every packed-tree width and batch-size pair in the
+// inclusive domains. Width is the packed verify width W (not K+1). Invalid domains throw.
+[[nodiscard]] std::size_t speculative_accept_tree_drafts_workspace_capacity_bytes(
+    std::int32_t token_domain, std::int32_t min_width, std::int32_t max_width,
+    std::int32_t min_batch, std::int32_t max_batch);
+
 /**
  * Op: speculative_prepare_verify_inputs
  *
@@ -57,18 +63,21 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
  *   Independently for each row b, greedy mode accepts the longest available draft prefix matching
  *   target_tokens and commits the target token at the first mismatch (or the bonus column).
  *   Sampling mode applies configs[b] to each valid verification column, accepts draft i with
- *   target probability p_i(draft_i), samples from the residual distribution on first rejection,
- *   and samples a bonus from column Pcur[b] when every available draft is accepted. The draft
- *   proposal distribution is one-hot at each greedy draft token.
+ *   probability min(1, p_i(d)/q_i(d)) (Leviathan), samples from max(0, p-q) on first rejection,
+ *   and samples a bonus from column Pcur[b] when every available draft is accepted. Null
+ *   selector_ids/selector_q is the one-hot draft convention: accept iff u < p_i(d) and the
+ *   residual excludes d. Greedy mode ignores q.
  *   RNG domains are the speculative accept/correction/bonus SamplePurpose values and logical
  *   positions derived from the old length.
  *
  * Logical shapes:
  *   All Tensor storage is contiguous. target_tokens/licensed_tokens are I32 [K+1,B], drafts is
  *   I32 [K,B], logits is BF16 [physical_rows,K+1,B], and current_extents/lengths/anchors/
- *   licensed_counts/accepted are I32 [B]. token_domain is in [1,physical_rows], K>=1, B>=1, and
- *   configs points to a device-resident SamplingConfig[B]. Tensor arguments, configs, and
- *   configs[b].token_counts do not overlap except for the explicitly mutated objects.
+ *   licensed_counts/accepted are I32 [B]. Optional selector_ids is I32 [C,K,B] and selector_q
+ *   is FP32 [C,K,B] with C>=1 (product C=16); both null or both non-null. token_domain is in
+ *   [1,physical_rows], K>=1, B>=1, and configs points to a device-resident SamplingConfig[B].
+ *   Tensor arguments, configs, and configs[b].token_counts do not overlap except for the
+ *   explicitly mutated objects.
  *
  * Numeric:
  *   Sampling filtering, penalties, normalization, and RNG semantics are those of sampling.h.
@@ -91,22 +100,34 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
                                       Tensor& licensed_counts, Tensor& accepted,
                                       std::int32_t token_domain, const SamplingConfig* configs,
-                                      WorkspaceArena& workspace, cudaStream_t stream);
+                                      WorkspaceArena& workspace, cudaStream_t stream,
+                                      const Tensor* selector_ids = nullptr,
+                                      const Tensor* selector_q = nullptr);
 
 /**
  * Op: speculative_accept_tree_drafts
  *
  * Greedy: from packed column 0, walk to the unique child whose token equals the target argmax;
  * otherwise emit that argmax as the correction. Sampling: at node u sample x from the truncated
- * target distribution; if x is a child of u, accept and continue, else emit x as correction.
- * Walks at most current_extents[b] accepted hops (same budget as chain verify). fold_path lists
- * packed columns of the processed path including the root; accepted_column is the last processed
- * packed index (hidden selector). licensed_tokens are time-ordered accepted child ids plus the
- * correction. accepted is the accepted draft count.
+ * target distribution; if x is a child of u, accept and continue, else emit x as correction
+ * (SpecInfer membership). Walks at most current_extents[b] accepted hops (same budget as chain
+ * verify). fold_path lists packed columns of the processed path including the root;
+ * accepted_column is the last processed packed index (hidden selector). licensed_tokens are
+ * time-ordered accepted child ids plus the correction. accepted is the accepted draft count.
+ * Sampling increments configs[b].token_counts for each produced token when that pointer is
+ * non-null; greedy does not. Large-vocabulary sampling uses the same partial/group pipeline as
+ * chain accept, with a parent-walk penalty overlay at each packed column, then the SpecInfer
+ * walk over the stored truncated distributions.
  *
  * verify_ids/parent_index/fold_path/licensed_tokens are I32 [W,B]. target_tokens is I32 [W,B].
  * logits is BF16 [physical_rows,W,B]. current_extents/valid_columns and the other vectors are
- * I32 [B]. W is the packed verify width (product k=7 uses 12).
+ * I32 [B]. W is the packed verify width in [2,16] (product k=7 uses 12). lengths[b] is the
+ * pre-round sequence length and is incremented by the produced count; it must not alias the
+ * packed-window base used by gqa_kv_compact_path (E+path[i] → E+i).
+ *
+ * Workspace:
+ *   Caller-owned transient storage reported by
+ *   speculative_accept_tree_drafts_workspace_capacity_bytes().
  */
 void speculative_accept_tree_drafts(const Tensor& target_tokens, const Tensor& logits,
                                     const Tensor& verify_ids, const Tensor& parent_index,

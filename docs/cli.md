@@ -126,22 +126,25 @@ For 35B-A3B DFlash v1:
   --spec dflash --draft-tokens 7 --lm-head-draft
 ```
 
-For Qwen3.8-27B DFlash2, the NVFP4 artifact must contain the appended `dflash/` objects:
+For Qwen3.8-27B DFlash2, the NVFP4 artifact must contain the appended `dflash/` objects. Its
+paper-accurate verifier is a chain with `W=k+1`; a width override, when supplied, must equal that
+value. On RTX 5090, `k=4` (block length five) is the measured speed recommendation.
 
 ```bash
 ./build/apps/ninfer out/qwen3_8_27b_nvfp4_dflash_w8.ninfer \
   --prompt "Write a short explanation of speculative decoding." \
   --max-context 16384 --max-new 512 \
-  --spec dflash --draft-tokens 7 --lm-head-draft
+  --spec dflash --draft-tokens 4 --lm-head-draft
 ```
 
 MTP and DFlash cannot be enabled together. `--spec dflash` on a 27B file without `dflash/` fails
 at bind. Current 3.8 MTP-only files and all 3.6-27B files stay valid MTP artifacts. The published
 [performance results](performance.md) use MTP with three draft tokens and DFlash with seven draft
 tokens (block length eight), both with the optimized proposal head. 35B DFlash v1 accepts up to
-fifteen draft tokens; 3.8 DFlash2 accepts up to eleven. Seven is the default tree window; eleven
-runs Spark two-block (7 MASK + 4 MASK) chain verify. Current C=1 measurements for Qwen3.8-27B NVFP4 DFlash2 are in
-[performance.md](performance.md).
+fifteen draft tokens; 3.8 DFlash2 accepts up to eleven. Eleven runs Spark two-block (7 MASK + 4
+MASK) chain verify. Published INT8-KV C=1 DFlash2 W8 numbers are in
+[performance.md](performance.md). The RTX 5090 packed-tree investigation and chain cutover are in
+[dflash2-tree-speed.md](maintainer/dflash2-tree-speed.md).
 
 ## Common options
 
@@ -156,7 +159,7 @@ runs Spark two-block (7 MASK + 4 MASK) chain verify. Current C=1 measurements fo
 | `--kv-dtype bf16\|int8\|nvfp4` | KV-cache storage | `nvfp4` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; 35B DFlash `1..15`; 3.8 DFlash2 `1..11` | unset |
-| `--dflash-verify-width N` | DFlash packed/chain verify width `2..16`; omit for the k-dependent default | auto |
+| `--dflash-verify-width N` | DFlash verify width `2..16`; chain-only targets require `W=k+1`, which is also the default | auto |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |

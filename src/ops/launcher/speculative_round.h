@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/sampling.h"
 
@@ -21,7 +22,9 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
                                              Tensor& licensed_tokens, Tensor& licensed_counts,
                                              Tensor& accepted, std::int32_t token_domain,
                                              const SamplingConfig* configs, DeviceSpan workspace,
-                                             cudaStream_t stream);
+                                             cudaStream_t stream,
+                                             const Tensor* selector_ids = nullptr,
+                                             const Tensor* selector_q = nullptr);
 
 void speculative_select_accepted_hidden_launch(const Tensor& hidden, const Tensor& selectors,
                                                Tensor& out, cudaStream_t stream);
@@ -34,7 +37,7 @@ void speculative_accept_tree_drafts_launch(const Tensor& target_tokens, const Te
                                            Tensor& licensed_counts, Tensor& accepted,
                                            Tensor& accepted_column, Tensor& fold_path,
                                            std::int32_t token_domain, const SamplingConfig* configs,
-                                           cudaStream_t stream);
+                                           DeviceSpan workspace, cudaStream_t stream);
 
 void proposal_remap_token_ids_launch(Tensor& proposal_tokens, const std::int32_t* id_map,
                                      std::int32_t n, cudaStream_t stream);

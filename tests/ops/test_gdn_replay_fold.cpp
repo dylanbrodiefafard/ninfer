@@ -715,13 +715,13 @@ int run_record_fold_rounds() {
 }
 
 int run_path_fold_case() {
-    constexpr FoldProfile kProfile{30, 32, 8192};
-    constexpr std::int32_t kWidth     = 4;
+    constexpr FoldProfile kProfile{48, 48, 10240};
+    constexpr std::int32_t kWidth     = 6;
     constexpr std::int32_t kSlotCount = 3;
     constexpr std::int32_t kSlot      = 2;
-    constexpr std::int32_t kSeqWidth  = 2;
+    constexpr std::int32_t kSeqWidth  = 4;
     constexpr std::uint32_t kSeed     = 1871U;
-    constexpr std::array<std::int32_t, 2> kPath{0, 2};
+    constexpr std::array<std::int32_t, 4> kPath{0, 1, 3, 5};
 
     const std::size_t recurrent_slot_elements =
         static_cast<std::size_t>(kStateDim) * kStateDim * kProfile.value_heads;
@@ -730,7 +730,7 @@ int run_path_fold_case() {
     const std::size_t conv_slot_bytes      = conv_slot_elements * sizeof(std::uint16_t);
 
     const auto fill_records = [&](std::int32_t width, GdnReplayRecords& records,
-                                  const std::array<std::int32_t, 2>& packed_from_tree,
+                                  const std::array<std::int32_t, 4>& packed_from_tree,
                                   const std::vector<std::uint16_t>& tree_conv,
                                   const std::vector<std::uint16_t>& tree_key,
                                   const std::vector<std::uint16_t>& tree_value,
@@ -908,8 +908,8 @@ int run_path_fold_case() {
     ops::GdnReplayFoldRow tree_row{};
     tree_row.linear_state_slot = kSlot;
     tree_row.commit_columns    = 0;
-    tree_row.path        = std::array<std::int32_t, 16>{0, 2};
-    tree_row.path_length = 2;
+    tree_row.path        = std::array<std::int32_t, 16>{0, 1, 3, 5};
+    tree_row.path_length = 4;
     ops::gdn_replay_fold(tree_records, tree_pool.all_layers_view(),
                          std::span<const ops::GdnReplayFoldRow>(&tree_row, 1), nullptr);
 
@@ -957,6 +957,160 @@ int run_path_fold_case() {
         return failures;
 }
 
+int run_identity_path_matches_prefix_fold() {
+    constexpr FoldProfile kProfile{48, 48, 10240};
+    constexpr std::int32_t kWidth     = 12;
+    constexpr std::int32_t kSlotCount = 2;
+    constexpr std::int32_t kSlot      = 1;
+    constexpr std::uint32_t kSeed     = 1891U;
+    constexpr std::int32_t kCapacity  = 8;
+
+    const std::size_t recurrent_slot_elements =
+        static_cast<std::size_t>(kStateDim) * kStateDim * kProfile.value_heads;
+    const std::size_t conv_slot_elements = static_cast<std::size_t>(kProfile.conv_channels) * 3;
+
+    LayoutBuilder record_builder;
+    const GdnReplayRecordLayout record_layout = plan_gdn_replay_records(
+        record_builder, {.layers          = kProfile.layers,
+                         .record_capacity = kCapacity,
+                         .width           = kWidth,
+                         .conv_channels   = kProfile.conv_channels,
+                         .qk_heads        = kQkHeads,
+                         .value_heads     = kProfile.value_heads,
+                         .key_dim         = kStateDim,
+                         .value_dim       = kStateDim});
+    DeviceBuffer record_storage(record_builder.finish(256));
+    record_storage.fill(0);
+    GdnReplayRecords records({record_storage.p, record_storage.bytes}, record_layout);
+
+    std::vector<std::uint16_t> conv(records.conv.numel());
+    std::vector<std::uint16_t> key(records.key.numel());
+    std::vector<std::uint16_t> value(records.value.numel());
+    std::vector<std::uint32_t> gate(records.gate.numel());
+    for (std::int32_t layer = 0; layer < kProfile.layers; ++layer) {
+        const std::int64_t dest_outer = static_cast<std::int64_t>(layer) * kCapacity;
+        for (std::int32_t token = 0; token < kWidth; ++token) {
+            const std::int64_t dest_column = dest_outer * kWidth + token;
+            for (std::int32_t channel = 0; channel < kProfile.conv_channels; ++channel) {
+                conv[static_cast<std::size_t>(dest_column) * kProfile.conv_channels + channel] =
+                    bf16_pattern(kSeed + layer * 131U + token * 7U + channel);
+            }
+            for (std::int32_t head = 0; head < kQkHeads; ++head) {
+                const std::size_t base = static_cast<std::size_t>(
+                    (dest_column * kQkHeads + head) * kStateDim);
+                for (std::int32_t dim = 0; dim < kStateDim; ++dim) {
+                    key[base + dim] =
+                        bf16_pattern(kSeed + 100003U + layer * 197U + token * 11U + head * 5U + dim,
+                                     0.08F);
+                }
+            }
+            for (std::int32_t head = 0; head < kProfile.value_heads; ++head) {
+                const std::size_t vector_base = static_cast<std::size_t>(
+                    (dest_column * kProfile.value_heads + head) * kStateDim);
+                for (std::int32_t dim = 0; dim < kStateDim; ++dim) {
+                    value[vector_base + dim] = bf16_pattern(
+                        kSeed + 200003U + layer * 211U + token * 13U + head * 7U + dim, 0.08F);
+                }
+                const std::size_t gate_base = static_cast<std::size_t>(
+                    (dest_column * kProfile.value_heads + head) * 2);
+                gate[gate_base] = std::bit_cast<std::uint32_t>(
+                    -0.03F - static_cast<float>(mix(kSeed + layer * 31U + token * 7U + head) % 900U) /
+                                 1000.0F);
+                gate[gate_base + 1] = std::bit_cast<std::uint32_t>(
+                    0.05F + static_cast<float>(mix(kSeed + 300007U + layer * 37U + token * 11U +
+                                                   head) %
+                                               900U) /
+                                1000.0F);
+            }
+        }
+    }
+    cuda_check(cudaMemcpy(records.conv.data, conv.data(), records.conv.bytes(),
+                          cudaMemcpyHostToDevice),
+               "upload identity-path conv records");
+    cuda_check(cudaMemcpy(records.key.data, key.data(), records.key.bytes(), cudaMemcpyHostToDevice),
+               "upload identity-path key records");
+    cuda_check(cudaMemcpy(records.value.data, value.data(), records.value.bytes(),
+                          cudaMemcpyHostToDevice),
+               "upload identity-path value records");
+    cuda_check(cudaMemcpy(records.gate.data, gate.data(), records.gate.bytes(),
+                          cudaMemcpyHostToDevice),
+               "upload identity-path gate records");
+
+    const auto make_pool = [&]() {
+        LayoutBuilder state_builder;
+        const LinearAttentionStatePoolLayout state_layout = plan_linear_attention_state_pool(
+            state_builder, {.layers         = static_cast<std::uint32_t>(kProfile.layers),
+                            .conv_channels  = kProfile.conv_channels,
+                            .conv_width     = 3,
+                            .value_heads    = kProfile.value_heads,
+                            .value_head_dim = kStateDim,
+                            .key_head_dim   = kStateDim,
+                            .slot_count     = kSlotCount,
+                            .conv_dtype     = DType::BF16});
+        DeviceBuffer storage(state_builder.finish(256));
+        storage.fill(0);
+        LinearAttentionStatePool pool({storage.p, storage.bytes}, state_layout);
+        for (std::int32_t layer = 0; layer < kProfile.layers; ++layer) {
+            const std::vector<float> recurrent(
+                recurrent_slot_elements, signed_pattern(kSeed + 500009U + layer * 227U, 0.01F));
+            cuda_check(cudaMemcpy(pool.recurrent_slot(static_cast<std::uint32_t>(layer), kSlot).data,
+                                  recurrent.data(), recurrent.size() * sizeof(float),
+                                  cudaMemcpyHostToDevice),
+                       "upload identity-path recurrent");
+            std::vector<std::uint16_t> conv_state(conv_slot_elements);
+            for (std::int32_t history = 0; history < 3; ++history) {
+                for (std::int32_t channel = 0; channel < kProfile.conv_channels; ++channel) {
+                    conv_state[static_cast<std::size_t>(history) * kProfile.conv_channels + channel] =
+                        bf16_pattern(kSeed + 400009U + layer * 223U + history * 13U + channel, 0.05F);
+                }
+            }
+            cuda_check(cudaMemcpy(pool.conv_slot(static_cast<std::uint32_t>(layer), kSlot).data,
+                                  conv_state.data(), conv_state.size() * sizeof(std::uint16_t),
+                                  cudaMemcpyHostToDevice),
+                       "upload identity-path conv state");
+        }
+        return std::tuple{std::move(storage), std::move(pool)};
+    };
+
+    auto [prefix_storage, prefix_pool] = make_pool();
+    auto [path_storage, path_pool]     = make_pool();
+
+    const std::array prefix_row{ops::GdnReplayFoldRow{kSlot, kWidth}};
+    ops::gdn_replay_fold(records, prefix_pool.all_layers_view(), prefix_row, nullptr);
+
+    ops::GdnReplayFoldRow path_row{};
+    path_row.linear_state_slot = kSlot;
+    path_row.commit_columns    = kWidth;
+    path_row.path_length       = kWidth;
+    for (std::int32_t i = 0; i < kWidth; ++i) { path_row.path[static_cast<std::size_t>(i)] = i; }
+    ops::gdn_replay_fold(records, path_pool.all_layers_view(),
+                         std::span<const ops::GdnReplayFoldRow>(&path_row, 1), nullptr);
+    cuda_synchronize();
+
+    for (std::int32_t layer = 0; layer < kProfile.layers; ++layer) {
+        if (from_device<float>(path_pool.recurrent_slot(static_cast<std::uint32_t>(layer), kSlot).data,
+                               recurrent_slot_elements) !=
+            from_device<float>(
+                prefix_pool.recurrent_slot(static_cast<std::uint32_t>(layer), kSlot).data,
+                recurrent_slot_elements)) {
+            std::cerr << "identity path W=12 fold recurrent differs from packed prefix layer="
+                      << layer << "\n";
+            return 1;
+        }
+        if (from_device<std::uint16_t>(
+                path_pool.conv_slot(static_cast<std::uint32_t>(layer), kSlot).data,
+                conv_slot_elements) !=
+            from_device<std::uint16_t>(
+                prefix_pool.conv_slot(static_cast<std::uint32_t>(layer), kSlot).data,
+                conv_slot_elements)) {
+            std::cerr << "identity path W=12 fold conv differs from packed prefix layer=" << layer
+                      << "\n";
+            return 1;
+        }
+    }
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -969,12 +1123,14 @@ int main() {
     failures += run_case({48, 48, 10240}, 2, 1, {2}, 1801U);
     failures += run_case({48, 48, 10240}, 3, 4, {0, 1, 2, 3}, 1811U);
     failures += run_case({48, 48, 10240}, 6, 8, {0, 1, 2, 3, 6, 4, 1, 5}, 1821U);
+    failures += run_case({48, 48, 10240}, 12, 1, {12}, 1883U);
     failures += run_case({30, 32, 8192}, 2, 1, {2}, 1831U);
     failures += run_case({30, 32, 8192}, 6, 1, {6}, 1841U);
     failures += run_case({30, 32, 8192}, 6, 2, {2, 5}, 1851U);
     failures += run_case({30, 32, 8192}, 16, 8, {0, 1, 2, 3, 16, 7, 12, 5}, 1861U);
     failures += run_record_fold_rounds();
     failures += run_path_fold_case();
+    failures += run_identity_path_matches_prefix_fold();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_replay_fold\n";
     return failures == 0 ? 0 : 1;
 }

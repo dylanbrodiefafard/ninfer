@@ -328,4 +328,43 @@ __device__ __forceinline__ int sampling_pick_from_support(const int* cand_idx, c
     return picked;
 }
 
+// q(token) over a shortlist of `n` (id, probability) pairs. Missing ids are 0.
+// A null shortlist is the one-hot draft convention (q=1 at the drafted token).
+__device__ __forceinline__ float sampling_selector_q(const int* ids, const float* q, int n,
+                                                     int token) {
+    if (ids == nullptr || q == nullptr || n <= 0) { return 1.0f; }
+    for (int c = 0; c < n; ++c) {
+        if (ids[c] == token) { return q[c]; }
+    }
+    return 0.0f;
+}
+
+// Leviathan residual: inverse-CDF of max(0, p - q) on the truncated target support.
+// Null q is one-hot at `draft_id` and matches sampling_pick_from_support(..., exclude).
+__device__ __forceinline__ int sampling_pick_from_p_minus_q(const int* cand_idx, const float* prob,
+                                                            int n, const int* q_ids,
+                                                            const float* q_vals, int q_n,
+                                                            int draft_id, float u) {
+    if (q_ids == nullptr || q_vals == nullptr || q_n <= 0) {
+        return sampling_pick_from_support(cand_idx, prob, n, draft_id, u);
+    }
+    float mass = 0.0f;
+    for (int j = 0; j < n; ++j) {
+        mass += fmaxf(0.0f, prob[j] - sampling_selector_q(q_ids, q_vals, q_n, cand_idx[j]));
+    }
+    if (mass <= 0.0f) { return draft_id; }
+    const float goal = u * mass;
+    float acc        = 0.0f;
+    int picked       = cand_idx[0];
+    for (int j = 0; j < n; ++j) {
+        const float r =
+            fmaxf(0.0f, prob[j] - sampling_selector_q(q_ids, q_vals, q_n, cand_idx[j]));
+        if (r <= 0.0f) { continue; }
+        acc += r;
+        picked = cand_idx[j];
+        if (goal < acc) { return picked; }
+    }
+    return picked;
+}
+
 } // namespace ninfer::ops

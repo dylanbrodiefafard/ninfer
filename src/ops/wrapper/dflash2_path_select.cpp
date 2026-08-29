@@ -111,6 +111,24 @@ void require_path(const Tensor& path, std::int32_t tokens, std::int32_t batch) {
     }
 }
 
+void require_selector(const Tensor& ids, const Tensor& q, std::int32_t tokens, std::int32_t batch) {
+    if (ids.dtype != DType::I32 || !ids.is_contiguous() || ids.data == nullptr) {
+        throw std::invalid_argument("dflash2_path_select: selector_ids must be contiguous I32");
+    }
+    if (q.dtype != DType::FP32 || !q.is_contiguous() || q.data == nullptr) {
+        throw std::invalid_argument("dflash2_path_select: selector_q must be contiguous FP32");
+    }
+    if (ids.ne[0] != kDflash2PathSelectTopK || ids.ne[1] != tokens || ids.ne[2] != batch ||
+        ids.ne[3] != 1) {
+        throw std::invalid_argument(
+            "dflash2_path_select: selector_ids must be I32 [16,T,1,1] or [16,T,B,1]");
+    }
+    if (q.ne[0] != kDflash2PathSelectTopK || q.ne[1] != tokens || q.ne[2] != batch || q.ne[3] != 1) {
+        throw std::invalid_argument(
+            "dflash2_path_select: selector_q must be FP32 [16,T,1,1] or [16,T,B,1]");
+    }
+}
+
 void require_projection_weight(const Weight& weight) {
     if (weight.n != kDflash2PathSelectRank || weight.k != kDflash2PathSelectHidden) {
         throw std::invalid_argument(
@@ -202,10 +220,12 @@ std::size_t dflash2_path_select_workspace_capacity_bytes(QType qtype, std::int32
 void dflash2_path_select(const Tensor& logits, const Tensor& hidden,
                          const Weight& hidden_projection, const Tensor& pred_code,
                          const Tensor& succ_code, const Tensor& anchors,
-                         const float* temperatures, const unsigned long long* seeds, Tensor& path,
-                         WorkspaceArena& workspace, cudaStream_t stream,
-                         const Tensor* logit_token_ids, const Weight* pred_nvfp4,
-                         const Weight* succ_nvfp4) {
+                         const Tensor& logical_positions,
+                         const SamplingConfig* configs, Tensor& path, WorkspaceArena& workspace,
+                         cudaStream_t stream, const Tensor* logit_token_ids,
+                         const Weight* pred_nvfp4, const Weight* succ_nvfp4, Tensor* selector_ids,
+                         Tensor* selector_q, unsigned long long seed_xor,
+                         std::int32_t position_offset, bool force_greedy) {
     require_logits(logits);
     const std::int32_t vocab  = logits.ne[0];
     const std::int32_t tokens = logits.ne[1];
@@ -227,15 +247,24 @@ void dflash2_path_select(const Tensor& logits, const Tensor& hidden,
         throw std::invalid_argument("dflash2_path_select: codebook row counts must match");
     }
     if (logit_token_ids != nullptr) { require_logit_token_ids(*logit_token_ids, vocab); }
-    if (temperatures == nullptr || seeds == nullptr) {
-        throw std::invalid_argument("dflash2_path_select: temperatures and seeds are required");
+    if (configs == nullptr) {
+        throw std::invalid_argument("dflash2_path_select: configs is required");
     }
     require_anchors(anchors, batch);
+    require_anchors(logical_positions, batch);
     require_path(path, tokens, batch);
     require_projection_weight(hidden_projection);
+    if ((selector_ids == nullptr) != (selector_q == nullptr)) {
+        throw std::invalid_argument(
+            "dflash2_path_select: selector_ids and selector_q must both be null or both set");
+    }
+    if (selector_ids != nullptr) { require_selector(*selector_ids, *selector_q, tokens, batch); }
     if (path.data == logits.data || path.data == hidden.data || path.data == pred_code.data ||
         path.data == succ_code.data || path.data == anchors.data ||
-        (logit_token_ids != nullptr && path.data == logit_token_ids->data)) {
+        path.data == logical_positions.data ||
+        (logit_token_ids != nullptr && path.data == logit_token_ids->data) ||
+        (selector_ids != nullptr &&
+         (path.data == selector_ids->data || path.data == selector_q->data))) {
         throw std::invalid_argument("dflash2_path_select: path must not alias inputs");
     }
 
@@ -259,7 +288,9 @@ void dflash2_path_select(const Tensor& logits, const Tensor& hidden,
     detail::dflash2_path_select_launch(topk.cand_val, topk.cand_idx, hidden_proj,
                                        pred_q == nullptr ? &pred_code : nullptr,
                                        succ_q == nullptr ? &succ_code : nullptr, pred_q, succ_q,
-                                       anchors, path, tokens, batch, temperatures, seeds, stream);
+                                       anchors, logical_positions, path, tokens, batch, configs,
+                                       stream, selector_ids, selector_q, seed_xor, position_offset,
+                                       force_greedy);
 }
 
 void dflash2_tree_select(const Tensor& logits, const Tensor& hidden,

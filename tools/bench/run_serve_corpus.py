@@ -1115,7 +1115,7 @@ def mode_display_name(mode_name: str) -> str:
     if mode_name == "dflash5":
         return "DFlash k=5 W=6 chain"
     if mode_name == "dflash7":
-        return "DFlash k=7 W=12 tree"
+        return "DFlash k=7 W=8 chain"
     if mode_name == "dflash11":
         return "DFlash k=11 W=12 chain"
     raise CampaignError(f"unsupported summary mode: {mode_name}")

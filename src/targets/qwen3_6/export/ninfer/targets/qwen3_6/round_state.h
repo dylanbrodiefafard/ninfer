@@ -138,6 +138,8 @@ struct DFlashDecodeStateLayout {
     TensorRegion append_positions;
     TensorRegion append_counts;
     TensorRegion draft_tokens;
+    TensorRegion selector_ids;
+    TensorRegion selector_q;
     TensorRegion verify_ids;
     TensorRegion parent_index;
     TensorRegion ancestor_mask;
@@ -268,6 +270,8 @@ struct DFlashDecodeState {
     Tensor append_positions;
     Tensor append_counts;
     Tensor draft_tokens;
+    Tensor selector_ids;
+    Tensor selector_q;
     Tensor verify_ids;
     Tensor parent_index;
     Tensor ancestor_mask;

@@ -4,6 +4,7 @@
 
 #include "ops/common/math.h"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
+#include "ninfer/ops/sampling.h"
 
 #include <cuda_bf16.h>
 #include <climits>
@@ -19,11 +20,6 @@ inline constexpr int kDflash2PathSelectGemmBlock = 256;
 inline constexpr int kDflash2PathSelectRngPurposeDevice = 16;
 inline constexpr int kDflash2PathSelectTopkSplits = 32;
 inline constexpr int kDflash2PathSelectMaxBatchDevice = 8;
-
-struct Dflash2PathSelectSampling {
-    float temperature[kDflash2PathSelectMaxBatchDevice];
-    unsigned long long seed[kDflash2PathSelectMaxBatchDevice];
-};
 
 struct Dflash2CodebookDevice {
     const __nv_bfloat16* bf16          = nullptr;
@@ -102,15 +98,12 @@ __device__ __forceinline__ unsigned long long dflash2_path_select_splitmix64(
     return x ^ (x >> 31);
 }
 
-__device__ __forceinline__ float dflash2_path_select_uniform(unsigned long long seed, int t, int b,
-                                                             int purpose) {
+__device__ __forceinline__ float dflash2_path_select_uniform(unsigned long long seed, int position,
+                                                              int purpose) {
     unsigned long long key = seed;
     key                    = dflash2_path_select_splitmix64(
-        key ^ (static_cast<unsigned long long>(static_cast<unsigned int>(t)) *
+        key ^ (static_cast<unsigned long long>(static_cast<unsigned int>(position)) *
                0xD1B54A32D192ED03ull));
-    key = dflash2_path_select_splitmix64(
-        key ^ (static_cast<unsigned long long>(static_cast<unsigned int>(b)) *
-               0xC2B2AE3D27D4EB4Full));
     key = dflash2_path_select_splitmix64(
         key ^ (static_cast<unsigned long long>(static_cast<unsigned int>(purpose)) << 21));
     const unsigned int bits = static_cast<unsigned int>(key >> 40);
@@ -307,13 +300,17 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__
     void dflash2_path_select_kernel(const float* cand_val, const int* cand_idx,
                                     const __nv_bfloat16* hidden_proj, Dflash2CodebookDevice pred_code,
                                     Dflash2CodebookDevice succ_code, const std::int32_t* anchors,
-                                    std::int32_t* path, std::int32_t tokens, std::int32_t batch,
-                                    Dflash2PathSelectSampling sampling) {
+                                     const std::int32_t* logical_positions, std::int32_t* path,
+                                     std::int32_t* selector_ids, float* selector_q,
+                                    std::int32_t tokens, std::int32_t batch,
+                                    const SamplingConfig* configs, unsigned long long seed_xor,
+                                     std::int32_t position_offset, bool force_greedy) {
     const int b   = static_cast<int>(blockIdx.x);
     const int tid = static_cast<int>(threadIdx.x);
     if (b >= batch) { return; }
-    const float temperature        = sampling.temperature[b];
-    const unsigned long long seed  = sampling.seed[b];
+    const SamplingConfig cfg       = configs[b];
+    const float temperature        = force_greedy ? 0.0f : cfg.temperature;
+    const unsigned long long seed  = cfg.seed ^ seed_xor;
 
     __shared__ float scores[kDflash2PathSelectK];
     __shared__ float sm_val[kDflash2PathSelectK];
@@ -364,8 +361,10 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__
                     scores[c] = expf((scores[c] - m) * inv_temp);
                     sum += scores[c];
                 }
-                const float u    = dflash2_path_select_uniform(
-                    seed, static_cast<int>(t), b, kDflash2PathSelectRngPurposeDevice);
+                const int position =
+                    logical_positions[b] + position_offset + static_cast<int>(t) + 1;
+                const float u = dflash2_path_select_uniform(
+                    seed, position, kDflash2PathSelectRngPurposeDevice);
                 const float goal = u * sum;
                 float run        = 0.0f;
                 pick             = kDflash2PathSelectK - 1;
@@ -392,6 +391,25 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__
 
             const int chosen = sm_idx[pick];
             path[static_cast<std::int64_t>(t) + static_cast<std::int64_t>(b) * tokens] = chosen;
+            if (selector_ids != nullptr) {
+                const std::int64_t sel_base =
+                    (static_cast<std::int64_t>(t) + static_cast<std::int64_t>(b) * tokens) *
+                    kDflash2PathSelectK;
+                float qsum = 0.0f;
+                if (temperature > 0.0f) {
+                    for (int c = 0; c < kDflash2PathSelectK; ++c) { qsum += scores[c]; }
+                }
+                for (int c = 0; c < kDflash2PathSelectK; ++c) {
+                    selector_ids[sel_base + c] = sm_idx[c];
+                    if (selector_q != nullptr) {
+                        if (temperature > 0.0f) {
+                            selector_q[sel_base + c] = qsum > 0.0f ? scores[c] / qsum : 0.0f;
+                        } else {
+                            selector_q[sel_base + c] = c == pick ? 1.0f : 0.0f;
+                        }
+                    }
+                }
+            }
             prev_id = chosen;
         }
         __syncthreads();

@@ -123,14 +123,20 @@ GdnReplayRecords::GdnReplayRecords(DeviceSpan backing, const GdnReplayRecordLayo
 }
 
 GdnReplayRecordLayer GdnReplayRecords::layer(std::int32_t layer_index, std::int32_t rows) const {
+    return layer(layer_index, 0, rows);
+}
+
+GdnReplayRecordLayer GdnReplayRecords::layer(std::int32_t layer_index, std::int32_t row_begin,
+                                             std::int32_t rows) const {
     validate_spec(spec);
     if (layer_index < 0 || layer_index >= spec.layers) {
         throw std::out_of_range("GDN replay layer index out of range");
     }
-    if (rows <= 0 || rows > spec.record_capacity) {
-        throw std::out_of_range("GDN replay active row count out of range");
+    if (row_begin < 0 || rows <= 0 ||
+        static_cast<std::int64_t>(row_begin) + rows > spec.record_capacity) {
+        throw std::out_of_range("GDN replay active row window is out of range");
     }
-    const std::int32_t outer_begin = layer_index * spec.record_capacity;
+    const std::int32_t outer_begin = layer_index * spec.record_capacity + row_begin;
     return GdnReplayRecordLayer{
         .conv  = conv.slice(2, outer_begin, rows).view({spec.conv_channels, spec.width, rows}),
         .key   = key.slice(3, outer_begin, rows),
