@@ -47,6 +47,8 @@ PRESETS = {
 }
 
 # Idea classes an agent must name. Verdict depends on the bound.
+# Catalog `dram`/`tc` are the typical gate; classify_idea() is the authority
+# (force_mma_small_t depends on T; flashattention_tiling depends on phase).
 IDEAS = (
     "occupancy",
     "more_smem",
@@ -66,6 +68,186 @@ IDEAS = (
     "2sm_mma",
     "cluster_multicast",
 )
+ILLEGAL_IDEAS = frozenset({"tcgen05", "tmem", "sm100", "2sm_mma", "cluster_multicast"})
+IDEA_CATALOG = {
+    "occupancy": {
+        "lever": "more CTAs/warps to hide latency",
+        "dram": "refuse",
+        "tc": "measure",
+        "note": "Does not cut Linear weight bytes.",
+    },
+    "more_smem": {
+        "lever": "larger shared-memory tiles or staging",
+        "dram": "refuse",
+        "tc": "measure",
+        "note": "Occupancy cost. Stay under sm_120 99 KiB.",
+    },
+    "software_pipeline": {
+        "lever": "overlap TMA/loads with MMA",
+        "dram": "refuse",
+        "tc": "allow",
+        "note": "Compute-side stages inside the current family.",
+    },
+    "tma": {
+        "lever": "async single-CTA TMA copies",
+        "dram": "measure",
+        "tc": "allow",
+        "note": "DRAM: only if NCU shows load inefficiency well below 1674.5 GB/s. cluster>1 illegal.",
+    },
+    "tile_shape": {
+        "lever": "tile M/N/K, warps, K-stages",
+        "dram": "refuse",
+        "tc": "allow",
+        "note": "Parameters inside the existing family, not a new algorithm.",
+    },
+    "epilogue_fusion": {
+        "lever": "fuse epilogue to cut extra DRAM traffic",
+        "dram": "measure",
+        "tc": "allow",
+        "note": "DRAM: only if it reduces model-byte traffic.",
+    },
+    "split_k": {
+        "lever": "split K with a partial reduction",
+        "dram": "measure",
+        "tc": "measure",
+        "note": "Refuse if it re-reads weights.",
+    },
+    "weight_replay": {
+        "lever": "one weight pass; cut extra bytes / more useful work",
+        "dram": "allow",
+        "tc": "allow",
+        "note": "Always attacks the model-byte floor. Typical decode win.",
+    },
+    "aggregate_T": {
+        "lever": "raise T per weight pass (B, MTP/DFlash width)",
+        "dram": "allow",
+        "tc": "allow",
+        "note": "Schedule, not a new MMA family. Typical decode/concurrent win.",
+    },
+    "force_mma_small_t": {
+        "lever": "force tensor-core MMA at small T",
+        "dram": "refuse",
+        "tc": "measure",
+        "note": "T<=16 is DRAM+issue. Do not force W4A4 off the SIMT/A16 crossover.",
+    },
+    "flashattention_tiling": {
+        "lever": "FlashAttention-style online-softmax pipeline",
+        "dram": "refuse",
+        "tc": "allow",
+        "note": "Not a Linear idea. Legal for compute-bound GQA prefill only.",
+    },
+    "new_family": {
+        "lever": "new kernel family / algorithm",
+        "dram": "refuse",
+        "tc": "measure",
+        "note": "Prefer parameters in the current family. TC: only after current-kernel gap is known.",
+    },
+    "tcgen05": {
+        "lever": "SM100 tcgen05 MMA",
+        "dram": "refuse",
+        "tc": "refuse",
+        "note": "Illegal on sm_120a. Warp mma.sync only.",
+        "illegal": True,
+    },
+    "tmem": {
+        "lever": "tensor memory (TMEM)",
+        "dram": "refuse",
+        "tc": "refuse",
+        "note": "Illegal on sm_120a. Accumulators stay in registers.",
+        "illegal": True,
+    },
+    "sm100": {
+        "lever": "B200/SM100 pipeline (128x128 TMEM tiles)",
+        "dram": "refuse",
+        "tc": "refuse",
+        "note": "RTX 5090 is sm_120a, not B200.",
+        "illegal": True,
+    },
+    "2sm_mma": {
+        "lever": "2-SM MMA",
+        "dram": "refuse",
+        "tc": "refuse",
+        "note": "Illegal on sm_120a.",
+        "illegal": True,
+    },
+    "cluster_multicast": {
+        "lever": "cluster-multicast TMA",
+        "dram": "refuse",
+        "tc": "refuse",
+        "note": "Illegal on sm_120a. Single-CTA TMA only (cluster=1).",
+        "illegal": True,
+    },
+}
+
+
+def format_idea_catalog() -> str:
+    """One line per idea. First token is the name (machine-parseable)."""
+    lines = []
+    for name in IDEAS:
+        meta = IDEA_CATALOG[name]
+        if meta.get("illegal"):
+            gate = f"{'ILLEGAL':<23}"
+        else:
+            gate = f"DRAM={meta['dram']:<7} TC={meta['tc']:<7}"
+        lines.append(f"{name:<22} {gate}  {meta['lever']}. {meta['note']}")
+    return "\n".join(lines)
+
+
+def add_problem_arguments(parser: argparse.ArgumentParser) -> None:
+    """Linear point flags shared by `bound` and `recipe`."""
+    parser.add_argument("--preset", choices=sorted(PRESETS), help="27B NVFP4 Linear problem")
+    parser.add_argument("--n", type=int)
+    parser.add_argument("--k", type=int)
+    parser.add_argument("--t", type=int)
+    parser.add_argument("--qtype", default=None, help="q4|q5|q6|w8|nvfp4|bf16")
+    parser.add_argument("--policy", default="a16", choices=["a16", "a4"])
+    parser.add_argument("--phase", choices=["prefill", "decode", "mixed"])
+    parser.add_argument("--idea", help="idea class to gate; see --list-ideas")
+    parser.add_argument("--measured-us", type=float, help="current public-Op median µs")
+    parser.add_argument("--mma-json", help="profiles/kdev/mma_issue.json from `kdev mma`")
+    parser.add_argument("--mma-per-s", type=float, help="override NVFP4 MMA/s from the issue probe")
+    parser.add_argument("--needs-tmem", action="store_true")
+    parser.add_argument("--needs-tcgen05", action="store_true")
+    parser.add_argument("--cluster", type=int, default=1)
+    parser.add_argument("--smem-bytes", type=int)
+
+
+def problem_is_complete(args) -> bool:
+    if getattr(args, "preset", None):
+        return getattr(args, "t", None) is not None
+    return (
+        getattr(args, "n", None) is not None
+        and getattr(args, "k", None) is not None
+        and getattr(args, "t", None) is not None
+    )
+
+
+def analyze_from_args(args) -> dict:
+    """Build the Layer-0 card from shared argparse flags. Raises ValueError."""
+    if args.preset:
+        spec = PRESETS[args.preset]
+        n, k = spec["n"], spec["k"]
+        qtype = args.qtype or spec["qtype"]
+        label = spec["label"]
+    else:
+        if args.n is None or args.k is None:
+            raise ValueError("provide --preset or both --n and --k")
+        n, k = args.n, args.k
+        qtype = args.qtype or "nvfp4"
+        label = ""
+    if args.t is None:
+        raise ValueError("--t is required")
+    mma_rate = args.mma_per_s if args.mma_per_s is not None else _load_mma_rate(args.mma_json)
+    card = analyze(
+        n, k, args.t, qtype,
+        policy=args.policy, phase=args.phase, idea=args.idea,
+        measured_us=args.measured_us, mma_per_s=mma_rate,
+        needs_tmem=args.needs_tmem, needs_tcgen05=args.needs_tcgen05,
+        cluster=args.cluster, smem_bytes=args.smem_bytes, label=label,
+    )
+    if args.preset:
+        card["preset"] = args.preset
+    return card
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -139,7 +321,7 @@ def classify_sm120(*, needs_tmem: bool, needs_tcgen05: bool, cluster: int,
 
 def classify_idea(idea: str, bound: str, t: int, phase: str) -> dict:
     idea = idea.strip()
-    if idea in {"tcgen05", "tmem", "sm100", "2sm_mma", "cluster_multicast"}:
+    if idea in ILLEGAL_IDEAS:
         return {
             "name": idea,
             "verdict": "refuse",
@@ -194,7 +376,13 @@ def classify_idea(idea: str, bound: str, t: int, phase: str) -> dict:
                 "verdict": "measure",
                 "reason": "Only if NCU shows DRAM well below the 1674.5 GB/s probe because of load inefficiency.",
             }
-        if idea in {"epilogue_fusion", "split_k"}:
+        if idea == "epilogue_fusion":
+            return {
+                "name": idea,
+                "verdict": "measure",
+                "reason": "Only if it reduces model-byte traffic (fused store, not extra workspace bytes).",
+            }
+        if idea == "split_k":
             return {
                 "name": idea,
                 "verdict": "measure",
@@ -239,6 +427,8 @@ def analyze(
         raise ValueError(f"unknown qtype '{qtype}'; expected {', '.join(QTYPES)}")
     if n <= 0 or k <= 0 or t <= 0:
         raise ValueError("n, k, t must be positive")
+    if idea is not None and idea.strip() not in IDEAS:
+        raise ValueError(f"unknown idea '{idea}'; expected one of: {', '.join(IDEAS)}")
     w_bytes = weight_bytes(n, k, qtype)
     a_bytes = activation_bytes(n, k, t)
     bytes_ = w_bytes + a_bytes
@@ -388,6 +578,14 @@ def _self_test() -> int:
     check("agg-allow", agg["verdict"] == "allow", agg)
     illegal = analyze(14336, 5120, 1024, "nvfp4", idea="tile_shape", needs_tcgen05=True)
     check("tmem-gate", illegal["idea"]["verdict"] == "refuse", illegal["idea"])
+    check("catalog-keys", tuple(IDEA_CATALOG) == IDEAS, str(tuple(IDEA_CATALOG)))
+    catalog_names = tuple(line.split()[0] for line in format_idea_catalog().splitlines())
+    check("catalog-lines", catalog_names == IDEAS, str(catalog_names))
+    try:
+        analyze(14336, 5120, 1, "nvfp4", idea="not_an_idea")
+        check("unknown-idea", False, "expected ValueError")
+    except ValueError:
+        check("unknown-idea", True)
     if failures:
         print("self-test FAIL")
         for item in failures:
@@ -402,21 +600,7 @@ def main(argv=None) -> int:
         prog="kdev bound",
         description="Layer-0 Linear bound classifier. Host-only. Refuses illegal idea classes.",
     )
-    parser.add_argument("--preset", choices=sorted(PRESETS), help="27B NVFP4 Linear problem")
-    parser.add_argument("--n", type=int)
-    parser.add_argument("--k", type=int)
-    parser.add_argument("--t", type=int)
-    parser.add_argument("--qtype", default=None, help="q4|q5|q6|w8|nvfp4|bf16")
-    parser.add_argument("--policy", default="a16", choices=["a16", "a4"])
-    parser.add_argument("--phase", choices=["prefill", "decode", "mixed"])
-    parser.add_argument("--idea", help="idea class to gate; see --list-ideas")
-    parser.add_argument("--measured-us", type=float, help="current public-Op median µs")
-    parser.add_argument("--mma-json", help="profiles/kdev/mma_issue.json from `kdev mma`")
-    parser.add_argument("--mma-per-s", type=float, help="override NVFP4 MMA/s from the issue probe")
-    parser.add_argument("--needs-tmem", action="store_true")
-    parser.add_argument("--needs-tcgen05", action="store_true")
-    parser.add_argument("--cluster", type=int, default=1)
-    parser.add_argument("--smem-bytes", type=int)
+    add_problem_arguments(parser)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--list-ideas", action="store_true")
     parser.add_argument("--list-presets", action="store_true")
@@ -426,39 +610,17 @@ def main(argv=None) -> int:
     if args.self_test:
         return _self_test()
     if args.list_ideas:
-        print("\n".join(IDEAS))
+        print(format_idea_catalog())
         return 0
     if args.list_presets:
         for name, spec in PRESETS.items():
             print(f"{name:10} n={spec['n']:<6} k={spec['k']:<6} {spec['qtype']}  {spec['label']}")
         return 0
 
-    if args.preset:
-        spec = PRESETS[args.preset]
-        n, k = spec["n"], spec["k"]
-        qtype = args.qtype or spec["qtype"]
-        label = spec["label"]
-    else:
-        if args.n is None or args.k is None:
-            parser.error("provide --preset or both --n and --k")
-        n, k = args.n, args.k
-        qtype = args.qtype or "nvfp4"
-        label = ""
-    if args.t is None:
-        parser.error("--t is required")
-
-    mma_rate = args.mma_per_s if args.mma_per_s is not None else _load_mma_rate(args.mma_json)
     try:
-        card = analyze(
-            n, k, args.t, qtype,
-            policy=args.policy, phase=args.phase, idea=args.idea,
-            measured_us=args.measured_us, mma_per_s=mma_rate,
-            needs_tmem=args.needs_tmem, needs_tcgen05=args.needs_tcgen05,
-            cluster=args.cluster, smem_bytes=args.smem_bytes, label=label,
-        )
+        card = analyze_from_args(args)
     except ValueError as exc:
-        print(str(exc), file=sys.stderr)
-        return 2
+        parser.error(str(exc))
 
     if args.json:
         print(json.dumps(card, indent=2))

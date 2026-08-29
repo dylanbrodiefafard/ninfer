@@ -1,0 +1,18 @@
+---
+description: Kernel speed work must follow Layer 0–3 (bound classifier before CUDA).
+globs: src/ops/**/*.{cu,cuh,cpp,h},tools/kdev/**,tools/mma_issue_probe.cu
+alwaysApply: false
+---
+
+# Kernel iteration
+
+Before writing or changing a CUDA kernel for performance:
+
+1. Read `docs/maintainer/kernel-iteration.md`. For NVFP4 decode-band Linear (serving T,
+   MTP/DFlash packed verify) also read `docs/maintainer/nvfp4-decode-linear.md`.
+2. Run `python3 -m tools.kdev recipe --preset … --t … --idea …` (or `--n --k --t`) and
+   read `STOP` / `MEASURE` / `GO`. Linear uses `ninfer_linear_bench`, not `kdev <op>`.
+3. Stop if the last line is `STOP` or `sm120` is illegal (no TMEM / tcgen05 / 2-SM MMA).
+4. Search parameters inside the current family. Measure the public Op. Delete losers.
+
+Do not invent a new MMA ISA, import B200/SM100 pipelines onto sm_120a, or Engine-A/B a kernel that has not won its Op point.

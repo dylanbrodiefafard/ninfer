@@ -1,9 +1,12 @@
 """CLI entry point.
 
 Layer 0–3:
+    python3 -m tools.kdev recipe [--preset ... --t T --idea ...]
     python3 -m tools.kdev bound ...
-    python3 -m tools.kdev recipe
     python3 -m tools.kdev mma
+
+Linear public Op (not a kdev <op>):
+    ./build/bench/ninfer_linear_bench --qtype ... --n N --k K --t T
 
 Op loop:
     python3 -m tools.kdev <op> [--fast|--full] [--bench] [--profile] [--san] [--json]
@@ -19,14 +22,14 @@ _USAGE = """\
 usage: python3 -m tools.kdev <command>
 
 Kernel iteration (docs/maintainer/kernel-iteration.md):
+  recipe    gate card: procedure, or fill a Linear point (--preset/--n --k --t --idea)
   bound     Layer-0 Linear bound classifier (host, no GPU)
-  recipe    print the gate card an agent must fill before writing CUDA
   mma       Layer-1 MMA issue-rate probe (writes profiles/kdev/mma_issue.json)
   diff      first-divergence localization: python3 -m tools.kdev.diff <op>
 
-Op loop:
+Linear (not a kdev <op>): ./build/bench/ninfer_linear_bench --qtype … --n N --k K --t T
+Op loop (registered: {ops}):
   python3 -m tools.kdev <op> [--fast|--full] [--bench] [--profile] [--san] [--json]
-  registered ops: {ops}
 """
 
 

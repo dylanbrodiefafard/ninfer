@@ -42,6 +42,7 @@ Runtime and Op references:
 - [Paged KV context storage, ownership, and capacity model](maintainer/paged-kv-cache.md)
 - [Op admission, contracts, ownership, qualification, and performance rules](maintainer/op-development.md)
 - [Kernel iteration layers 0–3](maintainer/kernel-iteration.md)
+- [NVFP4 decode-band Linear mapping (RTX 5090)](maintainer/nvfp4-decode-linear.md)
 - [Performance enhancements that did not move tok/s](maintainer/performance_enhancements.md)
 - [DFlash2 packed-tree verify speed](maintainer/dflash2-tree-speed.md)
 - [ReplaySSM GDN technical reference](maintainer/replayssm-gdn.md)
