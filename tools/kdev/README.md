@@ -1,17 +1,27 @@
 # tools/kdev — kernel iteration control plane
 
 Layer 0–3 procedure: [`docs/maintainer/kernel-iteration.md`](../../docs/maintainer/kernel-iteration.md).
-Print the gate card:
+Decode-band NVFP4 Linear mapping: [`docs/maintainer/nvfp4-decode-linear.md`](../../docs/maintainer/nvfp4-decode-linear.md).
+Fill the gate card (blank procedure, or a Linear point that fills numbers + next commands):
 
 ```
 python3 -m tools.kdev recipe
+python3 -m tools.kdev recipe --preset attn_in --t 1 --idea occupancy
+python3 -m tools.kdev recipe --n 14336 --k 5120 --t 1024 --qtype nvfp4 --policy a4 \
+    --measured-us 152.6 --idea tile_shape
 ```
 
+Exit 2 is `STOP` (refused idea or illegal SM120). Do not write CUDA.
+
 ## Layer 0 — bound (host)
+
+The bound classifier is Linear GEMM only (`ninfer::ops::linear`). `recipe` with a point
+runs it and prints the eight-item card; `bound` is the compact one-screen form.
 
 ```
 python3 -m tools.kdev bound --preset attn_in --t 1 --idea occupancy
 python3 -m tools.kdev bound --n 14336 --k 5120 --t 1024 --qtype nvfp4 --json
+python3 -m tools.kdev bound --list-ideas
 python3 -m tools.kdev bound --self-test
 ```
 
@@ -23,9 +33,19 @@ Exit 2 means refuse. Do not write CUDA.
 python3 -m tools.kdev mma
 ```
 
-Writes `profiles/kdev/mma_issue.json`. Bound reads it for `t_issue`.
+Writes `profiles/kdev/mma_issue.json`. Bound and recipe read it for `t_issue`.
 
-## Layers 2–3 — Op loop
+## Layers 2–3 — public Op at the exact point
+
+Linear is not a kdev `<op>`. Measure it through the public bench (`recipe` prints the
+filled command):
+
+```
+./build/bench/ninfer_linear_bench --qtype nvfp4 --policy a16 --n 14336 --k 5120 --t 1
+./build/bench/ninfer_linear_bench --qtype nvfp4 --policy a4  --n 14336 --k 5120 --t 1024
+```
+
+Registered kdev ops:
 
 ```
 python3 -m tools.kdev <op> [--fast|--full] [--bench] [--profile] [--san] [--json]

@@ -269,10 +269,11 @@ Pass `--kv-dtype bf16` when uncompressed KV is the contract. Qwen3.8-27B DFlash2
 keeps BF16 selector codebooks with NVFP4 draft matrices; NVFP4 codebooks are not the speed path.
 
 Kernel speed work follows [`docs/maintainer/kernel-iteration.md`](docs/maintainer/kernel-iteration.md).
-Before writing or changing a CUDA kernel for performance, run `python3 -m tools.kdev recipe` and
-`python3 -m tools.kdev bound` at the exact `(N,K,T,qtype)` and named idea class. Do not implement
-an idea the classifier refuses. Calibrate `t_issue` with `python3 -m tools.kdev mma` when the
-bound needs an MMA issue roof.
+Before writing or changing a CUDA kernel for performance, run `python3 -m tools.kdev recipe` at
+the exact `(N,K,T,qtype,policy)` with a named idea class (or `--preset` plus `--t`). Stop on
+`STOP`. Do not implement an idea the classifier refuses. Linear is measured with
+`ninfer_linear_bench`, not `kdev <op>`. Calibrate `t_issue` with `python3 -m tools.kdev mma`
+when the bound needs an MMA issue roof.
 
 Define a performance claim at the level where it matters: operator, schedule, request phase, or
 end-to-end inference. Measure that level directly when practical. An isolated microbenchmark can
