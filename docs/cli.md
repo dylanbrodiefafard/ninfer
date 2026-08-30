@@ -6,7 +6,7 @@ download an artifact using the [project README](../README.md) before following t
 ## Text input
 
 ```bash
-./build/apps/ninfer models/qwen3_6_27b.ninfer \
+./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
   --prompt "Summarize the difference between prefill and decode." \
   --max-context 16384 \
   --max-new 256
@@ -19,7 +19,7 @@ canonical `weights_id`), timings, throughput, GPU memory, and speculative-decodi
 written to stderr, so stdout can be redirected independently:
 
 ```bash
-./build/apps/ninfer models/qwen3_6_27b.ninfer \
+./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
   --prompt "Return one sentence." --max-new 64 \
   > answer.txt 2> run.log
 ```
@@ -76,7 +76,7 @@ and an optional `tools` array.
 Run message files from the repository root when they contain repository-relative media paths:
 
 ```bash
-./build/apps/ninfer models/qwen3_6_27b.ninfer \
+./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
   --messages examples/cli/messages/image_chart.json \
   --max-context 8192 \
   --max-new 128 \
@@ -109,7 +109,7 @@ text-only DFlash v1 with one to fifteen, or Qwen3.8-27B NVFP4 text-only DFlash2 
 `--lm-head-draft` selects the optimized proposal head and requires a selected backend:
 
 ```bash
-./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
+./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
   --prompt "Write a short explanation of speculative decoding." \
   --max-context 16384 \
   --max-new 512 \

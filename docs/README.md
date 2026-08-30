@@ -53,7 +53,7 @@ Artifact and model references:
 - [NInfer artifact container](maintainer/artifact-container.md)
 - [Persistent tensor numeric formats](maintainer/tensor-formats.md)
 - [Persistent storage layouts](maintainer/storage-layouts.md)
-- [Qwen3.6-27B model semantics](maintainer/qwen3.6-27b-model.md)
+- [Qwen3.6-27B model semantics and family/Variant structure](maintainer/qwen3.6-27b-model.md)
 - [Qwen3.6-27B artifact contracts, including NVFP4](maintainer/qwen3.6-27b-artifact.md)
 - [Qwen3.8-27B artifact contract](maintainer/qwen3.8-27b-artifact.md)
 - [Qwen3.6-35B-A3B model semantics](maintainer/qwen3.6-35b-a3b-model.md)

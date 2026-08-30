@@ -916,6 +916,9 @@ pairs. The tensor inventory contains no deep-stack merger and no audio tower.
 
 ## 18. Evidence and implementation map
 
+The shared family/Variant package structure of the 27B and 35B-A3B targets is documented in
+[qwen3.6-27b-model.md](qwen3.6-27b-model.md) §16.
+
 This reference was cross-checked on 2026-07-23 against the following independent sources:
 
 | Concern | Source |

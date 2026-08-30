@@ -551,3 +551,21 @@ precision, and does not define cross-runtime generated-token equality. Each Op i
 its own naive FP32/FP64 or exact oracle. The C++ target
 implements the complete Text/Vision/MTP product over `.ninfer` through the closed Engine
 architecture.
+
+## 16. Family runtime and Variant structure
+
+The 27B (`src/targets/qwen3_6_27b`) and 35B-A3B (`src/targets/qwen3_6_35b_a3b`) execution packages
+are peer compile-time Variants of one identity-free Qwen3.6 family runtime
+(`src/targets/qwen3_6`).
+
+The family owns the shared `SequencePlan<Variant>`, `RequestPlan<Variant>`, and `Program<Variant>`
+algorithms; frontend and output semantics; Text/Vision/speculative schedules; state transactions;
+workspace composition; and CUDA Graph capture/replay mechanics. Each package separately owns its
+registered artifact identities and bindings, immutable model view, dimensions/storage facts, three
+closed execution-leaf families (attention projection, GDN projection/control, post-mixer), graph
+frontier data, and Program instance bytes.
+
+Invariants: no mutable state or device allocation is shared between Programs; neither package is
+defined as a delta from the other; and there is no runtime family selection or target-dependent
+branch inside family scheduling. All artifacts embed the same six frontend resources, and a
+prepared prompt carries no exact-target tag.
