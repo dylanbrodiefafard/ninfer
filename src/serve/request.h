@@ -11,6 +11,7 @@
 // by Engine; media sources remain unresolved until the product service acquires
 // owning bytes.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -53,6 +54,18 @@ struct CompletionUsage {
     int completion_tokens = 0;
 };
 
+// Prefill emits the first generated token (counted in prefill.ms / TTFT). Decode
+// rates use the remaining completion tokens so tok_s = tokens / (ms/1000).
+[[nodiscard]] inline int decode_eval_tokens(int completion_tokens) {
+    return std::max(0, completion_tokens - 1);
+}
+
+// Prompt tokens actually computed this request (excludes the reused prefix).
+[[nodiscard]] inline int prefill_eval_tokens(int prompt_tokens, int reused) {
+    const int reused_n = std::max(0, std::min(reused, std::max(prompt_tokens, 0)));
+    return std::max(0, prompt_tokens - reused_n);
+}
+
 // llama.cpp-compatible timing block for Open WebUI / LiteLLM info bubbles.
 struct CompletionTimings {
     int prompt_n                = 0;
@@ -65,6 +78,11 @@ struct CompletionTimings {
     // Prefill throughput over the trailing window (<= 1s) of prefill: the steady-state rate.
     double prefill_tail_tok_s      = 0.0;
     double prefill_tail_window_s   = 0.0;
+    // HTTP prepare + engine time to first token (queue wait, vision, prefill).
+    // Same definition as [req] done ttft; not equal to prefill.ms.
+    double ttft_ms              = 0.0;
+    // Decode eval token count (completion_tokens - 1). Prefill samples the first
+    // generated token; rates use this so tok_s = predicted_n / (predicted_ms/1000).
     int predicted_n             = 0;
     double predicted_ms         = 0.0;
     double predicted_per_token_ms = 0.0;

@@ -63,6 +63,7 @@ CompletionTimings completion_timings_from_outcome(const GenerationOutcome& outco
         outcome.metrics.captured_context_checkpoint_tokens;
     timings.restored_context_checkpoint_tokens =
         outcome.metrics.restored_context_checkpoint_tokens;
+    timings.ttft_ms               = outcome.metrics.ttft_seconds * 1000.0;
     timings.reasoning_tokens      = outcome.reasoning_tokens;
     timings.kv_ram_capacity_bytes = outcome.metrics.kv_ram_capacity_bytes;
     timings.kv_ram_used_bytes     = outcome.metrics.kv_ram_used_bytes;

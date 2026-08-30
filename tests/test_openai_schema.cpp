@@ -604,6 +604,7 @@ int test_response_serialization() {
     timings.kv_ram_load_ms        = 14.0;
     timings.prefix_reuse_source   = ninfer::PrefixReuseSource::HostRam;
     timings.prompt_per_second     = 12.34567;
+    timings.ttft_ms               = 358.024679;
     const Json jt = Json::parse(
         make_chat_completion_response("id-1", "m", 111, "hello world", "", "stop", usage, &timings));
     const Json& usage_t   = jt.at("usage");
@@ -616,13 +617,18 @@ int test_response_serialization() {
     failures += check(!usage_t.contains("reuse_source"), "usage duplicates reuse_source at top level");
     failures += check(!jt.contains("timings"), "top-level timings still present");
     failures += check(ptd.at("cached_tokens") == 0, "ptd cached_tokens zero on cache miss");
+    failures += check(ninfer_ptd.at("ttft_ms") == 358.025, "ttft_ms rounded to three decimals");
     failures += check(ninfer_ptd.at("reuse_source") == "host_ram", "reuse_source host_ram");
     failures += check(ninfer_ptd.at("prefix_reuse_path") == "full_reset",
                       "prefix_reuse_path defaults to full_reset");
     failures += check(ninfer_ptd.at("prefill").at("ms") == 250.0, "prefill ms");
+    failures += check(ninfer_ptd.at("prefill").at("tokens") == 10,
+                      "prefill tokens is the computed suffix");
     failures += check(ninfer_ptd.at("prefill").at("tok_s") == 12.346,
                       "prefill rates are not rounded to three decimals");
     failures += check(ninfer_ptd.at("decode").at("ms") == 1000.0, "decode ms");
+    failures += check(ninfer_ptd.at("decode").at("tokens") == 2,
+                      "decode tokens exclude the prefill-sampled first token");
     // First completion token is attributed to prefill, so 3 completions = 2 decode tokens
     // over 1.0s.
     failures += check(ninfer_ptd.at("decode").at("tok_s") == 2.0, "decode tok_s");
@@ -741,14 +747,31 @@ int test_response_serialization() {
     failures +=
         check(reused_timings.prompt_per_second == 16.0, "prompt_per_second uses computed tokens");
     failures += check(reused_timings.prompt_per_token_ms == 62.5, "prompt_per_token_ms");
+    failures += check(reused_timings.predicted_n == 2, "predicted_n is decode eval tokens");
     const Json jre = Json::parse(make_chat_completion_response(
         "id-1", "m", 111, "hello world", "", "stop", usage, &reused_timings));
     failures += check(jre.at("usage").at("prompt_tokens_details").at("cached_tokens") == 6,
                       "cached_tokens serialized");
     failures += check(jre.at("usage").at("prompt_tokens_details").at("ninfer")
                          .at("prefill")
+                         .at("tokens") == 4,
+                      "serialized prefill tokens reflects computed suffix");
+    failures += check(jre.at("usage").at("prompt_tokens_details").at("ninfer")
+                         .at("prefill")
                          .at("tok_s") == 16.0,
                       "serialized prefill tok_s reflects computed suffix");
+
+    failures += check(decode_eval_tokens(0) == 0 && decode_eval_tokens(1) == 0 &&
+                          decode_eval_tokens(2) == 1,
+                      "decode_eval_tokens is max(0, n-1)");
+    failures += check(prefill_eval_tokens(10, 6) == 4 && prefill_eval_tokens(4, 6) == 0,
+                      "prefill_eval_tokens clamps reused to the prompt");
+    CompletionTimings one_token = make_completion_timings(10, 1, 0.25, 1.0);
+    failures += check(one_token.predicted_n == 0 && one_token.predicted_per_second == 0.0,
+                      "one completion token is entirely prefill; decode tok_s is 0");
+    CompletionTimings two_tokens = make_completion_timings(10, 2, 0.25, 0.5);
+    failures += check(two_tokens.predicted_n == 1 && two_tokens.predicted_per_second == 2.0,
+                      "two completions: one decode token over 0.5s");
 
     // Speculation + reasoning populate the OpenAI-standard completion details.
     CompletionTimings spec_timings = make_completion_timings(10, 3, 0.25, 1.0, 8, 5);

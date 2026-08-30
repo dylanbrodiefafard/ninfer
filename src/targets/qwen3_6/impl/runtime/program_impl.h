@@ -35,6 +35,14 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+// Wall time of in-flight compute after host ingress is already filled. Graph
+// select, host packing, and KV materialize stay outside decode.ms so tok_s
+// matches the GPU round the engine log times, not the CPU setup around it.
+double synchronize_round_seconds(DeviceContext& device, Clock::time_point started) {
+    device.synchronize();
+    return std::chrono::duration<double>(Clock::now() - started).count();
+}
+
 std::int32_t checked_i32(std::uint32_t value, const char* label) {
     if (value > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error(label);
@@ -2703,6 +2711,20 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         sequence.tail_hidden_valid      = true;
         request.timings.vision_seconds  = vision_seconds;
         request.timings.prefill_seconds = std::max(0.0, staged.elapsed_seconds - vision_seconds);
+        // Drain vision encode from the earliest step windows so tail_tok_s matches
+        // overall prefill.tok_s on the common image-first path. Media later in the
+        // prompt still biases the tail on short requests; prefill.ms / tok_s stay
+        // exact (elapsed - vision). Without this, a short image request reports a
+        // diluted "steady-state" prefill rate.
+        if (vision_seconds > 0.0) {
+            double remaining = vision_seconds;
+            for (double& seconds : staged.step_seconds) {
+                const double take = std::min(seconds, remaining);
+                seconds -= take;
+                remaining -= take;
+                if (remaining <= 0.0) { break; }
+            }
+        }
         prefill_tail_rate(staged.step_tokens, staged.step_seconds,
                           request.timings.prefill_tail_tok_s,
                           request.timings.prefill_tail_window_s);
@@ -2788,7 +2810,6 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
     }
 
-    const auto start = Clock::now();
     try {
         DecodeGraphExecutable* executable = nullptr;
         ops::GqaExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
@@ -2826,11 +2847,10 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             tail_hidden_store};
 
         mark_workspace_usage(workspace_plan.ordinary_round);
+        const auto start = Clock::now();
         schedule::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                         envelope, executable);
-        device.synchronize();
-
-        const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
+        const double seconds = synchronize_round_seconds(device, start);
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence    = sequences[lanes[row]];
             RequestControl& request    = requests[lanes[row]];
@@ -2900,7 +2920,6 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
     }
 
-    const auto started = Clock::now();
     try {
         DecodeGraphExecutable* executable = nullptr;
         schedule::MtpGqaEnvelopes envelopes =
@@ -2959,11 +2978,10 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                  tail_hidden_store};
 
         mark_workspace_usage(workspace_plan.mtp_round);
+        const auto started = Clock::now();
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                    draft_window, envelopes, executable);
-        device.synchronize();
-
-        const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
+        const double seconds = synchronize_round_seconds(device, started);
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence       = sequences[lanes[row]];
             RequestControl& request       = requests[lanes[row]];
@@ -3072,7 +3090,6 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                      sequence.execution_frontier + dflash_verify_width);
     }
 
-    const auto started = Clock::now();
     try {
         DecodeGraphExecutable* executable   = nullptr;
         schedule::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier, draft_window);
@@ -3131,10 +3148,11 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                     tail_hidden_store};
 
         mark_workspace_usage(workspace_plan.dflash_round);
+        const auto started = Clock::now();
         schedule::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                       draft_window, dflash_verify_width, envelopes, target_envelope,
                                       executable);
-        device.synchronize();
+        const double seconds = synchronize_round_seconds(device, started);
         if (ninfer::targets::qwen3_6::detail::dflash_candidate_stats_enabled() &&
             io.dflash_decode.has_value()) {
             qwen3_6::DFlashDecodeState& frame = *io.dflash_decode;
@@ -3157,8 +3175,6 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                     count, w, static_cast<int>(draft_window));
             }
         }
-
-        const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence       = sequences[lanes[row]];
             RequestControl& request       = requests[lanes[row]];

@@ -143,9 +143,18 @@ duplicates, no Ollama-compat aliases):
   (`none` / `vram_resident` / `host_ram`), `prefix_reuse_path` (`full_reset` / `append_frontier` /
   `restore_turn_checkpoint` / `restore_response_checkpoint` / `restore_context_checkpoint` /
   `restore_turn_rollback`),
-  `context_checkpoint` (`restored_tokens` / `captured_tokens`), `prefill` (`ms`, `tok_s`, `ms_per_token`, `tail_tok_s`,
-  `tail_window_s`) and `decode` (`ms`, `tok_s`, `ms_per_token`). Prefill rates cover the computed
-  (non-reused) suffix only. Rate and millisecond fields are rounded to three decimal places.
+  `context_checkpoint` (`restored_tokens` / `captured_tokens`), `ttft_ms`, `prefill` (`tokens`, `ms`, `tok_s`, `ms_per_token`, `tail_tok_s`,
+  `tail_window_s`) and `decode` (`tokens`, `ms`, `tok_s`, `ms_per_token`). `ttft_ms` is the same value as `[req] done`
+  `ttft`: HTTP prepare plus engine time to the first generated token (admission wait, Vision encode, and prefill,
+  including the first-token sample). It is not `prefill.ms`. Prefill `tokens` / rates cover the computed
+  (non-reused) suffix only. `tail_tok_s` is that suffix's throughput over the trailing ≤1s of prefill
+  GPU time and excludes Vision encode (which has its own `vision` phase in the request log). Decode
+  `tokens` are `max(0, completion_tokens - 1)`: when a first generated token exists it is sampled
+  during prefill (and is in `prefill.ms` / TTFT), so `tok_s = tokens / (ms / 1000)`. Clients
+  that divide `usage.completion_tokens` by `decode.ms` will overstate decode tok/s (2× on a
+  two-token completion). `decode.ms` is the GPU round time after host ingress and CUDA Graph
+  install; it does not include CPU packing or graph-profile switching. Speculative GDN fold /
+  compact after a round is still in `decode.ms`. Rate and millisecond fields are rounded to three decimal places.
   `cached_tokens` is the reused prefix length for any reuse path. `reuse_source` is where that
   prefix lived (`vram_resident` vs `host_ram`). `context_checkpoint.restored_tokens` is the
   absolute staged-checkpoint head frontier this request restored (the same length as
