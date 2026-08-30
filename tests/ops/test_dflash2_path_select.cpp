@@ -1312,6 +1312,272 @@ int run_nvfp4_codebook_matches_bf16_accept(const char* label, std::int32_t token
     return failures;
 }
 
+// ---------------------------------------------------------------------------
+// Content-level tree-select oracle.
+//
+// The structural tree tests above (run_tree_layout_case / run_tree_compact_case)
+// use a zero codebook and a zero hidden, so every (parent, cand) pair scores
+// identically and only the *structural* invariants (prefix-closed parent, mask
+// closure, cache/rope slots, live count) are exercised. The content of the
+// node selection -- which token actually lands in which tree node, via the real
+// Markov score -- was never checked. This oracle rebuilds the same beam-2 BFS
+// in FP64 on the host and compares the full packed tree.
+//
+// The inputs are deliberately well-separated so the top-2 frontier choice is
+// unambiguous regardless of the kernel's FP32/BF16 accumulation order:
+//   pred_code[token, r] = prime[token]          (unique per token, all r)
+//   succ_code[token, r] = token + 1             (unique per token, all r)
+//   W_h[r, 0] = 1, W_h[r, k>0] = 0  and  hidden[0] = 1, hidden[k>0] = 0
+//     => hidden projection h[r] = 1 exactly for every r
+// so the Markov score for (parent, cand) is exactly
+//   unary[cand] + kRank * prime[parent] * (cand + 1),
+// which is strictly separated across (parent, cand) pairs.
+
+struct TreeContentOracle {
+    std::vector<std::int32_t> ids;
+    std::vector<std::int32_t> parent;
+    std::vector<std::int32_t> cache;
+    std::vector<std::int32_t> rope;
+    std::vector<std::int32_t> mask;
+    std::int32_t valid = 0;
+};
+
+TreeContentOracle tree_content_oracle(const std::vector<float>& logits,
+                                       const std::vector<float>& pred,
+                                       const std::vector<float>& succ,
+                                       std::int32_t anchor, std::int32_t frontier,
+                                       std::int32_t vocab, std::int32_t tokens,
+                                       std::int32_t width) {
+    const std::int32_t kExpand = ops::kDflash2TreeExpandWidth;
+    // node_id[i] = packed column i's token id; node_parent[i] = parent packed column
+    // (-1 for the root); node_score[i] = cumulative Markov score of the path.
+    std::vector<std::int32_t> node_id;    // token id per packed column
+    std::vector<std::int32_t> node_parent;
+    std::vector<std::int32_t> node_depth;
+    std::vector<double> node_score;
+    node_id.push_back(anchor);
+    node_parent.push_back(-1);
+    node_depth.push_back(0);
+    node_score.push_back(0.0);
+
+    auto top16 = [&](std::int32_t t) {
+        std::vector<float> tv(kTopK, -std::numeric_limits<float>::infinity());
+        std::vector<int> ti(kTopK, 0x7fffffff);
+        const std::size_t col = static_cast<std::size_t>(t) * static_cast<std::size_t>(vocab);
+        for (std::int32_t v = 0; v < vocab; ++v) {
+            insert_topk(tv, ti, logits[col + static_cast<std::size_t>(v)], v);
+        }
+        return std::pair<std::vector<float>, std::vector<int>>(std::move(tv), std::move(ti));
+    };
+
+    // h[r] for each draft column: here the test fixtures force h = 1 exactly, but the
+    // oracle computes the Markov sum generically over the kRank ranks so it stays valid
+    // if the fixture is relaxed.
+    std::vector<std::vector<double>> hidden_proj(tokens, std::vector<double>(kRank, 1.0));
+
+    std::vector<std::int32_t> frontier_nodes{0};
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        const auto tv_ti = top16(t);
+        const auto& top_val = tv_ti.first;
+        const auto& top_idx = tv_ti.second;
+        struct Pair {
+            double joint;
+            int cand;
+            int pcol;
+        };
+        std::vector<Pair> pairs;
+        pairs.reserve(frontier_nodes.size() * static_cast<std::size_t>(kTopK));
+        for (int f : frontier_nodes) {
+            const int pcol         = f;
+            const double base     = node_score[pcol];
+            const int parent_token = node_id[pcol];
+            for (int c = 0; c < kTopK; ++c) {
+                const int cand        = top_idx[static_cast<std::size_t>(c)];
+                const double unary    = static_cast<double>(top_val[static_cast<std::size_t>(c)]);
+                double markov         = 0.0;
+                for (std::int32_t r = 0; r < kRank; ++r) {
+                    markov += (static_cast<double>(
+                                    pred[static_cast<std::size_t>(parent_token) * kRank + r]) *
+                                hidden_proj[static_cast<std::size_t>(t)][static_cast<std::size_t>(r)]) *
+                               static_cast<double>(succ[static_cast<std::size_t>(cand) * kRank + r]);
+                }
+                pairs.push_back({base + unary + markov, cand, pcol});
+            }
+        }
+        // Top-2 by (joint desc, cand asc, pcol asc) -- matches the kernel tiebreak.
+        std::sort(pairs.begin(), pairs.end(), [](const Pair& a, const Pair& b) {
+            if (a.joint != b.joint) { return a.joint > b.joint; }
+            if (a.cand != b.cand) { return a.cand < b.cand; }
+            return a.pcol < b.pcol;
+        });
+        const int take = std::min<std::size_t>(2, pairs.size());
+        std::vector<std::int32_t> next_frontier;
+        for (int s = 0; s < take; ++s) {
+            const auto& p = pairs[static_cast<std::size_t>(s)];
+            if (static_cast<std::int32_t>(node_id.size()) >= kExpand) { break; }
+            node_id.push_back(p.cand);
+            node_parent.push_back(p.pcol);
+            node_depth.push_back(t + 1);
+            node_score.push_back(p.joint);
+            next_frontier.push_back(static_cast<std::int32_t>(node_id.size() - 1));
+        }
+        if (!next_frontier.empty()) { frontier_nodes = std::move(next_frontier); }
+    }
+
+    const std::int32_t out_n =
+        static_cast<std::int32_t>(std::min(node_id.size(), static_cast<std::size_t>(width)));
+    TreeContentOracle out;
+    out.ids.resize(width);
+    out.parent.resize(width);
+    out.cache.resize(width);
+    out.rope.resize(width);
+    out.mask.resize(width);
+    const std::int32_t last = out_n > 0 ? out_n - 1 : 0;
+    for (std::int32_t i = 0; i < width; ++i) {
+        if (i < out_n) {
+            out.ids[static_cast<std::size_t>(i)]    = node_id[static_cast<std::size_t>(i)];
+            out.parent[static_cast<std::size_t>(i)] = i == 0 ? -1 : node_parent[static_cast<std::size_t>(i)];
+            out.cache[static_cast<std::size_t>(i)]  = frontier + i;
+            out.rope[static_cast<std::size_t>(i)]   = frontier + node_depth[static_cast<std::size_t>(i)];
+            int m   = 0;
+            int cur = i;
+            while (cur >= 0) {
+                m |= 1 << cur;
+                cur = node_parent[static_cast<std::size_t>(cur)];
+            }
+            out.mask[static_cast<std::size_t>(i)] = m;
+        } else {
+            // Padding columns duplicate the last live node's id/parent/rope/mask, but keep
+            // their own cache slot (e + col) -- matches the kernel's output convention.
+            out.ids[static_cast<std::size_t>(i)]    = out.ids[static_cast<std::size_t>(last)];
+            out.parent[static_cast<std::size_t>(i)] = out.parent[static_cast<std::size_t>(last)];
+            out.cache[static_cast<std::size_t>(i)]  = frontier + i;
+            out.rope[static_cast<std::size_t>(i)]   = out.rope[static_cast<std::size_t>(last)];
+            out.mask[static_cast<std::size_t>(i)]   = out.mask[static_cast<std::size_t>(last)];
+        }
+    }
+    out.valid = out_n;
+    return out;
+}
+
+int run_tree_content_case(const char* label, std::int32_t tokens, std::int32_t width,
+                          std::int32_t anchor, std::int32_t frontier) {
+    constexpr std::int32_t vocab = 32;
+    // The first 32 primes, so prime[token] is unique per token.
+    const std::int32_t prime[vocab] = {
+        2,  3,  5,  7,  11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53,
+        59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131,
+    };
+    std::vector<float> logits(static_cast<std::size_t>(vocab) * tokens, 0.0f);
+    std::vector<float> hidden(static_cast<std::size_t>(kHidden) * tokens, 0.0f);
+    std::vector<float> pred(static_cast<std::size_t>(kRank) * vocab, 0.0f);
+    std::vector<float> succ(static_cast<std::size_t>(kRank) * vocab, 0.0f);
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        const std::size_t col = static_cast<std::size_t>(t) * static_cast<std::size_t>(vocab);
+        for (std::int32_t v = 0; v < vocab; ++v) { logits[col + static_cast<std::size_t>(v)] = static_cast<float>(v); }
+        // hidden[0] = 1 for every draft column, rest zero -> h = 1 exactly.
+        hidden[static_cast<std::size_t>(t) * kHidden + 0] = 1.0f;
+    }
+    for (std::int32_t token = 0; token < vocab; ++token) {
+        for (std::int32_t r = 0; r < kRank; ++r) {
+            pred[static_cast<std::size_t>(token) * kRank + static_cast<std::size_t>(r)] =
+                static_cast<float>(prime[token]);
+            succ[static_cast<std::size_t>(token) * kRank + static_cast<std::size_t>(r)] =
+                static_cast<float>(token + 1);
+        }
+    }
+    round_to_bf16(logits);
+    round_to_bf16(hidden);
+    round_to_bf16(pred);
+    round_to_bf16(succ);
+
+    // W_h = identity-ish: row r has W_h[r,0] = 1, rest 0 -> h[r] = hidden[0] = 1.
+    HostWeight host_weight;
+    host_weight.n = kRank;
+    host_weight.k = kHidden;
+    host_weight.bits.assign(static_cast<std::size_t>(kRank) * kHidden, 0);
+    for (std::int32_t r = 0; r < kRank; ++r) {
+        host_weight.bits[static_cast<std::size_t>(r) * kHidden + 0] = f32_to_bf16(1.0f);
+    }
+    DeviceWeight device_weight(std::move(host_weight));
+
+    const TreeContentOracle expected =
+        tree_content_oracle(logits, pred, succ, anchor, frontier, vocab, tokens, width);
+
+    const auto logit_bits  = encode_bf16(logits);
+    const auto hidden_bits = encode_bf16(hidden);
+    const auto pred_bits   = encode_bf16(pred);
+    const auto succ_bits   = encode_bf16(succ);
+    GuardedDeviceBuffer device_logits(logit_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_hidden(hidden_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_pred(pred_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_succ(succ_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_anchors(sizeof(std::int32_t));
+    GuardedDeviceBuffer device_frontiers(sizeof(std::int32_t));
+    GuardedDeviceBuffer device_ids(static_cast<std::size_t>(width) * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_parent(static_cast<std::size_t>(width) * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_cache(static_cast<std::size_t>(width) * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_rope(static_cast<std::size_t>(width) * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_mask(static_cast<std::size_t>(width) * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_valid(sizeof(std::int32_t));
+    device_logits.copy_from_host(logit_bits.data(), device_logits.bytes());
+    device_hidden.copy_from_host(hidden_bits.data(), device_hidden.bytes());
+    device_pred.copy_from_host(pred_bits.data(), device_pred.bytes());
+    device_succ.copy_from_host(succ_bits.data(), device_succ.bytes());
+    device_anchors.copy_from_host(&anchor, sizeof(anchor));
+    device_frontiers.copy_from_host(&frontier, sizeof(frontier));
+
+    Tensor logits_t(device_logits.data(), DType::BF16, {vocab, tokens});
+    Tensor hidden_t(device_hidden.data(), DType::BF16, {kHidden, tokens});
+    Tensor pred_t(device_pred.data(), DType::BF16, {kRank, vocab});
+    Tensor succ_t(device_succ.data(), DType::BF16, {kRank, vocab});
+    Tensor anchors_t(device_anchors.data(), DType::I32, {1});
+    Tensor frontiers_t(device_frontiers.data(), DType::I32, {1});
+    Tensor ids_t(device_ids.data(), DType::I32, {width, 1});
+    Tensor parent_t(device_parent.data(), DType::I32, {width, 1});
+    Tensor cache_t(device_cache.data(), DType::I32, {width, 1});
+    Tensor rope_t(device_rope.data(), DType::I32, {width, 1});
+    Tensor mask_t(device_mask.data(), DType::I32, {width, 1});
+    Tensor valid_t(device_valid.data(), DType::I32, {1});
+    WorkspaceArena workspace(std::max<std::size_t>(
+        256, ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, 1)));
+    ops::dflash2_tree_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t,
+                             frontiers_t, ids_t, parent_t, cache_t, rope_t, mask_t, valid_t,
+                             workspace, nullptr);
+    cuda_synchronize();
+
+    const auto ids    = from_device<std::int32_t>(device_ids.data(), width);
+    const auto parent = from_device<std::int32_t>(device_parent.data(), width);
+    const auto cache  = from_device<std::int32_t>(device_cache.data(), width);
+    const auto rope   = from_device<std::int32_t>(device_rope.data(), width);
+    const auto mask   = from_device<std::int32_t>(device_mask.data(), width);
+    const auto valid  = from_device<std::int32_t>(device_valid.data(), 1);
+    int failures      = 0;
+    if (valid[0] != expected.valid) {
+        std::cerr << label << ": valid got " << valid[0] << " expected " << expected.valid << "\n";
+        ++failures;
+    }
+    for (std::int32_t i = 0; i < width; ++i) {
+        if (i < expected.valid &&
+            (ids[static_cast<std::size_t>(i)] != expected.ids[static_cast<std::size_t>(i)] ||
+             parent[static_cast<std::size_t>(i)] != expected.parent[static_cast<std::size_t>(i)])) {
+            std::cerr << label << ": node " << i << " got id=" << ids[static_cast<std::size_t>(i)]
+                      << " parent=" << parent[static_cast<std::size_t>(i)] << " expected id="
+                      << expected.ids[static_cast<std::size_t>(i)]
+                      << " parent=" << expected.parent[static_cast<std::size_t>(i)] << "\n";
+            ++failures;
+        }
+        if (cache[static_cast<std::size_t>(i)] != expected.cache[static_cast<std::size_t>(i)] ||
+            rope[static_cast<std::size_t>(i)] != expected.rope[static_cast<std::size_t>(i)] ||
+            mask[static_cast<std::size_t>(i)] != expected.mask[static_cast<std::size_t>(i)]) {
+            std::cerr << label << ": cache/rope/mask mismatch at node " << i << "\n";
+            ++failures;
+        }
+    }
+    failures += device_ids.verify_guards((std::string(label) + " ids").c_str());
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -1337,6 +1603,10 @@ int main() {
     failures += run_tree_layout_case(ops::kDflash2VerifyWidth);
     failures += run_tree_layout_case(6);
     failures += run_tree_compact_case();
+    failures += run_tree_content_case(
+        "dflash2_tree_select content T=4 W=12 anchor=5 e=16", 4, ops::kDflash2VerifyWidth, 5, 16);
+    failures += run_tree_content_case(
+        "dflash2_tree_select content T=7 W=12 anchor=9 e=24", 7, ops::kDflash2VerifyWidth, 9, 24);
     failures += run_nvfp4_codebook_greedy_case("dflash2_path_select NVFP4 codebook greedy T=2 V=128",
                                               2, 1, 23u);
     failures += run_nvfp4_codebook_greedy_case(
