@@ -398,11 +398,11 @@ std::string format_request_done(const RequestLogContext& context,
                                 const GenerationOutcome& outcome) {
     const GenerationMetrics& metrics = outcome.metrics;
     const double ttft_ms             = metrics.ttft_seconds * 1000.0;
-    // Prefill emits the first token; the remaining (gen - 1) come from decode.
+    // Same token bases as usage.prompt_tokens_details.ninfer.{prefill,decode}.
     const double decode_tokens =
-        outcome.completion_tokens > 0 ? static_cast<double>(outcome.completion_tokens - 1) : 0.0;
-    const double computed_prefill_tokens = static_cast<double>(
-        std::max(0, outcome.prompt_tokens - static_cast<int>(metrics.prefix_cache_hit_tokens)));
+        static_cast<double>(decode_eval_tokens(outcome.completion_tokens));
+    const double computed_prefill_tokens = static_cast<double>(prefill_eval_tokens(
+        outcome.prompt_tokens, static_cast<int>(metrics.prefix_cache_hit_tokens)));
 
     std::ostringstream out;
     out << "[req " << context.id << "] done finish="
@@ -614,8 +614,8 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
              {"prompt_tokens", outcome.prompt_tokens},
              {"completion_tokens", outcome.completion_tokens},
              {"computed_prefill_tokens",
-              std::max(0, outcome.prompt_tokens -
-                              static_cast<int>(outcome.metrics.prefix_cache_hit_tokens))},
+              prefill_eval_tokens(outcome.prompt_tokens,
+                                    static_cast<int>(outcome.metrics.prefix_cache_hit_tokens))},
              {"prefix_cache_hit_tokens", outcome.metrics.prefix_cache_hit_tokens},
              {"prefix_reuse_path", prefix_reuse_path_name(outcome.metrics.prefix_reuse_path)},
              {"reuse_source", prefix_reuse_source_name(outcome.metrics.prefix_reuse_source)},

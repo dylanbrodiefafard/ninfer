@@ -580,7 +580,7 @@ Json usage_to_json(const CompletionUsage& usage, const CompletionTimings* timing
     // usage keys) but forward the standard details sub-objects, so every stat lives
     // exactly once, here:
 //  - prompt_tokens_details: the OpenAI-standard `cached_tokens` plus engine stats
-    //    under the `ninfer` vendor namespace (prefill/decode rates, reuse source,
+    //    under the `ninfer` vendor namespace (ttft_ms, prefill/decode rates, reuse source,
     //    prefix_reuse_path, context_checkpoint restored/captured head frontiers, KV RAM tier).
     //  - completion_tokens_details: OpenAI-standard keys only, so they survive proxy
     //    normalization (reasoning + speculative-decoding token breakdowns).
@@ -592,14 +592,17 @@ Json usage_to_json(const CompletionUsage& usage, const CompletionTimings* timing
                       static_cast<int>(timings->restored_context_checkpoint_tokens)},
                      {"captured_tokens",
                       static_cast<int>(timings->captured_context_checkpoint_tokens)}}},
+                   {"ttft_ms", json_decimal3(timings->ttft_ms)},
                    {"prefill",
-                    {{"ms", json_decimal3(timings->prompt_ms)},
+                    {{"tokens", prefill_eval_tokens(timings->prompt_n, timings->prompt_reused_n)},
+                     {"ms", json_decimal3(timings->prompt_ms)},
                      {"tok_s", json_decimal3(timings->prompt_per_second)},
                      {"ms_per_token", json_decimal3(timings->prompt_per_token_ms)},
                      {"tail_tok_s", json_decimal3(timings->prefill_tail_tok_s)},
                      {"tail_window_s", json_decimal3(timings->prefill_tail_window_s)}}},
                    {"decode",
-                    {{"ms", json_decimal3(timings->predicted_ms)},
+                    {{"tokens", timings->predicted_n},
+                     {"ms", json_decimal3(timings->predicted_ms)},
                      {"tok_s", json_decimal3(timings->predicted_per_second)},
                      {"ms_per_token", json_decimal3(timings->predicted_per_token_ms)}}}};
     if (timings->kv_ram_capacity_bytes != 0) {
@@ -640,7 +643,7 @@ CompletionTimings make_completion_timings(int prompt_tokens, int completion_toke
     out.prompt_ms           = prefill_seconds * 1000.0;
     // Prefill rates cover the computed (non-reused) suffix only: a cached prefix is
     // not re-prefilled, so counting it would inflate the rate by the reuse ratio.
-    const int computed_prompt_tokens = prompt_tokens - out.prompt_reused_n;
+    const int computed_prompt_tokens = prefill_eval_tokens(prompt_tokens, out.prompt_reused_n);
     out.prompt_per_token_ms =
         computed_prompt_tokens > 0 ? out.prompt_ms / computed_prompt_tokens : 0.0;
     out.prompt_per_second =
@@ -649,11 +652,10 @@ CompletionTimings make_completion_timings(int prompt_tokens, int completion_toke
             : 0.0;
     out.prefill_tail_tok_s    = prefill_tail_tok_s;
     out.prefill_tail_window_s = prefill_tail_window_s;
-    out.predicted_n  = completion_tokens;
+    // First completion token is sampled during prefill; decode.ms is later rounds only.
+    const int decode_tokens = decode_eval_tokens(completion_tokens);
+    out.predicted_n  = decode_tokens;
     out.predicted_ms = decode_seconds * 1000.0;
-    // Match NInfer/llama.cpp decode accounting: first token is attributed to prefill/TTFT.
-    const int decode_tokens =
-        completion_tokens > 1 ? completion_tokens - 1 : std::max(completion_tokens, 0);
     out.predicted_per_token_ms =
         decode_tokens > 0 ? out.predicted_ms / static_cast<double>(decode_tokens) : 0.0;
     out.predicted_per_second = decode_seconds > 0.0 && decode_tokens > 0
