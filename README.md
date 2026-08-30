@@ -14,14 +14,14 @@ runtime:
 | [Qwen3.6-27B](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | `groupwise-int` | `qwen3_6_27b.ninfer` | 17,495,365,888 bytes (16.29 GiB) | `7b51600ffd10632b9660f56085efdd9b751d79733ad32036a652234b64bebe7b` |
 | [Qwen3.6-27B NVFP4](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) | `nvfp4` | `qwen3_6_27b_nvfp4.ninfer` | 18,324,064,000 bytes (17.07 GiB) | `bce5f00d066c0f20f1317bf1fdcb458264cf95837c3b1f3fbec163694627893a` |
 | [Qwen3.8-27B](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | `groupwise-int` | `qwen3_8_27b.ninfer` | 18,210,531,328 bytes (16.96 GiB) | `eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e` |
+| [Qwen3.8-27B NVFP4](https://huggingface.co/Ostfralla/Qwen3.8-27B-NVFP4-NInfer) | `nvfp4` | `qwen3_8_27b_nvfp4.ninfer` | — | — |
 | [Qwen3.6-35B-A3B](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | `groupwise-int` | `qwen3_6_35b_a3b.ninfer` | 22,783,246,080 bytes (21.22 GiB) | `1fb9ea0b5b8561e49d9604115ec89e5d9f2b6f6434e32c37c57fffd480a325d2` |
 
-The two Qwen3.6-27B weight profiles bind to the registered `qwen3_6_27b` target; the version-2
-artifact identity selects the profile without a separate runtime flag. Qwen3.8-27B is separately
-registered as `qwen3_8_27b` and shares the 27B execution package while using W8 token-embedding and
-full-output-head weights. The `nvfp4` profile uses W4A4 Tensor Core MMA for prefill and A16 NVFP4
-kernels for decode. All three 27B artifacts retain the same Text, Vision, MTP, prefix-reuse, CLI,
-and serving routes.
+The supported identity `qwen3.8-27b/nvfp4` is registered as the `qwen3_8_27b` target and shares
+the 27B execution package while using W8 token-embedding and full-output-head weights. The `nvfp4`
+profile uses W4A4 Tensor Core MMA for prefill and A16 NVFP4 kernels for decode. The artifact
+retains the full Text, Vision, MTP, prefix-reuse, CLI, and serving routes. The other listed
+artifacts remain loadable but are outside the current product contract.
 
 ## Performance
 
@@ -94,7 +94,8 @@ used INT8 KV. Qwen3.8-27B NVFP4 reports both KV codecs on
 | [Qwen3.8-27B NVFP4](https://huggingface.co/Ostfralla/Qwen3.8-27B-NVFP4-NInfer) | INT8 | 100.00% | 96.67% | 89.90% |
 | [Qwen3.8-27B NVFP4](https://huggingface.co/Ostfralla/Qwen3.8-27B-NVFP4-NInfer) | NVFP4 | 93.33% | 100.00% | 92.42% |
 
-Qwen3.8-27B `groupwise-int` is supported but is not in this evaluation campaign.
+Qwen3.8-27B `groupwise-int` remains loadable but is outside the current product contract, and is
+not in this evaluation campaign.
 
 These are single-sample results under that NInfer evaluation profile, not pass@k. See the model
 cards and [full performance document](docs/performance.md) for correct/total counts and evaluation
@@ -154,7 +155,7 @@ docker run --rm \
   --publish 8080:8080 \
   --volume "$PWD/models:/models:ro" \
   ninfer:local \
-  ninfer-serve /models/qwen3_6_27b.ninfer \
+  ninfer-serve /models/qwen3_8_27b_nvfp4.ninfer \
   --host 0.0.0.0
 ```
 
@@ -165,14 +166,22 @@ docker run --rm \
   --gpus '"device=0"' \
   --volume "$PWD/models:/models:ro" \
   ninfer:local \
-  ninfer /models/qwen3_6_27b.ninfer \
+  ninfer /models/qwen3_8_27b_nvfp4.ninfer \
   --prompt "Explain prefill and decode in three sentences." \
   --max-new 256
 ```
 
 ## Download a model
 
-Use the Hugging Face CLI to download one of the registered artifacts:
+Use the Hugging Face CLI to download the supported artifact:
+
+```bash
+hf download Ostfralla/Qwen3.8-27B-NVFP4-NInfer \
+  qwen3_8_27b_nvfp4.ninfer \
+  --local-dir models
+```
+
+The other registered artifacts remain loadable but are outside the current product contract:
 
 ```bash
 hf download neroued/Qwen3.6-27B-NInfer \
@@ -195,7 +204,13 @@ hf download neroued/Qwen3.6-35B-A3B-NInfer \
   --local-dir models
 ```
 
-Current NInfer builds accept only the version-2 artifact container, and all four downloads above
+The supported identity is `qwen3.8-27b/nvfp4`; when available, the default artifact is the
+MTP-NVFP4 or DFlash2 (NVFP4 matrices, BF16 selector codebook) variant over the base Ostfralla
+NVFP4 shell. Both are built from `qwen3_8_27b_nvfp4.ninfer`, and the MTP-NVFP4 variant
+additionally takes the Qwen3.8-27B BF16 source, using the conversion tooling described in the
+[qwen3.8-27B artifact contract](docs/maintainer/qwen3.8-27b-artifact.md).
+
+Current NInfer builds accept only the version-2 artifact container, and all five downloads above
 are version 2. Migration applies only to Qwen3.6 artifacts downloaded before their version-2
 publication; Qwen3.8-27B was published directly as version 2. Migrate an older exact local file in
 place:
@@ -216,13 +231,12 @@ disabled by default, so MTP/DFlash state and the optimized proposal head are not
 Vision is also disabled by default, so its weights, Vision scratch phase, and frozen
 request-transient allocation are omitted. Add `--vision` to the CLI or server process that must
 accept image or video input. Disabled capabilities cannot be enabled by a later request. DFlash is
-text-only: 35B-A3B DFlash v1, and Qwen3.8-27B NVFP4 DFlash2 when the artifact includes `dflash/`
-objects.
+text-only: Qwen3.8-27B NVFP4 DFlash2 when the artifact includes `dflash/` objects.
 
 ## Run the CLI
 
 ```bash
-./build/apps/ninfer models/qwen3_6_27b.ninfer \
+./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
   --prompt "Explain prefill and decode in three sentences." \
   --max-context 16384 \
   --max-new 256 \
@@ -233,7 +247,7 @@ objects.
 Use `--messages FILE` instead of `--prompt` for chat history, images, or videos:
 
 ```bash
-./build/apps/ninfer models/qwen3_6_27b.ninfer \
+./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
   --messages examples/cli/messages/image_chart.json \
   --max-context 8192 \
   --max-new 128 \
@@ -247,7 +261,7 @@ speculative-decoding statistics are written to stderr. See the [CLI guide](docs/
 ## Run the HTTP server
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
+./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
   --max-context 16384 \
   --kv-capacity auto \
   --max-concurrency 2 \
@@ -264,7 +278,7 @@ Then send an OpenAI-style request:
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-27b",
+    "model": "qwen3.8-27b",
     "messages": [{"role": "user", "content": "Reply with one short sentence."}],
     "max_tokens": 64
   }'
@@ -291,14 +305,13 @@ All three registered model IDs support:
   usage accounting;
 - prompt-rendered function tools and parsed tool calls.
 
-The 35B-A3B target additionally supports text-only DFlash v1 speculative decoding with draft
-windows from one to fifteen. Qwen3.8-27B NVFP4 additionally supports text-only DFlash2 with draft
-windows from one to seven when the artifact contains the companion objects.
+The supported identity additionally supports text-only DFlash2 speculative decoding with draft
+windows from one to eleven when the artifact contains the companion objects.
 
 ## Current limits
 
-- Only the four `(model_id, weights_id)` artifact identities listed above are accepted product
-  identities.
+- Only the `qwen3.8-27b/nvfp4` artifact identity is an accepted product identity; the other listed
+  artifacts remain loadable but are outside the current contract.
 - Execution is specialized for one RTX 5090 and one CUDA device.
 - One Engine owns one resident model and supports a startup-fixed capacity of 1–8 active requests.
   Decode-ready requests are compacted at round boundaries and executed in one batched model

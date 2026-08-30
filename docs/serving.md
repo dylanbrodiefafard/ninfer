@@ -6,22 +6,12 @@ Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
 ## Start the server
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
+./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
   --host 127.0.0.1 \
   --port 8080 \
   --max-context 16384 \
   --kv-capacity 32768 \
   --max-concurrency 2 \
-  --spec mtp --draft-tokens 3 \
-  --lm-head-draft
-```
-
-For the 35B-A3B artifact, select its artifact path; the public model ID follows the container
-identity automatically:
-
-```bash
-./build/apps/ninfer-serve models/qwen3_6_35b_a3b.ninfer \
-  --max-context 16384 \
   --spec mtp --draft-tokens 3 \
   --lm-head-draft
 ```
@@ -35,8 +25,8 @@ buffer are not allocated, and media
 requests and token-count requests fail with HTTP 400 `vision_disabled`. Add `--vision` when the
 server must accept image or video input. Speculative residency is likewise frozen by
 `--spec mtp|dflash` and `--draft-tokens`; omitting `--spec` loads neither backend.
-`--lm-head-draft` additionally loads the optimized proposal head. DFlash is text-only (35B-A3B
-DFlash v1, or Qwen3.8-27B DFlash2 when `dflash/` is present) and cannot be combined with
+`--lm-head-draft` additionally loads the optimized proposal head. DFlash is text-only: Qwen3.8-27B
+DFlash2 when `dflash/` is present, and it cannot be combined with
 `--vision`. On Qwen3.8-27B, DFlash2 uses paper-accurate chain verify (`W=k+1`); on RTX 5090,
 `--spec dflash --draft-tokens 4 --lm-head-draft` is the measured speed recommendation.
 A later request cannot enable a capability omitted at startup.
@@ -63,7 +53,7 @@ A later request cannot enable a capability omitted at startup.
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-27b",
+    "model": "qwen3.8-27b",
     "messages": [
       {"role": "system", "content": "Answer concisely."},
       {"role": "user", "content": "What is speculative decoding?"}
@@ -179,7 +169,7 @@ Start the server with `--vision` before sending media:
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-27b",
+    "model": "qwen3.8-27b",
     "messages": [{
       "role": "user",
       "content": [
@@ -219,7 +209,7 @@ Conversations, or compaction.
 curl http://127.0.0.1:8080/v1/responses \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-27b",
+    "model": "qwen3.8-27b",
     "instructions": "Answer concisely.",
     "input": "What is speculative decoding?",
     "max_output_tokens": 128,
@@ -234,7 +224,7 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="local-secret")
 response = client.responses.create(
-    model="qwen3.6-27b",
+    model="qwen3.8-27b",
     instructions="Answer concisely.",
     input="What is speculative decoding?",
     max_output_tokens=128,
@@ -426,7 +416,7 @@ template, and media expansion, and does not run generation:
 ```bash
 curl http://127.0.0.1:8080/v1/responses/input_tokens \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwen3.6-27b","input":"Count this prompt."}'
+  -d '{"model":"qwen3.8-27b","input":"Count this prompt."}'
 ```
 
 ```json
@@ -444,7 +434,7 @@ tools. These are compatibility boundaries, not silently accepted placeholders.
 curl http://127.0.0.1:8080/v1/messages \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-27b",
+    "model": "qwen3.8-27b",
     "max_tokens": 128,
     "messages": [
       {"role": "user", "content": "Explain prefix reuse in one sentence."}
@@ -478,7 +468,7 @@ without running GPU generation:
 curl http://127.0.0.1:8080/v1/messages/count_tokens \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-27b",
+    "model": "qwen3.8-27b",
     "messages": [{"role": "user", "content": "Count this prompt."}]
   }'
 ```
@@ -557,7 +547,7 @@ file. The parent directory must already exist. Failure to open the file aborts s
 is also rejected if it resolves to the model artifact.
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
+./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
