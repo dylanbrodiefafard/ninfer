@@ -73,6 +73,7 @@ struct BenchOptions {
     SpeculativeBackend spec_backend    = SpeculativeBackend::Mtp;
     std::uint32_t draft_tokens         = 0;
     std::uint32_t dflash_verify_width  = 0;
+    bool adaptive_draft                = false;
     ProposalHead proposal_head         = ProposalHead::Full;
     int device                     = 0;
     bool use_cuda_graph            = true;
@@ -123,6 +124,7 @@ struct BenchEnvironment {
     SpeculativeBackend speculative_backend         = SpeculativeBackend::None;
     std::uint32_t draft_tokens                      = 0;
     std::uint32_t dflash_verify_width               = 0;
+    bool adaptive_draft                             = false;
     ProposalHead proposal_head                      = ProposalHead::Full;
     bool use_cuda_graph                            = true;
     bool decode_graph_primed                       = false;

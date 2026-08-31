@@ -9,6 +9,8 @@
 
 #include <ninfer/targets/qwen3_6/runtime.h>
 
+#include <span>
+
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 
 using Variant                        = NINFER_QWEN36_VARIANT;
@@ -75,6 +77,29 @@ inline constexpr std::uint32_t kMaximumDFlashDraftTokens = Variant::maximum_dfla
         return false;
     }
     return true;
+}
+
+[[nodiscard]] inline constexpr std::uint32_t
+dflash_captured_verify_width(std::uint32_t k, std::uint32_t storage_ceil) {
+    const std::uint32_t live = dflash_verify_width(k, 0);
+    return live <= storage_ceil ? live : storage_ceil;
+}
+
+// Storage / ReplaySSM / pending-features width. Adaptive `{3,4,5}` is chain W<=6
+// even when `--draft-tokens 7` (native tree W=12). An explicit --dflash-verify-width
+// still wins. Frozen N=7 stays W=12.
+[[nodiscard]] inline std::uint32_t
+dflash_storage_verify_width(std::span<const std::uint32_t> captured_ks,
+                            std::uint32_t draft_window, std::uint32_t override_width) {
+    if (override_width != 0) {
+        return dflash_verify_width(draft_window, override_width);
+    }
+    std::uint32_t ceil = 0;
+    for (const std::uint32_t k : captured_ks) {
+        const std::uint32_t w = dflash_default_verify_width(k);
+        if (w > ceil) { ceil = w; }
+    }
+    return ceil != 0 ? ceil : dflash_default_verify_width(draft_window);
 }
 
 inline std::vector<GraphExecutionProfile> ordinary_graph_profiles(std::uint32_t capacity) {

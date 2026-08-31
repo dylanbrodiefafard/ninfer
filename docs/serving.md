@@ -509,7 +509,8 @@ curl http://127.0.0.1:8080/v1/models \
 | `--kv-dtype bf16\|int8\|nvfp4` | KV-cache storage | `nvfp4` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; 35B DFlash `1..15`; 3.8 DFlash2 `1..11` | unset |
-| `--dflash-verify-width N` | DFlash verify width `2..16`; chain-only targets require `W=k+1`, which is also the default | auto |
+| `--adaptive-draft` | pick live draft K from host EWMA; requires `--spec mtp\|dflash` | off |
+| `--dflash-verify-width N` | DFlash verify width `2..16`; chain-only targets require `W=k+1`. Qwen3.8 DFlash2 defaults to chain `W=k+1` for `k<=5` and packed-tree `W=12` for `k` in `{6,7}` | auto |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--vision` | enable media input and load Vision GPU allocations | off |
@@ -570,7 +571,8 @@ CUDA event elapsed for that request's RAM-tier FIFO D2H capture and H2D unpack (
 in the same copy span). They are not admission wait. Live-lane context-checkpoint freeze D2H and a
 VRAM-resident restore that unpacks already-pinned lane GDN are not included. Throughput events repeat
 those two keys as interval sums. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
-`drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
+`drafted_tokens`, `accepted_tokens`, `fallback_steps`, `accepted_per_position`, `live_draft_tokens`,
+and `rounds_per_draft`. Rates can be
 derived downstream from raw token counts and seconds instead of rounded stderr strings.
 
 The JSONL file contains no generated response text and never records an API-key value; `argv`

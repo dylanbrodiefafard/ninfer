@@ -1,4 +1,5 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
+#include "targets/qwen3_6/impl/runtime/panel_copy.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
@@ -177,6 +178,13 @@ void DFlashFeatureSink::capture_layer(int layer, const Tensor& value, cudaStream
         Tensor source = value.view({value.ne[0], batch_width, batch_size});
         Tensor target =
             batch_features->slice(0, static_cast<std::int32_t>(index) * value.ne[0], value.ne[0]);
+        if (target.ne[1] < batch_width) {
+            throw std::logic_error("DFlash batch feature sink is narrower than the live width");
+        }
+        if (target.ne[1] != batch_width) {
+            // Persistent pending_features is W_ceil; scatter only the live W(k) prefix.
+            target = target.slice(1, 0, batch_width);
+        }
         ops::scatter_bf16_batch(source, *batch_lanes, *batch_valid_columns, target, stream);
         captured_mask |= 1U << index;
         return;
@@ -689,7 +697,8 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                                            const Tensor& valid_columns, const Tensor& kv_table_rows,
                                            const Tensor& linear_state_slots,
                                            ops::GqaExecutionEnvelope envelope, Tensor& hidden,
-                                           Tensor& logits, Tensor& target_tokens, Tap& tap) {
+                                           Tensor& logits, Tensor& target_tokens, Tap& tap,
+                                           bool reset_workspace) {
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
     if (width <= 0 || width > static_cast<std::int32_t>(kDFlashDecodeMaximumWidth) || batch <= 0 ||
@@ -725,7 +734,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
     }
 
     cudaStream_t stream = ctx_.stream;
-    work_.reset();
+    if (reset_workspace) { work_.reset(); }
     {
         ScopedPositions cache_binding(active_cache_positions_, cache_positions);
         ScopedPositions rope_binding(active_rope_positions_, rope_positions);
@@ -751,17 +760,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
         ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
     }
-    work_.reset();
-}
-
-void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
-                                      const Tensor& rope_positions, const Tensor& valid_columns,
-                                      const Tensor& kv_table_rows, const Tensor& linear_state_slots,
-                                      ops::GqaExecutionEnvelope envelope, Tensor& hidden,
-                                      Tensor& logits, Tensor& target_tokens) {
-    NullTap tap;
-    target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                             linear_state_slots, envelope, hidden, logits, target_tokens, tap);
+    if (reset_workspace) { work_.reset(); }
 }
 
 void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
@@ -769,9 +768,22 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       const Tensor& kv_table_rows, const Tensor& linear_state_slots,
                                       ops::GqaExecutionEnvelope envelope, Tensor& hidden,
                                       Tensor& logits, Tensor& target_tokens,
-                                      DFlashFeatureSink& sink) {
+                                      bool reset_workspace) {
+    NullTap tap;
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                             linear_state_slots, envelope, hidden, logits, target_tokens, sink);
+                             linear_state_slots, envelope, hidden, logits, target_tokens, tap,
+                             reset_workspace);
+}
+
+void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
+                                      const Tensor& rope_positions, const Tensor& valid_columns,
+                                      const Tensor& kv_table_rows, const Tensor& linear_state_slots,
+                                      ops::GqaExecutionEnvelope envelope, Tensor& hidden,
+                                      Tensor& logits, Tensor& target_tokens,
+                                      DFlashFeatureSink& sink, bool reset_workspace) {
+    target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
+                             linear_state_slots, envelope, hidden, logits, target_tokens, sink,
+                             reset_workspace);
 }
 
 void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
@@ -914,15 +926,33 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         Tensor gate_output      = z.view({kCfg.value_dim, width, active_sequence_batch_});
         Tensor& conv_states     = state_.conv.at(static_cast<std::size_t>(gidx));
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
+        GdnReplayRecordLayer persistent_records;
+        GdnReplayRecordLayer live_records;
+        const bool pack_replay =
+            gdn_state_action_ == GdnStateAction::RecordForReplay && replay_records_ != nullptr &&
+            width != replay_records_->spec.width;
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
             if (replay_records_ == nullptr) {
                 throw std::logic_error("Replay-record GDN has no record storage");
             }
-            GdnReplayRecordLayer records =
-                replay_records_->layer(gidx, 0, active_sequence_batch_);
+            persistent_records = replay_records_->layer(gidx, 0, active_sequence_batch_);
+            live_records       = persistent_records;
+            if (pack_replay) {
+                // LLD Capture/run: GDN requires record.ne[2]==q.ne[2]; pack only when they differ.
+                const GdnReplayRecordSpec& spec = replay_records_->spec;
+                live_records.conv = work_.alloc(DType::BF16, {spec.conv_channels, width,
+                                                              active_sequence_batch_});
+                live_records.key  = work_.alloc(
+                    DType::BF16, {spec.key_dim, spec.qk_heads, width, active_sequence_batch_});
+                live_records.value = work_.alloc(
+                    DType::BF16,
+                    {spec.value_dim, spec.value_heads, width, active_sequence_batch_});
+                live_records.gate = work_.alloc(
+                    DType::FP32, {2, spec.value_heads, width, active_sequence_batch_});
+            }
             Variant::gdn_input_projection_record(projection_input, *w.projection, *w.conv1d,
                                                  conv_states, valid, *active_linear_state_slots_,
-                                                 records.conv, query_output, key_output,
+                                                 live_records.conv, query_output, key_output,
                                                  value_output, gate_output, ph, work_, s,
                                                  active_parent_index_);
         } else {
@@ -931,28 +961,13 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                 *active_linear_state_slots_, *active_linear_state_slots_, query_output, key_output,
                 value_output, gate_output, ph, work_, s);
         }
-    } else {
-        const auto conv = workspace_recipe::gdn_prefill_conv<TextConfig>(work_, T);
-        Tensor qkv      = conv.projected;
-        Variant::gdn_input_projection(h, *w.projection, qkv, z, ph, work_, s);
-        Tensor qkv_c = conv.convolved;
-        Tensor conv_state =
-            state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
-        ops::causal_conv1d_silu(qkv, *w.conv1d, conv_state, conv_state, qkv_c, s);
-        ops::extract_bf16_columns(qkv_c, 0, qc, s);
-        ops::extract_bf16_columns(qkv_c, kCfg.key_dim, kc, s);
-        ops::extract_bf16_columns(qkv_c, 2 * kCfg.key_dim, vc, s);
-    }
 
-    Tensor q_recurrent = qc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, T});
-    Tensor k_recurrent = kc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, T});
-
-    Tensor vv = vc.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
-    Tensor o  = workspace_recipe::gdn_recurrent_output<TextConfig>(work_, T).view(
-        {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
-    if (ph == Phase::Verify) {
+        Tensor q_recurrent = qc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, T});
+        Tensor k_recurrent = kc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, T});
+        Tensor vv          = vc.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+        Tensor o           = workspace_recipe::gdn_recurrent_output<TextConfig>(work_, T).view(
+            {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
         Tensor& recurrent_states = state_.recurrent.at(static_cast<std::size_t>(gidx));
-        const std::int32_t width = active_sequence_width_;
         Tensor q_batch =
             q_recurrent.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, width, active_sequence_batch_});
         Tensor k_batch =
@@ -962,31 +977,56 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         Tensor beta_batch = beta.view({kCfg.gdn_v_heads, width, active_sequence_batch_});
         Tensor out_batch =
             o.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, width, active_sequence_batch_});
-        const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
-            GdnReplayRecordLayer records =
-                replay_records_->layer(gidx, 0, active_sequence_batch_);
             // Nested like the workspace plan: fold scratch pops before
             // gdn_normalized_output. Same-stream launch keeps the pointer live
             // until this kernel completes.
             auto fold_scope = work_.scope();
             ops::gated_delta_net_replay_record(q_batch, k_batch, v_batch, g_batch, beta_batch,
                                                kGdnScale, recurrent_states, valid,
-                                               *active_linear_state_slots_, records.key,
-                                               records.value, records.gate, out_batch, s,
+                                               *active_linear_state_slots_, live_records.key,
+                                               live_records.value, live_records.gate, out_batch, s,
                                                active_parent_index_, &work_);
+            if (pack_replay) {
+                qwen3_6::pack_replay_record_layer(persistent_records, live_records, s);
+            }
         } else {
             ops::gated_delta_net_snapshot(q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale,
                                           /*normalize_qk=*/true, recurrent_states, valid,
                                           *active_linear_state_slots_, *active_linear_state_slots_,
                                           out_batch, s);
         }
-    } else {
-        Tensor recurrent_state =
-            state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
-        ops::gated_delta_net(q_recurrent, k_recurrent, vv, g, beta, kGdnScale,
-                             /*normalize_qk=*/true, work_, recurrent_state, o, s);
+
+        Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
+            {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+        ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s);
+        Tensor on_flat = on.view({kCfg.value_dim, T});
+        Variant::gdn_output_projection(on_flat, *w.out_proj, x, ph, work_, s,
+                                       packed_route_tokens(active_sequence_batch_,
+                                                           active_sequence_width_));
+        return;
     }
+
+    const auto conv = workspace_recipe::gdn_prefill_conv<TextConfig>(work_, T);
+    Tensor qkv      = conv.projected;
+    Variant::gdn_input_projection(h, *w.projection, qkv, z, ph, work_, s);
+    Tensor qkv_c = conv.convolved;
+    Tensor conv_state =
+        state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
+    ops::causal_conv1d_silu(qkv, *w.conv1d, conv_state, conv_state, qkv_c, s);
+    ops::extract_bf16_columns(qkv_c, 0, qc, s);
+    ops::extract_bf16_columns(qkv_c, kCfg.key_dim, kc, s);
+    ops::extract_bf16_columns(qkv_c, 2 * kCfg.key_dim, vc, s);
+
+    Tensor q_recurrent = qc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, T});
+    Tensor k_recurrent = kc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, T});
+    Tensor vv          = vc.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+    Tensor o           = workspace_recipe::gdn_recurrent_output<TextConfig>(work_, T).view(
+        {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+    Tensor recurrent_state =
+        state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
+    ops::gated_delta_net(q_recurrent, k_recurrent, vv, g, beta, kGdnScale,
+                         /*normalize_qk=*/true, work_, recurrent_state, o, s);
 
     Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});

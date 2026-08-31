@@ -499,6 +499,9 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.speculative_fallback_steps  = result.speculative.fallback_steps;
     outcome.metrics.speculative_accepted_per_position =
         std::move(result.speculative.accepted_per_position);
+    outcome.metrics.speculative_live_draft_tokens = result.speculative.live_draft_tokens;
+    outcome.metrics.speculative_rounds_per_draft =
+        std::move(result.speculative.rounds_per_draft);
 
     bool is_tool_call_response = false;
     if (prepared.tool_capable) {

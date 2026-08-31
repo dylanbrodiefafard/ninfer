@@ -1,5 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/dflash_candidate_stats.h"
 #include "targets/qwen3_6/impl/runtime/instance.h"
+#include "targets/qwen3_6/impl/runtime/panel_copy.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
@@ -62,16 +63,6 @@ void copy_fused_row_range(const Tensor& fused, std::int32_t row0, Tensor& out,
         static_cast<std::size_t>(fused.ne[1]), cudaMemcpyDeviceToDevice, stream));
 }
 
-// [W,B] I32 with W fastest. A width prefix of a wider round-state panel is strided at B>1.
-void copy_i32_panel(Tensor& dst, const Tensor& src, cudaStream_t stream) {
-    if (dst.data == src.data) { return; }
-    CUDA_CHECK(cudaMemcpy2DAsync(
-        dst.data, static_cast<std::size_t>(dst.nb[1]), src.data,
-        static_cast<std::size_t>(src.nb[1]),
-        static_cast<std::size_t>(src.ne[0]) * sizeof(std::int32_t),
-        static_cast<std::size_t>(src.ne[1]), cudaMemcpyDeviceToDevice, stream));
-}
-
 // [C,K,B] with C fastest. Copies src hops into dst starting at hop0.
 void copy_selector_hops(Tensor& dst, const Tensor& src, std::int32_t hop0, cudaStream_t stream) {
     if (src.ne[0] != dst.ne[0] || src.ne[2] != dst.ne[2] || hop0 < 0 ||
@@ -88,6 +79,7 @@ void copy_selector_hops(Tensor& dst, const Tensor& src, std::int32_t hop0, cudaS
         static_cast<std::size_t>(src.ne[0]) * static_cast<std::size_t>(src.ne[1]) * elem,
         static_cast<std::size_t>(src.ne[2]), cudaMemcpyDeviceToDevice, stream));
 }
+
 
 ops::LinearPolicy dflash_weight_policy(QType qtype) {
     return qtype == QType::NVFP4 ? ops::LinearPolicy::AllowA4 : ops::LinearPolicy::A16Only;
@@ -837,9 +829,9 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                                           V::draft_head_rows, state.execution.device.stream);
         }
         }
-        copy_i32_panel(ids_view, ids_full, state.execution.device.stream);
-        copy_i32_panel(pos_view, pos_full, state.execution.device.stream);
-        copy_i32_panel(drafts_view, drafts, state.execution.device.stream);
+        qwen3_6::copy_i32_panel(ids_view, ids_full, state.execution.device.stream);
+        qwen3_6::copy_i32_panel(pos_view, pos_full, state.execution.device.stream);
+        qwen3_6::copy_i32_panel(drafts_view, drafts, state.execution.device.stream);
         state.execution.work.reset();
     }
 }
@@ -866,8 +858,6 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         Tensor text_rows        = frame.text_kv_table_rows.slice(0, 0, batch_size);
         Tensor dflash_rows      = frame.dflash_kv_table_rows.slice(0, 0, batch_size);
         Tensor lanes            = frame.lanes.slice(0, 0, batch_size);
-        Tensor append_positions =
-            frame.append_positions.slice(0, 0, vw).slice(1, 0, batch_size);
         Tensor append_counts    = frame.append_counts.slice(0, 0, batch_size);
         Tensor drafts           = frame.draft_tokens.slice(0, 0, static_cast<std::int32_t>(k))
                             .slice(1, 0, batch_size);
@@ -895,15 +885,71 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         [[maybe_unused]] Tensor fold_path        = frame.fold_path.slice(0, 0, vw).slice(1, 0, batch_size);
 
         state.execution.work.reset();
-        Tensor compact_features = state.execution.work.alloc(
-            DType::BF16, {Variant::DFlashConfig::feature_rows, vw, batch_size});
+        const std::int32_t w_ceil = frame.verify_ids.ne[0];
+        const bool compact        = vw < w_ceil; // LLD Capture/run: no extra nodes when W(k)==W_ceil
+        // pending_features is stored at W_ceil. prepare_ragged_prefix requires dest.ne[1]
+        // == source.ne[1]; compact the live W(k) prefix only for append/verify consumers.
+        Tensor prepare_positions =
+            frame.append_positions.slice(0, 0, w_ceil).slice(1, 0, batch_size);
+        Tensor prefix_features = state.execution.work.alloc(
+            DType::BF16, {Variant::DFlashConfig::feature_rows, w_ceil, batch_size});
         ops::prepare_ragged_prefix(dflash_state(state).pending_features, lanes, context_starts,
-                                   frontiers, compact_features, append_positions, append_counts,
+                                   frontiers, prefix_features, prepare_positions, append_counts,
                                    state.execution.device.stream);
-        append_context_impl<Variant>(state, compact_features, append_positions, append_counts,
+        Tensor append_features   = prefix_features;
+        Tensor append_positions  = prepare_positions;
+        if (compact) {
+            append_features = state.execution.work.alloc(
+                DType::BF16, {Variant::DFlashConfig::feature_rows, vw, batch_size});
+            qwen3_6::copy_strided_width_panel(append_features, prefix_features,
+                                              state.execution.device.stream);
+            Tensor packed_append = state.execution.work.alloc(DType::I32, {vw, batch_size});
+            qwen3_6::copy_i32_panel(packed_append, prepare_positions.slice(0, 0, vw),
+                                    state.execution.device.stream);
+            append_positions = packed_append;
+        }
+        append_context_impl<Variant>(state, append_features, append_positions, append_counts,
                                      lanes, dflash_rows, envelopes.append);
 
         propose_batch_impl<Variant>(state, frame, batch_size, k, envelopes, verify_width);
+        drafts = frame.draft_tokens.slice(0, 0, static_cast<std::int32_t>(k))
+                     .slice(1, 0, batch_size);
+        verify_ids = frame.verify_ids.slice(0, 0, vw).slice(1, 0, batch_size);
+        parent_index =
+            frame.parent_index.slice(0, 0, vw).slice(1, 0, batch_size);
+        ancestor_mask =
+            frame.ancestor_mask.slice(0, 0, vw).slice(1, 0, batch_size);
+        cache_positions =
+            frame.cache_positions.slice(0, 0, vw).slice(1, 0, batch_size);
+        rope_positions =
+            frame.proposal_positions.slice(0, 0, vw).slice(1, 0, batch_size);
+        target_tokens = frame.target_argmax.slice(0, 0, vw).slice(1, 0, batch_size);
+        licensed_tokens =
+            frame.licensed_tokens.slice(0, 0, vw).slice(1, 0, batch_size);
+        fold_path = frame.fold_path.slice(0, 0, vw).slice(1, 0, batch_size);
+        if (compact) {
+            // Overlay prefix/propose scratch. Compact verify panels stay live through
+            // accept (reset_workspace=false) without stacking on the proposal peak.
+            state.execution.work.reset();
+            auto copy_panel = [&](const Tensor& src, std::int32_t rows) {
+                Tensor dst = state.execution.work.alloc(DType::I32, {rows, batch_size});
+                qwen3_6::copy_i32_panel(dst, src, state.execution.device.stream);
+                return dst;
+            };
+            drafts          = copy_panel(drafts, static_cast<std::int32_t>(k));
+            verify_ids      = copy_panel(verify_ids, vw);
+            parent_index    = copy_panel(parent_index, vw);
+            ancestor_mask   = copy_panel(ancestor_mask, vw);
+            cache_positions = copy_panel(cache_positions, vw);
+            rope_positions  = copy_panel(rope_positions, vw);
+            target_tokens   = state.execution.work.alloc(DType::I32, {vw, batch_size});
+            licensed_tokens = state.execution.work.alloc(DType::I32, {vw, batch_size});
+            fold_path       = state.execution.work.alloc(DType::I32, {vw, batch_size});
+            target_hidden   = state.execution.work.alloc(
+                DType::BF16, {TextConfig::hidden, vw, batch_size});
+            target_logits = state.execution.work.alloc(
+                DType::BF16, {TextConfig::output_rows, vw, batch_size});
+        }
         const bool use_tree = dflash_uses_tree_verify(k, verify_width);
         if (!use_tree) {
             // Chain verify writes ids only unless positions are filled here. Tree select
@@ -967,7 +1013,16 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             }
         }
         target_verify_accept(state.execution, state.continuation_hidden_store, card, verify_frame,
-                             target_envelope);
+                             target_envelope, !compact);
+        if (compact) {
+            qwen3_6::copy_i32_panel(
+                frame.licensed_tokens.slice(0, 0, vw).slice(1, 0, batch_size), licensed_tokens,
+                state.execution.device.stream);
+            qwen3_6::copy_i32_panel(frame.fold_path.slice(0, 0, vw).slice(1, 0, batch_size),
+                                    fold_path, state.execution.device.stream);
+            qwen3_6::copy_strided_width_panel(frame.target_hidden.slice(2, 0, batch_size),
+                                              target_hidden, state.execution.device.stream);
+        }
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
                                    sizeof(qwen3_6::DFlashDecodeEgress), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));

@@ -145,7 +145,7 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          std::uint32_t mtp_proposal_extent);
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
-                          ops::GqaExecutionEnvelope envelope);
+                          ops::GqaExecutionEnvelope envelope, bool reset_workspace = true);
 
 [[nodiscard]] PrefillChunkResult prefill_text_chunk(
     PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,

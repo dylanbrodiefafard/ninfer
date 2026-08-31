@@ -292,6 +292,10 @@ void print_generation_summary(const ninfer::GenerationResult& result,
         const std::string backend =
             speculative.backend == ninfer::SpeculativeBackend::DFlash ? "dflash" : "mtp";
         print_metric(backend + " draft window", std::to_string(speculative.draft_window));
+        if (speculative.live_draft_tokens != 0) {
+            print_metric(backend + " live draft tokens",
+                         std::to_string(speculative.live_draft_tokens));
+        }
         print_metric(backend + " rounds", std::to_string(speculative.rounds));
         print_metric(backend + " fallback steps", std::to_string(speculative.fallback_steps));
         print_metric(backend + " drafted tokens", std::to_string(speculative.drafted_tokens));

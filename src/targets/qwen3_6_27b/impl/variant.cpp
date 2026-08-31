@@ -1,4 +1,5 @@
 #include "targets/qwen3_6_27b/impl/variant.h"
+#include "targets/qwen3_6/impl/runtime/adaptive_draft.h"
 
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/gdn_gating_proj.h"
@@ -659,6 +660,16 @@ std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
         }
     }
     return layout.peak_bytes(1);
+}
+
+float Variant::adaptive_draft_round_time(SpeculativeBackend backend, std::uint32_t k) {
+    if (backend == SpeculativeBackend::Mtp) {
+        return k < 6 ? qwen3_6::kAdaptiveMtpT[k] : 0.0f;
+    }
+    if (backend == SpeculativeBackend::DFlash) {
+        return k < 8 ? qwen3_6::kAdaptiveDflashT[k] : 0.0f;
+    }
+    return 0.0f;
 }
 
 } // namespace ninfer::targets::qwen3_6_27b::detail

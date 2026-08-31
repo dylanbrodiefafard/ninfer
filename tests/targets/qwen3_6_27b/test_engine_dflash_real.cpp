@@ -38,6 +38,16 @@ ninfer::EngineOptions speculative_engine_options(const char* artifact,
     return options;
 }
 
+ninfer::EngineOptions adaptive_engine_options(const char* artifact,
+                                              ninfer::SpeculativeBackend backend,
+                                              std::uint32_t draft_tokens,
+                                              std::uint32_t max_concurrency) {
+    ninfer::EngineOptions options =
+        speculative_engine_options(artifact, backend, draft_tokens, max_concurrency);
+    options.speculative.adaptive_draft = true;
+    return options;
+}
+
 ninfer::RequestOptions greedy_options(std::uint32_t outputs) {
     ninfer::RequestOptions options;
     options.execution.requested_output_tokens = outputs;
@@ -45,6 +55,21 @@ ninfer::RequestOptions greedy_options(std::uint32_t outputs) {
     options.execution.allow_prefix_reuse      = false;
     options.stop.include_model_defaults       = false;
     return options;
+}
+
+ninfer::RequestOptions greedy_reuse(std::uint32_t outputs, bool reuse) {
+    ninfer::RequestOptions options          = greedy_options(outputs);
+    options.execution.allow_prefix_reuse    = reuse;
+    return options;
+}
+
+std::vector<ninfer::TokenId> resume_prefix(const std::vector<ninfer::TokenId>& keep,
+                                           const std::vector<ninfer::TokenId>& generated) {
+    std::vector<ninfer::TokenId> prefix = keep;
+    if (!generated.empty()) {
+        prefix.insert(prefix.end(), generated.begin(), generated.end() - 1);
+    }
+    return prefix;
 }
 
 void dump_tokens(const char* tag, const std::vector<ninfer::TokenId>& tokens) {
@@ -56,7 +81,7 @@ void dump_tokens(const char* tag, const std::vector<ninfer::TokenId>& tokens) {
 void dump_speculative(const char* tag, const ninfer::SpeculativeStats& stats) {
     std::cerr << tag << " rounds=" << stats.rounds << " drafted=" << stats.drafted_tokens
               << " accepted=" << stats.accepted_tokens << " fallback=" << stats.fallback_steps
-              << " per_pos=";
+              << " live_k=" << stats.live_draft_tokens << " per_pos=";
     for (std::uint64_t count : stats.accepted_per_position) { std::cerr << ' ' << count; }
     std::cerr << '\n';
 }
@@ -182,6 +207,24 @@ int exercise_chain_verify_short_output_entitlement(const char* artifact) {
         return 1;
     }
     if (check_speculative(result, "chain-verify short-output entitlement") != 0) { return 1; }
+    return 0;
+}
+
+int check_adaptive_dflash(const ninfer::GenerationResult& result, const char* label) {
+    if (check_speculative(result, label) != 0) { return 1; }
+    std::uint64_t hist = 0;
+    for (std::uint64_t count : result.speculative.rounds_per_draft) { hist += count; }
+    if (hist != result.speculative.rounds) {
+        std::cerr << label << " rounds_per_draft sum " << hist << " != rounds "
+                  << result.speculative.rounds << '\n';
+        return 1;
+    }
+    const std::uint32_t live = result.speculative.live_draft_tokens;
+    if (live != 3 && live != 4 && live != 5) {
+        std::cerr << label << " live_draft_tokens " << live << " not in {3,4,5}\n";
+        dump_speculative("  spec", result.speculative);
+        return 1;
+    }
     return 0;
 }
 
@@ -390,6 +433,187 @@ int main() {
     }
     if (only_k == nullptr || std::string(only_k) == "5") {
         if (const int result = run_k(5, "DFlash2 k=5 chain C=3"); result != 0) { return result; }
+    }
+
+    {
+        const char* label = "DFlash2 adaptive N=7 {3,4,5}";
+        ninfer::Engine engine(adaptive_engine_options(
+            artifact, ninfer::SpeculativeBackend::DFlash, 7, 3));
+        if (const int result = check_dflash_load(engine); result != 0) { return result; }
+        // Prefill commits the first generated token. Seven tokens leave remaining=6 on
+        // the first DFlash round: budget_extent=5, seed live_k=5, W(k)=6 under W_ceil=6.
+        const ninfer::GenerationResult compact =
+            engine.generate(engine.prepare_tokens(prompts[0]), greedy_options(7));
+        if (compact.generated_token_ids.size() != 7 || check_speculative(compact, label) != 0) {
+            std::cerr << label << " compact k=5 under N=7 did not complete\n";
+            dump_tokens("  got", compact.generated_token_ids);
+            dump_speculative("  spec", compact.speculative);
+            return 1;
+        }
+        if (compact.speculative.rounds_per_draft.size() < 6 ||
+            compact.speculative.rounds_per_draft[5] == 0) {
+            std::cerr << label << " compact run did not record k=5 rounds under N=7\n";
+            dump_speculative("  spec", compact.speculative);
+            return 1;
+        }
+        auto compact_a = engine.submit(engine.prepare_tokens(prompts[0]), greedy_options(7));
+        auto compact_b = engine.submit(engine.prepare_tokens(prompts[1]), greedy_options(7));
+        const ninfer::GenerationResult compact_ra = compact_a.wait();
+        const ninfer::GenerationResult compact_rb = compact_b.wait();
+        if (compact_ra.generated_token_ids.size() != 7 ||
+            compact_rb.generated_token_ids.size() != 7 ||
+            check_speculative(compact_ra, label) != 0 ||
+            check_speculative(compact_rb, label) != 0 ||
+            compact_ra.speculative.rounds_per_draft.size() < 6 ||
+            compact_ra.speculative.rounds_per_draft[5] == 0) {
+            std::cerr << label << " compact C=2 k=5 under N=7 failed\n";
+            dump_speculative("  A", compact_ra.speculative);
+            dump_speculative("  B", compact_rb.speculative);
+            return 1;
+        }
+        const ninfer::GenerationResult seq =
+            engine.generate(engine.prepare_tokens(prompts[0]), greedy_options(24));
+        if (seq.generated_token_ids.size() != 24 || check_speculative(seq, label) != 0) {
+            std::cerr << label << " C=1 did not complete\n";
+            dump_tokens("  got", seq.generated_token_ids);
+            dump_speculative("  spec", seq.speculative);
+            return 1;
+        }
+        std::uint64_t hist = 0;
+        for (std::uint64_t count : seq.speculative.rounds_per_draft) { hist += count; }
+        if (hist != seq.speculative.rounds) {
+            std::cerr << label << " rounds_per_draft sum mismatch\n";
+            return 1;
+        }
+        const std::uint32_t live = seq.speculative.live_draft_tokens;
+        if (live != 3 && live != 4 && live != 5) {
+            std::cerr << label << " live_draft_tokens " << live << " not in {3,4,5}\n";
+            return 1;
+        }
+        auto a = engine.submit(engine.prepare_tokens(prompts[0]), greedy_options(19));
+        auto b = engine.submit(engine.prepare_tokens(prompts[1]), greedy_options(13));
+        auto c = engine.submit(engine.prepare_tokens(prompts[2]), greedy_options(7));
+        const std::array<ninfer::GenerationResult, 3> results{a.wait(), b.wait(), c.wait()};
+        const std::array<std::uint32_t, 3> lengths{19, 13, 7};
+        for (std::size_t i = 0; i < 3; ++i) {
+            if (results[i].generated_token_ids.size() != lengths[i] ||
+                check_speculative(results[i], label) != 0) {
+                std::cerr << label << " C=3 request " << i << " failed\n";
+                dump_tokens("  got", results[i].generated_token_ids);
+                dump_speculative("  spec", results[i].speculative);
+                return 1;
+            }
+        }
+        std::cout << "ok " << label << '\n' << std::flush;
+    }
+
+    {
+        const char* label = "DFlash2 adaptive RAM reseed {3,4,5}";
+        ninfer::EngineOptions options =
+            adaptive_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 7, 1);
+        options.kv_ram_capacity_bytes = 1024ULL * 1024ULL * 1024ULL;
+        ninfer::Engine engine(options);
+        if (const int result = check_dflash_load(engine); result != 0) { return result; }
+        if (engine.memory_summary().kv_ram_capacity_bytes == 0) {
+            std::cerr << label << " RAM tier is disabled\n";
+            return 1;
+        }
+        const ninfer::GenerationResult first =
+            engine.generate(engine.prepare_tokens(prompts[0]), greedy_reuse(8, false));
+        if (first.generated_token_ids.size() != 8 ||
+            check_adaptive_dflash(first, label) != 0 ||
+            first.speculative.live_draft_tokens != 5) {
+            std::cerr << label << " source did not stay at seeded k=5\n";
+            dump_speculative("  spec", first.speculative);
+            return 1;
+        }
+        const auto captures_before = engine.runtime_stats().kv_ram_captures;
+        const ninfer::GenerationResult evictor =
+            engine.generate(engine.prepare_tokens(prompts[1]), greedy_reuse(4, false));
+        if (evictor.generated_token_ids.size() != 4 ||
+            engine.runtime_stats().kv_ram_captures <= captures_before) {
+            std::cerr << label << " evictor did not capture the first chat to RAM\n";
+            return 1;
+        }
+        const std::vector<ninfer::TokenId> history =
+            resume_prefix(prompts[0], first.generated_token_ids);
+        const auto restores_before = engine.runtime_stats().kv_ram_restores;
+        const ninfer::GenerationResult hit =
+            engine.generate(engine.prepare_tokens(history), greedy_reuse(4, true));
+        if (hit.prefix_reuse_source != ninfer::PrefixReuseSource::HostRam) {
+            std::cerr << label << " restore source is "
+                      << static_cast<int>(hit.prefix_reuse_source) << ", expected HostRam\n";
+            return 1;
+        }
+        if (engine.runtime_stats().kv_ram_restores != restores_before + 1) {
+            std::cerr << label << " kv_ram_restores did not increment\n";
+            return 1;
+        }
+        if (hit.generated_token_ids.size() != 4 || check_adaptive_dflash(hit, label) != 0 ||
+            hit.speculative.live_draft_tokens != 5) {
+            std::cerr << label << " RAM restore leaked live_k off the seeded attractor\n";
+            dump_speculative("  hit", hit.speculative);
+            return 1;
+        }
+        std::cout << "ok " << label << '\n' << std::flush;
+    }
+
+    {
+        const char* label = "DFlash2 adaptive RAM restore in flight {3,4,5}";
+        ninfer::EngineOptions options =
+            adaptive_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 7, 2);
+        options.kv_ram_capacity_bytes = 1024ULL * 1024ULL * 1024ULL;
+        ninfer::Engine engine(options);
+        if (const int result = check_dflash_load(engine); result != 0) { return result; }
+        const ninfer::GenerationResult first =
+            engine.generate(engine.prepare_tokens(prompts[0]), greedy_reuse(8, false));
+        const ninfer::GenerationResult second =
+            engine.generate(engine.prepare_tokens(prompts[1]), greedy_reuse(4, false));
+        if (first.generated_token_ids.size() != 8 || second.generated_token_ids.size() != 4) {
+            std::cerr << label << " C=2 fill did not complete\n";
+            return 1;
+        }
+        const auto captures_before = engine.runtime_stats().kv_ram_captures;
+        const ninfer::GenerationResult evictor =
+            engine.generate(engine.prepare_tokens(prompts[2]), greedy_reuse(4, false));
+        if (evictor.generated_token_ids.size() != 4 ||
+            engine.runtime_stats().kv_ram_captures <= captures_before) {
+            std::cerr << label << " third request did not dump a chat to RAM\n";
+            return 1;
+        }
+        const std::vector<ninfer::TokenId> history =
+            resume_prefix(prompts[0], first.generated_token_ids);
+        // Restored exact-prefix generate overlaps a compact k=5 decode (greedy 7 →
+        // remaining=6 after prefill, budget_extent=5, W(k)=6 under W_ceil=6) on the
+        // other lane while copy_stream H2D-restores cyclic DFlash KV / GDN / pages.
+        auto restored_h =
+            engine.submit(engine.prepare_tokens(history), greedy_reuse(4, true));
+        auto inflight_h =
+            engine.submit(engine.prepare_tokens(prompts[1]), greedy_reuse(7, false));
+        const ninfer::GenerationResult hit      = restored_h.wait();
+        const ninfer::GenerationResult inflight = inflight_h.wait();
+        if (hit.generated_token_ids.size() != 4 || inflight.generated_token_ids.size() != 7 ||
+            check_adaptive_dflash(hit, label) != 0 ||
+            check_adaptive_dflash(inflight, label) != 0 ||
+            hit.speculative.live_draft_tokens != 5) {
+            std::cerr << label << " overlapping RAM restore dropped live_k or failed compact\n";
+            dump_speculative("  hit", hit.speculative);
+            dump_speculative("  inflight", inflight.speculative);
+            return 1;
+        }
+        if (inflight.speculative.rounds_per_draft.size() < 6 ||
+            inflight.speculative.rounds_per_draft[5] == 0) {
+            std::cerr << label << " inflight compact did not record k=5 rounds under N=7\n";
+            dump_speculative("  inflight", inflight.speculative);
+            return 1;
+        }
+        if (hit.prefix_reuse_source != ninfer::PrefixReuseSource::HostRam &&
+            hit.prefix_reuse_source != ninfer::PrefixReuseSource::VramResident) {
+            std::cerr << label << " restore source is "
+                      << static_cast<int>(hit.prefix_reuse_source) << '\n';
+            return 1;
+        }
+        std::cout << "ok " << label << '\n' << std::flush;
     }
     return 0;
 }

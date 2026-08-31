@@ -34,9 +34,11 @@ SPECULATIVE_MODES = {
     "mtp3": ("mtp", 3, 0),
     "mtp4": ("mtp", 4, 0),
     "mtp5": ("mtp", 5, 0),
+    "dflash3": ("dflash", 3, 0),
     "dflash4": ("dflash", 4, 0),
     "dflash4w6": ("dflash", 4, 6),
     "dflash5": ("dflash", 5, 0),
+    "dflash6": ("dflash", 6, 0),
     "dflash7": ("dflash", 7, 0),
     "dflash11": ("dflash", 11, 0),
 }
@@ -63,6 +65,9 @@ LONG_DECODE_FIXTURES = (
     "long_decode_aime26_15",
     "long_decode_aime26_30",
 )
+
+# Decode-saturation only; not part of corpus-makespan membership.
+SATURATION_ONLY_FIXTURES = ("thinking_logic_grid",)
 
 SCENARIO_FIXTURES = {
     "code": (
@@ -360,7 +365,7 @@ def parse_artifacts(values: Sequence[str]) -> list[tuple[str, Path]]:
 def fixture_metadata(name: str) -> tuple[str, str | None]:
     if name in NIAH_FIXTURES:
         return "long_niah", None
-    if name in LONG_DECODE_FIXTURES:
+    if name in LONG_DECODE_FIXTURES or name in SATURATION_ONLY_FIXTURES:
         return "long_decode", "reasoning"
     for category, names in SCENARIO_FIXTURES.items():
         if name in names:
@@ -379,6 +384,7 @@ def load_fixtures() -> dict[str, Fixture]:
     selected_names = (
         *NIAH_FIXTURES,
         *LONG_DECODE_FIXTURES,
+        *SATURATION_ONLY_FIXTURES,
         *(name for names in SCENARIO_FIXTURES.values() for name in names),
         WARMUP_FIXTURE,
     )
@@ -1108,14 +1114,18 @@ def mode_display_name(mode_name: str) -> str:
         return "MTP0"
     if backend == "mtp":
         return f"MTP{draft_tokens}"
+    if mode_name == "dflash3":
+        return "DFlash k=3 W=4 chain"
     if mode_name == "dflash4":
         return "DFlash k=4 W=5 chain"
     if mode_name == "dflash4w6":
         return "DFlash k=4 W=6 tree"
     if mode_name == "dflash5":
         return "DFlash k=5 W=6 chain"
+    if mode_name == "dflash6":
+        return "DFlash k=6 W=12 tree"
     if mode_name == "dflash7":
-        return "DFlash k=7 W=8 chain"
+        return "DFlash k=7 W=12 tree"
     if mode_name == "dflash11":
         return "DFlash k=11 W=12 chain"
     raise CampaignError(f"unsupported summary mode: {mode_name}")
