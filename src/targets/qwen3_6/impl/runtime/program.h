@@ -9,6 +9,7 @@
 #include "core/decode_graph.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
+#include "targets/qwen3_6/impl/runtime/adaptive_draft.h"
 #include "targets/qwen3_6/impl/runtime/context_checkpoint.h"
 #include "targets/qwen3_6/impl/runtime/kv_ram_cache.h"
 #include "targets/qwen3_6/impl/runtime/layouts.h"
@@ -119,6 +120,9 @@ struct PendingCandidate {
     std::uint32_t base_S        = 0;
     std::uint32_t prompt_tokens = 0;
     std::uint32_t produced      = 0;
+    std::uint32_t round_k       = 0;
+    std::uint32_t verify_width  = 0;
+    bool tree_verify            = false;
 };
 
 enum class Lifecycle : std::uint8_t {
@@ -200,6 +204,8 @@ struct DecodeGraphProfile {
     std::uint32_t min_execution_frontier = 0;
     std::uint32_t max_execution_frontier = 0;
     std::uint32_t topology_class         = 0;
+    std::uint32_t draft_k                = 0;
+    std::uint32_t verify_width           = 0;
     DecodeGraphDefinition definition;
 };
 
@@ -282,6 +288,7 @@ struct RequestControl {
     };
 
     std::optional<Prefill> prefill;
+    qwen3_6::AdaptiveDraftState adaptive;
 };
 
 class ProgramImplCore {
@@ -359,6 +366,9 @@ public:
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
     const std::uint32_t dflash_verify_width;
+    const bool adaptive_draft;
+    const std::vector<std::uint32_t> captured_ks;
+    const std::vector<float> adaptive_round_time;
     const SpeculativeBackend speculative_backend;
     const std::vector<std::uint32_t> context_marks;
     const DType kv_dtype;

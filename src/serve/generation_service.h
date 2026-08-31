@@ -39,6 +39,8 @@ struct GenerationMetrics {
     std::uint64_t speculative_accepted_tokens = 0;
     std::uint64_t speculative_fallback_steps  = 0;
     std::vector<std::uint64_t> speculative_accepted_per_position;
+    std::uint32_t speculative_live_draft_tokens = 0;
+    std::vector<std::uint64_t> speculative_rounds_per_draft;
     std::uint32_t prefix_cache_hit_tokens     = 0;
     ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::FullReset;
     ninfer::PrefixReuseSource prefix_reuse_source = ninfer::PrefixReuseSource::None;

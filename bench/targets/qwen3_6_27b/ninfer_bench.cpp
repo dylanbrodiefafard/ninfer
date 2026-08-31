@@ -123,6 +123,13 @@ ninfer::bench::RepTiming fold_lane_results(const std::vector<ninfer::GenerationR
         for (std::size_t j = 0; j < in.accepted_per_position.size(); ++j) {
             timing.speculative.accepted_per_position[j] += in.accepted_per_position[j];
         }
+        timing.speculative.live_draft_tokens = in.live_draft_tokens;
+        if (timing.speculative.rounds_per_draft.size() < in.rounds_per_draft.size()) {
+            timing.speculative.rounds_per_draft.resize(in.rounds_per_draft.size());
+        }
+        for (std::size_t j = 0; j < in.rounds_per_draft.size(); ++j) {
+            timing.speculative.rounds_per_draft[j] += in.rounds_per_draft[j];
+        }
     }
     return timing;
 }
@@ -280,6 +287,7 @@ int main(int argc, char** argv) {
         engine_options.speculative.draft_tokens  = options.draft_tokens;
         engine_options.speculative.proposal_head = options.proposal_head;
         engine_options.speculative.dflash_verify_width = options.dflash_verify_width;
+        engine_options.speculative.adaptive_draft = options.adaptive_draft;
         engine_options.use_cuda_graph            = options.use_cuda_graph;
 
         ninfer::bench::BenchEnvironment env;
@@ -297,6 +305,7 @@ int main(int argc, char** argv) {
                                            : options.spec_backend;
         env.draft_tokens             = options.draft_tokens;
         env.dflash_verify_width      = options.dflash_verify_width;
+        env.adaptive_draft           = options.adaptive_draft;
         env.proposal_head            = options.proposal_head;
         env.use_cuda_graph           = options.use_cuda_graph;
         env.repetitions              = options.repetitions;

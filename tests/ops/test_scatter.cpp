@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -186,6 +187,143 @@ int batch_prefix_case() {
     return failures;
 }
 
+int pitched_live_width_case() {
+    // Adaptive DFlash stores pending_features at W_ceil and verify/scatter at W(k).
+    // scatter dest is a dim-1 prefix of the W_ceil pool; prepare dest matches W_ceil.
+    constexpr std::int32_t rows     = 8;
+    constexpr std::int32_t w_ceil   = 12;
+    constexpr std::int32_t vw       = 6;
+    constexpr std::int32_t batch    = 2;
+    constexpr std::int32_t capacity = 3;
+    const std::vector<std::int32_t> lanes{2, 0};
+    const std::vector<std::int32_t> valid{6, 4};
+    const auto source = bit_pattern(static_cast<std::size_t>(rows * vw * batch), 0x51ed51edu);
+    const auto initial =
+        bit_pattern(static_cast<std::size_t>(rows * w_ceil * capacity), 0xa11ce110u);
+    auto expected_pool = initial;
+    for (std::int32_t b = 0; b < batch; ++b) {
+        for (std::int32_t column = 0; column < valid[static_cast<std::size_t>(b)]; ++column) {
+            for (std::int32_t row = 0; row < rows; ++row) {
+                expected_pool[static_cast<std::size_t>(
+                                  (lanes[static_cast<std::size_t>(b)] * w_ceil + column) * rows +
+                                  row)] =
+                    source[static_cast<std::size_t>((b * vw + column) * rows + row)];
+            }
+        }
+    }
+
+    DeviceBuffer device_source = to_device(source);
+    DeviceBuffer device_lanes  = to_device(lanes);
+    DeviceBuffer device_valid  = to_device(valid);
+    GuardedDeviceBuffer device_pool(initial.size() * sizeof(std::uint16_t));
+    device_pool.copy_from_host(initial.data(), initial.size() * sizeof(std::uint16_t));
+
+    Tensor source_tensor(device_source.p, DType::BF16, {rows, vw, batch});
+    Tensor lanes_tensor(device_lanes.p, DType::I32, {batch});
+    Tensor valid_tensor(device_valid.p, DType::I32, {batch});
+    Tensor pool_ceil(device_pool.data(), DType::BF16, {rows, w_ceil, capacity});
+    Tensor pool_live = pool_ceil.slice(1, 0, vw);
+    ops::scatter_bf16_batch(source_tensor, lanes_tensor, valid_tensor, pool_live, nullptr);
+    cuda_synchronize();
+
+    int failures = verify_exact(
+        "scatter live W into W_ceil pending",
+        from_device<std::uint16_t>(device_pool.data(), expected_pool.size()), expected_pool);
+    failures += device_pool.verify_guards("scatter live W pool guards");
+
+    bool threw = false;
+    try {
+        ops::scatter_bf16_batch(source_tensor, lanes_tensor, valid_tensor, pool_ceil, nullptr);
+    } catch (const std::invalid_argument&) { threw = true; }
+    failures += threw ? 0 : 1;
+    if (!threw) {
+        std::cerr << "FAIL: scatter_bf16_batch accepted W(k) source into W_ceil dest\n";
+    }
+
+    const std::vector<std::int32_t> starts{0, 10};
+    const std::vector<std::int32_t> ends{6, 14};
+    DeviceBuffer device_starts = to_device(starts);
+    DeviceBuffer device_ends   = to_device(ends);
+    GuardedDeviceBuffer device_gathered(static_cast<std::size_t>(rows * w_ceil * batch) *
+                                        sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_positions(static_cast<std::size_t>(w_ceil * batch) *
+                                         sizeof(std::int32_t));
+    GuardedDeviceBuffer device_counts(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
+    device_gathered.fill(0xcd);
+    device_positions.fill(0xef);
+    device_counts.fill(0xab);
+    Tensor gathered(device_gathered.data(), DType::BF16, {rows, w_ceil, batch});
+    Tensor positions(device_positions.data(), DType::I32, {w_ceil, batch});
+    Tensor counts(device_counts.data(), DType::I32, {batch});
+    Tensor starts_tensor(device_starts.p, DType::I32, {batch});
+    Tensor ends_tensor(device_ends.p, DType::I32, {batch});
+    ops::prepare_ragged_prefix(pool_ceil, lanes_tensor, starts_tensor, ends_tensor, gathered,
+                               positions, counts, nullptr);
+    cuda_synchronize();
+
+    std::vector<std::uint16_t> expected_gathered(static_cast<std::size_t>(rows * w_ceil * batch), 0);
+    const std::vector<std::int32_t> expected_counts{6, 4};
+    for (std::int32_t b = 0; b < batch; ++b) {
+        const std::int32_t count = expected_counts[static_cast<std::size_t>(b)];
+        for (std::int32_t column = 0; column < count; ++column) {
+            for (std::int32_t row = 0; row < rows; ++row) {
+                expected_gathered[static_cast<std::size_t>((b * w_ceil + column) * rows + row)] =
+                    expected_pool[static_cast<std::size_t>(
+                        (lanes[static_cast<std::size_t>(b)] * w_ceil + column) * rows + row)];
+            }
+        }
+    }
+    failures += verify_exact(
+        "prepare_ragged_prefix from W_ceil pending",
+        from_device<std::uint16_t>(device_gathered.data(), expected_gathered.size()),
+        expected_gathered);
+    failures += verify_exact("prepare_ragged_prefix W_ceil counts",
+                             from_device<std::int32_t>(device_counts.data(), expected_counts.size()),
+                             expected_counts);
+
+    threw = false;
+    GuardedDeviceBuffer device_narrow(static_cast<std::size_t>(rows * vw * batch) *
+                                      sizeof(std::uint16_t));
+    Tensor gathered_vw(device_narrow.data(), DType::BF16, {rows, vw, batch});
+    GuardedDeviceBuffer device_pos_vw(static_cast<std::size_t>(vw * batch) * sizeof(std::int32_t));
+    Tensor positions_vw(device_pos_vw.data(), DType::I32, {vw, batch});
+    try {
+        ops::prepare_ragged_prefix(pool_ceil, lanes_tensor, starts_tensor, ends_tensor,
+                                   gathered_vw, positions_vw, counts, nullptr);
+    } catch (const std::invalid_argument&) { threw = true; }
+    failures += threw ? 0 : 1;
+    if (!threw) {
+        std::cerr << "FAIL: prepare_ragged_prefix accepted W_ceil source into W(k) dest\n";
+    }
+
+    GuardedDeviceBuffer device_compact(static_cast<std::size_t>(rows * vw * batch) *
+                                       sizeof(std::uint16_t));
+    device_compact.fill(0xcd);
+    Tensor compact(device_compact.data(), DType::BF16, {rows, vw, batch});
+    const std::size_t elem     = sizeof(std::uint16_t);
+    const std::size_t live_row = static_cast<std::size_t>(rows) * static_cast<std::size_t>(vw) * elem;
+    cuda_check(cudaMemcpy2D(compact.data, static_cast<std::size_t>(compact.nb[2]), gathered.data,
+                            static_cast<std::size_t>(gathered.nb[2]), live_row,
+                            static_cast<std::size_t>(batch), cudaMemcpyDeviceToDevice),
+               "wide-to-narrow W_ceil pack");
+    cuda_synchronize();
+    std::vector<std::uint16_t> expected_compact(static_cast<std::size_t>(rows * vw * batch));
+    for (std::int32_t b = 0; b < batch; ++b) {
+        for (std::int32_t column = 0; column < vw; ++column) {
+            for (std::int32_t row = 0; row < rows; ++row) {
+                expected_compact[static_cast<std::size_t>((b * vw + column) * rows + row)] =
+                    expected_gathered[static_cast<std::size_t>((b * w_ceil + column) * rows + row)];
+            }
+        }
+    }
+    failures += verify_exact(
+        "pack W_ceil features down to W(k)",
+        from_device<std::uint16_t>(device_compact.data(), expected_compact.size()),
+        expected_compact);
+    failures += device_compact.verify_guards("pack W_ceil compact guards");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -200,6 +338,7 @@ int main() {
     failures += extract_case(10240, 6144, 4096, 6);
     failures += extract_case(8192, 2048, 2048, 1);
     failures += batch_prefix_case();
+    failures += pitched_live_width_case();
     std::cout << (failures ? "FAIL" : "OK") << " scatter and extract_bf16_columns\n";
     return failures ? 1 : 0;
 }

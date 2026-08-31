@@ -255,7 +255,9 @@ Json speculative_json(const GenerationMetrics& metrics) {
                 {"drafted_tokens", metrics.speculative_draft_tokens},
                 {"accepted_tokens", metrics.speculative_accepted_tokens},
                 {"fallback_steps", metrics.speculative_fallback_steps},
-                {"accepted_per_position", metrics.speculative_accepted_per_position}};
+                {"accepted_per_position", metrics.speculative_accepted_per_position},
+                {"live_draft_tokens", metrics.speculative_live_draft_tokens},
+                {"rounds_per_draft", metrics.speculative_rounds_per_draft}};
 }
 
 // Tokens/second with fixed precision, or "n/a" when the interval is degenerate.

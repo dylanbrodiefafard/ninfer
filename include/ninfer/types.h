@@ -107,6 +107,8 @@ struct SpeculativeOptions {
     ProposalHead proposal_head = ProposalHead::Full;
     // Packed/chain DFlash verify width. 0 selects the k-dependent default.
     std::uint32_t dflash_verify_width = 0;
+    // Startup-only: capture extra draft-K graphs and pick live K from host EWMA.
+    bool adaptive_draft = false;
 };
 
 struct LoadProgress {
@@ -452,6 +454,8 @@ struct SpeculativeStats {
     std::uint64_t accepted_tokens = 0;
     std::uint64_t fallback_steps  = 0;
     std::vector<std::uint64_t> accepted_per_position;
+    std::uint32_t live_draft_tokens = 0;         // last live K used this request
+    std::vector<std::uint64_t> rounds_per_draft; // index = K, size N+1
 };
 
 enum class PrefixReusePath : std::uint8_t {

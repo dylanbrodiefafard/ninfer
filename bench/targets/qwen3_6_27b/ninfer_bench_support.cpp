@@ -176,6 +176,13 @@ SpeculativeStats aggregate_speculative(const TestResult& result) {
         for (std::size_t i = 0; i < in.accepted_per_position.size(); ++i) {
             out.accepted_per_position[i] += in.accepted_per_position[i];
         }
+        out.live_draft_tokens = in.live_draft_tokens;
+        if (out.rounds_per_draft.size() < in.rounds_per_draft.size()) {
+            out.rounds_per_draft.resize(in.rounds_per_draft.size());
+        }
+        for (std::size_t i = 0; i < in.rounds_per_draft.size(); ++i) {
+            out.rounds_per_draft[i] += in.rounds_per_draft[i];
+        }
     }
     return out;
 }
@@ -224,6 +231,13 @@ void append_speculative_json(std::ostringstream& out, const SpeculativeStats& st
     for (std::size_t i = 0; i < stats.accepted_per_position.size(); ++i) {
         if (i != 0) { out << ", "; }
         out << stats.accepted_per_position[i];
+    }
+    out << "]\n";
+    out << ",\n" << indent << "  \"live_draft_tokens\": " << stats.live_draft_tokens;
+    out << ",\n" << indent << "  \"rounds_per_draft\": [";
+    for (std::size_t i = 0; i < stats.rounds_per_draft.size(); ++i) {
+        if (i != 0) { out << ", "; }
+        out << stats.rounds_per_draft[i];
     }
     out << "]\n" << indent << '}';
 }
@@ -293,6 +307,7 @@ std::string usage_text(std::string_view program) {
          << "                              the artifact to contain dflash/ objects\n"
          << "  --draft-tokens <0..15>    speculative draft window: mtp [0,5] (0 = none),\n"
          << "                              dflash [1,15] (default: 0)\n"
+         << "  --adaptive-draft            pick live K from host EWMA; requires --spec mtp|dflash\n"
          << "  --dflash-verify-width <2..16> DFlash packed verify width; 0 = k-dependent\n"
          << "                              default (dflash only)\n"
          << "  --lm-head-draft             use the optimized proposal head; requires --draft-tokens\n"
@@ -372,6 +387,8 @@ BenchOptions parse_args(int argc, char** argv) {
             if (options.draft_tokens > kMaxDFlashDraftTokens) {
                 throw std::invalid_argument("--draft-tokens must be in [0,15]");
             }
+        } else if (arg == "--adaptive-draft") {
+            options.adaptive_draft = true;
         } else if (arg == "--dflash-verify-width") {
             options.dflash_verify_width =
                 parse_u32(value("--dflash-verify-width"), "dflash-verify-width", true);
@@ -429,6 +446,9 @@ BenchOptions parse_args(int argc, char** argv) {
     if (options.proposal_head == ProposalHead::Optimized && options.draft_tokens == 0) {
         throw std::invalid_argument(
             "--lm-head-draft requires --draft-tokens greater than zero");
+    }
+    if (options.adaptive_draft && options.draft_tokens == 0) {
+        throw std::invalid_argument("--adaptive-draft requires --spec mtp|dflash and --draft-tokens");
     }
     return options;
 }

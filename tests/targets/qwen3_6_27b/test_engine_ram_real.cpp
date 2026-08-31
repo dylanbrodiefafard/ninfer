@@ -108,8 +108,9 @@ ninfer::EngineOptions pooled_c3_options(const char* artifact) {
 ninfer::EngineOptions mtp_options(const char* artifact) {
     ninfer::EngineOptions options     = ordinary_options(artifact, 1, 4096, kRamHitBytes);
     options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
-    options.speculative.draft_tokens  = 3;
+    options.speculative.draft_tokens  = 5;
     options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+    options.speculative.adaptive_draft = true;
     return options;
 }
 
@@ -1218,6 +1219,12 @@ int exercise_mtp(const char* artifact) {
     if (source.generated_token_ids.size() != 8) {
         return fail("MTP suffix source did not complete");
     }
+    if (source.speculative.draft_window != 5 || source.speculative.rounds_per_draft.size() < 5 ||
+        source.speculative.rounds_per_draft[4] == 0) {
+        std::cerr << "MTP adaptive source live_k=" << source.speculative.live_draft_tokens
+                  << " window=" << source.speculative.draft_window << '\n';
+        return fail("MTP adaptive source did not record seeded k=4 rounds");
+    }
     const std::vector<ninfer::TokenId> history = resume_prefix(keep, source.generated_token_ids);
     const std::vector<ninfer::TokenId> continued = concat(history, {198, 198, 198, 198});
     const ninfer::GenerationResult vram =
@@ -1250,6 +1257,9 @@ int exercise_mtp(const char* artifact) {
     }
     if (hit.generated_token_ids != vram.generated_token_ids) {
         return fail("MTP suffix RAM reuse changed greedy output");
+    }
+    if (hit.speculative.draft_window != 5 || vram.speculative.draft_window != 5) {
+        return fail("MTP RAM/VRAM restore leaked live_k off the seeded attractor");
     }
     return 0;
 }

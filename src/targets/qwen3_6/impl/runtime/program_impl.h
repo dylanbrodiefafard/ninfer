@@ -85,11 +85,12 @@ schedule::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier, std::uint
 }
 
 DecodeGraphProfile& select_graph_profile(DecodeGraphFamily& family, std::uint32_t batch_size,
-                                         std::uint32_t frontier, const char* label) {
+                                         std::uint32_t frontier, const char* label,
+                                         std::uint32_t draft_k = 0) {
     const auto it = std::find_if(
         family.profiles.begin(), family.profiles.end(), [&](const DecodeGraphProfile& profile) {
             return profile.batch_size == batch_size && profile.min_execution_frontier <= frontier &&
-                   frontier <= profile.max_execution_frontier;
+                   frontier <= profile.max_execution_frontier && profile.draft_k == draft_k;
         });
     if (it == family.profiles.end()) {
         throw std::logic_error(std::string(label) + " CUDA Graph coverage is incomplete");
@@ -203,6 +204,16 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     : model(model_in), device(device_in), capacity(plan.capacity), kv_capacity(plan.kv_capacity),
       max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
       draft_window(plan.draft_window), dflash_verify_width(plan.dflash_verify_width),
+      adaptive_draft(plan.adaptive_draft), captured_ks(plan.captured_ks),
+      adaptive_round_time([&] {
+          std::vector<float> times(16, 0.0f);
+          for (const std::uint32_t k : plan.captured_ks) {
+              if (k < times.size()) {
+                  times[k] = Variant::adaptive_draft_round_time(plan.speculative_backend, k);
+              }
+          }
+          return times;
+      }()),
       speculative_backend(plan.speculative_backend),
       context_marks(plan.context_checkpoint_marks),
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
@@ -880,10 +891,10 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
             // every non-tree DFlash commit fold no GDN columns at all.
             .path_length       = -1,
         };
-        const bool tree_fold = speculative_backend == SpeculativeBackend::DFlash &&
-                               dflash_uses_tree_verify(draft_window, dflash_verify_width);
+        const bool tree_fold = pending.tree_verify;
         if (tree_fold && committed > 0) {
             fold_rows[row].path_length = static_cast<std::int32_t>(committed);
+            // LLD Capture/run: host fold_path stays packed at row * W_ceil + i.
             for (std::uint32_t i = 0; i < committed; ++i) {
                 fold_rows[row].path[i] = dflash_host_egress->fold_path
                     [row * dflash_verify_width + i];
@@ -936,7 +947,12 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
         }
 
         if (speculative_backend == SpeculativeBackend::DFlash && io.dflash_decode) {
-            if (dflash_uses_tree_verify(draft_window, dflash_verify_width)) {
+            // LLD PendingCandidate: tree vs chain from this round's pending, not Program N.
+            bool tree_fold_batch = false;
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                tree_fold_batch = tree_fold_batch || requests[lanes[row]].pending.tree_verify;
+            }
+            if (tree_fold_batch) {
                 qwen3_6::DFlashDecodeState& frame = *io.dflash_decode;
                 const auto batch = static_cast<std::int32_t>(lanes.size());
                 Tensor compact_counts = frame.append_counts.slice(0, 0, batch);
@@ -1835,6 +1851,7 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.rewrite_checkpoint      = {};
     clear_context_checkpoints(sequence);
     request.pending                  = {};
+    request.adaptive                 = {};
 }
 
 qwen3_6::PagedKVCache* ProgramImplCore::backend_kv_cache() noexcept {
@@ -2232,80 +2249,123 @@ void ProgramImplCore::prepare_graphs() {
     }
 
     if (speculative_backend == SpeculativeBackend::Mtp) {
-        const auto planned_profiles = mtp_graph_profiles(capacity, draft_window);
-        validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
+        std::uint32_t max_planned = 0;
+        for (const std::uint32_t k : captured_ks) {
+            const auto planned_profiles = mtp_graph_profiles(capacity, k);
+            validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
+            for (const GraphExecutionProfile planned : planned_profiles) {
+                max_planned = std::max(max_planned, planned.topology_class);
+            }
+        }
+        const std::uint32_t k_stride = qwen3_6::adaptive_k_stride(max_concurrency, max_planned);
+        const std::uint32_t warm_k =
+            captured_ks.empty() ? draft_window : captured_ks.back();
         schedule::MtpBatchContext mtp_state{
             execution_core(),  decoder->text_kv, *decoder->mtp_cache(), *io.mtp_decode,
             *mtp_host_ingress, *mtp_host_egress, tail_hidden_store};
-        const GraphExecutionProfile code_warm = planned_profiles.front();
+        const auto warm_profiles = mtp_graph_profiles(capacity, warm_k);
+        const GraphExecutionProfile code_warm = warm_profiles.front();
         prepare_representative(code_warm.min, 1);
         device.synchronize();
-        schedule::mtp_decode_batch(mtp_state, 1, draft_window,
-                                   mtp_gqa_envelopes(code_warm.max, draft_window, capacity),
+        schedule::mtp_decode_batch(mtp_state, 1, warm_k,
+                                   mtp_gqa_envelopes(code_warm.max, warm_k, capacity),
                                    nullptr);
         device.synchronize();
 
-        mtp_graphs.profiles.reserve(planned_profiles.size() * max_concurrency);
-        for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
-            for (const GraphExecutionProfile planned : planned_profiles) {
-                mtp_graphs.profiles.emplace_back();
-                DecodeGraphProfile& profile    = mtp_graphs.profiles.back();
-                profile.batch_size             = batch_size;
-                profile.min_execution_frontier = planned.min;
-                profile.max_execution_frontier = planned.max;
-                profile.topology_class =
-                    planned.topology_class * max_concurrency + (batch_size - 1U);
-                schedule::capture_mtp_decode_batch(
-                    mtp_state, static_cast<std::int32_t>(batch_size), draft_window,
-                    mtp_gqa_envelopes(planned.max, draft_window, capacity), profile.definition);
+        std::size_t profile_count = 0;
+        for (const std::uint32_t k : captured_ks) {
+            profile_count += mtp_graph_profiles(capacity, k).size() * max_concurrency;
+        }
+        mtp_graphs.profiles.reserve(profile_count);
+        for (std::uint32_t k_index = 0; k_index < captured_ks.size(); ++k_index) {
+            const std::uint32_t k           = captured_ks[k_index];
+            const auto planned_profiles     = mtp_graph_profiles(capacity, k);
+            for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
+                for (const GraphExecutionProfile planned : planned_profiles) {
+                    mtp_graphs.profiles.emplace_back();
+                    DecodeGraphProfile& profile    = mtp_graphs.profiles.back();
+                    profile.batch_size             = batch_size;
+                    profile.min_execution_frontier = planned.min;
+                    profile.max_execution_frontier = planned.max;
+                    profile.draft_k                = k;
+                    profile.verify_width           = k + 1U;
+                    profile.topology_class         = qwen3_6::adaptive_topology_class(
+                        k_index, k_stride, planned.topology_class, max_concurrency, batch_size);
+                    schedule::capture_mtp_decode_batch(
+                        mtp_state, static_cast<std::int32_t>(batch_size), k,
+                        mtp_gqa_envelopes(planned.max, k, capacity), profile.definition);
+                }
             }
         }
     }
     if (speculative_backend == SpeculativeBackend::DFlash) {
-        const auto batch_one_profiles =
-            dflash_graph_profiles(capacity, draft_window, 1, dflash_verify_width);
-        validate_graph_profiles(batch_one_profiles, capacity - 1, "DFlash");
+        std::uint32_t max_planned = 0;
+        for (const std::uint32_t k : captured_ks) {
+            const std::uint32_t wk = dflash_captured_verify_width(k, dflash_verify_width);
+            for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
+                const auto planned_profiles =
+                    dflash_graph_profiles(capacity, k, batch_size, wk);
+                if (batch_size == 1) {
+                    validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
+                }
+                for (const GraphExecutionProfile planned : planned_profiles) {
+                    max_planned = std::max(max_planned, planned.topology_class);
+                }
+            }
+        }
+        const std::uint32_t k_stride = qwen3_6::adaptive_k_stride(max_concurrency, max_planned);
+        const std::uint32_t warm_k =
+            captured_ks.empty() ? draft_window : captured_ks.back();
+        const std::uint32_t warm_w = dflash_captured_verify_width(warm_k, dflash_verify_width);
         schedule::DFlashBatchContext dflash_state{
             execution_core(),     decoder->text_kv,    *dflash,          *io.dflash_decode,
             *dflash_host_ingress, *dflash_host_egress, tail_hidden_store};
+        const auto batch_one_profiles = dflash_graph_profiles(capacity, warm_k, 1, warm_w);
         const GraphExecutionProfile code_warm = batch_one_profiles.front();
         const ops::GqaExecutionEnvelope code_warm_target{
             1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                   capacity, static_cast<std::uint64_t>(code_warm.max) +
-                                 dflash_verify_width))};
+                   capacity, static_cast<std::uint64_t>(code_warm.max) + warm_w))};
         prepare_representative(code_warm.min, 1);
         device.synchronize();
-        schedule::dflash_decode_batch(dflash_state, 1, draft_window, dflash_verify_width,
-                                      dflash_envelopes(code_warm.min, code_warm.max, draft_window),
+        schedule::dflash_decode_batch(dflash_state, 1, warm_k, warm_w,
+                                      dflash_envelopes(code_warm.min, code_warm.max, warm_k),
                                       code_warm_target, nullptr);
         device.synchronize();
 
-        dflash_graphs.profiles.reserve(batch_one_profiles.size() * max_concurrency);
-        for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
-            const auto planned_profiles =
-                batch_size == 1 ? batch_one_profiles
-                                : dflash_graph_profiles(capacity, draft_window, batch_size,
-                                                         dflash_verify_width);
-            validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
-            for (const GraphExecutionProfile planned : planned_profiles) {
-                dflash_graphs.profiles.emplace_back();
-                DecodeGraphProfile& profile    = dflash_graphs.profiles.back();
-                profile.batch_size             = batch_size;
-                profile.min_execution_frontier = planned.min;
-                profile.max_execution_frontier = planned.max;
-                profile.topology_class =
-                    planned.topology_class * max_concurrency + (batch_size - 1U);
-                const ops::GqaExecutionEnvelope target_envelope{
-                    1,
-                    static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                        capacity, static_cast<std::uint64_t>(planned.max) +
-                                      dflash_verify_width))};
-                prepare_representative(planned.min, batch_size);
-                device.synchronize();
-                schedule::capture_dflash_decode_batch(
-                    dflash_state, static_cast<std::int32_t>(batch_size), draft_window,
-                    dflash_verify_width, dflash_envelopes(planned.min, planned.max, draft_window),
-                    target_envelope, profile.definition);
+        std::size_t dflash_profile_count = 0;
+        for (const std::uint32_t k : captured_ks) {
+            const std::uint32_t wk = dflash_captured_verify_width(k, dflash_verify_width);
+            dflash_profile_count +=
+                dflash_graph_profiles(capacity, k, 1, wk).size() * max_concurrency;
+        }
+        dflash_graphs.profiles.reserve(dflash_profile_count);
+        for (std::uint32_t k_index = 0; k_index < captured_ks.size(); ++k_index) {
+            const std::uint32_t k  = captured_ks[k_index];
+            const std::uint32_t wk = dflash_captured_verify_width(k, dflash_verify_width);
+            for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
+                const auto planned_profiles =
+                    dflash_graph_profiles(capacity, k, batch_size, wk);
+                validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
+                for (const GraphExecutionProfile planned : planned_profiles) {
+                    dflash_graphs.profiles.emplace_back();
+                    DecodeGraphProfile& profile    = dflash_graphs.profiles.back();
+                    profile.batch_size             = batch_size;
+                    profile.min_execution_frontier = planned.min;
+                    profile.max_execution_frontier = planned.max;
+                    profile.draft_k                = k;
+                    profile.verify_width           = wk;
+                    profile.topology_class         = qwen3_6::adaptive_topology_class(
+                        k_index, k_stride, planned.topology_class, max_concurrency, batch_size);
+                    const ops::GqaExecutionEnvelope target_envelope{
+                        1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                               capacity, static_cast<std::uint64_t>(planned.max) + wk))};
+                    prepare_representative(planned.min, batch_size);
+                    device.synchronize();
+                    schedule::capture_dflash_decode_batch(
+                        dflash_state, static_cast<std::int32_t>(batch_size), k, wk,
+                        dflash_envelopes(planned.min, planned.max, k), target_envelope,
+                        profile.definition);
+                }
             }
         }
     }
@@ -2376,7 +2436,10 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
         .enabled               = speculative_backend != SpeculativeBackend::None,
         .draft_window          = draft_window,
         .accepted_per_position = std::vector<std::uint64_t>(draft_window, 0),
+        .rounds_per_draft      = std::vector<std::uint64_t>(draft_window + 1U, 0),
     };
+    qwen3_6::seed_adaptive_draft_state(
+        request.adaptive, qwen3_6::adaptive_seed_k(captured_ks, speculative_backend));
     const bool penalties = request.sampling_host.presence_penalty != 0.0F ||
                            request.sampling_host.frequency_penalty != 0.0F;
     request.sampling_host.token_counts =
@@ -2897,6 +2960,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
     const std::uint32_t width      = draft_window + 1;
     std::uint32_t maximum_frontier = 0;
+    std::array<std::uint32_t, kMaximumConcurrency> row_ks{};
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
         if (lane >= max_concurrency ||
@@ -2918,18 +2982,40 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             throw std::logic_error("MTP batch row is not decode-ready");
         }
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
+        const std::uint32_t desired =
+            adaptive_draft ? request.adaptive.live_k : draft_window;
+        const std::uint32_t budget_extent = budgets[row].generated_tokens_remaining > 1
+                                                ? budgets[row].generated_tokens_remaining - 1
+                                                : 0;
+        const std::uint32_t cap_extent =
+            capacity > sequence.execution_frontier + 1
+                ? capacity - sequence.execution_frontier - 1
+                : 0;
+        row_ks[row] = std::min({desired, budget_extent, cap_extent});
     }
+    std::array<const qwen3_6::AdaptiveDraftState*, kMaximumConcurrency> row_states{};
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        row_states[row] = &requests[lanes[row]].adaptive;
+    }
+    const std::uint32_t batch_k =
+        adaptive_draft && lanes.size() > 1
+            ? qwen3_6::adaptive_batch_k_sum_score(
+                  std::span<const qwen3_6::AdaptiveDraftState* const>(row_states.data(),
+                                                                      lanes.size()),
+                  std::span<const std::uint32_t>(row_ks.data(), lanes.size()), captured_ks,
+                  std::span<const float>(qwen3_6::kAdaptiveMtpC2T))
+            : qwen3_6::adaptive_batch_k(
+                  std::span<const std::uint32_t>(row_ks.data(), lanes.size()), captured_ks);
 
     try {
         DecodeGraphExecutable* executable = nullptr;
-        schedule::MtpGqaEnvelopes envelopes =
-            mtp_gqa_envelopes(maximum_frontier, draft_window, capacity);
+        schedule::MtpGqaEnvelopes envelopes = mtp_gqa_envelopes(maximum_frontier, batch_k, capacity);
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(mtp_graphs, static_cast<std::uint32_t>(lanes.size()),
-                                     maximum_frontier, "MTP batch");
+                                     maximum_frontier, "MTP batch", batch_k);
             executable = &install_graph_profile(mtp_graphs, profile, "MTP batch");
-            envelopes  = mtp_gqa_envelopes(profile.max_execution_frontier, draft_window, capacity);
+            envelopes  = mtp_gqa_envelopes(profile.max_execution_frontier, batch_k, capacity);
         }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -2940,7 +3026,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                     ? budgets[row].generated_tokens_remaining - 1
                                                     : 0;
             const std::uint32_t extent =
-                std::min({sequence.mtp_draft_count, draft_window, max_by_budget,
+                std::min({sequence.mtp_draft_count, batch_k, max_by_budget,
                           capacity - sequence.execution_frontier - 1});
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
@@ -2980,7 +3066,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         mark_workspace_usage(workspace_plan.mtp_round);
         const auto started = Clock::now();
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                   draft_window, envelopes, executable);
+                                   batch_k, envelopes, executable);
         const double seconds = synchronize_round_seconds(device, started);
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence       = sequences[lanes[row]];
@@ -3014,13 +3100,44 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                     request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
                         1;
                 }
+                if (batch_k < request.speculative_stats.rounds_per_draft.size()) {
+                    request.speculative_stats.rounds_per_draft[batch_k] += 1;
+                }
             }
+            if (adaptive_draft && pcur > 0) {
+                const std::uint32_t remaining_after =
+                    budgets[row].generated_tokens_remaining >
+                            static_cast<std::uint32_t>(count_i)
+                        ? budgets[row].generated_tokens_remaining -
+                              static_cast<std::uint32_t>(count_i)
+                        : 0;
+                const std::uint32_t next_budget =
+                    remaining_after > 1 ? remaining_after - 1 : 0;
+                const std::uint32_t next_cap =
+                    capacity > static_cast<std::uint32_t>(base_E) +
+                                    static_cast<std::uint32_t>(count_i) + 1
+                        ? capacity - (base_E + static_cast<std::uint32_t>(count_i)) - 1
+                        : 0;
+                const std::uint32_t budget_extent = std::min(next_budget, next_cap);
+                if (budget_extent > 0) {
+                    qwen3_6::AdaptiveDraftConfig cfg;
+                    cfg.captured_ks = captured_ks;
+                    cfg.round_time  = adaptive_round_time;
+                    (void)qwen3_6::adaptive_draft_next(cfg, request.adaptive,
+                                                 static_cast<std::uint32_t>(accepted_i), pcur,
+                                                 budget_extent, batch_k);
+                }
+            }
+            request.speculative_stats.live_draft_tokens = request.adaptive.live_k;
             request.pending = PendingCandidate{
                 .kind          = PendingKind::Speculative,
                 .base_E        = base_E,
                 .base_S        = base_S,
                 .prompt_tokens = 0,
                 .produced      = static_cast<std::uint32_t>(count_i),
+                .round_k       = batch_k,
+                .verify_width  = batch_k + 1U,
+                .tree_verify   = false,
             };
             request.lifecycle = Lifecycle::Pending;
             request.timings.decode_seconds += seconds;
@@ -3054,7 +3171,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
 
     const std::uint32_t width           = dflash_verify_width;
     std::uint32_t maximum_frontier      = 0;
-    std::uint32_t maximum_target_tokens = 1;
+    std::array<std::uint32_t, kMaximumConcurrency> row_ks{};
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
         if (lane >= max_concurrency ||
@@ -3079,32 +3196,53 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             sequence.prefix_identity.size() != sequence.ledger_frontier) {
             throw std::logic_error("DFlash batch row is not decode-ready");
         }
-        const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
+        maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
+        const std::uint32_t desired =
+            adaptive_draft ? request.adaptive.live_k : draft_window;
+        const std::uint32_t budget_extent = budgets[row].generated_tokens_remaining > 1
                                                 ? budgets[row].generated_tokens_remaining - 1U
                                                 : 0U;
-        const std::uint32_t extent =
-            std::min({draft_window, max_by_budget, capacity - sequence.execution_frontier - 1U});
-        maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
+        const std::uint32_t cap_extent =
+            capacity > sequence.execution_frontier + 1
+                ? capacity - sequence.execution_frontier - 1U
+                : 0U;
+        row_ks[row] = std::min({desired, budget_extent, cap_extent});
+    }
+    std::array<const qwen3_6::AdaptiveDraftState*, kMaximumConcurrency> dflash_row_states{};
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        dflash_row_states[row] = &requests[lanes[row]].adaptive;
+    }
+    const std::uint32_t batch_k =
+        adaptive_draft && lanes.size() > 1
+            ? qwen3_6::adaptive_batch_k_sum_score(
+                  std::span<const qwen3_6::AdaptiveDraftState* const>(dflash_row_states.data(),
+                                                                      lanes.size()),
+                  std::span<const std::uint32_t>(row_ks.data(), lanes.size()), captured_ks,
+                  qwen3_6::adaptive_dflash_round_time(static_cast<std::uint32_t>(lanes.size())))
+            : qwen3_6::adaptive_batch_k(
+                  std::span<const std::uint32_t>(row_ks.data(), lanes.size()), captured_ks);
+    const std::uint32_t live_w = dflash_captured_verify_width(batch_k, dflash_verify_width);
+    std::uint32_t maximum_target_tokens = 1;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
         maximum_target_tokens =
-            std::max(maximum_target_tokens,
-                     sequence.execution_frontier + dflash_verify_width);
+            std::max(maximum_target_tokens, sequences[lanes[row]].execution_frontier + live_w);
     }
 
     try {
         DecodeGraphExecutable* executable   = nullptr;
-        schedule::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier, draft_window);
+        schedule::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier, batch_k);
         ops::GqaExecutionEnvelope target_envelope{maximum_frontier + 1, maximum_target_tokens};
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(dflash_graphs, static_cast<std::uint32_t>(lanes.size()),
-                                     maximum_frontier, "DFlash batch");
+                                     maximum_frontier, "DFlash batch", batch_k);
             executable      = &install_graph_profile(dflash_graphs, profile, "DFlash batch");
             envelopes       = dflash_envelopes(profile.min_execution_frontier,
-                                               profile.max_execution_frontier, draft_window);
+                                               profile.max_execution_frontier, batch_k);
             target_envelope = {
                 1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
                        capacity, static_cast<std::uint64_t>(profile.max_execution_frontier) +
-                                     dflash_verify_width))};
+                                     live_w))};
         }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -3115,7 +3253,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                     ? budgets[row].generated_tokens_remaining - 1U
                                                     : 0U;
             const std::uint32_t extent =
-                std::min({draft_window, max_by_budget, capacity - frontier - 1U});
+                std::min({batch_k, max_by_budget, capacity - frontier - 1U});
             if (row == 0) { *dflash_host_ingress = {}; }
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
             dflash_host_ingress->execution_frontiers[row] =
@@ -3150,8 +3288,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         mark_workspace_usage(workspace_plan.dflash_round);
         const auto started = Clock::now();
         schedule::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                      draft_window, dflash_verify_width, envelopes, target_envelope,
-                                      executable);
+                                      batch_k, live_w, envelopes, target_envelope, executable);
         const double seconds = synchronize_round_seconds(device, started);
         if (ninfer::targets::qwen3_6::detail::dflash_candidate_stats_enabled() &&
             io.dflash_decode.has_value()) {
@@ -3205,7 +3342,36 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                     request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
                         1;
                 }
+                if (batch_k < request.speculative_stats.rounds_per_draft.size()) {
+                    request.speculative_stats.rounds_per_draft[batch_k] += 1;
+                }
             }
+            if (adaptive_draft && extent > 0) {
+                const std::uint32_t remaining_after =
+                    budgets[row].generated_tokens_remaining >
+                            static_cast<std::uint32_t>(count_i)
+                        ? budgets[row].generated_tokens_remaining -
+                              static_cast<std::uint32_t>(count_i)
+                        : 0;
+                const std::uint32_t next_budget =
+                    remaining_after > 1 ? remaining_after - 1 : 0;
+                const std::uint32_t next_cap =
+                    capacity > base_E + static_cast<std::uint32_t>(count_i) + 1
+                        ? capacity - (base_E + static_cast<std::uint32_t>(count_i)) - 1
+                        : 0;
+                const std::uint32_t budget_extent = std::min(next_budget, next_cap);
+                if (budget_extent > 0) {
+                    qwen3_6::AdaptiveDraftConfig cfg;
+                    cfg.captured_ks         = captured_ks;
+                    cfg.round_time          = adaptive_round_time;
+                    cfg.first_remove_warmup = qwen3_6::kAdaptiveDflashFirstRemoveWarmup;
+                    cfg.drop_to_3_max       = qwen3_6::kAdaptiveDropTo3Max;
+                    (void)qwen3_6::adaptive_draft_next(cfg, request.adaptive,
+                                                 static_cast<std::uint32_t>(accepted_i), extent,
+                                                 budget_extent, batch_k);
+                }
+            }
+            request.speculative_stats.live_draft_tokens = request.adaptive.live_k;
             sequence.dflash_context_frontier = base_E;
             request.pending                  = PendingCandidate{
                                  .kind          = PendingKind::Speculative,
@@ -3213,6 +3379,9 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                  .base_S        = base_S,
                                  .prompt_tokens = 0,
                                  .produced      = static_cast<std::uint32_t>(count_i),
+                                 .round_k       = batch_k,
+                                 .verify_width  = live_w,
+                                 .tree_verify   = dflash_uses_tree_verify(batch_k, live_w),
             };
             request.lifecycle = Lifecycle::Pending;
             request.timings.decode_seconds += seconds;

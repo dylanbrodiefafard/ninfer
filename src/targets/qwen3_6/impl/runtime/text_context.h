@@ -219,12 +219,13 @@ public:
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_slots,
                              ops::GqaExecutionEnvelope envelope, Tensor& hidden, Tensor& logits,
-                             Tensor& target_tokens);
+                             Tensor& target_tokens, bool reset_workspace = true);
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_slots,
                              ops::GqaExecutionEnvelope envelope, Tensor& hidden, Tensor& logits,
-                             Tensor& target_tokens, DFlashFeatureSink& sink);
+                             Tensor& target_tokens, DFlashFeatureSink& sink,
+                             bool reset_workspace = true);
     void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
                                   const Tensor& cache_positions, const Tensor& rope_positions,
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
@@ -257,7 +258,8 @@ private:
                                   const Tensor& rope_positions, const Tensor& valid_columns,
                                   const Tensor& kv_table_rows, const Tensor& linear_state_slots,
                                   ops::GqaExecutionEnvelope envelope, Tensor& hidden,
-                                  Tensor& logits, Tensor& target_tokens, Tap& tap);
+                                  Tensor& logits, Tensor& target_tokens, Tap& tap,
+                                  bool reset_workspace);
 
     void mtp_forward_stem(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
                           Tensor& x, Tensor& ah);

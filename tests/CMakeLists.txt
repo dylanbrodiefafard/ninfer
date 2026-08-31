@@ -122,6 +122,11 @@ ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
   LIBRARIES ninfer_engine ninfer_core)
 target_include_directories(ninfer_qwen3_6_runtime_mechanisms_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+ninfer_add_test(ninfer_qwen3_6_adaptive_draft_test
+  SOURCES targets/qwen3_6/test_adaptive_draft.cpp)
+target_include_directories(ninfer_qwen3_6_adaptive_draft_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 ninfer_add_test(ninfer_qwen3_6_score_index_test
   SOURCES targets/qwen3_6/test_score_index.cpp)
 ninfer_add_test(ninfer_qwen3_6_27b_prefix_real_test

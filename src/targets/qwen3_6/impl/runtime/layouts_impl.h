@@ -1,3 +1,4 @@
+#include "targets/qwen3_6/impl/runtime/adaptive_draft.h"
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
@@ -259,8 +260,17 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto verify        = drafts + 1;
     const auto dflash_verify = static_cast<std::int32_t>(
         plan.features.dflash() ? plan.dflash_verify_width : plan.draft_window + 1U);
-    const bool dflash_tree   = plan.features.dflash() &&
-                             dflash_uses_tree_verify(plan.draft_window, plan.dflash_verify_width);
+    bool dflash_tree = false;
+    if (plan.features.dflash()) {
+        for (const std::uint32_t k : plan.captured_ks) {
+            const std::uint32_t wk =
+                dflash_captured_verify_width(k, plan.dflash_verify_width);
+            dflash_tree = dflash_tree || dflash_uses_tree_verify(k, wk);
+        }
+        if (plan.captured_ks.empty()) {
+            dflash_tree = dflash_uses_tree_verify(plan.draft_window, plan.dflash_verify_width);
+        }
+    }
     const ops::GqaExecutionEnvelope text_envelope{1, plan.capacity};
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
@@ -317,6 +327,17 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 // Nested: gdn_mix scopes the fold alloc before gdn_normalized_output.
                 scratch(layout, ops::gated_delta_net_replay_record_workspace_capacity_bytes(
                                     TextConfig::gdn_value_heads, batch_size, max_width));
+            }
+            if (plan.adaptive_draft) {
+                (void)layout.alloc(DType::BF16,
+                                   {TextConfig::convolution_dim, max_width, batch_size});
+                (void)layout.alloc(DType::BF16, {TextConfig::gdn_key_head_dim,
+                                                 TextConfig::gdn_key_heads, max_width, batch_size});
+                (void)layout.alloc(DType::BF16,
+                                   {TextConfig::gdn_value_head_dim, TextConfig::gdn_value_heads,
+                                    max_width, batch_size});
+                (void)layout.alloc(DType::FP32,
+                                   {2, TextConfig::gdn_value_heads, max_width, batch_size});
             }
         }
         if (path == GdnWorkspacePath::Prefill) {
@@ -488,8 +509,53 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             const std::size_t batch_accept =
                 ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
                     TextConfig::token_domain, drafts, drafts, batch, batch);
-            out.mtp_round = std::max({out.mtp_round, finish(target), finish(alignment), finish(ar),
-                                      finish(proposal), batch_accept});
+            const std::size_t mtp_peak = std::max(
+                {out.mtp_round, finish(target), finish(alignment), finish(ar), finish(proposal),
+                 batch_accept});
+            out.mtp_round = mtp_peak;
+            if (plan.adaptive_draft) {
+                std::size_t panel_bytes = 0;
+                for (const std::uint32_t k : plan.captured_ks) {
+                    if (k == 0 || k >= plan.draft_window) { continue; }
+                    const std::int32_t wk        = static_cast<std::int32_t>(k) + 1;
+                    const std::int32_t compact_t = batch * wk;
+                    WorkspaceLayoutBuilder panels;
+                    matrix(panels, DType::I32, static_cast<std::int32_t>(k), batch);
+                    matrix(panels, DType::I32, wk, batch);
+                    matrix(panels, DType::I32, wk, batch);
+                    matrix(panels, DType::I32, wk, batch);
+                    matrix(panels, DType::I32, wk, batch);
+                    matrix(panels, DType::I32, wk, batch);
+                    matrix(panels, DType::I32, wk, batch);
+                    matrix(panels, DType::BF16, TextConfig::hidden, compact_t);
+                    matrix(panels, DType::BF16, TextConfig::output_rows, compact_t);
+                    matrix(panels, DType::BF16, TextConfig::hidden, compact_t);
+                    panel_bytes = std::max(panel_bytes, finish(panels));
+                    WorkspaceLayoutBuilder compact;
+                    matrix(compact, DType::I32, static_cast<std::int32_t>(k), batch);
+                    matrix(compact, DType::I32, wk, batch);
+                    matrix(compact, DType::I32, wk, batch);
+                    matrix(compact, DType::I32, wk, batch);
+                    matrix(compact, DType::I32, wk, batch);
+                    matrix(compact, DType::I32, wk, batch);
+                    matrix(compact, DType::I32, wk, batch);
+                    matrix(compact, DType::BF16, TextConfig::hidden, compact_t);
+                    matrix(compact, DType::BF16, TextConfig::output_rows, compact_t);
+                    matrix(compact, DType::BF16, TextConfig::hidden, compact_t);
+                    target_body(compact, compact_t, compact_t, qwen3_6::TextPhase::Verify,
+                                GdnWorkspacePath::ReplayRecord, batch, wk, wk, text_envelope);
+                    scratch(compact,
+                            ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+                                TextConfig::token_domain, static_cast<std::int32_t>(k),
+                                static_cast<std::int32_t>(k), batch, batch));
+                    out.mtp_round = std::max(out.mtp_round, finish(compact));
+                }
+                // Compact panels stay live under nested mtp_forward (LLD Capture/run).
+                if (panel_bytes != 0) {
+                    out.mtp_round = std::max(
+                        out.mtp_round, checked_add(mtp_peak, panel_bytes, "adaptive MTP compact"));
+                }
+            }
         }
     }
 
@@ -719,8 +785,64 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                         TextConfig::token_domain, dflash_verify, dflash_verify, batch, batch);
                 const std::size_t accept   = std::max(chain_accept, tree_accept);
                 const std::size_t proposal = dflash_proposal_capacity(verify, batch);
-                out.dflash_round           = std::max({out.dflash_round, finish(target), accept,
-                                                       dflash_context_capacity(aggregate, true), proposal});
+                const std::size_t dflash_peak =
+                    std::max({out.dflash_round, finish(target), accept,
+                              dflash_context_capacity(aggregate, true), proposal});
+                out.dflash_round = dflash_peak;
+                if (plan.adaptive_draft) {
+                    std::size_t panel_bytes = 0;
+                    for (const std::uint32_t k : plan.captured_ks) {
+                        const auto wk = static_cast<std::int32_t>(
+                            dflash_captured_verify_width(k, plan.dflash_verify_width));
+                        if (wk >= dflash_verify) { continue; }
+                        const std::int32_t compact_t = wk * batch;
+                        WorkspaceLayoutBuilder extra;
+                        matrix(extra, DType::BF16, DFlashConfig::feature_rows, compact_t);
+                        matrix(extra, DType::I32, wk, batch);
+                        const std::size_t extra_bytes = finish(extra);
+                        out.dflash_round              = std::max(
+                            out.dflash_round,
+                            checked_add(dflash_peak, extra_bytes, "adaptive DFlash prefix compact"));
+                        WorkspaceLayoutBuilder panels;
+                        matrix(panels, DType::I32, static_cast<std::int32_t>(k), batch);
+                        matrix(panels, DType::I32, wk, batch);
+                        matrix(panels, DType::I32, wk, batch);
+                        matrix(panels, DType::I32, wk, batch);
+                        matrix(panels, DType::I32, wk, batch);
+                        matrix(panels, DType::I32, wk, batch);
+                        matrix(panels, DType::I32, wk, batch);
+                        matrix(panels, DType::I32, wk, batch);
+                        matrix(panels, DType::I32, wk, batch);
+                        matrix(panels, DType::BF16, TextConfig::hidden, compact_t);
+                        matrix(panels, DType::BF16, TextConfig::output_rows, compact_t);
+                        panel_bytes = std::max(panel_bytes, finish(panels));
+                        WorkspaceLayoutBuilder compact;
+                        matrix(compact, DType::I32, static_cast<std::int32_t>(k), batch);
+                        matrix(compact, DType::I32, wk, batch);
+                        matrix(compact, DType::I32, wk, batch);
+                        matrix(compact, DType::I32, wk, batch);
+                        matrix(compact, DType::I32, wk, batch);
+                        matrix(compact, DType::I32, wk, batch);
+                        matrix(compact, DType::I32, wk, batch);
+                        matrix(compact, DType::I32, wk, batch);
+                        matrix(compact, DType::I32, wk, batch);
+                        matrix(compact, DType::BF16, TextConfig::hidden, compact_t);
+                        matrix(compact, DType::BF16, TextConfig::output_rows, compact_t);
+                        target_body(compact, compact_t, compact_t, qwen3_6::TextPhase::Verify,
+                                    GdnWorkspacePath::ReplayRecord, batch, wk, wk, text_envelope,
+                                    dflash_uses_tree_verify(k, static_cast<std::uint32_t>(wk)));
+                        scratch(compact,
+                                ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+                                    TextConfig::token_domain, static_cast<std::int32_t>(k),
+                                    static_cast<std::int32_t>(k), batch, batch));
+                        out.dflash_round = std::max(out.dflash_round, finish(compact));
+                    }
+                    if (panel_bytes != 0) {
+                        out.dflash_round = std::max(
+                            out.dflash_round,
+                            checked_add(dflash_peak, panel_bytes, "adaptive DFlash compact"));
+                    }
+                }
             }
         }
     }
@@ -808,6 +930,10 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         }
         break;
     }
+    if (options.speculative.adaptive_draft &&
+        options.speculative.backend == SpeculativeBackend::None) {
+        throw std::invalid_argument("--adaptive-draft requires MTP or DFlash");
+    }
     if (device.sm() != 120) {
         throw std::invalid_argument("Qwen3.6 family runtime requires compute capability 12.0");
     }
@@ -835,9 +961,14 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->max_concurrency     = inputs.max_concurrency;
     impl->prefill_chunk       = inputs.prefill_chunk;
     impl->draft_window        = inputs.draft_window;
+    impl->adaptive_draft      = inputs.adaptive_draft;
+    impl->captured_ks =
+        qwen3_6::adaptive_draft_ks(inputs.speculative_backend, inputs.draft_window,
+                                   inputs.adaptive_draft);
     impl->dflash_verify_width =
         inputs.speculative_backend == SpeculativeBackend::DFlash
-            ? dflash_verify_width(inputs.draft_window, inputs.dflash_verify_width)
+            ? dflash_storage_verify_width(impl->captured_ks, inputs.draft_window,
+                                          inputs.dflash_verify_width)
             : 0U;
     impl->speculative_backend = inputs.speculative_backend;
     impl->proposal_head       = inputs.proposal_head;
@@ -861,39 +992,94 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             schedule::VisionContext::output_transient_bytes(merged);
     }
     if (impl->use_cuda_graph) {
-        // Allowance is per instantiated executable, not per context-bucket definition. Program
-        // folds exact B into topology_class. Ordinary/MTP planned profiles share class 0, so this
-        // is 12 MiB × C. DFlash may instantiate several classes per B; those still use 64 MiB each.
+        // Allowance is per instantiated executable. K and B are folded into topology_class here
+        // (LLD Topology class) so graph_topology_allowance is not multiplied by C again.
         if (impl->speculative_backend == SpeculativeBackend::None) {
             impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
                                                       "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
-            // Same 12 MiB executable bound as ordinary decode. Context buckets share class 0.
-            const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
-            const std::size_t per_batch_allowance = graph_topology_allowance(
-                profiles, [&](GraphExecutionProfile) { return 12ULL * kMiB; },
-                "MTP graph allowance");
-            impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
-                                                      "MTP exact-b graph allowance");
-        } else {
-            const auto class_allowance = [&](std::uint32_t batch_size) {
+            std::uint32_t max_planned = 0;
+            for (const std::uint32_t k : impl->captured_ks) {
+                for (const GraphExecutionProfile profile :
+                     mtp_graph_profiles(impl->capacity, k)) {
+                    max_planned = std::max(max_planned, profile.topology_class);
+                }
+            }
+            const std::uint32_t k_stride =
+                qwen3_6::adaptive_k_stride(impl->max_concurrency, max_planned);
+            std::vector<GraphExecutionProfile> expanded;
+            for (std::uint32_t k_index = 0; k_index < impl->captured_ks.size(); ++k_index) {
                 const auto profiles =
-                    dflash_graph_profiles(impl->capacity, impl->draft_window, batch_size,
-                                          impl->dflash_verify_width);
-                return graph_topology_allowance(
-                    profiles,
-                    [&](GraphExecutionProfile profile) {
-                        const std::uint64_t final_visible = std::min<std::uint64_t>(
-                            impl->capacity, static_cast<std::uint64_t>(profile.max) +
-                                                impl->dflash_verify_width);
-                        return (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
-                    },
-                    "DFlash graph allowance");
-            };
-            for (std::uint32_t batch_size = 1; batch_size <= impl->max_concurrency; ++batch_size) {
-                impl->graph_allowance_bytes =
-                    checked_add(impl->graph_allowance_bytes, class_allowance(batch_size),
-                                "DFlash exact-b graph allowance");
+                    mtp_graph_profiles(impl->capacity, impl->captured_ks[k_index]);
+                for (std::uint32_t batch_size = 1; batch_size <= impl->max_concurrency;
+                     ++batch_size) {
+                    for (const GraphExecutionProfile planned : profiles) {
+                        GraphExecutionProfile folded = planned;
+                        folded.topology_class        = qwen3_6::adaptive_topology_class(
+                            k_index, k_stride, planned.topology_class, impl->max_concurrency,
+                            batch_size);
+                        expanded.push_back(folded);
+                    }
+                }
+            }
+            impl->graph_allowance_bytes = graph_topology_allowance(
+                expanded, [&](GraphExecutionProfile) { return 12ULL * kMiB; },
+                "MTP graph allowance");
+        } else {
+            std::uint32_t max_planned = 0;
+            for (const std::uint32_t k : impl->captured_ks) {
+                const std::uint32_t wk =
+                    dflash_captured_verify_width(k, impl->dflash_verify_width);
+                for (std::uint32_t batch_size = 1; batch_size <= impl->max_concurrency;
+                     ++batch_size) {
+                    for (const GraphExecutionProfile profile :
+                         dflash_graph_profiles(impl->capacity, k, batch_size, wk)) {
+                        max_planned = std::max(max_planned, profile.topology_class);
+                    }
+                }
+            }
+            const std::uint32_t k_stride =
+                qwen3_6::adaptive_k_stride(impl->max_concurrency, max_planned);
+            std::vector<GraphExecutionProfile> expanded;
+            std::vector<std::uint32_t> expanded_w;
+            for (std::uint32_t k_index = 0; k_index < impl->captured_ks.size(); ++k_index) {
+                const std::uint32_t k  = impl->captured_ks[k_index];
+                const std::uint32_t wk =
+                    dflash_captured_verify_width(k, impl->dflash_verify_width);
+                for (std::uint32_t batch_size = 1; batch_size <= impl->max_concurrency;
+                     ++batch_size) {
+                    const auto profiles =
+                        dflash_graph_profiles(impl->capacity, k, batch_size, wk);
+                    for (const GraphExecutionProfile planned : profiles) {
+                        GraphExecutionProfile folded = planned;
+                        folded.topology_class        = qwen3_6::adaptive_topology_class(
+                            k_index, k_stride, planned.topology_class, impl->max_concurrency,
+                            batch_size);
+                        expanded.push_back(folded);
+                        expanded_w.push_back(wk);
+                    }
+                }
+            }
+            std::vector<std::pair<std::uint32_t, std::size_t>> classes;
+            for (std::size_t i = 0; i < expanded.size(); ++i) {
+                const std::uint64_t final_visible = std::min<std::uint64_t>(
+                    impl->capacity,
+                    static_cast<std::uint64_t>(expanded[i].max) + expanded_w[i]);
+                const std::size_t allowance = (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
+                const auto existing =
+                    std::find_if(classes.begin(), classes.end(), [&](const auto& entry) {
+                        return entry.first == expanded[i].topology_class;
+                    });
+                if (existing == classes.end()) {
+                    classes.emplace_back(expanded[i].topology_class, allowance);
+                } else {
+                    existing->second = std::max(existing->second, allowance);
+                }
+            }
+            for (const auto& [topology_class, allowance] : classes) {
+                (void)topology_class;
+                impl->graph_allowance_bytes = checked_add(
+                    impl->graph_allowance_bytes, allowance, "DFlash exact-b graph allowance");
             }
         }
     }
@@ -920,6 +1106,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
         .dflash_verify_width = options.speculative.dflash_verify_width,
+        .adaptive_draft      = options.speculative.adaptive_draft,
         .speculative_backend = options.speculative.backend,
         .kv_dtype       = options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16
                         : options.kv_cache == KvCacheStorage::Nvfp4     ? DType::U8

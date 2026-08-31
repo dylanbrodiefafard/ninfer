@@ -321,15 +321,15 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     }
     static_assert(std::is_standard_layout_v<DFlashDecodeIngress>);
     static_assert(std::is_standard_layout_v<DFlashDecodeEgress>);
-    const auto batch          = static_cast<std::int32_t>(batch_capacity);
-    const auto drafts         = static_cast<std::int32_t>(draft_window);
-    const auto width          = layout.verify_ids.shape[0];
-    if (width < 2 || width > static_cast<std::int32_t>(kDFlashDecodeMaximumWidth) ||
-        drafts < 1 || drafts > width - 1) {
+    const auto batch = static_cast<std::int32_t>(batch_capacity);
+    const auto width = layout.verify_ids.shape[0];
+    // Frame tensors are W-wide. Adaptive storage ceil is max W(k) over captured K, so
+    // CLI N (draft_window) may exceed W-1 when live K is a chain subset of N.
+    if (width < 2 || width > static_cast<std::int32_t>(kDFlashDecodeMaximumWidth)) {
         throw std::invalid_argument(
-            "DFlash decode state verify width does not match the draft window");
+            "DFlash decode state verify width is outside the supported domain");
     }
-    (void)drafts;
+    (void)draft_window;
     ingress                   = layout.ingress.bind(backing);
     egress                    = layout.egress.bind(backing);
     const auto ingress_tensor = [&](std::size_t offset, DType dtype,

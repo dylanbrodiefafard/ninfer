@@ -8,7 +8,7 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
-                          ops::GqaExecutionEnvelope envelope) {
+                          ops::GqaExecutionEnvelope envelope, bool reset_workspace) {
     if (frame.replay_records == nullptr) {
         throw std::logic_error("speculative target verify has no ReplaySSM record storage");
     }
@@ -28,11 +28,12 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
         card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
                                  frame.valid_columns, frame.kv_table_rows, frame.lanes, envelope,
                                  frame.target_hidden, frame.target_logits, frame.target_tokens,
-                                 *frame.feature_sink);
+                                 *frame.feature_sink, reset_workspace);
     } else {
         card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
                                  frame.valid_columns, frame.kv_table_rows, frame.lanes, envelope,
-                                 frame.target_hidden, frame.target_logits, frame.target_tokens);
+                                 frame.target_hidden, frame.target_logits, frame.target_tokens,
+                                 reset_workspace);
     }
     if (tree) {
         ops::speculative_accept_tree_drafts(

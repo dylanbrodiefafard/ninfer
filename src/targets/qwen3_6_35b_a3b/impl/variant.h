@@ -42,6 +42,8 @@ struct Variant {
     [[nodiscard]] static std::vector<GraphExecutionProfile>
     dflash_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window,
                           std::uint32_t batch_size, std::uint32_t verify_width);
+    [[nodiscard]] static float adaptive_draft_round_time(SpeculativeBackend backend,
+                                                         std::uint32_t k);
 
     // route_tokens is the C=1 width of a packed verify round (0 when not batched packed
     // verify). The 35B-A3B package is all-A16: every route below is T-family-stable, so the

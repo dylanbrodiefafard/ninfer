@@ -59,11 +59,13 @@ class Point:
     sampling_mode: str
     suite: str
     concurrency: int
+    adaptive_draft: bool = False
 
     @property
     def key(self) -> str:
+        adaptive = "_adaptive" if self.adaptive_draft else ""
         return (
-            f"{self.target}_{self.speculative_mode}_{self.sampling_mode}_"
+            f"{self.target}_{self.speculative_mode}{adaptive}_{self.sampling_mode}_"
             f"{self.suite.replace('-', '_')}_c{self.concurrency}"
         )
 
@@ -152,8 +154,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--saturation-fixture",
-        default=SATURATION_FIXTURE,
-        help="examples/cli fixture name for decode-saturation (default: long_decode_aime26_15)",
+        action="append",
+        dest="saturation_fixtures",
+        default=None,
+        help="decode-saturation fixture; repeat for mixed C=N (one fixture per slot, or one for all)",
     )
     parser.add_argument(
         "--saturation-messages",
@@ -174,6 +178,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="shared Main KV capacity passed to ninfer-serve (default: 262144)",
     )
     parser.add_argument("--prefill-chunk", type=int, default=4096)
+    parser.add_argument(
+        "--kv-dtype",
+        choices=corpus.KV_DTYPES,
+        default="int8",
+        help="KV storage for the server process (default: int8, published concurrency method)",
+    )
+    parser.add_argument(
+        "--adaptive-draft",
+        action="store_true",
+        help="pass --adaptive-draft (live K); requires MTP or DFlash --mode",
+    )
     parser.add_argument("--output", type=Path, required=True, help="benchmark output directory")
     parser.add_argument("--port", type=int, default=8080, help="loopback serving port")
     parser.add_argument("--device", type=int, default=0, help="CUDA device index")
@@ -182,12 +197,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=("optimized", "full"),
         default="optimized",
         help="DFlash/MTP proposal head: optimized (--lm-head-draft) or full vocab (default: optimized)",
-    )
-    parser.add_argument(
-        "--kv-dtype",
-        choices=corpus.KV_DTYPES,
-        default="int8",
-        help="KV cache storage (default: int8, published concurrent method)",
     )
     parser.add_argument(
         "--dry-run", action="store_true", help="print point commands and request counts only"
@@ -248,14 +257,19 @@ def build_points(
                             sampling_mode=args.sampling,
                             suite=suite,
                             concurrency=concurrency,
+                            adaptive_draft=bool(getattr(args, "adaptive_draft", False)),
                         )
                     )
     return points
 
 
-def saturation_fixture(
-    fixtures: dict[str, corpus.Fixture], args: argparse.Namespace
-) -> corpus.Fixture:
+def saturation_job_fixtures(
+    fixtures: dict[str, corpus.Fixture], args: argparse.Namespace, concurrency: int
+) -> list[corpus.Fixture]:
+    names = getattr(args, "saturation_fixtures", None)
+    if not names:
+        legacy = getattr(args, "saturation_fixture", None)
+        names = [legacy] if legacy else [SATURATION_FIXTURE]
     if args.saturation_messages is not None:
         path = args.saturation_messages.expanduser().resolve()
         try:
@@ -264,7 +278,7 @@ def saturation_fixture(
             raise corpus.CampaignError(f"failed to read --saturation-messages: {exc}") from exc
         if not isinstance(messages, list) or not messages:
             raise corpus.CampaignError("--saturation-messages must be a non-empty JSON list")
-        return corpus.Fixture(
+        one = corpus.Fixture(
             name=path.stem,
             messages=messages,
             thinking=bool(args.saturation_thinking),
@@ -272,25 +286,34 @@ def saturation_fixture(
             suite="long_niah",
             category=None,
         )
-    name = args.saturation_fixture
-    if name not in fixtures:
-        raise corpus.CampaignError(f"unknown --saturation-fixture: {name}")
-    fixture = fixtures[name]
-    if args.saturation_thinking and not fixture.thinking:
-        return dataclasses.replace(fixture, thinking=True)
-    return fixture
+        return [one] * concurrency
+    resolved: list[corpus.Fixture] = []
+    for name in names:
+        if name not in fixtures:
+            raise corpus.CampaignError(f"unknown --saturation-fixture: {name}")
+        fixture = fixtures[name]
+        if args.saturation_thinking and not fixture.thinking:
+            fixture = dataclasses.replace(fixture, thinking=True)
+        resolved.append(fixture)
+    if len(resolved) == 1:
+        return resolved * concurrency
+    if len(resolved) == concurrency:
+        return resolved
+    raise corpus.CampaignError(
+        f"decode-saturation needs 1 or C={concurrency} --saturation-fixture values, got {len(resolved)}"
+    )
 
 
 def build_jobs(
     point: Point, fixtures: dict[str, corpus.Fixture], args: argparse.Namespace
 ) -> list[Job]:
     if point.suite == "decode-saturation":
-        fixture = saturation_fixture(fixtures, args)
+        slot_fixtures = saturation_job_fixtures(fixtures, args, point.concurrency)
         return [
             Job(
                 index=index,
                 case_index=index,
-                fixture=fixture,
+                fixture=slot_fixtures[index],
                 seed=SATURATION_SEEDS[index],
                 max_tokens=args.decode_tokens,
             )
@@ -390,6 +413,8 @@ def server_command(
         )
         if getattr(args, "proposal_head", "optimized") == "optimized":
             command.append("--lm-head-draft")
+        if getattr(args, "adaptive_draft", False):
+            command.append("--adaptive-draft")
     if point.sampling_mode == "greedy":
         command.append("--greedy")
     else:
@@ -856,6 +881,7 @@ def analyze_point(
         "speculative_mode": point.speculative_mode,
         "speculative_backend": point.speculative_backend,
         "draft_tokens": point.draft_tokens,
+        "adaptive_draft": point.adaptive_draft,
         "sampling_mode": point.sampling_mode,
         "suite": point.suite,
         "workload_order": workload_order(point),

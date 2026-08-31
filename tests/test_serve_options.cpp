@@ -109,6 +109,17 @@ int main() {
     } catch (const std::invalid_argument&) { implicit_backend_rejected = true; }
     failures += check(implicit_backend_rejected, "--draft-tokens selected a backend implicitly");
 
+    const ServeOptions adaptive = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp",
+                                         "--draft-tokens", "5", "--adaptive-draft"});
+    failures += check(adaptive.speculative.adaptive_draft,
+                      "--adaptive-draft did not set SpeculativeOptions");
+    bool adaptive_without_spec_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--adaptive-draft"});
+    } catch (const std::invalid_argument&) { adaptive_without_spec_rejected = true; }
+    failures += check(adaptive_without_spec_rejected,
+                      "--adaptive-draft was accepted without --spec");
+
     const ServeOptions configured = parse(
         {"ninfer-serve", "model.ninfer", "--no-prefix-reuse", "--vision", "--max-concurrency", "4",
          "--max-pending-requests", "12", "--pending-timeout-ms", "2500", "--max-context", "4096",

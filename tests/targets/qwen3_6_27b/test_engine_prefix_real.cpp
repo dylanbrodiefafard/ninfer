@@ -19,6 +19,7 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens  = 3;
     options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+    options.speculative.adaptive_draft = true;
     options.enable_vision             = true;
     return options;
 }
@@ -810,13 +811,15 @@ int exercise_vision(ninfer::Engine& engine) {
         engine.generate(engine.prepare(first_input(image_bytes)), bridge_options);
     if (bridge_source.generated_token_ids.size() != 1 ||
         visual_bridge.reused_prompt_tokens != visual_prefix.size() ||
-        !(visual_bridge.timings.vision_seconds > 0.0) || visual_bridge.speculative.rounds == 0) {
+        !(visual_bridge.timings.vision_seconds > 0.0) ||         visual_bridge.speculative.rounds == 0 ||
+        visual_bridge.speculative.live_draft_tokens != 3) {
         std::cerr << "visual MTP bridge did not append the prefix and enter speculative decode: "
                   << "source_outputs=" << bridge_source.generated_token_ids.size()
                   << " reused=" << visual_bridge.reused_prompt_tokens
                   << " vision=" << visual_bridge.timings.vision_seconds
                   << " rounds=" << visual_bridge.speculative.rounds
-                  << " fallbacks=" << visual_bridge.speculative.fallback_steps << '\n';
+                  << " fallbacks=" << visual_bridge.speculative.fallback_steps
+                  << " live_k=" << visual_bridge.speculative.live_draft_tokens << '\n';
         return 1;
     }
     ninfer::RequestOptions bridge_baseline_options       = bridge_options;

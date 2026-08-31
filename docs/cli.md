@@ -159,7 +159,8 @@ MASK) chain verify. Published INT8-KV C=1 DFlash2 W8 numbers are in
 | `--kv-dtype bf16\|int8\|nvfp4` | KV-cache storage | `nvfp4` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; 35B DFlash `1..15`; 3.8 DFlash2 `1..11` | unset |
-| `--dflash-verify-width N` | DFlash verify width `2..16`; chain-only targets require `W=k+1`, which is also the default | auto |
+| `--adaptive-draft` | pick live draft K from host EWMA; requires `--spec mtp\|dflash` | off |
+| `--dflash-verify-width N` | DFlash verify width `2..16`; chain-only targets require `W=k+1`. Qwen3.8 DFlash2 defaults to chain `W=k+1` for `k<=5` and packed-tree `W=12` for `k` in `{6,7}` | auto |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
