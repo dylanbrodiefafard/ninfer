@@ -17,7 +17,7 @@
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 15;
+inline constexpr int kRequestLogSchemaVersion        = 16;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct RequestLogContext {
@@ -93,6 +93,8 @@ RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
 std::string format_request_start(const RequestLogContext& context);
 std::string format_request_rejected(const RequestRejectionLogContext& context);
 std::string format_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
+std::string format_ignored_qwen_tool_call_markup(const RequestLogContext& context,
+                                                 const GenerationOutcome& outcome);
 std::string format_request_error(const RequestLogContext& context, const std::string& message);
 std::string format_throughput(const ThroughputReport& report);
 
@@ -164,5 +166,11 @@ private:
     std::mutex mutex_;
     bool failed_ = false;
 };
+
+// Emits the complete successful-request diagnostic: the human done line, the
+// tools-off Qwen warning when applicable, and the structured request_done event.
+// Kept here so every HTTP protocol uses one observable logging path.
+void write_request_done_logs(JsonlRequestLog& jsonl, const RequestLogContext& context,
+                             const GenerationOutcome& outcome);
 
 } // namespace ninfer::serve

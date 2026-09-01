@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iostream>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -115,7 +116,7 @@ int main() {
                       "server record artifact type mismatch");
     failures += check(server.at("schema_version") == kRequestLogSchemaVersion,
                       "server record schema mismatch");
-    failures += check(kRequestLogSchemaVersion == 15, "request-log schema is not version 15");
+    failures += check(kRequestLogSchemaVersion == 16, "request-log schema is not version 16");
     failures += check(server.at("event") == "server_start", "server event mismatch");
     failures += check(server.at("server").at("public_model_id") == "deployment-alias",
                       "resolved public model id missing");
@@ -289,6 +290,65 @@ int main() {
                       "request_done captured_tokens should be 0 without a freeze");
     failures += check(done.at("result").at("reuse_source") == "none",
                       "reuse_source missing from request_done");
+    failures += check(done.at("result").at("ignored_qwen_tool_call_names").empty(),
+                      "request_done JSON should list no ignored names by default");
+    failures += check(format_request_done(context, outcome).find("ignored_tool_calls=") ==
+                          std::string::npos,
+                      "done line should omit ignored_tool_calls when none were ignored");
+    outcome.ignored_qwen_tool_call_names = {"fetch_url"};
+    const std::string ignored_done       = format_request_done(context, outcome);
+    const std::string ignored_warning =
+        format_ignored_qwen_tool_call_markup(context, outcome);
+    const Json ignored_json =
+        Json::parse(format_request_done_json("serve-test", 3001, context, outcome));
+    failures += check(ignored_done.find("ignored_tool_calls=fetch_url") != std::string::npos,
+                      "done line should include ignored_tool_calls=fetch_url");
+    failures += check(ignored_json.at("result").at("ignored_qwen_tool_call_names") ==
+                          Json::array({"fetch_url"}),
+                      "request_done JSON should list ignored_qwen_tool_call_names");
+    failures += check(ignored_warning.find("[req 7] ignored Qwen tool-call markup") !=
+                              std::string::npos &&
+                          ignored_warning.find("names=fetch_url") != std::string::npos &&
+                          ignored_warning.find("tools=0") != std::string::npos &&
+                          ignored_warning.find("tool_choice=auto") != std::string::npos &&
+                          ignored_warning.find("tool_history=no") != std::string::npos,
+                      "warning should include req id, names=fetch_url, and tools-off shape");
+
+    char live_log_path[] = "/tmp/ninfer-request-log-test-XXXXXX";
+    const int log_fd = mkstemp(live_log_path);
+    failures += check(log_fd >= 0, "failed to create temporary request log");
+    if (log_fd >= 0) {
+        close(log_fd);
+        std::ostringstream captured_console;
+        std::streambuf* original_cerr = std::cerr.rdbuf(captured_console.rdbuf());
+        {
+            JsonlRequestLog live_log(live_log_path);
+            write_request_done_logs(live_log, context, outcome);
+        }
+        std::cerr.rdbuf(original_cerr);
+
+        const std::string console = captured_console.str();
+        failures += check(console.find("[info] ninfer-serve: [req 7] done") != std::string::npos &&
+                              console.find("ignored_tool_calls=fetch_url") != std::string::npos,
+                          "live done logger should emit the ignored tool name");
+        failures += check(console.find("[warning] ninfer-serve: [req 7] ignored Qwen tool-call markup") !=
+                                  std::string::npos &&
+                              console.find("names=fetch_url tools=0 tool_choice=auto tool_history=no") !=
+                                  std::string::npos,
+                          "live done logger should emit the tools-off warning");
+
+        std::ifstream logged(live_log_path);
+        std::string record;
+        std::getline(logged, record);
+        const Json live_json = Json::parse(record);
+        failures += check(live_json.at("event") == "request_done" &&
+                              live_json.at("request").at("request_id") == 7 &&
+                              live_json.at("result").at("ignored_qwen_tool_call_names") ==
+                                  Json::array({"fetch_url"}),
+                          "live done logger should persist ignored names in request_done JSONL");
+        std::filesystem::remove(live_log_path);
+    }
+    outcome.ignored_qwen_tool_call_names.clear();
     outcome.metrics.prefix_reuse_source = ninfer::PrefixReuseSource::HostRam;
     const Json ram_hit =
         Json::parse(format_request_done_json("serve-test", 3002, context, outcome));

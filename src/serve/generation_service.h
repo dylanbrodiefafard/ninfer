@@ -61,6 +61,9 @@ struct GenerationOutcome {
     std::string text;
     std::string reasoning;
     std::vector<ToolCall> tool_calls;
+    // Set when the model emitted parseable Qwen <tool_call> markup but the request
+    // was not tool-capable. The markup stays in `text`; serve logs a warning.
+    std::vector<std::string> ignored_qwen_tool_call_names;
     int prompt_tokens                  = 0;
     int completion_tokens              = 0;
     int reasoning_tokens               = 0;

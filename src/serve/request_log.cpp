@@ -425,12 +425,35 @@ std::string format_request_done(const RequestLogContext& context,
                                   metrics.kv_ram_drops, metrics.kv_ram_save_seconds,
                                   metrics.kv_ram_load_seconds);
     }
+    if (!outcome.ignored_qwen_tool_call_names.empty()) {
+        out << " ignored_tool_calls=";
+        for (std::size_t i = 0; i < outcome.ignored_qwen_tool_call_names.size(); ++i) {
+            if (i != 0) { out << ','; }
+            out << outcome.ignored_qwen_tool_call_names[i];
+        }
+    }
     out << " ttft=" << std::fixed
         << std::setprecision(0) << ttft_ms << "ms"
         << " prefill=" << rate(computed_prefill_tokens, metrics.prefill_seconds)
         << " decode=" << rate(decode_tokens, metrics.decode_seconds)
         << " wall=" << seconds_str(metrics.total_seconds)
         << " speculative=" << speculative_str(metrics);
+    return out.str();
+}
+
+std::string format_ignored_qwen_tool_call_markup(const RequestLogContext& context,
+                                                 const GenerationOutcome& outcome) {
+    std::ostringstream out;
+    out << "[req " << context.id
+        << "] ignored Qwen tool-call markup because the request is not tool-capable "
+           "(no tools, or tool_choice=none); returning markup as content names=";
+    for (std::size_t i = 0; i < outcome.ignored_qwen_tool_call_names.size(); ++i) {
+        if (i != 0) { out << ','; }
+        out << outcome.ignored_qwen_tool_call_names[i];
+    }
+    out << " tools=" << context.tool_count
+        << " tool_choice=" << tool_choice_name(context.tool_choice)
+        << " tool_history=" << (context.has_tool_history ? "yes" : "no");
     return out.str();
 }
 
@@ -631,7 +654,8 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
              {"kv_ram_restores", outcome.metrics.kv_ram_restores},
              {"kv_ram_evictions", outcome.metrics.kv_ram_evictions},
              {"kv_ram_drops", outcome.metrics.kv_ram_drops},
-             {"tool_call_count", outcome.tool_calls.size()}};
+             {"tool_call_count", outcome.tool_calls.size()},
+             {"ignored_qwen_tool_call_names", outcome.ignored_qwen_tool_call_names}};
     record["timings_seconds"] = Json{
         {"prepare", outcome.metrics.prepare_seconds},
         {"ttft", outcome.metrics.ttft_seconds},
@@ -763,6 +787,16 @@ void JsonlRequestLog::write_request_done(const RequestLogContext& context,
                                          const GenerationOutcome& outcome) {
     if (!enabled()) { return; }
     append(format_request_done_json(server_instance_id_, unix_time_ms(), context, outcome));
+}
+
+void write_request_done_logs(JsonlRequestLog& jsonl, const RequestLogContext& context,
+                             const GenerationOutcome& outcome) {
+    write_console_log(ConsoleLogLevel::Info, format_request_done(context, outcome));
+    if (!outcome.ignored_qwen_tool_call_names.empty()) {
+        write_console_log(ConsoleLogLevel::Warning,
+                          format_ignored_qwen_tool_call_markup(context, outcome));
+    }
+    jsonl.write_request_done(context, outcome);
 }
 
 void JsonlRequestLog::write_request_error(const RequestLogContext& context,

@@ -510,6 +510,9 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         outcome.text          = std::move(parsed.content);
         is_tool_call_response = parsed.is_tool_call_response;
         if (is_tool_call_response) { outcome.tool_calls = std::move(parsed.tool_calls); }
+    } else {
+        outcome.ignored_qwen_tool_call_names =
+            parseable_qwen_tool_call_names(outcome.text, prepared.tool_name_max_length);
     }
     if (output_sink) {
         outcome.streamed_content_bytes = output_sink->finish(is_tool_call_response);

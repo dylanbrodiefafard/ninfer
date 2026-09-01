@@ -4,6 +4,7 @@
 
 #include <iostream>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -151,6 +152,61 @@ int test_incremental_filter_fallback() {
     return failures;
 }
 
+int test_compact_fetch_url_already_parses() {
+    // Exact assistant content from Open WebUI chat fb0d11ba (2026-08-30).
+    const std::string text =
+        "I'll look up what that video is about so I can summarize it for you.\n\n"
+        "<tool_call>\n<function=fetch_url>\n<parameter=url>\n"
+        "https://www.youtube.com/watch?v=7cEdPWh9hqU</parameter>\n"
+        "</function>\n</tool_call>";
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output(text, 64);
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response, "compact fetch_url already parses as a tool call");
+    failures += check(parsed.content ==
+                          "I'll look up what that video is about so I can summarize it for you.",
+                      "compact fetch_url keeps the spoken prefix");
+    failures += check(parsed.tool_calls.size() == 1 && parsed.tool_calls[0].name == "fetch_url",
+                      "compact fetch_url name");
+    const Json args = Json::parse(parsed.tool_calls[0].arguments_json);
+    failures += check(args.at("url") == "https://www.youtube.com/watch?v=7cEdPWh9hqU",
+                      "compact fetch_url argument");
+    return failures;
+}
+
+int test_parseable_names_on_tools_off_leak() {
+    const std::string text =
+        "I'll look up what that video is about so I can summarize it for you.\n\n"
+        "<tool_call>\n<function=fetch_url>\n<parameter=url>\n"
+        "https://www.youtube.com/watch?v=7cEdPWh9hqU</parameter>\n"
+        "</function>\n</tool_call>";
+    const std::vector<std::string> names =
+        ninfer::serve::parseable_qwen_tool_call_names(text, 64);
+    int failures = 0;
+    failures += check(names.size() == 1 && names[0] == "fetch_url",
+                      "parseable names for the tools-off leak");
+    failures += check(ninfer::serve::parseable_qwen_tool_call_names("ordinary answer", 64).empty(),
+                      "ordinary text has no parseable names");
+    failures += check(ninfer::serve::parseable_qwen_tool_call_names(text + "\ndone.", 64).empty(),
+                      "leftover after a call is not parseable");
+    return failures;
+}
+
+int test_suffix_after_compact_fetch_url_is_plain_text() {
+    const std::string text =
+        "I'll look up what that video is about so I can summarize it for you.\n\n"
+        "<tool_call> <function=fetch_url> <parameter=url> "
+        "https://www.youtube.com/watch?v=7cEdPWh9hqU</parameter> </function> </tool_call>\n"
+        "done.";
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output(text, 64);
+    int failures = 0;
+    failures += check(!parsed.is_tool_call_response,
+                      "compact fetch_url plus leftover is not a tool response");
+    failures += check(parsed.content == text, "leftover after a valid call preserves the raw xml");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -162,6 +218,9 @@ int main() {
     failures += test_configured_name_limit();
     failures += test_incremental_filter_valid_tool();
     failures += test_incremental_filter_fallback();
+    failures += test_compact_fetch_url_already_parses();
+    failures += test_parseable_names_on_tools_off_leak();
+    failures += test_suffix_after_compact_fetch_url_is_plain_text();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

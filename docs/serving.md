@@ -71,7 +71,10 @@ The endpoint supports:
 - one stop string or an array of stop strings;
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`;
-- function tools, tool choices, assistant tool-call history, and tool-result messages;
+- function tools, tool choices, assistant tool-call history, and tool-result messages.
+  Qwen `<tool_call>` markup becomes `tool_calls` only when the request includes tools and
+  `tool_choice` is not `none`, or the conversation already has tool-call history. Markup on a
+  tools-off request stays in `content` and ninfer-serve logs a warning.
 - the top-level `reasoning_effort` field;
 - the `enable_thinking` extension;
 - `chat_template_kwargs.preserve_thinking` and the top-level `preserve_thinking` alias.
@@ -313,11 +316,14 @@ Responses function definitions are flat rather than Chat Completions' nested `fu
 ```
 
 NInfer renders these definitions in the Qwen prompt and parses model output into separate
-`function_call` output Items. Each output has a protocol Item `id` (`fc_...`) and a distinct
-`call_id` (`call_...`). The client executes the function and sends a `function_call_output` Item in
-a later request. NInfer does not execute functions or enforce JSON Schema through constrained
-decoding, so `strict:true`, `tool_choice:required`, named tool choice, hosted tools, MCP tools, and
-custom free-form tools are rejected.
+`function_call` output Items. Parsing runs only when the request includes tools and `tool_choice`
+is not `none`, or the conversation already has tool-call history. If the model emits Qwen
+`<tool_call>` markup on a tools-off request, NInfer leaves it in the answer text and logs a
+warning; it does not invent a structured tool call. Each parsed output has a protocol Item `id`
+(`fc_...`) and a distinct `call_id` (`call_...`). The client executes the function and sends a
+`function_call_output` Item in a later request. NInfer does not execute functions or enforce JSON
+Schema through constrained decoding, so `strict:true`, `tool_choice:required`, named tool choice,
+hosted tools, MCP tools, and custom free-form tools are rejected.
 
 ### Response object and usage
 
@@ -552,7 +558,7 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v15 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v16 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance.
 
@@ -561,7 +567,7 @@ that server instance.
 | `server_start` | target/weights identity and artifact, resolved Engine, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, pinned-host KV RAM capacity/occupancy, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, `reuse_source` (`none` / `vram_resident` / `host_ram`), `context_checkpoint` (`restored_tokens` / `captured_tokens`), unrounded phase seconds including `kv_ram_save` / `kv_ram_load`, and complete speculative-decoding counters |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, `reuse_source` (`none` / `vram_resident` / `host_ram`), `context_checkpoint` (`restored_tokens` / `captured_tokens`), unrounded phase seconds including `kv_ram_save` / `kv_ram_load`, complete speculative-decoding counters, `tool_call_count`, and `ignored_qwen_tool_call_names` (empty unless a tools-off completion contained parseable Qwen `<tool_call>` markup) |
 | `request_error` | the resolved request configuration and generation error message |
 | `throughput` | interval token deltas and rates, scheduler occupancy, interval `timings_seconds.kv_ram_save` / `kv_ram_load`, and decode-round batch statistics |
 
@@ -578,12 +584,15 @@ derived downstream from raw token counts and seconds instead of rounded stderr s
 The JSONL file contains no generated response text and never records an API-key value; `argv`
 replaces that value with `<redacted>`. The existing stderr summaries remain available for operators
 but are rounded and are not the aggregation source. Console lines use local
-`[YYYY-MM-DD HH:MM:SS.mmm] [level]` timestamps. OpenAI Responses, OpenAI Chat, and Anthropic
-generation requests receive a request ID when they enter synchronous preparation. Successful
-preparation produces `request_start`; a preparation failure produces `request_rejected` without a
-matching start. Later generation failures produce `request_error`. Schema/model validation
-rejections before preparation and token-count-only calls are not measurement requests and do not
-receive request IDs.
+`[YYYY-MM-DD HH:MM:SS.mmm] [level]` timestamps. A tools-off completion whose answer contains
+parseable Qwen `<tool_call>` markup also writes a `warning` line naming the ignored functions and
+the request's `tools` / `tool_choice` / `tool_history` shape; the same names are in
+`request_done.result.ignored_qwen_tool_call_names`. OpenAI Responses, OpenAI Chat, and
+Anthropic generation requests receive a request ID when they enter synchronous preparation.
+Successful preparation produces `request_start`; a preparation failure produces `request_rejected`
+without a matching start. Later generation failures produce `request_error`. Schema/model
+validation rejections before preparation and token-count-only calls are not measurement requests
+and do not receive request IDs.
 
 By default the server also reports aggregate activity every five seconds. `prefill` counts prompt
 suffix tokens actually computed during the interval, excluding prefix-cache hits; `decode` counts
