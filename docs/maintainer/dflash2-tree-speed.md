@@ -13,12 +13,14 @@ codebooks; NVFP4 codebooks save ~174 MiB and are not a decode tok/s win. CUDA Gr
 
 ## Outcome
 
-The packed-tree experiment is no longer the product path. The paper-accurate chain won the final
-RTX 5090 speed comparison on both AIME and story and avoids the tree-only replay/compaction surface.
-Qwen3.8 DFlash2 now requires `W=k+1`; k=4/W=5 is the speed recommendation and k=7/W=8 is the
-native-block option. After fused batched NVFP4 GDN conv-record, C>1 isolation holds and AIME
-C=3 k=4 reaches **324 aggregate tok/s** (NVFP4 KV). The sections below retain the evidence
-that led to the chain cutover.
+The packed-tree verify (beam-2 BFS, W=12) is a permanent product feature (`tree_verify=true`
+for 27B) and the default route for the native draft window k=6,7; the chain (`W=k+1`) is used
+for k≤5 and for k>7 (the spark two-block propose). The chain remains the speed recommendation:
+k=4/W=5 is fastest on AIME, and at k=7 the tree (W=12) is slightly slower in tok/s than the
+chain (W=8) (164.95 vs 166.82) with a slightly higher accept rate (32.88% vs 32.23%), so the
+wider tree window is useful on workloads where it pays off. After fused batched NVFP4 GDN
+conv-record, C>1 isolation holds and AIME C=3 k=4 reaches **324 aggregate tok/s** (NVFP4 KV).
+The sections below retain the A/B evidence from the chain/tree speed investigation.
 
 Tree GDN record uses 4-warp parent tiles in HBM when the ReplaySSM workspace is sized for it;
 tests without that workspace keep the 1-warp shared-memory tile. Path/tree select scans the
