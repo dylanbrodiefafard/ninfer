@@ -192,8 +192,7 @@ void HttpServer::log_request_rejected(const RequestRejectionLogContext& context)
 
 void HttpServer::log_request_done(const RequestLogContext& context,
                                   const GenerationOutcome& outcome) {
-    log_line(format_request_done(context, outcome));
-    request_jsonl_.write_request_done(context, outcome);
+    write_request_done_logs(request_jsonl_, context, outcome);
 }
 
 void HttpServer::log_request_error(const RequestLogContext& context, const std::string& message) {

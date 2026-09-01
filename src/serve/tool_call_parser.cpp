@@ -157,6 +157,17 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     return out;
 }
 
+std::vector<std::string> parseable_qwen_tool_call_names(const std::string& text,
+                                                       std::size_t max_tool_name_length) {
+    if (text.find("<tool_call>") == std::string::npos) { return {}; }
+    const ParsedToolCallOutput parsed = parse_qwen_tool_call_output(text, max_tool_name_length);
+    if (!parsed.is_tool_call_response) { return {}; }
+    std::vector<std::string> names;
+    names.reserve(parsed.tool_calls.size());
+    for (const ToolCall& call : parsed.tool_calls) { names.push_back(call.name); }
+    return names;
+}
+
 std::string ToolCallStreamFilter::feed(std::string_view text) {
     if (finished_) { throw std::logic_error("tool-call stream filter is already finished"); }
     if (text.empty()) { return {}; }

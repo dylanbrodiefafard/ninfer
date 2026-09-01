@@ -5,6 +5,7 @@
 
 #include "serve/openai_schema.h"
 #include "serve/request.h"
+#include "serve/tool_call_parser.h"
 #include "serve/translate.h"
 
 #include <nlohmann/json.hpp>
@@ -1160,6 +1161,102 @@ int run_sse_bench() {
     return 0;
 }
 
+// Open WebUI chat fb0d11ba (2026-08-30): reasoning closed, then this answer text was
+// stored as output_text with no function_call item. Same model had executed
+// fetch_url as a native tool_call minutes earlier. GenerationService only parses
+// Qwen markup when the request uses_tools() or has tool history.
+int test_owui_youtube_fetch_url_logged_turn() {
+    const std::string content =
+        "I'll look up what that video is about so I can summarize it for you.\n\n"
+        "<tool_call>\n<function=fetch_url>\n<parameter=url>\n"
+        "https://www.youtube.com/watch?v=7cEdPWh9hqU</parameter>\n"
+        "</function>\n</tool_call>";
+    const std::string reasoning =
+        "The user shared a YouTube link without any instructions. Per my instructions: "
+        "\"When given a YouTube link and no instructions provide a detailed summary of the video.\"\n\n"
+        "I need to fetch the YouTube URL to get details about the video. Let me use fetch_url on it.\n";
+    const Json user_message =
+        Json{{"role", "user"},
+             {"content", "https://youtu.be/7cEdPWh9hqU?si=48PBda0VDwvAzclN"}};
+    const Json fetch_tool =
+        Json{{"type", "function"},
+             {"function",
+              Json{{"name", "fetch_url"},
+                   {"description", "Fetch and extract the main text content from a web page URL."},
+                   {"parameters",
+                    Json{{"type", "object"},
+                         {"properties",
+                          Json{{"url", Json{{"type", "string"},
+                                            {"description", "The URL to fetch content from"}}}}},
+                         {"required", Json::array({"url"})}}}}}};
+    const CompletionUsage usage{1284, 115};
+
+    int failures = 0;
+
+    const GenerationRequest no_tools = parse_chat_completion_request(
+        Json{{"model", "angel-gpt27b-5090"},
+             {"messages", Json::array({user_message})},
+             {"stream", true}},
+        default_limits());
+    failures += check(!no_tools.uses_tools() && !no_tools.has_tool_history(),
+                      "logged request without tools is not tool-capable");
+
+    const Json leaked = Json::parse(make_chat_completion_response(
+        "chatcmpl-owui", "angel-gpt27b-5090", 1788077000, content, reasoning, "stop", usage));
+    const Json& leaked_message = leaked.at("choices").at(0).at("message");
+    failures += check(leaked.at("choices").at(0).at("finish_reason") == "stop",
+                      "tools-off finish_reason is stop");
+    failures += check(leaked_message.at("content") == content,
+                      "tools-off content keeps the logged xml");
+    failures += check(leaked_message.at("reasoning_content") == reasoning,
+                      "tools-off reasoning matches the logged think block");
+    failures += check(!leaked_message.contains("tool_calls"),
+                      "tools-off response has no tool_calls");
+
+    const GenerationRequest with_tools = parse_chat_completion_request(
+        Json{{"model", "angel-gpt27b-5090"},
+             {"messages", Json::array({user_message})},
+             {"stream", true},
+             {"tools", Json::array({fetch_tool})}},
+        default_limits());
+    failures += check(with_tools.uses_tools(), "logged request with fetch_url is tool-capable");
+
+    const ParsedToolCallOutput parsed = parse_qwen_tool_call_output(content, 64);
+    failures += check(parsed.is_tool_call_response, "logged xml parses when tools are on");
+    failures += check(parsed.content ==
+                          "I'll look up what that video is about so I can summarize it for you.",
+                      "tools-on content is the spoken prefix only");
+    failures += check(parsed.tool_calls.size() == 1 && parsed.tool_calls[0].name == "fetch_url",
+                      "tools-on tool name is fetch_url");
+    const Json args = Json::parse(parsed.tool_calls[0].arguments_json);
+    failures += check(args.at("url") == "https://www.youtube.com/watch?v=7cEdPWh9hqU",
+                      "tools-on url argument");
+
+    const Json native = Json::parse(make_chat_completion_tool_response(
+        "chatcmpl-owui", "angel-gpt27b-5090", 1788077000, parsed.content, reasoning,
+        parsed.tool_calls, usage));
+    const Json& native_message = native.at("choices").at(0).at("message");
+    failures += check(native.at("choices").at(0).at("finish_reason") == "tool_calls",
+                      "tools-on finish_reason is tool_calls");
+    failures += check(native_message.at("content") == parsed.content,
+                      "tools-on serialized content has no xml");
+    failures += check(native_message.at("content").get<std::string>().find("<tool_call>") ==
+                          std::string::npos,
+                      "tools-on content does not contain tool markup");
+    failures += check(native_message.at("reasoning_content") == reasoning,
+                      "tools-on reasoning is unchanged");
+    failures += check(native_message.at("tool_calls").at(0).at("function").at("name") ==
+                          "fetch_url",
+                      "tools-on wire tool name");
+
+    ToolCallStreamFilter filtered;
+    std::string streamed_with_tools = filtered.feed(content);
+    streamed_with_tools += filtered.finish(true);
+    failures += check(streamed_with_tools == parsed.content,
+                      "tools-on stream holds the xml out of chat");
+    return failures;
+}
+
 int main() {
     if (std::getenv("NINFER_BENCH_SSE") != nullptr) { return run_sse_bench(); }
     int failures = 0;
@@ -1177,6 +1274,7 @@ int main() {
     failures += test_parse_sampling_carried();
     failures += test_response_serialization();
     failures += test_tool_response_serialization();
+    failures += test_owui_youtube_fetch_url_logged_turn();
     failures += test_chunk_serialization();
     failures += test_tool_chunk_serialization();
     failures += test_models_and_error();
