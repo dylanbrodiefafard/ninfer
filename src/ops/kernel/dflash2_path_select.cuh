@@ -16,6 +16,7 @@ namespace ninfer::ops {
 inline constexpr int kDflash2PathSelectBlock     = 256;
 inline constexpr int kDflash2PathSelectK         = 16;
 inline constexpr int kDflash2PathSelectRank      = 256;
+inline constexpr int kDflash2PathSelectSuccStride  = kDflash2PathSelectRank + 2;
 inline constexpr int kDflash2PathSelectGemmBlock = 256;
 inline constexpr int kDflash2PathSelectRngPurposeDevice = 16;
 inline constexpr int kDflash2PathSelectTopkSplits = 32;
@@ -317,7 +318,7 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__
     __shared__ int sm_idx[kDflash2PathSelectK];
     __shared__ float sm_h[kDflash2PathSelectRank];
     __shared__ __nv_bfloat16 sm_pred[kDflash2PathSelectRank];
-    __shared__ __nv_bfloat16 sm_succ[kDflash2PathSelectK * kDflash2PathSelectRank];
+    __shared__ __nv_bfloat16 sm_succ[kDflash2PathSelectK * kDflash2PathSelectSuccStride];
     __shared__ int prev_id;
 
     if (tid == 0) { prev_id = anchors[b]; }
@@ -340,13 +341,13 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__
              i += kDflash2PathSelectBlock) {
             const int c = i / kDflash2PathSelectRank;
             const int r = i - c * kDflash2PathSelectRank;
-            sm_succ[i]  = dflash2_codebook_load(succ_code, sm_idx[c], r);
+            sm_succ[c * kDflash2PathSelectSuccStride + r]  = dflash2_codebook_load(succ_code, sm_idx[c], r);
         }
         __syncthreads();
 
         if (tid < kDflash2PathSelectK) {
             scores[tid] = dflash2_markov_score_staged(
-                sm_h, sm_pred, sm_succ + tid * kDflash2PathSelectRank, sm_val[tid]);
+                sm_h, sm_pred, sm_succ + tid * kDflash2PathSelectSuccStride, sm_val[tid]);
         }
         __syncthreads();
 
@@ -443,7 +444,7 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__
     __shared__ int live;
     __shared__ float sm_h[kDflash2PathSelectRank];
     __shared__ __nv_bfloat16 sm_pred[kFrontier * kDflash2PathSelectRank];
-    __shared__ __nv_bfloat16 sm_succ[kDflash2PathSelectK * kDflash2PathSelectRank];
+    __shared__ __nv_bfloat16 sm_succ[kDflash2PathSelectK * kDflash2PathSelectSuccStride];
     __shared__ float pair_score[kFrontier * kDflash2PathSelectK];
 
     if (tid == 0) {
@@ -479,7 +480,7 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__
              i += kDflash2PathSelectBlock) {
             const int c = i / kDflash2PathSelectRank;
             const int r = i - c * kDflash2PathSelectRank;
-            sm_succ[i] = dflash2_codebook_load(succ_code, sm_idx[c], r);
+            sm_succ[c * kDflash2PathSelectSuccStride + r] = dflash2_codebook_load(succ_code, sm_idx[c], r);
         }
         __syncthreads();
 
@@ -489,7 +490,7 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__
             if (f < frontier_n) {
                 pair_score[tid] = dflash2_markov_score_staged(
                     sm_h, sm_pred + f * kDflash2PathSelectRank,
-                    sm_succ + c * kDflash2PathSelectRank, sm_val[c]);
+                    sm_succ + c * kDflash2PathSelectSuccStride, sm_val[c]);
             } else {
                 pair_score[tid] = -CUDART_INF_F;
             }
