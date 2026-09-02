@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 
 namespace ninfer::runtime {
@@ -39,6 +40,27 @@ struct AdmissionProtection {
     std::size_t donor_count       = 0;
     std::uint64_t temporal_credit = 0;
     ProtectionPhase phase         = ProtectionPhase::Open;
+};
+
+// Worker-local scheduling state for the interval between two maximal decode rounds.  Once a
+// decode-ready membership exists, its free lanes form a frozen, non-refundable admission debt:
+// every successful bind consumes one lane even when that prefill immediately terminates.
+class DecodeAdmissionBurst {
+public:
+    void observe_membership(std::uint32_t max_concurrency, std::uint32_t active_slots,
+                            std::uint32_t membership_slots);
+    [[nodiscard]] bool allows_admission() const noexcept;
+    void consume_admission();
+    void complete_decode() noexcept;
+
+    [[nodiscard]] std::optional<std::uint32_t> remaining_budget() const noexcept {
+        return remaining_budget_;
+    }
+    [[nodiscard]] std::uint32_t admissions() const noexcept { return admissions_; }
+
+private:
+    std::optional<std::uint32_t> remaining_budget_;
+    std::uint32_t admissions_ = 0;
 };
 
 [[nodiscard]] bool admission_resources_fit(const AdmissionResources& used,

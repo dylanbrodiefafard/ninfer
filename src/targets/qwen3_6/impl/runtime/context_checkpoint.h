@@ -5,6 +5,7 @@
 #include <ninfer/types.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -30,6 +31,29 @@ struct PrefillReuseHead {
     std::uint32_t frontier     = 0;
     ContextCheckpointKind kind = ContextCheckpointKind::Ladder;
 };
+
+// A pooled host image is reusable only for an exact state layout.  MTP has no DFlash cyclic
+// image; DFlash does.  Keeping this decision independent of CUDA storage makes the pool's
+// ownership contract directly testable.
+struct ContextCheckpointImageLayout {
+    std::size_t conv_bytes      = 0;
+    std::size_t recurrent_bytes = 0;
+    std::size_t hidden_bytes    = 0;
+    std::size_t dflash_bytes    = 0;
+};
+
+[[nodiscard]] constexpr bool context_checkpoint_image_layout_matches(
+    ContextCheckpointImageLayout lhs, ContextCheckpointImageLayout rhs) noexcept {
+    return lhs.conv_bytes == rhs.conv_bytes && lhs.recurrent_bytes == rhs.recurrent_bytes &&
+           lhs.hidden_bytes == rhs.hidden_bytes && lhs.dflash_bytes == rhs.dflash_bytes;
+}
+
+// Each lane owns at most one image for each ladder mark and one rollback image. Retired images
+// are only retained within this exact live high-water bound.
+[[nodiscard]] constexpr std::size_t context_checkpoint_image_pool_capacity(
+    std::uint32_t max_concurrency, std::size_t mark_count) noexcept {
+    return static_cast<std::size_t>(max_concurrency) * (mark_count + 1U);
+}
 
 // Prefill chunk-end thresholds. Advertised restore frontier is the committed chunk end
 // at or past the mark, never the raw named size (24000, 36000, 150000, ...).

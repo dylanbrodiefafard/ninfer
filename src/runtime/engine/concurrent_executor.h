@@ -1284,14 +1284,13 @@ private:
 
     AdmissionProgress try_admit_one() {
         bool control_progress = false;
-        for (;;) {
-            const std::vector<std::shared_ptr<Request>> queued = pending_snapshot();
-            if (queued.empty()) {
-                protection_.reset();
-                return control_progress ? AdmissionProgress::ControlProgress
-                                        : AdmissionProgress::None;
-            }
-            const std::shared_ptr<Request>& head = queued.front();
+        const std::vector<std::shared_ptr<Request>> queued = pending_snapshot();
+        if (queued.empty()) {
+            protection_.reset();
+            return AdmissionProgress::None;
+        }
+        for (std::size_t head_index = 0; head_index < queued.size(); ++head_index) {
+            const std::shared_ptr<Request>& head = queued[head_index];
             if (protection_ && protection_->head_request_id != head->id) { protection_.reset(); }
             if (head->cancelled.load(std::memory_order_acquire)) {
                 if (erase_pending(head)) {
@@ -1359,7 +1358,7 @@ private:
 
             const std::uint64_t frontier_distance =
                 protection_frontier_distance(*protection_, active.span());
-            for (std::size_t i = 1; i < queued.size(); ++i) {
+            for (std::size_t i = head_index + 1; i < queued.size(); ++i) {
                 const std::shared_ptr<Request>& candidate = queued[i];
                 if (candidate->cancelled.load(std::memory_order_acquire)) {
                     if (erase_pending(candidate)) {
@@ -1405,7 +1404,8 @@ private:
                 if (!candidate_lane) { continue; }
                 const RequestPlanSummary& candidate_plan =
                     candidate_lane->ram_entry_id != 0 ? candidate->ram_plan->summary()
-                                                      : candidate->lane_plans[candidate_lane->lane]->summary();
+                                                      : candidate->lane_plans[candidate_lane->lane]
+                                                            ->summary();
 
                 BackfillClass backfill = BackfillClass::None;
                 if (persistent_backfill_is_safe(*protection_, active.span(),
@@ -1422,6 +1422,8 @@ private:
             }
             return control_progress ? AdmissionProgress::ControlProgress : AdmissionProgress::None;
         }
+        protection_.reset();
+        return control_progress ? AdmissionProgress::ControlProgress : AdmissionProgress::None;
     }
 
     void run_decode_round(const RoundMembership& membership) {
@@ -1549,8 +1551,10 @@ private:
     }
 
     void worker_loop() noexcept {
-        bool previous_unit_was_decode = false;
-        bool stable_decode_epoch      = false;
+        // Once a decode-ready donor exists, successful binds spend frozen free-lane debt without
+        // refund. A maximal decode is the only operation that refreshes it.
+        DecodeAdmissionBurst decode_admission_burst;
+        bool stable_decode_epoch = false;
         for (;;) {
             const bool control_changed =
                 control_dirty_.exchange(false, std::memory_order_acquire);
@@ -1560,7 +1564,6 @@ private:
                     const RoundMembership membership = build_round_membership();
                     if (!membership.empty()) {
                         run_decode_round(membership);
-                        previous_unit_was_decode = true;
                         continue;
                     }
                     stable_decode_epoch = false;
@@ -1596,6 +1599,18 @@ private:
                 cancel_active_requests(cancelled_at_boundary);
                 const RoundMembership membership = build_round_membership();
 
+                std::uint32_t active_slots = 0;
+                for (const auto& request : slots_) {
+                    if (request != nullptr) { ++active_slots; }
+                }
+                decode_admission_burst.observe_membership(max_concurrency_, active_slots,
+                                                          membership.size);
+
+                const auto run_membership_decode = [&] {
+                    run_decode_round(membership);
+                    decode_admission_burst.complete_decode();
+                };
+
                 if (copy_hold_) {
                     const bool held_in_membership =
                         membership_contains(membership, copy_hold_->lane);
@@ -1605,41 +1620,31 @@ private:
                     }
                     if (!membership.empty() && !held_in_membership &&
                         !instance_.program->kv_ram_copies_ready()) {
-                        run_decode_round(membership);
-                        previous_unit_was_decode = true;
+                        run_membership_decode();
                     } else {
                         const AdmissionProgress progress = admit_complete(membership.empty());
-                        if (progress == AdmissionProgress::RanGpuUnit) {
-                            previous_unit_was_decode = false;
-                        } else if (progress == AdmissionProgress::CopyHold &&
-                                   !membership.empty() &&
-                                   !membership_contains(membership, copy_hold_->lane)) {
-                            run_decode_round(membership);
-                            previous_unit_was_decode = true;
+                        if (progress == AdmissionProgress::CopyHold &&
+                            !membership.empty() &&
+                            !membership_contains(membership, copy_hold_->lane)) {
+                            run_membership_decode();
                         }
                     }
                     continue;
                 }
 
                 if (prefill_lane_) {
-                    if (!membership.empty() && !previous_unit_was_decode) {
-                        run_decode_round(membership);
-                        previous_unit_was_decode = true;
-                    } else {
-                        run_prefill_step();
-                        previous_unit_was_decode = false;
-                    }
+                    run_prefill_step();
                     continue;
                 }
 
-                if (have_pending && (membership.empty() || previous_unit_was_decode)) {
+                if (have_pending &&
+                    (membership.empty() || decode_admission_burst.allows_admission())) {
                     const AdmissionProgress progress = try_admit_one();
-                    if (progress == AdmissionProgress::RanGpuUnit) {
-                        previous_unit_was_decode = false;
-                        continue;
-                    }
-                    if (progress == AdmissionProgress::CopyHold) {
-                        previous_unit_was_decode = false;
+                    if (progress == AdmissionProgress::RanGpuUnit ||
+                        progress == AdmissionProgress::CopyHold) {
+                        if (!membership.empty()) {
+                            decode_admission_burst.consume_admission();
+                        }
                         continue;
                     }
                     if (progress == AdmissionProgress::ControlProgress && membership.empty()) {
@@ -1648,9 +1653,8 @@ private:
                 }
 
                 if (!membership.empty()) {
-                    run_decode_round(membership);
-                    previous_unit_was_decode = true;
-                    stable_decode_epoch      = !have_pending;
+                    run_membership_decode();
+                    stable_decode_epoch = !have_pending;
                     continue;
                 }
             } catch (...) {

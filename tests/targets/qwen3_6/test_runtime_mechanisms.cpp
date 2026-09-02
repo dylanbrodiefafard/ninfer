@@ -1075,6 +1075,35 @@ void test_adaptive_capture_and_topology() {
            "k_index folds before B");
 }
 
+void test_context_checkpoint_image_pool_policy() {
+    using q36::detail::ContextCheckpointImageLayout;
+    constexpr ContextCheckpointImageLayout mtp{.conv_bytes      = 64,
+                                               .recurrent_bytes = 128,
+                                               .hidden_bytes    = 32,
+                                               .dflash_bytes    = 0};
+    constexpr ContextCheckpointImageLayout dflash{.conv_bytes      = 64,
+                                                  .recurrent_bytes = 128,
+                                                  .hidden_bytes    = 32,
+                                                  .dflash_bytes    = 96};
+    expect(q36::detail::context_checkpoint_image_layout_matches(mtp, mtp),
+           "exact MTP checkpoint image layout reuses its host image");
+    expect(!q36::detail::context_checkpoint_image_layout_matches(mtp, dflash),
+           "MTP image must not reuse DFlash cyclic-state storage");
+    expect(!q36::detail::context_checkpoint_image_layout_matches(
+               mtp, ContextCheckpointImageLayout{64, 127, 32, 0}),
+           "recurrent-state size mismatch must not reuse a host image");
+    expect(!q36::detail::context_checkpoint_image_layout_matches(
+               mtp, ContextCheckpointImageLayout{63, 128, 32, 0}),
+           "convolution-state size mismatch must not reuse a host image");
+    expect(!q36::detail::context_checkpoint_image_layout_matches(
+               mtp, ContextCheckpointImageLayout{64, 128, 31, 0}),
+           "hidden-state size mismatch must not reuse a host image");
+    expect(q36::detail::context_checkpoint_image_pool_capacity(1, 0) == 1 &&
+               q36::detail::context_checkpoint_image_pool_capacity(1, 3) == 4 &&
+               q36::detail::context_checkpoint_image_pool_capacity(8, 16) == 136,
+           "pool high-water bound is one rollback plus every mark per lane");
+}
+
 int main() {
     test_topology();
     test_decoder_layout();
@@ -1087,6 +1116,7 @@ int main() {
     test_resident_reuse_decision();
     test_dflash_chain_verify_kv_headroom();
     test_adaptive_capture_and_topology();
+    test_context_checkpoint_image_pool_policy();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;

@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <initializer_list>
 #include <iostream>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -151,6 +152,92 @@ int run_overlapping(ninfer::Engine& engine, std::span<const std::vector<ninfer::
     return failed;
 }
 
+int check_prefill_first_batch(ninfer::Engine& engine,
+                              std::span<const std::vector<ninfer::TokenId>> seeds,
+                              const char* label) {
+    std::vector<ninfer::TokenId> prompt_a = seeds[0];
+    std::vector<ninfer::TokenId> prompt_b = seeds[1];
+    std::vector<ninfer::TokenId> prompt_c = seeds[2];
+    prompt_a.resize(896, 3709);
+    prompt_b.resize(896, 4120);
+    prompt_c.resize(896, 5200);
+
+    const auto run_pair = [&](const std::vector<ninfer::TokenId>& first,
+                              const std::vector<ninfer::TokenId>& second,
+                              const char* wave)
+        -> std::optional<std::array<std::vector<ninfer::TokenId>, 2>> {
+        auto prepared_first  = engine.prepare_tokens(first);
+        auto prepared_second = engine.prepare_tokens(second);
+        const ninfer::RuntimeStats before = engine.runtime_stats();
+        auto handle_first = engine.submit(std::move(prepared_first), greedy_options(2));
+        auto handle_second = engine.submit(std::move(prepared_second), greedy_options(2));
+        const ninfer::GenerationResult result_first = handle_first.wait();
+        const ninfer::GenerationResult result_second = handle_second.wait();
+        (void)engine.memory_summary(); // Fence the worker's counter publication at this boundary.
+        const ninfer::RuntimeStats after = engine.runtime_stats();
+
+        if (result_first.generated_token_ids.size() != 2 ||
+            result_second.generated_token_ids.size() != 2) {
+            std::cerr << label << ' ' << wave
+                      << " prefill-first pair did not generate two tokens per lane\n";
+            return std::nullopt;
+        }
+        const std::uint64_t rounds = after.decode_rounds - before.decode_rounds;
+        const std::uint64_t rows   = after.decode_row_rounds - before.decode_row_rounds;
+        if (rounds != 1 || rows != 2) {
+            std::cerr << label << ' ' << wave << " prefill-first pair ran " << rounds
+                      << " decode rounds / " << rows
+                      << " row rounds, expected one maximal B=2 decode\n";
+            return std::nullopt;
+        }
+        return std::array<std::vector<ninfer::TokenId>, 2>{result_first.generated_token_ids,
+                                                           result_second.generated_token_ids};
+    };
+
+    const auto ab = run_pair(prompt_a, prompt_b, "A/B");
+    const auto ac = run_pair(prompt_a, prompt_c, "A/C");
+    const auto bc = run_pair(prompt_b, prompt_c, "B/C");
+    if (!ab || !ac || !bc) { return 1; }
+    if ((*ab)[0] == (*ab)[1] || (*ab)[0] != (*ac)[0] || (*ab)[1] != (*bc)[0] ||
+        (*ac)[1] != (*bc)[1]) {
+        std::cerr << label
+                  << " exact-B=2 partner waves did not preserve per-request output ownership\n";
+        return 1;
+    }
+    return 0;
+}
+
+int check_terminal_prefill_debt(ninfer::Engine& engine,
+                                std::span<const std::vector<ninfer::TokenId>> seeds,
+                                const char* label) {
+    std::array<std::vector<ninfer::TokenId>, 4> prompts{seeds[0], seeds[1], seeds[2], seeds[1]};
+    constexpr std::array<ninfer::TokenId, 4> fills{3709, 4120, 5200, 96220};
+    for (std::size_t i = 0; i < prompts.size(); ++i) { prompts[i].resize(896, fills[i]); }
+
+    std::array<decltype(engine.prepare_tokens(prompts[0])), 4> prepared{
+        engine.prepare_tokens(prompts[0]), engine.prepare_tokens(prompts[1]),
+        engine.prepare_tokens(prompts[2]), engine.prepare_tokens(prompts[3])};
+    auto donor = engine.submit(std::move(prepared[0]), greedy_options(2));
+    auto terminal_b = engine.submit(std::move(prepared[1]), greedy_options(1));
+    auto terminal_c = engine.submit(std::move(prepared[2]), greedy_options(1));
+    auto terminal_d = engine.submit(std::move(prepared[3]), greedy_options(1));
+
+    const ninfer::GenerationResult donor_result = donor.wait();
+    const ninfer::GenerationResult result_b = terminal_b.wait();
+    const ninfer::GenerationResult result_c = terminal_c.wait();
+    const ninfer::GenerationResult result_d = terminal_d.wait();
+    (void)engine.memory_summary();
+
+    if (result_b.generated_token_ids.size() != 1 || result_c.generated_token_ids.size() != 1 ||
+        result_d.generated_token_ids.size() != 1 ||
+        donor_result.generated_token_ids.size() != 2) {
+        std::cerr << label
+                  << " terminal-prefill burst did not preserve donor and terminal completions\n";
+        return 1;
+    }
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -211,6 +298,23 @@ int main() {
 
     if (const int result = run_k(3, "MTP NVFP4 k=3"); result != 0) { return result; }
     if (const int result = run_k(5, "MTP NVFP4 k=5"); result != 0) { return result; }
+
+    {
+        const char* label = "MTP NVFP4 prefill-first scheduling";
+        ninfer::EngineOptions options = mtp_engine_options(artifact, 3, 3);
+        options.max_context = 1024;
+        options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(
+            options.max_context * options.max_concurrency);
+        ninfer::Engine engine(options);
+        if (const int result = check_load(engine); result != 0) { return result; }
+        if (const int result = check_prefill_first_batch(engine, prompts, label); result != 0) {
+            return result;
+        }
+        if (const int result = check_terminal_prefill_debt(engine, prompts, label); result != 0) {
+            return result;
+        }
+        std::cout << "ok " << label << '\n' << std::flush;
+    }
 
     {
         const char* label = "MTP NVFP4 adaptive N=5";

@@ -87,7 +87,8 @@ NInfer 不支持 preemption，因此 request 只有在其 prompt、声明的最�
 ### 2.5 One prefill owner
 
 同一时刻最多有一个 admitted request 拥有 prefill/finalization path。Suffix prefill 以 bounded chunk 为
-单位，在 decode rounds 之间运行。其他等待请求仍留在 host queue，不占 slot 或 model state。
+单位连续运行到 finalization；只在整个 owner 完成、取消或失败后选择下一次 admission 或 decode。
+其他等待请求仍留在 host queue，不占 slot 或 model state。
 
 ### 2.6 Single GPU execution owner
 
@@ -97,11 +98,14 @@ NInfer 不支持 preemption，因此 request 只有在其 prompt、声明的最�
 
 RAM 第二层的 D2H/H2D 走独立的 copy engine（`DeviceContext::copy_stream`），不是 GPU scheduling
 unit，也不占用 compute owner。Copy 可以与**另一条** lane 的合法 compute unit 重叠；当前
-PrefillChunk / DecodeRound 正在读写的 pages 不得作为 copy source 或 destination。MTP prefill
-context-checkpoint 冻结是例外：staging GDN（slot `2C`，与 lane current 不相交）以及 staging hidden
-的 D2H 可以与**同一条** lane 的下一 prefill chunk 重叠。冻结期间 `2C` 从 turn-rollback occupant
+PrefillChunk / DecodeRound 正在读写的 pages 不得作为 copy source 或 destination。MTP/DFlash prefill
+context-checkpoint 冻结是例外：staging GDN（slot `2C`，与 lane current 不相交）、staging hidden，
+以及 DFlash staging cyclic state 的 D2H 可以与**同一条** lane 的下一 prefill chunk 重叠。冻结期间 `2C` 从 turn-rollback occupant
 借出，pack 后 H2D 把 rollback 装回；`occupied=false` 必须发生在 clobber D2D 之前。`device.stream`
-上的 `synchronize()` 只排空 compute，不排空 copy_stream。
+上的 `synchronize()` 只排空 compute，不排空 copy_stream。Checkpoint host images 使用 Program-owned
+high-water pinned pool；head 离队后回池，后续相同 layout 的 freeze 复用 allocation 与 completion event，
+不在 prefill boundary 重复 `cudaMallocHost`/`cudaFreeHost`。Pool 只保留实际到达过的 high-water image，
+不按 `C * mark-count` 预分配。
 
 ### 2.7 Bounded ingress and output
 
@@ -403,8 +407,8 @@ oldest head is exclusively feasible but blocked by active lane/entitlement
 ```
 
 若 head 的完整 lane/entitlement 已经可行、只因现有 one-prefill-owner 不能 admission，它保持 ordinary
-head waiting，不建立 protection epoch，也不扫描 later candidates；prefill owner 清除后的下一个合法
-admission turn 先重试该 head。Protection 只在没有 prefill owner、head 确实需要现有 active request 释放
+head waiting，不建立 protection epoch，也不扫描 later candidates；prefill owner 清除后的下一个有
+admission budget 的 boundary 先重试该 head。Protection 只在没有 prefill owner、head 确实需要现有 active request 释放
 lane 或 entitlement 时建立，因此 frozen donor set 非空。
 
 同一时刻只保护一个最老 head。Protection 绑定稳定的 request generation identity，不绑定可回收的 lane、
@@ -425,7 +429,7 @@ PROTECTED_DRAIN
 ```
 
 `PROTECTED_OPEN` 允许 §5.5 定义的 backfill。`PROTECTED_DRAIN` 禁止所有 later/backfill admission，只推进
-已经 admitted 的 bounded prefill/decode work，并在每个合法 admission turn 继续 first-retry protected head。
+已经 admitted 的 bounded prefill/decode work，并在每个有 admission budget 的 boundary 继续 first-retry protected head。
 Head 成功 admission、cancellation、queue timeout 或 permanent rejection 清除当前 protection；下一最老
 request 之后可以建立自己的 epoch，但不会继承旧 frontier、work credit 或 shadow ledger。多个 waiting
 大请求不建立嵌套 reservations。
@@ -466,8 +470,9 @@ sum(E(a), a in surviving members of A without D)
 一个 candidate 只有同时 `fits-now` 且加入后仍满足该逐维关系，才能成为 persistent-safe backfill。必须
 累计核算所有仍存活的 `P`；不能让多个 candidate 分别与同一份初始 surplus 比较。Persistent-safe request
 完成后从 ledger 移除，其 surplus 可以被另一个 qualified request 使用；但任何 resource-release boundary
-若同时是 admission turn，都必须先重试 `H`，再考虑复用 surplus；否则只记录 release/maturity，并在下一
-合法 turn 先重试 `H`。
+若同时有 admission budget，都必须先重试 `H`，再考虑复用 surplus；否则只记录 release/maturity。若
+decode membership 仍存活则在下一次 maximal decode 后先重试；若最后一个 donor 已离队则 debt 清除并
+可以立即重试。
 
 这一 invariant 保证：即使所有 `P` 在 donor frontier 到达时仍然 active，`H` 也不会因它们失去所需 lane、
 Main pages 或 backend pages。它不保证 `H` 的 wall time 不受影响；backfill 的 bounded prefill 和更大的
@@ -528,59 +533,69 @@ Scheduler 对 bounded pending snapshot 按 prepared order 扫描，选择最老�
 request 都声明相同的巨大 default output bound，Scheduler 没有可靠证据判断实际难度；此时 temporal
 qualification 会自然保守，仍可使用可证明的 persistent-safe backfill，不能根据 prompt 内容猜测。
 
-### 5.6 Admission boundary and progress rules
+### 5.6 Admission burst and progress rules
 
-只有满足以下条件的 boundary 才是 admission turn：
+只有满足以下条件的 boundary 才能尝试 admission：
 
 ```text
 no prefill owner
 and no copy-hold admission
-and (no decode-ready request or the completed GPU unit was a DecodeRound)
+and (no decode-ready request or decode-admission budget > 0)
 ```
 
 copy-hold 与 prefill owner 一样独占 admission/prefill opportunity：它不是 GPU unit，但在 D2H/H2D
 完成并调用 `start_prefill_lane` 之前不得再 admission 第二个 request。held lane 不是 decode-ready，
 也不是 prefill owner。
 
-其他 boundary 可以处理 completion、cancellation、timeout 和 protection bookkeeping，但不能 commit head
-或 backfill admission。这个 gate 保证已有 decode-ready donors 在两次 admission 之间至少完成一次 progress
-round；final prefill/finalization 结束后不能立即连续 admission 另一个 request。
+第一个 decode-ready membership 出现时，Scheduler 把本次 `decode-admission budget` 冻结为当前 free
+lanes 数。每次成功 bind 一个 request 扣一个 budget，request 即使在 final prefill 的首 token terminal、
+随后 cancellation 或 failure 也不返还。Budget 为零时必须先运行一次包含全部 decode-ready rows 的
+`DecodeRound`；该 round 完成后下一个 membership 才从当时的 free lanes 建立新 budget。没有任何
+decode-ready request 时不需要 progress debt，Scheduler 可以继续处理 finite pending snapshots。
 
-一次 admission turn 最多成功 admission 一个 request。Cancellation、timeout 和 permanent-invalid entry 的
+一次 admission attempt 最多成功 admission 一个 request。Cancellation、timeout 和 permanent-invalid entry 的
 清理不算 admission；Scheduler 可以在同一 frozen pending snapshot 中继续寻找新的 head/candidate，但同一
 资源状态下失败的 candidate 不在该 boundary 反复尝试。
 
-每次 admission opportunity 的顺序固定为：
+每次 boundary opportunity 的顺序固定为：
 
 ```text
 1. resolve completed GPU unit
 2. finish/cancel active requests and release-or-retain their state
 3. remove visible pending cancellation, timeout and permanent failures
-4. if this is an admission turn, retry the protected head or the oldest FIFO head
+4. if admission is eligible, retry the protected head or the oldest FIFO head
 5. on the same turn, if an open protected head remains blocked,
    admit at most one qualified backfill
 6. choose and launch one next GPU unit
 ```
 
+一个 admission attempt 只消费 boundary 内取得的一份 finite pending snapshot。清理 snapshot 中的
+cancelled、expired 或 permanent-invalid entries 可以继续检查同一 snapshot 的新 head/candidates，但不能
+重新 snapshot；boundary 后到达的 request 留给下一次 GPU-unit 或 idle-control boundary。
+
 若 exact current accounting 已让 protected head 可行，它总是先于 later request admission。若 frozen donors
 已经释放，或当前非-temporal shadow resources 已足以容纳 `H`，但 `H` 仍被 temporal borrower 或现有
 prefill owner 阻塞，protection 立即进入 `PROTECTED_DRAIN`。Drain 不抢占 borrower；它禁止 later/backfill
-admission，但 protected head 仍在每个合法 turn 优先重试。Persistent-safe borrower 尚在 prefill 时也可能
+admission，但 protected head 仍在每个 eligible boundary 优先重试。Persistent-safe borrower 尚在 prefill 时也可能
 短暂阻止 head admission，但 one-prefill-owner work 有限且此期间不能再接纳其他请求。
 
-Frontier member completion/cancellation 只在其 state 于 boundary 真正释放后计为 release。该 boundary 若是
-admission turn 就立即 head-first retry；否则更新 maturity，并在下一合法 turn 先重试。Active request 的
+Frontier member completion/cancellation 只在其 state 于 boundary 真正释放后计为 release。该 boundary 若有
+admission budget 就立即 head-first retry；否则更新 maturity。只要 decode membership 仍存活，就在下一次
+maximal decode 后先重试；最后一个 donor 离队则清除 debt 并可以立即重试。Active request 的
 used/reserved 转换不改变其 entitlement；尚未 materialize 的 future reservation 不是 tail surplus。
 Backfill completion retention 也不能覆盖 head-first active-priority eviction。
 
-Protection 不改变 GPU progress policy：
+Protection 消费 GPU progress policy：
 
-- 两次成功的 backfill admissions 之间，每个仍存活 frozen donor 至少参加一次 maximal `DecodeRound`；
+- 一次 burst 在首次出现 decode-ready donor 后最多再成功 admission `C-1` 次，每次 bind 永久扣减本
+  burst budget；
 - 每个非 terminal row 的成功 decode/speculative round 至少 commit 一个 output token，否则直接 terminal；
 - 每个 `PrefillChunk` 推进正数的有限 prompt work，或完成 finalization；
 - 每个 request 有 finite output bound，每个 GPU unit 有 bounded execution extent。
 
-因此 frozen donors 在有限 rounds 内 release。Frontier 前能发生的 temporal admissions 也有限；frontier
+因此 surviving frozen donor 在最多 `C-1` 个 intervening admissions 后参加一次 maximal decode，即使
+这些 admissions 全部在 prefill token terminal 并立即释放 lane。Frozen donors 在有限 rounds 内 release。
+Frontier 前能发生的 temporal admissions 也有限；frontier
 成熟后的 miss 进入 drain，已经 admitted 的 borrowers 最终 completion/cancellation 后释放资源。持续 ingress
 不能把 donor frontier 向后滚动，也不能形成资源 deadlock。该保证是 eventual progress，不是零 wall-time
 interference 或 admission ETA。
@@ -867,19 +882,21 @@ opportunity，直到该 lane 的 copies 允许 `start_prefill_lane`。
 2. resolve the completed unit's per-request results
 3. finish/cancel requests and release or retain their state
 4. clean visible pending cancellation/timeout/permanent failures
-5. if this boundary is an admission turn, apply one head-first
+5. if this boundary has admission eligibility, apply one head-first
    protected admission/backfill opportunity (bind may return copy-hold
    without launching a GPU unit; complete starts this lane's prefill
    only after the relevant copies are ready)
 6. choose, prepare and launch one next GPU unit
 ```
 
-copy-hold 在 admission-turn gate 之前检查：membership 非空且 copies 未就绪时先跑其他 lane 的
+copy-hold 在 admission gate 之前检查：membership 非空且 copies 未就绪时先跑其他 lane 的
 DecodeRound（不 harvest、不 `EventSynchronize` copy）；membership 空则 `EventSynchronize` copy
-并 complete。Harvest 只在该 request 的 `start_prefill_lane` wait 之后。
+并 complete。Capture D2H ready 后 `admit_complete` 可能排入 restore H2D；若 frozen membership 非空，
+同一 boundary transaction 立即运行该 membership 的 DecodeRound，不重新处理 control events。Harvest
+只在该 request 的 `start_prefill_lane` wait 之后。
 
 boundary 开始后到达的 event 留到下一 boundary。这保证一次 membership update 有限，持续 arrival 不能
-无限延迟下一次 launch。Admission turn 的 gate、frozen pending snapshot 和 protection state 由 §5.6 定义；
+无限延迟下一次 launch。Admission gate、frozen pending snapshot 和 protection state 由 §5.6 定义；
 不满足 gate 的 boundary 只更新 control/resource state。清理多个无效 entries 不算多个 admissions，但一次
 boundary 最多发布一个新 admitted request。
 
@@ -888,35 +905,33 @@ boundary 最多发布一个新 admitted request。
 调度策略为：
 
 ```text
-if the completed unit was a DecodeRound and a prefill owner exists:
-    run one latency-bounded PrefillChunk
-else if one or more requests are DECODE_READY:
-    run one DecodeRound containing all of them
-else if a prefill owner exists:
+if a prefill owner exists:
     run the next PrefillChunk
+else if an admitted copy-hold is ready:
+    complete it and start its prefill
+else if a pending request is admissible and decode-admission budget permits:
+    admit it and start its prefill
+else if one or more requests are DECODE_READY:
+    run one DecodeRound containing all of them and refresh the next burst
 else:
     remain idle
 ```
 
-因此 decode 和 prefill 同时持续 runnable 时：
+因此 startup 有三个 cold requests 时：
 
 ```text
-DecodeRound -> PrefillChunk -> DecodeRound -> PrefillChunk -> ...
+Prefill[A, all chunks] -> Prefill[B, all chunks] -> Prefill[C, all chunks]
+-> DecodeRound[A,B,C] -> DecodeRound[A,B,C] -> ...
 ```
 
-没有 decode-ready request 时，prefill chunks 连续执行；没有 prefill owner 时，decode rounds 连续执行。
+已有 A decode-ready、另有 B/C pending 且 lanes/resources/budget 可用时，B 完整 prefill 后立即 admission
+C；B/C 都 decode-ready 后才运行 `DecodeRound[A,B,C]`。若 B 在 prefill token terminal，其 bind 仍消费
+budget，持续 ingress 不能跳过 mandatory donor decode。
 
-当没有 prefill owner 而 ordered pending queue 非空时，§5 选中的 head 或 backfill request 占用下一次
-prefill/finalization opportunity：GPU idle 时可以立即 admission；已有 decode-ready rows 时，先完成一个
-DecodeRound，再 admission selected request 并执行它的 first prefill/finalization unit。若该 unit 未完成，
-它成为唯一 prefill owner并进入上述交替；若它完成，request 在下一 boundary 加入 decode batch。持续
-ingress 因此不能在两个 donor progress rounds 之间连续 admission 多个 requests，也不能无限延迟 frozen
-frontier 的 decode progress。
-
-Prefill chunk profile 限制插入两个 decode rounds 之间的 GPU 时间。其具体 token/media extent 是经过
-target 和 hardware qualification 的配置，不属于 scheduler semantic。Vision 和其他 prefill GPU phases
-必须本身构成 bounded unit，或已被计入该 chunk 的 latency bound；不存在 scheduler 之外的
-unbounded prefill work。
+Prefill chunk profile 限制一次不可取消 GPU unit 的时间；完整 admission burst 的 wall time 可以包含最多
+`C-1` 个完整 request prefills。其具体 token/media extent 是经过 target 和 hardware qualification 的配置，
+不属于 scheduler semantic。Vision 和其他 prefill GPU phases 必须本身构成 bounded unit，或已被计入该
+chunk 的 latency bound；不存在 scheduler 之外的 unbounded prefill work。
 
 ### 7.4 Joining and leaving decode
 
@@ -947,7 +962,8 @@ base：该处若有 turn-rollback 或 ladder head 则 restore 该 head；否则�
 
 Waiting protected head 或 backfill candidate 的 cancellation 在 §7.2 control cleanup 中移除；protected head
 离队会原子清空 epoch，下一最老 entry 不继承 shadow state。Frozen donor 的 cancellation 只有在其 active
-state 真正释放后才缩短 frontier；若该 boundary 不是 admission turn，则在下一合法 turn 先触发 head retry。
+state 真正释放后才缩短 frontier；若该 boundary 没有 admission budget 且 decode membership 仍存活，则在
+下一次 maximal decode 后先触发 head retry；最后一个 donor 离队则可以立即 retry。
 
 ---
 
@@ -1395,25 +1411,25 @@ shared round 中某一行可以安全继续。
 
 ## 12. End-to-end examples
 
-### 12.1 New request joins an existing decode
+### 12.1 Prefill burst joins an existing decode
 
 ```text
 time ───────────────────────────────────────────────────────────►
 
 GPU: Decode[A]
-       │ boundary: admit B as the prefill owner
+       │ boundary: admit B; freeze remaining burst budget
        ▼
-     Prefill[B, chunk 0]
+     Prefill[B, all chunks]
+       │ B becomes decode-ready; admit C with remaining budget
        ▼
-     Decode[A]
+     Prefill[C, all chunks]
+       │ C becomes decode-ready; budget exhausted / slots full
        ▼
-     Prefill[B, final chunk]
-       │ B becomes decode-ready
-       ▼
-     Decode[A,B] -> Decode[A,B] -> ...
+     Decode[A,B,C] -> Decode[A,B,C] -> ...
 ```
 
-B 不执行单独的 decode forward，而是在 final prefill 后加入 A 的下一 logical batch。
+B/C 不执行单独的 decode forward，也不在自己的 chunks 间插入 A decode；它们在各自 final prefill 后
+一起加入 A 的下一 logical batch。
 
 ### 12.2 Two rows assembled and committed
 
@@ -1508,9 +1524,8 @@ release frontier，且 epoch temporal credit 足够时才能作为 temporal back
 
 ```text
 Decode[A,B]
-  -> admit/fill P
-  -> Decode[A,B,P]
-  -> admit/fill T if temporally qualified
+  -> admit/prefill P completely
+  -> admit/prefill T completely if temporally qualified and burst budget remains
   -> Decode[A,B,P,T] ...
 ```
 
