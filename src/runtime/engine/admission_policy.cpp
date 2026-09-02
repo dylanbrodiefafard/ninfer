@@ -53,6 +53,36 @@ bool is_donor(const AdmissionProtection& protection, std::uint64_t id) noexcept 
 
 } // namespace
 
+void DecodeAdmissionBurst::observe_membership(std::uint32_t max_concurrency,
+                                              std::uint32_t active_slots,
+                                              std::uint32_t membership_slots) {
+    if (membership_slots == 0) {
+        complete_decode();
+        return;
+    }
+    if (active_slots < membership_slots || active_slots > max_concurrency) {
+        throw std::logic_error("decode membership exceeds active slot count");
+    }
+    if (!remaining_budget_) { remaining_budget_ = max_concurrency - active_slots; }
+}
+
+bool DecodeAdmissionBurst::allows_admission() const noexcept {
+    return !remaining_budget_ || *remaining_budget_ != 0;
+}
+
+void DecodeAdmissionBurst::consume_admission() {
+    if (!remaining_budget_ || *remaining_budget_ == 0) {
+        throw std::logic_error("decode admission consumed an exhausted burst budget");
+    }
+    --*remaining_budget_;
+    ++admissions_;
+}
+
+void DecodeAdmissionBurst::complete_decode() noexcept {
+    remaining_budget_.reset();
+    admissions_ = 0;
+}
+
 bool admission_resources_fit(const AdmissionResources& used,
                              const AdmissionResources& capacity) noexcept {
     ResourceTotals total;

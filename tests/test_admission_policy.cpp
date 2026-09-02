@@ -162,6 +162,66 @@ int main() {
         !ninfer::runtime::persistent_backfill_is_safe(no_lane, two_large, tiny, two_lanes),
         "2-page leftover fit ignored that both lanes are occupied");
 
+    // Decode debt state machine: one ready donor in C=3 freezes two admissions. A terminal
+    // prefill freeing its lane does not refund debt, so a continuous stream cannot starve decode.
+    ninfer::runtime::DecodeAdmissionBurst burst;
+    burst.observe_membership(3, 1, 1);
+    failures += check(burst.remaining_budget() == 2 && burst.allows_admission() &&
+                          burst.admissions() == 0,
+                      "first decode membership did not freeze all free lanes as debt");
+    burst.consume_admission(); // terminal or cancelled prefill: active slots can still be one.
+    failures += check(burst.remaining_budget() == 1 && burst.admissions() == 1,
+                      "terminal admission incorrectly refunded decode debt");
+    burst.observe_membership(3, 1, 1);
+    failures += check(burst.remaining_budget() == 1,
+                      "later boundary recomputed rather than preserving frozen debt");
+    burst.consume_admission();
+    failures += check(!burst.allows_admission() && burst.remaining_budget() == 0 &&
+                          burst.admissions() == 2,
+                      "C-1 admissions did not force the donor decode");
+    bool exhausted_rejected = false;
+    try {
+        burst.consume_admission();
+    } catch (const std::logic_error&) {
+        exhausted_rejected = true;
+    }
+    failures += check(exhausted_rejected, "exhausted decode debt admitted another prefill");
+    burst.complete_decode();
+    failures += check(!burst.remaining_budget() && burst.admissions() == 0 &&
+                          burst.allows_admission(),
+                      "decode completion did not start a fresh admission interval");
+
+    // Empty membership is startup/pure-prefill mode, not decode debt. Membership transitions
+    // reset stale debt, while malformed worker snapshots are rejected before scheduling work.
+    burst.observe_membership(3, 0, 0);
+    failures += check(!burst.remaining_budget() && burst.allows_admission(),
+                      "pure-prefill mode inherited decode admission debt");
+    bool invalid_membership_rejected = false;
+    try {
+        burst.observe_membership(3, 1, 2);
+    } catch (const std::logic_error&) {
+        invalid_membership_rejected = true;
+    }
+    failures += check(invalid_membership_rejected,
+                      "membership larger than active slots was accepted");
+    bool over_capacity_rejected = false;
+    try {
+        burst.observe_membership(3, 4, 1);
+    } catch (const std::logic_error&) {
+        over_capacity_rejected = true;
+    }
+    failures += check(over_capacity_rejected, "active slots beyond concurrency were accepted");
+    bool absent_budget_rejected = false;
+    try {
+        burst.consume_admission();
+    } catch (const std::logic_error&) {
+        absent_budget_rejected = true;
+    }
+    failures += check(absent_budget_rejected, "startup admission consumed nonexistent decode debt");
+    burst.observe_membership(3, 3, 2);
+    failures += check(burst.remaining_budget() == 0 && !burst.allows_admission(),
+                      "full active set incorrectly admitted between decode rounds");
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

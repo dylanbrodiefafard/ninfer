@@ -509,6 +509,11 @@ private:
     void restore_dflash_cyclic_from_head(SequenceState& sequence, const ContextCheckpointHead& head);
     void snapshot_dflash_cyclic_to_staging(std::int32_t lane);
     void pack_dflash_cyclic_to_head(ContextCheckpointHead& head);
+    [[nodiscard]] ContextCheckpointHead acquire_context_checkpoint_head(
+        std::size_t conv_bytes, std::size_t recurrent_bytes, std::size_t hidden_bytes,
+        std::size_t dflash_bytes);
+    void record_context_checkpoint_head_use(ContextCheckpointHead& head, cudaStream_t stream);
+    void recycle_context_checkpoint_head(ContextCheckpointHead&& head);
     void drop_context_checkpoints_after(SequenceState& sequence, std::uint32_t frontier) noexcept;
     void clear_context_checkpoints(SequenceState& sequence) noexcept;
     void install_ram_context_checkpoints(SequenceState& sequence,
@@ -532,6 +537,7 @@ private:
         cudaEvent_t copies_done = nullptr;
     };
     ContextCheckpointStaging staging_;
+    std::vector<ContextCheckpointHead> context_checkpoint_pool_;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
