@@ -66,7 +66,8 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
  *   probability min(1, p_i(d)/q_i(d)) (Leviathan), samples from max(0, p-q) on first rejection,
  *   and samples a bonus from column Pcur[b] when every available draft is accepted. Null
  *   selector_ids/selector_q is the one-hot draft convention: accept iff u < p_i(d) and the
- *   residual excludes d. Greedy mode ignores q.
+ *   residual excludes d. Greedy mode ignores q. When configs[b].p_less is set, p is the p-less
+ *   distribution from sampling.h rather than the top-k/top-p/min-p truncation.
  *   RNG domains are the speculative accept/correction/bonus SamplePurpose values and logical
  *   positions derived from the old length.
  *
@@ -109,7 +110,8 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
  *
  * Greedy: from packed column 0, walk to the unique child whose token equals the target argmax;
  * otherwise emit that argmax as the correction. Sampling: at node u sample x from the truncated
- * target distribution; if x is a child of u, accept and continue, else emit x as correction
+ * target distribution (p-less when configs[b].p_less is set); if x is a child of u, accept and
+ * continue, else emit x as correction
  * (SpecInfer membership). Walks at most current_extents[b] accepted hops (same budget as chain
  * verify). fold_path lists packed columns of the processed path including the root;
  * accepted_column is the last processed packed index (hidden selector). licensed_tokens are

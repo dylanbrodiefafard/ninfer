@@ -223,6 +223,8 @@ int main() {
                       "resolved preserve-thinking metadata missing");
     failures += check(started.at("request").at("sampling").at("seed") == 7632647173703958409ULL,
                       "resolved seed missing");
+    failures += check(started.at("request").at("sampling").at("p_less") == false,
+                      "resolved p_less missing");
 
     ApiError preparation_error;
     preparation_error.status = 400;

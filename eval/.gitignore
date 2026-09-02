@@ -1,5 +1,5 @@
 .venv/
 runs/
+server-logs/
 __pycache__/
 *.pyc
-server-logs/*.requests.jsonl

@@ -1,7 +1,8 @@
 // Implements: include/ninfer/ops/sampling.h
 // Match: validated contiguous BF16/I32 tensors and a shared-layout workspace.
 // Algorithm assumptions: launcher and kernels use sampler_multiblock_ok() from
-// the same layout authority, so exactly one finite route owns each shape.
+// the same layout authority. Small/fallback shapes use the per-row kernel; the
+// partial/group/mass pipeline owns every multiblock mode.
 #include "ops/launcher/sampling.h"
 
 #include "ops/common/math.h"
@@ -41,6 +42,13 @@ void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_d
     sampling_group_finalize_sample_kernel<<<group_grid, kSamplerGroupBlock, 0, stream>>>(
         static_cast<std::int32_t*>(out.data), configs, positions, purpose, token_domain,
         partial_blocks, groups, scratch);
+    CUDA_CHECK(cudaGetLastError());
+    const dim3 p_less_grid(
+        static_cast<unsigned int>(sampler_p_less_workers_per_column(partial_blocks, batch)),
+        static_cast<unsigned int>(batch));
+    sampling_p_less_mass_sample_kernel<<<p_less_grid, kSamplerBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(logits.data), static_cast<std::int32_t*>(out.data),
+        configs, positions, purpose, token_domain, physical_rows, partial_blocks, scratch);
     CUDA_CHECK(cudaGetLastError());
 }
 

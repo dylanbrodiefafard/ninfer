@@ -31,6 +31,7 @@ constexpr std::int32_t kTokenDomain  = 248077;
 enum class Mode {
     Greedy,
     Stochastic,
+    PLess,
 };
 
 struct Options {
@@ -46,7 +47,7 @@ struct Options {
 };
 
 void usage(const char* argv0) {
-    std::printf("usage: %s [--sample|--mtp|--matrix] [--mode greedy|stochastic] "
+    std::printf("usage: %s [--sample|--mtp|--matrix] [--mode greedy|stochastic|p-less] "
                 "[--batch 1..8] [--mtp-k 1..5] [--top-k 1..20] [--no-counts] "
                 "[--suppress-stop]\n",
                 argv0);
@@ -85,8 +86,10 @@ Options parse_args(int argc, char** argv) {
                 options.mode = Mode::Greedy;
             } else if (mode == "stochastic") {
                 options.mode = Mode::Stochastic;
+            } else if (mode == "p-less") {
+                options.mode = Mode::PLess;
             } else {
-                throw std::invalid_argument("--mode must be greedy or stochastic");
+                throw std::invalid_argument("--mode must be greedy, stochastic, or p-less");
             }
         } else if (arg == "--batch") {
             options.batch = parse_int(need_value("--batch"), "--batch");
@@ -157,6 +160,7 @@ DeviceBuffer make_config(DeviceBuffer& counts, Mode mode, bool counts_active, in
     config.top_k            = top_k;
     config.top_p            = 0.95f;
     config.presence_penalty = mode == Mode::Stochastic && counts_active ? 1.0f : 0.0f;
+    config.p_less           = mode == Mode::PLess ? 1 : 0;
     config.seed             = 20260716ull;
     config.token_counts =
         mode == Mode::Stochastic && counts_active ? static_cast<std::int32_t*>(counts.p) : nullptr;
@@ -176,6 +180,7 @@ DeviceBuffer make_batch_configs(DeviceBuffer& counts, int batch, Mode mode, bool
         config.top_k                = top_k;
         config.top_p                = 0.95f;
         config.presence_penalty     = mode == Mode::Stochastic && counts_active ? 1.0f : 0.0f;
+        config.p_less               = mode == Mode::PLess ? 1 : 0;
         config.seed                 = 20260716ull + static_cast<unsigned long long>(row);
         config.token_counts         = mode == Mode::Stochastic && counts_active
                                           ? static_cast<std::int32_t*>(counts.p) +
@@ -192,6 +197,12 @@ double stochastic_payload_bytes(int cols, bool counts_active) {
     const double per_col = static_cast<double>(kTokenDomain) * 2.0 +
                            (counts_active ? static_cast<double>(kTokenDomain) * 4.0 : 0.0);
     return per_col * static_cast<double>(cols);
+}
+
+const char* mode_label(Mode mode, bool counts_active) {
+    if (mode == Mode::Greedy) { return "greedy"; }
+    if (mode == Mode::PLess) { return counts_active ? "p-less counts" : "p-less"; }
+    return counts_active ? "stochastic counts" : "stochastic";
 }
 
 void run_sample(DeviceBuffer& logits, DeviceBuffer& counts, int batch, Mode mode,
@@ -218,8 +229,7 @@ void run_sample(DeviceBuffer& logits, DeviceBuffer& counts, int batch, Mode mode
         },
         bytes);
     const std::string label = std::string("G2 B=") + std::to_string(batch) + " " +
-                              (mode == Mode::Greedy ? "greedy" : "stochastic") +
-                              (counts_active && mode == Mode::Stochastic ? " counts" : "") +
+                              mode_label(mode, counts_active && mode != Mode::Greedy) +
                               (suppress_stop ? " suppress-stop" : "") +
                               " top_k=" + std::to_string(top_k);
     print_result(label.c_str(), result);
@@ -269,8 +279,7 @@ void run_mtp(DeviceBuffer& logits, DeviceBuffer& counts, int k, Mode mode, bool 
         },
         bytes);
     const std::string label = std::string("G3 K=") + std::to_string(k) + " " +
-                              (mode == Mode::Greedy ? "greedy" : "stochastic") +
-                              (counts_active && mode == Mode::Stochastic ? " counts" : "") +
+                              mode_label(mode, counts_active && mode != Mode::Greedy) +
                               (suppress_stop ? " suppress-stop" : "") +
                               " top_k=" + std::to_string(top_k);
     print_result(label.c_str(), result);
@@ -314,6 +323,9 @@ int main(int argc, char** argv) {
             }
             run_sample(logits, counts, 1, Mode::Stochastic, false, 20,
                        options.suppress_stop);
+            run_sample(logits, counts, 1, Mode::PLess, false, 20, options.suppress_stop);
+            run_sample(logits, counts, 8, Mode::PLess, false, 20, options.suppress_stop);
+            run_mtp(logits, counts, 3, Mode::PLess, false, 20, options.suppress_stop);
             for (int k = 1; k <= 5; ++k) {
                 run_mtp(logits, counts, k, Mode::Greedy, false, 1, options.suppress_stop);
                 run_mtp(logits, counts, k, Mode::Stochastic, true, 20,

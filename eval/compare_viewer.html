@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>P-less vs production</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/contrib/auto-render.min.js"></script>
+  <style>
+    :root {
+      --bg: #121417;
+      --bg-2: #1b1f24;
+      --bg-3: #242a31;
+      --line: #323a44;
+      --text: #e7ecf1;
+      --muted: #9aa6b2;
+      --ok: #3d9a64;
+      --bad: #c45b5b;
+      --miss: #5c6570;
+      --diff: #c9a227;
+      --accent: #6ea8d8;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 14px/1.45 "Source Sans 3", "Segoe UI", sans-serif; }
+    body { display: flex; flex-direction: column; min-height: 100%; }
+    header { padding: 12px 16px 8px; border-bottom: 1px solid var(--line); background: var(--bg-2); }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .row + .row { margin-top: 8px; }
+    label { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+    select, button, input[type="number"] {
+      background: var(--bg-3); color: var(--text); border: 1px solid var(--line);
+      border-radius: 6px; padding: 5px 8px; font: inherit;
+    }
+    button { cursor: pointer; }
+    button:hover { border-color: var(--accent); }
+    .scores { color: var(--muted); }
+    .scores b { color: var(--text); font-weight: 600; }
+    .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+    .chip {
+      width: 28px; height: 24px; border-radius: 4px; border: 1px solid var(--line);
+      background: var(--bg-3); color: var(--muted); font-size: 11px; padding: 0; cursor: pointer;
+    }
+    .chip.on { outline: 1px solid var(--accent); color: var(--text); }
+    .chip.ok { background: #1c3a29; color: #b7e0c6; }
+    .chip.bad { background: #3a1c1c; color: #f0c4c4; }
+    .chip.diff { background: #3a3214; color: #f0e0a0; }
+    .chip.miss { background: var(--bg); color: var(--miss); }
+    .question {
+      margin: 0 16px; padding: 12px 14px; border-bottom: 1px solid var(--line);
+      background: var(--bg-2);
+    }
+    .question h2 { margin: 0 0 8px; font-size: 13px; color: var(--muted); font-weight: 600; letter-spacing: .04em; text-transform: uppercase; display: flex; gap: 12px; flex-wrap: wrap; align-items: baseline; }
+    .question .body { white-space: pre-wrap; font-size: 16px; line-height: 1.55; }
+    .panes { flex: 1; display: grid; grid-template-columns: 1fr 1fr; min-height: 0; }
+    .pane { display: flex; flex-direction: column; min-width: 0; border-right: 1px solid var(--line); overflow: hidden; }
+    .pane:last-child { border-right: 0; }
+    .pane-head { padding: 10px 14px; background: var(--bg-2); border-bottom: 1px solid var(--line); }
+    .pane-head h1 { margin: 0 0 6px; font-size: 16px; }
+    .meta { color: var(--muted); font-size: 12px; display: flex; gap: 10px; flex-wrap: wrap; }
+    .tag { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 12px; border: 1px solid var(--line); }
+    .tag.ok { color: #b7e0c6; border-color: var(--ok); }
+    .tag.bad { color: #f0c4c4; border-color: var(--bad); }
+    .tag.miss { color: var(--muted); }
+    .pane-body { flex: 1; overflow: auto; padding: 0 14px 24px; }
+    section { margin-top: 14px; }
+    section h2 { margin: 0 0 6px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+    .prose { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14.5px; line-height: 1.5; }
+    .empty { color: var(--muted); padding: 24px 8px; }
+    .katex-display { margin: .6em 0; overflow-x: auto; overflow-y: hidden; }
+    kbd { font-size: 11px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 3px; padding: 0 4px; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="row">
+      <label>Production
+        <select id="prodRun"></select>
+      </label>
+      <label>P-less
+        <select id="plessRun"></select>
+      </label>
+      <label>Job
+        <select id="job"></select>
+      </label>
+      <label>Filter
+        <select id="filter">
+          <option value="all">All</option>
+          <option value="disagree">Disagree</option>
+          <option value="wrong">Either wrong</option>
+          <option value="missing">Missing a side</option>
+        </select>
+      </label>
+      <label>Question
+        <button id="prev" type="button">←</button>
+        <input id="qIndex" type="number" min="0" step="1" style="width:4.5em">
+        <button id="next" type="button">→</button>
+        <span id="qCount" class="scores"></span>
+      </label>
+      <button id="refresh" type="button">Refresh</button>
+      <label><input id="auto" type="checkbox"> Auto-refresh</label>
+      <span class="scores" id="jobScores"></span>
+    </div>
+    <div class="row">
+      <div class="chips" id="chips"></div>
+      <span class="scores">←/→ question · independent sample menus below · <kbd>r</kbd> reload</span>
+    </div>
+  </header>
+  <div class="question">
+    <h2>Question <span id="qMeta"></span></h2>
+    <div class="body" id="question">Loading…</div>
+  </div>
+  <div class="panes">
+    <div class="pane" data-side="production"></div>
+    <div class="pane" data-side="p_less"></div>
+  </div>
+<script>
+const MATH_LIMIT = 24000;
+const HUGE_TEXT = 80000;
+const state = {
+  data: null,
+  jobId: null,
+  index: 0,
+  sample: { production: 0, p_less: 0 },
+  syncing: false,
+  loadSeq: 0,
+};
+let sampleAbort = null;
+
+function $(id) { return document.getElementById(id); }
+
+function selectedJob() {
+  return (state.data?.jobs || []).find(job => job.id === state.jobId) || state.data?.jobs?.[0];
+}
+
+function itemMap(side) {
+  const map = new Map();
+  for (const item of side?.items || []) map.set(String(item.index), item);
+  return map;
+}
+
+function classification(prod, pless) {
+  const p = prod?.samples?.[0];
+  const q = pless?.samples?.[0];
+  if (!p || !q) return "miss";
+  const pOk = p.acc === 1 || p.acc === true;
+  const qOk = q.acc === 1 || q.acc === true;
+  if (pOk !== qOk || String(p.extracted) !== String(q.extracted)) return "diff";
+  if (pOk && qOk) return "ok";
+  return "bad";
+}
+
+function matchesFilter(kind) {
+  const filter = $("filter").value;
+  if (filter === "all") return true;
+  if (filter === "disagree") return kind === "diff";
+  if (filter === "wrong") return kind === "bad" || kind === "diff";
+  if (filter === "missing") return kind === "miss";
+  return true;
+}
+
+function indicesForJob(job) {
+  const keys = new Set();
+  for (const item of job?.production?.items || []) keys.add(Number(item.index));
+  for (const item of job?.p_less?.items || []) keys.add(Number(item.index));
+  const planned = Math.max(
+    job?.production?.planned || 0,
+    job?.p_less?.planned || 0,
+    30,
+  );
+  if (keys.size === 0) {
+    return Array.from({ length: planned }, (_, i) => i);
+  }
+  const max = Math.max(...keys, planned - 1);
+  return Array.from({ length: max + 1 }, (_, i) => i);
+}
+
+function fmtAcc(sample) {
+  if (!sample) return "missing";
+  if (sample.acc === 1 || sample.acc === true) return "correct";
+  if (sample.acc === 0 || sample.acc === false) return "wrong";
+  return "unscored";
+}
+
+function fmtTokens(sample) {
+  if (!sample) return "";
+  const bits = [];
+  if (sample.output_tokens != null) bits.push(sample.output_tokens + " tok");
+  if (sample.reasoning_tokens != null) bits.push(sample.reasoning_tokens + " think");
+  if (sample.reasoning_chars) bits.push(sample.reasoning_chars.toLocaleString() + " reasoning chars");
+  if (sample.stop_reason) bits.push(sample.stop_reason);
+  return bits.join(" · ");
+}
+
+function renderMath(el, text, withDollar) {
+  const raw = text || "";
+  if (raw.length > HUGE_TEXT) {
+    el.textContent =
+      raw.slice(0, 40000) +
+      "\n\n… [" + raw.length.toLocaleString() + " chars; truncated for display] …\n\n" +
+      raw.slice(-12000);
+    return;
+  }
+  el.textContent = raw;
+  if (!window.renderMathInElement || !raw || raw.length > MATH_LIMIT) return;
+  const delimiters = [
+    { left: "$$", right: "$$", display: true },
+    { left: "\\[", right: "\\]", display: true },
+    { left: "\\(", right: "\\)", display: false },
+  ];
+  if (withDollar) {
+    delimiters.push({ left: "$", right: "$", display: false });
+  }
+  try {
+    renderMathInElement(el, { delimiters, throwOnError: false, ignoredTags: ["script", "noscript", "style"] });
+  } catch (err) {
+    el.textContent = raw;
+  }
+}
+
+function sideLabel(side) {
+  return side === "production" ? "Production" : "P-less";
+}
+
+function fillRuns() {
+  const runs = state.data.runs || [];
+  state.syncing = true;
+  for (const [id, key] of [["prodRun", "production_id"], ["plessRun", "p_less_id"]]) {
+    const select = $(id);
+    const current = state.data[key];
+    select.innerHTML = runs.map(run => {
+      const tag = run.method ? ` (${run.method})` : "";
+      const st = run.status ? ` · ${run.status}` : "";
+      return `<option value="${run.id}" ${run.id === current ? "selected" : ""}>${run.id}${tag}${st}</option>`;
+    }).join("");
+  }
+  state.syncing = false;
+}
+
+function fillJobs() {
+  const select = $("job");
+  state.syncing = true;
+  select.innerHTML = (state.data.jobs || []).map(job => {
+    const t = job.temperature == null ? "" : ` T=${job.temperature}`;
+    const p = job.production;
+    const q = job.p_less;
+    const pN = p.n || 0;
+    const qN = q.n || 0;
+    return `<option value="${job.id}" ${job.id === state.jobId ? "selected" : ""}>${job.dataset || job.id}${t} · prod ${pN} · p-less ${qN}</option>`;
+  }).join("");
+  state.syncing = false;
+}
+
+function renderChips() {
+  const job = selectedJob();
+  const prod = itemMap(job?.production);
+  const pless = itemMap(job?.p_less);
+  const chips = $("chips");
+  chips.innerHTML = "";
+  for (const index of indicesForJob(job)) {
+    const kind = classification(prod.get(String(index)), pless.get(String(index)));
+    const btn = document.createElement("button");
+    btn.className = `chip ${kind}` + (index === state.index ? " on" : "");
+    btn.textContent = index;
+    btn.title = `item ${index} (${kind})`;
+    btn.addEventListener("click", () => setIndex(index));
+    chips.appendChild(btn);
+  }
+}
+
+function jobScoreLine(job) {
+  if (!job) return "";
+  const p = job.production;
+  const q = job.p_less;
+  const pTxt = p.scored ? `${p.correct}/${p.scored}` : `${p.n || 0} done`;
+  const qTxt = q.scored ? `${q.correct}/${q.scored}` : `${q.n || 0} done`;
+  return `Production ${pTxt} (${p.status || "?"}) · P-less ${qTxt} (${q.status || "?"})`;
+}
+
+function renderPane(side, payload, meta) {
+  const el = document.querySelector(`.pane[data-side="${side}"]`);
+  const samples = meta?.samples || [];
+  const sampleI = Math.min(state.sample[side] || 0, Math.max(0, samples.length - 1));
+  state.sample[side] = sampleI;
+  const sampleMeta = samples[sampleI];
+  const accClass = !sampleMeta ? "miss" : (sampleMeta.acc === 1 || sampleMeta.acc === true) ? "ok" : (sampleMeta.acc == null ? "miss" : "bad");
+  const options = samples.map((sample, i) =>
+    `<option value="${i}" ${i === sampleI ? "selected" : ""}>#${i} extracted ${sample.extracted || "?"} · ${fmtAcc(sample)}</option>`
+  ).join("");
+  if (!payload) {
+    el.innerHTML = `
+      <div class="pane-head">
+        <h1>${sideLabel(side)}</h1>
+        <div class="meta">
+          <label>Sample <select data-sample="${side}" ${samples.length ? "" : "disabled"}>${options || "<option>none</option>"}</select></label>
+        </div>
+      </div>
+      <div class="pane-body"><div class="empty">${samples.length ? "Loading…" : "Not generated yet."}</div></div>`;
+    bindSampleSelect(el, side);
+    return;
+  }
+  el.innerHTML = `
+    <div class="pane-head">
+      <h1>${sideLabel(side)}</h1>
+      <div class="meta">
+        <label>Sample <select data-sample="${side}">${options || "<option>none</option>"}</select></label>
+        <span class="tag ${accClass}">${fmtAcc(sampleMeta)}</span>
+        <span>extracted <b>${payload.extracted || "—"}</b></span>
+        <span>gold <b>${payload.gold || meta?.gold || "—"}</b></span>
+        <span>${fmtTokens(payload)}</span>
+      </div>
+    </div>
+    <div class="pane-body">
+      <section>
+        <h2>Answer</h2>
+        <div class="prose" data-kind="visible"></div>
+      </section>
+      <section>
+        <h2>Reasoning</h2>
+        <div class="prose" data-kind="reasoning"></div>
+      </section>
+    </div>`;
+  renderMath(el.querySelector("[data-kind=visible]"), payload.visible, true);
+  renderMath(el.querySelector("[data-kind=reasoning]"), payload.reasoning, false);
+  bindSampleSelect(el, side);
+}
+
+function bindSampleSelect(el, side) {
+  const select = el.querySelector("select[data-sample]");
+  if (!select) return;
+  select.addEventListener("change", () => {
+    state.sample[side] = Number(select.value);
+    loadTranscripts();
+  });
+}
+
+async function loadState(keepIndex) {
+  const seq = ++state.loadSeq;
+  const params = new URLSearchParams();
+  if ($("prodRun").value) params.set("production", $("prodRun").value);
+  if ($("plessRun").value) params.set("p_less", $("plessRun").value);
+  const response = await fetch("/api/state?" + params.toString());
+  if (!response.ok) throw new Error("state " + response.status);
+  const data = await response.json();
+  if (seq !== state.loadSeq) return;
+  state.data = data;
+  if (!state.jobId || !data.jobs.some(job => job.id === state.jobId)) {
+    state.jobId = data.jobs[0]?.id;
+  }
+  fillRuns();
+  fillJobs();
+  $("job").value = state.jobId;
+  $("jobScores").textContent = jobScoreLine(selectedJob());
+  const idxs = indicesForJob(selectedJob());
+  if (!keepIndex || !idxs.includes(state.index)) state.index = idxs[0] || 0;
+  $("qIndex").value = state.index;
+  $("qCount").textContent = `/ ${idxs.length ? idxs[idxs.length - 1] : 0}`;
+  renderChips();
+  await loadTranscripts();
+}
+
+async function fetchSample(runId, side, signal) {
+  const job = selectedJob();
+  const items = itemMap(job?.[side === "production" ? "production" : "p_less"]);
+  const item = items.get(String(state.index));
+  if (!item || !runId) return { payload: null, meta: item };
+  const sample = state.sample[side] || 0;
+  const params = new URLSearchParams({
+    run: runId,
+    job: job.id,
+    index: String(state.index),
+    sample: String(sample),
+  });
+  const response = await fetch("/api/sample?" + params.toString(), { signal });
+  if (!response.ok) return { payload: null, meta: item };
+  return { payload: await response.json(), meta: item };
+}
+
+async function loadTranscripts() {
+  if (sampleAbort) sampleAbort.abort();
+  const abort = new AbortController();
+  sampleAbort = abort;
+  const job = selectedJob();
+  $("jobScores").textContent = jobScoreLine(job);
+  renderChips();
+  $("qIndex").value = state.index;
+  try {
+    const prod = await fetchSample(state.data.production_id, "production", abort.signal);
+    const pless = await fetchSample(state.data.p_less_id, "p_less", abort.signal);
+    if (abort.signal.aborted) return;
+    const question = prod.payload?.question || pless.payload?.question || "";
+    const gold = prod.payload?.gold || pless.payload?.gold || prod.meta?.gold || pless.meta?.gold || "";
+    const pExt = prod.payload?.extracted || prod.meta?.samples?.[state.sample.production]?.extracted || "—";
+    const qExt = pless.payload?.extracted || pless.meta?.samples?.[state.sample.p_less]?.extracted || "—";
+    $("qMeta").textContent = `item ${state.index} · gold ${gold || "—"} · prod ${pExt} · p-less ${qExt}`;
+    renderMath($("question"), question || "No transcript for this item yet.", true);
+    renderPane("production", prod.payload, prod.meta);
+    renderPane("p_less", pless.payload, pless.meta);
+  } catch (err) {
+    if (err && err.name === "AbortError") return;
+    $("question").textContent = "Failed to load transcripts. Is the viewer still running at this URL?";
+  }
+}
+
+function setIndex(index) {
+  state.index = index;
+  state.sample.production = 0;
+  state.sample.p_less = 0;
+  loadTranscripts();
+}
+
+function step(delta) {
+  const job = selectedJob();
+  const prod = itemMap(job?.production);
+  const pless = itemMap(job?.p_less);
+  const idxs = indicesForJob(job).filter(index =>
+    matchesFilter(classification(prod.get(String(index)), pless.get(String(index))))
+  );
+  if (!idxs.length) return;
+  const at = idxs.indexOf(state.index);
+  const next = idxs[(at < 0 ? 0 : at + delta + idxs.length) % idxs.length];
+  setIndex(next);
+}
+
+$("prodRun").addEventListener("change", () => { if (!state.syncing) loadState(true); });
+$("plessRun").addEventListener("change", () => { if (!state.syncing) loadState(true); });
+$("job").addEventListener("change", () => {
+  if (state.syncing) return;
+  state.jobId = $("job").value;
+  state.index = 0;
+  state.sample = { production: 0, p_less: 0 };
+  $("jobScores").textContent = jobScoreLine(selectedJob());
+  const idxs = indicesForJob(selectedJob());
+  $("qCount").textContent = `/ ${idxs.length ? idxs[idxs.length - 1] : 0}`;
+  renderChips();
+  loadTranscripts();
+});
+$("filter").addEventListener("change", () => renderChips());
+$("prev").addEventListener("click", () => step(-1));
+$("next").addEventListener("click", () => step(1));
+$("qIndex").addEventListener("change", () => setIndex(Number($("qIndex").value) || 0));
+$("refresh").addEventListener("click", () => loadState(true));
+document.addEventListener("keydown", event => {
+  if (event.target.matches("input, select, textarea")) return;
+  if (event.key === "ArrowLeft" || event.key === "k") step(-1);
+  if (event.key === "ArrowRight" || event.key === "j") step(1);
+  if (event.key === "r") loadState(true);
+});
+setInterval(() => { if ($("auto").checked) loadState(true); }, 20000);
+
+loadState(false).catch(err => {
+  $("question").textContent = "Viewer failed to load: " + err;
+});
+</script>
+</body>
+</html>

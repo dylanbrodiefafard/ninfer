@@ -169,6 +169,7 @@ MASK) chain verify. Published INT8-KV C=1 DFlash2 W8 numbers are in
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
 | `--reasoning-effort low\|medium\|xhigh` | select an effort exposed by the loaded chat template | template default |
 | `--greedy` | exact argmax decoding | off |
+| `--p-less-sampling` | full-vocabulary p-less truncation (temperature and seed only) | off |
 | `--temperature F` | sampling temperature override | registered model/mode default |
 | `--top-p F` | nucleus-threshold override | registered model/mode default |
 | `--top-k N` | top-k-threshold override | registered model/mode default |
@@ -191,6 +192,10 @@ the loaded model and the rendered prompt mode. The current presets are:
 
 Frequency penalty is `0` in every registered preset. Qwen's separate precise-coding recommendation
 is task-specific and is therefore an explicit override rather than an inferred Engine default.
+
+`--p-less-sampling` is a process-level truncation mode, not a registered preset. It keeps
+temperature and seed, ignores top-p, top-k, min-p, and presence/frequency penalties, and writes a
+one-time warning on stderr. Combined with `--greedy` it remains exact argmax.
 
 Repeat `--stop-token-id`, `--stop`, or `--reasoning-stop` to add stop conditions. Use
 `--raw-output` to expose the frontend's raw output stream and `--print-token-ids` to include

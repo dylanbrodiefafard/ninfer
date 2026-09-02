@@ -4,8 +4,8 @@
 // Match: contiguous BF16 logits, physical stride >= token domain, and at most
 // sixteen columns on the multi-block route.
 // Algorithm assumptions: 256-thread/2-item partial tiles feed bounded top-20
-// group merges through caller-owned workspace; unsupported finite geometries
-// use the semantically identical single-block fallback.
+// merges or full-vocabulary p-less moments through caller-owned workspace;
+// unsupported finite geometries use the single-block fallback.
 
 #include "ops/kernel/sampling_device.cuh"
 
@@ -23,6 +23,27 @@ __launch_bounds__(kSamplerBlock) __global__
 
     __shared__ float red_val[kSamplerBlock];
     __shared__ int red_idx[kSamplerBlock];
+    __shared__ float red_aux[kSamplerBlock];
+
+    const int partial_blocks = div_up(token_domain, kSamplerPartialTileItems);
+    const int group_count    = sampler_group_count(partial_blocks);
+    // The partial/group/mass path owns every mode on representable large shapes.
+    // This kernel remains in the graph and handles only the small/fallback route.
+    if (sampler_multiblock_ok(token_domain, static_cast<int>(gridDim.x), partial_blocks,
+                              group_count)) {
+        return;
+    }
+
+    if (sampling_p_less_active(cfg)) {
+        const int picked =
+            sampling_p_less_draw(logits, base, token_domain, cfg, logical_positions[row], purpose,
+                                 red_val, red_idx, red_aux);
+        if (tid == 0) {
+            out[row] = picked;
+            if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
+        }
+        return;
+    }
 
     // Greedy: exact argmax over raw logits. Bit-identical to argmax().
     if (!(cfg.temperature > 0.0f)) {
@@ -48,14 +69,6 @@ __launch_bounds__(kSamplerBlock) __global__
             __syncthreads();
         }
         if (tid == 0) { out[row] = red_idx[0]; }
-        return;
-    }
-
-    const int partial_blocks = div_up(token_domain, kSamplerPartialTileItems);
-    const int group_count    = sampler_group_count(partial_blocks);
-    // No-op when the scratch/group path owns this shape (see sample_batch_launch).
-    if (sampler_multiblock_ok(token_domain, static_cast<int>(gridDim.x), partial_blocks,
-                              group_count)) {
         return;
     }
 
@@ -101,12 +114,22 @@ __launch_bounds__(kSamplerBlock) __global__
 
     __shared__ typename SamplingPartialSort::TempStorage sort_storage;
     __shared__ unsigned long long greedy_warp_keys[kSamplerBlock / 32];
+    __shared__ float p_less_red_val[kSamplerBlock];
+    __shared__ float p_less_red_aux[kSamplerBlock];
     unsigned long long keys[kSamplerItemsPerThread];
 
-    const bool greedy       = !(cfg.temperature > 0.0f);
-    const int cap           = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
     const std::int64_t base = static_cast<std::int64_t>(col) * physical_rows;
     const int tile_start    = partial * kSamplerPartialTileItems;
+    if (sampling_p_less_active(cfg)) {
+        const SamplingPLessMoments moments = sampling_p_less_tile_moments(
+            logits, base, token_domain, tile_start, 1.0f / cfg.temperature, p_less_red_val,
+            p_less_red_aux, greedy_warp_keys);
+        if (threadIdx.x == 0) { sampling_p_less_store_moments(workspace, col, partial, moments); }
+        return;
+    }
+
+    const bool greedy = !(cfg.temperature > 0.0f);
+    const int cap     = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
 #pragma unroll
     for (int item = 0; item < kSamplerItemsPerThread; ++item) {
         const int v = tile_start + item * blockDim.x + threadIdx.x;
@@ -155,13 +178,14 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
     __shared__ float cand_val[kSamplerCandidateCap];
     __shared__ int cand_idx[kSamplerCandidateCap];
     __shared__ float prob[kSamplerCandidateCap];
+    __shared__ unsigned long long published_keys[kSamplerCandidateCap];
     __shared__ int n_support;
     __shared__ int is_last;
     __shared__ unsigned long long greedy_warp_keys[kSamplerGroupBlock / 32];
+    __shared__ float p_less_red_val[kSamplerGroupBlock];
+    __shared__ float p_less_red_aux[kSamplerGroupBlock];
     unsigned long long keys[kSamplerGroupItemsPerThread];
 
-    const bool greedy = !(cfg.temperature > 0.0f);
-    const int cap     = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
     // The preceding partial launch initializes group_done[col], so caller-owned
     // workspace does not rely on prior contents or a separate memset launch.
 
@@ -170,6 +194,31 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
     if (group_partials < 0) { group_partials = 0; }
     if (group_partials > kSamplerPartialsPerGroup) { group_partials = kSamplerPartialsPerGroup; }
 
+    if (sampling_p_less_active(cfg)) {
+        const float inv_temp = 1.0f / cfg.temperature;
+        const SamplingPLessMoments group_moments = sampling_p_less_merge_moments(
+            workspace, col, group_begin, group_partials, inv_temp, p_less_red_val,
+            p_less_red_aux, greedy_warp_keys);
+        if (tid == 0) {
+            sampling_p_less_store_moments(workspace, col, partial_blocks + group, group_moments);
+            const int done = sampling_completion_add(&workspace.group_done[col], group_count);
+            is_last        = done == group_count ? 1 : 0;
+        }
+        __syncthreads();
+        if (!is_last) { return; }
+
+        const SamplingPLessMoments global_moments = sampling_p_less_merge_moments(
+            workspace, col, partial_blocks, group_count, inv_temp, p_less_red_val,
+            p_less_red_aux, greedy_warp_keys);
+        if (tid == 0) {
+            sampling_p_less_store_global(workspace, col, global_moments);
+            workspace.group_done[col] = 0;
+        }
+        return;
+    }
+
+    const bool greedy = !(cfg.temperature > 0.0f);
+    const int cap     = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
     if (greedy) {
         unsigned long long best = 0ull;
         for (int p = tid; p < group_partials; p += blockDim.x) {
@@ -179,9 +228,8 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
         best = sampling_block_max_key(best, greedy_warp_keys);
         if (tid == 0) {
             const int out_off = sampling_partial_offset(workspace, col, partial_blocks + group, 0);
-            workspace.partial_keys[out_off] = best;
-            __threadfence();
-            const int done = atomicAdd(&workspace.group_done[col], 1) + 1;
+            sampling_publish_key(workspace, out_off, best);
+            const int done = sampling_completion_add(&workspace.group_done[col], group_count);
             is_last        = (done == group_count) ? 1 : 0;
         }
         __syncthreads();
@@ -190,7 +238,8 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
         best = 0ull;
         for (int p = tid; p < group_count; p += blockDim.x) {
             const int off = sampling_partial_offset(workspace, col, partial_blocks + p, 0);
-            if (workspace.partial_keys[off] > best) { best = workspace.partial_keys[off]; }
+            const unsigned long long candidate = sampling_load_published_key(workspace, off);
+            if (candidate > best) { best = candidate; }
         }
         best = sampling_block_max_key(best, greedy_warp_keys);
         if (tid == 0) {
@@ -218,17 +267,17 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
 #pragma unroll
     for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
         const int rank = tid * kSamplerGroupItemsPerThread + item;
-        if (rank < cap) {
-            const int out_off =
-                sampling_partial_offset(workspace, col, partial_blocks + group, rank);
-            workspace.partial_keys[out_off] = keys[item];
-        }
+        if (rank < cap) { published_keys[rank] = keys[item]; }
     }
     __syncthreads();
 
     if (tid == 0) {
-        __threadfence();
-        const int done = atomicAdd(&workspace.group_done[col], 1) + 1;
+        for (int rank = 0; rank < cap; ++rank) {
+            const int out_off =
+                sampling_partial_offset(workspace, col, partial_blocks + group, rank);
+            sampling_publish_key(workspace, out_off, published_keys[rank]);
+        }
+        const int done = sampling_completion_add(&workspace.group_done[col], group_count);
         is_last        = (done == group_count) ? 1 : 0;
     }
     __syncthreads();
@@ -242,7 +291,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
             const int partial = partial_blocks + p / cap;
             const int j       = p - (p / cap) * cap;
             const int off     = sampling_partial_offset(workspace, col, partial, j);
-            keys[item]        = workspace.partial_keys[off];
+            keys[item]        = sampling_load_published_key(workspace, off);
         } else {
             keys[item] = 0ull;
         }
@@ -275,6 +324,95 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
         out[col] = picked;
         if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
         workspace.group_done[col] = 0;
+    }
+}
+
+__launch_bounds__(kSamplerBlock) __global__ void sampling_p_less_mass_sample_kernel(
+    const __nv_bfloat16* logits, std::int32_t* out, const SamplingConfig* cfg_ptr,
+    const std::int32_t* logical_positions, std::int32_t purpose, std::int32_t token_domain,
+    std::int32_t physical_rows, std::int32_t partial_blocks, SamplingWorkspace workspace) {
+    const int col            = static_cast<int>(blockIdx.y);
+    const SamplingConfig cfg = cfg_ptr[col];
+    if (!sampling_p_less_active(cfg)) { return; }
+
+    __shared__ float warp_sums[kSamplerBlock];
+    __shared__ float weights[kSamplerBlock];
+    __shared__ float admitted;
+    __shared__ float selected_goal;
+    __shared__ float running;
+    __shared__ int is_last;
+    __shared__ int selected_tile;
+    __shared__ int picked;
+    __shared__ int found;
+
+    const SamplingPLessMoments moments = sampling_p_less_load_global(workspace, col);
+    const float thresh                 = sampling_p_less_load_threshold(workspace, col);
+    const float inv_temp               = 1.0f / cfg.temperature;
+    const std::int64_t base            = static_cast<std::int64_t>(col) * physical_rows;
+    for (int partial = static_cast<int>(blockIdx.x); partial < partial_blocks;
+         partial += static_cast<int>(gridDim.x)) {
+        const int tile_start = partial * kSamplerPartialTileItems;
+        const float tile_mass = sampling_p_less_tile_admitted_mass(
+            logits, base, token_domain, tile_start, moments.m, inv_temp, thresh, warp_sums);
+
+        if (threadIdx.x == 0) {
+            sampling_p_less_store_tile_mass(workspace, col, partial, tile_mass);
+            const int done = sampling_completion_add(&workspace.group_done[col], partial_blocks);
+            is_last        = done == partial_blocks ? 1 : 0;
+        }
+        __syncthreads();
+        if (!is_last) { continue; }
+
+        if (threadIdx.x == 0) {
+            float total = 0.0f;
+            for (int p = 0; p < partial_blocks; ++p) {
+                total += sampling_p_less_load_tile_mass(workspace, col, p);
+            }
+            admitted = total;
+            sampling_p_less_store_admitted(workspace, col, total);
+            selected_tile = -1;
+            selected_goal = 0.0f;
+            picked        = moments.argmax;
+            if (total > 0.0f) {
+                const float goal =
+                    sampling_uniform(cfg.seed, logical_positions[col], purpose, 0u) * total;
+                float prefix      = 0.0f;
+                int last_nonempty = -1;
+                float last_prefix = 0.0f;
+                for (int p = 0; p < partial_blocks; ++p) {
+                    const float mass = sampling_p_less_load_tile_mass(workspace, col, p);
+                    if (mass > 0.0f) {
+                        last_nonempty = p;
+                        last_prefix   = prefix;
+                    }
+                    if (goal < prefix + mass) {
+                        selected_tile = p;
+                        selected_goal = goal - prefix;
+                        break;
+                    }
+                    prefix += mass;
+                }
+                if (selected_tile < 0 && last_nonempty >= 0) {
+                    selected_tile = last_nonempty;
+                    selected_goal = fmaxf(0.0f, goal - last_prefix);
+                }
+            }
+        }
+        __syncthreads();
+
+        int result = moments.argmax;
+        if (selected_tile >= 0) {
+            result = sampling_p_less_pick_from_tile(
+                logits, base, token_domain, selected_tile, moments.m, inv_temp, thresh, admitted,
+                selected_goal, moments.argmax, false, -1, nullptr, nullptr, 0, weights, &running,
+                &picked, &found);
+        }
+        if (threadIdx.x == 0) {
+            out[col] = result;
+            if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[result], 1); }
+            workspace.group_done[col] = 0;
+        }
+        return;
     }
 }
 

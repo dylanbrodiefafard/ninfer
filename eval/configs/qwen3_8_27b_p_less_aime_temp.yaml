@@ -1,0 +1,122 @@
+schema_version: 1
+
+# Client-side AIME25/AIME26 temperature matrix for production sampling vs process-level
+# --p-less-sampling. Run the same yaml twice against two sequential ninfer-serve processes;
+# see eval/README.md. Client top_p/top_k/presence_penalty apply only on the production server.
+
+targets:
+  qwen38_api:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18080/v1
+    model: qwen3.8-27b
+    max_concurrency: 1
+    request:
+      timeout_seconds: 86400
+      retries: 2
+      retry_interval_seconds: 10
+
+suites:
+  aime_temp:
+    jobs:
+      - id: aime25_t06
+        backend: evalscope
+        dataset: aime25
+        target: qwen38_api
+        max_concurrency: 1
+        generation: &gen_t06
+          temperature: 0.6
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 1.0
+          frequency_penalty: 0.0
+          max_tokens: 262144
+          seed: 42
+        backend_args: &aime_backend
+          judge_strategy: rule
+
+      - id: aime26_t06
+        backend: evalscope
+        dataset: aime26
+        target: qwen38_api
+        max_concurrency: 1
+        generation: *gen_t06
+        backend_args: *aime_backend
+
+      - id: aime25_t10
+        backend: evalscope
+        dataset: aime25
+        target: qwen38_api
+        max_concurrency: 1
+        generation: &gen_t10
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 1.0
+          frequency_penalty: 0.0
+          max_tokens: 262144
+          seed: 42
+        backend_args: *aime_backend
+
+      - id: aime26_t10
+        backend: evalscope
+        dataset: aime26
+        target: qwen38_api
+        max_concurrency: 1
+        generation: *gen_t10
+        backend_args: *aime_backend
+
+      - id: aime25_t15
+        backend: evalscope
+        dataset: aime25
+        target: qwen38_api
+        max_concurrency: 1
+        generation: &gen_t15
+          temperature: 1.5
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 1.0
+          frequency_penalty: 0.0
+          max_tokens: 262144
+          seed: 42
+        backend_args: *aime_backend
+
+      - id: aime26_t15
+        backend: evalscope
+        dataset: aime26
+        target: qwen38_api
+        max_concurrency: 1
+        generation: *gen_t15
+        backend_args: *aime_backend
+
+      - id: aime25_t20
+        backend: evalscope
+        dataset: aime25
+        target: qwen38_api
+        max_concurrency: 1
+        generation: &gen_t20
+          temperature: 2.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 1.0
+          frequency_penalty: 0.0
+          max_tokens: 262144
+          seed: 42
+        backend_args: *aime_backend
+
+      - id: aime26_t20
+        backend: evalscope
+        dataset: aime26
+        target: qwen38_api
+        max_concurrency: 1
+        generation: *gen_t20
+        backend_args: *aime_backend
+
+runtime:
+  max_parallel_jobs: 1
+  runs_dir: eval/runs
+  progress:
+    enabled: true
+    refresh_seconds: 1
+    heartbeat_seconds: 30
+  samples:
+    retention: all

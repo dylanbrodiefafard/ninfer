@@ -163,13 +163,15 @@ Json event_base(const std::string& server_instance_id, std::uint64_t timestamp, 
 }
 
 Json sampler_json(const ninfer::ResolvedSamplingParameters& sampling) {
-    return Json{{"temperature", sampling.temperature},
-                {"top_p", sampling.top_p},
-                {"top_k", sampling.top_k},
-                {"min_p", sampling.min_p},
-                {"presence_penalty", sampling.presence_penalty},
-                {"frequency_penalty", sampling.frequency_penalty},
-                {"seed", sampling.seed}};
+    Json out{{"temperature", sampling.temperature},
+             {"top_p", sampling.top_p},
+             {"top_k", sampling.top_k},
+             {"min_p", sampling.min_p},
+             {"presence_penalty", sampling.presence_penalty},
+             {"frequency_penalty", sampling.frequency_penalty},
+             {"seed", sampling.seed},
+             {"p_less", sampling.p_less}};
+    return out;
 }
 
 Json preset_json(const ninfer::SamplingPreset& preset) {
@@ -188,7 +190,8 @@ Json overrides_json(const ninfer::SamplingOverrides& overrides) {
                 {"min_p", nullptr},
                 {"presence_penalty", nullptr},
                 {"frequency_penalty", nullptr},
-                {"seed", nullptr}};
+                {"seed", nullptr},
+                {"p_less", overrides.p_less}};
     if (overrides.temperature) { result["temperature"] = *overrides.temperature; }
     if (overrides.top_p) { result["top_p"] = *overrides.top_p; }
     if (overrides.top_k) { result["top_k"] = *overrides.top_k; }
@@ -281,7 +284,12 @@ std::string seconds_str(double seconds) {
 std::string sampler_str(const ninfer::ResolvedSamplingParameters& sampling) {
     if (sampling.temperature <= 0.0f) { return "greedy"; }
     std::ostringstream out;
-    out << std::fixed << std::setprecision(2) << "temp=" << sampling.temperature
+    out << std::fixed << std::setprecision(2);
+    if (sampling.p_less) {
+        out << "p-less temp=" << sampling.temperature << " seed=" << sampling.seed;
+        return out.str();
+    }
+    out << "temp=" << sampling.temperature
         << " top_p=" << sampling.top_p << " top_k=" << sampling.top_k;
     if (sampling.min_p > 0.0f) { out << " min_p=" << sampling.min_p; }
     if (sampling.presence_penalty != 0.0f) { out << " pres=" << sampling.presence_penalty; }

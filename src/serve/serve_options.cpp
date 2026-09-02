@@ -97,7 +97,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--system-prepend TEXT] "
            "[--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
-           "[--frequency-penalty F] [--seed N] [--greedy]\n"
+           "[--frequency-penalty F] [--seed N] [--greedy] [--p-less-sampling]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
            "       --default-max-tokens defaults to " +
            std::to_string(kDefaultMaxTokens) +
@@ -122,7 +122,9 @@ std::string serve_usage_text(const char* argv0) {
            "every request (inserts a system turn if missing)\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
-           "       --greedy forces temperature 0 (exact argmax).\n";
+           "       --greedy forces temperature 0 (exact argmax).\n"
+           "       --p-less-sampling uses temperature (and seed) only; top-p, top-k, min-p, and "
+           "penalties from flags and requests are ignored.\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -283,6 +285,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.sampling_overrides.seed = parse_u64(require_value("--seed"), "seed");
         } else if (arg == "--greedy") {
             options.greedy = true;
+        } else if (arg == "--p-less-sampling") {
+            options.sampling_overrides.p_less = true;
         } else {
             throw std::invalid_argument("unknown argument: " + arg);
         }

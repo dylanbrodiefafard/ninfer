@@ -33,6 +33,7 @@ struct SamplingConfig {
     float min_p                = 0.0f; // <= 0 => disabled
     float presence_penalty     = 0.0f;
     float frequency_penalty    = 0.0f;
+    std::int32_t p_less        = 0; // != 0 => p-less; ignore top_k/top_p/min_p/penalties
     unsigned long long seed    = 0;
     std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
     std::int32_t suppressed_token_count = 0;
@@ -58,7 +59,11 @@ struct SamplingConfig {
  *   out[b] = min argmax_v float(logits[v,b]).
  *
  * Penalties, filters, RNG, and token_counts updates are skipped for that row. With positive
- * temperature, let c_v=configs[b].token_counts[v] (or zero when the pointer is null):
+ * temperature and configs[b].p_less!=0, let z_v=float(logits[v,b]) over v in [0,token_domain)
+ * (penalties, top_k, top_p, and min_p are ignored). Let p=softmax(z/temperature) over that
+ * domain, L=sum_v p_v^2, and V={v: p_v>=L} (non-empty: the mode is always admitted). Sample
+ * from the renormalized restriction of p to V. With positive temperature and p_less==0, let
+ * c_v=configs[b].token_counts[v] (or zero when the pointer is null):
  *
  *   adjusted_v = float(logits[v,b])
  *                - configs[b].presence_penalty * (c_v > 0)
@@ -69,7 +74,8 @@ struct SamplingConfig {
  * Candidate weights are exp(adjusted_v/temperature-max). min_p removes the suffix below
  * min_p*max_weight; top_p keeps the shortest remaining prefix whose cumulative weight reaches
  * top_p times the pre-truncation candidate weight. At least the best candidate remains, the
- * support is renormalized, and one id is drawn for that row.
+ * support is renormalized, and one id is drawn for that row. Greedy, p-less, and truncated
+ * rows may coexist in one invocation.
  *
  * Row b uses counter-based RNG key
  * (configs[b].seed,logical_positions[b],purpose), without mutable RNG state or dependence on the
