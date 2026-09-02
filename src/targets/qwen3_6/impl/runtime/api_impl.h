@@ -187,6 +187,12 @@ Program<Variant>::decode_batch(std::span<const std::uint32_t> lanes,
 }
 
 template <>
+void Program<Variant>::set_suppressed_tokens_lane(std::uint32_t lane,
+                                                  std::span<const TokenId> tokens) {
+    impl_->set_suppressed_tokens_lane(lane, tokens);
+}
+
+template <>
 void Program<Variant>::clear_suppressed_tokens_lane(std::uint32_t lane) {
     impl_->clear_suppressed_tokens_lane(lane);
 }
@@ -195,8 +201,9 @@ template <>
 void Program<Variant>::resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                              std::span<const std::uint32_t> accepted_tokens,
                                              std::span<const std::uint8_t> terminal,
-                                             std::span<const std::uint8_t> cancelled) {
-    impl_->resolve_pending_batch(lanes, accepted_tokens, terminal, cancelled);
+                                             std::span<const std::uint8_t> cancelled,
+                                             std::span<const std::uint8_t> rejected) {
+    impl_->resolve_pending_batch(lanes, accepted_tokens, terminal, cancelled, rejected);
 }
 
 template <>

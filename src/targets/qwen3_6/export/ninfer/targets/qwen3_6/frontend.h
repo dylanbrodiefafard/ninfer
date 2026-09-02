@@ -95,8 +95,10 @@ public:
                                                   FinishReason limit_reason);
     [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
     [[nodiscard]] PublishedOutput commit_preview() noexcept;
+    void discard_preview() noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
     [[nodiscard]] bool in_reasoning() const noexcept;
+    [[nodiscard]] bool model_stop_tokens_allowed() const noexcept;
 
 private:
     class Impl;

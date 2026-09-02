@@ -122,6 +122,10 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
     const nlohmann::json tokens = nlohmann::json::array(
         {added(1, "helloST"), added(2, "OPtail"), added(3, "thought</thi"),
          added(4, "nk>\n\nanswer"), added(6, "<eos>", true), added(7, "<0.0 seconds>"),
+         added(14, "   \n"), added(15, "answer"),
+         added(16, "<tool_"), added(17, "call>"), added(18, "<function=f>"),
+         added(19, "</function>"), added(20, "</tool_call>"), added(21, "<tool_call>"),
+         added(22, "preface"),
          added(30, "user\n"), added(31, "assistant\n"), added(32, "\n"),
          added(248045, "<|im_start|>", true), added(248046, "<|im_end|>", true),
          added(248053, "<|vision_start|>", true), added(248054, "<|vision_end|>", true),
@@ -1195,6 +1199,166 @@ int test_reasoning_split(const Frontend& frontend) {
     return failures;
 }
 
+int test_structured_model_stop_eligibility(const Frontend& frontend) {
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput thinking_input;
+    thinking_input.messages.push_back(std::move(message));
+    thinking_input.options.enable_thinking = true;
+    auto thinking_prompt = frontend.prepare(std::move(thinking_input));
+    auto thinking        = frontend.make_output_session(thinking_prompt, {});
+
+    int failures = check(!thinking.model_stop_tokens_allowed(),
+                         "model stop was eligible during reasoning");
+    auto decision = thinking.preview(std::array<ninfer::TokenId, 1>{248069}, 8,
+                                     ninfer::FinishReason::OutputLimit);
+    failures += check(!decision.finished() && !decision.reject_generated_round,
+                      "reasoning close was rejected");
+    (void)thinking.commit_preview();
+    failures += check(!thinking.in_reasoning() && !thinking.model_stop_tokens_allowed(),
+                      "model stop was eligible before post-reasoning content");
+
+    decision = thinking.preview(std::array<ninfer::TokenId, 1>{14}, 7,
+                                ninfer::FinishReason::OutputLimit);
+    (void)thinking.commit_preview();
+    failures += check(!thinking.model_stop_tokens_allowed(),
+                      "whitespace made the post-reasoning model stop eligible");
+
+    decision = thinking.preview(std::array<ninfer::TokenId, 1>{6}, 6,
+                                ninfer::FinishReason::OutputLimit);
+    failures += check(decision.reject_generated_round && decision.accepted_tokens == 0 &&
+                          !decision.finished(),
+                      "invalid empty-answer model stop was not rejected");
+    thinking.discard_preview();
+    failures += check(!thinking.model_stop_tokens_allowed(),
+                      "discarding an invalid stop changed output state");
+
+    decision = thinking.preview(std::array<ninfer::TokenId, 1>{15}, 6,
+                                ninfer::FinishReason::OutputLimit);
+    (void)thinking.commit_preview();
+    failures += check(thinking.model_stop_tokens_allowed(),
+                      "answer content did not make the model stop eligible");
+    decision = thinking.preview(std::array<ninfer::TokenId, 1>{6}, 5,
+                                ninfer::FinishReason::OutputLimit);
+    failures += check(decision.finished() &&
+                          decision.finish_reason == ninfer::FinishReason::StopToken &&
+                          !decision.reject_generated_round,
+                      "established answer did not stop normally");
+    (void)thinking.commit_preview();
+
+    ninfer::ChatMessage tool_message;
+    tool_message.role = ninfer::ChatRole::User;
+    tool_message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::ChatMessage assistant_call;
+    assistant_call.role = ninfer::ChatRole::Assistant;
+    assistant_call.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "", .media = {}});
+    assistant_call.tool_calls.push_back(
+        ninfer::ToolCall{.id = "", .name = "f", .arguments_json = "{}"});
+    ninfer::ChatMessage next_message;
+    next_message.role = ninfer::ChatRole::User;
+    next_message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput tool_input;
+    tool_input.messages.push_back(std::move(tool_message));
+    tool_input.messages.push_back(std::move(assistant_call));
+    tool_input.messages.push_back(std::move(next_message));
+    tool_input.options.enable_thinking = false;
+    auto tool_prompt = frontend.prepare(std::move(tool_input));
+    auto tool = frontend.make_output_session(tool_prompt, {});
+    failures += check(!tool.model_stop_tokens_allowed(),
+                      "tools-enabled empty output allowed a model stop");
+
+    ninfer::ChatMessage ignored_user_call;
+    ignored_user_call.role = ninfer::ChatRole::User;
+    ignored_user_call.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ignored_user_call.tool_calls.push_back(
+        ninfer::ToolCall{.id = "", .name = "f", .arguments_json = "{}"});
+    ninfer::PromptInput ignored_user_call_input;
+    ignored_user_call_input.messages.push_back(std::move(ignored_user_call));
+    ignored_user_call_input.options.enable_thinking = false;
+    auto ignored_user_call_prompt = frontend.prepare(std::move(ignored_user_call_input));
+    auto ignored_user_call_output = frontend.make_output_session(ignored_user_call_prompt, {});
+    failures += check(ignored_user_call_output.model_stop_tokens_allowed(),
+                      "ignored non-assistant tool_calls enabled structured tool output");
+
+    decision = tool.preview(std::array<ninfer::TokenId, 1>{22}, 16,
+                            ninfer::FinishReason::OutputLimit);
+    (void)tool.commit_preview();
+    failures += check(tool.model_stop_tokens_allowed(),
+                      "ordinary pre-tool content did not allow a model stop");
+
+    const std::array<ninfer::TokenId, 2> partial_and_stop{16, 6};
+    decision = tool.preview(partial_and_stop, 15, ninfer::FinishReason::OutputLimit);
+    failures += check(decision.reject_generated_round && decision.accepted_tokens == 0,
+                      "same-round partial tool opener did not reject its model stop");
+    tool.discard_preview();
+    failures += check(tool.model_stop_tokens_allowed(),
+                      "rejected tool round changed committed structure");
+
+    decision = tool.preview(std::array<ninfer::TokenId, 1>{16}, 15,
+                            ninfer::FinishReason::OutputLimit);
+    (void)tool.commit_preview();
+    failures += check(!tool.model_stop_tokens_allowed(),
+                      "ambiguous tool opener allowed a model stop");
+    decision = tool.preview(std::array<ninfer::TokenId, 1>{17}, 14,
+                            ninfer::FinishReason::OutputLimit);
+    (void)tool.commit_preview();
+    failures += check(!tool.model_stop_tokens_allowed(),
+                      "open tool call allowed a model stop");
+    decision = tool.preview(std::array<ninfer::TokenId, 2>{18, 19}, 13,
+                            ninfer::FinishReason::OutputLimit);
+    (void)tool.commit_preview();
+    failures += check(!tool.model_stop_tokens_allowed(),
+                      "incomplete tool call allowed a model stop");
+    decision = tool.preview(std::array<ninfer::TokenId, 1>{20}, 11,
+                            ninfer::FinishReason::OutputLimit);
+    (void)tool.commit_preview();
+    failures += check(tool.model_stop_tokens_allowed(),
+                      "complete tool call did not allow a model stop");
+
+    const std::array<ninfer::TokenId, 5> parallel_call_and_stop{21, 18, 19, 20, 6};
+    decision = tool.preview(parallel_call_and_stop, 10, ninfer::FinishReason::OutputLimit);
+    failures += check(decision.finished() && decision.accepted_tokens == 5 &&
+                          decision.finish_reason == ninfer::FinishReason::StopToken,
+                      "complete parallel tool call did not stop in the same round");
+    (void)tool.commit_preview();
+
+    auto marker_literal = frontend.make_output_session(tool_prompt, {});
+    decision = marker_literal.preview(std::array<ninfer::TokenId, 5>{21, 18, 21, 19, 20}, 6,
+                                      ninfer::FinishReason::OutputLimit);
+    (void)marker_literal.commit_preview();
+    failures += check(marker_literal.model_stop_tokens_allowed(),
+                      "tool opener text inside a parameter was treated as a nested call");
+
+    ninfer::StopPolicy no_model_defaults;
+    no_model_defaults.include_model_defaults = false;
+    auto no_defaults = frontend.make_output_session(tool_prompt, no_model_defaults);
+    decision = no_defaults.preview(std::array<ninfer::TokenId, 1>{22}, 4,
+                                   ninfer::FinishReason::OutputLimit);
+    (void)no_defaults.commit_preview();
+    decision = no_defaults.preview(partial_and_stop, 3, ninfer::FinishReason::OutputLimit);
+    failures += check(decision.reject_generated_round && decision.accepted_tokens == 0,
+                      "protected model stop depended on caller default-stop policy");
+    no_defaults.discard_preview();
+
+    auto raw = frontend.make_output_session(
+        tool_prompt, {},
+        ninfer::OutputOptions{.raw = true, .preserve_special_tokens = false});
+    failures += check(raw.model_stop_tokens_allowed(),
+                      "raw output unexpectedly applied structured stop eligibility");
+    decision = raw.preview(std::array<ninfer::TokenId, 1>{6}, 1,
+                           ninfer::FinishReason::OutputLimit);
+    failures += check(decision.finished() && !decision.reject_generated_round,
+                      "raw output rejected its model stop");
+    (void)raw.commit_preview();
+    return failures;
+}
+
 int test_utf8_and_hidden_eos(const Frontend& frontend) {
     auto prompt             = frontend.prepare_tokens({0});
     auto session            = frontend.make_output_session(prompt, {});
@@ -1426,6 +1590,7 @@ int main() {
     failures += test_same_token_stop_priority(frontend);
     failures += test_terminal_flush(frontend);
     failures += test_reasoning_split(frontend);
+    failures += test_structured_model_stop_eligibility(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_disabled_vision();
     return failures == 0 ? 0 : 1;

@@ -86,11 +86,15 @@ advertised alias is the artifact `identity.model_id` by default, or the explicit
 override. Reasoning is returned separately as `reasoning_content`; answer
 text remains in `content`.
 
-While a structured Qwen response is inside its open reasoning block, the registered model EOS
-tokens are excluded from selection. Selection is restored immediately after the reasoning
-terminator's accepted round commits, so the next GPU round can end the answer with the normal model
-EOS. Other request-provided stop conditions remain active, and raw-output requests do not apply
-this structured-output guard.
+For structured Qwen output, registered model stop tokens are excluded from selection while reasoning
+is open and after `</think>` until non-whitespace answer content begins. Tools-enabled output also
+excludes them for an ambiguous `<tool_call>` prefix and until its matching `</tool_call>` is
+complete; this applies independently to consecutive parallel calls. Model stop tokens become
+eligible after ordinary answer content or a complete tool call. If one speculative round crosses
+into a protected state before selecting a model stop token, NInfer rejects that uncommitted round
+and retries with the registered model stop tokens excluded.
+Other request-provided stop conditions remain active, and raw-output requests do not apply this
+structured-output guard.
 
 Message roles retain their input order through schema translation. The Qwen family frontend maps
 both `system` and `developer` to system-class ChatML blocks at their original positions; it does not

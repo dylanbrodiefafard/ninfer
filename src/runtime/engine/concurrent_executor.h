@@ -150,7 +150,7 @@ public:
         try {
             auto output = instance_.loaded->frontend.make_output_session(prompt, options.stop,
                                                                          options.output);
-            if (output.in_reasoning()) {
+            if (!output.model_stop_tokens_allowed()) {
                 const auto& stop_ids = instance_.loaded->frontend.default_stop_policy().token_ids;
                 if (stop_ids.size() > options.execution.suppressed_token_ids.size()) {
                     throw std::logic_error("model defines too many default stop tokens");
@@ -637,6 +637,9 @@ private:
         const std::span<const TokenId> tokens(&token, 1);
         const OutputDecision decision = request->output.preview(
             tokens, request->budget->remaining(), request->budget->limit_reason());
+        if (decision.reject_generated_round) {
+            throw std::logic_error("non-speculative sampler selected a suppressed model stop token");
+        }
         if (decision.accepted_tokens != 1) {
             throw std::logic_error("prefill output policy did not accept its licensed token");
         }
@@ -644,11 +647,7 @@ private:
         instance_.program->resolve_prefill_lane(lane, decision.finished());
         request->budget->commit(1);
         auto published = request->output.commit_preview();
-        if (!decision.finished() && request->stop_suppression_active &&
-            !request->output.in_reasoning()) {
-            instance_.program->clear_suppressed_tokens_lane(lane);
-            request->stop_suppression_active = false;
-        }
+        if (!decision.finished()) { synchronize_stop_suppression(request, lane); }
         if (!request->first_token) { request->first_token = Clock::now(); }
         append_output(request, std::move(published), !decision.finished());
         if (decision.finished()) {
@@ -659,6 +658,24 @@ private:
     }
 
     void invalidate_lane_plans(std::uint32_t lane) noexcept { ++lane_plan_versions_[lane]; }
+
+    void enable_stop_suppression(const std::shared_ptr<Request>& request, std::uint32_t lane) {
+        if (request->stop_suppression_active) { return; }
+        const auto& stop_ids = instance_.loaded->frontend.default_stop_policy().token_ids;
+        instance_.program->set_suppressed_tokens_lane(lane, stop_ids);
+        request->stop_suppression_active = true;
+    }
+
+    void synchronize_stop_suppression(const std::shared_ptr<Request>& request,
+                                      std::uint32_t lane) {
+        const bool suppress = !request->output.model_stop_tokens_allowed();
+        if (suppress) {
+            enable_stop_suppression(request, lane);
+        } else if (request->stop_suppression_active) {
+            instance_.program->clear_suppressed_tokens_lane(lane);
+            request->stop_suppression_active = false;
+        }
+    }
 
     void remove_completed_slot(std::uint32_t lane) {
         slots_[lane].reset();
@@ -1426,6 +1443,7 @@ private:
 
         std::array<std::uint32_t, kMaximumConcurrency> accepted{};
         std::array<std::uint8_t, kMaximumConcurrency> terminal{};
+        std::array<std::uint8_t, kMaximumConcurrency> rejected{};
         std::array<FinishReason, kMaximumConcurrency> finish_reasons{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             const std::uint32_t lane = lanes[row];
@@ -1446,8 +1464,18 @@ private:
             }
             const OutputDecision decision = request->output.preview(
                 row_tokens, request->budget->remaining(), request->budget->limit_reason());
-            if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
-                (!decision.finished() && decision.accepted_tokens != count)) {
+            if (decision.reject_generated_round) {
+                if (decision.accepted_tokens != 0 || decision.finished()) {
+                    throw std::logic_error("output policy returned an invalid rejected round");
+                }
+                if (request->stop_suppression_active) {
+                    throw std::logic_error(
+                        "speculative sampler selected a suppressed model stop token");
+                }
+                rejected[row] = 1;
+                enable_stop_suppression(request, lane);
+            } else if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
+                       (!decision.finished() && decision.accepted_tokens != count)) {
                 throw std::logic_error("output policy returned an invalid licensed prefix");
             }
             accepted[row]       = decision.accepted_tokens;
@@ -1458,18 +1486,25 @@ private:
         instance_.program->resolve_pending_batch(
             lanes, std::span<const std::uint32_t>(accepted.data(), lanes.size()),
             std::span<const std::uint8_t>(terminal.data(), lanes.size()),
-            std::span<const std::uint8_t>(cancelled.data(), lanes.size()));
+            std::span<const std::uint8_t>(cancelled.data(), lanes.size()),
+            std::span<const std::uint8_t>(rejected.data(), lanes.size()));
 
         ++cumulative_stats_.decode_rounds;
         cumulative_stats_.decode_row_rounds += lanes.size();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
-            if (!cancelled[row]) { cumulative_stats_.committed_decode_tokens += accepted[row]; }
+            if (!cancelled[row] && !rejected[row]) {
+                cumulative_stats_.committed_decode_tokens += accepted[row];
+            }
         }
         publish_hot_runtime_counters();
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             const std::uint32_t lane = lanes[row];
             const auto request       = slots_[lane];
+            if (rejected[row]) {
+                request->output.discard_preview();
+                continue;
+            }
             if (!cancelled[row]) {
                 const auto row_tokens = round.tokens.subspan(
                     row * round.row_stride, static_cast<std::size_t>(accepted[row]));
@@ -1479,11 +1514,7 @@ private:
                 consume_service_work(request, accepted[row]);
             }
             auto published = request->output.commit_preview();
-            if (!terminal[row] && request->stop_suppression_active &&
-                !request->output.in_reasoning()) {
-                instance_.program->clear_suppressed_tokens_lane(lane);
-                request->stop_suppression_active = false;
-            }
+            if (!terminal[row]) { synchronize_stop_suppression(request, lane); }
             if (!request->first_token && accepted[row] != 0) {
                 request->first_token = Clock::now();
             }
