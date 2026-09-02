@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Sequential production vs --p-less-sampling AIME25/AIME26 temperature sweep.
-# Same client generation fields both times; the second process ignores truncation
+# Sequential --no-p-less-sampling vs default p-less AIME25/AIME26 temperature sweep.
+# Same client generation fields both times; the default process ignores truncation
 # and penalties. Do not merge the two methods into one Engine.
 
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -91,9 +91,9 @@ start_server() {
     local method="$1"
     local max_ctx="$2"
     local run_stamp="$3"
-    local -a pless_args=()
-    if [[ "${method}" == "p-less" ]]; then
-        pless_args=(--p-less-sampling)
+    local -a sampling_args=()
+    if [[ "${method}" == "production" ]]; then
+        sampling_args=(--no-p-less-sampling)
     fi
 
     current_server_log="${log_dir}/qwen3_8_27b_nvfp4-p-less-aime-${method}-c1-${run_stamp}.server.log"
@@ -118,7 +118,7 @@ start_server() {
         --spec mtp \
         --draft-tokens 3 \
         --lm-head-draft \
-        "${pless_args[@]}" \
+        "${sampling_args[@]}" \
         --request-log-jsonl "${current_request_log}" \
         >"${current_server_log}" 2>&1 &
     server_pid=$!

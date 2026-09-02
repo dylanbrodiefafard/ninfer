@@ -45,6 +45,7 @@ ResolvedSamplingParameters resolve_sampling(const ModelSamplingDefaults& default
         .seed              = overrides.seed.value_or(0),
         .p_less            = overrides.p_less,
     };
+    validate(resolved);
     if (resolved.p_less) {
         resolved.top_k             = 0;
         resolved.top_p             = 1.0F;
@@ -52,7 +53,6 @@ ResolvedSamplingParameters resolve_sampling(const ModelSamplingDefaults& default
         resolved.presence_penalty  = 0.0F;
         resolved.frequency_penalty = 0.0F;
     }
-    validate(resolved);
     return resolved;
 }
 

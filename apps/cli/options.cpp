@@ -100,7 +100,7 @@ std::string usage_text(const char* argv0) {
            "       [--adaptive-draft] [--dflash-verify-width N] [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
-           "       [--p-less-sampling]\n"
+           "       [--no-p-less-sampling]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking]\n"
            "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
@@ -119,10 +119,9 @@ std::string usage_text(const char* argv0) {
            "replaces the default marks and requires --spec mtp or dflash.\n"
            "--capture-context-checkpoint pins the current resume frontier on an exact-hit "
            "(no-op on a fresh one-shot run).\n"
-           "Sampling defaults come from the loaded model and thinking mode; flags override "
-           "individual fields.\n"
-           "--p-less-sampling uses temperature (and seed) only; top-p, top-k, min-p, and "
-           "penalties are ignored.\n";
+           "P-less sampling is enabled by default and uses temperature (default 2.0) and seed "
+           "only; top-p, top-k, min-p, and penalties are ignored.\n"
+           "--no-p-less-sampling opts into the registered production sampler.\n";
 }
 
 Options parse_options(int argc, char** argv) {
@@ -231,8 +230,8 @@ Options parse_options(int argc, char** argv) {
             options.sampling.seed = parse_u64(value(arg), "seed");
         } else if (arg == "--greedy") {
             options.greedy = true;
-        } else if (arg == "--p-less-sampling") {
-            options.sampling.p_less = true;
+        } else if (arg == "--no-p-less-sampling") {
+            options.sampling.p_less = false;
         } else {
             throw std::invalid_argument("unknown argument: " + std::string(arg));
         }

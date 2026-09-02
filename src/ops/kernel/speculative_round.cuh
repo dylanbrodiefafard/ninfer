@@ -732,6 +732,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
 __device__ __forceinline__ void
 speculative_p_less_store_aux_mass(const SamplingWorkspace& workspace, int col, int partial,
                                   float mass) {
+    // Slot 1 aliases the per-partial moments pair after it has been merged into the dist region.
     workspace.partial_keys[sampling_partial_offset(workspace, col, partial, 1)] =
         static_cast<unsigned long long>(__float_as_uint(mass));
 }

@@ -57,6 +57,22 @@ ninfer::RequestOptions greedy_options(std::uint32_t outputs) {
     return options;
 }
 
+ninfer::RequestOptions p_less_options(std::uint32_t outputs, std::uint64_t seed) {
+    ninfer::RequestOptions options;
+    options.execution.requested_output_tokens     = outputs;
+    options.execution.sampling.temperature        = 2.0F;
+    options.execution.sampling.top_k              = 1;
+    options.execution.sampling.top_p              = 0.1F;
+    options.execution.sampling.min_p              = 0.9F;
+    options.execution.sampling.presence_penalty   = 2.0F;
+    options.execution.sampling.frequency_penalty  = 2.0F;
+    options.execution.sampling.seed               = seed;
+    options.execution.sampling.p_less             = true;
+    options.execution.allow_prefix_reuse          = false;
+    options.stop.include_model_defaults           = false;
+    return options;
+}
+
 ninfer::RequestOptions greedy_reuse(std::uint32_t outputs, bool reuse) {
     ninfer::RequestOptions options          = greedy_options(outputs);
     options.execution.allow_prefix_reuse    = reuse;
@@ -242,6 +258,60 @@ int greedy_oracle(ninfer::Engine& engine, const std::vector<ninfer::TokenId>& pr
     return 0;
 }
 
+int exercise_p_less_product_tree(ninfer::Engine& engine,
+                                 const std::vector<ninfer::TokenId>& prompt) {
+    constexpr const char* label = "DFlash2 p-less k=7 W=12";
+    constexpr std::uint64_t seed = 0x123456789abcdef0ULL;
+    const ninfer::GenerationResult first =
+        engine.generate(engine.prepare_tokens(prompt), p_less_options(32, seed));
+    const ninfer::GenerationResult replay =
+        engine.generate(engine.prepare_tokens(prompt), p_less_options(32, seed));
+    ninfer::RequestOptions top1_options = p_less_options(32, seed);
+    top1_options.execution.sampling.p_less = false;
+    const ninfer::GenerationResult top1 =
+        engine.generate(engine.prepare_tokens(prompt), top1_options);
+    if (first.finish_reason != ninfer::FinishReason::OutputLimit ||
+        replay.finish_reason != ninfer::FinishReason::OutputLimit ||
+        top1.finish_reason != ninfer::FinishReason::OutputLimit ||
+        first.generated_token_ids.size() != 32 || replay.generated_token_ids.size() != 32 ||
+        top1.generated_token_ids.size() != 32) {
+        std::cerr << label << " did not complete seeded p-less/replay/top-1 requests\n";
+        dump_tokens("  first", first.generated_token_ids);
+        dump_tokens("  replay", replay.generated_token_ids);
+        dump_tokens("  top-1", top1.generated_token_ids);
+        return 1;
+    }
+    if (check_speculative(first, label) != 0 || check_speculative(replay, label) != 0 ||
+        check_speculative(top1, label) != 0) {
+        return 1;
+    }
+    if (first.speculative.live_draft_tokens != 7 || first.speculative.drafted_tokens == 0 ||
+        first.speculative.accepted_tokens == 0) {
+        std::cerr << label << " did not execute and accept from the native draft tree\n";
+        dump_speculative("  spec", first.speculative);
+        return 1;
+    }
+    if (first.generated_token_ids != replay.generated_token_ids ||
+        first.speculative.rounds != replay.speculative.rounds ||
+        first.speculative.drafted_tokens != replay.speculative.drafted_tokens ||
+        first.speculative.accepted_tokens != replay.speculative.accepted_tokens) {
+        std::cerr << label << " changed under identical seeded CUDA-graph replay\n";
+        dump_tokens("  first", first.generated_token_ids);
+        dump_tokens("  replay", replay.generated_token_ids);
+        dump_speculative("  first", first.speculative);
+        dump_speculative("  replay", replay.speculative);
+        return 1;
+    }
+    if (first.generated_token_ids == top1.generated_token_ids) {
+        std::cerr << label << " produced the top-1 control sequence; p-less was not observed\n";
+        dump_tokens("  p-less", first.generated_token_ids);
+        dump_tokens("  top-1", top1.generated_token_ids);
+        return 1;
+    }
+    std::cout << "ok " << label << '\n' << std::flush;
+    return 0;
+}
+
 std::vector<ninfer::TokenId> token_prefix(const std::vector<ninfer::TokenId>& tokens,
                                           std::uint32_t length, const char* label) {
     if (tokens.size() < length) {
@@ -410,6 +480,11 @@ int main() {
                 run_overlapping_c3(engine, prompts, dflash_oracles, target_oracles, label) != 0) {
                 failed = 1;
             }
+            if (draft_tokens == 7 && dflash_options.speculative.dflash_verify_width == 0 &&
+                (only_prompt == nullptr || std::string(only_prompt) == "0") &&
+                exercise_p_less_product_tree(engine, prompts[0]) != 0) {
+                failed = 1;
+            }
             if (failed != 0) { return failed; }
         } catch (const std::bad_alloc&) {
             std::cerr << label << " engine std::bad_alloc (k=" << draft_tokens
@@ -423,7 +498,13 @@ int main() {
 
     const char* only_k = std::getenv("NINFER_DFLASH_TEST_ONLY_K");
     if (only_k == nullptr || std::string(only_k) == "7") {
-        if (const int result = run_k(7, "DFlash2 k=7 chain C=3"); result != 0) { return result; }
+        std::string label = "DFlash2 k=7 W=12 tree C=3";
+        if (std::getenv("NINFER_DFLASH_TEST_CHAIN") != nullptr) {
+            label = "DFlash2 k=7 W=8 chain C=3";
+        } else if (const char* width = std::getenv("NINFER_DFLASH_TEST_VERIFY_WIDTH")) {
+            label = "DFlash2 k=7 W=" + std::string(width) + " override C=3";
+        }
+        if (const int result = run_k(7, label.c_str()); result != 0) { return result; }
     }
     if (only_k == nullptr || std::string(only_k) == "1") {
         if (const int result = run_k(1, "DFlash2 k=1 chain C=3"); result != 0) { return result; }

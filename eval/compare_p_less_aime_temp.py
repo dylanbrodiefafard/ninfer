@@ -139,7 +139,7 @@ def load_predictions(run_dir: Path) -> dict[str, list[dict[str, Any]]]:
     return out
 
 
-def request_stats(path: Path | None) -> dict[str, Any]:
+def request_stats(path: Path, expected_p_less: bool) -> dict[str, Any]:
     empty = {
         "n": 0,
         "completion_tokens": 0,
@@ -150,23 +150,46 @@ def request_stats(path: Path | None) -> dict[str, Any]:
         "decode_tok_s": None,
         "e2e_tok_s": None,
         "finish_reasons": {},
+        "request_starts": 0,
+        "p_less_observed": 0,
     }
-    if path is None or not path.exists():
-        return empty
+    if not path.exists():
+        raise FileNotFoundError(f"request log does not exist: {path}")
     n = 0
     completion = 0
     prompt = 0
     decode_s = 0.0
     total_s = 0.0
+    request_starts = 0
+    p_less_observed = 0
     reasons: dict[str, int] = defaultdict(int)
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line_i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         if not line.strip():
             continue
         try:
             record = json.loads(line)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{path}:{line_i}: invalid JSON: {exc}") from exc
+        event = record.get("event") or record.get("type")
+        if event == "request_start":
+            request = record.get("request") or {}
+            sampling = request.get("sampling") or {}
+            observed = sampling.get("p_less")
+            if expected_p_less:
+                if observed is not True:
+                    raise ValueError(
+                        f"{path}:{line_i}: expected request_start sampling.p_less=true, "
+                        f"got {observed!r}"
+                    )
+            elif observed not in (None, False):
+                raise ValueError(
+                    f"{path}:{line_i}: expected request_start sampling.p_less=false or absent, "
+                    f"got {observed!r}"
+                )
+            request_starts += 1
+            p_less_observed += int(observed is True)
             continue
-        if record.get("event") != "request_done" and record.get("type") != "request_done":
+        if event != "request_done":
             continue
         result = record.get("result") or {}
         timings = record.get("timings_seconds") or {}
@@ -177,7 +200,11 @@ def request_stats(path: Path | None) -> dict[str, Any]:
         reason = str(result.get("finish_reason") or "unknown")
         reasons[reason] += 1
         n += 1
+    if request_starts == 0:
+        raise ValueError(f"{path}: no request_start records found")
     if n == 0:
+        empty["request_starts"] = request_starts
+        empty["p_less_observed"] = p_less_observed
         return empty
     return {
         "n": n,
@@ -189,6 +216,8 @@ def request_stats(path: Path | None) -> dict[str, Any]:
         "decode_tok_s": (completion / decode_s) if decode_s > 0 else None,
         "e2e_tok_s": (completion / total_s) if total_s > 0 else None,
         "finish_reasons": dict(reasons),
+        "request_starts": request_starts,
+        "p_less_observed": p_less_observed,
     }
 
 
@@ -224,15 +253,15 @@ def snippet(text: str, limit: int = 900) -> str:
 def render(
     production_dir: Path,
     pless_dir: Path,
-    production_requests: Path | None,
-    pless_requests: Path | None,
+    production_requests: Path,
+    pless_requests: Path,
 ) -> str:
     prod_jobs = summary_jobs(production_dir)
     pless_jobs = summary_jobs(pless_dir)
     prod_pred = load_predictions(production_dir)
     pless_pred = load_predictions(pless_dir)
-    prod_req = request_stats(production_requests)
-    pless_req = request_stats(pless_requests)
+    prod_req = request_stats(production_requests, expected_p_less=False)
+    pless_req = request_stats(pless_requests, expected_p_less=True)
 
     lines = [
         "# P-less vs production AIME temperature sweep",
@@ -242,6 +271,13 @@ def render(
         "",
         "Claim under test: p-less degrades less than the production sampler as "
         "temperature rises (not a guaranteed win at T=0.6).",
+        "",
+        "## Mechanism verification",
+        "",
+        f"- Production p_less observed: {prod_req['p_less_observed']}/"
+        f"{prod_req['request_starts']} request starts (expected 0).",
+        f"- P-less p_less observed: {pless_req['p_less_observed']}/"
+        f"{pless_req['request_starts']} request starts.",
         "",
         "## Accuracy",
         "",
@@ -447,15 +483,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--production", required=True, type=Path)
     parser.add_argument("--p-less", required=True, type=Path)
-    parser.add_argument("--production-requests", type=Path)
-    parser.add_argument("--p-less-requests", type=Path)
+    parser.add_argument("--production-requests", required=True, type=Path)
+    parser.add_argument("--p-less-requests", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     args = parser.parse_args()
     text = render(
         args.production.resolve(),
         args.p_less.resolve(),
-        args.production_requests.resolve() if args.production_requests else None,
-        args.p_less_requests.resolve() if args.p_less_requests else None,
+        args.production_requests.resolve(),
+        args.p_less_requests.resolve(),
     )
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "summary.md").write_text(text, encoding="utf-8")

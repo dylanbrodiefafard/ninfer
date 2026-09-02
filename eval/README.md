@@ -31,8 +31,8 @@ for a network-free example.
 [`configs/qwen3_8_27b_reasoning.yaml`](configs/qwen3_8_27b_reasoning.yaml) are the published
 AIME25, AIME26, and GPQA-Diamond reasoning suites for those 27B identities.
 [`configs/qwen3_8_27b_p_less_aime_temp.yaml`](configs/qwen3_8_27b_p_less_aime_temp.yaml) is the
-AIME25/AIME26 temperature sweep used to compare production sampling against process-level
-`--p-less-sampling` (see [P-less AIME temperature sweep](#p-less-aime-temperature-sweep)).
+AIME25/AIME26 temperature sweep used to compare opt-out production sampling against default
+p-less sampling (see [P-less AIME temperature sweep](#p-less-aime-temperature-sweep)).
 
 [`configs/qwen3_6_35b_needle_haystack.yaml`](configs/qwen3_6_35b_needle_haystack.yaml)
 defines the 35B-A3B Needle-in-a-Haystack profiles separately: `standard` preserves EvalScope's
@@ -200,8 +200,10 @@ generations per method). Compare two sequential `ninfer-serve` processes on Qwen
 (`--kv-dtype nvfp4`); do not merge the two methods into one Engine:
 
 [`run_qwen3_8_27b_p_less_aime_temp.sh`](run_qwen3_8_27b_p_less_aime_temp.sh) starts the two
-processes in order (production, then `--p-less-sampling`), using the published Qwen 3.8 NVFP4
-reasoning server flags (`--max-context 262144`, `--kv-dtype nvfp4`, MTP=3) at concurrency 1:
+processes in order (`--no-p-less-sampling`, then default p-less), using the published Qwen 3.8 NVFP4
+reasoning server flags (`--max-context 262144`, `--kv-dtype nvfp4`, MTP=3) at concurrency 1.
+This campaign qualifies the MTP chain route only; it is not DFlash2 packed-tree quality or
+performance evidence. Run it with:
 
 ```bash
 eval/run_qwen3_8_27b_p_less_aime_temp.sh
@@ -214,16 +216,16 @@ Manual equivalent:
 ./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
   --host 127.0.0.1 --port 18080 \
   --max-context 262144 --kv-capacity auto --kv-dtype nvfp4 \
-  --spec mtp --draft-tokens 3 --lm-head-draft
+  --spec mtp --draft-tokens 3 --lm-head-draft \
+  --no-p-less-sampling
 PYTHONPATH=eval eval/.venv/bin/python -m ninfer_eval run \
   --config eval/configs/qwen3_8_27b_p_less_aime_temp.yaml --suite aime_temp
 
-# P-less: same client generation fields; the server ignores truncation and penalties.
+# Default p-less: same client generation fields; the server ignores truncation and penalties.
 ./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
   --host 127.0.0.1 --port 18080 \
   --max-context 262144 --kv-capacity auto --kv-dtype nvfp4 \
-  --spec mtp --draft-tokens 3 --lm-head-draft \
-  --p-less-sampling
+  --spec mtp --draft-tokens 3 --lm-head-draft
 PYTHONPATH=eval eval/.venv/bin/python -m ninfer_eval run \
   --config eval/configs/qwen3_8_27b_p_less_aime_temp.yaml --suite aime_temp
 ```

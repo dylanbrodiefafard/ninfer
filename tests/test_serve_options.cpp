@@ -54,8 +54,8 @@ int main() {
     failures += check(
         !defaults.sampling_overrides.temperature && !defaults.sampling_overrides.top_p &&
             !defaults.sampling_overrides.top_k && !defaults.sampling_overrides.presence_penalty &&
-            !defaults.sampling_overrides.frequency_penalty && !defaults.sampling_overrides.p_less,
-        "server defaults unexpectedly override registered model sampling");
+            !defaults.sampling_overrides.frequency_penalty && defaults.sampling_overrides.p_less,
+        "server did not enable p-less by default");
     failures += check(resolve_public_model_id(defaults, "artifact-model") == "artifact-model",
                       "artifact model id was not selected by default");
 
@@ -202,11 +202,13 @@ int main() {
                           sampling.sampling_overrides.seed == 0,
                       "server sampling flags did not preserve explicit values and zeros");
 
-    const ServeOptions pless = parse({"ninfer-serve", "model.ninfer", "--p-less-sampling"});
-    failures += check(pless.sampling_overrides.p_less,
-                      "--p-less-sampling did not reach serving options");
-    failures += check(serve_usage_text("ninfer-serve").find("--p-less-sampling") != std::string::npos,
-                      "serve help omits --p-less-sampling");
+    const ServeOptions production =
+        parse({"ninfer-serve", "model.ninfer", "--no-p-less-sampling"});
+    failures += check(!production.sampling_overrides.p_less,
+                      "--no-p-less-sampling did not reach serving options");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--no-p-less-sampling") != std::string::npos,
+              "serve help omits --no-p-less-sampling");
 
     GenerationRequest request;
     request.max_tokens = 1;
@@ -226,8 +228,10 @@ int main() {
                           inherited_sampling.execution.sampling.top_p == 0.9F &&
                           inherited_sampling.execution.sampling.seed == 0,
                       "server sampling overrides did not reach Engine options");
-    failures += check(to_request_options(request, pless).execution.sampling.p_less,
-                      "--p-less-sampling did not reach Engine overrides");
+    failures += check(to_request_options(request, defaults).execution.sampling.p_less,
+                      "default p-less mode did not reach Engine overrides");
+    failures += check(!to_request_options(request, production).execution.sampling.p_less,
+                      "--no-p-less-sampling did not reach Engine overrides");
     request.sampling.temperature = 1.1;
     failures += check(to_request_options(request, sampling).execution.sampling.temperature == 1.1F,
                       "request sampling override did not win over the server override");
