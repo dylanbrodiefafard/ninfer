@@ -1,6 +1,7 @@
 #include "ninfer/ops/argmax.h"
 #include "ops/op_tester.h"
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -95,6 +96,47 @@ int run_case(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t t
     return failures;
 }
 
+int run_suppressed_case(std::int32_t physical_rows, std::int32_t valid_rows,
+                        const char* label) {
+    constexpr std::int32_t width         = 3;
+    constexpr std::int32_t batch         = 2;
+    constexpr std::int32_t tokens        = width * batch;
+    std::vector<std::uint16_t> logits(static_cast<std::size_t>(physical_rows) * tokens,
+                                      f32_to_bf16(-20.0f));
+    for (int column = 0; column < tokens; ++column) {
+        const int suppressed = column < width ? 11 : 17;
+        const std::size_t base = static_cast<std::size_t>(column) * physical_rows;
+        logits[base + suppressed] = f32_to_bf16(9.0f);
+        logits[base + 23]         = f32_to_bf16(8.0f);
+    }
+    for (int token = 0; token < valid_rows; ++token) {
+        logits[static_cast<std::size_t>(token)] = f32_to_bf16(-INFINITY);
+    }
+    std::vector<ops::SamplingConfig> configs(batch);
+    configs[0].suppressed_token_count = 2;
+    configs[0].suppressed_tokens[0]   = 0;
+    configs[0].suppressed_tokens[1]   = 11;
+    configs[1].suppressed_token_count = 1;
+    configs[1].suppressed_tokens[0]   = 17;
+
+    DeviceBuffer device_logits  = to_device(logits);
+    DeviceBuffer device_configs = to_device(configs);
+    GuardedDeviceBuffer device_output(static_cast<std::size_t>(tokens) * sizeof(std::int32_t));
+    Tensor logits_tensor(device_logits.p, DType::BF16, {physical_rows, tokens});
+    Tensor output_tensor(device_output.data(), DType::I32, {tokens});
+    ops::argmax(logits_tensor, output_tensor, valid_rows,
+                static_cast<const ops::SamplingConfig*>(device_configs.p), width, nullptr);
+    cuda_synchronize();
+
+    std::vector<std::int32_t> expected(tokens, 23);
+    expected[0] = 1;
+    int failures = verify_exact(
+        label, from_device<std::int32_t>(device_output.data(), static_cast<std::size_t>(tokens)),
+        expected);
+    failures += device_output.verify_guards(label);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -111,6 +153,9 @@ int main() {
     failures += run_case(131072, 131072, 1);
     failures += run_case(131072, 131072, 15);
     failures += run_case(131072, 131072, 120);
+    failures += run_suppressed_case(1024, 1000, "argmax row-local suppressed tokens small");
+    failures += run_suppressed_case(248320, 248077,
+                                    "argmax row-local suppressed tokens tiled");
     std::cout << (failures ? "FAIL" : "OK") << " argmax\n";
     return failures ? 1 : 0;
 }

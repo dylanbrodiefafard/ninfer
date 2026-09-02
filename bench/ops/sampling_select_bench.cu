@@ -38,6 +38,7 @@ struct Options {
     bool mtp           = false;
     bool matrix        = false;
     bool counts_active = true;
+    bool suppress_stop = false;
     Mode mode          = Mode::Stochastic;
     int batch          = 1;
     int mtp_k          = 3;
@@ -46,7 +47,8 @@ struct Options {
 
 void usage(const char* argv0) {
     std::printf("usage: %s [--sample|--mtp|--matrix] [--mode greedy|stochastic] "
-                "[--batch 1..8] [--mtp-k 1..5] [--top-k 1..20] [--no-counts]\n",
+                "[--batch 1..8] [--mtp-k 1..5] [--top-k 1..20] [--no-counts] "
+                "[--suppress-stop]\n",
                 argv0);
 }
 
@@ -94,6 +96,8 @@ Options parse_args(int argc, char** argv) {
             options.top_k = parse_int(need_value("--top-k"), "--top-k");
         } else if (arg == "--no-counts") {
             options.counts_active = false;
+        } else if (arg == "--suppress-stop") {
+            options.suppress_stop = true;
         } else if (arg == "-h" || arg == "--help") {
             usage(argc > 0 ? argv[0] : "ninfer_sampling_select_bench");
             std::exit(0);
@@ -139,7 +143,15 @@ DeviceBuffer make_i32(const std::vector<std::int32_t>& host) {
     return device;
 }
 
-DeviceBuffer make_config(DeviceBuffer& counts, Mode mode, bool counts_active, int top_k) {
+void configure_suppression(ops::SamplingConfig& config, bool suppress_stop) {
+    if (!suppress_stop) { return; }
+    config.suppressed_token_count = 2;
+    config.suppressed_tokens[0]   = 248044;
+    config.suppressed_tokens[1]   = 248046;
+}
+
+DeviceBuffer make_config(DeviceBuffer& counts, Mode mode, bool counts_active, int top_k,
+                         bool suppress_stop) {
     ops::SamplingConfig config;
     config.temperature      = mode == Mode::Greedy ? 0.0f : 0.6f;
     config.top_k            = top_k;
@@ -148,6 +160,7 @@ DeviceBuffer make_config(DeviceBuffer& counts, Mode mode, bool counts_active, in
     config.seed             = 20260716ull;
     config.token_counts =
         mode == Mode::Stochastic && counts_active ? static_cast<std::int32_t*>(counts.p) : nullptr;
+    configure_suppression(config, suppress_stop);
 
     DeviceBuffer device(sizeof(ops::SamplingConfig));
     CUDA_CHECK(cudaMemcpy(device.p, &config, sizeof(config), cudaMemcpyHostToDevice));
@@ -155,7 +168,7 @@ DeviceBuffer make_config(DeviceBuffer& counts, Mode mode, bool counts_active, in
 }
 
 DeviceBuffer make_batch_configs(DeviceBuffer& counts, int batch, Mode mode, bool counts_active,
-                                int top_k) {
+                                int top_k, bool suppress_stop) {
     std::vector<ops::SamplingConfig> configs(static_cast<std::size_t>(batch));
     for (int row = 0; row < batch; ++row) {
         ops::SamplingConfig& config = configs[static_cast<std::size_t>(row)];
@@ -168,6 +181,7 @@ DeviceBuffer make_batch_configs(DeviceBuffer& counts, int batch, Mode mode, bool
                                           ? static_cast<std::int32_t*>(counts.p) +
                                         static_cast<std::size_t>(row) * kTokenDomain
                                           : nullptr;
+        configure_suppression(config, suppress_stop);
     }
     DeviceBuffer device(configs.size() * sizeof(ops::SamplingConfig));
     CUDA_CHECK(cudaMemcpy(device.p, configs.data(), device.bytes, cudaMemcpyHostToDevice));
@@ -181,9 +195,10 @@ double stochastic_payload_bytes(int cols, bool counts_active) {
 }
 
 void run_sample(DeviceBuffer& logits, DeviceBuffer& counts, int batch, Mode mode,
-                bool counts_active, int top_k) {
+                bool counts_active, int top_k, bool suppress_stop) {
     CUDA_CHECK(cudaMemset(counts.p, 0, counts.bytes));
-    DeviceBuffer configs = make_batch_configs(counts, batch, mode, counts_active, top_k);
+    DeviceBuffer configs =
+        make_batch_configs(counts, batch, mode, counts_active, top_k, suppress_stop);
     DeviceBuffer out(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
     std::vector<std::int32_t> positions(static_cast<std::size_t>(batch));
     for (int row = 0; row < batch; ++row) { positions[static_cast<std::size_t>(row)] = 4096 + row; }
@@ -205,14 +220,15 @@ void run_sample(DeviceBuffer& logits, DeviceBuffer& counts, int batch, Mode mode
     const std::string label = std::string("G2 B=") + std::to_string(batch) + " " +
                               (mode == Mode::Greedy ? "greedy" : "stochastic") +
                               (counts_active && mode == Mode::Stochastic ? " counts" : "") +
+                              (suppress_stop ? " suppress-stop" : "") +
                               " top_k=" + std::to_string(top_k);
     print_result(label.c_str(), result);
 }
 
 void run_mtp(DeviceBuffer& logits, DeviceBuffer& counts, int k, Mode mode, bool counts_active,
-             int top_k) {
+             int top_k, bool suppress_stop) {
     CUDA_CHECK(cudaMemset(counts.p, 0, counts.bytes));
-    DeviceBuffer config = make_config(counts, mode, counts_active, top_k);
+    DeviceBuffer config = make_config(counts, mode, counts_active, top_k, suppress_stop);
     std::vector<std::int32_t> target_host(static_cast<std::size_t>(k + 1));
     std::vector<std::int32_t> draft_host(static_cast<std::size_t>(k));
     for (int col = 0; col <= k; ++col) {
@@ -255,6 +271,7 @@ void run_mtp(DeviceBuffer& logits, DeviceBuffer& counts, int k, Mode mode, bool 
     const std::string label = std::string("G3 K=") + std::to_string(k) + " " +
                               (mode == Mode::Greedy ? "greedy" : "stochastic") +
                               (counts_active && mode == Mode::Stochastic ? " counts" : "") +
+                              (suppress_stop ? " suppress-stop" : "") +
                               " top_k=" + std::to_string(top_k);
     print_result(label.c_str(), result);
 }
@@ -291,22 +308,25 @@ int main(int argc, char** argv) {
                 1024.0);
         if (options.matrix) {
             for (const int batch : {1, 2, 4, 8}) {
-                run_sample(logits, counts, batch, Mode::Greedy, false, 1);
-                run_sample(logits, counts, batch, Mode::Stochastic, true, 20);
+                run_sample(logits, counts, batch, Mode::Greedy, false, 1, options.suppress_stop);
+                run_sample(logits, counts, batch, Mode::Stochastic, true, 20,
+                           options.suppress_stop);
             }
-            run_sample(logits, counts, 1, Mode::Stochastic, false, 20);
+            run_sample(logits, counts, 1, Mode::Stochastic, false, 20,
+                       options.suppress_stop);
             for (int k = 1; k <= 5; ++k) {
-                run_mtp(logits, counts, k, Mode::Greedy, false, 1);
-                run_mtp(logits, counts, k, Mode::Stochastic, true, 20);
+                run_mtp(logits, counts, k, Mode::Greedy, false, 1, options.suppress_stop);
+                run_mtp(logits, counts, k, Mode::Stochastic, true, 20,
+                        options.suppress_stop);
             }
         } else {
             if (options.sample) {
                 run_sample(logits, counts, options.batch, options.mode, options.counts_active,
-                           options.top_k);
+                           options.top_k, options.suppress_stop);
             }
             if (options.mtp) {
                 run_mtp(logits, counts, options.mtp_k, options.mode, options.counts_active,
-                        options.top_k);
+                        options.top_k, options.suppress_stop);
             }
         }
     } catch (const std::exception& e) {

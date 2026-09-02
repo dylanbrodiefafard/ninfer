@@ -29,6 +29,7 @@ __launch_bounds__(kSamplerBlock) __global__
         float bv = -CUDART_INF_F;
         int bi   = INT_MAX;
         for (int v = tid; v < token_domain; v += blockDim.x) {
+            if (sampling_token_suppressed(v, cfg)) { continue; }
             const float x = __bfloat162float(logits[base + v]);
             if (sampling_better(x, v, bv, bi)) {
                 bv = x;
@@ -109,7 +110,7 @@ __launch_bounds__(kSamplerBlock) __global__
 #pragma unroll
     for (int item = 0; item < kSamplerItemsPerThread; ++item) {
         const int v = tile_start + item * blockDim.x + threadIdx.x;
-        if (v < token_domain) {
+        if (v < token_domain && !sampling_token_suppressed(v, cfg)) {
             const float raw = __bfloat162float(logits[base + v]);
             const float x   = greedy ? raw : sampling_adjusted_logit(raw, v, cfg);
             keys[item]      = sampling_sort_key(x, v);

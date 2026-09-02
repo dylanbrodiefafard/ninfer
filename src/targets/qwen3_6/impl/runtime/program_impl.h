@@ -3413,6 +3413,15 @@ ProgramImplCore::decode_batch(std::span<const std::uint32_t> lanes,
     return decode_dflash_batch(lanes, budgets);
 }
 
+void ProgramImplCore::clear_suppressed_tokens_lane(std::uint32_t lane) {
+    if (lane >= max_concurrency) { throw std::out_of_range("sampling lane is out of range"); }
+    RequestControl& request = requests[lane];
+    if (request.lifecycle == Lifecycle::Empty) {
+        throw std::logic_error("cannot update sampling for an idle lane");
+    }
+    request.sampling_host.suppressed_token_count = 0;
+}
+
 void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
                                                       RequestControl& request,
                                                       std::uint32_t accepted_tokens,

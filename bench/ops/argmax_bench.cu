@@ -28,10 +28,11 @@ constexpr int kLogitSlots                = 256;
 struct Options {
     std::string shape;
     int cols = 0;
+    bool suppress_stop = false;
 };
 
 void usage(const char* argv0) {
-    std::printf("usage: %s [--shape full|shortlist --cols N]\n", argv0);
+    std::printf("usage: %s [--shape full|shortlist --cols N] [--suppress-stop]\n", argv0);
 }
 
 int parse_int(std::string_view value, const char* name) {
@@ -59,6 +60,8 @@ Options parse_args(int argc, char** argv) {
             options.shape = need_value("--shape");
         } else if (arg == "--cols") {
             options.cols = parse_int(need_value("--cols"), "--cols");
+        } else if (arg == "--suppress-stop") {
+            options.suppress_stop = true;
         } else if (arg == "-h" || arg == "--help") {
             usage(argc > 0 ? argv[0] : "ninfer_argmax_bench");
             std::exit(0);
@@ -81,11 +84,19 @@ Options parse_args(int argc, char** argv) {
     return options;
 }
 
-void run_shape(std::int32_t physical_rows, std::int32_t valid_rows, int cols, const char* shape) {
+void run_shape(std::int32_t physical_rows, std::int32_t valid_rows, int cols, const char* shape,
+               bool suppress_stop) {
     DeviceBuffer logits = make_bf16(static_cast<std::size_t>(physical_rows) * kLogitSlots);
     DeviceBuffer out    = make_zeros(static_cast<std::size_t>(cols) * sizeof(std::int32_t));
     auto* logits_base   = static_cast<std::uint16_t*>(logits.p);
     Tensor tout(out.p, DType::I32, {cols});
+    ops::SamplingConfig host_config;
+    host_config.suppressed_token_count = 2;
+    host_config.suppressed_tokens[0]   = valid_rows - 1;
+    host_config.suppressed_tokens[1]   = valid_rows - 2;
+    DeviceBuffer device_config(sizeof(ops::SamplingConfig));
+    CUDA_CHECK(cudaMemcpy(device_config.p, &host_config, sizeof(host_config),
+                          cudaMemcpyHostToDevice));
 
     const double bytes     = static_cast<double>(valid_rows) * 2.0 * static_cast<double>(cols);
     int launch             = 0;
@@ -95,13 +106,18 @@ void run_shape(std::int32_t physical_rows, std::int32_t valid_rows, int cols, co
             const int slot = (launch++ % window_count) * cols;
             auto* window   = logits_base + static_cast<std::size_t>(slot) * physical_rows;
             Tensor tlogits(window, DType::BF16, {physical_rows, cols});
-            ops::argmax(tlogits, tout, valid_rows, stream);
+            if (suppress_stop) {
+                ops::argmax(tlogits, tout, valid_rows,
+                            static_cast<const ops::SamplingConfig*>(device_config.p), cols, stream);
+            } else {
+                ops::argmax(tlogits, tout, valid_rows, stream);
+            }
         },
         bytes);
 
     const std::string label = std::string("argmax ") + shape +
                               " rows=" + std::to_string(valid_rows) + " C=" + std::to_string(cols) +
-                              " route=public";
+                              " route=public suppress=" + (suppress_stop ? "yes" : "no");
     print_result(label.c_str(), result);
 }
 
@@ -118,16 +134,19 @@ int main(int argc, char** argv) {
         const Options options = parse_args(argc, argv);
         if (options.shape.empty()) {
             for (int cols = 1; cols <= 16; ++cols) {
-                run_shape(kFullPhysicalRows, kFullValidRows, cols, "full");
+                run_shape(kFullPhysicalRows, kFullValidRows, cols, "full", options.suppress_stop);
             }
-            run_shape(kFullPhysicalRows, kFullValidRows, 128, "full");
+            run_shape(kFullPhysicalRows, kFullValidRows, 128, "full", options.suppress_stop);
             for (const int cols : {1, 120}) {
-                run_shape(kShortlistRows, kShortlistRows, cols, "shortlist");
+                run_shape(kShortlistRows, kShortlistRows, cols, "shortlist",
+                          options.suppress_stop);
             }
         } else if (options.shape == "full") {
-            run_shape(kFullPhysicalRows, kFullValidRows, options.cols, "full");
+            run_shape(kFullPhysicalRows, kFullValidRows, options.cols, "full",
+                      options.suppress_stop);
         } else {
-            run_shape(kShortlistRows, kShortlistRows, options.cols, "shortlist");
+            run_shape(kShortlistRows, kShortlistRows, options.cols, "shortlist",
+                      options.suppress_stop);
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "ninfer_argmax_bench: %s\n", e.what());

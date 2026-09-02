@@ -1162,11 +1162,14 @@ int test_reasoning_split(const Frontend& frontend) {
     input.options.enable_thinking       = true;
     auto prompt                         = frontend.prepare(std::move(input));
     auto session                        = frontend.make_output_session(prompt, {});
+    int failures = check(session.in_reasoning(), "thinking output session did not start open");
+    auto raw_session =
+        frontend.make_output_session(prompt, {}, ninfer::OutputOptions{.raw = true});
+    failures += check(!raw_session.in_reasoning(), "raw output session entered reasoning state");
     const std::array<ninfer::TokenId, 2> tokens{3, 4};
-    const auto decision = session.preview(tokens, 2, ninfer::FinishReason::OutputLimit);
-    int failures        = check(decision.accepted_tokens == 2 &&
-                                    decision.finish_reason == ninfer::FinishReason::OutputLimit,
-                                "reasoning output did not finish at the requested token limit");
+    const auto decision = session.preview(tokens, 3, ninfer::FinishReason::OutputLimit);
+    failures += check(decision.accepted_tokens == 2 && !decision.finished(),
+                      "reasoning close unexpectedly made a nonterminal preview terminal");
     const auto output   = session.commit_preview();
     failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) == "thought",
                       "reasoning channel did not remove the close marker");
@@ -1174,6 +1177,21 @@ int test_reasoning_split(const Frontend& frontend) {
                       "content channel did not strip the post-thinking separator");
     failures += check(session.reasoning_tokens() == 2,
                       "reasoning token usage did not count accepted reasoning tokens exactly");
+    failures += check(!session.in_reasoning(),
+                      "thinking output session remained open after the close marker");
+
+    ninfer::ChatMessage direct_message;
+    direct_message.role = ninfer::ChatRole::User;
+    direct_message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput direct_input;
+    direct_input.messages.push_back(std::move(direct_message));
+    direct_input.options.add_generation_prompt = true;
+    direct_input.options.enable_thinking       = false;
+    auto direct_prompt                         = frontend.prepare(std::move(direct_input));
+    auto direct_session                        = frontend.make_output_session(direct_prompt, {});
+    failures += check(!direct_session.in_reasoning(),
+                      "non-thinking output session entered reasoning state");
     return failures;
 }
 

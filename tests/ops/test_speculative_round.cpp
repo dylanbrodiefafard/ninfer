@@ -497,6 +497,18 @@ int tree_sampling_membership_cases(int token_domain) {
                                       kWidth, parent, verify_ids, targets, logits, 7, kWidth, cfg,
                                       counts, want_lic, 0, 0, want_path);
     }
+    {
+        ops::SamplingConfig suppressed_cfg = cfg;
+        suppressed_cfg.suppressed_token_count = 1;
+        suppressed_cfg.suppressed_tokens[0]   = 11;
+        const auto logits = peaked_column_logits(token_domain, kWidth, {11, 0, 0, 0});
+        std::vector<std::int32_t> want_lic{0, 0, 0, 0};
+        std::vector<std::int32_t> want_path{0, 0, 0, 0};
+        failures += execute_tree_case("tree sampling rejects suppressed draft" + tag,
+                                      token_domain, token_domain, kWidth, parent, verify_ids,
+                                      targets, logits, 7, kWidth, suppressed_cfg, counts, want_lic,
+                                      0, 0, want_path);
+    }
     return failures;
 }
 
@@ -541,6 +553,7 @@ int deterministic_sampling_case() {
         const int winner =
             col < accepted ? drafts[static_cast<std::size_t>(col)] : correction + col - accepted;
         logits[base + static_cast<std::size_t>(winner)] = 20.0f;
+        logits[base + 13]                               = 30.0f;
         logits[base + token_domain]                     = 100.0f;
         logits[base + physical_rows - 1]                = 200.0f;
     }
@@ -561,9 +574,67 @@ int deterministic_sampling_case() {
     config.top_p       = 0.9f;
     config.min_p       = 0.5f;
     config.seed        = 0x123456789abcdef0ull;
+    config.suppressed_token_count = 1;
+    config.suppressed_tokens[0]   = 13;
     return execute_accept_case("speculative sampling deterministic support", targets, logits_bits,
                                physical_rows, drafts, initial_length, token_domain, config,
                                token_counts, expected);
+}
+
+int suppressed_bonus_case() {
+    constexpr int token_domain = 64;
+    constexpr int k            = 1;
+    const std::vector<std::int32_t> drafts{7};
+    const std::vector<std::int32_t> targets{7, 8};
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * (k + 1), -20.0f);
+    logits[7]                                           = 20.0f;
+    logits[9]                                           = 30.0f;
+    logits[static_cast<std::size_t>(token_domain) + 8] = 20.0f;
+    logits[static_cast<std::size_t>(token_domain) + 9] = 30.0f;
+    round_to_bf16(logits);
+    std::vector<std::uint16_t> logits_bits(logits.size());
+    for (std::size_t i = 0; i < logits.size(); ++i) { logits_bits[i] = f32_to_bf16(logits[i]); }
+
+    constexpr std::int32_t initial_length = 40;
+    const auto expected = accept_state_oracle(drafts, 1, 8, initial_length);
+    std::vector<std::int32_t> token_counts(token_domain, 0);
+    ops::SamplingConfig config{};
+    config.temperature            = 1.0f;
+    config.top_k                  = 1;
+    config.seed                   = 7ull;
+    config.suppressed_token_count = 1;
+    config.suppressed_tokens[0]   = 9;
+    return execute_accept_case("speculative sampling suppresses EOS in accept and bonus",
+                               targets, logits_bits, token_domain, drafts, initial_length,
+                               token_domain, config, token_counts, expected);
+}
+
+int suppressed_draft_rejection_case(int token_domain) {
+    constexpr int k = 1;
+    const std::vector<std::int32_t> drafts{9};
+    const std::vector<std::int32_t> targets{7, 8};
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * (k + 1), -20.0f);
+    logits[7]                                           = 20.0f;
+    logits[9]                                           = 30.0f;
+    logits[static_cast<std::size_t>(token_domain) + 8] = 20.0f;
+    logits[static_cast<std::size_t>(token_domain) + 9] = 30.0f;
+    round_to_bf16(logits);
+    std::vector<std::uint16_t> logits_bits(logits.size());
+    for (std::size_t i = 0; i < logits.size(); ++i) { logits_bits[i] = f32_to_bf16(logits[i]); }
+
+    constexpr std::int32_t initial_length = 40;
+    const auto expected = accept_state_oracle(drafts, 0, 7, initial_length);
+    std::vector<std::int32_t> token_counts(token_domain, 0);
+    ops::SamplingConfig config{};
+    config.temperature            = 1.0f;
+    config.top_k                  = 1;
+    config.seed                   = 7ull;
+    config.suppressed_token_count = 1;
+    config.suppressed_tokens[0]   = 9;
+    return execute_accept_case("speculative sampling rejects suppressed draft V=" +
+                                   std::to_string(token_domain),
+                               targets, logits_bits, token_domain, drafts, initial_length,
+                               token_domain, config, token_counts, expected);
 }
 
 int batched_sampling_workspace_stride_case() {
@@ -1024,6 +1095,9 @@ int main() {
     failures += tree_sampling_presence_overlay_case(64);
     failures += tree_sampling_presence_overlay_case(257);
     failures += deterministic_sampling_case();
+    failures += suppressed_bonus_case();
+    failures += suppressed_draft_rejection_case(64);
+    failures += suppressed_draft_rejection_case(257);
     failures += batched_sampling_workspace_stride_case();
     failures += select_hidden_case(5120, 6, 0);
     failures += select_hidden_case(5120, 6, 5);

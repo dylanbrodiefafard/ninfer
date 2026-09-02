@@ -126,8 +126,16 @@ __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
     return col * kSamplerCandidateCap + j;
 }
 
-// Applies presence/frequency penalties to a raw logit. `overlay`/`overlay_len`
-// carry a round-local count overlay: tokens already committed earlier in the
+__device__ __forceinline__ bool sampling_token_suppressed(int v, const SamplingConfig& c) {
+    const int count = min(c.suppressed_token_count, SamplingConfig::kMaximumSuppressedTokens);
+    for (int i = 0; i < count; ++i) {
+        if (c.suppressed_tokens[i] == v) { return true; }
+    }
+    return false;
+}
+
+// Applies presence/frequency penalties to an eligible raw logit. `overlay`/`overlay_len` carry a
+// round-local count overlay: tokens already committed earlier in the
 // current speculative round but not yet flushed to the global `token_counts`. For speculative
 // verify column `col` the overlay is exactly drafts[0..col-1] (statically known,
 // since column `col` is only consumed when every earlier draft was accepted), so
@@ -192,6 +200,7 @@ __device__ inline void sampling_normalize_support(const SamplingConfig& cfg, flo
                                                   int n) {
     const int tid = threadIdx.x;
     if (tid == 0) {
+        while (n > 0 && cand_idx[n - 1] == INT_MAX) { --n; }
         const float inv_temp = 1.0f / cfg.temperature;
         const float m        = cand_val[0] * inv_temp;
         float sum            = 0.0f;
@@ -234,10 +243,14 @@ sampling_build_truncated_small(const __nv_bfloat16* logits, std::int64_t base, s
     const int cap = sampling_candidate_cap(cfg, vocab);
     if (tid < kSamplerTileItems) {
         if (tid < vocab) {
-            const float x = sampling_adjusted_logit(__bfloat162float(logits[base + tid]), tid, cfg,
-                                                    overlay, overlay_len);
-            tile_val[tid] = x;
-            tile_idx[tid] = tid;
+            if (sampling_token_suppressed(tid, cfg)) {
+                tile_val[tid] = -CUDART_INF_F;
+                tile_idx[tid] = INT_MAX;
+            } else {
+                tile_val[tid] = sampling_adjusted_logit(
+                    __bfloat162float(logits[base + tid]), tid, cfg, overlay, overlay_len);
+                tile_idx[tid] = tid;
+            }
         } else {
             tile_val[tid] = -CUDART_INF_F;
             tile_idx[tid] = INT_MAX;
@@ -273,6 +286,7 @@ __device__ inline void sampling_build_truncated_block_fast(
 
     const int fast_cap = cap;
     for (int v = tid; v < vocab; v += blockDim.x) {
+        if (sampling_token_suppressed(v, cfg)) { continue; }
         const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg, overlay,
                                                 overlay_len);
         sampling_insert_candidate(local_val, local_idx, fast_cap, x, v);

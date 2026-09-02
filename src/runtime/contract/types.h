@@ -2,6 +2,7 @@
 
 #include "ninfer/types.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -20,10 +21,14 @@ using ::ninfer::TokenId;
 // Engine has already selected the registered model/mode preset, applied every explicit override,
 // and validated these values before constructing the runtime request.
 struct ResolvedExecutionOptions {
+    static constexpr std::size_t kMaximumSuppressedTokens = 4;
+
     ResolvedSamplingParameters sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
     bool capture_context_checkpoint       = false;
+    std::array<TokenId, kMaximumSuppressedTokens> suppressed_token_ids{};
+    std::uint32_t suppressed_token_count = 0;
 };
 
 struct ResolvedRequestOptions {

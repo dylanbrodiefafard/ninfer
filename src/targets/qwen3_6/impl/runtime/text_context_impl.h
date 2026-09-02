@@ -758,7 +758,12 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_tokens = target_tokens.view({columns});
         ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
         ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
-        ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
+        if (sampling_config_ != nullptr) {
+            ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, sampling_config_, width,
+                        stream);
+        } else {
+            ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
+        }
     }
     if (reset_workspace) { work_.reset(); }
 }
