@@ -32,9 +32,9 @@ std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
     return total;
 }
 
-} // namespace
-
-void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cudaStream_t stream) {
+void argmax_impl(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
+                 const SamplingConfig* configs, std::int32_t columns_per_config,
+                 cudaStream_t stream) {
     if (logits.dtype != DType::BF16) { throw std::invalid_argument("argmax: logits must be BF16"); }
     if (out.dtype != DType::I32) { throw std::invalid_argument("argmax: out must be I32"); }
 
@@ -64,8 +64,28 @@ void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cudaStre
     if (logits.data == nullptr || out.data == nullptr) {
         throw std::invalid_argument("argmax: logits/out data must be non-null");
     }
+    if (configs != nullptr &&
+        (columns_per_config <= 0 || logits.ne[1] % columns_per_config != 0)) {
+        throw std::invalid_argument(
+            "argmax: suppressed-token config width must divide the output columns");
+    }
 
-    detail::argmax_launch(logits, out, valid_rows, stream);
+    detail::argmax_launch(logits, out, valid_rows, configs, columns_per_config, stream);
+}
+
+} // namespace
+
+void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cudaStream_t stream) {
+    argmax_impl(logits, out, valid_rows, nullptr, 1, stream);
+}
+
+void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
+            const SamplingConfig* configs, std::int32_t columns_per_config,
+            cudaStream_t stream) {
+    if (configs == nullptr) {
+        throw std::invalid_argument("argmax: suppressed-token configs must be non-null");
+    }
+    argmax_impl(logits, out, valid_rows, configs, columns_per_config, stream);
 }
 
 } // namespace ninfer::ops

@@ -43,7 +43,10 @@ bool same_config(const ops::SamplingConfig& a, const ops::SamplingConfig& b) {
     return a.temperature == b.temperature && a.top_k == b.top_k && a.top_p == b.top_p &&
            a.min_p == b.min_p && a.presence_penalty == b.presence_penalty &&
            a.frequency_penalty == b.frequency_penalty && a.seed == b.seed &&
-           a.token_counts == b.token_counts;
+           a.token_counts == b.token_counts &&
+           a.suppressed_token_count == b.suppressed_token_count &&
+           std::equal(std::begin(a.suppressed_tokens), std::end(a.suppressed_tokens),
+                      std::begin(b.suppressed_tokens));
 }
 
 std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
@@ -78,13 +81,19 @@ std::vector<int> greedy_oracle(const std::vector<float>& logits, int physical_ro
 Distribution distribution_oracle(const std::vector<float>& column, int token_domain,
                                  const ops::SamplingConfig& config,
                                  const std::vector<int>* counts = nullptr) {
-    std::vector<Candidate> candidates(static_cast<std::size_t>(token_domain));
+    std::vector<Candidate> candidates;
+    candidates.reserve(static_cast<std::size_t>(token_domain));
     for (int token = 0; token < token_domain; ++token) {
+        bool suppressed = false;
+        for (int i = 0; i < config.suppressed_token_count; ++i) {
+            suppressed |= config.suppressed_tokens[i] == token;
+        }
+        if (suppressed) { continue; }
         const int count = counts == nullptr ? 0 : (*counts)[static_cast<std::size_t>(token)];
         double adjusted = static_cast<double>(column[static_cast<std::size_t>(token)]);
         if (count > 0) { adjusted -= static_cast<double>(config.presence_penalty); }
         adjusted -= static_cast<double>(config.frequency_penalty) * static_cast<double>(count);
-        candidates[static_cast<std::size_t>(token)] = {adjusted, token};
+        candidates.push_back({adjusted, token});
     }
     std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
         if (a.adjusted != b.adjusted) { return a.adjusted > b.adjusted; }
@@ -447,6 +456,40 @@ int heterogeneous_batch_contract() {
     return failures;
 }
 
+int suppressed_token_contract() {
+    constexpr int token_domain = 257;
+    constexpr int batch        = 3;
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * batch, -20.0f);
+    for (int row = 0; row < batch; ++row) {
+        const std::size_t base = static_cast<std::size_t>(row) * token_domain;
+        logits[base + 11] = 8.0f;
+        logits[base + 17] = 7.0f;
+    }
+    for (int token = 0; token < token_domain; ++token) {
+        logits[static_cast<std::size_t>(2 * token_domain + token)] = -INFINITY;
+    }
+    round_to_bf16(logits);
+
+    std::vector<ops::SamplingConfig> configs(batch);
+    configs[0].temperature             = 0.0f;
+    configs[0].suppressed_token_count  = 1;
+    configs[0].suppressed_tokens[0]    = 11;
+    configs[1].temperature             = 0.8f;
+    configs[1].top_k                   = 1;
+    configs[1].seed                    = 1234;
+    configs[1].suppressed_token_count  = 1;
+    configs[1].suppressed_tokens[0]    = 11;
+    configs[2].temperature             = 0.0f;
+    configs[2].suppressed_token_count  = 1;
+    configs[2].suppressed_tokens[0]    = 0;
+
+    const RunResult result = run_batch(logits, token_domain, token_domain, std::move(configs),
+                                       {1, 2, 3}, ops::kSamplePurposeDecode);
+    return result.integrity_failures +
+           verify_exact("sample suppresses greedy and stochastic top token", result.tokens,
+                        {17, 17, 1});
+}
+
 int filtered_distribution_contract() {
     std::vector<float> column = {3.0f, 2.7f,  2.7f,  2.1f,  1.5f,  0.7f,
                                  0.1f, -0.4f, -1.0f, -2.0f, -3.0f, -4.0f};
@@ -603,6 +646,7 @@ int main() {
     failures += greedy_contract();
     failures += deterministic_stochastic_contract();
     failures += heterogeneous_batch_contract();
+    failures += suppressed_token_contract();
     failures += filtered_distribution_contract();
     failures += capped_distribution_contract();
     failures += real_shape_distribution_contract();

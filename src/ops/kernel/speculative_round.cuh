@@ -360,7 +360,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
 #pragma unroll
     for (int item = 0; item < kSamplerItemsPerThread; ++item) {
         const int v = tile_start + item * blockDim.x + threadIdx.x;
-        if (v < token_domain) {
+        if (v < token_domain && !sampling_token_suppressed(v, cfg)) {
             const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg,
                                                     overlay, overlay_len);
             keys[item]    = sampling_sort_key(x, v);

@@ -1012,7 +1012,7 @@ Batch assembly 对不同数据采用不同处理：
 | token、position、sampling config 等小型 controls | 按 compact row 写入连续 batch ingress |
 | KV payload 和 block tables | 保留在 shared paged pool，只写 per-row table-row selector |
 | Linear Attention / backend fixed state | 保留在 shared state pool，以 stable lane 或 backend-defined row 定位 |
-| request stop、output 和 external identity | 只保留在 host slot，不进入 model graph |
+| request stop、output 和 external identity | 只保留在 host slot；open-reasoning 期间需屏蔽的 registered EOS 作为 SamplingConfig row control 进入 graph |
 | activations、hidden、logits | 由一次 whole-batch schedule 在 shared execution memory 中产生 |
 
 不得 gather/copy KV 或 recurrent state 来制造连续 batch，也不得为每行构造 device-pointer array。Target

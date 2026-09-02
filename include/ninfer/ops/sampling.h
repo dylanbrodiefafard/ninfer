@@ -20,8 +20,13 @@ enum SamplePurpose : std::int32_t {
 };
 
 // Device-resident sampling parameters. token_counts is an optional device I32
-// [token_domain] occurrence-count array used by both penalties.
+// [token_domain] occurrence-count array used by both penalties. The first
+// suppressed_token_count entries in suppressed_tokens are excluded from selection;
+// callers must keep the count in [0, kMaximumSuppressedTokens] and leave at least one token in the
+// sampling domain eligible.
 struct SamplingConfig {
+    static constexpr std::int32_t kMaximumSuppressedTokens = 4;
+
     float temperature          = 0.0f; // <= 0 => greedy argmax (bit-identical to argmax())
     std::int32_t top_k         = 0;    // clamped to 20: top_k <= 0 or top_k > 20 => 20
     float top_p                = 1.0f; // >= 1 => disabled
@@ -30,6 +35,8 @@ struct SamplingConfig {
     float frequency_penalty    = 0.0f;
     unsigned long long seed    = 0;
     std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
+    std::int32_t suppressed_token_count = 0;
+    std::int32_t suppressed_tokens[kMaximumSuppressedTokens] = {-1, -1, -1, -1};
 };
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive

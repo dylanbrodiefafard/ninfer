@@ -40,6 +40,22 @@ ops::SamplingConfig translate_sampling(const ResolvedSamplingParameters& source)
     return out;
 }
 
+void install_suppressed_tokens(ops::SamplingConfig& destination,
+                               const runtime::ResolvedExecutionOptions& options) {
+    if (options.suppressed_token_count > destination.kMaximumSuppressedTokens) {
+        throw std::invalid_argument("too many suppressed sampling tokens");
+    }
+    destination.suppressed_token_count =
+        static_cast<std::int32_t>(options.suppressed_token_count);
+    for (std::uint32_t i = 0; i < options.suppressed_token_count; ++i) {
+        const TokenId token = options.suppressed_token_ids[i];
+        if (token < 0 || token >= TextConfig::token_domain) {
+            throw std::invalid_argument("suppressed sampling token is outside the vocabulary");
+        }
+        destination.suppressed_tokens[i] = token;
+    }
+}
+
 std::uint32_t pages_for_tokens(std::uint32_t tokens) noexcept {
     return 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
 }
@@ -99,6 +115,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->summary.transient_alignment    = 1;
     base->summary.transient_bytes        = 0;
     base->sampling                       = translate_sampling(options.sampling);
+    install_suppressed_tokens(base->sampling, options);
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
     base->capture_context_checkpoint     = options.capture_context_checkpoint;
     if (options.capture_context_checkpoint &&

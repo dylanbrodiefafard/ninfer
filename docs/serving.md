@@ -86,6 +86,12 @@ advertised alias is the artifact `identity.model_id` by default, or the explicit
 override. Reasoning is returned separately as `reasoning_content`; answer
 text remains in `content`.
 
+While a structured Qwen response is inside its open reasoning block, the registered model EOS
+tokens are excluded from selection. Selection is restored immediately after the reasoning
+terminator's accepted round commits, so the next GPU round can end the answer with the normal model
+EOS. Other request-provided stop conditions remain active, and raw-output requests do not apply
+this structured-output guard.
+
 Message roles retain their input order through schema translation. The Qwen family frontend maps
 both `system` and `developer` to system-class ChatML blocks at their original positions; it does not
 move later instructions to the beginning of the conversation. A leading instruction keeps the

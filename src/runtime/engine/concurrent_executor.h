@@ -150,6 +150,16 @@ public:
         try {
             auto output = instance_.loaded->frontend.make_output_session(prompt, options.stop,
                                                                          options.output);
+            if (output.in_reasoning()) {
+                const auto& stop_ids = instance_.loaded->frontend.default_stop_policy().token_ids;
+                if (stop_ids.size() > options.execution.suppressed_token_ids.size()) {
+                    throw std::logic_error("model defines too many default stop tokens");
+                }
+                options.execution.suppressed_token_count =
+                    static_cast<std::uint32_t>(stop_ids.size());
+                std::copy(stop_ids.begin(), stop_ids.end(),
+                          options.execution.suppressed_token_ids.begin());
+            }
             request = std::make_shared<Request>(request_id, std::move(prompt), std::move(output),
                                                 prompt_summary, prepare_seconds, std::move(options),
                                                 delivery, pending_deadline, submitted,
@@ -361,7 +371,8 @@ private:
             : id(request_identity), host_input(std::move(input_lease)), prompt(std::move(input)),
               output(std::move(output_session)), prompt_summary(summary),
               prepare_seconds(frontend_seconds), options(std::move(request_options)),
-              delivery(output_delivery), deadline(limit), submitted(submit_time) {}
+              delivery(output_delivery), deadline(limit), submitted(submit_time),
+              stop_suppression_active(options.execution.suppressed_token_count != 0) {}
 
         const std::uint64_t id;
         HostInputLease host_input;
@@ -382,6 +393,7 @@ private:
         std::optional<std::uint32_t> lane;
         std::atomic<bool> cancelled{false};
         bool decode_ready = false;
+        bool stop_suppression_active = false;
 
         std::optional<BasePlan> base_plan;
         std::array<std::optional<Plan>, kMaximumConcurrency> lane_plans{};
@@ -632,6 +644,11 @@ private:
         instance_.program->resolve_prefill_lane(lane, decision.finished());
         request->budget->commit(1);
         auto published = request->output.commit_preview();
+        if (!decision.finished() && request->stop_suppression_active &&
+            !request->output.in_reasoning()) {
+            instance_.program->clear_suppressed_tokens_lane(lane);
+            request->stop_suppression_active = false;
+        }
         if (!request->first_token) { request->first_token = Clock::now(); }
         append_output(request, std::move(published), !decision.finished());
         if (decision.finished()) {
@@ -1462,6 +1479,11 @@ private:
                 consume_service_work(request, accepted[row]);
             }
             auto published = request->output.commit_preview();
+            if (!terminal[row] && request->stop_suppression_active &&
+                !request->output.in_reasoning()) {
+                instance_.program->clear_suppressed_tokens_lane(lane);
+                request->stop_suppression_active = false;
+            }
             if (!request->first_token && accepted[row] != 0) {
                 request->first_token = Clock::now();
             }
