@@ -456,6 +456,7 @@ int main() {
             dump_speculative("  spec", compact.speculative);
             return 1;
         }
+        const std::uint64_t decode_before = engine.runtime_stats().committed_decode_tokens;
         auto compact_a = engine.submit(engine.prepare_tokens(prompts[0]), greedy_options(7));
         auto compact_b = engine.submit(engine.prepare_tokens(prompts[1]), greedy_options(7));
         const ninfer::GenerationResult compact_ra = compact_a.wait();
@@ -469,6 +470,12 @@ int main() {
             std::cerr << label << " compact C=2 k=5 under N=7 failed\n";
             dump_speculative("  A", compact_ra.speculative);
             dump_speculative("  B", compact_rb.speculative);
+            return 1;
+        }
+        // Each seven-token request commits its first token in prefill, then six tokens in decode.
+        // A terminal wait must not become observable before those decode counters are published.
+        if (engine.runtime_stats().committed_decode_tokens < decode_before + 12) {
+            std::cerr << label << " terminal waits preceded committed decode-stat publication\n";
             return 1;
         }
         const ninfer::GenerationResult seq =
@@ -503,6 +510,45 @@ int main() {
                 dump_speculative("  spec", results[i].speculative);
                 return 1;
             }
+        }
+        std::cout << "ok " << label << '\n' << std::flush;
+    }
+
+    {
+        const char* label = "DFlash2 terminal delivery and queue telemetry";
+        ninfer::Engine engine(adaptive_engine_options(
+            artifact, ninfer::SpeculativeBackend::DFlash, 7, 1));
+        if (const int result = check_dflash_load(engine); result != 0) { return result; }
+
+        struct DiscardingSink final : ninfer::OutputSink {
+            void publish(ninfer::OutputDelta) override {}
+        } sink;
+        auto terminal = engine.submit(engine.prepare_tokens(prompts[0]), greedy_options(7));
+        bool rejected = false;
+        try {
+            (void)terminal.wait(&sink);
+        } catch (const std::logic_error&) {
+            rejected = true;
+        }
+        if (!rejected) {
+            std::cerr << label << " accepted a sink for terminal-only delivery\n";
+            return 1;
+        }
+        if (terminal.wait().generated_token_ids.size() != 7) {
+            std::cerr << label << " terminal request did not complete after sink rejection\n";
+            return 1;
+        }
+
+        auto active = engine.submit(engine.prepare_tokens(prompts[0]), greedy_options(16));
+        auto queued = engine.submit(engine.prepare_tokens(prompts[1]), greedy_options(7));
+        if (engine.runtime_stats().waiting_requests == 0) {
+            std::cerr << label << " full engine did not publish queued depth at ingress\n";
+            return 1;
+        }
+        if (active.wait().generated_token_ids.size() != 16 ||
+            queued.wait().generated_token_ids.size() != 7) {
+            std::cerr << label << " queued requests did not complete\n";
+            return 1;
         }
         std::cout << "ok " << label << '\n' << std::flush;
     }

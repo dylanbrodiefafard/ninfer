@@ -412,6 +412,11 @@ struct OutputDelta {
     std::string text;
 };
 
+enum class OutputDelivery : std::uint8_t {
+    TerminalOnly,
+    Streaming,
+};
+
 class OutputSink {
 public:
     virtual ~OutputSink()                   = default;
@@ -533,8 +538,9 @@ struct MemorySummary {
     std::size_t kv_ram_entry_count                = 0;
 };
 
-// Monotonic execution counters plus one boundary-consistent scheduler snapshot. Consumers derive
-// interval throughput by subtracting two snapshots and dividing by their own monotonic wall time.
+// Monotonic execution counters plus fieldwise-concurrent live scheduler gauges. A returned value is
+// race-free but is not a multi-field transaction with one boundary identity. Consumers derive
+// interval throughput from the monotonic counters and their own monotonic wall time.
 struct RuntimeStats {
     // Actual prompt tokens evaluated by prefill; resident prefix hits are excluded.
     std::uint64_t computed_prefill_tokens = 0;

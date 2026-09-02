@@ -34,6 +34,69 @@ over the loopback OpenAI-compatible HTTP endpoint. Each reported corpus fixture 
 seeds. Values are arithmetic mean ± sample standard deviation, and server warm-up completes before
 the measured requests. The concurrent campaign has its own sustained-wave method below.
 
+## Qwen3.8-27B NVFP4 host-overhead campaign
+
+The 2026-09-01 non-kernel campaign fixed the supported target to
+`qwen3.8-27b/nvfp4`, one RTX 5090, DFlash k=4, NVFP4 KV, CUDA Graphs, prefix reuse disabled,
+`--prefill-chunk 4096`, and startup concurrency C=1, 2, 3, or 4. The artifact was
+`out/qwen3_8_27b_nvfp4_dflash_nvfp4_codebook.ninfer`. The benchmark-reported toolchain was CUDA
+13.3 compile/runtime with driver API 13.0. Greedy fixed waves used exact work counters and compared
+output hashes as multisets because concurrent HTTP admission may permute requests across lanes.
+
+The configuration gate selected DFlash k=4 at every C. Its external decode rates were 209.97,
+328.37, 391.60, and 467.91 tokens/s for C=1-4. The following ratios are candidate/prior external
+throughput; a value of 1.0 is neutral. Each row used the immediately preceding retained binary.
+
+| Host change | C=1 | C=2 | C=3 | C=4 | Decision |
+|---|---:|---:|---:|---:|---|
+| Lock-free hot runtime counters and transition-only full snapshots | 0.9982 | 0.9980 | 1.0002 | 0.9982 | Retained: removes per-round locked lane/KV scans; no material regression |
+| Periodic reporter no longer calls `memory_summary()` | 1.0000 | 0.9996 | 0.9996 | 0.9993 | Retained: removes reporter contention with the executor; throughput-neutral |
+| Terminal-only publication for non-stream requests | 0.9971 | 1.0003 | 0.9988 | 1.0000 | Retained: removes per-round event lock/allocation/wakeup; exact outputs |
+| Stable-decode dirty signal | 1.0027 | 0.9997 | 1.0012 | 1.0013 | Retained: skips unchanged queue/deadline/admission scans |
+| Cached Program graph selection | 0.9973 | 0.9978 | 0.9998 | 1.0026 | Reverted: regressed C=1/2 and added invalidation state |
+| Direct `(K,B,frontier)` graph-routing table | 0.9999 | 0.9989 | 0.9995 | 0.9999 | Reverted: O(1) lookup produced no end-to-end win |
+
+Two fresh cumulative A/B passes against the preserved pre-campaign binary, in opposite binary
+orders, produced retained/baseline throughput ratios of `0.9987/1.0014/0.9994/0.9995` and
+`1.0030/1.0014/1.0013/1.0001` at C=1-4. Their per-C geometric means are
+`1.0009/1.0014/1.0003/0.9998`: C=2's +0.14% result repeated, but no material uniform
+end-to-end speedup is established. Exact work and output-hash multisets matched. The cumulative
+host changes are retained for removing unnecessary executor-side contention and publication work,
+not claimed as a general decode-speed improvement.
+
+The terminal-only SSE control A/B preserved output hashes, event counts, and ordering. Mean
+first-output changes for C=1-4 were +0.62, +0.49, +0.71, and -0.03 ms; worst event-gap changes were
+below 0.9 ms. A 7,705-token prefill follow-up removed the full transition snapshot after the first
+nonterminal 4,096-token chunk. A fresh C=4 paired repeat produced candidate/prior prefill-speed
+ratios of 0.9991, 1.0003, 0.9997, and 1.0008 across the four serialized request positions and a
+0.03% lower wave makespan, with exact work and output multisets.
+
+Allocation and representation gates rejected final-string preallocation, stop-token lookup, and
+stop-string matcher changes: representative final output growth copied only about 8 KiB per
+2,048-token request, the artifact has exactly two default stop token IDs, and the fixed workload
+has no stop strings. Consumer cancellation polling was retained because `CancellationView` has no
+owning notification hook; replacing it would add cross-layer lifetime machinery without improving
+the GPU launch path.
+
+The graph-profile gate separately tested tighter DFlash context envelopes while preserving every
+target-declared implementation-transition boundary. Relative to the existing profiles, maximum
+spans of 2,048, 1,024, and 512 tokens produced C=1-4 external-throughput ratios of respectively
+`1.0001/1.0002/0.9995/1.0004`, `1.0020/1.0010/0.9995/1.0006`, and
+`1.0017/0.9974/0.9960/0.9965`. Exact work and output hashes matched. The 2,048 and 1,024 results
+were neutral at measurement scale and 512 regressed C=2-4, so the existing transition-derived
+profiles remain selected; startup graph update compatibility is not treated as evidence that a
+profile is performance-optimal.
+
+Primary reports are under `profiles/bench/host-overhead-*`. The baseline gate is
+`host-overhead-mode-gate-baseline-20260831`; retained decode A/Bs end in
+`memory-candidate-greedy-20260831`, `runtime-stats-causal-greedy-20260831`,
+`terminal-only-candidate-greedy-20260831`, and `stable-decode-candidate-greedy-20260901`. The final
+prefill repeat is `host-overhead-prefill-stats-{prior,candidate}-rerun-c4-thinking-greedy-20260901`.
+The graph-routing baseline and profile sweep are under `profiles/bench/graph-routing-baseline-*`
+and `profiles/bench/graph-profiles-span{2048,1024,512}-candidate-*`.
+The fresh cumulative reports are
+`host-overhead-cumulative-{baseline,candidate}{,-rerun}-greedy-20260901`.
+
 ## Single-request serving performance method
 
 | Setting | Value |

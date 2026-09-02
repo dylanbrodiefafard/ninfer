@@ -193,8 +193,10 @@ graph families，而不是构造 `C` 个单请求 Program。
 
 Blocking `Engine::generate` 可以保留为 product facade，但其语义是提交一个 owning request record 并等待该
 request 完成，而不是在 caller thread 内运行完整 generation loop。一个 Engine-owned GPU worker 执行全局
-boundary loop；并发 callers 等待各自的 result/output queue。GPU worker 只追加 committed output events，
-不调用 network write 或可能阻塞的 `OutputSink`。
+boundary loop；并发 callers 等待各自的 owning result，以及 streaming request 的 output queue。Delivery
+intent 在 queue membership 前固定：两种模式都由 GPU worker 追加 committed output 到 owning result，只有
+`Streaming` 模式写 per-round output events；`TerminalOnly` 模式直到 completion 才唤醒 consumer。GPU
+worker 不调用 network write 或可能阻塞的 `OutputSink`。
 
 ---
 
@@ -1133,15 +1135,16 @@ row result
 ```
 
 对每行而言，model-state frontier、target cursor、sampler/penalty progress、usage 和 owning output record 是
-一次逻辑 transaction。Output event 只有在这些 state 全部 commit 后才能对 response path 可见。一行结束、
-取消或在 speculative mode 中接受较短 prefix，不改变其他行的 commit result。
+一次逻辑 transaction。Streaming output event 只有在这些 state 全部 commit 后才能对 response path
+可见；terminal-only request 不产生 per-round event。一行结束、取消或在 speculative mode 中接受较短
+prefix，不改变其他行的 commit result。
 
 Speculative backend 的 target GDN 使用 ReplaySSM 时，GPU graph 只读 lane 的 current state 并写
 Program-owned raw records，不推进 committed GDN state。CPU output preview 得到每行最终提交长度后，
 `resolve_pending_batch` 先用原始 `B` 行执行一次 all-layer Fold，再完成必要的 hidden/backend correction，
 同步成功后才推进 host frontiers。取消行以 `commit_columns=0` 参与原始 row mapping，Fold 对该行严格
 no-op，随后 retain 该行已 commit 的 continuation，而不是释放 bundle。Executor 只能在这个 commit tail
-成功后提交 output preview 和发布 output event。
+成功后提交 output preview，并在 streaming 模式发布 output event。
 
 全部 rows resolve 后，`RoundMembership` 销毁，frame 可以被下一 unit 覆盖。继续运行的 slots 在下一
 boundary 重新 compact；没有任何 row identity 从当前 frame 继承到下一 frame。
@@ -1350,20 +1353,22 @@ commit 前截断 effective committed extent，model state 和 output 只提交�
 
 ## 11. Completion and response handling
 
-Ingress 为 request 建立 owning record；有效 output bound 在 admission 时确定。每个 boundary 把 committed
-tokens 追加到该 record，因此 ordinary 或 multi-token speculative round 都不依赖 network progress 才能
-commit。
+Ingress 为 request 建立 owning record，并在 queue membership 前固定 `OutputDelivery`；有效 output bound
+在 admission 时确定。每个 boundary 把 committed tokens 追加到该 record，因此 ordinary 或 multi-token
+speculative round 都不依赖 network progress 才能 commit。`Streaming` 同时把该 round 的 compact deltas
+写入 request-owned event queue 并至多唤醒 consumer 一次；`TerminalOnly` 不建立 per-round events，也不在
+terminal publication 前唤醒 consumer。
 
 Model completion 时，GPU Executor 终结 owning result record，释放 request 的 slot 和 unused reservation，
 并释放 sequence state 或按 §6.4 把带有 target-declared reusable checkpoints 的 state 转移给
 retained-prefix cache。上述 GPU
 resource 被复用后，response path 仍可继续读取 owning record。
 
-Committed output events 写入 request-owned result/event storage，由等待该 request 的 caller thread 取出。
-Network write、protocol serialization 和 `OutputSink` callback 不在 GPU Executor 上运行。Caller 消费缓慢
-不会阻塞 GPU boundary loop；积压仍受该 request 的 finite output bound 限制。Request lifetime capacity 在
-response consumer 释放 owning record 前继续计费，因此 model slot 已复用并不产生无界 completed-result
-backlog。
+Committed output 始终写入 request-owned result storage；只有 streaming deltas 进入 event storage，由等待
+该 request 的 caller thread 取出。Network write、protocol serialization 和 `OutputSink` callback 不在 GPU
+Executor 上运行。Caller 消费缓慢不会阻塞 GPU boundary loop；积压仍受该 request 的 finite output bound
+限制。Request lifetime capacity 在 response consumer 释放 owning record 前继续计费，因此 model slot 已
+复用并不产生无界 completed-result backlog。
 
 因此 model completion 和 response completion 是两个独立 lifetime：
 
@@ -1373,6 +1378,14 @@ response lifetime:  request received ──────────────�
 active slot/state:   admission ──────────── model finished
 retained state:                                 optional ───── eviction/reuse
 ```
+
+Runtime telemetry 不拥有 executor state。四个 hot monotonic counters 由单一 executor writer 以 lock-free
+publication 更新；scheduler 和 KV-RAM gauges 只在 admission、prefill transition、completion、cancellation、
+timeout、failure 或 KV-RAM mutation 等实际 state transition 后发布。`runtime_stats()` 返回 race-free、
+fieldwise-concurrent view，而不是伪装成具有单一 boundary identity 的 multi-field transaction；由 completing
+request 造成的 transition publication 必须先于该 request 的 terminal notification。Periodic serving
+reporter 只读取这个 published view，不调用会取得 execution ownership 的 `memory_summary()`；后者保留给
+startup、CLI 和 caller-requested 的完整 arena diagnostics。
 
 GPU execution 或 state-integrity failure 属于 Engine-wide failure：停止 admission，active 和 queued
 requests 以 unavailable/failure 结束，重新创建 Engine 后才能恢复 serving。Scheduler 不猜测 failed

@@ -375,7 +375,8 @@ int main(int argc, char** argv) {
         ninfer::PreparedPrompt prompt = engine.prepare(std::move(input));
 
         StreamingSink sink;
-        ninfer::GenerationHandle generation = engine.submit(std::move(prompt), std::move(request));
+        ninfer::GenerationHandle generation = engine.submit(
+            std::move(prompt), std::move(request), ninfer::OutputDelivery::Streaming);
         const ninfer::ResolvedSamplingParameters sampling = generation.resolved_sampling();
         const ninfer::GenerationResult result             = generation.wait(&sink);
         sink.finish_streams();

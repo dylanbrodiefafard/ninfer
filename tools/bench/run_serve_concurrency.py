@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import dataclasses
+import hashlib
 import http.client
 import json
 import math
@@ -29,7 +30,7 @@ from tools.bench import run_serve_corpus as corpus  # noqa: E402
 
 
 SUITES = ("decode-saturation", "corpus-makespan")
-STATS_INTERVAL_MS = 1000
+DEFAULT_STATS_INTERVAL_MS = 1000
 PENDING_TIMEOUT_MS = 24 * 60 * 60 * 1000
 SATURATION_FIXTURE = "long_decode_aime26_15"
 SATURATION_SEEDS = (
@@ -45,7 +46,7 @@ SATURATION_SEEDS = (
 CORPUS_ORDER_SEED = 20260811
 POINT_ARTIFACT_TYPE = "ninfer_serve_concurrency_bench_point"
 SUMMARY_ARTIFACT_TYPE = "ninfer_serve_concurrency_bench_summary"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 @dataclasses.dataclass(frozen=True)
@@ -59,13 +60,15 @@ class Point:
     sampling_mode: str
     suite: str
     concurrency: int
+    streaming: bool = False
     adaptive_draft: bool = False
 
     @property
     def key(self) -> str:
         adaptive = "_adaptive" if self.adaptive_draft else ""
+        delivery = "_stream" if self.streaming else ""
         return (
-            f"{self.target}_{self.speculative_mode}{adaptive}_{self.sampling_mode}_"
+            f"{self.target}_{self.speculative_mode}{adaptive}{delivery}_{self.sampling_mode}_"
             f"{self.suite.replace('-', '_')}_c{self.concurrency}"
         )
 
@@ -87,6 +90,13 @@ class ClientResult:
     prompt_tokens: int
     completion_tokens: int
     finish_reason: str
+    content_sha256: str = ""
+    reasoning_sha256: str = ""
+    content_bytes: int = 0
+    reasoning_bytes: int = 0
+    first_output_at: float | None = None
+    output_event_count: int = 0
+    max_output_gap_seconds: float | None = None
 
     @property
     def elapsed_seconds(self) -> float:
@@ -179,10 +189,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--prefill-chunk", type=int, default=4096)
     parser.add_argument(
+        "--log-stats-interval-ms",
+        type=int,
+        default=DEFAULT_STATS_INTERVAL_MS,
+        help="server throughput-log interval; 0 disables periodic logging (default: 1000)",
+    )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="measure the Chat Completions SSE path instead of the non-streaming response path",
+    )
+    parser.add_argument(
         "--kv-dtype",
         choices=corpus.KV_DTYPES,
-        default="int8",
-        help="KV storage for the server process (default: int8, published concurrency method)",
+        default="nvfp4",
+        help="KV storage for the server process (default: nvfp4)",
     )
     parser.add_argument(
         "--adaptive-draft",
@@ -215,6 +236,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise corpus.CampaignError("--decode-tokens must be positive")
     if args.prefill_chunk <= 0 or args.prefill_chunk % 128 != 0:
         raise corpus.CampaignError("--prefill-chunk must be a positive multiple of 128")
+    if args.log_stats_interval_ms < 0:
+        raise corpus.CampaignError("--log-stats-interval-ms must be nonnegative")
     if args.kv_capacity != "auto":
         if not args.kv_capacity.isdigit() or int(args.kv_capacity) <= 0:
             raise corpus.CampaignError("--kv-capacity must be a positive integer or auto")
@@ -257,6 +280,7 @@ def build_points(
                             sampling_mode=args.sampling,
                             suite=suite,
                             concurrency=concurrency,
+                            streaming=bool(args.stream),
                             adaptive_draft=bool(getattr(args, "adaptive_draft", False)),
                         )
                     )
@@ -362,6 +386,9 @@ def workload_order_label(point: Point) -> str:
 def request_payload(point: Point, job: Job) -> dict[str, Any]:
     payload = corpus.request_payload(point.model_id, job.fixture, job.seed)
     payload["max_completion_tokens"] = job.max_tokens
+    payload["stream"] = point.streaming
+    if point.streaming:
+        payload["stream_options"] = {"include_usage": True}
     return payload
 
 
@@ -393,7 +420,7 @@ def server_command(
         "--prefill-chunk",
         str(args.prefill_chunk),
         "--log-stats-interval-ms",
-        str(STATS_INTERVAL_MS),
+        str(getattr(args, "log_stats_interval_ms", DEFAULT_STATS_INTERVAL_MS)),
         "--device",
         str(args.device),
         "--request-log-jsonl",
@@ -451,7 +478,9 @@ def validate_server_start(
         "max_pending_requests": 1,
         "pending_timeout_ms": PENDING_TIMEOUT_MS,
         "prefill_chunk": args.prefill_chunk,
-        "log_stats_interval_ms": STATS_INTERVAL_MS,
+        "log_stats_interval_ms": getattr(
+            args, "log_stats_interval_ms", DEFAULT_STATS_INTERVAL_MS
+        ),
         "kv_cache": corpus.KV_CACHE_LOG_NAMES[args.kv_dtype],
         "cuda_graph": True,
         "prefix_reuse": False,
@@ -489,6 +518,11 @@ def parse_client_response(
         prompt_tokens = int(usage["prompt_tokens"])
         completion_tokens = int(usage["completion_tokens"])
         finish_reason = str(choices[0]["finish_reason"])
+        message = choices[0]["message"]
+        content = message.get("content") or ""
+        reasoning = message.get("reasoning_content") or ""
+        if not isinstance(content, str) or not isinstance(reasoning, str):
+            raise TypeError("assistant output is not text")
     except (KeyError, IndexError, TypeError, ValueError) as exc:
         raise corpus.CampaignError(f"invalid Chat Completions response: {exc}") from exc
     return ClientResult(
@@ -498,6 +532,114 @@ def parse_client_response(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         finish_reason=finish_reason,
+        content_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        reasoning_sha256=hashlib.sha256(reasoning.encode("utf-8")).hexdigest(),
+        content_bytes=len(content.encode("utf-8")),
+        reasoning_bytes=len(reasoning.encode("utf-8")),
+    )
+
+
+def receive_stream(
+    connection: http.client.HTTPConnection, job: Job, started_at: float
+) -> ClientResult:
+    try:
+        response = connection.getresponse()
+    except (OSError, http.client.HTTPException) as exc:
+        raise corpus.CampaignError(f"HTTP request failed: {exc}") from exc
+    if response.status != 200:
+        detail = response.read().decode("utf-8", errors="replace")
+        raise corpus.CampaignError(f"HTTP {response.status} {response.reason}: {detail}")
+
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    finish_reason: str | None = None
+    first_output_at: float | None = None
+    previous_output_at: float | None = None
+    max_output_gap_seconds: float | None = None
+    output_event_count = 0
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    saw_done = False
+    try:
+        while True:
+            raw_line = response.readline()
+            if not raw_line:
+                break
+            line = raw_line.decode("utf-8").strip()
+            if not line:
+                continue
+            if not line.startswith("data:"):
+                raise corpus.CampaignError(f"invalid SSE field: {line!r}")
+            data = line[5:].lstrip()
+            if data == "[DONE]":
+                saw_done = True
+                break
+            event = json.loads(data)
+            if not isinstance(event, dict):
+                raise corpus.CampaignError("SSE data is not a JSON object")
+            usage = event.get("usage")
+            if isinstance(usage, dict):
+                prompt_tokens = int(usage["prompt_tokens"])
+                completion_tokens = int(usage["completion_tokens"])
+            choices = event.get("choices", [])
+            if not isinstance(choices, list):
+                raise corpus.CampaignError("SSE choices is not a JSON list")
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    raise corpus.CampaignError("SSE choice is not a JSON object")
+                if choice.get("finish_reason") is not None:
+                    finish_reason = str(choice["finish_reason"])
+                delta = choice.get("delta", {})
+                if not isinstance(delta, dict):
+                    raise corpus.CampaignError("SSE delta is not a JSON object")
+                if any(
+                    delta.get(name) not in (None, "")
+                    for name in ("content", "reasoning_content")
+                ):
+                    now = time.monotonic()
+                    if first_output_at is None:
+                        first_output_at = now
+                    if previous_output_at is not None:
+                        gap = now - previous_output_at
+                        max_output_gap_seconds = max(max_output_gap_seconds or 0.0, gap)
+                    previous_output_at = now
+                    output_event_count += 1
+                content = delta.get("content")
+                reasoning = delta.get("reasoning_content")
+                if content is not None:
+                    if not isinstance(content, str):
+                        raise TypeError("streamed content is not text")
+                    content_parts.append(content)
+                if reasoning is not None:
+                    if not isinstance(reasoning, str):
+                        raise TypeError("streamed reasoning is not text")
+                    reasoning_parts.append(reasoning)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise corpus.CampaignError(f"invalid Chat Completions SSE response: {exc}") from exc
+
+    finished_at = time.monotonic()
+    if not saw_done:
+        raise corpus.CampaignError("Chat Completions SSE response ended before [DONE]")
+    if prompt_tokens is None or completion_tokens is None:
+        raise corpus.CampaignError("Chat Completions SSE response has no terminal usage")
+    if finish_reason is None:
+        raise corpus.CampaignError("Chat Completions SSE response has no finish reason")
+    content = "".join(content_parts)
+    reasoning = "".join(reasoning_parts)
+    return ClientResult(
+        job=job,
+        started_at=started_at,
+        finished_at=finished_at,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        finish_reason=finish_reason,
+        content_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        reasoning_sha256=hashlib.sha256(reasoning.encode("utf-8")).hexdigest(),
+        content_bytes=len(content.encode("utf-8")),
+        reasoning_bytes=len(reasoning.encode("utf-8")),
+        first_output_at=first_output_at,
+        output_event_count=output_event_count,
+        max_output_gap_seconds=max_output_gap_seconds,
     )
 
 
@@ -557,12 +699,20 @@ def run_clients(
                             corpus.send_json(connection, payload)
                             next_dispatch_index += 1
                             dispatch_condition.notify_all()
-                        response = corpus.receive_json(connection)
+                        if point.streaming:
+                            result = receive_stream(connection, job, started_at)
+                        else:
+                            response = corpus.receive_json(connection)
                     else:
                         started_at = time.monotonic()
-                        response = corpus.post_json(connection, payload)
-                    finished_at = time.monotonic()
-                    result = parse_client_response(job, response, started_at, finished_at)
+                        if point.streaming:
+                            corpus.send_json(connection, payload)
+                            result = receive_stream(connection, job, started_at)
+                        else:
+                            response = corpus.post_json(connection, payload)
+                    if not point.streaming:
+                        finished_at = time.monotonic()
+                        result = parse_client_response(job, response, started_at, finished_at)
                 except Exception as exc:
                     record_failure(exc)
                     return
@@ -800,9 +950,20 @@ def client_records(
             "prompt_tokens": result.prompt_tokens,
             "completion_tokens": result.completion_tokens,
             "finish_reason": result.finish_reason,
+            "content_sha256": result.content_sha256,
+            "reasoning_sha256": result.reasoning_sha256,
+            "content_bytes": result.content_bytes,
+            "reasoning_bytes": result.reasoning_bytes,
             "start_offset_seconds": result.started_at - campaign_start,
             "finish_offset_seconds": result.finished_at - campaign_start,
             "elapsed_seconds": result.elapsed_seconds,
+            "first_output_seconds": (
+                None
+                if result.first_output_at is None
+                else result.first_output_at - result.started_at
+            ),
+            "output_event_count": result.output_event_count,
+            "max_output_gap_seconds": result.max_output_gap_seconds,
         }
         for result in results
     ]
@@ -884,6 +1045,7 @@ def analyze_point(
         "adaptive_draft": point.adaptive_draft,
         "sampling_mode": point.sampling_mode,
         "suite": point.suite,
+        "streaming": point.streaming,
         "workload_order": workload_order(point),
         "concurrency": point.concurrency,
         "request_count": len(results),

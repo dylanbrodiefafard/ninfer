@@ -76,10 +76,13 @@ public:
     [[nodiscard]] PromptCapabilities prompt_capabilities() const;
     [[nodiscard]] ModelSamplingDefaults sampling_defaults() const;
 
-    // Establishes queue membership synchronously. Destroying an unconsumed handle cancels its
-    // request; wait() owns result consumption and may run independently from GPU execution.
+    // Establishes queue membership synchronously. Delivery intent is fixed before queue
+    // membership; terminal-only requests do not publish per-round OutputDelta events. Destroying
+    // an unconsumed handle cancels its request; wait() owns result consumption and may run
+    // independently from GPU execution.
     [[nodiscard]] GenerationHandle
     submit(PreparedPrompt prompt, RequestOptions options,
+           OutputDelivery delivery = OutputDelivery::TerminalOnly,
            std::chrono::steady_clock::time_point pending_deadline = {},
            HostInputLease host_input                              = {});
 
