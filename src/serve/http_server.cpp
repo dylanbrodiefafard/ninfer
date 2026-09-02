@@ -118,8 +118,7 @@ ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
     };
 }
 
-bool report_has_activity(const ThroughputReport& report, const ninfer::RuntimeStats& previous,
-                         std::size_t previous_used, std::size_t previous_entries) {
+bool report_has_activity(const ThroughputReport& report, const ninfer::RuntimeStats& previous) {
     return report.computed_prefill_tokens != 0 || report.committed_decode_tokens != 0 ||
            report.decode_rounds != 0 || report.scheduler.running_requests != 0 ||
            report.scheduler.waiting_requests != 0 ||
@@ -128,8 +127,8 @@ bool report_has_activity(const ThroughputReport& report, const ninfer::RuntimeSt
            report.scheduler.kv_ram_evictions != previous.kv_ram_evictions ||
            report.scheduler.kv_ram_drops != previous.kv_ram_drops ||
            report.kv_ram_save_seconds != 0.0 || report.kv_ram_load_seconds != 0.0 ||
-           report.kv_ram_used_bytes != previous_used ||
-           report.kv_ram_entry_count != previous_entries;
+           report.kv_ram_used_bytes != previous.kv_ram_used_bytes ||
+           report.kv_ram_entry_count != previous.kv_ram_entry_count;
 }
 
 std::string_view unstreamed_content(const GenerationOutcome& outcome) {
@@ -206,9 +205,8 @@ void HttpServer::log_throughput(const ThroughputReport& report) {
 }
 
 void HttpServer::run_stats_reporter() {
-    using Clock                     = std::chrono::steady_clock;
-    ninfer::RuntimeStats previous   = service_->runtime_stats();
-    ninfer::MemorySummary previous_memory = service_->memory_summary();
+    using Clock                   = std::chrono::steady_clock;
+    ninfer::RuntimeStats previous = service_->runtime_stats();
     Clock::time_point previous_time = Clock::now();
     const auto interval             = std::chrono::milliseconds(options_.log_stats_interval_ms);
 
@@ -219,30 +217,26 @@ void HttpServer::run_stats_reporter() {
         }
 
         const ninfer::RuntimeStats current = service_->runtime_stats();
-        const ninfer::MemorySummary memory = service_->memory_summary();
         const Clock::time_point now        = Clock::now();
         ThroughputReport report            = make_throughput_report(
             previous, current, std::chrono::duration<double>(now - previous_time).count());
-        report.kv_ram_capacity_bytes = memory.kv_ram_capacity_bytes;
-        report.kv_ram_used_bytes     = memory.kv_ram_used_bytes;
-        report.kv_ram_entry_count    = memory.kv_ram_entry_count;
-        if (report_has_activity(report, previous, previous_memory.kv_ram_used_bytes,
-                                previous_memory.kv_ram_entry_count)) {
+        report.kv_ram_capacity_bytes = current.kv_ram_capacity_bytes;
+        report.kv_ram_used_bytes     = current.kv_ram_used_bytes;
+        report.kv_ram_entry_count    = current.kv_ram_entry_count;
+        if (report_has_activity(report, previous)) {
             log_throughput(report);
         }
         previous      = current;
         previous_time = now;
-        previous_memory = memory;
     }
 
     const ninfer::RuntimeStats current = service_->runtime_stats();
-    const ninfer::MemorySummary memory = service_->memory_summary();
     const Clock::time_point now        = Clock::now();
     ThroughputReport tail              = make_throughput_report(
         previous, current, std::chrono::duration<double>(now - previous_time).count());
-    tail.kv_ram_capacity_bytes = memory.kv_ram_capacity_bytes;
-    tail.kv_ram_used_bytes     = memory.kv_ram_used_bytes;
-    tail.kv_ram_entry_count    = memory.kv_ram_entry_count;
+    tail.kv_ram_capacity_bytes = current.kv_ram_capacity_bytes;
+    tail.kv_ram_used_bytes     = current.kv_ram_used_bytes;
+    tail.kv_ram_entry_count    = current.kv_ram_entry_count;
     if (tail.computed_prefill_tokens != 0 || tail.committed_decode_tokens != 0 ||
         tail.decode_rounds != 0) {
         log_throughput(tail);

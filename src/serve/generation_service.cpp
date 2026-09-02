@@ -390,8 +390,12 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
         prepared.prompt_tokens = static_cast<int>(prompt.summary().prompt_tokens);
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
+        const ninfer::OutputDelivery delivery = request.stream
+            ? ninfer::OutputDelivery::Streaming
+            : ninfer::OutputDelivery::TerminalOnly;
         prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
-                                              prepared.lifetime->deadline, std::move(host_input));
+                                              delivery, prepared.lifetime->deadline,
+                                              std::move(host_input));
         prepared.sampling   = prepared.generation.resolved_sampling();
     } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
         throw_request_error(exception);

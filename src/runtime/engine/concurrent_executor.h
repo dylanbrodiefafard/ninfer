@@ -63,7 +63,7 @@ public:
             std::lock_guard lock(queue_mutex_);
             stopping_ = true;
         }
-        queue_cv_.notify_all();
+        signal_control(true);
         if (worker_.joinable()) { worker_.join(); }
     }
 
@@ -95,6 +95,9 @@ public:
             if (owner_ == nullptr || request_ == nullptr) {
                 throw std::logic_error("concurrent submission is empty");
             }
+            if (sink != nullptr && request_->delivery != OutputDelivery::Streaming) {
+                throw std::logic_error("terminal-only submission cannot consume an OutputSink");
+            }
             ConcurrentExecutor* owner = std::exchange(owner_, nullptr);
             return owner->wait_for_request(std::exchange(request_, nullptr), sink, cancellation);
         }
@@ -118,6 +121,7 @@ public:
 
     Submission submit(targets::qwen3_6::PreparedPrompt prompt, PromptSummary prompt_summary,
                       double prepare_seconds, ResolvedRequestOptions options,
+                      OutputDelivery delivery,
                       Clock::time_point pending_deadline = {}, HostInputLease host_input = {}) {
         const Clock::time_point submitted = Clock::now();
         if (pending_deadline == Clock::time_point{}) {
@@ -148,7 +152,8 @@ public:
                                                                          options.output);
             request = std::make_shared<Request>(request_id, std::move(prompt), std::move(output),
                                                 prompt_summary, prepare_seconds, std::move(options),
-                                                pending_deadline, submitted, std::move(host_input));
+                                                delivery, pending_deadline, submitted,
+                                                std::move(host_input));
             request->base_plan.emplace(
                 instance_.program->plan_request_base(request->prompt, request->options.execution));
         } catch (...) {
@@ -164,8 +169,10 @@ public:
                                    "inference engine is unavailable");
             }
             pending_.push_back(request);
+            published_waiting_requests_.store(static_cast<std::uint32_t>(pending_.size()),
+                                              std::memory_order_relaxed);
         }
-        queue_cv_.notify_one();
+        signal_control();
         return Submission(*this, std::move(request));
     }
 
@@ -229,7 +236,15 @@ public:
 
     [[nodiscard]] RuntimeStats runtime_stats() const {
         std::lock_guard lock(stats_mutex_);
-        return published_stats_;
+        RuntimeStats out              = published_stats_;
+        out.waiting_requests          = published_waiting_requests_.load(std::memory_order_relaxed);
+        out.computed_prefill_tokens   = published_computed_prefill_tokens_.load(
+            std::memory_order_relaxed);
+        out.committed_decode_tokens   = published_committed_decode_tokens_.load(
+            std::memory_order_relaxed);
+        out.decode_rounds             = published_decode_rounds_.load(std::memory_order_relaxed);
+        out.decode_row_rounds         = published_decode_row_rounds_.load(std::memory_order_relaxed);
+        return out;
     }
 
     void reset_memory_peaks() noexcept {
@@ -241,11 +256,23 @@ public:
     }
 
 private:
+    void publish_hot_runtime_counters() noexcept {
+        published_computed_prefill_tokens_.store(cumulative_stats_.computed_prefill_tokens,
+                                                  std::memory_order_relaxed);
+        published_committed_decode_tokens_.store(cumulative_stats_.committed_decode_tokens,
+                                                  std::memory_order_relaxed);
+        published_decode_rounds_.store(cumulative_stats_.decode_rounds,
+                                       std::memory_order_relaxed);
+        published_decode_row_rounds_.store(cumulative_stats_.decode_row_rounds,
+                                           std::memory_order_relaxed);
+    }
+
     void publish_runtime_stats() {
         RuntimeStats snapshot = cumulative_stats_;
         {
             std::lock_guard lock(queue_mutex_);
             snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
+            published_waiting_requests_.store(snapshot.waiting_requests, std::memory_order_relaxed);
         }
         snapshot.prefilling_requests = prefill_lane_.has_value() ? 1U : 0U;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -300,7 +327,7 @@ private:
                 } catch (...) {
                     caller_error = std::current_exception();
                     request->cancelled.store(true, std::memory_order_release);
-                    queue_cv_.notify_one();
+                    signal_control();
                 }
             }
 
@@ -308,12 +335,12 @@ private:
                 try {
                     if (cancellation.requested()) {
                         request->cancelled.store(true, std::memory_order_release);
-                        queue_cv_.notify_one();
+                        signal_control();
                     }
                 } catch (...) {
                     caller_error = std::current_exception();
                     request->cancelled.store(true, std::memory_order_release);
-                    queue_cv_.notify_one();
+                    signal_control();
                 }
             }
             if (!done) { continue; }
@@ -329,11 +356,12 @@ private:
         Request(std::uint64_t request_identity, targets::qwen3_6::PreparedPrompt input,
                 targets::qwen3_6::OutputSession output_session, PromptSummary summary,
                 double frontend_seconds, ResolvedRequestOptions request_options,
-                Clock::time_point limit, Clock::time_point submit_time, HostInputLease input_lease)
+                OutputDelivery output_delivery, Clock::time_point limit,
+                Clock::time_point submit_time, HostInputLease input_lease)
             : id(request_identity), host_input(std::move(input_lease)), prompt(std::move(input)),
               output(std::move(output_session)), prompt_summary(summary),
               prepare_seconds(frontend_seconds), options(std::move(request_options)),
-              deadline(limit), submitted(submit_time) {}
+              delivery(output_delivery), deadline(limit), submitted(submit_time) {}
 
         const std::uint64_t id;
         HostInputLease host_input;
@@ -342,6 +370,7 @@ private:
         PromptSummary prompt_summary;
         double prepare_seconds = 0.0;
         ResolvedRequestOptions options;
+        OutputDelivery delivery = OutputDelivery::TerminalOnly;
         Clock::time_point deadline;
         Clock::time_point submitted;
         std::optional<Clock::time_point> first_token;
@@ -437,18 +466,19 @@ private:
     }
 
     void append_output(const std::shared_ptr<Request>& request,
-                       targets::qwen3_6::PublishedOutput output) {
+                       targets::qwen3_6::PublishedOutput output, bool notify = true) {
         if (output.empty()) { return; }
+        for (OutputDelta& delta : output) {
+            std::string& full = delta.channel == OutputChannel::Reasoning ? request->reasoning
+                                                                          : request->content;
+            full += delta.text;
+        }
+        if (request->delivery == OutputDelivery::TerminalOnly) { return; }
         {
             std::lock_guard lock(request->mutex);
-            for (OutputDelta& delta : output) {
-                std::string& full = delta.channel == OutputChannel::Reasoning ? request->reasoning
-                                                                              : request->content;
-                full += delta.text;
-                request->events.push_back(std::move(delta));
-            }
+            for (OutputDelta& delta : output) { request->events.push_back(std::move(delta)); }
         }
-        request->cv.notify_one();
+        if (notify) { request->cv.notify_one(); }
     }
 
     void release_reserved_capacity() noexcept {
@@ -471,8 +501,17 @@ private:
 
     void abandon_request(std::shared_ptr<Request> request) noexcept {
         request->cancelled.store(true, std::memory_order_release);
-        queue_cv_.notify_one();
+        signal_control();
         release_consumer(request);
+    }
+
+    void signal_control(bool all = false) noexcept {
+        control_dirty_.store(true, std::memory_order_release);
+        if (all) {
+            queue_cv_.notify_all();
+        } else {
+            queue_cv_.notify_one();
+        }
     }
 
     bool mark_completed(const std::shared_ptr<Request>& request) noexcept {
@@ -494,10 +533,19 @@ private:
         request->ram_index_version = 0;
     }
 
-    void complete_error(const std::shared_ptr<Request>& request, std::exception_ptr error) {
+    void retire_request(const std::shared_ptr<Request>& request) {
+        if (request->lane) {
+            const std::uint32_t lane = *request->lane;
+            if (slots_[lane] == request) { remove_completed_slot(lane); }
+        }
+        publish_runtime_stats();
+    }
+
+    void complete_error(std::shared_ptr<Request> request, std::exception_ptr error) {
         release_planning_state(request);
         request->prompt = {};
         request->host_input.reset();
+        retire_request(request);
         {
             std::lock_guard lock(request->mutex);
             if (request->done) { return; }
@@ -508,7 +556,7 @@ private:
         request->cv.notify_one();
     }
 
-    void complete_success(const std::shared_ptr<Request>& request, FinishReason reason) {
+    void complete_success(std::shared_ptr<Request> request, FinishReason reason) {
         release_planning_state(request);
         request->prompt = {};
         request->host_input.reset();
@@ -546,6 +594,7 @@ private:
         result.timings.total_seconds =
             request->prepare_seconds +
             std::chrono::duration<double>(Clock::now() - request->submitted).count();
+        retire_request(request);
         {
             std::lock_guard lock(request->mutex);
             if (request->done) { return; }
@@ -556,9 +605,9 @@ private:
         request->cv.notify_one();
     }
 
-    void complete_cancelled(const std::shared_ptr<Request>& request) {
+    void complete_cancelled(std::shared_ptr<Request> request) {
         (void)request->output.preview_terminal(FinishReason::Cancelled);
-        append_output(request, request->output.commit_preview());
+        append_output(request, request->output.commit_preview(), false);
         complete_success(request, FinishReason::Cancelled);
     }
 
@@ -568,7 +617,7 @@ private:
         if (cancel_at_boundary) {
             (void)request->output.preview_terminal(FinishReason::Cancelled);
             instance_.program->resolve_prefill_lane(lane, true);
-            append_output(request, request->output.commit_preview());
+            append_output(request, request->output.commit_preview(), false);
             complete_success(request, FinishReason::Cancelled);
             return true;
         }
@@ -584,7 +633,7 @@ private:
         request->budget->commit(1);
         auto published = request->output.commit_preview();
         if (!request->first_token) { request->first_token = Clock::now(); }
-        append_output(request, std::move(published));
+        append_output(request, std::move(published), !decision.finished());
         if (decision.finished()) {
             complete_success(request, decision.finish_reason);
             return true;
@@ -620,7 +669,6 @@ private:
 
     void
     cancel_active_requests(const std::array<bool, kMaximumConcurrency>& cancelled_at_boundary) {
-        bool changed = false;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = slots_[lane];
             if (request == nullptr || !cancelled_at_boundary[lane]) { continue; }
@@ -635,10 +683,7 @@ private:
                 prefill_lane_.reset();
             }
             complete_cancelled(request);
-            remove_completed_slot(lane);
-            changed = true;
         }
-        if (changed) { publish_runtime_stats(); }
     }
 
     [[nodiscard]] bool expire_pending_requests() {
@@ -660,6 +705,8 @@ private:
                 }
             }
             have_pending = !pending_.empty();
+            published_waiting_requests_.store(static_cast<std::uint32_t>(pending_.size()),
+                                              std::memory_order_relaxed);
         }
         if (protection_) {
             const auto removed_protected = [&](const std::shared_ptr<Request>& request) {
@@ -676,7 +723,6 @@ private:
                                         RequestErrorKind::QueueTimeout,
                                         "inference request expired while waiting for admission")));
         }
-        if (!cancelled.empty() || !expired.empty()) { publish_runtime_stats(); }
         return have_pending;
     }
 
@@ -715,9 +761,11 @@ private:
         return active;
     }
 
-    void resolve_prefill_step(const std::shared_ptr<Request>& request,
-                              const PrefillStepResult& step, bool cancel_at_boundary) {
+    [[nodiscard]] bool resolve_prefill_step(const std::shared_ptr<Request>& request,
+                                            const PrefillStepResult& step,
+                                            bool cancel_at_boundary) {
         cumulative_stats_.computed_prefill_tokens += step.processed_prompt_tokens;
+        publish_hot_runtime_counters();
         consume_service_work(request, 1);
         if (step.host_input_consumed || step.complete) { request->host_input.reset(); }
         if (cancel_at_boundary) {
@@ -733,10 +781,9 @@ private:
                 instance_.program->abort_lane(lane);
             }
             complete_cancelled(request);
-            remove_completed_slot(lane);
-            return;
+            return true;
         }
-        if (!step.complete) { return; }
+        if (!step.complete) { return false; }
         if (!request->lane) { throw std::logic_error("completed prefill has no request lane"); }
         if (prefill_lane_ && *request->lane == *prefill_lane_) {
             instance_.request_memory.deactivate();
@@ -746,11 +793,10 @@ private:
         if (step.round.tokens.size() != 1) {
             throw std::logic_error("prefill did not license exactly one token");
         }
-        if (resolve_round(request, step.round.tokens.front(), false)) {
-            remove_completed_slot(*request->lane);
-        } else {
+        if (!resolve_round(request, step.round.tokens.front(), false)) {
             request->decode_ready = true;
         }
+        return true;
     }
 
     void run_prefill_step() {
@@ -762,8 +808,7 @@ private:
         }
         const PrefillStepResult step  = instance_.program->advance_prefill_lane(lane);
         const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
-        resolve_prefill_step(request, step, cancel_at_boundary);
-        publish_runtime_stats();
+        if (resolve_prefill_step(request, step, cancel_at_boundary)) { publish_runtime_stats(); }
     }
 
     [[nodiscard]] std::vector<std::shared_ptr<Request>> pending_snapshot() const {
@@ -776,6 +821,8 @@ private:
         const auto it = std::find(pending_.begin(), pending_.end(), request);
         if (it == pending_.end()) { return false; }
         pending_.erase(it);
+        published_waiting_requests_.store(static_cast<std::uint32_t>(pending_.size()),
+                                          std::memory_order_relaxed);
         return true;
     }
 
@@ -920,7 +967,6 @@ private:
         if (!erase_pending(request)) { return AdmissionProgress::None; }
         clear_protection_if_head(request);
         complete_error(request, std::move(error));
-        publish_runtime_stats();
         return AdmissionProgress::ControlProgress;
     }
 
@@ -1013,7 +1059,7 @@ private:
             }
             const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
             copy_hold_.reset();
-            resolve_prefill_step(request, first, cancel_at_boundary);
+            (void)resolve_prefill_step(request, first, cancel_at_boundary);
             publish_runtime_stats();
             return AdmissionProgress::RanGpuUnit;
         } catch (...) {
@@ -1051,7 +1097,6 @@ private:
             if (!erase_pending(request)) { return AdmissionProgress::None; }
             clear_protection_if_head(request);
             complete_cancelled(request);
-            publish_runtime_stats();
             return AdmissionProgress::ControlProgress;
         }
 
@@ -1218,7 +1263,6 @@ private:
                 if (erase_pending(head)) {
                     clear_protection_if_head(head);
                     complete_cancelled(head);
-                    publish_runtime_stats();
                     control_progress = true;
                 }
                 continue;
@@ -1286,7 +1330,6 @@ private:
                 if (candidate->cancelled.load(std::memory_order_acquire)) {
                     if (erase_pending(candidate)) {
                         complete_cancelled(candidate);
-                        publish_runtime_stats();
                         control_progress = true;
                     }
                     continue;
@@ -1400,9 +1443,16 @@ private:
             std::span<const std::uint8_t>(terminal.data(), lanes.size()),
             std::span<const std::uint8_t>(cancelled.data(), lanes.size()));
 
+        ++cumulative_stats_.decode_rounds;
+        cumulative_stats_.decode_row_rounds += lanes.size();
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            if (!cancelled[row]) { cumulative_stats_.committed_decode_tokens += accepted[row]; }
+        }
+        publish_hot_runtime_counters();
+
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             const std::uint32_t lane = lanes[row];
-            const auto& request      = slots_[lane];
+            const auto request       = slots_[lane];
             if (!cancelled[row]) {
                 const auto row_tokens = round.tokens.subspan(
                     row * round.row_stride, static_cast<std::size_t>(accepted[row]));
@@ -1415,18 +1465,9 @@ private:
             if (!request->first_token && accepted[row] != 0) {
                 request->first_token = Clock::now();
             }
-            append_output(request, std::move(published));
-            if (terminal[row]) {
-                complete_success(request, finish_reasons[row]);
-                remove_completed_slot(lane);
-            }
+            append_output(request, std::move(published), terminal[row] == 0);
+            if (terminal[row]) { complete_success(request, finish_reasons[row]); }
         }
-        ++cumulative_stats_.decode_rounds;
-        cumulative_stats_.decode_row_rounds += lanes.size();
-        for (std::size_t row = 0; row < lanes.size(); ++row) {
-            if (!cancelled[row]) { cumulative_stats_.committed_decode_tokens += accepted[row]; }
-        }
-        publish_runtime_stats();
     }
 
     void fail_all(std::exception_ptr error) noexcept {
@@ -1437,6 +1478,7 @@ private:
             failed_ = true;
             pending.assign(pending_.begin(), pending_.end());
             pending_.clear();
+            published_waiting_requests_.store(0, std::memory_order_relaxed);
         }
         drain_copy_hold_before_abort();
         if (prefill_lane_) {
@@ -1448,16 +1490,33 @@ private:
             if (slots_[lane] != nullptr) {
                 instance_.program->abort_lane(lane);
                 complete_error(slots_[lane], error);
-                slots_[lane].reset();
             }
         }
         for (const auto& request : pending) { complete_error(request, error); }
-        publish_runtime_stats();
     }
 
     void worker_loop() noexcept {
         bool previous_unit_was_decode = false;
+        bool stable_decode_epoch      = false;
         for (;;) {
+            const bool control_changed =
+                control_dirty_.exchange(false, std::memory_order_acquire);
+            if (stable_decode_epoch && !control_changed) {
+                try {
+                    std::scoped_lock execution_lock(execution_mutex_);
+                    const RoundMembership membership = build_round_membership();
+                    if (!membership.empty()) {
+                        run_decode_round(membership);
+                        previous_unit_was_decode = true;
+                        continue;
+                    }
+                    stable_decode_epoch = false;
+                } catch (...) {
+                    fail_all(std::current_exception());
+                    return;
+                }
+            }
+            stable_decode_epoch = false;
             {
                 std::unique_lock lock(queue_mutex_);
                 if (!stopping_ && pending_.empty()) {
@@ -1538,6 +1597,7 @@ private:
                 if (!membership.empty()) {
                     run_decode_round(membership);
                     previous_unit_was_decode = true;
+                    stable_decode_epoch      = !have_pending;
                     continue;
                 }
             } catch (...) {
@@ -1568,6 +1628,14 @@ private:
     std::uint64_t next_protection_epoch_ = 1;
     RuntimeStats cumulative_stats_;
     RuntimeStats published_stats_;
+    static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
+    static_assert(std::atomic<bool>::is_always_lock_free);
+    std::atomic<std::uint64_t> published_computed_prefill_tokens_{0};
+    std::atomic<std::uint64_t> published_committed_decode_tokens_{0};
+    std::atomic<std::uint64_t> published_decode_rounds_{0};
+    std::atomic<std::uint64_t> published_decode_row_rounds_{0};
+    std::atomic<std::uint32_t> published_waiting_requests_{0};
+    std::atomic<bool> control_dirty_{true};
     bool stopping_ = false;
     bool failed_   = false;
     std::thread worker_;
