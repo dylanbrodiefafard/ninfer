@@ -120,9 +120,11 @@ struct PendingCandidate {
     std::uint32_t base_S        = 0;
     std::uint32_t prompt_tokens = 0;
     std::uint32_t produced      = 0;
+    std::uint32_t drafted       = 0;
     std::uint32_t round_k       = 0;
     std::uint32_t verify_width  = 0;
     bool tree_verify            = false;
+    qwen3_6::AdaptiveDraftState adaptive_before;
 };
 
 enum class Lifecycle : std::uint8_t {
@@ -321,12 +323,14 @@ public:
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_batch(std::span<const std::uint32_t> lanes,
                  std::span<const runtime::RoundBudget> budgets);
+    void set_suppressed_tokens_lane(std::uint32_t lane, std::span<const TokenId> tokens);
     void clear_suppressed_tokens_lane(std::uint32_t lane);
     void resolve_prefill_lane(std::uint32_t lane, bool terminal);
     void resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                std::span<const std::uint32_t> accepted_tokens,
                                std::span<const std::uint8_t> terminal,
-                               std::span<const std::uint8_t> cancelled);
+                               std::span<const std::uint8_t> cancelled,
+                               std::span<const std::uint8_t> rejected = {});
     void abort_lane(std::uint32_t lane) noexcept;
     void retain_lane(std::uint32_t lane);
     [[nodiscard]] bool revert_cancelled_prefill_lane(std::uint32_t lane);

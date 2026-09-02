@@ -194,11 +194,13 @@ is task-specific and is therefore an explicit override rather than an inferred E
 
 Repeat `--stop-token-id`, `--stop`, or `--reasoning-stop` to add stop conditions. Use
 `--raw-output` to expose the frontend's raw output stream and `--print-token-ids` to include
-generated token IDs in diagnostics. During structured Qwen thinking output, the registered model
-EOS tokens are excluded from sampling until the reasoning terminator has committed. This prevents
-an EOS from ending a response inside an open reasoning block; ordinary EOS selection resumes in
-the next GPU round for the answer. Other caller-added stop conditions remain active, and raw output
-does not apply this structured-output guard.
+generated token IDs in diagnostics. During structured Qwen output, registered model stop tokens
+are excluded from sampling while reasoning is open and after the reasoning terminator until
+non-whitespace answer content begins. This prevents a response from ending inside reasoning or
+with an empty post-reasoning answer. For tools-enabled prompts, they are also excluded while a
+`<tool_call>` opener is ambiguous or a tool call is incomplete, and become eligible after the
+matching `</tool_call>`. Other caller-added stop conditions remain active, and raw output does not
+apply this structured-output guard.
 
 Run `./build/apps/ninfer --help` for the exact option contract.
 

@@ -40,6 +40,7 @@ struct ResolvedRequestOptions {
 struct OutputDecision {
     std::uint32_t accepted_tokens = 0;
     FinishReason finish_reason    = FinishReason::None;
+    bool reject_generated_round   = false;
 
     [[nodiscard]] bool finished() const noexcept { return finish_reason != FinishReason::None; }
 };

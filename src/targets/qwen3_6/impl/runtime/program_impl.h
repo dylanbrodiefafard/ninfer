@@ -50,6 +50,60 @@ std::int32_t checked_i32(std::uint32_t value, const char* label) {
     return static_cast<std::int32_t>(value);
 }
 
+void rollback_speculative_stats(RequestControl& request, const PendingCandidate& pending) {
+    SpeculativeStats& stats = request.speculative_stats;
+    if (pending.drafted == 0) {
+        if (stats.fallback_steps == 0) {
+            throw std::logic_error("rejected speculative fallback stats underflow");
+        }
+        --stats.fallback_steps;
+    } else {
+        const std::uint32_t accepted = pending.produced - 1U;
+        if (stats.rounds == 0 || stats.drafted_tokens < pending.drafted ||
+            stats.accepted_tokens < accepted || accepted > stats.accepted_per_position.size() ||
+            pending.round_k >= stats.rounds_per_draft.size() ||
+            stats.rounds_per_draft[pending.round_k] == 0) {
+            throw std::logic_error("rejected speculative stats do not match pending round");
+        }
+        --stats.rounds;
+        stats.drafted_tokens -= pending.drafted;
+        stats.accepted_tokens -= accepted;
+        for (std::uint32_t index = 0; index < accepted; ++index) {
+            if (stats.accepted_per_position[index] == 0) {
+                throw std::logic_error("rejected speculative position stats underflow");
+            }
+            --stats.accepted_per_position[index];
+        }
+        --stats.rounds_per_draft[pending.round_k];
+    }
+    request.adaptive        = pending.adaptive_before;
+    stats.live_draft_tokens = request.adaptive.live_k;
+}
+
+void rollback_sampling_counts(const ops::SamplingConfig& sampling,
+                              std::span<const TokenId> tokens) {
+    if (sampling.temperature <= 0.0F || sampling.token_counts == nullptr) { return; }
+    for (std::size_t index = 0; index < tokens.size(); ++index) {
+        if (std::find(tokens.begin(), tokens.begin() + static_cast<std::ptrdiff_t>(index),
+                      tokens[index]) !=
+            tokens.begin() + static_cast<std::ptrdiff_t>(index)) {
+            continue;
+        }
+        const auto occurrences = static_cast<std::int32_t>(
+            std::count(tokens.begin() + static_cast<std::ptrdiff_t>(index), tokens.end(),
+                       tokens[index]));
+        std::int32_t count = 0;
+        CUDA_CHECK(cudaMemcpy(&count, sampling.token_counts + tokens[index], sizeof(count),
+                              cudaMemcpyDeviceToHost));
+        if (count < occurrences) {
+            throw std::logic_error("rejected sampling token count underflow");
+        }
+        count -= occurrences;
+        CUDA_CHECK(cudaMemcpy(sampling.token_counts + tokens[index], &count, sizeof(count),
+                              cudaMemcpyHostToDevice));
+    }
+}
+
 std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& prompt,
                                                  std::uint32_t token) {
     const std::size_t tokens = prompt.token_ids.size();
@@ -828,11 +882,17 @@ void ProgramImplCore::resolve_prefill_lane(std::uint32_t lane, bool terminal) {
 void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                             std::span<const std::uint32_t> accepted_tokens,
                                             std::span<const std::uint8_t> terminal,
-                                            std::span<const std::uint8_t> cancelled) {
+                                            std::span<const std::uint8_t> cancelled,
+                                            std::span<const std::uint8_t> rejected) {
     if (lanes.empty() || lanes.size() > max_concurrency || accepted_tokens.size() != lanes.size() ||
-        terminal.size() != lanes.size() || cancelled.size() != lanes.size()) {
+        terminal.size() != lanes.size() || cancelled.size() != lanes.size() ||
+        (!rejected.empty() && rejected.size() != lanes.size())) {
         throw std::invalid_argument("pending batch resolution has inconsistent membership");
     }
+
+    const auto row_rejected = [&](std::size_t row) {
+        return !rejected.empty() && rejected[row] != 0;
+    };
 
     if (speculative_backend == SpeculativeBackend::None) {
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -843,6 +903,8 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
             }
             if (cancelled[row]) {
                 clear_lane(sequences[lane], requests[lane]);
+            } else if (row_rejected(row)) {
+                throw std::logic_error("ordinary pending rounds cannot be rejected");
             } else {
                 resolve_non_speculative_pending(sequences[lane], requests[lane],
                                                 accepted_tokens[row], terminal[row] != 0);
@@ -877,9 +939,12 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
              sequence.dflash_context_frontier != pending.base_E)) {
             throw std::logic_error("speculative pending row is not at its recorded base");
         }
-        const std::uint32_t committed = cancelled[row] ? 0U : accepted_tokens[row];
+        const bool retry = row_rejected(row);
+        const std::uint32_t committed = (cancelled[row] || retry) ? 0U : accepted_tokens[row];
         if ((cancelled[row] && accepted_tokens[row] != 0) ||
-            (!cancelled[row] && (committed == 0 || committed > pending.produced ||
+            (retry && (cancelled[row] || terminal[row] || accepted_tokens[row] != 0)) ||
+            (!cancelled[row] && !retry &&
+             (committed == 0 || committed > pending.produced ||
                                  (!terminal[row] && committed != pending.produced)))) {
             throw std::logic_error("speculative pending row has an invalid committed prefix");
         }
@@ -1006,7 +1071,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
             std::array<std::uint32_t, kMaximumConcurrency> append_counts{};
             std::size_t append_size = 0;
             for (std::size_t row = 0; row < lanes.size(); ++row) {
-                if (!cancelled[row] && terminal[row]) {
+                if (!cancelled[row] && !row_rejected(row) && terminal[row]) {
                     append_lanes[append_size]  = lanes[row];
                     append_starts[append_size] = requests[lanes[row]].pending.base_E;
                     append_counts[append_size] = accepted_tokens[row];
@@ -1043,7 +1108,24 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
             SequenceState& sequence = sequences[lanes[row]];
             RequestControl& request = requests[lanes[row]];
             if (cancelled[row]) {
+                sequence.tail_hidden_valid = false;
                 retain_committed_sequence(sequence, request);
+                continue;
+            }
+            if (row_rejected(row)) {
+                const PendingCandidate pending = request.pending;
+                const TokenId* token_base =
+                    speculative_backend == SpeculativeBackend::Mtp
+                        ? mtp_host_egress->licensed_tokens.data() + row * width
+                        : dflash_host_egress->licensed_tokens.data() + row * width;
+                rollback_sampling_counts(
+                    request.sampling_host,
+                    std::span<const TokenId>(token_base, pending.produced));
+                rollback_speculative_stats(request, pending);
+                sequence.tail_hidden_valid = false;
+                request.lifecycle = Lifecycle::Active;
+                request.pending   = {};
+                request.timings.decode_seconds += tail_seconds;
                 continue;
             }
 
@@ -3071,6 +3153,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence       = sequences[lanes[row]];
             RequestControl& request       = requests[lanes[row]];
+            const qwen3_6::AdaptiveDraftState adaptive_before = request.adaptive;
             const std::uint32_t base_E    = sequence.execution_frontier;
             const std::uint32_t base_S    = sequence.ledger_frontier;
             const std::int32_t count_i    = mtp_host_egress->licensed_counts[row];
@@ -3130,14 +3213,16 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             }
             request.speculative_stats.live_draft_tokens = request.adaptive.live_k;
             request.pending = PendingCandidate{
-                .kind          = PendingKind::Speculative,
-                .base_E        = base_E,
-                .base_S        = base_S,
-                .prompt_tokens = 0,
-                .produced      = static_cast<std::uint32_t>(count_i),
-                .round_k       = batch_k,
-                .verify_width  = batch_k + 1U,
-                .tree_verify   = false,
+                .kind            = PendingKind::Speculative,
+                .base_E          = base_E,
+                .base_S          = base_S,
+                .prompt_tokens   = 0,
+                .produced        = static_cast<std::uint32_t>(count_i),
+                .drafted         = pcur,
+                .round_k         = batch_k,
+                .verify_width    = batch_k + 1U,
+                .tree_verify     = false,
+                .adaptive_before = adaptive_before,
             };
             request.lifecycle = Lifecycle::Pending;
             request.timings.decode_seconds += seconds;
@@ -3315,6 +3400,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence       = sequences[lanes[row]];
             RequestControl& request       = requests[lanes[row]];
+            const qwen3_6::AdaptiveDraftState adaptive_before = request.adaptive;
             const std::uint32_t base_E    = sequence.execution_frontier;
             const std::uint32_t base_S    = sequence.ledger_frontier;
             const std::int32_t count_i    = dflash_host_egress->licensed_counts[row];
@@ -3373,15 +3459,17 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             }
             request.speculative_stats.live_draft_tokens = request.adaptive.live_k;
             sequence.dflash_context_frontier = base_E;
-            request.pending                  = PendingCandidate{
-                                 .kind          = PendingKind::Speculative,
-                                 .base_E        = base_E,
-                                 .base_S        = base_S,
-                                 .prompt_tokens = 0,
-                                 .produced      = static_cast<std::uint32_t>(count_i),
-                                 .round_k       = batch_k,
-                                 .verify_width  = live_w,
-                                 .tree_verify   = dflash_uses_tree_verify(batch_k, live_w),
+            request.pending = PendingCandidate{
+                .kind            = PendingKind::Speculative,
+                .base_E          = base_E,
+                .base_S          = base_S,
+                .prompt_tokens   = 0,
+                .produced        = static_cast<std::uint32_t>(count_i),
+                .drafted         = extent,
+                .round_k         = batch_k,
+                .verify_width    = live_w,
+                .tree_verify     = dflash_uses_tree_verify(batch_k, live_w),
+                .adaptive_before = adaptive_before,
             };
             request.lifecycle = Lifecycle::Pending;
             request.timings.decode_seconds += seconds;
@@ -3420,6 +3508,22 @@ void ProgramImplCore::clear_suppressed_tokens_lane(std::uint32_t lane) {
         throw std::logic_error("cannot update sampling for an idle lane");
     }
     request.sampling_host.suppressed_token_count = 0;
+}
+
+void ProgramImplCore::set_suppressed_tokens_lane(std::uint32_t lane,
+                                                 std::span<const TokenId> tokens) {
+    if (lane >= max_concurrency) { throw std::out_of_range("sampling lane is out of range"); }
+    RequestControl& request = requests[lane];
+    if (request.lifecycle == Lifecycle::Empty) {
+        throw std::logic_error("cannot update sampling for an idle lane");
+    }
+    if (tokens.size() > static_cast<std::size_t>(request.sampling_host.kMaximumSuppressedTokens)) {
+        throw std::invalid_argument("too many suppressed sampling tokens");
+    }
+    request.sampling_host.suppressed_token_count = static_cast<std::int32_t>(tokens.size());
+    for (std::size_t index = 0; index < tokens.size(); ++index) {
+        request.sampling_host.suppressed_tokens[index] = tokens[index];
+    }
 }
 
 void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
