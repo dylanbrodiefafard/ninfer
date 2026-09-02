@@ -93,7 +93,12 @@ std::string format_arena_peak(const ninfer::ArenaMemorySummary& arena) {
 std::string format_sampling(const ninfer::ResolvedSamplingParameters& sampling) {
     if (sampling.temperature <= 0.0F) { return "greedy (temperature 0)"; }
     std::ostringstream output;
-    output << std::fixed << std::setprecision(2) << "temp=" << sampling.temperature
+    output << std::fixed << std::setprecision(2);
+    if (sampling.p_less) {
+        output << "p-less temp=" << sampling.temperature << " seed=" << sampling.seed;
+        return output.str();
+    }
+    output << "temp=" << sampling.temperature
            << " top_p=" << sampling.top_p << " top_k=" << sampling.top_k
            << " min_p=" << sampling.min_p << " presence=" << sampling.presence_penalty
            << " freq=" << sampling.frequency_penalty << " seed=" << sampling.seed;
@@ -329,6 +334,10 @@ int main(int argc, char** argv) {
         if (cli.help_requested) {
             std::cout << ninfer::cli::usage_text(argv[0]);
             return 0;
+        }
+
+        if (cli.sampling.p_less) {
+            std::cerr << ninfer::kPLessSamplingIgnoredParamsWarning << '\n';
         }
 
         ninfer::PromptInput input =

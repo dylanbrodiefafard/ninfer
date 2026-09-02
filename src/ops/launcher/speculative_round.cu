@@ -1,7 +1,8 @@
 // Implements: include/ninfer/ops/speculative_round.h
 // Match: validated speculative state and BF16 verification logits.
-// Algorithm assumptions: the shared sampling layout selects either one block
-// or a two-launch partial/group pipeline without host reads of device config.
+// Algorithm assumptions: the per-row kernel always launches for the small route;
+// the multiblock partial/group/mass pipeline owns every large mode. Launchers do
+// not read device SamplingConfig.
 #include "ops/launcher/speculative_round.h"
 
 #include "ops/common/math.h"
@@ -105,6 +106,20 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
         configs, token_domain, cols, partial_blocks, groups, scratch, layout.bytes, selector_id_ptr,
         selector_q_ptr, selector_k, nullptr, nullptr, nullptr, nullptr, nullptr);
     CUDA_CHECK(cudaGetLastError());
+    const dim3 p_less_grid(
+        static_cast<unsigned int>(
+            sampler_p_less_workers_per_column(partial_blocks, cols * batch)),
+        static_cast<unsigned int>(cols), static_cast<unsigned int>(batch));
+    speculative_sampling_p_less_mass_finalize_kernel<<<p_less_grid, kSamplerBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(logits.data),
+        static_cast<const std::int32_t*>(drafts.data),
+        static_cast<const std::int32_t*>(current_extents.data),
+        static_cast<std::int32_t*>(lengths.data), static_cast<std::int32_t*>(anchors.data),
+        static_cast<std::int32_t*>(licensed_tokens.data),
+        static_cast<std::int32_t*>(licensed_counts.data), static_cast<std::int32_t*>(accepted.data),
+        configs, token_domain, physical_rows, cols, partial_blocks, scratch, layout.bytes,
+        selector_id_ptr, selector_q_ptr, selector_k, nullptr, nullptr, nullptr, nullptr, nullptr);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void speculative_select_accepted_hidden_launch(const Tensor& hidden, const Tensor& selectors,
@@ -187,6 +202,23 @@ void speculative_accept_tree_drafts_launch(const Tensor& target_tokens, const Te
         static_cast<std::int32_t*>(licensed_tokens.data),
         static_cast<std::int32_t*>(licensed_counts.data), static_cast<std::int32_t*>(accepted.data),
         configs, token_domain, width, partial_blocks, groups, scratch, layout.bytes, nullptr,
+        nullptr, 0, static_cast<const std::int32_t*>(verify_ids.data),
+        static_cast<const std::int32_t*>(parent_index.data),
+        static_cast<const std::int32_t*>(valid_columns.data),
+        static_cast<std::int32_t*>(accepted_column.data),
+        static_cast<std::int32_t*>(fold_path.data));
+    CUDA_CHECK(cudaGetLastError());
+    const dim3 p_less_grid(
+        static_cast<unsigned int>(
+            sampler_p_less_workers_per_column(partial_blocks, width * batch)),
+        static_cast<unsigned int>(width), static_cast<unsigned int>(batch));
+    speculative_sampling_p_less_mass_finalize_kernel<<<p_less_grid, kSamplerBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(logits.data), nullptr,
+        static_cast<const std::int32_t*>(current_extents.data),
+        static_cast<std::int32_t*>(lengths.data), static_cast<std::int32_t*>(anchors.data),
+        static_cast<std::int32_t*>(licensed_tokens.data),
+        static_cast<std::int32_t*>(licensed_counts.data), static_cast<std::int32_t*>(accepted.data),
+        configs, token_domain, physical_rows, width, partial_blocks, scratch, layout.bytes, nullptr,
         nullptr, 0, static_cast<const std::int32_t*>(verify_ids.data),
         static_cast<const std::int32_t*>(parent_index.data),
         static_cast<const std::int32_t*>(valid_columns.data),

@@ -211,6 +211,9 @@ struct SamplingOverrides {
     std::optional<float> presence_penalty;
     std::optional<float> frequency_penalty;
     std::optional<std::uint64_t> seed;
+    // Process/request mode flag, not a model preset. When true, Engine keeps temperature and
+    // seed and ignores top-k, top-p, min-p, and presence/frequency penalties.
+    bool p_less = false;
 };
 
 // Complete parameters after Engine resolution. Target runtimes consume only this type.
@@ -222,7 +225,11 @@ struct ResolvedSamplingParameters {
     float presence_penalty  = 0.0F;
     float frequency_penalty = 0.0F;
     std::uint64_t seed      = 0;
+    bool p_less             = false;
 };
+
+inline constexpr const char* kPLessSamplingIgnoredParamsWarning =
+    "p-less sampling: top-p, top-k, min-p, presence penalty, and frequency penalty are ignored";
 
 enum class OutputChannel : std::uint8_t {
     Content,

@@ -56,6 +56,11 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        if (options.sampling_overrides.p_less) {
+            ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Warning,
+                                             ninfer::kPLessSamplingIgnoredParamsWarning);
+        }
+
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, "loading model...");
         auto load_progress_options        = ninfer::product::stderr_load_progress_options();
         load_progress_options.line_prefix = [] {

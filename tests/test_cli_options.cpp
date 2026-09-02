@@ -49,9 +49,14 @@ int main() {
     failures += check(ninfer::cli::usage_text("ninfer").find("--capture-context-checkpoint") !=
                           std::string::npos,
                       "CLI help omits --capture-context-checkpoint");
-    failures += check(ninfer::cli::usage_text("ninfer").find("--context-checkpoints") !=
+    failures += check(ninfer::cli::usage_text("ninfer").find("--p-less-sampling") !=
                           std::string::npos,
-                      "CLI help omits --context-checkpoints");
+                      "CLI help omits --p-less-sampling");
+
+    const ninfer::cli::Options pless =
+        parse({"ninfer", "model.ninfer", "--prompt", "hi", "--p-less-sampling", "--top-p", "0.5"});
+    failures += check(pless.sampling.p_less && pless.sampling.top_p == 0.5F,
+                      "--p-less-sampling did not parse with ignored top-p still recorded");
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

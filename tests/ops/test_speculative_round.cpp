@@ -587,8 +587,8 @@ int suppressed_bonus_case() {
     const std::vector<std::int32_t> drafts{7};
     const std::vector<std::int32_t> targets{7, 8};
     std::vector<float> logits(static_cast<std::size_t>(token_domain) * (k + 1), -20.0f);
-    logits[7]                                           = 20.0f;
-    logits[9]                                           = 30.0f;
+    logits[7]                                          = 20.0f;
+    logits[9]                                          = 30.0f;
     logits[static_cast<std::size_t>(token_domain) + 8] = 20.0f;
     logits[static_cast<std::size_t>(token_domain) + 9] = 30.0f;
     round_to_bf16(logits);
@@ -596,7 +596,7 @@ int suppressed_bonus_case() {
     for (std::size_t i = 0; i < logits.size(); ++i) { logits_bits[i] = f32_to_bf16(logits[i]); }
 
     constexpr std::int32_t initial_length = 40;
-    const auto expected = accept_state_oracle(drafts, 1, 8, initial_length);
+    const auto expected                   = accept_state_oracle(drafts, 1, 8, initial_length);
     std::vector<std::int32_t> token_counts(token_domain, 0);
     ops::SamplingConfig config{};
     config.temperature            = 1.0f;
@@ -604,9 +604,9 @@ int suppressed_bonus_case() {
     config.seed                   = 7ull;
     config.suppressed_token_count = 1;
     config.suppressed_tokens[0]   = 9;
-    return execute_accept_case("speculative sampling suppresses EOS in accept and bonus",
-                               targets, logits_bits, token_domain, drafts, initial_length,
-                               token_domain, config, token_counts, expected);
+    return execute_accept_case("speculative sampling suppresses EOS in accept and bonus", targets,
+                               logits_bits, token_domain, drafts, initial_length, token_domain,
+                               config, token_counts, expected);
 }
 
 int suppressed_draft_rejection_case(int token_domain) {
@@ -614,8 +614,8 @@ int suppressed_draft_rejection_case(int token_domain) {
     const std::vector<std::int32_t> drafts{9};
     const std::vector<std::int32_t> targets{7, 8};
     std::vector<float> logits(static_cast<std::size_t>(token_domain) * (k + 1), -20.0f);
-    logits[7]                                           = 20.0f;
-    logits[9]                                           = 30.0f;
+    logits[7]                                          = 20.0f;
+    logits[9]                                          = 30.0f;
     logits[static_cast<std::size_t>(token_domain) + 8] = 20.0f;
     logits[static_cast<std::size_t>(token_domain) + 9] = 30.0f;
     round_to_bf16(logits);
@@ -623,7 +623,7 @@ int suppressed_draft_rejection_case(int token_domain) {
     for (std::size_t i = 0; i < logits.size(); ++i) { logits_bits[i] = f32_to_bf16(logits[i]); }
 
     constexpr std::int32_t initial_length = 40;
-    const auto expected = accept_state_oracle(drafts, 0, 7, initial_length);
+    const auto expected                   = accept_state_oracle(drafts, 0, 7, initial_length);
     std::vector<std::int32_t> token_counts(token_domain, 0);
     ops::SamplingConfig config{};
     config.temperature            = 1.0f;
@@ -635,6 +635,84 @@ int suppressed_draft_rejection_case(int token_domain) {
                                    std::to_string(token_domain),
                                targets, logits_bits, token_domain, drafts, initial_length,
                                token_domain, config, token_counts, expected);
+}
+
+int p_less_deterministic_accept_case() {
+    constexpr int physical_rows = 248320;
+    constexpr int token_domain  = 248077;
+    constexpr int k             = 5;
+    constexpr int accepted      = 2;
+    const std::vector<std::int32_t> drafts{17, 7919, 65537, 131071, 200003};
+    std::vector<std::int32_t> targets(static_cast<std::size_t>(k + 1));
+    for (int i = 0; i <= k; ++i) { targets[static_cast<std::size_t>(i)] = 101 + i; }
+    constexpr std::int32_t correction = 150001;
+
+    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * (k + 1), -20.0f);
+    for (int col = 0; col <= k; ++col) {
+        const std::size_t base = static_cast<std::size_t>(col) * physical_rows;
+        const int winner =
+            col < accepted ? drafts[static_cast<std::size_t>(col)] : correction + col - accepted;
+        logits[base + static_cast<std::size_t>(winner)] = 20.0f;
+        logits[base + token_domain]                     = 100.0f;
+        logits[base + physical_rows - 1]                = 200.0f;
+    }
+    round_to_bf16(logits);
+    std::vector<std::uint16_t> logits_bits(logits.size());
+    for (std::size_t i = 0; i < logits.size(); ++i) { logits_bits[i] = f32_to_bf16(logits[i]); }
+
+    const std::int32_t initial_length = 4093;
+    const auto expected = accept_state_oracle(drafts, accepted, correction, initial_length);
+    std::vector<std::int32_t> token_counts(token_domain, 0);
+    token_counts[static_cast<std::size_t>(drafts[0])]  = 3;
+    token_counts[static_cast<std::size_t>(drafts[1])]  = 5;
+    token_counts[static_cast<std::size_t>(correction)] = 7;
+
+    ops::SamplingConfig config{};
+    config.temperature = 1.0f;
+    config.top_k       = 20;
+    config.top_p       = 0.9f;
+    config.p_less      = 1;
+    config.seed        = 0x123456789abcdef0ull;
+    return execute_accept_case("speculative p-less deterministic support", targets, logits_bits,
+                               physical_rows, drafts, initial_length, token_domain, config,
+                               token_counts, expected);
+}
+
+int p_less_tree_membership_cases(int token_domain) {
+    constexpr int kWidth = 4;
+    const std::vector<std::int32_t> parent{-1, 0, 0, 1};
+    const std::vector<std::int32_t> verify_ids{7, 10, 11, 12};
+    const std::vector<std::int32_t> targets{0, 0, 0, 0};
+    ops::SamplingConfig cfg{};
+    cfg.temperature = 1.0f;
+    cfg.top_k       = 1;
+    cfg.p_less      = 1;
+    cfg.seed        = 1ull;
+    std::vector<std::int32_t> counts(static_cast<std::size_t>(token_domain), 0);
+    counts[10]            = 3;
+    counts[11]            = 4;
+    counts[5]             = 9;
+    counts[50]            = 1;
+    const std::string tag = " V=" + std::to_string(token_domain);
+
+    int failures = 0;
+    {
+        const auto logits = peaked_column_logits(token_domain, kWidth, {10, 50, 0, 0});
+        std::vector<std::int32_t> want_lic{10, 50, 0, 0};
+        std::vector<std::int32_t> want_path{0, 1, 0, 0};
+        failures += execute_tree_case("tree p-less first child" + tag, token_domain, token_domain,
+                                      kWidth, parent, verify_ids, targets, logits, 7, kWidth, cfg,
+                                      counts, want_lic, 1, 1, want_path);
+    }
+    {
+        const auto logits = peaked_column_logits(token_domain, kWidth, {11, 0, 50, 0});
+        std::vector<std::int32_t> want_lic{11, 50, 0, 0};
+        std::vector<std::int32_t> want_path{0, 2, 0, 0};
+        failures += execute_tree_case("tree p-less second child" + tag, token_domain, token_domain,
+                                      kWidth, parent, verify_ids, targets, logits, 7, kWidth, cfg,
+                                      counts, want_lic, 1, 2, want_path);
+    }
+    return failures;
 }
 
 int batched_sampling_workspace_stride_case() {
@@ -1098,6 +1176,9 @@ int main() {
     failures += suppressed_bonus_case();
     failures += suppressed_draft_rejection_case(64);
     failures += suppressed_draft_rejection_case(257);
+    failures += p_less_deterministic_accept_case();
+    failures += p_less_tree_membership_cases(64);
+    failures += p_less_tree_membership_cases(257);
     failures += batched_sampling_workspace_stride_case();
     failures += select_hidden_case(5120, 6, 0);
     failures += select_hidden_case(5120, 6, 5);

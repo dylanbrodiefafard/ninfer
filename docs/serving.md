@@ -67,7 +67,8 @@ The endpoint supports:
 - `system`, `developer`, `user`, `assistant`, and `tool` history;
 - string content and ordered text, `image_url`, and `video_url` parts;
 - `max_completion_tokens` and the legacy `max_tokens` spelling;
-- `temperature`, `top_p`, `top_k`, presence/frequency penalties, and a nonnegative `seed`;
+- `temperature`, `top_p`, `top_k`, presence/frequency penalties, and a nonnegative `seed`
+  (ignored when the process was started with `--p-less-sampling`, except temperature and seed);
 - one stop string or an array of stop strings;
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`;
@@ -545,6 +546,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--frequency-penalty F` | process-level frequency-penalty override | unset |
 | `--seed N` | fixed seed when a request omits one | fresh random seed per request |
 | `--greedy` | force exact argmax for all requests | off |
+| `--p-less-sampling` | full-vocabulary p-less truncation (temperature and seed only) | off |
 
 Engine selects sampling defaults from the loaded model and the request's resolved thinking mode.
 Qwen3.6-27B uses `1.0/0.95/20/0/0` for temperature/top-p/top-k/min-p/presence penalty in thinking
@@ -553,6 +555,10 @@ modes (`0.6/0.95/20/0/0` thinking, `0.7/0.80/20/0/0` non-thinking). Qwen3.6-35B-
 `1.0/0.95/20/0/1.5` in thinking mode and `0.7/0.80/20/0/1.5` in non-thinking mode. Frequency
 penalty is `0` for all registered presets. Process flags override registered values, request
 fields override process flags, and `--greedy` finally forces temperature `0`.
+`--p-less-sampling` keeps temperature and seed and ignores top-p, top-k, min-p, and
+presence/frequency penalties from both process flags and request bodies. Startup logs a
+one-time warning. Combined with `--greedy` it remains exact argmax. There is no OpenAI or
+Anthropic schema field for this mode.
 
 Run `./build/apps/ninfer-serve --help` for the exact option contract.
 
@@ -575,7 +581,7 @@ that server instance.
 | Event | Contents |
 |---|---|
 | `server_start` | target/weights identity and artifact, resolved Engine, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, pinned-host KV RAM capacity/occupancy, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
-| `request_start` | protocol, resolved sampler and seed, thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
+| `request_start` | protocol, resolved sampler and seed (including `p_less`), thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, `reuse_source` (`none` / `vram_resident` / `host_ram`), `context_checkpoint` (`restored_tokens` / `captured_tokens`), unrounded phase seconds including `kv_ram_save` / `kv_ram_load`, complete speculative-decoding counters, `tool_call_count`, and `ignored_qwen_tool_call_names` (empty unless a tools-off completion contained parseable Qwen `<tool_call>` markup) |
 | `request_error` | the resolved request configuration and generation error message |

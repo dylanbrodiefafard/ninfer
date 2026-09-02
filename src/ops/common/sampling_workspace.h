@@ -24,12 +24,23 @@ inline constexpr int kSamplerPartialsPerGroup    = 25;
 inline constexpr int kSamplerFastCandidates      = 20;
 inline constexpr int kSamplerCandidateCap        = kSamplerFastCandidates;
 inline constexpr int kSamplerMaxColumns          = 16;
+// Enough CTAs to cover the RTX 5090 through the exp-heavy admitted-mass wave,
+// while bounding the device-branch no-op cost for greedy/truncated replay.
+inline constexpr int kSamplerPLessTargetBlocks   = 1024;
 
 static_assert(kSamplerPartialsPerGroup * kSamplerCandidateCap <= kSamplerGroupTileItems,
               "group merge tile must hold one group's candidates");
 
 __host__ __device__ inline int sampler_group_count(int partial_blocks) {
     return div_up(partial_blocks, kSamplerPartialsPerGroup);
+}
+
+__host__ __device__ inline int sampler_p_less_workers_per_column(int partial_blocks,
+                                                                 int total_columns) {
+    int workers = total_columns > 0 ? kSamplerPLessTargetBlocks / total_columns : 1;
+    if (workers < 1) { workers = 1; }
+    if (workers > partial_blocks) { workers = partial_blocks; }
+    return workers;
 }
 
 // The multi-block route is deliberately finite. A single final merge tile must

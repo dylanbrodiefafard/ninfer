@@ -107,8 +107,25 @@ int main() {
         ninfer::runtime::resolve_sampling(qwen3_8, ninfer::SamplingMode::NonThinking, overrides);
     failures += check(overridden.temperature == 0.0F && overridden.top_k == 0 &&
                           overridden.top_p == 0.0F && overridden.presence_penalty == 0.0F &&
-                          overridden.frequency_penalty == -1.0F && overridden.seed == 123,
+                          overridden.frequency_penalty == -1.0F && overridden.seed == 123 &&
+                          !overridden.p_less,
                       "explicit zero sampling overrides were lost");
+
+    ninfer::SamplingOverrides p_less_overrides;
+    p_less_overrides.p_less            = true;
+    p_less_overrides.temperature       = 1.5F;
+    p_less_overrides.top_k             = 5;
+    p_less_overrides.top_p             = 0.5F;
+    p_less_overrides.min_p             = 0.2F;
+    p_less_overrides.presence_penalty  = 1.5F;
+    p_less_overrides.frequency_penalty = 0.5F;
+    p_less_overrides.seed              = 99;
+    const ninfer::ResolvedSamplingParameters p_less = ninfer::runtime::resolve_sampling(
+        qwen3_8, ninfer::SamplingMode::Thinking, p_less_overrides);
+    failures += check(p_less.p_less && p_less.temperature == 1.5F && p_less.seed == 99 &&
+                          p_less.top_k == 0 && p_less.top_p == 1.0F && p_less.min_p == 0.0F &&
+                          p_less.presence_penalty == 0.0F && p_less.frequency_penalty == 0.0F,
+                      "p-less resolution did not keep temperature/seed and drop filters");
 
     overrides.temperature = std::numeric_limits<float>::quiet_NaN();
     failures += check(throws_invalid([&] {
