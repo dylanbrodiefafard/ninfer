@@ -58,14 +58,13 @@ constexpr ModelSamplingDefaults kQwen3_6Defaults{
 };
 
 constexpr ModelSamplingDefaults kQwen3_8Defaults{
-    // Align with LiteLLM remote-research serving (thinking): temp 0.6 / top_p 0.95 / top_k 20.
-    .thinking     = {.temperature       = 0.6F,
+    .thinking     = {.temperature       = 2.0F,
                      .top_k             = 20,
                      .top_p             = 0.95F,
                      .min_p             = 0.0F,
                      .presence_penalty  = 0.0F,
                      .frequency_penalty = 0.0F},
-    .non_thinking = {.temperature       = 0.7F,
+    .non_thinking = {.temperature       = 2.0F,
                      .top_k             = 20,
                      .top_p             = 0.80F,
                      .min_p             = 0.0F,

@@ -126,7 +126,9 @@ It is rejected for `qwen3_6_27b`. Add
 Its schema-v5 result and flattened summaries retain the canonical `weights_id` received from the
 schema-v9 serving startup record. The stochastic route pins its complete
 temperature/top-p/top-k/min-p/presence/frequency profile explicitly, so model-default changes do
-not alter the measurement method.
+not alter the measurement method. `--sampling p-less` intentionally uses the product-default
+p-less sampler and registered temperature (`2.0` for Qwen3.8); startup-log validation rejects a
+point if the resolved process mode does not match the selected benchmark mode.
 
 ## Concurrent serving benchmark
 

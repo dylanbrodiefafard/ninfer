@@ -211,9 +211,9 @@ struct SamplingOverrides {
     std::optional<float> presence_penalty;
     std::optional<float> frequency_penalty;
     std::optional<std::uint64_t> seed;
-    // Process/request mode flag, not a model preset. When true, Engine keeps temperature and
-    // seed and ignores top-k, top-p, min-p, and presence/frequency penalties.
-    bool p_less = false;
+    // Product-default process/request mode. False explicitly opts out. When true, Engine keeps
+    // temperature and seed and ignores top-k, top-p, min-p, and presence/frequency penalties.
+    bool p_less = true;
 };
 
 // Complete parameters after Engine resolution. Target runtimes consume only this type.

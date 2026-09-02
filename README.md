@@ -298,8 +298,8 @@ All three registered model IDs support:
 - startup-bounded small-scale concurrent serving with true batched decode;
 - MTP speculative decoding with draft windows from one to five;
 - BF16, INT8 group-64, and NVFP4 KV cache (default NVFP4);
-- model- and thinking-mode-aware official sampling defaults, with explicit greedy, temperature,
-  top-k, top-p, min-p, and presence/frequency-penalty overrides;
+- default p-less sampling (Qwen3.8 temperature `2.0`) with explicit greedy, temperature, and seed
+  overrides; `--no-p-less-sampling` selects the top-k/top-p/min-p/penalty sampler;
 - compatible-prefix reuse;
 - OpenAI Responses Core, OpenAI Chat Completions, and Anthropic Messages, including streaming and
   usage accounting;

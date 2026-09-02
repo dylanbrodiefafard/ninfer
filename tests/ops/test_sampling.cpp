@@ -740,6 +740,50 @@ int p_less_heterogeneous_batch_contract() {
     return failures;
 }
 
+int p_less_multiblock_heterogeneous_batch_contract() {
+    constexpr int physical_rows = 248320;
+    constexpr int token_domain  = 248077;
+    constexpr int batch         = 2;
+    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * batch, -20.0f);
+    const auto set = [&](int row, int token, float value) {
+        logits[static_cast<std::size_t>(row) * physical_rows + token] = value;
+    };
+    set(0, 3, 2.0f);
+    set(0, 17, 1.85f);
+    set(0, 7919, 1.7f);
+    set(0, 65537, 0.5f);
+    set(1, 200003, 4.0f);
+    set(1, 65537, 3.5f);
+    for (int row = 0; row < batch; ++row) {
+        set(row, token_domain, 100.0f);
+        set(row, physical_rows - 1, 200.0f);
+    }
+    round_to_bf16(logits);
+
+    std::vector<ops::SamplingConfig> configs(batch);
+    configs[0].temperature = 1.2f;
+    configs[0].p_less      = 1;
+    configs[0].seed        = 271828;
+    configs[1].temperature = 0.8f;
+    configs[1].top_k       = 1;
+    configs[1].seed        = 314159;
+
+    const RunResult result = run_batch(logits, physical_rows, token_domain, configs, {3000, 4000},
+                                       ops::kSamplePurposeDecode);
+    int failures = result.integrity_failures;
+    failures += verify_exact("p-less multi-block mixed batch truncated row",
+                             std::vector<int>{result.tokens[1]}, {200003});
+    const Distribution p_less_oracle =
+        distribution_oracle(std::vector<float>(logits.begin(), logits.begin() + physical_rows),
+                            token_domain, configs[0]);
+    if (std::find(p_less_oracle.tokens.begin(), p_less_oracle.tokens.end(), result.tokens[0]) ==
+        p_less_oracle.tokens.end()) {
+        std::cerr << "p-less multi-block mixed batch row outside oracle support\n";
+        ++failures;
+    }
+    return failures;
+}
+
 int workspace_route_boundary_contract() {
     constexpr int token_domain = 257;
     constexpr int batch        = 8;
@@ -786,6 +830,7 @@ int main() {
     failures += p_less_distribution_contract();
     failures += p_less_real_shape_contract();
     failures += p_less_heterogeneous_batch_contract();
+    failures += p_less_multiblock_heterogeneous_batch_contract();
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sample public contract\n";
     return failures == 0 ? 0 : 1;

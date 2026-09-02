@@ -43,7 +43,7 @@ SPECULATIVE_MODES = {
     "dflash11": ("dflash", 11, 0),
 }
 DEFAULT_MODES = ("mtp0", "mtp3")
-SAMPLING_MODES = ("stochastic", "greedy")
+SAMPLING_MODES = ("stochastic", "p-less", "greedy")
 
 SEEDS = (
     7632647173703958409,
@@ -568,6 +568,9 @@ def validate_server_start(
         spec.sampling_mode == "greedy"
     ):
         raise CampaignError("server_start sampling mode does not match the campaign")
+    p_less = event.get("sampling_defaults", {}).get("server_overrides", {}).get("p_less")
+    if p_less != (spec.sampling_mode == "p-less"):
+        raise CampaignError("server_start p-less mode does not match the campaign")
     if event.get("artifact", {}).get("target") != spec.target:
         raise CampaignError(
             "loaded artifact target mismatch: "
@@ -794,12 +797,13 @@ def server_command(
         if spec.dflash_verify_width:
             command.extend(["--dflash-verify-width", str(spec.dflash_verify_width)])
     if spec.sampling_mode == "greedy":
-        command.append("--greedy")
-    else:
+        command.extend(["--greedy", "--no-p-less-sampling"])
+    elif spec.sampling_mode == "stochastic":
         # Published stochastic measurements use this explicit profile; they must not drift when
         # product defaults follow a newly registered model recommendation.
         command.extend(
             [
+                "--no-p-less-sampling",
                 "--temperature",
                 "0.6",
                 "--top-p",

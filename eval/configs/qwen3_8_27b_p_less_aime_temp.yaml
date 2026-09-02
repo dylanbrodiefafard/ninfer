@@ -1,8 +1,8 @@
 schema_version: 1
 
-# Client-side AIME25/AIME26 temperature matrix for production sampling vs process-level
-# --p-less-sampling. Run the same yaml twice against two sequential ninfer-serve processes;
-# see eval/README.md. Client top_p/top_k/presence_penalty apply only on the production server.
+# Client-side AIME25/AIME26 temperature matrix for opt-out production sampling vs default p-less.
+# Run the same yaml twice against two sequential ninfer-serve processes; see eval/README.md.
+# Client top_p/top_k/presence_penalty apply only on the production server.
 
 targets:
   qwen38_api:

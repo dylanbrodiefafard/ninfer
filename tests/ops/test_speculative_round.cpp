@@ -715,6 +715,58 @@ int p_less_tree_membership_cases(int token_domain) {
     return failures;
 }
 
+int p_less_dflash2_product_tree_multiblock_case() {
+    constexpr int physical_rows = 248320;
+    constexpr int token_domain  = 248077;
+    constexpr int kWidth        = 12;
+    const std::vector<std::int32_t> parent{-1, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5};
+    const std::vector<std::int32_t> verify_ids{
+        7, 17, 7919, 65537, 131071, 200003, 240001, 29, 3001, 50021, 170003, 230003};
+    constexpr std::int32_t correction = 150001;
+
+    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * kWidth, -20.0f);
+    const auto set = [&](int col, int token, float value) {
+        logits[static_cast<std::size_t>(col) * physical_rows + token] = value;
+    };
+    set(0, verify_ids[2], 20.0f);
+    set(2, verify_ids[6], 20.0f);
+    set(6, correction, 20.0f);
+    for (int col = 0; col < kWidth; ++col) {
+        set(col, token_domain, 100.0f);
+        set(col, physical_rows - 1, 200.0f);
+    }
+    round_to_bf16(logits);
+    std::vector<std::uint16_t> bits(logits.size());
+    for (std::size_t i = 0; i < logits.size(); ++i) { bits[i] = f32_to_bf16(logits[i]); }
+
+    ops::SamplingConfig cfg{};
+    cfg.temperature       = 1.0f;
+    cfg.top_k             = 1;
+    cfg.top_p             = 0.1f;
+    cfg.min_p             = 0.9f;
+    cfg.presence_penalty  = 2.0f;
+    cfg.frequency_penalty = 2.0f;
+    cfg.p_less            = 1;
+    cfg.seed              = 0x123456789abcdef0ull;
+
+    std::vector<std::int32_t> counts(static_cast<std::size_t>(token_domain), 0);
+    counts[static_cast<std::size_t>(verify_ids[2])] = 3;
+    counts[static_cast<std::size_t>(verify_ids[6])] = 5;
+    counts[static_cast<std::size_t>(correction)]    = 7;
+    std::vector<std::int32_t> want_lic(kWidth, 0);
+    want_lic[0] = verify_ids[2];
+    want_lic[1] = verify_ids[6];
+    want_lic[2] = correction;
+    std::vector<std::int32_t> want_path(kWidth, 0);
+    want_path[0] = 0;
+    want_path[1] = 2;
+    want_path[2] = 6;
+    return execute_tree_case("DFlash2 p-less tree W=12 real token-domain", token_domain,
+                             physical_rows, kWidth, parent, verify_ids,
+                             std::vector<std::int32_t>(kWidth, 0), bits, 7, kWidth, cfg, counts,
+                             want_lic, 2, 6, want_path, 4093);
+}
+
 int batched_sampling_workspace_stride_case() {
     constexpr int physical_rows = 257;
     constexpr int token_domain  = 257;
@@ -1179,6 +1231,7 @@ int main() {
     failures += p_less_deterministic_accept_case();
     failures += p_less_tree_membership_cases(64);
     failures += p_less_tree_membership_cases(257);
+    failures += p_less_dflash2_product_tree_multiblock_case();
     failures += batched_sampling_workspace_stride_case();
     failures += select_hidden_case(5120, 6, 0);
     failures += select_hidden_case(5120, 6, 5);

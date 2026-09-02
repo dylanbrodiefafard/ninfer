@@ -443,11 +443,12 @@ def server_command(
         if getattr(args, "adaptive_draft", False):
             command.append("--adaptive-draft")
     if point.sampling_mode == "greedy":
-        command.append("--greedy")
-    else:
+        command.extend(["--greedy", "--no-p-less-sampling"])
+    elif point.sampling_mode == "stochastic":
         # Defaults match the published concurrency method. Callers may override.
         command.extend(
             [
+                "--no-p-less-sampling",
                 "--temperature",
                 str(getattr(args, "temperature", 0.6)),
                 "--top-p",
@@ -495,6 +496,9 @@ def validate_server_start(
         point.sampling_mode == "greedy"
     ):
         raise corpus.CampaignError("server_start sampling mode does not match the point")
+    p_less = event.get("sampling_defaults", {}).get("server_overrides", {}).get("p_less")
+    if p_less != (point.sampling_mode == "p-less"):
+        raise corpus.CampaignError("server_start p-less mode does not match the point")
     if event.get("artifact", {}).get("target") != point.target:
         raise corpus.CampaignError("loaded artifact target does not match the point")
     if event.get("server", {}).get("public_model_id") != point.model_id:

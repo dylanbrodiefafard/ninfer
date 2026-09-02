@@ -49,14 +49,16 @@ int main() {
     failures += check(ninfer::cli::usage_text("ninfer").find("--capture-context-checkpoint") !=
                           std::string::npos,
                       "CLI help omits --capture-context-checkpoint");
-    failures += check(ninfer::cli::usage_text("ninfer").find("--p-less-sampling") !=
+    failures += check(ninfer::cli::usage_text("ninfer").find("--no-p-less-sampling") !=
                           std::string::npos,
-                      "CLI help omits --p-less-sampling");
+                      "CLI help omits --no-p-less-sampling");
 
-    const ninfer::cli::Options pless =
-        parse({"ninfer", "model.ninfer", "--prompt", "hi", "--p-less-sampling", "--top-p", "0.5"});
-    failures += check(pless.sampling.p_less && pless.sampling.top_p == 0.5F,
-                      "--p-less-sampling did not parse with ignored top-p still recorded");
+    const ninfer::cli::Options defaults = parse({"ninfer", "model.ninfer", "--prompt", "hi"});
+    failures += check(defaults.sampling.p_less, "CLI did not enable p-less by default");
+    const ninfer::cli::Options production = parse(
+        {"ninfer", "model.ninfer", "--prompt", "hi", "--no-p-less-sampling", "--top-p", "0.5"});
+    failures += check(!production.sampling.p_less && production.sampling.top_p == 0.5F,
+                      "--no-p-less-sampling did not opt into the production sampler");
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
