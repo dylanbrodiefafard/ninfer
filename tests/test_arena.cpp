@@ -6,7 +6,9 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <iostream>
+#include <memory>
 #include <new>
 #include <stdexcept>
 #include <utility>
@@ -252,6 +254,24 @@ int main() {
         if (host.try_alloc(2048, 256) != nullptr) {
             ++failures;
             std::cerr << "host arena allocated more than its capacity\n";
+        }
+    }
+
+    {
+        auto future = std::async(std::launch::async, [] {
+            CUDA_CHECK(cudaSetDevice(0));
+            return std::make_unique<ninfer::HostPinnedArena>(1024);
+        });
+        std::unique_ptr<ninfer::HostPinnedArena> host = future.get();
+        void* allocation = host->try_alloc(1024, 256);
+        if (allocation == nullptr) {
+            ++failures;
+            std::cerr << "cross-thread host arena allocation failed\n";
+        } else {
+            std::memset(allocation, 0x5a, 1024);
+            ninfer::DeviceBuffer transfer(1024);
+            transfer.copy_from_host(allocation, 1024);
+            host->free(allocation);
         }
     }
 

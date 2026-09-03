@@ -82,16 +82,13 @@ endif()
 
 find_package(CUDAToolkit REQUIRED)
 find_package(PkgConfig REQUIRED)
+find_package(Threads REQUIRED)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
   libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)
 pkg_check_modules(ZSTD REQUIRED libzstd)
 if(NINFER_BUILD_MEDIA_ACQUIRE)
   pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl>=7.85)
 endif()
-if(NINFER_BUILD_SERVE)
-  find_package(Threads REQUIRED)
-endif()
-
 # --- Subdirectories ----------------------------------------------------------
 add_subdirectory(src)
 if(NINFER_BUILD_APPS)

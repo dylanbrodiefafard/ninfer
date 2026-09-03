@@ -864,7 +864,9 @@ print CUDA D2H `save=` and H2D `load=` elapsed harvested after the first non-thr
 `start_prefill_lane`. The host image packs logical page `i`
 densely and neither stores nor sorts physical page IDs. A RAM hit still requires a complete
 SequenceState proof; active pages are not moved because of RAM capture/restore. Capacity is fixed
-in MiB by `--kv-ram-capacity`, default off; a failed `cudaHostAlloc` fails Engine construction.
+in MiB by `--kv-ram-capacity`, default off. Construction pre-faults the complete contiguous host
+arena in parallel and registers it with CUDA before startup succeeds; a failed host reservation or
+CUDA registration fails Engine construction.
 One long MTP or DFlash bundle with six ladder heads is about 6 GiB (Main+backend KV plus current/rewrite GDN plus
 moved live heads, including DFlash cyclic). `--kv-ram-capacity off` still keeps the live-lane pinned GDN log for same-lane
 rollback; other-lane restore after eviction remains a miss without the FIFO. Eviction of a retained

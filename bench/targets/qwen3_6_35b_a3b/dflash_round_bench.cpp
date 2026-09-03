@@ -239,7 +239,7 @@ int run(const Options& options) {
         target::Package::construct_loaded_model(std::move(load_plan), std::move(materialized));
     auto frontend                      = target::Package::make_frontend(*model);
     const std::size_t request_capacity = sequence.request_transient_capacity_bytes();
-    auto program = target::Package::create_program(*model, std::move(sequence), device);
+    auto program = target::Package::create_program(*model, std::move(sequence), device, nullptr);
     ninfer::runtime::RequestMemory request_memory(device, request_capacity);
     ninfer::runtime::ResolvedExecutionOptions execution;
     execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);

@@ -35,7 +35,9 @@ add_library(ninfer_core STATIC
   runtime/engine/request_memory.cpp)
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
-target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3)
+target_link_libraries(ninfer_core
+  PUBLIC CUDA::cudart CUDA::nvtx3
+  PRIVATE Threads::Threads)
 
 # Generic .ninfer framing, binding, and direct final materialization.
 add_library(ninfer_artifact STATIC
@@ -45,7 +47,9 @@ add_library(ninfer_artifact STATIC
   artifact/materializer.cpp
   artifact/typed_binding.cpp)
 ninfer_internal_includes(ninfer_artifact)
-target_link_libraries(ninfer_artifact PUBLIC ninfer_core)
+target_link_libraries(ninfer_artifact
+  PUBLIC ninfer_core
+  PRIVATE Threads::Threads)
 
 # The warp-specialized SM120 kernel uses setmaxnreg to transfer registers from its
 # producer warpgroup to its consumer warpgroups. Relocatable device code makes ptxas

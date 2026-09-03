@@ -258,7 +258,8 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
 } // namespace
 
 ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const SequencePlanImpl& plan,
-                                 DeviceContext& device_in)
+                                 DeviceContext& device_in,
+                                 std::unique_ptr<HostPinnedArena> kv_ram_arena)
     : model(model_in), device(device_in), capacity(plan.capacity), kv_capacity(plan.kv_capacity),
       max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
       draft_window(plan.draft_window), dflash_verify_width(plan.dflash_verify_width),
@@ -407,7 +408,16 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     work.reset();
     work.reset_peak();
     workspace_logical_peak_bytes = 0;
-    if (kv_ram_capacity_bytes != 0) { kv_ram_cache_.emplace(kv_ram_capacity_bytes); }
+    if (kv_ram_capacity_bytes == 0) {
+        if (kv_ram_arena != nullptr) {
+            throw std::invalid_argument("disabled KV RAM cache received a host arena");
+        }
+    } else {
+        if (kv_ram_arena == nullptr || kv_ram_arena->capacity() != kv_ram_capacity_bytes) {
+            throw std::invalid_argument("KV RAM cache host arena does not match the sequence plan");
+        }
+        kv_ram_cache_.emplace(std::move(*kv_ram_arena));
+    }
     if (kv_disk_capacity_bytes != 0) {
         const PagedKVPool& text_pool = decoder->text_kv.pool();
         const qwen3_6::PagedKVCache* backend = backend_kv_cache();

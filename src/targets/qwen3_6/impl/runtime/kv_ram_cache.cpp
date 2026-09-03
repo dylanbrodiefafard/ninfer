@@ -364,6 +364,8 @@ RamRestoredHost host_from_header(const void* block, const HeaderView& header) {
 
 KVRamCache::KVRamCache(std::size_t capacity_bytes) : arena_(capacity_bytes) {}
 
+KVRamCache::KVRamCache(HostPinnedArena&& arena) : arena_(std::move(arena)) {}
+
 KVRamCache::~KVRamCache() {
     reap_retired(true);
     std::vector<std::uint64_t> ids(fifo_.begin(), fifo_.end());

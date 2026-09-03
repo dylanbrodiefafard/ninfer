@@ -109,8 +109,9 @@ private:
     std::size_t size_ = 0;
 };
 
-// One cudaHostAlloc region with a first-fit block allocator. try_alloc never throws for
-// capacity; construction throws if the pinned allocation fails.
+// One contiguous, fully resident CUDA-registered region with a first-fit block allocator.
+// try_alloc never throws for capacity; construction throws if the host reservation or CUDA
+// registration fails.
 class HostPinnedArena {
 public:
     explicit HostPinnedArena(std::size_t capacity_bytes);
@@ -140,9 +141,10 @@ private:
 
     void insert_free(std::size_t offset, std::size_t size);
 
-    void* base_       = nullptr;
-    std::size_t cap_  = 0;
-    std::size_t used_ = 0;
+    void* base_                = nullptr;
+    std::size_t cap_           = 0;
+    std::size_t used_          = 0;
+    std::size_t mapping_bytes_ = 0;
     std::vector<FreeSpan> free_;
     std::unordered_map<void*, LiveBlock> live_;
 };
