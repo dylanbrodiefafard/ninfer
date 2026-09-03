@@ -64,7 +64,9 @@ struct SamplingConfig {
  * that are not listed in the first suppressed_token_count entries of suppressed_tokens
  * (penalties, top_k, top_p, and min_p are ignored). Let p=softmax(z/temperature) over that
  * eligible domain, L=sum_v p_v^2, and V={v: p_v>=L} (non-empty: the eligible mode is always
- * admitted). Sample from the renormalized restriction of p to V. With positive temperature and
+ * admitted). Equivalently, with e_v=exp((z_v-m)/temperature) and m the eligible max logit, V is
+ * {v: e_v * sum_i e_i >= sum_i e_i^2} so the cut is not rounded through L = (sum e^2)/(sum e)^2.
+ * Sample from the renormalized restriction of p to V. With positive temperature and
  * p_less==0, let
  * c_v=configs[b].token_counts[v] (or zero when the pointer is null):
  *
