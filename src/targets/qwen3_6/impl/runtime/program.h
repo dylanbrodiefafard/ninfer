@@ -12,6 +12,7 @@
 #include "targets/qwen3_6/impl/runtime/adaptive_draft.h"
 #include "targets/qwen3_6/impl/runtime/context_checkpoint.h"
 #include "targets/qwen3_6/impl/runtime/kv_ram_cache.h"
+#include "targets/qwen3_6/impl/runtime/kv_disk_cache.h"
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
@@ -96,6 +97,9 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t backend_kv_page_entitlement = 0;
     PrefixReuseSource reuse_source            = PrefixReuseSource::None;
     std::uint64_t ram_entry_id                = 0;
+    std::uint64_t disk_entry_id               = 0;
+    PrefixHash128 disk_hash_f{};
+    std::uint32_t disk_execution_frontier     = 0;
     bool capture_context_checkpoints          = false;
     bool capture_context_checkpoint           = false;
 };
@@ -145,10 +149,10 @@ struct ContextCheckpointHead {
     std::uint32_t frontier = 0;
     qwen3_6::detail::PrefixHash128 hash{};
     qwen3_6::detail::ContextCheckpointKind kind = qwen3_6::detail::ContextCheckpointKind::Ladder;
-    std::optional<PinnedHostBuffer> conv;
-    std::optional<PinnedHostBuffer> recurrent;
-    std::optional<PinnedHostBuffer> hidden;
-    std::optional<PinnedHostBuffer> dflash;
+    std::shared_ptr<PinnedHostBuffer> conv;
+    std::shared_ptr<PinnedHostBuffer> recurrent;
+    std::shared_ptr<PinnedHostBuffer> hidden;
+    std::shared_ptr<PinnedHostBuffer> dflash;
     cudaEvent_t copies_done = nullptr;
 
     ContextCheckpointHead() = default;
@@ -244,9 +248,15 @@ struct SequenceState {
     bool tail_hidden_valid        = false;
     bool retained                 = false;
     std::uint64_t use_tick        = 0;
+    std::uint64_t disk_entry_id   = 0;
     RewriteCheckpoint rewrite_checkpoint;
     std::vector<ContextCheckpointHead> context_checkpoints;
     std::uint32_t next_context_mark = 0;
+    // Set by HostDisk staged restore after the matching head is unpacked into current.
+    // start_prefill skips a second unpack when occupy matches this (base, hash). Cleared
+    // at end of occupy and in clear_lane so a later VRAM/RAM staged restore still unpacks.
+    std::uint32_t disk_unpacked_context_base = 0;
+    qwen3_6::detail::PrefixHash128 disk_unpacked_context_hash{};
 };
 
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
@@ -307,6 +317,8 @@ public:
                                                     const RequestBasePlan& base);
     [[nodiscard]] RequestPlan plan_ram_reuse(const PreparedPromptData& prompt,
                                              const RequestBasePlan& base);
+    [[nodiscard]] RequestPlan plan_disk_reuse(const PreparedPromptData& prompt,
+                                              const RequestBasePlan& base);
     [[nodiscard]] bool can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept;
     [[nodiscard]] bool
     can_admit_lane_after_retained_eviction(std::uint32_t lane,
@@ -337,18 +349,42 @@ public:
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] std::uint64_t retained_use_tick(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
-    [[nodiscard]] bool capture_retained_lane(std::uint32_t lane);
+    [[nodiscard]] bool capture_retained_lane(std::uint32_t lane, std::uint64_t* ram_entry_id = nullptr);
     void restore_ram_entry(std::uint32_t lane, std::uint64_t entry_id, const RequestPlan& plan);
+    void restore_disk_entry(std::uint32_t lane, std::uint64_t entry_id, const RequestPlan& plan);
     void claim_ram_entry(std::uint64_t entry_id);
     void release_ram_entry(std::uint64_t entry_id);
     void consume_ram_entry(std::uint64_t entry_id);
+    [[nodiscard]] bool claim_disk_entry(std::uint64_t entry_id, std::uint32_t expected_frontier,
+                                        std::uint64_t hash_lo, std::uint64_t hash_hi,
+                                        std::uint32_t expected_reuse_base = 0,
+                                        PrefixReusePath expected_reuse = PrefixReusePath::FullReset);
+    void release_disk_entry(std::uint64_t entry_id);
+    void consume_disk_entry(std::uint64_t entry_id);
+    void prefetch_disk_window(std::uint64_t entry_id, std::uint32_t text_pages,
+                              std::uint32_t backend_pages);
+    void prefetch_disk_plan(std::uint64_t entry_id, const RequestPlan& plan);
+    void pump_disk_restore();
+    void cancel_disk_restore();
+    void discard_ram_capture(std::uint64_t ram_id);
+    void shutdown_kv_tiers(LoadProgress progress = {});
+    void request_idle_spill();
+    void install_pending_disk_restore_checkpoints();
     [[nodiscard]] qwen3_6::detail::KvRamSnapshot kv_ram_snapshot() const noexcept;
     qwen3_6::detail::KvRamCopySeconds harvest_kv_ram_copy_seconds();
+    [[nodiscard]] qwen3_6::detail::KvDiskSnapshot kv_disk_snapshot() const noexcept;
+    qwen3_6::detail::KvDiskCopySeconds harvest_kv_disk_copy_seconds();
     [[nodiscard]] bool kv_ram_copies_ready() const;
+    [[nodiscard]] bool kv_disk_copies_ready() const;
+    [[nodiscard]] bool kv_disk_restore_failed() const;
+    [[nodiscard]] bool kv_copies_ready() const;
     void wait_kv_ram_copies_on_compute();
     void wait_kv_ram_copies();
+    void wait_kv_disk_copies();
+    [[nodiscard]] std::uint64_t pending_disk_restore_ticket() const noexcept;
     void synchronize_all();
     [[nodiscard]] std::uint64_t kv_ram_index_version() const noexcept;
+    [[nodiscard]] std::uint64_t kv_disk_index_version() const noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] std::uint32_t
@@ -386,6 +422,7 @@ public:
     const bool use_cuda_graph;
     const std::size_t kv_payload_bytes;
     const std::size_t kv_ram_capacity_bytes;
+    const std::size_t kv_disk_capacity_bytes;
     const std::size_t graph_allowance_bytes;
     std::size_t graph_observed_bytes = 0;
     const WorkspacePlan workspace_plan;
@@ -425,7 +462,11 @@ public:
 
     std::size_t workspace_logical_peak_bytes = 0;
     std::optional<qwen3_6::detail::KVRamCache> kv_ram_cache_;
+    std::optional<qwen3_6::detail::KVDiskCache> kv_disk_cache_;
     std::uint64_t next_use_tick_ = 1;
+    bool kv_tiers_shutdown_      = false;
+    std::optional<std::uint32_t> pending_disk_checkpoint_lane_;
+    std::uint64_t pending_disk_restore_ticket_ = 0;
 
 private:
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
@@ -518,6 +559,8 @@ private:
     void clear_context_checkpoints(SequenceState& sequence) noexcept;
     void install_ram_context_checkpoints(SequenceState& sequence,
                                          const qwen3_6::detail::RamRestoredHost& host);
+    void install_disk_context_checkpoints(SequenceState& sequence,
+                                          qwen3_6::detail::DiskRestoredHost&& host);
     [[nodiscard]] bool staging_holds(std::uint32_t lane, qwen3_6::detail::PrefixHash128 hash,
                                      std::uint32_t frontier) const noexcept;
     [[nodiscard]] bool captures_context_checkpoints() const noexcept;

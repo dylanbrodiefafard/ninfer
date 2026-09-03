@@ -142,6 +142,12 @@ RequestPlan<Variant> Program<Variant>::plan_ram_reuse(const PreparedPrompt& prom
 }
 
 template <>
+RequestPlan<Variant> Program<Variant>::plan_disk_reuse(const PreparedPrompt& prompt,
+                                                       const RequestBasePlan<Variant>& base) {
+    return impl_->plan_disk_reuse(PreparedPromptAccess::view(prompt), base);
+}
+
+template <>
 bool Program<Variant>::can_admit_lane(std::uint32_t lane,
                                       const RequestPlan<Variant>& plan) const noexcept {
     return impl_->can_admit_lane(lane, plan);
@@ -242,14 +248,20 @@ void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
 }
 
 template <>
-bool Program<Variant>::capture_retained_lane(std::uint32_t lane) {
-    return impl_->capture_retained_lane(lane);
+bool Program<Variant>::capture_retained_lane(std::uint32_t lane, std::uint64_t* ram_entry_id) {
+    return impl_->capture_retained_lane(lane, ram_entry_id);
 }
 
 template <>
 void Program<Variant>::restore_ram_entry(std::uint32_t lane, std::uint64_t entry_id,
                                          const RequestPlan<Variant>& plan) {
     impl_->restore_ram_entry(lane, entry_id, plan);
+}
+
+template <>
+void Program<Variant>::restore_disk_entry(std::uint32_t lane, std::uint64_t entry_id,
+                                          const RequestPlan<Variant>& plan) {
+    impl_->restore_disk_entry(lane, entry_id, plan);
 }
 
 template <>
@@ -268,6 +280,62 @@ void Program<Variant>::consume_ram_entry(std::uint64_t entry_id) {
 }
 
 template <>
+bool Program<Variant>::claim_disk_entry(std::uint64_t entry_id, std::uint32_t expected_frontier,
+                                        std::uint64_t hash_lo, std::uint64_t hash_hi,
+                                        std::uint32_t expected_reuse_base,
+                                        PrefixReusePath expected_reuse) {
+    return impl_->claim_disk_entry(entry_id, expected_frontier, hash_lo, hash_hi,
+                                   expected_reuse_base, expected_reuse);
+}
+
+template <>
+void Program<Variant>::release_disk_entry(std::uint64_t entry_id) {
+    impl_->release_disk_entry(entry_id);
+}
+
+template <>
+void Program<Variant>::consume_disk_entry(std::uint64_t entry_id) {
+    impl_->consume_disk_entry(entry_id);
+}
+
+template <>
+void Program<Variant>::prefetch_disk_window(std::uint64_t entry_id, std::uint32_t text_pages,
+                                            std::uint32_t backend_pages) {
+    impl_->prefetch_disk_window(entry_id, text_pages, backend_pages);
+}
+
+template <>
+void Program<Variant>::prefetch_disk_plan(std::uint64_t entry_id,
+                                          const RequestPlan<Variant>& plan) {
+    impl_->prefetch_disk_plan(entry_id, plan);
+}
+
+template <>
+void Program<Variant>::pump_disk_restore() {
+    impl_->pump_disk_restore();
+}
+
+template <>
+void Program<Variant>::cancel_disk_restore() {
+    impl_->cancel_disk_restore();
+}
+
+template <>
+void Program<Variant>::discard_ram_capture(std::uint64_t ram_id) {
+    impl_->discard_ram_capture(ram_id);
+}
+
+template <>
+void Program<Variant>::shutdown_kv_tiers(LoadProgress progress) {
+    impl_->shutdown_kv_tiers(std::move(progress));
+}
+
+template <>
+void Program<Variant>::request_idle_spill() {
+    impl_->request_idle_spill();
+}
+
+template <>
 qwen3_6::detail::KvRamSnapshot Program<Variant>::kv_ram_snapshot() const noexcept {
     return impl_->kv_ram_snapshot();
 }
@@ -278,8 +346,33 @@ qwen3_6::detail::KvRamCopySeconds Program<Variant>::harvest_kv_ram_copy_seconds(
 }
 
 template <>
+qwen3_6::detail::KvDiskSnapshot Program<Variant>::kv_disk_snapshot() const noexcept {
+    return impl_->kv_disk_snapshot();
+}
+
+template <>
+qwen3_6::detail::KvDiskCopySeconds Program<Variant>::harvest_kv_disk_copy_seconds() {
+    return impl_->harvest_kv_disk_copy_seconds();
+}
+
+template <>
 bool Program<Variant>::kv_ram_copies_ready() const {
     return impl_->kv_ram_copies_ready();
+}
+
+template <>
+bool Program<Variant>::kv_disk_copies_ready() const {
+    return impl_->kv_disk_copies_ready();
+}
+
+template <>
+bool Program<Variant>::kv_disk_restore_failed() const {
+    return impl_->kv_disk_restore_failed();
+}
+
+template <>
+bool Program<Variant>::kv_copies_ready() const {
+    return impl_->kv_copies_ready();
 }
 
 template <>
@@ -293,6 +386,16 @@ void Program<Variant>::wait_kv_ram_copies() {
 }
 
 template <>
+void Program<Variant>::wait_kv_disk_copies() {
+    impl_->wait_kv_disk_copies();
+}
+
+template <>
+std::uint64_t Program<Variant>::pending_disk_restore_ticket() const noexcept {
+    return impl_->pending_disk_restore_ticket();
+}
+
+template <>
 void Program<Variant>::synchronize_all() {
     impl_->synchronize_all();
 }
@@ -300,6 +403,11 @@ void Program<Variant>::synchronize_all() {
 template <>
 std::uint64_t Program<Variant>::kv_ram_index_version() const noexcept {
     return impl_->kv_ram_index_version();
+}
+
+template <>
+std::uint64_t Program<Variant>::kv_disk_index_version() const noexcept {
+    return impl_->kv_disk_index_version();
 }
 
 template <>

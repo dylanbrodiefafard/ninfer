@@ -873,6 +873,52 @@ entry. A middle-head hit unpacks that head's GDN+hidden (and DFlash cyclic) into
 `dst_extent` Main `pages_for_tokens(F)` / MTP `pages_for_tokens(F-1)` / DFlash Full `pages_for_tokens(F)`. Host RAM is not a second GPU
 working set.
 
+### 10.5 Inclusive SSD third tier
+
+`--kv-disk-capacity` enables an inclusive SSD store of completed bundles and requires
+`--kv-ram-capacity > 0`. Equal reuse prefers VRAM, then RAM, then disk. A disk hit claims an
+immutable entry and its pack-generation lease, restores directly into the selected VRAM lane,
+and never parks the restored bundle in the RAM FIFO. Consuming the claim releases its generation
+lease but does not delete the durable entry; a later VRAM or RAM hit likewise leaves the disk copy
+available. C=1 does not submit restore reads until the selected retained victim has been captured
+and its GPU pages released.
+
+Disk format v4 stores objects in 1 GiB, per-kind pack segments under an atomically selected
+generation. `PACKSET` names the generation and reserves monotonically increasing object-ID ranges.
+The immutable base map and append-only, CRC-framed log resolve stable object IDs to aligned
+extents. Page and state records carry header/payload CRC32C; ledger and identity records retain
+their exact codecs. Page records are individually 4 KiB padded even when a spill submits four
+contiguous records with one `pwritev`. Capacity bills unique retained extents and includes all
+physically allocated active, stale, and rolled pack files when deciding whether a write can start.
+
+The publication order is segment bytes and segment namespace, object-map log, entry metadata,
+then manifest. Each preceding stage is synchronized before the next one becomes durable. A crash
+may therefore leave pack garbage or an unreachable map Put, but never a published entry that
+depends on an undurable extent. Startup accepts those unreachable records, derives future append
+frontiers from the durable pack namespace, and validates direct-I/O support only for live,
+skipped, or held page/state objects. It memory-maps object maps, validates sorted extent ranges,
+and checks each live page CRC once across the bounded reader pool. Torn map tails are truncated;
+conflicting IDs, overlapping extents, corrupt live records, and unsupported fingerprints
+invalidate the affected store or entry according to their ownership boundary.
+
+Compaction copies live extents into a new generation, publishes its complete base map, and then
+atomically replaces `PACKSET`. Old pack roots and their maps are removed only after publication is
+durable and all reader leases have drained. Admission requires the copy-on-write reserve before
+the first compaction or spill byte is written. Eviction uses durable tombstones so an uncertain
+metadata publication cannot make a referenced object reusable.
+
+Restore owns `2 * restore_io_threads` pinned page slots and equally sized device staging slots.
+Readers issue aligned direct reads into the pinned slots, validate each packed record, enqueue one
+dense H2D per logical page, and scatter it into the target's physical planes. Raw state objects
+read directly into their final pinned owners using 4 MiB read/CRC chunks; each object uses at most
+four readers and independent objects share the startup-fixed reader budget. Compressed state uses
+bounded decoded owners. Contiguous CRC32C checks use the serial SSE4.2 dependency chain below
+512 KiB and three interleaved hardware chains for larger payloads; incremental checks remain
+serial.
+The page window, state owners, destination page mappings, and generation lease remain alive until
+the copy-stream completion event has been consumed. The spill side uses separate pinned scratch,
+so an idle spill may overlap restore reads; emergency spill remains exclusive with restore I/O.
+
 ---
 
 ## 11. Speculative decoding

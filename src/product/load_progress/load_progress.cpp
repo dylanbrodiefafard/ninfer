@@ -9,6 +9,7 @@
 #include <ostream>
 #include <sstream>
 #include <string>
+#include <string_view>
 
 namespace ninfer::product {
 namespace {
@@ -49,11 +50,25 @@ std::string format_bytes(std::uint64_t bytes) {
 
 std::string format_line(std::string_view phase, std::uint64_t done, std::uint64_t total,
                         double seconds) {
+    std::string_view category = "load";
+    std::string_view detail   = phase;
+    constexpr std::string_view kDiskPrefix = "kv-disk ";
+    const bool disk_counts = phase.size() > kDiskPrefix.size() &&
+                              phase.substr(0, kDiskPrefix.size()) == kDiskPrefix;
+    if (disk_counts) {
+        category = "kv-disk";
+        detail   = phase.substr(kDiskPrefix.size());
+    }
     std::ostringstream output;
-    output << std::left << std::setw(12) << "load" << std::setw(26) << phase << std::right
-           << std::setw(8) << format_percent(done, total) << std::setw(14) << format_bytes(done)
-           << " / " << std::setw(14) << format_bytes(total) << std::setw(12)
-           << format_seconds(seconds);
+    output << std::left << std::setw(12) << category << std::setw(26) << detail << std::right
+           << std::setw(8) << format_percent(done, total);
+    if (disk_counts) {
+        output << std::setw(14) << done << " / " << std::setw(14) << total;
+    } else {
+        output << std::setw(14) << format_bytes(done) << " / " << std::setw(14)
+               << format_bytes(total);
+    }
+    output << std::setw(12) << format_seconds(seconds);
     return output.str();
 }
 
@@ -111,8 +126,13 @@ void LoadProgressRenderer::update(std::string_view phase, std::uint64_t done, st
 
     last_done_       = done;
     last_total_      = total;
-    const bool final = done >= total;
-    if (!new_phase && !final && now - last_rendered_ < options_.min_refresh_interval) { return; }
+    const bool final = total != 0 && done >= total;
+    const bool disk_counts =
+        phase.size() > 8 && phase.substr(0, 8) == std::string_view{"kv-disk "};
+    if (!new_phase && !final && !disk_counts &&
+        now - last_rendered_ < options_.min_refresh_interval) {
+        return;
+    }
 
     render(done, total, now, final);
     last_rendered_ = now;

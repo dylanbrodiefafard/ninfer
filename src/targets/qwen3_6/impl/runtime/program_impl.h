@@ -2,7 +2,10 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
 
+#include <functional>
+
 #include "targets/qwen3_6/impl/runtime/schedule.h"
+#include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/gqa_attention.h"
 #include "ninfer/ops/linear.h"
@@ -24,6 +27,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -275,6 +279,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       xattn_min_len(plan.xattn_min_len), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       kv_ram_capacity_bytes(plan.kv_ram_capacity_bytes),
+      kv_disk_capacity_bytes(plan.kv_disk_capacity_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), workspace_storage.capacity()}),
@@ -403,9 +408,44 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     work.reset_peak();
     workspace_logical_peak_bytes = 0;
     if (kv_ram_capacity_bytes != 0) { kv_ram_cache_.emplace(kv_ram_capacity_bytes); }
+    if (kv_disk_capacity_bytes != 0) {
+        const PagedKVPool& text_pool = decoder->text_kv.pool();
+        const qwen3_6::PagedKVCache* backend = backend_kv_cache();
+        const PagedKVPool* backend_pool = backend != nullptr ? &backend->pool() : nullptr;
+        std::size_t page_bytes = paged_kv_logical_page_bytes(text_pool);
+        if (backend_pool != nullptr) {
+            page_bytes = std::max(page_bytes, paged_kv_logical_page_bytes(*backend_pool));
+        }
+        std::size_t staging = decoder->linear_attention.conv_host_image_bytes() +
+                              decoder->linear_attention.recurrent_host_image_bytes();
+        staging = std::max(staging, tail_hidden_store.bytes());
+        if (dflash) { staging = std::max(staging, dflash->local.lane_host_bytes()); }
+        const KvCacheStorage kv_cache = kv_dtype == DType::BF16  ? KvCacheStorage::BFloat16
+                                        : kv_dtype == DType::U8 ? KvCacheStorage::Nvfp4
+                                                                : KvCacheStorage::Int8Group64;
+        qwen3_6::detail::DiskOpenConfig disk;
+        disk.location            = plan.kv_disk_location;
+        disk.capacity_bytes      = kv_disk_capacity_bytes;
+        disk.compress            = plan.kv_disk_compress;
+        disk.max_context         = capacity;
+        disk.ram                 = kv_ram_cache_ ? &*kv_ram_cache_ : nullptr;
+        disk.fingerprint         = qwen3_6::detail::make_disk_fingerprint(
+            plan.model_id, plan.weights_id, kv_cache, speculative_backend, text_pool, backend_pool,
+            &decoder->linear_attention, dflash ? &dflash->local : nullptr);
+        disk.text_pool           = &text_pool;
+        disk.backend_pool        = backend_pool;
+        disk.logical_page_bytes  = page_bytes;
+        disk.gdn_staging_bytes   = staging;
+        disk.hidden_bytes        = sequences[0].tail_hidden.bytes();
+        disk.restore_io_threads  = 16;
+        kv_disk_cache_.emplace(std::move(disk));
+    }
 }
 
 ProgramImplCore::~ProgramImplCore() noexcept {
+    try {
+        shutdown_kv_tiers();
+    } catch (...) {}
     fence_staging_copies();
     if (staging_.d2d_done != nullptr) {
         (void)cudaEventDestroy(staging_.d2d_done);
@@ -804,6 +844,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         request.pending            = {};
         request.restored_context_checkpoint_tokens =
             qwen3_6::detail::is_staged_checkpoint_restore(request_plan.reuse) ? base : 0;
+        sequence.disk_unpacked_context_base = 0;
+        sequence.disk_unpacked_context_hash = {};
         sequence.mtp_draft_count   = 0;
         sequence.tail_hidden_valid = base == prompt_tokens && sequence.tail_hidden_valid;
         sequence.ledger.assign(prompt.token_ids.begin(), prompt.token_ids.end());
@@ -1399,14 +1441,53 @@ ProgramImplCore::ram_capture_source(const SequenceState& sequence) {
         }
         source.dflash_lane = static_cast<std::int32_t>(sequence.lane);
     }
+    source.disk_entry_id = sequence.disk_entry_id;
     source.stream = device.copy_stream;
     return source;
 }
 
-bool ProgramImplCore::capture_retained_lane(std::uint32_t lane) {
+bool ProgramImplCore::capture_retained_lane(std::uint32_t lane, std::uint64_t* ram_entry_id) {
+    if (ram_entry_id != nullptr) { *ram_entry_id = 0; }
     if (!kv_ram_cache_ || !has_retained_lane(lane)) { return true; }
     device.order_copy_after_compute();
-    return kv_ram_cache_->capture(ram_capture_source(sequences[lane]));
+    qwen3_6::detail::RamCaptureSource source = ram_capture_source(sequences[lane]);
+    for (;;) {
+        const std::optional<std::uint64_t> id = kv_ram_cache_->capture(source);
+        if (id) {
+            if (kv_disk_cache_) { kv_disk_cache_->note_ram_resident(*id, source.disk_entry_id); }
+            if (ram_entry_id != nullptr) { *ram_entry_id = *id; }
+            return true;
+        }
+        if (kv_disk_cache_) { kv_disk_cache_->cancel_idle_spill(); }
+        std::optional<std::uint64_t> victim = kv_ram_cache_->peek_oldest_unpinned();
+        if (!victim) {
+            try {
+                kv_ram_cache_->wait_pending_copies();
+            } catch (...) {}
+            victim = kv_ram_cache_->peek_oldest_unpinned();
+        }
+        if (!victim) {
+            kv_ram_cache_->record_drop();
+            return false;
+        }
+        if (kv_disk_cache_ && !kv_disk_cache_->ram_is_durable(*victim)) {
+            if (!kv_disk_cache_->emergency_spill_ram(*victim)) {
+                kv_ram_cache_->record_drop();
+                return false;
+            }
+        }
+        if (kv_disk_cache_) { kv_disk_cache_->begin_ram_idle_exclusion(*victim); }
+        bool evicted = false;
+        try {
+            evicted = kv_ram_cache_->evict_one_unpinned(*victim);
+        } catch (...) {
+            if (kv_disk_cache_) { kv_disk_cache_->end_ram_idle_exclusion(*victim); }
+            throw;
+        }
+        if (evicted && kv_disk_cache_) { kv_disk_cache_->forget_ram_resident(*victim); }
+        if (kv_disk_cache_) { kv_disk_cache_->end_ram_idle_exclusion(*victim); }
+        if (!evicted) { continue; }
+    }
 }
 
 void ProgramImplCore::fence_staging_copies() noexcept {
@@ -1497,10 +1578,14 @@ ContextCheckpointHead ProgramImplCore::acquire_context_checkpoint_head(
     }
 
     ContextCheckpointHead head;
-    if (conv_bytes != 0) { head.conv.emplace(conv_bytes); }
-    if (recurrent_bytes != 0) { head.recurrent.emplace(recurrent_bytes); }
-    if (hidden_bytes != 0) { head.hidden.emplace(hidden_bytes); }
-    if (dflash_bytes != 0) { head.dflash.emplace(dflash_bytes); }
+    if (conv_bytes != 0) { head.conv = std::make_shared<PinnedHostBuffer>(conv_bytes); }
+    if (recurrent_bytes != 0) {
+        head.recurrent = std::make_shared<PinnedHostBuffer>(recurrent_bytes);
+    }
+    if (hidden_bytes != 0) { head.hidden = std::make_shared<PinnedHostBuffer>(hidden_bytes); }
+    if (dflash_bytes != 0) {
+        head.dflash = std::make_shared<PinnedHostBuffer>(dflash_bytes);
+    }
     return head;
 }
 
@@ -1547,22 +1632,59 @@ void ProgramImplCore::install_ram_context_checkpoints(
     std::vector<ContextCheckpointHead> heads;
     heads.reserve(host.ladder_images.size());
     for (const qwen3_6::detail::RamLadderImage& image : host.ladder_images) {
+        if (image.hidden_bytes != 0 && sequence.tail_hidden.bytes() != 0 &&
+            image.hidden_bytes != sequence.tail_hidden.bytes()) {
+            continue;
+        }
+        if (image.conv != nullptr && sequence.tail_hidden.bytes() != 0 &&
+            image.hidden == nullptr) {
+            continue;
+        }
         ContextCheckpointHead head = acquire_context_checkpoint_head(
-            image.conv_bytes, image.recurrent_bytes, image.hidden_bytes, image.dflash_bytes);
+            image.conv != nullptr ? image.conv_bytes : 0,
+            image.recurrent != nullptr ? image.recurrent_bytes : 0,
+            image.hidden != nullptr ? image.hidden_bytes : 0,
+            image.dflash != nullptr ? image.dflash_bytes : 0);
         head.wait_copies();
         head.frontier = image.frontier;
         head.hash     = image.hash;
         head.kind     = image.kind;
-        if (image.conv_bytes != 0) { std::memcpy(head.conv->data(), image.conv, image.conv_bytes); }
-        if (image.recurrent_bytes != 0) {
+        if (image.conv_bytes != 0 && image.conv != nullptr) {
+            std::memcpy(head.conv->data(), image.conv, image.conv_bytes);
+        }
+        if (image.recurrent_bytes != 0 && image.recurrent != nullptr) {
             std::memcpy(head.recurrent->data(), image.recurrent, image.recurrent_bytes);
         }
-        if (image.hidden_bytes != 0) {
+        if (image.hidden_bytes != 0 && image.hidden != nullptr) {
             std::memcpy(head.hidden->data(), image.hidden, image.hidden_bytes);
         }
-        if (image.dflash_bytes != 0) {
+        if (image.dflash_bytes != 0 && image.dflash != nullptr) {
             std::memcpy(head.dflash->data(), image.dflash, image.dflash_bytes);
         }
+        heads.push_back(std::move(head));
+    }
+    clear_context_checkpoints(sequence);
+    sequence.context_checkpoints = std::move(heads);
+}
+
+void ProgramImplCore::install_disk_context_checkpoints(
+    SequenceState& sequence, qwen3_6::detail::DiskRestoredHost&& host) {
+    std::vector<ContextCheckpointHead> heads;
+    heads.reserve(host.ladder_images.size());
+    for (qwen3_6::detail::DiskLadderImage& image : host.ladder_images) {
+        if (image.hidden && sequence.tail_hidden.bytes() != 0 &&
+            image.hidden->size() != sequence.tail_hidden.bytes()) {
+            continue;
+        }
+        if (image.conv && sequence.tail_hidden.bytes() != 0 && !image.hidden) { continue; }
+        ContextCheckpointHead head;
+        head.frontier  = image.frontier;
+        head.hash      = image.hash;
+        head.kind      = image.kind;
+        head.conv      = std::move(image.conv);
+        head.recurrent = std::move(image.recurrent);
+        head.hidden    = std::move(image.hidden);
+        head.dflash    = std::move(image.dflash);
         heads.push_back(std::move(head));
     }
     clear_context_checkpoints(sequence);
@@ -1611,6 +1733,10 @@ void ProgramImplCore::restore_context_checkpoint_state(SequenceState& sequence,
     if (head == sequence.context_checkpoints.end()) {
         throw std::logic_error("context checkpoint head is missing at restore");
     }
+    if (sequence.disk_unpacked_context_base == base &&
+        sequence.disk_unpacked_context_hash == head->hash) {
+        return;
+    }
     const std::int32_t current =
         LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
     if (qwen3_6::detail::restore_may_d2d_staging(
@@ -1633,7 +1759,13 @@ void ProgramImplCore::restore_context_checkpoint_state(SequenceState& sequence,
     }
     decoder->linear_attention.unpack_slot_from_host(current, head->conv->data(),
                                                     head->recurrent->data(), device.stream);
+    if (sequence.tail_hidden.bytes() != 0 && !head->hidden) {
+        throw std::logic_error("context checkpoint hidden image is incomplete");
+    }
     if (head->hidden) {
+        if (head->hidden->size() != sequence.tail_hidden.bytes()) {
+            throw std::logic_error("context checkpoint hidden geometry mismatch");
+        }
         CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, head->hidden->data(),
                                    sequence.tail_hidden.bytes(), cudaMemcpyHostToDevice,
                                    device.stream));
@@ -1690,7 +1822,6 @@ void ProgramImplCore::maybe_capture_turn_rollback(SequenceState& sequence, Reque
     head.frontier = base;
     head.hash     = hash;
     head.kind     = qwen3_6::detail::ContextCheckpointKind::TurnRollback;
-
     fence_staging_copies();
     unoccupy_staging();
     const std::int32_t current =
@@ -1906,6 +2037,7 @@ void ProgramImplCore::restore_ram_entry(std::uint32_t lane, std::uint64_t entry_
         };
         sequence.ledger          = std::move(host.ledger);
         sequence.prefix_identity = std::move(host.identity);
+        sequence.disk_entry_id   = host.disk_entry_id;
         sequence.mtp_draft_count = 0;
         sequence.retained        = true;
         install_ram_context_checkpoints(sequence, host);
@@ -1931,7 +2063,14 @@ void ProgramImplCore::restore_ram_entry(std::uint32_t lane, std::uint64_t entry_
 
 void ProgramImplCore::claim_ram_entry(std::uint64_t entry_id) {
     if (!kv_ram_cache_) { throw std::logic_error("RAM claim requires an enabled RAM tier"); }
-    kv_ram_cache_->claim(entry_id);
+    if (kv_disk_cache_) { kv_disk_cache_->begin_ram_idle_exclusion(entry_id); }
+    try {
+        kv_ram_cache_->claim(entry_id);
+    } catch (...) {
+        if (kv_disk_cache_) { kv_disk_cache_->end_ram_idle_exclusion(entry_id); }
+        throw;
+    }
+    if (kv_disk_cache_) { kv_disk_cache_->end_ram_idle_exclusion(entry_id); }
 }
 
 void ProgramImplCore::release_ram_entry(std::uint64_t entry_id) {
@@ -1942,6 +2081,7 @@ void ProgramImplCore::release_ram_entry(std::uint64_t entry_id) {
 void ProgramImplCore::consume_ram_entry(std::uint64_t entry_id) {
     if (!kv_ram_cache_) { throw std::logic_error("RAM consume requires an enabled RAM tier"); }
     kv_ram_cache_->consume(entry_id);
+    if (kv_disk_cache_) { kv_disk_cache_->forget_ram_resident(entry_id); }
 }
 
 qwen3_6::detail::KvRamSnapshot ProgramImplCore::kv_ram_snapshot() const noexcept {
@@ -1953,22 +2093,332 @@ qwen3_6::detail::KvRamCopySeconds ProgramImplCore::harvest_kv_ram_copy_seconds()
                          : qwen3_6::detail::KvRamCopySeconds{};
 }
 
+namespace {
+
+void disk_reuse_pages(SpeculativeBackend backend, bool growing_backend, std::uint32_t reuse_base,
+                      std::uint32_t& text_pages, std::uint32_t& backend_pages) {
+    text_pages = ninfer::pages_for_tokens(reuse_base);
+    backend_pages = 0;
+    if (!growing_backend) { return; }
+    if (backend == SpeculativeBackend::Mtp) {
+        backend_pages =
+            ninfer::pages_for_tokens(reuse_base == 0 ? 0U : reuse_base - 1U);
+    } else if (backend == SpeculativeBackend::DFlash) {
+        backend_pages = ninfer::pages_for_tokens(reuse_base);
+    }
+}
+
+} // namespace
+
+void ProgramImplCore::restore_disk_entry(std::uint32_t lane, std::uint64_t entry_id,
+                                         const RequestPlan& plan) {
+    if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    if (!kv_disk_cache_) { throw std::logic_error("disk restore requires an enabled disk tier"); }
+    if (plan.impl_ == nullptr) { throw std::invalid_argument("request plan is empty"); }
+    const RequestPlanImpl& request_plan = *plan.impl_;
+    if (request_plan.reuse == ReusePath::FullReset || request_plan.disk_entry_id != entry_id ||
+        request_plan.reuse_source != PrefixReuseSource::HostDisk || request_plan.reuse_base == 0) {
+        throw std::logic_error("disk restore requires a winning host-disk reuse plan");
+    }
+    SequenceState& sequence = sequences[lane];
+    RequestControl& request = requests[lane];
+    if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
+        request.lifecycle == Lifecycle::Pending) {
+        throw std::logic_error("disk restore requires a free request lane");
+    }
+    try {
+        if (has_retained_lane(lane)) {
+            throw std::logic_error(
+                "disk restore requires an empty lane; copy-hold must evict after D2H");
+        }
+        sequence.kv.reset();
+        sequence.retained           = false;
+        sequence.mtp_draft_count    = 0;
+        sequence.rewrite_checkpoint = {};
+
+        device.order_copy_after_compute();
+        reserve_sequence_kv(sequence, request_plan.text_kv_page_entitlement,
+                            request_plan.backend_kv_page_entitlement);
+        std::uint32_t text_pages    = 0;
+        std::uint32_t backend_pages = 0;
+        disk_reuse_pages(speculative_backend, sequence.kv->backend.has_value(),
+                         request_plan.reuse_base, text_pages, backend_pages);
+        sequence.kv->text.materialize_pages(text_pages, device.copy_stream);
+        if (sequence.kv->backend) {
+            sequence.kv->backend->materialize_pages(backend_pages, device.copy_stream);
+        }
+
+        qwen3_6::detail::DiskRestoreTarget target;
+        target.text_dst_pages    = text_pages;
+        target.backend_dst_pages = backend_pages;
+        target.text              = &sequence.kv->text;
+        target.text_pool         = &decoder->text_kv.pool();
+        if (sequence.kv->backend) {
+            target.backend      = &*sequence.kv->backend;
+            target.backend_pool = &backend_kv_cache()->pool();
+        }
+        target.gdn                 = &decoder->linear_attention;
+        target.gdn_current_slot    = LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
+        target.gdn_checkpoint_slot =
+            LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency);
+        target.tail_hidden               = &sequence.tail_hidden;
+        target.rewrite_checkpoint_hidden = &sequence.rewrite_checkpoint_hidden;
+        target.reuse                     = request_plan.reuse;
+        target.reuse_base                = request_plan.reuse_base;
+        if (dflash) {
+            target.dflash_local      = &dflash->local;
+            target.dflash_checkpoint = &dflash->rewrite_checkpoint_local;
+            target.dflash_lane       = static_cast<std::int32_t>(sequence.lane);
+        }
+        target.stream = device.copy_stream;
+
+        std::optional<qwen3_6::detail::DiskRestoredHost> loaded =
+            kv_disk_cache_->load_host(entry_id);
+        if (!loaded) {
+            throw std::runtime_error("KV disk restore lost its claimed entry");
+        }
+        qwen3_6::detail::DiskRestoredHost host = std::move(*loaded);
+        pending_disk_restore_ticket_ = kv_disk_cache_->restore_device(entry_id, target);
+        pending_disk_checkpoint_lane_ = lane;
+        sequence.execution_frontier      = host.execution_frontier;
+        sequence.ledger_frontier         = host.ledger_frontier;
+        sequence.rope_delta              = host.rope_delta;
+        sequence.text_kv_valid           = host.text_kv_valid;
+        sequence.mtp_kv_valid            = host.mtp_kv_valid;
+        sequence.dflash_context_frontier = host.dflash_context_frontier;
+        sequence.tail_hidden_valid       = host.tail_hidden_valid;
+        sequence.rewrite_checkpoint      = RewriteCheckpoint{
+            .valid    = host.rewrite_valid,
+            .kind     = host.rewrite_kind,
+            .frontier = host.rewrite_frontier,
+        };
+        sequence.ledger          = std::move(host.ledger);
+        sequence.prefix_identity = std::move(host.identity);
+        sequence.disk_entry_id   = entry_id;
+        sequence.mtp_draft_count = 0;
+        sequence.retained        = true;
+        if (qwen3_6::detail::is_staged_checkpoint_restore(request_plan.reuse)) {
+            sequence.disk_unpacked_context_base = request_plan.reuse_base;
+            sequence.disk_unpacked_context_hash = qwen3_6::detail::prefix_hash_at(
+                sequence.ledger, sequence.prefix_identity, request_plan.reuse_base);
+            sequence.tail_hidden_valid = true;
+            if (speculative_backend == SpeculativeBackend::DFlash) {
+                sequence.dflash_context_frontier = request_plan.reuse_base;
+            }
+            if (qwen3_6::detail::occupy_drops_rewrite_ahead_of_restore(
+                    request_plan.reuse, sequence.rewrite_checkpoint.valid,
+                    sequence.rewrite_checkpoint.frontier, request_plan.reuse_base)) {
+                sequence.rewrite_checkpoint = {};
+            }
+        }
+    } catch (...) {
+        pending_disk_checkpoint_lane_.reset();
+        try {
+            device.synchronize_all();
+        } catch (...) {}
+        if (kv_disk_cache_) { kv_disk_cache_->cancel_restore(); }
+        clear_lane(sequence, request);
+        throw;
+    }
+}
+
+bool ProgramImplCore::claim_disk_entry(std::uint64_t entry_id, std::uint32_t expected_frontier,
+                                       std::uint64_t hash_lo, std::uint64_t hash_hi,
+                                       std::uint32_t expected_reuse_base,
+                                       PrefixReusePath expected_reuse) {
+    if (!kv_disk_cache_) { throw std::logic_error("disk claim requires an enabled disk tier"); }
+    qwen3_6::detail::PrefixHash128 hash;
+    hash.lo = hash_lo;
+    hash.hi = hash_hi;
+    return kv_disk_cache_->claim(entry_id, hash, expected_frontier, expected_reuse_base,
+                                  expected_reuse);
+}
+
+void ProgramImplCore::release_disk_entry(std::uint64_t entry_id) {
+    if (!kv_disk_cache_) { throw std::logic_error("disk release requires an enabled disk tier"); }
+    kv_disk_cache_->release(entry_id);
+}
+
+void ProgramImplCore::consume_disk_entry(std::uint64_t entry_id) {
+    if (!kv_disk_cache_) { throw std::logic_error("disk consume requires an enabled disk tier"); }
+    kv_disk_cache_->consume(entry_id);
+}
+
+void ProgramImplCore::prefetch_disk_window(std::uint64_t entry_id, std::uint32_t text_pages,
+                                           std::uint32_t backend_pages) {
+    if (!kv_disk_cache_) { return; }
+    kv_disk_cache_->prefetch_window(entry_id, text_pages, backend_pages);
+}
+
+void ProgramImplCore::prefetch_disk_plan(std::uint64_t entry_id, const RequestPlan& plan) {
+    if (!kv_disk_cache_ || plan.impl_ == nullptr) { return; }
+    std::uint32_t text_pages    = 0;
+    std::uint32_t backend_pages = 0;
+    disk_reuse_pages(speculative_backend, backend_kv_cache() != nullptr, plan.impl_->reuse_base,
+                     text_pages, backend_pages);
+    if (text_pages > 2) {
+        text_pages    = 2;
+        backend_pages = 0;
+    } else if (text_pages + backend_pages > 2) {
+        backend_pages = 2 - text_pages;
+    }
+    prefetch_disk_window(entry_id, text_pages, backend_pages);
+}
+
+void ProgramImplCore::pump_disk_restore() {
+    if (kv_disk_cache_) { kv_disk_cache_->pump_restore(device.copy_stream); }
+}
+
+void ProgramImplCore::cancel_disk_restore() {
+    if (!kv_disk_cache_) { return; }
+    const std::uint64_t ticket = pending_disk_restore_ticket_;
+    kv_disk_cache_->cancel_restore();
+    if (ticket != 0) { kv_disk_cache_->release_restore_ticket(ticket); }
+    pending_disk_restore_ticket_ = 0;
+    pending_disk_checkpoint_lane_.reset();
+}
+
+void ProgramImplCore::discard_ram_capture(std::uint64_t ram_id) {
+    if (ram_id == 0 || !kv_ram_cache_) { return; }
+    if (kv_disk_cache_) { kv_disk_cache_->begin_ram_idle_exclusion(ram_id); }
+    bool evicted = false;
+    try {
+        evicted = kv_ram_cache_->evict_one_unpinned(ram_id);
+    } catch (...) {
+        if (kv_disk_cache_) { kv_disk_cache_->end_ram_idle_exclusion(ram_id); }
+        throw;
+    }
+    if (evicted && kv_disk_cache_) { kv_disk_cache_->forget_ram_resident(ram_id); }
+    if (kv_disk_cache_) { kv_disk_cache_->end_ram_idle_exclusion(ram_id); }
+}
+
+void ProgramImplCore::shutdown_kv_tiers(LoadProgress progress) {
+    if (kv_tiers_shutdown_) { return; }
+    kv_tiers_shutdown_ = true;
+    auto report = [&](std::string_view phase, std::uint64_t done, std::uint64_t total) {
+        if (!progress.callback) { return; }
+        try {
+            progress.callback(phase, done, total);
+        } catch (...) {}
+    };
+    const bool report_disk = kv_disk_cache_.has_value() && static_cast<bool>(progress.callback);
+    if (kv_disk_cache_) { kv_disk_cache_->cancel_restore(); }
+    if (kv_disk_cache_) { kv_disk_cache_->cancel_idle_spill(); }
+    std::vector<std::uint32_t> failed_lanes;
+    std::uint64_t retained = 0;
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        if (has_retained_lane(lane)) { ++retained; }
+    }
+    if (report_disk) { report("kv-disk copy active chats", 0, retained); }
+    std::uint64_t captured = 0;
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        if (!has_retained_lane(lane)) { continue; }
+        if (!capture_retained_lane(lane)) { failed_lanes.push_back(lane); }
+        ++captured;
+        if (report_disk) { report("kv-disk copy active chats", captured, retained); }
+    }
+    wait_kv_ram_copies();
+    auto spill_progress =
+        report_disk ? std::function<void(std::uint64_t, std::uint64_t)>(
+                          [&](std::uint64_t done, std::uint64_t total) {
+                              report("kv-disk save cache entries", done, total);
+                          })
+                    : std::function<void(std::uint64_t, std::uint64_t)>{};
+    if (kv_disk_cache_) { kv_disk_cache_->flush_not_durable_ram(spill_progress); }
+    for (std::uint32_t lane : failed_lanes) {
+        if (has_retained_lane(lane)) { (void)capture_retained_lane(lane); }
+    }
+    wait_kv_ram_copies();
+    if (kv_disk_cache_) {
+        kv_disk_cache_->flush_not_durable_ram(spill_progress);
+        if (report_disk) { report("kv-disk finish disk writes", 0, 1); }
+        kv_disk_cache_->wait_idle_and_fsync();
+        if (report_disk) { report("kv-disk finish disk writes", 1, 1); }
+    }
+}
+
+void ProgramImplCore::request_idle_spill() {
+    if (kv_disk_cache_) { kv_disk_cache_->request_idle_spill(); }
+}
+
+qwen3_6::detail::KvDiskSnapshot ProgramImplCore::kv_disk_snapshot() const noexcept {
+    return kv_disk_cache_ ? kv_disk_cache_->snapshot() : qwen3_6::detail::KvDiskSnapshot{};
+}
+
+qwen3_6::detail::KvDiskCopySeconds ProgramImplCore::harvest_kv_disk_copy_seconds() {
+    return kv_disk_cache_ ? kv_disk_cache_->harvest_copy_seconds()
+                          : qwen3_6::detail::KvDiskCopySeconds{};
+}
+
 bool ProgramImplCore::kv_ram_copies_ready() const {
     return !kv_ram_cache_ || kv_ram_cache_->pending_copies_ready();
 }
 
+bool ProgramImplCore::kv_disk_copies_ready() const {
+    return !kv_disk_cache_ || kv_disk_cache_->copies_ready();
+}
+
+bool ProgramImplCore::kv_disk_restore_failed() const {
+    return kv_disk_cache_ && kv_disk_cache_->restore_failed();
+}
+
+bool ProgramImplCore::kv_copies_ready() const {
+    return kv_ram_copies_ready() && kv_disk_copies_ready();
+}
+
 void ProgramImplCore::wait_kv_ram_copies_on_compute() {
     if (kv_ram_cache_) { kv_ram_cache_->wait_pending_copies_on_stream(device.stream); }
+    if (kv_disk_cache_) {
+        kv_disk_cache_->wait_copies_on_stream(device.stream, pending_disk_restore_ticket_);
+        if (pending_disk_restore_ticket_ != 0) {
+            kv_disk_cache_->release_restore_ticket(pending_disk_restore_ticket_);
+            pending_disk_restore_ticket_ = 0;
+        }
+    }
 }
 
 void ProgramImplCore::wait_kv_ram_copies() {
     if (kv_ram_cache_) { kv_ram_cache_->wait_pending_copies(); }
 }
 
+void ProgramImplCore::wait_kv_disk_copies() {
+    try {
+        if (kv_disk_cache_) { kv_disk_cache_->wait_copies(pending_disk_restore_ticket_); }
+    } catch (...) {
+        pending_disk_checkpoint_lane_.reset();
+        if (pending_disk_restore_ticket_ != 0 && kv_disk_cache_) {
+            kv_disk_cache_->release_restore_ticket(pending_disk_restore_ticket_);
+            pending_disk_restore_ticket_ = 0;
+        }
+        if (kv_disk_cache_ && kv_disk_cache_->restore_failed()) {
+            throw ninfer::RequestError(ninfer::RequestErrorKind::Unavailable,
+                                      "KV disk restore failed");
+        }
+        throw;
+    }
+    install_pending_disk_restore_checkpoints();
+}
+
+void ProgramImplCore::install_pending_disk_restore_checkpoints() {
+    if (!pending_disk_checkpoint_lane_ || !kv_disk_cache_) { return; }
+    const std::uint32_t lane = *pending_disk_checkpoint_lane_;
+    pending_disk_checkpoint_lane_.reset();
+    qwen3_6::detail::DiskRestoredHost host = kv_disk_cache_->take_restore_checkpoints();
+    install_disk_context_checkpoints(sequences[lane], std::move(host));
+}
+
+std::uint64_t ProgramImplCore::pending_disk_restore_ticket() const noexcept {
+    return pending_disk_restore_ticket_;
+}
+
 void ProgramImplCore::synchronize_all() { device.synchronize_all(); }
 
 std::uint64_t ProgramImplCore::kv_ram_index_version() const noexcept {
     return kv_ram_cache_ ? kv_ram_cache_->index_version() : 0;
+}
+
+std::uint64_t ProgramImplCore::kv_disk_index_version() const noexcept {
+    return kv_disk_cache_ ? kv_disk_cache_->index_version() : 0;
 }
 
 GenerationTimings ProgramImplCore::generation_timings_lane(std::uint32_t lane) const noexcept {
@@ -2005,7 +2455,10 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.tail_hidden_valid       = false;
     sequence.retained                = false;
     sequence.use_tick                = 0;
+    sequence.disk_entry_id           = 0;
     sequence.rewrite_checkpoint      = {};
+    sequence.disk_unpacked_context_base = 0;
+    sequence.disk_unpacked_context_hash = {};
     clear_context_checkpoints(sequence);
     request.pending                  = {};
     request.adaptive                 = {};
@@ -3665,6 +4118,11 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.kv_ram_capacity_bytes = ram.capacity_bytes;
     out.kv_ram_used_bytes     = ram.used_bytes;
     out.kv_ram_entry_count    = ram.entry_count;
+    const qwen3_6::detail::KvDiskSnapshot disk =
+        kv_disk_cache_ ? kv_disk_cache_->snapshot() : qwen3_6::detail::KvDiskSnapshot{};
+    out.kv_disk_capacity_bytes = disk.capacity_bytes;
+    out.kv_disk_used_bytes     = disk.used_bytes;
+    out.kv_disk_entry_count    = disk.entry_count;
     return out;
 }
 

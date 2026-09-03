@@ -53,6 +53,8 @@ void validate_options(const EngineOptions& options) {
     if (options.max_pending_requests == 0 || options.pending_timeout_ms == 0) {
         throw std::invalid_argument("Engine pending request capacity and timeout must be nonzero");
     }
+    validate_kv_disk_options(options.kv_ram_capacity_bytes, options.kv_disk_capacity_bytes,
+                             options.kv_disk_location);
 }
 
 artifact::LoadProgress artifact_progress(const LoadProgress& progress) {
@@ -87,9 +89,13 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     const auto weights_profile                    = Target::resolve_weights(identity);
     const ModelSamplingDefaults sampling_defaults = Target::sampling_defaults(identity.model_id);
 
+    EngineOptions planned = options;
+    planned.model_id      = identity.model_id;
+    planned.weights_id    = identity.weights_id;
+
     artifact::Binder binder(reader);
-    auto load_plan        = Target::plan_load(binder, options, weights_profile);
-    auto sequence_planner = Target::make_sequence_planner(device, options, weights_profile);
+    auto load_plan        = Target::plan_load(binder, planned, weights_profile);
+    auto sequence_planner = Target::make_sequence_planner(device, planned, weights_profile);
     const runtime::SequenceCapacityCurve curve = sequence_planner.capacity_curve();
     const std::size_t preflight_runtime_bytes =
         runtime_bytes_after_planned_weights(load_plan.materialization().device_capacity_bytes);

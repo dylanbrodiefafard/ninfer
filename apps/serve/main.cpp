@@ -91,7 +91,8 @@ int main(int argc, char** argv) {
                  << " slack=" << format_bytes(memory.planned_slack_bytes)
                  << " graphs=" << format_bytes(memory.cuda_graph_observed_bytes) << '/'
                  << format_bytes(memory.cuda_graph_allowance_bytes)
-                 << " kv-ram=" << ninfer::serve::format_kv_ram_occupancy(memory);
+                 << " kv-ram=" << ninfer::serve::format_kv_ram_occupancy(memory)
+                 << " kv-disk=" << ninfer::serve::format_kv_disk_occupancy(memory);
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, capacity.str());
 
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, "warming up...");
@@ -101,6 +102,11 @@ int main(int argc, char** argv) {
             std::ostringstream ram;
             ram << "kv-ram=" << ninfer::serve::format_kv_ram_occupancy(warmed);
             ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, ram.str());
+        }
+        if (warmed.kv_disk_capacity_bytes != 0) {
+            std::ostringstream disk;
+            disk << "kv-disk=" << ninfer::serve::format_kv_disk_occupancy(warmed);
+            ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, disk.str());
         }
 
         g_server.store(&server);

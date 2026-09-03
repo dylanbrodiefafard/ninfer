@@ -848,8 +848,29 @@ the least-recently-admitted retained bundle, then lowest lane index. Page-reclai
 other free retained lanes uses the same recency order and never captures the selected lane twice.
 The admitted `RequestPlan` is the winner: RAM pass 1 keeps `evict_retained=false` even if the
 target lane is dirty, and restore captures that lane's old bundle. `GenerationResult` uses
-`prefix_reuse_source` for `none` / `vram_resident` / `host_ram`; `prefix_reuse_path` still describes
+`prefix_reuse_source` for `none` / `vram_resident` / `host_ram` / `host_disk`; `prefix_reuse_path` still describes
 only frontier/checkpoint semantics.
+
+`--kv-disk-capacity` adds an inclusive SSD third tier beside the RAM FIFO. Disk is considered in
+both admission passes after the RAM strictly-greater check; equal reuse keeps VRAM then RAM. C=1
+disk restore never enqueues RestoreRead until the VRAM victim is evicted. Orderly shutdown captures
+retained VRAM, flushes not-durable RAM, and fsyncs before aborting occupied lanes. When
+`EngineOptions.load_progress` is set, that callback reports `kv-disk copy active chats`,
+`kv-disk save cache entries`, and `kv-disk finish disk writes` during shutdown.
+
+One restore coordinator and the startup-fixed reader pool own disk restore. A claimed request pins
+its immutable entry and pack generation while readers fill the bounded pinned/page-device window.
+The coordinator may overlap validated page H2D/scatter with later SSD reads and may load independent
+state objects in parallel, but it publishes no partially restored lane. Admit-complete waits for
+the restore state owners and copy-stream event immediately before `start_prefill_lane`; cancellation
+drains those owners and releases the claim without consuming the durable entry.
+
+Disk work has three scheduling classes. Restore reads yield only to an emergency spill needed to
+make the selected admission feasible. Emergency spill excludes all restore payload I/O. Idle spill
+uses separate staging and may duplex with restore, but every page job rechecks its spill epoch and
+RAM residency before capture so eviction/cancellation cannot publish a stale bundle. Commit and
+fsync preserve pack-namespace → map → entry → manifest order. Shutdown promotes unfinished idle
+work as needed, waits for all payload jobs, publishes durable metadata, then synchronizes the store.
 
 ---
 

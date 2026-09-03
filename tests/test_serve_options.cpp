@@ -262,6 +262,15 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--kv-ram-capacity") != std::string::npos,
               "serve help omits --kv-ram-capacity");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--kv-disk-capacity") != std::string::npos,
+              "serve help omits --kv-disk-capacity");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--kv-disk-location") != std::string::npos,
+              "serve help omits --kv-disk-location");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--kv-disk-compress") != std::string::npos,
+              "serve help omits --kv-disk-compress");
     failures += check(serve_usage_text("ninfer-serve").find("pinned host KV prefix-cache capacity in MiB") !=
                           std::string::npos,
                       "serve help omits KV RAM MiB wording");
@@ -308,6 +317,38 @@ int main() {
     reject_ram("", "--kv-ram-capacity empty was accepted");
     reject_ram("auto", "--kv-ram-capacity non-decimal was accepted");
     reject_ram("17592186044416", "--kv-ram-capacity overflow was accepted");
+
+    const ServeOptions disk_off = parse({"ninfer-serve", "model.ninfer"});
+    failures += check(disk_off.kv_disk_capacity_bytes == 0 && disk_off.kv_disk_location.empty() &&
+                          disk_off.kv_disk_compress == ninfer::KvDiskCompress::Off,
+                      "omitted disk flags did not default off");
+    const ServeOptions disk_on =
+        parse({"ninfer-serve", "model.ninfer", "--kv-ram-capacity", "1", "--kv-disk-capacity", "2",
+               "--kv-disk-location", "/tmp/ninfer-kv-disk", "--kv-disk-compress", "zstd"});
+    failures += check(disk_on.kv_disk_capacity_bytes == 2ULL * 1024ULL * 1024ULL &&
+                          disk_on.kv_disk_location == "/tmp/ninfer-kv-disk" &&
+                          disk_on.kv_disk_compress == ninfer::KvDiskCompress::Zstd,
+                      "disk flags did not parse");
+    auto reject_disk = [&](std::vector<std::string> args, const char* message) {
+        bool rejected = false;
+        try {
+            parse(std::move(args));
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, message);
+    };
+    reject_disk({"ninfer-serve", "model.ninfer", "--kv-disk-capacity", "1"},
+                "disk capacity without location was accepted");
+    reject_disk({"ninfer-serve", "model.ninfer", "--kv-disk-location", "/tmp/x"},
+                "disk location without capacity was accepted");
+    reject_disk({"ninfer-serve", "model.ninfer", "--kv-disk-capacity", "1", "--kv-disk-location",
+                 "/tmp/x"},
+                "disk without RAM was accepted");
+    reject_disk({"ninfer-serve", "model.ninfer", "--kv-ram-capacity", "1", "--kv-disk-capacity",
+                 "0"},
+                "--kv-disk-capacity 0 was accepted");
+    reject_disk({"ninfer-serve", "model.ninfer", "--kv-ram-capacity", "1", "--kv-disk-capacity",
+                 "1", "--kv-disk-location", "/tmp/x", "--kv-disk-compress", "lz4"},
+                "unknown --kv-disk-compress was accepted");
 
     const ServeOptions logged = parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl",
                                        "requests.jsonl", "--api-key", "do-not-log"});

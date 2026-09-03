@@ -234,23 +234,32 @@ std::size_t DeviceArena::peak_used() const noexcept { return peak_; }
 
 void DeviceArena::reset_peak() noexcept { peak_ = off_; }
 
-PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
+PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes, std::size_t alignment) {
     if (size_bytes == 0) { throw std::invalid_argument("PinnedHostBuffer size must be nonzero"); }
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
+        throw std::invalid_argument("PinnedHostBuffer alignment must be a power of two");
+    }
+    if (size_bytes > std::numeric_limits<std::size_t>::max() - (alignment - 1)) {
+        throw std::overflow_error("PinnedHostBuffer allocation size overflow");
+    }
 
     void* ptr             = nullptr;
-    const cudaError_t err = cudaMallocHost(&ptr, size_bytes);
+    const cudaError_t err = cudaMallocHost(&ptr, size_bytes + alignment - 1);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMallocHost failed", err));
     }
 
-    data_ = ptr;
+    const auto address = reinterpret_cast<std::uintptr_t>(ptr);
+    allocation_ = ptr;
+    data_ = reinterpret_cast<void*>((address + alignment - 1) & ~(alignment - 1));
     size_ = size_bytes;
 }
 
-PinnedHostBuffer::~PinnedHostBuffer() { free_pinned(data_); }
+PinnedHostBuffer::~PinnedHostBuffer() { free_pinned(allocation_); }
 
 PinnedHostBuffer::PinnedHostBuffer(PinnedHostBuffer&& other) noexcept
-    : data_(other.data_), size_(other.size_) {
+    : allocation_(other.allocation_), data_(other.data_), size_(other.size_) {
+    other.allocation_ = nullptr;
     other.data_ = nullptr;
     other.size_ = 0;
 }
@@ -258,10 +267,12 @@ PinnedHostBuffer::PinnedHostBuffer(PinnedHostBuffer&& other) noexcept
 PinnedHostBuffer& PinnedHostBuffer::operator=(PinnedHostBuffer&& other) noexcept {
     if (this == &other) { return *this; }
 
-    free_pinned(data_);
+    free_pinned(allocation_);
+    allocation_ = other.allocation_;
     data_ = other.data_;
     size_ = other.size_;
 
+    other.allocation_ = nullptr;
     other.data_ = nullptr;
     other.size_ = 0;
     return *this;

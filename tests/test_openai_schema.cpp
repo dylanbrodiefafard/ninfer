@@ -620,6 +620,13 @@ int test_response_serialization() {
     failures += check(ptd.at("cached_tokens") == 0, "ptd cached_tokens zero on cache miss");
     failures += check(ninfer_ptd.at("ttft_ms") == 358.025, "ttft_ms rounded to three decimals");
     failures += check(ninfer_ptd.at("reuse_source") == "host_ram", "reuse_source host_ram");
+    timings.prefix_reuse_source = ninfer::PrefixReuseSource::HostDisk;
+    const Json disk_source = Json::parse(
+        make_chat_completion_response("id-1d", "m", 111, "hello world", "", "stop", usage, &timings));
+    failures += check(disk_source.at("usage").at("prompt_tokens_details").at("ninfer").at("reuse_source") ==
+                          "host_disk",
+                      "reuse_source host_disk");
+    timings.prefix_reuse_source = ninfer::PrefixReuseSource::HostRam;
     failures += check(ninfer_ptd.at("prefix_reuse_path") == "full_reset",
                       "prefix_reuse_path defaults to full_reset");
     failures += check(ninfer_ptd.at("prefill").at("ms") == 250.0, "prefill ms");
@@ -643,6 +650,30 @@ int test_response_serialization() {
     failures += check(kv_ram.at("lifetime").at("evictions") == 0, "kv_ram lifetime evictions");
     failures += check(kv_ram.at("lifetime").at("drops") == 1, "kv_ram lifetime drops");
     failures += check(!kv_ram.contains("capacity_bytes"), "kv_ram serializes pin capacity");
+    timings.kv_disk_capacity_bytes = 2097152;
+    timings.kv_disk_used_bytes     = 1048576;
+    timings.kv_disk_entry_count    = 2;
+    timings.kv_disk_captures       = 5;
+    timings.kv_disk_restores       = 3;
+    timings.kv_disk_evictions      = 1;
+    timings.kv_disk_drops          = 0;
+    timings.kv_disk_save_ms        = 5.0;
+    timings.kv_disk_load_ms        = 9.0;
+    timings.kv_disk_h2d_ms         = 12.0;
+    const Json disk_usage = Json::parse(
+        make_chat_completion_response("id-1k", "m", 111, "hello world", "", "stop", usage, &timings));
+    const Json& kv_disk =
+        disk_usage.at("usage").at("prompt_tokens_details").at("ninfer").at("kv_disk");
+    failures += check(kv_disk.at("used_bytes") == 1048576, "kv_disk used_bytes gauge");
+    failures += check(kv_disk.at("load_ms") == 9.0, "kv_disk per-request load_ms");
+    failures += check(kv_disk.at("h2d_ms") == 12.0, "kv_disk per-request h2d_ms");
+    timings.kv_disk_h2d_ms = 0.0;
+    const Json disk_zero = Json::parse(
+        make_chat_completion_response("id-1kz", "m", 111, "hello world", "", "stop", usage, &timings));
+    failures += check(disk_zero.at("usage").at("prompt_tokens_details").at("ninfer").at("kv_disk").at(
+                          "h2d_ms") == 0.0,
+                      "kv_disk emits zero h2d_ms by default");
+    failures += check(kv_disk.at("lifetime").at("restores") == 3, "kv_disk lifetime restores");
 
     // completion_tokens_details carries only OpenAI-standard keys.
     const Json& ctd = usage_t.at("completion_tokens_details");

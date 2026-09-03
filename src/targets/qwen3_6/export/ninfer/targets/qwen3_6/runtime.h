@@ -4,6 +4,7 @@
 #include "runtime/contract/transient_region.h"
 #include "runtime/contract/types.h"
 #include "targets/qwen3_6/impl/runtime/kv_ram_snapshot.h"
+#include "targets/qwen3_6/impl/runtime/kv_disk_snapshot.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include <cstddef>
@@ -152,6 +153,8 @@ public:
                                                              const RequestBasePlan<Variant>& base);
     [[nodiscard]] RequestPlan<Variant> plan_ram_reuse(const PreparedPrompt& prompt,
                                                       const RequestBasePlan<Variant>& base);
+    [[nodiscard]] RequestPlan<Variant> plan_disk_reuse(const PreparedPrompt& prompt,
+                                                       const RequestBasePlan<Variant>& base);
     [[nodiscard]] bool can_admit_lane(std::uint32_t lane,
                                       const RequestPlan<Variant>& plan) const noexcept;
     [[nodiscard]] bool
@@ -183,19 +186,44 @@ public:
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] std::uint64_t retained_use_tick(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
-    [[nodiscard]] bool capture_retained_lane(std::uint32_t lane);
+    [[nodiscard]] bool capture_retained_lane(std::uint32_t lane,
+                                             std::uint64_t* ram_entry_id = nullptr);
     void restore_ram_entry(std::uint32_t lane, std::uint64_t entry_id,
                            const RequestPlan<Variant>& plan);
+    void restore_disk_entry(std::uint32_t lane, std::uint64_t entry_id,
+                            const RequestPlan<Variant>& plan);
     void claim_ram_entry(std::uint64_t entry_id);
     void release_ram_entry(std::uint64_t entry_id);
     void consume_ram_entry(std::uint64_t entry_id);
+    [[nodiscard]] bool claim_disk_entry(std::uint64_t entry_id, std::uint32_t expected_frontier,
+                                        std::uint64_t hash_lo, std::uint64_t hash_hi,
+                                        std::uint32_t expected_reuse_base = 0,
+                                        PrefixReusePath expected_reuse = PrefixReusePath::FullReset);
+    void release_disk_entry(std::uint64_t entry_id);
+    void consume_disk_entry(std::uint64_t entry_id);
+    void prefetch_disk_window(std::uint64_t entry_id, std::uint32_t text_pages,
+                              std::uint32_t backend_pages);
+    void prefetch_disk_plan(std::uint64_t entry_id, const RequestPlan<Variant>& plan);
+    void pump_disk_restore();
+    void cancel_disk_restore();
+    void discard_ram_capture(std::uint64_t ram_id);
+    void shutdown_kv_tiers(LoadProgress progress = {});
+    void request_idle_spill();
     [[nodiscard]] qwen3_6::detail::KvRamSnapshot kv_ram_snapshot() const noexcept;
     qwen3_6::detail::KvRamCopySeconds harvest_kv_ram_copy_seconds();
+    [[nodiscard]] qwen3_6::detail::KvDiskSnapshot kv_disk_snapshot() const noexcept;
+    qwen3_6::detail::KvDiskCopySeconds harvest_kv_disk_copy_seconds();
     [[nodiscard]] bool kv_ram_copies_ready() const;
+    [[nodiscard]] bool kv_disk_copies_ready() const;
+    [[nodiscard]] bool kv_disk_restore_failed() const;
+    [[nodiscard]] bool kv_copies_ready() const;
     void wait_kv_ram_copies_on_compute();
     void wait_kv_ram_copies();
+    void wait_kv_disk_copies();
+    [[nodiscard]] std::uint64_t pending_disk_restore_ticket() const noexcept;
     void synchronize_all();
     [[nodiscard]] std::uint64_t kv_ram_index_version() const noexcept;
+    [[nodiscard]] std::uint64_t kv_disk_index_version() const noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] std::uint32_t

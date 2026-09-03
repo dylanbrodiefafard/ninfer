@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <optional>
 #include <span>
@@ -305,6 +306,26 @@ void test_prefix_identity() {
     ledger.resize(prompt_only.token_ids.size());
     expect(q36::detail::prefix_matches(prompt_only, ledger, resident, ledger.size()),
            "truncated multimodal continuation identity");
+
+    {
+        q36::detail::ResidentPrefixIdentity packed;
+        packed.assign(prompt_only);
+        std::vector<std::uint8_t> blob(packed.packed_bytes());
+        packed.pack(blob.data());
+        q36::detail::ResidentPrefixIdentity restored;
+        restored.unpack(blob.data(), blob.size());
+        expect(q36::detail::prefix_matches(prompt_only, ledger, restored, prompt_only.token_ids.size()),
+               "prefix identity pack/unpack roundtrip");
+        std::vector<std::uint8_t> huge_count(8, 0);
+        const std::uint32_t huge = 0xffffffffu;
+        std::memcpy(huge_count.data(), &huge, 4);
+        bool threw = false;
+        try {
+            q36::detail::ResidentPrefixIdentity poisoned;
+            poisoned.unpack(huge_count.data(), huge_count.size());
+        } catch (...) { threw = true; }
+        expect(threw, "prefix identity unpack rejects a huge token count in a tiny buffer");
+    }
 }
 
 void test_prefix_hash_and_dflash_gate() {

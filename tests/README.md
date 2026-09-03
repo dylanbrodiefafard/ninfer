@@ -134,8 +134,8 @@ artifact. The 35B-A3B reference binding test follows the same rule with
 `NINFER_QWEN3_6_35B_A3B_ARTIFACT` and `out/qwen3_6_35b_a3b.ninfer`. The remaining Python
 target tests still run without either artifact.
 
-The C++ prefix/MTP and RAM-tier integration tests are separately opt-in because they load a full
-artifact and run the real Engine. Point `NINFER_QWEN3_6_27B_WEIGHTS` and/or
+The C++ prefix/MTP, RAM-tier, and three-tier disk integration tests are separately opt-in because
+they load a full artifact and run the real Engine. Point `NINFER_QWEN3_6_27B_WEIGHTS` and/or
 `NINFER_QWEN3_6_27B_NVFP4_WEIGHTS` at any Engine-loadable 27B-family `.ninfer` of that weight
 profile; the artifact identity selects the target. Qwen3.6-27B and Qwen3.8-27B both work, so
 `NINFER_QWEN3_6_27B_NVFP4_WEIGHTS` may be `out/qwen3_6_27b_nvfp4.ninfer` or
@@ -152,8 +152,12 @@ older dirty lane, C=2 FullReset covering the oldest dirty lane and RAM restore c
 lane, exclusive
 FIFO occupancy (RAM hit drops the restored chat from `used`/`entries`; later spill recaptures it),
 one-entry spill drop of a dirty-lane occupant, Engine teardown after a RAM restore,
-and the C=3 shared-pool analog (three 3-page chats, two 4-page continuations plus RAM suffix restore of the third, 2-page fits-now backfill, blocked 4-page tail, exact vs suffix reuse). `ninfer_admission_policy_test` locks the same 10-page leftover-2 / leftover-0 / no-lane arithmetic. `ninfer_kv_ram_cache_perf_test` and
-`ninfer_kv_ram_cache_opt_test` check host pack/unpack bandwidth against pinned memcpy, event
+and the C=3 shared-pool analog (three 3-page chats, two 4-page continuations plus RAM suffix restore of the third, 2-page fits-now backfill, blocked 4-page tail, exact vs suffix reuse). `ninfer_qwen3_6_27b_disk_real_test` covers the SSD third tier on a real Engine: disk-without-RAM construction, restart `HostDisk`, inclusive disk after RAM consume, equal-length VRAM then RAM then disk, longer disk over shorter VRAM, suffix prefill after disk restore, C=1 dirty-lane and RAM-full disk hits, C=2 empty-lane and dirty-only disk hits, C=3 overlapping empty lanes, empty-lane disk vs two VRAM continues, triple overlapping `HostDisk` covering three dirty lanes, disk restore plus two MRU VRAM continues, duplicate disk submit, queued disk matcher behind a full batch, cancel-during-disk-restore, suffix disk with occupants, two HostDisk plus one MRU VRAM continue, disk admit after two in-flight VRAM continues, greedy vs DFlash directory fingerprint, and DFlash2 disk restore. `ninfer_admission_policy_test` locks the same 10-page leftover-2 / leftover-0 / no-lane arithmetic.
+`ninfer_kv_ram_cache_perf_test` checks host pack/unpack bandwidth against pinned memcpy.
+`ninfer_kv_disk_cache_perf_test` spills and restores a ~90 MiB 64-plane INT8 page image on the
+repository `out/` NVMe (override with `NINFER_KV_DISK_PERF_DIR`), against a 40 MB/s floor and
+buffered plus `O_DIRECT` sequential POSIX write/read baselines.
+`ninfer_kv_ram_cache_opt_test` checks event
 overlapped restore, fragmented vs contiguous PageMajor runs, and GDN/hidden RAM round-trips.
 `ninfer_kv_ram_cache_test` includes `test_copy_compute_stream_overlap`: a 32 MiB hidden D2H/H2D
 on `copy_stream` must still be in flight after a compute-only `cudaEventSynchronize` on
@@ -169,6 +173,10 @@ NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_6_27b.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_prefix_real_test --output-on-failure
 NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=/path/to/qwen3_8_27b_nvfp4.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_ram_real_test --output-on-failure
+NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=/path/to/qwen3_8_27b_nvfp4.ninfer \
+  ctest --test-dir build -R ninfer_qwen3_6_27b_disk_real_test --output-on-failure
+NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS=/path/to/qwen3_8_27b_nvfp4_dflash.ninfer \
+  ctest --test-dir build -R ninfer_qwen3_6_27b_disk_real_test --output-on-failure
 NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=/path/to/qwen3_8_27b_nvfp4.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_context_checkpoint_real_test --output-on-failure
 NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS=$PWD/out/qwen3_8_27b_nvfp4_dflash_w8.ninfer \

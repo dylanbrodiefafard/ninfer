@@ -74,6 +74,16 @@ CompletionTimings completion_timings_from_outcome(const GenerationOutcome& outco
     timings.kv_ram_drops          = outcome.metrics.kv_ram_drops;
     timings.kv_ram_save_ms        = outcome.metrics.kv_ram_save_seconds * 1000.0;
     timings.kv_ram_load_ms        = outcome.metrics.kv_ram_load_seconds * 1000.0;
+    timings.kv_disk_capacity_bytes = outcome.metrics.kv_disk_capacity_bytes;
+    timings.kv_disk_used_bytes     = outcome.metrics.kv_disk_used_bytes;
+    timings.kv_disk_entry_count    = outcome.metrics.kv_disk_entry_count;
+    timings.kv_disk_captures       = outcome.metrics.kv_disk_captures;
+    timings.kv_disk_restores       = outcome.metrics.kv_disk_restores;
+    timings.kv_disk_evictions      = outcome.metrics.kv_disk_evictions;
+    timings.kv_disk_drops          = outcome.metrics.kv_disk_drops;
+    timings.kv_disk_save_ms        = outcome.metrics.kv_disk_save_seconds * 1000.0;
+    timings.kv_disk_load_ms        = outcome.metrics.kv_disk_load_seconds * 1000.0;
+    timings.kv_disk_h2d_ms         = outcome.metrics.kv_disk_h2d_seconds * 1000.0;
     return timings;
 }
 
@@ -115,6 +125,8 @@ ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
         .scheduler         = current,
         .kv_ram_save_seconds = current.kv_ram_save_seconds - previous.kv_ram_save_seconds,
         .kv_ram_load_seconds = current.kv_ram_load_seconds - previous.kv_ram_load_seconds,
+        .kv_disk_save_seconds = current.kv_disk_save_seconds - previous.kv_disk_save_seconds,
+        .kv_disk_load_seconds = current.kv_disk_load_seconds - previous.kv_disk_load_seconds,
     };
 }
 
@@ -128,7 +140,14 @@ bool report_has_activity(const ThroughputReport& report, const ninfer::RuntimeSt
            report.scheduler.kv_ram_drops != previous.kv_ram_drops ||
            report.kv_ram_save_seconds != 0.0 || report.kv_ram_load_seconds != 0.0 ||
            report.kv_ram_used_bytes != previous.kv_ram_used_bytes ||
-           report.kv_ram_entry_count != previous.kv_ram_entry_count;
+           report.kv_ram_entry_count != previous.kv_ram_entry_count ||
+           report.scheduler.kv_disk_captures != previous.kv_disk_captures ||
+           report.scheduler.kv_disk_restores != previous.kv_disk_restores ||
+           report.scheduler.kv_disk_evictions != previous.kv_disk_evictions ||
+           report.scheduler.kv_disk_drops != previous.kv_disk_drops ||
+           report.kv_disk_save_seconds != 0.0 || report.kv_disk_load_seconds != 0.0 ||
+           report.kv_disk_used_bytes != previous.kv_disk_used_bytes ||
+           report.kv_disk_entry_count != previous.kv_disk_entry_count;
 }
 
 std::string_view unstreamed_content(const GenerationOutcome& outcome) {
@@ -223,6 +242,9 @@ void HttpServer::run_stats_reporter() {
         report.kv_ram_capacity_bytes = current.kv_ram_capacity_bytes;
         report.kv_ram_used_bytes     = current.kv_ram_used_bytes;
         report.kv_ram_entry_count    = current.kv_ram_entry_count;
+        report.kv_disk_capacity_bytes = current.kv_disk_capacity_bytes;
+        report.kv_disk_used_bytes     = current.kv_disk_used_bytes;
+        report.kv_disk_entry_count    = current.kv_disk_entry_count;
         if (report_has_activity(report, previous)) {
             log_throughput(report);
         }
@@ -237,6 +259,9 @@ void HttpServer::run_stats_reporter() {
     tail.kv_ram_capacity_bytes = current.kv_ram_capacity_bytes;
     tail.kv_ram_used_bytes     = current.kv_ram_used_bytes;
     tail.kv_ram_entry_count    = current.kv_ram_entry_count;
+    tail.kv_disk_capacity_bytes = current.kv_disk_capacity_bytes;
+    tail.kv_disk_used_bytes     = current.kv_disk_used_bytes;
+    tail.kv_disk_entry_count    = current.kv_disk_entry_count;
     if (tail.computed_prefill_tokens != 0 || tail.committed_decode_tokens != 0 ||
         tail.decode_rounds != 0) {
         log_throughput(tail);

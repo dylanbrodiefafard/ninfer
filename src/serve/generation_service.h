@@ -55,6 +55,16 @@ struct GenerationMetrics {
     std::uint64_t kv_ram_drops        = 0;
     double kv_ram_save_seconds        = 0;
     double kv_ram_load_seconds        = 0;
+    std::size_t kv_disk_capacity_bytes = 0;
+    std::size_t kv_disk_used_bytes     = 0;
+    std::size_t kv_disk_entry_count    = 0;
+    std::uint64_t kv_disk_captures     = 0;
+    std::uint64_t kv_disk_restores     = 0;
+    std::uint64_t kv_disk_evictions    = 0;
+    std::uint64_t kv_disk_drops        = 0;
+    double kv_disk_save_seconds        = 0;
+    double kv_disk_load_seconds        = 0;
+    double kv_disk_h2d_seconds         = 0;
 };
 
 struct GenerationOutcome {
