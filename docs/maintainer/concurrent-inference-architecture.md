@@ -790,7 +790,9 @@ request 都进入相同 prefill/decode schedule 和 compact batch formation。
 
 `--kv-ram-capacity` enables a startup-fixed pinned-host budget that stores **already completed**
 prefix bundles, plus any live ladder GDN heads moved into that same FIFO image at eviction. The
-default is `off`. It does not change GPU pool capacity, active-set
+complete contiguous arena is pre-faulted in parallel, CUDA-registered, and validated concurrently
+with artifact materialization before the target Program takes ownership. The default is `off`. It
+does not change GPU pool capacity, active-set
 accounting, or CUDA Graph addresses, and it does not move an in-flight request off the GPU.
 
 MTP 或 DFlash prefill may freeze current GDN into an Engine-wide staging slot during an in-flight prefill

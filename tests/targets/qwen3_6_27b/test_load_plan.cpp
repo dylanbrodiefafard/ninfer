@@ -184,7 +184,8 @@ int verify_profile_mismatch_rejection() {
     RuntimeModelView empty_model;
     try {
         (void)ninfer::targets::qwen3_6::create_program<Variant>(empty_model, WeightsProfile::Nvfp4,
-                                                                std::move(sequence), device);
+                                                                std::move(sequence), device,
+                                                                nullptr);
     } catch (const std::invalid_argument& error) {
         if (std::string(error.what()).find("weights profile") != std::string::npos) { return 0; }
     }

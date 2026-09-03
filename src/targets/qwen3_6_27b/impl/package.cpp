@@ -3,6 +3,7 @@
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include "artifact/reader.h"
+#include "core/arena.h"
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
 #include "targets/qwen3_6_27b/impl/variant.h"
 
@@ -131,10 +132,12 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
 }
 
 std::unique_ptr<Package::Program>
-Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device) {
+Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device,
+                        std::unique_ptr<HostPinnedArena> kv_ram_arena) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
     return qwen3_6::create_program<detail::Variant>(
-        model.impl_->data.runtime, model.impl_->weights_profile, std::move(plan), device);
+        model.impl_->data.runtime, model.impl_->weights_profile, std::move(plan), device,
+        std::move(kv_ram_arena));
 }
 
 } // namespace ninfer::targets::qwen3_6_27b

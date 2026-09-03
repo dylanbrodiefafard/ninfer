@@ -14,6 +14,7 @@
 
 namespace ninfer {
 struct DeviceContext;
+class HostPinnedArena;
 }
 
 namespace ninfer::targets::qwen3_6 {
@@ -245,7 +246,8 @@ private:
     template <class V>
     friend std::unique_ptr<Program<V>> create_program(const typename V::ModelView&,
                                                       typename V::WeightsProfile, SequencePlan<V>&&,
-                                                      DeviceContext&);
+                                                      DeviceContext&,
+                                                      std::unique_ptr<HostPinnedArena>);
 };
 
 template <class Variant>
@@ -257,6 +259,6 @@ template <class Variant>
 [[nodiscard]] std::unique_ptr<Program<Variant>>
 create_program(const typename Variant::ModelView& model,
                typename Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& plan,
-               DeviceContext& device);
+               DeviceContext& device, std::unique_ptr<HostPinnedArena> kv_ram_arena);
 
 } // namespace ninfer::targets::qwen3_6

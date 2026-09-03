@@ -12,6 +12,8 @@
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace {
 
@@ -59,6 +61,28 @@ ninfer::test::artifact_fixture::TemporaryArtifact write_fixture() {
                         })},
         },
         "materialization");
+}
+
+ninfer::test::artifact_fixture::TemporaryArtifact write_parallel_fixture() {
+    using Json = ninfer::test::artifact_fixture::Json;
+    Json objects = Json::array();
+    for (std::uint64_t i = 0; i < 9; ++i) {
+        objects.push_back({
+            {"name", "weights/parallel-" + std::to_string(i)},
+            {"kind", "tensor"},
+            {"shape", {1}},
+            {"format", "BF16"},
+            {"layout", "contiguous-le-v1"},
+            {"offset", i * 8192},
+            {"bytes", 2},
+        });
+    }
+    return ninfer::test::artifact_fixture::write_fixture(
+        {
+            {"identity", {{"model_id", "fixture-model"}, {"weights_id", "fixture-weights"}}},
+            {"objects", std::move(objects)},
+        },
+        "parallel-materialization");
 }
 
 bool cuda_unavailable(cudaError_t error) {
@@ -159,6 +183,35 @@ int main() {
         require(materialized.device_arena().capacity() == plan.device_capacity_bytes &&
                     materialized.device_arena().used() == plan.device_capacity_bytes,
                 "materialized tensor does not own the planned device backing");
+
+        auto parallel_fixture = write_parallel_fixture();
+        ninfer::artifact::Reader parallel_reader(parallel_fixture.path);
+        ninfer::artifact::Binder parallel_binder(parallel_reader);
+        std::vector<ninfer::artifact::ObjectHandle> parallel_handles;
+        constexpr std::array<std::uint64_t, 1> parallel_shape = {1};
+        for (std::size_t i = 0; i < 9; ++i) {
+            const auto handle = parallel_binder.require_tensor(
+                "weights/parallel-" + std::to_string(i),
+                ninfer::artifact::NumericFormat::BF16,
+                ninfer::artifact::StorageLayout::ContiguousLeV1, parallel_shape);
+            parallel_binder.materialize_on_device(handle);
+            parallel_handles.push_back(handle);
+        }
+        const auto parallel_plan = parallel_binder.finish();
+        auto parallel = ninfer::artifact::materialize(parallel_reader, parallel_plan, device);
+        for (std::size_t i = 0; i < parallel_handles.size(); ++i) {
+            std::array<std::byte, 2> value{};
+            CUDA_CHECK(cudaMemcpy(value.data(), parallel.device_data(parallel_handles[i]),
+                                  value.size(), cudaMemcpyDeviceToHost));
+            const std::byte expected{static_cast<unsigned char>(i + 1)};
+            require(value[0] == expected && value[1] == expected,
+                    "parallel materialization tensor payload differs from the artifact");
+        }
+        require(parallel.stats().tensor_count == parallel_handles.size() &&
+                    parallel.stats().h2d_bytes == parallel_handles.size() * 2 &&
+                    parallel.stats().peak_staging_bytes ==
+                        8 * ninfer::artifact::Reader::direct_io_alignment,
+                "parallel materialization did not exercise eight reusable staging slots");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

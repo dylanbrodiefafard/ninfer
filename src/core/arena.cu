@@ -2,11 +2,20 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <system_error>
+#include <thread>
+#include <vector>
+
+#include <sys/mman.h>
+#include <unistd.h>
 
 namespace ninfer {
 namespace {
@@ -49,6 +58,80 @@ void free_pinned(void*& ptr) noexcept {
         log_cuda_error("cudaFreeHost", cudaFreeHost(ptr));
         ptr = nullptr;
     }
+}
+
+constexpr std::size_t kMaximumHostPrefaultWorkers = 8;
+constexpr std::size_t kHostPrefaultBytesPerWorker = 64ULL * 1024ULL * 1024ULL;
+
+std::size_t system_page_size() {
+    const long page_size = ::sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) { throw std::runtime_error("sysconf(_SC_PAGESIZE) failed"); }
+    return static_cast<std::size_t>(page_size);
+}
+
+std::size_t align_up_size(std::size_t value, std::size_t alignment) {
+    if (value > std::numeric_limits<std::size_t>::max() - (alignment - 1)) {
+        throw std::overflow_error("host arena capacity alignment overflow");
+    }
+    return (value + alignment - 1) / alignment * alignment;
+}
+
+void* allocate_registered_host(std::size_t capacity_bytes, std::size_t& mapping_bytes) {
+    const std::size_t page_size = system_page_size();
+    mapping_bytes               = align_up_size(capacity_bytes, page_size);
+    void* mapping =
+        ::mmap(nullptr, mapping_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapping == MAP_FAILED) {
+        mapping_bytes = 0;
+        throw std::system_error(errno, std::generic_category(), "mmap HostPinnedArena");
+    }
+#ifdef MADV_NOHUGEPAGE
+    // CUDA registration must pin every base page. Avoid first building transparent huge pages
+    // that the driver immediately has to split while registering the same range.
+    (void)::madvise(mapping, mapping_bytes, MADV_NOHUGEPAGE);
+#endif
+
+    const std::size_t requested_workers =
+        1 + (mapping_bytes - 1) / kHostPrefaultBytesPerWorker;
+    const std::size_t worker_count = std::min(kMaximumHostPrefaultWorkers, requested_workers);
+    const std::size_t page_count       = mapping_bytes / page_size;
+    const std::size_t pages_per_worker = 1 + (page_count - 1) / worker_count;
+    try {
+        std::vector<std::jthread> workers;
+        workers.reserve(worker_count);
+        for (std::size_t worker = 0; worker < worker_count; ++worker) {
+            const std::size_t begin_page = worker * pages_per_worker;
+            const std::size_t end_page   = std::min(page_count, begin_page + pages_per_worker);
+            if (begin_page == end_page) { break; }
+            workers.emplace_back([mapping, page_size, begin_page, end_page] {
+                auto* begin = static_cast<unsigned char*>(mapping) + begin_page * page_size;
+                std::memset(begin, 0, (end_page - begin_page) * page_size);
+            });
+        }
+    } catch (...) {
+        (void)::munmap(mapping, mapping_bytes);
+        mapping_bytes = 0;
+        throw;
+    }
+
+    const cudaError_t registration =
+        cudaHostRegister(mapping, mapping_bytes, cudaHostRegisterDefault);
+    if (registration != cudaSuccess) {
+        (void)::munmap(mapping, mapping_bytes);
+        mapping_bytes = 0;
+        throw std::runtime_error(cuda_error_message("cudaHostRegister failed", registration));
+    }
+    return mapping;
+}
+
+void free_registered_host(void*& ptr, std::size_t& mapping_bytes) noexcept {
+    if (ptr == nullptr) { return; }
+    log_cuda_error("cudaHostUnregister", cudaHostUnregister(ptr));
+    if (::munmap(ptr, mapping_bytes) != 0) {
+        std::fprintf(stderr, "host arena cleanup failed during munmap: %s\n", std::strerror(errno));
+    }
+    ptr           = nullptr;
+    mapping_bytes = 0;
 }
 
 } // namespace
@@ -286,37 +369,36 @@ HostPinnedArena::HostPinnedArena(std::size_t capacity_bytes) {
     if (capacity_bytes == 0) {
         throw std::invalid_argument("HostPinnedArena capacity must be nonzero");
     }
-    void* ptr             = nullptr;
-    const cudaError_t err = cudaHostAlloc(&ptr, capacity_bytes, cudaHostAllocDefault);
-    if (err != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("cudaHostAlloc failed", err));
-    }
-    base_ = ptr;
+    base_ = allocate_registered_host(capacity_bytes, mapping_bytes_);
     cap_  = capacity_bytes;
     free_.push_back(FreeSpan{0, capacity_bytes});
 }
 
-HostPinnedArena::~HostPinnedArena() { free_pinned(base_); }
+HostPinnedArena::~HostPinnedArena() { free_registered_host(base_, mapping_bytes_); }
 
 HostPinnedArena::HostPinnedArena(HostPinnedArena&& other) noexcept
-    : base_(other.base_), cap_(other.cap_), used_(other.used_), free_(std::move(other.free_)),
+    : base_(other.base_), cap_(other.cap_), used_(other.used_),
+      mapping_bytes_(other.mapping_bytes_), free_(std::move(other.free_)),
       live_(std::move(other.live_)) {
-    other.base_ = nullptr;
-    other.cap_  = 0;
-    other.used_ = 0;
+    other.base_          = nullptr;
+    other.cap_           = 0;
+    other.used_          = 0;
+    other.mapping_bytes_ = 0;
 }
 
 HostPinnedArena& HostPinnedArena::operator=(HostPinnedArena&& other) noexcept {
     if (this == &other) { return *this; }
-    free_pinned(base_);
-    base_       = other.base_;
-    cap_        = other.cap_;
-    used_       = other.used_;
-    free_       = std::move(other.free_);
-    live_       = std::move(other.live_);
-    other.base_ = nullptr;
-    other.cap_  = 0;
-    other.used_ = 0;
+    free_registered_host(base_, mapping_bytes_);
+    base_                = other.base_;
+    cap_                 = other.cap_;
+    used_                = other.used_;
+    mapping_bytes_       = other.mapping_bytes_;
+    free_                = std::move(other.free_);
+    live_                = std::move(other.live_);
+    other.base_          = nullptr;
+    other.cap_           = 0;
+    other.used_          = 0;
+    other.mapping_bytes_ = 0;
     return *this;
 }
 

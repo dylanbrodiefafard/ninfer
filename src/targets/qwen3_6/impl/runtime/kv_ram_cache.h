@@ -154,6 +154,7 @@ struct RamMatch {
 class KVRamCache {
 public:
     explicit KVRamCache(std::size_t capacity_bytes);
+    explicit KVRamCache(HostPinnedArena&& arena);
     ~KVRamCache();
 
     KVRamCache(const KVRamCache&)            = delete;

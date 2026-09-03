@@ -15,6 +15,7 @@ RUN apt-get update \
         libavutil-dev \
         libcurl4-openssl-dev \
         libswscale-dev \
+        libzstd-dev \
         ninja-build \
         pkg-config \
         python3 \
@@ -48,6 +49,7 @@ RUN apt-get update \
         libavutil58 \
         libcurl4t64 \
         libswscale7 \
+        libzstd1 \
     && rm -rf /var/lib/apt/lists/* \
     # Host driver supplies libcuda (e.g. 580.x). The image cuda-compat tree (590.x)
     # wins ldconfig on this base and triggers cudaErrorCompatNotSupportedOnDevice

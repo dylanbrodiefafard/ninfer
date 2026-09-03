@@ -306,7 +306,7 @@ struct RequestControl {
 class ProgramImplCore {
 public:
     ProgramImplCore(const LoadedModelData& model, const SequencePlanImpl& plan,
-                    DeviceContext& device);
+                    DeviceContext& device, std::unique_ptr<HostPinnedArena> kv_ram_arena);
     ~ProgramImplCore() noexcept;
 
     [[nodiscard]] RequestBasePlan

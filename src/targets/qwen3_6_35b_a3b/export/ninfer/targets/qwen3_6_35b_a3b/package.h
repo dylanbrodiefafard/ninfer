@@ -102,7 +102,8 @@ struct Package {
                                                                const EngineOptions& options,
                                                                WeightsProfile weights_profile);
     [[nodiscard]] static std::unique_ptr<Program>
-    create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device);
+    create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device,
+                   std::unique_ptr<HostPinnedArena> kv_ram_arena);
 };
 
 } // namespace targets::qwen3_6_35b_a3b
