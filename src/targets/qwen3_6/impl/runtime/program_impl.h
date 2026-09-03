@@ -904,7 +904,20 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                 throw std::logic_error("ordinary pending batch no longer matches Program state");
             }
             if (cancelled[row]) {
-                clear_lane(sequences[lane], requests[lane]);
+                SequenceState& sequence            = sequences[lane];
+                RequestControl& request            = requests[lane];
+                const PendingCandidate pending     = request.pending;
+                if (pending.produced != 1 || sequence.ledger.size() != pending.base_S + 1 ||
+                    sequence.ledger_frontier != pending.base_S ||
+                    sequence.execution_frontier != pending.base_E) {
+                    throw std::logic_error(
+                        "cancelled ordinary pending round is not a single staged token");
+                }
+                sequence.ledger.resize(pending.base_S);
+                sequence.prefix_identity.truncate(pending.base_S);
+                sequence.text_kv_valid = pending.base_E;
+                trim_sequence_kv(sequence, pending.base_E, backend_kv_valid(sequence));
+                retain_committed_sequence(sequence, request);
             } else if (row_rejected(row)) {
                 throw std::logic_error("ordinary pending rounds cannot be rejected");
             } else {
