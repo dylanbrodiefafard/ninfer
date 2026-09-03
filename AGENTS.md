@@ -207,6 +207,12 @@ concrete lifetime risk; performance changes get measurement at the claimed scope
 attribution tools only when needed; serving changes get affected OpenAI/Anthropic schema tests
 and observable request/stream behavior.
 
+After substantial work, and before a commit or push, run the full C++ unit-test suite with
+`./scripts/run-unit-tests.sh`. That command builds the test targets in the `ninfer-builder`
+GPU container and runs every CTest except the opt-in real-artifact Engine tests.
+`--real` includes those Engine tests and binds `.ninfer` files from `models/`, `/models`, or `models/weights.env`. Focused checks remain the right evidence during the work;
+the full suite is the gate that unrelated tests still pass.
+
 ## Local environment
 
 Conventional project resources (not a per-task checklist): Python 3.11 via `python3`; the
@@ -214,7 +220,10 @@ supported artifact is `qwen3_8_27b_nvfp4.ninfer`, a local file placed by the mai
 example in `models/`), with its download source in the README; local directories such as `out/`
 are checkout-specific, not a convention; normal build in `build/`; profiler output in
 `profiles/ncu/`, `profiles/nsys/`, `profiles/bench/`; hardware/toolchain is RTX 5090, `sm_120a`,
-CUDA 13.1; speed and Engine A/B work uses `--kv-dtype nvfp4`. Use the selected Python 3.11 interpreter explicitly; do not
+CUDA 13.1; speed and Engine A/B work uses `--kv-dtype nvfp4`. GPU tests and kernel iteration
+run in the `ninfer-builder` container, started with `./scripts/dev-setup.sh`. That image is
+the Dockerfile `build` stage (`docker build --target build --tag local/ninfer-builder:5090 .`),
+not the runtime serve image. Use the selected Python 3.11 interpreter explicitly; do not
 install or upgrade dependencies unless the task requires it. Never select an artifact by glob,
 modification time, or an unqualified "latest" name; large artifacts, source checkpoints, and
 profiler outputs are local prerequisites, not things to download or regenerate unless in scope.

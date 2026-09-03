@@ -8,7 +8,7 @@ incrementally available).
 
 The container name is overridable via NINFER_DEV_CONTAINER (default ninfer-builder).
 If it is not running, the control plane refuses to guess and points at
-ninfer/dev-setup.sh instead of silently starting something it shouldn't own.
+scripts/dev-setup.sh instead of silently starting something it shouldn't own.
 """
 
 import os
@@ -52,7 +52,7 @@ def run(cmd: str, *, check: bool = True, env: dict | None = None,
     if not _container_running():
         raise HarnessError(
             f"dev container '{CONTAINER}' is not running. Start it (idempotent) with "
-            f"./ninfer/dev-setup.sh, or point NINFER_DEV_CONTAINER elsewhere."
+            f"./scripts/dev-setup.sh, or point NINFER_DEV_CONTAINER elsewhere."
         )
     argv = ["docker", "exec"]
     for key, value in (env or {}).items():
