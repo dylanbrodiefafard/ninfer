@@ -48,17 +48,31 @@ void validate_token_interval(std::int32_t first, std::int32_t last) {
 constexpr ops::LinearPolicy kNvfp4TextPolicy = ops::LinearPolicy::AllowA4;
 
 ops::LinearPolicy text_policy(const Weight& weight,
-                              qwen3_6::TextPhase phase = qwen3_6::TextPhase::Prefill) {
-    (void)phase;
+                              qwen3_6::TextPhase phase = qwen3_6::TextPhase::Prefill,
+                              std::int32_t aggregate_tokens = 0) {
+    // P-less is sensitive to small target-logit perturbations at its collision-probability
+    // boundary. Keep target verification on the same A16 matrix route as ordinary decode.
+    // Wide concurrent verification is presented to these leaves as per-request panels below.
+    if (phase == qwen3_6::TextPhase::Verify && aggregate_tokens > 0 &&
+        aggregate_tokens <= 16) {
+        return ops::LinearPolicy::A16Only;
+    }
     return weight.qtype == QType::NVFP4 ? kNvfp4TextPolicy : ops::LinearPolicy::A16Only;
+}
+
+bool split_verify_panels(qwen3_6::TextPhase phase, std::int32_t route_tokens,
+                         std::int32_t aggregate_tokens) {
+    return phase == qwen3_6::TextPhase::Verify && route_tokens > 0 &&
+           route_tokens < aggregate_tokens;
 }
 
 // Packed verify launches Linear at T=width*B. Pin the C=1 width's NVFP4 family so a
 // C>1 aggregate does not flip A16↔W4A4 vs the sequential round. Thresholds match
 // ops/linear/nvfp4/nvfp4_config.h (attn-in 4, residual-6144 5, residual-17408 3).
 ops::LinearPolicy attn_input_packed_policy(const Weight& weight, qwen3_6::TextPhase phase,
-                                           std::int32_t route_tokens) {
-    const ops::LinearPolicy policy = text_policy(weight, phase);
+                                           std::int32_t route_tokens,
+                                           std::int32_t aggregate_tokens) {
+    const ops::LinearPolicy policy = text_policy(weight, phase, aggregate_tokens);
     if (route_tokens > 0 && route_tokens < 4 && weight.qtype == QType::NVFP4 &&
         policy == ops::LinearPolicy::AllowA4) {
         return ops::LinearPolicy::A16Only;
@@ -67,8 +81,9 @@ ops::LinearPolicy attn_input_packed_policy(const Weight& weight, qwen3_6::TextPh
 }
 
 ops::LinearPolicy residual_packed_policy(const Weight& weight, qwen3_6::TextPhase phase,
-                                         std::int32_t route_tokens) {
-    const ops::LinearPolicy policy = text_policy(weight, phase);
+                                         std::int32_t route_tokens,
+                                         std::int32_t aggregate_tokens) {
+    const ops::LinearPolicy policy = text_policy(weight, phase, aggregate_tokens);
     if (route_tokens <= 0 || weight.qtype != QType::NVFP4 ||
         policy != ops::LinearPolicy::AllowA4) {
         return policy;
@@ -228,16 +243,39 @@ void Variant::attention_projection(const Tensor& hidden,
         return;
     }
     const Weight& fused = std::get<FusedAttentionProjectionPayload>(weights).query_key_gate_value;
+    if (split_verify_panels(phase, route_tokens, hidden.ne[1])) {
+        for (std::int32_t offset = 0; offset < hidden.ne[1]; offset += route_tokens) {
+            Tensor query_panel = query.slice(1, offset, route_tokens);
+            Tensor gate_panel  = gate.slice(1, offset, route_tokens);
+            Tensor key_panel   = key.slice(1, offset, route_tokens);
+            Tensor value_panel = value.slice(1, offset, route_tokens);
+            ops::attn_input_proj(hidden.slice(1, offset, route_tokens), fused, query_panel,
+                                 gate_panel, key_panel, value_panel,
+                                 text_policy(fused, phase, route_tokens), workspace, stream);
+        }
+        return;
+    }
     ops::attn_input_proj(hidden, fused, query, gate, key, value,
-                         attn_input_packed_policy(fused, phase, route_tokens), workspace, stream);
+                         attn_input_packed_policy(fused, phase, route_tokens, hidden.ne[1]),
+                         workspace, stream);
 }
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
                                           Tensor& residual, qwen3_6::TextPhase phase,
                                           WorkspaceArena& workspace, cudaStream_t stream,
                                           std::int32_t route_tokens) {
-    ops::linear_add(attention, weight, residual, residual_packed_policy(weight, phase, route_tokens),
-                    workspace, stream);
+    if (split_verify_panels(phase, route_tokens, attention.ne[1])) {
+        for (std::int32_t offset = 0; offset < attention.ne[1]; offset += route_tokens) {
+            Tensor residual_panel = residual.slice(1, offset, route_tokens);
+            ops::linear_add(attention.slice(1, offset, route_tokens), weight,
+                            residual_panel, text_policy(weight, phase, route_tokens), workspace,
+                            stream);
+        }
+        return;
+    }
+    ops::linear_add(attention, weight, residual,
+                    residual_packed_policy(weight, phase, route_tokens, attention.ne[1]), workspace,
+                    stream);
 }
 
 void Variant::mtp_attention_projection(const Tensor& hidden,
@@ -303,7 +341,8 @@ void Variant::mtp_attention_output(const Tensor& attention, const Weight& weight
                                    std::int32_t route_tokens) {
     if (weight.qtype == QType::NVFP4) {
         ops::linear_add(attention, weight, residual,
-                        residual_packed_policy(weight, qwen3_6::TextPhase::Verify, route_tokens),
+                        residual_packed_policy(weight, qwen3_6::TextPhase::Verify, route_tokens,
+                                               attention.ne[1]),
                         workspace, stream);
         return;
     }
@@ -327,8 +366,8 @@ void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeig
     }
     const Weight& fused =
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
-    ops::gdn_input_proj(hidden, fused, qkv, output_gate_flat, text_policy(fused, phase), workspace,
-                        stream);
+    ops::gdn_input_proj(hidden, fused, qkv, output_gate_flat,
+                        text_policy(fused, phase, hidden.ne[1]), workspace, stream);
 }
 
 void Variant::gdn_input_projection_snapshot(
@@ -352,7 +391,9 @@ void Variant::gdn_input_projection_snapshot(
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
     ops::gdn_input_proj_conv_snapshot(hidden, fused, conv_weight, conv_states, valid_columns,
                                       initial_slot, snapshot_base_slot, query, key, value,
-                                      output_gate_view, text_policy(fused, phase), leaf_workspace, stream);
+                                      output_gate_view,
+                                      text_policy(fused, phase, hidden.ne[1]),
+                                      leaf_workspace, stream);
 }
 
 void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProjectionWeights& weights,
@@ -378,14 +419,25 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
     ops::gdn_input_proj_conv_record(hidden, fused, conv_weight, conv_states, valid_columns,
                                     initial_slots, conv_record, query, key, value, output_gate_view,
-                                    text_policy(fused, phase), leaf_workspace, stream, parent_index);
+                                    text_policy(fused, phase, hidden.ne[1]), leaf_workspace, stream,
+                                    parent_index);
 }
 
 void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
                                     qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                                     cudaStream_t stream, std::int32_t route_tokens) {
-    ops::linear_add(hidden, weight, residual, residual_packed_policy(weight, phase, route_tokens),
-                    workspace, stream);
+    if (split_verify_panels(phase, route_tokens, hidden.ne[1])) {
+        for (std::int32_t offset = 0; offset < hidden.ne[1]; offset += route_tokens) {
+            Tensor residual_panel = residual.slice(1, offset, route_tokens);
+            ops::linear_add(hidden.slice(1, offset, route_tokens), weight,
+                            residual_panel, text_policy(weight, phase, route_tokens), workspace,
+                            stream);
+        }
+        return;
+    }
+    ops::linear_add(hidden, weight, residual,
+                    residual_packed_policy(weight, phase, route_tokens, hidden.ne[1]), workspace,
+                    stream);
 }
 
 void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& norm_weight,
@@ -402,10 +454,23 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
                          std::int32_t route_tokens) {
     auto scope        = workspace.scope();
     Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
+    if (split_verify_panels(phase, route_tokens, hidden.ne[1])) {
+        for (std::int32_t offset = 0; offset < hidden.ne[1]; offset += route_tokens) {
+            const Tensor hidden_panel = hidden.slice(1, offset, route_tokens);
+            Tensor activation_panel   = activation.slice(1, offset, route_tokens);
+            Tensor residual_panel     = residual.slice(1, offset, route_tokens);
+            ops::linear_swiglu(hidden_panel, weights.gate_up, activation_panel,
+                               text_policy(weights.gate_up, phase, route_tokens), workspace, stream);
+            ops::linear_add(activation_panel, weights.down, residual_panel,
+                            text_policy(weights.down, phase, route_tokens), workspace, stream);
+        }
+        return;
+    }
     ops::linear_swiglu(hidden, weights.gate_up, activation,
-                       text_policy(weights.gate_up, phase), workspace, stream);
+                       text_policy(weights.gate_up, phase, hidden.ne[1]), workspace, stream);
     ops::linear_add(activation, weights.down, residual,
-                    residual_packed_policy(weights.down, phase, route_tokens), workspace, stream);
+                    residual_packed_policy(weights.down, phase, route_tokens, hidden.ne[1]),
+                    workspace, stream);
 }
 
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
@@ -419,7 +484,7 @@ void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& we
                            workspace, stream);
         ops::linear_add(activation, weights.down, residual,
                         residual_packed_policy(weights.down, qwen3_6::TextPhase::Verify,
-                                               route_tokens),
+                                               route_tokens, hidden.ne[1]),
                         workspace, stream);
         return;
     }

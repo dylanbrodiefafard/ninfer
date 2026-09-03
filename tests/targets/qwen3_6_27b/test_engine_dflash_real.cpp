@@ -312,6 +312,45 @@ int exercise_p_less_product_tree(ninfer::Engine& engine,
     return 0;
 }
 
+int exercise_p_less_target_likelihood(const char* artifact,
+                                      const std::vector<ninfer::TokenId>& prompt) {
+    constexpr const char* label = "DFlash2 adaptive p-less target likelihood";
+    constexpr std::uint64_t seed = 15446143373561885318ULL;
+    // This short seeded route is a fast guard for the broad 3,000-token verifier-drift
+    // diagnosis; target-only teacher forcing is the independent distribution oracle.
+    std::vector<ninfer::TokenId> corpus = prompt;
+    {
+        ninfer::Engine engine(adaptive_engine_options(
+            artifact, ninfer::SpeculativeBackend::DFlash, 7, 1));
+        const ninfer::GenerationResult generated =
+            engine.generate(engine.prepare_tokens(prompt), p_less_options(64, seed));
+        if (generated.generated_token_ids.size() != 64 ||
+            check_adaptive_dflash(generated, label) != 0) {
+            std::cerr << label << " generation did not complete\n";
+            return 1;
+        }
+        corpus.insert(corpus.end(), generated.generated_token_ids.begin(),
+                      generated.generated_token_ids.end());
+    }
+
+    ninfer::Engine baseline(base_engine_options(artifact));
+    ninfer::ScoreOptions score_options;
+    score_options.schedule = ninfer::ScoreSchedule::Decode;
+    score_options.skip_tokens = static_cast<std::uint32_t>(prompt.size() - 1);
+    const ninfer::ScoreResult score =
+        baseline.score(baseline.prepare_tokens(std::move(corpus), false), score_options);
+    if (score.tokens_scored != 64 || score.non_finite != 0 || score.mean_nll > 0.5 ||
+        score.max_nll > 4.0) {
+        std::cerr << label << " drifted from the ordinary target distribution: scored="
+                  << score.tokens_scored << " non_finite=" << score.non_finite
+                  << " mean_nll=" << score.mean_nll << " max_nll=" << score.max_nll << '\n';
+        return 1;
+    }
+    std::cout << "ok " << label << " mean_nll=" << score.mean_nll
+              << " max_nll=" << score.max_nll << '\n';
+    return 0;
+}
+
 std::vector<ninfer::TokenId> token_prefix(const std::vector<ninfer::TokenId>& tokens,
                                           std::uint32_t length, const char* label) {
     if (tokens.size() < length) {
@@ -397,6 +436,13 @@ int main() {
             1710,   248046, 198, 248045, 74455, 198,   248068, 198,
         },
     };
+
+    if (std::getenv("NINFER_DFLASH_TEST_SKIP_LIKELIHOOD") == nullptr) {
+        if (const int result = exercise_p_less_target_likelihood(artifact, prompts[0]);
+            result != 0) {
+            return result;
+        }
+    }
 
     auto run_k = [&](std::uint32_t draft_tokens, const char* label) -> int {
         std::array<std::vector<ninfer::TokenId>, 3> target_oracles;
