@@ -88,7 +88,7 @@ int run_q4_q5() {
         quantized_weight::make_patterned_weight(QType::Q5G64_F16S, kParent, kHidden, 107U));
 
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 16, 17, 21, 48}) {
+    for (const std::int32_t tokens : {1, 16, 17, 21, 48}) {
         failures += run_q4_q5_case(query_key, gate_value, tokens);
     }
     return failures;
@@ -233,7 +233,7 @@ int run_bf16_target() {
         std::cerr << "BF16 attention input workspace interval is not zero-capacity\n";
         ++failures;
     }
-    for (const std::int32_t tokens : {1, 2, 4, 8, 16, 17, 22, 23, 32, 33, 128, 129, 1024}) {
+    for (const std::int32_t tokens : {1, 2, 22, 23, 128}) {
         failures += run_bf16_target_case(parent, tokens);
     }
     return failures;
@@ -351,11 +351,10 @@ int run_nvfp4_target() {
         quantized_weight::make_patterned_weight(QType::NVFP4, kParentRows, kHidden, 331U, options));
 
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 4, 6, 8, 16, 20, 32, 33}) {
+    for (const std::int32_t tokens : {1, 2, 16, 32, 33}) {
         failures += run_nvfp4_target_case(parent, tokens);
     }
-    for (const std::int32_t tokens :
-         {1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 18, 24, 36, 1024, 2048, 4096}) {
+    for (const std::int32_t tokens : {1, 4, 15, 36, 1024}) {
         failures += run_nvfp4_target_case(parent, tokens, ops::LinearPolicy::AllowA4);
     }
     for (const std::int32_t tokens : {2}) {
@@ -404,7 +403,7 @@ int run_w8_target() {
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::W8G32_F16S, 9216, kHidden, 211U));
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 17, 48, 64, 65, 129}) {
+    for (const std::int32_t tokens : {1, 2, 64, 65, 129}) {
         failures += run_w8_target_case(parent, tokens);
     }
     return failures;

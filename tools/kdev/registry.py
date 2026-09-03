@@ -40,17 +40,14 @@ OPS = {
         full_bench_args=["--tokens", "1024"],
         dump=True,  # l2norm_dump side-band wired (P2)
     ),
-    # The GQA attention the approx-attention campaign runs. Oracle = the full
-    # conformance matrix (no fast tier yet); bench = the NVFP4-S3 prefill route
-    # (no CLI args). The intermediate side-band (QK partials / running max-sum /
-    # PV) is not ported yet and intentionally does not touch the campaign's
-    # gqa_attention_nvfp4s3_tma.cuh — add it deliberately when you want it.
+    # Default CTest is the route-boundary unit matrix. `--full` is the complete
+    # Cartesian (kdev --full). Bench = the NVFP4-S3 prefill route.
     "gqa_attention": Op(
         name="gqa_attention",
         test_target="ninfer_gqa_attention_test",
         bench_target="ninfer_gqa_attention_nvfp4s3_bench",
-        fast_test_args=[],  # full conformance (the real oracle); slower than a fast tier
-        full_test_args=[],
+        fast_test_args=[],
+        full_test_args=["--full"],
         fast_bench_args=[],
         full_bench_args=[],
         dump=False,

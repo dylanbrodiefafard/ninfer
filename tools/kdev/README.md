@@ -78,7 +78,8 @@ Artifacts land in `profiles/kdev/<op>/` (gitignore-able): `<ts>.json`,
 Add an op to `registry.py` (test/bench targets + argv lists). Currently:
 - `l2norm` — fast tier (one cheap case) + bench + **intermediate side-band**
   (`l2norm_dump` → `diff.py`).
-- `gqa_attention` — oracle (full conformance) + NVFP4-S3 bench/profile + the
+- `gqa_attention` — default CTest is the route-boundary unit matrix; `kdev --full`
+  (`--full` on the test binary) is the complete Cartesian. NVFP4-S3 bench/profile + the
   **sage quality mode** (below). Its intermediate side-band is not ported yet;
   the port target is the base `gqa_attention_prefill_nvfp4s3.cuh` (the TMA file
   includes it, so a fix there is inherited by `..._tma.cuh`).
@@ -137,10 +138,11 @@ wrong-sum bug is localized to `sumsq@5` in a single run).
 
 ## Dev container
 
-`./ninfer/dev-setup.sh` (idempotent, never touches the live `ninfer` serve
-container) sets up the `ninfer-builder` dev home: ccache, the CUDA-compat strip
-(the RTX 5090 host-driver fix), and the tests+bench build tree. Profilers
-(ncu/nsys/cuda-gdb/compute-sanitizer) ship in the image.
+`./scripts/dev-setup.sh` (idempotent, never touches a live `ninfer` serve
+container) sets up the `ninfer-builder` dev home from this repository's Dockerfile
+`build` stage: ccache, the CUDA-compat strip (the RTX 5090 host-driver fix), and
+the tests+bench build tree. Profilers (ncu/nsys/cuda-gdb/compute-sanitizer) ship
+in the image. `./scripts/run-unit-tests.sh` is the full C++ unit-test command.
 
 ## Process discipline baked in
 
