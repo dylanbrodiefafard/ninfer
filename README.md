@@ -135,13 +135,18 @@ build/apps/ninfer
 build/apps/ninfer-serve
 ```
 
-Tests, benchmarks, and maintainer tools are excluded from the default build.
+Tests, benchmarks, and maintainer tools are excluded from the default build. The
+C++ unit suite is `./scripts/run-unit-tests.sh`, which uses the Dockerfile `build`
+stage as the `ninfer-builder` GPU container; see [Tests](tests/README.md).
 
 ## Docker
 
 Build the runtime image on a 64-bit Linux host with an RTX 5090, a CUDA 13.1-compatible NVIDIA
 driver, Docker, and the
 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+The same Dockerfile `build` stage is the developer builder (`local/ninfer-builder:5090`);
+`./scripts/dev-setup.sh` starts it for tests and kernel work. That container is not the serve
+image.
 
 ```bash
 docker build --tag ninfer:local .

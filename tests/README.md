@@ -51,14 +51,37 @@ weight decoding.
 
 ## Build and run
 
+One command for the full C++ unit suite (GPU builder container, excluding opt-in
+real-artifact Engine tests):
+
+```bash
+./scripts/run-unit-tests.sh
+```
+
+`./scripts/dev-setup.sh` starts `ninfer-builder` from this repository's Dockerfile
+`build` stage when the container is not already running. Extra arguments go to CTest
+(`./scripts/run-unit-tests.sh -R ninfer_sampling_test`). `--real` includes the
+opt-in Engine tests and auto-finds exact `.ninfer` filenames in `models/`, `out/`,
+`/models`, the builder's models mount, and sibling folders of that mount. Override
+with environment variables or `models/weights.env`. `--print-weights` shows what
+`--real` would use without running tests. `--python` also runs the host pytest suite
+when that interpreter can import `pytest` and `torch`. The script exits before CTest
+when the GPU has less than 20 GiB free and prints the processes holding VRAM.
+
+Equivalent native commands:
+
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 cmake --build build --parallel
-ctest --test-dir build --output-on-failure
+ctest --test-dir build --output-on-failure -E '_real_test$'
 ```
 
 GPU tests fail if there is no usable CUDA device. CTest skip (`77`) is only for
 opt-in real-artifact Engine tests when the corresponding weights env is unset.
+Frontend tests that need the official HF tokenizer skip those cases when
+`NINFER_OFFICIAL_TOKENIZER_DIR` (or the maintainer checkout paths) is unset;
+synthetic tokenizer coverage still runs. `ninfer_gqa_attention_test --full`
+restores the complete Cartesian matrix; CTest uses the route-boundary unit set.
 
 Run a focused target for a localized change:
 

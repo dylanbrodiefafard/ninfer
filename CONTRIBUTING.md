@@ -69,6 +69,8 @@ Select evidence according to the claim being made:
 
 Use the existing project workflows instead of inventing parallel verification paths:
 
+- `./scripts/run-unit-tests.sh` for the full C++ unit suite before a commit or push of
+  substantial work;
 - [`tests/README.md`](tests/README.md) for test organization and commands;
 - [`bench/README.md`](bench/README.md) for product and operator benchmarks; and
 - [`docs/maintainer/op-development.md`](docs/maintainer/op-development.md) for numerical Op

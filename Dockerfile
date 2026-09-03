@@ -1,4 +1,8 @@
 # syntax=docker/dockerfile:1
+#
+# The `build` stage is also the developer builder image (`ninfer-builder`):
+#   docker build --target build --tag local/ninfer-builder:5090 .
+# Start it with ./scripts/dev-setup.sh and run tests with ./scripts/run-unit-tests.sh.
 
 FROM nvidia/cuda:13.1.2-devel-ubuntu24.04 AS build
 
@@ -13,7 +17,14 @@ RUN apt-get update \
         libswscale-dev \
         ninja-build \
         pkg-config \
-    && rm -rf /var/lib/apt/lists/*
+        python3 \
+    && rm -rf /var/lib/apt/lists/* \
+    # Host driver supplies libcuda (e.g. 580.x). The image cuda-compat tree (590.x)
+    # wins ldconfig on this base and triggers cudaErrorCompatNotSupportedOnDevice
+    # on RTX 5090 / Blackwell. Prefer the injected host driver libraries.
+    && rm -rf /usr/local/cuda/compat /usr/local/cuda-13.1/compat /usr/local/cuda-13/compat \
+    && rm -f /etc/ld.so.conf.d/*compat*.conf \
+    && ldconfig
 
 WORKDIR /src
 COPY . .

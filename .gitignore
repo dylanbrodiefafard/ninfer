@@ -30,6 +30,8 @@ venv/
 *.gguf
 out/
 *.log
+models/weights.env
+/weights.env
 
 # Measurement raw corpora & intermediates (large; produced by offline tooling).
 # The small final frequency stats under fixtures/ranking/ ARE tracked; the rest is ignored.
