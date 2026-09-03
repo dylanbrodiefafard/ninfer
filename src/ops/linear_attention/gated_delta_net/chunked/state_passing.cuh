@@ -3,6 +3,10 @@
 #include "ops/common/mma.cuh"
 #include "ops/linear_attention/gated_delta_net/chunked/common.cuh"
 
+#include <cuda_fp16.h>
+
+#include <type_traits>
+
 // Stage 3: chunk-sequential state passing.
 //
 // Math + I/O layouts: see the Gated DeltaNet chunked state_passing_config.
@@ -87,24 +91,24 @@ struct SnapView {
     }
 };
 
-// prepare_wy_wu stores W's private workspace in the native-BF16 fragment
+// prepare_wy_wu stores W's private workspace in the native 16-bit fragment
 // order {0,4,1,5,2,6,3,7} within each group of eight logical columns.
-struct Bf16WView {
-    __nv_bfloat16* __restrict__ base;
+template <class T>
+struct W16View {
+    T* __restrict__ base;
 
     __device__ __forceinline__ int swizzled_col(int row, int col) const {
         return (col & ~63) + ((((col & 63) >> 3) ^ (row & 7)) << 3) + (col & 7);
     }
 
-    __device__ __forceinline__ __nv_bfloat16* ptr(int row, int col) const {
+    __device__ __forceinline__ T* ptr(int row, int col) const {
         return &base[row * kStateDim + swizzled_col(row, col)];
     }
 };
 
-template <int THREADS>
-__device__ __forceinline__ void issue_load_w_bf16(Bf16WView view,
-                                                  const __nv_bfloat16* gmem_base_row0,
-                                                  int64_t gmem_row_stride, int tid) {
+template <int THREADS, class T>
+__device__ __forceinline__ void issue_load_w_16(W16View<T> view, const T* gmem_base_row0,
+                                                int64_t gmem_row_stride, int tid) {
     constexpr int ELEMS_PER_COPY = 8;
     constexpr int COPIES_PER_ROW = kStateDim / ELEMS_PER_COPY;
     constexpr int COPIES         = BT * COPIES_PER_ROW;
@@ -117,12 +121,30 @@ __device__ __forceinline__ void issue_load_w_bf16(Bf16WView view,
     }
 }
 
-// K is staged in native BF16 because it is already representable exactly as
-// a TF32 operand. Within each group of eight token rows, physical rows are
-// ordered {0,4,1,5,2,6,3,7}. ldmatrix.x2.trans then packs token columns
-// {t,t+4} into the two halves of each register, matching the TF32 A fragment.
-struct Bf16KView {
-    __nv_bfloat16* __restrict__ base;
+template <int ROWS, int COLS, int THREADS>
+__device__ __forceinline__ void issue_load_f16_to_float_vec4(SmemTile<COLS> dst,
+                                                             const __half* __restrict__ src_row0,
+                                                             int64_t src_row_stride, int tid) {
+    constexpr int VEC_PER_ROW = COLS / 4;
+    constexpr int N_VEC       = ROWS * VEC_PER_ROW;
+#pragma unroll
+    for (int v = tid; v < N_VEC; v += THREADS) {
+        const int row      = v / VEC_PER_ROW;
+        const int col4     = (v - row * VEC_PER_ROW) * 4;
+        const __half2 lo_h = load_vec<__half2>(src_row0 + (int64_t)row * src_row_stride + col4);
+        const __half2 hi_h = load_vec<__half2>(src_row0 + (int64_t)row * src_row_stride + col4 + 2);
+        const float2 lo    = __half22float2(lo_h);
+        const float2 hi    = __half22float2(hi_h);
+        dst.vec4_at(row, col4) = make_float4(lo.x, lo.y, hi.x, hi.y);
+    }
+}
+
+// K uses the selected private 16-bit profile. Within each group of eight token rows, physical rows
+// are ordered {0,4,1,5,2,6,3,7}. ldmatrix.x2.trans then packs token columns {t,t+4} into the two
+// halves of each register, matching the TF32 A fragment.
+template <class T>
+struct K16View {
+    T* __restrict__ base;
 
     __device__ __forceinline__ int physical_row(int logical_row) const {
         const int row8 = logical_row & 7;
@@ -133,20 +155,19 @@ struct Bf16KView {
         return (col & ~63) + ((((col & 63) >> 3) ^ (physical_row_ & 7)) << 3) + (col & 7);
     }
 
-    __device__ __forceinline__ __nv_bfloat16* logical_ptr(int row, int col) const {
+    __device__ __forceinline__ T* logical_ptr(int row, int col) const {
         const int row_phys = physical_row(row);
         return &base[row_phys * kStateDim + swizzled_col(row_phys, col)];
     }
 
-    __device__ __forceinline__ __nv_bfloat16* physical_ptr(int row, int col) const {
+    __device__ __forceinline__ T* physical_ptr(int row, int col) const {
         return &base[row * kStateDim + swizzled_col(row, col)];
     }
 };
 
-template <int THREADS>
-__device__ __forceinline__ void issue_load_k_bf16(Bf16KView view,
-                                                  const __nv_bfloat16* gmem_base_row0,
-                                                  int64_t gmem_row_stride, int tid) {
+template <int THREADS, class T>
+__device__ __forceinline__ void issue_load_k_16(K16View<T> view, const T* gmem_base_row0,
+                                                int64_t gmem_row_stride, int tid) {
     constexpr int ELEMS_PER_COPY = 8;
     constexpr int COPIES_PER_ROW = kStateDim / ELEMS_PER_COPY;
     constexpr int COPIES         = BT * COPIES_PER_ROW;
@@ -165,18 +186,29 @@ __device__ __forceinline__ void unpack_bf16x2_to_fp32_bits(unsigned packed, unsi
     high = packed & 0xffff0000U;
 }
 
+__device__ __forceinline__ void unpack_f16x2_to_fp32_bits(unsigned packed, unsigned& low,
+                                                          unsigned& high) {
+    const float2 value = __half22float2(ninfer::ops::half2_from_bits(packed));
+    low                = __float_as_uint(value.x);
+    high               = __float_as_uint(value.y);
+}
+
 // The narrow geometry targets two 128-register CTAs per SM. The wide geometry
 // uses one 512-thread CTA; both expose 16 resident warps without local spills.
-template <int NStrip>
+template <bool K_F16, int NStrip>
 __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS) __global__
-    void state_passing_kernel(const __nv_bfloat16* __restrict__ W_in,
-                              const __nv_bfloat16* __restrict__ U_in,
-                              const __nv_bfloat16* __restrict__ k_in,
-                              const float* __restrict__ g_cumsum, const float* state_in,
-                              __nv_bfloat16* __restrict__ v_new,
-                              __nv_bfloat16* __restrict__ h_chunk, float* state_out,
-                              head_map qk_map, int chunks) {
+    void state_passing_kernel(const void* __restrict__ W_raw, const void* __restrict__ U_raw,
+                              const void* __restrict__ k_raw, const float* __restrict__ g_cumsum,
+                              const float* state_in, void* __restrict__ v_new_raw,
+                              void* __restrict__ h_chunk_raw, float* state_out, head_map qk_map,
+                              int chunks) {
     using D                         = kernel_dims<NStrip>;
+    using KType                     = std::conditional_t<K_F16, __half, __nv_bfloat16>;
+    const auto* const k_in          = static_cast<const KType*>(k_raw);
+    const auto* const W_in          = static_cast<const KType*>(W_raw);
+    const auto* const U_in          = static_cast<const KType*>(U_raw);
+    auto* const v_new               = static_cast<KType*>(v_new_raw);
+    auto* const h_chunk             = static_cast<KType*>(h_chunk_raw);
     using L                         = smem_layout<NStrip>;
     constexpr int N_STRIP_PER_BLOCK = D::N_STRIP_PER_BLOCK;
     constexpr int D_STRIPS          = D::D_STRIPS;
@@ -212,15 +244,15 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
     // Smem partition. U and vd alias (`uvd_smem`) in disjoint phases. snap
     // is per-sit so the chunk-start unified scatter feeds every sit's MM1.
     extern __shared__ float smem[];
-    auto* const W_smem     = reinterpret_cast<__nv_bfloat16*>(smem); // W_LOAD_BF16
-    float* const uvd_smem  = smem + W_STORAGE_FLT;                   // UVD_FLT
-    auto* const k_smem     = reinterpret_cast<__nv_bfloat16*>(uvd_smem + UVD_FLT);
+    auto* const W_smem     = reinterpret_cast<KType*>(smem); // W_LOAD_16
+    float* const uvd_smem  = smem + W_STORAGE_FLT;           // UVD_FLT
+    auto* const k_smem     = reinterpret_cast<KType*>(uvd_smem + UVD_FLT);
     float* const snap_smem = uvd_smem + UVD_FLT + K_STORAGE_FLT; // SNAP_FLT * N_SNAP_BUF
     float* const g_smem    = snap_smem + SNAP_FLT * N_SNAP_BUF;  // BT
 
-    Bf16WView W_view{W_smem};
+    W16View<KType> W_view{W_smem};
     SmemTile<N_STRIP_PER_BLOCK> vd_view{uvd_smem};
-    Bf16KView k_view{k_smem};
+    K16View<KType> k_view{k_smem};
     SmemTile<N_STRIP_PER_BLOCK> U_view{uvd_smem};
     // One SnapView per sit so each owning warp scatters into a unique buffer
     // (Phase 2.a unified-scatter design). The array is sized on N_SNAP_BUF
@@ -292,16 +324,21 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
     const int64_t g_block_base  = h_v;
     const int64_t g_thread_base = g_block_base + (int64_t)tid * H_v;
 
-    // W/K stay native BF16 in shared memory. W is committed first for MM1;
-    // K is the later group and remains in flight until MM2. U is expanded
-    // synchronously while both async groups make progress.
+    // W/K stay in their selected native 16-bit profile in shared memory. W is committed first for
+    // MM1; K is the later group and remains in flight until MM2. U is expanded synchronously while
+    // both async groups make progress.
     {
-        issue_load_w_bf16<THREADS_K>(W_view, W_in + W_block_base, W_stride, tid);
+        issue_load_w_16<THREADS_K>(W_view, W_in + W_block_base, W_stride, tid);
         cp_commit();
-        issue_load_k_bf16<THREADS_K>(k_view, k_in + k_block_base, k_stride, tid);
+        issue_load_k_16<THREADS_K>(k_view, k_in + k_block_base, k_stride, tid);
         cp_commit();
-        issue_load_bf16_to_float_vec4<BT, N_STRIP_PER_BLOCK, THREADS_K>(
-            U_view, U_in + W_block_base + d_off, W_stride, tid);
+        if constexpr (K_F16) {
+            issue_load_f16_to_float_vec4<BT, N_STRIP_PER_BLOCK, THREADS_K>(
+                U_view, U_in + W_block_base + d_off, W_stride, tid);
+        } else {
+            issue_load_bf16_to_float_vec4<BT, N_STRIP_PER_BLOCK, THREADS_K>(
+                U_view, U_in + W_block_base + d_off, W_stride, tid);
+        }
     }
 
     // === Main chunk loop ===
@@ -368,14 +405,19 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
                     const int k_off    = kvec * 4;
                     float4 val         = snap.vec4_at(d_local, k_off);
                     const int d_global = d_off + d_local;
-                    __nv_bfloat16* out =
+                    KType* out =
                         &h_chunk[hc_base + (int64_t)d_global * kStateDim + k_row_off + k_off];
-                    store_vec(out, __floats2bfloat162_rn(val.x, val.y));
-                    store_vec(out + 2, __floats2bfloat162_rn(val.z, val.w));
+                    if constexpr (K_F16) {
+                        store_vec(out, __floats2half2_rn(val.x, val.y));
+                        store_vec(out + 2, __floats2half2_rn(val.z, val.w));
+                    } else {
+                        store_vec(out, __floats2bfloat162_rn(val.x, val.y));
+                        store_vec(out + 2, __floats2bfloat162_rn(val.z, val.w));
+                    }
                 }
             }
 
-            // W's producer-interleaved BF16 layout lets ldmatrix.x2 form the
+            // W's producer-interleaved 16-bit layout lets ldmatrix.x2 form the
             // four exact FP32/TF32 A operands. The FP32 state snapshot uses
             // ldmatrix.x2 as a b16 transport for the two B operand bit patterns.
             const int lane_in_8   = lane & 7;
@@ -399,8 +441,13 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
                     unsigned packed0, packed1;
                     ldmatrix_x2(packed0, packed1, a_addr);
                     unsigned ua0, ua1, ua2, ua3;
-                    unpack_bf16x2_to_fp32_bits(packed0, ua0, ua2);
-                    unpack_bf16x2_to_fp32_bits(packed1, ua1, ua3);
+                    if constexpr (K_F16) {
+                        unpack_f16x2_to_fp32_bits(packed0, ua0, ua2);
+                        unpack_f16x2_to_fp32_bits(packed1, ua1, ua3);
+                    } else {
+                        unpack_bf16x2_to_fp32_bits(packed0, ua0, ua2);
+                        unpack_bf16x2_to_fp32_bits(packed1, ua1, ua3);
+                    }
 
                     mma_tf32_bits(vnew_frag[m_mm1][0], vnew_frag[m_mm1][1], vnew_frag[m_mm1][2],
                                   vnew_frag[m_mm1][3], ua0, ua1, ua2, ua3, ub0, ub1);
@@ -449,10 +496,17 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
             const float v2 = vnew_frag[m_mm1][2];
             const float v3 = vnew_frag[m_mm1][3];
 
-            const __nv_bfloat162 out0 = __floats2bfloat162_rn(v0, v1);
-            const __nv_bfloat162 out1 = __floats2bfloat162_rn(v2, v3);
-            store_vec(&v_new[vn_base + (int64_t)row_g0 * vn_stride + col_d0], out0);
-            store_vec(&v_new[vn_base + (int64_t)row_g1 * vn_stride + col_d0], out1);
+            if constexpr (K_F16) {
+                store_vec(&v_new[vn_base + (int64_t)row_g0 * vn_stride + col_d0],
+                          __floats2half2_rn(v0, v1));
+                store_vec(&v_new[vn_base + (int64_t)row_g1 * vn_stride + col_d0],
+                          __floats2half2_rn(v2, v3));
+            } else {
+                store_vec(&v_new[vn_base + (int64_t)row_g0 * vn_stride + col_d0],
+                          __floats2bfloat162_rn(v0, v1));
+                store_vec(&v_new[vn_base + (int64_t)row_g1 * vn_stride + col_d0],
+                          __floats2bfloat162_rn(v2, v3));
+            }
 
             const int row_g0_loc = s_idx * BT_PER_WARP + m_mm1 * MMA_M + lane_g;
             const int row_g1_loc = row_g0_loc + 8;
@@ -467,7 +521,7 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
             for (int e = 0; e < 4; ++e) { h_frag[m][e] *= gamma_C; }
         }
 
-        // Drain native-BF16 K, then make K and Phase-D v_decay visible to MM2.
+        // Drain native 16-bit K, then make K and Phase-D v_decay visible to MM2.
         cp_wait<0>();
         __syncthreads();
 
@@ -490,8 +544,13 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
                 unsigned packed0, packed1;
                 ldmatrix_x2_t(packed0, packed1, smem_addr(k_view.physical_ptr(a_row, a_col)));
                 unsigned ua0, ua1, ua2, ua3;
-                unpack_bf16x2_to_fp32_bits(packed0, ua0, ua2);
-                unpack_bf16x2_to_fp32_bits(packed1, ua1, ua3);
+                if constexpr (K_F16) {
+                    unpack_f16x2_to_fp32_bits(packed0, ua0, ua2);
+                    unpack_f16x2_to_fp32_bits(packed1, ua1, ua3);
+                } else {
+                    unpack_bf16x2_to_fp32_bits(packed0, ua0, ua2);
+                    unpack_bf16x2_to_fp32_bits(packed1, ua1, ua3);
+                }
 
                 mma_tf32_bits(h_frag[m][0], h_frag[m][1], h_frag[m][2], h_frag[m][3], ua0, ua1, ua2,
                               ua3, __float_as_uint(b0), __float_as_uint(b1));
@@ -503,12 +562,17 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
         // The next chunk repeats the W-then-K async group order used by the
         // prologue. Its Phase A drains W only; Phase E drains K.
         if (chunk + 1 < chunks) {
-            issue_load_w_bf16<THREADS_K>(W_view, W_in + W_base_next, W_stride, tid);
+            issue_load_w_16<THREADS_K>(W_view, W_in + W_base_next, W_stride, tid);
             cp_commit();
-            issue_load_k_bf16<THREADS_K>(k_view, k_in + k_base_next, k_stride, tid);
+            issue_load_k_16<THREADS_K>(k_view, k_in + k_base_next, k_stride, tid);
             cp_commit();
-            issue_load_bf16_to_float_vec4<BT, N_STRIP_PER_BLOCK, THREADS_K>(
-                U_view, U_in + W_base_next + d_off, W_stride, tid);
+            if constexpr (K_F16) {
+                issue_load_f16_to_float_vec4<BT, N_STRIP_PER_BLOCK, THREADS_K>(
+                    U_view, U_in + W_base_next + d_off, W_stride, tid);
+            } else {
+                issue_load_bf16_to_float_vec4<BT, N_STRIP_PER_BLOCK, THREADS_K>(
+                    U_view, U_in + W_base_next + d_off, W_stride, tid);
+            }
         }
 
         // Advance loop-carried bases for the next chunk.

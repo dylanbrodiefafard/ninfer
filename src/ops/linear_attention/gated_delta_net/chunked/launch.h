@@ -4,6 +4,7 @@
 #include "ops/linear_attention/gated_delta_net/common.h"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -29,18 +30,19 @@ struct workspace_layout {
     std::size_t total_bytes = 0;
 };
 
-inline workspace_layout compute_workspace_layout(std::int32_t value_heads, std::int32_t tokens) {
+inline workspace_layout compute_workspace_layout(std::int32_t value_heads, std::int32_t tokens,
+                                                 DType private_dtype = DType::BF16) {
     const std::int32_t chunks = tokens / kChunkSize;
     LayoutBuilder builder;
     workspace_layout w{};
     w.g_cumsum =
         builder.add_tensor(DType::FP32, {value_heads, tokens}, kWorkspaceAlign, "g_cumsum");
-    w.W = builder.add_tensor(DType::BF16, {kStateDim, value_heads, tokens}, kWorkspaceAlign, "W");
-    w.U = builder.add_tensor(DType::BF16, {kStateDim, value_heads, tokens}, kWorkspaceAlign, "U");
-    w.v_new =
-        builder.add_tensor(DType::BF16, {kStateDim, value_heads, tokens}, kWorkspaceAlign, "v_new");
-    w.h_chunk     = builder.add_tensor(DType::BF16, {kStateDim, kStateDim, value_heads, chunks},
-                                       kWorkspaceAlign, "h_chunk");
+    w.W = builder.add_tensor(private_dtype, {kStateDim, value_heads, tokens}, kWorkspaceAlign, "W");
+    w.U = builder.add_tensor(private_dtype, {kStateDim, value_heads, tokens}, kWorkspaceAlign, "U");
+    w.v_new   = builder.add_tensor(private_dtype, {kStateDim, value_heads, tokens}, kWorkspaceAlign,
+                                   "v_new");
+    w.h_chunk = builder.add_tensor(private_dtype, {kStateDim, kStateDim, value_heads, chunks},
+                                   kWorkspaceAlign, "h_chunk");
     w.total_bytes = builder.finish(kWorkspaceAlign, "Gated DeltaNet chunk workspace");
     return w;
 }
@@ -54,13 +56,14 @@ struct prepare_wy_wu_config {
     std::int32_t H_v  = 0;
     std::int32_t L    = 0;
 
-    const __nv_bfloat16* k = nullptr;
+    const void* k          = nullptr;
+    bool private_fp16      = false;
     const __nv_bfloat16* v = nullptr;
     const float* g_in      = nullptr;
     const float* beta      = nullptr;
 
-    __nv_bfloat16* W    = nullptr;
-    __nv_bfloat16* U    = nullptr;
+    void* W             = nullptr;
+    void* U             = nullptr;
     float* g_cumsum_out = nullptr;
 
     cudaStream_t stream = nullptr;
@@ -71,15 +74,16 @@ struct state_passing_config {
     std::int32_t H_v  = 0;
     std::int32_t L    = 0;
 
-    const __nv_bfloat16* W = nullptr;
-    const __nv_bfloat16* U = nullptr;
-    const __nv_bfloat16* k = nullptr;
-    const float* g_cumsum  = nullptr;
-    const float* state_in  = nullptr;
+    const void* W         = nullptr;
+    const void* U         = nullptr;
+    const void* k         = nullptr;
+    bool private_fp16     = false;
+    const float* g_cumsum = nullptr;
+    const float* state_in = nullptr;
 
-    __nv_bfloat16* v_new   = nullptr;
-    __nv_bfloat16* h_chunk = nullptr;
-    float* state_out       = nullptr;
+    void* v_new      = nullptr;
+    void* h_chunk    = nullptr;
+    float* state_out = nullptr;
 
     cudaStream_t stream = nullptr;
 };
@@ -89,11 +93,12 @@ struct chunk_output_config {
     std::int32_t H_v  = 0;
     std::int32_t L    = 0;
 
-    const __nv_bfloat16* q       = nullptr;
-    const __nv_bfloat16* k       = nullptr;
-    const __nv_bfloat16* v_new   = nullptr;
-    const float* g_cumsum        = nullptr;
-    const __nv_bfloat16* h_chunk = nullptr;
+    const void* q         = nullptr;
+    const void* k         = nullptr;
+    bool private_fp16     = false;
+    const void* v_new     = nullptr;
+    const float* g_cumsum = nullptr;
+    const void* h_chunk   = nullptr;
 
     __nv_bfloat16* attn_out = nullptr;
 

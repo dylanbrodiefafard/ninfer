@@ -4,6 +4,7 @@
 #include "ops/linear_attention/gated_delta_net/chunked/common.cuh"
 
 #include <cmath>
+#include <type_traits>
 
 // Stage 2 (fused): build T_inv in smem, immediately consume it to produce
 // W and U. T_inv never crosses HBM or occupies workspace.
@@ -23,6 +24,7 @@ using ninfer::ops::cp_wait;
 using ninfer::ops::ldmatrix_x2;
 using ninfer::ops::ldmatrix_x4;
 using ninfer::ops::mma_bf16;
+using ninfer::ops::mma_f16;
 using ninfer::ops::smem_addr;
 
 static_assert(kChunkSize == 64, "stage_prepare_wy_wu: kChunkSize must be 64 (kernel hard-codes "
@@ -74,19 +76,24 @@ struct kernel_dims {
         T_inv_floats + stage_floats + output_stage_floats + g_floats + beta_floats + bg_floats;
 };
 
-template <int STRIDE>
-struct Bf16SmemTile {
-    __nv_bfloat16* __restrict__ base;
+template <class T, int STRIDE>
+struct Smem16Tile {
+    T* __restrict__ base;
     static_assert(STRIDE == 32 || STRIDE == 64);
 
     __device__ __forceinline__ int swizzled_col(int row, int col) const {
         return col ^ ((row & (STRIDE / 8 - 1)) << 3);
     }
 
-    __device__ __forceinline__ __nv_bfloat16* ptr(int row, int col) const {
+    __device__ __forceinline__ T* ptr(int row, int col) const {
         return base + row * STRIDE + swizzled_col(row, col);
     }
 };
+
+template <int STRIDE>
+using Bf16SmemTile = Smem16Tile<__nv_bfloat16, STRIDE>;
+template <int STRIDE>
+using F16SmemTile = Smem16Tile<__half, STRIDE>;
 
 template <int Stride>
 __device__ __forceinline__ int wu_output_swizzled_col(int row, int col) {
@@ -253,6 +260,28 @@ load_scaled_wu_panel(SmemTile<WU_PANEL_COLS> panel, const __nv_bfloat16* __restr
 
 template <int WU_PANEL_COLS, int BLOCK_THREADS>
 __device__ __forceinline__ void
+load_scaled_wu_panel(SmemTile<WU_PANEL_COLS> panel, const __half* __restrict__ input_row0,
+                     std::int64_t input_row_stride, const float* __restrict__ scale, int panel_col,
+                     int tid) {
+    constexpr int VEC_PER_ROW = WU_PANEL_COLS / 4;
+    constexpr int N_VEC       = BT * VEC_PER_ROW;
+#pragma unroll
+    for (int v = tid; v < N_VEC; v += BLOCK_THREADS) {
+        const int row  = v / VEC_PER_ROW;
+        const int col4 = (v - row * VEC_PER_ROW) * 4;
+        const __half2 loh =
+            load_vec<__half2>(input_row0 + (std::int64_t)row * input_row_stride + panel_col + col4);
+        const __half2 hih = load_vec<__half2>(input_row0 + (std::int64_t)row * input_row_stride +
+                                              panel_col + col4 + 2);
+        const float2 lo   = __half22float2(loh);
+        const float2 hi   = __half22float2(hih);
+        const float s     = scale[row];
+        panel.vec4_at(row, col4) = make_float4(lo.x * s, lo.y * s, hi.x * s, hi.y * s);
+    }
+}
+
+template <int WU_PANEL_COLS, int BLOCK_THREADS>
+__device__ __forceinline__ void
 load_scaled_wu_panel_from_smem(SmemTile<WU_PANEL_COLS> panel, Bf16SmemTile<WU_PANEL_COLS> input,
                                const float* __restrict__ scale, int tid) {
     constexpr int VEC_PER_ROW = WU_PANEL_COLS / 4;
@@ -269,12 +298,11 @@ load_scaled_wu_panel_from_smem(SmemTile<WU_PANEL_COLS> panel, Bf16SmemTile<WU_PA
     }
 }
 
-template <bool InterleaveOutput, int WU_PANEL_COLS, int BLOCK_WARPS>
+template <bool InterleaveOutput, class OutputType, int WU_PANEL_COLS, int BLOCK_WARPS>
 __device__ __forceinline__ void
 compute_store_wu_panel(SmemTile<BT> T_view, SmemTile<WU_PANEL_COLS> panel,
-                       __nv_bfloat16* __restrict__ output_smem,
-                       __nv_bfloat16* __restrict__ output_row0, std::int64_t output_row_stride,
-                       int panel_col, int warp, int lane) {
+                       OutputType* __restrict__ output_smem, OutputType* __restrict__ output_row0,
+                       std::int64_t output_row_stride, int panel_col, int warp, int lane) {
     static_assert(BLOCK_WARPS == 4 || BLOCK_WARPS == 8);
     constexpr int WARPS_PER_ROW   = BLOCK_WARPS / N_SUB;
     constexpr int WARP_PANEL_COLS = WU_PANEL_COLS / WARPS_PER_ROW;
@@ -310,16 +338,25 @@ compute_store_wu_panel(SmemTile<BT> T_view, SmemTile<WU_PANEL_COLS> panel,
         }
     }
 
-    __nv_bfloat16* const warp_output = output_smem + warp * MMA_M * WARP_PANEL_COLS;
+    OutputType* const warp_output = output_smem + warp * MMA_M * WARP_PANEL_COLS;
 #pragma unroll
     for (int n = 0; n < WU_N_TILES; ++n) {
         const int col = n * MMA_N + col_pair;
-        store_vec(&warp_output[lane_g * WARP_PANEL_COLS +
-                               wu_output_swizzled_col<WARP_PANEL_COLS>(lane_g, col)],
-                  __floats2bfloat162_rn(D[n][0], D[n][1]));
-        store_vec(&warp_output[(lane_g + 8) * WARP_PANEL_COLS +
-                               wu_output_swizzled_col<WARP_PANEL_COLS>(lane_g + 8, col)],
-                  __floats2bfloat162_rn(D[n][2], D[n][3]));
+        if constexpr (std::is_same_v<OutputType, __half>) {
+            store_vec(&warp_output[lane_g * WARP_PANEL_COLS +
+                                   wu_output_swizzled_col<WARP_PANEL_COLS>(lane_g, col)],
+                      __floats2half2_rn(D[n][0], D[n][1]));
+            store_vec(&warp_output[(lane_g + 8) * WARP_PANEL_COLS +
+                                   wu_output_swizzled_col<WARP_PANEL_COLS>(lane_g + 8, col)],
+                      __floats2half2_rn(D[n][2], D[n][3]));
+        } else {
+            store_vec(&warp_output[lane_g * WARP_PANEL_COLS +
+                                   wu_output_swizzled_col<WARP_PANEL_COLS>(lane_g, col)],
+                      __floats2bfloat162_rn(D[n][0], D[n][1]));
+            store_vec(&warp_output[(lane_g + 8) * WARP_PANEL_COLS +
+                                   wu_output_swizzled_col<WARP_PANEL_COLS>(lane_g + 8, col)],
+                      __floats2bfloat162_rn(D[n][2], D[n][3]));
+        }
     }
     __syncwarp();
 
@@ -336,7 +373,7 @@ compute_store_wu_panel(SmemTile<BT> T_view, SmemTile<WU_PANEL_COLS> panel,
         if constexpr (InterleaveOutput) {
             // W is a private prepare -> state-passing workspace. Store every
             // group of eight columns as {0,4,1,5,2,6,3,7}, so the consumer's
-            // native-BF16 ldmatrix.x2 directly produces its TF32 A fragment.
+            // native 16-bit ldmatrix.x2 directly produces its TF32 A fragment.
             packed = {
                 (packed.x & 0x0000ffffU) | (packed.z << 16),
                 (packed.x >> 16) | (packed.z & 0xffff0000U),
@@ -350,11 +387,11 @@ compute_store_wu_panel(SmemTile<BT> T_view, SmemTile<WU_PANEL_COLS> panel,
     }
 }
 
-template <int K_PANEL_COLS, int WU_PANEL_COLS, int BLOCK_WARPS>
+template <bool K_F16, int K_PANEL_COLS, int WU_PANEL_COLS, int BLOCK_WARPS>
 __global__ void
-prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16* __restrict__ v_in,
+prepare_wy_wu_kernel(const void* __restrict__ k_raw, const __nv_bfloat16* __restrict__ v_in,
                      const float* __restrict__ g_in, const float* __restrict__ beta_in,
-                     __nv_bfloat16* __restrict__ W, __nv_bfloat16* __restrict__ U,
+                     void* __restrict__ W_raw, void* __restrict__ U_raw,
                      float* __restrict__ g_cumsum_out, head_map qk_map) {
     static_assert(BLOCK_WARPS == 4 || BLOCK_WARPS == 8);
     static_assert(BLOCK_WARPS % N_SUB == 0);
@@ -368,19 +405,23 @@ prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16
     extern __shared__ float smem[];
     float* const T_inv_smem = smem;
     float* const stage_smem = smem + dims::T_inv_floats;
-    auto* const output_smem = reinterpret_cast<__nv_bfloat16*>(stage_smem + dims::stage_floats);
+    using KType             = std::conditional_t<K_F16, __half, __nv_bfloat16>;
+    auto* const output_smem = reinterpret_cast<KType*>(stage_smem + dims::stage_floats);
     float* const g_smem     = stage_smem + dims::stage_floats + dims::output_stage_floats;
     float* const beta_smem  = g_smem + BT;
     float* const bg_smem    = beta_smem + BT;
 
-    // stage_smem aliases BF16 K (WY-B), FP32 Schur scratch (WY-D), and one
+    // stage_smem aliases 16-bit K (WY-B), FP32 Schur scratch (WY-D), and one
     // pre-scaled FP32 V/K panel (WU). All handovers are block-barrier guarded.
-    auto* const K_smem    = reinterpret_cast<__nv_bfloat16*>(stage_smem);
-    float* const scr_smem = stage_smem;
+    const auto* const k_in = static_cast<const KType*>(k_raw);
+    auto* const W          = static_cast<KType*>(W_raw);
+    auto* const U          = static_cast<KType*>(U_raw);
+    auto* const K_smem     = reinterpret_cast<KType*>(stage_smem);
+    float* const scr_smem  = stage_smem;
 
     SmemTile<BT> M_view{T_inv_smem};
     SmemTile<BT> T_view{T_inv_smem};
-    Bf16SmemTile<K_PANEL_COLS> K_view{K_smem};
+    Smem16Tile<KType, K_PANEL_COLS> K_view{K_smem};
     SmemTile<WU_PANEL_COLS> WU_view{stage_smem};
 
     const int tid    = static_cast<int>(threadIdx.x);
@@ -442,12 +483,11 @@ prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16
         g_cumsum_out[g_row_base + (int64_t)t1 * H_v] = c1;
     }
 
-    // === Phase WY-B: native BF16 KKT on the lower-tri 4x4 sub-block grid ===
+    // === Phase WY-B: native 16-bit KKT on the lower-tri 4x4 sub-block grid ===
     //
-    // K is a represented BF16 Op input. Keeping it BF16 through shared memory
-    // and m16n8k16 changes no operand precision relative to the former
-    // BF16->FP32->TF32 path: every BF16 value is exactly representable in TF32.
-    // The KKT accumulator remains FP32.
+    // Raw K remains at its represented BF16 boundary. Fused normalization uses
+    // private FP16 so its extra significand bits reach native m16n8k16. The KKT
+    // accumulator remains FP32.
     float A_reg[N_SUB][8] = {};
 
     const int64_t k_base = cs * k_stride_t + static_cast<int64_t>(qk_map.qk_head(h_v)) * kStateDim;
@@ -477,9 +517,15 @@ prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16
                     const int row_b = j_sub * BC + n_tile * MMA_N + b_rin;
                     unsigned bf[2];
                     ldmatrix_x2(bf[0], bf[1], smem_addr(K_view.ptr(row_b, k_off + b_koff)));
-                    mma_bf16(A_reg[j_sub][n_tile * 4 + 0], A_reg[j_sub][n_tile * 4 + 1],
-                             A_reg[j_sub][n_tile * 4 + 2], A_reg[j_sub][n_tile * 4 + 3], af[0],
-                             af[1], af[2], af[3], bf[0], bf[1]);
+                    if constexpr (K_F16) {
+                        mma_f16(A_reg[j_sub][n_tile * 4 + 0], A_reg[j_sub][n_tile * 4 + 1],
+                                A_reg[j_sub][n_tile * 4 + 2], A_reg[j_sub][n_tile * 4 + 3], af[0],
+                                af[1], af[2], af[3], bf[0], bf[1]);
+                    } else {
+                        mma_bf16(A_reg[j_sub][n_tile * 4 + 0], A_reg[j_sub][n_tile * 4 + 1],
+                                 A_reg[j_sub][n_tile * 4 + 2], A_reg[j_sub][n_tile * 4 + 3], af[0],
+                                 af[1], af[2], af[3], bf[0], bf[1]);
+                    }
                 }
             }
         }
@@ -491,9 +537,9 @@ prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16
 
 #pragma unroll
         for (int v = tid; v < K_STAGE_VECS; v += BLOCK_THREADS) {
-            const int row            = v / K_VECS_PER_ROW;
-            const int col8           = (v - row * K_VECS_PER_ROW) * 8;
-            const __nv_bfloat16* src = k_in + k_base + (int64_t)row * k_stride_t + panel_col + col8;
+            const int row    = v / K_VECS_PER_ROW;
+            const int col8   = (v - row * K_VECS_PER_ROW) * 8;
+            const KType* src = k_in + k_base + (int64_t)row * k_stride_t + panel_col + col8;
             cp_async<16, Cache::cg>(K_view.ptr(row, col8), src);
         }
         cp_commit();
@@ -524,7 +570,7 @@ prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16
                 constexpr int VECS_PER_ROW   = WU_PANEL_COLS / 8;
                 constexpr int N_VECS         = BT * VECS_PER_ROW;
                 const int helper_tid         = tid - WY_WARPS * ninfer::ops::kWarpSize;
-                Bf16SmemTile<WU_PANEL_COLS> preload{output_smem};
+                Bf16SmemTile<WU_PANEL_COLS> preload{reinterpret_cast<__nv_bfloat16*>(output_smem)};
 #pragma unroll
                 for (int v = helper_tid; v < N_VECS; v += HELPER_THREADS) {
                     const int row  = v / VECS_PER_ROW;
@@ -674,10 +720,9 @@ prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16
     // === Phase WY-E: +I on diagonal of T_inv (no HBM write; sync fused into WU-A) ===
     if (tid < BT) { M_view.at(tid, tid) += 1.0f; }
 
-    // W/U preserve the former precision path. BF16 inputs are converted to
-    // FP32, multiplied by their FP32 row scale, stored as FP32, and consumed by
-    // TF32 MMA with FP32 accumulation. In particular, T_inv and scaled V/K are
-    // never down-cast to BF16.
+    // Inputs are converted to FP32, multiplied by their FP32 row scale, stored
+    // as FP32, and consumed by TF32 MMA with FP32 accumulation. T_inv and the
+    // scaled V/K panels therefore never cross a narrower materialization.
     if (tid < BT) { bg_smem[tid] = beta_smem[tid] * expf(g_smem[tid]); }
 
     const int64_t out_base       = cs * H_v * kStateDim + static_cast<int64_t>(h_v) * kStateDim;
@@ -693,7 +738,9 @@ prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16
         if constexpr (BLOCK_WARPS == 8) {
             if (panel == 0) {
                 load_scaled_wu_panel_from_smem<WU_PANEL_COLS, BLOCK_THREADS>(
-                    WU_view, Bf16SmemTile<WU_PANEL_COLS>{output_smem}, beta_smem, tid);
+                    WU_view,
+                    Bf16SmemTile<WU_PANEL_COLS>{reinterpret_cast<__nv_bfloat16*>(output_smem)},
+                    beta_smem, tid);
             } else {
                 load_scaled_wu_panel<WU_PANEL_COLS, BLOCK_THREADS>(
                     WU_view, v_in + v_base, v_stride_t, beta_smem, panel_col, tid);
@@ -703,7 +750,7 @@ prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16
                                                                beta_smem, panel_col, tid);
         }
         __syncthreads();
-        compute_store_wu_panel<false, WU_PANEL_COLS, BLOCK_WARPS>(
+        compute_store_wu_panel<false, KType, WU_PANEL_COLS, BLOCK_WARPS>(
             T_view, WU_view, output_smem, U + out_base, out_row_stride, panel_col, warp, lane);
     }
 
@@ -716,7 +763,7 @@ prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16
         load_scaled_wu_panel<WU_PANEL_COLS, BLOCK_THREADS>(WU_view, k_in + k_wu_base, k_stride_t,
                                                            bg_smem, panel_col, tid);
         __syncthreads();
-        compute_store_wu_panel<true, WU_PANEL_COLS, BLOCK_WARPS>(
+        compute_store_wu_panel<true, KType, WU_PANEL_COLS, BLOCK_WARPS>(
             T_view, WU_view, output_smem, W + out_base, out_row_stride, panel_col, warp, lane);
     }
 }

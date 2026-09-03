@@ -1,336 +1,238 @@
-# Qwen3.8-27B performance backlog
+# Qwen3.8-27B NVFP4 active work
 
-## Current non-kernel gate: GPU-gap attribution (2026-09-01)
+This file contains only current work for the supported `qwen3.8-27b/nvfp4` product on one RTX
+5090. The default measurement profile is NVFP4 KV, CUDA Graphs enabled, prefill chunk 4096, and
+startup-fixed C=1/2/3/4 unless a narrower experiment says otherwise. Completed campaigns belong in
+the active documentation or git history, not in this backlog.
 
-The DFlash4 NVFP4 host-overhead campaign at C=1/2/3/4 removed avoidable telemetry and
-terminal-publication work but showed no material uniform end-to-end decode gain. The next work is
-therefore a **GPU-gap attribution gate**, not another speculative host cleanup:
+## Long-context chunk sensitivity
 
-1. Capture one warmed, steady DFlash4 decode wave at each supported C on the current artifact,
-   NVFP4 KV, `--prefill-chunk 4096`, and fixed greedy workload.
-2. Measure each GPU-idle interval between completed GPU work and the next CUDA submission, and
-   assign it to one owner: executor scheduling/frame packing, graph selection/install, launch,
-   D2H/output-state folding, or response publication.
-3. Implement a CPU-side change only if a repeatable owned gap is large enough to move the
-   end-to-end wave metric; benchmark it against the preserved cumulative baseline with exact work
-   and output hashes.
+The directly submit-able 101,708-token reproducer and its observed behavior are recorded beside the
+fixture:
 
-Do not add an online graph autotuner, a new graph lookup cache, or per-round profiling output
-without this attribution. The current transition-derived graph profiles and linear selection remain
+- `plans/fixtures/qwen38-long-context-chunk-invariance-request.json`
+- `plans/fixtures/qwen38-long-context-chunk-invariance-request.md`
+
+### Established facts
+
+- Before `972f3cde`, the default chunk-4096 DFlash2 path could select a registered stop token while
+  the structured Qwen output session was still in reasoning. It reproduced on fresh prefill and
+  response-checkpoint reuse.
+- The runtime excludes registered model stop tokens from ordinary and speculative selection while
+  reasoning is open, after `</think>` until non-whitespace answer content begins, and while a
+  tools-enabled output has an ambiguous opener or unbalanced `<tool_call>` markers. Stops remain
+  eligible after an established answer or complete tool call. A speculative round that crosses
+  into a protected state and then selects a stop is discarded transactionally and retried with the
+  registered model stops excluded. Caller stops and raw output retain their normal behavior.
+- With stop suppression temporarily disabled, the current chunk-4096 route reproduced a registered
+  stop after 32 reasoning tokens and emitted no answer on both fresh prefill and VRAM response-
+  checkpoint reuse. The guard therefore masks a still-live model trajectory failure; it did not
+  affect any prefill-stage localization.
+- A target-model/no-spec diagnostic of the failing round measured `<|im_end|>` at 80.91% of the
+  actual post-filter sampling distribution. The remaining support was ` Keep` 11.24%, ` Since`
+  6.64%, and ` Need` 1.20%; the seeded draw was 0.52699. Premature selection was therefore the
+  dominant model probability, not a low-probability sampling accident.
+- At the exact failing DFlash2 verification column, the target distribution assigned 67.80% to
+  `<|im_end|>`, 12.26% to ` Since`, 6.35% to newline, 5.57% to ` The`, 4.28% to ` Given`, and
+  3.75% to ` Keep`; all other tokens were removed by the configured filters. This is the target
+  distribution `p` at the selected speculative column. The diagnostic did not retain the proposal
+  distribution `q`, so it does not establish the conditional `p-q` correction distribution when
+  that correction path selected the token.
+- The underlying token trajectory remains sensitive to legal long-prompt chunk boundaries. At the
+  common 91,061-token frontier for chunk 4096 versus 1024, layer-0 input, control projection,
+  projected Q/K/V, convolution output, and final BF16 convolution state were byte-identical. The
+  first difference was the GDN recurrence: relative L2 was `3.68e-6` for its output and `3.52e-5`
+  for FP32 state, comfortably inside the Op criteria `4.1e-3` and `2.7e-3`. Layer 1 then received
+  different represented BF16 input, so its amplification was not a same-input Op comparison.
+- A production-shape direct regression now compares C=6144, T=3404 against
+  `1024+1024+1024+332` using the independent FP64 causal-convolution oracle and requires exact
+  final BF16 state. It passes. The real-model trace and direct tests classify the dense split as
+  qualified recurrence association sensitivity rather than an incorrect slot, convolution, or
+  outer-prefill state transition.
+- The independent GDN oracle was re-audited against the active model formula and the upstream
+  recurrent definition: it consumes represented BF16 Q/K/V and FP32 gates/state, normalizes Q/K in
+  FP64 with epsilon `1e-6`, applies decay before the delta correction, reads from the updated state,
+  and retains the logical state/output in FP64. A production-geometry T=3404 diagnostic found the
+  current chunked route and `1024+1024+1024+332` partition bit-identical, but both had output
+  relative L2 `3.90949e-3` and maximum error `1.55941e-4` against the oracle. The relative criterion
+  `4.1e-3` passed, while the gross limit `1.52500e-4` failed by 2.26%; final-state relative L2 was
+  `2.02075e-3` against `2.7e-3`. This is evidence that the production route is close to the existing
+  accuracy boundary, not that the oracle is too low precision.
+- Canonical 1024-token micro-tiling inside the GDN Op was rejected. On the real 91,061-token fixture,
+  chunk 4096 retained the exact same 57-token completion before and after the prototype, while the
+  chunk-1024 control remained on a different 64-token reasoning trajectory. Prefill was 6460.2
+  tok/s before and 6452.0 tok/s after, within run noise. The prototype therefore neither repaired
+  trajectory sensitivity nor established a performance benefit and was removed.
+- Exact layer-0 operands and incoming state were captured for the shared final T=947 prefill unit
+  from both chunk routes. Q/K/V/g/beta were byte-identical. Incoming FP32 state differed by relative
+  L2 `2.07975e-4`, but independent FP64 replay attenuated that to `8.08324e-6` in output and
+  `1.86972e-5` in final state. The production chunked replay instead produced a `5.54177e-4` output
+  difference and `3.56142e-5` final-state difference; the direct FP32 recurrent route produced
+  `1.46484e-4` and `1.87039e-5`. Against the same FP64 oracle, chunked final-state error was
+  `1.0671e-3`, versus `1.4e-6` for the recurrent route. The incoming drift is therefore not the
+  dominant source at this frontier: the material amplification comes from the chunked route's
+  BF16 intermediates and/or TF32 state-passing arithmetic. Separating those two implementation
+  profiles is the next numerical experiment.
+- A follow-up replay isolated the normalized-Q/K cast before any chunk W/U or TF32 state-passing
+  work. The direct recurrent route with FP32-normalized Q/K had final-state error `1.40391e-6`
+  against FP64; materializing the same normalized values to BF16 first raised it to `9.38114e-4`.
+  The full chunked route was `1.0671e-3`, so normalized-Q/K BF16 staging accounts for about 88% of
+  its observed state error on this real input. Output error rose from `1.58781e-3` to `1.7534e-3`
+  under that cast, versus `1.88392e-3` for the full chunked route. Across the two incoming states,
+  the recurrent final-state difference remained `1.8704e-5` with either normalization profile;
+  the cast primarily introduces absolute trajectory error accumulated across prefill rather than
+  amplifying the final unit's incoming-state difference. Promoting `h_chunk` alone is not useful
+  for persistent-state correctness because it does not feed persistent state.
+- The selected correction retains the public BF16 inputs and independent FP64 oracle while using
+  FP16 for the private normalized Q/K and W/U/v_new/h_chunk chunk workspaces. Normalized Q/K are
+  bounded and FP16 retains a 10-bit significand, matching TF32 operand precision, at the same two
+  bytes per element as BF16. Extending that profile through the other private workspaces removes
+  their BF16 rounding without changing workspace or CUDA Graph allocation bytes; width-one decode
+  still bypasses the chunked route. At production geometry T=3404, the independent oracle measured
+  output relative L2 `1.87873e-3` and maximum error `8.27174e-5`, passing limits `4.1e-3` and
+  `1.52500e-4`. Final-state relative L2 was `4.20052e-4`, down 79.2% from the BF16-workspace
+  same-input BF16-workspace baseline `2.02075e-3`, and maximum state error was `1.39668e-4`
+  against the `9.02478e-4` gross limit. The same-input BF16 baseline reproduced output relative
+  L2 `3.90949e-3` and its gross-bound failure. The full focused GDN suite passes, including raw-Q/K
+  BF16, chunk/tail, distinct-state, and partitioned execution.
+- A paired cold-L2 CUDA-Graph operator A/B alternated five baseline and five candidate binaries
+  built from the same source state at each width (20 warmups and 200 samples per run). At T=1024
+  the median-of-run medians was `163.872 us` for BF16 private staging and `165.888 us` for FP16, a
+  1.23% cost. At T=4096 it was `718.848 us` versus `720.576 us`, a 0.24% cost. Workspace remained
+  exactly
+  `71,499,776` bytes at T=1024 and `285,999,104` bytes at T=4096, with five graph nodes in both
+  profiles. At width one, five alternating 500-sample runs were exactly tied at a `6.144 us`
+  median because both builds dispatch the unchanged recurrent kernel.
+- Matched Engine A/Bs on the DFlash2 NVFP4 artifact used NVFP4 KV, CUDA Graphs, C=1, DFlash-5,
+  and the optimized draft head (two warmups plus five measured repetitions). Candidate prefill
+  throughput versus the BF16-private baseline was `10,767.5` versus `10,774.9 tok/s` at T=1024
+  (-0.07%) and `11,621.1` versus `11,646.2 tok/s` at T=4096 (-0.22%). Removing redundant
+  normalization of the recurrent tail raised the final T=3404 candidate to `10,255.3 tok/s`
+  versus `10,222.7 tok/s` for the baseline (+0.32%). The 512-token decode result was `134.33` versus
+  `133.59 tok/s` (+0.55%) with identical DFlash acceptance length `2.07287`, consistent with zero
+  direct decode cost. Workspace capacity, per-case allocator peaks, CUDA Graph observed memory
+  (`6,291,456` bytes), and all reported startup reservations were byte-identical.
+- A matched XAttention-enabled Engine A/B on the same RTX 5090 used tau 0.9, NVFP4 KV, CUDA
+  Graphs, C=1, T=32768, and prefill chunk 4096. Three order-balanced pairs each used two warmups
+  and five measured repetitions after the GPU queue was clear. The FP16-private candidate's paired
+  median throughput effect was +0.10%, with individual pairs from -0.32% to +0.34%; this establishes
+  no measurable XAttention prefill slowdown. Median-of-run medians was 11,664.7 versus 11,635.4
+  tok/s (+0.25%). Workspace allocator peak (`723,812,352` bytes) and observed CUDA Graph memory
+  (`2,097,152` bytes) were byte-identical. The GDN correction remains active in the model's GDN
+  layers while XAttention changes only the GQA attention layers.
+- On the real 91,061-token fixture at prefill chunk 4096, the matched BF16-private baseline
+  reproduced its known normal 57-token completion at `6,430.0 tok/s`. The FP16-private route
+  completed normally in 50 tokens at `6,413.0 tok/s` (-0.27%). Its chunk-1024 control also closed
+  reasoning, emitted an answer, and stopped normally in 46 tokens at `4,953.1 tok/s`; the prior
+  BF16-private chunk-1024 control had remained in reasoning through the 64-token diagnostic limit.
+  The two legal chunk sizes still take different qualified floating-point trajectories, but both
+  now clear the behavioral failure frontier and neither selects a premature structured stop.
+- The 27B control route previously dropped split-K at arbitrary power-of-two widths. Direct RTX 5090
+  screening supports split8 through T=1792, split4 through T=3584, and split2 through T=4096. At
+  T=3072 the control projection falls from 45.1 to 34.4 us, and at the real 3404-token tail from
+  46.7 to 34.8 us; the finer routes are also closer to the independent FP64 oracle.
+- Canonical chunk 128 is not a viable product workaround: it reduced prefill throughput by 75.8%
+  and made TTFT 4.13 times slower than chunk 4096 on the reproducer.
+- Exact token identity across chunk partitions is not the semantic target. The target is correct
+  represented state transitions and valid structured output, with any approximation covered by an
+  explicit numerical or behavioral criterion.
+
+### Investigation design
+
+Dense behavior and DFlash2 concurrent row isolation are classified. Continue with XAttention.
+Tau 1.0 is the dense-identity gate. Tau 0.9 remains an explicitly approximate mode;
+its measured long-context result was about +49.7% prefill throughput and -33.1% TTFT, but it needs
+perplexity and long-context behavioral qualification before any default-policy decision.
+
+Current XAttention numerical evidence on 2026-09-02:
+
+- Tau 1.0 does not enter the sparse launcher; it selects the ordinary exact-NVFP4 dense kernel, so
+  the identity gate has no separate arithmetic path.
+- The focused GQA proof passes for both registered geometries. It checks the production keep-list
+  against an independent paper inverse-reshape/mass oracle, includes adversarial inputs that
+  distinguish the retired four-antidiagonal heuristic, and compares the retained-tile attention
+  result directly with an independent FP64 softmax oracle under the NVFP4 criterion.
+- On the isolated 27B T=4096 synthetic operator workload, tau 0.9 kept 90.7%, 90.2%, and 90.1% of
+  visible pages at 32k, 64k, and 128k. Median operator time improved from 12.438 to 11.138 ms at
+  32k, 25.494 to 22.750 ms at 64k, and 51.625 to 46.402 ms at 128k. Rank scratch was 120, 240,
+  and 479 MB respectively. These random-input timings qualify the implementation cost only; they
+  neither replace real-model keep density nor establish quality.
+- The real-model CUDA-Graph prefill PPL comparison passed at 8k and 32k. Against dense NVFP4,
+  tau 0.9 changed mean NLL by -0.00084 at 8k (paired 2-sigma 0.00171) and -0.00234 at 32k
+  (paired 2-sigma 0.00488); both are unresolved inside paired noise, with no non-finite values.
+- The first 32k XAttention cell exposed an integration defect before scoring: CUDA Graph startup
+  consumed 70 MiB against the 12 MiB ordinary allowance. XAttention prefill is already eager and
+  decode remains exact, so disabling decode graphs would be the wrong fix. XAttention-enabled
+  plans now reserve the established 96 MiB large-topology allowance. Ordinary, MTP, and DFlash
+  startup all pass with the new bound; this changes reserved VRAM, not execution work.
+- The required 64k NIAH gate passed under tau 0.9, NVFP4 KV, CUDA Graphs, and MTP: the model returned
+  the exact `ORCHID=493817; COLOR=COBALT` record from a 64,511-token prompt. Tau 0.9 remains an
+  explicit approximate experiment rather than the product default; the isolated random-input
+  keep density and scratch cost do not support changing the default policy on their own.
+
+Final validation covers fresh prefill and response-checkpoint reuse at C=1/2/3/4, confirms that
+reasoning cannot terminate on a registered stop token, confirms normal post-reasoning stopping, and
+benchmarks TTFT/prefill throughput at the default chunk 4096. Exact token equality across legal chunk
+partitions is required only if the localized operation's actual semantic contract requires it.
+
+### Structured stop eligibility
+
+The implementation, correction review, and maintainer approval are complete.
+
+- `OutputSession` owns reasoning closure, first non-whitespace answer establishment, incremental
+  tool-marker state, and speculative preview commit/discard. Tool-output eligibility is derived by
+  ordinary and incremental prompt preparation from tool schemas, assistant tool-call history, or a
+  Tool-role message; raw-token preparation remains unstructured and there is no public override.
+- The executor suppresses registered model stops at committed state boundaries. A speculative round
+  that enters a protected state and then selects a registered model stop is rejected independently
+  of the caller's default-stop policy and retried with those stops suppressed.
+- Rejection folds zero GDN columns, preserves the committed DFlash context frontier, invalidates the
+  overwritten tail hidden value, reverses stochastic device token counts, and restores adaptive
+  state plus every per-attempt speculative counter. Cancellation also invalidates an in-flight
+  speculative tail before retention. Greedy penalty requests do not reverse counts because greedy
+  selection never increments them.
+- Greedy DFlash/MTP target verification receives the active sampling configuration, so target
+  argmax honors the same suppression as proposal/acceptance.
+
+Qualification on 2026-09-02:
+
+- A clean full build and the full 104-entry CTest sweep had zero failures; 11 real-artifact tests
+  skipped normally without their opt-in environment variables. The affected 13-test frontend/runtime,
+  sampling, speculative, replay-fold, CLI, and serving-schema subset also passed independently.
+- The relaxed real DFlash test passed with the local NVFP4 codebook artifact at fixed k=5 C=1,
+  including adaptive N=7 concurrency, terminal/queue behavior, RAM reseed, and in-flight restore.
+  The subsequent numerical campaign classified the k=5/k=7 C=1-versus-C=3 differences against
+  independent Op/state oracles; exact amplified greedy identity is not the numerical criterion.
+- The long fixture completed from fresh prefill and resident response-checkpoint reuse with a normal
+  post-reasoning stop: 49 generated tokens, 125 reasoning characters, and 70 answer characters in
+  both runs. This local `qwen3_8_27b_nvfp4_dflash_w8.ninfer` artifact rendered 91,061 prompt tokens;
+  the fixture hash remained the recorded `fbe71d...e98`.
+- The temporary exact-output Engine A/B used the 16-token prompt, 128 outputs per lane, greedy
+  sampling, model-default termination off, NVFP4 KV, DFlash k=5 optimized head, graphs, one warmup
+  pair, and eight alternating measured pairs at startup-fixed C=1/2/3/4. Median full-wave deltas
+  were -0.020% C1, +0.008% C2, -0.126% C3, and +0.036% C4. The worst slowdown was 0.036%, with no
+  systematic regression; the temporary harness and API toggle were removed.
+- The requested final Sol review found no remaining correctness, API, or performance defects against
+  the seven handoff corrections.
+
+## GPU-gap attribution
+
+The DFlash4 NVFP4 host-overhead campaign removed avoidable telemetry and terminal-publication work
+but showed no material uniform end-to-end decode gain. Before another CPU cleanup, capture one
+warmed steady DFlash4 decode wave at each C=1/2/3/4 and assign every repeatable GPU-idle interval to
+executor scheduling/frame packing, graph selection/install, launch, D2H/output-state folding, or
+response publication. Change a CPU path only when its owned gap is large enough to move the
+end-to-end wave metric. Preserve exact work and output hashes in the A/B.
+
+Do not add an online graph autotuner, another graph lookup cache, or per-round profiling output
+without this attribution. The transition-derived graph profiles and current linear selection are
 the measured choice.
 
-### Deferred correctness investigation: strict DFlash packed/T=1 oracle
-
-After the GPU-gap item, investigate the current codebook artifact's strict target-only greedy
-divergence in `ninfer_qwen3_8_27b_dflash_real_test` (DFlash k=4 chain) and the independent
-DFlash k=7 C=3 row-isolation divergence from sequential C=1 DFlash. Relaxing the packed/T=1
-target-only comparison does **not** relax row isolation, and the full relaxed suite still fails
-that k=7 concurrent oracle. The host-overhead changes did not touch target math and their
-pre/post benchmark output hashes match; nevertheless, do not treat relaxed testing as a
-replacement for either strict oracle. Establish whether each mismatch is an accepted represented
-precision boundary or a model/Op bug, then either fix it or state the supported numerical
-criterion explicitly.
-
-Working backlog for maximum single-GPU inference speed on the registered
-`qwen3.8-27b` identities. Primary serving shape: **MTP**, `--lm-head-draft`,
-INT8 KV, CUDA Graphs on, RTX 5090 / `sm_120a`.
-
-This is not a second architecture spec. Contracts stay in
-`docs/maintainer/qwen3.8-27b-artifact.md`, `qwen3.6-27b-model.md`,
-`concurrent-inference-architecture.md`, and `op-development.md`. Remove or
-rewrite this file when the backlog is exhausted or the product target changes.
-
-Qwen3.8-27B shares the 27B execution package with Qwen3.6-27B. Almost every
-item below is package work. The Qwen3.8-specific deltas are W8 embedding and
-output-head on `groupwise-int`, Qwen3.8 tokenizer/template bytes, and the
-registered sampling presets.
-
-## 1. Decision: do not set `min-p=0` to make optimization easier
-
-**No.** `min-p` is not a kernel fork and does not make the sampler, MTP graph,
-or 27B body easier to optimize.
-
-The sampler already treats `min_p <= 0` as disabled. With `min_p > 0` it only
-drops a suffix of the **already truncated** candidate list (at most 20 ids)
-after `exp`/`sum`:
-
-```204:214:src/ops/kernel/sampling_device.cuh
-        const float min_p_thresh = (cfg.min_p > 0.0f) ? cfg.min_p * e0 : -1.0f;
-        const bool top_p_active  = (cfg.top_p < 1.0f);
-        const float top_p_target = cfg.top_p * sum;
-        // ...
-            if (min_p_thresh >= 0.0f && prob[j] < min_p_thresh) { break; }
-```
-
-That does not change the 248k `sampling_partial_topk` grid, workspace, CUDA
-Graph topology, or GEMM/attention launches. Cost vs a 27B MTP verify round is
-noise.
-
-What `min-p` *does* change is which token is drawn, therefore MTP accept length
-and tokens/round. Turning it off “for speed work” mixes a quality/acceptance
-shift into every A/B.
-
-Registered Engine `min_p` for Qwen3.8 is already **0**. `--min-p 0.01` on the
-live serve line is an override, not the package default.
-
-Use one **frozen** sampling profile for all speed A/Bs and keep it for the
-whole campaign:
-
-| Knob | Recommendation |
-|---|---|
-| `min-p` | Leave at the registered 0, or keep 0.01 if that is the product serve line. Do not flip it between runs. |
-| temperature / top-p / top-k | Freeze. Temperature moves MTP acceptance far more than `min-p`. |
-| greedy | Allowed as a **kernel-timing** overlay (exact argmax, zero sampler variance). Not a substitute for the stochastic product line. |
-| `--lm-head-draft` | Always on for the MTP product path. |
-| `--spec mtp --draft-tokens` | Freeze k while measuring a kernel; sweep k as its own experiment (item B1). |
-
-Do not add a sampler special-case, a second graph, or a “fast path” that is
-only legal at `min_p=0`.
-
-## 2. Target, baseline, and how to measure
-
-### 2.1 Identities
-
-| Artifact | Weights | Notes |
-|---|---|---|
-| `qwen3_8_27b_nvfp4.ninfer` | `nvfp4` | Same object layout as Qwen3.6-27B NVFP4. Current live serve line. |
-| `qwen3_8_27b.ninfer` | `groupwise-int` | Qwen3.8 delta: W8 embedding and full output head. Slower body; same MTP host path. |
-
-Run the campaign on the artifact that is actually served. Quote the other
-profile only when a claim is about that profile.
-
-Qwen3.8 is **not** in `docs/performance.md`. Do not cite 3.6 tables as 3.8
-results. Use 3.6-27B MTP3 only as a prior: roughly 213–231 tok/s NVFP4 and
-162–175 tok/s groupwise-int at C=1 on a 5090.
-
-### 2.2 Product flags to pin
-
-Typical live shape (adjust here if the serve line changes):
-
-```text
---spec mtp --draft-tokens 3 --lm-head-draft
---kv-dtype int8 --kv-capacity auto --max-context 260000
---max-concurrency 2
-```
-
-CUDA Graphs stay on. `--no-cuda-graph` is a debug overlay, not a candidate
-default.
-
-### 2.3 Metrics
-
-| Metric | Use |
-|---|---|
-| committed decode tok/s | primary, from server unrounded `decode_seconds` |
-| MTP acceptance and tokens/round | required whenever k, sampling, or draft head changes |
-| server TTFT (`prepare + vision + prefill`) | host / prefill / MTP bridge |
-| C=2 decode-while-prefill aggregate tok/s | only for chunk-policy work |
-| startup / `upload_seconds` | load path only |
-
-An isolated op bench supports a kernel claim. It does not close an end-to-end
-claim.
-
-### 2.4 First profile (gate for everything else)
-
-Warmed `ninfer-serve`, Qwen3.8 artifact, MTP3, C=1 then C=2. nsys one round:
-
-1. target verify T=K+1 through 64 layers
-2. sampler on those columns
-3. MTP alignment forward
-4. `draft_head` GEMM × K
-5. MTP AR steps
-6. D2H + CPU `OutputSession::preview`
-7. `gdn_replay_fold` + second sync
-8. `cudaGraphExecUpdate` when E crosses a graph bucket
-
-Stop collecting once those slices can be ranked. Do not start a full ncu
-campaign until a named kernel is the live decision.
-
-## 3. Workstreams
-
-Expected ranges are hypotheses until §2.4 exists for this artifact. “Body
-kernels” are owned by the parallel decode/prefill campaign; they stay on the
-list so this file is complete, but this backlog does not duplicate that work.
-
-### A. 27B body kernels (owned elsewhere)
-
-Do not pick these up here unless that campaign hands them back.
-
-| ID | Item | Why it matters | Expected e2e | Difficulty |
-|---|---|---|---|---|
-| A1 | NVFP4 / groupwise decode GEMM, GQA, GDN recurrent | Most of an MTP verify at T=4 | large | high |
-| A2 | Prefill GEMM / attention / GDN chunked | TTFT and C=2 decode stalls | large on prefill | high |
-| A3 | W8 output head (Qwen3.8 groupwise-int) | Target-verify lm_head; 3.8-specific vs 3.6 groupwise | medium on that profile | high |
-| A4 | Fused RMSNorm / RoPE / residual inside the graph | Launch tax already gone; math still separate | small unless nsys says otherwise | med |
-
-### B. MTP product levers (this backlog, first)
-
-| ID | Item | Why | Expected | Difficulty | Profile? |
-|---|---|---|---|---|---|
-| B1 | Sweep `--draft-tokens` 3 vs 4 vs 5 on Qwen3.8, keep `--lm-head-draft` | tok/s = tokens_per_round / ms_per_round. Extra AR is already in the graph. | 0–15%+ or a loss if acceptance drops | low | yes (corpus, not ncu) |
-| B2 | Keep `--lm-head-draft`; never A/B the full 248k proposal head as a “speed” option | Full head is three 248k GEMMs per round | regression | n/a | no |
-| B3 | C=2 `--prefill-chunk` 256 / 512 / 1024 | One prefill owner; decode waits a full chunk. ~1024 NVFP4 tokens can be several MTP rounds. | 5–20% of **decode-while-prefill** TPS; may hurt prefill tok/s | med | **yes** |
-| B4 | Do not default DFlash | 27B package does not support it | n/a | n/a | n/a |
-
-### C. MTP round structure (this backlog, after nsys)
-
-MTP3 graph body is `mtp_decode_batch_body` in
-`src/targets/qwen3_6/impl/runtime/mtp_impl.h`: H2D → verify/accept → MTP
-alignment → propose ×3 → D2H. Fold is **after** CPU preview in
-`program_impl.h`.
-
-| ID | Item | Why | Expected | Difficulty | Profile? |
-|---|---|---|---|---|---|
-| C1 | Time Fold + CPU preview gap | 48 GDN layers, second `device.synchronize()`, stop strings need host detokenize | 1–5% if ≳0.3 ms on a ~15 ms round; else ignore | high to put Fold in the graph; low to measure | **yes** |
-| C2 | Sampler on T=K+1 columns (248k vocab, ≤20 candidates, `min-p` irrelevant) | 4× ordinary decode sampler | 0–5% | med–high (oracle) | **yes** |
-| C3 | `text/draft_head` Q4 GEMM `[131072,5120]` × K | MTP-only; not the 27B body campaign | few % to low tens of % if nsys names it | med | **yes** |
-| C4 | MTP layer (attn + SwiGLU) alignment + AR | One-layer draft, width 4 then 1 | only if nsys names it | med | **yes** |
-| C5 | `cudaGraphExecUpdate` at `{127,511,2047,…}` plus MTP3 cut near 1029 | 260k context / 50k gen **will** cross buckets | amortized 1–5% on long gens; hitches at boundaries | med | **yes** |
-| C6 | Device-resident next-round drafts (skip D2H for the following ingress) | Architectural; host still needs tokens for stop policy | 0–3% | high | nsys D2H |
-
-Do not recapture graphs at serving time. Do not fold “max-K then undo” into
-GDN state.
-
-### D. Host / TTFT (secondary for MTP tok/s)
-
-| ID | Item | Metric | Expected | Difficulty |
-|---|---|---|---|---|
-| D1 | Tokenizer BPE (naive pair-merge) | long-prompt TTFT | 10–100+ ms at 8k if BPE dominates; prefill still owns 64k+ | med (bit-identical) |
-| D2 | `encode_rendered_chat` double-encode on rewrite checkpoint | TTFT | small | low |
-| D3 | Load-time `id → bytes` detokenize table | GPU-thread preview of up to K+1 tokens | &lt;1–3% tok/s at 27B MTP | low |
-| D4 | MTP prefill bridge + eager AR propose on last chunk | TTFT | 1–5% of short-prompt TTFT | med |
-| D5 | Eager 64-layer prefill wrappers + double sync on last chunk | prefill tok/s | &lt;1–5% | med |
-| D6 | Vision FFmpeg + host bicubic + media mutex | vision TTFT | large on that slice | med (numeric resize contract) |
-| D7 | HTTP SSE `nlohmann` dump | client inter-token latency, **not** Engine tok/s | 50–300 µs/token | low |
-| D8 | KV-RAM pack / C=1 restore | TTFT on RAM hit (`--kv-ram-capacity`) | 0–15% of `kv_ram_load`; 0 tok/s on an in-flight MTP round | low–med |
-
-### E. Load and toolchain (not tok/s)
-
-| ID | Item | Expected | Notes |
-|---|---|---|---|
-| E1 | Clean CMake Release so `CMAKE_CUDA_FLAGS_RELEASE` is `-O3 -DNDEBUG` | &lt;1% graph-on decode; tiny prefill host | Docker does **not** add extra speed flags. Wipe a stale `build/` if the cache var is empty. |
-| E2 | Stay on Release; no RelWithDebInfo `-lineinfo` in production | avoid debug metadata | already the advertised path |
-| E3 | Do not add `--use_fast_math`, host `-ffast-math`, global `--maxrregcount`, RDC on NVFP4 TMA, RDC off on `ninfer_ops` | numeric / illegal insn | |
-| E4 | Host `-march=native` / LTO / device `-dlto` | noise on GPU-bound MTP; `-dlto` can break `memory_evict` | only after e2e is bored |
-| E5 | Artifact `O_DIRECT` + 4×64 MiB pinned H2D | 0–20% of **startup** | bind-mount `.ninfer` off overlayfs |
-| E6 | Persistence mode / clocks / NUMA | process start, not warmed tok/s | not a CMake flag |
-
-## 4. Order of work
-
-1. **Gate:** §2.4 nsys on the served Qwen3.8 artifact, MTP k frozen, sampling frozen.
-2. **B1** k=3/4/5 sweep on one long-reasoning fixture and one low-acceptance fixture (story-like).
-3. **B3** only if C=2 overlapping prefill+decode is a real workload.
-4. **C1–C5** in nsys rank order. Do not start Fold-in-graph or sampler fusion until the slice is ≥ a couple percent.
-5. **A\*** stays with the body-kernel campaign. Hand C3/C4 to them if nsys says the draft stack is the round.
-6. **D\*** when the goal is TTFT or streaming latency, not MTP tok/s.
-7. **E1** whenever a local `build/` cache is empty; otherwise ignore toolchain.
-
-Stop a line when the next experiment cannot change the live default.
-
-## 5. Explicit non-goals
-
-- Mixed prefill+decode in one traversal
-- C ≫ 8, preemption, multi-GPU
-- CPU sampling or logits D2H
-- Serving-time graph capture
-- Changing OpenAI/Anthropic wire JSON for speed
-- Treating Docker as a faster runtime than local Release+Ninja
-- Flipping `min-p`, temperature, or k inside a kernel A/B
-
-## 6. Open questions (fill from §2.4)
-
-- [x] Qwen3.8 NVFP4 MTP3 C=1 tok/s, acceptance, tokens/round vs the 3.6 proxy
-- [x] Round ms split: verify / sampler / draft_head×K / MTP AR / Fold+preview
-- [x] k=4 and k=5 on this checkpoint
-- [x] C=2 chunk 256/512/1024 vs decode-round ms
-- [x] Graph-update hitch (startup-range capture; 9 updates × ~0.24 ms)
-- [ ] Whether the served line stays NVFP4 or also ships groupwise-int
-
-Measured 2026-08-19, RTX 5090, `qwen3_8_27b_nvfp4.ninfer`, frozen sampling
-(temp 0.6, min-p 0, presence 1.0), INT8 KV, graphs on, `--lm-head-draft`.
-
-### Baseline (before speed work)
-
-Short AIME, 4096 gen, max-context 16384:
-
-| C | Decode tok/s | Prefill tok/s | MTP tok/round | Accept |
-|---|---|---|---|---|
-| 1 | 169.1 | 6270 | 2.34 | 44.7% |
-| 2 | 163.4 | ~6300 | ~2.4 | ~46% |
-| 3 | 152.7 | ~6280 | ~2.3–2.4 | ~44–46% |
-
-High-context (thinking-on AIME after haystack; first NIAH run was invalid — 17-token stop):
-
-| Wave | Prefill tok/s | Decode tok/s | TTFT | Accept |
-|---|---|---|---|---|
-| 50k C=1 | 7505 | 175.9 | 6.78 s | 55.6% |
-| 50k C=2 | 7494 | 139.1 | 6.8 / 14.3 s | ~46% |
-| 50k C=3 | 7461 | 127.8 | 6.8 / 14.3 / 22.0 s | ~48% |
-| 100k C=1 | 5129 | 156.7 | 19.7 s | 52.3% |
-| 100k C=2 | 5124 | 122.4 | 19.7 / 40.9 s | ~46% |
-| 100k C=3 | 5122 | 114.4 | 19.7 / 41.0 / 62.5 s | ~50% |
-| 150k C=1 | 3891 | 140.8 | 38.9 s | 49.5% |
-| 150k C=2 | 3895 | 115.1 | 38.8 / 80.0 s | ~48% |
-
-3.6-27B NVFP4 MTP3 proxy was ~213–231 tok/s at ~73–80% accept. Qwen3.8 is
-slower because acceptance is ~45% on AIME, not because the round is much
-longer.
-
-### nsys gate (C=1, 256 gen after warmup)
-
-GPU kernel share of the capture (includes short prefill):
-
-| Slice | Share | Per-round | Action |
-|---|---|---|---|
-| NVFP4 body GEMM / GDN / residual (A1) | ~60%+ | most of ~14 ms | other campaign |
-| W8 target lm_head T=K+1 (A3-class) | 5.5% | ~0.80 ms | other campaign |
-| C3 `q4_rowsplit_gemv` draft_head ×K | 4.5% | ~0.64 ms | measured T=1 MMA; GEMV wins; do not ship |
-| C1 `recurrent_fold` | 1.1% | ~0.17 ms | skip (&lt;0.3 ms) |
-| C2 speculative sampler | 0.2% | ~0.03 ms | skip |
-| C4 MTP pack/split/prepare | &lt;0.1% | noise | skip |
-| C5 `cudaGraphExecUpdate` | 0.1% API | 9× ~0.24 ms | skip |
-| C6 D2H inside `cudaMemcpyAsync` | mixed in 0.8% API | small | skip |
-
-`cudaStreamSynchronize` is 77% of CUDA API time: host waiting on the graph,
-not extra CPU work.
-
-## 7. Per-item prefill / decode report
-
-Deltas vs the §6 baseline. Decode primary is C=1 AIME 4096 unless noted.
-
-| ID | What happened | Prefill tok/s | Decode tok/s | Notes |
-|---|---|---|---|---|
-| A1 | Not this campaign | — | — | Body GEMM/attn/GDN owns ~60%+ of GPU time |
-| A2 | Not this campaign | — | — | Prefill GEMM/attn |
-| A3 | Not this campaign | — | — | W8 verify head 5.5% of capture |
-| A4 | Not this campaign | — | — | RMSNorm already in graph |
-| B1 | Measured k=3/4/5 | 0% (same short prompt) | **k=4 AIME +2.9%** (173.7 vs 168.8); **k=5 −1.1%**; story k=4 **−3.6%**, k=5 **−5.7%** | Leave default k=3. k=4 wins only on high-accept AIME |
-| B2 | Policy: keep `--lm-head-draft` | n/a | n/a | Full 248k proposal head not A/B'd |
-| B3 | Measured chunk 256/512/1024 at 50k C=2 | **256: −33%** (4943 vs 7424); 512: −20% | **256: +4.6%** overlapping decode (145 vs 139); 512: +7.8% | Wall **worse** at 256 (+27%). Keep 1024 |
-| B4 | Policy: no DFlash | n/a | n/a | 27B package does not support it |
-| C1 | nsys only | 0% | 0% | Fold 0.17 ms/round; do not put in graph |
-| C2 | nsys only | 0% | 0% | Sampler 0.2% of GPU |
-| C3 | Measured T=1 MMA vs GEMV; **do not ship** | 0% | 0% (would be ~−0.2% if shipped) | 27B draft_head T=1: GEMV **233.5 µs** (91% HBM) vs MMA **243.7 µs**. 35B k=2048: tie ~106.5 µs. T=2 MMA already 245.8 µs — same roof. Serial K proposes stay serial. |
-| C4 | nsys only | 0% | 0% | MTP layer kernels &lt;0.1% |
-| C5 | nsys only | 0% | 0% | Update hitch ~0.24 ms at bucket crossings |
-| C6 | nsys only | 0% | 0% | D2H not the round |
-| D1+D2+D3 | Shipped together (heap BPE, one-pass checkpoint, id→bytes table) | **0%** (7505→7466, noise) | **0%** (169.1→168.9; 50k decode 175.9=175.9) | 50k **prepare 69→47 ms (−32%)**; TTFT unchanged (prefill owns it) |
-| D4 | Measured last-chunk skip-inner-sync; **do not ship** | 0% | 0% | Short AIME TTFT 54.0→54.4 ms (noise). Last chunk already proposes MTP; extra sync is after GPU work. |
-| D5 | Same measurement as D4 | 0% | 0% | Intermediate chunks must sync before `work_.reset()`. |
-| D6 | N/A | — | — | Vision skipped this pass |
-| D7 | Measured nlohmann vs concat; **do not ship** | 0% | 0% | Typical content chunk **1378→331 ns**. Unnoticeable vs a ~6 ms round. Hand-built JSON changes key order vs nlohmann `dump()`. |
-| D8 | Measured pack vs pinned memcpy; **do not ship** | — | — | 27B GDN 28.75 vs 28.77 GB/s; fragmented 100 MiB KV 28.42 vs 28.74 GB/s. Restore 412 MiB in 14.3 ms at memcpy roof. |
-| E1 | Shipped: `CMAKE_CUDA_FLAGS_RELEASE=-O3 -DNDEBUG` | 0% | 0% | Same A/B as D*; graph-on decode already optimized |
-| E2 | Already Release | n/a | n/a | |
-| E3 | Policy: do not add fast-math / maxrregcount | n/a | n/a | |
-| E4 | Not shipped | — | — | GPU-bound MTP; `-dlto` risk |
-| E5 | Not shipped | — | — | Startup only |
-| E6 | Not shipped | — | — | Persistence/clocks; not warmed tok/s |
-
-**Shipped code in this campaign:** tokenizer D1/D2/D3 and CMake E1. They do not
-move warmed decode or prefill tok/s. The live product lever that actually
-moved decode is **B1 k=4 on AIME only**; do not flip the default from k=3
-without a quality call, because story acceptance drops.
-
-**Largest remaining decode gap vs 3.6:** MTP accept ~45% vs ~75%. That is a
-checkpoint/sampling issue, not a missing kernel in this backlog. Body GEMM
-(A1) is still most of each round.
+## Smaller opportunities
+
+- Cold or rewritten 150k-token prompts still spend about 21 ms in full-prompt BPE. Incremental
+  turn-2+ encode is already shipped. Any new tokenizer design must beat both the plain-short-word
+  and tool-heavy fixtures without token drift; do not revive the stack-128 rewrite.
+- Adaptive draft is strong in aggregate but retains workload-specific losses, particularly the
+  mixed CUDA/Python case. Its measurement history remains in `plans/adaptive-draft-bench.md`; it is
+  lower priority than the numerical work and GPU-gap attribution.
