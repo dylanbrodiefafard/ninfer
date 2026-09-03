@@ -56,20 +56,24 @@ struct SamplingConfig {
  *
  * For row b with configs[b].temperature<=0:
  *
- *   out[b] = min argmax_v float(logits[v,b]).
+ *   out[b] = min argmax_v float(logits[v,b]) over v not listed in the first
+ *   suppressed_token_count entries of suppressed_tokens.
  *
  * Penalties, filters, RNG, and token_counts updates are skipped for that row. With positive
  * temperature and configs[b].p_less!=0, let z_v=float(logits[v,b]) over v in [0,token_domain)
+ * that are not listed in the first suppressed_token_count entries of suppressed_tokens
  * (penalties, top_k, top_p, and min_p are ignored). Let p=softmax(z/temperature) over that
- * domain, L=sum_v p_v^2, and V={v: p_v>=L} (non-empty: the mode is always admitted). Sample
- * from the renormalized restriction of p to V. With positive temperature and p_less==0, let
+ * eligible domain, L=sum_v p_v^2, and V={v: p_v>=L} (non-empty: the eligible mode is always
+ * admitted). Sample from the renormalized restriction of p to V. With positive temperature and
+ * p_less==0, let
  * c_v=configs[b].token_counts[v] (or zero when the pointer is null):
  *
  *   adjusted_v = float(logits[v,b])
  *                - configs[b].presence_penalty * (c_v > 0)
  *                - configs[b].frequency_penalty * c_v.
  *
- * Candidates are sorted by adjusted_v descending with lower token id breaking ties. Per-row top_k
+ * Candidates are formed from the same eligible v (suppressed tokens are omitted) and sorted by
+ * adjusted_v descending with lower token id breaking ties. Per-row top_k
  * in [1,19] keeps that many candidates; top_k<=0 or top_k>=20 keeps min(20,token_domain).
  * Candidate weights are exp(adjusted_v/temperature-max). min_p removes the suffix below
  * min_p*max_weight; top_p keeps the shortest remaining prefix whose cumulative weight reaches

@@ -82,17 +82,29 @@ Distribution distribution_oracle(const std::vector<float>& column, int token_dom
                                  const ops::SamplingConfig& config,
                                  const std::vector<int>* counts = nullptr) {
     if (config.p_less != 0) {
+        auto suppressed = [&](int token) {
+            for (int i = 0; i < config.suppressed_token_count; ++i) {
+                if (config.suppressed_tokens[i] == token) { return true; }
+            }
+            return false;
+        };
         std::vector<double> logits(static_cast<std::size_t>(token_domain));
         double max_scaled = 0.0;
+        bool have_max     = false;
         for (int token = 0; token < token_domain; ++token) {
+            if (suppressed(token)) { continue; }
             logits[static_cast<std::size_t>(token)] =
                 static_cast<double>(column[static_cast<std::size_t>(token)]);
             const double scaled = logits[static_cast<std::size_t>(token)] / config.temperature;
-            if (token == 0 || scaled > max_scaled) { max_scaled = scaled; }
+            if (!have_max || scaled > max_scaled) {
+                max_scaled = scaled;
+                have_max   = true;
+            }
         }
         std::vector<double> weights(static_cast<std::size_t>(token_domain));
         double total = 0.0;
         for (int token = 0; token < token_domain; ++token) {
+            if (suppressed(token)) { continue; }
             const double w =
                 std::exp(logits[static_cast<std::size_t>(token)] / config.temperature - max_scaled);
             weights[static_cast<std::size_t>(token)] = w;
@@ -100,12 +112,14 @@ Distribution distribution_oracle(const std::vector<float>& column, int token_dom
         }
         double collision = 0.0;
         for (int token = 0; token < token_domain; ++token) {
+            if (suppressed(token)) { continue; }
             const double p = weights[static_cast<std::size_t>(token)] / total;
             collision += p * p;
         }
         Distribution out;
         double kept = 0.0;
         for (int token = 0; token < token_domain; ++token) {
+            if (suppressed(token)) { continue; }
             const double p = weights[static_cast<std::size_t>(token)] / total;
             if (p >= collision) {
                 out.tokens.push_back(token);
@@ -644,6 +658,92 @@ int rng_key_contract() {
     return failures;
 }
 
+int p_less_suppressed_token_contract() {
+    constexpr int token_domain = 257;
+    constexpr int batch        = 2;
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * batch, -20.0f);
+    for (int row = 0; row < batch; ++row) {
+        const std::size_t base = static_cast<std::size_t>(row) * token_domain;
+        logits[base + 11]      = 8.0f;
+        logits[base + 17]      = 7.0f;
+    }
+    round_to_bf16(logits);
+
+    std::vector<ops::SamplingConfig> configs(batch);
+    configs[0].temperature            = 0.8f;
+    configs[0].p_less                 = 1;
+    configs[0].seed                   = 1234;
+    configs[0].suppressed_token_count = 1;
+    configs[0].suppressed_tokens[0]   = 11;
+    configs[1].temperature            = 0.8f;
+    configs[1].p_less                 = 1;
+    configs[1].seed                   = 5678;
+    configs[1].suppressed_token_count = 1;
+    configs[1].suppressed_tokens[0]   = 11;
+
+    const RunResult result = run_batch(logits, token_domain, token_domain, std::move(configs),
+                                       {1, 2}, ops::kSamplePurposeDecode);
+    return result.integrity_failures +
+           verify_exact("sample p-less suppresses peaked token", result.tokens, {17, 17});
+}
+
+int p_less_suppressed_distribution_contract() {
+    std::vector<float> column = {1.0f, 0.9f, 0.8f, 0.2f, -1.0f, -2.0f};
+    round_to_bf16(column);
+    ops::SamplingConfig config;
+    config.temperature            = 0.9f;
+    config.p_less                 = 1;
+    config.seed                   = 314159;
+    config.suppressed_token_count = 1;
+    config.suppressed_tokens[0]   = 0;
+
+    const Distribution oracle =
+        distribution_oracle(column, static_cast<int>(column.size()), config);
+    if (oracle.tokens.empty() ||
+        std::find(oracle.tokens.begin(), oracle.tokens.end(), 0) != oracle.tokens.end()) {
+        std::cerr << "p-less suppression oracle kept the excluded token or emptied support\n";
+        return 1;
+    }
+
+    constexpr int samples  = 16384;
+    const RunResult result = run_repeated(column, static_cast<int>(column.size()), samples, 8,
+                                          config, 50, ops::kSamplePurposeDecode);
+    return result.integrity_failures +
+           verify_distribution("sample p-less suppressed small-vocab", result.tokens, oracle);
+}
+
+int p_less_suppressed_real_shape_contract() {
+    constexpr int physical_rows = 248320;
+    constexpr int token_domain  = 248077;
+    std::vector<float> column(physical_rows, -20.0f);
+    const int ids[]      = {3, 17, 7919, 65537, 200003};
+    const float logits[] = {2.0f, 1.85f, 1.7f, 0.5f, 0.0f};
+    for (int i = 0; i < 5; ++i) { column[ids[i]] = logits[i]; }
+    column[token_domain]      = 100.0f;
+    column[physical_rows - 1] = 200.0f;
+    round_to_bf16(column);
+
+    ops::SamplingConfig config;
+    config.temperature            = 1.2f;
+    config.p_less                 = 1;
+    config.seed                   = 271828;
+    config.suppressed_token_count = 1;
+    config.suppressed_tokens[0]   = 3;
+    const Distribution oracle     = distribution_oracle(column, token_domain, config);
+    if (oracle.tokens.empty() ||
+        std::find(oracle.tokens.begin(), oracle.tokens.end(), 3) != oracle.tokens.end()) {
+        std::cerr << "p-less real-shape suppression oracle kept token 3 or emptied support\n";
+        return 1;
+    }
+
+    constexpr int samples = 4096;
+    RunResult result =
+        run_repeated(column, token_domain, samples, 8, config, 3000, ops::kSamplePurposeDecode);
+    return result.integrity_failures +
+           verify_distribution("sample p-less suppressed real token-domain B=8", result.tokens,
+                               oracle);
+}
+
 int p_less_distribution_contract() {
     std::vector<float> column = {1.0f, 0.9f, 0.8f, 0.2f, -1.0f, -2.0f};
     round_to_bf16(column);
@@ -831,6 +931,9 @@ int main() {
     failures += p_less_real_shape_contract();
     failures += p_less_heterogeneous_batch_contract();
     failures += p_less_multiblock_heterogeneous_batch_contract();
+    failures += p_less_suppressed_token_contract();
+    failures += p_less_suppressed_distribution_contract();
+    failures += p_less_suppressed_real_shape_contract();
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sample public contract\n";
     return failures == 0 ? 0 : 1;
