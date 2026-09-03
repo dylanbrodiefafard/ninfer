@@ -346,14 +346,15 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_p_less_mass_sample_ker
     __shared__ int found;
 
     const SamplingPLessMoments moments = sampling_p_less_load_global(workspace, col);
-    const float thresh                 = sampling_p_less_load_threshold(workspace, col);
-    const float inv_temp               = 1.0f / cfg.temperature;
+    const SamplingPLessGate gate =
+        sampling_p_less_gate(moments, 1.0f / cfg.temperature);
     const std::int64_t base            = static_cast<std::int64_t>(col) * physical_rows;
     for (int partial = static_cast<int>(blockIdx.x); partial < partial_blocks;
          partial += static_cast<int>(gridDim.x)) {
         const int tile_start = partial * kSamplerPartialTileItems;
+        const float tile_max = sampling_p_less_load_tile_max(workspace, col, partial);
         const float tile_mass = sampling_p_less_tile_admitted_mass(
-            logits, base, token_domain, cfg, tile_start, moments.m, inv_temp, thresh, warp_sums);
+            logits, base, token_domain, cfg, tile_start, gate, tile_max, warp_sums);
 
         if (threadIdx.x == 0) {
             sampling_p_less_store_tile_mass(workspace, col, partial, tile_mass);
@@ -403,9 +404,9 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_p_less_mass_sample_ker
         int result = moments.argmax;
         if (selected_tile >= 0) {
             result = sampling_p_less_pick_from_tile(
-                logits, base, token_domain, cfg, selected_tile, moments.m, inv_temp, thresh,
-                admitted, selected_goal, moments.argmax, false, -1, nullptr, nullptr, 0, weights,
-                &running, &picked, &found);
+                logits, base, token_domain, cfg, selected_tile, gate, admitted, selected_goal,
+                moments.argmax, false, -1, nullptr, nullptr, 0, weights, &running, &picked,
+                &found);
         }
         if (threadIdx.x == 0) {
             out[col] = result;
