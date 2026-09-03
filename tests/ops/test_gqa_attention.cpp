@@ -3893,24 +3893,28 @@ int run_tree_column0_matches_decode(const Geometry& geometry, DType dtype, std::
                             decode_out, attention_criterion(dtype));
 }
 
-int run_tree_verify_cases() {
+int run_tree_verify_cases(bool full) {
     int failures = 0;
     for (const Geometry& geometry : kGeometries) {
         for (const DType dtype : {DType::BF16, DType::I8, DType::U8}) {
             failures += run_tree_verify_case(geometry, dtype, 4, chain_tree_parent(4), "chain");
             failures += run_tree_verify_case(geometry, dtype, 4, star_tree_parent(4), "star");
-            failures += run_tree_verify_case(geometry, dtype, 12, chain_tree_parent(12), "chain");
-            failures += run_tree_verify_case(geometry, dtype, 12, star_tree_parent(12), "star");
-            if (dtype == DType::U8) {
+            if (full) {
+                failures += run_tree_verify_case(geometry, dtype, 12, chain_tree_parent(12), "chain");
+                failures += run_tree_verify_case(geometry, dtype, 12, star_tree_parent(12), "star");
+            }
+            if (dtype == DType::U8 && (full || geometry.q_heads == 24)) {
                 failures += run_tree_column0_matches_decode(geometry, dtype, 16, 12);
-                failures += run_tree_column0_matches_decode(geometry, dtype, 24, 12);
+                if (full) {
+                    failures += run_tree_column0_matches_decode(geometry, dtype, 24, 12);
+                }
             }
         }
     }
     return failures;
 }
 
-int run_batch_cases() {
+int run_batch_cases(bool full) {
     int failures = 0;
     failures += run_batch_case(kGeometries[0], DType::I8,
                                {6, {127}, {3}, {0}, MappingPattern::Identity, 499u});
@@ -3918,13 +3922,23 @@ int run_batch_cases() {
                                {16, {49}, {7}, {0}, MappingPattern::Identity, 500u});
     failures += run_batch_case(kGeometries[0], DType::BF16,
                                {1, {63, 2048}, {1, 1}, {1, 0}, MappingPattern::Fragmented, 501u});
-    failures += run_batch_case(kGeometries[1], DType::I8,
-                               {1,
-                                {0, 31, 63, 127, 511, 1023, 2047, 4095},
-                                {1, 1, 1, 1, 1, 1, 1, 1},
-                                {7, 0, 5, 2, 6, 1, 4, 3},
-                                MappingPattern::Identity,
-                                502u});
+    if (full) {
+        failures += run_batch_case(kGeometries[1], DType::I8,
+                                   {1,
+                                    {0, 31, 63, 127, 511, 1023, 2047, 4095},
+                                    {1, 1, 1, 1, 1, 1, 1, 1},
+                                    {7, 0, 5, 2, 6, 1, 4, 3},
+                                    MappingPattern::Identity,
+                                    502u});
+    } else {
+        failures += run_batch_case(kGeometries[1], DType::I8,
+                                   {1,
+                                    {0, 31, 63, 127, 511},
+                                    {1, 1, 1, 1, 1},
+                                    {4, 0, 3, 2, 1},
+                                    MappingPattern::Identity,
+                                    502u});
+    }
     failures +=
         run_batch_case(kGeometries[0], DType::I8,
                        {6, {61, 127, 511}, {6, 3, 0}, {2, 0, 1}, MappingPattern::Fragmented, 503u});
@@ -3936,13 +3950,18 @@ int run_batch_cases() {
     return failures;
 }
 
-int run_geometry(const Geometry& geometry) {
+int run_geometry(const Geometry& geometry, bool full) {
     int failures = 0;
     const bool sage_only = std::getenv("GQA_SAGE_ONLY") != nullptr;
+    const MappingPattern mappings_full[] = {
+        MappingPattern::Identity, MappingPattern::Offset, MappingPattern::Fragmented};
+    const MappingPattern mappings_unit[] = {MappingPattern::Identity, MappingPattern::Fragmented};
+    const MappingPattern* mappings     = full ? mappings_full : mappings_unit;
+    const int mapping_count            = full ? 3 : 2;
     for (const DType dtype : {DType::BF16, DType::I8, DType::U8}) {
         if (sage_only && dtype != DType::U8) { continue; }
-        for (const MappingPattern mapping :
-             {MappingPattern::Identity, MappingPattern::Offset, MappingPattern::Fragmented}) {
+        for (int mapping_i = 0; mapping_i < mapping_count; ++mapping_i) {
+            const MappingPattern mapping = mappings[mapping_i];
             if (!sage_only) {
                 failures += run_append_case(geometry, dtype, mapping, 100u + geometry.q_heads);
                 failures += run_a1_case(geometry, dtype, {6, 61, 67, 190u}, mapping);
@@ -3955,51 +3974,65 @@ int run_geometry(const Geometry& geometry) {
         }
 
         if (!sage_only) {
-            const AttentionCase a1_cases[] = {
+            const AttentionCase a1_cases_full[] = {
                 {1, 0, 1, 201u},
-                {1, 63, 64, 206u},  // T=1 last token of page 0 (page size 64)
-                {1, 64, 65, 207u},  // T=1 first token of page 1
-                {1, 65, 66, 208u},  // T=1 one past the page boundary
+                {1, 63, 64, 206u},
+                {1, 64, 65, 207u},
+                {1, 65, 66, 208u},
                 {6, 17, 23, 202u},  {7, 17, 512, 203u},
                 {17, 31, 48, 204u}, {66, 63, 129, 205u},
-        };
-            for (const AttentionCase& test_case : a1_cases) {
-                failures += run_a1_case(geometry, dtype, test_case, MappingPattern::Identity);
+            };
+            const AttentionCase a1_cases_unit[] = {
+                {1, 0, 1, 201u},
+                {1, 63, 64, 206u},
+                {1, 64, 65, 207u},
+                {6, 17, 23, 202u},
+                {17, 31, 48, 204u},
+            };
+            const AttentionCase* a1_cases = full ? a1_cases_full : a1_cases_unit;
+            const int a1_count = full ? 8 : 5;
+            for (int i = 0; i < a1_count; ++i) {
+                failures += run_a1_case(geometry, dtype, a1_cases[i], MappingPattern::Identity);
             }
 
-            const AttentionCase a3_cases[] = {
+            const AttentionCase a3_cases_full[] = {
                 {1, 31, 32, 301u},
                 {7, 17, 512, 302u},
                 {17, 31, 48, 303u},
             };
-            for (const AttentionCase& test_case : a3_cases) {
-                failures += run_a3_case(geometry, dtype, test_case, MappingPattern::Identity);
+            const AttentionCase a3_cases_unit[] = {
+                {1, 31, 32, 301u},
+                {7, 17, 512, 302u},
+            };
+            const AttentionCase* a3_cases = full ? a3_cases_full : a3_cases_unit;
+            const int a3_count = full ? 3 : 2;
+            for (int i = 0; i < a3_count; ++i) {
+                failures += run_a3_case(geometry, dtype, a3_cases[i], MappingPattern::Identity);
             }
         }
 
         if (dtype == DType::U8 && !sage_only) {
             failures +=
                 run_a1_case(geometry, dtype, {128, 64, 256, 210u}, MappingPattern::Identity);
-            failures +=
-                run_a1_case(geometry, dtype, {129, 64, 256, 211u}, MappingPattern::Identity);
-            failures +=
-                run_a1_case(geometry, dtype, {128, 64, 256, 212u}, MappingPattern::Fragmented);
+            if (full) {
+                failures +=
+                    run_a1_case(geometry, dtype, {129, 64, 256, 211u}, MappingPattern::Identity);
+                failures +=
+                    run_a1_case(geometry, dtype, {128, 64, 256, 212u}, MappingPattern::Fragmented);
+            }
             failures +=
                 run_a3_case(geometry, dtype, {4, 512, 1024, 310u}, MappingPattern::Identity);
-            failures +=
-                run_a3_case(geometry, dtype, {4, 2048, 4096, 311u}, MappingPattern::Identity);
-            failures +=
-                run_a3_case(geometry, dtype, {4, 2048, 4096, 312u}, MappingPattern::Fragmented);
+            if (full) {
+                failures +=
+                    run_a3_case(geometry, dtype, {4, 2048, 4096, 311u}, MappingPattern::Identity);
+                failures +=
+                    run_a3_case(geometry, dtype, {4, 2048, 4096, 312u}, MappingPattern::Fragmented);
+            }
         }
 
         if (dtype == DType::U8) {
-            // Sage (SageAttention3-style FP4-PV) pass: d-major V-scale cache + FP4 PV GEMM.
-            // The fill case byte-checks the running-max rescale; A1 covers the prefill s3
-            // kernel (fill + attention); A3 T=4 covers the decode s3 partial (Bc=32 and the
-            // Bc=64 dynamic-arena tier). GQA_SAGE_FAST=1 drops the two T=128 multi-tile A1
-            // cases (the expensive FP64 reference matrix); single-tile + decode coverage
-            // remains in the fast tier.
-            const bool sage_fast = std::getenv("GQA_SAGE_FAST") != nullptr;
+            const bool sage_fast =
+                !full || std::getenv("GQA_SAGE_FAST") != nullptr;
             failures += run_append_case(geometry, dtype, MappingPattern::Identity, 500u +
                                                                                            geometry.q_heads,
                                         3, 57, /*sage=*/true);
@@ -4008,9 +4041,6 @@ int run_geometry(const Geometry& geometry) {
                                         3, 121, /*sage=*/true);
             failures += run_a1_case(geometry, dtype, {6, 55, 64, 510u}, MappingPattern::Identity,
                                     /*sage=*/true);
-            // Decode-width (T<=6) pack that owns the 16-key block's first slot:
-            // hybrid must take the whole-pack max (inject_codec_edges plants
-            // v=+1 on the last packed key). Distinct from {6,55,64} mid-block.
             failures += run_a1_case(geometry, dtype, {6, 48, 64, 518u}, MappingPattern::Identity,
                                     /*sage=*/true);
             if (!sage_fast) {
@@ -4021,9 +4051,11 @@ int run_geometry(const Geometry& geometry) {
             failures +=
                 run_a3_case(geometry, dtype, {4, 512, 1024, 512u}, MappingPattern::Identity,
                             /*sage=*/true);
-            failures +=
-                run_a3_case(geometry, dtype, {4, 2048, 4096, 513u}, MappingPattern::Identity,
-                            /*sage=*/true);
+            if (full) {
+                failures +=
+                    run_a3_case(geometry, dtype, {4, 2048, 4096, 513u}, MappingPattern::Identity,
+                                /*sage=*/true);
+            }
             failures +=
                 run_a1_case(geometry, dtype, {12, 0, 64, 514u}, MappingPattern::Identity, true);
             if (!sage_fast) {
@@ -4031,42 +4063,38 @@ int run_geometry(const Geometry& geometry) {
                     run_a1_case(geometry, dtype, {128, 0, 128, 515u}, MappingPattern::Identity,
                                 true);
             }
-            // T=1 decode width (the production decode lane; PPL decode cells run T=1
-            // SmallT keep_frac=1.0 here): A1 append route at the Bc=32 tier (window 64
-            // exercises the <16,1,32> dispatch tier) and the cached route at the Bc=64
-            // dynamic-arena tier. GQA_KEEP_FRAC unset = exact sage (keep_frac 1.0).
             failures += run_a1_case(geometry, dtype, {1, 63, 64, 516u}, MappingPattern::Identity,
                                     /*sage=*/true);
-            failures += run_a3_case(geometry, dtype, {1, 2048, 4096, 517u},
-                                    MappingPattern::Identity, /*sage=*/true);
+            if (full) {
+                failures += run_a3_case(geometry, dtype, {1, 2048, 4096, 517u},
+                                        MappingPattern::Identity, /*sage=*/true);
+            }
             failures += run_sage_skip_rejected(geometry);
             if (!sage_only) {
-                // Prompt skip on exact NVFP4. T=512 / base=0 dump is q_block 0, which
-                // only sees two causal K-tiles — both force-kept (sink + last). That
-                // checks kernel==v1 keep-list identity, not ranking. The planted
-                // base=384 cases below actually drop tiles.
                 failures += run_a1_skip_case(geometry, {128, 0, 256, 530u}, 1.0f, 1.0f, 0);
-                failures += run_a1_skip_case(geometry, {512, 0, 512, 531u}, 0.5f, 1.0f, 0);
-                failures += run_a1_skip_case(geometry, {300, 100, 512, 533u}, 0.5f, 1.0f, 0);
-                failures += run_a1_skip_case(geometry, {512, 0, 512, 532u}, 1.0f, 0.9f, 0);
-                failures += run_a1_skip_case(geometry, {128, 0, 128, 551u}, 1.0f, 0.9f, 8192);
                 failures += run_a1_skip_case(geometry, {128, 384, 512, 540u}, 1.0f, 0.9f, 0,
                                              XattnPlant::V1Antidiag);
-                failures += run_a1_skip_case(geometry, {128, 384, 512, 541u}, 1.0f, 0.9f, 0,
-                                             XattnPlant::PaperInverse);
-                failures += run_a1_skip_case(geometry, {12, 384, 512, 542u}, 1.0f, 0.9f, 0);
+                if (full) {
+                    failures += run_a1_skip_case(geometry, {512, 0, 512, 531u}, 0.5f, 1.0f, 0);
+                    failures += run_a1_skip_case(geometry, {300, 100, 512, 533u}, 0.5f, 1.0f, 0);
+                    failures += run_a1_skip_case(geometry, {512, 0, 512, 532u}, 1.0f, 0.9f, 0);
+                    failures += run_a1_skip_case(geometry, {128, 0, 128, 551u}, 1.0f, 0.9f, 8192);
+                    failures += run_a1_skip_case(geometry, {128, 384, 512, 541u}, 1.0f, 0.9f, 0,
+                                                 XattnPlant::PaperInverse);
+                    failures += run_a1_skip_case(geometry, {12, 384, 512, 542u}, 1.0f, 0.9f, 0);
+                }
             }
         }
 
         if (geometry.q_heads == 16 && !sage_only) {
-            // Loose execution envelopes straddle the two registered host-resource frontiers.
-            // Device positions, not these bounds, continue to define the oracle result.
             failures += run_a1_case(geometry, dtype, {7, 17, 513, 401u}, MappingPattern::Identity);
             failures += run_a3_case(geometry, dtype, {7, 17, 513, 402u}, MappingPattern::Identity);
-            failures +=
-                run_a3_case(geometry, dtype, {16, 17, 1024, 403u}, MappingPattern::Identity);
-            failures +=
-                run_a3_case(geometry, dtype, {16, 17, 1025, 404u}, MappingPattern::Identity);
+            if (full) {
+                failures +=
+                    run_a3_case(geometry, dtype, {16, 17, 1024, 403u}, MappingPattern::Identity);
+                failures +=
+                    run_a3_case(geometry, dtype, {16, 17, 1025, 404u}, MappingPattern::Identity);
+            }
         }
     }
     return failures;
@@ -5046,7 +5074,7 @@ int main(int argc, char** argv) {
             std::cerr << "FAIL: no usable CUDA device\n";
             return 1;
         }
-        const int failures = run_batch_cases();
+        const int failures = run_batch_cases(true);
         std::cout << (failures == 0 ? "PASS" : "FAIL") << " gqa_attention batch cases\n";
         return failures == 0 ? 0 : 1;
     }
@@ -5055,7 +5083,7 @@ int main(int argc, char** argv) {
             std::cerr << "FAIL: no usable CUDA device\n";
             return 1;
         }
-        const int failures = run_tree_verify_cases() + run_kv_compact_path_cases();
+        const int failures = run_tree_verify_cases(true) + run_kv_compact_path_cases();
         std::cout << (failures == 0 ? "PASS" : "FAIL") << " gqa_attention tree-verify\n";
         return failures == 0 ? 0 : 1;
     }
@@ -5064,11 +5092,13 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    const bool full = std::getenv("GQA_FULL") != nullptr ||
+                      (argc > 1 && std::strcmp(argv[1], "--full") == 0);
     int failures = 0;
     failures += verify_workspace_capacity_contract();
-    for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
-    failures += run_batch_cases();
-    failures += run_tree_verify_cases();
+    for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry, full); }
+    failures += run_batch_cases(full);
+    failures += run_tree_verify_cases(full);
     failures += run_kv_compact_path_cases();
     std::cout << (failures == 0 ? "PASS" : "FAIL")
               << " gqa_attention public-contract correctness\n";
