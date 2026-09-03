@@ -1427,9 +1427,25 @@ private:
     }
 
     void run_decode_round(const RoundMembership& membership) {
-        const std::span<const std::uint32_t> lanes = membership.lane_span();
+        RoundMembership live;
+        for (std::size_t index = 0; index < membership.size; ++index) {
+            const std::uint32_t lane = membership.lanes[index];
+            const auto& request      = slots_[lane];
+            if (request != nullptr && request->cancelled.load(std::memory_order_acquire)) {
+                if (copy_hold_ && copy_hold_->lane == lane) { drain_copy_hold_before_abort(); }
+                instance_.program->retain_lane(lane);
+                complete_cancelled(request);
+                continue;
+            }
+            live.lanes[live.size]   = lane;
+            live.budgets[live.size] = membership.budgets[index];
+            ++live.size;
+        }
+        if (live.empty()) { return; }
+
+        const std::span<const std::uint32_t> lanes = live.lane_span();
         const BatchedGeneratedRound round =
-            instance_.program->decode_batch(lanes, membership.budget_span());
+            instance_.program->decode_batch(lanes, live.budget_span());
 
         std::array<std::uint8_t, kMaximumConcurrency> cancelled{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
