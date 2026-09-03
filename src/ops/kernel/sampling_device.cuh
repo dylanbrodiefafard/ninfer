@@ -112,6 +112,19 @@ __device__ __forceinline__ bool sampling_p_less_active(const SamplingConfig& cfg
     return cfg.p_less != 0 && cfg.temperature > 0.0f;
 }
 
+__device__ __forceinline__ bool sampling_token_suppressed(int v, const SamplingConfig& c) {
+    const int count = min(c.suppressed_token_count, SamplingConfig::kMaximumSuppressedTokens);
+    for (int i = 0; i < count; ++i) {
+        if (c.suppressed_tokens[i] == v) { return true; }
+    }
+    return false;
+}
+
+__device__ __forceinline__ bool sampling_p_less_in_domain(int v, std::int32_t vocab,
+                                                         const SamplingConfig& cfg) {
+    return v >= 0 && v < vocab && !sampling_token_suppressed(v, cfg);
+}
+
 __device__ inline float sampling_block_sum(float value, float* shared) {
     const int tid = threadIdx.x;
     shared[tid]   = value;
@@ -210,13 +223,15 @@ struct SamplingPLessMoments {
 
 __device__ inline SamplingPLessMoments sampling_p_less_moments(const __nv_bfloat16* logits,
                                                                std::int64_t base,
-                                                               std::int32_t vocab, float inv_temp,
-                                                               float* red_val, int* red_idx,
-                                                               float* red_aux) {
+                                                               std::int32_t vocab,
+                                                               const SamplingConfig& cfg,
+                                                               float inv_temp, float* red_val,
+                                                               int* red_idx, float* red_aux) {
     const int tid = threadIdx.x;
     float bv      = -CUDART_INF_F;
     int bi        = INT_MAX;
     for (int v = tid; v < vocab; v += blockDim.x) {
+        if (!sampling_p_less_in_domain(v, vocab, cfg)) { continue; }
         const float x = __bfloat162float(logits[base + v]);
         if (sampling_better(x, v, bv, bi)) {
             bv = x;
@@ -240,6 +255,7 @@ __device__ inline SamplingPLessMoments sampling_p_less_moments(const __nv_bfloat
     float local_s = 0.0f;
     float local_q = 0.0f;
     for (int v = tid; v < vocab; v += blockDim.x) {
+        if (!sampling_p_less_in_domain(v, vocab, cfg)) { continue; }
         const float e = __expf((__bfloat162float(logits[base + v]) - out.m) * inv_temp);
         local_s += e;
         local_q += e * e;
@@ -267,11 +283,13 @@ __device__ __forceinline__ float sampling_p_less_logit_exp(const __nv_bfloat16* 
 
 __device__ inline float sampling_p_less_admitted_mass(const __nv_bfloat16* logits,
                                                       std::int64_t base, std::int32_t vocab,
-                                                      float m, float inv_temp, float thresh,
+                                                      const SamplingConfig& cfg, float m,
+                                                      float inv_temp, float thresh,
                                                       float* red_val) {
     const int tid = threadIdx.x;
     float local_z = 0.0f;
     for (int v = tid; v < vocab; v += blockDim.x) {
+        if (!sampling_p_less_in_domain(v, vocab, cfg)) { continue; }
         const float e = sampling_p_less_logit_exp(logits, base, v, m, inv_temp);
         if (e >= thresh) { local_z += e; }
     }
@@ -281,13 +299,15 @@ __device__ inline float sampling_p_less_admitted_mass(const __nv_bfloat16* logit
 // Inverse-CDF over p-less support. All threads of the block must call. `u` is
 // the same counter-based uniform on every thread. argmax is the fallback.
 __device__ inline int sampling_p_less_inverse_cdf(const __nv_bfloat16* logits, std::int64_t base,
-                                                  std::int32_t vocab, float m, float inv_temp,
-                                                  float thresh, float admitted, float u,
-                                                  int argmax, float* red_val, int* red_idx) {
+                                                  std::int32_t vocab, const SamplingConfig& cfg,
+                                                  float m, float inv_temp, float thresh,
+                                                  float admitted, float u, int argmax,
+                                                  float* red_val, int* red_idx) {
     const int tid = threadIdx.x;
     if (!(admitted > 0.0f)) { return argmax; }
     float local_z = 0.0f;
     for (int v = tid; v < vocab; v += blockDim.x) {
+        if (!sampling_p_less_in_domain(v, vocab, cfg)) { continue; }
         const float e = sampling_p_less_logit_exp(logits, base, v, m, inv_temp);
         if (e >= thresh) { local_z += e; }
     }
@@ -302,6 +322,7 @@ __device__ inline int sampling_p_less_inverse_cdf(const __nv_bfloat16* logits, s
     if (local_z > 0.0f && goal >= exclusive && (goal < inclusive || inclusive == total)) {
         float acc = exclusive;
         for (int v = tid; v < vocab; v += blockDim.x) {
+            if (!sampling_p_less_in_domain(v, vocab, cfg)) { continue; }
             const float e = sampling_p_less_logit_exp(logits, base, v, m, inv_temp);
             if (e < thresh) { continue; }
             acc += e;
@@ -330,13 +351,13 @@ __device__ inline int sampling_p_less_draw(const __nv_bfloat16* logits, std::int
                                            float* red_aux) {
     const float inv_temp          = 1.0f / cfg.temperature;
     const SamplingPLessMoments st =
-        sampling_p_less_moments(logits, base, vocab, inv_temp, red_val, red_idx, red_aux);
+        sampling_p_less_moments(logits, base, vocab, cfg, inv_temp, red_val, red_idx, red_aux);
     if (!(st.sum_exp > 0.0f)) { return st.argmax; }
     const float thresh   = st.sum_exp2 / st.sum_exp;
-    const float admitted = sampling_p_less_admitted_mass(logits, base, vocab, st.m, inv_temp, thresh,
-                                                         red_val);
+    const float admitted = sampling_p_less_admitted_mass(logits, base, vocab, cfg, st.m, inv_temp,
+                                                         thresh, red_val);
     const float u = sampling_uniform(cfg.seed, position, purpose, 0u);
-    return sampling_p_less_inverse_cdf(logits, base, vocab, st.m, inv_temp, thresh, admitted, u,
+    return sampling_p_less_inverse_cdf(logits, base, vocab, cfg, st.m, inv_temp, thresh, admitted, u,
                                        st.argmax, red_val, red_idx);
 }
 
@@ -357,14 +378,6 @@ __device__ __forceinline__ int sampling_partial_offset(const SamplingWorkspace& 
 
 __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
     return col * kSamplerCandidateCap + j;
-}
-
-__device__ __forceinline__ bool sampling_token_suppressed(int v, const SamplingConfig& c) {
-    const int count = min(c.suppressed_token_count, SamplingConfig::kMaximumSuppressedTokens);
-    for (int i = 0; i < count; ++i) {
-        if (c.suppressed_tokens[i] == v) { return true; }
-    }
-    return false;
 }
 
 // Device-scope release RMWs form one release sequence; the last CTA's acquire
@@ -431,16 +444,16 @@ __device__ __forceinline__ void sampling_p_less_store_moments(
 }
 
 __device__ inline SamplingPLessMoments sampling_p_less_tile_moments(
-    const __nv_bfloat16* logits, std::int64_t base, std::int32_t vocab, int tile_start,
-    float inv_temp, float* red_val, float* red_aux, unsigned long long* warp_keys) {
+    const __nv_bfloat16* logits, std::int64_t base, std::int32_t vocab, const SamplingConfig& cfg,
+    int tile_start, float inv_temp, float* red_val, float* red_aux, unsigned long long* warp_keys) {
     float values[kSamplerItemsPerThread];
     unsigned long long best = 0ull;
 #pragma unroll
     for (int item = 0; item < kSamplerItemsPerThread; ++item) {
         const int v = tile_start + item * blockDim.x + threadIdx.x;
-        values[item] = v < vocab ? __bfloat162float(logits[base + v]) : -CUDART_INF_F;
-        const unsigned long long key =
-            v < vocab ? sampling_sort_key(values[item], v) : 0ull;
+        const bool keep = sampling_p_less_in_domain(v, vocab, cfg);
+        values[item]    = keep ? __bfloat162float(logits[base + v]) : -CUDART_INF_F;
+        const unsigned long long key = keep ? sampling_sort_key(values[item], v) : 0ull;
         if (key > best) { best = key; }
     }
     best          = sampling_block_max_key_broadcast(best, warp_keys);
@@ -451,7 +464,7 @@ __device__ inline SamplingPLessMoments sampling_p_less_tile_moments(
 #pragma unroll
     for (int item = 0; item < kSamplerItemsPerThread; ++item) {
         const int v = tile_start + item * blockDim.x + threadIdx.x;
-        if (v >= vocab) { continue; }
+        if (!sampling_p_less_in_domain(v, vocab, cfg)) { continue; }
         const float e = __expf((values[item] - m) * inv_temp);
         local_s += e;
         local_q += e * e;
@@ -539,13 +552,13 @@ sampling_p_less_load_admitted(const SamplingWorkspace& workspace, int col) {
 }
 
 __device__ inline float sampling_p_less_tile_admitted_mass(
-    const __nv_bfloat16* logits, std::int64_t base, std::int32_t vocab, int tile_start, float m,
-    float inv_temp, float thresh, float* warp_sums) {
+    const __nv_bfloat16* logits, std::int64_t base, std::int32_t vocab, const SamplingConfig& cfg,
+    int tile_start, float m, float inv_temp, float thresh, float* warp_sums) {
     float local_z = 0.0f;
 #pragma unroll
     for (int item = 0; item < kSamplerItemsPerThread; ++item) {
         const int v = tile_start + item * blockDim.x + threadIdx.x;
-        if (v >= vocab) { continue; }
+        if (!sampling_p_less_in_domain(v, vocab, cfg)) { continue; }
         const float e = sampling_p_less_logit_exp(logits, base, v, m, inv_temp);
         if (e >= thresh) { local_z += e; }
     }
@@ -556,9 +569,9 @@ __device__ __forceinline__ float sampling_p_less_q_at(int v, int draft_id, const
                                                       const float* q_vals, int q_n);
 
 __device__ inline int sampling_p_less_pick_from_tile(
-    const __nv_bfloat16* logits, std::int64_t base, std::int32_t vocab, int tile, float m,
-    float inv_temp, float thresh, float admitted, float goal, int fallback, bool residual,
-    int draft_id, const int* q_ids, const float* q_vals, int q_n, float* weights,
+    const __nv_bfloat16* logits, std::int64_t base, std::int32_t vocab, const SamplingConfig& cfg,
+    int tile, float m, float inv_temp, float thresh, float admitted, float goal, int fallback,
+    bool residual, int draft_id, const int* q_ids, const float* q_vals, int q_n, float* weights,
     float* running, int* picked, int* found) {
     if (threadIdx.x == 0) {
         *running = 0.0f;
@@ -572,7 +585,7 @@ __device__ inline int sampling_p_less_pick_from_tile(
     for (int item = 0; item < kSamplerItemsPerThread; ++item) {
         const int v = tile_start + item * blockDim.x + threadIdx.x;
         float weight = 0.0f;
-        if (v < vocab) {
+        if (sampling_p_less_in_domain(v, vocab, cfg)) {
             const float e = sampling_p_less_logit_exp(logits, base, v, m, inv_temp);
             if (e >= thresh) {
                 weight = residual
@@ -857,17 +870,20 @@ __device__ __forceinline__ float sampling_p_less_q_at(int v, int draft_id, const
 }
 
 __device__ __forceinline__ float sampling_p_less_prob(const __nv_bfloat16* logits, std::int64_t base,
-                                                      int token, float m, float inv_temp,
-                                                      float thresh, float admitted) {
-    if (!(admitted > 0.0f) || token < 0) { return 0.0f; }
+                                                      int token, std::int32_t vocab,
+                                                      const SamplingConfig& cfg, float m,
+                                                      float inv_temp, float thresh,
+                                                      float admitted) {
+    if (!(admitted > 0.0f) || !sampling_p_less_in_domain(token, vocab, cfg)) { return 0.0f; }
     const float e = sampling_p_less_logit_exp(logits, base, token, m, inv_temp);
     return e >= thresh ? e / admitted : 0.0f;
 }
 
 // Leviathan residual inverse-CDF of max(0, p'-q) under p-less. All threads call.
 __device__ inline int sampling_p_less_residual(const __nv_bfloat16* logits, std::int64_t base,
-                                               std::int32_t vocab, float m, float inv_temp,
-                                               float thresh, float admitted, float u, int draft_id,
+                                               std::int32_t vocab, const SamplingConfig& cfg,
+                                               float m, float inv_temp, float thresh,
+                                               float admitted, float u, int draft_id,
                                                const int* q_ids, const float* q_vals, int q_n,
                                                int argmax, float* red_val, int* red_idx) {
     const int tid = threadIdx.x;
@@ -875,13 +891,16 @@ __device__ inline int sampling_p_less_residual(const __nv_bfloat16* logits, std:
     const float inv_z = 1.0f / admitted;
     float local_mass  = 0.0f;
     for (int v = tid; v < vocab; v += blockDim.x) {
+        if (!sampling_p_less_in_domain(v, vocab, cfg)) { continue; }
         const float e = sampling_p_less_logit_exp(logits, base, v, m, inv_temp);
         if (e < thresh) { continue; }
         const float r = e * inv_z - sampling_p_less_q_at(v, draft_id, q_ids, q_vals, q_n);
         if (r > 0.0f) { local_mass += r; }
     }
     const float mass = sampling_block_sum(local_mass, red_val);
-    if (!(mass > 0.0f)) { return draft_id; }
+        if (!(mass > 0.0f)) {
+        return sampling_p_less_in_domain(draft_id, vocab, cfg) ? draft_id : argmax;
+    }
     red_val[tid] = local_mass;
     __syncthreads();
     sampling_block_inclusive_scan(red_val);
@@ -893,6 +912,7 @@ __device__ inline int sampling_p_less_residual(const __nv_bfloat16* logits, std:
     if (local_mass > 0.0f && goal >= exclusive && (goal < inclusive || inclusive == total)) {
         float acc = exclusive;
         for (int v = tid; v < vocab; v += blockDim.x) {
+            if (!sampling_p_less_in_domain(v, vocab, cfg)) { continue; }
             const float e = sampling_p_less_logit_exp(logits, base, v, m, inv_temp);
             if (e < thresh) { continue; }
             const float r = e * inv_z - sampling_p_less_q_at(v, draft_id, q_ids, q_vals, q_n);
@@ -904,7 +924,7 @@ __device__ inline int sampling_p_less_residual(const __nv_bfloat16* logits, std:
     }
     red_idx[tid] = local_pick;
     __syncthreads();
-    int picked = draft_id;
+    int picked = sampling_p_less_in_domain(draft_id, vocab, cfg) ? draft_id : argmax;
     for (int t = 0; t < blockDim.x; ++t) {
         if (red_idx[t] >= 0) {
             picked = red_idx[t];

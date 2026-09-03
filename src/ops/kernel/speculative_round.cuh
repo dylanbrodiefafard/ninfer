@@ -241,18 +241,19 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
         if (p_less) {
             const float inv_temp = 1.0f / cfg.temperature;
             const SamplingPLessMoments st = sampling_p_less_moments(
-                row_logits, base, token_domain, inv_temp, red_val, red_idx, red_aux);
+                row_logits, base, token_domain, cfg, inv_temp, red_val, red_idx, red_aux);
             const float thresh = (st.sum_exp > 0.0f) ? (st.sum_exp2 / st.sum_exp) : 0.0f;
             const float admitted = sampling_p_less_admitted_mass(
-                row_logits, base, token_domain, st.m, inv_temp, thresh, red_val);
+                row_logits, base, token_domain, cfg, st.m, inv_temp, thresh, red_val);
             if (tid == 0) {
                 decision_sh = 0;
                 if (done_sh == 0) {
                     const int L = L_sh;
                     if (i < extent) {
                         const int d        = row_drafts[i];
-                        const float pd     = sampling_p_less_prob(row_logits, base, d, st.m,
-                                                                 inv_temp, thresh, admitted);
+                        const float pd     = sampling_p_less_prob(row_logits, base, d, token_domain,
+                                                                 cfg, st.m, inv_temp, thresh,
+                                                                 admitted);
                         const int* hop_ids = nullptr;
                         const float* hop_q = nullptr;
                         speculative_chain_hop_q(selector_ids, selector_q, selector_k, i, row, k,
@@ -283,7 +284,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
                 const float ur = sampling_uniform(cfg.seed, L_sh + i + 1,
                                                   kSamplePurposeSpeculativeCorrection, 0u);
                 const int tstar = sampling_p_less_residual(
-                    row_logits, base, token_domain, st.m, inv_temp, thresh, admitted, ur, d,
+                    row_logits, base, token_domain, cfg, st.m, inv_temp, thresh, admitted, ur, d,
                     hop_ids, hop_q, selector_k, st.argmax, red_val, red_idx);
                 if (tid == 0) {
                     tstar_sh = tstar;
@@ -297,7 +298,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
                     sampling_uniform(cfg.seed, L_sh + extent + 1, kSamplePurposeSpeculativeBonus,
                                      0u);
                 const int tstar = sampling_p_less_inverse_cdf(
-                    row_logits, base, token_domain, st.m, inv_temp, thresh, admitted, u,
+                    row_logits, base, token_domain, cfg, st.m, inv_temp, thresh, admitted, u,
                     st.argmax, red_val, red_idx);
                 if (tid == 0) {
                     tstar_sh = tstar;
@@ -415,7 +416,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     const int tile_start    = partial * kSamplerPartialTileItems;
     if (sampling_p_less_active(cfg)) {
         const SamplingPLessMoments moments = sampling_p_less_tile_moments(
-            logits, base, token_domain, tile_start, 1.0f / cfg.temperature, p_less_red_val,
+            logits, base, token_domain, cfg, tile_start, 1.0f / cfg.temperature, p_less_red_val,
             p_less_red_aux, p_less_warp_keys);
         if (threadIdx.x == 0) { sampling_p_less_store_moments(workspace, col, partial, moments); }
         return;
@@ -744,15 +745,17 @@ speculative_p_less_load_aux_mass(const SamplingWorkspace& workspace, int col, in
 }
 
 __device__ inline float speculative_p_less_residual_tile_mass(
-    const __nv_bfloat16* row_logits, std::int64_t base, std::int32_t token_domain, int tile,
-    const SamplingWorkspace& workspace, int col, float m, float inv_temp, float thresh,
-    float admitted, int draft_id, const int* q_ids, const float* q_vals, int q_n) {
+    const __nv_bfloat16* row_logits, std::int64_t base, std::int32_t token_domain,
+    const SamplingConfig& cfg, int tile, const SamplingWorkspace& workspace, int col, float m,
+    float inv_temp, float thresh, float admitted, int draft_id, const int* q_ids,
+    const float* q_vals, int q_n) {
     if (!(admitted > 0.0f)) { return 0.0f; }
     float correction = 0.0f;
     const int begin  = tile * kSamplerPartialTileItems;
     const int end    = begin + kSamplerPartialTileItems;
     if (q_ids == nullptr || q_vals == nullptr || q_n <= 0) {
-        if (draft_id >= begin && draft_id < end && draft_id < token_domain) {
+        if (sampling_p_less_in_domain(draft_id, token_domain, cfg) && draft_id >= begin &&
+            draft_id < end) {
             const float e =
                 sampling_p_less_logit_exp(row_logits, base, draft_id, m, inv_temp);
             if (e >= thresh) { correction = fminf(e / admitted, 1.0f); }
@@ -767,8 +770,8 @@ __device__ inline float speculative_p_less_residual_tile_mass(
                     break;
                 }
             }
-            if (duplicate || token < begin || token >= end || token < 0 ||
-                token >= token_domain) {
+            if (duplicate || token < begin || token >= end ||
+                !sampling_p_less_in_domain(token, token_domain, cfg)) {
                 continue;
             }
             const float e = sampling_p_less_logit_exp(row_logits, base, token, m, inv_temp);
@@ -783,22 +786,25 @@ __device__ inline float speculative_p_less_residual_tile_mass(
 // that tile for the cooperative 512-token rescan.
 __device__ inline void speculative_p_less_choose_tile(
     const __nv_bfloat16* row_logits, std::int64_t base, std::int32_t token_domain,
-    const SamplingWorkspace& workspace, int col, int partial_blocks, float inv_temp, bool residual,
-    int draft_id, const int* q_ids, const float* q_vals, int q_n, float u, int* selected_tile,
-    float* selected_goal, int* fallback) {
+    const SamplingConfig& cfg, const SamplingWorkspace& workspace, int col, int partial_blocks,
+    float inv_temp, bool residual, int draft_id, const int* q_ids, const float* q_vals, int q_n,
+    float u, int* selected_tile, float* selected_goal, int* fallback) {
     const SamplingPLessMoments moments = sampling_p_less_load_global(workspace, col);
     const float thresh                 = sampling_p_less_load_threshold(workspace, col);
     const float admitted               = sampling_p_less_load_admitted(workspace, col);
     *selected_tile = -1;
     *selected_goal = 0.0f;
     *fallback      = residual ? draft_id : moments.argmax;
+    if (residual && !sampling_p_less_in_domain(draft_id, token_domain, cfg)) {
+        *fallback = moments.argmax;
+    }
 
     float total = admitted;
     if (residual) {
         total = 0.0f;
         for (int p = 0; p < partial_blocks; ++p) {
             const float mass = speculative_p_less_residual_tile_mass(
-                row_logits, base, token_domain, p, workspace, col, moments.m, inv_temp, thresh,
+                row_logits, base, token_domain, cfg, p, workspace, col, moments.m, inv_temp, thresh,
                 admitted, draft_id, q_ids, q_vals, q_n);
             speculative_p_less_store_aux_mass(workspace, col, p, mass);
             total += mass;
@@ -887,8 +893,8 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_p_less_mas
     for (int partial = static_cast<int>(blockIdx.x); partial < partial_blocks;
          partial += static_cast<int>(gridDim.x)) {
         const float tile_mass = sampling_p_less_tile_admitted_mass(
-            row_logits, base, token_domain, partial * kSamplerPartialTileItems, moments.m, inv_temp,
-            thresh, warp_sums);
+            row_logits, base, token_domain, cfg, partial * kSamplerPartialTileItems, moments.m,
+            inv_temp, thresh, warp_sums);
         if (threadIdx.x == 0) {
             sampling_p_less_store_tile_mass(workspace, col, partial, tile_mass);
             const int done = sampling_completion_add(&workspace.group_done[col], partial_blocks);
@@ -941,7 +947,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_p_less_mas
                 const float u = sampling_uniform(cfg.seed, L_sh + a_sh + 1,
                                                  kSamplePurposeSpeculativeAccept, 0u);
                 speculative_p_less_choose_tile(
-                    row_logits, static_cast<std::int64_t>(node) * physical_rows, token_domain,
+                    row_logits, static_cast<std::int64_t>(node) * physical_rows, token_domain, cfg,
                     workspace, node, partial_blocks, inv_temp, false, -1, nullptr, nullptr, 0, u,
                     &selected_tile, &selected_goal, &fallback);
             }
@@ -949,7 +955,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_p_less_mas
             int sampled = fallback;
             if (selected_tile >= 0) {
                 sampled = sampling_p_less_pick_from_tile(
-                    row_logits, static_cast<std::int64_t>(node) * physical_rows, token_domain,
+                    row_logits, static_cast<std::int64_t>(node) * physical_rows, token_domain, cfg,
                     selected_tile, node_moments.m, inv_temp, node_thresh, admitted, selected_goal,
                     fallback, false, -1, nullptr, nullptr, 0, weights, &running, &picked, &found);
             }
@@ -996,8 +1002,8 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_p_less_mas
         if (threadIdx.x == 0) {
             if (i < extent) {
                 const float pd = sampling_p_less_prob(
-                    row_logits, static_cast<std::int64_t>(i) * physical_rows, d, col_moments.m,
-                    inv_temp, col_thresh, admitted);
+                    row_logits, static_cast<std::int64_t>(i) * physical_rows, d, token_domain, cfg,
+                    col_moments.m, inv_temp, col_thresh, admitted);
                 const float qd =
                     sampling_selector_q(hop_ids, hop_q, selector_k > 0 ? selector_k : 0, d);
                 const float u =
@@ -1022,15 +1028,15 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_p_less_mas
                 residual ? kSamplePurposeSpeculativeCorrection : kSamplePurposeSpeculativeBonus,
                 0u);
             speculative_p_less_choose_tile(
-                row_logits, static_cast<std::int64_t>(i) * physical_rows, token_domain, workspace,
-                i, partial_blocks, inv_temp, residual, d, hop_ids, hop_q, selector_k, u,
+                row_logits, static_cast<std::int64_t>(i) * physical_rows, token_domain, cfg,
+                workspace, i, partial_blocks, inv_temp, residual, d, hop_ids, hop_q, selector_k, u,
                 &selected_tile, &selected_goal, &fallback);
         }
         __syncthreads();
         int sampled = fallback;
         if (selected_tile >= 0) {
             sampled = sampling_p_less_pick_from_tile(
-                row_logits, static_cast<std::int64_t>(i) * physical_rows, token_domain,
+                row_logits, static_cast<std::int64_t>(i) * physical_rows, token_domain, cfg,
                 selected_tile, col_moments.m, inv_temp, col_thresh, admitted, selected_goal,
                 fallback, action == 1, d, hop_ids, hop_q, selector_k, weights, &running, &picked,
                 &found);
