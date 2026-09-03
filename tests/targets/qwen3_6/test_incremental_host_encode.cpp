@@ -7,6 +7,7 @@
 #include "targets/qwen3_6/impl/frontend/processor.h"
 #include "targets/qwen3_6/impl/frontend/test_access.h"
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
+#include "targets/qwen3_6/official_tokenizer_dir.h"
 
 #include <nlohmann/json.hpp>
 
@@ -79,31 +80,15 @@ const fi::CompiledChatTemplate& reasoning_effort_template() {
     return value;
 }
 
-const std::string& official_tokenizer_dir() {
-    static const std::string tokenizer_dir = [] {
-        const char* env          = std::getenv("NINFER_OFFICIAL_TOKENIZER_DIR");
-        const char* candidates[] = {
-            env,
-            "/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16",
-            "/ssdpool2nvme/local_llm/ninfer-dylan2/profiles/bench/official-tokenizer",
-        };
-        for (const char* dir : candidates) {
-            if (dir == nullptr || dir[0] == '\0') { continue; }
-            std::ifstream stream(std::string(dir) + "/tokenizer.json", std::ios::binary);
-            if (stream) { return std::string(dir); }
-        }
-        throw std::runtime_error("official tokenizer.json was not found");
-    }();
-    return tokenizer_dir;
-}
-
 const fi::Tokenizer& official_tokenizer() {
+    const auto& tokenizer_dir = official_tokenizer_dir();
+    if (!tokenizer_dir) { throw std::runtime_error("official tokenizer.json was not found"); }
     static const std::string tokenizer_json =
-        read_file((official_tokenizer_dir() + "/tokenizer.json").c_str());
+        read_file((tokenizer_dir.value() + "/tokenizer.json").c_str());
     static const std::string tokenizer_config_json =
-        read_file((official_tokenizer_dir() + "/tokenizer_config.json").c_str());
+        read_file((tokenizer_dir.value() + "/tokenizer_config.json").c_str());
     static const std::string generation_config_json =
-        read_file((official_tokenizer_dir() + "/generation_config.json").c_str());
+        read_file((tokenizer_dir.value() + "/generation_config.json").c_str());
     static const fi::Tokenizer tokenizer({.tokenizer_json         = tokenizer_json,
                                           .tokenizer_config_json  = tokenizer_config_json,
                                           .generation_config_json = generation_config_json});
@@ -175,14 +160,16 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
 }
 
 FrontendResources official_frontend_resources(const std::string& chat_template) {
+    const auto& tokenizer_dir = official_tokenizer_dir();
+    if (!tokenizer_dir) { throw std::runtime_error("official tokenizer.json was not found"); }
     FrontendResources result     = resources(chat_template);
-    result.tokenizer_json        = read_file((official_tokenizer_dir() + "/tokenizer.json").c_str());
+    result.tokenizer_json        = read_file((tokenizer_dir.value() + "/tokenizer.json").c_str());
     nlohmann::json config        = nlohmann::json::parse(
-        read_file((official_tokenizer_dir() + "/tokenizer_config.json").c_str()));
+        read_file((tokenizer_dir.value() + "/tokenizer_config.json").c_str()));
     config["chat_template"]      = chat_template;
     result.tokenizer_config_json = config.dump();
     result.generation_config_json =
-        read_file((official_tokenizer_dir() + "/generation_config.json").c_str());
+        read_file((tokenizer_dir.value() + "/generation_config.json").c_str());
     return result;
 }
 
@@ -415,6 +402,7 @@ int check_splice_matches_cold(const fi::Tokenizer& tokenizer, const fi::Rendered
 }
 
 int test_loop_pos_and_splice() {
+    if (skip_without_official_tokenizer("test_loop_pos_and_splice")) { return 0; }
     const fi::Tokenizer& tokenizer = official_tokenizer();
     int failures                   = 0;
 
@@ -663,6 +651,7 @@ bool same_observation(const fi::HostEncodeObservation& a, const fi::HostEncodeOb
 }
 
 int test_engine_shaped_cache() {
+    if (skip_without_official_tokenizer("test_engine_shaped_cache")) { return 0; }
     const Frontend frontend =
         FrontendFactory::create_component(official_frontend_resources(thinking_toggle_template_source()));
     const Frontend effort_frontend = FrontendFactory::create_component(
@@ -985,6 +974,7 @@ int test_engine_shaped_cache() {
 }
 
 int test_concurrency_and_copy_out() {
+    if (skip_without_official_tokenizer("test_concurrency_and_copy_out")) { return 0; }
     const Frontend frontend =
         FrontendFactory::create_component(official_frontend_resources(thinking_toggle_template_source()));
     ninfer::PromptOptions preserve;
@@ -1094,6 +1084,7 @@ int test_concurrency_and_copy_out() {
 }
 
 int test_verify_poison() {
+    if (skip_without_official_tokenizer("test_verify_poison")) { return 0; }
     const Frontend frontend =
         FrontendFactory::create_component(official_frontend_resources(thinking_toggle_template_source()));
     ninfer::PromptOptions preserve;
@@ -1156,6 +1147,7 @@ int test_verify_poison() {
 }
 
 int test_non_loop_pos_insert_refused() {
+    if (skip_without_official_tokenizer("test_non_loop_pos_insert_refused")) { return 0; }
     const fi::Tokenizer& tokenizer = official_tokenizer();
     fi::EncodedHistoryCache cache;
     const std::string full = thinking_toggle_template()
@@ -1171,6 +1163,7 @@ int test_non_loop_pos_insert_refused() {
 }
 
 int test_coverage_gaps() {
+    if (skip_without_official_tokenizer("test_coverage_gaps")) { return 0; }
     try {
     const Frontend frontend =
         FrontendFactory::create_component(official_frontend_resources(thinking_toggle_template_source()));
@@ -1528,8 +1521,9 @@ int test_coverage_gaps() {
 }
 
 int test_byte_match_and_boundaries() {
+    int failures = 0;
+    if (!skip_without_official_tokenizer("test_byte_match_and_boundaries official")) {
     const fi::Tokenizer& tokenizer = official_tokenizer();
-    int failures                   = 0;
 
     fi::ChatRenderOptions no_generation;
     no_generation.add_generation_prompt = false;
@@ -1668,6 +1662,7 @@ int test_byte_match_and_boundaries() {
     longer_than_full.insert_committed(word.text + "x", tokenizer.encode(word.text + "x"));
     failures += check(!longer_than_full.copy_longest_prefix(word.text, tokenizer, std::nullopt),
                       "stored bytes longer than full were used as a hit");
+    }
 
     const fi::Tokenizer toy_tok({.tokenizer_json         = resources().tokenizer_json,
                                  .tokenizer_config_json  = resources().tokenizer_config_json,

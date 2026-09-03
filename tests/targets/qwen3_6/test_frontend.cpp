@@ -5,6 +5,7 @@
 #include "targets/qwen3_6/impl/frontend/processor.h"
 #include "targets/qwen3_6/impl/frontend/test_access.h"
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
+#include "targets/qwen3_6/official_tokenizer_dir.h"
 
 #include <nlohmann/json.hpp>
 
@@ -75,25 +76,14 @@ const fi::CompiledChatTemplate& reasoning_effort_template() {
 }
 
 const fi::Tokenizer& official_tokenizer() {
-    static const std::string tokenizer_dir = [] {
-        const char* env = std::getenv("NINFER_OFFICIAL_TOKENIZER_DIR");
-        const char* candidates[] = {
-            env,
-            "/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16",
-            "/ssdpool2nvme/local_llm/ninfer-dylan2/profiles/bench/official-tokenizer",
-        };
-        for (const char* dir : candidates) {
-            if (dir == nullptr || dir[0] == '\0') { continue; }
-            std::ifstream stream(std::string(dir) + "/tokenizer.json", std::ios::binary);
-            if (stream) { return std::string(dir); }
-        }
-        throw std::runtime_error("official tokenizer.json was not found");
-    }();
-    static const std::string tokenizer_json = read_file((tokenizer_dir + "/tokenizer.json").c_str());
+    const auto& tokenizer_dir = official_tokenizer_dir();
+    if (!tokenizer_dir) { throw std::runtime_error("official tokenizer.json was not found"); }
+    static const std::string tokenizer_json =
+        read_file((tokenizer_dir.value() + "/tokenizer.json").c_str());
     static const std::string tokenizer_config_json =
-        read_file((tokenizer_dir + "/tokenizer_config.json").c_str());
+        read_file((tokenizer_dir.value() + "/tokenizer_config.json").c_str());
     static const std::string generation_config_json =
-        read_file((tokenizer_dir + "/generation_config.json").c_str());
+        read_file((tokenizer_dir.value() + "/generation_config.json").c_str());
     static const fi::Tokenizer tokenizer({.tokenizer_json         = tokenizer_json,
                                           .tokenizer_config_json  = tokenizer_config_json,
                                           .generation_config_json = generation_config_json});
@@ -273,6 +263,7 @@ bool throws_invalid_argument(Callable&& callable) {
 }
 
 int test_official_tokenizer_merge() {
+    if (skip_without_official_tokenizer("test_official_tokenizer_merge")) { return 0; }
     const fi::Tokenizer& tokenizer = official_tokenizer();
 
     constexpr std::array<std::pair<const char*, int>, 7> appended = {{
@@ -431,12 +422,14 @@ int test_ordered_instruction_turns() {
                           appended_diagnostics.substr(stable_history.size()) ==
                               "<|im_start|>system\ncurrent diagnostics<|im_end|>\n",
                       "appended diagnostics changed the stable serialized history prefix");
-    const std::vector<int> stable_tokens   = official_tokenizer().encode(stable_history);
-    const std::vector<int> appended_tokens = official_tokenizer().encode(appended_diagnostics);
-    failures +=
-        check(appended_tokens.size() > stable_tokens.size() &&
-                  std::equal(stable_tokens.begin(), stable_tokens.end(), appended_tokens.begin()),
-              "appended diagnostics changed the stable token prefix");
+    if (!skip_without_official_tokenizer("test_official_chat_template token prefix")) {
+        const std::vector<int> stable_tokens   = official_tokenizer().encode(stable_history);
+        const std::vector<int> appended_tokens = official_tokenizer().encode(appended_diagnostics);
+        failures += check(
+            appended_tokens.size() > stable_tokens.size() &&
+                std::equal(stable_tokens.begin(), stable_tokens.end(), appended_tokens.begin()),
+            "appended diagnostics changed the stable token prefix");
+    }
 
     fi::ChatRenderOptions tools = no_generation;
     tools.tool_jsons.push_back(
