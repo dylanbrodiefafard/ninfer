@@ -47,11 +47,13 @@ if [[ "$(docker inspect -f '{{.State.Running}}' "$BUILDER")" != "true" ]]; then
   docker start "$BUILDER" >/dev/null
 fi
 
-# python3 is in the image; keep this for checkouts built from an older layer.
+# Repair long-lived containers created from an older builder image.
 docker exec "$BUILDER" bash -lc \
   'command -v python3 >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq python3; }'
 docker exec "$BUILDER" bash -lc \
   'command -v ccache >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq ccache; }'
+docker exec "$BUILDER" bash -lc \
+  'pkg-config --exists libzstd || { apt-get update -qq && apt-get install -y -qq libzstd-dev; }'
 
 # Idempotent RTX 5090 host-driver fix (also applied in the Dockerfile build stage).
 docker exec "$BUILDER" bash -lc \

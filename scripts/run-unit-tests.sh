@@ -532,7 +532,7 @@ fi
 bind_real_weights
 require_free_vram
 
-if builder_running || { command -v docker >/dev/null 2>&1 && "${ROOT}/scripts/dev-setup.sh"; }; then
+if command -v docker >/dev/null 2>&1 && "${ROOT}/scripts/dev-setup.sh"; then
   inner_args=(--inner)
   if [[ "$INCLUDE_REAL" -eq 1 ]]; then
     inner_args+=(--real)
