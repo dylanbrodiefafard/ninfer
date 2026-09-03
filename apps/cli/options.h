@@ -21,6 +21,9 @@ struct Options {
     std::uint32_t max_context    = 2048;
     KvCapacityPolicy kv_capacity = KvCapacityPolicy::explicit_capacity(2048);
     std::size_t kv_ram_capacity_bytes = 0;
+    std::size_t kv_disk_capacity_bytes = 0;
+    std::filesystem::path kv_disk_location;
+    KvDiskCompress kv_disk_compress = KvDiskCompress::Off;
     std::uint32_t prefill_chunk  = 4096;
     int device                   = 0;
 

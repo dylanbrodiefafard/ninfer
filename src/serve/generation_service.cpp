@@ -266,6 +266,9 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.max_context          = options_.max_context;
     engine_options.kv_capacity          = options_.kv_capacity;
     engine_options.kv_ram_capacity_bytes = options_.kv_ram_capacity_bytes;
+    engine_options.kv_disk_capacity_bytes = options_.kv_disk_capacity_bytes;
+    engine_options.kv_disk_location = options_.kv_disk_location;
+    engine_options.kv_disk_compress = options_.kv_disk_compress;
     engine_options.context_checkpoint_marks = options_.context_checkpoint_marks;
     engine_options.max_concurrency      = options_.max_concurrency;
     engine_options.max_pending_requests = options_.max_pending_requests;
@@ -495,6 +498,16 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.kv_ram_drops                = stats.kv_ram_drops;
     outcome.metrics.kv_ram_save_seconds         = result.kv_ram_save_seconds;
     outcome.metrics.kv_ram_load_seconds         = result.kv_ram_load_seconds;
+    outcome.metrics.kv_disk_capacity_bytes      = stats.kv_disk_capacity_bytes;
+    outcome.metrics.kv_disk_used_bytes          = stats.kv_disk_used_bytes;
+    outcome.metrics.kv_disk_entry_count         = stats.kv_disk_entry_count;
+    outcome.metrics.kv_disk_captures            = stats.kv_disk_captures;
+    outcome.metrics.kv_disk_restores            = stats.kv_disk_restores;
+    outcome.metrics.kv_disk_evictions           = stats.kv_disk_evictions;
+    outcome.metrics.kv_disk_drops               = stats.kv_disk_drops;
+    outcome.metrics.kv_disk_save_seconds        = result.kv_disk_save_seconds;
+    outcome.metrics.kv_disk_load_seconds        = result.kv_disk_load_seconds;
+    outcome.metrics.kv_disk_h2d_seconds         = result.kv_disk_h2d_seconds;
     outcome.metrics.speculative_backend         = result.speculative.backend;
     outcome.metrics.speculative_draft_window    = result.speculative.draft_window;
     outcome.metrics.speculative_rounds          = result.speculative.rounds;

@@ -18,6 +18,66 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## V4 SSD page-spill qualification
+
+The 2026-09-02 page-only qualification used an RTX 5090, CUDA 13.1, the local ZFS mirror, NVFP4
+KV geometry, incompressible deterministic data, and the exact 33,981-token workload: 531 logical
+pages, 1,148,387,328 payload bytes, and 1,151,143,936 capacity-billed bytes per repetition. Each
+three-repetition sample synchronized the pool before reading device counters and again after the
+cache commit. Physical bytes are the sum of both NVMe leaf deltas divided by the explicitly
+configured mirror replication factor of two; samples are accepted only when that normalized value
+is within 3% of the cache's durable-extent accounting.
+
+| Page batch | Host-visible commit GB/s | Post-pool-sync payload GB/s |
+|---:|---:|---:|
+| 1 | 3.716 | 2.357 |
+| 4 | 4.119 | 2.507 |
+| 8 | 3.471 | 2.244 |
+
+Batch four is the production setting. Its clean aggregate was 6,920,171,520 leaf-device bytes,
+3,460,085,760 mirror-normalized bytes, and 3,453,431,808 cache-accounted bytes. The dataset had
+`sync=disabled`, so the host-visible commit number is not a crash-durability result. The post-sync
+number includes an explicit pool sync and is the relevant physical write-through result for this
+dataset, but no mirror-normalized v3 post-sync measurement survives for a same-scope comparison.
+The historical v3 host-visible result was approximately 3.6–3.8 GB/s.
+
+The same campaign measured pinned H2D at 28.94 GB/s, D2H at 28.67 GB/s, and packed-page
+H2D-plus-scatter at 28.11 GB/s (97.1% of pinned H2D), so the page copy/scatter route is not the
+remaining restore bottleneck. Direct-reader scaling at 1/4/8/16/32 readers was
+3.85/11.99/15.63/17.64/17.57 GiB/s; production retains 16 readers. Warm 531-page restore
+diagnostics varied from about 11.3 to 19.5 GB/s. They validate the route and concurrency but are
+not cold-device claims because the available host could not evict ZFS ARC and the dataset uses
+`primarycache=all`.
+
+A follow-up V4-compatible qualification used the benchmark's exact 27B linear-attention geometry:
+153,944,064 raw state bytes and a one-page prompt. One serial direct read plus serial CRC measured
+2.617 GB/s. Four 4 MiB read/CRC chunks in flight measured 10.87–13.89 GB/s across the retained
+runs (4.2–5.3×); more per-object workers contended, so production caps each large state object at
+four while sharing the startup-fixed reader budget across independent objects. The exact 531-page
+startup audit fell from a 259.1 ms mean to 65.6 ms (3.95×) by reading each page record once and
+validating independent CRCs across that same bounded pool. This startup measurement was
+warm/ARC-resident; it isolates validation overhead and is not a cold-device startup claim. Startup
+still rejects corrupt live payloads before advertising an entry.
+
+A second follow-up isolated CRC32C and state-worker dispatch. Alternating 1 GiB CRC sweeps on the
+Ryzen 9 7950X3D measured the serial SSE4.2 chain at 14.0–14.3 GB/s. Three interleaved hardware
+chains measured 22.5–23.1 GB/s at 1 MiB, 29.9–34.5 GB/s at the production 4 MiB chunk, and
+28.8–32.2 GB/s at 256 MiB. The combine overhead lost below 512 KiB, so production retains the
+serial path for smaller records and switches at 512 KiB. In the clean exact-state run this changed
+restore from 13.06 to 14.87 GB/s (+13.8%), and the warm/ARC-resident 531-page startup audit mean
+fell from 65.6 to 59.1 ms (-9.9%). Reusing the existing restore threads through a persistent
+state-task queue instead regressed paired state restores by 3.4% and 7.1% (13.54→13.08 and
+14.73→13.69 GB/s); that candidate was rejected and the transient four-worker state path remains.
+
+Compaction of 312,246,272 retained bytes measured 2.57–2.65 GB/s against a 2.9–3.27 GB/s direct
+write control. Increasing its transfer buffer from 1 MiB to 8 MiB regressed from 2.65 to 2.48 GB/s,
+so the production buffer remains 1 MiB and no extra pipeline is retained. The final physical
+batch-four rerun measured 3.944 GB/s host-visible commit and 2.448 GB/s post-pool-sync payload,
+with every mirror-normalized sample within the 3% accounting bound. These results leave no
+supported wire-format reason for a disk format v5: the accepted state and startup changes operate
+entirely within v4, while contiguous page reads, compaction, H2D/scatter, and durable writes are at
+or close to the relevant measured hardware/filesystem ceilings.
+
 The serving measurements characterize the two measured Qwen3.6 model IDs independently on one
 NVIDIA GeForce RTX 5090. They cover long-context prefill and baseline decode with speculative
 decoding disabled, plus long-reasoning and cross-scenario decode with MTP and DFlash. The 27B

@@ -24,6 +24,7 @@ add_library(ninfer_core STATIC
   core/gdn_replay_records.cpp
   core/cyclic_kv_cache.cpp
   core/paged_kv_cache.cpp
+  core/paged_kv_scatter.cu
   core/linear_attention_state.cpp
   core/layout.cpp
   core/tensor.cpp
@@ -303,13 +304,18 @@ add_subdirectory(targets/qwen3_6)
 add_subdirectory(targets/qwen3_6_27b)
 add_subdirectory(targets/qwen3_6_35b_a3b)
 
+target_include_directories(ninfer_engine PRIVATE ${ZSTD_INCLUDE_DIRS})
+if(ZSTD_CFLAGS_OTHER)
+  target_compile_options(ninfer_engine PRIVATE ${ZSTD_CFLAGS_OTHER})
+endif()
 target_link_libraries(ninfer_engine
   PRIVATE
     ninfer_artifact
     ninfer_core
     ninfer_ops
     ninfer_text
-    ninfer_media_decode)
+    ninfer_media_decode
+    ${ZSTD_LIBRARIES})
 add_library(ninfer::engine ALIAS ninfer_engine)
 
 if(NINFER_BUILD_SERVE)

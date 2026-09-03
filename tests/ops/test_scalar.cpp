@@ -57,6 +57,7 @@ int assign_i32_contract(cudaStream_t stream) {
     constexpr std::int32_t destination_value = 1985229328;
     store<std::int32_t>(source, source_value);
     store<std::int32_t>(destination, destination_value);
+    cuda_synchronize();
     Tensor source_tensor(source.data(), DType::I32, {1});
     Tensor destination_tensor(destination.data(), DType::I32, {1});
 
@@ -84,6 +85,7 @@ int add_i32_contract(cudaStream_t stream) {
     store<std::int32_t>(lhs, lhs_value);
     store<std::int32_t>(rhs, rhs_value);
     store<std::int32_t>(destination, -1);
+    cuda_synchronize();
     Tensor lhs_tensor(lhs.data(), DType::I32, {1});
     Tensor rhs_tensor(rhs.data(), DType::I32, {1});
     Tensor destination_tensor(destination.data(), DType::I32, {1});

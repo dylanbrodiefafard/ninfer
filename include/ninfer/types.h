@@ -67,6 +67,11 @@ enum class KvCapacityMode : std::uint8_t {
     Automatic,
 };
 
+enum class KvDiskCompress : std::uint8_t {
+    Off,
+    Zstd,
+};
+
 inline constexpr std::size_t kDefaultKvCapacityHeadroomBytes = 1024ULL * 1024ULL * 1024ULL;
 
 struct KvCapacityPolicy {
@@ -125,6 +130,12 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 4096;
     std::size_t kv_ram_capacity_bytes  = 0;
+    std::size_t kv_disk_capacity_bytes = 0;
+    std::filesystem::path kv_disk_location;
+    KvDiskCompress kv_disk_compress    = KvDiskCompress::Off;
+    // Filled from the loaded artifact at Engine construction for the KV-disk fingerprint.
+    std::string model_id;
+    std::string weights_id;
     // nullopt = default prefill ladder; empty = disable automatic ladder (`off`).
     std::optional<std::vector<std::uint32_t>> context_checkpoint_marks;
     KvCacheStorage kv_cache            = KvCacheStorage::Nvfp4;
@@ -173,6 +184,23 @@ inline void validate_sparse_attn_flags(KvCacheStorage kv_cache, bool sage_attn, 
     }
     if ((keep_frac < 1.0f || xattn_tau < 1.0f) && kv_cache != KvCacheStorage::Nvfp4) {
         throw std::invalid_argument("--keep-frac / --xattn-tau require --kv-dtype nvfp4");
+    }
+}
+
+inline void validate_kv_disk_options(std::size_t ram_capacity_bytes,
+                                     std::size_t disk_capacity_bytes,
+                                     const std::filesystem::path& disk_location) {
+    if (disk_capacity_bytes == 0) {
+        if (!disk_location.empty()) {
+            throw std::invalid_argument("--kv-disk-location requires --kv-disk-capacity");
+        }
+        return;
+    }
+    if (disk_location.empty()) {
+        throw std::invalid_argument("--kv-disk-capacity requires --kv-disk-location");
+    }
+    if (ram_capacity_bytes == 0) {
+        throw std::invalid_argument("--kv-disk-capacity requires --kv-ram-capacity > 0");
     }
 }
 
@@ -483,6 +511,7 @@ enum class PrefixReuseSource : std::uint8_t {
     None,
     VramResident,
     HostRam,
+    HostDisk,
 };
 
 struct GenerationResult {
@@ -505,6 +534,14 @@ struct GenerationResult {
     // CUDA D2H/H2D elapsed for this request's admission spills and RAM restore.
     double kv_ram_save_seconds = 0;
     double kv_ram_load_seconds = 0;
+    // Disk spill I/O harvested onto this request (emergency/idle overlap). Restore
+    // load is the host wall from the first live SSD read of this request's restore
+    // until the last page or state object has arrived in the pinned host window.
+    // h2d is the host wall from that last host arrival until copy_stream copies_done
+    // (page and state H2D that remain after SSD is idle, not overlapped copy time).
+    double kv_disk_save_seconds = 0;
+    double kv_disk_load_seconds = 0;
+    double kv_disk_h2d_seconds  = 0;
     GenerationTimings timings;
     SpeculativeStats speculative;
 };
@@ -543,6 +580,9 @@ struct MemorySummary {
     // a retired copy may still occupy the pin until its D2H/H2D event is reaped.
     std::size_t kv_ram_used_bytes                 = 0;
     std::size_t kv_ram_entry_count                = 0;
+    std::size_t kv_disk_capacity_bytes            = 0;
+    std::size_t kv_disk_used_bytes                = 0;
+    std::size_t kv_disk_entry_count               = 0;
 };
 
 // Monotonic execution counters plus fieldwise-concurrent live scheduler gauges. A returned value is
@@ -569,6 +609,15 @@ struct RuntimeStats {
     std::size_t kv_ram_capacity_bytes   = 0;
     std::size_t kv_ram_used_bytes       = 0;
     std::size_t kv_ram_entry_count      = 0;
+    std::uint64_t kv_disk_captures      = 0;
+    std::uint64_t kv_disk_restores      = 0;
+    std::uint64_t kv_disk_evictions     = 0;
+    std::uint64_t kv_disk_drops         = 0;
+    double kv_disk_save_seconds         = 0;
+    double kv_disk_load_seconds         = 0;
+    std::size_t kv_disk_capacity_bytes  = 0;
+    std::size_t kv_disk_used_bytes      = 0;
+    std::size_t kv_disk_entry_count     = 0;
 };
 
 enum class ScoreSchedule : std::uint8_t {

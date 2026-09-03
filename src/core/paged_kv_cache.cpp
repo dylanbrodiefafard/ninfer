@@ -3,6 +3,7 @@
 #include "core/device.h"
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -644,6 +645,106 @@ void unpack_paged_kv_allocation_from_host(PagedKVAllocation& allocation, const P
             }
         }
         in += static_cast<std::size_t>(src_page_count) * bpp;
+    }
+}
+
+std::size_t paged_kv_logical_page_bytes(const PagedKVPool& pool) {
+    return paged_kv_host_image_bytes(pool, 1);
+}
+
+void pack_paged_kv_logical_page_to_host(const PagedKVAllocation& allocation, const PagedKVPool& pool,
+                                        std::uint32_t logical_index, void* dst, cudaStream_t stream) {
+    if (!allocation.valid() || !allocation.belongs_to(pool)) {
+        throw std::invalid_argument("Paged KV pack requires an allocation from the named pool");
+    }
+    if (logical_index >= allocation.mapped_page_count()) {
+        throw std::logic_error("Paged KV logical page index exceeds mapped pages");
+    }
+    if (dst == nullptr) { throw std::invalid_argument("Paged KV logical-page pack destination is null"); }
+    const std::int32_t page_id            = allocation.page_ids()[logical_index];
+    const PagedKVPlaneOrder order         = pool.plane_order();
+    auto* out                             = static_cast<unsigned char*>(dst);
+    for (std::size_t plane_index = 0; plane_index < pool.plane_count(); ++plane_index) {
+        const Tensor& plane   = pool.plane(plane_index);
+        const std::size_t bpp = plane_page_bytes(plane, order);
+        auto* base            = static_cast<unsigned char*>(plane.data);
+        if (order == PagedKVPlaneOrder::PageMajor) {
+            CUDA_CHECK(cudaMemcpyAsync(out, base + static_cast<std::int64_t>(page_id) * plane.nb[3],
+                                       bpp, cudaMemcpyDeviceToHost, stream));
+        } else {
+            CUDA_CHECK(cudaMemcpy2DAsync(
+                out, static_cast<std::size_t>(plane.nb[2]),
+                base + static_cast<std::int64_t>(page_id) * plane.nb[2],
+                static_cast<std::size_t>(plane.nb[3]), static_cast<std::size_t>(plane.nb[2]),
+                static_cast<std::size_t>(plane.ne[3]), cudaMemcpyDeviceToHost, stream));
+        }
+        out += bpp;
+    }
+}
+
+void unpack_paged_kv_logical_page_from_host(PagedKVAllocation& allocation, const PagedKVPool& pool,
+                                            const void* src, std::uint32_t logical_index,
+                                            cudaStream_t stream) {
+    if (!allocation.valid() || !allocation.belongs_to(pool)) {
+        throw std::invalid_argument("Paged KV unpack requires an allocation from the named pool");
+    }
+    if (logical_index >= allocation.mapped_page_count()) {
+        throw std::logic_error("Paged KV logical page index exceeds mapped destination pages");
+    }
+    if (src == nullptr) { throw std::invalid_argument("Paged KV logical-page unpack source is null"); }
+    const std::int32_t page_id    = allocation.page_ids()[logical_index];
+    const PagedKVPlaneOrder order = pool.plane_order();
+    const auto* in                = static_cast<const unsigned char*>(src);
+    for (std::size_t plane_index = 0; plane_index < pool.plane_count(); ++plane_index) {
+        const Tensor& plane   = pool.plane(plane_index);
+        const std::size_t bpp = plane_page_bytes(plane, order);
+        auto* base            = static_cast<unsigned char*>(plane.data);
+        if (order == PagedKVPlaneOrder::PageMajor) {
+            CUDA_CHECK(cudaMemcpyAsync(base + static_cast<std::int64_t>(page_id) * plane.nb[3], in,
+                                       bpp, cudaMemcpyHostToDevice, stream));
+        } else {
+            CUDA_CHECK(cudaMemcpy2DAsync(
+                base + static_cast<std::int64_t>(page_id) * plane.nb[2],
+                static_cast<std::size_t>(plane.nb[3]), in, static_cast<std::size_t>(plane.nb[2]),
+                static_cast<std::size_t>(plane.nb[2]), static_cast<std::size_t>(plane.ne[3]),
+                cudaMemcpyHostToDevice, stream));
+        }
+        in += bpp;
+    }
+}
+
+void logical_page_host_slices(const void* image, const PagedKVPool& pool,
+                              std::uint32_t src_page_count, std::uint32_t logical_index,
+                              std::vector<std::pair<const void*, std::size_t>>& out) {
+    if (logical_index >= src_page_count) {
+        throw std::logic_error("Paged KV gather index exceeds the captured image");
+    }
+    if (image == nullptr) {
+        throw std::invalid_argument("Paged KV gather source is null");
+    }
+    const PagedKVPlaneOrder order = pool.plane_order();
+    const auto* in                = static_cast<const unsigned char*>(image);
+    out.clear();
+    out.reserve(pool.plane_count());
+    for (std::size_t plane_index = 0; plane_index < pool.plane_count(); ++plane_index) {
+        const std::size_t bpp = plane_page_bytes(pool.plane(plane_index), order);
+        out.emplace_back(in + static_cast<std::size_t>(logical_index) * bpp, bpp);
+        in += static_cast<std::size_t>(src_page_count) * bpp;
+    }
+}
+
+void gather_logical_page_from_host_image(const void* image, const PagedKVPool& pool,
+                                         std::uint32_t src_page_count, std::uint32_t logical_index,
+                                         void* dst) {
+    if (dst == nullptr) {
+        throw std::invalid_argument("Paged KV gather destination is null");
+    }
+    std::vector<std::pair<const void*, std::size_t>> slices;
+    logical_page_host_slices(image, pool, src_page_count, logical_index, slices);
+    auto* out = static_cast<unsigned char*>(dst);
+    for (const auto& slice : slices) {
+        if (slice.second != 0) { std::memcpy(out, slice.first, slice.second); }
+        out += slice.second;
     }
 }
 

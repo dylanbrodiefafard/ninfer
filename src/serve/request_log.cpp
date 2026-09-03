@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iomanip>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -121,6 +122,8 @@ const char* prefix_reuse_source_name(ninfer::PrefixReuseSource source) {
         return "vram_resident";
     case ninfer::PrefixReuseSource::HostRam:
         return "host_ram";
+    case ninfer::PrefixReuseSource::HostDisk:
+        return "host_disk";
     }
     return "unknown";
 }
@@ -334,6 +337,21 @@ std::string format_kv_ram_live(const ninfer::MemorySummary& memory, std::uint64_
     return out.str();
 }
 
+std::string format_kv_disk_live(const ninfer::MemorySummary& memory, std::uint64_t restores,
+                                std::uint64_t evictions, std::uint64_t drops, double save_seconds,
+                                double load_seconds,
+                                std::optional<double> h2d_seconds = std::nullopt) {
+    std::ostringstream out;
+    out << " kv-disk=" << format_kv_ram_size(memory.kv_disk_used_bytes, kv_ram_log_exact_bytes())
+        << " n=" << memory.kv_disk_entry_count << " restores=" << restores
+        << " evicts=" << evictions << " drops=" << drops << std::fixed << std::setprecision(0)
+        << " save=" << (save_seconds * 1000.0) << "ms load=" << (load_seconds * 1000.0) << "ms";
+    if (h2d_seconds) {
+        out << " h2d=" << (*h2d_seconds * 1000.0) << "ms";
+    }
+    return out.str();
+}
+
 } // namespace
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
@@ -433,6 +451,15 @@ std::string format_request_done(const RequestLogContext& context,
                                   metrics.kv_ram_drops, metrics.kv_ram_save_seconds,
                                   metrics.kv_ram_load_seconds);
     }
+    if (metrics.kv_disk_capacity_bytes != 0) {
+        ninfer::MemorySummary occupancy;
+        occupancy.kv_disk_capacity_bytes = metrics.kv_disk_capacity_bytes;
+        occupancy.kv_disk_used_bytes     = metrics.kv_disk_used_bytes;
+        occupancy.kv_disk_entry_count    = metrics.kv_disk_entry_count;
+        out << format_kv_disk_live(occupancy, metrics.kv_disk_restores, metrics.kv_disk_evictions,
+                                   metrics.kv_disk_drops, metrics.kv_disk_save_seconds,
+                                   metrics.kv_disk_load_seconds, metrics.kv_disk_h2d_seconds);
+    }
     if (!outcome.ignored_qwen_tool_call_names.empty()) {
         out << " ignored_tool_calls=";
         for (std::size_t i = 0; i < outcome.ignored_qwen_tool_call_names.size(); ++i) {
@@ -494,6 +521,16 @@ std::string format_kv_ram_occupancy(const ninfer::MemorySummary& memory) {
     return out.str();
 }
 
+std::string format_kv_disk_occupancy(const ninfer::MemorySummary& memory) {
+    if (memory.kv_disk_capacity_bytes == 0) { return "off"; }
+    const bool exact = kv_ram_log_exact_bytes();
+    std::ostringstream out;
+    out << format_kv_ram_size(memory.kv_disk_capacity_bytes, exact) << " used="
+        << format_kv_ram_size(memory.kv_disk_used_bytes, exact)
+        << " entries=" << memory.kv_disk_entry_count;
+    return out.str();
+}
+
 std::string format_throughput(const ThroughputReport& report) {
     const double prefill_rate =
         report.interval_seconds > 0.0
@@ -525,6 +562,15 @@ std::string format_throughput(const ThroughputReport& report) {
         out << format_kv_ram_live(occupancy, report.scheduler.kv_ram_restores,
                                   report.scheduler.kv_ram_evictions, report.scheduler.kv_ram_drops,
                                   report.kv_ram_save_seconds, report.kv_ram_load_seconds);
+    }
+    if (report.kv_disk_capacity_bytes != 0) {
+        ninfer::MemorySummary occupancy;
+        occupancy.kv_disk_capacity_bytes = report.kv_disk_capacity_bytes;
+        occupancy.kv_disk_used_bytes     = report.kv_disk_used_bytes;
+        occupancy.kv_disk_entry_count    = report.kv_disk_entry_count;
+        out << format_kv_disk_live(occupancy, report.scheduler.kv_disk_restores,
+                                   report.scheduler.kv_disk_evictions, report.scheduler.kv_disk_drops,
+                                   report.kv_disk_save_seconds, report.kv_disk_load_seconds);
     }
     return out.str();
 }
@@ -579,6 +625,9 @@ std::string format_server_start_json(
           {"kv_ram_capacity_bytes", memory.kv_ram_capacity_bytes},
           {"kv_ram_used_bytes", memory.kv_ram_used_bytes},
           {"kv_ram_entry_count", memory.kv_ram_entry_count},
+          {"kv_disk_capacity_bytes", memory.kv_disk_capacity_bytes},
+          {"kv_disk_used_bytes", memory.kv_disk_used_bytes},
+          {"kv_disk_entry_count", memory.kv_disk_entry_count},
           {"speculative_backend", product::speculative_backend_name(options.speculative.backend)},
           {"speculative_draft_window", options.speculative.draft_tokens},
           {"proposal_head", proposal_head_name(options.speculative.proposal_head)}};
@@ -605,7 +654,10 @@ std::string format_server_start_json(
              {"kv_payload_bytes", memory.kv_payload_bytes},
              {"kv_ram_capacity_bytes", memory.kv_ram_capacity_bytes},
              {"kv_ram_used_bytes", memory.kv_ram_used_bytes},
-             {"kv_ram_entry_count", memory.kv_ram_entry_count}};
+             {"kv_ram_entry_count", memory.kv_ram_entry_count},
+             {"kv_disk_capacity_bytes", memory.kv_disk_capacity_bytes},
+             {"kv_disk_used_bytes", memory.kv_disk_used_bytes},
+             {"kv_disk_entry_count", memory.kv_disk_entry_count}};
     record["environment"] =
         Json{{"device", environment.device},
              {"gpu_name", environment.gpu_name},
@@ -662,6 +714,13 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
              {"kv_ram_restores", outcome.metrics.kv_ram_restores},
              {"kv_ram_evictions", outcome.metrics.kv_ram_evictions},
              {"kv_ram_drops", outcome.metrics.kv_ram_drops},
+             {"kv_disk_capacity_bytes", outcome.metrics.kv_disk_capacity_bytes},
+             {"kv_disk_used_bytes", outcome.metrics.kv_disk_used_bytes},
+             {"kv_disk_entry_count", outcome.metrics.kv_disk_entry_count},
+             {"kv_disk_captures", outcome.metrics.kv_disk_captures},
+             {"kv_disk_restores", outcome.metrics.kv_disk_restores},
+             {"kv_disk_evictions", outcome.metrics.kv_disk_evictions},
+             {"kv_disk_drops", outcome.metrics.kv_disk_drops},
              {"tool_call_count", outcome.tool_calls.size()},
              {"ignored_qwen_tool_call_names", outcome.ignored_qwen_tool_call_names}};
     record["timings_seconds"] = Json{
@@ -672,7 +731,10 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
         {"decode", outcome.metrics.decode_seconds},
         {"total", outcome.metrics.total_seconds},
         {"kv_ram_save", outcome.metrics.kv_ram_save_seconds},
-        {"kv_ram_load", outcome.metrics.kv_ram_load_seconds}};
+        {"kv_ram_load", outcome.metrics.kv_ram_load_seconds},
+        {"kv_disk_save", outcome.metrics.kv_disk_save_seconds},
+        {"kv_disk_load", outcome.metrics.kv_disk_load_seconds},
+        {"kv_disk_h2d", outcome.metrics.kv_disk_h2d_seconds}};
     record["speculative"] = speculative_json(outcome.metrics);
     return record.dump();
 }
@@ -717,10 +779,19 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                                   {"kv_ram_drops", report.scheduler.kv_ram_drops},
                                   {"kv_ram_capacity_bytes", report.kv_ram_capacity_bytes},
                                   {"kv_ram_used_bytes", report.kv_ram_used_bytes},
-                                  {"kv_ram_entry_count", report.kv_ram_entry_count}};
+                                  {"kv_ram_entry_count", report.kv_ram_entry_count},
+                                  {"kv_disk_captures", report.scheduler.kv_disk_captures},
+                                  {"kv_disk_restores", report.scheduler.kv_disk_restores},
+                                  {"kv_disk_evictions", report.scheduler.kv_disk_evictions},
+                                  {"kv_disk_drops", report.scheduler.kv_disk_drops},
+                                  {"kv_disk_capacity_bytes", report.kv_disk_capacity_bytes},
+                                  {"kv_disk_used_bytes", report.kv_disk_used_bytes},
+                                  {"kv_disk_entry_count", report.kv_disk_entry_count}};
     record["timings_seconds"] =
         Json{{"kv_ram_save", report.kv_ram_save_seconds},
-             {"kv_ram_load", report.kv_ram_load_seconds}};
+             {"kv_ram_load", report.kv_ram_load_seconds},
+             {"kv_disk_save", report.kv_disk_save_seconds},
+             {"kv_disk_load", report.kv_disk_load_seconds}};
     record["decode_batch"] = Json{{"rounds", report.decode_rounds},
                                   {"row_rounds", report.decode_row_rounds},
                                   {"average_size", std::move(average_batch)}};

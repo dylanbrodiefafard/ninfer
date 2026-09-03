@@ -79,10 +79,21 @@ ninfer_add_test(ninfer_kv_ram_cache_test
   LIBRARIES ninfer_engine ninfer_core)
 target_include_directories(ninfer_kv_ram_cache_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+ninfer_add_test(ninfer_kv_disk_cache_test
+  SOURCES test_kv_disk_cache.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_kv_disk_cache_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 ninfer_add_test(ninfer_kv_ram_cache_perf_test
   SOURCES test_kv_ram_cache_perf.cpp
   LIBRARIES ninfer_engine ninfer_core)
 target_include_directories(ninfer_kv_ram_cache_perf_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+ninfer_add_test(ninfer_kv_disk_cache_perf_test
+  SOURCES test_kv_disk_cache_perf.cpp
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_kv_disk_cache_perf_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 ninfer_add_test(ninfer_kv_ram_cache_opt_test
   SOURCES test_kv_ram_cache_opt.cpp
@@ -137,6 +148,10 @@ ninfer_add_test(ninfer_qwen3_6_27b_ram_real_test
   SOURCES targets/qwen3_6_27b/test_engine_ram_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_27b_ram_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_6_27b_disk_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_disk_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_6_27b_disk_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_27b_context_checkpoint_real_test
   SOURCES targets/qwen3_6_27b/test_engine_context_checkpoint_real.cpp
   LIBRARIES ninfer_engine)

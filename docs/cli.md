@@ -153,6 +153,9 @@ MASK) chain verify. Published INT8-KV C=1 DFlash2 W8 numbers are in
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
 | `--kv-ram-capacity off\|N` | pinned host KV prefix-cache capacity in MiB; `off` disables the tier | `off` |
+| `--kv-disk-capacity off\|N` | SSD KV prefix-cache unique-object capacity in MiB; `off` disables the tier | `off` |
+| `--kv-disk-location PATH` | directory for the SSD page store; required iff `--kv-disk-capacity` is enabled | unset |
+| `--kv-disk-compress off\|zstd` | zstd-1 on new GDN/hidden/cyclic writes; KV pages stay uncompressed | `off` |
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `4096` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
@@ -230,6 +233,15 @@ CLI normally leaves the option omitted so it follows
 `--kv-ram-capacity N` is a separate pinned-host budget in MiB for completed prefix bundles. It is
 not a token capacity, does not enlarge the GPU pool, and defaults to `off`. `N` must be a positive
 decimal integer; `0` is rejected. Construction fails if the host pin cannot be allocated.
+`--kv-disk-capacity N` is a third-tier SSD budget in MiB of unique object bytes. It requires
+`--kv-ram-capacity > 0` and `--kv-disk-location PATH`. Location without capacity is an error.
+`--kv-disk-compress zstd` compresses new GDN/hidden/cyclic blobs only; KV pages are never
+application-compressed. Disk is inclusive: a VRAM or RAM hit does not delete the committed SSD
+generation. Equal reuse prefers VRAM, then RAM, then disk.
+Orderly Engine shutdown copies active chats into the host cache, saves cache entries that are not
+yet on SSD, and finishes outstanding disk writes. When disk is enabled, the same stderr progress
+renderer prints `kv-disk` `copy active chats` / `save cache entries` / `finish disk writes`
+counts as shutdown runs.
 Host RAM is an exclusive FIFO: a bundle lives in VRAM or in this budget, not both. One long MTP
 or DFlash bundle with five context-checkpoint heads is about 6 GiB (Main+backend KV plus GDN and
 DFlash cyclic heads); size the
@@ -237,14 +249,19 @@ budget accordingly. `off` still captures live-lane GDN to ordinary pinned buffer
 rollback works; other-lane restore after eviction remains a miss. Startup still
 prints capacity plus `used`/`entries`. Serve `[req] done` and throughput lines print live
 host-resident `kv-ram=` used bytes plus `n=` / `restores=` / `evicts=` / `drops=` / `save=` /
-`load=`. `kv-ram=` / `n=` exclude a chat after consume following a restore onto a KV lane; a later
-spill recaptures it as a new FIFO tail. `save=` / `load=` are CUDA event elapsed for that request's
+`load=`. When disk is enabled the same lines also print `kv-disk=` occupancy and counters. `kv-ram=` / `n=` exclude a chat after consume following a restore onto a KV lane; a later
+spill recaptures it as a new FIFO tail. RAM `save=` / `load=` are CUDA event elapsed for that request's
 RAM-tier D2H capture and H2D unpack of the FIFO bundle (Main+backend KV, rewrite GDN, and any ladder
-GDN/cyclic images in the same copy span). They are not admission wait, and they do not include live-lane
+GDN/cyclic images in the same copy span). Disk `save=` is spill-session wall harvested onto the
+request; disk `load=` is the host wall from the first live SSD read of that
+restore until the last page or state object has arrived in the pinned host window (not H2D, and not a
+sum of overlapped SSD and copy clocks). Disk `h2d=` is the host wall from that last host arrival until
+the restore's page and state H2D complete (extra copy time after SSD is idle, not the overlapping
+first-to-last copy span). They are not admission wait, and they do not include live-lane
 context-checkpoint freeze D2H or a VRAM-resident restore that unpacks already-pinned lane GDN.
 `restores=` / `evicts=` / `drops=` are lifetime counters on both lines.
 CLI `KV RAM events` prints lifetime captures/restores/evicts/drops plus that request's `save=` /
-`load=`. The generation summary also prints `prefix reuse path`, `prefix reuse source`, and
+`load=`. CLI `KV disk events` also prints `h2d=` (post-disk H2D wall). The generation summary also prints `prefix reuse path`, `prefix reuse source`, and
 `context checkpoint` (`restored:F` / `captured:F` absolute ladder or turn-rollback head frontiers). Exact-hit `--capture-context-checkpoint` uses the same `captured:F` field. Exact byte values remain on the Engine API and in the JSONL request log; set
 `NINFER_KV_RAM_LOG_BYTES=1` to print those same byte counts on the human lines. A new capture may
 still need to reap or evict while logged occupancy looks low, because a just-consumed copy can

@@ -165,6 +165,8 @@ std::string format_prefix_reuse_source(ninfer::PrefixReuseSource source) {
         return "vram_resident";
     case ninfer::PrefixReuseSource::HostRam:
         return "host_ram";
+    case ninfer::PrefixReuseSource::HostDisk:
+        return "host_disk";
     }
     return "unknown";
 }
@@ -282,6 +284,21 @@ void print_generation_summary(const ninfer::GenerationResult& result,
                      " drops=" + std::to_string(stats.kv_ram_drops) +
                      " save=" + format_ms(result.kv_ram_save_seconds) +
                      " load=" + format_ms(result.kv_ram_load_seconds));
+    print_metric("KV disk capacity", memory.kv_disk_capacity_bytes == 0
+                                         ? "off"
+                                         : format_kv_ram_size(memory.kv_disk_capacity_bytes));
+    print_metric("KV disk used", memory.kv_disk_capacity_bytes == 0
+                                     ? "off"
+                                     : format_kv_ram_size(memory.kv_disk_used_bytes) + " / " +
+                                           std::to_string(memory.kv_disk_entry_count) + " entries");
+    print_metric("KV disk events",
+                 "captures=" + std::to_string(stats.kv_disk_captures) +
+                     " restores=" + std::to_string(stats.kv_disk_restores) +
+                     " evicts=" + std::to_string(stats.kv_disk_evictions) +
+                     " drops=" + std::to_string(stats.kv_disk_drops) +
+                     " save=" + format_ms(result.kv_disk_save_seconds) +
+                     " load=" + format_ms(result.kv_disk_load_seconds) +
+                     " h2d=" + format_ms(result.kv_disk_h2d_seconds));
     print_metric("gpu workspace peak", format_arena_peak(memory.workspace));
     print_metric("runtime reservation", format_bytes(memory.runtime_reservation_bytes));
     print_metric("free after weights", format_bytes(memory.available_after_weights_bytes));
@@ -364,6 +381,9 @@ int main(int argc, char** argv) {
         engine_options.max_context    = cli.max_context;
         engine_options.kv_capacity    = cli.kv_capacity;
         engine_options.kv_ram_capacity_bytes = cli.kv_ram_capacity_bytes;
+        engine_options.kv_disk_capacity_bytes = cli.kv_disk_capacity_bytes;
+        engine_options.kv_disk_location = cli.kv_disk_location;
+        engine_options.kv_disk_compress = cli.kv_disk_compress;
         engine_options.context_checkpoint_marks = cli.context_checkpoint_marks;
         engine_options.prefill_chunk  = cli.prefill_chunk;
         engine_options.kv_cache       = cli.kv_cache;

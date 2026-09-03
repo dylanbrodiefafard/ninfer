@@ -13,6 +13,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -82,6 +83,11 @@ struct SequencePlanningInputs {
     bool use_cuda_graph = true;
     int device          = 0;
     std::size_t kv_ram_capacity_bytes = 0;
+    std::size_t kv_disk_capacity_bytes = 0;
+    std::filesystem::path kv_disk_location;
+    KvDiskCompress kv_disk_compress = KvDiskCompress::Off;
+    std::string model_id;
+    std::string weights_id;
     std::vector<std::uint32_t> context_checkpoint_marks;
 };
 
@@ -113,6 +119,11 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     bool use_cuda_graph = true;
     int device          = 0;
     std::size_t kv_ram_capacity_bytes = 0;
+    std::size_t kv_disk_capacity_bytes = 0;
+    std::filesystem::path kv_disk_location;
+    KvDiskCompress kv_disk_compress = KvDiskCompress::Off;
+    std::string model_id;
+    std::string weights_id;
     std::vector<std::uint32_t> context_checkpoint_marks;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;

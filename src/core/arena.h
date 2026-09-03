@@ -92,7 +92,7 @@ private:
 
 class PinnedHostBuffer {
 public:
-    explicit PinnedHostBuffer(std::size_t size_bytes);
+    explicit PinnedHostBuffer(std::size_t size_bytes, std::size_t alignment = 256);
     ~PinnedHostBuffer();
 
     PinnedHostBuffer(const PinnedHostBuffer&)            = delete;
@@ -104,6 +104,7 @@ public:
     std::size_t size() const noexcept;
 
 private:
+    void* allocation_ = nullptr;
     void* data_       = nullptr;
     std::size_t size_ = 0;
 };

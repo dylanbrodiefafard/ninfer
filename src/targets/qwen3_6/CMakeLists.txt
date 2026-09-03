@@ -8,6 +8,7 @@ target_sources(ninfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/tokenizer.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/prefix_identity.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/kv_ram_cache.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/kv_disk_cache.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/state/decoder_state.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/state/round_state.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/visual_scatter.cpp

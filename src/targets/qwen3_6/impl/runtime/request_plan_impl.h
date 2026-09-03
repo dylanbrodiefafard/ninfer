@@ -7,7 +7,9 @@
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <optional>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
@@ -285,16 +287,24 @@ void ProgramImplCore::finish_request_plan(RequestPlanImpl& plan, const ResidentS
     }
 
     if (plan.reuse == ReusePath::FullReset) {
-        plan.reuse_source  = PrefixReuseSource::None;
-        plan.ram_entry_id  = 0;
-        plan.reuse_base    = 0;
+        plan.reuse_source             = PrefixReuseSource::None;
+        plan.ram_entry_id             = 0;
+        plan.disk_entry_id            = 0;
+        plan.disk_hash_f              = {};
+        plan.disk_execution_frontier  = 0;
+        plan.reuse_base               = 0;
     } else if (plan.reuse_source == PrefixReuseSource::None) {
         plan.reuse_source = PrefixReuseSource::VramResident;
     }
 
-    plan.summary.reusable_prompt_tokens = plan.reuse_base;
-    plan.summary.ram_entry_id           = plan.ram_entry_id;
-    plan.summary.reuse_source           = plan.reuse_source;
+    plan.summary.reusable_prompt_tokens  = plan.reuse_base;
+    plan.summary.ram_entry_id            = plan.ram_entry_id;
+    plan.summary.disk_entry_id           = plan.disk_entry_id;
+    plan.summary.disk_hash_f_lo          = plan.disk_hash_f.lo;
+    plan.summary.disk_hash_f_hi          = plan.disk_hash_f.hi;
+    plan.summary.disk_execution_frontier = plan.disk_execution_frontier;
+    plan.summary.disk_reuse_path         = plan.reuse;
+    plan.summary.reuse_source            = plan.reuse_source;
     if (speculative_backend == SpeculativeBackend::Mtp) {
         if (plan.reuse == ReusePath::FullReset) {
             plan.prepare_mtp = true;
@@ -438,6 +448,70 @@ RequestPlan ProgramImplCore::plan_ram_reuse(const PreparedPromptData& prompt,
     }
     plan->reuse_source  = PrefixReuseSource::HostRam;
     plan->ram_entry_id  = match->entry_id;
+    finish_request_plan(*plan, &view, prompt, base);
+    return RequestPlan(std::move(plan));
+}
+
+RequestPlan ProgramImplCore::plan_disk_reuse(const PreparedPromptData& prompt,
+                                             const RequestBasePlan& base_plan) {
+    if (base_plan.impl_ == nullptr) { throw std::logic_error("request base plan is empty"); }
+    const RequestBasePlanImpl& base = *base_plan.impl_;
+
+    auto plan                         = std::make_unique<RequestPlanImpl>();
+    plan->summary                     = base.summary;
+    plan->sampling                    = base.sampling;
+    plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
+    plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
+
+    if (!kv_disk_cache_ || !base.allow_prefix_reuse || !prompt.identity.reusable) {
+        finish_request_plan(*plan, nullptr, prompt, base);
+        return RequestPlan(std::move(plan));
+    }
+
+    const std::vector<qwen3_6::detail::PrefixHash128> chain =
+        qwen3_6::detail::prefix_hash_chain(prompt);
+    const std::optional<qwen3_6::detail::DiskMatch> match =
+        kv_disk_cache_->plan_match(prompt, chain);
+    if (!match || match->reuse_base == 0) {
+        finish_request_plan(*plan, nullptr, prompt, base);
+        return RequestPlan(std::move(plan));
+    }
+
+    const std::optional<qwen3_6::detail::DiskRestoredHost> loaded =
+        kv_disk_cache_->load_host(match->entry_id);
+    if (!loaded) {
+        finish_request_plan(*plan, nullptr, prompt, base);
+        return RequestPlan(std::move(plan));
+    }
+    qwen3_6::detail::DiskRestoredHost host = std::move(*loaded);
+    ResidentStateView view;
+    view.ledger                  = &host.ledger;
+    view.identity                = &host.identity;
+    view.execution_frontier      = host.execution_frontier;
+    view.rewrite_checkpoint      = RewriteCheckpoint{
+        .valid    = host.rewrite_valid,
+        .kind     = host.rewrite_kind,
+        .frontier = host.rewrite_frontier,
+    };
+    view.text_kv_valid           = host.text_kv_valid;
+    view.mtp_kv_valid            = host.mtp_kv_valid;
+    view.dflash_context_frontier = host.dflash_context_frontier;
+    view.tail_hidden_valid       = host.tail_hidden_valid;
+    view.backend_image_present   = host.backend_image_present;
+    view.context_checkpoints.reserve(host.ladders.size());
+    for (const qwen3_6::detail::RamLadderIndex& head : host.ladders) {
+        view.context_checkpoints.push_back(ContextCheckpointIndex{
+            .frontier = head.frontier, .hash = head.hash, .kind = head.kind});
+    }
+    apply_reuse_decision(*plan, view, prompt, base);
+    if (plan->reuse_base == 0) {
+        finish_request_plan(*plan, nullptr, prompt, base);
+        return RequestPlan(std::move(plan));
+    }
+    plan->reuse_source              = PrefixReuseSource::HostDisk;
+    plan->disk_entry_id             = match->entry_id;
+    plan->disk_hash_f               = match->hash_f;
+    plan->disk_execution_frontier   = match->execution_frontier;
     finish_request_plan(*plan, &view, prompt, base);
     return RequestPlan(std::move(plan));
 }

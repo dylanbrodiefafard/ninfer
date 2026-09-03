@@ -3,17 +3,22 @@
 #include "core/device.h"
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <new>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::detail {
 namespace {
 
 constexpr std::uint32_t kRamMagic   = 0x4D41524E;
-constexpr std::uint32_t kRamVersion = 4;
+constexpr std::uint32_t kRamVersion = 5;
 constexpr std::size_t kSectionCount = 12;
 constexpr std::size_t kHostAlign    = 8;
 constexpr std::size_t kDeviceAlign  = 256;
@@ -142,6 +147,7 @@ struct HeaderView {
     std::uint64_t gdn_recurrent_bytes     = 0;
     std::uint64_t cyclic_lane_bytes       = 0;
     std::uint32_t ladder_count            = 0;
+    std::uint64_t disk_entry_id           = 0;
     std::array<std::uint64_t, kSectionCount> offset{};
     std::array<std::uint64_t, kSectionCount> length{};
     std::uint64_t entry_bytes             = 0;
@@ -150,7 +156,8 @@ struct HeaderView {
     std::vector<RamLadderImage> ladder_images;
 };
 
-constexpr std::size_t kFixedHeader = 356;
+constexpr std::size_t kFixedHeader = 364;
+constexpr std::size_t kDiskTicketOffset = 156;
 
 std::size_t header_bytes_for(std::uint32_t text_planes, std::uint32_t backend_planes,
                              std::uint32_t ladder_count) {
@@ -197,6 +204,7 @@ void write_fixed_header(Cursor& w, const HeaderView& h) {
     w.u64(h.cyclic_lane_bytes);
     w.u32(h.ladder_count);
     w.u32(0);
+    w.u64(h.disk_entry_id);
     for (std::size_t i = 0; i < kSectionCount; ++i) {
         w.u64(h.offset[i]);
         w.u64(h.length[i]);
@@ -248,6 +256,7 @@ HeaderView read_header(const void* block, std::size_t bytes) {
     h.cyclic_lane_bytes       = r.u64();
     h.ladder_count            = r.u32();
     r.skip(4);
+    h.disk_entry_id           = r.u64();
     for (std::size_t i = 0; i < kSectionCount; ++i) {
         h.offset[i] = r.u64();
         h.length[i] = r.u64();
@@ -347,6 +356,7 @@ RamRestoredHost host_from_header(const void* block, const HeaderView& header) {
     out.identity.unpack(identity, static_cast<std::size_t>(header.length[1]));
     out.ladders        = header.ladders;
     out.ladder_images  = header.ladder_images;
+    out.disk_entry_id  = header.disk_entry_id;
     return out;
 }
 
@@ -386,11 +396,18 @@ const KVRamCache::Record& KVRamCache::require(std::uint64_t entry_id) const {
     return it->second;
 }
 
-void KVRamCache::destroy_record(std::uint64_t entry_id, bool count_eviction) {
+void KVRamCache::destroy_record(std::uint64_t entry_id, bool count_eviction,
+                                std::unique_lock<std::mutex>& lock) {
     auto it = records_.find(entry_id);
     if (it == records_.end()) { return; }
+    if (it->second.io_pins != 0) {
+        throw std::logic_error("RAM cache cannot destroy an I/O-pinned entry");
+    }
+    const cudaEvent_t done = it->second.copies_done;
+    if (done != nullptr) { wait_event_unlocked(lock, done, entry_id); }
+    it = records_.find(entry_id);
+    if (it == records_.end()) { return; }
     orphaned_save_seconds_ += harvest_record(it->second);
-    wait_copies(it->second);
     if (it->second.copies_start != nullptr) {
         CUDA_CHECK(cudaEventDestroy(it->second.copies_start));
         it->second.copies_start = nullptr;
@@ -426,20 +443,28 @@ void KVRamCache::record_copies(Record& record, cudaStream_t stream) {
     record.copies_timed = record.copies_start != nullptr;
 }
 
+double KVRamCache::copy_elapsed_seconds(const Record& record) const {
+    if (!record.copies_timed || record.copies_start == nullptr || record.copies_done == nullptr) {
+        return 0;
+    }
+    float milliseconds = 0;
+    CUDA_CHECK(cudaEventElapsedTime(&milliseconds, record.copies_start, record.copies_done));
+    return static_cast<double>(milliseconds) / 1000.0;
+}
+
 double KVRamCache::harvest_record(Record& record) {
     if (!record.copies_timed || record.copies_start == nullptr || record.copies_done == nullptr) {
         return 0;
     }
-    wait_copies(record);
-    float milliseconds = 0;
-    CUDA_CHECK(cudaEventElapsedTime(&milliseconds, record.copies_start, record.copies_done));
+    const double seconds = copy_elapsed_seconds(record);
     record.copies_timed = false;
     CUDA_CHECK(cudaEventDestroy(record.copies_start));
     record.copies_start = nullptr;
-    return static_cast<double>(milliseconds) / 1000.0;
+    return seconds;
 }
 
 KvRamCopySeconds KVRamCache::harvest_copy_seconds() {
+    std::unique_lock lock(io_mutex_);
     KvRamCopySeconds out;
     out.save += orphaned_save_seconds_;
     save_seconds_ += orphaned_save_seconds_;
@@ -447,6 +472,18 @@ KvRamCopySeconds KVRamCache::harvest_copy_seconds() {
     out.load += orphaned_load_seconds_;
     load_seconds_ += orphaned_load_seconds_;
     orphaned_load_seconds_ = 0;
+    std::vector<cudaEvent_t> events;
+    std::vector<std::uint64_t> pinned;
+    pin_pending_copy_events(events, pinned);
+    lock.unlock();
+    maybe_copy_sync_stall();
+    try {
+        for (cudaEvent_t event : events) { CUDA_CHECK(cudaEventSynchronize(event)); }
+    } catch (...) {
+        unpin_copy_events(pinned);
+        throw;
+    }
+    lock.lock();
     for (std::uint64_t id : pending_save_ids_) {
         const auto it = records_.find(id);
         if (it == records_.end()) { continue; }
@@ -464,10 +501,16 @@ KvRamCopySeconds KVRamCache::harvest_copy_seconds() {
         }
         pending_load_id_.reset();
     }
+    for (std::uint64_t id : pinned) {
+        const auto it = records_.find(id);
+        if (it == records_.end() || it->second.io_pins == 0) { continue; }
+        --it->second.io_pins;
+    }
+    io_cv_.notify_all();
     return out;
 }
 
-bool KVRamCache::copies_ready(std::uint64_t entry_id) const {
+bool KVRamCache::copies_ready_locked(std::uint64_t entry_id) const {
     const auto it = records_.find(entry_id);
     if (it == records_.end() || it->second.copies_done == nullptr) { return true; }
     const cudaError_t ready = cudaEventQuery(it->second.copies_done);
@@ -476,36 +519,57 @@ bool KVRamCache::copies_ready(std::uint64_t entry_id) const {
     return true;
 }
 
+bool KVRamCache::copies_ready(std::uint64_t entry_id) const {
+    std::lock_guard lock(io_mutex_);
+    return copies_ready_locked(entry_id);
+}
+
 bool KVRamCache::pending_copies_ready() const {
+    std::lock_guard lock(io_mutex_);
     for (std::uint64_t id : pending_save_ids_) {
-        if (!copies_ready(id)) { return false; }
+        if (!copies_ready_locked(id)) { return false; }
     }
-    if (pending_load_id_ && !copies_ready(*pending_load_id_)) { return false; }
+    if (pending_load_id_ && !copies_ready_locked(*pending_load_id_)) { return false; }
     return true;
 }
 
 void KVRamCache::wait_pending_copies_on_stream(cudaStream_t stream) {
-    for (std::uint64_t id : pending_save_ids_) {
-        const auto it = records_.find(id);
-        if (it == records_.end()) { continue; }
-        wait_copies_on_stream(it->second, stream);
+    std::vector<cudaEvent_t> events;
+    std::vector<std::uint64_t> pinned;
+    {
+        std::lock_guard lock(io_mutex_);
+        pin_pending_copy_events(events, pinned);
     }
-    if (pending_load_id_) {
-        const auto it = records_.find(*pending_load_id_);
-        if (it != records_.end()) { wait_copies_on_stream(it->second, stream); }
+    try {
+        for (cudaEvent_t event : events) {
+            if (stream != nullptr) {
+                CUDA_CHECK(cudaStreamWaitEvent(stream, event, 0));
+            } else {
+                CUDA_CHECK(cudaEventSynchronize(event));
+            }
+        }
+        for (cudaEvent_t event : events) { CUDA_CHECK(cudaEventSynchronize(event)); }
+    } catch (...) {
+        unpin_copy_events(pinned);
+        throw;
     }
+    unpin_copy_events(pinned);
 }
 
 void KVRamCache::wait_pending_copies() {
-    for (std::uint64_t id : pending_save_ids_) {
-        const auto it = records_.find(id);
-        if (it == records_.end()) { continue; }
-        wait_copies(it->second);
+    std::vector<cudaEvent_t> events;
+    std::vector<std::uint64_t> pinned;
+    {
+        std::lock_guard lock(io_mutex_);
+        pin_pending_copy_events(events, pinned);
     }
-    if (pending_load_id_) {
-        const auto it = records_.find(*pending_load_id_);
-        if (it != records_.end()) { wait_copies(it->second); }
+    try {
+        for (cudaEvent_t event : events) { CUDA_CHECK(cudaEventSynchronize(event)); }
+    } catch (...) {
+        unpin_copy_events(pinned);
+        throw;
     }
+    unpin_copy_events(pinned);
 }
 
 void KVRamCache::wait_copies(Record& record) {
@@ -521,13 +585,72 @@ void KVRamCache::wait_copies_on_stream(Record& record, cudaStream_t stream) {
     wait_copies(record);
 }
 
+void KVRamCache::maybe_copy_sync_stall() const {
+    copy_sync_entered_.store(true, std::memory_order_release);
+    const int ms = copy_sync_stall_ms_.load(std::memory_order_acquire);
+    if (ms > 0) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
+}
+
+void KVRamCache::wait_event_unlocked(std::unique_lock<std::mutex>& lock, cudaEvent_t event,
+                                       std::uint64_t entry_id) {
+    if (event == nullptr) { return; }
+    auto it = records_.find(entry_id);
+    if (it != records_.end()) { ++it->second.io_pins; }
+    lock.unlock();
+    maybe_copy_sync_stall();
+    try {
+        if (fail_next_copy_sync_) {
+            fail_next_copy_sync_ = false;
+            throw std::runtime_error("injected RAM copy sync failure");
+        }
+        CUDA_CHECK(cudaEventSynchronize(event));
+    } catch (...) {
+        lock.lock();
+        auto pinned = records_.find(entry_id);
+        if (pinned != records_.end() && pinned->second.io_pins > 0) { --pinned->second.io_pins; }
+        io_cv_.notify_all();
+        throw;
+    }
+    lock.lock();
+    auto pinned = records_.find(entry_id);
+    if (pinned != records_.end() && pinned->second.io_pins > 0) { --pinned->second.io_pins; }
+    io_cv_.notify_all();
+}
+
+void KVRamCache::pin_pending_copy_events(std::vector<cudaEvent_t>& events,
+                                        std::vector<std::uint64_t>& ids) {
+    auto pin = [&](std::uint64_t id) {
+        const auto it = records_.find(id);
+        if (it == records_.end() || it->second.copies_done == nullptr) { return; }
+        ++it->second.io_pins;
+        ids.push_back(id);
+        events.push_back(it->second.copies_done);
+    };
+    for (std::uint64_t id : pending_save_ids_) { pin(id); }
+    if (pending_load_id_) { pin(*pending_load_id_); }
+}
+
+void KVRamCache::unpin_copy_events(const std::vector<std::uint64_t>& ids) noexcept {
+    std::lock_guard lock(io_mutex_);
+    for (std::uint64_t id : ids) {
+        const auto it = records_.find(id);
+        if (it == records_.end() || it->second.io_pins == 0) { continue; }
+        --it->second.io_pins;
+    }
+    io_cv_.notify_all();
+}
+
 void KVRamCache::retire_record(Record& record) {
+    if (fail_next_retire_) {
+        fail_next_retire_ = false;
+        throw std::bad_alloc();
+    }
     RetiredCopy item;
     item.block       = record.block;
     item.copies_done = record.copies_done;
-    record.block     = nullptr;
-    record.copies_done = nullptr;
     retired_.push_back(item);
+    record.block       = nullptr;
+    record.copies_done = nullptr;
 }
 
 void KVRamCache::reap_retired(bool block) {
@@ -555,16 +678,6 @@ void KVRamCache::reap_retired(bool block) {
     retired_.resize(keep);
 }
 
-void KVRamCache::evict_unpinned() {
-    for (std::uint64_t id : fifo_) {
-        const auto it = records_.find(id);
-        if (it != records_.end() && !it->second.pinned) {
-            destroy_record(id, true);
-            return;
-        }
-    }
-}
-
 void KVRamCache::drop_pending_save(std::uint64_t entry_id) noexcept {
     pending_save_ids_.erase(
         std::remove(pending_save_ids_.begin(), pending_save_ids_.end(), entry_id),
@@ -577,13 +690,21 @@ void KVRamCache::drop_pending_id(std::uint64_t entry_id) noexcept {
 }
 
 void KVRamCache::claim(std::uint64_t entry_id) {
+    std::lock_guard lock(io_mutex_);
     Record& record = require(entry_id);
     if (record.pinned) { throw std::logic_error("RAM cache entry is already claimed"); }
     record.pinned = true;
     bump_version();
 }
 
+bool KVRamCache::is_claimed(std::uint64_t entry_id) const {
+    std::lock_guard lock(io_mutex_);
+    const auto it = records_.find(entry_id);
+    return it != records_.end() && it->second.pinned;
+}
+
 void KVRamCache::release(std::uint64_t entry_id) {
+    std::lock_guard lock(io_mutex_);
     Record& record = require(entry_id);
     if (!record.pinned) { throw std::logic_error("RAM cache entry is not claimed"); }
     record.pinned = false;
@@ -591,30 +712,139 @@ void KVRamCache::release(std::uint64_t entry_id) {
 }
 
 void KVRamCache::consume(std::uint64_t entry_id) {
+    std::unique_lock lock(io_mutex_);
     Record& record = require(entry_id);
     if (!record.pinned) { throw std::logic_error("RAM cache consume requires a claimed entry"); }
-    ++restores_;
-    const double leftover = harvest_record(record);
-    if (pending_load_id_ && *pending_load_id_ == entry_id) {
+    io_cv_.wait(lock, [&] { return record.io_pins == 0; });
+    const cudaEvent_t done = record.copies_done;
+    if (done != nullptr) { wait_event_unlocked(lock, done, entry_id); }
+    Record& live = require(entry_id);
+    const double leftover    = copy_elapsed_seconds(live);
+    const bool load_pending  = pending_load_id_ && *pending_load_id_ == entry_id;
+    retire_record(live);
+    if (live.copies_start != nullptr) {
+        (void)cudaEventDestroy(live.copies_start);
+        live.copies_start = nullptr;
+    }
+    live.copies_timed = false;
+    if (load_pending) {
         orphaned_load_seconds_ += leftover;
     } else {
         orphaned_save_seconds_ += leftover;
     }
     drop_pending_id(entry_id);
-    if (record.copies_start != nullptr) {
-        CUDA_CHECK(cudaEventDestroy(record.copies_start));
-        record.copies_start = nullptr;
-    }
-    record.copies_timed = false;
-    retire_record(record);
     records_.erase(entry_id);
     fifo_.erase(std::remove(fifo_.begin(), fifo_.end(), entry_id), fifo_.end());
+    ++restores_;
     bump_version();
-    reap_retired(false);
+    try {
+        reap_retired(false);
+    } catch (...) {}
+}
+
+std::optional<std::uint64_t> KVRamCache::peek_oldest_unpinned() const {
+    std::lock_guard lock(io_mutex_);
+    for (std::uint64_t id : fifo_) {
+        const Record& record = require(id);
+        if (!record.pinned && record.io_pins == 0) { return id; }
+    }
+    return std::nullopt;
+}
+
+std::vector<std::uint64_t> KVRamCache::fifo_ids() const {
+    std::lock_guard lock(io_mutex_);
+    return {fifo_.begin(), fifo_.end()};
+}
+
+void KVRamCache::pin_for_io(std::uint64_t entry_id) {
+    std::lock_guard lock(io_mutex_);
+    Record& record = require(entry_id);
+    ++record.io_pins;
+}
+
+void KVRamCache::unpin_for_io(std::uint64_t entry_id) {
+    std::lock_guard lock(io_mutex_);
+    Record& record = require(entry_id);
+    if (record.io_pins == 0) { throw std::logic_error("RAM cache I/O pin is not held"); }
+    --record.io_pins;
+    io_cv_.notify_all();
+}
+
+bool KVRamCache::evict_one_unpinned(std::uint64_t entry_id) {
+    std::unique_lock lock(io_mutex_);
+    const auto it = records_.find(entry_id);
+    if (it == records_.end()) { return false; }
+    if (it->second.pinned || it->second.io_pins != 0) { return false; }
+    destroy_record(entry_id, true, lock);
+    return true;
+}
+
+void KVRamCache::set_disk_entry_id(std::uint64_t entry_id, std::uint64_t disk_id) {
+    std::lock_guard lock(io_mutex_);
+    Record& record = require(entry_id);
+    if (fail_next_ticket_write_) {
+        fail_next_ticket_write_ = false;
+        throw std::logic_error("RAM disk ticket write failed");
+    }
+    if (record.block == nullptr || record.bytes < kDiskTicketOffset + 8) {
+        throw std::logic_error("RAM entry header is truncated");
+    }
+    auto* raw = static_cast<std::uint8_t*>(record.block);
+    Cursor w{raw + kDiskTicketOffset, raw + kDiskTicketOffset + 8};
+    w.u64(disk_id);
+    record.disk_entry_id = disk_id;
+}
+
+std::uint64_t KVRamCache::disk_entry_id(std::uint64_t entry_id) const {
+    std::lock_guard lock(io_mutex_);
+    return require(entry_id).disk_entry_id;
+}
+
+const void* KVRamCache::host_block(std::uint64_t entry_id) const {
+    std::lock_guard lock(io_mutex_);
+    return require(entry_id).block;
+}
+
+std::size_t KVRamCache::host_bytes(std::uint64_t entry_id) const {
+    std::lock_guard lock(io_mutex_);
+    return require(entry_id).bytes;
+}
+
+KVRamCache::HostKvView KVRamCache::host_kv(std::uint64_t entry_id) const {
+    std::lock_guard lock(io_mutex_);
+    const Record& record = require(entry_id);
+    const HeaderView header = read_header(record.block, record.bytes);
+    const auto* raw = static_cast<const std::uint8_t*>(record.block);
+    HostKvView view;
+    view.text_pages = header.text_mapped_pages;
+    view.backend_pages = header.backend_mapped_pages;
+    view.text = section_ptr(record.block, header, 2);
+    view.backend = section_ptr(record.block, header, 3);
+    view.ledger = section_ptr(record.block, header, 0);
+    view.ledger_bytes = static_cast<std::size_t>(header.length[0]);
+    view.identity = section_ptr(record.block, header, 1);
+    view.identity_bytes = static_cast<std::size_t>(header.length[1]);
+    view.gdn_conv_current = section_ptr(record.block, header, 4);
+    view.gdn_recurrent_current = section_ptr(record.block, header, 6);
+    view.gdn_conv_checkpoint = section_ptr(record.block, header, 5);
+    view.gdn_recurrent_checkpoint = section_ptr(record.block, header, 7);
+    view.tail_hidden = section_ptr(record.block, header, 8);
+    view.rewrite_hidden = section_ptr(record.block, header, 9);
+    view.dflash_local = section_ptr(record.block, header, 10);
+    view.dflash_rewrite = section_ptr(record.block, header, 11);
+    view.gdn_conv_bytes = static_cast<std::size_t>(header.gdn_conv_bytes);
+    view.gdn_recurrent_bytes = static_cast<std::size_t>(header.gdn_recurrent_bytes);
+    view.hidden_bytes = static_cast<std::size_t>(header.tail_hidden_bytes);
+    view.rewrite_hidden_bytes = static_cast<std::size_t>(header.length[9]);
+    view.cyclic_bytes = static_cast<std::size_t>(header.cyclic_lane_bytes);
+    view.ladder_images = header.ladder_images;
+    (void)raw;
+    return view;
 }
 
 std::optional<RamMatch> KVRamCache::plan_match(const PreparedPromptData& prompt,
                                                std::span<const PrefixHash128> hash_chain) {
+    std::lock_guard lock(io_mutex_);
     std::optional<RamMatch> best;
     for (std::uint64_t id : fifo_) {
         const Record& record = require(id);
@@ -661,11 +891,13 @@ std::optional<RamMatch> KVRamCache::plan_match(const PreparedPromptData& prompt,
 }
 
 RamRestoredHost KVRamCache::load_host(std::uint64_t entry_id) const {
+    std::lock_guard lock(io_mutex_);
     const Record& record = require(entry_id);
     return host_from_header(record.block, read_header(record.block, record.bytes));
 }
 
 KvRamSnapshot KVRamCache::snapshot() const noexcept {
+    std::lock_guard lock(io_mutex_);
     std::size_t used = 0;
     for (const auto& entry : records_) { used += entry.second.bytes; }
     return KvRamSnapshot{
@@ -681,13 +913,25 @@ KvRamSnapshot KVRamCache::snapshot() const noexcept {
     };
 }
 
-bool KVRamCache::capture(const RamCaptureSource& source) {
+void KVRamCache::record_drop() {
+    std::lock_guard lock(io_mutex_);
+    ++drops_;
+    bump_version();
+}
+
+std::optional<std::uint64_t> KVRamCache::capture(const RamCaptureSource& source) {
     if (source.identity == nullptr || source.text == nullptr || source.text_pool == nullptr) {
         throw std::invalid_argument("RAM capture source is incomplete");
     }
     if (source.ledger.size() != source.ledger_frontier ||
         source.ledger_frontier != source.execution_frontier + 1) {
         throw std::logic_error("RAM capture ledger frontier is inconsistent");
+    }
+    if (fail_next_capture_) {
+        fail_next_capture_ = false;
+        ++drops_;
+        bump_version();
+        return std::nullopt;
     }
 
     HeaderView header;
@@ -726,6 +970,7 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
         header.gdn_recurrent_bytes = source.gdn->recurrent_host_image_bytes();
     }
     header.ladder_count = static_cast<std::uint32_t>(source.ladder_heads.size());
+    header.disk_entry_id = source.disk_entry_id;
 
     std::array<std::size_t, kSectionCount> lengths{};
     std::array<std::size_t, kSectionCount> aligns{};
@@ -792,7 +1037,7 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
     if (header.entry_bytes > arena_.capacity()) {
         ++drops_;
         bump_version();
-        return false;
+        return std::nullopt;
     }
 
     reap_retired(false);
@@ -801,15 +1046,8 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
         reap_retired(true);
         block = arena_.try_alloc(header.entry_bytes, kDeviceAlign);
     }
-    while (block == nullptr) {
-        const std::size_t before = records_.size();
-        evict_unpinned();
-        if (records_.size() == before) {
-            ++drops_;
-            bump_version();
-            return false;
-        }
-        block = arena_.try_alloc(header.entry_bytes, kDeviceAlign);
+    if (block == nullptr) {
+        return std::nullopt;
     }
 
     bool copies_launched = false;
@@ -957,7 +1195,9 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
         }
         record.block               = block;
         record.bytes               = header.entry_bytes;
+        record.disk_entry_id       = source.disk_entry_id;
         record.copies_start        = copies_start;
+        std::lock_guard lock(io_mutex_);
         const auto [it, inserted]  = records_.emplace(record.id, record);
         if (!inserted) { throw std::logic_error("RAM cache entry id already exists"); }
         copies_start               = nullptr;
@@ -967,7 +1207,7 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
         pending_save_ids_.push_back(record.id);
         ++captures_;
         bump_version();
-        return true;
+        return record.id;
     } catch (...) {
         if (copies_launched) {
             if (source.stream != nullptr) {
@@ -978,7 +1218,8 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
         }
         if (copies_start != nullptr) { (void)cudaEventDestroy(copies_start); }
         if (live_id != 0) {
-            destroy_record(live_id, false);
+            std::unique_lock lock(io_mutex_);
+            destroy_record(live_id, false, lock);
         } else {
             arena_.free(block);
         }
@@ -987,55 +1228,84 @@ bool KVRamCache::capture(const RamCaptureSource& source) {
 }
 
 RamRestoredHost KVRamCache::unpack_device(std::uint64_t entry_id, const RamRestoreTarget& target) {
-    Record& record            = require(entry_id);
-    wait_copies_on_stream(record, target.stream);
-    const HeaderView header   = read_header(record.block, record.bytes);
-    auto* raw                 = static_cast<std::uint8_t*>(record.block);
-    const auto* fingerprint   = raw + kFixedHeader;
-    InCursor fp{fingerprint, raw + header.header_bytes};
-    if (target.text == nullptr || target.text_pool == nullptr) {
-        throw std::invalid_argument("RAM restore target is incomplete");
-    }
-    verify_pool(fp, *target.text_pool, header.text_plane_count, "text KV");
-    if (header.backend_plane_count != 0) {
-        if (target.backend == nullptr || target.backend_pool == nullptr) {
-            throw std::logic_error("RAM restore is missing the backend pool");
+    HeaderView header;
+    std::uint8_t* raw = nullptr;
+    cudaEvent_t prior_done = nullptr;
+    {
+        std::lock_guard lock(io_mutex_);
+        Record& record          = require(entry_id);
+        header                  = read_header(record.block, record.bytes);
+        raw                     = static_cast<std::uint8_t*>(record.block);
+        prior_done              = record.copies_done;
+        const auto* fingerprint = raw + kFixedHeader;
+        InCursor fp{fingerprint, raw + header.header_bytes};
+        if (target.text == nullptr || target.text_pool == nullptr) {
+            throw std::invalid_argument("RAM restore target is incomplete");
         }
-        verify_pool(fp, *target.backend_pool, header.backend_plane_count, "backend KV");
-    }
-    if (header.has_dflash) {
-        if (target.dflash_local == nullptr) {
-            throw std::logic_error("RAM restore is missing DFlash cyclic state");
-        }
-        verify_cyclic(header, *target.dflash_local);
-        if (header.length[11] != 0) {
-            if (target.dflash_checkpoint == nullptr) {
-                throw std::logic_error("RAM restore is missing DFlash checkpoint cyclic state");
+        verify_pool(fp, *target.text_pool, header.text_plane_count, "text KV");
+        if (header.backend_plane_count != 0) {
+            if (target.backend == nullptr || target.backend_pool == nullptr) {
+                throw std::logic_error("RAM restore is missing the backend pool");
             }
-            verify_cyclic(header, *target.dflash_checkpoint);
+            verify_pool(fp, *target.backend_pool, header.backend_plane_count, "backend KV");
+        }
+        if (header.has_dflash) {
+            if (target.dflash_local == nullptr) {
+                throw std::logic_error("RAM restore is missing DFlash cyclic state");
+            }
+            verify_cyclic(header, *target.dflash_local);
+            if (header.length[11] != 0) {
+                if (target.dflash_checkpoint == nullptr) {
+                    throw std::logic_error("RAM restore is missing DFlash checkpoint cyclic state");
+                }
+                verify_cyclic(header, *target.dflash_checkpoint);
+            }
+        }
+        if (header.has_gdn) {
+            if (target.gdn == nullptr) { throw std::logic_error("RAM restore is missing GDN state"); }
+            if (header.gdn_conv_bytes != target.gdn->conv_host_image_bytes() ||
+                header.gdn_recurrent_bytes != target.gdn->recurrent_host_image_bytes()) {
+                throw std::logic_error("RAM entry GDN geometry mismatch");
+            }
+        }
+        if (target.tail_hidden != nullptr &&
+            header.tail_hidden_bytes != target.tail_hidden->bytes()) {
+            throw std::logic_error("RAM entry hidden geometry mismatch");
+        }
+        if (target.rewrite_checkpoint_hidden != nullptr &&
+            header.length[9] != 0 &&
+            header.length[9] != target.rewrite_checkpoint_hidden->bytes()) {
+            throw std::logic_error("RAM entry rewrite-checkpoint hidden geometry mismatch");
+        }
+        drop_pending_save(entry_id);
+    }
+    if (prior_done != nullptr) { CUDA_CHECK(cudaEventSynchronize(prior_done)); }
+    double harvested = 0;
+    cudaEvent_t harvest_start = nullptr;
+    {
+        std::lock_guard lock(io_mutex_);
+        Record& record = require(entry_id);
+        if (record.copies_timed && record.copies_start != nullptr &&
+            record.copies_done != nullptr) {
+            harvest_start = record.copies_start;
         }
     }
-    if (header.has_gdn) {
-        if (target.gdn == nullptr) { throw std::logic_error("RAM restore is missing GDN state"); }
-        if (header.gdn_conv_bytes != target.gdn->conv_host_image_bytes() ||
-            header.gdn_recurrent_bytes != target.gdn->recurrent_host_image_bytes()) {
-            throw std::logic_error("RAM entry GDN geometry mismatch");
+    if (harvest_start != nullptr && prior_done != nullptr) {
+        float milliseconds = 0;
+        CUDA_CHECK(cudaEventElapsedTime(&milliseconds, harvest_start, prior_done));
+        harvested = static_cast<double>(milliseconds) / 1000.0;
+    }
+    {
+        std::lock_guard lock(io_mutex_);
+        Record& record = require(entry_id);
+        orphaned_save_seconds_ += harvested;
+        if (record.copies_start != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(record.copies_start));
+            record.copies_start = nullptr;
         }
+        record.copies_timed = false;
+        begin_copies(record, target.stream);
     }
-    if (target.tail_hidden != nullptr &&
-        header.tail_hidden_bytes != target.tail_hidden->bytes()) {
-        throw std::logic_error("RAM entry hidden geometry mismatch");
-    }
-    if (target.rewrite_checkpoint_hidden != nullptr &&
-        header.length[9] != 0 &&
-        header.length[9] != target.rewrite_checkpoint_hidden->bytes()) {
-        throw std::logic_error("RAM entry rewrite-checkpoint hidden geometry mismatch");
-    }
-
-    orphaned_save_seconds_ += harvest_record(record);
-    drop_pending_save(entry_id);
-
-    begin_copies(record, target.stream);
     unpack_paged_kv_allocation_from_host(*target.text, *target.text_pool, raw + header.offset[2],
                                          header.text_mapped_pages, target.text_dst_pages,
                                          target.stream);
@@ -1115,9 +1385,13 @@ RamRestoredHost KVRamCache::unpack_device(std::uint64_t entry_id, const RamResto
         target.dflash_checkpoint->copy_lane_from_host(raw + header.offset[11], target.dflash_lane,
                                                       target.stream);
     }
-    record_copies(record, target.stream);
-    pending_load_id_ = entry_id;
-    return host_from_header(record.block, header);
+    {
+        std::lock_guard lock(io_mutex_);
+        Record& record = require(entry_id);
+        record_copies(record, target.stream);
+        pending_load_id_ = entry_id;
+    }
+    return host_from_header(raw, header);
 }
 
 void KVRamCache::test_tamper_identity_digest(std::uint64_t entry_id, std::uint8_t byte) {
@@ -1131,7 +1405,23 @@ void KVRamCache::test_tamper_identity_digest(std::uint64_t entry_id, std::uint8_
 }
 
 std::size_t KVRamCache::test_pending_copy_count() const noexcept {
+    std::lock_guard lock(io_mutex_);
     return pending_save_ids_.size() + (pending_load_id_ ? 1 : 0);
+}
+
+std::uint32_t KVRamCache::test_io_pins(std::uint64_t entry_id) const {
+    std::lock_guard lock(io_mutex_);
+    const auto it = records_.find(entry_id);
+    return it == records_.end() ? 0 : it->second.io_pins;
+}
+
+void KVRamCache::test_set_copy_sync_stall_ms(int ms) {
+    copy_sync_entered_.store(false, std::memory_order_release);
+    copy_sync_stall_ms_.store(ms, std::memory_order_release);
+}
+
+bool KVRamCache::test_copy_sync_entered() const {
+    return copy_sync_entered_.load(std::memory_order_acquire);
 }
 
 } // namespace ninfer::targets::qwen3_6::detail

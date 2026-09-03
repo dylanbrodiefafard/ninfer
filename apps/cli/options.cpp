@@ -81,6 +81,29 @@ std::size_t parse_kv_ram_capacity_bytes(const char* text) {
     return static_cast<std::size_t>(bytes);
 }
 
+std::size_t parse_kv_disk_capacity_bytes(const char* text) {
+    if (text == nullptr || std::string_view(text) == "off") { return 0; }
+    const std::uint64_t mib = parse_u64(text, "kv-disk-capacity");
+    if (mib == 0) {
+        throw std::invalid_argument("--kv-disk-capacity must be off or a positive MiB integer");
+    }
+    constexpr std::uint64_t kMiB = 1024ULL * 1024ULL;
+    if (mib > std::numeric_limits<std::uint64_t>::max() / kMiB) {
+        throw std::invalid_argument("--kv-disk-capacity overflows 64-bit bytes");
+    }
+    const std::uint64_t bytes = mib * kMiB;
+    if (bytes > std::numeric_limits<std::size_t>::max()) {
+        throw std::invalid_argument("--kv-disk-capacity overflows size_t");
+    }
+    return static_cast<std::size_t>(bytes);
+}
+
+KvDiskCompress parse_kv_disk_compress(const char* text) {
+    if (text == nullptr || std::string_view(text) == "off") { return KvDiskCompress::Off; }
+    if (std::string_view(text) == "zstd") { return KvDiskCompress::Zstd; }
+    throw std::invalid_argument("--kv-disk-compress must be off or zstd");
+}
+
 ReasoningEffort parse_reasoning_effort(std::string_view text) {
     if (text == "low") { return ReasoningEffort::Low; }
     if (text == "medium") { return ReasoningEffort::Medium; }
@@ -93,7 +116,8 @@ ReasoningEffort parse_reasoning_effort(std::string_view text) {
 std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
-           "       [--max-context N] [--kv-capacity N|auto] [--kv-ram-capacity off|N] [--prefill-chunk N] [--max-new N]\n"
+           "       [--max-context N] [--kv-capacity N|auto] [--kv-ram-capacity off|N] [--kv-disk-capacity off|N]\n"
+           "       [--kv-disk-location PATH] [--kv-disk-compress off|zstd] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
            "       [--kv-dtype bf16|int8|nvfp4] [--sage] [--keep-frac F] [--xattn-tau F]\n"
            "       [--spec mtp|dflash --draft-tokens N]\n"
@@ -115,6 +139,9 @@ std::string usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom.\n"
            "--kv-ram-capacity sets pinned host KV prefix-cache capacity in MiB (default off).\n"
+           "--kv-disk-capacity sets SSD KV prefix-cache unique-object capacity in MiB (default off).\n"
+           "--kv-disk-location is required iff --kv-disk-capacity is enabled.\n"
+           "--kv-disk-compress applies zstd-1 to new GDN/hidden/cyclic writes (default off).\n"
            "--context-checkpoints off disables the automatic prefill ladder; a comma list "
            "replaces the default marks and requires --spec mtp or dflash.\n"
            "--capture-context-checkpoint pins the current resume frontier on an exact-hit "
@@ -154,6 +181,12 @@ Options parse_options(int argc, char** argv) {
             kv_capacity_explicit = true;
         } else if (arg == "--kv-ram-capacity") {
             options.kv_ram_capacity_bytes = parse_kv_ram_capacity_bytes(value(arg));
+        } else if (arg == "--kv-disk-capacity") {
+            options.kv_disk_capacity_bytes = parse_kv_disk_capacity_bytes(value(arg));
+        } else if (arg == "--kv-disk-location") {
+            options.kv_disk_location = value(arg);
+        } else if (arg == "--kv-disk-compress") {
+            options.kv_disk_compress = parse_kv_disk_compress(value(arg));
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {
@@ -253,6 +286,8 @@ Options parse_options(int argc, char** argv) {
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
+    validate_kv_disk_options(options.kv_ram_capacity_bytes, options.kv_disk_capacity_bytes,
+                             options.kv_disk_location);
     if (options.sage_attn && options.kv_cache != KvCacheStorage::Nvfp4) {
         throw std::invalid_argument("--sage requires --kv-dtype nvfp4");
     }

@@ -548,6 +548,8 @@ const char* prefix_reuse_source_name(ninfer::PrefixReuseSource source) {
         return "vram_resident";
     case ninfer::PrefixReuseSource::HostRam:
         return "host_ram";
+    case ninfer::PrefixReuseSource::HostDisk:
+        return "host_disk";
     }
     return "unknown";
 }
@@ -617,6 +619,20 @@ Json usage_to_json(const CompletionUsage& usage, const CompletionTimings* timing
                               {"restores", timings->kv_ram_restores},
                               {"evictions", timings->kv_ram_evictions},
                               {"drops", timings->kv_ram_drops}}}};
+    }
+    if (timings->kv_disk_capacity_bytes != 0) {
+        // Host KV disk tier: live gauges, this request's SSD-to-host restore wall,
+        // post-disk H2D wall, and engine-lifetime cumulative counters.
+        ninfer["kv_disk"] = {{"used_bytes", timings->kv_disk_used_bytes},
+                             {"entry_count", timings->kv_disk_entry_count},
+                             {"save_ms", json_decimal3(timings->kv_disk_save_ms)},
+                             {"load_ms", json_decimal3(timings->kv_disk_load_ms)},
+                             {"h2d_ms", json_decimal3(timings->kv_disk_h2d_ms)},
+                             {"lifetime",
+                              {{"captures", timings->kv_disk_captures},
+                               {"restores", timings->kv_disk_restores},
+                               {"evictions", timings->kv_disk_evictions},
+                               {"drops", timings->kv_disk_drops}}}};
     }
     ptd["ninfer"] = std::move(ninfer);
     out["prompt_tokens_details"] = std::move(ptd);

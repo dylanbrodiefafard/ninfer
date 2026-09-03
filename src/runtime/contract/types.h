@@ -63,8 +63,13 @@ struct RequestPlanSummary {
     std::size_t transient_alignment       = 1;
     AdmissionResources admission;
     std::uint64_t service_work_quanta = 0;
-    std::uint64_t ram_entry_id        = 0;
-    PrefixReuseSource reuse_source    = PrefixReuseSource::None;
+    std::uint64_t ram_entry_id             = 0;
+    std::uint64_t disk_entry_id            = 0;
+    std::uint64_t disk_hash_f_lo           = 0;
+    std::uint64_t disk_hash_f_hi           = 0;
+    std::uint32_t disk_execution_frontier  = 0;
+    PrefixReusePath disk_reuse_path       = PrefixReusePath::FullReset;
+    PrefixReuseSource reuse_source         = PrefixReuseSource::None;
 };
 
 struct BeginSummary {

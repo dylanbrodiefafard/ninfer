@@ -173,7 +173,9 @@ duplicates, no Ollama-compat aliases):
 When `--kv-ram-capacity` is enabled, the `ninfer` namespace also carries a `kv_ram` object — the
 same live host-KV figures as the serve `[req] done` line: engine-wide gauges `used_bytes` /
 `entry_count`, this request's D2H/H2D `save_ms` / `load_ms`, and engine-lifetime cumulative
-`lifetime.{captures,restores,evictions,drops}`. It is omitted when the RAM tier is off.
+`lifetime.{captures,restores,evictions,drops}`. It is omitted when the RAM tier is off. When
+`--kv-disk-capacity` is enabled, `kv_disk` is the same gauges plus this request's SSD-to-host
+`load_ms` and post-disk `h2d_ms`.
 
 ### Multimodal request
 
@@ -513,6 +515,9 @@ curl http://127.0.0.1:8080/v1/models \
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
 | `--kv-ram-capacity off\|N` | pinned host KV prefix-cache capacity in MiB; `off` disables the tier | `off` |
+| `--kv-disk-capacity off\|N` | SSD KV prefix-cache unique-object capacity in MiB; `off` disables the tier | `off` |
+| `--kv-disk-location PATH` | directory for the SSD page store; required iff `--kv-disk-capacity` is enabled | unset |
+| `--kv-disk-compress off\|zstd` | zstd-1 on new GDN/hidden/cyclic writes; KV pages stay uncompressed | `off` |
 | `--max-concurrency N` | maximum admitted requests; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
@@ -585,7 +590,7 @@ that server instance.
 | `server_start` | target/weights identity and artifact, resolved Engine, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, pinned-host KV RAM capacity/occupancy, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed (including `p_less`), thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, `reuse_source` (`none` / `vram_resident` / `host_ram`), `context_checkpoint` (`restored_tokens` / `captured_tokens`), unrounded phase seconds including `kv_ram_save` / `kv_ram_load`, complete speculative-decoding counters, `tool_call_count`, and `ignored_qwen_tool_call_names` (empty unless a tools-off completion contained parseable Qwen `<tool_call>` markup) |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, `reuse_source` (`none` / `vram_resident` / `host_ram` / `host_disk`), `context_checkpoint` (`restored_tokens` / `captured_tokens`), unrounded phase seconds including `kv_ram_save` / `kv_ram_load` / `kv_disk_save` / `kv_disk_load` / `kv_disk_h2d`, complete speculative-decoding counters, `tool_call_count`, and `ignored_qwen_tool_call_names` (empty unless a tools-off completion contained parseable Qwen `<tool_call>` markup) |
 | `request_error` | the resolved request configuration and generation error message |
 | `throughput` | interval token deltas and rates, scheduler occupancy, interval `timings_seconds.kv_ram_save` / `kv_ram_load`, and decode-round batch statistics |
 
@@ -655,6 +660,13 @@ and is not divided evenly among request lanes. `--kv-ram-capacity` is a separate
 in MiB for completed prefix bundles and does not change GPU pool sizing. One long MTP chat with five
 context-checkpoint heads is about 6 GiB in that FIFO; `off` still keeps same-lane GDN rollback on
 the live pinned log, but other-lane restore after eviction needs the FIFO.
+`--kv-disk-capacity` is a third-tier SSD budget in unique object bytes. It requires
+`--kv-ram-capacity > 0` and `--kv-disk-location`. Disk is inclusive of VRAM/RAM hits; equal reuse
+length prefers VRAM, then RAM, then disk. `--kv-disk-compress` is not part of the directory
+fingerprint and affects new GDN/hidden/cyclic writes only.
+On stop, orderly shutdown copies active chats into the host cache, saves cache entries that are not
+yet on SSD, and finishes outstanding disk writes. The progress renderer prints `kv-disk`
+`copy active chats` / `save cache entries` / `finish disk writes` counts while shutdown runs.
 
 Automatic sizing evaluates the complete target runtime layout for the chosen concurrency, KV
 dtype, speculative backend, draft window, Vision setting, workspace, and CUDA Graph allowance. It
@@ -664,9 +676,14 @@ slack, actual free memory after complete startup, observed Graph memory, and pin
 occupancy in MiB. When `--kv-ram-capacity` is enabled, a post-warmup line reprints occupancy,
 periodic throughput lines print live host-resident `kv-ram=` used bytes plus `n=` / `restores=` /
 `evicts=` / `drops=` / `save=` / `load=`, and each `[req] done` line includes `reuse_source=` plus
-the same occupancy and counters. `kv-ram=` / `n=` count chats still in the host FIFO, not chats
-already consumed after a restore onto a KV lane. `save=` / `load=` are CUDA D2H/H2D elapsed for
-that request or the throughput interval. `restores=` / `evicts=` / `drops=` are lifetime counters
+the same occupancy and counters. When `--kv-disk-capacity` is enabled, those lines also print
+`kv-disk=` occupancy and counters. `kv-ram=` / `n=` count chats still in the host FIFO, not chats
+already consumed after a restore onto a KV lane. RAM `save=` / `load=` are CUDA D2H/H2D elapsed for
+that request or the throughput interval. Disk `save=` is spill-session wall harvested onto the
+request; disk `load=` is the host wall from the first live SSD read of that restore until the last
+page or state object has arrived in the pinned host window. Disk `h2d=` is the host wall from that
+last host arrival until the restore's page and state H2D complete (extra copy time after SSD is
+idle, not the overlapping first-to-last copy span). `restores=` / `evicts=` / `drops=` are lifetime counters
 on both human lines; lifetime capture counts stay in JSONL.
 Exact RAM byte occupancy remains in `server_start`, `request_done`, and `throughput` JSONL; set
 `NINFER_KV_RAM_LOG_BYTES=1` to print those byte values on the human lines. A new capture may still
