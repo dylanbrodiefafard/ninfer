@@ -222,7 +222,12 @@ the capture; almost all host event-wait time was the required GPU-route-to-CPU-i
 expanding pinned staging to ten slots was rejected.
 
 Retained public-Op A/Bs localize the admitted speed changes. The fixed QSA selector reduced the
-4096-token frontier from 79,335.678 to 108.384 us. The grouped-query tiled attention route then
+4096-token frontier from 79,335.678 to 108.384 us. A later host-extent-selected short sorting
+network reduced selector medians from 24.128 to 10.208--10.528 us at one visible token, from
+110.240 to 88.096--88.160 us at four tokens, and from 114.144 to 102.208--102.272 us at 2048;
+the source-identical 4096 route did not regress. A post-validation nine-repetition verifier run
+measured 36.440 ms/token and 27.44 token/s, within the earlier repeated end-to-end range. The
+grouped-query tiled attention route then
 reduced the previously accepted 4096-frontier selected-attention entry from 580.960 to 42.560 us;
 the exact 2051-entry boundary measured 40.192 us, while the four-entry short kernel changed from
 2.641 to 2.595 us in matched Nsight kernel averages. It preserves the independent nonuniform

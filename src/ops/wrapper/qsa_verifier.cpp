@@ -4,6 +4,7 @@
 #include "core/layout.h"
 #include "ninfer/ops/ggml_block_linear.h"
 #include "ops/launcher/qsa_verifier.h"
+#include "ops/wrapper/qsa_validation.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -126,6 +127,40 @@ void qsa_verifier_token(const Tensor& x, const Tensor& token_id, const Tensor& p
         throw std::invalid_argument("qsa_verifier_token: workspace is too small");
     }
     validate_weights(weights);
+    detail::qsa_validate_state(state, "qsa_verifier_token");
+    detail::qsa_require_disjoint(
+        {detail::qsa_address_range(x, "qsa_verifier_token", "x"),
+         detail::qsa_address_range(token_id, "qsa_verifier_token", "token_id"),
+         detail::qsa_address_range(position, "qsa_verifier_token", "position"),
+         detail::qsa_address_range(visible_ids, "qsa_verifier_token", "visible_ids"),
+         detail::qsa_address_range(visible_offsets, "qsa_verifier_token", "visible_offsets"),
+         detail::qsa_address_range(weights.index_query, "qsa_verifier_token", "index_query"),
+         detail::qsa_address_range(weights.index_key, "qsa_verifier_token", "index_key"),
+         detail::qsa_address_range(weights.core_query_gate, "qsa_verifier_token",
+                                   "core_query_gate"),
+         detail::qsa_address_range(weights.core_key, "qsa_verifier_token", "core_key"),
+         detail::qsa_address_range(weights.core_value, "qsa_verifier_token", "core_value"),
+         detail::qsa_address_range(weights.output, "qsa_verifier_token", "output_weight"),
+         detail::qsa_address_range(weights.index_query_norm, "qsa_verifier_token",
+                                   "index_query_norm"),
+         detail::qsa_address_range(weights.index_key_norm, "qsa_verifier_token",
+                                   "index_key_norm"),
+         detail::qsa_address_range(weights.core_query_norm, "qsa_verifier_token",
+                                   "core_query_norm"),
+         detail::qsa_address_range(weights.core_key_norm, "qsa_verifier_token",
+                                   "core_key_norm"),
+         detail::qsa_address_range(state.k_codes, "qsa_verifier_token", "state.k_codes"),
+         detail::qsa_address_range(state.v_codes, "qsa_verifier_token", "state.v_codes"),
+         detail::qsa_address_range(state.k_scales, "qsa_verifier_token", "state.k_scales"),
+         detail::qsa_address_range(state.v_scales, "qsa_verifier_token", "state.v_scales"),
+         detail::qsa_address_range(state.raw_index_keys, "qsa_verifier_token",
+                                   "state.raw_index_keys"),
+         detail::qsa_address_range(state.positions, "qsa_verifier_token", "state.positions"),
+         detail::qsa_address_range(selected_ids, "qsa_verifier_token", "selected_ids"),
+         detail::qsa_address_range(selected_count, "qsa_verifier_token", "selected_count"),
+         detail::qsa_address_range(out, "qsa_verifier_token", "out"),
+         detail::qsa_address_range(workspace, "qsa_verifier_token", "workspace")},
+        "qsa_verifier_token");
 
     DeviceArena arena(DeviceSpan{workspace.data, workspace.bytes()});
     Scratch scratch = allocate_scratch(arena);
