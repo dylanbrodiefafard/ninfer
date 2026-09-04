@@ -132,6 +132,12 @@ public outputs of this entry and raw keys survive the call. A future compressed 
 must be a separately registered state representation and be qualified directly against this same
 logical projection. Packed weights are exact-decoded by the oracle before an FP64 dot product.
 
+The live NVFP4 state view requires four-byte-aligned K/V code planes for packed 32-bit stores,
+byte-aligned scale planes, two-byte-aligned BF16 raw keys, and four-byte-aligned I32 positions. The
+six state planes are pairwise disjoint. Append K/V inputs are 16-byte aligned for their vectorized
+K16 loads; BF16 raw-key inputs are two-byte aligned and I32 position/id inputs are four-byte
+aligned.
+
 ### 2.2 Effects, aliasing, and workspace
 
 The Op writes every valid `raw_query` element and exactly the raw-key and position rows named by
@@ -215,6 +221,12 @@ preview `K%r=0`, truncation does nothing and the valid result length is at most 
 scores, including all-zero queries or keys, select lower logical block ids first. This ordering is
 an NInfer semantic promise; unstable `topk` ordering from an upstream framework is diagnostic only.
 
+The fixed verifier implementation selects its sorting network only from the host-known flat
+visible extent and selected-output capacity. Extents through 2051 can contain at most 512 complete
+blocks, so they use the next power-of-two network over the bounded complete-block count. Larger
+extents use the fixed 1024-block network. Device CSR contents do not control dispatch: malformed
+columns still take the host-selected route and produce the same empty result.
+
 ### 3.2 Effects, validation, and workspace
 
 Selection reads but does not mutate index state. It rejects an out-of-frontier id, a duplicate or
@@ -238,7 +250,10 @@ caller-known bound in `[1,2051]`; selected count is a device scalar in `[0,bound
 one aligned 1,008,128-byte workspace and no pointer survives the call. The fixed
 `qsa_verifier_token` composes that entry with the state append and selector, actual Q5_K
 core/output projections, converted-gamma norms, partial MRoPE, and the output gate. The generalized
-entry below remains a proposed future composite.
+entry below remains a proposed future composite. The verifier validates the complete state view
+and the pairwise separation of every caller-owned input, weight, state, output, and workspace range
+synchronously before its first projection launch; a rejected call queues no work and mutates no
+storage.
 
 Conceptual entry:
 

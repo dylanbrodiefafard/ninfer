@@ -22,7 +22,9 @@ inline constexpr std::int32_t kQsaSelectedCapacity = 2051;
  * startup-fixed in [1,4096]. K/V use NVFP4-G16: codes are U8 [128,capacity,2], with the low
  * nibble representing the even feature and the high nibble the odd feature; scales are
  * FP8_E4M3FN [16,capacity,2]. Raw index keys are BF16 [128,capacity], and positions are I32
- * [3,capacity] in temporal/height/width order.
+ * [3,capacity] in temporal/height/width order. Code planes are four-byte aligned for their packed
+ * stores, raw index keys are two-byte aligned, and positions are four-byte aligned; all six planes
+ * are pairwise disjoint.
  */
 struct QsaStateView {
     Tensor k_codes;
@@ -37,7 +39,9 @@ struct QsaStateView {
  * Encode normalized/rotated K and projected V from BF16 [256,2,W] into exact NVFP4-G16 and
  * append BF16 raw index keys [128,W] plus I32 MRoPE positions [3,W] at I32 append_ids [W].
  * An id of -1 is an invalid suffix and writes nothing. Every other id is promised by the caller
- * to be unique and in the state's capacity. This Op owns no frontier or commit decision.
+ * to be unique and in the state's capacity. K and V are 16-byte aligned for their vectorized K16
+ * loads; raw index keys are two-byte aligned and position/append ids are four-byte aligned. This Op
+ * owns no frontier or commit decision. All input and state storage is pairwise non-overlapping.
  */
 void qsa_state_append(const Tensor& k, const Tensor& v, const Tensor& raw_index_keys,
                       const Tensor& position_ids, const Tensor& append_ids, QsaStateView state,
@@ -60,7 +64,8 @@ void qsa_state_append(const Tensor& k, const Tensor& v, const Tensor& raw_index_
  * contiguous, at least four-byte-aligned U8 with at least
  * qsa_index_select_workspace_bytes(W) bytes. The trusted caller owns CSR/id validation; the kernel
  * guards every state access but reports malformed device data as an empty output rather than
- * synchronizing the stream to throw.
+ * synchronizing the stream to throw. All input, state, output, and workspace storage is pairwise
+ * non-overlapping.
  */
 void qsa_index_select(const Tensor& raw_query, const QsaStateView& state,
                       const Tensor& query_ids, const Tensor& visible_ids,

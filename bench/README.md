@@ -149,8 +149,9 @@ evidence. Short-prefix traces do not qualify the 2048/4096 QSA regimes.
 
 ## Qwen4 QSA Op benchmark
 
-`ninfer_qsa_bench` measures the public C=1 QSA selector and NVFP4-G16 selected-attention
-entries at default frontiers 4, 2048, and 4096. A single frontier, including the 2051-entry
+`ninfer_qsa_bench` measures the public C=1 QSA selector and NVFP4-G16 selected-attention entries at
+default frontiers 1, 4, 64, 256, 2048, and 4096. These cover the short selector's dynamic networks
+and the unchanged 1024-block long route. A single frontier, including the 2051-entry
 selected-capacity boundary, can be isolated for profiling with `--frontier N`; setup and state
 initialization are outside both timed regions.
 

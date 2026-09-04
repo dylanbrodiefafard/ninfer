@@ -74,7 +74,8 @@ void run(int frontier) {
     DeviceBuffer query_ids = copy_i32({frontier - 1});
     DeviceBuffer visible_ids = copy_i32(visible);
     DeviceBuffer visible_offsets = copy_i32({0, frontier});
-    DeviceBuffer norm = copy_f32(std::vector<float>(128, 1.0F));
+    DeviceBuffer query_norm = copy_f32(std::vector<float>(128, 1.0F));
+    DeviceBuffer key_norm = copy_f32(std::vector<float>(128, 1.0F));
     DeviceBuffer selected(static_cast<std::size_t>(ops::kQsaSelectedCapacity) * sizeof(std::int32_t));
     DeviceBuffer selected_count(sizeof(std::int32_t));
     DeviceBuffer selector_workspace(ops::qsa_index_select_workspace_bytes(1));
@@ -86,7 +87,8 @@ void run(int frontier) {
     Tensor query_ids_t(query_ids.p, DType::I32, {1});
     Tensor visible_ids_t(visible_ids.p, DType::I32, {frontier});
     Tensor visible_offsets_t(visible_offsets.p, DType::I32, {2});
-    Tensor norm_t(norm.p, DType::FP32, {128});
+    Tensor query_norm_t(query_norm.p, DType::FP32, {128});
+    Tensor key_norm_t(key_norm.p, DType::FP32, {128});
     Tensor selected_t(selected.p, DType::I32, {ops::kQsaSelectedCapacity, 1});
     Tensor attention_selected_t(
         selected.p, DType::I32,
@@ -102,8 +104,8 @@ void run(int frontier) {
     CUDA_CHECK(cudaStreamCreate(&stream));
     const auto select = [&](cudaStream_t s) {
         ops::qsa_index_select(raw_query_t, state_view, query_ids_t, visible_ids_t,
-                              visible_offsets_t, norm_t, norm_t, selected_t, selected_count_t,
-                              selector_workspace_t, s);
+                              visible_offsets_t, query_norm_t, key_norm_t, selected_t,
+                              selected_count_t, selector_workspace_t, s);
     };
     const ColdTiming select_timing = measure_launch(select, stream, 4, 24);
     select(stream);
@@ -134,7 +136,7 @@ int main(int argc, char** argv) {
     }
     print_device_caps("qwen4-qsa");
     if (argc == 1) {
-        for (int frontier : {4, 2048, 4096}) { run(frontier); }
+        for (int frontier : {1, 4, 64, 256, 2048, 4096}) { run(frontier); }
         return 0;
     }
     if (argc != 3 || std::strcmp(argv[1], "--frontier") != 0) {
