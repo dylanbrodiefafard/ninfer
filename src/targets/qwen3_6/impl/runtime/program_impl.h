@@ -313,9 +313,6 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     if (model.mtp.has_value() && model.dflash.has_value()) {
         throw std::invalid_argument("MTP and DFlash model views are mutually exclusive");
     }
-    if (model.dflash.has_value() && model.vision.has_value()) {
-        throw std::invalid_argument("DFlash and Vision model views are mutually exclusive");
-    }
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
     decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder);
     if (plan.persistent.replay_records) {
@@ -3888,7 +3885,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             dflash_host_ingress->text_kv_table_rows[row]   = sequence.kv->text.bound_row();
             dflash_host_ingress->dflash_kv_table_rows[row] =
                 sequence.kv->backend ? sequence.kv->backend->bound_row() : 0;
-            dflash_host_ingress->lanes[row]    = static_cast<std::int32_t>(sequence.lane);
+            dflash_host_ingress->lanes[row]      = static_cast<std::int32_t>(sequence.lane);
+            dflash_host_ingress->rope_deltas[row] = sequence.rope_delta;
             dflash_host_ingress->sampling[row] = request.sampling_host;
             materialize_sequence_kv(
                 sequence,

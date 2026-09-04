@@ -162,7 +162,6 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     if (prompt.has_media()) {
         auto control =
             std::make_shared<qwen3_6::VisionControl>(qwen3_6::build_vision_control(prompt));
-        std::size_t max_merged     = 0;
         std::uint32_t previous_end = 0;
         for (const qwen3_6::VisionItemControl& item : control->items) {
             if (item.scatter_indices.empty()) {
@@ -183,10 +182,8 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
                 throw std::invalid_argument("vision item exceeds the Program workspace envelope");
             }
             previous_end = end;
-            max_merged   = std::max(max_merged, item.merged_count);
         }
-        base->vision_transient_bytes = schedule::VisionContext::output_transient_bytes(max_merged);
-        base->vision_control         = std::move(control);
+        base->vision_control = std::move(control);
     }
 
     if (prompt.identity.rewrite_checkpoint) {
@@ -330,6 +327,7 @@ void ProgramImplCore::finish_request_plan(RequestPlanImpl& plan, const ResidentS
         VisionPrefillPlan vision;
         vision.control = base.vision_control;
         vision.uses.reserve(base.vision_control->items.size());
+        std::size_t total_merged = 0;
         for (std::size_t index = 0; index < base.vision_control->items.size(); ++index) {
             const qwen3_6::VisionItemControl& item = base.vision_control->items[index];
             const auto first          = static_cast<std::uint32_t>(item.scatter_indices.front());
@@ -337,11 +335,17 @@ void ProgramImplCore::finish_request_plan(RequestPlanImpl& plan, const ResidentS
             const std::uint32_t begin = plan.prepare_mtp && first != 0 ? first - 1 : first;
             const std::uint32_t end   = last + 1;
             if (end <= plan.reuse_base) { continue; }
-            vision.uses.push_back(VisionUseSpan{begin, end, static_cast<std::uint32_t>(index)});
+            vision.uses.push_back(VisionUseSpan{begin, end, static_cast<std::uint32_t>(index),
+                                                total_merged});
+            if (item.merged_count > std::numeric_limits<std::size_t>::max() - total_merged) {
+                throw std::overflow_error("Vision output extent overflows size_t");
+            }
+            total_merged += item.merged_count;
         }
         if (!vision.uses.empty()) {
             plan.summary.transient_alignment = 256;
-            plan.summary.transient_bytes     = base.vision_transient_bytes;
+            plan.summary.transient_bytes =
+                schedule::VisionContext::output_transient_bytes(total_merged);
             plan.vision                      = std::move(vision);
         }
     }

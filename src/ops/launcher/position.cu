@@ -28,4 +28,16 @@ void offset_i32_positions_block_launch(const Tensor& source, const Tensor& delta
     CUDA_CHECK(cudaGetLastError());
 }
 
+void offset_i32_position_rows_launch(const Tensor& source, const Tensor& deltas,
+                                     Tensor& destination, cudaStream_t stream) {
+    constexpr int block = 32;
+    const dim3 grid(static_cast<unsigned>(div_up(source.ne[0], block)),
+                    static_cast<unsigned>(source.ne[1]));
+    offset_i32_position_rows_kernel<<<grid, block, 0, stream>>>(
+        static_cast<const std::int32_t*>(source.data),
+        static_cast<const std::int32_t*>(deltas.data),
+        static_cast<std::int32_t*>(destination.data), source.ne[0]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

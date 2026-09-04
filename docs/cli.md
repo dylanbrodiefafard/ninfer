@@ -35,16 +35,17 @@ template's default. An artifact whose template does not expose effort rejects th
 GPU residency is frozen when the Engine starts:
 
 - no `--spec` omits MTP/DFlash weights and state and the optimized proposal head;
-- `--spec mtp` loads only MTP, while `--spec dflash` loads only the text-only DFlash backend
+- `--spec mtp` loads only MTP, while `--spec dflash` loads only the DFlash companion
   (35B-A3B DFlash v1, or Qwen3.8-27B DFlash2 when `dflash/` is present);
 - a speculative backend with the full proposal head omits the optimized proposal head;
 - Vision is disabled by default, omitting its weights, Vision scratch phase, and frozen
   request-transient allocation;
 - `--vision` loads those allocations and enables image/video input.
 
-The complete `.ninfer` inventory is still validated. These choices are not lazy loading: a
-text-only Engine rejects media and cannot enable Vision later. DFlash and Vision are mutually
-exclusive. The default speculative and Vision settings produce the smallest resident profile.
+The complete `.ninfer` inventory is still validated. These choices are not lazy loading: an
+Engine without `--vision` rejects media and cannot enable Vision later. Qwen3.8-27B DFlash2 can be
+combined with Vision when both are selected at startup; 35B-A3B DFlash v1 remains text-only. The
+default speculative and Vision settings produce the smallest resident profile.
 
 ## Structured messages
 
@@ -105,7 +106,9 @@ long-decode, and long-context inputs.
 ## Speculative decoding
 
 Speculative decoding is disabled by default. Select MTP with one to five draft positions, 35B-A3B
-text-only DFlash v1 with one to fifteen, or Qwen3.8-27B NVFP4 text-only DFlash2 with one to seven.
+text-only DFlash v1 with one to fifteen, or Qwen3.8-27B NVFP4 DFlash2 with one to eleven. The
+Qwen3.8 companion is text-only internally, but a `--vision` Engine supplies it target hidden
+features after Vision embedding composition and uses target MRoPE positions for verification.
 `--lm-head-draft` selects the optimized proposal head and requires a selected backend:
 
 ```bash
@@ -126,9 +129,10 @@ For 35B-A3B DFlash v1:
   --spec dflash --draft-tokens 7 --lm-head-draft
 ```
 
-For Qwen3.8-27B DFlash2, the NVFP4 artifact must contain the appended `dflash/` objects. Its
-paper-accurate verifier is a chain with `W=k+1`; a width override, when supplied, must equal that
-value. On RTX 5090, `k=4` (block length five) is the measured speed recommendation.
+For Qwen3.8-27B DFlash2, the NVFP4 artifact must contain the appended `dflash/` objects. Its default
+verifier is chain `W=k+1` for `k<=5`, packed-tree `W=12` for `k` in `{6,7}`, and two-block chain
+`W=k+1` for `k` from eight through eleven. On RTX 5090, `k=4` (block length five) is the measured
+speed recommendation.
 
 ```bash
 ./build/apps/ninfer out/qwen3_8_27b_nvfp4_dflash_w8.ninfer \
@@ -163,7 +167,7 @@ MASK) chain verify. Published INT8-KV C=1 DFlash2 W8 numbers are in
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; 35B DFlash `1..15`; 3.8 DFlash2 `1..11` | unset |
 | `--adaptive-draft` | pick live draft K from host EWMA; requires `--spec mtp\|dflash` | off |
-| `--dflash-verify-width N` | DFlash verify width `2..16`; chain-only targets require `W=k+1`. Qwen3.8 DFlash2 defaults to chain `W=k+1` for `k<=5` and packed-tree `W=12` for `k` in `{6,7}` | auto |
+| `--dflash-verify-width N` | DFlash verify width `2..16`; chain-only targets require `W=k+1`. Qwen3.8 DFlash2 defaults to chain `W=k+1` for `k<=5`, packed-tree `W=12` for `k` in `{6,7}`, and two-block chain `W=k+1` for `k>=8` | auto |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |

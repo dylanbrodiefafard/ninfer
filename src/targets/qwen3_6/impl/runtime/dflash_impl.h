@@ -15,6 +15,7 @@
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ninfer/ops/position.h"
 #include "ninfer/ops/prepare_masked_block.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/residual_add.h"
@@ -858,6 +859,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         Tensor text_rows        = frame.text_kv_table_rows.slice(0, 0, batch_size);
         Tensor dflash_rows      = frame.dflash_kv_table_rows.slice(0, 0, batch_size);
         Tensor lanes            = frame.lanes.slice(0, 0, batch_size);
+        Tensor rope_deltas      = frame.rope_deltas.slice(0, 0, batch_size);
         Tensor append_counts    = frame.append_counts.slice(0, 0, batch_size);
         Tensor drafts           = frame.draft_tokens.slice(0, 0, static_cast<std::int32_t>(k))
                             .slice(1, 0, batch_size);
@@ -873,7 +875,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         Tensor cache_positions =
             frame.cache_positions.slice(0, 0, vw).slice(1, 0, batch_size);
         Tensor rope_positions =
-            frame.proposal_positions.slice(0, 0, vw).slice(1, 0, batch_size);
+            frame.target_rope_positions.slice(0, 0, vw).slice(1, 0, batch_size);
         Tensor target_tokens    = frame.target_argmax.slice(0, 0, vw).slice(1, 0, batch_size);
         Tensor target_logits    = frame.target_logits.slice(1, 0, vw).slice(2, 0, batch_size);
         Tensor target_hidden    = frame.target_hidden.slice(1, 0, vw).slice(2, 0, batch_size);
@@ -921,8 +923,20 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             frame.ancestor_mask.slice(0, 0, vw).slice(1, 0, batch_size);
         cache_positions =
             frame.cache_positions.slice(0, 0, vw).slice(1, 0, batch_size);
-        rope_positions =
+        Tensor proposal_positions =
             frame.proposal_positions.slice(0, 0, vw).slice(1, 0, batch_size);
+        const bool vision_positions = state.execution.model.vision.has_value();
+        if (vision_positions && !compact) {
+            rope_positions =
+                frame.target_rope_positions.slice(0, 0, vw).slice(1, 0, batch_size);
+            Tensor deltas = rope_deltas.slice(0, 0, batch_size);
+            ops::offset_i32_position_rows(proposal_positions, deltas, rope_positions,
+                                          state.execution.device.stream);
+        } else {
+            // Preserve the original text-only graph: its MRoPE delta is always zero, so no
+            // position materialization or extra graph node is needed.
+            rope_positions = proposal_positions;
+        }
         target_tokens = frame.target_argmax.slice(0, 0, vw).slice(1, 0, batch_size);
         licensed_tokens =
             frame.licensed_tokens.slice(0, 0, vw).slice(1, 0, batch_size);
@@ -942,6 +956,11 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             ancestor_mask   = copy_panel(ancestor_mask, vw);
             cache_positions = copy_panel(cache_positions, vw);
             rope_positions  = copy_panel(rope_positions, vw);
+            if (vision_positions) {
+                Tensor deltas = rope_deltas.slice(0, 0, batch_size);
+                ops::offset_i32_position_rows(rope_positions, deltas, rope_positions,
+                                              state.execution.device.stream);
+            }
             target_tokens   = state.execution.work.alloc(DType::I32, {vw, batch_size});
             licensed_tokens = state.execution.work.alloc(DType::I32, {vw, batch_size});
             fold_path       = state.execution.work.alloc(DType::I32, {vw, batch_size});

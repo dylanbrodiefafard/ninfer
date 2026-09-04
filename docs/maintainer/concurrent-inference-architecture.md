@@ -1362,8 +1362,11 @@ verify/accept view、per-row accepted-prefix result 和 target state transaction
 
 Engine capability 在 startup 时固定。MTP Engine 可以同时启用 Vision；MTP 的 shifted input 落在视觉列
 时使用与 target 相同的 Vision-composed embedding，prefix-reuse bridge 与正常 prefill 遵守同一输入
-语义。当前 DFlash companion checkpoint 是 text-only，因此 `DFlash + Vision` 在 Engine 构造时拒绝，
-不形成 request-level fallback。
+语义。Qwen3.8-27B NVFP4 DFlash2 companion 本身保持 text-only，但可以与 Vision 同时驻留：
+multimodal target prefill 完成
+embedding compose 后捕获相同的 selected-layer hidden features 给 DFlash context。DFlash proposal 使用
+absolute positions；target verifier 使用独立 position panel，并逐 row 加保存的 `rope_delta`，因此后续
+decode 保持 MRoPE 语义。该组合不是 request-level fallback。
 
 不同 request 可以接受不同数量的 proposals。Acceptance length 是 result metadata，不能据此拆分
 verification、重放 model 或形成 acceptance cohort。Target model 始终是 output authority，只有 accepted

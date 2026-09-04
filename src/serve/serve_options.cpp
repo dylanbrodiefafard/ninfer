@@ -362,9 +362,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
     product::validate_speculative_cli_options(options.speculative);
-    if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
-        throw std::invalid_argument("--spec dflash cannot be combined with --vision");
-    }
     if (default_max_tokens_explicit) {
         if (options.default_max_tokens <= 0) {
             throw std::invalid_argument("--default-max-tokens must be positive");

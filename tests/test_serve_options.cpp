@@ -96,12 +96,12 @@ int main() {
     failures += check(dflash_width_without_spec_rejected,
                       "--dflash-verify-width was accepted without --spec dflash");
 
-    bool dflash_vision_rejected = false;
-    try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--spec", "dflash", "--draft-tokens", "15",
-                     "--vision"});
-    } catch (const std::invalid_argument&) { dflash_vision_rejected = true; }
-    failures += check(dflash_vision_rejected, "DFlash and Vision were accepted together");
+    const ServeOptions dflash_vision =
+        parse({"ninfer-serve", "model.ninfer", "--spec", "dflash", "--draft-tokens", "15",
+               "--vision"});
+    failures += check(dflash_vision.enable_vision &&
+                          dflash_vision.speculative.backend == ninfer::SpeculativeBackend::DFlash,
+                      "DFlash and Vision were not accepted together");
 
     bool implicit_backend_rejected = false;
     try {

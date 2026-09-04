@@ -13,6 +13,7 @@ struct VisionUseSpan {
     std::uint32_t begin      = 0;
     std::uint32_t end        = 0;
     std::uint32_t item_index = 0;
+    std::size_t output_begin = 0;
 };
 
 struct VisionPrefillPlan {

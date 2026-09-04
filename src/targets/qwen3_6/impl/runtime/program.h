@@ -74,7 +74,6 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     std::shared_ptr<const qwen3_6::VisionControl> vision_control;
-    std::size_t vision_transient_bytes = 0;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
     bool allow_prefix_reuse = false;
     bool capture_context_checkpoint = false;

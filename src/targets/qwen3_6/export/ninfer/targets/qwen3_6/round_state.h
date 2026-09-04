@@ -81,6 +81,9 @@ struct DFlashDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> dflash_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> lanes{};
+    // DFlash companion positions remain absolute. The target verifier applies this per-row
+    // MRoPE delta to its own position panel after proposal construction.
+    std::array<std::int32_t, kMaximumConcurrency> rope_deltas{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
 
@@ -135,6 +138,7 @@ struct DFlashDecodeStateLayout {
     LayoutRegion egress;
     TensorRegion proposal_ids;
     TensorRegion proposal_positions;
+    TensorRegion target_rope_positions;
     TensorRegion append_positions;
     TensorRegion append_counts;
     TensorRegion draft_tokens;
@@ -261,12 +265,14 @@ struct DFlashDecodeState {
     Tensor text_kv_table_rows;
     Tensor dflash_kv_table_rows;
     Tensor lanes;
+    Tensor rope_deltas;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor licensed_tokens;
     Tensor licensed_counts;
     Tensor accepted_drafts;
     Tensor proposal_ids;
     Tensor proposal_positions;
+    Tensor target_rope_positions;
     Tensor append_positions;
     Tensor append_counts;
     Tensor draft_tokens;

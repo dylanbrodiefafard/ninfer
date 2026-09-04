@@ -1,5 +1,6 @@
 #include "artifact/reader.h"
 #include "ninfer/engine.h"
+#include "product/prompt_input/prompt_input.h"
 #include "product/speculative_options.h"
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
 
@@ -190,6 +191,7 @@ int main(int argc, char** argv) {
     try {
         std::string weights;
         std::string ids_path;
+        std::string messages_path;
         std::string text_path;
         std::string scheme = "kv-bf16";
         std::string out_json;
@@ -197,6 +199,7 @@ int main(int argc, char** argv) {
         ninfer::ScoreOptions score_options;
         ninfer::SpeculativeOptions speculative;
         std::uint32_t tokens            = 0;
+        std::uint32_t max_context       = 4096;
         std::uint32_t prefill_chunk     = 4096;
         int device                      = 0;
         bool sage_attn                  = false;
@@ -205,6 +208,10 @@ int main(int argc, char** argv) {
         std::optional<float> xattn_tau;
         bool help                       = false;
         bool encode                     = false;
+        bool enable_vision              = false;
+        bool enable_thinking            = false;
+        bool score_last_message         = false;
+        bool skip_set                   = false;
         bool use_cuda_graph             = true;
         for (int i = 1; i < argc; ++i) {
             const std::string_view arg(argv[i]);
@@ -218,6 +225,8 @@ int main(int argc, char** argv) {
                 weights = value("--weights");
             } else if (arg == "--ids") {
                 ids_path = value("--ids");
+            } else if (arg == "--messages") {
+                messages_path = value("--messages");
             } else if (arg == "--encode") {
                 encode = true;
             } else if (arg == "--text") {
@@ -238,6 +247,7 @@ int main(int argc, char** argv) {
                 score_options.schedule = parse_schedule(value("--schedule"));
             } else if (arg == "--skip") {
                 score_options.skip_tokens = parse_skip(value("--skip"));
+                skip_set                  = true;
             } else if (arg == "--spec") {
                 speculative.backend = ninfer::product::parse_speculative_backend(value("--spec"));
             } else if (arg == "--draft-tokens") {
@@ -251,12 +261,22 @@ int main(int argc, char** argv) {
                 use_cuda_graph = false;
             } else if (arg == "--tokens") {
                 tokens = static_cast<std::uint32_t>(std::stoul(value("--tokens")));
+            } else if (arg == "--max-context") {
+                max_context = static_cast<std::uint32_t>(std::stoul(value("--max-context")));
             } else if (arg == "--prefill-chunk") {
                 prefill_chunk = static_cast<std::uint32_t>(std::stoul(value("--prefill-chunk")));
             } else if (arg == "--device") {
                 device = std::stoi(value("--device"));
             } else if (arg == "--out-json") {
                 out_json = value("--out-json");
+            } else if (arg == "--vision") {
+                enable_vision = true;
+            } else if (arg == "--thinking") {
+                enable_thinking = true;
+            } else if (arg == "--no-thinking") {
+                enable_thinking = false;
+            } else if (arg == "--score-last-message") {
+                score_last_message = true;
             } else {
                 throw std::invalid_argument("unknown argument: " + std::string(arg));
             }
@@ -264,6 +284,7 @@ int main(int argc, char** argv) {
         if (help) {
             std::cout
                 << "Usage: ninfer-ppl --weights <artifact.ninfer> --ids <corpus.ids> [options]\n"
+                << "       ninfer-ppl --weights <artifact.ninfer> --messages <messages.json> [--vision] [options]\n"
                 << "       ninfer-ppl --encode --weights <artifact.ninfer> --text <file> --ids <out.ids>\n"
                 << "  --scheme <name>             cell name (default: kv-bf16)\n"
                 << "  --kv-dtype <bf16|int8|nvfp4>  default: nvfp4\n"
@@ -279,8 +300,12 @@ int main(int argc, char** argv) {
                 << "  --dflash-verify-width <n>   optional DFlash packed/chain verify width\n"
                 << "  --cuda-graph / --no-cuda-graph  default: graphs on (production decode)\n"
                 << "  --tokens <n>                score/encode the first n ids (default: all)\n"
+                << "  --max-context <n>           message-input context ceiling (default: 4096)\n"
                 << "  --prefill-chunk <n>         default 4096\n"
                 << "  --device <id>\n"
+                << "  --vision                    enable image/video parts in --messages\n"
+                << "  --thinking / --no-thinking message template mode (default: no-thinking)\n"
+                << "  --score-last-message        score only the final assistant message\n"
                 << "  --out-json <path|->\n";
             return 0;
         }
@@ -292,8 +317,17 @@ int main(int argc, char** argv) {
             encode_text_file(weights, text_path, ids_path, tokens);
             return 0;
         }
-        if (ids_path.empty()) {
-            throw std::invalid_argument("--weights and --ids are required");
+        if (ids_path.empty() == messages_path.empty()) {
+            throw std::invalid_argument("exactly one of --ids or --messages is required");
+        }
+        if (!messages_path.empty() && tokens != 0) {
+            throw std::invalid_argument("--tokens applies only to --ids input");
+        }
+        if (score_last_message && messages_path.empty()) {
+            throw std::invalid_argument("--score-last-message requires --messages");
+        }
+        if (score_last_message && skip_set) {
+            throw std::invalid_argument("--score-last-message and --skip are mutually exclusive");
         }
 
         ninfer::product::validate_speculative_cli_options(speculative);
@@ -302,7 +336,8 @@ int main(int argc, char** argv) {
             throw std::invalid_argument(
                 "ninfer-ppl does not teacher-force DFlash decode; use --schedule prefill");
         }
-        const std::vector<ninfer::TokenId> ids = load_ids(ids_path, tokens);
+        std::vector<ninfer::TokenId> ids;
+        if (!ids_path.empty()) { ids = load_ids(ids_path, tokens); }
         if (sage_attn && kv_dtype != ninfer::KvCacheStorage::Nvfp4) {
             throw std::invalid_argument("--sage requires --kv-dtype nvfp4 (sage_pv k_mean plane)");
         }
@@ -322,7 +357,7 @@ int main(int argc, char** argv) {
         ninfer::EngineOptions options;
         options.artifact_path    = weights;
         options.device           = device;
-        options.max_context      = static_cast<std::uint32_t>(ids.size());
+        options.max_context      = ids.empty() ? max_context : static_cast<std::uint32_t>(ids.size());
         options.kv_capacity      = ninfer::KvCapacityPolicy::explicit_capacity(options.max_context);
         options.max_concurrency  = 1;
         options.prefill_chunk    = prefill_chunk;
@@ -331,7 +366,7 @@ int main(int argc, char** argv) {
         options.keep_frac        = keep_frac.value_or(1.0f);
         options.xattn_tau        = xattn_tau.value_or(1.0f);
         options.speculative      = speculative;
-        options.enable_vision    = false;
+        options.enable_vision    = enable_vision;
         options.use_cuda_graph   = use_cuda_graph;
         ninfer::validate_sparse_attn_flags(options.kv_cache, options.sage_attn, options.keep_frac,
                                            options.xattn_tau);
@@ -341,7 +376,29 @@ int main(int argc, char** argv) {
         }
 
         ninfer::Engine engine(std::move(options));
-        ninfer::PreparedPrompt prompt = engine.prepare_tokens(ids, false);
+        ninfer::PreparedPrompt prompt;
+        if (messages_path.empty()) {
+            prompt = engine.prepare_tokens(std::move(ids), false);
+        } else {
+            ninfer::PromptInput input = ninfer::product::prompt_from_messages(
+                messages_path, enable_thinking, enable_vision);
+            if (score_last_message) {
+                if (input.messages.size() < 2 ||
+                    input.messages.back().role != ninfer::ChatRole::Assistant) {
+                    throw std::invalid_argument(
+                        "--score-last-message requires a final assistant message with history");
+                }
+                ninfer::PromptInput prefix = input;
+                prefix.messages.pop_back();
+                const std::uint32_t prefix_tokens = engine.count_tokens(std::move(prefix));
+                if (prefix_tokens == 0) {
+                    throw std::logic_error("assistant scoring prefix is empty");
+                }
+                score_options.skip_tokens = prefix_tokens - 1;
+                input.options.add_generation_prompt = false;
+            }
+            prompt = engine.prepare(std::move(input));
+        }
         const ninfer::ScoreResult score = engine.score(std::move(prompt), score_options);
         write_cell_json(out_json, scheme, weights, engine.load_summary(), kv_dtype, prefill_chunk,
                         use_cuda_graph, speculative.backend, speculative.draft_tokens, sage_attn,

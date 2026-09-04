@@ -23,4 +23,7 @@ target_include_directories(ninfer-ppl PRIVATE
   ${PROJECT_SOURCE_DIR}/include
   ${PROJECT_SOURCE_DIR}/src
   ${PROJECT_SOURCE_DIR}/third_party)
-target_link_libraries(ninfer-ppl PRIVATE ninfer_engine ninfer_artifact)
+target_link_libraries(ninfer-ppl PRIVATE
+  ninfer_engine
+  ninfer_artifact
+  ninfer_product_prompt_input)

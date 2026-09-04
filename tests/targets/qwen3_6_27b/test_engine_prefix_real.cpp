@@ -890,12 +890,7 @@ int exercise_artifact(const char* artifact) {
         if (const int result = exercise_append_cancel_keeps_turn_rollback(engine); result != 0) {
             return result;
         }
-        if (engine.load_summary().target == "qwen3_6_27b") {
-            vision_rc = exercise_vision(engine);
-        } else {
-            std::cerr << "skip vision greedy reuse on " << engine.load_summary().target
-                      << " (RestoreTurnCheckpoint vs FullReset diverges)\n";
-        }
+        vision_rc = exercise_vision(engine);
     }
 
     std::cerr << "ladder first-prompt cancel\n";

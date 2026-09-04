@@ -13,5 +13,7 @@ void offset_i32_positions_launch(const Tensor& source, const Tensor& delta, Tens
                                  cudaStream_t stream);
 void offset_i32_positions_block_launch(const Tensor& source, const Tensor& delta,
                                        Tensor& destination, int block, cudaStream_t stream);
+void offset_i32_position_rows_launch(const Tensor& source, const Tensor& deltas,
+                                     Tensor& destination, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

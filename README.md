@@ -235,8 +235,9 @@ Each artifact is complete, while GPU residency is fixed at process startup. Spec
 disabled by default, so MTP/DFlash state and the optimized proposal head are not uploaded.
 Vision is also disabled by default, so its weights, Vision scratch phase, and frozen
 request-transient allocation are omitted. Add `--vision` to the CLI or server process that must
-accept image or video input. Disabled capabilities cannot be enabled by a later request. DFlash is
-text-only: Qwen3.8-27B NVFP4 DFlash2 when the artifact includes `dflash/` objects.
+accept image or video input. Disabled capabilities cannot be enabled by a later request. Qwen3.8-27B
+NVFP4 DFlash2 is available when the artifact includes `dflash/` objects; its companion consumes
+target hidden states and can run with Vision when both capabilities are enabled at startup.
 
 ## Run the CLI
 
@@ -310,8 +311,9 @@ All three registered model IDs support:
   usage accounting;
 - prompt-rendered function tools and parsed tool calls.
 
-The supported identity additionally supports text-only DFlash2 speculative decoding with draft
-windows from one to eleven when the artifact contains the companion objects.
+The supported identity additionally supports DFlash2 speculative decoding with draft windows from
+one to eleven when the artifact contains the companion objects. `--spec dflash ... --vision`
+combines it with image, multi-image, video, and mixed-media prompts.
 
 ## Current limits
 

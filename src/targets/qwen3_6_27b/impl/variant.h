@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6_27b::detail {
@@ -36,6 +37,11 @@ struct Variant {
     static constexpr std::uint32_t maximum_context             = kNativeContext;
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
     static constexpr std::int32_t draft_head_rows              = 131072;
+
+    [[nodiscard]] static constexpr bool supports_dflash_vision(
+        std::string_view model_id, std::string_view weights_id) {
+        return model_id == "qwen3.8-27b" && weights_id == "nvfp4";
+    }
 
     // The target-verify leaves receive route_tokens: the C=1 width of a packed verify round (0
     // when the round is not batched packed verify). It selects the C=1 quantization family for
