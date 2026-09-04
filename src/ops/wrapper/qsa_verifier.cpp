@@ -24,6 +24,7 @@ struct Scratch {
     Tensor attention;
     Tensor gated;
     Tensor select_workspace;
+    Tensor attention_workspace;
 };
 
 template <class Allocator>
@@ -40,6 +41,8 @@ Scratch allocate_scratch(Allocator& allocator) {
         allocator.alloc(DType::BF16, {6144}),
         allocator.alloc(DType::U8,
                         {static_cast<std::int32_t>(qsa_index_select_workspace_bytes(1))}),
+        allocator.alloc(DType::U8,
+                        {static_cast<std::int32_t>(qsa_selected_attention_workspace_bytes())}),
     };
 }
 
@@ -143,8 +146,11 @@ void qsa_verifier_token(const Tensor& x, const Tensor& token_id, const Tensor& p
     qsa_index_select(scratch.index_query, state, token_id, visible_ids, visible_offsets,
                      weights.index_query_norm, weights.index_key_norm, selected_ids,
                      selected_count, scratch.select_workspace, stream);
-    qsa_selected_attention(scratch.query, selected_ids, selected_count, state, scratch.attention,
-                           stream);
+    const std::int32_t selected_bound =
+        visible_ids.ne[0] < kQsaSelectedCapacity ? visible_ids.ne[0] : kQsaSelectedCapacity;
+    Tensor selected_view(selected_ids.data, DType::I32, {selected_bound});
+    qsa_selected_attention(scratch.query, selected_view, selected_count, state,
+                           scratch.attention, scratch.attention_workspace, stream);
     detail::qsa_output_gate_launch(scratch.attention, scratch.raw_query_gate, scratch.gated,
                                    stream);
     ggml_block_linear(scratch.gated, weights.output, out, stream);

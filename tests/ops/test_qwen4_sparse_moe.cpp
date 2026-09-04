@@ -1,6 +1,6 @@
 #include "ninfer/ops/qwen4_sparse_moe.h"
 
-#include "ops/ggml_block_linear/ggml_codebook_data.h"
+#include "ops/ggml_iq_oracle.h"
 #include "ops/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -37,6 +37,45 @@ enum class RouteFixture {
     AllZero,
     Nonuniform,
     Underflow,
+};
+
+struct PipelineEvents {
+    cudaStream_t transfer_stream = nullptr;
+    cudaEvent_t route_ready = nullptr;
+    cudaEvent_t ids_ready = nullptr;
+    std::array<cudaEvent_t, ops::kQwen4SparseMoePipelineSlots> transfer_ready{};
+    std::array<cudaEvent_t, ops::kQwen4SparseMoePipelineSlots> consumer_complete{};
+
+    PipelineEvents() {
+        cuda_check(cudaStreamCreateWithFlags(&transfer_stream, cudaStreamNonBlocking),
+                   "cudaStreamCreate transfer");
+        cuda_check(cudaEventCreateWithFlags(&route_ready, cudaEventDisableTiming),
+                   "cudaEventCreate route_ready");
+        cuda_check(cudaEventCreateWithFlags(
+                       &ids_ready, cudaEventDisableTiming | cudaEventBlockingSync),
+                   "cudaEventCreate ids_ready");
+        for (std::size_t slot = 0; slot < transfer_ready.size(); ++slot) {
+            cuda_check(cudaEventCreateWithFlags(
+                           &transfer_ready[slot],
+                           cudaEventDisableTiming | cudaEventBlockingSync),
+                       "cudaEventCreate transfer_ready");
+            cuda_check(cudaEventCreateWithFlags(&consumer_complete[slot],
+                                                 cudaEventDisableTiming),
+                       "cudaEventCreate consumer_complete");
+        }
+    }
+
+    ~PipelineEvents() {
+        if (transfer_stream != nullptr) { (void)cudaStreamSynchronize(transfer_stream); }
+        for (cudaEvent_t event : consumer_complete) { (void)cudaEventDestroy(event); }
+        for (cudaEvent_t event : transfer_ready) { (void)cudaEventDestroy(event); }
+        (void)cudaEventDestroy(ids_ready);
+        (void)cudaEventDestroy(route_ready);
+        (void)cudaStreamDestroy(transfer_stream);
+    }
+
+    PipelineEvents(const PipelineEvents&) = delete;
+    PipelineEvents& operator=(const PipelineEvents&) = delete;
 };
 
 // A routed path crosses gate, up, SwiGLU-input, down, and final BF16 representations. The fixed
@@ -147,10 +186,10 @@ double decode_value(QType qtype, const std::uint8_t* block, int index) {
         const std::uint16_t control = read_u16(block + 34 + 2 * group);
         const int grid = block[2 + 4 * group + lane] |
                          (((control >> (3 * lane)) & 7U) << 8U);
-        const int digit = (ops::detail::kIq1SPackedGrid[grid] >> (2 * item)) & 3U;
+        const int digit = iq_oracle::iq1_grid(grid)[item];
         const double delta = (control & 0x8000U) != 0 ? -0.125 : 0.125;
         const int multiplier = 2 * ((control >> 12U) & 7U) + 1;
-        return half_to_double(read_u16(block)) * multiplier * (digit - 1 + delta);
+        return half_to_double(read_u16(block)) * multiplier * (digit + delta);
     }
     if (qtype == QType::GGML_IQ2_XXS) {
         const int group = index / 32;
@@ -161,16 +200,15 @@ double decode_value(QType qtype, const std::uint8_t* block, int index) {
         const int grid = (grids >> (8 * lane)) & 255U;
         int signs = (signs_scales >> (7 * lane)) & 127U;
         signs |= (__builtin_popcount(static_cast<unsigned>(signs)) & 1) << 7;
-        const int digit = (ops::detail::kIq2XxsPackedGrid[grid] >> (2 * item)) & 3U;
-        constexpr std::array<int, 3> magnitudes = {8, 25, 43};
+        const int magnitude = iq_oracle::iq2_grid(grid)[item];
         const double group_scale = half_to_double(read_u16(block)) *
                                    (0.5 + static_cast<double>(signs_scales >> 28U)) / 4.0;
         const int sign = (signs & (1 << item)) != 0 ? -1 : 1;
-        return group_scale * magnitudes[static_cast<std::size_t>(digit)] * sign;
+        return group_scale * magnitude * sign;
     }
     const std::uint8_t packed = block[2 + (index & 15)];
     const int code = index < 16 ? packed & 15U : packed >> 4U;
-    return half_to_double(read_u16(block)) * ops::detail::kIq4NlGrid[code];
+    return half_to_double(read_u16(block)) * iq_oracle::kIq4Nl[code];
 }
 
 std::vector<double> linear(QType qtype, std::span<const std::uint8_t> matrix, int rows,
@@ -264,6 +302,48 @@ std::vector<std::uint8_t> make_matrix(QType qtype, int rows, int columns, std::u
             write_u16(block, scale_word(qtype, index));
         }
         if (qtype == QType::GGML_Q5_K) { write_u16(block + 2, 0x0400U); }
+        if (qtype == QType::GGML_IQ1_S) {
+            constexpr std::array<int, 4> grids = {0, 1, 2, 2047};
+            for (int group = 0; group < 8; ++group) {
+                std::uint16_t control = 0;
+                for (int lane = 0; lane < 4; ++lane) {
+                    const int grid = grids[(seed + index + group + lane) & 3U];
+                    block[2 + 4 * group + lane] = static_cast<std::uint8_t>(grid);
+                    control |= static_cast<std::uint16_t>(grid >> 8) << (3 * lane);
+                }
+                const std::uint16_t multiplier =
+                    static_cast<std::uint16_t>((seed + index + group) & 7U);
+                const std::uint16_t delta =
+                    ((seed + index + group) & 1U) != 0 ? 0x8000U : 0U;
+                write_u16(block + 34 + 2 * group,
+                          static_cast<std::uint16_t>(control | (multiplier << 12U) | delta));
+            }
+        } else if (qtype == QType::GGML_IQ2_XXS) {
+            constexpr std::array<int, 4> grids = {0, 1, 2, 255};
+            for (int group = 0; group < 8; ++group) {
+                std::uint32_t signs = 0;
+                for (int lane = 0; lane < 4; ++lane) {
+                    block[2 + 8 * group + lane] = static_cast<std::uint8_t>(
+                        grids[(seed + index + group + lane) & 3U]);
+                    const std::uint32_t sign =
+                        (seed + 19U * index + 11U * group + 29U * lane) & 127U;
+                    signs |= sign << (7 * lane);
+                }
+                const std::uint32_t scale =
+                    static_cast<std::uint32_t>((seed + index + group) & 15U) << 28U;
+                const std::uint32_t control = signs | scale;
+                for (int byte = 0; byte < 4; ++byte) {
+                    block[6 + 8 * group + byte] =
+                        static_cast<std::uint8_t>(control >> (8 * byte));
+                }
+            }
+        } else if (qtype == QType::GGML_IQ4_NL) {
+            for (int lane = 0; lane < 16; ++lane) {
+                const int low = static_cast<int>((seed + index + 5U * lane) & 15U);
+                const int high = static_cast<int>((seed + 3U * index + 7U * lane) & 15U);
+                block[2 + lane] = static_cast<std::uint8_t>((high << 4) | low);
+            }
+        }
     }
     return result;
 }
@@ -440,7 +520,8 @@ std::vector<float> make_input() {
 }
 
 int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
-             float shared_gate_extreme, cudaStream_t stream) {
+             float shared_gate_extreme, PipelineEvents& pipeline_events,
+             cudaStream_t stream) {
     const auto input = make_input();
     std::vector<double> oracle_input(input.begin(), input.end());
     std::vector<float> router(static_cast<std::size_t>(kExperts) * kHidden, 0.0F);
@@ -448,13 +529,15 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
     if (route_fixture == RouteFixture::AllZero) {
         std::iota(intended_ids.begin(), intended_ids.end(), 0);
     } else if (route_fixture == RouteFixture::Nonuniform) {
-        intended_ids = {511, 257, 128, 64, 32, 16, 8, 4, 2, 0};
+        // The selected set crosses both 256-expert halves. Experts 255 and 256 tie at the tenth
+        // boundary, so the lower id must win even though the pair straddles the half boundary.
+        intended_ids = {511, 400, 300, 257, 128, 64, 32, 16, 8, 255};
         for (int rank = 0; rank < 9; ++rank) {
             router[static_cast<std::size_t>(intended_ids[rank]) * kHidden] =
                 static_cast<float>(12 - rank);
         }
-        router[0] = 2.0F;
-        router[static_cast<std::size_t>(1) * kHidden] = 2.0F;
+        router[static_cast<std::size_t>(255) * kHidden] = 2.0F;
+        router[static_cast<std::size_t>(256) * kHidden] = 2.0F;
     } else {
         // All non-maximum FP32 softmax values underflow to zero. Selection must still rank the
         // distinct raw logits rather than incorrectly treating the underflowed probabilities as
@@ -472,6 +555,21 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
     const OracleRoute route = route_oracle(router, oracle_input);
     if (route.ids != intended_ids) { throw std::logic_error("test router fixture is malformed"); }
 
+    // A second, disjoint route exercises persistent slot ownership across Op calls. The second
+    // invocation is submitted without synchronizing either stream after the first, so a rank-8/9
+    // slot overwritten by the next call's rank 0/1 changes the first result.
+    std::vector<float> next_router(static_cast<std::size_t>(kExperts) * kHidden, 0.0F);
+    std::array<int, kTopK> next_intended_ids{};
+    for (int rank = 0; rank < kTopK; ++rank) {
+        next_intended_ids[rank] = 510 - rank;
+        next_router[static_cast<std::size_t>(next_intended_ids[rank]) * kHidden] =
+            static_cast<float>(20 - rank);
+    }
+    const OracleRoute next_route = route_oracle(next_router, oracle_input);
+    if (next_route.ids != next_intended_ids) {
+        throw std::logic_error("back-to-back test router fixture is malformed");
+    }
+
     const std::size_t one_routed = matrix_bytes(routed_qtype, kIntermediate, kHidden);
     const std::size_t bank_bytes = static_cast<std::size_t>(kExperts) * one_routed;
     AnonymousMapping mapped_gate(bank_bytes);
@@ -487,20 +585,41 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
         std::memcpy(mapped_up.mutable_data() +
                         static_cast<std::size_t>(route.ids[rank]) * one_routed,
                     up.data(), up.size());
+        const auto next_gate = make_matrix(routed_qtype, kIntermediate, kHidden,
+                                           0x7000U + static_cast<unsigned>(rank));
+        const auto next_up = make_matrix(routed_qtype, kIntermediate, kHidden,
+                                         0x8000U + static_cast<unsigned>(rank));
+        std::memcpy(mapped_gate.mutable_data() +
+                        static_cast<std::size_t>(next_route.ids[rank]) * one_routed,
+                    next_gate.data(), next_gate.size());
+        std::memcpy(mapped_up.mutable_data() +
+                        static_cast<std::size_t>(next_route.ids[rank]) * one_routed,
+                    next_up.data(), next_up.size());
     }
     mapped_gate.make_read_only();
     mapped_up.make_read_only();
+
+    DeviceBuffer resident_gate(bank_bytes);
+    DeviceBuffer resident_up(bank_bytes);
+    resident_gate.copy_from_host(mapped_gate.data(), mapped_gate.size());
+    resident_up.copy_from_host(mapped_up.data(), mapped_up.size());
 
     const std::size_t one_down = matrix_bytes(QType::GGML_IQ4_NL, kHidden, kIntermediate);
     const std::size_t down_bank_bytes = static_cast<std::size_t>(kExperts) * one_down;
     DeviceBuffer device_down(down_bank_bytes);
     device_down.fill(0);
     std::array<std::vector<std::uint8_t>, kTopK> down_matrices;
+    std::array<std::vector<std::uint8_t>, kTopK> next_down_matrices;
     for (int rank = 0; rank < kTopK; ++rank) {
         down_matrices[rank] = make_matrix(QType::GGML_IQ4_NL, kHidden, kIntermediate,
                                           0x3000U + static_cast<unsigned>(rank));
         device_down.copy_from_host(down_matrices[rank].data(), one_down,
                                    static_cast<std::size_t>(route.ids[rank]) * one_down);
+        next_down_matrices[rank] = make_matrix(
+            QType::GGML_IQ4_NL, kHidden, kIntermediate,
+            0x9000U + static_cast<unsigned>(rank));
+        device_down.copy_from_host(next_down_matrices[rank].data(), one_down,
+                                   static_cast<std::size_t>(next_route.ids[rank]) * one_down);
     }
 
     const auto shared_gate_proj = make_matrix(shared_qtype, kIntermediate, kHidden, 0x4000U);
@@ -522,25 +641,57 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
         shared_down,
     };
     const auto reference = complete_oracle(oracle_input, route, oracle_weights);
+    const OracleInputs next_oracle_weights{
+        routed_qtype,
+        shared_qtype,
+        next_router,
+        mapped_gate,
+        mapped_up,
+        next_down_matrices,
+        shared_gate,
+        shared_gate_proj,
+        shared_up,
+        shared_down,
+    };
+    const auto next_reference = complete_oracle(oracle_input, next_route, next_oracle_weights);
 
     DeviceBuffer device_x = to_device_bf16(input);
     DeviceBuffer device_router = to_device_f32(router);
+    DeviceBuffer next_device_router = to_device_f32(next_router);
     DeviceBuffer device_shared_gate = to_device_f32(shared_gate);
     DeviceBuffer device_shared_gate_proj = to_device(shared_gate_proj);
     DeviceBuffer device_shared_up = to_device(shared_up);
     DeviceBuffer device_shared_down = to_device(shared_down);
-    GuardedDeviceBuffer device_stage(ops::kQwen4SparseMoeStageBytes);
+    GuardedDeviceBuffer device_stage(ops::kQwen4SparseMoePipelineStageBytes);
     GuardedDeviceBuffer device_ids(kTopK * sizeof(std::int32_t));
     GuardedDeviceBuffer device_route_weights(kTopK * sizeof(float));
     GuardedDeviceBuffer device_destination(kHidden * sizeof(std::uint16_t));
+    GuardedDeviceBuffer next_device_ids(kTopK * sizeof(std::int32_t));
+    GuardedDeviceBuffer next_device_route_weights(kTopK * sizeof(float));
+    GuardedDeviceBuffer next_device_destination(kHidden * sizeof(std::uint16_t));
+    GuardedDeviceBuffer resident_device_ids(kTopK * sizeof(std::int32_t));
+    GuardedDeviceBuffer resident_device_route_weights(kTopK * sizeof(float));
+    GuardedDeviceBuffer resident_device_destination(kHidden * sizeof(std::uint16_t));
+    GuardedDeviceBuffer next_resident_device_ids(kTopK * sizeof(std::int32_t));
+    GuardedDeviceBuffer next_resident_device_route_weights(kTopK * sizeof(float));
+    GuardedDeviceBuffer next_resident_device_destination(kHidden * sizeof(std::uint16_t));
     device_stage.fill(0xcd);
     device_ids.fill(0xcd);
     device_route_weights.fill(0xcd);
     device_destination.fill(0xcd);
+    next_device_ids.fill(0xcd);
+    next_device_route_weights.fill(0xcd);
+    next_device_destination.fill(0xcd);
+    resident_device_ids.fill(0xcd);
+    resident_device_route_weights.fill(0xcd);
+    resident_device_destination.fill(0xcd);
+    next_resident_device_ids.fill(0xcd);
+    next_resident_device_route_weights.fill(0xcd);
+    next_resident_device_destination.fill(0xcd);
     cuda_synchronize();
 
     constexpr std::size_t host_guard = 256;
-    PinnedHostBuffer pinned(ops::kQwen4SparseMoeStageBytes + 2 * host_guard);
+    PinnedHostBuffer pinned(ops::kQwen4SparseMoePipelineStageBytes + 2 * host_guard);
     auto* pinned_bytes = static_cast<std::uint8_t*>(pinned.data());
     std::memset(pinned_bytes, 0xa5, pinned.size());
     void* pinned_stage = pinned_bytes + host_guard;
@@ -548,10 +699,21 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
 
     Tensor x(device_x.p, DType::BF16, {kHidden});
     Tensor stage(device_stage.data(), DType::U8,
-                 {static_cast<std::int32_t>(ops::kQwen4SparseMoeStageBytes)});
+                 {static_cast<std::int32_t>(ops::kQwen4SparseMoePipelineStageBytes)});
     Tensor ids(device_ids.data(), DType::I32, {kTopK});
     Tensor route_weights(device_route_weights.data(), DType::FP32, {kTopK});
     Tensor destination(device_destination.data(), DType::BF16, {kHidden});
+    Tensor next_ids(next_device_ids.data(), DType::I32, {kTopK});
+    Tensor next_route_weights(next_device_route_weights.data(), DType::FP32, {kTopK});
+    Tensor next_destination(next_device_destination.data(), DType::BF16, {kHidden});
+    Tensor resident_ids(resident_device_ids.data(), DType::I32, {kTopK});
+    Tensor resident_route_weights(resident_device_route_weights.data(), DType::FP32, {kTopK});
+    Tensor resident_destination(resident_device_destination.data(), DType::BF16, {kHidden});
+    Tensor next_resident_ids(next_resident_device_ids.data(), DType::I32, {kTopK});
+    Tensor next_resident_route_weights(next_resident_device_route_weights.data(), DType::FP32,
+                                       {kTopK});
+    Tensor next_resident_destination(next_resident_device_destination.data(), DType::BF16,
+                                     {kHidden});
     Tensor shared_gate_tensor(device_shared_gate.p, DType::FP32, {kHidden});
     ops::Qwen4SparseMoeWeights weights{
         .router = make_router(device_router.p),
@@ -573,9 +735,45 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
         .shared_down = make_ggml_weight(device_shared_down.p, shared_down.size(),
                                         QType::GGML_Q8_0, 1, kHidden, kIntermediate),
     };
+    auto next_weights = weights;
+    next_weights.router = make_router(next_device_router.p);
+    ops::Qwen4ResidentSparseMoeWeights resident_weights{
+        .router = weights.router,
+        .routed_gate = make_ggml_weight(resident_gate.p, resident_gate.bytes, routed_qtype,
+                                        kExperts, kIntermediate, kHidden),
+        .routed_up = make_ggml_weight(resident_up.p, resident_up.bytes, routed_qtype,
+                                      kExperts, kIntermediate, kHidden),
+        .routed_down = weights.routed_down,
+        .shared_gate = weights.shared_gate,
+        .shared_gate_proj = weights.shared_gate_proj,
+        .shared_up = weights.shared_up,
+        .shared_down = weights.shared_down,
+    };
+    auto next_resident_weights = resident_weights;
+    next_resident_weights.router = make_router(next_device_router.p);
+    ops::Qwen4SparseMoePipeline pipeline{
+        .pinned_stage = pinned_stage,
+        .pinned_stage_bytes = ops::kQwen4SparseMoePipelineStageBytes,
+        .device_stage = stage,
+        .transfer_stream = pipeline_events.transfer_stream,
+        .route_ready = pipeline_events.route_ready,
+        .ids_ready = pipeline_events.ids_ready,
+        .transfer_ready = {pipeline_events.transfer_ready[0],
+                           pipeline_events.transfer_ready[1]},
+        .consumer_complete = {pipeline_events.consumer_complete[0],
+                              pipeline_events.consumer_complete[1]},
+    };
 
-    ops::qwen4_sparse_moe(x, weights, pinned_stage, ops::kQwen4SparseMoeStageBytes, stage, ids,
-                          route_weights, destination, workspace, stream);
+    ops::qwen4_sparse_moe(x, weights, pipeline, ids, route_weights, destination, workspace,
+                          stream);
+    ops::qwen4_sparse_moe(x, next_weights, pipeline, next_ids, next_route_weights,
+                          next_destination, workspace, stream);
+    ops::qwen4_sparse_moe_resident(x, resident_weights, resident_ids,
+                                   resident_route_weights, resident_destination, workspace,
+                                   stream);
+    ops::qwen4_sparse_moe_resident(x, next_resident_weights, next_resident_ids,
+                                   next_resident_route_weights, next_resident_destination,
+                                   workspace, stream);
     cuda_synchronize(stream);
 
     int failures = 0;
@@ -591,69 +789,152 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
     const auto actual = from_device_bf16(device_destination.data(), kHidden);
     failures += verify_reduction("Qwen4 sparse MoE complete FP64 formula", actual, reference,
                                  kOutputCriterion);
+    const auto next_actual_ids = from_device<std::int32_t>(next_device_ids.data(), kTopK);
+    if (!std::equal(next_actual_ids.begin(), next_actual_ids.end(), next_route.ids.begin())) {
+        std::cerr << "Qwen4 sparse MoE back-to-back call selected wrong expert ids\n";
+        ++failures;
+    }
+    const auto next_actual_weight_f32 =
+        from_device<float>(next_device_route_weights.data(), kTopK);
+    std::vector<double> next_actual_weights(next_actual_weight_f32.begin(),
+                                            next_actual_weight_f32.end());
+    failures += verify_pointwise("Qwen4 sparse MoE back-to-back selected weights",
+                                 next_actual_weights, next_route.weights,
+                                 kRouteWeightCriterion);
+    const auto next_actual = from_device_bf16(next_device_destination.data(), kHidden);
+    failures += verify_reduction("Qwen4 sparse MoE back-to-back complete FP64 formula",
+                                 next_actual, next_reference, kOutputCriterion);
+    const auto resident_actual_ids =
+        from_device<std::int32_t>(resident_device_ids.data(), kTopK);
+    if (!std::equal(resident_actual_ids.begin(), resident_actual_ids.end(), route.ids.begin())) {
+        std::cerr << "Qwen4 resident sparse MoE selected wrong expert ids\n";
+        ++failures;
+    }
+    const auto resident_actual_weight_f32 =
+        from_device<float>(resident_device_route_weights.data(), kTopK);
+    std::vector<double> resident_actual_weights(resident_actual_weight_f32.begin(),
+                                                resident_actual_weight_f32.end());
+    failures += verify_pointwise("Qwen4 resident sparse MoE selected weights",
+                                 resident_actual_weights, route.weights,
+                                 kRouteWeightCriterion);
+    const auto resident_actual =
+        from_device_bf16(resident_device_destination.data(), kHidden);
+    failures += verify_reduction("Qwen4 resident sparse MoE complete FP64 formula",
+                                 resident_actual, reference, kOutputCriterion);
+    if (!std::equal(actual.begin(), actual.end(), resident_actual.begin())) {
+        std::cerr << "Qwen4 resident fusion changed a routed BF16 seam\n";
+        ++failures;
+    }
+    const auto next_resident_actual_ids =
+        from_device<std::int32_t>(next_resident_device_ids.data(), kTopK);
+    if (!std::equal(next_resident_actual_ids.begin(), next_resident_actual_ids.end(),
+                    next_route.ids.begin())) {
+        std::cerr << "Qwen4 resident sparse MoE back-to-back call selected wrong expert ids\n";
+        ++failures;
+    }
+    const auto next_resident_actual_weight_f32 =
+        from_device<float>(next_resident_device_route_weights.data(), kTopK);
+    std::vector<double> next_resident_actual_weights(next_resident_actual_weight_f32.begin(),
+                                                     next_resident_actual_weight_f32.end());
+    failures += verify_pointwise("Qwen4 resident sparse MoE back-to-back selected weights",
+                                 next_resident_actual_weights, next_route.weights,
+                                 kRouteWeightCriterion);
+    const auto next_resident_actual =
+        from_device_bf16(next_resident_device_destination.data(), kHidden);
+    failures += verify_reduction("Qwen4 resident sparse MoE back-to-back complete FP64 formula",
+                                 next_resident_actual, next_reference, kOutputCriterion);
+    if (!std::equal(next_actual.begin(), next_actual.end(), next_resident_actual.begin())) {
+        std::cerr << "Qwen4 resident back-to-back fusion changed a routed BF16 seam\n";
+        ++failures;
+    }
 
-    const std::size_t copied = ops::qwen4_sparse_moe_selected_stage_bytes(routed_qtype);
-    std::vector<std::uint8_t> expected_stage(copied);
-    for (int rank = 0; rank < kTopK; ++rank) {
-        std::memcpy(expected_stage.data() + static_cast<std::size_t>(2 * rank) * one_routed,
-                    mapped_gate.data() + static_cast<std::size_t>(route.ids[rank]) * one_routed,
+    const std::size_t rank_bytes = ops::qwen4_sparse_moe_rank_stage_bytes(routed_qtype);
+    std::vector<std::uint8_t> actual_stage(ops::kQwen4SparseMoePipelineStageBytes);
+    device_stage.copy_to_host(actual_stage.data(), actual_stage.size());
+    for (int slot = 0; slot < ops::kQwen4SparseMoePipelineSlots; ++slot) {
+        const int rank = kTopK - ops::kQwen4SparseMoePipelineSlots + slot;
+        std::vector<std::uint8_t> expected_pair(rank_bytes);
+        std::memcpy(expected_pair.data(),
+                    mapped_gate.data() +
+                        static_cast<std::size_t>(next_route.ids[rank]) * one_routed,
                     one_routed);
-        std::memcpy(expected_stage.data() + static_cast<std::size_t>(2 * rank + 1) * one_routed,
-                    mapped_up.data() + static_cast<std::size_t>(route.ids[rank]) * one_routed,
+        std::memcpy(expected_pair.data() + one_routed,
+                    mapped_up.data() +
+                        static_cast<std::size_t>(next_route.ids[rank]) * one_routed,
                     one_routed);
-    }
-    if (std::memcmp(pinned_stage, expected_stage.data(), copied) != 0 ||
-        !std::all_of(pinned_bytes, pinned_bytes + host_guard,
-                     [](std::uint8_t value) { return value == 0xa5; }) ||
-        !std::all_of(pinned_bytes + host_guard + ops::kQwen4SparseMoeStageBytes,
-                     pinned_bytes + pinned.size(),
-                     [](std::uint8_t value) { return value == 0xa5; })) {
-        std::cerr << "Qwen4 sparse MoE pinned stage gather or guard mismatch\n";
-        ++failures;
-    }
-    std::vector<std::uint8_t> actual_stage(copied);
-    device_stage.copy_to_host(actual_stage.data(), copied);
-    if (actual_stage != expected_stage) {
-        std::cerr << "Qwen4 sparse MoE H2D stage changed source bytes\n";
-        ++failures;
-    }
-    if (copied < ops::kQwen4SparseMoeStageBytes) {
-        std::array<std::uint8_t, 256> unused{};
-        device_stage.copy_to_host(unused.data(), unused.size(), copied);
-        if (!std::all_of(unused.begin(), unused.end(),
-                         [](std::uint8_t value) { return value == 0xcd; })) {
-            std::cerr << "Qwen4 sparse MoE copied beyond the IQ1_S stage extent\n";
+        const std::size_t slot_offset = static_cast<std::size_t>(slot) *
+                                        ops::kQwen4SparseMoeRankStageCapacityBytes;
+        if (std::memcmp(pinned_bytes + host_guard + slot_offset, expected_pair.data(),
+                        rank_bytes) != 0 ||
+            !std::equal(expected_pair.begin(), expected_pair.end(),
+                        actual_stage.begin() + static_cast<std::ptrdiff_t>(slot_offset))) {
+            std::cerr << "Qwen4 sparse MoE rank-pipeline bytes changed\n";
             ++failures;
         }
+        if (!std::all_of(pinned_bytes + host_guard + slot_offset + rank_bytes,
+                         pinned_bytes + host_guard + slot_offset +
+                             ops::kQwen4SparseMoeRankStageCapacityBytes,
+                         [](std::uint8_t value) { return value == 0xa5; }) ||
+            !std::all_of(actual_stage.begin() +
+                             static_cast<std::ptrdiff_t>(slot_offset + rank_bytes),
+                         actual_stage.begin() + static_cast<std::ptrdiff_t>(
+                             slot_offset + ops::kQwen4SparseMoeRankStageCapacityBytes),
+                         [](std::uint8_t value) { return value == 0xcd; })) {
+            std::cerr << "Qwen4 sparse MoE copied beyond one rank slot\n";
+            ++failures;
+        }
+    }
+    if (!std::all_of(pinned_bytes, pinned_bytes + host_guard,
+                     [](std::uint8_t value) { return value == 0xa5; }) ||
+        !std::all_of(pinned_bytes + host_guard + ops::kQwen4SparseMoePipelineStageBytes,
+                     pinned_bytes + pinned.size(),
+                     [](std::uint8_t value) { return value == 0xa5; })) {
+        std::cerr << "Qwen4 sparse MoE pinned stage guard mismatch\n";
+        ++failures;
     }
 
     failures += device_stage.verify_guards("Qwen4 sparse MoE device stage");
     failures += device_ids.verify_guards("Qwen4 sparse MoE selected ids");
     failures += device_route_weights.verify_guards("Qwen4 sparse MoE selected weights");
     failures += device_destination.verify_guards("Qwen4 sparse MoE destination");
+    failures += next_device_ids.verify_guards("Qwen4 sparse MoE back-to-back selected ids");
+    failures += next_device_route_weights.verify_guards(
+        "Qwen4 sparse MoE back-to-back selected weights");
+    failures += next_device_destination.verify_guards(
+        "Qwen4 sparse MoE back-to-back destination");
+    failures += resident_device_ids.verify_guards("Qwen4 resident sparse MoE selected ids");
+    failures += resident_device_route_weights.verify_guards(
+        "Qwen4 resident sparse MoE selected weights");
+    failures += resident_device_destination.verify_guards(
+        "Qwen4 resident sparse MoE destination");
+    failures += next_resident_device_ids.verify_guards(
+        "Qwen4 resident sparse MoE back-to-back selected ids");
+    failures += next_resident_device_route_weights.verify_guards(
+        "Qwen4 resident sparse MoE back-to-back selected weights");
+    failures += next_resident_device_destination.verify_guards(
+        "Qwen4 resident sparse MoE back-to-back destination");
 
     auto invalid_bank = weights;
     invalid_bank.routed_gate_up.gate = invalid_bank.routed_gate_up.gate.first(
         invalid_bank.routed_gate_up.gate.size() - 1);
     failures += expect_invalid(
         [&] {
-            ops::qwen4_sparse_moe(x, invalid_bank, pinned_stage,
-                                  ops::kQwen4SparseMoeStageBytes, stage, ids, route_weights,
-                                  destination, workspace, stream);
+            ops::qwen4_sparse_moe(x, invalid_bank, pipeline, ids, route_weights, destination,
+                                  workspace, stream);
         },
         "short mapped routed bank");
+    auto short_pinned_pipeline = pipeline;
+    --short_pinned_pipeline.pinned_stage_bytes;
     failures += expect_invalid(
         [&] {
-            ops::qwen4_sparse_moe(x, weights, pinned_stage,
-                                  ops::kQwen4SparseMoeStageBytes - 1, stage, ids, route_weights,
+            ops::qwen4_sparse_moe(x, weights, short_pinned_pipeline, ids, route_weights,
                                   destination, workspace, stream);
         },
         "short pinned stage");
     Tensor aliased_destination = x;
     failures += expect_invalid(
         [&] {
-            ops::qwen4_sparse_moe(x, weights, pinned_stage,
-                                  ops::kQwen4SparseMoeStageBytes, stage, ids, route_weights,
+            ops::qwen4_sparse_moe(x, weights, pipeline, ids, route_weights,
                                   aliased_destination, workspace, stream);
         },
         "aliased destination");
@@ -662,26 +943,52 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
         shared_qtype == QType::GGML_Q5_K ? QType::GGML_Q6_K : QType::GGML_Q5_K;
     failures += expect_invalid(
         [&] {
-            ops::qwen4_sparse_moe(x, mismatched_shared, pinned_stage,
-                                  ops::kQwen4SparseMoeStageBytes, stage, ids, route_weights,
+            ops::qwen4_sparse_moe(x, mismatched_shared, pipeline, ids, route_weights,
                                   destination, workspace, stream);
         },
         "mismatched shared gate/up formats");
-    Tensor short_stage(device_stage.data(), DType::U8,
-                       {static_cast<std::int32_t>(ops::kQwen4SparseMoeStageBytes - 1)});
+    auto short_resident_bank = resident_weights;
+    --short_resident_bank.routed_gate.payload_bytes;
     failures += expect_invalid(
         [&] {
-            ops::qwen4_sparse_moe(x, weights, pinned_stage,
-                                  ops::kQwen4SparseMoeStageBytes, short_stage, ids, route_weights,
+            ops::qwen4_sparse_moe_resident(
+                x, short_resident_bank, resident_ids, resident_route_weights,
+                resident_destination, workspace, stream);
+        },
+        "short resident routed bank");
+    auto mismatched_resident = resident_weights;
+    mismatched_resident.routed_up.qtype =
+        routed_qtype == QType::GGML_IQ1_S ? QType::GGML_IQ2_XXS : QType::GGML_IQ1_S;
+    failures += expect_invalid(
+        [&] {
+            ops::qwen4_sparse_moe_resident(
+                x, mismatched_resident, resident_ids, resident_route_weights,
+                resident_destination, workspace, stream);
+        },
+        "mismatched resident routed formats");
+    Tensor short_stage(device_stage.data(), DType::U8,
+                       {static_cast<std::int32_t>(ops::kQwen4SparseMoePipelineStageBytes - 1)});
+    auto short_device_pipeline = pipeline;
+    short_device_pipeline.device_stage = short_stage;
+    failures += expect_invalid(
+        [&] {
+            ops::qwen4_sparse_moe(x, weights, short_device_pipeline, ids, route_weights,
                                   destination, workspace, stream);
         },
         "short device stage");
+    auto same_stream_pipeline = pipeline;
+    same_stream_pipeline.transfer_stream = stream;
+    failures += expect_invalid(
+        [&] {
+            ops::qwen4_sparse_moe(x, weights, same_stream_pipeline, ids, route_weights,
+                                  destination, workspace, stream);
+        },
+        "same compute and transfer stream");
     DeviceArena short_workspace(ops::qwen4_sparse_moe_workspace_capacity_bytes() - 1);
     failures += expect_invalid(
         [&] {
-            ops::qwen4_sparse_moe(x, weights, pinned_stage,
-                                  ops::kQwen4SparseMoeStageBytes, stage, ids, route_weights,
-                                  destination, short_workspace, stream);
+            ops::qwen4_sparse_moe(x, weights, pipeline, ids, route_weights, destination,
+                                  short_workspace, stream);
         },
         "short workspace");
     return failures;
@@ -692,22 +999,24 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
 int main() {
     try {
         if (const int unavailable = require_cuda(); unavailable != 0) { return unavailable; }
-        if (ops::qwen4_sparse_moe_selected_stage_bytes(QType::GGML_IQ1_S) != 6'400'000 ||
-            ops::qwen4_sparse_moe_selected_stage_bytes(QType::GGML_IQ2_XXS) !=
-                ops::kQwen4SparseMoeStageBytes) {
+        if (ops::qwen4_sparse_moe_rank_stage_bytes(QType::GGML_IQ1_S) != 640'000 ||
+            ops::qwen4_sparse_moe_rank_stage_bytes(QType::GGML_IQ2_XXS) != 844'800) {
             throw std::runtime_error("Qwen4 sparse MoE stage-capacity proof is wrong");
         }
         int failures = expect_invalid(
-            [] { (void)ops::qwen4_sparse_moe_selected_stage_bytes(QType::GGML_Q5_K); },
+            [] { (void)ops::qwen4_sparse_moe_rank_stage_bytes(QType::GGML_Q5_K); },
             "unsupported staged format");
         cudaStream_t stream = nullptr;
         cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
+        PipelineEvents pipeline_events;
         failures += run_case(QType::GGML_IQ1_S, QType::GGML_Q5_K,
-                             RouteFixture::AllZero, 80.0F, stream);
+                             RouteFixture::AllZero, 80.0F, pipeline_events, stream);
         failures += run_case(QType::GGML_IQ2_XXS, QType::GGML_Q6_K,
-                             RouteFixture::Nonuniform, -80.0F, stream);
+                             RouteFixture::Nonuniform, -80.0F, pipeline_events, stream);
         failures += run_case(QType::GGML_IQ1_S, QType::GGML_Q5_K,
-                             RouteFixture::Underflow, 0.0F, stream);
+                             RouteFixture::Underflow, 0.0F, pipeline_events, stream);
+        cuda_check(cudaStreamSynchronize(pipeline_events.transfer_stream),
+                   "cudaStreamSynchronize transfer");
         cuda_check(cudaStreamDestroy(stream), "cudaStreamDestroy");
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

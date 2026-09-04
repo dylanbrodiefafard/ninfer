@@ -81,6 +81,98 @@ and `-r 1`, synchronizes after warmup, and brackets only the measured repetition
 `cudaProfilerStart/Stop`. Use it with an Nsight Systems `cudaProfilerApi` capture range so artifact
 load, graph construction, and warmup do not enter topology counts.
 
+## Qwen4 architecture-verifier benchmark
+
+`ninfer_qwen4_sparse_moe_resident_bench` is the exact H2560/E512/top10/I640 public-Op
+placement A/B. It uses complete IQ1_S or IQ2_XXS gate/up banks and the IQ4_NL down bank in both
+profiles. `staged` gathers the selected gate/up bytes from ordinary host storage through the live
+two-slot pipeline; `resident` dynamically indexes complete device banks from GPU route ids and
+performs no copy or host synchronization inside the Op. The resident route uses fused all-rank
+routed grids and fused shared projections while preserving the Op's represented BF16 seams and
+rank-ordered FP32 accumulation. `fixed_hot` repeatedly selects one expert window, while `rotating`
+cycles 52 windows covering all 512 experts so selected bank bytes do not remain an L2-only working
+set.
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNINFER_BUILD_BENCHMARKS=ON
+cmake --build build --parallel --target ninfer_qwen4_sparse_moe_resident_bench
+./build/bench/ninfer_qwen4_sparse_moe_resident_bench --iterations 104
+```
+
+The benchmark reports synchronous host wall time and the compute-stream critical path per public
+Op call. Its synthetic blocks have finite scales and exercise the exact production decoders; the
+independent complete FP64 formula remains owned by `ninfer_qwen4_sparse_moe_test`. This is a
+one-layer placement experiment, not evidence that all 48 preview expert banks fit the RTX 5090.
+
+`ninfer_qwen4_verifier_bench` measures the unregistered C=1 eager Text Program over an explicitly
+named Qwen4 verification artifact. It is not an Engine, CLI, serving, CUDA Graph, or product
+benchmark. QSA KV is intrinsically NVFP4-G16 and has no runtime selector. The harness never searches
+for, downloads, or substitutes an artifact.
+
+Artifact loading and Program allocation are reported separately. Every warmup and measured
+repetition starts with a full continuation reset; reset time is excluded from token time. At least
+one complete sequence is required for warmup so the measured sequence excludes first execution,
+mapped-page, and module-loading effects. Measured `execute_token` calls are synchronous and their
+wall time therefore includes GPU work, selected-expert host addressing and copies, and dependency
+waits. It constructs the Program with GR diagnostic snapshots disabled, so none are produced or
+returned, and performs no result D2H snapshot.
+
+The default sequence is the frozen four-token integration fixture. Numeric inputs and teacher-forced
+targets may be overridden with equal-length comma-separated lists up to the 4096-token verifier
+ceiling:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNINFER_BUILD_BENCHMARKS=ON
+cmake --build build --parallel --target ninfer_qwen4_verifier_bench
+./build/bench/ninfer_qwen4_verifier_bench \
+  --weights /path/to/qwen4_ud_iq1_s_verify.ninfer \
+  --warmup 1 --repetitions 3
+```
+
+`--profile` requires `--repetitions 1` and brackets only the measured sequence with
+`cudaProfilerStart/Stop`. Target-side NVTX ranges identify each token, layer, QSA mixer, and sparse
+MoE call; their payloads carry the token frontier or zero-based layer. A clean Nsight Systems capture
+is:
+
+```bash
+nsys profile --trace=cuda,nvtx,osrt --sample=process-tree \
+  --capture-range=cudaProfilerApi --capture-range-end=stop \
+  --output profiles/nsys/qwen4_verifier_warm \
+  ./build/bench/ninfer_qwen4_verifier_bench \
+  --weights /path/to/qwen4_ud_iq1_s_verify.ninfer \
+  --warmup 1 --repetitions 1 --profile
+```
+
+Record the explicit artifact, GPU/toolchain, token sequence, wall-time summary, H2D sizes, host page
+fault/copy attribution, synchronization gaps, and kernel totals when using a trace as optimization
+evidence. Short-prefix traces do not qualify the 2048/4096 QSA regimes.
+
+## Qwen4 QSA Op benchmark
+
+`ninfer_qsa_bench` measures the public C=1 QSA selector and NVFP4-G16 selected-attention
+entries at default frontiers 4, 2048, and 4096. A single frontier, including the 2051-entry
+selected-capacity boundary, can be isolated for profiling with `--frontier N`; setup and state
+initialization are outside both timed regions.
+
+```bash
+cmake --build build --parallel --target ninfer_qsa_bench
+./build/bench/ninfer_qsa_bench --frontier 4096
+./build/bench/ninfer_qsa_bench --frontier 2051
+```
+
+## Qwen4 gated-residual Op benchmark
+
+`ninfer_gated_residual_bench` separately measures the public read and read/write entries at the
+only admitted preview geometry: C=1, H=2560, four residual branches, rank 320, Q8_0 down/up
+matrices, and FP32 norm/write weights. Device inputs and workspace stay resident and repeated warm
+launches are batched behind CUDA events. Select one entry with `--operation read` or
+`--operation read-write` when attributing its production kernels in a profiler.
+
+```bash
+cmake --build build --parallel --target ninfer_gated_residual_bench
+./build/bench/ninfer_gated_residual_bench --warmup 50 --repeat 200 --min-ms 1000
+```
+
 ## Linear Op benchmark
 
 `ninfer_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,

@@ -129,6 +129,7 @@ struct Scratch {
     Tensor up;
     Tensor activated;
     Tensor expert;
+    Tensor shared;
     Tensor routed;
     Tensor shared_gate_value;
 };
@@ -141,15 +142,40 @@ Scratch allocate_scratch(Allocator& allocator) {
         allocator.alloc(DType::BF16, {kQwen4SparseMoeIntermediate}),
         allocator.alloc(DType::BF16, {kQwen4SparseMoeIntermediate}),
         allocator.alloc(DType::BF16, {kQwen4SparseMoeHidden}),
+        allocator.alloc(DType::BF16, {kQwen4SparseMoeHidden}),
         allocator.alloc(DType::FP32, {kQwen4SparseMoeHidden}),
         allocator.alloc(DType::FP32, {1}),
     };
 }
 
+struct ResidentScratch {
+    Tensor logits;
+    Tensor shared_activated;
+    Tensor shared;
+    Tensor shared_gate_value;
+    Tensor routed_activated;
+};
+
+template <class Allocator>
+ResidentScratch allocate_resident_scratch(Allocator& allocator) {
+    return {
+        allocator.alloc(DType::FP32, {kQwen4SparseMoeExperts}),
+        allocator.alloc(DType::BF16, {kQwen4SparseMoeIntermediate}),
+        allocator.alloc(DType::BF16, {kQwen4SparseMoeHidden}),
+        allocator.alloc(DType::FP32, {1}),
+        allocator.alloc(DType::BF16,
+                        {kQwen4SparseMoeTopK * kQwen4SparseMoeIntermediate}),
+    };
+}
+
 std::size_t required_workspace() {
-    WorkspaceLayoutBuilder layout;
-    (void)allocate_scratch(layout);
-    return layout.peak_bytes();
+    WorkspaceLayoutBuilder staged_layout;
+    (void)allocate_scratch(staged_layout);
+    WorkspaceLayoutBuilder resident_layout;
+    (void)allocate_resident_scratch(resident_layout);
+    return staged_layout.peak_bytes() > resident_layout.peak_bytes()
+               ? staged_layout.peak_bytes()
+               : resident_layout.peak_bytes();
 }
 
 Weight matrix_view(const void* data, QType qtype, std::int32_t rows, std::int32_t columns) {
@@ -206,25 +232,26 @@ void require_disjoint(const std::vector<AddressRange>& ranges) {
 
 } // namespace
 
-std::size_t qwen4_sparse_moe_selected_stage_bytes(QType routed_qtype) {
+std::size_t qwen4_sparse_moe_rank_stage_bytes(QType routed_qtype) {
     if (routed_qtype != QType::GGML_IQ1_S && routed_qtype != QType::GGML_IQ2_XXS) {
         throw std::invalid_argument(
-            "qwen4_sparse_moe_selected_stage_bytes: unsupported routed format");
+            "qwen4_sparse_moe_rank_stage_bytes: unsupported routed format");
     }
-    return static_cast<std::size_t>(2 * kQwen4SparseMoeTopK) *
+    return 2U *
            matrix_bytes(routed_qtype, kQwen4SparseMoeIntermediate, kQwen4SparseMoeHidden);
 }
 
 std::size_t qwen4_sparse_moe_workspace_capacity_bytes() { return required_workspace(); }
 
 void qwen4_sparse_moe(const Tensor& x, const Qwen4SparseMoeWeights& weights,
-                      void* pinned_stage, std::size_t pinned_stage_bytes, Tensor& device_stage,
+                      Qwen4SparseMoePipeline& pipeline,
                       Tensor& selected_ids, Tensor& selected_weights, Tensor& destination,
                       WorkspaceArena& workspace, cudaStream_t stream) {
     require_tensor(x, DType::BF16, kQwen4SparseMoeHidden, "x");
     require_tensor(weights.shared_gate, DType::FP32, kQwen4SparseMoeHidden, "shared_gate");
-    require_tensor(device_stage, DType::U8, static_cast<std::int32_t>(kQwen4SparseMoeStageBytes),
-                   "device_stage");
+    require_tensor(pipeline.device_stage, DType::U8,
+                   static_cast<std::int32_t>(kQwen4SparseMoePipelineStageBytes),
+                   "pipeline device_stage");
     require_tensor(selected_ids, DType::I32, kQwen4SparseMoeTopK, "selected_ids");
     require_tensor(selected_weights, DType::FP32, kQwen4SparseMoeTopK, "selected_weights");
     require_tensor(destination, DType::BF16, kQwen4SparseMoeHidden, "destination");
@@ -244,11 +271,34 @@ void qwen4_sparse_moe(const Tensor& x, const Qwen4SparseMoeWeights& weights,
                         kQwen4SparseMoeIntermediate, kQwen4SparseMoeHidden, "shared_up");
     require_ggml_weight(weights.shared_down, QType::GGML_Q8_0, 1, kQwen4SparseMoeHidden,
                         kQwen4SparseMoeIntermediate, "shared_down");
-    if (pinned_stage_bytes != kQwen4SparseMoeStageBytes || pinned_stage == nullptr) {
-        throw std::invalid_argument("qwen4_sparse_moe: pinned stage has wrong capacity");
+    if (pipeline.pinned_stage_bytes != kQwen4SparseMoePipelineStageBytes ||
+        pipeline.pinned_stage == nullptr) {
+        throw std::invalid_argument("qwen4_sparse_moe: pipeline pinned stage has wrong capacity");
+    }
+    if (pipeline.transfer_stream == nullptr || pipeline.transfer_stream == stream) {
+        throw std::invalid_argument("qwen4_sparse_moe: transfer stream must be distinct");
+    }
+    std::array<cudaEvent_t, 2 + 2 * kQwen4SparseMoePipelineSlots> events{
+        pipeline.route_ready,
+        pipeline.ids_ready,
+        pipeline.transfer_ready[0],
+        pipeline.transfer_ready[1],
+        pipeline.consumer_complete[0],
+        pipeline.consumer_complete[1],
+    };
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        if (events[i] == nullptr) {
+            throw std::invalid_argument("qwen4_sparse_moe: pipeline event is null");
+        }
+        for (std::size_t j = 0; j < i; ++j) {
+            if (events[i] == events[j]) {
+                throw std::invalid_argument("qwen4_sparse_moe: pipeline events must be distinct");
+            }
+        }
     }
     cudaPointerAttributes attributes{};
-    const cudaError_t attribute_status = cudaPointerGetAttributes(&attributes, pinned_stage);
+    const cudaError_t attribute_status =
+        cudaPointerGetAttributes(&attributes, pipeline.pinned_stage);
     if (attribute_status != cudaSuccess || attributes.type != cudaMemoryTypeHost) {
         if (attribute_status != cudaSuccess) { (void)cudaGetLastError(); }
         throw std::invalid_argument("qwen4_sparse_moe: stage is not pinned host memory");
@@ -270,7 +320,7 @@ void qwen4_sparse_moe(const Tensor& x, const Qwen4SparseMoeWeights& weights,
         address_range(weights.shared_up.payload, weights.shared_up.payload_bytes, "shared_up"),
         address_range(weights.shared_down.payload, weights.shared_down.payload_bytes,
                       "shared_down"),
-        address_range(device_stage.data, device_stage.bytes(), "device_stage"),
+        address_range(pipeline.device_stage.data, pipeline.device_stage.bytes(), "device_stage"),
         address_range(selected_ids.data, selected_ids.bytes(), "selected_ids"),
         address_range(selected_weights.data, selected_weights.bytes(), "selected_weights"),
         address_range(destination.data, destination.bytes(), "destination"),
@@ -281,23 +331,44 @@ void qwen4_sparse_moe(const Tensor& x, const Qwen4SparseMoeWeights& weights,
                                     weights.routed_gate_up.gate.size(), "mapped_gate"),
                       address_range(weights.routed_gate_up.up.data(),
                                     weights.routed_gate_up.up.size(), "mapped_up"),
-                      address_range(pinned_stage, pinned_stage_bytes, "pinned_stage")});
+                      address_range(pipeline.pinned_stage, pipeline.pinned_stage_bytes,
+                                    "pinned_stage")});
 
     auto scope = workspace.scope();
     Scratch scratch = allocate_scratch(workspace);
     detail::qwen4_sparse_moe_route_launch(x, weights.router, scratch.logits, selected_ids,
                                           selected_weights, stream);
 
-    CUDA_CHECK(cudaMemcpyAsync(pinned_stage, selected_ids.data,
+    CUDA_CHECK(cudaEventRecord(pipeline.route_ready, stream));
+    CUDA_CHECK(cudaStreamWaitEvent(pipeline.transfer_stream, pipeline.route_ready, 0));
+    CUDA_CHECK(cudaMemcpyAsync(pipeline.pinned_stage, selected_ids.data,
                                kQwen4SparseMoeTopK * sizeof(std::int32_t),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+                               cudaMemcpyDeviceToHost, pipeline.transfer_stream));
+    CUDA_CHECK(cudaEventRecord(pipeline.ids_ready, pipeline.transfer_stream));
+
+    // This branch is independent of the selected routed experts. Queue it while the route ids
+    // cross to the host and preserve its result in dedicated scratch before routed scratch reuse.
+    detail::qwen4_sparse_moe_zero_routed_launch(scratch.routed, stream);
+    detail::qwen4_sparse_moe_shared_gate_launch(x, weights.shared_gate,
+                                                scratch.shared_gate_value, stream);
+    ggml_block_linear(x, weights.shared_gate_proj, scratch.gate, stream);
+    ggml_block_linear(x, weights.shared_up, scratch.up, stream);
+    detail::qwen4_sparse_moe_swiglu_launch(scratch.gate, scratch.up, scratch.activated, stream);
+    ggml_block_linear(scratch.activated, weights.shared_down, scratch.shared, stream);
+
+    CUDA_CHECK(cudaEventSynchronize(pipeline.ids_ready));
     std::array<std::int32_t, kQwen4SparseMoeTopK> host_ids{};
-    std::memcpy(host_ids.data(), pinned_stage, sizeof(host_ids));
+    std::memcpy(host_ids.data(), pipeline.pinned_stage, sizeof(host_ids));
 
     const std::size_t one_matrix = static_cast<std::size_t>(matrix_bytes(
         weights.routed_gate_up.qtype, kQwen4SparseMoeIntermediate, kQwen4SparseMoeHidden));
-    auto* stage_bytes = static_cast<std::byte*>(pinned_stage);
+    const std::size_t rank_bytes = qwen4_sparse_moe_rank_stage_bytes(
+        weights.routed_gate_up.qtype);
+    auto* pinned_bytes = static_cast<std::byte*>(pipeline.pinned_stage);
+    auto* device_bytes = static_cast<std::byte*>(pipeline.device_stage.data);
+    const auto* routed_down = static_cast<const std::byte*>(weights.routed_down.payload);
+    const std::size_t routed_down_matrix = static_cast<std::size_t>(matrix_bytes(
+        QType::GGML_IQ4_NL, kQwen4SparseMoeHidden, kQwen4SparseMoeIntermediate));
     for (std::int32_t rank = 0; rank < kQwen4SparseMoeTopK; ++rank) {
         const std::int32_t expert = host_ids[rank];
         if (expert < 0 || expert >= kQwen4SparseMoeExperts) {
@@ -308,32 +379,36 @@ void qwen4_sparse_moe(const Tensor& x, const Qwen4SparseMoeWeights& weights,
                 throw std::runtime_error("qwen4_sparse_moe: GPU route produced a duplicate id");
             }
         }
-        std::memcpy(stage_bytes + static_cast<std::size_t>(2 * rank) * one_matrix,
+        const std::int32_t slot = rank % kQwen4SparseMoePipelineSlots;
+        auto* pinned_slot = pinned_bytes + static_cast<std::size_t>(slot) *
+                                               kQwen4SparseMoeRankStageCapacityBytes;
+        auto* device_slot = device_bytes + static_cast<std::size_t>(slot) *
+                                               kQwen4SparseMoeRankStageCapacityBytes;
+        if (rank >= kQwen4SparseMoePipelineSlots) {
+            // transfer_ready protects the host slot from overwrite; consumer_complete protects
+            // the paired device slot. Neither wait changes routed rank order on compute stream.
+            CUDA_CHECK(cudaEventSynchronize(pipeline.transfer_ready[slot]));
+            CUDA_CHECK(cudaStreamWaitEvent(pipeline.transfer_stream,
+                                           pipeline.consumer_complete[slot], 0));
+        }
+        std::memcpy(pinned_slot,
                     weights.routed_gate_up.gate.data() +
                         static_cast<std::size_t>(expert) * one_matrix,
                     one_matrix);
-        std::memcpy(stage_bytes + static_cast<std::size_t>(2 * rank + 1) * one_matrix,
+        std::memcpy(pinned_slot + one_matrix,
                     weights.routed_gate_up.up.data() +
                         static_cast<std::size_t>(expert) * one_matrix,
                     one_matrix);
-    }
-    const std::size_t copied_bytes = qwen4_sparse_moe_selected_stage_bytes(
-        weights.routed_gate_up.qtype);
-    CUDA_CHECK(cudaMemcpyAsync(device_stage.data, pinned_stage, copied_bytes,
-                               cudaMemcpyHostToDevice, stream));
-
-    detail::qwen4_sparse_moe_zero_routed_launch(scratch.routed, stream);
-    const auto* device_bytes = static_cast<const std::byte*>(device_stage.data);
-    const auto* routed_down = static_cast<const std::byte*>(weights.routed_down.payload);
-    const std::size_t routed_down_matrix = static_cast<std::size_t>(matrix_bytes(
-        QType::GGML_IQ4_NL, kQwen4SparseMoeHidden, kQwen4SparseMoeIntermediate));
-    for (std::int32_t rank = 0; rank < kQwen4SparseMoeTopK; ++rank) {
+        CUDA_CHECK(cudaMemcpyAsync(device_slot, pinned_slot, rank_bytes,
+                                   cudaMemcpyHostToDevice, pipeline.transfer_stream));
+        CUDA_CHECK(cudaEventRecord(pipeline.transfer_ready[slot], pipeline.transfer_stream));
+        CUDA_CHECK(cudaStreamWaitEvent(stream, pipeline.transfer_ready[slot], 0));
         const Weight gate =
-            matrix_view(device_bytes + static_cast<std::size_t>(2 * rank) * one_matrix,
+            matrix_view(device_slot,
                         weights.routed_gate_up.qtype, kQwen4SparseMoeIntermediate,
                         kQwen4SparseMoeHidden);
         const Weight up =
-            matrix_view(device_bytes + static_cast<std::size_t>(2 * rank + 1) * one_matrix,
+            matrix_view(device_slot + one_matrix,
                         weights.routed_gate_up.qtype, kQwen4SparseMoeIntermediate,
                         kQwen4SparseMoeHidden);
         const Weight down = matrix_view(
@@ -346,16 +421,88 @@ void qwen4_sparse_moe(const Tensor& x, const Qwen4SparseMoeWeights& weights,
         ggml_block_linear(scratch.activated, down, scratch.expert, stream);
         detail::qwen4_sparse_moe_accumulate_launch(scratch.expert, selected_weights, rank,
                                                    scratch.routed, stream);
+        CUDA_CHECK(cudaEventRecord(pipeline.consumer_complete[slot], stream));
     }
 
-    detail::qwen4_sparse_moe_shared_gate_launch(x, weights.shared_gate,
-                                                scratch.shared_gate_value, stream);
-    ggml_block_linear(x, weights.shared_gate_proj, scratch.gate, stream);
-    ggml_block_linear(x, weights.shared_up, scratch.up, stream);
-    detail::qwen4_sparse_moe_swiglu_launch(scratch.gate, scratch.up, scratch.activated, stream);
-    ggml_block_linear(scratch.activated, weights.shared_down, scratch.expert, stream);
-    detail::qwen4_sparse_moe_finish_launch(scratch.routed, scratch.expert,
+    detail::qwen4_sparse_moe_finish_launch(scratch.routed, scratch.shared,
                                            scratch.shared_gate_value, destination, stream);
+}
+
+void qwen4_sparse_moe_resident(const Tensor& x,
+                               const Qwen4ResidentSparseMoeWeights& weights,
+                               Tensor& selected_ids, Tensor& selected_weights,
+                               Tensor& destination, WorkspaceArena& workspace,
+                               cudaStream_t stream) {
+    require_tensor(x, DType::BF16, kQwen4SparseMoeHidden, "x");
+    require_tensor(weights.shared_gate, DType::FP32, kQwen4SparseMoeHidden, "shared_gate");
+    require_tensor(selected_ids, DType::I32, kQwen4SparseMoeTopK, "selected_ids");
+    require_tensor(selected_weights, DType::FP32, kQwen4SparseMoeTopK, "selected_weights");
+    require_tensor(destination, DType::BF16, kQwen4SparseMoeHidden, "destination");
+    require_dense_router(weights.router);
+    const QType routed_qtype = weights.routed_gate.qtype;
+    if ((routed_qtype != QType::GGML_IQ1_S && routed_qtype != QType::GGML_IQ2_XXS) ||
+        weights.routed_up.qtype != routed_qtype) {
+        throw std::invalid_argument(
+            "qwen4_sparse_moe_resident: routed gate/up formats differ or are invalid");
+    }
+    require_ggml_weight(weights.routed_gate, routed_qtype, kQwen4SparseMoeExperts,
+                        kQwen4SparseMoeIntermediate, kQwen4SparseMoeHidden, "routed_gate");
+    require_ggml_weight(weights.routed_up, routed_qtype, kQwen4SparseMoeExperts,
+                        kQwen4SparseMoeIntermediate, kQwen4SparseMoeHidden, "routed_up");
+    require_ggml_weight(weights.routed_down, QType::GGML_IQ4_NL, kQwen4SparseMoeExperts,
+                        kQwen4SparseMoeHidden, kQwen4SparseMoeIntermediate, "routed_down");
+    if ((weights.shared_gate_proj.qtype != QType::GGML_Q5_K &&
+         weights.shared_gate_proj.qtype != QType::GGML_Q6_K) ||
+        weights.shared_up.qtype != weights.shared_gate_proj.qtype) {
+        throw std::invalid_argument(
+            "qwen4_sparse_moe_resident: shared gate/up formats differ or are invalid");
+    }
+    require_ggml_weight(weights.shared_gate_proj, weights.shared_gate_proj.qtype, 1,
+                        kQwen4SparseMoeIntermediate, kQwen4SparseMoeHidden,
+                        "shared_gate_proj");
+    require_ggml_weight(weights.shared_up, weights.shared_gate_proj.qtype, 1,
+                        kQwen4SparseMoeIntermediate, kQwen4SparseMoeHidden, "shared_up");
+    require_ggml_weight(weights.shared_down, QType::GGML_Q8_0, 1, kQwen4SparseMoeHidden,
+                        kQwen4SparseMoeIntermediate, "shared_down");
+    if (workspace.base() == nullptr || workspace.capacity() < required_workspace()) {
+        throw std::invalid_argument("qwen4_sparse_moe_resident: insufficient workspace");
+    }
+
+    require_disjoint({
+        address_range(x.data, x.bytes(), "x"),
+        address_range(weights.router.payload, weights.router.payload_bytes, "router"),
+        address_range(weights.routed_gate.payload, weights.routed_gate.payload_bytes,
+                      "routed_gate"),
+        address_range(weights.routed_up.payload, weights.routed_up.payload_bytes, "routed_up"),
+        address_range(weights.routed_down.payload, weights.routed_down.payload_bytes,
+                      "routed_down"),
+        address_range(weights.shared_gate.data, weights.shared_gate.bytes(), "shared_gate"),
+        address_range(weights.shared_gate_proj.payload, weights.shared_gate_proj.payload_bytes,
+                      "shared_gate_proj"),
+        address_range(weights.shared_up.payload, weights.shared_up.payload_bytes, "shared_up"),
+        address_range(weights.shared_down.payload, weights.shared_down.payload_bytes,
+                      "shared_down"),
+        address_range(selected_ids.data, selected_ids.bytes(), "selected_ids"),
+        address_range(selected_weights.data, selected_weights.bytes(), "selected_weights"),
+        address_range(destination.data, destination.bytes(), "destination"),
+        address_range(workspace.base(), workspace.capacity(), "workspace"),
+    });
+
+    auto scope = workspace.scope();
+    ResidentScratch scratch = allocate_resident_scratch(workspace);
+    detail::qwen4_sparse_moe_resident_route_launch(
+        x, weights.router, weights.shared_gate, scratch.logits, selected_ids,
+        selected_weights, scratch.shared_gate_value, stream);
+    detail::qwen4_sparse_moe_shared_gate_up_swiglu_launch(
+        x, weights.shared_gate_proj, weights.shared_up, scratch.shared_activated, stream);
+    ggml_block_linear(scratch.shared_activated, weights.shared_down, scratch.shared, stream);
+
+    detail::qwen4_sparse_moe_indexed_gate_up_swiglu_launch(
+        x, weights.routed_gate, weights.routed_up, selected_ids, scratch.routed_activated,
+        stream);
+    detail::qwen4_sparse_moe_indexed_down_finish_launch(
+        scratch.routed_activated, weights.routed_down, selected_ids, selected_weights,
+        scratch.shared, scratch.shared_gate_value, destination, stream);
 }
 
 } // namespace ninfer::ops

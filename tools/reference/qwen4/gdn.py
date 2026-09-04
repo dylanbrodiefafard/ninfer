@@ -1,11 +1,18 @@
-"""Complete Qwen4 Gated DeltaNet mathematical oracle.
+"""Qwen4 Gated DeltaNet mathematical oracles for both represented artifacts.
 
 Each closed-Op helper evaluates its direct formula in float64 from represented
-operands.  :func:`sublayer` additionally models the public representations that
-connect those Ops: BF16 projection/convolution, recurrence, and gated-norm
-outputs; FP32 controls; BF16 convolution history; and FP32 recurrent state.
+operands.  :func:`source_sublayer` and :func:`actual_gguf_sublayer` additionally
+model the public representations that connect those Ops: BF16 projection and
+convolution, recurrence, and gated-norm outputs; FP32 controls; BF16 convolution
+history; and FP32 recurrent state.
 Only the final output projection remains ideal, ready for comparison with its
 represented production output under that Op's numerical criterion.
+
+The pinned source checkpoint and converted GGUF do not expose the same operands:
+the source stores ``A_log`` and grouped Q/K-to-V head association, while the GGUF
+stores already-folded ``ssm_a=-exp(A_log)`` and tiled V-side order.  Their public
+entry points are deliberately distinct so an actual-artifact comparison cannot
+silently apply the source transform a second time.
 """
 
 from __future__ import annotations
@@ -35,8 +42,8 @@ class GDNState:
 
 
 @dataclass(frozen=True, slots=True)
-class GDNWeights:
-    """Represented weights for the separate QKV, Z, A, and B projections."""
+class SourceGDNWeights:
+    """Pinned source-checkpoint weights, including unfused ``A_log``."""
 
     qkv: torch.Tensor
     z: torch.Tensor
@@ -44,6 +51,21 @@ class GDNWeights:
     b: torch.Tensor
     conv: torch.Tensor
     a_log: torch.Tensor
+    dt_bias: torch.Tensor
+    norm: torch.Tensor
+    output: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class ActualGgufGDNWeights:
+    """Converted GGUF weights, including direct folded ``ssm_a``."""
+
+    qkv: torch.Tensor
+    z: torch.Tensor
+    a: torch.Tensor
+    b: torch.Tensor
+    conv: torch.Tensor
+    ssm_a: torch.Tensor
     dt_bias: torch.Tensor
     norm: torch.Tensor
     output: torch.Tensor
@@ -101,13 +123,13 @@ def causal_depthwise_convolution(
     return activated, next_history
 
 
-def control_gates(
+def source_control_gates(
     a: torch.Tensor,
     b: torch.Tensor,
     a_log: torch.Tensor,
     dt_bias: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return log-decay and delta learning rate from represented controls."""
+    """Return controls from source ``A_log`` (the fold occurs in this formula)."""
 
     if a.ndim != 2 or b.shape != a.shape:
         raise ValueError("A and B projections must have matching shape [T,value_heads]")
@@ -119,12 +141,37 @@ def control_gates(
     return log_decay, sigmoid(b)
 
 
-def repeat_key_value_heads(value: torch.Tensor, value_heads: int) -> torch.Tensor:
-    """Repeat each Q/K head contiguously to the value-head count."""
+def actual_gguf_control_gates(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    ssm_a: torch.Tensor,
+    dt_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return controls from converted GGUF ``ssm_a=-exp(A_log)`` directly."""
+
+    if a.ndim != 2 or b.shape != a.shape:
+        raise ValueError("A and B projections must have matching shape [T,value_heads]")
+    value_heads = a.shape[1]
+    if ssm_a.numel() != value_heads or dt_bias.numel() != value_heads:
+        raise ValueError("ssm_a and dt_bias must contain one value per value head")
+    shifted = as_f64(a) + as_f64(dt_bias).reshape(1, value_heads)
+    return as_f64(ssm_a).reshape(1, value_heads) * F.softplus(shifted), sigmoid(b)
+
+
+def repeat_grouped_query_key_heads(value: torch.Tensor, value_heads: int) -> torch.Tensor:
+    """Expand source Q/K heads contiguously into grouped V-head order."""
 
     if value.ndim != 3 or value_heads % value.shape[1]:
         raise ValueError("value-head count must be a multiple of the Q/K head count")
     return as_f64(value).repeat_interleave(value_heads // value.shape[1], dim=1)
+
+
+def tile_actual_gguf_query_key_heads(value: torch.Tensor, value_heads: int) -> torch.Tensor:
+    """Expand converted-GGUF Q/K heads so represented V head ``h`` uses ``h % Hq``."""
+
+    if value.ndim != 3 or value_heads % value.shape[1]:
+        raise ValueError("value-head count must be a multiple of Q/K head count")
+    return as_f64(value).repeat(1, value_heads // value.shape[1], 1)
 
 
 def _l2norm(value: torch.Tensor, eps: float) -> torch.Tensor:
@@ -206,24 +253,18 @@ def output_projection(
     return linear(represented.flatten(-2), output_weight)
 
 
-def sublayer(
+def _sublayer(
     hidden: torch.Tensor,
-    weights: GDNWeights,
+    weights: SourceGDNWeights | ActualGgufGDNWeights,
     initial_state: GDNState,
     *,
     key_heads: int,
     value_heads: int,
     key_width: int,
     value_width: int,
+    actual_gguf: bool,
     eps: float = 1e-6,
 ) -> GDNSublayerResult:
-    """Evaluate the complete logical GDN sublayer for one request.
-
-    The current Qwen4 preview uses ``key_heads=16``, ``value_heads=48``,
-    ``key_width=value_width=128``, and a width-four convolution.  Smaller
-    geometrically equivalent values make this oracle practical in unit tests.
-    """
-
     if hidden.ndim != 2 or hidden.shape[0] < 1:
         raise ValueError("hidden must have shape [T,hidden_width] with T >= 1")
     if min(key_heads, value_heads, key_width, value_width) < 1:
@@ -246,8 +287,10 @@ def sublayer(
             raise ValueError(f"{name} weight must have shape {expected}")
     if weights.output.ndim != 2 or weights.output.shape[1] != gate_width:
         raise ValueError(f"output weight must have shape [output_width,{gate_width}]")
-    if weights.a_log.numel() != value_heads or weights.dt_bias.numel() != value_heads:
-        raise ValueError("A_log and dt_bias must contain one value per value head")
+    decay_weight = weights.ssm_a if actual_gguf else weights.a_log
+    if decay_weight.numel() != value_heads or weights.dt_bias.numel() != value_heads:
+        name = "ssm_a" if actual_gguf else "A_log"
+        raise ValueError(f"{name} and dt_bias must contain one value per value head")
     if tuple(initial_state.conv_history.shape) != (qkv_width, 3):
         raise ValueError(f"convolution history must have shape [{qkv_width},3]")
     if initial_state.conv_history.dtype != torch.bfloat16:
@@ -268,7 +311,10 @@ def sublayer(
     z = linear(hidden, weights.z).to(torch.bfloat16).reshape(-1, value_heads, value_width)
     a = linear(hidden, weights.a)
     b = linear(hidden, weights.b)
-    log_decay, beta = control_gates(a, b, weights.a_log, weights.dt_bias)
+    if actual_gguf:
+        log_decay, beta = actual_gguf_control_gates(a, b, decay_weight, weights.dt_bias)
+    else:
+        log_decay, beta = source_control_gates(a, b, decay_weight, weights.dt_bias)
     # gdn_gating_proj publishes FP32 controls.
     log_decay = log_decay.to(torch.float32)
     beta = beta.to(torch.float32)
@@ -277,8 +323,11 @@ def sublayer(
     query = convolved_qkv[:, :key_span].reshape(-1, key_heads, key_width)
     key = convolved_qkv[:, key_span : 2 * key_span].reshape(-1, key_heads, key_width)
     value = convolved_qkv[:, 2 * key_span :].reshape(-1, value_heads, value_width)
-    repeated_query = repeat_key_value_heads(query, value_heads)
-    repeated_key = repeat_key_value_heads(key, value_heads)
+    expand_heads = (
+        tile_actual_gguf_query_key_heads if actual_gguf else repeat_grouped_query_key_heads
+    )
+    repeated_query = expand_heads(query, value_heads)
+    repeated_key = expand_heads(key, value_heads)
     core_result = recurrence(
         repeated_query,
         repeated_key,
@@ -303,15 +352,76 @@ def sublayer(
     )
 
 
+def source_sublayer(
+    hidden: torch.Tensor,
+    weights: SourceGDNWeights,
+    initial_state: GDNState,
+    *,
+    key_heads: int,
+    value_heads: int,
+    key_width: int,
+    value_width: int,
+    eps: float = 1e-6,
+) -> GDNSublayerResult:
+    """Evaluate the pinned source-checkpoint GDN formula for one request."""
+
+    return _sublayer(
+        hidden,
+        weights,
+        initial_state,
+        key_heads=key_heads,
+        value_heads=value_heads,
+        key_width=key_width,
+        value_width=value_width,
+        actual_gguf=False,
+        eps=eps,
+    )
+
+
+def actual_gguf_sublayer(
+    hidden: torch.Tensor,
+    weights: ActualGgufGDNWeights,
+    initial_state: GDNState,
+    *,
+    key_heads: int,
+    value_heads: int,
+    key_width: int,
+    value_width: int,
+    eps: float = 1e-6,
+) -> GDNSublayerResult:
+    """Evaluate converted-GGUF direct-decay/tiled-head semantics for one request.
+
+    The preview artifact uses ``key_heads=16``, ``value_heads=48`` and
+    ``key_width=value_width=128``.  ``weights.conv`` is the mathematical
+    ``[QKV,4]`` view after adapting the GGUF K-fastest bytes.
+    """
+
+    return _sublayer(
+        hidden,
+        weights,
+        initial_state,
+        key_heads=key_heads,
+        value_heads=value_heads,
+        key_width=key_width,
+        value_width=value_width,
+        actual_gguf=True,
+        eps=eps,
+    )
+
+
 __all__ = [
     "GDNResult",
     "GDNState",
     "GDNSublayerResult",
-    "GDNWeights",
+    "ActualGgufGDNWeights",
+    "SourceGDNWeights",
+    "actual_gguf_control_gates",
+    "actual_gguf_sublayer",
     "causal_depthwise_convolution",
-    "control_gates",
     "output_projection",
     "recurrence",
-    "repeat_key_value_heads",
-    "sublayer",
+    "repeat_grouped_query_key_heads",
+    "source_control_gates",
+    "source_sublayer",
+    "tile_actual_gguf_query_key_heads",
 ]

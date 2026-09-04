@@ -1,5 +1,7 @@
 #include "targets/qwen4/verifier.h"
 
+#include "targets/qwen4/profile_range.h"
+
 #include "core/device.h"
 #include "ninfer/ops/gated_residual.h"
 #include "ninfer/ops/ggml_block_linear.h"
@@ -81,13 +83,18 @@ private:
 
 } // namespace
 
-Program::Program(const LoadedModel& model, cudaStream_t stream)
-    : model_(model), stream_(stream), controls_(kControlBytes),
+Program::Program(const LoadedModel& model, DeviceContext& device,
+                 DiagnosticSnapshots diagnostic_snapshots)
+    : model_(model), stream_(device.stream), transfer_stream_(device.copy_stream),
+      controls_(kControlBytes),
       ngram_rows_(ops::kPleHeads * sizeof(std::int32_t)),
       ple_embedding_(ops::kPleEmbeddingWidth * sizeof(std::uint16_t)),
       final_hidden_(kHidden * sizeof(std::uint16_t)),
       logits_(static_cast<std::size_t>(kVocabulary) * sizeof(std::uint16_t)),
-      nll_(sizeof(float)), gr_trace_(2 * kLayerCount * kResidualBytes),
+      nll_(sizeof(float)),
+      gr_trace_(diagnostic_snapshots == DiagnosticSnapshots::Enabled
+                    ? 2 * kLayerCount * kResidualBytes
+                    : 0),
       qsa_selected_ids_(kQsaLayerCount * kQsaIdsPerLayerBytes),
       qsa_selected_counts_(kQsaLayerCount * sizeof(std::int32_t)),
       router_ids_(kLayerCount * kRouterStride),
@@ -99,36 +106,84 @@ Program::Program(const LoadedModel& model, cudaStream_t stream)
           .ple_layer_index = 0,
           .seed = 1234,
           .vocab_base = 20'000'000,
-      })) {
+      })),
+      diagnostic_snapshots_(diagnostic_snapshots) {
     validate_topology(model_.view());
-    std::size_t qsa = 0;
-    for (std::size_t layer = 0; layer < kLayerCount; ++layer) {
-        if (model_.view().layers[layer].qsa) {
-            qsa_diagnostics_[qsa] = {
-                .layer = layer,
-                .selected_ids = tensor_at(qsa_selected_ids_, qsa * kQsaIdsPerLayerBytes,
-                                          DType::I32, {ops::kQsaSelectedCapacity}),
-                .selected_count = tensor_at(qsa_selected_counts_, qsa * sizeof(std::int32_t),
-                                            DType::I32, {1}),
-            };
-            ++qsa;
+    try {
+        CUDA_CHECK(cudaEventCreateWithFlags(&moe_route_ready_, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(
+            &moe_ids_ready_, cudaEventDisableTiming | cudaEventBlockingSync));
+        for (std::size_t slot = 0; slot < ops::kQwen4SparseMoePipelineSlots; ++slot) {
+            CUDA_CHECK(cudaEventCreateWithFlags(
+                &moe_transfer_ready_[slot], cudaEventDisableTiming | cudaEventBlockingSync));
+            CUDA_CHECK(cudaEventCreateWithFlags(&moe_consumer_complete_[slot],
+                                                cudaEventDisableTiming));
         }
-        router_diagnostics_[layer] = {
-            .layer = layer,
-            .selected_ids = tensor_at(router_ids_, layer * kRouterStride, DType::I32,
-                                      {ops::kQwen4SparseMoeTopK}),
-            .selected_weights = tensor_at(router_weights_, layer * kRouterStride, DType::FP32,
+        std::size_t qsa = 0;
+        for (std::size_t layer = 0; layer < kLayerCount; ++layer) {
+            if (model_.view().layers[layer].qsa) {
+                qsa_diagnostics_[qsa] = {
+                    .layer = layer,
+                    .selected_ids = tensor_at(qsa_selected_ids_, qsa * kQsaIdsPerLayerBytes,
+                                              DType::I32, {ops::kQsaSelectedCapacity}),
+                    .selected_count = tensor_at(qsa_selected_counts_,
+                                                qsa * sizeof(std::int32_t), DType::I32, {1}),
+                };
+                ++qsa;
+            }
+            router_diagnostics_[layer] = {
+                .layer = layer,
+                .selected_ids = tensor_at(router_ids_, layer * kRouterStride, DType::I32,
                                           {ops::kQwen4SparseMoeTopK}),
-        };
-        gr_diagnostics_[layer] = {
-            .layer = layer,
-            .attention_residual = tensor_at(gr_trace_, (2 * layer) * kResidualBytes,
-                                            DType::BF16, {kHidden, kBranches}),
-            .ffn_residual = tensor_at(gr_trace_, (2 * layer + 1) * kResidualBytes,
-                                      DType::BF16, {kHidden, kBranches}),
-        };
+                .selected_weights = tensor_at(router_weights_, layer * kRouterStride,
+                                              DType::FP32, {ops::kQwen4SparseMoeTopK}),
+            };
+            if (diagnostic_snapshots_ == DiagnosticSnapshots::Enabled) {
+                gr_diagnostics_[layer] = {
+                    .layer = layer,
+                    .attention_residual = tensor_at(gr_trace_, (2 * layer) * kResidualBytes,
+                                                    DType::BF16, {kHidden, kBranches}),
+                    .ffn_residual = tensor_at(gr_trace_, (2 * layer + 1) * kResidualBytes,
+                                              DType::BF16, {kHidden, kBranches}),
+                };
+            }
+        }
+        if (qsa != kQsaLayerCount) {
+            throw std::logic_error("Qwen4 Program QSA count changed");
+        }
+    } catch (...) {
+        destroy_pipeline_events();
+        throw;
     }
-    if (qsa != kQsaLayerCount) { throw std::logic_error("Qwen4 Program QSA count changed"); }
+}
+
+Program::~Program() {
+    if (stream_ != nullptr) { (void)cudaStreamSynchronize(stream_); }
+    if (transfer_stream_ != nullptr) { (void)cudaStreamSynchronize(transfer_stream_); }
+    destroy_pipeline_events();
+}
+
+void Program::destroy_pipeline_events() noexcept {
+    for (cudaEvent_t& event : moe_consumer_complete_) {
+        if (event != nullptr) {
+            (void)cudaEventDestroy(event);
+            event = nullptr;
+        }
+    }
+    for (cudaEvent_t& event : moe_transfer_ready_) {
+        if (event != nullptr) {
+            (void)cudaEventDestroy(event);
+            event = nullptr;
+        }
+    }
+    if (moe_ids_ready_ != nullptr) {
+        (void)cudaEventDestroy(moe_ids_ready_);
+        moe_ids_ready_ = nullptr;
+    }
+    if (moe_route_ready_ != nullptr) {
+        (void)cudaEventDestroy(moe_route_ready_);
+        moe_route_ready_ = nullptr;
+    }
 }
 
 void Program::reset() {
@@ -140,7 +195,9 @@ void Program::reset() {
     CUDA_CHECK(cudaMemsetAsync(final_hidden_.p, 0, final_hidden_.bytes, stream_));
     CUDA_CHECK(cudaMemsetAsync(logits_.p, 0, logits_.bytes, stream_));
     CUDA_CHECK(cudaMemsetAsync(nll_.p, 0, nll_.bytes, stream_));
-    CUDA_CHECK(cudaMemsetAsync(gr_trace_.p, 0, gr_trace_.bytes, stream_));
+    if (gr_trace_.bytes != 0) {
+        CUDA_CHECK(cudaMemsetAsync(gr_trace_.p, 0, gr_trace_.bytes, stream_));
+    }
     CUDA_CHECK(cudaMemsetAsync(qsa_selected_ids_.p, 0xff, qsa_selected_ids_.bytes, stream_));
     CUDA_CHECK(cudaMemsetAsync(qsa_selected_counts_.p, 0, qsa_selected_counts_.bytes, stream_));
     CUDA_CHECK(cudaMemsetAsync(router_ids_.p, 0xff, router_ids_.bytes, stream_));
@@ -163,6 +220,8 @@ TokenResultView Program::execute_token(std::int32_t token_id, std::int32_t targe
 
     TokenExecutionGuard execution_guard(reset_);
     const std::int32_t current = frontier_;
+    profile::ScopedRange token_range(profile::Phase::Token,
+                                     static_cast<std::uint64_t>(current));
     auto* host = static_cast<std::byte*>(host_controls_.data());
     std::memcpy(host + kTokenOffset, &token_id, sizeof(token_id));
     const std::int32_t valid = 1;
@@ -206,6 +265,8 @@ TokenResultView Program::execute_token(std::int32_t token_id, std::int32_t targe
     state_.embed_token(model_.view().token_embedding, token_id, stream_);
     std::size_t qsa_index = 0;
     for (std::size_t layer = 0; layer < kLayerCount; ++layer) {
+        profile::ScopedRange layer_range(profile::Phase::Layer,
+                                         static_cast<std::uint64_t>(layer));
         if (layer == 1) {
             Tensor ple_device_rows = state_.ple_device_rows();
             ops::ple_iq4_nl_decode_rows(ple_device_rows, ple_embedding, stream_);
@@ -242,6 +303,8 @@ TokenResultView Program::execute_token(std::int32_t token_id, std::int32_t targe
             if (qsa_index >= kQsaLayerCount || !state_.qsa()[layer]) {
                 throw std::logic_error("Qwen4 Program QSA schedule changed after validation");
             }
+            profile::ScopedRange qsa_range(profile::Phase::Qsa,
+                                           static_cast<std::uint64_t>(layer));
             Tensor qsa_workspace(state_.workspace().base(), DType::U8,
                                  {static_cast<std::int32_t>(ops::qsa_verifier_workspace_bytes())});
             ops::qsa_verifier_token(
@@ -260,8 +323,11 @@ TokenResultView Program::execute_token(std::int32_t token_id, std::int32_t targe
                                        ple_device_rows, stream_);
         }
         ops::gated_residual_inject(residual, block, write_scale, residual, stream_);
-        CUDA_CHECK(cudaMemcpyAsync(gr_diagnostics_[layer].attention_residual.data, residual.data,
-                                   kResidualBytes, cudaMemcpyDeviceToDevice, stream_));
+        if (diagnostic_snapshots_ == DiagnosticSnapshots::Enabled) {
+            CUDA_CHECK(cudaMemcpyAsync(gr_diagnostics_[layer].attention_residual.data,
+                                       residual.data, kResidualBytes, cudaMemcpyDeviceToDevice,
+                                       stream_));
+        }
 
         {
             WorkspaceArena workspace = state_.workspace();
@@ -270,16 +336,28 @@ TokenResultView Program::execute_token(std::int32_t token_id, std::int32_t targe
                                            write_scale, workspace, stream_);
         }
         {
+            profile::ScopedRange moe_range(profile::Phase::SparseMoe,
+                                           static_cast<std::uint64_t>(layer));
             WorkspaceArena workspace = state_.workspace();
-            Tensor expert_device_stage = state_.expert_device_stage();
+            ops::Qwen4SparseMoePipeline pipeline{
+                .pinned_stage = state_.expert_host_stage(),
+                .pinned_stage_bytes = state_.expert_host_stage_bytes(),
+                .device_stage = state_.expert_device_stage(),
+                .transfer_stream = transfer_stream_,
+                .route_ready = moe_route_ready_,
+                .ids_ready = moe_ids_ready_,
+                .transfer_ready = {moe_transfer_ready_[0], moe_transfer_ready_[1]},
+                .consumer_complete = {moe_consumer_complete_[0], moe_consumer_complete_[1]},
+            };
             ops::qwen4_sparse_moe(
-                mixed, weights.moe, state_.expert_host_stage(), state_.expert_host_stage_bytes(),
-                expert_device_stage, router_diagnostics_[layer].selected_ids,
+                mixed, weights.moe, pipeline, router_diagnostics_[layer].selected_ids,
                 router_diagnostics_[layer].selected_weights, block, workspace, stream_);
         }
         ops::gated_residual_inject(residual, block, write_scale, residual, stream_);
-        CUDA_CHECK(cudaMemcpyAsync(gr_diagnostics_[layer].ffn_residual.data, residual.data,
-                                   kResidualBytes, cudaMemcpyDeviceToDevice, stream_));
+        if (diagnostic_snapshots_ == DiagnosticSnapshots::Enabled) {
+            CUDA_CHECK(cudaMemcpyAsync(gr_diagnostics_[layer].ffn_residual.data, residual.data,
+                                       kResidualBytes, cudaMemcpyDeviceToDevice, stream_));
+        }
     }
     if (qsa_index != kQsaLayerCount) {
         throw std::logic_error("Qwen4 Program did not execute all QSA layers");
@@ -297,6 +375,10 @@ TokenResultView Program::execute_token(std::int32_t token_id, std::int32_t targe
     frontier_ = current + 1;
     execution_guard.complete();
 
+    const std::span<const GrDiagnosticView> gr =
+        diagnostic_snapshots_ == DiagnosticSnapshots::Enabled
+            ? std::span<const GrDiagnosticView>(gr_diagnostics_)
+            : std::span<const GrDiagnosticView>();
     return {
         .token_index = current,
         .logits = logits,
@@ -305,7 +387,7 @@ TokenResultView Program::execute_token(std::int32_t token_id, std::int32_t targe
         .ple_row_ids = row_ids.reshape({ops::kPleHeads}),
         .qsa = qsa_diagnostics_,
         .routers = router_diagnostics_,
-        .gr = gr_diagnostics_,
+        .gr = gr,
     };
 }
 

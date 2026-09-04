@@ -8,6 +8,24 @@ void qwen4_sparse_moe_route_launch(const Tensor& x, const Weight& router, Tensor
                                    Tensor& selected_ids, Tensor& selected_weights,
                                    cudaStream_t stream);
 
+void qwen4_sparse_moe_resident_route_launch(
+    const Tensor& x, const Weight& router, const Tensor& shared_gate, Tensor& logits,
+    Tensor& selected_ids, Tensor& selected_weights, Tensor& shared_gate_value,
+    cudaStream_t stream);
+
+void qwen4_sparse_moe_shared_gate_up_swiglu_launch(
+    const Tensor& x, const Weight& gate, const Weight& up, Tensor& activated,
+    cudaStream_t stream);
+
+void qwen4_sparse_moe_indexed_gate_up_swiglu_launch(
+    const Tensor& x, const Weight& gate_bank, const Weight& up_bank,
+    const Tensor& selected_ids, Tensor& activated, cudaStream_t stream);
+
+void qwen4_sparse_moe_indexed_down_finish_launch(
+    const Tensor& activated, const Weight& expert_bank, const Tensor& selected_ids,
+    const Tensor& selected_weights, const Tensor& shared, const Tensor& shared_gate,
+    Tensor& destination, cudaStream_t stream);
+
 void qwen4_sparse_moe_swiglu_launch(const Tensor& gate, const Tensor& up, Tensor& activated,
                                     cudaStream_t stream);
 

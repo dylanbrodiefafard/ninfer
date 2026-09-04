@@ -14,6 +14,6 @@ void qsa_index_select_launch(const Tensor& raw_query, const QsaStateView& state,
                              Tensor& selected_count, Tensor& workspace, cudaStream_t stream);
 void qsa_selected_attention_launch(const Tensor& q, const Tensor& selected_ids,
                                    const Tensor& selected_count, const QsaStateView& state,
-                                   Tensor& out, cudaStream_t stream);
+                                   Tensor& out, Tensor& workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

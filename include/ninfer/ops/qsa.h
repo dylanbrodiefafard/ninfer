@@ -69,16 +69,19 @@ void qsa_index_select(const Tensor& raw_query, const QsaStateView& state,
                       Tensor& selected_count, Tensor& workspace, cudaStream_t stream);
 
 /**
- * Compute selected grouped-query attention from normalized/rotated BF16 q [256,24,W] and the
- * exact selected prefixes. Query head h consumes KV head floor(h/12). Every K/V value is decoded
- * from the NVFP4-G16 state, including values appended earlier on the same stream. Softmax uses
- * FP32 max/subtract/exp/sum and the fixed 1/sqrt(256) scale. out is BF16 [256,24,W]. Empty/invalid
- * query columns are exact zero. The caller promises valid selected ids are unique, visible, and
- * in range; selected_count is in [0,2051]. No state is mutated and no workspace is required.
+ * Compute one-token selected grouped-query attention from normalized/rotated BF16 q [256,24,1]
+ * and the exact selected prefix. Query head h consumes KV head floor(h/12). Every K/V value is
+ * decoded from the NVFP4-G16 state, including values appended earlier on the same stream. Softmax
+ * uses FP32 max/subtract/exp/sum and the fixed 1/sqrt(256) scale. out is BF16 [256,24,1].
+ * Empty/invalid queries are exact zero. selected_ids is I32 [S] for a caller-known bound S in
+ * [1,2051]; the caller promises valid selected ids are unique, visible, and in range and
+ * selected_count is in [0,S]. Workspace is caller-owned, 256-byte aligned U8 with at least
+ * qsa_selected_attention_workspace_bytes() bytes. No state is mutated.
  */
+[[nodiscard]] std::size_t qsa_selected_attention_workspace_bytes();
 void qsa_selected_attention(const Tensor& q, const Tensor& selected_ids,
                             const Tensor& selected_count, const QsaStateView& state, Tensor& out,
-                            cudaStream_t stream);
+                            Tensor& workspace, cudaStream_t stream);
 
 struct QsaVerifierWeights {
     Weight index_query; // contiguous BF16_CTRL [512,2560]
