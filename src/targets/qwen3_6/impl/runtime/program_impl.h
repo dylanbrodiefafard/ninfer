@@ -2946,7 +2946,7 @@ void ProgramImplCore::prepare_graphs() {
         device.synchronize();
         schedule::dflash_decode_batch(dflash_state, 1, warm_k, warm_w,
                                       dflash_envelopes(code_warm.min, code_warm.max, warm_k),
-                                      code_warm_target, nullptr);
+                                      code_warm_target, false, nullptr);
         device.synchronize();
 
         std::size_t dflash_profile_count = 0;
@@ -3909,7 +3909,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         mark_workspace_usage(workspace_plan.dflash_round);
         const auto started = Clock::now();
         schedule::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                      batch_k, live_w, envelopes, target_envelope, executable);
+                                      batch_k, live_w, envelopes, target_envelope,
+                                      !use_cuda_graph, executable);
         const double seconds = synchronize_round_seconds(device, started);
         if (ninfer::targets::qwen3_6::detail::dflash_candidate_stats_enabled() &&
             io.dflash_decode.has_value()) {

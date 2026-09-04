@@ -537,17 +537,17 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
                                   conv_record, query, key, value, z, workspace, parent_index);
         require_record_parent_index(parent_index, geometry);
 
-        // Packed T=2..16 uses one SmallT fused GEMM+FP32 conv launch (grid.x=B when
-        // B>1). Flattened compose-record (W4A4 + BF16 conv) flips greedy column 0.
+        // Packed T=2..16: one fused T=1 GEMV+FP32 conv launch per sequence so verify matches
+        // ordinary decode without replaying NVFP4 weights once per column.
         const bool tree = parent_index_active(parent_index);
         const detail::Nvfp4GdnConvPlan plan =
             detail::nvfp4_gdn_conv_resolve_plan(policy, geometry.width, geometry.batch);
         if (plan.schedule == detail::Nvfp4GdnConvScheduleId::SmallTFusedA16) {
             const std::int32_t* parent_ptr =
                 tree ? static_cast<const std::int32_t*>(parent_index->data) : nullptr;
-            detail::nvfp4_gdn_record_small_t_launch(x, weight, conv_weight, conv_states,
-                                                    valid_columns, initial_state_slots, conv_record,
-                                                    query, key, value, z, stream, parent_ptr);
+            detail::nvfp4_gdn_record_t1_fused_launch(x, weight, conv_weight, conv_states,
+                                                     valid_columns, initial_state_slots, conv_record,
+                                                     query, key, value, z, stream, parent_ptr);
             return;
         }
         if (tree) {

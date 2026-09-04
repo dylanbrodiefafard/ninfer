@@ -566,7 +566,9 @@ top-k, min-p, and presence/frequency penalties from both process flags and reque
 logs a one-time warning. Ignored request fields must still satisfy their normal input ranges before
 sampler resolution.
 `--no-p-less-sampling` opts into the registered production sampler. Combined with `--greedy`,
-p-less remains exact argmax. There is no OpenAI or Anthropic schema field for this mode.
+p-less remains exact argmax. Under MTP or DFlash2, p-less applies at hop 0 (chain Leviathan with
+one-hot draft `q`, or tree SpecInfer membership); later hops and the bonus are greedy. There is
+no OpenAI or Anthropic schema field for this mode.
 
 Run `./build/apps/ninfer-serve --help` for the exact option contract.
 

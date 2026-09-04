@@ -28,8 +28,9 @@ struct RouteSpec {
 
 constexpr std::array<RouteSpec, 6> k27Routes{{
     {{1, 1}, Bf16GdnGatingScheduleId::GemvPairedRows},
-    // Product DFlash2 verify is T=12. MMA split-8 at T=9.. was a different reduction than
-    // T=1 GEMV and flipped greedy tokens; packed GEMV through T=16 keeps one launch.
+    // Product DFlash2 verify is T=12 at C=1. MMA split-8 at T>=17 is a different reduction
+    // than SmallT GEMV and flips greedy/p-less tokens. Packed C>1 is T=width*B (C=2 W=12
+    // is T=24); the verify leaf panels at the C=1 width so this route stays SmallT.
     {{2, 16}, Bf16GdnGatingScheduleId::SmallTFusedCooperative},
     // As token tiles double, halve SplitK. This keeps the cooperative grid near 192 CTAs instead
     // of making T a launch limit. Once the unsplit grid has enough independent work, it also

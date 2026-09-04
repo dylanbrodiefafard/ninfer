@@ -298,9 +298,13 @@ int run_nvfp4() {
     int failures   = 0;
     const auto run = [&](std::int32_t width, std::int32_t batch, std::vector<std::int32_t> valid,
                          ops::LinearPolicy policy, std::uint32_t seed) {
+        std::vector<std::int32_t> valid_host = valid;
+        if (valid_host.empty()) {
+            valid_host.assign(static_cast<std::size_t>(batch), width);
+        }
         const std::size_t snapshot_bytes =
             ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(QType::NVFP4, kRows, kHidden,
-                                                                       policy, batch, width, width);
+                                                                       policy, 1, 1, 1);
         const std::size_t record_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
             QType::NVFP4, kRows, kHidden, policy, batch, width, width);
         return run_case(
@@ -308,12 +312,51 @@ int run_nvfp4() {
                 " B=" + std::to_string(batch) + " T=" + std::to_string(width),
             kHidden, kValueRows, kZRows, width, batch, std::move(valid), snapshot_bytes,
             record_bytes,
-            [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid_columns,
+            [&, valid_host, policy, width, batch](
+                const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid_columns,
                 const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
                 Tensor& z, WorkspaceArena& workspace) {
-                ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid_columns,
-                                                  initial, snapshot_base, q, k, v, z, policy,
-                                                  workspace, nullptr);
+                (void)valid_columns;
+                (void)initial;
+                (void)snapshot_base;
+                const std::int32_t hidden    = x.ne[0];
+                const std::int32_t aggregate = width * batch;
+                std::vector<std::int32_t> live(static_cast<std::size_t>(batch));
+                for (std::int32_t b = 0; b < batch; ++b) {
+                    live[static_cast<std::size_t>(b)] = aggregate + b;
+                }
+                auto column = [&](Tensor& tensor, std::int32_t b, std::int32_t t) {
+                    auto* data = static_cast<std::uint8_t*>(tensor.data) +
+                                 static_cast<std::int64_t>(b * width + t) * tensor.ne[0] *
+                                     static_cast<std::int64_t>(sizeof(std::uint16_t));
+                    return Tensor(data, DType::BF16, {tensor.ne[0], 1});
+                };
+                auto* x_bytes = static_cast<std::uint8_t*>(x.data);
+                for (std::int32_t b = 0; b < batch; ++b) {
+                    for (std::int32_t t = 0; t < width; ++t) {
+                        const std::int32_t ok =
+                            t < valid_host[static_cast<std::size_t>(b)] ? 1 : 0;
+                        const std::int32_t base = b * width + t;
+                        DeviceBuffer device_valid = to_device(std::vector<std::int32_t>{ok});
+                        DeviceBuffer device_init =
+                            to_device(std::vector<std::int32_t>{live[static_cast<std::size_t>(b)]});
+                        DeviceBuffer device_base = to_device(std::vector<std::int32_t>{base});
+                        Tensor x1(x_bytes + static_cast<std::int64_t>(base) * hidden *
+                                                static_cast<std::int64_t>(sizeof(std::uint16_t)),
+                                  DType::BF16, {hidden, 1});
+                        Tensor q1      = column(q, b, t);
+                        Tensor k1      = column(k, b, t);
+                        Tensor v1      = column(v, b, t);
+                        Tensor z1      = column(z, b, t);
+                        Tensor valid_t(device_valid.p, DType::I32, {1});
+                        Tensor init_t(device_init.p, DType::I32, {1});
+                        Tensor base_t(device_base.p, DType::I32, {1});
+                        ops::gdn_input_proj_conv_snapshot(x1, parent.view(), conv, state, valid_t,
+                                                          init_t, base_t, q1, k1, v1, z1, policy,
+                                                          workspace, nullptr);
+                        if (ok != 0) { live[static_cast<std::size_t>(b)] = base; }
+                    }
+                }
             },
             [&](const Tensor& x, const Tensor& conv, const Tensor& state,
                 const Tensor& valid_columns, const Tensor& initial, Tensor& record, Tensor& q,

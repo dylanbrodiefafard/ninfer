@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -23,7 +24,10 @@ ninfer::EngineOptions base_engine_options(const char* artifact) {
     options.kv_capacity    = ninfer::KvCapacityPolicy::explicit_capacity(512);
     options.prefill_chunk  = 128;
     options.kv_cache       = ninfer::KvCacheStorage::Nvfp4;
-    options.use_cuda_graph = true;
+    if (std::getenv("NINFER_DFLASH_TEST_BF16_KV") != nullptr) {
+        options.kv_cache = ninfer::KvCacheStorage::BFloat16;
+    }
+    options.use_cuda_graph = std::getenv("NINFER_DFLASH_TEST_NO_GRAPH") == nullptr;
     options.enable_vision  = false;
     return options;
 }
@@ -81,6 +85,27 @@ ninfer::RequestOptions greedy_reuse(std::uint32_t outputs, bool reuse) {
     return options;
 }
 
+ninfer::RequestOptions p_less_reuse(std::uint32_t outputs, std::uint64_t seed, bool reuse) {
+    ninfer::RequestOptions options          = p_less_options(outputs, seed);
+    options.execution.allow_prefix_reuse    = reuse;
+    return options;
+}
+
+ninfer::RequestOptions p_less_chat(std::uint32_t outputs, std::uint64_t seed, bool reuse) {
+    ninfer::RequestOptions options          = p_less_reuse(outputs, seed, reuse);
+    options.stop.include_model_defaults     = true;
+    return options;
+}
+
+ninfer::EngineOptions chat_dflash_options(const char* artifact) {
+    ninfer::EngineOptions options =
+        speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 7, 1);
+    options.max_context = 2048;
+    options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(2048);
+    options.prefill_chunk = 512;
+    return options;
+}
+
 std::vector<ninfer::TokenId> resume_prefix(const std::vector<ninfer::TokenId>& keep,
                                            const std::vector<ninfer::TokenId>& generated) {
     std::vector<ninfer::TokenId> prefix = keep;
@@ -102,6 +127,172 @@ void dump_speculative(const char* tag, const ninfer::SpeculativeStats& stats) {
               << " live_k=" << stats.live_draft_tokens << " per_pos=";
     for (std::uint64_t count : stats.accepted_per_position) { std::cerr << ' ' << count; }
     std::cerr << '\n';
+}
+
+void dump_c2_divergence(const char* label, const char* which,
+                        const ninfer::GenerationResult& seq, const ninfer::GenerationResult& got) {
+    const auto& want = seq.generated_token_ids;
+    const auto& have = got.generated_token_ids;
+    std::size_t index = 0;
+    const std::size_t n = std::min(want.size(), have.size());
+    for (; index < n && want[index] == have[index]; ++index) {}
+    std::cerr << label << ' ' << which
+              << " diverged from its sequential C=1 p-less oracle at generated index " << index
+              << '\n';
+    dump_tokens("  seq", want);
+    dump_tokens("  c2", have);
+    dump_speculative("  seq", seq.speculative);
+    dump_speculative("  c2", got.speculative);
+}
+
+void dump_score(const char* tag, const ninfer::ScoreResult& score) {
+    std::cerr << tag << " scored=" << score.tokens_scored << " non_finite=" << score.non_finite
+              << " terrible=" << score.terrible_tokens << " mean_nll=" << score.mean_nll
+              << " max_nll=" << score.max_nll << " ppl=" << score.perplexity << '\n';
+    if (score.token_nlls.empty()) { return; }
+    std::size_t worst = 0;
+    for (std::size_t i = 1; i < score.token_nlls.size(); ++i) {
+        if (score.token_nlls[i] > score.token_nlls[worst]) { worst = i; }
+    }
+    std::cerr << tag << " worst_at=" << worst << " nll=" << score.token_nlls[worst] << " nlls=";
+    for (std::size_t i = 0; i < score.token_nlls.size(); ++i) {
+        if (i > 0) { std::cerr << ','; }
+        std::cerr << score.token_nlls[i];
+    }
+    std::cerr << '\n';
+}
+
+bool looks_like_counting_collapse(const std::string& text) {
+    int run = 0;
+    int best = 0;
+    std::string tok;
+    const auto flush = [&](bool integer) {
+        if (integer && tok.size() >= 1 && tok.size() <= 4) {
+            ++run;
+            if (run > best) { best = run; }
+        } else {
+            run = 0;
+        }
+        tok.clear();
+    };
+    for (unsigned char c : text) {
+        if (std::isdigit(c)) {
+            tok.push_back(static_cast<char>(c));
+            continue;
+        }
+        if (c == ' ' || c == '\n' || c == '\t') {
+            flush(!tok.empty() &&
+                  std::all_of(tok.begin(), tok.end(),
+                              [](unsigned char ch) { return std::isdigit(ch) != 0; }));
+            continue;
+        }
+        flush(false);
+    }
+    flush(!tok.empty());
+    return best >= 20;
+}
+
+bool looks_like_word_salad(const std::string& text) {
+    int run = 0;
+    int best = 0;
+    std::string tok;
+    const auto flush = [&] {
+        bool word = !tok.empty() && tok.size() <= 8;
+        for (unsigned char ch : tok) {
+            if (std::isalpha(ch) == 0) { word = false; }
+        }
+        if (word) {
+            ++run;
+            if (run > best) { best = run; }
+        } else {
+            run = 0;
+        }
+        tok.clear();
+    };
+    for (unsigned char c : text) {
+        if (std::isalpha(c) != 0) {
+            tok.push_back(static_cast<char>(c));
+            continue;
+        }
+        flush();
+    }
+    flush();
+    return best >= 24;
+}
+
+bool looks_like_role_token_loop(const std::vector<ninfer::TokenId>& ids) {
+    int run = 0;
+    int best = 0;
+    for (ninfer::TokenId token : ids) {
+        if (token == 248045 || token == 248046 || token == 198) {
+            ++run;
+            if (run > best) { best = run; }
+        } else {
+            run = 0;
+        }
+    }
+    return best >= 24;
+}
+
+bool looks_like_punctuation_salad(const std::string& text) {
+    if (text.size() < 80) { return false; }
+    int punct = 0;
+    for (unsigned char c : text) {
+        if (std::isalnum(c) == 0 && std::isspace(c) == 0) { ++punct; }
+    }
+    return punct * 20 > static_cast<int>(text.size()) * 7;
+}
+
+bool looks_like_decoherence(const std::string& text) {
+    return looks_like_counting_collapse(text) || looks_like_word_salad(text) ||
+           looks_like_punctuation_salad(text);
+}
+
+const char* reuse_path_name(ninfer::PrefixReusePath path) {
+    switch (path) {
+    case ninfer::PrefixReusePath::FullReset:
+        return "full_reset";
+    case ninfer::PrefixReusePath::AppendAtFrontier:
+        return "append_at_frontier";
+    case ninfer::PrefixReusePath::RestoreTurnCheckpoint:
+        return "restore_turn_checkpoint";
+    case ninfer::PrefixReusePath::RestoreResponseCheckpoint:
+        return "restore_response_checkpoint";
+    case ninfer::PrefixReusePath::RestoreContextCheckpoint:
+        return "restore_context_checkpoint";
+    case ninfer::PrefixReusePath::RestoreTurnRollback:
+        return "restore_turn_rollback";
+    }
+    return "unknown";
+}
+
+void dump_turn(const char* tag, const ninfer::GenerationResult& result) {
+    std::cerr << tag << " finish=" << static_cast<int>(result.finish_reason)
+              << " path=" << reuse_path_name(result.prefix_reuse_path)
+              << " source=" << static_cast<int>(result.prefix_reuse_source)
+              << " reused=" << result.reused_prompt_tokens
+              << " prompt=" << result.prompt.prompt_tokens
+              << " gen=" << result.generated_token_ids.size()
+              << " reasoning_tokens=" << result.reasoning_tokens
+              << " content_bytes=" << result.content.size()
+              << " reasoning_bytes=" << result.reasoning.size() << '\n';
+    dump_speculative(tag, result.speculative);
+    if (!result.reasoning.empty()) { std::cerr << tag << "-reasoning: " << result.reasoning << '\n'; }
+    std::cerr << tag << "-content: " << result.content << '\n';
+}
+
+ninfer::ChatMessage text_turn(ninfer::ChatRole role, std::string text) {
+    ninfer::ChatMessage message;
+    message.role = role;
+    message.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+    return message;
+}
+
+ninfer::ChatMessage assistant_from_result(const ninfer::GenerationResult& result) {
+    ninfer::ChatMessage message = text_turn(ninfer::ChatRole::Assistant, result.content);
+    message.reasoning_content   = result.reasoning;
+    return message;
 }
 
 int report_mismatch(const char* label, const ninfer::GenerationResult& result,
@@ -133,13 +324,14 @@ std::size_t match_prefix_length(const std::vector<ninfer::TokenId>& got,
 bool relax_oracle() { return std::getenv("NINFER_DFLASH_TEST_RELAX_ORACLE") != nullptr; }
 
 int check_speculative(const ninfer::GenerationResult& result, const char* label);
+int fail_if_decohered(const char* label, const char* turn, const ninfer::GenerationResult& result);
 
 enum class OracleKind { TargetOnly, StrictTargetOnly, C1DFlash };
 
 // Target-only: packed/T=1 numerical identity. First token must agree. A later greedy
 // flip fails the default run; NINFER_DFLASH_TEST_RELAX_ORACLE=1 prints it and continues.
 // C=1 DFlash: overlapping C>1 must match sequential C=1 of the same k. Never relaxed —
-// that comparison is row isolation, not packed-versus-T=1 drift. Flattening NVFP4
+// that comparison is packed-batch identity, not packed-versus-T=1 drift. Flattening NVFP4
 // GDN conv-record to T=W*B compose (W4A4 GEMM + BF16 conv) flipped greedy col 0 vs
 // C=1 fused SmallT+FP32; the Op guard is run_nvfp4_batched_matches_serial_fused.
 int check_tokens(const char* label, const ninfer::GenerationResult& result,
@@ -475,9 +667,6 @@ int exercise_chain_verify_short_output_entitlement(const char* artifact) {
     options.kv_cache                        = ninfer::KvCacheStorage::Nvfp4;
     options.max_context                     = 256;
     options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(256);
-    if (std::getenv("NINFER_DFLASH_TEST_NO_GRAPH") != nullptr) {
-        options.use_cuda_graph = false;
-    }
     ninfer::Engine engine(options);
     if (const int result = check_dflash_load(engine); result != 0) { return result; }
 
@@ -584,42 +773,960 @@ int exercise_p_less_product_tree(ninfer::Engine& engine,
     return 0;
 }
 
-int exercise_p_less_target_likelihood(const char* artifact,
-                                      const std::vector<ninfer::TokenId>& prompt) {
-    constexpr const char* label = "DFlash2 adaptive p-less target likelihood";
-    constexpr std::uint64_t seed = 15446143373561885318ULL;
-    // This short seeded route is a fast guard for the broad 3,000-token verifier-drift
-    // diagnosis; target-only teacher forcing is the independent distribution oracle.
-    std::vector<ninfer::TokenId> corpus = prompt;
+int exercise_p_less_c2_matches_c1(const char* artifact,
+                                  const std::array<std::vector<ninfer::TokenId>, 3>& prompts) {
+    // Live OpenCode salad is one of two concurrent p-less tree decodes collapsing
+    // into 248045/248046/198 while the other stays coherent. Greedy C=3 isolation
+    // never enters the p-less mass-finalize walk, and B=2 GQA/path-select/accept
+    // Op tests pass because they use peaked logits or numeric tolerances. C=2 vs
+    // C=1 must match for the same seed and position RNG. Seed 0x9e3779b97f4a7c15
+    // sits on that seam: C=1 continues a 248044 turn with 30097..., C=2 emits
+    // role-token salad. Equal-length same prompt, graphs on or off, and submit
+    // order do not remove the split.
+    constexpr const char* label = "DFlash2 k=7 W=12 p-less C=2 matches C=1";
+    constexpr std::uint64_t seed_a = 0x9e3779b97f4a7c15ULL;
+    constexpr std::uint64_t seed_b = 0x123456789abcdef0ULL;
+    constexpr std::uint32_t kTokens = 48;
+    ninfer::EngineOptions options =
+        speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 7, 2);
+    options.max_context = 2048;
+    options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(2048);
+    ninfer::Engine engine(options);
+
+    auto extend = [](const std::vector<ninfer::TokenId>& base, std::size_t copies) {
+        std::vector<ninfer::TokenId> out;
+        out.reserve(base.size() * copies);
+        for (std::size_t i = 0; i < copies; ++i) {
+            out.insert(out.end(), base.begin(), base.end());
+        }
+        return out;
+    };
+    const std::vector<ninfer::TokenId> prompt_a = extend(prompts[0], 8);
+    const std::vector<ninfer::TokenId> prompt_b = extend(prompts[0], 8);
+
+    const ninfer::GenerationResult seq_a =
+        engine.generate(engine.prepare_tokens(prompt_a), p_less_options(kTokens, seed_a));
+    const ninfer::GenerationResult seq_b =
+        engine.generate(engine.prepare_tokens(prompt_b), p_less_options(kTokens, seed_b));
+    if (seq_a.generated_token_ids.size() != kTokens ||
+        seq_b.generated_token_ids.size() != kTokens || check_speculative(seq_a, label) != 0 ||
+        check_speculative(seq_b, label) != 0) {
+        std::cerr << label << " sequential C=1 oracles did not complete\n";
+        dump_speculative("  A", seq_a.speculative);
+        dump_speculative("  B", seq_b.speculative);
+        return 1;
+    }
+
+    auto handle_a =
+        engine.submit(engine.prepare_tokens(prompt_a), p_less_options(kTokens, seed_a));
+    auto handle_b =
+        engine.submit(engine.prepare_tokens(prompt_b), p_less_options(kTokens, seed_b));
+    ninfer::GenerationResult conc_a;
+    ninfer::GenerationResult conc_b;
+    try {
+        conc_a = handle_a.wait();
+        conc_b = handle_b.wait();
+    } catch (const std::exception& error) {
+        std::cerr << label << " concurrent p-less threw: " << error.what() << '\n';
+        return 1;
+    }
+    if (conc_a.generated_token_ids.size() != kTokens ||
+        conc_b.generated_token_ids.size() != kTokens || check_speculative(conc_a, label) != 0 ||
+        check_speculative(conc_b, label) != 0) {
+        std::cerr << label << " concurrent requests did not complete\n";
+        dump_speculative("  A", conc_a.speculative);
+        dump_speculative("  B", conc_b.speculative);
+        return 1;
+    }
+    if (conc_a.generated_token_ids != seq_a.generated_token_ids) {
+        dump_c2_divergence(label, "request A", seq_a, conc_a);
+        return 1;
+    }
+    if (conc_b.generated_token_ids != seq_b.generated_token_ids) {
+        dump_c2_divergence(label, "request B", seq_b, conc_b);
+        return 1;
+    }
+    // Isolation contract is token identity with sequential C=1. This 48-token C=1
+    // sample includes chat-template role tokens and Chinese punctuation, so the
+    // decoherence heuristic is not applied after a match.
+    std::cout << "ok " << label << '\n' << std::flush;
+    return 0;
+}
+
+int exercise_p_less_c2_mixed_frontiers_matches_c1(
+    const char* artifact, const std::array<std::vector<ninfer::TokenId>, 3>& prompts) {
+    constexpr const char* label =
+        "DFlash2 k=7 W=12 p-less C=2 mixed frontiers match C=1 without graphs";
+    constexpr std::uint64_t seed_a = 0x9e3779b97f4a7c15ULL;
+    constexpr std::uint64_t seed_b = 0x123456789abcdef0ULL;
+    constexpr std::uint32_t kTokens = 24;
+    ninfer::EngineOptions options =
+        speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 7, 2);
+    options.max_context = 2048;
+    options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(2048);
+    if (options.use_cuda_graph) {
+        std::cerr << label << " requires NINFER_DFLASH_TEST_NO_GRAPH\n";
+        return 1;
+    }
+    ninfer::Engine engine(options);
+
+    auto extend = [](const std::vector<ninfer::TokenId>& base, std::size_t copies) {
+        std::vector<ninfer::TokenId> out;
+        out.reserve(base.size() * copies);
+        for (std::size_t i = 0; i < copies; ++i) {
+            out.insert(out.end(), base.begin(), base.end());
+        }
+        return out;
+    };
+    // The short request remains below SWA's direct/split boundary for all 24 outputs,
+    // while its peer starts above it. A shared maximum envelope would therefore run
+    // the short C=2 proposal through split-KV instead of its sequential direct route.
+    const std::vector<ninfer::TokenId> prompt_a = extend(prompts[0], 4);
+    const std::vector<ninfer::TokenId> prompt_b = extend(prompts[1], 8);
+    const ninfer::GenerationResult seq_a =
+        engine.generate(engine.prepare_tokens(prompt_a), p_less_options(kTokens, seed_a));
+    const ninfer::GenerationResult seq_b =
+        engine.generate(engine.prepare_tokens(prompt_b), p_less_options(kTokens, seed_b));
+    if (seq_a.generated_token_ids.size() != kTokens ||
+        seq_b.generated_token_ids.size() != kTokens || check_speculative(seq_a, label) != 0 ||
+        check_speculative(seq_b, label) != 0) {
+        std::cerr << label << " sequential C=1 oracles did not complete\n";
+        return 1;
+    }
+
+    auto handle_b =
+        engine.submit(engine.prepare_tokens(prompt_b), p_less_options(kTokens, seed_b));
+    auto handle_a =
+        engine.submit(engine.prepare_tokens(prompt_a), p_less_options(kTokens, seed_a));
+    ninfer::GenerationResult conc_a;
+    ninfer::GenerationResult conc_b;
+    try {
+        conc_a = handle_a.wait();
+        conc_b = handle_b.wait();
+    } catch (const std::exception& error) {
+        std::cerr << label << " concurrent p-less threw: " << error.what() << '\n';
+        return 1;
+    }
+    if (conc_a.generated_token_ids.size() != kTokens ||
+        conc_b.generated_token_ids.size() != kTokens || check_speculative(conc_a, label) != 0 ||
+        check_speculative(conc_b, label) != 0) {
+        std::cerr << label << " concurrent requests did not complete\n";
+        return 1;
+    }
+    if (conc_a.generated_token_ids != seq_a.generated_token_ids) {
+        dump_c2_divergence(label, "short request", seq_a, conc_a);
+        return 1;
+    }
+    if (conc_b.generated_token_ids != seq_b.generated_token_ids) {
+        dump_c2_divergence(label, "long request", seq_b, conc_b);
+        return 1;
+    }
+    std::cout << "ok " << label << '\n' << std::flush;
+    return 0;
+}
+
+int exercise_p_less_c2_long_context_matches_c1(
+    const char* artifact, const std::array<std::vector<ninfer::TokenId>, 3>& prompts) {
+    constexpr const char* label =
+        "DFlash2 k=7 W=12 p-less C=2 long context matches C=1";
+    constexpr std::uint64_t seed_a = 14784394741258868421ULL;
+    constexpr std::uint64_t seed_b = 11406468648257731684ULL;
+    constexpr std::size_t kPromptTokens = 39764;
+    constexpr std::uint32_t kTokensA = 1024;
+    constexpr std::uint32_t kTokensB = 128;
+    ninfer::EngineOptions options =
+        speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 7, 2);
+    options.max_context   = 65536;
+    options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(131072);
+    options.prefill_chunk = 4096;
+    ninfer::Engine engine(options);
+
+    auto repeat_to = [](const std::vector<ninfer::TokenId>& base, std::size_t count) {
+        std::vector<ninfer::TokenId> out;
+        out.reserve(count);
+        while (out.size() < count) {
+            const std::size_t remaining = count - out.size();
+            out.insert(out.end(), base.begin(),
+                       base.begin() + static_cast<std::ptrdiff_t>(std::min(remaining, base.size())));
+        }
+        return out;
+    };
+    const std::vector<ninfer::TokenId> prompt_a = repeat_to(prompts[0], kPromptTokens);
+    const std::vector<ninfer::TokenId> prompt_b = repeat_to(prompts[0], kPromptTokens);
+
+    const ninfer::GenerationResult seq_a =
+        engine.generate(engine.prepare_tokens(prompt_a), p_less_options(kTokensA, seed_a));
+    const ninfer::GenerationResult seq_b =
+        engine.generate(engine.prepare_tokens(prompt_b), p_less_options(kTokensB, seed_b));
+    auto handle_a =
+        engine.submit(engine.prepare_tokens(prompt_a), p_less_options(kTokensA, seed_a));
+    auto handle_b =
+        engine.submit(engine.prepare_tokens(prompt_b), p_less_options(kTokensB, seed_b));
+    ninfer::GenerationResult conc_a;
+    ninfer::GenerationResult conc_b;
+    try {
+        conc_a = handle_a.wait();
+        conc_b = handle_b.wait();
+    } catch (const std::exception& error) {
+        std::cerr << label << " concurrent p-less threw: " << error.what() << '\n';
+        return 1;
+    }
+    if (seq_a.generated_token_ids.size() != kTokensA ||
+        seq_b.generated_token_ids.size() != kTokensB ||
+        conc_a.generated_token_ids.size() != kTokensA ||
+        conc_b.generated_token_ids.size() != kTokensB || check_speculative(seq_a, label) != 0 ||
+        check_speculative(seq_b, label) != 0 || check_speculative(conc_a, label) != 0 ||
+        check_speculative(conc_b, label) != 0) {
+        std::cerr << label << " requests did not complete\n";
+        return 1;
+    }
+    if (conc_a.generated_token_ids != seq_a.generated_token_ids) {
+        dump_c2_divergence(label, "request A", seq_a, conc_a);
+        return 1;
+    }
+    if (conc_b.generated_token_ids != seq_b.generated_token_ids) {
+        dump_c2_divergence(label, "request B", seq_b, conc_b);
+        return 1;
+    }
+
+    constexpr std::uint64_t reuse_seed = 2101703384980058981ULL;
+    constexpr std::uint32_t kTurn1Tokens = 64;
+    constexpr std::uint32_t kTurn2Tokens = 512;
+    constexpr std::size_t kSuffixTokens = 5800;
+    const auto make_follow = [&](const ninfer::GenerationResult& turn1) {
+        std::vector<ninfer::TokenId> follow = prompt_b;
+        follow.insert(follow.end(), turn1.generated_token_ids.begin(),
+                      turn1.generated_token_ids.end());
+        const std::vector<ninfer::TokenId> suffix = repeat_to(prompts[1], kSuffixTokens);
+        follow.insert(follow.end(), suffix.begin(), suffix.end());
+        return follow;
+    };
+
+    const ninfer::GenerationResult seq_turn1 = engine.generate(
+        engine.prepare_tokens(prompt_b), p_less_reuse(kTurn1Tokens, reuse_seed, false));
+    const std::vector<ninfer::TokenId> seq_follow = make_follow(seq_turn1);
+    const ninfer::GenerationResult seq_turn2 =
+        engine.generate(engine.prepare_tokens(seq_follow),
+                        p_less_reuse(kTurn2Tokens, reuse_seed + 1, true));
+
+    auto peer = engine.submit(engine.prepare_tokens(prompt_a), p_less_options(kTokensA, seed_a));
+    const ninfer::GenerationResult conc_turn1 = engine.generate(
+        engine.prepare_tokens(prompt_b), p_less_reuse(kTurn1Tokens, reuse_seed, false));
+    const std::vector<ninfer::TokenId> conc_follow = make_follow(conc_turn1);
+    auto follow =
+        engine.submit(engine.prepare_tokens(conc_follow),
+                      p_less_reuse(kTurn2Tokens, reuse_seed + 1, true));
+    const ninfer::GenerationResult conc_peer  = peer.wait();
+    const ninfer::GenerationResult conc_turn2 = follow.wait();
+    if (seq_turn1.generated_token_ids.size() != kTurn1Tokens ||
+        seq_turn2.generated_token_ids.size() != kTurn2Tokens ||
+        conc_turn1.generated_token_ids.size() != kTurn1Tokens ||
+        conc_turn2.generated_token_ids.size() != kTurn2Tokens ||
+        conc_peer.generated_token_ids.size() != kTokensA ||
+        seq_turn2.prefix_reuse_path == ninfer::PrefixReusePath::FullReset ||
+        seq_turn2.reused_prompt_tokens == 0 ||
+        conc_turn2.prefix_reuse_path == ninfer::PrefixReusePath::FullReset ||
+        conc_turn2.reused_prompt_tokens == 0) {
+        std::cerr << label << " long prefix-reuse seam did not complete\n";
+        return 1;
+    }
+    if (conc_peer.generated_token_ids != seq_a.generated_token_ids) {
+        dump_c2_divergence(label, "reuse peer", seq_a, conc_peer);
+        return 1;
+    }
+    if (conc_turn1.generated_token_ids != seq_turn1.generated_token_ids) {
+        dump_c2_divergence(label, "reuse turn 1", seq_turn1, conc_turn1);
+        return 1;
+    }
+    if (conc_turn2.generated_token_ids != seq_turn2.generated_token_ids) {
+        dump_c2_divergence(label, "reuse turn 2", seq_turn2, conc_turn2);
+        return 1;
+    }
+    std::cout << "ok " << label << '\n' << std::flush;
+    return 0;
+}
+
+int exercise_greedy_tree_matches_ordinary(const char* artifact,
+                                          const std::vector<ninfer::TokenId>& prompt) {
+    constexpr const char* label = "DFlash2 k=7 W=12 greedy matches ordinary";
+    constexpr std::uint32_t kTokens = 64;
+    std::vector<ninfer::TokenId> tree_tokens;
+    std::vector<ninfer::TokenId> ordinary_tokens;
     {
-        ninfer::Engine engine(adaptive_engine_options(
-            artifact, ninfer::SpeculativeBackend::DFlash, 7, 1));
+        ninfer::EngineOptions options =
+            speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 7, 1);
+        if (std::getenv("NINFER_DFLASH_TEST_CHAIN") != nullptr) {
+            options.speculative.dflash_verify_width = 8;
+        }
+        ninfer::Engine engine(options);
         const ninfer::GenerationResult generated =
-            engine.generate(engine.prepare_tokens(prompt), p_less_options(64, seed));
-        if (generated.generated_token_ids.size() != 64 ||
-            check_adaptive_dflash(generated, label) != 0) {
-            std::cerr << label << " generation did not complete\n";
+            engine.generate(engine.prepare_tokens(prompt), greedy_options(kTokens));
+        if (generated.generated_token_ids.size() != kTokens ||
+            generated.speculative.live_draft_tokens != 7 ||
+            generated.speculative.drafted_tokens == 0) {
+            std::cerr << label << " tree greedy did not complete on the native draft tree\n";
+            dump_speculative("  spec", generated.speculative);
             return 1;
         }
-        corpus.insert(corpus.end(), generated.generated_token_ids.begin(),
-                      generated.generated_token_ids.end());
+        dump_speculative("  spec", generated.speculative);
+        tree_tokens = generated.generated_token_ids;
+        std::cerr << "  tree-text: " << generated.content << '\n';
+    }
+    {
+        ninfer::Engine engine(base_engine_options(artifact));
+        const ninfer::GenerationResult generated =
+            engine.generate(engine.prepare_tokens(prompt), greedy_options(kTokens));
+        if (generated.generated_token_ids.size() != kTokens) {
+            std::cerr << label << " ordinary greedy did not complete\n";
+            dump_tokens("  ordinary", generated.generated_token_ids);
+            return 1;
+        }
+        ordinary_tokens = generated.generated_token_ids;
+        std::cerr << "  ordinary-text: " << generated.content << '\n';
+    }
+    dump_tokens("  tree", tree_tokens);
+    dump_tokens("  ordinary", ordinary_tokens);
+    if (tree_tokens != ordinary_tokens) {
+        const auto mismatch = std::mismatch(tree_tokens.begin(), tree_tokens.end(),
+                                            ordinary_tokens.begin(), ordinary_tokens.end());
+        std::cerr << label << " diverged at token "
+                  << static_cast<std::size_t>(mismatch.first - tree_tokens.begin())
+                  << " tree=" << (mismatch.first == tree_tokens.end() ? -1 : *mismatch.first)
+                  << " ordinary="
+                  << (mismatch.second == ordinary_tokens.end() ? -1 : *mismatch.second) << '\n';
+        return 1;
+    }
+    std::cout << "ok " << label << '\n';
+    return 0;
+}
+
+int exercise_p_less_tree_target_likelihood(const char* artifact,
+                                           const std::vector<ninfer::TokenId>& prompt) {
+    constexpr const char* label = "DFlash2 k=7 W=12 p-less target likelihood";
+    constexpr std::uint64_t seed = 7632647173703958409ULL;
+    constexpr std::uint32_t kTokens = 256;
+    std::vector<ninfer::TokenId> tree_tokens;
+    std::vector<ninfer::TokenId> ordinary_tokens;
+    std::string tree_text;
+    std::string ordinary_text;
+    {
+        ninfer::EngineOptions options =
+            speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 7, 1);
+        if (std::getenv("NINFER_DFLASH_TEST_CHAIN") != nullptr) {
+            options.speculative.dflash_verify_width = 8;
+        }
+        ninfer::Engine engine(options);
+        const ninfer::GenerationResult generated =
+            engine.generate(engine.prepare_tokens(prompt), p_less_options(kTokens, seed));
+        if (generated.generated_token_ids.size() != kTokens ||
+            generated.speculative.live_draft_tokens != 7 ||
+            generated.speculative.drafted_tokens == 0) {
+            std::cerr << label << " generation did not complete on the native draft tree\n";
+            dump_speculative("  spec", generated.speculative);
+            return 1;
+        }
+        dump_speculative("  spec", generated.speculative);
+        tree_tokens = generated.generated_token_ids;
+        tree_text   = generated.content;
+    }
+    {
+        ninfer::Engine engine(base_engine_options(artifact));
+        const ninfer::GenerationResult generated =
+            engine.generate(engine.prepare_tokens(prompt), p_less_options(kTokens, seed));
+        if (generated.generated_token_ids.size() != kTokens) {
+            std::cerr << label << " ordinary p-less control did not complete\n";
+            dump_tokens("  ordinary", generated.generated_token_ids);
+            return 1;
+        }
+        ordinary_tokens = generated.generated_token_ids;
+        ordinary_text   = generated.content;
+    }
+    if (tree_tokens.front() != ordinary_tokens.front()) {
+        std::cerr << label << " hop 0 diverged from ordinary p-less sample: tree="
+                  << tree_tokens.front() << " ordinary=" << ordinary_tokens.front() << '\n';
+        dump_tokens("  tree", tree_tokens);
+        dump_tokens("  ordinary", ordinary_tokens);
+        return 1;
     }
 
     ninfer::Engine baseline(base_engine_options(artifact));
     ninfer::ScoreOptions score_options;
     score_options.schedule = ninfer::ScoreSchedule::Decode;
     score_options.skip_tokens = static_cast<std::uint32_t>(prompt.size() - 1);
-    const ninfer::ScoreResult score =
-        baseline.score(baseline.prepare_tokens(std::move(corpus), false), score_options);
-    if (score.tokens_scored != 64 || score.non_finite != 0 || score.mean_nll > 0.5 ||
-        score.max_nll > 4.0) {
-        std::cerr << label << " drifted from the ordinary target distribution: scored="
-                  << score.tokens_scored << " non_finite=" << score.non_finite
-                  << " mean_nll=" << score.mean_nll << " max_nll=" << score.max_nll << '\n';
+    auto score_ids = [&](const std::vector<ninfer::TokenId>& generated) {
+        std::vector<ninfer::TokenId> corpus = prompt;
+        corpus.insert(corpus.end(), generated.begin(), generated.end());
+        return baseline.score(baseline.prepare_tokens(std::move(corpus), false), score_options);
+    };
+    const ninfer::ScoreResult tree_score = score_ids(tree_tokens);
+    const ninfer::ScoreResult ordinary_score = score_ids(ordinary_tokens);
+    dump_score("  tree-nll", tree_score);
+    dump_score("  ordinary-nll", ordinary_score);
+    dump_tokens("  tree", tree_tokens);
+    dump_tokens("  ordinary", ordinary_tokens);
+    std::cerr << "  tree-text: " << tree_text << '\n';
+    std::cerr << "  ordinary-text: " << ordinary_text << '\n';
+    if (tree_score.tokens_scored != kTokens || tree_score.non_finite != 0) {
+        std::cerr << label << " score did not cover the generated tree tokens\n";
         return 1;
     }
-    std::cout << "ok " << label << " mean_nll=" << score.mean_nll
-              << " max_nll=" << score.max_nll << '\n';
+    if (looks_like_counting_collapse(tree_text)) {
+        std::cerr << label << " collapsed into a counting run\n";
+        return 1;
+    }
+    std::cout << "ok " << label << " mean_nll=" << tree_score.mean_nll
+              << " max_nll=" << tree_score.max_nll
+              << " ordinary_mean_nll=" << ordinary_score.mean_nll
+              << " ordinary_max_nll=" << ordinary_score.max_nll << '\n';
+    return 0;
+}
+
+int exercise_p_less_tree_commit_matches_reconstruction(
+    const char* artifact, const std::vector<ninfer::TokenId>& prompt) {
+    constexpr const char* label = "DFlash2 k=7 W=12 tree commit matches reconstruction";
+    constexpr std::uint64_t seed = 7632647173703958409ULL;
+    constexpr std::uint32_t kFirstTokens = 512;
+    constexpr std::uint32_t kProbeTokens = 64;
+    ninfer::EngineOptions options =
+        speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 7, 1);
+    options.max_context = 2048;
+    options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(2048);
+
+    std::vector<ninfer::TokenId> history;
+    ninfer::GenerationResult restored;
+    {
+        ninfer::Engine retained(options);
+        const ninfer::GenerationResult first =
+            retained.generate(retained.prepare_tokens(prompt), p_less_options(kFirstTokens, seed));
+        if (first.generated_token_ids.size() != kFirstTokens ||
+            first.speculative.accepted_tokens == 0) {
+            std::cerr << label << " did not exercise an accepted tree path\n";
+            dump_speculative("  first", first.speculative);
+            return 1;
+        }
+        history = resume_prefix(prompt, first.generated_token_ids);
+        restored =
+            retained.generate(retained.prepare_tokens(history), greedy_reuse(kProbeTokens, true));
+        if (restored.prefix_reuse_path == ninfer::PrefixReusePath::FullReset ||
+            restored.reused_prompt_tokens == 0) {
+            std::cerr << label << " did not restore the committed tree state\n";
+            return 1;
+        }
+    }
+
+    ninfer::Engine reconstructed(options);
+    const ninfer::GenerationResult fresh = reconstructed.generate(
+        reconstructed.prepare_tokens(history), greedy_reuse(kProbeTokens, false));
+    if (restored.generated_token_ids != fresh.generated_token_ids) {
+        dump_c2_divergence(label, "restored state", fresh, restored);
+        return 1;
+    }
+    std::cout << "ok " << label << " reuse="
+              << static_cast<int>(restored.prefix_reuse_path)
+              << " reused=" << restored.reused_prompt_tokens << '\n';
+    return 0;
+}
+
+int exercise_p_less_tree_chat_coherence(const char* artifact) {
+    constexpr const char* label = "DFlash2 k=7 W=12 p-less chat coherence";
+    constexpr std::uint64_t seed = 0x9e3779b97f4a7c15ULL;
+    constexpr std::uint32_t kTokens = 192;
+    ninfer::EngineOptions options =
+        speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 7, 1);
+    options.max_context = 2048;
+    options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(2048);
+    ninfer::Engine engine(options);
+
+    ninfer::PromptInput first;
+    first.options.enable_thinking = false;
+    first.messages.push_back(text_turn(
+        ninfer::ChatRole::User,
+        "Write one shell command that prints the first 25 git commits and the first 40 lines of "
+        "README.md. Then explain in five sentences what that output is for."));
+    const ninfer::GenerationResult turn1 =
+        engine.generate(engine.prepare(first), p_less_options(kTokens, seed));
+    std::cerr << label << " turn1 finish=" << static_cast<int>(turn1.finish_reason)
+              << " gen=" << turn1.generated_token_ids.size()
+              << " content_bytes=" << turn1.content.size() << '\n';
+    dump_speculative("  turn1-spec", turn1.speculative);
+    std::cerr << "  turn1-text: " << turn1.content << '\n';
+    if (turn1.generated_token_ids.size() != kTokens) {
+        std::cerr << label << " turn 1 did not complete\n";
+        return 1;
+    }
+    if (looks_like_counting_collapse(turn1.content)) {
+        std::cerr << label << " turn 1 collapsed into a counting run\n";
+        return 1;
+    }
+
+    ninfer::PromptInput second = first;
+    ninfer::ChatMessage assistant = text_turn(ninfer::ChatRole::Assistant, turn1.content);
+    second.messages.push_back(std::move(assistant));
+    second.messages.push_back(text_turn(
+        ninfer::ChatRole::User,
+        "Show first commits and README intro. Keep using complete sentences."));
+    ninfer::RequestOptions turn2_opts = p_less_options(kTokens, seed + 1);
+    turn2_opts.execution.allow_prefix_reuse = true;
+    const ninfer::GenerationResult turn2 =
+        engine.generate(engine.prepare(second), turn2_opts);
+    std::cerr << label << " turn2 finish=" << static_cast<int>(turn2.finish_reason)
+              << " gen=" << turn2.generated_token_ids.size()
+              << " content_bytes=" << turn2.content.size() << '\n';
+    dump_speculative("  turn2-spec", turn2.speculative);
+    std::cerr << "  turn2-text: " << turn2.content << '\n';
+    if (turn2.generated_token_ids.size() != kTokens) {
+        std::cerr << label << " turn 2 did not complete\n";
+        return 1;
+    }
+    if (looks_like_counting_collapse(turn2.content) ||
+        looks_like_counting_collapse(turn1.content + " " + turn2.content)) {
+        std::cerr << label << " turn 2 collapsed into a counting run\n";
+        return 1;
+    }
+    std::cout << "ok " << label << '\n';
+    return 0;
+}
+
+int fail_if_decohered(const char* label, const char* turn, const ninfer::GenerationResult& result) {
+    const std::string visible = result.reasoning + "\n" + result.content;
+    if (!looks_like_decoherence(visible) && !looks_like_role_token_loop(result.generated_token_ids)) {
+        return 0;
+    }
+    std::cerr << label << " " << turn
+              << " decohered (counting, word salad, or im_start/im_end loop)\n";
+    dump_turn(turn, result);
+    dump_tokens("  tokens", result.generated_token_ids);
+    return 1;
+}
+
+int check_reuse_hit(const char* label, const ninfer::GenerationResult& result) {
+    if (result.prefix_reuse_path == ninfer::PrefixReusePath::FullReset ||
+        result.reused_prompt_tokens == 0) {
+        std::cerr << label << " follow-up FullReset; did not hit a prefix-reuse seam\n";
+        dump_turn("  follow-up", result);
+        return 1;
+    }
+    return 0;
+}
+
+int check_reuse_hop0_vs_reset(ninfer::Engine& engine, const ninfer::PromptInput& followup,
+                              const ninfer::GenerationResult& reused, std::uint64_t seed,
+                              const char* label) {
+    const ninfer::GenerationResult reset =
+        engine.generate(engine.prepare(followup), p_less_chat(8, seed, false));
+    dump_turn("  reset", reset);
+    if (reused.generated_token_ids.empty() || reset.generated_token_ids.empty()) {
+        std::cerr << label << " missing hop 0 tokens for reuse vs full-reset\n";
+        return 1;
+    }
+    if (reused.generated_token_ids.front() != reset.generated_token_ids.front()) {
+        std::cerr << label << " reuse hop 0 diverged from DFlash full-reset hop 0: reuse="
+                  << reused.generated_token_ids.front() << " reset="
+                  << reset.generated_token_ids.front() << " path="
+                  << reuse_path_name(reused.prefix_reuse_path)
+                  << " reused=" << reused.reused_prompt_tokens << '\n';
+        dump_tokens("  reuse", reused.generated_token_ids);
+        dump_tokens("  reset", reset.generated_token_ids);
+        return 1;
+    }
+    return 0;
+}
+
+int exercise_p_less_thinking_followup(const char* artifact) {
+    constexpr const char* label = "DFlash2 k=7 p-less thinking follow-up";
+    constexpr std::uint64_t seed = 0x9e3779b97f4a7c15ULL;
+    constexpr std::uint32_t kTurn1 = 96;
+    constexpr std::uint32_t kTurn2 = 192;
+    ninfer::Engine engine(chat_dflash_options(artifact));
+
+    ninfer::PromptInput first;
+    first.options.enable_thinking   = true;
+    first.options.preserve_thinking = false;
+    first.messages.push_back(text_turn(
+        ninfer::ChatRole::User,
+        "Write one shell command that prints the first 25 git commits and the first 40 lines of "
+        "README.md. Then explain in five sentences what that output is for."));
+    const ninfer::GenerationResult turn1 =
+        engine.generate(engine.prepare(first), p_less_chat(kTurn1, seed, false));
+    dump_turn("  turn1", turn1);
+    if (turn1.generated_token_ids.size() < 16 || turn1.speculative.rounds == 0) {
+        std::cerr << label << " turn 1 did not run DFlash decode\n";
+        return 1;
+    }
+    if (fail_if_decohered(label, "turn1", turn1) != 0) { return 1; }
+
+    ninfer::PromptInput second = first;
+    second.messages.push_back(assistant_from_result(turn1));
+    second.messages.push_back(text_turn(
+        ninfer::ChatRole::User,
+        "Show first commits and README intro. Keep using complete sentences."));
+    const ninfer::GenerationResult turn2 =
+        engine.generate(engine.prepare(second), p_less_chat(kTurn2, seed + 1, true));
+    dump_turn("  turn2", turn2);
+    if (turn2.generated_token_ids.empty()) {
+        std::cerr << label << " turn 2 produced no tokens\n";
+        return 1;
+    }
+    if (check_reuse_hit(label, turn2) != 0) { return 1; }
+    int failed = fail_if_decohered(label, "turn2", turn2);
+    if (check_reuse_hop0_vs_reset(engine, second, turn2, seed + 1, label) != 0) { failed = 1; }
+    if (failed != 0) { return failed; }
+    std::cout << "ok " << label << " path=" << reuse_path_name(turn2.prefix_reuse_path)
+              << " reused=" << turn2.reused_prompt_tokens << '\n';
+    return 0;
+}
+
+int exercise_p_less_finished_thinking_followup(const char* artifact) {
+    constexpr const char* label = "DFlash2 k=7 p-less finished-thinking follow-up";
+    constexpr std::uint64_t seed = 0xa5a5a5a5a5a5a5a5ULL;
+    ninfer::Engine engine(chat_dflash_options(artifact));
+
+    ninfer::PromptInput first;
+    first.options.enable_thinking   = true;
+    first.options.preserve_thinking = false;
+    first.messages.push_back(text_turn(ninfer::ChatRole::User, "Reply with only the word hello."));
+    const ninfer::GenerationResult turn1 =
+        engine.generate(engine.prepare(first), p_less_chat(256, seed, false));
+    dump_turn("  turn1", turn1);
+    if (turn1.generated_token_ids.size() < 8 || turn1.speculative.rounds == 0) {
+        std::cerr << label << " turn 1 did not run DFlash decode\n";
+        return 1;
+    }
+    if (fail_if_decohered(label, "turn1", turn1) != 0) { return 1; }
+
+    ninfer::PromptInput second = first;
+    second.messages.push_back(assistant_from_result(turn1));
+    second.messages.push_back(
+        text_turn(ninfer::ChatRole::User, "Now reply with only the word bonjour."));
+    const ninfer::GenerationResult turn2 =
+        engine.generate(engine.prepare(second), p_less_chat(192, seed + 1, true));
+    dump_turn("  turn2", turn2);
+    if (turn2.generated_token_ids.empty()) {
+        std::cerr << label << " turn 2 produced no tokens\n";
+        return 1;
+    }
+    if (check_reuse_hit(label, turn2) != 0) { return 1; }
+    if (fail_if_decohered(label, "turn2", turn2) != 0) { return 1; }
+    std::cout << "ok " << label << " path=" << reuse_path_name(turn2.prefix_reuse_path)
+              << " reused=" << turn2.reused_prompt_tokens
+              << " turn1_content_bytes=" << turn1.content.size()
+              << " turn2_content_bytes=" << turn2.content.size() << '\n';
+    return 0;
+}
+
+ninfer::PromptInput tool_loop_prompt(int completed_responses, bool preserve_thinking,
+                                     bool enable_thinking) {
+    auto assistant_call = [](std::string reasoning, std::string id, std::string key) {
+        ninfer::ChatMessage message = text_turn(ninfer::ChatRole::Assistant, "");
+        message.reasoning_content   = std::move(reasoning);
+        message.tool_calls.push_back(ninfer::ToolCall{
+            .id = std::move(id), .name = "lookup", .arguments_json = "{\"key\":\"" + key + "\"}"});
+        return message;
+    };
+    ninfer::PromptInput input;
+    input.messages.push_back(text_turn(
+        ninfer::ChatRole::User,
+        "Use the lookup tool to fetch key alpha, then summarize the value in one sentence."));
+    if (completed_responses >= 1) {
+        input.messages.push_back(
+            assistant_call("Need the alpha record before answering.", "call_alpha", "alpha"));
+        ninfer::ChatMessage tool =
+            text_turn(ninfer::ChatRole::Tool, "{\"value\":17,\"next\":\"beta\"}");
+        tool.tool_call_id = "call_alpha";
+        input.messages.push_back(std::move(tool));
+    }
+    if (completed_responses >= 2) {
+        input.messages.push_back(
+            assistant_call("Alpha requested beta. Looking that up next.", "call_beta", "beta"));
+        ninfer::ChatMessage tool = text_turn(ninfer::ChatRole::Tool, "{\"value\":25}");
+        tool.tool_call_id        = "call_beta";
+        input.messages.push_back(std::move(tool));
+    }
+    input.options.enable_thinking   = enable_thinking;
+    input.options.preserve_thinking = preserve_thinking;
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}}})");
+    return input;
+}
+
+// Live OpenCode: one slot keeps generating while the other prefills a tool-loop
+// follow-up (prefix reuse) and then both decode at C=2. Greedy C=3 isolation
+// never takes that seam, and the C=2 p-less match above uses two cold FullReset
+// prefills with reuse disabled.
+int exercise_p_less_c2_reuse_during_peer_decode(const char* artifact) {
+    constexpr const char* label = "DFlash2 k=7 p-less C=2 reuse during peer decode";
+    constexpr std::uint64_t seed_a = 0xa5a5a5a5a5a5a5a5ULL;
+    constexpr std::uint64_t seed_b = 0x243f6a8885a308d3ULL;
+    constexpr std::uint32_t kPeer  = 96;
+    constexpr std::uint32_t kTurn1 = 16;
+    constexpr std::uint32_t kTurn2 = 48;
+    ninfer::EngineOptions options =
+        speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 7, 2);
+    options.max_context = 2048;
+    options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(2048);
+    ninfer::Engine engine(options);
+
+    ninfer::PromptInput story;
+    story.options.enable_thinking = true;
+    story.messages.push_back(text_turn(
+        ninfer::ChatRole::User,
+        "Write a long numbered list of repository subsystems. Keep going until the token budget."));
+
+    const ninfer::PromptInput first  = tool_loop_prompt(0, false, true);
+    const ninfer::PromptInput follow = tool_loop_prompt(1, false, true);
+
+    const ninfer::GenerationResult seq_a =
+        engine.generate(engine.prepare(story), p_less_options(kPeer, seed_a));
+    const ninfer::GenerationResult seq_b1 =
+        engine.generate(engine.prepare(first), p_less_chat(kTurn1, seed_b, false));
+    const ninfer::GenerationResult seq_b2 =
+        engine.generate(engine.prepare(follow), p_less_chat(kTurn2, seed_b + 1, true));
+    if (seq_a.generated_token_ids.size() != kPeer || seq_b1.generated_token_ids.size() < 8 ||
+        seq_b2.generated_token_ids.empty() || check_speculative(seq_a, label) != 0 ||
+        check_reuse_hit(label, seq_b2) != 0) {
+        std::cerr << label << " sequential oracles did not complete a reuse seam\n";
+        dump_speculative("  A", seq_a.speculative);
+        dump_turn("  B1", seq_b1);
+        dump_turn("  B2", seq_b2);
+        return 1;
+    }
+
+    auto handle_a = engine.submit(engine.prepare(story), p_less_options(kPeer, seed_a));
+    ninfer::GenerationResult conc_b1;
+    try {
+        conc_b1 = engine.generate(engine.prepare(first), p_less_chat(kTurn1, seed_b, false));
+    } catch (const std::exception& error) {
+        std::cerr << label << " concurrent B turn1 threw: " << error.what() << '\n';
+        return 1;
+    }
+    auto handle_b2 = engine.submit(engine.prepare(follow), p_less_chat(kTurn2, seed_b + 1, true));
+    ninfer::GenerationResult conc_a;
+    ninfer::GenerationResult conc_b2;
+    try {
+        conc_a  = handle_a.wait();
+        conc_b2 = handle_b2.wait();
+    } catch (const std::exception& error) {
+        std::cerr << label << " concurrent wait threw: " << error.what() << '\n';
+        return 1;
+    }
+    dump_turn("  concurrent-B2", conc_b2);
+    if (conc_a.generated_token_ids.size() != kPeer || check_speculative(conc_a, label) != 0) {
+        std::cerr << label << " concurrent peer A did not complete\n";
+        dump_speculative("  A", conc_a.speculative);
+        return 1;
+    }
+    if (conc_b2.generated_token_ids.empty() || check_reuse_hit(label, conc_b2) != 0) {
+        std::cerr << label << " concurrent follow-up missed prefix reuse\n";
+        return 1;
+    }
+    if (conc_a.generated_token_ids != seq_a.generated_token_ids) {
+        std::cerr << label << " peer A diverged from its sequential p-less oracle\n";
+        dump_tokens("  seq", seq_a.generated_token_ids);
+        dump_tokens("  c2", conc_a.generated_token_ids);
+        dump_speculative("  seq", seq_a.speculative);
+        dump_speculative("  c2", conc_a.speculative);
+        return 1;
+    }
+    if (conc_b1.generated_token_ids != seq_b1.generated_token_ids) {
+        std::cerr << label << " B turn1 diverged from its sequential p-less oracle\n";
+        dump_tokens("  seq", seq_b1.generated_token_ids);
+        dump_tokens("  c2", conc_b1.generated_token_ids);
+        return 1;
+    }
+    if (conc_b2.generated_token_ids != seq_b2.generated_token_ids) {
+        std::cerr << label << " reused follow-up diverged from its sequential p-less oracle\n";
+        dump_tokens("  seq", seq_b2.generated_token_ids);
+        dump_tokens("  c2", conc_b2.generated_token_ids);
+        dump_speculative("  seq", seq_b2.speculative);
+        dump_speculative("  c2", conc_b2.speculative);
+        return 1;
+    }
+    std::cout << "ok " << label << " reuse=" << reuse_path_name(conc_b2.prefix_reuse_path)
+              << " reused=" << conc_b2.reused_prompt_tokens << '\n'
+              << std::flush;
+    return 0;
+}
+
+int check_tool_rewrite_hop0_greedy(ninfer::Engine& engine) {
+    const bool variants[] = {false, true};
+    for (bool preserve_thinking : variants) {
+        const std::string label =
+            std::string("DFlash2 k=7 greedy tool-loop hop0 preserve_thinking=") +
+            (preserve_thinking ? "true" : "false");
+        const ninfer::PromptInput first = tool_loop_prompt(0, preserve_thinking, true);
+        const ninfer::PromptInput followup = tool_loop_prompt(1, preserve_thinking, true);
+        const ninfer::GenerationResult turn1 =
+            engine.generate(engine.prepare(first), greedy_reuse(16, false));
+        dump_turn("  greedy-turn1", turn1);
+        if (turn1.generated_token_ids.size() < 8 || turn1.speculative.rounds == 0) {
+            std::cerr << label << " source request did not run DFlash decode\n";
+            return 1;
+        }
+        const ninfer::GenerationResult reused =
+            engine.generate(engine.prepare(followup), greedy_reuse(8, true));
+        dump_turn("  greedy-reuse", reused);
+        if (check_reuse_hit(label.c_str(), reused) != 0) { return 1; }
+        if (reused.generated_token_ids.empty()) {
+            std::cerr << label << " reuse produced no tokens\n";
+            return 1;
+        }
+        const ninfer::GenerationResult reset =
+            engine.generate(engine.prepare(followup), greedy_reuse(8, false));
+        dump_turn("  greedy-reset", reset);
+        if (reset.generated_token_ids.empty() ||
+            reused.generated_token_ids.front() != reset.generated_token_ids.front()) {
+            std::cerr << label << " reuse hop 0 diverged from DFlash full-reset hop 0: reuse="
+                      << (reused.generated_token_ids.empty() ? -1
+                                                             : reused.generated_token_ids.front())
+                      << " reset="
+                      << (reset.generated_token_ids.empty() ? -1 : reset.generated_token_ids.front())
+                      << " path=" << reuse_path_name(reused.prefix_reuse_path)
+                      << " reused=" << reused.reused_prompt_tokens << '\n';
+            dump_tokens("  reuse", reused.generated_token_ids);
+            dump_tokens("  reset", reset.generated_token_ids);
+            return 1;
+        }
+        std::cout << "ok " << label << " path=" << reuse_path_name(reused.prefix_reuse_path)
+                  << " hop0=" << reused.generated_token_ids.front() << '\n';
+    }
+    return 0;
+}
+
+int exercise_p_less_tool_history_reuse(const char* artifact) {
+    constexpr std::uint64_t seed = 0x243f6a8885a308d3ULL;
+    constexpr std::uint32_t kTurn2 = 192;
+    ninfer::Engine engine(chat_dflash_options(artifact));
+    if (const int result = check_tool_rewrite_hop0_greedy(engine); result != 0) { return result; }
+
+    const bool variants[][2] = {{false, true}, {true, true}};
+    for (const auto& variant : variants) {
+        const bool preserve_thinking = variant[0];
+        const bool enable_thinking   = variant[1];
+        const std::string label =
+            std::string("DFlash2 k=7 p-less tool-loop reuse preserve_thinking=") +
+            (preserve_thinking ? "true" : "false");
+        const std::uint32_t turn1_tokens = preserve_thinking ? 64 : 192;
+        const ninfer::PromptInput first = tool_loop_prompt(0, preserve_thinking, enable_thinking);
+        const ninfer::GenerationResult turn1 =
+            engine.generate(engine.prepare(first), p_less_chat(turn1_tokens, seed, false));
+        dump_turn("  turn1", turn1);
+        if (turn1.generated_token_ids.size() < 8 || turn1.speculative.rounds == 0) {
+            std::cerr << label << " source request did not run DFlash decode\n";
+            return 1;
+        }
+        if (fail_if_decohered(label.c_str(), "turn1", turn1) != 0) { return 1; }
+
+        const ninfer::PromptInput followup =
+            tool_loop_prompt(1, preserve_thinking, enable_thinking);
+        const ninfer::GenerationResult turn2 =
+            engine.generate(engine.prepare(followup), p_less_chat(kTurn2, seed + 1, true));
+        dump_turn("  turn2", turn2);
+        if (turn2.generated_token_ids.empty()) {
+            std::cerr << label << " tool follow-up produced no tokens\n";
+            return 1;
+        }
+        if (check_reuse_hit(label.c_str(), turn2) != 0) { return 1; }
+        int failed = fail_if_decohered(label.c_str(), "turn2", turn2);
+
+        const ninfer::PromptInput second_loop =
+            tool_loop_prompt(2, preserve_thinking, enable_thinking);
+        const ninfer::GenerationResult turn3 =
+            engine.generate(engine.prepare(second_loop), p_less_chat(kTurn2, seed + 2, true));
+        dump_turn("  turn3", turn3);
+        if (turn3.generated_token_ids.empty()) {
+            std::cerr << label << " second tool follow-up produced no tokens\n";
+            return 1;
+        }
+        if (check_reuse_hit(label.c_str(), turn3) != 0) { return 1; }
+        // preserve_thinking=false captures TurnClosure at the first assistant start, so both
+        // tool follow-ups restore the same base. ResponseReplay (preserve_thinking=true)
+        // must walk forward with the rendered history.
+        if (preserve_thinking &&
+            (turn2.prefix_reuse_path != ninfer::PrefixReusePath::RestoreResponseCheckpoint ||
+             turn3.prefix_reuse_path != ninfer::PrefixReusePath::RestoreResponseCheckpoint ||
+             turn3.reused_prompt_tokens <= turn2.reused_prompt_tokens)) {
+            std::cerr << label << " response checkpoint did not advance across the tool loop: first="
+                      << turn2.reused_prompt_tokens << " path="
+                      << reuse_path_name(turn2.prefix_reuse_path)
+                      << " second=" << turn3.reused_prompt_tokens << " path="
+                      << reuse_path_name(turn3.prefix_reuse_path) << '\n';
+            failed = 1;
+        }
+        failed |= fail_if_decohered(label.c_str(), "turn3", turn3);
+        // Greedy hop0 already checks rewrite-restore logits. p-less hop0 vs a later
+        // FullReset is too sensitive: T=2 can flip when argmax agrees (see greedy hop0=760).
+        if (failed != 0) { return failed; }
+        std::cout << "ok " << label << " path=" << reuse_path_name(turn2.prefix_reuse_path)
+                  << " reused=" << turn2.reused_prompt_tokens << "->" << turn3.reused_prompt_tokens
+                  << '\n';
+    }
+    return 0;
+}
+
+int exercise_p_less_target_likelihood(const char* artifact,
+                                      const std::vector<ninfer::TokenId>& prompt) {
+    constexpr const char* label = "DFlash2 adaptive p-less target likelihood";
+    constexpr std::uint64_t seed = 15446143373561885318ULL;
+    constexpr std::uint32_t kTokens = 64;
+    std::vector<ninfer::TokenId> dflash_tokens;
+    std::vector<ninfer::TokenId> ordinary_tokens;
+    {
+        ninfer::Engine engine(adaptive_engine_options(
+            artifact, ninfer::SpeculativeBackend::DFlash, 7, 1));
+        const ninfer::GenerationResult generated =
+            engine.generate(engine.prepare_tokens(prompt), p_less_options(kTokens, seed));
+        if (generated.generated_token_ids.size() != kTokens ||
+            check_adaptive_dflash(generated, label) != 0) {
+            std::cerr << label << " generation did not complete\n";
+            return 1;
+        }
+        dump_speculative("  spec", generated.speculative);
+        dflash_tokens = generated.generated_token_ids;
+    }
+    {
+        ninfer::Engine engine(base_engine_options(artifact));
+        const ninfer::GenerationResult generated =
+            engine.generate(engine.prepare_tokens(prompt), p_less_options(kTokens, seed));
+        if (generated.generated_token_ids.size() != kTokens) {
+            std::cerr << label << " ordinary p-less control did not complete\n";
+            return 1;
+        }
+        ordinary_tokens = generated.generated_token_ids;
+    }
+    if (dflash_tokens.front() != ordinary_tokens.front()) {
+        std::cerr << label << " hop 0 diverged from ordinary p-less sample: dflash="
+                  << dflash_tokens.front() << " ordinary=" << ordinary_tokens.front() << '\n';
+        dump_tokens("  dflash", dflash_tokens);
+        dump_tokens("  ordinary", ordinary_tokens);
+        return 1;
+    }
+
+    ninfer::Engine baseline(base_engine_options(artifact));
+    ninfer::ScoreOptions score_options;
+    score_options.schedule = ninfer::ScoreSchedule::Decode;
+    score_options.skip_tokens = static_cast<std::uint32_t>(prompt.size() - 1);
+    auto score_ids = [&](const std::vector<ninfer::TokenId>& generated) {
+        std::vector<ninfer::TokenId> corpus = prompt;
+        corpus.insert(corpus.end(), generated.begin(), generated.end());
+        return baseline.score(baseline.prepare_tokens(std::move(corpus), false), score_options);
+    };
+    const ninfer::ScoreResult dflash_score = score_ids(dflash_tokens);
+    const ninfer::ScoreResult ordinary_score = score_ids(ordinary_tokens);
+    dump_score("  dflash-nll", dflash_score);
+    dump_score("  ordinary-nll", ordinary_score);
+    dump_tokens("  dflash", dflash_tokens);
+    dump_tokens("  ordinary", ordinary_tokens);
+    if (dflash_score.tokens_scored != kTokens || dflash_score.non_finite != 0 ||
+        dflash_score.mean_nll > ordinary_score.mean_nll + 0.35 ||
+        dflash_score.max_nll > ordinary_score.max_nll + 2.0 ||
+        dflash_score.terrible_tokens > ordinary_score.terrible_tokens) {
+        std::cerr << label << " drifted from ordinary p-less samples of the same seed\n";
+        return 1;
+    }
+    std::cout << "ok " << label << " mean_nll=" << dflash_score.mean_nll
+              << " max_nll=" << dflash_score.max_nll
+              << " ordinary_mean_nll=" << ordinary_score.mean_nll
+              << " ordinary_max_nll=" << ordinary_score.max_nll << '\n';
     return 0;
 }
 
@@ -683,13 +1790,32 @@ int main() {
         return 77;
     }
 
+    // AIME is one generate (prompt → thinking → response). Live salad shows up after a
+    // second user prompt or after a tool-call turn, i.e. prefix reuse, not a cold prefill.
+    if (std::getenv("NINFER_DFLASH_TEST_TURNS_ONLY") != nullptr) {
+        if (const int result = exercise_p_less_thinking_followup(artifact); result != 0) {
+            return result;
+        }
+        if (const int result = exercise_p_less_finished_thinking_followup(artifact); result != 0) {
+            return result;
+        }
+        if (const int result = exercise_p_less_tool_history_reuse(artifact); result != 0) {
+            return result;
+        }
+        if (const int result = exercise_p_less_c2_reuse_during_peer_decode(artifact); result != 0) {
+            return result;
+        }
+        return 0;
+    }
+
     if (std::getenv("NINFER_DFLASH_TEST_SKIP_VISION") == nullptr) {
         std::cerr << "dflash_real: Vision-composed prefill and MRoPE decode\n";
         if (const int result = exercise_dflash_vision(artifact); result != 0) { return result; }
     }
     if (std::getenv("NINFER_DFLASH_TEST_ONLY_VISION") != nullptr) { return 0; }
 
-    if (std::getenv("NINFER_DFLASH_TEST_SKIP_ENTITLEMENT") == nullptr) {
+    if (std::getenv("NINFER_DFLASH_TEST_SKIP_ENTITLEMENT") == nullptr &&
+        std::getenv("NINFER_DFLASH_TEST_C2_PLESS") == nullptr) {
         std::cerr << "dflash_real: chain-verify short-output Main KV entitlement\n";
         if (const int result = exercise_chain_verify_short_output_entitlement(artifact);
             result != 0) {
@@ -697,9 +1823,9 @@ int main() {
         }
     }
 
-    // Chain W=k+1 uses packed SmallT / W4A4 at T=W. Ordinary decode stays T=1 GEMV.
-    // C=1 vs target-only can flip a later greedy token (k=4 prompt 0 token 21).
-    // C>1 must still match saved C=1 DFlash of the same k (row isolation).
+    // Packed verify is T=W (SmallT GQA at T<=6; Prompt GQA at T>6 on 24 heads). Ordinary
+    // decode stays T=1 GEMV. C=1 vs target-only can flip a later greedy token
+    // (k=4 prompt 0 token 21). C>1 must still match saved C=1 DFlash of the same k.
     const std::array<std::vector<ninfer::TokenId>, 3> prompts{
         std::vector<ninfer::TokenId>{
             248045, 846,    198, 109266, 3709,  96220, 117443, 97913,
@@ -715,10 +1841,59 @@ int main() {
         },
     };
 
+    if (std::getenv("NINFER_DFLASH_TEST_TREE_STATE_ONLY") != nullptr) {
+        return exercise_p_less_tree_commit_matches_reconstruction(artifact, prompts[0]);
+    }
+    if (std::getenv("NINFER_DFLASH_TEST_TREE_LIKELIHOOD_ONLY") != nullptr) {
+        return exercise_p_less_tree_target_likelihood(artifact, prompts[0]);
+    }
+    if (std::getenv("NINFER_DFLASH_TEST_GREEDY_TREE_ONLY") != nullptr) {
+        return exercise_greedy_tree_matches_ordinary(artifact, prompts[0]);
+    }
+    if (std::getenv("NINFER_DFLASH_TEST_CHAT_COHERENCE") != nullptr) {
+        return exercise_p_less_tree_chat_coherence(artifact);
+    }
+
+    if (std::getenv("NINFER_DFLASH_TEST_C2_PLESS") != nullptr) {
+        if (const int result = exercise_p_less_c2_matches_c1(artifact, prompts); result != 0) {
+            return result;
+        }
+        if (std::getenv("NINFER_DFLASH_TEST_C2_LONG") != nullptr) {
+            if (const int result = exercise_p_less_c2_long_context_matches_c1(artifact, prompts);
+                result != 0) {
+                return result;
+            }
+        }
+        if (std::getenv("NINFER_DFLASH_TEST_NO_GRAPH") != nullptr) {
+            if (const int result =
+                    exercise_p_less_c2_mixed_frontiers_matches_c1(artifact, prompts);
+                result != 0) {
+                return result;
+            }
+        }
+        if (const int result = exercise_p_less_c2_reuse_during_peer_decode(artifact); result != 0) {
+            return result;
+        }
+        return 0;
+    }
+
     if (std::getenv("NINFER_DFLASH_TEST_SKIP_LIKELIHOOD") == nullptr) {
         if (const int result = exercise_p_less_target_likelihood(artifact, prompts[0]);
             result != 0) {
             return result;
+        }
+        if (const int result = exercise_p_less_c2_matches_c1(artifact, prompts); result != 0) {
+            return result;
+        }
+        if (std::getenv("NINFER_DFLASH_TEST_NO_GRAPH") != nullptr) {
+            if (const int result =
+                    exercise_p_less_c2_mixed_frontiers_matches_c1(artifact, prompts);
+                result != 0) {
+                return result;
+            }
+        }
+        if (std::getenv("NINFER_DFLASH_TEST_LIKELIHOOD_ONLY") != nullptr) {
+            return 0;
         }
     }
 
@@ -747,9 +1922,6 @@ int main() {
             speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, draft_tokens, 3);
         if (std::getenv("NINFER_DFLASH_TEST_MAX1") != nullptr) {
             dflash_options.max_concurrency = 1;
-        }
-        if (std::getenv("NINFER_DFLASH_TEST_NO_GRAPH") != nullptr) {
-            dflash_options.use_cuda_graph = false;
         }
         if (std::getenv("NINFER_DFLASH_TEST_FULL_HEAD") != nullptr) {
             dflash_options.speculative.proposal_head = ninfer::ProposalHead::Full;

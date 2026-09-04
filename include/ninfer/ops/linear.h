@@ -87,6 +87,8 @@ enum class LinearPolicy : std::uint8_t {
  * LinearPolicy::A16Only and LinearPolicy::AllowA8. NVFP4 admits A16Only and AllowA4; AllowA4
  * permits the private resolver to select either a qualified A16 route or activation quantization
  * to NVFP4 at every positive T. The selected route depends only on the registered problem and T.
+ * Callers that pack B independent sequences as `T = sequence_width * B` must use
+ * `linear_packed_sequences` so C>1 does not select a different T-specialized kernel than C=1.
  *
  * @par Workspace
  * `workspace` is caller-owned call-scoped transient storage sized by
@@ -116,5 +118,23 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
  * @param[in] stream CUDA stream on which execution is enqueued.
  */
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+
+/**
+ * @brief Applies Linear independently to each packed sequence of `sequence_width` columns.
+ *
+ * @details Concurrent DFlash/target activations are stored as contiguous `[K, width*B]`. NVFP4
+ * SmallT, Q4 draft-head, and W8/Q4 SIMT/MMA routes are specialized by exact T, so launching once
+ * at `T=width*B` selects a different kernel than sequential C=1 (`T=width`). This entry launches
+ * one Linear per sequence at `sequence_width`. `T` must be a positive multiple of
+ * `sequence_width`. Tensor, weight, aliasing, policy, and workspace requirements match `linear`.
+ *
+ * @param[in] sequence_width Per-sequence column count (the C=1 T).
+ */
+void linear_packed_sequences(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
+                             WorkspaceArena& workspace, cudaStream_t stream,
+                             std::int32_t sequence_width);
+
+void linear_packed_sequences(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream,
+                             std::int32_t sequence_width);
 
 } // namespace ninfer::ops

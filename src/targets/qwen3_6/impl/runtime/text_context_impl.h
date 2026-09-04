@@ -70,11 +70,11 @@ void require_tensor_shape(const Tensor& t, DType dtype, std::initializer_list<st
     if (t.data == nullptr) { throw std::invalid_argument(std::string(label) + " data is null"); }
 }
 
-// Batched verify packs sequences as [rows, width*batch] and traverses every column-independent
-// projection once over the aggregate T=width*batch, per the concurrent contract. NVFP4 W4A4
-// routes are selected from that aggregate T, so a C>1 round can cross a W4A4 threshold the C=1
-// (T=width) round does not. The family hands the C=1 width to the leaves that own T-dependent
-// routes so the target package can pin the C=1 quantization family at the aggregate launch.
+// Residual verify is [rows, T] with T=width*batch when a caller packs sequences. NVFP4 W4A4
+// and SmallT/Q4-head routes key off that T, so packed C>1 Linear/GDN-control panel at
+// C=1 width via packed_route_tokens. GQA launches one B=1 decode per sequence. NVFP4 GDN
+// conv-record is fused T=1 GEMV+conv per sequence. DFlash proposal still isolates compact
+// rows so SWA envelopes follow each sequence's frontier.
 std::int32_t packed_route_tokens(std::int32_t batch, std::int32_t width) {
     return (batch > 1 && width > 1) ? width : 0;
 }
@@ -757,7 +757,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_logits = logits.view({kCfg.vocab, columns});
         Tensor flat_tokens = target_tokens.view({columns});
         ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
-        ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
+        ops::linear_packed_sequences(flat_hidden, *lm_head_, flat_logits, stream, width);
         if (sampling_config_ != nullptr) {
             ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, sampling_config_, width,
                         stream);
@@ -907,8 +907,9 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor h           = control.hidden;
     Tensor g           = control.g;
     Tensor beta        = control.beta;
-    Variant::gdn_norm_control_projection(x, *w.input_norm, kCfg.rms_eps, *w.projection, h, g, beta,
-                                         work_, s);
+    Variant::gdn_norm_control_projection(
+        x, *w.input_norm, kCfg.rms_eps, *w.projection, h, g, beta, work_, s,
+        packed_route_tokens(active_sequence_batch_, active_sequence_width_));
 
     const auto projection = workspace_recipe::gdn_projection<TextConfig>(work_, T);
     Tensor z              = projection.output_gate.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
@@ -940,7 +941,8 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
             if (replay_records_ == nullptr) {
                 throw std::logic_error("Replay-record GDN has no record storage");
             }
-            persistent_records = replay_records_->layer(gidx, 0, active_sequence_batch_);
+            persistent_records = replay_records_->layer(gidx, active_sequence_row_,
+                                                        active_sequence_batch_);
             live_records       = persistent_records;
             if (pack_replay) {
                 // LLD Capture/run: GDN requires record.ne[2]==q.ne[2]; pack only when they differ.

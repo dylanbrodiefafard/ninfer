@@ -228,7 +228,19 @@ void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, 
 void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& norm_weight,
                                           float eps, const GdnProjectionWeights& weights,
                                           Tensor& hidden, Tensor& g, Tensor& beta,
-                                          WorkspaceArena& workspace, cudaStream_t stream) {
+                                          WorkspaceArena& workspace, cudaStream_t stream,
+                                          std::int32_t route_tokens) {
+    if (route_tokens > 0 && route_tokens < residual.ne[1]) {
+        for (std::int32_t offset = 0; offset < residual.ne[1]; offset += route_tokens) {
+            Tensor hidden_panel = hidden.slice(1, offset, route_tokens);
+            Tensor g_panel      = g.slice(1, offset, route_tokens);
+            Tensor beta_panel   = beta.slice(1, offset, route_tokens);
+            ops::gdn_norm_gating_proj(residual.slice(1, offset, route_tokens), norm_weight, eps,
+                                      weights.a_b_projection, weights.a_log, weights.dt_bias,
+                                      workspace, hidden_panel, g_panel, beta_panel, stream);
+        }
+        return;
+    }
     ops::gdn_norm_gating_proj(residual, norm_weight, eps, weights.a_b_projection, weights.a_log,
                               weights.dt_bias, workspace, hidden, g, beta, stream);
 }

@@ -68,6 +68,15 @@ void nvfp4_gdn_record_small_t_launch(const Tensor& x, const Weight& weight,
                                      Tensor& z, cudaStream_t stream,
                                      const std::int32_t* parent_index = nullptr);
 
+// Packed T=2..16 record: one launch of T=1 GEMV+FP32 conv per sequence. Weights stay in L2
+// across the token loop; each column matches ordinary-decode GEMV+BF16 3-tap history.
+void nvfp4_gdn_record_t1_fused_launch(const Tensor& x, const Weight& weight,
+                                      const Tensor& conv_weight, const Tensor& conv_states,
+                                      const Tensor& valid_columns, const Tensor& initial_slot,
+                                      Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
+                                      Tensor& z, cudaStream_t stream,
+                                      const std::int32_t* parent_index = nullptr);
+
 void nvfp4_gdn_snapshot_post_launch(const Tensor& projected, const Tensor& conv_weight,
                                     Tensor& conv_states, const Tensor& valid_columns,
                                     const Tensor& initial_slot, const Tensor& snapshot_base_slot,

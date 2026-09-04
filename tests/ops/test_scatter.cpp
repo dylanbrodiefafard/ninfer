@@ -2,6 +2,7 @@
 #include "ninfer/ops/scatter.h"
 #include "ops/op_tester.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -324,6 +325,64 @@ int pitched_live_width_case() {
     return failures;
 }
 
+// Host fold of a DFlash2 binary tree is never the identity 0,1,2,... spine, so
+// gather_bf16_path actually runs. Compact row index is not the KV/feature lane:
+// OpenCode C=2 can occupy lanes {1,0}. Indexing features by compact row would
+// swap the two chats' pending features after a branched accept.
+int gather_path_crossed_lanes_case() {
+    constexpr std::int32_t rows     = 8;
+    constexpr std::int32_t width    = 12;
+    constexpr std::int32_t capacity = 3;
+    constexpr std::int32_t batch    = 2;
+    const std::vector<std::int32_t> lanes{2, 0};
+    const std::vector<std::int32_t> counts{3, 4};
+    const std::vector<std::int32_t> path{
+        0, 2, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // compact row 0 → lane 2
+        0, 1, 3, 7, 0, 0, 0, 0, 0, 0, 0, 0,  // compact row 1 → lane 0
+    };
+    const auto initial =
+        bit_pattern(static_cast<std::size_t>(rows) * width * capacity, 0x0d15ea5eu);
+    auto expected = initial;
+    const auto column = [&](std::int32_t lane, std::int32_t col) -> std::size_t {
+        return static_cast<std::size_t>(lane * width + col) * static_cast<std::size_t>(rows);
+    };
+    for (std::int32_t b = 0; b < batch; ++b) {
+        const std::int32_t lane  = lanes[static_cast<std::size_t>(b)];
+        const std::int32_t count = counts[static_cast<std::size_t>(b)];
+        std::vector<std::uint16_t> saved(static_cast<std::size_t>(count) *
+                                         static_cast<std::size_t>(rows));
+        for (std::int32_t i = 0; i < count; ++i) {
+            const std::int32_t src = path[static_cast<std::size_t>(b) * width + i];
+            std::copy(initial.begin() + static_cast<std::ptrdiff_t>(column(lane, src)),
+                      initial.begin() + static_cast<std::ptrdiff_t>(column(lane, src) + rows),
+                      saved.begin() + static_cast<std::ptrdiff_t>(i * rows));
+        }
+        for (std::int32_t i = 0; i < count; ++i) {
+            std::copy(saved.begin() + static_cast<std::ptrdiff_t>(i * rows),
+                      saved.begin() + static_cast<std::ptrdiff_t>((i + 1) * rows),
+                      expected.begin() + static_cast<std::ptrdiff_t>(column(lane, i)));
+        }
+    }
+
+    GuardedDeviceBuffer device_features(initial.size() * sizeof(std::uint16_t));
+    device_features.copy_from_host(initial.data(), initial.size() * sizeof(std::uint16_t));
+    DeviceBuffer device_lanes  = to_device(lanes);
+    DeviceBuffer device_path   = to_device(path);
+    DeviceBuffer device_counts = to_device(counts);
+    Tensor features_t(device_features.data(), DType::BF16, {rows, width, capacity});
+    Tensor lanes_t(device_lanes.p, DType::I32, {batch});
+    Tensor path_t(device_path.p, DType::I32, {width, batch});
+    Tensor counts_t(device_counts.p, DType::I32, {batch});
+    ops::gather_bf16_path(features_t, lanes_t, path_t, counts_t, nullptr);
+    cuda_synchronize();
+
+    int failures = verify_exact(
+        "gather_bf16_path B=2 crossed lanes",
+        from_device<std::uint16_t>(device_features.data(), expected.size()), expected);
+    failures += device_features.verify_guards("gather_bf16_path B=2 crossed lanes guards");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -339,6 +398,7 @@ int main() {
     failures += extract_case(8192, 2048, 2048, 1);
     failures += batch_prefix_case();
     failures += pitched_live_width_case();
+    failures += gather_path_crossed_lanes_case();
     std::cout << (failures ? "FAIL" : "OK") << " scatter and extract_bf16_columns\n";
     return failures ? 1 : 0;
 }

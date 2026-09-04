@@ -125,6 +125,20 @@ __device__ __forceinline__ bool sampling_p_less_in_domain(int v, std::int32_t vo
     return v >= 0 && v < vocab && !sampling_token_suppressed(v, cfg);
 }
 
+// A missed inverse-CDF or a dirty workspace can yield INT_MAX / a padding row.
+// Counting that id would write past token_counts and poison later rounds.
+__device__ __forceinline__ int sampling_clamp_token(int token, int fallback, std::int32_t vocab) {
+    if (token >= 0 && token < vocab) { return token; }
+    if (fallback >= 0 && fallback < vocab) { return fallback; }
+    return 0;
+}
+
+__device__ __forceinline__ void sampling_count_token(const SamplingConfig& cfg, int token,
+                                                     std::int32_t vocab) {
+    if (cfg.token_counts == nullptr || token < 0 || token >= vocab) { return; }
+    atomicAdd(&cfg.token_counts[token], 1);
+}
+
 __device__ inline float sampling_block_sum(float value, float* shared) {
     const int tid = threadIdx.x;
     shared[tid]   = value;
@@ -888,7 +902,7 @@ __device__ __forceinline__ int sampling_pick_from_p_minus_q(const int* cand_idx,
     for (int j = 0; j < n; ++j) {
         mass += fmaxf(0.0f, prob[j] - sampling_selector_q(q_ids, q_vals, q_n, cand_idx[j]));
     }
-    if (mass <= 0.0f) { return draft_id; }
+    if (mass <= 0.0f) { return sampling_pick_from_support(cand_idx, prob, n, -1, u); }
     const float goal = u * mass;
     float acc        = 0.0f;
     int picked       = cand_idx[0];
@@ -927,6 +941,7 @@ __device__ inline int sampling_p_less_residual(const __nv_bfloat16* logits, std:
                                                const float* q_vals, int q_n, int argmax,
                                                float* red_val, int* red_idx) {
     const int tid = threadIdx.x;
+    // Degenerate p': no residual or p' inverse-CDF is possible.
     if (!(admitted > 0.0f)) { return argmax; }
     const float inv_z = 1.0f / admitted;
     float local_mass  = 0.0f;
@@ -938,8 +953,12 @@ __device__ inline int sampling_p_less_residual(const __nv_bfloat16* logits, std:
         if (r > 0.0f) { local_mass += r; }
     }
     const float mass = sampling_block_sum(local_mass, red_val);
-        if (!(mass > 0.0f)) {
-        return sampling_p_less_in_domain(draft_id, vocab, cfg) ? draft_id : argmax;
+    if (!(mass > 0.0f)) {
+        // Empty max(0,p'-q): q covered p' (16-way shortlist) or the draft was
+        // the only survivor. Draw from p' rather than re-emitting the rejected
+        // draft (that loop is independent of whether the selector was greedy).
+        return sampling_p_less_inverse_cdf(logits, base, vocab, cfg, gate, u, argmax, red_val,
+                                           red_idx);
     }
     red_val[tid] = local_mass;
     __syncthreads();
@@ -965,7 +984,7 @@ __device__ inline int sampling_p_less_residual(const __nv_bfloat16* logits, std:
     }
     red_idx[tid] = local_pick;
     __syncthreads();
-    int picked = sampling_p_less_in_domain(draft_id, vocab, cfg) ? draft_id : argmax;
+    int picked = argmax;
     for (int t = 0; t < blockDim.x; ++t) {
         if (red_idx[t] >= 0) {
             picked = red_idx[t];

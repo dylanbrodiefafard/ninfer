@@ -204,7 +204,9 @@ P-less is the default process/request truncation mode, with temperature `2.0` fo
 temperature and seed, ignores top-p, top-k, min-p, and presence/frequency penalties, and writes a
 one-time warning on stderr. Ignored parameters must still satisfy their normal input ranges.
 `--no-p-less-sampling` opts into the registered production sampler. Combined with `--greedy`,
-p-less remains exact argmax.
+p-less remains exact argmax. Under MTP or DFlash2, p-less applies at hop 0 (chain Leviathan with
+one-hot draft `q`, or tree SpecInfer membership). Later hops and the bonus after a full accept
+are greedy packed-column argmax.
 
 Repeat `--stop-token-id`, `--stop`, or `--reasoning-stop` to add stop conditions. Use
 `--raw-output` to expose the frontend's raw output stream and `--print-token-ids` to include
