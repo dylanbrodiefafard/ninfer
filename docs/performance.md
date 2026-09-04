@@ -259,26 +259,74 @@ failure. At C=8, available device memory after startup was 2.66 GiB for 27B grou
 RTX 5090, CUDA Graph, NVFP4 KV, optimized proposal head, greedy
 `long_decode_aime26_15`, 2,048 output tokens per request, max-context 16,384, and one compact
 full-concurrency batch. The retained W=5 route aggregates the A16 attention-output, GDN-output,
-and MLP-down residual projections across requests. Numerically sensitive attention-input and
-fused SwiGLU projections remain request panels; other verify widths also retain their prior panel
-execution until separately qualified.
+MLP-down, fused SwiGLU, and supported fused attention-input projections across requests. Packed
+GDN conv-record uses one request-indexed SmallT launch for C=2..4 instead of C serialized T=1
+launches; C=1 retains the post-origin T=1 route.
+Attention-input aggregation is limited to the NVFP4 and BF16-control routes used by this
+artifact; Q4/Q5 and other verify widths retain their prior panel execution until separately
+qualified.
 
-| C | Panel control tok/s | Aggregate tok/s | Change |
-|---:|---:|---:|---:|
-| 1 | — | 175.4 | unchanged execution shape |
-| 2 | 207.6 | 228.6 | +10.1% |
-| 3 | 214.6 | 240.1 | +11.9% |
-| 4 | 209.8 | 236.6 | +12.8% |
+| C | All panels tok/s | Residual aggregate tok/s | Projection aggregates tok/s | Concurrent GDN tok/s | vs prior | vs panels |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 161.3 | 173.6 | 187.5 | **219.9** | +17.3% | +36.3% |
+| 3 | 163.6 | 177.8 | 193.3 | **229.6** | +18.8% | +40.4% |
+| 4 | 164.4 | 173.5 | 186.8 | **220.6** | +18.1% | +34.2% |
 
-The matched C=2..4 control and aggregate runs use the same source/toolchain apart from the three
-projection call sites. An nsys C=4 capture reduced total GPU kernel time per DFlash path-select
-round from 55.6 ms to 49.1 ms (-11.7%). At the operator level, four W=5 A16 LinearAdd panels
-versus one T=20 launch measured 90.1 vs 51.2 us for 5120x6144 and 196.7 vs 114.7 us for
-5120x17408. Independent FP64 Op oracles cover the A16 aggregate schedule through T=64, and the
-W=5 C=2/3/4 aggregate results are bit-identical to separate panels for both NVFP4 and BF16
-weights. Reports: `profiles/bench/c4-retune-panel-control-final-20260903/`,
-`profiles/bench/c4-retune-residual-aggregate-final-20260903/`, and
-`profiles/nsys/c4-retune-{baseline,residual-aggregate}.nsys-rep`.
+The same shared target route improves matched MTP4 serving without changing acceptance:
+
+| C | All panels tok/s | Residual aggregate tok/s | Projection aggregates tok/s | Concurrent GDN tok/s | vs prior | vs panels |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 156.7 | 167.9 | 178.4 | **212.1** | +18.9% | +35.3% |
+| 3 | 162.3 | 177.2 | 190.9 | **229.5** | +20.2% | +41.4% |
+| 4 | 164.8 | 175.2 | 188.1 | **225.3** | +19.8% | +36.7% |
+
+The post-origin C=2..4 runs use the same artifact and prompts. All-panel, residual-only,
+projection, and concurrent-GDN runs have identical output hashes,
+speculative rounds, drafted-token counts, accepted-token counts, and acceptance. Relative to
+five-token panels, the aggregated NVFP4 SwiGLU launches at T=10/15/20 measured
+114.7/165.9/213.1 us instead of
+174.1/233.5/294.9 us. NVFP4 attention-input measured 59.4/75.8/92.2 us instead of
+73.7/102.4/131.1 us; the six BF16-control attention layers measured 108.5/124.9/137.2 us instead
+of 202.8/301.1/399.4 us. The BF16 panel-preserving phase order is intentionally global at these
+shapes: against the prior standalone packed route, T=10 is 1.9% slower, T=15 is 13.0% slower
+(110.6 to 124.9 us), and T=20 is unchanged. That cost is dominated by eliminating two repeated
+weight passes in the supported W=5 C=3 production route, which is 58.5% faster than its panels.
+At the complete public GDN conv-record Op, W=5 C=2 cold Graph replay fell from 217.088 to
+110.592 us (-49.1%); the superseded pair-within-CTA candidate measured 215.072 us and was removed.
+
+Independent mathematical Op oracles cover every new T=10/15/20 route. The residual T=20
+schedule retains the T=5 panel's 16-value-per-lane reduction; using the generic eight-value
+schedule changed reduction association and failed the long C=4 identity gate. A true all-panels
+versus combined C=4 probe was bit-identical across 512,000 sampled post-MLP BF16 values, 102,400
+target-hidden BF16 values, 4,966,400 target-logit BF16 values, verifier IDs, cache positions,
+argmax, and sampled live and ReplaySSM BF16/FP32 GDN state. Every checkpoint had zero mismatches,
+zero relative L2 and maximum absolute error, and no nonfinite values. The GDN change adds direct
+intermediate coverage at its public boundary: W=5 C=2/3/4 dense, ragged, and tree-parent q/k/v/z
+outputs and valid conv-record values are bit-exact to independent C=1 T=1 launches. Sixty-three
+decoded-NVFP4 FP64 projection/convolution checks had no nonfinite values; worst relative L2 was
+0.00269457 under 0.00315 and worst maximum absolute error was 0.00380876 under its 0.00738378
+gross limit. Four 2,048-token Graph
+streams also matched exactly, including 681 rounds, 2,724 drafts, 1,366 accepts, and 50.1468%
+DFlash acceptance. Separately, target-only decode PPL remained 6.414141594 through the GDN change:
+all 2,047 scored FP32 NLL values were byte-identical, with 19 terrible tokens and no nonfinite
+values. That PPL route does not exercise concurrent packed verification.
+
+A proposed fusion of the DFlash2 proposer MLP gate-up Linear and SiLU stages saved up to 2.0 us
+in isolation but reduced production throughput in its matched pre-rebase C=2/3/4 campaign, so it
+was removed.
+
+The pre-rebase C=4 CUDA Graph node trace used to select the projection work attributed 32.5% of
+kernel time to SwiGLU, 20.7% to GDN record, 17.6% to MLP down, and about 1% to DFlash top-k
+selection. A fresh post-origin C=2 trace then exposed GDN request serialization as 36.1% of the
+incremental round cost, motivating the concurrent route.
+
+Reports: `profiles/bench/multi-request-kernel-post-origin-panel-control-20260904/`,
+`profiles/bench/multi-request-kernel-post-origin-mtp4-panel-control-20260904/`,
+`profiles/bench/multi-request-kernel-post-origin-residual-only-fixed-20260904/`, and
+`profiles/bench/multi-request-kernel-post-origin-final-20260904/`. Concurrent-GDN results are in
+`profiles/bench/multi-request-kernel-gdn-{final,mtp4-final}-20260904/`; its Op A/B is in
+`profiles/bench/gdn-c2-retune-20260904/`. Accuracy report:
+`profiles/ppl/multi-request-kernel-gdn-final-20260904.{json,nllf32}`.
 
 ## Reproduction
 

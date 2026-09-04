@@ -1057,8 +1057,9 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache);
         // Target verify stays packed B=batch. Linear/GDN-control panel at C=1 width.
-        // GQA launches one B=1 decode per sequence; packed GDN conv-record is fused T=1
-        // GEMV+conv. Isolating the whole 27B forward serialized C=2 and broke graph capture.
+        // GQA launches one B=1 decode per sequence; packed GDN conv-record uses fused T=1
+        // reduction at B=1 and one request-indexed SmallT grid at B=2..4. Isolating the whole
+        // 27B forward serialized C=2 and broke graph capture.
         DFlashFeatureSink sink =
             batch_feature_sink_impl<Variant>(state, lanes, valid_columns, vw, batch_size);
         TargetVerifyFrameView verify_frame{

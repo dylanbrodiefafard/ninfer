@@ -68,8 +68,8 @@ void nvfp4_gdn_record_small_t_launch(const Tensor& x, const Weight& weight,
                                      Tensor& z, cudaStream_t stream,
                                      const std::int32_t* parent_index = nullptr);
 
-// Packed T=2..16 record: one launch of T=1 GEMV+FP32 conv per sequence. Weights stay in L2
-// across the token loop; each column matches ordinary-decode GEMV+BF16 3-tap history.
+// Packed T=2..16 B=1 record: T=1 GEMV+FP32 conv with BF16 3-tap history. B>1 dispatches
+// the same-reduction request-indexed SmallT route above.
 void nvfp4_gdn_record_t1_fused_launch(const Tensor& x, const Weight& weight,
                                       const Tensor& conv_weight, const Tensor& conv_states,
                                       const Tensor& valid_columns, const Tensor& initial_slot,

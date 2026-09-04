@@ -203,23 +203,29 @@ The opt-in 27B live Engine tests (`ninfer_qwen3_6_27b_prefix_real_test`,
 
 `ninfer_qwen3_8_27b_dflash_real_test` loads a reconverted NVFP4+DFlash2 file from
 `NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS`. Sequential C=1 DFlash tokens are saved and used
-as the C>1 oracle: overlapping C=3 Graph DFlash2 greedy on three distinct prompts must
+as the C>1 oracle: overlapping C=4 Graph DFlash2 greedy on four distinct prompts must
 match C=1 DFlash of the same k. The same C=1 and C>1 strings are also compared against
 target-only T=1 decode. A later packed/T=1 greedy flip is not treated as row mixing;
 `NINFER_DFLASH_TEST_RELAX_ORACLE=1` continues past that T=1 mismatch. Product k=4 and k=5
 chain widths are T=5/T=6 SmallT, so they are not required to match MTP k=3 token-for-token.
-NVFP4 GDN conv-record is fused T=1 GEMV+FP32 conv in one launch per sequence (ordinary-decode
-GEMV and BF16 3-tap history). Flattening that site to `T=W×B` compose (W4A4 GEMM + BF16 conv)
-flipped greedy column 0 versus C=1; `run_nvfp4_batched_matches_serial_fused` guards the
-identity. Packed GDN recurrent then overlays T=1 snapshot `out` on scratch SSM. DFlash C>1
+NVFP4 GDN conv-record keeps the ordinary-decode reduction and BF16 3-tap history. B=1 uses the
+fused T=1 GEMV+FP32 conv route; B=2..4 uses one same-reduction SmallT launch with request-indexed
+CTAs and explicit BF16 history roundtrips. Flattening that site to `T=W×B` W4A4 compose flipped
+greedy column 0 versus C=1; `run_nvfp4_batched_matches_serial_fused` guards exact q/k/v/z and
+valid-record identity for dense, ragged, and tree-parent W=5 C=2..4 shapes. Packed GDN recurrent
+then overlays T=1 snapshot `out` on scratch SSM. DFlash C>1
 propose isolates each compact row as a C=1-shaped forward (`T=width`, `B=1`) so draft
 Linears, SWA, and the draft head use sequential kernels. Eager propose resolves SWA's
 direct/split route from the row frontier rather than the batch maximum; graph replay keeps
 its fixed profile envelope. Target verify stays packed `B=batch` so graphs capture one 27B
 forward; ReplaySSM records are `layer(g, 0, B)` and the feature sink covers the compact
-lanes. Packed Linear/GDN-control sites that aggregate `T=W×B` launch at the C=1 width via
+lanes. Packed Linear/GDN-control sites normally launch at the C=1 width via
 `linear_packed_sequences` / `packed_route_tokens` so C>1 does not select a different
 T-specialized kernel (NVFP4 SmallT warp count, Q4 draft-head SmallT vs MMA, or A16↔W4A4).
+The qualified W=5 C=2..4 residual Linear, fused NVFP4/BF16-control attention-input, and NVFP4
+SwiGLU routes are explicit exceptions: their A16 T=10/15/20 schedules are bit-identical to C
+separate T=5 panels. In particular, residual T=20 retains the T=5 panel reduction profile rather
+than using the generic T=20 reduction.
 Target GQA stays `[D, heads, W, B]` and launches one B=1 decode per sequence (SmallT or
 ChunkedSmallT at T<=6; Prompt at T>6 on 24 Q heads) so a packed caller does not take
 `MultiBatch=true`; p-less T=2 samples that reduction. NVFP4 target verify at `T>=4` uses W4A4 attention, so no DFlash path is required

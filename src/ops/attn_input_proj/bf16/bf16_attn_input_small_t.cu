@@ -55,7 +55,9 @@ struct Bf16AttentionSmallTProductionSchedule {
     static constexpr Bf16SmallTActivationAccess kActivationAccess =
         ActiveTokens <= 8 ? Bf16SmallTActivationAccess::WarpPacked
                           : Bf16SmallTActivationAccess::DirectStream;
-    static constexpr bool kSequential = ActiveTokens <= 9 || ActiveTokens >= 17;
+    static constexpr bool kW5Aggregate =
+        ActiveTokens == 10 || ActiveTokens == 15 || ActiveTokens == 20;
+    static constexpr bool kSequential = kW5Aggregate || ActiveTokens <= 9 || ActiveTokens >= 17;
     static constexpr bool kUnroll2 = ActiveTokens == 4 || ActiveTokens == 5 || ActiveTokens == 8 ||
                                      (ActiveTokens >= 10 && ActiveTokens <= 18) ||
                                      ActiveTokens >= 23;

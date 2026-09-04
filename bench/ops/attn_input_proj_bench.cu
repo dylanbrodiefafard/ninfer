@@ -44,6 +44,7 @@ struct Options {
     int warmup   = 5;
     int repeat   = 30;
     bool profile = false;
+    std::int32_t panel_width = 0;
     std::string csv_out;
 };
 
@@ -64,7 +65,7 @@ struct Result {
                  "usage: ninfer_attn_input_proj_bench "
                  "[--format q4q5|w8-qgkv|w8-qkv|bf16|nvfp4|all] "
                  "[--nvfp4-policy a16|a4] [--tokens T,...] [--cache cold|warm|both] "
-                 "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
+                 "[--panel-width N] [--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
                  message);
     std::exit(2);
 }
@@ -145,6 +146,10 @@ Options parse_options(int argc, char** argv) {
             options.warmup = parse_i32(next("--warmup requires a value"), 0, 10000, "--warmup");
         } else if (argument == "--repeat") {
             options.repeat = parse_i32(next("--repeat requires a value"), 1, 10000, "--repeat");
+        } else if (argument == "--panel-width") {
+            options.panel_width =
+                parse_i32(next("--panel-width requires a value"), 1,
+                          std::numeric_limits<std::int32_t>::max(), "--panel-width");
         } else if (argument == "--profile") {
             options.profile = true;
         } else if (argument == "--csv-out") {
@@ -158,6 +163,16 @@ Options parse_options(int argc, char** argv) {
     if (options.profile && (options.format == Format::All || options.tokens.size() != 1 ||
                             options.cache == CacheMode::Both)) {
         usage("--profile requires one format, one T, and one cache state");
+    }
+    if (options.panel_width > 0) {
+        if (options.format != Format::Bf16 && options.format != Format::Nvfp4) {
+            usage("--panel-width requires --format bf16 or nvfp4");
+        }
+        for (const std::int32_t tokens : options.tokens) {
+            if (tokens % options.panel_width != 0) {
+                usage("every T must be divisible by --panel-width");
+            }
+        }
     }
     return options;
 }
@@ -290,6 +305,23 @@ void run_four_output(const Options& options, const char* format, QType qtype,
         Tensor tk(k.p, DType::BF16, {kv_rows, tokens});
         Tensor tv(v.p, DType::BF16, {kv_rows, tokens});
         const auto launch = [&](cudaStream_t launch_stream) {
+            if (options.panel_width > 0) {
+                for (std::int32_t offset = 0; offset < tokens; offset += options.panel_width) {
+                    Tensor panel_x = x.slice(1, offset, options.panel_width);
+                    Tensor panel_q = tq.slice(1, offset, options.panel_width);
+                    Tensor panel_g = tg.slice(1, offset, options.panel_width);
+                    Tensor panel_k = tk.slice(1, offset, options.panel_width);
+                    Tensor panel_v = tv.slice(1, offset, options.panel_width);
+                    if (implicit_a16_entry) {
+                        ops::attn_input_proj(panel_x, fixture.weight, panel_q, panel_g, panel_k,
+                                             panel_v, launch_stream);
+                    } else {
+                        ops::attn_input_proj(panel_x, fixture.weight, panel_q, panel_g, panel_k,
+                                             panel_v, policy, workspace, launch_stream);
+                    }
+                }
+                return;
+            }
             if (implicit_a16_entry) {
                 ops::attn_input_proj(x, fixture.weight, tq, tg, tk, tv, launch_stream);
             } else {
@@ -304,7 +336,10 @@ void run_four_output(const Options& options, const char* format, QType qtype,
                            options.warmup);
             continue;
         }
-        const std::uint64_t logical = fixture.model_weight_bytes() + tensor_bytes(hidden, tokens) +
+        const std::int32_t weight_reads =
+            options.panel_width > 0 ? tokens / options.panel_width : 1;
+        const std::uint64_t logical = fixture.model_weight_bytes() * weight_reads +
+                                      tensor_bytes(hidden, tokens) +
                                       tensor_bytes(2 * q_rows + 2 * kv_rows, tokens);
         const double flops = 2.0 * parent_rows * hidden * static_cast<double>(tokens);
         for (const CacheState cache : {CacheState::Cold, CacheState::Warm}) {
@@ -366,12 +401,13 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
     std::ofstream output(path);
     if (!output) throw std::runtime_error("failed to open CSV output");
-    output << "entry,format,policy,cache,T,workspace_bytes,logical_bytes,useful_flops,"
+    output << "entry,format,policy,cache,T,panel_width,workspace_bytes,logical_bytes,useful_flops,"
               "median_us,min_us,p95_us\n";
     for (const Result& result : results) {
         output << "attn_input_proj," << result.format << ',' << result.policy << ','
-               << cache_name(result.cache) << ',' << result.tokens << ',' << result.workspace_bytes
-               << ',' << result.logical_bytes << ',' << result.useful_flops << ','
+               << cache_name(result.cache) << ',' << result.tokens << ',' << options.panel_width
+               << ',' << result.workspace_bytes << ',' << result.logical_bytes << ','
+               << result.useful_flops << ','
                << result.timing.median_us << ',' << result.timing.min_us << ','
                << result.timing.p95_us << '\n';
     }

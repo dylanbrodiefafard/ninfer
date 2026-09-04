@@ -76,6 +76,8 @@ using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
 template <int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    static constexpr bool kW5MultiRequest =
+        ActiveTokens == 10 || ActiveTokens == 15 || ActiveTokens == 20;
     static constexpr auto kActivationAccess = ActiveTokens <= 4
                                                   ? Nvfp4SmallTActivationAccess::SharedPhase
                                                   : Nvfp4SmallTActivationAccess::TokenPacked;
@@ -83,7 +85,11 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
     // MLP-down reads next (pair microbench cs+def: ~+10% warm vs Default; solo SwiGLU loses).
     static constexpr auto kCodeCache =
         ActiveTokens <= 4 ? Nvfp4CodeCache::Streaming : Nvfp4CodeCache::Default;
-    static constexpr int kWarpsPerCta = ActiveTokens >= 13 ? 16 : (ActiveTokens >= 5 ? 4 : 8);
+    // W=5 C=2..4 keeps the qualified four-warp T=5 reduction mapping while loading each
+    // gate/up row only once across requests. The generic T>=13 sixteen-warp mapping assigns
+    // rows differently and is not the target-verification arithmetic profile.
+    static constexpr int kWarpsPerCta =
+        kW5MultiRequest ? 4 : (ActiveTokens >= 13 ? 16 : (ActiveTokens >= 5 ? 4 : 8));
     using Schedule = Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, 16, ActiveTokens, 1, kActivationAccess,
                                          Nvfp4ScaleAccess::Direct, kCodeCache, 1,
                                          Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
@@ -105,7 +111,7 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
         &launch_exact<kNvfp4FirstSmallT + static_cast<int>(Offsets)>...};
 }
 
-constexpr auto kLaunchers = make_launchers(std::make_index_sequence<16 - kNvfp4FirstSmallT + 1>{});
+constexpr auto kLaunchers = make_launchers(std::make_index_sequence<20 - kNvfp4FirstSmallT + 1>{});
 
 } // namespace
 

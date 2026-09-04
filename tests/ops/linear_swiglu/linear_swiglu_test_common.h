@@ -29,4 +29,9 @@ int run_profile(std::string_view label, const Profile& profile,
 int run_column0_matches_decode(std::string_view label, const Profile& profile,
                                std::span<const std::int32_t> packed_widths);
 
+// Exact supplementary parity for a packed call against independent fixed-width panels.
+int run_packed_matches_panels(std::string_view label, const Profile& profile,
+                              std::int32_t panel_width,
+                              std::span<const std::int32_t> packed_widths);
+
 } // namespace ninfer::test::linear_swiglu

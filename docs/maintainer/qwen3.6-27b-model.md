@@ -384,9 +384,14 @@ One propose block:
 5. The 27B target verifies the packed tree (product W=12 at k=7) or chain (W=k+1) in one
    causal forward for the compact batch. Concurrent C>1 keeps that forward packed (`B=batch`)
    so CUDA graphs capture one 27B verify rather than a serial host loop. Residual Linear and
-   GDN-control panel at the C=1 width (`packed_route_tokens`); GQA launches one B=1 decode per
-   sequence so it does not take `MultiBatch=true`. ReplaySSM records are `layer(g, 0, B)`.
-   Packed GDN conv-record is fused T=1 GEMV+FP32 conv in one launch per sequence; packed GDN
+   GDN-control normally panel at the C=1 width (`packed_route_tokens`); the qualified W=5
+   C=2..4 residual Linear routes instead use one panel-bit-exact A16 T=10/15/20 launch; T=20
+   retains the T=5 panel reduction profile. Fused
+   NVFP4/BF16-control attention input and NVFP4 SwiGLU make the same qualified exception. GQA
+   launches one B=1 decode per sequence so it does not take `MultiBatch=true`. ReplaySSM records
+   are `layer(g, 0, B)`.
+   Packed GDN conv-record keeps the T=1 reduction and BF16 history boundary: B=1 uses the fused
+   T=1 GEMV+FP32 conv route, while B=2..4 uses one request-indexed SmallT launch. Packed GDN
    recurrent overlays T=1 snapshot `out` on scratch SSM. Greedy accepts the matching prefix.
    Truncated sampling uses Leviathan `min(1,p/q)` on every hop. Under p-less, hop 0 is
    Leviathan with one-hot `q` (tree: SpecInfer membership); later hops and the bonus are greedy
@@ -413,9 +418,9 @@ target tokens. Under p-less, DFlash2 chain accept uses the same one-hot `q` conv
 full accept, are greedy (accept iff the draft equals that packed column's p-less argmax). Packed
 tree verify is the same split: hop 0 is SpecInfer membership from p-less(`P_LLM`); later hops walk
 only the argmax child. DFlash2 differs by producing the whole candidate chain in one masked-block
-forward. Packed GDN conv-record is fused T=1 GEMV+FP32 conv; packed GDN recurrent overlays ordinary
-T=1 snapshot arithmetic on scratch SSM so those packed logits match width-one decode. Fold still
-consumes the T=W records.
+forward. Packed GDN conv-record uses a T=1-reduction, BF16-history SmallT launch at B=2..4; packed
+GDN recurrent overlays ordinary T=1 snapshot arithmetic on scratch SSM so those packed logits
+match width-one decode. Fold still consumes the T=W records.
 
 Target verification writes candidate KV into provisioned but unpublished extents. After the final
 per-row output prefix is known, one all-layer Fold commits the accepted sequential prefix into the

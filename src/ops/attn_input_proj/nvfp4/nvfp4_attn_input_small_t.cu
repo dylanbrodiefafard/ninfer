@@ -52,7 +52,10 @@ struct Nvfp4AttentionSmallTProductionSchedule {
     static_assert(ActiveTokens >= kNvfp4FirstSmallT);
     static_assert(ActiveTokens <= kNvfp4LastSmallT);
     static constexpr int kWarpsPerCta       = ActiveTokens >= 17 ? 4 : (ActiveTokens >= 8 ? 16 : 8);
-    static constexpr int kValuesPerLane     = ActiveTokens >= 17 && ActiveTokens <= 20 ? 8 : 16;
+    static constexpr bool kW5Aggregate =
+        ActiveTokens == 10 || ActiveTokens == 15 || ActiveTokens == 20;
+    static constexpr int kValuesPerLane =
+        kW5Aggregate ? 16 : (ActiveTokens >= 17 && ActiveTokens <= 20 ? 8 : 16);
     static constexpr auto kActivationAccess = ActiveTokens <= 4
                                                   ? Nvfp4SmallTActivationAccess::SharedPhase
                                                   : Nvfp4SmallTActivationAccess::TokenPacked;
