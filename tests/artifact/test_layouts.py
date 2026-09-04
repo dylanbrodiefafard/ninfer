@@ -18,6 +18,8 @@ from tools.artifact.layouts import (
     encode_row_split,
     encoded_size,
     gather_row_planes,
+    ggml_block_geometry,
+    ggml_matrix_view,
     row_split_geometry,
     split_row_planes,
 )
@@ -104,6 +106,79 @@ def test_row_split_geometry_and_encoded_size_are_derived_from_format_and_shape()
         4352,
         0,
     )
+
+
+@pytest.mark.parametrize(
+    ("format_name", "block_values", "block_bytes"),
+    (
+        ("Q8_0", 32, 34),
+        ("Q4_K", 256, 144),
+        ("Q5_K", 256, 176),
+        ("Q6_K", 256, 210),
+        ("IQ1_S", 256, 50),
+        ("IQ2_XXS", 256, 66),
+        ("IQ4_NL", 32, 18),
+    ),
+)
+def test_ggml_block_layout_preserves_exact_source_rows(
+    format_name: str, block_values: int, block_bytes: int
+) -> None:
+    shape = (3, 2, 2 * block_values)
+    geometry = ggml_block_geometry(format_name, shape)
+    assert (
+        geometry.matrices,
+        geometry.rows_per_matrix,
+        geometry.columns,
+        geometry.block_values,
+        geometry.block_bytes,
+        geometry.blocks_per_row,
+        geometry.row_bytes,
+        geometry.matrix_bytes,
+        geometry.payload_bytes,
+    ) == (
+        3,
+        2,
+        2 * block_values,
+        block_values,
+        block_bytes,
+        2,
+        2 * block_bytes,
+        4 * block_bytes,
+        12 * block_bytes,
+    )
+    assert encoded_size("ggml-block-row-v1", format_name, shape) == 12 * block_bytes
+
+    payload = bytes(index & 0xFF for index in range(geometry.payload_bytes))
+    expert = ggml_matrix_view(payload, format_name, shape, 1)
+    assert isinstance(expert, memoryview)
+    assert expert.obj is payload
+    assert bytes(expert) == payload[geometry.matrix_bytes : 2 * geometry.matrix_bytes]
+
+    resident = torch.arange(geometry.payload_bytes, dtype=torch.int64).to(torch.uint8)
+    resident_expert = ggml_matrix_view(resident, format_name, shape, 2)
+    assert isinstance(resident_expert, torch.Tensor)
+    assert resident_expert.data_ptr() == resident.data_ptr() + 2 * geometry.matrix_bytes
+    assert torch.equal(
+        resident_expert,
+        resident[2 * geometry.matrix_bytes : 3 * geometry.matrix_bytes],
+    )
+
+
+def test_ggml_block_layout_rejects_partial_rows_wrong_ranks_and_formats() -> None:
+    with pytest.raises(ValueError, match="K divisible by 256"):
+        ggml_block_geometry("Q5_K", (4, 255))
+    with pytest.raises(ValueError, match="rank 2.*rank 3"):
+        ggml_block_geometry("IQ1_S", (256,))
+    with pytest.raises(ValueError, match="registered GGML block format"):
+        ggml_block_geometry("NVFP4", (128, 64))
+    with pytest.raises(ValueError, match="does not accept"):
+        encoded_size("ggml-block-row-v1", "BF16", (2, 256))
+
+    payload = bytes(2 * 144)
+    with pytest.raises(ValueError, match="expected 288"):
+        ggml_matrix_view(payload[:-1], "Q4_K", (2, 256))
+    with pytest.raises(IndexError, match="outside"):
+        ggml_matrix_view(payload, "Q4_K", (2, 256), 1)
 
 
 @pytest.mark.parametrize(

@@ -38,6 +38,7 @@ WEIGHT_VARS=(
   NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS
   NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS
   NINFER_QWEN3_6_35B_A3B_WEIGHTS
+  NINFER_QWEN4_VERIFY_WEIGHTS
 )
 
 while [[ $# -gt 0 ]]; do
@@ -99,6 +100,9 @@ weight_filenames() {
     NINFER_QWEN3_6_35B_A3B_WEIGHTS)
       printf '%s\n' qwen3_6_35b_a3b.ninfer
       ;;
+    NINFER_QWEN4_VERIFY_WEIGHTS)
+      printf '%s\n' qwen4_ud_iq1_s_verify.ninfer
+      ;;
   esac
 }
 
@@ -118,6 +122,9 @@ weight_tests() {
       ;;
     NINFER_QWEN3_6_35B_A3B_WEIGHTS)
       echo "35B real, ram, dflash, load-plan"
+      ;;
+    NINFER_QWEN4_VERIFY_WEIGHTS)
+      echo "Qwen4 verifier artifact and program"
       ;;
   esac
 }
@@ -364,12 +371,13 @@ print_weights_report() {
 require_real_weights() {
   if [[ -n "${NINFER_QWEN3_6_27B_NVFP4_WEIGHTS:-}" \
      || -n "${NINFER_QWEN3_6_27B_WEIGHTS:-}" \
-     || -n "${NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS:-}" ]]; then
+     || -n "${NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS:-}" \
+     || -n "${NINFER_QWEN4_VERIFY_WEIGHTS:-}" ]]; then
     return 0
   fi
-  echo "Cannot run --real: no 27B .ninfer is visible." >&2
-  echo "Place qwen3_8_27b_nvfp4.ninfer in models/ (or the builder /models mount)," >&2
-  echo "or set NINFER_QWEN3_6_27B_NVFP4_WEIGHTS in models/weights.env." >&2
+  echo "Cannot run --real: no supported .ninfer artifact is visible." >&2
+  echo "Place an exact supported artifact filename in models/ (or the builder /models mount)," >&2
+  echo "or set its NINFER_*_WEIGHTS variable in models/weights.env." >&2
   exit 1
 }
 
@@ -466,6 +474,7 @@ run_python_suite() {
     tests/artifact \
     tests/targets/qwen3_6_27b \
     tests/targets/qwen3_6_35b_a3b \
+    tests/targets/qwen4 \
     tests/test_bench_matrix.py \
     tests/test_serve_corpus.py)
 }

@@ -14,10 +14,12 @@ for the selected tool.
 |---|---|
 | Build the 27B artifact | [`convert/qwen3_6_27b/`](convert/qwen3_6_27b/) |
 | Build the Qwen3.8-27B artifact | [`convert/qwen3_8_27b/`](convert/qwen3_8_27b/) |
+| Build the unregistered Qwen4 verifier artifact | [`convert/qwen4/`](convert/qwen4/) |
 | Build the 35B-A3B artifact | [`convert/qwen3_6_35b_a3b/`](convert/qwen3_6_35b_a3b/) |
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
 | Run the 27B Python reference | [`reference/qwen3_6_27b/`](reference/qwen3_6_27b/README.md) |
 | Run the 35B-A3B Python reference | [`reference/qwen3_6_35b_a3b/`](reference/qwen3_6_35b_a3b/README.md) |
+| Inspect Qwen4-preview small-shape oracles | [`reference/qwen4/`](reference/qwen4/) |
 | Compare 27B artifact/source Vision activations | [`parity/qwen3_6_27b/`](parity/qwen3_6_27b/README.md) |
 | Kernel iteration (bound / MMA probe / Op loop) | [`kdev/`](kdev/README.md) |
 | Run benchmark matrices | [`bench/`](bench/README.md) |
@@ -57,6 +59,12 @@ python3 -m tools.convert.qwen3_6_35b_a3b.convert \
   --model /path/to/Qwen3.6-35B-A3B-base \
   --dflash-model /path/to/Qwen3.6-35B-A3B-DFlash \
   --out out/qwen3_6_35b_a3b.ninfer
+
+# Architecture-verification only: byte-preserve the pinned UD-IQ1_S tensor
+# payloads in one native artifact. This does not register an Engine target.
+python3 -m tools.convert.qwen4.convert \
+  --model /path/to/qwen4-preview-gguf/UD-IQ1_S \
+  --out /path/to/qwen4_ud_iq1_s_verify.ninfer
 ```
 
 Inspect either result:
