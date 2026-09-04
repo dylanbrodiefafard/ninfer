@@ -1,13 +1,13 @@
 # NInfer Persistent Tensor Numeric Formats
 
-This reference defines the eight persistent numeric tensor formats accepted by current `.ninfer`
+This reference defines the fifteen persistent numeric tensor formats accepted by current `.ninfer`
 artifacts: their logical words, quantization semantics, canonical reference encoders where
 applicable, and conformance boundaries. Container framing, physical byte layouts, checkpoint
 assignment, kernels, and runtime-state codecs are defined separately.
 
 ## 1. Registered formats
 
-NInfer has exactly eight persistent numeric tensor formats in three categories.
+NInfer has exactly fifteen persistent numeric tensor formats in four categories.
 
 Direct scalar formats preserve one logical scalar word per tensor element:
 
@@ -32,6 +32,22 @@ The block-scaled floating-point weight format is:
 |---|---|---:|---|---|
 | `NVFP4` | E2M1, 4 bits/weight | 16 | one E4M3FN word/group | one positive FP32 weight divisor |
 
+The source-byte-preserving GGML block formats are:
+
+| Canonical name | Values/block | Bytes/block | Represented values |
+|---|---:|---:|---|
+| `Q8_0` | 32 | 34 | binary16 scale times signed 8-bit code |
+| `Q4_K` | 256 | 144 | unsigned 4-bit codes with unsigned 6-bit scale/minimum pairs |
+| `Q5_K` | 256 | 176 | unsigned 5-bit codes with unsigned 6-bit scale/minimum pairs |
+| `Q6_K` | 256 | 210 | signed 6-bit codes with signed 8-bit group scales |
+| `IQ1_S` | 256 | 50 | ternary codebook plus odd group multiplier and signed one-eighth delta |
+| `IQ2_XXS` | 256 | 66 | magnitude codebook, parity-completed signs, and 4-bit group scale |
+| `IQ4_NL` | 32 | 18 | fixed nonlinear 16-entry signed codebook |
+
+The seven GGML identities support the byte-preserving Qwen4 architecture-verification
+verification artifact. Their registration does not register that model with the target registry or
+make it available through Engine.
+
 This is a closed registry, not a template from which arbitrary scalar types, bit widths, and group
 sizes may be constructed. In particular, `FP16`, `I64`, `Q4G32_F16S`, `Q6G128_F16S`, and
 `W8G64_F16S` do not become valid merely because their components look familiar. The use of a
@@ -39,9 +55,9 @@ binary16 scale inside the four grouped signed-integer formats does not register 
 tensor format.
 
 NInfer does not reserve entries for hypothetical formats. A future format is added only for a real
-selected checkpoint target, after its numerical contract, cited upstream quality evidence where
-quantization is involved, storage path, and useful kernels on the current execution platform are
-known. Registry membership
+selected checkpoint target or an explicitly admitted architecture-verification artifact, after its
+numerical contract, cited upstream quality evidence where quantization is involved, storage path,
+and useful verification or execution kernels on the current platform are known. Registry membership
 means that a logical representation is allowed; it does not imply that every tensor role, operator,
 layout, shape, checkpoint, or GPU can consume it.
 
@@ -66,8 +82,8 @@ The registry keeps the following concerns separate.
 
 A **persistent numeric format** defines the logical words needed to recover a numeric tensor from
 an artifact. The closed registry contains direct scalar formats, grouped signed-integer formats,
-and the block-scaled `NVFP4` format. It does not identify a tensor's model role, physical byte
-layout, or supported consumer.
+the block-scaled `NVFP4` format, and seven exact GGML block formats. It does not identify a tensor's
+model role, physical byte layout, or supported consumer.
 
 ### 2.2 Direct scalar format
 
@@ -89,7 +105,7 @@ A **quantization scheme** defines only the persistent logical representation of 
 - the validity rules for codes and scales;
 - the mathematical reconstruction of each represented weight.
 
-The five quantized names above identify schemes in this sense. Their meanings are immutable: a
+The twelve quantized names above identify schemes in this sense. Their meanings are immutable: a
 consumer must not infer a different zero point, scale geometry, code range, or reconstruction rule
 from context.
 
@@ -109,6 +125,11 @@ the resulting persistent codes and binary16 scales obey the same logical contrac
 encoder. Its current checkpoint recipe copies already selected E2M1, E4M3FN, and FP32 divisor words
 from its fixed source and validates them without requantization. Encoder provenance must not be
 confused with decoder semantics.
+
+The seven GGML block formats likewise have exact decode contracts in Section 3.4 but no
+NInfer-owned source quantizer. Their selected checkpoint recipe copies already quantized block
+bytes unchanged. The independent scalar decoders establish represented values without making the
+pinned upstream implementation part of the production runtime.
 
 Direct formats also separate representation from conversion. For example, the `BF16` format does
 not decide whether an FP32 source is rounded, truncated, or rejected. Any conversion from a source
@@ -140,9 +161,10 @@ among other things:
 
 One format may have more than one deliberately supported layout, but every layout must decode to
 exactly the same direct words or logical codes and scales. The currently registered layouts are
-`contiguous-le-v1` for direct words, `row-split-k128-v1` for grouped signed-integer formats, and
-`blockscale-k16-m128x4-v1` for `NVFP4`. Their byte order, plane packing, padding, swizzle, divisor
-placement, and alignment rules belong to the layout registry, not to these eight numeric formats.
+`contiguous-le-v1` for direct words, `row-split-k128-v1` for grouped signed-integer formats,
+`blockscale-k16-m128x4-v1` for `NVFP4`, and `ggml-block-row-v1` for the seven GGML formats. Their byte
+order, plane packing, padding, swizzle, divisor placement, and alignment rules belong to the layout
+registry, not to these fifteen numeric formats.
 
 ### 2.7 Compute profile and kernel support
 
@@ -305,6 +327,75 @@ The checkpoint recipe copies all three fields from its selected source without r
 canonicalizing them. Activation calibration is not part of this weight format. In particular, a
 site-level input divisor used by an NVFP4 execution path is a separate model-role tensor and cannot
 be inferred from `NVFP4`, its block scales, or `d_w`.
+
+### 3.4 Exact GGML block formats
+
+These seven identities preserve the exact little-endian block words selected by the source
+checkpoint. They are not aliases for the grouped formats in Section 3.2. Each block begins and ends
+at the format's registered block boundary; no scale, minimum, control word, or code crosses a block.
+All binary16 fields below are interpreted as IEEE binary16 and then exactly promoted for the
+mathematical decode.
+
+For `Q8_0`, bytes 0..1 are `d` and bytes 2..33 are two's-complement signed 8-bit `q[i]`:
+
+```text
+w[i] = d * q[i]                              i = 0..31
+```
+
+For `Q4_K` and `Q5_K`, bytes 0..1 are `d`, bytes 2..3 are `dmin`, and bytes 4..15 encode eight
+unsigned 6-bit `(s[g], m[g])` pairs. For `g < 4`, `s[g]` is the low six bits of byte `4+g` and
+`m[g]` the low six bits of byte `8+g`. For `g >= 4`, byte `8+g` contains the low nibbles of
+`s[g]` and `m[g]`; their high two bits are the high bits of bytes `g` and `4+g`, respectively,
+within that 12-byte table. Each 32-value group uses one nibble of its 32-byte quant run. `Q5_K`
+adds byte `16+i` bit `g` as code bit 4; its nibble plane begins at byte 48 rather than byte 16.
+
+```text
+Q4_K: q[g,i] in [0,15]
+Q5_K: q[g,i] in [0,31]
+w[32*g+i] = d * s[g] * q[g,i] - dmin * m[g]
+```
+
+For `Q6_K`, bytes 0..127 are low nibbles, bytes 128..191 are two-bit high planes, bytes
+192..207 are sixteen two's-complement signed 8-bit group scales, and bytes 208..209 are `d`.
+Reassembling the six stored bits yields `u[i]`; the signed code is explicitly `u[i]-32`:
+
+```text
+w[i] = d * signed_i8(scale[floor(i/16)]) * (u[i] - 32)
+```
+
+For `IQ1_S`, bytes 0..1 are `d`, bytes 2..33 are four low grid-index bytes per 32-value group,
+and bytes 34..49 are eight little-endian control words. Control bits 0..11 supply four 3-bit grid
+index extensions, bits 12..14 select odd multiplier `m=2*s+1`, and bit 15 selects delta `-1/8`
+when set and `+1/8` otherwise. Its 2,048 by 8 grid maps packed digits `0,1,2` to `-1,0,+1`:
+
+```text
+w[32*g+8*l+j] = d * m[g] * (grid[index[g,l],j] + delta[g])
+```
+
+For `IQ2_XXS`, bytes 0..1 are `d`; each following 8-byte group contains little-endian words
+`grids` and `signs_scales`. The four bytes of `grids` select four 8-value magnitude grids. Four
+7-bit sign indices occupy bits 0..27 of `signs_scales`; their eighth bit is the parity of the seven
+stored bits. Bits 28..31 select `s`, and the magnitude grid maps digits `0,1,2` to `8,25,43`:
+
+```text
+db = d * (s + 1/2) / 4
+w[32*g+8*l+j] = db * magnitude[index[g,l],j] * sign[g,l,j]
+```
+
+The immutable packed IQ1/IQ2 grids are the arrays in
+`tools/reference/qwen4/ggml_codecs.py`. Encoding each row as one little-endian
+`uint16` with lane zero in the least-significant two bits gives SHA-256
+`e9ffebfc997ad6023063a667c0bf4eedd8ebf7f56b3da399cbc7d1b1f7ea52c6` for the 4,096-byte IQ1
+table and `915952ebc4af8ddba8113583ca1316fc818843f7b825bbf1a25ae1c39bf0e16d` for the 512-byte IQ2
+table. These hashes identify immutable format data, not an artifact-integrity requirement.
+
+For `IQ4_NL`, bytes 0..1 are `d` and bytes 2..17 carry low-nibble values 0..15 followed by
+high-nibble values 16..31. A nibble indexes this exact signed codebook:
+
+```text
+[-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113]
+w[i] = d * codebook[q[i]]
+```
 
 ## 4. Grouped signed-integer tensor model
 
@@ -580,6 +671,8 @@ A conforming producer must:
   legal signed codes, including never emitting W8 `-128`;
 - for `NVFP4`, emit only valid E2M1 code words, nonnegative finite E4M3FN scale words, and one finite
   positive FP32 weight divisor under Section 3.3;
+- for an exact GGML format, copy complete source blocks unchanged and preserve the final-axis block
+  boundaries defined in Section 3.4;
 - record enough checkpoint-recipe provenance for the artifact producer to identify how the values
   were derived;
 - when an encoder converts floating-point source values, fail rather than silently quantize
@@ -606,6 +699,7 @@ The `.ninfer` container and each registered storage layout must:
   implementation;
 - for `NVFP4`, reconstruct every E2M1 code word, natural E4M3FN scale word, and the matrix FP32
   divisor under Section 3.3;
+- for exact GGML formats, preserve every source block byte and its row/block ownership;
 - define its canonical physical-padding contents and producer responsibilities, if it materializes
   padding;
 - reject unknown formats and unsupported format/layout combinations;
@@ -619,9 +713,9 @@ that representation belongs to the container contract.
 
 Project-owned producers establish the applicable value invariants while writing the artifact:
 direct-word preservation under Section 3.1, legal grouped signed-integer identities, codes, and
-scales under Section 3.2 and Sections 4 through 7, and legal `NVFP4` words and divisor under
-Section 3.3. Section 7 governs only a producer claiming the canonical grouped signed-integer encoder
-profile. The layout codec
+scales under Section 3.2 and Sections 4 through 7, legal `NVFP4` words and divisor under
+Section 3.3, and exact copied GGML blocks under Section 3.4. Section 7 governs only a producer
+claiming the canonical grouped signed-integer encoder profile. The layout codec
 preserves those already selected words and owns canonical physical padding. The offline checkpoint
 verifier checks the complete target inventory and representative source-to-artifact values.
 
@@ -638,10 +732,11 @@ codec and operator tests independently protect the representation and numerical 
 
 A consuming kernel or model component must interpret direct logical words according to Section 3.1,
 grouped signed-integer identities, codes, and scales according to Section 3.2 and Sections 5 and 6,
-and `NVFP4` words and divisor according to Section 3.3. It may choose its private fusion, reduction,
-staging, and intermediate precision; the observable Op result is qualified against the independent
-oracle with the Op's named criterion for that implementation profile. Kernel implementation details
-do not alter the persistent format and must not be needed to decode an artifact independently.
+`NVFP4` words and divisor according to Section 3.3, and exact GGML blocks according to Section 3.4.
+It may choose its private fusion, reduction, staging, and intermediate precision; the observable Op
+result is qualified against the independent oracle with the Op's named criterion for that
+implementation profile. Kernel implementation details do not alter the persistent format and must
+not be needed to decode an artifact independently.
 
 There is no mandatory generic unpack-to-dense fallback. If NInfer has not implemented the exact
 combination required by a selected target, conversion or loading fails explicitly rather than
@@ -651,7 +746,7 @@ meanings defined here.
 
 ## 9. Checkpoint and model boundary
 
-This registry does not say where any of the eight formats are used. A checkpoint numeric-format
+This registry does not say where any of the fifteen formats are used. A checkpoint numeric-format
 document must separately define, for every persisted source tensor or derived tensor:
 
 - its source checkpoint identity and source tensor or derivation;
@@ -679,12 +774,12 @@ The registry contains no implicit or reserved support for:
 
 - other direct scalar types, including `FP16`, `FP64`, signed widths other than `I32`, and unsigned
   integers;
-- other integer widths, including Q2 and Q3;
+- other constructed integer widths or group-size variants;
 - alternate group sizes for the four accepted code widths;
 - asymmetric or affine quantization with zero points;
 - per-channel schemes disguised as an arbitrary group size;
-- codebook formats such as NF4;
-- GGUF K-quant, I-quant, or block layouts as scheme aliases;
+- codebook formats other than the exact registered IQ1/IQ2/IQ4 identities;
+- GGUF K-quant, I-quant, or block formats other than the seven exact registered identities;
 - GPTQ or AWQ serialization dialects as scheme aliases;
 - any other persistent FP8, FP4, microscaling, or shared-exponent format; `NVFP4` registers only
   the exact E2M1/E4M3FN/divisor contract in Section 3.3;
@@ -704,7 +799,8 @@ registry identities.
 ### 11.1 Admission trigger
 
 A new numeric format is considered only when an accepted, measurable requirement of a real selected
-checkpoint target cannot be met by the current registry and the candidate has a concrete benefit.
+checkpoint target or explicitly admitted architecture verifier cannot be met by the current registry
+and the candidate has a concrete benefit.
 Cartesian completeness, upstream popularity, theoretical elegance, or a desire to reserve future
 IDs is insufficient.
 
@@ -757,6 +853,8 @@ enum spellings or private kernel layout. The retained codec and encoder evidence
   padding, consecutive row views, and arbitrary row gathers;
 - all 16 E2M1 words, all 256 E4M3FN words, NVFP4 scale/divisor validity, the exact divisor-based
   reconstruction equation, and known block-scale swizzle offsets;
+- fixed and randomized blocks for all seven exact GGML formats, with exact stored-byte geometry,
+  independent scalar decoding, and parity against the pinned GGML implementation;
 - canonical binary16 scale rounding, reciprocal-multiply rather than direct division, positive and
   negative ties-to-even, minimum-subnormal rescue, and rejection of non-finite or overflowing source
   groups;
@@ -768,13 +866,15 @@ encode oracle is a bit-level host/software implementation of the ordered algorit
 production converters claiming that profile require parity against it rather than defining the
 oracle through their own arithmetic. The `NVFP4` decode oracle is the E2M1/E4M3FN/FP32 divisor
 reconstruction in Section 3.3; its current producer is protected by exact source-word comparison
-rather than Section 7. An NVFP4 Op oracle starts from the represented public activation and this
-exact-decoded persistent weight. A site-level activation divisor and any private activation
-quantization do not alter the ideal Op formula; their numerical effects are covered by the
-production route's output criterion rather than reproduced inside the oracle. Numerical operator
-tests separately protect the combinations used by the registered target, including their public
-input/output formats, output tolerance, and real target shapes. Private activation quantization,
-staging, and accumulation remain implementation choices.
+rather than Section 7. The GGML decode oracles are the independent complete-block decoders from
+Section 3.4; the pinned implementation is a cross-check, not the oracle. An NVFP4 or GGML Op oracle
+starts from the represented public activation and exact-decoded persistent weight. A site-level
+activation divisor and any private activation quantization do not alter the ideal Op formula; their
+numerical effects are covered by the production route's output criterion rather than reproduced
+inside the oracle. Numerical operator tests separately protect the combinations used by the
+registered or explicitly previewed target, including their public input/output formats, output
+criterion, and real target shapes. Private activation quantization, staging, and accumulation
+remain implementation choices.
 
 ## 13. Integration summary
 
@@ -782,8 +882,8 @@ This decision leaves directory, metadata encoding, integrity, sharding, and phys
 to the container and layout contracts. This numeric-format decision does not leave the following
 questions open:
 
-- persistent low-bit weights use the four grouped signed-integer identities or the exact `NVFP4`
-  identity; no spelling constructs another scheme;
+- persistent low-bit weights use the four grouped signed-integer identities, exact `NVFP4`, or one
+  of the seven exact source-block GGML identities; no spelling constructs another scheme;
 - direct persistent tensors use only `BF16`, `FP32`, and `I32`, with the exact logical words in
   Section 3.1;
 - quantization groups run along the final logical dimension and never cross a leading coordinate;
@@ -791,6 +891,7 @@ questions open:
   with codes and reconstruction defined in Sections 5 and 6;
 - `NVFP4` uses E2M1 codes, one E4M3FN scale per K-axis group of 16, and one positive FP32 matrix
   divisor under Section 3.3;
+- the seven GGML identities retain their exact source block bytes and decode under Section 3.4;
 - the canonical `MAXABS_F16_RECIP_RNE_V1` encoder applies only to the four grouped signed-integer
   formats and uses FP16-rounded scale followed by binary32 reciprocal-multiply;
 - the container, checkpoint recipe, compute profile, and runtime-state codecs remain separate

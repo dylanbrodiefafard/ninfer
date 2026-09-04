@@ -36,7 +36,16 @@ class Nvfp4Format:
     group_size: int
 
 
-NumericFormat: TypeAlias = DirectFormat | QuantFormat | Nvfp4Format
+@dataclass(frozen=True, slots=True)
+class GgmlBlockFormat:
+    """One exact upstream GGML block representation."""
+
+    name: str
+    block_values: int
+    block_bytes: int
+
+
+NumericFormat: TypeAlias = DirectFormat | QuantFormat | Nvfp4Format | GgmlBlockFormat
 
 
 BF16 = DirectFormat("BF16", 2)
@@ -49,6 +58,14 @@ Q6G64_F16S = QuantFormat("Q6G64_F16S", 6, 64, -32, 31)
 W8G32_F16S = QuantFormat("W8G32_F16S", 8, 32, -127, 127)
 NVFP4 = Nvfp4Format("NVFP4", 16)
 
+Q8_0 = GgmlBlockFormat("Q8_0", 32, 34)
+Q4_K = GgmlBlockFormat("Q4_K", 256, 144)
+Q5_K = GgmlBlockFormat("Q5_K", 256, 176)
+Q6_K = GgmlBlockFormat("Q6_K", 256, 210)
+IQ1_S = GgmlBlockFormat("IQ1_S", 256, 50)
+IQ2_XXS = GgmlBlockFormat("IQ2_XXS", 256, 66)
+IQ4_NL = GgmlBlockFormat("IQ4_NL", 32, 18)
+
 
 DIRECT_FORMATS = MappingProxyType(
     {item.name: item for item in (BF16, FP32, I32)}
@@ -60,8 +77,14 @@ QUANT_FORMATS = MappingProxyType(
     }
 )
 NVFP4_FORMATS = MappingProxyType({NVFP4.name: NVFP4})
+GGML_BLOCK_FORMATS = MappingProxyType(
+    {
+        item.name: item
+        for item in (Q8_0, Q4_K, Q5_K, Q6_K, IQ1_S, IQ2_XXS, IQ4_NL)
+    }
+)
 NUMERIC_FORMATS = MappingProxyType(
-    {**DIRECT_FORMATS, **QUANT_FORMATS, **NVFP4_FORMATS}
+    {**DIRECT_FORMATS, **QUANT_FORMATS, **NVFP4_FORMATS, **GGML_BLOCK_FORMATS}
 )
 
 
@@ -128,15 +151,24 @@ __all__ = [
     "DIRECT_FORMATS",
     "DirectFormat",
     "FP32",
+    "GGML_BLOCK_FORMATS",
+    "GgmlBlockFormat",
     "I32",
+    "IQ1_S",
+    "IQ2_XXS",
+    "IQ4_NL",
     "NUMERIC_FORMATS",
     "NVFP4",
     "NVFP4_FORMATS",
     "Nvfp4Format",
     "NumericFormat",
     "Q4G64_F16S",
+    "Q4_K",
     "Q5G64_F16S",
+    "Q5_K",
     "Q6G64_F16S",
+    "Q6_K",
+    "Q8_0",
     "QUANT_FORMATS",
     "QuantFormat",
     "W8G32_F16S",

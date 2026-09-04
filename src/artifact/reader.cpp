@@ -96,6 +96,13 @@ NumericFormat parse_format(std::string_view name) {
     if (name == "Q6G64_F16S") { return NumericFormat::Q6G64_F16S; }
     if (name == "W8G32_F16S") { return NumericFormat::W8G32_F16S; }
     if (name == "NVFP4") { return NumericFormat::NVFP4; }
+    if (name == "Q8_0") { return NumericFormat::Q8_0; }
+    if (name == "Q4_K") { return NumericFormat::Q4_K; }
+    if (name == "Q5_K") { return NumericFormat::Q5_K; }
+    if (name == "Q6_K") { return NumericFormat::Q6_K; }
+    if (name == "IQ1_S") { return NumericFormat::IQ1_S; }
+    if (name == "IQ2_XXS") { return NumericFormat::IQ2_XXS; }
+    if (name == "IQ4_NL") { return NumericFormat::IQ4_NL; }
     throw ArtifactError("unknown tensor format: " + std::string(name));
 }
 
@@ -103,6 +110,7 @@ StorageLayout parse_layout(std::string_view name) {
     if (name == "contiguous-le-v1") { return StorageLayout::ContiguousLeV1; }
     if (name == "row-split-k128-v1") { return StorageLayout::RowSplitK128V1; }
     if (name == "blockscale-k16-m128x4-v1") { return StorageLayout::BlockScaleK16M128x4V1; }
+    if (name == "ggml-block-row-v1") { return StorageLayout::GgmlBlockRowV1; }
     throw ArtifactError("unknown tensor layout: " + std::string(name));
 }
 
@@ -355,7 +363,7 @@ struct Reader::Impl {
     std::uint64_t payload_start = 0;
 };
 
-Reader::Reader(const std::filesystem::path& path) : impl_(std::make_unique<Impl>(path)) {}
+Reader::Reader(const std::filesystem::path& path) : impl_(std::make_shared<Impl>(path)) {}
 
 Reader::~Reader()                            = default;
 Reader::Reader(Reader&&) noexcept            = default;
@@ -396,5 +404,7 @@ std::size_t Reader::read_direct(std::uint64_t absolute_offset,
                                 std::span<std::byte> destination) const {
     return impl_->file.read_direct(absolute_offset, destination);
 }
+
+std::shared_ptr<const void> Reader::retain_mapping() const noexcept { return impl_; }
 
 } // namespace ninfer::artifact

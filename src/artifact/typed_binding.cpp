@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstddef>
+#include <limits>
 #include <span>
 #include <stdexcept>
 
@@ -23,6 +24,14 @@ StorageLayout storage_layout_for(NumericFormat format) {
         return StorageLayout::RowSplitK128V1;
     case NumericFormat::NVFP4:
         return StorageLayout::BlockScaleK16M128x4V1;
+    case NumericFormat::Q8_0:
+    case NumericFormat::Q4_K:
+    case NumericFormat::Q5_K:
+    case NumericFormat::Q6_K:
+    case NumericFormat::IQ1_S:
+    case NumericFormat::IQ2_XXS:
+    case NumericFormat::IQ4_NL:
+        return StorageLayout::GgmlBlockRowV1;
     }
     throw std::logic_error("unhandled numeric format");
 }
@@ -45,6 +54,20 @@ QType qtype_for(NumericFormat format) {
         return QType::W8G32_F16S;
     case NumericFormat::NVFP4:
         return QType::NVFP4;
+    case NumericFormat::Q8_0:
+        return QType::GGML_Q8_0;
+    case NumericFormat::Q4_K:
+        return QType::GGML_Q4_K;
+    case NumericFormat::Q5_K:
+        return QType::GGML_Q5_K;
+    case NumericFormat::Q6_K:
+        return QType::GGML_Q6_K;
+    case NumericFormat::IQ1_S:
+        return QType::GGML_IQ1_S;
+    case NumericFormat::IQ2_XXS:
+        return QType::GGML_IQ2_XXS;
+    case NumericFormat::IQ4_NL:
+        return QType::GGML_IQ4_NL;
     }
     throw std::logic_error("unhandled numeric format");
 }
@@ -109,6 +132,72 @@ Weight row_split_weight(const MaterializedArtifact& materialized, ObjectHandle h
     return out;
 }
 
+bool is_ggml_block_format(NumericFormat format) {
+    return storage_layout_for(format) == StorageLayout::GgmlBlockRowV1;
+}
+
+struct GgmlQtypeGeometry {
+    std::uint32_t block_values;
+    std::uint32_t block_bytes;
+};
+
+GgmlQtypeGeometry ggml_qtype_geometry(QType qtype) {
+    switch (qtype) {
+    case QType::GGML_Q8_0:
+        return {32, 34};
+    case QType::GGML_Q4_K:
+        return {256, 144};
+    case QType::GGML_Q5_K:
+        return {256, 176};
+    case QType::GGML_Q6_K:
+        return {256, 210};
+    case QType::GGML_IQ1_S:
+        return {256, 50};
+    case QType::GGML_IQ2_XXS:
+        return {256, 66};
+    case QType::GGML_IQ4_NL:
+        return {32, 18};
+    default:
+        throw std::invalid_argument("ggml_block_matrix_view: weight is not a GGML block format");
+    }
+}
+
+Weight ggml_block_weight(const MaterializedArtifact& materialized, ObjectHandle handle,
+                         NumericFormat format, std::span<const std::int32_t> shape) {
+    if (!is_ggml_block_format(format) || (shape.size() != 2 && shape.size() != 3)) {
+        throw std::invalid_argument(
+            "materialized_ggml_block_weight: expected a rank-two matrix or rank-three bank");
+    }
+    std::array<std::uint64_t, 3> artifact_shape{};
+    for (std::size_t i = 0; i < shape.size(); ++i) {
+        if (shape[i] <= 0) {
+            throw std::invalid_argument(
+                "materialized_ggml_block_weight: dimensions must be positive");
+        }
+        artifact_shape[i] = static_cast<std::uint64_t>(shape[i]);
+    }
+    const auto geometry =
+        ggml_block_geometry(format, std::span(artifact_shape.data(), shape.size()));
+    const auto* bytes = static_cast<const std::byte*>(materialized.device_data(handle));
+
+    Weight out{};
+    out.payload       = bytes;
+    out.payload_bytes = geometry.encoded_bytes;
+    out.qtype         = qtype_for(format);
+    out.layout        = QuantLayout::GgmlBlockRow;
+    out.group_size    = static_cast<std::uint32_t>(geometry.block_values);
+    out.qdata         = bytes;
+    out.n             = static_cast<std::int32_t>(geometry.rows_per_matrix);
+    out.k             = static_cast<std::int32_t>(geometry.columns);
+    out.group         = static_cast<std::int32_t>(geometry.block_values);
+    out.ndim          = static_cast<std::uint32_t>(shape.size());
+    for (std::size_t i = 0; i < shape.size(); ++i) {
+        out.shape[i]        = shape[i];
+        out.padded_shape[i] = shape[i];
+    }
+    return out;
+}
+
 } // namespace
 
 ObjectHandle bind_tensor(Binder& binder, std::string_view name, NumericFormat format,
@@ -116,10 +205,18 @@ ObjectHandle bind_tensor(Binder& binder, std::string_view name, NumericFormat fo
     const ObjectHandle handle =
         binder.require_tensor(name, format, storage_layout_for(format),
                               std::span<const std::uint64_t>(shape.begin(), shape.size()));
-    if (placement == TensorPlacement::Device) {
+    switch (placement) {
+    case TensorPlacement::Device:
         binder.materialize_on_device(handle);
-    } else {
+        break;
+    case TensorPlacement::MappedHost:
+        binder.map_tensor_on_host(handle);
+        break;
+    case TensorPlacement::ValidateOnly:
         binder.validate_only(handle);
+        break;
+    default:
+        throw std::invalid_argument("bind_tensor: invalid tensor placement");
     }
     return handle;
 }
@@ -147,10 +244,65 @@ Weight materialized_weight(const MaterializedArtifact& materialized, ObjectHandl
         throw std::invalid_argument(
             "materialized_weight: NVFP4 requires target-validated weight and input divisors");
     }
+    if (is_ggml_block_format(format)) {
+        const std::array<std::int32_t, 2> shape = {rows, columns};
+        return ggml_block_weight(materialized, handle, format, shape);
+    }
     if (storage_layout_for(format) == StorageLayout::ContiguousLeV1) {
         return contiguous_weight(materialized, handle, format, rows, columns);
     }
     return row_split_weight(materialized, handle, format, rows, columns);
+}
+
+Weight materialized_ggml_block_weight(const MaterializedArtifact& materialized,
+                                      ObjectHandle handle, NumericFormat format,
+                                      std::initializer_list<std::int32_t> shape) {
+    return ggml_block_weight(materialized, handle, format,
+                             std::span<const std::int32_t>(shape.begin(), shape.size()));
+}
+
+Weight ggml_block_matrix_view(const Weight& bank, std::int32_t matrix_index) {
+    const auto geometry = ggml_qtype_geometry(bank.qtype);
+    if (bank.layout != QuantLayout::GgmlBlockRow || bank.ndim != 3 || bank.shape[0] <= 0 ||
+        bank.shape[1] <= 0 || bank.shape[2] <= 0 || matrix_index < 0 ||
+        matrix_index >= bank.shape[0] || bank.payload == nullptr || bank.qdata != bank.payload ||
+        bank.qhigh != nullptr || bank.scales != nullptr || bank.high_plane_bytes != 0 ||
+        bank.n != bank.shape[1] || bank.k != bank.shape[2] ||
+        bank.padded_shape[0] != bank.shape[0] || bank.padded_shape[1] != bank.shape[1] ||
+        bank.padded_shape[2] != bank.shape[2] || bank.group_size != geometry.block_values ||
+        bank.group != static_cast<std::int32_t>(geometry.block_values) ||
+        bank.shape[2] % static_cast<std::int32_t>(geometry.block_values) != 0) {
+        throw std::invalid_argument("ggml_block_matrix_view: invalid GGML expert bank or index");
+    }
+    const std::uint64_t row_bytes =
+        static_cast<std::uint64_t>(bank.shape[2]) / geometry.block_values * geometry.block_bytes;
+    if (row_bytes > std::numeric_limits<std::uint64_t>::max() /
+                        static_cast<std::uint64_t>(bank.shape[1])) {
+        throw std::invalid_argument("ggml_block_matrix_view: GGML matrix size overflows");
+    }
+    const std::uint64_t matrix_bytes = row_bytes * static_cast<std::uint64_t>(bank.shape[1]);
+    if (matrix_bytes > std::numeric_limits<std::uint64_t>::max() /
+                           static_cast<std::uint64_t>(bank.shape[0]) ||
+        bank.payload_bytes != matrix_bytes * static_cast<std::uint64_t>(bank.shape[0])) {
+        throw std::invalid_argument("ggml_block_matrix_view: invalid GGML expert bank payload");
+    }
+    const auto offset = matrix_bytes * static_cast<std::uint64_t>(matrix_index);
+    const auto* data  = static_cast<const std::byte*>(bank.payload) + offset;
+
+    Weight out        = bank;
+    out.payload       = data;
+    out.payload_bytes = matrix_bytes;
+    out.qdata         = data;
+    out.ndim          = 2;
+    out.shape[0]      = bank.shape[1];
+    out.shape[1]      = bank.shape[2];
+    out.shape[2]      = 1;
+    out.padded_shape[0] = bank.padded_shape[1];
+    out.padded_shape[1] = bank.padded_shape[2];
+    out.padded_shape[2] = 1;
+    out.n               = bank.shape[1];
+    out.k               = bank.shape[2];
+    return out;
 }
 
 } // namespace ninfer::artifact

@@ -139,6 +139,16 @@ Tests, benchmarks, and maintainer tools are excluded from the default build. The
 C++ unit suite is `./scripts/run-unit-tests.sh`, which uses the Dockerfile `build`
 stage as the `ninfer-builder` GPU container; see [Tests](tests/README.md).
 
+The Qwen4 work is an unregistered architecture verifier, not another CLI or Engine model. Its
+current verification weights are converted from the Qwen3.8-Flash-Next UD-IQ1_S preview checkpoint.
+Maintainers with the converted `.ninfer` artifact can run the complete four-token C=1
+Text/reset-replay diagnostic directly:
+
+```bash
+NINFER_QWEN4_VERIFY_WEIGHTS=/path/to/qwen4_ud_iq1_s_verify.ninfer \
+  ctest --test-dir build -R ninfer_qwen4_program_real_test --output-on-failure
+```
+
 ## Docker
 
 Build the runtime image on a 64-bit Linux host with an RTX 5090, a CUDA 13.1-compatible NVIDIA

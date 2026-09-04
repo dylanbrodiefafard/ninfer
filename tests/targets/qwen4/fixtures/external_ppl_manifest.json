@@ -1,0 +1,123 @@
+{
+  "schema": "ninfer.qwen4.external_ppl.v1",
+  "created_utc": "2026-09-04",
+  "corpus": {
+    "path": "tests/targets/qwen4/fixtures/external_ppl_corpus.txt",
+    "utf8_bytes": 3437,
+    "sha256": "f689ec6374bdfc238155b616101ed7792f3390f64e8d10a333b07a9a71e8b1ae",
+    "construction": "seven exact repetitions of the one-line paragraph, each terminated by LF"
+  },
+  "tokenization": {
+    "authority": "pinned llama.cpp llama_tokenize",
+    "add_special": true,
+    "parse_special": false,
+    "raw_file_token_count": 602,
+    "perplexity_file_prompt_token_count": 601,
+    "file_loader_boundary": "llama.cpp -f removes exactly one terminal LF before tokenization",
+    "paragraph_with_lf_token_ids": [
+      48, 16451, 17120, 22188, 11988, 3817, 19039, 888, 264, 2716, 8097, 40701, 13, 561,
+      1558, 15339, 1754, 3299, 303, 1906, 321, 54004, 1092, 3905, 1727, 13, 3931, 921,
+      13224, 20480, 16338, 1528, 11, 6326, 13224, 62586, 6575, 2193, 11, 321, 32335, 11312,
+      5000, 3955, 10885, 13, 1061, 14648, 13901, 5533, 13983, 19464, 12, 23, 1414, 11, 14733,
+      59429, 11, 321, 3213, 10885, 364, 799, 2526, 10756, 14751, 1931, 19221, 3136, 13, 11116,
+      7193, 369, 33625, 17066, 5721, 11, 524, 264, 3591, 883, 3992, 4131, 13, 198
+    ],
+    "perplexity_file_prompt_ids_encoding": "paragraph_with_lf_token_ids repeated six times, followed by the same sequence without terminal token 198",
+    "inserted_bos": false,
+    "native_four_token_inputs": [48, 16451, 17120, 22188],
+    "native_four_token_targets": [16451, 17120, 22188, 11988]
+  },
+  "model": {
+    "identity": "Qwen3.8-Flash-Next-UD-IQ1_S",
+    "shards": [
+      {
+        "name": "Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf",
+        "sha256": "88a1420825a9304063e882ada29d438263617f51ac8923d438d927496693bafd"
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-UD-IQ1_S-00002-of-00003.gguf",
+        "sha256": "3a62e35bbf9add4733bd1438ebd3a67649d5edd6cb0e72bb78e33c913992b2b6"
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-UD-IQ1_S-00003-of-00003.gguf",
+        "sha256": "0e25ceaeb89b8a80aa973c6c0c7448943682f7408c2855b2ebd016b7643a861a"
+      }
+    ]
+  },
+  "tool": {
+    "source_tree": "/ssdpool2nvme/local_llm/llama.cpp-qwen4exp",
+    "pinned_source_commit": "9a4843cf2f1a3fc8e39f8148e92ee6bfe18e2db6",
+    "binary_version": "0.3.0-dev",
+    "binary_build": 0,
+    "binary_self_reported_commit": "unknown",
+    "compiler_self_report": "GNU 13.3.0 for Linux x86_64",
+    "prefix_nll_instrumentation": {
+      "path": "tests/targets/qwen4/fixtures/llama_perplexity_prefix_nll.patch",
+      "sha256": "85d384a90c92cde57ee5ad19e7e2059a7b9475c5048cd3253fd82bd538bc6b2f",
+      "effect": "print-only: retain positions 0..3 logits and apply the scorer's existing log_softmax without changing model evaluation or aggregate scoring"
+    }
+  },
+  "profile": {
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "gpu_memory_mib": 32607,
+    "driver": "580.173.02",
+    "cuda_arch": 1200,
+    "cuda_graphs": true,
+    "blackwell_native_fp4": true,
+    "gpu_layers": 31,
+    "fit": false,
+    "split_mode": "none",
+    "load_mode": "mmap",
+    "lazy_mode": true,
+    "flash_attention": true,
+    "cache_type_k": "iq4_nl",
+    "cache_type_v": "iq4_nl",
+    "parallel": 1,
+    "threads": 16,
+    "threads_batch": 16,
+    "warmup": false,
+    "seed": 1234
+  },
+  "command": [
+    "/ssdpool2nvme/local_llm/llama.cpp-qwen4exp/build/bin/llama-perplexity",
+    "-m", "/ssdpool2nvme/local_llm/models/qwen4-ud-iq1s/UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf",
+    "-f", "tests/targets/qwen4/fixtures/external_ppl_corpus.txt",
+    "--ctx-size", "32", "--chunks", "1", "--ppl-output-type", "1",
+    "--batch-size", "256", "--ubatch-size", "256",
+    "--threads", "16", "--threads-batch", "16",
+    "--gpu-layers", "31", "--fit", "off", "--split-mode", "none",
+    "--flash-attn", "on", "--cache-type-k", "iq4_nl", "--cache-type-v", "iq4_nl",
+    "--load-mode", "mmap", "--lazy-mode", "on", "--parallel", "1",
+    "--no-warmup", "--seed", "1234"
+  ],
+  "result": {
+    "requested_context": 32,
+    "effective_scorer_context": 32,
+    "chunks": 1,
+    "aggregate_scored_input_positions": [16, 30],
+    "aggregate_scored_target_positions": [17, 31],
+    "aggregate_scored_count": 15,
+    "mean_nll": 2.760369,
+    "ppl": 15.8057,
+    "nll_standard_error": 0.735396,
+    "ppl_uncertainty": 11.62342,
+    "native_prefix": [
+      {"position": 0, "input_id": 48, "target_id": 16451, "nll": 3.15870537},
+      {"position": 1, "input_id": 16451, "target_id": 17120, "nll": 13.7408428},
+      {"position": 2, "input_id": 17120, "target_id": 22188, "nll": 12.0528638},
+      {"position": 3, "input_id": 22188, "target_id": 11988, "nll": 8.32870839}
+    ],
+    "native_cross_route_criterion": {
+      "maximum_per_token_absolute_delta_nll": 1.0,
+      "maximum_mean_absolute_delta_nll": 0.5,
+      "maximum_non_finite_count": 0,
+      "rationale": "The profiles intentionally differ in represented activation and KV formats. A one-nat gross cap bounds any frozen target-probability ratio by e, while the 0.5-nat mean cap detects systematic full-Program drift without claiming numerical identity."
+    }
+  },
+  "limitations": [
+    "Stock llama-perplexity exposes aggregate mean NLL/PPL but not individual token NLL; the frozen print-only patch exposes the four prefix values through the same scorer log_softmax.",
+    "This llama.cpp dense-mask and IQ4_NL cache route is paired external integration evidence, not a native NInfer Op or state oracle.",
+    "IQ4_NL K/V is not NInfer NVFP4-G16 K/V, and the external result must not be used as NVFP4 cache numerical evidence.",
+    "The tiny aggregate sample has high uncertainty and is not a language-quality benchmark."
+  ]
+}

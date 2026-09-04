@@ -58,9 +58,14 @@ Artifact and model references:
 - [Qwen3.8-27B artifact contract](maintainer/qwen3.8-27b-artifact.md)
 - [Qwen3.6-35B-A3B model semantics](maintainer/qwen3.6-35b-a3b-model.md)
 - [Qwen3.6-35B-A3B artifact contracts](maintainer/qwen3.6-35b-a3b-artifact.md)
+- [Qwen4 architecture model semantics](maintainer/qwen4-model.md)
+- [Qwen4 verification artifact and preview-source inventory](maintainer/qwen4-artifact.md)
+- [Qwen4 Op contracts and qualification fixtures](maintainer/qwen4-op-contracts.md)
 
 Pending plans:
 
 - [Softmax Attention organization and migration](maintainer/softmax-attention.md) describes the
   single target state for an unfinished source and public-contract cutover; it is not the current
   implementation map.
+- [Qwen4 architecture implementation](../plans/qwen4-architecture.md) defines the preview-grounded
+  family design, runnable-target admission gate, oracle/PPL requirements, and phased product work.

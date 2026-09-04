@@ -184,6 +184,14 @@ void* MaterializedArtifact::device_data(ObjectHandle handle) const {
     return objects_[handle.index].device;
 }
 
+std::span<const std::byte>
+MaterializedArtifact::mapped_tensor_bytes(ObjectHandle handle) const {
+    if (handle.index >= objects_.size() || objects_[handle.index].mapped_tensor.empty()) {
+        throw ArtifactError("object handle does not name a mapped host tensor");
+    }
+    return objects_[handle.index].mapped_tensor;
+}
+
 std::span<const std::byte> MaterializedArtifact::resource_bytes(ObjectHandle handle) const {
     if (handle.index >= objects_.size() || objects_[handle.index].resource.empty()) {
         throw ArtifactError("object handle does not name a materialized resource");
@@ -200,6 +208,11 @@ std::vector<std::byte> MaterializedArtifact::take_resource_bytes(ObjectHandle ha
     return std::move(resource);
 }
 
+std::shared_ptr<const void>
+MaterializedArtifact::retain_reader_mapping(const Reader& reader) {
+    return reader.retain_mapping();
+}
+
 DeviceArena& MaterializedArtifact::device_arena() {
     if (!device_arena_) { throw ArtifactError("artifact has no device tensor backing"); }
     return *device_arena_;
@@ -210,13 +223,31 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     MaterializedArtifact out;
     out.objects_.resize(plan.object_count);
     const std::uint64_t capacity = plan.device_capacity_bytes;
-    if (capacity == 0 || capacity > static_cast<std::uint64_t>(SIZE_MAX)) {
+    if (capacity > static_cast<std::uint64_t>(SIZE_MAX)) {
         throw ArtifactError("artifact tensor backing size is invalid");
     }
-    out.device_arena_ = std::make_unique<DeviceArena>(static_cast<std::size_t>(capacity));
+    if (capacity != 0) {
+        out.device_arena_ = std::make_unique<DeviceArena>(static_cast<std::size_t>(capacity));
+    }
     out.stats_.device_capacity_bytes = capacity;
     out.stats_.tensor_count          = plan.device_objects.size();
+    out.stats_.mapped_tensor_count   = plan.mapped_tensor_objects.size();
     out.stats_.resource_count        = plan.host_objects.size();
+
+    if (!plan.mapped_tensor_objects.empty()) {
+        out.mapped_backing_ = MaterializedArtifact::retain_reader_mapping(reader);
+        for (const MappedTensorMaterialization& placement : plan.mapped_tensor_objects) {
+            const PayloadSpan payload =
+                reader.payload(reader.objects().at(placement.object.index));
+            if (payload.data.size() != placement.bytes) {
+                throw ArtifactError("materialization plan does not match mapped tensor payload");
+            }
+            out.objects_.at(placement.object.index).mapped_tensor = payload.data;
+            out.stats_.mapped_tensor_bytes =
+                checked_add(out.stats_.mapped_tensor_bytes, placement.bytes,
+                            "mapped tensor byte count overflows u64");
+        }
+    }
 
     for (const HostMaterialization& placement : plan.host_objects) {
         auto& resource            = out.objects_.at(placement.object.index).resource;
@@ -252,7 +283,7 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         });
         total = checked_add(total, placement.bytes, "artifact tensor byte count overflows u64");
     }
-    if (ranges.empty()) { throw ArtifactError("materialization plan has no device tensors"); }
+    if (ranges.empty()) { return out; }
     std::sort(ranges.begin(), ranges.end(), [](const CopyRange& a, const CopyRange& b) {
         return a.source_begin < b.source_begin;
     });

@@ -24,6 +24,9 @@ benchmark-report, and external protocol behavior. Repository verification princi
 - `targets/qwen3_6_35b_a3b/` — registered inventory/converter contracts, artifact-native diagnostic
   reference, MoE oracle, typed binding, selected-expert row access, 256K INT8 memory calculation,
   and the opt-in real public-Engine route;
+- `targets/qwen4/` — research-only formula/continuation fixtures and opt-in native
+  four-token Text execution for Qwen4-preview GR, PLE, exact n-gram addressing, QSA, sparse MoE,
+  and GDN; these do not register or advertise the preview as an Engine target;
 - `test_ninfer_artifact_reader.cpp` — C++ framing, directory, encoded-size, payload-span, and
   geometry behavior against a self-contained C++ fixture;
 - `test_request_memory.cpp` — startup-frozen request-transient capacity, stable address,
@@ -187,6 +190,17 @@ NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS=/ssdpool2nvme/local_llm/models/qwen3.8-nvfp
   ctest --test-dir build -R ninfer_qwen3_8_27b_mtp_nvfp4_real_test --output-on-failure
 NINFER_QWEN3_6_35B_A3B_WEIGHTS=$PWD/out/qwen3_6_35b_a3b.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_35b_a3b_ram_real_test --output-on-failure
+```
+
+The Qwen4 verification artifact has a separate unregistered test. Its weights come from the
+Qwen3.8-Flash-Next preview checkpoint. The test executes four frozen
+numeric token/target pairs through the complete C=1 eager Text schedule twice, checks exact
+reset/replay and routing/state diagnostics, and prints per-token NLL plus their PPL. It does not use
+the Engine or expose a runnable product identity:
+
+```bash
+NINFER_QWEN4_VERIFY_WEIGHTS=/path/to/qwen4_ud_iq1_s_verify.ninfer \
+  ctest --test-dir build -R ninfer_qwen4_program_real_test --output-on-failure
 ```
 
 `--system-prepend` is applied on every request, including follow-ups, so the leading system

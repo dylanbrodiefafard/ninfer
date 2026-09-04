@@ -197,13 +197,17 @@ The version-2 registry contains:
 
 | Namespace | Registered identities | Authority |
 |---|---|---|
-| tensor numeric format | `BF16`, `FP32`, `I32`, `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`, `W8G32_F16S`, `NVFP4` | [`tensor-formats.md`](tensor-formats.md) |
+| tensor numeric format | `BF16`, `FP32`, `I32`, `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`, `W8G32_F16S`, `NVFP4`, `Q8_0`, `Q4_K`, `Q5_K`, `Q6_K`, `IQ1_S`, `IQ2_XXS`, `IQ4_NL` | [`tensor-formats.md`](tensor-formats.md) |
 | `model_id` | `qwen3.6-27b`, `qwen3.6-35b-a3b`, `qwen3.8-27b` | respective [Qwen3.6-27B](qwen3.6-27b-artifact.md), [Qwen3.6-35B-A3B](qwen3.6-35b-a3b-artifact.md), or [Qwen3.8-27B](qwen3.8-27b-artifact.md) artifact reference |
 | `(model_id, weights_id)` | `qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`, `qwen3.6-35b-a3b/groupwise-int`, `qwen3.8-27b/groupwise-int`, `qwen3.8-27b/nvfp4` | respective [Qwen3.6-27B](qwen3.6-27b-artifact.md), [Qwen3.6-35B-A3B](qwen3.6-35b-a3b-artifact.md), or [Qwen3.8-27B](qwen3.8-27b-artifact.md) artifact reference |
-| tensor layout | `contiguous-le-v1`, `row-split-k128-v1`, `blockscale-k16-m128x4-v1` | [`storage-layouts.md`](storage-layouts.md) |
+| tensor layout | `contiguous-le-v1`, `row-split-k128-v1`, `blockscale-k16-m128x4-v1`, `ggml-block-row-v1` | [`storage-layouts.md`](storage-layouts.md) |
 | resource encoding | `raw-bytes-v1` | [`storage-layouts.md`](storage-layouts.md) |
 
 There are no retired tombstones at this revision.
+
+The seven GGML formats and `ggml-block-row-v1` are available to the unregistered
+Qwen4 architecture-verification artifact sourced from the preview checkpoint. They do not add a `model_id`,
+`weights_id`, target package, GGUF runtime reader, or Engine route.
 
 A registered identity has one documented meaning. The common reader does not synthesize unknown
 formats or layouts from names, bit widths, shapes, group sizes, or payload lengths.
@@ -302,10 +306,19 @@ The binder owns semantic completeness. It may generate repeated layer names and 
 with model-private loops rather than duplicating a flat JSON table in C++.
 
 Completeness validation and device residency are separate. A registered target always consumes and
-validates its complete artifact inventory, then its frozen Engine startup features select which
-validated tensor groups enter the compact device materialization plan. An omitted group has no
-device address and cannot become resident later; this does not define a partial or alternate
-artifact.
+validates its complete artifact inventory, then assigns every object exactly one placement. A tensor
+is copied to the compact device arena, exposed as a read-only mapped-host span, or validate-only; a
+resource is copied into owning host bytes or validate-only. Mapped tensors are distinct from copied
+resources: `MaterializedArtifact` retains the file mapping for the lifetime of every exposed span,
+but does not pin or copy the tensor payload. A validate-only object has no runtime address and cannot
+become resident later. These choices do not define a partial or alternate artifact.
+
+Mapped-host placement is a raw storage/lifetime mechanism, not authority for generic CPU execution
+or arbitrary weight streaming. The exact target artifact contract must name any tensor assigned that
+placement and own how bounded consumers access it. Materialization statistics report device tensor
+count, mapped tensor count/bytes, copied resource count/bytes, actual file-read bytes, H2D bytes, and
+pinned upload staging separately; merely establishing a mapping does not count the full mapped span
+as bytes read.
 
 When one target accepts multiple `weights_id` values, the package resolver produces one typed
 profile and passes that same value to both the exact binder and the sequence/workspace planner. The
@@ -329,9 +342,10 @@ The runtime does not rescan every scale, code, direct word, or padding byte befo
 would duplicate work in a trusted, project-owned conversion path without improving the model binding
 contract. The common directory parser therefore owns structural decoding only.
 
-How the Engine allocates, uploads, owns, or publishes a loaded product is outside the container ABI.
-A Python reference may keep an mmap open and stream rows; a C++ target may materialize packed device
-spans. Both consume the same directory and registered layout bytes.
+How the Engine assigns a validated tensor to device, mapped-host, or validate-only placement remains
+outside the container ABI. A Python reference may keep an mmap open and stream rows; a C++ target may
+retain an artifact-owned read-only mapping or materialize packed device spans. Both consume the same
+directory and registered layout bytes.
 
 ## 7. Writing an artifact
 
@@ -412,10 +426,10 @@ The native implementation in `tools/artifact/`, `tools/convert/qwen3_6_27b/`,
 `tools/convert/qwen3_8_27b/`, `tools/reference/qwen3_6_27b/`, and `src/artifact/` satisfies this
 layer. The compact evidence retained for later changes is:
 
-- Python version-2 round trips for all eight numeric formats and a raw resource;
+- Python and C++ registry/layout checks for all fifteen numeric formats and a raw resource;
 - representative framing, schema, offset/alignment, overlap, bounds, and encoded-size failures;
-- exact representative direct-word, Q4/Q5/Q6/W8 code/scale, and NVFP4 block-scale layout round
-  trips;
+- exact representative direct-word, Q4/Q5/Q6/W8 code/scale, NVFP4 block-scale, and source-preserved
+  GGML block-row layout checks;
 - an independently constructed C++ version-2 fixture covering hierarchical identity, payload spans,
   encoded sizes, and alignment;
 - the complete registered target inventories, including the 1124-object 27B groupwise contracts

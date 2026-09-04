@@ -33,6 +33,32 @@ struct QuantGeometry {
     std::uint64_t high_bytes_per_group;
 };
 
+struct GgmlFormatGeometry {
+    std::uint64_t block_values;
+    std::uint64_t block_bytes;
+};
+
+GgmlFormatGeometry ggml_format_geometry(NumericFormat format) {
+    switch (format) {
+    case NumericFormat::Q8_0:
+        return {32, 34};
+    case NumericFormat::Q4_K:
+        return {256, 144};
+    case NumericFormat::Q5_K:
+        return {256, 176};
+    case NumericFormat::Q6_K:
+        return {256, 210};
+    case NumericFormat::IQ1_S:
+        return {256, 50};
+    case NumericFormat::IQ2_XXS:
+        return {256, 66};
+    case NumericFormat::IQ4_NL:
+        return {32, 18};
+    default:
+        throw ArtifactError("ggml-block-row-v1 requires a registered GGML block format");
+    }
+}
+
 QuantGeometry quant_geometry(NumericFormat format) {
     switch (format) {
     case NumericFormat::Q4G64_F16S:
@@ -80,6 +106,20 @@ std::string_view format_name(NumericFormat format) noexcept {
         return "W8G32_F16S";
     case NumericFormat::NVFP4:
         return "NVFP4";
+    case NumericFormat::Q8_0:
+        return "Q8_0";
+    case NumericFormat::Q4_K:
+        return "Q4_K";
+    case NumericFormat::Q5_K:
+        return "Q5_K";
+    case NumericFormat::Q6_K:
+        return "Q6_K";
+    case NumericFormat::IQ1_S:
+        return "IQ1_S";
+    case NumericFormat::IQ2_XXS:
+        return "IQ2_XXS";
+    case NumericFormat::IQ4_NL:
+        return "IQ4_NL";
     }
     return {};
 }
@@ -92,6 +132,8 @@ std::string_view layout_name(StorageLayout layout) noexcept {
         return "row-split-k128-v1";
     case StorageLayout::BlockScaleK16M128x4V1:
         return "blockscale-k16-m128x4-v1";
+    case StorageLayout::GgmlBlockRowV1:
+        return "ggml-block-row-v1";
     }
     return {};
 }
@@ -130,6 +172,9 @@ std::uint64_t tensor_encoded_size(StorageLayout layout, NumericFormat format,
     }
     if (layout == StorageLayout::BlockScaleK16M128x4V1) {
         return block_scale_geometry(format, shape).encoded_bytes;
+    }
+    if (layout == StorageLayout::GgmlBlockRowV1) {
+        return ggml_block_geometry(format, shape).encoded_bytes;
     }
     throw ArtifactError("unknown tensor layout");
 }
@@ -186,6 +231,33 @@ BlockScaleGeometry block_scale_geometry(NumericFormat format,
     out.weight_divisor_offset =
         checked_add(out.scale_plane_offset, out.scale_plane_bytes, "NVFP4 weight divisor offset");
     out.encoded_bytes = checked_add(out.weight_divisor_offset, 4, "NVFP4 tensor encoded size");
+    return out;
+}
+
+GgmlBlockGeometry ggml_block_geometry(NumericFormat format,
+                                      std::span<const std::uint64_t> shape) {
+    if ((shape.size() != 2 && shape.size() != 3) || shape[shape.size() - 2] == 0 ||
+        shape.back() == 0 || (shape.size() == 3 && shape.front() == 0)) {
+        throw ArtifactError(
+            "ggml-block-row-v1 requires rank 2 [N,K] or rank 3 [E,N,K]");
+    }
+    const auto format_geometry = ggml_format_geometry(format);
+    if (shape.back() % format_geometry.block_values != 0) {
+        throw ArtifactError("ggml-block-row-v1 requires K divisible by the format block size");
+    }
+
+    GgmlBlockGeometry out;
+    out.matrices        = shape.size() == 2 ? 1 : shape.front();
+    out.rows_per_matrix = shape[shape.size() - 2];
+    out.columns        = shape.back();
+    out.block_values   = format_geometry.block_values;
+    out.block_bytes    = format_geometry.block_bytes;
+    out.blocks_per_row = out.columns / out.block_values;
+    out.row_bytes = checked_mul(out.blocks_per_row, out.block_bytes, "GGML block row bytes");
+    out.matrix_bytes =
+        checked_mul(out.rows_per_matrix, out.row_bytes, "GGML block matrix bytes");
+    out.encoded_bytes =
+        checked_mul(out.matrices, out.matrix_bytes, "GGML block tensor bytes");
     return out;
 }
 

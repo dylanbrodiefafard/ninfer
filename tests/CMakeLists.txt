@@ -205,6 +205,22 @@ ninfer_add_test(ninfer_qwen3_6_35b_a3b_ram_real_test
   SOURCES targets/qwen3_6_35b_a3b/test_engine_ram_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_35b_a3b_ram_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# Unregistered Qwen4 verifier: prove the exact host/device placement and fixed C=1
+# NVFP4-QSA state budget against a real converted artifact without exposing an Engine target.
+ninfer_add_test(ninfer_qwen4_verifier_state_test
+  SOURCES targets/qwen4/test_verifier_state.cpp
+  LIBRARIES ninfer_qwen4_verifier)
+ninfer_add_test(ninfer_qwen4_artifact_real_test
+  SOURCES targets/qwen4/test_artifact_real.cpp
+  LIBRARIES ninfer_qwen4_verifier)
+target_link_libraries(ninfer_qwen4_artifact_real_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_qwen4_artifact_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen4_program_real_test
+  SOURCES targets/qwen4/test_program_real.cpp
+  LIBRARIES ninfer_qwen4_verifier)
+target_link_libraries(ninfer_qwen4_program_real_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_qwen4_program_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_35b_a3b_dflash_real_test
   SOURCES targets/qwen3_6_35b_a3b/test_engine_dflash_real.cpp
   LIBRARIES ninfer_engine)
@@ -320,8 +336,32 @@ ninfer_add_op_test(ninfer_prepare_ragged_prefix_test
 ninfer_add_op_test(ninfer_sparse_moe_test
   SOURCES ops/test_sparse_moe.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_ggml_block_linear_test
+  SOURCES ops/test_ggml_block_linear.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_qwen4_sparse_moe_test
+  SOURCES ops/test_qwen4_sparse_moe.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_ggml_embedding_test
+  SOURCES ops/test_ggml_embedding.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_gated_delta_net_layer_test
+  SOURCES ops/test_gated_delta_net_layer.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_gated_residual_test
+  SOURCES ops/test_gated_residual.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_mtp_pack_test
   SOURCES ops/test_mtp_pack.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_ngram_embedding_test
+  SOURCES ops/test_ngram_embedding.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_ple_test
+  SOURCES ops/test_ple.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_qsa_test
+  SOURCES ops/test_qsa.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_linear_test(ninfer_mtp_fc_test ops/test_mtp_fc.cpp)
 ninfer_add_op_test(ninfer_mtp_round_test

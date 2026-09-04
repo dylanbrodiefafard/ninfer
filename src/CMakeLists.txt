@@ -75,6 +75,10 @@ add_library(ninfer_ops STATIC
   ops/launcher/cast.cu
   ops/launcher/causal_conv1d.cu
   ops/launcher/embed_gather.cu
+  ops/launcher/ggml_embedding.cu
+  ops/launcher/ggml_block_linear.cu
+  ops/launcher/gated_delta_net_layer.cu
+  ops/launcher/gated_residual.cu
   ops/launcher/gdn_gating.cu
   ops/launcher/gelu.cu
   ops/launcher/bidirectional_gqa_attention.cu
@@ -89,11 +93,16 @@ add_library(ninfer_ops STATIC
   ops/launcher/l2norm.cu
   ops/launcher/layer_norm.cu
   ops/launcher/mtp_pack.cu
+  ops/launcher/ngram_embedding.cu
   ops/launcher/mtp_round.cu
   ops/launcher/speculative_round.cu
   ops/launcher/position.cu
+  ops/launcher/ple.cu
   ops/launcher/prepare_ragged_prefix.cu
   ops/launcher/prepare_masked_block.cu
+  ops/launcher/qwen4_sparse_moe.cu
+  ops/launcher/qsa.cu
+  ops/launcher/qsa_verifier.cu
   ops/launcher/residual_add.cu
   ops/launcher/rmsnorm.cu
   ops/launcher/residual_rmsnorm.cu
@@ -223,6 +232,10 @@ add_library(ninfer_ops STATIC
   ops/wrapper/cast.cpp
   ops/wrapper/causal_conv1d_silu.cpp
   ops/wrapper/embedding.cpp
+  ops/wrapper/ggml_embedding.cpp
+  ops/wrapper/ggml_block_linear.cpp
+  ops/wrapper/gated_delta_net_layer.cpp
+  ops/wrapper/gated_residual.cpp
   ops/wrapper/gdn_gating.cpp
   ops/wrapper/gdn_gating_proj.cpp
   ops/wrapper/gdn_input_proj.cpp
@@ -239,11 +252,16 @@ add_library(ninfer_ops STATIC
   ops/wrapper/linear_swiglu.cpp
   ops/wrapper/mtp_fc.cpp
   ops/wrapper/mtp_pack.cpp
+  ops/wrapper/ngram_embedding.cpp
   ops/wrapper/mtp_round.cpp
   ops/wrapper/speculative_round.cpp
   ops/wrapper/position.cpp
+  ops/wrapper/ple.cpp
   ops/wrapper/prepare_ragged_prefix.cpp
   ops/wrapper/prepare_masked_block.cpp
+  ops/wrapper/qwen4_sparse_moe.cpp
+  ops/wrapper/qsa.cpp
+  ops/wrapper/qsa_verifier.cpp
   ops/wrapper/residual_add.cpp
   ops/wrapper/rmsnorm.cpp
   ops/wrapper/residual_rmsnorm.cpp
@@ -307,6 +325,7 @@ target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
 add_subdirectory(targets/qwen3_6)
 add_subdirectory(targets/qwen3_6_27b)
 add_subdirectory(targets/qwen3_6_35b_a3b)
+add_subdirectory(targets/qwen4)
 
 target_include_directories(ninfer_engine PRIVATE ${ZSTD_INCLUDE_DIRS})
 if(ZSTD_CFLAGS_OTHER)

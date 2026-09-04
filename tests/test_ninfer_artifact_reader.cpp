@@ -81,6 +81,55 @@ Json normative_directory() {
                          {"layout", "row-split-k128-v1"},
                          {"offset", 3072},
                          {"bytes", 264}},
+                        {{"name", "ggml_q8"},
+                         {"kind", "tensor"},
+                         {"shape", {1, 32}},
+                         {"format", "Q8_0"},
+                         {"layout", "ggml-block-row-v1"},
+                         {"offset", 3584},
+                         {"bytes", 34}},
+                        {{"name", "ggml_q4"},
+                         {"kind", "tensor"},
+                         {"shape", {1, 256}},
+                         {"format", "Q4_K"},
+                         {"layout", "ggml-block-row-v1"},
+                         {"offset", 3840},
+                         {"bytes", 144}},
+                        {{"name", "ggml_q5"},
+                         {"kind", "tensor"},
+                         {"shape", {1, 256}},
+                         {"format", "Q5_K"},
+                         {"layout", "ggml-block-row-v1"},
+                         {"offset", 4096},
+                         {"bytes", 176}},
+                        {{"name", "ggml_q6"},
+                         {"kind", "tensor"},
+                         {"shape", {1, 256}},
+                         {"format", "Q6_K"},
+                         {"layout", "ggml-block-row-v1"},
+                         {"offset", 4352},
+                         {"bytes", 210}},
+                        {{"name", "ggml_iq1"},
+                         {"kind", "tensor"},
+                         {"shape", {2, 1, 256}},
+                         {"format", "IQ1_S"},
+                         {"layout", "ggml-block-row-v1"},
+                         {"offset", 4608},
+                         {"bytes", 100}},
+                        {{"name", "ggml_iq2"},
+                         {"kind", "tensor"},
+                         {"shape", {1, 256}},
+                         {"format", "IQ2_XXS"},
+                         {"layout", "ggml-block-row-v1"},
+                         {"offset", 4864},
+                         {"bytes", 66}},
+                        {{"name", "ggml_iq4"},
+                         {"kind", "tensor"},
+                         {"shape", {1, 32}},
+                         {"format", "IQ4_NL"},
+                         {"layout", "ggml-block-row-v1"},
+                         {"offset", 5120},
+                         {"bytes", 18}},
                     })},
     };
 }
@@ -97,6 +146,7 @@ void test_registered_sizes() {
     using ninfer::artifact::tensor_encoded_size;
     constexpr StorageLayout direct = StorageLayout::ContiguousLeV1;
     constexpr StorageLayout rows   = StorageLayout::RowSplitK128V1;
+    constexpr StorageLayout ggml   = StorageLayout::GgmlBlockRowV1;
 
     const std::array<std::uint64_t, 2> shape_2x3 = {2, 3};
     const std::array<std::uint64_t, 1> shape_2   = {2};
@@ -104,6 +154,8 @@ void test_registered_sizes() {
     const std::array<std::uint64_t, 2> q5_shape  = {2, 130};
     const std::array<std::uint64_t, 2> q6_shape  = {1, 64};
     const std::array<std::uint64_t, 2> w8_shape  = {1, 33};
+    const std::array<std::uint64_t, 2> ggml32_shape  = {1, 32};
+    const std::array<std::uint64_t, 2> ggml256_shape = {1, 256};
 
     if (tensor_encoded_size(direct, NumericFormat::BF16, shape_2x3) != 12 ||
         tensor_encoded_size(direct, NumericFormat::FP32, {}) != 4 ||
@@ -111,7 +163,14 @@ void test_registered_sizes() {
         tensor_encoded_size(rows, NumericFormat::Q4G64_F16S, q4_shape) != 260 ||
         tensor_encoded_size(rows, NumericFormat::Q5G64_F16S, q5_shape) != 528 ||
         tensor_encoded_size(rows, NumericFormat::Q6G64_F16S, q6_shape) != 516 ||
-        tensor_encoded_size(rows, NumericFormat::W8G32_F16S, w8_shape) != 264) {
+        tensor_encoded_size(rows, NumericFormat::W8G32_F16S, w8_shape) != 264 ||
+        tensor_encoded_size(ggml, NumericFormat::Q8_0, ggml32_shape) != 34 ||
+        tensor_encoded_size(ggml, NumericFormat::Q4_K, ggml256_shape) != 144 ||
+        tensor_encoded_size(ggml, NumericFormat::Q5_K, ggml256_shape) != 176 ||
+        tensor_encoded_size(ggml, NumericFormat::Q6_K, ggml256_shape) != 210 ||
+        tensor_encoded_size(ggml, NumericFormat::IQ1_S, ggml256_shape) != 50 ||
+        tensor_encoded_size(ggml, NumericFormat::IQ2_XXS, ggml256_shape) != 66 ||
+        tensor_encoded_size(ggml, NumericFormat::IQ4_NL, ggml32_shape) != 18) {
         throw std::runtime_error("registered encoded-size calculation is wrong");
     }
 }
@@ -120,13 +179,15 @@ void test_normative_fixture() {
     auto fixture = write_fixture(normative_directory(), "valid");
     Reader reader(fixture.path);
     if (reader.identity().model_id != "fixture-model" ||
-        reader.identity().weights_id != "fixture-weights" || reader.objects().size() != 8 ||
+        reader.identity().weights_id != "fixture-weights" || reader.objects().size() != 15 ||
         reader.payload_offset() != 4096) {
         throw std::runtime_error("fixture root descriptor mismatch");
     }
 
-    const std::array<std::string_view, 8> expected_names = {
-        "resource", "bf16", "fp32_scalar", "i32", "q4", "q5", "q6", "w8",
+    const std::array<std::string_view, 15> expected_names = {
+        "resource", "bf16", "fp32_scalar", "i32", "q4",       "q5",       "q6",
+        "w8",       "ggml_q8", "ggml_q4",   "ggml_q5", "ggml_q6", "ggml_iq1",
+        "ggml_iq2", "ggml_iq4",
     };
     for (std::size_t i = 0; i < expected_names.size(); ++i) {
         const auto& object = reader.objects()[i];
@@ -148,9 +209,15 @@ void test_normative_fixture() {
 
     const auto* resource = std::get_if<ResourceDescriptor>(&reader.objects().front());
     const auto* q5       = std::get_if<TensorDescriptor>(reader.find("q5"));
+    const auto* iq1      = std::get_if<TensorDescriptor>(reader.find("ggml_iq1"));
     if (resource == nullptr || q5 == nullptr || q5->shape != std::vector<std::uint64_t>({2, 130}) ||
         q5->format != NumericFormat::Q5G64_F16S || q5->layout != StorageLayout::RowSplitK128V1) {
         throw std::runtime_error("fixture object signature mismatch");
+    }
+    if (iq1 == nullptr || iq1->shape != std::vector<std::uint64_t>({2, 1, 256}) ||
+        iq1->format != NumericFormat::IQ1_S ||
+        iq1->layout != StorageLayout::GgmlBlockRowV1) {
+        throw std::runtime_error("GGML fixture object signature mismatch");
     }
 }
 
@@ -160,6 +227,25 @@ void test_common_validation() {
         directory["objects"][5]["bytes"] = 527;
         auto fixture                     = write_fixture(directory, "wrong_encoded_size");
         expect_artifact_error([&] { Reader reader(fixture.path); }, "wrong encoded size");
+    }
+    {
+        auto directory                    = normative_directory();
+        directory["objects"][9]["bytes"] = 143;
+        auto fixture = write_fixture(directory, "wrong_ggml_encoded_size");
+        expect_artifact_error([&] { Reader reader(fixture.path); }, "wrong GGML encoded size");
+    }
+    {
+        auto directory                    = normative_directory();
+        directory["objects"][10]["shape"] = {1, 255};
+        directory["objects"][10]["bytes"] = 176;
+        auto fixture = write_fixture(directory, "partial_ggml_block");
+        expect_artifact_error([&] { Reader reader(fixture.path); }, "partial GGML K block");
+    }
+    {
+        auto directory                      = normative_directory();
+        directory["objects"][11]["format"] = "BF16";
+        auto fixture = write_fixture(directory, "wrong_ggml_format_layout");
+        expect_artifact_error([&] { Reader reader(fixture.path); }, "wrong GGML format/layout");
     }
     {
         auto directory                    = normative_directory();
