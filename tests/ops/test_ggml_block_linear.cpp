@@ -1,5 +1,5 @@
 #include "ninfer/ops/ggml_block_linear.h"
-#include "ops/ggml_block_linear/ggml_codebook_data.h"
+#include "ops/ggml_iq_oracle.h"
 #include "ops/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -129,11 +129,10 @@ std::vector<double> oracle_decode_block(const FormatSpec& format,
             for (int lane = 0; lane < 4; ++lane) {
                 const int grid = block[2 + 4 * group + lane] +
                                  256 * ((control >> (3 * lane)) & 7U);
-                const std::uint16_t packed = ops::detail::kIq1SPackedGrid[grid];
+                const auto& witness = iq_oracle::iq1_grid(grid);
                 for (int item = 0; item < 8; ++item) {
-                    const int trit = (packed >> (2 * item)) & 3U;
                     values[32 * group + 8 * lane + item] =
-                        d * multiplier * (static_cast<double>(trit - 1) + delta);
+                        d * multiplier * (static_cast<double>(witness[item]) + delta);
                 }
             }
         }
@@ -141,7 +140,6 @@ std::vector<double> oracle_decode_block(const FormatSpec& format,
     }
     if (format.qtype == QType::GGML_IQ2_XXS) {
         const double d = half_to_double(read_u16(block));
-        constexpr std::array<int, 3> magnitudes = {8, 25, 43};
         for (int group = 0; group < 8; ++group) {
             const std::uint32_t grids = read_u32(block + 2 + 8 * group);
             const std::uint32_t signs_scales = read_u32(block + 6 + 8 * group);
@@ -150,10 +148,9 @@ std::vector<double> oracle_decode_block(const FormatSpec& format,
                 const int grid = (grids >> (8 * lane)) & 255U;
                 int sign_bits = (signs_scales >> (7 * lane)) & 127U;
                 sign_bits |= (__builtin_popcount(static_cast<unsigned>(sign_bits)) & 1) << 7;
-                const std::uint16_t packed = ops::detail::kIq2XxsPackedGrid[grid];
+                const auto& witness = iq_oracle::iq2_grid(grid);
                 for (int item = 0; item < 8; ++item) {
-                    const int digit = (packed >> (2 * item)) & 3U;
-                    const double magnitude = magnitudes[static_cast<std::size_t>(digit)];
+                    const double magnitude = witness[item];
                     const int sign = (sign_bits & (1 << item)) != 0 ? -1 : 1;
                     values[32 * group + 8 * lane + item] = db * magnitude * sign;
                 }
@@ -165,8 +162,8 @@ std::vector<double> oracle_decode_block(const FormatSpec& format,
     const double d = half_to_double(read_u16(block));
     for (int lane = 0; lane < 16; ++lane) {
         const std::uint8_t packed = block[2 + lane];
-        values[lane] = d * ops::detail::kIq4NlGrid[packed & 15U];
-        values[16 + lane] = d * ops::detail::kIq4NlGrid[packed >> 4U];
+        values[lane] = d * iq_oracle::kIq4Nl[packed & 15U];
+        values[16 + lane] = d * iq_oracle::kIq4Nl[packed >> 4U];
     }
     return values;
 }
@@ -193,6 +190,51 @@ std::vector<std::uint8_t> make_row(const FormatSpec& format, std::int32_t k,
         }
         if (format.qtype == QType::GGML_Q4_K || format.qtype == QType::GGML_Q5_K) {
             write_u16(block + 2, (block_index & 1U) == 0 ? 0x1800U : 0x9800U);
+        } else if (format.qtype == QType::GGML_IQ1_S) {
+            // Every block independently exercises low indices 0/1/2 and the maximum 2047.
+            // Restricting the randomized fixture to test-owned anchors keeps its oracle wholly
+            // independent of the production 2048-entry table.
+            constexpr std::array<int, 4> grids = {0, 1, 2, 2047};
+            for (int group = 0; group < 8; ++group) {
+                std::uint16_t control = 0;
+                for (int lane = 0; lane < 4; ++lane) {
+                    const int grid = grids[(seed + block_index + group + lane) & 3U];
+                    block[2 + 4 * group + lane] = static_cast<std::uint8_t>(grid);
+                    control |= static_cast<std::uint16_t>(grid >> 8) << (3 * lane);
+                }
+                const std::uint16_t multiplier =
+                    static_cast<std::uint16_t>((seed + block_index + group) & 7U);
+                const std::uint16_t delta =
+                    ((seed + block_index + group) & 1U) != 0 ? 0x8000U : 0U;
+                write_u16(block + 34 + 2 * group,
+                          static_cast<std::uint16_t>(control | (multiplier << 12U) | delta));
+            }
+        } else if (format.qtype == QType::GGML_IQ2_XXS) {
+            constexpr std::array<int, 4> grids = {0, 1, 2, 255};
+            for (int group = 0; group < 8; ++group) {
+                std::uint32_t signs = 0;
+                for (int lane = 0; lane < 4; ++lane) {
+                    block[2 + 8 * group + lane] = static_cast<std::uint8_t>(
+                        grids[(seed + block_index + group + lane) & 3U]);
+                    const std::uint32_t sign =
+                        (seed + 19U * block_index + 11U * group + 29U * lane) & 127U;
+                    signs |= sign << (7 * lane);
+                }
+                const std::uint32_t scale =
+                    static_cast<std::uint32_t>((seed + block_index + group) & 15U) << 28U;
+                const std::uint32_t control = signs | scale;
+                for (int byte = 0; byte < 4; ++byte) {
+                    block[6 + 8 * group + byte] =
+                        static_cast<std::uint8_t>(control >> (8 * byte));
+                }
+            }
+        } else if (format.qtype == QType::GGML_IQ4_NL) {
+            // Each half covers all 16 codes, with seed-dependent permutations across rows.
+            for (int lane = 0; lane < 16; ++lane) {
+                const int low = static_cast<int>((seed + block_index + 5U * lane) & 15U);
+                const int high = static_cast<int>((seed + 3U * block_index + 7U * lane) & 15U);
+                block[2 + lane] = static_cast<std::uint8_t>((high << 4) | low);
+            }
         }
     }
     return row;

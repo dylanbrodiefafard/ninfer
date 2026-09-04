@@ -351,7 +351,7 @@ int main() {
     try {
         ninfer::DeviceContext device(0);
         std::unique_ptr<verifier::LoadedModel> model = verifier::LoadedModel::load(path, device);
-        verifier::Program program(*model, device.stream);
+        verifier::Program program(*model, device);
         std::array<std::vector<TokenSnapshot>, 2> runs;
         std::array<std::vector<float>, 2> nlls;
         std::vector<std::uint8_t> first_continuation;

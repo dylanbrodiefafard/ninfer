@@ -30,7 +30,7 @@ inline constexpr std::size_t kDeviceTensorCount = 1127;
 inline constexpr std::uint64_t kMappedTensorBytes = 45'996'784'640ULL;
 inline constexpr std::uint64_t kDevicePayloadBytes = 26'538'652'160ULL;
 inline constexpr std::size_t kPersistentStateBytes = 157'126'664ULL;
-inline constexpr std::size_t kExpertStageBytes = ops::kQwen4SparseMoeStageBytes;
+inline constexpr std::size_t kExpertStageBytes = ops::kQwen4SparseMoePipelineStageBytes;
 inline constexpr std::int32_t kQsaCapacity = 4096;
 inline constexpr std::int32_t kPleResetToken = 248044;
 
@@ -256,6 +256,11 @@ struct TokenResultView {
     std::span<const GrDiagnosticView> gr;
 };
 
+enum class DiagnosticSnapshots {
+    Enabled,
+    Disabled,
+};
+
 /**
  * Complete unregistered C=1 eager Text verifier over the bound UD-IQ1_S artifact profile.
  *
@@ -263,15 +268,19 @@ struct TokenResultView {
  * BF16 logits, and per-layer QSA/router diagnostic outputs. reset starts a new sequence. Each
  * execute_token refreshes all four residual branches from the numeric token id, executes PLE at
  * zero-based layer 1, then all 48 attention and MoE sublayers, and advances exactly one frontier.
+ * DiagnosticSnapshots::Disabled omits the additional GR residual copies and returns an empty gr
+ * span; QSA/router selections remain because they are direct outputs required by their Ops.
  * Calls are deliberately synchronous because PLE and every routed expert layer have host-address
  * dependencies; no work remains on stream when a public method returns.
  *
- * The caller owns model and stream and must keep both alive for Program's lifetime. This class is
- * not a registry, Engine, CLI, serving, Vision, MTP, batching, or CUDA-Graph entry.
+ * The caller owns model and DeviceContext and must keep both alive for Program's lifetime. This
+ * class is not a registry, Engine, CLI, serving, Vision, MTP, batching, or CUDA-Graph entry.
  */
 class Program {
 public:
-    Program(const LoadedModel& model, cudaStream_t stream);
+    Program(const LoadedModel& model, DeviceContext& device,
+            DiagnosticSnapshots diagnostic_snapshots = DiagnosticSnapshots::Enabled);
+    ~Program();
 
     Program(const Program&) = delete;
     Program& operator=(const Program&) = delete;
@@ -284,8 +293,11 @@ public:
     [[nodiscard]] const State& state() const noexcept { return state_; }
 
 private:
+    void destroy_pipeline_events() noexcept;
+
     const LoadedModel& model_;
     cudaStream_t stream_ = nullptr;
+    cudaStream_t transfer_stream_ = nullptr;
     State state_;
     DeviceBuffer controls_;
     DeviceBuffer ngram_rows_;
@@ -305,6 +317,11 @@ private:
     std::array<QsaDiagnosticView, kQsaLayerCount> qsa_diagnostics_;
     std::array<RouterDiagnosticView, kLayerCount> router_diagnostics_;
     std::array<GrDiagnosticView, kLayerCount> gr_diagnostics_;
+    cudaEvent_t moe_route_ready_ = nullptr;
+    cudaEvent_t moe_ids_ready_ = nullptr;
+    std::array<cudaEvent_t, ops::kQwen4SparseMoePipelineSlots> moe_transfer_ready_{};
+    std::array<cudaEvent_t, ops::kQwen4SparseMoePipelineSlots> moe_consumer_complete_{};
+    DiagnosticSnapshots diagnostic_snapshots_ = DiagnosticSnapshots::Enabled;
     std::int32_t frontier_ = 0;
     bool reset_ = false;
 };
