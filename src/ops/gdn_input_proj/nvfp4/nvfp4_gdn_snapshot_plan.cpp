@@ -34,9 +34,9 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
     if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
         throw std::invalid_argument("nvfp4 gdn conv admits only A16 or A4");
     }
-    // Width selects the fused family. Snapshot T=2..16 is SmallT GEMM+FP32 conv; record
-    // T=2..16 is fused T=1 GEMV+FP32 conv. B>1 runs the C=1 kernel once per sequence.
-    // Do not flatten to B*W (W4A4 GEMM + BF16 conv).
+    // Width selects the fused family. Snapshot T=2..16 is SmallT GEMM+FP32 conv. Record
+    // B=1 retains fused T=1 GEMV+FP32 conv; B>1 uses request-indexed SmallT CTAs with
+    // the same reduction and BF16 history boundary. Do not flatten to B*W W4A4 compose.
     if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
     if (tokens <= kNvfp4LastPackedGdnConvSmallT) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
     if (policy == LinearPolicy::A16Only) {

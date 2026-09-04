@@ -21,9 +21,9 @@ using RecordLaunch = void (*)(const Tensor&, const Weight&, const Tensor&, const
                               Tensor&, const std::int32_t*, cudaStream_t);
 
 // Packed snapshot T=2..16 GDN conv uses the SmallT production schedule (token-parallel
-// GEMM) with FP32 projected-conv in the epilogue. Record T=2..16 is fused T=1 GEMV+conv.
-// B>1 runs the C=1 kernel once per row so verify does not take a MultiBatch
-// specialization; do not flatten to B*W compose (W4A4+BF16 conv).
+// GEMM) with FP32 projected-conv in the epilogue. Record B=1 retains the fused T=1
+// GEMV+conv route; B>1 uses this same-reduction SmallT kernel with request-indexed CTAs.
+// Convolution history rounds through BF16 at every column, matching the T=1 route.
 template <int ActiveTokens, bool Tree, class Publish>
 void launch_exact(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
                   const Tensor& conv_states, const Tensor& valid_columns,
@@ -37,17 +37,31 @@ void launch_exact(const Tensor& x, const Weight& weight, const Tensor& conv_weig
 
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const float inverse   = 1.0F / weight.weight_scale_divisor;
+    const int batch       = x.ne[2] > 1 ? x.ne[2] : 1;
     const auto output     = make_nvfp4_gdn_conv_output<ActiveTokens, Tree>(
         conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z, publish,
         parent_index);
-    nvfp4_small_t_kernel<Geometry, ActiveTokens, Schedule, Nvfp4IdentityEpilogue,
-                         Nvfp4GdnConvOutput<ActiveTokens, Publish, Tree>,
-                         Nvfp4SmallTFinalization::RowVector>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
-            Nvfp4PackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data)},
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), inverse, Nvfp4IdentityEpilogue{},
-            output);
+    if (batch > 1) {
+        nvfp4_small_t_kernel<Geometry, ActiveTokens, Schedule, Nvfp4IdentityEpilogue,
+                             Nvfp4GdnConvOutput<ActiveTokens, Publish, Tree>,
+                             Nvfp4SmallTFinalization::RowVector,
+                             Nvfp4BatchedPackedActivation<Geometry>>
+            <<<dim3(batch, kBlocks), Schedule::kThreads, 0, stream>>>(
+                Nvfp4BatchedPackedActivation<Geometry>{
+                    static_cast<const __nv_bfloat16*>(x.data), ActiveTokens},
+                static_cast<const std::uint8_t*>(weight.qdata),
+                static_cast<const std::uint8_t*>(weight.scales), inverse, Nvfp4IdentityEpilogue{},
+                output);
+    } else {
+        nvfp4_small_t_kernel<Geometry, ActiveTokens, Schedule, Nvfp4IdentityEpilogue,
+                             Nvfp4GdnConvOutput<ActiveTokens, Publish, Tree>,
+                             Nvfp4SmallTFinalization::RowVector>
+            <<<kBlocks, Schedule::kThreads, 0, stream>>>(
+                Nvfp4PackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data)},
+                static_cast<const std::uint8_t*>(weight.qdata),
+                static_cast<const std::uint8_t*>(weight.scales), inverse, Nvfp4IdentityEpilogue{},
+                output);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -87,27 +101,6 @@ void launch_record_exact(const Tensor& x, const Weight& weight, const Tensor& co
                          const Tensor& initial_slot, Tensor& conv_record, Tensor& query,
                          Tensor& key, Tensor& value, Tensor& z, const std::int32_t* parent_index,
                          cudaStream_t stream) {
-    if (x.ne[2] > 1) {
-        const int batch = x.ne[2];
-        const int width = x.ne[1];
-        for (int b = 0; b < batch; ++b) {
-            const Tensor valid_b =
-                valid_columns.data == nullptr ? Tensor{} : valid_columns.slice(0, b, 1);
-            Tensor record_b = conv_record.slice(2, b, 1);
-            Tensor query_b  = query.slice(2, b, 1);
-            Tensor key_b    = key.slice(2, b, 1);
-            Tensor value_b  = value.slice(2, b, 1);
-            Tensor z_b      = z.slice(2, b, 1);
-            const std::int32_t* parent_b =
-                parent_index == nullptr
-                    ? nullptr
-                    : parent_index + static_cast<std::int64_t>(b) * width;
-            launch_record_exact<ActiveTokens>(x.slice(2, b, 1), weight, conv_weight, conv_states,
-                                              valid_b, initial_slot.slice(0, b, 1), record_b,
-                                              query_b, key_b, value_b, z_b, parent_b, stream);
-        }
-        return;
-    }
     const RecordColumnPublish publish{static_cast<__nv_bfloat16*>(conv_record.data),
                                       kNvfp4GdnChannels, ActiveTokens};
     if (parent_index == nullptr) {

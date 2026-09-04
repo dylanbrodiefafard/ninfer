@@ -126,9 +126,9 @@ struct GdnConvEpilogue {
             }
 
             publish.publish(token, batch_row, row, s1, s2, p);
-            s0 = s1;
-            s1 = s2;
-            s2 = p;
+            s0 = __bfloat162float(__float2bfloat16_rn(s1));
+            s1 = __bfloat162float(__float2bfloat16_rn(s2));
+            s2 = __bfloat162float(__float2bfloat16_rn(p));
         }
     }
 };
@@ -219,9 +219,9 @@ struct GdnConvEpilogue<Publish, true> {
             }
 
             publish.publish(token, batch_row, row, s1, s2, p);
-            saved0[token] = s1;
-            saved1[token] = s2;
-            saved2[token] = p;
+            saved0[token] = __bfloat162float(__float2bfloat16_rn(s1));
+            saved1[token] = __bfloat162float(__float2bfloat16_rn(s2));
+            saved2[token] = __bfloat162float(__float2bfloat16_rn(p));
         }
     }
 };

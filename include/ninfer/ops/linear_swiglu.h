@@ -25,7 +25,7 @@ namespace ninfer::ops {
                                                                  std::int32_t max_tokens);
 
 /**
- * Policy-bearing capacity query. Q4/W8 admit A16Only. NVFP4 admits A16Only through T=16 and
+ * Policy-bearing capacity query. Q4/W8 admit A16Only. NVFP4 admits A16Only through T=20 and
  * AllowA4 for every positive T. AllowA4 covers whichever qualified A16 or A4 route the private
  * resolver selects across the requested interval.
  */
@@ -69,7 +69,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
 
 /**
  * A16-only convenience form. Q4/W8 retain their complete positive-T domain. NVFP4 is admitted
- * only through T=16; larger NVFP4 extents require the policy-bearing AllowA4 form.
+ * only through T=20; larger NVFP4 extents require the policy-bearing AllowA4 form.
  */
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,
                    cudaStream_t stream);

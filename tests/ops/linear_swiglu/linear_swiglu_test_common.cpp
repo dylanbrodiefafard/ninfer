@@ -99,6 +99,24 @@ std::vector<std::uint16_t> make_activation(const Profile& profile, std::int32_t 
     return activation;
 }
 
+std::vector<std::uint16_t> make_dense_activation(const Profile& profile, std::int32_t tokens) {
+    std::vector<std::uint16_t> activation(
+        checked_elements(profile.input_rows, tokens, "dense activation size"));
+    const float scale = profile.qtype == QType::NVFP4 ? 1.0e-3F : 1.0e-5F;
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        for (std::int32_t column = 0; column < profile.input_rows; ++column) {
+            const std::uint64_t mixed =
+                mix64((static_cast<std::uint64_t>(profile.seed + token) << 32) |
+                      static_cast<std::uint32_t>(column));
+            int numerator = static_cast<int>((mixed >> 48) % 63U) - 31;
+            if (numerator == 0) { numerator = ((column + token) & 1) == 0 ? 1 : -1; }
+            activation[static_cast<std::size_t>(token) * profile.input_rows + column] =
+                test::f32_to_bf16(static_cast<float>(numerator) * scale);
+        }
+    }
+    return activation;
+}
+
 struct ActiveValue {
     std::int32_t token;
     double value;
@@ -397,6 +415,83 @@ int run_column0_matches_decode(std::string_view label, const Profile& profile,
         failures += compare_output(case_label, std::vector<double>(packed.begin(), packed.begin() +
                                                                                        decode_elements),
                                    decode.data(), ActivationCompute::A16);
+    }
+    return failures;
+}
+
+int run_packed_matches_panels(std::string_view label, const Profile& profile,
+                              std::int32_t panel_width,
+                              std::span<const std::int32_t> packed_widths) {
+    validate_profile(profile);
+    if (profile.activation_compute != ActivationCompute::A16 || panel_width <= 0 ||
+        packed_widths.empty()) {
+        throw std::invalid_argument("linear_swiglu test: invalid packed-panel comparison");
+    }
+    const std::int32_t maximum_tokens = packed_widths.back();
+    for (std::size_t index = 0; index < packed_widths.size(); ++index) {
+        if (packed_widths[index] <= panel_width || packed_widths[index] % panel_width != 0 ||
+            (index != 0 && packed_widths[index] <= packed_widths[index - 1])) {
+            throw std::invalid_argument(
+                "linear_swiglu test: packed widths must be increasing panel multiples");
+        }
+    }
+
+    quantized_weight::PatternedWeightOptions weight_options;
+    if (profile.qtype == QType::NVFP4) {
+        weight_options.weight_scale_divisor = 0.125F;
+        weight_options.input_scale_divisor  = 3.5F;
+    }
+    quantized_weight::PackedWeight host_weight = quantized_weight::make_patterned_weight(
+        profile.qtype, profile.gate_up_rows, profile.input_rows, profile.seed, weight_options);
+    const std::vector<std::uint16_t> host_activation =
+        make_dense_activation(profile, maximum_tokens);
+
+    test::GuardedDeviceBuffer device_weight(host_weight.payload.size());
+    device_weight.copy_from_host(host_weight.payload.data(), host_weight.payload.size());
+    const Weight weight = host_weight.device_weight(device_weight.data());
+    test::GuardedDeviceBuffer device_activation(host_activation.size() * sizeof(std::uint16_t));
+    device_activation.copy_from_host(host_activation.data(),
+                                     host_activation.size() * sizeof(std::uint16_t));
+
+    const std::size_t workspace_bytes = ops::linear_swiglu_workspace_capacity_bytes(
+        profile.qtype, profile.gate_up_rows, profile.input_rows, ops::LinearPolicy::A16Only, 1,
+        maximum_tokens);
+    WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
+    int failures = 0;
+    for (const std::int32_t tokens : packed_widths) {
+        const std::size_t output_elements =
+            checked_elements(profile.output_rows, tokens, "packed-panel output size");
+        test::GuardedDeviceBuffer packed_output(output_elements * sizeof(std::uint16_t));
+        test::GuardedDeviceBuffer panel_output(output_elements * sizeof(std::uint16_t));
+        packed_output.fill(0xff);
+        panel_output.fill(0xff);
+        Tensor x(device_activation.data(), DType::BF16, {profile.input_rows, tokens});
+        Tensor packed(packed_output.data(), DType::BF16, {profile.output_rows, tokens});
+        Tensor panels(panel_output.data(), DType::BF16, {profile.output_rows, tokens});
+
+        workspace.reset();
+        ops::linear_swiglu(x, weight, packed, ops::LinearPolicy::A16Only, workspace, nullptr);
+        for (std::int32_t offset = 0; offset < tokens; offset += panel_width) {
+            workspace.reset();
+            Tensor panel_x = x.slice(1, offset, panel_width);
+            Tensor panel_y = panels.slice(1, offset, panel_width);
+            ops::linear_swiglu(panel_x, weight, panel_y, ops::LinearPolicy::A16Only, workspace,
+                               nullptr);
+        }
+        test::cuda_check(cudaDeviceSynchronize(), "synchronize LinearSwiGLU packed panels");
+
+        std::vector<std::uint16_t> packed_bits(output_elements);
+        std::vector<std::uint16_t> panel_bits(output_elements);
+        packed_output.copy_to_host(packed_bits.data(), packed_bits.size() * sizeof(std::uint16_t));
+        panel_output.copy_to_host(panel_bits.data(), panel_bits.size() * sizeof(std::uint16_t));
+        const std::string case_label =
+            std::string(label) + " T=" + std::to_string(tokens);
+        if (packed_bits != panel_bits) {
+            std::cerr << case_label << ": packed output differs from panels\n";
+            ++failures;
+        }
+        failures += packed_output.verify_guards(case_label + " packed");
+        failures += panel_output.verify_guards(case_label + " panels");
     }
     return failures;
 }

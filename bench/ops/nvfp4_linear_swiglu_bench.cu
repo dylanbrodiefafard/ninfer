@@ -34,6 +34,7 @@ struct Options {
     int warmup   = 5;
     int repeat   = 30;
     bool profile = false;
+    std::int32_t panel_width = 0;
     std::string csv_out;
 };
 
@@ -90,11 +91,13 @@ Options parse_options(int argc, char** argv) {
             options.repeat = std::stoi(std::string(next("--repeat")));
         } else if (argument == "--profile") {
             options.profile = true;
+        } else if (argument == "--panel-width") {
+            options.panel_width = std::stoi(std::string(next("--panel-width")));
         } else if (argument == "--csv-out") {
             options.csv_out = next("--csv-out");
         } else if (argument == "--help" || argument == "-h") {
-            std::printf("Usage: %s --policy a16|a4 [--t-sweep 1,4,...] [--warmup N] [--repeat N] "
-                        "[--profile] [--csv-out PATH]\n",
+            std::printf("Usage: %s --policy a16|a4 [--t-sweep 1,4,...] [--panel-width N] "
+                        "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
                         argv[0]);
             std::exit(0);
         } else {
@@ -104,12 +107,15 @@ Options parse_options(int argc, char** argv) {
     if (options.warmup < 0 || options.repeat <= 0) {
         throw std::invalid_argument("--warmup must be nonnegative and --repeat positive");
     }
+    if (options.panel_width < 0) {
+        throw std::invalid_argument("--panel-width must be nonnegative");
+    }
     if (options.profile && options.t_sweep.size() != 1) {
         throw std::invalid_argument("--profile requires exactly one T");
     }
     if (options.policy == ops::LinearPolicy::A16Only &&
-        *std::max_element(options.t_sweep.begin(), options.t_sweep.end()) > 16) {
-        throw std::invalid_argument("A16 policy is registered only through T=16");
+        *std::max_element(options.t_sweep.begin(), options.t_sweep.end()) > 20) {
+        throw std::invalid_argument("A16 policy is registered only through T=20");
     }
     return options;
 }
@@ -125,11 +131,18 @@ void write_csv(const Options& options, const std::vector<Result>& results,
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
     std::ofstream out(path);
     if (!out) { throw std::runtime_error("failed to open CSV: " + options.csv_out); }
-    out << "op,weight_type,policy,N,K,T,weight_bytes,median_us,min_us,p95_us,effective_gbs,"
-           "useful_tflops,warmup,repeat,flush_bytes\n";
+    out << "op,weight_type,policy,N,K,T,panel_width,weight_reads,weight_bytes,modeled_bytes,"
+           "median_us,min_us,p95_us,effective_gbs,useful_tflops,warmup,repeat,flush_bytes\n";
     for (const Result& result : results) {
-        out << "linear_swiglu,NVFP4," << policy_name(options.policy) << ',' << kGateUpRows << ','
-            << kHidden << ',' << result.tokens << ',' << weight_bytes << ','
+        const std::int32_t weight_reads =
+            options.panel_width == 0 ? 1 : result.tokens / options.panel_width;
+        const std::uint64_t modeled_bytes =
+            weight_bytes * static_cast<std::uint64_t>(weight_reads) +
+            2ULL * static_cast<std::uint64_t>(kHidden + kOutputRows) * result.tokens;
+        out << (options.panel_width ? "linear_swiglu_panels" : "linear_swiglu")
+            << ",NVFP4," << policy_name(options.policy) << ',' << kGateUpRows << ','
+            << kHidden << ',' << result.tokens << ',' << options.panel_width << ',' << weight_reads
+            << ',' << weight_bytes << ',' << modeled_bytes << ','
             << result.timing.median_us << ',' << result.timing.min_us << ',' << result.timing.p95_us
             << ',' << result.effective_gbs << ',' << result.useful_tflops << ',' << options.warmup
             << ',' << options.repeat << ',' << kFlushBytes << '\n';
@@ -145,6 +158,13 @@ int main(int argc, char** argv) {
             *std::max_element(options.t_sweep.begin(), options.t_sweep.end());
         const std::int32_t min_t =
             *std::min_element(options.t_sweep.begin(), options.t_sweep.end());
+        if (options.panel_width > 0) {
+            for (const std::int32_t tokens : options.t_sweep) {
+                if (tokens % options.panel_width != 0) {
+                    throw std::invalid_argument("every T must be divisible by --panel-width");
+                }
+            }
+        }
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         DeviceBuffer flush(kFlushBytes);
@@ -159,7 +179,17 @@ int main(int argc, char** argv) {
             return [&, tokens](cudaStream_t launch_stream) {
                 Tensor x(input.p, DType::BF16, {kHidden, tokens});
                 Tensor out(output.p, DType::BF16, {kOutputRows, tokens});
-                ops::linear_swiglu(x, packed.weight, out, options.policy, workspace, launch_stream);
+                if (options.panel_width == 0) {
+                    ops::linear_swiglu(x, packed.weight, out, options.policy, workspace,
+                                       launch_stream);
+                    return;
+                }
+                for (std::int32_t offset = 0; offset < tokens; offset += options.panel_width) {
+                    Tensor panel_x = x.slice(1, offset, options.panel_width);
+                    Tensor panel_out = out.slice(1, offset, options.panel_width);
+                    ops::linear_swiglu(panel_x, packed.weight, panel_out, options.policy, workspace,
+                                       launch_stream);
+                }
             };
         };
 
@@ -194,12 +224,16 @@ int main(int argc, char** argv) {
                 bench::measure_cold_launch(launch, flush, stream, options.warmup, options.repeat);
             const double seconds      = timing.median_us * 1.0e-6;
             const double useful_flops = 2.0 * static_cast<double>(kGateUpRows) * kHidden * tokens;
-            const double model_bytes  = static_cast<double>(packed.model_weight_bytes()) +
+            const std::int32_t weight_reads =
+                options.panel_width == 0 ? 1 : tokens / options.panel_width;
+            const double model_bytes  = static_cast<double>(packed.model_weight_bytes()) *
+                                            weight_reads +
                                        2.0 * static_cast<double>(kHidden + kOutputRows) * tokens;
             const double useful_tflops = useful_flops / seconds / 1.0e12;
             const double effective_gbs = model_bytes / seconds / 1.0e9;
             std::printf("%-14s %3s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %10.2f\n",
-                        "linear_swiglu", policy_name(options.policy), kGateUpRows, kHidden, tokens,
+                        options.panel_width ? "swiglu_panels" : "linear_swiglu",
+                        policy_name(options.policy), kGateUpRows, kHidden, tokens,
                         timing.median_us, timing.min_us, timing.p95_us, effective_gbs,
                         useful_tflops);
             results.push_back({tokens, timing, effective_gbs, useful_tflops});

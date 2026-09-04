@@ -52,8 +52,9 @@ ops::LinearPolicy text_policy(const Weight& weight,
                               std::int32_t aggregate_tokens = 0) {
     // P-less is sensitive to small target-logit perturbations at its collision-probability
     // boundary. Keep target verification on the same A16 matrix route as ordinary decode.
-    // Numerically sensitive fused projections remain per-request panels. The qualified W=5
-    // residual route may aggregate requests because this policy pins both shapes to A16.
+    // Numerically sensitive fused projections remain per-request panels unless they have an
+    // exact panel-preserving aggregate schedule. The qualified W=5 projection routes pin both
+    // shapes to A16.
     if (phase == qwen3_6::TextPhase::Verify && aggregate_tokens > 0 &&
         aggregate_tokens <= 16) {
         return ops::LinearPolicy::A16Only;
@@ -70,6 +71,12 @@ bool split_verify_panels(qwen3_6::TextPhase phase, std::int32_t route_tokens,
 bool aggregate_w5_verify_residuals(qwen3_6::TextPhase phase, std::int32_t route_tokens,
                                    std::int32_t aggregate_tokens) {
     return split_verify_panels(phase, route_tokens, aggregate_tokens) && route_tokens == 5;
+}
+
+bool aggregate_w5_verify_c_le4(qwen3_6::TextPhase phase, std::int32_t route_tokens,
+                               std::int32_t aggregate_tokens) {
+    return aggregate_w5_verify_residuals(phase, route_tokens, aggregate_tokens) &&
+           (aggregate_tokens == 10 || aggregate_tokens == 15 || aggregate_tokens == 20);
 }
 
 // Packed verify launches Linear at T=width*B. Pin the C=1 width's NVFP4 family so a
@@ -108,7 +115,8 @@ ops::LinearPolicy residual_packed_policy(const Weight& weight, qwen3_6::TextPhas
 
 constexpr std::size_t kMinimumLeafWorkspaceBytes = 1;
 
-// NVFP4 packed verify T=2..16 is fused T=1 GEMV+FP32 conv (one launch per sequence).
+// NVFP4 packed verify T=2..16 uses the fused T=1-reduction route at B=1 and the
+// same-reduction request-indexed SmallT route at B=2..4; neither needs workspace.
 std::size_t nvfp4_gdn_record_leaf_bytes(std::int32_t batch, std::int32_t min_width,
                                         std::int32_t max_width) {
     return std::max(kMinimumLeafWorkspaceBytes,
@@ -249,7 +257,9 @@ void Variant::attention_projection(const Tensor& hidden,
         return;
     }
     const Weight& fused = std::get<FusedAttentionProjectionPayload>(weights).query_key_gate_value;
-    if (split_verify_panels(phase, route_tokens, hidden.ne[1])) {
+    const bool aggregate = aggregate_w5_verify_c_le4(phase, route_tokens, hidden.ne[1]) &&
+                           (fused.qtype == QType::NVFP4 || fused.qtype == QType::BF16_CTRL);
+    if (split_verify_panels(phase, route_tokens, hidden.ne[1]) && !aggregate) {
         for (std::int32_t offset = 0; offset < hidden.ne[1]; offset += route_tokens) {
             Tensor query_panel = query.slice(1, offset, route_tokens);
             Tensor gate_panel  = gate.slice(1, offset, route_tokens);
@@ -261,9 +271,11 @@ void Variant::attention_projection(const Tensor& hidden,
         }
         return;
     }
-    ops::attn_input_proj(hidden, fused, query, gate, key, value,
-                         attn_input_packed_policy(fused, phase, route_tokens, hidden.ne[1]),
-                         workspace, stream);
+    ops::attn_input_proj(
+        hidden, fused, query, gate, key, value,
+        aggregate ? text_policy(fused, phase, route_tokens)
+                  : attn_input_packed_policy(fused, phase, route_tokens, hidden.ne[1]),
+        workspace, stream);
 }
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
@@ -482,6 +494,16 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
     if (split_verify_panels(phase, route_tokens, hidden.ne[1])) {
         const bool aggregate_down =
             aggregate_w5_verify_residuals(phase, route_tokens, hidden.ne[1]);
+        const bool aggregate_swiglu = weights.gate_up.qtype == QType::NVFP4 &&
+                                      aggregate_w5_verify_c_le4(phase, route_tokens, hidden.ne[1]);
+        if (aggregate_swiglu) {
+            ops::linear_swiglu(hidden, weights.gate_up, activation,
+                               text_policy(weights.gate_up, phase, route_tokens), workspace,
+                               stream);
+            ops::linear_add(activation, weights.down, residual,
+                            text_policy(weights.down, phase, route_tokens), workspace, stream);
+            return;
+        }
         for (std::int32_t offset = 0; offset < hidden.ne[1]; offset += route_tokens) {
             Tensor activation_panel = activation.slice(1, offset, route_tokens);
             ops::linear_swiglu(hidden.slice(1, offset, route_tokens), weights.gate_up,

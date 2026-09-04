@@ -223,6 +223,62 @@ int run_bf16_target_case(DeviceWeight& parent, std::int32_t tokens) {
     return failures;
 }
 
+int run_bf16_w5_panels(DeviceWeight& parent, std::int32_t tokens) {
+    constexpr std::int32_t kPanel  = 5;
+    constexpr std::int32_t kHidden = 5120;
+    constexpr std::int32_t kQRows  = 6144;
+    constexpr std::int32_t kKvRows = 1024;
+    const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 359U + tokens);
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    DeviceBuffer device_activation = to_device(activation_bits);
+
+    GuardedBf16Tensor packed_q(kQRows, tokens), packed_gate(kQRows, tokens);
+    GuardedBf16Tensor packed_k(kKvRows, tokens), packed_value(kKvRows, tokens);
+    GuardedBf16Tensor panel_q(kQRows, tokens), panel_gate(kQRows, tokens);
+    GuardedBf16Tensor panel_k(kKvRows, tokens), panel_value(kKvRows, tokens);
+    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor pq = packed_q.tensor(), pg = packed_gate.tensor(), pk = packed_k.tensor();
+    Tensor pv = packed_value.tensor(), cq = panel_q.tensor(), cg = panel_gate.tensor();
+    Tensor ck = panel_k.tensor(), cv = panel_value.tensor();
+    DeviceArena workspace(256);
+    ops::attn_input_proj(x, parent.view(), pq, pg, pk, pv, ops::LinearPolicy::A16Only, workspace,
+                         nullptr);
+    for (std::int32_t offset = 0; offset < tokens; offset += kPanel) {
+        Tensor panel_x = x.slice(1, offset, kPanel);
+        Tensor out_q = cq.slice(1, offset, kPanel), out_g = cg.slice(1, offset, kPanel);
+        Tensor out_k = ck.slice(1, offset, kPanel), out_v = cv.slice(1, offset, kPanel);
+        ops::attn_input_proj(panel_x, parent.view(), out_q, out_g, out_k, out_v,
+                             ops::LinearPolicy::A16Only, workspace, nullptr);
+    }
+    cuda_synchronize();
+
+    int failures = 0;
+    const auto exact = [&](std::string_view name, const GuardedBf16Tensor& packed,
+                           const GuardedBf16Tensor& panels) {
+        if (packed.bits() == panels.bits()) { return; }
+        std::cerr << "attn " << name << " BF16 A16 W5 panels T=" << tokens
+                  << ": packed output differs from panels\n";
+        ++failures;
+    };
+    exact("q", packed_q, panel_q);
+    exact("gate", packed_gate, panel_gate);
+    exact("k", packed_k, panel_k);
+    exact("value", packed_value, panel_value);
+    for (const auto& [name, output] :
+         std::initializer_list<std::pair<std::string_view, const GuardedBf16Tensor*>>{
+             {"packed q", &packed_q},       {"packed gate", &packed_gate},
+             {"packed k", &packed_k},       {"packed value", &packed_value},
+             {"panel q", &panel_q},         {"panel gate", &panel_gate},
+             {"panel k", &panel_k},         {"panel value", &panel_value},
+         }) {
+        failures += output->verify_guards(name);
+        failures += output->verify_fully_written(name);
+    }
+    failures += verify_preserved("attn BF16 W5 panels x", device_activation, activation_bits);
+    failures += parent.verify_preserved("attn BF16 W5 panels parent");
+    return failures;
+}
+
 int run_bf16_target() {
     constexpr std::int32_t kHidden     = 5120;
     constexpr std::int32_t kParentRows = 14336;
@@ -233,8 +289,11 @@ int run_bf16_target() {
         std::cerr << "BF16 attention input workspace interval is not zero-capacity\n";
         ++failures;
     }
-    for (const std::int32_t tokens : {1, 2, 22, 23, 128}) {
+    for (const std::int32_t tokens : {1, 2, 10, 15, 20, 22, 23, 128}) {
         failures += run_bf16_target_case(parent, tokens);
+    }
+    for (const std::int32_t tokens : {10, 15, 20}) {
+        failures += run_bf16_w5_panels(parent, tokens);
     }
     return failures;
 }
@@ -284,6 +343,62 @@ int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens,
                               activation, kHidden, tokens, criterion, sample_count);
     failures += verify_preserved("attn x" + suffix, device_activation, activation_bits);
     failures += parent.verify_preserved("attn parent" + suffix);
+    return failures;
+}
+
+int run_nvfp4_w5_panels(DevicePackedWeight& parent, std::int32_t tokens) {
+    constexpr std::int32_t kPanel  = 5;
+    constexpr std::int32_t kHidden = 5120;
+    constexpr std::int32_t kQRows  = 6144;
+    constexpr std::int32_t kKvRows = 1024;
+    const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 373U + tokens);
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    DeviceBuffer device_activation = to_device(activation_bits);
+
+    GuardedBf16Tensor packed_q(kQRows, tokens), packed_gate(kQRows, tokens);
+    GuardedBf16Tensor packed_k(kKvRows, tokens), packed_value(kKvRows, tokens);
+    GuardedBf16Tensor panel_q(kQRows, tokens), panel_gate(kQRows, tokens);
+    GuardedBf16Tensor panel_k(kKvRows, tokens), panel_value(kKvRows, tokens);
+    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor pq = packed_q.tensor(), pg = packed_gate.tensor(), pk = packed_k.tensor();
+    Tensor pv = packed_value.tensor(), cq = panel_q.tensor(), cg = panel_gate.tensor();
+    Tensor ck = panel_k.tensor(), cv = panel_value.tensor();
+    DeviceArena workspace(256);
+    ops::attn_input_proj(x, parent.view(), pq, pg, pk, pv, ops::LinearPolicy::A16Only, workspace,
+                         nullptr);
+    for (std::int32_t offset = 0; offset < tokens; offset += kPanel) {
+        Tensor panel_x = x.slice(1, offset, kPanel);
+        Tensor out_q = cq.slice(1, offset, kPanel), out_g = cg.slice(1, offset, kPanel);
+        Tensor out_k = ck.slice(1, offset, kPanel), out_v = cv.slice(1, offset, kPanel);
+        ops::attn_input_proj(panel_x, parent.view(), out_q, out_g, out_k, out_v,
+                             ops::LinearPolicy::A16Only, workspace, nullptr);
+    }
+    cuda_synchronize();
+
+    int failures = 0;
+    const auto exact = [&](std::string_view name, const GuardedBf16Tensor& packed,
+                           const GuardedBf16Tensor& panels) {
+        if (packed.bits() == panels.bits()) { return; }
+        std::cerr << "attn " << name << " NVFP4 A16 W5 panels T=" << tokens
+                  << ": packed output differs from panels\n";
+        ++failures;
+    };
+    exact("q", packed_q, panel_q);
+    exact("gate", packed_gate, panel_gate);
+    exact("k", packed_k, panel_k);
+    exact("value", packed_value, panel_value);
+    for (const auto& [name, output] :
+         std::initializer_list<std::pair<std::string_view, const GuardedBf16Tensor*>>{
+             {"packed q", &packed_q},       {"packed gate", &packed_gate},
+             {"packed k", &packed_k},       {"packed value", &packed_value},
+             {"panel q", &panel_q},         {"panel gate", &panel_gate},
+             {"panel k", &panel_k},         {"panel value", &panel_value},
+         }) {
+        failures += output->verify_guards(name);
+        failures += output->verify_fully_written(name);
+    }
+    failures += verify_preserved("attn NVFP4 W5 panels x", device_activation, activation_bits);
+    failures += parent.verify_preserved("attn NVFP4 W5 panels parent");
     return failures;
 }
 
@@ -351,8 +466,11 @@ int run_nvfp4_target() {
         quantized_weight::make_patterned_weight(QType::NVFP4, kParentRows, kHidden, 331U, options));
 
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 16, 32, 33}) {
+    for (const std::int32_t tokens : {1, 2, 10, 15, 16, 20, 32, 33}) {
         failures += run_nvfp4_target_case(parent, tokens);
+    }
+    for (const std::int32_t tokens : {10, 15, 20}) {
+        failures += run_nvfp4_w5_panels(parent, tokens);
     }
     for (const std::int32_t tokens : {1, 4, 15, 36, 1024}) {
         failures += run_nvfp4_target_case(parent, tokens, ops::LinearPolicy::AllowA4);

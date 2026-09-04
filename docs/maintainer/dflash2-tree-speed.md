@@ -418,28 +418,38 @@ headline numbers use the request_done aggregate. Logs:
 C=3 k=4 is **324 aggregate tok/s**. Isolation holds; per-request rate is the shared-SM cost of
 the compact decode batch, not a quality loss.
 
-## C<=4 residual-projection retune (2026-09-03)
+## C<=4 W=5 aggregate retune (2026-09-04)
 
-For W=5, the compact verify tensor is consumed as one A16 LinearAdd at T=5*C for attention
-output, GDN output, and MLP down. Attention input and LinearSwiGLU stay as W-token panels:
-aggregating all target leaves changed the T=15 arithmetic schedule and failed C=3 row isolation.
-Other verify widths retain their prior panel execution until separately qualified. The retained
-split removes repeated weight reads and graph nodes only at residual epilogues whose independent
-output rows remain isolated.
+For W=5, the compact verify tensor is consumed at T=5*C by the A16 LinearAdd residual projections,
+NVFP4 LinearSwiGLU, and fused NVFP4/BF16-control attention-input projections. The latter two use
+explicit T=10/15/20 schedules qualified against both their independent mathematical oracles and
+five-token panel execution. Q4/Q5 attention input and other verify widths retain their prior panel
+execution until separately qualified.
 
 Matched greedy W=5 serving, 2,048 output tokens per request, NVFP4 KV:
 
-| C | W=5 panels | Aggregate residuals | Change |
-|---:|---:|---:|---:|
-| 2 | 207.6 tok/s | 228.6 tok/s | +10.1% |
-| 3 | 214.6 tok/s | 240.1 tok/s | +11.9% |
-| 4 | 209.8 tok/s | 236.6 tok/s | +12.8% |
+| C | All panels | Aggregate residuals | Projection aggregates | Concurrent GDN | vs prior | vs panels |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 161.3 tok/s | 173.6 tok/s | 187.5 tok/s | **219.9 tok/s** | +17.3% | +36.3% |
+| 3 | 163.6 tok/s | 177.8 tok/s | 193.3 tok/s | **229.6 tok/s** | +18.8% | +40.4% |
+| 4 | 164.4 tok/s | 173.5 tok/s | 186.8 tok/s | **220.6 tok/s** | +18.1% | +34.2% |
 
-C=4 nsys total kernel time normalized by the once-per-round path-select call fell from 55.6 ms
-to 49.1 ms. The real-artifact C=4 isolation gate uses four distinct prompts and matches each
-overlapping result to its sequential C=1 DFlash stream. Independent FP64 oracles cover the A16
-aggregate schedules through T=64; at W=5, the C=2/3/4 aggregate residuals are also bit-identical
-to separate panels for both NVFP4 and BF16 weights.
+Because the target Program is shared, MTP4 receives the same W=5 route. Its matched C=2/3/4
+throughput progressed from the projection aggregate's 178.4/190.9/188.1 to
+212.1/229.5/225.3 tok/s (+18.9%/+20.2%/+19.8%). Relative to all panels the complete gain is
++35.3%/+41.4%/+36.7%. Speculative rounds, accepted-token counts, and output hashes were unchanged.
+
+In the pre-rebase residual-projection step, C=4 nsys total kernel time normalized by the
+once-per-round path-select call fell from 55.6 ms to 49.1 ms. The later SwiGLU and attention-input
+work removes the remaining repeated large-weight reads at those projection sites while keeping
+the W=5 row semantics. Residual T=20 uses the T=5 panel's 16-value-per-lane reduction; the generic
+eight-value
+schedule changed reduction association and was rejected after diverging at emitted token 133.
+A true all-panels versus combined C=4 probe produced zero mismatches, relative L2, maximum absolute
+error, or nonfinite values across sampled intermediate activations, logits, verifier decisions,
+cache positions, and BF16/FP32 GDN state. Four Graph streams then matched across all 2,048 tokens,
+with identical rounds and acceptance. Target-only PPL also remained byte-identical across the
+rebase, but that route does not exercise concurrent packed verification.
 
 This does not make complete greedy streams universally batch-size invariant. A diagnostic fourth
 prompt with token 6100 at the differing position flipped token 16 between C=1 and C=4 under both
@@ -447,9 +457,22 @@ the panel control and aggregate route. It is an existing close-boundary target-v
 not residual aggregation drift; the fixed four-prompt isolation fixture avoids that unstable
 boundary and remains exact.
 
-A separate aggregate GDN conv-record specialization for the concrete W=5 C=2..4 shapes was
-rejected. Cold graph-replay medians regressed from 112.6/155.4/200.7 us to
-133.1/165.9/208.9 us at C=2/3/4; keep the existing fused W=5 launch with `grid.x=C`.
+The post-origin numerical fix temporarily serialized the exact T=1 GDN record kernel per request;
+a current public-Op control measured 217.088 us at W=5 C=2. Restoring the same-reduction SmallT
+route with request-indexed CTAs and explicit BF16 history roundtrips reduced that to 110.592 us
+(-49.1%). The first pair-within-CTA candidate measured 215.072 us and was removed. W=5 C=2/3/4
+dense, ragged, and tree-parent q/k/v/z and valid records are bit-exact to independent C=1 T=1
+launches; 63 decoded-NVFP4 FP64 oracle checks passed with no nonfinite values.
+
+A DFlash2 proposer MLP gate-up Linear+SiLU fusion was also rejected. In its matched pre-rebase
+campaign it improved the isolated T=10/15/20 composite from 73.7 us to 71.7/71.7/73.7 us, but
+reduced production throughput at C=2/3/4. Separately, top-k path selection is only about 1% of
+the profiled C=4 kernel time, so rewriting it is not a material round-speed lever.
+
+The BF16 attention-input phase-order change is visible to any standalone T=10/15/20 A16 caller.
+It is 1.9% slower than the old packed route at T=10, 13.0% slower at T=15, and unchanged at T=20;
+the selected order preserves exact W=5 panel arithmetic and makes the production C=3 aggregate
+58.5% faster than three panel launches.
 
 Reports: `profiles/bench/qwen38_dflash2_nvfp4_aime_20260829/`,
 `qwen38_dflash2_fused_batch_aime_20260829/`,
@@ -458,6 +481,10 @@ Reports: `profiles/bench/qwen38_dflash2_nvfp4_aime_20260829/`,
 `qwen38_dflash2_markov_sample_aime/`, `qwen38_dflash2_markov_t03_aime/`,
 `qwen38_dflash2_markov_t02_clean_aime/`, `qwen38_dflash2_markov_t02_story/`,
 `qwen38_dflash2_binary_aime/`, `qwen38_dflash2_greedy_rebase_aime/`.
+The C<=4 retune A/Bs are in
+`profiles/bench/multi-request-kernel-post-origin-{panel-control,mtp4-panel-control,residual-only-fixed,final}-20260904/`.
+Concurrent-GDN results are in `profiles/bench/multi-request-kernel-gdn-{final,mtp4-final}-20260904/`
+and the Op A/B is in `profiles/bench/gdn-c2-retune-20260904/`.
 
 ## Do not retry without new attribution
 

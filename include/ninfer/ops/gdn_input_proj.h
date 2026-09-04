@@ -172,9 +172,10 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
 
 /**
- * Returns the transient capacity for the [16384,5120] NVFP4 record-producing profile. A16 and
- * fused T=1 GEMV+conv routes require no storage. AllowA4 returns only the activation-quantization
- * workspace selected by the corresponding projection route; conv_record is caller-owned.
+ * Returns the transient capacity for the [16384,5120] NVFP4 record-producing profile. The B=1
+ * fused T=1-reduction route and B=2..4 request-indexed SmallT route require no storage. AllowA4
+ * returns only the activation-quantization workspace selected by the corresponding projection
+ * route; conv_record is caller-owned.
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
@@ -184,9 +185,10 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
  * Op: gdn_input_proj_conv_record
  *
  * For each batch row, evaluates the registered projection, width-four causal convolution, SiLU,
- * and q/k/value/z split from the BF16 history selected by initial_state_slots. It writes the BF16
- * represented projection column consumed by the convolution to conv_record [C,T,B]. Query, key,
- * and value are zero in each row's invalid tail; z is projected for every physical column.
+ * and q/k/value/z split from the BF16 history selected by initial_state_slots. The current
+ * convolution consumes the projection route's FP32 accumulator; the Op writes its BF16
+ * representation to conv_record [C,T,B] for subsequent history/replay. Query, key, and value are
+ * zero in each row's invalid tail; z is projected for every physical column.
  *
  * The execution domain is B=1..4 and T=2..16. valid_columns is empty for dense input or device
  * I32 [B], with each caller-supplied extent in [1,T]. conv_states is a read-only BF16 [C,3,S]
@@ -197,8 +199,9 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
  * [T,B] (or [T] when B=1) parent tensor used by gated_delta_net_replay_record: token 0 loads the
  * checkpoint history, every other valid token j loads the width-three history saved after its
  * parent, and the kernel saves the post-convolution history for j so siblings can share a parent.
- * NVFP4 T=2..16 runs fused T=1 GEMV+FP32 conv in one launch per sequence (ordinary-decode
- * GEMV and BF16 3-tap history) so packed verify does not take SmallT GEMM or BF16 compose-record.
+ * NVFP4 T=2..16 B=1 uses the fused T=1-reduction GEMV+FP32-convolution route. B=2..4 uses one
+ * same-reduction SmallT grid with request-indexed CTAs. Both routes round saved three-tap history
+ * through BF16 at each valid column and avoid the BF16 projected compose-record route.
  *
  * The two-parent form registers Q4 q/k [4096,5120] and the Q5 value/z parent [12288,5120]. All
  * tensor operands, outputs, conv_record, source state, and live workspace must be disjoint.
