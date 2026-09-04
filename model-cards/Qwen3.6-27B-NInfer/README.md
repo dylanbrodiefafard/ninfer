@@ -209,7 +209,7 @@ These are single-sample results under the stated NInfer evaluation profile, not 
 
 - The artifact is accepted only by NInfer revision `bd265a3` or later and the matching registered
   target.
-- NInfer executes on one RTX 5090 and one CUDA device, with a startup-fixed capacity of 1–8 active
+- NInfer executes on one RTX 5090 and one CUDA device, with a startup-fixed capacity of 1–4 active
   requests per Engine.
 - It does not provide large-scale or preemptive continuous batching, priority/QoS scheduling,
   multi-GPU execution, CPU/GPU offload, or distributed serving.

@@ -1,7 +1,7 @@
 # NInfer 小规模并发推理架构
 
 本文定义 NInfer 在单 GPU、单模型实例下支持少量并发请求的执行架构。典型
-`max_concurrency` 为 2–8。
+`max_concurrency` 为 1–4。
 
 设计目标不是让多个请求轮流执行，而是让所有处于 decode 阶段的请求形成一次真正的 batched
 model execution：一次 model traversal、一次 CUDA Graph replay 和一组 batched operators 同时为
@@ -18,7 +18,7 @@ model execution：一次 model traversal、一次 CUDA Graph replay 和一组 ba
 ### 1.1 Supported workload
 
 - 单 GPU、单 resident model instance；
-- 启动时固定 `max_concurrency=C`，典型 `C=2..8`；
+- 启动时固定 `max_concurrency=C`，支持 `C=1..4`；
 - 运行时 `0..C` 个 admitted requests；
 - Text 与 image/video prompt；
 - ordinary decoding 与 engine-wide speculative decoding；

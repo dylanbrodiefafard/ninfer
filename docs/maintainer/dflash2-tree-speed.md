@@ -385,7 +385,8 @@ NVFP4 C>1 verify no longer flattens GDN conv-record to `T=W×B` compose (W4A4 GE
 conv). That path flipped greedy column 0 versus C=1 fused SmallT+FP32. The speed path is one
 fused SmallT launch at `T=W` per row (`grid.x=B`). Op guard:
 `run_nvfp4_batched_matches_serial_fused` (B=3 W=8, B=3 W=5, mixed valid). Engine isolation
-`ninfer_qwen3_8_27b_dflash_real_test` k=7 C=3 Graph DFlash still matches saved C=1 DFlash.
+`ninfer_qwen3_8_27b_dflash_real_test` C=4 Graph DFlash still matches four saved C=1 DFlash
+streams per row.
 
 Isolated CLI C=1, NVFP4 KV, same AIME command as the W4A4 table
 (`/models/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`, seed `7632647173703958409`, presence
@@ -416,6 +417,39 @@ headline numbers use the request_done aggregate. Logs:
 
 C=3 k=4 is **324 aggregate tok/s**. Isolation holds; per-request rate is the shared-SM cost of
 the compact decode batch, not a quality loss.
+
+## C<=4 residual-projection retune (2026-09-03)
+
+For W=5, the compact verify tensor is consumed as one A16 LinearAdd at T=5*C for attention
+output, GDN output, and MLP down. Attention input and LinearSwiGLU stay as W-token panels:
+aggregating all target leaves changed the T=15 arithmetic schedule and failed C=3 row isolation.
+Other verify widths retain their prior panel execution until separately qualified. The retained
+split removes repeated weight reads and graph nodes only at residual epilogues whose independent
+output rows remain isolated.
+
+Matched greedy W=5 serving, 2,048 output tokens per request, NVFP4 KV:
+
+| C | W=5 panels | Aggregate residuals | Change |
+|---:|---:|---:|---:|
+| 2 | 207.6 tok/s | 228.6 tok/s | +10.1% |
+| 3 | 214.6 tok/s | 240.1 tok/s | +11.9% |
+| 4 | 209.8 tok/s | 236.6 tok/s | +12.8% |
+
+C=4 nsys total kernel time normalized by the once-per-round path-select call fell from 55.6 ms
+to 49.1 ms. The real-artifact C=4 isolation gate uses four distinct prompts and matches each
+overlapping result to its sequential C=1 DFlash stream. Independent FP64 oracles cover the A16
+aggregate schedules through T=64; at W=5, the C=2/3/4 aggregate residuals are also bit-identical
+to separate panels for both NVFP4 and BF16 weights.
+
+This does not make complete greedy streams universally batch-size invariant. A diagnostic fourth
+prompt with token 6100 at the differing position flipped token 16 between C=1 and C=4 under both
+the panel control and aggregate route. It is an existing close-boundary target-verify variation,
+not residual aggregation drift; the fixed four-prompt isolation fixture avoids that unstable
+boundary and remains exact.
+
+A separate aggregate GDN conv-record specialization for the concrete W=5 C=2..4 shapes was
+rejected. Cold graph-replay medians regressed from 112.6/155.4/200.7 us to
+133.1/165.9/208.9 us at C=2/3/4; keep the existing fused W=5 launch with `grid.x=C`.
 
 Reports: `profiles/bench/qwen38_dflash2_nvfp4_aime_20260829/`,
 `qwen38_dflash2_fused_batch_aime_20260829/`,

@@ -52,7 +52,8 @@ ops::LinearPolicy text_policy(const Weight& weight,
                               std::int32_t aggregate_tokens = 0) {
     // P-less is sensitive to small target-logit perturbations at its collision-probability
     // boundary. Keep target verification on the same A16 matrix route as ordinary decode.
-    // Wide concurrent verification is presented to these leaves as per-request panels below.
+    // Numerically sensitive fused projections remain per-request panels. The qualified W=5
+    // residual route may aggregate requests because this policy pins both shapes to A16.
     if (phase == qwen3_6::TextPhase::Verify && aggregate_tokens > 0 &&
         aggregate_tokens <= 16) {
         return ops::LinearPolicy::A16Only;
@@ -64,6 +65,11 @@ bool split_verify_panels(qwen3_6::TextPhase phase, std::int32_t route_tokens,
                          std::int32_t aggregate_tokens) {
     return phase == qwen3_6::TextPhase::Verify && route_tokens > 0 &&
            route_tokens < aggregate_tokens;
+}
+
+bool aggregate_w5_verify_residuals(qwen3_6::TextPhase phase, std::int32_t route_tokens,
+                                   std::int32_t aggregate_tokens) {
+    return split_verify_panels(phase, route_tokens, aggregate_tokens) && route_tokens == 5;
 }
 
 // Packed verify launches Linear at T=width*B. Pin the C=1 width's NVFP4 family so a
@@ -264,18 +270,20 @@ void Variant::attention_output_projection(const Tensor& attention, const Weight&
                                           Tensor& residual, qwen3_6::TextPhase phase,
                                           WorkspaceArena& workspace, cudaStream_t stream,
                                           std::int32_t route_tokens) {
-    if (split_verify_panels(phase, route_tokens, attention.ne[1])) {
+    if (split_verify_panels(phase, route_tokens, attention.ne[1]) &&
+        !aggregate_w5_verify_residuals(phase, route_tokens, attention.ne[1])) {
         for (std::int32_t offset = 0; offset < attention.ne[1]; offset += route_tokens) {
             Tensor residual_panel = residual.slice(1, offset, route_tokens);
-            ops::linear_add(attention.slice(1, offset, route_tokens), weight,
-                            residual_panel, text_policy(weight, phase, route_tokens), workspace,
-                            stream);
+            ops::linear_add(attention.slice(1, offset, route_tokens), weight, residual_panel,
+                            text_policy(weight, phase, route_tokens), workspace, stream);
         }
         return;
     }
     ops::linear_add(attention, weight, residual,
-                    residual_packed_policy(weight, phase, route_tokens, attention.ne[1]), workspace,
-                    stream);
+                    aggregate_w5_verify_residuals(phase, route_tokens, attention.ne[1])
+                        ? text_policy(weight, phase, route_tokens)
+                        : residual_packed_policy(weight, phase, route_tokens, attention.ne[1]),
+                    workspace, stream);
 }
 
 void Variant::mtp_attention_projection(const Tensor& hidden,
@@ -426,18 +434,20 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
 void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
                                     qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                                     cudaStream_t stream, std::int32_t route_tokens) {
-    if (split_verify_panels(phase, route_tokens, hidden.ne[1])) {
+    if (split_verify_panels(phase, route_tokens, hidden.ne[1]) &&
+        !aggregate_w5_verify_residuals(phase, route_tokens, hidden.ne[1])) {
         for (std::int32_t offset = 0; offset < hidden.ne[1]; offset += route_tokens) {
             Tensor residual_panel = residual.slice(1, offset, route_tokens);
-            ops::linear_add(hidden.slice(1, offset, route_tokens), weight,
-                            residual_panel, text_policy(weight, phase, route_tokens), workspace,
-                            stream);
+            ops::linear_add(hidden.slice(1, offset, route_tokens), weight, residual_panel,
+                            text_policy(weight, phase, route_tokens), workspace, stream);
         }
         return;
     }
     ops::linear_add(hidden, weight, residual,
-                    residual_packed_policy(weight, phase, route_tokens, hidden.ne[1]), workspace,
-                    stream);
+                    aggregate_w5_verify_residuals(phase, route_tokens, hidden.ne[1])
+                        ? text_policy(weight, phase, route_tokens)
+                        : residual_packed_policy(weight, phase, route_tokens, hidden.ne[1]),
+                    workspace, stream);
 }
 
 void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& norm_weight,
@@ -470,13 +480,21 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
     auto scope        = workspace.scope();
     Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
     if (split_verify_panels(phase, route_tokens, hidden.ne[1])) {
+        const bool aggregate_down =
+            aggregate_w5_verify_residuals(phase, route_tokens, hidden.ne[1]);
         for (std::int32_t offset = 0; offset < hidden.ne[1]; offset += route_tokens) {
-            const Tensor hidden_panel = hidden.slice(1, offset, route_tokens);
-            Tensor activation_panel   = activation.slice(1, offset, route_tokens);
-            Tensor residual_panel     = residual.slice(1, offset, route_tokens);
-            ops::linear_swiglu(hidden_panel, weights.gate_up, activation_panel,
-                               text_policy(weights.gate_up, phase, route_tokens), workspace, stream);
-            ops::linear_add(activation_panel, weights.down, residual_panel,
+            Tensor activation_panel = activation.slice(1, offset, route_tokens);
+            ops::linear_swiglu(hidden.slice(1, offset, route_tokens), weights.gate_up,
+                               activation_panel, text_policy(weights.gate_up, phase, route_tokens),
+                               workspace, stream);
+            if (!aggregate_down) {
+                Tensor residual_panel = residual.slice(1, offset, route_tokens);
+                ops::linear_add(activation_panel, weights.down, residual_panel,
+                                text_policy(weights.down, phase, route_tokens), workspace, stream);
+            }
+        }
+        if (aggregate_down) {
+            ops::linear_add(activation, weights.down, residual,
                             text_policy(weights.down, phase, route_tokens), workspace, stream);
         }
         return;

@@ -320,7 +320,7 @@ combines it with image, multi-image, video, and mixed-media prompts.
 - Only the `qwen3.8-27b/nvfp4` artifact identity is an accepted product identity; the other listed
   artifacts remain loadable but are outside the current contract.
 - Execution is specialized for one RTX 5090 and one CUDA device.
-- One Engine owns one resident model and supports a startup-fixed capacity of 1–8 active requests.
+- One Engine owns one resident model and supports a startup-fixed capacity of 1–4 active requests.
   Decode-ready requests are compacted at round boundaries and executed in one batched model
   traversal.
 - NInfer does not provide large-scale or preemptive continuous batching, priority/QoS scheduling,

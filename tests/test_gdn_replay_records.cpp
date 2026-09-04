@@ -67,7 +67,7 @@ int main() {
 
     const ninfer::GdnReplayRecordSpec spec{
         .layers          = 3,
-        .record_capacity = 5,
+        .record_capacity = 4,
         .width           = 4,
         .conv_channels   = 256,
         .qk_heads        = 2,
@@ -81,10 +81,10 @@ int main() {
     auto backing            = make_backing(bytes);
     const ninfer::GdnReplayRecords records({backing.get(), bytes}, layout);
 
-    failures += expect_shape(records.conv, 256, 4, 15, 1, "conv plane");
-    failures += expect_shape(records.key, 128, 2, 4, 15, "key plane");
-    failures += expect_shape(records.value, 128, 6, 4, 15, "value plane");
-    failures += expect_shape(records.gate, 2, 6, 4, 15, "gate plane");
+    failures += expect_shape(records.conv, 256, 4, 12, 1, "conv plane");
+    failures += expect_shape(records.key, 128, 2, 4, 12, "key plane");
+    failures += expect_shape(records.value, 128, 6, 4, 12, "value plane");
+    failures += expect_shape(records.gate, 2, 6, 4, 12, "gate plane");
     failures += expect(records.conv.dtype == ninfer::DType::BF16, "conv dtype differs");
     failures += expect(records.key.dtype == ninfer::DType::BF16, "key dtype differs");
     failures += expect(records.value.dtype == ninfer::DType::BF16, "value dtype differs");
@@ -125,41 +125,41 @@ int main() {
     failures += expect_throw([&] { (void)records.layer(-1, 1); }, "negative layer");
     failures += expect_throw([&] { (void)records.layer(3, 1); }, "past-end layer");
     failures += expect_throw([&] { (void)records.layer(0, 0); }, "zero active rows");
-    failures += expect_throw([&] { (void)records.layer(0, 6); }, "excess active rows");
+    failures += expect_throw([&] { (void)records.layer(0, 5); }, "excess active rows");
 
     failures += expect_size(record_bytes({.layers          = 48,
-                                          .record_capacity = 8,
+                                          .record_capacity = 4,
                                           .width           = 6,
                                           .conv_channels   = 10240,
                                           .qk_heads        = 16,
                                           .value_heads     = 48,
                                           .key_dim         = 128,
                                           .value_dim       = 128}),
-                            85819392, "48-layer T6 capacity");
+                            42909696, "48-layer T6 capacity");
     failures += expect_size(record_bytes({.layers          = 30,
-                                          .record_capacity = 8,
+                                          .record_capacity = 4,
                                           .width           = 6,
                                           .conv_channels   = 8192,
                                           .qk_heads        = 16,
                                           .value_heads     = 32,
                                           .key_dim         = 128,
                                           .value_dim       = 128}),
-                            41656320, "30-layer T6 capacity");
+                            20828160, "30-layer T6 capacity");
     failures += expect_size(record_bytes({.layers          = 30,
-                                          .record_capacity = 8,
+                                          .record_capacity = 4,
                                           .width           = 16,
                                           .conv_channels   = 8192,
                                           .qk_heads        = 16,
                                           .value_heads     = 32,
                                           .key_dim         = 128,
                                           .value_dim       = 128}),
-                            111083520, "30-layer T16 capacity");
+                            55541760, "30-layer T16 capacity");
 
     failures += expect_throw(
         [&] {
             ninfer::LayoutBuilder invalid;
             (void)ninfer::plan_gdn_replay_records(invalid, {.layers          = 1,
-                                                            .record_capacity = 9,
+                                                            .record_capacity = 5,
                                                             .width           = 2,
                                                             .conv_channels   = 1,
                                                             .qk_heads        = 1,
@@ -167,7 +167,7 @@ int main() {
                                                             .key_dim         = 1,
                                                             .value_dim       = 1});
         },
-        "record capacity above eight");
+        "record capacity above four");
 
     ninfer::LayoutBuilder state_builder;
     const auto state_layout = ninfer::plan_linear_attention_state_pool(
@@ -196,7 +196,7 @@ int main() {
                             "recurrent layer stride");
     failures +=
         expect_size(static_cast<std::size_t>(all.spec.slot_count), 7, "all-layer slot count");
-    failures += expect_size(static_cast<std::size_t>(records.spec.record_capacity), 5,
+    failures += expect_size(static_cast<std::size_t>(records.spec.record_capacity), 4,
                             "independent record capacity");
 
     const ninfer::Tensor saved = state.conv[1];

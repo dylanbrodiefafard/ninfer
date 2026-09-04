@@ -31,7 +31,7 @@ namespace {
 
 constexpr std::int32_t kStateDim       = 128;
 constexpr std::int32_t kQkHeads        = 16;
-constexpr std::int32_t kRecordCapacity = 8;
+constexpr std::int32_t kRecordCapacity = 4;
 constexpr std::size_t kGuardBytes      = 256;
 
 std::uint32_t mix(std::uint32_t value) {
@@ -963,7 +963,7 @@ int run_identity_path_matches_prefix_fold() {
     constexpr std::int32_t kSlotCount = 2;
     constexpr std::int32_t kSlot      = 1;
     constexpr std::uint32_t kSeed     = 1891U;
-    constexpr std::int32_t kCapacity  = 8;
+    constexpr std::int32_t kCapacity  = 4;
 
     const std::size_t recurrent_slot_elements =
         static_cast<std::size_t>(kStateDim) * kStateDim * kProfile.value_heads;

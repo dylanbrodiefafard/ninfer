@@ -33,7 +33,7 @@ namespace {
 
 constexpr std::int32_t kQkHeads        = 16;
 constexpr std::int32_t kStateDim       = 128;
-constexpr std::int32_t kRecordCapacity = 8;
+constexpr std::int32_t kRecordCapacity = 4;
 constexpr std::int32_t kStateSlots     = 11;
 constexpr std::size_t kDefaultFlush    = 256ULL << 20;
 
@@ -134,7 +134,7 @@ void print_help(const char* program) {
                 "  --component fold|recurrent|all\n"
                 "                              Measured component (default all).\n"
                 "  --width T                   One physical width in [2,16].\n"
-                "  --batch B                   One active row count in [1,8].\n"
+                "  --batch B                   One active row count in [1,4].\n"
                 "  --commits one|dense|mixed|all\n"
                 "                              Commit policy (default all).\n"
                 "  --valid dense|mixed|all     Recurrent valid-prefix policy (default all).\n"
@@ -160,7 +160,7 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--width") {
             options.exact_width = parse_i32(next("width"), "width", 2, 16);
         } else if (argument == "--batch") {
-            options.exact_batch = parse_i32(next("batch"), "batch", 1, 8);
+            options.exact_batch = parse_i32(next("batch"), "batch", 1, 4);
         } else if (argument == "--commits") {
             options.commits = parse_commits(next("commit policy"));
         } else if (argument == "--valid") {
@@ -247,14 +247,14 @@ const char* commit_name(CommitSelection selection) {
 
 std::vector<ops::GdnReplayFoldRow> make_rows(std::int32_t batch, std::int32_t width,
                                              CommitSelection selection) {
-    constexpr std::int32_t kSlots[kRecordCapacity] = {10, 2, 8, 0, 6, 4, 9, 1};
+    constexpr std::int32_t kSlots[kRecordCapacity] = {10, 2, 8, 0};
     std::vector<ops::GdnReplayFoldRow> rows(static_cast<std::size_t>(batch));
     for (std::int32_t row = 0; row < batch; ++row) {
         std::int32_t commit = 1;
         if (selection == CommitSelection::Dense) {
             commit = width;
         } else if (selection == CommitSelection::Mixed) {
-            constexpr std::int32_t kMixed[kRecordCapacity] = {0, 1, 2, 3, 16, 7, 12, 5};
+            constexpr std::int32_t kMixed[kRecordCapacity] = {0, 1, 2, 3};
             commit                                         = std::min(width, kMixed[row]);
         }
         rows[static_cast<std::size_t>(row)] = {kSlots[row], commit};
