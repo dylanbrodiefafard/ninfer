@@ -13,6 +13,8 @@
 
 namespace ninfer::artifact {
 
+class MaterializedArtifact;
+
 class ArtifactError : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
@@ -28,6 +30,13 @@ enum class NumericFormat {
     W8G32_F16S,
     NVFP4,
     FP8_E4M3FN_ROW_BF16S,
+    Q8_0,
+    Q4_K,
+    Q5_K,
+    Q6_K,
+    IQ1_S,
+    IQ2_XXS,
+    IQ4_NL,
 };
 
 enum class StorageLayout {
@@ -35,6 +44,7 @@ enum class StorageLayout {
     RowSplitK128V1,
     BlockScaleK16M128x4V1,
     RowScaleV1,
+    GgmlBlockRowV1,
 };
 
 enum class ResourceEncoding {
@@ -92,6 +102,20 @@ struct RowScaleGeometry {
 };
 
 RowScaleGeometry row_scale_geometry(NumericFormat format, std::span<const std::uint64_t> shape);
+struct GgmlBlockGeometry {
+    std::uint64_t matrices        = 0;
+    std::uint64_t rows_per_matrix = 0;
+    std::uint64_t columns        = 0;
+    std::uint64_t block_values   = 0;
+    std::uint64_t block_bytes    = 0;
+    std::uint64_t blocks_per_row = 0;
+    std::uint64_t row_bytes      = 0;
+    std::uint64_t matrix_bytes   = 0;
+    std::uint64_t encoded_bytes  = 0;
+};
+
+GgmlBlockGeometry ggml_block_geometry(NumericFormat format,
+                                      std::span<const std::uint64_t> shape);
 
 struct TensorDescriptor {
     std::string name;
@@ -153,8 +177,12 @@ public:
     std::size_t read_direct(std::uint64_t absolute_offset, std::span<std::byte> destination) const;
 
 private:
+    friend class MaterializedArtifact;
+
+    [[nodiscard]] std::shared_ptr<const void> retain_mapping() const noexcept;
+
     struct Impl;
-    std::unique_ptr<Impl> impl_;
+    std::shared_ptr<Impl> impl_;
 };
 
 } // namespace ninfer::artifact

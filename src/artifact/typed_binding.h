@@ -29,4 +29,11 @@ class MaterializedArtifact;
                                          ObjectHandle handle, NumericFormat format,
                                          std::int32_t rows, std::int32_t columns);
 
+[[nodiscard]] Weight materialized_ggml_block_weight(
+    const MaterializedArtifact& materialized, ObjectHandle handle, NumericFormat format,
+    std::initializer_list<std::int32_t> shape);
+
+/** Return one byte-identical rank-two matrix view of a rank-three GGML expert bank. */
+[[nodiscard]] Weight ggml_block_matrix_view(const Weight& bank, std::int32_t matrix_index);
+
 } // namespace ninfer::artifact

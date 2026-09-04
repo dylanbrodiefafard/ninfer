@@ -21,6 +21,7 @@ import torch
 from .numeric import (
     DirectFormat,
     Fp8RowFormat,
+    GgmlBlockFormat,
     Nvfp4Format,
     NumericFormat,
     QuantFormat,
@@ -84,6 +85,20 @@ class RowScaleGeometry:
     payload_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class GgmlBlockGeometry:
+    shape: tuple[int, ...]
+    matrices: int
+    rows_per_matrix: int
+    columns: int
+    block_values: int
+    block_bytes: int
+    blocks_per_row: int
+    row_bytes: int
+    matrix_bytes: int
+    payload_bytes: int
+
+
 Plane: TypeAlias = bytes | bytearray | memoryview | torch.Tensor
 Payload: TypeAlias = bytes | bytearray | memoryview | torch.Tensor
 
@@ -117,6 +132,12 @@ ROW_SCALE_V1 = Layout(
     frozenset(("FP8_E4M3FN_ROW_BF16S",)),
 )
 
+GGML_BLOCK_ROW_V1 = Layout(
+    "ggml-block-row-v1",
+    256,
+    frozenset(("Q8_0", "Q4_K", "Q5_K", "Q6_K", "IQ1_S", "IQ2_XXS", "IQ4_NL")),
+)
+
 LAYOUTS = MappingProxyType(
     {
         layout.name: layout
@@ -125,6 +146,7 @@ LAYOUTS = MappingProxyType(
             ROW_SPLIT_K128_V1,
             BLOCKSCALE_K16_M128X4_V1,
             ROW_SCALE_V1,
+            GGML_BLOCK_ROW_V1,
         )
     }
 )
@@ -269,6 +291,41 @@ def row_scale_geometry(
     )
 
 
+def ggml_block_geometry(
+    format: str | GgmlBlockFormat, shape: Sequence[int]
+) -> GgmlBlockGeometry:
+    """Return exact row/block geometry for a source-byte-preserving GGML tensor."""
+
+    spec = _format(format)
+    if not isinstance(spec, GgmlBlockFormat):
+        raise ValueError("ggml-block-row-v1 requires a registered GGML block format")
+    dims = _shape(shape)
+    if len(dims) not in (2, 3):
+        raise ValueError("ggml-block-row-v1 requires rank 2 [N,K] or rank 3 [E,N,K]")
+    matrices = 1 if len(dims) == 2 else dims[0]
+    rows_per_matrix = dims[-2]
+    columns = dims[-1]
+    if columns % spec.block_values != 0:
+        raise ValueError(
+            f"ggml-block-row-v1 {spec.name} requires K divisible by {spec.block_values}"
+        )
+    blocks_per_row = columns // spec.block_values
+    row_bytes = blocks_per_row * spec.block_bytes
+    matrix_bytes = rows_per_matrix * row_bytes
+    return GgmlBlockGeometry(
+        shape=dims,
+        matrices=matrices,
+        rows_per_matrix=rows_per_matrix,
+        columns=columns,
+        block_values=spec.block_values,
+        block_bytes=spec.block_bytes,
+        blocks_per_row=blocks_per_row,
+        row_bytes=row_bytes,
+        matrix_bytes=matrix_bytes,
+        payload_bytes=matrices * matrix_bytes,
+    )
+
+
 def encoded_size(
     layout: str | Layout,
     format: str | NumericFormat,
@@ -299,6 +356,10 @@ def encoded_size(
         if not isinstance(numeric_spec, Fp8RowFormat):
             raise ValueError("row-scale-v1 requires a row-scaled FP8 format")
         return row_scale_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is GGML_BLOCK_ROW_V1:
+        if not isinstance(numeric_spec, GgmlBlockFormat):
+            raise ValueError("ggml-block-row-v1 requires a registered GGML block format")
+        return ggml_block_geometry(numeric_spec, shape).payload_bytes
     raise ValueError(f"unsupported tensor layout: {layout_spec.name!r}")
 
 
@@ -682,6 +743,30 @@ def _byte_view(payload: bytes | bytearray | memoryview) -> memoryview:
     if not view.c_contiguous:
         raise TypeError("byte payloads must be contiguous")
     return view.cast("B")
+
+
+def ggml_matrix_view(
+    payload: Payload,
+    format: str | GgmlBlockFormat,
+    shape: Sequence[int],
+    matrix: int = 0,
+) -> memoryview | torch.Tensor:
+    """Return one byte-identical rank-two matrix or expert slice without repacking."""
+
+    geometry = ggml_block_geometry(format, shape)
+    if _payload_length(payload) != geometry.payload_bytes:
+        raise ValueError(
+            f"GGML block payload has {_payload_length(payload)} bytes, "
+            f"expected {geometry.payload_bytes}"
+        )
+    if isinstance(matrix, bool) or not isinstance(matrix, int):
+        raise TypeError("GGML matrix index must be an integer")
+    if matrix < 0 or matrix >= geometry.matrices:
+        raise IndexError("GGML matrix index is outside the tensor")
+    source: memoryview | torch.Tensor
+    source = payload if isinstance(payload, torch.Tensor) else _byte_view(payload)
+    begin = matrix * geometry.matrix_bytes
+    return source[begin : begin + geometry.matrix_bytes]
 
 
 def split_row_planes(
@@ -1073,6 +1158,8 @@ __all__ = [
     "BLOCKSCALE_K16_M128X4_V1",
     "BlockScaleGeometry",
     "CONTIGUOUS_LE_V1",
+    "GGML_BLOCK_ROW_V1",
+    "GgmlBlockGeometry",
     "K_ALIGNMENT",
     "LAYOUTS",
     "Layout",
@@ -1097,6 +1184,8 @@ __all__ = [
     "encode_row_split",
     "encoded_size",
     "gather_row_planes",
+    "ggml_block_geometry",
+    "ggml_matrix_view",
     "get_layout",
     "row_scale_geometry",
     "row_split_geometry",
