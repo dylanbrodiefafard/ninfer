@@ -94,7 +94,11 @@ excludes them for an ambiguous `<tool_call>` prefix and until its matching `</to
 complete; this applies independently to consecutive parallel calls. Model stop tokens become
 eligible after ordinary answer content or a complete tool call. If one speculative round crosses
 into a protected state before selecting a model stop token, NInfer rejects that uncommitted round
-and retries with the registered model stop tokens excluded.
+and retries with the registered model stop tokens excluded. If a round sampled with those tokens
+excluded later completes a tool call, NInfer commits only through that close and lets the next
+round sample with model stops eligible, so extra-accepted tokens cannot immediately open another
+call.
+
 Other request-provided stop conditions remain active, and raw-output requests do not apply this
 structured-output guard.
 

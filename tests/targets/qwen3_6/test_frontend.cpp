@@ -1314,6 +1314,52 @@ int test_structured_model_stop_eligibility(const Frontend& frontend) {
     failures += check(tool.model_stop_tokens_allowed(),
                       "complete tool call did not allow a model stop");
 
+    ninfer::ChatMessage think_tools_user;
+    think_tools_user.role = ninfer::ChatRole::User;
+    think_tools_user.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::ChatMessage think_tools_assistant;
+    think_tools_assistant.role = ninfer::ChatRole::Assistant;
+    think_tools_assistant.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "", .media = {}});
+    think_tools_assistant.tool_calls.push_back(
+        ninfer::ToolCall{.id = "", .name = "f", .arguments_json = "{}"});
+    ninfer::ChatMessage think_tools_next;
+    think_tools_next.role = ninfer::ChatRole::User;
+    think_tools_next.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput think_tools_input;
+    think_tools_input.messages.push_back(std::move(think_tools_user));
+    think_tools_input.messages.push_back(std::move(think_tools_assistant));
+    think_tools_input.messages.push_back(std::move(think_tools_next));
+    think_tools_input.options.enable_thinking = true;
+    auto think_tools_prompt = frontend.prepare(std::move(think_tools_input));
+    auto think_tools        = frontend.make_output_session(think_tools_prompt, {});
+    failures += check(!think_tools.model_stop_tokens_allowed(),
+                      "thinking tools session allowed a model stop before content");
+    const std::array<ninfer::TokenId, 6> close_then_repeat{248069, 21, 18, 19, 20, 21};
+    decision = think_tools.preview(close_then_repeat, 16, ninfer::FinishReason::OutputLimit);
+    failures += check(!decision.finished() && !decision.reject_generated_round &&
+                          decision.accepted_tokens == 5,
+                      "suppressed-stop round continued past the first complete tool call");
+    (void)think_tools.commit_preview();
+    failures += check(!think_tools.in_reasoning() && think_tools.model_stop_tokens_allowed(),
+                      "truncated tool-call round did not make the model stop eligible");
+
+    auto open_call = frontend.make_output_session(tool_prompt, {});
+    decision = open_call.preview(std::array<ninfer::TokenId, 3>{21, 18, 19}, 8,
+                                 ninfer::FinishReason::OutputLimit);
+    (void)open_call.commit_preview();
+    failures += check(!open_call.model_stop_tokens_allowed(),
+                      "open tool-call session allowed a model stop");
+    decision = open_call.preview(std::array<ninfer::TokenId, 2>{20, 21}, 5,
+                                 ninfer::FinishReason::OutputLimit);
+    failures += check(!decision.finished() && decision.accepted_tokens == 1,
+                      "open tool-call round committed tokens past </tool_call>");
+    (void)open_call.commit_preview();
+    failures += check(open_call.model_stop_tokens_allowed(),
+                      "truncated close did not make the model stop eligible");
+
     const std::array<ninfer::TokenId, 5> parallel_call_and_stop{21, 18, 19, 20, 6};
     decision = tool.preview(parallel_call_and_stop, 10, ninfer::FinishReason::OutputLimit);
     failures += check(decision.finished() && decision.accepted_tokens == 5 &&
