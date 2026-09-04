@@ -14,8 +14,9 @@ The initial storage registry contains exactly these identities:
 | `contiguous-le-v1` | tensor layout | `BF16`, `FP32`, `I32` | rank `0..16` | 256 bytes |
 | `row-split-k128-v1` | tensor layout | `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`, `W8G32_F16S` | rank 2 `[N,K]` | 256 bytes |
 | `blockscale-k16-m128x4-v1` | tensor layout | `NVFP4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
-| `raw-bytes-v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
 | `row-scale-v1` | tensor layout | `FP8_E4M3FN_ROW_BF16S` | positive rank 2 `[N,K]` | 256 bytes |
+| `ggml-block-row-v1` | tensor layout | `Q8_0`, `Q4_K`, `Q5_K`, `Q6_K`, `IQ1_S`, `IQ2_XXS`, `IQ4_NL` | rank 2 `[N,K]` or rank 3 `[E,N,K]`, complete K blocks | 256 bytes |
+| `raw-bytes-v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
 
 These are closed identities, not templates. A format/layout combination not present in the table is
 unsupported. In particular, a direct format cannot use a quantized layout, grouped
@@ -305,7 +306,42 @@ Only the code/scale gap is padded (zero bytes); no per-row or trailing padding i
 present. Codes and scales are preserved bit-exactly, including signed-zero codes.
 This layout accepts only `FP8_E4M3FN_ROW_BF16S`; it does not transpose or repack at load.
 
-## 6. `raw-bytes-v1`
+## 6. `ggml-block-row-v1`
+
+This layout stores complete upstream GGML blocks without changing any source byte. The logical
+shape is either a positive matrix `[N,K]` or a positive expert bank `[E,N,K]`. The numeric format
+supplies exact block geometry:
+
+| Format | Values/block `V` | Bytes/block `B` |
+|---|---:|---:|
+| `Q8_0` | 32 | 34 |
+| `Q4_K` | 256 | 144 |
+| `Q5_K` | 256 | 176 |
+| `Q6_K` | 256 | 210 |
+| `IQ1_S` | 256 | 50 |
+| `IQ2_XXS` | 256 | 66 |
+| `IQ4_NL` | 32 | 18 |
+
+`K` must be exactly divisible by `V`. Let `M=1` for rank two and `M=E` for rank three:
+
+```text
+blocks_per_row = K / V
+row_bytes       = blocks_per_row * B
+matrix_bytes    = N * row_bytes
+payload_bytes   = M * matrix_bytes
+```
+
+The payload traverses matrix/expert, then row, then K block. Every row is the direct concatenation
+of the corresponding source blocks. There is no header, row padding, inter-matrix padding, internal
+alignment gap, trailing padding, endianness conversion, or runtime weight repack. The object-level
+offset remains 256-byte aligned, but individual rows need not be aligned.
+
+A rank-three expert slice is the single contiguous byte range
+`[expert * matrix_bytes, (expert+1) * matrix_bytes)`. It is therefore a byte-identical rank-two
+view `[N,K]`; constructing the view changes only checked pointer/shape metadata and performs no
+copy or decode.
+
+## 7. `raw-bytes-v1`
 
 `raw-bytes-v1` is a required-resource encoding, not a tensor layout. Its enclosing object payload is
 the resource byte string itself:
@@ -320,7 +356,7 @@ trailing padding. The resource object's JSON `bytes` is its exact nonzero length
 returns the complete span unchanged. A model contract assigns a resource name and interprets those
 bytes; the common encoding does not infer that meaning from the name.
 
-## 7. Decode boundary
+## 8. Decode boundary
 
 Layout decoding yields only persistent logical words:
 
@@ -329,8 +365,10 @@ Layout decoding yields only persistent logical words:
   `0..K-1`, discarding physical columns `K..K_pad-1`;
 - `blockscale-k16-m128x4-v1` yields the packed E2M1 words, natural E4M3FN group-scale words, and
   matrix-level FP32 weight divisor;
+- `row-scale-v1` yields signed E4M3FN code words and exact BF16 row multipliers;
+- `ggml-block-row-v1` yields the exact source GGML blocks with their matrix, row, and K-block
+  ownership unchanged;
 - `raw-bytes-v1` yields the enclosing resource bytes.
-- `row-scale-v1` yields signed E4M3FN code words and exact BF16 row multipliers.
 
 Dequantized values follow the reconstruction rule in `tensor-formats.md`. This document does
 not select a quantization encoder, output dtype, accumulation dtype, kernel, runtime device layout,

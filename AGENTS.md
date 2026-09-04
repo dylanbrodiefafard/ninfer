@@ -83,6 +83,22 @@ product. This is a trusted local, single-owner project, and requirements from a 
 workload, trust model, or deployment model are out of scope until the contract is explicitly
 changed.
 
+For an exact Qwen4 target whose artifact authority contains the preview-style n-gram/PLE embedding
+table, “one resident model instance” does not require that random-access table to reside in VRAM.
+Such a target uses one artifact-owned host mapping, bounded pinned staging, and asynchronous H2D
+row gathers while the non-PLE compute core remains GPU-resident. This target-specific exception is
+not authority for CPU execution or streaming of ordinary model weights, or for assuming that every
+future Qwen4 checkpoint has PLE.
+
+The Qwen4 verification work over the external Qwen3.8-Flash-Next UD-IQ1_S checkpoint may
+additionally use one unregistered, tool-only profile: Text only, C=1, eager execution, a 4096-token
+ceiling, and NVFP4-G16 QSA KV. Its PLE table
+and 48 routed gate/up expert banks are artifact-mapped on the host; after GPU routing, only the
+selected top-10 gate/up expert slices are gathered through a bounded pinned/device ring and executed
+on the GPU. Routed-down and all non-routed weights remain device-resident. This exception exists to
+verify Qwen4 model mathematics and state on the 5090; it is not an Engine, CLI, serve, registered
+target, CPU-compute backend, graph-performance path, or authority for any other streamed weight.
+
 ## Sources of truth
 
 Read only the current authorities relevant to a live decision in the task; this list is a

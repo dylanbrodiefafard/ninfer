@@ -105,6 +105,20 @@ void Binder::materialize_on_device(ObjectHandle handle) {
     planned_[handle.index]                 = true;
 }
 
+void Binder::map_tensor_on_host(ObjectHandle handle) {
+    const auto* tensor = std::get_if<TensorDescriptor>(&descriptor(handle));
+    if (tensor == nullptr) {
+        throw ArtifactError("resource cannot be mapped as a host tensor");
+    }
+    if (planned_[handle.index]) {
+        throw ArtifactError("artifact object has more than one materialization placement: " +
+                            std::string(tensor->name));
+    }
+    materialization_.mapped_tensor_objects.push_back(
+        MappedTensorMaterialization{handle, tensor->bytes});
+    planned_[handle.index] = true;
+}
+
 void Binder::retain_on_host(ObjectHandle handle) {
     const auto* resource = std::get_if<ResourceDescriptor>(&descriptor(handle));
     if (resource == nullptr) {

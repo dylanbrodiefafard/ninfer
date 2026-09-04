@@ -1,0 +1,17 @@
+diff --git a/tools/perplexity/perplexity.cpp b/tools/perplexity/perplexity.cpp
+--- a/tools/perplexity/perplexity.cpp
++++ b/tools/perplexity/perplexity.cpp
+@@ -579,1 +579,2 @@
+-                    batch.logits  [idx]    = batch.pos[idx] >= first ? 1 : 0;
++                    // Diagnostic build: retain prefix logits for the four-token fixture as well.
++                    batch.logits  [idx]    = 1;
+@@ -614,1 +615,9 @@
+         for (int seq = 0; seq < n_seq_batch; seq++) {
++            const float * prefix_logits = llama_get_logits_ith(ctx, seq*n_ctx);
++            const llama_token * prefix_tokens = tokens.data() + start + seq*n_ctx;
++            for (int j = 0; j < 4; ++j) {
++                const results_log_softmax prefix = log_softmax(
++                    n_vocab, prefix_logits + size_t(j)*n_vocab, prefix_tokens[j + 1]);
++                LOG("TOKEN_NLL position=%d input=%d target=%d nll=%.9g\n",
++                    start + seq*n_ctx + j, prefix_tokens[j], prefix_tokens[j + 1], -prefix.log_softmax);
++            }
