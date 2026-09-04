@@ -62,6 +62,24 @@ std::vector<std::uint16_t> make_activation(std::int32_t rows, std::int32_t token
     return result;
 }
 
+std::vector<std::uint16_t> make_reduction_sensitive_activation(std::int32_t rows,
+                                                                std::int32_t tokens,
+                                                                std::uint32_t seed) {
+    std::vector<std::uint16_t> result(static_cast<std::size_t>(rows) * tokens);
+    for (std::size_t index = 0; index < result.size(); ++index) {
+        std::uint32_t value = seed ^ (static_cast<std::uint32_t>(index) * 0x9e3779b9U);
+        value ^= value >> 16;
+        value *= 0x7feb352dU;
+        value ^= value >> 15;
+        const std::uint16_t sign = (value & 1U) == 0 ? 0U : 0x8000U;
+        const std::uint16_t exponent =
+            static_cast<std::uint16_t>(120U + ((value >> 24U) % 9U)) << 7U;
+        const std::uint16_t mantissa = static_cast<std::uint16_t>((value >> 8U) & 0x7fU);
+        result[index] = static_cast<std::uint16_t>(sign | exponent | mantissa);
+    }
+    return result;
+}
+
 std::vector<std::uint16_t> make_residual(std::int32_t rows, std::int32_t tokens,
                                          std::uint32_t seed) {
     std::vector<std::uint16_t> result(static_cast<std::size_t>(rows) * tokens);
@@ -89,8 +107,28 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
 int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
     const std::array invocations{
         Invocation{1, ops::LinearPolicy::A16Only},
+        Invocation{2, ops::LinearPolicy::A16Only},
         Invocation{4, ops::LinearPolicy::A16Only},
+        Invocation{5, ops::LinearPolicy::A16Only},
         Invocation{6, ops::LinearPolicy::A16Only},
+        Invocation{8, ops::LinearPolicy::A16Only},
+        Invocation{10, ops::LinearPolicy::A16Only},
+        Invocation{12, ops::LinearPolicy::A16Only},
+        Invocation{14, ops::LinearPolicy::A16Only},
+        Invocation{15, ops::LinearPolicy::A16Only},
+        Invocation{16, ops::LinearPolicy::A16Only},
+        Invocation{17, ops::LinearPolicy::A16Only},
+        Invocation{20, ops::LinearPolicy::A16Only},
+        Invocation{24, ops::LinearPolicy::A16Only},
+        Invocation{28, ops::LinearPolicy::A16Only},
+        Invocation{32, ops::LinearPolicy::A16Only},
+        Invocation{33, ops::LinearPolicy::A16Only},
+        Invocation{36, ops::LinearPolicy::A16Only},
+        Invocation{44, ops::LinearPolicy::A16Only},
+        Invocation{48, ops::LinearPolicy::A16Only},
+        Invocation{52, ops::LinearPolicy::A16Only},
+        Invocation{60, ops::LinearPolicy::A16Only},
+        Invocation{64, ops::LinearPolicy::A16Only},
         Invocation{1, ops::LinearPolicy::AllowA4},
         Invocation{2, ops::LinearPolicy::AllowA4},
         Invocation{3, ops::LinearPolicy::AllowA4},
@@ -240,6 +278,74 @@ int run_packed_column0(std::int32_t n, std::int32_t k, std::uint32_t seed) {
     return failures;
 }
 
+int run_w5_aggregate_matches_panels(std::int32_t n, std::int32_t k, std::uint32_t seed) {
+    constexpr std::int32_t kWidth    = 5;
+    constexpr std::int32_t kMaxBatch = 4;
+    constexpr std::int32_t kMaxT     = kWidth * kMaxBatch;
+    quantized_weight::PatternedWeightOptions options;
+    options.weight_scale_divisor = 0.125F;
+    options.input_scale_divisor  = 3.5F;
+    quantized_weight::PackedWeight host_weight =
+        quantized_weight::make_patterned_weight(QType::NVFP4, n, k, seed, options);
+    const std::vector<std::uint16_t> activation =
+        make_reduction_sensitive_activation(k, kMaxT, seed + 1U);
+    const std::vector<std::uint16_t> initial_residual = make_residual(n, kMaxT, seed + 2U);
+
+    GuardedDeviceBuffer device_activation(activation.size() * sizeof(std::uint16_t));
+    device_activation.copy_from_host(activation.data(), device_activation.bytes());
+    GuardedDeviceBuffer device_weight(host_weight.payload.size());
+    device_weight.copy_from_host(host_weight.payload.data(), host_weight.payload.size());
+    const Weight weight = host_weight.device_weight(device_weight.data());
+
+    int failures = 0;
+    for (std::int32_t batch = 2; batch <= kMaxBatch; ++batch) {
+        const std::int32_t tokens       = kWidth * batch;
+        const std::size_t output_words = static_cast<std::size_t>(n) * tokens;
+        const std::size_t output_bytes = output_words * sizeof(std::uint16_t);
+        GuardedDeviceBuffer aggregate(output_bytes);
+        GuardedDeviceBuffer panels(output_bytes);
+        aggregate.copy_from_host(initial_residual.data(), output_bytes);
+        panels.copy_from_host(initial_residual.data(), output_bytes);
+        WorkspaceArena workspace(256);
+
+        Tensor aggregate_x(device_activation.data(), DType::BF16, {k, tokens});
+        Tensor aggregate_y(aggregate.data(), DType::BF16, {n, tokens});
+        ops::linear_add(aggregate_x, weight, aggregate_y, ops::LinearPolicy::A16Only, workspace,
+                        nullptr);
+        for (std::int32_t row = 0; row < batch; ++row) {
+            auto* input = static_cast<std::uint8_t*>(device_activation.data()) +
+                          static_cast<std::int64_t>(row) * kWidth * k * sizeof(std::uint16_t);
+            auto* output = static_cast<std::uint8_t*>(panels.data()) +
+                           static_cast<std::int64_t>(row) * kWidth * n * sizeof(std::uint16_t);
+            Tensor panel_x(input, DType::BF16, {k, kWidth});
+            Tensor panel_y(output, DType::BF16, {n, kWidth});
+            ops::linear_add(panel_x, weight, panel_y, ops::LinearPolicy::A16Only, workspace,
+                            nullptr);
+        }
+        cuda_check(cudaDeviceSynchronize(), "synchronize NVFP4 W5 aggregate parity");
+
+        std::vector<std::uint16_t> aggregate_bits(output_words);
+        std::vector<std::uint16_t> panel_bits(output_words);
+        aggregate.copy_to_host(aggregate_bits.data(), output_bytes);
+        panels.copy_to_host(panel_bits.data(), output_bytes);
+        const std::string label = "NVFP4 linear_add W5 aggregate parity [" +
+                                  std::to_string(n) + "," + std::to_string(k) + "] C=" +
+                                  std::to_string(batch);
+        if (aggregate_bits != panel_bits) {
+            const auto mismatch = std::mismatch(aggregate_bits.begin(), aggregate_bits.end(),
+                                                panel_bits.begin());
+            std::cerr << label << ": first BF16 mismatch at "
+                      << std::distance(aggregate_bits.begin(), mismatch.first) << '\n';
+            ++failures;
+        }
+        failures += aggregate.verify_guards(label + " aggregate");
+        failures += panels.verify_guards(label + " panels");
+    }
+    failures += device_activation.verify_guards("NVFP4 W5 aggregate parity activation");
+    failures += device_weight.verify_guards("NVFP4 W5 aggregate parity weight");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -252,6 +358,8 @@ int main() {
     failures += run_shape(5120, 17408, 821U);
     failures += run_packed_column0(5120, 6144, 811U);
     failures += run_packed_column0(5120, 17408, 821U);
+    failures += run_w5_aggregate_matches_panels(5120, 6144, 831U);
+    failures += run_w5_aggregate_matches_panels(5120, 17408, 841U);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " NVFP4 linear_add\n";
     return failures == 0 ? 0 : 1;
 }

@@ -19,7 +19,7 @@ namespace ninfer::ops {
 namespace {
 
 constexpr std::int32_t kStateDim    = detail::gated_delta_net::kStateDim;
-constexpr std::int32_t kMaximumRows = 8;
+constexpr std::int32_t kMaximumRows = 4;
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;

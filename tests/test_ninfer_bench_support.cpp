@@ -164,7 +164,7 @@ int test_cli_contract() {
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(
-                {"ninfer_bench", "--weights", "model.ninfer", "--concurrency", "9"});
+                {"ninfer_bench", "--weights", "model.ninfer", "--concurrency", "5"});
         },
         "unsupported concurrency");
     return failures;

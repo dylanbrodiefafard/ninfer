@@ -36,7 +36,7 @@ is enabled and the matrix contains decode work, one ordinary public generation r
 decode graph before warmups and measured repetitions. `--concurrency N` also primes the N-lane
 decode graph.
 
-`--concurrency N` (1–8) sizes the Engine for N active lanes. Decode throughput is aggregate:
+`--concurrency N` (1–4) sizes the Engine for N active lanes. Decode throughput is aggregate:
 `N * G / max(decode_seconds)` across lanes. For `pp+tg` at `N>1`, each lane first completes a
 sequential one-token seed with prefix reuse enabled, then the measured step overlaps the
 continuations. That isolates batched decode from the scheduler's prefill/decode interleave. C>1
@@ -52,7 +52,7 @@ ninfer_bench --weights <artifact.ninfer>
           [-pg, --prompt-gen <P,G;P,G...>]
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
-          [--kv-dtype <bf16|int8|nvfp4>] [--concurrency <1..8>]
+          [--kv-dtype <bf16|int8|nvfp4>] [--concurrency <1..4>]
            [--spec <mtp|dflash>] [--draft-tokens <0..15>] [--dflash-verify-width <2..16>]
            [--lm-head-draft]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
@@ -266,10 +266,10 @@ cmake --build build --parallel --target ninfer_gdn_input_proj_bench
 ## GDN input projection/convolution/snapshot Op benchmark
 
 `ninfer_gdn_input_proj_conv_snapshot_bench` measures the public Qwen3.6 Q4/Q5, NVFP4, and W8
-`gdn_input_proj_conv_snapshot` forms for exact `B=1..8`. The timed body is exactly one complete
-public Op call; the benchmark does not include private launchers, candidate selection, duplicated
-compositions, or route labels. Its default `T=1..6` sweep is the production MTP verification
-interval. NVFP4 accepts
+`gdn_input_proj_conv_snapshot` forms for exact `B=1..8` and record-producing forms for the product
+domain `B=1..4`. The timed body is exactly one complete public Op call; the benchmark does not
+include private launchers, candidate selection, duplicated compositions, or route labels. Its
+default `T=1..6` sweep is the production MTP verification interval. NVFP4 accepts
 the public `a16` and `a4` policies; the reported profile names the caller policy, not a private
 resolved route.
 

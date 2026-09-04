@@ -11,7 +11,7 @@ Op 的状态效果、kernel 寻址约束和性能准入条件。具体 allocator
 
 ## 1. Requirements
 
-- `max_concurrency=2..8` 的 active requests 共享各类 growing KV capacity；
+- `max_concurrency=1..4` 的 active requests 共享各类 growing KV capacity；
 - 单个 request 可以使用 main KV pool 的大部分容量，不按 slot 平均切分；
 - 不同 request 的物理 KV 不要求连续；
 - active、retained 和 speculative provisional KV 使用同一套 reservation accounting；
@@ -629,7 +629,7 @@ blocks；其 Full pool 使用 §4.3 的 head-major page-run order。两者保留
 看到一个 pool-specific typed plane view，而不是跨模型机制的 composite payload。
 
 假设 page ID 为 32-bit，128 Ki context 的单个 block-table row 为 8 KiB。即使
-`max_concurrency=8` 且每个 slot 同时持有 main 与一个 backend row，全部 metadata 也只有 128 KiB。
+`max_concurrency=4` 且每个 slot 同时持有 main 与一个 backend row，全部 metadata 也只有 64 KiB。
 
 ---
 
@@ -1225,7 +1225,7 @@ valid_columns  optional I32 [B]
 table_rows     I32  [B]
 ```
 
-`B=1` 覆盖 single-sequence prompt/decode route；`B=2..8` 覆盖 batched decode/verify 的 `W=1..16`。
+`B=1` 覆盖 single-sequence prompt/decode route；`B=2..4` 覆盖 batched decode/verify 的 `W=1..16`。
 `valid_columns[b]` 只让每行的 prefix `[0,Vb)` 生效。`positions` 是 KV logical ordinal，不是
 RoPE/MRoPE coordinate。对 row `b` 的 query position `p`，causal visible domain 仍是该 allocation 的
 `[0,p]`；page boundary 不产生 mask boundary。

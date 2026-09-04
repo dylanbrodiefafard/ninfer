@@ -552,10 +552,10 @@ int main() {
     int failures = 0;
     failures += run_case(32, 2, 1, {}, 1701U);
     failures += run_case(32, 16, 1, {7}, 1711U);
-    failures += run_case(32, 6, 8, {6, 5, 4, 3, 2, 1, 6, 2}, 1721U);
+    failures += run_case(32, 6, 4, {6, 5, 4, 3}, 1721U);
     failures += run_case(48, 5, 3, {5, 5, 5}, 1726U);
     failures += run_case(48, 2, 1, {1}, 1731U);
-    failures += run_case(48, 6, 8, {6, 4, 3, 2, 1, 5, 6, 2}, 1741U);
+    failures += run_case(48, 6, 4, {6, 4, 3, 2}, 1741U);
     failures += run_tree_case(32, 1751U);
     failures += run_tree_case(48, 1761U);
     failures += run_tree_chain_matches_sequential(48, 12, 1766U);

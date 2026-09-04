@@ -254,6 +254,32 @@ contained 608 complete full-batch steady intervals and had no request, CUDA, or 
 failure. At C=8, available device memory after startup was 2.66 GiB for 27B groupwise-int,
 2.18 GiB for 27B NVFP4, and 4.38 GiB for 35B-A3B.
 
+## Qwen3.8-27B DFlash k=4 C<=4 retune
+
+RTX 5090, CUDA Graph, NVFP4 KV, optimized proposal head, greedy
+`long_decode_aime26_15`, 2,048 output tokens per request, max-context 16,384, and one compact
+full-concurrency batch. The retained W=5 route aggregates the A16 attention-output, GDN-output,
+and MLP-down residual projections across requests. Numerically sensitive attention-input and
+fused SwiGLU projections remain request panels; other verify widths also retain their prior panel
+execution until separately qualified.
+
+| C | Panel control tok/s | Aggregate tok/s | Change |
+|---:|---:|---:|---:|
+| 1 | — | 175.4 | unchanged execution shape |
+| 2 | 207.6 | 228.6 | +10.1% |
+| 3 | 214.6 | 240.1 | +11.9% |
+| 4 | 209.8 | 236.6 | +12.8% |
+
+The matched C=2..4 control and aggregate runs use the same source/toolchain apart from the three
+projection call sites. An nsys C=4 capture reduced total GPU kernel time per DFlash path-select
+round from 55.6 ms to 49.1 ms (-11.7%). At the operator level, four W=5 A16 LinearAdd panels
+versus one T=20 launch measured 90.1 vs 51.2 us for 5120x6144 and 196.7 vs 114.7 us for
+5120x17408. Independent FP64 Op oracles cover the A16 aggregate schedule through T=64, and the
+W=5 C=2/3/4 aggregate results are bit-identical to separate panels for both NVFP4 and BF16
+weights. Reports: `profiles/bench/c4-retune-panel-control-final-20260903/`,
+`profiles/bench/c4-retune-residual-aggregate-final-20260903/`, and
+`profiles/nsys/c4-retune-{baseline,residual-aggregate}.nsys-rep`.
+
 ## Reproduction
 
 Build `ninfer-serve` and prepare the registered `.ninfer` artifacts. The refreshed per-target
@@ -294,7 +320,7 @@ python3 tools/bench/run_serve_concurrency.py \
   --serve build/apps/ninfer-serve \
   --artifact qwen3_6_27b=out/qwen3_6_27b.ninfer \
   --mode mtp3 --suite decode-saturation \
-  --concurrency 1 --concurrency 2 --concurrency 4 --concurrency 8 \
+  --concurrency 1 --concurrency 2 --concurrency 3 --concurrency 4 \
   --decode-tokens 8192 --max-context 16384 --kv-capacity auto \
   --output profiles/bench/concurrent_decode_27b_mtp3_20260811
 
@@ -302,7 +328,7 @@ python3 tools/bench/run_serve_concurrency.py \
   --serve build/apps/ninfer-serve \
   --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
   --mode mtp3 --suite decode-saturation \
-  --concurrency 1 --concurrency 2 --concurrency 4 --concurrency 8 \
+  --concurrency 1 --concurrency 2 --concurrency 3 --concurrency 4 \
   --decode-tokens 8192 --max-context 16384 --kv-capacity auto \
   --output profiles/bench/concurrent_decode_27b_nvfp4_mtp3_20260811
 
@@ -310,7 +336,7 @@ python3 tools/bench/run_serve_concurrency.py \
   --serve build/apps/ninfer-serve \
   --artifact qwen3_6_35b_a3b=out/qwen3_6_35b_a3b.ninfer \
   --mode mtp3 --suite decode-saturation \
-  --concurrency 1 --concurrency 2 --concurrency 4 --concurrency 8 \
+  --concurrency 1 --concurrency 2 --concurrency 3 --concurrency 4 \
   --decode-tokens 8192 --max-context 16384 --kv-capacity auto \
   --output profiles/bench/concurrent_decode_35b_mtp3_20260811
 ```

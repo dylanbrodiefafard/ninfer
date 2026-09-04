@@ -292,7 +292,8 @@ struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual6144Geometry, ActiveToke
     static_assert(ActiveTokens >= kNvfp4FirstSmallT);
     static_assert(ActiveTokens <= kNvfp4LastSmallT);
     static constexpr int kWarpsPerCta   = ActiveTokens <= 16 ? (ActiveTokens >= 14 ? 16 : 4) : 4;
-    static constexpr int kValuesPerLane = ActiveTokens >= 17 && ActiveTokens <= 20 ? 8 : 16;
+    // T=20 is the W=5 C=4 aggregate and must retain the T=5 panel reduction association.
+    static constexpr int kValuesPerLane = ActiveTokens >= 17 && ActiveTokens <= 19 ? 8 : 16;
     static constexpr auto kActivationAccess = Nvfp4SmallTActivationAccess::TokenPacked;
     static constexpr int kPhaseUnroll       = ActiveTokens <= 4 ? 4 : 1;
     using Type =
@@ -309,7 +310,8 @@ struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual17408Geometry, ActiveTok
     static_assert(ActiveTokens >= kNvfp4FirstSmallT);
     static_assert(ActiveTokens <= kNvfp4LastSmallT);
     static constexpr int kWarpsPerCta       = ActiveTokens <= 16 ? (ActiveTokens >= 8 ? 16 : 4) : 4;
-    static constexpr int kValuesPerLane     = ActiveTokens >= 17 && ActiveTokens <= 20 ? 8 : 16;
+    // T=20 is the W=5 C=4 aggregate and must retain the T=5 panel reduction association.
+    static constexpr int kValuesPerLane     = ActiveTokens >= 17 && ActiveTokens <= 19 ? 8 : 16;
     static constexpr auto kActivationAccess = Nvfp4SmallTActivationAccess::TokenPacked;
     static constexpr int kPhaseUnroll       = ActiveTokens <= 4 ? 4 : 1;
     using Type =

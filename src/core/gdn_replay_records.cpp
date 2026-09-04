@@ -9,7 +9,7 @@ namespace ninfer {
 namespace {
 
 constexpr std::size_t kRecordAlignment        = 256;
-constexpr std::int32_t kMaximumRecordCapacity = 8;
+constexpr std::int32_t kMaximumRecordCapacity = 4;
 
 void require_positive(std::int32_t value, const char* label) {
     if (value <= 0) {
@@ -36,7 +36,7 @@ void validate_spec(const GdnReplayRecordSpec& spec) {
     require_positive(spec.key_dim, "key dimension");
     require_positive(spec.value_dim, "value dimension");
     if (spec.record_capacity > kMaximumRecordCapacity) {
-        throw std::invalid_argument("GDN replay record capacity exceeds eight rows");
+        throw std::invalid_argument("GDN replay record capacity exceeds four rows");
     }
     if (spec.value_heads % spec.qk_heads != 0) {
         throw std::invalid_argument("GDN replay value heads must be grouped by Q/K heads");

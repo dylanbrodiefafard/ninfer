@@ -300,7 +300,7 @@ std::string usage_text(std::string_view program) {
          << "  --sage                    Sage3-style FP4-PV attention; requires --kv-dtype nvfp4\n"
          << "  --keep-frac <f>           Sparge keep fraction (0,1] on exact NVFP4; forbids --sage\n"
          << "  --xattn-tau <f>           XAttention mass threshold (0,1] on exact NVFP4\n"
-        << "  --concurrency <1..8>        concurrent Engine lanes (default: 1);\n"
+        << "  --concurrency <1..4>        concurrent Engine lanes (default: 1);\n"
         << "                              pp+tg at C>1 reports batched decode after a sequential\n"
         << "                              prefix-reuse seed so prefill/decode do not interleave\n"
          << "  --spec <mtp|dflash>       speculative backend (default: mtp); dflash requires\n"
@@ -371,7 +371,7 @@ BenchOptions parse_args(int argc, char** argv) {
         } else if (arg == "--concurrency") {
             options.concurrency = parse_u32(value("--concurrency"), "concurrency");
             if (options.concurrency > kMaximumConcurrency) {
-                throw std::invalid_argument("--concurrency must be in [1,8]");
+                throw std::invalid_argument("--concurrency must be in [1,4]");
             }
         } else if (arg == "--spec") {
             const std::string selected = value("--spec");
