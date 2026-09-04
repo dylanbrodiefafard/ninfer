@@ -33,8 +33,9 @@ For architecture bring-up only, this plan selects one explicit exception rather 
 whole GGUF as a product profile. An unregistered C=1 eager Text verifier may preserve the public
 UD-IQ1_S represented weights, keep NVFP4-G16 QSA KV on the GPU, and host-map PLE plus the 48 routed
 gate/up expert banks. Routed-down and every non-routed tensor remain device-resident. GPU routing
-selects ten experts, then a bounded host/device ring gathers only those compressed gate/up slices
-for GPU execution. The verifier has a 4096-token ceiling so it can cross the 2048-token QSA selection
+selects ten experts, then a bounded two-slot host/device pipeline gathers only those compressed
+gate/up slices, one route rank at a time, for GPU execution. The verifier has a 4096-token ceiling
+so it can cross the 2048-token QSA selection
 budget without claiming native-context capacity. It is not an Engine/CLI/serve identity, CUDA Graph
 or performance route, and does not authorize CPU execution or any other streamed weight.
 
@@ -351,16 +352,29 @@ inventory splits as follows:
 
 The routed banks contain 68 IQ1_S and 28 IQ2_XXS gate/up tensors plus 48 IQ4_NL down tensors; the
 PLE table is the remaining IQ4_NL tensor. For C=1 decode, gathering the selected ten gate/up slices
-transfers exactly 335,872,000 encoded bytes over all 48 layers per token. The per-layer device ring
-needs at most 8,448,000 bytes per slot before alignment. This is smaller than staging routed-down
+transfers exactly 335,872,000 encoded bytes over all 48 layers per token. The reusable staging
+pipeline uses two 844,800-byte slots, for 1,689,600 bytes of device storage and the same amount of
+pinned host storage. Each slot holds one maximum-size IQ2_XXS gate/up rank pair; IQ1_S pairs use
+640,000 bytes. This is smaller than staging routed-down
 (442,368,000 bytes/token) or all routed weights (778,240,000 bytes/token), and it keeps every model
 transformation on the GPU for implementation verification.
 
 The verifier is eager because each layer's router result determines its host source spans. Each
-layer completes the route-id D2H dependency, gathers/deduplicates the selected slices into the
-bounded pinned slot, copies them into the stable device slot, executes the routed expert Op, and
-observes the `consumer_done` boundary before reuse. Shared-expert work may overlap the selected-bank
-copy after correctness is established. No whole-round graph claim is made.
+layer completes one 40-byte route-id D2H dependency, queues the independent shared expert, then
+gathers selected rank pairs into alternating pinned slots. A distinct transfer stream copies each
+rank into its paired device slot while the compute stream consumes the preceding rank. Explicit
+transfer-ready and consumer-complete events protect slot reuse, while accumulation remains in route
+rank order. The next layer's route/ID barrier transitively closes both slots from the preceding
+call. No whole-round graph claim is made.
+
+A separate one-layer public-Op benchmark measures the future device-resident placement without
+changing this verifier. It owns complete device IQ1_S or IQ2_XXS gate/up banks and the IQ4_NL down
+bank, keeps selected ids on device, and fuses the routed grids and shared projections while
+preserving the explicit BF16 seams and rank-ordered FP32 accumulation. Its exact weight footprints
+are 808,785,920 bytes for the IQ1_S/Q5_K profile and 914,078,720 bytes for IQ2_XXS/Q6_K. Rotating
+route windows cover all 512 experts so the result is not an L2-only hot slice. The experiment
+cannot establish full-model fit: adding all preview gate/up banks to the 26,538,652,160 resident
+bytes would require 43,735,298,560 bytes before state and runtime storage.
 
 GGUF remains converter input, never a runtime lane. The converter writes one `.ninfer` artifact and
 preserves the represented GGML blocks under explicit registered numeric-format/layout identities.

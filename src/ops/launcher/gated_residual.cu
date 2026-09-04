@@ -63,17 +63,16 @@ __global__ void mix_kernel(const __nv_bfloat16* normalized, const __nv_bfloat16*
 __global__ __launch_bounds__(kBlock)
 void write_kernel(const __nv_bfloat16* normalized, const float* weight,
                   __nv_bfloat16* write_scale) {
-    const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
-    const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
-    if (warp >= kBranches) { return; }
-    const auto* row = weight + static_cast<long long>(warp) * kFlat;
+    const int branch = static_cast<int>(blockIdx.x);
+    const auto* row = weight + static_cast<long long>(branch) * kFlat;
     float sum = 0.0F;
-    for (int k = lane; k < kFlat; k += kWarpSize) {
+    for (int k = static_cast<int>(threadIdx.x); k < kFlat; k += kBlock) {
         sum = fmaf(__bfloat162float(normalized[k]), row[k], sum);
     }
-    sum = warp_reduce_sum(sum);
-    if (lane == 0) {
-        write_scale[warp] = __float2bfloat16_rn(2.0F * sigmoid(sum * 0.25F));
+    __shared__ float warp_sums[kWarps];
+    sum = block_reduce_sum<kBlock>(sum, warp_sums);
+    if (threadIdx.x == 0) {
+        write_scale[branch] = __float2bfloat16_rn(2.0F * sigmoid(sum * 0.25F));
     }
 }
 
@@ -119,9 +118,10 @@ void gated_residual_mix_launch(const Tensor& normalized, const Tensor& up_logits
 
 void gated_residual_write_launch(const Tensor& normalized, const Tensor& write_weight,
                                  Tensor& write_scale, cudaStream_t stream) {
-    write_kernel<<<1, kBlock, 0, stream>>>(static_cast<const __nv_bfloat16*>(normalized.data),
-                                           static_cast<const float*>(write_weight.data),
-                                           static_cast<__nv_bfloat16*>(write_scale.data));
+    write_kernel<<<kBranches, kBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(normalized.data),
+        static_cast<const float*>(write_weight.data),
+        static_cast<__nv_bfloat16*>(write_scale.data));
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -5,14 +5,18 @@ import math
 import torch
 
 from tools.reference.qwen4.gdn import (
+    ActualGgufGDNWeights,
     GDNState,
-    GDNWeights,
+    SourceGDNWeights,
+    actual_gguf_control_gates,
+    actual_gguf_sublayer,
     causal_depthwise_convolution,
-    control_gates,
     output_projection,
     recurrence,
-    repeat_key_value_heads,
-    sublayer,
+    repeat_grouped_query_key_heads,
+    source_control_gates,
+    source_sublayer,
+    tile_actual_gguf_query_key_heads,
 )
 from tools.reference.qwen4.moe import route, sparse_moe
 
@@ -166,7 +170,7 @@ def test_gdn_controls_and_contiguous_three_way_head_repeat() -> None:
     b = torch.tensor([[0.0, math.log(3.0)]])
     a_log = torch.tensor([0.0, math.log(2.0)])
     dt_bias = torch.tensor([0.0, -math.log(3.0)])
-    log_decay, beta = control_gates(a, b, a_log, dt_bias)
+    log_decay, beta = source_control_gates(a, b, a_log, dt_bias)
     expected_decay = -torch.exp(a_log.double()) * torch.nn.functional.softplus(
         a.double() + dt_bias.double()
     ).squeeze(0)
@@ -175,14 +179,31 @@ def test_gdn_controls_and_contiguous_three_way_head_repeat() -> None:
     torch.testing.assert_close(beta, expected_beta, atol=1e-14, rtol=1e-14)
 
     heads = torch.tensor([[[1.0], [2.0]]])
-    repeated = repeat_key_value_heads(heads, 6)
+    repeated = repeat_grouped_query_key_heads(heads, 6)
     assert repeated[:, :, 0].tolist() == [[1.0, 1.0, 1.0, 2.0, 2.0, 2.0]]
+
+
+def test_actual_gguf_controls_are_direct_and_heads_are_tiled() -> None:
+    a = torch.tensor([[0.0, math.log(3.0)]])
+    b = torch.tensor([[0.0, math.log(3.0)]])
+    ssm_a = torch.tensor([-2.0, -4.0])
+    dt_bias = torch.tensor([0.0, -math.log(3.0)])
+    log_decay, beta = actual_gguf_control_gates(a, b, ssm_a, dt_bias)
+    expected = ssm_a.double() * torch.nn.functional.softplus(
+        a.double() + dt_bias.double()
+    ).squeeze(0)
+    torch.testing.assert_close(log_decay[0], expected, atol=1e-14, rtol=1e-14)
+    torch.testing.assert_close(beta, torch.sigmoid(b.double()), atol=1e-14, rtol=1e-14)
+
+    heads = torch.tensor([[[1.0], [2.0]]])
+    tiled = tile_actual_gguf_query_key_heads(heads, 6)
+    assert tiled[:, :, 0].tolist() == [[1.0, 2.0, 1.0, 2.0, 1.0, 2.0]]
 
 
 def test_complete_gdn_sublayer_matches_hand_scalar_head_formula() -> None:
     hidden = torch.ones((1, 1))
     qkv = torch.tensor([[1.0], [2.0], [3.0], [4.0], [5.0]])
-    weights = GDNWeights(
+    weights = SourceGDNWeights(
         qkv=qkv,
         z=torch.zeros((3, 1)),
         a=torch.zeros((3, 1)),
@@ -197,7 +218,7 @@ def test_complete_gdn_sublayer_matches_hand_scalar_head_formula() -> None:
         conv_history=torch.zeros((5, 3), dtype=torch.bfloat16),
         recurrent=torch.zeros((3, 1, 1), dtype=torch.float32),
     )
-    result = sublayer(
+    result = source_sublayer(
         hidden,
         weights,
         state,
@@ -232,12 +253,12 @@ def test_complete_gdn_sublayer_matches_hand_scalar_head_formula() -> None:
     )
 
 
-def _complete_gdn_case() -> tuple[torch.Tensor, GDNWeights, GDNState]:
+def _complete_gdn_case() -> tuple[torch.Tensor, SourceGDNWeights, GDNState]:
     generator = torch.Generator().manual_seed(211)
     tokens, hidden_width = 7, 4
     key_heads, value_heads, width = 2, 6, 3
     qkv_width = 2 * key_heads * width + value_heads * width
-    weights = GDNWeights(
+    weights = SourceGDNWeights(
         qkv=0.2 * torch.randn(qkv_width, hidden_width, generator=generator),
         z=0.2 * torch.randn(value_heads * width, hidden_width, generator=generator),
         a=0.2 * torch.randn(value_heads, hidden_width, generator=generator),
@@ -260,7 +281,7 @@ def _complete_gdn_case() -> tuple[torch.Tensor, GDNWeights, GDNState]:
 def test_complete_gdn_publishes_each_declared_consumer_representation() -> None:
     hidden, weights, initial = _complete_gdn_case()
     geometry = dict(key_heads=2, value_heads=6, key_width=3, value_width=3)
-    result = sublayer(hidden, weights, initial, **geometry)
+    result = source_sublayer(hidden, weights, initial, **geometry)
 
     assert result.convolved_qkv.dtype == torch.bfloat16
     assert result.repeated_query.dtype == torch.float64
@@ -282,7 +303,7 @@ def test_complete_gdn_real_16_48_128_geometry_and_nonzero_fp32_state() -> None:
     key_heads, value_heads, width, hidden_width = 16, 48, 128, 1
     qkv_width = 2 * key_heads * width + value_heads * width
     hidden = torch.tensor([[0.75]], dtype=torch.bfloat16)
-    weights = GDNWeights(
+    weights = SourceGDNWeights(
         qkv=0.01 * torch.randn(qkv_width, hidden_width, generator=generator),
         z=0.01 * torch.randn(value_heads * width, hidden_width, generator=generator),
         a=0.01 * torch.randn(value_heads, hidden_width, generator=generator),
@@ -299,7 +320,7 @@ def test_complete_gdn_real_16_48_128_geometry_and_nonzero_fp32_state() -> None:
             torch.float32
         ),
     )
-    result = sublayer(
+    result = source_sublayer(
         hidden,
         weights,
         initial,
@@ -351,3 +372,79 @@ def test_complete_gdn_real_16_48_128_geometry_and_nonzero_fp32_state() -> None:
     assert torch.equal(result.final_state.recurrent[0], expected_state)
     expected_core = torch.sum(expected_state.double() * q[:, None], dim=0).to(torch.bfloat16)
     assert torch.equal(result.core[0, 0], expected_core)
+
+
+def test_actual_gguf_real_geometry_two_token_continuation_matches_direct_state_formula() -> None:
+    generator = torch.Generator().manual_seed(0x38F1A5)
+    key_heads, value_heads, width, hidden_width = 16, 48, 128, 1
+    qkv_width = 2 * key_heads * width + value_heads * width
+    hidden = torch.tensor([[0.625], [-0.375]], dtype=torch.bfloat16)
+    weights = ActualGgufGDNWeights(
+        qkv=0.01 * torch.randn(qkv_width, hidden_width, generator=generator),
+        z=0.01 * torch.randn(value_heads * width, hidden_width, generator=generator),
+        a=0.01 * torch.randn(value_heads, hidden_width, generator=generator),
+        b=0.01 * torch.randn(value_heads, hidden_width, generator=generator),
+        conv=0.01 * torch.randn(qkv_width, 4, generator=generator),
+        ssm_a=-(0.25 + 0.01 * torch.arange(value_heads)),
+        dt_bias=0.01 * torch.randn(value_heads, generator=generator),
+        norm=1.0 + 0.01 * torch.randn(width, generator=generator),
+        output=0.01 * torch.randn(3, value_heads * width, generator=generator),
+    )
+    initial = GDNState(
+        conv_history=(0.01 * torch.randn(qkv_width, 3, generator=generator)).to(torch.bfloat16),
+        recurrent=(0.001 * torch.randn(value_heads, width, width, generator=generator)).to(
+            torch.float32
+        ),
+    )
+    geometry = dict(
+        key_heads=key_heads,
+        value_heads=value_heads,
+        key_width=width,
+        value_width=width,
+    )
+    first = actual_gguf_sublayer(hidden[:1], weights, initial, **geometry)
+    second = actual_gguf_sublayer(hidden[1:], weights, first.final_state, **geometry)
+
+    projected = torch.nn.functional.linear(hidden.double(), weights.qkv.double()).to(
+        torch.bfloat16
+    )
+    expected_history = torch.stack(
+        (initial.conv_history[:, 2], projected[0], projected[1]), dim=1
+    )
+    assert torch.equal(second.final_state.conv_history, expected_history)
+
+    # All three actual-GGUF tiles consume the same Q/K head without grouped repetition.
+    for base in (0, 15):
+        torch.testing.assert_close(
+            first.repeated_query[0, [base, base + 16, base + 32]],
+            first.repeated_query[0, base].expand(3, width),
+            atol=0.0,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            first.repeated_key[0, [base, base + 16, base + 32]],
+            first.repeated_key[0, base].expand(3, width),
+            atol=0.0,
+            rtol=0.0,
+        )
+
+    # Independently replay two public T=1 transitions for representatives from every tile.
+    qk_span = key_heads * width
+    for head in (0, 15, 16, 31, 32, 47):
+        state = initial.recurrent[head].double()
+        for token, result in enumerate((first, second)):
+            qk_head = head % key_heads
+            q = result.convolved_qkv[0, qk_head * width : (qk_head + 1) * width].double()
+            k_begin = qk_span + qk_head * width
+            k = result.convolved_qkv[0, k_begin : k_begin + width].double()
+            v_begin = 2 * qk_span + head * width
+            value = result.convolved_qkv[0, v_begin : v_begin + width].double()
+            q = q / torch.sqrt(torch.sum(q * q) + 1e-6) / math.sqrt(width)
+            k = k / torch.sqrt(torch.sum(k * k) + 1e-6)
+            decayed = state * torch.exp(result.log_decay[0, head].double())
+            prediction = torch.sum(decayed * k[:, None], dim=0)
+            delta = result.beta[0, head].double() * (value - prediction)
+            state = (decayed + k[:, None] * delta[None, :]).to(torch.float32).double()
+            expected_core = torch.sum(state * q[:, None], dim=0).to(torch.bfloat16)
+            assert torch.equal(result.core[0, head], expected_core)
+        assert torch.equal(second.final_state.recurrent[head], state.to(torch.float32))

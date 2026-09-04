@@ -84,6 +84,8 @@ ninfer_add_op_bench(ninfer_prepare_masked_block_bench
   SOURCES ops/prepare_masked_block_bench.cu)
 ninfer_add_op_bench(ninfer_sampling_select_bench SOURCES ops/sampling_select_bench.cu)
 ninfer_add_op_bench(ninfer_sparse_moe_bench SOURCES ops/sparse_moe_bench.cu)
+ninfer_add_op_bench(ninfer_qsa_bench SOURCES ops/qsa_bench.cu)
+ninfer_add_op_bench(ninfer_gated_residual_bench SOURCES ops/gated_residual_bench.cu)
 ninfer_add_op_bench(ninfer_linear_pair_bench SOURCES ops/linear_pair_bench.cu)
 ninfer_add_op_bench(ninfer_mtp_pack_bench SOURCES ops/mtp_pack_bench.cu)
 ninfer_add_op_bench(ninfer_proposal_remap_bench SOURCES ops/proposal_remap_bench.cu)
@@ -130,3 +132,22 @@ target_include_directories(ninfer_qwen3_6_35b_a3b_dflash_round_bench PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 target_link_libraries(ninfer_qwen3_6_35b_a3b_dflash_round_bench PRIVATE
   ninfer_engine ninfer_core)
+
+# Unregistered C=1 Qwen4 architecture-verifier benchmark. It intentionally enters through the
+# target-private eager Program and requires an explicit verifier artifact path.
+add_executable(ninfer_qwen4_verifier_bench targets/qwen4/verifier_bench.cpp)
+target_include_directories(ninfer_qwen4_verifier_bench PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(ninfer_qwen4_verifier_bench PRIVATE
+  ninfer_qwen4_verifier CUDA::cudart CUDA::nvtx3)
+
+# Exact-shape Qwen4 sparse-MoE placement A/B: mapped-host selected staging versus complete
+# device-resident GGML expert banks, including a rotating route that exceeds L2 capacity.
+add_executable(ninfer_qwen4_sparse_moe_resident_bench
+  ops/qwen4_sparse_moe_resident_bench.cu)
+target_include_directories(ninfer_qwen4_sparse_moe_resident_bench PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(ninfer_qwen4_sparse_moe_resident_bench PRIVATE
+  ninfer_ops CUDA::cudart)
