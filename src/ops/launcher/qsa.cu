@@ -245,6 +245,74 @@ __device__ __forceinline__ bool qsa_block_is_better(float lhs_score, int lhs_blo
     return lhs_score > rhs_score || (lhs_score == rhs_score && lhs_block < rhs_block);
 }
 
+__global__ void qsa_select_topk_short_kernel(const std::int32_t* visible_ids,
+                                             const std::int32_t* visible_offsets,
+                                             std::int32_t* selected,
+                                             std::int32_t* selected_count, float* scratch,
+                                             int width, int sort_blocks) {
+    __shared__ float scores[kKeep];
+    __shared__ std::int32_t blocks[kKeep];
+    const int token = blockIdx.x;
+    const int lane = threadIdx.x;
+    if (token >= width || selected_count[token] != -1) { return; }
+    const int begin = visible_offsets[token];
+    const int end = visible_offsets[token + 1];
+    const int complete = (end - begin) / 4;
+    const float* block_scores =
+        scratch + static_cast<std::int64_t>(token) * kSelectorScratchFloats +
+        kQsaIndexHeadDim * kQsaIndexQueryHeads;
+
+    for (int index = lane; index < sort_blocks; index += blockDim.x) {
+        if (index < complete) {
+            scores[index] = block_scores[index];
+            blocks[index] = index;
+        } else {
+            scores[index] = -FLT_MAX;
+            blocks[index] = sort_blocks;
+        }
+    }
+    __syncthreads();
+
+    const int comparators = sort_blocks / 2;
+    for (int size = 2; size <= sort_blocks; size <<= 1) {
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            if (lane < comparators) {
+                const int left = (lane / stride) * (stride << 1) + lane % stride;
+                const int right = left + stride;
+                const bool ascending_better = (left & size) == 0;
+                const bool right_better = qsa_block_is_better(
+                    scores[right], blocks[right], scores[left], blocks[left]);
+                const bool left_better = qsa_block_is_better(
+                    scores[left], blocks[left], scores[right], blocks[right]);
+                if ((ascending_better && right_better) ||
+                    (!ascending_better && left_better)) {
+                    const float score = scores[left];
+                    scores[left] = scores[right];
+                    scores[right] = score;
+                    const int block = blocks[left];
+                    blocks[left] = blocks[right];
+                    blocks[right] = block;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    std::int32_t* output =
+        selected + static_cast<std::int64_t>(kQsaSelectedCapacity) * token;
+    const int kept = complete < kKeep ? complete : kKeep;
+    for (int rank = lane; rank < kept; rank += blockDim.x) {
+        const int source = begin + 4 * blocks[rank];
+        const int destination = 4 * rank;
+        for (int r = 0; r < 4; ++r) { output[destination + r] = visible_ids[source + r]; }
+    }
+    if (lane == 0) {
+        int count = 4 * kept;
+        for (int i = begin + 4 * complete; i < end; ++i) { output[count++] = visible_ids[i]; }
+        selected_count[token] = count;
+    }
+}
+
 __global__ void qsa_select_topk_kernel(const std::int32_t* visible_ids,
                                        const std::int32_t* visible_offsets,
                                        std::int32_t* selected, std::int32_t* selected_count,
@@ -577,12 +645,25 @@ void qsa_index_select_launch(const Tensor& raw_query, const QsaStateView& state,
         static_cast<const std::int32_t*>(selected_count.data), static_cast<float*>(workspace.data),
         raw_query.ne[2]);
     CUDA_CHECK(cudaGetLastError());
-    qsa_select_topk_kernel<<<raw_query.ne[2], kKeep, 0, stream>>>(
-        static_cast<const std::int32_t*>(visible_ids.data),
-        static_cast<const std::int32_t*>(visible_offsets.data),
-        static_cast<std::int32_t*>(selected_ids.data),
-        static_cast<std::int32_t*>(selected_count.data), static_cast<float*>(workspace.data),
-        raw_query.ne[2]);
+    if (visible_ids.ne[0] <= selected_ids.ne[0]) {
+        int sort_blocks = 1;
+        while (sort_blocks < score_blocks) { sort_blocks <<= 1; }
+        int sort_threads = sort_blocks / 2;
+        if (sort_threads < 32) { sort_threads = 32; }
+        qsa_select_topk_short_kernel<<<raw_query.ne[2], sort_threads, 0, stream>>>(
+            static_cast<const std::int32_t*>(visible_ids.data),
+            static_cast<const std::int32_t*>(visible_offsets.data),
+            static_cast<std::int32_t*>(selected_ids.data),
+            static_cast<std::int32_t*>(selected_count.data),
+            static_cast<float*>(workspace.data), raw_query.ne[2], sort_blocks);
+    } else {
+        qsa_select_topk_kernel<<<raw_query.ne[2], kKeep, 0, stream>>>(
+            static_cast<const std::int32_t*>(visible_ids.data),
+            static_cast<const std::int32_t*>(visible_offsets.data),
+            static_cast<std::int32_t*>(selected_ids.data),
+            static_cast<std::int32_t*>(selected_count.data),
+            static_cast<float*>(workspace.data), raw_query.ne[2]);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -18,6 +18,28 @@ using namespace ninfer::test;
 
 namespace {
 
+template <typename Function>
+int expect_invalid_argument(const char* label, Function&& function) {
+    try {
+        function();
+    } catch (const std::invalid_argument&) {
+        return 0;
+    }
+    std::cerr << "FAIL: " << label << " accepted invalid input\n";
+    return 1;
+}
+
+int verify_filled(const char* label, const void* device, std::size_t bytes,
+                  std::uint8_t expected) {
+    const auto actual = from_device<std::uint8_t>(device, bytes);
+    if (std::all_of(actual.begin(), actual.end(),
+                    [expected](std::uint8_t value) { return value == expected; })) {
+        return 0;
+    }
+    std::cerr << "FAIL: " << label << " changed after rejected call\n";
+    return 1;
+}
+
 struct StateFixture {
     explicit StateFixture(int capacity)
         : capacity(capacity), k_codes(static_cast<std::size_t>(128) * capacity * 2),
@@ -316,6 +338,162 @@ int append_codec_and_attention_case() {
     return failures;
 }
 
+int append_alignment_and_state_validation_case() {
+    constexpr int capacity = 1;
+    constexpr int width = 1;
+    constexpr std::uint8_t sentinel = 0xcdU;
+    StateFixture state(capacity);
+
+    std::vector<float> k(static_cast<std::size_t>(256) * 2 * width, 0.0F);
+    std::vector<float> v(k.size(), 0.0F);
+    std::vector<float> raw(128, 0.0F);
+    auto dk = to_device_bf16(k);
+    auto dv = to_device_bf16(v);
+    auto draw = to_device_bf16(raw);
+    auto dposition = to_device(std::vector<std::int32_t>{0, 0, 0});
+    auto did = to_device(std::vector<std::int32_t>{0});
+    Tensor k_t(dk.p, DType::BF16, {256, 2, width});
+    Tensor v_t(dv.p, DType::BF16, {256, 2, width});
+    Tensor raw_t(draw.p, DType::BF16, {128, width});
+    Tensor position_t(dposition.p, DType::I32, {3, width});
+    Tensor id_t(did.p, DType::I32, {width});
+
+    const std::size_t kv_bytes = k.size() * sizeof(std::uint16_t);
+    DeviceBuffer misaligned_k(kv_bytes + 16U);
+    DeviceBuffer misaligned_v(kv_bytes + 16U);
+    DeviceBuffer misaligned_raw(raw.size() * sizeof(std::uint16_t) + 2U);
+    DeviceBuffer misaligned_position(3U * sizeof(std::int32_t) + 4U);
+    DeviceBuffer misaligned_id(sizeof(std::int32_t) + 4U);
+    misaligned_k.fill(sentinel);
+    misaligned_v.fill(sentinel);
+    misaligned_raw.fill(sentinel);
+    misaligned_position.fill(sentinel);
+    misaligned_id.fill(sentinel);
+    Tensor bad_k(static_cast<std::byte*>(misaligned_k.p) + 2, DType::BF16,
+                 {256, 2, width});
+    Tensor bad_v(static_cast<std::byte*>(misaligned_v.p) + 2, DType::BF16,
+                 {256, 2, width});
+    Tensor bad_raw(static_cast<std::byte*>(misaligned_raw.p) + 1, DType::BF16, {128, width});
+    Tensor bad_position(static_cast<std::byte*>(misaligned_position.p) + 2, DType::I32,
+                        {3, width});
+    Tensor bad_id(static_cast<std::byte*>(misaligned_id.p) + 2, DType::I32, {width});
+
+    int failures = 0;
+    failures += expect_invalid_argument("qsa append misaligned K", [&] {
+        ops::qsa_state_append(bad_k, v_t, raw_t, position_t, id_t, state.view(), nullptr);
+    });
+    failures += expect_invalid_argument("qsa append misaligned V", [&] {
+        ops::qsa_state_append(k_t, bad_v, raw_t, position_t, id_t, state.view(), nullptr);
+    });
+    failures += expect_invalid_argument("qsa append misaligned raw index key", [&] {
+        ops::qsa_state_append(k_t, v_t, bad_raw, position_t, id_t, state.view(), nullptr);
+    });
+    failures += expect_invalid_argument("qsa append misaligned position", [&] {
+        ops::qsa_state_append(k_t, v_t, raw_t, bad_position, id_t, state.view(), nullptr);
+    });
+    failures += expect_invalid_argument("qsa append misaligned id", [&] {
+        ops::qsa_state_append(k_t, v_t, raw_t, position_t, bad_id, state.view(), nullptr);
+    });
+
+    DeviceBuffer bad_k_codes(state.k_codes.bytes() + 4U);
+    DeviceBuffer bad_v_codes(state.v_codes.bytes() + 4U);
+    DeviceBuffer bad_raw_state(state.raw_keys.bytes() + 2U);
+    DeviceBuffer bad_position_state(state.positions.bytes() + 4U);
+    bad_k_codes.fill(sentinel);
+    bad_v_codes.fill(sentinel);
+    bad_raw_state.fill(sentinel);
+    bad_position_state.fill(sentinel);
+
+    auto bad_state = state.view();
+    bad_state.k_codes = Tensor(static_cast<std::byte*>(bad_k_codes.p) + 1, DType::U8,
+                               {128, capacity, 2});
+    failures += expect_invalid_argument("qsa append misaligned state K codes", [&] {
+        ops::qsa_state_append(k_t, v_t, raw_t, position_t, id_t, bad_state, nullptr);
+    });
+    bad_state = state.view();
+    bad_state.v_codes = Tensor(static_cast<std::byte*>(bad_v_codes.p) + 1, DType::U8,
+                               {128, capacity, 2});
+    failures += expect_invalid_argument("qsa append misaligned state V codes", [&] {
+        ops::qsa_state_append(k_t, v_t, raw_t, position_t, id_t, bad_state, nullptr);
+    });
+    bad_state = state.view();
+    bad_state.raw_index_keys = Tensor(static_cast<std::byte*>(bad_raw_state.p) + 1, DType::BF16,
+                                      {128, capacity});
+    failures += expect_invalid_argument("qsa append misaligned state raw index keys", [&] {
+        ops::qsa_state_append(k_t, v_t, raw_t, position_t, id_t, bad_state, nullptr);
+    });
+    bad_state = state.view();
+    bad_state.positions = Tensor(static_cast<std::byte*>(bad_position_state.p) + 2, DType::I32,
+                                 {3, capacity});
+    failures += expect_invalid_argument("qsa append misaligned state positions", [&] {
+        ops::qsa_state_append(k_t, v_t, raw_t, position_t, id_t, bad_state, nullptr);
+    });
+    bad_state = state.view();
+    bad_state.v_codes = bad_state.k_codes;
+    failures += expect_invalid_argument("qsa append overlapping state planes", [&] {
+        ops::qsa_state_append(k_t, v_t, raw_t, position_t, id_t, bad_state, nullptr);
+    });
+    bad_state = state.view();
+    bad_state.k_codes = Tensor(dk.p, DType::U8, {128, capacity, 2});
+    failures += expect_invalid_argument("qsa append overlapping input/state", [&] {
+        ops::qsa_state_append(k_t, v_t, raw_t, position_t, id_t, bad_state, nullptr);
+    });
+
+    auto dvisible = to_device(std::vector<std::int32_t>{0});
+    auto doffsets = to_device(std::vector<std::int32_t>{0, 1});
+    auto dquery_norm = to_device_f32(std::vector<float>(128, 1.0F));
+    auto dkey_norm = to_device_f32(std::vector<float>(128, 1.0F));
+    GuardedDeviceBuffer selected(static_cast<std::size_t>(ops::kQsaSelectedCapacity) *
+                                 sizeof(std::int32_t));
+    GuardedDeviceBuffer count(sizeof(std::int32_t));
+    GuardedDeviceBuffer selector_workspace(ops::qsa_index_select_workspace_bytes(1));
+    selected.fill(sentinel);
+    count.fill(sentinel);
+    selector_workspace.fill(sentinel);
+    Tensor alias_query(selector_workspace.data(), DType::BF16, {128, 4, 1});
+    Tensor visible_t(dvisible.p, DType::I32, {1});
+    Tensor offsets_t(doffsets.p, DType::I32, {2});
+    Tensor query_norm_t(dquery_norm.p, DType::FP32, {128});
+    Tensor key_norm_t(dkey_norm.p, DType::FP32, {128});
+    Tensor selected_t(selected.data(), DType::I32, {ops::kQsaSelectedCapacity, 1});
+    Tensor count_t(count.data(), DType::I32, {1});
+    Tensor selector_workspace_t(selector_workspace.data(), DType::U8,
+                                {static_cast<int>(selector_workspace.bytes())});
+    failures += expect_invalid_argument("qsa selector overlapping query/workspace", [&] {
+        ops::qsa_index_select(alias_query, state.view(), id_t, visible_t, offsets_t, query_norm_t,
+                              key_norm_t, selected_t, count_t, selector_workspace_t, nullptr);
+    });
+
+    cuda_synchronize();
+    failures += verify_filled("qsa rejected state K codes", state.k_codes.data(),
+                              state.k_codes.bytes(), sentinel);
+    failures += verify_filled("qsa rejected state V codes", state.v_codes.data(),
+                              state.v_codes.bytes(), sentinel);
+    failures += verify_filled("qsa rejected state K scales", state.k_scales.data(),
+                              state.k_scales.bytes(), sentinel);
+    failures += verify_filled("qsa rejected state V scales", state.v_scales.data(),
+                              state.v_scales.bytes(), sentinel);
+    failures += verify_filled("qsa rejected state raw keys", state.raw_keys.data(),
+                              state.raw_keys.bytes(), sentinel);
+    failures += verify_filled("qsa rejected state positions", state.positions.data(),
+                              state.positions.bytes(), sentinel);
+    failures += verify_filled("qsa rejected misaligned K-code storage", bad_k_codes.p,
+                              bad_k_codes.bytes, sentinel);
+    failures += verify_filled("qsa rejected misaligned V-code storage", bad_v_codes.p,
+                              bad_v_codes.bytes, sentinel);
+    failures += verify_filled("qsa rejected misaligned raw-key storage", bad_raw_state.p,
+                              bad_raw_state.bytes, sentinel);
+    failures += verify_filled("qsa rejected misaligned position storage", bad_position_state.p,
+                              bad_position_state.bytes, sentinel);
+    failures += verify_filled("qsa rejected selector ids", selected.data(), selected.bytes(),
+                              sentinel);
+    failures += verify_filled("qsa rejected selector count", count.data(), count.bytes(),
+                              sentinel);
+    failures += verify_filled("qsa rejected selector workspace", selector_workspace.data(),
+                              selector_workspace.bytes(), sentinel);
+    return failures;
+}
+
 int selector_ceiling_and_permutation_case() {
     constexpr int capacity = ops::kQsaMaximumTokens;
     constexpr int width    = 2;
@@ -408,7 +586,8 @@ int selector_boundary_ties_case() {
         offsets.push_back(static_cast<std::int32_t>(visible.size()));
     }
     auto dquery = to_device_bf16(query);
-    auto dnorm = to_device_f32(norm);
+    auto dnorm_query = to_device_f32(norm);
+    auto dnorm_key = to_device_f32(norm);
     auto dquery_ids = to_device(query_ids);
     auto dvisible = to_device(visible);
     auto doffsets = to_device(offsets);
@@ -420,13 +599,14 @@ int selector_boundary_ties_case() {
     Tensor query_ids_t(dquery_ids.p, DType::I32, {width});
     Tensor visible_t(dvisible.p, DType::I32, {static_cast<int>(visible.size())});
     Tensor offsets_t(doffsets.p, DType::I32, {width + 1});
-    Tensor norm_t(dnorm.p, DType::FP32, {128});
+    Tensor query_norm_t(dnorm_query.p, DType::FP32, {128});
+    Tensor key_norm_t(dnorm_key.p, DType::FP32, {128});
     Tensor selected_t(dselected.data(), DType::I32, {ops::kQsaSelectedCapacity, width});
     Tensor count_t(dcount.data(), DType::I32, {width});
     Tensor workspace_t(workspace.data(), DType::U8, {static_cast<int>(workspace.bytes())});
     auto state_view = state.view();
-    ops::qsa_index_select(query_t, state_view, query_ids_t, visible_t, offsets_t, norm_t, norm_t,
-                          selected_t, count_t, workspace_t, nullptr);
+    ops::qsa_index_select(query_t, state_view, query_ids_t, visible_t, offsets_t, query_norm_t,
+                          key_norm_t, selected_t, count_t, workspace_t, nullptr);
     cuda_synchronize();
 
     const auto actual_count = from_device<std::int32_t>(dcount.data(), width);
@@ -453,6 +633,113 @@ int selector_boundary_ties_case() {
     return failures;
 }
 
+int selector_route_switch_and_malformed_case() {
+    constexpr int short_length = ops::kQsaSelectedCapacity;
+    constexpr int long_length = short_length + 1;
+    StateFixture state(ops::kQsaMaximumTokens);
+    state.raw_keys.fill(0);
+    state.positions.fill(0);
+
+    std::vector<float> query(static_cast<std::size_t>(128) * 4, 0.0F);
+    std::vector<float> norm(128, 0.0F);
+    std::vector<std::int32_t> visible(long_length);
+    for (int id = 0; id < long_length; ++id) {
+        visible[static_cast<std::size_t>(id)] = id;
+    }
+    const std::vector<std::int32_t> malformed{0, 2, 1, 3};
+    auto dquery = to_device_bf16(query);
+    auto dnorm_query = to_device_f32(norm);
+    auto dnorm_key = to_device_f32(norm);
+    auto dshort_query_id = to_device(std::vector<std::int32_t>{short_length - 1});
+    auto dlong_query_id = to_device(std::vector<std::int32_t>{long_length - 1});
+    auto dmalformed_query_id = to_device(std::vector<std::int32_t>{3});
+    auto dvisible = to_device(visible);
+    auto dmalformed = to_device(malformed);
+    auto dshort_offsets = to_device(std::vector<std::int32_t>{0, short_length});
+    auto dlong_offsets = to_device(std::vector<std::int32_t>{0, long_length});
+    auto dmalformed_offsets = to_device(std::vector<std::int32_t>{0, 4});
+    GuardedDeviceBuffer short_selected(
+        static_cast<std::size_t>(ops::kQsaSelectedCapacity) * sizeof(std::int32_t));
+    GuardedDeviceBuffer long_selected(
+        static_cast<std::size_t>(ops::kQsaSelectedCapacity) * sizeof(std::int32_t));
+    GuardedDeviceBuffer malformed_selected(
+        static_cast<std::size_t>(ops::kQsaSelectedCapacity) * sizeof(std::int32_t));
+    GuardedDeviceBuffer short_count(sizeof(std::int32_t));
+    GuardedDeviceBuffer long_count(sizeof(std::int32_t));
+    GuardedDeviceBuffer malformed_count(sizeof(std::int32_t));
+    GuardedDeviceBuffer workspace(ops::qsa_index_select_workspace_bytes(1));
+
+    Tensor query_t(dquery.p, DType::BF16, {128, 4, 1});
+    Tensor query_norm_t(dnorm_query.p, DType::FP32, {128});
+    Tensor key_norm_t(dnorm_key.p, DType::FP32, {128});
+    Tensor short_query_id_t(dshort_query_id.p, DType::I32, {1});
+    Tensor long_query_id_t(dlong_query_id.p, DType::I32, {1});
+    Tensor malformed_query_id_t(dmalformed_query_id.p, DType::I32, {1});
+    Tensor short_visible_t(dvisible.p, DType::I32, {short_length});
+    Tensor long_visible_t(dvisible.p, DType::I32, {long_length});
+    Tensor malformed_visible_t(dmalformed.p, DType::I32, {4});
+    Tensor short_offsets_t(dshort_offsets.p, DType::I32, {2});
+    Tensor long_offsets_t(dlong_offsets.p, DType::I32, {2});
+    Tensor malformed_offsets_t(dmalformed_offsets.p, DType::I32, {2});
+    Tensor short_selected_t(short_selected.data(), DType::I32,
+                            {ops::kQsaSelectedCapacity, 1});
+    Tensor long_selected_t(long_selected.data(), DType::I32,
+                           {ops::kQsaSelectedCapacity, 1});
+    Tensor malformed_selected_t(malformed_selected.data(), DType::I32,
+                                {ops::kQsaSelectedCapacity, 1});
+    Tensor short_count_t(short_count.data(), DType::I32, {1});
+    Tensor long_count_t(long_count.data(), DType::I32, {1});
+    Tensor malformed_count_t(malformed_count.data(), DType::I32, {1});
+    Tensor workspace_t(workspace.data(), DType::U8, {static_cast<int>(workspace.bytes())});
+    auto state_view = state.view();
+    cudaStream_t stream = nullptr;
+    cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
+    ops::qsa_index_select(query_t, state_view, short_query_id_t, short_visible_t,
+                          short_offsets_t, query_norm_t, key_norm_t, short_selected_t,
+                          short_count_t, workspace_t, stream);
+    ops::qsa_index_select(query_t, state_view, long_query_id_t, long_visible_t,
+                          long_offsets_t, query_norm_t, key_norm_t, long_selected_t, long_count_t,
+                          workspace_t, stream);
+    ops::qsa_index_select(query_t, state_view, malformed_query_id_t, malformed_visible_t,
+                          malformed_offsets_t, query_norm_t, key_norm_t, malformed_selected_t,
+                          malformed_count_t, workspace_t, stream);
+    cuda_synchronize(stream);
+    cuda_check(cudaStreamDestroy(stream), "cudaStreamDestroy");
+
+    const auto short_actual =
+        from_device<std::int32_t>(short_selected.data(), ops::kQsaSelectedCapacity);
+    const auto long_actual =
+        from_device<std::int32_t>(long_selected.data(), ops::kQsaSelectedCapacity);
+    const auto malformed_actual =
+        from_device<std::int32_t>(malformed_selected.data(), ops::kQsaSelectedCapacity);
+    const auto short_actual_count = from_device<std::int32_t>(short_count.data(), 1);
+    const auto long_actual_count = from_device<std::int32_t>(long_count.data(), 1);
+    const auto malformed_actual_count = from_device<std::int32_t>(malformed_count.data(), 1);
+    int failures = verify_exact("qsa selector route-switch short count", short_actual_count,
+                                std::vector<std::int32_t>{short_length});
+    failures += verify_exact("qsa selector route-switch long count", long_actual_count,
+                             std::vector<std::int32_t>{2048});
+    failures += verify_exact("qsa selector malformed count", malformed_actual_count,
+                             std::vector<std::int32_t>{0});
+    for (int i = 0; i < ops::kQsaSelectedCapacity; ++i) {
+        if (short_actual[static_cast<std::size_t>(i)] != i) { ++failures; }
+        const int expected_long = i < 2048 ? i : -1;
+        if (long_actual[static_cast<std::size_t>(i)] != expected_long) { ++failures; }
+        if (malformed_actual[static_cast<std::size_t>(i)] != -1) { ++failures; }
+    }
+    if (failures != 0) {
+        std::cerr << "FAIL: qsa selector short/long switch or malformed back-to-back\n";
+    }
+    failures += short_selected.verify_guards("qsa route-switch short selected");
+    failures += long_selected.verify_guards("qsa route-switch long selected");
+    failures += malformed_selected.verify_guards("qsa malformed selected");
+    failures += short_count.verify_guards("qsa route-switch short count");
+    failures += long_count.verify_guards("qsa route-switch long count");
+    failures += malformed_count.verify_guards("qsa malformed count");
+    failures += workspace.verify_guards("qsa route-switch workspace");
+    return failures;
+}
+
 int selector_score_order_case() {
     constexpr int capacity = 8;
     StateFixture state(capacity);
@@ -474,7 +761,8 @@ int selector_score_order_case() {
     const std::vector<std::int32_t> visible{0, 1, 2, 3, 4, 5, 6, 7};
     const std::vector<std::int32_t> offsets{0, 8};
     auto dquery = to_device_bf16(query);
-    auto dnorm = to_device_f32(norm);
+    auto dnorm_query = to_device_f32(norm);
+    auto dnorm_key = to_device_f32(norm);
     auto dquery_ids = to_device(query_ids);
     auto dvisible = to_device(visible);
     auto doffsets = to_device(offsets);
@@ -486,13 +774,14 @@ int selector_score_order_case() {
     Tensor query_ids_t(dquery_ids.p, DType::I32, {1});
     Tensor visible_t(dvisible.p, DType::I32, {8});
     Tensor offsets_t(doffsets.p, DType::I32, {2});
-    Tensor norm_t(dnorm.p, DType::FP32, {128});
+    Tensor query_norm_t(dnorm_query.p, DType::FP32, {128});
+    Tensor key_norm_t(dnorm_key.p, DType::FP32, {128});
     Tensor selected_t(dselected.data(), DType::I32, {ops::kQsaSelectedCapacity, 1});
     Tensor count_t(dcount.data(), DType::I32, {1});
     Tensor workspace_t(workspace.data(), DType::U8, {static_cast<int>(workspace.bytes())});
     auto state_view = state.view();
-    ops::qsa_index_select(query_t, state_view, query_ids_t, visible_t, offsets_t, norm_t, norm_t,
-                          selected_t, count_t, workspace_t, nullptr);
+    ops::qsa_index_select(query_t, state_view, query_ids_t, visible_t, offsets_t, query_norm_t,
+                          key_norm_t, selected_t, count_t, workspace_t, nullptr);
     cuda_synchronize();
 
     const auto actual_count = from_device<std::int32_t>(dcount.data(), 1);
@@ -902,6 +1191,83 @@ int verifier_composite_real_shape_case() {
     const auto actual = from_device_bf16(dout.data(), 2560);
     failures += verify_pointwise("qsa verifier complete FP64 oracle", actual, expected,
                                  PointwiseCriterion{0.025, 0.02});
+
+    // Composite validation is a synchronous transaction boundary: neither an alias nor a
+    // malformed state may enqueue even the leading projections. Fill every mutable external
+    // range, then make workspace itself the input so any missed preflight is observable.
+    constexpr std::uint8_t rejection_sentinel = 0x5aU;
+    const auto state_k_before =
+        from_device<std::uint8_t>(state.k_codes.data(), state.k_codes.bytes());
+    const auto state_v_before =
+        from_device<std::uint8_t>(state.v_codes.data(), state.v_codes.bytes());
+    const auto state_ks_before =
+        from_device<std::uint8_t>(state.k_scales.data(), state.k_scales.bytes());
+    const auto state_vs_before =
+        from_device<std::uint8_t>(state.v_scales.data(), state.v_scales.bytes());
+    const auto state_raw_before =
+        from_device<std::uint8_t>(state.raw_keys.data(), state.raw_keys.bytes());
+    const auto state_position_before =
+        from_device<std::uint8_t>(state.positions.data(), state.positions.bytes());
+    const auto fill_rejection_outputs = [&] {
+        dselected.fill(rejection_sentinel);
+        dcount.fill(rejection_sentinel);
+        dout.fill(rejection_sentinel);
+        workspace.fill(rejection_sentinel);
+    };
+    const auto verify_rejection_outputs = [&] {
+        int rejection_failures = 0;
+        rejection_failures += verify_filled(
+            "qsa verifier rejected selected ids", dselected.data(), dselected.bytes(),
+            rejection_sentinel);
+        rejection_failures += verify_filled("qsa verifier rejected selected count", dcount.data(),
+                                            dcount.bytes(), rejection_sentinel);
+        rejection_failures += verify_filled("qsa verifier rejected output", dout.data(),
+                                            dout.bytes(), rejection_sentinel);
+        rejection_failures += verify_filled("qsa verifier rejected workspace", workspace.data(),
+                                            workspace.bytes(), rejection_sentinel);
+        return rejection_failures;
+    };
+
+    fill_rejection_outputs();
+    Tensor aliased_x(workspace.data(), DType::BF16, {2560});
+    failures += expect_invalid_argument("qsa verifier aliased input/workspace", [&] {
+        ops::qsa_verifier_token(aliased_x, token_id_t, position_t, visible_ids_t,
+                                visible_offsets_t, weights, state_view, selected_t, count_t, out_t,
+                                workspace_t, nullptr);
+    });
+    cuda_synchronize();
+    failures += verify_rejection_outputs();
+
+    fill_rejection_outputs();
+    auto malformed_state = state_view;
+    malformed_state.positions.ne[1] = capacity - 1;
+    failures += expect_invalid_argument("qsa verifier malformed state", [&] {
+        ops::qsa_verifier_token(x_t, token_id_t, position_t, visible_ids_t, visible_offsets_t,
+                                weights, malformed_state, selected_t, count_t, out_t, workspace_t,
+                                nullptr);
+    });
+    cuda_synchronize();
+    failures += verify_rejection_outputs();
+    failures += verify_exact("qsa verifier rejected state K codes",
+                             from_device<std::uint8_t>(state.k_codes.data(), state.k_codes.bytes()),
+                             state_k_before);
+    failures += verify_exact("qsa verifier rejected state V codes",
+                             from_device<std::uint8_t>(state.v_codes.data(), state.v_codes.bytes()),
+                             state_v_before);
+    failures += verify_exact(
+        "qsa verifier rejected state K scales",
+        from_device<std::uint8_t>(state.k_scales.data(), state.k_scales.bytes()), state_ks_before);
+    failures += verify_exact(
+        "qsa verifier rejected state V scales",
+        from_device<std::uint8_t>(state.v_scales.data(), state.v_scales.bytes()), state_vs_before);
+    failures += verify_exact(
+        "qsa verifier rejected state raw keys",
+        from_device<std::uint8_t>(state.raw_keys.data(), state.raw_keys.bytes()), state_raw_before);
+    failures += verify_exact(
+        "qsa verifier rejected state positions",
+        from_device<std::uint8_t>(state.positions.data(), state.positions.bytes()),
+        state_position_before);
+
     failures += state.k_codes.verify_guards("qsa verifier K codes");
     failures += state.v_codes.verify_guards("qsa verifier V codes");
     failures += state.k_scales.verify_guards("qsa verifier K scales");
@@ -921,8 +1287,10 @@ int main() {
     if (require_cuda() != 0) { return 1; }
     int failures = 0;
     failures += append_codec_and_attention_case();
+    failures += append_alignment_and_state_validation_case();
     failures += selector_ceiling_and_permutation_case();
     failures += selector_boundary_ties_case();
+    failures += selector_route_switch_and_malformed_case();
     failures += selector_score_order_case();
     failures += selected_attention_capacity_case();
     failures += verifier_composite_real_shape_case();
