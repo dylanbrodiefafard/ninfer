@@ -1330,7 +1330,7 @@ int exercise_c3_disk_after_vram_inflight(const char* artifact) {
 }
 
 bool truncate_first_main_object(const std::filesystem::path& disk) {
-    // v4 stores main pages as extents in a generation pack rather than one
+    // The packed format stores main pages as extents in a generation pack rather than one
     // file per object.  Truncating the first main pack is an intentionally
     // stronger corruption injection: the entry must be rejected rather than
     // restored from a silently short extent.

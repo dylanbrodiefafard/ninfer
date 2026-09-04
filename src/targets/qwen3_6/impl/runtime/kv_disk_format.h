@@ -22,12 +22,12 @@ inline constexpr char kDiskTombstoneMagic[8]    = {'N', 'I', 'D', 'K', 'T', 'B',
 inline constexpr char kDiskPackSetMagic[8]      = {'N', 'I', 'D', 'K', 'P', 'S', '0', '1'};
 inline constexpr char kDiskObjectMapMagic[8]    = {'N', 'I', 'D', 'K', 'O', 'M', '0', '1'};
 
-inline constexpr std::uint32_t kDiskFormatVersion     = 4;
+inline constexpr std::uint32_t kDiskFormatVersion     = 5;
 inline constexpr std::uint32_t kDiskPageHeaderBytes   = 16;
 inline constexpr std::uint32_t kDiskPageIoAlignment   = 4096;
 inline constexpr std::uint32_t kDiskCodecHeaderBytes  = 24;
 inline constexpr std::uint32_t kDiskStatePayloadOffset = 4096;
-inline constexpr std::uint32_t kDiskFingerprintPlanes = 56;
+inline constexpr std::uint32_t kDiskFingerprintPlaneBytes = 20;
 
 enum class DiskCodec : std::uint8_t {
     Raw  = 0,
@@ -73,14 +73,26 @@ struct DiskCheckpointSlot {
     std::uint64_t dflash_id    = 0;
 };
 
+// Describes one plane in the canonical packed logical-page image. Physical resident-page
+// capacity, allocation alignment, and device strides are intentionally absent: none of them is
+// present in a disk page record, and restore scatters the canonical bytes through the destination
+// pool's current geometry.
+struct DiskPlaneSchema {
+    DType dtype                 = DType::BF16;
+    PagedKVPlaneOrder order     = PagedKVPlaneOrder::PageMajor;
+    std::int32_t leading_extent = 0;
+    std::int32_t head_extent    = 0;
+    std::uint64_t page_bytes    = 0;
+
+    [[nodiscard]] bool operator==(const DiskPlaneSchema&) const = default;
+};
+
 struct DiskFingerprint {
     std::string model_id;
     std::string weights_id;
     KvCacheStorage kv_cache          = KvCacheStorage::Nvfp4;
     SpeculativeBackend speculative   = SpeculativeBackend::None;
     std::uint32_t page_size          = static_cast<std::uint32_t>(kPagedKVPageSize);
-    std::uint32_t text_plane_count   = 0;
-    std::uint32_t backend_plane_count = 0;
     std::uint64_t gdn_conv_bytes     = 0;
     std::uint64_t gdn_recurrent_bytes = 0;
     std::uint64_t cyclic_lane_bytes  = 0;
@@ -91,8 +103,8 @@ struct DiskFingerprint {
     std::int32_t cyclic_head_dim     = 0;
     std::int32_t cyclic_lane_capacity = 0;
     std::uint32_t snapshot_version   = kDiskFormatVersion;
-    std::vector<std::uint8_t> text_plane_bytes;
-    std::vector<std::uint8_t> backend_plane_bytes;
+    std::vector<DiskPlaneSchema> text_planes;
+    std::vector<DiskPlaneSchema> backend_planes;
 };
 
 struct DiskMeta {

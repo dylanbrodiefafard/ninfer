@@ -73,10 +73,11 @@ Compaction of 312,246,272 retained bytes measured 2.57–2.65 GB/s against a 2.9
 write control. Increasing its transfer buffer from 1 MiB to 8 MiB regressed from 2.65 to 2.48 GB/s,
 so the production buffer remains 1 MiB and no extra pipeline is retained. The final physical
 batch-four rerun measured 3.944 GB/s host-visible commit and 2.448 GB/s post-pool-sync payload,
-with every mirror-normalized sample within the 3% accounting bound. These results leave no
-supported wire-format reason for a disk format v5: the accepted state and startup changes operate
-entirely within v4, while contiguous page reads, compaction, H2D/scatter, and durable writes are at
-or close to the relevant measured hardware/filesystem ceilings.
+with every mirror-normalized sample within the 3% accounting bound. The accepted state and startup
+changes did not alter page-record transfer layout; disk format v5 later changed only the startup
+fingerprint from physical tensor geometry to the canonical logical-page schema. Contiguous page
+reads, compaction, H2D/scatter, and durable writes remain at or close to the relevant measured
+hardware/filesystem ceilings.
 
 The serving measurements characterize the two measured Qwen3.6 model IDs independently on one
 NVIDIA GeForce RTX 5090. They cover long-context prefill and baseline decode with speculative

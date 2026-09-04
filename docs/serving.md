@@ -671,6 +671,11 @@ the live pinned log, but other-lane restore after eviction needs the FIFO.
 `--kv-ram-capacity > 0` and `--kv-disk-location`. Disk is inclusive of VRAM/RAM hits; equal reuse
 length prefers VRAM, then RAM, then disk. `--kv-disk-compress` is not part of the directory
 fingerprint and affects new GDN/hidden/cyclic writes only.
+Disk format v5 fingerprints canonical logical KV pages rather than the current GPU pool capacity,
+so one location can reopen across `--vision` on/off and automatic resident-capacity changes. Media
+content remains part of each entry identity. Pre-v5 locations fail the version check and must be
+cleared once; model, weights, KV dtype, speculative backend, and persistent-state incompatibilities
+still fail startup.
 On stop, orderly shutdown copies active chats into the host cache, saves cache entries that are not
 yet on SSD, and finishes outstanding disk writes. The progress renderer prints `kv-disk`
 `copy active chats` / `save cache entries` / `finish disk writes` counts while shutdown runs.
