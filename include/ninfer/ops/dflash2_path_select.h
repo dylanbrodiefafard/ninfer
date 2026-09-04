@@ -41,9 +41,12 @@ inline constexpr std::int32_t kDflash2VerifyWidth              = 12;
  *       + sum_{r=0}^{255} (pred_code[r, prev[t-1,b]] * h[r,t,b]) * succ_code[r, candidates[c]].
  *
  *   configs is a device-resident SamplingConfig[B] (same buffer the round copies into ingress).
- *   If configs[b].temperature <= 0, path[t,b] is the candidate with the greatest score; equal
- *   scores select the lower token id. If temperature > 0, the 16 scores are softmax-normalized
- *   after dividing by temperature and one candidate is drawn by inverse-CDF using
+ *   If configs[b].temperature <= 0 or configs[b].p_less != 0, path[t,b] is the candidate with the
+ *   greatest score; equal scores select the lower token id. P-less temperature parameterizes the
+ *   target distribution in sampling.h, not these draft scores: a 16-way softmax at the product
+ *   p-less T=2 is nearly uniform and is not a valid chain proposal. If temperature > 0 and
+ *   p_less==0, the 16 scores are softmax-normalized after dividing by temperature and one
+ *   candidate is drawn by inverse-CDF using
  *
  *     u = splitmix64(configs[b].seed ^ seed_xor,
  *                    logical_positions[b] + position_offset + t + 1,
@@ -52,8 +55,10 @@ inline constexpr std::int32_t kDflash2VerifyWidth              = 12;
  *   Then prev[t,b] = path[t,b]. Candidate order does not affect the selected token.
  *   An internal force_greedy call may override temperature for an intermediate refinement pass.
  *   When selector_ids / selector_q are non-null they receive the 16 candidate token ids and
- *   the proposal distribution q: one-hot at the greedy pick, else the 16-way softmax. Chain
- *   Leviathan accept uses this q; null selectors leave q implicit one-hot at path[t,b].
+ *   the proposal distribution q: one-hot at the greedy/p-less pick, else the 16-way softmax.
+ *   Truncated-sampling Leviathan accept uses this q. Under p-less, chain accept ignores any
+ *   recorded selector q and uses one-hot at the drafted token (same as MTP / null selectors).
+ *   Null selectors leave q implicit one-hot at path[t,b].
  *
  * Logical shapes:
  *   logits is contiguous BF16 [V,T] or [V,T,B] with V>=16. hidden is contiguous BF16 [5120,T] or
@@ -72,7 +77,8 @@ inline constexpr std::int32_t kDflash2VerifyWidth              = 12;
  * Supported domain:
  *   hidden_projection is BF16_CTRL Contiguous [256,5120], or a Linear-registered Q4G64_F16S /
  *   W8G32_F16S RowSplit / NVFP4 BlockScale problem of that logical shape. The Q4/W8/NVFP4 route
- *   calls ops::linear.
+ *   calls Linear at per-sequence T (not T*B) so C>1 does not select a different T-specialized
+ *   kernel than C=1.
  *
  *   pred_code and succ_code are contiguous BF16 [256, codebook_rows] (rank fastest), or NVFP4
  *   BlockScale weights of logical shape [codebook_rows, 256] passed as pred_nvfp4/succ_nvfp4.

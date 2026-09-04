@@ -388,6 +388,109 @@ struct SnapshotAccess {
     }
 };
 
+template <bool Masked, bool ParentIndexed>
+struct OverlayAccess {
+    const __nv_bfloat16* q;
+    const __nv_bfloat16* k;
+    const __nv_bfloat16* v;
+    const float* g;
+    const float* beta;
+    const float* live_states;
+    float* overlay_states;
+    const std::int32_t* valid_columns;
+    const std::int32_t* initial_slots;
+    const std::int32_t* parent_index;
+    __nv_bfloat16* out;
+    head_map heads;
+    std::int32_t width;
+    std::int32_t batch_size;
+    std::int64_t live_slot_stride;
+    std::int64_t overlay_slot_stride;
+    float scale;
+
+    __device__ __forceinline__ RecurrentCoordinates coordinates() const {
+        return make_coordinates(static_cast<std::int32_t>(blockIdx.y), 0,
+                                static_cast<std::int32_t>(blockIdx.z), heads);
+    }
+
+    __device__ __forceinline__ std::int32_t
+    active_columns(const RecurrentCoordinates& coord) const {
+        if constexpr (Masked) { return valid_columns[coord.batch]; }
+        return width;
+    }
+
+    __device__ __forceinline__ std::int64_t column(const RecurrentCoordinates& coord,
+                                                   std::int32_t token) const {
+        return static_cast<std::int64_t>(coord.batch) * width + token;
+    }
+
+    __device__ __forceinline__ std::int32_t column_slot(std::int32_t token,
+                                                        std::int32_t batch) const {
+        return token * batch_size + batch;
+    }
+
+    __device__ __forceinline__ std::int32_t work_slot(std::int32_t batch) const {
+        return width * batch_size + batch;
+    }
+
+    __device__ __forceinline__ const float* live_head(const RecurrentCoordinates& coord) const {
+        return live_states +
+               static_cast<std::int64_t>(initial_slots[coord.batch]) * live_slot_stride +
+               static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
+    }
+
+    __device__ __forceinline__ float* overlay_head(std::int32_t slot,
+                                                   const RecurrentCoordinates& coord) const {
+        return overlay_states + static_cast<std::int64_t>(slot) * overlay_slot_stride +
+               static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
+    }
+
+    __device__ __forceinline__ const __nv_bfloat16* key_ptr(const RecurrentCoordinates& coord,
+                                                            std::int32_t token) const {
+        return k + (column(coord, token) * heads.H_qk + coord.qk_head) * kStateDim;
+    }
+
+    __device__ __forceinline__ const __nv_bfloat16* value_ptr(const RecurrentCoordinates& coord,
+                                                              std::int32_t token) const {
+        return v + (column(coord, token) * heads.H_v + coord.value_head) * kStateDim;
+    }
+
+    __device__ __forceinline__ RawGatePair load_gate(const RecurrentCoordinates& coord,
+                                                     std::int32_t token) const {
+        return load_source_gate(g, beta, column(coord, token) * heads.H_v + coord.value_head);
+    }
+
+    __device__ __forceinline__ const __nv_bfloat16* query_ptr(const RecurrentCoordinates& coord,
+                                                              std::int32_t token) const {
+        return q + (column(coord, token) * heads.H_qk + coord.qk_head) * kStateDim;
+    }
+
+    __device__ __forceinline__ __nv_bfloat16* output_ptr(const RecurrentCoordinates& coord,
+                                                         std::int32_t token) const {
+        return out + (column(coord, token) * heads.H_v + coord.value_head) * kStateDim;
+    }
+
+    __device__ __forceinline__ void
+    load_tile(const float* head, const RecurrentCoordinates& coord,
+              float (&state)[kDvPerWarp][kQkPerLane]) const {
+#pragma unroll
+        for (int r = 0; r < kDvPerWarp; ++r) {
+            load_qk_lane(state[r], head + static_cast<std::int64_t>(coord.dv_base + r) * kStateDim,
+                         coord.dqk_base);
+        }
+    }
+
+    __device__ __forceinline__ void
+    store_tile(float* head, const RecurrentCoordinates& coord,
+               const float (&state)[kDvPerWarp][kQkPerLane]) const {
+#pragma unroll
+        for (int r = 0; r < kDvPerWarp; ++r) {
+            store_qk_lane(state[r], head + static_cast<std::int64_t>(coord.dv_base + r) * kStateDim,
+                          coord.dqk_base);
+        }
+    }
+};
+
 template <bool Masked, bool ParentIndexed = false, int NumWarps = kNumWarps>
 struct RecordAccess {
     static constexpr bool kParentIndexed = ParentIndexed;
@@ -843,6 +946,59 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     const RecurrentCoordinates coord = access.coordinates();
     recurrent_bf16_body<RecurrentMode::Snapshot, NormalizeInputs>(access, coord, access.width,
                                                                   access.active_columns(coord));
+}
+
+template <bool Masked, bool ParentIndexed>
+__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+    recurrent_overlay_kernel(OverlayAccess<Masked, ParentIndexed> access) {
+    const RecurrentCoordinates coord = access.coordinates();
+    const std::int32_t valid         = access.active_columns(coord);
+    const std::int32_t width         = access.width;
+    __align__(16) float state[kDvPerWarp][kQkPerLane];
+
+    for (std::int32_t token = 0; token < width; ++token) {
+        if (token >= valid) {
+            if (coord.lane < kDvPerWarp) {
+                access.output_ptr(coord, token)[coord.dv_base + coord.lane] =
+                    __float2bfloat16(0.0f);
+            }
+            continue;
+        }
+
+        if constexpr (ParentIndexed) {
+            const std::int32_t parent = access.parent_index[access.column(coord, token)];
+            if (parent < 0) {
+                access.load_tile(access.live_head(coord), coord, state);
+            } else {
+                access.load_tile(access.overlay_head(access.column_slot(parent, coord.batch), coord),
+                                 coord, state);
+            }
+        } else if (token == 0) {
+            access.load_tile(access.live_head(coord), coord, state);
+        } else {
+            access.load_tile(access.overlay_head(access.work_slot(coord.batch), coord), coord,
+                             state);
+        }
+
+        RawQkLane key = load_raw_qk_lane(access.key_ptr(coord, token), coord.dqk_base);
+        normalize_qk_lane<true>(key.value, coord.lane);
+        const RawGatePair gate = access.load_gate(coord, token);
+        const RawValueLane value =
+            load_value_lane(access.value_ptr(coord, token), coord.lane, coord.dv_base);
+        apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
+        readout_and_store<true>(state, access.query_ptr(coord, token),
+                                access.output_ptr(coord, token), coord.dqk_base, coord.dv_base,
+                                coord.lane, access.scale);
+
+        if constexpr (ParentIndexed) {
+            access.store_tile(access.overlay_head(access.column_slot(token, coord.batch), coord),
+                              coord, state);
+        } else {
+            access.store_tile(access.overlay_head(access.work_slot(coord.batch), coord), coord,
+                              state);
+        }
+        __syncthreads();
+    }
 }
 
 template <bool Masked, bool ParentIndexed, int NumWarps>

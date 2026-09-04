@@ -206,6 +206,6 @@ void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_s
 void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                          std::uint32_t verify_width, DFlashEnvelopes envelopes,
                          ops::GqaExecutionEnvelope target_envelope,
-                         DecodeGraphExecutable* executable);
+                         bool exact_sequence_envelopes, DecodeGraphExecutable* executable);
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

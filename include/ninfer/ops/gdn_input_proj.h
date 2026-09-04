@@ -88,7 +88,7 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
 /**
  * Returns the transient capacity for the [16384,5120] NVFP4 snapshot profile. `batch_size` is exact
  * and the query covers every W in the inclusive width interval. NVFP4 B=1 and B=2..8 (W<=16)
- * use the fused snapshot resolver (one launch; grid.x=B when B>1, T=1 still loops GEMV)
+ * use the fused snapshot resolver (one C=1 SmallT launch per sequence; T=1 still loops GEMV)
  * and need no transient plane.
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
@@ -173,7 +173,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
 
 /**
  * Returns the transient capacity for the [16384,5120] NVFP4 record-producing profile. A16 and
- * fused small-T routes require no storage. AllowA4 returns only the activation-quantization
+ * fused T=1 GEMV+conv routes require no storage. AllowA4 returns only the activation-quantization
  * workspace selected by the corresponding projection route; conv_record is caller-owned.
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
@@ -197,8 +197,8 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
  * [T,B] (or [T] when B=1) parent tensor used by gated_delta_net_replay_record: token 0 loads the
  * checkpoint history, every other valid token j loads the width-three history saved after its
  * parent, and the kernel saves the post-convolution history for j so siblings can share a parent.
- * NVFP4 T=2..16 keeps fused SmallT GEMM+conv in one launch (grid.x=B when B>1) so column 0
- * does not take the BF16 compose-record roundtrip.
+ * NVFP4 T=2..16 runs fused T=1 GEMV+FP32 conv in one launch per sequence (ordinary-decode
+ * GEMV and BF16 3-tap history) so packed verify does not take SmallT GEMM or BF16 compose-record.
  *
  * The two-parent form registers Q4 q/k [4096,5120] and the Q5 value/z parent [12288,5120]. All
  * tensor operands, outputs, conv_record, source state, and live workspace must be disjoint.

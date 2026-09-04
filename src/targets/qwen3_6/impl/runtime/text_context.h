@@ -191,6 +191,7 @@ public:
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
     void set_tree_verify(const Tensor* parent_index, const Tensor* ancestor_mask,
                          const Tensor* prefix_lengths);
+    void set_sequence_row(std::int32_t row) noexcept { active_sequence_row_ = row; }
 
     [[nodiscard]] const Weight* proposal_head() const noexcept { return proposal_head_; }
 
@@ -320,6 +321,7 @@ private:
     const ops::GqaExecutionEnvelope* active_gqa_envelope_ = nullptr;
     std::int32_t active_sequence_batch_                   = 0;
     std::int32_t active_sequence_width_                   = 0;
+    std::int32_t active_sequence_row_                     = 0;
     std::int32_t rope_delta_                              = 0;
     std::int32_t linear_state_current_slot_               = 0;
     std::int32_t linear_state_rewrite_checkpoint_slot_    = 0;

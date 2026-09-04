@@ -101,7 +101,8 @@ struct Variant {
     static void gdn_norm_control_projection(const Tensor& residual, const Tensor& norm_weight,
                                             float eps, const GdnProjectionWeights& weights,
                                             Tensor& hidden, Tensor& g, Tensor& beta,
-                                            WorkspaceArena& workspace, cudaStream_t stream);
+                                            WorkspaceArena& workspace, cudaStream_t stream,
+                                            std::int32_t route_tokens = 0);
     static void post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                            qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                            cudaStream_t stream, std::int32_t route_tokens = 0);

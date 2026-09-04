@@ -263,8 +263,9 @@ o  = (S @ q) * (1/sqrt(128))
 
 The CUDA recurrence uses an algebraically equivalent ordering appropriate to the kernel. Prefill
 uses chunked parallel state passing for large T and recurrent/small-T paths where appropriate;
-ordinary decode uses the width-one in-place path, while MTP verification and Fold share the same
-finite-precision recurrent transition through their Record and Fold modes.
+ordinary decode uses the width-one in-place path, while MTP verification records T=W transitions
+for Fold and overlays T=1 snapshot arithmetic on scratch SSM for packed `out`, so each verify
+column matches ordinary decode. Fold applies the same finite-precision recurrent transition.
 
 The per-head output is normalized and gated before projection:
 
@@ -367,16 +368,33 @@ One propose block:
    - `h = RMSNorm(residual, post_attention_norm)`
    - `h, mlp_k1 = mlp_conv.prepare(h)`; SiLU-GLU MLP; `mlp_conv.finish`; residual add
 3. Final RMSNorm → draft-head logits on the seven mask columns (not the anchor).
+   Concurrent C>1 runs each compact row as a C=1-shaped propose (`T=width`, `B=1`) so those
+   Linears, SWA, and the draft head use the sequential kernels rather than a `T=width*B`
+   specialization. Eager execution also resolves SWA's direct/split route from that row's
+   frontier rather than the batch maximum; graph replay retains the fixed profile envelope.
 4. Path selector (`dflash2_path_select`): unsorted top-16 of those logits, then the Markov score
-   `score = unary + ⟨pred_code(prev) ⊙ W_h h_t , succ_code(cand)⟩`. Greedy chooses the maximum;
-   sampling draws from the temperature-scaled 16-way distribution and retains that row as `q`.
+   `score = unary + ⟨pred_code(prev) ⊙ W_h h_t , succ_code(cand)⟩`. Greedy chooses the maximum.
+   Sampling draws from the temperature-scaled 16-way distribution and retains that row as `q`,
+   except under p-less: p-less temperature is a target-distribution parameter, so the selector
+   stays greedy / one-hot `q` (same chain convention as MTP). Chain accept also ignores any
+   recorded 16-way `q` under p-less and uses that one-hot convention, so a stale or temperature-2
+   softmax shortlist cannot inflate `p/q` and lock onto copied n-grams.
    Selector RNG is keyed by request seed and absolute token position, independent of compact batch
    row. `--lm-head-draft` runs top-16 on the shortlist and gathers codebooks by token id.
-5. The 27B target verifies the chain in one causal forward of width `W=k+1`. Greedy accepts the
-   matching prefix. Sampling uses Leviathan `min(1,p/q)` acceptance and samples the first correction
-   from normalized `max(0,p-q)`; all-accepted rounds sample a target bonus. ReplaySSM Fold commits
-   the corresponding sequential prefix. The RTX 5090 recommendation is k=4 (W=5); native k=7 uses
-   W=8. The maximum k=11 route performs two MASK blocks (7+4) before one W=12 chain verify.
+5. The 27B target verifies the packed tree (product W=12 at k=7) or chain (W=k+1) in one
+   causal forward for the compact batch. Concurrent C>1 keeps that forward packed (`B=batch`)
+   so CUDA graphs capture one 27B verify rather than a serial host loop. Residual Linear and
+   GDN-control panel at the C=1 width (`packed_route_tokens`); GQA launches one B=1 decode per
+   sequence so it does not take `MultiBatch=true`. ReplaySSM records are `layer(g, 0, B)`.
+   Packed GDN conv-record is fused T=1 GEMV+FP32 conv in one launch per sequence; packed GDN
+   recurrent overlays T=1 snapshot `out` on scratch SSM. Greedy accepts the matching prefix.
+   Truncated sampling uses Leviathan `min(1,p/q)` on every hop. Under p-less, hop 0 is
+   Leviathan with one-hot `q` (tree: SpecInfer membership); later hops and the bonus are greedy
+   argmax. ReplaySSM Fold commits the corresponding sequential prefix. The RTX 5090
+   recommendation is k=4 (W=5, one SmallT GQA tile). Native k=7 uses W=8 chain or W=12 packed
+   tree; chain W=8 on 24 Q heads is T>6, so B=1 causal verify uses the Prompt GQA route over
+   the full visible KV. The maximum k=11 route performs two MASK blocks (7+4) before one W=12
+   chain verify.
 
 `GroupedDynamicCausalConv` is grouped size-16, kernel 2, left-padded (causal along the query
 block): `prepare` before the sublayer on the pre-norm hidden, `finish` on that sublayer's output.
@@ -389,7 +407,15 @@ and accepts only the prefix licensed by the target distribution.
 In greedy mode, MTP and DFlash2 accept the longest draft prefix matching the target argmax. In
 sampling mode both use chain rejection sampling against the represented target distribution. A bad
 draft therefore reduces acceptance and throughput; it must not change the distribution of emitted
-target tokens. DFlash2 differs by producing the whole candidate chain in one masked-block forward.
+target tokens. Under p-less, DFlash2 chain accept uses the same one-hot `q` convention as MTP
+(ignore any 16-way selector `q`) **only at hop 0**: p-less temperature is not a draft softmax, so
+`p/q` from a 16-way shortlist would over-accept copied n-grams. Later hops, and the bonus after a
+full accept, are greedy (accept iff the draft equals that packed column's p-less argmax). Packed
+tree verify is the same split: hop 0 is SpecInfer membership from p-less(`P_LLM`); later hops walk
+only the argmax child. DFlash2 differs by producing the whole candidate chain in one masked-block
+forward. Packed GDN conv-record is fused T=1 GEMV+FP32 conv; packed GDN recurrent overlays ordinary
+T=1 snapshot arithmetic on scratch SSM so those packed logits match width-one decode. Fold still
+consumes the T=W records.
 
 Target verification writes candidate KV into provisioned but unpublished extents. After the final
 per-row output prefix is known, one all-layer Fold commits the accepted sequential prefix into the

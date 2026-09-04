@@ -323,11 +323,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         }
         (void)workspace_recipe::gdn_recurrent_output<TextConfig>(layout, last);
         if (path == GdnWorkspacePath::ReplayRecord) {
-            if (dflash_tree) {
-                // Nested: gdn_mix scopes the fold alloc before gdn_normalized_output.
-                scratch(layout, ops::gated_delta_net_replay_record_workspace_capacity_bytes(
-                                    TextConfig::gdn_value_heads, batch_size, max_width));
-            }
+            // Nested: gdn_mix scopes the fold alloc before gdn_normalized_output.
+            // Chain and tree both reserve parent-tile + T=1 overlay scratch.
+            scratch(layout, ops::gated_delta_net_replay_record_workspace_capacity_bytes(
+                                TextConfig::gdn_value_heads, batch_size, max_width));
             if (plan.adaptive_draft) {
                 (void)layout.alloc(DType::BF16,
                                    {TextConfig::convolution_dim, max_width, batch_size});

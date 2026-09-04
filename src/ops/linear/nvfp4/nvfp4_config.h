@@ -241,8 +241,9 @@ inline constexpr std::int32_t kNvfp4FirstW4a4MlpGateUp     = 2;
 inline constexpr std::int32_t kNvfp4FirstW4a4Residual6144  = 5;
 inline constexpr std::int32_t kNvfp4FirstW4a4Residual17408 = 3;
 inline constexpr std::int32_t kNvfp4FirstW4a4MtpFc         = 8;
-// Tree/chain verify is W<=16. Fused GDN conv stays A16 SmallT on that range (parent-indexed
-// FP32 epilogue), including C>1 (one launch, grid.x=B). W4A4 Materialized compose is prefill.
+// Tree/chain verify is W<=16. Packed GDN conv-record is fused T=1 GEMV+FP32 conv in one
+// launch per sequence (parent-indexed on a tree). Snapshot T=2..16 stays fused SmallT.
+// W4A4 Materialized compose is prefill.
 inline constexpr std::int32_t kNvfp4LastPackedGdnConvSmallT = 16;
 
 // RTX 5090 cold-cache winners for contiguous Linear output. T=2..4 amortizes activation loads

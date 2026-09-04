@@ -35,9 +35,11 @@ __host__ __device__ inline int sampler_group_count(int partial_blocks) {
     return div_up(partial_blocks, kSamplerPartialsPerGroup);
 }
 
+// `columns` is the per-row column count (speculative W or K+1, or sample_batch B). Do not
+// multiply by batch: C>1 would then use fewer workers per column than sequential C=1.
 __host__ __device__ inline int sampler_p_less_workers_per_column(int partial_blocks,
-                                                                 int total_columns) {
-    int workers = total_columns > 0 ? kSamplerPLessTargetBlocks / total_columns : 1;
+                                                                 int columns) {
+    int workers = columns > 0 ? kSamplerPLessTargetBlocks / columns : 1;
     if (workers < 1) { workers = 1; }
     if (workers > partial_blocks) { workers = partial_blocks; }
     return workers;

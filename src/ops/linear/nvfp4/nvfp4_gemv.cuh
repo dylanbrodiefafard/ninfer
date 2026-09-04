@@ -183,20 +183,6 @@ struct Nvfp4PackedActivation {
     }
 };
 
-// GDN fused conv B>1: grid is dim3(batch, row_blocks) so blockIdx.x is the request
-// row and consecutive CTAs share output-row weights. Linear SmallT stays 1D.
-template <class Geometry>
-struct Nvfp4BatchedPackedActivation {
-    const __nv_bfloat16* x;
-    int width;
-
-    __device__ __forceinline__ const __nv_bfloat16* values(int token, int value_begin) const {
-        const int batch = static_cast<int>(blockIdx.x);
-        return x + (static_cast<std::int64_t>(batch) * width + token) * Geometry::kInputRows +
-               value_begin;
-    }
-};
-
 template <class Geometry>
 struct Nvfp4SplitKActivation {
     static_assert((Geometry::kInputRows % 2) == 0);

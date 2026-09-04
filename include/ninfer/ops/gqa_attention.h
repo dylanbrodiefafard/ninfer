@@ -61,7 +61,8 @@ struct GqaS3PrefillDump;
 
 /**
  * Returns the transient arena capacity required for every W in the inclusive interval at one
- * exact logical batch size. Head geometry, cache dtype, and execution envelope are the fixed
+ * exact logical batch size. B>1 SmallT/ChunkedSmallT peak is the B=1 decode scratch (one
+ * sequence at a time). Head geometry, cache dtype, and execution envelope are the fixed
  * implementation profile. Invalid profiles or intervals throw; a legal B=1 prompt route may
  * return zero. Prefill Sparge keep-lists live in kernel smem. XAttention ranker
  * scratch (packed-K / logits / mass / keep) is sized here when xattn_tau < 1 on
@@ -124,6 +125,10 @@ gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
  * decode small-T route at W=1..16 (chunked for W>6), including B=1; it is not a Prompt-kernel
  * path. gqa_attention_workspace_capacity_bytes(..., tree_verify=true) reserves that decode
  * scratch. Ordinary MTP/causal calls omit both tensors.
+ *
+ * Concurrent B>1 SmallT/ChunkedSmallT launches one B=1 decode per sequence so C>1 uses the same
+ * kernel as sequential C=1 (`MultiBatch=false`). The batched MultiBatch specialization is an
+ * indexing variant, not a required semantic path; p-less T=2 is sensitive to its reduction.
  */
 void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
                    const Tensor& valid_columns, const Tensor& kv_table_rows, float scale,

@@ -107,8 +107,7 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
         selector_q_ptr, selector_k, nullptr, nullptr, nullptr, nullptr, nullptr);
     CUDA_CHECK(cudaGetLastError());
     const dim3 p_less_grid(
-        static_cast<unsigned int>(
-            sampler_p_less_workers_per_column(partial_blocks, cols * batch)),
+        static_cast<unsigned int>(sampler_p_less_workers_per_column(partial_blocks, cols)),
         static_cast<unsigned int>(cols), static_cast<unsigned int>(batch));
     speculative_sampling_p_less_mass_finalize_kernel<<<p_less_grid, kSamplerBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(logits.data),
@@ -209,8 +208,7 @@ void speculative_accept_tree_drafts_launch(const Tensor& target_tokens, const Te
         static_cast<std::int32_t*>(fold_path.data));
     CUDA_CHECK(cudaGetLastError());
     const dim3 p_less_grid(
-        static_cast<unsigned int>(
-            sampler_p_less_workers_per_column(partial_blocks, width * batch)),
+        static_cast<unsigned int>(sampler_p_less_workers_per_column(partial_blocks, width)),
         static_cast<unsigned int>(width), static_cast<unsigned int>(batch));
     speculative_sampling_p_less_mass_finalize_kernel<<<p_less_grid, kSamplerBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(logits.data), nullptr,

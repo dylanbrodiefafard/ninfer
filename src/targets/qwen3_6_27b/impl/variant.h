@@ -44,8 +44,10 @@ struct Variant {
     }
 
     // The target-verify leaves receive route_tokens: the C=1 width of a packed verify round (0
-    // when the round is not batched packed verify). It selects the C=1 quantization family for
-    // the single aggregate launch; see the pinned policy in variant.cpp.
+    // when the round is not batched packed verify). Packed T=width*B would otherwise select a
+    // different T-specialized kernel than sequential C=1 (NVFP4 A16↔W4A4, Q4/W8 SmallT, and
+    // 27B GDN control SmallT GEMV vs MMA at T>=17). Leaves either panel at that width or pin
+    // the C=1 quantization family; see variant.cpp.
     static void attention_projection(const Tensor& hidden,
                                      const FullAttentionProjectionWeights& weights, Tensor& query,
                                      Tensor& gate, Tensor& key, Tensor& value,
@@ -93,7 +95,8 @@ struct Variant {
     static void gdn_norm_control_projection(const Tensor& residual, const Tensor& norm_weight,
                                             float eps, const GdnProjectionWeights& weights,
                                             Tensor& hidden, Tensor& g, Tensor& beta,
-                                            WorkspaceArena& workspace, cudaStream_t stream);
+                                            WorkspaceArena& workspace, cudaStream_t stream,
+                                            std::int32_t route_tokens = 0);
     static void post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                            qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                            cudaStream_t stream, std::int32_t route_tokens = 0);

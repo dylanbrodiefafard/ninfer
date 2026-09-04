@@ -158,4 +158,35 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) 
     dispatch_linear(x, w, out, LinearPolicy::A16Only, nullptr, stream);
 }
 
+void linear_packed_sequences(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
+                             WorkspaceArena& workspace, cudaStream_t stream,
+                             std::int32_t sequence_width) {
+    if (sequence_width <= 0) {
+        throw std::invalid_argument("linear_packed_sequences: sequence_width must be positive");
+    }
+    if (x.ne[1] % sequence_width != 0) {
+        throw std::invalid_argument(
+            "linear_packed_sequences: T must be a multiple of sequence_width");
+    }
+    for (std::int32_t offset = 0; offset < x.ne[1]; offset += sequence_width) {
+        Tensor out_panel = out.slice(1, offset, sequence_width);
+        linear(x.slice(1, offset, sequence_width), w, out_panel, policy, workspace, stream);
+    }
+}
+
+void linear_packed_sequences(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream,
+                             std::int32_t sequence_width) {
+    if (sequence_width <= 0) {
+        throw std::invalid_argument("linear_packed_sequences: sequence_width must be positive");
+    }
+    if (x.ne[1] % sequence_width != 0) {
+        throw std::invalid_argument(
+            "linear_packed_sequences: T must be a multiple of sequence_width");
+    }
+    for (std::int32_t offset = 0; offset < x.ne[1]; offset += sequence_width) {
+        Tensor out_panel = out.slice(1, offset, sequence_width);
+        linear(x.slice(1, offset, sequence_width), w, out_panel, stream);
+    }
+}
+
 } // namespace ninfer::ops

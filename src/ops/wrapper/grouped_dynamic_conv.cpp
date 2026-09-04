@@ -161,7 +161,7 @@ void grouped_dynamic_conv_prepare(const Tensor& hidden, const Tensor& base_kerne
         detail::grouped_dynamic_conv_bf16_gemv_launch(hidden_flat, kernel_projection, projection,
                                                       stream);
     } else {
-        ops::linear(hidden_flat, kernel_projection, projection, stream);
+        ops::linear_packed_sequences(hidden_flat, kernel_projection, projection, stream, tokens);
     }
     detail::grouped_dynamic_conv_prepare_launch(hidden, base_kernel, projection, prepared,
                                                 finish_dynamic, stream);

@@ -39,8 +39,8 @@ __launch_bounds__(kSamplerBlock) __global__
             sampling_p_less_draw(logits, base, token_domain, cfg, logical_positions[row], purpose,
                                  red_val, red_idx, red_aux);
         if (tid == 0) {
-            out[row] = picked;
-            if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
+            out[row] = sampling_clamp_token(picked, 0, token_domain);
+            sampling_count_token(cfg, out[row], token_domain);
         }
         return;
     }
@@ -99,8 +99,8 @@ __launch_bounds__(kSamplerBlock) __global__
             break;
         }
     }
-    out[row] = picked;
-    if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
+    out[row] = sampling_clamp_token(picked, 0, token_domain);
+    sampling_count_token(cfg, out[row], token_domain);
 }
 
 __launch_bounds__(kSamplerBlock) __global__
@@ -321,8 +321,8 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
                 break;
             }
         }
-        out[col] = picked;
-        if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
+        out[col] = sampling_clamp_token(picked, 0, token_domain);
+        sampling_count_token(cfg, out[col], token_domain);
         workspace.group_done[col] = 0;
     }
 }
@@ -409,8 +409,8 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_p_less_mass_sample_ker
                 &found);
         }
         if (threadIdx.x == 0) {
-            out[col] = result;
-            if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[result], 1); }
+            out[col] = sampling_clamp_token(result, moments.argmax, token_domain);
+            sampling_count_token(cfg, out[col], token_domain);
             workspace.group_done[col] = 0;
         }
         return;

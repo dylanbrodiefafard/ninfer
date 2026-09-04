@@ -67,7 +67,14 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
  *   and samples a bonus from column Pcur[b] when every available draft is accepted. Null
  *   selector_ids/selector_q is the one-hot draft convention: accept iff u < p_i(d) and the
  *   residual excludes d. Greedy mode ignores q. When configs[b].p_less is set, p is the p-less
- *   distribution from sampling.h rather than the top-k/top-p/min-p truncation.
+ *   distribution from sampling.h rather than the top-k/top-p/min-p truncation, and selector q is
+ *   ignored (one-hot at the drafted token, same as MTP): p-less temperature is not a draft
+ *   softmax, and a 16-way q at that T would make Leviathan accept almost every top-16 copy. Hop 0
+ *   is that Leviathan test; every later hop, and the bonus after a full accept, is greedy
+ *   (accept the draft iff it equals the packed-column argmax, else emit that argmax). A hop-0
+ *   p-less residual whose mass is numerically zero draws from p' rather than re-emitting the
+ *   rejected draft. If admitted mass is zero, or a residual inverse-CDF with positive mass does
+ *   not land on a survivor, the correction is the packed-column argmax.
  *   RNG domains are the speculative accept/correction/bonus SamplePurpose values and logical
  *   positions derived from the old length.
  *
@@ -109,17 +116,18 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
  * Op: speculative_accept_tree_drafts
  *
  * Greedy: from packed column 0, walk to the unique child whose token equals the target argmax;
- * otherwise emit that argmax as the correction. Sampling: at node u sample x from the truncated
- * target distribution (p-less when configs[b].p_less is set); if x is a child of u, accept and
- * continue, else emit x as correction
- * (SpecInfer membership). Walks at most current_extents[b] accepted hops (same budget as chain
- * verify). fold_path lists packed columns of the processed path including the root;
- * accepted_column is the last processed packed index (hidden selector). licensed_tokens are
- * time-ordered accepted child ids plus the correction. accepted is the accepted draft count.
- * Sampling increments configs[b].token_counts for each produced token when that pointer is
- * non-null; greedy does not. Large-vocabulary sampling uses the same partial/group pipeline as
- * chain accept, with a parent-walk penalty overlay at each packed column, then the SpecInfer
- * walk over the stored truncated distributions.
+ * otherwise emit that argmax as the correction. Sampling with p_less==0: at node u sample x from
+ * the truncated target distribution; if x is a child of u, accept and continue, else emit x as
+ * correction (SpecInfer membership). When configs[b].p_less is set, hop 0 is that membership
+ * draw from p-less(p_LLM); every later hop walks only the packed-column argmax (greedy
+ * correction if that argmax is not a child). Walks at most current_extents[b] accepted hops
+ * (same budget as chain verify). fold_path lists packed columns of the processed path including
+ * the root; accepted_column is the last processed packed index (hidden selector).
+ * licensed_tokens are time-ordered accepted child ids plus the correction. accepted is the
+ * accepted draft count. Sampling increments configs[b].token_counts for each produced token when
+ * that pointer is non-null; greedy does not. Large-vocabulary sampling uses the same
+ * partial/group pipeline as chain accept, with a parent-walk penalty overlay at each packed
+ * column, then the hop-0 membership / later-hop greedy walk over the stored p-less moments.
  *
  * verify_ids/parent_index/fold_path/licensed_tokens are I32 [W,B]. target_tokens is I32 [W,B].
  * logits is BF16 [physical_rows,W,B]. current_extents/valid_columns and the other vectors are

@@ -155,6 +155,21 @@ std::size_t hidden_proj_bytes(std::int32_t tokens, std::int32_t batch) {
            static_cast<std::size_t>(batch) * sizeof(std::uint16_t);
 }
 
+void project_hidden(const Tensor& hidden, const Weight& hidden_projection, Tensor& hidden_proj,
+                    std::int32_t tokens, std::int32_t batch, cudaStream_t stream) {
+    Tensor hidden_flat = hidden.view({kDflash2PathSelectHidden, tokens * batch});
+    if (hidden_projection.qtype == QType::BF16_CTRL) {
+        if (!aligned_to(hidden_flat.data, 16) || !aligned_to(hidden_proj.data, 16)) {
+            throw std::invalid_argument(
+                "dflash2_path_select: hidden/projection scratch must be 16-byte aligned");
+        }
+        detail::dflash2_path_select_bf16_gemv_launch(hidden_flat, hidden_projection, hidden_proj,
+                                                     stream);
+        return;
+    }
+    ops::linear_packed_sequences(hidden_flat, hidden_projection, hidden_proj, stream, tokens);
+}
+
 constexpr int kTopkSplits = 32;
 
 std::size_t align_workspace(std::size_t bytes) {
@@ -271,17 +286,7 @@ void dflash2_path_select(const Tensor& logits, const Tensor& hidden,
     auto scratch_scope           = workspace.scope();
     const DeviceSpan proj_span   = workspace.alloc_bytes(hidden_proj_bytes(tokens, batch));
     Tensor hidden_proj(proj_span.data, DType::BF16, {kDflash2PathSelectRank, tokens * batch});
-    Tensor hidden_flat           = hidden.view({kDflash2PathSelectHidden, tokens * batch});
-    if (hidden_projection.qtype == QType::BF16_CTRL) {
-        if (!aligned_to(hidden_flat.data, 16) || !aligned_to(hidden_proj.data, 16)) {
-            throw std::invalid_argument(
-                "dflash2_path_select: hidden/projection scratch must be 16-byte aligned");
-        }
-        detail::dflash2_path_select_bf16_gemv_launch(hidden_flat, hidden_projection, hidden_proj,
-                                                     stream);
-    } else {
-        ops::linear(hidden_flat, hidden_projection, hidden_proj, stream);
-    }
+    project_hidden(hidden, hidden_projection, hidden_proj, tokens, batch, stream);
     const TopkScratch topk = alloc_topk_scratch(workspace, tokens, batch);
     detail::dflash2_column_topk_launch(logits, topk.split_val, topk.split_idx, topk.cand_val,
                                        topk.cand_idx, logit_token_ids, stream);
@@ -357,13 +362,7 @@ void dflash2_tree_select(const Tensor& logits, const Tensor& hidden,
     auto scratch_scope         = workspace.scope();
     const DeviceSpan proj_span = workspace.alloc_bytes(hidden_proj_bytes(tokens, batch));
     Tensor hidden_proj(proj_span.data, DType::BF16, {kDflash2PathSelectRank, tokens * batch});
-    Tensor hidden_flat = hidden.view({kDflash2PathSelectHidden, tokens * batch});
-    if (hidden_projection.qtype == QType::BF16_CTRL) {
-        detail::dflash2_path_select_bf16_gemv_launch(hidden_flat, hidden_projection, hidden_proj,
-                                                     stream);
-    } else {
-        ops::linear(hidden_flat, hidden_projection, hidden_proj, stream);
-    }
+    project_hidden(hidden, hidden_projection, hidden_proj, tokens, batch, stream);
     const TopkScratch topk = alloc_topk_scratch(workspace, tokens, batch);
     detail::dflash2_column_topk_launch(logits, topk.split_val, topk.split_idx, topk.cand_val,
                                        topk.cand_idx, logit_token_ids, stream);

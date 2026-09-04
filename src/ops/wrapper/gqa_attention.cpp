@@ -424,8 +424,11 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
     const auto chunk_capacity = [&](std::int32_t width) {
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q_heads, width, cache_dtype, envelope);
+        // B>1 SmallT/ChunkedSmallT launches one B=1 decode per sequence, so peak
+        // scratch is the B=1 partial/stat tiles (reused across the host loop).
+        const std::int32_t launch_batch = batch_size > 1 ? 1 : batch_size;
         WorkspaceLayoutBuilder layout;
-        (void)allocate_small_t_workspace(layout, q_heads, width, splits, batch_size);
+        (void)allocate_small_t_workspace(layout, q_heads, width, splits, launch_batch);
         // Sparge-decode tile-skip scratch (rank keep set): only a T=1 step on a
         // sage (U8) cache with keep_frac < 1 allocates the rank scratch, so only
         // that width carries the addition. Dry-run the same three allocations
@@ -433,7 +436,7 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
         // modeled exactly (a flat byte sum undercounts and overflows the arena).
         if (keep_frac < 1.0f && cache_dtype == DType::U8 && width == 1) {
             const std::int32_t kv_rows  =
-                batch_size * kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
+                launch_batch * kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
             const std::int32_t max_keep =
                 (static_cast<std::int32_t>(envelope.max_visible_keys) + 31) / 32;
             (void)layout.alloc(DType::I32, {kv_rows, max_keep});
@@ -531,6 +534,46 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     auto scope = workspace.scope();
     const detail::GqaAttentionRoute route =
         detail::gqa_attention_resolve_route(q.ne[1], width, batch, envelope, tree_verify);
+    // SmallT instantiates a different kernel for B=1 (MultiBatch=false) vs B>1. P-less T=2
+    // samples that perturbation; C=2 must run the C=1 kernel per sequence rather than the
+    // batched specialization. Do not re-enter the public Op: B=1 W=7..16 causal 27B would
+    // otherwise flip ChunkedSmallT to Prompt.
+    if (batch > 1 && (route == detail::GqaAttentionRoute::ChunkedSmallT ||
+                      route == detail::GqaAttentionRoute::SmallT)) {
+        for (std::int32_t b = 0; b < batch; ++b) {
+            auto sequence_scope     = workspace.scope();
+            Tensor q_seq            = q.slice(3, b, 1);
+            Tensor k_seq            = k.slice(3, b, 1);
+            Tensor v_seq            = v.slice(3, b, 1);
+            Tensor out_seq          = out.slice(3, b, 1);
+            Tensor positions_seq    = positions.slice(1, b, 1);
+            Tensor table_rows_seq   = kv_table_rows.slice(0, b, 1);
+            const Tensor valid_seq  = valid_columns.data == nullptr
+                                          ? Tensor{}
+                                          : valid_columns.slice(0, b, 1);
+            const Tensor mask_seq   = ancestor_mask.data == nullptr
+                                          ? Tensor{}
+                                          : ancestor_mask.slice(1, b, 1);
+            const Tensor prefix_seq = prefix_lengths.data == nullptr
+                                          ? Tensor{}
+                                          : prefix_lengths.slice(0, b, 1);
+            if (route == detail::GqaAttentionRoute::ChunkedSmallT) {
+                launch_chunked_small_t(q_seq, k_seq, v_seq, positions_seq, valid_seq,
+                                       table_rows_seq, scale, cache, envelope, workspace, out_seq,
+                                       stream, mask_seq, prefix_seq);
+            } else {
+                const std::int32_t splits =
+                    detail::gqa_attention_split_capacity(q.ne[1], width, cache.dtype, envelope);
+                SmallTWorkspace partial =
+                    allocate_small_t_workspace(workspace, q.ne[1], width, splits, 1);
+                detail::gqa_attention_small_t_launch(
+                    q_seq, k_seq, v_seq, positions_seq, valid_seq, table_rows_seq, scale, cache,
+                    envelope, 0, width, partial.acc, partial.m, partial.l, out_seq, stream,
+                    mask_seq, prefix_seq, 1.0f, {});
+            }
+        }
+        return;
+    }
     if (route == detail::GqaAttentionRoute::ChunkedSmallT) {
         launch_chunked_small_t(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
                                envelope, workspace, out, stream, ancestor_mask, prefix_lengths);

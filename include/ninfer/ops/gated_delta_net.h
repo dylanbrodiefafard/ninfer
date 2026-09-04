@@ -99,10 +99,14 @@ void gated_delta_net_snapshot(const Tensor& q, const Tensor& k, const Tensor& v,
  * `parent_index` is null or empty for sequential packed time: S_j = F(S_{j-1}, x_j) from the
  * checkpoint slot. When non-null it is contiguous I32 [T,B], or [T] when B=1, and the recurrence
  * is the tree rule S_j = F(S_parent[j], x_j). parent_index[0,b] is -1 and names the checkpoint
- * slot; every other valid column j has parent in [0,j). Packed order is not time. With a
- * workspace sized by gated_delta_net_replay_record_workspace_capacity_bytes(), parent tiles live
- * in HBM and the record kernel uses the 4-warp sequential tile geometry. Without workspace the
- * 1-warp shared-memory tile is used. Sequential record allocates no arena workspace.
+ * slot; every other valid column j has parent in [0,j). Packed order is not time. Records still
+ * come from the T=W record kernel (Fold consumes them). With a workspace sized by
+ * gated_delta_net_replay_record_workspace_capacity_bytes(), `out` is then overwritten by a T=1
+ * snapshot overlay on scratch SSM so each packed column matches ordinary width-one decode:
+ * sequential ping-pongs one work slot per row; tree loads the parent (or checkpoint) column from
+ * the scratch pool. Parent tiles for the tree record kernel occupy the first region of that
+ * workspace. Without workspace there is no overlay and the tree record kernel uses the 1-warp
+ * shared-memory tile.
  */
 [[nodiscard]] std::size_t gated_delta_net_replay_record_workspace_capacity_bytes(
     std::int32_t value_heads, std::int32_t batch, std::int32_t width);

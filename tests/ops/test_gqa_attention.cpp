@@ -3716,6 +3716,54 @@ int cache_position_mismatch(const HostCache& got, std::int32_t got_pos, const Ho
     return 0;
 }
 
+void assign_cache_position(HostCache& dst, std::int32_t dst_pos, const HostCache& src,
+                           std::int32_t src_pos) {
+    if (dst.dtype != src.dtype || dst.logical_capacity != src.logical_capacity ||
+        dst.geometry.kv_heads != src.geometry.kv_heads) {
+        throw std::invalid_argument("assign_cache_position: cache geometry mismatch");
+    }
+    const Geometry& geometry            = dst.geometry;
+    const std::int32_t logical_capacity = dst.logical_capacity;
+    for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
+        if (dst.dtype == DType::U8) {
+            for (std::int32_t byte = 0; byte < kNvfp4CodeWidth; ++byte) {
+                dst.k_u8[nvfp4_code_index(geometry, logical_capacity, head, dst_pos, byte)] =
+                    src.k_u8[nvfp4_code_index(geometry, logical_capacity, head, src_pos, byte)];
+                dst.v_u8[nvfp4_code_index(geometry, logical_capacity, head, dst_pos, byte)] =
+                    src.v_u8[nvfp4_code_index(geometry, logical_capacity, head, src_pos, byte)];
+            }
+            for (std::int32_t group = 0; group < kNvfp4Groups; ++group) {
+                dst.k_fp8[nvfp4_scale_index(geometry, logical_capacity, head, dst_pos, group)] =
+                    src.k_fp8[nvfp4_scale_index(geometry, logical_capacity, head, src_pos, group)];
+                dst.v_fp8[nvfp4_scale_index(geometry, logical_capacity, head, dst_pos, group)] =
+                    src.v_fp8[nvfp4_scale_index(geometry, logical_capacity, head, src_pos, group)];
+            }
+            continue;
+        }
+        if (dst.dtype == DType::I8) {
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                dst.k_i8[cache_index(geometry, logical_capacity, head, dst_pos, d)] =
+                    src.k_i8[cache_index(geometry, logical_capacity, head, src_pos, d)];
+                dst.v_i8[cache_index(geometry, logical_capacity, head, dst_pos, d)] =
+                    src.v_i8[cache_index(geometry, logical_capacity, head, src_pos, d)];
+            }
+            for (std::int32_t group = 0; group < kQuantGroups; ++group) {
+                dst.k_scale[scale_index(geometry, logical_capacity, head, dst_pos, group)] =
+                    src.k_scale[scale_index(geometry, logical_capacity, head, src_pos, group)];
+                dst.v_scale[scale_index(geometry, logical_capacity, head, dst_pos, group)] =
+                    src.v_scale[scale_index(geometry, logical_capacity, head, src_pos, group)];
+            }
+            continue;
+        }
+        for (std::int32_t d = 0; d < kHeadDim; ++d) {
+            dst.k_bf16[cache_index(geometry, logical_capacity, head, dst_pos, d)] =
+                src.k_bf16[cache_index(geometry, logical_capacity, head, src_pos, d)];
+            dst.v_bf16[cache_index(geometry, logical_capacity, head, dst_pos, d)] =
+                src.v_bf16[cache_index(geometry, logical_capacity, head, src_pos, d)];
+        }
+    }
+}
+
 int run_kv_compact_path_case(const Geometry& geometry, DType dtype, bool identity,
                              std::vector<std::int32_t> branch = {0, 3, 7},
                              std::int32_t prefix = 61) {
@@ -3786,6 +3834,80 @@ int run_kv_compact_path_case(const Geometry& geometry, DType dtype, bool identit
     return failures;
 }
 
+// Live OpenCode C=2 occupies lanes that are not compact-row order. Compact must
+// follow kv_table_rows[b], not blockIdx.x, or one chat's packed tree is folded
+// onto the other chat's pages.
+int run_kv_compact_path_batch_case(const Geometry& geometry, DType dtype) {
+    constexpr std::int32_t kWidth  = 12;
+    constexpr std::int32_t kBatch  = 2;
+    constexpr std::uint32_t kSeed  = 811u;
+    const std::int32_t prefixes[kBatch] = {61, 127};
+    const std::vector<std::int32_t> paths[kBatch] = {{0, 2, 6}, {0, 1, 3, 7}};
+    const std::int32_t table_rows[kBatch]         = {1, 0};
+    const std::int32_t max_prefix                 = prefixes[1];
+    const std::int32_t max_context                = max_prefix + kWidth + 3;
+    const std::size_t kv_column =
+        static_cast<std::size_t>(kHeadDim) * geometry.kv_heads;
+
+    std::vector<HostCache> populated;
+    populated.reserve(kBatch);
+    for (std::int32_t row = 0; row < kBatch; ++row) {
+        populated.push_back(make_cache(geometry, dtype, max_context, kSeed + 20u + 3u * row));
+    }
+    std::vector<std::int32_t> path_panel(static_cast<std::size_t>(kWidth) * kBatch, 0);
+    std::vector<std::int32_t> counts(kBatch, 0);
+    for (std::int32_t row = 0; row < kBatch; ++row) {
+        const std::vector<std::int32_t>& path = paths[row];
+        counts[static_cast<std::size_t>(row)] = static_cast<std::int32_t>(path.size());
+        for (std::size_t i = 0; i < path.size(); ++i) {
+            path_panel[static_cast<std::size_t>(row) * kWidth + i] = path[i];
+        }
+        std::vector<float> k =
+            make_bf16_values(kv_column * kWidth, kSeed + 1u + 5u * row, -0.25f, 0.25f);
+        std::vector<float> v =
+            make_bf16_values(kv_column * kWidth, kSeed + 2u + 5u * row, -1.0f, 1.0f);
+        std::vector<std::int32_t> positions(static_cast<std::size_t>(kWidth));
+        for (std::int32_t token = 0; token < kWidth; ++token) {
+            positions[static_cast<std::size_t>(token)] = prefixes[row] + token;
+        }
+        append_cache(populated[static_cast<std::size_t>(table_rows[row])], k, v, positions);
+    }
+
+    std::vector<HostCache> expected = populated;
+    for (std::int32_t row = 0; row < kBatch; ++row) {
+        const std::int32_t table = table_rows[row];
+        const std::int32_t count = counts[static_cast<std::size_t>(row)];
+        const HostCache& before  = populated[static_cast<std::size_t>(table)];
+        HostCache& after         = expected[static_cast<std::size_t>(table)];
+        for (std::int32_t i = 0; i < count; ++i) {
+            const std::int32_t src = prefixes[row] + path_panel[static_cast<std::size_t>(row) * kWidth +
+                                                               static_cast<std::size_t>(i)];
+            const std::int32_t dst = prefixes[row] + i;
+            assign_cache_position(after, dst, before, src);
+        }
+    }
+
+    BatchDeviceCache cache(populated, MappingPattern::Identity);
+    GuardedDeviceBuffer dpath(path_panel.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer dprefix(kBatch * sizeof(std::int32_t));
+    GuardedDeviceBuffer dcount(kBatch * sizeof(std::int32_t));
+    GuardedDeviceBuffer drows(kBatch * sizeof(std::int32_t));
+    dpath.copy_from_host(path_panel.data(), path_panel.size() * sizeof(std::int32_t));
+    dprefix.copy_from_host(prefixes, sizeof(prefixes));
+    dcount.copy_from_host(counts.data(), counts.size() * sizeof(std::int32_t));
+    drows.copy_from_host(table_rows, sizeof(table_rows));
+    Tensor tpath(dpath.data(), DType::I32, {kWidth, kBatch});
+    Tensor tprefix(dprefix.data(), DType::I32, {kBatch});
+    Tensor tcount(dcount.data(), DType::I32, {kBatch});
+    Tensor trows(drows.data(), DType::I32, {kBatch});
+    ops::gqa_kv_compact_path(cache.view(), trows, tprefix, tpath, tcount, nullptr);
+    cuda_synchronize();
+
+    const std::string label = std::string("gqa_kv_compact_path B=2 crossed rows ") + geometry.name +
+                              " " + cache_name(dtype) + " W=12";
+    return cache.verify(label, expected);
+}
+
 int run_kv_compact_path_cases() {
     int failures = 0;
     for (const Geometry& geometry : kGeometries) {
@@ -3793,6 +3915,9 @@ int run_kv_compact_path_cases() {
             failures += run_kv_compact_path_case(geometry, dtype, true);
             failures += run_kv_compact_path_case(geometry, dtype, false);
             failures += run_kv_compact_path_case(geometry, dtype, false, {0, 1, 3, 5}, 16);
+            if (dtype != DType::U8) {
+                failures += run_kv_compact_path_batch_case(geometry, dtype);
+            }
         }
     }
     return failures;
@@ -3893,6 +4018,131 @@ int run_tree_column0_matches_decode(const Geometry& geometry, DType dtype, std::
                             decode_out, attention_criterion(dtype));
 }
 
+// Product k=7 tree verify is W=12 chunked SmallT. Existing tree cases are B=1;
+// causal batch cases omit ancestor_mask. Greedy C=3 isolation can still emit the
+// target argmax from mixed logits; p-less SpecInfer samples the contaminated
+// support. Compact row is not the KV table row: C=2 can occupy tables {1,0}.
+int run_tree_verify_batch_isolation_case(const Geometry& geometry, DType dtype) {
+    constexpr std::int32_t kWidth = 12;
+    constexpr std::int32_t kBatch = 2;
+    constexpr std::uint32_t kSeed = 911u;
+    const std::int32_t prefixes[kBatch]   = {61, 127};
+    const std::int32_t table_rows[kBatch] = {1, 0};
+    const std::vector<std::int32_t> parents[kBatch] = {star_tree_parent(kWidth),
+                                                       chain_tree_parent(kWidth)};
+    const std::int32_t max_visible = prefixes[1] + kWidth;
+    const std::int32_t max_context = max_visible + 3;
+    const std::size_t q_column  = static_cast<std::size_t>(kHeadDim) * geometry.q_heads;
+    const std::size_t kv_column = static_cast<std::size_t>(kHeadDim) * geometry.kv_heads;
+    const std::size_t columns   = static_cast<std::size_t>(kWidth) * kBatch;
+
+    std::vector<float> q = make_bf16_values(q_column * columns, kSeed, -0.25f, 0.25f);
+    std::vector<float> k = make_bf16_values(kv_column * columns, kSeed + 1u, -0.25f, 0.25f);
+    std::vector<float> v = make_bf16_values(kv_column * columns, kSeed + 2u, -1.0f, 1.0f);
+    inject_codec_edges(geometry, static_cast<std::int32_t>(columns), k, v);
+
+    std::vector<std::int32_t> positions(columns, 0);
+    std::vector<std::int32_t> ancestor_mask(columns, 0);
+    for (std::int32_t row = 0; row < kBatch; ++row) {
+        const std::vector<std::int32_t> mask = ancestor_mask_from_parent(parents[row]);
+        for (std::int32_t token = 0; token < kWidth; ++token) {
+            const std::size_t at = static_cast<std::size_t>(row) * kWidth + token;
+            positions[at]        = prefixes[row] + token;
+            ancestor_mask[at]    = mask[static_cast<std::size_t>(token)];
+        }
+    }
+
+    std::vector<HostCache> initial;
+    initial.reserve(kBatch);
+    for (std::int32_t row = 0; row < kBatch; ++row) {
+        initial.push_back(make_cache(geometry, dtype, max_context, kSeed + 20u + 3u * row));
+    }
+    std::vector<HostCache> expected = initial;
+    std::vector<double> reference(q_column * columns, 0.0);
+    for (std::int32_t row = 0; row < kBatch; ++row) {
+        const std::int32_t table = table_rows[row];
+        std::vector<std::int32_t> row_positions(static_cast<std::size_t>(kWidth));
+        std::copy_n(positions.begin() + static_cast<std::ptrdiff_t>(row * kWidth), kWidth,
+                    row_positions.begin());
+        const std::vector<float> row_q = extract_request_columns(q, q_column, kWidth, row, kWidth);
+        const std::vector<float> row_k = extract_request_columns(k, kv_column, kWidth, row, kWidth);
+        const std::vector<float> row_v = extract_request_columns(v, kv_column, kWidth, row, kWidth);
+        append_cache(expected[static_cast<std::size_t>(table)], row_k, row_v, row_positions);
+        const std::vector<std::int32_t> row_mask(ancestor_mask.begin() + row * kWidth,
+                                                 ancestor_mask.begin() + (row + 1) * kWidth);
+        insert_request_columns(ideal_attention(row_q, expected[static_cast<std::size_t>(table)],
+                                               row_positions, row_mask, prefixes[row]),
+                               q_column, kWidth, row, reference);
+    }
+
+    BatchDeviceCache cache(initial, MappingPattern::Identity);
+    const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
+    const std::vector<std::uint16_t> k_bits = to_bf16_bits(k);
+    const std::vector<std::uint16_t> v_bits = to_bf16_bits(v);
+    GuardedDeviceBuffer dq(q_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dk(k_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dv(v_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dp(positions.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer dmask(ancestor_mask.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer dprefix(kBatch * sizeof(std::int32_t));
+    GuardedDeviceBuffer dtable(kBatch * sizeof(std::int32_t));
+    GuardedDeviceBuffer dout(q_bits.size() * sizeof(std::uint16_t));
+    dq.copy_from_host(q_bits.data(), q_bits.size() * sizeof(std::uint16_t));
+    dk.copy_from_host(k_bits.data(), k_bits.size() * sizeof(std::uint16_t));
+    dv.copy_from_host(v_bits.data(), v_bits.size() * sizeof(std::uint16_t));
+    dp.copy_from_host(positions.data(), positions.size() * sizeof(std::int32_t));
+    dmask.copy_from_host(ancestor_mask.data(), ancestor_mask.size() * sizeof(std::int32_t));
+    dprefix.copy_from_host(prefixes, sizeof(prefixes));
+    dtable.copy_from_host(table_rows, sizeof(table_rows));
+    std::vector<std::uint16_t> output_canary(q_bits.size(), kOutputCanary);
+    dout.copy_from_host(output_canary.data(), output_canary.size() * sizeof(std::uint16_t));
+
+    Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, kWidth, kBatch});
+    Tensor tk(dk.data(), DType::BF16, {kHeadDim, geometry.kv_heads, kWidth, kBatch});
+    Tensor tv(dv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, kWidth, kBatch});
+    Tensor tp(dp.data(), DType::I32, {kWidth, kBatch});
+    Tensor tmask(dmask.data(), DType::I32, {kWidth, kBatch});
+    Tensor tprefix(dprefix.data(), DType::I32, {kBatch});
+    Tensor ttable(dtable.data(), DType::I32, {kBatch});
+    Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, kWidth, kBatch});
+    const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(max_visible),
+                                             static_cast<std::uint32_t>(max_visible)};
+    const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
+        geometry.q_heads, dtype, envelope, kBatch, kWidth, kWidth, 1.0f, true);
+    GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
+    WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
+
+    ops::gqa_attention(tq, tk, tv, tp, Tensor{}, ttable, kAttentionScale, cache.view(), envelope,
+                       workspace, tout, nullptr, 1.0f, 1.0f, 8192, nullptr, tmask, tprefix);
+    cuda_synchronize();
+
+    const std::string label = std::string("gqa_attention tree-verify B=2 isolation ") +
+                              geometry.name + " " + cache_name(dtype) +
+                              " W=12 prefixes=61,127 tables=1,0 star+chain";
+    const std::vector<std::uint16_t> output_bits =
+        copy_from_guarded<std::uint16_t>(dout, q_bits.size());
+    int failures = verify_attention(label, bf16_bits_to_double(output_bits), reference,
+                                    attention_criterion(dtype));
+    failures += cache.verify(label, expected);
+    failures += verify_input(label + " q unchanged", dq, q_bits);
+    failures += verify_input(label + " k unchanged", dk, k_bits);
+    failures += verify_input(label + " v unchanged", dv, v_bits);
+    failures += verify_positions(label + " positions unchanged", dp, positions);
+    failures += verify_positions(label + " ancestor mask unchanged", dmask, ancestor_mask);
+    failures +=
+        verify_positions(label + " prefix lengths unchanged", dprefix,
+                         std::vector<std::int32_t>(prefixes, prefixes + kBatch));
+    failures += verify_positions(label + " table rows unchanged", dtable,
+                                 std::vector<std::int32_t>(table_rows, table_rows + kBatch));
+    failures += dout.verify_guards((label + " output").c_str());
+    failures += workspace_buffer.verify_guards((label + " workspace").c_str());
+    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+        std::cerr << label << ": workspace query/execution high-water mismatch\n";
+        ++failures;
+    }
+    return failures;
+}
+
 int run_tree_verify_cases(bool full) {
     int failures = 0;
     for (const Geometry& geometry : kGeometries) {
@@ -3902,6 +4152,9 @@ int run_tree_verify_cases(bool full) {
             if (full) {
                 failures += run_tree_verify_case(geometry, dtype, 12, chain_tree_parent(12), "chain");
                 failures += run_tree_verify_case(geometry, dtype, 12, star_tree_parent(12), "star");
+            }
+            if (dtype != DType::U8) {
+                failures += run_tree_verify_batch_isolation_case(geometry, dtype);
             }
             if (dtype == DType::U8 && (full || geometry.q_heads == 24)) {
                 failures += run_tree_column0_matches_decode(geometry, dtype, 16, 12);
