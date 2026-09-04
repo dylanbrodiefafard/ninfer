@@ -1178,6 +1178,9 @@ row result
 可见；terminal-only request 不产生 per-round event。一行结束、取消或在 speculative mode 中接受较短
 prefix，不改变其他行的 commit result。
 
+A round sampled with model stop tokens excluded may commit only through the first completed
+`</tool_call>`; `resolve_pending_batch` then folds that shorter prefix.
+
 Speculative backend 的 target GDN 使用 ReplaySSM 时，GPU graph 只读 lane 的 current state 并写
 Program-owned raw records，不推进 committed GDN state。CPU output preview 得到每行最终提交长度后，
 `resolve_pending_batch` 先用原始 `B` 行执行一次 all-layer Fold，再完成必要的 hidden/backend correction，

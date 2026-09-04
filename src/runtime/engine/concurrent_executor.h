@@ -1703,8 +1703,9 @@ private:
                 }
                 rejected[row] = 1;
                 enable_stop_suppression(request, lane);
-            } else if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
-                       (!decision.finished() && decision.accepted_tokens != count)) {
+            } else if (decision.accepted_tokens == 0 || decision.accepted_tokens > count) {
+                // Non-terminal accepted_tokens < count is a structured-output prefix
+                // (first completed tool call in a round sampled with model stops excluded).
                 throw std::logic_error("output policy returned an invalid licensed prefix");
             }
             accepted[row]       = decision.accepted_tokens;

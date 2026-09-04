@@ -38,6 +38,8 @@ struct ResolvedRequestOptions {
 };
 
 struct OutputDecision {
+    // Tokens to commit from the licensed round. A non-terminal decision may be a
+    // proper prefix (structured-output cut). Zero only with reject_generated_round.
     std::uint32_t accepted_tokens = 0;
     FinishReason finish_reason    = FinishReason::None;
     bool reject_generated_round   = false;

@@ -539,11 +539,15 @@ bool has_ambiguous_tool_marker(const DecoderState& state, bool tool_output_enabl
     return !state.tool_marker_pending.empty();
 }
 
+bool in_tool_region(const DecoderState& state, bool tool_output_enabled) {
+    return state.in_tool_call || has_ambiguous_tool_marker(state, tool_output_enabled);
+}
+
 bool model_stop_allowed(const DecoderState& state, bool raw, bool tool_output_enabled) {
     if (raw) { return true; }
     if (state.in_reasoning) { return false; }
     if (state.require_initial_content && !state.has_non_whitespace_content) { return false; }
-    return !state.in_tool_call && !has_ambiguous_tool_marker(state, tool_output_enabled);
+    return !in_tool_region(state, tool_output_enabled);
 }
 
 struct StopMatch {
@@ -848,6 +852,10 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
     impl_->preview_state = impl_->state;
     impl_->preview_output.clear();
 
+    const bool stops_blocked_at_start =
+        !model_stop_allowed(impl_->state, impl_->raw, impl_->tool_output_enabled);
+    bool saw_tool_region = in_tool_region(impl_->state, impl_->tool_output_enabled);
+
     const auto complete = [&](std::uint32_t count, FinishReason reason,
                               bool reject_generated_round = false) {
         impl_->preview_ready = true;
@@ -905,6 +913,18 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
             terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count,
                         impl_->tool_output_enabled);
             return complete(count, FinishReason::StopToken);
+        }
+
+        saw_tool_region =
+            saw_tool_region || in_tool_region(impl_->preview_state, impl_->tool_output_enabled);
+        // A round sampled with model stops excluded cannot emit <|im_end|> after
+        // </tool_call>. Extra-accepted tokens past that close reopen another call
+        // and keep suppression on until the output budget. Commit only through the
+        // first completing close; the next round samples with stops eligible.
+        if (stops_blocked_at_start && saw_tool_region &&
+            model_stop_allowed(impl_->preview_state, impl_->raw, impl_->tool_output_enabled) &&
+            index + 1 < tokens.size()) {
+            return complete(count, FinishReason::None);
         }
     }
 

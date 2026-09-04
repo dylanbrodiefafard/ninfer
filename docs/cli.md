@@ -215,8 +215,9 @@ are excluded from sampling while reasoning is open and after the reasoning termi
 non-whitespace answer content begins. This prevents a response from ending inside reasoning or
 with an empty post-reasoning answer. For tools-enabled prompts, they are also excluded while a
 `<tool_call>` opener is ambiguous or a tool call is incomplete, and become eligible after the
-matching `</tool_call>`. Other caller-added stop conditions remain active, and raw output does not
-apply this structured-output guard.
+matching `</tool_call>`. A speculative round sampled with those tokens excluded commits only
+through the first completing `</tool_call>`; the next round can then stop. Other caller-added stop
+conditions remain active, and raw output does not apply this structured-output guard.
 
 Run `./build/apps/ninfer --help` for the exact option contract.
 

@@ -84,6 +84,29 @@ void rollback_speculative_stats(RequestControl& request, const PendingCandidate&
     stats.live_draft_tokens = request.adaptive.live_k;
 }
 
+void trim_speculative_stats_to_commit(RequestControl& request, const PendingCandidate& pending,
+                                      std::uint32_t committed) {
+    if (committed == pending.produced || pending.drafted == 0) { return; }
+    SpeculativeStats& stats              = request.speculative_stats;
+    const std::uint32_t counted_accepted = pending.produced - 1U;
+    // Licensed tokens are A drafts plus one correction/bonus. A committed prefix
+    // shorter than `produced` has not reached that last token, so all `committed`
+    // tokens are drafts.
+    const std::uint32_t keep_accepted = committed;
+    if (keep_accepted >= counted_accepted) { return; }
+    const std::uint32_t drop = counted_accepted - keep_accepted;
+    if (stats.accepted_tokens < drop || counted_accepted > stats.accepted_per_position.size()) {
+        throw std::logic_error("partial speculative commit stats do not match pending round");
+    }
+    stats.accepted_tokens -= drop;
+    for (std::uint32_t index = keep_accepted; index < counted_accepted; ++index) {
+        if (stats.accepted_per_position[index] == 0) {
+            throw std::logic_error("partial speculative position stats underflow");
+        }
+        --stats.accepted_per_position[index];
+    }
+}
+
 void rollback_sampling_counts(const ops::SamplingConfig& sampling,
                               std::span<const TokenId> tokens) {
     if (sampling.temperature <= 0.0F || sampling.token_counts == nullptr) { return; }
@@ -1007,9 +1030,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
         const std::uint32_t committed = (cancelled[row] || retry) ? 0U : accepted_tokens[row];
         if ((cancelled[row] && accepted_tokens[row] != 0) ||
             (retry && (cancelled[row] || terminal[row] || accepted_tokens[row] != 0)) ||
-            (!cancelled[row] && !retry &&
-             (committed == 0 || committed > pending.produced ||
-                                 (!terminal[row] && committed != pending.produced)))) {
+            (!cancelled[row] && !retry && (committed == 0 || committed > pending.produced))) {
             throw std::logic_error("speculative pending row has an invalid committed prefix");
         }
         fold_rows[row] = ops::GdnReplayFoldRow{
@@ -1029,15 +1050,15 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                     [row * dflash_verify_width + i];
             }
         }
-        const bool partial_terminal =
-            !cancelled[row] && terminal[row] && committed < pending.produced;
+        const bool partial_commit =
+            !cancelled[row] && !retry && committed > 0 && committed < pending.produced;
         if (tree_fold && committed > 0) {
             hidden_selectors[row] = fold_rows[row].path[committed - 1U];
         } else {
             hidden_selectors[row] = static_cast<std::int32_t>(
-                partial_terminal ? committed - 1U : pending.produced - 1U);
+                partial_commit ? committed - 1U : pending.produced - 1U);
         }
-        needs_hidden_correction = needs_hidden_correction || partial_terminal;
+        needs_hidden_correction = needs_hidden_correction || partial_commit;
     }
 
     const auto tail_started = Clock::now();
@@ -1205,10 +1226,13 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
             sequence.ledger_frontier    = pending.base_S + committed;
             sequence.text_kv_valid      = sequence.execution_frontier;
             sequence.tail_hidden_valid  = true;
+            if (committed < pending.produced) {
+                trim_speculative_stats_to_commit(request, pending, committed);
+            }
 
             if (speculative_backend == SpeculativeBackend::Mtp) {
                 sequence.mtp_kv_valid = sequence.execution_frontier;
-                if (terminal[row]) {
+                if (terminal[row] || committed < pending.produced) {
                     sequence.mtp_draft_count = 0;
                 } else {
                     const std::int32_t next  = mtp_host_egress->next_extents[row];
