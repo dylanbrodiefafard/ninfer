@@ -6,7 +6,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <new>
 #include <string>
 #include <utility>
@@ -132,7 +134,7 @@ bool relax_oracle() { return std::getenv("NINFER_DFLASH_TEST_RELAX_ORACLE") != n
 
 int check_speculative(const ninfer::GenerationResult& result, const char* label);
 
-enum class OracleKind { TargetOnly, C1DFlash };
+enum class OracleKind { TargetOnly, StrictTargetOnly, C1DFlash };
 
 // Target-only: packed/T=1 numerical identity. First token must agree. A later greedy
 // flip fails the default run; NINFER_DFLASH_TEST_RELAX_ORACLE=1 prints it and continues.
@@ -142,7 +144,7 @@ enum class OracleKind { TargetOnly, C1DFlash };
 // C=1 fused SmallT+FP32; the Op guard is run_nvfp4_batched_matches_serial_fused.
 int check_tokens(const char* label, const ninfer::GenerationResult& result,
                  const std::vector<ninfer::TokenId>& want, OracleKind kind) {
-    const char* want_name = kind == OracleKind::TargetOnly ? "target-only" : "C=1 DFlash";
+    const char* want_name = kind == OracleKind::C1DFlash ? "C=1 DFlash" : "target-only";
     if (check_speculative(result, label) != 0) { return 1; }
     if (result.generated_token_ids.size() != want.size()) {
         std::cerr << label << " generated " << result.generated_token_ids.size()
@@ -189,6 +191,276 @@ int check_speculative(const ninfer::GenerationResult& result, const char* label)
         result.speculative.rounds == 0) {
         std::cerr << label << " did not execute speculative decode\n";
         return 1;
+    }
+    return 0;
+}
+
+int exercise_dflash_vision(const char* artifact) {
+    constexpr const char* label = "DFlash2 Vision p-less XAttention";
+    const auto read_fixture = [](const char* relative) {
+        const std::string path = std::string(NINFER_SOURCE_DIR) + relative;
+        std::ifstream input(path, std::ios::binary);
+        return std::vector<std::uint8_t>(std::istreambuf_iterator<char>(input), {});
+    };
+    const std::vector<std::uint8_t> image_bytes =
+        read_fixture("/examples/cli/media/visual_chart.png");
+    const std::vector<std::uint8_t> natural_bytes =
+        read_fixture("/examples/cli/media/natural_scene.png");
+    const std::vector<std::uint8_t> video_bytes =
+        read_fixture("/examples/cli/media/temporal_events.mp4");
+    if (image_bytes.empty() || natural_bytes.empty() || video_bytes.empty()) {
+        std::cerr << label << " could not read the deterministic media fixtures\n";
+        return 1;
+    }
+    const auto media_part = [](ninfer::MediaKind kind, const std::vector<std::uint8_t>& bytes,
+                               std::string media_type, std::string name) {
+        ninfer::MessagePart media;
+        media.kind              = ninfer::MessagePartKind::Media;
+        media.media.kind        = kind;
+        media.media.bytes       = bytes;
+        media.media.media_type  = std::move(media_type);
+        media.media.source_name = std::move(name);
+        return media;
+    };
+
+    const auto make_input = [&] {
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        message.parts.push_back(
+            media_part(ninfer::MediaKind::Image, image_bytes, "image/png", "visual_chart.png"));
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text,
+            .text = "读取图中的标题，数出红色圆形，并判断蓝色方块在绿色三角形的哪一侧。"
+                    "只输出：标题；数量；左侧或右侧。",
+            .media = {}});
+        ninfer::PromptInput input;
+        input.messages.push_back(std::move(message));
+        input.options.enable_thinking = false;
+        return input;
+    };
+    const auto make_mixed_multiturn_input = [&] {
+        ninfer::PromptInput input;
+        ninfer::ChatMessage system;
+        system.role = ninfer::ChatRole::System;
+        system.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text,
+            .text = "准确保留不同轮次媒体中的可见事实。",
+            .media = {}});
+        input.messages.push_back(std::move(system));
+        ninfer::ChatMessage image_turn;
+        image_turn.role = ninfer::ChatRole::User;
+        image_turn.parts.push_back(
+            media_part(ninfer::MediaKind::Image, natural_bytes, "image/png", "natural_scene.png"));
+        image_turn.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text,
+            .text = "请查看这幅场景，记住邮箱上的数字，暂时不要回答。",
+            .media = {}});
+        input.messages.push_back(std::move(image_turn));
+        ninfer::ChatMessage assistant;
+        assistant.role = ninfer::ChatRole::Assistant;
+        assistant.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text,
+            .text = "好的，我会保留图像中的邮箱数字。",
+            .media = {}});
+        input.messages.push_back(std::move(assistant));
+        ninfer::ChatMessage video_turn;
+        video_turn.role = ninfer::ChatRole::User;
+        video_turn.parts.push_back(media_part(ninfer::MediaKind::Video, video_bytes, "video/mp4",
+                                              "temporal_events.mp4"));
+        video_turn.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text,
+            .text = "把上一轮邮箱数字和视频末尾 END 数字用连字符连接。只输出连接结果。",
+            .media = {}});
+        input.messages.push_back(std::move(video_turn));
+        input.options.enable_thinking = false;
+        return input;
+    };
+    const auto make_text_input = [] {
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text,
+            .text = "只输出：TEXT-42",
+            .media = {}});
+        ninfer::PromptInput input;
+        input.messages.push_back(std::move(message));
+        input.options.enable_thinking = false;
+        return input;
+    };
+
+    ninfer::RequestOptions chart_greedy_options = greedy_options(24);
+    chart_greedy_options.stop.include_model_defaults = true;
+    ninfer::RequestOptions mixed_options = greedy_options(16);
+    mixed_options.stop.include_model_defaults = true;
+    std::vector<ninfer::TokenId> target_chart_tokens;
+    std::vector<ninfer::TokenId> target_mixed_tokens;
+    std::vector<ninfer::TokenId> target_text_tokens;
+    {
+        // The independent target-only Engine is deliberately destroyed before DFlash is loaded:
+        // both resident models do not fit concurrently on the supported 32 GiB device.
+        ninfer::EngineOptions target_options = base_engine_options(artifact);
+        target_options.enable_vision          = true;
+        target_options.max_context            = 2048;
+        target_options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(2048);
+        target_options.xattn_tau     = 0.9F;
+        target_options.xattn_min_len = 0;
+        if (std::getenv("NINFER_DFLASH_TEST_NO_GRAPH") != nullptr) {
+            target_options.use_cuda_graph = false;
+        }
+        ninfer::Engine target(target_options);
+        const ninfer::GenerationResult target_chart =
+            target.generate(target.prepare(make_input()), chart_greedy_options);
+        const ninfer::GenerationResult target_mixed =
+            target.generate(target.prepare(make_mixed_multiturn_input()), mixed_options);
+        const ninfer::GenerationResult target_text =
+            target.generate(target.prepare(make_text_input()), greedy_options(5));
+        if (!target_chart.prompt.has_media || !(target_chart.timings.vision_seconds > 0.0) ||
+            target_chart.content.find("731；3；左侧") == std::string::npos ||
+            !target_mixed.prompt.has_media || !(target_mixed.timings.vision_seconds > 0.0) ||
+            target_mixed.content.find("24-9") == std::string::npos) {
+            std::cerr << label << " target-only Vision oracle failed: chart='"
+                      << target_chart.content << "' mixed='" << target_mixed.content << "'\n";
+            return 1;
+        }
+        target_chart_tokens = target_chart.generated_token_ids;
+        target_mixed_tokens = target_mixed.generated_token_ids;
+        target_text_tokens  = target_text.generated_token_ids;
+    }
+
+    {
+        // Use the native packed-tree route (k=7/W=12), not the simpler short-chain route.
+        ninfer::EngineOptions options =
+            speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 7, 2);
+        options.enable_vision = true;
+        options.max_context   = 2048;
+        options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(2048);
+        // Force the XAttention production route at this short fixture length. The public default
+        // threshold remains 8192; this test is specifically its DFlash+Vision composition guard.
+        options.xattn_tau     = 0.9F;
+        options.xattn_min_len = 0;
+        if (std::getenv("NINFER_DFLASH_TEST_NO_GRAPH") != nullptr) {
+            options.use_cuda_graph = false;
+        }
+        ninfer::Engine engine(options);
+        if (const int result = check_dflash_load(engine); result != 0) { return result; }
+
+        const ninfer::GenerationResult greedy_chart =
+            engine.generate(engine.prepare(make_input()), chart_greedy_options);
+        if (check_tokens("DFlash2 Vision chart target parity", greedy_chart, target_chart_tokens,
+                         OracleKind::StrictTargetOnly) != 0) {
+            return 1;
+        }
+
+        ninfer::RequestOptions first_options = p_less_options(24, 12345);
+        first_options.stop.include_model_defaults = true;
+        const ninfer::GenerationResult result =
+            engine.generate(engine.prepare(make_input()), first_options);
+        if (!result.prompt.has_media || !(result.timings.vision_seconds > 0.0) ||
+            check_speculative(result, label) != 0 || result.speculative.drafted_tokens == 0 ||
+            result.speculative.accepted_tokens == 0 ||
+            result.content.find("NIFER VISION 731；3；左侧") == std::string::npos) {
+            std::cerr << label << " did not preserve the chart answer: content='" << result.content
+                      << "' media=" << result.prompt.has_media
+                      << " vision=" << result.timings.vision_seconds << '\n';
+            dump_speculative("  spec", result.speculative);
+            return 1;
+        }
+
+        ninfer::RequestOptions reuse_options = p_less_options(24, 12345);
+        reuse_options.execution.allow_prefix_reuse = true;
+        reuse_options.stop.include_model_defaults   = true;
+        const ninfer::GenerationResult reused =
+            engine.generate(engine.prepare(make_input()), reuse_options);
+        if (reused.generated_token_ids != result.generated_token_ids ||
+            reused.reused_prompt_tokens == 0 || reused.timings.vision_seconds != 0.0 ||
+            check_speculative(reused, label) != 0 || reused.speculative.accepted_tokens == 0) {
+            std::cerr << label << " did not restore the retained multimodal prefix: reused="
+                      << reused.reused_prompt_tokens << " vision=" << reused.timings.vision_seconds
+                      << '\n';
+            dump_tokens("  first", result.generated_token_ids);
+            dump_tokens("  reused", reused.generated_token_ids);
+            return 1;
+        }
+
+        const ninfer::GenerationResult text_oracle =
+            engine.generate(engine.prepare(make_text_input()), first_options);
+        auto vision_handle = engine.submit(engine.prepare(make_input()), first_options);
+        auto text_handle   = engine.submit(engine.prepare(make_text_input()), first_options);
+        const ninfer::GenerationResult batched_vision = vision_handle.wait();
+        const ninfer::GenerationResult batched_text   = text_handle.wait();
+        if (batched_vision.generated_token_ids != result.generated_token_ids ||
+            batched_text.generated_token_ids != text_oracle.generated_token_ids ||
+            check_speculative(batched_vision, label) != 0 ||
+            check_speculative(batched_text, label) != 0) {
+            std::cerr
+                << label
+                << " mixed text/Vision batch changed a row relative to sequential execution\n";
+            dump_tokens("  vision sequential", result.generated_token_ids);
+            dump_tokens("  vision batched", batched_vision.generated_token_ids);
+            dump_tokens("  text sequential", text_oracle.generated_token_ids);
+            dump_tokens("  text batched", batched_text.generated_token_ids);
+            return 1;
+        }
+        const ninfer::GenerationResult mixed =
+            engine.generate(engine.prepare(make_mixed_multiturn_input()), mixed_options);
+        if (!mixed.prompt.has_media || !(mixed.timings.vision_seconds > 0.0) ||
+            mixed.content.find("24-9") == std::string::npos ||
+            check_tokens("DFlash2 Vision mixed-media target parity", mixed, target_mixed_tokens,
+                         OracleKind::StrictTargetOnly) != 0) {
+            std::cerr << label << " failed the mixed multi-turn image/video oracle: content='"
+                      << mixed.content << "'\n";
+            return 1;
+        }
+        std::cout << "ok " << label << " content='" << result.content << "'\n" << std::flush;
+    }
+
+    {
+        // Five requested tokens leave k=3 after prefill. Under adaptive N=7 the persistent
+        // storage width is six, so W=4 exercises the compact strided-panel route at C=2.
+        ninfer::EngineOptions options =
+            adaptive_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 7, 2);
+        options.enable_vision = true;
+        options.max_context   = 2048;
+        options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(2048);
+        options.xattn_tau     = 0.9F;
+        options.xattn_min_len = 0;
+        if (std::getenv("NINFER_DFLASH_TEST_NO_GRAPH") != nullptr) {
+            options.use_cuda_graph = false;
+        }
+        ninfer::Engine engine(options);
+        if (const int result = check_dflash_load(engine); result != 0) { return result; }
+        const ninfer::RequestOptions short_options = greedy_options(5);
+        const ninfer::RuntimeStats before = engine.runtime_stats();
+        auto chart_handle = engine.submit(engine.prepare(make_input()), short_options);
+        auto text_handle  = engine.submit(engine.prepare(make_text_input()), short_options);
+        const ninfer::GenerationResult chart = chart_handle.wait();
+        const ninfer::GenerationResult text  = text_handle.wait();
+        (void)engine.memory_summary(); // Fence worker counter publication at this boundary.
+        const ninfer::RuntimeStats after  = engine.runtime_stats();
+        const std::uint64_t decode_rounds = after.decode_rounds - before.decode_rounds;
+        const std::uint64_t row_rounds    = after.decode_row_rounds - before.decode_row_rounds;
+        if (target_chart_tokens.size() < 5) {
+            std::cerr << label << " target-only chart oracle is shorter than five tokens\n";
+            return 1;
+        }
+        const std::vector<ninfer::TokenId> chart_oracle(target_chart_tokens.begin(),
+                                                        target_chart_tokens.begin() + 5);
+        if (target_text_tokens.size() != 5 ||
+            check_tokens("adaptive compact Vision chart target parity", chart, chart_oracle,
+                         OracleKind::StrictTargetOnly) != 0 ||
+            check_tokens("adaptive compact text target parity", text, target_text_tokens,
+                         OracleKind::StrictTargetOnly) != 0 ||
+            chart.speculative.rounds_per_draft.size() <= 3 ||
+            chart.speculative.rounds_per_draft[3] == 0 ||
+            text.speculative.rounds_per_draft.size() <= 3 ||
+            text.speculative.rounds_per_draft[3] == 0 || row_rounds <= decode_rounds) {
+            std::cerr << label << " adaptive compact C=2 did not execute k=3/W=4\n";
+            dump_speculative("  chart", chart.speculative);
+            dump_speculative("  text", text.speculative);
+            std::cerr << "  decode rounds=" << decode_rounds << " row rounds=" << row_rounds
+                      << '\n';
+            return 1;
+        }
     }
     return 0;
 }
@@ -410,6 +682,12 @@ int main() {
         std::cout << "skip: NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS is not set\n";
         return 77;
     }
+
+    if (std::getenv("NINFER_DFLASH_TEST_SKIP_VISION") == nullptr) {
+        std::cerr << "dflash_real: Vision-composed prefill and MRoPE decode\n";
+        if (const int result = exercise_dflash_vision(artifact); result != 0) { return result; }
+    }
+    if (std::getenv("NINFER_DFLASH_TEST_ONLY_VISION") != nullptr) { return 0; }
 
     if (std::getenv("NINFER_DFLASH_TEST_SKIP_ENTITLEMENT") == nullptr) {
         std::cerr << "dflash_real: chain-verify short-output Main KV entitlement\n";

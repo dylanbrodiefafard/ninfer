@@ -96,14 +96,15 @@ int q4_a16_conformance() {
 
     constexpr std::array kN3456K1152{
         a16(4),   a16(20),  a16(36),  a16(40),   a16(44),     a16(128),
-        a16(320), a16(324), a16(328), a16(1024), a16(131072),
+        a16(320), a16(324), a16(328), a16(1024), a16(1536),   a16(131072),
     };
     failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
                           {3456, 1152, 137U, Comparison::Sampled, false, kN3456K1152});
 
     constexpr std::array kN4304K1152{
         a16(4),  a16(8),   a16(12),  a16(16),  a16(20),  a16(24),   a16(28),
-        a16(32), a16(128), a16(320), a16(324), a16(328), a16(1024), a16(131072),
+        a16(32), a16(128), a16(320), a16(324), a16(328), a16(1024), a16(1536),
+        a16(131072),
     };
     failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
                           {4304, 1152, 139U, Comparison::Sampled, false, kN4304K1152});

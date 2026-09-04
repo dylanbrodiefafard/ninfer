@@ -40,8 +40,8 @@ __global__ void vision_pos_embed_add_d1152_warp_kernel(const __nv_bfloat162* tab
             hi += value.y * corner_weights[corner];
         }
         const __nv_bfloat162 residual = x[x_base + pair];
-        x[x_base + pair] =
-            __floats2bfloat162_rn(__low2float(residual) + lo, __high2float(residual) + hi);
+        const __nv_bfloat162 position = __floats2bfloat162_rn(lo, hi);
+        x[x_base + pair]              = __hadd2_rn(residual, position);
     }
 }
 
@@ -75,8 +75,8 @@ __launch_bounds__(Block) __global__
             hi += value.y * corner_weights[corner];
         }
         const __nv_bfloat162 residual = x[x_base + pair];
-        x[x_base + pair] =
-            __floats2bfloat162_rn(__low2float(residual) + lo, __high2float(residual) + hi);
+        const __nv_bfloat162 position = __floats2bfloat162_rn(lo, hi);
+        x[x_base + pair]              = __hadd2_rn(residual, position);
     }
 }
 
@@ -99,7 +99,8 @@ __global__ void vision_pos_embed_add_kernel(const __nv_bfloat16* table, const st
                             weights[control];
             }
         }
-        x[linear] = __float2bfloat16_rn(__bfloat162float(x[linear]) + position);
+        const __nv_bfloat16 staged_position = __float2bfloat16_rn(position);
+        x[linear]                         = __hadd_rn(x[linear], staged_position);
     }
 }
 

@@ -345,6 +345,12 @@ captures the five target residuals after completing layers `5, 19, 33, 47, 61` (
 all five draft layers. Decode appends only newly committed target features. Rejected query K/V is
 not context. There is no growing DFlash Full pool.
 
+For a multimodal prompt, capture occurs after token embeddings and Vision merger embeddings have
+been composed, so the companion receives the same selected target residuals as text-only prefill.
+The companion keeps absolute positions for its own context/proposal model. Target verification has
+a separate position panel and applies the request's saved `rope_delta`; cache writes remain at
+absolute token positions while Text RoPE follows the post-Vision MRoPE sequence.
+
 One propose block:
 
 1. Query rows are the anchor embedding plus seven MASK embeddings (id **248070**) at positions
@@ -413,8 +419,9 @@ ceiling; Engine `max_context` admits the complete rendered text-plus-media promp
 
 ## 11. Vision tower
 
-Patch rows are converted to BF16 and projected into `[1152,P]`. The runtime adds a bilinearly
-interpolated learned 48×48 position table.
+Patch rows are converted to BF16 and projected into `[1152,P]`. The bilinearly interpolated learned
+48×48 position value is cast to BF16 before the BF16 residual add, matching the checkpoint's
+explicit position-embedding cast boundary.
 
 Each of the 27 transformer blocks performs:
 

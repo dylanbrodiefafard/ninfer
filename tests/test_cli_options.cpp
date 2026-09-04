@@ -60,6 +60,14 @@ int main() {
     failures += check(!production.sampling.p_less && production.sampling.top_p == 0.5F,
                       "--no-p-less-sampling did not opt into the production sampler");
 
+    const ninfer::cli::Options dflash_vision =
+        parse({"ninfer", "model.ninfer", "--prompt", "hi", "--spec", "dflash",
+               "--draft-tokens", "3", "--vision"});
+    failures += check(dflash_vision.enable_vision &&
+                          dflash_vision.speculative.backend ==
+                              ninfer::SpeculativeBackend::DFlash,
+                      "CLI did not accept DFlash and Vision together");
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

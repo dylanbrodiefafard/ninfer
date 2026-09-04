@@ -73,6 +73,54 @@ int offset_case(std::int32_t count, std::int32_t delta_value, bool in_place) {
     return failures;
 }
 
+int offset_rows_case(std::int32_t width, std::int32_t rows, bool in_place) {
+    const auto count = static_cast<std::size_t>(width) * static_cast<std::size_t>(rows);
+    std::vector<std::int32_t> source(count);
+    std::vector<std::int32_t> deltas(static_cast<std::size_t>(rows));
+    std::vector<std::int32_t> expected(count);
+    for (std::int32_t row = 0; row < rows; ++row) {
+        deltas[static_cast<std::size_t>(row)] = 97 - 23 * row;
+        for (std::int32_t column = 0; column < width; ++column) {
+            const auto index = static_cast<std::size_t>(row) * static_cast<std::size_t>(width) +
+                               static_cast<std::size_t>(column);
+            source[index]   = 131072 + 7 * column + 101 * row;
+            expected[index] = source[index] + deltas[static_cast<std::size_t>(row)];
+        }
+    }
+
+    GuardedDeviceBuffer device_source(source.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_deltas(deltas.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_output(source.size() * sizeof(std::int32_t));
+    device_source.copy_from_host(source.data(), source.size() * sizeof(std::int32_t));
+    device_deltas.copy_from_host(deltas.data(), deltas.size() * sizeof(std::int32_t));
+    device_output.fill(0xcd);
+
+    Tensor source_tensor(device_source.data(), DType::I32, {width, rows});
+    Tensor deltas_tensor(device_deltas.data(), DType::I32, {rows});
+    Tensor output_tensor(device_output.data(), DType::I32, {width, rows});
+    Tensor& destination = in_place ? source_tensor : output_tensor;
+    ops::offset_i32_position_rows(source_tensor, deltas_tensor, destination, nullptr);
+    cuda_synchronize();
+
+    const std::string label = "offset_i32_position_rows T=" + std::to_string(width) +
+                              " B=" + std::to_string(rows) +
+                              (in_place ? " in-place" : " out-of-place");
+    int failures = verify_exact(
+        label.c_str(),
+        from_device<std::int32_t>(in_place ? device_source.data() : device_output.data(), count),
+        expected);
+    if (!in_place) {
+        failures += verify_exact((label + " preserves source").c_str(),
+                                 from_device<std::int32_t>(device_source.data(), count), source);
+    }
+    failures += verify_exact((label + " preserves deltas").c_str(),
+                             from_device<std::int32_t>(device_deltas.data(), deltas.size()), deltas);
+    failures += device_source.verify_guards((label + " source").c_str());
+    failures += device_deltas.verify_guards((label + " deltas").c_str());
+    if (!in_place) { failures += device_output.verify_guards((label + " destination").c_str()); }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -88,6 +136,9 @@ int main() {
     failures += offset_case(1, -17, false);
     failures += offset_case(6, 31, true);
     failures += offset_case(1024, -257, false);
+    failures += offset_rows_case(4, 1, false);
+    failures += offset_rows_case(12, 2, true);
+    failures += offset_rows_case(16, 8, false);
     std::cout << (failures ? "FAIL" : "OK") << " position\n";
     return failures ? 1 : 0;
 }

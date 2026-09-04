@@ -918,8 +918,10 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
                 "DFlash draft window must be in [1," +
                 std::to_string(kMaximumDFlashDraftTokens) + "]");
         }
-        if (options.enable_vision) {
-            throw std::invalid_argument("DFlash and Vision cannot be enabled together");
+        if (options.enable_vision &&
+            !Variant::supports_dflash_vision(options.model_id, options.weights_id)) {
+            throw std::invalid_argument(
+                "DFlash and Vision are not supported together by this target");
         }
         if constexpr (!DFlashConfig::tree_verify) {
             if (options.speculative.dflash_verify_width != 0 &&

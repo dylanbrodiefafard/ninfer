@@ -51,4 +51,28 @@ void fill_i32_positions(Tensor& positions, std::int32_t start, cudaStream_t stre
 void offset_i32_positions(const Tensor& source, const Tensor& delta, Tensor& destination,
                           cudaStream_t stream);
 
+/**
+ * Op: offset_i32_position_rows
+ *
+ * Math / indexing:
+ *   destination[i,b] = source[i,b] + deltas[b],
+ *   0 <= i < T, 0 <= b < B.
+ *
+ * Logical shapes:
+ *   source and destination are contiguous I32 matrices [T,B]; deltas is a contiguous I32 vector
+ *   [B].
+ *
+ * Numeric:
+ *   Callers provide values whose sums are representable by I32.
+ *
+ * Effects:
+ *   Writes the full destination. Source and destination may alias; deltas must not alias a written
+ *   destination element.
+ *
+ * Workspace:
+ *   None. The Op has no other state side effect.
+ */
+void offset_i32_position_rows(const Tensor& source, const Tensor& deltas, Tensor& destination,
+                              cudaStream_t stream);
+
 } // namespace ninfer::ops

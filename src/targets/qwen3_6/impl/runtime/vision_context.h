@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
@@ -40,15 +41,28 @@ struct VisionScheduleConfig {
     static constexpr float norm_eps          = VisionConfig::norm_epsilon;
 };
 
+// Target-private diagnostic boundary. Implementations must consume the tensor on the supplied
+// stream before returning because Vision workspace storage is intentionally reused between Ops.
+// The production path passes no sink and performs no device transfer or synchronization.
+class VisionTraceSink {
+public:
+    virtual ~VisionTraceSink() = default;
+    virtual void capture(std::string_view name, const Tensor& value, cudaStream_t stream) = 0;
+};
+
 class VisionContext {
 public:
     VisionContext(DeviceContext& device, const LoadedModelData& model);
 
     [[nodiscard]] static std::size_t output_transient_bytes(std::size_t merged_tokens);
     [[nodiscard]] static std::size_t workspace_bytes(const qwen3_6::VisionItemControl& item);
+    [[nodiscard]] static std::size_t workspace_bytes(std::size_t patches,
+                                                     std::size_t merged_tokens,
+                                                     std::size_t segments);
     [[nodiscard]] static std::size_t workspace_capacity_bytes(std::uint32_t max_merged_tokens,
                                                               std::uint32_t max_segments);
-    void encode(const VisionItemView& item, Tensor& output, WorkspaceArena& workspace) const;
+    void encode(const VisionItemView& item, Tensor& output, WorkspaceArena& workspace,
+                VisionTraceSink* trace = nullptr) const;
 
 private:
     struct BlockW {
@@ -100,14 +114,19 @@ public:
     [[nodiscard]] double elapsed_seconds() const;
 
 private:
+    void encode_batch();
+
     DeviceContext& device_;
     WorkspaceArena& workspace_;
     qwen3_6::PreparedPromptData& prompt_;
     const VisionPrefillPlan& plan_;
     runtime::TransientRegion transient_;
     VisionContext context_;
+    qwen3_6::VisionItemControl batch_control_;
     std::optional<std::uint32_t> active_item_;
     std::uint32_t final_item_ = 0;
+    bool aggregate_enabled_   = true;
+    bool batch_encoded_       = false;
     bool final_item_encoded_  = false;
     bool payload_released_    = false;
     std::vector<CudaEventTimer> timers_;

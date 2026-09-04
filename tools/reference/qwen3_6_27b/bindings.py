@@ -25,6 +25,8 @@ from tools.artifact import (
 
 MODEL_ID = "qwen3.6-27b"
 WEIGHTS_ID = "groupwise-int"
+QWEN3_8_MODEL_ID = "qwen3.8-27b"
+NVFP4_WEIGHTS_ID = "nvfp4"
 TOKENIZER_VOCAB_SIZE = 248077
 
 CONTIGUOUS = "contiguous-le-v1"
@@ -755,6 +757,149 @@ class ArtifactBinding:
         self.close()
 
 
+class VisionArtifactBinding:
+    """Vision-only binding for the supported Qwen3.8-27B/NVFP4 product artifact.
+
+    Qwen3.8 changes the Text and speculative inventories but retains the exact
+    groupwise Vision tensor contract. Keeping this diagnostic binding
+    Vision-only avoids pretending that the older complete Python Text model
+    implements Qwen3.8 NVFP4 execution.
+    """
+
+    def __init__(self, artifact: Artifact, *, owns_artifact: bool = False):
+        expected_identity = ArtifactIdentity(QWEN3_8_MODEL_ID, NVFP4_WEIGHTS_ID)
+        if artifact.identity != expected_identity:
+            raise BindingError(
+                f"artifact identity is {artifact.identity!r}; expected "
+                f"{expected_identity!r}"
+            )
+        expected_objects: tuple[_ExpectedObject, ...] = (
+            _RESOURCE_CONTRACT + _VISION_CONTRACT
+        )
+        actual_by_name = {obj.name: obj for obj in artifact.objects}
+        for expected in expected_objects:
+            actual = actual_by_name.get(expected.name)
+            if isinstance(expected, _ExpectedTensor):
+                signature = (
+                    expected.name,
+                    expected.shape,
+                    expected.format,
+                    expected.layout,
+                )
+                if not isinstance(actual, TensorObject) or (
+                    actual.name,
+                    actual.shape,
+                    actual.format,
+                    actual.layout,
+                ) != signature:
+                    raise BindingError(
+                        f"object {expected.name!r} does not match Vision tensor "
+                        f"signature {signature!r}"
+                    )
+            else:
+                signature = (expected.name, expected.encoding)
+                if not isinstance(actual, ResourceObject) or (
+                    actual.name,
+                    actual.encoding,
+                ) != signature:
+                    raise BindingError(
+                        f"object {expected.name!r} does not match frontend resource "
+                        f"signature {signature!r}"
+                    )
+
+        self._artifact = artifact
+        self._owns_artifact = owns_artifact
+        resources = {
+            obj.name: BoundResource(obj)
+            for obj in artifact.objects
+            if isinstance(obj, ResourceObject)
+            and any(obj.name == expected.name for expected in _RESOURCE_CONTRACT)
+        }
+        vision_names = {expected.name for expected in _VISION_CONTRACT}
+        blocks: dict[str, PhysicalBlock] = {}
+        tensors: list[PhysicalBlock] = []
+        for obj in artifact.objects:
+            if isinstance(obj, TensorObject) and obj.name in vision_names:
+                block = PhysicalBlock(len(tensors), obj, "vision")
+                tensors.append(block)
+                blocks[obj.name] = block
+        self.tensors = tuple(tensors)
+        self.frontend = FrontendResources(
+            resources["frontend/tokenizer.json"],
+            resources["frontend/tokenizer_config.json"],
+            resources["frontend/chat_template.jinja"],
+            resources["frontend/generation_config.json"],
+            resources["frontend/preprocessor_config.json"],
+            resources["frontend/video_preprocessor_config.json"],
+        )
+        vision_layers: list[VisionLayerBinding] = []
+        for layer in VISION_LAYERS:
+            prefix = f"vision/layers/{layer}/"
+            vision_layers.append(
+                VisionLayerBinding(
+                    index=layer,
+                    attention_qkv=blocks[prefix + "attention/qkv"],
+                    attention_qkv_bias=blocks[prefix + "attention/qkv_bias"],
+                    attention_output=blocks[prefix + "attention/output"],
+                    attention_output_bias=blocks[prefix + "attention/output_bias"],
+                    mlp_fc1=blocks[prefix + "mlp/fc1"],
+                    mlp_fc1_bias=blocks[prefix + "mlp/fc1_bias"],
+                    mlp_fc2=blocks[prefix + "mlp/fc2"],
+                    mlp_fc2_bias=blocks[prefix + "mlp/fc2_bias"],
+                    norm1_weight=blocks[prefix + "norm1/weight"],
+                    norm1_bias=blocks[prefix + "norm1/bias"],
+                    norm2_weight=blocks[prefix + "norm2/weight"],
+                    norm2_bias=blocks[prefix + "norm2/bias"],
+                )
+            )
+        self.vision = VisionBinding(
+            patch_embedding=blocks["vision/patch_embedding"],
+            patch_embedding_bias=blocks["vision/patch_embedding_bias"],
+            position_embedding=blocks["vision/position_embedding"],
+            layers=tuple(vision_layers),
+            merger=VisionMergerBinding(
+                fc1=blocks["vision/merger/fc1"],
+                fc1_bias=blocks["vision/merger/fc1_bias"],
+                fc2=blocks["vision/merger/fc2"],
+                fc2_bias=blocks["vision/merger/fc2_bias"],
+                norm_weight=blocks["vision/merger/norm/weight"],
+                norm_bias=blocks["vision/merger/norm/bias"],
+            ),
+        )
+
+    @classmethod
+    def open(cls, path: str | Path) -> "VisionArtifactBinding":
+        artifact = Artifact.open(path)
+        try:
+            return cls(artifact, owns_artifact=True)
+        except BaseException:
+            artifact.close()
+            raise
+
+    @property
+    def identity(self) -> ArtifactIdentity:
+        return self._artifact.identity
+
+    def payload(self, block: PhysicalBlock) -> memoryview:
+        return self._artifact.payload(block.descriptor)
+
+    def resource_bytes(self, resource: BoundResource) -> bytes:
+        return bytes(self._artifact.payload(resource.descriptor))
+
+    def blocks_for(self, *components: Component) -> tuple[PhysicalBlock, ...]:
+        return self.tensors if "vision" in components else ()
+
+    def close(self) -> None:
+        if self._owns_artifact:
+            self._artifact.close()
+
+    def __enter__(self) -> "VisionArtifactBinding":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
+
+
 __all__ = [
     "ArtifactBinding",
     "AxisView",
@@ -777,4 +922,5 @@ __all__ = [
     "VisionLayerBinding",
     "VisionMergerBinding",
     "WeightObject",
+    "VisionArtifactBinding",
 ]

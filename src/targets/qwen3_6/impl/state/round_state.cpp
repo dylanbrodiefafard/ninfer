@@ -197,6 +197,8 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
             add_tensor(builder, DType::I32, {dflash_width, batch}, "DFlash proposal ids");
         decode.proposal_positions =
             add_tensor(builder, DType::I32, {dflash_width, batch}, "DFlash proposal positions");
+        decode.target_rope_positions =
+            add_tensor(builder, DType::I32, {dflash_width, batch}, "DFlash target RoPE positions");
         decode.append_positions =
             add_tensor(builder, DType::I32, {dflash_width, batch}, "DFlash append positions");
         decode.append_counts = add_tensor(builder, DType::I32, {batch}, "DFlash append counts");
@@ -353,7 +355,9 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
         ingress_tensor(offsetof(DFlashDecodeIngress, text_kv_table_rows), DType::I32, {batch});
     dflash_kv_table_rows =
         ingress_tensor(offsetof(DFlashDecodeIngress, dflash_kv_table_rows), DType::I32, {batch});
-    lanes    = ingress_tensor(offsetof(DFlashDecodeIngress, lanes), DType::I32, {batch});
+    lanes = ingress_tensor(offsetof(DFlashDecodeIngress, lanes), DType::I32, {batch});
+    rope_deltas =
+        ingress_tensor(offsetof(DFlashDecodeIngress, rope_deltas), DType::I32, {batch});
     sampling = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) + offsetof(DFlashDecodeIngress, sampling));
     licensed_tokens =
@@ -367,6 +371,7 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     fold_path = egress_tensor(offsetof(DFlashDecodeEgress, fold_path), DType::I32, {width, batch});
     proposal_ids               = layout.proposal_ids.bind(backing);
     proposal_positions         = layout.proposal_positions.bind(backing);
+    target_rope_positions      = layout.target_rope_positions.bind(backing);
     append_positions           = layout.append_positions.bind(backing);
     append_counts              = layout.append_counts.bind(backing);
     draft_tokens               = layout.draft_tokens.bind(backing);

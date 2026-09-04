@@ -127,7 +127,7 @@ std::string usage_text(const char* argv0) {
            "       [--no-p-less-sampling]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking]\n"
-           "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
+           "       [--reasoning-effort low|medium|xhigh]\n"
            "       [--vision] [--no-cuda-graph] [--capture-context-checkpoint]\n"
            "       [--context-checkpoints off|a,b,c]\n"
            "\n"
@@ -294,9 +294,6 @@ Options parse_options(int argc, char** argv) {
     validate_sparse_attn_flags(options.kv_cache, options.sage_attn, options.keep_frac,
                                options.xattn_tau);
     product::validate_speculative_cli_options(options.speculative);
-    if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
-        throw std::invalid_argument("--spec dflash cannot be combined with --vision");
-    }
     if (!options.enable_thinking && options.reasoning_effort) {
         throw std::invalid_argument("--reasoning-effort cannot be combined with --no-thinking");
     }

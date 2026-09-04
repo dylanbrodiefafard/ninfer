@@ -24,6 +24,15 @@ void require_i32_scalar(const Tensor& tensor, const char* name) {
     }
 }
 
+void require_i32_matrix(const Tensor& tensor, const char* name) {
+    if (tensor.dtype != DType::I32 || tensor.ne[0] <= 0 || tensor.ne[1] <= 0 ||
+        tensor.ne[2] != 1 || tensor.ne[3] != 1 || !tensor.is_contiguous() ||
+        tensor.data == nullptr) {
+        throw std::invalid_argument(std::string(name) +
+                                    " must be a non-empty contiguous I32 matrix");
+    }
+}
+
 } // namespace
 
 void fill_i32_positions(Tensor& positions, std::int32_t start, cudaStream_t stream) {
@@ -46,6 +55,26 @@ void offset_i32_positions(const Tensor& source, const Tensor& delta, Tensor& des
         throw std::invalid_argument("offset_i32_positions: delta must not alias destination");
     }
     detail::offset_i32_positions_launch(source, delta, destination, stream);
+}
+
+void offset_i32_position_rows(const Tensor& source, const Tensor& deltas, Tensor& destination,
+                              cudaStream_t stream) {
+    require_i32_matrix(source, "offset_i32_position_rows source");
+    require_i32_vector(deltas, "offset_i32_position_rows deltas");
+    require_i32_matrix(destination, "offset_i32_position_rows destination");
+    if (source.ne[0] != destination.ne[0] || source.ne[1] != destination.ne[1]) {
+        throw std::invalid_argument(
+            "offset_i32_position_rows: source and destination shapes differ");
+    }
+    if (deltas.ne[0] != source.ne[1]) {
+        throw std::invalid_argument(
+            "offset_i32_position_rows: delta count must equal the matrix row count");
+    }
+    if (deltas.data == destination.data) {
+        throw std::invalid_argument(
+            "offset_i32_position_rows: deltas must not alias destination");
+    }
+    detail::offset_i32_position_rows_launch(source, deltas, destination, stream);
 }
 
 } // namespace ninfer::ops

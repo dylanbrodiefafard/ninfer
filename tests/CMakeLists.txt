@@ -133,6 +133,13 @@ ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
   LIBRARIES ninfer_engine ninfer_core)
 target_include_directories(ninfer_qwen3_6_runtime_mechanisms_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+ninfer_add_test(ninfer_qwen3_6_dflash_vision_capability_test
+  SOURCES targets/qwen3_6/test_dflash_vision_capability.cpp
+  LIBRARIES ninfer_engine CUDA::cudart)
+target_include_directories(ninfer_qwen3_6_dflash_vision_capability_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_35b_a3b/export)
 ninfer_add_test(ninfer_qwen3_6_adaptive_draft_test
   SOURCES targets/qwen3_6/test_adaptive_draft.cpp)
 target_include_directories(ninfer_qwen3_6_adaptive_draft_test PRIVATE
@@ -158,6 +165,7 @@ ninfer_add_test(ninfer_qwen3_6_27b_context_checkpoint_real_test
 set_tests_properties(ninfer_qwen3_6_27b_context_checkpoint_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_8_27b_dflash_real_test
   SOURCES targets/qwen3_6_27b/test_engine_dflash_real.cpp
+  NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_8_27b_dflash_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_8_27b_mtp_nvfp4_real_test
@@ -173,6 +181,22 @@ target_include_directories(ninfer_qwen3_6_27b_load_plan_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
 target_link_libraries(ninfer_qwen3_6_27b_load_plan_test PRIVATE CUDA::cudart)
 set_tests_properties(ninfer_qwen3_6_27b_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# Opt-in target diagnostic used by tools/parity/qwen3_6_27b/vision.py. It observes the exact
+# production Vision schedule at every material numerical boundary and therefore is built with the
+# tests, but it is not a standalone CTest (the Python driver supplies an artifact, prompt, and
+# output directory).
+add_executable(ninfer_qwen3_8_27b_vision_trace
+  targets/qwen3_6_27b/vision_trace_real.cpp)
+target_include_directories(ninfer_qwen3_8_27b_vision_trace PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/third_party
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+target_link_libraries(ninfer_qwen3_8_27b_vision_trace PRIVATE
+  ninfer_engine ninfer_product_prompt_input ninfer_artifact ninfer_core CUDA::cudart)
 ninfer_add_test(ninfer_qwen3_6_35b_a3b_real_test
   SOURCES targets/qwen3_6_35b_a3b/test_engine_real.cpp
   LIBRARIES ninfer_engine)

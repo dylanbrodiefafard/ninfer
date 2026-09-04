@@ -25,9 +25,10 @@ buffer are not allocated, and media
 requests and token-count requests fail with HTTP 400 `vision_disabled`. Add `--vision` when the
 server must accept image or video input. Speculative residency is likewise frozen by
 `--spec mtp|dflash` and `--draft-tokens`; omitting `--spec` loads neither backend.
-`--lm-head-draft` additionally loads the optimized proposal head. DFlash is text-only: Qwen3.8-27B
-DFlash2 when `dflash/` is present, and it cannot be combined with
-`--vision`. On Qwen3.8-27B, DFlash2 uses paper-accurate chain verify (`W=k+1`); on RTX 5090,
+`--lm-head-draft` additionally loads the optimized proposal head. Qwen3.8-27B DFlash2 is available
+when `dflash/` is present and can be combined with `--vision`; the text-only companion consumes
+Vision-composed target hidden features. Its default verifier is chain `W=k+1` for `k<=5`,
+packed-tree `W=12` for `k` in `{6,7}`, and two-block chain `W=k+1` for `k>=8`; on RTX 5090,
 `--spec dflash --draft-tokens 4 --lm-head-draft` is the measured speed recommendation.
 A later request cannot enable a capability omitted at startup.
 
@@ -532,7 +533,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; 35B DFlash `1..15`; 3.8 DFlash2 `1..11` | unset |
 | `--adaptive-draft` | pick live draft K from host EWMA; requires `--spec mtp\|dflash` | off |
-| `--dflash-verify-width N` | DFlash verify width `2..16`; chain-only targets require `W=k+1`. Qwen3.8 DFlash2 defaults to chain `W=k+1` for `k<=5` and packed-tree `W=12` for `k` in `{6,7}` | auto |
+| `--dflash-verify-width N` | DFlash verify width `2..16`; chain-only targets require `W=k+1`. Qwen3.8 DFlash2 defaults to chain `W=k+1` for `k<=5`, packed-tree `W=12` for `k` in `{6,7}`, and two-block chain `W=k+1` for `k>=8` | auto |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--vision` | enable media input and load Vision GPU allocations | off |

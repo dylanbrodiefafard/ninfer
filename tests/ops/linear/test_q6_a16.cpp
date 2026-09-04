@@ -45,7 +45,7 @@ int q6_a16_conformance() {
 
     constexpr std::array kN1152K1536Large{
         a16(100), a16(704), a16(708),  a16(828),  a16(832),  a16(836),  a16(896),    a16(900),
-        a16(960), a16(964), a16(1024), a16(1028), a16(1088), a16(1092), a16(131072),
+        a16(960), a16(964), a16(1024), a16(1028), a16(1088), a16(1092), a16(1536),   a16(131072),
     };
     failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6g64_f16s_weight,
                           {1152, 1536, 197U, Comparison::Sampled, false, kN1152K1536Large});

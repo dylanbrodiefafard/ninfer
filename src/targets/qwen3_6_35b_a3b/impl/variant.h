@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6_35b_a3b::detail {
@@ -34,6 +35,11 @@ struct Variant {
     static constexpr std::uint32_t maximum_context             = kNativeContext;
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
     static constexpr std::int32_t draft_head_rows              = 131072;
+
+    [[nodiscard]] static constexpr bool supports_dflash_vision(
+        std::string_view, std::string_view) {
+        return false;
+    }
 
     [[nodiscard]] static std::vector<GraphExecutionProfile>
     ordinary_graph_profiles(std::uint32_t capacity);

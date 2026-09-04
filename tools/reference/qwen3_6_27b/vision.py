@@ -160,9 +160,19 @@ class VisionEncoder:
 
         vision = self.binding.vision
         started = time.perf_counter()
-        x = combined_pixels.to(device=self.device, dtype=torch.bfloat16)
+        combined_pixels = combined_pixels.to(device=self.device, dtype=torch.float32)
+        if tap:
+            tap("input/patch_f32", combined_pixels)
+        x = combined_pixels.to(dtype=torch.bfloat16)
+        if tap:
+            tap("input/patch_bf16", x)
         weight = self._weight(vision.patch_embedding)
-        x = add_bias(linear(x, weight), self._weight(vision.patch_embedding_bias))
+        x = linear(x, weight)
+        if tap:
+            tap("patch/linear", x)
+        x = add_bias(x, self._weight(vision.patch_embedding_bias))
+        if tap:
+            tap("patch/bias", x)
         del weight
         position = interpolate_position_embedding(
             self._weight(vision.position_embedding), combined_grid
@@ -171,65 +181,109 @@ class VisionEncoder:
         pos_ids = vision_position_ids(combined_grid)
         cu_seqlens = vision_cu_seqlens(combined_grid)
         if tap:
-            tap("patch_embed", x)
+            tap("patch/position", x)
 
         for layer in vision.layers:
+            prefix = f"block_{layer.index:02d}/"
             h = layer_norm(
                 x,
                 self._weight(layer.norm1_weight),
                 self._weight(layer.norm1_bias),
             )
+            if tap:
+                tap(prefix + "norm1", h)
             weight = self._weight(layer.attention_qkv)
-            qkv = add_bias(linear(h, weight), self._weight(layer.attention_qkv_bias))
+            qkv = linear(h, weight)
+            if tap:
+                tap(prefix + "qkv_linear", qkv)
+            qkv = add_bias(qkv, self._weight(layer.attention_qkv_bias))
+            if tap:
+                tap(prefix + "qkv_bias", qkv)
             del weight, h
             qkv = qkv.reshape(-1, 3, VISION_CFG.heads, VISION_CFG.head_dim)
             q, k, v = qkv.unbind(1)
             q, k = apply_vision_rope(q, k, pos_ids)
+            if tap:
+                tap(prefix + "q_rope", q)
+                tap(prefix + "k_rope", k)
+                tap(prefix + "value", v)
             attended = vision_attention(q, k, v, cu_seqlens).reshape(
                 -1, VISION_CFG.hidden
             )
+            if tap:
+                tap(prefix + "attention", attended)
             del qkv, q, k, v
             weight = self._weight(layer.attention_output)
-            projected = add_bias(
-                linear(attended, weight), self._weight(layer.attention_output_bias)
-            )
+            projected = linear(attended, weight)
+            if tap:
+                tap(prefix + "projection_linear", projected)
+            projected = add_bias(projected, self._weight(layer.attention_output_bias))
+            if tap:
+                tap(prefix + "projection_bias", projected)
             del weight, attended
             x = residual_add(x, projected)
+            if tap:
+                tap(prefix + "attention_residual", x)
             h = layer_norm(
                 x,
                 self._weight(layer.norm2_weight),
                 self._weight(layer.norm2_bias),
             )
+            if tap:
+                tap(prefix + "norm2", h)
             weight = self._weight(layer.mlp_fc1)
-            h = gelu(
-                add_bias(linear(h, weight), self._weight(layer.mlp_fc1_bias)),
-                approximate=True,
-            )
+            h = linear(h, weight)
+            if tap:
+                tap(prefix + "fc1_linear", h)
+            h = add_bias(h, self._weight(layer.mlp_fc1_bias))
+            if tap:
+                tap(prefix + "fc1_bias", h)
+            h = gelu(h, approximate=True)
+            if tap:
+                tap(prefix + "gelu", h)
             del weight
             weight = self._weight(layer.mlp_fc2)
-            h = add_bias(linear(h, weight), self._weight(layer.mlp_fc2_bias))
+            h = linear(h, weight)
+            if tap:
+                tap(prefix + "fc2_linear", h)
+            h = add_bias(h, self._weight(layer.mlp_fc2_bias))
+            if tap:
+                tap(prefix + "fc2_bias", h)
             del weight
             x = residual_add(x, h)
-            if tap and layer.index in {0, 13, 26}:
-                tap(f"block_{layer.index:02d}", x)
+            if tap:
+                tap(prefix + "mlp_residual", x)
 
         merger = vision.merger
         x = layer_norm(
             x,
             self._weight(merger.norm_weight),
             self._weight(merger.norm_bias),
-        ).reshape(-1, VISION_CFG.merger_hidden)
-        weight = self._weight(merger.fc1)
-        x = gelu(
-            add_bias(linear(x, weight), self._weight(merger.fc1_bias)),
-            approximate=False,
         )
+        if tap:
+            tap("merger/norm", x)
+        x = x.reshape(-1, VISION_CFG.merger_hidden)
+        if tap:
+            tap("merger/grouped", x)
+        weight = self._weight(merger.fc1)
+        x = linear(x, weight)
+        if tap:
+            tap("merger/fc1_linear", x)
+        x = add_bias(x, self._weight(merger.fc1_bias))
+        if tap:
+            tap("merger/fc1_bias", x)
+        x = gelu(x, approximate=False)
+        if tap:
+            tap("merger/gelu", x)
         del weight
         weight = self._weight(merger.fc2)
-        x = add_bias(linear(x, weight), self._weight(merger.fc2_bias))
+        x = linear(x, weight)
+        if tap:
+            tap("merger/fc2_linear", x)
+        x = add_bias(x, self._weight(merger.fc2_bias))
         del weight
         if tap:
-            tap("merger", x)
+            tap("merger/fc2_bias", x)
         if x.shape != (llm_tokens, VISION_CFG.out_hidden):
             raise RuntimeError(
                 f"vision merger returned {tuple(x.shape)}, expected "
