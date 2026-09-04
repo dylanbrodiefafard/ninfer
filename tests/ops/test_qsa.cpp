@@ -275,11 +275,14 @@ int append_codec_and_attention_case() {
     auto dselected = to_device(selected);
     auto dcount = to_device(count);
     GuardedDeviceBuffer dout(static_cast<std::size_t>(256) * 24 * sizeof(std::uint16_t));
+    GuardedDeviceBuffer attention_workspace(ops::qsa_selected_attention_workspace_bytes());
     Tensor qt(dq.p, DType::BF16, {256, 24, 1});
-    Tensor st(dselected.p, DType::I32, {ops::kQsaSelectedCapacity, 1});
+    Tensor st(dselected.p, DType::I32, {2, 1});
     Tensor ct(dcount.p, DType::I32, {1});
     Tensor ot(dout.data(), DType::BF16, {256, 24, 1});
-    ops::qsa_selected_attention(qt, st, ct, state_view, ot, nullptr);
+    Tensor attention_workspace_t(attention_workspace.data(), DType::U8,
+                                 {static_cast<int>(attention_workspace.bytes())});
+    ops::qsa_selected_attention(qt, st, ct, state_view, ot, attention_workspace_t, nullptr);
     cuda_synchronize();
     const auto actual = from_device_bf16(dout.data(), static_cast<std::size_t>(256) * 24);
     std::vector<double> expected(actual.size());
@@ -309,6 +312,7 @@ int append_codec_and_attention_case() {
     failures += verify_pointwise("qsa selected attention decoded FP64 oracle", actual, expected,
                                  PointwiseCriterion{0.02, 0.005});
     failures += dout.verify_guards("qsa selected attention out");
+    failures += attention_workspace.verify_guards("qsa selected attention workspace");
     return failures;
 }
 
@@ -383,6 +387,247 @@ int selector_ceiling_and_permutation_case() {
     failures += dselected.verify_guards("qsa selected ids");
     failures += dcount.verify_guards("qsa selected count");
     failures += workspace.verify_guards("qsa selector workspace");
+    return failures;
+}
+
+int selector_boundary_ties_case() {
+    constexpr std::array<int, 7> lengths{2047, 2048, 2049, 2050, 2051, 2052, 2053};
+    constexpr int width = static_cast<int>(lengths.size());
+    StateFixture state(ops::kQsaMaximumTokens);
+    state.raw_keys.fill(0);
+    state.positions.fill(0);
+
+    std::vector<float> query(static_cast<std::size_t>(128) * 4 * width, 0.0F);
+    std::vector<float> norm(128, 0.0F);
+    std::vector<std::int32_t> query_ids;
+    std::vector<std::int32_t> visible;
+    std::vector<std::int32_t> offsets{0};
+    for (int length : lengths) {
+        query_ids.push_back(length - 1);
+        for (int id = 0; id < length; ++id) { visible.push_back(id); }
+        offsets.push_back(static_cast<std::int32_t>(visible.size()));
+    }
+    auto dquery = to_device_bf16(query);
+    auto dnorm = to_device_f32(norm);
+    auto dquery_ids = to_device(query_ids);
+    auto dvisible = to_device(visible);
+    auto doffsets = to_device(offsets);
+    GuardedDeviceBuffer dselected(static_cast<std::size_t>(ops::kQsaSelectedCapacity) * width *
+                                  sizeof(std::int32_t));
+    GuardedDeviceBuffer dcount(width * sizeof(std::int32_t));
+    GuardedDeviceBuffer workspace(ops::qsa_index_select_workspace_bytes(width));
+    Tensor query_t(dquery.p, DType::BF16, {128, 4, width});
+    Tensor query_ids_t(dquery_ids.p, DType::I32, {width});
+    Tensor visible_t(dvisible.p, DType::I32, {static_cast<int>(visible.size())});
+    Tensor offsets_t(doffsets.p, DType::I32, {width + 1});
+    Tensor norm_t(dnorm.p, DType::FP32, {128});
+    Tensor selected_t(dselected.data(), DType::I32, {ops::kQsaSelectedCapacity, width});
+    Tensor count_t(dcount.data(), DType::I32, {width});
+    Tensor workspace_t(workspace.data(), DType::U8, {static_cast<int>(workspace.bytes())});
+    auto state_view = state.view();
+    ops::qsa_index_select(query_t, state_view, query_ids_t, visible_t, offsets_t, norm_t, norm_t,
+                          selected_t, count_t, workspace_t, nullptr);
+    cuda_synchronize();
+
+    const auto actual_count = from_device<std::int32_t>(dcount.data(), width);
+    const auto actual = from_device<std::int32_t>(
+        dselected.data(), static_cast<std::size_t>(ops::kQsaSelectedCapacity) * width);
+    int failures = 0;
+    for (int column = 0; column < width; ++column) {
+        const int length = lengths[static_cast<std::size_t>(column)];
+        const int expected_count = length <= 2051 ? length : 2048 + (length & 3);
+        if (actual_count[static_cast<std::size_t>(column)] != expected_count) { ++failures; }
+        const std::size_t base = static_cast<std::size_t>(ops::kQsaSelectedCapacity) * column;
+        for (int i = 0; i < expected_count; ++i) {
+            const int expected_id = i < 2048 ? i : length - (length & 3) + (i - 2048);
+            if (actual[base + static_cast<std::size_t>(i)] != expected_id) { ++failures; }
+        }
+        for (int i = expected_count; i < ops::kQsaSelectedCapacity; ++i) {
+            if (actual[base + static_cast<std::size_t>(i)] != -1) { ++failures; }
+        }
+    }
+    if (failures != 0) { std::cerr << "FAIL: qsa selector 2047..2053 tie boundaries\n"; }
+    failures += dselected.verify_guards("qsa boundary selected ids");
+    failures += dcount.verify_guards("qsa boundary selected count");
+    failures += workspace.verify_guards("qsa boundary selector workspace");
+    return failures;
+}
+
+int selector_score_order_case() {
+    constexpr int capacity = 8;
+    StateFixture state(capacity);
+    std::vector<float> keys(static_cast<std::size_t>(128) * capacity);
+    for (int id = 0; id < capacity; ++id) {
+        const float value = id < 4 ? -1.0F : 1.0F;
+        std::fill_n(keys.begin() + static_cast<std::size_t>(128) * id, 128, value);
+    }
+    round_to_bf16(keys);
+    std::vector<std::uint16_t> key_bits(keys.size());
+    for (std::size_t i = 0; i < keys.size(); ++i) { key_bits[i] = f32_to_bf16(keys[i]); }
+    state.raw_keys.copy_from_host(key_bits.data(), key_bits.size() * sizeof(std::uint16_t));
+    state.positions.fill(0);
+
+    std::vector<float> query(static_cast<std::size_t>(128) * 4, 1.0F);
+    round_to_bf16(query);
+    const std::vector<float> norm(128, 1.0F);
+    const std::vector<std::int32_t> query_ids{7};
+    const std::vector<std::int32_t> visible{0, 1, 2, 3, 4, 5, 6, 7};
+    const std::vector<std::int32_t> offsets{0, 8};
+    auto dquery = to_device_bf16(query);
+    auto dnorm = to_device_f32(norm);
+    auto dquery_ids = to_device(query_ids);
+    auto dvisible = to_device(visible);
+    auto doffsets = to_device(offsets);
+    GuardedDeviceBuffer dselected(static_cast<std::size_t>(ops::kQsaSelectedCapacity) *
+                                  sizeof(std::int32_t));
+    GuardedDeviceBuffer dcount(sizeof(std::int32_t));
+    GuardedDeviceBuffer workspace(ops::qsa_index_select_workspace_bytes(1));
+    Tensor query_t(dquery.p, DType::BF16, {128, 4, 1});
+    Tensor query_ids_t(dquery_ids.p, DType::I32, {1});
+    Tensor visible_t(dvisible.p, DType::I32, {8});
+    Tensor offsets_t(doffsets.p, DType::I32, {2});
+    Tensor norm_t(dnorm.p, DType::FP32, {128});
+    Tensor selected_t(dselected.data(), DType::I32, {ops::kQsaSelectedCapacity, 1});
+    Tensor count_t(dcount.data(), DType::I32, {1});
+    Tensor workspace_t(workspace.data(), DType::U8, {static_cast<int>(workspace.bytes())});
+    auto state_view = state.view();
+    ops::qsa_index_select(query_t, state_view, query_ids_t, visible_t, offsets_t, norm_t, norm_t,
+                          selected_t, count_t, workspace_t, nullptr);
+    cuda_synchronize();
+
+    const auto actual_count = from_device<std::int32_t>(dcount.data(), 1);
+    const auto actual = from_device<std::int32_t>(dselected.data(), ops::kQsaSelectedCapacity);
+    int failures = verify_exact("qsa selector distinct-score count", actual_count,
+                                std::vector<std::int32_t>{8});
+    constexpr std::array<std::int32_t, 8> expected{4, 5, 6, 7, 0, 1, 2, 3};
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        if (actual[i] != expected[i]) { ++failures; }
+    }
+    for (int i = static_cast<int>(expected.size()); i < ops::kQsaSelectedCapacity; ++i) {
+        if (actual[static_cast<std::size_t>(i)] != -1) { ++failures; }
+    }
+    if (failures != 0) { std::cerr << "FAIL: qsa selector distinct-score block ordering\n"; }
+    failures += dselected.verify_guards("qsa score-order selected ids");
+    failures += dcount.verify_guards("qsa score-order selected count");
+    failures += workspace.verify_guards("qsa score-order selector workspace");
+    return failures;
+}
+
+int selected_attention_capacity_case() {
+    constexpr int capacity = ops::kQsaSelectedCapacity;
+    StateFixture state(capacity);
+    std::vector<std::uint8_t> k_codes(state.k_codes.bytes(), 0);
+    std::vector<std::uint8_t> v_codes(state.v_codes.bytes(), 0);
+    std::vector<std::uint8_t> k_scales(state.k_scales.bytes(), 0x38U);
+    std::vector<std::uint8_t> v_scales(state.v_scales.bytes(), 0x38U);
+    for (int head = 0; head < 2; ++head) {
+        for (int id = 0; id < capacity; ++id) {
+            for (int pair = 0; pair < 128; ++pair) {
+                const int d0 = 2 * pair;
+                const auto k_nibble = [&](int d) {
+                    if (d >= 16) { return std::uint8_t{0}; }
+                    const std::uint8_t magnitude =
+                        static_cast<std::uint8_t>(1 + (id + 3 * head + d) % 7);
+                    return static_cast<std::uint8_t>(magnitude |
+                                                     (((id + head + d) & 4) != 0 ? 8U : 0U));
+                };
+                const auto v_nibble = [&](int d) {
+                    const std::uint8_t magnitude =
+                        static_cast<std::uint8_t>(1 + (id + 5 * head + d / 3) % 7);
+                    return static_cast<std::uint8_t>(magnitude |
+                                                     (((id / 5 + head + d) & 2) != 0 ? 8U : 0U));
+                };
+                k_codes[code_index(pair, id, head, capacity)] = static_cast<std::uint8_t>(
+                    k_nibble(d0) | static_cast<std::uint8_t>(k_nibble(d0 + 1) << 4U));
+                v_codes[code_index(pair, id, head, capacity)] = static_cast<std::uint8_t>(
+                    v_nibble(d0) | static_cast<std::uint8_t>(v_nibble(d0 + 1) << 4U));
+            }
+            for (int group = 0; group < 16; ++group) {
+                // Exact E4M3 encodings 0x30=0.5, 0x38=1.0, and 0x40=2.0 create
+                // nonuniform key scores and value scales across both KV heads.
+                constexpr std::uint8_t scales[]{0x30U, 0x38U, 0x40U};
+                k_scales[scale_index(group, id, head, capacity)] =
+                    scales[(id + group + head) % 3];
+                v_scales[scale_index(group, id, head, capacity)] =
+                    scales[(2 * id + group + head) % 3];
+            }
+        }
+    }
+    state.k_codes.copy_from_host(k_codes.data(), k_codes.size());
+    state.v_codes.copy_from_host(v_codes.data(), v_codes.size());
+    state.k_scales.copy_from_host(k_scales.data(), k_scales.size());
+    state.v_scales.copy_from_host(v_scales.data(), v_scales.size());
+
+    std::vector<float> query(static_cast<std::size_t>(256) * 24, 0.0F);
+    for (int head = 0; head < 24; ++head) {
+        for (int d = 0; d < 16; ++d) {
+            query[d + 256 * head] = ((head + d) & 1) == 0 ? 0.125F : -0.09375F;
+        }
+    }
+    round_to_bf16(query);
+    std::vector<std::int32_t> selected(capacity);
+    for (int rank = 0; rank < capacity; ++rank) {
+        selected[static_cast<std::size_t>(rank)] = (37 * rank + 11) % capacity;
+    }
+    auto dquery = to_device_bf16(query);
+    auto dselected = to_device(selected);
+    auto dcount = to_device(std::vector<std::int32_t>{capacity});
+    GuardedDeviceBuffer dout(static_cast<std::size_t>(256) * 24 * sizeof(std::uint16_t));
+    GuardedDeviceBuffer attention_workspace(ops::qsa_selected_attention_workspace_bytes());
+    Tensor query_t(dquery.p, DType::BF16, {256, 24, 1});
+    Tensor selected_t(dselected.p, DType::I32, {capacity, 1});
+    Tensor count_t(dcount.p, DType::I32, {1});
+    Tensor out_t(dout.data(), DType::BF16, {256, 24, 1});
+    Tensor attention_workspace_t(attention_workspace.data(), DType::U8,
+                                 {static_cast<int>(attention_workspace.bytes())});
+    auto state_view = state.view();
+    ops::qsa_selected_attention(query_t, selected_t, count_t, state_view, out_t,
+                                attention_workspace_t, nullptr);
+    cuda_synchronize();
+    const auto actual = from_device_bf16(dout.data(), static_cast<std::size_t>(256) * 24);
+    std::vector<double> expected(actual.size());
+    std::vector<double> scores(capacity);
+    for (int head = 0; head < 24; ++head) {
+        const int kv_head = head / 12;
+        double maximum = -INFINITY;
+        for (int rank = 0; rank < capacity; ++rank) {
+            const int id = selected[static_cast<std::size_t>(rank)];
+            double score = 0.0;
+            for (int d = 0; d < 256; ++d) {
+                score += static_cast<double>(query[d + 256 * head]) *
+                         decode_cache(k_codes, k_scales, d, id, kv_head, capacity);
+            }
+            scores[static_cast<std::size_t>(rank)] = score / 16.0;
+            maximum = std::max(maximum, scores[static_cast<std::size_t>(rank)]);
+        }
+        double denominator = 0.0;
+        for (double& score : scores) {
+            score = std::exp(score - maximum);
+            denominator += score;
+        }
+        for (int d = 0; d < 256; ++d) {
+            double value = 0.0;
+            for (int rank = 0; rank < capacity; ++rank) {
+                const int id = selected[static_cast<std::size_t>(rank)];
+                value += scores[static_cast<std::size_t>(rank)] / denominator *
+                         decode_cache(v_codes, v_scales, d, id, kv_head, capacity);
+            }
+            expected[d + 256 * head] = value;
+        }
+    }
+    int failures = verify_pointwise("qsa selected attention nonuniform 2051-entry FP64 oracle",
+                                    actual, expected, PointwiseCriterion{0.02, 0.005});
+    Tensor aliased_workspace(out_t.data, DType::U8,
+                             {static_cast<int>(attention_workspace.bytes())});
+    try {
+        ops::qsa_selected_attention(query_t, selected_t, count_t, state_view, out_t,
+                                    aliased_workspace, nullptr);
+        std::cerr << "FAIL: qsa selected attention accepted aliased workspace/output\n";
+        ++failures;
+    } catch (const std::invalid_argument&) {
+    }
+    failures += dout.verify_guards("qsa selected attention capacity out");
+    failures += attention_workspace.verify_guards("qsa selected attention capacity workspace");
     return failures;
 }
 
@@ -677,6 +922,9 @@ int main() {
     int failures = 0;
     failures += append_codec_and_attention_case();
     failures += selector_ceiling_and_permutation_case();
+    failures += selector_boundary_ties_case();
+    failures += selector_score_order_case();
+    failures += selected_attention_capacity_case();
     failures += verifier_composite_real_shape_case();
     if (failures != 0) {
         std::cerr << "qsa tests failed: " << failures << "\n";

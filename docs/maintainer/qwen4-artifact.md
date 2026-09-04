@@ -182,26 +182,61 @@ materialization test passed on the RTX
 5090: 26,538,652,160 payload bytes occupied a 26,538,656,768-byte device arena while the
 45,996,784,640-byte mapped set retained its mapping after the reader closed. The same process also
 allocated the 157,126,664-byte fixed C=1 state budget, including all twelve 4096-token NVFP4-G16
-QSA K/V/index states, and one 8,448,000-byte expert staging slot. This is direct capacity evidence
-for beginning native verification, not a logits, PPL, latency, or product-admission result. The
+QSA K/V/index states, plus two 844,800-byte expert staging slots in pinned host memory and two on
+the device. This is direct capacity evidence for beginning native verification, not a logits, PPL,
+latency, or product-admission result. The
 target-private package test additionally populated all 48 strongly typed layer views and reset the
 GDN/QSA/PLE state before exact-decoding one real Q4_K token row into all four BF16 residual
-branches. The package now also contains a complete synchronous C=1 eager Text Program and a
-separate opt-in four-token native test. On 2026-09-04, the RTX 5090 test executed frozen
+branches. The package now also contains a complete C=1 eager Text Program with bounded two-stream,
+two-slot expert staging and a separate opt-in four-token native test. On 2026-09-04, the RTX 5090
+test executed frozen
 teacher-forced pairs `48->16451`, `16451->17120`, `17120->22188`, and `22188->11988`, producing
-finite NLLs `3.42502`, `14.3384`, `12.2828`, and `8.42543` (four-position PPL `15031.6`) and an
+finite NLLs `3.47466`, `14.0819`, `12.4137`, and `8.87907` (four-position PPL `16520.4`) and an
 exact reset/replay match for logits, NLL bits, final hidden, PLE rows/state, both GR boundaries,
 all GDN/QSA state, QSA ids/counts/current NVFP4 rows, and MoE ids/weights. The corresponding pinned
 llama.cpp NLLs were `3.15870537`, `13.7408428`, `12.0528638`, and `8.32870839`; this short trace is
 useful localization evidence, not numerical-identity evidence, an Op tolerance, or a
-product-quality/PPL threshold,
-because the native verifier deliberately uses BF16 represented intermediates and NVFP4-G16 KV
-while that external diagnostic uses its own FP32 graph profile and IQ4_NL KV.
+product-quality/PPL threshold, because the native verifier deliberately uses BF16 represented
+intermediates and NVFP4-G16 KV while that external diagnostic uses its own FP32 graph profile and
+IQ4_NL KV.
 The opt-in native test enforces the manifest's deliberately coarse cross-representation integration
 gate: every paired prefix NLL must differ by at most 1.0 nat, their mean absolute difference by at
 most 0.5 nat, and neither route may be non-finite. One nat caps a frozen target-probability ratio at
 `e`; the mean bound detects systematic Program drift. These are behavioral integration limits, not
 Op tolerances or a claim that the two numeric profiles are identical.
+
+Same-day final RTX 5090 measurements of the same warmed four-token Program workload disabled GR
+diagnostic snapshots. Three independent three-repetition runs had sequence means of 148.666,
+144.349, and 147.234 ms; the median run was 36.808 ms/token and 27.17 token/s. Nsight Systems
+instrumentation raised a separate captured sequence to 166.445 ms. The capture contained 15,804
+CUDA kernels taking 82.434 ms in aggregate. The capture and source audit place
+every decode, projection, normalization, activation, GDN, QSA, residual, router, mixture, and NLL
+operation in CUDA kernels; the CPU performs integer n-gram/address calculation and exact
+encoded-byte gathering only. The 1,936 H2Ds totaled 1,343,495,112 bytes: 1,920 selected-rank
+transfers contributed 1,343,488,000 bytes and 16 control/PLE transfers contributed the remaining
+7,112 bytes. The other traffic was 192 route-id D2Hs totaling 7,680 bytes and 12 embedding-fanout
+device copies totaling 61,440 bytes. There were no QSA KV transfers: all
+twelve caches remained in their device NVFP4-G16 code/FP8-scale layout. The two-slot reuse waits
+occupied 0.721 ms of CUPTI event-synchronization duration and 1.040 ms of host CUDA-API time across
+the capture; almost all host event-wait time was the required GPU-route-to-CPU-id dependency, so
+expanding pinned staging to ten slots was rejected.
+
+Retained public-Op A/Bs localize the admitted speed changes. The fixed QSA selector reduced the
+4096-token frontier from 79,335.678 to 108.384 us. The grouped-query tiled attention route then
+reduced the previously accepted 4096-frontier selected-attention entry from 580.960 to 42.560 us;
+the exact 2051-entry boundary measured 40.192 us, while the four-entry short kernel changed from
+2.641 to 2.595 us in matched Nsight kernel averages. It preserves the independent nonuniform
+2051-entry FP64 attention criterion and the existing current-token cache witness. The
+two-stream/two-slot sparse-MoE pipeline reduced a warm layer from 0.795 to 0.632 ms for IQ1_S and
+from 1.117 to 0.817 ms for IQ2_XXS, without changing routed accumulation order or NLL/PPL. The
+separate fully resident one-layer profile measured 129.018--129.064 us for an IQ1_S fixed-hot route
+and 138.945--139.375 us while rotating over all 512 experts; the corresponding IQ2_XXS results were
+120.947--121.178 and 134.399--134.405 us. These resident figures exclude the verifier's host
+route-id barrier and selected-byte transfers, so they isolate transferable GPU scheduling and
+kernel work rather than predict end-to-end performance for the host-staged preview. The four-CTA
+gated-residual write route reduced the complete read/write entry from a 31.69 us median to
+29.65 us. These figures qualify the unregistered verifier and its Ops only; they are not Engine
+throughput claims.
 
 ## 3. Exact component totals
 

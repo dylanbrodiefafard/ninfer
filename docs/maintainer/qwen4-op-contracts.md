@@ -231,11 +231,14 @@ valid counts and visible lengths inside the declared maxima without changing sem
 ## 4. QSA gated sparse GQA
 
 The inner cache-consuming attention is implemented by `qsa_selected_attention` in
-`include/ninfer/ops/qsa.h`: it accepts already normalized/rotated BF16 queries, maps 24 query heads
-to two NVFP4-G16 KV heads in groups of 12, decodes every selected K/V row from state, and emits the
-BF16 `[256,24,W]` attention result. The fixed C=1/T=1 `qsa_verifier_token` composes that entry with
-the state append and selector, actual Q5_K core/output projections, converted-gamma norms, partial
-MRoPE, and the output gate. The generalized entry below remains a proposed future composite.
+`include/ninfer/ops/qsa.h`: the live C=1/T=1 entry accepts already normalized/rotated BF16
+`q [256,24,1]`, maps 24 query heads to two NVFP4-G16 KV heads in groups of 12, decodes every
+selected K/V row from state, and emits BF16 `[256,24,1]`. Its I32 selected-id operand has a
+caller-known bound in `[1,2051]`; selected count is a device scalar in `[0,bound]`. The caller owns
+one aligned 1,008,128-byte workspace and no pointer survives the call. The fixed
+`qsa_verifier_token` composes that entry with the state append and selector, actual Q5_K
+core/output projections, converted-gamma norms, partial MRoPE, and the output gate. The generalized
+entry below remains a proposed future composite.
 
 Conceptual entry:
 
@@ -299,6 +302,12 @@ caller promises visibility because this entry deliberately does not receive the 
 the selector already guarantees causality, and this Op does not infer it from numeric ids. Every
 valid query must have at least one selected id.
 
+For selected bounds at most 64, the qualified live implementation uses one CTA per query head. At
+larger bounds, grouped-query score and value tiles share each decoded NVFP4 K/V row across four
+query heads, with deterministic tile-order finalization in the caller-owned workspace. This is a
+private T=1 implementation profile: it does not change the listed-id formula, FP32 softmax, cache
+codec, or public represented outputs.
+
 `out` is BF16 `[H,W,C]` for the preview. Invalid token columns are exact zero. In the live T=1
 verifier the per-head represented BF16 attention is multiplied by sigmoid of its corresponding
 represented BF16 raw gate, then the concatenated `[6144]` vector crosses the Q5_K output matrix.
@@ -351,6 +360,13 @@ write_scale = 2 * sigmoid(W_write vec(Rhat) / B),
 with FP32 `W_write [4,10240]` and output `[B]`. The final read-only form has no write weight or
 scale output. `x` and `write_scale` are explicit represented BF16 outputs for the preview, so their
 final casts are semantic; internal norm/projection materializations are not.
+
+The qualified write implementation assigns one 256-thread CTA to each of the four rows and uses
+the common FP32 block reduction. On an RTX 5090 with CUDA 13.1, three warm public-Op measurements
+changed `gated_residual_read_write` from 31.75/31.69/31.50 us to 29.70/29.65/29.64 us (6.4% at the
+median of run medians). The unchanged read entry measured 25.86/25.85/25.85 us before and
+25.95/26.03/26.04 us after; its 0.7% shift bounds measurement drift rather than a read-path change.
+The supplementary public read/write-minus-read increment fell from about 5.84 us to 3.62 us.
 
 ### 5.2 Inject formula and effects
 
@@ -609,14 +625,30 @@ The live UD-IQ1_S verifier accepts a contiguous FP32 K-fastest router, mapped-ho
 IQ2_XXS routed gate/up banks, device IQ4_NL routed down, a contiguous FP32 shared scalar gate,
 Q5_K shared gate/up (or the layer-2 Q6_K pair), and Q8_0 shared down. The GPU computes routing and
 exposes the ten ids and renormalized FP32 weights. The host copies those ids into the first 40 bytes
-of a caller-owned pinned slot, waits for that route only, and overwrites the slot with exact encoded
-gate/up matrix pairs in route-rank order. One H2D transfer fills a stable device slot; every decode,
-linear, SwiGLU, shared gate, mixture accumulation, and output operation remains on the GPU.
+of caller-owned pinned staging, waits for that route only, and copies exact encoded gate/up matrix
+pairs in route-rank order into alternating slots. A distinct transfer stream performs one H2D per
+rank while the compute stream consumes the preceding rank; every decode, linear, SwiGLU, shared
+gate, mixture accumulation, and output operation remains on the GPU.
 
-An IQ1_S matrix is 320,000 bytes and ten gate/up pairs occupy 6,400,000 bytes. An IQ2_XXS matrix is
-422,400 bytes and ten pairs occupy the fixed maximum of 8,448,000 bytes. The mapped banks are never
-pinned or copied in full. Slot reuse is legal only after the caller observes completion of all
-consumers on the stream. The entry owns no staging ring, scheduling, model registry, or Engine path.
+An IQ1_S gate/up pair is 640,000 bytes. An IQ2_XXS pair is 844,800 bytes, the fixed per-slot maximum.
+The live pipeline owns two slots, so both pinned and device staging are exactly 1,689,600 bytes; the
+same 6,400,000 or 8,448,000 encoded bytes still cross H2D per layer. Transfer-ready and
+consumer-complete events protect host and device reuse. The next call's route-ready -> IDs-ready
+barrier also proves the preceding call's two slots complete before rank zero can overwrite them.
+The mapped banks are never pinned or copied in full. The entry owns no scheduling, model registry,
+or Engine path.
+
+The same semantic Op also has a device-resident verifier profile. Its routed gate and up operands
+are complete rank-three IQ1_S or IQ2_XXS banks `[512,640,2560]`, and routed down is the complete
+IQ4_NL bank `[512,2560,640]`. A resident-only deterministic bitonic route orders raw logits by
+descending score and then ascending expert id. One two-dimensional grid computes all ten routed
+gate/up pairs and their BF16 SwiGLU seam; one down/finish grid visits ranks in order, preserves the
+BF16 routed-down seam, and accumulates in FP32. The shared Q5_K/Q6_K gate/up projections and SwiGLU
+are fused, and a 513th router CTA computes the shared scalar gate. The profile performs no transfer,
+host synchronization, event operation, or runtime repack. The staged route and kernels remain
+separate and unchanged. The one-layer placement benchmark owns full device banks and reports both
+a fixed hot route and rotating windows covering all 512 experts. It is not a claim that the
+48-layer preview artifact fits one RTX 5090 or authority to change the live verifier's placement.
 
 The complete closed Op, not private router or expert stages, owns the oracle. Qualification includes
 all-zero router logits selecting ids `0..9` with weights exactly `0.1` in the ideal oracle, a
@@ -634,8 +666,9 @@ The unregistered `src/targets/qwen4/program.cpp` verifier now composes these liv
 48-layer eager Text schedule with one exact 4096-token frontier. It resets continuation only at a
 sequence boundary, refreshes the four residual branches for each numeric token, runs PLE before
 zero-based layer 1, appends and selects QSA through the NVFP4-G16 cache, serializes the selected
-expert staging slot, and finishes with the read-only GR and untied Q4_K head. It exposes diagnostic
-views and GPU-computed NLL but is not a registered target or an Engine execution path.
+expert route-id dependency before feeding the two-stream/two-slot staging pipeline, and finishes
+with the read-only GR and untied Q4_K head. It exposes diagnostic views and GPU-computed NLL but is
+not a registered target or an Engine execution path.
 
 The following remain in `src/targets/qwen4` even when they invoke the Ops above:
 
@@ -688,13 +721,13 @@ The minimum meaningful matrix is:
 |---|---|
 | QSA projection/composite | live verifier: separate BF16 512x2560/128x2560 index projections, Q5_K 12288x2560/512x2560/2560x6144 core/output projections, FP32 norms, C=1/T=1, exact selected ids, current-token NVFP4 round-trip, complete FP64 output oracle. Future registered batched entry qualifies C=4,8 and distinct-state forms |
 | QSA selector | visible counts 0..5 and 2047..2053; 512-block saturation; non-contiguous visible ids; unequal C lanes; fragmented pages; multimodal positions; all-zero and boundary ties; BF16 pool/cast witnesses |
-| QSA attention | real 24/2/256 geometry; T=1 and prefill; new-current cache read; fragmented pages; BF16 then each compressed cache; gate saturation; selected count 1, 2048, and 2051 |
+| QSA attention | live verifier: real 24/2/256 T=1 geometry; new-current NVFP4-G16 cache read; selected count 1, 2048, and 2051; nonuniform 2051-entry complete FP64 oracle; short and tiled routes. Future registered entry qualifies prefill, fragmented pages, and other cache codecs |
 | GR | live verifier: real 4x2560/R=320; FP32 norm/write and Q8_0 down/up; read-only/read-write/inject; C=1/T=1; exact Q8_0 decode oracle; in-place inject. Future registered batched entry qualifies C=4,8 and graph envelopes |
 | n-gram | exact vectors below; empty/short history; EOS as current and prior token; one-shot/chunk/T=1; C lane isolation; every admitted PLE-module index |
 | PLE gather | first/last valid row, repeated and permuted ids, 16-head order, codec edges, direct versus staged-remap equality when both execution profiles exist |
 | PLE inject | live verifier: real 4x2560 projections/state; zero and nonzero history; one-shot/legal chunks/T=1; dilation witness; in-place output; C=1. Future registered batched entry: C=4,8 isolation and invalid-suffix semantics |
 | GDN | live verifier: source 16 Q/K heads expanded to 48 tiled artifact heads (`h%16`) at width 128; direct represented `ssm_a`; Q5_K and layer-2 Q6_K inputs; Q6_K output; repeated T=1; nonzero FP32 initial state; sigmoid output gate; distinct rollback and in-place continuation. Future Program routes qualify prefill and snapshot/record/fold if used |
-| sparse MoE | live verifier: 512/top10/I640; lower-id all-zero and tenth-boundary ties; selected normalization; IQ1_S/IQ2_XXS host staging; IQ4_NL routed down; Q5_K/Q6_K shared gate/up; Q8_0 shared down; shared-gate extremes; exact 8,448,000-byte cap; T=1 Store result. Future registered entry qualifies batched/prefill routes |
+| sparse MoE | live verifier: 512/top10/I640; lower-id all-zero and tenth-boundary ties; selected normalization; IQ1_S/IQ2_XXS two-slot host staging and complete device-resident bank profiles; IQ4_NL routed down; Q5_K/Q6_K shared gate/up; Q8_0 shared down; shared-gate extremes; exact 844,800-byte per-slot cap and two-slot lifetime; device-id bank indexing; T=1 Store result. Future registered entry qualifies batched/prefill routes |
 
 Named numeric criteria must be fixed from adversarial and target-representative oracle-error
 distributions before a failing candidate is judged. Reduction Ops require both a normwise bound and
