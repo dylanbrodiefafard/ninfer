@@ -7,6 +7,8 @@
 #include "targets/qwen3_6/impl/runtime/kv_ram_cache.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 
+#include <ninfer/targets/qwen3_6/vision_control.h>
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -358,6 +360,47 @@ std::uint64_t capture_tokens(q36::detail::KVRamCache& ram, ninfer::PagedKVPool& 
     return *id;
 }
 
+std::uint64_t capture_prepared_prompt(q36::detail::KVRamCache& ram, ninfer::PagedKVPool& pool,
+                                      ninfer::PagedKVAllocation& alloc,
+                                      ninfer::DeviceContext& ctx,
+                                      const q36::PreparedPromptData& prompt) {
+    const std::size_t tokens = prompt.token_ids.size();
+    if (prompt.token_types.size() != tokens || prompt.positions.size() != 3 * tokens) {
+        throw std::logic_error("prepared-prompt cache fixture has invalid identity geometry");
+    }
+    auto retained = prompt;
+    retained.token_ids.push_back(0);
+    retained.token_types.push_back(0);
+    std::vector<std::int32_t> retained_positions(3 * (tokens + 1));
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        std::copy_n(prompt.positions.data() + axis * tokens, tokens,
+                    retained_positions.data() + axis * (tokens + 1));
+        retained_positions[axis * (tokens + 1) + tokens] =
+            tokens == 0 ? 0 : prompt.positions[axis * tokens + tokens - 1] + 1;
+    }
+    retained.positions = std::move(retained_positions);
+
+    q36::detail::ResidentPrefixIdentity identity;
+    identity.assign(retained);
+    q36::detail::RamCaptureSource source;
+    source.execution_frontier = static_cast<std::uint32_t>(tokens);
+    source.ledger_frontier    = static_cast<std::uint32_t>(retained.token_ids.size());
+    source.text_kv_valid      = source.execution_frontier;
+    source.tail_hidden_valid  = true;
+    source.ledger             = retained.token_ids;
+    source.identity           = &identity;
+    source.hash_f = q36::detail::prefix_hash_at(retained.token_ids, identity,
+                                                 source.execution_frontier);
+    source.text      = &alloc;
+    source.text_pool = &pool;
+    source.stream    = ctx.copy_stream;
+    const auto id    = capture_or_evict(ram, source);
+    if (!id) { throw std::runtime_error("prepared-prompt RAM capture failed"); }
+    ctx.synchronize_all();
+    ram.wait_pending_copies();
+    return *id;
+}
+
 std::uint64_t capture_tokens_hidden(q36::detail::KVRamCache& ram, ninfer::PagedKVPool& pool,
                                       ninfer::PagedKVAllocation& alloc, ninfer::DeviceContext& ctx,
                                       const std::vector<ninfer::TokenId>& prompt_tokens,
@@ -634,6 +677,203 @@ int test_lock_and_fingerprint(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& p
     if (!threw) { return fail("fingerprint mismatch did not name model_id"); }
     (void)ctx;
     return 0;
+}
+
+int exercise_vision_disk_reopen_across_pool_capacity(ninfer::DeviceContext& ctx,
+                                                     ninfer::PagedKVPlaneOrder order,
+                                                     const char* tag) {
+    TmpDir dir(tag);
+    const std::vector<ninfer::PagedKVPlaneSpec> nvfp4_planes = {
+        {ninfer::DType::U8, 128, 4},
+        {ninfer::DType::U8, 128, 4},
+        {ninfer::DType::FP8_E4M3FN, 16, 4},
+        {ninfer::DType::FP8_E4M3FN, 16, 4},
+        {ninfer::DType::FP32, 4, 4},
+    };
+    auto source_plan = plan_paged_cache(18, 12, 2, nvfp4_planes, order);
+    ninfer::DeviceArena source_arena(source_plan.bytes);
+    ninfer::PagedKVPool source_pool({source_arena.base(), source_arena.capacity()},
+                                    source_plan.layout);
+    q36::detail::KVRamCache source_ram(16ULL << 20);
+    auto source_blocker = source_pool.reserve(4);
+    source_blocker.materialize_pages(4, ctx.stream);
+    auto source = source_pool.reserve(2);
+    source.materialize_pages(1, ctx.stream);
+
+    std::vector<std::uint8_t> expected(ninfer::paged_kv_logical_page_bytes(source_pool));
+    std::uint64_t pattern = order == ninfer::PagedKVPlaneOrder::PageMajor
+                                ? 0x42e7a1c95b3d680fULL
+                                : 0xd19f307a84c26e5bULL;
+    for (std::uint8_t& byte : expected) {
+        pattern ^= pattern >> 12;
+        pattern ^= pattern << 25;
+        pattern ^= pattern >> 27;
+        byte = static_cast<std::uint8_t>((pattern * 0x2545f4914f6cdd1dULL) >> 56);
+    }
+    ninfer::unpack_paged_kv_logical_page_from_host(source, source_pool, expected.data(), 0,
+                                                   ctx.stream);
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    std::vector<std::uint8_t> source_readback(expected.size());
+    ninfer::pack_paged_kv_logical_page_to_host(source, source_pool, 0, source_readback.data(),
+                                               ctx.stream);
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    if (source.page_ids()[0] == 0 || source_readback != expected) {
+        source.release();
+        return fail("Vision disk source canonical-page pattern did not round-trip");
+    }
+
+    auto prompt = text_prompt(std::vector<ninfer::TokenId>(64, 17));
+    for (std::size_t token = 16; token < 20; ++token) {
+        prompt.token_types[token] = 1;
+        prompt.positions[64 + token] = static_cast<std::int32_t>(token - 16);
+        prompt.positions[128 + token] = static_cast<std::int32_t>(token % 4);
+    }
+    q36::VisionItem item;
+    item.modality      = q36::PromptModality::Image;
+    item.grid          = {.temporal = 1, .height = 4, .width = 4};
+    item.patch_begin   = 0;
+    item.patch_count   = 16;
+    item.token_spans   = {{.begin = 16, .count = 4}};
+    item.content_digest.fill(0xa5);
+    prompt.vision_items.push_back(item);
+    prompt.prepare.media_items   = 1;
+    prompt.prepare.raw_patches   = 16;
+    prompt.prepare.vision_tokens = 4;
+    (void)q36::build_vision_control(prompt);
+
+    const auto ram_id = capture_prepared_prompt(source_ram, source_pool, source, ctx, prompt);
+    auto source_cfg = disk_config(dir.path, source_ram, source_pool, nullptr,
+                                  ninfer::SpeculativeBackend::None, 32ULL << 20, 4096);
+    source_cfg.fingerprint.model_id   = "qwen3.8-27b";
+    source_cfg.fingerprint.weights_id = "nvfp4";
+    source_cfg.fingerprint.kv_cache   = ninfer::KvCacheStorage::Nvfp4;
+    {
+        q36::detail::KVDiskCache disk(source_cfg);
+        disk.note_ram_resident(ram_id, 0);
+        if (!disk.emergency_spill_ram(ram_id)) {
+            source.release();
+            return fail("Vision disk capacity fixture did not spill");
+        }
+        const auto match = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+        if (!match || match->reuse_base != prompt.token_ids.size()) {
+            source.release();
+            return fail("Vision disk capacity fixture did not match before reopen");
+        }
+    }
+
+    auto target_plan = plan_paged_cache(12, 9, 3, nvfp4_planes, order);
+    ninfer::DeviceArena target_arena(target_plan.bytes);
+    ninfer::PagedKVPool target_pool({target_arena.base(), target_arena.capacity()},
+                                    target_plan.layout);
+    q36::detail::KVRamCache target_ram(16ULL << 20);
+    auto target_blocker = target_pool.reserve(2);
+    target_blocker.materialize_pages(2, ctx.stream);
+    auto target_cfg = disk_config(dir.path, target_ram, target_pool, nullptr,
+                                  ninfer::SpeculativeBackend::None, 32ULL << 20, 4096);
+    target_cfg.fingerprint.model_id   = "qwen3.8-27b";
+    target_cfg.fingerprint.weights_id = "nvfp4";
+    target_cfg.fingerprint.kv_cache   = ninfer::KvCacheStorage::Nvfp4;
+    if (source_cfg.fingerprint.text_planes != target_cfg.fingerprint.text_planes) {
+        source.release();
+        return fail("canonical disk plane schema changed with resident pool capacity");
+    }
+    {
+        q36::detail::KVDiskCache reopened(target_cfg);
+        const auto match = reopened.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+        if (!match || match->reuse_base != prompt.token_ids.size()) {
+            source.release();
+            return fail("Vision disk entry did not reopen across resident pool capacity");
+        }
+
+        auto changed_media = prompt;
+        changed_media.vision_items[0].content_digest[0] ^= 0xff;
+        const auto changed = reopened.plan_match(changed_media,
+                                                 q36::detail::prefix_hash_chain(changed_media));
+        if (changed && changed->reuse_base > item.token_spans.front().begin) {
+            source.release();
+            return fail("Vision disk identity reused beyond changed media content");
+        }
+
+        if (!reopened.claim(match->entry_id, match->hash_f, match->execution_frontier)) {
+            source.release();
+            return fail("Vision disk entry claim failed after capacity change");
+        }
+        auto destination = target_pool.reserve(2);
+        destination.materialize_pages(1, ctx.stream);
+        if (destination.page_ids()[0] == 0 ||
+            destination.page_ids()[0] == source.page_ids()[0]) {
+            reopened.release(match->entry_id);
+            destination.release();
+            source.release();
+            return fail("Vision disk capacity fixture did not use distinct nonzero page IDs");
+        }
+        q36::detail::DiskRestoreTarget target;
+        target.text           = &destination;
+        target.text_pool      = &target_pool;
+        target.text_dst_pages = 1;
+        target.stream         = ctx.copy_stream;
+        reopened.restore_device(match->entry_id, target);
+        try {
+            if (const int rc = wait_restore_bounded(reopened, ctx,
+                                                     "Vision capacity-change restore hung");
+                rc != 0) {
+                reopened.release(match->entry_id);
+                destination.release();
+                source.release();
+                return rc;
+            }
+        } catch (const std::exception& e) {
+            reopened.release(match->entry_id);
+            destination.release();
+            source.release();
+            std::cerr << "Vision capacity-change restore threw: " << e.what() << '\n';
+            return 1;
+        }
+        ctx.synchronize_all();
+        std::vector<std::uint8_t> restored(expected.size());
+        ninfer::pack_paged_kv_logical_page_to_host(destination, target_pool, 0, restored.data(),
+                                                   ctx.stream);
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+        reopened.cancel_restore();
+        reopened.release(match->entry_id);
+        destination.release();
+        if (restored != expected) {
+            source.release();
+            return fail("Vision disk restore changed canonical KV bytes across pool capacity");
+        }
+    }
+
+    auto incompatible_planes = nvfp4_planes;
+    incompatible_planes[0].leading_extent = 64;
+    auto incompatible_plan =
+        plan_paged_cache(12, 9, 3, std::move(incompatible_planes), order);
+    ninfer::DeviceArena incompatible_arena(incompatible_plan.bytes);
+    ninfer::PagedKVPool incompatible_pool(
+        {incompatible_arena.base(), incompatible_arena.capacity()}, incompatible_plan.layout);
+    auto incompatible_cfg = disk_config(dir.path, target_ram, incompatible_pool, nullptr,
+                                        ninfer::SpeculativeBackend::None, 32ULL << 20, 4096);
+    incompatible_cfg.fingerprint.model_id   = "qwen3.8-27b";
+    incompatible_cfg.fingerprint.weights_id = "nvfp4";
+    incompatible_cfg.fingerprint.kv_cache   = ninfer::KvCacheStorage::Nvfp4;
+    bool rejected = false;
+    try {
+        q36::detail::KVDiskCache incompatible(incompatible_cfg);
+    } catch (const std::runtime_error& e) {
+        rejected = std::string(e.what()).find("text_plane_schema") != std::string::npos;
+    }
+    source.release();
+    if (!rejected) { return fail("disk cache accepted an incompatible logical plane schema"); }
+    return 0;
+}
+
+int test_vision_disk_reopen_across_pool_capacity(ninfer::DeviceContext& ctx) {
+    if (const int rc = exercise_vision_disk_reopen_across_pool_capacity(
+            ctx, ninfer::PagedKVPlaneOrder::PageMajor, "vision-capacity-page");
+        rc != 0) {
+        return rc;
+    }
+    return exercise_vision_disk_reopen_across_pool_capacity(
+        ctx, ninfer::PagedKVPlaneOrder::HeadMajor, "vision-capacity-head");
 }
 
 int test_ram_io_pin_and_capture_id(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
@@ -9866,7 +10106,6 @@ int test_failed_entry_unlink_does_not_resurrect(ninfer::DeviceContext& ctx,
     child.resize(70, 11);
     std::uint64_t parent_id = 0;
     std::uint64_t child_id  = 0;
-    fs::path child_dir;
     {
         q36::detail::KVDiskCache disk(cfg);
         const auto ram_p = capture_tokens(ram, pool, alloc, ctx, parent);
@@ -9895,26 +10134,20 @@ int test_failed_entry_unlink_does_not_resurrect(ninfer::DeviceContext& ctx,
             alloc.release();
             return fail("unlink-res child match failed");
         }
-        child_id  = child_match->entry_id;
-        child_dir = dir.path / "entries" / std::to_string(child_id);
+        child_id = child_match->entry_id;
         if (!disk.claim(parent_id)) {
             alloc.release();
             return fail("unlink-res claim of parent failed");
         }
-        std::error_code ec;
-        fs::permissions(child_dir, fs::perms::none, ec);
+        disk.test_arm_fail_entry_unlink();
         if (!disk.test_fifo_evict_one()) {
-            fs::permissions(child_dir, fs::perms::owner_all, ec);
             disk.release(parent_id);
             alloc.release();
-            return fail("unlink-res did not evict the chmod'd child");
+            return fail("unlink-res did not evict the child with injected unlink failure");
         }
         disk.release(parent_id);
-        fs::permissions(child_dir, fs::perms::owner_all, ec);
         disk.wait_idle_and_fsync();
     }
-    std::error_code rec;
-    fs::permissions(child_dir, fs::perms::owner_all, rec);
     q36::detail::KVDiskCache reopened(cfg);
     const auto parent_hit = reopened.plan_match(
         text_prompt(parent), q36::detail::prefix_hash_chain(text_prompt(parent)));
@@ -10330,23 +10563,17 @@ int test_tombstone_survives_failed_entries_unlink(ninfer::DeviceContext& ctx,
             return fail("tombstone match failed");
         }
         entry_id = match->entry_id;
-        std::error_code ec;
-        fs::permissions(dir.path / "entries", fs::perms::none, ec);
+        disk.test_arm_fail_entry_unlink();
         if (!disk.test_fifo_evict_one()) {
-            fs::permissions(dir.path / "entries", fs::perms::owner_all, ec);
             alloc.release();
             return fail("tombstone evict failed");
         }
         if (!fs::exists(dir.path / "tombstones" / std::to_string(entry_id))) {
-            fs::permissions(dir.path / "entries", fs::perms::owner_all, ec);
             alloc.release();
             return fail("evict did not write a tombstone outside entries/");
         }
         disk.wait_idle_and_fsync();
-        fs::permissions(dir.path / "entries", fs::perms::owner_all, ec);
     }
-    std::error_code rec;
-    fs::permissions(dir.path / "entries", fs::perms::owner_all, rec);
     q36::detail::KVDiskCache reopened(cfg);
     if (reopened.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
         alloc.release();
@@ -10444,17 +10671,12 @@ int test_tombstone_does_not_poison_reused_ids(ninfer::DeviceContext& ctx,
             return fail("tomb-reuse first match failed");
         }
         first_id = match->entry_id;
-        std::error_code ec;
-        fs::permissions(dir.path / "entries", fs::perms::none, ec);
+        disk.test_arm_fail_entry_unlink();
         if (!disk.test_fifo_evict_one()) {
-            fs::permissions(dir.path / "entries", fs::perms::owner_all, ec);
             alloc.release();
             return fail("tomb-reuse evict failed");
         }
-        fs::permissions(dir.path / "entries", fs::perms::owner_all, ec);
     }
-    std::error_code rec;
-    fs::permissions(dir.path / "entries", fs::perms::owner_all, rec);
     std::uint64_t second_id = 0;
     {
         q36::detail::KVDiskCache disk(cfg);
@@ -10510,17 +10732,12 @@ int test_listed_tombstone_is_not_loaded(ninfer::DeviceContext& ctx, ninfer::Page
         }
         disk.wait_idle_and_fsync();
         fs::copy_file(man, bak);
-        std::error_code ec;
-        fs::permissions(dir.path / "entries", fs::perms::none, ec);
+        disk.test_arm_fail_entry_unlink();
         if (!disk.test_fifo_evict_one()) {
-            fs::permissions(dir.path / "entries", fs::perms::owner_all, ec);
             alloc.release();
             return fail("tomb-listed evict failed");
         }
-        fs::permissions(dir.path / "entries", fs::perms::owner_all, ec);
     }
-    std::error_code rec;
-    fs::permissions(dir.path / "entries", fs::perms::owner_all, rec);
     fs::copy_file(bak, man, fs::copy_options::overwrite_existing);
     q36::detail::KVDiskCache reopened(cfg);
     if (reopened.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)))) {
@@ -11088,7 +11305,7 @@ int test_kind_conflict_is_skipped(ninfer::DeviceContext& ctx, ninfer::PagedKVPoo
     std::vector<std::uint8_t> meta((std::istreambuf_iterator<char>(in)),
                                    std::istreambuf_iterator<char>());
     in.close();
-    // encode_meta: magic 8, version 4, then packed scalars through identity_id at
+    // encode_meta: magic 8, version 5, then packed scalars through identity_id at
     // byte 100, current_gdn_id at 108, current_hidden_id at 116.
     constexpr std::size_t kCurrentHiddenIdOff = 116;
     if (meta.size() < kCurrentHiddenIdOff + 8) {
@@ -11886,7 +12103,7 @@ int test_uncertainty_holds_reclaim_on_evict_and_reopen(ninfer::DeviceContext& ct
         alloc.release();
         return fail("reopen after uncertain rollback kept the unpublished new generation");
     }
-    // A durable location append can precede a failed meta publication.  In v4
+    // A durable location append can precede a failed meta publication. In the packed format,
     // that extent is intentionally retained as unreachable pack garbage until
     // generation compaction; the observable requirement is that it is not
     // resurrected as a matching entry.
@@ -14435,6 +14652,7 @@ int main() {
     failures += test_batch_page_unpack(ctx);
     failures += test_device_scatter_page_unpack(ctx);
     failures += test_lock_and_fingerprint(ctx, paged_pool);
+    failures += test_vision_disk_reopen_across_pool_capacity(ctx);
     failures += test_ram_io_pin_and_capture_id(ctx, paged_pool);
     failures += test_flush_reports_progress(ctx, paged_pool);
     failures += test_spill_match_extend_branch(ctx, paged_pool);

@@ -263,6 +263,7 @@ public:
     void test_arm_fail_tombstone();
     void test_arm_fail_object_write();
     void test_arm_fail_object_unlink();
+    void test_arm_fail_entry_unlink();
     void test_arm_fail_prepare_spill();
     bool test_fifo_evict_one_unpersisted();
     [[nodiscard]] bool test_meta_renamed() const;
@@ -947,14 +948,13 @@ private:
     bool fail_tombstone_              = false;
     mutable bool fail_object_write_         = false;
     bool fail_object_unlink_                = false;
+    bool fail_entry_unlink_                 = false;
     bool fail_prepare_spill_               = false;
     bool force_zstd_fail_     = false;
     std::filesystem::path canonical_location_;
     std::vector<std::uint64_t> branch_shared_ids_;
 };
 
-void write_plane_fingerprint(std::vector<std::uint8_t>& out, const Tensor& plane,
-                             PagedKVPlaneOrder order);
 DiskFingerprint make_disk_fingerprint(std::string model_id, std::string weights_id,
                                       KvCacheStorage kv_cache, SpeculativeBackend speculative,
                                       const PagedKVPool& text, const PagedKVPool* backend,

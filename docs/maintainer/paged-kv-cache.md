@@ -885,7 +885,7 @@ lease but does not delete the durable entry; a later VRAM or RAM hit likewise le
 available. C=1 does not submit restore reads until the selected retained victim has been captured
 and its GPU pages released.
 
-Disk format v4 stores objects in 1 GiB, per-kind pack segments under an atomically selected
+Disk format v5 stores objects in 1 GiB, per-kind pack segments under an atomically selected
 generation. `PACKSET` names the generation and reserves monotonically increasing object-ID ranges.
 The immutable base map and append-only, CRC-framed log resolve stable object IDs to aligned
 extents. Page and state records carry header/payload CRC32C; ledger and identity records retain
@@ -902,6 +902,16 @@ skipped, or held page/state objects. It memory-maps object maps, validates sorte
 and checks each live page CRC once across the bounded reader pool. Torn map tails are truncated;
 conflicting IDs, overlapping extents, corrupt live records, and unsupported fingerprints
 invalidate the affected store or entry according to their ownership boundary.
+
+The fingerprint describes each packed logical-page plane by dtype, plane order, logical
+leading/head extents, and packed bytes per page. It deliberately excludes the resident GPU page
+count, block-table row count and logical capacity, allocation alignment, and device strides. Those
+are destination-pool properties rather than disk-record properties: restore scatters the canonical
+packed bytes through the current pool geometry. A cache directory can therefore reopen after
+`--vision` changes an auto-sized resident KV pool, while model/weights identity, KV dtype, page
+size, logical plane schema, speculative backend, and persistent GDN/DFlash state geometry remain
+strict compatibility boundaries. Vision media identity remains in each entry's exact identity
+record, so changed image or video content cannot reuse a stored prefix.
 
 Compaction copies live extents into a new generation, publishes its complete base map, and then
 atomically replaces `PACKSET`. Old pack roots and their maps are removed only after publication is

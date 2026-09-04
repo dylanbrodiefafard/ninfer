@@ -447,17 +447,66 @@ constexpr std::uint32_t kDiskMetaMaxPageIds   = 1u << 16;
     return static_cast<std::uint32_t>(i);
 }
 
-void append_plane_fingerprint(OutBuf& w, const Tensor& plane, PagedKVPlaneOrder order) {
+[[nodiscard]] std::uint64_t plane_schema_bytes(DType dtype, std::uint32_t page_size,
+                                                std::int32_t leading_extent,
+                                                std::int32_t head_extent) {
+    if (page_size == 0 || leading_extent <= 0 || head_extent <= 0) {
+        throw std::runtime_error("KV disk FINGERPRINT plane geometry is invalid");
+    }
+    std::uint64_t bytes = dtype_size(dtype);
+    for (const std::uint64_t extent : {static_cast<std::uint64_t>(page_size),
+                                       static_cast<std::uint64_t>(leading_extent),
+                                       static_cast<std::uint64_t>(head_extent)}) {
+        if (bytes > std::numeric_limits<std::uint64_t>::max() / extent) {
+            throw std::runtime_error("KV disk FINGERPRINT plane geometry overflows");
+        }
+        bytes *= extent;
+    }
+    return bytes;
+}
+
+[[nodiscard]] DiskPlaneSchema make_plane_schema(const Tensor& plane, PagedKVPlaneOrder order) {
+    if (plane.ne[1] != kPagedKVPageSize || !plane.is_contiguous()) {
+        throw std::logic_error("Paged KV plane does not have canonical page geometry");
+    }
+    DiskPlaneSchema schema;
+    schema.dtype          = plane.dtype;
+    schema.order          = order;
+    schema.leading_extent = plane.ne[0];
+    schema.head_extent =
+        order == PagedKVPlaneOrder::PageMajor ? plane.ne[2] : plane.ne[3];
+    schema.page_bytes = plane_schema_bytes(schema.dtype, kPagedKVPageSize,
+                                           schema.leading_extent, schema.head_extent);
+    return schema;
+}
+
+void encode_plane_schema(OutBuf& w, const DiskPlaneSchema& plane) {
     w.u8(static_cast<std::uint8_t>(plane.dtype));
-    w.u8(static_cast<std::uint8_t>(order));
-    w.u8(0);
-    w.u8(0);
-    w.u8(0);
-    w.u8(0);
-    w.u8(0);
-    w.u8(0);
-    for (int i = 0; i < 4; ++i) { w.i32(plane.ne[i]); }
-    for (int i = 0; i < 4; ++i) { w.i64(plane.nb[i]); }
+    w.u8(static_cast<std::uint8_t>(plane.order));
+    w.u16(0);
+    w.i32(plane.leading_extent);
+    w.i32(plane.head_extent);
+    w.u64(plane.page_bytes);
+}
+
+[[nodiscard]] DiskPlaneSchema decode_plane_schema(InBuf& r, std::uint32_t page_size) {
+    const std::uint8_t dtype_raw = r.u8();
+    const std::uint8_t order_raw = r.u8();
+    if (r.u16() != 0 || dtype_raw > static_cast<std::uint8_t>(DType::FP8_E4M3FN) ||
+        order_raw > static_cast<std::uint8_t>(PagedKVPlaneOrder::HeadMajor)) {
+        throw std::runtime_error("KV disk FINGERPRINT plane schema is invalid");
+    }
+    DiskPlaneSchema plane;
+    plane.dtype          = static_cast<DType>(dtype_raw);
+    plane.order          = static_cast<PagedKVPlaneOrder>(order_raw);
+    plane.leading_extent = r.i32();
+    plane.head_extent    = r.i32();
+    plane.page_bytes     = r.u64();
+    if (plane.page_bytes !=
+        plane_schema_bytes(plane.dtype, page_size, plane.leading_extent, plane.head_extent)) {
+        throw std::runtime_error("KV disk FINGERPRINT plane byte extent is invalid");
+    }
+    return plane;
 }
 
 [[nodiscard]] std::vector<std::uint8_t> encode_fingerprint(const DiskFingerprint& fp) {
@@ -469,8 +518,12 @@ void append_plane_fingerprint(OutBuf& w, const Tensor& plane, PagedKVPlaneOrder 
     w.u8(static_cast<std::uint8_t>(fp.kv_cache));
     w.u8(static_cast<std::uint8_t>(fp.speculative));
     w.u32(fp.page_size);
-    w.u32(fp.text_plane_count);
-    w.u32(fp.backend_plane_count);
+    if (fp.text_planes.size() > std::numeric_limits<std::uint32_t>::max() ||
+        fp.backend_planes.size() > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::logic_error("KV disk FINGERPRINT has too many planes");
+    }
+    w.u32(static_cast<std::uint32_t>(fp.text_planes.size()));
+    w.u32(static_cast<std::uint32_t>(fp.backend_planes.size()));
     w.u64(fp.gdn_conv_bytes);
     w.u64(fp.gdn_recurrent_bytes);
     w.u64(fp.cyclic_lane_bytes);
@@ -481,8 +534,8 @@ void append_plane_fingerprint(OutBuf& w, const Tensor& plane, PagedKVPlaneOrder 
     w.i32(fp.cyclic_head_dim);
     w.i32(fp.cyclic_lane_capacity);
     w.u32(fp.snapshot_version);
-    w.raw(fp.text_plane_bytes.data(), fp.text_plane_bytes.size());
-    w.raw(fp.backend_plane_bytes.data(), fp.backend_plane_bytes.size());
+    for (const DiskPlaneSchema& plane : fp.text_planes) { encode_plane_schema(w, plane); }
+    for (const DiskPlaneSchema& plane : fp.backend_planes) { encode_plane_schema(w, plane); }
     return std::move(w.bytes);
 }
 
@@ -500,8 +553,8 @@ void append_plane_fingerprint(OutBuf& w, const Tensor& plane, PagedKVPlaneOrder 
     fp.kv_cache             = static_cast<KvCacheStorage>(r.u8());
     fp.speculative          = static_cast<SpeculativeBackend>(r.u8());
     fp.page_size            = r.u32();
-    fp.text_plane_count     = r.u32();
-    fp.backend_plane_count  = r.u32();
+    const std::uint32_t text_plane_count    = r.u32();
+    const std::uint32_t backend_plane_count = r.u32();
     fp.gdn_conv_bytes       = r.u64();
     fp.gdn_recurrent_bytes  = r.u64();
     fp.cyclic_lane_bytes    = r.u64();
@@ -512,19 +565,23 @@ void append_plane_fingerprint(OutBuf& w, const Tensor& plane, PagedKVPlaneOrder 
     fp.cyclic_head_dim      = r.i32();
     fp.cyclic_lane_capacity = r.i32();
     fp.snapshot_version     = r.u32();
-    const std::uint64_t text_n =
-        static_cast<std::uint64_t>(fp.text_plane_count) * kDiskFingerprintPlanes;
-    const std::uint64_t backend_n =
-        static_cast<std::uint64_t>(fp.backend_plane_count) * kDiskFingerprintPlanes;
-    if (text_n / kDiskFingerprintPlanes != fp.text_plane_count ||
-        backend_n / kDiskFingerprintPlanes != fp.backend_plane_count ||
-        r.remain() < text_n || r.remain() - text_n < backend_n) {
+    const std::uint64_t plane_count =
+        static_cast<std::uint64_t>(text_plane_count) + backend_plane_count;
+    if (plane_count > (1U << 20) ||
+        plane_count > r.remain() / kDiskFingerprintPlaneBytes) {
         throw std::runtime_error("KV disk FINGERPRINT plane list is truncated");
     }
-    fp.text_plane_bytes.resize(static_cast<std::size_t>(text_n));
-    r.raw(fp.text_plane_bytes.data(), fp.text_plane_bytes.size());
-    fp.backend_plane_bytes.resize(static_cast<std::size_t>(backend_n));
-    r.raw(fp.backend_plane_bytes.data(), fp.backend_plane_bytes.size());
+    fp.text_planes.reserve(text_plane_count);
+    for (std::uint32_t i = 0; i < text_plane_count; ++i) {
+        fp.text_planes.push_back(decode_plane_schema(r, fp.page_size));
+    }
+    fp.backend_planes.reserve(backend_plane_count);
+    for (std::uint32_t i = 0; i < backend_plane_count; ++i) {
+        fp.backend_planes.push_back(decode_plane_schema(r, fp.page_size));
+    }
+    if (r.remain() != 0) {
+        throw std::runtime_error("KV disk FINGERPRINT has trailing bytes");
+    }
     return fp;
 }
 
@@ -757,8 +814,9 @@ void check_fingerprint(const DiskFingerprint& have, const DiskFingerprint& want)
     compare_fingerprint_field(have.kv_cache == want.kv_cache, "kv_cache");
     compare_fingerprint_field(have.speculative == want.speculative, "speculative");
     compare_fingerprint_field(have.page_size == want.page_size, "page_size");
-    compare_fingerprint_field(have.text_plane_count == want.text_plane_count, "text_plane_count");
-    compare_fingerprint_field(have.backend_plane_count == want.backend_plane_count,
+    compare_fingerprint_field(have.text_planes.size() == want.text_planes.size(),
+                              "text_plane_count");
+    compare_fingerprint_field(have.backend_planes.size() == want.backend_planes.size(),
                               "backend_plane_count");
     compare_fingerprint_field(have.gdn_conv_bytes == want.gdn_conv_bytes, "gdn_conv_bytes");
     compare_fingerprint_field(have.gdn_recurrent_bytes == want.gdn_recurrent_bytes,
@@ -772,9 +830,9 @@ void check_fingerprint(const DiskFingerprint& have, const DiskFingerprint& want)
     compare_fingerprint_field(have.cyclic_lane_capacity == want.cyclic_lane_capacity,
                               "cyclic_lane_capacity");
     compare_fingerprint_field(have.snapshot_version == want.snapshot_version, "snapshot_version");
-    compare_fingerprint_field(have.text_plane_bytes == want.text_plane_bytes, "text_plane_bytes");
-    compare_fingerprint_field(have.backend_plane_bytes == want.backend_plane_bytes,
-                              "backend_plane_bytes");
+    compare_fingerprint_field(have.text_planes == want.text_planes, "text_plane_schema");
+    compare_fingerprint_field(have.backend_planes == want.backend_planes,
+                              "backend_plane_schema");
 }
 
 [[nodiscard]] PrefixReusePath rewrite_path(RewriteCheckpointKind kind) {
@@ -920,13 +978,6 @@ try_decode_tombstone(const std::vector<std::uint8_t>& bytes) {
 
 } // namespace
 
-void write_plane_fingerprint(std::vector<std::uint8_t>& out, const Tensor& plane,
-                             PagedKVPlaneOrder order) {
-    OutBuf w;
-    append_plane_fingerprint(w, plane, order);
-    out.insert(out.end(), w.bytes.begin(), w.bytes.end());
-}
-
 DiskFingerprint make_disk_fingerprint(std::string model_id, std::string weights_id,
                                       KvCacheStorage kv_cache, SpeculativeBackend speculative,
                                       const PagedKVPool& text, const PagedKVPool* backend,
@@ -938,15 +989,15 @@ DiskFingerprint make_disk_fingerprint(std::string model_id, std::string weights_
     fp.kv_cache            = kv_cache;
     fp.speculative         = speculative;
     fp.page_size           = static_cast<std::uint32_t>(kPagedKVPageSize);
-    fp.text_plane_count    = static_cast<std::uint32_t>(text.plane_count());
-    fp.backend_plane_count = backend ? static_cast<std::uint32_t>(backend->plane_count()) : 0;
-    for (std::uint32_t i = 0; i < fp.text_plane_count; ++i) {
-        write_plane_fingerprint(fp.text_plane_bytes, text.plane(i), text.plane_order());
+    fp.text_planes.reserve(text.plane_count());
+    for (std::size_t i = 0; i < text.plane_count(); ++i) {
+        fp.text_planes.push_back(make_plane_schema(text.plane(i), text.plane_order()));
     }
     if (backend != nullptr) {
-        for (std::uint32_t i = 0; i < fp.backend_plane_count; ++i) {
-            write_plane_fingerprint(fp.backend_plane_bytes, backend->plane(i),
-                                    backend->plane_order());
+        fp.backend_planes.reserve(backend->plane_count());
+        for (std::size_t i = 0; i < backend->plane_count(); ++i) {
+            fp.backend_planes.push_back(
+                make_plane_schema(backend->plane(i), backend->plane_order()));
         }
     }
     if (gdn != nullptr) {
@@ -1242,7 +1293,7 @@ void KVDiskCache::open_directory() {
     std::filesystem::create_directories(config_.location / "packs");
     std::filesystem::create_directories(config_.location / "maps");
     // Keep empty legacy namespaces so stale external directory scans are
-    // harmless. v4 never writes or reads object payloads through them.
+    // harmless. The packed format never writes or reads object payloads through them.
     for (DiskObjectKind kind : {DiskObjectKind::Main, DiskObjectKind::Backend,
                                 DiskObjectKind::State, DiskObjectKind::Ledger,
                                 DiskObjectKind::Identity}) {
@@ -2934,6 +2985,7 @@ bool KVDiskCache::unlink_path(const std::filesystem::path& path) {
     }
     std::error_code ec;
     if (path.parent_path().filename() == "entries") {
+        if (fail_entry_unlink_) { return false; }
         std::uint64_t id = 0;
         try {
             id = static_cast<std::uint64_t>(std::stoull(path.filename().string()));
@@ -3007,7 +3059,7 @@ void KVDiskCache::bump_next_id(std::uint64_t& next, std::uint64_t seen) const no
 }
 
 void KVDiskCache::adopt_object_ids() {
-    // v4 obtains the durable global high-water mark from PACKSET and the
+    // The packed format obtains the durable global high-water mark from PACKSET and the
     // object-location map before entry metadata is scanned.
 }
 
@@ -7862,6 +7914,10 @@ void KVDiskCache::test_arm_fail_object_write() {
 
 void KVDiskCache::test_arm_fail_object_unlink() {
     fail_object_unlink_ = true;
+}
+
+void KVDiskCache::test_arm_fail_entry_unlink() {
+    fail_entry_unlink_ = true;
 }
 
 void KVDiskCache::test_arm_fail_prepare_spill() {
