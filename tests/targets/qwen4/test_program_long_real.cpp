@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <span>
 #include <sstream>
@@ -35,6 +36,7 @@ namespace {
 constexpr std::int32_t kVocabulary = 248320;
 constexpr std::int32_t kEos = verifier::kPleResetToken;
 constexpr std::size_t kCopyChunkBytes = 1U << 20;
+constexpr std::size_t kLayer0GdnConvStateBytes = 3U * 10240U * sizeof(std::uint16_t);
 constexpr std::array<std::int32_t, 11> kProbePositions = {
     3, 4, 5, 2047, 2048, 2049, 2050, 2051, 2052, 2053, 4095};
 constexpr std::array<std::uint64_t, 3> kNgramMultiplier = {
@@ -112,6 +114,78 @@ enum class ValidationKind {
 };
 
 bool finite_bf16(std::uint16_t bits) { return (bits & 0x7f80U) != 0x7f80U; }
+
+double bf16_value(std::uint16_t bits) {
+    return static_cast<double>(
+        std::bit_cast<float>(static_cast<std::uint32_t>(bits) << 16U));
+}
+
+double represented_logsumexp(std::span<const std::uint16_t> logits) {
+    double maximum = -std::numeric_limits<double>::infinity();
+    for (const std::uint16_t bits : logits) { maximum = std::max(maximum, bf16_value(bits)); }
+    double sum = 0.0;
+    for (const std::uint16_t bits : logits) { sum += std::exp(bf16_value(bits) - maximum); }
+    return maximum + std::log(sum);
+}
+
+int report_bf16_delta(std::string_view label, std::span<const std::uint16_t> actual,
+                      std::span<const std::uint16_t> reference) {
+    if (actual.size() != reference.size() || actual.empty()) {
+        std::cerr << label << " extent mismatch\n";
+        return 1;
+    }
+    double squared_delta = 0.0;
+    double squared_reference = 0.0;
+    double maximum_absolute = 0.0;
+    for (std::size_t index = 0; index < actual.size(); ++index) {
+        const double actual_value = bf16_value(actual[index]);
+        const double reference_value = bf16_value(reference[index]);
+        if (!std::isfinite(actual_value) || !std::isfinite(reference_value)) {
+            std::cerr << label << " contains a non-finite represented value\n";
+            return 1;
+        }
+        const double delta = actual_value - reference_value;
+        squared_delta += delta * delta;
+        squared_reference += reference_value * reference_value;
+        maximum_absolute = std::max(maximum_absolute, std::abs(delta));
+    }
+    const double relative_l2 =
+        std::sqrt(squared_delta / std::max(squared_reference, 1.0e-30));
+    std::cout << label << " relative_l2=" << relative_l2
+              << " maximum_absolute=" << maximum_absolute << '\n';
+    return 0;
+}
+
+int report_logits_behavior(std::string_view label,
+                           std::span<const std::uint16_t> actual,
+                           std::span<const std::uint16_t> reference) {
+    if (actual.size() != kVocabulary || reference.size() != kVocabulary) {
+        std::cerr << label << " vocabulary extent mismatch\n";
+        return 1;
+    }
+    const double actual_lse = represented_logsumexp(actual);
+    const double reference_lse = represented_logsumexp(reference);
+    double total_absolute = 0.0;
+    double maximum_absolute = 0.0;
+    std::size_t targets_above_one_nat = 0;
+    for (std::size_t target = 0; target < actual.size(); ++target) {
+        const double actual_nll = actual_lse - bf16_value(actual[target]);
+        const double reference_nll = reference_lse - bf16_value(reference[target]);
+        const double delta = std::abs(actual_nll - reference_nll);
+        total_absolute += delta;
+        maximum_absolute = std::max(maximum_absolute, delta);
+        targets_above_one_nat += delta > 1.0;
+    }
+    const double mean_absolute = total_absolute / static_cast<double>(actual.size());
+    std::cout << label << " mean_abs_nll_delta=" << mean_absolute
+              << " max_abs_nll_delta=" << maximum_absolute
+              << " targets_above_one_nat=" << targets_above_one_nat << '\n';
+    if (!std::isfinite(mean_absolute) || !std::isfinite(maximum_absolute)) {
+        std::cerr << label << " contains a non-finite represented NLL delta\n";
+        return 1;
+    }
+    return 0;
+}
 
 void validate_host_bytes(std::span<const std::uint8_t> bytes, ValidationKind kind,
                          std::string_view label, int& failures) {
@@ -601,9 +675,26 @@ struct RunEvidence {
     bool operator==(const RunEvidence&) const = default;
 };
 
+struct FinalWitness {
+    std::vector<std::uint16_t> logits;
+    std::vector<std::uint16_t> hidden;
+
+    bool operator==(const FinalWitness&) const = default;
+};
+
+struct PrefillEvidence {
+    FinalWitness final;
+    std::vector<std::uint8_t> continuation;
+    Digest128 continuation_digest;
+    Digest128 selector_digest;
+
+    bool operator==(const PrefillEvidence&) const = default;
+};
+
 RunEvidence run_sequence(verifier::Program& program, int replay,
                          std::vector<std::uint8_t>* captured_continuation,
                          const std::vector<std::uint8_t>* expected_continuation,
+                         FinalWitness* final_witness,
                          int& failures) {
     program.reset();
     if (program.frontier() != 0) {
@@ -645,6 +736,10 @@ RunEvidence run_sequence(verifier::Program& program, int replay,
         if (nll.size() != 1 || !std::isfinite(nll[0]) || nll[0] < 0.0F) {
             std::cerr << "invalid NLL at token " << position << '\n';
             ++failures;
+        }
+        if (final_witness != nullptr && position == verifier::kQsaCapacity - 1) {
+            final_witness->logits = copy_tensor<std::uint16_t>(result.logits);
+            final_witness->hidden = copy_tensor<std::uint16_t>(result.final_hidden);
         }
         const auto ple_rows = copy_tensor<std::int32_t>(result.ple_row_ids);
         observables.add_field("ple_rows", ple_rows.data(), ple_rows.size() * sizeof(ple_rows[0]));
@@ -720,6 +815,101 @@ RunEvidence run_sequence(verifier::Program& program, int replay,
     return {observables, probes, std::move(exact_probes), continuation};
 }
 
+PrefillEvidence run_prefill_sequence(verifier::Program& program,
+                                     std::span<const std::int32_t> chunks,
+                                     std::string_view label, int& failures) {
+    std::int32_t total = 0;
+    for (const std::int32_t width : chunks) {
+        if (width <= 0 || width > verifier::kMaximumPrefillChunk - total) {
+            throw std::logic_error("invalid Qwen4 long-prefill test partition");
+        }
+        total += width;
+    }
+    if (total != verifier::kQsaCapacity) {
+        throw std::logic_error("Qwen4 long-prefill test partition does not fill capacity");
+    }
+
+    program.reset();
+    std::array<std::int32_t, 2> ple_history{kEos, kEos};
+    std::int32_t offset = 0;
+    std::vector<std::int32_t> tokens;
+    tokens.reserve(verifier::kQsaCapacity);
+    for (std::int32_t position = 0; position < verifier::kQsaCapacity; ++position) {
+        tokens.push_back(sequence_token(position));
+    }
+    FinalWitness final;
+    Digest128 selector_digest;
+    const auto begin = std::chrono::steady_clock::now();
+    for (const std::int32_t width : chunks) {
+        std::vector<std::int32_t> expected_rows;
+        expected_rows.reserve(static_cast<std::size_t>(ops::kPleHeads) * width);
+        for (std::int32_t token = 0; token < width; ++token) {
+            const std::int32_t id = tokens[static_cast<std::size_t>(offset + token)];
+            const auto rows = expected_ple_rows(id, ple_history);
+            expected_rows.insert(expected_rows.end(), rows.begin(), rows.end());
+            ple_history = {ple_history[1], id};
+        }
+        const verifier::PrefillResultView result = program.prefill_chunk(
+            std::span<const std::int32_t>(tokens).subspan(
+                static_cast<std::size_t>(offset), static_cast<std::size_t>(width)));
+        if (result.begin_index != offset || result.end_index != offset + width - 1 ||
+            program.frontier() != offset + width) {
+            std::cerr << label << " prefill interval/frontier mismatch at " << offset << '\n';
+            ++failures;
+        }
+        if (copy_tensor<std::int32_t>(result.ple_row_ids) != expected_rows) {
+            std::cerr << label << " prefill PLE row panel mismatch at " << offset << '\n';
+            ++failures;
+        }
+        const auto counts = copy_tensor<std::int32_t>(result.qsa_selected_count);
+        const auto ids = copy_tensor<std::int32_t>(result.qsa_selected_ids);
+        if (counts.size() != static_cast<std::size_t>(width) ||
+            ids.size() != static_cast<std::size_t>(ops::kQsaSelectedCapacity) * width) {
+            std::cerr << label << " prefill QSA diagnostic extent mismatch at " << offset
+                      << '\n';
+            ++failures;
+        } else {
+            for (std::int32_t token = 0; token < width; ++token) {
+                const auto selected = std::span<const std::int32_t>(ids).subspan(
+                    static_cast<std::size_t>(token) * ops::kQsaSelectedCapacity,
+                    ops::kQsaSelectedCapacity);
+                const std::int32_t position = offset + token;
+                selector_digest.add_scalar(position);
+                selector_digest.add_scalar(counts[static_cast<std::size_t>(token)]);
+                selector_digest.add(selected.data(), selected.size_bytes());
+                failures += validate_selected_ids(
+                    selected, counts[static_cast<std::size_t>(token)], position, 47);
+            }
+        }
+        if (offset + width == verifier::kQsaCapacity) {
+            final.logits = copy_tensor<std::uint16_t>(result.logits);
+            final.hidden = copy_tensor<std::uint16_t>(result.final_hidden);
+        }
+        offset += width;
+    }
+
+    const auto represented_history = copy_tensor<std::int32_t>(program.state().ple_token_history());
+    if (!std::equal(represented_history.begin(), represented_history.end(), ple_history.begin())) {
+        std::cerr << label << " final PLE history mismatch\n";
+        ++failures;
+    }
+    std::vector<std::uint8_t> scratch(kCopyChunkBytes);
+    const Digest128 continuation_digest =
+        hash_continuation(program.state(), ple_history, scratch, failures);
+    PrefillEvidence evidence{.final = std::move(final),
+                             .continuation = capture_continuation(program.state()),
+                             .continuation_digest = continuation_digest,
+                             .selector_digest = selector_digest};
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+    std::cout << "Qwen4 long " << label << " seconds=" << seconds
+              << " input_tok_s=" << static_cast<double>(verifier::kQsaCapacity) / seconds
+              << " selector_hash=" << digest_string(selector_digest)
+              << " continuation_hash=" << digest_string(continuation_digest)
+              << '\n';
+    return evidence;
+}
+
 } // namespace
 
 int main() {
@@ -740,16 +930,93 @@ int main() {
         verifier::Program program(*model, device, verifier::DiagnosticSnapshots::Disabled);
         int failures = 0;
         std::vector<std::uint8_t> first_continuation;
-        const RunEvidence first = run_sequence(program, 0, &first_continuation, nullptr, failures);
+        FinalWitness scalar_final;
+        const RunEvidence first =
+            run_sequence(program, 0, &first_continuation, nullptr, &scalar_final, failures);
         const RunEvidence replay =
-            run_sequence(program, 1, nullptr, &first_continuation, failures);
+            run_sequence(program, 1, nullptr, &first_continuation, nullptr, failures);
         if (!(first == replay)) {
             std::cerr << "long-frontier observable/probe reset-replay mismatch\n";
             ++failures;
         }
+        constexpr std::array<std::int32_t, 1> kOneShot{verifier::kQsaCapacity};
+        const PrefillEvidence one_shot =
+            run_prefill_sequence(program, kOneShot, "prefill=4096", failures);
+        const PrefillEvidence one_shot_replay =
+            run_prefill_sequence(program, kOneShot, "prefill=4096-replay", failures);
+        if (!(one_shot == one_shot_replay)) {
+            std::cerr << "one-shot maximum-width prefill changed after reset/replay\n";
+            ++failures;
+        }
+        // Cross both the GDN 64-token scan boundary and QSA's 2051-to-2052 selector switch at
+        // nonzero Program frontiers while ending at the same maximum-capacity continuation.
+        constexpr std::array<std::int32_t, 5> kBoundaryPartition{64, 1, 1986, 1, 2044};
+        const PrefillEvidence partitioned = run_prefill_sequence(
+            program, kBoundaryPartition, "prefill=64+1+1986+1+2044", failures);
+        const PrefillEvidence partitioned_replay = run_prefill_sequence(
+            program, kBoundaryPartition, "prefill=64+1+1986+1+2044-replay", failures);
+        if (!(partitioned == partitioned_replay)) {
+            std::cerr << "boundary-partitioned maximum-width prefill changed after reset/replay\n";
+            ++failures;
+        }
+        std::cout << "Qwen4 one-shot/partition continuation_bit_identical="
+                  << (one_shot.continuation == partitioned.continuation ? "true" : "false")
+                  << " final_bit_identical="
+                  << (one_shot.final == partitioned.final ? "true" : "false")
+                  << " selector_bit_identical="
+                  << (one_shot.selector_digest == partitioned.selector_digest ? "true"
+                                                                               : "false")
+                  << '\n';
+        // Pin the current implementation profile's earliest-difference localization: the
+        // represented layer-0 BF16 convolution bytes are exact across scalar and both prefill
+        // schedules. This is a regression witness, not the GDN floating semantic criterion.
+        if (scalar_final.logits.empty() || one_shot.continuation.size() <
+                                                 kLayer0GdnConvStateBytes ||
+            partitioned.continuation.size() < kLayer0GdnConvStateBytes ||
+            first_continuation.size() < kLayer0GdnConvStateBytes ||
+            !std::equal(one_shot.continuation.begin(),
+                        one_shot.continuation.begin() + kLayer0GdnConvStateBytes,
+                        first_continuation.begin()) ||
+            !std::equal(partitioned.continuation.begin(),
+                        partitioned.continuation.begin() + kLayer0GdnConvStateBytes,
+                        first_continuation.begin())) {
+            std::cerr << "scalar/prefill layer-0 GDN convolution state differs before the "
+                         "qualified recurrence boundary\n";
+            ++failures;
+        }
+        // Cross-profile floating deltas are localization evidence only. The first differing
+        // persistent tensor is layer-0 GDN recurrence; the closed T=4096 one-shot and matching
+        // partition routes are admitted directly against the independent FP64 GDN oracle.
+        failures += report_bf16_delta("Qwen4 scalar/prefill final hidden",
+                                      one_shot.final.hidden, scalar_final.hidden);
+        failures += report_bf16_delta("Qwen4 scalar/prefill final logits",
+                                      one_shot.final.logits, scalar_final.logits);
+        failures += report_logits_behavior("Qwen4 scalar/prefill final logits",
+                                            one_shot.final.logits, scalar_final.logits);
+        failures += report_bf16_delta("Qwen4 one-shot/partition final hidden",
+                                      partitioned.final.hidden, one_shot.final.hidden);
+        failures += report_bf16_delta("Qwen4 one-shot/partition final logits",
+                                      partitioned.final.logits, one_shot.final.logits);
+        failures += report_logits_behavior("Qwen4 one-shot/partition final logits",
+                                            partitioned.final.logits, one_shot.final.logits);
+        const std::int32_t final_target = sequence_token(verifier::kQsaCapacity);
+        const double scalar_nll = represented_logsumexp(scalar_final.logits) -
+                                  bf16_value(scalar_final.logits[final_target]);
+        const double prefill_nll = represented_logsumexp(one_shot.final.logits) -
+                                   bf16_value(one_shot.final.logits[final_target]);
+        const double nll_delta = std::abs(prefill_nll - scalar_nll);
+        std::cout << "Qwen4 scalar/prefill final target=" << final_target
+                  << " scalar_nll=" << scalar_nll << " prefill_nll=" << prefill_nll
+                  << " absolute_delta=" << nll_delta << '\n';
+        if (!std::isfinite(scalar_nll) || !std::isfinite(prefill_nll)) {
+            std::cerr << "scalar/prefill final represented NLL is non-finite\n";
+            ++failures;
+        }
         std::cout << (failures == 0 ? "OK" : "FAIL")
                   << " qwen4_program_long_real tokens_per_replay=" << verifier::kQsaCapacity
-                  << " replays=2 probes=" << kProbePositions.size() << '\n';
+                  << " scalar_replays=2 prefill_profiles=2 prefill_replays=2 probes="
+                  << kProbePositions.size()
+                  << '\n';
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "Qwen4 long-frontier real-artifact execution failed: " << error.what()

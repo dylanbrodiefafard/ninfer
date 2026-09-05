@@ -215,13 +215,20 @@ NINFER_QWEN4_VERIFY_WEIGHTS=/path/to/qwen4_ud_iq1_s_verify.ninfer \
 ```
 
 The long-frontier companion keeps GR snapshots disabled and uses bounded streaming hashes rather
-than retaining per-token logits. It executes the full 4096-token capacity twice, validates QSA
-block/count/tail structure and current NVFP4 rows at positions 3-5, 2047-2053, and 4095, and keeps
-an exact 1,307,372-byte probe transcript. Per-token output hashes are supplementary; the probe
-transcript and full 157,147,144-byte continuation are compared byte-for-byte across reset/replay,
-and the raw continuation is compared again after each rejected overflow. Through position 2050
-every complete block fits; at positions 2051 and later it checks structural selection invariants
-and exact reset/replay rather than claiming an independent top-block score oracle:
+than retaining per-token logits. It executes the full 4096-token scalar capacity twice, validates
+QSA block/count/tail structure and current NVFP4 rows at positions 3-5, 2047-2053, and 4095, and
+keeps an exact 1,307,372-byte probe transcript. It then executes and exactly replays both one-shot
+T=4096 prefill and the `64+1+1986+1+2044` partition, crossing the GDN 64-token boundary and the QSA
+2051-to-2052 selector switch. Every route validates the complete persistent-state inventory,
+exact PLE addressing/history, and final-layer QSA selection structure. Scalar/prefill floating
+deltas are reported only as localization evidence: their first persistent difference is the
+layer-0 FP32 GDN recurrence after an exact 61,440-byte BF16 convolution state, and the independent
+GDN Op test admits both maximum-width schedules against its complete FP64 oracle. Per-token output
+hashes remain supplementary; the scalar probe transcript and full 157,147,144-byte continuation
+are compared byte-for-byte across reset/replay, and the raw continuation is compared again after
+each rejected overflow. Through position 2050 every complete block fits; at positions 2051 and
+later the test checks structural selection invariants and deterministic replay rather than
+claiming an independent top-block score oracle:
 
 ```bash
 NINFER_QWEN4_VERIFY_WEIGHTS=/path/to/qwen4_ud_iq1_s_verify.ninfer \

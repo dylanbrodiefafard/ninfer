@@ -413,12 +413,11 @@ arithmetic or QSA offload.
 
 The corresponding transfer-free public-Op checkpoints remained stable: fully resident sparse MoE
 was 131.180/141.740 us for IQ1_S fixed-hot/rotating routes and 123.269/135.063 us for IQ2_XXS;
-the QSA selector/attention pair was 10.464/4.960 us at frontier 1 and 111.040/41.184 us at frontier
-4096. Q5_K block-linear kernels were the largest compute family in the longer trace at 509.018 ms,
-25.3% of CUDA-kernel time. Consequently, further tuning of host staging would optimize only this
-temporary verifier. Architecture-transferable performance work remains the fully resident MoE and
-Q5_K compute path, with the already-qualified long-frontier QSA route retained unchanged until a
-measured public-Op candidate wins.
+the original QSA selector/attention pair was 10.464/4.960 us at frontier 1 and 111.040/41.184 us at
+frontier 4096. Q5_K block-linear kernels were the largest compute family in the longer trace at
+509.018 ms, 25.3% of CUDA-kernel time. Consequently, further tuning of host staging would optimize
+only this temporary verifier. Architecture-transferable performance work remains the fully
+resident MoE, Q5_K compute, and public QSA paths.
 
 A later resident-width tranche generalized that same semantic Op to T=1..4096 without changing
 the mapped-host Program placement. T<256 repeats the accepted scalar implementation; T>=256 uses a
@@ -472,9 +471,11 @@ retained about 5.32 GB free after model, state, and maximum prefill storage cons
 
 On the frozen four-token real-artifact witness, scalar T=1 execution, one-shot T=4 prefill, and a
 1+3 partition produced bit-identical final hidden, final logits, next-token logits, and complete
-represented continuation state. The integration test also exact-checks the final QSA layer's
-per-column causal selected IDs/counts, PLE row panel and committed token history, EOS split across
-calls, and pre-enqueue capacity rejection without state mutation.
+represented continuation state. Direct T=1 prefill is exact against scalar execution, and a
+scalar-token prefix followed by a T=3 prefill suffix closes to the same represented outputs and
+state. The integration test also exact-checks the final QSA layer's per-column causal selected
+IDs/counts, PLE row panel and committed token history, EOS split across calls as both 1+2 and 2+1,
+and pre-enqueue capacity rejection without state mutation.
 
 With NVFP4-G16 QSA state and the final vocabulary head included, three same-process width-512 runs
 measured 214.00, 261.82, and 262.82 input token/s; the latter two are process-warm mapped-page-cache
@@ -526,6 +527,32 @@ changed from this sweep. The retained PLE dependency schedule creates measured o
 matched pre/post throughput A/B, so the absolute Program baselines above are not attributed to it.
 The scheduling opportunity remains applicable to a future all-GPU-fit core checkpoint only when
 it retains this same RAM-resident PLE profile.
+
+The maximum-width numerical gate independently qualifies the complete GDN recurrence at T=4096
+and the matching `64+1+1986+1+2044` partition against one FP64 oracle, including every BF16 output
+and the final FP32 state. The real artifact then executes scalar T=1 over all 4096 tokens twice,
+one-shot T=4096 prefill twice, and the same five-part prefill twice. Each profile resets and
+replays bit-for-bit while validating every persistent tensor, PLE history, and QSA structural
+invariant. Cross-profile floating results are diagnostics rather than a second admission
+criterion: the first persistent difference is the layer-0 FP32 GDN recurrence after an exact
+61,440-byte BF16 convolution prefix. Scalar versus one-shot final logits had relative L2 0.128898,
+maximum absolute delta 0.532227, and an all-target maximum NLL delta of 0.538495 nat. One-shot
+versus partitioned logits had relative L2 0.190362, maximum absolute delta 0.949219, and an
+all-target maximum NLL delta of 0.978671 nat; no target exceeded one nat in either diagnostic.
+
+The QSA score kernel now pools its 128 represented key dimensions cooperatively, retains the
+per-dimension BF16 cast and original lane-0 norm, RoPE, dot-product, and score association, and
+omits the score launch when fewer than four visible entries form no complete block. A matched
+101-sample launch-policy sweep compared one versus 128 threads per score block. Selector medians
+in microseconds
+were 78.112/73.952 at frontier 4, 82.240/77.824 at 64, 86.048/81.440 at 256,
+88.000/83.840 at 1023, 87.808/83.968 at 1024, 92.000/87.904 at 2051, and
+98.272/94.240 at 4096, so the retained route uses 128 threads for every nonempty scored frontier.
+The independent QSA oracle and exact selector tests pass unchanged. In the maximum-width real run,
+one-shot replays measured 285.813 and 287.182 input token/s; boundary-partitioned replays measured
+273.209 and 275.903 input token/s. These Program rates overlap the prior warm one-shot baseline,
+as expected because QSA was only 10.6% of the prior T=4096 profile and its score stage is only part
+of QSA; no whole-Program speedup is attributed to this Op result.
 
 ## 3. Exact component totals
 

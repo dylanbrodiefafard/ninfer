@@ -401,6 +401,7 @@ int main() {
         std::array<std::vector<TokenSnapshot>, 2> runs;
         std::array<std::vector<float>, 2> nlls;
         std::vector<std::uint8_t> first_continuation;
+        std::vector<std::uint8_t> first_token_continuation;
         int failures = 0;
         for (std::size_t replay = 0; replay < runs.size(); ++replay) {
             program.reset();
@@ -422,6 +423,10 @@ int main() {
                     failures);
                 nlls[replay].push_back(std::bit_cast<float>(snapshot.nll_bits));
                 runs[replay].push_back(std::move(snapshot));
+                if (replay == 0 && token == 0) {
+                    first_token_continuation =
+                        snapshot_continuation(program.state(), failures);
+                }
             }
             const auto continuation = snapshot_continuation(program.state(), failures);
             if (replay == 0) {
@@ -444,17 +449,33 @@ int main() {
             std::vector<std::uint16_t> continuation_logits;
             std::uint32_t continuation_nll = 0;
         };
+        enum class PrefillPrefix {
+            None,
+            Prefill,
+            PrefillAfterEos,
+            Scalar,
+        };
         const auto capture_prefill = [&](std::span<const std::int32_t> ids,
-                                         bool partitioned) {
+                                         PrefillPrefix prefix) {
             program.reset();
             verifier::PrefillResultView result;
-            if (partitioned) {
+            if (prefix == PrefillPrefix::Prefill) {
                 (void)program.prefill_chunk(ids.first(1));
+                result = program.prefill_chunk(ids.subspan(1));
+            } else if (prefix == PrefillPrefix::PrefillAfterEos) {
+                (void)program.prefill_chunk(ids.first(2));
+                result = program.prefill_chunk(ids.subspan(2));
+            } else if (prefix == PrefillPrefix::Scalar) {
+                (void)program.execute_token(ids.front(), ids[1]);
                 result = program.prefill_chunk(ids.subspan(1));
             } else {
                 result = program.prefill_chunk(ids);
             }
-            if (result.begin_index != (partitioned ? 1 : 0) ||
+            const std::int32_t prefix_width =
+                prefix == PrefillPrefix::None
+                    ? 0
+                    : prefix == PrefillPrefix::PrefillAfterEos ? 2 : 1;
+            if (result.begin_index != prefix_width ||
                 result.end_index != static_cast<std::int32_t>(ids.size() - 1) ||
                 program.frontier() != static_cast<std::int32_t>(ids.size())) {
                 std::cerr << "prefill frontier/result interval mismatch\n";
@@ -478,7 +499,7 @@ int main() {
                 history = {history[1], id};
             }
             const std::size_t row_begin =
-                partitioned ? static_cast<std::size_t>(ops::kPleHeads) : 0;
+                static_cast<std::size_t>(prefix_width) * ops::kPleHeads;
             if (!std::equal(snapshot.rows.begin(), snapshot.rows.end(),
                             expected_rows.begin() + static_cast<std::ptrdiff_t>(row_begin))) {
                 std::cerr << "prefill PLE row panel mismatch\n";
@@ -523,8 +544,20 @@ int main() {
             return snapshot;
         };
 
-        const PrefillSnapshot one_shot = capture_prefill(kInputs, false);
-        const PrefillSnapshot replay = capture_prefill(kInputs, false);
+        program.reset();
+        const auto width_one_result =
+            program.prefill_chunk(std::span(kInputs).first(1));
+        const auto width_one_state = snapshot_continuation(program.state(), failures);
+        if (copy_tensor<std::uint16_t>(width_one_result.logits) != runs[0].front().logits ||
+            copy_tensor<std::uint16_t>(width_one_result.final_hidden) !=
+                runs[0].front().final_hidden ||
+            width_one_state != first_token_continuation) {
+            std::cerr << "prefill T=1/scalar represented state or output mismatch\n";
+            ++failures;
+        }
+
+        const PrefillSnapshot one_shot = capture_prefill(kInputs, PrefillPrefix::None);
+        const PrefillSnapshot replay = capture_prefill(kInputs, PrefillPrefix::None);
         if (one_shot.logits != replay.logits || one_shot.hidden != replay.hidden ||
             one_shot.rows != replay.rows || one_shot.state != replay.state ||
             one_shot.continuation_logits != replay.continuation_logits ||
@@ -532,7 +565,8 @@ int main() {
             std::cerr << "prefill changed after deterministic reset/replay\n";
             ++failures;
         }
-        const PrefillSnapshot partitioned = capture_prefill(kInputs, true);
+        const PrefillSnapshot partitioned =
+            capture_prefill(kInputs, PrefillPrefix::Prefill);
         if (partitioned.state != one_shot.state) {
             std::cerr << "prefill one-shot/partition represented state mismatch\n";
             ++failures;
@@ -551,9 +585,44 @@ int main() {
             std::cerr << "prefill/scalar represented outputs mismatch\n";
             ++failures;
         }
+        const PrefillSnapshot scalar_to_prefill =
+            capture_prefill(kInputs, PrefillPrefix::Scalar);
+        if (scalar_to_prefill.state != one_shot.state ||
+            scalar_to_prefill.hidden != one_shot.hidden ||
+            scalar_to_prefill.logits != one_shot.logits ||
+            scalar_to_prefill.continuation_logits != one_shot.continuation_logits ||
+            scalar_to_prefill.continuation_nll != one_shot.continuation_nll) {
+            std::cerr << "scalar-prefix/prefill-suffix represented continuation mismatch\n";
+            ++failures;
+        }
 
         constexpr std::array<std::int32_t, 3> eos_crossing{48, kEos, 17120};
-        const PrefillSnapshot eos_result = capture_prefill(eos_crossing, false);
+        const PrefillSnapshot eos_result =
+            capture_prefill(eos_crossing, PrefillPrefix::None);
+        const PrefillSnapshot eos_prefill_split =
+            capture_prefill(eos_crossing, PrefillPrefix::Prefill);
+        const PrefillSnapshot eos_after_split =
+            capture_prefill(eos_crossing, PrefillPrefix::PrefillAfterEos);
+        const PrefillSnapshot eos_scalar_split =
+            capture_prefill(eos_crossing, PrefillPrefix::Scalar);
+        if (eos_prefill_split.state != eos_result.state ||
+            eos_prefill_split.hidden != eos_result.hidden ||
+            eos_prefill_split.logits != eos_result.logits ||
+            eos_prefill_split.continuation_logits != eos_result.continuation_logits ||
+            eos_prefill_split.continuation_nll != eos_result.continuation_nll ||
+            eos_after_split.state != eos_result.state ||
+            eos_after_split.hidden != eos_result.hidden ||
+            eos_after_split.logits != eos_result.logits ||
+            eos_after_split.continuation_logits != eos_result.continuation_logits ||
+            eos_after_split.continuation_nll != eos_result.continuation_nll ||
+            eos_scalar_split.state != eos_result.state ||
+            eos_scalar_split.hidden != eos_result.hidden ||
+            eos_scalar_split.logits != eos_result.logits ||
+            eos_scalar_split.continuation_logits != eos_result.continuation_logits ||
+            eos_scalar_split.continuation_nll != eos_result.continuation_nll) {
+            std::cerr << "EOS one-shot/split represented continuation mismatch\n";
+            ++failures;
+        }
         if (eos_result.rows.size() !=
             static_cast<std::size_t>(ops::kPleHeads) * eos_crossing.size()) {
             std::cerr << "EOS-crossing PLE panel extent mismatch\n";
