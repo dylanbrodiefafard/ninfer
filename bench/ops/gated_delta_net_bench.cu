@@ -555,9 +555,15 @@ std::string running_implementation(std::int32_t qk_heads, std::int32_t value_hea
     if (full_tokens == 0) { return "public.recurrent.qk_fused"; }
     const bool fused_q =
         gated_delta_net_detail::uses_fused_q_normalization(qk_heads, value_heads, tokens, true);
+    const bool fused_k =
+        gated_delta_net_detail::uses_fused_k_normalization(qk_heads, value_heads, tokens, true);
     if (full_tokens == tokens) {
-        return fused_q ? "public.l2norm_k+chunked.q_norm_fused_output"
-                       : "public.l2norm_x2+chunked";
+        if (fused_q && fused_k) { return "public.chunked.q_norm_fused_output+k_norm_fused_prepare"; }
+        if (fused_q) { return "public.l2norm_k+chunked.q_norm_fused_output"; }
+        return "public.l2norm_x2+chunked";
+    }
+    if (fused_q && fused_k) {
+        return "public.chunked.q_norm_fused_output+k_norm_fused_prepare+recurrent_tail";
     }
     return fused_q ? "public.l2norm_k+chunked.q_norm_fused_output+recurrent_tail"
                    : "public.l2norm_x2+chunked+recurrent_tail";
@@ -780,7 +786,7 @@ std::vector<BenchRow> run_chunked(const Options& options, std::int32_t tokens, D
     prepare.H_qk         = problem.qk_heads;
     prepare.H_v          = problem.value_heads;
     prepare.L            = tokens;
-    prepare.k            = static_cast<const __nv_bfloat16*>(k.data);
+    prepare.k_private    = k.data;
     prepare.v            = static_cast<const __nv_bfloat16*>(v.data);
     prepare.g_in         = static_cast<const float*>(g.data);
     prepare.beta         = static_cast<const float*>(beta.data);

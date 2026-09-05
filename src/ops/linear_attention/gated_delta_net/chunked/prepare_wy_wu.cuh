@@ -387,15 +387,18 @@ compute_store_wu_panel(SmemTile<BT> T_view, SmemTile<WU_PANEL_COLS> panel,
     }
 }
 
-template <bool K_F16, int K_PANEL_COLS, int WU_PANEL_COLS, int BLOCK_WARPS>
+template <bool NORMALIZE_K, bool K_F16, int K_PANEL_COLS, int WU_PANEL_COLS, int BLOCK_WARPS>
 __global__ void
-prepare_wy_wu_kernel(const void* __restrict__ k_raw, const __nv_bfloat16* __restrict__ v_in,
+prepare_wy_wu_kernel(void* __restrict__ k_private_raw,
+                     const __nv_bfloat16* __restrict__ k_source,
+                     const __nv_bfloat16* __restrict__ v_in,
                      const float* __restrict__ g_in, const float* __restrict__ beta_in,
                      void* __restrict__ W_raw, void* __restrict__ U_raw,
                      float* __restrict__ g_cumsum_out, head_map qk_map) {
     static_assert(BLOCK_WARPS == 4 || BLOCK_WARPS == 8);
     static_assert(BLOCK_WARPS % N_SUB == 0);
     static_assert(WU_PANEL_COLS % (BLOCK_WARPS / N_SUB) == 0);
+    static_assert(!NORMALIZE_K || (K_F16 && K_PANEL_COLS == 64 && BLOCK_WARPS == 8));
 
     using dims                  = kernel_dims<K_PANEL_COLS, WU_PANEL_COLS>;
     constexpr int BLOCK_THREADS = BLOCK_WARPS * ninfer::ops::kWarpSize;
@@ -413,7 +416,8 @@ prepare_wy_wu_kernel(const void* __restrict__ k_raw, const __nv_bfloat16* __rest
 
     // stage_smem aliases 16-bit K (WY-B), FP32 Schur scratch (WY-D), and one
     // pre-scaled FP32 V/K panel (WU). All handovers are block-barrier guarded.
-    const auto* const k_in = static_cast<const KType*>(k_raw);
+    const auto* const k_in = static_cast<const KType*>(k_private_raw);
+    auto* const k_normalized_out = static_cast<__half*>(k_private_raw);
     auto* const W          = static_cast<KType*>(W_raw);
     auto* const U          = static_cast<KType*>(U_raw);
     auto* const K_smem     = reinterpret_cast<KType*>(stage_smem);
@@ -422,6 +426,7 @@ prepare_wy_wu_kernel(const void* __restrict__ k_raw, const __nv_bfloat16* __rest
     SmemTile<BT> M_view{T_inv_smem};
     SmemTile<BT> T_view{T_inv_smem};
     Smem16Tile<KType, K_PANEL_COLS> K_view{K_smem};
+    Smem16Tile<KType, K_PANEL_COLS> K_second_view{reinterpret_cast<KType*>(T_inv_smem)};
     SmemTile<WU_PANEL_COLS> WU_view{stage_smem};
 
     const int tid    = static_cast<int>(threadIdx.x);
@@ -488,12 +493,26 @@ prepare_wy_wu_kernel(const void* __restrict__ k_raw, const __nv_bfloat16* __rest
     // Raw K remains at its represented BF16 boundary. Fused normalization uses
     // private FP16 so its extra significand bits reach native m16n8k16. The KKT
     // accumulator remains FP32.
-    float A_reg[N_SUB][8] = {};
-
     const int64_t k_base = cs * k_stride_t + static_cast<int64_t>(qk_map.qk_head(h_v)) * kStateDim;
     const int64_t v_base = cs * v_stride_t + static_cast<int64_t>(h_v) * kStateDim;
     constexpr int K_VECS_PER_ROW = K_PANEL_COLS / 8;
     constexpr int K_STAGE_VECS   = BT * K_VECS_PER_ROW;
+
+    if constexpr (NORMALIZE_K) {
+#pragma unroll
+        for (int row = warp; row < BT; row += BLOCK_WARPS) {
+            const auto* source_row = reinterpret_cast<const __nv_bfloat162*>(
+                k_source + k_base + static_cast<std::int64_t>(row) * k_stride_t);
+            __half2 normalized[2];
+            normalize_bf16_128_row_to_fp16_lane(source_row, lane, normalized);
+
+            store_vec(K_view.ptr(row, lane * 2), normalized[0]);
+            store_vec(K_second_view.ptr(row, lane * 2), normalized[1]);
+        }
+        __syncthreads();
+    }
+
+    float A_reg[N_SUB][8] = {};
 
     const int a_mat    = lane >> 3;
     const int a_rin    = lane & 7;
@@ -502,13 +521,13 @@ prepare_wy_wu_kernel(const void* __restrict__ k_raw, const __nv_bfloat16* __rest
     const int b_rin    = lane & 7;
     const int b_koff   = ((lane >> 3) & 1) << 3;
 
-    auto kkt_strip = [&]<int N_OWNED>() {
+    auto kkt_strip = [&]<int N_OWNED>(Smem16Tile<KType, K_PANEL_COLS> panel_view) {
 #pragma unroll
         for (int k_tile = 0; k_tile < dims::K_TILES_PER_PANEL; ++k_tile) {
             const int k_off = k_tile * BF16_MMA_K;
             unsigned af[4];
             ldmatrix_x4(af[0], af[1], af[2], af[3],
-                        smem_addr(K_view.ptr(warp * BC + a_rowoff, k_off + a_coloff)));
+                        smem_addr(panel_view.ptr(warp * BC + a_rowoff, k_off + a_coloff)));
 
 #pragma unroll
             for (int j_sub = 0; j_sub < N_OWNED; ++j_sub) {
@@ -516,7 +535,7 @@ prepare_wy_wu_kernel(const void* __restrict__ k_raw, const __nv_bfloat16* __rest
                 for (int n_tile = 0; n_tile < 2; ++n_tile) {
                     const int row_b = j_sub * BC + n_tile * MMA_N + b_rin;
                     unsigned bf[2];
-                    ldmatrix_x2(bf[0], bf[1], smem_addr(K_view.ptr(row_b, k_off + b_koff)));
+                    ldmatrix_x2(bf[0], bf[1], smem_addr(panel_view.ptr(row_b, k_off + b_koff)));
                     if constexpr (K_F16) {
                         mma_f16(A_reg[j_sub][n_tile * 4 + 0], A_reg[j_sub][n_tile * 4 + 1],
                                 A_reg[j_sub][n_tile * 4 + 2], A_reg[j_sub][n_tile * 4 + 3], af[0],
@@ -535,30 +554,53 @@ prepare_wy_wu_kernel(const void* __restrict__ k_raw, const __nv_bfloat16* __rest
     for (int kp = 0; kp < N_K_PANELS; ++kp) {
         const int panel_col = kp * K_PANEL_COLS;
 
+        if constexpr (!NORMALIZE_K) {
 #pragma unroll
-        for (int v = tid; v < K_STAGE_VECS; v += BLOCK_THREADS) {
-            const int row    = v / K_VECS_PER_ROW;
-            const int col8   = (v - row * K_VECS_PER_ROW) * 8;
-            const KType* src = k_in + k_base + (int64_t)row * k_stride_t + panel_col + col8;
-            cp_async<16, Cache::cg>(K_view.ptr(row, col8), src);
+            for (int v = tid; v < K_STAGE_VECS; v += BLOCK_THREADS) {
+                const int row    = v / K_VECS_PER_ROW;
+                const int col8   = (v - row * K_VECS_PER_ROW) * 8;
+                const KType* src = k_in + k_base + (int64_t)row * k_stride_t + panel_col + col8;
+                cp_async<16, Cache::cg>(K_view.ptr(row, col8), src);
+            }
+            cp_commit();
+            cp_wait<0>();
+            __syncthreads();
         }
-        cp_commit();
-        cp_wait<0>();
-        __syncthreads();
+
+        const auto panel_view = NORMALIZE_K && kp == 1 ? K_second_view : K_view;
 
         switch (warp) {
         case 0:
-            kkt_strip.template operator()<1>();
+            kkt_strip.template operator()<1>(panel_view);
             break;
         case 1:
-            kkt_strip.template operator()<2>();
+            kkt_strip.template operator()<2>(panel_view);
             break;
         case 2:
-            kkt_strip.template operator()<3>();
+            kkt_strip.template operator()<3>(panel_view);
             break;
         case 3:
-            kkt_strip.template operator()<4>();
+            kkt_strip.template operator()<4>(panel_view);
             break;
+        }
+
+        // The exact-H48 owner publishes its resident FP16 K panel while the first four warps
+        // execute KKT. Vectorized helper-warp copies overlap publication with that work; the block
+        // barrier below closes these writes before this CTA's later W-phase reread.
+        if constexpr (NORMALIZE_K) {
+            if (warp >= WY_WARPS) {
+                constexpr int HELPER_THREADS = (BLOCK_WARPS - WY_WARPS) * ninfer::ops::kWarpSize;
+                const int helper_tid         = tid - WY_WARPS * ninfer::ops::kWarpSize;
+#pragma unroll
+                for (int v = helper_tid; v < K_STAGE_VECS; v += HELPER_THREADS) {
+                    const int row  = v / K_VECS_PER_ROW;
+                    const int col8 = (v - row * K_VECS_PER_ROW) * 8;
+                    const uint4 packed = load_vec<uint4>(panel_view.ptr(row, col8));
+                    store_vec(k_normalized_out + k_base +
+                                  static_cast<std::int64_t>(row) * k_stride_t + panel_col + col8,
+                              packed);
+                }
+            }
         }
 
         // The wide route's four W/U helper warps would otherwise wait for the
