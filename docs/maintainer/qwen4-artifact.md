@@ -287,7 +287,12 @@ test executed frozen
 teacher-forced pairs `48->16451`, `16451->17120`, `17120->22188`, and `22188->11988`, producing
 finite NLLs `3.47466`, `14.0819`, `12.4137`, and `8.87907` (four-position PPL `16520.4`) and an
 exact reset/replay match for logits, NLL bits, final hidden, PLE rows/state, both GR boundaries,
-all GDN/QSA state, QSA ids/counts/current NVFP4 rows, and MoE ids/weights. The corresponding pinned
+all GDN/QSA state, QSA ids/counts/current NVFP4 rows, and MoE ids/weights. For every shifted pair,
+the test also independently decodes all 248,320 returned BF16 logits and evaluates stable FP64
+log-sum-exp minus the exact target logit. The returned FP32 NLL must match that represented-output
+oracle under the admitted NLL Op criterion (`2e-3` absolute plus `1e-5` relative), covering the
+Program's vocabulary-head extent, target wiring, and token-position shift together. The
+corresponding pinned
 601-token llama.cpp trace began with NLLs `3.05634404`, `13.2171541`, `12.0150434`, and
 `8.82161897`; this four-token prefix satisfies the coarse bounds and remains useful localization
 evidence, not numerical-identity evidence, an Op tolerance, or a
