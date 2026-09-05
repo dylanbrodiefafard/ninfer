@@ -18,6 +18,7 @@
 #    include "ops/common/memory.cuh"
 #    include "ops/common/warp.cuh"
 #    include <cuda_bf16.h>
+#    include <cuda_fp16.h>
 #    define NINFER_KERNELS_HOST_DEVICE __host__ __device__
 #else
 #    define NINFER_KERNELS_HOST_DEVICE
@@ -94,6 +95,29 @@ issue_load_bf16_to_float_vec4(View view, const __nv_bfloat16* __restrict__ gmem_
 }
 
 inline constexpr float kLog2E = 1.4426950408889634f;
+
+static __device__ __forceinline__ void
+normalize_bf16_128_row_to_fp16_lane(const __nv_bfloat162* row, int lane,
+                                    __half2 (&normalized)[2]) {
+    __nv_bfloat162 values[2];
+    float sum = 0.0f;
+#    pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        const int pair  = lane + k * kWarpSize;
+        values[k]       = row[pair];
+        const float2 xf = __bfloat1622float2(values[k]);
+        sum += xf.x * xf.x + xf.y * xf.y;
+    }
+
+    sum       = warp_reduce_sum(sum);
+    float inv = lane == 0 ? rsqrtf(sum + 1.0e-6f) : 0.0f;
+    inv       = __shfl_sync(kFullWarpMask, inv, 0);
+#    pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        const float2 xf = __bfloat1622float2(values[k]);
+        normalized[k]   = __floats2half2_rn(xf.x * inv, xf.y * inv);
+    }
+}
 
 #endif // __CUDACC__
 

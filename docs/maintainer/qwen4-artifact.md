@@ -544,6 +544,29 @@ accumulated-state correctness bug. A forced direct-recurrence candidate improved
 but changed the public Op median from 98.304 to 520.192 us at T=512 and from 851.968 to
 4,113.408 us at T=4096, so it was rejected and removed.
 
+The retained exact `Hq=Hv=48` prefill route now normalizes raw BF16 Q directly into the
+chunk-output kernel's resident FP16 shared tile once the full-chunk extent reaches 448 tokens. It
+uses the same per-lane FP32 accumulation, warp reduction, `rsqrtf(sum+1e-6)`, and FP16
+round-to-nearest helper as the standalone normalizer, so the private represented-Q profile is
+unchanged. Normalized K remains materialized because prepare, state passing, and output all consume
+it. Grouped-head and shorter profiles retain the prior two-normalizer route. Three alternating
+101-sample cold-L2 public-Op
+runs had median-of-medians of 102.400/100.352 us for materialized/fused at T=512 and
+866.304/802.816 us at T=4096, improvements of 2.0% and 7.33%. At the retained crossover, T=448
+measured 90.112/88.064 us for materialized/fused; candidates at T=64, 128, 192, 256, 320, and 384
+lost, so they are not reachable. The admitted route removes one graph node, the normalized-Q
+write/read, and 6/48 MiB of workspace at T=512/4096. Its single-/multi-job kernels use 126/128
+registers per thread versus 122/123 for the retained materialized-Q kernels, with 24 KiB shared
+memory and no local storage or stack spill.
+
+At whole-Program scope, the mapped expert banks dominate this preview artifact. Process-warm
+width-512 measurements overlapped at 270.41/269.90 input token/s before the change and
+270.48/269.95 after it; immediate scalar decode remained about 24--25 token/s and cannot select
+the fusion. A separate process-warm width-4096 candidate run measured 293.27 input token/s. The
+maximum-width correctness gate measured one-shot replays at 287.69 and 287.62 input token/s and
+reproduced complete state and selector hashes. These are diagnostic bounds rather than an
+end-to-end speedup claim; the directly measured public GDN Op is the performance admission.
+
 The real artifact then executes scalar T=1 over all 4096 tokens twice, one-shot T=4096 prefill
 twice, and the same five-part prefill twice. Each profile resets and replays bit-for-bit while
 validating every persistent tensor, PLE history, and QSA structural invariant. Cross-profile

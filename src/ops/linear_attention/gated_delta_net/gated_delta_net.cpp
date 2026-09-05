@@ -6,6 +6,7 @@
 #include "ops/linear_attention/gated_delta_net/common.h"
 #include "ops/linear_attention/gated_delta_net/launch.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -188,8 +189,14 @@ ChunkedWorkspace allocate_chunked_workspace(Allocator& allocator, std::int32_t q
         (tokens / detail::gated_delta_net::kChunkSize) * detail::gated_delta_net::kChunkSize;
     if (full == 0) { return out; }
     if (normalize_qk) {
-        out.normalized_q =
-            allocator.alloc(DType::FP16, {detail::gated_delta_net::kStateDim, qk_heads, tokens});
+        // In the exact Qwen4 geometry, each chunk-output CTA owns one distinct Q head and
+        // normalizes it directly into its resident shared-memory tile. Retain materialized Q for
+        // every other profile.
+        if (!detail::gated_delta_net::uses_fused_q_normalization(qk_heads, value_heads, tokens,
+                                                                 normalize_qk)) {
+            out.normalized_q = allocator.alloc(
+                DType::FP16, {detail::gated_delta_net::kStateDim, qk_heads, tokens});
+        }
         out.normalized_k =
             allocator.alloc(DType::FP16, {detail::gated_delta_net::kStateDim, qk_heads, tokens});
     }
@@ -210,7 +217,20 @@ std::size_t gated_delta_net_workspace_capacity_bytes(std::int32_t qk_heads,
     }
     WorkspaceLayoutBuilder layout;
     (void)allocate_chunked_workspace(layout, qk_heads, value_heads, max_tokens, normalize_qk);
-    return layout.peak_bytes(1);
+    std::size_t peak = layout.peak_bytes(1);
+    // The fused route drops normalized-Q storage at its measured crossover, so workspace is not
+    // monotonic at that boundary. Preserve the interval query's maximum-capacity contract.
+    if (!detail::gated_delta_net::uses_fused_q_normalization(
+            qk_heads, value_heads, min_tokens, normalize_qk) &&
+        detail::gated_delta_net::uses_fused_q_normalization(qk_heads, value_heads, max_tokens,
+                                                            normalize_qk)) {
+        WorkspaceLayoutBuilder before_fusion;
+        (void)allocate_chunked_workspace(before_fusion, qk_heads, value_heads,
+                                         detail::gated_delta_net::kFusedQNormalizationMinTokens - 1,
+                                         normalize_qk);
+        peak = std::max(peak, before_fusion.peak_bytes(1));
+    }
+    return peak;
 }
 
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
@@ -251,27 +271,32 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
     const std::int32_t T = q.ne[2];
     const std::int32_t T_full =
         (T / detail::gated_delta_net::kChunkSize) * detail::gated_delta_net::kChunkSize;
+    const bool fuse_q_normalization =
+        detail::gated_delta_net::uses_fused_q_normalization(q.ne[1], v.ne[1], T, normalize_qk);
     ChunkedWorkspace scratch = allocate_chunked_workspace(ws, q.ne[1], v.ne[1], T, normalize_qk);
     if (normalize_qk && T_full > 0) {
-        Tensor q_source     = q.slice(2, 0, T_full);
         Tensor k_source     = k.slice(2, 0, T_full);
-        Tensor q_normalized = scratch.normalized_q.slice(2, 0, T_full);
         Tensor k_normalized = scratch.normalized_k.slice(2, 0, T_full);
-        detail::gated_delta_net::launch_normalize_fp16(q_source, q_normalized, stream);
+        if (!fuse_q_normalization) {
+            Tensor q_source     = q.slice(2, 0, T_full);
+            Tensor q_normalized = scratch.normalized_q.slice(2, 0, T_full);
+            detail::gated_delta_net::launch_normalize_fp16(q_source, q_normalized, stream);
+        }
         detail::gated_delta_net::launch_normalize_fp16(k_source, k_normalized, stream);
     }
     if (T_full > 0) {
-        Tensor q_full =
-            normalize_qk ? scratch.normalized_q.slice(2, 0, T_full) : q.slice(2, 0, T_full);
+        Tensor q_full = normalize_qk && !fuse_q_normalization
+                            ? scratch.normalized_q.slice(2, 0, T_full)
+                            : q.slice(2, 0, T_full);
         Tensor k_full =
             normalize_qk ? scratch.normalized_k.slice(2, 0, T_full) : k.slice(2, 0, T_full);
         Tensor v_full    = v.slice(2, 0, T_full);
         Tensor g_full    = g.slice(1, 0, T_full);
         Tensor beta_full = beta.slice(1, 0, T_full);
         Tensor out_full  = out.slice(2, 0, T_full);
-        detail::gated_delta_net::launch_chunked(q_full, k_full, v_full, g_full, beta_full, scale,
-                                                ssm_state_in, ssm_state_out, out_full,
-                                                scratch.stage.data, scratch.stage.bytes, stream);
+        detail::gated_delta_net::launch_chunked(
+            q_full, k_full, v_full, g_full, beta_full, scale, fuse_q_normalization, ssm_state_in,
+            ssm_state_out, out_full, scratch.stage.data, scratch.stage.bytes, stream);
     }
 
     const std::int32_t tail = T - T_full;

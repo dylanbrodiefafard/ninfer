@@ -96,6 +96,7 @@ struct chunk_output_config {
     const void* q         = nullptr;
     const void* k         = nullptr;
     bool private_fp16     = false;
+    bool normalize_q      = false;
     const void* v_new     = nullptr;
     const float* g_cumsum = nullptr;
     const void* h_chunk   = nullptr;
