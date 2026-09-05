@@ -375,14 +375,14 @@ int run_case(const FormatSpec& format, std::int32_t n, std::int32_t k,
     return device_out.verify_guards(std::string(format.name) + " " + profile);
 }
 
-int run_qwen4_q5_replay_shape_case(std::int32_t tokens, cudaStream_t stream) {
-    const FormatSpec& format = kFormats[2];
-    constexpr std::int32_t n = 10240;
-    constexpr std::int32_t k = 2560;
+int run_qwen4_replay_shape_case(const FormatSpec& format, std::int32_t n, std::int32_t k,
+                                std::int32_t tokens, cudaStream_t stream) {
     constexpr std::size_t pattern_count = 4;
     std::array<std::vector<std::uint8_t>, pattern_count> rows;
     for (std::size_t pattern = 0; pattern < pattern_count; ++pattern) {
-        rows[pattern] = make_row(format, k, 0x45a7U + static_cast<std::uint32_t>(pattern) * 131U);
+        rows[pattern] = make_row(
+            format, k, 0x45a7U + static_cast<std::uint32_t>(format.qtype) * 257U +
+                           static_cast<std::uint32_t>(pattern) * 131U);
     }
     const std::size_t row_bytes = rows[0].size();
     std::vector<std::uint8_t> payload(row_bytes * static_cast<std::size_t>(n));
@@ -428,25 +428,28 @@ int run_qwen4_q5_replay_shape_case(std::int32_t tokens, cudaStream_t stream) {
             const double error = std::abs(actual[index] - expected.value);
             maximum_ratio      = std::max(maximum_ratio, error / limit);
             if (!std::isfinite(actual[index]) || error > limit) {
-                std::cerr << "Q5_K qwen4-replay-boundary-t" << tokens << " row " << row
-                          << " token " << token << " error=" << error << " bound=" << limit
-                          << " reference=" << expected.value << '\n';
+                std::cerr << format.name << " qwen4-replay-boundary-t" << tokens << " row "
+                          << row << " token " << token << " error=" << error
+                          << " bound=" << limit << " reference=" << expected.value << '\n';
                 failures = 1;
                 break;
             }
         }
     }
     if (error_stats_enabled()) {
-        std::cout << "OP_ERROR_STATS kind=derived_bound format=Q5_K profile=qwen4-replay-"
-                     "boundary-t"
-                  << tokens << " max_bound_ratio=" << maximum_ratio << '\n';
+        std::cout << "OP_ERROR_STATS kind=derived_bound format=" << format.name
+                  << " profile=qwen4-replay-boundary-t" << tokens
+                  << " max_bound_ratio=" << maximum_ratio << '\n';
     }
-    failures += device_out.verify_guards("Q5_K qwen4 replay boundary");
-    failures += verify_exact("Q5_K qwen4 replay weights unchanged",
+    const std::string label = std::string(format.name) + " qwen4 replay";
+    failures += device_out.verify_guards(label + " boundary");
+    const std::string weights_label = label + " weights unchanged";
+    failures += verify_exact(weights_label.c_str(),
                              from_device<std::uint8_t>(device_payload, payload.size()), payload);
     std::vector<std::uint16_t> represented_x(x.size());
     std::transform(x.begin(), x.end(), represented_x.begin(), f32_to_bf16);
-    failures += verify_exact("Q5_K qwen4 replay input unchanged",
+    const std::string input_label = label + " input unchanged";
+    failures += verify_exact(input_label.c_str(),
                              from_device<std::uint16_t>(device_x, represented_x.size()),
                              represented_x);
     return failures;
@@ -541,9 +544,12 @@ int main() {
         failures += run_case(kFormats[2], 3, 512, 15, false, stream, "q5-aggregate-t15");
         failures += run_case(kFormats[2], 3, 512, 128, false, stream,
                              "aggregate-t128");
-        failures += run_qwen4_q5_replay_shape_case(511, stream);
-        failures += run_qwen4_q5_replay_shape_case(512, stream);
-        failures += run_qwen4_q5_replay_shape_case(513, stream);
+        failures += run_qwen4_replay_shape_case(kFormats[2], 10240, 2560, 511, stream);
+        failures += run_qwen4_replay_shape_case(kFormats[2], 10240, 2560, 512, stream);
+        failures += run_qwen4_replay_shape_case(kFormats[2], 10240, 2560, 513, stream);
+        failures += run_qwen4_replay_shape_case(kFormats[3], 2560, 6144, 511, stream);
+        failures += run_qwen4_replay_shape_case(kFormats[3], 2560, 6144, 512, stream);
+        failures += run_qwen4_replay_shape_case(kFormats[3], 2560, 6144, 513, stream);
         failures += run_case(kFormats[0], 1, 32, 4096, true, stream,
                              "aggregate-t4096");
         cuda_check(cudaStreamDestroy(stream), "cudaStreamDestroy");

@@ -11,7 +11,7 @@ namespace ninfer::ops {
  *
  * This verifier Op computes `out[n,t] = sum_k decode(w[n,k]) * FP32(x[k,t])`, where `x` is
  * contiguous BF16 `[K,T]`, `out` is contiguous BF16 `[N,T]`, and `w` is a rank-two `[N,K]`
- * GGML block-row weight. T is in [1,4096]. The established T=1 kernel remains unchanged;
+ * GGML block-row weight. T is in [1,4096]. The established T=1 kernel remains unchanged.
  * Each dot product accumulates the decoded weight and represented BF16 activation in FP32 and
  * rounds the completed output once to BF16.
  * It admits exactly GGML Q8_0, Q4_K, Q5_K, Q6_K, IQ1_S, IQ2_XXS, and IQ4_NL. The device-resident

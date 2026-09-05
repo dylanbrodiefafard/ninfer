@@ -584,7 +584,9 @@ Its live artifact verifier profile has:
    `[6144,2560]`, plus FP32 controls a/b `[48,2560]`; qkv history is represented BF16
    `[10240,3]`, while Z bypasses convolution. At aligned prefill widths divisible by 256, the
    Q5_K qkv projection privately decodes one row into FP32 shared storage and replays it through
-   the established sequential 16-token FP32 accumulators; this changes no represented boundary;
+   the established sequential 16-token FP32 accumulators. At exactly T=512, the Q6_K output
+   projection uses the same decoded-row ownership with four sequential windows per CTA. Both
+   profiles change no represented boundary;
 2. mathematical FP32 convolution weights `[10240,4]`, physically viewed as contiguous
    `[4,10240]` and indexed `weight[channel*4+tap]`, plus represented
    `ssm_a=-exp(A_log)` and `dt_bias`, consumed without a BF16 verifier lane;
@@ -623,10 +625,10 @@ complete BF16 output, selected cumulative prefixes, and final FP32 state compare
 complete FP64 recurrence oracle; pairwise bit comparisons remain diagnostic implementation-profile
 evidence.
 
-The projection oracle also exercises the exact Q5_K `[10240,2560]` dispatch boundary at
-T=511/512/513. It independently decodes the stored block scales, minimums, low nibbles, and high
-bits into FP64 products from represented BF16 activations, compares every BF16 output, and checks
-that input and weight storage remain unchanged.
+The projection oracle also exercises the exact Q5_K `[10240,2560]` and Q6_K `[2560,6144]`
+dispatch boundaries at T=511/512/513. It independently decodes the stored block scales, minimums,
+low nibbles, and high bits into FP64 products from represented BF16 activations, compares every
+BF16 output, and checks that input and weight storage remain unchanged.
 
 ## 9. Live C=1 sparse-MoE verifier
 
@@ -716,9 +718,12 @@ shared gate/up codecs, exact host/device staged bytes, and actual T=1 shapes. It
 decodes IQ1_S/IQ2_XXS, IQ4_NL, Q5_K/Q6_K, and Q8_0 independently and evaluates the complete ideal formula.
 The verifier's private BF16 projection/SwiGLU storage and FP32 routing/accumulation profile are
 qualified with fixed normwise and finite gross criteria; they are not copied into the ideal oracle.
-The T-wide profiles additionally cover duplicate-token routes, both routed/shared codec pairs, a
-70-unique-expert panel that forces 32/32/6 mapped-stage grouping and slot reuse, exact staged bytes
-and occurrence order, and complete FP64 output. The resident grouped path is checked independently
+The T-wide profiles additionally cover duplicate-token routes, both routed/shared codec pairs, and
+a T=28 nonzero 70-unique-expert panel that forces 32/32/6 mapped-stage grouping and slot reuse.
+Each expert receives four distinct represented inputs and route weights; expert ids are permuted so
+all three groups own a highest- or second-highest-weight expert. The panel independently derives
+routing, exact staged bytes and occurrence order, surviving slot contents, and each token's output
+from the complete FP64 formula. The resident grouped path is checked independently
 at T=257 with four alternating nonzero represented inputs, two distinct route sets, same-expert
 reuse across different inputs and permuted ranks, back-to-back workspace reuse, exact route
 outputs, and per-token complete FP64 output criteria. A T=4096 all-zero-input run checks maximum

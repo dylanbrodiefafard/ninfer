@@ -8,6 +8,19 @@
 namespace ninfer::ops::detail {
 namespace {
 
+template <QType Format, int Columns, int TileTokens, int MinimumBlocksPerSm>
+void launch_replay(const Tensor& x, const Weight& w, Tensor& out, std::uint64_t row_bytes,
+                   cudaStream_t stream) {
+    const dim3 grid(static_cast<unsigned>(w.n),
+                    static_cast<unsigned>(x.ne[1] / TileTokens));
+    constexpr int shared_bytes = (Columns + TileTokens * 8) * static_cast<int>(sizeof(float));
+    ggml_block_linear_replay_kernel<Format, Columns, TileTokens, MinimumBlocksPerSm>
+        <<<grid, 256, shared_bytes, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(w.qdata), static_cast<__nv_bfloat16*>(out.data),
+            w.n, row_bytes);
+}
+
 template <QType Format>
 void launch_format(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     constexpr std::uint64_t block_values = GgmlDecoder<Format>::block_values;
@@ -16,17 +29,15 @@ void launch_format(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t s
     const std::int32_t tokens = x.ne[1];
     if constexpr (Format == QType::GGML_Q5_K) {
         if (uses_qwen4_q5_k_weight_replay(Format, w.n, w.k, tokens)) {
-            const dim3 grid(
-                static_cast<unsigned>(w.n),
-                static_cast<unsigned>(tokens / kGgmlQ5KReplayTokens));
-            constexpr int shared_bytes =
-                (2560 + kGgmlQ5KReplayTokens / kGgmlBlockLinearAggregateTokens * 16 * 8) *
-                static_cast<int>(sizeof(float));
-            ggml_q5_k_block_linear_replay_kernel<kGgmlQ5KReplayTokens>
-                <<<grid, 256, shared_bytes, stream>>>(
-                    static_cast<const __nv_bfloat16*>(x.data),
-                    static_cast<const std::uint8_t*>(w.qdata),
-                    static_cast<__nv_bfloat16*>(out.data), w.n, row_bytes);
+            launch_replay<QType::GGML_Q5_K, 2560, kGgmlQ5KReplayTokens, 5>(
+                x, w, out, row_bytes, stream);
+            return;
+        }
+    }
+    if constexpr (Format == QType::GGML_Q6_K) {
+        if (uses_qwen4_q6_k_output_replay(Format, w.n, w.k, tokens)) {
+            launch_replay<QType::GGML_Q6_K, 6144, kGgmlQ6KReplayTokens, 3>(
+                x, w, out, row_bytes, stream);
             return;
         }
     }
