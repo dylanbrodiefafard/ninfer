@@ -29,13 +29,14 @@ constexpr std::int32_t kVocabulary = 248320;
 constexpr std::int32_t kEos = verifier::kPleResetToken;
 constexpr std::array<std::int32_t, 4> kInputs = {48, 16451, 17120, 22188};
 constexpr std::array<std::int32_t, 4> kTargets = {16451, 17120, 22188, 11988};
-// Pinned llama.cpp values and the declared cross-representation criterion are mirrored from
-// fixtures/external_ppl_manifest.json. The external FP32/IQ4_NL route is integration evidence,
-// not the mathematical oracle for NInfer's represented BF16/NVFP4-G16 profile.
-constexpr std::array<double, 4> kExternalNll = {3.15870537, 13.7408428, 12.0528638,
-                                                 8.32870839};
-constexpr double kMaximumAbsoluteNllDelta = 1.0;
-constexpr double kMaximumMeanAbsoluteNllDelta = 0.5;
+// The first four values from the pinned 601-token llama.cpp trace are mirrored from
+// fixtures/external_ppl_manifest.json. This prefix remains useful localization evidence, but the
+// complete trace has 33/600 deltas above one nat and is an unresolved integration discrepancy,
+// not a production correctness claim or a mathematical oracle for BF16/NVFP4-G16 execution.
+constexpr std::array<double, 4> kExternalPairedPrefixNll = {
+    3.0563440376731457, 13.217154127288497, 12.015043390206641, 8.821618971613773};
+constexpr double kPrefixMaximumAbsoluteNllDelta = 1.0;
+constexpr double kPrefixMaximumMeanAbsoluteNllDelta = 0.5;
 constexpr std::array<std::uint64_t, 3> kMultiplier = {
     23703573157769ULL, 20109073645365ULL, 8052911324071ULL};
 constexpr std::array<std::int32_t, 16> kPrime = {
@@ -396,7 +397,7 @@ int main() {
         for (std::size_t token = 0; token < kInputs.size(); ++token) {
             total_nll += nlls[0][token];
             const double delta = std::abs(static_cast<double>(nlls[0][token]) -
-                                          kExternalNll[token]);
+                                          kExternalPairedPrefixNll[token]);
             total_absolute_delta += delta;
             maximum_absolute_delta = std::max(maximum_absolute_delta, delta);
             std::cout << " " << kInputs[token] << "->" << kTargets[token] << "="
@@ -412,12 +413,12 @@ int main() {
             std::cerr << "teacher-forced PPL or paired NLL delta is not finite\n";
             ++failures;
         }
-        if (maximum_absolute_delta > kMaximumAbsoluteNllDelta ||
-            mean_absolute_delta > kMaximumMeanAbsoluteNllDelta) {
-            std::cerr << "paired external integration criterion failed: max_abs_delta_nll="
-                      << maximum_absolute_delta << " limit=" << kMaximumAbsoluteNllDelta
+        if (maximum_absolute_delta > kPrefixMaximumAbsoluteNllDelta ||
+            mean_absolute_delta > kPrefixMaximumMeanAbsoluteNllDelta) {
+            std::cerr << "paired external prefix localization criterion failed: max_abs_delta_nll="
+                      << maximum_absolute_delta << " limit=" << kPrefixMaximumAbsoluteNllDelta
                       << " mean_abs_delta_nll=" << mean_absolute_delta
-                      << " limit=" << kMaximumMeanAbsoluteNllDelta << '\n';
+                      << " limit=" << kPrefixMaximumMeanAbsoluteNllDelta << '\n';
             ++failures;
         }
         std::cout << (failures == 0 ? "OK" : "FAIL")

@@ -12,6 +12,7 @@
 #include <cstring>
 #include <iostream>
 #include <span>
+#include <utility>
 #include <vector>
 
 using namespace ninfer;
@@ -207,8 +208,7 @@ struct Inputs {
     explicit Inputs(int width) : width(width), residual(static_cast<std::size_t>(ops::kPleChannels) * width),
                                  embedding(static_cast<std::size_t>(ops::kPleEmbeddingWidth) * width),
                                  conv_weight(static_cast<std::size_t>(ops::kPleChannels) * 4),
-                                 norm(ops::kPleChannels, 0.75F),
-                                 zero_state(static_cast<std::size_t>(ops::kPleChannels) * 9, 0.0F) {
+                                 norm(ops::kPleChannels, 0.75F) {
         for (int token = 0; token < width; ++token) {
             embedding[ops::kPleEmbeddingWidth * token] = 1.0F + token * 0.125F;
             embedding[ops::kPleEmbeddingWidth * token + 1] = 0.5F + token * 0.125F;
@@ -236,7 +236,6 @@ struct Inputs {
     std::vector<float> embedding;
     std::vector<float> conv_weight;
     std::vector<float> norm;
-    std::vector<float> zero_state;
 };
 
 struct RunResult {
@@ -284,8 +283,16 @@ RunResult run_inject(std::span<const float> residual, std::span<const float> emb
     return result;
 }
 
-std::vector<double> oracle_output(const Inputs& input, const Weights& weights) {
-    std::vector<double> state(static_cast<std::size_t>(ops::kPleChannels) * 9, 0.0);
+struct OracleResult {
+    std::vector<double> output;
+    std::vector<std::uint16_t> state;
+};
+
+OracleResult oracle(const Inputs& input, const Weights& weights,
+                    std::span<const std::uint16_t> initial_state) {
+    std::vector<double> state(initial_state.size());
+    std::transform(initial_state.begin(), initial_state.end(), state.begin(),
+                   [](std::uint16_t bits) { return static_cast<double>(bf16_to_f32(bits)); });
     std::vector<double> current(static_cast<std::size_t>(ops::kPleChannels) * input.width);
     std::vector<double> output(static_cast<std::size_t>(ops::kPleChannels) * input.width);
     const double key_unit = static_cast<double>(weights.scale) * 127.0;
@@ -337,16 +344,42 @@ std::vector<double> oracle_output(const Inputs& input, const Weights& weights) {
             }
         }
     }
-    return output;
+
+    std::vector<std::uint16_t> final_state(initial_state.size());
+    for (int history = 0; history < 9; ++history) {
+        const int logical = input.width - 9 + history;
+        for (int channel = 0; channel < ops::kPleChannels; ++channel) {
+            const std::size_t destination =
+                static_cast<std::size_t>(history) * ops::kPleChannels + channel;
+            if (logical < 0) {
+                final_state[destination] =
+                    initial_state[static_cast<std::size_t>(logical + 9) * ops::kPleChannels +
+                                  channel];
+            } else {
+                final_state[destination] = f32_to_bf16(static_cast<float>(
+                    current[static_cast<std::size_t>(logical) * ops::kPleChannels + channel]));
+            }
+        }
+    }
+    return {std::move(output), std::move(final_state)};
 }
 
 int injection_state_case() {
     constexpr int width = 4;
     Inputs input(width);
     Weights weights;
-    const std::vector<std::uint16_t> zero_state(static_cast<std::size_t>(ops::kPleChannels) * 9,
-                                                 f32_to_bf16(0.0F));
-    const RunResult one = run_inject(input.residual, input.embedding, width, zero_state, input,
+    std::vector<std::uint16_t> initial_state(static_cast<std::size_t>(ops::kPleChannels) * 9);
+    for (int history = 0; history < 9; ++history) {
+        for (int channel = 0; channel < ops::kPleChannels; ++channel) {
+            const float magnitude =
+                0.01F + 0.002F * history + 0.0001F * static_cast<float>(channel % 19);
+            const float value = ((channel + history) & 1) == 0 ? magnitude : -magnitude;
+            initial_state[static_cast<std::size_t>(history) * ops::kPleChannels + channel] =
+                f32_to_bf16(value);
+        }
+    }
+    const OracleResult expected = oracle(input, weights, initial_state);
+    const RunResult one = run_inject(input.residual, input.embedding, width, initial_state, input,
                                      weights, false);
     int failures = one.guards;
     const auto actual = [&] {
@@ -354,9 +387,11 @@ int injection_state_case() {
         for (std::size_t i = 0; i < values.size(); ++i) { values[i] = bf16_to_f32(one.output[i]); }
         return values;
     }();
-    failures += verify_pointwise("PLE injection FP64 formula", actual, oracle_output(input, weights),
+    failures += verify_pointwise("PLE injection FP64 formula", actual, expected.output,
                                  PointwiseCriterion{0.02, 0.01});
-    const RunResult in_place = run_inject(input.residual, input.embedding, width, zero_state, input,
+    failures += verify_exact("PLE injection independent final BF16 state", one.state,
+                             expected.state);
+    const RunResult in_place = run_inject(input.residual, input.embedding, width, initial_state, input,
                                           weights, false, true);
     failures += verify_exact("PLE distinct vs in-place residual output", one.output,
                              in_place.output);
@@ -366,7 +401,7 @@ int injection_state_case() {
     const std::size_t channels = ops::kPleChannels;
     const RunResult first = run_inject(std::span(input.residual).first(2 * channels),
                                        std::span(input.embedding).first(2 * ops::kPleEmbeddingWidth),
-                                       2, zero_state, input, weights, true);
+                                       2, initial_state, input, weights, true);
     const RunResult second = run_inject(std::span(input.residual).subspan(2 * channels),
                                         std::span(input.embedding).subspan(2 * ops::kPleEmbeddingWidth),
                                         2, first.state, input, weights, false);
@@ -377,7 +412,7 @@ int injection_state_case() {
     failures += first.guards + second.guards;
 
     std::vector<std::uint16_t> repeated_output;
-    std::vector<std::uint16_t> repeated_state = zero_state;
+    std::vector<std::uint16_t> repeated_state = initial_state;
     for (int token = 0; token < width; ++token) {
         const RunResult step = run_inject(
             std::span(input.residual).subspan(static_cast<std::size_t>(token) * channels, channels),
