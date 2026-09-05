@@ -68,9 +68,8 @@ std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
                                      std::size_t prefill_splits) noexcept {
     const std::uint32_t suffix = summary.prompt_tokens - reuse_base;
     const std::uint64_t prefill_units =
-        suffix == 0
-            ? 1ULL
-            : 1ULL + (static_cast<std::uint64_t>(suffix) - 1ULL) / prefill_chunk + prefill_splits;
+        suffix == 0 ? 1ULL
+                    : schedule::prefill_chunk_count(suffix, prefill_chunk) + prefill_splits;
     const std::uint64_t decode_units =
         summary.effective_output_tokens == 0 ? 0ULL : summary.effective_output_tokens - 1ULL;
     return prefill_units + decode_units;

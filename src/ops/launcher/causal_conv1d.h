@@ -16,6 +16,8 @@ inline constexpr std::int32_t kCausalConvParallelMaxTokens = 16;
 void causal_conv1d_prefill_launch(const Tensor& x, const Tensor& weight,
                                   const Tensor& conv_state_in, Tensor& conv_state_out, Tensor& out,
                                   cudaStream_t stream);
+void causal_conv1d_split_launch(const Tensor& x, const Tensor& weight, Tensor& conv_state,
+                                Tensor& query, Tensor& key, Tensor& value, cudaStream_t stream);
 void causal_conv1d_sequence_launch(const Tensor& x, const Tensor& weight,
                                    const Tensor& conv_state_in, Tensor& conv_state_out, Tensor& out,
                                    cudaStream_t stream);

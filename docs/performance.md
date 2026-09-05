@@ -224,6 +224,63 @@ Reports are under `profiles/bench/multi-request-kernel-final-config-sweep-clean-
 `profiles/bench/multi-request-kernel-mtp5-baseline-isolation-20260905`, plus
 `profiles/ppl/multi-request-kernel-final-20260905.json`.
 
+## Qwen3.8-27B NVFP4 mixed-phase prefill campaign
+
+The 2026-09-05 follow-up kept the preceding DFlash4/MTP4 decode implementation and targeted
+prefill latency when one request enters while another request is decoding. Tests used the same
+Qwen3.8-27B DFlash2 artifact, NVFP4 KV, CUDA Graphs, and one RTX 5090. The retained GDN prefill Op
+writes the causal-convolution result directly to compact Q/K/V planes, eliminating a
+`[10240,T]` intermediate and three device-to-device splits in each of 48 GDN layers. The default
+prefill chunk is 8,192 tokens. A remaining unit above 4,096 that is not aligned to the 128-token
+kernel schedule is decomposed as a 4,096-token unit plus its tail; aligned extents retain the
+single 8,192-token route.
+
+The public causal-convolution Op benchmark at the production 10,240-channel partition measured
+the direct split against the ordinary Op plus the three production-shaped copies. Representative
+means were 108.10 to 59.36 us at T=2,048, 218.69 to 134.85 us at T=4,096 (-38.3%), and 441.25 to
+266.40 us at T=8,192 (-39.6%). Whole-prefill profiling attributed the gain to eliminating the
+copies: the replacement convolution kernel itself was slightly slower, while device-to-device
+copy time fell from about 4.59 ms to 0.26 ms per profiled pass.
+
+With the retained default and adaptive decomposition, public-Engine prefill results were:
+
+| Startup C | 7,669-token owner ms | Aggregate tok/s | 8,192-token owner ms | Aggregate tok/s |
+|---:|---:|---:|---:|---:|
+| 1 | 708.831 | 10,819 | 695.170 | 11,784 |
+| 2 | 710.758 | 21,580 | 697.484 | 23,490 |
+| 3 | 711.069 | 32,356 | 698.983 | 35,160 |
+| 4 | 712.920 | 43,029 | 700.311 | 46,791 |
+
+The Engine serializes prefill ownership, so the table's aggregate column is C times the per-owner
+rate rather than C simultaneous prefill kernels. Startup C=4 added only 0.58% per-owner latency at
+7,669 tokens and 0.74% at 8,192 tokens relative to C=1. At 8,192 tokens, the complete retained
+route improved the preceding default-4,096 binary from 725.237 to 695.170 ms at C=1 (+4.15%) and
+729.699 to 700.311 ms at C=4 (+4.03%). The direct-store fusion contributes about 0.9% at this
+length; the larger aligned unit supplies the remainder. For the irregular 7,669-token prompt,
+adaptive decomposition improves the static-8,192 candidate from 727.047 to 707.508 ms (-2.69%).
+
+The staggered C=2 HTTP workload started a 7,669-token newcomer while a 1,024-token DFlash4 donor
+was decoding. Relative to the preceding default-4,096 binary, newcomer prefill changed from
+733.857 to 726.006 ms (-1.07%) and TTFT from 743.222 to 734.647 ms (-1.15%). Mean donor
+interruption changed from 741.624 to 740.254 ms; its median changed from 744.792 to 734.282 ms.
+All donor and newcomer hashes matched exactly.
+
+The new split route was checked directly against the independent complete FP64 causal-convolution
+and SiLU oracle at the production Q/K/V partition for T=1, 7, 65, and 257. Final BF16 convolution
+state and input/output guards matched exactly. The packed real-artifact DFlash4 C=4 Graph suite
+passed chain, adaptive-length, terminal/queue, reseed, and in-flight restore isolation. Target-only
+PPL retained all 2,047 NLL values byte-for-byte (PPL 6.414141594; no non-finite values). A matched
+DFlash4 serve rerun preserved every output hash and the 50.1468% acceptance rate; C=1-4 decode
+changes were -0.00%, -0.27%, -0.00%, and +0.15%. The uncontended matched MTP4 rerun likewise
+preserved every output hash and the 46.5897% acceptance rate; C=1-4 decode changes were +0.89%,
++1.53%, +1.28%, and +0.36%.
+
+Primary reports are under `profiles/bench/mixed-phase-goal-final-prefill-c*-20260905.json`,
+`profiles/bench/mixed-phase-goal-c2-{baseline,adaptive-split-clean}-20260905`,
+`profiles/bench/mixed-phase-goal-final-serve-dflash4-decode-20260905`,
+`profiles/bench/mixed-phase-goal-final-serve-mtp4-decode-uncontended-20260905`, and
+`profiles/ppl/mixed-phase-prefill-split-20260905.json`.
+
 ## Single-request serving performance method
 
 | Setting | Value |

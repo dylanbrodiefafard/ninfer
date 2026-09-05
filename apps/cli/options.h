@@ -24,7 +24,7 @@ struct Options {
     std::size_t kv_disk_capacity_bytes = 0;
     std::filesystem::path kv_disk_location;
     KvDiskCompress kv_disk_compress = KvDiskCompress::Off;
-    std::uint32_t prefill_chunk  = 4096;
+    std::uint32_t prefill_chunk  = 8192;
     int device                   = 0;
 
     KvCacheStorage kv_cache = KvCacheStorage::Nvfp4;

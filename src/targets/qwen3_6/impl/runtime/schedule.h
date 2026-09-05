@@ -17,9 +17,10 @@
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
-#include <array>
 #include <functional>
 #include <optional>
 #include <span>
@@ -28,6 +29,31 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 
 using qwen3_6::PreparedPromptData;
 using qwen3_6::PromptModality;
+
+// Large aligned extents use the full 8192-token workspace efficiently. A large unaligned tail
+// sends every major projection through its remainder schedule; cap that unit at 4096 so only the
+// smaller final unit pays the tail cost. Explicit smaller chunks retain their requested policy.
+inline constexpr std::uint32_t kIrregularPrefillSplit = 4096;
+
+[[nodiscard]] inline std::uint32_t select_prefill_chunk(std::uint32_t remaining,
+                                                        std::uint32_t maximum) noexcept {
+    const std::uint32_t nominal = std::min(remaining, maximum);
+    if (maximum > kIrregularPrefillSplit && nominal > kIrregularPrefillSplit &&
+        nominal % kPrefillChunkAlignment != 0) {
+        return kIrregularPrefillSplit;
+    }
+    return nominal;
+}
+
+[[nodiscard]] inline std::uint64_t prefill_chunk_count(std::uint32_t tokens,
+                                                       std::uint32_t maximum) noexcept {
+    std::uint64_t count = 0;
+    while (tokens != 0) {
+        tokens -= select_prefill_chunk(tokens, maximum);
+        ++count;
+    }
+    return count;
+}
 
 struct ExecutionCore {
     DeviceContext& device;

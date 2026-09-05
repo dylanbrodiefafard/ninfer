@@ -103,8 +103,11 @@ with context length.
 `T` denotes the Text/MTP token extent supplied to an Op. It is any positive tensor extent that
 fits the applicable storage or explicit state capacity. Decode (`T=1`), verification-sized calls,
 and prefill chunks are workload points and private implementation routes, not different Op domains.
-The configured prefill chunk controls target workspace and request decomposition; its default 4096
-does not cap an Op's `T`.
+The configured prefill chunk controls target workspace and request decomposition; its default 8192
+uses one unit for aligned extents through 8192. When a remaining default-sized unit is larger than
+4096 but not a multiple of the 128-token kernel alignment, the Program processes 4096 first so the
+smaller tail, rather than every large projection, owns the remainder schedule. This private
+decomposition does not cap an Op's `T`.
 
 Vision uses different axes. `P` is the aggregate raw-patch count and must be a positive multiple of
 4 because of the 2x2 spatial merge; `V=P/4` is the aggregate merged-token count. The registered 27B
@@ -217,12 +220,14 @@ a = in_a(h)       # [48,T]
 b = in_b(h)       # [48,T]
 ```
 
-Q/K/V are concatenated into `[10240,T]` and passed through the depthwise causal width-4 convolution
-and SiLU. Q and K are then L2-normalized per head with epsilon `1e-6`. The production GDN Op always
-receives raw BF16 convolution outputs. Its recurrent implementation keeps normalized values in FP32
-registers; when it selects the chunked implementation, it privately materializes normalized BF16
-q/k for the chunked body and recurrent tail. The decay and update controls `g` and `beta` are
-observable FP32 values with the logical formula:
+The input projection materializes concatenated Q/K/V as `[10240,T]`. Prefill applies the depthwise
+causal width-4 convolution and SiLU while storing the three channel ranges directly into compact
+Q/K/V planes; it does not materialize and then split a second interleaved tensor. Q and K are then
+L2-normalized per head with epsilon `1e-6`. The production GDN Op always receives raw BF16
+convolution outputs. Its recurrent implementation keeps normalized values in FP32 registers; when
+it selects the chunked implementation, it privately materializes normalized BF16 q/k for the
+chunked body and recurrent tail. The decay and update controls `g` and `beta` are observable FP32
+values with the logical formula:
 
 ```text
 g    = -exp(A_log) * softplus(a + dt_bias)
