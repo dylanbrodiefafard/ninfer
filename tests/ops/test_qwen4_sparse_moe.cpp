@@ -1085,6 +1085,57 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
             },
             "misaligned prefill host scratch");
 
+        const std::size_t prefill_required =
+            ops::qwen4_sparse_moe_prefill_workspace_capacity_bytes(prefill_width);
+        DeviceArena offset_prefill_workspace(prefill_required + 256);
+        (void)offset_prefill_workspace.alloc_bytes(1, 1);
+        ops::qwen4_sparse_moe_prefill(
+            prefill_x_tensor, weights, prefill_pipeline, prefill_ids_tensor,
+            prefill_weights_tensor, prefill_output_tensor, offset_prefill_workspace, stream);
+        cuda_synchronize(stream);
+        if (offset_prefill_workspace.used() != 1) {
+            std::cerr << "Qwen4 sparse MoE prefill did not restore an offset workspace\n";
+            ++failures;
+        }
+        DeviceArena short_offset_prefill_workspace(prefill_required + 255);
+        (void)short_offset_prefill_workspace.alloc_bytes(1, 1);
+        failures += expect_invalid(
+            [&] {
+                ops::qwen4_sparse_moe_prefill(
+                    prefill_x_tensor, weights, prefill_pipeline, prefill_ids_tensor,
+                    prefill_weights_tensor, prefill_output_tensor,
+                    short_offset_prefill_workspace, stream);
+            },
+            "prefill workspace missing alignment padding");
+
+        DeviceBuffer unaligned_workspace_backing(prefill_required + 256);
+        DeviceArena unaligned_prefill_workspace(DeviceSpan{
+            static_cast<std::byte*>(unaligned_workspace_backing.p) + 1,
+            prefill_required + 255});
+        (void)unaligned_prefill_workspace.alloc_bytes(1, 1);
+        ops::qwen4_sparse_moe_prefill(
+            prefill_x_tensor, weights, prefill_pipeline, prefill_ids_tensor,
+            prefill_weights_tensor, prefill_output_tensor, unaligned_prefill_workspace,
+            stream);
+        cuda_synchronize(stream);
+        if (unaligned_prefill_workspace.used() != 1) {
+            std::cerr << "Qwen4 sparse MoE prefill did not restore an unaligned workspace\n";
+            ++failures;
+        }
+        DeviceBuffer short_unaligned_workspace_backing(prefill_required + 255);
+        DeviceArena short_unaligned_prefill_workspace(DeviceSpan{
+            static_cast<std::byte*>(short_unaligned_workspace_backing.p) + 1,
+            prefill_required + 254});
+        (void)short_unaligned_prefill_workspace.alloc_bytes(1, 1);
+        failures += expect_invalid(
+            [&] {
+                ops::qwen4_sparse_moe_prefill(
+                    prefill_x_tensor, weights, prefill_pipeline, prefill_ids_tensor,
+                    prefill_weights_tensor, prefill_output_tensor,
+                    short_unaligned_prefill_workspace, stream);
+            },
+            "prefill workspace missing absolute-address alignment padding");
+
         constexpr int small_resident_width = 2;
         std::vector<float> small_resident_input = prefill_input;
         small_resident_input[static_cast<std::size_t>(kHidden) + 1] += 0.125F;
@@ -1541,7 +1592,6 @@ int prefill_partition_and_slot_reuse_case() {
     constexpr int active_experts = pattern_count * kTopK;
     constexpr QType routed_qtype = QType::GGML_IQ1_S;
     const std::size_t one_routed = matrix_bytes(routed_qtype, kIntermediate, kHidden);
-    const std::size_t rank_bytes = 2 * one_routed;
     const std::size_t bank_bytes = static_cast<std::size_t>(kExperts) * one_routed;
     AnonymousMapping mapped_gate(bank_bytes);
     AnonymousMapping mapped_up(bank_bytes);
@@ -1573,7 +1623,7 @@ int prefill_partition_and_slot_reuse_case() {
             const int expert = expert_for(pattern, rank);
             router[static_cast<std::size_t>(expert) * kHidden + pattern] = 20.0F - rank;
             if (rank < 2) {
-                high_weight_group[expert < 32 ? 0 : (expert < 64 ? 1 : 2)] = true;
+                high_weight_group[expert < 16 ? 0 : (expert < 48 ? 1 : 2)] = true;
             }
         }
         for (int amplitude = 0; amplitude < amplitude_count; ++amplitude) {
@@ -1651,25 +1701,167 @@ int prefill_partition_and_slot_reuse_case() {
                 pattern_input, routes[pattern][amplitude], oracle_weights);
         }
     }
+
+    // A second, independently encoded panel changes both the routed codec and every token's
+    // selected expert set. It is submitted on the same event/slot resources without an
+    // intervening caller synchronization, so its ids-ready barrier must close every consumer of
+    // the first panel before either slot is overwritten.
+    constexpr QType next_routed_qtype = QType::GGML_IQ2_XXS;
+    const std::size_t next_one_routed =
+        matrix_bytes(next_routed_qtype, kIntermediate, kHidden);
+    const std::size_t next_rank_bytes = 2 * next_one_routed;
+    const std::size_t next_bank_bytes =
+        static_cast<std::size_t>(kExperts) * next_one_routed;
+    AnonymousMapping next_mapped_gate(next_bank_bytes);
+    AnonymousMapping next_mapped_up(next_bank_bytes);
+    for (int expert = 0; expert < active_experts; ++expert) {
+        const auto gate = make_matrix(next_routed_qtype, kIntermediate, kHidden,
+                                      0x1b000U + static_cast<std::uint32_t>(expert));
+        const auto up = make_matrix(next_routed_qtype, kIntermediate, kHidden,
+                                    0x1c000U + static_cast<std::uint32_t>(expert));
+        std::memcpy(next_mapped_gate.mutable_data() +
+                        static_cast<std::size_t>(expert) * next_one_routed,
+                    gate.data(), next_one_routed);
+        std::memcpy(next_mapped_up.mutable_data() +
+                        static_cast<std::size_t>(expert) * next_one_routed,
+                    up.data(), next_one_routed);
+    }
+    next_mapped_gate.make_read_only();
+    next_mapped_up.make_read_only();
+
+    std::vector<float> next_input(static_cast<std::size_t>(kHidden) * width, 0.0F);
+    std::vector<float> next_router(static_cast<std::size_t>(kExperts) * kHidden, 0.0F);
+    std::vector<std::int32_t> next_expected_ids(static_cast<std::size_t>(kTopK) * width);
+    std::vector<double> next_expected_weights(static_cast<std::size_t>(kTopK) * width);
+    const auto next_expert_for = [=](int pattern, int rank) {
+        return ((pattern * kTopK + rank) * 13 + 7) % active_experts;
+    };
+    std::array<std::array<OracleRoute, amplitude_count>, pattern_count> next_routes;
+    std::array<bool, 3> next_high_weight_group{};
+    for (int pattern = 0; pattern < pattern_count; ++pattern) {
+        for (int rank = 0; rank < kTopK; ++rank) {
+            const int expert = next_expert_for(pattern, rank);
+            next_router[static_cast<std::size_t>(expert) * kHidden + pattern] = 20.0F - rank;
+            if (rank < 2) {
+                next_high_weight_group[expert < 16 ? 0 : (expert < 48 ? 1 : 2)] = true;
+            }
+        }
+        for (int amplitude = 0; amplitude < amplitude_count; ++amplitude) {
+            std::vector<double> pattern_input(kHidden, 0.0);
+            pattern_input[pattern] = amplitudes[amplitude];
+            next_routes[pattern][amplitude] = route_oracle(next_router, pattern_input);
+            for (int rank = 0; rank < kTopK; ++rank) {
+                if (next_routes[pattern][amplitude].ids[rank] !=
+                    next_expert_for(pattern, rank)) {
+                    throw std::logic_error("next prefill partition router fixture is malformed");
+                }
+            }
+        }
+    }
+    if (!std::all_of(next_high_weight_group.begin(), next_high_weight_group.end(),
+                     [](bool covered) { return covered; })) {
+        throw std::logic_error("next prefill partition rank permutation is malformed");
+    }
+    for (int token = 0; token < width; ++token) {
+        const int pattern = (5 * token + 3) % pattern_count;
+        const int amplitude = amplitude_count - 1 - token / pattern_count;
+        next_input[pattern + static_cast<std::size_t>(kHidden) * token] =
+            amplitudes[amplitude];
+        std::array<int, kTopK> first_set = routes[pattern][token / pattern_count].ids;
+        std::array<int, kTopK> next_set = next_routes[pattern][amplitude].ids;
+        std::sort(first_set.begin(), first_set.end());
+        std::sort(next_set.begin(), next_set.end());
+        if (first_set == next_set) {
+            throw std::logic_error("back-to-back prefill route sets are not distinct");
+        }
+        for (int rank = 0; rank < kTopK; ++rank) {
+            next_expected_ids[rank + kTopK * token] = next_routes[pattern][amplitude].ids[rank];
+            next_expected_weights[rank + kTopK * token] =
+                next_routes[pattern][amplitude].weights[rank];
+        }
+    }
+    round_to_bf16(next_input);
+    DeviceBuffer next_device_down(down_bank_bytes);
+    next_device_down.fill(0);
+    std::array<std::array<std::vector<std::uint8_t>, kTopK>, pattern_count>
+        next_down_matrices;
+    for (int pattern = 0; pattern < pattern_count; ++pattern) {
+        for (int rank = 0; rank < kTopK; ++rank) {
+            const int expert = next_routes[pattern][0].ids[rank];
+            auto& matrix = next_down_matrices[pattern][rank];
+            matrix = make_matrix(QType::GGML_IQ4_NL, kHidden, kIntermediate,
+                                 0x1a000U + static_cast<std::uint32_t>(expert));
+            next_device_down.copy_from_host(matrix.data(), matrix.size(),
+                                            static_cast<std::size_t>(expert) * one_down);
+        }
+    }
+    const auto next_shared_gate_proj =
+        make_matrix(QType::GGML_Q5_K, kIntermediate, kHidden, 0x1d000U);
+    const auto next_shared_up =
+        make_matrix(QType::GGML_Q5_K, kIntermediate, kHidden, 0x1e000U);
+    const auto next_shared_down =
+        make_matrix(QType::GGML_Q8_0, kHidden, kIntermediate, 0x1f000U);
+    std::vector<float> next_shared_gate(kHidden, 0.0F);
+    for (int pattern = 0; pattern < pattern_count; ++pattern) {
+        next_shared_gate[pattern] = static_cast<float>(3 - pattern) / 7.0F;
+    }
+    std::array<std::array<std::vector<double>, amplitude_count>, pattern_count>
+        next_pattern_references;
+    for (int pattern = 0; pattern < pattern_count; ++pattern) {
+        for (int amplitude = 0; amplitude < amplitude_count; ++amplitude) {
+            std::vector<double> pattern_input(kHidden, 0.0);
+            pattern_input[pattern] = amplitudes[amplitude];
+            const OracleInputs oracle_weights{
+                next_routed_qtype,
+                QType::GGML_Q5_K,
+                next_router,
+                next_mapped_gate,
+                next_mapped_up,
+                next_down_matrices[pattern],
+                next_routes[pattern][amplitude].ids,
+                next_shared_gate,
+                next_shared_gate_proj,
+                next_shared_up,
+                next_shared_down,
+            };
+            next_pattern_references[pattern][amplitude] = complete_oracle(
+                pattern_input, next_routes[pattern][amplitude], oracle_weights);
+        }
+    }
     DeviceBuffer device_x = to_device_bf16(input);
     DeviceBuffer device_router = to_device_f32(router);
     DeviceBuffer device_shared_gate = to_device_f32(shared_gate);
     DeviceBuffer device_shared_gate_proj = to_device(shared_gate_proj);
     DeviceBuffer device_shared_up = to_device(shared_up);
     DeviceBuffer device_shared_down = to_device(shared_down);
+    DeviceBuffer next_device_x = to_device_bf16(next_input);
+    DeviceBuffer next_device_router = to_device_f32(next_router);
+    DeviceBuffer next_device_shared_gate = to_device_f32(next_shared_gate);
+    DeviceBuffer next_device_shared_gate_proj = to_device(next_shared_gate_proj);
+    DeviceBuffer next_device_shared_up = to_device(next_shared_up);
+    DeviceBuffer next_device_shared_down = to_device(next_shared_down);
     GuardedDeviceBuffer stage(ops::kQwen4SparseMoePrefillPipelineStageBytes);
     GuardedDeviceBuffer ids(static_cast<std::size_t>(kTopK) * width * sizeof(std::int32_t));
     GuardedDeviceBuffer weights(static_cast<std::size_t>(kTopK) * width * sizeof(float));
     GuardedDeviceBuffer output(static_cast<std::size_t>(kHidden) * width *
                                sizeof(std::uint16_t));
+    GuardedDeviceBuffer next_ids(static_cast<std::size_t>(kTopK) * width *
+                                 sizeof(std::int32_t));
+    GuardedDeviceBuffer next_weights(static_cast<std::size_t>(kTopK) * width * sizeof(float));
+    GuardedDeviceBuffer next_output(static_cast<std::size_t>(kHidden) * width *
+                                    sizeof(std::uint16_t));
     stage.fill(0xcd);
     ids.fill(0xcd);
     weights.fill(0xcd);
     output.fill(0xcd);
+    next_ids.fill(0xcd);
+    next_weights.fill(0xcd);
+    next_output.fill(0xcd);
     PinnedHostBuffer pinned(ops::kQwen4SparseMoePrefillPipelineStageBytes);
     PinnedHostBuffer host_scratch(ops::kQwen4SparseMoePrefillHostScratchBytes);
     std::memset(pinned.data(), 0xa5, pinned.size());
     DeviceArena workspace(ops::qwen4_sparse_moe_prefill_workspace_capacity_bytes(width));
+    DeviceArena next_workspace(ops::qwen4_sparse_moe_prefill_workspace_capacity_bytes(width));
     PipelineEvents events;
     cudaStream_t stream = nullptr;
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
@@ -1682,7 +1874,12 @@ int prefill_partition_and_slot_reuse_case() {
     Tensor ids_tensor(ids.data(), DType::I32, {kTopK, width});
     Tensor weights_tensor(weights.data(), DType::FP32, {kTopK, width});
     Tensor output_tensor(output.data(), DType::BF16, {kHidden, width});
+    Tensor next_x_tensor(next_device_x.p, DType::BF16, {kHidden, width});
+    Tensor next_ids_tensor(next_ids.data(), DType::I32, {kTopK, width});
+    Tensor next_weights_tensor(next_weights.data(), DType::FP32, {kTopK, width});
+    Tensor next_output_tensor(next_output.data(), DType::BF16, {kHidden, width});
     Tensor shared_gate_tensor(device_shared_gate.p, DType::FP32, {kHidden});
+    Tensor next_shared_gate_tensor(next_device_shared_gate.p, DType::FP32, {kHidden});
     ops::Qwen4SparseMoeWeights model_weights{
         .router = make_router(device_router.p),
         .routed_gate_up = {
@@ -1703,6 +1900,28 @@ int prefill_partition_and_slot_reuse_case() {
         .shared_down = make_ggml_weight(device_shared_down.p, shared_down.size(),
                                         QType::GGML_Q8_0, 1, kHidden, kIntermediate),
     };
+    ops::Qwen4SparseMoeWeights next_model_weights{
+        .router = make_router(next_device_router.p),
+        .routed_gate_up = {
+            .gate = std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(next_mapped_gate.data()),
+                next_mapped_gate.size()),
+            .up = std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(next_mapped_up.data()),
+                next_mapped_up.size()),
+            .qtype = next_routed_qtype,
+        },
+        .routed_down = make_ggml_weight(next_device_down.p, down_bank_bytes,
+                                        QType::GGML_IQ4_NL, kExperts, kHidden, kIntermediate),
+        .shared_gate = next_shared_gate_tensor,
+        .shared_gate_proj = make_ggml_weight(
+            next_device_shared_gate_proj.p, next_shared_gate_proj.size(), QType::GGML_Q5_K, 1,
+            kIntermediate, kHidden),
+        .shared_up = make_ggml_weight(next_device_shared_up.p, next_shared_up.size(),
+                                      QType::GGML_Q5_K, 1, kIntermediate, kHidden),
+        .shared_down = make_ggml_weight(next_device_shared_down.p, next_shared_down.size(),
+                                        QType::GGML_Q8_0, 1, kHidden, kIntermediate),
+    };
     ops::Qwen4SparseMoePrefillPipeline pipeline{
         .pinned_stage = pinned.data(),
         .pinned_stage_bytes = pinned.size(),
@@ -1718,6 +1937,9 @@ int prefill_partition_and_slot_reuse_case() {
     };
     ops::qwen4_sparse_moe_prefill(x_tensor, model_weights, pipeline, ids_tensor,
                                   weights_tensor, output_tensor, workspace, stream);
+    ops::qwen4_sparse_moe_prefill(next_x_tensor, next_model_weights, pipeline,
+                                  next_ids_tensor, next_weights_tensor, next_output_tensor,
+                                  next_workspace, stream);
     cuda_synchronize(stream);
 
     int failures = verify_exact("Qwen4 sparse MoE prefill partition ids",
@@ -1740,54 +1962,80 @@ int prefill_partition_and_slot_reuse_case() {
             pattern_references[pattern][amplitude], kOutputCriterion);
     }
 
+    failures += verify_exact(
+        "Qwen4 sparse MoE back-to-back IQ2 prefill partition ids",
+        from_device<std::int32_t>(next_ids.data(), next_expected_ids.size()),
+        next_expected_ids);
+    const auto next_actual_weight_f32 =
+        from_device<float>(next_weights.data(), next_expected_weights.size());
+    failures += verify_pointwise(
+        "Qwen4 sparse MoE back-to-back IQ2 prefill partition weights",
+        std::vector<double>(next_actual_weight_f32.begin(), next_actual_weight_f32.end()),
+        next_expected_weights, kRouteWeightCriterion);
+    const auto next_actual_output =
+        from_device_bf16(next_output.data(), static_cast<std::size_t>(kHidden) * width);
+    for (int token = 0; token < width; ++token) {
+        const int pattern = (5 * token + 3) % pattern_count;
+        const int amplitude = amplitude_count - 1 - token / pattern_count;
+        failures += verify_reduction(
+            "Qwen4 sparse MoE back-to-back IQ2 per-token complete FP64 formula",
+            std::span<const double>(next_actual_output).subspan(
+                static_cast<std::size_t>(token) * kHidden, kHidden),
+            next_pattern_references[pattern][amplitude], kOutputCriterion);
+    }
+
     const auto* pinned_bytes = static_cast<const std::uint8_t*>(pinned.data());
     const auto* device_bytes = static_cast<const std::uint8_t*>(stage.data());
     for (int slot_index = 0; slot_index < 2; ++slot_index) {
-        const int first_expert = slot_index == 0 ? 64 : 32;
-        const int expert_count = slot_index == 0 ? 6 : 32;
+        const int first_expert = slot_index == 0 ? 48 : 16;
+        const int expert_count = slot_index == 0 ? 22 : 32;
         const std::size_t slot_offset = static_cast<std::size_t>(slot_index) *
                                         ops::kQwen4SparseMoePrefillSlotCapacityBytes;
         for (int local = 0; local < expert_count; ++local) {
             const int expert = first_expert + local;
-            std::vector<std::uint8_t> expected_pair(rank_bytes);
+            std::vector<std::uint8_t> expected_pair(next_rank_bytes);
             std::memcpy(expected_pair.data(),
-                        mapped_gate.data() + static_cast<std::size_t>(expert) * one_routed,
-                        one_routed);
-            std::memcpy(expected_pair.data() + one_routed,
-                        mapped_up.data() + static_cast<std::size_t>(expert) * one_routed,
-                        one_routed);
+                        next_mapped_gate.data() +
+                            static_cast<std::size_t>(expert) * next_one_routed,
+                        next_one_routed);
+            std::memcpy(expected_pair.data() + next_one_routed,
+                        next_mapped_up.data() +
+                            static_cast<std::size_t>(expert) * next_one_routed,
+                        next_one_routed);
             if (std::memcmp(pinned_bytes + slot_offset + static_cast<std::size_t>(local) *
-                                                       rank_bytes,
-                            expected_pair.data(), rank_bytes) != 0) {
-                std::cerr << "Qwen4 sparse MoE prefill partition host bytes changed\n";
+                                                       next_rank_bytes,
+                            expected_pair.data(), next_rank_bytes) != 0) {
+                std::cerr << "Qwen4 sparse MoE IQ2 prefill partition host bytes changed\n";
                 ++failures;
             }
             failures += verify_exact(
-                "Qwen4 sparse MoE prefill partition device bytes",
+                "Qwen4 sparse MoE IQ2 prefill partition device bytes",
                 from_device<std::uint8_t>(
-                    device_bytes + slot_offset + static_cast<std::size_t>(local) * rank_bytes,
-                    rank_bytes),
+                    device_bytes + slot_offset +
+                        static_cast<std::size_t>(local) * next_rank_bytes,
+                    next_rank_bytes),
                 expected_pair);
         }
         std::vector<std::int32_t> expected_occurrences;
         for (int expert = first_expert; expert < first_expert + expert_count; ++expert) {
-            for (std::size_t rank_token = 0; rank_token < expected_ids.size(); ++rank_token) {
-                if (expected_ids[rank_token] == expert) {
+            for (std::size_t rank_token = 0; rank_token < next_expected_ids.size();
+                 ++rank_token) {
+                if (next_expected_ids[rank_token] == expert) {
                     expected_occurrences.push_back(static_cast<std::int32_t>(rank_token));
                 }
             }
         }
         const std::size_t occurrence_offset =
-            slot_offset + static_cast<std::size_t>(expert_count) * rank_bytes;
+            slot_offset + static_cast<std::size_t>(expert_count) * next_rank_bytes;
         const auto* host_occurrences = reinterpret_cast<const std::int32_t*>(
             pinned_bytes + occurrence_offset);
         if (!std::equal(expected_occurrences.begin(), expected_occurrences.end(),
                         host_occurrences)) {
-            std::cerr << "Qwen4 sparse MoE prefill partition host occurrences changed\n";
+            std::cerr << "Qwen4 sparse MoE IQ2 prefill partition host occurrences changed\n";
             ++failures;
         }
         failures += verify_exact(
-            "Qwen4 sparse MoE prefill partition device occurrences",
+            "Qwen4 sparse MoE IQ2 prefill partition device occurrences",
             from_device<std::int32_t>(device_bytes + occurrence_offset,
                                       expected_occurrences.size()),
             expected_occurrences);
@@ -1796,11 +2044,22 @@ int prefill_partition_and_slot_reuse_case() {
     failures += ids.verify_guards("Qwen4 sparse MoE prefill partition ids");
     failures += weights.verify_guards("Qwen4 sparse MoE prefill partition weights");
     failures += output.verify_guards("Qwen4 sparse MoE prefill partition output");
+    failures += next_ids.verify_guards("Qwen4 sparse MoE back-to-back IQ2 partition ids");
+    failures += next_weights.verify_guards(
+        "Qwen4 sparse MoE back-to-back IQ2 partition weights");
+    failures += next_output.verify_guards("Qwen4 sparse MoE back-to-back IQ2 partition output");
     std::vector<std::uint16_t> represented_input(input.size());
     std::transform(input.begin(), input.end(), represented_input.begin(), f32_to_bf16);
     failures += verify_exact(
         "Qwen4 sparse MoE prefill partition input unchanged",
         from_device<std::uint16_t>(device_x, represented_input.size()), represented_input);
+    std::vector<std::uint16_t> next_represented_input(next_input.size());
+    std::transform(next_input.begin(), next_input.end(), next_represented_input.begin(),
+                   f32_to_bf16);
+    failures += verify_exact(
+        "Qwen4 sparse MoE back-to-back IQ2 partition input unchanged",
+        from_device<std::uint16_t>(next_device_x, next_represented_input.size()),
+        next_represented_input);
     cuda_check(cudaStreamSynchronize(events.transfer_stream),
                "cudaStreamSynchronize prefill partition transfer");
     cuda_check(cudaStreamDestroy(stream), "cudaStreamDestroy prefill partition");
