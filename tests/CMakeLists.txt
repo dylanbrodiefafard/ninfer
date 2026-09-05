@@ -211,7 +211,7 @@ set_tests_properties(ninfer_qwen3_6_35b_a3b_ram_real_test PROPERTIES SKIP_RETURN
 ninfer_add_test(ninfer_qwen4_verifier_state_test
   SOURCES targets/qwen4/test_verifier_state.cpp
   LIBRARIES ninfer_qwen4_verifier)
-ninfer_add_test(ninfer_qwen4_artifact_real_test
+ninfer_add_op_test(ninfer_qwen4_artifact_real_test
   SOURCES targets/qwen4/test_artifact_real.cpp
   LIBRARIES ninfer_qwen4_verifier)
 target_link_libraries(ninfer_qwen4_artifact_real_test PRIVATE CUDA::cudart)
@@ -221,6 +221,21 @@ ninfer_add_test(ninfer_qwen4_program_real_test
   LIBRARIES ninfer_qwen4_verifier)
 target_link_libraries(ninfer_qwen4_program_real_test PRIVATE CUDA::cudart)
 set_tests_properties(ninfer_qwen4_program_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen4_program_long_real_test
+  SOURCES targets/qwen4/test_program_long_real.cpp
+  LIBRARIES ninfer_qwen4_verifier)
+target_link_libraries(ninfer_qwen4_program_long_real_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_qwen4_program_long_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_op_test(ninfer_qwen4_numerics_real_test
+  SOURCES targets/qwen4/test_real_numerics.cpp
+          targets/qwen4/test_real_gr_oracle.cpp
+          targets/qwen4/test_real_qsa_oracle.cpp
+          targets/qwen4/real_gdn_oracle.cpp
+          targets/qwen4/real_moe_oracle.cpp
+          targets/qwen4/real_ple_oracle.cpp
+  LIBRARIES ninfer_qwen4_verifier)
+target_link_libraries(ninfer_qwen4_numerics_real_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_qwen4_numerics_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_35b_a3b_dflash_real_test
   SOURCES targets/qwen3_6_35b_a3b/test_engine_dflash_real.cpp
   LIBRARIES ninfer_engine)

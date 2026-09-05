@@ -147,9 +147,28 @@ and no warmup:
 - a fixed 31-GPU-layer, one-chunk, 32-token-context PPL run over
   `tests/targets/qwen4/fixtures/external_ppl_corpus.txt`, whose UTF-8 SHA-256 is
   `f689ec6374bdfc238155b616101ed7792f3390f64e8d10a333b07a9a71e8b1ae`, scored 15 positions and
-  completed with `PPL = 15.8057 +/- 11.62342`. Its exact command, tokenization, profile, aggregate
-  result, and four print-only prefix NLLs are frozen in `external_ppl_manifest.json` beside the
-  fixture.
+  completed with `PPL = 15.8057 +/- 11.62342`. This remains historical smoke evidence in
+  `external_ppl_manifest.json`; it is not the full-sequence comparison.
+
+An environment-gated diagnostic patch to the same pinned scorer subsequently retained every
+causal logit without changing its normal path. A single 601-token context was required because
+llama-perplexity clears model state between chunks. It emitted all 600 frozen input-to-target NLLs
+under the otherwise unchanged 31-layer external profile. The external trace had mean NLL
+`0.662443483` (`PPL = 1.939525747`), while two bit-exact native verifier replays had mean NLL
+`0.684480605` (`PPL = 1.982741742`). Every position and token pair matched the frozen sequence and
+both traces were finite. The two native replays also reproduced all `157,147,144` bytes of final
+GDN, QSA, PLE, and residual continuation state exactly; the diagnostic copies occur outside the
+timed token sequence. The complete commands, instrumentation hash, raw-result hashes, aggregate
+statistics, and localization summary are frozen in `external_ppl_manifest.json`; raw files at a
+particular machine path are not prerequisites.
+
+The paired mean absolute NLL delta was `0.197146964`, below the declared `0.5`-nat mean bound, but
+the maximum was `7.157103105` at position 521 and 33 of 600 positions exceeded the `1.0`-nat gross
+bound. Of those gross failures, 26 occurred in paragraph repetitions four through seven. Repeated
+paragraph offsets 5, 9, 25, 39, 49, 55, and 71 were localized, but the same offsets stayed within
+one nat in other repetitions; the discrepancy is state- and repetition-dependent rather than a
+fixed token-pair bias. The mean gate therefore passes and the per-token gate fails. This is an
+unresolved integration discrepancy, not an external-parity or production-correctness result.
 
 A subsequent capacity/QSA baseline fixed llama.cpp to 31 GPU layers with fit disabled, C=1, an
 8192-token context, and IQ4_NL K/V cache. It processed all 5536 tokens of repository `README.md`
@@ -194,16 +213,35 @@ teacher-forced pairs `48->16451`, `16451->17120`, `17120->22188`, and `22188->11
 finite NLLs `3.47466`, `14.0819`, `12.4137`, and `8.87907` (four-position PPL `16520.4`) and an
 exact reset/replay match for logits, NLL bits, final hidden, PLE rows/state, both GR boundaries,
 all GDN/QSA state, QSA ids/counts/current NVFP4 rows, and MoE ids/weights. The corresponding pinned
-llama.cpp NLLs were `3.15870537`, `13.7408428`, `12.0528638`, and `8.32870839`; this short trace is
-useful localization evidence, not numerical-identity evidence, an Op tolerance, or a
+601-token llama.cpp trace began with NLLs `3.05634404`, `13.2171541`, `12.0150434`, and
+`8.82161897`; this four-token prefix satisfies the coarse bounds and remains useful localization
+evidence, not numerical-identity evidence, an Op tolerance, or a
 product-quality/PPL threshold, because the native verifier deliberately uses BF16 represented
 intermediates and NVFP4-G16 KV while that external diagnostic uses its own FP32 graph profile and
 IQ4_NL KV.
-The opt-in native test enforces the manifest's deliberately coarse cross-representation integration
-gate: every paired prefix NLL must differ by at most 1.0 nat, their mean absolute difference by at
-most 0.5 nat, and neither route may be non-finite. One nat caps a frozen target-probability ratio at
-`e`; the mean bound detects systematic Program drift. These are behavioral integration limits, not
-Op tolerances or a claim that the two numeric profiles are identical.
+The opt-in four-token native test retains those prefix bounds as a localization check: every paired
+prefix NLL must differ by at most 1.0 nat, their mean absolute difference by at most 0.5 nat, and
+neither route may be non-finite. The full 600-transition evidence supersedes any interpretation of
+that passing prefix as an integration gate: although its mean bound passes, 33 gross per-token
+failures remain unresolved. One nat caps a frozen target-probability ratio at `e`; these are coarse
+behavioral diagnostics rather than Op tolerances, numeric identity, or target admission.
+
+The single-load real-artifact numerical harness independently decodes the bound packed weights and
+evaluates complete formulas from represented public inputs for layer-0 GR, layer-0 Q5_K and
+layer-2 Q6_K GDN, layer-3 QSA with NVFP4-G16 cache, layer-0 sparse MoE, and PLE. On the RTX 5090 all
+cells passed their pre-existing public-Op criteria. GR used 0.353/0.284 of its mixed/write-scale
+relative-L2 limits. QSA's raw-index, K-codec, and V-codec bound ratios were 0, 0.847, and 0.873;
+its complete nine-item output matched its FP64 oracle exactly. Its independently constructed
+prefix forced QSA block 1 to outrank block 0 (`15.8921` versus `0`), produced a `10.1456`
+maximum attention-logit spread, and gave the real current key a maximum probability of `0.999448`.
+The current K/V NVFP4 codes and FP8 scales, selected order, metadata, and untouched state planes
+also matched independent exact expectations. The two GDN output relative-L2 ratios
+were 0.176 and 0.188 of limit; sparse-MoE used 0.265 of its output relative-L2 limit and selected
+the exact ten independent router ids; PLE's complete-output maximum criterion ratio was 0.029 and
+its computed-state ratio was 0.101. Exact retained-history, staged-byte, and guard checks also
+passed. The real-weight QSA cell now discriminates two complete blocks and the current-token tail;
+capacity-transition and saturation semantics remain owned by the independent synthetic QSA tests
+and the 4096-token Program diagnostic.
 
 Same-day final RTX 5090 measurements of the same warmed four-token Program workload disabled GR
 diagnostic snapshots. Three independent three-repetition runs had sequence means of 148.666,
@@ -242,6 +280,36 @@ kernel work rather than predict end-to-end performance for the host-staged previ
 gated-residual write route reduced the complete read/write entry from a 31.69 us median to
 29.65 us. These figures qualify the unregistered verifier and its Ops only; they are not Engine
 throughput claims.
+
+A representative longer capture on the same RTX 5090 used one warm 86-transition paragraph and
+one measured 86-transition replay with NVFP4-G16 QSA state and diagnostics disabled. Under Nsight
+Systems the measured sequence took 3,662.685 ms (42.589 ms/token, 23.48 token/s). Its 41,624 H2Ds
+carried 28,885.159 MB, or 335.874 MB/token; 41,280 of those copies were the ten selected expert
+gate/up pairs for every one of 48 layers. They occupied 1,137.809 ms of GPU copy time. Route-id
+D2Hs totaled only 0.165 MB, and no QSA cache bytes crossed the host boundary. The sparse-MoE NVTX
+ranges occupied 3,202.207 ms of host duration and projected to 2,322.514 ms of GPU work, while
+host `cudaEventSynchronize` calls accumulated 1,097.718 ms. This confirms that the remaining
+whole-verifier gap is the deliberate mapped-expert staging profile rather than unintended CPU
+arithmetic or QSA offload.
+
+The corresponding transfer-free public-Op checkpoints remained stable: fully resident sparse MoE
+was 131.180/141.740 us for IQ1_S fixed-hot/rotating routes and 123.269/135.063 us for IQ2_XXS;
+the QSA selector/attention pair was 10.464/4.960 us at frontier 1 and 111.040/41.184 us at frontier
+4096. Q5_K block-linear kernels were the largest compute family in the longer trace at 509.018 ms,
+25.3% of CUDA-kernel time. Consequently, further tuning of host staging would optimize only this
+temporary verifier. Architecture-transferable performance work remains the fully resident MoE and
+Q5_K compute path, with the already-qualified long-frontier QSA route retained unchanged until a
+measured public-Op candidate wins.
+
+The follow-up public-Op checkpoint isolated the largest transferable Q5_K point, GDN
+`N=10240,K=2560,T=1`. Nine independent 101-sample cold-L2 runs had a 73.344 us
+median-of-medians (run medians 71.680--73.376 us) for an 18,048,000-byte footprint. The kernel
+classifier identifies the point as DRAM-bound: compute, occupancy, tiling, software-pipeline, and
+MMA changes are inadmissible, and replay/aggregate-T do not apply when C=T=1 and every stored
+weight is consumed once. Single-CTA TMA row staging remains only a measurement candidate; its
+required physical-load-efficiency counters were unavailable because both ordinary and
+container-root Nsight Compute access returned `ERR_NVGPUCTRPERM`. No CUDA change was made without
+that evidence. The existing public Q5_K numerical test continued to pass.
 
 ## 3. Exact component totals
 

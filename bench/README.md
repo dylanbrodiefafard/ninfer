@@ -115,7 +115,7 @@ one complete sequence is required for warmup so the measured sequence excludes f
 mapped-page, and module-loading effects. Measured `execute_token` calls are synchronous and their
 wall time therefore includes GPU work, selected-expert host addressing and copies, and dependency
 waits. It constructs the Program with GR diagnostic snapshots disabled, so none are produced or
-returned, and performs no result D2H snapshot.
+returned. Normal timing runs perform no result D2H snapshot.
 
 The default sequence is the frozen four-token integration fixture. Numeric inputs and teacher-forced
 targets may be overridden with equal-length comma-separated lists up to the 4096-token verifier
@@ -128,6 +128,14 @@ cmake --build build --parallel --target ninfer_qwen4_verifier_bench
   --weights /path/to/qwen4_ud_iq1_s_verify.ninfer \
   --warmup 1 --repetitions 3
 ```
+
+`--nll-output <path>` turns the same explicit sequence into a numerical capture and requires at
+least two measured repetitions. It copies the FP32 NLL after each already-synchronous token, then
+requires every measured repetition to reproduce both the same NLL bits and complete continuation
+state after reset. It writes one little-endian float32 per input/target pair and reports mean NLL,
+perplexity, maximum NLL, the count at or above 10, the non-finite count, and compared state bytes.
+The per-token timing ends before the NLL and state diagnostic copies; omit the option for an
+ordinary performance run.
 
 `--profile` requires `--repetitions 1` and brackets only the measured sequence with
 `cudaProfilerStart/Stop`. Target-side NVTX ranges identify each token, layer, QSA mixer, and sparse

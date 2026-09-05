@@ -203,6 +203,31 @@ NINFER_QWEN4_VERIFY_WEIGHTS=/path/to/qwen4_ud_iq1_s_verify.ninfer \
   ctest --test-dir build -R ninfer_qwen4_program_real_test --output-on-failure
 ```
 
+`ninfer_qwen4_numerics_real_test` loads the same artifact once, obtains represented BF16 inputs at
+real Program/GR boundaries, independently decodes its packed matrices, and checks complete FP64
+formulas for layer-0 GR, layer-0 Q5_K and layer-2 Q6_K GDN, layer-3 QSA with NVFP4-G16 K/V,
+layer-0 sparse MoE, and PLE. Exact checks own integer routing, codec-addressed stage bytes, retained
+PLE history, and QSA metadata; numerical criteria own floating-point outputs and computed state:
+
+```bash
+NINFER_QWEN4_VERIFY_WEIGHTS=/path/to/qwen4_ud_iq1_s_verify.ninfer \
+  ctest --test-dir build -R ninfer_qwen4_numerics_real_test --output-on-failure
+```
+
+The long-frontier companion keeps GR snapshots disabled and uses bounded streaming hashes rather
+than retaining per-token logits. It executes the full 4096-token capacity twice, validates QSA
+block/count/tail structure and current NVFP4 rows at positions 3-5, 2047-2053, and 4095, and keeps
+an exact 1,307,372-byte probe transcript. Per-token output hashes are supplementary; the probe
+transcript and full 157,147,144-byte continuation are compared byte-for-byte across reset/replay,
+and the raw continuation is compared again after each rejected overflow. Through position 2050
+every complete block fits; at positions 2051 and later it checks structural selection invariants
+and exact reset/replay rather than claiming an independent top-block score oracle:
+
+```bash
+NINFER_QWEN4_VERIFY_WEIGHTS=/path/to/qwen4_ud_iq1_s_verify.ninfer \
+  ctest --test-dir build -R ninfer_qwen4_program_long_real_test --output-on-failure
+```
+
 `--system-prepend` is applied on every request, including follow-ups, so the leading system
 tokens stay in the reusable prefix. `ninfer_serve_system_prepend_real_test` checks VRAM reuse on
 turn 2 and a host-RAM restore after an unrelated chat spills the first turn:

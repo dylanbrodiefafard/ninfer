@@ -149,6 +149,27 @@ NINFER_QWEN4_VERIFY_WEIGHTS=/path/to/qwen4_ud_iq1_s_verify.ninfer \
   ctest --test-dir build -R ninfer_qwen4_program_real_test --output-on-failure
 ```
 
+The companion real-weight numerical test loads the artifact once and checks independent FP64 or
+exact formulas for GR, both Q5_K and Q6_K GDN routes, NVFP4-G16 QSA state, sparse MoE, and PLE:
+
+```bash
+NINFER_QWEN4_VERIFY_WEIGHTS=/path/to/qwen4_ud_iq1_s_verify.ninfer \
+  ctest --test-dir build -R ninfer_qwen4_numerics_real_test --output-on-failure
+```
+
+The separate capacity diagnostic executes two 4096-token reset/replays with GR snapshots disabled.
+It checks QSA block/count/tail structure and NVFP4 state at positions 3-5, 2047-2053, and 4095,
+uses supplementary streaming hashes for every token output, and compares the bounded probe
+transcript and full 157,147,144-byte continuation byte-for-byte across reset/replay. The same raw
+continuation is compared again after each rejected overflow. Up to position 2050 every complete
+block fits; beyond that boundary the check covers structural selection invariants and exact replay,
+not an independent top-block score oracle:
+
+```bash
+NINFER_QWEN4_VERIFY_WEIGHTS=/path/to/qwen4_ud_iq1_s_verify.ninfer \
+  ctest --test-dir build -R ninfer_qwen4_program_long_real_test --output-on-failure
+```
+
 ## Docker
 
 Build the runtime image on a 64-bit Linux host with an RTX 5090, a CUDA 13.1-compatible NVIDIA

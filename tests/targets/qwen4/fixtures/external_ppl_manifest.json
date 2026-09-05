@@ -1,5 +1,5 @@
 {
-  "schema": "ninfer.qwen4.external_ppl.v1",
+  "schema": "ninfer.qwen4.external_ppl.v2",
   "created_utc": "2026-09-04",
   "corpus": {
     "path": "tests/targets/qwen4/fixtures/external_ppl_corpus.txt",
@@ -24,6 +24,7 @@
     ],
     "perplexity_file_prompt_ids_encoding": "paragraph_with_lf_token_ids repeated six times, followed by the same sequence without terminal token 198",
     "inserted_bos": false,
+    "scored_transition_count": 600,
     "native_four_token_inputs": [48, 16451, 17120, 22188],
     "native_four_token_targets": [16451, 17120, 22188, 11988]
   },
@@ -44,20 +45,23 @@
       }
     ]
   },
-  "tool": {
-    "source_tree": "/ssdpool2nvme/local_llm/llama.cpp-qwen4exp",
+  "external_tool": {
     "pinned_source_commit": "9a4843cf2f1a3fc8e39f8148e92ee6bfe18e2db6",
+    "perplexity_source_sha256_before_patch": "b9958b81bb2c77a1f42dadeef6ddaf5abbe68d7d3bc46f509608e463f8575b6f",
     "binary_version": "0.3.0-dev",
     "binary_build": 0,
     "binary_self_reported_commit": "unknown",
     "compiler_self_report": "GNU 13.3.0 for Linux x86_64",
-    "prefix_nll_instrumentation": {
-      "path": "tests/targets/qwen4/fixtures/llama_perplexity_prefix_nll.patch",
-      "sha256": "85d384a90c92cde57ee5ad19e7e2059a7b9475c5048cd3253fd82bd538bc6b2f",
-      "effect": "print-only: retain positions 0..3 logits and apply the scorer's existing log_softmax without changing model evaluation or aggregate scoring"
+    "paired_nll_instrumentation": {
+      "path": "tests/targets/qwen4/fixtures/llama_perplexity_paired_nll.patch",
+      "sha256": "b0ef87d5a8f826e0928f72b7c80afebf390efc5ca19d6f5c27fe8fde78841ed3",
+      "application": "git apply tests/targets/qwen4/fixtures/llama_perplexity_paired_nll.patch",
+      "perplexity_source_sha256_after_patch": "6e76881804ebdaa1b28ae2d3495eb5d2d49329878ec07bf659e9d8fd3d97c966",
+      "activation": "set NINFER_EMIT_PAIRED_NLL=1",
+      "effect": "require one tokenized sequence to fill the context, retain every causal logit, and emit positions 0..n_ctx-2 through the scorer's existing log_softmax; behavior is unchanged when the environment variable is absent"
     }
   },
-  "profile": {
+  "common_external_profile": {
     "gpu": "NVIDIA GeForce RTX 5090",
     "gpu_memory_mib": 32607,
     "driver": "580.173.02",
@@ -75,24 +79,14 @@
     "parallel": 1,
     "threads": 16,
     "threads_batch": 16,
+    "batch_size": 256,
+    "ubatch_size": 256,
     "warmup": false,
     "seed": 1234
   },
-  "command": [
-    "/ssdpool2nvme/local_llm/llama.cpp-qwen4exp/build/bin/llama-perplexity",
-    "-m", "/ssdpool2nvme/local_llm/models/qwen4-ud-iq1s/UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf",
-    "-f", "tests/targets/qwen4/fixtures/external_ppl_corpus.txt",
-    "--ctx-size", "32", "--chunks", "1", "--ppl-output-type", "1",
-    "--batch-size", "256", "--ubatch-size", "256",
-    "--threads", "16", "--threads-batch", "16",
-    "--gpu-layers", "31", "--fit", "off", "--split-mode", "none",
-    "--flash-attn", "on", "--cache-type-k", "iq4_nl", "--cache-type-v", "iq4_nl",
-    "--load-mode", "mmap", "--lazy-mode", "on", "--parallel", "1",
-    "--no-warmup", "--seed", "1234"
-  ],
-  "result": {
-    "requested_context": 32,
-    "effective_scorer_context": 32,
+  "historical_context_32_baseline": {
+    "status": "retained historical smoke evidence; it is not the full-sequence paired result",
+    "context_size": 32,
     "chunks": 1,
     "aggregate_scored_input_positions": [16, 30],
     "aggregate_scored_target_positions": [17, 31],
@@ -101,23 +95,148 @@
     "ppl": 15.8057,
     "nll_standard_error": 0.735396,
     "ppl_uncertainty": 11.62342,
-    "native_prefix": [
+    "prefix_nll": [
       {"position": 0, "input_id": 48, "target_id": 16451, "nll": 3.15870537},
       {"position": 1, "input_id": 16451, "target_id": 17120, "nll": 13.7408428},
       {"position": 2, "input_id": 17120, "target_id": 22188, "nll": 12.0528638},
       {"position": 3, "input_id": 22188, "target_id": 11988, "nll": 8.32870839}
+    ]
+  },
+  "paired_context_601": {
+    "status": "unresolved integration discrepancy: mean gate passes but gross per-token gate fails",
+    "command_environment": {"NINFER_EMIT_PAIRED_NLL": "1"},
+    "command_template": [
+      "${LLAMA_CPP_BUILD}/bin/llama-perplexity",
+      "-m", "${QWEN4_GGUF_SHARD_1}",
+      "-f", "tests/targets/qwen4/fixtures/external_ppl_corpus.txt",
+      "--ctx-size", "601", "--chunks", "1", "--ppl-output-type", "1",
+      "--batch-size", "256", "--ubatch-size", "256",
+      "--threads", "16", "--threads-batch", "16",
+      "--gpu-layers", "31", "--fit", "off", "--split-mode", "none",
+      "--flash-attn", "on", "--cache-type-k", "iq4_nl", "--cache-type-v", "iq4_nl",
+      "--load-mode", "mmap", "--lazy-mode", "on", "--parallel", "1",
+      "--no-warmup", "--seed", "1234"
     ],
-    "native_cross_route_criterion": {
+    "context_change_rationale": "601 replaces the historical 32-token context so all 600 transitions share one uninterrupted causal state; llama-perplexity clears model state between chunks",
+    "wall_seconds": 46.86,
+    "model_pass_seconds": 33.09,
+    "max_rss_kb": 27029300,
+    "external_result": {
+      "transition_count": 600,
+      "position_range": [0, 599],
+      "token_pair_match_to_frozen_ids": 600,
+      "non_finite_count": 0,
+      "mean_nll": 0.6624434828479007,
+      "ppl": 1.93952574693645,
+      "minimum_nll": 0.000024786188603524552,
+      "maximum_nll": 13.217154127288497,
+      "nll_at_least_10_count": 6,
+      "nll_standard_error": 0.077494,
+      "ppl_uncertainty": 0.15030,
+      "first_four_nll": [3.0563440376731457, 13.217154127288497, 12.015043390206641, 8.821618971613773]
+    },
+    "native_result": {
+      "profile": "C=1 eager Qwen4 verifier with NVFP4-G16 QSA KV",
+      "artifact": {
+        "model_id": "qwen4/verification",
+        "weights_id": "unsloth-ud-iq1-s-host-staged",
+        "conversion_recipe": "qwen4_ud_iq1_s_verify-v1",
+        "bytes": 72535629824
+      },
+      "command_template": [
+        "${NINFER_BUILD}/bench/ninfer_qwen4_verifier_bench",
+        "--weights", "${QWEN4_VERIFY_ARTIFACT}",
+        "--warmup", "1", "--repetitions", "2",
+        "--inputs", "${FROZEN_PROMPT_IDS_0_THROUGH_599_CSV}",
+        "--targets", "${FROZEN_PROMPT_IDS_1_THROUGH_600_CSV}",
+        "--nll-output", "${NATIVE_NLL_SIDECAR}"
+      ],
+      "token_argument_construction": "expand tokenization.perplexity_file_prompt_ids_encoding, pass elements 0..599 as inputs and 1..600 as targets",
+      "transition_count": 600,
+      "exact_nll_two_replay_agreement": true,
+      "exact_continuation_two_replay_agreement": true,
+      "exact_continuation_bytes_per_replay": 157147144,
+      "non_finite_count": 0,
+      "mean_nll": 0.6844806051254273,
+      "ppl": 1.9827417421492308,
+      "minimum_nll": 0.0000286102294921875,
+      "maximum_nll": 14.081942558288574,
+      "nll_at_least_10_count": 6,
+      "first_four_nll": [3.4746618270874023, 14.081942558288574, 12.413739204406738, 8.879072189331055]
+    },
+    "paired_delta": {
+      "mean_signed_external_minus_native": -0.022037122277526553,
+      "mean_absolute": 0.1971469643044105,
+      "median_absolute": 0.005047897510364323,
+      "maximum_absolute": 7.157103104843059,
+      "maximum_position": 521,
+      "maximum_input_id": 3817,
+      "maximum_target_id": 19039,
+      "absolute_delta_count_strictly_greater_than_0_1": 142,
+      "absolute_delta_count_strictly_greater_than_0_5": 51,
+      "absolute_delta_count_strictly_greater_than_1_0": 33,
+      "positions_strictly_greater_than_1_0": [
+        10, 42, 65, 73, 87, 200, 221, 283, 297, 304, 313, 320, 349, 353, 369, 378,
+        383, 393, 419, 435, 438, 439, 442, 456, 485, 500, 501, 521, 571, 575, 576, 587,
+        598
+      ]
+    },
+    "criterion": {
       "maximum_per_token_absolute_delta_nll": 1.0,
       "maximum_mean_absolute_delta_nll": 0.5,
       "maximum_non_finite_count": 0,
-      "rationale": "The profiles intentionally differ in represented activation and KV formats. A one-nat gross cap bounds any frozen target-probability ratio by e, while the 0.5-nat mean cap detects systematic full-Program drift without claiming numerical identity."
+      "mean_gate_passed": true,
+      "per_token_gate_passed": false,
+      "finite_gate_passed": true,
+      "overall_passed": false,
+      "interpretation": "The full-sequence evidence does not qualify the native Program as externally matched; investigate the localized recurrent divergence before making a production correctness claim."
+    },
+    "paragraph_localization": {
+      "segmentation": "repetitions 1..6 own 86 transition input positions each, including the terminal-LF transition; repetition 7 owns positions 516..599",
+      "per_repetition_mean_abs_delta": [
+        0.29109315076977754, 0.021616358154999047, 0.09008004857192788,
+        0.1473601771412972, 0.2897465535047175, 0.28216711827984486,
+        0.25941340036078336
+      ],
+      "per_repetition_max_abs_delta": [
+        2.344641896477958, 1.138305515291908, 2.048993502034449, 1.7571965074013765,
+        5.946871690951163, 4.615672427641719, 7.157103104843059
+      ],
+      "per_repetition_count_abs_delta_gt_1": [4, 1, 2, 5, 7, 8, 6],
+      "late_repetition_count_abs_delta_gt_1": {
+        "repetition_range_inclusive": [4, 7],
+        "count": 26,
+        "total_gross_count": 33
+      },
+      "repeated_offsets_with_abs_delta_gt_1": [
+        {"offset": 5, "positions": [349, 435, 521]},
+        {"offset": 9, "positions": [353, 439]},
+        {"offset": 25, "positions": [283, 369]},
+        {"offset": 39, "positions": [297, 383]},
+        {"offset": 49, "positions": [221, 393]},
+        {"offset": 55, "positions": [313, 485, 571]},
+        {"offset": 71, "positions": [501, 587]}
+      ],
+      "interpretation": "The same offsets remain within one nat in other repetitions, so this is state- and repetition-dependent rather than a fixed token-pair bias."
+    },
+    "result_artifacts": {
+      "external_raw_log": {
+        "bytes": 46882,
+        "sha256": "2157bf2959c0ca0502e3f4021ef5de80e236439864c3fc81a75d00864a630c2b",
+        "content": "600 text TOKEN_NLL records plus llama-perplexity aggregate output"
+      },
+      "native_nll_sidecar": {
+        "bytes": 2400,
+        "sha256": "d9233109119a0a0f282fceebff195c27dd210d757c23a084327ea092cacffc73",
+        "content": "600 little-endian IEEE-754 binary32 NLL values in position order"
+      },
+      "availability": "result hashes record the measured evidence; machine-local raw files are not repository or runtime prerequisites"
     }
   },
   "limitations": [
-    "Stock llama-perplexity exposes aggregate mean NLL/PPL but not individual token NLL; the frozen print-only patch exposes the four prefix values through the same scorer log_softmax.",
-    "This llama.cpp dense-mask and IQ4_NL cache route is paired external integration evidence, not a native NInfer Op or state oracle.",
-    "IQ4_NL K/V is not NInfer NVFP4-G16 K/V, and the external result must not be used as NVFP4 cache numerical evidence.",
-    "The tiny aggregate sample has high uncertainty and is not a language-quality benchmark."
+    "The external runner executes QSA selection but uses a dense attention fallback; it is not a QSA performance or sparse-attention oracle.",
+    "External IQ4_NL K/V is not NInfer NVFP4-G16 K/V, so paired deltas cross distinct represented cache and activation profiles.",
+    "The mean paired gate passes but 33 per-token deltas exceed the one-nat gross cap; this is unresolved integration evidence, not external parity or production correctness.",
+    "The historical context-32 PPL result scores only 15 positions and remains smoke evidence rather than a language-quality benchmark."
   ]
 }
