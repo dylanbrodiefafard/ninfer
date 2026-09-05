@@ -85,6 +85,12 @@ struct PipelineEvents {
 constexpr ReductionCriterion kOutputCriterion{/*relative_l2=*/2.5 / 255.0,
                                                /*gross_absolute=*/1.0 / 32768.0,
                                                /*gross_relative_to_max_reference=*/2.0 / 255.0};
+// The standalone fused Op has two semantic BF16 projection boundaries and one BF16 Store. Its
+// ideal FP64 oracle applies those boundaries without reproducing the production reduction order.
+constexpr ReductionCriterion kGateUpSwiGluCriterion{
+    /*relative_l2=*/2.5 / 255.0,
+    /*gross_absolute=*/1.0 / 32768.0,
+    /*gross_relative_to_max_reference=*/2.0 / 255.0};
 constexpr PointwiseCriterion kRouteWeightCriterion{
     /*absolute=*/128.0 * std::numeric_limits<float>::epsilon(),
     /*relative=*/128.0 * std::numeric_limits<float>::epsilon(),
@@ -240,6 +246,44 @@ double sigmoid(double value) {
 }
 
 double silu(double value) { return value * sigmoid(value); }
+
+std::uint64_t round_nonnegative_ties_to_even(double value) {
+    const double lower_value = std::floor(value);
+    auto lower = static_cast<std::uint64_t>(lower_value);
+    const double remainder = value - lower_value;
+    if (remainder > 0.5 || (remainder == 0.5 && (lower & 1U) != 0)) { ++lower; }
+    return lower;
+}
+
+double round_fp64_to_bf16(double value) {
+    if (value == 0.0 || !std::isfinite(value)) { return value; }
+    const bool negative = std::signbit(value);
+    const double magnitude = std::abs(value);
+    std::uint16_t word = negative ? 0x8000U : 0U;
+    if (magnitude < std::ldexp(1.0, -126)) {
+        const auto significand = round_nonnegative_ties_to_even(std::ldexp(magnitude, 133));
+        word = static_cast<std::uint16_t>(word | significand);
+        return static_cast<double>(bf16_to_f32(word));
+    }
+
+    int exponent = 0;
+    const double fraction = std::frexp(magnitude, &exponent);
+    int unbiased_exponent = exponent - 1;
+    auto significand = round_nonnegative_ties_to_even(std::ldexp(fraction, 8));
+    if (significand == 256) {
+        significand = 128;
+        ++unbiased_exponent;
+    }
+    if (unbiased_exponent > 127) {
+        word = static_cast<std::uint16_t>(word | 0x7f80U);
+    } else {
+        const auto exponent_field = static_cast<std::uint16_t>(unbiased_exponent + 127);
+        word = static_cast<std::uint16_t>(
+            word | static_cast<std::uint16_t>(exponent_field << 7U) |
+            static_cast<std::uint16_t>(significand - 128));
+    }
+    return static_cast<double>(bf16_to_f32(word));
+}
 
 class AnonymousMapping {
 public:
@@ -543,6 +587,212 @@ std::vector<float> make_input() {
     input[0] = 1.0F;
     round_to_bf16(input);
     return input;
+}
+
+int prefill_gate_up_dense_oracle_case(QType routed_qtype, cudaStream_t stream) {
+    constexpr int maximum_test_width = 17;
+    const auto gate = make_matrix(routed_qtype, kIntermediate, kHidden, 0x17U);
+    const auto up = make_matrix(routed_qtype, kIntermediate, kHidden, 0x2bU);
+    DeviceBuffer device_gate = to_device(gate);
+    DeviceBuffer device_up = to_device(up);
+    const Weight gate_weight = make_ggml_weight(
+        device_gate.p, gate.size(), routed_qtype, 1, kIntermediate, kHidden);
+    const Weight up_weight = make_ggml_weight(
+        device_up.p, up.size(), routed_qtype, 1, kIntermediate, kHidden);
+
+    std::vector<float> input(static_cast<std::size_t>(kHidden) * maximum_test_width);
+    for (int token = 0; token < maximum_test_width; ++token) {
+        for (int column = 0; column < kHidden; ++column) {
+            input[static_cast<std::size_t>(token) * kHidden + column] =
+                static_cast<float>((column * 29 + token * 17) % 61 - 30) / 128.0F;
+        }
+    }
+    round_to_bf16(input);
+    std::vector<double> reference;
+    reference.reserve(static_cast<std::size_t>(kIntermediate) * maximum_test_width);
+    for (int token = 0; token < maximum_test_width; ++token) {
+        std::vector<double> represented(kHidden);
+        for (int column = 0; column < kHidden; ++column) {
+            represented[column] = input[static_cast<std::size_t>(token) * kHidden + column];
+        }
+        const auto gate_projection = linear(routed_qtype, gate, kIntermediate, kHidden,
+                                            represented);
+        const auto up_projection = linear(routed_qtype, up, kIntermediate, kHidden,
+                                          represented);
+        for (int row = 0; row < kIntermediate; ++row) {
+            const double gate_bf16 = round_fp64_to_bf16(gate_projection[row]);
+            const double up_bf16 = round_fp64_to_bf16(up_projection[row]);
+            reference.push_back(round_fp64_to_bf16(silu(gate_bf16) * up_bf16));
+        }
+    }
+
+    DeviceBuffer device_input = to_device_bf16(input);
+    int failures = 0;
+    for (int width : {1, 16, 17}) {
+        GuardedDeviceBuffer device_output(
+            static_cast<std::size_t>(kIntermediate) * width * sizeof(std::uint16_t));
+        cuda_check(cudaDeviceSynchronize(),
+                   "cudaDeviceSynchronize public gate/up SwiGLU guards");
+        cuda_check(cudaMemsetAsync(device_output.data(), 0xa7, device_output.bytes(), stream),
+                   "cudaMemsetAsync public gate/up SwiGLU output");
+        Tensor x(device_input.p, DType::BF16, {kHidden, width});
+        Tensor output(device_output.data(), DType::BF16, {kIntermediate, width});
+        ops::qwen4_sparse_moe_gate_up_swiglu(
+            x, gate_weight, up_weight, output, stream);
+        cuda_synchronize(stream);
+        const auto actual = from_device_bf16(
+            device_output.data(), static_cast<std::size_t>(kIntermediate) * width);
+        const std::string label =
+            std::string(routed_qtype == QType::GGML_IQ1_S ? "Qwen4 IQ1" : "Qwen4 IQ2") +
+            " public gate/up SwiGLU dense FP64 T=" + std::to_string(width);
+        failures += verify_reduction(
+            label.c_str(), actual,
+            std::span<const double>(reference).first(
+                static_cast<std::size_t>(kIntermediate) * width),
+            kGateUpSwiGluCriterion);
+        failures += device_output.verify_guards(label.c_str());
+    }
+
+    constexpr int maximum_width = ops::kQwen4SparseMoePrefillMaxWidth;
+    DeviceBuffer zero_input(
+        static_cast<std::size_t>(kHidden) * maximum_width * sizeof(std::uint16_t));
+    GuardedDeviceBuffer maximum_output(
+        static_cast<std::size_t>(kIntermediate) * maximum_width * sizeof(std::uint16_t));
+    cuda_check(cudaDeviceSynchronize(),
+               "cudaDeviceSynchronize public gate/up SwiGLU maximum guards");
+    cuda_check(cudaMemsetAsync(zero_input.p, 0, zero_input.bytes, stream),
+               "cudaMemsetAsync public gate/up SwiGLU maximum input");
+    cuda_check(cudaMemsetAsync(maximum_output.data(), 0xa7, maximum_output.bytes(), stream),
+               "cudaMemsetAsync public gate/up SwiGLU maximum output");
+    Tensor maximum_x(zero_input.p, DType::BF16, {kHidden, maximum_width});
+    Tensor maximum_out(maximum_output.data(), DType::BF16,
+                       {kIntermediate, maximum_width});
+    ops::qwen4_sparse_moe_gate_up_swiglu(
+        maximum_x, gate_weight, up_weight, maximum_out, stream);
+    cuda_synchronize(stream);
+    failures += verify_exact(
+        routed_qtype == QType::GGML_IQ1_S
+            ? "Qwen4 IQ1 public gate/up SwiGLU maximum zero oracle"
+            : "Qwen4 IQ2 public gate/up SwiGLU maximum zero oracle",
+        from_device<std::uint16_t>(maximum_output.data(),
+                                   static_cast<std::size_t>(kIntermediate) * maximum_width),
+        std::vector<std::uint16_t>(static_cast<std::size_t>(kIntermediate) * maximum_width));
+    failures += maximum_output.verify_guards(
+        routed_qtype == QType::GGML_IQ1_S
+            ? "Qwen4 IQ1 public gate/up SwiGLU maximum"
+            : "Qwen4 IQ2 public gate/up SwiGLU maximum");
+
+    Tensor wrong_shape(device_input.p, DType::BF16, {kHidden - 1, maximum_test_width});
+    Tensor valid_output(maximum_output.data(), DType::BF16,
+                        {kIntermediate, maximum_test_width});
+    failures += expect_invalid(
+        [&] {
+            ops::qwen4_sparse_moe_gate_up_swiglu(
+                wrong_shape, gate_weight, up_weight, valid_output, stream);
+        },
+        "Qwen4 public gate/up SwiGLU malformed input shape");
+    Weight wrong_format = gate_weight;
+    wrong_format.qtype = QType::GGML_Q8_0;
+    failures += expect_invalid(
+        [&] {
+            ops::qwen4_sparse_moe_gate_up_swiglu(
+                Tensor(device_input.p, DType::BF16, {kHidden, maximum_test_width}),
+                wrong_format, up_weight, valid_output, stream);
+        },
+        "Qwen4 public gate/up SwiGLU malformed format");
+    Tensor aliased_output(device_input.p, DType::BF16,
+                          {kIntermediate, maximum_test_width});
+    failures += expect_invalid(
+        [&] {
+            ops::qwen4_sparse_moe_gate_up_swiglu(
+                Tensor(device_input.p, DType::BF16, {kHidden, maximum_test_width}),
+                gate_weight, up_weight, aliased_output, stream);
+        },
+        "Qwen4 public gate/up SwiGLU destructive output alias");
+    failures += expect_invalid(
+        [&] {
+            ops::qwen4_sparse_moe_gate_up_swiglu(
+                Tensor(device_input.p, DType::BF16, {kHidden, maximum_test_width}),
+                gate_weight, gate_weight, valid_output, stream);
+        },
+        "Qwen4 public gate/up SwiGLU aliased gate/up");
+    return failures;
+}
+
+int prefill_gate_up_rounding_boundary_case(QType routed_qtype, cudaStream_t stream) {
+    constexpr int width = 17;
+    const std::uint32_t gate_seed = routed_qtype == QType::GGML_IQ1_S ? 3U : 0U;
+    const std::uint32_t up_seed = 2U;
+    const float active_input = routed_qtype == QType::GGML_IQ1_S ? 500.0F : 752.0F;
+    const FormatSpec format = format_spec(routed_qtype);
+
+    // One independently packed nonzero coefficient makes the FP32 dot product exact and
+    // association-independent. The remaining blocks have zero scales. Tokens 15 and 16 straddle
+    // the production 16-occurrence tile boundary.
+    auto gate = make_zero_scaled_matrix(routed_qtype, kIntermediate, kHidden, gate_seed);
+    auto up = make_zero_scaled_matrix(routed_qtype, kIntermediate, kHidden, up_seed);
+    const auto gate_witness = make_matrix(routed_qtype, 1, kHidden, gate_seed);
+    const auto up_witness = make_matrix(routed_qtype, 1, kHidden, up_seed);
+    std::copy_n(gate_witness.begin(), format.bytes, gate.begin());
+    std::copy_n(up_witness.begin(), format.bytes, up.begin());
+
+    std::vector<float> input(static_cast<std::size_t>(kHidden) * width, 0.0F);
+    constexpr std::array<int, 3> active_tokens{0, 15, 16};
+    for (int token : active_tokens) {
+        input[static_cast<std::size_t>(kHidden) * token] = active_input;
+    }
+    round_to_bf16(input);
+
+    const double gate_exact = decode_value(routed_qtype, gate.data(), 0) * active_input;
+    const double up_exact = decode_value(routed_qtype, up.data(), 0) * active_input;
+    const float gate_total = static_cast<float>(gate_exact);
+    const float up_total = static_cast<float>(up_exact);
+    const float gate_bf16 = bf16_to_f32(f32_to_bf16(gate_total));
+    const float up_bf16 = bf16_to_f32(f32_to_bf16(up_total));
+    const std::uint16_t expected_word = f32_to_bf16(
+        gate_bf16 / (1.0F + std::exp(-gate_bf16)) * up_bf16);
+    const std::uint16_t unrounded_word =
+        f32_to_bf16(gate_total / (1.0F + std::exp(-gate_total)) * up_total);
+    if (expected_word == unrounded_word) {
+        throw std::logic_error("SwiGLU fixture does not witness BF16 projection rounding");
+    }
+
+    DeviceBuffer device_x = to_device_bf16(input);
+    DeviceBuffer device_gate = to_device(gate);
+    DeviceBuffer device_up = to_device(up);
+    GuardedDeviceBuffer device_activated(
+        static_cast<std::size_t>(kIntermediate) * width * sizeof(std::uint16_t));
+    cuda_check(cudaDeviceSynchronize(),
+               "cudaDeviceSynchronize public gate/up SwiGLU witness guards");
+    cuda_check(cudaMemsetAsync(
+                   device_activated.data(), 0xcd, device_activated.bytes(), stream),
+               "cudaMemsetAsync public gate/up SwiGLU witness output");
+    Tensor x(device_x.p, DType::BF16, {kHidden, width});
+    Tensor activated(device_activated.data(), DType::BF16, {kIntermediate, width});
+    const Weight gate_weight = make_ggml_weight(
+        device_gate.p, gate.size(), routed_qtype, 1, kIntermediate, kHidden);
+    const Weight up_weight = make_ggml_weight(
+        device_up.p, up.size(), routed_qtype, 1, kIntermediate, kHidden);
+    ops::qwen4_sparse_moe_gate_up_swiglu(
+        x, gate_weight, up_weight, activated, stream);
+    cuda_synchronize(stream);
+
+    const auto actual = from_device<std::uint16_t>(
+        device_activated.data(), static_cast<std::size_t>(kIntermediate) * width);
+    std::vector<std::uint16_t> expected(actual.size(), 0);
+    for (int token : active_tokens) {
+        expected[static_cast<std::size_t>(kIntermediate) * token] = expected_word;
+    }
+    int failures = verify_exact(
+        routed_qtype == QType::GGML_IQ1_S
+            ? "Qwen4 IQ1 prefill fused BF16 projection/SwiGLU boundaries"
+            : "Qwen4 IQ2 prefill fused BF16 projection/SwiGLU boundaries",
+        actual, expected);
+    failures += device_activated.verify_guards(
+        routed_qtype == QType::GGML_IQ1_S
+            ? "Qwen4 IQ1 prefill fused activation"
+            : "Qwen4 IQ2 prefill fused activation");
+    return failures;
 }
 
 int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
@@ -878,21 +1128,19 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
     }
 
     if (route_fixture != RouteFixture::Underflow) {
-        constexpr int prefill_width = 2;
+        constexpr int prefill_width = 17;
         std::vector<float> prefill_input;
         prefill_input.reserve(static_cast<std::size_t>(kHidden) * prefill_width);
-        prefill_input.insert(prefill_input.end(), input.begin(), input.end());
-        prefill_input.insert(prefill_input.end(), input.begin(), input.end());
         std::vector<double> prefill_reference;
         prefill_reference.reserve(static_cast<std::size_t>(kHidden) * prefill_width);
-        prefill_reference.insert(prefill_reference.end(), reference.begin(), reference.end());
-        prefill_reference.insert(prefill_reference.end(), reference.begin(), reference.end());
         std::vector<double> next_prefill_reference;
         next_prefill_reference.reserve(static_cast<std::size_t>(kHidden) * prefill_width);
-        next_prefill_reference.insert(next_prefill_reference.end(), next_reference.begin(),
-                                      next_reference.end());
-        next_prefill_reference.insert(next_prefill_reference.end(), next_reference.begin(),
-                                      next_reference.end());
+        for (int token = 0; token < prefill_width; ++token) {
+            prefill_input.insert(prefill_input.end(), input.begin(), input.end());
+            prefill_reference.insert(prefill_reference.end(), reference.begin(), reference.end());
+            next_prefill_reference.insert(next_prefill_reference.end(), next_reference.begin(),
+                                          next_reference.end());
+        }
 
         DeviceBuffer prefill_x = to_device_bf16(prefill_input);
         GuardedDeviceBuffer prefill_stage(ops::kQwen4SparseMoePrefillPipelineStageBytes);
@@ -978,10 +1226,20 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
                 return std::vector<double>(values.begin(), values.end());
             }(),
             expected_weights, kRouteWeightCriterion);
+        const auto prefill_actual =
+            from_device_bf16(prefill_output.data(), prefill_reference.size());
         failures += verify_reduction(
             "Qwen4 sparse MoE prefill complete FP64 formula",
-            from_device_bf16(prefill_output.data(), prefill_reference.size()),
-            prefill_reference, kOutputCriterion);
+            prefill_actual, prefill_reference, kOutputCriterion);
+        for (int token : {15, 16}) {
+            failures += verify_reduction(
+                token == 15
+                    ? "Qwen4 sparse MoE prefill occurrence column 15 FP64 formula"
+                    : "Qwen4 sparse MoE prefill occurrence column 16 FP64 formula",
+                std::span<const double>(prefill_actual).subspan(
+                    static_cast<std::size_t>(token) * kHidden, kHidden),
+                reference, kOutputCriterion);
+        }
         failures += verify_exact(
             "Qwen4 sparse MoE prefill back-to-back ids",
             from_device<std::int32_t>(next_prefill_ids.data(), expected_next_ids.size()),
@@ -1027,8 +1285,9 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
         for (int expert : sorted_experts) {
             const auto iterator = std::find(next_route.ids.begin(), next_route.ids.end(), expert);
             const int rank = static_cast<int>(iterator - next_route.ids.begin());
-            expected_occurrences.push_back(rank);
-            expected_occurrences.push_back(rank + kTopK);
+            for (int token = 0; token < prefill_width; ++token) {
+                expected_occurrences.push_back(rank + kTopK * token);
+            }
         }
         const auto* pinned_occurrences = reinterpret_cast<const std::int32_t*>(
             pinned_prefill + sorted_experts.size() * rank_bytes);
@@ -1137,7 +1396,10 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
             "prefill workspace missing absolute-address alignment padding");
 
         constexpr int small_resident_width = 2;
-        std::vector<float> small_resident_input = prefill_input;
+        std::vector<float> small_resident_input;
+        small_resident_input.reserve(static_cast<std::size_t>(kHidden) * small_resident_width);
+        small_resident_input.insert(small_resident_input.end(), input.begin(), input.end());
+        small_resident_input.insert(small_resident_input.end(), input.begin(), input.end());
         small_resident_input[static_cast<std::size_t>(kHidden) + 1] += 0.125F;
         round_to_bf16(small_resident_input);
         std::vector<double> second_small_oracle_input(
@@ -2100,6 +2362,10 @@ int main() {
         cudaStream_t stream = nullptr;
         cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
         PipelineEvents pipeline_events;
+        failures += prefill_gate_up_rounding_boundary_case(QType::GGML_IQ1_S, stream);
+        failures += prefill_gate_up_rounding_boundary_case(QType::GGML_IQ2_XXS, stream);
+        failures += prefill_gate_up_dense_oracle_case(QType::GGML_IQ1_S, stream);
+        failures += prefill_gate_up_dense_oracle_case(QType::GGML_IQ2_XXS, stream);
         failures += run_case(QType::GGML_IQ1_S, QType::GGML_Q5_K,
                              RouteFixture::AllZero, 80.0F, pipeline_events, stream);
         failures += run_case(QType::GGML_IQ2_XXS, QType::GGML_Q6_K,

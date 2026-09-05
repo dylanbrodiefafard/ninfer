@@ -135,6 +135,32 @@ struct Qwen4SparseMoePrefillPipeline {
     std::int32_t width);
 
 /**
+ * Op: qwen4_sparse_moe_gate_up_swiglu
+ *
+ * Computes the routed Qwen4-preview expert activation for C=1 and T in [1,4096]:
+ *
+ * `out[row,t] = BF16(SiLU(BF16(sum_k decode(gate[row,k])*x[k,t])) *
+ *                       BF16(sum_k decode(up[row,k])*x[k,t]))`.
+ *
+ * x is contiguous BF16 [2560,T], gate and up are distinct device-resident rank-two GGML
+ * block-row weights [640,2560] with the same IQ1_S or IQ2_XXS format, and out is contiguous BF16
+ * [640,T]. Each dot product accumulates independently in FP32. The completed gate and up
+ * projections are semantic BF16-RNE boundaries; both are widened for the FP32 SiLU/product, and
+ * the completed activation is rounded once to BF16-RNE.
+ *
+ * The independent oracle exact-decodes each packed coefficient into FP64 and evaluates the two
+ * complete dot products and SwiGLU formula from represented BF16 x. An additional
+ * association-independent sparse witness exact-checks both projection rounds and the activation
+ * round. x and out require 16-byte alignment; both GGML payloads require 256-byte alignment. x,
+ * gate, up, and out are read-only/read-only/read-only/write-only and pairwise disjoint. The Op
+ * performs no allocation, repacking, persistent mutation, or host synchronization. Work is
+ * enqueued on stream, and the caller owns every storage lifetime through completion.
+ */
+void qwen4_sparse_moe_gate_up_swiglu(const Tensor& x, const Weight& gate,
+                                     const Weight& up, Tensor& out,
+                                     cudaStream_t stream);
+
+/**
  * Op: qwen4_sparse_moe
  *
  * Computes the complete Qwen4-preview C=1/T=1 sparse-MoE formula. The GPU evaluates the FP32
