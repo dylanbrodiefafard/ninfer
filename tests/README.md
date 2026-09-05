@@ -224,10 +224,12 @@ exact PLE addressing/history, and final-layer QSA selection structure. Scalar/pr
 deltas are reported only as localization evidence: their first persistent difference is the
 layer-0 FP32 GDN recurrence after an exact 61,440-byte BF16 convolution state, and the independent
 GDN Op test admits scalar T=1, one-shot, aligned 64x64, and the five-part schedule at the exact
-post-expansion `Hq=Hv=48,D=128,T=4096` geometry against one complete FP64 oracle. Per-token output
-hashes remain supplementary; the scalar probe transcript and full 157,147,144-byte continuation
-are compared byte-for-byte across reset/replay, and the raw continuation is compared again after
-each rejected overflow. Through position 2050 every complete block fits; at positions 2051 and
+post-expansion `Hq=Hv=48,D=128,T=4096` geometry against one complete FP64 oracle. The same oracle
+directly covers T=447/448/449 around the fused-Q dispatch and first recurrent tail, while a
+workspace-interval witness crosses the same allocation boundary. Per-token output hashes remain
+supplementary; the scalar probe transcript and full 157,147,144-byte continuation are compared
+byte-for-byte across reset/replay, and the raw continuation is compared again after each rejected
+overflow. Through position 2050 every complete block fits; at positions 2051 and
 later the test checks structural selection invariants and deterministic replay rather than
 claiming an independent top-block score oracle:
 

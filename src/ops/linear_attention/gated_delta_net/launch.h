@@ -67,7 +67,7 @@ std::size_t chunked_workspace_bytes(std::int32_t value_heads, std::int32_t token
 void launch_normalize_fp16(const Tensor& x, Tensor& out, cudaStream_t stream);
 
 void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                    const Tensor& beta, float scale, const Tensor& ssm_state_in,
+                    const Tensor& beta, float scale, bool normalize_q, const Tensor& ssm_state_in,
                     Tensor& ssm_state_out, Tensor& out, void* workspace,
                     std::size_t workspace_bytes, cudaStream_t stream);
 

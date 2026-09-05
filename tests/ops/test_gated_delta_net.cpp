@@ -846,6 +846,16 @@ int main() {
             ++failures;
         }
     }
+    const std::size_t before_fusion =
+        ops::gated_delta_net_workspace_capacity_bytes(48, 48, true, 447, 447);
+    const std::size_t after_fusion =
+        ops::gated_delta_net_workspace_capacity_bytes(48, 48, true, 448, 448);
+    const std::size_t crossing =
+        ops::gated_delta_net_workspace_capacity_bytes(48, 48, true, 447, 448);
+    if (crossing != std::max(before_fusion, after_fusion)) {
+        std::cerr << "gated_delta_net interval capacity missed the fused-Q crossover\n";
+        ++failures;
+    }
     try {
         (void)ops::gated_delta_net_workspace_capacity_bytes(16, 48, true, 0, 65);
         std::cerr << "gated_delta_net accepted an invalid token interval\n";
@@ -870,6 +880,12 @@ int main() {
     failures += distinct_state_case({"27b two-chunk fused-qk-norm", 16, 48, 128, true}, 12128u);
     failures += distinct_state_case({"27b production-tail fused-qk-norm", 16, 48, 3404, true},
                                     15404u);
+    failures += distinct_state_case(
+        {"Qwen4 materialized-Q crossover predecessor", 48, 48, 447, true}, 15447u);
+    failures +=
+        distinct_state_case({"Qwen4 fused-Q crossover", 48, 48, 448, true}, 15448u);
+    failures +=
+        distinct_state_case({"Qwen4 fused-Q crossover tail", 48, 48, 449, true}, 15449u);
     failures += inplace_case({"35b two-chunk raw-qk", 16, 32, 128, false}, 12228u);
     failures += partition_case({"27b chunk boundary", 16, 48, 128, true}, {64, 64}, 12428u);
     failures += partition_case({"27b chunk tail", 16, 48, 65, true}, {64, 1}, 12465u);
