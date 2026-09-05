@@ -468,6 +468,7 @@ struct OracleInputs {
     const AnonymousMapping& routed_gate;
     const AnonymousMapping& routed_up;
     const std::array<std::vector<std::uint8_t>, kTopK>& routed_down;
+    std::array<int, kTopK> routed_down_experts;
     std::span<const float> shared_gate;
     std::span<const std::uint8_t> shared_gate_proj;
     std::span<const std::uint8_t> shared_up;
@@ -490,7 +491,14 @@ std::vector<double> complete_oracle(std::span<const double> input, const OracleR
         for (int i = 0; i < kIntermediate; ++i) {
             activated[i] = silu(gate[i]) * up[i];
         }
-        const auto down = linear(QType::GGML_IQ4_NL, weights.routed_down[rank], kHidden,
+        const auto down_entry = std::find(weights.routed_down_experts.begin(),
+                                          weights.routed_down_experts.end(), expert);
+        if (down_entry == weights.routed_down_experts.end()) {
+            throw std::logic_error("oracle has no routed-down matrix for selected expert");
+        }
+        const auto down_index = static_cast<std::size_t>(
+            std::distance(weights.routed_down_experts.begin(), down_entry));
+        const auto down = linear(QType::GGML_IQ4_NL, weights.routed_down[down_index], kHidden,
                                  kIntermediate, activated);
         for (int i = 0; i < kHidden; ++i) {
             output[i] += route.weights[rank] * down[i];
@@ -653,6 +661,7 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
         mapped_gate,
         mapped_up,
         down_matrices,
+        route.ids,
         shared_gate,
         shared_gate_proj,
         shared_up,
@@ -666,6 +675,7 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
         mapped_gate,
         mapped_up,
         next_down_matrices,
+        next_route.ids,
         shared_gate,
         shared_gate_proj,
         shared_up,
@@ -1143,9 +1153,10 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
         failures += small_resident_output.verify_guards("Qwen4 resident small-T output");
 
         // Qualify the device-grouped resident route directly against the independent formula.
-        // Three represented inputs alternate: two select the same experts with different values,
-        // and one selects a disjoint expert set. This catches token/rank coupling, expert grouping,
-        // and result-scatter mistakes that identical-token or zero-matrix panels cannot expose.
+        // Four represented inputs alternate: two select the same experts with different values,
+        // one selects a disjoint expert set, and one selects the first set in reversed rank order.
+        // This catches token/rank coupling, expert grouping, and result-scatter mistakes that
+        // identical-token or fixed-rank panels cannot expose.
         constexpr int resident_width = 257;
         std::vector<float> resident_router(static_cast<std::size_t>(kExperts) * kHidden, 0.0F);
         for (int rank = 0; rank < kTopK; ++rank) {
@@ -1155,40 +1166,50 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
                 static_cast<float>(20 - rank);
             resident_router[static_cast<std::size_t>(next_route.ids[rank]) * kHidden + 2] =
                 static_cast<float>(20 - rank);
+            resident_router[static_cast<std::size_t>(route.ids[kTopK - 1 - rank]) * kHidden +
+                            3] = static_cast<float>(20 - rank);
         }
-        std::array<std::vector<float>, 3> resident_inputs;
+        std::array<std::vector<float>, 4> resident_inputs;
         resident_inputs[0].assign(kHidden, 0.0F);
         resident_inputs[1].assign(kHidden, 0.0F);
         resident_inputs[2].assign(kHidden, 0.0F);
+        resident_inputs[3].assign(kHidden, 0.0F);
         resident_inputs[0][0] = 1.0F;
         resident_inputs[1][1] = 0.75F;
         resident_inputs[2][2] = 1.0F;
+        resident_inputs[3][3] = 0.5F;
         for (auto& value : resident_inputs) { round_to_bf16(value); }
-        std::array<std::vector<double>, 3> resident_oracle_inputs;
-        std::array<OracleRoute, 3> resident_routes;
-        for (int pattern = 0; pattern < 3; ++pattern) {
+        std::array<std::vector<double>, 4> resident_oracle_inputs;
+        std::array<OracleRoute, 4> resident_routes;
+        for (int pattern = 0; pattern < 4; ++pattern) {
             resident_oracle_inputs[pattern].assign(resident_inputs[pattern].begin(),
                                                    resident_inputs[pattern].end());
             resident_routes[pattern] = route_oracle(resident_router,
                                                     resident_oracle_inputs[pattern]);
         }
+        auto reverse_route_ids = route.ids;
+        std::reverse(reverse_route_ids.begin(), reverse_route_ids.end());
         if (resident_routes[0].ids != route.ids || resident_routes[1].ids != route.ids ||
-            resident_routes[2].ids != next_route.ids) {
+            resident_routes[2].ids != next_route.ids ||
+            resident_routes[3].ids != reverse_route_ids) {
             throw std::logic_error("resident grouped route fixture is malformed");
         }
         const OracleInputs resident_oracle_weights{
             routed_qtype, shared_qtype, resident_router, mapped_gate, mapped_up,
-            down_matrices, shared_gate, shared_gate_proj, shared_up, shared_down};
+            down_matrices, route.ids, shared_gate, shared_gate_proj, shared_up, shared_down};
         const OracleInputs resident_next_oracle_weights{
             routed_qtype, shared_qtype, resident_router, mapped_gate, mapped_up,
-            next_down_matrices, shared_gate, shared_gate_proj, shared_up, shared_down};
-        std::array<std::vector<double>, 3> resident_references{
+            next_down_matrices, next_route.ids, shared_gate, shared_gate_proj, shared_up,
+            shared_down};
+        std::array<std::vector<double>, 4> resident_references{
             complete_oracle(resident_oracle_inputs[0], resident_routes[0],
                             resident_oracle_weights),
             complete_oracle(resident_oracle_inputs[1], resident_routes[1],
                             resident_oracle_weights),
             complete_oracle(resident_oracle_inputs[2], resident_routes[2],
                             resident_next_oracle_weights),
+            complete_oracle(resident_oracle_inputs[3], resident_routes[3],
+                            resident_oracle_weights),
         };
 
         std::vector<float> resident_panel;
@@ -1198,7 +1219,7 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
         std::vector<double> resident_expected_weights(
             static_cast<std::size_t>(resident_width) * kTopK);
         for (int token = 0; token < resident_width; ++token) {
-            const int pattern = token % 3;
+            const int pattern = token % 4;
             resident_panel.insert(resident_panel.end(), resident_inputs[pattern].begin(),
                                   resident_inputs[pattern].end());
             std::copy(resident_routes[pattern].ids.begin(), resident_routes[pattern].ids.end(),
@@ -1264,7 +1285,7 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
             ++failures;
         }
         for (int token = 0; token < resident_width; ++token) {
-            const int pattern = token % 3;
+            const int pattern = token % 4;
             const auto begin = static_cast<std::size_t>(token) * kHidden;
             failures += verify_reduction(
                 "Qwen4 resident grouped per-token complete FP64 formula",
