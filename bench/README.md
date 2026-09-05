@@ -84,25 +84,28 @@ load, graph construction, and warmup do not enter topology counts.
 ## Qwen4 architecture-verifier benchmark
 
 `ninfer_qwen4_sparse_moe_resident_bench` is the exact H2560/E512/top10/I640 public-Op
-placement A/B. It uses complete IQ1_S or IQ2_XXS gate/up banks and the IQ4_NL down bank in both
-profiles. `staged` gathers the selected gate/up bytes from ordinary host storage through the live
-two-slot pipeline; `resident` dynamically indexes complete device banks from GPU route ids and
-performs no copy or host synchronization inside the Op. The resident route uses fused all-rank
-routed grids and fused shared projections while preserving the Op's represented BF16 seams and
-rank-ordered FP32 accumulation. `fixed_hot` repeatedly selects one expert window, while `rotating`
-cycles 52 windows covering all 512 experts so selected bank bytes do not remain an L2-only working
-set.
+placement and width A/B. It uses complete IQ1_S or IQ2_XXS gate/up banks, the complete IQ4_NL down
+bank, and all three real shared-format combinations: IQ1_S/Q5_K, IQ2_XXS/Q5_K, and the layer-2
+IQ2_XXS/Q6_K pair. `scalar_repeat` invokes the accepted T=1 public Op T times. `resident` invokes
+one `[2560,T]` public Op, dynamically indexes complete device banks from GPU route ids, and performs
+no copy or host synchronization inside the Op. `fixed_hot` selects the same ten experts across the
+panel; at T>=52, `rotating` cycles 52 windows covering all 512 experts. At those widths it is the
+full-bank-reuse profile rather than an L2-only hot-set result.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNINFER_BUILD_BENCHMARKS=ON
 cmake --build build --parallel --target ninfer_qwen4_sparse_moe_resident_bench
-./build/bench/ninfer_qwen4_sparse_moe_resident_bench --iterations 104
+./build/bench/ninfer_qwen4_sparse_moe_resident_bench --width 512 --iterations 5
+./build/bench/ninfer_qwen4_sparse_moe_resident_bench --width 4096 --iterations 3
 ```
 
-The benchmark reports synchronous host wall time and the compute-stream critical path per public
-Op call. Its synthetic blocks have finite scales and exercise the exact production decoders; the
-independent complete FP64 formula remains owned by `ninfer_qwen4_sparse_moe_test`. This is a
-one-layer placement experiment, not evidence that all 48 preview expert banks fit the RTX 5090.
+The benchmark reports synchronous host wall time, compute-stream critical path, input tokens per
+second, complete resident weight bytes, and width-specific workspace bytes per public Op call.
+`--profile` selects one IQ1_S/Q5_K rotating resident call after warmup and brackets it with the CUDA
+profiler API for an Nsight Systems capture. Its synthetic blocks have finite scales and exercise
+the exact production decoders; the independent complete FP64 formula remains owned by
+`ninfer_qwen4_sparse_moe_test`. This is a one-layer placement experiment, not evidence that all 48
+preview expert banks fit the RTX 5090.
 
 `ninfer_qwen4_verifier_bench` measures the unregistered C=1 eager Text Program over an explicitly
 named Qwen4 verification artifact. It is not an Engine, CLI, serving, CUDA Graph, or product
