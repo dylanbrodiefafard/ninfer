@@ -582,7 +582,9 @@ Its live artifact verifier profile has:
 
 1. hidden width 2560 and separate GGML block-row projections qkv `[10240,2560]` and z
    `[6144,2560]`, plus FP32 controls a/b `[48,2560]`; qkv history is represented BF16
-   `[10240,3]`, while Z bypasses convolution;
+   `[10240,3]`, while Z bypasses convolution. At aligned prefill widths divisible by 256, the
+   Q5_K qkv projection privately decodes one row into FP32 shared storage and replays it through
+   the established sequential 16-token FP32 accumulators; this changes no represented boundary;
 2. mathematical FP32 convolution weights `[10240,4]`, physically viewed as contiguous
    `[4,10240]` and indexed `weight[channel*4+tap]`, plus represented
    `ssm_a=-exp(A_log)` and `dt_bias`, consumed without a BF16 verifier lane;
@@ -620,6 +622,11 @@ inputs for scalar T=1, one-shot, aligned 64x64, and `64+1+1986+1+2044` schedules
 complete BF16 output, selected cumulative prefixes, and final FP32 state compare directly to one
 complete FP64 recurrence oracle; pairwise bit comparisons remain diagnostic implementation-profile
 evidence.
+
+The projection oracle also exercises the exact Q5_K `[10240,2560]` dispatch boundary at
+T=511/512/513. It independently decodes the stored block scales, minimums, low nibbles, and high
+bits into FP64 products from represented BF16 activations, compares every BF16 output, and checks
+that input and weight storage remain unchanged.
 
 ## 9. Live C=1 sparse-MoE verifier
 

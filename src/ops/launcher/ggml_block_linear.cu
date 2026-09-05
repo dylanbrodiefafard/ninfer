@@ -14,6 +14,22 @@ void launch_format(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t s
     constexpr std::uint64_t block_bytes  = GgmlDecoder<Format>::block_bytes;
     const auto row_bytes = static_cast<std::uint64_t>(w.k) / block_values * block_bytes;
     const std::int32_t tokens = x.ne[1];
+    if constexpr (Format == QType::GGML_Q5_K) {
+        if (uses_qwen4_q5_k_weight_replay(Format, w.n, w.k, tokens)) {
+            const dim3 grid(
+                static_cast<unsigned>(w.n),
+                static_cast<unsigned>(tokens / kGgmlQ5KReplayTokens));
+            constexpr int shared_bytes =
+                (2560 + kGgmlQ5KReplayTokens / kGgmlBlockLinearAggregateTokens * 16 * 8) *
+                static_cast<int>(sizeof(float));
+            ggml_q5_k_block_linear_replay_kernel<kGgmlQ5KReplayTokens>
+                <<<grid, 256, shared_bytes, stream>>>(
+                    static_cast<const __nv_bfloat16*>(x.data),
+                    static_cast<const std::uint8_t*>(w.qdata),
+                    static_cast<__nv_bfloat16*>(out.data), w.n, row_bytes);
+            return;
+        }
+    }
     if (tokens == 1) {
         ggml_block_linear_kernel<Format><<<w.n, 256, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),

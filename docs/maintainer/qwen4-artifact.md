@@ -515,15 +515,29 @@ page-fault diagnostics rather than steady prefill measurements. Nsight reduced t
 pair to 273.80--274.75 input token/s, so profiler and uninstrumented rates are not interchanged.
 
 An exact GGML block-row gate and retained public-Op benchmark then evaluated the dominant
-T-wide projection family. At Q5_K `N=10240,K=2560,T=512`, the current 16-token aggregate route
-measured 5.252--5.449 ms in separate 20-repetition cold-L2 runs. A temporary 32-token tile measured
-5.883 ms and an 8-token tile 5.996 ms; both lost and were deleted. Matched Q8_0 and IQ4_NL checks
-also retained 16 tokens. The final aggregate instantiations use 41--44 registers, zero local bytes,
-and zero stack bytes, so no spill-driven variant is justified. The classifier admits
-`aggregate_T` because it attacks repeated packed-weight reads. Other GGML compute-side ideas remain
-measurement tasks: the exact representation-byte floor does not model scalar codec instructions
-or physical replay and therefore cannot classify them as DRAM- or compute-bound. No CUDA kernel
-changed from this sweep. The retained PLE dependency schedule creates measured overlap but has no
+T-wide projection family. At Q5_K `N=10240,K=2560,T=512`, the original 16-token aggregate route
+measured a 5.294 ms median over 101 cold-L2 samples. Tiles of 8 and 32 lost and were deleted; a
+bounded decoded-row replay sweep measured 4.976, 4.472, 4.398, and 4.049 ms at 32, 64, 128, and
+256 tokens. The retained exact-profile kernel decodes one 2560-element row once into FP32 shared
+storage, then preserves the original 16-token FP32 FMA and reduction order across sixteen
+sequential windows. It is selected only for Q5_K `[10240,2560]` at positive multiples of 256;
+all formats, shapes, and unaligned widths retain the established route. The final 101-sample
+cold-L2 measurement was 4.005 ms median and 4.027 ms p95, a 24.3% median reduction. Widths 256,
+1024, and 4096 retained the win, while 255, 257, 511, and 513 exercised the unchanged boundary
+route.
+
+The baseline Nsight Compute capture measured 5.826 ms, 73.09% SM throughput, 71.33% memory
+throughput, 68.33% achieved occupancy, and 41 registers without spills. The retained 256-token
+route measured 4.054 ms under the profiler, 83.41% SM throughput, 89.43% memory throughput,
+86.97% achieved occupancy, five-CTA residency, 18,432 bytes of dynamic shared storage, and no
+spills. A process-warm width-512 verifier A/B improved from 269.61 to 277.55 input token/s; a
+reverse candidate run measured 276.83 input token/s, while scalar decode remained in its
+established 24--25 token/s range because T=1 does not select the replay route. Exact
+N=10240/K=2560 tests compare every output at T=511/512/513 directly with the independent
+packed-Q5_K FP64 oracle using four cyclic encoded row patterns. A final four-token artifact replay
+reproduced every FP32 NLL bit and all 157,147,144 continuation bytes across resets, with mean NLL
+9.712354, perplexity 16520.444356,
+and no non-finite values. The retained PLE dependency schedule creates measured overlap but has no
 matched pre/post throughput A/B, so the absolute Program baselines above are not attributed to it.
 The scheduling opportunity remains applicable to a future all-GPU-fit core checkpoint only when
 it retains this same RAM-resident PLE profile.
