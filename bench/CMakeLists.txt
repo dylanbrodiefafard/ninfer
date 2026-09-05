@@ -142,6 +142,16 @@ target_include_directories(ninfer_qwen4_verifier_bench PRIVATE
 target_link_libraries(ninfer_qwen4_verifier_bench PRIVATE
   ninfer_qwen4_verifier CUDA::cudart CUDA::nvtx3)
 
+# Opt-in represented-boundary capture for comparing the unregistered verifier with pinned
+# external Qwen4 research traces. It uses Program diagnostics and is never linked by the product.
+add_executable(ninfer_qwen4_native_trace
+  ${PROJECT_SOURCE_DIR}/tools/parity/qwen4/native_trace.cpp)
+target_include_directories(ninfer_qwen4_native_trace PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(ninfer_qwen4_native_trace PRIVATE
+  ninfer_qwen4_verifier CUDA::cudart)
+
 # Exact-shape Qwen4 sparse-MoE placement A/B: mapped-host selected staging versus complete
 # device-resident GGML expert banks, including a rotating route that exceeds L2 capacity.
 add_executable(ninfer_qwen4_sparse_moe_resident_bench

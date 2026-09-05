@@ -59,6 +59,14 @@
       "perplexity_source_sha256_after_patch": "6e76881804ebdaa1b28ae2d3495eb5d2d49329878ec07bf659e9d8fd3d97c966",
       "activation": "set NINFER_EMIT_PAIRED_NLL=1",
       "effect": "require one tokenized sequence to fill the context, retain every causal logit, and emit positions 0..n_ctx-2 through the scorer's existing log_softmax; behavior is unchanged when the environment variable is absent"
+    },
+    "boundary_summary_instrumentation": {
+      "path": "tests/targets/qwen4/fixtures/llama_qwen4_boundary_tap.patch",
+      "sha256": "5c0be36853b0041117514802be1942179880ea32519cf54ecb782ffaa6f069a3",
+      "application": "apply only to a dedicated trace source tree, then build a separate llama-debug binary",
+      "activation": "set NINFER_QWEN4_TAP=1 and select exact tensor names with --tensor-filter",
+      "effect": "when activated, filter tensors during the callback ask phase, expose post-attention and post-FFN four-branch residuals through distinct diagnostic copy nodes without renaming l_last, and emit one FP64 sum/sum-of-squares/maximum-magnitude record per local microbatch token; without activation the ordinary llama-debug ask/print behavior is retained, while the dedicated trace graph still contains the diagnostic copies",
+      "comparison_tool": "tools/parity/qwen4/compare_boundary_traces.py"
     }
   },
   "common_external_profile": {
@@ -108,7 +116,7 @@
     ]
   },
   "paired_context_601": {
-    "status": "cross-profile integration sensitivity: mean gate passes, gross per-token gate fails, and controlled external profiles show that the external NLL trace is not a stable numerical oracle",
+    "status": "unresolved cross-profile integration discrepancy: the declared mean gate passes, the declared one-nat per-token gate fails at 33 of 600 transitions, and controlled external profiles provide diagnostic sensitivity context only",
     "command_environment": {"NINFER_EMIT_PAIRED_NLL": "1"},
     "command_template": [
       "${LLAMA_CPP_BUILD}/bin/llama-perplexity",
@@ -314,14 +322,107 @@
       "interpretation": "The exact IQ4 agreement between batch256/ubatch1 and batch1/ubatch1 isolates the external schedule sensitivity to multi-token microbatch execution rather than outer batch grouping. Cache dtype, microbatch width, and external layer placement each produce material NLL changes. Moving all ordinary transformer weights to the GPU reduces the native/external gross count from 27 to 23 but does not monotonically improve mean absolute delta. These controls invalidate external NLL as a numerical oracle; they do not qualify either implementation or identify a native defect. Native correctness remains owned by independent represented-input Op and accumulated-state oracles."
     },
     "criterion": {
+      "kind": "declared cross-profile paired-NLL integration bounds",
       "maximum_per_token_absolute_delta_nll": 1.0,
       "maximum_mean_absolute_delta_nll": 0.5,
       "maximum_non_finite_count": 0,
+      "required_transition_count": 600,
+      "required_exact_token_pair_matches": 600,
+      "require_exact_native_replay": true,
       "mean_gate_passed": true,
       "per_token_gate_passed": false,
       "finite_gate_passed": true,
+      "token_alignment_gate_passed": true,
+      "native_replay_gate_passed": true,
       "overall_passed": false,
-      "interpretation": "The full-sequence evidence does not qualify the native Program as externally matched. Controlled external schedule and cache profiles produce comparable or larger deltas, so the gross failures identify context/execution-profile sensitivity rather than a native recurrent-state defect."
+      "external_self_sensitivity_affects_acceptance": false,
+      "independent_oracle_gate": "required separately; exact or FP32/FP64 represented-input Op/state criteria are unchanged",
+      "interpretation": "The mean bound passes but the one-nat per-token bound fails at 33 of 600 transitions, so external integration remains unresolved. Controlled external self-sensitivity contextualizes the disagreement but does not alter either declared gate. This is not a numerical correctness result; independent represented-boundary oracles remain the hard numerical gates."
+    },
+    "boundary_localization": {
+      "trace_status": "regenerated with the corrected instrumentation in a dedicated trace source tree and llama-debug build",
+      "native_trace_tool": {
+        "path": "tools/parity/qwen4/native_trace.cpp",
+        "sha256": "20d11bb37cd3317d704812edba7f85f583abc74cc38e991e30deea072ab6696c",
+        "command_template": [
+          "${NINFER_BUILD}/bench/ninfer_qwen4_native_trace",
+          "--weights", "${QWEN4_VERIFY_ARTIFACT}",
+          "--tokens", "${FROZEN_PROMPT_IDS_0_THROUGH_600_CSV}",
+          "--probes", "${ORIGINAL_33_GROSS_POSITIONS_CSV}",
+          "--output", "${NATIVE_BOUNDARY_TRACE}"
+        ],
+        "pre_emission_validation": "independent exact PLE n-gram rows; QSA frontier count, visible-set completeness before the 2048-token budget, bounds, uniqueness, and -1 padding; router bounds, uniqueness, finiteness, nonnegativity, and FP32-sum normalization"
+      },
+      "command_environment": {"NINFER_QWEN4_TAP": "1"},
+      "command_template": [
+        "${LLAMA_CPP_TRACE_BUILD}/bin/llama-debug",
+        "--model", "${MODEL_FIRST_SHARD}",
+        "--file", "tests/targets/qwen4/fixtures/external_ppl_corpus.txt",
+        "--ctx-size", "601",
+        "--batch-size", "601",
+        "--ubatch-size", "${TRACE_UBATCH_SIZE}",
+        "--threads", "16",
+        "--threads-batch", "16",
+        "--gpu-layers", "31",
+        "--fit", "off",
+        "--split-mode", "none",
+        "--flash-attn", "on",
+        "--cache-type-k", "iq4_nl",
+        "--cache-type-v", "iq4_nl",
+        "--load-mode", "mmap",
+        "--lazy-mode", "on",
+        "--parallel", "1",
+        "--no-warmup",
+        "--seed", "1234",
+        "--log-colors", "off",
+        "--tensor-filter", "^(hc_init|attn_residual-[0-9]+|ffn_residual-[0-9]+|result_norm)$"
+      ],
+      "profiles": [
+        {"batch_size": 601, "ubatch_size": 256, "instrumentation_patch_sha256": "5c0be36853b0041117514802be1942179880ea32519cf54ecb782ffaa6f069a3", "raw_log_bytes": 6635885, "raw_log_sha256": "5172cc0495a0d7b6ae0034e8959e1863361bee008c27e3512d391cf21746ecaf"},
+        {"batch_size": 601, "ubatch_size": 1, "instrumentation_patch_sha256": "5c0be36853b0041117514802be1942179880ea32519cf54ecb782ffaa6f069a3", "raw_log_bytes": 13330128, "raw_log_sha256": "f64f60a13a3250bf2e2d70b596353b63e7e7807fa045e6131e18d832b5da1625"},
+        {"native_nvfp4_g16": true, "probe_positions": [0, 7, 10, 60, 221, 227, 438, 521], "raw_log_bytes": 310821, "raw_log_sha256": "c45259ba01016ddb264d4014eae021eaceb1277a34824e942ccbf3303cb7be93"},
+        {"native_nvfp4_g16": true, "probe_set": "all original greater-than-one-nat positions", "probe_count": 33, "raw_log_bytes": 1553052, "raw_log_sha256": "fe29840535d73146811696d9b93725182a7397ed30dc8bfd8b16627d37e98a3c", "generated_by_current_validating_tool": true, "comparison_csv_sha256": "62af103a014e750ebbaa98685e4720d88fe5576baca0f2957dfcaa29fd03cbfd"}
+      ],
+      "alignment": "exact direct tensor names only; derived reshapes are excluded; every required series must reproduce the declared per-microbatch local-token sequence before occurrence order is mapped to absolute positions; layer 47 and final output-row-selected series are excluded when incomplete",
+      "position_60": "native/external residual-norm divergence first clearly amplifies at layer-32 post-attention, while external wide/tokenwise divergence is only 0.570 percent there; the native gap is not explained by external microbatch width",
+      "position_221": "divergence broadens through layers 32..34, sharply amplifies across the layer-35 FFN/MoE transition, and amplifies again at the layer-39 QSA transition; both effects survive the external tokenwise control",
+      "all_33_native_exact_metadata": {"ple_rows_matching_independent_integer_oracle": 33, "qsa_layer_records_with_exact_count_and_complete_id_set": 396, "finite_normalized_unique_router_records": 1584},
+      "all_33_peak_residual_norm_deltas_vs_tokenwise_external": [
+        {"position": 10, "seam": "attn_residual", "layer": 37, "relative_l2_norm_delta": 0.058231},
+        {"position": 42, "seam": "attn_residual", "layer": 38, "relative_l2_norm_delta": 0.056194},
+        {"position": 65, "seam": "ffn_residual", "layer": 44, "relative_l2_norm_delta": 0.046870},
+        {"position": 73, "seam": "ffn_residual", "layer": 36, "relative_l2_norm_delta": 0.137298},
+        {"position": 87, "seam": "attn_residual", "layer": 46, "relative_l2_norm_delta": 0.082438},
+        {"position": 200, "seam": "attn_residual", "layer": 38, "relative_l2_norm_delta": 0.113857},
+        {"position": 221, "seam": "attn_residual", "layer": 39, "relative_l2_norm_delta": 0.072206},
+        {"position": 283, "seam": "attn_residual", "layer": 29, "relative_l2_norm_delta": 0.057387},
+        {"position": 297, "seam": "attn_residual", "layer": 46, "relative_l2_norm_delta": 0.115677},
+        {"position": 304, "seam": "ffn_residual", "layer": 31, "relative_l2_norm_delta": 0.072002},
+        {"position": 313, "seam": "ffn_residual", "layer": 39, "relative_l2_norm_delta": 0.138982},
+        {"position": 320, "seam": "attn_residual", "layer": 46, "relative_l2_norm_delta": 0.103039},
+        {"position": 349, "seam": "attn_residual", "layer": 39, "relative_l2_norm_delta": 0.201028},
+        {"position": 353, "seam": "ffn_residual", "layer": 34, "relative_l2_norm_delta": 0.067085},
+        {"position": 369, "seam": "attn_residual", "layer": 46, "relative_l2_norm_delta": 0.070851},
+        {"position": 378, "seam": "attn_residual", "layer": 39, "relative_l2_norm_delta": 0.163395},
+        {"position": 383, "seam": "attn_residual", "layer": 36, "relative_l2_norm_delta": 0.164242},
+        {"position": 393, "seam": "attn_residual", "layer": 46, "relative_l2_norm_delta": 0.079981},
+        {"position": 419, "seam": "attn_residual", "layer": 42, "relative_l2_norm_delta": 0.201422},
+        {"position": 435, "seam": "attn_residual", "layer": 46, "relative_l2_norm_delta": 0.356726},
+        {"position": 438, "seam": "attn_residual", "layer": 38, "relative_l2_norm_delta": 0.316261},
+        {"position": 439, "seam": "attn_residual", "layer": 46, "relative_l2_norm_delta": 0.064970},
+        {"position": 442, "seam": "ffn_residual", "layer": 42, "relative_l2_norm_delta": 0.214400},
+        {"position": 456, "seam": "attn_residual", "layer": 44, "relative_l2_norm_delta": 0.118630},
+        {"position": 485, "seam": "ffn_residual", "layer": 41, "relative_l2_norm_delta": 0.080242},
+        {"position": 500, "seam": "attn_residual", "layer": 38, "relative_l2_norm_delta": 0.260166},
+        {"position": 501, "seam": "ffn_residual", "layer": 39, "relative_l2_norm_delta": 0.091461},
+        {"position": 521, "seam": "attn_residual", "layer": 39, "relative_l2_norm_delta": 0.233816},
+        {"position": 571, "seam": "attn_residual", "layer": 36, "relative_l2_norm_delta": 0.164321},
+        {"position": 575, "seam": "attn_residual", "layer": 37, "relative_l2_norm_delta": 0.118069},
+        {"position": 576, "seam": "ffn_residual", "layer": 38, "relative_l2_norm_delta": 0.237023},
+        {"position": 587, "seam": "attn_residual", "layer": 40, "relative_l2_norm_delta": 0.048752},
+        {"position": 598, "seam": "attn_residual", "layer": 34, "relative_l2_norm_delta": 0.091567}
+      ],
+      "limitations": "summary norms localize amplification but cannot detect offsetting elementwise differences and cannot identify the correct implementation profile; native uses BF16 residuals and NVFP4-G16 KV while external uses FP32 residuals and IQ4_NL KV"
     },
     "paragraph_localization": {
       "segmentation": "repetitions 1..6 own 86 transition input positions each, including the terminal-LF transition; repetition 7 owns positions 516..599",
@@ -368,7 +469,7 @@
   "limitations": [
     "The external runner executes QSA selection but uses a dense attention fallback; it is not a QSA performance or sparse-attention oracle.",
     "External IQ4_NL K/V is not NInfer NVFP4-G16 K/V, so paired deltas cross distinct represented cache and activation profiles.",
-    "The mean paired gate passes but 33 per-token deltas exceed the one-nat gross cap; controlled external profiles show comparable or larger self-deltas, so this is sensitivity evidence rather than external parity, production correctness, or proof of a native defect.",
+    "The declared mean paired gate passes, but 33 per-token deltas exceed the declared one-nat cap and the external integration criterion remains unresolved. Controlled external profiles show comparable or larger self-deltas, which is diagnostic context rather than authority to change the failed gate or proof of a native defect.",
     "The historical context-32 PPL result scores only 15 positions and remains smoke evidence rather than a language-quality benchmark."
   ]
 }

@@ -4,21 +4,43 @@ import math
 
 import torch
 
-from tools.reference.qwen4.common import grouped_zero_centered_rmsnorm
-from tools.reference.qwen4.gated_residual import final_read, inject, read
+from tools.reference.qwen4.common import (
+    actual_gguf_grouped_rmsnorm,
+    source_grouped_rmsnorm,
+)
+from tools.reference.qwen4.gated_residual import (
+    actual_gguf_final_read,
+    actual_gguf_read,
+    inject,
+    source_final_read,
+    source_read,
+)
 from tools.reference.qwen4.ple import dilated_depthwise_conv
-from tools.reference.qwen4.ple import inject as ple_inject
+from tools.reference.qwen4.ple import actual_gguf_inject as ple_actual_gguf_inject
+from tools.reference.qwen4.ple import source_inject as ple_source_inject
 
 
-def test_grouped_zero_centered_rmsnorm_matches_hand_computation() -> None:
+def test_grouped_rmsnorm_profiles_match_distinct_hand_formulas() -> None:
     value = torch.tensor([[3.0, 4.0, 0.0, 2.0]])
     weight = torch.tensor([0.0, 1.0, -0.5, 0.25])
-    actual = grouped_zero_centered_rmsnorm(value, weight, group_size=2, eps=0.0)
-    expected = torch.tensor(
+    source = source_grouped_rmsnorm(value, weight, group_size=2, eps=0.0)
+    expected_source = torch.tensor(
         [[3.0 / math.sqrt(12.5), 8.0 / math.sqrt(12.5), 0.0, 2.5 / math.sqrt(2.0)]],
         dtype=torch.float64,
     )
-    torch.testing.assert_close(actual, expected, atol=1e-14, rtol=1e-14)
+    direct_gamma = torch.tensor([0.5, 1.5, 2.0, 0.25])
+    actual_gguf = actual_gguf_grouped_rmsnorm(
+        value, direct_gamma, group_size=2, eps=0.0
+    )
+    expected_actual_gguf = torch.tensor(
+        [[1.5 / math.sqrt(12.5), 6.0 / math.sqrt(12.5), 0.0, 0.5 / math.sqrt(2.0)]],
+        dtype=torch.float64,
+    )
+    torch.testing.assert_close(source, expected_source, atol=1e-14, rtol=1e-14)
+    torch.testing.assert_close(
+        actual_gguf, expected_actual_gguf, atol=1e-14, rtol=1e-14
+    )
+    assert not torch.equal(source, actual_gguf)
 
 
 def test_gated_residual_read_inject_and_final_read_match_direct_formula() -> None:
@@ -27,7 +49,7 @@ def test_gated_residual_read_inject_and_final_read_match_direct_formula() -> Non
     down = torch.tensor([[0.2, -0.1, 0.4, 0.3]])
     up = torch.tensor([[0.5], [-0.25], [0.75], [0.1]])
     write = torch.tensor([[0.2, 0.1, -0.1, 0.4], [-0.3, 0.5, 0.2, -0.2]])
-    result = read(branches, norm_weight, down, up, write, eps=1e-6)
+    result = source_read(branches, norm_weight, down, up, write, eps=1e-6)
 
     flat = branches.double().flatten(-2)
     grouped = flat.reshape(1, 2, 2)
@@ -46,8 +68,19 @@ def test_gated_residual_read_inject_and_final_read_match_direct_formula() -> Non
     torch.testing.assert_close(inject(branches, block, represented_write), expected_branches)
     assert not torch.equal(represented_write.double(), result.injection_scales)
     torch.testing.assert_close(
-        final_read(branches, norm_weight, down, up),
+        source_final_read(branches, norm_weight, down, up),
         result.mixed,
+    )
+
+    folded_gamma = 1.0 + norm_weight.double()
+    actual_gguf = actual_gguf_read(
+        branches, folded_gamma, down, up, write, eps=1e-6
+    )
+    torch.testing.assert_close(actual_gguf.mixed, expected_mixed)
+    torch.testing.assert_close(actual_gguf.injection_scales, expected_write)
+    torch.testing.assert_close(
+        actual_gguf_final_read(branches, folded_gamma, down, up),
+        expected_mixed,
     )
 
 
@@ -72,7 +105,7 @@ def test_ple_context_gate_matches_hand_formula_when_conv_is_zero() -> None:
     rows = torch.tensor([[[2.0, -1.0]]])
     identity = torch.eye(2)
     zeros = torch.zeros(4)
-    result = ple_inject(
+    result = ple_source_inject(
         residual,
         rows,
         key_weight=torch.cat((identity, identity)),
@@ -118,15 +151,15 @@ def test_ple_dilated_convolution_matches_lag_and_weight_order_fixture() -> None:
 def test_ple_one_shot_chunked_and_t1_continuation_are_identical() -> None:
     fixture = _ple_fixture()
     fixture["conv_state"] = fixture["conv_state"].to(torch.bfloat16)
-    one_shot = ple_inject(**fixture)
+    one_shot = ple_source_inject(**fixture)
     first_args = {key: value[:2] if key in {"residual_branches", "table_rows"} else value for key, value in fixture.items()}
-    first = ple_inject(**first_args)
+    first = ple_source_inject(**first_args)
     second_args = {
         key: (value[2:] if key in {"residual_branches", "table_rows"} else value)
         for key, value in fixture.items()
     }
     second_args["conv_state"] = first.next_conv_state
-    second = ple_inject(**second_args)
+    second = ple_source_inject(**second_args)
     torch.testing.assert_close(one_shot.output, torch.cat((first.output, second.output)), atol=1e-12, rtol=1e-12)
     torch.testing.assert_close(one_shot.next_conv_state, second.next_conv_state, atol=0.0, rtol=0.0)
 
@@ -138,18 +171,28 @@ def test_ple_one_shot_chunked_and_t1_continuation_are_identical() -> None:
             for key, value in fixture.items()
         }
         token_args["conv_state"] = state
-        token_result = ple_inject(**token_args)
+        token_result = ple_source_inject(**token_args)
         token_outputs.append(token_result.output)
         state = token_result.next_conv_state
     torch.testing.assert_close(one_shot.output, torch.cat(token_outputs), atol=1e-12, rtol=1e-12)
     torch.testing.assert_close(one_shot.next_conv_state, state, atol=0.0, rtol=0.0)
     assert one_shot.next_conv_state.dtype == torch.bfloat16
 
+    actual_args = dict(fixture)
+    actual_args["key_norm_gamma"] = 1.0 + actual_args.pop("key_norm_weight").double()
+    actual_args["query_norm_gamma"] = 1.0 + actual_args.pop("query_norm_weight").double()
+    actual_args["conv_norm_gamma"] = 1.0 + actual_args.pop("conv_norm_weight").double()
+    actual_gguf = ple_actual_gguf_inject(**actual_args)
+    torch.testing.assert_close(actual_gguf.output, one_shot.output, atol=1e-12, rtol=1e-12)
+    torch.testing.assert_close(
+        actual_gguf.next_conv_state, one_shot.next_conv_state, atol=0.0, rtol=0.0
+    )
+
 
 def test_ple_convolution_reads_current_rows_after_represented_state_rounding() -> None:
     residual = torch.tensor([[[0.0]]], dtype=torch.bfloat16)
     rows = torch.tensor([[[1.00390625]]], dtype=torch.float32)
-    result = ple_inject(
+    result = ple_source_inject(
         residual,
         rows,
         key_weight=torch.zeros(1, 1),
