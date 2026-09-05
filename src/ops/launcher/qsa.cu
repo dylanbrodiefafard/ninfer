@@ -386,29 +386,34 @@ __global__ void qsa_attention_short_kernel(const __nv_bfloat16* q,
                                            const std::uint8_t* k_scales,
                                            const std::uint8_t* v_scales,
                                            __nv_bfloat16* out, int selected_bound,
-                                           int capacity) {
+                                           int capacity, int width) {
     __shared__ float scores[kQsaSelectedCapacity];
     __shared__ float reduction[kQsaHeadDim];
     const int d     = threadIdx.x;
     const int lane  = d & 31;
     const int warp  = d >> 5;
     const int head  = blockIdx.x;
-    const int count = counts[0];
-    const std::int64_t output_index = d + static_cast<std::int64_t>(kQsaHeadDim) *
-                                             head;
+    const int token = blockIdx.y;
+    if (token >= width) { return; }
+    const int count = counts[token];
+    const auto* token_selected =
+        selected + static_cast<std::int64_t>(selected_bound) * token;
+    const std::int64_t output_index =
+        d + static_cast<std::int64_t>(kQsaHeadDim) *
+                (head + static_cast<std::int64_t>(kQsaQueryHeads) * token);
     if (count <= 0 || count > selected_bound) {
         out[output_index] = __float2bfloat16_rn(0.0F);
         return;
     }
     const int kv_head = head / 12;
     for (int j = warp; j < count; j += kQsaHeadDim / 32) {
-        const int id = selected[j];
+        const int id = token_selected[j];
         float dot = 0.0F;
         if (id >= 0 && id < capacity) {
             for (int feature = lane; feature < kQsaHeadDim; feature += 32) {
                 const std::int64_t query_index =
                     feature + static_cast<std::int64_t>(kQsaHeadDim) *
-                                  head;
+                                  (head + static_cast<std::int64_t>(kQsaQueryHeads) * token);
                 dot += __bfloat162float(q[query_index]) *
                        decode_value(k_codes, k_scales, feature, id, kv_head, capacity);
             }
@@ -445,7 +450,7 @@ __global__ void qsa_attention_short_kernel(const __nv_bfloat16* q,
     const float inv = 1.0F / reduction[0];
     float value = 0.0F;
     for (int j = 0; j < count; ++j) {
-        const int id = selected[j];
+        const int id = token_selected[j];
         if (id >= 0 && id < capacity) {
             value += scores[j] * inv * decode_value(v_codes, v_scales, d, id, kv_head, capacity);
         }
@@ -671,8 +676,9 @@ void qsa_selected_attention_launch(const Tensor& q, const Tensor& selected_ids,
                                    const Tensor& selected_count, const QsaStateView& state,
                                    Tensor& out, Tensor& workspace, cudaStream_t stream) {
     const int selected_bound = selected_ids.ne[0];
-    if (selected_bound <= kAttentionValueTile) {
-        qsa_attention_short_kernel<<<kQsaQueryHeads, kQsaHeadDim, 0, stream>>>(
+    const int width = q.ne[2];
+    if (width > 1 || selected_bound <= kAttentionValueTile) {
+        qsa_attention_short_kernel<<<dim3(kQsaQueryHeads, width), kQsaHeadDim, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data),
             static_cast<const std::int32_t*>(selected_ids.data),
             static_cast<const std::int32_t*>(selected_count.data),
@@ -681,7 +687,7 @@ void qsa_selected_attention_launch(const Tensor& q, const Tensor& selected_ids,
             static_cast<const std::uint8_t*>(state.k_scales.data),
             static_cast<const std::uint8_t*>(state.v_scales.data),
             static_cast<__nv_bfloat16*>(out.data), selected_bound,
-            state.raw_index_keys.ne[1]);
+            state.raw_index_keys.ne[1], width);
         CUDA_CHECK(cudaGetLastError());
         return;
     }

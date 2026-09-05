@@ -32,6 +32,7 @@ inline constexpr std::uint64_t kDevicePayloadBytes = 26'538'652'160ULL;
 inline constexpr std::size_t kPersistentStateBytes = 157'126'664ULL;
 inline constexpr std::size_t kExpertStageBytes = ops::kQwen4SparseMoePipelineStageBytes;
 inline constexpr std::int32_t kQsaCapacity = 4096;
+inline constexpr std::int32_t kMaximumPrefillChunk = 4096;
 inline constexpr std::int32_t kPleResetToken = 248044;
 
 struct GrHandles {
@@ -256,6 +257,23 @@ struct TokenResultView {
     std::span<const GrDiagnosticView> gr;
 };
 
+/**
+ * Views produced by one successful layer-major prompt chunk. Only the final column is projected
+ * through the vocabulary head: logits is BF16 [248320] and final_hidden is BF16 [2560].
+ * ple_row_ids is the exact I32 [16,T] address panel. qsa_selected_ids/count are the final QSA
+ * layer's exact I32 [2051,T]/[T] selector outputs. Storage is owned by Program and remains valid
+ * until the next execute_token, prefill_chunk, or reset call.
+ */
+struct PrefillResultView {
+    std::int32_t begin_index = -1;
+    std::int32_t end_index = -1;
+    Tensor logits;
+    Tensor final_hidden;
+    Tensor ple_row_ids;
+    Tensor qsa_selected_ids;
+    Tensor qsa_selected_count;
+};
+
 enum class DiagnosticSnapshots {
     Enabled,
     Disabled,
@@ -288,11 +306,13 @@ public:
     void reset();
     [[nodiscard]] TokenResultView execute_token(std::int32_t token_id,
                                                 std::int32_t target_id);
+    [[nodiscard]] PrefillResultView prefill_chunk(std::span<const std::int32_t> token_ids);
 
     [[nodiscard]] std::int32_t frontier() const noexcept { return frontier_; }
     [[nodiscard]] const State& state() const noexcept { return state_; }
 
 private:
+    class PrefillStorage;
     void destroy_pipeline_events() noexcept;
 
     const LoadedModel& model_;
@@ -319,9 +339,11 @@ private:
     std::array<GrDiagnosticView, kLayerCount> gr_diagnostics_;
     cudaEvent_t moe_route_ready_ = nullptr;
     cudaEvent_t moe_ids_ready_ = nullptr;
+    cudaEvent_t ple_transfer_ready_ = nullptr;
     std::array<cudaEvent_t, ops::kQwen4SparseMoePipelineSlots> moe_transfer_ready_{};
     std::array<cudaEvent_t, ops::kQwen4SparseMoePipelineSlots> moe_consumer_complete_{};
     DiagnosticSnapshots diagnostic_snapshots_ = DiagnosticSnapshots::Enabled;
+    std::unique_ptr<PrefillStorage> prefill_storage_;
     std::int32_t frontier_ = 0;
     bool reset_ = false;
 };

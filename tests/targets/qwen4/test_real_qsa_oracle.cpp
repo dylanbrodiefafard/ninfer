@@ -788,7 +788,7 @@ int run_accumulated_qsa_cell(const verifier::LoadedModel& model, DeviceContext& 
         static_cast<std::size_t>(ops::kQsaSelectedCapacity) * sizeof(std::int32_t));
     GuardedDeviceBuffer device_count(sizeof(std::int32_t));
     GuardedDeviceBuffer device_output(static_cast<std::size_t>(kHidden) * sizeof(std::uint16_t));
-    GuardedDeviceBuffer workspace(ops::qsa_verifier_workspace_bytes());
+    GuardedDeviceBuffer workspace(ops::qsa_verifier_workspace_bytes(1));
     device_selected.fill(0xcd);
     device_count.fill(0xcd);
     device_output.fill(0xcd);
@@ -804,7 +804,7 @@ int run_accumulated_qsa_cell(const verifier::LoadedModel& model, DeviceContext& 
     Tensor output_tensor(device_output.data(), DType::BF16, {kHidden});
     Tensor workspace_tensor(workspace.data(), DType::U8,
                             {static_cast<std::int32_t>(workspace.bytes())});
-    ops::qsa_verifier_token(x_tensor, token_id_tensor, position_tensor, visible_ids_tensor,
+    ops::qsa_verifier(x_tensor, token_id_tensor, position_tensor, visible_ids_tensor,
                             visible_offsets_tensor, weights, device_state.view, selected_tensor,
                             count_tensor, output_tensor, workspace_tensor, device.stream);
     device.synchronize();
@@ -1132,7 +1132,7 @@ int ninfer::test::qwen4::real_oracle::run_qsa_cell(const verifier::LoadedModel& 
         static_cast<std::size_t>(ops::kQsaSelectedCapacity) * sizeof(std::int32_t));
     GuardedDeviceBuffer device_count(sizeof(std::int32_t));
     GuardedDeviceBuffer device_output(static_cast<std::size_t>(kHidden) * sizeof(std::uint16_t));
-    GuardedDeviceBuffer workspace(ops::qsa_verifier_workspace_bytes());
+    GuardedDeviceBuffer workspace(ops::qsa_verifier_workspace_bytes(1));
     device_selected.fill(0xcd);
     device_count.fill(0xcd);
     device_output.fill(0xcd);
@@ -1149,7 +1149,7 @@ int ninfer::test::qwen4::real_oracle::run_qsa_cell(const verifier::LoadedModel& 
     Tensor output_tensor(device_output.data(), DType::BF16, {kHidden});
     Tensor workspace_tensor(workspace.data(), DType::U8,
                             {static_cast<std::int32_t>(workspace.bytes())});
-    ops::qsa_verifier_token(x_tensor, token_id_tensor, position_tensor, visible_ids_tensor,
+    ops::qsa_verifier(x_tensor, token_id_tensor, position_tensor, visible_ids_tensor,
                             visible_offsets_tensor, weights, state, selected_tensor,
                             count_tensor, output_tensor, workspace_tensor, device.stream);
     device.synchronize();

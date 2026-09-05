@@ -12,7 +12,8 @@ of them would occupy 64,383,447,992 bytes (59.96 GiB) before scales, state, KV, 
 Graphs, and the required 1 GiB headroom. The audited UD-IQ1_S profile still has 43,735,298,560
 non-PLE tensor bytes (40.73 GiB). No registered target, `.ninfer` product weights profile, or
 fallback product lane is defined by this document. The selected UD-IQ1_S artifact has one
-unregistered C=1 eager numeric-token Program solely for native architecture verification. A
+unregistered C=1 eager numeric-token Program with T=1 decode and T=1..4096 chunked prefill solely
+for native architecture verification. A
 complete custom profile converted from the
 pinned BF16 source is conditionally eligible only after it fits one 32 GB RTX 5090 and passes Phase
 0 of the implementation plan, or after a separately authorized change to the product contract.
@@ -484,6 +485,30 @@ state, positions, and MTP provisional state are persistent owners. A prefix snap
 it restores only core KV: it must restore every continuation owner at one matching committed
 frontier. Speculation must record QSA block/tail, GDN, PLE, and MTP effects provisionally and fold
 only the accepted prefix.
+
+### 12.1 Verification Program prefill transaction
+
+The unregistered verification Program accepts one dense C=1 token chunk of width 1..4096. It
+computes all n-gram rows sequentially from the existing two-token history, broadcasts the decoded
+embedding into four residual branches, and runs each of the 48 layers over the full token panel.
+QSA appends all current K/V/index rows first, but every query receives a distinct causal CSR slice
+ending at its own logical token, so later appended rows are never visible. GDN and PLE consume their
+panels in causal order and leave the same final represented state as any legal partition of the same
+token sequence under their declared Op/state criteria.
+
+PLE row gathering and sparse-expert grouping are CPU integer/raw-byte operations required by the
+host-resident artifact placement; all decode and floating-point model transformations execute on
+the GPU. The PLE panel transfer overlaps decoder layer 0. Each MoE layer receives all route ids once,
+stages each unique gate/up expert once in ascending expert groups, and preserves rank-order mixture
+accumulation per token. Persistent buffers and both streams are startup-owned; no Op allocates while
+executing a chunk.
+
+Ordinary prefill computes the vocabulary head only for the final column and returns that logits
+view plus the final hidden column and all PLE row ids. Teacher-forced scoring remains the T=1 path,
+where a target id is paired with every input. A call validates token/frontier capacity before
+enqueue. After enqueue, state is mutated in place; the Program publishes the new frontier and host
+PLE history only after both streams synchronize successfully. A failure after enqueue poisons the
+Program until `reset`, which drains both streams before restoring all state.
 
 ## 13. Oracle and quality requirements
 

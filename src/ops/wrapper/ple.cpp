@@ -7,13 +7,14 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 namespace ninfer::ops {
 namespace {
@@ -85,7 +86,7 @@ Range range(const void* pointer, std::size_t bytes, const char* op) {
 
 bool overlaps(Range a, Range b) { return a.begin < b.end && b.begin < a.end; }
 
-void require_disjoint(const std::vector<Range>& ranges, const char* op) {
+void require_disjoint(std::span<const Range> ranges, const char* op) {
     for (std::size_t i = 0; i < ranges.size(); ++i) {
         for (std::size_t j = i + 1; j < ranges.size(); ++j) {
             if (overlaps(ranges[i], ranges[j])) {
@@ -100,46 +101,66 @@ void require_disjoint(const std::vector<Range>& ranges, const char* op) {
 void ple_iq4_nl_stage_rows(const PleMappedIq4NlTable& table,
                            std::span<const std::int32_t, kPleHeads> row_ids, void* pinned_rows,
                            std::size_t pinned_bytes, Tensor& device_rows, cudaStream_t stream) {
-    constexpr const char* op = "ple_iq4_nl_stage_rows";
-    require_tensor(device_rows, DType::U8, kPleIq4NlRowBytes, kPleHeads, 1, op, "device_rows", 16);
+    ple_iq4_nl_stage_rows_batch(table, row_ids, 1, pinned_rows, pinned_bytes, device_rows, stream);
+}
+
+void ple_iq4_nl_stage_rows_batch(const PleMappedIq4NlTable& table,
+                                 std::span<const std::int32_t> row_ids, std::int32_t width,
+                                 void* pinned_rows, std::size_t pinned_bytes,
+                                 Tensor& device_rows, cudaStream_t stream) {
+    constexpr const char* op = "ple_iq4_nl_stage_rows_batch";
+    if (width <= 0 || width > kPleMaxWidth ||
+        row_ids.size() != static_cast<std::size_t>(kPleHeads) * width) {
+        throw std::invalid_argument("ple_iq4_nl_stage_rows_batch: invalid width or row-id extent");
+    }
+    require_tensor(device_rows, DType::U8, kPleIq4NlRowBytes, kPleHeads, width, op,
+                   "device_rows", 16);
     if (table.data == nullptr || table.rows == 0 || table.rows > UINT64_MAX / kPleIq4NlRowBytes ||
         table.bytes != table.rows * kPleIq4NlRowBytes) {
-        throw std::invalid_argument("ple_iq4_nl_stage_rows: invalid mapped table span");
+        throw std::invalid_argument("ple_iq4_nl_stage_rows_batch: invalid mapped table span");
     }
-    if (pinned_rows == nullptr || pinned_bytes < kPleStagedBytes) {
-        throw std::invalid_argument("ple_iq4_nl_stage_rows: pinned slot is too small");
+    const std::size_t staged_bytes = static_cast<std::size_t>(kPleStagedBytes) * width;
+    if (pinned_rows == nullptr || pinned_bytes < staged_bytes) {
+        throw std::invalid_argument("ple_iq4_nl_stage_rows_batch: pinned slot is too small");
     }
-    require_disjoint({range(table.data, static_cast<std::size_t>(table.bytes), op),
-                      range(pinned_rows, kPleStagedBytes, op),
-                      range(device_rows.data, device_rows.bytes(), op)},
-                     op);
+    const std::array<Range, 3> ranges{
+        range(table.data, static_cast<std::size_t>(table.bytes), op),
+        range(pinned_rows, staged_bytes, op),
+        range(device_rows.data, device_rows.bytes(), op)};
+    require_disjoint(ranges, op);
     cudaPointerAttributes attributes{};
     const cudaError_t attribute_status = cudaPointerGetAttributes(&attributes, pinned_rows);
     if (attribute_status != cudaSuccess || attributes.type != cudaMemoryTypeHost) {
         if (attribute_status != cudaSuccess) { (void)cudaGetLastError(); }
-        throw std::invalid_argument("ple_iq4_nl_stage_rows: staging source is not pinned host memory");
+        throw std::invalid_argument(
+            "ple_iq4_nl_stage_rows_batch: staging source is not pinned host memory");
     }
-    for (int head = 0; head < kPleHeads; ++head) {
-        const std::int32_t row = row_ids[head];
+    for (const std::int32_t row : row_ids) {
         if (row < 0 || static_cast<std::uint64_t>(row) >= table.rows) {
-            throw std::invalid_argument("ple_iq4_nl_stage_rows: row id is outside mapped table");
+            throw std::invalid_argument(
+                "ple_iq4_nl_stage_rows_batch: row id is outside mapped table");
         }
     }
     auto* destination = static_cast<std::uint8_t*>(pinned_rows);
-    for (int head = 0; head < kPleHeads; ++head) {
-        const std::int32_t row = row_ids[head];
-        std::memcpy(destination + static_cast<std::size_t>(head) * kPleIq4NlRowBytes,
+    for (std::size_t slot = 0; slot < row_ids.size(); ++slot) {
+        const std::int32_t row = row_ids[slot];
+        std::memcpy(destination + slot * kPleIq4NlRowBytes,
                     table.data + static_cast<std::uint64_t>(row) * kPleIq4NlRowBytes,
                     kPleIq4NlRowBytes);
     }
-    CUDA_CHECK(cudaMemcpyAsync(device_rows.data, pinned_rows, kPleStagedBytes,
+    CUDA_CHECK(cudaMemcpyAsync(device_rows.data, pinned_rows, staged_bytes,
                                cudaMemcpyHostToDevice, stream));
 }
 
 void ple_iq4_nl_decode_rows(const Tensor& device_rows, Tensor& embedding, cudaStream_t stream) {
     constexpr const char* op = "ple_iq4_nl_decode_rows";
-    require_tensor(device_rows, DType::U8, kPleIq4NlRowBytes, kPleHeads, 1, op, "device_rows", 16);
-    require_tensor(embedding, DType::BF16, kPleRowWidth, kPleHeads, 1, op, "embedding", 16);
+    const int width = device_rows.ne[2];
+    if (width <= 0 || width > kPleMaxWidth) {
+        throw std::invalid_argument("ple_iq4_nl_decode_rows: width must be in [1,4096]");
+    }
+    require_tensor(device_rows, DType::U8, kPleIq4NlRowBytes, kPleHeads, width, op,
+                   "device_rows", 16);
+    require_tensor(embedding, DType::BF16, kPleRowWidth, kPleHeads, width, op, "embedding", 16);
     if (overlaps(range(device_rows.data, device_rows.bytes(), op),
                  range(embedding.data, embedding.bytes(), op))) {
         throw std::invalid_argument("ple_iq4_nl_decode_rows: input and output overlap");
@@ -198,31 +219,28 @@ void ple_inject(const Tensor& residual, const Tensor& embedding, const Weight& k
           old_conv_state.bytes() == new_conv_state.bytes())) {
         throw std::invalid_argument("ple_inject: convolution states partially overlap");
     }
-    std::vector<Range> ranges{
-        residual_range,
-        range(embedding.data, embedding.bytes(), op),
-        range(key_weight.payload, static_cast<std::size_t>(key_weight.payload_bytes), op),
-        range(value_weight.payload, static_cast<std::size_t>(value_weight.payload_bytes), op),
-        range(key_norm_weight.data, key_norm_weight.bytes(), op),
-        range(query_norm_weight.data, query_norm_weight.bytes(), op),
-        range(conv_norm_weight.data, conv_norm_weight.bytes(), op),
-        range(conv_weight.data, conv_weight.bytes(), op),
-        old_range,
-        range(workspace.base(), workspace.capacity(), op),
-    };
-    if (residual_out.data != residual.data) { ranges.push_back(output_range); }
-    if (new_conv_state.data != old_conv_state.data) { ranges.push_back(new_range); }
-    require_disjoint(ranges, op);
+    std::array<Range, 12> ranges{};
+    std::size_t range_count = 0;
+    ranges[range_count++] = residual_range;
+    ranges[range_count++] = range(embedding.data, embedding.bytes(), op);
+    ranges[range_count++] =
+        range(key_weight.payload, static_cast<std::size_t>(key_weight.payload_bytes), op);
+    ranges[range_count++] =
+        range(value_weight.payload, static_cast<std::size_t>(value_weight.payload_bytes), op);
+    ranges[range_count++] = range(key_norm_weight.data, key_norm_weight.bytes(), op);
+    ranges[range_count++] = range(query_norm_weight.data, query_norm_weight.bytes(), op);
+    ranges[range_count++] = range(conv_norm_weight.data, conv_norm_weight.bytes(), op);
+    ranges[range_count++] = range(conv_weight.data, conv_weight.bytes(), op);
+    ranges[range_count++] = old_range;
+    ranges[range_count++] = range(workspace.base(), workspace.capacity(), op);
+    if (residual_out.data != residual.data) { ranges[range_count++] = output_range; }
+    if (new_conv_state.data != old_conv_state.data) { ranges[range_count++] = new_range; }
+    require_disjoint(std::span<const Range>(ranges.data(), range_count), op);
 
     auto scope     = workspace.scope();
     Scratch scratch = allocate_scratch(workspace, width);
-    for (int token = 0; token < width; ++token) {
-        Tensor input = embedding.slice(1, token, 1).reshape({kPleEmbeddingWidth});
-        Tensor key_output = scratch.key.slice(1, token, 1).reshape({kPleChannels});
-        Tensor value_output = scratch.value.slice(1, token, 1).reshape({kPleEmbeddingWidth});
-        ggml_block_linear(input, key_weight, key_output, stream);
-        ggml_block_linear(input, value_weight, value_output, stream);
-    }
+    ggml_block_linear(embedding, key_weight, scratch.key, stream);
+    ggml_block_linear(embedding, value_weight, scratch.value, stream);
     detail::ple_gate_launch(residual, scratch.key, scratch.value, key_norm_weight,
                             query_norm_weight, scratch.gated, stream);
     detail::ple_conv_input_launch(scratch.gated, conv_norm_weight, scratch.current_state, stream);
