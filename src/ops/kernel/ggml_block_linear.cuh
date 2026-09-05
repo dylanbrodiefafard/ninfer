@@ -268,27 +268,26 @@ __global__ void ggml_block_linear_aggregate_kernel(const __nv_bfloat16* x,
     }
 }
 
-// Qwen4's K=2560 Q5_K projections are cache/codec limited at prefill widths. One CTA retains the
+// Exact Qwen4 projection profiles are cache/codec limited at prefill widths. One CTA retains the
 // existing 16-token accumulator and reduction order, but decodes its row once into shared memory
-// and replays those exact FP32 values across sixteen token windows.
-template <int TileTokens>
-__launch_bounds__(256, 5) __global__ void ggml_q5_k_block_linear_replay_kernel(
+// and replays those exact FP32 values across a bounded number of token windows.
+template <QType Format, int Columns, int TileTokens, int MinimumBlocksPerSm>
+__launch_bounds__(256, MinimumBlocksPerSm) __global__ void ggml_block_linear_replay_kernel(
     const __nv_bfloat16* x, const std::uint8_t* weights, __nv_bfloat16* out, std::int32_t n,
     std::uint64_t row_bytes) {
     static_assert(TileTokens % kGgmlBlockLinearAggregateTokens == 0);
     constexpr int kWindows = TileTokens / kGgmlBlockLinearAggregateTokens;
     static_assert(kWindows <= 16);
-    using Decoder = GgmlDecoder<QType::GGML_Q5_K>;
+    using Decoder = GgmlDecoder<Format>;
 
-    constexpr int kColumns = 2560;
     constexpr int kWarps   = 8;
     constexpr unsigned kFullWarp = 0xffffffffU;
     extern __shared__ float shared[];
     float* const decoded = shared;
-    float* const warp_sums = decoded + kColumns;
+    float* const warp_sums = decoded + Columns;
     const auto* const row = weights + static_cast<std::uint64_t>(blockIdx.x) * row_bytes;
 
-    for (int column = static_cast<int>(threadIdx.x); column < kColumns; column += blockDim.x) {
+    for (int column = static_cast<int>(threadIdx.x); column < Columns; column += blockDim.x) {
         const int block_index = column / Decoder::block_values;
         const int block_item  = column % Decoder::block_values;
         decoded[column] =
@@ -304,14 +303,14 @@ __launch_bounds__(256, 5) __global__ void ggml_q5_k_block_linear_replay_kernel(
     for (int window = 0; window < kWindows; ++window) {
         const int token_base = tile_base + window * kGgmlBlockLinearAggregateTokens;
         float partial[kGgmlBlockLinearAggregateTokens]{};
-        for (int column = static_cast<int>(threadIdx.x); column < kColumns;
+        for (int column = static_cast<int>(threadIdx.x); column < Columns;
              column += blockDim.x) {
             const float weight = decoded[column];
 #pragma unroll
             for (int token = 0; token < kGgmlBlockLinearAggregateTokens; ++token) {
                 partial[token] =
                     fmaf(weight,
-                         __bfloat162float(x[column + static_cast<std::int64_t>(kColumns) *
+                         __bfloat162float(x[column + static_cast<std::int64_t>(Columns) *
                                                       (token_base + token)]),
                          partial[token]);
             }
