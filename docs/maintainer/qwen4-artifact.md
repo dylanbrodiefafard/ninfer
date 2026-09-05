@@ -542,6 +542,22 @@ matched pre/post throughput A/B, so the absolute Program baselines above are not
 The scheduling opportunity remains applicable to a future all-GPU-fit core checkpoint only when
 it retains this same RAM-resident PLE profile.
 
+A subsequent process-warm width-512 profile attributed 1.425 s of 1.711 s GPU-kernel time to GGML
+block projections. The Q6_K GDN output shape `[2560,6144,512]` was the strongest remaining bounded
+candidate: its final 101-sample cold-L2 public-Op median fell from 3.229 to 2.403 ms (p95 3.250 to
+2.417 ms) when one CTA decoded a 6144-value row once and replayed it across four sequential
+16-token windows. Tiles of 128 and 256 measured
+4.794 and 2.410 ms and were rejected. Eight clean process-warm Program samples changed from a
+1.854 s median (276.23 input token/s) to 1.819 s (281.41 input token/s), a 1.87% throughput gain
+with the final head included. The T=1 decode route is unchanged. The retained specialization uses
+47 registers, 26,624 bytes of dynamic shared storage, three-CTA launch residency, and no stack or
+local-memory spill. Exact Q6_K `[2560,6144]` T=511/512/513 tests compare every output directly with
+the independent packed-code FP64 oracle. In the same tranche, the mapped-host sparse-MoE
+32/32/6-stage witness was strengthened from zero-scaled weights to a T=28 nonzero, per-token
+complete FP64 formula over all 70 selected experts. Four distinct represented amplitudes and a
+rank permutation put high-weight experts in every group, so occurrence order, group-to-slot
+association, and material contribution are independently observable.
+
 The maximum-width numerical gate uses the exact post-expansion Qwen4 recurrence geometry
 `Hq=Hv=48,D=128,T=4096` and one represented-input FP64 oracle. It independently qualifies 4096
 scalar T=1 calls, one-shot T=4096, aligned 64x64 chunks, and the Program partition
