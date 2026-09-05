@@ -7,9 +7,12 @@
 #include "ops/linear_attention/gated_delta_net/launch.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
 
@@ -42,6 +45,82 @@ void require_contiguous_nonnull(const Tensor& t, const char* name) {
         throw std::invalid_argument(std::string("gated_delta_net: ") + name +
                                     " data must be non-null");
     }
+}
+
+void require_alignment(const Tensor& tensor, std::uintptr_t alignment, const char* name) {
+    if ((reinterpret_cast<std::uintptr_t>(tensor.data) & (alignment - 1)) != 0) {
+        throw std::invalid_argument(std::string("gated_delta_net: ") + name +
+                                    " has insufficient alignment");
+    }
+}
+
+struct AddressRange {
+    std::uintptr_t begin;
+    std::uintptr_t end;
+    const char* name;
+};
+
+AddressRange address_range(const void* pointer, std::size_t bytes, const char* name) {
+    const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(pointer);
+    if (pointer == nullptr || bytes == 0 ||
+        bytes > std::numeric_limits<std::uintptr_t>::max() - begin) {
+        throw std::invalid_argument(std::string("gated_delta_net: invalid address range for ") +
+                                    name);
+    }
+    return {begin, begin + bytes, name};
+}
+
+AddressRange address_range(const Tensor& tensor, const char* name) {
+    return address_range(tensor.data, tensor.bytes(), name);
+}
+
+bool overlaps(const AddressRange& left, const AddressRange& right) {
+    return left.begin < right.end && right.begin < left.end;
+}
+
+void require_disjoint(std::span<const AddressRange> ranges) {
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        for (std::size_t j = i + 1; j < ranges.size(); ++j) {
+            if (overlaps(ranges[i], ranges[j])) {
+                throw std::invalid_argument(std::string("gated_delta_net: ") + ranges[i].name +
+                                            " overlaps " + ranges[j].name);
+            }
+        }
+    }
+}
+
+bool exact_alias(const Tensor& left, const Tensor& right) {
+    return left.data == right.data && left.bytes() == right.bytes();
+}
+
+void validate_recurrent_storage(const Tensor& q, const Tensor& k, const Tensor& v,
+                                const Tensor& g, const Tensor& beta,
+                                const Tensor& ssm_state_in, const Tensor& ssm_state_out,
+                                const Tensor& out,
+                                std::span<const AddressRange> scratch_ranges = {}) {
+    require_alignment(q, 16, "q");
+    require_alignment(k, 16, "k");
+    require_alignment(v, 16, "v");
+    require_alignment(g, alignof(float), "g");
+    require_alignment(beta, alignof(float), "beta");
+    require_alignment(ssm_state_in, 16, "ssm_state_in");
+    require_alignment(ssm_state_out, 16, "ssm_state_out");
+    require_alignment(out, alignof(std::uint32_t), "out");
+
+    std::array<AddressRange, 11> ranges{};
+    std::size_t count = 0;
+    ranges[count++]   = address_range(q, "q");
+    ranges[count++]   = address_range(k, "k");
+    ranges[count++]   = address_range(v, "v");
+    ranges[count++]   = address_range(g, "g");
+    ranges[count++]   = address_range(beta, "beta");
+    ranges[count++]   = address_range(ssm_state_in, "ssm_state_in");
+    ranges[count++]   = address_range(out, "out");
+    if (!exact_alias(ssm_state_in, ssm_state_out)) {
+        ranges[count++] = address_range(ssm_state_out, "ssm_state_out");
+    }
+    for (const AddressRange& range : scratch_ranges) { ranges[count++] = range; }
+    require_disjoint(std::span<const AddressRange>(ranges.data(), count));
 }
 
 Geometry require_geometry(const Tensor& q, const Tensor& v) {
@@ -242,6 +321,7 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
         return;
     }
     validate_recurrent(q, k, v, g, beta, scale, ssm_state, out);
+    validate_recurrent_storage(q, k, v, g, beta, ssm_state, ssm_state, out);
 
     (void)ws;
     detail::gated_delta_net::launch_recurrent(q, k, v, g, beta, scale, normalize_qk, ssm_state, out,
@@ -266,6 +346,7 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                      const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
                      cudaStream_t stream) {
     validate_chunked(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out, out);
+    validate_recurrent_storage(q, k, v, g, beta, ssm_state_in, ssm_state_out, out);
 
     auto scratch_scope   = ws.scope();
     const std::int32_t T = q.ne[2];
@@ -276,6 +357,21 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
     const bool fuse_k_normalization =
         detail::gated_delta_net::uses_fused_k_normalization(q.ne[1], v.ne[1], T, normalize_qk);
     ChunkedWorkspace scratch = allocate_chunked_workspace(ws, q.ne[1], v.ne[1], T, normalize_qk);
+    std::array<AddressRange, 3> scratch_ranges{};
+    std::size_t scratch_count = 0;
+    if (scratch.normalized_q.data != nullptr) {
+        scratch_ranges[scratch_count++] = address_range(scratch.normalized_q, "normalized_q");
+    }
+    if (scratch.normalized_k.data != nullptr) {
+        scratch_ranges[scratch_count++] = address_range(scratch.normalized_k, "normalized_k");
+    }
+    if (scratch.stage.data != nullptr) {
+        scratch_ranges[scratch_count++] =
+            address_range(scratch.stage.data, scratch.stage.bytes, "chunked_workspace");
+    }
+    validate_recurrent_storage(
+        q, k, v, g, beta, ssm_state_in, ssm_state_out, out,
+        std::span<const AddressRange>(scratch_ranges.data(), scratch_count));
     if (normalize_qk && T_full > 0) {
         Tensor k_source     = k.slice(2, 0, T_full);
         Tensor k_normalized = scratch.normalized_k.slice(2, 0, T_full);
