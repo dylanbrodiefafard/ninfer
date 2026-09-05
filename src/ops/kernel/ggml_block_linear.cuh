@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/ggml_block_linear/ggml_block_linear_schedule.h"
 #include "ops/ggml_block_linear/ggml_codebook_data.h"
 
 #include <cuda_bf16.h>
@@ -203,8 +204,6 @@ __global__ void ggml_block_linear_kernel(const __nv_bfloat16* x, const std::uint
     }
 }
 
-inline constexpr int kGgmlBlockLinearAggregateTokens = 16;
-
 template <QType Format>
 __global__ void ggml_block_linear_aggregate_kernel(const __nv_bfloat16* x,
                                                    const std::uint8_t* weights,
@@ -262,6 +261,91 @@ __global__ void ggml_block_linear_aggregate_kernel(const __nv_bfloat16* x,
                 total += __shfl_down_sync(full_warp, total, offset);
             }
             if (lane == 0 && token < tile_tokens) {
+                out[blockIdx.x + static_cast<std::int64_t>(n) * (token_base + token)] =
+                    __float2bfloat16_rn(total);
+            }
+        }
+    }
+}
+
+// Qwen4's K=2560 Q5_K projections are cache/codec limited at prefill widths. One CTA retains the
+// existing 16-token accumulator and reduction order, but decodes its row once into shared memory
+// and replays those exact FP32 values across sixteen token windows.
+template <int TileTokens>
+__launch_bounds__(256, 5) __global__ void ggml_q5_k_block_linear_replay_kernel(
+    const __nv_bfloat16* x, const std::uint8_t* weights, __nv_bfloat16* out, std::int32_t n,
+    std::uint64_t row_bytes) {
+    static_assert(TileTokens % kGgmlBlockLinearAggregateTokens == 0);
+    constexpr int kWindows = TileTokens / kGgmlBlockLinearAggregateTokens;
+    static_assert(kWindows <= 16);
+    using Decoder = GgmlDecoder<QType::GGML_Q5_K>;
+
+    constexpr int kColumns = 2560;
+    constexpr int kWarps   = 8;
+    constexpr unsigned kFullWarp = 0xffffffffU;
+    extern __shared__ float shared[];
+    float* const decoded = shared;
+    float* const warp_sums = decoded + kColumns;
+    const auto* const row = weights + static_cast<std::uint64_t>(blockIdx.x) * row_bytes;
+
+    for (int column = static_cast<int>(threadIdx.x); column < kColumns; column += blockDim.x) {
+        const int block_index = column / Decoder::block_values;
+        const int block_item  = column % Decoder::block_values;
+        decoded[column] =
+            Decoder::value(row + static_cast<std::uint64_t>(block_index) * Decoder::block_bytes,
+                           block_item);
+    }
+    __syncthreads();
+
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int tile_base = static_cast<int>(blockIdx.y) * TileTokens;
+#pragma unroll 1
+    for (int window = 0; window < kWindows; ++window) {
+        const int token_base = tile_base + window * kGgmlBlockLinearAggregateTokens;
+        float partial[kGgmlBlockLinearAggregateTokens]{};
+        for (int column = static_cast<int>(threadIdx.x); column < kColumns;
+             column += blockDim.x) {
+            const float weight = decoded[column];
+#pragma unroll
+            for (int token = 0; token < kGgmlBlockLinearAggregateTokens; ++token) {
+                partial[token] =
+                    fmaf(weight,
+                         __bfloat162float(x[column + static_cast<std::int64_t>(kColumns) *
+                                                      (token_base + token)]),
+                         partial[token]);
+            }
+        }
+
+#pragma unroll
+        for (int token = 0; token < kGgmlBlockLinearAggregateTokens; ++token) {
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                partial[token] += __shfl_down_sync(kFullWarp, partial[token], offset);
+            }
+        }
+        if (lane == 0) {
+#pragma unroll
+            for (int token = 0; token < kGgmlBlockLinearAggregateTokens; ++token) {
+                warp_sums[(window * kGgmlBlockLinearAggregateTokens + token) * kWarps + warp] =
+                    partial[token];
+            }
+        }
+    }
+    __syncthreads();
+
+    for (int window = warp; window < kWindows; window += kWarps) {
+        const int token_base = tile_base + window * kGgmlBlockLinearAggregateTokens;
+#pragma unroll
+        for (int token = 0; token < kGgmlBlockLinearAggregateTokens; ++token) {
+            float total = lane < kWarps
+                              ? warp_sums[(window * kGgmlBlockLinearAggregateTokens + token) *
+                                              kWarps +
+                                          lane]
+                              : 0.0F;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                total += __shfl_down_sync(kFullWarp, total, offset);
+            }
+            if (lane == 0) {
                 out[blockIdx.x + static_cast<std::int64_t>(n) * (token_base + token)] =
                     __float2bfloat16_rn(total);
             }

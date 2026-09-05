@@ -218,6 +218,7 @@ struct Stream {
 struct Timing {
     double median_us;
     double min_us;
+    double p95_us;
     double max_us;
 };
 
@@ -250,7 +251,8 @@ Timing measure(const Options& options, const Tensor& x, const Weight& weight, Te
         samples.push_back(static_cast<double>(milliseconds) * 1000.0);
     }
     std::sort(samples.begin(), samples.end());
-    return {samples[samples.size() / 2], samples.front(), samples.back()};
+    const std::size_t p95_index = (95 * samples.size() + 99) / 100 - 1;
+    return {samples[samples.size() / 2], samples.front(), samples[p95_index], samples.back()};
 }
 
 int run(const Options& options) {
@@ -290,15 +292,6 @@ int run(const Options& options) {
     Stream stream;
     const Timing timing =
         measure(options, input_tensor, weight, output_tensor, l2_flush, stream.value);
-    const std::uint64_t aggregate_tokens = options.t == 1 ? 1 : 16;
-    const std::uint64_t weight_passes =
-        (static_cast<std::uint64_t>(options.t) + aggregate_tokens - 1) / aggregate_tokens;
-    const std::uint64_t full_weight_passes =
-        static_cast<std::uint64_t>(options.t) / aggregate_tokens;
-    const std::uint64_t tail_tokens =
-        static_cast<std::uint64_t>(options.t) % aggregate_tokens;
-    const double average_tokens_per_weight_pass =
-        static_cast<double>(options.t) / static_cast<double>(weight_passes);
     const double effective_gbs =
         static_cast<double>(model_bytes) / (timing.median_us * 1.0e3);
 
@@ -306,21 +299,14 @@ int run(const Options& options) {
     std::printf("qtype=%s N=%d K=%d T=%d warmup=%d repetitions=%d cache=cold profile=%s\n",
                 format.name, options.n, options.k, options.t, options.warmup,
                 options.repetitions, options.profile ? "true" : "false");
-    std::printf("median_us=%.3f min_us=%.3f max_us=%.3f\n", timing.median_us,
-                timing.min_us, timing.max_us);
+    std::printf("median_us=%.3f min_us=%.3f p95_us=%.3f max_us=%.3f\n", timing.median_us,
+                timing.min_us, timing.p95_us, timing.max_us);
     std::printf("weight_bytes=%llu input_bytes=%llu output_bytes=%llu model_bytes=%llu\n",
                 static_cast<unsigned long long>(weight_bytes),
                 static_cast<unsigned long long>(input_bytes),
                 static_cast<unsigned long long>(output_bytes),
                 static_cast<unsigned long long>(model_bytes));
-    std::printf("aggregate_tile_tokens=%llu weight_passes=%llu full_weight_passes=%llu "
-                "tail_tokens=%llu average_tokens_per_weight_pass=%.3f "
-                "effective_model_GB_s=%.3f\n",
-                static_cast<unsigned long long>(aggregate_tokens),
-                static_cast<unsigned long long>(weight_passes),
-                static_cast<unsigned long long>(full_weight_passes),
-                static_cast<unsigned long long>(tail_tokens), average_tokens_per_weight_pass,
-                effective_gbs);
+    std::printf("effective_model_GB_s=%.3f\n", effective_gbs);
     return 0;
 }
 

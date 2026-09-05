@@ -375,6 +375,83 @@ int run_case(const FormatSpec& format, std::int32_t n, std::int32_t k,
     return device_out.verify_guards(std::string(format.name) + " " + profile);
 }
 
+int run_qwen4_q5_replay_shape_case(std::int32_t tokens, cudaStream_t stream) {
+    const FormatSpec& format = kFormats[2];
+    constexpr std::int32_t n = 10240;
+    constexpr std::int32_t k = 2560;
+    constexpr std::size_t pattern_count = 4;
+    std::array<std::vector<std::uint8_t>, pattern_count> rows;
+    for (std::size_t pattern = 0; pattern < pattern_count; ++pattern) {
+        rows[pattern] = make_row(format, k, 0x45a7U + static_cast<std::uint32_t>(pattern) * 131U);
+    }
+    const std::size_t row_bytes = rows[0].size();
+    std::vector<std::uint8_t> payload(row_bytes * static_cast<std::size_t>(n));
+    for (std::int32_t row = 0; row < n; ++row) {
+        const auto& source = rows[static_cast<std::size_t>(row) % pattern_count];
+        std::copy(source.begin(), source.end(),
+                  payload.begin() + static_cast<std::size_t>(row) * row_bytes);
+    }
+    const auto x = make_input(k, tokens);
+    std::vector<OracleDot> oracle(pattern_count * static_cast<std::size_t>(tokens));
+    for (std::size_t pattern = 0; pattern < pattern_count; ++pattern) {
+        for (std::int32_t token = 0; token < tokens; ++token) {
+            oracle[pattern * static_cast<std::size_t>(tokens) + token] =
+                oracle_dot(format, rows[pattern], x, token, k);
+        }
+    }
+
+    DeviceBuffer device_payload = to_device(payload);
+    DeviceBuffer device_x       = to_device_bf16(x);
+    const std::size_t output_count =
+        static_cast<std::size_t>(n) * static_cast<std::size_t>(tokens);
+    GuardedDeviceBuffer device_out(output_count * sizeof(std::uint16_t));
+    device_out.fill(0xcd);
+    cuda_synchronize();
+    Tensor x_tensor(device_x.p, DType::BF16, {k, tokens});
+    Tensor out_tensor(device_out.data(), DType::BF16, {n, tokens});
+    Weight weight = make_weight(device_payload.p, payload.size(), format, n, k);
+    ops::ggml_block_linear(x_tensor, weight, out_tensor, stream);
+    cuda_synchronize(stream);
+
+    const auto actual = from_device_bf16(device_out.data(), output_count);
+    double maximum_ratio = 0.0;
+    int failures          = 0;
+    for (std::int32_t token = 0; token < tokens && failures == 0; ++token) {
+        for (std::int32_t row = 0; row < n; ++row) {
+            const OracleDot& expected =
+                oracle[(static_cast<std::size_t>(row) % pattern_count) *
+                           static_cast<std::size_t>(tokens) +
+                       static_cast<std::size_t>(token)];
+            const std::size_t index =
+                static_cast<std::size_t>(token) * static_cast<std::size_t>(n) + row;
+            const double limit = error_bound(format, k, expected);
+            const double error = std::abs(actual[index] - expected.value);
+            maximum_ratio      = std::max(maximum_ratio, error / limit);
+            if (!std::isfinite(actual[index]) || error > limit) {
+                std::cerr << "Q5_K qwen4-replay-boundary-t" << tokens << " row " << row
+                          << " token " << token << " error=" << error << " bound=" << limit
+                          << " reference=" << expected.value << '\n';
+                failures = 1;
+                break;
+            }
+        }
+    }
+    if (error_stats_enabled()) {
+        std::cout << "OP_ERROR_STATS kind=derived_bound format=Q5_K profile=qwen4-replay-"
+                     "boundary-t"
+                  << tokens << " max_bound_ratio=" << maximum_ratio << '\n';
+    }
+    failures += device_out.verify_guards("Q5_K qwen4 replay boundary");
+    failures += verify_exact("Q5_K qwen4 replay weights unchanged",
+                             from_device<std::uint8_t>(device_payload, payload.size()), payload);
+    std::vector<std::uint16_t> represented_x(x.size());
+    std::transform(x.begin(), x.end(), represented_x.begin(), f32_to_bf16);
+    failures += verify_exact("Q5_K qwen4 replay input unchanged",
+                             from_device<std::uint16_t>(device_x, represented_x.size()),
+                             represented_x);
+    return failures;
+}
+
 template <class Function>
 int expect_invalid(Function&& function, const char* label) {
     try {
@@ -460,8 +537,13 @@ int main() {
         }
         failures += run_case(kFormats[2], 3, 6144, 1, false, stream,
                              "q5-output-projection-k");
+        failures += run_case(kFormats[2], 3, 512, 2, false, stream, "q5-aggregate-t2");
+        failures += run_case(kFormats[2], 3, 512, 15, false, stream, "q5-aggregate-t15");
         failures += run_case(kFormats[2], 3, 512, 128, false, stream,
                              "aggregate-t128");
+        failures += run_qwen4_q5_replay_shape_case(511, stream);
+        failures += run_qwen4_q5_replay_shape_case(512, stream);
+        failures += run_qwen4_q5_replay_shape_case(513, stream);
         failures += run_case(kFormats[0], 1, 32, 4096, true, stream,
                              "aggregate-t4096");
         cuda_check(cudaStreamDestroy(stream), "cudaStreamDestroy");
