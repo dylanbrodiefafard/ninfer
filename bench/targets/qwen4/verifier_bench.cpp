@@ -6,16 +6,20 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory>
 #include <numeric>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -40,6 +44,7 @@ struct Options {
     int warmup      = 1;
     int repetitions = 3;
     bool profile    = false;
+    std::filesystem::path nll_output;
 };
 
 void print_usage(const char* executable) {
@@ -47,10 +52,12 @@ void print_usage(const char* executable) {
         << "usage: " << executable
         << " --weights <qwen4-verifier.ninfer> [--device <id>] [--warmup <sequences>]"
            " [--repetitions <sequences>] [--inputs <id,id,...>]"
-           " [--targets <id,id,...>] [--profile]\n\n"
+           " [--targets <id,id,...>] [--nll-output <path>] [--profile]\n\n"
            "The artifact path is mandatory. QSA KV is always the verifier's intrinsic"
            " NVFP4-G16 layout. --profile requires --repetitions 1 and brackets only the"
-           " measured sequence with the CUDA profiler API.\n";
+           " measured sequence with the CUDA profiler API. --nll-output writes one little-endian"
+           " float32 NLL per input/target pair after exact NLL and continuation-state replay"
+           " agreement and requires at least two measured repetitions.\n";
 }
 
 std::vector<std::int32_t> parse_ids(std::string_view text, std::string_view option) {
@@ -110,6 +117,8 @@ Options parse_options(int argc, char** argv) {
             options.inputs = parse_ids(value(argument), argument);
         } else if (argument == "--targets") {
             options.targets = parse_ids(value(argument), argument);
+        } else if (argument == "--nll-output") {
+            options.nll_output = std::string(value(argument));
         } else if (argument == "--profile") {
             options.profile = true;
         } else if (argument == "-h" || argument == "--help") {
@@ -133,6 +142,9 @@ Options parse_options(int argc, char** argv) {
     if (options.profile && options.repetitions != 1) {
         throw std::invalid_argument("--profile requires --repetitions 1");
     }
+    if (!options.nll_output.empty() && options.repetitions < 2) {
+        throw std::invalid_argument("--nll-output requires --repetitions at least 2");
+    }
     if (options.inputs.size() != options.targets.size()) {
         throw std::invalid_argument("--inputs and --targets must have equal lengths");
     }
@@ -152,8 +164,10 @@ double elapsed_ms(Clock::time_point begin, Clock::time_point end) {
 }
 
 double run_sequence(verifier::Program& program, const Options& options,
-                    std::vector<std::vector<double>>* token_samples) {
+                    std::vector<std::vector<double>>* token_samples,
+                    std::vector<float>* nlls) {
     const Clock::time_point sequence_begin = Clock::now();
+    double excluded_diagnostic_ms = 0.0;
     for (std::size_t token = 0; token < options.inputs.size(); ++token) {
         const Clock::time_point token_begin = Clock::now();
         const verifier::TokenResultView result =
@@ -169,8 +183,64 @@ double run_sequence(verifier::Program& program, const Options& options,
         if (token_samples != nullptr) {
             (*token_samples)[token].push_back(elapsed_ms(token_begin, token_end));
         }
+        if (nlls != nullptr) {
+            const Clock::time_point copy_begin = Clock::now();
+            float nll = 0.0F;
+            CUDA_CHECK(cudaMemcpy(&nll, result.nll.data, sizeof(nll), cudaMemcpyDeviceToHost));
+            nlls->push_back(nll);
+            excluded_diagnostic_ms += elapsed_ms(copy_begin, Clock::now());
+        }
     }
-    return elapsed_ms(sequence_begin, Clock::now());
+    return elapsed_ms(sequence_begin, Clock::now()) - excluded_diagnostic_ms;
+}
+
+void write_nll_sidecar(const std::filesystem::path& path, std::span<const float> nlls) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) {
+        throw std::runtime_error("cannot open --nll-output path: " + path.string());
+    }
+    for (float value : nlls) {
+        const std::uint32_t bits = std::bit_cast<std::uint32_t>(value);
+        const std::array<char, 4> encoded = {
+            static_cast<char>(bits & 0xffU),
+            static_cast<char>((bits >> 8U) & 0xffU),
+            static_cast<char>((bits >> 16U) & 0xffU),
+            static_cast<char>((bits >> 24U) & 0xffU),
+        };
+        output.write(encoded.data(), static_cast<std::streamsize>(encoded.size()));
+    }
+    if (!output) { throw std::runtime_error("failed writing --nll-output: " + path.string()); }
+}
+
+void append_tensor_bytes(std::vector<std::uint8_t>& destination, const ninfer::Tensor& tensor) {
+    const std::size_t offset = destination.size();
+    destination.resize(offset + tensor.bytes());
+    CUDA_CHECK(cudaMemcpy(destination.data() + offset, tensor.data, tensor.bytes(),
+                          cudaMemcpyDeviceToHost));
+}
+
+std::vector<std::uint8_t> snapshot_continuation(const verifier::State& state) {
+    std::vector<std::uint8_t> snapshot;
+    snapshot.reserve(verifier::kPersistentStateBytes + state.residual().bytes());
+    for (std::size_t layer = 0; layer < verifier::kLayerCount; ++layer) {
+        if (state.gdn()[layer]) {
+            append_tensor_bytes(snapshot, state.gdn()[layer]->conv);
+            append_tensor_bytes(snapshot, state.gdn()[layer]->recurrence);
+        }
+        if (state.qsa()[layer]) {
+            const auto& qsa = *state.qsa()[layer];
+            append_tensor_bytes(snapshot, qsa.k_codes);
+            append_tensor_bytes(snapshot, qsa.v_codes);
+            append_tensor_bytes(snapshot, qsa.k_scales);
+            append_tensor_bytes(snapshot, qsa.v_scales);
+            append_tensor_bytes(snapshot, qsa.raw_index_keys);
+            append_tensor_bytes(snapshot, qsa.positions);
+        }
+    }
+    append_tensor_bytes(snapshot, state.ple_conv_state());
+    append_tensor_bytes(snapshot, state.ple_token_history());
+    append_tensor_bytes(snapshot, state.residual());
+    return snapshot;
 }
 
 struct Distribution {
@@ -226,7 +296,7 @@ int run(const Options& options) {
             const Clock::time_point reset_begin = Clock::now();
             program.reset();
             warmup_reset_ms += elapsed_ms(reset_begin, Clock::now());
-            warmup_token_ms += run_sequence(program, options, nullptr);
+            warmup_token_ms += run_sequence(program, options, nullptr, nullptr);
         }
     }
 
@@ -234,6 +304,9 @@ int run(const Options& options) {
     std::vector<double> sequence_samples;
     std::vector<double> all_token_samples;
     std::vector<std::vector<double>> token_samples(options.inputs.size());
+    std::vector<float> reference_nlls;
+    std::vector<std::uint8_t> reference_continuation;
+    const bool capture_nlls = !options.nll_output.empty();
     reset_samples.reserve(static_cast<std::size_t>(options.repetitions));
     sequence_samples.reserve(static_cast<std::size_t>(options.repetitions));
     all_token_samples.reserve(static_cast<std::size_t>(options.repetitions) * options.inputs.size());
@@ -244,11 +317,32 @@ int run(const Options& options) {
         reset_samples.push_back(elapsed_ms(reset_begin, Clock::now()));
 
         if (options.profile) { CUDA_CHECK(cudaProfilerStart()); }
+        std::vector<float> repetition_nlls;
+        repetition_nlls.reserve(options.inputs.size());
         {
             ninfer::NvtxRange range("qwen4.verifier.measured_sequence");
-            sequence_samples.push_back(run_sequence(program, options, &token_samples));
+            sequence_samples.push_back(run_sequence(
+                program, options, &token_samples, capture_nlls ? &repetition_nlls : nullptr));
         }
         if (options.profile) { CUDA_CHECK(cudaProfilerStop()); }
+        if (!capture_nlls) {
+            continue;
+        }
+        std::vector<std::uint8_t> repetition_continuation =
+            snapshot_continuation(program.state());
+        if (reference_nlls.empty()) {
+            reference_nlls = std::move(repetition_nlls);
+            reference_continuation = std::move(repetition_continuation);
+        } else if (reference_nlls.size() != repetition_nlls.size() ||
+                   !std::equal(reference_nlls.begin(), reference_nlls.end(),
+                               repetition_nlls.begin(), [](float lhs, float rhs) {
+                                   return std::bit_cast<std::uint32_t>(lhs) ==
+                                          std::bit_cast<std::uint32_t>(rhs);
+                               }) ||
+                   reference_continuation != repetition_continuation) {
+            throw std::runtime_error(
+                "measured NLL or continuation state changed after deterministic reset/replay");
+        }
     }
     for (const auto& position : token_samples) {
         all_token_samples.insert(all_token_samples.end(), position.begin(), position.end());
@@ -260,6 +354,29 @@ int run(const Options& options) {
     const auto& stats = model->backing().stats();
     const double tokens_per_second = 1000.0 * static_cast<double>(options.inputs.size()) /
                                      sequence.mean;
+    double mean_nll = 0.0;
+    double perplexity = 0.0;
+    double max_nll = 0.0;
+    std::size_t non_finite_nlls = 0;
+    std::size_t terrible_nlls = 0;
+    if (capture_nlls) {
+        double total_nll = 0.0;
+        for (float nll : reference_nlls) {
+            if (!std::isfinite(nll)) {
+                ++non_finite_nlls;
+                continue;
+            }
+            total_nll += static_cast<double>(nll);
+            max_nll = std::max(max_nll, static_cast<double>(nll));
+            terrible_nlls += nll >= 10.0F ? 1U : 0U;
+        }
+        if (non_finite_nlls != 0) {
+            throw std::runtime_error("measured sequence produced a non-finite NLL");
+        }
+        mean_nll = total_nll / static_cast<double>(reference_nlls.size());
+        perplexity = std::exp(mean_nll);
+        write_nll_sidecar(options.nll_output, reference_nlls);
+    }
 
     std::cout << std::fixed << std::setprecision(6);
     std::cout << "format,qwen4_verifier_profile_v1\n";
@@ -290,6 +407,15 @@ int run(const Options& options) {
     std::cout << "token_p95_ms," << token.p95 << '\n';
     std::cout << "token_max_ms," << token.maximum << '\n';
     std::cout << "tokens_per_second," << tokens_per_second << '\n';
+    if (capture_nlls) {
+        std::cout << "mean_nll," << mean_nll << '\n';
+        std::cout << "perplexity," << perplexity << '\n';
+        std::cout << "max_nll," << max_nll << '\n';
+        std::cout << "terrible_nll_count," << terrible_nlls << '\n';
+        std::cout << "non_finite_nll_count," << non_finite_nlls << '\n';
+        std::cout << "exact_replay_state_bytes," << reference_continuation.size() << '\n';
+        std::cout << "nll_output," << options.nll_output.string() << '\n';
+    }
     for (std::size_t position = 0; position < token_samples.size(); ++position) {
         const Distribution sample = summarize(token_samples[position]);
         std::cout << "position," << position << ",input," << options.inputs[position]

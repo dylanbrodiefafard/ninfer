@@ -1,0 +1,63 @@
+diff --git a/tools/perplexity/perplexity.cpp b/tools/perplexity/perplexity.cpp
+--- a/tools/perplexity/perplexity.cpp
++++ b/tools/perplexity/perplexity.cpp
+@@ -10,5 +10,6 @@
+ #include <chrono>
+ #include <clocale>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstdio>
+ #include <cstring>
+@@ -472,13 +473,20 @@ static results_perplexity perplexity_v2(llama_context * ctx, const common_params
+     auto tim1 = std::chrono::high_resolution_clock::now();
+     LOG_INF("%s: tokenizing the input ..\n", __func__);
+-
++
+     std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true);
+-
++
++    const bool emit_paired_nll = std::getenv("NINFER_EMIT_PAIRED_NLL") != nullptr;
++
+     auto tim2 = std::chrono::high_resolution_clock::now();
+     LOG_INF("%s: tokenization took %g ms\n",__func__,1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2-tim1).count());
+-
+-    if (int(tokens.size()) < 2*n_ctx) {
++
++    if (emit_paired_nll && int(tokens.size()) != n_ctx) {
++        LOG_ERR("%s: paired NLL requires token count (%zu) to equal context size (%d)\n",
++                __func__, tokens.size(), n_ctx);
++        return {std::move(tokens), 0., {}, {}};
++    }
++    if (!emit_paired_nll && int(tokens.size()) < 2*n_ctx) {
+         LOG_ERR("%s: you need at least %d tokens to evaluate perplexity with a context of %d\n",__func__,2*n_ctx,
+                 n_ctx);
+         LOG_ERR("%s: the data file you provided tokenizes to only %zu tokens\n",__func__,tokens.size());
+         return {std::move(tokens), 0., {}, {}};
+@@ -539,6 +547,6 @@ static results_perplexity perplexity_v2(llama_context * ctx, const common_params
+     // Example, we have a context window of 512, we will compute perplexity for each of the
+     // last 256 tokens.  Then, we split the input up into context window size chunks to
+     // process the entire prompt.
+-    const int first = n_ctx/2;
+-
++    const int first = emit_paired_nll ? 0 : n_ctx/2;
++
+     for (int i = 0; i < n_chunk; i += n_seq) {
+@@ -614,7 +622,17 @@ static results_perplexity perplexity_v2(llama_context * ctx, const common_params
+         for (int seq = 0; seq < n_seq_batch; seq++) {
+             const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
+-
++
+             llama_token * tokens_data = tokens.data() + start + seq*n_ctx + first;
++            if (emit_paired_nll) {
++                for (int position = 0; position < n_ctx - 1; ++position) {
++                    const results_log_softmax result = log_softmax(
++                        n_vocab, all_logits + size_t(position)*n_vocab,
++                        tokens_data[position + 1]);
++                    LOG("TOKEN_NLL position=%d input_id=%d target_id=%d nll=%.17g\n",
++                        start + seq*n_ctx + position, tokens_data[position],
++                        tokens_data[position + 1], -result.log_softmax);
++                }
++            }
+             if (!params.logits_file.empty()) {
+                 process_logits(logits_stream, n_vocab, all_logits,
+                         tokens_data, n_ctx - 1 - first,
