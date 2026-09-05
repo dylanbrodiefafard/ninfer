@@ -69,6 +69,7 @@
     "cuda_graphs": true,
     "blackwell_native_fp4": true,
     "gpu_layers": 31,
+    "layer_placement": "llama.cpp loader assigns input/embedding and transformer layers 0..17 to CPU and transformer layers 18..47 plus output to GPU, subject to backend operation support",
     "fit": false,
     "split_mode": "none",
     "load_mode": "mmap",
@@ -81,6 +82,10 @@
     "threads_batch": 16,
     "batch_size": 256,
     "ubatch_size": 256,
+    "ggml_op_offload_min_batch": {
+      "environment": "unset",
+      "compiled_default": 32
+    },
     "warmup": false,
     "seed": 1234
   },
@@ -103,7 +108,7 @@
     ]
   },
   "paired_context_601": {
-    "status": "unresolved integration discrepancy: mean gate passes but gross per-token gate fails",
+    "status": "cross-profile integration sensitivity: mean gate passes, gross per-token gate fails, and controlled external profiles show that the external NLL trace is not a stable numerical oracle",
     "command_environment": {"NINFER_EMIT_PAIRED_NLL": "1"},
     "command_template": [
       "${LLAMA_CPP_BUILD}/bin/llama-perplexity",
@@ -181,6 +186,133 @@
         598
       ]
     },
+    "sensitivity_controls": {
+      "purpose": "separate external execution-partition, cache-representation, and layer-placement sensitivity from evidence of a native semantic defect; every control retains the same weights, token IDs, target shift, scorer, seed, and cleared initial state, while each comparison changes only its named profile dimensions",
+      "profiles": {
+        "iq4_batch256_ubatch1": {
+          "command_overrides": ["--batch-size", "256", "--ubatch-size", "1"],
+          "mean_nll": 0.5870559894163495,
+          "ppl": 1.7986852645066058,
+          "minimum_nll": 0.000013491103312805717,
+          "maximum_nll": 13.577172311991259,
+          "nll_at_least_10_count": 8,
+          "raw_log_bytes": 46956,
+          "raw_log_sha256": "6f37f72ec9dddb7fd183db72429750416b893977a0dfc8837f65657b542a9204"
+        },
+        "iq4_batch1_ubatch1": {
+          "command_overrides": ["--batch-size", "1", "--ubatch-size", "1"],
+          "mean_nll": 0.5870559894163495,
+          "ppl": 1.7986852645066058,
+          "minimum_nll": 0.000013491103312805717,
+          "maximum_nll": 13.577172311991259,
+          "nll_at_least_10_count": 8,
+          "raw_log_bytes": 46954,
+          "raw_log_sha256": "1f7984aa9d207539081538a3b34b4285086fe14e2b511c20f297b486683800b0"
+        },
+        "f16_batch256_ubatch256": {
+          "command_overrides": ["--cache-type-k", "f16", "--cache-type-v", "f16"],
+          "mean_nll": 0.7401974075893399,
+          "ppl": 2.0963493089134286,
+          "minimum_nll": 0.000012685924739857878,
+          "maximum_nll": 14.336836762302596,
+          "nll_at_least_10_count": 6,
+          "raw_log_bytes": 46798,
+          "raw_log_sha256": "170d52d4057caa7455c3768b94987c80737e7ac277ee1fb1ec380814bfe2f298"
+        },
+        "f16_batch1_ubatch1": {
+          "command_overrides": ["--batch-size", "1", "--ubatch-size", "1", "--cache-type-k", "f16", "--cache-type-v", "f16"],
+          "mean_nll": 0.5825969800887033,
+          "ppl": 1.7906827650039476,
+          "minimum_nll": 0.000012304167531709594,
+          "maximum_nll": 14.1542700789556,
+          "nll_at_least_10_count": 6,
+          "raw_log_bytes": 47048,
+          "raw_log_sha256": "131940be7b5fb502cf56438a3a20d05733ffbe54d3bc0fed00ca220aa13e1e44"
+        },
+        "iq4_batch1_ubatch1_gpu_ordinary_weights": {
+          "command_overrides": [
+            "--batch-size", "1", "--ubatch-size", "1", "--gpu-layers", "all",
+            "--override-tensor", "blk\\.[0-9]+\\.(ffn_gate_exps|ffn_up_exps)\\.weight=CPU"
+          ],
+          "layer_placement": "llama.cpp assigns input/embedding and routed expert gate/up banks to CPU, the PLE table to its lazy host-mapped buffer, and every transformer layer's remaining weights plus output to GPU, subject to backend operation support",
+          "execution_note": "with GGML_OP_OFFLOAD_MIN_BATCH unset, llama.cpp's CUDA default threshold is 32; at tokenwise width 1 the CPU-resident routed gate/up projections execute on CPU inside its heterogeneous graph rather than using NInfer selected-slice GPU staging",
+          "model_pass_seconds": 19.47,
+          "model_input_tokens_per_second": 30.868002054442734,
+          "scored_transitions_per_second": 30.816640986132512,
+          "wall_seconds": 30.08,
+          "max_rss_kb": 39796580,
+          "mean_nll": 0.5964375530348003,
+          "ppl": 1.8156391473627436,
+          "minimum_nll": 0.000008853058644388956,
+          "maximum_nll": 13.980389390421548,
+          "nll_at_least_10_count": 6,
+          "raw_log_bytes": 47178,
+          "raw_log_sha256": "89d8ce5f17603dd0e5aed77cde3063c283a9f7599954e6032fee6d309501fa20"
+        }
+      },
+      "comparisons": {
+        "iq4_batch256_ubatch256_vs_batch256_ubatch1": {
+          "mean_absolute": 0.15591298760632435,
+          "maximum_absolute": 7.163071313053117,
+          "maximum_position": 521,
+          "absolute_delta_count_strictly_greater_than_1_0": 20
+        },
+        "iq4_batch256_ubatch1_vs_batch1_ubatch1": {
+          "exact_nll_agreement": true,
+          "mean_absolute": 0.0,
+          "maximum_absolute": 0.0,
+          "absolute_delta_count_strictly_greater_than_1_0": 0
+        },
+        "iq4_vs_f16_batch256_ubatch256": {
+          "mean_absolute": 0.2431531221048067,
+          "maximum_absolute": 9.05500560380465,
+          "maximum_position": 587,
+          "absolute_delta_count_strictly_greater_than_1_0": 36
+        },
+        "iq4_vs_f16_batch1_ubatch1": {
+          "mean_absolute": 0.08914918235583118,
+          "maximum_absolute": 3.2608226767037634,
+          "maximum_position": 227,
+          "absolute_delta_count_strictly_greater_than_1_0": 11
+        },
+        "native_vs_iq4_batch1_ubatch1": {
+          "mean_signed_external_minus_native": -0.09742461570907765,
+          "mean_absolute": 0.1722041736642831,
+          "maximum_absolute": 7.9098036981783375,
+          "maximum_position": 227,
+          "absolute_delta_count_strictly_greater_than_1_0": 27
+        },
+        "native_vs_f16_batch1_ubatch1": {
+          "mean_signed_external_minus_native": -0.10188362503672393,
+          "mean_absolute": 0.1653445065620277,
+          "maximum_absolute": 5.499093879214999,
+          "maximum_position": 419,
+          "absolute_delta_count_strictly_greater_than_1_0": 27
+        },
+        "iq4_batch1_ubatch1_gpu_ordinary_weights_vs_31_gpu_layers": {
+          "mean_signed_gpu_ordinary_minus_31_gpu_layers": 0.009381563618450706,
+          "mean_absolute": 0.08766201302772017,
+          "maximum_absolute": 4.782517062219456,
+          "maximum_position": 438,
+          "absolute_delta_count_strictly_greater_than_1_0": 6
+        },
+        "native_vs_iq4_batch1_ubatch1_gpu_ordinary_weights": {
+          "mean_signed_external_minus_native": -0.08804305209062693,
+          "mean_absolute": 0.186474799140237,
+          "maximum_absolute": 8.11109223996958,
+          "maximum_position": 227,
+          "absolute_delta_count_strictly_greater_than_1_0": 23
+        }
+      },
+      "position_521_witness": {
+        "native_nvfp4_g16_nll": 0.006252288818359375,
+        "external_iq4_batch256_ubatch256_nll": 7.163355393661418,
+        "external_iq4_batch1_ubatch1_nll": 0.00028408060830097283,
+        "external_f16_batch256_ubatch256_nll": 0.00022162331040139136,
+        "interpretation": "the original maximum paired delta disappears in both the tokenwise IQ4 control and the F16 control, so it is not evidence of a native defect"
+      },
+      "interpretation": "The exact IQ4 agreement between batch256/ubatch1 and batch1/ubatch1 isolates the external schedule sensitivity to multi-token microbatch execution rather than outer batch grouping. Cache dtype, microbatch width, and external layer placement each produce material NLL changes. Moving all ordinary transformer weights to the GPU reduces the native/external gross count from 27 to 23 but does not monotonically improve mean absolute delta. These controls invalidate external NLL as a numerical oracle; they do not qualify either implementation or identify a native defect. Native correctness remains owned by independent represented-input Op and accumulated-state oracles."
+    },
     "criterion": {
       "maximum_per_token_absolute_delta_nll": 1.0,
       "maximum_mean_absolute_delta_nll": 0.5,
@@ -189,7 +321,7 @@
       "per_token_gate_passed": false,
       "finite_gate_passed": true,
       "overall_passed": false,
-      "interpretation": "The full-sequence evidence does not qualify the native Program as externally matched; investigate the localized recurrent divergence before making a production correctness claim."
+      "interpretation": "The full-sequence evidence does not qualify the native Program as externally matched. Controlled external schedule and cache profiles produce comparable or larger deltas, so the gross failures identify context/execution-profile sensitivity rather than a native recurrent-state defect."
     },
     "paragraph_localization": {
       "segmentation": "repetitions 1..6 own 86 transition input positions each, including the terminal-LF transition; repetition 7 owns positions 516..599",
@@ -217,7 +349,7 @@
         {"offset": 55, "positions": [313, 485, 571]},
         {"offset": 71, "positions": [501, 587]}
       ],
-      "interpretation": "The same offsets remain within one nat in other repetitions, so this is state- and repetition-dependent rather than a fixed token-pair bias."
+      "interpretation": "The same offsets remain within one nat in other repetitions, so this is context- and execution-profile-dependent rather than a fixed token-pair bias; the NLL trace alone does not identify which state or arithmetic subsystem causes the sensitivity."
     },
     "result_artifacts": {
       "external_raw_log": {
@@ -236,7 +368,7 @@
   "limitations": [
     "The external runner executes QSA selection but uses a dense attention fallback; it is not a QSA performance or sparse-attention oracle.",
     "External IQ4_NL K/V is not NInfer NVFP4-G16 K/V, so paired deltas cross distinct represented cache and activation profiles.",
-    "The mean paired gate passes but 33 per-token deltas exceed the one-nat gross cap; this is unresolved integration evidence, not external parity or production correctness.",
+    "The mean paired gate passes but 33 per-token deltas exceed the one-nat gross cap; controlled external profiles show comparable or larger self-deltas, so this is sensitivity evidence rather than external parity, production correctness, or proof of a native defect.",
     "The historical context-32 PPL result scores only 15 positions and remains smoke evidence rather than a language-quality benchmark."
   ]
 }
