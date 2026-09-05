@@ -21,6 +21,9 @@ namespace ninfer::ops {
 namespace {
 
 constexpr std::int32_t kResidentGroupedMinWidth = 256;
+// Start consuming after half a slot; this balances earlier first work against overlap of the
+// following full-slot transfer on the mapped-host RTX 5090 profile.
+constexpr std::size_t kPrefillBootstrapExperts = 16;
 
 struct BlockGeometry {
     std::uint32_t values;
@@ -58,6 +61,17 @@ std::uint64_t matrix_bytes(QType qtype, std::int32_t rows, std::int32_t columns)
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr &&
            (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1U)) == 0;
+}
+
+bool has_workspace_capacity(const WorkspaceArena& workspace, std::size_t required) {
+    constexpr std::size_t alignment = 256;
+    const std::size_t used = workspace.used();
+    if (workspace.base() == nullptr || used > workspace.capacity()) { return false; }
+    const std::size_t remainder =
+        (reinterpret_cast<std::uintptr_t>(workspace.base()) + used) & (alignment - 1U);
+    const std::size_t padding = remainder == 0 ? 0 : alignment - remainder;
+    return padding <= workspace.capacity() - used &&
+           required <= workspace.capacity() - used - padding;
 }
 
 void require_tensor(const Tensor& tensor, DType dtype, std::int32_t n0, const char* name) {
@@ -425,8 +439,7 @@ void qwen4_sparse_moe(const Tensor& x, const Qwen4SparseMoeWeights& weights,
         throw std::invalid_argument("qwen4_sparse_moe: stage is not pinned host memory");
     }
     const std::size_t required = required_workspace();
-    if (workspace.base() == nullptr || workspace.capacity() < required ||
-        workspace.used() > workspace.capacity() - required) {
+    if (!has_workspace_capacity(workspace, required)) {
         throw std::invalid_argument("qwen4_sparse_moe: insufficient workspace");
     }
 
@@ -637,8 +650,7 @@ void qwen4_sparse_moe_prefill(const Tensor& x, const Qwen4SparseMoeWeights& weig
             "qwen4_sparse_moe_prefill: host scratch is not pinned host memory");
     }
     const std::size_t required = required_prefill_workspace(width);
-    if (workspace.base() == nullptr || workspace.capacity() < required ||
-        workspace.used() > workspace.capacity() - required) {
+    if (!has_workspace_capacity(workspace, required)) {
         throw std::invalid_argument("qwen4_sparse_moe_prefill: insufficient workspace");
     }
 
@@ -745,13 +757,22 @@ void qwen4_sparse_moe_prefill(const Tensor& x, const Qwen4SparseMoeWeights& weig
     const std::size_t routed_down_matrix = static_cast<std::size_t>(matrix_bytes(
         QType::GGML_IQ4_NL, kQwen4SparseMoeHidden, kQwen4SparseMoeIntermediate));
     const std::size_t groups =
-        (unique_count + kQwen4SparseMoePrefillGroupExperts - 1) /
-        kQwen4SparseMoePrefillGroupExperts;
+        unique_count <= kQwen4SparseMoePrefillGroupExperts
+            ? 1
+            : 1 + (unique_count - kPrefillBootstrapExperts +
+                   kQwen4SparseMoePrefillGroupExperts - 1) /
+                      kQwen4SparseMoePrefillGroupExperts;
     for (std::size_t group = 0; group < groups; ++group) {
-        const std::size_t group_begin = group * kQwen4SparseMoePrefillGroupExperts;
+        const std::size_t group_begin =
+            group == 0
+                ? 0
+                : kPrefillBootstrapExperts +
+                      (group - 1) * kQwen4SparseMoePrefillGroupExperts;
+        const std::size_t group_capacity =
+            group == 0 && groups != 1 ? kPrefillBootstrapExperts
+                       : static_cast<std::size_t>(kQwen4SparseMoePrefillGroupExperts);
         const std::size_t group_end = std::min(
-            group_begin + static_cast<std::size_t>(kQwen4SparseMoePrefillGroupExperts),
-            unique_count);
+            group_begin + group_capacity, unique_count);
         const std::int32_t slot = static_cast<std::int32_t>(group %
                                                             kQwen4SparseMoePipelineSlots);
         auto* pinned_slot = pinned_bytes +
@@ -876,8 +897,7 @@ void qwen4_sparse_moe_resident(const Tensor& x,
     require_ggml_weight(weights.shared_down, QType::GGML_Q8_0, 1, kQwen4SparseMoeHidden,
                         kQwen4SparseMoeIntermediate, "shared_down");
     const std::size_t required = required_resident_workspace(width);
-    if (workspace.base() == nullptr || workspace.capacity() < required ||
-        workspace.used() > workspace.capacity() - required) {
+    if (!has_workspace_capacity(workspace, required)) {
         throw std::invalid_argument("qwen4_sparse_moe_resident: insufficient workspace");
     }
 
