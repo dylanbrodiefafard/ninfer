@@ -537,8 +537,10 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
                                   conv_record, query, key, value, z, workspace, parent_index);
         require_record_parent_index(parent_index, geometry);
 
-        // Packed T=2..16: B=1 retains fused T=1 GEMV+FP32 conv. B>1 uses concurrent
-        // same-reduction SmallT CTAs with the same BF16 history boundary.
+        // Packed T=2..16: B=1 retains fused T=1 GEMV+FP32 conv. Qualified B>1
+        // W=2/5 shapes replay one same-reduction SmallT weight load across each
+        // request pair, then consume the private FP32 projection without adding a
+        // semantic BF16 boundary. Other widths retain request-indexed CTAs.
         const bool tree = parent_index_active(parent_index);
         const detail::Nvfp4GdnConvPlan plan =
             detail::nvfp4_gdn_conv_resolve_plan(policy, geometry.width, geometry.batch);
@@ -548,7 +550,7 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
             if (geometry.batch > 1) {
                 detail::nvfp4_gdn_record_small_t_launch(
                     x, weight, conv_weight, conv_states, valid_columns, initial_state_slots,
-                    conv_record, query, key, value, z, stream, parent_ptr);
+                    conv_record, query, key, value, z, workspace, stream, parent_ptr);
             } else {
                 detail::nvfp4_gdn_record_t1_fused_launch(
                     x, weight, conv_weight, conv_states, valid_columns, initial_state_slots,
@@ -764,19 +766,8 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
             "gdn_input_proj_conv_record workspace: unsupported single-parent profile");
     }
     require_record_capacity_domain(batch_size, min_width, max_width);
-    const detail::Nvfp4GdnConvPlan minimum_plan =
-        detail::nvfp4_gdn_conv_resolve_plan(policy, min_width, batch_size);
-    const detail::Nvfp4GdnConvPlan maximum_plan =
-        detail::nvfp4_gdn_conv_resolve_plan(policy, max_width, batch_size);
-    if (minimum_plan.schedule == detail::Nvfp4GdnConvScheduleId::DecodeFusedA16) {
-        throw std::logic_error("ReplaySSM record planner admitted NVFP4 decode");
-    }
-    if (maximum_plan.schedule == detail::Nvfp4GdnConvScheduleId::SmallTFusedA16) { return 0; }
-    if (batch_size > 1) {
-        throw std::logic_error("batched NVFP4 conv-record has no Materialized route");
-    }
-    return detail::nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy::AllowA4,
-                                                            std::max(min_width, 4), max_width);
+    return detail::nvfp4_gdn_record_workspace_capacity_bytes(policy, batch_size, min_width,
+                                                             max_width);
 }
 
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,

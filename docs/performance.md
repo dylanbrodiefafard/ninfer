@@ -331,6 +331,43 @@ Packed real-artifact C=4 Graph isolation also retained exact C=1 outputs through
 token window. A rebuilt-candidate NVFP4 decode PPL rerun remained 6.414141594 over 2,047 scored
 tokens, and its complete FP32 NLL stream was byte-identical to the retained pre-change file.
 
+Fresh post-GQA CUDA Graph node traces then localized the remaining C<=4 projection cost. At C=2,
+NVFP4 SmallT accounted for 42.97% of kernel time and fused NVFP4 SwiGLU for 26.29%; at C=4 the
+shares were 45.85% and 26.64%. GQA had fallen below 1% in both traces. Exact-shape
+`tools.kdev` classification found the W=2..5 Linear, SwiGLU, and GDN points DRAM-bound and refused
+tile/warp retuning. The generic Linear and already-fused SwiGLU paths therefore remain unchanged.
+The material opportunity was GDN record weight replay: W=2 and W=5 now project two requests per
+SmallT weight pass, retain the W-local reduction profile, keep the channel projection in private
+FP32 workspace, and perform the convolution in a separate 2.1 us kernel. W=3/4 retain their
+request-indexed route because pairing was slower at those widths.
+
+| Width | C | Prior GDN record us | Paired us | Change |
+|---:|---:|---:|---:|---:|
+| 2 | 2 | 59.392 | 51.200 | -13.8% |
+| 2 | 3 | 73.728 | 69.632 | -5.6% |
+| 2 | 4 | 89.824 | 69.632 | -22.5% |
+| 5 | 2 | 112.640 | 88.064 | -21.8% |
+| 5 | 3 | 155.648 | 145.408 | -6.6% |
+| 5 | 4 | 200.672 | 151.552 | -24.5% |
+
+The production C=2 trace reduced the full GDN record family from 806.014 to 625.437 ms across
+7,440 record invocations (-22.4%); the paired projection used 230 registers/thread with no local
+memory or spills. Matched 1,024-token-per-lane fixed waves show the end-to-end effect:
+
+| Backend | C | Prior tok/s | Paired tok/s | Throughput | Makespan |
+|---|---:|---:|---:|---:|---:|
+| DFlash k=4 | 2 | 248.820 | 256.241 | +2.98% | -3.06% |
+| DFlash k=4 | 4 | 251.962 | 261.382 | +3.74% | -3.62% |
+| MTP4 | 2 | 238.822 | 245.388 | +2.75% | -3.26% |
+| MTP4 | 4 | 255.958 | 265.386 | +3.68% | -3.95% |
+
+DFlash acceptance remained exactly 59.2745% with 608/1,216 row-rounds at C=2/4; MTP acceptance
+remained exactly 54.9219% with 640/1,280 row-rounds. Independent decoded-NVFP4 FP64 oracles cover
+W=2 and W=5 at C=2/3/4, including dense, ragged, and tree-parent records; outputs are bit-exact to
+the serial C=1 arithmetic. Real packed-artifact C=4 Graph isolation also matched C=1 through the
+qualified window. The NVFP4 decode PPL rerun remained 6.414141594 over 2,047 scored tokens with
+no nonfinite values, and every FP32 NLL was byte-identical to the post-GQA baseline.
+
 A proposed fusion of the DFlash2 proposer MLP gate-up Linear and SiLU stages saved up to 2.0 us
 in isolation but reduced production throughput in its matched pre-rebase C=2/3/4 campaign, so it
 was removed.
@@ -351,6 +388,10 @@ are in `profiles/bench/multi-request-gqa-{baseline,candidate}-20260904/` and
 `profiles/bench/multi-request-gqa-e2e-{baseline,candidate}-20260904/`; the uncontended repeat is
 in `profiles/bench/multi-request-gqa-e2e-{baseline,candidate}-clean-20260904/`. The PPL rerun is
 in `profiles/ppl/multi-request-gqa-candidate-20260904/`.
+The post-GQA profiles are in `profiles/nsys/smallt-post-gqa-c{2,4}-nodes.nsys-rep`; isolated GDN
+A/Bs are in `profiles/bench/smallt-goal-{baseline-isolated,candidate-paired}/`; the long serving
+A/Bs are in `profiles/bench/smallt-goal-long-{baseline,paired}-20260905/`; and the PPL result is
+`profiles/ppl/smallt-paired-20260905.{json,nllf32}`.
 
 ## Reproduction
 
