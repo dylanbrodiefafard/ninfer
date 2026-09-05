@@ -192,9 +192,8 @@ cmake --build build --parallel --target ninfer_gated_residual_bench
 `ggml_iq4_nl` block-row layouts. It requires an explicit N/K/T point, constructs deterministic
 finite encoded blocks, and reports CUDA-event time plus the exact public-representation byte
 floor. Each timed call follows a 256 MiB L2 eviction outside the timed event interval.
-`aggregate_tile_tokens`, `weight_passes`, `full_weight_passes`, `tail_tokens`, and
-`average_tokens_per_weight_pass` describe the live scalar or 16-token aggregate route; they are
-observations, not benchmark controls.
+Timing reports the median, minimum, p95, and maximum sample. Private tile, pass-count, and dispatch
+details stay out of this retained public-Op measurement entry.
 `--profile` requires one repetition and
 brackets that single post-warmup public call with the CUDA profiler API.
 
