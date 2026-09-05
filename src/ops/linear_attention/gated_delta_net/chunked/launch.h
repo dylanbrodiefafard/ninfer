@@ -56,11 +56,13 @@ struct prepare_wy_wu_config {
     std::int32_t H_v  = 0;
     std::int32_t L    = 0;
 
-    const void* k          = nullptr;
-    bool private_fp16      = false;
-    const __nv_bfloat16* v = nullptr;
-    const float* g_in      = nullptr;
-    const float* beta      = nullptr;
+    void* k_private                = nullptr;
+    const __nv_bfloat16* k_source = nullptr;
+    bool private_fp16             = false;
+    bool normalize_k              = false;
+    const __nv_bfloat16* v        = nullptr;
+    const float* g_in             = nullptr;
+    const float* beta             = nullptr;
 
     void* W             = nullptr;
     void* U             = nullptr;

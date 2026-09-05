@@ -273,6 +273,8 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
         (T / detail::gated_delta_net::kChunkSize) * detail::gated_delta_net::kChunkSize;
     const bool fuse_q_normalization =
         detail::gated_delta_net::uses_fused_q_normalization(q.ne[1], v.ne[1], T, normalize_qk);
+    const bool fuse_k_normalization =
+        detail::gated_delta_net::uses_fused_k_normalization(q.ne[1], v.ne[1], T, normalize_qk);
     ChunkedWorkspace scratch = allocate_chunked_workspace(ws, q.ne[1], v.ne[1], T, normalize_qk);
     if (normalize_qk && T_full > 0) {
         Tensor k_source     = k.slice(2, 0, T_full);
@@ -282,7 +284,9 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
             Tensor q_normalized = scratch.normalized_q.slice(2, 0, T_full);
             detail::gated_delta_net::launch_normalize_fp16(q_source, q_normalized, stream);
         }
-        detail::gated_delta_net::launch_normalize_fp16(k_source, k_normalized, stream);
+        if (!fuse_k_normalization) {
+            detail::gated_delta_net::launch_normalize_fp16(k_source, k_normalized, stream);
+        }
     }
     if (T_full > 0) {
         Tensor q_full = normalize_qk && !fuse_q_normalization
@@ -293,10 +297,12 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
         Tensor v_full    = v.slice(2, 0, T_full);
         Tensor g_full    = g.slice(1, 0, T_full);
         Tensor beta_full = beta.slice(1, 0, T_full);
-        Tensor out_full  = out.slice(2, 0, T_full);
+        Tensor out_full   = out.slice(2, 0, T_full);
+        Tensor raw_k_full = k.slice(2, 0, T_full);
         detail::gated_delta_net::launch_chunked(
-            q_full, k_full, v_full, g_full, beta_full, scale, fuse_q_normalization, ssm_state_in,
-            ssm_state_out, out_full, scratch.stage.data, scratch.stage.bytes, stream);
+            q_full, raw_k_full, k_full, v_full, g_full, beta_full, scale, fuse_q_normalization,
+            fuse_k_normalization, ssm_state_in, ssm_state_out, out_full, scratch.stage.data,
+            scratch.stage.bytes, stream);
     }
 
     const std::int32_t tail = T - T_full;

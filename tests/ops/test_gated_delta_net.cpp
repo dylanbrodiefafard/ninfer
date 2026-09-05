@@ -886,6 +886,15 @@ int main() {
         distinct_state_case({"Qwen4 fused-Q crossover", 48, 48, 448, true}, 15448u);
     failures +=
         distinct_state_case({"Qwen4 fused-Q crossover tail", 48, 48, 449, true}, 15449u);
+    failures +=
+        distinct_state_case({"Qwen4 materialized-K crossover predecessor", 48, 48, 511, true},
+                            15511u);
+    failures +=
+        distinct_state_case({"Qwen4 fused-K crossover", 48, 48, 512, true}, 15512u);
+    failures +=
+        distinct_state_case({"Qwen4 fused-K crossover tail", 48, 48, 513, true}, 15513u);
+    failures += distinct_state_case({"27b grouped K-fusion exclusion", 16, 48, 512, true},
+                                    16512u);
     failures += inplace_case({"35b two-chunk raw-qk", 16, 32, 128, false}, 12228u);
     failures += partition_case({"27b chunk boundary", 16, 48, 128, true}, {64, 64}, 12428u);
     failures += partition_case({"27b chunk tail", 16, 48, 65, true}, {64, 1}, 12465u);
