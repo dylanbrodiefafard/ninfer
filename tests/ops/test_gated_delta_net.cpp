@@ -343,10 +343,6 @@ int partition_case(const Case& test_case, std::initializer_list<std::int32_t> ch
                                   gated_delta_net_state_fp32_criterion());
     failures += verify_recurrence(label + " partition state oracle", partition_state_values,
                                   ref.final_state, gated_delta_net_state_fp32_criterion());
-    failures += verify_recurrence(label + " output delta", partition_output, full_output,
-                                  gated_delta_net_output_bf16_criterion());
-    failures += verify_recurrence(label + " state delta", partition_state_values,
-                                  full_state_values, gated_delta_net_state_fp32_criterion());
     failures += full_state.verify_guards((label + " full state").c_str());
     failures += partition_state.verify_guards((label + " partition state").c_str());
     failures += full_out.verify_guards((label + " full out").c_str());
@@ -675,9 +671,16 @@ int main() {
     failures += distinct_state_case({"27b two-chunk fused-qk-norm", 16, 48, 128, true}, 12128u);
     failures += distinct_state_case({"27b production-tail fused-qk-norm", 16, 48, 3404, true},
                                     15404u);
+    // Maximum-width Program localization first differs at this FP32 recurrence boundary. Keep
+    // both schedules tied to the independent complete recurrence instead of treating their
+    // floating pairwise delta as an oracle.
+    failures += distinct_state_case({"27b maximum prefill fused-qk-norm", 16, 48, 4096, true},
+                                    16096u);
     failures += inplace_case({"35b two-chunk raw-qk", 16, 32, 128, false}, 12228u);
     failures += partition_case({"27b chunk boundary", 16, 48, 128, true}, {64, 64}, 12428u);
     failures += partition_case({"27b chunk tail", 16, 48, 65, true}, {64, 1}, 12465u);
+    failures += partition_case({"27b maximum prefill partition", 16, 48, 4096, true},
+                               {64, 1, 1986, 1, 2044}, 16496u);
 
     // Snapshot is a separate public state transition. Nonzero source slots also prove that the
     // selected initial state, not slot zero, seeds the complete recurrence.

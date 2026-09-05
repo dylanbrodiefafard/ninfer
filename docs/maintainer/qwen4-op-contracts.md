@@ -597,9 +597,14 @@ Program owns which in-place state becomes committed.
 
 The oracle exact-decodes Q5_K/Q6_K bytes and covers projection, width-four causal convolution, Q/K
 L2 normalization, control gates, every FP32 recurrence update, sigmoid output gating, and Q6_K
-output projection. T=1, T=64, T=65, arbitrary partitions, and nonzero initial state are compared
-directly to one sequential FP64 oracle from the same represented inputs; a distinct-output call
-proves the rollback boundary.
+output projection. Complete-layer Q5_K T=3 and layer-2 Q6_K T=1 cells, including nonzero initial
+state, compare directly to one sequential FP64 oracle from the represented inputs; a
+distinct-output call proves the rollback boundary. Complete-layer T=64 and T=65 partition cells
+compare chunked execution with the production one-shot route, including exact BF16 convolution
+state and criterion-bound output and FP32 recurrence state. A recurrence-only real-geometry cell
+extends the represented-input `gated_delta_net` route to T=4096 and
+`64+1+1986+1+2044`, comparing every BF16 output and the final FP32 state directly to one complete
+FP64 recurrence oracle.
 
 ## 9. Live C=1 sparse-MoE verifier
 
@@ -767,7 +772,7 @@ The minimum meaningful matrix is:
 | n-gram | exact vectors below; empty/short history; EOS as current and prior token; one-shot/chunk/T=1; C lane isolation; every admitted PLE-module index |
 | PLE gather | first/last valid row, repeated and permuted ids, 16-head/token order, codec edges, and exact T=1/16/17/128/4096 decode against the independent IQ4_NL oracle |
 | PLE inject | live verifier: real 4x2560 projections/state; zero and nonzero history; one-shot/legal chunks/T=1; dilation witness; in-place output; C=1. Future registered batched entry: C=4,8 isolation and invalid-suffix semantics |
-| GDN | live verifier: source 16 Q/K heads expanded to 48 tiled artifact heads (`h%16`) at width 128; direct represented `ssm_a`; Q5_K and layer-2 Q6_K inputs; Q6_K output; T=1/64/65 and arbitrary partition continuation; nonzero FP32 initial state; sigmoid output gate; distinct rollback and in-place continuation. Future registered routes qualify multi-request snapshot/record/fold if used |
+| GDN | live verifier complete layer: source 16 Q/K heads expanded to 48 tiled artifact heads (`h%16`) at width 128; direct represented `ssm_a`; Q5_K and layer-2 Q6_K inputs; Q6_K output; direct FP64 oracle at Q5_K T=3 and layer-2 Q6_K T=1; pairwise one-shot/partition evidence at T=64/65; nonzero FP32 initial state; sigmoid output gate; distinct rollback and in-place continuation. Represented-input recurrence: direct FP64 oracle at T=4096 and `64+1+1986+1+2044`, covering every BF16 output and final FP32 state. Future registered routes qualify multi-request snapshot/record/fold if used |
 | sparse MoE | live verifier: 512/top10/I640; lower-id all-zero and tenth-boundary ties; selected normalization; IQ1_S/IQ2_XXS scalar and grouped T=1..4096 two-slot host staging plus complete device-resident bank profiles; IQ4_NL routed down; Q5_K/Q6_K shared gate/up; Q8_0 shared down; exact group bytes/occurrence order and FP64 Store output. Future registered entry qualifies C=4,8 |
 
 Named numeric criteria must be fixed from adversarial and target-representative oracle-error
