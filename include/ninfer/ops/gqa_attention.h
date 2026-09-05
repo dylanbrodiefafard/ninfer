@@ -126,9 +126,9 @@ gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
  * path. gqa_attention_workspace_capacity_bytes(..., tree_verify=true) reserves that decode
  * scratch. Ordinary MTP/causal calls omit both tensors.
  *
- * Concurrent B>1 SmallT/ChunkedSmallT launches one B=1 decode per sequence so C>1 uses the same
- * kernel as sequential C=1 (`MultiBatch=false`). The batched MultiBatch specialization is an
- * indexing variant, not a required semantic path; p-less T=2 is sensitive to its reduction.
+ * Concurrent B>1 SmallT/ChunkedSmallT uses one request-indexed partial launch and one batched
+ * reduction per chunk. Each grid.z row retains the B=1 CTA arithmetic and owns disjoint partial,
+ * output, metadata, and paged-cache rows.
  */
 void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
                    const Tensor& valid_columns, const Tensor& kv_table_rows, float scale,
