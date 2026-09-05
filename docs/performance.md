@@ -311,6 +311,26 @@ DFlash acceptance. Separately, target-only decode PPL remained 6.414141594 throu
 all 2,047 scored FP32 NLL values were byte-identical, with 19 terrible tokens and no nonfinite
 values. That PPL route does not exercise concurrent packed verification.
 
+The subsequent GQA retune removes the remaining per-request attention loop. Concurrent NVFP4
+SmallT verification now launches one request-indexed partial and one batched reduction per chunk;
+the B=1 specialization and each request CTA's arithmetic remain unchanged. At public Graph Op scope
+over W=2..5 and contexts 37/128/2,048/4,096, the mean speedups were 1.68x/1.97x/2.40x at
+C=2/3/4. Representative W=5 latency fell from 22.528 to 14.016 us at C=2, from 32.768 to
+14.336 us at C=3, and from 42.976 to 16.064 us at C=4 for context 37; at context 4,096 the
+corresponding changes were 36.864 to 24.576 us, 53.248 to 34.816 us, and 69.632 to 40.960 us.
+The existing 64-value reduction chunk remained best or tied at every sampled C=2/C=4, W=2/W=5,
+context-128/context-4,096 point; 8/16/32-value alternatives were 11% to 105% slower.
+
+Two matched 2,048-token fixed-wave serving A/Bs produced geometric-mean gains of 0.24% at C=2
+and 1.33% at C=4; the uncontended pair improved C=2 from 219.50 to 221.02 aggregate tok/s and
+C=4 from 220.86 to 224.54 tok/s. The complete first pass kept C=1 within 0.3% noise and measured
+a 0.36% C=3 gain. Every lane retained the same output hash; speculative rounds, drafts, accepts,
+and 50.1468% acceptance were exact at each concurrency. Independent mathematical-oracle coverage
+includes dense, ragged, fragmented-page, permuted-table, W=2 C=2, and W=5 C=4 NVFP4 batches.
+Packed real-artifact C=4 Graph isolation also retained exact C=1 outputs through the qualified
+token window. A rebuilt-candidate NVFP4 decode PPL rerun remained 6.414141594 over 2,047 scored
+tokens, and its complete FP32 NLL stream was byte-identical to the retained pre-change file.
+
 A proposed fusion of the DFlash2 proposer MLP gate-up Linear and SiLU stages saved up to 2.0 us
 in isolation but reduced production throughput in its matched pre-rebase C=2/3/4 campaign, so it
 was removed.
@@ -326,7 +346,11 @@ Reports: `profiles/bench/multi-request-kernel-post-origin-panel-control-20260904
 `profiles/bench/multi-request-kernel-post-origin-final-20260904/`. Concurrent-GDN results are in
 `profiles/bench/multi-request-kernel-gdn-{final,mtp4-final}-20260904/`; its Op A/B is in
 `profiles/bench/gdn-c2-retune-20260904/`. Accuracy report:
-`profiles/ppl/multi-request-kernel-gdn-final-20260904.{json,nllf32}`.
+`profiles/ppl/multi-request-kernel-gdn-final-20260904.{json,nllf32}`. The GQA Op and serving A/Bs
+are in `profiles/bench/multi-request-gqa-{baseline,candidate}-20260904/` and
+`profiles/bench/multi-request-gqa-e2e-{baseline,candidate}-20260904/`; the uncontended repeat is
+in `profiles/bench/multi-request-gqa-e2e-{baseline,candidate}-clean-20260904/`. The PPL rerun is
+in `profiles/ppl/multi-request-gqa-candidate-20260904/`.
 
 ## Reproduction
 

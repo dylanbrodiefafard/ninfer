@@ -469,6 +469,23 @@ campaign it improved the isolated T=10/15/20 composite from 73.7 us to 71.7/71.7
 reduced production throughput at C=2/3/4. Separately, top-k path selection is only about 1% of
 the profiled C=4 kernel time, so rewriting it is not a material round-speed lever.
 
+The next retained step removes GQA's per-request host loop without changing its C=1 route or CTA
+arithmetic. NVFP4 W=2..5 now uses one request-indexed partial launch and one batched reduction per
+chunk. Across contexts 37/128/2,048/4,096 the public Graph Op averaged 1.68x/1.97x/2.40x faster
+at C=2/3/4; W=5 context-4,096 improved from 36.864/53.248/69.632 us to
+24.576/34.816/40.960 us. A reduction-chunk sweep retained 64 because all smaller choices were
+slower or, at one point, tied. Two fixed-wave serving A/Bs produced geometric-mean gains of 0.24%
+at C=2 and 1.33% at C=4; the complete first pass also measured C=1 within 0.3% noise and C=3 at
++0.36%. Output hashes, rounds, drafts, accepts, and 50.1468% acceptance were exact. Direct
+independent-oracle tests cover dense, ragged, fragmented, permuted-table, W=2 C=2, and W=5 C=4
+NVFP4 batches; packed real-artifact C=4 Graph isolation also remained exact. Candidate NVFP4
+decode PPL stayed 6.414141594, with its per-token FP32 NLL stream byte-identical to the retained
+pre-change file.
+
+The same C=4 node trace attributes 1.13% of kernel time to DFlash top-k and path selection, about
+0.03% to speculative accept/finalize/select-hidden work, and no separate material commit kernel.
+That sub-percent fusion ceiling does not justify another control kernel or state boundary.
+
 The BF16 attention-input phase-order change is visible to any standalone T=10/15/20 A16 caller.
 It is 1.9% slower than the old packed route at T=10, 13.0% slower at T=15, and unchanged at T=20;
 the selected order preserves exact W=5 panel arithmetic and makes the production C=3 aggregate

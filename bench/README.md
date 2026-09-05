@@ -310,11 +310,11 @@ counts, or kernel-name filters in these benchmarks.
 
 `ninfer_causal_softmax_attention_bench` measures the two public causal-cache entries:
 append-and-attend and cached-only. It covers the registered D256 H24/KV4 and H16/KV2 geometries
-with BF16 and INT8-G64 KV storage. Production dispatch receives the caller-visible execution
-envelope and owns all decode, prompt, Small-T, and split-KV choices.
+with BF16, INT8-G64, and NVFP4-G16 KV storage. Production dispatch receives the caller-visible
+execution envelope and owns all decode, prompt, Small-T, and split-KV choices.
 
-Append-and-attend accepts `--batch 1,2,4,8`; each ordinary `--context L` point gives every row the
-same context and all `W` columns are valid. One exact mixed profile uses `--row-contexts`,
+Append-and-attend accepts any `B` from 1 through 8; each ordinary `--context L` point gives every
+row the same context and all `W` columns are valid. One exact mixed profile uses `--row-contexts`,
 `--valid-columns`, and `--table-rows`, each with exactly `B` entries. Cached-only remains B=1.
 The timed call consumes the whole batch once; metadata copies and graph capture remain outside the
 interval. Uniform full-width profiles use the dense public contract; exact partial profiles use
@@ -325,6 +325,10 @@ cmake --build build --parallel --target ninfer_causal_softmax_attention_bench
 ./build/bench/ninfer_causal_softmax_attention_bench \
   --entry both --geometry all --kv-dtype all --batch 1 \
   --tokens 1,2,4,6,8,12,16 --context 0,128,2048,8192 \
+  --execution graph --cache cold --warmup 10 --repeat 61
+./build/bench/ninfer_causal_softmax_attention_bench \
+  --entry append --geometry d256-h24-kv4 --kv-dtype nvfp4 --batch 1,2,3,4 \
+  --tokens 2,3,4,5 --context 128,4096 \
   --execution graph --cache cold --warmup 10 --repeat 61
 ./build/bench/ninfer_causal_softmax_attention_bench \
   --entry append --geometry d256-h16-kv2 --kv-dtype int8 \
