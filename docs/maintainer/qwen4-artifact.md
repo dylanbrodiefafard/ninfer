@@ -162,13 +162,65 @@ timed token sequence. The complete commands, instrumentation hash, raw-result ha
 statistics, and localization summary are frozen in `external_ppl_manifest.json`; raw files at a
 particular machine path are not prerequisites.
 
+That 31-layer llama.cpp placement is itself heterogeneous: its loader assigns the input/embedding
+and transformer layers 0 through 17 to the CPU, while assigning layers 18 through 47 and the output
+to the GPU, subject to backend operation support. The native verifier instead executes every model
+Op on CUDA and transfers only selected rows or expert slices from its mapped host tensors. The
+external timing and NLL trace therefore do not measure the native staging design or provide a
+like-for-like performance comparison.
+
 The paired mean absolute NLL delta was `0.197146964`, below the declared `0.5`-nat mean bound, but
 the maximum was `7.157103105` at position 521 and 33 of 600 positions exceeded the `1.0`-nat gross
 bound. Of those gross failures, 26 occurred in paragraph repetitions four through seven. Repeated
 paragraph offsets 5, 9, 25, 39, 49, 55, and 71 were localized, but the same offsets stayed within
-one nat in other repetitions; the discrepancy is state- and repetition-dependent rather than a
-fixed token-pair bias. The mean gate therefore passes and the per-token gate fails. This is an
-unresolved integration discrepancy, not an external-parity or production-correctness result.
+one nat in other repetitions; the discrepancy is context- and execution-profile-dependent rather
+than a fixed token-pair bias. The mean gate therefore passes and the per-token gate fails. This is
+integration-sensitivity evidence, not an external-parity, production-correctness, or native-defect
+result.
+
+Controlled reruns show why the failed gross gate cannot diagnose a native recurrent-state bug.
+Holding the external IQ4_NL weights, cache, tokens, scorer, offload, and cleared initial state fixed,
+changing only `--ubatch-size 256` to `1` changed the 600 NLLs by mean absolute `0.155912988`, with a
+`7.163071313` maximum and 20 positions above one nat. Keeping microbatch size one while changing the
+outer batch from 256 to one reproduced every NLL exactly, isolating that schedule sensitivity to
+multi-token microbatch execution rather than outer grouping. At position 521, the original external
+IQ4_NL microbatch-256 NLL was `7.163355394`, but external tokenwise IQ4_NL, external microbatch-256
+F16, and native NVFP4-G16 respectively produced `0.000284081`, `0.000221623`, and `0.006252289`.
+The original worst paired failure therefore disappears under two external controls.
+
+Cache representation is independently sensitive. External IQ4_NL versus F16 at microbatch 256 had
+mean absolute delta `0.243153122`, maximum `9.055005604`, and 36 positions above one nat; the same
+cache comparison tokenwise had mean `0.089149182`, maximum `3.260822677`, and 11 gross positions.
+Native versus tokenwise IQ4_NL improves from 33 to 27 gross positions and from `0.197146964` to
+`0.172204174` mean absolute delta, but remains a cross-representation behavioral comparison rather
+than an oracle. The commands, aggregates, and raw-log hashes for all controls are recorded in
+`external_ppl_manifest.json`. Native numerical correctness remains owned by independent exact and
+FP32/FP64 represented-input/state oracles.
+
+A tokenwise placement control then assigned every ordinary transformer weight and the output to the
+GPU, subject to backend operation support, while retaining the input/embedding and separate routed
+expert gate/up banks on the CPU and the PLE table in its lazy host-mapped buffer. Relative to the
+otherwise identical 31-GPU-layer IQ4_NL run, this changed six
+positions by more than one nat (`0.087662013` mean absolute, `4.782517062` maximum). Relative to
+native it reduced the gross count from 27 to 23, but increased mean absolute delta from
+`0.172204174` to `0.186474799`. Its 601-input-token pass took 19.47 seconds, about 30.9 input
+tokens/s, and supplied 600 scored transitions (30.8 scored transitions/s using the same pass time).
+`GGML_OP_OFFLOAD_MIN_BATCH` was unset, so llama.cpp used its CUDA default of 32 and the width-one
+routed gate/up projections executed on CPU inside its heterogeneous graph. This differs from
+NInfer's selected-slice GPU staging, so the result is layer-placement sensitivity evidence, not a
+native staging benchmark or numerical oracle.
+
+The source-level boundary audit also makes an exact synchronized hidden-state trace inapplicable.
+The first unavoidable represented-value seam is the initial embedding: llama.cpp retains FP32
+activations while the native verifier explicitly materializes BF16. Subsequent intentional seams
+include FP32 versus BF16 hyper-connections and PLE state, different GDN projection/convolution
+materializations and FP32 reduction association, IQ4_NL versus NVFP4-G16 QSA cache, physical-order
+versus score-ranked attention accumulation, FP32 versus BF16 MoE intermediates, and different
+final-logit reductions. A source audit finds matching PLE hash/history/reset formulas, but the NLL
+trace does not directly observe PLE rows. Cross-profile tracing can measure sensitivity at these
+seams, but cannot distinguish which profile is correct or justify changing a native semantic
+boundary. Native defects must instead be established against the represented-input/state Op oracles
+below.
 
 A subsequent capacity/QSA baseline fixed llama.cpp to 31 GPU layers with fit disabled, C=1, an
 8192-token context, and IQ4_NL K/V cache. It processed all 5536 tokens of repository `README.md`
@@ -223,7 +275,8 @@ The opt-in four-token native test retains those prefix bounds as a localization 
 prefix NLL must differ by at most 1.0 nat, their mean absolute difference by at most 0.5 nat, and
 neither route may be non-finite. The full 600-transition evidence supersedes any interpretation of
 that passing prefix as an integration gate: although its mean bound passes, 33 gross per-token
-failures remain unresolved. One nat caps a frozen target-probability ratio at `e`; these are coarse
+failures remain in that cross-profile comparison. One nat caps a frozen target-probability ratio at
+`e`; these are coarse
 behavioral diagnostics rather than Op tolerances, numeric identity, or target admission.
 
 The single-load real-artifact numerical harness independently decodes the bound packed weights and
@@ -242,6 +295,15 @@ its computed-state ratio was 0.101. Exact retained-history, staged-byte, and gua
 passed. The real-weight QSA cell now discriminates two complete blocks and the current-token tail;
 capacity-transition and saturation semantics remain owned by the independent synthetic QSA tests
 and the 4096-token Program diagnostic.
+
+An additional accumulated-state QSA cell runs the frozen prefix through position 226, captures the
+pre-append layer-3 state and represented BF16 input, then independently evaluates position 227.
+All 228 selected IDs and padding, the newly encoded NVFP4 K/V codes and FP8 scales, metadata, and
+untouched state planes matched exactly. The independent complete 228-item FP64 attention/gate/output
+oracle had maximum absolute error `0.0009765625` and used 0.0353 of its fixed pointwise criterion;
+the selector-score and attention-logit spreads were `4.36032` and `15.6427`. This directly qualifies
+the native QSA transition at the largest tokenwise IQ4/native NLL disagreement without treating the
+external result as its oracle.
 
 Same-day final RTX 5090 measurements of the same warmed four-token Program workload disabled GR
 diagnostic snapshots. Three independent three-repetition runs had sequence means of 148.666,
