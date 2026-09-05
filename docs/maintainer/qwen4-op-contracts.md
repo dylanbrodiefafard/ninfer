@@ -692,10 +692,11 @@ qualified with fixed normwise and finite gross criteria; they are not copied int
 The T-wide profiles additionally cover duplicate-token routes, both routed/shared codec pairs, a
 70-unique-expert panel that forces 32/32/6 mapped-stage grouping and slot reuse, exact staged bytes
 and occurrence order, and complete FP64 output. The resident grouped path is checked independently
-at T=257 with three alternating nonzero represented inputs, two distinct route sets, same-expert
-reuse across different inputs, back-to-back workspace reuse, exact route outputs, and per-token
-complete FP64 output criteria. A T=4096 all-zero-input run checks maximum capacity, guards, and
-lower-id ties without weakening the nonzero oracle witness. Batched C lanes remain future
+at T=257 with four alternating nonzero represented inputs, two distinct route sets, same-expert
+reuse across different inputs and permuted ranks, back-to-back workspace reuse, exact route
+outputs, and per-token complete FP64 output criteria. A T=4096 all-zero-input run checks maximum
+capacity, guards, and lower-id ties without weakening the nonzero oracle witness. Batched C lanes
+remain future
 registered-target work.
 
 ## 10. Schedule-owned transactions are not Ops

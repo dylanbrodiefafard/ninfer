@@ -440,6 +440,13 @@ so codec-pipe, fusion, and further tile ideas remain measurement tasks rather th
 changes. The one-layer result demonstrates the future all-GPU-fit execution path only: the current
 48-layer preview expert banks still do not fit the 32 GB device.
 
+The classifier-admitted 32-occurrence aggregation candidate was also rejected. At T=512 it changed
+the retained/candidate resident times from 29.522/33.451 ms and 25.907/63.560 ms for IQ1_S/Q5_K
+fixed-hot/rotating, 27.638/32.989 ms and 24.289/61.197 ms for IQ2_XXS/Q5_K, and 27.580/33.038 ms
+and 24.230/61.832 ms for IQ2_XXS/Q6_K. The compiled grouped kernels used 93--95 registers per
+thread versus 60--62 at the retained 16-occurrence tile, with no local-memory spill. Because the
+candidate lost the complete public Op by 13--20% fixed-hot and 145--155% rotating, it was deleted.
+
 The follow-up public-Op checkpoint isolated the largest transferable Q5_K point, GDN
 `N=10240,K=2560,T=1`. Nine independent 101-sample cold-L2 runs had a 73.344 us
 median-of-medians (run medians 71.680--73.376 us) for an 18,048,000-byte footprint. The kernel
