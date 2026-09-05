@@ -30,6 +30,11 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
                                                                       std::int32_t min_tokens,
                                                                       std::int32_t max_tokens);
 
+[[nodiscard]] std::size_t nvfp4_gdn_record_workspace_capacity_bytes(LinearPolicy policy,
+                                                                    std::int32_t batch_size,
+                                                                    std::int32_t min_tokens,
+                                                                    std::int32_t max_tokens);
+
 void nvfp4_gdn_snapshot_decode_launch(const Tensor& x, const Weight& weight,
                                       const Tensor& conv_weight, Tensor& conv_states,
                                       const Tensor& valid_columns, const Tensor& initial_slot,
@@ -65,11 +70,12 @@ void nvfp4_gdn_record_small_t_launch(const Tensor& x, const Weight& weight,
                                      const Tensor& conv_weight, const Tensor& conv_states,
                                      const Tensor& valid_columns, const Tensor& initial_slot,
                                      Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
-                                     Tensor& z, cudaStream_t stream,
+                                     Tensor& z, WorkspaceArena& workspace, cudaStream_t stream,
                                      const std::int32_t* parent_index = nullptr);
 
-// Packed T=2..16 B=1 record: T=1 GEMV+FP32 conv with BF16 3-tap history. B>1 dispatches
-// the same-reduction request-indexed SmallT route above.
+// Packed T=2..16 B=1 record: T=1 GEMV+FP32 conv with BF16 3-tap history. The
+// qualified B>1 W=2/5 routes pair requests per SmallT weight pass and materialize
+// only the private FP32 projection; other widths retain request-indexed CTAs.
 void nvfp4_gdn_record_t1_fused_launch(const Tensor& x, const Weight& weight,
                                       const Tensor& conv_weight, const Tensor& conv_states,
                                       const Tensor& valid_columns, const Tensor& initial_slot,

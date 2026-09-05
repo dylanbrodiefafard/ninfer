@@ -482,6 +482,22 @@ NVFP4 batches; packed real-artifact C=4 Graph isolation also remained exact. Can
 decode PPL stayed 6.414141594, with its per-token FP32 NLL stream byte-identical to the retained
 pre-change file.
 
+Fresh post-GQA C=2/C=4 node traces left NVFP4 SmallT at 42.97%/45.85% of kernel time and fused
+SwiGLU at 26.29%/26.64%; GQA was below 1%. The exact Linear, SwiGLU, and GDN W=2..5 points classify
+as DRAM-bound, so generic tile/warp retuning was refused and the already-fused SwiGLU route was
+left alone. The retained GDN specialization instead replays each SmallT weight load across a pair
+of requests at W=2 and W=5, preserves the W-local reduction, materializes only a private FP32
+channel projection, and consumes it with a separate convolution kernel. W=3/4 pairing lost and
+retains request-indexed CTAs. Public Op latency improves by 13.8%/22.5% at W=2 C=2/4 and by
+21.8%/24.5% at W=5 C=2/4. The full C=2 GDN record family falls 22.4% in the production trace with
+no spills.
+
+Matched 1,024-token-per-lane fixed waves improve DFlash by 2.98%/3.74% at C=2/4 and MTP4 by
+2.75%/3.68%; wave makespan falls 3.06%/3.62% and 3.26%/3.95%, respectively. Acceptance, round
+counts, and outputs are unchanged. Independent FP64 decoded-weight oracles cover W=2/5 C=2/3/4
+dense, ragged, and tree records; the production route is bit-exact to serial C=1. Packed-artifact
+C=4 Graph isolation also remains exact, and the complete NVFP4 PPL NLL stream is byte-identical.
+
 The same C=4 node trace attributes 1.13% of kernel time to DFlash top-k and path selection, about
 0.03% to speculative accept/finalize/select-hidden work, and no separate material commit kernel.
 That sub-percent fusion ceiling does not justify another control kernel or state boundary.
@@ -513,9 +529,9 @@ and the Op A/B is in `profiles/bench/gdn-c2-retune-20260904/`.
 - Shortlist K=32 (33.5% / 147.8 tok/s).
 - Unary child ranking (27.8%).
 - Markov softmax child sampling at T=0.6 / 0.3 (story also loses at T=0.2).
-- Flatten NVFP4 GDN conv-record to `T=W×B` compose for C>1 (W4A4 GEMM + BF16 conv). It
-  flips greedy column 0 versus C=1 fused SmallT+FP32. Keep one fused SmallT launch at `T=W`
-  per row (`grid.x=B`).
+- Flatten NVFP4 GDN conv-record to `T=W×B` W4A4 compose with a BF16 convolution input. It
+  flips greedy column 0 versus C=1 fused SmallT+FP32. The qualified W=2/5 pair replay is distinct:
+  it retains the W-local SmallT reduction and an FP32 convolution input.
 - Forced binary after depth 1 (29.2%).
 - Native T=12 INT8 GQA tile under the current `RowTiles<=3` kernel.
 - GDN 4-slot parent-tile smem cache (32 KiB; wash vs 2-slot).

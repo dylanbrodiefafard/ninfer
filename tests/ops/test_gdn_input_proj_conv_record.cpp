@@ -1097,6 +1097,10 @@ int run_nvfp4_batched_matches_serial_fused() {
     };
 
     int failures = 0;
+    failures += run_shape(2, 2, {}, {}, 1981U);
+    failures += run_shape(2, 3, {}, {}, 1987U);
+    failures += run_shape(2, 4, {2, 2, 1, 1}, {}, 1991U);
+    failures += run_shape(2, 4, {2, 2, 2, 1}, {-1, 0, -1, 0, -1, 0, -1, 0}, 1997U);
     failures += run_shape(5, 2, {}, {}, 2011U);
     failures += run_shape(5, 3, {}, {}, 2021U);
     failures += run_shape(5, 4, {}, {}, 2031U);

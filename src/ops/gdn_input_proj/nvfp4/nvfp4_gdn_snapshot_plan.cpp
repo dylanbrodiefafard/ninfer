@@ -4,10 +4,13 @@
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
+
+inline constexpr std::int32_t kNvfp4RecordChannels = 10240;
 
 struct Nvfp4GdnProjectedWorkspace {
     Tensor projected;
@@ -35,8 +38,9 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
         throw std::invalid_argument("nvfp4 gdn conv admits only A16 or A4");
     }
     // Width selects the fused family. Snapshot T=2..16 is SmallT GEMM+FP32 conv. Record
-    // B=1 retains fused T=1 GEMV+FP32 conv; B>1 uses request-indexed SmallT CTAs with
-    // the same reduction and BF16 history boundary. Do not flatten to B*W W4A4 compose.
+    // B=1 retains fused T=1 GEMV+FP32 conv. Qualified B>1 W=2/5 shapes pair requests
+    // while retaining the W-local reduction and FP32 conv input; other widths use
+    // request-indexed SmallT CTAs. Do not flatten to B*W W4A4 compose.
     if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
     if (tokens <= kNvfp4LastPackedGdnConvSmallT) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
     if (policy == LinearPolicy::A16Only) {
@@ -66,6 +70,34 @@ std::size_t nvfp4_gdn_snapshot_workspace_capacity_bytes(LinearPolicy policy,
     WorkspaceLayoutBuilder layout;
     (void)allocate_workspace(layout, max_tokens);
     return layout.peak_bytes(1);
+}
+
+std::size_t nvfp4_gdn_record_workspace_capacity_bytes(LinearPolicy policy, std::int32_t batch_size,
+                                                      std::int32_t min_tokens,
+                                                      std::int32_t max_tokens) {
+    if (min_tokens <= 0 || max_tokens < min_tokens || batch_size <= 0 || batch_size > 4) {
+        throw std::invalid_argument("nvfp4 gdn record workspace: invalid B/T domain");
+    }
+    const Nvfp4GdnConvPlan minimum_plan =
+        nvfp4_gdn_conv_resolve_plan(policy, min_tokens, batch_size);
+    const Nvfp4GdnConvPlan maximum_plan =
+        nvfp4_gdn_conv_resolve_plan(policy, max_tokens, batch_size);
+    if (minimum_plan.schedule == Nvfp4GdnConvScheduleId::DecodeFusedA16) {
+        throw std::logic_error("ReplaySSM record planner admitted NVFP4 decode");
+    }
+    if (maximum_plan.schedule == Nvfp4GdnConvScheduleId::SmallTFusedA16) {
+        const bool uses_pair_replay = batch_size > 1 && ((min_tokens <= 2 && max_tokens >= 2) ||
+                                                         (min_tokens <= 5 && max_tokens >= 5));
+        if (!uses_pair_replay) { return 0; }
+        WorkspaceLayoutBuilder layout;
+        (void)layout.alloc(DType::FP32, {kNvfp4RecordChannels, max_tokens, batch_size}, 256);
+        return layout.peak_bytes(1);
+    }
+    if (batch_size > 1) {
+        throw std::logic_error("batched NVFP4 conv-record has no Materialized route");
+    }
+    return nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy::AllowA4, std::max(min_tokens, 4),
+                                                    max_tokens);
 }
 
 void nvfp4_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
