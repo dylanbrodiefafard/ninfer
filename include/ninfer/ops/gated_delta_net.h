@@ -42,9 +42,10 @@ namespace ninfer::ops {
  * criterion, not the oracle. Recurrent implementations may apply the normalization directly;
  * chunked implementations may use private normalized staging. The corresponding private storage
  * is included by gated_delta_net_workspace_capacity_bytes when `normalize_qk` is true.
- * Inputs and out do not overlap state or one another. `ws` supplies transient storage reported by
- * gated_delta_net_workspace_capacity_bytes; scratch is scoped to the call. T may be any positive
- * value.
+ * Inputs and out do not overlap state or one another. q/k/v and state are 16-byte aligned, g/beta
+ * are naturally FP32-aligned, and out is 4-byte aligned. `ws` supplies transient storage reported
+ * by gated_delta_net_workspace_capacity_bytes; the storage allocated by this call does not overlap
+ * any operand and scratch is scoped to the call. T may be any positive value.
  *
  * This overload reads and writes the same `ssm_state`, publishing the state after all T tokens.
  */

@@ -826,6 +826,228 @@ int contract_rejection_cases() {
     return failures;
 }
 
+int storage_contract_cases() {
+    constexpr int qk_heads    = 1;
+    constexpr int value_heads = 1;
+    constexpr int tokens      = 1;
+    const std::size_t qk_bytes =
+        static_cast<std::size_t>(kStateDim * qk_heads * tokens) * sizeof(std::uint16_t);
+    const std::size_t value_bytes =
+        static_cast<std::size_t>(kStateDim * value_heads * tokens) * sizeof(std::uint16_t);
+    const std::size_t control_bytes =
+        static_cast<std::size_t>(value_heads * tokens) * sizeof(float);
+    const std::size_t state_bytes =
+        static_cast<std::size_t>(kStateDim * kStateDim * value_heads) * sizeof(float);
+    const float scale = 1.0f / std::sqrt(static_cast<float>(kStateDim));
+
+    DeviceBuffer q_buffer(qk_bytes + 16);
+    DeviceBuffer k_buffer(qk_bytes);
+    DeviceBuffer v_buffer(value_bytes);
+    DeviceBuffer g_buffer(control_bytes + 4);
+    DeviceBuffer beta_buffer(control_bytes);
+    DeviceBuffer state_buffer(state_bytes + 16);
+    DeviceBuffer state_out_buffer(state_bytes);
+    DeviceBuffer out_buffer(value_bytes + 4);
+    q_buffer.fill(0x11);
+    k_buffer.fill(0x22);
+    v_buffer.fill(0x33);
+    g_buffer.fill(0x44);
+    beta_buffer.fill(0x55);
+    state_buffer.fill(0x66);
+    state_out_buffer.fill(0x77);
+    out_buffer.fill(0x88);
+
+    Tensor q(q_buffer.p, DType::BF16, {kStateDim, qk_heads, tokens});
+    Tensor k(k_buffer.p, DType::BF16, {kStateDim, qk_heads, tokens});
+    Tensor v(v_buffer.p, DType::BF16, {kStateDim, value_heads, tokens});
+    Tensor g(g_buffer.p, DType::FP32, {value_heads, tokens});
+    Tensor beta(beta_buffer.p, DType::FP32, {value_heads, tokens});
+    Tensor state(state_buffer.p, DType::FP32, {kStateDim, kStateDim, value_heads});
+    Tensor state_out(state_out_buffer.p, DType::FP32,
+                     {kStateDim, kStateDim, value_heads});
+    Tensor out(out_buffer.p, DType::BF16, {kStateDim, value_heads, tokens});
+    WorkspaceArena workspace(256);
+
+    auto rejected = [&](const char* label, bool normalize_qk, const Tensor& test_q,
+                        const Tensor& test_k, const Tensor& test_v, const Tensor& test_g,
+                        const Tensor& test_beta, const Tensor& test_state_in,
+                        Tensor& test_state_out, Tensor& test_out, WorkspaceArena& test_workspace) {
+        try {
+            ops::gated_delta_net(test_q, test_k, test_v, test_g, test_beta, scale, normalize_qk,
+                                 test_workspace, test_state_in, test_state_out, test_out, nullptr);
+            cuda_synchronize();
+            std::cerr << "gated_delta_net accepted " << label << '\n';
+            return 1;
+        } catch (const std::invalid_argument&) { return 0; }
+    };
+
+    int failures = 0;
+    Tensor aliased_k(q_buffer.p, DType::BF16, {kStateDim, qk_heads, tokens});
+    failures += rejected("overlapping q/k", true, q, aliased_k, v, g, beta, state, state_out,
+                         out, workspace);
+    Tensor aliased_out(q_buffer.p, DType::BF16, {kStateDim, value_heads, tokens});
+    failures += rejected("overlapping q/out", true, q, k, v, g, beta, state, state_out,
+                         aliased_out, workspace);
+    Tensor state_backed_q(state_buffer.p, DType::BF16, {kStateDim, qk_heads, tokens});
+    failures += rejected("overlapping q/state", true, state_backed_q, k, v, g, beta, state,
+                         state_out, out, workspace);
+    Tensor partial_state_out(static_cast<std::byte*>(state_buffer.p) + 16, DType::FP32,
+                             {kStateDim, kStateDim, value_heads});
+    failures += rejected("partially overlapping state", true, q, k, v, g, beta, state,
+                         partial_state_out, out, workspace);
+    Tensor misaligned_q(static_cast<std::byte*>(q_buffer.p) + 2, DType::BF16,
+                        {kStateDim, qk_heads, tokens});
+    failures += rejected("misaligned q", true, misaligned_q, k, v, g, beta, state, state_out,
+                         out, workspace);
+    Tensor misaligned_k(static_cast<std::byte*>(k_buffer.p) + 2, DType::BF16,
+                        {kStateDim, qk_heads, tokens});
+    failures += rejected("misaligned k", true, q, misaligned_k, v, g, beta, state, state_out,
+                         out, workspace);
+    Tensor misaligned_v(static_cast<std::byte*>(v_buffer.p) + 2, DType::BF16,
+                        {kStateDim, value_heads, tokens});
+    failures += rejected("misaligned v", true, q, k, misaligned_v, g, beta, state, state_out,
+                         out, workspace);
+    Tensor misaligned_g(static_cast<std::byte*>(g_buffer.p) + 2, DType::FP32,
+                        {value_heads, tokens});
+    failures += rejected("misaligned g", true, q, k, v, misaligned_g, beta, state, state_out,
+                         out, workspace);
+    Tensor misaligned_beta(static_cast<std::byte*>(beta_buffer.p) + 2, DType::FP32,
+                           {value_heads, tokens});
+    failures += rejected("misaligned beta", true, q, k, v, g, misaligned_beta, state, state_out,
+                         out, workspace);
+    Tensor misaligned_state(static_cast<std::byte*>(state_buffer.p) + 4, DType::FP32,
+                            {kStateDim, kStateDim, value_heads});
+    failures += rejected("misaligned state", true, q, k, v, g, beta, misaligned_state,
+                         state_out, out, workspace);
+    Tensor misaligned_state_out(static_cast<std::byte*>(state_out_buffer.p) + 4, DType::FP32,
+                                {kStateDim, kStateDim, value_heads});
+    failures += rejected("misaligned state_out", true, q, k, v, g, beta, state,
+                         misaligned_state_out, out, workspace);
+    Tensor misaligned_out(static_cast<std::byte*>(out_buffer.p) + 2, DType::BF16,
+                          {kStateDim, value_heads, tokens});
+    failures += rejected("misaligned out", true, q, k, v, g, beta, state, state_out,
+                         misaligned_out, workspace);
+
+    try {
+        ops::gated_delta_net(misaligned_q, k, v, g, beta, scale, true, workspace, state, out,
+                             nullptr);
+        cuda_synchronize();
+        std::cerr << "gated_delta_net in-place accepted misaligned q\n";
+        ++failures;
+    } catch (const std::invalid_argument&) {}
+
+    const std::uintptr_t overflowing_address =
+        (std::numeric_limits<std::uintptr_t>::max() - qk_bytes / 2) & ~std::uintptr_t{15};
+    Tensor overflowing_q(reinterpret_cast<void*>(overflowing_address), DType::BF16,
+                         {kStateDim, qk_heads, tokens});
+    failures += rejected("overflowing q range", true, overflowing_q, k, v, g, beta, state,
+                         state_out, out, workspace);
+
+    failures += verify_exact("rejected q sentinel", from_device<std::uint8_t>(q_buffer, q_buffer.bytes),
+                             std::vector<std::uint8_t>(q_buffer.bytes, 0x11));
+    failures += verify_exact("rejected state sentinel",
+                             from_device<std::uint8_t>(state_buffer, state_buffer.bytes),
+                             std::vector<std::uint8_t>(state_buffer.bytes, 0x66));
+    failures += verify_exact("rejected state-out sentinel",
+                             from_device<std::uint8_t>(state_out_buffer, state_out_buffer.bytes),
+                             std::vector<std::uint8_t>(state_out_buffer.bytes, 0x77));
+    failures += verify_exact("rejected out sentinel",
+                             from_device<std::uint8_t>(out_buffer, out_buffer.bytes),
+                             std::vector<std::uint8_t>(out_buffer.bytes, 0x88));
+
+    constexpr int chunk_tokens = 64;
+    const std::size_t chunk_qk_bytes =
+        static_cast<std::size_t>(kStateDim * qk_heads * chunk_tokens) * sizeof(std::uint16_t);
+    const std::size_t chunk_control_bytes =
+        static_cast<std::size_t>(value_heads * chunk_tokens) * sizeof(float);
+    const std::size_t scratch_bytes = ops::gated_delta_net_workspace_capacity_bytes(
+        qk_heads, value_heads, true, chunk_tokens, chunk_tokens);
+    const std::size_t q_offset = (scratch_bytes + 255) & ~std::size_t{255};
+    DeviceBuffer borrowed_storage(q_offset + chunk_qk_bytes);
+    DeviceBuffer chunk_k(chunk_qk_bytes);
+    DeviceBuffer chunk_v(chunk_qk_bytes);
+    DeviceBuffer chunk_g(chunk_control_bytes);
+    DeviceBuffer chunk_beta(chunk_control_bytes);
+    DeviceBuffer chunk_state(state_bytes);
+    DeviceBuffer chunk_state_out(state_bytes);
+    DeviceBuffer chunk_out(chunk_qk_bytes);
+    borrowed_storage.fill();
+    chunk_k.fill();
+    chunk_v.fill();
+    chunk_g.fill();
+    chunk_beta.fill();
+    chunk_state.fill();
+    chunk_state_out.fill();
+    chunk_out.fill(0x99);
+    Tensor chunk_k_tensor(chunk_k.p, DType::BF16, {kStateDim, qk_heads, chunk_tokens});
+    Tensor chunk_v_tensor(chunk_v.p, DType::BF16, {kStateDim, value_heads, chunk_tokens});
+    Tensor chunk_g_tensor(chunk_g.p, DType::FP32, {value_heads, chunk_tokens});
+    Tensor chunk_beta_tensor(chunk_beta.p, DType::FP32, {value_heads, chunk_tokens});
+    Tensor chunk_state_tensor(chunk_state.p, DType::FP32,
+                              {kStateDim, kStateDim, value_heads});
+    Tensor chunk_state_out_tensor(chunk_state_out.p, DType::FP32,
+                                  {kStateDim, kStateDim, value_heads});
+    Tensor chunk_out_tensor(chunk_out.p, DType::BF16,
+                            {kStateDim, value_heads, chunk_tokens});
+
+    Tensor overlapping_chunk_q(borrowed_storage.p, DType::BF16,
+                               {kStateDim, qk_heads, chunk_tokens});
+    WorkspaceArena overlapping_workspace(
+        DeviceSpan{borrowed_storage.p, borrowed_storage.bytes});
+    failures += rejected("input/scratch overlap", true, overlapping_chunk_q, chunk_k_tensor,
+                         chunk_v_tensor, chunk_g_tensor, chunk_beta_tensor, chunk_state_tensor,
+                         chunk_state_out_tensor, chunk_out_tensor, overlapping_workspace);
+    if (overlapping_workspace.used() != 0) {
+        std::cerr << "gated_delta_net did not restore workspace after rejection\n";
+        ++failures;
+    }
+    failures += verify_exact("scratch-overlap state sentinel",
+                             from_device<std::uint8_t>(chunk_state, chunk_state.bytes),
+                             std::vector<std::uint8_t>(chunk_state.bytes, 0));
+    failures += verify_exact("scratch-overlap out sentinel",
+                             from_device<std::uint8_t>(chunk_out, chunk_out.bytes),
+                             std::vector<std::uint8_t>(chunk_out.bytes, 0x99));
+
+    const std::size_t raw_scratch_bytes = ops::gated_delta_net_workspace_capacity_bytes(
+        qk_heads, value_heads, false, chunk_tokens, chunk_tokens);
+    constexpr std::size_t prefix_bytes = 256;
+    DeviceBuffer raw_borrowed_storage(prefix_bytes + raw_scratch_bytes + chunk_qk_bytes);
+    raw_borrowed_storage.fill();
+    WorkspaceArena raw_workspace(
+        DeviceSpan{raw_borrowed_storage.p, raw_borrowed_storage.bytes});
+    (void)raw_workspace.alloc_bytes(prefix_bytes);
+    const std::size_t saved_workspace_offset = raw_workspace.used();
+    Tensor stage_overlapping_q(static_cast<std::byte*>(raw_borrowed_storage.p) + prefix_bytes,
+                               DType::BF16, {kStateDim, qk_heads, chunk_tokens});
+    failures += rejected("input/stage overlap after arena prefix", false, stage_overlapping_q,
+                         chunk_k_tensor, chunk_v_tensor, chunk_g_tensor, chunk_beta_tensor,
+                         chunk_state_tensor, chunk_state_out_tensor, chunk_out_tensor,
+                         raw_workspace);
+    if (raw_workspace.used() != saved_workspace_offset) {
+        std::cerr << "gated_delta_net did not restore the nonzero workspace cursor\n";
+        ++failures;
+    }
+
+    Tensor disjoint_chunk_q(static_cast<std::byte*>(borrowed_storage.p) + q_offset, DType::BF16,
+                            {kStateDim, qk_heads, chunk_tokens});
+    WorkspaceArena nested_workspace(DeviceSpan{borrowed_storage.p, borrowed_storage.bytes});
+    try {
+        ops::gated_delta_net(disjoint_chunk_q, chunk_k_tensor, chunk_v_tensor, chunk_g_tensor,
+                             chunk_beta_tensor, scale, true, nested_workspace, chunk_state_tensor,
+                             chunk_state_out_tensor, chunk_out_tensor, nullptr);
+        cuda_synchronize();
+    } catch (const std::exception& error) {
+        std::cerr << "gated_delta_net rejected disjoint storage inside arena capacity: "
+                  << error.what() << '\n';
+        ++failures;
+    }
+    if (nested_workspace.used() != 0) {
+        std::cerr << "gated_delta_net did not restore nested workspace\n";
+        ++failures;
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -867,6 +1089,7 @@ int main() {
         ++failures;
     } catch (const std::invalid_argument&) {}
     failures += contract_rejection_cases();
+    failures += storage_contract_cases();
 
     // Registered 27B/35B-A3B geometries, public state forms, and the recurrent/chunk/tail route
     // boundary are all qualified directly against the same complete FP64 recurrence.
