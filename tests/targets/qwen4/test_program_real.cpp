@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <span>
@@ -27,8 +28,18 @@ namespace {
 
 constexpr std::int32_t kVocabulary = 248320;
 constexpr std::int32_t kEos = verifier::kPleResetToken;
-constexpr std::array<std::int32_t, 4> kInputs = {48, 16451, 17120, 22188};
-constexpr std::array<std::int32_t, 4> kTargets = {16451, 17120, 22188, 11988};
+constexpr std::array<std::int32_t, 5> kTeacherForcedTokens = {
+    48, 16451, 17120, 22188, 11988};
+constexpr auto kInputs = [] {
+    std::array<std::int32_t, kTeacherForcedTokens.size() - 1> result{};
+    std::copy_n(kTeacherForcedTokens.begin(), result.size(), result.begin());
+    return result;
+}();
+constexpr auto kTargets = [] {
+    std::array<std::int32_t, kTeacherForcedTokens.size() - 1> result{};
+    std::copy_n(kTeacherForcedTokens.begin() + 1, result.size(), result.begin());
+    return result;
+}();
 // The first four values from the pinned 601-token llama.cpp trace are mirrored from
 // fixtures/external_ppl_manifest.json. This prefix remains useful localization evidence, but the
 // complete trace has 33/600 deltas above one nat and is an unresolved integration discrepancy,
@@ -37,6 +48,8 @@ constexpr std::array<double, 4> kExternalPairedPrefixNll = {
     3.0563440376731457, 13.217154127288497, 12.015043390206641, 8.821618971613773};
 constexpr double kPrefixMaximumAbsoluteNllDelta = 1.0;
 constexpr double kPrefixMaximumMeanAbsoluteNllDelta = 0.5;
+constexpr double kNllAbsoluteTolerance = 2.0e-3;
+constexpr double kNllRelativeTolerance = 1.0e-5;
 constexpr std::array<std::uint64_t, 3> kMultiplier = {
     23703573157769ULL, 20109073645365ULL, 8052911324071ULL};
 constexpr std::array<std::int32_t, 16> kPrime = {
@@ -78,6 +91,27 @@ bool finite_bf16(std::span<const std::uint16_t> values) {
     return std::all_of(values.begin(), values.end(), [](std::uint16_t bits) {
         return (bits & 0x7f80U) != 0x7f80U;
     });
+}
+
+float bf16_to_f32(std::uint16_t bits) {
+    return std::bit_cast<float>(static_cast<std::uint32_t>(bits) << 16U);
+}
+
+double represented_nll_oracle(std::span<const std::uint16_t> logits,
+                              std::int32_t target) {
+    if (logits.size() != kVocabulary || target < 0 || target >= kVocabulary) {
+        throw std::logic_error("Program NLL oracle received malformed represented inputs");
+    }
+    double maximum = -std::numeric_limits<double>::infinity();
+    for (std::uint16_t bits : logits) {
+        maximum = std::max(maximum, static_cast<double>(bf16_to_f32(bits)));
+    }
+    double exponential_sum = 0.0;
+    for (std::uint16_t bits : logits) {
+        exponential_sum += std::exp(static_cast<double>(bf16_to_f32(bits)) - maximum);
+    }
+    return maximum + std::log(exponential_sum) -
+           static_cast<double>(bf16_to_f32(logits[static_cast<std::size_t>(target)]));
 }
 
 std::int64_t signed_u64(std::uint64_t value) { return std::bit_cast<std::int64_t>(value); }
@@ -255,6 +289,7 @@ TokenSnapshot snapshot_and_validate(const verifier::TokenResultView& result,
                                     const verifier::State& state,
                                     const std::array<std::int32_t, 16>& expected_rows,
                                     const std::array<std::int32_t, 2>& expected_history,
+                                    std::int32_t target,
                                     int& failures) {
     TokenSnapshot snapshot;
     snapshot.logits = copy_tensor<std::uint16_t>(result.logits);
@@ -262,10 +297,20 @@ TokenSnapshot snapshot_and_validate(const verifier::TokenResultView& result,
     snapshot.ple_rows = copy_tensor<std::int32_t>(result.ple_row_ids);
     const auto nll = copy_tensor<float>(result.nll);
     snapshot.nll_bits = std::bit_cast<std::uint32_t>(nll[0]);
+    const double expected_nll = represented_nll_oracle(snapshot.logits, target);
+    const double nll_tolerance =
+        kNllAbsoluteTolerance + kNllRelativeTolerance * std::abs(expected_nll);
     if (!finite_bf16(snapshot.logits) || !finite_bf16(snapshot.final_hidden) ||
         !std::isfinite(nll[0]) || nll[0] < 0.0F ||
         !std::equal(snapshot.ple_rows.begin(), snapshot.ple_rows.end(), expected_rows.begin())) {
         std::cerr << "non-finite output/NLL or wrong PLE rows at token " << result.token_index
+                  << '\n';
+        ++failures;
+    }
+    if (std::abs(static_cast<double>(nll[0]) - expected_nll) > nll_tolerance) {
+        std::cerr << "Program NLL does not match its represented BF16 logits at token "
+                  << result.token_index << " actual=" << nll[0]
+                  << " reference=" << expected_nll << " tolerance=" << nll_tolerance
                   << '\n';
         ++failures;
     }
@@ -373,7 +418,8 @@ int main() {
                     ++failures;
                 }
                 TokenSnapshot snapshot = snapshot_and_validate(
-                    result, program.state(), expected_rows, history, failures);
+                    result, program.state(), expected_rows, history, kTargets[token],
+                    failures);
                 nlls[replay].push_back(std::bit_cast<float>(snapshot.nll_bits));
                 runs[replay].push_back(std::move(snapshot));
             }
