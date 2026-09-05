@@ -130,6 +130,10 @@ struct Qwen4SparseMoePrefillPipeline {
 [[nodiscard]] std::size_t qwen4_sparse_moe_prefill_workspace_capacity_bytes(
     std::int32_t width);
 
+/** Caller-owned transient device capacity for qwen4_sparse_moe_resident at exact width T. */
+[[nodiscard]] std::size_t qwen4_sparse_moe_resident_workspace_capacity_bytes(
+    std::int32_t width);
+
 /**
  * Op: qwen4_sparse_moe
  *
@@ -195,19 +199,27 @@ void qwen4_sparse_moe_prefill(const Tensor& x, const Qwen4SparseMoeWeights& weig
 /**
  * Op: qwen4_sparse_moe_resident
  *
- * Computes the same complete C=1/T=1 formula, observable route outputs, represented-format
- * decoding, BF16 projection/SwiGLU seams, rank-ordered FP32 routed accumulation, shared branch,
- * and BF16 Store result as qwen4_sparse_moe. The routed gate/up banks are instead complete
+ * Computes the same complete formula, observable route outputs, represented-format decoding,
+ * BF16 projection/SwiGLU seams, rank-ordered FP32 routed accumulation, shared branch, and BF16
+ * Store result as qwen4_sparse_moe independently for every token. x/destination are contiguous
+ * BF16 [2560,T], selected_ids are I32 [10,T], and selected_weights are FP32 [10,T], with
+ * rank-fastest route storage and T in [1,4096]. The routed gate/up banks are complete
  * device-resident rank-three IQ1_S or IQ2_XXS weights [512,640,2560]; routed down is a complete
- * device-resident IQ4_NL weight [512,2560,640]. GPU-produced selected_ids dynamically index all
- * three banks. No selected id or weight byte crosses to the host, and the Op performs no copy,
- * host synchronization, event operation, allocation, or runtime repack.
+ * device-resident IQ4_NL weight [512,2560,640]. Same-expert selections across tokens remain
+ * independent occurrences. GPU-produced selected_ids dynamically index all three banks. No
+ * selected id or weight byte crosses to the host, and the Op performs no copy, host
+ * synchronization, event operation, allocation, or runtime repack.
  *
  * All inputs and weights are read-only. selected_ids, selected_weights, destination, and workspace
- * are pairwise disjoint from every input and weight. The same independent complete FP64 oracle and
- * output criteria used by qwen4_sparse_moe qualify this implementation. Work is enqueued on stream;
- * the caller owns every device allocation and must retain it through stream completion. This eager
- * verifier implementation is not CUDA-Graph qualified.
+ * are pairwise disjoint from every input and weight. The width-specific workspace query is the
+ * exact caller-owned capacity contract. T=1 retains the scalar fused implementation. Private
+ * small-T dispatch repeats that implementation, while sufficiently wide calls use device-only
+ * route grouping and exact-format expert aggregation; grouping order is private because every
+ * occurrence writes its unique rank/token slot before the observable rank-order merge. The same
+ * independent complete FP64 oracle and per-token output criteria used by
+ * qwen4_sparse_moe qualify this implementation. Work is enqueued on stream; the caller owns every
+ * device allocation and must retain it through stream completion. This eager verifier
+ * implementation is not CUDA-Graph qualified.
  */
 void qwen4_sparse_moe_resident(const Tensor& x,
                                const Qwen4ResidentSparseMoeWeights& weights,

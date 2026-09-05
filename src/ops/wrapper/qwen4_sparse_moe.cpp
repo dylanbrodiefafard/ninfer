@@ -20,6 +20,8 @@
 namespace ninfer::ops {
 namespace {
 
+constexpr std::int32_t kResidentGroupedMinWidth = 256;
+
 struct BlockGeometry {
     std::uint32_t values;
     std::uint32_t bytes;
@@ -66,11 +68,12 @@ void require_tensor(const Tensor& tensor, DType dtype, std::int32_t n0, const ch
 }
 
 void require_matrix_tensor(const Tensor& tensor, DType dtype, std::int32_t n0,
-                           std::int32_t width, const char* name) {
+                           std::int32_t width, const char* name,
+                           const char* operation = "qwen4_sparse_moe_prefill") {
     if (width <= 0 || width > kQwen4SparseMoePrefillMaxWidth || tensor.dtype != dtype ||
         tensor.ne[0] != n0 || tensor.ne[1] != width || tensor.ne[2] != 1 ||
         tensor.ne[3] != 1 || !tensor.is_contiguous() || !aligned_to(tensor.data, 16)) {
-        throw std::invalid_argument(std::string("qwen4_sparse_moe_prefill: invalid ") + name);
+        throw std::invalid_argument(std::string(operation) + ": invalid " + name);
     }
 }
 
@@ -165,6 +168,21 @@ struct ResidentScratch {
     Tensor routed_activated;
 };
 
+struct ResidentWideScratch {
+    Tensor logits;
+    Tensor shared_gate_value;
+    Tensor shared_gate_projection;
+    Tensor shared_up;
+    Tensor shared;
+    Tensor routed_gate;
+    Tensor routed_up;
+    Tensor rank_results;
+    Tensor expert_counts;
+    Tensor expert_offsets;
+    Tensor expert_cursors;
+    Tensor occurrence_slots;
+};
+
 struct PrefillScratch {
     Tensor logits;
     Tensor shared_gate_value;
@@ -211,6 +229,27 @@ ResidentScratch allocate_resident_scratch(Allocator& allocator) {
     };
 }
 
+template <class Allocator>
+ResidentWideScratch allocate_resident_wide_scratch(Allocator& allocator,
+                                                   std::int32_t width) {
+    const std::int32_t occurrences = kQwen4SparseMoeTopK * width;
+    return {
+        allocator.alloc(DType::FP32, {kQwen4SparseMoeExperts, width}),
+        allocator.alloc(DType::FP32, {width}),
+        allocator.alloc(DType::BF16, {kQwen4SparseMoeIntermediate, width}),
+        allocator.alloc(DType::BF16, {kQwen4SparseMoeIntermediate, width}),
+        allocator.alloc(DType::BF16, {kQwen4SparseMoeHidden, width}),
+        allocator.alloc(DType::BF16, {kQwen4SparseMoeIntermediate, occurrences}),
+        allocator.alloc(DType::BF16, {kQwen4SparseMoeIntermediate, occurrences}),
+        allocator.alloc(DType::BF16,
+                        {kQwen4SparseMoeHidden, kQwen4SparseMoeTopK, width}),
+        allocator.alloc(DType::I32, {kQwen4SparseMoeExperts}),
+        allocator.alloc(DType::I32, {kQwen4SparseMoeExperts}),
+        allocator.alloc(DType::I32, {kQwen4SparseMoeExperts}),
+        allocator.alloc(DType::I32, {occurrences}),
+    };
+}
+
 std::size_t required_workspace() {
     WorkspaceLayoutBuilder staged_layout;
     (void)allocate_scratch(staged_layout);
@@ -224,6 +263,20 @@ std::size_t required_workspace() {
 std::size_t required_prefill_workspace(std::int32_t width) {
     WorkspaceLayoutBuilder layout;
     (void)allocate_prefill_scratch(layout, width);
+    return layout.peak_bytes();
+}
+
+
+std::size_t required_resident_workspace(std::int32_t width) {
+    WorkspaceLayoutBuilder layout;
+    if (width == 1) {
+        (void)allocate_resident_scratch(layout);
+    } else if (width < kResidentGroupedMinWidth) {
+        // The scalar implementation reuses one token's scratch serially.
+        (void)allocate_resident_scratch(layout);
+    } else {
+        (void)allocate_resident_wide_scratch(layout, width);
+    }
     return layout.peak_bytes();
 }
 
@@ -298,6 +351,14 @@ std::size_t qwen4_sparse_moe_prefill_workspace_capacity_bytes(std::int32_t width
             "qwen4_sparse_moe_prefill_workspace_capacity_bytes: width must be in [1,4096]");
     }
     return required_prefill_workspace(width);
+}
+
+std::size_t qwen4_sparse_moe_resident_workspace_capacity_bytes(std::int32_t width) {
+    if (width <= 0 || width > kQwen4SparseMoePrefillMaxWidth) {
+        throw std::invalid_argument(
+            "qwen4_sparse_moe_resident_workspace_capacity_bytes: width must be in [1,4096]");
+    }
+    return required_resident_workspace(width);
 }
 
 void qwen4_sparse_moe(const Tensor& x, const Qwen4SparseMoeWeights& weights,
@@ -778,11 +839,16 @@ void qwen4_sparse_moe_resident(const Tensor& x,
                                Tensor& selected_ids, Tensor& selected_weights,
                                Tensor& destination, WorkspaceArena& workspace,
                                cudaStream_t stream) {
-    require_tensor(x, DType::BF16, kQwen4SparseMoeHidden, "x");
+    const std::int32_t width = x.ne[1];
+    require_matrix_tensor(x, DType::BF16, kQwen4SparseMoeHidden, width, "x",
+                          "qwen4_sparse_moe_resident");
     require_tensor(weights.shared_gate, DType::FP32, kQwen4SparseMoeHidden, "shared_gate");
-    require_tensor(selected_ids, DType::I32, kQwen4SparseMoeTopK, "selected_ids");
-    require_tensor(selected_weights, DType::FP32, kQwen4SparseMoeTopK, "selected_weights");
-    require_tensor(destination, DType::BF16, kQwen4SparseMoeHidden, "destination");
+    require_matrix_tensor(selected_ids, DType::I32, kQwen4SparseMoeTopK, width,
+                          "selected_ids", "qwen4_sparse_moe_resident");
+    require_matrix_tensor(selected_weights, DType::FP32, kQwen4SparseMoeTopK, width,
+                          "selected_weights", "qwen4_sparse_moe_resident");
+    require_matrix_tensor(destination, DType::BF16, kQwen4SparseMoeHidden, width,
+                          "destination", "qwen4_sparse_moe_resident");
     require_dense_router(weights.router);
     const QType routed_qtype = weights.routed_gate.qtype;
     if ((routed_qtype != QType::GGML_IQ1_S && routed_qtype != QType::GGML_IQ2_XXS) ||
@@ -809,7 +875,9 @@ void qwen4_sparse_moe_resident(const Tensor& x,
                         kQwen4SparseMoeIntermediate, kQwen4SparseMoeHidden, "shared_up");
     require_ggml_weight(weights.shared_down, QType::GGML_Q8_0, 1, kQwen4SparseMoeHidden,
                         kQwen4SparseMoeIntermediate, "shared_down");
-    if (workspace.base() == nullptr || workspace.capacity() < required_workspace()) {
+    const std::size_t required = required_resident_workspace(width);
+    if (workspace.base() == nullptr || workspace.capacity() < required ||
+        workspace.used() > workspace.capacity() - required) {
         throw std::invalid_argument("qwen4_sparse_moe_resident: insufficient workspace");
     }
 
@@ -835,20 +903,73 @@ void qwen4_sparse_moe_resident(const Tensor& x,
     require_disjoint(ranges);
 
     auto scope = workspace.scope();
-    ResidentScratch scratch = allocate_resident_scratch(workspace);
-    detail::qwen4_sparse_moe_resident_route_launch(
+    if (width < kResidentGroupedMinWidth) {
+        ResidentScratch scratch = allocate_resident_scratch(workspace);
+        for (std::int32_t token = 0; token < width; ++token) {
+            auto* x_data = static_cast<std::byte*>(x.data) +
+                           static_cast<std::size_t>(token) * kQwen4SparseMoeHidden *
+                               sizeof(std::uint16_t);
+            auto* ids_data = static_cast<std::byte*>(selected_ids.data) +
+                             static_cast<std::size_t>(token) * kQwen4SparseMoeTopK *
+                                 sizeof(std::int32_t);
+            auto* selected_data = static_cast<std::byte*>(selected_weights.data) +
+                                  static_cast<std::size_t>(token) * kQwen4SparseMoeTopK *
+                                      sizeof(float);
+            auto* destination_data = static_cast<std::byte*>(destination.data) +
+                                     static_cast<std::size_t>(token) *
+                                         kQwen4SparseMoeHidden * sizeof(std::uint16_t);
+            Tensor token_x(x_data, DType::BF16, {kQwen4SparseMoeHidden});
+            Tensor token_ids(ids_data, DType::I32, {kQwen4SparseMoeTopK});
+            Tensor token_weights(selected_data, DType::FP32, {kQwen4SparseMoeTopK});
+            Tensor token_destination(destination_data, DType::BF16,
+                                     {kQwen4SparseMoeHidden});
+            detail::qwen4_sparse_moe_resident_route_launch(
+                token_x, weights.router, weights.shared_gate, scratch.logits, token_ids,
+                token_weights, scratch.shared_gate_value, stream);
+            detail::qwen4_sparse_moe_shared_gate_up_swiglu_launch(
+                token_x, weights.shared_gate_proj, weights.shared_up,
+                scratch.shared_activated, stream);
+            ggml_block_linear(scratch.shared_activated, weights.shared_down, scratch.shared,
+                              stream);
+            detail::qwen4_sparse_moe_indexed_gate_up_swiglu_launch(
+                token_x, weights.routed_gate, weights.routed_up, token_ids,
+                scratch.routed_activated, stream);
+            detail::qwen4_sparse_moe_indexed_down_finish_launch(
+                scratch.routed_activated, weights.routed_down, token_ids, token_weights,
+                scratch.shared, scratch.shared_gate_value, token_destination, stream);
+        }
+        return;
+    }
+
+    ResidentWideScratch scratch = allocate_resident_wide_scratch(workspace, width);
+    detail::qwen4_sparse_moe_resident_wide_route_launch(
         x, weights.router, weights.shared_gate, scratch.logits, selected_ids,
         selected_weights, scratch.shared_gate_value, stream);
-    detail::qwen4_sparse_moe_shared_gate_up_swiglu_launch(
-        x, weights.shared_gate_proj, weights.shared_up, scratch.shared_activated, stream);
-    ggml_block_linear(scratch.shared_activated, weights.shared_down, scratch.shared, stream);
+    ggml_block_linear(x, weights.shared_gate_proj, scratch.shared_gate_projection, stream);
+    ggml_block_linear(x, weights.shared_up, scratch.shared_up, stream);
+    detail::qwen4_sparse_moe_swiglu_launch(
+        scratch.shared_gate_projection, scratch.shared_up,
+        scratch.shared_gate_projection, stream);
+    ggml_block_linear(scratch.shared_gate_projection, weights.shared_down, scratch.shared,
+                      stream);
 
-    detail::qwen4_sparse_moe_indexed_gate_up_swiglu_launch(
-        x, weights.routed_gate, weights.routed_up, selected_ids, scratch.routed_activated,
-        stream);
-    detail::qwen4_sparse_moe_indexed_down_finish_launch(
-        scratch.routed_activated, weights.routed_down, selected_ids, selected_weights,
-        scratch.shared, scratch.shared_gate_value, destination, stream);
+    detail::qwen4_sparse_moe_resident_group_launch(
+        selected_ids, scratch.expert_counts, scratch.expert_offsets,
+        scratch.expert_cursors, scratch.occurrence_slots, stream);
+    detail::qwen4_sparse_moe_resident_grouped_gate_up_launch(
+        x, weights.routed_gate, scratch.expert_counts, scratch.expert_offsets,
+        scratch.occurrence_slots, scratch.routed_gate, stream);
+    detail::qwen4_sparse_moe_resident_grouped_gate_up_launch(
+        x, weights.routed_up, scratch.expert_counts, scratch.expert_offsets,
+        scratch.occurrence_slots, scratch.routed_up, stream);
+    detail::qwen4_sparse_moe_swiglu_launch(
+        scratch.routed_gate, scratch.routed_up, scratch.routed_gate, stream);
+    detail::qwen4_sparse_moe_resident_grouped_down_launch(
+        scratch.routed_gate, weights.routed_down, scratch.expert_counts,
+        scratch.expert_offsets, scratch.occurrence_slots, scratch.rank_results, stream);
+    detail::qwen4_sparse_moe_prefill_finish_launch(
+        scratch.rank_results, selected_weights, scratch.shared,
+        scratch.shared_gate_value, destination, stream);
 }
 
 } // namespace ninfer::ops

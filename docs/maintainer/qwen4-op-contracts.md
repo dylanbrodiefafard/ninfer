@@ -665,17 +665,21 @@ not duplicate staged matrix bytes, and the Op performs no allocation or floating
 The host scratch is four-byte aligned and mutually disjoint from both mapped banks and the pinned
 stage; the same fixed-compute-stream rule protects cross-call slot reuse.
 
-The same semantic Op also has a device-resident verifier profile. Its routed gate and up operands
-are complete rank-three IQ1_S or IQ2_XXS banks `[512,640,2560]`, and routed down is the complete
-IQ4_NL bank `[512,2560,640]`. A resident-only deterministic bitonic route orders raw logits by
-descending score and then ascending expert id. One two-dimensional grid computes all ten routed
-gate/up pairs and their BF16 SwiGLU seam; one down/finish grid visits ranks in order, preserves the
-BF16 routed-down seam, and accumulates in FP32. The shared Q5_K/Q6_K gate/up projections and SwiGLU
-are fused, and a 513th router CTA computes the shared scalar gate. The profile performs no transfer,
-host synchronization, event operation, or runtime repack. The staged route and kernels remain
-separate and unchanged. The one-layer placement benchmark owns full device banks and reports both
-a fixed hot route and rotating windows covering all 512 experts. It is not a claim that the
-48-layer preview artifact fits one RTX 5090 or authority to change the live verifier's placement.
+The same semantic Op also has a device-resident T=1..4096 verifier profile. Its routed gate and up
+operands are complete rank-three IQ1_S or IQ2_XXS banks `[512,640,2560]`, and routed down is the
+complete IQ4_NL bank `[512,2560,640]`. T below 256 repeats the exact scalar fused route because the
+measured fixed grouping and launch overhead outweighs its reuse benefit at short widths. At T>=256,
+a 16-token FP32 router tile reads
+each router row once per tile, then device histogram/prefix/scatter stages only integer occurrence
+indices by expert. Grouped GGML kernels reuse each exact packed row across as many as 16 occurrences
+and BF16-store gate/up, SwiGLU, and down projection seams. Each down result lands in its unique
+rank-token slot; the final kernel visits ranks zero through nine in order and accumulates in FP32.
+The shared Q5_K/Q6_K and Q8_0 branch uses the existing T-wide aggregate kernels. The profile
+performs no transfer, host synchronization, event operation, allocation, or runtime repack. The
+mapped-host staged route and current Program placement remain separate and unchanged. The one-layer
+placement benchmark owns full device banks and reports both a fixed hot route and rotating windows;
+at T>=52 the rotating profile covers all 512 experts. It is not a claim that the 48-layer preview
+artifact fits one RTX 5090 or authority to change the live verifier's placement.
 
 The complete closed Op, not private router or expert stages, owns the oracle. Qualification includes
 all-zero router logits selecting ids `0..9` with weights exactly `0.1` in the ideal oracle, a
@@ -685,9 +689,14 @@ shared gate/up codecs, exact host/device staged bytes, and actual T=1 shapes. It
 decodes IQ1_S/IQ2_XXS, IQ4_NL, Q5_K/Q6_K, and Q8_0 independently and evaluates the complete ideal formula.
 The verifier's private BF16 projection/SwiGLU storage and FP32 routing/accumulation profile are
 qualified with fixed normwise and finite gross criteria; they are not copied into the ideal oracle.
-The T-wide profile additionally covers duplicate-token routes, both routed/shared codec pairs, a
-70-unique-expert panel that forces 32/32/6 grouping and slot reuse, exact staged bytes and
-occurrence order, and complete FP64 output. Batched C lanes remain future registered-target work.
+The T-wide profiles additionally cover duplicate-token routes, both routed/shared codec pairs, a
+70-unique-expert panel that forces 32/32/6 mapped-stage grouping and slot reuse, exact staged bytes
+and occurrence order, and complete FP64 output. The resident grouped path is checked independently
+at T=257 with three alternating nonzero represented inputs, two distinct route sets, same-expert
+reuse across different inputs, back-to-back workspace reuse, exact route outputs, and per-token
+complete FP64 output criteria. A T=4096 all-zero-input run checks maximum capacity, guards, and
+lower-id ties without weakening the nonzero oracle witness. Batched C lanes remain future
+registered-target work.
 
 ## 10. Schedule-owned transactions are not Ops
 

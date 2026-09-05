@@ -415,6 +415,31 @@ temporary verifier. Architecture-transferable performance work remains the fully
 Q5_K compute path, with the already-qualified long-frontier QSA route retained unchanged until a
 measured public-Op candidate wins.
 
+A later resident-width tranche generalized that same semantic Op to T=1..4096 without changing
+the mapped-host Program placement. T<256 repeats the accepted scalar implementation; T>=256 uses a
+16-token router tile, device-only expert occurrence grouping, and grouped exact GGML projections.
+At T=16 and T=64, the retained public entry remained the scalar route and matched its direct repeat
+baseline within measurement noise. At the T=256 grouped-route cutoff, five-repetition scalar/grouped
+GPU times were 31.994/14.395 ms and 34.882/22.871 ms for IQ1_S/Q5_K fixed-hot/rotating,
+30.433/13.377 ms and 33.953/21.280 ms for IQ2_XXS/Q5_K, and 29.907/13.252 ms and
+33.467/21.252 ms for IQ2_XXS/Q6_K. At T=512, five-repetition GPU times for scalar/grouped were
+63.995/29.512 ms (IQ1_S/Q5_K fixed-hot), 69.595/26.025 ms (IQ1_S/Q5_K rotating),
+60.848/27.445 ms and 67.354/24.148 ms (IQ2_XXS/Q5_K), and 59.793/27.354 ms and
+66.360/24.085 ms (IQ2_XXS/Q6_K). At T=4096, three-repetition scalar/grouped times were
+511.918/242.198 ms and 556.770/143.870 ms for IQ1_S/Q5_K, 486.944/225.103 ms and
+542.512/134.994 ms for IQ2_XXS/Q5_K, and 478.827/225.866 ms and 533.554/134.364 ms for
+IQ2_XXS/Q6_K. The widest workspace is 354,605,056 bytes; complete one-layer resident storage is
+808,785,920 bytes for IQ1_S/Q5_K, 913,643,520 bytes for IQ2_XXS/Q5_K, and 914,078,720 bytes for
+IQ2_XXS/Q6_K.
+
+The exact T=512 IQ1_S/Q5_K rotating Nsight capture attributed 52.5% of GPU time to the two grouped
+gate/up projections and 41.9% to grouped IQ4_NL down. Router, grouping, shared work, SwiGLU, and
+rank-order finish together were 5.6%. The measured Op issued no H2D or D2H; its only GPU memory
+operation was the 512-counter asynchronous memset. NCU counters remain unavailable on this host,
+so codec-pipe, fusion, and further tile ideas remain measurement tasks rather than retained CUDA
+changes. The one-layer result demonstrates the future all-GPU-fit execution path only: the current
+48-layer preview expert banks still do not fit the 32 GB device.
+
 The follow-up public-Op checkpoint isolated the largest transferable Q5_K point, GDN
 `N=10240,K=2560,T=1`. Nine independent 101-sample cold-L2 runs had a 73.344 us
 median-of-medians (run medians 71.680--73.376 us) for an 18,048,000-byte footprint. The kernel
