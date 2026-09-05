@@ -4,16 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Sequence
+from typing import Callable, Sequence
 
 import torch
 
 from .common import (
-    grouped_zero_centered_rmsnorm,
+    actual_gguf_grouped_rmsnorm,
     ideal_softmax,
     linear,
     partial_rope,
     sigmoid,
+    source_grouped_rmsnorm,
 )
 
 
@@ -32,6 +33,9 @@ class QSAAttentionResult:
     probabilities: tuple[torch.Tensor, ...]
 
 
+GroupedRmsNorm = Callable[..., torch.Tensor]
+
+
 def _represented_pool(raw_keys: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
     """Semantic FP32 mean followed by a cast to the represented raw-key dtype."""
 
@@ -40,7 +44,7 @@ def _represented_pool(raw_keys: torch.Tensor, indices: torch.Tensor) -> torch.Te
     return pooled.to(raw_keys.dtype).to(torch.float64)
 
 
-def select(
+def _select(
     index_queries: torch.Tensor,
     raw_keys: torch.Tensor,
     visible_token_ids: Sequence[torch.Tensor],
@@ -49,6 +53,7 @@ def select(
     query_norm_weight: torch.Tensor,
     key_norm_weight: torch.Tensor,
     *,
+    grouped_rmsnorm: GroupedRmsNorm,
     token_budget: int = 2048,
     compress_ratio: int = 4,
     rotary_dim: int = 64,
@@ -65,7 +70,7 @@ def select(
     if token_budget % compress_ratio:
         raise ValueError("token_budget must be divisible by compress_ratio")
     head_dim = index_queries.shape[-1]
-    queries = grouped_zero_centered_rmsnorm(
+    queries = grouped_rmsnorm(
         index_queries,
         query_norm_weight,
         group_size=head_dim,
@@ -93,7 +98,7 @@ def select(
             pooled = torch.stack(
                 [_represented_pool(raw_keys, block) for block in blocks], dim=0
             )
-            pooled = grouped_zero_centered_rmsnorm(
+            pooled = grouped_rmsnorm(
                 pooled,
                 key_norm_weight,
                 group_size=head_dim,
@@ -131,7 +136,79 @@ def select(
     return tuple(results)
 
 
-def sparse_attention(
+def source_select(
+    index_queries: torch.Tensor,
+    raw_keys: torch.Tensor,
+    visible_token_ids: Sequence[torch.Tensor],
+    query_positions: torch.Tensor,
+    key_positions: torch.Tensor,
+    query_norm_weight: torch.Tensor,
+    key_norm_weight: torch.Tensor,
+    *,
+    token_budget: int = 2048,
+    compress_ratio: int = 4,
+    rotary_dim: int = 64,
+    theta: float = 10_000_000.0,
+    mrope_section: tuple[int, int, int] | None = None,
+    eps: float = 1e-6,
+) -> tuple[QSASelection, ...]:
+    """Select QSA blocks from source-checkpoint zero-centered norm weights."""
+
+    return _select(
+        index_queries,
+        raw_keys,
+        visible_token_ids,
+        query_positions,
+        key_positions,
+        query_norm_weight,
+        key_norm_weight,
+        grouped_rmsnorm=source_grouped_rmsnorm,
+        token_budget=token_budget,
+        compress_ratio=compress_ratio,
+        rotary_dim=rotary_dim,
+        theta=theta,
+        mrope_section=mrope_section,
+        eps=eps,
+    )
+
+
+def actual_gguf_select(
+    index_queries: torch.Tensor,
+    raw_keys: torch.Tensor,
+    visible_token_ids: Sequence[torch.Tensor],
+    query_positions: torch.Tensor,
+    key_positions: torch.Tensor,
+    query_norm_gamma: torch.Tensor,
+    key_norm_gamma: torch.Tensor,
+    *,
+    token_budget: int = 2048,
+    compress_ratio: int = 4,
+    rotary_dim: int = 64,
+    theta: float = 10_000_000.0,
+    mrope_section: tuple[int, int, int] | None = None,
+    eps: float = 1e-6,
+) -> tuple[QSASelection, ...]:
+    """Select QSA blocks from actual-GGUF already-folded norm gammas."""
+
+    return _select(
+        index_queries,
+        raw_keys,
+        visible_token_ids,
+        query_positions,
+        key_positions,
+        query_norm_gamma,
+        key_norm_gamma,
+        grouped_rmsnorm=actual_gguf_grouped_rmsnorm,
+        token_budget=token_budget,
+        compress_ratio=compress_ratio,
+        rotary_dim=rotary_dim,
+        theta=theta,
+        mrope_section=mrope_section,
+        eps=eps,
+    )
+
+
+def _sparse_attention(
     queries: torch.Tensor,
     keys: torch.Tensor,
     values: torch.Tensor,
@@ -143,6 +220,7 @@ def sparse_attention(
     output_gate: torch.Tensor,
     output_weight: torch.Tensor,
     *,
+    grouped_rmsnorm: GroupedRmsNorm,
     core_cache_dtype: torch.dtype | None = None,
     rotary_dim: int = 64,
     theta: float = 10_000_000.0,
@@ -166,10 +244,10 @@ def sparse_attention(
         raise ValueError("query head count must be divisible by KV head count")
     if len(selections) != query_count:
         raise ValueError("one selection is required per query")
-    q = grouped_zero_centered_rmsnorm(
+    q = grouped_rmsnorm(
         queries, query_norm_weight, group_size=head_dim, eps=eps
     )
-    k = grouped_zero_centered_rmsnorm(
+    k = grouped_rmsnorm(
         keys, key_norm_weight, group_size=head_dim, eps=eps
     )
     q = partial_rope(
@@ -211,4 +289,91 @@ def sparse_attention(
     return QSAAttentionResult(output=output, core=core, probabilities=tuple(probabilities))
 
 
-__all__ = ["QSAAttentionResult", "QSASelection", "select", "sparse_attention"]
+def source_sparse_attention(
+    queries: torch.Tensor,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    selections: Sequence[torch.Tensor | QSASelection],
+    query_positions: torch.Tensor,
+    key_positions: torch.Tensor,
+    query_norm_weight: torch.Tensor,
+    key_norm_weight: torch.Tensor,
+    output_gate: torch.Tensor,
+    output_weight: torch.Tensor,
+    *,
+    core_cache_dtype: torch.dtype | None = None,
+    rotary_dim: int = 64,
+    theta: float = 10_000_000.0,
+    mrope_section: tuple[int, int, int] | None = None,
+    eps: float = 1e-6,
+) -> QSAAttentionResult:
+    """Evaluate QSA from source-checkpoint zero-centered norm weights."""
+
+    return _sparse_attention(
+        queries,
+        keys,
+        values,
+        selections,
+        query_positions,
+        key_positions,
+        query_norm_weight,
+        key_norm_weight,
+        output_gate,
+        output_weight,
+        grouped_rmsnorm=source_grouped_rmsnorm,
+        core_cache_dtype=core_cache_dtype,
+        rotary_dim=rotary_dim,
+        theta=theta,
+        mrope_section=mrope_section,
+        eps=eps,
+    )
+
+
+def actual_gguf_sparse_attention(
+    queries: torch.Tensor,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    selections: Sequence[torch.Tensor | QSASelection],
+    query_positions: torch.Tensor,
+    key_positions: torch.Tensor,
+    query_norm_gamma: torch.Tensor,
+    key_norm_gamma: torch.Tensor,
+    output_gate: torch.Tensor,
+    output_weight: torch.Tensor,
+    *,
+    core_cache_dtype: torch.dtype | None = None,
+    rotary_dim: int = 64,
+    theta: float = 10_000_000.0,
+    mrope_section: tuple[int, int, int] | None = None,
+    eps: float = 1e-6,
+) -> QSAAttentionResult:
+    """Evaluate QSA from actual-GGUF already-folded norm gammas."""
+
+    return _sparse_attention(
+        queries,
+        keys,
+        values,
+        selections,
+        query_positions,
+        key_positions,
+        query_norm_gamma,
+        key_norm_gamma,
+        output_gate,
+        output_weight,
+        grouped_rmsnorm=actual_gguf_grouped_rmsnorm,
+        core_cache_dtype=core_cache_dtype,
+        rotary_dim=rotary_dim,
+        theta=theta,
+        mrope_section=mrope_section,
+        eps=eps,
+    )
+
+
+__all__ = [
+    "QSAAttentionResult",
+    "QSASelection",
+    "actual_gguf_select",
+    "actual_gguf_sparse_attention",
+    "source_select",
+    "source_sparse_attention",
+]

@@ -169,16 +169,18 @@ Op on CUDA and transfers only selected rows or expert slices from its mapped hos
 external timing and NLL trace therefore do not measure the native staging design or provide a
 like-for-like performance comparison.
 
-The paired mean absolute NLL delta was `0.197146964`, below the declared `0.5`-nat mean bound, but
-the maximum was `7.157103105` at position 521 and 33 of 600 positions exceeded the `1.0`-nat gross
-bound. Of those gross failures, 26 occurred in paragraph repetitions four through seven. Repeated
+The paired mean absolute NLL delta was `0.197146964`, below the declared `0.5`-nat mean bound. The
+maximum was `7.157103105` at position 521 and 33 of 600 positions exceeded the declared one-nat
+per-token bound. Of those gross failures, 26 occurred in paragraph repetitions four through seven. Repeated
 paragraph offsets 5, 9, 25, 39, 49, 55, and 71 were localized, but the same offsets stayed within
 one nat in other repetitions; the discrepancy is context- and execution-profile-dependent rather
-than a fixed token-pair bias. The mean gate therefore passes and the per-token gate fails. This is
-integration-sensitivity evidence, not an external-parity, production-correctness, or native-defect
-result.
+than a fixed token-pair bias. Exact token alignment, finite traces, exact native replay, and the
+mean gate pass, but the per-token gate and therefore the declared external integration criterion
+fail. The comparison remains unresolved. Controlled external self-sensitivity contextualizes the
+failure but does not change either declared bound. This is not a production-correctness or
+native-defect result; independent represented-boundary oracles remain the numerical gates.
 
-Controlled reruns show why the failed gross gate cannot diagnose a native recurrent-state bug.
+Controlled reruns show why a one-nat per-token gate cannot diagnose a native recurrent-state bug.
 Holding the external IQ4_NL weights, cache, tokens, scorer, offload, and cleared initial state fixed,
 changing only `--ubatch-size 256` to `1` changed the 600 NLLs by mean absolute `0.155912988`, with a
 `7.163071313` maximum and 20 positions above one nat. Keeping microbatch size one while changing the
@@ -221,6 +223,27 @@ trace does not directly observe PLE rows. Cross-profile tracing can measure sens
 seams, but cannot distinguish which profile is correct or justify changing a native semantic
 boundary. Native defects must instead be established against the represented-input/state Op oracles
 below.
+
+An explicitly dedicated trace build and `tools/parity/qwen4/compare_boundary_traces.py` then
+captured aligned per-token FP64 sum, squared-norm, and maximum-magnitude summaries at every usable
+post-attention and post-FFN four-branch residual. Separate diagnostic copy nodes preserve
+llama.cpp's `l_last` ownership. The parser requires every direct seam through layer 46 and the exact
+local-token sequence implied by each external microbatch partition; incomplete output-row-selected
+layer-47/final series are explicitly excluded. The external profiles used microbatch widths 256
+and one. The native trace used the same 601 token IDs and recorded raw-BF16 hashes, exact PLE row
+IDs, QSA counts/selected IDs, router IDs/weights, final GR output, and NLL first at eight
+diagnostic positions and then at all 33 original greater-than-one-nat positions. Its trace tool
+independently rejects incorrect PLE rows, QSA counts/sets/padding, and invalid, duplicate, non-finite,
+or unnormalized router diagnostics before emission. Across those 33, every PLE row panel matched
+the integer oracle, all 396 QSA records had the exact frontier count and complete ID set, and all
+1,584 router records had unique IDs and finite weights summing to one. At position 60 the
+native/external norm gap first clearly amplified at layer-32
+post-attention while the two external schedules differed by only 0.570 percent there. At position
+221 the gap broadened through layers 32--34, sharply amplified across layer-35 FFN/MoE, and
+amplified again at layer-39 QSA; both effects survived the tokenwise external control. These scalar
+summaries localize where profile differences amplify but can hide offsetting vector differences and
+do not identify which profile is correct. Patch, command, trace hashes, alignment rules, and exact
+observations are recorded in `external_ppl_manifest.json`.
 
 A subsequent capacity/QSA baseline fixed llama.cpp to 31 GPU layers with fit disabled, C=1, an
 8192-token context, and IQ4_NL K/V cache. It processed all 5536 tokens of repository `README.md`
@@ -271,12 +294,14 @@ evidence, not numerical-identity evidence, an Op tolerance, or a
 product-quality/PPL threshold, because the native verifier deliberately uses BF16 represented
 intermediates and NVFP4-G16 KV while that external diagnostic uses its own FP32 graph profile and
 IQ4_NL KV.
+
 The opt-in four-token native test retains those prefix bounds as a localization check: every paired
 prefix NLL must differ by at most 1.0 nat, their mean absolute difference by at most 0.5 nat, and
 neither route may be non-finite. The full 600-transition evidence supersedes any interpretation of
-that passing prefix as an integration gate: although its mean bound passes, 33 gross per-token
-failures remain in that cross-profile comparison. One nat caps a frozen target-probability ratio at
-`e`; these are coarse
+that passing prefix as an integration gate. The full trace passes exact alignment, finiteness,
+native replay, and the 0.5-nat mean bound, but 33 per-token deltas fail the declared one-nat bound;
+the external integration criterion therefore remains unresolved. Controlled external sensitivity
+does not alter that verdict. One nat caps a frozen target-probability ratio at `e`; these are coarse
 behavioral diagnostics rather than Op tolerances, numeric identity, or target admission.
 
 The single-load real-artifact numerical harness independently decodes the bound packed weights and
@@ -296,14 +321,41 @@ passed. The real-weight QSA cell now discriminates two complete blocks and the c
 capacity-transition and saturation semantics remain owned by the independent synthetic QSA tests
 and the 4096-token Program diagnostic.
 
-An additional accumulated-state QSA cell runs the frozen prefix through position 226, captures the
-pre-append layer-3 state and represented BF16 input, then independently evaluates position 227.
-All 228 selected IDs and padding, the newly encoded NVFP4 K/V codes and FP8 scales, metadata, and
-untouched state planes matched exactly. The independent complete 228-item FP64 attention/gate/output
-oracle had maximum absolute error `0.0009765625` and used 0.0353 of its fixed pointwise criterion;
-the selector-score and attention-logit spreads were `4.36032` and `15.6427`. This directly qualifies
-the native QSA transition at the largest tokenwise IQ4/native NLL disagreement without treating the
-external result as its oracle.
+Four accumulated-state witness cells close the Program seams selected by the boundary traces. At
+position 60, the layer-32 cell takes the represented layer-31 post-FFN residual and accumulated
+BF16 convolution/FP32 recurrence state as public inputs. Its independent direct-gamma, exact-Q8_0
+FP64 attention-GR read used 0.379 of the relative-L2 criterion, while GR write scale used 0.227,
+GDN output used 0.183, recurrence relative-L2 was `5.1532e-08`, and reconstructed Program injection
+used 0.408. The projected convolution state was exact. At position 221, the layer-35 cell checks
+the represented FFN GR, exact router IDs, complete sparse-MoE formula, and reconstructed Program
+post-FFN residual. GR mixed/write scale used 0.351/0.430 of their relative-L2 criteria, router
+weights used 0.00260 of their pointwise criterion, MoE output used 0.366, and Program injection used
+0.537.
+
+The accumulated QSA cells treat their incoming prefix state and preceding represented BF16
+residual as production boundary inputs, then independently own each current transition. At layer 3
+position 227, all 228 Program and isolated selector IDs/padding and complete post-state agree with
+the exact state oracle. Attention-GR mixed/write scale used 0.409/0.586 of their relative-L2
+criteria, the complete FP64 attention/gate/output oracle had maximum absolute error
+`0.0009765625` and used 0.0353 of its pointwise criterion, and reconstructed Program injection used
+0.589 of its relative-L2 criterion; selector-score and attention-logit spreads were `4.36032` and
+`15.6427`. At layer 39 position 221, all 222 selector IDs/padding and the complete Program/isolated
+NVFP4-G16 post-state agree exactly. Attention-GR mixed/write scale used 0.391/0.286 of their
+relative-L2 criteria, QSA output maximum error was `1.90735e-06` or `7.63e-05` of its pointwise
+criterion, and reconstructed Program injection used 0.563 of its relative-L2 criterion;
+selector-score and attention-logit spreads were `6.34422` and `18.2334`. These cells qualify the
+native transitions at the localized amplification seams without treating an external hidden state
+as an oracle.
+
+A position-221 final-path cell independently reads the represented four-branch BF16 Program
+residual, evaluates final GR in FP64 from direct represented FP32 gamma and exact Q8_0 weights,
+decodes every one of the 248,320 Q4_K output-head rows into a naive FP64 dot product, and computes
+stable FP64 NLL from the represented BF16 logits. Final GR used 0.324 of its relative-L2 criterion;
+all vocabulary logits stayed within the Q4_K route's derived accumulation-plus-BF16 bound with a
+maximum bound ratio of 0.468; and NLL differed by `4.97487e-06`, 0.00245 of its pointwise criterion.
+This excludes an out-of-contract native implementation defect in those stages for their represented
+inputs. It does not exclude the intended BF16 materialization and reduction profiles from
+contributing to native-versus-external divergence.
 
 Same-day final RTX 5090 measurements of the same warmed four-token Program workload disabled GR
 diagnostic snapshots. Three independent three-repetition runs had sequence means of 148.666,

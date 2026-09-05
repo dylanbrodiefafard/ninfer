@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 import torch
 
-from .common import grouped_zero_centered_rmsnorm, linear, sigmoid, silu
+from .common import (
+    actual_gguf_grouped_rmsnorm,
+    linear,
+    sigmoid,
+    silu,
+    source_grouped_rmsnorm,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,22 +24,24 @@ class GatedResidualRead:
     injection_scales: torch.Tensor | None
 
 
-def read(
+GroupedRmsNorm = Callable[..., torch.Tensor]
+
+
+def _read(
     branches: torch.Tensor,
     norm_weight: torch.Tensor,
     down_weight: torch.Tensor,
     up_weight: torch.Tensor,
     inject_weight: torch.Tensor | None,
     *,
+    grouped_rmsnorm: GroupedRmsNorm,
     eps: float = 1e-6,
 ) -> GatedResidualRead:
-    """Evaluate the GR read and optional scalar-per-branch write gate."""
-
     if branches.ndim < 2:
         raise ValueError("branches must have shape [..., branch_count, hidden]")
     branch_count, hidden = branches.shape[-2:]
     flat = branches.detach().to(dtype=torch.float64, device="cpu").flatten(-2)
-    normalized = grouped_zero_centered_rmsnorm(
+    normalized = grouped_rmsnorm(
         flat,
         norm_weight,
         group_size=hidden,
@@ -57,6 +66,50 @@ def read(
     )
 
 
+def source_read(
+    branches: torch.Tensor,
+    norm_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    inject_weight: torch.Tensor | None,
+    *,
+    eps: float = 1e-6,
+) -> GatedResidualRead:
+    """Evaluate GR read from source-checkpoint zero-centered norm weights."""
+
+    return _read(
+        branches,
+        norm_weight,
+        down_weight,
+        up_weight,
+        inject_weight,
+        grouped_rmsnorm=source_grouped_rmsnorm,
+        eps=eps,
+    )
+
+
+def actual_gguf_read(
+    branches: torch.Tensor,
+    norm_gamma: torch.Tensor,
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    inject_weight: torch.Tensor | None,
+    *,
+    eps: float = 1e-6,
+) -> GatedResidualRead:
+    """Evaluate GR read from actual-GGUF already-folded norm gamma."""
+
+    return _read(
+        branches,
+        norm_gamma,
+        down_weight,
+        up_weight,
+        inject_weight,
+        grouped_rmsnorm=actual_gguf_grouped_rmsnorm,
+        eps=eps,
+    )
+
+
 def inject(
     branches: torch.Tensor,
     block_output: torch.Tensor,
@@ -76,7 +129,7 @@ def inject(
     return represented_branches + represented_scale.unsqueeze(-1) * update
 
 
-def final_read(
+def source_final_read(
     branches: torch.Tensor,
     norm_weight: torch.Tensor,
     down_weight: torch.Tensor,
@@ -86,7 +139,31 @@ def final_read(
 ) -> torch.Tensor:
     """Read-only final mixer used before the language-model head."""
 
-    return read(branches, norm_weight, down_weight, up_weight, None, eps=eps).mixed
+    return source_read(
+        branches, norm_weight, down_weight, up_weight, None, eps=eps
+    ).mixed
 
 
-__all__ = ["GatedResidualRead", "final_read", "inject", "read"]
+def actual_gguf_final_read(
+    branches: torch.Tensor,
+    norm_gamma: torch.Tensor,
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    *,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Read-only final mixer from actual-GGUF already-folded norm gamma."""
+
+    return actual_gguf_read(
+        branches, norm_gamma, down_weight, up_weight, None, eps=eps
+    ).mixed
+
+
+__all__ = [
+    "GatedResidualRead",
+    "actual_gguf_final_read",
+    "actual_gguf_read",
+    "inject",
+    "source_final_read",
+    "source_read",
+]
