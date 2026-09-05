@@ -2,25 +2,32 @@
 
 Layer 0–3 procedure: [`docs/maintainer/kernel-iteration.md`](../../docs/maintainer/kernel-iteration.md).
 Decode-band NVFP4 Linear mapping: [`docs/maintainer/nvfp4-decode-linear.md`](../../docs/maintainer/nvfp4-decode-linear.md).
-Fill the gate card (blank procedure, or a Linear point that fills numbers + next commands):
+Fill the gate card (blank procedure, a registered Linear point, or an exact GGML block-row
+projection point):
 
 ```
 python3 -m tools.kdev recipe
 python3 -m tools.kdev recipe --preset attn_in --t 1 --idea occupancy
 python3 -m tools.kdev recipe --n 14336 --k 5120 --t 1024 --qtype nvfp4 --policy a4 \
     --measured-us 152.6 --idea tile_shape
+python3 -m tools.kdev recipe --n 10240 --k 2560 --t 512 --qtype ggml_q5_k \
+    --measured-us 5279.8 --idea aggregate_T
 ```
 
 Exit 2 is `STOP` (refused idea or illegal SM120). Do not write CUDA.
 
 ## Layer 0 — bound (host)
 
-The bound classifier is Linear GEMM only (`ninfer::ops::linear`). `recipe` with a point
-runs it and prints the eight-item card; `bound` is the compact one-screen form.
+Registered Linear cards use the GEMM roofline for `ninfer::ops::linear`. GGML block-row cards
+for `ninfer::ops::ggml_block_linear` calculate exact representation bytes and a one-read memory
+lower bound, but mark codec compute `profile-required`: the dense-FP4 roof does not model scalar
+decode instructions or physical weight replay. `recipe` prints the eight-item card and exact
+public benchmark; `bound` is the compact one-screen form.
 
 ```
 python3 -m tools.kdev bound --preset attn_in --t 1 --idea occupancy
 python3 -m tools.kdev bound --n 14336 --k 5120 --t 1024 --qtype nvfp4 --json
+python3 -m tools.kdev bound --n 10240 --k 2560 --t 512 --qtype ggml_q5_k --idea aggregate_T
 python3 -m tools.kdev bound --list-ideas
 python3 -m tools.kdev bound --self-test
 ```
@@ -44,6 +51,22 @@ filled command):
 ./build/bench/ninfer_linear_bench --qtype nvfp4 --policy a16 --n 14336 --k 5120 --t 1
 ./build/bench/ninfer_linear_bench --qtype nvfp4 --policy a4  --n 14336 --k 5120 --t 1024
 ```
+
+GGML qtypes are `ggml_q8_0`, `ggml_q4_k`, `ggml_q5_k`, `ggml_q6_k`, `ggml_iq1_s`,
+`ggml_iq2_xxs`, and `ggml_iq4_nl`. They require represented BF16 input (`policy=a16`) and use:
+
+```
+./build/bench/ninfer_ggml_block_linear_bench \
+    --qtype ggml_q5_k --n 10240 --k 2560 --t 512
+ncu --profile-from-start off --set full \
+    ./build/bench/ninfer_ggml_block_linear_bench \
+    --qtype ggml_q5_k --n 10240 --k 2560 --t 512 --profile --repetitions 1
+```
+
+For these cards at `T>16`, `aggregate_T` and `weight_replay` are admitted because they reduce
+packed-weight passes; at `T<=16` the live route already makes one pass. Other legal compute ideas
+remain `measure` until the exact public-Op profile identifies physical traffic, instruction-pipe
+limits, occupancy, and spills.
 
 Registered kdev ops:
 

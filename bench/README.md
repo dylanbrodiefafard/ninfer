@@ -184,6 +184,23 @@ cmake --build build --parallel --target ninfer_gated_residual_bench
 
 ## Linear Op benchmark
 
+`ninfer_ggml_block_linear_bench` is the retained public-Op measurement entry for the exact
+`ggml_q8_0`, `ggml_q4_k`, `ggml_q5_k`, `ggml_q6_k`, `ggml_iq1_s`, `ggml_iq2_xxs`, and
+`ggml_iq4_nl` block-row layouts. It requires an explicit N/K/T point, constructs deterministic
+finite encoded blocks, and reports CUDA-event time plus the exact public-representation byte
+floor. Each timed call follows a 256 MiB L2 eviction outside the timed event interval.
+`aggregate_tile_tokens`, `weight_passes`, `full_weight_passes`, `tail_tokens`, and
+`average_tokens_per_weight_pass` describe the live scalar or 16-token aggregate route; they are
+observations, not benchmark controls.
+`--profile` requires one repetition and
+brackets that single post-warmup public call with the CUDA profiler API.
+
+```bash
+cmake --build build --parallel --target ninfer_ggml_block_linear_bench
+./build/bench/ninfer_ggml_block_linear_bench \
+  --qtype ggml_q5_k --n 10240 --k 2560 --t 512 --warmup 3 --repetitions 20
+```
+
 `ninfer_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,
 W8, registered BF16 weights, and the registered NVFP4 problems. Existing formats use
 `--policy a16`; NVFP4 additionally supports `--policy a4`, which lets the production resolver

@@ -1,8 +1,8 @@
-"""Print the Layer 0–3 kernel-iteration recipe, filled when a Linear point is given.
+"""Print the Layer 0–3 kernel-iteration recipe, filled for a supported projection point.
 
 The contract is docs/maintainer/kernel-iteration.md. Without geometry this command
-prints the procedure, idea catalog, and exact public-Op commands. With a Linear
-point it fills the gate card from the bound classifier and prints the next command.
+prints the procedure, idea catalog, and exact public-Op commands. Registered Linear
+points use a roofline bound; GGML block-row points use exact bytes and a profile-required gate.
 
     python3 -m tools.kdev recipe
     python3 -m tools.kdev recipe --preset attn_in --t 1 --idea occupancy
@@ -19,6 +19,7 @@ import os
 from . import bound, registry
 
 _LINEAR_BENCH = "./build/bench/ninfer_linear_bench"
+_GGML_LINEAR_BENCH = "./build/bench/ninfer_ggml_block_linear_bench"
 _NCU_QUESTIONS = (
     "DRAM vs 1674.5 GB/s",
     "tensor-pipe busy",
@@ -59,6 +60,14 @@ def args_qtype_overridden(card: dict) -> bool:
 
 
 def linear_bench_cmd(n: int, k: int, t: int, qtype: str, policy: str, *, profile: bool = False) -> str:
+    if qtype.startswith("ggml_"):
+        cmd = (
+            f"{_GGML_LINEAR_BENCH} --qtype {qtype} "
+            f"--n {n} --k {k} --t {t}"
+        )
+        if profile:
+            return f"ncu --profile-from-start off --set full {cmd} --profile --repetitions 1"
+        return cmd
     cmd = (
         f"{_LINEAR_BENCH} --qtype {qtype} --policy {policy} "
         f"--n {n} --k {k} --t {t}"
@@ -101,6 +110,8 @@ def _fmt_flops(n: int) -> str:
 
 
 def _matching_roof(card: dict) -> str:
+    if card["bound"] == "profile-required":
+        return "the one-read represented-byte throughput roof (1674.5 GB/s)"
     if card["bound"] == "DRAM":
         return "1674.5 GB/s sustained read"
     t_issue = card.get("t_issue_us")
@@ -124,12 +135,13 @@ def _layer2(card: dict) -> dict:
     bench = linear_bench_cmd(p["n"], p["k"], p["t"], p["qtype"], p["policy"])
     ncu = linear_bench_cmd(p["n"], p["k"], p["t"], p["qtype"], p["policy"], profile=True)
     return {
-        "op": "linear",
+        "op": "ggml_block_linear" if p["qtype"].startswith("ggml_") else "linear",
         "bench": bench,
         "ncu": ncu,
         "ncu_questions": list(_NCU_QUESTIONS),
         "note": (
-            "Linear is not a kdev <op>. Measure ninfer::ops::linear through ninfer_linear_bench. "
+            "Linear is not a kdev <op>. Measure the named public Op through the selected "
+            "registered-Linear or GGML-block-row benchmark. "
             "Registered kdev ops: " + ", ".join(registry.names()) + "."
         ),
     }
@@ -195,27 +207,39 @@ def render_filled(card: dict) -> str:
     layer2 = _layer2(card)
     status = status_of(card)
     label = card.get("label") or ""
+    is_ggml = p["qtype"].startswith("ggml_")
+    op_name = "ggml_block_linear" if is_ggml else "linear"
     t_issue = (
         f"{card['t_issue_us']:.2f}us" if card["t_issue_us"] is not None else "n/a"
     )
     hint = _policy_hint(p)
     lines = [
-        "NInfer kernel gate card — Linear  RTX 5090 / sm_120a",
+        f"NInfer kernel gate card — {op_name}  RTX 5090 / sm_120a",
         "Authority: docs/maintainer/kernel-iteration.md",
         "",
-        f"1. Op     linear  n={p['n']} k={p['k']} T={p['t']} qtype={p['qtype']} "
+        f"1. Op     {op_name}  n={p['n']} k={p['k']} T={p['t']} qtype={p['qtype']} "
         f"policy={p['policy']}  phase={p['phase']}"
         + (f"  ({label})" if label else ""),
         f"2. Floor  bound={card['bound']}  model_bytes={_fmt_bytes(card['model_bytes'])}",
         f"          weight={_fmt_bytes(card['weight_bytes'])}  "
         f"act={_fmt_bytes(card['activation_bytes'])}",
-        f"          useful_flops={_fmt_flops(card['useful_flops'])}  "
-        f"AI={card['ai_flop_per_byte']:.1f} FLOP/B  "
-        f"ridge={card['ridge_flop_per_byte']:.0f} FLOP/B"
-        + (f"  ridge_T≈{card['ridge_t']:.0f}" if card.get("ridge_t") else ""),
-        f"          t_mem={card['t_mem_us']:.2f}us  t_comp={card['t_comp_us']:.2f}us  "
-        f"t_issue={t_issue}  floor={card['floor_us']:.2f}us",
     ]
+    if is_ggml:
+        lines.extend([
+            f"          useful_flops={_fmt_flops(card['useful_flops'])}  "
+            f"one-read AI={card['ai_flop_per_byte']:.1f} FLOP/B",
+            f"          one_read_mem={card['t_mem_us']:.2f}us  codec_compute=unmodeled  "
+            f"lower_bound={card['floor_us']:.2f}us",
+        ])
+    else:
+        lines.extend([
+            f"          useful_flops={_fmt_flops(card['useful_flops'])}  "
+            f"AI={card['ai_flop_per_byte']:.1f} FLOP/B  "
+            f"ridge={card['ridge_flop_per_byte']:.0f} FLOP/B"
+            + (f"  ridge_T≈{card['ridge_t']:.0f}" if card.get("ridge_t") else ""),
+            f"          t_mem={card['t_mem_us']:.2f}us  t_comp={card['t_comp_us']:.2f}us  "
+            f"t_issue={t_issue}  floor={card['floor_us']:.2f}us",
+        ])
     if hint:
         lines.append(f"          note: {hint}")
     if card["measured_us"] is None:
@@ -236,7 +260,12 @@ def render_filled(card: dict) -> str:
         lines.append(f"          {idea['reason']}")
     else:
         lines.append("4. Idea   unknown  — pass --idea <class>. If it does not attack this bound, stop.")
-    if card["sm120"]["legal"]:
+    if card["sm120"]["legal"] and is_ggml:
+        lines.append(
+            f"5. SM120  legal  current scalar GGML codec family  "
+            f"smem<={bound.SMEM_LIMIT_BYTES} B  cluster=1  no TMEM/tcgen05"
+        )
+    elif card["sm120"]["legal"]:
         atom = card["mma_atom"]
         lines.append(
             f"5. SM120  legal  warp mma.sync m{atom['m']}n{atom['n']}k{atom['k']}  "
@@ -248,6 +277,11 @@ def render_filled(card: dict) -> str:
         lines.append(
             "6. Family DRAM-bound. Do not fork a compute family. "
             "Attack extra bytes or raise T per weight pass."
+        )
+    elif is_ggml:
+        lines.append(
+            "6. Family GGML codec compute is unmodeled. Profile physical bytes/throughput, "
+            "instruction pipes, occupancy, and spills before choosing a compute-side idea."
         )
     else:
         lines.append(
@@ -262,7 +296,7 @@ def render_filled(card: dict) -> str:
     lines.append("8. Lose   Delete the candidate. Do not leave a second path.")
     lines.append("")
     lines.extend(_group_lines(_classified(card)))
-    if card["t_issue_us"] is None and card["bound"] != "DRAM":
+    if card["t_issue_us"] is None and card["bound"] != "DRAM" and not is_ggml:
         lines.append("")
         lines.append(
             "t_issue=n/a  run `python3 -m tools.kdev mma` once; bound/recipe pick up "
@@ -294,7 +328,10 @@ def _guide_payload() -> dict:
             "smem_limit_bytes": bound.SMEM_LIMIT_BYTES,
         },
         "scope": {
-            "bound": "Linear GEMM model-byte floor (ninfer::ops::linear). Not GQA/l2norm.",
+            "bound": (
+                "Registered Linear uses its GEMM roofline; GGML block-row uses exact "
+                "representation bytes with codec compute profile-required. Not GQA/l2norm."
+            ),
             "legal": "warp mma.sync (mxf4nvf4), single-CTA TMA, acc in registers, smem <= 99 KiB, cluster=1",
             "illegal": sorted(bound.ILLEGAL_IDEAS),
         },
@@ -302,6 +339,9 @@ def _guide_payload() -> dict:
         "ideas": ideas,
         "linear_bench": (
             f"{_LINEAR_BENCH} --qtype QTYPE --policy a16|a4 --n N --k K --t T"
+        ),
+        "ggml_block_linear_bench": (
+            f"{_GGML_LINEAR_BENCH} --qtype ggml_QTYPE --n N --k K --t T"
         ),
         "kdev_ops": registry.names(),
         "fill": [
@@ -323,13 +363,16 @@ def render_guide() -> str:
     return f"""\
 NInfer kernel iteration — RTX 5090 / sm_120a
 Authority: docs/maintainer/kernel-iteration.md
-Bound numbers are the Linear GEMM model-byte floor (ninfer::ops::linear). They do not
-apply to GQA or l2norm; those still use SM120 legality + the public-Op loop.
+Registered Linear cards use its GEMM roofline (ninfer::ops::linear). GGML block-row
+cards compute exact represented bytes but require a profile for the codec compute bound.
+Neither applies to GQA or l2norm; those use SM120 legality + the public-Op loop.
 
-Fill this card for a Linear point (host, no GPU):
+Fill this card for a supported projection point (host, no GPU):
   python3 -m tools.kdev recipe --preset attn_in --t 1 --idea occupancy
   python3 -m tools.kdev recipe --n 14336 --k 5120 --t 1024 --qtype nvfp4 --policy a4 \\
       --measured-us 152.6 --idea tile_shape
+  python3 -m tools.kdev recipe --n 10240 --k 2560 --t 512 --qtype ggml_q5_k \\
+      --measured-us 5279.8 --idea aggregate_T
   python3 -m tools.kdev recipe --list-ideas
   python3 -m tools.kdev recipe --list-presets
 
@@ -338,6 +381,9 @@ Layer 0  bound (host). Predicted time = max(t_mem, t_comp[, t_issue]).
   extra bytes or raise useful work per weight pass (weight_replay, aggregate_T).
   tensor-core (typical prefill T=1024): tile / TMA / pipeline / epilogue inside the
   existing SM120 NVFP4 family.
+  profile-required (GGML block rows): exact one-read bytes only; profile physical
+  traffic and instruction pipes. At T>16, aggregate_T/weight_replay may proceed to an
+  A/B because they provably reduce packed-weight passes; T<=16 already uses one pass.
   STOP if verdict=refuse or sm120=ILLEGAL. Do not write CUDA.
 
 Layer 1  legality + issue roof (once per machine, or after ops/common/mma.cuh changes)
@@ -350,6 +396,8 @@ Layer 2  public Op at the exact point. Oracle first. Fast-but-wrong is invalid.
   Linear (the bound's subject; not a kdev <op>):
     {_LINEAR_BENCH} --qtype nvfp4 --policy a16 --n 14336 --k 5120 --t 1
     {_LINEAR_BENCH} --qtype nvfp4 --policy a4  --n 14336 --k 5120 --t 1024
+  GGML block-row projection (codec bound requires profiling):
+    {_GGML_LINEAR_BENCH} --qtype ggml_q5_k --n 10240 --k 2560 --t 512
   Registered kdev ops ({ops}):
     python3 -m tools.kdev <op> --fast --bench
     python3 -m tools.kdev <op> --fast --bench --profile
@@ -368,8 +416,9 @@ Idea classes (name one; the classifier gates it for this bound):
 
 Gate: any unknown means measure, do not implement.
   1 Op + exact (N,K,T,qtype,policy) + phase
-  2 model_bytes, useful_flops, AI, t_mem, t_comp[, t_issue], bound
-  3 measured µs and % of the matching roof
+  2 Linear: model bytes + compute/issue floors; GGML: exact bytes + one-read floor,
+    codec compute unmodeled
+  3 measured µs and registered-Linear roof %, or GGML one-read throughput efficiency
   4 idea class — must attack this bound
   5 SM120 legality
   6 parameters inside the current family, or why a new family is required
@@ -440,6 +489,12 @@ def _self_test() -> int:
     payload = filled_payload(allow)
     check("json-status", payload["status"] == "go")
     check("json-layer2", "--t 1024" in payload["layer2"]["bench"])
+    ggml = bound.analyze(10240, 2560, 512, "ggml_q5_k", idea="aggregate_T")
+    check("ggml-layer2", _GGML_LINEAR_BENCH in _layer2(ggml)["bench"])
+    check("ggml-no-policy", "--policy" not in _layer2(ggml)["bench"])
+    check("ggml-op", _layer2(ggml)["op"] == "ggml_block_linear", _layer2(ggml)["op"])
+    check("ggml-profile-required", "bound=profile-required" in render_filled(ggml))
+    check("ggml-profile-one-rep", "--repetitions 1" in _layer2(ggml)["ncu"])
 
     if failures:
         print("self-test FAIL")

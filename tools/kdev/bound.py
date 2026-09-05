@@ -1,8 +1,9 @@
-"""Layer-0 Linear bound classifier.
+"""Layer-0 Linear and GGML block-row gate classifier.
 
-Host-only. Uses the public Linear model-byte floor from
-``docs/maintainer/linear-benchmark.md`` and RTX 5090 roofs. It does not emulate
-caches. It decides which idea class is legal to implement.
+Host-only. Registered Linear uses the public model-byte floor from
+``docs/maintainer/linear-benchmark.md`` and RTX 5090 roofs. GGML block-row cards
+compute exact represented bytes but leave the execution bound unmodeled until a
+profile establishes physical traffic and instruction/pipe limits.
 
     python3 -m tools.kdev bound --preset attn_in --t 1 --idea occupancy
     python3 -m tools.kdev bound --n 14336 --k 5120 --t 1024 --qtype nvfp4 --json
@@ -36,6 +37,15 @@ QTYPES = {
     "w8": {"group": 32, "bytes_per_group": 34, "pad_k": 128},
     "nvfp4": {"group": 16, "bytes_per_group": 9, "pad_k": 0},
     "bf16": {"group": 1, "bytes_per_group": 2, "pad_k": 0},
+    # Exact GGML block-row storage. Unlike the registered q4/q5/q6 Linear layouts above,
+    # these formats have no K padding and require K to contain complete codec blocks.
+    "ggml_q8_0": {"group": 32, "bytes_per_group": 34, "pad_k": 0, "exact_block": True},
+    "ggml_q4_k": {"group": 256, "bytes_per_group": 144, "pad_k": 0, "exact_block": True},
+    "ggml_q5_k": {"group": 256, "bytes_per_group": 176, "pad_k": 0, "exact_block": True},
+    "ggml_q6_k": {"group": 256, "bytes_per_group": 210, "pad_k": 0, "exact_block": True},
+    "ggml_iq1_s": {"group": 256, "bytes_per_group": 50, "pad_k": 0, "exact_block": True},
+    "ggml_iq2_xxs": {"group": 256, "bytes_per_group": 66, "pad_k": 0, "exact_block": True},
+    "ggml_iq4_nl": {"group": 32, "bytes_per_group": 18, "pad_k": 0, "exact_block": True},
 }
 
 PRESETS = {
@@ -194,12 +204,15 @@ def format_idea_catalog() -> str:
 
 
 def add_problem_arguments(parser: argparse.ArgumentParser) -> None:
-    """Linear point flags shared by `bound` and `recipe`."""
+    """Supported projection-point flags shared by `bound` and `recipe`."""
     parser.add_argument("--preset", choices=sorted(PRESETS), help="27B NVFP4 Linear problem")
     parser.add_argument("--n", type=int)
     parser.add_argument("--k", type=int)
     parser.add_argument("--t", type=int)
-    parser.add_argument("--qtype", default=None, help="q4|q5|q6|w8|nvfp4|bf16")
+    parser.add_argument(
+        "--qtype", default=None,
+        help="registered q4|q5|q6|w8|nvfp4|bf16, or exact ggml_q8_0|ggml_q4_k|ggml_q5_k|ggml_q6_k|ggml_iq1_s|ggml_iq2_xxs|ggml_iq4_nl",
+    )
     parser.add_argument("--policy", default="a16", choices=["a16", "a4"])
     parser.add_argument("--phase", choices=["prefill", "decode", "mixed"])
     parser.add_argument("--idea", help="idea class to gate; see --list-ideas")
@@ -262,6 +275,12 @@ def weight_bytes(n: int, k: int, qtype: str) -> int:
         return 2 * n * k
     if qtype == "nvfp4":
         # Production NVFP4 packing: N%128==0, K%64==0, no K-pad. Code + UE4M3 scales.
+        return n * k * spec["bytes_per_group"] // spec["group"]
+    if spec.get("exact_block"):
+        if k % spec["group"] != 0:
+            raise ValueError(
+                f"{qtype} requires K divisible by its {spec['group']}-value codec block"
+            )
         return n * k * spec["bytes_per_group"] // spec["group"]
     padded_k = _align_up(k, spec["pad_k"])
     groups = n * padded_k // spec["group"]
@@ -326,6 +345,36 @@ def classify_idea(idea: str, bound: str, t: int, phase: str) -> dict:
             "name": idea,
             "verdict": "refuse",
             "reason": "illegal on sm_120a (RTX 5090). Stay on warp mma.sync + single-CTA TMA.",
+        }
+    if bound == "profile-required":
+        if idea in {"weight_replay", "aggregate_T"}:
+            if t <= 16:
+                return {
+                    "name": idea,
+                    "verdict": "refuse",
+                    "reason": "The live GGML route already consumes each weight once when T<=16.",
+                }
+            return {
+                "name": idea,
+                "verdict": "allow",
+                "reason": (
+                    "Provably reduces packed-weight passes; benchmark the public GGML Op and "
+                    "retain only a measured winner."
+                ),
+            }
+        if idea == "flashattention_tiling":
+            return {
+                "name": idea,
+                "verdict": "refuse",
+                "reason": "FlashAttention is not an implementation of GGML block-row projection.",
+            }
+        return {
+            "name": idea,
+            "verdict": "measure",
+            "reason": (
+                "GGML codec compute is unmodeled; first profile physical DRAM bytes/throughput, "
+                "instruction pipes, occupancy, and spills at the exact public-Op point."
+            ),
         }
     if idea == "weight_replay":
         return {
@@ -427,6 +476,11 @@ def analyze(
         raise ValueError(f"unknown qtype '{qtype}'; expected {', '.join(QTYPES)}")
     if n <= 0 or k <= 0 or t <= 0:
         raise ValueError("n, k, t must be positive")
+    is_ggml = qtype.startswith("ggml_")
+    if is_ggml and (n > 248320 or k > 10240 or t > 4096):
+        raise ValueError("GGML block-row N, K, and T exceed the public Op domain")
+    if is_ggml and policy != "a16":
+        raise ValueError("GGML block-row projection has represented BF16 input and requires policy=a16")
     if idea is not None and idea.strip() not in IDEAS:
         raise ValueError(f"unknown idea '{idea}'; expected one of: {', '.join(IDEAS)}")
     w_bytes = weight_bytes(n, k, qtype)
@@ -435,18 +489,29 @@ def analyze(
     flops = useful_flops(n, k, t)
     ai = flops / bytes_
     t_mem_us = (bytes_ / (SUSTAINED_READ_GB_S * 1e9)) * 1e6
-    t_comp_us = (flops / (DENSE_FP4_TFLOP_S * 1e12)) * 1e6
-    atom = NVFP4_MMA if qtype == "nvfp4" else (BF16_MMA if qtype == "bf16" else S8_MMA)
-    count = mma_count(n, k, t, atom)
-    t_issue_us = None
-    if mma_per_s and mma_per_s > 0:
-        t_issue_us = (count / mma_per_s) * 1e6
-    floors = [t_mem_us, t_comp_us]
-    if t_issue_us is not None:
-        floors.append(t_issue_us)
-    floor_us = max(floors)
-    compute_us = t_comp_us if t_issue_us is None else max(t_comp_us, t_issue_us)
-    bound = "DRAM" if t_mem_us >= compute_us else "tensor-core"
+    if is_ggml:
+        # Exact public-representation bytes give a one-read lower bound. The live scalar codec
+        # family has format-specific decode instructions and may replay weights across T tiles;
+        # neither dense-FP4 peak nor the registered Linear MMA issue rate models that work.
+        t_comp_us = None
+        atom = None
+        count = None
+        t_issue_us = None
+        floor_us = t_mem_us
+        bound = "profile-required"
+    else:
+        t_comp_us = (flops / (DENSE_FP4_TFLOP_S * 1e12)) * 1e6
+        atom = NVFP4_MMA if qtype == "nvfp4" else (BF16_MMA if qtype == "bf16" else S8_MMA)
+        count = mma_count(n, k, t, atom)
+        t_issue_us = None
+        if mma_per_s and mma_per_s > 0:
+            t_issue_us = (count / mma_per_s) * 1e6
+        floors = [t_mem_us, t_comp_us]
+        if t_issue_us is not None:
+            floors.append(t_issue_us)
+        floor_us = max(floors)
+        compute_us = t_comp_us if t_issue_us is None else max(t_comp_us, t_issue_us)
+        bound = "DRAM" if t_mem_us >= compute_us else "tensor-core"
     phase = phase or infer_phase(t)
     sm120 = classify_sm120(
         needs_tmem=needs_tmem, needs_tcgen05=needs_tcgen05,
@@ -470,22 +535,28 @@ def analyze(
         else:
             measured.append(name)
 
-    next_step = (
-        "Do not write CUDA. Attack bytes or raise T per weight pass (aggregate_T / weight_replay)."
-        if bound == "DRAM"
-        else "Stay in the SM120 NVFP4 family. Autotune tile/TMA/pipeline; do not invent a new MMA ISA."
-    )
+    if bound == "profile-required":
+        next_step = (
+            "Profile the exact public GGML Op before choosing a compute-side idea; only "
+            "weight-pass reduction is admitted without a codec compute roof."
+        )
+    elif bound == "DRAM":
+        next_step = "Do not write CUDA. Attack bytes or raise T per weight pass (aggregate_T / weight_replay)."
+    else:
+        next_step = "Stay in the SM120 NVFP4 family. Autotune tile/TMA/pipeline; do not invent a new MMA ISA."
     if idea_card and idea_card["verdict"] == "refuse":
         next_step = f"REFUSE this idea. {idea_card['reason']}"
     elif idea_card and idea_card["verdict"] == "allow":
-        next_step = f"Allowed. Implement only as a parameter inside the current family, then Layer 2 microbench."
+        next_step = "Allowed. Implement as a temporary current-family parameter, then run the Layer 2 public-Op bench."
 
     measured_pct = None
     if measured_us is not None and floor_us > 0:
         measured_pct = 100.0 * floor_us / measured_us
 
     denom = (2 * n * k / (DENSE_FP4_TFLOP_S * 1e12)) - (2 * (n + k) / (SUSTAINED_READ_GB_S * 1e9))
-    ridge_t = (w_bytes / (SUSTAINED_READ_GB_S * 1e9) / denom) if denom > 0 else None
+    ridge_t = None if is_ggml else (
+        w_bytes / (SUSTAINED_READ_GB_S * 1e9) / denom if denom > 0 else None
+    )
 
     return {
         "layer": 0,
@@ -502,7 +573,7 @@ def analyze(
         "t_comp_us": t_comp_us,
         "t_issue_us": t_issue_us,
         "mma_count": count,
-        "mma_atom": {"m": atom[0], "n": atom[1], "k": atom[2]},
+        "mma_atom": None if atom is None else {"m": atom[0], "n": atom[1], "k": atom[2]},
         "floor_us": floor_us,
         "bound": bound,
         "sm120": sm120,
@@ -525,15 +596,31 @@ def render(card: dict) -> str:
     p = card["problem"]
     idea = card.get("idea")
     verdict = (idea or {}).get("verdict", "n/a")
+    default_label = "ggml_block_linear" if p["qtype"].startswith("ggml_") else "linear"
+    if card["bound"] == "profile-required":
+        bound_line = (
+            f"       bound=profile-required  one-read AI={card['ai_flop_per_byte']:.1f} FLOP/B"
+        )
+        timing_line = (
+            f"       one_read_mem={card['t_mem_us']:.2f}us  codec_compute=unmodeled  "
+            f"lower_bound={card['floor_us']:.2f}us"
+        )
+    else:
+        bound_line = (
+            f"       bound={card['bound']}  AI={card['ai_flop_per_byte']:.1f} FLOP/B  "
+            f"ridge={card['ridge_flop_per_byte']:.0f} FLOP/B"
+            + (f"  ridge_T≈{card['ridge_t']:.0f}" if card.get("ridge_t") else "")
+        )
+        timing_line = (
+            f"       t_mem={card['t_mem_us']:.2f}us  t_comp={card['t_comp_us']:.2f}us"
+            + (f"  t_issue={card['t_issue_us']:.2f}us" if card["t_issue_us"] is not None else "  t_issue=n/a")
+            + f"  floor={card['floor_us']:.2f}us"
+        )
     lines = [
-        f"[kdev-bound] {card.get('label') or 'linear'} "
+        f"[kdev-bound] {card.get('label') or default_label} "
         f"[{p['n']},{p['k']}] T={p['t']} {p['qtype']} {p['policy']} phase={p['phase']}",
-        f"       bound={card['bound']}  AI={card['ai_flop_per_byte']:.1f} FLOP/B  "
-        f"ridge={card['ridge_flop_per_byte']:.0f} FLOP/B"
-        + (f"  ridge_T≈{card['ridge_t']:.0f}" if card.get("ridge_t") else ""),
-        f"       t_mem={card['t_mem_us']:.2f}us  t_comp={card['t_comp_us']:.2f}us"
-        + (f"  t_issue={card['t_issue_us']:.2f}us" if card["t_issue_us"] is not None else "  t_issue=n/a")
-        + f"  floor={card['floor_us']:.2f}us",
+        bound_line,
+        timing_line,
         f"       model_bytes={card['model_bytes']}  weight={card['weight_bytes']}  act={card['activation_bytes']}",
     ]
     if card["measured_us"] is not None:
@@ -561,6 +648,15 @@ def _self_test() -> int:
     # linear-benchmark.md §9: Q4 [4096,5120] T=1 weight bytes = 11141120.
     check("q4-weight", weight_bytes(4096, 5120, "q4") == 11141120,
           str(weight_bytes(4096, 5120, "q4")))
+    check("ggml-q5-k-weight", weight_bytes(10240, 2560, "ggml_q5_k") == 18022400,
+          str(weight_bytes(10240, 2560, "ggml_q5_k")))
+    check("ggml-iq4-nl-weight", weight_bytes(2560, 768, "ggml_iq4_nl") == 1105920,
+          str(weight_bytes(2560, 768, "ggml_iq4_nl")))
+    try:
+        weight_bytes(1, 255, "ggml_q5_k")
+        check("ggml-block-divisibility", False, "expected ValueError")
+    except ValueError:
+        check("ggml-block-divisibility", True)
     # NVFP4 9/16 bytes, attn-in.
     check("nvfp4-weight", weight_bytes(14336, 5120, "nvfp4") == 14336 * 5120 * 9 // 16,
           str(weight_bytes(14336, 5120, "nvfp4")))
@@ -576,6 +672,28 @@ def _self_test() -> int:
     check("tile-allow", tile["verdict"] == "allow", tile)
     agg = classify_idea("aggregate_T", "DRAM", 1, "decode")
     check("agg-allow", agg["verdict"] == "allow", agg)
+    ggml = analyze(10240, 2560, 512, "ggml_q5_k", idea="tile_shape")
+    check("ggml-profile-required", ggml["bound"] == "profile-required", ggml["bound"])
+    check("ggml-compute-unmodeled", ggml["t_comp_us"] is None, ggml["t_comp_us"])
+    check("ggml-tile-measure", ggml["idea"]["verdict"] == "measure", ggml["idea"])
+    check("ggml-op-label", "codec_compute=unmodeled" in render(ggml), render(ggml))
+    ggml_t1 = analyze(10240, 2560, 1, "ggml_q5_k", idea="aggregate_T")
+    check("ggml-t1-no-replay", ggml_t1["idea"]["verdict"] == "refuse", ggml_t1["idea"])
+    try:
+        analyze(10240, 2560, 512, "ggml_q5_k", policy="a4")
+        check("ggml-a4-reject", False, "expected ValueError")
+    except ValueError:
+        check("ggml-a4-reject", True)
+    for name, n, k, t in (
+        ("ggml-n-max", 248321, 256, 1),
+        ("ggml-k-max", 1, 10496, 1),
+        ("ggml-t-max", 1, 256, 4097),
+    ):
+        try:
+            analyze(n, k, t, "ggml_q5_k")
+            check(name, False, "expected ValueError")
+        except ValueError:
+            check(name, True)
     illegal = analyze(14336, 5120, 1024, "nvfp4", idea="tile_shape", needs_tcgen05=True)
     check("tmem-gate", illegal["idea"]["verdict"] == "refuse", illegal["idea"])
     check("catalog-keys", tuple(IDEA_CATALOG) == IDEAS, str(tuple(IDEA_CATALOG)))
@@ -591,14 +709,17 @@ def _self_test() -> int:
         for item in failures:
             print("  " + item)
         return 1
-    print("self-test OK  (q4 bytes, nvfp4 bytes, T=1 DRAM, T=1024 TC, idea gates)")
+    print("self-test OK  (registered/GGML bytes, T=1 DRAM, T=1024 TC, idea gates)")
     return 0
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="kdev bound",
-        description="Layer-0 Linear bound classifier. Host-only. Refuses illegal idea classes.",
+        description=(
+            "Layer-0 registered-Linear roof and GGML profile-required gate. Host-only; "
+            "refuses illegal idea classes."
+        ),
     )
     add_problem_arguments(parser)
     parser.add_argument("--json", action="store_true")
