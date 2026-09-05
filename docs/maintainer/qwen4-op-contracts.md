@@ -595,17 +595,27 @@ live C=1 entry accepts arbitrary T partitions, updates the three-column BF16 con
 sequentially, and composes the recurrence in 64-token tiles while preserving one FP32 final state.
 Program owns which in-place state becomes committed.
 
+For exact post-expansion `Hq=Hv=48` prefill, a measured private route begins at 448 full-chunk
+tokens. It normalizes raw BF16 Q directly into the output CTA's FP16 shared Q tile using the same
+FP32 warp reduction and FP16 cast as materialized normalization; normalized K stays in workspace
+for its three consumers. Shorter and every other head profile retain materialized Q/K. This
+changes no public represented boundary or recurrence formula. The workspace interval query
+accounts for the non-monotonic allocation crossover rather than assuming the maximum T always has
+the largest allocation.
+
 The oracle exact-decodes Q5_K/Q6_K bytes and covers projection, width-four causal convolution, Q/K
 L2 normalization, control gates, every FP32 recurrence update, sigmoid output gating, and Q6_K
 output projection. Complete-layer Q5_K T=3 and layer-2 Q6_K T=1 cells, including nonzero initial
 state, compare directly to one sequential FP64 oracle from the represented inputs; a
 distinct-output call proves the rollback boundary. Complete-layer T=64 and T=65 partition cells
 compare chunked execution with the production one-shot route, including exact BF16 convolution
-state and criterion-bound output and FP32 recurrence state. A recurrence-only real-geometry cell
-uses the post-expansion `Hq=Hv=48,D=128,T=4096` represented inputs for scalar T=1, one-shot,
-aligned 64x64, and `64+1+1986+1+2044` schedules. Every route's complete BF16 output, selected
-cumulative prefixes, and final FP32 state compare directly to one complete FP64 recurrence oracle;
-pairwise bit comparisons remain diagnostic implementation-profile evidence.
+state and criterion-bound output and FP32 recurrence state. Recurrence-only T=447/448/449 cells at
+post-expansion `Hq=Hv=48,D=128` cover the last materialized-Q call, the fused single-job boundary,
+and its first recurrent tail. The maximum-width real-geometry cell uses matching T=4096 represented
+inputs for scalar T=1, one-shot, aligned 64x64, and `64+1+1986+1+2044` schedules. Every route's
+complete BF16 output, selected cumulative prefixes, and final FP32 state compare directly to one
+complete FP64 recurrence oracle; pairwise bit comparisons remain diagnostic implementation-profile
+evidence.
 
 ## 9. Live C=1 sparse-MoE verifier
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/common/mma.cuh"
+#include "ops/common/warp.cuh"
 #include "ops/linear_attention/gated_delta_net/chunked/common.cuh"
 
 #include <cmath>
@@ -12,10 +13,12 @@
 //   A[t,s] = (s <= t) ? dot(q[t], k[s]) * exp(g[t] - g[s]) : 0
 //   out    = scale * (exp(g) * q @ h_chunk^T + A @ v_new)
 //
-// Public Q/K/V and state inputs retain their represented types. With fused
-// Q/K normalization, private Q/K/W/U/v_new/h_chunk staging uses FP16 to retain
-// a 10-bit significand at the same traffic as BF16; the raw-Q/K route remains
-// BF16. The decayed A matrix remains FP32 through TF32 MMA for A @ V.
+// Public Q/K/V and state inputs retain their represented types. The long,
+// exact Qwen4 Hq=Hv=48 route normalizes raw BF16 Q directly into its resident
+// FP16 shared tile; normalized K and private W/U/v_new/h_chunk remain FP16.
+// Short or grouped-head normalization keeps materialized FP16 Q/K, while the
+// raw-Q/K route remains BF16. The decayed A matrix remains FP32 through TF32
+// MMA for A @ V.
 //
 // Shared memory: persistent 16-bit Q (16 KiB) and two 4 KiB 16-bit staging
 // buffers, for 24 KiB total. FP32 g reuses the K buffer that becomes dead
@@ -154,27 +157,53 @@ __device__ __forceinline__ void mma_av_panel(float (&D)[N_TILES][4], const float
     }
 }
 
-template <bool QK_F16>
+template <class PrivateType, bool NormalizeQ>
+__device__ __forceinline__ void load_q_tile(
+    Smem16Tile<PrivateType, kStateDim> q_view, const void* __restrict__ q_raw,
+    std::int64_t q_base, std::int64_t qk_stride_t, int tid) {
+    if constexpr (!NormalizeQ) {
+        const auto* const q_in = static_cast<const PrivateType*>(q_raw);
+        issue_cp_16<BT, kStateDim, THREADS>(q_view, q_in + q_base, qk_stride_t, tid);
+    } else {
+        static_assert(std::is_same_v<PrivateType, __half>);
+        const auto* const q_in = static_cast<const __nv_bfloat16*>(q_raw);
+        const int lane         = tid & (kWarpSize - 1);
+        const int warp         = tid / kWarpSize;
+        for (int row = warp; row < BT; row += N_WARPS) {
+            const std::int64_t row_base = q_base + static_cast<std::int64_t>(row) * qk_stride_t;
+            __half2 normalized[2];
+            normalize_bf16_128_row_to_fp16_lane(
+                reinterpret_cast<const __nv_bfloat162*>(q_in + row_base), lane, normalized);
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                const int pair  = lane + k * kWarpSize;
+                *reinterpret_cast<__half2*>(q_view.ptr(row, 2 * pair)) =
+                    normalized[k];
+            }
+        }
+    }
+}
+
+template <bool PRIVATE_F16, bool NORMALIZE_Q>
 __device__ __forceinline__ void
 output_job(const void* __restrict__ q_raw, const void* __restrict__ k_raw,
            const void* __restrict__ v_new_raw, const float* __restrict__ g_cumsum_in,
            const void* __restrict__ h_chunk_raw, __nv_bfloat16* __restrict__ attn_out,
            head_map qk_map, float scale, int chunk, int h_v, float* smem) {
-    using QKType                 = std::conditional_t<QK_F16, __half, __nv_bfloat16>;
-    const auto* const q_in       = static_cast<const QKType*>(q_raw);
-    const auto* const k_in       = static_cast<const QKType*>(k_raw);
-    const auto* const v_new_in   = static_cast<const QKType*>(v_new_raw);
-    const auto* const h_chunk_in = static_cast<const QKType*>(h_chunk_raw);
-    auto* const q_smem           = reinterpret_cast<QKType*>(smem);
+    using PrivateType            = std::conditional_t<PRIVATE_F16, __half, __nv_bfloat16>;
+    const auto* const k_in       = static_cast<const PrivateType*>(k_raw);
+    const auto* const v_new_in   = static_cast<const PrivateType*>(v_new_raw);
+    const auto* const h_chunk_in = static_cast<const PrivateType*>(h_chunk_raw);
+    auto* const q_smem           = reinterpret_cast<PrivateType*>(smem);
     auto* const stage0           = q_smem + kernel_dims::Q_BF16;
     auto* const stage1           = stage0 + kernel_dims::STAGE_BF16;
     float* const g_smem          = reinterpret_cast<float*>(stage0 + kernel_dims::V_PANEL_BF16);
 
-    Smem16Tile<QKType, kStateDim> q_view{q_smem};
-    Smem16Tile<QKType, K_PANEL> k_stage0{reinterpret_cast<QKType*>(stage0)};
-    Smem16Tile<QKType, K_PANEL> k_stage1{reinterpret_cast<QKType*>(stage1)};
-    Smem16Tile<QKType, kStateDim> h_view{reinterpret_cast<QKType*>(stage0)};
-    Smem16Tile<QKType, D_PANEL> v_view{reinterpret_cast<QKType*>(stage1)};
+    Smem16Tile<PrivateType, kStateDim> q_view{q_smem};
+    Smem16Tile<PrivateType, K_PANEL> k_stage0{reinterpret_cast<PrivateType*>(stage0)};
+    Smem16Tile<PrivateType, K_PANEL> k_stage1{reinterpret_cast<PrivateType*>(stage1)};
+    Smem16Tile<PrivateType, kStateDim> h_view{reinterpret_cast<PrivateType*>(stage0)};
+    Smem16Tile<PrivateType, D_PANEL> v_view{reinterpret_cast<PrivateType*>(stage1)};
 
     const int tid    = static_cast<int>(threadIdx.x);
     const int lane   = tid & (kWarpSize - 1);
@@ -196,9 +225,16 @@ output_job(const void* __restrict__ q_raw, const void* __restrict__ k_raw,
 
     // Q is permanent. K uses two 64x32 16-bit buffers and is prefetched one
     // panel ahead while the current panel feeds native 16-bit MMA.
-    issue_cp_16<BT, kStateDim, THREADS>(q_view, q_in + q_base, qk_stride_t, tid);
-    issue_cp_16<BT, K_PANEL, THREADS>(k_stage0, k_in + k_base, qk_stride_t, tid);
-    cp_commit();
+    if constexpr (NORMALIZE_Q) {
+        issue_cp_16<BT, K_PANEL, THREADS>(k_stage0, k_in + k_base, qk_stride_t, tid);
+        cp_commit();
+        load_q_tile<PrivateType, true>(q_view, q_raw, q_base, qk_stride_t, tid);
+    } else {
+        // Preserve the original private/pre-normalized path's single async copy group.
+        load_q_tile<PrivateType, false>(q_view, q_raw, q_base, qk_stride_t, tid);
+        issue_cp_16<BT, K_PANEL, THREADS>(k_stage0, k_in + k_base, qk_stride_t, tid);
+        cp_commit();
+    }
     cp_wait<0>();
     __syncthreads();
 
@@ -206,9 +242,9 @@ output_job(const void* __restrict__ q_raw, const void* __restrict__ k_raw,
 
 #pragma unroll
     for (int panel = 0; panel < N_K_PANELS; ++panel) {
-        Smem16Tile<QKType, K_PANEL> current = (panel & 1) == 0 ? k_stage0 : k_stage1;
+        Smem16Tile<PrivateType, K_PANEL> current = (panel & 1) == 0 ? k_stage0 : k_stage1;
         if (panel + 1 < N_K_PANELS) {
-            Smem16Tile<QKType, K_PANEL> next = (panel & 1) == 0 ? k_stage1 : k_stage0;
+            Smem16Tile<PrivateType, K_PANEL> next = (panel & 1) == 0 ? k_stage1 : k_stage0;
             issue_cp_16<BT, K_PANEL, THREADS>(
                 next, k_in + k_base + static_cast<std::int64_t>(panel + 1) * K_PANEL, qk_stride_t,
                 tid);
@@ -219,7 +255,7 @@ output_job(const void* __restrict__ q_raw, const void* __restrict__ k_raw,
             g_smem[tid] = g_cumsum_in[(cs + static_cast<std::int64_t>(tid)) * H_v + h_v];
         }
 
-        mma_16_panel<QK_F16, N_TILES_BT, K_PANEL / BF16_MMA_K>(
+        mma_16_panel<PRIVATE_F16, N_TILES_BT, K_PANEL / BF16_MMA_K>(
             A_strip, q_view, current, warp * MMA_M, panel * K_PANEL, 0, lane);
 
         if (panel + 1 < N_K_PANELS) {
@@ -302,8 +338,8 @@ output_job(const void* __restrict__ q_raw, const void* __restrict__ k_raw,
         cp_commit();
 
         float D_frag[D_PANEL / MMA_N][4] = {};
-        mma_16_panel<QK_F16, D_PANEL / MMA_N, kStateDim / BF16_MMA_K>(D_frag, q_view, h_view,
-                                                                      warp * MMA_M, 0, 0, lane);
+        mma_16_panel<PRIVATE_F16, D_PANEL / MMA_N, kStateDim / BF16_MMA_K>(
+            D_frag, q_view, h_view, warp * MMA_M, 0, 0, lane);
 
 #pragma unroll
         for (int nt = 0; nt < D_PANEL / MMA_N; ++nt) {
@@ -324,7 +360,7 @@ output_job(const void* __restrict__ q_raw, const void* __restrict__ k_raw,
             cp_commit();
         }
 
-        mma_av_panel<QKType>(D_frag, A_a, v_view, lane_g, lane_t);
+        mma_av_panel<PrivateType>(D_frag, A_a, v_view, lane_g, lane_t);
 
 #pragma unroll
         for (int nt = 0; nt < D_PANEL / MMA_N; ++nt) {
@@ -348,7 +384,7 @@ output_job(const void* __restrict__ q_raw, const void* __restrict__ k_raw,
     }
 }
 
-template <bool QK_F16, bool MULTI_JOB>
+template <bool PRIVATE_F16, bool NORMALIZE_Q, bool MULTI_JOB>
 __launch_bounds__(THREADS, 4) __global__
     void output_kernel(const void* __restrict__ q_in, const void* __restrict__ k_in,
                        const void* __restrict__ v_new_in, const float* __restrict__ g_cumsum_in,
@@ -360,13 +396,14 @@ __launch_bounds__(THREADS, 4) __global__
     if constexpr (MULTI_JOB) {
         const int chunk_stride = static_cast<int>(gridDim.x);
         for (int chunk = static_cast<int>(blockIdx.x); chunk < chunks; chunk += chunk_stride) {
-            output_job<QK_F16>(q_in, k_in, v_new_in, g_cumsum_in, h_chunk_in, attn_out, qk_map,
-                               scale, chunk, h_v, smem);
+            output_job<PRIVATE_F16, NORMALIZE_Q>(q_in, k_in, v_new_in, g_cumsum_in, h_chunk_in,
+                                                attn_out, qk_map, scale, chunk, h_v, smem);
             if (chunk + chunk_stride < chunks) { __syncthreads(); }
         }
     } else {
-        output_job<QK_F16>(q_in, k_in, v_new_in, g_cumsum_in, h_chunk_in, attn_out, qk_map, scale,
-                           static_cast<int>(blockIdx.x), h_v, smem);
+        output_job<PRIVATE_F16, NORMALIZE_Q>(q_in, k_in, v_new_in, g_cumsum_in, h_chunk_in,
+                                            attn_out, qk_map, scale,
+                                            static_cast<int>(blockIdx.x), h_v, smem);
     }
 }
 

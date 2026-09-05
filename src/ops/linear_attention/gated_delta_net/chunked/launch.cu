@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/common/warp.cuh"
+#include "ops/linear_attention/gated_delta_net/common.cuh"
 #include "ops/linear_attention/gated_delta_net/chunked/launch.h"
 
 #include <cuda_bf16.h>
@@ -20,7 +21,6 @@ __launch_bounds__(Block) __global__
     void normalize_bf16_to_fp16_kernel(const __nv_bfloat162* x, __half2* out, std::int64_t rows) {
     static_assert(Block % ninfer::ops::kWarpSize == 0);
     constexpr int kWarpsPerBlock = Block / ninfer::ops::kWarpSize;
-    constexpr int kPairsPerLane  = 2;
     constexpr int kPairsPerRow   = kStateDim / 2;
     const int lane               = static_cast<int>(threadIdx.x) & (ninfer::ops::kWarpSize - 1);
     const int warp               = static_cast<int>(threadIdx.x) / ninfer::ops::kWarpSize;
@@ -28,24 +28,12 @@ __launch_bounds__(Block) __global__
     if (row >= rows) { return; }
 
     const std::int64_t row_base = row * kPairsPerRow;
-    __nv_bfloat162 values[kPairsPerLane];
-    float sum = 0.0f;
+    __half2 normalized[2];
+    normalize_bf16_128_row_to_fp16_lane(x + row_base, lane, normalized);
 #pragma unroll
-    for (int k = 0; k < kPairsPerLane; ++k) {
+    for (int k = 0; k < 2; ++k) {
         const int pair  = lane + k * ninfer::ops::kWarpSize;
-        values[k]       = x[row_base + pair];
-        const float2 xf = __bfloat1622float2(values[k]);
-        sum += xf.x * xf.x + xf.y * xf.y;
-    }
-
-    sum       = ninfer::ops::warp_reduce_sum(sum);
-    float inv = lane == 0 ? rsqrtf(sum + 1.0e-6f) : 0.0f;
-    inv       = __shfl_sync(ninfer::ops::kFullWarpMask, inv, 0);
-#pragma unroll
-    for (int k = 0; k < kPairsPerLane; ++k) {
-        const int pair       = lane + k * ninfer::ops::kWarpSize;
-        const float2 xf      = __bfloat1622float2(values[k]);
-        out[row_base + pair] = __floats2half2_rn(xf.x * inv, xf.y * inv);
+        out[row_base + pair] = normalized[k];
     }
 }
 
@@ -73,10 +61,10 @@ std::size_t chunked_workspace_bytes(std::int32_t value_heads, std::int32_t token
 }
 
 void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                    const Tensor& beta, float scale, const Tensor& ssm_state_in,
+                    const Tensor& beta, float scale, bool normalize_q, const Tensor& ssm_state_in,
                     Tensor& ssm_state_out, Tensor& out, void* workspace,
                     std::size_t workspace_bytes, cudaStream_t stream) {
-    const auto layout = chunked::compute_workspace_layout(v.ne[1], q.ne[2], q.dtype);
+    const auto layout = chunked::compute_workspace_layout(v.ne[1], q.ne[2], k.dtype);
     if (workspace == nullptr || workspace_bytes < layout.total_bytes) { throw std::bad_alloc(); }
 
     const DeviceSpan backing{workspace, workspace_bytes};
@@ -123,7 +111,8 @@ void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Ten
     output.L            = q.ne[2];
     output.q            = q.data;
     output.k            = k.data;
-    output.private_fp16 = q.dtype == DType::FP16;
+    output.private_fp16 = k.dtype == DType::FP16;
+    output.normalize_q  = normalize_q;
     output.v_new        = v_new.data;
     output.g_cumsum     = static_cast<const float*>(g_cumsum.data);
     output.h_chunk      = h_chunk.data;
