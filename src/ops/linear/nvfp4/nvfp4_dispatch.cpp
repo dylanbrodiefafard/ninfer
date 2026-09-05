@@ -72,6 +72,18 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
 
 } // namespace
 
+bool is_nvfp4_dflash_w5_aggregate_problem(std::int32_t output_rows, std::int32_t input_rows,
+                                          LinearPolicy policy) noexcept {
+    if (!is_nvfp4_linear_problem(output_rows, input_rows)) { return false; }
+    const Nvfp4Problem problem = resolve_nvfp4_problem(output_rows, input_rows);
+    if (problem == Nvfp4Problem::DflashQkv || problem == Nvfp4Problem::DflashAttnOut) {
+        return policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA4;
+    }
+    if (problem == Nvfp4Problem::DflashConvProj) { return policy == LinearPolicy::A16Only; }
+    return policy == LinearPolicy::AllowA4 && (problem == Nvfp4Problem::MlpGateUp ||
+                                               problem == Nvfp4Problem::Residual17408);
+}
+
 std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t output_rows, std::int32_t input_rows,
                                                   LinearPolicy policy, std::int32_t min_tokens,
                                                   std::int32_t max_tokens) {

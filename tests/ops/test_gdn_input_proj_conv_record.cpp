@@ -1117,6 +1117,25 @@ int run_nvfp4_batched_matches_serial_fused() {
     return failures;
 }
 
+int verify_nvfp4_grouped_workspace_interval() {
+    constexpr std::int32_t kParentRows = 16384;
+    constexpr std::int32_t kHidden     = 5120;
+    constexpr std::int32_t kBatch      = 3;
+    const auto capacity = [&](std::int32_t first, std::int32_t last) {
+        return ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+            QType::NVFP4, kParentRows, kHidden, ops::LinearPolicy::AllowA4, kBatch, first, last);
+    };
+    const std::size_t width2 = capacity(2, 2);
+    const std::size_t width5 = capacity(5, 5);
+    int failures             = 0;
+    if (width2 == 0 || width5 <= width2 || capacity(2, 4) != width2 || capacity(3, 4) != 0 ||
+        capacity(5, 16) != width5 || capacity(2, 16) != width5) {
+        std::cerr << "NVFP4 grouped record workspace interval is not the minimum high-water\n";
+        ++failures;
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -1134,6 +1153,7 @@ int main() {
     failures += run_nvfp4_compose_chain_matches_snapshot();
     failures += run_nvfp4_tree_chain_matches_sequential_fused();
     failures += run_nvfp4_batched_matches_serial_fused();
+    failures += verify_nvfp4_grouped_workspace_interval();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_record\n";
     return failures == 0 ? 0 : 1;
 }

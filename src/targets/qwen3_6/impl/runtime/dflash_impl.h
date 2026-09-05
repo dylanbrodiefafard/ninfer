@@ -273,7 +273,10 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
     if constexpr (!V::supports_dflash) {
         throw std::logic_error("DFlash proposal is unavailable for this target");
     } else {
-        if (batch_size > 1) {
+        using Config = typename V::DFlashConfig;
+        const bool lockstep_dflash4 = Config::kind == qwen3_6::DFlashKind::DFlash2 && k == 4 &&
+                                      verify_width == k + 1;
+        if (batch_size > 1 && !lockstep_dflash4) {
             for (std::int32_t row = 0; row < batch_size; ++row) {
                 propose_batch_impl<V>(state, frame, 1, k, envelopes, verify_width,
                                       exact_sequence_envelope, row_begin + row);
@@ -284,7 +287,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
         // route is selected from max_context. Use the host ingress frontier so an isolated row
         // takes the same route as an eager C=1 call. Captured graphs retain their fixed profile
         // envelope because launch topology cannot vary across replays.
-        if (exact_sequence_envelope) {
+        if (exact_sequence_envelope && batch_size == 1) {
             const std::int32_t frontier = state.host_ingress.execution_frontiers.at(
                 static_cast<std::size_t>(row_begin));
             if (frontier < 0) {
@@ -294,7 +297,6 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
             envelopes.local    = {0, visible};
             envelopes.full     = {0, visible};
         }
-        using Config                     = typename V::DFlashConfig;
         const std::int32_t full_width    = static_cast<std::int32_t>(k) + 1;
         std::int32_t width               = full_width;
         std::int32_t columns             = width * batch_size;
@@ -404,11 +406,42 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                         value.view({Config::head_dim, Config::kv_heads, width, batch_size});
                     Tensor attention_batch = roots.attention.view(
                         {Config::head_dim, Config::query_heads, width, batch_size});
-                    ops::swa(query_batch, key_batch, value_batch, positions, valid_columns, lanes,
-                             Config::attention_scale,
-                             dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
-                             envelopes.local, state.execution.work, attention_batch,
-                             state.execution.device.stream);
+                    if (batch_size == 1) {
+                        ops::swa(
+                            query_batch, key_batch, value_batch, positions, valid_columns, lanes,
+                            Config::attention_scale,
+                            dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
+                            envelopes.local, state.execution.work, attention_batch,
+                            state.execution.device.stream);
+                    } else {
+                        for (std::int32_t row = 0; row < batch_size; ++row) {
+                            ops::SwaContextExecutionEnvelope row_envelope = envelopes.local;
+                            if (exact_sequence_envelope) {
+                                const std::int32_t frontier =
+                                    state.host_ingress.execution_frontiers.at(
+                                        static_cast<std::size_t>(row_begin + row));
+                                if (frontier < 0) {
+                                    throw std::logic_error(
+                                        "DFlash proposal frontier must be non-negative");
+                                }
+                                const auto visible    = static_cast<std::uint32_t>(frontier);
+                                row_envelope           = {0, visible};
+                            }
+                            Tensor query_row     = query_batch.slice(3, row, 1);
+                            Tensor key_row       = key_batch.slice(3, row, 1);
+                            Tensor value_row     = value_batch.slice(3, row, 1);
+                            Tensor position_row  = positions.slice(1, row, 1);
+                            Tensor valid_row     = valid_columns.slice(0, row, 1);
+                            Tensor lane_row      = lanes.slice(0, row, 1);
+                            Tensor attention_row = attention_batch.slice(3, row, 1);
+                            ops::swa(
+                                query_row, key_row, value_row, position_row, valid_row, lane_row,
+                                Config::attention_scale,
+                                dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
+                                row_envelope, state.execution.work, attention_row,
+                                state.execution.device.stream);
+                        }
+                    }
                     ops::linear_packed_sequences(
                         roots.attention.view({Config::query_size, columns}),
                         weight.attention_output, roots.delta,
@@ -765,15 +798,32 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                                              state.execution.device.stream, logit_token_ids,
                                              dflash2_nvfp4_codebook(dflash.predecessor_codebook_nvfp4),
                                              dflash2_nvfp4_codebook(dflash.successor_codebook_nvfp4));
+                } else if (batch_size == 1) {
+                    ops::dflash2_path_select(
+                        logits_batch, hidden_batch, dflash.hidden_projection,
+                        dflash.predecessor_codebook, dflash.successor_codebook, anchors, frontiers,
+                        frame.sampling + row_begin, drafts, state.execution.work,
+                        state.execution.device.stream, logit_token_ids,
+                        dflash2_nvfp4_codebook(dflash.predecessor_codebook_nvfp4),
+                        dflash2_nvfp4_codebook(dflash.successor_codebook_nvfp4), &sel_ids, &sel_q);
                 } else {
-                    ops::dflash2_path_select(logits_batch, hidden_batch, dflash.hidden_projection,
-                                             dflash.predecessor_codebook, dflash.successor_codebook,
-                                             anchors, frontiers, frame.sampling + row_begin, drafts,
-                                             state.execution.work, state.execution.device.stream,
-                                             logit_token_ids,
-                                             dflash2_nvfp4_codebook(dflash.predecessor_codebook_nvfp4),
-                                             dflash2_nvfp4_codebook(dflash.successor_codebook_nvfp4),
-                                             &sel_ids, &sel_q);
+                    for (std::int32_t row = 0; row < batch_size; ++row) {
+                        Tensor logits_row = logits_batch.slice(2, row, 1);
+                        Tensor hidden_row = hidden_batch.slice(2, row, 1);
+                        Tensor anchor_row = anchors.slice(0, row, 1);
+                        Tensor frontier_row = frontiers.slice(0, row, 1);
+                        Tensor draft_row = drafts.slice(1, row, 1);
+                        Tensor sel_ids_row = sel_ids.slice(2, row, 1);
+                        Tensor sel_q_row = sel_q.slice(2, row, 1);
+                        ops::dflash2_path_select(
+                            logits_row, hidden_row, dflash.hidden_projection,
+                            dflash.predecessor_codebook, dflash.successor_codebook, anchor_row,
+                            frontier_row, frame.sampling + row_begin + row, draft_row,
+                            state.execution.work, state.execution.device.stream, logit_token_ids,
+                            dflash2_nvfp4_codebook(dflash.predecessor_codebook_nvfp4),
+                            dflash2_nvfp4_codebook(dflash.successor_codebook_nvfp4), &sel_ids_row,
+                            &sel_q_row);
+                    }
                 }
             };
             const auto refine_unmask = [&](Tensor& logits, const auto& head,
@@ -1056,10 +1106,10 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                          state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache);
-        // Target verify stays packed B=batch. Linear/GDN-control panel at C=1 width.
-        // GQA uses request-indexed decode CTAs; packed GDN conv-record uses fused T=1
-        // reduction at B=1 and one request-indexed SmallT grid at B=2..4. Isolating the whole
-        // 27B forward serialized C=2 and broke graph capture.
+        // Target verify stays packed B=batch. Linear and GDN control preserve the C=1-width
+        // reduction profile, with qualified W=5 aggregation across B=2..4. GQA remains
+        // request-indexed. Packed GDN conv-record uses fused T=1 reduction at B=1, qualified
+        // W=2/5 grouped weight replay at B=2..4, and request-indexed SmallT otherwise.
         DFlashFeatureSink sink =
             batch_feature_sink_impl<Variant>(state, lanes, valid_columns, vw, batch_size);
         TargetVerifyFrameView verify_frame{

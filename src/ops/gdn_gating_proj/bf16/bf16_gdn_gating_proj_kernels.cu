@@ -24,6 +24,7 @@ constexpr int kThreads            = 256;
 constexpr int kLogicalRows        = 2 * kN;
 constexpr int kSmallTMax          = 8;
 constexpr int kGemvPackedMax      = 16;
+constexpr int kGemvPackedExtendedMax = 20;
 constexpr int kSmallTKSlice       = 512;
 constexpr int kSmallTSplits       = kK / kSmallTKSlice;
 constexpr int kSmallTRowsPerBlock = 4;
@@ -142,20 +143,22 @@ __global__ void bf16_gdn_gating_proj_small_t_reduce_kernel(const float* __restri
     beta[out_index]              = sigmoid(acc_b);
 }
 
+template <int PackedMax>
 __global__ void bf16_gdn_gating_proj_gemv_kernel(const __nv_bfloat16* x,
                                                  const __nv_bfloat16* a_weight,
                                                  const __nv_bfloat16* b_weight, const float* A_log,
                                                  const float* dt_bias, float* g, float* beta,
                                                  std::int32_t t) {
+    static_assert(PackedMax == kGemvPackedMax || PackedMax == kGemvPackedExtendedMax);
     const int global_row = static_cast<int>(blockIdx.x);
     const bool is_b      = global_row >= kN;
     const int row        = is_b ? global_row - kN : global_row;
     const auto* weight   = is_b ? b_weight : a_weight;
     __shared__ float warp_sums[kThreads / kWarpSize];
 
-    float acc[kGemvPackedMax];
+    float acc[PackedMax];
 #pragma unroll
-    for (int tt = 0; tt < kGemvPackedMax; ++tt) { acc[tt] = 0.0f; }
+    for (int tt = 0; tt < PackedMax; ++tt) { acc[tt] = 0.0f; }
 
     constexpr int kPairs        = kK / 2;
     const std::int64_t row_base = static_cast<std::int64_t>(row) * kK;
@@ -164,7 +167,7 @@ __global__ void bf16_gdn_gating_proj_gemv_kernel(const __nv_bfloat16* x,
     for (int p = static_cast<int>(threadIdx.x); p < kPairs; p += static_cast<int>(blockDim.x)) {
         const float2 wf = bf16x2_to_float2(w2[p]);
 #pragma unroll
-        for (int tt = 0; tt < kGemvPackedMax; ++tt) {
+        for (int tt = 0; tt < PackedMax; ++tt) {
             if (tt < t) {
                 const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(
                     x + static_cast<std::int64_t>(tt) * kK);
@@ -353,15 +356,22 @@ void bf16_gdn_gating_proj_gemv_launch(const Tensor& x, const Weight& a_weight,
     require_shape(a_weight, "a_weight");
     require_shape(b_weight, "b_weight");
     const std::int32_t t = x.ne[1];
-    if (t < 1 || t > kGemvPackedMax) {
-        throw std::invalid_argument("gdn_gating_proj: GEMV/small-T fused admits T=1..16");
+    if (t < 1 || t > kGemvPackedExtendedMax) {
+        throw std::invalid_argument("gdn_gating_proj: GEMV/small-T fused admits T=1..20");
     }
-    bf16_gdn_gating_proj_gemv_kernel<<<2 * kN, kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data),
-        static_cast<const __nv_bfloat16*>(a_weight.qdata),
-        static_cast<const __nv_bfloat16*>(b_weight.qdata), static_cast<const float*>(A_log.data),
-        static_cast<const float*>(dt_bias.data), static_cast<float*>(g.data),
-        static_cast<float*>(beta.data), t);
+    const auto launch = [&]<int PackedMax>() {
+        bf16_gdn_gating_proj_gemv_kernel<PackedMax><<<2 * kN, kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const __nv_bfloat16*>(a_weight.qdata),
+            static_cast<const __nv_bfloat16*>(b_weight.qdata),
+            static_cast<const float*>(A_log.data), static_cast<const float*>(dt_bias.data),
+            static_cast<float*>(g.data), static_cast<float*>(beta.data), t);
+    };
+    if (t <= kGemvPackedMax) {
+        launch.template operator()<kGemvPackedMax>();
+    } else {
+        launch.template operator()<kGemvPackedExtendedMax>();
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -407,8 +417,8 @@ void bf16_gdn_gating_proj_small_t_fused_launch(const Tensor& x, const Weight& a_
                                                Tensor& beta, cudaStream_t stream) {
     (void)workspace;
     (void)workspace_bytes;
-    if (x.ne[1] < 2 || x.ne[1] > kGemvPackedMax) {
-        throw std::invalid_argument("gdn_gating_proj: small-T fused admits T=2..16");
+    if (x.ne[1] < 2 || x.ne[1] > kGemvPackedExtendedMax) {
+        throw std::invalid_argument("gdn_gating_proj: small-T fused admits T=2..20");
     }
     // Same 96-CTA GEMV reduction as T=1, one launch, weights streamed once. Column 0 is
     // bit-identical to ordinary decode GEMV; split-K SmallT and MMA split-8 were not.

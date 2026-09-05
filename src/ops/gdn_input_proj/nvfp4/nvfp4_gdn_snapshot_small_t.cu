@@ -21,27 +21,27 @@ using RecordLaunch = void (*)(const Tensor&, const Weight&, const Tensor&, const
                               Tensor&, WorkspaceArena&, const std::int32_t*, cudaStream_t);
 
 template <class Geometry>
-struct Nvfp4PairedPackedActivation {
+struct Nvfp4GroupedPackedActivation {
     const __nv_bfloat16* x;
-    int pair_width;
+    int group_width;
     int columns;
 
     __device__ __forceinline__ const __nv_bfloat16* values(int token, int value_begin) const {
-        int column = static_cast<int>(blockIdx.x) * pair_width + token;
+        int column = static_cast<int>(blockIdx.x) * group_width + token;
         column     = column < columns ? column : columns - 1;
         return x + static_cast<std::int64_t>(column) * Geometry::kInputRows + value_begin;
     }
 };
 
-template <int Width>
-struct Nvfp4PairedGdnProjectionOutput {
+template <int Width, int RequestsPerGroup>
+struct Nvfp4GroupedGdnProjectionOutput {
     float* projected;
     __nv_bfloat16* z;
     int columns;
 
     __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
                                           float value) const {
-        const int column = static_cast<int>(blockIdx.x) * (2 * Width) + token;
+        const int column = static_cast<int>(blockIdx.x) * (RequestsPerGroup * Width) + token;
         if (column >= columns) { return; }
         if (parent_row < kNvfp4GdnChannels) {
             projected[static_cast<std::int64_t>(column) * kNvfp4GdnChannels + parent_row] = value;
@@ -52,8 +52,33 @@ struct Nvfp4PairedGdnProjectionOutput {
     }
 };
 
+template <class Geometry>
+struct Nvfp4TriplePackedActivation {
+    const __nv_bfloat16* x;
+
+    __device__ __forceinline__ const __nv_bfloat16* values(int token, int value_begin) const {
+        return x + static_cast<std::int64_t>(token) * Geometry::kInputRows + value_begin;
+    }
+};
+
+template <int Width>
+struct Nvfp4TripleGdnProjectionOutput {
+    float* projected;
+    __nv_bfloat16* z;
+
+    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
+                                          float value) const {
+        if (parent_row < kNvfp4GdnChannels) {
+            projected[static_cast<std::int64_t>(token) * kNvfp4GdnChannels + parent_row] = value;
+        } else {
+            z[static_cast<std::int64_t>(token) * kNvfp4GdnZRows + parent_row -
+              kNvfp4GdnChannels] = __float2bfloat16_rn(value);
+        }
+    }
+};
+
 template <int Width, bool Tree, class Publish>
-__global__ __launch_bounds__(256) void nvfp4_paired_gdn_conv_kernel(
+__global__ __launch_bounds__(256) void nvfp4_grouped_gdn_conv_kernel(
     const float* __restrict__ projected, GdnConvEpilogue<Publish, Tree> conv, int batch) {
     const int batch_row = static_cast<int>(blockIdx.x);
     const int row =
@@ -71,40 +96,42 @@ __global__ __launch_bounds__(256) void nvfp4_paired_gdn_conv_kernel(
     conv.store(row, row_projection);
 }
 
-template <int Width, bool Tree, class Publish>
-void launch_paired_record(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
-                          const Tensor& conv_states, const Tensor& valid_columns,
-                          const Tensor& initial_slot, Tensor& conv_record, Tensor& query,
-                          Tensor& key, Tensor& value, Tensor& z, Publish publish,
-                          WorkspaceArena& workspace, cudaStream_t stream,
-                          const std::int32_t* parent_index) {
-    using Geometry            = Nvfp4GdnInputGeometry;
-    constexpr int kPairTokens = 2 * Width;
+template <int Width, int RequestsPerGroup, bool Tree, class Publish>
+void launch_grouped_record(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
+                           const Tensor& conv_states, const Tensor& valid_columns,
+                           const Tensor& initial_slot, Tensor& conv_record, Tensor& query,
+                           Tensor& key, Tensor& value, Tensor& z, Publish publish,
+                           WorkspaceArena& workspace, cudaStream_t stream,
+                           const std::int32_t* parent_index) {
+    using Geometry                = Nvfp4GdnInputGeometry;
+    constexpr int kGroupedTokens  = RequestsPerGroup * Width;
+    constexpr int kRowsPerWarp    = 2;
     // Match the W-local GDN reduction exactly: 8 warps, 16 values/lane, four
-    // accumulator chains. Only the token register panel is widened to replay weights.
+    // accumulator chains. Only the token register panel widens to replay weights.
     using Schedule =
-        Nvfp4SmallTSchedule<8, 1, 2, 16, kPairTokens, 4, Nvfp4SmallTActivationAccess::TokenPacked,
+        Nvfp4SmallTSchedule<8, 1, kRowsPerWarp, 16, kGroupedTokens, 4,
+                            Nvfp4SmallTActivationAccess::TokenPacked,
                             Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 1,
                             Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const int batch       = x.ne[2];
     const int columns     = batch * Width;
-    const int pair_count  = (batch + 1) / 2;
+    const int group_count = (batch + RequestsPerGroup - 1) / RequestsPerGroup;
     const float inverse   = 1.0F / weight.weight_scale_divisor;
 
     auto scope       = workspace.scope();
     Tensor projected = workspace.alloc(DType::FP32, {kNvfp4GdnChannels, Width, batch}, 256);
-    nvfp4_small_t_kernel<Geometry, kPairTokens, Schedule, Nvfp4IdentityEpilogue,
-                         Nvfp4PairedGdnProjectionOutput<Width>,
+    nvfp4_small_t_kernel<Geometry, kGroupedTokens, Schedule, Nvfp4IdentityEpilogue,
+                         Nvfp4GroupedGdnProjectionOutput<Width, RequestsPerGroup>,
                          Nvfp4SmallTFinalization::Elementwise,
-                         Nvfp4PairedPackedActivation<Geometry>>
-        <<<dim3(pair_count, kBlocks), Schedule::kThreads, 0, stream>>>(
-            Nvfp4PairedPackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data),
-                                                  kPairTokens, columns},
+                         Nvfp4GroupedPackedActivation<Geometry>>
+        <<<dim3(group_count, kBlocks), Schedule::kThreads, 0, stream>>>(
+            Nvfp4GroupedPackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data),
+                                                   kGroupedTokens, columns},
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), inverse, Nvfp4IdentityEpilogue{},
-            Nvfp4PairedGdnProjectionOutput<Width>{static_cast<float*>(projected.data),
-                                                  static_cast<__nv_bfloat16*>(z.data), columns});
+            Nvfp4GroupedGdnProjectionOutput<Width, RequestsPerGroup>{
+                static_cast<float*>(projected.data), static_cast<__nv_bfloat16*>(z.data), columns});
     CUDA_CHECK(cudaGetLastError());
 
     auto conv = make_nvfp4_gdn_conv_output<Width, Tree>(conv_weight, conv_states, valid_columns,
@@ -112,16 +139,58 @@ void launch_paired_record(const Tensor& x, const Weight& weight, const Tensor& c
                                                         parent_index)
                     .conv;
     constexpr int kPostBlocks = (kNvfp4GdnChannels + 255) / 256;
-    nvfp4_paired_gdn_conv_kernel<Width, Tree><<<dim3(batch, kPostBlocks), 256, 0, stream>>>(
+    nvfp4_grouped_gdn_conv_kernel<Width, Tree><<<dim3(batch, kPostBlocks), 256, 0, stream>>>(
         static_cast<const float*>(projected.data), conv, batch);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <int Width, bool Tree, class Publish>
+void launch_triple_record(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
+                          const Tensor& conv_states, const Tensor& valid_columns,
+                          const Tensor& initial_slot, Tensor& conv_record, Tensor& query,
+                          Tensor& key, Tensor& value, Tensor& z, Publish publish,
+                          WorkspaceArena& workspace, cudaStream_t stream,
+                          const std::int32_t* parent_index) {
+    // C=3 owns one exact request-major 3*W panel, avoiding the half-empty second pair.
+    using Geometry              = Nvfp4GdnInputGeometry;
+    constexpr int kTripleTokens = 3 * Width;
+    using Schedule =
+        Nvfp4SmallTSchedule<8, 1, 2, 16, kTripleTokens, 4,
+                            Nvfp4SmallTActivationAccess::TokenPacked,
+                            Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 1,
+                            Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
+    constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
+    const float inverse   = 1.0F / weight.weight_scale_divisor;
+
+    auto scope       = workspace.scope();
+    Tensor projected = workspace.alloc(DType::FP32, {kNvfp4GdnChannels, Width, 3}, 256);
+    nvfp4_small_t_kernel<Geometry, kTripleTokens, Schedule, Nvfp4IdentityEpilogue,
+                         Nvfp4TripleGdnProjectionOutput<Width>,
+                         Nvfp4SmallTFinalization::Elementwise,
+                         Nvfp4TriplePackedActivation<Geometry>>
+        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
+            Nvfp4TriplePackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data)},
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales), inverse, Nvfp4IdentityEpilogue{},
+            Nvfp4TripleGdnProjectionOutput<Width>{static_cast<float*>(projected.data),
+                                                  static_cast<__nv_bfloat16*>(z.data)});
+    CUDA_CHECK(cudaGetLastError());
+
+    auto conv = make_nvfp4_gdn_conv_output<Width, Tree>(conv_weight, conv_states, valid_columns,
+                                                        initial_slot, query, key, value, z, publish,
+                                                        parent_index)
+                    .conv;
+    constexpr int kPostBlocks = (kNvfp4GdnChannels + 255) / 256;
+    nvfp4_grouped_gdn_conv_kernel<Width, Tree><<<dim3(3, kPostBlocks), 256, 0, stream>>>(
+        static_cast<const float*>(projected.data), conv, 3);
     CUDA_CHECK(cudaGetLastError());
 }
 
 // Packed snapshot T=2..16 GDN conv uses the SmallT production schedule (token-parallel
 // GEMM) with FP32 projected-conv in the epilogue. Record B=1 retains the fused T=1
-// GEMV+conv route; qualified B>1 W=2/5 shapes use a paired weight-replay projection
-// and separate FP32 conv. Convolution history rounds through BF16 at every column,
-// matching the T=1 route.
+// GEMV+conv route; qualified B>1 W=2/5 shapes use grouped weight-replay projection
+// (pairs, plus a direct W=5 triple at B=3) and separate FP32 conv. Convolution history
+// rounds through BF16 at every column, matching the T=1 route.
 template <int ActiveTokens, bool Tree, class Publish>
 void launch_exact(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
                   const Tensor& conv_states, const Tensor& valid_columns,
@@ -201,15 +270,36 @@ void launch_record_exact(const Tensor& x, const Weight& weight, const Tensor& co
                          const std::int32_t* parent_index, cudaStream_t stream) {
     const RecordColumnPublish publish{static_cast<__nv_bfloat16*>(conv_record.data),
                                       kNvfp4GdnChannels, ActiveTokens};
-    if (x.ne[2] > 1 && (ActiveTokens == 2 || ActiveTokens == 5)) {
+    if (nvfp4_gdn_record_uses_grouped_replay(ActiveTokens, x.ne[2])) {
         if (parent_index == nullptr) {
-            launch_paired_record<ActiveTokens, false>(
-                x, weight, conv_weight, conv_states, valid_columns, initial_slot, conv_record,
-                query, key, value, z, publish, workspace, stream, nullptr);
+            if constexpr (ActiveTokens == 5) {
+                if (x.ne[2] == 3) {
+                    launch_triple_record<ActiveTokens, false>(
+                        x, weight, conv_weight, conv_states, valid_columns, initial_slot,
+                        conv_record, query, key, value, z, publish, workspace, stream, nullptr);
+                    return;
+                }
+            }
+            {
+                launch_grouped_record<ActiveTokens, 2, false>(
+                    x, weight, conv_weight, conv_states, valid_columns, initial_slot, conv_record,
+                    query, key, value, z, publish, workspace, stream, nullptr);
+            }
         } else {
-            launch_paired_record<ActiveTokens, true>(
-                x, weight, conv_weight, conv_states, valid_columns, initial_slot, conv_record,
-                query, key, value, z, publish, workspace, stream, parent_index);
+            if constexpr (ActiveTokens == 5) {
+                if (x.ne[2] == 3) {
+                    launch_triple_record<ActiveTokens, true>(
+                        x, weight, conv_weight, conv_states, valid_columns, initial_slot,
+                        conv_record, query, key, value, z, publish, workspace, stream,
+                        parent_index);
+                    return;
+                }
+            }
+            {
+                launch_grouped_record<ActiveTokens, 2, true>(
+                    x, weight, conv_weight, conv_states, valid_columns, initial_slot, conv_record,
+                    query, key, value, z, publish, workspace, stream, parent_index);
+            }
         }
         return;
     }

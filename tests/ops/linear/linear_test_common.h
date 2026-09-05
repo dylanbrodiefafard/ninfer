@@ -67,4 +67,11 @@ int run_packed_column0_matches_decode(std::string_view label, WeightGenerator ge
                                       ops::LinearPolicy packed_policy,
                                       std::span<const std::int32_t> packed_widths);
 
+int run_packed_sequences_matches_panels(std::string_view label, WeightGenerator generator,
+                                        std::int32_t n, std::int32_t k, std::uint32_t seed,
+                                        std::int32_t sequence_width,
+                                        std::span<const std::int32_t> batch_sizes,
+                                        ops::LinearPolicy policy = ops::LinearPolicy::A16Only,
+                                        bool verify_convenience = true);
+
 } // namespace ninfer::test::linear

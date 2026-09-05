@@ -4,6 +4,10 @@
 
 namespace ninfer::ops::detail {
 
+bool is_w8_vocabulary_problem(std::int32_t n, std::int32_t k) noexcept {
+    return n == 248320 && k == 5120;
+}
+
 W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (t <= 0) { throw std::invalid_argument("w8 linear: unsupported shape or T"); }
 

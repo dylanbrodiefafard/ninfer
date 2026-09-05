@@ -48,11 +48,11 @@ if(CMAKE_GENERATOR MATCHES "Ninja")
 "\t@\"${CMAKE_MAKE_PROGRAM}\" \"$@\"\n")
 endif()
 
-# cicc is single-threaded unless nvcc --split-compile is set. --threads is a
-# no-op for our single sm_120a arch. 0 = all host CPUs (nvcc docs). Fat GQA
-# launchers are also split into their own TUs so ninja can run several cicc
-# processes. Override with -DNINFER_NVCC_THREADS=OFF to disable.
-set(NINFER_NVCC_THREADS 0 CACHE STRING "nvcc --split-compile (0 = nproc, OFF = disable)")
+# Keep optimization within each CUDA translation unit single-threaded. CUDA 13.1's parallel
+# split optimizer can emit materially different SASS from identical input; 1 disables the split
+# while Ninja still compiles independent translation units concurrently. Set 0 explicitly to use
+# all host CPUs inside each nvcc process, accepting nondeterministic code generation.
+set(NINFER_NVCC_THREADS 1 CACHE STRING "nvcc --split-compile (1 = reproducible, 0 = nproc, OFF = disable)")
 if(NINFER_NVCC_THREADS STREQUAL "OFF")
   # disabled
 elseif(NINFER_NVCC_THREADS GREATER_EQUAL 0)

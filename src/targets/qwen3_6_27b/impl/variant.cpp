@@ -116,8 +116,9 @@ ops::LinearPolicy residual_packed_policy(const Weight& weight, qwen3_6::TextPhas
 constexpr std::size_t kMinimumLeafWorkspaceBytes = 1;
 
 // NVFP4 packed verify T=2..16 uses the fused T=1-reduction route at B=1. Qualified
-// B=2..4 W=2/5 shapes pair requests per weight pass and keep the projection in
-// private FP32 workspace; the other widths retain request-indexed CTAs.
+// B=2..4 W=2/5 shapes group requests per weight pass (including the direct W=5,
+// B=3 group) and keep the projection in private FP32 workspace; the other widths
+// retain request-indexed CTAs.
 std::size_t nvfp4_gdn_record_leaf_bytes(std::int32_t batch, std::int32_t min_width,
                                         std::int32_t max_width) {
     return std::max(kMinimumLeafWorkspaceBytes,
@@ -468,23 +469,15 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
                                           Tensor& hidden, Tensor& g, Tensor& beta,
                                           WorkspaceArena& workspace, cudaStream_t stream,
                                           std::int32_t route_tokens) {
-    // Packed C>1 verify is T=width*B. 27B GDN control keeps SmallT GEMV through T=16 and
-    // switches to MMA at T>=17, so C=2 W=12 (T=24) would not match C=1 W=12 (T=12).
     if (route_tokens > 0 && route_tokens < residual.ne[1]) {
-        for (std::int32_t offset = 0; offset < residual.ne[1]; offset += route_tokens) {
-            Tensor hidden_panel = hidden.slice(1, offset, route_tokens);
-            Tensor g_panel      = g.slice(1, offset, route_tokens);
-            Tensor beta_panel   = beta.slice(1, offset, route_tokens);
-            ops::gdn_norm_gating_proj(residual.slice(1, offset, route_tokens), norm_weight, eps,
-                                      weights.a_projection, weights.b_projection, weights.a_log,
-                                      weights.dt_bias, workspace, hidden_panel, g_panel,
-                                      beta_panel, stream);
-        }
-        return;
+        ops::gdn_norm_gating_proj_packed_sequences(
+            residual, norm_weight, eps, weights.a_projection, weights.b_projection, weights.a_log,
+            weights.dt_bias, workspace, hidden, g, beta, stream, route_tokens);
+    } else {
+        ops::gdn_norm_gating_proj(residual, norm_weight, eps, weights.a_projection,
+                                  weights.b_projection, weights.a_log, weights.dt_bias, workspace,
+                                  hidden, g, beta, stream);
     }
-    ops::gdn_norm_gating_proj(residual, norm_weight, eps, weights.a_projection,
-                              weights.b_projection, weights.a_log, weights.dt_bias, workspace,
-                              hidden, g, beta, stream);
 }
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,

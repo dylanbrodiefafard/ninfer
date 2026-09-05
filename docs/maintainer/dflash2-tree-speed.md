@@ -76,8 +76,9 @@ after the fold was gated on `dflash_uses_tree_verify`.
 | **DFlash two-block k=11 fixed** | **163.7** | **20.7%** | **3.28** | **20.0** |
 
 Round time for k=11 did not change. The 432 tok/s was fake accept on corrupted GDN/KV. Fixed k=11
-is ~k=7 tok/s with worse accept; MTP3 still wins AIME. k=7 stays the product default. k=11 is not
-an AIME hammer once commit is sequential.
+is ~k=7 tok/s with worse accept; MTP3 still wins AIME. k=7 therefore remained this historical
+DFlash experiment's baseline. Speculation remains disabled by default, and k=11 is not an AIME
+hammer once commit is sequential.
 
 Story C=1 (`scenario_story_en_mystery`, 1024 decode, thinking off), measured on the busted fold:
 MTP3 **163.8 tok/s** / 41.9% / 2.26; two-block k=11 **100.8 tok/s** / 7.8% / 1.85. Do not use k=11
@@ -530,8 +531,8 @@ and the Op A/B is in `profiles/bench/gdn-c2-retune-20260904/`.
 - Unary child ranking (27.8%).
 - Markov softmax child sampling at T=0.6 / 0.3 (story also loses at T=0.2).
 - Flatten NVFP4 GDN conv-record to `T=W×B` W4A4 compose with a BF16 convolution input. It
-  flips greedy column 0 versus C=1 fused SmallT+FP32. The qualified W=2/5 pair replay is distinct:
-  it retains the W-local SmallT reduction and an FP32 convolution input.
+  flips greedy column 0 versus C=1 fused SmallT+FP32. The qualified W=2/5 grouped replay is
+  distinct: it retains the W-local SmallT reduction and an FP32 convolution input.
 - Forced binary after depth 1 (29.2%).
 - Native T=12 INT8 GQA tile under the current `RowTiles<=3` kernel.
 - GDN 4-slot parent-tile smem cache (32 KiB; wash vs 2-slot).

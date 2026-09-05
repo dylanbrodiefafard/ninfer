@@ -24,6 +24,7 @@ int run_nvfp4_a4() {
         Invocation{15, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{16, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{18, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{20, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{24, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{36, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA4},
@@ -51,6 +52,19 @@ int run_nvfp4_a4() {
     failures += run_packed_column0_matches_decode(
         "NVFP4_A4 packed-col0 [5120,17408]", make_nvfp4_weight, 5120, 17408, 725U,
         ops::LinearPolicy::AllowA4, packed_col0);
+    constexpr std::array<std::int32_t, 3> dflash_batches{2, 3, 4};
+    failures += run_packed_sequences_matches_panels(
+        "NVFP4_A4 DFlash gate-up packed", make_nvfp4_weight, 34816, 5120, 731U, 5,
+        dflash_batches, ops::LinearPolicy::AllowA4, false);
+    failures += run_packed_sequences_matches_panels(
+        "NVFP4_A4 DFlash down packed", make_nvfp4_weight, 5120, 17408, 733U, 5,
+        dflash_batches, ops::LinearPolicy::AllowA4, false);
+    failures += run_packed_sequences_matches_panels(
+        "NVFP4_A4 DFlash QKV packed", make_nvfp4_weight, 6144, 5120, 735U, 5,
+        dflash_batches, ops::LinearPolicy::AllowA4, false);
+    failures += run_packed_sequences_matches_panels(
+        "NVFP4_A4 DFlash attention-output packed", make_nvfp4_weight, 5120, 4096, 737U, 5,
+        dflash_batches, ops::LinearPolicy::AllowA4, false);
     return failures;
 }
 

@@ -187,11 +187,18 @@ selects the 35B contiguous-parent form. `--candidate auto` uses production dispa
 `--candidate composed` is the explicit RMSNorm-plus-control comparison. Every row reports the
 selected route and transient workspace after a 256 MiB L2 flush.
 
+For the 27B norm/control profile, `--packed-width W` measures the public packed-independent-
+sequence entry with each listed `T` interpreted as `W*B` for B=1..4. It is valid only with
+`--norm-control --candidate auto`; private candidate bit-exact screening remains a separate mode.
+
 ```bash
 cmake --build build --parallel --target ninfer_gdn_gating_proj_bench
 ./build/bench/ninfer_gdn_gating_proj_bench \
   --norm-control --candidate auto \
   -p 1,2,3,4,5,6,8,16,32,48 --warmup 10 --repeat 200
+./build/bench/ninfer_gdn_gating_proj_bench \
+  --norm-control --candidate auto --packed-width 5 \
+  -p 5,10,15,20 --warmup 10 --repeat 200
 ./build/bench/ninfer_gdn_gating_proj_bench \
   --35b --norm-control --candidate auto \
   -p 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 --warmup 10 --repeat 200

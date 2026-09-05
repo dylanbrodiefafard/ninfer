@@ -34,6 +34,7 @@ struct Options {
     bool auto_route            = true;
     bool composed_norm_control = false;
     bool bitexact              = false;
+    std::int32_t packed_width  = 0;
     ops::detail::Bf16GdnGatingScheduleId candidate =
         ops::detail::Bf16GdnGatingScheduleId::SimtWarpRowC4;
     ops::detail::Bf16GdnGatingScheduleId bitexact_candidate =
@@ -145,6 +146,8 @@ Options parse_args(int argc, char** argv) {
             const std::string_view raw = next("bitexact");
             opt.bitexact               = true;
             opt.bitexact_candidate     = parse_candidate(raw);
+        } else if (!std::strcmp(argv[i], "--packed-width")) {
+            opt.packed_width = std::atoi(next("packed-width"));
         } else if (!std::strcmp(argv[i], "-p") || !std::strcmp(argv[i], "--tokens")) {
             opt.tokens = parse_tokens(next("tokens"));
         } else if (!std::strcmp(argv[i], "--warmup")) {
@@ -160,7 +163,7 @@ Options parse_args(int argc, char** argv) {
                         "[--candidate auto|composed|simt-c4|simt-c8|mma-split32|"
                         "mma-split16|mma-split8|mma-split4|mma-split2|mma-unsplit|"
                         "small-t-split10|small-t-fused] "
-                        "[--bitexact <candidate>] "
+                        "[--bitexact <candidate>] [--packed-width W] "
                         "[-p 1,2,...] [--warmup N] [--repeat N] [--flush-mib N]\n",
                         argv[0]);
             std::exit(0);
@@ -186,6 +189,15 @@ Options parse_args(int argc, char** argv) {
     }
     if (opt.norm_control && !opt.auto_route && !opt.composed_norm_control) {
         throw std::invalid_argument("--norm-control supports only --candidate auto or composed");
+    }
+    if (opt.packed_width != 0 &&
+        (!opt.norm_control || opt.geometry35 || !opt.auto_route || opt.packed_width < 1)) {
+        throw std::invalid_argument(
+            "--packed-width requires 27B --norm-control --candidate auto");
+    }
+    if (opt.packed_width != 0 && opt.bitexact) {
+        throw std::invalid_argument(
+            "--packed-width cannot be combined with private candidate bitexact screening");
     }
     if (!opt.norm_control && opt.composed_norm_control) {
         throw std::invalid_argument("--candidate composed requires --norm-control");
@@ -224,16 +236,34 @@ bool run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
     const Weight parent = bf16_weight(weights.p, 2 * heads, hidden);
     const Weight wa     = bf16_row_view(parent, 0, heads);
     const Weight wb     = bf16_row_view(parent, heads, heads);
+    if (opt.packed_width != 0 &&
+        (tokens % opt.packed_width != 0 || tokens / opt.packed_width < 1 ||
+         tokens / opt.packed_width > 4)) {
+        throw std::invalid_argument("packed T must be W times B=1..4");
+    }
 
     const ops::detail::Bf16GdnGatingProblem problem{heads, hidden, tokens};
-    const auto plan                   = opt.auto_route || opt.composed_norm_control
-                                            ? ops::detail::bf16_gdn_gating_resolve_plan(problem)
-                                            : ops::detail::bf16_gdn_gating_resolve_candidate(opt.candidate, problem);
+    const auto plan = [&] {
+        if (opt.packed_width == 5 && tokens / opt.packed_width >= 2) {
+            return ops::detail::bf16_gdn_gating_resolve_packed_w5_plan(problem);
+        }
+        if (opt.packed_width != 0) {
+            return ops::detail::bf16_gdn_gating_resolve_plan(
+                {heads, hidden, opt.packed_width});
+        }
+        return opt.auto_route || opt.composed_norm_control
+                   ? ops::detail::bf16_gdn_gating_resolve_plan(problem)
+                   : ops::detail::bf16_gdn_gating_resolve_candidate(opt.candidate, problem);
+    }();
     const auto norm_plan              = ops::detail::bf16_gdn_norm_gating_resolve_plan(problem);
     const std::size_t workspace_bytes = std::max(interval_capacity, plan.workspace_bytes);
     WorkspaceArena ws(std::max<std::size_t>(1, workspace_bytes));
     const auto launch = [&](cudaStream_t stream) {
-        if (opt.norm_control && opt.composed_norm_control) {
+        if (opt.norm_control && opt.packed_width != 0) {
+            ops::gdn_norm_gating_proj_packed_sequences(
+                tx, tnorm_weight, 1.0e-6F, wa, wb, tA_log, tdt_bias, ws, th, tg, tbeta, stream,
+                opt.packed_width);
+        } else if (opt.norm_control && opt.composed_norm_control) {
             ops::rmsnorm(tx, tnorm_weight, 1.0e-6F, true, th, stream);
             if (opt.geometry35) {
                 ops::gdn_gating_proj(th, parent, tA_log, tdt_bias, ws, tg, tbeta, stream);
@@ -266,8 +296,14 @@ bool run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
         2.0 * 2.0 * static_cast<double>(heads) * hidden * static_cast<double>(tokens);
     const bool mma = plan.token_variant != ops::detail::Bf16GdnGatingTokenVariant::None;
     const std::int32_t mma_tile = opt.geometry35 ? 64 : 128;
-    const double executed_cols =
-        mma ? static_cast<double>(((tokens + mma_tile - 1) / mma_tile) * mma_tile) : tokens;
+    const double executed_cols = !mma
+                                     ? tokens
+                                     : opt.packed_width != 0
+                                           ? static_cast<double>(tokens / opt.packed_width) *
+                                                 ((opt.packed_width + mma_tile - 1) / mma_tile) *
+                                                 mma_tile
+                                           : static_cast<double>(
+                                                 ((tokens + mma_tile - 1) / mma_tile) * mma_tile);
     const double executed_flops  = 2.0 * 2.0 * static_cast<double>(heads) * hidden * executed_cols;
     const double useful_tflops   = useful_flops / sec / 1e12;
     const double executed_tflops = executed_flops / sec / 1e12;
@@ -279,15 +315,19 @@ bool run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
     }
     const double useful_gbs = useful_bytes / sec / 1e9;
 
-const char* route =
-        opt.norm_control
+    const char* route =
+        opt.packed_width != 0
+            ? "gdn_norm_gating_proj.bf16.packed_sequences"
+            : opt.norm_control
             ? (opt.composed_norm_control
                    ? "gdn_norm_gating_proj.bf16.composed_control"
                    : ops::detail::bf16_gdn_norm_gating_schedule_name(norm_plan.schedule))
             : ops::detail::bf16_gdn_gating_schedule_name(plan.schedule);
-    const std::size_t reported_workspace = opt.norm_control && !opt.composed_norm_control
-                                                ? norm_plan.workspace_bytes
-                                                : plan.workspace_bytes;
+    const std::size_t reported_workspace =
+        opt.packed_width != 0
+            ? interval_capacity
+            : (opt.norm_control && !opt.composed_norm_control ? norm_plan.workspace_bytes
+                                                               : plan.workspace_bytes);
 
     char bitexact[16] = "-";
     bool bitexact_ok  = true;
@@ -345,7 +385,11 @@ int main(int argc, char** argv) {
         const std::int32_t min_tokens = *std::min_element(opt.tokens.begin(), opt.tokens.end());
         const std::int32_t max_tokens = *std::max_element(opt.tokens.begin(), opt.tokens.end());
         const std::size_t interval_capacity =
-            opt.norm_control
+            opt.packed_width != 0
+                ? ops::gdn_norm_gating_proj_packed_sequences_workspace_capacity_bytes(
+                      opt.packed_width, min_tokens / opt.packed_width,
+                      max_tokens / opt.packed_width)
+            : opt.norm_control
                 ? ops::gdn_norm_gating_proj_workspace_capacity_bytes(heads, hidden, min_tokens,
                                                                      max_tokens)
                 : ops::gdn_gating_proj_workspace_capacity_bytes(heads, hidden, min_tokens,

@@ -16,6 +16,9 @@ namespace ninfer::ops::detail {
                                                                 std::int32_t min_tokens,
                                                                 std::int32_t max_tokens);
 
+bool is_nvfp4_dflash_w5_aggregate_problem(std::int32_t output_rows, std::int32_t input_rows,
+                                          LinearPolicy policy) noexcept;
+
 void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                     WorkspaceArena* workspace, cudaStream_t stream);
 

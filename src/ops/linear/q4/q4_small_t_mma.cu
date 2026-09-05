@@ -12,7 +12,7 @@ namespace ninfer::ops::detail {
 namespace {
 
 constexpr int kFirstSmallT    = 2;
-constexpr int kLastFullT      = 8;
+constexpr int kLastFullT      = 16;
 constexpr int kLastOptimizedT = 20;
 using FullGeometry            = Q4DraftHeadGeometry<5120>;
 using OptimizedGeometry       = Q4DraftHeadGeometry<2048>;
