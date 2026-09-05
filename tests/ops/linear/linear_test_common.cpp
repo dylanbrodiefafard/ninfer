@@ -450,4 +450,99 @@ int run_packed_column0_matches_decode(std::string_view label, WeightGenerator ge
     return failures;
 }
 
+int run_packed_sequences_matches_panels(std::string_view label, WeightGenerator generator,
+                                        std::int32_t n, std::int32_t k, std::uint32_t seed,
+                                        std::int32_t sequence_width,
+                                        std::span<const std::int32_t> batch_sizes,
+                                        ops::LinearPolicy policy, bool verify_convenience) {
+    if (sequence_width <= 0 || batch_sizes.empty()) {
+        throw std::invalid_argument("linear test: invalid packed sequence domain");
+    }
+    const std::int32_t maximum_batch =
+        *std::max_element(batch_sizes.begin(), batch_sizes.end());
+    if (maximum_batch <= 0) {
+        throw std::invalid_argument("linear test: packed batch must be positive");
+    }
+    const std::int32_t maximum_tokens = sequence_width * maximum_batch;
+    quantized_weight::PackedWeight host_weight = generator(n, k, seed);
+    const std::vector<std::uint16_t> activation_bits =
+        make_activation(k, maximum_tokens, seed + 1U, ActivationCompute::A16);
+
+    DeviceBuffer device_activation(activation_bits.size() * sizeof(std::uint16_t));
+    device_activation.copy_from_host(activation_bits.data(), device_activation.bytes);
+    DeviceBuffer device_weight(host_weight.payload.size());
+    device_weight.copy_from_host(host_weight.payload.data(), device_weight.bytes);
+    const Weight weight = host_weight.device_weight(device_weight.p);
+
+    int failures = 0;
+    for (const std::int32_t batch : batch_sizes) {
+        if (batch <= 0 || batch > maximum_batch) {
+            throw std::invalid_argument("linear test: invalid packed batch");
+        }
+        const std::int32_t tokens = sequence_width * batch;
+        const std::size_t elements = checked_elements(n, tokens, "packed comparison");
+        GuardedOutput aggregate(elements);
+        GuardedOutput panels(elements);
+        Tensor x(device_activation.p, DType::BF16, {k, tokens});
+        Tensor aggregate_out(aggregate.data(), DType::BF16, {n, tokens});
+        Tensor panel_out(panels.data(), DType::BF16, {n, tokens});
+        const std::string case_label = std::string(label) + " B=" + std::to_string(batch);
+        std::vector<std::uint16_t> convenience_bits;
+        if (verify_convenience) {
+            ops::linear_packed_sequences(x, weight, aggregate_out, nullptr, sequence_width);
+            for (std::int32_t offset = 0; offset < tokens; offset += sequence_width) {
+                Tensor destination = panel_out.slice(1, offset, sequence_width);
+                ops::linear(x.slice(1, offset, sequence_width), weight, destination, nullptr);
+            }
+            cuda_check(cudaDeviceSynchronize(), "synchronize packed sequence comparison");
+            failures += aggregate.verify_guards(case_label + " aggregate");
+            failures += panels.verify_guards(case_label + " panels");
+            convenience_bits.resize(elements);
+            std::vector<std::uint16_t> panel_bits(elements);
+            cuda_check(cudaMemcpy(convenience_bits.data(), aggregate.data(),
+                                  elements * sizeof(std::uint16_t), cudaMemcpyDeviceToHost),
+                       "copy aggregate packed output");
+            cuda_check(cudaMemcpy(panel_bits.data(), panels.data(), elements * sizeof(std::uint16_t),
+                                  cudaMemcpyDeviceToHost),
+                       "copy panel packed output");
+            if (convenience_bits != panel_bits) {
+                std::cerr << case_label << ": aggregate output differs from independent panels\n";
+                ++failures;
+            }
+        }
+
+        aggregate.poison();
+        panels.poison();
+        const std::size_t workspace_capacity = ops::linear_workspace_capacity_bytes(
+            weight.qtype, n, k, policy, sequence_width, tokens);
+        DeviceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
+        ops::linear_packed_sequences(x, weight, aggregate_out, policy, workspace, nullptr,
+                                     sequence_width);
+        for (std::int32_t offset = 0; offset < tokens; offset += sequence_width) {
+            Tensor destination = panel_out.slice(1, offset, sequence_width);
+            ops::linear(x.slice(1, offset, sequence_width), weight, destination, policy, workspace,
+                        nullptr);
+        }
+        cuda_check(cudaDeviceSynchronize(), "synchronize policy packed sequence comparison");
+        failures += aggregate.verify_guards(case_label + " policy aggregate");
+        failures += panels.verify_guards(case_label + " policy panels");
+        std::vector<std::uint16_t> policy_aggregate_bits(elements);
+        std::vector<std::uint16_t> policy_panel_bits(elements);
+        cuda_check(cudaMemcpy(policy_aggregate_bits.data(), aggregate.data(),
+                              elements * sizeof(std::uint16_t), cudaMemcpyDeviceToHost),
+                   "copy policy aggregate packed output");
+        cuda_check(cudaMemcpy(policy_panel_bits.data(), panels.data(),
+                              elements * sizeof(std::uint16_t), cudaMemcpyDeviceToHost),
+                   "copy policy panel packed output");
+        if (policy_aggregate_bits != policy_panel_bits ||
+            (verify_convenience && policy_aggregate_bits != convenience_bits)) {
+            std::cerr << case_label << ": policy aggregate differs from panels";
+            if (verify_convenience) { std::cerr << " or convenience A16"; }
+            std::cerr << '\n';
+            ++failures;
+        }
+    }
+    return failures;
+}
+
 } // namespace ninfer::test::linear

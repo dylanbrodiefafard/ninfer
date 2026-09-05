@@ -387,11 +387,13 @@ One propose block:
    GDN-control normally panel at the C=1 width (`packed_route_tokens`); the qualified W=5
    C=2..4 residual Linear routes instead use one panel-bit-exact A16 T=10/15/20 launch; T=20
    retains the T=5 panel reduction profile. Fused
-   NVFP4/BF16-control attention input and NVFP4 SwiGLU make the same qualified exception. GQA
-   launches one B=1 decode per sequence so it does not take `MultiBatch=true`. ReplaySSM records
+   NVFP4/BF16-control attention input and NVFP4 SwiGLU make the same qualified exception. SmallT
+   GQA uses one batched launch with request-indexed partial CTAs and a batched reduction, preserving
+   each request's arithmetic without taking the generic `MultiBatch=true` route. ReplaySSM records
    are `layer(g, 0, B)`.
-   Packed GDN conv-record keeps the T=1 reduction and BF16 history boundary: B=1 uses the fused
-   T=1 GEMV+FP32 conv route, while B=2..4 uses one request-indexed SmallT launch. Packed GDN
+   Packed GDN conv-record keeps the W-local reduction and BF16 history boundary: B=1 uses the fused
+   T=1 GEMV+FP32 conv route; qualified W=2/5 B=2..4 shapes group weight replay while materializing
+   a private FP32 projection, and other widths use request-indexed SmallT CTAs. Packed GDN
    recurrent overlays T=1 snapshot `out` on scratch SSM. Greedy accepts the matching prefix.
    Truncated sampling uses Leviathan `min(1,p/q)` on every hop. Under p-less, hop 0 is
    Leviathan with one-hot `q` (tree: SpecInfer membership); later hops and the bonus are greedy

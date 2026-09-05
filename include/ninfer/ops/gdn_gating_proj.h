@@ -24,6 +24,11 @@ namespace ninfer::ops {
                                                                         std::int32_t min_tokens,
                                                                         std::int32_t max_tokens);
 
+// Transient capacity for the 27B packed-sequence form below. Batch is restricted to 1..4;
+// fallback panels reuse one workspace allocation.
+[[nodiscard]] std::size_t gdn_norm_gating_proj_packed_sequences_workspace_capacity_bytes(
+    std::int32_t sequence_width, std::int32_t min_batch, std::int32_t max_batch);
+
 /**
  * Fuses two BF16 projections with Gated DeltaNet gate preparation. For each h,t:
  *
@@ -77,6 +82,16 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
                           const Tensor& dt_bias, WorkspaceArena& ws, Tensor& h, Tensor& g,
                           Tensor& beta, cudaStream_t stream);
+
+/**
+ * Applies gdn_norm_gating_proj to B=1..4 packed independent 27B sequences. T must be positive and
+ * equal to `sequence_width * B`. The execution may aggregate qualified profiles or reuse one
+ * panel workspace sequentially; both are private implementation choices.
+ */
+void gdn_norm_gating_proj_packed_sequences(
+    const Tensor& x, const Tensor& norm_weight, float eps, const Weight& a_weight,
+    const Weight& b_weight, const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
+    Tensor& h, Tensor& g, Tensor& beta, cudaStream_t stream, std::int32_t sequence_width);
 
 /** Qwen3.6-35B-A3B contiguous-parent storage form of gdn_norm_gating_proj. */
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,

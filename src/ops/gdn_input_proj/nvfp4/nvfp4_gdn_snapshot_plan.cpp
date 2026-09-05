@@ -38,7 +38,7 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
         throw std::invalid_argument("nvfp4 gdn conv admits only A16 or A4");
     }
     // Width selects the fused family. Snapshot T=2..16 is SmallT GEMM+FP32 conv. Record
-    // B=1 retains fused T=1 GEMV+FP32 conv. Qualified B>1 W=2/5 shapes pair requests
+    // B=1 retains fused T=1 GEMV+FP32 conv. Qualified B>1 W=2/5 shapes group requests
     // while retaining the W-local reduction and FP32 conv input; other widths use
     // request-indexed SmallT CTAs. Do not flatten to B*W W4A4 compose.
     if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
@@ -86,11 +86,19 @@ std::size_t nvfp4_gdn_record_workspace_capacity_bytes(LinearPolicy policy, std::
         throw std::logic_error("ReplaySSM record planner admitted NVFP4 decode");
     }
     if (maximum_plan.schedule == Nvfp4GdnConvScheduleId::SmallTFusedA16) {
-        const bool uses_pair_replay = batch_size > 1 && ((min_tokens <= 2 && max_tokens >= 2) ||
-                                                         (min_tokens <= 5 && max_tokens >= 5));
-        if (!uses_pair_replay) { return 0; }
+        std::int32_t maximum_grouped_width = 0;
+        if (min_tokens <= 2 && max_tokens >= 2 &&
+            nvfp4_gdn_record_uses_grouped_replay(2, batch_size)) {
+            maximum_grouped_width = 2;
+        }
+        if (min_tokens <= 5 && max_tokens >= 5 &&
+            nvfp4_gdn_record_uses_grouped_replay(5, batch_size)) {
+            maximum_grouped_width = 5;
+        }
+        if (maximum_grouped_width == 0) { return 0; }
         WorkspaceLayoutBuilder layout;
-        (void)layout.alloc(DType::FP32, {kNvfp4RecordChannels, max_tokens, batch_size}, 256);
+        (void)layout.alloc(DType::FP32,
+                           {kNvfp4RecordChannels, maximum_grouped_width, batch_size}, 256);
         return layout.peak_bytes(1);
     }
     if (batch_size > 1) {

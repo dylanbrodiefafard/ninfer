@@ -1,4 +1,5 @@
 #include "ninfer/ops/gdn_gating_proj.h"
+#include "ninfer/ops/rmsnorm.h"
 
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 
@@ -58,6 +59,25 @@ void require_sequence_tensor(const Tensor& t, DType dtype, std::int32_t n0, std:
     }
 }
 
+void validate_norm_gating_27(const Tensor& x, const Tensor& norm_weight, float eps,
+                             const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
+                             const Tensor& dt_bias, const Tensor& h, const Tensor& g,
+                             const Tensor& beta, const char* op) {
+    const std::int32_t tokens = x.ne[1];
+    if (!(eps > 0.0F) || !std::isfinite(eps)) {
+        throw std::invalid_argument(std::string(op) + ": eps must be positive and finite");
+    }
+    require_sequence_tensor(x, DType::BF16, 5120, tokens, op, "x");
+    require_vector_tensor(norm_weight, DType::BF16, 5120, op, "norm_weight");
+    require_sequence_tensor(h, DType::BF16, 5120, tokens, op, "h");
+    require_vector_tensor(A_log, DType::FP32, 48, op, "A_log");
+    require_vector_tensor(dt_bias, DType::FP32, 48, op, "dt_bias");
+    require_sequence_tensor(g, DType::FP32, 48, tokens, op, "g");
+    require_sequence_tensor(beta, DType::FP32, 48, tokens, op, "beta");
+    require_bf16_weight(a_weight, 48, 5120, "a_weight");
+    require_bf16_weight(b_weight, 48, 5120, "b_weight");
+}
+
 } // namespace
 
 std::size_t gdn_gating_proj_workspace_capacity_bytes(std::int32_t heads, std::int32_t input_rows,
@@ -73,6 +93,12 @@ std::size_t gdn_norm_gating_proj_workspace_capacity_bytes(std::int32_t heads,
                                                           std::int32_t max_tokens) {
     return detail::bf16_gdn_norm_gating_capacity_workspace_bytes(heads, input_rows, min_tokens,
                                                                  max_tokens);
+}
+
+std::size_t gdn_norm_gating_proj_packed_sequences_workspace_capacity_bytes(
+    std::int32_t sequence_width, std::int32_t min_batch, std::int32_t max_batch) {
+    return detail::bf16_gdn_norm_gating_packed_sequences_capacity_workspace_bytes(
+        sequence_width, min_batch, max_batch);
 }
 
 void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
@@ -112,23 +138,46 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
                           const Tensor& dt_bias, WorkspaceArena& ws, Tensor& h, Tensor& g,
                           Tensor& beta, cudaStream_t stream) {
-    constexpr const char* op  = "gdn_norm_gating_proj";
-    const std::int32_t tokens = x.ne[1];
-    if (!(eps > 0.0F) || !std::isfinite(eps)) {
-        throw std::invalid_argument("gdn_norm_gating_proj: eps must be positive and finite");
-    }
-    require_sequence_tensor(x, DType::BF16, 5120, tokens, op, "x");
-    require_vector_tensor(norm_weight, DType::BF16, 5120, op, "norm_weight");
-    require_sequence_tensor(h, DType::BF16, 5120, tokens, op, "h");
-    require_vector_tensor(A_log, DType::FP32, 48, op, "A_log");
-    require_vector_tensor(dt_bias, DType::FP32, 48, op, "dt_bias");
-    require_sequence_tensor(g, DType::FP32, 48, tokens, op, "g");
-    require_sequence_tensor(beta, DType::FP32, 48, tokens, op, "beta");
-    require_bf16_weight(a_weight, 48, 5120, "a_weight");
-    require_bf16_weight(b_weight, 48, 5120, "b_weight");
+    constexpr const char* op = "gdn_norm_gating_proj";
+    validate_norm_gating_27(x, norm_weight, eps, a_weight, b_weight, A_log, dt_bias, h, g, beta,
+                            op);
 
     detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
                                           dt_bias, ws, g, beta, stream);
+}
+
+void gdn_norm_gating_proj_packed_sequences(
+    const Tensor& x, const Tensor& norm_weight, float eps, const Weight& a_weight,
+    const Weight& b_weight, const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
+    Tensor& h, Tensor& g, Tensor& beta, cudaStream_t stream, std::int32_t sequence_width) {
+    constexpr const char* op = "gdn_norm_gating_proj_packed_sequences";
+    if (x.ne[1] <= 0 || sequence_width <= 0 || x.ne[1] % sequence_width != 0) {
+        throw std::invalid_argument(
+            "gdn_norm_gating_proj_packed_sequences: T must be a positive multiple of width");
+    }
+    validate_norm_gating_27(x, norm_weight, eps, a_weight, b_weight, A_log, dt_bias, h, g, beta,
+                            op);
+
+    const std::int32_t tokens = x.ne[1];
+    const std::int32_t batch = tokens / sequence_width;
+    if (batch <= 0 || batch > 4) {
+        throw std::invalid_argument(
+            "gdn_norm_gating_proj_packed_sequences: batch must be in 1..4");
+    }
+    const bool aggregate_w5 = sequence_width == 5 && batch >= 2;
+    if (aggregate_w5) {
+        detail::bf16_gdn_norm_gating_packed_w5_dispatch(
+            x, norm_weight, eps, h, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
+        return;
+    }
+
+    for (std::int32_t offset = 0; offset < tokens; offset += sequence_width) {
+        Tensor h_panel    = h.slice(1, offset, sequence_width);
+        Tensor g_panel    = g.slice(1, offset, sequence_width);
+        Tensor beta_panel = beta.slice(1, offset, sequence_width);
+        gdn_norm_gating_proj(x.slice(1, offset, sequence_width), norm_weight, eps, a_weight,
+                             b_weight, A_log, dt_bias, ws, h_panel, g_panel, beta_panel, stream);
+    }
 }
 
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,

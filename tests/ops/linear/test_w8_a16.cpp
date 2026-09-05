@@ -16,11 +16,15 @@ int w8_a16_conformance() {
     int failures = 0;
 
     constexpr std::array kN248320K5120{
-        a16(1),  a16(6),  a16(16), a16(17), a16(32), a16(33),
-        a16(34), a16(48), a16(49), a16(64), a16(65),
+        a16(1),  a16(5),  a16(6),  a16(10), a16(15), a16(16), a16(17),
+        a16(20), a16(32), a16(33), a16(34), a16(48), a16(49), a16(64), a16(65),
     };
     failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
                           {248320, 5120, 197U, Comparison::Sampled, false, kN248320K5120});
+    constexpr std::array kVocabularyBatches{2, 3, 4};
+    failures += run_packed_sequences_matches_panels(
+        "W8_A16 vocabulary packed", make_w8g32_f16s_weight, 248320, 5120, 199U, 5,
+        kVocabularyBatches);
 
     constexpr std::array kN5120K10240{
         a16(1),  a16(4),  a16(5),  a16(8),  a16(9),  a16(16), a16(17), a16(24),

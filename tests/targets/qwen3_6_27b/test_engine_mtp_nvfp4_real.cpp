@@ -152,6 +152,78 @@ int run_overlapping(ninfer::Engine& engine, std::span<const std::vector<ninfer::
     return failed;
 }
 
+int check_k4_b4_isolation(ninfer::Engine& engine,
+                          std::span<const std::vector<ninfer::TokenId>> seeds,
+                          const char* label) {
+    std::array<std::vector<ninfer::TokenId>, 5> prompts{
+        seeds[0], seeds[1], seeds[2], seeds[0], seeds[1]};
+    constexpr std::array<ninfer::TokenId, 5> fills{3709, 4120, 5200, 96220, 74455};
+    for (std::size_t i = 0; i < prompts.size(); ++i) { prompts[i].resize(896, fills[i]); }
+
+    const auto run_wave = [&](const std::array<std::size_t, 4>& order, const char* wave)
+        -> std::optional<std::array<std::vector<ninfer::TokenId>, 5>> {
+        std::array<decltype(engine.prepare_tokens(prompts[0])), 4> prepared{
+            engine.prepare_tokens(prompts[order[0]]), engine.prepare_tokens(prompts[order[1]]),
+            engine.prepare_tokens(prompts[order[2]]), engine.prepare_tokens(prompts[order[3]])};
+        const ninfer::RuntimeStats before = engine.runtime_stats();
+        std::array<ninfer::GenerationHandle, 4> handles{
+            engine.submit(std::move(prepared[0]), greedy_options(24)),
+            engine.submit(std::move(prepared[1]), greedy_options(24)),
+            engine.submit(std::move(prepared[2]), greedy_options(24)),
+            engine.submit(std::move(prepared[3]), greedy_options(24))};
+
+        std::array<std::vector<ninfer::TokenId>, 5> outputs;
+        for (std::size_t row = 0; row < handles.size(); ++row) {
+            const ninfer::GenerationResult result = handles[row].wait();
+            if (result.generated_token_ids.size() != 24 || check_speculative(result, label) != 0) {
+                std::cerr << label << ' ' << wave << " row " << row
+                          << " did not complete MTP decode\n";
+                dump_tokens("  got", result.generated_token_ids);
+                dump_speculative("  spec", result.speculative);
+                return std::nullopt;
+            }
+            outputs[order[row]] = result.generated_token_ids;
+        }
+        (void)engine.memory_summary();
+        const ninfer::RuntimeStats after = engine.runtime_stats();
+        const std::uint64_t rounds       = after.decode_rounds - before.decode_rounds;
+        const std::uint64_t rows         = after.decode_row_rounds - before.decode_row_rounds;
+        if (rounds == 0 || rows <= 3 * rounds) {
+            std::cerr << label << ' ' << wave << " did not exercise a B=4 decode round: rounds="
+                      << rounds << " rows=" << rows << '\n';
+            return std::nullopt;
+        }
+        return outputs;
+    };
+
+    const auto base = run_wave({0, 1, 2, 3}, "base");
+    const auto permuted = run_wave({3, 2, 0, 1}, "permuted");
+    const auto partner = run_wave({0, 1, 2, 4}, "alternate-partner");
+    if (!base || !permuted || !partner) { return 1; }
+    for (std::size_t i = 0; i < 4; ++i) {
+        for (std::size_t j = i + 1; j < 4; ++j) {
+            if ((*base)[i] == (*base)[j]) {
+                std::cerr << label << " base prompts " << i << " and " << j
+                          << " did not produce distinguishable outputs\n";
+                return 1;
+            }
+        }
+    }
+    for (std::size_t i = 0; i < 3; ++i) {
+        if ((*partner)[i] == (*partner)[4]) {
+            std::cerr << label << " alternate partner did not produce a distinguishable output\n";
+            return 1;
+        }
+    }
+    if (*base != *permuted || (*base)[0] != (*partner)[0] || (*base)[1] != (*partner)[1] ||
+        (*base)[2] != (*partner)[2]) {
+        std::cerr << label
+                  << " changed a request output after a B=4 row permutation or partner change\n";
+        return 1;
+    }
+    return 0;
+}
+
 int check_prefill_first_batch(ninfer::Engine& engine,
                               std::span<const std::vector<ninfer::TokenId>> seeds,
                               const char* label) {
@@ -298,6 +370,20 @@ int main() {
 
     if (const int result = run_k(3, "MTP NVFP4 k=3"); result != 0) { return result; }
     if (const int result = run_k(5, "MTP NVFP4 k=5"); result != 0) { return result; }
+
+    {
+        const char* label = "MTP NVFP4 k=4 B=4 isolation";
+        ninfer::EngineOptions options = mtp_engine_options(artifact, 4, 4);
+        options.max_context = 1024;
+        options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(
+            options.max_context * options.max_concurrency);
+        ninfer::Engine engine(options);
+        if (const int result = check_load(engine); result != 0) { return result; }
+        if (const int result = check_k4_b4_isolation(engine, prompts, label); result != 0) {
+            return result;
+        }
+        std::cout << "ok " << label << '\n' << std::flush;
+    }
 
     {
         const char* label = "MTP NVFP4 prefill-first scheduling";

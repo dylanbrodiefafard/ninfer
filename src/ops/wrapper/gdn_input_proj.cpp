@@ -538,9 +538,10 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
         require_record_parent_index(parent_index, geometry);
 
         // Packed T=2..16: B=1 retains fused T=1 GEMV+FP32 conv. Qualified B>1
-        // W=2/5 shapes replay one same-reduction SmallT weight load across each
-        // request pair, then consume the private FP32 projection without adding a
-        // semantic BF16 boundary. Other widths retain request-indexed CTAs.
+        // W=2/5 shapes replay one same-reduction SmallT weight load across request
+        // groups (including a direct W=5 C=3 group), then consume the private FP32
+        // projection without adding a semantic BF16 boundary. Other widths retain
+        // request-indexed CTAs.
         const bool tree = parent_index_active(parent_index);
         const detail::Nvfp4GdnConvPlan plan =
             detail::nvfp4_gdn_conv_resolve_plan(policy, geometry.width, geometry.batch);

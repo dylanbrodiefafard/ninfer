@@ -71,11 +71,11 @@ void require_tensor_shape(const Tensor& t, DType dtype, std::initializer_list<st
 }
 
 // Residual verify is [rows, T] with T=width*batch when a caller packs sequences. NVFP4 W4A4
-// and SmallT/Q4-head routes key off that T, so packed C>1 Linear/GDN-control panel at
-// C=1 width via packed_route_tokens. GQA uses request-indexed decode CTAs. NVFP4 GDN
-// conv-record uses a T=1-reduction fused route at B=1 and one request-indexed SmallT grid at
-// B=2..4. DFlash proposal still isolates compact rows so SWA envelopes follow each sequence's
-// frontier.
+// and SmallT/Q4-head routes key off that T, so packed_route_tokens preserves the C=1-width
+// reduction profile: qualified shapes aggregate B=2..4 and other shapes panel per request.
+// GQA remains request-indexed. NVFP4 GDN conv-record uses fused T=1 reduction at B=1,
+// qualified W=2/5 grouped weight replay at B=2..4, and request-indexed SmallT otherwise.
+// DFlash proposal still isolates compact rows so SWA envelopes follow each sequence's frontier.
 std::int32_t packed_route_tokens(std::int32_t batch, std::int32_t width) {
     return (batch > 1 && width > 1) ? width : 0;
 }

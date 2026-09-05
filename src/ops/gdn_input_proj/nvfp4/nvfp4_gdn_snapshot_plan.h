@@ -73,9 +73,15 @@ void nvfp4_gdn_record_small_t_launch(const Tensor& x, const Weight& weight,
                                      Tensor& z, WorkspaceArena& workspace, cudaStream_t stream,
                                      const std::int32_t* parent_index = nullptr);
 
-// Packed T=2..16 B=1 record: T=1 GEMV+FP32 conv with BF16 3-tap history. The
-// qualified B>1 W=2/5 routes pair requests per SmallT weight pass and materialize
-// only the private FP32 projection; other widths retain request-indexed CTAs.
+// Packed T=2..16 B=1 record: T=1 GEMV+FP32 conv with BF16 3-tap history. Qualified
+// B>1 W=2/5 routes group requests per SmallT weight pass (including one W=5 C=3
+// group) and materialize only the private FP32 projection; other widths use
+// request-indexed CTAs.
+inline constexpr bool nvfp4_gdn_record_uses_grouped_replay(std::int32_t width,
+                                                            std::int32_t batch_size) noexcept {
+    return batch_size > 1 && (width == 2 || width == 5);
+}
+
 void nvfp4_gdn_record_t1_fused_launch(const Tensor& x, const Weight& weight,
                                       const Tensor& conv_weight, const Tensor& conv_states,
                                       const Tensor& valid_columns, const Tensor& initial_slot,

@@ -29,8 +29,9 @@ struct RouteSpec {
 constexpr std::array<RouteSpec, 6> k27Routes{{
     {{1, 1}, Bf16GdnGatingScheduleId::GemvPairedRows},
     // Product DFlash2 verify is T=12 at C=1. MMA split-8 at T>=17 is a different reduction
-    // than SmallT GEMV and flips greedy/p-less tokens. Packed C>1 is T=width*B (C=2 W=12
-    // is T=24); the verify leaf panels at the C=1 width so this route stays SmallT.
+    // than SmallT GEMV and flips greedy/p-less tokens. Packed execution therefore preserves
+    // the C=1 reduction profile: qualified W=5 shapes aggregate across B=2..4 in SmallT,
+    // while other widths execute one W-column panel per request.
     {{2, 16}, Bf16GdnGatingScheduleId::SmallTFusedCooperative},
     // As token tiles double, halve SplitK. This keeps the cooperative grid near 192 CTAs instead
     // of making T a launch limit. Once the unsplit grid has enough independent work, it also
@@ -208,6 +209,19 @@ std::size_t checked_partial_bytes(std::int32_t heads, std::int32_t split_k, std:
     return elements * sizeof(float);
 }
 
+Bf16GdnGatingPlan make_plan(Bf16GdnGatingScheduleId schedule,
+                            const Bf16GdnGatingProblem& problem) {
+    const bool mma                           = schedule_uses_mma(schedule);
+    const Bf16GdnGatingTokenVariant variant = !mma ? Bf16GdnGatingTokenVariant::None
+                                                    : ((problem.cols % mma_tile_cols(problem)) == 0
+                                                           ? Bf16GdnGatingTokenVariant::Full
+                                                           : Bf16GdnGatingTokenVariant::Predicated);
+    const std::int32_t split_k = schedule_split_k(schedule);
+    const std::size_t workspace =
+        split_k > 1 ? checked_partial_bytes(problem.heads, split_k, problem.cols) : 0;
+    return {schedule, variant, workspace};
+}
+
 void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem& problem,
                       const Tensor& x, const Weight& a_weight, const Weight& b_weight,
                       const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws, Tensor& g,
@@ -351,15 +365,16 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId sche
     if (!candidate_is_legal(schedule, problem)) {
         throw std::invalid_argument("BF16 GDN gating: candidate is not legal for exact problem");
     }
-    const bool mma                          = schedule_uses_mma(schedule);
-    const Bf16GdnGatingTokenVariant variant = !mma ? Bf16GdnGatingTokenVariant::None
-                                                   : ((problem.cols % mma_tile_cols(problem)) == 0
-                                                          ? Bf16GdnGatingTokenVariant::Full
-                                                          : Bf16GdnGatingTokenVariant::Predicated);
-    const std::int32_t split_k              = schedule_split_k(schedule);
-    const std::size_t workspace =
-        split_k > 1 ? checked_partial_bytes(problem.heads, split_k, problem.cols) : 0;
-    return {schedule, variant, workspace};
+    return make_plan(schedule, problem);
+}
+
+Bf16GdnGatingPlan bf16_gdn_gating_resolve_packed_w5_plan(
+    const Bf16GdnGatingProblem& problem) {
+    if (!is_27(problem) || (problem.cols != 10 && problem.cols != 15 && problem.cols != 20)) {
+        throw std::invalid_argument(
+            "BF16 GDN gating: packed W=5 plan requires 27B B=2..4");
+    }
+    return make_plan(Bf16GdnGatingScheduleId::SmallTFusedCooperative, problem);
 }
 
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& problem) {
@@ -425,6 +440,27 @@ std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t heads,
     return maximum;
 }
 
+std::size_t bf16_gdn_norm_gating_packed_sequences_capacity_workspace_bytes(
+    std::int32_t sequence_width, std::int32_t min_batch, std::int32_t max_batch) {
+    if (sequence_width <= 0 || min_batch <= 0 || max_batch < min_batch || max_batch > 4 ||
+        sequence_width > std::numeric_limits<std::int32_t>::max() / max_batch) {
+        throw std::invalid_argument("BF16 GDN packed norm/control: invalid width or batch interval");
+    }
+    std::size_t maximum = 0;
+    for (std::int32_t batch = min_batch; batch <= max_batch; ++batch) {
+        if (sequence_width == 5 && batch >= 2) {
+            maximum = std::max(maximum,
+                               bf16_gdn_gating_resolve_packed_w5_plan(
+                                   {48, 5120, sequence_width * batch})
+                                   .workspace_bytes);
+        } else {
+            maximum = std::max(maximum, bf16_gdn_norm_gating_capacity_workspace_bytes(
+                                                48, 5120, sequence_width, sequence_width));
+        }
+    }
+    return maximum;
+}
+
 void bf16_gdn_gating_execute_plan(const Bf16GdnGatingPlan& plan, const Tensor& x,
                                   const Weight& a_weight, const Weight& b_weight,
                                   const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
@@ -474,6 +510,16 @@ void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, f
     bf16_gdn_norm_gating_proj_35_mma_split32_launch(plan.control.token_variant, x, norm_weight, eps,
                                                     h, a_weight, b_weight, A_log, dt_bias,
                                                     scratch.data, g, beta, stream);
+}
+
+void bf16_gdn_norm_gating_packed_w5_dispatch(
+    const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h, const Weight& a_weight,
+    const Weight& b_weight, const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
+    Tensor& g, Tensor& beta, cudaStream_t stream) {
+    const Bf16GdnGatingProblem problem{g.ne[0], x.ne[0], x.ne[1]};
+    const Bf16GdnGatingPlan plan = bf16_gdn_gating_resolve_packed_w5_plan(problem);
+    rmsnorm(x, norm_weight, eps, true, h, stream);
+    execute_resolved(plan, problem, h, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
 }
 
 } // namespace ninfer::ops::detail

@@ -226,7 +226,9 @@ The qualified W=5 C=2..4 residual Linear, fused NVFP4/BF16-control attention-inp
 SwiGLU routes are explicit exceptions: their A16 T=10/15/20 schedules are bit-identical to C
 separate T=5 panels. In particular, residual T=20 retains the T=5 panel reduction profile rather
 than using the generic T=20 reduction.
-Target GQA stays `[D, heads, W, B]` and launches one B=1 decode per sequence (SmallT or
-ChunkedSmallT at T<=6; Prompt at T>6 on 24 Q heads) so a packed caller does not take
-`MultiBatch=true`; p-less T=2 samples that reduction. NVFP4 target verify at `T>=4` uses W4A4 attention, so no DFlash path is required
-to match ordinary `T=1` A16 decode.
+Target GQA stays `[D, heads, W, B]`. SmallT uses one batched launch with request-indexed partial
+CTAs and a batched reduction, preserving each request's arithmetic without taking the generic
+`MultiBatch=true` route; p-less T=2 samples that reduction. Packed GDN conv-record similarly keeps
+the W-local reduction: qualified W=2/5 B=2..4 shapes group weight replay through a private FP32
+projection and other widths remain request-indexed. NVFP4 target verify at `T>=4` uses W4A4
+attention, so no DFlash path is required to match ordinary `T=1` A16 decode.

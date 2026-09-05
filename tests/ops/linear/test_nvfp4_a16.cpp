@@ -25,7 +25,10 @@ int run_nvfp4_a16() {
         Invocation{4, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{5, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{8, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{10, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{15, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{16, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{20, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{30, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{33, CallForm::Policy, ops::LinearPolicy::A16Only},
     };
@@ -52,6 +55,16 @@ int run_nvfp4_a16() {
                           {256, 5120, 721U, Comparison::Sampled, true, new_problem_invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {5120, 10240, 723U, Comparison::Sampled, true, new_problem_invocations});
+    constexpr std::array<std::int32_t, 3> dflash_batches{2, 3, 4};
+    failures += run_packed_sequences_matches_panels(
+        "NVFP4_A16 DFlash QKV packed", make_nvfp4_weight, 6144, 5120, 727U, 5,
+        dflash_batches);
+    failures += run_packed_sequences_matches_panels(
+        "NVFP4_A16 DFlash attention-output packed", make_nvfp4_weight, 5120, 4096, 729U, 5,
+        dflash_batches);
+    failures += run_packed_sequences_matches_panels(
+        "NVFP4_A16 DFlash conv packed", make_nvfp4_weight, 1280, 5120, 731U, 5,
+        dflash_batches);
     return failures;
 }
 

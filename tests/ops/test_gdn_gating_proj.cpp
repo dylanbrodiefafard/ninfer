@@ -470,8 +470,9 @@ int run_packed_columns_match_decode(const Geometry& geometry, std::int32_t token
     return failures;
 }
 
-int run_norm_packed_column0_matches_decode(const Geometry& geometry, std::int32_t tokens,
-                                           std::uint32_t seed) {
+int run_norm_packed_columns_match_decode(const Geometry& geometry, std::int32_t tokens,
+                                         std::uint32_t seed,
+                                         std::int32_t sequence_width = 5) {
     constexpr float kEps = 1.0e-6F;
     std::vector<float> x(static_cast<std::size_t>(geometry.hidden) * tokens);
     std::vector<float> norm_weight(static_cast<std::size_t>(geometry.hidden));
@@ -505,63 +506,85 @@ int run_norm_packed_column0_matches_decode(const Geometry& geometry, std::int32_
     GuardedDeviceBuffer packed_h_buf(packed_h * sizeof(std::uint16_t));
     GuardedDeviceBuffer packed_g(packed_ctrl * sizeof(float));
     GuardedDeviceBuffer packed_beta(packed_ctrl * sizeof(float));
-    GuardedDeviceBuffer decode_h_buf(static_cast<std::size_t>(geometry.hidden) * sizeof(std::uint16_t));
-    GuardedDeviceBuffer decode_g(static_cast<std::size_t>(geometry.heads) * sizeof(float));
-    GuardedDeviceBuffer decode_beta(static_cast<std::size_t>(geometry.heads) * sizeof(float));
+    GuardedDeviceBuffer panel_h_buf(packed_h * sizeof(std::uint16_t));
+    GuardedDeviceBuffer panel_g(packed_ctrl * sizeof(float));
+    GuardedDeviceBuffer panel_beta(packed_ctrl * sizeof(float));
     packed_h_buf.fill(0xff);
     packed_g.fill(0xff);
     packed_beta.fill(0xff);
-    decode_h_buf.fill(0xff);
-    decode_g.fill(0xff);
-    decode_beta.fill(0xff);
+    panel_h_buf.fill(0xff);
+    panel_g.fill(0xff);
+    panel_beta.fill(0xff);
 
     Tensor tensor_x(device_x.p, DType::BF16, {geometry.hidden, tokens});
-    Tensor tensor_x1(device_x.p, DType::BF16, {geometry.hidden, 1});
     Tensor tensor_norm(device_norm_weight.p, DType::BF16, {geometry.hidden});
     Tensor tensor_a_log(device_a_log.p, DType::FP32, {geometry.heads});
     Tensor tensor_dt_bias(device_dt_bias.p, DType::FP32, {geometry.heads});
     Tensor tensor_ph(packed_h_buf.data(), DType::BF16, {geometry.hidden, tokens});
     Tensor tensor_pg(packed_g.data(), DType::FP32, {geometry.heads, tokens});
     Tensor tensor_pb(packed_beta.data(), DType::FP32, {geometry.heads, tokens});
-    Tensor tensor_dh(decode_h_buf.data(), DType::BF16, {geometry.hidden, 1});
-    Tensor tensor_dg(decode_g.data(), DType::FP32, {geometry.heads, 1});
-    Tensor tensor_db(decode_beta.data(), DType::FP32, {geometry.heads, 1});
+    Tensor tensor_panel_h(panel_h_buf.data(), DType::BF16, {geometry.hidden, tokens});
+    Tensor tensor_panel_g(panel_g.data(), DType::FP32, {geometry.heads, tokens});
+    Tensor tensor_panel_beta(panel_beta.data(), DType::FP32, {geometry.heads, tokens});
     Weight weight_a = bf16_weight(device_a.p, geometry.heads, geometry.hidden);
     Weight weight_b = bf16_weight(device_b.p, geometry.heads, geometry.hidden);
 
-    const std::size_t packed_ws = ops::gdn_norm_gating_proj_workspace_capacity_bytes(
-        geometry.heads, geometry.hidden, tokens, tokens);
-    const std::size_t decode_ws =
-        ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 1, 1);
+    const std::int32_t batch = tokens / sequence_width;
+    const std::size_t packed_ws =
+        ops::gdn_norm_gating_proj_packed_sequences_workspace_capacity_bytes(sequence_width, batch,
+                                                                            batch);
+    const std::size_t panel_ws = ops::gdn_norm_gating_proj_workspace_capacity_bytes(
+        geometry.heads, geometry.hidden, sequence_width, sequence_width);
     WorkspaceArena packed_workspace(std::max<std::size_t>(256, packed_ws));
-    WorkspaceArena decode_workspace(std::max<std::size_t>(256, decode_ws));
-    ops::gdn_norm_gating_proj(tensor_x, tensor_norm, kEps, weight_a, weight_b, tensor_a_log,
-                              tensor_dt_bias, packed_workspace, tensor_ph, tensor_pg, tensor_pb,
-                              nullptr);
-    ops::gdn_norm_gating_proj(tensor_x1, tensor_norm, kEps, weight_a, weight_b, tensor_a_log,
-                              tensor_dt_bias, decode_workspace, tensor_dh, tensor_dg, tensor_db,
-                              nullptr);
+    ops::gdn_norm_gating_proj_packed_sequences(
+        tensor_x, tensor_norm, kEps, weight_a, weight_b, tensor_a_log, tensor_dt_bias,
+        packed_workspace, tensor_ph, tensor_pg, tensor_pb, nullptr, sequence_width);
+    WorkspaceArena panel_workspace(std::max<std::size_t>(256, panel_ws));
+    for (std::int32_t offset = 0; offset < tokens; offset += sequence_width) {
+        Tensor panel_h_out    = tensor_panel_h.slice(1, offset, sequence_width);
+        Tensor panel_g_out    = tensor_panel_g.slice(1, offset, sequence_width);
+        Tensor panel_beta_out = tensor_panel_beta.slice(1, offset, sequence_width);
+        ops::gdn_norm_gating_proj(
+            tensor_x.slice(1, offset, sequence_width), tensor_norm, kEps, weight_a, weight_b,
+            tensor_a_log, tensor_dt_bias, panel_workspace, panel_h_out, panel_g_out, panel_beta_out,
+            nullptr);
+    }
     cuda_synchronize();
 
-    const std::string label = std::string("gdn_norm_gating_proj packed-col0 ") + geometry.label +
-                              " T=" + std::to_string(tokens);
-    int failures = 0;
-    failures += verify_exact(
-        (label + " h").c_str(),
-        from_device<std::uint16_t>(packed_h_buf.data(), static_cast<std::size_t>(geometry.hidden)),
-        from_device<std::uint16_t>(decode_h_buf.data(), static_cast<std::size_t>(geometry.hidden)));
-    failures += verify_exact(
-        (label + " g").c_str(),
-        from_device<float>(packed_g.data(), static_cast<std::size_t>(geometry.heads)),
-        from_device<float>(decode_g.data(), static_cast<std::size_t>(geometry.heads)));
-    failures += verify_exact(
-        (label + " beta").c_str(),
-        from_device<float>(packed_beta.data(), static_cast<std::size_t>(geometry.heads)),
-        from_device<float>(decode_beta.data(), static_cast<std::size_t>(geometry.heads)));
+    const std::vector<std::uint16_t> packed_h_host =
+        from_device<std::uint16_t>(packed_h_buf.data(), packed_h);
+    const std::vector<float> packed_g_host = from_device<float>(packed_g.data(), packed_ctrl);
+    const std::vector<float> packed_beta_host =
+        from_device<float>(packed_beta.data(), packed_ctrl);
+    const std::string label = std::string("gdn_norm_gating_proj packed-panels ") +
+                              geometry.label + " T=" + std::to_string(tokens) +
+                              " W=" + std::to_string(sequence_width);
+    int failures = verify_exact(
+        (label + " h").c_str(), packed_h_host,
+        from_device<std::uint16_t>(panel_h_buf.data(), packed_h));
+    failures += verify_exact((label + " g").c_str(), packed_g_host,
+                             from_device<float>(panel_g.data(), packed_ctrl));
+    failures += verify_exact((label + " beta").c_str(), packed_beta_host,
+                             from_device<float>(panel_beta.data(), packed_ctrl));
+    failures += packed_h_buf.verify_guards("gdn_norm_gating_proj packed h");
+    failures += packed_g.verify_guards("gdn_norm_gating_proj packed g");
+    failures += packed_beta.verify_guards("gdn_norm_gating_proj packed beta");
+    failures += panel_h_buf.verify_guards("gdn_norm_gating_proj panel h");
+    failures += panel_g.verify_guards("gdn_norm_gating_proj panel g");
+    failures += panel_beta.verify_guards("gdn_norm_gating_proj panel beta");
+    if (packed_workspace.used() != 0 || packed_workspace.peak_used() != packed_ws) {
+        std::cerr << label << ": packed workspace query/execution high-water mismatch\n";
+        ++failures;
+    }
+    if (panel_workspace.used() != 0 || panel_workspace.peak_used() != panel_ws) {
+        std::cerr << label << ": panel workspace query/execution high-water mismatch\n";
+        ++failures;
+    }
     return failures;
 }
 
-int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint32_t seed) {
+int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint32_t seed,
+                             std::int32_t sequence_width = 0) {
     constexpr float kEps = 1.0e-6F;
     std::vector<float> x(static_cast<std::size_t>(geometry.hidden) * tokens);
     std::vector<float> norm_weight(static_cast<std::size_t>(geometry.hidden));
@@ -613,8 +636,12 @@ int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std:
     Tensor tensor_dt_bias(device_dt_bias.p, DType::FP32, {geometry.heads});
     Tensor tensor_g(device_g.data(), DType::FP32, {geometry.heads, tokens});
     Tensor tensor_beta(device_beta.data(), DType::FP32, {geometry.heads, tokens});
-    const std::size_t workspace_bytes = ops::gdn_norm_gating_proj_workspace_capacity_bytes(
-        geometry.heads, geometry.hidden, tokens, tokens);
+    const std::size_t workspace_bytes =
+        sequence_width > 0
+            ? ops::gdn_norm_gating_proj_packed_sequences_workspace_capacity_bytes(
+                  sequence_width, tokens / sequence_width, tokens / sequence_width)
+            : ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden,
+                                                                  tokens, tokens);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
 
     if (geometry.parent_weight) {
@@ -625,14 +652,24 @@ int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std:
     } else {
         Weight weight_a = bf16_weight(device_weight.p, geometry.heads, geometry.hidden);
         Weight weight_b = bf16_weight(device_b_weight.p, geometry.heads, geometry.hidden);
-        ops::gdn_norm_gating_proj(tensor_x, tensor_norm_weight, kEps, weight_a, weight_b,
-                                  tensor_a_log, tensor_dt_bias, workspace, tensor_h, tensor_g,
-                                  tensor_beta, nullptr);
+        if (sequence_width > 0) {
+            ops::gdn_norm_gating_proj_packed_sequences(
+                tensor_x, tensor_norm_weight, kEps, weight_a, weight_b, tensor_a_log,
+                tensor_dt_bias, workspace, tensor_h, tensor_g, tensor_beta, nullptr,
+                sequence_width);
+        } else {
+            ops::gdn_norm_gating_proj(tensor_x, tensor_norm_weight, kEps, weight_a, weight_b,
+                                      tensor_a_log, tensor_dt_bias, workspace, tensor_h, tensor_g,
+                                      tensor_beta, nullptr);
+        }
     }
     cuda_synchronize();
 
-    const std::string label =
-        std::string("gdn_norm_gating_proj ") + geometry.label + " T=" + std::to_string(tokens);
+    const std::string label = std::string("gdn_norm_gating_proj ") + geometry.label +
+                              " T=" + std::to_string(tokens) +
+                              (sequence_width > 0 ? " packed-width=" +
+                                                        std::to_string(sequence_width)
+                                                  : "");
     int failures = 0;
     failures += verify_normwise(label + " h", from_device_bf16(device_h.data(), h_elements),
                                 reference_h, kGdnNormOutputBf16);
@@ -653,7 +690,9 @@ int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std:
                                  from_device<std::uint16_t>(device_b_weight, b_weight_bits.size()),
                                  b_weight_bits);
     }
-    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+    const bool invalid_workspace =
+        workspace.used() != 0 || workspace.peak_used() != workspace_bytes;
+    if (invalid_workspace) {
         std::cerr << label << ": workspace query/execution high-water mismatch\n";
         ++failures;
     }
@@ -688,6 +727,26 @@ int verify_workspace_capacity_contract(const Geometry& geometry,
     return failures;
 }
 
+int verify_packed_workspace_rejections() {
+    int failures = 0;
+    const auto expect_invalid = [&](std::int32_t width, std::int32_t first,
+                                    std::int32_t last) {
+        try {
+            (void)ops::gdn_norm_gating_proj_packed_sequences_workspace_capacity_bytes(width, first,
+                                                                                      last);
+            std::cerr << "gdn packed workspace accepted invalid W=" << width << " B=" << first
+                      << ".." << last << '\n';
+            ++failures;
+        } catch (const std::invalid_argument&) {
+        }
+    };
+    expect_invalid(0, 1, 1);
+    expect_invalid(5, 0, 1);
+    expect_invalid(5, 3, 2);
+    expect_invalid(5, 1, 5);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -699,6 +758,7 @@ int main() {
     int failures = 0;
     failures += verify_workspace_capacity_contract(kQwen27, {1, 16, 1024, 2048, 4096, 4097});
     failures += verify_workspace_capacity_contract(kQwen35, {1, 127, 1024, 2048, 4096, 4097});
+    failures += verify_packed_workspace_rejections();
 
     // Every registered 27B projection route, including predicated and full token tiles.
     // 16 is the last packed-GEMV width (product DFlash2 verify is 12); 17 is MMA split-8.
@@ -713,9 +773,12 @@ int main() {
     failures += run_packed_column0_matches_decode(kQwen27, 16, 0x5110u);
     failures += run_packed_columns_match_decode(kQwen27, 8, 0x5188u);
     failures += run_packed_columns_match_decode(kQwen27, 12, 0x518cu);
-    failures += run_norm_packed_column0_matches_decode(kQwen27, 2, 0x6102u);
-    failures += run_norm_packed_column0_matches_decode(kQwen27, 6, 0x6106u);
-    failures += run_norm_packed_column0_matches_decode(kQwen27, 12, 0x610cu);
+    failures += run_norm_packed_columns_match_decode(kQwen27, 5, 0x6105u);
+    failures += run_norm_packed_columns_match_decode(kQwen27, 10, 0x610au);
+    failures += run_norm_packed_columns_match_decode(kQwen27, 15, 0x610fu);
+    failures += run_norm_packed_columns_match_decode(kQwen27, 20, 0x6114u);
+    failures += run_norm_packed_columns_match_decode(kQwen27, 24, 0x6118u, 12);
+    failures += run_norm_packed_columns_match_decode(kQwen27, 34, 0x6122u, 17);
     // Every registered 35B projection route and its contiguous-parent storage contract.
     for (const std::int32_t tokens : {1, 127, 128, 1024, 1025, 2049, 4097}) {
         failures +=
@@ -724,7 +787,11 @@ int main() {
 
     // 27B uses the composed implementation; 35B also qualifies both sides of its fused boundary.
     failures += run_norm_projection_case(kQwen27, 1, 0x3001u);
-    failures += run_norm_projection_case(kQwen27, 9, 0x3009u);
+    failures += run_norm_projection_case(kQwen27, 5, 0x3005u);
+    failures += run_norm_projection_case(kQwen27, 10, 0x300au, 5);
+    failures += run_norm_projection_case(kQwen27, 15, 0x300fu, 5);
+    failures += run_norm_projection_case(kQwen27, 20, 0x3014u, 5);
+    failures += run_norm_projection_case(kQwen27, 24, 0x3018u, 12);
     failures += run_norm_projection_case(kQwen27, 64, 0x3040u);
     failures += run_norm_projection_case(kQwen35, 1, 0x4001u);
     failures += run_norm_projection_case(kQwen35, 16, 0x4010u);

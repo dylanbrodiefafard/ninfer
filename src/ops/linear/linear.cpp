@@ -9,6 +9,7 @@
 #include "ops/linear/q6/q6_dispatch.h"
 #include "ops/linear/w8/w8_dispatch.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -72,6 +73,34 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
         throw std::invalid_argument("linear: x/out must be non-null and 16-byte aligned");
     }
     validate_linear_policy(policy);
+}
+
+bool aggregate_w8_vocabulary_sequences(const Tensor& x, const Weight& w,
+                                       std::int32_t sequence_width, LinearPolicy policy) {
+    return policy == LinearPolicy::A16Only && w.qtype == QType::W8G32_F16S &&
+           detail::is_w8_vocabulary_problem(w.n, w.k) && sequence_width == 5 && x.ne[1] >= 10 &&
+           x.ne[1] <= 20;
+}
+
+std::int32_t packed_sequence_group_width(const Tensor& x, const Weight& w,
+                                         std::int32_t sequence_width, LinearPolicy policy) {
+    if (aggregate_w8_vocabulary_sequences(x, w, sequence_width, policy)) { return x.ne[1]; }
+    if (w.qtype == QType::NVFP4 && sequence_width == 5 && x.ne[1] >= 10 && x.ne[1] <= 20 &&
+        detail::is_nvfp4_dflash_w5_aggregate_problem(w.n, w.k, policy)) {
+        // Direct T=20 A16 differs by a few BF16 ulps on real recurrent activations despite
+        // passing random conformance inputs. Two T=10 groups preserve the qualified C=2 route
+        // exactly while still halving C=4 weight reads. W4A4 gate/down is exact at T=20.
+        if (x.ne[1] == 20 && detail::is_nvfp4_a16_only_problem(
+                                 detail::resolve_nvfp4_problem(w.n, w.k))) {
+            return 2 * sequence_width;
+        }
+        return x.ne[1];
+    }
+    if (w.qtype == QType::Q4G64_F16S && policy == LinearPolicy::A16Only && sequence_width == 4 &&
+        x.ne[1] >= 8 && x.ne[1] <= 16 && detail::is_q4_27b_draft_head_problem(w.n, w.k)) {
+        return x.ne[1];
+    }
+    return sequence_width;
 }
 
 void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
@@ -168,9 +197,11 @@ void linear_packed_sequences(const Tensor& x, const Weight& w, Tensor& out, Line
         throw std::invalid_argument(
             "linear_packed_sequences: T must be a multiple of sequence_width");
     }
-    for (std::int32_t offset = 0; offset < x.ne[1]; offset += sequence_width) {
-        Tensor out_panel = out.slice(1, offset, sequence_width);
-        linear(x.slice(1, offset, sequence_width), w, out_panel, policy, workspace, stream);
+    const std::int32_t group_width = packed_sequence_group_width(x, w, sequence_width, policy);
+    for (std::int32_t offset = 0; offset < x.ne[1]; offset += group_width) {
+        const std::int32_t active = std::min(group_width, x.ne[1] - offset);
+        Tensor out_panel          = out.slice(1, offset, active);
+        linear(x.slice(1, offset, active), w, out_panel, policy, workspace, stream);
     }
 }
 
@@ -183,9 +214,12 @@ void linear_packed_sequences(const Tensor& x, const Weight& w, Tensor& out, cuda
         throw std::invalid_argument(
             "linear_packed_sequences: T must be a multiple of sequence_width");
     }
-    for (std::int32_t offset = 0; offset < x.ne[1]; offset += sequence_width) {
-        Tensor out_panel = out.slice(1, offset, sequence_width);
-        linear(x.slice(1, offset, sequence_width), w, out_panel, stream);
+    const std::int32_t group_width =
+        packed_sequence_group_width(x, w, sequence_width, LinearPolicy::A16Only);
+    for (std::int32_t offset = 0; offset < x.ne[1]; offset += group_width) {
+        const std::int32_t active = std::min(group_width, x.ne[1] - offset);
+        Tensor out_panel          = out.slice(1, offset, active);
+        linear(x.slice(1, offset, active), w, out_panel, stream);
     }
 }
 

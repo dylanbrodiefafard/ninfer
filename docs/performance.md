@@ -158,6 +158,72 @@ and `profiles/bench/graph-profiles-span{2048,1024,512}-candidate-*`.
 The fresh cumulative reports are
 `host-overhead-cumulative-{baseline,candidate}{,-rerun}-greedy-20260901`.
 
+## Qwen3.8-27B NVFP4 C=1-4 kernel campaign
+
+The 2026-09-05 campaign used the Qwen3.8-27B DFlash2 artifact with NVFP4 matrices, BF16
+selector codebook, NVFP4 KV, CUDA Graphs, the optimized proposal head, greedy sampling, a
+16,384-token context ceiling, and 2,048 generated tokens per lane on one RTX 5090. The retained
+changes group only classifier-qualified fixed shapes while preserving each request's C=1-width
+reduction domain: W=5 GDN input/control, selected DFlash4 NVFP4/Q4 Linear calls, the W=5 W8
+target vocabulary projection, and the Q4 DFlash proposal head at T=12/16. Unsupported shapes
+continue through the existing per-request panels.
+
+Against the preserved `40f6e4c5` binary, aggregate decode throughput measured from exact decode
+tokens divided by complete-wave makespan changed as follows. Response hashes, speculative work,
+and acceptance counts matched in every cell.
+
+| Backend | C | Prior tok/s | Retained tok/s | Change |
+|---|---:|---:|---:|---:|
+| DFlash4 | 2 | 226.49 | 245.37 | +8.33% |
+| DFlash4 | 3 | 226.96 | 265.92 | +17.17% |
+| DFlash4 | 4 | 223.28 | 260.04 | +16.46% |
+| MTP4 | 2 | 219.28 | 229.18 | +4.52% |
+| MTP4 | 3 | 223.41 | 254.50 | +13.92% |
+| MTP4 | 4 | 236.78 | 251.85 | +6.37% |
+
+The final configuration sweep compared DFlash4 and MTP3/4/5 at every supported concurrency.
+These are aggregate complete-wave rates, not per-lane rates.
+
+| Configuration | C=1 | C=2 | C=3 | C=4 |
+|---|---:|---:|---:|---:|
+| DFlash4 | 163.63 | 245.37 | 265.92 | 260.04 |
+| MTP3 | 154.05 | 203.12 | 213.72 | 218.73 |
+| MTP4 | 149.26 | 229.18 | 254.50 | 251.85 |
+| MTP5 | 139.48 | 174.71 | 179.00 | 181.39 |
+
+DFlash4 was fastest at every C, by 6.22%, 7.06%, 4.49%, and 3.25% over the next configuration.
+This supports DFlash4 as the explicit speed configuration for this measured greedy AIME
+workload and artifact; the sweep did not cover other prompts, sampling policies, or DFlash draft
+widths. It does not change the product default because speculative execution still requires an
+explicitly compatible artifact and changes the numerical execution route. MTP5's C4 greedy
+response differed from its C1-3 response, but the preserved prior binary produced exactly the
+same two hashes, acceptance, and fallback counts; this is not a regression from the campaign.
+
+Operator qualification measured the W=5 C3 GDN input-projection/conv-record Op at 147.456 to
+116.736 us and the W8 target vocabulary projection at 849.920 us for T=5/10/15 and 855.712 us
+for T=20. The GDN record route passed decoded-weight FP64 dense/ragged/tree oracle checks;
+aggregated Linear and control routes passed their independent mathematical oracles and exact
+packed-versus-panel checks. The final DFlash4 real-artifact C4 isolation passed in both Graph and
+eager execution, and MTP4 passed a B4 partner/permutation isolation gate. Target-only C1,
+speculation-disabled decode PPL was byte-identical across all 2,047 scored NLL values to the
+pre-campaign reference (PPL 6.414141594, no non-finite values); that PPL run does not exercise
+concurrent speculative verification.
+
+CUDA 13.1's parallel split optimizer was also found to emit two materially different SASS
+variants from identical CUDA input. Three clean `--split-compile 0` compilations of the GDN
+snapshot translation unit alternated between 96- and 121-register decode kernels; three
+`--split-compile 1` compilations were stable. Replacing only the slow snapshot object with the
+stable object changed C=1 MTP4 from 144.59 to 150.64 tok/s (+4.19%) with exact output,
+acceptance, and work counts. The build therefore defaults `NINFER_NVCC_THREADS` to 1. Ninja
+continues to compile independent translation units concurrently, while an explicit value of 0
+retains the faster but nondeterministic within-translation-unit build mode.
+
+Reports are under `profiles/bench/multi-request-kernel-final-config-sweep-clean-20260905`,
+`profiles/bench/multi-request-kernel-final-config-sweep-clean-mtp5-rerun-20260905`,
+`profiles/bench/multi-request-kernel-last-commit-baseline-20260905`, and
+`profiles/bench/multi-request-kernel-mtp5-baseline-isolation-20260905`, plus
+`profiles/ppl/multi-request-kernel-final-20260905.json`.
+
 ## Single-request serving performance method
 
 | Setting | Value |

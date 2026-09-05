@@ -4,6 +4,10 @@
 
 namespace ninfer::ops::detail {
 
+bool is_q4_27b_draft_head_problem(std::int32_t n, std::int32_t k) noexcept {
+    return n == 131072 && k == 5120;
+}
+
 Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (t <= 0) { throw std::invalid_argument("q4 linear: unsupported shape or T"); }
 
@@ -49,7 +53,7 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             return launch_q4_mma_r64_c128;
         case 131072:
             if (t == 1) { return launch_q4_gemv_r4_w1_direct; }
-            if (t <= 8) { return launch_q4_draft_head_small_t; }
+            if (t <= 16) { return launch_q4_draft_head_small_t; }
             return launch_q4_mma_r64_c128;
         default:
             break;
