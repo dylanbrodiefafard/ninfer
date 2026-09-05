@@ -305,23 +305,27 @@ TokenResultView Program::execute_token(std::int32_t token_id, std::int32_t targe
     profile::ScopedRange token_range(profile::Phase::Token,
                                      static_cast<std::uint64_t>(current));
     auto* host = static_cast<std::byte*>(host_controls_.data());
-    std::memcpy(host + kTokenOffset, &token_id, sizeof(token_id));
-    const std::int32_t valid = 1;
-    std::memcpy(host + kValidOffset, &valid, sizeof(valid));
-    std::memcpy(host + kAppendOffset, &current, sizeof(current));
-    std::memcpy(host + kTargetOffset, &target_id, sizeof(target_id));
-    const std::array<std::int32_t, 3> position = {current, current, current};
-    std::memcpy(host + kPositionOffset, position.data(), sizeof(position));
-    const std::array<std::int32_t, 2> offsets = {0, current + 1};
-    std::memcpy(host + kVisibleOffsetsOffset, offsets.data(), sizeof(offsets));
-    const ops::NgramRowHostStep ple_step =
-        ops::ngram_row_ids_host_step(token_id, ple_history_, ple_ngram_config_);
-    ple_history_ = ple_step.new_history;
-    std::memcpy(host + kHostPleHistoryOffset, ple_history_.data(), sizeof(ple_history_));
-    std::memcpy(host_ngram_rows_.data(), ple_step.row_ids.data(),
-                ple_step.row_ids.size() * sizeof(std::int32_t));
-    auto* visible = reinterpret_cast<std::int32_t*>(host + kVisibleIdsOffset);
-    for (std::int32_t id = 0; id <= current; ++id) { visible[id] = id; }
+    ops::NgramRowHostStep ple_step{};
+    {
+        profile::ScopedRange host_range(profile::Phase::HostPrepare,
+                                        static_cast<std::uint64_t>(current));
+        std::memcpy(host + kTokenOffset, &token_id, sizeof(token_id));
+        const std::int32_t valid = 1;
+        std::memcpy(host + kValidOffset, &valid, sizeof(valid));
+        std::memcpy(host + kAppendOffset, &current, sizeof(current));
+        std::memcpy(host + kTargetOffset, &target_id, sizeof(target_id));
+        const std::array<std::int32_t, 3> position = {current, current, current};
+        std::memcpy(host + kPositionOffset, position.data(), sizeof(position));
+        const std::array<std::int32_t, 2> offsets = {0, current + 1};
+        std::memcpy(host + kVisibleOffsetsOffset, offsets.data(), sizeof(offsets));
+        ple_step = ops::ngram_row_ids_host_step(token_id, ple_history_, ple_ngram_config_);
+        ple_history_ = ple_step.new_history;
+        std::memcpy(host + kHostPleHistoryOffset, ple_history_.data(), sizeof(ple_history_));
+        std::memcpy(host_ngram_rows_.data(), ple_step.row_ids.data(),
+                    ple_step.row_ids.size() * sizeof(std::int32_t));
+        auto* visible = reinterpret_cast<std::int32_t*>(host + kVisibleIdsOffset);
+        for (std::int32_t id = 0; id <= current; ++id) { visible[id] = id; }
+    }
     const std::size_t control_copy_bytes =
         kVisibleIdsOffset + static_cast<std::size_t>(current + 1) * sizeof(std::int32_t);
     CUDA_CHECK(cudaMemcpyAsync(controls_.p, host_controls_.data(), control_copy_bytes,
@@ -400,6 +404,7 @@ TokenResultView Program::execute_token(std::int32_t token_id, std::int32_t targe
             // host gather overlap that GPU work; the same-stream H2D remains ordered before the
             // layer-1 decode and injection.
             Tensor ple_device_rows = state_.ple_device_rows();
+            profile::ScopedRange ple_range(profile::Phase::PleStage, 1);
             ops::ple_iq4_nl_stage_rows(model_.view().ple.table, ple_step.row_ids,
                                        state_.ple_host_rows(), state_.ple_host_rows_bytes(),
                                        ple_device_rows, stream_);
@@ -501,25 +506,29 @@ PrefillResultView Program::prefill_chunk(std::span<const std::int32_t> token_ids
 
     std::array<std::int32_t, 2> candidate_history = ple_history_;
     std::size_t visible_count = 0;
-    host_offsets[0] = 0;
-    for (std::int32_t token = 0; token < width; ++token) {
-        const std::int32_t id = token_ids[static_cast<std::size_t>(token)];
-        const std::int32_t position = frontier_ + token;
-        host_tokens[token] = id;
-        host_append[token] = position;
-        host_positions[3 * token] = position;
-        host_positions[3 * token + 1] = position;
-        host_positions[3 * token + 2] = position;
-        for (std::int32_t visible = 0; visible <= position; ++visible) {
-            host_visible[visible_count++] = visible;
-        }
-        host_offsets[token + 1] = static_cast<std::int32_t>(visible_count);
-        const ops::NgramRowHostStep ple_step =
-            ops::ngram_row_ids_host_step(id, candidate_history, ple_ngram_config_);
-        candidate_history = ple_step.new_history;
-        for (std::int32_t head = 0; head < ops::kPleHeads; ++head) {
-            host_rows[head + ops::kPleHeads * token] =
-                ple_step.row_ids[static_cast<std::size_t>(head)];
+    {
+        profile::ScopedRange host_range(profile::Phase::HostPrepare,
+                                        static_cast<std::uint64_t>(width));
+        host_offsets[0] = 0;
+        for (std::int32_t token = 0; token < width; ++token) {
+            const std::int32_t id = token_ids[static_cast<std::size_t>(token)];
+            const std::int32_t position = frontier_ + token;
+            host_tokens[token] = id;
+            host_append[token] = position;
+            host_positions[3 * token] = position;
+            host_positions[3 * token + 1] = position;
+            host_positions[3 * token + 2] = position;
+            for (std::int32_t visible = 0; visible <= position; ++visible) {
+                host_visible[visible_count++] = visible;
+            }
+            host_offsets[token + 1] = static_cast<std::int32_t>(visible_count);
+            const ops::NgramRowHostStep ple_step =
+                ops::ngram_row_ids_host_step(id, candidate_history, ple_ngram_config_);
+            candidate_history = ple_step.new_history;
+            for (std::int32_t head = 0; head < ops::kPleHeads; ++head) {
+                host_rows[head + ops::kPleHeads * token] =
+                    ple_step.row_ids[static_cast<std::size_t>(head)];
+            }
         }
     }
     if (visible_count > kMaximumPrefillVisibleIds) {
@@ -532,13 +541,6 @@ PrefillResultView Program::prefill_chunk(std::span<const std::int32_t> token_ids
 
     Tensor ple_device_rows(storage.ple_device_rows.p, DType::U8,
                            {ops::kPleIq4NlRowBytes, ops::kPleHeads, width});
-    ops::ple_iq4_nl_stage_rows_batch(
-        model_.view().ple.table,
-        std::span<const std::int32_t>(host_rows,
-                                      static_cast<std::size_t>(ops::kPleHeads) * width),
-        width, storage.ple_host_rows.data(), storage.ple_host_rows.size(), ple_device_rows,
-        transfer_stream_);
-    CUDA_CHECK(cudaEventRecord(ple_transfer_ready_, transfer_stream_));
 
     const std::size_t control_copy_bytes =
         kPrefillVisibleIdsOffset + visible_count * sizeof(std::int32_t);
@@ -637,6 +639,20 @@ PrefillResultView Program::prefill_chunk(std::span<const std::int32_t> token_ids
             ops::qsa_verifier(mixed, append_ids, positions, visible_ids, visible_offsets,
                               *weights.qsa, *state_.qsa()[layer], selected_ids,
                               selected_count, block, qsa_workspace, stream_);
+        }
+        if (layer == 0) {
+            // Match decode scheduling: layer-0 mixer work is already queued, so the mandatory
+            // RAM-resident n-gram row gather and its H2D can overlap useful GPU work. Layer 1
+            // retains the explicit transfer dependency immediately before PLE decode/injection.
+            profile::ScopedRange ple_range(profile::Phase::PleStage,
+                                           static_cast<std::uint64_t>(width));
+            ops::ple_iq4_nl_stage_rows_batch(
+                model_.view().ple.table,
+                std::span<const std::int32_t>(
+                    host_rows, static_cast<std::size_t>(ops::kPleHeads) * width),
+                width, storage.ple_host_rows.data(), storage.ple_host_rows.size(),
+                ple_device_rows, transfer_stream_);
+            CUDA_CHECK(cudaEventRecord(ple_transfer_ready_, transfer_stream_));
         }
         ops::gated_residual_inject(residual, block, write_scale, residual, stream_);
 

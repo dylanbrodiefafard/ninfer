@@ -5,8 +5,9 @@ Layer 0–3:
     python3 -m tools.kdev bound ...
     python3 -m tools.kdev mma
 
-Linear public Op (not a kdev <op>):
+Projection public Ops (not kdev <op> commands):
     ./build/bench/ninfer_linear_bench --qtype ... --n N --k K --t T
+    ./build/bench/ninfer_ggml_block_linear_bench --qtype ggml_... --n N --k K --t T
 
 Op loop:
     python3 -m tools.kdev <op> [--fast|--full] [--bench] [--profile] [--san] [--json]
@@ -22,12 +23,12 @@ _USAGE = """\
 usage: python3 -m tools.kdev <command>
 
 Kernel iteration (docs/maintainer/kernel-iteration.md):
-  recipe    gate card: procedure, or fill a Linear point (--preset/--n --k --t --idea)
-  bound     Layer-0 Linear bound classifier (host, no GPU)
+  recipe    gate card: procedure, or fill a supported projection point
+  bound     Layer-0 registered-Linear roof / GGML profile-required gate (host, no GPU)
   mma       Layer-1 MMA issue-rate probe (writes profiles/kdev/mma_issue.json)
   diff      first-divergence localization: python3 -m tools.kdev.diff <op>
 
-Linear (not a kdev <op>): ./build/bench/ninfer_linear_bench --qtype … --n N --k K --t T
+Projection benches (not kdev <op> commands): ninfer_linear_bench, ninfer_ggml_block_linear_bench
 Op loop (registered: {ops}):
   python3 -m tools.kdev <op> [--fast|--full] [--bench] [--profile] [--san] [--json]
 """
