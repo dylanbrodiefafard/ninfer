@@ -449,10 +449,46 @@ qualify the changed arithmetic route.
 
 The post-change width-512 Nsight Systems capture measured 2.481 s including the final head
 (206.37 input token/s under instrumentation). The wide GGML kernels accounted for 90.8% of
-GPU kernel time and sparse-MoE ranges for 2.068 s of the 2.481 s prefill range. Combining each
-expert group's matrices and occurrences reduced H2D calls from 2,566 to 2,265 in the otherwise
-matching profile; H2D time remained 1.161 s because encoded expert bytes, not call overhead, are
-the dominant transfer cost. QSA selection/attention remained a small fraction of the profile.
+GPU kernel time and sparse-MoE ranges for 2.068 s of the 2.481 s prefill range. Within the exact
+prefill NVTX interval, combining each expert group's matrices and occurrences reduced H2D calls
+from 606 to 305 while preserving 6.224 GB of transferred payload; H2D time changed only from
+217.999 to 217.074 ms. Earlier whole-process counts of 2,566 and 2,265 calls and about 1.161 s of
+H2D time also included initial model materialization and therefore do not attribute prefill. The
+interval result shows that encoded expert bytes, not call overhead, dominate this preview-only
+transfer path. QSA selection/attention remained a small fraction of the profile.
+
+A 2026-09-05 follow-up made the host/device split explicit in profiler ranges and moved the
+mandatory prefill PLE gather until after layer-0 mixer work had been queued, matching the scalar
+decode schedule. Layer 1 still waits on the PLE transfer event immediately before row decode and
+injection, so represented state and arithmetic are unchanged. In the process-warm width-512
+Nsight run, host preparation (including all n-gram addressing and the contiguous visibility
+panel) took 25.421 us and the RAM row gather plus H2D enqueue took 331.193 us. At width 4096 the
+corresponding warm ranges took 2.221 and 2.749 ms. Host preparation remains before GPU enqueue;
+only the mapped-row gather and H2D enqueue overlap queued layer-0 work. A scalar continuation from
+the width-512 run spent
+1.050 us in host preparation and 9.320 us in PLE staging; these values are negligible beside
+mapped-expert MoE staging and confirm that no model floating-point work moved to the CPU.
+
+The same follow-up established post-change uninstrumented baselines with NVFP4-G16 QSA state and
+the final vocabulary head included. Four process-warm width-512 runs spanned 261.28--264.64 input
+token/s; two process-warm width-4096 runs measured 286.85 and 287.70 input token/s. A five-replay
+four-token scalar run measured 35.750 ms/token and 27.97 token/s. Ambient first-touch runs remain
+page-fault diagnostics rather than steady prefill measurements. Nsight reduced the width-4096
+pair to 273.80--274.75 input token/s, so profiler and uninstrumented rates are not interchanged.
+
+An exact GGML block-row gate and retained public-Op benchmark then evaluated the dominant
+T-wide projection family. At Q5_K `N=10240,K=2560,T=512`, the current 16-token aggregate route
+measured 5.252--5.449 ms in separate 20-repetition cold-L2 runs. A temporary 32-token tile measured
+5.883 ms and an 8-token tile 5.996 ms; both lost and were deleted. Matched Q8_0 and IQ4_NL checks
+also retained 16 tokens. The final aggregate instantiations use 41--44 registers, zero local bytes,
+and zero stack bytes, so no spill-driven variant is justified. The classifier admits
+`aggregate_T` because it attacks repeated packed-weight reads. Other GGML compute-side ideas remain
+measurement tasks: the exact representation-byte floor does not model scalar codec instructions
+or physical replay and therefore cannot classify them as DRAM- or compute-bound. No CUDA kernel
+changed from this sweep. The retained PLE dependency schedule creates measured overlap but has no
+matched pre/post throughput A/B, so the absolute Program baselines above are not attributed to it.
+The scheduling opportunity remains applicable to a future all-GPU-fit core checkpoint only when
+it retains this same RAM-resident PLE profile.
 
 ## 3. Exact component totals
 
