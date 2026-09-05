@@ -7,10 +7,12 @@
 namespace ninfer::ops {
 
 /**
- * @brief Decode one stored GGML block matrix and apply a single-column linear projection.
+ * @brief Decode one stored GGML block matrix and apply a contiguous BF16 projection.
  *
- * This verifier Op computes `out[n] = sum_k decode(w[n,k]) * FP32(x[k])`, where `x` and
- * `out` are contiguous BF16 vectors and `w` is a rank-two `[N,K]` GGML block-row weight.
+ * This verifier Op computes `out[n,t] = sum_k decode(w[n,k]) * FP32(x[k,t])`, where `x` is
+ * contiguous BF16 `[K,T]`, `out` is contiguous BF16 `[N,T]`, and `w` is a rank-two `[N,K]`
+ * GGML block-row weight. T is in [1,4096]. The established T=1 kernel remains unchanged;
+ * T>1 uses 16-column aggregate tiles that decode each weight once per output row and tile.
  * It admits exactly GGML Q8_0, Q4_K, Q5_K, Q6_K, IQ1_S, IQ2_XXS, and IQ4_NL. The device-resident
  * source block bytes are read in place; the Op performs no allocation, repacking, or persistent
  * mutation.
@@ -25,9 +27,9 @@ namespace ninfer::ops {
  * route's FP32 decode/product/reduction profile and final BF16 representation without reproducing
  * those boundaries in the oracle.
  *
- * This is deliberately a C=1/T=1 numerical-verification route. It is not part of generic Linear
- * dispatch and makes no throughput claim. Input, output, and weight storage must not overlap the
- * output. Work is enqueued on `stream`; the caller owns every storage lifetime through completion.
+ * This is deliberately a C=1 verifier route. It is not part of generic Linear dispatch and makes
+ * no throughput claim. Output storage must not overlap input or weight storage. Work is enqueued
+ * on `stream`; the caller owns every storage lifetime through completion.
  */
 void ggml_block_linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 

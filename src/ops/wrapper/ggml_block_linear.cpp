@@ -59,12 +59,13 @@ ByteRange range(const void* data, std::uint64_t bytes) {
 
 bool overlaps(ByteRange a, ByteRange b) { return a.begin < b.end && b.begin < a.end; }
 
-void require_vector(const Tensor& tensor, std::int32_t size, const char* label) {
-    if (tensor.dtype != DType::BF16 || tensor.ne[0] != size || tensor.ne[1] != 1 ||
+void require_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t tokens,
+                    const char* label) {
+    if (tensor.dtype != DType::BF16 || tensor.ne[0] != rows || tensor.ne[1] != tokens ||
         tensor.ne[2] != 1 || tensor.ne[3] != 1 || !tensor.is_contiguous() ||
         tensor.data == nullptr) {
         throw std::invalid_argument(std::string("ggml_block_linear: ") + label +
-                                    " must be a non-null contiguous BF16 vector");
+                                    " must be a non-null contiguous BF16 matrix");
     }
     if ((reinterpret_cast<std::uintptr_t>(tensor.data) & 0xfU) != 0) {
         throw std::invalid_argument(std::string("ggml_block_linear: ") + label +
@@ -94,8 +95,12 @@ void ggml_block_linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream
         w.qhigh != nullptr || w.scales != nullptr || w.high_plane_bytes != 0) {
         throw std::invalid_argument("ggml_block_linear: invalid GGML payload metadata");
     }
-    require_vector(x, w.k, "x");
-    require_vector(out, w.n, "out");
+    const std::int32_t tokens = x.ne[1];
+    if (tokens <= 0 || tokens > 4096) {
+        throw std::invalid_argument("ggml_block_linear: T must be in [1,4096]");
+    }
+    require_matrix(x, w.k, tokens, "x");
+    require_matrix(out, w.n, tokens, "out");
     const ByteRange output_range = range(out.data, out.bytes());
     if (overlaps(output_range, range(x.data, x.bytes())) ||
         overlaps(output_range, range(w.payload, w.payload_bytes))) {

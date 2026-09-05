@@ -390,6 +390,186 @@ int main() {
             ++failures;
         }
 
+        struct PrefillSnapshot {
+            std::vector<std::uint16_t> logits;
+            std::vector<std::uint16_t> hidden;
+            std::vector<std::int32_t> rows;
+            std::vector<std::uint8_t> state;
+            std::vector<std::uint16_t> continuation_logits;
+            std::uint32_t continuation_nll = 0;
+        };
+        const auto capture_prefill = [&](std::span<const std::int32_t> ids,
+                                         bool partitioned) {
+            program.reset();
+            verifier::PrefillResultView result;
+            if (partitioned) {
+                (void)program.prefill_chunk(ids.first(1));
+                result = program.prefill_chunk(ids.subspan(1));
+            } else {
+                result = program.prefill_chunk(ids);
+            }
+            if (result.begin_index != (partitioned ? 1 : 0) ||
+                result.end_index != static_cast<std::int32_t>(ids.size() - 1) ||
+                program.frontier() != static_cast<std::int32_t>(ids.size())) {
+                std::cerr << "prefill frontier/result interval mismatch\n";
+                ++failures;
+            }
+            PrefillSnapshot snapshot{
+                .logits = copy_tensor<std::uint16_t>(result.logits),
+                .hidden = copy_tensor<std::uint16_t>(result.final_hidden),
+                .rows = copy_tensor<std::int32_t>(result.ple_row_ids),
+            };
+            if (!finite_bf16(snapshot.logits) || !finite_bf16(snapshot.hidden)) {
+                std::cerr << "non-finite prefill final output\n";
+                ++failures;
+            }
+            std::array<std::int32_t, 2> history{kEos, kEos};
+            std::vector<std::int32_t> expected_rows;
+            expected_rows.reserve(static_cast<std::size_t>(ops::kPleHeads) * ids.size());
+            for (std::int32_t id : ids) {
+                const auto rows = expected_ple_rows(id, history);
+                expected_rows.insert(expected_rows.end(), rows.begin(), rows.end());
+                history = {history[1], id};
+            }
+            const std::size_t row_begin =
+                partitioned ? static_cast<std::size_t>(ops::kPleHeads) : 0;
+            if (!std::equal(snapshot.rows.begin(), snapshot.rows.end(),
+                            expected_rows.begin() + static_cast<std::ptrdiff_t>(row_begin))) {
+                std::cerr << "prefill PLE row panel mismatch\n";
+                ++failures;
+            }
+            const auto qsa_counts = copy_tensor<std::int32_t>(result.qsa_selected_count);
+            const auto qsa_ids = copy_tensor<std::int32_t>(result.qsa_selected_ids);
+            for (std::int32_t token = 0; token < result.qsa_selected_count.ne[0]; ++token) {
+                const std::int32_t expected_count = result.begin_index + token + 1;
+                if (qsa_counts[static_cast<std::size_t>(token)] != expected_count) {
+                    std::cerr << "prefill causal QSA selected count mismatch\n";
+                    ++failures;
+                }
+                for (std::int32_t selected = 0; selected < ops::kQsaSelectedCapacity;
+                     ++selected) {
+                    const std::int32_t expected = selected < expected_count ? selected : -1;
+                    const std::size_t offset = static_cast<std::size_t>(selected) +
+                                               static_cast<std::size_t>(
+                                                   ops::kQsaSelectedCapacity) * token;
+                    if (qsa_ids[offset] != expected) {
+                        std::cerr << "prefill causal QSA selected id mismatch\n";
+                        ++failures;
+                        break;
+                    }
+                }
+            }
+            const auto device_history =
+                copy_tensor<std::int32_t>(program.state().ple_token_history());
+            if (!std::equal(device_history.begin(), device_history.end(), history.begin())) {
+                std::cerr << "prefill committed PLE token history mismatch\n";
+                ++failures;
+            }
+            for (std::int32_t position = 0;
+                 position < static_cast<std::int32_t>(ids.size()); ++position) {
+                failures += validate_current_qsa_cache(program.state(), position);
+            }
+            snapshot.state = snapshot_continuation(program.state(), failures);
+            const auto continuation = program.execute_token(kTargets.back(), 1);
+            snapshot.continuation_logits = copy_tensor<std::uint16_t>(continuation.logits);
+            snapshot.continuation_nll =
+                std::bit_cast<std::uint32_t>(copy_tensor<float>(continuation.nll)[0]);
+            return snapshot;
+        };
+
+        const PrefillSnapshot one_shot = capture_prefill(kInputs, false);
+        const PrefillSnapshot replay = capture_prefill(kInputs, false);
+        if (one_shot.logits != replay.logits || one_shot.hidden != replay.hidden ||
+            one_shot.rows != replay.rows || one_shot.state != replay.state ||
+            one_shot.continuation_logits != replay.continuation_logits ||
+            one_shot.continuation_nll != replay.continuation_nll) {
+            std::cerr << "prefill changed after deterministic reset/replay\n";
+            ++failures;
+        }
+        const PrefillSnapshot partitioned = capture_prefill(kInputs, true);
+        if (partitioned.state != one_shot.state) {
+            std::cerr << "prefill one-shot/partition represented state mismatch\n";
+            ++failures;
+        }
+        if (partitioned.hidden != one_shot.hidden || partitioned.logits != one_shot.logits ||
+            partitioned.continuation_logits != one_shot.continuation_logits) {
+            std::cerr << "prefill one-shot/partition represented outputs mismatch\n";
+            ++failures;
+        }
+        if (one_shot.state != first_continuation) {
+            std::cerr << "prefill/scalar represented continuation state mismatch\n";
+            ++failures;
+        }
+        if (one_shot.hidden != runs[0].back().final_hidden ||
+            one_shot.logits != runs[0].back().logits) {
+            std::cerr << "prefill/scalar represented outputs mismatch\n";
+            ++failures;
+        }
+
+        constexpr std::array<std::int32_t, 3> eos_crossing{48, kEos, 17120};
+        const PrefillSnapshot eos_result = capture_prefill(eos_crossing, false);
+        if (eos_result.rows.size() !=
+            static_cast<std::size_t>(ops::kPleHeads) * eos_crossing.size()) {
+            std::cerr << "EOS-crossing PLE panel extent mismatch\n";
+            ++failures;
+        }
+        program.reset();
+        (void)program.prefill_chunk(std::span(eos_crossing).first(2));
+        const auto eos_tail = program.prefill_chunk(std::span(eos_crossing).last(1));
+        const auto expected_eos_tail_rows =
+            expected_ple_rows(eos_crossing.back(), {eos_crossing.front(), kEos});
+        if (copy_tensor<std::int32_t>(eos_tail.ple_row_ids) !=
+            std::vector<std::int32_t>(expected_eos_tail_rows.begin(),
+                                      expected_eos_tail_rows.end())) {
+            std::cerr << "EOS-crossing split PLE row mismatch\n";
+            ++failures;
+        }
+        const std::array<std::int32_t, 2> expected_eos_history{kEos, eos_crossing.back()};
+        if (copy_tensor<std::int32_t>(program.state().ple_token_history()) !=
+            std::vector<std::int32_t>(expected_eos_history.begin(),
+                                      expected_eos_history.end())) {
+            std::cerr << "EOS-crossing split PLE history mismatch\n";
+            ++failures;
+        }
+
+        program.reset();
+        const std::int32_t frontier_before_rejection = program.frontier();
+        try {
+            (void)program.prefill_chunk(std::span<const std::int32_t>{});
+            std::cerr << "empty prefill was accepted\n";
+            ++failures;
+        } catch (const std::invalid_argument&) {
+        }
+        constexpr std::array<std::int32_t, 1> invalid_token{-1};
+        try {
+            (void)program.prefill_chunk(invalid_token);
+            std::cerr << "invalid prefill token was accepted\n";
+            ++failures;
+        } catch (const std::invalid_argument&) {
+        }
+        constexpr std::array<std::int32_t, 1> valid_after_rejection{48};
+        (void)program.prefill_chunk(valid_after_rejection);
+        if (frontier_before_rejection != 0 || program.frontier() != 1) {
+            std::cerr << "prefill rejection mutated frontier or poisoned Program\n";
+            ++failures;
+        }
+        const auto state_before_capacity_rejection =
+            snapshot_continuation(program.state(), failures);
+        const std::vector<std::int32_t> excessive_at_nonzero_frontier(
+            verifier::kMaximumPrefillChunk, 48);
+        try {
+            (void)program.prefill_chunk(excessive_at_nonzero_frontier);
+            std::cerr << "nonzero-frontier excessive prefill was accepted\n";
+            ++failures;
+        } catch (const std::length_error&) {
+        }
+        if (program.frontier() != 1 ||
+            snapshot_continuation(program.state(), failures) !=
+                state_before_capacity_rejection) {
+            std::cerr << "capacity rejection mutated state or frontier\n";
+            ++failures;
+        }
+
         double total_nll = 0.0;
         double total_absolute_delta = 0.0;
         double maximum_absolute_delta = 0.0;

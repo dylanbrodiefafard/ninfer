@@ -236,7 +236,7 @@ ModelView load_view(const BindingPlan& bindings,
 std::size_t verifier_workspace_bytes() {
     return std::max({ops::gated_residual_workspace_capacity_bytes(),
                      ops::gated_delta_net_layer_workspace_capacity_bytes(),
-                     ops::qsa_verifier_workspace_bytes(), ops::ple_workspace_capacity_bytes(1),
+                     ops::qsa_verifier_workspace_bytes(1), ops::ple_workspace_capacity_bytes(1),
                      ops::qwen4_sparse_moe_workspace_capacity_bytes()});
 }
 

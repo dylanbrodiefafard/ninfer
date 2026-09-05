@@ -373,6 +373,35 @@ required physical-load-efficiency counters were unavailable because both ordinar
 container-root Nsight Compute access returned `ERR_NVGPUCTRPERM`. No CUDA change was made without
 that evidence. The existing public Q5_K numerical test continued to pass.
 
+The verifier now also owns a real T=1..4096 chunked-prefill route. Its startup-fixed expert
+pipeline has two 27,197,440-byte pinned slots and matching device slots; a separate 335,876-byte
+pinned integer scratch holds the single `10*T` route-id D2H and all bounded grouping tables. For
+each layer, every unique routed gate/up expert is copied once in ascending-id groups of at most 32,
+with the group matrices and occurrence list published by one contiguous H2D. The mapped PLE table
+likewise supplies one `16*T` panel through fixed 5,898,240-byte pinned/device storage. The RTX 5090
+retained about 5.32 GB free after model, state, and maximum prefill storage construction.
+
+On the frozen four-token real-artifact witness, scalar T=1 execution, one-shot T=4 prefill, and a
+1+3 partition produced bit-identical final hidden, final logits, next-token logits, and complete
+represented continuation state. The integration test also exact-checks the final QSA layer's
+per-column causal selected IDs/counts, PLE row panel and committed token history, EOS split across
+calls, and pre-enqueue capacity rejection without state mutation.
+
+With NVFP4-G16 QSA state and the final vocabulary head included, three same-process width-512 runs
+measured 214.00, 261.82, and 262.82 input token/s; the latter two are process-warm mapped-page-cache
+runs. A separate ambient-cache width-4096 run measured 264.11 input token/s. Immediate T=1 decode
+after the width-512 runs measured 25.50--26.35 token/s. These are diagnostic Program measurements,
+not Engine or registered-product claims. The admitted GGML T-wide kernel decodes each packed weight
+once for a 16-token tile rather than once per token; independent codec tests at T=1/16/17/128/4096
+qualify the changed arithmetic route.
+
+The post-change width-512 Nsight Systems capture measured 2.481 s including the final head
+(206.37 input token/s under instrumentation). The wide GGML kernels accounted for 90.8% of
+GPU kernel time and sparse-MoE ranges for 2.068 s of the 2.481 s prefill range. Combining each
+expert group's matrices and occurrences reduced H2D calls from 2,566 to 2,265 in the otherwise
+matching profile; H2D time remained 1.161 s because encoded expert bytes, not call overhead, are
+the dominant transfer cost. QSA selection/attention remained a small fraction of the profile.
+
 ## 3. Exact component totals
 
 | Source component | Tensors | Values | Payload bytes |

@@ -13,9 +13,22 @@ void launch_format(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t s
     constexpr std::uint64_t block_values = GgmlDecoder<Format>::block_values;
     constexpr std::uint64_t block_bytes  = GgmlDecoder<Format>::block_bytes;
     const auto row_bytes = static_cast<std::uint64_t>(w.k) / block_values * block_bytes;
-    ggml_block_linear_kernel<Format><<<w.n, 256, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-        static_cast<__nv_bfloat16*>(out.data), w.k, row_bytes);
+    const std::int32_t tokens = x.ne[1];
+    if (tokens == 1) {
+        ggml_block_linear_kernel<Format><<<w.n, 256, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<__nv_bfloat16*>(out.data), w.k, row_bytes);
+    } else {
+        const dim3 grid(
+            static_cast<unsigned>(w.n),
+            static_cast<unsigned>((tokens + kGgmlBlockLinearAggregateTokens - 1) /
+                                  kGgmlBlockLinearAggregateTokens));
+        ggml_block_linear_aggregate_kernel<Format><<<grid, 256, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<__nv_bfloat16*>(out.data), w.n, w.k, tokens, row_bytes);
+    }
 }
 
 } // namespace

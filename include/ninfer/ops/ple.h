@@ -21,6 +21,9 @@ inline constexpr std::int32_t kPleIq4NlBlockValues  = 32;
 inline constexpr std::int32_t kPleIq4NlBlockBytes   = 18;
 inline constexpr std::int32_t kPleIq4NlRowBytes     = 90;
 inline constexpr std::int32_t kPleStagedBytes       = 1440;
+inline constexpr std::int32_t kPleMaxWidth          = 4096;
+inline constexpr std::size_t kPleMaxStagedBytes =
+    static_cast<std::size_t>(kPleStagedBytes) * kPleMaxWidth;
 
 struct PleMappedIq4NlTable {
     const std::uint8_t* data = nullptr;
@@ -43,7 +46,20 @@ void ple_iq4_nl_stage_rows(const PleMappedIq4NlTable& table,
                            std::size_t pinned_bytes, Tensor& device_rows, cudaStream_t stream);
 
 /**
- * Exact GPU decode of staged U8 IQ4_NL [90,16] into BF16 [160,16]. In each 18-byte block, bytes
+ * T-wide form of ple_iq4_nl_stage_rows. row_ids is the contiguous I32 logical shape [16,T],
+ * head-fastest. The exact selected source bytes are packed into U8 [90,16,T], also
+ * head-fastest within each token, and transferred with one H2D. T is in [1,4096]. The caller's
+ * pinned and device slots require exactly 1440*T live bytes; all other ownership and host-work
+ * restrictions are identical to the scalar entry point.
+ */
+void ple_iq4_nl_stage_rows_batch(const PleMappedIq4NlTable& table,
+                                 std::span<const std::int32_t> row_ids, std::int32_t width,
+                                 void* pinned_rows, std::size_t pinned_bytes,
+                                 Tensor& device_rows, cudaStream_t stream);
+
+/**
+ * Exact GPU decode of staged U8 IQ4_NL [90,16,T] into BF16 [160,16,T], T in [1,4096]. In each
+ * 18-byte block, bytes
  * 0..1 are a little-endian binary16 scale and byte 2+j carries output j in its low nibble and
  * output 16+j in its high nibble. The signed codebook is
  * [-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113]. The FP32 product is rounded once

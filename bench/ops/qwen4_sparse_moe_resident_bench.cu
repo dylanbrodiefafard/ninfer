@@ -262,18 +262,19 @@ public:
             .shared_up = staged_weights_.shared_up,
             .shared_down = staged_weights_.shared_down,
         };
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
         pipeline_ = {
             .pinned_stage = pinned_stage_.data(),
             .pinned_stage_bytes = pinned_stage_.size(),
             .device_stage = device_stage_view_,
             .transfer_stream = events_.transfer,
+            .compute_stream = stream_,
             .route_ready = events_.route_ready,
             .ids_ready = events_.ids_ready,
             .transfer_ready = {events_.transfer_ready[0], events_.transfer_ready[1]},
             .consumer_complete = {events_.consumer_complete[0],
                                   events_.consumer_complete[1]},
         };
-        CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
     }
 
     ~Fixture() {

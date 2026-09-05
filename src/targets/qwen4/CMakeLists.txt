@@ -2,3 +2,7 @@
 add_library(ninfer_qwen4_verifier STATIC verifier.cpp program.cpp)
 ninfer_internal_includes(ninfer_qwen4_verifier)
 target_link_libraries(ninfer_qwen4_verifier PUBLIC ninfer_artifact ninfer_ops)
+
+add_executable(ninfer_qwen4_prefill_bench prefill_bench.cpp)
+ninfer_internal_includes(ninfer_qwen4_prefill_bench)
+target_link_libraries(ninfer_qwen4_prefill_bench PRIVATE ninfer_qwen4_verifier)

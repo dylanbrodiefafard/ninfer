@@ -27,12 +27,13 @@ __device__ __forceinline__ float iq4_nl_value(const std::uint8_t* block, int ind
     return __half2float(__ushort_as_half(load_u16_le(block))) * static_cast<float>(codebook[code]);
 }
 
-__global__ void ple_iq4_nl_decode_kernel(const std::uint8_t* encoded, __nv_bfloat16* output) {
+__global__ void ple_iq4_nl_decode_kernel(const std::uint8_t* encoded, __nv_bfloat16* output,
+                                         int count) {
     const int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= kPleHeads * kPleRowWidth) { return; }
-    const int head       = index / kPleRowWidth;
+    if (index >= count) { return; }
+    const int row_index  = index / kPleRowWidth;
     const int d          = index % kPleRowWidth;
-    const auto* row      = encoded + head * kPleIq4NlRowBytes;
+    const auto* row      = encoded + row_index * kPleIq4NlRowBytes;
     const auto* block    = row + (d / kPleIq4NlBlockValues) * kPleIq4NlBlockBytes;
     output[index]        = __float2bfloat16_rn(iq4_nl_value(block, d % kPleIq4NlBlockValues));
 }
@@ -190,10 +191,10 @@ __global__ void ple_state_update_kernel(const __nv_bfloat16* old_state,
 void ple_iq4_nl_decode_rows_launch(const Tensor& device_rows, Tensor& embedding,
                                    cudaStream_t stream) {
     constexpr int block = 256;
-    constexpr int count = kPleHeads * kPleRowWidth;
+    const int count = kPleHeads * kPleRowWidth * embedding.ne[2];
     ple_iq4_nl_decode_kernel<<<(count + block - 1) / block, block, 0, stream>>>(
         static_cast<const std::uint8_t*>(device_rows.data),
-        static_cast<__nv_bfloat16*>(embedding.data));
+        static_cast<__nv_bfloat16*>(embedding.data), count);
     CUDA_CHECK(cudaGetLastError());
 }
 

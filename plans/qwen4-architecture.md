@@ -287,9 +287,10 @@ Before product admission, `src/targets/qwen4/verifier.{h,cpp}` and `program.cpp`
 diagnostic exception: an unregistered C=1 eager Text package that binds only
 `qwen4/verification` + `unsloth-ud-iq1-s-host-staged`, owns the fixed 4096-token
 verification state/staging, and composes the admitted Ops into the exact 48-layer schedule. Its
-Program accepts only numeric token/target ids and exposes logits, NLL, and state/routing diagnostics
-for the opt-in real-artifact test; it has no registry, Engine, CLI, serving, MTP, Vision, batching,
-or CUDA-Graph route. It is not the eventual family runtime or an exact product-SKU leaf.
+Program accepts only numeric token/target ids, exposes logits, NLL, and state/routing diagnostics,
+and has C=1 T=1 decode plus T=1..4096 chunked prefill for the opt-in real-artifact test; it has no
+registry, Engine, CLI, serving, MTP, Vision, multi-request batching, or CUDA-Graph route. It is not
+the eventual family runtime or an exact product-SKU leaf.
 
 QSA, GR, PLE, and exact n-gram continuation state make the Program materially different from
 `src/targets/qwen3_6`. Do not copy the Qwen3.6 Program into a leaf, introduce a family base class,
@@ -365,7 +366,16 @@ gathers selected rank pairs into alternating pinned slots. A distinct transfer s
 rank into its paired device slot while the compute stream consumes the preceding rank. Explicit
 transfer-ready and consumer-complete events protect slot reuse, while accumulation remains in route
 rank order. The next layer's route/ID barrier transitively closes both slots from the preceding
-call. No whole-round graph claim is made.
+call. One pipeline/event set is bound to one compute stream; changing streams requires an external
+drain and a distinct pipeline. No whole-round graph claim is made.
+
+For chunked prefill, the GPU returns all `10*T` ids once per layer. Fixed caller-owned integer
+scratch groups occurrences by ascending expert id; each unique gate/up pair is gathered once into
+groups of at most 32 and the matrices plus occurrence list cross in one contiguous H2D per group.
+Two maximum-size group slots overlap transfer and GPU consumption. PLE similarly gathers the
+complete `16*T` row panel and overlaps its single H2D with layer 0. These are raw compressed-byte
+host operations only: all decode, projection, recurrence, attention, and mixture arithmetic stays
+on the GPU.
 
 A separate one-layer public-Op benchmark measures the future device-resident placement without
 changing this verifier. It owns complete device IQ1_S or IQ2_XXS gate/up banks and the IQ4_NL down
@@ -631,6 +641,12 @@ the Engine internals that currently hard-code `targets::qwen3_6::PreparedPrompt`
 per-package type erasure or a variant keyed by `ActiveTarget`; do not expose target types publicly.
 Gate: artifact-native reference parity for layer taps, selected indices, logits/NLL, chunked
 prefill, T=1 continuation, request reset, and C=1..8 isolation.
+
+The unregistered verifier portion of this phase is implemented for C=1: startup-fixed T=1..4096
+storage, T-wide embedding/GR/GDN/PLE/QSA/MoE execution, per-query causal QSA visibility, final-column
+head projection, and reset/partition/EOS continuation tests are live. Product registration,
+frontend ownership, multi-request C=1..8 scheduling, transactional MTP, and CUDA Graphs remain the
+later gates described below and are not implied by the verifier.
 
 ### Phase 5 — Vision and frontend
 

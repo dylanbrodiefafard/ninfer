@@ -220,9 +220,8 @@ void qsa_selected_attention(const Tensor& q, const Tensor& selected_ids,
     require_tensor(out, DType::BF16, op, "out");
     require_tensor(workspace, DType::U8, op, "workspace");
     const int width = q.ne[2];
-    if (width != 1) {
-        throw std::invalid_argument(std::string(op) +
-                                    ": only the implemented one-token route is supported");
+    if (width <= 0 || width > kQsaMaximumTokens) {
+        throw std::invalid_argument(std::string(op) + ": width must be in [1,4096]");
     }
     const int selected_bound = selected_ids.ne[0];
     if (selected_bound <= 0 || selected_bound > kQsaSelectedCapacity) {

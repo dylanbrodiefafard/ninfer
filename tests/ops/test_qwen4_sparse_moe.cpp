@@ -348,6 +348,23 @@ std::vector<std::uint8_t> make_matrix(QType qtype, int rows, int columns, std::u
     return result;
 }
 
+std::vector<std::uint8_t> make_zero_scaled_matrix(QType qtype, int rows, int columns,
+                                                  std::uint32_t seed) {
+    std::vector<std::uint8_t> result = make_matrix(qtype, rows, columns, seed);
+    const FormatSpec format = format_spec(qtype);
+    const std::size_t blocks = result.size() / static_cast<std::size_t>(format.bytes);
+    for (std::size_t index = 0; index < blocks; ++index) {
+        auto* block = result.data() + index * static_cast<std::size_t>(format.bytes);
+        if (qtype == QType::GGML_Q6_K) {
+            write_u16(block + 208, 0);
+        } else {
+            write_u16(block, 0);
+            if (qtype == QType::GGML_Q5_K) { write_u16(block + 2, 0); }
+        }
+    }
+    return result;
+}
+
 Weight make_ggml_weight(void* data, std::size_t bytes, QType qtype, int matrices, int rows,
                         int columns) {
     const FormatSpec format = format_spec(qtype);
@@ -756,6 +773,7 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
         .pinned_stage_bytes = ops::kQwen4SparseMoePipelineStageBytes,
         .device_stage = stage,
         .transfer_stream = pipeline_events.transfer_stream,
+        .compute_stream = stream,
         .route_ready = pipeline_events.route_ready,
         .ids_ready = pipeline_events.ids_ready,
         .transfer_ready = {pipeline_events.transfer_ready[0],
@@ -846,6 +864,215 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
     if (!std::equal(next_actual.begin(), next_actual.end(), next_resident_actual.begin())) {
         std::cerr << "Qwen4 resident back-to-back fusion changed a routed BF16 seam\n";
         ++failures;
+    }
+
+    if (route_fixture != RouteFixture::Underflow) {
+        constexpr int prefill_width = 2;
+        std::vector<float> prefill_input;
+        prefill_input.reserve(static_cast<std::size_t>(kHidden) * prefill_width);
+        prefill_input.insert(prefill_input.end(), input.begin(), input.end());
+        prefill_input.insert(prefill_input.end(), input.begin(), input.end());
+        std::vector<double> prefill_reference;
+        prefill_reference.reserve(static_cast<std::size_t>(kHidden) * prefill_width);
+        prefill_reference.insert(prefill_reference.end(), reference.begin(), reference.end());
+        prefill_reference.insert(prefill_reference.end(), reference.begin(), reference.end());
+        std::vector<double> next_prefill_reference;
+        next_prefill_reference.reserve(static_cast<std::size_t>(kHidden) * prefill_width);
+        next_prefill_reference.insert(next_prefill_reference.end(), next_reference.begin(),
+                                      next_reference.end());
+        next_prefill_reference.insert(next_prefill_reference.end(), next_reference.begin(),
+                                      next_reference.end());
+
+        DeviceBuffer prefill_x = to_device_bf16(prefill_input);
+        GuardedDeviceBuffer prefill_stage(ops::kQwen4SparseMoePrefillPipelineStageBytes);
+        GuardedDeviceBuffer prefill_ids(static_cast<std::size_t>(kTopK) * prefill_width *
+                                        sizeof(std::int32_t));
+        GuardedDeviceBuffer prefill_weights(static_cast<std::size_t>(kTopK) * prefill_width *
+                                            sizeof(float));
+        GuardedDeviceBuffer prefill_output(static_cast<std::size_t>(kHidden) * prefill_width *
+                                           sizeof(std::uint16_t));
+        GuardedDeviceBuffer next_prefill_ids(static_cast<std::size_t>(kTopK) * prefill_width *
+                                             sizeof(std::int32_t));
+        GuardedDeviceBuffer next_prefill_weights(static_cast<std::size_t>(kTopK) * prefill_width *
+                                                 sizeof(float));
+        GuardedDeviceBuffer next_prefill_output(static_cast<std::size_t>(kHidden) * prefill_width *
+                                                sizeof(std::uint16_t));
+        prefill_stage.fill(0xcd);
+        PinnedHostBuffer prefill_pinned(ops::kQwen4SparseMoePrefillPipelineStageBytes);
+        PinnedHostBuffer prefill_host_scratch(
+            ops::kQwen4SparseMoePrefillHostScratchBytes);
+        std::memset(prefill_pinned.data(), 0xa5, prefill_pinned.size());
+        DeviceArena prefill_workspace(
+            ops::qwen4_sparse_moe_prefill_workspace_capacity_bytes(prefill_width));
+        Tensor prefill_x_tensor(prefill_x.p, DType::BF16, {kHidden, prefill_width});
+        Tensor prefill_stage_tensor(
+            prefill_stage.data(), DType::U8,
+            {static_cast<std::int32_t>(ops::kQwen4SparseMoePrefillPipelineStageBytes)});
+        Tensor prefill_ids_tensor(prefill_ids.data(), DType::I32, {kTopK, prefill_width});
+        Tensor prefill_weights_tensor(prefill_weights.data(), DType::FP32,
+                                      {kTopK, prefill_width});
+        Tensor prefill_output_tensor(prefill_output.data(), DType::BF16,
+                                     {kHidden, prefill_width});
+        Tensor next_prefill_ids_tensor(next_prefill_ids.data(), DType::I32,
+                                       {kTopK, prefill_width});
+        Tensor next_prefill_weights_tensor(next_prefill_weights.data(), DType::FP32,
+                                           {kTopK, prefill_width});
+        Tensor next_prefill_output_tensor(next_prefill_output.data(), DType::BF16,
+                                          {kHidden, prefill_width});
+        ops::Qwen4SparseMoePrefillPipeline prefill_pipeline{
+            .pinned_stage = prefill_pinned.data(),
+            .pinned_stage_bytes = prefill_pinned.size(),
+            .host_scratch = prefill_host_scratch.data(),
+            .host_scratch_bytes = prefill_host_scratch.size(),
+            .device_stage = prefill_stage_tensor,
+            .transfer_stream = pipeline_events.transfer_stream,
+            .compute_stream = stream,
+            .route_ready = pipeline_events.route_ready,
+            .ids_ready = pipeline_events.ids_ready,
+            .transfer_ready = {pipeline_events.transfer_ready[0],
+                               pipeline_events.transfer_ready[1]},
+            .consumer_complete = {pipeline_events.consumer_complete[0],
+                                  pipeline_events.consumer_complete[1]},
+        };
+        ops::qwen4_sparse_moe_prefill(prefill_x_tensor, weights, prefill_pipeline,
+                                      prefill_ids_tensor, prefill_weights_tensor,
+                                      prefill_output_tensor, prefill_workspace, stream);
+        ops::qwen4_sparse_moe_prefill(prefill_x_tensor, next_weights, prefill_pipeline,
+                                      next_prefill_ids_tensor, next_prefill_weights_tensor,
+                                      next_prefill_output_tensor, prefill_workspace, stream);
+        cuda_synchronize(stream);
+
+        std::vector<std::int32_t> expected_ids(static_cast<std::size_t>(kTopK) * prefill_width);
+        std::vector<double> expected_weights(static_cast<std::size_t>(kTopK) * prefill_width);
+        std::vector<std::int32_t> expected_next_ids(expected_ids.size());
+        std::vector<double> expected_next_weights(expected_weights.size());
+        for (int token = 0; token < prefill_width; ++token) {
+            std::copy(route.ids.begin(), route.ids.end(),
+                      expected_ids.begin() + static_cast<std::ptrdiff_t>(token * kTopK));
+            std::copy(route.weights.begin(), route.weights.end(),
+                      expected_weights.begin() + static_cast<std::ptrdiff_t>(token * kTopK));
+            std::copy(next_route.ids.begin(), next_route.ids.end(),
+                      expected_next_ids.begin() + static_cast<std::ptrdiff_t>(token * kTopK));
+            std::copy(next_route.weights.begin(), next_route.weights.end(),
+                      expected_next_weights.begin() + static_cast<std::ptrdiff_t>(token * kTopK));
+        }
+        failures += verify_exact(
+            "Qwen4 sparse MoE prefill duplicate-token ids",
+            from_device<std::int32_t>(prefill_ids.data(), expected_ids.size()), expected_ids);
+        failures += verify_pointwise(
+            "Qwen4 sparse MoE prefill duplicate-token weights",
+            [&] {
+                const auto values = from_device<float>(prefill_weights.data(),
+                                                       expected_weights.size());
+                return std::vector<double>(values.begin(), values.end());
+            }(),
+            expected_weights, kRouteWeightCriterion);
+        failures += verify_reduction(
+            "Qwen4 sparse MoE prefill complete FP64 formula",
+            from_device_bf16(prefill_output.data(), prefill_reference.size()),
+            prefill_reference, kOutputCriterion);
+        failures += verify_exact(
+            "Qwen4 sparse MoE prefill back-to-back ids",
+            from_device<std::int32_t>(next_prefill_ids.data(), expected_next_ids.size()),
+            expected_next_ids);
+        failures += verify_pointwise(
+            "Qwen4 sparse MoE prefill back-to-back weights",
+            [&] {
+                const auto values = from_device<float>(next_prefill_weights.data(),
+                                                       expected_next_weights.size());
+                return std::vector<double>(values.begin(), values.end());
+            }(),
+            expected_next_weights, kRouteWeightCriterion);
+        failures += verify_reduction(
+            "Qwen4 sparse MoE prefill back-to-back complete FP64 formula",
+            from_device_bf16(next_prefill_output.data(), next_prefill_reference.size()),
+            next_prefill_reference, kOutputCriterion);
+
+        std::vector<int> sorted_experts(next_route.ids.begin(), next_route.ids.end());
+        std::sort(sorted_experts.begin(), sorted_experts.end());
+        const std::size_t rank_bytes = ops::qwen4_sparse_moe_rank_stage_bytes(routed_qtype);
+        std::vector<std::uint8_t> staged_pair(rank_bytes);
+        auto* pinned_prefill = static_cast<const std::uint8_t*>(prefill_pinned.data());
+        for (std::size_t local = 0; local < sorted_experts.size(); ++local) {
+            const int expert = sorted_experts[local];
+            std::memcpy(staged_pair.data(), mapped_gate.data() +
+                                                static_cast<std::size_t>(expert) * one_routed,
+                        one_routed);
+            std::memcpy(staged_pair.data() + one_routed,
+                        mapped_up.data() + static_cast<std::size_t>(expert) * one_routed,
+                        one_routed);
+            if (std::memcmp(pinned_prefill + local * rank_bytes, staged_pair.data(),
+                            rank_bytes) != 0) {
+                std::cerr << "Qwen4 sparse MoE prefill unique staging bytes changed\n";
+                ++failures;
+            }
+            const auto device_pair = from_device<std::uint8_t>(
+                static_cast<const std::uint8_t*>(prefill_stage.data()) + local * rank_bytes,
+                rank_bytes);
+            failures += verify_exact("Qwen4 sparse MoE prefill device staging bytes",
+                                     device_pair, staged_pair);
+        }
+        std::vector<std::int32_t> expected_occurrences;
+        for (int expert : sorted_experts) {
+            const auto iterator = std::find(next_route.ids.begin(), next_route.ids.end(), expert);
+            const int rank = static_cast<int>(iterator - next_route.ids.begin());
+            expected_occurrences.push_back(rank);
+            expected_occurrences.push_back(rank + kTopK);
+        }
+        const auto* pinned_occurrences = reinterpret_cast<const std::int32_t*>(
+            pinned_prefill + sorted_experts.size() * rank_bytes);
+        if (!std::equal(expected_occurrences.begin(), expected_occurrences.end(),
+                        pinned_occurrences)) {
+            std::cerr << "Qwen4 sparse MoE prefill occurrence grouping changed\n";
+            ++failures;
+        }
+        const auto device_occurrences = from_device<std::int32_t>(
+            static_cast<const std::uint8_t*>(prefill_stage.data()) +
+                sorted_experts.size() * rank_bytes,
+            expected_occurrences.size());
+        failures += verify_exact("Qwen4 sparse MoE prefill device occurrence grouping",
+                                 device_occurrences, expected_occurrences);
+        failures += prefill_stage.verify_guards("Qwen4 sparse MoE prefill stage");
+        failures += prefill_ids.verify_guards("Qwen4 sparse MoE prefill ids");
+        failures += prefill_weights.verify_guards("Qwen4 sparse MoE prefill weights");
+        failures += prefill_output.verify_guards("Qwen4 sparse MoE prefill destination");
+        failures += next_prefill_ids.verify_guards(
+            "Qwen4 sparse MoE prefill back-to-back ids");
+        failures += next_prefill_weights.verify_guards(
+            "Qwen4 sparse MoE prefill back-to-back weights");
+        failures += next_prefill_output.verify_guards(
+            "Qwen4 sparse MoE prefill back-to-back destination");
+
+        Tensor bad_prefill_ids(prefill_ids.data(), DType::I32, {kTopK, 1});
+        failures += expect_invalid(
+            [&] {
+                ops::qwen4_sparse_moe_prefill(
+                    prefill_x_tensor, weights, prefill_pipeline, bad_prefill_ids,
+                    prefill_weights_tensor, prefill_output_tensor, prefill_workspace, stream);
+            },
+            "mismatched prefill route width");
+        auto short_prefill_pipeline = prefill_pipeline;
+        --short_prefill_pipeline.pinned_stage_bytes;
+        failures += expect_invalid(
+            [&] {
+                ops::qwen4_sparse_moe_prefill(
+                    prefill_x_tensor, weights, short_prefill_pipeline, prefill_ids_tensor,
+                    prefill_weights_tensor, prefill_output_tensor, prefill_workspace, stream);
+            },
+            "short prefill pinned stage");
+        PinnedHostBuffer misaligned_scratch(
+            ops::kQwen4SparseMoePrefillHostScratchBytes + 1);
+        auto misaligned_prefill_pipeline = prefill_pipeline;
+        misaligned_prefill_pipeline.host_scratch =
+            static_cast<std::byte*>(misaligned_scratch.data()) + 1;
+        failures += expect_invalid(
+            [&] {
+                ops::qwen4_sparse_moe_prefill(
+                    prefill_x_tensor, weights, misaligned_prefill_pipeline,
+                    prefill_ids_tensor, prefill_weights_tensor, prefill_output_tensor,
+                    prefill_workspace, stream);
+            },
+            "misaligned prefill host scratch");
     }
 
     const std::size_t rank_bytes = ops::qwen4_sparse_moe_rank_stage_bytes(routed_qtype);
@@ -984,6 +1211,14 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
                                   destination, workspace, stream);
         },
         "same compute and transfer stream");
+    auto changed_compute_stream_pipeline = pipeline;
+    changed_compute_stream_pipeline.compute_stream = pipeline_events.transfer_stream;
+    failures += expect_invalid(
+        [&] {
+            ops::qwen4_sparse_moe(x, weights, changed_compute_stream_pipeline, ids,
+                                  route_weights, destination, workspace, stream);
+        },
+        "changed pipeline compute stream");
     DeviceArena short_workspace(ops::qwen4_sparse_moe_workspace_capacity_bytes() - 1);
     failures += expect_invalid(
         [&] {
@@ -991,6 +1226,199 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
                                   short_workspace, stream);
         },
         "short workspace");
+    return failures;
+}
+
+int prefill_partition_and_slot_reuse_case() {
+    constexpr int width = 7;
+    constexpr QType routed_qtype = QType::GGML_IQ1_S;
+    const std::size_t one_routed = matrix_bytes(routed_qtype, kIntermediate, kHidden);
+    const std::size_t rank_bytes = 2 * one_routed;
+    const std::size_t bank_bytes = static_cast<std::size_t>(kExperts) * one_routed;
+    AnonymousMapping mapped_gate(bank_bytes);
+    AnonymousMapping mapped_up(bank_bytes);
+    for (int expert = 0; expert < width * kTopK; ++expert) {
+        const auto gate = make_zero_scaled_matrix(routed_qtype, kIntermediate, kHidden,
+                                                  0xb000U + expert);
+        const auto up = make_zero_scaled_matrix(routed_qtype, kIntermediate, kHidden,
+                                                0xc000U + expert);
+        std::memcpy(mapped_gate.mutable_data() + static_cast<std::size_t>(expert) * one_routed,
+                    gate.data(), one_routed);
+        std::memcpy(mapped_up.mutable_data() + static_cast<std::size_t>(expert) * one_routed,
+                    up.data(), one_routed);
+    }
+    mapped_gate.make_read_only();
+    mapped_up.make_read_only();
+
+    std::vector<float> input(static_cast<std::size_t>(kHidden) * width, 0.0F);
+    std::vector<float> router(static_cast<std::size_t>(kExperts) * kHidden, 0.0F);
+    std::vector<std::int32_t> expected_ids(static_cast<std::size_t>(kTopK) * width);
+    std::vector<double> expected_weights(static_cast<std::size_t>(kTopK) * width);
+    for (int token = 0; token < width; ++token) {
+        input[token + static_cast<std::size_t>(kHidden) * token] = 1.0F;
+        double denominator = 0.0;
+        for (int rank = 0; rank < kTopK; ++rank) {
+            const int expert = token * kTopK + rank;
+            expected_ids[rank + kTopK * token] = expert;
+            router[static_cast<std::size_t>(expert) * kHidden + token] = 20.0F - rank;
+            expected_weights[rank + kTopK * token] = std::exp(-static_cast<double>(rank));
+            denominator += expected_weights[rank + kTopK * token];
+        }
+        for (int rank = 0; rank < kTopK; ++rank) {
+            expected_weights[rank + kTopK * token] /= denominator;
+        }
+    }
+    round_to_bf16(input);
+    const std::size_t down_bank_bytes = static_cast<std::size_t>(kExperts) *
+                                        matrix_bytes(QType::GGML_IQ4_NL, kHidden,
+                                                     kIntermediate);
+    DeviceBuffer device_down(down_bank_bytes);
+    device_down.fill(0);
+    const auto shared_gate_proj = make_zero_scaled_matrix(QType::GGML_Q5_K, kIntermediate,
+                                                          kHidden, 0xd000U);
+    const auto shared_up = make_zero_scaled_matrix(QType::GGML_Q5_K, kIntermediate, kHidden,
+                                                   0xe000U);
+    const auto shared_down = make_zero_scaled_matrix(QType::GGML_Q8_0, kHidden, kIntermediate,
+                                                     0xf000U);
+    std::vector<float> shared_gate(kHidden, 0.0F);
+    DeviceBuffer device_x = to_device_bf16(input);
+    DeviceBuffer device_router = to_device_f32(router);
+    DeviceBuffer device_shared_gate = to_device_f32(shared_gate);
+    DeviceBuffer device_shared_gate_proj = to_device(shared_gate_proj);
+    DeviceBuffer device_shared_up = to_device(shared_up);
+    DeviceBuffer device_shared_down = to_device(shared_down);
+    GuardedDeviceBuffer stage(ops::kQwen4SparseMoePrefillPipelineStageBytes);
+    GuardedDeviceBuffer ids(static_cast<std::size_t>(kTopK) * width * sizeof(std::int32_t));
+    GuardedDeviceBuffer weights(static_cast<std::size_t>(kTopK) * width * sizeof(float));
+    GuardedDeviceBuffer output(static_cast<std::size_t>(kHidden) * width *
+                               sizeof(std::uint16_t));
+    stage.fill(0xcd);
+    ids.fill(0xcd);
+    weights.fill(0xcd);
+    output.fill(0xcd);
+    PinnedHostBuffer pinned(ops::kQwen4SparseMoePrefillPipelineStageBytes);
+    PinnedHostBuffer host_scratch(ops::kQwen4SparseMoePrefillHostScratchBytes);
+    std::memset(pinned.data(), 0xa5, pinned.size());
+    DeviceArena workspace(ops::qwen4_sparse_moe_prefill_workspace_capacity_bytes(width));
+    PipelineEvents events;
+    cudaStream_t stream = nullptr;
+    cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+               "cudaStreamCreate prefill partition");
+
+    Tensor x_tensor(device_x.p, DType::BF16, {kHidden, width});
+    Tensor stage_tensor(
+        stage.data(), DType::U8,
+        {static_cast<std::int32_t>(ops::kQwen4SparseMoePrefillPipelineStageBytes)});
+    Tensor ids_tensor(ids.data(), DType::I32, {kTopK, width});
+    Tensor weights_tensor(weights.data(), DType::FP32, {kTopK, width});
+    Tensor output_tensor(output.data(), DType::BF16, {kHidden, width});
+    Tensor shared_gate_tensor(device_shared_gate.p, DType::FP32, {kHidden});
+    ops::Qwen4SparseMoeWeights model_weights{
+        .router = make_router(device_router.p),
+        .routed_gate_up = {
+            .gate = std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(mapped_gate.data()), mapped_gate.size()),
+            .up = std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(mapped_up.data()), mapped_up.size()),
+            .qtype = routed_qtype,
+        },
+        .routed_down = make_ggml_weight(device_down.p, down_bank_bytes,
+                                        QType::GGML_IQ4_NL, kExperts, kHidden, kIntermediate),
+        .shared_gate = shared_gate_tensor,
+        .shared_gate_proj = make_ggml_weight(
+            device_shared_gate_proj.p, shared_gate_proj.size(), QType::GGML_Q5_K, 1,
+            kIntermediate, kHidden),
+        .shared_up = make_ggml_weight(device_shared_up.p, shared_up.size(), QType::GGML_Q5_K, 1,
+                                      kIntermediate, kHidden),
+        .shared_down = make_ggml_weight(device_shared_down.p, shared_down.size(),
+                                        QType::GGML_Q8_0, 1, kHidden, kIntermediate),
+    };
+    ops::Qwen4SparseMoePrefillPipeline pipeline{
+        .pinned_stage = pinned.data(),
+        .pinned_stage_bytes = pinned.size(),
+        .host_scratch = host_scratch.data(),
+        .host_scratch_bytes = host_scratch.size(),
+        .device_stage = stage_tensor,
+        .transfer_stream = events.transfer_stream,
+        .compute_stream = stream,
+        .route_ready = events.route_ready,
+        .ids_ready = events.ids_ready,
+        .transfer_ready = {events.transfer_ready[0], events.transfer_ready[1]},
+        .consumer_complete = {events.consumer_complete[0], events.consumer_complete[1]},
+    };
+    ops::qwen4_sparse_moe_prefill(x_tensor, model_weights, pipeline, ids_tensor,
+                                  weights_tensor, output_tensor, workspace, stream);
+    cuda_synchronize(stream);
+
+    int failures = verify_exact("Qwen4 sparse MoE prefill partition ids",
+                                from_device<std::int32_t>(ids.data(), expected_ids.size()),
+                                expected_ids);
+    const auto actual_weight_f32 = from_device<float>(weights.data(), expected_weights.size());
+    failures += verify_pointwise(
+        "Qwen4 sparse MoE prefill partition weights",
+        std::vector<double>(actual_weight_f32.begin(), actual_weight_f32.end()),
+        expected_weights, kRouteWeightCriterion);
+    const auto actual_output = from_device<std::uint16_t>(
+        output.data(), static_cast<std::size_t>(kHidden) * width);
+    if (!std::all_of(actual_output.begin(), actual_output.end(),
+                     [](std::uint16_t value) { return value == 0; })) {
+        std::cerr << "Qwen4 sparse MoE prefill zero-formula output changed\n";
+        ++failures;
+    }
+
+    const auto* pinned_bytes = static_cast<const std::uint8_t*>(pinned.data());
+    const auto* device_bytes = static_cast<const std::uint8_t*>(stage.data());
+    for (int slot_index = 0; slot_index < 2; ++slot_index) {
+        const int first_expert = slot_index == 0 ? 64 : 32;
+        const int expert_count = slot_index == 0 ? 6 : 32;
+        const std::size_t slot_offset = static_cast<std::size_t>(slot_index) *
+                                        ops::kQwen4SparseMoePrefillSlotCapacityBytes;
+        for (int local = 0; local < expert_count; ++local) {
+            const int expert = first_expert + local;
+            std::vector<std::uint8_t> expected_pair(rank_bytes);
+            std::memcpy(expected_pair.data(),
+                        mapped_gate.data() + static_cast<std::size_t>(expert) * one_routed,
+                        one_routed);
+            std::memcpy(expected_pair.data() + one_routed,
+                        mapped_up.data() + static_cast<std::size_t>(expert) * one_routed,
+                        one_routed);
+            if (std::memcmp(pinned_bytes + slot_offset + static_cast<std::size_t>(local) *
+                                                       rank_bytes,
+                            expected_pair.data(), rank_bytes) != 0) {
+                std::cerr << "Qwen4 sparse MoE prefill partition host bytes changed\n";
+                ++failures;
+            }
+            failures += verify_exact(
+                "Qwen4 sparse MoE prefill partition device bytes",
+                from_device<std::uint8_t>(
+                    device_bytes + slot_offset + static_cast<std::size_t>(local) * rank_bytes,
+                    rank_bytes),
+                expected_pair);
+        }
+        std::vector<std::int32_t> expected_occurrences(expert_count);
+        std::iota(expected_occurrences.begin(), expected_occurrences.end(), first_expert);
+        const std::size_t occurrence_offset =
+            slot_offset + static_cast<std::size_t>(expert_count) * rank_bytes;
+        const auto* host_occurrences = reinterpret_cast<const std::int32_t*>(
+            pinned_bytes + occurrence_offset);
+        if (!std::equal(expected_occurrences.begin(), expected_occurrences.end(),
+                        host_occurrences)) {
+            std::cerr << "Qwen4 sparse MoE prefill partition host occurrences changed\n";
+            ++failures;
+        }
+        failures += verify_exact(
+            "Qwen4 sparse MoE prefill partition device occurrences",
+            from_device<std::int32_t>(device_bytes + occurrence_offset,
+                                      expected_occurrences.size()),
+            expected_occurrences);
+    }
+    failures += stage.verify_guards("Qwen4 sparse MoE prefill partition stage");
+    failures += ids.verify_guards("Qwen4 sparse MoE prefill partition ids");
+    failures += weights.verify_guards("Qwen4 sparse MoE prefill partition weights");
+    failures += output.verify_guards("Qwen4 sparse MoE prefill partition output");
+    cuda_check(cudaStreamSynchronize(events.transfer_stream),
+               "cudaStreamSynchronize prefill partition transfer");
+    cuda_check(cudaStreamDestroy(stream), "cudaStreamDestroy prefill partition");
     return failures;
 }
 
@@ -1003,9 +1431,22 @@ int main() {
             ops::qwen4_sparse_moe_rank_stage_bytes(QType::GGML_IQ2_XXS) != 844'800) {
             throw std::runtime_error("Qwen4 sparse MoE stage-capacity proof is wrong");
         }
+        static_assert(ops::kQwen4SparseMoePrefillGroupMatrixCapacityBytes == 27'033'600);
+        static_assert(ops::kQwen4SparseMoePrefillSlotCapacityBytes == 27'197'440);
+        static_assert(ops::kQwen4SparseMoePrefillPipelineStageBytes == 54'394'880);
+        static_assert(ops::kQwen4SparseMoePrefillHostScratchBytes == 335'876);
         int failures = expect_invalid(
             [] { (void)ops::qwen4_sparse_moe_rank_stage_bytes(QType::GGML_Q5_K); },
             "unsupported staged format");
+        failures += expect_invalid(
+            [] { (void)ops::qwen4_sparse_moe_prefill_workspace_capacity_bytes(0); },
+            "zero prefill width");
+        failures += expect_invalid(
+            [] { (void)ops::qwen4_sparse_moe_prefill_workspace_capacity_bytes(4097); },
+            "excessive prefill width");
+        if (ops::qwen4_sparse_moe_prefill_workspace_capacity_bytes(4096) == 0) {
+            throw std::runtime_error("Qwen4 sparse MoE maximum prefill workspace is empty");
+        }
         cudaStream_t stream = nullptr;
         cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
         PipelineEvents pipeline_events;
@@ -1015,6 +1456,7 @@ int main() {
                              RouteFixture::Nonuniform, -80.0F, pipeline_events, stream);
         failures += run_case(QType::GGML_IQ1_S, QType::GGML_Q5_K,
                              RouteFixture::Underflow, 0.0F, pipeline_events, stream);
+        failures += prefill_partition_and_slot_reuse_case();
         cuda_check(cudaStreamSynchronize(pipeline_events.transfer_stream),
                    "cudaStreamSynchronize transfer");
         cuda_check(cudaStreamDestroy(stream), "cudaStreamDestroy");

@@ -10,6 +10,7 @@ namespace ninfer::targets::qwen4::verifier::profile {
 
 enum class Phase : std::size_t {
     Token,
+    Prefill,
     Layer,
     Qsa,
     SparseMoe,
@@ -20,9 +21,10 @@ enum class Phase : std::size_t {
     static nvtxDomainHandle_t handle = [] {
         nvtxDomainHandle_t out = nvtxDomainCreateA("ninfer.qwen4.verifier");
         nvtxDomainNameCategoryA(out, 1, "token");
-        nvtxDomainNameCategoryA(out, 2, "layer");
-        nvtxDomainNameCategoryA(out, 3, "qsa");
-        nvtxDomainNameCategoryA(out, 4, "sparse-moe");
+        nvtxDomainNameCategoryA(out, 2, "prefill");
+        nvtxDomainNameCategoryA(out, 3, "layer");
+        nvtxDomainNameCategoryA(out, 4, "qsa");
+        nvtxDomainNameCategoryA(out, 5, "sparse-moe");
         return out;
     }();
     return handle;
@@ -31,6 +33,7 @@ enum class Phase : std::size_t {
 [[nodiscard]] inline nvtxStringHandle_t message(Phase phase) noexcept {
     static constexpr std::array<const char*, static_cast<std::size_t>(Phase::Count)> names{
         "token",
+        "prefill",
         "layer",
         "qsa",
         "sparse_moe",
@@ -48,6 +51,7 @@ enum class Phase : std::size_t {
 [[nodiscard]] inline std::uint32_t color(Phase phase) noexcept {
     static constexpr std::array<std::uint32_t, static_cast<std::size_t>(Phase::Count)> colors{
         0xfff28e2bu,
+        0xff59a14fu,
         0xff76b7b2u,
         0xffe15759u,
         0xffb07aa1u,
