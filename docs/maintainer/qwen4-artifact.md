@@ -528,24 +528,37 @@ matched pre/post throughput A/B, so the absolute Program baselines above are not
 The scheduling opportunity remains applicable to a future all-GPU-fit core checkpoint only when
 it retains this same RAM-resident PLE profile.
 
-The maximum-width numerical gate independently qualifies the complete GDN recurrence at T=4096
-and the matching `64+1+1986+1+2044` partition against one FP64 oracle, including every BF16 output
-and the final FP32 state. The real artifact then executes scalar T=1 over all 4096 tokens twice,
-one-shot T=4096 prefill twice, and the same five-part prefill twice. Each profile resets and
-replays bit-for-bit while validating every persistent tensor, PLE history, and QSA structural
-invariant. Cross-profile floating results are diagnostics rather than a second admission
-criterion: the first persistent difference is the layer-0 FP32 GDN recurrence after an exact
-61,440-byte BF16 convolution prefix. Scalar versus one-shot final logits had relative L2 0.128898,
-maximum absolute delta 0.532227, and an all-target maximum NLL delta of 0.538495 nat. One-shot
-versus partitioned logits had relative L2 0.190362, maximum absolute delta 0.949219, and an
-all-target maximum NLL delta of 0.978671 nat; no target exceeded one nat in either diagnostic.
+The maximum-width numerical gate uses the exact post-expansion Qwen4 recurrence geometry
+`Hq=Hv=48,D=128,T=4096` and one represented-input FP64 oracle. It independently qualifies 4096
+scalar T=1 calls, one-shot T=4096, aligned 64x64 chunks, and the Program partition
+`64+1+1986+1+2044`, including every BF16 output, selected cumulative prefixes, and the final FP32
+state. Scalar and one-shot output relative L2 were 0.00166020 and 0.00188043; their final-state
+relative L2 values were 1.40e-7 and 0.00082944. Aligned 64x64 was bit-identical to one-shot. The
+peak diagnostic per-token relative L2 values were 0.00173786 for scalar, 0.00197489 for one-shot
+and aligned, and 0.00196828 for the Program partition, below the fixed 0.0041 complete-output
+criterion without promoting per-token observations to a new gate. The first scalar/one-shot BF16
+difference occurs at token 0, while the Program partition first differs from one-shot at token 64
+where its one-token call selects direct recurrence. This localizes the
+difference to admitted private normalization, MMA, and recurrence association rather than an
+accumulated-state correctness bug. A forced direct-recurrence candidate improved oracle proximity
+but changed the public Op median from 98.304 to 520.192 us at T=512 and from 851.968 to
+4,113.408 us at T=4096, so it was rejected and removed.
+
+The real artifact then executes scalar T=1 over all 4096 tokens twice, one-shot T=4096 prefill
+twice, and the same five-part prefill twice. Each profile resets and replays bit-for-bit while
+validating every persistent tensor, PLE history, and QSA structural invariant. Cross-profile
+floating results are diagnostics rather than a second admission criterion: the first persistent
+difference is the layer-0 FP32 GDN recurrence after an exact 61,440-byte BF16 convolution prefix.
+Scalar versus one-shot final logits had relative L2 0.128898, maximum absolute delta 0.532227, and
+an all-target maximum NLL delta of 0.538495 nat. One-shot versus partitioned logits had relative L2
+0.190362, maximum absolute delta 0.949219, and an all-target maximum NLL delta of 0.978671 nat; no
+target exceeded one nat in either diagnostic.
 
 The QSA score kernel now pools its 128 represented key dimensions cooperatively, retains the
 per-dimension BF16 cast and original lane-0 norm, RoPE, dot-product, and score association, and
 omits the score launch when fewer than four visible entries form no complete block. A matched
 101-sample launch-policy sweep compared one versus 128 threads per score block. Selector medians
-in microseconds
-were 78.112/73.952 at frontier 4, 82.240/77.824 at 64, 86.048/81.440 at 256,
+in microseconds were 78.112/73.952 at frontier 4, 82.240/77.824 at 64, 86.048/81.440 at 256,
 88.000/83.840 at 1023, 87.808/83.968 at 1024, 92.000/87.904 at 2051, and
 98.272/94.240 at 4096, so the retained route uses 128 threads for every nonempty scored frontier.
 The independent QSA oracle and exact selector tests pass unchanged. In the maximum-width real run,
