@@ -29,6 +29,7 @@ using ninfer::Weight;
 using ninfer::WorkspaceArena;
 using ninfer::test::GuardedDeviceBuffer;
 using ninfer::test::PointwiseCriterion;
+using ninfer::test::ReductionCriterion;
 using ninfer::test::bf16_to_f32;
 using ninfer::test::error_stats_enabled;
 using ninfer::test::f32_to_bf16;
@@ -37,11 +38,15 @@ using ninfer::test::from_device_bf16;
 using ninfer::test::to_device;
 using ninfer::test::verify_exact;
 using ninfer::test::verify_pointwise;
+using ninfer::test::verify_reduction;
 using namespace ninfer::test::qwen4::real_oracle;
 
 namespace {
 
 constexpr std::int32_t kHidden = 2560;
+constexpr std::int32_t kBranches = 4;
+constexpr std::int32_t kFlat = kBranches * kHidden;
+constexpr std::int32_t kGrRank = 320;
 constexpr std::int32_t kIndex = 128;
 constexpr std::int32_t kIndexHeads = 4;
 constexpr std::int32_t kHeadDim = 256;
@@ -66,6 +71,15 @@ constexpr std::array<std::int32_t, 86> kFrozenParagraph = {
 
 // This is the fixed complete-composite criterion owned by test_qsa.cpp.
 constexpr PointwiseCriterion kCompleteCriterion{/*absolute=*/0.025, /*relative=*/0.02};
+constexpr ReductionCriterion kGrReadCriterion{/*relative_l2=*/6.0e-3,
+                                               /*gross_absolute=*/4.0e-3,
+                                               /*gross_relative_to_max_reference=*/5.0e-3};
+constexpr ReductionCriterion kGrScaleCriterion{/*relative_l2=*/3.5e-3,
+                                                /*gross_absolute=*/1.5e-3,
+                                                /*gross_relative_to_max_reference=*/3.0e-3};
+constexpr ReductionCriterion kGrInjectCriterion{/*relative_l2=*/3.0e-3,
+                                                 /*gross_absolute=*/2.0e-3,
+                                                 /*gross_relative_to_max_reference=*/2.0e-3};
 
 struct Dot {
     double value = 0.0;
@@ -121,6 +135,134 @@ void require_bf16(const Weight& weight, std::int32_t rows, const char* name) {
         weight.payload_bytes != static_cast<std::size_t>(rows) * kHidden * sizeof(std::uint16_t)) {
         throw std::logic_error(std::string("Qwen4 real QSA malformed ") + name);
     }
+}
+
+void require_qsa_weights(const ops::QsaVerifierWeights& weights, std::int32_t layer) {
+    require_bf16(weights.index_query, kIndex * kIndexHeads, "index query");
+    require_bf16(weights.index_key, kIndex, "index key");
+    require_q5(weights.core_query_gate, kQueryGateRows, kHidden, "core query/gate");
+    require_q5(weights.core_key, kKvHeads * kHeadDim, kHidden, "core key");
+    require_q5(weights.core_value, kKvHeads * kHeadDim, kHidden, "core value");
+    require_q5(weights.output, kHidden, kOutputColumns, "output");
+    if (weights.index_query_norm.dtype != DType::FP32 ||
+        weights.index_query_norm.numel() != kIndex ||
+        weights.index_key_norm.dtype != DType::FP32 ||
+        weights.index_key_norm.numel() != kIndex ||
+        weights.core_query_norm.dtype != DType::FP32 ||
+        weights.core_query_norm.numel() != kHeadDim ||
+        weights.core_key_norm.dtype != DType::FP32 ||
+        weights.core_key_norm.numel() != kHeadDim) {
+        throw std::logic_error("Qwen4 layer-" + std::to_string(layer) +
+                               " QSA norm binding changed");
+    }
+}
+
+void require_gr_weights(const verifier::GrWeights& weights, std::int32_t layer) {
+    const std::size_t down_bytes = static_cast<std::size_t>(kGrRank) * kFlat /
+                                   kQ8BlockValues * kQ8BlockBytes;
+    const std::size_t up_bytes = static_cast<std::size_t>(kFlat) * kGrRank /
+                                 kQ8BlockValues * kQ8BlockBytes;
+    const auto require_q8 = [](const Weight& weight, std::int32_t rows,
+                               std::int32_t columns, std::size_t bytes,
+                               const char* name) {
+        if (weight.qtype != QType::GGML_Q8_0 ||
+            weight.layout != QuantLayout::GgmlBlockRow || weight.qdata == nullptr ||
+            weight.n != rows || weight.k != columns || weight.ndim != 2 ||
+            weight.shape[0] != rows || weight.shape[1] != columns ||
+            weight.payload_bytes != bytes) {
+            throw std::logic_error(std::string("Qwen4 real QSA malformed ") + name);
+        }
+    };
+    require_q8(weights.down, kGrRank, kFlat, down_bytes, "attention GR down");
+    require_q8(weights.up, kFlat, kGrRank, up_bytes, "attention GR up");
+    if (weights.norm.dtype != DType::FP32 || weights.norm.data == nullptr ||
+        weights.norm.numel() != kFlat || weights.inject.dtype != DType::FP32 ||
+        weights.inject.data == nullptr ||
+        weights.inject.numel() != static_cast<std::int64_t>(kBranches) * kFlat) {
+        throw std::logic_error("Qwen4 layer-" + std::to_string(layer) +
+                               " attention GR binding changed");
+    }
+}
+
+std::vector<double> q8_project(std::span<const std::uint8_t> matrix,
+                               std::int32_t rows, std::int32_t columns,
+                               std::span<const double> input) {
+    const std::size_t row_bytes =
+        static_cast<std::size_t>(columns) / kQ8BlockValues * kQ8BlockBytes;
+    if (matrix.size() != static_cast<std::size_t>(rows) * row_bytes ||
+        input.size() != static_cast<std::size_t>(columns)) {
+        throw std::logic_error("Qwen4 real QSA GR oracle received malformed storage");
+    }
+    std::vector<double> result(static_cast<std::size_t>(rows));
+    for (std::int32_t row = 0; row < rows; ++row) {
+        const auto* encoded = matrix.data() + static_cast<std::size_t>(row) * row_bytes;
+        double dot = 0.0;
+        for (std::int32_t column = 0; column < columns; ++column) {
+            dot += ggml_q8_0_value(encoded, column) * input[static_cast<std::size_t>(column)];
+        }
+        result[static_cast<std::size_t>(row)] = dot;
+    }
+    return result;
+}
+
+struct GrOracle {
+    std::vector<double> mixed;
+    std::vector<double> write_scale;
+};
+
+GrOracle gr_oracle(std::span<const std::uint16_t> residual,
+                   std::span<const float> gamma,
+                   std::span<const std::uint8_t> down,
+                   std::span<const std::uint8_t> up,
+                   std::span<const float> write) {
+    if (residual.size() != static_cast<std::size_t>(kFlat) ||
+        gamma.size() != static_cast<std::size_t>(kFlat) ||
+        write.size() != static_cast<std::size_t>(kBranches) * kFlat) {
+        throw std::logic_error("Qwen4 real QSA GR oracle received malformed represented data");
+    }
+    std::vector<double> normalized(static_cast<std::size_t>(kFlat));
+    for (std::int32_t branch = 0; branch < kBranches; ++branch) {
+        const std::size_t base = static_cast<std::size_t>(branch) * kHidden;
+        double sum_squares = 0.0;
+        for (std::int32_t dimension = 0; dimension < kHidden; ++dimension) {
+            const double value = bf16_to_f32(residual[base + dimension]);
+            sum_squares += value * value;
+        }
+        const double inverse_rms = 1.0 / std::sqrt(sum_squares / kHidden + 1.0e-6);
+        for (std::int32_t dimension = 0; dimension < kHidden; ++dimension) {
+            const std::size_t index = base + dimension;
+            normalized[index] = static_cast<double>(bf16_to_f32(residual[index])) *
+                                inverse_rms * static_cast<double>(gamma[index]);
+        }
+    }
+    std::vector<double> low_rank = q8_project(down, kGrRank, kFlat, normalized);
+    for (double& value : low_rank) {
+        const double scaled = value / static_cast<double>(kBranches);
+        value = scaled * sigmoid(scaled);
+    }
+    const std::vector<double> read_gate = q8_project(up, kFlat, kGrRank, low_rank);
+    GrOracle result{std::vector<double>(static_cast<std::size_t>(kHidden)),
+                    std::vector<double>(static_cast<std::size_t>(kBranches))};
+    for (std::int32_t dimension = 0; dimension < kHidden; ++dimension) {
+        double mixed = 0.0;
+        for (std::int32_t branch = 0; branch < kBranches; ++branch) {
+            const std::size_t index =
+                static_cast<std::size_t>(branch) * kHidden + dimension;
+            mixed += sigmoid(read_gate[index]) * normalized[index];
+        }
+        result.mixed[static_cast<std::size_t>(dimension)] = mixed / kBranches;
+    }
+    for (std::int32_t branch = 0; branch < kBranches; ++branch) {
+        double projected = 0.0;
+        const std::size_t base = static_cast<std::size_t>(branch) * kFlat;
+        for (std::int32_t column = 0; column < kFlat; ++column) {
+            projected += static_cast<double>(write[base + column]) *
+                         normalized[static_cast<std::size_t>(column)];
+        }
+        result.write_scale[static_cast<std::size_t>(branch)] =
+            2.0 * sigmoid(projected / kBranches);
+    }
+    return result;
 }
 
 Dot q5_dot(std::span<const std::uint8_t> matrix, std::int32_t row, std::int32_t rows,
@@ -626,13 +768,127 @@ int verify_bounded(const char* label, std::span<const double> actual,
     return violations == 0 ? 0 : 1;
 }
 
-int run_accumulated_qsa_cell(const verifier::LoadedModel& model, DeviceContext& device) {
-    constexpr std::int32_t current_id = 227;
-    const ops::QsaVerifierWeights& weights = *model.view().layers[3].qsa;
+int verify_exact_state(const std::string& label, const HostQsaState& actual,
+                       const HostQsaState& expected) {
+    if (actual.capacity != expected.capacity) {
+        std::cerr << "FAIL: " << label << " capacity changed\n";
+        return 1;
+    }
+    int failures = verify_exact((label + " K codes").c_str(), actual.k_codes,
+                                expected.k_codes);
+    failures += verify_exact((label + " V codes").c_str(), actual.v_codes,
+                             expected.v_codes);
+    failures += verify_exact((label + " K scales").c_str(), actual.k_scales,
+                             expected.k_scales);
+    failures += verify_exact((label + " V scales").c_str(), actual.v_scales,
+                             expected.v_scales);
+    failures += verify_exact((label + " raw index keys").c_str(), actual.raw_index_keys,
+                             expected.raw_index_keys);
+    failures += verify_exact((label + " positions").c_str(), actual.positions,
+                             expected.positions);
+    return failures;
+}
+
+int verify_state_transition(const std::string& label, HostQsaState actual,
+                            const HostQsaState& initial, const HostQsaState& expected,
+                            std::int32_t current_id, const Projection& index_key) {
+    if (actual.capacity != initial.capacity || expected.capacity != initial.capacity) {
+        throw std::logic_error("Qwen4 accumulated QSA state capacity changed");
+    }
+    std::vector<std::uint8_t> actual_current_k_codes;
+    std::vector<std::uint8_t> actual_current_v_codes;
+    std::vector<std::uint8_t> expected_current_k_codes;
+    std::vector<std::uint8_t> expected_current_v_codes;
+    std::vector<std::uint8_t> actual_current_k_scales;
+    std::vector<std::uint8_t> actual_current_v_scales;
+    std::vector<std::uint8_t> expected_current_k_scales;
+    std::vector<std::uint8_t> expected_current_v_scales;
+    for (std::int32_t head = 0; head < kKvHeads; ++head) {
+        for (std::int32_t byte = 0; byte < kHeadDim / 2; ++byte) {
+            const std::size_t index = code_index(byte, current_id, head, initial.capacity);
+            actual_current_k_codes.push_back(actual.k_codes[index]);
+            actual_current_v_codes.push_back(actual.v_codes[index]);
+            expected_current_k_codes.push_back(expected.k_codes[index]);
+            expected_current_v_codes.push_back(expected.v_codes[index]);
+            actual.k_codes[index] = initial.k_codes[index];
+            actual.v_codes[index] = initial.v_codes[index];
+        }
+        for (std::int32_t group = 0; group < kHeadDim / 16; ++group) {
+            const std::size_t index = scale_index(group, current_id, head, initial.capacity);
+            actual_current_k_scales.push_back(actual.k_scales[index]);
+            actual_current_v_scales.push_back(actual.v_scales[index]);
+            expected_current_k_scales.push_back(expected.k_scales[index]);
+            expected_current_v_scales.push_back(expected.v_scales[index]);
+            actual.k_scales[index] = initial.k_scales[index];
+            actual.v_scales[index] = initial.v_scales[index];
+        }
+    }
+    int failures = verify_exact((label + " independently encoded current K codes").c_str(),
+                                actual_current_k_codes, expected_current_k_codes);
+    failures += verify_exact((label + " independently encoded current V codes").c_str(),
+                             actual_current_v_codes, expected_current_v_codes);
+    failures += verify_exact((label + " independently encoded current K scales").c_str(),
+                             actual_current_k_scales, expected_current_k_scales);
+    failures += verify_exact((label + " independently encoded current V scales").c_str(),
+                             actual_current_v_scales, expected_current_v_scales);
+    failures += verify_exact((label + " untouched K code plane").c_str(), actual.k_codes,
+                             initial.k_codes);
+    failures += verify_exact((label + " untouched V code plane").c_str(), actual.v_codes,
+                             initial.v_codes);
+    failures += verify_exact((label + " untouched K scale plane").c_str(), actual.k_scales,
+                             initial.k_scales);
+    failures += verify_exact((label + " untouched V scale plane").c_str(), actual.v_scales,
+                             initial.v_scales);
+
+    std::vector<double> actual_raw_key(kIndex);
+    std::vector<double> raw_key_bound(kIndex);
+    for (std::int32_t d = 0; d < kIndex; ++d) {
+        const std::size_t index = static_cast<std::size_t>(current_id) * kIndex + d;
+        actual_raw_key[d] = bf16_to_f32(actual.raw_index_keys[index]);
+        actual.raw_index_keys[index] = initial.raw_index_keys[index];
+        raw_key_bound[d] = index_key.production_to_ideal_bound[d] +
+                           std::abs(index_key.represented[d] - index_key.ideal[d]);
+    }
+    failures += verify_bounded((label + " raw index key").c_str(), actual_raw_key,
+                               index_key.represented, raw_key_bound);
+    failures += verify_exact((label + " untouched raw-index-key plane").c_str(),
+                             actual.raw_index_keys, initial.raw_index_keys);
+    failures += verify_exact(
+        (label + " exact current three-axis position").c_str(),
+        std::vector<std::int32_t>(actual.positions.begin() + 3 * current_id,
+                                  actual.positions.begin() + 3 * current_id + 3),
+        std::vector<std::int32_t>(expected.positions.begin() + 3 * current_id,
+                                  expected.positions.begin() + 3 * current_id + 3));
+    std::copy(initial.positions.begin() + 3 * current_id,
+              initial.positions.begin() + 3 * current_id + 3,
+              actual.positions.begin() + 3 * current_id);
+    failures += verify_exact((label + " untouched position plane").c_str(),
+                             actual.positions, initial.positions);
+    return failures;
+}
+
+int run_accumulated_qsa_cell(const verifier::LoadedModel& model, DeviceContext& device,
+                             std::int32_t layer, std::int32_t current_id) {
+    if (layer <= 0 || layer >= verifier::kLayerCount || current_id < 4 ||
+        current_id >= verifier::kQsaCapacity || !model.view().layers[layer].qsa.has_value()) {
+        throw std::logic_error("Qwen4 accumulated QSA case is malformed");
+    }
+    const ops::QsaVerifierWeights& weights = *model.view().layers[layer].qsa;
+    require_qsa_weights(weights, layer);
+    const std::string case_name = "Qwen4_accumulated_QSA_layer_" + std::to_string(layer) +
+                                  "_position_" + std::to_string(current_id);
 
     HostQsaState initial_state(verifier::kQsaCapacity);
+    HostQsaState program_post_state(verifier::kQsaCapacity);
+    std::vector<std::uint16_t> represented_gr_residual;
+    std::vector<std::uint16_t> program_attention_residual;
+    std::vector<std::int32_t> program_selected;
+    std::int32_t program_selected_count = -1;
     GuardedDeviceBuffer qsa_x(static_cast<std::size_t>(kHidden) * sizeof(std::uint16_t));
+    GuardedDeviceBuffer qsa_write_scale(static_cast<std::size_t>(kBranches) *
+                                        sizeof(std::uint16_t));
     qsa_x.fill(0xcd);
+    qsa_write_scale.fill(0xcd);
     {
         verifier::Program program(model, device, verifier::DiagnosticSnapshots::Enabled);
         program.reset();
@@ -643,10 +899,10 @@ int run_accumulated_qsa_cell(const verifier::LoadedModel& model, DeviceContext& 
                 (static_cast<std::size_t>(position) + 1U) % kFrozenParagraph.size()];
             (void) program.execute_token(token, target);
         }
-        if (program.frontier() != current_id || !program.state().qsa()[3].has_value()) {
+        if (program.frontier() != current_id || !program.state().qsa()[layer].has_value()) {
             throw std::logic_error("Qwen4 accumulated QSA pre-append frontier/state changed");
         }
-        initial_state = copy_qsa_state(*program.state().qsa()[3]);
+        initial_state = copy_qsa_state(*program.state().qsa()[layer]);
 
         const std::int32_t token =
             kFrozenParagraph[static_cast<std::size_t>(current_id) % kFrozenParagraph.size()];
@@ -654,19 +910,70 @@ int run_accumulated_qsa_cell(const verifier::LoadedModel& model, DeviceContext& 
             (static_cast<std::size_t>(current_id) + 1U) % kFrozenParagraph.size()];
         const verifier::TokenResultView result = program.execute_token(token, target);
         if (result.token_index != current_id || result.gr.size() != verifier::kLayerCount ||
-            result.gr[2].layer != 2 || result.gr[2].ffn_residual.dtype != DType::BF16 ||
-            result.gr[2].ffn_residual.ne[0] != kHidden ||
-            result.gr[2].ffn_residual.ne[1] != 4) {
-            throw std::logic_error("Qwen4 accumulated QSA layer-2 residual diagnostic changed");
+            result.gr[layer - 1].layer != layer - 1 ||
+            result.gr[layer - 1].ffn_residual.dtype != DType::BF16 ||
+            result.gr[layer - 1].ffn_residual.ne[0] != kHidden ||
+            result.gr[layer - 1].ffn_residual.ne[1] != kBranches ||
+            result.gr[layer].layer != static_cast<std::size_t>(layer) ||
+            result.gr[layer].attention_residual.dtype != DType::BF16 ||
+            result.gr[layer].attention_residual.ne[0] != kHidden ||
+            result.gr[layer].attention_residual.ne[1] != kBranches) {
+            throw std::logic_error("Qwen4 accumulated QSA GR diagnostic changed");
+        }
+        const auto qsa_diagnostic =
+            std::find_if(result.qsa.begin(), result.qsa.end(), [layer](const auto& item) {
+                return item.layer == static_cast<std::size_t>(layer);
+            });
+        if (qsa_diagnostic == result.qsa.end() ||
+            qsa_diagnostic->selected_ids.dtype != DType::I32 ||
+            qsa_diagnostic->selected_ids.numel() != ops::kQsaSelectedCapacity ||
+            qsa_diagnostic->selected_count.dtype != DType::I32 ||
+            qsa_diagnostic->selected_count.numel() != 1 ||
+            !program.state().qsa()[layer].has_value()) {
+            throw std::logic_error("Qwen4 accumulated QSA selector/state diagnostic changed");
         }
 
+        // The accumulated prefix and preceding layer residual are represented production
+        // boundaries. This cell independently owns and verifies the complete layer-current
+        // transition from those inputs; it does not claim to oracle the earlier prefix.
+        represented_gr_residual = copy_device_values<std::uint16_t>(
+            result.gr[layer - 1].ffn_residual.data, kFlat);
+        program_attention_residual = copy_device_values<std::uint16_t>(
+            result.gr[layer].attention_residual.data, kFlat);
+        program_selected = copy_device_values<std::int32_t>(
+            qsa_diagnostic->selected_ids.data, ops::kQsaSelectedCapacity);
+        program_selected_count =
+            copy_device_values<std::int32_t>(qsa_diagnostic->selected_count.data, 1).front();
+        program_post_state = copy_qsa_state(*program.state().qsa()[layer]);
+
         Tensor x_tensor(qsa_x.data(), DType::BF16, {kHidden});
+        Tensor write_scale_tensor(qsa_write_scale.data(), DType::BF16, {kBranches});
         WorkspaceArena gr_workspace(ops::gated_residual_workspace_capacity_bytes());
-        const verifier::GrWeights& layer3_gr = model.view().layers[3].attention_gr;
-        ops::gated_residual_read(result.gr[2].ffn_residual, layer3_gr.norm, layer3_gr.down,
-                                 layer3_gr.up, x_tensor, gr_workspace, device.stream);
+        const verifier::GrWeights& attention_gr = model.view().layers[layer].attention_gr;
+        ops::gated_residual_read_write(
+            result.gr[layer - 1].ffn_residual, attention_gr.norm, attention_gr.down,
+            attention_gr.up, attention_gr.inject, x_tensor, write_scale_tensor, gr_workspace,
+            device.stream);
         device.synchronize();
     }
+
+    const verifier::GrWeights& attention_gr = model.view().layers[layer].attention_gr;
+    require_gr_weights(attention_gr, layer);
+    const auto gr_gamma = copy_device_values<float>(attention_gr.norm.data, kFlat);
+    const auto gr_write =
+        copy_device_values<float>(attention_gr.inject.data,
+                                  static_cast<std::size_t>(kBranches) * kFlat);
+    const auto gr_down =
+        copy_device_bytes(attention_gr.down.qdata, attention_gr.down.payload_bytes);
+    const auto gr_up = copy_device_bytes(attention_gr.up.qdata, attention_gr.up.payload_bytes);
+    const GrOracle expected_gr =
+        gr_oracle(represented_gr_residual, gr_gamma, gr_down, gr_up, gr_write);
+    int failures = verify_reduction((case_name + " attention GR mixed").c_str(),
+                                    from_device_bf16(qsa_x.data(), kHidden),
+                                    expected_gr.mixed, kGrReadCriterion);
+    failures += verify_reduction((case_name + " attention GR write scale").c_str(),
+                                 from_device_bf16(qsa_write_scale.data(), kBranches),
+                                 expected_gr.write_scale, kGrScaleCriterion);
 
     const std::vector<std::uint16_t> residual_bits =
         from_device<std::uint16_t>(qsa_x.data(), kHidden);
@@ -736,8 +1043,8 @@ int run_accumulated_qsa_cell(const verifier::LoadedModel& model, DeviceContext& 
         std::int32_t rank;
         double score;
     };
-    constexpr std::int32_t selected_count = current_id + 1;
-    constexpr std::int32_t complete_blocks = selected_count / 4;
+    const std::int32_t selected_count = current_id + 1;
+    const std::int32_t complete_blocks = selected_count / 4;
     std::vector<RankedBlock> blocks;
     blocks.reserve(complete_blocks);
     for (std::int32_t block = 0; block < complete_blocks; ++block) {
@@ -809,85 +1116,26 @@ int run_accumulated_qsa_cell(const verifier::LoadedModel& model, DeviceContext& 
                             count_tensor, output_tensor, workspace_tensor, device.stream);
     device.synchronize();
 
-    int failures = 0;
-    failures += verify_exact("Qwen4 accumulated QSA selected count",
+    failures += verify_exact((case_name + " isolated selected count").c_str(),
                              from_device<std::int32_t>(device_count.data(), 1),
                              std::vector<std::int32_t>{selected_count});
     failures += verify_exact(
-        "Qwen4 accumulated QSA exact all-visible selector order and padding",
+        (case_name + " isolated exact all-visible selector order and padding").c_str(),
         from_device<std::int32_t>(device_selected.data(), ops::kQsaSelectedCapacity),
         expected_selected);
-
-    HostQsaState actual_state = copy_qsa_state(device_state.view);
-    std::vector<std::uint8_t> actual_current_k_codes;
-    std::vector<std::uint8_t> actual_current_v_codes;
-    std::vector<std::uint8_t> expected_current_k_codes;
-    std::vector<std::uint8_t> expected_current_v_codes;
-    std::vector<std::uint8_t> actual_current_k_scales;
-    std::vector<std::uint8_t> actual_current_v_scales;
-    std::vector<std::uint8_t> expected_current_k_scales;
-    std::vector<std::uint8_t> expected_current_v_scales;
-    for (std::int32_t head = 0; head < kKvHeads; ++head) {
-        for (std::int32_t byte = 0; byte < kHeadDim / 2; ++byte) {
-            const std::size_t index = code_index(byte, current_id, head, initial_state.capacity);
-            actual_current_k_codes.push_back(actual_state.k_codes[index]);
-            actual_current_v_codes.push_back(actual_state.v_codes[index]);
-            expected_current_k_codes.push_back(expected_state.k_codes[index]);
-            expected_current_v_codes.push_back(expected_state.v_codes[index]);
-            actual_state.k_codes[index] = initial_state.k_codes[index];
-            actual_state.v_codes[index] = initial_state.v_codes[index];
-        }
-        for (std::int32_t group = 0; group < kHeadDim / 16; ++group) {
-            const std::size_t index =
-                scale_index(group, current_id, head, initial_state.capacity);
-            actual_current_k_scales.push_back(actual_state.k_scales[index]);
-            actual_current_v_scales.push_back(actual_state.v_scales[index]);
-            expected_current_k_scales.push_back(expected_state.k_scales[index]);
-            expected_current_v_scales.push_back(expected_state.v_scales[index]);
-            actual_state.k_scales[index] = initial_state.k_scales[index];
-            actual_state.v_scales[index] = initial_state.v_scales[index];
-        }
-    }
-    failures += verify_exact("Qwen4 accumulated QSA independently encoded current K codes",
-                             actual_current_k_codes, expected_current_k_codes);
-    failures += verify_exact("Qwen4 accumulated QSA independently encoded current V codes",
-                             actual_current_v_codes, expected_current_v_codes);
-    failures += verify_exact("Qwen4 accumulated QSA independently encoded current K scales",
-                             actual_current_k_scales, expected_current_k_scales);
-    failures += verify_exact("Qwen4 accumulated QSA independently encoded current V scales",
-                             actual_current_v_scales, expected_current_v_scales);
-    failures += verify_exact("Qwen4 accumulated QSA untouched K code plane", actual_state.k_codes,
-                             initial_state.k_codes);
-    failures += verify_exact("Qwen4 accumulated QSA untouched V code plane", actual_state.v_codes,
-                             initial_state.v_codes);
-    failures += verify_exact("Qwen4 accumulated QSA untouched K scale plane",
-                             actual_state.k_scales, initial_state.k_scales);
-    failures += verify_exact("Qwen4 accumulated QSA untouched V scale plane",
-                             actual_state.v_scales, initial_state.v_scales);
-
-    std::vector<double> actual_raw_key(kIndex);
-    std::vector<double> raw_key_bound(kIndex);
-    for (std::int32_t d = 0; d < kIndex; ++d) {
-        const std::size_t index = static_cast<std::size_t>(current_id) * kIndex + d;
-        actual_raw_key[d] = bf16_to_f32(actual_state.raw_index_keys[index]);
-        actual_state.raw_index_keys[index] = initial_state.raw_index_keys[index];
-        raw_key_bound[d] = index_key.production_to_ideal_bound[d] +
-                           std::abs(index_key.represented[d] - index_key.ideal[d]);
-    }
-    failures += verify_bounded("qwen4_accumulated_qsa_raw_index_key", actual_raw_key,
-                               index_key.represented, raw_key_bound);
-    failures += verify_exact("Qwen4 accumulated QSA untouched raw-index-key plane",
-                             actual_state.raw_index_keys, initial_state.raw_index_keys);
+    const HostQsaState isolated_post_state = copy_qsa_state(device_state.view);
+    failures += verify_state_transition(case_name + " isolated transition", isolated_post_state,
+                                        initial_state, expected_state, current_id, index_key);
+    failures += verify_state_transition(case_name + " Program transition", program_post_state,
+                                        initial_state, expected_state, current_id, index_key);
+    failures += verify_exact_state(case_name + " Program/isolated exact post-state",
+                                   program_post_state, isolated_post_state);
+    failures += verify_exact((case_name + " Program selected count").c_str(),
+                             std::vector<std::int32_t>{program_selected_count},
+                             std::vector<std::int32_t>{selected_count});
     failures += verify_exact(
-        "Qwen4 accumulated QSA exact current three-axis position",
-        std::vector<std::int32_t>(actual_state.positions.begin() + 3 * current_id,
-                                  actual_state.positions.begin() + 3 * current_id + 3),
-        position_values);
-    std::copy(initial_state.positions.begin() + 3 * current_id,
-              initial_state.positions.begin() + 3 * current_id + 3,
-              actual_state.positions.begin() + 3 * current_id);
-    failures += verify_exact("Qwen4 accumulated QSA untouched position plane",
-                             actual_state.positions, initial_state.positions);
+        (case_name + " Program exact all-visible selector order and padding").c_str(),
+        program_selected, expected_selected);
 
     std::vector<double> gated(kOutputColumns);
     double maximum_logit_spread = 0.0;
@@ -940,16 +1188,40 @@ int run_accumulated_qsa_cell(const verifier::LoadedModel& model, DeviceContext& 
     std::transform(projected_output.ideal.begin(), projected_output.ideal.end(),
                    expected_output.begin(),
                    [](double value) { return represented_bf16(value); });
-    failures += verify_pointwise("Qwen4 accumulated layer-3 QSA complete 228-item FP64 oracle",
+    const std::string output_label = "Qwen4 accumulated layer-" + std::to_string(layer) +
+                                     " QSA complete " + std::to_string(selected_count) +
+                                     "-item FP64 oracle";
+    failures += verify_pointwise(output_label.c_str(),
                                  from_device_bf16(device_output.data(), kHidden), expected_output,
                                  kCompleteCriterion);
+
+    std::vector<double> injected_reference(static_cast<std::size_t>(kFlat));
+    for (std::int32_t branch = 0; branch < kBranches; ++branch) {
+        const double represented_scale =
+            represented_bf16(expected_gr.write_scale[static_cast<std::size_t>(branch)]);
+        for (std::int32_t dimension = 0; dimension < kHidden; ++dimension) {
+            const std::size_t residual_index =
+                static_cast<std::size_t>(branch) * kHidden + dimension;
+            injected_reference[residual_index] =
+                static_cast<double>(bf16_to_f32(represented_gr_residual[residual_index])) +
+                represented_scale * expected_output[static_cast<std::size_t>(dimension)];
+        }
+    }
+    std::vector<double> program_attention(kFlat);
+    std::transform(program_attention_residual.begin(), program_attention_residual.end(),
+                   program_attention.begin(), [](std::uint16_t bits) {
+                       return static_cast<double>(bf16_to_f32(bits));
+                   });
+    failures += verify_reduction(
+        (case_name + " Program post-attention GR inject").c_str(), program_attention,
+        injected_reference, kGrInjectCriterion);
 
     if (error_stats_enabled()) {
         std::cout << "OP_ERROR_STATS kind=witness selector_score_spread="
                   << maximum_score->score - minimum_score->score
                   << " attention_logit_spread=" << maximum_logit_spread
                   << " selected_count=" << selected_count
-                  << " case=Qwen4_accumulated_QSA_position_227\n";
+                  << " case=" << case_name << '\n';
     }
     failures += device_state.verify_guards();
     failures += device_selected.verify_guards("Qwen4 accumulated QSA selected ids");
@@ -957,8 +1229,8 @@ int run_accumulated_qsa_cell(const verifier::LoadedModel& model, DeviceContext& 
     failures += device_output.verify_guards("Qwen4 accumulated QSA output");
     failures += workspace.verify_guards("Qwen4 accumulated QSA workspace");
     failures += qsa_x.verify_guards("Qwen4 accumulated QSA represented input");
-    std::cout << (failures == 0 ? "OK" : "FAIL")
-              << " qwen4_real_qsa_accumulated_position_227_cell\n";
+    failures += qsa_write_scale.verify_guards("Qwen4 accumulated QSA GR write scale");
+    std::cout << (failures == 0 ? "OK" : "FAIL") << ' ' << case_name << "_cell\n";
     return failures;
 }
 
@@ -970,20 +1242,7 @@ int ninfer::test::qwen4::real_oracle::run_qsa_cell(const verifier::LoadedModel& 
         throw std::logic_error("Qwen4 layer 3 is not a QSA layer");
     }
     const ops::QsaVerifierWeights& weights = *model.view().layers[3].qsa;
-    require_bf16(weights.index_query, kIndex * kIndexHeads, "index query");
-    require_bf16(weights.index_key, kIndex, "index key");
-    require_q5(weights.core_query_gate, kQueryGateRows, kHidden, "core query/gate");
-    require_q5(weights.core_key, kKvHeads * kHeadDim, kHidden, "core key");
-    require_q5(weights.core_value, kKvHeads * kHeadDim, kHidden, "core value");
-    require_q5(weights.output, kHidden, kOutputColumns, "output");
-    if (weights.index_query_norm.dtype != DType::FP32 ||
-        weights.index_query_norm.numel() != kIndex ||
-        weights.index_key_norm.dtype != DType::FP32 || weights.index_key_norm.numel() != kIndex ||
-        weights.core_query_norm.dtype != DType::FP32 ||
-        weights.core_query_norm.numel() != kHeadDim || weights.core_key_norm.dtype != DType::FP32 ||
-        weights.core_key_norm.numel() != kHeadDim) {
-        throw std::logic_error("Qwen4 layer-3 QSA norm binding changed");
-    }
+    require_qsa_weights(weights, 3);
 
     GuardedDeviceBuffer qsa_x(static_cast<std::size_t>(kHidden) * sizeof(std::uint16_t));
     qsa_x.fill(0xcd);
@@ -1365,7 +1624,8 @@ int ninfer::test::qwen4::real_oracle::run_qsa_cell(const verifier::LoadedModel& 
     failures += device_output.verify_guards("Qwen4 real QSA output");
     failures += workspace.verify_guards("Qwen4 real QSA workspace");
     failures += qsa_x.verify_guards("Qwen4 real QSA represented input");
-    failures += run_accumulated_qsa_cell(model, device);
+    failures += run_accumulated_qsa_cell(model, device, 3, 227);
+    failures += run_accumulated_qsa_cell(model, device, 39, 221);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " qwen4_real_qsa_oracle_cell\n";
     return failures;
 }

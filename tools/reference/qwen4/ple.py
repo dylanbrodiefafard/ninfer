@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 import torch
 
-from .common import grouped_zero_centered_rmsnorm, linear, sigmoid, silu
+from .common import (
+    actual_gguf_grouped_rmsnorm,
+    linear,
+    sigmoid,
+    silu,
+    source_grouped_rmsnorm,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,7 +50,10 @@ def dilated_depthwise_conv(
     return output, next_state
 
 
-def inject(
+GroupedRmsNorm = Callable[..., torch.Tensor]
+
+
+def _inject(
     residual_branches: torch.Tensor,
     table_rows: torch.Tensor,
     key_weight: torch.Tensor,
@@ -54,6 +64,7 @@ def inject(
     conv_weight: torch.Tensor,
     conv_state: torch.Tensor,
     *,
+    grouped_rmsnorm: GroupedRmsNorm,
     dilation: int = 3,
     eps: float = 1e-6,
 ) -> PLEResult:
@@ -68,10 +79,10 @@ def inject(
     tokens, branch_count, hidden = residual_branches.shape
     embedding = table_rows.detach().to(dtype=torch.float64, device="cpu").reshape(tokens, -1)
     flat_residual = residual_branches.detach().to(dtype=torch.float64, device="cpu").flatten(-2)
-    keys = grouped_zero_centered_rmsnorm(
+    keys = grouped_rmsnorm(
         linear(embedding, key_weight), key_norm_weight, group_size=hidden, eps=eps
     ).reshape(tokens, branch_count, hidden)
-    queries = grouped_zero_centered_rmsnorm(
+    queries = grouped_rmsnorm(
         flat_residual, query_norm_weight, group_size=hidden, eps=eps
     ).reshape(tokens, branch_count, hidden)
     raw_gate = torch.sum(keys * queries, dim=-1, keepdim=True) / (hidden**0.5)
@@ -79,7 +90,7 @@ def inject(
     value = linear(embedding, value_weight)
     gated = sigmoid(gate) * value.unsqueeze(-2)
     gated_flat = gated.flatten(-2)
-    ideal_conv_input = grouped_zero_centered_rmsnorm(
+    ideal_conv_input = grouped_rmsnorm(
         gated_flat, conv_norm_weight, group_size=hidden, eps=eps
     )
     # The PLE convolution history is persistent represented state.  Current
@@ -100,4 +111,68 @@ def inject(
     )
 
 
-__all__ = ["PLEResult", "dilated_depthwise_conv", "inject"]
+def source_inject(
+    residual_branches: torch.Tensor,
+    table_rows: torch.Tensor,
+    key_weight: torch.Tensor,
+    value_weight: torch.Tensor,
+    key_norm_weight: torch.Tensor,
+    query_norm_weight: torch.Tensor,
+    conv_norm_weight: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    *,
+    dilation: int = 3,
+    eps: float = 1e-6,
+) -> PLEResult:
+    """Evaluate PLE from source-checkpoint zero-centered norm weights."""
+
+    return _inject(
+        residual_branches,
+        table_rows,
+        key_weight,
+        value_weight,
+        key_norm_weight,
+        query_norm_weight,
+        conv_norm_weight,
+        conv_weight,
+        conv_state,
+        grouped_rmsnorm=source_grouped_rmsnorm,
+        dilation=dilation,
+        eps=eps,
+    )
+
+
+def actual_gguf_inject(
+    residual_branches: torch.Tensor,
+    table_rows: torch.Tensor,
+    key_weight: torch.Tensor,
+    value_weight: torch.Tensor,
+    key_norm_gamma: torch.Tensor,
+    query_norm_gamma: torch.Tensor,
+    conv_norm_gamma: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    *,
+    dilation: int = 3,
+    eps: float = 1e-6,
+) -> PLEResult:
+    """Evaluate PLE from actual-GGUF already-folded norm gammas."""
+
+    return _inject(
+        residual_branches,
+        table_rows,
+        key_weight,
+        value_weight,
+        key_norm_gamma,
+        query_norm_gamma,
+        conv_norm_gamma,
+        conv_weight,
+        conv_state,
+        grouped_rmsnorm=actual_gguf_grouped_rmsnorm,
+        dilation=dilation,
+        eps=eps,
+    )
+
+
+__all__ = ["PLEResult", "actual_gguf_inject", "dilated_depthwise_conv", "source_inject"]

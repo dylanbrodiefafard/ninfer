@@ -37,6 +37,7 @@ using ninfer::test::ReductionCriterion;
 using ninfer::test::bf16_to_f32;
 using ninfer::test::from_device;
 using ninfer::test::from_device_bf16;
+using ninfer::test::to_device;
 using ninfer::test::verify_pointwise;
 using ninfer::test::verify_reduction;
 using namespace ninfer::test::qwen4::real_oracle;
@@ -44,6 +45,9 @@ using namespace ninfer::test::qwen4::real_oracle;
 namespace {
 
 constexpr std::int32_t kHidden = ops::kQwen4SparseMoeHidden;
+constexpr std::int32_t kBranches = 4;
+constexpr std::int32_t kFlat = kBranches * kHidden;
+constexpr std::int32_t kGrRank = 320;
 constexpr std::int32_t kExperts = ops::kQwen4SparseMoeExperts;
 constexpr std::int32_t kTopK = ops::kQwen4SparseMoeTopK;
 constexpr std::int32_t kIntermediate = ops::kQwen4SparseMoeIntermediate;
@@ -51,6 +55,25 @@ constexpr std::size_t kIq1BlockValues = 256;
 constexpr std::size_t kIq1BlockBytes = 50;
 constexpr std::size_t kIq4BlockValues = 32;
 constexpr std::size_t kIq4BlockBytes = 18;
+constexpr std::int32_t kAccumulatedPosition = 221;
+constexpr std::size_t kQ8DownBytes =
+    static_cast<std::size_t>(kGrRank) * kFlat / kQ8BlockValues * kQ8BlockBytes;
+constexpr std::size_t kQ8UpBytes =
+    static_cast<std::size_t>(kFlat) * kGrRank / kQ8BlockValues * kQ8BlockBytes;
+
+// Pinned llama_tokenize output for one paragraph including its terminal LF. The 601-token
+// evidence repeats this paragraph; position 221 is offset 49 in its third repetition.
+constexpr std::array<std::int32_t, 86> kFrozenParagraph = {
+    48, 16451, 17120, 22188, 11988, 3817, 19039, 888, 264, 2716, 8097, 40701, 13, 561,
+    1558, 15339, 1754, 3299, 303, 1906, 321, 54004, 1092, 3905, 1727, 13, 3931, 921,
+    13224, 20480, 16338, 1528, 11, 6326, 13224, 62586, 6575, 2193, 11, 321, 32335,
+    11312, 5000, 3955, 10885, 13, 1061, 14648, 13901, 5533, 13983, 19464, 12, 23,
+    1414, 11, 14733, 59429, 11, 321, 3213, 10885, 364, 799, 2526, 10756, 14751,
+    1931, 19221, 3136, 13, 11116, 7193, 369, 33625, 17066, 5721, 11, 524, 264,
+    3591, 883, 3992, 4131, 13, 198,
+};
+static_assert(kFrozenParagraph[kAccumulatedPosition % kFrozenParagraph.size()] == 5533);
+static_assert(kFrozenParagraph[(kAccumulatedPosition + 1) % kFrozenParagraph.size()] == 13983);
 
 // These are the established complete-Op criteria from test_qwen4_sparse_moe.cpp. This cell
 // changes only the represented x and artifact weights.
@@ -61,6 +84,15 @@ constexpr PointwiseCriterion kRouteWeightCriterion{
     /*absolute=*/128.0 * std::numeric_limits<float>::epsilon(),
     /*relative=*/128.0 * std::numeric_limits<float>::epsilon(),
 };
+constexpr ReductionCriterion kGrReadCriterion{/*relative_l2=*/6.0e-3,
+                                               /*gross_absolute=*/4.0e-3,
+                                               /*gross_relative_to_max_reference=*/5.0e-3};
+constexpr ReductionCriterion kGrScaleCriterion{/*relative_l2=*/3.5e-3,
+                                                /*gross_absolute=*/1.5e-3,
+                                                /*gross_relative_to_max_reference=*/3.0e-3};
+constexpr ReductionCriterion kGrInjectCriterion{/*relative_l2=*/3.0e-3,
+                                                 /*gross_absolute=*/2.0e-3,
+                                                 /*gross_relative_to_max_reference=*/2.0e-3};
 
 constexpr std::array<int, 16> kIq4Nl = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
@@ -360,6 +392,67 @@ double sigmoid(double value) {
 
 double silu(double value) { return value * sigmoid(value); }
 
+struct GrOracle {
+    std::vector<double> mixed;
+    std::vector<double> write_scale;
+};
+
+GrOracle gr_oracle(std::span<const std::uint16_t> residual_bits,
+                   std::span<const float> gamma, std::span<const std::uint8_t> down,
+                   std::span<const std::uint8_t> up, std::span<const float> write) {
+    if (residual_bits.size() != static_cast<std::size_t>(kFlat) ||
+        gamma.size() != static_cast<std::size_t>(kFlat) ||
+        write.size() != static_cast<std::size_t>(kBranches) * kFlat) {
+        throw std::logic_error("real accumulated GR oracle received malformed represented data");
+    }
+    std::vector<double> normalized(static_cast<std::size_t>(kFlat));
+    for (std::int32_t branch = 0; branch < kBranches; ++branch) {
+        const std::size_t base = static_cast<std::size_t>(branch) * kHidden;
+        double sum_squares = 0.0;
+        for (std::int32_t dimension = 0; dimension < kHidden; ++dimension) {
+            const double value = bf16_to_f32(residual_bits[base + dimension]);
+            sum_squares += value * value;
+        }
+        const double inverse_rms = 1.0 / std::sqrt(sum_squares / kHidden + 1.0e-6);
+        for (std::int32_t dimension = 0; dimension < kHidden; ++dimension) {
+            const std::size_t index = base + dimension;
+            // The actual GGUF has already folded the source checkpoint's unit offset. Gamma is
+            // therefore consumed directly here, matching the public native Op contract.
+            normalized[index] = static_cast<double>(bf16_to_f32(residual_bits[index])) *
+                                inverse_rms * static_cast<double>(gamma[index]);
+        }
+    }
+
+    std::vector<double> low_rank =
+        linear(QType::GGML_Q8_0, down, kGrRank, kFlat, normalized);
+    for (double& value : low_rank) { value = silu(value / kBranches); }
+    const std::vector<double> gate_logits =
+        linear(QType::GGML_Q8_0, up, kFlat, kGrRank, low_rank);
+
+    GrOracle result{std::vector<double>(static_cast<std::size_t>(kHidden)),
+                    std::vector<double>(static_cast<std::size_t>(kBranches))};
+    for (std::int32_t dimension = 0; dimension < kHidden; ++dimension) {
+        double mixed = 0.0;
+        for (std::int32_t branch = 0; branch < kBranches; ++branch) {
+            const std::size_t index =
+                static_cast<std::size_t>(branch) * kHidden + dimension;
+            mixed += sigmoid(gate_logits[index]) * normalized[index];
+        }
+        result.mixed[static_cast<std::size_t>(dimension)] = mixed / kBranches;
+    }
+    for (std::int32_t branch = 0; branch < kBranches; ++branch) {
+        double projected = 0.0;
+        const std::size_t row = static_cast<std::size_t>(branch) * kFlat;
+        for (std::int32_t column = 0; column < kFlat; ++column) {
+            projected += static_cast<double>(write[row + column]) *
+                         normalized[static_cast<std::size_t>(column)];
+        }
+        result.write_scale[static_cast<std::size_t>(branch)] =
+            2.0 * sigmoid(projected / kBranches);
+    }
+    return result;
+}
+
 struct OracleRoute {
     std::array<std::int32_t, kTopK> ids{};
     std::array<double, kTopK> weights{};
@@ -519,11 +612,12 @@ void require_ggml_weight(const Weight& weight, QType qtype, std::uint32_t ndim,
         weight.padded_shape[2] != shape[2] || weight.n != expected_n ||
         weight.k != expected_k || weight.group_size != block_values ||
         weight.group != static_cast<std::int32_t>(block_values)) {
-        throw std::logic_error("Qwen4 layer-0 MoE binding changed for " + std::string(label));
+        throw std::logic_error("Qwen4 real oracle binding changed for " + std::string(label));
     }
 }
 
-void validate_layer_zero(const ops::Qwen4SparseMoeWeights& weights) {
+void validate_moe_weights(const ops::Qwen4SparseMoeWeights& weights,
+                          std::string_view label) {
     const std::size_t routed_matrix =
         matrix_bytes(QType::GGML_IQ1_S, kIntermediate, kHidden);
     const std::size_t routed_down_matrix =
@@ -543,22 +637,24 @@ void validate_layer_zero(const ops::Qwen4SparseMoeWeights& weights) {
         weights.routed_gate_up.gate.size() != static_cast<std::size_t>(kExperts) * routed_matrix ||
         weights.routed_gate_up.up.size() != static_cast<std::size_t>(kExperts) * routed_matrix ||
         weights.shared_gate.dtype != DType::FP32 || weights.shared_gate.numel() != kHidden) {
-        throw std::logic_error("Qwen4 layer-0 sparse-MoE binding changed");
+        throw std::logic_error("Qwen4 " + std::string(label) + " sparse-MoE binding changed");
     }
     require_ggml_weight(weights.routed_down, QType::GGML_IQ4_NL, 3,
                         {kExperts, kHidden, kIntermediate},
                         static_cast<std::size_t>(kExperts) * routed_down_matrix,
-                        "routed_down");
+                        std::string(label) + " routed_down");
     require_ggml_weight(weights.shared_gate_proj, QType::GGML_Q5_K, 2,
                         {kIntermediate, kHidden, 1},
                         matrix_bytes(QType::GGML_Q5_K, kIntermediate, kHidden),
-                        "shared_gate_proj");
+                        std::string(label) + " shared_gate_proj");
     require_ggml_weight(weights.shared_up, QType::GGML_Q5_K, 2,
                         {kIntermediate, kHidden, 1},
-                        matrix_bytes(QType::GGML_Q5_K, kIntermediate, kHidden), "shared_up");
+                        matrix_bytes(QType::GGML_Q5_K, kIntermediate, kHidden),
+                        std::string(label) + " shared_up");
     require_ggml_weight(weights.shared_down, QType::GGML_Q8_0, 2,
                         {kHidden, kIntermediate, 1},
-                        matrix_bytes(QType::GGML_Q8_0, kHidden, kIntermediate), "shared_down");
+                        matrix_bytes(QType::GGML_Q8_0, kHidden, kIntermediate),
+                        std::string(label) + " shared_down");
 }
 
 class PipelineEvents {
@@ -616,15 +712,265 @@ private:
     cudaStream_t compute_stream_ = nullptr;
 };
 
-const verifier::GrDiagnosticView& layer_zero_gr(const verifier::TokenResultView& result) {
+const verifier::GrDiagnosticView& layer_gr(const verifier::TokenResultView& result,
+                                           std::size_t layer) {
     const auto found = std::find_if(result.gr.begin(), result.gr.end(),
-                                    [](const verifier::GrDiagnosticView& item) {
-                                        return item.layer == 0;
+                                    [layer](const verifier::GrDiagnosticView& item) {
+                                        return item.layer == layer;
                                     });
     if (found == result.gr.end()) {
-        throw std::logic_error("Qwen4 Program did not expose layer-0 attention GR snapshot");
+        throw std::logic_error("Qwen4 Program did not expose the requested GR snapshot");
     }
     return *found;
+}
+
+const verifier::RouterDiagnosticView& layer_router(const verifier::TokenResultView& result,
+                                                   std::size_t layer) {
+    const auto found = std::find_if(result.routers.begin(), result.routers.end(),
+                                    [layer](const verifier::RouterDiagnosticView& item) {
+                                        return item.layer == layer;
+                                    });
+    if (found == result.routers.end()) {
+        throw std::logic_error("Qwen4 Program did not expose the requested router result");
+    }
+    return *found;
+}
+
+void validate_ffn_gr(const verifier::GrWeights& weights, std::string_view label) {
+    if (weights.norm.data == nullptr || weights.norm.dtype != DType::FP32 ||
+        weights.norm.numel() != kFlat || weights.inject.data == nullptr ||
+        weights.inject.dtype != DType::FP32 ||
+        weights.inject.numel() != static_cast<std::int64_t>(kBranches) * kFlat) {
+        throw std::logic_error("Qwen4 " + std::string(label) + " FFN GR binding changed");
+    }
+    require_ggml_weight(weights.down, QType::GGML_Q8_0, 2, {kGrRank, kFlat, 1},
+                        kQ8DownBytes, std::string(label) + " FFN GR down");
+    require_ggml_weight(weights.up, QType::GGML_Q8_0, 2, {kFlat, kGrRank, 1},
+                        kQ8UpBytes, std::string(label) + " FFN GR up");
+}
+
+struct AccumulatedCapture {
+    std::vector<std::uint16_t> attention_residual;
+    std::vector<std::uint16_t> ffn_residual;
+    std::vector<std::int32_t> router_ids;
+    std::vector<float> router_weights;
+};
+
+AccumulatedCapture capture_layer35_position221(const verifier::LoadedModel& model,
+                                               ninfer::DeviceContext& device) {
+    verifier::Program program(model, device, verifier::DiagnosticSnapshots::Enabled);
+    program.reset();
+    for (std::int32_t position = 0; position < kAccumulatedPosition; ++position) {
+        const std::size_t index = static_cast<std::size_t>(position) % kFrozenParagraph.size();
+        (void) program.execute_token(kFrozenParagraph[index],
+                                     kFrozenParagraph[(index + 1) % kFrozenParagraph.size()]);
+    }
+    const std::size_t index =
+        static_cast<std::size_t>(kAccumulatedPosition) % kFrozenParagraph.size();
+    const verifier::TokenResultView result =
+        program.execute_token(kFrozenParagraph[index],
+                              kFrozenParagraph[(index + 1) % kFrozenParagraph.size()]);
+    const verifier::GrDiagnosticView& gr = layer_gr(result, 35);
+    const verifier::RouterDiagnosticView& router = layer_router(result, 35);
+    if (result.token_index != kAccumulatedPosition ||
+        program.frontier() != kAccumulatedPosition + 1 ||
+        gr.attention_residual.dtype != DType::BF16 ||
+        gr.attention_residual.numel() != kFlat || gr.ffn_residual.dtype != DType::BF16 ||
+        gr.ffn_residual.numel() != kFlat || router.selected_ids.dtype != DType::I32 ||
+        router.selected_ids.numel() != kTopK ||
+        router.selected_weights.dtype != DType::FP32 ||
+        router.selected_weights.numel() != kTopK) {
+        throw std::logic_error("Qwen4 position-221 layer-35 Program diagnostic changed");
+    }
+    return {
+        .attention_residual = copy_device_values<std::uint16_t>(
+            gr.attention_residual.data, static_cast<std::size_t>(kFlat)),
+        .ffn_residual = copy_device_values<std::uint16_t>(
+            gr.ffn_residual.data, static_cast<std::size_t>(kFlat)),
+        .router_ids = copy_device_values<std::int32_t>(router.selected_ids.data, kTopK),
+        .router_weights = copy_device_values<float>(router.selected_weights.data, kTopK),
+    };
+}
+
+int run_accumulated_layer35_cell(const verifier::LoadedModel& model,
+                                 ninfer::DeviceContext& device) {
+    constexpr std::size_t kLayer = 35;
+    const verifier::LayerWeights& layer = model.view().layers[kLayer];
+    validate_ffn_gr(layer.ffn_gr, "position-221 layer-35");
+    validate_moe_weights(layer.moe, "position-221 layer-35");
+    const AccumulatedCapture captured = capture_layer35_position221(model, device);
+
+    const std::vector<float> gamma = copy_device_values<float>(
+        layer.ffn_gr.norm.data, static_cast<std::size_t>(kFlat));
+    const std::vector<float> write = copy_device_values<float>(
+        layer.ffn_gr.inject.data, static_cast<std::size_t>(kBranches) * kFlat);
+    const std::vector<std::uint8_t> gr_down =
+        copy_device_bytes(layer.ffn_gr.down.qdata, layer.ffn_gr.down.payload_bytes);
+    const std::vector<std::uint8_t> gr_up =
+        copy_device_bytes(layer.ffn_gr.up.qdata, layer.ffn_gr.up.payload_bytes);
+    const GrOracle gr_reference =
+        gr_oracle(captured.attention_residual, gamma, gr_down, gr_up, write);
+
+    DeviceBuffer device_residual = to_device(captured.attention_residual);
+    GuardedDeviceBuffer device_x(static_cast<std::size_t>(kHidden) * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_scale(static_cast<std::size_t>(kBranches) *
+                                     sizeof(std::uint16_t));
+    device_x.fill(0xcd);
+    device_scale.fill(0xcd);
+    Tensor residual(device_residual.p, DType::BF16, {kHidden, kBranches});
+    Tensor x(device_x.data(), DType::BF16, {kHidden});
+    Tensor scale(device_scale.data(), DType::BF16, {kBranches});
+    WorkspaceArena gr_workspace(ops::gated_residual_workspace_capacity_bytes());
+    ops::gated_residual_read_write(residual, layer.ffn_gr.norm, layer.ffn_gr.down,
+                                   layer.ffn_gr.up, layer.ffn_gr.inject, x, scale,
+                                   gr_workspace, device.stream);
+    device.synchronize();
+
+    int failures = verify_reduction(
+        "Qwen4 real position-221 layer-35 FFN GR mixed",
+        from_device_bf16(device_x.data(), kHidden), gr_reference.mixed, kGrReadCriterion);
+    failures += verify_reduction(
+        "Qwen4 real position-221 layer-35 FFN GR write scale",
+        from_device_bf16(device_scale.data(), kBranches), gr_reference.write_scale,
+        kGrScaleCriterion);
+
+    const std::vector<std::uint16_t> input_bits =
+        from_device<std::uint16_t>(device_x.data(), kHidden);
+    std::vector<double> oracle_input(static_cast<std::size_t>(kHidden));
+    for (std::size_t dimension = 0; dimension < oracle_input.size(); ++dimension) {
+        oracle_input[dimension] = bf16_to_f32(input_bits[dimension]);
+        if (!std::isfinite(oracle_input[dimension])) {
+            throw std::logic_error("Qwen4 position-221 layer-35 MoE input is non-finite");
+        }
+    }
+
+    const ops::Qwen4SparseMoeWeights& weights = layer.moe;
+    const std::vector<float> router = copy_device_values<float>(
+        weights.router.qdata, static_cast<std::size_t>(kExperts) * kHidden);
+    const OracleRoute route = route_oracle(router, oracle_input);
+    const std::vector<std::int32_t> expected_ids(route.ids.begin(), route.ids.end());
+    if (captured.router_ids != expected_ids) {
+        std::cerr << "Qwen4 Program position-221 layer-35 selected wrong expert ids\n";
+        ++failures;
+    }
+    failures += verify_pointwise(
+        "Qwen4 Program position-221 layer-35 selected weights",
+        std::vector<double>(captured.router_weights.begin(), captured.router_weights.end()),
+        route.weights, kRouteWeightCriterion);
+    const std::size_t routed_down_matrix =
+        matrix_bytes(QType::GGML_IQ4_NL, kHidden, kIntermediate);
+    std::array<std::vector<std::uint8_t>, kTopK> routed_down;
+    for (std::int32_t rank = 0; rank < kTopK; ++rank) {
+        routed_down[static_cast<std::size_t>(rank)] = selected_device_expert(
+            weights.routed_down, route.ids[static_cast<std::size_t>(rank)], routed_down_matrix);
+    }
+    const std::vector<float> shared_gate =
+        copy_device_values<float>(weights.shared_gate.data, kHidden);
+    const std::vector<std::uint8_t> shared_gate_proj =
+        copy_device_bytes(weights.shared_gate_proj.qdata, weights.shared_gate_proj.payload_bytes);
+    const std::vector<std::uint8_t> shared_up =
+        copy_device_bytes(weights.shared_up.qdata, weights.shared_up.payload_bytes);
+    const std::vector<std::uint8_t> shared_down =
+        copy_device_bytes(weights.shared_down.qdata, weights.shared_down.payload_bytes);
+    const OracleWeights oracle_weights{
+        .router = router,
+        .routed_gate_up = weights.routed_gate_up,
+        .routed_down = routed_down,
+        .shared_gate = shared_gate,
+        .shared_gate_proj = shared_gate_proj,
+        .shared_up = shared_up,
+        .shared_down = shared_down,
+    };
+    const std::vector<double> moe_reference =
+        complete_oracle(oracle_input, route, oracle_weights);
+    if (!std::all_of(moe_reference.begin(), moe_reference.end(),
+                     [](double value) { return std::isfinite(value); })) {
+        throw std::logic_error("Qwen4 position-221 layer-35 MoE oracle is non-finite");
+    }
+
+    PinnedHostBuffer pinned(ops::kQwen4SparseMoePipelineStageBytes);
+    GuardedDeviceBuffer device_stage(ops::kQwen4SparseMoePipelineStageBytes);
+    GuardedDeviceBuffer device_ids(static_cast<std::size_t>(kTopK) * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_weights(static_cast<std::size_t>(kTopK) * sizeof(float));
+    GuardedDeviceBuffer device_output(static_cast<std::size_t>(kHidden) *
+                                      sizeof(std::uint16_t));
+    device_stage.fill(0xcd);
+    device_ids.fill(0xcd);
+    device_weights.fill(0xcd);
+    device_output.fill(0xcd);
+    Tensor stage(device_stage.data(), DType::U8,
+                 {static_cast<std::int32_t>(ops::kQwen4SparseMoePipelineStageBytes)});
+    Tensor selected_ids(device_ids.data(), DType::I32, {kTopK});
+    Tensor selected_weights(device_weights.data(), DType::FP32, {kTopK});
+    Tensor output(device_output.data(), DType::BF16, {kHidden});
+    WorkspaceArena moe_workspace(ops::qwen4_sparse_moe_workspace_capacity_bytes());
+    PipelineEvents events(device.stream);
+    ops::Qwen4SparseMoePipeline pipeline{
+        .pinned_stage = pinned.data(),
+        .pinned_stage_bytes = pinned.size(),
+        .device_stage = stage,
+        .transfer_stream = events.transfer_stream,
+        .compute_stream = device.stream,
+        .route_ready = events.route_ready,
+        .ids_ready = events.ids_ready,
+        .transfer_ready = {events.transfer_ready[0], events.transfer_ready[1]},
+        .consumer_complete = {events.consumer_complete[0], events.consumer_complete[1]},
+    };
+    ops::qwen4_sparse_moe(x, weights, pipeline, selected_ids, selected_weights, output,
+                          moe_workspace, device.stream);
+    device.synchronize();
+    CUDA_CHECK(cudaStreamSynchronize(events.transfer_stream));
+
+    const std::vector<std::int32_t> actual_ids =
+        from_device<std::int32_t>(device_ids.data(), kTopK);
+    if (actual_ids != expected_ids) {
+        std::cerr << "Qwen4 real position-221 layer-35 sparse-MoE selected wrong expert ids\n";
+        ++failures;
+    }
+    const std::vector<float> actual_weight_f32 =
+        from_device<float>(device_weights.data(), kTopK);
+    failures += verify_pointwise(
+        "Qwen4 real position-221 layer-35 sparse-MoE selected weights",
+        std::vector<double>(actual_weight_f32.begin(), actual_weight_f32.end()), route.weights,
+        kRouteWeightCriterion);
+    const std::vector<double> actual_moe =
+        from_device_bf16(device_output.data(), kHidden);
+    failures += verify_reduction(
+        "Qwen4 real position-221 layer-35 sparse-MoE complete FP64 formula", actual_moe,
+        moe_reference, kOutputCriterion);
+
+    const std::vector<double> represented_scale =
+        from_device_bf16(device_scale.data(), kBranches);
+    std::vector<double> injected_reference(static_cast<std::size_t>(kFlat));
+    for (std::int32_t branch = 0; branch < kBranches; ++branch) {
+        for (std::int32_t dimension = 0; dimension < kHidden; ++dimension) {
+            const std::size_t residual_index =
+                static_cast<std::size_t>(branch) * kHidden + dimension;
+            injected_reference[residual_index] =
+                static_cast<double>(bf16_to_f32(captured.attention_residual[residual_index])) +
+                represented_scale[static_cast<std::size_t>(branch)] *
+                    actual_moe[static_cast<std::size_t>(dimension)];
+        }
+    }
+    std::vector<double> program_ffn(static_cast<std::size_t>(kFlat));
+    std::transform(captured.ffn_residual.begin(), captured.ffn_residual.end(),
+                   program_ffn.begin(),
+                   [](std::uint16_t bits) { return bf16_to_f32(bits); });
+    failures += verify_reduction("Qwen4 real position-221 layer-35 post-FFN GR inject",
+                                 program_ffn, injected_reference, kGrInjectCriterion);
+    failures += device_x.verify_guards("Qwen4 real position-221 layer-35 FFN GR mixed");
+    failures += device_scale.verify_guards(
+        "Qwen4 real position-221 layer-35 FFN GR write scale");
+    failures += device_stage.verify_guards(
+        "Qwen4 real position-221 layer-35 sparse-MoE stage");
+    failures += device_ids.verify_guards("Qwen4 real position-221 layer-35 sparse-MoE ids");
+    failures += device_weights.verify_guards(
+        "Qwen4 real position-221 layer-35 sparse-MoE weights");
+    failures += device_output.verify_guards(
+        "Qwen4 real position-221 layer-35 sparse-MoE output");
+    std::cout << (failures == 0 ? "OK" : "FAIL")
+              << " qwen4_real_position_221_layer_35_ffn_moe_cell\n";
+    return failures;
 }
 
 } // namespace
@@ -633,12 +979,12 @@ namespace ninfer::test::qwen4::real_oracle {
 
 int run_moe_cell(const verifier::LoadedModel& model, ninfer::DeviceContext& device) {
     const ops::Qwen4SparseMoeWeights& weights = model.view().layers[0].moe;
-    validate_layer_zero(weights);
+    validate_moe_weights(weights, "layer-0");
 
     verifier::Program program(model, device, verifier::DiagnosticSnapshots::Enabled);
     program.reset();
     const verifier::TokenResultView result = program.execute_token(48, 16451);
-    const verifier::GrDiagnosticView& gr = layer_zero_gr(result);
+    const verifier::GrDiagnosticView& gr = layer_gr(result, 0);
     if (gr.attention_residual.dtype != DType::BF16 ||
         gr.attention_residual.numel() != static_cast<std::int64_t>(4) * kHidden) {
         throw std::logic_error("Qwen4 layer-0 attention GR snapshot changed");
@@ -806,6 +1152,7 @@ int run_moe_cell(const verifier::LoadedModel& model, ninfer::DeviceContext& devi
     failures += device_ids.verify_guards("Qwen4 real layer-0 sparse-MoE ids");
     failures += device_weights.verify_guards("Qwen4 real layer-0 sparse-MoE weights");
     failures += device_destination.verify_guards("Qwen4 real layer-0 sparse-MoE destination");
+    failures += run_accumulated_layer35_cell(model, device);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " qwen4_real_moe_oracle_cell ids=";
     for (std::size_t rank = 0; rank < route.ids.size(); ++rank) {
         std::cout << (rank == 0 ? "" : ",") << route.ids[rank];

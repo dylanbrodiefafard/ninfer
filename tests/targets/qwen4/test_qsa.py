@@ -6,7 +6,12 @@ import pytest
 import torch
 
 from tools.reference.qwen4.common import partial_rope
-from tools.reference.qwen4.qsa import select, sparse_attention
+from tools.reference.qwen4.qsa import (
+    actual_gguf_select,
+    actual_gguf_sparse_attention,
+    source_select,
+    source_sparse_attention,
+)
 
 
 def _selector(
@@ -16,7 +21,7 @@ def _selector(
     token_budget: int = 4,
 ):
     queries = torch.zeros((1, 4, 2), dtype=raw_keys.dtype)
-    return select(
+    return source_select(
         queries,
         raw_keys,
         [torch.tensor(visible)],
@@ -65,7 +70,7 @@ def test_qsa_fp32_pool_is_cast_back_before_key_normalization() -> None:
         dtype=torch.bfloat16,
     )
     queries = torch.tensor([[[1.0, 0.0]] * 4], dtype=torch.bfloat16)
-    result = select(
+    result = source_select(
         queries,
         raw_keys,
         [torch.arange(4)],
@@ -86,6 +91,21 @@ def test_qsa_fp32_pool_is_cast_back_before_key_normalization() -> None:
     query /= torch.sqrt((query**2).mean() + 1e-6)
     expected = 4.0 * torch.relu(query @ pooled) / math.sqrt(2.0)
     torch.testing.assert_close(result.scores, expected.reshape(1), atol=1e-12, rtol=1e-12)
+
+    actual_gguf = actual_gguf_select(
+        queries,
+        raw_keys,
+        [torch.arange(4)],
+        query_positions=torch.zeros(1),
+        key_positions=torch.zeros(4),
+        query_norm_gamma=torch.ones(2),
+        key_norm_gamma=1.0 + torch.tensor([0.2, -0.1], dtype=torch.float32).double(),
+        token_budget=4,
+        compress_ratio=4,
+        rotary_dim=2,
+        eps=1e-6,
+    )[0]
+    torch.testing.assert_close(actual_gguf.scores, expected.reshape(1), atol=1e-12, rtol=1e-12)
 
 
 def test_partial_interleaved_mrope_takes_each_frequency_from_its_axis() -> None:
@@ -109,7 +129,7 @@ def test_sparse_gqa_uses_exact_selected_ids_gate_and_projection() -> None:
     queries = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
     keys = torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]], [[-1.0, 0.0]]])
     values = torch.tensor([[[2.0, 0.0]], [[0.0, 4.0]], [[100.0, 100.0]]])
-    result = sparse_attention(
+    result = source_sparse_attention(
         queries,
         keys,
         values,
@@ -141,12 +161,29 @@ def test_sparse_gqa_uses_exact_selected_ids_gate_and_projection() -> None:
         rtol=1e-14,
     )
 
+    actual_gguf = actual_gguf_sparse_attention(
+        queries,
+        keys,
+        values,
+        [torch.tensor([0, 1])],
+        query_positions=torch.zeros(1),
+        key_positions=torch.zeros(3),
+        query_norm_gamma=torch.ones(2),
+        key_norm_gamma=torch.ones(2),
+        output_gate=torch.zeros(1, 4),
+        output_weight=torch.eye(4),
+        core_cache_dtype=torch.float64,
+        rotary_dim=2,
+        eps=0.0,
+    )
+    torch.testing.assert_close(actual_gguf.output, result.output, atol=1e-14, rtol=1e-14)
+
 
 def test_sparse_attention_reads_bf16_encoded_core_cache() -> None:
     queries = torch.tensor([[[1.0, 0.25]]])
     keys = torch.tensor([[[1.0, 0.2]], [[0.1, 1.0]]])
     values = torch.tensor([[[2.01, -0.3]], [[0.2, 4.03]]])
-    result = sparse_attention(
+    result = source_sparse_attention(
         queries,
         keys,
         values,
