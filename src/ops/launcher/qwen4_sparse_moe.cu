@@ -244,7 +244,7 @@ __global__ void indexed_gate_up_swiglu_kernel(
             up_total += __shfl_down_sync(full_warp, up_total, offset);
         }
         if (lane == 0) {
-            // The unfused public profile stores both projections to BF16 before SwiGLU.
+            // The represented profile rounds both projections to BF16 before SwiGLU.
             const __nv_bfloat16 gate_bf16 = __float2bfloat16_rn(gate_total);
             const __nv_bfloat16 up_bf16 = __float2bfloat16_rn(up_total);
             activated[static_cast<std::uint64_t>(rank) * rows + blockIdx.x] =
@@ -252,6 +252,104 @@ __global__ void indexed_gate_up_swiglu_kernel(
                 silu(__bfloat162float(gate_bf16)) * __bfloat162float(up_bf16));
         }
     }
+}
+
+// One fused launch consumes a staged expert pair. Within each 16-occurrence CTA, pairing the row
+// decodes lets each input element feed both FP32 dot products and removes the two global projection
+// tensors. The explicit BF16 conversions retain the observable rounding boundaries.
+template <QType Format>
+__global__ void prefill_gate_up_swiglu_kernel(
+    const __nv_bfloat16* x, const std::uint8_t* gate, const std::uint8_t* up,
+    __nv_bfloat16* activated, std::int32_t rows, std::int32_t columns,
+    std::int32_t tokens, std::uint64_t row_bytes) {
+    using Decoder = GgmlDecoder<Format>;
+    const int token_base = static_cast<int>(blockIdx.y) * kAggregateTokens;
+    const int tile_tokens = min(kAggregateTokens, tokens - token_base);
+    const auto* gate_row = gate + static_cast<std::uint64_t>(blockIdx.x) * row_bytes;
+    const auto* up_row = up + static_cast<std::uint64_t>(blockIdx.x) * row_bytes;
+    float gate_partial[kAggregateTokens]{};
+    float up_partial[kAggregateTokens]{};
+    for (int column = static_cast<int>(threadIdx.x); column < columns;
+         column += static_cast<int>(blockDim.x)) {
+        const int block_index = column / Decoder::block_values;
+        const int block_item = column % Decoder::block_values;
+        const std::uint64_t block_offset =
+            static_cast<std::uint64_t>(block_index) * Decoder::block_bytes;
+        const float gate_weight = Decoder::value(gate_row + block_offset, block_item);
+        const float up_weight = Decoder::value(up_row + block_offset, block_item);
+#pragma unroll
+        for (int token = 0; token < kAggregateTokens; ++token) {
+            if (token < tile_tokens) {
+                const float input = __bfloat162float(
+                    x[column + static_cast<std::int64_t>(columns) * (token_base + token)]);
+                gate_partial[token] = fmaf(gate_weight, input, gate_partial[token]);
+                up_partial[token] = fmaf(up_weight, input, up_partial[token]);
+            }
+        }
+    }
+
+    constexpr unsigned kFullWarp = 0xffffffffU;
+#pragma unroll
+    for (int token = 0; token < kAggregateTokens; ++token) {
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            gate_partial[token] +=
+                __shfl_down_sync(kFullWarp, gate_partial[token], offset);
+            up_partial[token] += __shfl_down_sync(kFullWarp, up_partial[token], offset);
+        }
+    }
+
+    __shared__ float gate_warp_sums[kAggregateTokens][8];
+    __shared__ float up_warp_sums[kAggregateTokens][8];
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    if (lane == 0) {
+#pragma unroll
+        for (int token = 0; token < kAggregateTokens; ++token) {
+            gate_warp_sums[token][warp] = gate_partial[token];
+            up_warp_sums[token][warp] = up_partial[token];
+        }
+    }
+    __syncthreads();
+    if (warp == 0) {
+#pragma unroll
+        for (int token = 0; token < kAggregateTokens; ++token) {
+            float gate_total = lane < 8 ? gate_warp_sums[token][lane] : 0.0F;
+            float up_total = lane < 8 ? up_warp_sums[token][lane] : 0.0F;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                gate_total += __shfl_down_sync(kFullWarp, gate_total, offset);
+                up_total += __shfl_down_sync(kFullWarp, up_total, offset);
+            }
+            if (lane == 0 && token < tile_tokens) {
+                const __nv_bfloat16 gate_bf16 = __float2bfloat16_rn(gate_total);
+                const __nv_bfloat16 up_bf16 = __float2bfloat16_rn(up_total);
+                activated[blockIdx.x + static_cast<std::int64_t>(rows) *
+                                             (token_base + token)] =
+                    __float2bfloat16_rn(
+                        silu(__bfloat162float(gate_bf16)) *
+                        __bfloat162float(up_bf16));
+            }
+        }
+    }
+}
+
+template <QType Format>
+void launch_prefill_gate_up_swiglu(const Tensor& x, const Weight& gate,
+                                   const Weight& up, Tensor& activated,
+                                   cudaStream_t stream) {
+    constexpr std::uint64_t block_values = GgmlDecoder<Format>::block_values;
+    constexpr std::uint64_t block_bytes = GgmlDecoder<Format>::block_bytes;
+    const std::uint64_t row_bytes =
+        static_cast<std::uint64_t>(gate.k) / block_values * block_bytes;
+    const int tokens = x.ne[1];
+    const dim3 grid(static_cast<unsigned>(gate.n),
+                    static_cast<unsigned>((tokens + kAggregateTokens - 1) /
+                                          kAggregateTokens));
+    prefill_gate_up_swiglu_kernel<Format><<<grid, kBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const std::uint8_t*>(gate.qdata),
+        static_cast<const std::uint8_t*>(up.qdata),
+        static_cast<__nv_bfloat16*>(activated.data), gate.n, gate.k, tokens,
+        row_bytes);
 }
 
 template <QType Format>
@@ -917,6 +1015,35 @@ void qwen4_sparse_moe_swiglu_launch(const Tensor& gate, const Tensor& up, Tensor
         static_cast<const __nv_bfloat16*>(gate.data),
         static_cast<const __nv_bfloat16*>(up.data),
         static_cast<__nv_bfloat16*>(activated.data), count);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen4_sparse_moe_prefill_gate_up_swiglu_launch(
+    const Tensor& x, const Weight& gate, const Weight& up, Tensor& activated,
+    cudaStream_t stream) {
+    switch (gate.qtype) {
+    case QType::GGML_IQ1_S:
+        if (x.ne[1] == 1) {
+            launch_shared_gate_up_swiglu<QType::GGML_IQ1_S>(
+                x, gate, up, activated, stream);
+        } else {
+            launch_prefill_gate_up_swiglu<QType::GGML_IQ1_S>(
+                x, gate, up, activated, stream);
+        }
+        break;
+    case QType::GGML_IQ2_XXS:
+        if (x.ne[1] == 1) {
+            launch_shared_gate_up_swiglu<QType::GGML_IQ2_XXS>(
+                x, gate, up, activated, stream);
+        } else {
+            launch_prefill_gate_up_swiglu<QType::GGML_IQ2_XXS>(
+                x, gate, up, activated, stream);
+        }
+        break;
+    default:
+        throw std::invalid_argument(
+            "Qwen4 prefill gate/up SwiGLU received unsupported format");
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -690,9 +690,15 @@ more than 32 unique experts starts with 16 so compute can begin before a full-sl
 groups contain at most 32. Two 27,197,440-byte pinned/device slots alternate. Each group stores its
 exact gate/up pairs followed immediately by its rank-token occurrence list, so one contiguous H2D
 publishes both.
-GPU gather, GGML projections, SwiGLU, routed down, scatter, shared branch, and rank-order FP32
-accumulation preserve the scalar represented boundaries. Duplicate expert use across tokens does
-not duplicate staged matrix bytes, and the Op performs no allocation or floating-point CPU work.
+GPU gather, a per-expert fused GGML gate/up projection and SwiGLU, routed down, scatter, shared
+branch, and rank-order FP32 accumulation preserve the scalar represented boundaries. The fused
+route accumulates gate and up separately in FP32, rounds each completed projection to BF16,
+widens both represented values for the existing FP32 SiLU/product, and rounds the activation to
+BF16. Per-expert occurrence count M=1 uses the scalar paired projection; M>1 uses
+16-occurrence tiles. The intermediate
+gate/up values are logical rounding boundaries rather than global workspace tensors. Duplicate
+expert use across tokens does not duplicate staged matrix bytes, and the Op performs no allocation
+or floating-point CPU work.
 The host scratch is four-byte aligned and mutually disjoint from both mapped banks and the pinned
 stage; the same fixed-compute-stream rule protects cross-call slot reuse.
 
@@ -718,10 +724,13 @@ nonuniform softmax with a tie at the tenth boundary, distinct raw logits whose n
 exponentials all underflow, positive and negative shared-gate saturation, both routed codecs, both
 shared gate/up codecs, exact host/device staged bytes, and actual T=1 shapes. Its naive FP64 oracle
 decodes IQ1_S/IQ2_XXS, IQ4_NL, Q5_K/Q6_K, and Q8_0 independently and evaluates the complete ideal formula.
-The verifier's private BF16 projection/SwiGLU storage and FP32 routing/accumulation profile are
-qualified with fixed normwise and finite gross criteria; they are not copied into the ideal oracle.
-The T-wide profiles additionally cover duplicate-token routes, both routed/shared codec pairs, and
-a T=28 nonzero 70-unique-expert panel that forces 16/32/22 mapped-stage grouping and slot reuse.
+The complete verifier's private FP32 reduction profile is qualified with fixed normwise and finite
+gross criteria rather than copied into its ideal oracle. The separately public fused gate/up
+SwiGLU Op's independent FP64 oracle does apply its declared BF16 projection and activation seams.
+The T-wide profiles additionally cover duplicate-token routes, both routed/shared codec pairs,
+an association-independent M=17 packed gate/up witness that exact-checks both projection rounds
+and the activation round across the 16-occurrence tile boundary, and a T=28 nonzero
+70-unique-expert panel that forces 16/32/22 mapped-stage grouping and slot reuse.
 Each expert receives four distinct represented inputs and route weights; expert ids are permuted so
 all three groups own a highest- or second-highest-weight expert. The panel independently derives
 routing, exact staged bytes and occurrence order, surviving slot contents, and each token's output

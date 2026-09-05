@@ -83,6 +83,22 @@ load, graph construction, and warmup do not enter topology counts.
 
 ## Qwen4 architecture-verifier benchmark
 
+`ninfer_qwen4_prefill_gate_up_swiglu_bench` measures the production
+`qwen4_sparse_moe_gate_up_swiglu` semantic Op for one exact `[640,2560]` IQ1_S or IQ2_XXS expert
+pair. It reports warm and cold-L2 event medians at an explicit occurrence width; `--profile`
+brackets one cold production call with the CUDA profiler API. It has no private route selector or
+retained comparison implementation. Numerical qualification, including independent packed-code
+FP64 checks at T=1/16/17 and an exact maximum-width zero oracle, remains in
+`ninfer_qwen4_sparse_moe_test`.
+
+```bash
+cmake --build build --parallel --target ninfer_qwen4_prefill_gate_up_swiglu_bench
+./build/bench/ninfer_qwen4_prefill_gate_up_swiglu_bench \
+  --qtype ggml_iq1_s --t 16 --warmup 30 --repetitions 300
+./build/bench/ninfer_qwen4_prefill_gate_up_swiglu_bench \
+  --qtype ggml_iq2_xxs --t 16 --profile
+```
+
 `ninfer_qwen4_sparse_moe_resident_bench` is the exact H2560/E512/top10/I640 public-Op
 placement and width A/B. It uses complete IQ1_S or IQ2_XXS gate/up banks, the complete IQ4_NL down
 bank, and all three real shared-format combinations: IQ1_S/Q5_K, IQ2_XXS/Q5_K, and the layer-2
