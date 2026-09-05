@@ -521,18 +521,19 @@ TrafficBytes running_traffic(const Problem& problem) {
 
     const Problem full{problem.qk_heads, problem.value_heads, full_tokens};
     const std::int32_t tail_tokens = problem.tokens - full_tokens;
-    const double qk_all            = qk_tensor_bytes(problem);
-    const double normalization     = 4.0 * qk_all;
-    const TrafficBytes chunked     = chunked_pipeline_traffic(full);
+    const double qk_full = qk_tensor_bytes(full);
+    const bool fuse_q_normalization = gated_delta_net_detail::uses_fused_q_normalization(
+        problem.qk_heads, problem.value_heads, problem.tokens, true);
+    const double normalization = (fuse_q_normalization ? 2.0 : 4.0) * qk_full;
+    const TrafficBytes chunked = chunked_pipeline_traffic(full);
 
     TrafficBytes traffic{
         normalization + chunked.total,
-        2.0 * qk_all + 4.0 * qk_tensor_bytes(full) + chunked.intermediate,
+        (fuse_q_normalization ? 4.0 : 6.0) * qk_full + chunked.intermediate,
     };
     if (tail_tokens > 0) {
         const Problem tail{problem.qk_heads, problem.value_heads, tail_tokens};
         traffic.total += running_logical_bytes(tail);
-        traffic.intermediate += 2.0 * qk_tensor_bytes(tail);
     }
     return traffic;
 }
@@ -547,12 +548,19 @@ TrafficBytes snapshot_traffic(const Problem& problem, bool composed) {
     };
 }
 
-std::string running_implementation(std::int32_t tokens) {
+std::string running_implementation(std::int32_t qk_heads, std::int32_t value_heads,
+                                   std::int32_t tokens) {
     const std::int32_t full_tokens =
         (tokens / gated_delta_net_detail::kChunkSize) * gated_delta_net_detail::kChunkSize;
     if (full_tokens == 0) { return "public.recurrent.qk_fused"; }
-    if (full_tokens == tokens) { return "public.l2norm_x2+chunked"; }
-    return "public.l2norm_x2+chunked+recurrent_tail";
+    const bool fused_q =
+        gated_delta_net_detail::uses_fused_q_normalization(qk_heads, value_heads, tokens, true);
+    if (full_tokens == tokens) {
+        return fused_q ? "public.l2norm_k+chunked.q_norm_fused_output"
+                       : "public.l2norm_x2+chunked";
+    }
+    return fused_q ? "public.l2norm_k+chunked.q_norm_fused_output+recurrent_tail"
+                   : "public.l2norm_x2+chunked+recurrent_tail";
 }
 
 BenchRow run_running(const Options& options, std::int32_t tokens, DeviceBuffer& flush,
@@ -592,7 +600,7 @@ BenchRow run_running(const Options& options, std::int32_t tokens, DeviceBuffer& 
     return {
         "running",
         "fused",
-        running_implementation(tokens),
+        running_implementation(problem.qk_heads, problem.value_heads, tokens),
         tokens,
         full_chunks,
         tokens % gated_delta_net_detail::kChunkSize,
