@@ -685,9 +685,11 @@ or Engine path.
 
 `qwen4_sparse_moe_prefill` owns the same complete formula for C=1, T=1..4096. It receives all
 `10*T` route ids in one D2H, validates and groups them using a fixed 335,876-byte caller-owned
-pinned integer scratch span, and stages each unique expert once in ascending-id groups of at most
-32. Two 27,197,440-byte pinned/device slots alternate. Each group stores its exact gate/up pairs
-followed immediately by its rank-token occurrence list, so one contiguous H2D publishes both.
+pinned integer scratch span, and stages each unique expert once in ascending-id order. A call with
+more than 32 unique experts starts with 16 so compute can begin before a full-slot transfer; later
+groups contain at most 32. Two 27,197,440-byte pinned/device slots alternate. Each group stores its
+exact gate/up pairs followed immediately by its rank-token occurrence list, so one contiguous H2D
+publishes both.
 GPU gather, GGML projections, SwiGLU, routed down, scatter, shared branch, and rank-order FP32
 accumulation preserve the scalar represented boundaries. Duplicate expert use across tokens does
 not duplicate staged matrix bytes, and the Op performs no allocation or floating-point CPU work.
@@ -719,11 +721,14 @@ decodes IQ1_S/IQ2_XXS, IQ4_NL, Q5_K/Q6_K, and Q8_0 independently and evaluates t
 The verifier's private BF16 projection/SwiGLU storage and FP32 routing/accumulation profile are
 qualified with fixed normwise and finite gross criteria; they are not copied into the ideal oracle.
 The T-wide profiles additionally cover duplicate-token routes, both routed/shared codec pairs, and
-a T=28 nonzero 70-unique-expert panel that forces 32/32/6 mapped-stage grouping and slot reuse.
+a T=28 nonzero 70-unique-expert panel that forces 16/32/22 mapped-stage grouping and slot reuse.
 Each expert receives four distinct represented inputs and route weights; expert ids are permuted so
 all three groups own a highest- or second-highest-weight expert. The panel independently derives
 routing, exact staged bytes and occurrence order, surviving slot contents, and each token's output
-from the complete FP64 formula. The resident grouped path is checked independently
+from the complete FP64 formula. Distinct IQ1_S and maximum-footprint IQ2_XXS panels are submitted
+back-to-back without caller synchronization on the same streams, events, and slots; both complete
+outputs are checked and the second panel's surviving slot bytes prove cross-call lifetime closure.
+The resident grouped path is checked independently
 at T=257 with four alternating nonzero represented inputs, two distinct route sets, same-expert
 reuse across different inputs and permuted ranks, back-to-back workspace reuse, exact route
 outputs, and per-token complete FP64 output criteria. A T=4096 all-zero-input run checks maximum
