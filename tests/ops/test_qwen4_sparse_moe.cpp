@@ -418,7 +418,7 @@ struct OracleRoute {
 };
 
 OracleRoute route_oracle(std::span<const float> router, std::span<const double> input) {
-    std::vector<double> probabilities(kExperts);
+    std::vector<double> logits(kExperts);
     for (int expert = 0; expert < kExperts; ++expert) {
         double logit = 0.0;
         for (int column = 0; column < kHidden; ++column) {
@@ -426,21 +426,22 @@ OracleRoute route_oracle(std::span<const float> router, std::span<const double> 
                          router[static_cast<std::size_t>(expert) * kHidden + column]) *
                      input[static_cast<std::size_t>(column)];
         }
-        probabilities[static_cast<std::size_t>(expert)] = logit;
+        logits[static_cast<std::size_t>(expert)] = logit;
     }
-    const double maximum = *std::max_element(probabilities.begin(), probabilities.end());
+    std::vector<double> probabilities(kExperts);
+    const double maximum = *std::max_element(logits.begin(), logits.end());
     double denominator = 0.0;
-    for (double& value : probabilities) {
-        value = std::exp(value - maximum);
-        denominator += value;
+    for (int expert = 0; expert < kExperts; ++expert) {
+        probabilities[expert] = std::exp(logits[expert] - maximum);
+        denominator += probabilities[expert];
     }
     for (double& value : probabilities) { value /= denominator; }
 
     std::vector<int> order(kExperts);
     std::iota(order.begin(), order.end(), 0);
     std::stable_sort(order.begin(), order.end(), [&](int left, int right) {
-        if (probabilities[left] != probabilities[right]) {
-            return probabilities[left] > probabilities[right];
+        if (logits[left] != logits[right]) {
+            return logits[left] > logits[right];
         }
         return left < right;
     });
@@ -1073,6 +1074,289 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
                     prefill_workspace, stream);
             },
             "misaligned prefill host scratch");
+
+        constexpr int small_resident_width = 2;
+        std::vector<float> small_resident_input = prefill_input;
+        small_resident_input[static_cast<std::size_t>(kHidden) + 1] += 0.125F;
+        round_to_bf16(small_resident_input);
+        std::vector<double> second_small_oracle_input(
+            small_resident_input.begin() + kHidden, small_resident_input.end());
+        const OracleRoute second_small_route = route_oracle(router, second_small_oracle_input);
+        if (second_small_route.ids != route.ids) {
+            throw std::logic_error("small resident panel route fixture is malformed");
+        }
+        const auto second_small_reference = complete_oracle(
+            second_small_oracle_input, second_small_route, oracle_weights);
+        DeviceBuffer small_resident_x = to_device_bf16(small_resident_input);
+        GuardedDeviceBuffer small_resident_ids(
+            small_resident_width * kTopK * sizeof(std::int32_t));
+        GuardedDeviceBuffer small_resident_weights(
+            small_resident_width * kTopK * sizeof(float));
+        GuardedDeviceBuffer small_resident_output(
+            small_resident_width * kHidden * sizeof(std::uint16_t));
+        DeviceArena small_resident_workspace(
+            ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(
+                small_resident_width));
+        Tensor small_resident_x_tensor(small_resident_x.p, DType::BF16,
+                                       {kHidden, small_resident_width});
+        Tensor small_resident_ids_tensor(small_resident_ids.data(), DType::I32,
+                                         {kTopK, small_resident_width});
+        Tensor small_resident_weights_tensor(small_resident_weights.data(), DType::FP32,
+                                             {kTopK, small_resident_width});
+        Tensor small_resident_output_tensor(small_resident_output.data(), DType::BF16,
+                                            {kHidden, small_resident_width});
+        ops::qwen4_sparse_moe_resident(
+            small_resident_x_tensor, resident_weights, small_resident_ids_tensor,
+            small_resident_weights_tensor, small_resident_output_tensor,
+            small_resident_workspace, stream);
+        cuda_synchronize(stream);
+        std::vector<std::int32_t> small_expected_ids(2 * kTopK);
+        std::copy(route.ids.begin(), route.ids.end(), small_expected_ids.begin());
+        std::copy(second_small_route.ids.begin(), second_small_route.ids.end(),
+                  small_expected_ids.begin() + kTopK);
+        failures += verify_exact(
+            "Qwen4 resident small-T distinct-input ids",
+            from_device<std::int32_t>(small_resident_ids.data(), small_expected_ids.size()),
+            small_expected_ids);
+        std::vector<double> small_expected_weights(2 * kTopK);
+        std::copy(route.weights.begin(), route.weights.end(), small_expected_weights.begin());
+        std::copy(second_small_route.weights.begin(), second_small_route.weights.end(),
+                  small_expected_weights.begin() + kTopK);
+        const auto small_weight_f32 = from_device<float>(
+            small_resident_weights.data(), small_expected_weights.size());
+        failures += verify_pointwise(
+            "Qwen4 resident small-T distinct-input weights",
+            std::vector<double>(small_weight_f32.begin(), small_weight_f32.end()),
+            small_expected_weights, kRouteWeightCriterion);
+        const auto small_actual = from_device_bf16(
+            small_resident_output.data(), small_resident_width * kHidden);
+        failures += verify_reduction(
+            "Qwen4 resident small-T first-token complete FP64 formula",
+            std::span<const double>(small_actual).first(kHidden), reference,
+            kOutputCriterion);
+        failures += verify_reduction(
+            "Qwen4 resident small-T second-token complete FP64 formula",
+            std::span<const double>(small_actual).subspan(kHidden, kHidden),
+            second_small_reference, kOutputCriterion);
+        failures += small_resident_ids.verify_guards("Qwen4 resident small-T ids");
+        failures += small_resident_weights.verify_guards("Qwen4 resident small-T weights");
+        failures += small_resident_output.verify_guards("Qwen4 resident small-T output");
+
+        // Qualify the device-grouped resident route directly against the independent formula.
+        // Three represented inputs alternate: two select the same experts with different values,
+        // and one selects a disjoint expert set. This catches token/rank coupling, expert grouping,
+        // and result-scatter mistakes that identical-token or zero-matrix panels cannot expose.
+        constexpr int resident_width = 257;
+        std::vector<float> resident_router(static_cast<std::size_t>(kExperts) * kHidden, 0.0F);
+        for (int rank = 0; rank < kTopK; ++rank) {
+            resident_router[static_cast<std::size_t>(route.ids[rank]) * kHidden] =
+                static_cast<float>(20 - rank);
+            resident_router[static_cast<std::size_t>(route.ids[rank]) * kHidden + 1] =
+                static_cast<float>(20 - rank);
+            resident_router[static_cast<std::size_t>(next_route.ids[rank]) * kHidden + 2] =
+                static_cast<float>(20 - rank);
+        }
+        std::array<std::vector<float>, 3> resident_inputs;
+        resident_inputs[0].assign(kHidden, 0.0F);
+        resident_inputs[1].assign(kHidden, 0.0F);
+        resident_inputs[2].assign(kHidden, 0.0F);
+        resident_inputs[0][0] = 1.0F;
+        resident_inputs[1][1] = 0.75F;
+        resident_inputs[2][2] = 1.0F;
+        for (auto& value : resident_inputs) { round_to_bf16(value); }
+        std::array<std::vector<double>, 3> resident_oracle_inputs;
+        std::array<OracleRoute, 3> resident_routes;
+        for (int pattern = 0; pattern < 3; ++pattern) {
+            resident_oracle_inputs[pattern].assign(resident_inputs[pattern].begin(),
+                                                   resident_inputs[pattern].end());
+            resident_routes[pattern] = route_oracle(resident_router,
+                                                    resident_oracle_inputs[pattern]);
+        }
+        if (resident_routes[0].ids != route.ids || resident_routes[1].ids != route.ids ||
+            resident_routes[2].ids != next_route.ids) {
+            throw std::logic_error("resident grouped route fixture is malformed");
+        }
+        const OracleInputs resident_oracle_weights{
+            routed_qtype, shared_qtype, resident_router, mapped_gate, mapped_up,
+            down_matrices, shared_gate, shared_gate_proj, shared_up, shared_down};
+        const OracleInputs resident_next_oracle_weights{
+            routed_qtype, shared_qtype, resident_router, mapped_gate, mapped_up,
+            next_down_matrices, shared_gate, shared_gate_proj, shared_up, shared_down};
+        std::array<std::vector<double>, 3> resident_references{
+            complete_oracle(resident_oracle_inputs[0], resident_routes[0],
+                            resident_oracle_weights),
+            complete_oracle(resident_oracle_inputs[1], resident_routes[1],
+                            resident_oracle_weights),
+            complete_oracle(resident_oracle_inputs[2], resident_routes[2],
+                            resident_next_oracle_weights),
+        };
+
+        std::vector<float> resident_panel;
+        resident_panel.reserve(static_cast<std::size_t>(resident_width) * kHidden);
+        std::vector<std::int32_t> resident_expected_ids(
+            static_cast<std::size_t>(resident_width) * kTopK);
+        std::vector<double> resident_expected_weights(
+            static_cast<std::size_t>(resident_width) * kTopK);
+        for (int token = 0; token < resident_width; ++token) {
+            const int pattern = token % 3;
+            resident_panel.insert(resident_panel.end(), resident_inputs[pattern].begin(),
+                                  resident_inputs[pattern].end());
+            std::copy(resident_routes[pattern].ids.begin(), resident_routes[pattern].ids.end(),
+                      resident_expected_ids.begin() + static_cast<std::ptrdiff_t>(token * kTopK));
+            std::copy(resident_routes[pattern].weights.begin(),
+                      resident_routes[pattern].weights.end(),
+                      resident_expected_weights.begin() +
+                          static_cast<std::ptrdiff_t>(token * kTopK));
+        }
+        DeviceBuffer resident_panel_device = to_device_bf16(resident_panel);
+        DeviceBuffer resident_router_device = to_device_f32(resident_router);
+        GuardedDeviceBuffer resident_panel_ids(
+            static_cast<std::size_t>(resident_width) * kTopK * sizeof(std::int32_t));
+        GuardedDeviceBuffer resident_panel_weights(
+            static_cast<std::size_t>(resident_width) * kTopK * sizeof(float));
+        GuardedDeviceBuffer resident_panel_output(
+            static_cast<std::size_t>(resident_width) * kHidden * sizeof(std::uint16_t));
+        GuardedDeviceBuffer resident_panel_second_output(
+            static_cast<std::size_t>(resident_width) * kHidden * sizeof(std::uint16_t));
+        DeviceArena resident_panel_workspace(
+            ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(resident_width));
+        Tensor resident_panel_x(resident_panel_device.p, DType::BF16,
+                                {kHidden, resident_width});
+        Tensor resident_panel_ids_tensor(resident_panel_ids.data(), DType::I32,
+                                          {kTopK, resident_width});
+        Tensor resident_panel_weights_tensor(resident_panel_weights.data(), DType::FP32,
+                                              {kTopK, resident_width});
+        Tensor resident_panel_output_tensor(resident_panel_output.data(), DType::BF16,
+                                             {kHidden, resident_width});
+        Tensor resident_panel_second_output_tensor(
+            resident_panel_second_output.data(), DType::BF16, {kHidden, resident_width});
+        auto resident_panel_model_weights = resident_weights;
+        resident_panel_model_weights.router = make_router(resident_router_device.p);
+        ops::qwen4_sparse_moe_resident(
+            resident_panel_x, resident_panel_model_weights, resident_panel_ids_tensor,
+            resident_panel_weights_tensor, resident_panel_output_tensor,
+            resident_panel_workspace, stream);
+        ops::qwen4_sparse_moe_resident(
+            resident_panel_x, resident_panel_model_weights, resident_panel_ids_tensor,
+            resident_panel_weights_tensor, resident_panel_second_output_tensor,
+            resident_panel_workspace, stream);
+        cuda_synchronize(stream);
+
+        failures += verify_exact(
+            "Qwen4 resident grouped heterogeneous ids",
+            from_device<std::int32_t>(resident_panel_ids.data(),
+                                      resident_expected_ids.size()),
+            resident_expected_ids);
+        const auto resident_panel_weight_f32 = from_device<float>(
+            resident_panel_weights.data(), resident_expected_weights.size());
+        failures += verify_pointwise(
+            "Qwen4 resident grouped heterogeneous weights",
+            std::vector<double>(resident_panel_weight_f32.begin(),
+                                resident_panel_weight_f32.end()),
+            resident_expected_weights, kRouteWeightCriterion);
+        const auto resident_panel_actual = from_device_bf16(
+            resident_panel_output.data(), static_cast<std::size_t>(resident_width) * kHidden);
+        const auto resident_panel_second_actual = from_device_bf16(
+            resident_panel_second_output.data(),
+            static_cast<std::size_t>(resident_width) * kHidden);
+        if (resident_panel_actual != resident_panel_second_actual) {
+            std::cerr << "Qwen4 resident grouped back-to-back output is nondeterministic\n";
+            ++failures;
+        }
+        for (int token = 0; token < resident_width; ++token) {
+            const int pattern = token % 3;
+            const auto begin = static_cast<std::size_t>(token) * kHidden;
+            failures += verify_reduction(
+                "Qwen4 resident grouped per-token complete FP64 formula",
+                std::span<const double>(resident_panel_actual).subspan(begin, kHidden),
+                resident_references[pattern], kOutputCriterion);
+            failures += verify_reduction(
+                "Qwen4 resident grouped back-to-back complete FP64 formula",
+                std::span<const double>(resident_panel_second_actual).subspan(begin, kHidden),
+                resident_references[pattern], kOutputCriterion);
+        }
+        failures += resident_panel_ids.verify_guards(
+            "Qwen4 resident grouped heterogeneous ids");
+        failures += resident_panel_weights.verify_guards(
+            "Qwen4 resident grouped heterogeneous weights");
+        failures += resident_panel_output.verify_guards(
+            "Qwen4 resident grouped heterogeneous output");
+        failures += resident_panel_second_output.verify_guards(
+            "Qwen4 resident grouped back-to-back output");
+
+        DeviceArena short_resident_panel_workspace(
+            ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(resident_width) - 1);
+        failures += expect_invalid(
+            [&] {
+                ops::qwen4_sparse_moe_resident(
+                    resident_panel_x, resident_panel_model_weights, resident_panel_ids_tensor,
+                    resident_panel_weights_tensor, resident_panel_output_tensor,
+                    short_resident_panel_workspace, stream);
+            },
+            "short resident grouped workspace");
+        Tensor wrong_resident_panel_ids(resident_panel_ids.data(), DType::I32,
+                                        {kTopK, resident_width - 1});
+        failures += expect_invalid(
+            [&] {
+                ops::qwen4_sparse_moe_resident(
+                    resident_panel_x, resident_panel_model_weights,
+                    wrong_resident_panel_ids, resident_panel_weights_tensor,
+                    resident_panel_output_tensor, resident_panel_workspace, stream);
+            },
+            "mismatched resident grouped route width");
+
+        if (routed_qtype == QType::GGML_IQ1_S &&
+            route_fixture == RouteFixture::AllZero) {
+            constexpr int maximum_width = ops::kQwen4SparseMoePrefillMaxWidth;
+            DeviceBuffer maximum_x(static_cast<std::size_t>(maximum_width) * kHidden *
+                                   sizeof(std::uint16_t));
+            maximum_x.fill(0);
+            GuardedDeviceBuffer maximum_ids(
+                static_cast<std::size_t>(maximum_width) * kTopK * sizeof(std::int32_t));
+            GuardedDeviceBuffer maximum_weights(
+                static_cast<std::size_t>(maximum_width) * kTopK * sizeof(float));
+            GuardedDeviceBuffer maximum_output(
+                static_cast<std::size_t>(maximum_width) * kHidden * sizeof(std::uint16_t));
+            DeviceArena maximum_workspace(
+                ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(maximum_width));
+            Tensor maximum_x_tensor(maximum_x.p, DType::BF16,
+                                    {kHidden, maximum_width});
+            Tensor maximum_ids_tensor(maximum_ids.data(), DType::I32,
+                                      {kTopK, maximum_width});
+            Tensor maximum_weights_tensor(maximum_weights.data(), DType::FP32,
+                                          {kTopK, maximum_width});
+            Tensor maximum_output_tensor(maximum_output.data(), DType::BF16,
+                                         {kHidden, maximum_width});
+            ops::qwen4_sparse_moe_resident(
+                maximum_x_tensor, resident_weights, maximum_ids_tensor,
+                maximum_weights_tensor, maximum_output_tensor, maximum_workspace, stream);
+            cuda_synchronize(stream);
+            std::vector<std::int32_t> maximum_expected_ids(
+                static_cast<std::size_t>(maximum_width) * kTopK);
+            for (int token = 0; token < maximum_width; ++token) {
+                std::iota(maximum_expected_ids.begin() +
+                              static_cast<std::ptrdiff_t>(token * kTopK),
+                          maximum_expected_ids.begin() +
+                              static_cast<std::ptrdiff_t>((token + 1) * kTopK),
+                          0);
+            }
+            failures += verify_exact(
+                "Qwen4 resident maximum-width tie ids",
+                from_device<std::int32_t>(maximum_ids.data(),
+                                          maximum_expected_ids.size()),
+                maximum_expected_ids);
+            const auto maximum_actual = from_device<std::uint16_t>(
+                maximum_output.data(), static_cast<std::size_t>(maximum_width) * kHidden);
+            if (!std::all_of(maximum_actual.begin(), maximum_actual.end(),
+                             [](std::uint16_t value) { return value == 0; })) {
+                std::cerr << "Qwen4 resident maximum-width zero formula changed\n";
+                ++failures;
+            }
+            failures += maximum_ids.verify_guards("Qwen4 resident maximum-width ids");
+            failures += maximum_weights.verify_guards(
+                "Qwen4 resident maximum-width weights");
+            failures += maximum_output.verify_guards("Qwen4 resident maximum-width output");
+        }
     }
 
     const std::size_t rank_bytes = ops::qwen4_sparse_moe_rank_stage_bytes(routed_qtype);
@@ -1444,6 +1728,12 @@ int main() {
         failures += expect_invalid(
             [] { (void)ops::qwen4_sparse_moe_prefill_workspace_capacity_bytes(4097); },
             "excessive prefill width");
+        failures += expect_invalid(
+            [] { (void)ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(0); },
+            "zero resident width");
+        failures += expect_invalid(
+            [] { (void)ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(4097); },
+            "excessive resident width");
         if (ops::qwen4_sparse_moe_prefill_workspace_capacity_bytes(4096) == 0) {
             throw std::runtime_error("Qwen4 sparse MoE maximum prefill workspace is empty");
         }

@@ -17,6 +17,25 @@ void qwen4_sparse_moe_resident_route_launch(
     Tensor& selected_ids, Tensor& selected_weights, Tensor& shared_gate_value,
     cudaStream_t stream);
 
+void qwen4_sparse_moe_resident_wide_route_launch(
+    const Tensor& x, const Weight& router, const Tensor& shared_gate, Tensor& logits,
+    Tensor& selected_ids, Tensor& selected_weights, Tensor& shared_gate_value,
+    cudaStream_t stream);
+
+void qwen4_sparse_moe_resident_group_launch(
+    const Tensor& selected_ids, Tensor& expert_counts, Tensor& expert_offsets,
+    Tensor& expert_cursors, Tensor& occurrence_slots, cudaStream_t stream);
+
+void qwen4_sparse_moe_resident_grouped_gate_up_launch(
+    const Tensor& x, const Weight& bank, const Tensor& expert_counts,
+    const Tensor& expert_offsets, const Tensor& occurrence_slots, Tensor& output,
+    cudaStream_t stream);
+
+void qwen4_sparse_moe_resident_grouped_down_launch(
+    const Tensor& activated, const Weight& bank, const Tensor& expert_counts,
+    const Tensor& expert_offsets, const Tensor& occurrence_slots, Tensor& rank_results,
+    cudaStream_t stream);
+
 void qwen4_sparse_moe_shared_gate_up_swiglu_launch(
     const Tensor& x, const Weight& gate, const Weight& up, Tensor& activated,
     cudaStream_t stream);
