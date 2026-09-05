@@ -14,6 +14,186 @@ namespace ninfer::ops::detail {
 namespace {
 
 constexpr int kBlock = 256;
+constexpr int kAggregateTokens = 16;
+constexpr int kGroupedRowBlocks = 32;
+
+__global__ void resident_wide_router_logits_kernel(
+    const __nv_bfloat16* x, const float* router, const float* shared_gate,
+    float* logits, float* shared_gate_value, std::int32_t width) {
+    const int row = static_cast<int>(blockIdx.x);
+    const int token_base = static_cast<int>(blockIdx.y) * kAggregateTokens;
+    const int tile_tokens = min(kAggregateTokens, width - token_base);
+    const float* weights = row < kQwen4SparseMoeExperts
+                               ? router + static_cast<std::int64_t>(row) *
+                                              kQwen4SparseMoeHidden
+                               : shared_gate;
+    float partial[kAggregateTokens]{};
+    for (int column = static_cast<int>(threadIdx.x);
+         column < kQwen4SparseMoeHidden; column += blockDim.x) {
+        const float weight = weights[column];
+#pragma unroll
+        for (int token = 0; token < kAggregateTokens; ++token) {
+            if (token < tile_tokens) {
+                partial[token] = fmaf(
+                    weight,
+                    __bfloat162float(x[column +
+                                       static_cast<std::int64_t>(kQwen4SparseMoeHidden) *
+                                           (token_base + token)]),
+                    partial[token]);
+            }
+        }
+    }
+
+    constexpr unsigned kFullWarp = 0xffffffffU;
+#pragma unroll
+    for (int token = 0; token < kAggregateTokens; ++token) {
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            partial[token] += __shfl_down_sync(kFullWarp, partial[token], offset);
+        }
+    }
+    __shared__ float warp_sums[kAggregateTokens][8];
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    if (lane == 0) {
+#pragma unroll
+        for (int token = 0; token < kAggregateTokens; ++token) {
+            warp_sums[token][warp] = partial[token];
+        }
+    }
+    __syncthreads();
+    if (warp == 0) {
+#pragma unroll
+        for (int token = 0; token < kAggregateTokens; ++token) {
+            float total = lane < 8 ? warp_sums[token][lane] : 0.0F;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                total += __shfl_down_sync(kFullWarp, total, offset);
+            }
+            if (lane == 0 && token < tile_tokens) {
+                const int absolute_token = token_base + token;
+                if (row < kQwen4SparseMoeExperts) {
+                    logits[row + static_cast<std::int64_t>(kQwen4SparseMoeExperts) *
+                                     absolute_token] = total;
+                } else {
+                    shared_gate_value[absolute_token] = sigmoid(total);
+                }
+            }
+        }
+    }
+}
+
+__global__ void resident_expert_histogram_kernel(const std::int32_t* selected_ids,
+                                                 std::int32_t* expert_counts,
+                                                 std::int32_t occurrences) {
+    const int rank_token = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (rank_token < occurrences) {
+        atomicAdd(expert_counts + selected_ids[rank_token], 1);
+    }
+}
+
+__global__ void resident_expert_prefix_kernel(const std::int32_t* expert_counts,
+                                              std::int32_t* expert_offsets,
+                                              std::int32_t* expert_cursors) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) { return; }
+    std::int32_t offset = 0;
+    for (int expert = 0; expert < kQwen4SparseMoeExperts; ++expert) {
+        expert_offsets[expert] = offset;
+        expert_cursors[expert] = offset;
+        offset += expert_counts[expert];
+    }
+}
+
+__global__ void resident_expert_scatter_kernel(const std::int32_t* selected_ids,
+                                               std::int32_t* expert_cursors,
+                                               std::int32_t* occurrence_slots,
+                                               std::int32_t occurrences) {
+    const int rank_token = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (rank_token < occurrences) {
+        const int expert = selected_ids[rank_token];
+        const int slot = atomicAdd(expert_cursors + expert, 1);
+        occurrence_slots[slot] = rank_token;
+    }
+}
+
+template <QType Format, int InputTokenDivisor>
+__global__ void resident_grouped_linear_kernel(
+    const __nv_bfloat16* x, const std::uint8_t* bank,
+    const std::int32_t* expert_counts, const std::int32_t* expert_offsets,
+    const std::int32_t* occurrence_slots, __nv_bfloat16* output,
+    std::int32_t rows, std::int32_t columns, std::uint64_t row_bytes) {
+    using Decoder = GgmlDecoder<Format>;
+    const int expert = static_cast<int>(blockIdx.y);
+    const int occurrence_count = expert_counts[expert];
+    if (occurrence_count == 0) { return; }
+    const int occurrence_begin = expert_offsets[expert];
+    const std::uint64_t matrix_bytes = static_cast<std::uint64_t>(rows) * row_bytes;
+    constexpr unsigned kFullWarp = 0xffffffffU;
+    __shared__ std::int32_t rank_tokens[kAggregateTokens];
+    __shared__ float warp_sums[kAggregateTokens][8];
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+
+    for (int tile = 0; tile < occurrence_count; tile += kAggregateTokens) {
+        const int tile_tokens = min(kAggregateTokens, occurrence_count - tile);
+        if (static_cast<int>(threadIdx.x) < tile_tokens) {
+            rank_tokens[threadIdx.x] = occurrence_slots[occurrence_begin + tile + threadIdx.x];
+        }
+        __syncthreads();
+        for (int row_index = static_cast<int>(blockIdx.x); row_index < rows;
+             row_index += kGroupedRowBlocks) {
+            const auto* row = bank + static_cast<std::uint64_t>(expert) * matrix_bytes +
+                              static_cast<std::uint64_t>(row_index) * row_bytes;
+            float partial[kAggregateTokens]{};
+            for (int column = static_cast<int>(threadIdx.x); column < columns;
+                 column += blockDim.x) {
+                const int block_index = column / Decoder::block_values;
+                const int block_item = column % Decoder::block_values;
+                const float weight = Decoder::value(
+                    row + static_cast<std::uint64_t>(block_index) * Decoder::block_bytes,
+                    block_item);
+#pragma unroll
+                for (int item = 0; item < kAggregateTokens; ++item) {
+                    if (item < tile_tokens) {
+                        const int input_token = rank_tokens[item] / InputTokenDivisor;
+                        partial[item] = fmaf(
+                            weight,
+                            __bfloat162float(
+                                x[column + static_cast<std::int64_t>(columns) * input_token]),
+                            partial[item]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int item = 0; item < kAggregateTokens; ++item) {
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    partial[item] +=
+                        __shfl_down_sync(kFullWarp, partial[item], offset);
+                }
+            }
+            if (lane == 0) {
+#pragma unroll
+                for (int item = 0; item < kAggregateTokens; ++item) {
+                    warp_sums[item][warp] = partial[item];
+                }
+            }
+            __syncthreads();
+            if (warp == 0) {
+#pragma unroll
+                for (int item = 0; item < kAggregateTokens; ++item) {
+                    float total = lane < 8 ? warp_sums[item][lane] : 0.0F;
+                    for (int offset = 16; offset > 0; offset >>= 1) {
+                        total += __shfl_down_sync(kFullWarp, total, offset);
+                    }
+                    if (lane == 0 && item < tile_tokens) {
+                        output[row_index + static_cast<std::int64_t>(rows) *
+                                               rank_tokens[item]] =
+                            __float2bfloat16_rn(total);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
 
 template <QType Format>
 __global__ void indexed_gate_up_swiglu_kernel(
@@ -581,6 +761,103 @@ void qwen4_sparse_moe_resident_route_launch(
     resident_route_kernel<<<1, kQwen4SparseMoeExperts, 0, stream>>>(
         static_cast<float*>(logits.data), static_cast<std::int32_t*>(selected_ids.data),
         static_cast<float*>(selected_weights.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen4_sparse_moe_resident_wide_route_launch(
+    const Tensor& x, const Weight& router, const Tensor& shared_gate, Tensor& logits,
+    Tensor& selected_ids, Tensor& selected_weights, Tensor& shared_gate_value,
+    cudaStream_t stream) {
+    const int width = x.ne[1];
+    const dim3 grid(
+        kQwen4SparseMoeExperts + 1,
+        static_cast<unsigned>((width + kAggregateTokens - 1) / kAggregateTokens));
+    resident_wide_router_logits_kernel<<<grid, kBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const float*>(router.qdata),
+        static_cast<const float*>(shared_gate.data), static_cast<float*>(logits.data),
+        static_cast<float*>(shared_gate_value.data), width);
+    CUDA_CHECK(cudaGetLastError());
+    route_kernel<<<width, kBlock, 0, stream>>>(
+        static_cast<float*>(logits.data),
+        static_cast<std::int32_t*>(selected_ids.data),
+        static_cast<float*>(selected_weights.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen4_sparse_moe_resident_group_launch(
+    const Tensor& selected_ids, Tensor& expert_counts, Tensor& expert_offsets,
+    Tensor& expert_cursors, Tensor& occurrence_slots, cudaStream_t stream) {
+    const std::int32_t occurrences = static_cast<std::int32_t>(selected_ids.numel());
+    CUDA_CHECK(cudaMemsetAsync(expert_counts.data, 0, expert_counts.bytes(), stream));
+    resident_expert_histogram_kernel<<<(occurrences + kBlock - 1) / kBlock, kBlock, 0,
+                                       stream>>>(
+        static_cast<const std::int32_t*>(selected_ids.data),
+        static_cast<std::int32_t*>(expert_counts.data), occurrences);
+    CUDA_CHECK(cudaGetLastError());
+    resident_expert_prefix_kernel<<<1, 1, 0, stream>>>(
+        static_cast<const std::int32_t*>(expert_counts.data),
+        static_cast<std::int32_t*>(expert_offsets.data),
+        static_cast<std::int32_t*>(expert_cursors.data));
+    CUDA_CHECK(cudaGetLastError());
+    resident_expert_scatter_kernel<<<(occurrences + kBlock - 1) / kBlock, kBlock, 0,
+                                     stream>>>(
+        static_cast<const std::int32_t*>(selected_ids.data),
+        static_cast<std::int32_t*>(expert_cursors.data),
+        static_cast<std::int32_t*>(occurrence_slots.data), occurrences);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <QType Format, int InputTokenDivisor>
+void launch_resident_grouped_linear(
+    const Tensor& x, const Weight& bank, const Tensor& expert_counts,
+    const Tensor& expert_offsets, const Tensor& occurrence_slots, Tensor& output,
+    cudaStream_t stream) {
+    constexpr std::uint64_t block_values = GgmlDecoder<Format>::block_values;
+    constexpr std::uint64_t block_bytes = GgmlDecoder<Format>::block_bytes;
+    const std::uint64_t row_bytes =
+        static_cast<std::uint64_t>(bank.k) / block_values * block_bytes;
+    const dim3 grid(kGroupedRowBlocks, kQwen4SparseMoeExperts);
+    resident_grouped_linear_kernel<Format, InputTokenDivisor><<<grid, kBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const std::uint8_t*>(bank.qdata),
+        static_cast<const std::int32_t*>(expert_counts.data),
+        static_cast<const std::int32_t*>(expert_offsets.data),
+        static_cast<const std::int32_t*>(occurrence_slots.data),
+        static_cast<__nv_bfloat16*>(output.data), bank.n, bank.k, row_bytes);
+}
+
+void qwen4_sparse_moe_resident_grouped_gate_up_launch(
+    const Tensor& x, const Weight& bank, const Tensor& expert_counts,
+    const Tensor& expert_offsets, const Tensor& occurrence_slots, Tensor& output,
+    cudaStream_t stream) {
+    switch (bank.qtype) {
+    case QType::GGML_IQ1_S:
+        launch_resident_grouped_linear<QType::GGML_IQ1_S, kQwen4SparseMoeTopK>(
+            x, bank, expert_counts, expert_offsets, occurrence_slots, output, stream);
+        break;
+    case QType::GGML_IQ2_XXS:
+        launch_resident_grouped_linear<QType::GGML_IQ2_XXS, kQwen4SparseMoeTopK>(
+            x, bank, expert_counts, expert_offsets, occurrence_slots, output, stream);
+        break;
+    default:
+        throw std::invalid_argument(
+            "Qwen4 resident grouped gate/up received unsupported format");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen4_sparse_moe_resident_grouped_down_launch(
+    const Tensor& activated, const Weight& bank, const Tensor& expert_counts,
+    const Tensor& expert_offsets, const Tensor& occurrence_slots, Tensor& rank_results,
+    cudaStream_t stream) {
+    if (bank.qtype != QType::GGML_IQ4_NL) {
+        throw std::invalid_argument(
+            "Qwen4 resident grouped down received unsupported format");
+    }
+    launch_resident_grouped_linear<QType::GGML_IQ4_NL, 1>(
+        activated, bank, expert_counts, expert_offsets, occurrence_slots, rank_results,
+        stream);
     CUDA_CHECK(cudaGetLastError());
 }
 
