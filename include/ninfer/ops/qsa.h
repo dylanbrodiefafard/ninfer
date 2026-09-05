@@ -74,13 +74,14 @@ void qsa_index_select(const Tensor& raw_query, const QsaStateView& state,
                       Tensor& selected_count, Tensor& workspace, cudaStream_t stream);
 
 /**
- * Compute one-token selected grouped-query attention from normalized/rotated BF16 q [256,24,1]
- * and the exact selected prefix. Query head h consumes KV head floor(h/12). Every K/V value is
- * decoded from the NVFP4-G16 state, including values appended earlier on the same stream. Softmax
- * uses FP32 max/subtract/exp/sum and the fixed 1/sqrt(256) scale. out is BF16 [256,24,1].
- * Empty/invalid queries are exact zero. selected_ids is I32 [S] for a caller-known bound S in
- * [1,2051]; the caller promises valid selected ids are unique, visible, and in range and
- * selected_count is in [0,S]. Workspace is caller-owned, 256-byte aligned U8 with at least
+ * Compute selected grouped-query attention from normalized/rotated BF16 q [256,24,W] and the
+ * exact per-column selected prefixes. Query head h consumes KV head floor(h/12). Every K/V value
+ * is decoded from the NVFP4-G16 state, including values appended earlier on the same stream.
+ * Softmax uses FP32 max/subtract/exp/sum and the fixed 1/sqrt(256) scale. out is BF16 [256,24,W].
+ * Empty/invalid queries are exact zero. selected_ids is I32 [S,W] for a caller-known bound S in
+ * [1,2051]; the caller promises each valid selected prefix is unique, visible, and in range and
+ * selected_count is I32 [W] with values in [0,S]. Workspace is caller-owned, 256-byte aligned U8
+ * with at least
  * qsa_selected_attention_workspace_bytes() bytes. No state is mutated.
  */
 [[nodiscard]] std::size_t qsa_selected_attention_workspace_bytes();
@@ -101,14 +102,14 @@ struct QsaVerifierWeights {
     Tensor core_key_norm;    // converted GGUF FP32 gamma [256]
 };
 
-/** Fixed transient device capacity for qsa_verifier_token. */
-[[nodiscard]] std::size_t qsa_verifier_workspace_bytes();
+/** Fixed transient device capacity for qsa_verifier at width W in [1,4096]. */
+[[nodiscard]] std::size_t qsa_verifier_workspace_bytes(std::int32_t width);
 
 /**
- * Actual-artifact C=1/T=1 QSA verifier composite. x/out are BF16 [2560], token_id is I32 [1],
- * position is I32 [3], visibility is one CSR slice (visible_offsets I32 [2]). The exact weights
- * and controls are QsaVerifierWeights. selected_ids/count expose the exact selector result as I32
- * [2051] and [1].
+ * Actual-artifact C=1 QSA verifier composite for W in [1,4096]. x/out are BF16 [2560,W],
+ * append_ids is I32 [W], position is I32 [3,W], and visibility is W CSR slices
+ * (visible_offsets I32 [W+1]). The exact weights and controls are QsaVerifierWeights.
+ * selected_ids/count expose the exact selector result as I32 [2051,W] and [W].
  *
  * The Op projects BF16 index queries/key, projects the per-head core query/gate parent plus K/V,
  * applies Q/K norms with converted GGUF gamma and 64-wide interleaved T/H/W MRoPE with theta 1e7,
@@ -121,12 +122,12 @@ struct QsaVerifierWeights {
  * This verifier entry owns no frontier, visibility construction, commit, or rollback. All storage
  * is caller-owned, non-overlapping except for no permitted aliases, and remains alive through the
  * stream. Workspace is contiguous U8, 256-byte aligned, and at least
- * qsa_verifier_workspace_bytes().
+ * qsa_verifier_workspace_bytes(W).
  */
-void qsa_verifier_token(const Tensor& x, const Tensor& token_id, const Tensor& position,
-                        const Tensor& visible_ids, const Tensor& visible_offsets,
-                        const QsaVerifierWeights& weights, QsaStateView state,
-                        Tensor& selected_ids, Tensor& selected_count, Tensor& out,
-                        Tensor& workspace, cudaStream_t stream);
+void qsa_verifier(const Tensor& x, const Tensor& append_ids, const Tensor& position,
+                  const Tensor& visible_ids, const Tensor& visible_offsets,
+                  const QsaVerifierWeights& weights, QsaStateView state,
+                  Tensor& selected_ids, Tensor& selected_count, Tensor& out,
+                  Tensor& workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops

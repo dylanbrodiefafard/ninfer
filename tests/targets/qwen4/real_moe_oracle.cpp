@@ -725,6 +725,7 @@ int run_moe_cell(const verifier::LoadedModel& model, ninfer::DeviceContext& devi
         .pinned_stage_bytes = ops::kQwen4SparseMoePipelineStageBytes,
         .device_stage = stage,
         .transfer_stream = events.transfer_stream,
+        .compute_stream = device.stream,
         .route_ready = events.route_ready,
         .ids_ready = events.ids_ready,
         .transfer_ready = {events.transfer_ready[0], events.transfer_ready[1]},

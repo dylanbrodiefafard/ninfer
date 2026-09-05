@@ -25,9 +25,10 @@ struct GatedDeltaNetLayerWeights {
 
 /**
  * Returns caller-owned transient capacity for the registered H=2560, Hq=16, Hv=48, Dh=128,
- * C=1/T=1 verifier profile.
+ * C=1/T<=max_tokens profile.
  */
-[[nodiscard]] std::size_t gated_delta_net_layer_workspace_capacity_bytes();
+[[nodiscard]] std::size_t
+gated_delta_net_layer_workspace_capacity_bytes(std::int32_t max_tokens = 1);
 
 /**
  * Op: gated_delta_net_layer
@@ -42,11 +43,12 @@ struct GatedDeltaNetLayerWeights {
  * is plain-RMS-normalized with epsilon 1e-6,
  * multiplied by sigmoid(z), represented as BF16, and projected to BF16 width 2560.
  *
- * x/out are contiguous BF16 [2560]. conv_state_in/out are BF16 [10240,3], storing the last three
+ * x/out are contiguous BF16 [2560,T]. conv_state_in/out are BF16 [10240,3], storing the last three
  * raw projected qkv columns in oldest-to-newest order. ssm_state_in/out are FP32 [128,128,48].
  * State outputs may exactly alias their corresponding inputs or be disjoint; partial overlap is
  * forbidden. Distinct inputs are read-only, which is the rollback boundary used by a caller. The
- * entry admits only C=1/T=1; repeated calls implement continuation without owning scheduling.
+ * entry admits C=1 and T in [1,4096]; repeated calls and arbitrarily partitioned panels implement
+ * the same continuation without owning scheduling. T=1 retains the verifier decode route.
  *
  * The mathematical oracle exact-decodes represented inputs/weights and evaluates each closed
  * formula naively in FP64. It applies the declared consumer representations between formulas:

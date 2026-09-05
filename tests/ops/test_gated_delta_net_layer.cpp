@@ -506,15 +506,12 @@ int run_complete_case(Fixture& fixture, std::int32_t tokens, const char* label) 
     round_to_bf16(input);
     round_to_bf16(initial_conv);
     const OracleResult expected = oracle(fixture, input, initial_conv, initial_ssm, tokens);
-    const OracleResult expected_first = oracle(fixture,
-        std::vector<float>(input.begin(), input.begin() + kHidden), initial_conv, initial_ssm, 1);
-
     DeviceBuffer d_input      = to_device_bf16(input);
     DeviceBuffer d_conv_in    = to_device_bf16(initial_conv);
     DeviceBuffer d_ssm_in     = to_device_f32(initial_ssm);
     GuardedDeviceBuffer d_conv_out(initial_conv.size() * 2);
     GuardedDeviceBuffer d_ssm_out(initial_ssm.size() * sizeof(float));
-    GuardedDeviceBuffer d_output(static_cast<std::size_t>(kHidden) * 2);
+    GuardedDeviceBuffer d_output(static_cast<std::size_t>(kHidden) * tokens * 2);
     d_conv_out.fill(0xff);
     d_ssm_out.fill(0xff);
     d_output.fill(0xff);
@@ -523,27 +520,26 @@ int run_complete_case(Fixture& fixture, std::int32_t tokens, const char* label) 
     Tensor conv_out(d_conv_out.data(), DType::BF16, {kQkvRows, 3});
     Tensor ssm_in(d_ssm_in.p, DType::FP32, {kHeadDim, kHeadDim, kValueHeads});
     Tensor ssm_out(d_ssm_out.data(), DType::FP32, {kHeadDim, kHeadDim, kValueHeads});
-    Tensor output(d_output.data(), DType::BF16, {kHidden});
+    Tensor output(d_output.data(), DType::BF16, {kHidden, tokens});
     auto weights = fixture.views();
-    const std::size_t full_bytes = ops::gated_delta_net_layer_workspace_capacity_bytes();
+    const std::size_t full_bytes = ops::gated_delta_net_layer_workspace_capacity_bytes(tokens);
     WorkspaceArena full_workspace(full_bytes);
-    Tensor x_first = x.slice(1, 0, 1);
-    ops::gated_delta_net_layer(x_first, weights, conv_in, conv_out, ssm_in, ssm_out, output,
+    ops::gated_delta_net_layer(x, weights, conv_in, conv_out, ssm_in, ssm_out, output,
                                full_workspace, nullptr);
     cuda_synchronize();
 
-    int failures = verify_reduction(std::string(label) + " distinct output",
-                                    from_device_bf16(d_output.data(), kHidden),
-                                    expected_first.output, kOutputCriterion);
+    int failures = verify_reduction(std::string(label) + " panel output",
+                                    from_device_bf16(d_output.data(), expected.output.size()),
+                                    expected.output, kOutputCriterion);
     failures += verify_reduction(std::string(label) + " distinct conv state",
                                  from_device_bf16(d_conv_out.data(), initial_conv.size()),
-                                 expected_first.conv_state, kConvStateCriterion);
+                                 expected.conv_state, kConvStateCriterion);
     std::vector<double> actual_ssm(initial_ssm.size());
     const std::vector<float> actual_ssm_f32 =
         from_device<float>(d_ssm_out.data(), initial_ssm.size());
     std::copy(actual_ssm_f32.begin(), actual_ssm_f32.end(), actual_ssm.begin());
     failures += verify_reduction(std::string(label) + " distinct SSM state", actual_ssm,
-                                 expected_first.ssm_state,
+                                 expected.ssm_state,
                                  kStateCriterion);
     const std::string rollback_conv_label = std::string(label) + " rollback conv input";
     const std::string rollback_ssm_label = std::string(label) + " rollback SSM input";
@@ -595,6 +591,93 @@ int run_complete_case(Fixture& fixture, std::int32_t tokens, const char* label) 
     return failures;
 }
 
+int run_partition_case(Fixture& fixture, std::int32_t tokens,
+                       std::initializer_list<std::int32_t> chunks, const char* label) {
+    std::int32_t total = 0;
+    std::int32_t maximum_chunk = 0;
+    for (const std::int32_t chunk : chunks) {
+        total += chunk;
+        maximum_chunk = std::max(maximum_chunk, chunk);
+    }
+    if (total != tokens || maximum_chunk <= 0) {
+        std::cerr << "FAIL invalid GDN layer partition fixture\n";
+        return 1;
+    }
+
+    std::vector<float> input(static_cast<std::size_t>(kHidden) * tokens);
+    std::vector<float> initial_conv(static_cast<std::size_t>(kQkvRows) * 3);
+    std::vector<float> initial_ssm(static_cast<std::size_t>(kHeadDim) * kHeadDim * kValueHeads);
+    fill_uniform(input, 9100U + tokens, -0.20F, 0.20F);
+    fill_uniform(initial_conv, 9200U + tokens, -0.05F, 0.05F);
+    fill_uniform(initial_ssm, 9300U + tokens, -0.002F, 0.002F);
+    round_to_bf16(input);
+    round_to_bf16(initial_conv);
+
+    DeviceBuffer d_input = to_device_bf16(input);
+    DeviceBuffer full_conv = to_device_bf16(initial_conv);
+    DeviceBuffer full_ssm = to_device_f32(initial_ssm);
+    GuardedDeviceBuffer full_output(input.size() * sizeof(std::uint16_t));
+    DeviceBuffer partition_conv = to_device_bf16(initial_conv);
+    DeviceBuffer partition_ssm = to_device_f32(initial_ssm);
+    GuardedDeviceBuffer partition_output(input.size() * sizeof(std::uint16_t));
+    full_output.fill(0xff);
+    partition_output.fill(0xff);
+
+    Tensor x(d_input.p, DType::BF16, {kHidden, tokens});
+    Tensor full_conv_t(full_conv.p, DType::BF16, {kQkvRows, 3});
+    Tensor full_ssm_t(full_ssm.p, DType::FP32, {kHeadDim, kHeadDim, kValueHeads});
+    Tensor full_output_t(full_output.data(), DType::BF16, {kHidden, tokens});
+    Tensor partition_conv_t(partition_conv.p, DType::BF16, {kQkvRows, 3});
+    Tensor partition_ssm_t(partition_ssm.p, DType::FP32, {kHeadDim, kHeadDim, kValueHeads});
+    Tensor partition_output_t(partition_output.data(), DType::BF16, {kHidden, tokens});
+    auto weights = fixture.views();
+
+    const std::size_t full_bytes = ops::gated_delta_net_layer_workspace_capacity_bytes(tokens);
+    WorkspaceArena full_workspace(full_bytes);
+    ops::gated_delta_net_layer(x, weights, full_conv_t, full_conv_t, full_ssm_t, full_ssm_t,
+                               full_output_t, full_workspace, nullptr);
+
+    const std::size_t partition_bytes =
+        ops::gated_delta_net_layer_workspace_capacity_bytes(maximum_chunk);
+    WorkspaceArena partition_workspace(partition_bytes);
+    std::int32_t offset = 0;
+    for (const std::int32_t chunk : chunks) {
+        Tensor x_chunk = x.slice(1, offset, chunk);
+        Tensor output_chunk = partition_output_t.slice(1, offset, chunk);
+        ops::gated_delta_net_layer(x_chunk, weights, partition_conv_t, partition_conv_t,
+                                   partition_ssm_t, partition_ssm_t, output_chunk,
+                                   partition_workspace, nullptr);
+        offset += chunk;
+    }
+    cuda_synchronize();
+
+    const std::string prefix = std::string(label) + " T=" + std::to_string(tokens);
+    const auto full_output_values = from_device_bf16(full_output.data(), input.size());
+    const auto partition_output_values = from_device_bf16(partition_output.data(), input.size());
+    std::vector<double> full_reference(full_output_values.begin(), full_output_values.end());
+    int failures = verify_reduction(prefix + " partition output", partition_output_values,
+                                    full_reference, kOutputCriterion);
+    failures += verify_exact((prefix + " partition conv state").c_str(),
+                             from_device<std::uint16_t>(partition_conv, initial_conv.size()),
+                             from_device<std::uint16_t>(full_conv, initial_conv.size()));
+    const auto full_ssm_values = from_device<float>(full_ssm, initial_ssm.size());
+    const auto partition_ssm_values = from_device<float>(partition_ssm, initial_ssm.size());
+    failures += verify_reduction(prefix + " partition SSM state",
+                                 std::vector<double>(partition_ssm_values.begin(),
+                                                     partition_ssm_values.end()),
+                                 std::vector<double>(full_ssm_values.begin(), full_ssm_values.end()),
+                                 kStateCriterion);
+    failures += full_output.verify_guards((prefix + " full output").c_str());
+    failures += partition_output.verify_guards((prefix + " partition output").c_str());
+    if (full_workspace.used() != 0 || full_workspace.peak_used() != full_bytes ||
+        partition_workspace.used() != 0 ||
+        partition_workspace.peak_used() != partition_bytes) {
+        std::cerr << "FAIL " << prefix << " workspace query/high-water mismatch\n";
+        ++failures;
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -602,8 +685,25 @@ int main() {
     Fixture q5_fixture(QType::GGML_Q5_K);
     int failures = conv_source_layout_witness();
     failures += run_complete_case(q5_fixture, kPrompt, "GDN Q5_K/Q6_K");
+    failures += run_partition_case(q5_fixture, 64, {31, 33}, "GDN chunk boundary");
+    failures += run_partition_case(q5_fixture, 65, {64, 1}, "GDN chunk tail");
     Fixture q6_fixture(QType::GGML_Q6_K);
     failures += run_complete_case(q6_fixture, 1, "GDN layer-2 Q6_K/Q6_K");
+    try {
+        const std::size_t broad = ops::gated_delta_net_layer_workspace_capacity_bytes(4096);
+        if (broad <= ops::gated_delta_net_layer_workspace_capacity_bytes(65)) {
+            std::cerr << "FAIL GDN broad workspace capacity\n";
+            ++failures;
+        }
+    } catch (const std::invalid_argument&) {
+        std::cerr << "FAIL GDN rejected T=4096 capacity\n";
+        ++failures;
+    }
+    try {
+        (void)ops::gated_delta_net_layer_workspace_capacity_bytes(4097);
+        std::cerr << "FAIL GDN accepted T=4097 capacity\n";
+        ++failures;
+    } catch (const std::invalid_argument&) {}
     std::cout << (failures ? "FAIL" : "OK") << " gated_delta_net_layer\n";
     return failures == 0 ? 0 : 1;
 }

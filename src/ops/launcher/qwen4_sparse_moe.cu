@@ -232,6 +232,9 @@ void launch_indexed_down_finish(const Tensor& activated, const Weight& expert_ba
 __global__ void router_logits_kernel(const __nv_bfloat16* x, const float* weight,
                                      float* logits) {
     const int expert = static_cast<int>(blockIdx.x);
+    const int token = static_cast<int>(blockIdx.y);
+    x += static_cast<std::int64_t>(token) * kQwen4SparseMoeHidden;
+    logits += static_cast<std::int64_t>(token) * kQwen4SparseMoeExperts;
     float sum = 0.0F;
     const auto* row = weight + static_cast<std::int64_t>(expert) * kQwen4SparseMoeHidden;
     for (int column = static_cast<int>(threadIdx.x); column < kQwen4SparseMoeHidden;
@@ -288,6 +291,9 @@ __global__ void route_kernel(float* logits, std::int32_t* selected_ids,
 
     const int lane = static_cast<int>(threadIdx.x);
     const int peer = lane + kBlock;
+    logits += static_cast<std::int64_t>(blockIdx.x) * kQwen4SparseMoeExperts;
+    selected_ids += static_cast<std::int64_t>(blockIdx.x) * kQwen4SparseMoeTopK;
+    selected_weights += static_cast<std::int64_t>(blockIdx.x) * kQwen4SparseMoeTopK;
     ranking_logits[lane] = logits[lane];
     ranking_logits[peer] = logits[peer];
     __syncthreads();
@@ -433,9 +439,9 @@ __global__ void resident_route_kernel(float* logits, std::int32_t* selected_ids,
 }
 
 __global__ void swiglu_kernel(const __nv_bfloat16* gate, const __nv_bfloat16* up,
-                              __nv_bfloat16* activated) {
+                              __nv_bfloat16* activated, std::int32_t count) {
     const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index >= kQwen4SparseMoeIntermediate) { return; }
+    if (index >= count) { return; }
     activated[index] = __float2bfloat16_rn(
         silu(__bfloat162float(gate[index])) * __bfloat162float(up[index]));
 }
@@ -454,6 +460,8 @@ __global__ void accumulate_kernel(const __nv_bfloat16* expert, const float* sele
 }
 
 __global__ void shared_gate_kernel(const __nv_bfloat16* x, const float* weight, float* output) {
+    const int token = static_cast<int>(blockIdx.x);
+    x += static_cast<std::int64_t>(token) * kQwen4SparseMoeHidden;
     float sum = 0.0F;
     for (int column = static_cast<int>(threadIdx.x); column < kQwen4SparseMoeHidden;
          column += blockDim.x) {
@@ -466,7 +474,7 @@ __global__ void shared_gate_kernel(const __nv_bfloat16* x, const float* weight, 
         if (threadIdx.x < stride) { partial[threadIdx.x] += partial[threadIdx.x + stride]; }
         __syncthreads();
     }
-    if (threadIdx.x == 0) { output[0] = sigmoid(partial[0]); }
+    if (threadIdx.x == 0) { output[token] = sigmoid(partial[0]); }
 }
 
 __global__ void finish_kernel(const float* routed, const __nv_bfloat16* shared,
@@ -475,6 +483,61 @@ __global__ void finish_kernel(const float* routed, const __nv_bfloat16* shared,
     if (index >= kQwen4SparseMoeHidden) { return; }
     destination[index] = __float2bfloat16_rn(
         fmaf(shared_gate[0], __bfloat162float(shared[index]), routed[index]));
+}
+
+__global__ void prefill_gather_kernel(const __nv_bfloat16* x,
+                                      const std::int32_t* occurrence_slots,
+                                      std::int32_t occurrence_offset,
+                                      std::int32_t occurrence_count,
+                                      __nv_bfloat16* gathered) {
+    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t count =
+        static_cast<std::int64_t>(kQwen4SparseMoeHidden) * occurrence_count;
+    if (index >= count) { return; }
+    const int occurrence = static_cast<int>(index / kQwen4SparseMoeHidden);
+    const int column = static_cast<int>(index % kQwen4SparseMoeHidden);
+    const int rank_token = occurrence_slots[occurrence_offset + occurrence];
+    const int token = rank_token / kQwen4SparseMoeTopK;
+    gathered[index] = x[column + static_cast<std::int64_t>(token) * kQwen4SparseMoeHidden];
+}
+
+__global__ void prefill_scatter_kernel(const __nv_bfloat16* expert,
+                                       const std::int32_t* occurrence_slots,
+                                       std::int32_t occurrence_offset,
+                                       std::int32_t occurrence_count,
+                                       __nv_bfloat16* rank_results) {
+    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t count =
+        static_cast<std::int64_t>(kQwen4SparseMoeHidden) * occurrence_count;
+    if (index >= count) { return; }
+    const int occurrence = static_cast<int>(index / kQwen4SparseMoeHidden);
+    const int column = static_cast<int>(index % kQwen4SparseMoeHidden);
+    const int rank_token = occurrence_slots[occurrence_offset + occurrence];
+    rank_results[column + static_cast<std::int64_t>(kQwen4SparseMoeHidden) * rank_token] =
+        expert[index];
+}
+
+__global__ void prefill_finish_kernel(const __nv_bfloat16* rank_results,
+                                      const float* selected_weights,
+                                      const __nv_bfloat16* shared,
+                                      const float* shared_gate,
+                                      __nv_bfloat16* destination, std::int32_t width) {
+    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t count = static_cast<std::int64_t>(kQwen4SparseMoeHidden) * width;
+    if (index >= count) { return; }
+    const int token = static_cast<int>(index / kQwen4SparseMoeHidden);
+    const int column = static_cast<int>(index % kQwen4SparseMoeHidden);
+    float routed = 0.0F;
+#pragma unroll
+    for (int rank = 0; rank < kQwen4SparseMoeTopK; ++rank) {
+        const std::int64_t rank_token = rank + static_cast<std::int64_t>(kQwen4SparseMoeTopK) * token;
+        routed = fmaf(selected_weights[rank_token],
+                      __bfloat162float(rank_results[
+                          column + static_cast<std::int64_t>(kQwen4SparseMoeHidden) * rank_token]),
+                      routed);
+    }
+    destination[index] = __float2bfloat16_rn(
+        fmaf(shared_gate[token], __bfloat162float(shared[index]), routed));
 }
 
 } // namespace
@@ -489,6 +552,20 @@ void qwen4_sparse_moe_route_launch(const Tensor& x, const Weight& router, Tensor
     route_kernel<<<1, kBlock, 0, stream>>>(static_cast<float*>(logits.data),
                                            static_cast<std::int32_t*>(selected_ids.data),
                                            static_cast<float*>(selected_weights.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen4_sparse_moe_prefill_route_launch(const Tensor& x, const Weight& router,
+                                           Tensor& logits, Tensor& selected_ids,
+                                           Tensor& selected_weights, cudaStream_t stream) {
+    const int width = x.ne[1];
+    router_logits_kernel<<<dim3(kQwen4SparseMoeExperts, width), kBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const float*>(router.qdata),
+        static_cast<float*>(logits.data));
+    CUDA_CHECK(cudaGetLastError());
+    route_kernel<<<width, kBlock, 0, stream>>>(static_cast<float*>(logits.data),
+                                               static_cast<std::int32_t*>(selected_ids.data),
+                                               static_cast<float*>(selected_weights.data));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -558,10 +635,41 @@ void qwen4_sparse_moe_indexed_down_finish_launch(
 
 void qwen4_sparse_moe_swiglu_launch(const Tensor& gate, const Tensor& up, Tensor& activated,
                                     cudaStream_t stream) {
-    swiglu_kernel<<<(kQwen4SparseMoeIntermediate + kBlock - 1) / kBlock, kBlock, 0, stream>>>(
+    const std::int32_t count = static_cast<std::int32_t>(gate.numel());
+    swiglu_kernel<<<(count + kBlock - 1) / kBlock, kBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(gate.data),
         static_cast<const __nv_bfloat16*>(up.data),
-        static_cast<__nv_bfloat16*>(activated.data));
+        static_cast<__nv_bfloat16*>(activated.data), count);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen4_sparse_moe_prefill_gather_launch(const Tensor& x,
+                                            const Tensor& occurrence_slots,
+                                            std::int32_t occurrence_offset,
+                                            std::int32_t occurrence_count, Tensor& gathered,
+                                            cudaStream_t stream) {
+    const std::int64_t count =
+        static_cast<std::int64_t>(kQwen4SparseMoeHidden) * occurrence_count;
+    prefill_gather_kernel<<<static_cast<unsigned>((count + kBlock - 1) / kBlock), kBlock, 0,
+                            stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const std::int32_t*>(occurrence_slots.data), occurrence_offset,
+        occurrence_count, static_cast<__nv_bfloat16*>(gathered.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen4_sparse_moe_prefill_scatter_launch(const Tensor& expert,
+                                             const Tensor& occurrence_slots,
+                                             std::int32_t occurrence_offset,
+                                             std::int32_t occurrence_count,
+                                             Tensor& rank_results, cudaStream_t stream) {
+    const std::int64_t count =
+        static_cast<std::int64_t>(kQwen4SparseMoeHidden) * occurrence_count;
+    prefill_scatter_kernel<<<static_cast<unsigned>((count + kBlock - 1) / kBlock), kBlock, 0,
+                             stream>>>(
+        static_cast<const __nv_bfloat16*>(expert.data),
+        static_cast<const std::int32_t*>(occurrence_slots.data), occurrence_offset,
+        occurrence_count, static_cast<__nv_bfloat16*>(rank_results.data));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -582,9 +690,26 @@ void qwen4_sparse_moe_accumulate_launch(const Tensor& expert, const Tensor& sele
 
 void qwen4_sparse_moe_shared_gate_launch(const Tensor& x, const Tensor& shared_gate,
                                          Tensor& gate_value, cudaStream_t stream) {
-    shared_gate_kernel<<<1, kBlock, 0, stream>>>(
+    shared_gate_kernel<<<x.ne[1], kBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data),
         static_cast<const float*>(shared_gate.data), static_cast<float*>(gate_value.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen4_sparse_moe_prefill_finish_launch(const Tensor& rank_results,
+                                            const Tensor& selected_weights,
+                                            const Tensor& shared,
+                                            const Tensor& shared_gate_value,
+                                            Tensor& destination, cudaStream_t stream) {
+    const std::int64_t count =
+        static_cast<std::int64_t>(kQwen4SparseMoeHidden) * destination.ne[1];
+    prefill_finish_kernel<<<static_cast<unsigned>((count + kBlock - 1) / kBlock), kBlock, 0,
+                            stream>>>(
+        static_cast<const __nv_bfloat16*>(rank_results.data),
+        static_cast<const float*>(selected_weights.data),
+        static_cast<const __nv_bfloat16*>(shared.data),
+        static_cast<const float*>(shared_gate_value.data),
+        static_cast<__nv_bfloat16*>(destination.data), destination.ne[1]);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -203,4 +203,70 @@ __global__ void ggml_block_linear_kernel(const __nv_bfloat16* x, const std::uint
     }
 }
 
+inline constexpr int kGgmlBlockLinearAggregateTokens = 16;
+
+template <QType Format>
+__global__ void ggml_block_linear_aggregate_kernel(const __nv_bfloat16* x,
+                                                   const std::uint8_t* weights,
+                                                   __nv_bfloat16* out, std::int32_t n,
+                                                   std::int32_t k, std::int32_t tokens,
+                                                   std::uint64_t row_bytes) {
+    using Decoder = GgmlDecoder<Format>;
+    const int token_base = static_cast<int>(blockIdx.y) * kGgmlBlockLinearAggregateTokens;
+    const int tile_tokens = tokens - token_base < kGgmlBlockLinearAggregateTokens
+                                ? tokens - token_base
+                                : kGgmlBlockLinearAggregateTokens;
+    const auto* row = weights + static_cast<std::uint64_t>(blockIdx.x) * row_bytes;
+    float partial[kGgmlBlockLinearAggregateTokens]{};
+    for (int column = threadIdx.x; column < k; column += blockDim.x) {
+        const int block_index = column / Decoder::block_values;
+        const int block_item  = column % Decoder::block_values;
+        const float weight =
+            Decoder::value(row + static_cast<std::uint64_t>(block_index) * Decoder::block_bytes,
+                           block_item);
+#pragma unroll
+        for (int token = 0; token < kGgmlBlockLinearAggregateTokens; ++token) {
+            if (token < tile_tokens) {
+                partial[token] =
+                    fmaf(weight,
+                         __bfloat162float(
+                             x[column + static_cast<std::int64_t>(k) * (token_base + token)]),
+                         partial[token]);
+            }
+        }
+    }
+
+    constexpr unsigned full_warp = 0xffffffffU;
+#pragma unroll
+    for (int token = 0; token < kGgmlBlockLinearAggregateTokens; ++token) {
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            partial[token] += __shfl_down_sync(full_warp, partial[token], offset);
+        }
+    }
+
+    __shared__ float warp_sums[kGgmlBlockLinearAggregateTokens][8];
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    if (lane == 0) {
+#pragma unroll
+        for (int token = 0; token < kGgmlBlockLinearAggregateTokens; ++token) {
+            warp_sums[token][warp] = partial[token];
+        }
+    }
+    __syncthreads();
+    if (warp == 0) {
+#pragma unroll
+        for (int token = 0; token < kGgmlBlockLinearAggregateTokens; ++token) {
+            float total = lane < 8 ? warp_sums[token][lane] : 0.0F;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                total += __shfl_down_sync(full_warp, total, offset);
+            }
+            if (lane == 0 && token < tile_tokens) {
+                out[blockIdx.x + static_cast<std::int64_t>(n) * (token_base + token)] =
+                    __float2bfloat16_rn(total);
+            }
+        }
+    }
+}
+
 } // namespace ninfer::ops::detail

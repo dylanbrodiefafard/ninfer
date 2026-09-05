@@ -10,10 +10,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
-#include <utility>
-#include <vector>
 
 namespace ninfer::ops {
 namespace {
@@ -40,19 +39,19 @@ struct Scratch {
 };
 
 template <class Allocator>
-Scratch allocate_scratch(Allocator& allocator) {
+Scratch allocate_scratch(Allocator& allocator, std::int32_t tokens) {
     const std::size_t recurrence_bytes =
-        gated_delta_net_workspace_capacity_bytes(kValueHeads, kValueHeads, true, 1, 1);
+        gated_delta_net_workspace_capacity_bytes(kValueHeads, kValueHeads, true, 1, tokens);
     Scratch scratch{
-        allocator.alloc(DType::BF16, {kQkvRows}),
-        allocator.alloc(DType::BF16, {kHeadDim, kValueHeads, 1}),
-        allocator.alloc(DType::BF16, {kHeadDim, kValueHeads, 1}),
-        allocator.alloc(DType::BF16, {kHeadDim, kValueHeads, 1}),
-        allocator.alloc(DType::BF16, {kValueRows}),
-        allocator.alloc(DType::FP32, {kValueHeads}),
-        allocator.alloc(DType::FP32, {kValueHeads}),
-        allocator.alloc(DType::BF16, {kHeadDim, kValueHeads, 1}),
-        allocator.alloc(DType::BF16, {kValueRows}),
+        allocator.alloc(DType::BF16, {kQkvRows, tokens}),
+        allocator.alloc(DType::BF16, {kHeadDim, kValueHeads, tokens}),
+        allocator.alloc(DType::BF16, {kHeadDim, kValueHeads, tokens}),
+        allocator.alloc(DType::BF16, {kHeadDim, kValueHeads, tokens}),
+        allocator.alloc(DType::BF16, {kValueRows, tokens}),
+        allocator.alloc(DType::FP32, {kValueHeads, tokens}),
+        allocator.alloc(DType::FP32, {kValueHeads, tokens}),
+        allocator.alloc(DType::BF16, {kHeadDim, kValueHeads, tokens}),
+        allocator.alloc(DType::BF16, {kValueRows, tokens}),
         {},
     };
     if (recurrence_bytes != 0) { scratch.recurrence = allocator.alloc_bytes(recurrence_bytes); }
@@ -97,30 +96,30 @@ void require_ggml_weight(const Weight& weight, std::int32_t rows, std::int32_t c
 struct AddressRange {
     std::uintptr_t begin;
     std::uintptr_t end;
-    std::string name;
+    const char* name;
 };
 
-AddressRange address_range(const void* pointer, std::size_t bytes, std::string name) {
+AddressRange address_range(const void* pointer, std::size_t bytes, const char* name) {
     if (pointer == nullptr || bytes == 0) {
-        throw std::invalid_argument("gated_delta_net_layer: empty " + name);
+        throw std::invalid_argument(std::string("gated_delta_net_layer: empty ") + name);
     }
     const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(pointer);
     if (bytes > std::numeric_limits<std::uintptr_t>::max() - begin) {
         throw std::overflow_error("gated_delta_net_layer: address range overflow");
     }
-    return {begin, begin + bytes, std::move(name)};
+    return {begin, begin + bytes, name};
 }
 
 bool overlaps(const AddressRange& left, const AddressRange& right) {
     return left.begin < right.end && right.begin < left.end;
 }
 
-void require_disjoint(const std::vector<AddressRange>& ranges) {
+void require_disjoint(std::span<const AddressRange> ranges) {
     for (std::size_t i = 0; i < ranges.size(); ++i) {
         for (std::size_t j = i + 1; j < ranges.size(); ++j) {
             if (overlaps(ranges[i], ranges[j])) {
-                throw std::invalid_argument("gated_delta_net_layer: " + ranges[i].name +
-                                            " overlaps " + ranges[j].name);
+                throw std::invalid_argument(std::string("gated_delta_net_layer: ") +
+                                            ranges[i].name + " overlaps " + ranges[j].name);
             }
         }
     }
@@ -130,21 +129,31 @@ bool exact_alias(const Tensor& input, const Tensor& output) {
     return input.data == output.data && input.bytes() == output.bytes();
 }
 
-std::size_t required_workspace() {
+std::size_t required_workspace(std::int32_t tokens) {
     WorkspaceLayoutBuilder layout;
-    (void)allocate_scratch(layout);
+    (void)allocate_scratch(layout, tokens);
     return layout.peak_bytes();
 }
 
 } // namespace
 
-std::size_t gated_delta_net_layer_workspace_capacity_bytes() { return required_workspace(); }
+std::size_t gated_delta_net_layer_workspace_capacity_bytes(std::int32_t max_tokens) {
+    if (max_tokens <= 0 || max_tokens > 4096) {
+        throw std::invalid_argument(
+            "gated_delta_net_layer_workspace_capacity_bytes: max_tokens must be in [1,4096]");
+    }
+    return required_workspace(max_tokens);
+}
 
 void gated_delta_net_layer(const Tensor& x, const GatedDeltaNetLayerWeights& weights,
                            const Tensor& conv_state_in, Tensor& conv_state_out,
                            const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
                            WorkspaceArena& workspace, cudaStream_t stream) {
-    require_tensor(x, DType::BF16, {kHidden, 1, 1, 1}, "x");
+    const std::int32_t tokens = x.ne[1];
+    if (tokens <= 0 || tokens > 4096) {
+        throw std::invalid_argument("gated_delta_net_layer: T must be in [1,4096]");
+    }
+    require_tensor(x, DType::BF16, {kHidden, tokens, 1, 1}, "x");
     require_ggml_weight(weights.qkv, kQkvRows, kHidden, true, "qkv weight");
     require_ggml_weight(weights.z, kValueRows, kHidden, true, "z weight");
     if (weights.z.qtype != weights.qkv.qtype) {
@@ -163,7 +172,7 @@ void gated_delta_net_layer(const Tensor& x, const GatedDeltaNetLayerWeights& wei
                    "ssm_state_in");
     require_tensor(ssm_state_out, DType::FP32, {kHeadDim, kHeadDim, kValueHeads, 1},
                    "ssm_state_out");
-    require_tensor(out, DType::BF16, {kHidden, 1, 1, 1}, "out");
+    require_tensor(out, DType::BF16, {kHidden, tokens, 1, 1}, "out");
 
     const bool conv_alias = exact_alias(conv_state_in, conv_state_out);
     const bool ssm_alias = exact_alias(ssm_state_in, ssm_state_out);
@@ -175,33 +184,38 @@ void gated_delta_net_layer(const Tensor& x, const GatedDeltaNetLayerWeights& wei
         throw std::invalid_argument("gated_delta_net_layer: state overlap must be exact");
     }
 
-    const std::size_t required = required_workspace();
+    const std::size_t required = required_workspace(tokens);
     if (workspace.base() == nullptr || workspace.capacity() < required ||
         workspace.used() > workspace.capacity() - required) {
         throw std::invalid_argument("gated_delta_net_layer: insufficient workspace");
     }
-    std::vector<AddressRange> ranges{
-        address_range(x.data, x.bytes(), "x"),
-        address_range(weights.qkv.payload, weights.qkv.payload_bytes, "qkv weight"),
-        address_range(weights.z.payload, weights.z.payload_bytes, "z weight"),
-        address_range(weights.a.data, weights.a.bytes(), "a weight"),
-        address_range(weights.b.data, weights.b.bytes(), "b weight"),
-        address_range(weights.conv.data, weights.conv.bytes(), "conv weight"),
-        address_range(weights.ssm_a.data, weights.ssm_a.bytes(), "ssm_a"),
-        address_range(weights.dt_bias.data, weights.dt_bias.bytes(), "dt_bias"),
-        address_range(weights.norm.data, weights.norm.bytes(), "norm weight"),
-        address_range(weights.output.payload, weights.output.payload_bytes, "output weight"),
-        conv_in,
-        ssm_in,
-        address_range(out.data, out.bytes(), "out"),
-        address_range(workspace.base(), workspace.capacity(), "workspace"),
-    };
-    if (!conv_alias) { ranges.push_back(conv_out); }
-    if (!ssm_alias) { ranges.push_back(ssm_out); }
-    require_disjoint(ranges);
+    std::array<AddressRange, 16> ranges{};
+    std::size_t range_count = 0;
+    ranges[range_count++] = address_range(x.data, x.bytes(), "x");
+    ranges[range_count++] =
+        address_range(weights.qkv.payload, weights.qkv.payload_bytes, "qkv weight");
+    ranges[range_count++] =
+        address_range(weights.z.payload, weights.z.payload_bytes, "z weight");
+    ranges[range_count++] = address_range(weights.a.data, weights.a.bytes(), "a weight");
+    ranges[range_count++] = address_range(weights.b.data, weights.b.bytes(), "b weight");
+    ranges[range_count++] = address_range(weights.conv.data, weights.conv.bytes(), "conv weight");
+    ranges[range_count++] = address_range(weights.ssm_a.data, weights.ssm_a.bytes(), "ssm_a");
+    ranges[range_count++] =
+        address_range(weights.dt_bias.data, weights.dt_bias.bytes(), "dt_bias");
+    ranges[range_count++] = address_range(weights.norm.data, weights.norm.bytes(), "norm weight");
+    ranges[range_count++] =
+        address_range(weights.output.payload, weights.output.payload_bytes, "output weight");
+    ranges[range_count++] = conv_in;
+    ranges[range_count++] = ssm_in;
+    ranges[range_count++] = address_range(out.data, out.bytes(), "out");
+    ranges[range_count++] =
+        address_range(workspace.base(), workspace.capacity(), "workspace");
+    if (!conv_alias) { ranges[range_count++] = conv_out; }
+    if (!ssm_alias) { ranges[range_count++] = ssm_out; }
+    require_disjoint(std::span<const AddressRange>(ranges.data(), range_count));
 
     auto scope = workspace.scope();
-    Scratch scratch = allocate_scratch(workspace);
+    Scratch scratch = allocate_scratch(workspace, tokens);
     ggml_block_linear(x, weights.qkv, scratch.projected_qkv, stream);
     ggml_block_linear(x, weights.z, scratch.z, stream);
     detail::gated_delta_net_layer_control_launch(x, weights.a, weights.b, weights.ssm_a,

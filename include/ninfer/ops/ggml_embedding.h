@@ -19,4 +19,15 @@ namespace ninfer::ops {
 void ggml_q4_k_embedding_row(const Weight& weight, std::int32_t token_id, Tensor& out,
                              cudaStream_t stream);
 
+/**
+ * Decode T rows of the same preview Q4_K token embedding.
+ *
+ * `token_ids` is contiguous device I32 `[T]`, `out` is contiguous BF16 `[2560,T]`, and T is in
+ * [1,4096]. Every token id is promised by the caller to be in `[0,weight.n)`. Each represented
+ * output is the exact selected stored value rounded once to BF16. The operation performs no host
+ * floating-point work, allocation, or persistent mutation. Output may not overlap ids or weight.
+ */
+void ggml_q4_k_embedding(const Weight& weight, const Tensor& token_ids, Tensor& out,
+                         cudaStream_t stream);
+
 } // namespace ninfer::ops

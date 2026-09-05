@@ -240,10 +240,13 @@ std::vector<std::uint8_t> make_row(const FormatSpec& format, std::int32_t k,
     return row;
 }
 
-std::vector<float> make_input(std::int32_t k) {
-    std::vector<float> x(static_cast<std::size_t>(k));
-    for (std::int32_t i = 0; i < k; ++i) {
-        x[static_cast<std::size_t>(i)] = static_cast<float>((i * 17) % 61 - 30) / 64.0F;
+std::vector<float> make_input(std::int32_t k, std::int32_t tokens) {
+    std::vector<float> x(static_cast<std::size_t>(k) * static_cast<std::size_t>(tokens));
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        for (std::int32_t i = 0; i < k; ++i) {
+            x[static_cast<std::size_t>(token) * k + i] =
+                static_cast<float>((i * 17 + token * 23 + (i * token) % 29) % 61 - 30) / 64.0F;
+        }
     }
     round_to_bf16(x);
     return x;
@@ -255,15 +258,16 @@ struct OracleDot {
 };
 
 OracleDot oracle_dot(const FormatSpec& format, const std::vector<std::uint8_t>& row,
-                     const std::vector<float>& x) {
+                     const std::vector<float>& x, std::int32_t token, std::int32_t k) {
     OracleDot result;
     const std::size_t blocks = row.size() / static_cast<std::size_t>(format.block_bytes);
     for (std::size_t block = 0; block < blocks; ++block) {
         const auto values = oracle_decode_block(
             format, row.data() + block * static_cast<std::size_t>(format.block_bytes));
         for (std::size_t item = 0; item < values.size(); ++item) {
-            const double product = values[item] *
-                                   static_cast<double>(x[block * values.size() + item]);
+            const std::size_t column = block * values.size() + item;
+            const double product =
+                values[item] * static_cast<double>(x[static_cast<std::size_t>(token) * k + column]);
             result.value += product;
             result.absolute_sum += std::abs(product);
         }
@@ -303,8 +307,8 @@ Weight make_weight(void* payload, std::size_t bytes, const FormatSpec& format, s
     return weight;
 }
 
-int run_case(const FormatSpec& format, std::int32_t n, std::int32_t k, bool repeat_row,
-             cudaStream_t stream, const char* profile) {
+int run_case(const FormatSpec& format, std::int32_t n, std::int32_t k,
+             std::int32_t tokens, bool repeat_row, cudaStream_t stream, const char* profile) {
     const auto first_row = make_row(format, k, 0x51a6U + static_cast<unsigned>(format.qtype));
     std::vector<std::uint8_t> payload(first_row.size() * static_cast<std::size_t>(n));
     for (std::int32_t row = 0; row < n; ++row) {
@@ -315,41 +319,53 @@ int run_case(const FormatSpec& format, std::int32_t n, std::int32_t k, bool repe
         std::copy(generated.begin(), generated.end(),
                   payload.begin() + static_cast<std::size_t>(row) * first_row.size());
     }
-    const auto x = make_input(k);
-    const OracleDot first_oracle = oracle_dot(format, first_row, x);
+    const auto x = make_input(k, tokens);
+    std::vector<OracleDot> first_oracles(static_cast<std::size_t>(tokens));
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        first_oracles[static_cast<std::size_t>(token)] =
+            oracle_dot(format, first_row, x, token, k);
+    }
 
     DeviceBuffer device_payload = to_device(payload);
     DeviceBuffer device_x       = to_device_bf16(x);
-    GuardedDeviceBuffer device_out(static_cast<std::size_t>(n) * sizeof(std::uint16_t));
+    const std::size_t output_count =
+        static_cast<std::size_t>(n) * static_cast<std::size_t>(tokens);
+    GuardedDeviceBuffer device_out(output_count * sizeof(std::uint16_t));
     device_out.fill(0xcd);
     // GuardedDeviceBuffer initializes on the default stream. Finish test setup before launching
     // the Op on an intentionally nonblocking stream.
     cuda_synchronize();
-    Tensor x_tensor(device_x.p, DType::BF16, {k});
-    Tensor out_tensor(device_out.data(), DType::BF16, {n});
+    Tensor x_tensor(device_x.p, DType::BF16, {k, tokens});
+    Tensor out_tensor(device_out.data(), DType::BF16, {n, tokens});
     Weight weight = make_weight(device_payload.p, payload.size(), format, n, k);
     ops::ggml_block_linear(x_tensor, weight, out_tensor, stream);
     cuda_synchronize(stream);
 
-    const auto actual = from_device_bf16(device_out.data(), static_cast<std::size_t>(n));
+    const auto actual = from_device_bf16(device_out.data(), output_count);
     double maximum_ratio = 0.0;
-    for (std::int32_t row = 0; row < n; ++row) {
-        const OracleDot expected =
-            repeat_row
-                ? first_oracle
-                : oracle_dot(format,
-                             std::vector<std::uint8_t>(
-                                 payload.begin() + static_cast<std::size_t>(row) * first_row.size(),
-                                 payload.begin() +
-                                     static_cast<std::size_t>(row + 1) * first_row.size()),
-                             x);
-        const double limit = error_bound(format, k, expected);
-        const double error = std::abs(actual[static_cast<std::size_t>(row)] - expected.value);
-        maximum_ratio = std::max(maximum_ratio, error / limit);
-        if (!std::isfinite(actual[static_cast<std::size_t>(row)]) || error > limit) {
-            std::cerr << format.name << ' ' << profile << " row " << row << " error=" << error
-                      << " bound=" << limit << " reference=" << expected.value << '\n';
-            return 1;
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        for (std::int32_t row = 0; row < n; ++row) {
+            const OracleDot expected =
+                repeat_row
+                    ? first_oracles[static_cast<std::size_t>(token)]
+                    : oracle_dot(
+                          format,
+                          std::vector<std::uint8_t>(
+                              payload.begin() + static_cast<std::size_t>(row) * first_row.size(),
+                              payload.begin() +
+                                  static_cast<std::size_t>(row + 1) * first_row.size()),
+                          x, token, k);
+            const std::size_t index =
+                static_cast<std::size_t>(token) * static_cast<std::size_t>(n) + row;
+            const double limit = error_bound(format, k, expected);
+            const double error = std::abs(actual[index] - expected.value);
+            maximum_ratio = std::max(maximum_ratio, error / limit);
+            if (!std::isfinite(actual[index]) || error > limit) {
+                std::cerr << format.name << ' ' << profile << " row " << row << " token "
+                          << token << " error=" << error << " bound=" << limit
+                          << " reference=" << expected.value << '\n';
+                return 1;
+            }
         }
     }
     if (error_stats_enabled()) {
@@ -379,12 +395,12 @@ int validation_cases() {
     for (std::int32_t row = 0; row < n; ++row) {
         std::copy(payload.begin(), payload.end(), rows.begin() + row * payload.size());
     }
-    auto x = make_input(k);
+    auto x = make_input(k, 2);
     DeviceBuffer device_payload = to_device(rows);
     DeviceBuffer device_x       = to_device_bf16(x);
-    DeviceBuffer device_out(static_cast<std::size_t>(n) * sizeof(std::uint16_t));
-    Tensor x_tensor(device_x.p, DType::BF16, {k});
-    Tensor out_tensor(device_out.p, DType::BF16, {n});
+    DeviceBuffer device_out(static_cast<std::size_t>(n) * 2 * sizeof(std::uint16_t));
+    Tensor x_tensor(device_x.p, DType::BF16, {k, 2});
+    Tensor out_tensor(device_out.p, DType::BF16, {n, 2});
     const Weight valid = make_weight(device_payload.p, rows.size(), format, n, k);
     int failures = 0;
 
@@ -400,9 +416,22 @@ int validation_cases() {
     wrong.ndim = 3;
     failures += expect_invalid(
         [&] { ops::ggml_block_linear(x_tensor, wrong, out_tensor, nullptr); }, "rank-three bank");
-    Tensor aliased_out(device_x.p, DType::BF16, {n});
+    Tensor aliased_out(device_x.p, DType::BF16, {n, 2});
     failures += expect_invalid(
         [&] { ops::ggml_block_linear(x_tensor, valid, aliased_out, nullptr); }, "output alias");
+    Tensor wrong_tokens_out(device_out.p, DType::BF16, {n});
+    failures += expect_invalid(
+        [&] { ops::ggml_block_linear(x_tensor, valid, wrong_tokens_out, nullptr); },
+        "output token mismatch");
+    Tensor too_wide_x(device_x.p, DType::BF16, {k, 4097});
+    failures += expect_invalid(
+        [&] { ops::ggml_block_linear(too_wide_x, valid, out_tensor, nullptr); },
+        "T above verifier ceiling");
+    Tensor empty_x = x_tensor;
+    empty_x.ne[1] = 0;
+    failures += expect_invalid(
+        [&] { ops::ggml_block_linear(empty_x, valid, out_tensor, nullptr); },
+        "zero-token input");
     Weight unsupported = valid;
     unsupported.qtype  = QType::NVFP4;
     failures += expect_invalid(
@@ -420,11 +449,21 @@ int main() {
         cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
         int failures = validation_cases();
         for (const auto& format : kFormats) {
-            failures += run_case(format, 3, 2 * format.block_values, false, stream,
-                                 "representative");
-            failures += run_case(format, format.real_n, format.real_k, true, stream, "real-shape");
+            failures += run_case(format, 3, 2 * format.block_values, 1, false, stream,
+                                 "representative-t1");
+            failures += run_case(format, 3, 2 * format.block_values, 16, false, stream,
+                                 "aggregate-t16");
+            failures += run_case(format, 3, 2 * format.block_values, 17, false, stream,
+                                 "aggregate-tail-t17");
+            failures +=
+                run_case(format, format.real_n, format.real_k, 1, true, stream, "real-shape-t1");
         }
-        failures += run_case(kFormats[2], 3, 6144, false, stream, "q5-output-projection-k");
+        failures += run_case(kFormats[2], 3, 6144, 1, false, stream,
+                             "q5-output-projection-k");
+        failures += run_case(kFormats[2], 3, 512, 128, false, stream,
+                             "aggregate-t128");
+        failures += run_case(kFormats[0], 1, 32, 4096, true, stream,
+                             "aggregate-t4096");
         cuda_check(cudaStreamDestroy(stream), "cudaStreamDestroy");
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
