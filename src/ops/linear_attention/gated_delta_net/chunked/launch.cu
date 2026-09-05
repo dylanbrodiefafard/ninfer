@@ -60,11 +60,12 @@ std::size_t chunked_workspace_bytes(std::int32_t value_heads, std::int32_t token
     return chunked::workspace_bytes(value_heads, tokens);
 }
 
-void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                    const Tensor& beta, float scale, bool normalize_q, const Tensor& ssm_state_in,
-                    Tensor& ssm_state_out, Tensor& out, void* workspace,
-                    std::size_t workspace_bytes, cudaStream_t stream) {
-    const auto layout = chunked::compute_workspace_layout(v.ne[1], q.ne[2], k.dtype);
+void launch_chunked(const Tensor& q, const Tensor& raw_k, const Tensor& private_k, const Tensor& v,
+                    const Tensor& g, const Tensor& beta, float scale, bool normalize_q,
+                    bool normalize_k_in_prepare, const Tensor& ssm_state_in, Tensor& ssm_state_out,
+                    Tensor& out, void* workspace, std::size_t workspace_bytes,
+                    cudaStream_t stream) {
+    const auto layout = chunked::compute_workspace_layout(v.ne[1], q.ne[2], private_k.dtype);
     if (workspace == nullptr || workspace_bytes < layout.total_bytes) { throw std::bad_alloc(); }
 
     const DeviceSpan backing{workspace, workspace_bytes};
@@ -78,8 +79,12 @@ void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Ten
     prepare.H_qk         = q.ne[1];
     prepare.H_v          = v.ne[1];
     prepare.L            = q.ne[2];
-    prepare.k            = k.data;
-    prepare.private_fp16 = k.dtype == DType::FP16;
+    prepare.k_private    = private_k.data;
+    prepare.k_source     = normalize_k_in_prepare
+                               ? static_cast<const __nv_bfloat16*>(raw_k.data)
+                               : nullptr;
+    prepare.private_fp16 = private_k.dtype == DType::FP16;
+    prepare.normalize_k  = normalize_k_in_prepare;
     prepare.v            = static_cast<const __nv_bfloat16*>(v.data);
     prepare.g_in         = static_cast<const float*>(g.data);
     prepare.beta         = static_cast<const float*>(beta.data);
@@ -95,8 +100,8 @@ void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Ten
     state.L            = q.ne[2];
     state.W            = W.data;
     state.U            = U.data;
-    state.k            = k.data;
-    state.private_fp16 = k.dtype == DType::FP16;
+    state.k            = private_k.data;
+    state.private_fp16 = private_k.dtype == DType::FP16;
     state.g_cumsum     = static_cast<const float*>(g_cumsum.data);
     state.state_in     = static_cast<const float*>(ssm_state_in.data);
     state.v_new        = v_new.data;
@@ -110,8 +115,8 @@ void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Ten
     output.H_v          = v.ne[1];
     output.L            = q.ne[2];
     output.q            = q.data;
-    output.k            = k.data;
-    output.private_fp16 = k.dtype == DType::FP16;
+    output.k            = private_k.data;
+    output.private_fp16 = private_k.dtype == DType::FP16;
     output.normalize_q  = normalize_q;
     output.v_new        = v_new.data;
     output.g_cumsum     = static_cast<const float*>(g_cumsum.data);

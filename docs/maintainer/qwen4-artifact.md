@@ -559,6 +559,24 @@ write/read, and 6/48 MiB of workspace at T=512/4096. Its single-/multi-job kerne
 registers per thread versus 122/123 for the retained materialized-Q kernels, with 24 KiB shared
 memory and no local storage or stack spill.
 
+The exact-head route separately fuses K normalization into `prepare_wy_wu` once the full-chunk
+extent reaches 512 tokens. Each `(chunk,head)` CTA uniquely owns 64 raw BF16 K rows, applies the
+same per-lane FP32 reduction, epsilon, `rsqrtf`, and FP16 round-to-nearest helper, stages the two
+64-column normalized panels in the existing K scratch and not-yet-live T-inverse storage, and
+publishes the identical contiguous FP16 K for W construction, state passing, and output. The four
+helper warps vector-publish each panel while the other four execute KKT, so the standalone launch
+and KKT global-load instructions disappear without increasing the 28.75 KiB shared allocation.
+Grouped heads cannot use this ownership and retain standalone normalization. Three alternating
+101-sample cold-L2 public-Op runs against an otherwise identical forced-materialized build had
+median-of-medians of 100.352/98.272 us at T=512 and 802.784/782.368 us at T=4096, improvements of
+2.07% and 2.54%; T=448 tied at 83.968 us and therefore remains materialized. Intermediate widths
+576, 640, 768, 1024, 1536, 2048, and 3072 showed no screening regression. The route removes one
+CUDA Graph node while retaining the prior tensor-I/O accounting because the old model counted one
+prepare K extent rather than separately charging its cache-reused KKT load. The fused and
+materialized normalizers produce bit-identical FP16 K on zero, epsilon-dominated, mixed-sign, and
+large finite rows. The fused prepare compiles with 64 registers, unchanged 28.75 KiB dynamic
+shared memory, and no local storage or stack spill.
+
 At whole-Program scope, the mapped expert banks dominate this preview artifact. Process-warm
 width-512 measurements overlapped at 270.41/269.90 input token/s before the change and
 270.48/269.95 after it; immediate scalar decode remained about 24--25 token/s and cannot select
@@ -566,6 +584,12 @@ the fusion. A separate process-warm width-4096 candidate run measured 293.27 inp
 maximum-width correctness gate measured one-shot replays at 287.69 and 287.62 input token/s and
 reproduced complete state and selector hashes. These are diagnostic bounds rather than an
 end-to-end speedup claim; the directly measured public GDN Op is the performance admission.
+
+After K fusion, the same long real-artifact gate measured one-shot width-4096 replays at 287.87
+and 287.51 input token/s and boundary-partitioned replays at 276.25 and 276.17 input token/s.
+Scalar replay took 165.65 and 164.39 seconds for 4096 tokens, or about 24.7--24.9 token/s. Exact
+replay hashes and every persistent-state check passed. These offload-dominated whole-Program rates
+are reported only as integration diagnostics and are not attributed to the public-Op fusion.
 
 The real artifact then executes scalar T=1 over all 4096 tokens twice, one-shot T=4096 prefill
 twice, and the same five-part prefill twice. Each profile resets and replays bit-for-bit while
