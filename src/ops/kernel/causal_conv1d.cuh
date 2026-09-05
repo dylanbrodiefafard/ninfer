@@ -18,6 +18,36 @@ __device__ __forceinline__ void causal_conv1d_acc_pair(__nv_bfloat162 w, __nv_bf
     acc1 += __high2float(w) * __high2float(x);
 }
 
+__device__ __forceinline__ void causal_conv1d_store_split(
+    __nv_bfloat16 value, std::int32_t channel, std::int32_t token, std::int32_t query_channels,
+    std::int32_t key_channels, std::int32_t value_channels, __nv_bfloat16* query,
+    __nv_bfloat16* key, __nv_bfloat16* value_output) {
+    if (channel < query_channels) {
+        query[static_cast<std::int64_t>(token) * query_channels + channel] = value;
+    } else if (channel < query_channels + key_channels) {
+        const std::int32_t local = channel - query_channels;
+        key[static_cast<std::int64_t>(token) * key_channels + local] = value;
+    } else {
+        const std::int32_t local = channel - query_channels - key_channels;
+        value_output[static_cast<std::int64_t>(token) * value_channels + local] = value;
+    }
+}
+
+__device__ __forceinline__ void causal_conv1d_store_split_pair(
+    __nv_bfloat162 value, std::int64_t pair, std::int32_t token, std::int32_t query_pairs,
+    std::int32_t key_pairs, std::int32_t value_pairs, __nv_bfloat162* query,
+    __nv_bfloat162* key, __nv_bfloat162* value_output) {
+    if (pair < query_pairs) {
+        query[static_cast<std::int64_t>(token) * query_pairs + pair] = value;
+    } else if (pair < query_pairs + key_pairs) {
+        const std::int64_t local = pair - query_pairs;
+        key[static_cast<std::int64_t>(token) * key_pairs + local] = value;
+    } else {
+        const std::int64_t local = pair - query_pairs - key_pairs;
+        value_output[static_cast<std::int64_t>(token) * value_pairs + local] = value;
+    }
+}
+
 inline constexpr int kCausalConvChannelTile = 32;
 
 __global__ void causal_conv1d_prefill_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
@@ -83,6 +113,81 @@ __global__ void causal_conv1d_prefill_pairs_kernel(const __nv_bfloat16* x,
     causal_conv1d_acc_pair(weight2[2 * C2 + p], x2v, acc0, acc1);
     causal_conv1d_acc_pair(weight2[3 * C2 + p], x3, acc0, acc1);
     out2[out_idx] = __floats2bfloat162_rn(silu(acc0), silu(acc1));
+}
+
+__global__ void causal_conv1d_prefill_split_kernel(
+    const __nv_bfloat16* x, const __nv_bfloat16* weight, const __nv_bfloat16* conv_state,
+    __nv_bfloat16* query, __nv_bfloat16* key, __nv_bfloat16* value_output, std::int32_t C,
+    std::int32_t T, std::int32_t query_channels, std::int32_t key_channels,
+    std::int32_t value_channels) {
+    const std::int64_t C64      = static_cast<std::int64_t>(C);
+    const std::int64_t c_blocks = div_up(C64, static_cast<std::int64_t>(blockDim.x));
+    const std::int64_t block    = static_cast<std::int64_t>(blockIdx.x);
+    const std::int32_t t        = static_cast<std::int32_t>(block / c_blocks);
+    const std::int64_t c_base   = (block - static_cast<std::int64_t>(t) * c_blocks) * blockDim.x;
+    const std::int64_t c64      = c_base + threadIdx.x;
+    if (t >= T || c64 >= C64) { return; }
+
+    const std::int32_t c       = static_cast<std::int32_t>(c64);
+    const std::int64_t out_idx = static_cast<std::int64_t>(t) * C64 + c64;
+    const __nv_bfloat16 x0     = (t >= 3) ? x[static_cast<std::int64_t>(t - 3) * C64 + c64]
+                                          : conv_state[static_cast<std::int64_t>(t) * C64 + c64];
+    const __nv_bfloat16 x1 =
+        (t >= 2) ? x[static_cast<std::int64_t>(t - 2) * C64 + c64]
+                 : conv_state[static_cast<std::int64_t>(t + 1) * C64 + c64];
+    const __nv_bfloat16 x2 =
+        (t >= 1) ? x[static_cast<std::int64_t>(t - 1) * C64 + c64]
+                 : conv_state[static_cast<std::int64_t>(t + 2) * C64 + c64];
+    const __nv_bfloat16 x3 = x[out_idx];
+
+    float acc = 0.0f;
+    acc += __bfloat162float(weight[c]) * __bfloat162float(x0);
+    acc += __bfloat162float(weight[C64 + c]) * __bfloat162float(x1);
+    acc += __bfloat162float(weight[2 * C64 + c]) * __bfloat162float(x2);
+    acc += __bfloat162float(weight[3 * C64 + c]) * __bfloat162float(x3);
+    causal_conv1d_store_split(__float2bfloat16_rn(silu(acc)), c, t, query_channels, key_channels,
+                              value_channels, query, key, value_output);
+}
+
+__global__ void causal_conv1d_prefill_pairs_split_kernel(
+    const __nv_bfloat16* x, const __nv_bfloat16* weight, const __nv_bfloat16* conv_state,
+    __nv_bfloat16* query, __nv_bfloat16* key, __nv_bfloat16* value_output, std::int32_t C,
+    std::int32_t T, std::int32_t query_pairs, std::int32_t key_pairs,
+    std::int32_t value_pairs) {
+    const std::int64_t C2        = static_cast<std::int64_t>(C / 2);
+    const std::int64_t c_blocks  = div_up(C2, static_cast<std::int64_t>(blockDim.x));
+    const std::int64_t block     = static_cast<std::int64_t>(blockIdx.x);
+    const std::int32_t t         = static_cast<std::int32_t>(block / c_blocks);
+    const std::int64_t pair_base = (block - static_cast<std::int64_t>(t) * c_blocks) * blockDim.x;
+    const std::int64_t pair      = pair_base + threadIdx.x;
+    if (t >= T || pair >= C2) { return; }
+
+    const auto* x2      = reinterpret_cast<const __nv_bfloat162*>(x);
+    const auto* weight2 = reinterpret_cast<const __nv_bfloat162*>(weight);
+    const auto* state2  = reinterpret_cast<const __nv_bfloat162*>(conv_state);
+    auto* query2        = reinterpret_cast<__nv_bfloat162*>(query);
+    auto* key2          = reinterpret_cast<__nv_bfloat162*>(key);
+    auto* value2        = reinterpret_cast<__nv_bfloat162*>(value_output);
+
+    const std::int64_t out_idx = static_cast<std::int64_t>(t) * C2 + pair;
+    const __nv_bfloat162 x0    = (t >= 3) ? x2[static_cast<std::int64_t>(t - 3) * C2 + pair]
+                                          : state2[static_cast<std::int64_t>(t) * C2 + pair];
+    const __nv_bfloat162 x1 =
+        (t >= 2) ? x2[static_cast<std::int64_t>(t - 2) * C2 + pair]
+                 : state2[static_cast<std::int64_t>(t + 1) * C2 + pair];
+    const __nv_bfloat162 x2v =
+        (t >= 1) ? x2[static_cast<std::int64_t>(t - 1) * C2 + pair]
+                 : state2[static_cast<std::int64_t>(t + 2) * C2 + pair];
+    const __nv_bfloat162 x3 = x2[out_idx];
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    causal_conv1d_acc_pair(weight2[pair], x0, acc0, acc1);
+    causal_conv1d_acc_pair(weight2[C2 + pair], x1, acc0, acc1);
+    causal_conv1d_acc_pair(weight2[2 * C2 + pair], x2v, acc0, acc1);
+    causal_conv1d_acc_pair(weight2[3 * C2 + pair], x3, acc0, acc1);
+    causal_conv1d_store_split_pair(__floats2bfloat162_rn(silu(acc0), silu(acc1)), pair, t,
+                                   query_pairs, key_pairs, value_pairs, query2, key2, value2);
 }
 
 // Writes the trailing width-3 conv window after consuming the T input columns.
@@ -161,6 +266,47 @@ __global__ void causal_conv1d_sequence_kernel(const __nv_bfloat16* x, const __nv
     conv_state_out[c64]           = s0;
     conv_state_out[C64 + c64]     = s1;
     conv_state_out[2 * C64 + c64] = s2;
+}
+
+// Split-output counterpart of the small-sequence kernel. One thread retains the complete
+// convolution history for a channel and routes each BF16 result directly to its compact plane.
+__global__ void causal_conv1d_split_sequence_kernel(
+    const __nv_bfloat16* x, const __nv_bfloat16* weight, __nv_bfloat16* conv_state,
+    __nv_bfloat16* query, __nv_bfloat16* key, __nv_bfloat16* value_output, std::int32_t C,
+    std::int32_t T, std::int32_t query_channels, std::int32_t key_channels,
+    std::int32_t value_channels) {
+    const std::int64_t c64 = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t C64 = static_cast<std::int64_t>(C);
+    if (c64 >= C64) { return; }
+
+    const std::int32_t c = static_cast<std::int32_t>(c64);
+    __nv_bfloat16 s0     = conv_state[c64];
+    __nv_bfloat16 s1     = conv_state[C64 + c64];
+    __nv_bfloat16 s2     = conv_state[2 * C64 + c64];
+    const float w0       = __bfloat162float(weight[c64]);
+    const float w1       = __bfloat162float(weight[C64 + c64]);
+    const float w2       = __bfloat162float(weight[2 * C64 + c64]);
+    const float w3       = __bfloat162float(weight[3 * C64 + c64]);
+
+    for (std::int32_t t = 0; t < T; ++t) {
+        const std::int64_t input_idx = static_cast<std::int64_t>(t) * C64 + c64;
+        const __nv_bfloat16 x0       = x[input_idx];
+
+        float acc = 0.0f;
+        acc += w0 * __bfloat162float(s0);
+        acc += w1 * __bfloat162float(s1);
+        acc += w2 * __bfloat162float(s2);
+        acc += w3 * __bfloat162float(x0);
+        causal_conv1d_store_split(__float2bfloat16_rn(silu(acc)), c, t, query_channels,
+                                  key_channels, value_channels, query, key, value_output);
+        s0 = s1;
+        s1 = s2;
+        s2 = x0;
+    }
+
+    conv_state[c64]           = s0;
+    conv_state[C64 + c64]     = s1;
+    conv_state[2 * C64 + c64] = s2;
 }
 
 // Small-T ordinary form parallelized across both channels and tokens. Each CTA owns one channel

@@ -3,6 +3,7 @@
 // Examples:
 //   ./ninfer_causal_conv1d_silu_bench --decode --channels 8192
 //   ./ninfer_causal_conv1d_silu_bench --prefill --channels 8192 --tokens 1024
+//   ./ninfer_causal_conv1d_silu_bench --split --channels 10240 --tokens 4096
 //   ./ninfer_causal_conv1d_silu_bench --distinct --channels 8192 --tokens 6
 //   ./ninfer_causal_conv1d_silu_bench --snapshot --channels 8192 --tokens 6 --slots 7
 // Printed logical GB/s is informational; NCU determines the applicable resource roofline.
@@ -34,6 +35,7 @@ struct Options {
     bool prefill  = false;
     bool distinct = false;
     bool snapshot = false;
+    bool split    = false;
 };
 
 __global__ void copy_u128_kernel(const uint4* src, uint4* dst, std::size_t n4) {
@@ -115,6 +117,62 @@ void run_prefill(const Options& options, bool distinct) {
     const std::string tag =
         shape_tag(distinct ? "distinct" : "prefill", options.channels, options.tokens);
     print_result(tag.c_str(), r);
+}
+
+void run_split(const Options& options) {
+    const std::int32_t query_channels = options.channels / 5;
+    const std::int32_t key_channels   = options.channels / 5;
+    const std::int32_t value_channels = options.channels - query_channels - key_channels;
+    const std::size_t n = static_cast<std::size_t>(options.channels) * options.tokens;
+    const std::size_t state_n = static_cast<std::size_t>(options.channels) * 3u;
+
+    DeviceBuffer x = make_varied_bf16(n, 0x12345678U);
+    DeviceBuffer weight =
+        make_varied_bf16(static_cast<std::size_t>(options.channels) * 4u, 0x87654321U);
+    DeviceBuffer composed_state = make_varied_bf16(state_n, 0x31415926U);
+    DeviceBuffer split_state    = make_varied_bf16(state_n, 0x31415926U);
+    DeviceBuffer interleaved    = make_zeros(n * 2u);
+    DeviceBuffer query =
+        make_zeros(static_cast<std::size_t>(query_channels) * options.tokens * 2u);
+    DeviceBuffer key = make_zeros(static_cast<std::size_t>(key_channels) * options.tokens * 2u);
+    DeviceBuffer value =
+        make_zeros(static_cast<std::size_t>(value_channels) * options.tokens * 2u);
+
+    Tensor tx(x.p, DType::BF16, {options.channels, options.tokens});
+    Tensor tw(weight.p, DType::BF16, {options.channels, 4});
+    Tensor tcomposed_state(composed_state.p, DType::BF16, {options.channels, 3});
+    Tensor tsplit_state(split_state.p, DType::BF16, {options.channels, 3});
+    Tensor tinterleaved(interleaved.p, DType::BF16, {options.channels, options.tokens});
+    Tensor tq(query.p, DType::BF16, {query_channels, options.tokens});
+    Tensor tk(key.p, DType::BF16, {key_channels, options.tokens});
+    Tensor tv(value.p, DType::BF16, {value_channels, options.tokens});
+
+    const auto copy_plane = [&](std::size_t source_channel, std::int32_t rows, DeviceBuffer& out,
+                                cudaStream_t stream) {
+        const auto* source = static_cast<const std::uint16_t*>(interleaved.p) + source_channel;
+        CUDA_CHECK(cudaMemcpy2DAsync(out.p, static_cast<std::size_t>(rows) * 2u, source,
+                                     static_cast<std::size_t>(options.channels) * 2u,
+                                     static_cast<std::size_t>(rows) * 2u, options.tokens,
+                                     cudaMemcpyDeviceToDevice, stream));
+    };
+    const double split_bytes = 4.0 * static_cast<double>(n) + 20.0 * options.channels;
+    const double composed_bytes = split_bytes + 4.0 * static_cast<double>(n);
+    const Result composed = bench_loop(
+        [&](cudaStream_t stream) {
+            ops::causal_conv1d_silu(tx, tw, tcomposed_state, tinterleaved, stream);
+            copy_plane(0, query_channels, query, stream);
+            copy_plane(query_channels, key_channels, key, stream);
+            copy_plane(query_channels + key_channels, value_channels, value, stream);
+        },
+        composed_bytes);
+    print_result(shape_tag("composed split", options.channels, options.tokens).c_str(), composed);
+
+    const Result direct = bench_loop(
+        [&](cudaStream_t stream) {
+            ops::causal_conv1d_silu_split(tx, tw, tsplit_state, tq, tk, tv, stream);
+        },
+        split_bytes);
+    print_result(shape_tag("direct split", options.channels, options.tokens).c_str(), direct);
 }
 
 void run_decode(const Options& options) {
@@ -204,7 +262,7 @@ void run_snapshot(const Options& options) {
 
 void print_usage(const char* program) {
     std::fprintf(stderr,
-                 "usage: %s [--decode] [--prefill] [--distinct] [--snapshot] "
+                 "usage: %s [--decode] [--prefill] [--distinct] [--snapshot] [--split] "
                  "[--channels C] [--tokens T] [--batch B] [--valid-columns V0,V1,...] "
                  "[--slots S] [--initial-slot I]\n",
                  program);
@@ -242,6 +300,8 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.distinct = true;
         } else if (!std::strcmp(argv[i], "--snapshot")) {
             options.snapshot = true;
+        } else if (!std::strcmp(argv[i], "--split")) {
+            options.split = true;
         } else if (!std::strcmp(argv[i], "--valid-columns") && i + 1 < argc) {
             if (!parse_valid_columns(argv[++i], options.valid_columns)) { return false; }
         } else if ((!std::strcmp(argv[i], "--channels") || !std::strcmp(argv[i], "--tokens") ||
@@ -264,7 +324,8 @@ bool parse_options(int argc, char** argv, Options& options) {
             return false;
         }
     }
-    if (!options.decode && !options.prefill && !options.distinct && !options.snapshot) {
+    if (!options.decode && !options.prefill && !options.distinct && !options.snapshot &&
+        !options.split) {
         options.decode = options.prefill = true;
     }
     if (options.batch > 8 || (options.batch > 1 && options.tokens > 16) ||
@@ -299,5 +360,6 @@ int main(int argc, char** argv) {
     if (options.prefill) run_prefill(options, false);
     if (options.distinct) run_prefill(options, true);
     if (options.snapshot) run_snapshot(options);
+    if (options.split) run_split(options);
     return 0;
 }

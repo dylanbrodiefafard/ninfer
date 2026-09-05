@@ -60,7 +60,10 @@ qb::BenchOptions parse_for_test(std::vector<std::string> arguments) {
 }
 
 int test_cli_contract() {
-    int failures                  = 0;
+    int failures = 0;
+    const qb::BenchOptions default_options =
+        parse_for_test({"ninfer_bench", "--weights", "model.ninfer"});
+    failures += expect_u32(default_options.prefill_chunk, 8192, "default prefill chunk");
     const qb::BenchOptions parsed = parse_for_test({
         "ninfer_bench",
         "--weights",

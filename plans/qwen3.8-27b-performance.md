@@ -1,9 +1,10 @@
 # Qwen3.8-27B NVFP4 active work
 
 This file contains only current work for the supported `qwen3.8-27b/nvfp4` product on one RTX
-5090. The default measurement profile is NVFP4 KV, CUDA Graphs enabled, prefill chunk 4096, and
-startup-fixed C=1/2/3/4 unless a narrower experiment says otherwise. Completed campaigns belong in
-the active documentation or git history, not in this backlog.
+5090. The default measurement profile is NVFP4 KV, CUDA Graphs enabled, prefill chunk 8192 with
+adaptive 4096 decomposition for a large unaligned remainder, and startup-fixed C=1/2/3/4 unless a
+narrower experiment says otherwise. Completed campaigns belong in the active documentation or git
+history, not in this backlog.
 
 ## Long-context chunk sensitivity
 
@@ -172,8 +173,9 @@ Current XAttention numerical evidence on 2026-09-02:
 
 Final validation covers fresh prefill and response-checkpoint reuse at C=1/2/3/4, confirms that
 reasoning cannot terminate on a registered stop token, confirms normal post-reasoning stopping, and
-benchmarks TTFT/prefill throughput at the default chunk 4096. Exact token equality across legal chunk
-partitions is required only if the localized operation's actual semantic contract requires it.
+benchmarks TTFT/prefill throughput at the default chunk 8192 and its adaptive unaligned-remainder
+route. Exact token equality across legal chunk partitions is required only if the localized
+operation's actual semantic contract requires it.
 
 ### Structured stop eligibility
 

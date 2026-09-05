@@ -200,7 +200,7 @@ int main(int argc, char** argv) {
         ninfer::SpeculativeOptions speculative;
         std::uint32_t tokens            = 0;
         std::uint32_t max_context       = 4096;
-        std::uint32_t prefill_chunk     = 4096;
+        std::uint32_t prefill_chunk     = 8192;
         int device                      = 0;
         bool sage_attn                  = false;
         bool s3_tma                     = false;
@@ -301,7 +301,7 @@ int main(int argc, char** argv) {
                 << "  --cuda-graph / --no-cuda-graph  default: graphs on (production decode)\n"
                 << "  --tokens <n>                score/encode the first n ids (default: all)\n"
                 << "  --max-context <n>           message-input context ceiling (default: 4096)\n"
-                << "  --prefill-chunk <n>         default 4096\n"
+                << "  --prefill-chunk <n>         default 8192\n"
                 << "  --device <id>\n"
                 << "  --vision                    enable image/video parts in --messages\n"
                 << "  --thinking / --no-thinking message template mode (default: no-thinking)\n"

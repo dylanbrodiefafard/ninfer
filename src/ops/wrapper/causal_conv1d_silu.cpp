@@ -3,6 +3,7 @@
 
 #include "ops/launcher/causal_conv1d.h" // detail::causal_conv1d_*_launch
 
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -76,6 +77,41 @@ void require_out_shape(const Tensor& x, const Tensor& out) {
     for (int d = 0; d < 4; ++d) {
         if (out.ne[d] != x.ne[d]) {
             throw std::invalid_argument("causal_conv1d: out shape must match x");
+        }
+    }
+}
+
+void require_split_output_shape(const Tensor& out, std::int32_t T, const char* label) {
+    if (out.ne[0] <= 0 || out.ne[1] != T || out.ne[2] != 1 || out.ne[3] != 1) {
+        throw std::invalid_argument(std::string("causal_conv1d: ") + label +
+                                    " must have shape [positive_channels,T]");
+    }
+}
+
+void require_split_nonoverlap(const Tensor& x, const Tensor& weight, const Tensor& conv_state,
+                              const Tensor& query, const Tensor& key, const Tensor& value) {
+    struct Range {
+        const Tensor* tensor;
+        const char* label;
+    };
+    const std::array<Range, 6> ranges{{
+        {&x, "x"},
+        {&weight, "weight"},
+        {&conv_state, "conv_state"},
+        {&query, "query"},
+        {&key, "key"},
+        {&value, "value"},
+    }};
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        const auto lhs_begin = reinterpret_cast<std::uintptr_t>(ranges[i].tensor->data);
+        const auto lhs_end   = lhs_begin + ranges[i].tensor->bytes();
+        for (std::size_t j = i + 1; j < ranges.size(); ++j) {
+            const auto rhs_begin = reinterpret_cast<std::uintptr_t>(ranges[j].tensor->data);
+            const auto rhs_end   = rhs_begin + ranges[j].tensor->bytes();
+            if (lhs_begin < rhs_end && rhs_begin < lhs_end) {
+                throw std::invalid_argument(std::string("causal_conv1d: ") + ranges[i].label +
+                                            " overlaps " + ranges[j].label);
+            }
         }
     }
 }
@@ -184,6 +220,44 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, Tensor& conv_stat
     } else {
         detail::causal_conv1d_prefill_launch(x, weight, conv_state, conv_state, out, stream);
     }
+}
+
+void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, Tensor& conv_state,
+                              Tensor& query, Tensor& key, Tensor& value, cudaStream_t stream) {
+    if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 ||
+        conv_state.dtype != DType::BF16 || query.dtype != DType::BF16 ||
+        key.dtype != DType::BF16 || value.dtype != DType::BF16) {
+        throw std::invalid_argument("causal_conv1d: split tensors must be BF16");
+    }
+
+    const std::int64_t n = numel_allow_zero(x, "x");
+    (void)numel_allow_zero(weight, "weight");
+    (void)numel_allow_zero(conv_state, "conv_state");
+    (void)numel_allow_zero(query, "query");
+    (void)numel_allow_zero(key, "key");
+    (void)numel_allow_zero(value, "value");
+    require_x_shape(x);
+    require_weight_shape(weight, x.ne[0]);
+    require_state_shape(conv_state, x.ne[0]);
+    require_split_output_shape(query, x.ne[1], "query");
+    require_split_output_shape(key, x.ne[1], "key");
+    require_split_output_shape(value, x.ne[1], "value");
+    const std::int64_t output_channels = static_cast<std::int64_t>(query.ne[0]) + key.ne[0] +
+                                         value.ne[0];
+    if (output_channels != x.ne[0]) {
+        throw std::invalid_argument("causal_conv1d: split output channels must sum to C");
+    }
+    if (n == 0) { return; }
+
+    const std::array<const Tensor*, 6> tensors{{&x, &weight, &conv_state, &query, &key, &value}};
+    for (const Tensor* tensor : tensors) {
+        if (!tensor->is_contiguous() || tensor->data == nullptr) {
+            throw std::invalid_argument(
+                "causal_conv1d: split tensors must be contiguous and non-null");
+        }
+    }
+    require_split_nonoverlap(x, weight, conv_state, query, key, value);
+    detail::causal_conv1d_split_launch(x, weight, conv_state, query, key, value, stream);
 }
 
 void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& conv_states,

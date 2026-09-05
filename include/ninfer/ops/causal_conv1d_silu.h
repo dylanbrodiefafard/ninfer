@@ -31,6 +31,17 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& con
                         Tensor& conv_state_out, Tensor& out, cudaStream_t stream);
 
 /**
+ * Split-output form used by GDN prefill. It evaluates the same complete convolution and SiLU
+ * formula, but writes the contiguous channel ranges directly to `query`, `key`, and `value`
+ * instead of materializing one `[C,T]` output followed by three copies. The outputs are contiguous
+ * BF16 `[Cq,T]`, `[Ck,T]`, and `[Cv,T]`, with `C=Cq+Ck+Cv`; all inputs, outputs, and state storage
+ * are disjoint except that the running state is updated in place. The numerical oracle and output
+ * criterion are identical to the ordinary form.
+ */
+void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, Tensor& conv_state,
+                              Tensor& query, Tensor& key, Tensor& value, cudaStream_t stream);
+
+/**
  * Snapshot form for B independent sequences. `x` and `out` are contiguous BF16 [C,W,B],
  * `conv_states` is contiguous BF16 [C,3,Slots], and `initial_state_slots` and
  * `snapshot_base_slots` are contiguous I32 [B]. `valid_columns` is either contiguous I32 [B],

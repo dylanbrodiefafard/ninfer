@@ -221,6 +221,72 @@ int ordinary_case(std::int32_t C, std::int32_t T, StateCall call, std::uint32_t 
     return failures;
 }
 
+int split_case(std::int32_t T, std::uint32_t seed) {
+    constexpr std::int32_t C  = 10240;
+    constexpr std::int32_t Cq = 2048;
+    constexpr std::int32_t Ck = 2048;
+    constexpr std::int32_t Cv = 6144;
+    const LogicalInput input   = make_input(C, T, seed);
+    const std::vector<float> state = make_state(C, seed + 2U);
+    const OracleResult oracle      = causal_conv_oracle(input.x, input.weight, state, C, T, false);
+
+    std::vector<double> expected_q(static_cast<std::size_t>(Cq) * T);
+    std::vector<double> expected_k(static_cast<std::size_t>(Ck) * T);
+    std::vector<double> expected_v(static_cast<std::size_t>(Cv) * T);
+    for (std::int32_t t = 0; t < T; ++t) {
+        const auto* source = oracle.output.data() + static_cast<std::size_t>(t) * C;
+        std::copy_n(source, Cq, expected_q.data() + static_cast<std::size_t>(t) * Cq);
+        std::copy_n(source + Cq, Ck, expected_k.data() + static_cast<std::size_t>(t) * Ck);
+        std::copy_n(source + Cq + Ck, Cv,
+                    expected_v.data() + static_cast<std::size_t>(t) * Cv);
+    }
+
+    const std::vector<std::uint16_t> x_bits      = bf16_bits(input.x);
+    const std::vector<std::uint16_t> weight_bits = bf16_bits(input.weight);
+    const std::vector<std::uint16_t> state_bits  = bf16_bits(state);
+    const std::vector<std::uint16_t> final_bits  = bf16_bits(oracle.final_state);
+    GuardedDeviceBuffer x(x_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer weight(weight_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer conv_state(state_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer query(expected_q.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer key(expected_k.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer value(expected_v.size() * sizeof(std::uint16_t));
+    x.copy_from_host(x_bits.data(), x.bytes());
+    weight.copy_from_host(weight_bits.data(), weight.bytes());
+    conv_state.copy_from_host(state_bits.data(), conv_state.bytes());
+    query.fill(kOutputPoison);
+    key.fill(kOutputPoison);
+    value.fill(kOutputPoison);
+
+    Tensor tx(x.data(), DType::BF16, {C, T});
+    Tensor tw(weight.data(), DType::BF16, {C, 4});
+    Tensor ts(conv_state.data(), DType::BF16, {C, 3});
+    Tensor tq(query.data(), DType::BF16, {Cq, T});
+    Tensor tk(key.data(), DType::BF16, {Ck, T});
+    Tensor tv(value.data(), DType::BF16, {Cv, T});
+    ops::causal_conv1d_silu_split(tx, tw, ts, tq, tk, tv, nullptr);
+    cuda_synchronize();
+
+    const std::string tag = "causal_conv1d_silu split T=" + std::to_string(T);
+    int failures          = 0;
+    failures += verify_output(tag + " query",
+                              from_device_bf16(query.data(), expected_q.size()), expected_q);
+    failures += verify_output(tag + " key", from_device_bf16(key.data(), expected_k.size()),
+                              expected_k);
+    failures += verify_output(tag + " value",
+                              from_device_bf16(value.data(), expected_v.size()), expected_v);
+    failures += verify_bits(tag + " final state", conv_state.data(), final_bits);
+    failures += verify_bits(tag + " x preserved", x.data(), x_bits);
+    failures += verify_bits(tag + " weight preserved", weight.data(), weight_bits);
+    failures += verify_buffer_guards(tag + " x", x);
+    failures += verify_buffer_guards(tag + " weight", weight);
+    failures += verify_buffer_guards(tag + " state", conv_state);
+    failures += verify_buffer_guards(tag + " query", query);
+    failures += verify_buffer_guards(tag + " key", key);
+    failures += verify_buffer_guards(tag + " value", value);
+    return failures;
+}
+
 // Continuation prefill reads a selected committed slot and publishes the new running state to slot
 // 0. The Op sees two valid disjoint [C,3] tensors; checking their common backing allocation also
 // proves that every surrounding state slot remains untouched.
@@ -488,6 +554,12 @@ int main() {
     failures += ordinary_case(kQwen27Channels, 17, StateCall::DistinctEntryExactAlias, 2017U);
     failures += ordinary_case(kQwen27Channels, 32, StateCall::DistinctEntry, 2032U);
     failures += continuation_slot_case(kQwen27Channels, 65, 6, 4, 2065U);
+
+    // The production Qwen3.8 GDN partition qualifies both direct-store launch families against
+    // the same complete FP64 oracle as the ordinary output form.
+    for (const std::int32_t T : {1, 7, 65, 257}) {
+        failures += split_case(T, 3000U + static_cast<std::uint32_t>(T));
+    }
 
     // The peer 35B-A3B geometry is a separate real channel extent.
     constexpr std::int32_t kQwen35Channels = 8192;

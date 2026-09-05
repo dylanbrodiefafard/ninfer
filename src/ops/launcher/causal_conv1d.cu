@@ -77,6 +77,66 @@ void causal_conv1d_prefill_launch(const Tensor& x, const Tensor& weight,
     CUDA_CHECK(cudaGetLastError());
 }
 
+void causal_conv1d_split_launch(const Tensor& x, const Tensor& weight, Tensor& conv_state,
+                                Tensor& query, Tensor& key, Tensor& value, cudaStream_t stream) {
+    constexpr int kOutputBlock  = 256;
+    constexpr int kChannelBlock = 256;
+    constexpr int kPairBlock    = 256;
+    const std::int32_t C        = x.ne[0];
+    const std::int32_t T        = x.ne[1];
+    const std::int32_t q        = query.ne[0];
+    const std::int32_t k        = key.ne[0];
+    const std::int32_t v        = value.ne[0];
+
+    if (T <= kCausalConvSequenceMaxTokens) {
+        const int block = T == 1 ? 256 : 32;
+        causal_conv1d_split_sequence_kernel<<<grid_for(C, block, "split sequence"), block, 0,
+                                               stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const __nv_bfloat16*>(weight.data),
+            static_cast<__nv_bfloat16*>(conv_state.data),
+            static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
+            static_cast<__nv_bfloat16*>(value.data), C, T, q, k, v);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    const auto x_addr     = reinterpret_cast<std::uintptr_t>(x.data);
+    const auto w_addr     = reinterpret_cast<std::uintptr_t>(weight.data);
+    const auto state_addr = reinterpret_cast<std::uintptr_t>(conv_state.data);
+    const auto q_addr     = reinterpret_cast<std::uintptr_t>(query.data);
+    const auto k_addr     = reinterpret_cast<std::uintptr_t>(key.data);
+    const auto v_addr     = reinterpret_cast<std::uintptr_t>(value.data);
+    if (((x_addr | w_addr | state_addr | q_addr | k_addr | v_addr) &
+         (alignof(__nv_bfloat162) - 1)) == 0 &&
+        ((C | q | k | v) & 1) == 0) {
+        causal_conv1d_prefill_pairs_split_kernel<<<
+            prefill_output_grid_for(C / 2, T, kPairBlock), kPairBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const __nv_bfloat16*>(weight.data),
+            static_cast<const __nv_bfloat16*>(conv_state.data),
+            static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
+            static_cast<__nv_bfloat16*>(value.data), C, T, q / 2, k / 2, v / 2);
+        CUDA_CHECK(cudaGetLastError());
+    } else {
+        causal_conv1d_prefill_split_kernel<<<prefill_output_grid_for(C, T, kOutputBlock),
+                                             kOutputBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const __nv_bfloat16*>(weight.data),
+            static_cast<const __nv_bfloat16*>(conv_state.data),
+            static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
+            static_cast<__nv_bfloat16*>(value.data), C, T, q, k, v);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    causal_conv1d_prefill_state_kernel<<<grid_for(C, kChannelBlock, "split prefill state"),
+                                         kChannelBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const __nv_bfloat16*>(conv_state.data),
+        static_cast<__nv_bfloat16*>(conv_state.data), C, T);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void causal_conv1d_smallt_launch(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
                                  Tensor& conv_state_out, Tensor& out, cudaStream_t stream) {
     const std::int32_t C = x.ne[0];
