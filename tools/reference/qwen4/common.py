@@ -33,25 +33,52 @@ def linear(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return as_f64(value) @ as_f64(weight).transpose(-1, -2)
 
 
-def grouped_zero_centered_rmsnorm(
+def _grouped_rmsnorm(
     value: torch.Tensor,
-    weight: torch.Tensor,
+    gamma: torch.Tensor,
     *,
     group_size: int,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Qwen4 grouped RMSNorm, including its zero-centered ``(1 + weight)``."""
-
     x = as_f64(value)
-    w = as_f64(weight)
-    if x.shape[-1] != w.numel():
+    represented_gamma = as_f64(gamma)
+    if x.shape[-1] != represented_gamma.numel():
         raise ValueError("RMSNorm weight width must equal the input width")
     if x.shape[-1] % group_size:
         raise ValueError("RMSNorm width must be divisible by group_size")
     grouped = x.reshape(*x.shape[:-1], -1, group_size)
     inv_rms = torch.rsqrt(torch.mean(grouped * grouped, dim=-1, keepdim=True) + eps)
     normalized = (grouped * inv_rms).flatten(-2)
-    return normalized * (1.0 + w)
+    return normalized * represented_gamma
+
+
+def source_grouped_rmsnorm(
+    value: torch.Tensor,
+    zero_centered_weight: torch.Tensor,
+    *,
+    group_size: int,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Source-checkpoint grouped RMSNorm with zero-centered ``(1 + weight)``."""
+
+    return _grouped_rmsnorm(
+        value,
+        1.0 + as_f64(zero_centered_weight),
+        group_size=group_size,
+        eps=eps,
+    )
+
+
+def actual_gguf_grouped_rmsnorm(
+    value: torch.Tensor,
+    gamma: torch.Tensor,
+    *,
+    group_size: int,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Actual-GGUF grouped RMSNorm with its already-folded direct gamma."""
+
+    return _grouped_rmsnorm(value, gamma, group_size=group_size, eps=eps)
 
 
 def ordinary_rmsnorm(

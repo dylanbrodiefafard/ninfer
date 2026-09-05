@@ -516,7 +516,9 @@ This authority does not make framework parity the mathematical oracle. Independe
 reference code must consume represented artifact inputs and evaluate:
 
 - exact signed-I64/unsigned-U64 n-gram addressing over I32 token ids and continuation;
-- FP64 grouped zero-centered RMSNorm, GR, PLE, QSA scores/attention, MoE, and Vision formulas;
+- source-checkpoint grouped RMSNorm with `1 + w`, or actual-GGUF grouped RMSNorm with its
+  already-folded gamma directly, followed by FP64 GR, PLE, QSA scores/attention, MoE, and Vision
+  formulas;
 - the complete GDN recurrence with FP32 persistent-state boundaries; and
 - MTP stem/state/fold only after Section 11's golden evidence closes it.
 
