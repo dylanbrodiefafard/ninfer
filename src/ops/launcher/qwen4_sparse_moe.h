@@ -52,6 +52,10 @@ void qwen4_sparse_moe_indexed_down_finish_launch(
 void qwen4_sparse_moe_swiglu_launch(const Tensor& gate, const Tensor& up, Tensor& activated,
                                     cudaStream_t stream);
 
+void qwen4_sparse_moe_prefill_gate_up_swiglu_launch(
+    const Tensor& x, const Weight& gate, const Weight& up, Tensor& activated,
+    cudaStream_t stream);
+
 void qwen4_sparse_moe_prefill_gather_launch(const Tensor& x,
                                             const Tensor& occurrence_slots,
                                             std::int32_t occurrence_offset,

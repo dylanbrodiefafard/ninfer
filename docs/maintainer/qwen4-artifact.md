@@ -577,6 +577,48 @@ and 152.95 ms, with no observed short-prefill regression. The T=1 decode route i
 A generic four-kernel grouped expert candidate was also deleted after regressing warm width-512
 prefill to 5.951 s.
 
+The next sparse-MoE pass fused each staged expert's routed gate and up projections with its
+SwiGLU activation. At per-expert occurrence count M=1 it uses the existing scalar paired
+projection; at M>1 one CTA holds
+separate 16-occurrence FP32 gate/up accumulators, decodes each packed row once, reuses each input
+load for both projections, then applies the two projection BF16 rounds and final activation BF16
+round explicitly. The gate/up global scratch tensors disappeared, reducing sparse-MoE workspace
+by 13,107,200 bytes at width 512 and 104,857,600 bytes at width 4096. Encoded H2D bytes, the
+16/32 expert transfer schedule, down projection, occurrence list lifetime, and rank-order mixture
+are unchanged.
+
+Exact T=16 Nsight Compute admission captures showed that the original IQ1_S/IQ2_XXS projection
+kernels took 29.60/29.57 us apiece, used 42 registers with five-block register limits and
+58.03/56.30% achieved occupancy, had 97.28/96.47% L2 hit rates and only 0.82/1.68% DRAM
+throughput, and issued no local-memory spills. The retained fused kernel took 37.15/35.26 us for
+both projections plus SwiGLU, used 56 registers with four-block register limits and 2,048 bytes
+of shared memory, reached 51.15/48.65% achieved occupancy, and had no spills. The lower occupancy
+is paid back by eliminating a gathered-input pass, two launches, and the projection
+write/read traffic.
+
+The task-local direct A/B exact-checked every BF16 activation against the established three-launch
+route before timing; the retained benchmark invokes only the production semantic Op. At M=16,
+300-sample warm medians changed from 45.536 to
+36.800 us for IQ1_S and 43.424 to 34.528 us for IQ2_XXS; cold medians changed from 47.104 to
+36.864 us and 45.056 to 34.816 us. M=1,2,3,4,5,6,7,8,17,32 all retained exact output words and
+measured wins. The independent packed-code test separately checks the complete FP64 sparse-MoE
+formula at M=17 for both codecs and uses a one-coefficient association-independent witness to
+exact-check both projection rounds and the activation round across occurrences 15 and 16.
+
+Six process-warm width-512 Program samples improved from a 1.7936 s median (285.47 input token/s)
+to 1.6907 s (302.83 input token/s), about 6.1%, with the final vocabulary head included. An
+uncontended reverse-order width-4 comparison improved from about 150.9 to 139.7 ms median. Two
+process-warm width-4096 samples improved from a 13.5820 s mean to 12.7749 s, about 6.3%. Immediate
+T=1 decode remained in its established 24--25 token/s band because it uses the unchanged scalar
+Program path.
+
+The final process-warm width-512 trace measured a 1.680484 s prefill range. Compute-stream kernel
+count/time fell from the retained schedule trace's 54,842/1,689.682 ms to 37,086/1,568.338 ms:
+the exact 17,756-launch reduction is two eliminated launches for each staged expert invocation,
+and kernel time fell by 121.344 ms. The trace still moved 6.223535 GB H2D in 218.008 ms, matching
+the prior 6.224 GB and 217.732 ms within measurement noise. This localizes the Program gain to
+the fused projection/activation work rather than to a change in CPU offload or transfer volume.
+
 The maximum-width numerical gate uses the exact post-expansion Qwen4 recurrence geometry
 `Hq=Hv=48,D=128,T=4096` and one represented-input FP64 oracle. It independently qualifies 4096
 scalar T=1 calls, one-shot T=4096, aligned 64x64 chunks, and the Program partition

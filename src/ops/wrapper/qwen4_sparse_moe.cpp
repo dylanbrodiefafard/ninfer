@@ -205,8 +205,6 @@ struct PrefillScratch {
     Tensor shared_activated;
     Tensor shared;
     Tensor gathered;
-    Tensor gate;
-    Tensor up;
     Tensor activated;
     Tensor expert;
     Tensor rank_results;
@@ -223,8 +221,6 @@ PrefillScratch allocate_prefill_scratch(Allocator& allocator, std::int32_t width
         allocator.alloc(DType::BF16, {kQwen4SparseMoeIntermediate, width}),
         allocator.alloc(DType::BF16, {kQwen4SparseMoeHidden, width}),
         allocator.alloc(DType::BF16, {kQwen4SparseMoeHidden, occurrences}),
-        allocator.alloc(DType::BF16, {kQwen4SparseMoeIntermediate, occurrences}),
-        allocator.alloc(DType::BF16, {kQwen4SparseMoeIntermediate, occurrences}),
         allocator.alloc(DType::BF16, {kQwen4SparseMoeIntermediate, occurrences}),
         allocator.alloc(DType::BF16, {kQwen4SparseMoeHidden, occurrences}),
         allocator.alloc(DType::BF16, {kQwen4SparseMoeHidden, kQwen4SparseMoeTopK, width}),
@@ -373,6 +369,33 @@ std::size_t qwen4_sparse_moe_resident_workspace_capacity_bytes(std::int32_t widt
             "qwen4_sparse_moe_resident_workspace_capacity_bytes: width must be in [1,4096]");
     }
     return required_resident_workspace(width);
+}
+
+void qwen4_sparse_moe_gate_up_swiglu(const Tensor& x, const Weight& gate,
+                                     const Weight& up, Tensor& out,
+                                     cudaStream_t stream) {
+    const std::int32_t width = x.ne[1];
+    require_matrix_tensor(x, DType::BF16, kQwen4SparseMoeHidden, width, "x",
+                          "qwen4_sparse_moe_gate_up_swiglu");
+    require_matrix_tensor(out, DType::BF16, kQwen4SparseMoeIntermediate, width, "out",
+                          "qwen4_sparse_moe_gate_up_swiglu");
+    if (gate.qtype != QType::GGML_IQ1_S && gate.qtype != QType::GGML_IQ2_XXS) {
+        throw std::invalid_argument(
+            "qwen4_sparse_moe_gate_up_swiglu: gate must be IQ1_S or IQ2_XXS");
+    }
+    require_ggml_weight(gate, gate.qtype, 1, kQwen4SparseMoeIntermediate,
+                        kQwen4SparseMoeHidden, "gate");
+    require_ggml_weight(up, gate.qtype, 1, kQwen4SparseMoeIntermediate,
+                        kQwen4SparseMoeHidden, "up");
+    const std::array<AddressRange, 4> ranges{
+        address_range(x.data, x.bytes(), "x"),
+        address_range(gate.payload, gate.payload_bytes, "gate"),
+        address_range(up.payload, up.payload_bytes, "up"),
+        address_range(out.data, out.bytes(), "out"),
+    };
+    require_disjoint(ranges);
+    detail::qwen4_sparse_moe_prefill_gate_up_swiglu_launch(
+        x, gate, up, out, stream);
 }
 
 void qwen4_sparse_moe(const Tensor& x, const Qwen4SparseMoeWeights& weights,
@@ -824,8 +847,6 @@ void qwen4_sparse_moe_prefill(const Tensor& x, const Qwen4SparseMoeWeights& weig
             const std::int32_t count = expert_counts[expert];
             const std::int32_t offset = expert_offsets[expert] - group_occurrence_begin;
             Tensor gathered = scratch.gathered.slice(1, offset, count);
-            Tensor gate_output = scratch.gate.slice(1, offset, count);
-            Tensor up_output = scratch.up.slice(1, offset, count);
             Tensor activated = scratch.activated.slice(1, offset, count);
             Tensor expert_output = scratch.expert.slice(1, offset, count);
             detail::qwen4_sparse_moe_prefill_gather_launch(
@@ -841,9 +862,8 @@ void qwen4_sparse_moe_prefill(const Tensor& x, const Qwen4SparseMoeWeights& weig
                 routed_down + static_cast<std::size_t>(expert) * routed_down_matrix,
                 QType::GGML_IQ4_NL, kQwen4SparseMoeHidden,
                 kQwen4SparseMoeIntermediate);
-            ggml_block_linear(gathered, gate, gate_output, stream);
-            ggml_block_linear(gathered, up, up_output, stream);
-            detail::qwen4_sparse_moe_swiglu_launch(gate_output, up_output, activated, stream);
+            detail::qwen4_sparse_moe_prefill_gate_up_swiglu_launch(
+                gathered, gate, up, activated, stream);
             ggml_block_linear(activated, down, expert_output, stream);
             detail::qwen4_sparse_moe_prefill_scatter_launch(
                 expert_output, occurrence_tensor, offset, count, scratch.rank_results, stream);
