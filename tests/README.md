@@ -223,7 +223,8 @@ T=4096 prefill and the `64+1+1986+1+2044` partition, crossing the GDN 64-token b
 exact PLE addressing/history, and final-layer QSA selection structure. Scalar/prefill floating
 deltas are reported only as localization evidence: their first persistent difference is the
 layer-0 FP32 GDN recurrence after an exact 61,440-byte BF16 convolution state, and the independent
-GDN Op test admits both maximum-width schedules against its complete FP64 oracle. Per-token output
+GDN Op test admits scalar T=1, one-shot, aligned 64x64, and the five-part schedule at the exact
+post-expansion `Hq=Hv=48,D=128,T=4096` geometry against one complete FP64 oracle. Per-token output
 hashes remain supplementary; the scalar probe transcript and full 157,147,144-byte continuation
 are compared byte-for-byte across reset/replay, and the raw continuation is compared again after
 each rejected overflow. Through position 2050 every complete block fits; at positions 2051 and
