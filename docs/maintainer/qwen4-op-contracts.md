@@ -1,16 +1,13 @@
 # Qwen4 Op contract design
 
 This document fixes the semantic boundaries and qualification design for the Ops needed by the
-Qwen4 family described in `plans/qwen4-architecture.md`. Section 5 now has the live C=1/T=1
-actual-artifact `gated_residual_read`, `gated_residual_read_write`, and `gated_residual_inject`
-entries at the
-preview geometry, Section 6 has a live exact `ngram_row_ids` entry, and Sections 2-4 have the live
-C=1 QSA foundation entries `qsa_state_append`, `qsa_index_select`, and
-`qsa_selected_attention`, plus the actual-artifact C=1/T=1 composite `qsa_verifier_token`.
-Section 7 has the live C=1 PLE entries `ple_iq4_nl_stage_rows`,
-`ple_iq4_nl_decode_rows`, and `ple_inject`, and Section 8 has the live C=1/T=1 GGML verifier profile
-`gated_delta_net_layer`. Section 9 has the live C=1/T=1 actual-artifact
-`qwen4_sparse_moe` verifier. Their concrete headers, CUDA implementations, and independent
+Qwen4 family described in `plans/qwen4-architecture.md`. The unregistered verifier now has C=1,
+T=1..4096 entries for GGML embedding/linear, gated residual, QSA, GDN, PLE, and sparse MoE while
+retaining the specialized T=1 decode routes. Exact n-gram continuation supplies the T-wide PLE
+rows. Sections 2-4 describe the live `qsa_state_append`, `qsa_index_select`,
+`qsa_selected_attention`, and actual-artifact `qsa_verifier` composite. Sections 5-9 describe the
+remaining live transformations, including both scalar `qwen4_sparse_moe` and grouped
+`qwen4_sparse_moe_prefill`. Their concrete headers, CUDA implementations, and independent
 qualification tests are present; remaining conceptual entries are implementation designs and are
 not evidence that those Ops, kernels, target, or product routes exist. A concrete
 header under `include/ninfer/ops/` is authoritative for its
@@ -91,11 +88,11 @@ section 8 fixes both consequences explicitly.
 ## 2. QSA index projection and state append
 
 The represented-state transition is implemented by `qsa_state_append` in
-`include/ninfer/ops/qsa.h`. It appends already-produced BF16 normalized/rotated core K, projected V,
-raw index keys, and three-axis positions to the fixed C=1 research state. Core K/V are encoded as
-NVFP4-G16. `qsa_verifier_token` is the admitted actual-artifact T=1 projection-plus-append form:
-it uses separate BF16 index-query `[512,2560]` and index-key `[128,2560]` weights and FP32 norm
-weights. The wider, batched conceptual entry below remains future design.
+`include/ninfer/ops/qsa.h`. It appends T-wide BF16 normalized/rotated core K, projected V, raw index
+keys, and three-axis positions to the fixed C=1 research state. Core K/V are encoded as
+NVFP4-G16. `qsa_verifier` is the admitted actual-artifact T=1..4096 projection-plus-append form: it
+uses separate BF16 index-query `[512,2560]` and index-key `[128,2560]` weights and FP32 norm weights.
+The multi-request conceptual entry below remains future design.
 
 The projection and append are one closed Op because the raw index key is persistent state, while
 selection is a separate Op because it is exact and can be independently qualified from represented
@@ -243,14 +240,13 @@ valid counts and visible lengths inside the declared maxima without changing sem
 ## 4. QSA gated sparse GQA
 
 The inner cache-consuming attention is implemented by `qsa_selected_attention` in
-`include/ninfer/ops/qsa.h`: the live C=1/T=1 entry accepts already normalized/rotated BF16
-`q [256,24,1]`, maps 24 query heads to two NVFP4-G16 KV heads in groups of 12, decodes every
-selected K/V row from state, and emits BF16 `[256,24,1]`. Its I32 selected-id operand has a
-caller-known bound in `[1,2051]`; selected count is a device scalar in `[0,bound]`. The caller owns
-one aligned 1,008,128-byte workspace and no pointer survives the call. The fixed
-`qsa_verifier_token` composes that entry with the state append and selector, actual Q5_K
+`include/ninfer/ops/qsa.h`: the live C=1/T=1..4096 entry accepts already normalized/rotated BF16
+`q [256,24,T]`, maps 24 query heads to two NVFP4-G16 KV heads in groups of 12, decodes every
+per-column selected K/V row from state, and emits BF16 `[256,24,T]`. Its I32 selected-id operand is
+`[S,T]` for caller-known `S` in `[1,2051]`; selected counts are device I32 `[T]`. The fixed
+`qsa_verifier` composes that entry with the T-wide state append and selector, actual Q5_K
 core/output projections, converted-gamma norms, partial MRoPE, and the output gate. The generalized
-entry below remains a proposed future composite. The verifier validates the complete state view
+multi-request entry below remains a proposed future composite. The verifier validates the complete state view
 and the pairwise separation of every caller-owned input, weight, state, output, and workspace range
 synchronously before its first projection launch; a rejected call queues no work and mutates no
 storage.
@@ -317,14 +313,15 @@ caller promises visibility because this entry deliberately does not receive the 
 the selector already guarantees causality, and this Op does not infer it from numeric ids. Every
 valid query must have at least one selected id.
 
-For selected bounds at most 64, the qualified live implementation uses one CTA per query head. At
-larger bounds, grouped-query score and value tiles share each decoded NVFP4 K/V row across four
-query heads, with deterministic tile-order finalization in the caller-owned workspace. This is a
-private T=1 implementation profile: it does not change the listed-id formula, FP32 softmax, cache
-codec, or public represented outputs.
+T=1 retains two qualified routes: selected bounds at most 64 use one CTA per query head, while
+larger bounds use grouped-query score/value tiles and deterministic tile-order finalization. T>1
+uses one CTA per query head and token and needs no workspace proportional to T; its per-query CSR
+selection is the causal boundary that prevents a query from observing K/V appended for later
+columns. These are private implementation profiles and do not change the listed-id formula, FP32
+softmax, cache codec, or public represented outputs.
 
-`out` is BF16 `[H,W,C]` for the preview. Invalid token columns are exact zero. In the live T=1
-verifier the per-head represented BF16 attention is multiplied by sigmoid of its corresponding
+`out` is BF16 `[H,W,C]` for the preview. Invalid token columns are exact zero. In the live verifier
+the per-head represented BF16 attention is multiplied by sigmoid of its corresponding
 represented BF16 raw gate, then the concatenated `[6144]` vector crosses the Q5_K output matrix.
 The cache write and
 the complete output are the only effects. Output may not alias `x`, selected ids, weights, or cache;
@@ -350,8 +347,8 @@ sublayer call.
 
 ### 5.1 Read formula
 
-The implemented verifier admits exactly C=1/T=1. For `R` `[H,B]`, normalize each branch
-separately with its own slice of converted GGUF gamma:
+The implemented verifier admits C=1 and T=1..4096. For `R` `[H,B,T]`, normalize each branch and
+token separately with its own slice of converted GGUF gamma:
 
 ```text
 Rhat_i = rmsnorm(R_i, eps) * gamma_i
@@ -385,10 +382,10 @@ The supplementary public read/write-minus-read increment fell from about 5.84 us
 
 ### 5.2 Inject formula and effects
 
-For block result `y` `[H]`:
+For block result `y` `[H,T]`:
 
 ```text
-R_out[:,i] = R[:,i] + write_scale[i] * y[:].
+R_out[:,i,t] = R[:,i,t] + write_scale[i,t] * y[:,t].
 ```
 
 Every element is written. `x` and `write_scale` may not overlap `R` or each other. Inject permits
@@ -401,17 +398,18 @@ decode/encode boundaries and its own criterion. It is not enabled by the BF16 co
 
 ## 6. Exact n-gram row addressing
 
-Implemented family: `include/ninfer/ops/ngram_embedding.h`, with exact CUDA and C=1/T=1 host
-integer routes qualified by `tests/ops/test_ngram_embedding.cpp`. The host entry prepares the same
-validated constants once, accepts one current token plus the oldest-to-newest two-token history,
-and returns sixteen rows plus the advanced raw history. It performs no floating-point work or
+Implemented family: `include/ninfer/ops/ngram_embedding.h`, with exact CUDA and C=1 host integer
+routes qualified by `tests/ops/test_ngram_embedding.cpp`. The host entry prepares the same validated
+constants once, advances an arbitrary token span from the oldest-to-newest two-token history, and
+returns sixteen rows per token plus the advanced raw history. It performs no floating-point work or
 embedding decode. The CUDA route remains independently exercised against the naive exact oracle;
-the tests also compare every host step directly with CUDA across continuation, EOS, and reset.
+the tests also compare one-shot, partitioned, and tokenwise host execution directly with CUDA
+across continuation, EOS, and reset.
 
 The UD-IQ1_S verifier owns its two-token host history, uploads the exact row ids and advanced
-history for device diagnostics/state, and starts the mapped-row gather after the layer-0 mixer is
-queued. The row H2D stays on the execution stream, so decode and PLE injection remain ordered before
-decoder layer 1 without a row-id D2H transfer or a PLE-specific stream synchronization.
+history for device diagnostics/state, and stages all T row panels on the transfer stream while
+layer 0 executes. A transfer-ready event orders device decode before decoder layer 1 without a
+row-id D2H transfer.
 
 Conceptual entry:
 
@@ -485,13 +483,13 @@ history selected by the Program. No workspace is required.
 
 ## 7. PLE gather/decode and injection
 
-Implemented family: `include/ninfer/ops/ple.h`. The admitted host-resident profile is the fixed
-C=1 decode boundary: `ple_iq4_nl_stage_rows` copies exactly sixteen 90-byte IQ4_NL rows from the
-mapped table into caller-owned pinned storage and enqueues one transfer into a stable device slot;
-`ple_iq4_nl_decode_rows` performs exact device decode to BF16. `ple_inject` implements the complete
-C=1 injection/state transition with Q8_0 key/value projections and FP32 norm/convolution controls.
-Every column in its declared W is valid; the future batched composite with `valid_tokens` and exact
-invalid suffixes is not implemented by this verifier entry.
+Implemented family: `include/ninfer/ops/ple.h`. The admitted host-resident C=1 profile has scalar
+`ple_iq4_nl_stage_rows` and T-wide `ple_iq4_nl_stage_rows_batch`; the latter copies exactly
+`16*T` 90-byte IQ4_NL rows into fixed caller-owned pinned storage and enqueues one contiguous H2D.
+`ple_iq4_nl_decode_rows` exact-decodes U8 `[90,16,T]` to BF16 `[160,16,T]` on the GPU.
+`ple_inject` implements the complete T=1..4096 injection/state transition with Q8_0 key/value
+projections and FP32 norm/convolution controls. Every column in W is valid; multi-request invalid
+suffixes remain outside this verifier entry.
 
 ### 7.1 Gather/decode boundary
 
@@ -507,8 +505,8 @@ to the represented table view. BF16 compares after exact BF16 decode; a future F
 requires a registered decoder and codec-specific criterion.
 
 A device-resident table could expose `ngram_embedding_gather(table,row_ids,E,...)` directly. The
-admitted host-resident C=1 path instead takes the sixteen exact row ids at the round boundary and
-copies their encoded 90-byte spans, in head order and without semantic deduplication, from the
+admitted host-resident C=1 path instead takes all `16*T` exact row ids at the round boundary and
+copies their encoded 90-byte spans, in token/head order and without semantic deduplication, from the
 artifact-owned mapping into one bounded pinned slot. One H2D transfer populates the paired stable
 device slot; `ple_iq4_nl_decode_rows` then performs only exact GPU decode. File I/O, page-fault
 policy, staging-ring ownership, and slot completion remain outside the Op. Neither entry mutates
@@ -569,7 +567,7 @@ envelope, not persistent history. One-shot prefill, arbitrary legal chunk partit
 ## 8. Qwen4 GDN profile
 
 Implemented first profile: `include/ninfer/ops/gated_delta_net_layer.h`. It is one semantically
-closed C=1/T=1 layer entry over the converted UD-IQ1_S checkpoint storage: qkv and z are GGML
+closed C=1/T=1..4096 layer entry over the converted UD-IQ1_S checkpoint storage: qkv and z are GGML
 Q5_K (Q6_K for layer 2), output is GGML Q6_K, and a/b/conv/ssm_a/dt_bias/norm are FP32.
 It owns projection, width-four causal convolution and final convolution history, controls, the
 recurrence call, sigmoid-gated learned RMSNorm, and output projection. Distinct state inputs remain
@@ -592,17 +590,18 @@ Its live artifact verifier profile has:
    128-wide value head, followed by output projection `[2560,6144]`; and
 4. distinct or exact in-place BF16 convolution state and FP32 recurrence state.
 
-Batched snapshot/replay/fold admission remains a future target-schedule tranche. It must reuse the
-same formula and represented boundaries; a Qwen4 Program will own which distinct outputs become
-committed. It is not implied by the C=1 verifier entry.
+Batched multi-request snapshot/replay/fold admission remains a future target-schedule tranche. The
+live C=1 entry accepts arbitrary T partitions, updates the three-column BF16 convolution history
+sequentially, and composes the recurrence in 64-token tiles while preserving one FP32 final state.
+Program owns which in-place state becomes committed.
 
 The oracle exact-decodes Q5_K/Q6_K bytes and covers projection, width-four causal convolution, Q/K
 L2 normalization, control gates, every FP32 recurrence update, sigmoid output gating, and Q6_K
-output projection. Repeated `T=1` continuation is compared to one sequential FP64 oracle from the
-same represented initial state; a distinct-output call proves the rollback boundary. There is no
-prefill entry in this verifier profile.
+output projection. T=1, T=64, T=65, arbitrary partitions, and nonzero initial state are compared
+directly to one sequential FP64 oracle from the same represented inputs; a distinct-output call
+proves the rollback boundary.
 
-## 9. Live C=1/T=1 sparse-MoE verifier
+## 9. Live C=1 sparse-MoE verifier
 
 The current `sparse_moe` contract is fixed to H=2048, 256 experts, top 8, width 512, and an
 AddResidual epilogue. `qwen4_sparse_moe` is a separate fixed verifier entry because the preview
@@ -650,8 +649,21 @@ The live pipeline owns two slots, so both pinned and device staging are exactly 
 same 6,400,000 or 8,448,000 encoded bytes still cross H2D per layer. Transfer-ready and
 consumer-complete events protect host and device reuse. The next call's route-ready -> IDs-ready
 barrier also proves the preceding call's two slots complete before rank zero can overwrite them.
+The pipeline binds its event set to one compute stream and rejects stream substitution, which is
+required for this transitive cross-call proof.
 The mapped banks are never pinned or copied in full. The entry owns no scheduling, model registry,
 or Engine path.
+
+`qwen4_sparse_moe_prefill` owns the same complete formula for C=1, T=1..4096. It receives all
+`10*T` route ids in one D2H, validates and groups them using a fixed 335,876-byte caller-owned
+pinned integer scratch span, and stages each unique expert once in ascending-id groups of at most
+32. Two 27,197,440-byte pinned/device slots alternate. Each group stores its exact gate/up pairs
+followed immediately by its rank-token occurrence list, so one contiguous H2D publishes both.
+GPU gather, GGML projections, SwiGLU, routed down, scatter, shared branch, and rank-order FP32
+accumulation preserve the scalar represented boundaries. Duplicate expert use across tokens does
+not duplicate staged matrix bytes, and the Op performs no allocation or floating-point CPU work.
+The host scratch is four-byte aligned and mutually disjoint from both mapped banks and the pinned
+stage; the same fixed-compute-stream rule protects cross-call slot reuse.
 
 The same semantic Op also has a device-resident verifier profile. Its routed gate and up operands
 are complete rank-three IQ1_S or IQ2_XXS banks `[512,640,2560]`, and routed down is the complete
@@ -673,17 +685,21 @@ shared gate/up codecs, exact host/device staged bytes, and actual T=1 shapes. It
 decodes IQ1_S/IQ2_XXS, IQ4_NL, Q5_K/Q6_K, and Q8_0 independently and evaluates the complete ideal formula.
 The verifier's private BF16 projection/SwiGLU storage and FP32 routing/accumulation profile are
 qualified with fixed normwise and finite gross criteria; they are not copied into the ideal oracle.
-Prefill and batched C lanes remain future registered-target work rather than claims of this entry.
+The T-wide profile additionally covers duplicate-token routes, both routed/shared codec pairs, a
+70-unique-expert panel that forces 32/32/6 grouping and slot reuse, exact staged bytes and
+occurrence order, and complete FP64 output. Batched C lanes remain future registered-target work.
 
 ## 10. Schedule-owned transactions are not Ops
 
 The unregistered `src/targets/qwen4/program.cpp` verifier now composes these live C=1 Ops into the
-48-layer eager Text schedule with one exact 4096-token frontier. It resets continuation only at a
-sequence boundary, refreshes the four residual branches for each numeric token, runs PLE before
-zero-based layer 1, appends and selects QSA through the NVFP4-G16 cache, serializes the selected
-expert route-id dependency before feeding the two-stream/two-slot staging pipeline, and finishes
-with the read-only GR and untied Q4_K head. It exposes diagnostic views and GPU-computed NLL but is
-not a registered target or an Engine execution path.
+48-layer eager Text schedule with one exact 4096-token frontier. `prefill_chunk` accepts 1..4096
+numeric token ids, constructs a causal CSR slice for every query, processes the layer schedule over
+the complete T panel, and projects only the final column through the untied Q4_K head. It overlaps
+the mapped PLE panel with layer 0 and uses grouped two-slot expert staging in each layer. The
+existing T=1 entry remains the teacher-forced NLL/decode path. Successful prefill commits the QSA,
+GDN, PLE, frontier, and final continuation state only after both streams synchronize; post-enqueue
+failure poisons the Program until reset, while pre-enqueue validation leaves it usable. It exposes
+diagnostic views but is not a registered target or an Engine execution path.
 
 The following remain in `src/targets/qwen4` even when they invoke the Ops above:
 
@@ -734,15 +750,15 @@ The minimum meaningful matrix is:
 
 | Family | Required cells |
 |---|---|
-| QSA projection/composite | live verifier: separate BF16 512x2560/128x2560 index projections, Q5_K 12288x2560/512x2560/2560x6144 core/output projections, FP32 norms, C=1/T=1, exact selected ids, current-token NVFP4 round-trip, complete FP64 output oracle. Future registered batched entry qualifies C=4,8 and distinct-state forms |
+| QSA projection/composite | live verifier: separate BF16 512x2560/128x2560 index projections, Q5_K 12288x2560/512x2560/2560x6144 core/output projections, FP32 norms, C=1/T=1..4096, exact per-column selected ids and current-token NVFP4 round-trip, complete FP64 output oracle. Future registered batched entry qualifies C=4,8 and distinct-state forms |
 | QSA selector | visible counts 0..5 and 2047..2053; 512-block saturation; non-contiguous visible ids; unequal C lanes; fragmented pages; multimodal positions; all-zero and boundary ties; BF16 pool/cast witnesses |
-| QSA attention | live verifier: real 24/2/256 T=1 geometry; new-current NVFP4-G16 cache read; selected count 1, 2048, and 2051; nonuniform 2051-entry complete FP64 oracle; short and tiled routes. Future registered entry qualifies prefill, fragmented pages, and other cache codecs |
-| GR | live verifier: real 4x2560/R=320; FP32 norm/write and Q8_0 down/up; read-only/read-write/inject; C=1/T=1; exact Q8_0 decode oracle; in-place inject. Future registered batched entry qualifies C=4,8 and graph envelopes |
+| QSA attention | live verifier: real 24/2/256 T=1..4096 geometry; newly appended NVFP4-G16 cache reads under per-query causal CSR; selected count 1, 2048, and 2051; nonuniform and batched complete FP64 oracles; short/tiled T=1 and one-CTA/head/token T-wide routes. Future registered entry qualifies fragmented pages and other cache codecs |
+| GR | live verifier: real 4x2560/R=320; FP32 norm/write and Q8_0 down/up; read-only/read-write/inject; C=1/T=1..4096; exact Q8_0 decode oracle; in-place inject. Future registered batched entry qualifies C=4,8 and graph envelopes |
 | n-gram | exact vectors below; empty/short history; EOS as current and prior token; one-shot/chunk/T=1; C lane isolation; every admitted PLE-module index |
-| PLE gather | first/last valid row, repeated and permuted ids, 16-head order, codec edges, direct versus staged-remap equality when both execution profiles exist |
+| PLE gather | first/last valid row, repeated and permuted ids, 16-head/token order, codec edges, and exact T=1/16/17/128/4096 decode against the independent IQ4_NL oracle |
 | PLE inject | live verifier: real 4x2560 projections/state; zero and nonzero history; one-shot/legal chunks/T=1; dilation witness; in-place output; C=1. Future registered batched entry: C=4,8 isolation and invalid-suffix semantics |
-| GDN | live verifier: source 16 Q/K heads expanded to 48 tiled artifact heads (`h%16`) at width 128; direct represented `ssm_a`; Q5_K and layer-2 Q6_K inputs; Q6_K output; repeated T=1; nonzero FP32 initial state; sigmoid output gate; distinct rollback and in-place continuation. Future Program routes qualify prefill and snapshot/record/fold if used |
-| sparse MoE | live verifier: 512/top10/I640; lower-id all-zero and tenth-boundary ties; selected normalization; IQ1_S/IQ2_XXS two-slot host staging and complete device-resident bank profiles; IQ4_NL routed down; Q5_K/Q6_K shared gate/up; Q8_0 shared down; shared-gate extremes; exact 844,800-byte per-slot cap and two-slot lifetime; device-id bank indexing; T=1 Store result. Future registered entry qualifies batched/prefill routes |
+| GDN | live verifier: source 16 Q/K heads expanded to 48 tiled artifact heads (`h%16`) at width 128; direct represented `ssm_a`; Q5_K and layer-2 Q6_K inputs; Q6_K output; T=1/64/65 and arbitrary partition continuation; nonzero FP32 initial state; sigmoid output gate; distinct rollback and in-place continuation. Future registered routes qualify multi-request snapshot/record/fold if used |
+| sparse MoE | live verifier: 512/top10/I640; lower-id all-zero and tenth-boundary ties; selected normalization; IQ1_S/IQ2_XXS scalar and grouped T=1..4096 two-slot host staging plus complete device-resident bank profiles; IQ4_NL routed down; Q5_K/Q6_K shared gate/up; Q8_0 shared down; exact group bytes/occurrence order and FP64 Store output. Future registered entry qualifies C=4,8 |
 
 Named numeric criteria must be fixed from adversarial and target-representative oracle-error
 distributions before a failing candidate is judged. Reduction Ops require both a normwise bound and

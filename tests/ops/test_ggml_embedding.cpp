@@ -9,6 +9,7 @@
 #include <limits>
 #include <random>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 using namespace ninfer;
@@ -94,6 +95,85 @@ int run_row(const std::vector<std::uint8_t>& encoded, Weight weight, int row_id)
     return failures;
 }
 
+int run_batch(const std::vector<std::uint8_t>& encoded, Weight weight,
+              std::int32_t tokens) {
+    std::vector<std::int32_t> token_ids(static_cast<std::size_t>(tokens));
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        token_ids[static_cast<std::size_t>(token)] = (token * 3 + 1) % kRows;
+    }
+    DeviceBuffer device_ids = to_device(token_ids);
+    const std::size_t count =
+        static_cast<std::size_t>(kWidth) * static_cast<std::size_t>(tokens);
+    GuardedDeviceBuffer output(count * sizeof(std::uint16_t));
+    output.fill(0xff);
+    cuda_synchronize();
+    Tensor ids(device_ids.p, DType::I32, {tokens});
+    Tensor out(output.data(), DType::BF16, {kWidth, tokens});
+    ops::ggml_q4_k_embedding(weight, ids, out, nullptr);
+    cuda_synchronize();
+
+    std::vector<std::uint16_t> expected(count);
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        const auto* row = encoded.data() +
+                          static_cast<std::size_t>(token_ids[static_cast<std::size_t>(token)]) *
+                              kRowBytes;
+        for (std::int32_t column = 0; column < kWidth; ++column) {
+            expected[static_cast<std::size_t>(token) * kWidth + column] =
+                f32_to_bf16(static_cast<float>(decode(row, column)));
+        }
+    }
+    const std::string label = "Q4_K embedding batch T=" + std::to_string(tokens);
+    int failures =
+        verify_exact(label.c_str(), from_device<std::uint16_t>(output.data(), count), expected);
+    failures += output.verify_guards(label);
+    return failures;
+}
+
+template <class Function>
+int expect_invalid(Function&& function, const char* label) {
+    try {
+        function();
+    } catch (const std::invalid_argument&) {
+        return 0;
+    }
+    std::cerr << label << " was accepted\n";
+    return 1;
+}
+
+int validation_cases(Weight weight) {
+    constexpr std::int32_t tokens = 2;
+    const std::vector<std::int32_t> token_ids = {0, kRows - 1};
+    DeviceBuffer device_ids = to_device(token_ids);
+    DeviceBuffer device_out(static_cast<std::size_t>(kWidth) * tokens *
+                            sizeof(std::uint16_t));
+    Tensor ids(device_ids.p, DType::I32, {tokens});
+    Tensor out(device_out.p, DType::BF16, {kWidth, tokens});
+    int failures = 0;
+
+    Tensor wrong_dtype_ids(device_ids.p, DType::BF16, {tokens});
+    failures += expect_invalid(
+        [&] { ops::ggml_q4_k_embedding(weight, wrong_dtype_ids, out, nullptr); },
+        "BF16 token ids");
+    Tensor wrong_tokens_out(device_out.p, DType::BF16, {kWidth});
+    failures += expect_invalid(
+        [&] { ops::ggml_q4_k_embedding(weight, ids, wrong_tokens_out, nullptr); },
+        "output token mismatch");
+    Tensor aliased_out(device_ids.p, DType::BF16, {kWidth, tokens});
+    failures += expect_invalid(
+        [&] { ops::ggml_q4_k_embedding(weight, ids, aliased_out, nullptr); },
+        "output/id alias");
+    Tensor too_many_ids(device_ids.p, DType::I32, {4097});
+    failures += expect_invalid(
+        [&] { ops::ggml_q4_k_embedding(weight, too_many_ids, out, nullptr); },
+        "T above verifier ceiling");
+    Tensor empty_ids = ids;
+    empty_ids.ne[0] = 0;
+    failures += expect_invalid(
+        [&] { ops::ggml_q4_k_embedding(weight, empty_ids, out, nullptr); },
+        "zero-token input");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -112,6 +192,10 @@ int main() {
     int failures = run_row(encoded, weight, 0);
     failures += run_row(encoded, weight, 2);
     failures += run_row(encoded, weight, kRows - 1);
+    for (const std::int32_t tokens : {1, 16, 17, 128, 4096}) {
+        failures += run_batch(encoded, weight, tokens);
+    }
+    failures += validation_cases(weight);
     for (const int invalid : {-1, kRows}) {
         try {
             DeviceBuffer output(static_cast<std::size_t>(kWidth) * sizeof(std::uint16_t));

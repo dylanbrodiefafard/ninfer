@@ -19,6 +19,24 @@ inline constexpr std::int32_t kQwen4SparseMoePipelineSlots = 2;
 inline constexpr std::size_t kQwen4SparseMoeRankStageCapacityBytes = 844'800;
 inline constexpr std::size_t kQwen4SparseMoePipelineStageBytes =
     kQwen4SparseMoePipelineSlots * kQwen4SparseMoeRankStageCapacityBytes;
+inline constexpr std::int32_t kQwen4SparseMoePrefillMaxWidth = 4096;
+inline constexpr std::int32_t kQwen4SparseMoePrefillGroupExperts = 32;
+inline constexpr std::size_t kQwen4SparseMoePrefillGroupMatrixCapacityBytes =
+    static_cast<std::size_t>(kQwen4SparseMoePrefillGroupExperts) *
+    kQwen4SparseMoeRankStageCapacityBytes;
+inline constexpr std::size_t kQwen4SparseMoePrefillOccurrenceCapacityBytes =
+    static_cast<std::size_t>(kQwen4SparseMoeTopK) * kQwen4SparseMoePrefillMaxWidth *
+    sizeof(std::int32_t);
+inline constexpr std::size_t kQwen4SparseMoePrefillSlotCapacityBytes =
+    kQwen4SparseMoePrefillGroupMatrixCapacityBytes +
+    kQwen4SparseMoePrefillOccurrenceCapacityBytes;
+inline constexpr std::size_t kQwen4SparseMoePrefillPipelineStageBytes =
+    kQwen4SparseMoePipelineSlots * kQwen4SparseMoePrefillSlotCapacityBytes;
+inline constexpr std::size_t kQwen4SparseMoePrefillHostScratchI32 =
+    2ULL * kQwen4SparseMoeTopK * kQwen4SparseMoePrefillMaxWidth +
+    4ULL * kQwen4SparseMoeExperts + 1ULL;
+inline constexpr std::size_t kQwen4SparseMoePrefillHostScratchBytes =
+    kQwen4SparseMoePrefillHostScratchI32 * sizeof(std::int32_t);
 
 /** Two read-only mapped-host expert banks with the same exact GGML format. */
 struct Qwen4MappedRoutedGateUp {
@@ -66,13 +84,39 @@ struct Qwen4ResidentSparseMoeWeights {
  * slots free: current route_ready follows all preceding compute consumers, and current ids_ready
  * follows route_ready plus all preceding transfer work. Within one call, ready/complete events
  * explicitly protect slot reuse beginning at rank two. These resources affect only execution and
- * not the Op result.
+ * not the Op result. compute_stream binds every use of one pipeline/event set to one stream so the
+ * cross-call ordering proof cannot be invalidated by stream substitution.
  */
 struct Qwen4SparseMoePipeline {
     void* pinned_stage = nullptr;
     std::size_t pinned_stage_bytes = 0;
     Tensor device_stage;
     cudaStream_t transfer_stream = nullptr;
+    cudaStream_t compute_stream = nullptr;
+    cudaEvent_t route_ready = nullptr;
+    cudaEvent_t ids_ready = nullptr;
+    cudaEvent_t transfer_ready[kQwen4SparseMoePipelineSlots]{};
+    cudaEvent_t consumer_complete[kQwen4SparseMoePipelineSlots]{};
+};
+
+/**
+ * Caller-owned two-stream/two-slot resources for qwen4_sparse_moe_prefill. Each slot has room for
+ * 32 exact IQ2_XXS gate/up pairs (the largest admitted routed format) followed by all 10*4096
+ * integer occurrence indices. The fixed 54,394,880-byte pinned/device spans bound staging without
+ * pinning a source bank. host_scratch is a fixed four-byte-aligned pinned span holding the one
+ * selected-id D2H and bounded integer grouping tables, so the Op performs no runtime allocation.
+ * It is mutually disjoint from both mapped banks and pinned_stage. Event ownership, fixed
+ * compute-stream binding, and transitive cross-call lifetime rules are identical to
+ * Qwen4SparseMoePipeline, but reuse is per unique-expert group rather than per rank.
+ */
+struct Qwen4SparseMoePrefillPipeline {
+    void* pinned_stage = nullptr;
+    std::size_t pinned_stage_bytes = 0;
+    void* host_scratch = nullptr;
+    std::size_t host_scratch_bytes = 0;
+    Tensor device_stage;
+    cudaStream_t transfer_stream = nullptr;
+    cudaStream_t compute_stream = nullptr;
     cudaEvent_t route_ready = nullptr;
     cudaEvent_t ids_ready = nullptr;
     cudaEvent_t transfer_ready[kQwen4SparseMoePipelineSlots]{};
@@ -81,6 +125,10 @@ struct Qwen4SparseMoePipeline {
 
 /** Caller-owned transient device capacity for the exact C=1/T=1 verifier profile. */
 [[nodiscard]] std::size_t qwen4_sparse_moe_workspace_capacity_bytes();
+
+/** Caller-owned transient device capacity for qwen4_sparse_moe_prefill at exact width T. */
+[[nodiscard]] std::size_t qwen4_sparse_moe_prefill_workspace_capacity_bytes(
+    std::int32_t width);
 
 /**
  * Op: qwen4_sparse_moe
@@ -120,6 +168,29 @@ void qwen4_sparse_moe(const Tensor& x, const Qwen4SparseMoeWeights& weights,
                       Qwen4SparseMoePipeline& pipeline,
                       Tensor& selected_ids, Tensor& selected_weights, Tensor& destination,
                       WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
+ * T-wide staged sparse-MoE for C=1, T in [1,4096]. x/destination are BF16 [2560,T], and route
+ * outputs are selected_ids I32 [10,T] and selected_weights FP32 [10,T], rank-fastest. Routing,
+ * softmax/renormalization, every decode/projection/SwiGLU, shared-expert work, and final rank-order
+ * FP32 accumulation execute on the GPU with the same represented BF16 boundaries as the scalar
+ * Op. The CPU receives all 10*T ids in one D2H, performs only validation and integer grouping,
+ * and copies every unique routed gate/up pair exactly once in ascending expert-id groups of at
+ * most 32. Two fixed slots overlap group transfer and consumption. An occurrence can reference a
+ * staged expert from any token/rank, and duplicate experts across tokens do not duplicate source
+ * bytes. Source banks are never decoded, repacked, or fully copied on the CPU.
+ *
+ * All device operands, output, route outputs, device stage, and workspace are pairwise disjoint;
+ * mapped banks and pinned stage are mutually disjoint. The caller owns both streams, all events,
+ * every view, and every lifetime through compute-stream completion. This host-grouped route is
+ * not CUDA-Graph capturable. The established qwen4_sparse_moe C=1/T=1 entry point and dispatch are
+ * unchanged.
+ */
+void qwen4_sparse_moe_prefill(const Tensor& x, const Qwen4SparseMoeWeights& weights,
+                              Qwen4SparseMoePrefillPipeline& pipeline,
+                              Tensor& selected_ids, Tensor& selected_weights,
+                              Tensor& destination, WorkspaceArena& workspace,
+                              cudaStream_t stream);
 
 /**
  * Op: qwen4_sparse_moe_resident

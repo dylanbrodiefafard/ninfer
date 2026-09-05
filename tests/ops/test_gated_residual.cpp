@@ -148,40 +148,47 @@ struct OracleResult {
     std::vector<double> scale;
 };
 
-OracleResult oracle(const Fixture& fixture, const std::vector<float>& residual) {
-    std::vector<double> normalized(kFlat);
-    for (std::int32_t branch = 0; branch < kBranches; ++branch) {
-        const std::size_t base = static_cast<std::size_t>(branch) * kHidden;
-        double sum_squares = 0.0;
-        for (std::int32_t d = 0; d < kHidden; ++d) {
-            const double value = residual[base + d];
-            sum_squares += value * value;
-        }
-        const double inverse = 1.0 / std::sqrt(sum_squares / kHidden + 1.0e-6);
-        for (std::int32_t d = 0; d < kHidden; ++d) {
-            normalized[base + d] = residual[base + d] * inverse * fixture.norm[base + d];
-        }
-    }
-
-    std::vector<double> low_rank = q8_project(fixture.down, kRank, kFlat, normalized);
-    for (double& value : low_rank) { value = silu(value / 4.0); }
-    const std::vector<double> up = q8_project(fixture.up, kFlat, kRank, low_rank);
-    OracleResult result{std::vector<double>(kHidden), std::vector<double>(kBranches)};
-    for (std::int32_t d = 0; d < kHidden; ++d) {
-        double mixed = 0.0;
+OracleResult oracle(const Fixture& fixture, const std::vector<float>& residual,
+                    std::int32_t tokens) {
+    OracleResult result{std::vector<double>(static_cast<std::size_t>(kHidden) * tokens),
+                        std::vector<double>(static_cast<std::size_t>(kBranches) * tokens)};
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        const std::size_t token_base = static_cast<std::size_t>(token) * kFlat;
+        std::vector<double> normalized(kFlat);
         for (std::int32_t branch = 0; branch < kBranches; ++branch) {
-            const std::size_t index = static_cast<std::size_t>(branch) * kHidden + d;
-            mixed += sigmoid(up[index]) * normalized[index];
+            const std::size_t base = static_cast<std::size_t>(branch) * kHidden;
+            double sum_squares = 0.0;
+            for (std::int32_t d = 0; d < kHidden; ++d) {
+                const double value = residual[token_base + base + d];
+                sum_squares += value * value;
+            }
+            const double inverse = 1.0 / std::sqrt(sum_squares / kHidden + 1.0e-6);
+            for (std::int32_t d = 0; d < kHidden; ++d) {
+                normalized[base + d] =
+                    residual[token_base + base + d] * inverse * fixture.norm[base + d];
+            }
         }
-        result.mixed[d] = mixed / 4.0;
-    }
-    for (std::int32_t branch = 0; branch < kBranches; ++branch) {
-        double projected = 0.0;
-        const std::size_t base = static_cast<std::size_t>(branch) * kFlat;
-        for (std::int32_t k = 0; k < kFlat; ++k) {
-            projected += fixture.write[base + k] * normalized[k];
+
+        std::vector<double> low_rank = q8_project(fixture.down, kRank, kFlat, normalized);
+        for (double& value : low_rank) { value = silu(value / 4.0); }
+        const std::vector<double> up = q8_project(fixture.up, kFlat, kRank, low_rank);
+        for (std::int32_t d = 0; d < kHidden; ++d) {
+            double mixed = 0.0;
+            for (std::int32_t branch = 0; branch < kBranches; ++branch) {
+                const std::size_t index = static_cast<std::size_t>(branch) * kHidden + d;
+                mixed += sigmoid(up[index]) * normalized[index];
+            }
+            result.mixed[static_cast<std::size_t>(token) * kHidden + d] = mixed / 4.0;
         }
-        result.scale[branch] = 2.0 * sigmoid(projected / 4.0);
+        for (std::int32_t branch = 0; branch < kBranches; ++branch) {
+            double projected = 0.0;
+            const std::size_t base = static_cast<std::size_t>(branch) * kFlat;
+            for (std::int32_t k = 0; k < kFlat; ++k) {
+                projected += fixture.write[base + k] * normalized[k];
+            }
+            result.scale[static_cast<std::size_t>(token) * kBranches + branch] =
+                2.0 * sigmoid(projected / 4.0);
+        }
     }
     return result;
 }
@@ -190,35 +197,35 @@ std::vector<std::uint16_t> bits(const void* device, std::size_t words) {
     return from_device<std::uint16_t>(device, words);
 }
 
-int run_case(const Fixture& fixture) {
-    std::vector<float> residual(kFlat);
-    std::vector<float> block_output(kHidden);
-    fill_uniform(residual, 7201U, -0.70F, 0.70F);
-    fill_uniform(block_output, 7202U, -0.30F, 0.30F);
+int run_case(const Fixture& fixture, std::int32_t tokens, const char* label) {
+    std::vector<float> residual(static_cast<std::size_t>(kFlat) * tokens);
+    std::vector<float> block_output(static_cast<std::size_t>(kHidden) * tokens);
+    fill_uniform(residual, 7201U + tokens, -0.70F, 0.70F);
+    fill_uniform(block_output, 7202U + tokens, -0.30F, 0.30F);
     round_to_bf16(residual);
     round_to_bf16(block_output);
-    const OracleResult expected = oracle(fixture, residual);
+    const OracleResult expected = oracle(fixture, residual, tokens);
 
     DeviceBuffer d_residual = to_device_bf16(residual);
     DeviceBuffer d_block = to_device_bf16(block_output);
-    GuardedDeviceBuffer d_mixed(kHidden * 2);
-    GuardedDeviceBuffer d_read_only(kHidden * 2);
-    GuardedDeviceBuffer d_scale(kBranches * 2);
-    GuardedDeviceBuffer d_injected(kFlat * 2);
+    GuardedDeviceBuffer d_mixed(static_cast<std::size_t>(kHidden) * tokens * 2);
+    GuardedDeviceBuffer d_read_only(static_cast<std::size_t>(kHidden) * tokens * 2);
+    GuardedDeviceBuffer d_scale(static_cast<std::size_t>(kBranches) * tokens * 2);
+    GuardedDeviceBuffer d_injected(static_cast<std::size_t>(kFlat) * tokens * 2);
     d_mixed.fill(0xcd);
     d_read_only.fill(0xcd);
     d_scale.fill(0xcd);
     d_injected.fill(0xcd);
 
-    Tensor residual_tensor(d_residual.p, DType::BF16, {kHidden, kBranches});
+    Tensor residual_tensor(d_residual.p, DType::BF16, {kHidden, kBranches, tokens});
     Tensor norm_tensor(fixture.d_norm.p, DType::FP32, {kFlat});
     Tensor write_tensor(fixture.d_write.p, DType::FP32, {kFlat, kBranches});
-    Tensor mixed_tensor(d_mixed.data(), DType::BF16, {kHidden});
-    Tensor read_only_tensor(d_read_only.data(), DType::BF16, {kHidden});
-    Tensor scale_tensor(d_scale.data(), DType::BF16, {kBranches});
+    Tensor mixed_tensor(d_mixed.data(), DType::BF16, {kHidden, tokens});
+    Tensor read_only_tensor(d_read_only.data(), DType::BF16, {kHidden, tokens});
+    Tensor scale_tensor(d_scale.data(), DType::BF16, {kBranches, tokens});
     const Weight down_weight = q8_weight(fixture.d_down.p, fixture.d_down.bytes, kRank, kFlat);
     const Weight up_weight = q8_weight(fixture.d_up.p, fixture.d_up.bytes, kFlat, kRank);
-    const std::size_t workspace_bytes = ops::gated_residual_workspace_capacity_bytes();
+    const std::size_t workspace_bytes = ops::gated_residual_workspace_capacity_bytes(tokens);
     WorkspaceArena workspace(workspace_bytes);
 
     ops::gated_residual_read_write(residual_tensor, norm_tensor, down_weight, up_weight,
@@ -227,39 +234,50 @@ int run_case(const Fixture& fixture) {
                              read_only_tensor, workspace, nullptr);
     cuda_synchronize();
 
-    const auto actual_mixed = from_device_bf16(d_mixed.data(), kHidden);
-    const auto actual_scale = from_device_bf16(d_scale.data(), kBranches);
-    int failures = verify_reduction("gated residual Q8 read", actual_mixed, expected.mixed,
+    const auto actual_mixed = from_device_bf16(d_mixed.data(), expected.mixed.size());
+    const auto actual_scale = from_device_bf16(d_scale.data(), expected.scale.size());
+    int failures = verify_reduction(std::string(label) + " Q8 read", actual_mixed, expected.mixed,
                                     kReadCriterion);
-    failures += verify_reduction("gated residual FP32 write", actual_scale, expected.scale,
+    failures += verify_reduction(std::string(label) + " FP32 write", actual_scale, expected.scale,
                                  kScaleCriterion);
-    failures += verify_exact("gated residual final read-only form", bits(d_read_only.data(), kHidden),
-                             bits(d_mixed.data(), kHidden));
+    const std::string read_only_label = std::string(label) + " final read-only form";
+    failures += verify_exact(read_only_label.c_str(),
+                             bits(d_read_only.data(), expected.mixed.size()),
+                             bits(d_mixed.data(), expected.mixed.size()));
 
-    Tensor block_tensor(d_block.p, DType::BF16, {kHidden});
-    Tensor injected_tensor(d_injected.data(), DType::BF16, {kHidden, kBranches});
+    Tensor block_tensor(d_block.p, DType::BF16, {kHidden, tokens});
+    Tensor injected_tensor(d_injected.data(), DType::BF16, {kHidden, kBranches, tokens});
     DeviceBuffer d_in_place = to_device_bf16(residual);
-    Tensor in_place_tensor(d_in_place.p, DType::BF16, {kHidden, kBranches});
+    Tensor in_place_tensor(d_in_place.p, DType::BF16, {kHidden, kBranches, tokens});
     ops::gated_residual_inject(residual_tensor, block_tensor, scale_tensor, injected_tensor, nullptr);
     ops::gated_residual_inject(in_place_tensor, block_tensor, scale_tensor, in_place_tensor, nullptr);
     cuda_synchronize();
 
-    std::vector<double> inject_expected(kFlat);
-    for (std::int32_t branch = 0; branch < kBranches; ++branch) {
-        for (std::int32_t d = 0; d < kHidden; ++d) {
-            const std::size_t index = static_cast<std::size_t>(branch) * kHidden + d;
-            inject_expected[index] = residual[index] + actual_scale[branch] * block_output[d];
+    std::vector<double> inject_expected(residual.size());
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        for (std::int32_t branch = 0; branch < kBranches; ++branch) {
+            for (std::int32_t d = 0; d < kHidden; ++d) {
+                const std::size_t index = static_cast<std::size_t>(token) * kFlat +
+                                          static_cast<std::size_t>(branch) * kHidden + d;
+                inject_expected[index] =
+                    residual[index] +
+                    actual_scale[static_cast<std::size_t>(token) * kBranches + branch] *
+                        block_output[static_cast<std::size_t>(token) * kHidden + d];
+            }
         }
     }
-    failures += verify_reduction("gated residual inject",
-                                 from_device_bf16(d_injected.data(), kFlat), inject_expected,
-                                 kInjectCriterion);
-    failures += verify_exact("gated residual in-place inject", bits(d_in_place.p, kFlat),
-                             bits(d_injected.data(), kFlat));
-    std::vector<std::uint16_t> expected_residual_bits(kFlat);
+    failures += verify_reduction(
+        std::string(label) + " inject",
+        from_device_bf16(d_injected.data(), inject_expected.size()), inject_expected,
+        kInjectCriterion);
+    const std::string inplace_label = std::string(label) + " in-place inject";
+    failures += verify_exact(inplace_label.c_str(),
+                             bits(d_in_place.p, residual.size()),
+                             bits(d_injected.data(), residual.size()));
+    std::vector<std::uint16_t> expected_residual_bits(residual.size());
     std::transform(residual.begin(), residual.end(), expected_residual_bits.begin(), f32_to_bf16);
-    failures += verify_exact("gated residual input preservation", bits(d_residual.p, kFlat),
-                             expected_residual_bits);
+    failures += verify_exact("gated residual input preservation",
+                             bits(d_residual.p, residual.size()), expected_residual_bits);
     failures += d_mixed.verify_guards("gated residual mixed");
     failures += d_read_only.verify_guards("gated residual read-only");
     failures += d_scale.verify_guards("gated residual scale");
@@ -276,7 +294,25 @@ int run_case(const Fixture& fixture) {
 int main() {
     if (const int unavailable = require_cuda()) { return unavailable; }
     Fixture fixture;
-    const int failures = run_case(fixture);
+    int failures = run_case(fixture, 1, "gated residual T=1");
+    failures += run_case(fixture, 3, "gated residual uneven T=3");
+    failures += run_case(fixture, 64, "gated residual T=64");
+    failures += run_case(fixture, 65, "gated residual T=65");
+    try {
+        const std::size_t broad = ops::gated_residual_workspace_capacity_bytes(4096);
+        if (broad <= ops::gated_residual_workspace_capacity_bytes(65)) {
+            std::cerr << "FAIL gated residual broad workspace capacity\n";
+            ++failures;
+        }
+    } catch (const std::invalid_argument&) {
+        std::cerr << "FAIL gated residual rejected T=4096 capacity\n";
+        ++failures;
+    }
+    try {
+        (void)ops::gated_residual_workspace_capacity_bytes(4097);
+        std::cerr << "FAIL gated residual accepted T=4097 capacity\n";
+        ++failures;
+    } catch (const std::invalid_argument&) {}
     std::cout << (failures ? "FAIL" : "OK") << " gated_residual\n";
     return failures == 0 ? 0 : 1;
 }

@@ -12,6 +12,7 @@
 #include <cstring>
 #include <iostream>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -147,6 +148,113 @@ int staging_decode_case() {
     failures += verify_exact("PLE exact IQ4_NL decode", actual, expected);
     failures += staged.verify_guards("PLE staged rows");
     failures += output.verify_guards("PLE decoded embedding");
+    return failures;
+}
+
+int batched_staging_decode_case(int width) {
+    constexpr int rows = 41;
+    const std::size_t slots = static_cast<std::size_t>(ops::kPleHeads) * width;
+    const std::size_t staged_bytes = static_cast<std::size_t>(ops::kPleStagedBytes) * width;
+    std::vector<std::uint8_t> table(static_cast<std::size_t>(rows) * ops::kPleIq4NlRowBytes);
+    for (int row = 0; row < rows; ++row) {
+        for (int block = 0; block < 5; ++block) {
+            auto* encoded = table.data() + static_cast<std::size_t>(row) * ops::kPleIq4NlRowBytes +
+                            block * ops::kPleIq4NlBlockBytes;
+            const std::uint16_t scale = f16_bits((2 * row + block + 3) / 512.0F);
+            encoded[0] = static_cast<std::uint8_t>(scale);
+            encoded[1] = static_cast<std::uint8_t>(scale >> 8U);
+            for (int lane = 0; lane < 16; ++lane) {
+                const int low = (row + 5 * block + lane) & 15;
+                const int high = (3 * row + block + 2 * lane + 1) & 15;
+                encoded[2 + lane] = static_cast<std::uint8_t>(low | (high << 4));
+            }
+        }
+    }
+    std::vector<std::int32_t> ids(slots);
+    for (int token = 0; token < width; ++token) {
+        for (int head = 0; head < ops::kPleHeads; ++head) {
+            ids[head + ops::kPleHeads * token] =
+                (token == width - 1 && (head == 3 || head == 11))
+                    ? 7
+                    : (17 * token + 5 * head + 2) % rows;
+        }
+    }
+
+    PinnedHostBuffer pinned(staged_bytes);
+    GuardedDeviceBuffer staged(staged_bytes);
+    GuardedDeviceBuffer output(slots * ops::kPleRowWidth * sizeof(std::uint16_t));
+    Tensor staged_tensor(staged.data(), DType::U8,
+                         {ops::kPleIq4NlRowBytes, ops::kPleHeads, width});
+    Tensor output_tensor(output.data(), DType::BF16,
+                         {ops::kPleRowWidth, ops::kPleHeads, width});
+    ops::ple_iq4_nl_stage_rows_batch(mapped_view(table, rows), ids, width, pinned.data(),
+                                     pinned.size(), staged_tensor, nullptr);
+    ops::ple_iq4_nl_decode_rows(staged_tensor, output_tensor, nullptr);
+    cuda_synchronize();
+
+    std::vector<std::uint8_t> expected_staged(staged_bytes);
+    std::vector<std::uint16_t> expected(slots * ops::kPleRowWidth);
+    for (std::size_t slot = 0; slot < slots; ++slot) {
+        const auto* row = table.data() + static_cast<std::size_t>(ids[slot]) * ops::kPleIq4NlRowBytes;
+        std::memcpy(expected_staged.data() + slot * ops::kPleIq4NlRowBytes, row,
+                    ops::kPleIq4NlRowBytes);
+        for (int d = 0; d < ops::kPleRowWidth; ++d) {
+            expected[d + ops::kPleRowWidth * slot] = f32_to_bf16(static_cast<float>(
+                iq4_oracle(row + (d / 32) * ops::kPleIq4NlBlockBytes, d % 32)));
+        }
+    }
+    std::vector<std::uint8_t> actual_pinned(staged_bytes);
+    std::memcpy(actual_pinned.data(), pinned.data(), staged_bytes);
+    int failures = verify_exact("PLE batched pinned row bytes", actual_pinned, expected_staged);
+    failures += verify_exact("PLE batched device row bytes",
+                             from_device<std::uint8_t>(staged.data(), staged_bytes),
+                             expected_staged);
+    failures += verify_exact("PLE batched exact IQ4_NL decode",
+                             from_device<std::uint16_t>(output.data(), expected.size()), expected);
+
+    const std::vector<std::uint8_t> before =
+        from_device<std::uint8_t>(staged.data(), staged_bytes);
+    auto invalid_ids = ids;
+    invalid_ids[ops::kPleHeads + 9] = rows;
+    bool rejected = false;
+    try {
+        ops::ple_iq4_nl_stage_rows_batch(mapped_view(table, rows), invalid_ids, width,
+                                         pinned.data(), pinned.size(), staged_tensor, nullptr);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    if (!rejected) {
+        std::cerr << "FAIL PLE batched invalid row was accepted\n";
+        ++failures;
+    }
+    failures += verify_exact("PLE rejected batch leaves device staging unchanged",
+                             from_device<std::uint8_t>(staged.data(), staged_bytes), before);
+    rejected = false;
+    try {
+        ops::ple_iq4_nl_stage_rows_batch(mapped_view(table, rows), ids, width, pinned.data(),
+                                         staged_bytes - 1, staged_tensor, nullptr);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    if (!rejected) {
+        std::cerr << "FAIL PLE batched short pinned slot was accepted\n";
+        ++failures;
+    }
+    rejected = false;
+    try {
+        ops::ple_iq4_nl_stage_rows_batch(mapped_view(table, rows),
+                                         std::span<const std::int32_t>(ids).first(ids.size() - 1),
+                                         width, pinned.data(), pinned.size(), staged_tensor,
+                                         nullptr);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    if (!rejected) {
+        std::cerr << "FAIL PLE batched malformed row-id extent was accepted\n";
+        ++failures;
+    }
+    failures += staged.verify_guards("PLE batched staged rows");
+    failures += output.verify_guards("PLE batched decoded embedding");
     return failures;
 }
 
@@ -432,9 +540,13 @@ int injection_state_case() {
 
 int main() {
     if (require_cuda() != 0) { return 1; }
+    static_assert(ops::kPleMaxStagedBytes == 5'898'240);
     int failures = 0;
     failures += conv_source_layout_witness();
     failures += staging_decode_case();
+    for (const int width : {3, 16, 17, 128, 4096}) {
+        failures += batched_staging_decode_case(width);
+    }
     failures += injection_state_case();
     if (failures != 0) {
         std::cerr << "PLE tests failed: " << failures << '\n';

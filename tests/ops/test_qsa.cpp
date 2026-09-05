@@ -284,54 +284,75 @@ int append_codec_and_attention_case() {
 
     // Independent FP64 attention oracle below starts from the exact stored code/scale bits. The
     // opposite K rows force a nonuniform softmax and witness the fixed scale and 12:1 head map.
-    std::vector<float> q(static_cast<std::size_t>(256) * 24);
-    for (int head = 0; head < 24; ++head) {
-        for (int d = 0; d < 256; ++d) { q[d + 256 * head] = (d & 1) == 0 ? 1.0F / 256 : -1.0F / 256; }
+    constexpr int attention_width = 2;
+    std::vector<float> q(static_cast<std::size_t>(256) * 24 * attention_width);
+    for (int token = 0; token < attention_width; ++token) {
+        for (int head = 0; head < 24; ++head) {
+            for (int d = 0; d < 256; ++d) {
+                const float sign = token == 0 ? 1.0F : -1.0F;
+                q[d + 256 * (head + 24 * token)] =
+                    sign * ((d & 1) == 0 ? 1.0F / 256 : -1.0F / 256);
+            }
+        }
     }
     round_to_bf16(q);
-    std::vector<std::int32_t> selected(ops::kQsaSelectedCapacity, -1);
+    std::vector<std::int32_t> selected(4, -1);
     selected[0] = 7;
     selected[1] = 0;
-    const std::vector<std::int32_t> count{2};
+    selected[2] = 0;
+    const std::vector<std::int32_t> count{2, 1};
     auto dq = to_device_bf16(q);
     auto dselected = to_device(selected);
     auto dcount = to_device(count);
-    GuardedDeviceBuffer dout(static_cast<std::size_t>(256) * 24 * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dout(static_cast<std::size_t>(256) * 24 * attention_width *
+                             sizeof(std::uint16_t));
     GuardedDeviceBuffer attention_workspace(ops::qsa_selected_attention_workspace_bytes());
-    Tensor qt(dq.p, DType::BF16, {256, 24, 1});
-    Tensor st(dselected.p, DType::I32, {2, 1});
-    Tensor ct(dcount.p, DType::I32, {1});
-    Tensor ot(dout.data(), DType::BF16, {256, 24, 1});
+    Tensor qt(dq.p, DType::BF16, {256, 24, attention_width});
+    Tensor st(dselected.p, DType::I32, {2, attention_width});
+    Tensor ct(dcount.p, DType::I32, {attention_width});
+    Tensor ot(dout.data(), DType::BF16, {256, 24, attention_width});
     Tensor attention_workspace_t(attention_workspace.data(), DType::U8,
                                  {static_cast<int>(attention_workspace.bytes())});
     ops::qsa_selected_attention(qt, st, ct, state_view, ot, attention_workspace_t, nullptr);
     cuda_synchronize();
-    const auto actual = from_device_bf16(dout.data(), static_cast<std::size_t>(256) * 24);
+    const auto actual = from_device_bf16(
+        dout.data(), static_cast<std::size_t>(256) * 24 * attention_width);
     std::vector<double> expected(actual.size());
-    constexpr int selected_host[]{7, 0};
-    for (int head = 0; head < 24; ++head) {
-        const int kv_head = head / 12;
-        double logits[2]{};
-        for (int j = 0; j < 2; ++j) {
-            for (int d = 0; d < 256; ++d) {
-                logits[j] += static_cast<double>(q[d + 256 * head]) *
-                             decode_cache(k_codes, k_scales, d, selected_host[j], kv_head,
-                                          capacity);
+    constexpr int selected_host[2][2]{{7, 0}, {0, -1}};
+    constexpr int selected_counts[2]{2, 1};
+    for (int token = 0; token < attention_width; ++token) {
+        for (int head = 0; head < 24; ++head) {
+            const int kv_head = head / 12;
+            double logits[2]{};
+            for (int j = 0; j < selected_counts[token]; ++j) {
+                for (int d = 0; d < 256; ++d) {
+                    logits[j] += static_cast<double>(q[d + 256 * (head + 24 * token)]) *
+                                 decode_cache(k_codes, k_scales, d,
+                                              selected_host[token][j], kv_head, capacity);
+                }
+                logits[j] /= 16.0;
             }
-            logits[j] /= 16.0;
-        }
-        const double maximum = std::max(logits[0], logits[1]);
-        const double e0 = std::exp(logits[0] - maximum);
-        const double e1 = std::exp(logits[1] - maximum);
-        const double p0 = e0 / (e0 + e1);
-        const double p1 = e1 / (e0 + e1);
-        for (int d = 0; d < 256; ++d) {
-            expected[d + 256 * head] =
-                p0 * decode_cache(v_codes, v_scales, d, selected_host[0], kv_head, capacity) +
-                p1 * decode_cache(v_codes, v_scales, d, selected_host[1], kv_head, capacity);
+            const double maximum = selected_counts[token] == 1
+                                       ? logits[0]
+                                       : std::max(logits[0], logits[1]);
+            double denominator = 0.0;
+            double probabilities[2]{};
+            for (int j = 0; j < selected_counts[token]; ++j) {
+                probabilities[j] = std::exp(logits[j] - maximum);
+                denominator += probabilities[j];
+            }
+            for (int d = 0; d < 256; ++d) {
+                double value = 0.0;
+                for (int j = 0; j < selected_counts[token]; ++j) {
+                    value += probabilities[j] / denominator *
+                             decode_cache(v_codes, v_scales, d, selected_host[token][j],
+                                          kv_head, capacity);
+                }
+                expected[d + 256 * (head + 24 * token)] = value;
+            }
         }
     }
-    failures += verify_pointwise("qsa selected attention decoded FP64 oracle", actual, expected,
+    failures += verify_pointwise("qsa batched attention decoded FP64 oracle", actual, expected,
                                  PointwiseCriterion{0.02, 0.005});
     failures += dout.verify_guards("qsa selected attention out");
     failures += attention_workspace.verify_guards("qsa selected attention workspace");
@@ -942,6 +963,7 @@ std::array<double, 256> oracle_core_norm_rope(const std::array<double, 256>& raw
 
 int verifier_composite_real_shape_case() {
     constexpr int capacity = 16;
+    constexpr int width = 2;
     StateFixture state(capacity);
 
     // Seed two complete visible blocks through the public state transition. Their opposite
@@ -1003,16 +1025,21 @@ int verifier_composite_real_shape_case() {
     }
     for (int row = 0; row < 2560; ++row) { output.set_unit(row, row); }
 
-    std::vector<float> x(2560, 0.0F);
-    x[0] = 1.0F;
-    x[1] = 0.5F;
-    x[2] = -1.0F;
-    x[3] = -0.5F;
+    std::vector<float> x(static_cast<std::size_t>(2560) * width, 0.0F);
+    for (int token = 0; token < width; ++token) {
+        x[2560 * token] = 1.0F;
+        x[2560 * token + 1] = 0.5F;
+        x[2560 * token + 2] = -1.0F;
+        x[2560 * token + 3] = -0.5F;
+    }
     round_to_bf16(x);
-    const std::vector<std::int32_t> token_id{8};
-    const std::vector<std::int32_t> position{1, 2, 3};
-    const std::vector<std::int32_t> visible_ids{0, 1, 2, 3, 4, 5, 6, 7, 8};
-    const std::vector<std::int32_t> visible_offsets{0, 9};
+    const std::vector<std::int32_t> token_id{8, 9};
+    const std::vector<std::int32_t> position{1, 2, 3, 4, 5, 6};
+    std::vector<std::int32_t> visible_ids;
+    for (int end = 8; end <= 9; ++end) {
+        for (int id = 0; id <= end; ++id) { visible_ids.push_back(id); }
+    }
+    const std::vector<std::int32_t> visible_offsets{0, 9, 19};
     const std::vector<float> index_norm(128, 0.0F);
     const std::vector<float> core_norm(256, 0.5F);
     auto dx = to_device_bf16(x);
@@ -1024,11 +1051,11 @@ int verifier_composite_real_shape_case() {
     auto dindex_key_norm = to_device_f32(index_norm);
     auto dcore_query_norm = to_device_f32(core_norm);
     auto dcore_key_norm = to_device_f32(core_norm);
-    GuardedDeviceBuffer dselected(static_cast<std::size_t>(ops::kQsaSelectedCapacity) *
+    GuardedDeviceBuffer dselected(static_cast<std::size_t>(ops::kQsaSelectedCapacity) * width *
                                   sizeof(std::int32_t));
-    GuardedDeviceBuffer dcount(sizeof(std::int32_t));
-    GuardedDeviceBuffer dout(2560 * sizeof(std::uint16_t));
-    GuardedDeviceBuffer workspace(ops::qsa_verifier_workspace_bytes());
+    GuardedDeviceBuffer dcount(width * sizeof(std::int32_t));
+    GuardedDeviceBuffer dout(static_cast<std::size_t>(2560) * width * sizeof(std::uint16_t));
+    GuardedDeviceBuffer workspace(ops::qsa_verifier_workspace_bytes(width));
     dout.fill(0xcd);
     workspace.fill(0xcd);
 
@@ -1044,34 +1071,45 @@ int verifier_composite_real_shape_case() {
         Tensor(dcore_query_norm.p, DType::FP32, {256}),
         Tensor(dcore_key_norm.p, DType::FP32, {256}),
     };
-    Tensor x_t(dx.p, DType::BF16, {2560});
-    Tensor token_id_t(dtoken_id.p, DType::I32, {1});
-    Tensor position_t(dposition.p, DType::I32, {3});
-    Tensor visible_ids_t(dvisible_ids.p, DType::I32, {9});
-    Tensor visible_offsets_t(dvisible_offsets.p, DType::I32, {2});
-    Tensor selected_t(dselected.data(), DType::I32, {ops::kQsaSelectedCapacity});
-    Tensor count_t(dcount.data(), DType::I32, {1});
-    Tensor out_t(dout.data(), DType::BF16, {2560});
+    Tensor x_t(dx.p, DType::BF16, {2560, width});
+    Tensor token_id_t(dtoken_id.p, DType::I32, {width});
+    Tensor position_t(dposition.p, DType::I32, {3, width});
+    Tensor visible_ids_t(dvisible_ids.p, DType::I32,
+                         {static_cast<int>(visible_ids.size())});
+    Tensor visible_offsets_t(dvisible_offsets.p, DType::I32, {width + 1});
+    Tensor selected_t(dselected.data(), DType::I32, {ops::kQsaSelectedCapacity, width});
+    Tensor count_t(dcount.data(), DType::I32, {width});
+    Tensor out_t(dout.data(), DType::BF16, {2560, width});
     Tensor workspace_t(workspace.data(), DType::U8,
                        {static_cast<int>(workspace.bytes())});
-    ops::qsa_verifier_token(x_t, token_id_t, position_t, visible_ids_t, visible_offsets_t,
+    ops::qsa_verifier(x_t, token_id_t, position_t, visible_ids_t, visible_offsets_t,
                             weights, state_view, selected_t, count_t, out_t, workspace_t,
                             nullptr);
     cuda_synchronize();
 
     int failures = 0;
-    const auto actual_count = from_device<std::int32_t>(dcount.data(), 1);
-    const auto selected = from_device<std::int32_t>(dselected.data(), ops::kQsaSelectedCapacity);
+    const auto actual_count = from_device<std::int32_t>(dcount.data(), width);
+    const auto selected = from_device<std::int32_t>(
+        dselected.data(), static_cast<std::size_t>(ops::kQsaSelectedCapacity) * width);
     // Zero represented index gamma makes every complete-block score an exact tie. The stable
     // lower-rank order is also a strict witness that no implicit +1 is applied.
-    const std::vector<std::int32_t> expected_ids{0, 1, 2, 3, 4, 5, 6, 7, 8};
+    const std::array<std::vector<std::int32_t>, width> expected_ids{{
+        {0, 1, 2, 3, 4, 5, 6, 7, 8},
+        {0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
+    }};
     failures += verify_exact("qsa verifier selected count", actual_count,
-                             std::vector<std::int32_t>{9});
-    for (int i = 0; i < static_cast<int>(expected_ids.size()); ++i) {
-        if (selected[i] != expected_ids[static_cast<std::size_t>(i)]) { ++failures; }
-    }
-    for (int i = static_cast<int>(expected_ids.size()); i < ops::kQsaSelectedCapacity; ++i) {
-        if (selected[i] != -1) { ++failures; }
+                             std::vector<std::int32_t>{9, 10});
+    for (int token = 0; token < width; ++token) {
+        const std::size_t base = static_cast<std::size_t>(ops::kQsaSelectedCapacity) * token;
+        for (int i = 0; i < static_cast<int>(expected_ids[token].size()); ++i) {
+            if (selected[base + i] != expected_ids[token][static_cast<std::size_t>(i)]) {
+                ++failures;
+            }
+        }
+        for (int i = static_cast<int>(expected_ids[token].size());
+             i < ops::kQsaSelectedCapacity; ++i) {
+            if (selected[base + i] != -1) { ++failures; }
+        }
     }
     if (failures != 0) { std::cerr << "FAIL: qsa verifier exact selector ids\n"; }
 
@@ -1086,12 +1124,19 @@ int verifier_composite_real_shape_case() {
     const auto stored_positions = from_device<std::int32_t>(
         state.positions.data(), static_cast<std::size_t>(3) * capacity);
     int state_metadata_failures = 0;
-    if (raw_keys[128 * 8] != f32_to_bf16(1.0F)) { ++state_metadata_failures; }
-    for (int d = 1; d < 128; ++d) {
-        if (raw_keys[d + 128 * 8] != f32_to_bf16(0.0F)) { ++state_metadata_failures; }
-    }
-    for (int axis = 0; axis < 3; ++axis) {
-        if (stored_positions[axis + 3 * 8] != position[axis]) { ++state_metadata_failures; }
+    for (int token = 0; token < width; ++token) {
+        const int id = token_id[token];
+        if (raw_keys[128 * id] != f32_to_bf16(1.0F)) { ++state_metadata_failures; }
+        for (int d = 1; d < 128; ++d) {
+            if (raw_keys[d + 128 * id] != f32_to_bf16(0.0F)) {
+                ++state_metadata_failures;
+            }
+        }
+        for (int axis = 0; axis < 3; ++axis) {
+            if (stored_positions[axis + 3 * id] != position[axis + 3 * token]) {
+                ++state_metadata_failures;
+            }
+        }
     }
     if (state_metadata_failures != 0) {
         std::cerr << "FAIL: qsa verifier current index-key/position transition: "
@@ -1103,8 +1148,14 @@ int verifier_composite_real_shape_case() {
     for (int d = 0; d < 256; ++d) { raw_q[d] = (d & 1) == 0 ? 1.0 : -1.0; }
     std::array<float, 256> core_gamma{};
     core_gamma.fill(0.5F);
-    const std::array<std::int32_t, 3> position_array{1, 2, 3};
-    const auto query = oracle_core_norm_rope(raw_q, core_gamma, position_array);
+    const std::array<std::array<std::int32_t, 3>, width> position_arrays{{
+        {1, 2, 3},
+        {4, 5, 6},
+    }};
+    std::array<std::array<double, 256>, width> queries{};
+    for (int token = 0; token < width; ++token) {
+        queries[token] = oracle_core_norm_rope(raw_q, core_gamma, position_arrays[token]);
+    }
 
     // The newly projected K/V must cross the represented cache boundary. Compare K against the
     // independent ideal norm/MRoPE result with an NVFP4 criterion and V against its represented
@@ -1112,33 +1163,40 @@ int verifier_composite_real_shape_case() {
     int cache_roundtrip_failures = 0;
     double maximum_k_bound_ratio = 0.0;
     double maximum_v_bound_ratio = 0.0;
-    for (int head = 0; head < 2; ++head) {
-        for (int group = 0; group < 16; ++group) {
-            double group_max = 0.0;
-            for (int lane = 0; lane < 16; ++lane) {
-                group_max = std::max(group_max, std::abs(query[group * 16 + lane]));
-            }
+    for (int token = 0; token < width; ++token) {
+        const int id = token_id[token];
+        const auto& query = queries[token];
+        for (int head = 0; head < 2; ++head) {
+            for (int group = 0; group < 16; ++group) {
+                double group_max = 0.0;
+                for (int lane = 0; lane < 16; ++lane) {
+                    group_max = std::max(group_max, std::abs(query[group * 16 + lane]));
+                }
             // E4M3's normal-range round-to-nearest scale is at most 17/16 of M/6. The largest
             // E2M1 code gap is two, so nearest-code error is at most one scale (and saturation
             // after a downward scale round is smaller). BF16 round-to-nearest contributes at
             // most |x|/256; 1e-4 conservatively covers the FP32 norm/RoPE evaluation before its
             // BF16 staging boundary. This is fixed from the codecs, not from observed output.
-            const double staged_group_max = group_max + group_max / 256.0 + 1.0e-4;
-            const double codec_bound = (17.0 / 96.0) * staged_group_max;
-            for (int lane = 0; lane < 16; ++lane) {
-                const int d = group * 16 + lane;
-                const double cached_k = decode_cache(k_codes, k_scales, d, 8, head, capacity);
-                const double k_error = std::abs(cached_k - query[d]);
-                const double k_bound = std::abs(query[d]) / 256.0 + 1.0e-4 + codec_bound;
-                maximum_k_bound_ratio = std::max(maximum_k_bound_ratio, k_error / k_bound);
-                if (k_error > k_bound) { ++cache_roundtrip_failures; }
+                const double staged_group_max = group_max + group_max / 256.0 + 1.0e-4;
+                const double codec_bound = (17.0 / 96.0) * staged_group_max;
+                for (int lane = 0; lane < 16; ++lane) {
+                    const int d = group * 16 + lane;
+                    const double cached_k =
+                        decode_cache(k_codes, k_scales, d, id, head, capacity);
+                    const double k_error = std::abs(cached_k - query[d]);
+                    const double k_bound = std::abs(query[d]) / 256.0 + 1.0e-4 + codec_bound;
+                    maximum_k_bound_ratio = std::max(maximum_k_bound_ratio, k_error / k_bound);
+                    if (k_error > k_bound) { ++cache_roundtrip_failures; }
 
-                const double expected_v = head == 0 ? 0.5 : -0.5;
-                const double cached_v = decode_cache(v_codes, v_scales, d, 8, head, capacity);
-                const double v_error = std::abs(cached_v - expected_v);
-                const double v_bound = (17.0 / 96.0) * std::abs(expected_v);
-                maximum_v_bound_ratio = std::max(maximum_v_bound_ratio, v_error / v_bound);
-                if (v_error > v_bound) { ++cache_roundtrip_failures; }
+                    const double expected_v = head == 0 ? 0.5 : -0.5;
+                    const double cached_v =
+                        decode_cache(v_codes, v_scales, d, id, head, capacity);
+                    const double v_error = std::abs(cached_v - expected_v);
+                    const double v_bound = (17.0 / 96.0) * std::abs(expected_v);
+                    maximum_v_bound_ratio = std::max(maximum_v_bound_ratio,
+                                                     v_error / v_bound);
+                    if (v_error > v_bound) { ++cache_roundtrip_failures; }
+                }
             }
         }
     }
@@ -1156,40 +1214,44 @@ int verifier_composite_real_shape_case() {
 
     // Complete independent FP64 formula from represented x/weights and exact decoded cache.
     // The direct Q5_K output map makes rows [0,2560) select the first ten gated heads.
-    std::vector<double> expected(2560);
-    for (int head = 0; head < 10; ++head) {
-        const int kv_head = head / 12;
-        std::array<double, 9> logits{};
-        double maximum = -INFINITY;
-        for (int item = 0; item < 9; ++item) {
-            const int id = expected_ids[static_cast<std::size_t>(item)];
+    std::vector<double> expected(static_cast<std::size_t>(2560) * width);
+    for (int token = 0; token < width; ++token) {
+        const auto& query = queries[token];
+        const auto& token_ids = expected_ids[token];
+        for (int head = 0; head < 10; ++head) {
+            const int kv_head = head / 12;
+            std::array<double, 10> logits{};
+            double maximum = -INFINITY;
+            for (int item = 0; item < static_cast<int>(token_ids.size()); ++item) {
+                const int id = token_ids[static_cast<std::size_t>(item)];
+                for (int d = 0; d < 256; ++d) {
+                    logits[item] += query[d] *
+                                    decode_cache(k_codes, k_scales, d, id, kv_head, capacity);
+                }
+                logits[item] /= 16.0;
+                maximum = std::max(maximum, logits[item]);
+            }
+            std::array<double, 10> probability{};
+            double denominator = 0.0;
+            for (int item = 0; item < static_cast<int>(token_ids.size()); ++item) {
+                probability[item] = std::exp(logits[item] - maximum);
+                denominator += probability[item];
+            }
+            const double raw_gate = (head & 1) == 0 ? 1.0 : -1.0;
+            const double gate = 1.0 / (1.0 + std::exp(-raw_gate));
             for (int d = 0; d < 256; ++d) {
-                logits[item] += query[d] *
-                                decode_cache(k_codes, k_scales, d, id, kv_head, capacity);
+                double attention = 0.0;
+                for (int item = 0; item < static_cast<int>(token_ids.size()); ++item) {
+                    const int id = token_ids[static_cast<std::size_t>(item)];
+                    attention += probability[item] / denominator *
+                                 decode_cache(v_codes, v_scales, d, id, kv_head, capacity);
+                }
+                expected[d + 256 * (head + 10 * token)] = gate * attention;
             }
-            logits[item] /= 16.0;
-            maximum = std::max(maximum, logits[item]);
-        }
-        std::array<double, 9> probability{};
-        double denominator = 0.0;
-        for (int item = 0; item < 9; ++item) {
-            probability[item] = std::exp(logits[item] - maximum);
-            denominator += probability[item];
-        }
-        const double raw_gate = (head & 1) == 0 ? 1.0 : -1.0;
-        const double gate = 1.0 / (1.0 + std::exp(-raw_gate));
-        for (int d = 0; d < 256; ++d) {
-            double attention = 0.0;
-            for (int item = 0; item < 9; ++item) {
-                const int id = expected_ids[static_cast<std::size_t>(item)];
-                attention += probability[item] / denominator *
-                             decode_cache(v_codes, v_scales, d, id, kv_head, capacity);
-            }
-            expected[d + 256 * head] = gate * attention;
         }
     }
-    const auto actual = from_device_bf16(dout.data(), 2560);
-    failures += verify_pointwise("qsa verifier complete FP64 oracle", actual, expected,
+    const auto actual = from_device_bf16(dout.data(), static_cast<std::size_t>(2560) * width);
+    failures += verify_pointwise("qsa batched verifier complete FP64 oracle", actual, expected,
                                  PointwiseCriterion{0.025, 0.02});
 
     // Composite validation is a synchronous transaction boundary: neither an alias nor a
@@ -1229,9 +1291,9 @@ int verifier_composite_real_shape_case() {
     };
 
     fill_rejection_outputs();
-    Tensor aliased_x(workspace.data(), DType::BF16, {2560});
+    Tensor aliased_x(workspace.data(), DType::BF16, {2560, width});
     failures += expect_invalid_argument("qsa verifier aliased input/workspace", [&] {
-        ops::qsa_verifier_token(aliased_x, token_id_t, position_t, visible_ids_t,
+        ops::qsa_verifier(aliased_x, token_id_t, position_t, visible_ids_t,
                                 visible_offsets_t, weights, state_view, selected_t, count_t, out_t,
                                 workspace_t, nullptr);
     });
@@ -1242,7 +1304,7 @@ int verifier_composite_real_shape_case() {
     auto malformed_state = state_view;
     malformed_state.positions.ne[1] = capacity - 1;
     failures += expect_invalid_argument("qsa verifier malformed state", [&] {
-        ops::qsa_verifier_token(x_t, token_id_t, position_t, visible_ids_t, visible_offsets_t,
+        ops::qsa_verifier(x_t, token_id_t, position_t, visible_ids_t, visible_offsets_t,
                                 weights, malformed_state, selected_t, count_t, out_t, workspace_t,
                                 nullptr);
     });
