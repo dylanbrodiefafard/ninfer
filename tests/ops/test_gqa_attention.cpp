@@ -4157,6 +4157,12 @@ int run_tree_verify_cases(bool full) {
                 failures += run_tree_verify_batch_isolation_case(geometry, dtype);
             }
             if (dtype == DType::U8 && (full || geometry.q_heads == 24)) {
+                // The real Qwen3.8 DFlash regression reaches this short-context frontier with
+                // W=2 and W=5. Packed tree verification and ordinary T=1 are independently
+                // reduced schedules, so compare both directly under the NVFP4 oracle rather
+                // than requiring bit identity or identical downstream greedy ties.
+                failures += run_tree_column0_matches_decode(geometry, dtype, 37, 2);
+                failures += run_tree_column0_matches_decode(geometry, dtype, 37, 5);
                 failures += run_tree_column0_matches_decode(geometry, dtype, 16, 12);
                 if (full) {
                     failures += run_tree_column0_matches_decode(geometry, dtype, 24, 12);
