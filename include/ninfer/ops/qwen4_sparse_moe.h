@@ -179,10 +179,12 @@ void qwen4_sparse_moe(const Tensor& x, const Qwen4SparseMoeWeights& weights,
  * softmax/renormalization, every decode/projection/SwiGLU, shared-expert work, and final rank-order
  * FP32 accumulation execute on the GPU with the same represented BF16 boundaries as the scalar
  * Op. The CPU receives all 10*T ids in one D2H, performs only validation and integer grouping,
- * and copies every unique routed gate/up pair exactly once in ascending expert-id groups of at
- * most 32. Two fixed slots overlap group transfer and consumption. An occurrence can reference a
- * staged expert from any token/rank, and duplicate experts across tokens do not duplicate source
- * bytes. Source banks are never decoded, repacked, or fully copied on the CPU.
+ * and copies every unique routed gate/up pair exactly once in ascending expert-id order. A
+ * multi-group call uses a 16-expert bootstrap group to start GPU consumption early; following
+ * groups contain at most 32 experts. Two fixed slots overlap group transfer and consumption. An
+ * occurrence can reference a staged expert from any token/rank, and duplicate experts across
+ * tokens do not duplicate source bytes. Source banks are never decoded, repacked, or fully copied
+ * on the CPU.
  *
  * All device operands, output, route outputs, device stage, and workspace are pairwise disjoint;
  * mapped banks and pinned stage are mutually disjoint. The caller owns both streams, all events,

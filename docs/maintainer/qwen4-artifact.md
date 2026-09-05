@@ -464,8 +464,9 @@ that evidence. The existing public Q5_K numerical test continued to pass.
 The verifier now also owns a real T=1..4096 chunked-prefill route. Its startup-fixed expert
 pipeline has two 27,197,440-byte pinned slots and matching device slots; a separate 335,876-byte
 pinned integer scratch holds the single `10*T` route-id D2H and all bounded grouping tables. For
-each layer, every unique routed gate/up expert is copied once in ascending-id groups of at most 32,
-with the group matrices and occurrence list published by one contiguous H2D. The mapped PLE table
+each layer, every unique routed gate/up expert is copied once in ascending-id order: calls with
+more than 32 unique experts start with a group of 16 and subsequent groups contain at most 32.
+Each group's matrices and occurrence list are published by one contiguous H2D. The mapped PLE table
 likewise supplies one `16*T` panel through fixed 5,898,240-byte pinned/device storage. The RTX 5090
 retained about 5.32 GB free after model, state, and maximum prefill storage construction.
 
@@ -553,10 +554,28 @@ with the final head included. The T=1 decode route is unchanged. The retained sp
 47 registers, 26,624 bytes of dynamic shared storage, three-CTA launch residency, and no stack or
 local-memory spill. Exact Q6_K `[2560,6144]` T=511/512/513 tests compare every output directly with
 the independent packed-code FP64 oracle. In the same tranche, the mapped-host sparse-MoE
-32/32/6-stage witness was strengthened from zero-scaled weights to a T=28 nonzero, per-token
+16/32/22-stage witness was strengthened from zero-scaled weights to a T=28 nonzero, per-token
 complete FP64 formula over all 70 selected experts. Four distinct represented amplitudes and a
 rank permutation put high-weight experts in every group, so occurrence order, group-to-slot
-association, and material contribution are independently observable.
+association, and material contribution are independently observable. Distinct IQ1_S and IQ2_XXS
+versions now execute back-to-back without caller synchronization; both use complete per-token FP64
+references, and the maximum-footprint IQ2_XXS call exact-checks surviving slot bytes and
+occurrences.
+
+The following mapped-host schedule pass found that encoded H2D was already mostly hidden and kept
+projection arithmetic unchanged. A 16-expert bootstrap group followed by the established
+32-expert groups reduced actual no-compute H2D exposure in the process-warm width-512 trace from
+82.427 to 63.073 ms; total encoded H2D time stayed effectively fixed at 217.965 versus 217.732 ms,
+and compute-stream kernel count/time stayed at 54,842 and about 1.690 s. One additional group in
+20 of the 48 layer calls raised H2D calls from 302 to 322 but shortened the required host event
+waits by about 24.6 ms. Matched uninstrumented six-sample warm medians improved from 1.8179 s
+(281.64 input token/s) to 1.7967 s (284.97 input token/s), about 1.18%. Bootstrap sizes 8 and 24
+measured 1.8057 and 1.8021 s and were rejected. At width 4096, reverse-order two-sample warm means
+were 13.5860 s before and 13.5480 s after; no regression was observed, but the small two-sample
+difference is not a positive maximum-width claim. At width 4, four-sample warm medians were 155.85
+and 152.95 ms, with no observed short-prefill regression. The T=1 decode route is unchanged.
+A generic four-kernel grouped expert candidate was also deleted after regressing warm width-512
+prefill to 5.951 s.
 
 The maximum-width numerical gate uses the exact post-expansion Qwen4 recurrence geometry
 `Hq=Hv=48,D=128,T=4096` and one represented-input FP64 oracle. It independently qualifies 4096
