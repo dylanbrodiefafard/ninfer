@@ -5,11 +5,14 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <random>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -121,9 +124,17 @@ int verify_exact(const std::string& label, const std::vector<T>& got,
     return ninfer::test::verify_exact(label.c_str(), got, expected);
 }
 
-int verify_recurrence(const std::string& label, const std::vector<double>& got,
-                      const std::vector<double>& expected, const ReductionCriterion& criterion) {
+int verify_recurrence(const std::string& label, std::span<const double> got,
+                      std::span<const double> expected, const ReductionCriterion& criterion) {
     return verify_reduction(label.c_str(), got, expected, criterion);
+}
+
+std::vector<double> bf16_doubles(const std::vector<std::uint16_t>& bits) {
+    std::vector<double> values(bits.size());
+    for (std::size_t index = 0; index < bits.size(); ++index) {
+        values[index] = static_cast<double>(bf16_to_f32(bits[index]));
+    }
+    return values;
 }
 
 std::vector<double> read_f32(const void* device, std::size_t count) {
@@ -158,6 +169,194 @@ struct DeviceInputs {
     DeviceBuffer g;
     DeviceBuffer beta;
 };
+
+struct RouteEvidence {
+    std::string name;
+    std::vector<std::uint16_t> output;
+    std::vector<float> state;
+    int failures = 0;
+};
+
+RouteEvidence run_partition_route(const Case& test_case, const gdn_ref::Inputs& in,
+                                  const DeviceInputs& device,
+                                  const std::vector<std::int32_t>& chunks,
+                                  std::string name) {
+    std::int32_t total = 0;
+    std::int32_t maximum_chunk = 0;
+    for (const std::int32_t chunk : chunks) {
+        total += chunk;
+        maximum_chunk = std::max(maximum_chunk, chunk);
+    }
+    RouteEvidence evidence{std::move(name)};
+    if (total != test_case.tokens || maximum_chunk <= 0) {
+        std::cerr << evidence.name << ": invalid route partition\n";
+        evidence.failures = 1;
+        return evidence;
+    }
+
+    GuardedDeviceBuffer state(in.state.size() * sizeof(float));
+    GuardedDeviceBuffer output(in.v.size() * sizeof(std::uint16_t));
+    state.copy_from_host(in.state.data(), state.bytes());
+    output.fill(0xff);
+    Tensor q(device.q.p, DType::BF16,
+             {kStateDim, test_case.qk_heads, test_case.tokens});
+    Tensor k(device.k.p, DType::BF16,
+             {kStateDim, test_case.qk_heads, test_case.tokens});
+    Tensor v(device.v.p, DType::BF16,
+             {kStateDim, test_case.value_heads, test_case.tokens});
+    Tensor g(device.g.p, DType::FP32, {test_case.value_heads, test_case.tokens});
+    Tensor beta(device.beta.p, DType::FP32, {test_case.value_heads, test_case.tokens});
+    Tensor state_tensor(state.data(), DType::FP32,
+                        {kStateDim, kStateDim, test_case.value_heads});
+    Tensor output_tensor(output.data(), DType::BF16,
+                         {kStateDim, test_case.value_heads, test_case.tokens});
+    const std::size_t workspace_bytes = ops::gated_delta_net_workspace_capacity_bytes(
+        test_case.qk_heads, test_case.value_heads, test_case.normalize_qk, 1, maximum_chunk);
+    WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
+    const float scale = 1.0f / std::sqrt(static_cast<float>(kStateDim));
+
+    std::int32_t offset = 0;
+    for (const std::int32_t chunk : chunks) {
+        Tensor q_chunk = q.slice(2, offset, chunk);
+        Tensor k_chunk = k.slice(2, offset, chunk);
+        Tensor v_chunk = v.slice(2, offset, chunk);
+        Tensor g_chunk = g.slice(1, offset, chunk);
+        Tensor beta_chunk = beta.slice(1, offset, chunk);
+        Tensor output_chunk = output_tensor.slice(2, offset, chunk);
+        ops::gated_delta_net(q_chunk, k_chunk, v_chunk, g_chunk, beta_chunk, scale,
+                             test_case.normalize_qk, workspace, state_tensor, output_chunk,
+                             nullptr);
+        offset += chunk;
+    }
+    cuda_synchronize();
+
+    evidence.output = from_device<std::uint16_t>(output.data(), in.v.size());
+    evidence.state = from_device<float>(state.data(), in.state.size());
+    evidence.failures += state.verify_guards((evidence.name + " state").c_str());
+    evidence.failures += output.verify_guards((evidence.name + " output").c_str());
+    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+        std::cerr << evidence.name << ": workspace query/execution high-water mismatch\n";
+        ++evidence.failures;
+    }
+    return evidence;
+}
+
+int qwen4_maximum_schedule_case() {
+    constexpr std::int32_t kTokens = 4096;
+    constexpr std::int32_t kHeads = 48;
+    const Case test_case{"Qwen4 exact-geometry maximum prefill", kHeads, kHeads, kTokens, true};
+    const gdn_ref::Inputs in = make_inputs(test_case, 16496u);
+    const float scale = 1.0f / std::sqrt(static_cast<float>(kStateDim));
+    const gdn_ref::Result reference = gdn_ref::evaluate(in, static_cast<double>(scale), true);
+    const DeviceInputs device(in);
+
+    std::vector<std::int32_t> scalar_chunks(kTokens, 1);
+    std::vector<std::int32_t> aligned_chunks(kTokens / 64, 64);
+    std::vector<RouteEvidence> routes;
+    routes.reserve(4);
+    routes.push_back(run_partition_route(test_case, in, device, scalar_chunks, "scalar T=1"));
+    routes.push_back(run_partition_route(test_case, in, device, {kTokens}, "one-shot T=4096"));
+    routes.push_back(
+        run_partition_route(test_case, in, device, aligned_chunks, "aligned 64x64"));
+    routes.push_back(run_partition_route(test_case, in, device, {64, 1, 1986, 1, 2044},
+                                         "Program 64+1+1986+1+2044"));
+
+    constexpr std::array<std::int32_t, 9> kPrefixWidths = {
+        1, 63, 64, 65, 127, 128, 129, 2051, 2052};
+    constexpr std::array<std::int32_t, 10> kDiagnosticTokens = {
+        0, 62, 63, 64, 126, 127, 128, 2050, 2051, kTokens - 1};
+    const std::size_t values_per_token = static_cast<std::size_t>(kStateDim * kHeads);
+    int failures = 0;
+    for (const RouteEvidence& route : routes) {
+        failures += route.failures;
+        const std::vector<double> output = bf16_doubles(route.output);
+        const std::vector<double> state = doubles(route.state);
+        const std::string label = std::string(test_case.name) + " " + route.name;
+        failures += verify_recurrence(label + " output oracle", output, reference.out,
+                                      gated_delta_net_output_bf16_criterion());
+        failures += verify_recurrence(label + " state oracle", state, reference.final_state,
+                                      gated_delta_net_state_fp32_criterion());
+        for (const std::int32_t width : kPrefixWidths) {
+            const std::size_t count = static_cast<std::size_t>(width) * values_per_token;
+            failures += verify_recurrence(
+                label + " output prefix T=" + std::to_string(width),
+                std::span<const double>(output.data(), count),
+                std::span<const double>(reference.out.data(), count),
+                gated_delta_net_output_bf16_criterion());
+        }
+        if (error_stats_enabled()) {
+            double peak_relative_l2 = -1.0;
+            double peak_absolute = -1.0;
+            std::int32_t peak_relative_token = -1;
+            std::int32_t peak_absolute_token = -1;
+            for (std::int32_t token = 0; token < kTokens; ++token) {
+                const std::size_t begin = static_cast<std::size_t>(token) * values_per_token;
+                const ReductionStats stats = compute_reduction_stats(
+                    output.data() + begin, reference.out.data() + begin,
+                    static_cast<std::int64_t>(values_per_token));
+                if (stats.relative_l2 > peak_relative_l2) {
+                    peak_relative_l2 = stats.relative_l2;
+                    peak_relative_token = token;
+                }
+                if (stats.maximum_absolute_error > peak_absolute) {
+                    peak_absolute = stats.maximum_absolute_error;
+                    peak_absolute_token = token;
+                }
+            }
+            std::cout << "GDN_TOKEN_ERROR_SUMMARY route=" << route.name
+                      << " peak_relative_token=" << peak_relative_token
+                      << " peak_relative_l2=" << peak_relative_l2
+                      << " peak_absolute_token=" << peak_absolute_token
+                      << " peak_absolute=" << peak_absolute << '\n';
+            for (const std::int32_t token : kDiagnosticTokens) {
+                const std::size_t begin = static_cast<std::size_t>(token) * values_per_token;
+                const ReductionStats stats = compute_reduction_stats(
+                    output.data() + begin, reference.out.data() + begin,
+                    static_cast<std::int64_t>(values_per_token));
+                report_reduction_stats(label + " output token t=" + std::to_string(token),
+                                       static_cast<std::int64_t>(values_per_token), stats,
+                                       gated_delta_net_output_bf16_criterion());
+            }
+        }
+    }
+
+    failures += verify_common_inputs_unchanged(std::string(test_case.name), in, device.q, device.k,
+                                               device.v, device.g, device.beta);
+    if (error_stats_enabled()) {
+        const auto report_pair = [&](std::size_t reference_index, std::size_t actual_index) {
+            const RouteEvidence& route_reference = routes[reference_index];
+            const RouteEvidence& route_actual = routes[actual_index];
+            const auto mismatch = std::mismatch(
+                route_reference.output.begin(), route_reference.output.end(),
+                route_actual.output.begin(), route_actual.output.end());
+            const bool state_bit_identical =
+                route_reference.state.size() == route_actual.state.size() &&
+                std::memcmp(route_reference.state.data(), route_actual.state.data(),
+                            route_reference.state.size() * sizeof(float)) == 0;
+            if (mismatch.first == route_reference.output.end()) {
+                std::cout << "GDN_SCHEDULE_DIAGNOSTIC reference=" << route_reference.name
+                          << " actual=" << route_actual.name
+                          << " output_bit_identical=true state_bit_identical="
+                          << (state_bit_identical ? "true" : "false") << '\n';
+                return;
+            }
+            const std::size_t index =
+                static_cast<std::size_t>(mismatch.first - route_reference.output.begin());
+            const std::size_t token = index / values_per_token;
+            const std::size_t within = index - token * values_per_token;
+            std::cout << "GDN_SCHEDULE_DIAGNOSTIC reference=" << route_reference.name
+                      << " actual=" << route_actual.name
+                      << " output_bit_identical=false state_bit_identical="
+                      << (state_bit_identical ? "true" : "false") << " first_token=" << token
+                      << " first_head=" << within / kStateDim
+                      << " first_dimension=" << within % kStateDim << '\n';
+        };
+        report_pair(0, 1);
+        report_pair(1, 2);
+        report_pair(1, 3);
+    }
+    return failures;
+}
 
 int inplace_case(const Case& test_case, std::uint32_t seed) {
     const gdn_ref::Inputs in = make_inputs(test_case, seed);
@@ -671,16 +870,13 @@ int main() {
     failures += distinct_state_case({"27b two-chunk fused-qk-norm", 16, 48, 128, true}, 12128u);
     failures += distinct_state_case({"27b production-tail fused-qk-norm", 16, 48, 3404, true},
                                     15404u);
-    // Maximum-width Program localization first differs at this FP32 recurrence boundary. Keep
-    // both schedules tied to the independent complete recurrence instead of treating their
-    // floating pairwise delta as an oracle.
-    failures += distinct_state_case({"27b maximum prefill fused-qk-norm", 16, 48, 4096, true},
-                                    16096u);
     failures += inplace_case({"35b two-chunk raw-qk", 16, 32, 128, false}, 12228u);
     failures += partition_case({"27b chunk boundary", 16, 48, 128, true}, {64, 64}, 12428u);
     failures += partition_case({"27b chunk tail", 16, 48, 65, true}, {64, 1}, 12465u);
-    failures += partition_case({"27b maximum prefill partition", 16, 48, 4096, true},
-                               {64, 1, 1986, 1, 2044}, 16496u);
+    // Qwen4 expands Q/K to the 48 value heads before recurrence. Exercise that exact geometry at
+    // maximum width, qualifying scalar, one-shot, aligned, and Program boundary schedules
+    // independently against one complete FP64 recurrence.
+    failures += qwen4_maximum_schedule_case();
 
     // Snapshot is a separate public state transition. Nonzero source slots also prove that the
     // selected initial state, not slot zero, seeds the complete recurrence.
