@@ -14,6 +14,8 @@ enum class Phase : std::size_t {
     Layer,
     Qsa,
     SparseMoe,
+    HostPrepare,
+    PleStage,
     Count,
 };
 
@@ -25,6 +27,8 @@ enum class Phase : std::size_t {
         nvtxDomainNameCategoryA(out, 3, "layer");
         nvtxDomainNameCategoryA(out, 4, "qsa");
         nvtxDomainNameCategoryA(out, 5, "sparse-moe");
+        nvtxDomainNameCategoryA(out, 6, "host-prepare");
+        nvtxDomainNameCategoryA(out, 7, "ple-stage");
         return out;
     }();
     return handle;
@@ -37,6 +41,8 @@ enum class Phase : std::size_t {
         "layer",
         "qsa",
         "sparse_moe",
+        "host_prepare",
+        "ple_stage",
     };
     static const auto handles = [] {
         std::array<nvtxStringHandle_t, names.size()> out{};
@@ -55,6 +61,8 @@ enum class Phase : std::size_t {
         0xff76b7b2u,
         0xffe15759u,
         0xffb07aa1u,
+        0xffedc948u,
+        0xff4e79a7u,
     };
     return colors[static_cast<std::size_t>(phase)];
 }
