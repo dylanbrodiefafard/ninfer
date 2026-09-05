@@ -189,24 +189,30 @@ __global__ void qsa_select_score_kernel(const __nv_bfloat16* raw_keys,
                                         float* scratch, int width) {
     const int block = blockIdx.x;
     const int token = blockIdx.y;
-    if (threadIdx.x != 0 || token >= width || selected_count[token] != -1) { return; }
+    if (token >= width || selected_count[token] != -1) { return; }
     const int begin = visible_offsets[token];
     const int end   = visible_offsets[token + 1];
     const int complete = (end - begin) / 4;
     if (block >= complete) { return; }
-    float* q_rot = scratch + static_cast<std::int64_t>(token) * kSelectorScratchFloats;
-    float* block_scores = q_rot + kQsaIndexHeadDim * kQsaIndexQueryHeads;
-
-    float key_sum2 = 0.0F;
-    for (int d = 0; d < kQsaIndexHeadDim; ++d) {
+    __shared__ float pooled_key[kQsaIndexHeadDim];
+    const int lane = threadIdx.x;
+    for (int d = lane; d < kQsaIndexHeadDim; d += blockDim.x) {
         float pooled = 0.0F;
         for (int r = 0; r < 4; ++r) {
             const int id = visible_ids[begin + block * 4 + r];
             pooled += __bfloat162float(
                 raw_keys[d + static_cast<std::int64_t>(kQsaIndexHeadDim) * id]);
         }
-        const float represented = __bfloat162float(__float2bfloat16_rn(pooled * 0.25F));
-        key_sum2 += represented * represented;
+        pooled_key[d] = __bfloat162float(__float2bfloat16_rn(pooled * 0.25F));
+    }
+    __syncthreads();
+    if (lane != 0) { return; }
+    float* q_rot = scratch + static_cast<std::int64_t>(token) * kSelectorScratchFloats;
+    float* block_scores = q_rot + kQsaIndexHeadDim * kQsaIndexQueryHeads;
+
+    float key_sum2 = 0.0F;
+    for (int index = 0; index < kQsaIndexHeadDim; ++index) {
+        key_sum2 += pooled_key[index] * pooled_key[index];
     }
     const float key_inv = rsqrtf(key_sum2 / kQsaIndexHeadDim + kEpsilon);
     const int block_id = visible_ids[begin + block * 4];
@@ -214,25 +220,17 @@ __global__ void qsa_select_score_kernel(const __nv_bfloat16* raw_keys,
     float score = 0.0F;
     for (int head = 0; head < kQsaIndexQueryHeads; ++head) {
         float dot = 0.0F;
-        for (int d = 0; d < kQsaIndexHeadDim; ++d) {
+        for (int index = 0; index < kQsaIndexHeadDim; ++index) {
             auto pooled_at = [&](int kd) {
-                float pooled = 0.0F;
-                for (int r = 0; r < 4; ++r) {
-                    const int id = visible_ids[begin + block * 4 + r];
-                    pooled += __bfloat162float(
-                        raw_keys[kd + static_cast<std::int64_t>(kQsaIndexHeadDim) * id]);
-                }
-                const float represented =
-                    __bfloat162float(__float2bfloat16_rn(pooled * 0.25F));
-                return represented * key_inv * key_weight[kd];
+                return pooled_key[kd] * key_inv * key_weight[kd];
             };
-            float key_value = pooled_at(d);
-            if (d < 64) {
-                const int pair = d & 31;
-                key_value = rope_component(pooled_at(pair), pooled_at(pair + 32), pair, d >= 32,
-                                           block_position);
+            float key_value = pooled_at(index);
+            if (index < 64) {
+                const int pair = index & 31;
+                key_value = rope_component(pooled_at(pair), pooled_at(pair + 32), pair,
+                                           index >= 32, block_position);
             }
-            dot += q_rot[d + kQsaIndexHeadDim * head] * key_value;
+            dot += q_rot[index + kQsaIndexHeadDim * head] * key_value;
         }
         score += fmaxf(dot, 0.0F);
     }
@@ -639,18 +637,23 @@ void qsa_index_select_launch(const Tensor& raw_query, const QsaStateView& state,
         raw_query.ne[2], visible_ids.ne[0], state.raw_index_keys.ne[1]);
     CUDA_CHECK(cudaGetLastError());
     int score_blocks = visible_ids.ne[0] / 4;
-    if (score_blocks < 1) { score_blocks = 1; }
     if (score_blocks > kMaximumBlocks) { score_blocks = kMaximumBlocks; }
-    qsa_select_score_kernel<<<dim3(score_blocks, raw_query.ne[2]), 1, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(state.raw_index_keys.data),
-        static_cast<const std::int32_t*>(state.positions.data),
-        static_cast<const std::int32_t*>(visible_ids.data),
-        static_cast<const std::int32_t*>(visible_offsets.data),
-        static_cast<const float*>(key_norm_weight.data),
-        static_cast<const std::int32_t*>(selected_count.data), static_cast<float*>(workspace.data),
-        raw_query.ne[2]);
-    CUDA_CHECK(cudaGetLastError());
+    if (score_blocks > 0) {
+        // One lane per represented index dimension wins the complete selector at every
+        // nonempty scored frontier measured on sm_120a (4 through 4096 visible entries).
+        qsa_select_score_kernel<<<dim3(score_blocks, raw_query.ne[2]), kQsaIndexHeadDim, 0,
+                                  stream>>>(
+            static_cast<const __nv_bfloat16*>(state.raw_index_keys.data),
+            static_cast<const std::int32_t*>(state.positions.data),
+            static_cast<const std::int32_t*>(visible_ids.data),
+            static_cast<const std::int32_t*>(visible_offsets.data),
+            static_cast<const float*>(key_norm_weight.data),
+            static_cast<const std::int32_t*>(selected_count.data),
+            static_cast<float*>(workspace.data), raw_query.ne[2]);
+        CUDA_CHECK(cudaGetLastError());
+    }
     if (visible_ids.ne[0] <= selected_ids.ne[0]) {
+        if (score_blocks < 1) { score_blocks = 1; }
         int sort_blocks = 1;
         while (sort_blocks < score_blocks) { sort_blocks <<= 1; }
         int sort_threads = sort_blocks / 2;
