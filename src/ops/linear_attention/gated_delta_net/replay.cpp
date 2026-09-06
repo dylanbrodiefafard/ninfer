@@ -333,17 +333,6 @@ std::size_t replay_record_ssm_pool_bytes(std::int32_t value_heads, std::int32_t 
     return checked_mul_size(checked_mul_size(hv, nslots, kOverflow), per_slot, kOverflow);
 }
 
-std::size_t replay_record_parent_tile_bytes(std::int32_t value_heads, std::int32_t batch,
-                                            std::int32_t width) {
-    constexpr const char* kOverflow = "gated_delta_net_replay_record workspace overflow";
-    const std::int64_t slots =
-        static_cast<std::int64_t>(batch) * static_cast<std::int64_t>(width);
-    if (slots <= 0 || slots > static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max())) {
-        throw std::overflow_error(kOverflow);
-    }
-    return replay_record_ssm_pool_bytes(value_heads, static_cast<std::int32_t>(slots));
-}
-
 std::size_t replay_record_overlay_bytes(std::int32_t value_heads, std::int32_t batch,
                                         std::int32_t width) {
     constexpr const char* kOverflow = "gated_delta_net_replay_record workspace overflow";
@@ -370,25 +359,21 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
         (parent_index != nullptr && parent_index->data != nullptr)
             ? static_cast<const std::int32_t*>(parent_index->data)
             : nullptr;
-    float* column_scratch = nullptr;
     float* overlay_states = nullptr;
     if (workspace != nullptr) {
         const std::size_t need = gated_delta_net_replay_record_workspace_capacity_bytes(
             v.ne[1], q.ne[3], q.ne[2]);
         unsigned char* bytes = static_cast<unsigned char*>(workspace->alloc_bytes(need).data);
-        const std::size_t parent_bytes =
-            replay_record_parent_tile_bytes(v.ne[1], q.ne[3], q.ne[2]);
-        column_scratch = parent_ptr != nullptr ? reinterpret_cast<float*>(bytes) : nullptr;
-        overlay_states = reinterpret_cast<float*>(bytes + parent_bytes);
+        overlay_states = reinterpret_cast<float*>(bytes);
     }
-    detail::gated_delta_net::launch_recurrent_record(q, k, v, g, beta, scale, ssm_states,
-                                                     valid_columns, initial_state_slots, key_record,
-                                                     value_record, gate_record, out, stream,
-                                                     parent_ptr, column_scratch);
     if (overlay_states != nullptr) {
         detail::gated_delta_net::launch_recurrent_overlay(
-            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, out,
-            overlay_states, parent_ptr, stream);
+            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, key_record,
+            value_record, gate_record, out, overlay_states, parent_ptr, stream);
+    } else {
+        detail::gated_delta_net::launch_recurrent_record(
+            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, key_record,
+            value_record, gate_record, out, stream, parent_ptr);
     }
 }
 
@@ -399,13 +384,7 @@ std::size_t gated_delta_net_replay_record_workspace_capacity_bytes(std::int32_t 
         throw std::invalid_argument(
             "gated_delta_net_replay_record workspace: invalid heads/batch/width");
     }
-    constexpr const char* kOverflow = "gated_delta_net_replay_record workspace overflow";
-    const std::size_t parent        = replay_record_parent_tile_bytes(value_heads, batch, width);
-    const std::size_t overlay       = replay_record_overlay_bytes(value_heads, batch, width);
-    if (overlay > std::numeric_limits<std::size_t>::max() - parent) {
-        throw std::overflow_error(kOverflow);
-    }
-    return parent + overlay;
+    return replay_record_overlay_bytes(value_heads, batch, width);
 }
 
 void gdn_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,

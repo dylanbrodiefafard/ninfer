@@ -596,6 +596,34 @@ A proposed fusion of the DFlash2 proposer MLP gate-up Linear and SiLU stages sav
 in isolation but reduced production throughput in its matched pre-rebase C=2/3/4 campaign, so it
 was removed.
 
+A fresh C=1 node trace after the GDN projection work attributed 28.8% of GPU time to target
+SwiGLU, 17.0% to GDN input projection, 14.9% to MLP-down, and 4.1% to the separate GDN replay
+record and T=1 overlay kernels. Exact-shape `tools.kdev` classification refused further
+tile/occupancy changes for the dominant DRAM-bound projections. Staging SwiGLU scales regressed
+W=4/5/6 public-Op latency, and a 16-warp/Bc64 NVFP4 GQA tile regressed the W=5, 32,768-context
+public Op from 45.056 to 57.344 us, so both were removed. The retained change publishes exact
+replay key/value/gate records in the existing numerically qualified T=1 overlay kernel. The
+production W=5 record-plus-overlay median fell from 14.24 to 8.54 us per GDN layer in the node
+trace.
+
+Matched C=1, 512-token, three-repetition runs with NVFP4 KV and unchanged speculative counters:
+
+| Backend | Before tok/s | Fused replay tok/s | Change |
+|---|---:|---:|---:|
+| DFlash3 | 109.493 | 111.211 | +1.57% |
+| DFlash4 | 110.948 | 112.848 | +1.71% |
+| DFlash5 | 89.178 | 90.606 | +1.60% |
+| MTP3 | 146.667 | 149.225 | +1.74% |
+| MTP4 | 117.225 | 119.214 | +1.70% |
+| MTP5 | 116.227 | 117.927 | +1.46% |
+
+The public replay Op directly checks C=1 W=4/5/6 fused records bitwise against the no-workspace
+record route, BF16 output against repeated T=1 snapshots, unchanged FP32 source state, and masked
+B=3/4 isolation. DFlash Graph and eager real-artifact checks pass. MTP k=3/5 real-artifact checks
+pass; the existing k=4/B=4 coverage assertion still fails because its short requests complete
+without producing a four-row round. Target-only decode PPL remained 6.414141594, with every one
+of 2,047 FP32 NLL values byte-identical and no nonfinite values.
+
 The pre-rebase C=4 CUDA Graph node trace used to select the projection work attributed 32.5% of
 kernel time to SwiGLU, 20.7% to GDN record, 17.6% to MLP down, and about 1% to DFlash top-k
 selection. A fresh post-origin C=2 trace then exposed GDN request serialization as 36.1% of the
@@ -638,6 +666,10 @@ and p-less DFlash3 are in `profiles/bench/c1-gdn-w4-mtp3-aime15-1024-{before-955
 and `profiles/bench/c1-gdn-w4-dflash3-pless-512-{before-95588f45,after}-20260906/`. Adaptive-k3
 smokes are in `profiles/bench/c1-gdn-w4-dflash-adaptive-k3-smoke-{before-95588f45,after}-20260906/`.
 The final PPL rerun is `profiles/ppl/c1-gdn-w456-after-20260906.{json,nllf32}`.
+The fused replay A/B is in
+`profiles/bench/c1-replay-fusion-{before,after}-{dflash3,dflash4,dflash5,mtp3,mtp4,mtp5}-tg512-20260906.json`;
+its short/long node traces are in `profiles/nsys/c1-opportunity-*-20260906.*`, and the PPL result is
+`profiles/ppl/c1-replay-fusion-after-20260906.{json,nllf32}`.
 The post-GQA profiles are in `profiles/nsys/smallt-post-gqa-c{2,4}-nodes.nsys-rep`; isolated GDN
 A/Bs are in `profiles/bench/smallt-goal-{baseline-isolated,candidate-paired}/`; the long serving
 A/Bs are in `profiles/bench/smallt-goal-long-{baseline,paired}-20260905/`; and the PPL result is

@@ -384,7 +384,9 @@ public:
           record_out_(value_elements() * sizeof(std::uint16_t)),
           key_record_(qk_elements() * sizeof(std::uint16_t)),
           value_record_(value_elements() * sizeof(std::uint16_t)),
-          gate_record_(gate_elements() * 2 * sizeof(float)) {
+          gate_record_(gate_elements() * 2 * sizeof(float)),
+          record_workspace_(ops::gated_delta_net_replay_record_workspace_capacity_bytes(
+              profile.value_heads, batch, width)) {
         snapshot_states_.fill(0);
         record_states_.fill(0);
         snapshot_out_.fill(0);
@@ -427,6 +429,27 @@ public:
         Tensor out(record_out_.p, DType::BF16, {kStateDim, profile_.value_heads, width_, batch_});
         ops::gated_delta_net_replay_record(q, k, v, g, beta, scale(), states, valid, initial,
                                            key_record, value_record, gate_record, out, stream);
+    }
+
+    void launch_record_overlay(cudaStream_t stream) {
+        Tensor q(q_.p, DType::BF16, {kStateDim, kQkHeads, width_, batch_});
+        Tensor k(k_.p, DType::BF16, {kStateDim, kQkHeads, width_, batch_});
+        Tensor v(v_.p, DType::BF16, {kStateDim, profile_.value_heads, width_, batch_});
+        Tensor g(g_.p, DType::FP32, {profile_.value_heads, width_, batch_});
+        Tensor beta(beta_.p, DType::FP32, {profile_.value_heads, width_, batch_});
+        Tensor states(record_states_.p, DType::FP32,
+                      {kStateDim, kStateDim, profile_.value_heads, batch_});
+        Tensor valid = valid_tensor();
+        Tensor initial(record_initial_.p, DType::I32, {batch_});
+        Tensor key_record(key_record_.p, DType::BF16, {kStateDim, kQkHeads, width_, batch_});
+        Tensor value_record(value_record_.p, DType::BF16,
+                            {kStateDim, profile_.value_heads, width_, batch_});
+        Tensor gate_record(gate_record_.p, DType::FP32, {2, profile_.value_heads, width_, batch_});
+        Tensor out(record_out_.p, DType::BF16, {kStateDim, profile_.value_heads, width_, batch_});
+        record_workspace_.reset();
+        ops::gated_delta_net_replay_record(q, k, v, g, beta, scale(), states, valid, initial,
+                                           key_record, value_record, gate_record, out, stream,
+                                           nullptr, &record_workspace_);
     }
 
 private:
@@ -508,6 +531,7 @@ private:
     DeviceBuffer key_record_;
     DeviceBuffer value_record_;
     DeviceBuffer gate_record_;
+    WorkspaceArena record_workspace_;
 };
 
 Measurement measure_fold(const FoldResources& resources,
@@ -552,8 +576,12 @@ void run_recurrent_point(const Profile& profile, std::int32_t width, std::int32_
     const Measurement record =
         measure_component([&](cudaStream_t stream) { resources.launch_record(stream); }, flush,
                           options.warmup, options.repeat);
+    const Measurement record_overlay = measure_component(
+        [&](cudaStream_t stream) { resources.launch_record_overlay(stream); }, flush,
+        options.warmup, options.repeat);
     print_recurrent_result(profile, width, batch, valid, "snapshot", snapshot);
     print_recurrent_result(profile, width, batch, valid, "record", record);
+    print_recurrent_result(profile, width, batch, valid, "record+overlay", record_overlay);
 }
 
 void print_result(const Profile& profile, std::int32_t width, std::int32_t batch,

@@ -40,6 +40,13 @@ int verify_equal(const std::string& label, const std::vector<std::uint16_t>& lhs
     return 1;
 }
 
+int verify_equal(const std::string& label, const std::vector<std::uint32_t>& lhs,
+                 const std::vector<std::uint32_t>& rhs) {
+    if (lhs == rhs) { return 0; }
+    std::cerr << label << ": FP32 bits differ\n";
+    return 1;
+}
+
 int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
              std::vector<std::int32_t> valid_columns, std::uint32_t seed) {
     constexpr std::int32_t kQkHeads = 16;
@@ -228,6 +235,15 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
         std::cerr << "overlay replay record modified source state" << suffix << "\n";
         ++failures;
     }
+    failures += verify_equal("overlay key records" + suffix,
+                             from_device<std::uint16_t>(overlay_key, qk_elements),
+                             key_bits_after);
+    failures += verify_equal("overlay value records" + suffix,
+                             from_device<std::uint16_t>(overlay_value, value_elements),
+                             value_bits_after);
+    failures += verify_equal("overlay gate records" + suffix,
+                             from_device<std::uint32_t>(overlay_gate, gate_elements * 2),
+                             gate_bits_after);
 
     const std::size_t slot_floats =
         static_cast<std::size_t>(kStateDim) * kStateDim * value_heads;
@@ -554,6 +570,9 @@ int main() {
     failures += run_case(32, 16, 1, {7}, 1711U);
     failures += run_case(32, 6, 4, {6, 5, 4, 3}, 1721U);
     failures += run_case(48, 5, 3, {5, 5, 5}, 1726U);
+    failures += run_case(48, 4, 1, {}, 1727U);
+    failures += run_case(48, 5, 1, {}, 1728U);
+    failures += run_case(48, 6, 1, {}, 1729U);
     failures += run_case(48, 2, 1, {1}, 1731U);
     failures += run_case(48, 6, 4, {6, 4, 3, 2}, 1741U);
     failures += run_tree_case(32, 1751U);

@@ -400,6 +400,9 @@ struct OverlayAccess {
     const std::int32_t* valid_columns;
     const std::int32_t* initial_slots;
     const std::int32_t* parent_index;
+    __nv_bfloat16* key_record;
+    __nv_bfloat16* value_record;
+    uint2* gate_record;
     __nv_bfloat16* out;
     head_map heads;
     std::int32_t width;
@@ -470,6 +473,35 @@ struct OverlayAccess {
         return out + (column(coord, token) * heads.H_v + coord.value_head) * kStateDim;
     }
 
+    __device__ __forceinline__ void store_key(const RecurrentCoordinates& coord,
+                                              std::int32_t token,
+                                              const RawQkLane& raw) const {
+        if (coord.state_tile == 0 && coord.warp == 0 &&
+            static_cast<int>(coord.value_head) % heads.group_size() == 0) {
+            __nv_bfloat16* destination =
+                key_record + (column(coord, token) * heads.H_qk + coord.qk_head) * kStateDim;
+            store_vec(destination + coord.dqk_base, raw.bits);
+        }
+    }
+
+    __device__ __forceinline__ void store_value(const RecurrentCoordinates& coord,
+                                                std::int32_t token,
+                                                const RawValueLane& raw) const {
+        if (coord.lane < kDvPerWarp) {
+            __nv_bfloat16* destination =
+                value_record + (column(coord, token) * heads.H_v + coord.value_head) * kStateDim;
+            destination[coord.dv_base + coord.lane] = raw.bits;
+        }
+    }
+
+    __device__ __forceinline__ void store_gate(const RecurrentCoordinates& coord,
+                                               std::int32_t token,
+                                               const RawGatePair& raw) const {
+        if (coord.state_tile == 0 && coord.warp == 0 && coord.lane == 0) {
+            gate_record[column(coord, token) * heads.H_v + coord.value_head] = raw.bits;
+        }
+    }
+
     __device__ __forceinline__ void
     load_tile(const float* head, const RecurrentCoordinates& coord,
               float (&state)[kDvPerWarp][kQkPerLane]) const {
@@ -514,7 +546,6 @@ struct RecordAccess {
     std::int32_t width;
     std::int64_t state_slot_stride;
     float scale;
-    float* column_scratch;
 
     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
         return make_coordinates(static_cast<std::int32_t>(blockIdx.y), 0,
@@ -594,20 +625,8 @@ struct RecordAccess {
     }
 
     __device__ __forceinline__ float* column_tile(std::int32_t token) const {
-        float* base = nullptr;
-        if constexpr (ParentIndexed && NumWarps == kNumWarps) {
-            const std::int64_t cta =
-                static_cast<std::int64_t>(blockIdx.x) +
-                static_cast<std::int64_t>(gridDim.x) *
-                    (blockIdx.y + static_cast<std::int64_t>(gridDim.y) * blockIdx.z);
-            const std::int64_t stride =
-                static_cast<std::int64_t>(width) * kDv * kStateDim;
-            base = column_scratch + cta * stride;
-        } else {
-            extern __shared__ float column_tiles[];
-            base = column_tiles;
-        }
-        return base + static_cast<std::int64_t>(token) * kDv * kStateDim;
+        extern __shared__ float column_tiles[];
+        return column_tiles + static_cast<std::int64_t>(token) * kDv * kStateDim;
     }
 
     __device__ __forceinline__ void
@@ -981,10 +1000,13 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
         }
 
         RawQkLane key = load_raw_qk_lane(access.key_ptr(coord, token), coord.dqk_base);
+        access.store_key(coord, token, key);
         normalize_qk_lane<true>(key.value, coord.lane);
         const RawGatePair gate = access.load_gate(coord, token);
         const RawValueLane value =
             load_value_lane(access.value_ptr(coord, token), coord.lane, coord.dv_base);
+        access.store_value(coord, token, value);
+        access.store_gate(coord, token, gate);
         apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
         readout_and_store<true>(state, access.query_ptr(coord, token),
                                 access.output_ptr(coord, token), coord.dqk_base, coord.dv_base,
