@@ -568,11 +568,11 @@ Story is `scenario_story_en_mystery` at 1024 output tokens.
 | MTP3 | story, stochastic | 163.5 | 41.9% | 2.26 |
 | DFlash2 k=7 W8 | story, stochastic | 115.7 | 21.6% | 2.51 |
 
-DFlash2 is a supported exclusive backend on this identity (`--spec dflash --draft-tokens 7
---lm-head-draft`; verify is the paper-accurate chain W=8). These first C=1 INT8-KV points beat
-MTP0 (1.47× on stochastic AIME) and trail MTP3 (0.69×) and MTP5 (0.65×). Greedy AIME and story
-show the same gap: DFlash2 accept is about 22–29% versus MTP3 about 42–52%. That accept gap is
-the current speed target; it is not a reason to drop the backend.
+DFlash2 is a supported exclusive backend on this identity (`--spec dflash --draft-tokens 4
+--lm-head-draft`; verify is chain `W=k+1`, maximum k=5). Historical C=1 INT8-KV points below used
+k=7 chain W=8. They beat MTP0 (1.47× on stochastic AIME) and trail MTP3 (0.69×) and MTP5 (0.65×).
+Greedy AIME and story show the same gap: DFlash2 accept is about 22–29% versus MTP3 about 42–52%.
+That accept gap is the current speed target; it is not a reason to drop the backend.
 
 Isolated CLI NVFP4-KV AIME (`long_decode_aime26_15`, 4096 tokens, seed `7632647173703958409`,
 presence penalty 0, `--lm-head-draft`) after fused batched GDN conv-record (2026-08-29):

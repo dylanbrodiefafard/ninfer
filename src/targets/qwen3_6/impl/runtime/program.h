@@ -408,7 +408,8 @@ public:
     const std::uint32_t dflash_verify_width;
     const bool adaptive_draft;
     const std::vector<std::uint32_t> captured_ks;
-    const std::vector<float> adaptive_round_time;
+    std::array<qwen3_6::AdaptiveRoundTimeState, kMaximumConcurrency> adaptive_t_by_batch{};
+    std::array<qwen3_6::AdaptiveBatchKState, kMaximumConcurrency> adaptive_batch_k_by_c{};
     const SpeculativeBackend speculative_backend;
     const std::vector<std::uint32_t> context_marks;
     const DType kv_dtype;

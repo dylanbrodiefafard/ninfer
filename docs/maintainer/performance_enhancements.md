@@ -79,8 +79,8 @@ fraction of that round. Prefill was never the target and did not move.
 
 ## DFlash2 packed-tree shapes and 4-warp smem GDN
 
-See [dflash2-tree-speed.md](dflash2-tree-speed.md) for the kept W=12 BFS path, split
-top-k select, and HBM 4-warp record. Do not retry:
+See [dflash2-tree-speed.md](dflash2-tree-speed.md) for the historical W=12 BFS path, split
+top-k select, and HBM 4-warp record. Product DFlash2 is chain-only `{3,4,5}`. Do not retry:
 
 - local-edge N=8 pack (collapses to a chain)
 - full beam W=16 (third GQA tile; slower than W=12)

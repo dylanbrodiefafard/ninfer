@@ -139,6 +139,12 @@ int test_cli_contract() {
         "unsupported MTP window");
     failures += expect_throws<std::invalid_argument>(
         [] {
+            (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec", "dflash",
+                                  "--draft-tokens", "6"});
+        },
+        "unsupported DFlash window");
+    failures += expect_throws<std::invalid_argument>(
+        [] {
             (void)parse_for_test(
                 {"ninfer_bench", "--weights", "model.ninfer", "--prefill-chunk", "129"});
         },

@@ -354,8 +354,8 @@ absolute token positions while Text RoPE follows the post-Vision MRoPE sequence.
 
 One propose block:
 
-1. Query rows are the anchor embedding plus seven MASK embeddings (id **248070**) at positions
-   `E .. E+7`. `input_embedding_scale` is 1.0.
+1. Query rows are the anchor embedding plus `k` MASK embeddings (id **248070**) at positions
+   `E .. E+k`. `input_embedding_scale` is 1.0.
 2. For each of the five layers, from pinned `Qwen3DFlashDecoderLayer`:
    - `h = RMSNorm(residual, input_norm)`
    - `h, attn_k1 = attention_conv.prepare(h)`
@@ -367,7 +367,7 @@ One propose block:
    - `o_proj` then `attention_conv.finish` on the 5120-d residual stream; residual add
    - `h = RMSNorm(residual, post_attention_norm)`
    - `h, mlp_k1 = mlp_conv.prepare(h)`; SiLU-GLU MLP; `mlp_conv.finish`; residual add
-3. Final RMSNorm → draft-head logits on the seven mask columns (not the anchor).
+3. Final RMSNorm → draft-head logits on the `k` mask columns (not the anchor).
    Concurrent C>1 runs each compact row as a C=1-shaped propose (`T=width`, `B=1`) so those
    Linears, SWA, and the draft head use the sequential kernels rather than a `T=width*B`
    specialization. Eager execution also resolves SWA's direct/split route from that row's
@@ -381,7 +381,7 @@ One propose block:
    softmax shortlist cannot inflate `p/q` and lock onto copied n-grams.
    Selector RNG is keyed by request seed and absolute token position, independent of compact batch
    row. `--lm-head-draft` runs top-16 on the shortlist and gathers codebooks by token id.
-5. The 27B target verifies the packed tree (product W=12 at k=7) or chain (W=k+1) in one
+5. The 27B target verifies the chain (`W=k+1`) in one
    causal forward for the compact batch. Concurrent C>1 keeps that forward packed (`B=batch`)
    so CUDA graphs capture one 27B verify rather than a serial host loop. Residual Linear and
    GDN-control normally panel at the C=1 width (`packed_route_tokens`); the qualified W=5
@@ -396,12 +396,19 @@ One propose block:
    a private FP32 projection, and other widths use request-indexed SmallT CTAs. Packed GDN
    recurrent overlays T=1 snapshot `out` on scratch SSM. Greedy accepts the matching prefix.
    Truncated sampling uses Leviathan `min(1,p/q)` on every hop. Under p-less, hop 0 is
-   Leviathan with one-hot `q` (tree: SpecInfer membership); later hops and the bonus are greedy
+   Leviathan with one-hot `q`; later hops and the bonus are greedy
    argmax. ReplaySSM Fold commits the corresponding sequential prefix. The RTX 5090
-   recommendation is k=4 (W=5, one SmallT GQA tile). Native k=7 uses W=8 chain or W=12 packed
-   tree; chain W=8 on 24 Q heads is T>6, so B=1 causal verify uses the Prompt GQA route over
-   the full visible KV. The maximum k=11 route performs two MASK blocks (7+4) before one W=12
-   chain verify.
+   recommendation is k=4 (W=5, one SmallT GQA tile). Maximum k=5 (W=6). `--adaptive-draft`
+   picks live k in `{3,4,5}` by locking `argmax E[Y(k)]/T(k,C,L)`. `Y(k)=1+Σ_{i<k} q_i` with
+   `q_i=Π_{j≤i} r_j` and `r_i=P(accepted>i | accepted>i-1)` a discounted Beta updated only when
+   the prefix reached i. Unseen `r_i` are omitted from `E[Y]` and filled with 1 only in the
+   optimistic bound used to drop dominated k. `T(k,C,L)=a_{C,k}+c_C L` is online least squares
+   (shared slope, per-k intercept) at the length the round ran. Unmeasured `T(k)` is
+   `max(T(k-1), 2 T(k-1)-T(k-2))` and is probed at most once if that bound still beats the
+   best measured arm. C=1 and C≥2 use the same lock; C≥2 shares one batch k and writes it to
+   every row. Switching k adds 1 ms to that arm's T. Ties keep the smaller k. CUDA graphs
+   capture one graph per k; the next k is chosen after the round (lagged one round, no
+   post-draft host seam).
 
 `GroupedDynamicCausalConv` is grouped size-16, kernel 2, left-padded (causal along the query
 block): `prepare` before the sublayer on the pre-norm hidden, `finish` on that sublayer's output.
@@ -417,10 +424,8 @@ draft therefore reduces acceptance and throughput; it must not change the distri
 target tokens. Under p-less, DFlash2 chain accept uses the same one-hot `q` convention as MTP
 (ignore any 16-way selector `q`) **only at hop 0**: p-less temperature is not a draft softmax, so
 `p/q` from a 16-way shortlist would over-accept copied n-grams. Later hops, and the bonus after a
-full accept, are greedy (accept iff the draft equals that packed column's p-less argmax). Packed
-tree verify is the same split: hop 0 is SpecInfer membership from p-less(`P_LLM`); later hops walk
-only the argmax child. DFlash2 differs by producing the whole candidate chain in one masked-block
-forward. Packed GDN conv-record uses a T=1-reduction, BF16-history SmallT launch at B=2..4; packed
+full accept, are greedy (accept iff the draft equals that packed column's p-less argmax). DFlash2
+differs by producing the whole candidate chain in one masked-block forward. Packed GDN conv-record uses a T=1-reduction, BF16-history SmallT launch at B=2..4; packed
 GDN recurrent overlays ordinary T=1 snapshot arithmetic on scratch SSM so those packed logits
 match width-one decode. Fold still consumes the T=W records.
 

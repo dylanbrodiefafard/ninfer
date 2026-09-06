@@ -266,12 +266,11 @@ std::uint32_t BenchTest::required_context(const SpeculativeOptions& spec) const 
     if (spec.draft_tokens != 0 && spec.backend == SpeculativeBackend::Mtp) {
         margin = 2ULL * spec.draft_tokens;
     } else if (spec.draft_tokens != 0 && spec.backend == SpeculativeBackend::DFlash) {
-        // 27B DFlash2 default verify width: 12-column tree at k<=7 (two-block Spark), chain
-        // width k+1 beyond that; an explicit dflash_verify_width wins. Two verify-widths of
-        // headroom cover the transient uncommitted round state.
+        // 27B DFlash2 is chain W=k+1. An explicit dflash_verify_width wins. Two
+        // verify-widths of headroom cover the transient uncommitted round state.
         const std::uint32_t width = spec.dflash_verify_width != 0
                                        ? spec.dflash_verify_width
-                                       : (spec.draft_tokens <= 7 ? 12U : spec.draft_tokens + 1U);
+                                       : spec.draft_tokens + 1U;
         margin = 2ULL * width;
     }
     return checked_context(prompt + decode + margin, "benchmark context requirement");
@@ -305,9 +304,9 @@ std::string usage_text(std::string_view program) {
         << "                              prefix-reuse seed so prefill/decode do not interleave\n"
          << "  --spec <mtp|dflash>       speculative backend (default: mtp); dflash requires\n"
          << "                              the artifact to contain dflash/ objects\n"
-         << "  --draft-tokens <0..15>    speculative draft window: mtp [0,5] (0 = none),\n"
-         << "                              dflash [1,15] (default: 0)\n"
-         << "  --adaptive-draft            pick live K from host EWMA; requires --spec mtp|dflash\n"
+         << "  --draft-tokens <0..5>     speculative draft window: mtp [0,5] (0 = none),\n"
+         << "                              dflash [1,5] (default: 0)\n"
+         << "  --adaptive-draft            pick live K in {3,4,5} by locking E[Y]/T(k,C,L); requires --spec mtp|dflash\n"
          << "  --dflash-verify-width <2..16> DFlash packed verify width; 0 = k-dependent\n"
          << "                              default (dflash only)\n"
          << "  --lm-head-draft             use the optimized proposal head; requires --draft-tokens\n"
@@ -385,7 +384,7 @@ BenchOptions parse_args(int argc, char** argv) {
         } else if (arg == "--draft-tokens") {
             options.draft_tokens = parse_u32(value("--draft-tokens"), "draft-tokens", true);
             if (options.draft_tokens > kMaxDFlashDraftTokens) {
-                throw std::invalid_argument("--draft-tokens must be in [0,15]");
+                throw std::invalid_argument("--draft-tokens must be in [0,5]");
             }
         } else if (arg == "--adaptive-draft") {
             options.adaptive_draft = true;
@@ -435,7 +434,7 @@ BenchOptions parse_args(int argc, char** argv) {
     }
     if (options.spec_backend == SpeculativeBackend::DFlash &&
         (options.draft_tokens == 0 || options.draft_tokens > kMaxDFlashDraftTokens)) {
-        throw std::invalid_argument("--spec dflash requires --draft-tokens in [1,15]");
+        throw std::invalid_argument("--spec dflash requires --draft-tokens in [1,5]");
     }
     if (options.dflash_verify_width != 0 && options.spec_backend != SpeculativeBackend::DFlash) {
         throw std::invalid_argument("--dflash-verify-width requires --spec dflash");

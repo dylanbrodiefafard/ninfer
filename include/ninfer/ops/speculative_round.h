@@ -131,7 +131,7 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
  *
  * verify_ids/parent_index/fold_path/licensed_tokens are I32 [W,B]. target_tokens is I32 [W,B].
  * logits is BF16 [physical_rows,W,B]. current_extents/valid_columns and the other vectors are
- * I32 [B]. W is the packed verify width in [2,16] (product k=7 uses 12). lengths[b] is the
+ * I32 [B]. W is the packed verify width in [2,16] (tree-select W=12 is historical). lengths[b] is the
  * pre-round sequence length and is incremented by the produced count; it must not alias the
  * packed-window base used by gqa_kv_compact_path (E+path[i] → E+i).
  *

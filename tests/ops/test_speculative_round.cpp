@@ -910,8 +910,8 @@ int p_less_dflash2_product_tree_multiblock_case() {
                              want_lic, 2, 6, want_path, 4093);
 }
 
-// Live serve is DFlash2 tree k=7 / W=12 / p-less T=2 / C=2. Greedy C>1 isolation
-// does not enter this kernel: p-less tree uses the multiblock mass-finalize walk
+// Product DFlash2 is chain k=4 / W=5 / p-less T=2 / C=2. This Op case still covers
+// packed-tree accept isolation: p-less tree uses the multiblock mass-finalize walk
 // with one workspace replica per compact row. If that stride is wrong, row 1
 // samples row 0's columns (OpenCode: one concurrent story stays coherent, the
 // other emits token salad).

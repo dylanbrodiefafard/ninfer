@@ -27,7 +27,7 @@ inline constexpr std::uint32_t kDefaultPrefillChunk   = 4096;
 inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
 inline constexpr std::uint32_t kKvPageTokens          = 64;
 inline constexpr std::uint32_t kMaxMtpDraftTokens     = 5;
-inline constexpr std::uint32_t kMaxDFlashDraftTokens  = 15;
+inline constexpr std::uint32_t kMaxDFlashDraftTokens  = 5;
 inline constexpr std::uint32_t kMaxDFlashVerifyWidth  = 16;
 
 enum class TestKind { Prefill, Decode, PrefillDecode };

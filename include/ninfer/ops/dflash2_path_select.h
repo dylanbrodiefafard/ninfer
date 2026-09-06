@@ -123,7 +123,8 @@ void dflash2_path_select(const Tensor& logits, const Tensor& hidden,
  * kDflash2TreeExpandWidth nodes, then keeps the BFS prefix of W nodes where W is
  * verify_ids.ne[0] (complete early depths, one truncated last depth). Column 0 is the
  * anchor. Unused columns copy the last live node and are excluded by valid_columns.
- * Product k=7 uses kDflash2VerifyWidth=12; k=4/5 tree A/B uses W=6.
+ * Historical product k=7 used kDflash2VerifyWidth=12; k=4/5 tree A/B uses W=6.
+ * Live DFlash2 verify is chain-only (this Op is not on that path).
  *
  * cache_positions[j,b] = frontiers[b] + j. rope_positions[j,b] = frontiers[b] + depth[j].
  * ancestor_mask[j,b] bit i is set iff packed column i is an ancestor of j, including j.
