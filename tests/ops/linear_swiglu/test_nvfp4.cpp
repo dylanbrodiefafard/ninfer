@@ -28,6 +28,14 @@ int main() {
             "LinearSwiGLU NVFP4_A16 W5 panels",
             {QType::NVFP4, 34816, 5120, 17408, 1801U, ActivationCompute::A16}, 5,
             std::array<std::int32_t, 3>{10, 15, 20});
+        failures += run_packed_matches_panels(
+            "LinearSwiGLU NVFP4_A16 W4 panels",
+            {QType::NVFP4, 34816, 5120, 17408, 1801U, ActivationCompute::A16}, 4,
+            std::array<std::int32_t, 3>{8, 12, 16});
+        failures += run_packed_matches_panels(
+            "LinearSwiGLU NVFP4_A16 W6 panels",
+            {QType::NVFP4, 34816, 5120, 17408, 1801U, ActivationCompute::A16}, 6,
+            std::array<std::int32_t, 2>{12, 18});
         std::cout << (failures == 0 ? "OK" : "FAIL") << " LinearSwiGLU NVFP4 correctness\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

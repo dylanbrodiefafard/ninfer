@@ -624,6 +624,56 @@ pass; the existing k=4/B=4 coverage assertion still fails because its short requ
 without producing a four-row round. Target-only decode PPL remained 6.414141594, with every one
 of 2,047 FP32 NLL values byte-identical and no nonfinite values.
 
+### W=4/6 multi-request weight replay and remaining decode research
+
+The 2026-09-06 follow-up used the same RTX 5090, Qwen3.8-27B NVFP4/BF16-codebook artifact,
+NVFP4 KV, CUDA Graphs, 4,096-token prefill chunks, optimized proposal head, and greedy fixed
+waves. W=4 now groups NVFP4 attention-input, fused SwiGLU, and MLP-down work across C=2..4;
+W=6 groups MLP-down across C=2..4, fused SwiGLU at C=2/3, and NVFP4 attention-input at C=2.
+The other W=4/6 attention-input and attention/GDN-output shapes remain panels: direct aggregate
+kernels passed random mathematical-oracle tolerances but changed real recurrent verification
+outputs. The W=6 C=3 MLP-down schedule retains the W=6 panel's 16-value reduction association.
+
+Against the preserved `415b1ef8` binary, matched 256-token DFlash waves measured:
+
+| Backend | C | Prior tok/s | Retained tok/s | Change |
+|---|---:|---:|---:|---:|
+| DFlash3 | 2 | 135.950 | 151.524 | +11.46% |
+| DFlash3 | 3 | 148.171 | 169.750 | +14.56% |
+| DFlash3 | 4 | 151.617 | 178.667 | +17.84% |
+| DFlash5 | 2 | 117.164 | 122.894 | +4.89% |
+| DFlash5 | 3 | 121.980 | 130.084 | +6.64% |
+| DFlash5 | 4 | 122.483 | 128.309 | +4.76% |
+
+Matched 128-token MTP waves independently confirmed the shared target-route gain:
+
+| Backend | C | Prior tok/s | Retained tok/s | Change |
+|---|---:|---:|---:|---:|
+| MTP3 | 2 | 168.553 | 190.362 | +12.94% |
+| MTP3 | 3 | 172.886 | 204.114 | +18.06% |
+| MTP3 | 4 | 175.968 | 214.136 | +21.69% |
+| MTP5 | 2 | 135.592 | 144.728 | +6.74% |
+| MTP5 | 3 | 145.510 | 156.704 | +7.69% |
+| MTP5 | 4 | 143.259 | 150.630 | +5.14% |
+
+Every paired cell retained identical speculative rounds, drafted tokens, and accepted tokens.
+Exact packed-versus-panel intermediate tests cover W=4/5/6 NVFP4 attention input, SwiGLU, and
+both residual Linear geometries; Graph and eager DFlash real-artifact isolation pass for k=3/5,
+and MTP Graph isolation passes through its existing short adaptive-k4 coverage assertion.
+
+Three other research directions produced no retained code. At W=5 and contexts
+32,768/65,536/131,072/196,608, the existing NVFP4-KV GQA path measured
+45.024/67.552/118.784/165.888 us. Reducing it from eight to four warps regressed those points by
+12-18%; the kernel already double-stages asynchronous KV loads, and NCU measured about 167.5 MB
+of L2 traffic with 66-68% DRAM throughput at 131,072 tokens. Persistent SwiGLU-plus-down fusion
+was rejected by the exact-shape classifier: its grid-wide dependency would remove only about
+170-220 KiB of activation traffic while streaming about 151 MiB of weights per W=5 layer. The
+fixed-width scheduling sweep selected W=5 for this DFlash corpus at C=1..3 (approximately tied
+with W=4 at C=4) and W=4 for MTP at every C. Adaptive N=5 selected W=4; its measured E[Y]/round
+time objective already includes weight streaming and all non-matrix round costs, so a separate
+accepted-tokens-per-weight-byte objective was not retained. Backend-specific cold seeding did not
+change the selected steady width and was removed.
+
 The pre-rebase C=4 CUDA Graph node trace used to select the projection work attributed 32.5% of
 kernel time to SwiGLU, 20.7% to GDN record, 17.6% to MLP down, and about 1% to DFlash top-k
 selection. A fresh post-origin C=2 trace then exposed GDN request serialization as 36.1% of the
