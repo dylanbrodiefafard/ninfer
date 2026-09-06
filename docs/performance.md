@@ -464,8 +464,9 @@ RTX 5090, CUDA Graph, NVFP4 KV, optimized proposal head, greedy
 `long_decode_aime26_15`, 2,048 output tokens per request, max-context 16,384, and one compact
 full-concurrency batch. The retained W=5 route aggregates the A16 attention-output, GDN-output,
 MLP-down, fused SwiGLU, and supported fused attention-input projections across requests. Packed
-GDN conv-record uses one request-indexed SmallT launch for C=2..4 instead of C serialized T=1
-launches; C=1 retains the post-origin T=1 route.
+GDN conv-record uses grouped SmallT weight replay for the qualified W=5 C=1..4 shapes instead of
+serial T=1 projection passes; C=1 uses one five-token weight panel and a separate sequential FP32
+convolution.
 Attention-input aggregation is limited to the NVFP4 and BF16-control routes used by this
 artifact; Q4/Q5 and other verify widths retain their prior panel execution until separately
 qualified.
@@ -475,6 +476,22 @@ qualified.
 | 2 | 161.3 | 173.6 | 187.5 | **219.9** | +17.3% | +36.3% |
 | 3 | 163.6 | 177.8 | 193.3 | **229.6** | +18.8% | +40.4% |
 | 4 | 164.4 | 173.5 | 186.8 | **220.6** | +18.1% | +34.2% |
+
+The subsequent C=1 W=4..6 specialization processes each verification panel in one weight pass.
+W=4 uses fused SmallT and needs no workspace: the complete public GDN record Op fell from 83.648
+to 49.152 us (-41.2%) cold and from 63.040 to 28.480 us (-54.8%) warm. W=5/6 use grouped replay
+and a separate sequential convolution. W=5 fell from 96.256 to 67.584 us (-29.8%) cold and from
+77.568 to 42.784 us (-44.8%) warm; W=6 fell from 112.640 to 69.632 us (-38.2%) cold and from
+92.000 to 47.040 us (-48.9%) warm. Across three matched 1,024-token fixtures, DFlash3 steady
+decode improved by 11.9-13.3% (+12.6% geomean) and whole-wave throughput by 10.8-11.1% (+11.0%
+geomean). Matched MTP3 improved from 157.18 to 173.22 tok/s (+10.2%) steady and 11.3% whole-wave;
+the seeded p-less DFlash3 control improved from 150.97 to 177.97 tok/s (+17.9%) steady and 11.2%
+whole-wave. DFlash4 steady decode
+improved by 8.0-10.1% (+9.2% geomean) and whole-wave throughput by 9.5-9.6% (+9.6% geomean), while
+DFlash5 improved by 6.9-13.0% (+10.5% geomean) and 12.3% geomean, respectively. A separate
+2,048-token DFlash5 fixture improved from 139.59 to 156.16 tok/s (+11.9%); matched MTP5 improved
+from 145.98 to 169.78 tok/s (+16.3%). Each A/B pair retained identical output hashes,
+draft/accept counters, and acceptance.
 
 The same shared target route improves matched MTP4 serving without changing acceptance:
 
@@ -505,13 +522,16 @@ versus combined C=4 probe was bit-identical across 512,000 sampled post-MLP BF16
 target-hidden BF16 values, 4,966,400 target-logit BF16 values, verifier IDs, cache positions,
 argmax, and sampled live and ReplaySSM BF16/FP32 GDN state. Every checkpoint had zero mismatches,
 zero relative L2 and maximum absolute error, and no nonfinite values. The GDN change adds direct
-intermediate coverage at its public boundary: W=5 C=2/3/4 dense, ragged, and tree-parent q/k/v/z
-outputs and valid conv-record values are bit-exact to independent C=1 T=1 launches. Sixty-three
-decoded-NVFP4 FP64 projection/convolution checks had no nonfinite values; worst relative L2 was
+intermediate coverage at its public boundary: W=4/5 C=1..4 and W=6 C=1 dense, ragged, and
+tree-parent q/k/v/z outputs and valid conv-record values are bit-exact to the former C=1 T=1
+route. Independent decoded-NVFP4 FP64 projection/convolution checks had no nonfinite values;
+worst relative L2 was
 0.00269457 under 0.00315 and worst maximum absolute error was 0.00380876 under its 0.00738378
 gross limit. Four 2,048-token Graph
 streams also matched exactly, including 681 rounds, 2,724 drafts, 1,366 accepts, and 50.1468%
-DFlash acceptance. Separately, target-only decode PPL remained 6.414141594 through the GDN change:
+DFlash acceptance. A matched W=6 p-less stream also retained exact output, counters, and 39.5322%
+acceptance while improving steady decode by 12.3%. Separately, target-only decode PPL remained
+6.414141594 through the GDN change:
 all 2,047 scored FP32 NLL values were byte-identical, with 19 terrible tokens and no nonfinite
 values. That PPL route does not exercise concurrent packed verification.
 
@@ -592,6 +612,32 @@ are in `profiles/bench/multi-request-gqa-{baseline,candidate}-20260904/` and
 `profiles/bench/multi-request-gqa-e2e-{baseline,candidate}-20260904/`; the uncontended repeat is
 in `profiles/bench/multi-request-gqa-e2e-{baseline,candidate}-clean-20260904/`. The PPL rerun is
 in `profiles/ppl/multi-request-gqa-candidate-20260904/`.
+The C=1 W=5 Op A/B is in
+`profiles/bench/c1-dflash4-gdn-b1-w5-{route-proxy-head95588f45,grouped-final}-20260905.csv`;
+its serving A/B is in `profiles/bench/c1-gdn-w5-e2e-{before-95588f45,after}-20260905/`, and the
+three-fixture confirmation is in
+`profiles/bench/c1-gdn-w5-general1024-{before-95588f45,after}-20260905/`. The
+retained NCU reports are in `profiles/ncu/c1-dflash4-gdn-record-w5-head95588f45-20260905.*` and
+`profiles/ncu/c1-dflash4-gdn-record-w5-grouped-candidate-20260905.*`. The W=6 Op A/B is in
+`profiles/bench/c1-dflash5-gdn-b1-w6-baseline-20260906.csv` and
+`profiles/bench/c1-dflash45-gdn-b1-w5-w6-grouped-candidate-20260906.csv`; its NCU report is
+`profiles/ncu/c1-dflash5-gdn-record-w6-grouped-candidate-20260905.*`. DFlash5 serving is in
+`profiles/bench/c1-gdn-w6-dflash5-{general1024,aime15-2048}-{before-95588f45,after}-20260906/`,
+and MTP5 is in `profiles/bench/c1-gdn-w6-mtp5-aime15-1024-{before-95588f45,after}-20260906/`.
+The p-less A/B and adaptive-k5 smoke are in
+`profiles/bench/c1-gdn-w6-dflash5-pless-512-{before-95588f45,after}-20260906/` and
+`profiles/bench/c1-gdn-w6-dflash5-adaptive-k5-smoke-20260906/`.
+The final target-only PPL rerun is `profiles/ppl/c1-gdn-w56-after-20260906.{json,nllf32}`.
+The W=4 serialized, grouped-control, and retained fused-SmallT Op measurements are in
+`profiles/bench/c1-draft3-gdn-b1-w4-baseline-20260906.csv`,
+`profiles/bench/c1-draft345-gdn-b1-w4-w6-grouped-candidate-20260906.csv`, and
+`profiles/bench/c1-draft345-gdn-b1-w4-fused-w5-w6-grouped-final-20260906.csv`; the retained NCU
+report is `profiles/ncu/c1-draft3-gdn-record-w4-fused-smallt-final-20260906.*`. DFlash3 serving is
+in `profiles/bench/c1-gdn-w4-dflash3-general1024-{before-95588f45,after}-20260906/`; matched MTP3
+and p-less DFlash3 are in `profiles/bench/c1-gdn-w4-mtp3-aime15-1024-{before-95588f45,after}-20260906/`
+and `profiles/bench/c1-gdn-w4-dflash3-pless-512-{before-95588f45,after}-20260906/`. Adaptive-k3
+smokes are in `profiles/bench/c1-gdn-w4-dflash-adaptive-k3-smoke-{before-95588f45,after}-20260906/`.
+The final PPL rerun is `profiles/ppl/c1-gdn-w456-after-20260906.{json,nllf32}`.
 The post-GQA profiles are in `profiles/nsys/smallt-post-gqa-c{2,4}-nodes.nsys-rep`; isolated GDN
 A/Bs are in `profiles/bench/smallt-goal-{baseline-isolated,candidate-paired}/`; the long serving
 A/Bs are in `profiles/bench/smallt-goal-long-{baseline,paired}-20260905/`; and the PPL result is

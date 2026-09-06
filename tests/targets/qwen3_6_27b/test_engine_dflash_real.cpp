@@ -333,7 +333,8 @@ enum class OracleKind { TargetOnly, StrictTargetOnly, C1DFlash };
 // C=1 DFlash is the strict oracle for overlapping C>1 of the same k: that comparison is
 // packed-batch identity, not packed-versus-T=1 drift. Flattening NVFP4
 // GDN conv-record to T=W*B compose (W4A4 GEMM + BF16 conv) flipped greedy col 0 vs
-// C=1 fused SmallT+FP32; the Op guard is run_nvfp4_batched_matches_serial_fused.
+// the C=1 same-reduction FP32-convolution route; the Op guard is
+// run_nvfp4_batched_matches_serial_fused.
 int check_tokens(const char* label, const ninfer::GenerationResult& result,
                  const std::vector<ninfer::TokenId>& want, OracleKind kind) {
     const char* want_name = kind == OracleKind::C1DFlash ? "C=1 DFlash" : "target-only";
@@ -2006,6 +2007,9 @@ int main() {
     if (only_k == nullptr || std::string(only_k) == "1") {
         if (const int result = run_k(1, "DFlash2 k=1 chain C=4"); result != 0) { return result; }
     }
+    if (only_k == nullptr || std::string(only_k) == "3") {
+        if (const int result = run_k(3, "DFlash2 k=3 chain C=4"); result != 0) { return result; }
+    }
     if (only_k == nullptr || std::string(only_k) == "4" || std::string(only_k) == "7") {
         if (const int result = run_k(4, "DFlash2 k=4 chain C=4"); result != 0) { return result; }
     }
@@ -2018,19 +2022,20 @@ int main() {
         ninfer::Engine engine(adaptive_engine_options(
             artifact, ninfer::SpeculativeBackend::DFlash, 5, 3));
         if (const int result = check_dflash_load(engine); result != 0) { return result; }
-        // Prefill commits the first generated token. Seven tokens leave remaining=6 on
-        // the first DFlash round: budget_extent=5, seed live_k=5, W(k)=6 under W_ceil=6.
+        // Adaptive selection probes the first unmeasured captured width, k=3. A seven-token
+        // request is the short-budget control; the longer request below exercises the retained
+        // fastest width after calibration.
         const ninfer::GenerationResult compact =
             engine.generate(engine.prepare_tokens(prompts[0]), greedy_options(7));
         if (compact.generated_token_ids.size() != 7 || check_speculative(compact, label) != 0) {
-            std::cerr << label << " compact k=5 under N=5 did not complete\n";
+            std::cerr << label << " compact request under N=5 did not complete\n";
             dump_tokens("  got", compact.generated_token_ids);
             dump_speculative("  spec", compact.speculative);
             return 1;
         }
-        if (compact.speculative.rounds_per_draft.size() < 6 ||
-            compact.speculative.rounds_per_draft[5] == 0) {
-            std::cerr << label << " compact run did not record k=5 rounds under N=5\n";
+        if (compact.speculative.rounds_per_draft.size() < 4 ||
+            compact.speculative.rounds_per_draft[3] == 0) {
+            std::cerr << label << " compact run did not record the initial k=3 probe\n";
             dump_speculative("  spec", compact.speculative);
             return 1;
         }
@@ -2043,9 +2048,9 @@ int main() {
             compact_rb.generated_token_ids.size() != 7 ||
             check_speculative(compact_ra, label) != 0 ||
             check_speculative(compact_rb, label) != 0 ||
-            compact_ra.speculative.rounds_per_draft.size() < 6 ||
-            compact_ra.speculative.rounds_per_draft[5] == 0) {
-            std::cerr << label << " compact C=2 k=5 under N=5 failed\n";
+            compact_ra.speculative.rounds_per_draft.size() < 4 ||
+            compact_ra.speculative.rounds_per_draft[3] == 0) {
+            std::cerr << label << " compact C=2 k=3 probe under N=5 failed\n";
             dump_speculative("  A", compact_ra.speculative);
             dump_speculative("  B", compact_rb.speculative);
             return 1;
@@ -2057,9 +2062,9 @@ int main() {
             return 1;
         }
         const ninfer::GenerationResult seq =
-            engine.generate(engine.prepare_tokens(prompts[0]), greedy_options(24));
-        if (seq.generated_token_ids.size() != 24 || check_speculative(seq, label) != 0) {
-            std::cerr << label << " C=1 did not complete\n";
+            engine.generate(engine.prepare_tokens(prompts[0]), greedy_options(64));
+        if (seq.generated_token_ids.size() != 64 || check_speculative(seq, label) != 0) {
+            std::cerr << label << " C=1 adaptive-width exercise did not complete\n";
             dump_tokens("  got", seq.generated_token_ids);
             dump_speculative("  spec", seq.speculative);
             return 1;
@@ -2068,6 +2073,12 @@ int main() {
         for (std::uint64_t count : seq.speculative.rounds_per_draft) { hist += count; }
         if (hist != seq.speculative.rounds) {
             std::cerr << label << " rounds_per_draft sum mismatch\n";
+            return 1;
+        }
+        if (seq.speculative.rounds_per_draft.size() < 4 ||
+            seq.speculative.rounds_per_draft[3] == 0) {
+            std::cerr << label << " C=1 did not execute k=3/W=4\n";
+            dump_speculative("  spec", seq.speculative);
             return 1;
         }
         const std::uint32_t live = seq.speculative.live_draft_tokens;
@@ -2146,8 +2157,8 @@ int main() {
             engine.generate(engine.prepare_tokens(prompts[0]), greedy_reuse(8, false));
         if (first.generated_token_ids.size() != 8 ||
             check_adaptive_dflash(first, label) != 0 ||
-            first.speculative.live_draft_tokens != 5) {
-            std::cerr << label << " source did not stay at seeded k=5\n";
+            first.speculative.live_draft_tokens != 3) {
+            std::cerr << label << " source did not retain the initial k=3 probe\n";
             dump_speculative("  spec", first.speculative);
             return 1;
         }
@@ -2174,8 +2185,8 @@ int main() {
             return 1;
         }
         if (hit.generated_token_ids.size() != 4 || check_adaptive_dflash(hit, label) != 0 ||
-            hit.speculative.live_draft_tokens != 5) {
-            std::cerr << label << " RAM restore leaked live_k off the seeded attractor\n";
+            hit.speculative.live_draft_tokens != first.speculative.live_draft_tokens) {
+            std::cerr << label << " RAM restore changed the saved live_k\n";
             dump_speculative("  hit", hit.speculative);
             return 1;
         }
@@ -2207,9 +2218,8 @@ int main() {
         }
         const std::vector<ninfer::TokenId> history =
             resume_prefix(prompts[0], first.generated_token_ids);
-        // Restored exact-prefix generate overlaps a compact k=5 decode (greedy 7 →
-        // remaining=6 after prefill, budget_extent=5, W(k)=6 under W_ceil=6) on the
-        // other lane while copy_stream H2D-restores cyclic DFlash KV / GDN / pages.
+        // Restored exact-prefix generate overlaps a compact initial-k=3 probe on the other
+        // lane while copy_stream H2D-restores cyclic DFlash KV / GDN / pages.
         auto restored_h =
             engine.submit(engine.prepare_tokens(history), greedy_reuse(4, true));
         auto inflight_h =
@@ -2219,15 +2229,15 @@ int main() {
         if (hit.generated_token_ids.size() != 4 || inflight.generated_token_ids.size() != 7 ||
             check_adaptive_dflash(hit, label) != 0 ||
             check_adaptive_dflash(inflight, label) != 0 ||
-            hit.speculative.live_draft_tokens != 5) {
+            hit.speculative.live_draft_tokens != 3) {
             std::cerr << label << " overlapping RAM restore dropped live_k or failed compact\n";
             dump_speculative("  hit", hit.speculative);
             dump_speculative("  inflight", inflight.speculative);
             return 1;
         }
-        if (inflight.speculative.rounds_per_draft.size() < 6 ||
-            inflight.speculative.rounds_per_draft[5] == 0) {
-            std::cerr << label << " inflight compact did not record k=5 rounds under N=5\n";
+        if (inflight.speculative.rounds_per_draft.size() < 4 ||
+            inflight.speculative.rounds_per_draft[3] == 0) {
+            std::cerr << label << " inflight compact did not record the initial k=3 probe\n";
             dump_speculative("  inflight", inflight.speculative);
             return 1;
         }

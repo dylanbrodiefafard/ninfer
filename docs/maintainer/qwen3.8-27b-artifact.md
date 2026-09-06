@@ -208,12 +208,15 @@ match C=1 DFlash of the same k. The same C=1 and C>1 strings are also compared a
 target-only T=1 decode. A later packed/T=1 greedy flip is not treated as row mixing;
 `NINFER_DFLASH_TEST_RELAX_ORACLE=1` continues past that T=1 mismatch. Product k=4 and k=5
 chain widths are T=5/T=6 SmallT, so they are not required to match MTP k=3 token-for-token.
-NVFP4 GDN conv-record keeps the ordinary-decode reduction and BF16 3-tap history. B=1 uses the
-fused T=1 GEMV+FP32 conv route; B=2..4 uses one same-reduction SmallT launch with request-indexed
-CTAs and explicit BF16 history roundtrips. Flattening that site to `T=W×B` W4A4 compose flipped
+NVFP4 GDN conv-record keeps the ordinary-decode reduction and BF16 3-tap history. B=1 W=4 uses
+one fused SmallT weight pass; B=1 W=5/6 uses one grouped SmallT weight pass and a separate
+sequential FP32 convolution. Other B=1 widths use the fused T=1 GEMV+FP32 conv route. Qualified
+B=2..4 W=2/5 shapes group requests per SmallT weight pass; other B>1 widths use request-indexed
+CTAs. Every route retains explicit BF16 history roundtrips.
+Flattening that site to `T=W×B` W4A4 compose flipped
 greedy column 0 versus C=1; `run_nvfp4_batched_matches_serial_fused` guards exact q/k/v/z and
-valid-record identity for dense, ragged, and tree-parent W=5 C=2..4 shapes. Packed GDN recurrent
-then overlays T=1 snapshot `out` on scratch SSM. DFlash C>1
+valid-record identity for dense, ragged, and tree-parent W=4/5 C=1..4 and W=6 C=1 shapes.
+Packed GDN recurrent then overlays T=1 snapshot `out` on scratch SSM. DFlash C>1
 propose isolates each compact row as a C=1-shaped forward (`T=width`, `B=1`) so draft
 Linears, SWA, and the draft head use sequential kernels. Eager propose resolves SWA's
 direct/split route from the row frontier rather than the batch maximum; graph replay keeps

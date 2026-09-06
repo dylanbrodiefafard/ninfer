@@ -1108,8 +1108,9 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                          &state.text_cache);
         // Target verify stays packed B=batch. Linear and GDN control preserve the C=1-width
         // reduction profile, with qualified W=5 aggregation across B=2..4. GQA remains
-        // request-indexed. Packed GDN conv-record uses fused T=1 reduction at B=1, qualified
-        // W=2/5 grouped weight replay at B=2..4, and request-indexed SmallT otherwise.
+        // request-indexed. Packed GDN conv-record uses fused SmallT at B=1 W=4, grouped
+        // W=5/6 weight replay at B=1, qualified W=2/5 grouped replay at B=2..4, and
+        // request-indexed SmallT for the other B>1 widths.
         DFlashFeatureSink sink =
             batch_feature_sink_impl<Variant>(state, lanes, valid_columns, vw, batch_size);
         TargetVerifyFrameView verify_frame{

@@ -38,9 +38,10 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
         throw std::invalid_argument("nvfp4 gdn conv admits only A16 or A4");
     }
     // Width selects the fused family. Snapshot T=2..16 is SmallT GEMM+FP32 conv. Record
-    // B=1 retains fused T=1 GEMV+FP32 conv. Qualified B>1 W=2/5 shapes group requests
-    // while retaining the W-local reduction and FP32 conv input; other widths use
-    // request-indexed SmallT CTAs. Do not flatten to B*W W4A4 compose.
+    // B=1 W=4 uses fused SmallT. B=1 W=5/6 and qualified B>1 W=2/5 shapes group requests
+    // while retaining the W-local reduction and FP32 conv input. Other B=1 widths retain
+    // fused T=1 GEMV+FP32 conv; other B>1 widths use request-indexed SmallT CTAs. Do not
+    // flatten to B*W W4A4 compose.
     if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
     if (tokens <= kNvfp4LastPackedGdnConvSmallT) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
     if (policy == LinearPolicy::A16Only) {
@@ -94,6 +95,10 @@ std::size_t nvfp4_gdn_record_workspace_capacity_bytes(LinearPolicy policy, std::
         if (min_tokens <= 5 && max_tokens >= 5 &&
             nvfp4_gdn_record_uses_grouped_replay(5, batch_size)) {
             maximum_grouped_width = 5;
+        }
+        if (min_tokens <= 6 && max_tokens >= 6 &&
+            nvfp4_gdn_record_uses_grouped_replay(6, batch_size)) {
+            maximum_grouped_width = 6;
         }
         if (maximum_grouped_width == 0) { return 0; }
         WorkspaceLayoutBuilder layout;

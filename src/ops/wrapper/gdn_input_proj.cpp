@@ -537,18 +537,18 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
                                   conv_record, query, key, value, z, workspace, parent_index);
         require_record_parent_index(parent_index, geometry);
 
-        // Packed T=2..16: B=1 retains fused T=1 GEMV+FP32 conv. Qualified B>1
-        // W=2/5 shapes replay one same-reduction SmallT weight load across request
-        // groups (including a direct W=5 C=3 group), then consume the private FP32
-        // projection without adding a semantic BF16 boundary. Other widths retain
-        // request-indexed CTAs.
+        // Packed T=2..16: B=1 W=4 uses one fused SmallT pass. B=1 W=5/6 and
+        // qualified B>1 W=2/5 shapes replay one grouped SmallT weight load (including
+        // a direct W=5 C=3 group), then consume the private FP32 projection without
+        // adding a semantic BF16 boundary. Other B=1 widths retain fused T=1
+        // GEMV+FP32 conv; other B>1 widths retain request-indexed CTAs.
         const bool tree = parent_index_active(parent_index);
         const detail::Nvfp4GdnConvPlan plan =
             detail::nvfp4_gdn_conv_resolve_plan(policy, geometry.width, geometry.batch);
         if (plan.schedule == detail::Nvfp4GdnConvScheduleId::SmallTFusedA16) {
             const std::int32_t* parent_ptr =
                 tree ? static_cast<const std::int32_t*>(parent_index->data) : nullptr;
-            if (geometry.batch > 1) {
+            if (detail::nvfp4_gdn_record_uses_small_t(geometry.width, geometry.batch)) {
                 detail::nvfp4_gdn_record_small_t_launch(
                     x, weight, conv_weight, conv_states, valid_columns, initial_state_slots,
                     conv_record, query, key, value, z, workspace, stream, parent_ptr);

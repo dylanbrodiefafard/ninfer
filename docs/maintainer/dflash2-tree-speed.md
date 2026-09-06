@@ -441,6 +441,22 @@ throughput progressed from the projection aggregate's 178.4/190.9/188.1 to
 212.1/229.5/225.3 tok/s (+18.9%/+20.2%/+19.8%). Relative to all panels the complete gain is
 +35.3%/+41.4%/+36.7%. Speculative rounds, accepted-token counts, and output hashes were unchanged.
 
+The later C=1 specialization replays the W=5 and W=6 record projection weights once per panel,
+then performs the unchanged sequential FP32 convolution with BF16 history roundtrips. Public-Op
+cold/warm latency fell 29.8%/44.8% at W=5 and 38.2%/48.9% at W=6. Three matched 1,024-token
+fixtures improved DFlash4 by 9.2% steady-decode geomean and DFlash5 by 10.5%; whole-wave gains
+were 9.6% and 12.3%. A 2,048-token DFlash5 confirmation gained 11.9%, and the shared MTP5 route
+gained 16.3% on its matched 1,024-token fixture. Outputs, speculative counters, and acceptance
+were exact across every pair. W=6 used 167 logical registers with no local loads or stores.
+
+The W=4 follow-up selected the existing fused SmallT family over grouped replay: the complete
+public Op fell from 83.648 to 49.152 us cold (-41.2%) and from 63.040 to 28.480 us warm (-54.8%),
+with no workspace or second convolution launch. Three matched 1,024-token DFlash3 fixtures gained
+12.6% steady-decode geomean and 11.0% whole-wave geomean; matched MTP3 gained 10.2% steady and
+11.3% whole-wave. Fixed-mode hashes, rounds, drafts, accepts, fallback, and acceptance were exact.
+The fused kernel used 127 logical/128 allocated registers with zero spill traffic. W=4 remains
+request-indexed and workspace-free at C=2..4.
+
 In the pre-rebase residual-projection step, C=4 nsys total kernel time normalized by the
 once-per-round path-select call fell from 55.6 ms to 49.1 ms. The later SwiGLU and attention-input
 work removes the remaining repeated large-weight reads at those projection sites while keeping

@@ -396,9 +396,10 @@ One propose block:
    GQA uses one batched launch with request-indexed partial CTAs and a batched reduction, preserving
    each request's arithmetic without taking the generic `MultiBatch=true` route. ReplaySSM records
    are `layer(g, 0, B)`.
-   Packed GDN conv-record keeps the W-local reduction and BF16 history boundary: B=1 uses the fused
-   T=1 GEMV+FP32 conv route; qualified W=2/5 B=2..4 shapes group weight replay while materializing
-   a private FP32 projection, and other widths use request-indexed SmallT CTAs. Packed GDN
+   Packed GDN conv-record keeps the W-local reduction and BF16 history boundary: B=1 W=4 uses a
+   fused SmallT pass; B=1 W=5/6 and qualified W=2/5 B=2..4 shapes group weight replay while
+   materializing a private FP32 projection. Other B=1 widths use the fused T=1 GEMV+FP32 conv
+   route, and other B>1 widths use request-indexed SmallT CTAs. Packed GDN
    recurrent overlays T=1 snapshot `out` on scratch SSM. Greedy accepts the matching prefix.
    Truncated sampling uses Leviathan `min(1,p/q)` on every hop. Under p-less, hop 0 is
    Leviathan with one-hot `q`; later hops and the bonus are greedy
