@@ -29,7 +29,11 @@ server must accept image or video input. Speculative residency is likewise froze
 when `dflash/` is present and can be combined with `--vision`; the text-only companion consumes
 Vision-composed target hidden features. Verify is chain `W=k+1` for `k` in `1..5`; on RTX 5090,
 `--spec dflash --draft-tokens 4 --lm-head-draft` is the measured speed recommendation.
-`--adaptive-draft` picks live k in `{3,4,5}` by locking `argmax E[Y(k)] / T(k,C,L)` from nested hop-survival `r_i` and online least-squares round time (shared slope, per-k intercept). An unmeasured k is probed at most once and dropped when dominated; switching k costs 1 ms. Frozen `--draft-tokens 4` stays `{4}`.
+`--adaptive-draft` picks live k in `{3,4,5}` after each round by locking
+`argmax E[Y(k)] / T(k,C,L)` from nested hop-survival `r_i` and online least-squares round time
+(shared slope, per-k intercept). An unmeasured k is probed at most once and dropped when
+dominated; switching k costs 1 ms. That is a sticky policy, not a once-per-launch latch: see
+[adaptive draft length](maintainer/qwen3.6-27b-model.md#81-adaptive-draft-length). Frozen `--draft-tokens 4` stays `{4}`.
 A later request cannot enable a capability omitted at startup.
 
 ## Endpoints

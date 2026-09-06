@@ -131,7 +131,11 @@ For 35B-A3B DFlash v1:
 
 For Qwen3.8-27B DFlash2, the NVFP4 artifact must contain the appended `dflash/` objects. Verify is
 chain `W=k+1` for `k` in `1..5`. On RTX 5090, `k=4` (block length five) is the measured speed
-recommendation. `--adaptive-draft` picks live k in `{3,4,5}` by locking `argmax E[Y(k)] / T(k,C,L)` from nested hop-survival `r_i` and online least-squares round time (shared slope, per-k intercept). An unmeasured k is probed at most once and dropped when dominated; switching k costs 1 ms. Frozen `--draft-tokens 4` stays `{4}`.
+recommendation. `--adaptive-draft` picks live k in `{3,4,5}` after each round by
+`argmax E[Y(k)] / T(k,C,L)` (nested hop-survival `r_i`, online least-squares round time). That
+is a sticky policy, not a once-per-launch latch: see
+[adaptive draft length](maintainer/qwen3.6-27b-model.md#81-adaptive-draft-length). Frozen
+`--draft-tokens 4` stays `{4}`.
 
 ```bash
 ./build/apps/ninfer out/qwen3_8_27b_nvfp4_dflash_w8.ninfer \

@@ -399,19 +399,70 @@ One propose block:
    Leviathan with one-hot `q`; later hops and the bonus are greedy
    argmax. ReplaySSM Fold commits the corresponding sequential prefix. The RTX 5090
    recommendation is k=4 (W=5, one SmallT GQA tile). Maximum k=5 (W=6). `--adaptive-draft`
-   picks live k in `{3,4,5}` by locking `argmax E[Y(k)]/T(k,C,L)`. `Y(k)=1+Σ_{i<k} q_i` with
-   `q_i=Π_{j≤i} r_j` and `r_i=P(accepted>i | accepted>i-1)` a discounted Beta updated only when
-   the prefix reached i. Unseen `r_i` are omitted from `E[Y]` and filled with 1 only in the
-   optimistic bound used to drop dominated k. `T(k,C,L)=a_{C,k}+c_C L` is online least squares
-   (shared slope, per-k intercept) at the length the round ran. Unmeasured `T(k)` is
-   `max(T(k-1), 2 T(k-1)-T(k-2))` and is probed at most once if that bound still beats the
-   best measured arm. C=1 and C≥2 use the same lock; C≥2 shares one batch k and writes it to
-   every row. Switching k adds 1 ms to that arm's T. Ties keep the smaller k. CUDA graphs
-   capture one graph per k; the next k is chosen after the round (lagged one round, no
-   post-draft host seam).
+   picks live k in `{3,4,5}` as in [§8.1](#81-adaptive-draft-length). Frozen
+   `--draft-tokens 4` stays `{4}`. CUDA graphs capture one graph per k; the next k is chosen
+   after the round (lagged one round, no post-draft host seam).
 
 `GroupedDynamicCausalConv` is grouped size-16, kernel 2, left-padded (causal along the query
 block): `prepare` before the sublayer on the pre-norm hidden, `finish` on that sublayer's output.
+
+### 8.1 Adaptive draft length
+
+`--adaptive-draft` is a **policy**, not a latch. It does not freeze k for the process or for
+the whole request. The picker **recomputes after every speculative round** and uses that k on
+the **next** round. “Lock” means: do not mix k as a bandit; take the current
+`argmax E[Y]/T` and stay unless that ranking actually flips.
+
+| State | Lifetime | Role |
+|---|---|---|
+| CUDA graphs for `{3,4,5}` | once per Engine launch | the three possible round shapes |
+| `T(k,C,L)` | Engine lifetime, one table per concurrency C | seconds for a k-round at this batch size and length |
+| hop chances `r_i` | one request | how far down the draft this prompt still matches |
+| `live_k` | chosen after each round, used next round | which graph to run |
+
+A decode is many rounds. Round *n* runs the `live_k` picked after round *n−1*. Near the end of
+a request, remaining-token budget can clamp k down (hists can be almost all k=4 while the row
+ends `live_k=3`).
+
+Throughput of a round is expected tokens kept divided by expected seconds. The denominator is
+hardware. Drafting 5 tokens is a bigger kernel than drafting 3, and attention grows with
+sequence length L, so
+
+`T(k,C,L) = a_{C,k} + c_C L`
+
+by online least squares: shared slope in L, per-k intercept, one table per C. That table is
+**shared across requests** on this server. After a few rounds, `T(3)`, `T(4)`, and `T(5)` are
+known. An unmeasured k is tried **at most once**, smallest first, and only if an optimistic
+bound (unseen hops treated as certain accept) still beats the best measured arm. Unmeasured
+`T(k)` is `max(T(k-1), 2 T(k-1) − T(k-2))`. Fallback rounds with draft extent 0 do not update
+T.
+
+The numerator is the prompt. DFlash proposes a chain of k drafts. Hop i can succeed only if
+hops `0..i-1` already matched (Leviathan nested survival):
+
+`r_i = P(accept hop i | prefix accepted)`, `q_i = r_0 ⋯ r_i`,
+`E[Y(k)] = 1 + q_0 + ⋯ + q_{k-1}`
+
+(The leading 1 is the bonus target token.) Online, each `r_i` is a discounted Beta-Bernoulli,
+updated only if the prefix reached i. Unseen `r_i` are omitted from mean `E[Y]` so a cold
+request does not invent a chain of successes. A new request **resets** these coins; it does
+not inherit the last prompt’s accept rate.
+
+Then `k* = argmax_k E[Y(k)] / T(k,C,L)`. Switching charges that arm an extra 1 ms so a
+coin-flip lead does not thrash graphs. Ties keep the smaller k. At C≥2 the batch has one k:
+hops are observed per row; the next k is one number written onto every row.
+
+A mixing bandit would keep sampling 3, 4, and 5. Mixing k forks the greedy CUDA-graph path
+and, at C≥2, makes every row wait on the same k. After T is measured the policy always takes
+the current argmax. That is sticky; it may still move if hops really change, or if budget
+cannot afford the locked k.
+
+On a long-lived serve, T is known after the first requests. A later request still starts with
+empty hops (`live_k = 0` on C=1), so the first rounds mostly pick from known T until this
+prompt’s coins exist, then sit on one k. Host tests cover hop updates, dominance, one probe,
+and shared batch k. Greedy Engine A/Bs vs frozen `{3,4,5}` are the throughput check: C≥2 stays
+on the frozen winner after one k=5 probe; C=1 pays a short probe tax; high-accept Python can
+linger on k=5 because the product of hop means is optimistic.
 
 ## 9. Speculative round semantics
 
