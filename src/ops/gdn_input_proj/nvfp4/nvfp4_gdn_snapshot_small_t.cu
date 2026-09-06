@@ -53,7 +53,7 @@ struct Nvfp4GroupedGdnProjectionOutput {
 };
 
 template <class Geometry>
-struct Nvfp4TriplePackedActivation {
+struct Nvfp4ContiguousPackedActivation {
     const __nv_bfloat16* x;
 
     __device__ __forceinline__ const __nv_bfloat16* values(int token, int value_begin) const {
@@ -62,7 +62,7 @@ struct Nvfp4TriplePackedActivation {
 };
 
 template <int Width>
-struct Nvfp4TripleGdnProjectionOutput {
+struct Nvfp4ContiguousGdnProjectionOutput {
     float* projected;
     __nv_bfloat16* z;
 
@@ -144,18 +144,20 @@ void launch_grouped_record(const Tensor& x, const Weight& weight, const Tensor& 
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <int Width, bool Tree, class Publish>
-void launch_triple_record(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
-                          const Tensor& conv_states, const Tensor& valid_columns,
-                          const Tensor& initial_slot, Tensor& conv_record, Tensor& query,
-                          Tensor& key, Tensor& value, Tensor& z, Publish publish,
-                          WorkspaceArena& workspace, cudaStream_t stream,
-                          const std::int32_t* parent_index) {
-    // C=3 owns one exact request-major 3*W panel, avoiding the half-empty second pair.
-    using Geometry              = Nvfp4GdnInputGeometry;
-    constexpr int kTripleTokens = 3 * Width;
+template <int Width, int Batch, bool Tree, class Publish>
+void launch_contiguous_record(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
+                              const Tensor& conv_states, const Tensor& valid_columns,
+                              const Tensor& initial_slot, Tensor& conv_record, Tensor& query,
+                              Tensor& key, Tensor& value, Tensor& z, Publish publish,
+                              WorkspaceArena& workspace, cudaStream_t stream,
+                              const std::int32_t* parent_index) {
+    static_assert(Batch == 1 || Batch == 3);
+    // B=1 needs no grouped address arithmetic. C=3 likewise owns one exact request-major
+    // 3*W panel, avoiding the half-empty second pair.
+    using Geometry                  = Nvfp4GdnInputGeometry;
+    constexpr int kContiguousTokens = Batch * Width;
     using Schedule =
-        Nvfp4SmallTSchedule<8, 1, 2, 16, kTripleTokens, 4,
+        Nvfp4SmallTSchedule<8, 1, 2, 16, kContiguousTokens, 4,
                             Nvfp4SmallTActivationAccess::TokenPacked,
                             Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 1,
                             Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
@@ -163,17 +165,17 @@ void launch_triple_record(const Tensor& x, const Weight& weight, const Tensor& c
     const float inverse   = 1.0F / weight.weight_scale_divisor;
 
     auto scope       = workspace.scope();
-    Tensor projected = workspace.alloc(DType::FP32, {kNvfp4GdnChannels, Width, 3}, 256);
-    nvfp4_small_t_kernel<Geometry, kTripleTokens, Schedule, Nvfp4IdentityEpilogue,
-                         Nvfp4TripleGdnProjectionOutput<Width>,
+    Tensor projected = workspace.alloc(DType::FP32, {kNvfp4GdnChannels, Width, Batch}, 256);
+    nvfp4_small_t_kernel<Geometry, kContiguousTokens, Schedule, Nvfp4IdentityEpilogue,
+                         Nvfp4ContiguousGdnProjectionOutput<Width>,
                          Nvfp4SmallTFinalization::Elementwise,
-                         Nvfp4TriplePackedActivation<Geometry>>
+                         Nvfp4ContiguousPackedActivation<Geometry>>
         <<<kBlocks, Schedule::kThreads, 0, stream>>>(
-            Nvfp4TriplePackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data)},
+            Nvfp4ContiguousPackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data)},
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), inverse, Nvfp4IdentityEpilogue{},
-            Nvfp4TripleGdnProjectionOutput<Width>{static_cast<float*>(projected.data),
-                                                  static_cast<__nv_bfloat16*>(z.data)});
+            Nvfp4ContiguousGdnProjectionOutput<Width>{static_cast<float*>(projected.data),
+                                                      static_cast<__nv_bfloat16*>(z.data)});
     CUDA_CHECK(cudaGetLastError());
 
     auto conv = make_nvfp4_gdn_conv_output<Width, Tree>(conv_weight, conv_states, valid_columns,
@@ -181,8 +183,8 @@ void launch_triple_record(const Tensor& x, const Weight& weight, const Tensor& c
                                                         parent_index)
                     .conv;
     constexpr int kPostBlocks = (kNvfp4GdnChannels + 255) / 256;
-    nvfp4_grouped_gdn_conv_kernel<Width, Tree><<<dim3(3, kPostBlocks), 256, 0, stream>>>(
-        static_cast<const float*>(projected.data), conv, 3);
+    nvfp4_grouped_gdn_conv_kernel<Width, Tree><<<dim3(Batch, kPostBlocks), 256, 0, stream>>>(
+        static_cast<const float*>(projected.data), conv, Batch);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -275,11 +277,11 @@ void launch_record_exact(const Tensor& x, const Weight& weight, const Tensor& co
         if constexpr (ActiveTokens == 5 || ActiveTokens == 6) {
             if (x.ne[2] == 1) {
                 if (parent_index == nullptr) {
-                    launch_grouped_record<ActiveTokens, 1, false>(
+                    launch_contiguous_record<ActiveTokens, 1, false>(
                         x, weight, conv_weight, conv_states, valid_columns, initial_slot,
                         conv_record, query, key, value, z, publish, workspace, stream, nullptr);
                 } else {
-                    launch_grouped_record<ActiveTokens, 1, true>(
+                    launch_contiguous_record<ActiveTokens, 1, true>(
                         x, weight, conv_weight, conv_states, valid_columns, initial_slot,
                         conv_record, query, key, value, z, publish, workspace, stream,
                         parent_index);
@@ -290,7 +292,7 @@ void launch_record_exact(const Tensor& x, const Weight& weight, const Tensor& co
         if (parent_index == nullptr) {
             if constexpr (ActiveTokens == 5) {
                 if (x.ne[2] == 3) {
-                    launch_triple_record<ActiveTokens, false>(
+                    launch_contiguous_record<ActiveTokens, 3, false>(
                         x, weight, conv_weight, conv_states, valid_columns, initial_slot,
                         conv_record, query, key, value, z, publish, workspace, stream, nullptr);
                     return;
@@ -304,7 +306,7 @@ void launch_record_exact(const Tensor& x, const Weight& weight, const Tensor& co
         } else {
             if constexpr (ActiveTokens == 5) {
                 if (x.ne[2] == 3) {
-                    launch_triple_record<ActiveTokens, true>(
+                    launch_contiguous_record<ActiveTokens, 3, true>(
                         x, weight, conv_weight, conv_states, valid_columns, initial_slot,
                         conv_record, query, key, value, z, publish, workspace, stream,
                         parent_index);
