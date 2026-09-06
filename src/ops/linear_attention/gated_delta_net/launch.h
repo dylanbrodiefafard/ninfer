@@ -46,17 +46,18 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
                              const Tensor& valid_columns, const Tensor& initial_state_slots,
                              Tensor& key_record, Tensor& value_record, Tensor& gate_record,
                              Tensor& out, cudaStream_t stream,
-                             const std::int32_t* parent_index = nullptr,
-                             float* column_scratch            = nullptr);
+                             const std::int32_t* parent_index = nullptr);
 
-// Overlay packed GDN out with ordinary T=1 snapshot arithmetic on scratch SSM.
+// Record replay inputs and produce packed GDN out with ordinary T=1 snapshot arithmetic on
+// scratch SSM in one pass.
 // overlay_states is FP32 [128,128,Hv,B*(W+1)]; column t of row b is slot t*B+b,
 // and sequential ping-pong uses slot W*B+b. Does not write live ssm_states.
 void launch_recurrent_overlay(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                               const Tensor& beta, float scale, const Tensor& ssm_states,
                               const Tensor& valid_columns, const Tensor& initial_state_slots,
-                              Tensor& out, float* overlay_states, const std::int32_t* parent_index,
-                              cudaStream_t stream);
+                              Tensor& key_record, Tensor& value_record, Tensor& gate_record,
+                              Tensor& out, float* overlay_states,
+                              const std::int32_t* parent_index, cudaStream_t stream);
 
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,

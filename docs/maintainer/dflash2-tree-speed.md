@@ -23,10 +23,12 @@ and still trailed chain k=5. After fused batched NVFP4 GDN conv-record, C>1 isol
 AIME C=3 k=4 reaches **324 aggregate tok/s** (NVFP4 KV). The sections below retain the A/B
 evidence from the chain/tree speed investigation.
 
-Tree GDN record uses 4-warp parent tiles in HBM when the ReplaySSM workspace is sized for it;
-tests without that workspace keep the 1-warp shared-memory tile. Path/tree select scans the
+The historical tree experiment used 4-warp parent tiles in HBM when the ReplaySSM workspace was
+sized for it; tests without that workspace kept the 1-warp shared-memory tile. The current chain
+route instead publishes replay records in the T=1 overlay kernel and reserves no parent-tile
+buffer. Path/tree select scans the
 shortlist with 32-way column splits, then scores each (parent, candidate) pair with the serial
-rank-256 FMA (32 pairs in parallel for the tree walk). The 4-warp tree record keeps a 16 KiB
+rank-256 FMA (32 pairs in parallel for the tree walk). The 4-warp tree record kept a 16 KiB
 2-slot smem cache of the last two written parent tiles.
 
 ## Serve C=1 (stochastic)
@@ -138,17 +140,18 @@ Post-opt nsys (`profiles/nsys/dflash2-w12-opt.nsys-rep`), 32 calls:
 
 Select went from 6.69 ms/round to 1.10 ms/round (−5.6 ms). That is the tok/s move.
 
-### 2. 4-warp HBM parent tiles for tree GDN record (kept)
+### 2. 4-warp HBM parent tiles for tree GDN record (historical)
 
 4-warp **smem** tiles are 96 KiB at W=12 (occupancy 1) and measured equal to 1-warp smem
 (119.0 vs 119.3 AIME). Do not retry smem 4-warp.
 
-HBM tiles reuse one graph-stable work-arena buffer of `Hv × B × W × 128 × 128 × 4` bytes
-(~37 MiB at C=1 W=12). Tree record is now the 4-warp sequential tile geometry.
+The tree A/B used one graph-stable work-arena buffer of `Hv × B × W × 128 × 128 × 4` bytes
+(~37 MiB at C=1 W=12). Its record kernel used the 4-warp sequential tile geometry.
 
 Post-opt: 26.1 ms / 1536 calls / **17.0 µs** vs 27.3 µs 1-warp (−0.50 ms/round). Still slower
 than sequential record (8.9 µs) because each column reloads parent state. Remaining GDN tax
-is ~0.4 ms/round.
+is ~0.4 ms/round. This packed-tree route is no longer a product route; current chain replay
+fuses record publication into the T=1 overlay kernel.
 
 ### 3. Skip KV/feature compact when `fold_path` is identity `0..m-1` (kept)
 
