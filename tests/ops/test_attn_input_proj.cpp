@@ -346,8 +346,7 @@ int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens,
     return failures;
 }
 
-int run_nvfp4_w5_panels(DevicePackedWeight& parent, std::int32_t tokens) {
-    constexpr std::int32_t kPanel  = 5;
+int run_nvfp4_panels(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t panel) {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kQRows  = 6144;
     constexpr std::int32_t kKvRows = 1024;
@@ -366,10 +365,10 @@ int run_nvfp4_w5_panels(DevicePackedWeight& parent, std::int32_t tokens) {
     DeviceArena workspace(256);
     ops::attn_input_proj(x, parent.view(), pq, pg, pk, pv, ops::LinearPolicy::A16Only, workspace,
                          nullptr);
-    for (std::int32_t offset = 0; offset < tokens; offset += kPanel) {
-        Tensor panel_x = x.slice(1, offset, kPanel);
-        Tensor out_q = cq.slice(1, offset, kPanel), out_g = cg.slice(1, offset, kPanel);
-        Tensor out_k = ck.slice(1, offset, kPanel), out_v = cv.slice(1, offset, kPanel);
+    for (std::int32_t offset = 0; offset < tokens; offset += panel) {
+        Tensor panel_x = x.slice(1, offset, panel);
+        Tensor out_q = cq.slice(1, offset, panel), out_g = cg.slice(1, offset, panel);
+        Tensor out_k = ck.slice(1, offset, panel), out_v = cv.slice(1, offset, panel);
         ops::attn_input_proj(panel_x, parent.view(), out_q, out_g, out_k, out_v,
                              ops::LinearPolicy::A16Only, workspace, nullptr);
     }
@@ -379,7 +378,7 @@ int run_nvfp4_w5_panels(DevicePackedWeight& parent, std::int32_t tokens) {
     const auto exact = [&](std::string_view name, const GuardedBf16Tensor& packed,
                            const GuardedBf16Tensor& panels) {
         if (packed.bits() == panels.bits()) { return; }
-        std::cerr << "attn " << name << " NVFP4 A16 W5 panels T=" << tokens
+        std::cerr << "attn " << name << " NVFP4 A16 W" << panel << " panels T=" << tokens
                   << ": packed output differs from panels\n";
         ++failures;
     };
@@ -397,8 +396,8 @@ int run_nvfp4_w5_panels(DevicePackedWeight& parent, std::int32_t tokens) {
         failures += output->verify_guards(name);
         failures += output->verify_fully_written(name);
     }
-    failures += verify_preserved("attn NVFP4 W5 panels x", device_activation, activation_bits);
-    failures += parent.verify_preserved("attn NVFP4 W5 panels parent");
+    failures += verify_preserved("attn NVFP4 panels x", device_activation, activation_bits);
+    failures += parent.verify_preserved("attn NVFP4 panels parent");
     return failures;
 }
 
@@ -469,8 +468,10 @@ int run_nvfp4_target() {
     for (const std::int32_t tokens : {1, 2, 10, 15, 16, 20, 32, 33}) {
         failures += run_nvfp4_target_case(parent, tokens);
     }
-    for (const std::int32_t tokens : {10, 15, 20}) {
-        failures += run_nvfp4_w5_panels(parent, tokens);
+    for (const std::int32_t panel : {4, 5, 6}) {
+        for (std::int32_t batch = 2; batch <= 4; ++batch) {
+            failures += run_nvfp4_panels(parent, panel * batch, panel);
+        }
     }
     for (const std::int32_t tokens : {1, 4, 15, 36, 1024}) {
         failures += run_nvfp4_target_case(parent, tokens, ops::LinearPolicy::AllowA4);
