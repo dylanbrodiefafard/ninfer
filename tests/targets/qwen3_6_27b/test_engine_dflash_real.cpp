@@ -100,7 +100,7 @@ ninfer::RequestOptions p_less_chat(std::uint32_t outputs, std::uint64_t seed, bo
 
 ninfer::EngineOptions chat_dflash_options(const char* artifact) {
     ninfer::EngineOptions options =
-        speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 7, 1);
+        speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 4, 1);
     options.max_context = 2048;
     options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(2048);
     options.prefill_chunk = 512;
@@ -525,9 +525,9 @@ int exercise_dflash_vision(const char* artifact) {
     }
 
     {
-        // Use the native packed-tree route (k=7/W=12), not the simpler short-chain route.
+        // Product chain k=4 / W=5 (one SmallT GQA tile), with Vision.
         ninfer::EngineOptions options =
-            speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 7, 2);
+            speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 4, 2);
         options.enable_vision = true;
         options.max_context   = 2048;
         options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(2048);
@@ -612,10 +612,10 @@ int exercise_dflash_vision(const char* artifact) {
     }
 
     {
-        // Five requested tokens leave k=3 after prefill. Under adaptive N=7 the persistent
+        // Five requested tokens leave k=3 after prefill. Under adaptive N=5 the persistent
         // storage width is six, so W=4 exercises the compact strided-panel route at C=2.
         ninfer::EngineOptions options =
-            adaptive_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 7, 2);
+            adaptive_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 5, 2);
         options.enable_vision = true;
         options.max_context   = 2048;
         options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(2048);
@@ -726,7 +726,7 @@ int greedy_oracle(ninfer::Engine& engine, const std::vector<ninfer::TokenId>& pr
 
 int exercise_p_less_product_tree(ninfer::Engine& engine,
                                  const std::vector<ninfer::TokenId>& prompt) {
-    constexpr const char* label = "DFlash2 p-less k=7 W=12";
+    constexpr const char* label = "DFlash2 p-less k=4 W=5";
     constexpr std::uint64_t seed = 0x123456789abcdef0ULL;
     const ninfer::GenerationResult first =
         engine.generate(engine.prepare_tokens(prompt), p_less_options(32, seed));
@@ -751,9 +751,9 @@ int exercise_p_less_product_tree(ninfer::Engine& engine,
         check_speculative(top1, label) != 0) {
         return 1;
     }
-    if (first.speculative.live_draft_tokens != 7 || first.speculative.drafted_tokens == 0 ||
+    if (first.speculative.live_draft_tokens != 4 || first.speculative.drafted_tokens == 0 ||
         first.speculative.accepted_tokens == 0) {
-        std::cerr << label << " did not execute and accept from the native draft tree\n";
+        std::cerr << label << " did not execute and accept from the product chain\n";
         dump_speculative("  spec", first.speculative);
         return 1;
     }
@@ -788,12 +788,12 @@ int exercise_p_less_c2_matches_c1(
     // sits on that seam: C=1 continues a 248044 turn with 30097..., C=2 emits
     // role-token salad. Equal-length same prompt, graphs on or off, and submit
     // order do not remove the split.
-    constexpr const char* label = "DFlash2 k=7 W=12 p-less C=2 matches C=1";
+    constexpr const char* label = "DFlash2 k=4 W=5 p-less C=2 matches C=1";
     constexpr std::uint64_t seed_a = 0x9e3779b97f4a7c15ULL;
     constexpr std::uint64_t seed_b = 0x123456789abcdef0ULL;
     constexpr std::uint32_t kTokens = 48;
     ninfer::EngineOptions options =
-        speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 7, 2);
+        speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 4, 2);
     options.max_context = 2048;
     options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(2048);
     ninfer::Engine engine(options);
@@ -861,12 +861,12 @@ int exercise_p_less_c2_matches_c1(
 int exercise_p_less_c2_mixed_frontiers_matches_c1(
     const char* artifact, std::span<const std::vector<ninfer::TokenId>> prompts) {
     constexpr const char* label =
-        "DFlash2 k=7 W=12 p-less C=2 mixed frontiers match C=1 without graphs";
+        "DFlash2 k=4 W=5 p-less C=2 mixed frontiers match C=1 without graphs";
     constexpr std::uint64_t seed_a = 0x9e3779b97f4a7c15ULL;
     constexpr std::uint64_t seed_b = 0x123456789abcdef0ULL;
     constexpr std::uint32_t kTokens = 24;
     ninfer::EngineOptions options =
-        speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 7, 2);
+        speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 4, 2);
     options.max_context = 2048;
     options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(2048);
     if (options.use_cuda_graph) {
@@ -933,14 +933,14 @@ int exercise_p_less_c2_mixed_frontiers_matches_c1(
 int exercise_p_less_c2_long_context_matches_c1(
     const char* artifact, std::span<const std::vector<ninfer::TokenId>> prompts) {
     constexpr const char* label =
-        "DFlash2 k=7 W=12 p-less C=2 long context matches C=1";
+        "DFlash2 k=4 W=5 p-less C=2 long context matches C=1";
     constexpr std::uint64_t seed_a = 14784394741258868421ULL;
     constexpr std::uint64_t seed_b = 11406468648257731684ULL;
     constexpr std::size_t kPromptTokens = 39764;
     constexpr std::uint32_t kTokensA = 1024;
     constexpr std::uint32_t kTokensB = 128;
     ninfer::EngineOptions options =
-        speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 7, 2);
+        speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 4, 2);
     options.max_context   = 65536;
     options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(131072);
     options.prefill_chunk = 4096;
@@ -1053,23 +1053,20 @@ int exercise_p_less_c2_long_context_matches_c1(
 
 int exercise_greedy_tree_matches_ordinary(const char* artifact,
                                           const std::vector<ninfer::TokenId>& prompt) {
-    constexpr const char* label = "DFlash2 k=7 W=12 greedy matches ordinary";
+    constexpr const char* label = "DFlash2 k=4 W=5 greedy matches ordinary";
     constexpr std::uint32_t kTokens = 64;
     std::vector<ninfer::TokenId> tree_tokens;
     std::vector<ninfer::TokenId> ordinary_tokens;
     {
         ninfer::EngineOptions options =
-            speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 7, 1);
-        if (std::getenv("NINFER_DFLASH_TEST_CHAIN") != nullptr) {
-            options.speculative.dflash_verify_width = 8;
-        }
+            speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 4, 1);
         ninfer::Engine engine(options);
         const ninfer::GenerationResult generated =
             engine.generate(engine.prepare_tokens(prompt), greedy_options(kTokens));
         if (generated.generated_token_ids.size() != kTokens ||
-            generated.speculative.live_draft_tokens != 7 ||
+            generated.speculative.live_draft_tokens != 4 ||
             generated.speculative.drafted_tokens == 0) {
-            std::cerr << label << " tree greedy did not complete on the native draft tree\n";
+            std::cerr << label << " chain greedy did not complete on the product chain\n";
             dump_speculative("  spec", generated.speculative);
             return 1;
         }
@@ -1107,7 +1104,7 @@ int exercise_greedy_tree_matches_ordinary(const char* artifact,
 
 int exercise_p_less_tree_target_likelihood(const char* artifact,
                                            const std::vector<ninfer::TokenId>& prompt) {
-    constexpr const char* label = "DFlash2 k=7 W=12 p-less target likelihood";
+    constexpr const char* label = "DFlash2 k=4 W=5 p-less target likelihood";
     constexpr std::uint64_t seed = 7632647173703958409ULL;
     constexpr std::uint32_t kTokens = 256;
     std::vector<ninfer::TokenId> tree_tokens;
@@ -1116,17 +1113,14 @@ int exercise_p_less_tree_target_likelihood(const char* artifact,
     std::string ordinary_text;
     {
         ninfer::EngineOptions options =
-            speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 7, 1);
-        if (std::getenv("NINFER_DFLASH_TEST_CHAIN") != nullptr) {
-            options.speculative.dflash_verify_width = 8;
-        }
+            speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 4, 1);
         ninfer::Engine engine(options);
         const ninfer::GenerationResult generated =
             engine.generate(engine.prepare_tokens(prompt), p_less_options(kTokens, seed));
         if (generated.generated_token_ids.size() != kTokens ||
-            generated.speculative.live_draft_tokens != 7 ||
+            generated.speculative.live_draft_tokens != 4 ||
             generated.speculative.drafted_tokens == 0) {
-            std::cerr << label << " generation did not complete on the native draft tree\n";
+            std::cerr << label << " generation did not complete on the product chain\n";
             dump_speculative("  spec", generated.speculative);
             return 1;
         }
@@ -1188,12 +1182,12 @@ int exercise_p_less_tree_target_likelihood(const char* artifact,
 
 int exercise_p_less_tree_commit_matches_reconstruction(
     const char* artifact, const std::vector<ninfer::TokenId>& prompt) {
-    constexpr const char* label = "DFlash2 k=7 W=12 tree commit matches reconstruction";
+    constexpr const char* label = "DFlash2 k=4 W=5 chain commit matches reconstruction";
     constexpr std::uint64_t seed = 7632647173703958409ULL;
     constexpr std::uint32_t kFirstTokens = 512;
     constexpr std::uint32_t kProbeTokens = 64;
     ninfer::EngineOptions options =
-        speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 7, 1);
+        speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 4, 1);
     options.max_context = 2048;
     options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(2048);
 
@@ -1233,11 +1227,11 @@ int exercise_p_less_tree_commit_matches_reconstruction(
 }
 
 int exercise_p_less_tree_chat_coherence(const char* artifact) {
-    constexpr const char* label = "DFlash2 k=7 W=12 p-less chat coherence";
+    constexpr const char* label = "DFlash2 k=4 W=5 p-less chat coherence";
     constexpr std::uint64_t seed = 0x9e3779b97f4a7c15ULL;
     constexpr std::uint32_t kTokens = 192;
     ninfer::EngineOptions options =
-        speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 7, 1);
+        speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 4, 1);
     options.max_context = 2048;
     options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(2048);
     ninfer::Engine engine(options);
@@ -1338,7 +1332,7 @@ int check_reuse_hop0_vs_reset(ninfer::Engine& engine, const ninfer::PromptInput&
 }
 
 int exercise_p_less_thinking_followup(const char* artifact) {
-    constexpr const char* label = "DFlash2 k=7 p-less thinking follow-up";
+    constexpr const char* label = "DFlash2 k=4 p-less thinking follow-up";
     constexpr std::uint64_t seed = 0x9e3779b97f4a7c15ULL;
     constexpr std::uint32_t kTurn1 = 96;
     constexpr std::uint32_t kTurn2 = 192;
@@ -1382,7 +1376,7 @@ int exercise_p_less_thinking_followup(const char* artifact) {
 }
 
 int exercise_p_less_finished_thinking_followup(const char* artifact) {
-    constexpr const char* label = "DFlash2 k=7 p-less finished-thinking follow-up";
+    constexpr const char* label = "DFlash2 k=4 p-less finished-thinking follow-up";
     constexpr std::uint64_t seed = 0xa5a5a5a5a5a5a5a5ULL;
     ninfer::Engine engine(chat_dflash_options(artifact));
 
@@ -1459,14 +1453,14 @@ ninfer::PromptInput tool_loop_prompt(int completed_responses, bool preserve_thin
 // never takes that seam, and the C=2 p-less match above uses two cold FullReset
 // prefills with reuse disabled.
 int exercise_p_less_c2_reuse_during_peer_decode(const char* artifact) {
-    constexpr const char* label = "DFlash2 k=7 p-less C=2 reuse during peer decode";
+    constexpr const char* label = "DFlash2 k=4 p-less C=2 reuse during peer decode";
     constexpr std::uint64_t seed_a = 0xa5a5a5a5a5a5a5a5ULL;
     constexpr std::uint64_t seed_b = 0x243f6a8885a308d3ULL;
     constexpr std::uint32_t kPeer  = 96;
     constexpr std::uint32_t kTurn1 = 16;
     constexpr std::uint32_t kTurn2 = 48;
     ninfer::EngineOptions options =
-        speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 7, 2);
+        speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 4, 2);
     options.max_context = 2048;
     options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(2048);
     ninfer::Engine engine(options);
@@ -1556,7 +1550,7 @@ int check_tool_rewrite_hop0_greedy(ninfer::Engine& engine) {
     const bool variants[] = {false, true};
     for (bool preserve_thinking : variants) {
         const std::string label =
-            std::string("DFlash2 k=7 greedy tool-loop hop0 preserve_thinking=") +
+            std::string("DFlash2 k=4 greedy tool-loop hop0 preserve_thinking=") +
             (preserve_thinking ? "true" : "false");
         const ninfer::PromptInput first = tool_loop_prompt(0, preserve_thinking, true);
         const ninfer::PromptInput followup = tool_loop_prompt(1, preserve_thinking, true);
@@ -1608,7 +1602,7 @@ int exercise_p_less_tool_history_reuse(const char* artifact) {
         const bool preserve_thinking = variant[0];
         const bool enable_thinking   = variant[1];
         const std::string label =
-            std::string("DFlash2 k=7 p-less tool-loop reuse preserve_thinking=") +
+            std::string("DFlash2 k=4 p-less tool-loop reuse preserve_thinking=") +
             (preserve_thinking ? "true" : "false");
         const std::uint32_t turn1_tokens = preserve_thinking ? 64 : 192;
         const ninfer::PromptInput first = tool_loop_prompt(0, preserve_thinking, enable_thinking);
@@ -1677,7 +1671,7 @@ int exercise_p_less_target_likelihood(const char* artifact,
     std::vector<ninfer::TokenId> ordinary_tokens;
     {
         ninfer::Engine engine(adaptive_engine_options(
-            artifact, ninfer::SpeculativeBackend::DFlash, 7, 1));
+            artifact, ninfer::SpeculativeBackend::DFlash, 5, 1));
         const ninfer::GenerationResult generated =
             engine.generate(engine.prepare_tokens(prompt), p_less_options(kTokens, seed));
         if (generated.generated_token_ids.size() != kTokens ||
@@ -1992,7 +1986,7 @@ int main() {
                 run_overlapping_c4(engine, prompts, dflash_oracles, target_oracles, label) != 0) {
                 failed = 1;
             }
-            if (draft_tokens == 7 && dflash_options.speculative.dflash_verify_width == 0 &&
+            if (draft_tokens == 4 && dflash_options.speculative.dflash_verify_width == 0 &&
                 (only_prompt == nullptr || std::string(only_prompt) == "0") &&
                 exercise_p_less_product_tree(engine, prompts[0]) != 0) {
                 failed = 1;
@@ -2009,19 +2003,10 @@ int main() {
     };
 
     const char* only_k = std::getenv("NINFER_DFLASH_TEST_ONLY_K");
-    if (only_k == nullptr || std::string(only_k) == "7") {
-        std::string label = "DFlash2 k=7 W=12 tree C=4";
-        if (std::getenv("NINFER_DFLASH_TEST_CHAIN") != nullptr) {
-            label = "DFlash2 k=7 W=8 chain C=4";
-        } else if (const char* width = std::getenv("NINFER_DFLASH_TEST_VERIFY_WIDTH")) {
-            label = "DFlash2 k=7 W=" + std::string(width) + " override C=4";
-        }
-        if (const int result = run_k(7, label.c_str()); result != 0) { return result; }
-    }
     if (only_k == nullptr || std::string(only_k) == "1") {
         if (const int result = run_k(1, "DFlash2 k=1 chain C=4"); result != 0) { return result; }
     }
-    if (only_k == nullptr || std::string(only_k) == "4") {
+    if (only_k == nullptr || std::string(only_k) == "4" || std::string(only_k) == "7") {
         if (const int result = run_k(4, "DFlash2 k=4 chain C=4"); result != 0) { return result; }
     }
     if (only_k == nullptr || std::string(only_k) == "5") {
@@ -2029,23 +2014,23 @@ int main() {
     }
 
     {
-        const char* label = "DFlash2 adaptive N=7 {3,4,5}";
+        const char* label = "DFlash2 adaptive N=5 {3,4,5}";
         ninfer::Engine engine(adaptive_engine_options(
-            artifact, ninfer::SpeculativeBackend::DFlash, 7, 3));
+            artifact, ninfer::SpeculativeBackend::DFlash, 5, 3));
         if (const int result = check_dflash_load(engine); result != 0) { return result; }
         // Prefill commits the first generated token. Seven tokens leave remaining=6 on
         // the first DFlash round: budget_extent=5, seed live_k=5, W(k)=6 under W_ceil=6.
         const ninfer::GenerationResult compact =
             engine.generate(engine.prepare_tokens(prompts[0]), greedy_options(7));
         if (compact.generated_token_ids.size() != 7 || check_speculative(compact, label) != 0) {
-            std::cerr << label << " compact k=5 under N=7 did not complete\n";
+            std::cerr << label << " compact k=5 under N=5 did not complete\n";
             dump_tokens("  got", compact.generated_token_ids);
             dump_speculative("  spec", compact.speculative);
             return 1;
         }
         if (compact.speculative.rounds_per_draft.size() < 6 ||
             compact.speculative.rounds_per_draft[5] == 0) {
-            std::cerr << label << " compact run did not record k=5 rounds under N=7\n";
+            std::cerr << label << " compact run did not record k=5 rounds under N=5\n";
             dump_speculative("  spec", compact.speculative);
             return 1;
         }
@@ -2060,7 +2045,7 @@ int main() {
             check_speculative(compact_rb, label) != 0 ||
             compact_ra.speculative.rounds_per_draft.size() < 6 ||
             compact_ra.speculative.rounds_per_draft[5] == 0) {
-            std::cerr << label << " compact C=2 k=5 under N=7 failed\n";
+            std::cerr << label << " compact C=2 k=5 under N=5 failed\n";
             dump_speculative("  A", compact_ra.speculative);
             dump_speculative("  B", compact_rb.speculative);
             return 1;
@@ -2110,7 +2095,7 @@ int main() {
     {
         const char* label = "DFlash2 terminal delivery and queue telemetry";
         ninfer::Engine engine(adaptive_engine_options(
-            artifact, ninfer::SpeculativeBackend::DFlash, 7, 1));
+            artifact, ninfer::SpeculativeBackend::DFlash, 5, 1));
         if (const int result = check_dflash_load(engine); result != 0) { return result; }
 
         struct DiscardingSink final : ninfer::OutputSink {
@@ -2149,7 +2134,7 @@ int main() {
     {
         const char* label = "DFlash2 adaptive RAM reseed {3,4,5}";
         ninfer::EngineOptions options =
-            adaptive_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 7, 1);
+            adaptive_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 5, 1);
         options.kv_ram_capacity_bytes = 1024ULL * 1024ULL * 1024ULL;
         ninfer::Engine engine(options);
         if (const int result = check_dflash_load(engine); result != 0) { return result; }
@@ -2200,7 +2185,7 @@ int main() {
     {
         const char* label = "DFlash2 adaptive RAM restore in flight {3,4,5}";
         ninfer::EngineOptions options =
-            adaptive_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 7, 2);
+            adaptive_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 5, 2);
         options.kv_ram_capacity_bytes = 1024ULL * 1024ULL * 1024ULL;
         ninfer::Engine engine(options);
         if (const int result = check_dflash_load(engine); result != 0) { return result; }
@@ -2242,7 +2227,7 @@ int main() {
         }
         if (inflight.speculative.rounds_per_draft.size() < 6 ||
             inflight.speculative.rounds_per_draft[5] == 0) {
-            std::cerr << label << " inflight compact did not record k=5 rounds under N=7\n";
+            std::cerr << label << " inflight compact did not record k=5 rounds under N=5\n";
             dump_speculative("  inflight", inflight.speculative);
             return 1;
         }

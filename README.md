@@ -312,7 +312,7 @@ All three registered model IDs support:
 - prompt-rendered function tools and parsed tool calls.
 
 The supported identity additionally supports DFlash2 speculative decoding with draft windows from
-one to eleven when the artifact contains the companion objects. `--spec dflash ... --vision`
+one to five when the artifact contains the companion objects. `--spec dflash ... --vision`
 combines it with image, multi-image, video, and mixed-media prompts.
 
 ## Current limits

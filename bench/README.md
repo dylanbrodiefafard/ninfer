@@ -53,7 +53,7 @@ ninfer_bench --weights <artifact.ninfer>
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
           [--kv-dtype <bf16|int8|nvfp4>] [--concurrency <1..4>]
-           [--spec <mtp|dflash>] [--draft-tokens <0..15>] [--dflash-verify-width <2..16>]
+           [--spec <mtp|dflash>] [--draft-tokens <0..5>] [--dflash-verify-width <2..16>]
            [--lm-head-draft]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
@@ -71,7 +71,7 @@ Example:
 
 `bf16` selects BF16 KV storage, `int8` selects INT8 group-64 KV storage, and `nvfp4` selects the
 NVFP4-G16 KV layout. `--spec mtp` (default) enables MTP with `--draft-tokens 1..5`; `--spec
-dflash` requires the artifact to contain `dflash/` objects and takes `--draft-tokens 1..15`
+dflash` requires the artifact to contain `dflash/` objects and takes `--draft-tokens 1..5`
 (verify width 0 = k-dependent default, or explicit `--dflash-verify-width`). `--lm-head-draft`
 selects the optimized proposal head. CUDA Graph decode is enabled by default. `--concurrency 2` is the
 batched-decode check: two Engine lanes, not HTTP.

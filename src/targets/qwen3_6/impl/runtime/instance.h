@@ -41,8 +41,8 @@ inline constexpr std::uint32_t kPrefillChunkAlignment    = Variant::prefill_chun
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = Variant::maximum_mtp_draft_tokens;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = Variant::maximum_dflash_draft_tokens;
 
-// Auto verify width from k when --dflash-verify-width is omitted. Chain-only targets use W=k+1.
-// A tree-capable target may select a wider package-owned default for its native draft window.
+// Auto verify width from k when --dflash-verify-width is omitted. Product DFlash is chain W=k+1.
+// A tree-capable package may still select a wider default for a native draft window.
 [[nodiscard]] inline constexpr std::uint32_t dflash_default_verify_width(std::uint32_t draft_window) {
     if constexpr (!DFlashConfig::tree_verify) {
         return draft_window + 1U;
@@ -85,9 +85,8 @@ dflash_captured_verify_width(std::uint32_t k, std::uint32_t storage_ceil) {
     return live <= storage_ceil ? live : storage_ceil;
 }
 
-// Storage / ReplaySSM / pending-features width. Adaptive `{3,4,5}` is chain W<=6
-// even when `--draft-tokens 7` (native tree W=12). An explicit --dflash-verify-width
-// still wins. Frozen N=7 stays W=12.
+// Storage / ReplaySSM / pending-features width. Adaptive `{3,4,5}` is chain W<=6.
+// An explicit --dflash-verify-width still wins; chain-only packages require W=k+1.
 [[nodiscard]] inline std::uint32_t
 dflash_storage_verify_width(std::span<const std::uint32_t> captured_ks,
                             std::uint32_t draft_window, std::uint32_t override_width) {

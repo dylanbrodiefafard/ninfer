@@ -112,7 +112,7 @@ struct SpeculativeOptions {
     ProposalHead proposal_head = ProposalHead::Full;
     // Packed/chain DFlash verify width. 0 selects the k-dependent default.
     std::uint32_t dflash_verify_width = 0;
-    // Startup-only: capture extra draft-K graphs and pick live K from host EWMA.
+    // Startup-only: capture extra draft-K graphs and lock live K at argmax E[Y]/T(k,C,L).
     bool adaptive_draft = false;
 };
 

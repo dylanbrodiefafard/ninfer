@@ -129,10 +129,9 @@ For 35B-A3B DFlash v1:
   --spec dflash --draft-tokens 7 --lm-head-draft
 ```
 
-For Qwen3.8-27B DFlash2, the NVFP4 artifact must contain the appended `dflash/` objects. Its default
-verifier is chain `W=k+1` for `k<=5`, packed-tree `W=12` for `k` in `{6,7}`, and two-block chain
-`W=k+1` for `k` from eight through eleven. On RTX 5090, `k=4` (block length five) is the measured
-speed recommendation.
+For Qwen3.8-27B DFlash2, the NVFP4 artifact must contain the appended `dflash/` objects. Verify is
+chain `W=k+1` for `k` in `1..5`. On RTX 5090, `k=4` (block length five) is the measured speed
+recommendation. `--adaptive-draft` picks live k in `{3,4,5}` by locking `argmax E[Y(k)] / T(k,C,L)` from nested hop-survival `r_i` and online least-squares round time (shared slope, per-k intercept). An unmeasured k is probed at most once and dropped when dominated; switching k costs 1 ms. Frozen `--draft-tokens 4` stays `{4}`.
 
 ```bash
 ./build/apps/ninfer out/qwen3_8_27b_nvfp4_dflash_w8.ninfer \
@@ -144,11 +143,10 @@ speed recommendation.
 MTP and DFlash cannot be enabled together. `--spec dflash` on a 27B file without `dflash/` fails
 at bind. Current 3.8 MTP-only files and all 3.6-27B files stay valid MTP artifacts. The published
 [performance results](performance.md) use MTP with three draft tokens and DFlash with seven draft
-tokens (block length eight), both with the optimized proposal head. 35B DFlash v1 accepts up to
-fifteen draft tokens; 3.8 DFlash2 accepts up to eleven. Eleven runs Spark two-block (7 MASK + 4
-MASK) chain verify. Published INT8-KV C=1 DFlash2 W8 numbers are in
-[performance.md](performance.md). The RTX 5090 packed-tree investigation and chain cutover are in
-[dflash2-tree-speed.md](maintainer/dflash2-tree-speed.md).
+tokens (block length eight), both with the optimized proposal head. Those DFlash k=7 figures are
+historical chain W=8; product DFlash2 is chain `k≤5`. 35B DFlash v1 accepts up to fifteen draft
+tokens; 3.8 DFlash2 accepts up to five. The RTX 5090 packed-tree investigation (removed from
+the product) is in [dflash2-tree-speed.md](maintainer/dflash2-tree-speed.md).
 
 ## Common options
 
@@ -165,9 +163,9 @@ MASK) chain verify. Published INT8-KV C=1 DFlash2 W8 numbers are in
 | `--device N` | CUDA device index | `0` |
 | `--kv-dtype bf16\|int8\|nvfp4` | KV-cache storage | `nvfp4` |
 | `--spec mtp\|dflash` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; 35B DFlash `1..15`; 3.8 DFlash2 `1..11` | unset |
-| `--adaptive-draft` | pick live draft K from host EWMA; requires `--spec mtp\|dflash` | off |
-| `--dflash-verify-width N` | DFlash verify width `2..16`; chain-only targets require `W=k+1`. Qwen3.8 DFlash2 defaults to chain `W=k+1` for `k<=5`, packed-tree `W=12` for `k` in `{6,7}`, and two-block chain `W=k+1` for `k>=8` | auto |
+| `--draft-tokens N` | MTP `1..5`; 35B DFlash `1..15`; 3.8 DFlash2 `1..5` | unset |
+| `--adaptive-draft` | pick live draft K in `{3,4,5}` by locking `E[Y]/T(k,C,L)` (nested `r_i`; least-squares T; at most one probe of an unmeasured k; 1 ms switch cost). `--draft-tokens 4` stays `{4}` | off |
+| `--dflash-verify-width N` | DFlash verify width `2..16`; chain-only targets require `W=k+1`. Qwen3.8 DFlash2 is chain `W=k+1` | auto |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
@@ -205,7 +203,7 @@ temperature and seed, ignores top-p, top-k, min-p, and presence/frequency penalt
 one-time warning on stderr. Ignored parameters must still satisfy their normal input ranges.
 `--no-p-less-sampling` opts into the registered production sampler. Combined with `--greedy`,
 p-less remains exact argmax. Under MTP or DFlash2, p-less applies at hop 0 (chain Leviathan with
-one-hot draft `q`, or tree SpecInfer membership). Later hops and the bonus after a full accept
+one-hot draft `q`). Later hops and the bonus after a full accept
 are greedy packed-column argmax.
 
 Repeat `--stop-token-id`, `--stop`, or `--reasoning-stop` to add stop conditions. Use
