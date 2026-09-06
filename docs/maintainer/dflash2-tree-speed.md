@@ -487,8 +487,8 @@ launches; 63 decoded-NVFP4 FP64 oracle checks passed with no nonfinite values.
 
 A DFlash2 proposer MLP gate-up Linear+SiLU fusion was also rejected. In its matched pre-rebase
 campaign it improved the isolated T=10/15/20 composite from 73.7 us to 71.7/71.7/73.7 us, but
-reduced production throughput at C=2/3/4. Separately, top-k path selection is only about 1% of
-the profiled C=4 kernel time, so rewriting it is not a material round-speed lever.
+reduced production throughput at C=2/3/4. The then-serial top-k path selection was only about 1%
+of profiled C=4 kernel time, but its much larger share at C=1 justified the bounded follow-up below.
 
 The next retained step removes GQA's per-request host loop without changing its C=1 route or CTA
 arithmetic. NVFP4 W=2..5 now uses one request-indexed partial launch and one batched reduction per
@@ -522,6 +522,32 @@ C=4 Graph isolation also remains exact, and the complete NVFP4 PPL NLL stream is
 The same C=4 node trace attributes 1.13% of kernel time to DFlash top-k and path selection, about
 0.03% to speculative accept/finalize/select-hidden work, and no separate material commit kernel.
 That sub-percent fusion ceiling does not justify another control kernel or state boundary.
+
+The C=1 follow-up profiles all production widths after `a39c5c25`. Target SwiGLU, MLP-down, and
+GDN-input projection remain the dominant round costs, but their exact decode points are
+DRAM-bound. Per-projection A4 was rejected despite isolated and Engine speedups because its
+different reduction profile changed real recurrent draft decisions. Fusing W=5/6 GDN projection
+and convolution regressed the public Op by 42%/57%; retaining the preceding SwiGLU weights in L2
+was a matched Engine wash; and proposal/target stream overlap has a draft-id dependency before
+verification while the independent preparation work is too small to offset contention with the
+DRAM-bound proposal path. Those prototypes were removed.
+
+The retained change removes serial sorting and merging from DFlash column top-k. Production splits
+hold at most 16 represented BF16 logits per thread, select 16 ranks through exact warp reductions,
+and reduce the 512 split candidates cooperatively across the merge block. Lower vocabulary index
+still wins ties and nonfinite logits remain excluded. At DFlash k=4 the split and merge kernels fall
+from 178.06/67.99 us to 31.98/17.34 us, a 79.9% combined reduction. Five-run fixed-work C=1
+DFlash k=3/4/5 improves 1.21%/0.88%/0.81%; k=4 improves 0.65% at C=2 and 0.91% at C=4. Every
+matched pair has identical rounds, drafts, accepts, fallback, and per-position acceptance. The exact
+selector oracle covers BF16 and decoded-NVFP4 codebooks, ties/nonfinites, shortlist remapping,
+trees, and batches. Real-artifact k=3/4/5 Graph isolation, k=4 eager isolation, adaptive state
+save/restore, exact tree-state reconstruction, and target likelihood pass. Target-only NVFP4 decode
+PPL remains 4.687420278 and its 1,023-value FP32 NLL stream is byte-identical; that control does not
+exercise DFlash decode scoring, which is unsupported.
+
+Reports: `profiles/nsys/c1-followup-a39c5c25-*-tg128-20260906.nsys-rep`,
+`profiles/nsys/c1-followup-dflash-topk-warp-merge-dflash4-tg128-20260906.nsys-rep`, and
+`profiles/bench/c1-followup-topk-final-*-20260906.json`.
 
 The BF16 attention-input phase-order change is visible to any standalone T=10/15/20 A16 caller.
 It is 1.9% slower than the old packed route at T=10, 13.0% slower at T=15, and unchanged at T=20;

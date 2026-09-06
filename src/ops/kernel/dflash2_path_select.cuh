@@ -160,46 +160,93 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__
     if (v0 < v1) {
         const std::int64_t logit_col =
             dflash2_column_index(batch, tokens, t, b) * static_cast<std::int64_t>(vocab);
-        for (int v = v0 + tid; v < v1; v += kDflash2PathSelectBlock) {
-            dflash2_insert_topk(local_val, local_idx, kDflash2PathSelectK,
-                                __bfloat162float(logits[logit_col + v]), v);
-        }
-    }
-
-    __shared__ float top_val[kDflash2PathSelectBlock * kDflash2PathSelectK];
-    __shared__ int top_idx[kDflash2PathSelectBlock * kDflash2PathSelectK];
-    __shared__ float warp_val[8 * kDflash2PathSelectK];
-    __shared__ int warp_idx[8 * kDflash2PathSelectK];
-    const int local_base = tid * kDflash2PathSelectK;
-#pragma unroll
-    for (int j = 0; j < kDflash2PathSelectK; ++j) {
-        top_val[local_base + j] = local_val[j];
-        top_idx[local_base + j] = local_idx[j];
-    }
-    __syncthreads();
-
-    const int warp = tid / 32;
-    const int lane = tid % 32;
-    if (lane == 0) {
-        float merged_val[kDflash2PathSelectK];
-        int merged_idx[kDflash2PathSelectK];
-        for (int j = 0; j < kDflash2PathSelectK; ++j) {
-            merged_val[j] = -CUDART_INF_F;
-            merged_idx[j] = INT_MAX;
-        }
-        const int thread0 = warp * 32;
-        for (int thread = thread0; thread < thread0 + 32; ++thread) {
-            const int row = thread * kDflash2PathSelectK;
-            for (int j = 0; j < kDflash2PathSelectK; ++j) {
-                if (top_idx[row + j] == INT_MAX) { continue; }
-                dflash2_insert_topk(merged_val, merged_idx, kDflash2PathSelectK, top_val[row + j],
-                                    top_idx[row + j]);
+        // The optimized production shortlist leaves at most 16 rows per thread in each
+        // split. Keep those rows unsorted and select the split's ranks cooperatively below;
+        // sorting every thread's private list costs more than the vocabulary scan.
+        if (v1 - v0 <= kDflash2PathSelectBlock * kDflash2PathSelectK) {
+            int count = 0;
+            for (int v = v0 + tid; v < v1; v += kDflash2PathSelectBlock) {
+                const float value = __bfloat162float(logits[logit_col + v]);
+                if (!isnan(value) && !isinf(value)) {
+                    local_val[count] = value;
+                    local_idx[count] = v;
+                    ++count;
+                }
+            }
+        } else {
+            for (int v = v0 + tid; v < v1; v += kDflash2PathSelectBlock) {
+                dflash2_insert_topk(local_val, local_idx, kDflash2PathSelectK,
+                                    __bfloat162float(logits[logit_col + v]), v);
             }
         }
-        const int wbase = warp * kDflash2PathSelectK;
+    }
+
+    __shared__ float warp_val[8 * kDflash2PathSelectK];
+    __shared__ int warp_idx[8 * kDflash2PathSelectK];
+    const int warp = tid / 32;
+    const int lane = tid % 32;
+    if (v1 - v0 <= kDflash2PathSelectBlock * kDflash2PathSelectK) {
         for (int j = 0; j < kDflash2PathSelectK; ++j) {
-            warp_val[wbase + j] = merged_val[j];
-            warp_idx[wbase + j] = merged_idx[j];
+            float best_val = -CUDART_INF_F;
+            int best_idx   = INT_MAX;
+#pragma unroll
+            for (int item = 0; item < kDflash2PathSelectK; ++item) {
+                if (local_idx[item] != INT_MAX &&
+                    dflash2_logit_better(local_val[item], local_idx[item], best_val, best_idx)) {
+                    best_val = local_val[item];
+                    best_idx = local_idx[item];
+                }
+            }
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                const float other_val = __shfl_down_sync(0xffffffffu, best_val, offset);
+                const int other_idx   = __shfl_down_sync(0xffffffffu, best_idx, offset);
+                if (dflash2_logit_better(other_val, other_idx, best_val, best_idx)) {
+                    best_val = other_val;
+                    best_idx = other_idx;
+                }
+            }
+            const int selected_idx = __shfl_sync(0xffffffffu, best_idx, 0);
+            if (lane == 0) {
+                const int dst = warp * kDflash2PathSelectK + j;
+                warp_val[dst] = best_val;
+                warp_idx[dst] = best_idx;
+            }
+#pragma unroll
+            for (int item = 0; item < kDflash2PathSelectK; ++item) {
+                if (local_idx[item] == selected_idx) { local_idx[item] = INT_MAX; }
+            }
+        }
+    } else {
+        __shared__ float top_val[kDflash2PathSelectBlock * kDflash2PathSelectK];
+        __shared__ int top_idx[kDflash2PathSelectBlock * kDflash2PathSelectK];
+        const int local_base = tid * kDflash2PathSelectK;
+#pragma unroll
+        for (int j = 0; j < kDflash2PathSelectK; ++j) {
+            top_val[local_base + j] = local_val[j];
+            top_idx[local_base + j] = local_idx[j];
+        }
+        __syncthreads();
+        if (lane == 0) {
+            float merged_val[kDflash2PathSelectK];
+            int merged_idx[kDflash2PathSelectK];
+            for (int j = 0; j < kDflash2PathSelectK; ++j) {
+                merged_val[j] = -CUDART_INF_F;
+                merged_idx[j] = INT_MAX;
+            }
+            const int thread0 = warp * 32;
+            for (int thread = thread0; thread < thread0 + 32; ++thread) {
+                const int row = thread * kDflash2PathSelectK;
+                for (int j = 0; j < kDflash2PathSelectK; ++j) {
+                    if (top_idx[row + j] == INT_MAX) { continue; }
+                    dflash2_insert_topk(merged_val, merged_idx, kDflash2PathSelectK,
+                                        top_val[row + j], top_idx[row + j]);
+                }
+            }
+            const int wbase = warp * kDflash2PathSelectK;
+            for (int j = 0; j < kDflash2PathSelectK; ++j) {
+                warp_val[wbase + j] = merged_val[j];
+                warp_idx[wbase + j] = merged_idx[j];
+            }
         }
     }
     __syncthreads();
@@ -234,36 +281,62 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__
     const int t   = static_cast<int>(blockIdx.x);
     const int b   = static_cast<int>(blockIdx.y);
     const int tid = static_cast<int>(threadIdx.x);
-    if (t >= tokens || b >= batch || tid != 0) { return; }
+    if (t >= tokens || b >= batch) { return; }
 
     const std::int64_t column = dflash2_column_index(batch, tokens, t, b);
     const std::int64_t src    = column * kDflash2PathSelectTopkSplits * kDflash2PathSelectK;
-    float out_val[kDflash2PathSelectK];
-    int out_idx[kDflash2PathSelectK];
-    for (int j = 0; j < kDflash2PathSelectK; ++j) {
-        out_val[j] = -CUDART_INF_F;
-        out_idx[j] = INT_MAX;
+    constexpr int kCandidates = kDflash2PathSelectTopkSplits * kDflash2PathSelectK;
+    constexpr int kPerThread  = kCandidates / kDflash2PathSelectBlock;
+    static_assert(kPerThread * kDflash2PathSelectBlock == kCandidates);
+    float local_val[kPerThread];
+    int local_idx[kPerThread];
+#pragma unroll
+    for (int item = 0; item < kPerThread; ++item) {
+        const int offset = tid + item * kDflash2PathSelectBlock;
+        local_val[item]  = split_val[src + offset];
+        local_idx[item]  = split_idx[src + offset];
     }
-    for (int p = 0; p < kDflash2PathSelectTopkSplits * kDflash2PathSelectK; ++p) {
-        if (split_idx[src + p] == INT_MAX) { continue; }
-        dflash2_insert_topk(out_val, out_idx, kDflash2PathSelectK, split_val[src + p],
-                            split_idx[src + p]);
-    }
-    for (int c = 0; c < kDflash2PathSelectK; ++c) {
-        if (out_idx[c] != INT_MAX) { continue; }
-        out_idx[c] = c < vocab ? c : 0;
-        out_val[c] = -CUDART_INF_F;
-    }
-    if (logit_token_ids != nullptr) {
-        for (int c = 0; c < kDflash2PathSelectK; ++c) {
-            const int row = out_idx[c];
-            out_idx[c]    = (row >= 0 && row < vocab) ? logit_token_ids[row] : 0;
-        }
-    }
+
+    __shared__ float reduce_val[kDflash2PathSelectBlock];
+    __shared__ int reduce_idx[kDflash2PathSelectBlock];
     const std::int64_t dst = column * kDflash2PathSelectK;
-    for (int c = 0; c < kDflash2PathSelectK; ++c) {
-        cand_val[dst + c] = out_val[c];
-        cand_idx[dst + c] = out_idx[c];
+    // The split stage contributes 32 exact top-16 lists. Select each final rank with
+    // the same value/index ordering as insertion_topk, but spread the 512 candidates
+    // across the block instead of serially merging them on thread zero.
+    for (int rank = 0; rank < kDflash2PathSelectK; ++rank) {
+        float best_val = -CUDART_INF_F;
+        int best_idx   = INT_MAX;
+#pragma unroll
+        for (int item = 0; item < kPerThread; ++item) {
+            if (local_idx[item] != INT_MAX &&
+                dflash2_logit_better(local_val[item], local_idx[item], best_val, best_idx)) {
+                best_val = local_val[item];
+                best_idx = local_idx[item];
+            }
+        }
+        reduce_val[tid] = best_val;
+        reduce_idx[tid] = best_idx;
+        __syncthreads();
+        for (int stride = kDflash2PathSelectBlock / 2; stride > 0; stride >>= 1) {
+            if (tid < stride &&
+                dflash2_logit_better(reduce_val[tid + stride], reduce_idx[tid + stride],
+                                     reduce_val[tid], reduce_idx[tid])) {
+                reduce_val[tid] = reduce_val[tid + stride];
+                reduce_idx[tid] = reduce_idx[tid + stride];
+            }
+            __syncthreads();
+        }
+        const int selected_idx = reduce_idx[0];
+        if (tid == 0) {
+            const int row = selected_idx != INT_MAX ? selected_idx : (rank < vocab ? rank : 0);
+            cand_val[dst + rank] = reduce_val[0];
+            cand_idx[dst + rank] = logit_token_ids != nullptr ? logit_token_ids[row] : row;
+        }
+#pragma unroll
+        for (int item = 0; item < kPerThread; ++item) {
+            if (local_idx[item] == selected_idx) { local_idx[item] = INT_MAX; }
+        }
+        __syncthreads();
     }
 }
 

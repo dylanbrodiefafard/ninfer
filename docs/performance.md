@@ -818,6 +818,25 @@ python3 tools/bench/run_serve_concurrency.py \
 
 ## Qwen3.8-27B NVFP4 C=1 decode
 
+Current fixed-work Engine measurements use the production DFlash artifact, NVFP4 KV, CUDA Graphs,
+4,096-token prefill chunks, the 65,536-token benchmark corpus, 512 generated tokens, and one active
+request. DFlash results are five-run matched measurements; MTP results are the three-run
+post-`a39c5c25` shape baseline.
+
+| Mode | Draft k / verify W | Decode tok/s | Incremental selector gain |
+|---|---:|---:|---:|
+| DFlash | 3 / 4 | **112.16** | **+1.21%** |
+| DFlash | 4 / 5 | **113.24** | **+0.88%** |
+| DFlash | 5 / 6 | **90.78** | **+0.81%** |
+| MTP | 3 / 4 | 150.83 | — |
+| MTP | 4 / 5 | 117.46 | — |
+| MTP | 5 / 6 | 116.35 | — |
+
+The selector rewrite is not a C=1 tradeoff: matched DFlash k=4 aggregate throughput also rises
+156.86 to 157.89 tok/s at C=2 (+0.65%) and 178.49 to 180.11 tok/s at C=4 (+0.91%). Rounds,
+drafts, accepts, fallback counts, and accepted-token counts at every draft position are identical
+for every matched pair.
+
 Same GPU, INT8 KV, graphs on, `--lm-head-draft`, seed `7632647173703958409`. The DFlash2 W8
 companion is appended on `out/qwen3_8_27b_nvfp4_dflash_w8.ninfer`; MTP points load that same file
 with DFlash host-placed. `long_decode_aime26_15` uses 4096 output tokens and max-context 16384.
