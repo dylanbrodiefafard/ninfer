@@ -771,6 +771,8 @@ int main() {
     failures += run_packed_column0_matches_decode(kQwen27, 8, 0x5108u);
     failures += run_packed_column0_matches_decode(kQwen27, 12, 0x510cu);
     failures += run_packed_column0_matches_decode(kQwen27, 16, 0x5110u);
+    failures += run_packed_columns_match_decode(kQwen27, 5, 0x5185u);
+    failures += run_packed_columns_match_decode(kQwen27, 6, 0x5186u);
     failures += run_packed_columns_match_decode(kQwen27, 8, 0x5188u);
     failures += run_packed_columns_match_decode(kQwen27, 12, 0x518cu);
     failures += run_norm_packed_columns_match_decode(kQwen27, 5, 0x6105u);

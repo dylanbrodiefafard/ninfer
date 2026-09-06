@@ -143,22 +143,25 @@ __global__ void bf16_gdn_gating_proj_small_t_reduce_kernel(const float* __restri
     beta[out_index]              = sigmoid(acc_b);
 }
 
-template <int PackedMax>
+template <int PackedMax, int FixedTokens = 0>
 __global__ void bf16_gdn_gating_proj_gemv_kernel(const __nv_bfloat16* x,
                                                  const __nv_bfloat16* a_weight,
                                                  const __nv_bfloat16* b_weight, const float* A_log,
                                                  const float* dt_bias, float* g, float* beta,
                                                  std::int32_t t) {
     static_assert(PackedMax == kGemvPackedMax || PackedMax == kGemvPackedExtendedMax);
+    static_assert(FixedTokens == 0 || FixedTokens == 5 || FixedTokens == 6);
+    static_assert(FixedTokens <= PackedMax);
     const int global_row = static_cast<int>(blockIdx.x);
     const bool is_b      = global_row >= kN;
     const int row        = is_b ? global_row - kN : global_row;
     const auto* weight   = is_b ? b_weight : a_weight;
     __shared__ float warp_sums[kThreads / kWarpSize];
 
-    float acc[PackedMax];
+    constexpr int kAccumulators = FixedTokens == 0 ? PackedMax : FixedTokens;
+    float acc[kAccumulators];
 #pragma unroll
-    for (int tt = 0; tt < PackedMax; ++tt) { acc[tt] = 0.0f; }
+    for (int tt = 0; tt < kAccumulators; ++tt) { acc[tt] = 0.0f; }
 
     constexpr int kPairs        = kK / 2;
     const std::int64_t row_base = static_cast<std::int64_t>(row) * kK;
@@ -167,8 +170,14 @@ __global__ void bf16_gdn_gating_proj_gemv_kernel(const __nv_bfloat16* x,
     for (int p = static_cast<int>(threadIdx.x); p < kPairs; p += static_cast<int>(blockDim.x)) {
         const float2 wf = bf16x2_to_float2(w2[p]);
 #pragma unroll
-        for (int tt = 0; tt < PackedMax; ++tt) {
-            if (tt < t) {
+        for (int tt = 0; tt < kAccumulators; ++tt) {
+            if constexpr (FixedTokens != 0) {
+                const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(
+                    x + static_cast<std::int64_t>(tt) * kK);
+                const float2 xf = bf16x2_to_float2(x2[p]);
+                acc[tt]         = fmaf(wf.x, xf.x, acc[tt]);
+                acc[tt]         = fmaf(wf.y, xf.y, acc[tt]);
+            } else if (tt < t) {
                 const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(
                     x + static_cast<std::int64_t>(tt) * kK);
                 const float2 xf = bf16x2_to_float2(x2[p]);
@@ -180,7 +189,7 @@ __global__ void bf16_gdn_gating_proj_gemv_kernel(const __nv_bfloat16* x,
 
     // Same pair-wise K FMA order as T=1 GEMV. block_reduce_sum barriers between tokens so
     // packed T=2..16 reuses this launch without a T=1 host loop.
-    for (int tt = 0; tt < t; ++tt) {
+    for (int tt = 0; tt < (FixedTokens == 0 ? t : FixedTokens); ++tt) {
         const float reduced = block_reduce_sum<kThreads>(acc[tt], warp_sums);
         if (threadIdx.x == 0) {
             const std::int64_t out = static_cast<std::int64_t>(tt) * kN + row;
@@ -359,15 +368,20 @@ void bf16_gdn_gating_proj_gemv_launch(const Tensor& x, const Weight& a_weight,
     if (t < 1 || t > kGemvPackedExtendedMax) {
         throw std::invalid_argument("gdn_gating_proj: GEMV/small-T fused admits T=1..20");
     }
-    const auto launch = [&]<int PackedMax>() {
-        bf16_gdn_gating_proj_gemv_kernel<PackedMax><<<2 * kN, kThreads, 0, stream>>>(
+    const auto launch = [&]<int PackedMax, int FixedTokens = 0>() {
+        bf16_gdn_gating_proj_gemv_kernel<PackedMax, FixedTokens>
+            <<<2 * kN, kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const __nv_bfloat16*>(a_weight.qdata),
             static_cast<const __nv_bfloat16*>(b_weight.qdata),
             static_cast<const float*>(A_log.data), static_cast<const float*>(dt_bias.data),
             static_cast<float*>(g.data), static_cast<float*>(beta.data), t);
     };
-    if (t <= kGemvPackedMax) {
+    if (t == 5) {
+        launch.template operator()<kGemvPackedMax, 5>();
+    } else if (t == 6) {
+        launch.template operator()<kGemvPackedMax, 6>();
+    } else if (t <= kGemvPackedMax) {
         launch.template operator()<kGemvPackedMax>();
     } else {
         launch.template operator()<kGemvPackedExtendedMax>();

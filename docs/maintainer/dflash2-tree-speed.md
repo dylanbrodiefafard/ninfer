@@ -572,6 +572,26 @@ Reports: `profiles/nsys/c1-next-node-34f64389-dflash*-tg128-20260906.nsys-rep`,
 `profiles/bench/c1-next-gdn-contiguous-*-20260906.json`, and
 `profiles/ppl/c1-next-gdn-contiguous-20260906.json`.
 
+The next C=1 pass specializes the existing BF16 GDN control GEMV for the production W=5 and W=6
+verification shapes. The CTA mapping, 256-thread pairwise FMA order, block reduction, FP32 output,
+and nonlinearities are unchanged; compiling only the live columns removes the generic 16-column
+predicates and lowers register use from 54 to 40 with no local-memory spill. Five interleaved
+public-Op pairs consistently reduce the cold RMSNorm-plus-control median from 16.384 to 14.336 us
+at W=5 (-12.5%) and from 18.432 to 14.336 us at W=6 (-22.2%). Same-command production node traces
+reduce the control kernel from 8.426 to 6.574 us (-22.0%) and from 10.487 to 7.803 us (-25.6%).
+
+The first five-run fixed-work pair improves DFlash k=4 from 114.963 to 115.448 tok/s (+0.42%) and
+k=5 from 91.790 to 92.166 tok/s (+0.41%). Longer opposite-order ten-run pairs bracket clock drift;
+their averaged baseline/candidate values are 114.284/114.611 tok/s (+0.29%) and 90.968/91.365
+tok/s (+0.44%). All pairs preserve exact rounds, drafts, accepts, fallbacks, and per-position
+acceptance. W=5/6 packed outputs are bit-exact to repeated T=1 projections and pass the independent
+FP64 oracle; Graph/eager real-artifact checks, adaptive state restore, and the byte-identical
+1,023-value target decode NLL control also pass.
+
+Reports: `profiles/nsys/c1-gating-fixed-{baseline,candidate}-dflash{4,5}-tg128-20260906.nsys-rep`,
+`profiles/bench/c1-gating-fixed-*-dflash{4,5}-*-20260906.json`, and
+`profiles/ppl/c1-gating-fixed-20260906.json`.
+
 The BF16 attention-input phase-order change is visible to any standalone T=10/15/20 A16 caller.
 It is 1.9% slower than the old packed route at T=10, 13.0% slower at T=15, and unchanged at T=20;
 the selected order preserves exact W=5 panel arithmetic and makes the production C=3 aggregate
