@@ -823,16 +823,20 @@ Current fixed-work Engine measurements use the production DFlash artifact, NVFP4
 request. DFlash results are five-run matched measurements; MTP results are the three-run
 post-`a39c5c25` shape baseline.
 
-| Mode | Draft k / verify W | Decode tok/s | Incremental selector gain |
+| Mode | Draft k / verify W | Decode tok/s | Latest incremental gain |
 |---|---:|---:|---:|
-| DFlash | 3 / 4 | **112.16** | **+1.21%** |
-| DFlash | 4 / 5 | **113.24** | **+0.88%** |
-| DFlash | 5 / 6 | **90.78** | **+0.81%** |
+| DFlash | 3 / 4 | **112.52** | — |
+| DFlash | 4 / 5 | **114.95** | **+1.18%** |
+| DFlash | 5 / 6 | **91.84** | **+1.09%** |
 | MTP | 3 / 4 | 150.83 | — |
 | MTP | 4 / 5 | 117.46 | — |
 | MTP | 5 / 6 | 116.35 | — |
 
-The selector rewrite is not a C=1 tradeoff: matched DFlash k=4 aggregate throughput also rises
+The latest gain removes multi-request address work from the single-request W=5/6 GDN record path;
+its projection falls 4.78% in the production node trace while preserving the qualified reduction
+and FP32/BF16 state boundaries. C=2/3/4 changes by -0.11%/+0.01%/+0.09%, all noise-level with
+identical speculative work. The preceding selector rewrite is also not a C=1 tradeoff: matched
+DFlash k=4 aggregate throughput rises
 156.86 to 157.89 tok/s at C=2 (+0.65%) and 178.49 to 180.11 tok/s at C=4 (+0.91%). Rounds,
 drafts, accepts, fallback counts, and accepted-token counts at every draft position are identical
 for every matched pair.

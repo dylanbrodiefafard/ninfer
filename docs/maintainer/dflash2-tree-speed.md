@@ -549,6 +549,29 @@ Reports: `profiles/nsys/c1-followup-a39c5c25-*-tg128-20260906.nsys-rep`,
 `profiles/nsys/c1-followup-dflash-topk-warp-merge-dflash4-tg128-20260906.nsys-rep`, and
 `profiles/bench/c1-followup-topk-final-*-20260906.json`.
 
+The post-`34f64389` C=1 node traces rank target SwiGLU at 29–31%, GDN input at 13–17%,
+MLP-down at 15–16%, the target head at about 5%, and recurrent fold at about 1%. Focused NCU and
+the Linear byte classifier show that the three dominant projections already read one weight pass;
+generic occupancy, tile, TMA, cache-hint, and stream-overlap changes therefore remain inadmissible
+or previously rejected. The retained W=5/6 GDN change specializes the existing contiguous panel
+policy for B=1 instead: it removes grouped-request block indexing, clamping, and output bounds from
+the same eight-warp/four-chain reduction without changing weight traffic or arithmetic.
+
+The public Graph Op improves from 67.584 to 65.536 us cold and 42.784 to 40.704 us warm at W=5
+(-3.0%/-4.9%), and from 71.680 to 69.632 us cold and 47.488 to 44.928 us warm at W=6
+(-2.9%/-5.4%). The production W=5 projection falls from 57.31 to 54.57 us (-4.78%). Five-run
+fixed-work C=1 DFlash improves from 113.62 to 114.95 tok/s at k=4 (+1.18%) and from 90.85 to
+91.84 tok/s at k=5 (+1.09%). Matched k=4 C=2/3/4 changes by -0.11%/+0.01%/+0.09%, within
+noise. All pairs preserve exact speculative counters and per-position acceptance. The independent
+FP64 decoded-weight record oracle, Graph/eager real-artifact isolation, adaptive state save/restore,
+exact recurrent-state reconstruction, and the byte-identical 1,023-value target decode NLL control
+qualify the route.
+
+Reports: `profiles/nsys/c1-next-node-34f64389-dflash*-tg128-20260906.nsys-rep`,
+`profiles/nsys/c1-next-node-gdn-contiguous-dflash4-tg128-20260906.nsys-rep`,
+`profiles/bench/c1-next-gdn-contiguous-*-20260906.json`, and
+`profiles/ppl/c1-next-gdn-contiguous-20260906.json`.
+
 The BF16 attention-input phase-order change is visible to any standalone T=10/15/20 A16 caller.
 It is 1.9% slower than the old packed route at T=10, 13.0% slower at T=15, and unchanged at T=20;
 the selected order preserves exact W=5 panel arithmetic and makes the production C=3 aggregate
