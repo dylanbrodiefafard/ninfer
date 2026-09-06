@@ -15,7 +15,7 @@
 
 namespace ninfer::bench {
 
-inline constexpr int kSchemaVersion                   = 13;
+inline constexpr int kSchemaVersion                   = 14;
 inline constexpr std::string_view kArtifactType       = "ninfer_bench_report";
 inline constexpr std::string_view kDefaultCorpusPath  = "bench/fixtures/bench_corpus.ids";
 inline constexpr int kDecodeSeedTokens                = 1;
@@ -23,7 +23,7 @@ inline constexpr int kDefaultNPrompt                  = 512;
 inline constexpr int kDefaultNGen                     = 128;
 inline constexpr int kDefaultRepetitions              = 5;
 inline constexpr int kDefaultWarmup                   = 1;
-inline constexpr std::uint32_t kDefaultPrefillChunk   = 8192;
+inline constexpr std::uint32_t kDefaultPrefillChunk   = 4096;
 inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
 inline constexpr std::uint32_t kKvPageTokens          = 64;
 inline constexpr std::uint32_t kMaxMtpDraftTokens     = 5;
@@ -87,6 +87,10 @@ struct RepTiming {
     GenerationTimings timings;
     SpeculativeStats speculative;
     std::uint32_t generated_output_tokens = 0;
+    // Host wall time from the first Engine submission until every request in the
+    // repetition resolves. Unlike per-request GenerationTimings, this includes
+    // scheduler queueing and is the denominator for pure-prefill wave throughput.
+    double wave_seconds = 0.0;
 };
 
 struct TestResult {
@@ -155,12 +159,14 @@ std::string speculative_backend_name(SpeculativeBackend backend);
 
 Stats compute_stats(const std::vector<double>& values);
 std::vector<double> prefill_tok_s_series(const TestResult& result);
+std::vector<double> prefill_active_tok_s_series(const TestResult& result);
 std::vector<double> decode_output_tok_s_series(const TestResult& result);
 std::vector<double> decode_engine_tok_s_series(const TestResult& result);
 std::vector<double> prepare_time_series(const TestResult& result);
 std::vector<double> prefill_time_series(const TestResult& result);
 std::vector<double> decode_time_series(const TestResult& result);
 std::vector<double> total_time_series(const TestResult& result);
+std::vector<double> wave_time_series(const TestResult& result);
 
 std::string format_table(const BenchEnvironment& env, const std::vector<TestResult>& results);
 std::string format_json(const BenchEnvironment& env, const std::string& command,

@@ -61,7 +61,7 @@ void xattn_log_keep(const GqaXattnScratchView& scratch, const Tensor& positions,
     const int n_kb_cap   = scratch.n_kb;
     const int n_slots    = q_heads * n_br;
     const int max_abs    = base_pos + tokens - 1;
-    const bool identity  = (max_abs + 1) < xattn_min_len;
+    const bool identity  = (max_abs + 1) <= xattn_min_len;
     std::vector<int> counts(static_cast<std::size_t>(n_slots));
     CUDA_CHECK(cudaMemcpy(counts.data(), scratch.count, counts.size() * sizeof(int),
                           cudaMemcpyDeviceToHost));

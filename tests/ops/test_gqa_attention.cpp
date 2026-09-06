@@ -3095,7 +3095,7 @@ int run_a1_skip_case(const Geometry& geometry, const AttentionCase& test_case, f
     const auto count_host = copy_from_guarded<std::int32_t>(dcount, geometry.q_heads);
     const bool xattn_identity =
         xattn_tau < 1.0f && keep_frac >= 1.0f &&
-        test_case.envelope_max < static_cast<std::uint32_t>(xattn_min_len);
+        test_case.envelope_max <= static_cast<std::uint32_t>(xattn_min_len);
 
     const std::int32_t n_q_blocks = (test_case.tokens + kSkipBr - 1) / kSkipBr;
     std::vector<std::vector<std::vector<char>>> keep(
@@ -5377,6 +5377,7 @@ int main(int argc, char** argv) {
         for (const Geometry& geometry : kGeometries) {
             failures += run_a1_skip_case(geometry, {512, 0, 512, 532u}, 1.0f, 0.9f, 0);
             failures += run_a1_skip_case(geometry, {128, 0, 128, 551u}, 1.0f, 0.9f, 8192);
+            failures += run_a1_skip_case(geometry, {128, 384, 512, 552u}, 1.0f, 0.9f, 512);
             failures += run_a1_skip_case(geometry, {512, 0, 512, 531u}, 0.5f, 1.0f, 0);
             failures += run_a1_skip_case(geometry, {300, 100, 512, 533u}, 0.5f, 1.0f, 0);
             failures += run_a1_skip_case(geometry, {128, 384, 512, 540u}, 1.0f, 0.9f, 0,

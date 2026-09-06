@@ -103,11 +103,11 @@ with context length.
 `T` denotes the Text/MTP token extent supplied to an Op. It is any positive tensor extent that
 fits the applicable storage or explicit state capacity. Decode (`T=1`), verification-sized calls,
 and prefill chunks are workload points and private implementation routes, not different Op domains.
-The configured prefill chunk controls target workspace and request decomposition; its default 8192
-uses one unit for aligned extents through 8192. When a remaining default-sized unit is larger than
-4096 but not a multiple of the 128-token kernel alignment, the Program processes 4096 first so the
-smaller tail, rather than every large projection, owns the remainder schedule. This private
-decomposition does not cap an Op's `T`.
+The configured prefill chunk controls target workspace and request decomposition; its default is
+4096. An explicit 8192 maximum uses one unit for aligned extents through 8192. When a remaining
+unit under that larger maximum exceeds 4096 but is not a multiple of the 128-token kernel
+alignment, the Program processes 4096 first so the smaller tail, rather than every large
+projection, owns the remainder schedule. This private decomposition does not cap an Op's `T`.
 
 Vision uses different axes. `P` is the aggregate raw-patch count and must be a positive multiple of
 4 because of the 2x2 spatial merge; `V=P/4` is the aggregate merged-token count. The registered 27B

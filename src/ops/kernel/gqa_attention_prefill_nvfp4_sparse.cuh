@@ -17,6 +17,7 @@
 
 #include "ops/kernel/gqa_attention_kv_nvfp4.cuh"
 #include "ops/kernel/gqa_attention_prefill_common.cuh"
+#include "ops/kernel/gqa_xattn_sort.cuh"
 #include "ops/launcher/gqa_xattn_scratch.h"
 #include "ninfer/ops/gqa_attention.h"
 
@@ -150,7 +151,7 @@ inline GqaXattnScratchView gqa_xattn_bind_scratch(void* p, int q_heads, int kv_h
 inline int gqa_xattn_score_smem_bytes() { return kXAttnScoreSmemBytes; }
 
 inline constexpr int kXAttnFinishSmemBytes =
-    2 * kGqaPrefillNvfp4RankTiles * static_cast<int>(sizeof(float)) +
+    kGqaPrefillNvfp4RankTiles * static_cast<int>(sizeof(float)) +
     kGqaPrefillNvfp4RankTiles * static_cast<int>(sizeof(int)) + kGqaPrefillNvfp4RankTiles;
 
 static_assert(kXAttnFinishSmemBytes <= 101376);
@@ -165,34 +166,6 @@ static_assert(2 * kGqaPrefillNvfp4RankTiles * static_cast<int>(sizeof(float)) +
                   kGqaPrefillHeadDim * static_cast<int>(sizeof(float)) <=
               kGqaPrefillNvfp4MmaSmemBytes);
 
-template <int N, int Threads>
-__device__ void gqa_bitonic_sort_desc(float* keys, int* ids, int tid) {
-    static_assert((N & (N - 1)) == 0, "bitonic length must be a power of two");
-    for (int k = 2; k <= N; k <<= 1) {
-        for (int j = k >> 1; j > 0; j >>= 1) {
-            for (int i = tid; i < N; i += Threads) {
-                const int ixj = i ^ j;
-                if (ixj > i) {
-                    const bool want_i_better = (i & k) == 0;
-                    const bool i_better =
-                        keys[i] > keys[ixj] ||
-                        (keys[i] == keys[ixj] && ids[i] >= 0 &&
-                         (ids[ixj] < 0 || ids[i] < ids[ixj]));
-                    if (i_better != want_i_better) {
-                        const float tk = keys[i];
-                        keys[i]        = keys[ixj];
-                        keys[ixj]      = tk;
-                        const int ti   = ids[i];
-                        ids[i]         = ids[ixj];
-                        ids[ixj]       = ti;
-                    }
-                }
-            }
-            __syncthreads();
-        }
-    }
-}
-
 // Pairwise online-softmax merge: (m,z) ⊕ (m2,z2).
 __device__ __forceinline__ void gqa_xattn_combine_mz(float& m, float& z, float m2, float z2) {
     if (m2 == m) {
@@ -204,20 +177,6 @@ __device__ __forceinline__ void gqa_xattn_combine_mz(float& m, float& z, float m
         m = m2;
     } else {
         z += (m2 == -CUDART_INF_F) ? 0.0f : z2 * expf(m2 - m);
-    }
-}
-
-// noinline so the four specializations stay out of the MMA register file.
-// nsort is 256, 512, 2048, or 4096; callers pad keys/ids to that length.
-__device__ __noinline__ void gqa_xattn_sort_desc(float* keys, int* ids, int nsort, int tid) {
-    if (nsort <= 256) {
-        gqa_bitonic_sort_desc<256, kGqaPrefillNvfp4Threads>(keys, ids, tid);
-    } else if (nsort <= 512) {
-        gqa_bitonic_sort_desc<512, kGqaPrefillNvfp4Threads>(keys, ids, tid);
-    } else if (nsort <= 2048) {
-        gqa_bitonic_sort_desc<2048, kGqaPrefillNvfp4Threads>(keys, ids, tid);
-    } else {
-        gqa_bitonic_sort_desc<4096, kGqaPrefillNvfp4Threads>(keys, ids, tid);
     }
 }
 
@@ -271,7 +230,7 @@ __global__ __launch_bounds__(kXAttnPackThreads, 8) void gqa_xattn_pack_kernel(
 
     const int base_pos      = positions[0];
     const int max_query_abs = base_pos + tokens - 1;
-    if (max_query_abs + 1 < xattn_min_len) { return; }
+    if (max_query_abs + 1 <= xattn_min_len) { return; }
     const int tile_k0 = kb * Bc;
     if (tile_k0 > max_query_abs) { return; }
 
@@ -360,7 +319,7 @@ __global__ __launch_bounds__(kXAttnScoreThreads, 2) void gqa_xattn_score_kernel(
     const int kv_head       = q_head / Geometry::GroupSize;
     const int base_pos      = positions[0];
     const int max_query_abs = base_pos + tokens - 1;
-    if (max_query_abs + 1 < xattn_min_len) { return; }
+    if (max_query_abs + 1 <= xattn_min_len) { return; }
 
     const int q_start = br_base * kXAttnBlock;
     if (q_start >= tokens) { return; }
@@ -551,7 +510,7 @@ __global__ void gqa_xattn_softmax_mass_kernel(Metadata metadata,
     if (q_start >= tokens) { return; }
     const int q_rows        = min(kXAttnBlock, tokens - q_start);
     const int max_query_abs = base_pos + q_start + q_rows - 1;
-    if (max_query_abs + 1 < xattn_min_len) { return; }
+    if (max_query_abs + 1 <= xattn_min_len) { return; }
     const int n_i    = gqa_xattn_n_i_rows(q_rows);
     const int n_j    = min(n_j_cap, max_query_abs / kXAttnStride + 1);
     const int kb_lim = min(n_kb_cap, max_query_abs / Bc + 1);
@@ -646,7 +605,7 @@ __global__ void gqa_xattn_finish_kernel(Metadata metadata, const std::int32_t* _
     const int slot          = q_head * n_br + br;
     std::uint16_t* dst      = keep + slot * n_kb_cap;
 
-    const bool identity = (max_query_abs + 1) < xattn_min_len;
+    const bool identity = (max_query_abs + 1) <= xattn_min_len;
     if (identity) {
         for (int kb = tid; kb < key_blocks; kb += kGqaPrefillNvfp4Threads) {
             dst[kb] = static_cast<std::uint16_t>(kb);
@@ -675,7 +634,13 @@ __global__ void gqa_xattn_finish_kernel(Metadata metadata, const std::int32_t* _
         for (int b = 0; b < n_blocks; ++b) { scores[b] *= inv_z; }
     }
     __syncthreads();
-    const int nsort = n_blocks <= 256 ? 256 : n_blocks <= 512 ? 512 : n_blocks <= 2048 ? 2048 : 4096;
+    const int nsort = n_blocks <= 64     ? 64
+                      : n_blocks <= 128  ? 128
+                      : n_blocks <= 256  ? 256
+                      : n_blocks <= 512  ? 512
+                      : n_blocks <= 1024 ? 1024
+                      : n_blocks <= 2048 ? 2048
+                                         : 4096;
     for (int i = tid; i < nsort; i += kGqaPrefillNvfp4Threads) {
         if (i < n_blocks) {
             sort_ids[i] = i;
@@ -685,7 +650,7 @@ __global__ void gqa_xattn_finish_kernel(Metadata metadata, const std::int32_t* _
         }
     }
     __syncthreads();
-    gqa_xattn_sort_desc(scores, sort_ids, nsort, tid);
+    gqa_xattn_sort_desc<kGqaPrefillNvfp4Threads>(scores, sort_ids, nsort, tid);
     if (tid == 0) {
         float kept = 0.0f;
         for (int i = 0; i < nsort; ++i) {

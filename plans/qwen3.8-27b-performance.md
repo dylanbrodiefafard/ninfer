@@ -1,10 +1,9 @@
 # Qwen3.8-27B NVFP4 active work
 
 This file contains only current work for the supported `qwen3.8-27b/nvfp4` product on one RTX
-5090. The default measurement profile is NVFP4 KV, CUDA Graphs enabled, prefill chunk 8192 with
-adaptive 4096 decomposition for a large unaligned remainder, and startup-fixed C=1/2/3/4 unless a
-narrower experiment says otherwise. Completed campaigns belong in the active documentation or git
-history, not in this backlog.
+5090. The default measurement profile is NVFP4 KV, CUDA Graphs enabled, prefill chunk 4096, and
+startup-fixed C=1/2/3/4 unless a narrower experiment says otherwise. Completed campaigns belong in
+the active documentation or git history, not in this backlog.
 
 ## Long-context chunk sensitivity
 
@@ -140,41 +139,22 @@ fixture:
 
 ### Investigation design
 
-Dense behavior and DFlash2 concurrent row isolation are classified. Continue with XAttention.
-Tau 1.0 is the dense-identity gate. Tau 0.9 remains an explicitly approximate mode;
-its measured long-context result was about +49.7% prefill throughput and -33.1% TTFT, but it needs
-perplexity and long-context behavioral qualification before any default-policy decision.
+The XAttention tau-0.9 production-profile optimization and qualification are complete. The
+retained selector stays dense through the 8,192-token minimum, removes unused finalizer shared
+memory, and uses exact power-of-two sort specializations. C=1-4 throughput, the independent
+keep-list/FP64 attention oracle, paired 8k/32k PPL, 64k NIAH, and forced-XAttention C=2 DFlash
+request isolation are recorded in `docs/performance.md`.
 
-Current XAttention numerical evidence on 2026-09-02:
-
-- Tau 1.0 does not enter the sparse launcher; it selects the ordinary exact-NVFP4 dense kernel, so
-  the identity gate has no separate arithmetic path.
-- The focused GQA proof passes for both registered geometries. It checks the production keep-list
-  against an independent paper inverse-reshape/mass oracle, includes adversarial inputs that
-  distinguish the retired four-antidiagonal heuristic, and compares the retained-tile attention
-  result directly with an independent FP64 softmax oracle under the NVFP4 criterion.
-- On the isolated 27B T=4096 synthetic operator workload, tau 0.9 kept 90.7%, 90.2%, and 90.1% of
-  visible pages at 32k, 64k, and 128k. Median operator time improved from 12.438 to 11.138 ms at
-  32k, 25.494 to 22.750 ms at 64k, and 51.625 to 46.402 ms at 128k. Rank scratch was 120, 240,
-  and 479 MB respectively. These random-input timings qualify the implementation cost only; they
-  neither replace real-model keep density nor establish quality.
-- The real-model CUDA-Graph prefill PPL comparison passed at 8k and 32k. Against dense NVFP4,
-  tau 0.9 changed mean NLL by -0.00084 at 8k (paired 2-sigma 0.00171) and -0.00234 at 32k
-  (paired 2-sigma 0.00488); both are unresolved inside paired noise, with no non-finite values.
-- The first 32k XAttention cell exposed an integration defect before scoring: CUDA Graph startup
-  consumed 70 MiB against the 12 MiB ordinary allowance. XAttention prefill is already eager and
-  decode remains exact, so disabling decode graphs would be the wrong fix. XAttention-enabled
-  plans now reserve the established 96 MiB large-topology allowance. Ordinary, MTP, and DFlash
-  startup all pass with the new bound; this changes reserved VRAM, not execution work.
-- The required 64k NIAH gate passed under tau 0.9, NVFP4 KV, CUDA Graphs, and MTP: the model returned
-  the exact `ORCHID=493817; COLOR=COBALT` record from a 64,511-token prompt. Tau 0.9 remains an
-  explicit approximate experiment rather than the product default; the isolated random-input
-  keep density and scratch cost do not support changing the default policy on their own.
+The default prefill chunk is now 4,096. A matched 32k C=1-4 A/B measured a 0.84-0.91% tau-0.9
+throughput cost versus 8,192 while halving workspace and freeing 650 MiB of total startup
+reservation. An explicit 8,192 remains the maximum-speed override. A future startup-auto policy may
+evaluate both fixed layouts before workspace and KV sizing, but runtime adaptation cannot reclaim
+an already reserved address-stable workspace.
 
 Final validation covers fresh prefill and response-checkpoint reuse at C=1/2/3/4, confirms that
 reasoning cannot terminate on a registered stop token, confirms normal post-reasoning stopping, and
-benchmarks TTFT/prefill throughput at the default chunk 8192 and its adaptive unaligned-remainder
-route. Exact token equality across legal chunk partitions is required only if the localized
+benchmarks TTFT/prefill throughput at the default chunk 4096 and the explicit 8192 adaptive
+unaligned-remainder route. Exact token equality across legal chunk partitions is required only if the localized
 operation's actual semantic contract requires it.
 
 ### Structured stop eligibility
