@@ -230,10 +230,11 @@ The 2026-09-05 follow-up kept the preceding DFlash4/MTP4 decode implementation a
 prefill latency when one request enters while another request is decoding. Tests used the same
 Qwen3.8-27B DFlash2 artifact, NVFP4 KV, CUDA Graphs, and one RTX 5090. The retained GDN prefill Op
 writes the causal-convolution result directly to compact Q/K/V planes, eliminating a
-`[10240,T]` intermediate and three device-to-device splits in each of 48 GDN layers. The default
-prefill chunk is 8,192 tokens. A remaining unit above 4,096 that is not aligned to the 128-token
+`[10240,T]` intermediate and three device-to-device splits in each of 48 GDN layers. This campaign
+evaluated an 8,192-token maximum. A remaining unit above 4,096 that is not aligned to the 128-token
 kernel schedule is decomposed as a 4,096-token unit plus its tail; aligned extents retain the
-single 8,192-token route.
+single 8,192-token route. The current product default is 4,096 following the later 32k
+memory/performance A/B below; 8,192 remains an explicit maximum-speed override.
 
 The public causal-convolution Op benchmark at the production 10,240-channel partition measured
 the direct split against the ordinary Op plus the three production-shaped copies. Representative
@@ -242,7 +243,7 @@ means were 108.10 to 59.36 us at T=2,048, 218.69 to 134.85 us at T=4,096 (-38.3%
 copies: the replacement convolution kernel itself was slightly slower, while device-to-device
 copy time fell from about 4.59 ms to 0.26 ms per profiled pass.
 
-With the retained default and adaptive decomposition, public-Engine prefill results were:
+With the explicit 8,192 maximum and adaptive decomposition, public-Engine prefill results were:
 
 | Startup C | 7,669-token owner ms | Aggregate tok/s | 8,192-token owner ms | Aggregate tok/s |
 |---:|---:|---:|---:|---:|
@@ -280,6 +281,86 @@ Primary reports are under `profiles/bench/mixed-phase-goal-final-prefill-c*-2026
 `profiles/bench/mixed-phase-goal-final-serve-dflash4-decode-20260905`,
 `profiles/bench/mixed-phase-goal-final-serve-mtp4-decode-uncontended-20260905`, and
 `profiles/ppl/mixed-phase-prefill-split-20260905.json`.
+
+## Qwen3.8-27B NVFP4 XAttention prefill campaign
+
+The 2026-09-05 XAttention follow-up used the production tau-0.9 profile, exact NVFP4 KV,
+8,192-token chunks for performance runs, 4,096-token chunks for PPL, CUDA Graph decode, and one
+RTX 5090. The selector now remains dense through the configured 8,192-token minimum instead of
+ranking only the final query tile at the boundary. That boundary previously paid the rank prepass
+while retaining every visible page. The keep-list finalizer also reserves only its live
+score/id/mark planes: dynamic shared memory falls
+from 53,248 to 36,864 bytes, admitting two CTAs per SM instead of one. Exact 64-, 128-, and
+1,024-entry bitonic specializations avoid padding those ranks to the next larger retained case.
+
+On the public T=4,096 GQA Op benchmark, the boundary change reduced the tau-0.9 8k cell from
+2,501.9 to 2,309.5 us (-7.69%, +8.33% throughput). Order-balanced finalizer A/Bs improved the
+32k, 64k, and 128k cells by about 0.25%, 0.42%, and 0.49%; the 1,024-entry sort supplied another
+0.37% at 128k. Nsight measured the 64k finalizer at about 270 us after the shared-memory change,
+down from about 439 us. The score GEMM remains the ranker's dominant component: at 64k it was
+1.34 ms, 90.3% compute-utilized, and 95.3% L2-hit. Sweeps of four versus eight query blocks per
+CTA, 64 versus 128 score columns, and a two-query-head fused CTA were 0.5% to 1.9% slower and were
+not retained.
+
+The Engine benchmark now measures each submitted request wave explicitly. For a pure-prefill test,
+aggregate throughput is total prompt tokens divided by wave wall time; it also reports the
+slowest lane's active prefill rate separately. This avoids multiplying a per-request active rate by
+startup concurrency even though the Engine deliberately permits only one prefill owner. Corrected
+matched 32k target-only results (no speculative backend) show nearly constant wave throughput from
+C=1 through C=4 and a consistent tau-0.9 benefit:
+
+| Startup C | Dense wave tok/s | XAttention wave tok/s | XAttention effect |
+|---:|---:|---:|---:|
+| 1 | 11,206 | 12,444 | +11.05% |
+| 2 | 11,163 | 12,461 | +11.63% |
+| 3 | 11,166 | 12,408 | +11.13% |
+| 4 | 11,146 | 12,387 | +11.14% |
+
+An order-balanced chunk-size A/B then reran the same 32k workload from the final binary. The table
+reports complete-wave throughput and the effect of selecting 4,096 instead of 8,192:
+
+| Attention | C | Chunk 4,096 tok/s | Chunk 8,192 tok/s | 4,096 effect |
+|---|---:|---:|---:|---:|
+| Dense | 1 | 11,177 | 11,284 | -0.95% |
+| Dense | 2 | 11,121 | 11,160 | -0.35% |
+| Dense | 3 | 11,077 | 11,145 | -0.61% |
+| Dense | 4 | 11,071 | 11,141 | -0.63% |
+| XAttention tau 0.9 | 1 | 12,376 | 12,489 | -0.91% |
+| XAttention tau 0.9 | 2 | 12,297 | 12,409 | -0.90% |
+| XAttention tau 0.9 | 3 | 12,287 | 12,394 | -0.87% |
+| XAttention tau 0.9 | 4 | 12,269 | 12,373 | -0.84% |
+
+Chunk 4,096 reduced the fixed workspace from 1,220.6 to 610.3 MiB and reduced the complete startup
+reservation by 650 MiB at every C. It is therefore the memory-efficient long-context profile for
+less than 1% measured 32k prefill cost, so 4,096 is the product default and 8,192 remains an
+explicit maximum-speed override. A future startup-auto refinement may evaluate both fixed layouts
+before KV sizing. Runtime switching cannot recover memory from the already reserved address-stable
+arena.
+
+The retained selector changes themselves are deliberately smaller than the dense-to-XAttention
+effect. At 8k and C=4, an order-balanced five-repetition A/B against `db14d3df` reduced the
+slowest lane's active prefill time by 0.18%. At 32k the corresponding active-rate effects were
++0.93% at C=2, +0.38% at C=3, and +0.03% at C=4. These active-time comparisons isolate the kernel
+changes; they are not aggregate wave-throughput claims. Workspace capacity and keep counts above
+the minimum were unchanged.
+
+The independent XAttention proof passed for both registered GQA geometries. It compares the
+production keep list with an independent inverse-reshape/mass oracle, distinguishes the retired
+four-antidiagonal heuristic with planted inputs, and checks retained-tile attention directly
+against an FP64 softmax oracle. A separate exact CUDA/CPU ordering oracle covers every retained
+64- through 4,096-entry rank specialization, including ties, padding, and non-power-of-two live
+counts. The new exact-minimum case selects dense as intended. At 8k,
+dense-NVFP4 and tau-0.9 per-token NLL sidecars were byte-identical. At 32k, tau 0.9 added 0.000501
+mean NLL over dense NVFP4, below the paired 1-sigma noise of 0.002492, with no non-finite values.
+The 64k NIAH run returned the exact `ORCHID=493817; COLOR=COBALT` record. The forced-XAttention C=2
+mixed Vision/text DFlash test also matched every sequential target token, covering packed request
+isolation and decode composition. In a production HTTP C=2 stagger, a 32,856-token newcomer
+arriving 0.5 seconds into a 512-token DFlash4 donor completed prefill at 10,911 tok/s while the
+donor completed at 206.4 decode tok/s; both requests finished normally.
+
+Primary reports are under `profiles/bench/xattn-goal-*`, including the matched
+`xattn-goal-chunk-ab-*` chunk comparison, and
+`profiles/ppl/xattn-goal-boundary-{8192,32768}-20260905`.
 
 ## Single-request serving performance method
 

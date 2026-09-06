@@ -128,7 +128,7 @@ struct EngineOptions {
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
-    std::uint32_t prefill_chunk        = 8192;
+    std::uint32_t prefill_chunk        = 4096;
     std::size_t kv_ram_capacity_bytes  = 0;
     std::size_t kv_disk_capacity_bytes = 0;
     std::filesystem::path kv_disk_location;
@@ -147,7 +147,7 @@ struct EngineOptions {
     // XAttention mass threshold τ on exact NVFP4 prefill. 1.0 = dense. Mutually
     // exclusive with keep_frac < 1. Requires kv_cache == Nvfp4 and sage_attn == false.
     float xattn_tau = 1.0f;
-    // Skip XAttention ranking below this cached length; short prefixes stay dense.
+    // Skip XAttention ranking at or below this cached length; short prefixes stay dense.
     std::int32_t xattn_min_len = 8192;
     SpeculativeOptions speculative;
     bool enable_vision  = false;

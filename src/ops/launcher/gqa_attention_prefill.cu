@@ -70,7 +70,7 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
         (keep_frac < 1.0f || xattn_tau < 1.0f || dump != nullptr)) {
         const bool skip_xattn_to_dense =
             xattn_tau < 1.0f && !(keep_frac < 1.0f) &&
-            envelope.max_visible_keys < static_cast<std::uint32_t>(xattn_min_len);
+            envelope.max_visible_keys <= static_cast<std::uint32_t>(xattn_min_len);
         if (!skip_xattn_to_dense) {
             gqa_sparse_prefill_attention_launch<Geometry>(
                 q, positions, scale, cache, metadata, out, stream, keep_frac, xattn_tau,

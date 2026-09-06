@@ -54,8 +54,8 @@ int main() {
                       "CLI help omits --no-p-less-sampling");
 
     const ninfer::cli::Options defaults = parse({"ninfer", "model.ninfer", "--prompt", "hi"});
-    failures += check(defaults.prefill_chunk == 8192,
-                      "CLI prefill chunk default is not 8192");
+    failures += check(defaults.prefill_chunk == 4096,
+                      "CLI prefill chunk default is not 4096");
     failures += check(defaults.sampling.p_less, "CLI did not enable p-less by default");
     const ninfer::cli::Options production = parse(
         {"ninfer", "model.ninfer", "--prompt", "hi", "--no-p-less-sampling", "--top-p", "0.5"});

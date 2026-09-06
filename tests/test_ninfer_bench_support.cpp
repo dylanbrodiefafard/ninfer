@@ -63,7 +63,7 @@ int test_cli_contract() {
     int failures = 0;
     const qb::BenchOptions default_options =
         parse_for_test({"ninfer_bench", "--weights", "model.ninfer"});
-    failures += expect_u32(default_options.prefill_chunk, 8192, "default prefill chunk");
+    failures += expect_u32(default_options.prefill_chunk, 4096, "default prefill chunk");
     const qb::BenchOptions parsed = parse_for_test({
         "ninfer_bench",
         "--weights",
@@ -242,15 +242,17 @@ ninfer::SpeculativeStats speculative(std::uint64_t rounds, std::uint64_t drafted
 std::vector<qb::TestResult> sample_results() {
     qb::TestResult pp;
     pp.test = {qb::TestKind::Prefill, 512, 0, "pp512"};
-    pp.reps = {{timings(0.01, 0.5, 0.0, 0.52), speculative(0, 0, 0, 0, {0, 0, 0, 0, 0}), 1},
-               {timings(0.02, 0.25, 0.0, 0.28), speculative(0, 0, 0, 0, {0, 0, 0, 0, 0}), 1}};
+    pp.reps = {
+        {timings(0.01, 0.5, 0.0, 0.52), speculative(0, 0, 0, 0, {0, 0, 0, 0, 0}), 1, 0.52},
+        {timings(0.02, 0.25, 0.0, 0.28), speculative(0, 0, 0, 0, {0, 0, 0, 0, 0}), 1, 0.28}};
     pp.workspace_peak_bytes           = 5ULL * 1024ULL * 1024ULL * 1024ULL;
     pp.workspace_allocator_peak_bytes = 4ULL * 1024ULL * 1024ULL;
 
     qb::TestResult tg;
     tg.test = {qb::TestKind::Decode, 0, 3, "tg3"};
-    tg.reps = {{timings(0.01, 0.1, 0.5, 0.62), speculative(1, 5, 5, 0, {1, 1, 1, 1, 1}), 4},
-               {timings(0.02, 0.1, 1.0, 1.13), speculative(0, 0, 0, 3, {0, 0, 0, 0, 0}), 4}};
+    tg.reps = {
+        {timings(0.01, 0.1, 0.5, 0.62), speculative(1, 5, 5, 0, {1, 1, 1, 1, 1}), 4, 0.62},
+        {timings(0.02, 0.1, 1.0, 1.13), speculative(0, 0, 0, 3, {0, 0, 0, 0, 0}), 4, 1.13}};
     tg.workspace_peak_bytes           = 1024ULL * 1024ULL;
     tg.workspace_allocator_peak_bytes = 512ULL * 1024ULL;
     return {std::move(pp), std::move(tg)};
@@ -311,7 +313,7 @@ int test_report_contract() {
         return fail(std::string("invalid benchmark JSON: ") + error.what());
     }
 
-    failures += expect(report.at("schema_version") == 13, "report schema v13");
+    failures += expect(report.at("schema_version") == 14, "report schema v14");
     failures += expect(report.at("artifact_type") == "ninfer_bench_report", "report identity");
     failures += expect(report.at("artifact").at("path") == "model.ninfer", "artifact path");
     failures += expect(report.at("load").at("target") == "qwen3_6_27b", "load target");
@@ -338,7 +340,10 @@ int test_report_contract() {
     const Json& pp = report.at("tests").at(0);
     failures +=
         expect(pp.at("kind") == "pp" && pp.at("requested_output_tokens") == 1, "pp request shape");
-    failures += expect_near(pp.at("prefill_tok_s_mean").get<double>(), 1536.0, "pp throughput");
+    failures += expect_near(pp.at("prefill_tok_s_mean").get<double>(), 1406.5934065934,
+                            "pp wave throughput");
+    failures += expect_near(pp.at("prefill_active_tok_s_mean").get<double>(), 1536.0,
+                            "pp active throughput");
     failures += expect(pp.at("decode_output_tok_s_mean").is_null(), "pp decode is null");
     failures += expect(pp.at("workspace_peak_bytes") == 5ULL * 1024ULL * 1024ULL * 1024ULL,
                        "pp workspace peak");
@@ -359,6 +364,18 @@ int test_report_contract() {
     const qb::Stats concurrent_engine       = qb::compute_stats(qb::decode_engine_tok_s_series(concurrent));
     failures += expect_near(concurrent_output.mean, 9.0, "C=2 decode output throughput");
     failures += expect_near(concurrent_engine.mean, 7.5, "C=2 decode engine throughput is not doubled");
+
+    qb::TestResult concurrent_pp = sample_results()[0];
+    concurrent_pp.concurrency    = 2;
+    for (qb::RepTiming& rep : concurrent_pp.reps) { rep.wave_seconds *= 2.0; }
+    const qb::Stats concurrent_prefill =
+        qb::compute_stats(qb::prefill_tok_s_series(concurrent_pp));
+    const qb::Stats concurrent_prefill_active =
+        qb::compute_stats(qb::prefill_active_tok_s_series(concurrent_pp));
+    failures += expect_near(concurrent_prefill.mean, 1406.5934065934,
+                            "C=2 prefill throughput uses serialized wave time");
+    failures += expect_near(concurrent_prefill_active.mean, 1536.0,
+                            "C=2 active prefill rate is not multiplied by lanes");
 
     failures += expect(tg.at("speculative").at("rounds") == 1, "speculative rounds");
     failures += expect(tg.at("speculative").at("fallback_steps") == 3, "speculative fallbacks");
@@ -397,11 +414,23 @@ int test_human_and_csv_reports() {
          {"proposal_head", "kv_payload_bytes", "load_host_to_device_bytes",
           "request_transient_capacity_bytes", "cuda_graph_allowance_bytes", "workspace_peak_bytes",
           "workspace_allocator_peak_bytes", "spec_acceptance_rate", "decode_output_tok_s_mean",
-          "decode_engine_tok_s_mean", "total_seconds_mean"}) {
+          "decode_engine_tok_s_mean", "prefill_active_tok_s_mean", "total_seconds_mean",
+          "wave_seconds_mean"}) {
         failures += expect(csv.find(field) != std::string::npos,
                            std::string("CSV field ") + std::string(field));
     }
     failures += expect(std::count(csv.begin(), csv.end(), '\n') == 3, "CSV header plus two rows");
+    const std::size_t header_end = csv.find('\n');
+    const std::size_t row_end    = csv.find('\n', header_end + 1);
+    failures += expect(header_end != std::string::npos && row_end != std::string::npos,
+                       "CSV contains header and data row");
+    if (header_end != std::string::npos && row_end != std::string::npos) {
+        const std::string_view header(csv.data(), header_end);
+        const std::string_view row(csv.data() + header_end + 1, row_end - header_end - 1);
+        failures += expect(std::count(header.begin(), header.end(), ',') ==
+                               std::count(row.begin(), row.end(), ','),
+                           "CSV header and row field counts match");
+    }
     return failures;
 }
 

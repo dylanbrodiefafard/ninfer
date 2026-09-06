@@ -5,12 +5,12 @@ import json
 from tools.bench.run_ninfer_bench_matrix import BenchCase, report_rows
 
 
-def test_schema_v12_report_is_flattened_for_matrix_summary(tmp_path) -> None:
+def test_schema_v14_report_is_flattened_for_matrix_summary(tmp_path) -> None:
     report_path = tmp_path / "report.json"
     report_path.write_text(
         json.dumps(
             {
-                "schema_version": 12,
+                "schema_version": 14,
                 "artifact_type": "ninfer_bench_report",
                 "tool": "ninfer_bench",
                 "artifact": {"path": "model.ninfer"},
@@ -37,7 +37,9 @@ def test_schema_v12_report_is_flattened_for_matrix_summary(tmp_path) -> None:
                     "max_context": 4096,
                     "prefill_chunk": 1024,
                     "kv_cache": "int8-group64",
-                    "mtp_draft_tokens": 5,
+                    "spec": "mtp",
+                    "draft_tokens": 5,
+                    "dflash_verify_width": 0,
                     "proposal_head": "optimized",
                     "decode_path": "cuda-graph",
                     "decode_graph_prime": {"primed": True, "output_tokens": 13},
@@ -55,7 +57,9 @@ def test_schema_v12_report_is_flattened_for_matrix_summary(tmp_path) -> None:
                         "workspace_allocator_peak_bytes": 524_288,
                         "decode_output_tok_s_mean": 4.5,
                         "decode_engine_tok_s_mean": 7.5,
+                        "prefill_active_tok_s_mean": None,
                         "total_seconds_mean": 0.875,
+                        "wave_seconds_mean": 0.875,
                         "speculative": {
                             "acceptance_rate": 1.0,
                             "acceptance_length": 5.0,
@@ -103,7 +107,10 @@ def test_schema_v12_report_is_flattened_for_matrix_summary(tmp_path) -> None:
     assert row["cuda_graph_allowance_bytes"] == 150_000_000
     assert row["workspace_peak_bytes"] == 1_048_576
     assert row["workspace_allocator_peak_bytes"] == 524_288
+    assert (row["spec"], row["draft_tokens"], row["dflash_verify_width"]) == ("mtp", 5, 0)
+    assert row["prefill_active_tok_s_mean"] is None
     assert row["decode_output_tok_s_mean"] == 4.5
     assert row["decode_engine_tok_s_mean"] == 7.5
+    assert row["wave_seconds_mean"] == 0.875
     assert row["spec_fallback_steps"] == 3
     assert row["spec_accepted_per_position"] == "[1,1,1,1,1]"

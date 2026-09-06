@@ -109,13 +109,15 @@ Use `--resume` to skip completed JSON reports in an existing `--output-dir`, and
 for a minimal script/runner check. `--no-build` uses the binary supplied by `--bench` without
 building it.
 
-Each raw report must be `ninfer_bench_report` schema v12. The flattened summary and schema-v3 matrix
+Each raw report must be `ninfer_bench_report` schema v14. The flattened summary and schema-v3 matrix
 manifest carry native names from the report: selected target, canonical `weights_id`, artifact,
 load/read/upload/staging values, Engine memory arenas including request transient and CUDA Graph
 allowance, per-test planned logical and allocator-observed workspace peaks, KV capacity and
-payload, configured proposal head and graph mode, phase timings and throughput, and speculative
-rounds/drafts/acceptance/fallbacks. The matrix manifest is descriptive and records the commands and
-selected local inputs; it does not make repository state part of report validity.
+payload, configured proposal head and graph mode, phase timings and throughput, complete-wave wall
+time, and speculative rounds/drafts/acceptance/fallbacks. Pure-prefill throughput is total prompt
+tokens over complete-wave wall time; `prefill_active_tok_s` separately reports the slowest lane's
+active prefill rate. The matrix manifest is descriptive and records the commands and selected local
+inputs; it does not make repository state part of report validity.
 
 `run_serve_corpus.py` runs both registered targets and both published MTP0/MTP3 suites when both
 artifacts are supplied. Pass one `--artifact` to select a single target and `--mode mtp0` or
@@ -276,4 +278,3 @@ length (150k/200k pass), so this is sampling variance over the strict needle, no
 monotonic long-context recall loss — but the occasional 128k value truncation is the one
 signal worth tracking as the approximate-attention (sage / nvfp4s3) arc proceeds. For a
 stable green gate use the default 8k+64k spine; treat matrix cells with `--runs`.
-

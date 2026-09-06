@@ -40,7 +40,7 @@ CONTEXT_CORE = ((512, 512), (2048, 512), (8192, 512))
 CONTEXT_FULL_EXTRA = ((32768, 256), (65536, 128))
 PRIMARY_KS = (0, 3, 5)
 SWEEP_KS = (0, 1, 2, 3, 4, 5)
-REPORT_SCHEMA_VERSION = 12
+REPORT_SCHEMA_VERSION = 14
 REPORT_ARTIFACT_TYPE = "ninfer_bench_report"
 REPORT_TOOL = "ninfer_bench"
 
@@ -315,6 +315,8 @@ def report_rows(report_path: Path, case: BenchCase) -> list[dict[str, Any]]:
             "workspace_allocator_peak_bytes": test.get("workspace_allocator_peak_bytes"),
             "prefill_tok_s_mean": test.get("prefill_tok_s_mean"),
             "prefill_tok_s_stddev": test.get("prefill_tok_s_stddev"),
+            "prefill_active_tok_s_mean": test.get("prefill_active_tok_s_mean"),
+            "prefill_active_tok_s_stddev": test.get("prefill_active_tok_s_stddev"),
             "decode_output_tok_s_mean": test.get("decode_output_tok_s_mean"),
             "decode_output_tok_s_stddev": test.get("decode_output_tok_s_stddev"),
             "decode_engine_tok_s_mean": test.get("decode_engine_tok_s_mean"),
@@ -323,6 +325,7 @@ def report_rows(report_path: Path, case: BenchCase) -> list[dict[str, Any]]:
             "prefill_seconds_mean": test.get("prefill_seconds_mean"),
             "decode_seconds_mean": test.get("decode_seconds_mean"),
             "total_seconds_mean": test.get("total_seconds_mean"),
+            "wave_seconds_mean": test.get("wave_seconds_mean"),
             "spec_acceptance_rate": speculative.get("acceptance_rate"),
             "spec_acceptance_length": speculative.get("acceptance_length"),
             "spec_rounds": speculative.get("rounds"),

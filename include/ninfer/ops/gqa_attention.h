@@ -112,8 +112,9 @@ gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
  * Prefill tile-skip on exact NVFP4 (Prompt route, T>6): keep_frac in (0,1] is Sparge meansim
  * (1.0 = dense). xattn_tau in (0,1] is XAttention mass threshold (1.0 = dense). The two are
  * mutually exclusive when both are < 1. Both require NVFP4 without sage_pv. SmallT/cached
- * routes ignore skip flags. dump is a test side-band (keep_list / tile_count); production
- * passes nullptr.
+ * routes ignore skip flags. XAttention stays dense while the maximum visible length is at or
+ * below xattn_min_len. dump is a test side-band (keep_list / tile_count); production passes
+ * nullptr.
  *
  * Packed-tree verify is off when ancestor_mask and prefix_lengths are empty. When both are
  * populated, A1 still writes K/V at positions[j,b] but query j attends key x iff x <=

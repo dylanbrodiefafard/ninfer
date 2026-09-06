@@ -255,8 +255,11 @@ int main(int argc, char** argv) {
                 const Tensor empty;
                 const GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(context),
                                                     static_cast<std::uint32_t>(context)};
+                const bool xattn_active =
+                    xattn_tau < 1.0f && context > xattn_min_len;
                 const std::size_t workspace_bytes = gqa_attention_workspace_capacity_bytes(
-                    kQHeads, DType::U8, envelope, 1, width, width, keep_frac, false, xattn_tau);
+                    kQHeads, DType::U8, envelope, 1, width, width, keep_frac, false,
+                    xattn_active ? xattn_tau : 1.0f);
                 WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 1));
                 auto op_launch = [&](cudaStream_t s) {
                     gqa_attention(q_t, k_t, v_t, pos_q_t, empty, table_rows, kScale,
@@ -270,7 +273,7 @@ int main(int argc, char** argv) {
 
                 int keep_n = 0;
                 int keep_d = 0;
-                if (keep_frac < 1.0f || xattn_tau < 1.0f) {
+                if (keep_frac < 1.0f || xattn_active) {
                     const int max_tiles = (context + kPageSize - 1) / kPageSize;
                     DeviceBuffer dkeep(static_cast<std::size_t>(kQHeads) * max_tiles *
                                        sizeof(std::int32_t));

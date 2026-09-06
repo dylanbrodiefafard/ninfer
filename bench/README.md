@@ -23,7 +23,8 @@ loop and does not call target implementation interfaces.
 The matrix contains three independently measured test kinds:
 
 - `pp{P}` prepares `P` tokens and requests one output token. This is the smallest request that runs
-  the model; `prefill t/s` is `P / GenerationTimings.prefill_seconds`.
+  the model. `prefill t/s` is total prompt tokens divided by complete request-wave wall time;
+  `active pp t/s` is `P / max(GenerationTimings.prefill_seconds)` and excludes scheduler queueing.
 - `tg{G}` prepares a one-token seed outside the reported phase and requests `G+1` output tokens.
   The begin-round token belongs to prefill, leaving exactly `G` tokens in the reported decode
   phase.
@@ -36,7 +37,9 @@ is enabled and the matrix contains decode work, one ordinary public generation r
 decode graph before warmups and measured repetitions. `--concurrency N` also primes the N-lane
 decode graph.
 
-`--concurrency N` (1–4) sizes the Engine for N active lanes. Decode throughput is aggregate:
+`--concurrency N` (1–4) sizes the Engine for N active lanes. Pure-prefill throughput is aggregate
+`N * P / wave_seconds`; because the Engine permits one prefill owner, it measures a serialized
+request wave rather than N simultaneous prefill kernels. Decode throughput is aggregate:
 `N * G / max(decode_seconds)` across lanes. For `pp+tg` at `N>1`, each lane first completes a
 sequential one-token seed with prefix reuse enabled, then the measured step overlaps the
 continuations. That isolates batched decode from the scheduler's prefill/decode interleave. C>1

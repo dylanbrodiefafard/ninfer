@@ -280,7 +280,8 @@ std::string usage_text(std::string_view program) {
     if (program.empty()) { program = "ninfer_bench"; }
     std::ostringstream out;
     out << "Usage: " << program << " --weights <artifact.ninfer> [options]\n\n"
-        << "Product-route throughput benchmark over ninfer::Engine. pp measures Engine prefill;\n"
+        << "Product-route throughput benchmark over ninfer::Engine. pp throughput is aggregate\n"
+        << "prompt tokens over request-wave wall time; active pp throughput excludes queueing.\n"
         << "tg measures G generated tokens after an untimed one-token seed prefill.\n\n"
         << "Options:\n"
         << "  --weights <path>            required .ninfer artifact\n"
@@ -595,8 +596,23 @@ std::vector<double> prefill_tok_s_series(const TestResult& result) {
     std::vector<double> out;
     if (!result.test.has_prefill()) { return out; }
     for (const RepTiming& rep : result.reps) {
-        if (rep.timings.prefill_seconds > 0.0) {
+        const double seconds = result.test.kind == TestKind::Prefill
+                                   ? rep.wave_seconds
+                                   : rep.timings.prefill_seconds;
+        if (seconds > 0.0) {
             out.push_back(static_cast<double>(result.test.n_prompt) * result.concurrency /
+                          seconds);
+        }
+    }
+    return out;
+}
+
+std::vector<double> prefill_active_tok_s_series(const TestResult& result) {
+    std::vector<double> out;
+    if (!result.test.has_prefill()) { return out; }
+    for (const RepTiming& rep : result.reps) {
+        if (rep.timings.prefill_seconds > 0.0) {
+            out.push_back(static_cast<double>(result.test.n_prompt) /
                           rep.timings.prefill_seconds);
         }
     }
@@ -653,6 +669,13 @@ std::vector<double> total_time_series(const TestResult& result) {
     return timing_series<&GenerationTimings::total_seconds>(result);
 }
 
+std::vector<double> wave_time_series(const TestResult& result) {
+    std::vector<double> out;
+    out.reserve(result.reps.size());
+    for (const RepTiming& rep : result.reps) { out.push_back(rep.wave_seconds); }
+    return out;
+}
+
 std::string format_table(const BenchEnvironment& env, const std::vector<TestResult>& results) {
     std::ostringstream out;
     out << "ninfer_bench product throughput report\n"
@@ -688,10 +711,10 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
                 : "n/a")
         << " repetitions=" << env.repetitions << " warmup=" << env.warmup << "\n\n";
 
-    constexpr std::size_t cols                   = 9;
+    constexpr std::size_t cols                   = 10;
     const std::array<std::string, cols> headings = {
-        "test",           "n_prompt", "n_gen",         "prefill t/s", "decode out t/s",
-        "decode eng t/s", "spec acc", "spec round/fb", "work peak"};
+        "test",           "n_prompt", "n_gen",         "prefill t/s", "active pp t/s",
+        "decode out t/s", "decode eng t/s", "spec acc", "spec round/fb", "work peak"};
     std::vector<std::array<std::string, cols>> rows;
     for (const TestResult& result : results) {
         const SpeculativeStats spec  = aggregate_speculative(result);
@@ -704,6 +727,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
                          : "n/a";
         rows.push_back({result.test.label, std::to_string(result.test.n_prompt),
                         std::to_string(result.test.n_gen), rate_cell(prefill_tok_s_series(result)),
+                        rate_cell(prefill_active_tok_s_series(result)),
                         rate_cell(decode_output_tok_s_series(result)),
                         rate_cell(decode_engine_tok_s_series(result)), acceptance, rounds,
                         format_bytes(result.workspace_peak_bytes)});
@@ -821,6 +845,8 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
             << ",\n";
         append_stat(out, "prefill_tok_s", prefill_tok_s_series(result), "      ");
         out << ",\n";
+        append_stat(out, "prefill_active_tok_s", prefill_active_tok_s_series(result), "      ");
+        out << ",\n";
         append_stat(out, "decode_output_tok_s", decode_output_tok_s_series(result), "      ");
         out << ",\n";
         append_stat(out, "decode_engine_tok_s", decode_engine_tok_s_series(result), "      ");
@@ -832,6 +858,8 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         append_stat(out, "decode_seconds", decode_time_series(result), "      ");
         out << ",\n";
         append_stat(out, "total_seconds", total_time_series(result), "      ");
+        out << ",\n";
+        append_stat(out, "wave_seconds", wave_time_series(result), "      ");
         out << ",\n      \"workspace_peak_bytes\": " << result.workspace_peak_bytes
             << ",\n      \"workspace_allocator_peak_bytes\": "
             << result.workspace_allocator_peak_bytes << ",\n";
@@ -846,7 +874,8 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
                 << "          \"decode_engine_tokens\": "
                 << (result.test.has_decode() ? std::to_string(decode_engine_tokens(result, rep))
                                              : "null")
-                << ",\n";
+                << ",\n"
+                << "          \"wave_seconds\": " << number(rep.wave_seconds) << ",\n";
             append_timings_json(out, rep.timings, "          ");
             out << ",\n";
             append_speculative_json(out, rep.speculative, "          ");
@@ -860,15 +889,18 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
 
 std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult>& results) {
     std::ostringstream out;
-    out << "label,kind,n_prompt,n_gen,target,weights_id,max_context,prefill_chunk,mtp_draft_tokens,"
-           "proposal_head,decode_path,kv_cache,kv_payload_bytes,load_host_to_device_bytes,"
+    out << "label,kind,n_prompt,n_gen,target,weights_id,max_context,prefill_chunk,"
+           "speculative_backend,draft_tokens,dflash_verify_width,proposal_head,decode_path,"
+           "kv_cache,kv_payload_bytes,load_host_to_device_bytes,"
            "weights_capacity_bytes,sequence_capacity_bytes,workspace_capacity_bytes,"
            "request_transient_capacity_bytes,cuda_graph_allowance_bytes,"
            "workspace_peak_bytes,workspace_allocator_peak_bytes,"
            "spec_rounds,spec_fallback_steps,spec_acceptance_rate,"
-           "repetitions,prefill_tok_s_mean,prefill_tok_s_stddev,decode_output_tok_s_mean,"
+           "repetitions,prefill_tok_s_mean,prefill_tok_s_stddev,prefill_active_tok_s_mean,"
+           "prefill_active_tok_s_stddev,decode_output_tok_s_mean,"
            "decode_output_tok_s_stddev,decode_engine_tok_s_mean,decode_engine_tok_s_stddev,"
-           "prepare_seconds_mean,prefill_seconds_mean,decode_seconds_mean,total_seconds_mean\n";
+           "prepare_seconds_mean,prefill_seconds_mean,decode_seconds_mean,total_seconds_mean,"
+           "wave_seconds_mean\n";
     const auto mean = [](const std::vector<double>& values) {
         return values.empty() ? std::string() : number(compute_stats(values).mean);
     };
@@ -898,12 +930,15 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
             << result.workspace_allocator_peak_bytes << ',' << spec.rounds << ','
             << spec.fallback_steps << ',' << acceptance << ',' << result.reps.size() << ','
             << mean(prefill_tok_s_series(result)) << ',' << stddev(prefill_tok_s_series(result))
+            << ',' << mean(prefill_active_tok_s_series(result)) << ','
+            << stddev(prefill_active_tok_s_series(result))
             << ',' << mean(decode_output_tok_s_series(result)) << ','
             << stddev(decode_output_tok_s_series(result)) << ','
             << mean(decode_engine_tok_s_series(result)) << ','
             << stddev(decode_engine_tok_s_series(result)) << ','
             << mean(prepare_time_series(result)) << ',' << mean(prefill_time_series(result)) << ','
-            << mean(decode_time_series(result)) << ',' << mean(total_time_series(result)) << '\n';
+            << mean(decode_time_series(result)) << ',' << mean(total_time_series(result)) << ','
+            << mean(wave_time_series(result)) << '\n';
     }
     return out.str();
 }

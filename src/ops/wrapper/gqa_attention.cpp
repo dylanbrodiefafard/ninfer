@@ -551,7 +551,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     }
     void* xattn_scratch = nullptr;
     if (xattn_tau < 1.0f && cache.dtype == DType::U8 &&
-        envelope.max_visible_keys >= static_cast<std::uint32_t>(xattn_min_len)) {
+        envelope.max_visible_keys > static_cast<std::uint32_t>(xattn_min_len)) {
         const int n_br = div_up(width, kGqaXattnPrefillBr);
         const int n_kb = gqa_xattn_n_kb(static_cast<int>(cache.block_tables.ne[0]),
                                         envelope.max_visible_keys);

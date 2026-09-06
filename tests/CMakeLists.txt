@@ -302,6 +302,9 @@ endforeach()
 ninfer_add_op_test(ninfer_gqa_attention_test
   SOURCES ops/test_gqa_attention.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_gqa_xattn_sort_test
+  SOURCES ops/test_gqa_xattn_sort.cu
+  LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_bidirectional_gqa_attention_test
   SOURCES ops/test_bidirectional_gqa_attention.cpp
   LIBRARIES ninfer_ops)
