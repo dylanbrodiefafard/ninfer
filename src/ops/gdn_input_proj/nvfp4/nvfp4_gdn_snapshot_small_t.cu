@@ -187,10 +187,11 @@ void launch_triple_record(const Tensor& x, const Weight& weight, const Tensor& c
 }
 
 // Packed snapshot T=2..16 GDN conv uses the SmallT production schedule (token-parallel
-// GEMM) with FP32 projected-conv in the epilogue. Record B=1 retains the fused T=1
-// GEMV+conv route; qualified B>1 W=2/5 shapes use grouped weight-replay projection
-// (pairs, plus a direct W=5 triple at B=3) and separate FP32 conv. Convolution history
-// rounds through BF16 at every column, matching the T=1 route.
+// GEMM) with FP32 projected-conv in the epilogue. Record B=1 W=4 uses fused SmallT;
+// B=1 W=5/6 and qualified B>1 W=2/5 shapes use grouped weight-replay projection
+// (single request, pairs, plus a direct W=5 triple at B=3) and separate FP32 conv.
+// Other B=1 widths retain the fused T=1 GEMV+conv route. Convolution history rounds
+// through BF16 at every column, matching it.
 template <int ActiveTokens, bool Tree, class Publish>
 void launch_exact(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
                   const Tensor& conv_states, const Tensor& valid_columns,
@@ -271,6 +272,21 @@ void launch_record_exact(const Tensor& x, const Weight& weight, const Tensor& co
     const RecordColumnPublish publish{static_cast<__nv_bfloat16*>(conv_record.data),
                                       kNvfp4GdnChannels, ActiveTokens};
     if (nvfp4_gdn_record_uses_grouped_replay(ActiveTokens, x.ne[2])) {
+        if constexpr (ActiveTokens == 5 || ActiveTokens == 6) {
+            if (x.ne[2] == 1) {
+                if (parent_index == nullptr) {
+                    launch_grouped_record<ActiveTokens, 1, false>(
+                        x, weight, conv_weight, conv_states, valid_columns, initial_slot,
+                        conv_record, query, key, value, z, publish, workspace, stream, nullptr);
+                } else {
+                    launch_grouped_record<ActiveTokens, 1, true>(
+                        x, weight, conv_weight, conv_states, valid_columns, initial_slot,
+                        conv_record, query, key, value, z, publish, workspace, stream,
+                        parent_index);
+                }
+                return;
+            }
+        }
         if (parent_index == nullptr) {
             if constexpr (ActiveTokens == 5) {
                 if (x.ne[2] == 3) {

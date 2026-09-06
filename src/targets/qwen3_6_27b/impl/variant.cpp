@@ -114,10 +114,10 @@ ops::LinearPolicy residual_packed_policy(const Weight& weight, qwen3_6::TextPhas
 
 constexpr std::size_t kMinimumLeafWorkspaceBytes = 1;
 
-// NVFP4 packed verify T=2..16 uses the fused T=1-reduction route at B=1. Qualified
-// B=2..4 W=2/5 shapes group requests per weight pass (including the direct W=5,
-// B=3 group) and keep the projection in private FP32 workspace; the other widths
-// retain request-indexed CTAs.
+// NVFP4 packed verify B=1 W=4 uses fused SmallT. B=1 W=5/6 and qualified B=2..4
+// W=2/5 shapes group requests per weight pass (including the direct W=5, B=3 group)
+// and keep the projection in private FP32 workspace. Other B=1 widths retain the
+// fused T=1-reduction route; the other B>1 widths retain request-indexed CTAs.
 std::size_t nvfp4_gdn_record_leaf_bytes(std::int32_t batch, std::int32_t min_width,
                                         std::int32_t max_width) {
     return std::max(kMinimumLeafWorkspaceBytes,

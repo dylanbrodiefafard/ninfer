@@ -1,5 +1,6 @@
 #include "ninfer/ops/gdn_input_proj.h"
 
+#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
 #include "ops/input_projection_test_common.h"
 
 #include <cuda_runtime.h>
@@ -500,7 +501,11 @@ int run_nvfp4() {
             seed);
     };
     failures += run(2, 1, {}, ops::LinearPolicy::A16Only, 1611U);
-    failures += run(16, 1, {11}, ops::LinearPolicy::A16Only, 1621U);
+    failures += run(5, 1, {}, ops::LinearPolicy::A16Only, 1617U);
+    failures += run(5, 1, {3}, ops::LinearPolicy::AllowA4, 1619U);
+    failures += run(6, 1, {}, ops::LinearPolicy::A16Only, 1620U);
+    failures += run(6, 1, {4}, ops::LinearPolicy::AllowA4, 1621U);
+    failures += run(16, 1, {11}, ops::LinearPolicy::A16Only, 1623U);
     failures += run(3, 1, {2}, ops::LinearPolicy::AllowA4, 1631U);
     failures += run(4, 1, {}, ops::LinearPolicy::AllowA4, 1641U);
     failures += run(16, 1, {13}, ops::LinearPolicy::AllowA4, 1651U);
@@ -988,6 +993,12 @@ int run_nvfp4_batched_matches_serial_fused() {
         GuardedBf16Tensor serial_v(kValueRows, aggregate);
         GuardedBf16Tensor serial_z(kZRows, aggregate);
         GuardedBf16Tensor serial_record(kChannels, aggregate);
+        GuardedBf16Tensor legacy_q(kQueryRows, aggregate);
+        GuardedBf16Tensor legacy_k(kKeyRows, aggregate);
+        GuardedBf16Tensor legacy_v(kValueRows, aggregate);
+        GuardedBf16Tensor legacy_z(kZRows, aggregate);
+        GuardedBf16Tensor legacy_record(kChannels, aggregate);
+        DeviceBuffer legacy_state = to_device(state_before);
 
         Tensor x(device_x.p, DType::BF16, {kHidden, width, batch});
         Tensor conv(device_conv_weight.p, DType::BF16, {kChannels, 4});
@@ -1010,6 +1021,12 @@ int run_nvfp4_batched_matches_serial_fused() {
         Tensor sv(serial_v.data(), DType::BF16, {kValueRows, width, batch});
         Tensor sz(serial_z.data(), DType::BF16, {kZRows, width, batch});
         Tensor sr(serial_record.data(), DType::BF16, {kChannels, width, batch});
+        Tensor legacy_state_view(legacy_state.p, DType::BF16, {kChannels, 3, slots});
+        Tensor lq(legacy_q.data(), DType::BF16, {kQueryRows, width, batch});
+        Tensor lk(legacy_k.data(), DType::BF16, {kKeyRows, width, batch});
+        Tensor lv(legacy_v.data(), DType::BF16, {kValueRows, width, batch});
+        Tensor lz(legacy_z.data(), DType::BF16, {kZRows, width, batch});
+        Tensor lr(legacy_record.data(), DType::BF16, {kChannels, width, batch});
 
         const std::size_t rec_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
             QType::NVFP4, kRows, kHidden, ops::LinearPolicy::AllowA4, batch, width, width);
@@ -1018,6 +1035,13 @@ int run_nvfp4_batched_matches_serial_fused() {
                                         br, bq, bk, bv, bz, ops::LinearPolicy::AllowA4, batched_ws,
                                         nullptr,
                                         parent_indices.empty() ? nullptr : &parent_index);
+        if (width == 4 || width == 5 || width == 6) {
+            ops::detail::nvfp4_gdn_record_t1_fused_launch(
+                x, parent.view(), conv, legacy_state_view, valid, initial, lr, lq, lk, lv, lz,
+                nullptr, parent_indices.empty() ? nullptr
+                                                : static_cast<const std::int32_t*>(
+                                                      parent_index.data));
+        }
         const std::size_t serial_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
             QType::NVFP4, kRows, kHidden, ops::LinearPolicy::AllowA4, 1, width, width);
         WorkspaceArena serial_ws(std::max<std::size_t>(256, serial_bytes));
@@ -1063,6 +1087,23 @@ int run_nvfp4_batched_matches_serial_fused() {
             label, parent.host, activation, conv_weight_bits, state_before, initial_slots,
             valid_columns, parent_indices, batched_q, batched_k, batched_v, batched_z,
             batched_record, kHidden, kValueRows, width, batch);
+        if (width == 4 || width == 5 || width == 6) {
+            failures += verify_equal(label + " legacy T1 query", batched_q.bits(), legacy_q.bits());
+            failures += verify_equal(label + " legacy T1 key", batched_k.bits(), legacy_k.bits());
+            failures += verify_equal(label + " legacy T1 value", batched_v.bits(), legacy_v.bits());
+            failures += verify_equal(label + " legacy T1 z", batched_z.bits(), legacy_z.bits());
+            failures += verify_valid_record_equal(label + " legacy T1 conv_record",
+                                                  batched_record.bits(), legacy_record.bits(),
+                                                  kChannels, width, batch, valid_columns);
+            failures += verify_equal(label + " legacy T1 source state", state_before,
+                                     from_device<std::uint16_t>(legacy_state,
+                                                                state_before.size()));
+            failures += legacy_q.verify_guards(label + " legacy T1 query");
+            failures += legacy_k.verify_guards(label + " legacy T1 key");
+            failures += legacy_v.verify_guards(label + " legacy T1 value");
+            failures += legacy_z.verify_guards(label + " legacy T1 z");
+            failures += legacy_record.verify_guards(label + " legacy T1 conv_record");
+        }
         failures += batched_q.verify_guards(label + " batched query");
         failures += batched_k.verify_guards(label + " batched key");
         failures += batched_v.verify_guards(label + " batched value");
@@ -1097,7 +1138,19 @@ int run_nvfp4_batched_matches_serial_fused() {
     };
 
     int failures = 0;
-    failures += run_shape(2, 2, {}, {}, 1981U);
+    failures += run_shape(4, 1, {}, {}, 1951U);
+    failures += run_shape(4, 1, {3}, {}, 1957U);
+    failures += run_shape(4, 1, {}, {-1, 0, 0, 1}, 1961U);
+    failures += run_shape(4, 2, {}, {}, 1963U);
+    failures += run_shape(4, 3, {4, 3, 1}, {}, 1967U);
+    failures += run_shape(4, 4, {4, 3, 2, 1},
+                          {-1, 0, 0, 1, -1, 0, 0, 1, -1, 0, 0, 1, -1, 0, 0, 1},
+                          1969U);
+    failures += run_shape(5, 1, {}, {}, 1973U);
+    failures += run_shape(5, 1, {4}, {-1, 0, 0, 1, 2}, 1979U);
+    failures += run_shape(6, 1, {}, {}, 1980U);
+    failures += run_shape(6, 1, {5}, {-1, 0, 0, 1, 2, 3}, 1981U);
+    failures += run_shape(2, 2, {}, {}, 1983U);
     failures += run_shape(2, 3, {}, {}, 1987U);
     failures += run_shape(2, 4, {2, 2, 1, 1}, {}, 1991U);
     failures += run_shape(2, 4, {2, 2, 2, 1}, {-1, 0, -1, 0, -1, 0, -1, 0}, 1997U);
@@ -1120,20 +1173,42 @@ int run_nvfp4_batched_matches_serial_fused() {
 int verify_nvfp4_grouped_workspace_interval() {
     constexpr std::int32_t kParentRows = 16384;
     constexpr std::int32_t kHidden     = 5120;
-    constexpr std::int32_t kBatch      = 3;
-    const auto capacity = [&](std::int32_t first, std::int32_t last) {
+    const auto capacity = [&](std::int32_t batch, std::int32_t first, std::int32_t last) {
         return ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-            QType::NVFP4, kParentRows, kHidden, ops::LinearPolicy::AllowA4, kBatch, first, last);
+            QType::NVFP4, kParentRows, kHidden, ops::LinearPolicy::AllowA4, batch, first, last);
     };
-    const std::size_t width2 = capacity(2, 2);
-    const std::size_t width5 = capacity(5, 5);
+    const std::size_t width2 = capacity(3, 2, 2);
+    const std::size_t width5 = capacity(3, 5, 5);
     int failures             = 0;
-    if (width2 == 0 || width5 <= width2 || capacity(2, 4) != width2 || capacity(3, 4) != 0 ||
-        capacity(5, 16) != width5 || capacity(2, 16) != width5) {
+    if (width2 == 0 || width5 <= width2 || capacity(3, 2, 4) != width2 ||
+        capacity(3, 3, 4) != 0 || capacity(3, 5, 16) != width5 ||
+        capacity(3, 2, 16) != width5 || capacity(2, 4, 4) != 0 ||
+        capacity(3, 4, 4) != 0 || capacity(4, 4, 4) != 0) {
         std::cerr << "NVFP4 grouped record workspace interval is not the minimum high-water\n";
         ++failures;
     }
     return failures;
+}
+
+int verify_nvfp4_b1_grouped_workspace_interval() {
+    constexpr std::int32_t kParentRows = 16384;
+    constexpr std::int32_t kHidden     = 5120;
+    const auto capacity = [&](std::int32_t first, std::int32_t last) {
+        return ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+            QType::NVFP4, kParentRows, kHidden, ops::LinearPolicy::AllowA4, 1, first, last);
+    };
+    const std::size_t width5 = capacity(5, 5);
+    const std::size_t width6 = capacity(6, 6);
+    constexpr std::size_t kExpectedWidth5 = 10240ULL * 5ULL * sizeof(float);
+    constexpr std::size_t kExpectedWidth6 = 10240ULL * 6ULL * sizeof(float);
+    if (width5 != kExpectedWidth5 || width6 != kExpectedWidth6 || width6 <= width5 ||
+        capacity(2, 4) != 0 || capacity(4, 5) != width5 ||
+        capacity(4, 16) != width6 || capacity(5, 16) != width6 ||
+        capacity(6, 16) != width6 || capacity(2, 16) != width6 || capacity(7, 16) != 0) {
+        std::cerr << "NVFP4 B=1 grouped record workspace interval is not the minimum high-water\n";
+        return 1;
+    }
+    return 0;
 }
 
 } // namespace
@@ -1154,6 +1229,7 @@ int main() {
     failures += run_nvfp4_tree_chain_matches_sequential_fused();
     failures += run_nvfp4_batched_matches_serial_fused();
     failures += verify_nvfp4_grouped_workspace_interval();
+    failures += verify_nvfp4_b1_grouped_workspace_interval();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_record\n";
     return failures == 0 ? 0 : 1;
 }
