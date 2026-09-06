@@ -826,17 +826,18 @@ post-`a39c5c25` shape baseline.
 | Mode | Draft k / verify W | Decode tok/s | Latest incremental gain |
 |---|---:|---:|---:|
 | DFlash | 3 / 4 | **112.52** | — |
-| DFlash | 4 / 5 | **114.95** | **+1.18%** |
-| DFlash | 5 / 6 | **91.84** | **+1.09%** |
+| DFlash | 4 / 5 | **115.45** | **+0.42%** |
+| DFlash | 5 / 6 | **92.17** | **+0.41%** |
 | MTP | 3 / 4 | 150.83 | — |
 | MTP | 4 / 5 | 117.46 | — |
 | MTP | 5 / 6 | 116.35 | — |
 
-The latest gain removes multi-request address work from the single-request W=5/6 GDN record path;
-its projection falls 4.78% in the production node trace while preserving the qualified reduction
-and FP32/BF16 state boundaries. C=2/3/4 changes by -0.11%/+0.01%/+0.09%, all noise-level with
-identical speculative work. The preceding selector rewrite is also not a C=1 tradeoff: matched
-DFlash k=4 aggregate throughput rises
+The latest gain specializes the exact W=5/6 BF16 GDN control projection, reducing its register
+count from 54 to 40 and its production latency by 22.0%/25.6%. Two opposite-order ten-run pairs,
+which bracketed clock drift, independently averaged +0.29%/+0.44% at DFlash k=4/5. All matched
+runs preserved exact speculative work. The preceding single-request GDN record change improved
+k=4/5 by 1.18%/1.09%; its C=2/3/4 changes were noise-level. The selector rewrite is also not a
+C=1 tradeoff: matched DFlash k=4 aggregate throughput rises
 156.86 to 157.89 tok/s at C=2 (+0.65%) and 178.49 to 180.11 tok/s at C=4 (+0.91%). Rounds,
 drafts, accepts, fallback counts, and accepted-token counts at every draft position are identical
 for every matched pair.
