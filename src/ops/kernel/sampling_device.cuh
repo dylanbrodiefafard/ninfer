@@ -125,6 +125,10 @@ __device__ __forceinline__ bool sampling_p_less_in_domain(int v, std::int32_t vo
     return v >= 0 && v < vocab && !sampling_token_suppressed(v, cfg);
 }
 
+__device__ __forceinline__ bool sampling_p_less_cycle_excluded(int v, const SamplingConfig& cfg) {
+    return cfg.typical_exclude >= 0 && v == cfg.typical_exclude;
+}
+
 // A missed inverse-CDF or a dirty workspace can yield INT_MAX / a padding row.
 // Counting that id would write past token_counts and poison later rounds.
 __device__ __forceinline__ int sampling_clamp_token(int token, int fallback, std::int32_t vocab) {
@@ -214,6 +218,20 @@ sampling_block_max_key_broadcast(unsigned long long key, unsigned long long* war
     return warp_keys[0];
 }
 
+// Block-wide top-2 of (local_best, local_second) keys. Unique sort keys; 0 is empty.
+__device__ inline void sampling_block_top2_keys(unsigned long long local_best,
+                                                unsigned long long local_second,
+                                                unsigned long long* warp_keys,
+                                                unsigned long long& out_best,
+                                                unsigned long long& out_second) {
+    const unsigned long long best = sampling_block_max_key_broadcast(local_best, warp_keys);
+    unsigned long long cand       = 0ull;
+    if (local_best != best) { cand = local_best; }
+    if (local_second > cand) { cand = local_second; }
+    out_second = sampling_block_max_key_broadcast(cand, warp_keys);
+    out_best   = best;
+}
+
 __device__ inline void sampling_block_inclusive_scan(float* shared) {
     const int tid = threadIdx.x;
     for (int offset = 1; offset < blockDim.x; offset <<= 1) {
@@ -229,14 +247,17 @@ __device__ inline void sampling_block_inclusive_scan(float* shared) {
 // the block must call. Penalties are not applied. red_idx[0] remains the min
 // argmax; red_val[0] is sum_exp and red_aux[0] is sum_exp2.
 struct SamplingPLessMoments {
-    float m        = 0.0f;
-    float sum_exp  = 0.0f;
-    float sum_exp2 = 0.0f;
-    int argmax     = 0;
+    float m                       = 0.0f;
+    float sum_exp                 = 0.0f;
+    float sum_exp2                = 0.0f;
+    int argmax                    = 0;
+    int runner_up                 = INT_MAX;
+    unsigned long long runner_key = 0ull;
 };
 
-// Membership is e*sum_exp >= sum_exp2 (exact p_v>=L without dividing into a
-// threshold). logit_cut is a conservative prefilter: z < logit_cut cannot pass.
+// Membership is e*sum_exp >= sum_exp2_cut, with sum_exp2_cut = sum_exp2 * exp(-2ε/T)
+// (p_v >= L·exp(-2ε/T) without dividing into a threshold). logit_cut is a
+// conservative prefilter at the same slack: z < logit_cut cannot pass.
 struct SamplingPLessGate {
     float m         = 0.0f;
     float sum_exp   = 0.0f;
@@ -248,13 +269,15 @@ struct SamplingPLessGate {
 __device__ __forceinline__ SamplingPLessGate sampling_p_less_gate(const SamplingPLessMoments& st,
                                                                   float inv_temp) {
     SamplingPLessGate g;
-    g.m        = st.m;
-    g.sum_exp  = st.sum_exp;
-    g.sum_exp2 = st.sum_exp2;
-    g.inv_temp = inv_temp;
+    g.m         = st.m;
+    g.sum_exp   = st.sum_exp;
+    g.inv_temp  = inv_temp;
     g.logit_cut = 1.0e30f;
+    const float two_eps_over_t = 2.0f * kPLessLogitPerturbation * inv_temp;
+    const float inv_scale      = __expf(-two_eps_over_t);
+    g.sum_exp2                 = st.sum_exp2 * inv_scale;
     if (st.sum_exp > 0.0f && st.sum_exp2 > 0.0f) {
-        const float x_cut = logf(st.sum_exp2 / st.sum_exp) - 1.0e-3f;
+        const float x_cut = logf(st.sum_exp2 / st.sum_exp) - two_eps_over_t;
         g.logit_cut       = st.m + x_cut / inv_temp;
     }
     return g;
@@ -269,6 +292,19 @@ __device__ __forceinline__ float sampling_p_less_survivor_exp(float z, const Sam
     if (!(z >= g.logit_cut)) { return 0.0f; }
     const float e = __expf((z - g.m) * g.inv_temp);
     return sampling_p_less_weight_admitted(e, g) ? e : 0.0f;
+}
+
+__device__ __forceinline__ float sampling_p_less_draw_exp(int v, float z, const SamplingPLessGate& g,
+                                                         const SamplingConfig& cfg) {
+    return sampling_p_less_cycle_excluded(v, cfg) ? 0.0f : sampling_p_less_survivor_exp(z, g);
+}
+
+__device__ __forceinline__ int sampling_p_less_support_fallback(const SamplingPLessMoments& st,
+                                                               const SamplingConfig& cfg) {
+    if (cfg.typical_exclude >= 0 && cfg.typical_exclude == st.argmax && st.runner_up != INT_MAX) {
+        return st.runner_up;
+    }
+    return st.argmax;
 }
 
 __device__ inline SamplingPLessMoments sampling_p_less_moments(const __nv_bfloat16* logits,
@@ -302,6 +338,29 @@ __device__ inline SamplingPLessMoments sampling_p_less_moments(const __nv_bfloat
     SamplingPLessMoments out;
     out.m      = red_val[0];
     out.argmax = red_idx[0];
+    float sv   = -CUDART_INF_F;
+    int si     = INT_MAX;
+    for (int v = tid; v < vocab; v += blockDim.x) {
+        if (!sampling_p_less_in_domain(v, vocab, cfg) || v == out.argmax) { continue; }
+        const float x = __bfloat162float(logits[base + v]);
+        if (sampling_better(x, v, sv, si)) {
+            sv = x;
+            si = v;
+        }
+    }
+    red_val[tid] = sv;
+    red_idx[tid] = si;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s &&
+            sampling_better(red_val[tid + s], red_idx[tid + s], red_val[tid], red_idx[tid])) {
+            red_val[tid] = red_val[tid + s];
+            red_idx[tid] = red_idx[tid + s];
+        }
+        __syncthreads();
+    }
+    out.runner_up  = red_idx[0];
+    out.runner_key = (red_idx[0] == INT_MAX) ? 0ull : sampling_sort_key(red_val[0], red_idx[0]);
     float local_s = 0.0f;
     float local_q = 0.0f;
     for (int v = tid; v < vocab; v += blockDim.x) {
@@ -334,7 +393,7 @@ __device__ inline float sampling_p_less_admitted_mass(const __nv_bfloat16* logit
     float local_z = 0.0f;
     for (int v = tid; v < vocab; v += blockDim.x) {
         if (!sampling_p_less_in_domain(v, vocab, cfg)) { continue; }
-        local_z += sampling_p_less_survivor_exp(__bfloat162float(logits[base + v]), gate);
+        local_z += sampling_p_less_draw_exp(v, __bfloat162float(logits[base + v]), gate, cfg);
     }
     return sampling_block_sum(local_z, red_val);
 }
@@ -349,7 +408,7 @@ __device__ inline int sampling_p_less_inverse_cdf(const __nv_bfloat16* logits, s
     float local_z = 0.0f;
     for (int v = tid; v < vocab; v += blockDim.x) {
         if (!sampling_p_less_in_domain(v, vocab, cfg)) { continue; }
-        local_z += sampling_p_less_survivor_exp(__bfloat162float(logits[base + v]), gate);
+        local_z += sampling_p_less_draw_exp(v, __bfloat162float(logits[base + v]), gate, cfg);
     }
     red_val[tid] = local_z;
     __syncthreads();
@@ -365,7 +424,7 @@ __device__ inline int sampling_p_less_inverse_cdf(const __nv_bfloat16* logits, s
         for (int v = tid; v < vocab; v += blockDim.x) {
             if (!sampling_p_less_in_domain(v, vocab, cfg)) { continue; }
             const float e =
-                sampling_p_less_survivor_exp(__bfloat162float(logits[base + v]), gate);
+                sampling_p_less_draw_exp(v, __bfloat162float(logits[base + v]), gate, cfg);
             if (!(e > 0.0f)) { continue; }
             acc += e;
             local_pick = v;
@@ -397,7 +456,8 @@ __device__ inline int sampling_p_less_draw(const __nv_bfloat16* logits, std::int
     if (!(st.sum_exp > 0.0f)) { return st.argmax; }
     const SamplingPLessGate gate = sampling_p_less_gate(st, inv_temp);
     const float u = sampling_uniform(cfg.seed, position, purpose, 0u);
-    return sampling_p_less_inverse_cdf(logits, base, vocab, cfg, gate, u, st.argmax, red_val,
+    return sampling_p_less_inverse_cdf(logits, base, vocab, cfg, gate, u,
+                                       sampling_p_less_support_fallback(st, cfg), red_val,
                                        red_idx);
 }
 
@@ -457,12 +517,15 @@ sampling_load_published_i32(const std::int32_t* ptr, int offset) {
     return ptr[offset];
 }
 
-inline constexpr int kSamplingPLessMaxSlot      = 0;
-inline constexpr int kSamplingPLessSumSlot      = 1;
-inline constexpr int kSamplingPLessSumSqSlot    = 2;
-inline constexpr int kSamplingPLessThreshSlot   = 3;
-inline constexpr int kSamplingPLessAdmittedSlot = 4;
+inline constexpr int kSamplingPLessMaxSlot         = 0;
+inline constexpr int kSamplingPLessSumSlot         = 1;
+inline constexpr int kSamplingPLessSumSqSlot       = 2;
+inline constexpr int kSamplingPLessThreshSlot      = 3;
+inline constexpr int kSamplingPLessAdmittedSlot    = 4;
+inline constexpr int kSamplingPLessRunnerSlot      = 1; // dist_idx only; dist_prob[1] is sum_exp
+inline constexpr int kSamplingPLessTileRunnerSlot  = 2;
 static_assert(kSamplerCandidateCap > kSamplingPLessAdmittedSlot);
+static_assert(kSamplerCandidateCap > kSamplingPLessTileRunnerSlot);
 
 __device__ __forceinline__ unsigned long long sampling_pack_float_pair(float first, float second) {
     return static_cast<unsigned long long>(__float_as_uint(first)) |
@@ -481,23 +544,34 @@ __device__ __forceinline__ void sampling_p_less_store_moments(
                          sampling_sort_key(moments.m, moments.argmax));
     sampling_publish_key(workspace, sampling_partial_offset(workspace, col, partial, 1),
                          sampling_pack_float_pair(moments.sum_exp, moments.sum_exp2));
+    sampling_publish_key(workspace, sampling_partial_offset(workspace, col, partial,
+                                                            kSamplingPLessTileRunnerSlot),
+                         moments.runner_key);
 }
 
 __device__ inline SamplingPLessMoments sampling_p_less_tile_moments(
     const __nv_bfloat16* logits, std::int64_t base, std::int32_t vocab, const SamplingConfig& cfg,
     int tile_start, float inv_temp, float* red_val, float* red_aux, unsigned long long* warp_keys) {
     float values[kSamplerItemsPerThread];
-    unsigned long long best = 0ull;
+    unsigned long long best   = 0ull;
+    unsigned long long second = 0ull;
 #pragma unroll
     for (int item = 0; item < kSamplerItemsPerThread; ++item) {
         const int v = tile_start + item * blockDim.x + threadIdx.x;
         const bool keep = sampling_p_less_in_domain(v, vocab, cfg);
         values[item]    = keep ? __bfloat162float(logits[base + v]) : -CUDART_INF_F;
         const unsigned long long key = keep ? sampling_sort_key(values[item], v) : 0ull;
-        if (key > best) { best = key; }
+        if (key > best) {
+            second = best;
+            best   = key;
+        } else if (key > second) {
+            second = key;
+        }
     }
-    best          = sampling_block_max_key_broadcast(best, warp_keys);
-    const float m = sampling_key_float(best);
+    unsigned long long global_best   = 0ull;
+    unsigned long long global_second = 0ull;
+    sampling_block_top2_keys(best, second, warp_keys, global_best, global_second);
+    const float m = sampling_key_float(global_best);
 
     float local_s = 0.0f;
     float local_q = 0.0f;
@@ -511,13 +585,21 @@ __device__ inline SamplingPLessMoments sampling_p_less_tile_moments(
     }
     const SamplingFloatPair sums =
         sampling_block_sum_pair(local_s, local_q, red_val, red_aux);
-    return {m, sums.first, sums.second, sampling_key_index(best)};
+    SamplingPLessMoments out;
+    out.m          = m;
+    out.sum_exp    = sums.first;
+    out.sum_exp2   = sums.second;
+    out.argmax     = sampling_key_index(global_best);
+    out.runner_key = global_second;
+    out.runner_up  = sampling_key_index(global_second);
+    return out;
 }
 
 __device__ inline SamplingPLessMoments sampling_p_less_merge_moments(
     const SamplingWorkspace& workspace, int col, int partial_begin, int partial_count,
     float inv_temp, float* red_val, float* red_aux, unsigned long long* warp_keys) {
-    unsigned long long key = 0ull;
+    unsigned long long key    = 0ull;
+    unsigned long long second = 0ull;
     SamplingFloatPair sums{};
     if (threadIdx.x < partial_count) {
         const int partial = partial_begin + threadIdx.x;
@@ -525,8 +607,12 @@ __device__ inline SamplingPLessMoments sampling_p_less_merge_moments(
             workspace, sampling_partial_offset(workspace, col, partial, 0));
         sums = sampling_unpack_float_pair(sampling_load_published_key(
             workspace, sampling_partial_offset(workspace, col, partial, 1)));
+        second = sampling_load_published_key(
+            workspace, sampling_partial_offset(workspace, col, partial, kSamplingPLessTileRunnerSlot));
     }
-    const unsigned long long best = sampling_block_max_key_broadcast(key, warp_keys);
+    unsigned long long best          = 0ull;
+    unsigned long long global_second = 0ull;
+    sampling_block_top2_keys(key, second, warp_keys, best, global_second);
     const float m                 = sampling_key_float(best);
     float local_s                 = 0.0f;
     float local_q                 = 0.0f;
@@ -537,7 +623,14 @@ __device__ inline SamplingPLessMoments sampling_p_less_merge_moments(
     }
     const SamplingFloatPair merged =
         sampling_block_sum_pair(local_s, local_q, red_val, red_aux);
-    return {m, merged.first, merged.second, sampling_key_index(best)};
+    SamplingPLessMoments out;
+    out.m          = m;
+    out.sum_exp    = merged.first;
+    out.sum_exp2   = merged.second;
+    out.argmax     = sampling_key_index(best);
+    out.runner_key = global_second;
+    out.runner_up  = sampling_key_index(global_second);
+    return out;
 }
 
 __device__ __forceinline__ void
@@ -548,17 +641,20 @@ sampling_p_less_store_global(const SamplingWorkspace& workspace, int col,
     workspace.dist_prob[sampling_dist_offset(col, kSamplingPLessSumSqSlot)] = moments.sum_exp2;
     workspace.dist_prob[sampling_dist_offset(col, kSamplingPLessThreshSlot)] =
         moments.sum_exp > 0.0f ? moments.sum_exp2 / moments.sum_exp : 0.0f;
-    workspace.dist_idx[sampling_dist_offset(col, kSamplingPLessMaxSlot)] = moments.argmax;
+    workspace.dist_idx[sampling_dist_offset(col, kSamplingPLessMaxSlot)]    = moments.argmax;
+    workspace.dist_idx[sampling_dist_offset(col, kSamplingPLessRunnerSlot)] = moments.runner_up;
 }
 
 __device__ __forceinline__ SamplingPLessMoments
 sampling_p_less_load_global(const SamplingWorkspace& workspace, int col) {
-    return {
-        workspace.dist_prob[sampling_dist_offset(col, kSamplingPLessMaxSlot)],
-        workspace.dist_prob[sampling_dist_offset(col, kSamplingPLessSumSlot)],
-        workspace.dist_prob[sampling_dist_offset(col, kSamplingPLessSumSqSlot)],
-        workspace.dist_idx[sampling_dist_offset(col, kSamplingPLessMaxSlot)],
-    };
+    SamplingPLessMoments out;
+    out.m        = workspace.dist_prob[sampling_dist_offset(col, kSamplingPLessMaxSlot)];
+    out.sum_exp  = workspace.dist_prob[sampling_dist_offset(col, kSamplingPLessSumSlot)];
+    out.sum_exp2 = workspace.dist_prob[sampling_dist_offset(col, kSamplingPLessSumSqSlot)];
+    out.argmax   = workspace.dist_idx[sampling_dist_offset(col, kSamplingPLessMaxSlot)];
+    out.runner_up =
+        workspace.dist_idx[sampling_dist_offset(col, kSamplingPLessRunnerSlot)];
+    return out;
 }
 
 __device__ __forceinline__ float
@@ -611,7 +707,7 @@ __device__ inline float sampling_p_less_tile_admitted_mass(
                 const int v = tile_start + item * blockDim.x + threadIdx.x;
                 if (!sampling_p_less_in_domain(v, vocab, cfg)) { continue; }
                 local_z +=
-                    sampling_p_less_survivor_exp(__bfloat162float(logits[base + v]), gate);
+                    sampling_p_less_draw_exp(v, __bfloat162float(logits[base + v]), gate, cfg);
             }
         }
     }
@@ -640,7 +736,7 @@ __device__ inline int sampling_p_less_pick_from_tile(
         float weight = 0.0f;
         if (sampling_p_less_in_domain(v, vocab, cfg)) {
             const float e =
-                sampling_p_less_survivor_exp(__bfloat162float(logits[base + v]), gate);
+                sampling_p_less_draw_exp(v, __bfloat162float(logits[base + v]), gate, cfg);
             if (e > 0.0f) {
                 weight = residual
                              ? fmaxf(0.0f, e / admitted -
@@ -929,7 +1025,7 @@ __device__ __forceinline__ float sampling_p_less_prob(const __nv_bfloat16* logit
                                                       const SamplingPLessGate& gate,
                                                       float admitted) {
     if (!(admitted > 0.0f) || !sampling_p_less_in_domain(token, vocab, cfg)) { return 0.0f; }
-    const float e = sampling_p_less_survivor_exp(__bfloat162float(logits[base + token]), gate);
+    const float e = sampling_p_less_draw_exp(token, __bfloat162float(logits[base + token]), gate, cfg);
     return e > 0.0f ? e / admitted : 0.0f;
 }
 
@@ -947,7 +1043,7 @@ __device__ inline int sampling_p_less_residual(const __nv_bfloat16* logits, std:
     float local_mass  = 0.0f;
     for (int v = tid; v < vocab; v += blockDim.x) {
         if (!sampling_p_less_in_domain(v, vocab, cfg)) { continue; }
-        const float e = sampling_p_less_survivor_exp(__bfloat162float(logits[base + v]), gate);
+        const float e = sampling_p_less_draw_exp(v, __bfloat162float(logits[base + v]), gate, cfg);
         if (!(e > 0.0f)) { continue; }
         const float r = e * inv_z - sampling_p_less_q_at(v, draft_id, q_ids, q_vals, q_n);
         if (r > 0.0f) { local_mass += r; }
@@ -973,7 +1069,7 @@ __device__ inline int sampling_p_less_residual(const __nv_bfloat16* logits, std:
         for (int v = tid; v < vocab; v += blockDim.x) {
             if (!sampling_p_less_in_domain(v, vocab, cfg)) { continue; }
             const float e =
-                sampling_p_less_survivor_exp(__bfloat162float(logits[base + v]), gate);
+                sampling_p_less_draw_exp(v, __bfloat162float(logits[base + v]), gate, cfg);
             if (!(e > 0.0f)) { continue; }
             const float r = e * inv_z - sampling_p_less_q_at(v, draft_id, q_ids, q_vals, q_n);
             if (r <= 0.0f) { continue; }

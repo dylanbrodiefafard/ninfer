@@ -373,7 +373,7 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_p_less_mass_sample_ker
             sampling_p_less_store_admitted(workspace, col, total);
             selected_tile = -1;
             selected_goal = 0.0f;
-            picked        = moments.argmax;
+            picked        = sampling_p_less_support_fallback(moments, cfg);
             if (total > 0.0f) {
                 const float goal =
                     sampling_uniform(cfg.seed, logical_positions[col], purpose, 0u) * total;
@@ -401,15 +401,15 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_p_less_mass_sample_ker
         }
         __syncthreads();
 
-        int result = moments.argmax;
+        int result = sampling_p_less_support_fallback(moments, cfg);
         if (selected_tile >= 0) {
             result = sampling_p_less_pick_from_tile(
                 logits, base, token_domain, cfg, selected_tile, gate, admitted, selected_goal,
-                moments.argmax, false, -1, nullptr, nullptr, 0, weights, &running, &picked,
-                &found);
+                result, false, -1, nullptr, nullptr, 0, weights, &running, &picked, &found);
         }
         if (threadIdx.x == 0) {
-            out[col] = sampling_clamp_token(result, moments.argmax, token_domain);
+            out[col] = sampling_clamp_token(result, sampling_p_less_support_fallback(moments, cfg),
+                                            token_domain);
             sampling_count_token(cfg, out[col], token_domain);
             workspace.group_done[col] = 0;
         }

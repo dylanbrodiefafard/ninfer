@@ -175,6 +175,7 @@ public:
                  std::span<const runtime::RoundBudget> budgets);
     void set_suppressed_tokens_lane(std::uint32_t lane, std::span<const TokenId> tokens);
     void clear_suppressed_tokens_lane(std::uint32_t lane);
+    void set_typical_cycle_reasoning_lane(std::uint32_t lane, bool enabled);
     void resolve_prefill_lane(std::uint32_t lane, bool terminal);
     void resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                std::span<const std::uint32_t> accepted_tokens,

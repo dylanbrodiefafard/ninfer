@@ -702,6 +702,7 @@ private:
             instance_.program->clear_suppressed_tokens_lane(lane);
             request->stop_suppression_active = false;
         }
+        instance_.program->set_typical_cycle_reasoning_lane(lane, request->output.in_reasoning());
     }
 
     void remove_completed_slot(std::uint32_t lane) {

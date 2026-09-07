@@ -204,6 +204,11 @@ void Program<Variant>::clear_suppressed_tokens_lane(std::uint32_t lane) {
 }
 
 template <>
+void Program<Variant>::set_typical_cycle_reasoning_lane(std::uint32_t lane, bool enabled) {
+    impl_->set_typical_cycle_reasoning_lane(lane, enabled);
+}
+
+template <>
 void Program<Variant>::resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                              std::span<const std::uint32_t> accepted_tokens,
                                              std::span<const std::uint8_t> terminal,

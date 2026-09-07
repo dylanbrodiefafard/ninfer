@@ -46,7 +46,8 @@ bool same_config(const ops::SamplingConfig& a, const ops::SamplingConfig& b) {
            a.token_counts == b.token_counts &&
            a.suppressed_token_count == b.suppressed_token_count &&
            std::equal(std::begin(a.suppressed_tokens), std::end(a.suppressed_tokens),
-                      std::begin(b.suppressed_tokens));
+                      std::begin(b.suppressed_tokens)) &&
+           a.typical_exclude == b.typical_exclude;
 }
 
 std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
@@ -116,18 +117,51 @@ Distribution distribution_oracle(const std::vector<float>& column, int token_dom
             const double p = weights[static_cast<std::size_t>(token)] / total;
             collision += p * p;
         }
+        const double scale = ops::p_less_admission_scale(config.temperature);
         Distribution out;
         double kept = 0.0;
         for (int token = 0; token < token_domain; ++token) {
             if (suppressed(token)) { continue; }
             const double p = weights[static_cast<std::size_t>(token)] / total;
-            if (p >= collision) {
+            if (p * scale >= collision) {
                 out.tokens.push_back(token);
                 out.probabilities.push_back(p);
                 kept += p;
             }
         }
         for (double& probability : out.probabilities) { probability /= kept; }
+        if (config.typical_exclude >= 0) {
+            const auto found = std::find(out.tokens.begin(), out.tokens.end(),
+                                         config.typical_exclude);
+            if (found != out.tokens.end()) {
+                if (out.tokens.size() == 1) {
+                    const int mode = out.tokens[0];
+                    int runner     = -1;
+                    float best     = 0.0f;
+                    bool have      = false;
+                    for (int token = 0; token < token_domain; ++token) {
+                        if (suppressed(token) || token == mode) { continue; }
+                        const float x = column[static_cast<std::size_t>(token)];
+                        if (!have || x > best || (x == best && token < runner)) {
+                            best   = x;
+                            runner = token;
+                            have   = true;
+                        }
+                    }
+                    out.tokens        = {runner};
+                    out.probabilities = {1.0};
+                } else {
+                    const std::size_t at =
+                        static_cast<std::size_t>(found - out.tokens.begin());
+                    out.tokens.erase(out.tokens.begin() + static_cast<std::ptrdiff_t>(at));
+                    out.probabilities.erase(out.probabilities.begin() +
+                                            static_cast<std::ptrdiff_t>(at));
+                    double rest = 0.0;
+                    for (double p : out.probabilities) { rest += p; }
+                    for (double& p : out.probabilities) { p /= rest; }
+                }
+            }
+        }
         return out;
     }
     std::vector<Candidate> candidates;
@@ -884,6 +918,257 @@ int p_less_multiblock_heterogeneous_batch_contract() {
     return failures;
 }
 
+int p_less_typical_exclude_identity_contract() {
+    std::vector<float> column = {1.0f, 0.9f, 0.8f, 0.2f, -1.0f, -2.0f};
+    round_to_bf16(column);
+    ops::SamplingConfig baseline;
+    baseline.temperature = 0.9f;
+    baseline.p_less      = 1;
+    baseline.seed        = 314159;
+    const Distribution original =
+        distribution_oracle(column, static_cast<int>(column.size()), baseline);
+    if (original.tokens.size() < 2) {
+        std::cerr << "typical-exclude identity fixture lost multi-token V\n";
+        return 1;
+    }
+    ops::SamplingConfig excluded = baseline;
+    excluded.typical_exclude     = 5;
+    if (std::find(original.tokens.begin(), original.tokens.end(), 5) != original.tokens.end()) {
+        std::cerr << "typical-exclude identity fixture put token 5 in V\n";
+        return 1;
+    }
+    constexpr int samples = 4096;
+    const RunResult a =
+        run_repeated(column, static_cast<int>(column.size()), samples, 8, baseline, 50,
+                     ops::kSamplePurposeDecode);
+    const RunResult b =
+        run_repeated(column, static_cast<int>(column.size()), samples, 8, excluded, 50,
+                     ops::kSamplePurposeDecode);
+    int failures = a.integrity_failures + b.integrity_failures;
+    if (a.tokens != b.tokens) {
+        std::cerr << "typical_exclude outside V changed the p-less draw stream\n";
+        ++failures;
+    }
+    return failures;
+}
+
+int p_less_typical_exclude_multi_support_contract() {
+    std::vector<float> column = {1.0f, 0.9f, 0.8f, 0.2f, -1.0f, -2.0f};
+    round_to_bf16(column);
+    ops::SamplingConfig baseline;
+    baseline.temperature = 0.9f;
+    baseline.p_less      = 1;
+    baseline.seed        = 271828;
+    const Distribution original =
+        distribution_oracle(column, static_cast<int>(column.size()), baseline);
+    if (original.tokens.size() < 2) {
+        std::cerr << "typical-exclude multi-support fixture lost multi-token V\n";
+        return 1;
+    }
+    const int drop               = original.tokens.front();
+    ops::SamplingConfig excluded = baseline;
+    excluded.typical_exclude     = drop;
+    const Distribution oracle =
+        distribution_oracle(column, static_cast<int>(column.size()), excluded);
+    if (oracle.tokens.empty() ||
+        std::find(oracle.tokens.begin(), oracle.tokens.end(), drop) != oracle.tokens.end()) {
+        std::cerr << "typical-exclude multi-support oracle kept the continuation or emptied V\n";
+        return 1;
+    }
+    for (int token : oracle.tokens) {
+        if (std::find(original.tokens.begin(), original.tokens.end(), token) ==
+            original.tokens.end()) {
+            std::cerr << "typical-exclude multi-support admitted token " << token
+                      << " outside original V\n";
+            return 1;
+        }
+    }
+    constexpr int samples  = 16384;
+    const RunResult result = run_repeated(column, static_cast<int>(column.size()), samples, 8,
+                                          excluded, 50, ops::kSamplePurposeDecode);
+    return result.integrity_failures +
+           verify_distribution("sample p-less typical_exclude multi-support", result.tokens,
+                               oracle);
+}
+
+int p_less_typical_exclude_singleton_runner_up_contract() {
+    std::vector<float> column(8, -20.0f);
+    column[3] = 8.0f;
+    column[5] = 1.0f;
+    round_to_bf16(column);
+    ops::SamplingConfig config;
+    config.temperature     = 2.0f;
+    config.p_less          = 1;
+    config.seed            = 7;
+    config.typical_exclude = 3;
+    const Distribution original = [&] {
+        ops::SamplingConfig base = config;
+        base.typical_exclude     = -1;
+        return distribution_oracle(column, static_cast<int>(column.size()), base);
+    }();
+    if (original.tokens != std::vector<int>{3}) {
+        std::cerr << "typical-exclude singleton fixture did not collapse V to the mode\n";
+        return 1;
+    }
+    const Distribution oracle =
+        distribution_oracle(column, static_cast<int>(column.size()), config);
+    if (oracle.tokens != std::vector<int>{5} || oracle.probabilities != std::vector<double>{1.0}) {
+        std::cerr << "typical-exclude singleton oracle was not Dirac on the runner-up\n";
+        return 1;
+    }
+    constexpr int samples  = 256;
+    const RunResult result = run_repeated(column, static_cast<int>(column.size()), samples, 8,
+                                          config, 11, ops::kSamplePurposeDecode);
+    int failures           = result.integrity_failures;
+    failures += verify_exact("sample p-less typical_exclude singleton runner-up", result.tokens,
+                             std::vector<int>(samples, 5));
+    return failures;
+}
+
+int p_less_typical_exclude_not_suppressed_rebuild_contract() {
+    std::vector<float> column(8, -0.5f);
+    column[0] = 6.0f;
+    column[1] = 0.5f;
+    column[2] = 0.4f;
+    column[3] = 0.3f;
+    column[4] = 0.2f;
+    round_to_bf16(column);
+    ops::SamplingConfig typical;
+    typical.temperature     = 0.9f;
+    typical.p_less          = 1;
+    typical.seed            = 99;
+    typical.typical_exclude = 0;
+    ops::SamplingConfig suppressed;
+    suppressed.temperature            = 0.9f;
+    suppressed.p_less                 = 1;
+    suppressed.seed                   = 99;
+    suppressed.suppressed_token_count = 1;
+    suppressed.suppressed_tokens[0]   = 0;
+    ops::SamplingConfig baseline = typical;
+    baseline.typical_exclude     = -1;
+    const Distribution original =
+        distribution_oracle(column, static_cast<int>(column.size()), baseline);
+    const Distribution typical_oracle =
+        distribution_oracle(column, static_cast<int>(column.size()), typical);
+    const Distribution suppressed_oracle =
+        distribution_oracle(column, static_cast<int>(column.size()), suppressed);
+    if (original.tokens != std::vector<int>{0}) {
+        std::cerr << "rebuild fixture did not collapse original V to the mode\n";
+        return 1;
+    }
+    if (typical_oracle.tokens.size() != 1 || typical_oracle.tokens[0] == 0) {
+        std::cerr << "typical_exclude of the mode was not Dirac on an in-domain runner-up\n";
+        return 1;
+    }
+    if (suppressed_oracle.tokens.size() < 2 ||
+        std::find(suppressed_oracle.tokens.begin(), suppressed_oracle.tokens.end(), 0) !=
+            suppressed_oracle.tokens.end()) {
+        std::cerr << "suppressing the mode did not rebuild a larger typical set\n";
+        return 1;
+    }
+    if (typical_oracle.tokens == suppressed_oracle.tokens) {
+        std::cerr << "typical_exclude and suppressed_tokens produced the same support\n";
+        return 1;
+    }
+    constexpr int samples = 512;
+    const RunResult typical_result =
+        run_repeated(column, static_cast<int>(column.size()), samples, 8, typical, 4,
+                     ops::kSamplePurposeDecode);
+    int failures = typical_result.integrity_failures;
+    failures += verify_exact("sample typical_exclude does not rebuild L", typical_result.tokens,
+                             std::vector<int>(samples, typical_oracle.tokens[0]));
+    const RunResult suppressed_result =
+        run_repeated(column, static_cast<int>(column.size()), samples, 8, suppressed, 4,
+                     ops::kSamplePurposeDecode);
+    failures += suppressed_result.integrity_failures;
+    failures += verify_distribution("sample suppressed mode rebuilds V", suppressed_result.tokens,
+                                    suppressed_oracle);
+    return failures;
+}
+
+int p_less_typical_exclude_greedy_ignores_contract() {
+    constexpr int token_domain = 8;
+    constexpr int batch        = 4;
+    std::vector<float> column(token_domain, -4.0f);
+    column[2] = 5.0f;
+    column[6] = 4.0f;
+    round_to_bf16(column);
+    const std::vector<float> logits = repeat_column(column, batch);
+    ops::SamplingConfig config;
+    config.temperature     = 0.0f;
+    config.p_less          = 1;
+    config.typical_exclude = 2;
+    const RunResult result =
+        run_homogeneous_batch(logits, token_domain, token_domain, batch, config, 0,
+                              ops::kSamplePurposeDecode);
+    return result.integrity_failures +
+           verify_exact("greedy ignores typical_exclude", result.tokens, std::vector<int>(batch, 2));
+}
+
+int p_less_typical_exclude_real_shape_singleton_contract() {
+    constexpr int physical_rows = 248320;
+    constexpr int token_domain  = 248077;
+    std::vector<float> column(physical_rows, -20.0f);
+    column[7919]              = 8.0f;
+    column[65537]             = 1.5f;
+    column[token_domain]      = 100.0f;
+    column[physical_rows - 1] = 200.0f;
+    round_to_bf16(column);
+    ops::SamplingConfig config;
+    config.temperature     = 2.0f;
+    config.p_less          = 1;
+    config.seed            = 4242;
+    config.typical_exclude = 7919;
+    const Distribution oracle = distribution_oracle(column, token_domain, config);
+    if (oracle.tokens != std::vector<int>{65537}) {
+        std::cerr << "real-shape typical_exclude singleton oracle was not the runner-up\n";
+        return 1;
+    }
+    constexpr int samples = 256;
+    const RunResult result =
+        run_repeated(column, token_domain, samples, 8, config, 3000, ops::kSamplePurposeDecode);
+    int failures = result.integrity_failures;
+    failures += verify_exact("sample p-less typical_exclude real-shape runner-up", result.tokens,
+                             std::vector<int>(samples, 65537));
+    return failures;
+}
+
+int p_less_typical_exclude_real_shape_multi_contract() {
+    constexpr int physical_rows = 248320;
+    constexpr int token_domain  = 248077;
+    std::vector<float> column(physical_rows, -20.0f);
+    const int ids[]      = {3, 17, 7919, 65537, 200003};
+    const float logits[] = {2.0f, 1.85f, 1.7f, 0.5f, 0.0f};
+    for (int i = 0; i < 5; ++i) { column[ids[i]] = logits[i]; }
+    column[token_domain]      = 100.0f;
+    column[physical_rows - 1] = 200.0f;
+    round_to_bf16(column);
+    ops::SamplingConfig baseline;
+    baseline.temperature = 1.2f;
+    baseline.p_less      = 1;
+    baseline.seed        = 271828;
+    const Distribution original = distribution_oracle(column, token_domain, baseline);
+    if (original.tokens.size() < 2) {
+        std::cerr << "real-shape typical_exclude multi fixture lost multi-token V\n";
+        return 1;
+    }
+    ops::SamplingConfig excluded = baseline;
+    excluded.typical_exclude     = original.tokens.front();
+    const Distribution oracle    = distribution_oracle(column, token_domain, excluded);
+    constexpr int samples        = 4096;
+    const RunResult result =
+        run_repeated(column, token_domain, samples, 8, excluded, 3000, ops::kSamplePurposeDecode);
+    int failures = result.integrity_failures;
+    if (std::find(result.tokens.begin(), result.tokens.end(), excluded.typical_exclude) !=
+        result.tokens.end()) {
+        std::cerr << "real-shape typical_exclude multi-support emitted the continuation\n";
+        ++failures;
+    }
+    failures += verify_distribution("sample p-less typical_exclude real-shape multi-support",
+                                    result.tokens, oracle);
+    return failures;
+}
+
 int workspace_route_boundary_contract() {
     constexpr int token_domain = 257;
     constexpr int batch        = 8;
@@ -894,6 +1179,44 @@ int workspace_route_boundary_contract() {
     int failures = result.integrity_failures;
     failures +=
         verify_exact("sample workspace route boundary", result.tokens, std::vector<int>(batch, 0));
+    return failures;
+}
+
+int p_less_first_order_slack_contract() {
+    ops::SamplingConfig config;
+    config.temperature = 2.0f;
+    config.p_less      = 1;
+    config.seed        = 7;
+    // Near-tie 2-mass: r < L but r ≥ L·exp(-2ε/T), so the slack admits both.
+    std::vector<float> near(8, -20.0f);
+    near[0] = 0.08f;
+    near[1] = 0.0f;
+    round_to_bf16(near);
+    const Distribution near_oracle =
+        distribution_oracle(near, static_cast<int>(near.size()), config);
+    if (near_oracle.tokens.size() != 2) {
+        std::cerr << "first-order slack did not admit the near-tie runner-up; |V|="
+                  << near_oracle.tokens.size() << '\n';
+        return 1;
+    }
+    // Peaked 2-mass stays a singleton: r is far below the relaxed cut.
+    std::vector<float> peaked(8, -20.0f);
+    peaked[0] = 4.0f;
+    peaked[1] = 0.0f;
+    round_to_bf16(peaked);
+    const Distribution peaked_oracle =
+        distribution_oracle(peaked, static_cast<int>(peaked.size()), config);
+    if (peaked_oracle.tokens != std::vector<int>{0}) {
+        std::cerr << "first-order slack admitted a far runner-up into a peaked V\n";
+        return 1;
+    }
+    constexpr int samples = 256;
+    const RunResult result =
+        run_repeated(near, static_cast<int>(near.size()), samples, 8, config, 11,
+                     ops::kSamplePurposeDecode);
+    int failures = result.integrity_failures;
+    failures += verify_distribution("sample p-less first-order slack near-tie", result.tokens,
+                                    near_oracle);
     return failures;
 }
 
@@ -934,6 +1257,14 @@ int main() {
     failures += p_less_suppressed_token_contract();
     failures += p_less_suppressed_distribution_contract();
     failures += p_less_suppressed_real_shape_contract();
+    failures += p_less_typical_exclude_identity_contract();
+    failures += p_less_typical_exclude_multi_support_contract();
+    failures += p_less_typical_exclude_singleton_runner_up_contract();
+    failures += p_less_typical_exclude_not_suppressed_rebuild_contract();
+    failures += p_less_typical_exclude_greedy_ignores_contract();
+    failures += p_less_typical_exclude_real_shape_singleton_contract();
+    failures += p_less_typical_exclude_real_shape_multi_contract();
+    failures += p_less_first_order_slack_contract();
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sample public contract\n";
     return failures == 0 ? 0 : 1;
