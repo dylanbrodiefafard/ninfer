@@ -70,11 +70,14 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
  *   distribution from sampling.h rather than the top-k/top-p/min-p truncation, and selector q is
  *   ignored (one-hot at the drafted token, same as MTP): p-less temperature is not a draft
  *   softmax, and a 16-way q at that T would make Leviathan accept almost every top-16 copy. Hop 0
- *   is that Leviathan test; every later hop, and the bonus after a full accept, is greedy
+ *   is that Leviathan test on the cycle-exit restriction p' of sampling.h (V without a typical
+ *   exclude, or Dirac on the runner-up when V is that singleton); every later hop, and the bonus
+ *   after a full accept, is greedy
  *   (accept the draft iff it equals the packed-column argmax, else emit that argmax). A hop-0
  *   p-less residual whose mass is numerically zero draws from p' rather than re-emitting the
- *   rejected draft. If admitted mass is zero, or a residual inverse-CDF with positive mass does
- *   not land on a survivor, the correction is the packed-column argmax.
+ *   rejected draft. If admitted p' mass is zero, or a residual inverse-CDF with positive mass does
+ *   not land on a survivor, the correction is the cycle-exit fallback (runner-up when V is the
+ *   excluded singleton, otherwise the packed-column argmax).
  *   RNG domains are the speculative accept/correction/bonus SamplePurpose values and logical
  *   positions derived from the old length.
  *
@@ -119,7 +122,8 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
  * otherwise emit that argmax as the correction. Sampling with p_less==0: at node u sample x from
  * the truncated target distribution; if x is a child of u, accept and continue, else emit x as
  * correction (SpecInfer membership). When configs[b].p_less is set, hop 0 is that membership
- * draw from p-less(p_LLM); every later hop walks only the packed-column argmax (greedy
+ * draw from the cycle-exit restriction of p-less(p_LLM); every later hop walks only the
+ * packed-column argmax (greedy
  * correction if that argmax is not a child). Walks at most current_extents[b] accepted hops
  * (same budget as chain verify). fold_path lists packed columns of the processed path including
  * the root; accepted_column is the last processed packed index (hidden selector).

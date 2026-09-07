@@ -3,12 +3,26 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 
 #include <cuda_runtime.h> // cudaStream_t
 
 namespace ninfer::ops {
+
+// L∞ logit perturbation used for the p-less membership cut. First-order softmax
+// maps ||Δz||_∞ ≤ ε to a relative p factor exp(2ε/T): admit v when
+// p_v ≥ L · exp(-2ε/T) ≡ L/(1+α). L itself is the unperturbed collision
+// probability and is not rebuilt. ε is one BF16 ulp at logit magnitude 8–16.
+inline constexpr float kPLessLogitPerturbation = 0.0625f;
+
+#if !defined(__CUDA_ARCH__)
+[[nodiscard]] inline double p_less_admission_scale(double temperature) noexcept {
+    if (!(temperature > 0.0)) { return 1.0; }
+    return std::exp(2.0 * static_cast<double>(kPLessLogitPerturbation) / temperature);
+}
+#endif
 
 // Counter-based RNG subkey. Distinct purposes keep draws at the same logical position separate.
 enum SamplePurpose : std::int32_t {
@@ -38,6 +52,9 @@ struct SamplingConfig {
     std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
     std::int32_t suppressed_token_count = 0;
     std::int32_t suppressed_tokens[kMaximumSuppressedTokens] = {-1, -1, -1, -1};
+    // Cycle-exit continuation, or -1. Not a suppressed_tokens member: V and L are
+    // computed on the eligible domain as usual. Greedy (temperature<=0) ignores it.
+    std::int32_t typical_exclude = -1;
 };
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive
@@ -63,11 +80,19 @@ struct SamplingConfig {
  * temperature and configs[b].p_less!=0, let z_v=float(logits[v,b]) over v in [0,token_domain)
  * that are not listed in the first suppressed_token_count entries of suppressed_tokens
  * (penalties, top_k, top_p, and min_p are ignored). Let p=softmax(z/temperature) over that
- * eligible domain, L=sum_v p_v^2, and V={v: p_v>=L} (non-empty: the eligible mode is always
- * admitted). Equivalently, with e_v=exp((z_v-m)/temperature) and m the eligible max logit, V is
- * {v: e_v * sum_i e_i >= sum_i e_i^2} so the cut is not rounded through L = (sum e^2)/(sum e)^2.
- * Sample from the renormalized restriction of p to V. With positive temperature and
- * p_less==0, let
+ * eligible domain, L=sum_v p_v^2, and V={v: p_v >= L·exp(-2ε/T)} with
+ * ε=kPLessLogitPerturbation (non-empty: the eligible mode is always admitted).
+ * Equivalently, with e_v=exp((z_v-m)/temperature) and m the eligible max logit, V is
+ * {v: e_v * sum_i e_i >= sum_i e_i^2 · exp(-2ε/T)} so the cut is not rounded through
+ * L = (sum e^2)/(sum e)^2 and a first-order softmax perturbation of the logits cannot
+ * drop a token that exact-math p_v>=L would have kept. L is the unperturbed collision
+ * probability; the scale only relaxes membership.
+ * If typical_exclude is in V and the remaining admitted mass is strictly positive, sample from
+ * the renormalized restriction of p to V without that atom. If V is exactly {typical_exclude},
+ * emit the in-domain runner-up (second-max eligible logit, lower id breaking ties). That atom
+ * is never added to suppressed_tokens and never rebuilds L. Sample from the renormalized
+ * restriction of p to V when typical_exclude is negative or outside V. With positive temperature
+ * and p_less==0, let
  * c_v=configs[b].token_counts[v] (or zero when the pointer is null):
  *
  *   adjusted_v = float(logits[v,b])

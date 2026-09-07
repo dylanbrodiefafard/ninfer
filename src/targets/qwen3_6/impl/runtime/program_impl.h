@@ -1,6 +1,7 @@
 #include "targets/qwen3_6/impl/runtime/dflash_candidate_stats.h"
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
+#include "runtime/contract/typical_cycle.h"
 
 #include <functional>
 
@@ -82,6 +83,18 @@ void rollback_speculative_stats(RequestControl& request, const PendingCandidate&
     }
     request.adaptive        = pending.adaptive_before;
     stats.live_draft_tokens = request.adaptive.live_k;
+}
+
+void arm_typical_exclude(RequestControl& request, const SequenceState& sequence) {
+    request.sampling_host.typical_exclude = -1;
+    if (!request.typical_cycle_reasoning) { return; }
+    const ops::SamplingConfig& cfg = request.sampling_host;
+    if (cfg.p_less == 0 || !(cfg.temperature > 0.0f)) { return; }
+    if (sequence.ledger.size() < request.prompt_tokens) { return; }
+    const std::span<const TokenId> generated(
+        sequence.ledger.data() + request.prompt_tokens,
+        sequence.ledger.size() - request.prompt_tokens);
+    request.sampling_host.typical_exclude = ninfer::runtime::typical_exclude_token(generated);
 }
 
 void trim_speculative_stats_to_commit(RequestControl& request, const PendingCandidate& pending,
@@ -912,6 +925,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             .capture_context_checkpoints = request_plan.capture_context_checkpoints,
         };
         request.prefill.emplace(std::move(prefill));
+        request.prompt_tokens = prompt_tokens;
         auto& staged = *request.prefill;
         if (staged.vision_plan) {
             staged.vision = std::make_unique<schedule::VisionPrefillSession>(
@@ -2484,6 +2498,8 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     clear_context_checkpoints(sequence);
     request.pending                  = {};
     request.adaptive                 = {};
+    request.typical_cycle_reasoning  = false;
+    request.prompt_tokens            = 0;
 }
 
 qwen3_6::PagedKVCache* ProgramImplCore::backend_kv_cache() noexcept {
@@ -3520,7 +3536,8 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence            = sequences[lanes[row]];
-            const RequestControl& request      = requests[lanes[row]];
+            RequestControl& request            = requests[lanes[row]];
+            arm_typical_exclude(request, sequence);
             const std::uint32_t frontier       = sequence.execution_frontier;
             ordinary_host_ingress->tokens[row] = sequence.ledger.back();
             ordinary_host_ingress->cache_positions[row] =
@@ -3681,7 +3698,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         std::uint32_t realized_extent = 0;
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence           = sequences[lanes[row]];
-            const RequestControl& request     = requests[lanes[row]];
+            RequestControl& request           = requests[lanes[row]];
+            arm_typical_exclude(request, sequence);
             const std::uint32_t frontier      = sequence.execution_frontier;
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1
@@ -3977,7 +3995,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         std::uint32_t realized_extent = 0;
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence           = sequences[lanes[row]];
-            const RequestControl& request     = requests[lanes[row]];
+            RequestControl& request           = requests[lanes[row]];
+            arm_typical_exclude(request, sequence);
             const std::uint32_t frontier      = sequence.execution_frontier;
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1U
@@ -4192,6 +4211,15 @@ void ProgramImplCore::clear_suppressed_tokens_lane(std::uint32_t lane) {
         throw std::logic_error("cannot update sampling for an idle lane");
     }
     request.sampling_host.suppressed_token_count = 0;
+}
+
+void ProgramImplCore::set_typical_cycle_reasoning_lane(std::uint32_t lane, bool enabled) {
+    if (lane >= max_concurrency) { throw std::out_of_range("sampling lane is out of range"); }
+    RequestControl& request = requests[lane];
+    if (request.lifecycle == Lifecycle::Empty) {
+        throw std::logic_error("cannot update sampling for an idle lane");
+    }
+    request.typical_cycle_reasoning = enabled;
 }
 
 void ProgramImplCore::set_suppressed_tokens_lane(std::uint32_t lane,

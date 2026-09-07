@@ -1573,11 +1573,12 @@ std::vector<int> p_less_support_oracle(const std::vector<float>& logits, int phy
         const double p = weights[static_cast<std::size_t>(token)] / total;
         collision += p * p;
     }
+    const double scale = ops::p_less_admission_scale(config.temperature);
     std::vector<int> support;
     for (int token = 0; token < token_domain; ++token) {
         if (p_less_token_suppressed(config, token) || !(total > 0.0)) { continue; }
         const double p = weights[static_cast<std::size_t>(token)] / total;
-        if (p >= collision) { support.push_back(token); }
+        if (p * scale >= collision) { support.push_back(token); }
     }
     return support;
 }
@@ -1893,6 +1894,148 @@ int p_less_two_token_rejection_emits_other_survivor(int physical_rows, int token
     return failures;
 }
 
+int p_less_typical_exclude_singleton_never_accepts_cycle(int physical_rows, int token_domain,
+                                                         unsigned long long seeds,
+                                                         const char* label) {
+    constexpr int k      = 5;
+    constexpr int cycle  = 7;
+    constexpr int runner = 11;
+    std::vector<std::int32_t> drafts(static_cast<std::size_t>(k), cycle);
+    std::vector<float> logits_f(static_cast<std::size_t>(physical_rows) *
+                                    static_cast<std::size_t>(k + 1),
+                                -20.0f);
+    for (int col = 0; col <= k; ++col) {
+        const std::size_t base =
+            static_cast<std::size_t>(col) * static_cast<std::size_t>(physical_rows);
+        logits_f[base + static_cast<std::size_t>(cycle)]  = 20.0f;
+        logits_f[base + static_cast<std::size_t>(runner)] = 5.0f;
+    }
+    std::vector<std::uint16_t> logits_bits(logits_f.size());
+    for (std::size_t i = 0; i < logits_f.size(); ++i) { logits_bits[i] = f32_to_bf16(logits_f[i]); }
+
+    ops::SamplingConfig config{};
+    config.temperature     = 2.0f;
+    config.p_less          = 1;
+    config.typical_exclude = cycle;
+    auto sel               = uniform_selector_q(drafts);
+    constexpr std::int32_t initial_length = 40;
+    int failures                          = 0;
+    for (unsigned long long seed = 1; seed <= seeds; ++seed) {
+        config.seed    = seed;
+        const auto got = run_chain_accept(logits_bits, physical_rows, drafts, initial_length,
+                                          token_domain, config, &sel.first, &sel.second);
+        if (got.accepted != 0) {
+            std::cerr << label << ": hop 0 accepted cyclic draft under typical_exclude seed="
+                      << seed << '\n';
+            ++failures;
+        }
+        if (got.count != 1 || got.licensed[0] != runner) {
+            std::cerr << label << ": hop-0 correction " << got.licensed[0]
+                      << " is not the runner-up\n";
+            ++failures;
+        }
+    }
+    return failures;
+}
+
+int p_less_typical_exclude_multi_never_emits_continuation(int physical_rows, int token_domain,
+                                                          unsigned long long seeds,
+                                                          const char* label) {
+    constexpr int k     = 5;
+    constexpr int cycle = 7;
+    constexpr int other = 11;
+    std::vector<std::int32_t> drafts(static_cast<std::size_t>(k), cycle);
+    auto logits_f =
+        peaked_p_less_chain_logits(physical_rows, token_domain, k + 1, {cycle, other}, 20.0f);
+    std::vector<std::uint16_t> logits_bits(logits_f.size());
+    for (std::size_t i = 0; i < logits_f.size(); ++i) { logits_bits[i] = f32_to_bf16(logits_f[i]); }
+
+    ops::SamplingConfig config{};
+    config.temperature     = 2.0f;
+    config.p_less          = 1;
+    config.typical_exclude = cycle;
+    auto sel               = uniform_selector_q(drafts);
+    constexpr std::int32_t initial_length = 40;
+    int failures                          = 0;
+    for (unsigned long long seed = 1; seed <= seeds; ++seed) {
+        config.seed    = seed;
+        const auto got = run_chain_accept(logits_bits, physical_rows, drafts, initial_length,
+                                          token_domain, config, &sel.first, &sel.second);
+        if (got.accepted != 0) {
+            std::cerr << label << ": hop 0 accepted excluded continuation seed=" << seed << '\n';
+            ++failures;
+        }
+        if (got.count != 1 || got.licensed[0] != other) {
+            std::cerr << label << ": hop-0 correction " << got.licensed[0]
+                      << " is not the remaining typical-set member\n";
+            ++failures;
+        }
+    }
+    return failures;
+}
+
+int p_less_typical_exclude_later_hops_keep_argmax(int physical_rows, int token_domain,
+                                                  unsigned long long seeds, const char* label) {
+    constexpr int k      = 2;
+    constexpr int hop0_a = 5;
+    constexpr int hop0_b = 9;
+    constexpr int later  = 20;
+    constexpr int runner = 21;
+    std::vector<std::int32_t> drafts{hop0_a, 99};
+    std::vector<float> logits_f(static_cast<std::size_t>(physical_rows) *
+                                    static_cast<std::size_t>(k + 1),
+                                -20.0f);
+    {
+        const std::size_t base = 0;
+        logits_f[base + hop0_a] = 8.0f;
+        logits_f[base + hop0_b] = 8.0f;
+    }
+    for (int col = 1; col <= k; ++col) {
+        const std::size_t base =
+            static_cast<std::size_t>(col) * static_cast<std::size_t>(physical_rows);
+        logits_f[base + later]  = 20.0f;
+        logits_f[base + runner] = 5.0f;
+    }
+    std::vector<std::uint16_t> logits_bits(logits_f.size());
+    for (std::size_t i = 0; i < logits_f.size(); ++i) { logits_bits[i] = f32_to_bf16(logits_f[i]); }
+
+    ops::SamplingConfig config{};
+    config.temperature     = 2.0f;
+    config.p_less          = 1;
+    config.typical_exclude = later;
+    auto sel               = uniform_selector_q(drafts);
+    constexpr std::int32_t initial_length = 40;
+    int failures                          = 0;
+    int hop1_seen                         = 0;
+    for (unsigned long long seed = 1; seed <= seeds; ++seed) {
+        config.seed    = seed;
+        const auto got = run_chain_accept(logits_bits, physical_rows, drafts, initial_length,
+                                          token_domain, config, &sel.first, &sel.second);
+        if (got.accepted == 0) {
+            if (got.licensed[0] != hop0_a && got.licensed[0] != hop0_b) {
+                std::cerr << label << ": hop-0 correction left original V\n";
+                ++failures;
+            }
+            continue;
+        }
+        ++hop1_seen;
+        if (got.licensed[0] != hop0_a) {
+            std::cerr << label << ": accepted prefix is not the hop-0 draft\n";
+            ++failures;
+        }
+        if (got.licensed[1] != later) {
+            std::cerr << label << ": hop 1 applied typical_exclude; got " << got.licensed[1]
+                      << " instead of unmodified argmax " << later << '\n';
+            ++failures;
+        }
+    }
+    if (hop1_seen == 0) {
+        std::cerr << label << ": never accepted hop 0, so later-hop ignore was not observed\n";
+        ++failures;
+    }
+    return failures;
+}
+
 struct TreeAcceptObserved {
     std::vector<std::int32_t> licensed;
     std::vector<std::int32_t> path;
@@ -2055,6 +2198,50 @@ int independent_p_less_sample(const std::vector<std::uint16_t>& packed_logits, i
                 pos_t, purpose, sample_workspace, nullptr);
     cuda_synchronize();
     return from_device<std::int32_t>(d_out, 1)[0];
+}
+
+int p_less_typical_exclude_tree_hop0_matches_sample(int physical_rows, int token_domain,
+                                                    unsigned long long seeds, const char* label) {
+    constexpr int kWidth = 4;
+    const std::vector<std::int32_t> parent{-1, 0, 0, 1};
+    const std::vector<std::int32_t> verify_ids{7, 50, 51, 52};
+    std::vector<float> logits_f(static_cast<std::size_t>(physical_rows) *
+                                    static_cast<std::size_t>(kWidth),
+                                -20.0f);
+    for (int col = 0; col < kWidth; ++col) {
+        const std::size_t base =
+            static_cast<std::size_t>(col) * static_cast<std::size_t>(physical_rows);
+        logits_f[base + 7]  = 20.0f;
+        logits_f[base + 11] = 5.0f;
+    }
+    std::vector<std::uint16_t> logits_bits(logits_f.size());
+    for (std::size_t i = 0; i < logits_f.size(); ++i) { logits_bits[i] = f32_to_bf16(logits_f[i]); }
+
+    ops::SamplingConfig config{};
+    config.temperature     = 2.0f;
+    config.p_less          = 1;
+    config.typical_exclude = 7;
+    constexpr std::int32_t initial_length = 40;
+    int failures                          = 0;
+    for (unsigned long long seed = 1; seed <= seeds; ++seed) {
+        config.seed    = seed;
+        const auto got = run_tree_accept(logits_bits, physical_rows, kWidth, parent, verify_ids, 3,
+                                         kWidth, initial_length, token_domain, config, nullptr);
+        if (got.accepted != 0 || got.licensed[0] != 11) {
+            std::cerr << label << ": tree hop 0 did not Dirac the runner-up\n";
+            ++failures;
+            continue;
+        }
+        const int independent = independent_p_less_sample(
+            logits_bits, physical_rows, 0, token_domain, config, initial_length + 1,
+            ops::kSamplePurposeSpeculativeAccept);
+        if (got.licensed[0] != independent) {
+            std::cerr << label << ": tree correction " << got.licensed[0]
+                      << " != independent sample() " << independent << " seed=" << seed << '\n';
+            ++failures;
+        }
+    }
+    return failures;
 }
 
 int p_less_sample_matches_tree_correction_when_no_child(int physical_rows, int token_domain,
@@ -2716,6 +2903,22 @@ int main() {
         64, 64, 64ull, "p-less two-survivor rejection emits the other token V=64");
     failures += p_less_two_token_rejection_emits_other_survivor(
         248320, 248077, 8ull, "DFlash2 p-less two-survivor rejection emits the other token");
+    failures += p_less_typical_exclude_singleton_never_accepts_cycle(
+        64, 64, 16ull, "p-less typical_exclude singleton rejects cyclic draft V=64");
+    failures += p_less_typical_exclude_singleton_never_accepts_cycle(
+        248320, 248077, 4ull, "DFlash2 p-less typical_exclude singleton rejects cyclic draft");
+    failures += p_less_typical_exclude_multi_never_emits_continuation(
+        64, 64, 16ull, "p-less typical_exclude multi-support never emits c V=64");
+    failures += p_less_typical_exclude_multi_never_emits_continuation(
+        248320, 248077, 4ull, "DFlash2 p-less typical_exclude multi-support never emits c");
+    failures += p_less_typical_exclude_later_hops_keep_argmax(
+        64, 64, 48ull, "p-less typical_exclude later hops keep argmax V=64");
+    failures += p_less_typical_exclude_later_hops_keep_argmax(
+        2048, 2048, 32ull, "p-less typical_exclude later hops keep argmax V=2048");
+    failures += p_less_typical_exclude_tree_hop0_matches_sample(
+        64, 64, 8ull, "p-less tree hop 0 typical_exclude matches sample() V=64");
+    failures += p_less_typical_exclude_tree_hop0_matches_sample(
+        2048, 2048, 8ull, "p-less tree hop 0 typical_exclude matches sample() V=2048");
     failures += p_less_sample_matches_tree_correction_when_no_child(
         64, 64, "p-less tree correction matches sample() when no child V=64");
     failures += p_less_sample_matches_tree_correction_when_no_child(

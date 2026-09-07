@@ -315,7 +315,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
                                                   kSamplePurposeSpeculativeCorrection, 0u);
                 const int tstar = sampling_p_less_residual(
                     row_logits, base, token_domain, cfg, gate, admitted, ur, d, hop_ids, hop_q,
-                    selector_k, st.argmax, red_val, red_idx);
+                    selector_k, sampling_p_less_support_fallback(st, cfg), red_val, red_idx);
                 if (tid == 0) {
                     tstar_sh = tstar;
                     done_sh  = 1;
@@ -328,7 +328,8 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
                     sampling_uniform(cfg.seed, L_sh + extent + 1, kSamplePurposeSpeculativeBonus,
                                      0u);
                 const int tstar = sampling_p_less_inverse_cdf(
-                    row_logits, base, token_domain, cfg, gate, u, st.argmax, red_val, red_idx);
+                    row_logits, base, token_domain, cfg, gate, u,
+                    sampling_p_less_support_fallback(st, cfg), red_val, red_idx);
                 if (tid == 0) {
                     tstar_sh = tstar;
                     done_sh  = 1;
@@ -788,8 +789,8 @@ __device__ inline float speculative_p_less_residual_tile_mass(
     if (q_ids == nullptr || q_vals == nullptr || q_n <= 0) {
         if (sampling_p_less_in_domain(draft_id, token_domain, cfg) && draft_id >= begin &&
             draft_id < end) {
-            const float e = sampling_p_less_survivor_exp(
-                __bfloat162float(row_logits[base + draft_id]), gate);
+            const float e = sampling_p_less_draw_exp(
+                draft_id, __bfloat162float(row_logits[base + draft_id]), gate, cfg);
             if (e > 0.0f) { correction = fminf(e / admitted, 1.0f); }
         }
     } else {
@@ -806,8 +807,8 @@ __device__ inline float speculative_p_less_residual_tile_mass(
                 !sampling_p_less_in_domain(token, token_domain, cfg)) {
                 continue;
             }
-            const float e = sampling_p_less_survivor_exp(
-                __bfloat162float(row_logits[base + token]), gate);
+            const float e = sampling_p_less_draw_exp(
+                token, __bfloat162float(row_logits[base + token]), gate, cfg);
             if (e > 0.0f) { correction += fminf(e / admitted, q_vals[c]); }
         }
     }
@@ -827,7 +828,8 @@ __device__ inline void speculative_p_less_choose_tile(
     const float admitted               = sampling_p_less_load_admitted(workspace, col);
     *selected_tile = -1;
     *selected_goal = 0.0f;
-    *fallback      = sampling_clamp_token(moments.argmax, 0, token_domain);
+    *fallback      = sampling_clamp_token(sampling_p_less_support_fallback(moments, cfg), 0,
+                                          token_domain);
 
     float total = admitted;
     if (residual) {

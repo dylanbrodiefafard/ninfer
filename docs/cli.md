@@ -206,9 +206,16 @@ P-less is the default process/request truncation mode, with temperature `2.0` fo
 temperature and seed, ignores top-p, top-k, min-p, and presence/frequency penalties, and writes a
 one-time warning on stderr. Ignored parameters must still satisfy their normal input ranges.
 `--no-p-less-sampling` opts into the registered production sampler. Combined with `--greedy`,
-p-less remains exact argmax. Under MTP or DFlash2, p-less applies at hop 0 (chain Leviathan with
-one-hot draft `q`). Later hops and the bonus after a full accept
-are greedy packed-column argmax.
+p-less remains exact argmax. During thinking, p-less also exits a generated token-id
+square: the least period p in [32, 512] such that the last 2p generated ids match with
+Hamming distance at most 2p/512 (so p<256 is exact identity). The continuation is excluded
+from the already-computed typical set V (renormalized V without that atom, or the in-domain
+runner-up when V is that singleton). This is not a `suppressed_tokens` member and does not
+rebuild L. There is no CLI flag. P-less membership is `p_v ≥ L·exp(-2ε/T)` with
+`ε = 1/16` (first-order softmax perturbation of the logits); L is the unperturbed collision
+probability. Under MTP or DFlash2,
+p-less applies at hop 0 (chain Leviathan with one-hot draft `q`). Later hops and the bonus after
+a full accept are greedy packed-column argmax.
 
 Repeat `--stop-token-id`, `--stop`, or `--reasoning-stop` to add stop conditions. Use
 `--raw-output` to expose the frontend's raw output stream and `--print-token-ids` to include
