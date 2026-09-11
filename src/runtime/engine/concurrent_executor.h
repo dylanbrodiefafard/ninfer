@@ -8,6 +8,8 @@
 #include "runtime/engine/request_memory.h"
 #include "runtime/generation/generation_budget.h"
 #include "targets/qwen3_6/export/ninfer/targets/qwen3_6/frontend.h"
+#include "targets/qwen3_6/export/ninfer/targets/qwen3_6/generation_recovery.h"
+#include "runtime/contract/reasoning_recovery.h"
 
 #include <algorithm>
 #include <array>
@@ -47,7 +49,7 @@ public:
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
           admission_capacity_(instance.program->admission_capacity()),
-          load_progress_(options.load_progress) {
+          load_progress_(options.load_progress), generation_recovery_(options.generation_recovery) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("concurrent executor bounds are invalid");
@@ -95,9 +97,6 @@ public:
         GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
             if (owner_ == nullptr || request_ == nullptr) {
                 throw std::logic_error("concurrent submission is empty");
-            }
-            if (sink != nullptr && request_->delivery != OutputDelivery::Streaming) {
-                throw std::logic_error("terminal-only submission cannot consume an OutputSink");
             }
             ConcurrentExecutor* owner = std::exchange(owner_, nullptr);
             return owner->wait_for_request(std::exchange(request_, nullptr), sink, cancellation);
@@ -164,7 +163,7 @@ public:
             request = std::make_shared<Request>(request_id, std::move(prompt), std::move(output),
                                                 prompt_summary, prepare_seconds, std::move(options),
                                                 delivery, pending_deadline, submitted,
-                                                std::move(host_input));
+                                                std::move(host_input), generation_recovery_);
             request->base_plan.emplace(
                 instance_.program->plan_request_base(request->prompt, request->options.execution));
         } catch (...) {
@@ -326,24 +325,30 @@ private:
 
         std::exception_ptr caller_error;
         std::vector<OutputDelta> events;
+        std::vector<RecoveryEvent> recovery_events;
         for (;;) {
             events.clear();
+            recovery_events.clear();
             bool done = false;
             {
                 std::unique_lock lock(request->mutex);
                 if (cancellation.armed()) {
                     request->cv.wait_for(lock, std::chrono::milliseconds(10),
-                                         [&] { return request->done || !request->events.empty(); });
+                                         [&] { return request->done || !request->events.empty() ||
+                                                       !request->recovery_events.empty(); });
                 } else {
                     request->cv.wait(lock,
-                                     [&] { return request->done || !request->events.empty(); });
+                                     [&] { return request->done || !request->events.empty() ||
+                                                   !request->recovery_events.empty(); });
                 }
                 events.swap(request->events);
+                recovery_events.swap(request->recovery_events);
                 done = request->done;
             }
 
             if (caller_error == nullptr && sink != nullptr) {
                 try {
+                    for (const auto& event : recovery_events) { sink->recovery_event(event); }
                     for (OutputDelta& event : events) { sink->publish(std::move(event)); }
                 } catch (...) {
                     caller_error = std::current_exception();
@@ -378,12 +383,17 @@ private:
                 targets::qwen3_6::OutputSession output_session, PromptSummary summary,
                 double frontend_seconds, ResolvedRequestOptions request_options,
                 OutputDelivery output_delivery, Clock::time_point limit,
-                Clock::time_point submit_time, HostInputLease input_lease)
+                Clock::time_point submit_time, HostInputLease input_lease,
+                bool generation_recovery)
             : id(request_identity), host_input(std::move(input_lease)), prompt(std::move(input)),
               output(std::move(output_session)), prompt_summary(summary),
               prepare_seconds(frontend_seconds), options(std::move(request_options)),
               delivery(output_delivery), deadline(limit), submitted(submit_time),
-              stop_suppression_active(options.execution.suppressed_token_count != 0) {}
+              stop_suppression_active(options.execution.suppressed_token_count != 0) {
+            if (generation_recovery && options.execution.sampling.p_less && !options.output.raw) {
+                recovery_context = output.generation_recovery_context();
+            }
+        }
 
         const std::uint64_t id;
         HostInputLease host_input;
@@ -405,6 +415,18 @@ private:
         std::atomic<bool> cancelled{false};
         bool decode_ready = false;
         bool stop_suppression_active = false;
+        std::shared_ptr<const targets::qwen3_6::GenerationRecoveryContext> recovery_context;
+        GenerationRecoveryStats recovery;
+        std::uint32_t cycle_exclusions = 0;
+        std::string recovery_cause;
+        bool recovery_pending = false;
+        std::size_t recovery_reasoning_begin = 0;
+        std::size_t recovery_generated_begin = 0;
+        RepeatedReasoningSpan reasoning_cycle;
+        std::uint32_t previous_reasoning_tokens = 0;
+        GenerationTimings initial_timings;
+        double previous_decode_seconds = 0.0;
+        SpeculativeStats previous_speculative;
 
         std::optional<BasePlan> base_plan;
         std::array<std::optional<Plan>, kMaximumConcurrency> lane_plans{};
@@ -426,6 +448,7 @@ private:
         std::mutex mutex;
         std::condition_variable cv;
         std::vector<OutputDelta> events;
+        std::vector<RecoveryEvent> recovery_events;
         GenerationResult result;
         std::exception_ptr error;
         bool done              = false;
@@ -592,7 +615,30 @@ private:
         request->cv.notify_one();
     }
 
+    void publish_recovery(const std::shared_ptr<Request>& request, RecoveryEventKind kind,
+                          std::string cause) {
+        RecoveryEvent event{.kind = kind, .cause = std::move(cause),
+            .attempts = request->recovery.attempts,
+            .cycle_exclusions = request->cycle_exclusions,
+            .discarded_tool_calls = request->recovery.discarded_tool_calls,
+            .discarded_reasoning_tokens = request->recovery.discarded_reasoning_tokens,
+            .generated_tokens = request->generated.size(),
+            .remaining_tokens = request->budget ? request->budget->remaining() : 0};
+        {
+            std::lock_guard lock(request->mutex);
+            request->recovery_events.push_back(std::move(event));
+        }
+        request->cv.notify_one();
+    }
+
     void complete_success(std::shared_ptr<Request> request, FinishReason reason) {
+        if (request->cycle_exclusions != 0 || !request->recovery_cause.empty()) {
+            publish_recovery(request, RecoveryEventKind::Finished,
+                reason == FinishReason::Cancelled ? "cancelled" :
+                !request->output.tool_calls().empty() ? "tool_calls" :
+                reason == FinishReason::OutputLimit ? "output_limit" :
+                reason == FinishReason::ContextCapacity ? "context_capacity" : "stop");
+        }
         release_planning_state(request);
         request->prompt = {};
         request->host_input.reset();
@@ -601,7 +647,18 @@ private:
         result.generated_token_ids     = std::move(request->generated);
         result.content                 = std::move(request->content);
         result.reasoning               = std::move(request->reasoning);
-        result.reasoning_tokens        = request->output.reasoning_tokens();
+        const auto calls = request->output.tool_calls();
+        if (reason != FinishReason::Cancelled) { result.tool_calls.assign(calls.begin(), calls.end()); }
+        result.recovery = request->recovery;
+        if (!request->output.has_tool_grammar()) {
+            result.undeclared_tool_call_names =
+                targets::qwen3_6::unconstrained_tool_call_names(result.content, 128);
+        }
+        for (std::size_t index = 0; index < result.tool_calls.size(); ++index) {
+            result.tool_calls[index].id = "call_" + std::to_string(request->id) + "_" +
+                                          std::to_string(index);
+        }
+        result.reasoning_tokens        = request->previous_reasoning_tokens + request->output.reasoning_tokens();
         result.finish_reason           = reason;
         result.timings.prepare_seconds = request->prepare_seconds;
         if (request->begin) {
@@ -625,6 +682,14 @@ private:
             result.timings.prepare_seconds = request->prepare_seconds;
             result.speculative = instance_.program->speculative_stats_lane(*request->lane);
         }
+        if (request->recovery.attempts != 0) {
+            result.timings.prefill_seconds = request->initial_timings.prefill_seconds;
+            result.timings.vision_seconds = request->initial_timings.vision_seconds;
+            result.timings.prefill_tail_tok_s = request->initial_timings.prefill_tail_tok_s;
+            result.timings.prefill_tail_window_s = request->initial_timings.prefill_tail_window_s;
+            result.timings.decode_seconds += request->previous_decode_seconds;
+            add_speculative(result.speculative, request->previous_speculative);
+        }
         if (request->first_token) {
             result.timings.first_token_seconds =
                 request->prepare_seconds +
@@ -645,9 +710,186 @@ private:
     }
 
     void complete_cancelled(std::shared_ptr<Request> request) {
-        (void)request->output.preview_terminal(FinishReason::Cancelled);
-        append_output(request, request->output.commit_preview(), false);
+        if (!request->output.terminal()) {
+            (void)request->output.preview_terminal(FinishReason::Cancelled);
+            append_output(request, request->output.commit_preview(), false);
+        }
         complete_success(request, FinishReason::Cancelled);
+    }
+
+    void recovery_exhausted(const std::shared_ptr<Request>& request, std::string detail) {
+        publish_recovery(request, RecoveryEventKind::Exhausted, detail);
+        const auto lane = *request->lane;
+        instance_.program->abort_lane(lane);
+        if (prefill_lane_ && *prefill_lane_ == lane) {
+            instance_.request_memory.deactivate();
+            prefill_lane_.reset();
+        }
+        request->recovery_pending = false;
+        complete_error(request, std::make_exception_ptr(RequestError(
+            RequestErrorKind::RecoveryExhausted,
+            "NInfer detected persistent repeated generation; bounded recovery exhausted: " + detail)));
+    }
+
+    static void add_speculative(SpeculativeStats& total, const SpeculativeStats& part) {
+        if (!part.enabled) { return; }
+        total.backend = part.backend;
+        total.enabled = true;
+        total.draft_window = part.draft_window;
+        total.rounds += part.rounds;
+        total.drafted_tokens += part.drafted_tokens;
+        total.accepted_tokens += part.accepted_tokens;
+        total.fallback_steps += part.fallback_steps;
+        auto add = [](auto& into, const auto& values) {
+            if (into.size() < values.size()) { into.resize(values.size()); }
+            for (std::size_t i = 0; i < values.size(); ++i) { into[i] += values[i]; }
+        };
+        add(total.accepted_per_position, part.accepted_per_position);
+        add(total.rounds_per_draft, part.rounds_per_draft);
+    }
+
+    // Recovery starts only after the generated round is committed. Tool calls
+    // remain unpublished; reasoning retries pause an otherwise active lane.
+    // Re-prefill owns the same admitted resource/service commitment.
+    [[nodiscard]] bool start_generation_recovery() {
+        while (!recovery_queue_.empty()) {
+            auto request = std::move(recovery_queue_.front());
+            recovery_queue_.pop_front();
+            if (!request->lane || slots_[*request->lane] != request || !request->recovery_pending) {
+                continue;
+            }
+            const auto lane = *request->lane;
+            const auto attempt = request->recovery.attempts + 1;
+            const auto started = Clock::now();
+            auto repaired = instance_.loaded->frontend.prepare(
+                request->recovery_context->repair(request->output.tool_calls(), attempt));
+            request->recovery.prepare_seconds +=
+                std::chrono::duration<double>(Clock::now() - started).count();
+            if (repaired.summary().prompt_tokens >
+                request->prompt_summary.prompt_tokens + request->generated.size()) {
+                recovery_exhausted(request, "repaired context would exceed the original reservation");
+                return true;
+            }
+            auto output = instance_.loaded->frontend.make_output_session(
+                repaired, request->options.stop, request->options.output);
+            auto execution = request->options.execution;
+            execution.requested_output_tokens = request->budget->remaining();
+            execution.allow_prefix_reuse = false;
+            execution.capture_context_checkpoint = false;
+            execution.suppressed_token_count = 0;
+            if (!output.model_stop_tokens_allowed()) {
+                const auto& stops = instance_.loaded->frontend.default_stop_policy().token_ids;
+                execution.suppressed_token_count = static_cast<std::uint32_t>(stops.size());
+                std::copy(stops.begin(), stops.end(), execution.suppressed_token_ids.begin());
+            }
+            auto base = instance_.program->plan_request_base(repaired, execution);
+            if (!admission_resources_fit(base.summary().admission, request->admission_resources) ||
+                base.summary().effective_output_tokens != request->budget->remaining()) {
+                recovery_exhausted(request, "repaired request cannot preserve its admitted output budget");
+                return true;
+            }
+            if (request->cancelled.load(std::memory_order_acquire)) {
+                instance_.program->abort_lane(lane);
+                complete_cancelled(request);
+                return true;
+            }
+
+            const auto previous = instance_.program->generation_timings_lane(lane);
+            if (request->recovery.attempts == 0) { request->initial_timings = previous; }
+            request->previous_decode_seconds += previous.decode_seconds;
+            add_speculative(request->previous_speculative, instance_.program->speculative_stats_lane(lane));
+            request->previous_reasoning_tokens += request->output.reasoning_tokens();
+            instance_.program->abort_lane(lane);
+            invalidate_lane_plans(lane);
+            release_planning_state(request);
+            auto plan = instance_.program->plan_request_for_lane(lane, repaired, base);
+            if (!instance_.program->can_admit_lane(lane, plan)) {
+                recovery_exhausted(request, "reserved lane cannot be rebuilt safely");
+                return true;
+            }
+            const auto summary = plan.summary();
+            request->prompt = std::move(repaired);
+            request->output = std::move(output);
+            request->recovery.attempts = attempt;
+            request->recovery_pending = false;
+            publish_recovery(request, RecoveryEventKind::RetryStarted, request->recovery_cause);
+            // The failed attempt may end mid-word. Keep it visible, but do not
+            // concatenate the new attempt onto that unfinished word in SSE/JSON.
+            if (!request->reasoning.empty()) {
+                targets::qwen3_6::PublishedOutput separator;
+                separator.push_back(OutputDelta{OutputChannel::Reasoning, "\n\n"});
+                append_output(request, std::move(separator));
+            }
+            request->recovery_reasoning_begin = request->reasoning.size();
+            request->recovery_generated_begin = request->generated.size();
+            request->reasoning_cycle = {};
+            request->stop_suppression_active = execution.suppressed_token_count != 0;
+            instance_.request_memory.activate(summary.transient_bytes, summary.transient_alignment);
+            prefill_lane_ = lane;
+            const auto prefill_started = Clock::now();
+            const auto first = instance_.program->start_prefill_lane(
+                lane, std::move(request->prompt), std::move(plan), instance_.request_memory.region(),
+                &request->output);
+            request->recovery.prefill_seconds +=
+                std::chrono::duration<double>(Clock::now() - prefill_started).count();
+            (void)resolve_prefill_step(request, first, request->cancelled.load(std::memory_order_acquire));
+            publish_runtime_stats();
+            return true;
+        }
+        return false;
+    }
+
+    bool recover_persistent_reasoning(const std::shared_ptr<Request>& request) {
+        if (!request->recovery_context || !request->output.in_reasoning() ||
+            !request->content.empty() || request->options.execution.sampling.temperature <= 0) { return false; }
+        const auto current = std::span<const TokenId>(request->generated).subspan(
+            request->recovery_generated_begin);
+        if (!request->reasoning_cycle.observe(current)) { return false; }
+        request->recovery.discarded_reasoning_tokens += request->output.reasoning_tokens();
+        request->recovery_cause = "repeated_reasoning";
+        publish_recovery(request, RecoveryEventKind::RetryTriggered, request->recovery_cause);
+        if (request->recovery.attempts >= targets::qwen3_6::GenerationRecoveryContext::maximum_attempts ||
+            request->budget->remaining() == 0) {
+            recovery_exhausted(request, "persistent reasoning exhausted its retry or output-token budget");
+            return true;
+        }
+        request->decode_ready = false;
+        request->recovery_pending = true;
+        recovery_queue_.push_back(request);
+        signal_control();
+        return true;
+    }
+
+    void finish_generation(const std::shared_ptr<Request>& request, FinishReason reason) {
+        if (!generation_recovery_allowed_at_finish(reason, request->generated, request->options.stop)) {
+            complete_success(request, reason);
+            return;
+        }
+        // An explicit caller stop still wins. A budget boundary containing the
+        // third repeated passage must not silently disguise recovery exhaustion
+        // as a normal length finish merely because it is the last licensed round.
+        if ((reason == FinishReason::OutputLimit || reason == FinishReason::ContextCapacity) &&
+            recover_persistent_reasoning(request)) { return; }
+        const auto calls = request->output.tool_calls();
+        const auto reasoning = std::string_view(request->reasoning).substr(request->recovery_reasoning_begin);
+        if (request->recovery_context &&
+            request->recovery_context->repeats(calls, reasoning)) {
+            request->recovery.discarded_tool_calls += static_cast<std::uint32_t>(calls.size());
+            request->recovery.discarded_reasoning_tokens += request->output.reasoning_tokens();
+            request->recovery_cause = "duplicate_tool_call";
+            publish_recovery(request, RecoveryEventKind::RetryTriggered, request->recovery_cause);
+            if (request->recovery.attempts >= targets::qwen3_6::GenerationRecoveryContext::maximum_attempts ||
+                request->budget->remaining() == 0) {
+                recovery_exhausted(request, "no retry or output-token budget remains");
+                return;
+            }
+            request->decode_ready = false;
+            request->recovery_pending = true;
+            recovery_queue_.push_back(request);
+            signal_control();
+            return;
+        }
+        complete_success(request, reason);
     }
 
     bool resolve_round(const std::shared_ptr<Request>& request, TokenId token,
@@ -678,7 +920,7 @@ private:
         if (!request->first_token) { request->first_token = Clock::now(); }
         append_output(request, std::move(published), !decision.finished());
         if (decision.finished()) {
-            complete_success(request, decision.finish_reason);
+            finish_generation(request, decision.finish_reason);
             return true;
         }
         return false;
@@ -702,7 +944,8 @@ private:
             instance_.program->clear_suppressed_tokens_lane(lane);
             request->stop_suppression_active = false;
         }
-        instance_.program->set_typical_cycle_reasoning_lane(lane, request->output.in_reasoning());
+        instance_.program->set_typical_cycle_reasoning_lane(
+            lane, generation_recovery_ && request->output.in_reasoning());
     }
 
     void remove_completed_slot(std::uint32_t lane) {
@@ -827,6 +1070,9 @@ private:
                                             const PrefillStepResult& step,
                                             bool cancel_at_boundary) {
         cumulative_stats_.computed_prefill_tokens += step.processed_prompt_tokens;
+        if (request->recovery.attempts != 0) {
+            request->recovery.prefill_tokens += step.processed_prompt_tokens;
+        }
         publish_hot_runtime_counters();
         consume_service_work(request, 1);
         if (step.host_input_consumed || step.complete) { request->host_input.reset(); }
@@ -851,7 +1097,12 @@ private:
             instance_.request_memory.deactivate();
             prefill_lane_.reset();
         }
-        request->begin = step.summary;
+        if (request->recovery.attempts == 0) {
+            request->begin = step.summary;
+        } else {
+            ++request->recovery.prefill_samples;
+            publish_recovery(request, RecoveryEventKind::RetryPrefillComplete, request->recovery_cause);
+        }
         if (step.round.tokens.size() != 1) {
             throw std::logic_error("prefill did not license exactly one token");
         }
@@ -868,7 +1119,12 @@ private:
         if (request == nullptr || request->decode_ready) {
             throw std::logic_error("staged prefill lane has invalid request state");
         }
+        const auto started = Clock::now();
         const PrefillStepResult step  = instance_.program->advance_prefill_lane(lane);
+        if (request->recovery.attempts != 0) {
+            request->recovery.prefill_seconds +=
+                std::chrono::duration<double>(Clock::now() - started).count();
+        }
         const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
         if (resolve_prefill_step(request, step, cancel_at_boundary)) { publish_runtime_stats(); }
     }
@@ -1186,7 +1442,7 @@ private:
                 transient     = instance_.request_memory.region();
             }
             const PrefillStepResult first = instance_.program->start_prefill_lane(
-                lane, std::move(request->prompt), std::move(hold.plan), transient);
+                lane, std::move(request->prompt), std::move(hold.plan), transient, &request->output);
             const auto copies = instance_.program->harvest_kv_ram_copy_seconds();
             request->kv_ram_save_seconds += copies.save;
             request->kv_ram_load_seconds += copies.load;
@@ -1658,6 +1914,16 @@ private:
         const std::span<const std::uint32_t> lanes = live.lane_span();
         const BatchedGeneratedRound round =
             instance_.program->decode_batch(lanes, live.budget_span());
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            if (!round.cycle_exclusions[row]) { continue; }
+            const auto& request = slots_[lanes[row]];
+            const auto count = ++request->cycle_exclusions;
+            // Bound log traffic in a persistent cycle: first and powers of two;
+            // the terminal event always reports the exact total.
+            if ((count & (count - 1)) == 0) {
+                publish_recovery(request, RecoveryEventKind::CycleExclusion, "reasoning_cycle");
+            }
+        }
 
         std::array<std::uint8_t, kMaximumConcurrency> cancelled{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -1750,7 +2016,11 @@ private:
                 request->first_token = Clock::now();
             }
             append_output(request, std::move(published), terminal[row] == 0);
-            if (terminal[row]) { complete_success(request, finish_reasons[row]); }
+            if (terminal[row]) {
+                finish_generation(request, finish_reasons[row]);
+            } else {
+                recover_persistent_reasoning(request);
+            }
         }
     }
 
@@ -1787,7 +2057,7 @@ private:
         for (;;) {
             const bool control_changed =
                 control_dirty_.exchange(false, std::memory_order_acquire);
-            if (stable_decode_epoch && !control_changed) {
+            if (stable_decode_epoch && !control_changed && recovery_queue_.empty()) {
                 try {
                     std::scoped_lock execution_lock(execution_mutex_);
                     const RoundMembership membership = build_round_membership();
@@ -1885,6 +2155,8 @@ private:
                     continue;
                 }
 
+                if (start_generation_recovery()) { continue; }
+
                 if (have_pending &&
                     (membership.empty() || decode_admission_burst.allows_admission())) {
                     const AdmissionProgress progress = try_admit_one();
@@ -1925,12 +2197,14 @@ private:
     const std::chrono::milliseconds pending_timeout_;
     const AdmissionResources admission_capacity_;
     LoadProgress load_progress_;
+    const bool generation_recovery_;
 
     mutable std::mutex execution_mutex_;
     mutable std::mutex queue_mutex_;
     mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;
     std::deque<std::shared_ptr<Request>> pending_;
+    std::deque<std::shared_ptr<Request>> recovery_queue_;
     std::size_t outstanding_       = 0;
     std::uint64_t next_request_id_ = 1;
     std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};

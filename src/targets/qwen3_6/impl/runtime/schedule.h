@@ -13,6 +13,7 @@
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include "targets/qwen3_6/impl/runtime/text_context.h"
+#include "targets/qwen3_6/impl/runtime/tool_masks.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
@@ -105,6 +106,7 @@ struct MtpBatchContext {
     const qwen3_6::MtpDecodeIngress& host_ingress;
     qwen3_6::MtpDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    qwen3_6::ToolMaskExchange* tool_masks = nullptr;
 };
 
 struct DFlashBatchContext {
@@ -115,6 +117,7 @@ struct DFlashBatchContext {
     const qwen3_6::DFlashDecodeIngress& host_ingress;
     qwen3_6::DFlashDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    qwen3_6::ToolMaskExchange* tool_masks = nullptr;
 };
 
 struct DFlashAppendContext {
@@ -163,6 +166,7 @@ struct TargetVerifyFrameView {
     const GdnReplayRecords* replay_records = nullptr;
     const ops::SamplingConfig* sampling    = nullptr;
     DFlashFeatureSink* feature_sink        = nullptr;
+    qwen3_6::ToolMaskExchange* tool_masks = nullptr;
 };
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,

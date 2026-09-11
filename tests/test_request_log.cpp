@@ -32,6 +32,30 @@ int check(bool condition, const char* message) {
 int main() {
     int failures = 0;
 
+    ninfer::RecoveryEvent recovery_event{
+        .kind = ninfer::RecoveryEventKind::RetryTriggered,
+        .cause = "repeated_reasoning", .attempts = 1, .cycle_exclusions = 17,
+        .discarded_tool_calls = 0, .discarded_reasoning_tokens = 6568,
+        .generated_tokens = 7000, .remaining_tokens = 25000};
+    failures += check(format_recovery_event(103, recovery_event) ==
+        "[req 103] recovery event=retry_triggered cause=repeated_reasoning attempts=1"
+        " cycle_exclusions=17 discarded_tool_calls=0 discarded_reasoning_tokens=6568"
+        " gen=7000 remaining=25000", "reasoning recovery log lost request identity or accounting");
+    for (const auto& [kind, name] : std::vector<std::pair<ninfer::RecoveryEventKind, std::string>>{
+             {ninfer::RecoveryEventKind::CycleExclusion, "cycle_exclusion"},
+             {ninfer::RecoveryEventKind::RetryStarted, "retry_started"},
+             {ninfer::RecoveryEventKind::RetryPrefillComplete, "retry_prefill_complete"},
+             {ninfer::RecoveryEventKind::Finished, "finished"},
+             {ninfer::RecoveryEventKind::Exhausted, "exhausted"}}) {
+        recovery_event.kind = kind;
+        recovery_event.cause = "duplicate_tool_call";
+        recovery_event.discarded_tool_calls = 1;
+        const auto record = format_recovery_event(104, recovery_event);
+        failures += check(record.find("event=" + name + " cause=duplicate_tool_call") != std::string::npos &&
+                          record.find("discarded_tool_calls=1") != std::string::npos,
+                          "recovery log stage or duplicate-call accounting missing");
+    }
+
     bool protected_artifact_rejected = false;
     try {
         JsonlRequestLog unsafe("same-path.ninfer", "same-path.ninfer");

@@ -2110,21 +2110,12 @@ int main() {
         if (const int result = check_dflash_load(engine); result != 0) { return result; }
 
         struct DiscardingSink final : ninfer::OutputSink {
-            void publish(ninfer::OutputDelta) override {}
+            std::size_t output_events = 0;
+            void publish(ninfer::OutputDelta) override { ++output_events; }
         } sink;
         auto terminal = engine.submit(engine.prepare_tokens(prompts[0]), greedy_options(7));
-        bool rejected = false;
-        try {
-            (void)terminal.wait(&sink);
-        } catch (const std::logic_error&) {
-            rejected = true;
-        }
-        if (!rejected) {
-            std::cerr << label << " accepted a sink for terminal-only delivery\n";
-            return 1;
-        }
-        if (terminal.wait().generated_token_ids.size() != 7) {
-            std::cerr << label << " terminal request did not complete after sink rejection\n";
+        if (terminal.wait(&sink).generated_token_ids.size() != 7 || sink.output_events != 0) {
+            std::cerr << label << " terminal diagnostics sink changed output delivery\n";
             return 1;
         }
 

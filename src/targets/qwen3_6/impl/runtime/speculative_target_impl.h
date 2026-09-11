@@ -21,6 +21,10 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
         throw std::logic_error("speculative tree verify frame is incomplete");
     }
     card.set_gdn_state_action(GdnStateAction::RecordForReplay, frame.replay_records);
+    if (frame.tool_masks) {
+        frame.sampling = frame.tool_masks->enqueue(frame.ids, tree ? &frame.parent_index : nullptr,
+                                                   frame.valid_columns, execution.device.stream);
+    }
     card.set_sampling(frame.sampling);
     if (tree) {
         card.set_tree_verify(&frame.parent_index, &frame.ancestor_mask, &frame.prefix_lengths);

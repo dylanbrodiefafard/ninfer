@@ -95,9 +95,9 @@ public:
 
     template <class Submission>
     Impl(std::shared_ptr<void> keep_alive, Submission submission,
-         ResolvedSamplingParameters sampling, OutputDelivery delivery)
+         ResolvedSamplingParameters sampling)
         : state_(std::make_unique<Model<Submission>>(std::move(keep_alive), std::move(submission))),
-          sampling_(sampling), delivery_(delivery) {}
+          sampling_(sampling) {}
 
     GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
         return state_->wait(sink, cancellation);
@@ -107,12 +107,9 @@ public:
         return sampling_;
     }
 
-    [[nodiscard]] OutputDelivery delivery() const noexcept { return delivery_; }
-
 private:
     std::unique_ptr<Concept> state_;
     ResolvedSamplingParameters sampling_;
-    OutputDelivery delivery_;
 };
 
 GenerationHandle::GenerationHandle() noexcept                              = default;
@@ -131,9 +128,6 @@ const ResolvedSamplingParameters& GenerationHandle::resolved_sampling() const no
 
 GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView& cancellation) {
     if (impl_ == nullptr) { throw std::logic_error("GenerationHandle is empty"); }
-    if (sink != nullptr && impl_->delivery() != OutputDelivery::Streaming) {
-        throw std::logic_error("terminal-only submission cannot consume an OutputSink");
-    }
     std::unique_ptr<Impl> impl = std::move(impl_);
     return impl->wait(sink, cancellation);
 }
@@ -294,12 +288,8 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
     if (resolved_options.execution.requested_output_tokens == 0) {
         struct ImmediateSubmission {
             GenerationResult result;
-            OutputDelivery delivery;
 
-            GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
-                if (sink != nullptr && delivery != OutputDelivery::Streaming) {
-                    throw std::logic_error("terminal-only submission cannot consume an OutputSink");
-                }
+            GenerationResult wait(OutputSink*, const CancellationView& cancellation) {
                 if (cancellation.requested()) { result.finish_reason = FinishReason::Cancelled; }
                 return std::move(result);
             }
@@ -309,11 +299,10 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
         immediate.result.finish_reason           = FinishReason::OutputLimit;
         immediate.result.timings.prepare_seconds = prepare_seconds;
         immediate.result.timings.total_seconds   = prepare_seconds;
-        immediate.delivery                       = delivery;
         prompt.impl_.reset();
         host_input.reset();
         return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
-            impl_, std::move(immediate), resolved_sampling, delivery));
+            impl_, std::move(immediate), resolved_sampling));
     }
 
     return std::visit(
@@ -327,7 +316,7 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                                                    delivery, pending_deadline,
                                                    std::move(host_input));
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
-                    impl_, std::move(submission), resolved_sampling, delivery));
+                    impl_, std::move(submission), resolved_sampling));
             }
         },
         impl_->executor);

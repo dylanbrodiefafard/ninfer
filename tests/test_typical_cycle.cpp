@@ -1,5 +1,6 @@
-// Suffix-square detector: exact at p<256, Hamming ≤ 2p/512 otherwise.
+// Suffix-square detector: exact at p<256, Hamming ≤ 2p/512 otherwise, through p=2048.
 #include "runtime/contract/typical_cycle.h"
+#include "runtime/contract/reasoning_recovery.h"
 
 #include <iostream>
 #include <span>
@@ -94,13 +95,39 @@ int detector_max_period() {
     const auto hit   = least_square_period(twice);
     int failures     = 0;
     failures += check(hit.has_value() && hit->period == kTypicalCyclePeriodMax,
-                      "period 512 square was not detected");
+                      "maximum-period square was not detected");
     std::vector<TokenId> too_long(kTypicalCyclePeriodMax + 1);
     for (std::size_t i = 0; i < too_long.size(); ++i) {
         too_long[i] = static_cast<TokenId>(static_cast<int>(i) + 50);
     }
     failures += check(!least_square_period(repeat_block(too_long, 2)).has_value(),
-                      "period 513 square was admitted above p_max");
+                      "period above p_max was admitted");
+    return failures;
+}
+
+// The captured OpenCode DFLASH-SCHEDULE attractor repeats a roughly 546-token paragraph group.
+// This is deliberately above the former 512-token ceiling.
+int detector_captured_long_period() {
+    constexpr std::size_t observed_period = 546;
+    std::vector<TokenId> block(observed_period);
+    for (std::size_t i = 0; i < block.size(); ++i) {
+        block[i] = static_cast<TokenId>(5000 + static_cast<int>(i));
+    }
+    auto twice = repeat_block(block, 2);
+    twice[twice.size() - 31] = block[observed_period - 31] + 1;
+    twice[twice.size() - 79] = block[observed_period - 79] + 1;
+
+    int failures = 0;
+    failures += check(typical_cycle_hamming_max(observed_period) == 2,
+                      "p=546 Hamming budget was not 2");
+    const auto hit = least_square_period(twice);
+    failures += check(hit.has_value() && hit->period == observed_period,
+                      "captured Hamming-2 period-546 shape was not detected");
+    failures += check(hit && hit->continuation == block[0],
+                      "p=546 continuation was not x[n-p]");
+    twice[twice.size() - 127] = block[observed_period - 127] + 1;
+    failures += check(!least_square_period(twice).has_value(),
+                      "Hamming-3 period-546 shape was admitted");
     return failures;
 }
 
@@ -157,8 +184,11 @@ int detector_hamming_budget_scales() {
     failures += check(typical_cycle_hamming_max(255) == 0, "p=255 Hamming budget was not 0");
     failures += check(typical_cycle_hamming_max(256) == 1, "p=256 Hamming budget was not 1");
     failures += check(typical_cycle_hamming_max(511) == 1, "p=511 Hamming budget was not 1");
-    failures += check(typical_cycle_hamming_max(kTypicalCyclePeriodMax) == 2,
-                      "p=512 Hamming budget was not 2");
+    failures += check(typical_cycle_hamming_max(512) == 2, "p=512 Hamming budget was not 2");
+    failures += check(typical_cycle_hamming_max(1024) == 4,
+                      "p=1024 Hamming budget was not 4");
+    failures += check(typical_cycle_hamming_max(2048) == 8,
+                      "p=2048 Hamming budget was not 8");
     return failures;
 }
 
@@ -177,21 +207,100 @@ int detector_fuzzy_budget() {
     failures += check(mid_hit && mid_hit->continuation == mid_block[0],
                       "p=256 near-square continuation was not x[n-p]");
 
-    std::vector<TokenId> long_block(kTypicalCyclePeriodMax);
+    constexpr std::size_t long_period = 1024;
+    std::vector<TokenId> long_block(long_period);
     for (std::size_t i = 0; i < long_block.size(); ++i) {
         long_block[i] = static_cast<TokenId>(3000 + static_cast<int>(i));
     }
     auto long_twice = repeat_block(long_block, 2);
-    long_twice[long_twice.size() - 1]  = long_block.back() + 1;
-    long_twice[long_twice.size() - 17] = long_block[kTypicalCyclePeriodMax - 17] + 1;
-    failures += check(suffix_square_hamming(long_twice, kTypicalCyclePeriodMax) == 2,
-                      "p=512 Hamming-2 fixture was not distance 2");
+    long_twice[long_twice.size() - 1]   = long_block.back() + 1;
+    long_twice[long_twice.size() - 17]  = long_block[long_period - 17] + 1;
+    long_twice[long_twice.size() - 33]  = long_block[long_period - 33] + 1;
+    long_twice[long_twice.size() - 49]  = long_block[long_period - 49] + 1;
+    failures += check(suffix_square_hamming(long_twice, long_period) == 4,
+                      "p=1024 Hamming-4 fixture was not distance 4");
     const auto hit = least_square_period(long_twice);
-    failures += check(hit.has_value() && hit->period == kTypicalCyclePeriodMax,
-                      "Hamming-2 period-512 square was not detected");
-    long_twice[long_twice.size() - 33] = long_block[kTypicalCyclePeriodMax - 33] + 1;
+    failures += check(hit.has_value() && hit->period == long_period,
+                      "Hamming-4 period-1024 square was not detected");
+    long_twice[long_twice.size() - 65] = long_block[long_period - 65] + 1;
     failures += check(!least_square_period(long_twice).has_value(),
-                      "Hamming-3 period-512 square was admitted");
+                      "Hamming-5 period-1024 square was admitted");
+    return failures;
+}
+
+// Periods observed in exact T1.5 traces, plus the new inclusive boundary.
+// Unique IDs isolate period/tolerance behavior from vocabulary coincidences.
+int detector_new_long_periods() {
+    int failures = 0;
+    for (const auto [period, tolerance] :
+         {std::pair<std::size_t, std::size_t>{1081, 4}, {1516, 5}, {1886, 7}, {2048, 8}}) {
+        std::vector<TokenId> block(period);
+        for (std::size_t i = 0; i < period; ++i) { block[i] = static_cast<TokenId>(10000 + i); }
+        auto twice = repeat_block(block, 2);
+        failures += check(!least_square_period(twice, 32, 1024),
+                          "long-period regression unexpectedly fits the former ceiling");
+        for (std::size_t i = 0; i < tolerance; ++i) { twice[period + 17*i] += 50000; }
+        auto hit = least_square_period(twice);
+        failures += check(hit && hit->period == period && hit->continuation == twice[period],
+                          "new long-period tolerance boundary or continuation failed");
+        twice[period + 17*tolerance] += 50000;
+        failures += check(!least_square_period(twice),
+                          "new long-period detector exceeded its mismatch tolerance");
+    }
+    return failures;
+}
+
+int persistent_recovery_evidence() {
+    using ninfer::runtime::RepeatedReasoningSpan;
+    int failures = 0;
+    std::vector<TokenId> paragraph(256);
+    for (std::size_t i = 0; i < paragraph.size(); ++i) { paragraph[i] = 10000 + i; }
+    RepeatedReasoningSpan detector;
+    failures += check(!detector.observe(repeat_block(paragraph, 2)),
+                      "two paragraphs triggered a retry without persistence evidence");
+    auto three = repeat_block(paragraph, 3);
+    failures += check(!detector.observe(three), "a brief repeated passage triggered a costly retry");
+    failures += check(detector.observe(repeat_block(paragraph, 17)),
+                      "4096 redundant tokens with three copies did not recover");
+    detector = {};
+    auto varied = repeat_block(paragraph, 20);
+    for (std::size_t copy = 0; copy < 20; ++copy) { varied[(copy + 1)*256 - 1] += copy; }
+    failures += check(!detector.observe(varied),
+                      "non-identical token passages triggered an exact-span retry");
+    detector = {};
+    const std::vector<TokenId> uniform(4352, 7);
+    failures += check(!detector.observe(std::span(uniform).first(4351)),
+                      "overlapping windows double-counted redundant token coverage");
+    failures += check(detector.observe(uniform), "redundant-token boundary did not recover");
+    std::vector<TokenId> long_reasoning(16000);
+    for (std::size_t i = 0; i < long_reasoning.size(); ++i) { long_reasoning[i] = 10000 + i; }
+    detector = {};
+    failures += check(!detector.observe(long_reasoning),
+                      "reasoning length alone triggered a retry");
+    // Different gaps model insertions/deletions induced by one-token exclusions;
+    // the repeated passage persists even though no stable cycle period exists.
+    std::vector<TokenId> disrupted;
+    TokenId gap = 90000;
+    for (int copy = 0; copy < 17; ++copy) {
+        for (int i = 0; i < 23 + copy; ++i) { disrupted.push_back(gap++); }
+        disrupted.insert(disrupted.end(), paragraph.begin(), paragraph.end());
+    }
+    detector = {};
+    bool recovered = false;
+    for (std::size_t n = 1; n <= disrupted.size(); ++n) {
+        recovered |= detector.observe(std::span(disrupted).first(n));
+    }
+    failures += check(recovered, "variable-period returning passage escaped recovery");
+    failures += check(!detector.observe(paragraph), "a fresh shorter attempt retained old evidence");
+    paragraph.resize(5000);
+    for (std::size_t i = 0; i < paragraph.size(); ++i) { paragraph[i] = 10000 + i; }
+    detector = {};
+    auto long_copies = repeat_block(paragraph, 2);
+    failures += check(!detector.observe(long_copies),
+                      "two large repeated passages bypassed the three-copy requirement");
+    long_copies.insert(long_copies.end(), paragraph.begin(), paragraph.begin() + 256);
+    failures += check(detector.observe(long_copies),
+                      "a multi-paragraph cycle above the square ceiling escaped recovery");
     return failures;
 }
 
@@ -289,11 +398,14 @@ int main() {
     failures += detector_below_p_min();
     failures += detector_primitive_not_multiple();
     failures += detector_max_period();
+    failures += detector_captured_long_period();
     failures += detector_rotation_and_break();
     failures += detector_prompt_excluded();
     failures += detector_short_period_is_exact();
     failures += detector_hamming_budget_scales();
     failures += detector_fuzzy_budget();
+    failures += detector_new_long_periods();
+    failures += persistent_recovery_evidence();
     failures += detector_non_square_permutation();
     failures += host_gates();
     failures += singleton_trap_lemma();

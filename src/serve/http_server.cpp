@@ -56,7 +56,7 @@ CompletionTimings completion_timings_from_outcome(const GenerationOutcome& outco
         static_cast<int>(outcome.metrics.speculative_draft_tokens),
         static_cast<int>(outcome.metrics.speculative_accepted_tokens),
         outcome.metrics.prefill_tail_tok_s, outcome.metrics.prefill_tail_window_s,
-        outcome.metrics.prefix_cache_hit_tokens);
+        outcome.metrics.prefix_cache_hit_tokens, outcome.metrics.recovery);
     timings.prefix_reuse_path     = outcome.metrics.prefix_reuse_path;
     timings.prefix_reuse_source   = outcome.metrics.prefix_reuse_source;
     timings.captured_context_checkpoint_tokens =
@@ -452,7 +452,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
     if (!request.stream) {
         try {
-            const GenerationOutcome outcome = service_->run(prepared, nullptr, [&req] {
+            const GenerationOutcome outcome = service_->run(prepared, log_context.id, nullptr, [&req] {
                 return req.is_connection_alive && !req.is_connection_alive();
             });
             log_request_done(log_context, outcome);
@@ -513,7 +513,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                            (sink.is_writable && !sink.is_writable());
                 };
 
-                const GenerationOutcome outcome = service_->run(stream->prepared, &output);
+                const GenerationOutcome outcome = service_->run(stream->prepared, log_context.id, &output);
                 log_request_done(log_context, outcome);
                 const CompletionTimings timings = completion_timings_from_outcome(outcome);
                 const std::string_view remaining = unstreamed_content(outcome);
@@ -673,7 +673,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
 
     if (!request.stream) {
         try {
-            const GenerationOutcome outcome = service_->run(prepared, nullptr, [&req] {
+            const GenerationOutcome outcome = service_->run(prepared, log_context.id, nullptr, [&req] {
                 return req.is_connection_alive && !req.is_connection_alive();
             });
             log_request_done(log_context, outcome);
@@ -751,7 +751,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                            (sink.is_writable && !sink.is_writable());
                 };
 
-                const GenerationOutcome outcome = service_->run(stream->prepared, &output);
+                const GenerationOutcome outcome = service_->run(stream->prepared, log_context.id, &output);
                 log_request_done(log_context, outcome);
                 const std::string_view remaining = unstreamed_content(outcome);
 

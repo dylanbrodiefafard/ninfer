@@ -89,6 +89,9 @@ struct BatchedGeneratedRound {
     std::span<const TokenId> tokens;
     std::span<const std::int32_t> row_counts;
     std::uint32_t row_stride = 1;
+    // True when the sampler was armed with a protected, valid cycle exclusion for
+    // that row's root selection. This does not claim the unmodified draw differed.
+    std::array<bool, kMaximumConcurrency> cycle_exclusions{};
 };
 
 struct PrefillStepResult {

@@ -1,0 +1,97 @@
+--- a/json_schema_converter.cc
++++ b/json_schema_converter.cc
+@@ -2353,45 +2353,73 @@
+   std::string mid_sep = NextSeparator();
+   std::string last_sep = NextSeparator(true);
+ 
+-  // Build one "item" alternation over every property (any required/optional key) plus any
+-  // additional/pattern key; any_order does not care which key goes where.
++  // Named properties form a subset automaton: every transition consumes a new
++  // key, and only states satisfying required/min/max may close. Share suffixes
++  // by the set already emitted, not by the permutation used to reach it.
++  // This is the same language for JSON validation and Qwen XML generation.
+   std::vector<std::string> item_patterns;
+   for (size_t idx = 0; idx < properties.size(); ++idx) {
+     const auto& prop = properties[idx];
+     std::string value_rule = CreateRule(prop.schema, rule_name + "_prop_" + std::to_string(idx));
+     item_patterns.push_back(FormatProperty(prop.name, value_rule, rule_name, idx));
+   }
++  std::string additional_pattern;
+   if (additional != nullptr) {
+     if (!additional_prop_pattern_override.empty()) {
+-      item_patterns.push_back(additional_prop_pattern_override);
++      additional_pattern = additional_prop_pattern_override;
+     } else {
+       std::string add_value_rule = CreateRule(additional, rule_name + "_" + additional_suffix);
+-      item_patterns.push_back(FormatOtherProperty(
++      additional_pattern = FormatOtherProperty(
+           GetKeyPatternExcluding(properties, rule_name),
+           add_value_rule,
+           rule_name,
+           additional_suffix
+-      ));
++      );
+     }
+   }
+ 
+-  std::string item_body;
+-  for (size_t i = 0; i < item_patterns.size(); ++i) {
+-    if (i != 0) {
+-      item_body += " | ";
++  std::unordered_map<std::string, std::string> states;
++  auto suffix = [&](auto&& self, std::string seen, int count) -> std::string {
++    // With no upper bound, counts above the lower bound are equivalent. Retain
++    // zero versus nonzero for the first separator. This also makes arbitrary
++    // additional properties a bounded recursive tail instead of an unrolling.
++    if (max_properties == -1) { count = std::min(count, std::max(1, min_properties)); }
++    const auto key = seen + ":" + std::to_string(count);
++    if (auto it = states.find(key); it != states.end()) { return it->second; }
++    const auto name = ebnf_script_creator_.AllocateRuleName(
++        rule_name + "_set_" + std::to_string(states.size()));
++    states.emplace(key, name);
++    int missing = 0;
++    for (size_t i = 0; i < properties.size(); ++i) {
++      missing += seen[i] == '0' && required.count(properties[i].name);
+     }
+-    item_body += item_patterns[i];
+-  }
+-  std::string item_rule = ebnf_script_creator_.AddRule(rule_name + "_item", item_body);
+-
+-  // Repeat `item` between n = max(minProperties, #required) and m = maxProperties times; only the
+-  // count is constrained, not which keys appear.
+-  int min_count = std::max(min_properties, static_cast<int>(required.size()));
+-  std::string content =
+-      item_rule + " " +
+-      GetPropertyWithNumberConstraints(mid_sep + " " + item_rule, min_count, max_properties, 1);
+-
+-  return first_sep + " (" + content + ") " + last_sep;
++    std::string body;
++    auto choice = [&](const std::string& value) {
++      if (!body.empty()) { body += " | "; }
++      body += "(" + value + ")";
++    };
++    // GenerateObject supplies the empty-object branch separately.
++    if (count > 0 && count >= min_properties && missing == 0) { choice(last_sep); }
++    if (max_properties == -1 || count < max_properties) {
++      const auto& sep = count == 0 ? first_sep : mid_sep;
++      for (size_t i = 0; i < properties.size(); ++i) {
++        if (seen[i] == '1') { continue; }
++        const int remaining = missing - static_cast<int>(required.count(properties[i].name));
++        if (max_properties != -1 && count + 1 + remaining > max_properties) { continue; }
++        auto next = seen;
++        next[i] = '1';
++        choice(sep + " " + item_patterns[i] + " " + self(self, std::move(next), count + 1));
++      }
++      if (!additional_pattern.empty() &&
++          (max_properties == -1 || count + 1 + missing <= max_properties)) {
++        choice(sep + " " + additional_pattern + " " + self(self, seen, count + 1));
++      }
++    }
++    XGRAMMAR_CHECK(!body.empty()) << "Unsatisfiable object property constraints";
++    ebnf_script_creator_.AddRuleWithAllocatedName(name, body);
++    return name;
++  };
++  return suffix(suffix, std::string(properties.size(), '0'), 0);
+ }
+ 
+ std::string JSONSchemaConverter::GetPartialRuleForProperties(

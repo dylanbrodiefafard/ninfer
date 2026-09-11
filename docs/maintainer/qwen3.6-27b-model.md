@@ -402,9 +402,9 @@ One propose block:
    route, and other B>1 widths use request-indexed SmallT CTAs. Packed GDN recurrence uses one
    fused scratch-SSM pass to publish raw replay records and produce T=1 snapshot `out`. Greedy
    accepts the matching prefix.
-   Truncated sampling uses Leviathan `min(1,p/q)` on every hop. Under p-less, hop 0 is
-   Leviathan with one-hot `q`; later hops and the bonus are greedy
-   argmax. ReplaySSM Fold commits the corresponding sequential prefix. The RTX 5090
+   Truncated sampling uses Leviathan `min(1,p/q)` on every hop. P-less also uses Leviathan
+   on every hop, with one-hot `q`, and samples the bonus from its column's p-less distribution.
+   A cycle exclusion affects hop 0 only. ReplaySSM Fold commits the corresponding sequential prefix. The RTX 5090
    recommendation is k=4 (W=5, one SmallT GQA tile). Maximum k=5 (W=6). `--adaptive-draft`
    picks live k in `{3,4,5}` as in [§8.1](#81-adaptive-draft-length). Frozen
    `--draft-tokens 4` stays `{4}`. CUDA graphs capture one graph per k; the next k is chosen
@@ -480,9 +480,10 @@ In greedy mode, MTP and DFlash2 accept the longest draft prefix matching the tar
 sampling mode both use chain rejection sampling against the represented target distribution. A bad
 draft therefore reduces acceptance and throughput; it must not change the distribution of emitted
 target tokens. Under p-less, DFlash2 chain accept uses the same one-hot `q` convention as MTP
-(ignore any 16-way selector `q`) **only at hop 0**: p-less temperature is not a draft softmax, so
-`p/q` from a 16-way shortlist would over-accept copied n-grams. Later hops, and the bonus after a
-full accept, are greedy (accept iff the draft equals that packed column's p-less argmax). DFlash2
+(ignore any 16-way selector `q`) at every hop: p-less temperature is not a draft softmax, so
+`p/q` from a 16-way shortlist would over-accept copied n-grams. Each hop uses its own represented
+p-less distribution, and the bonus samples its own column's distribution. Cycle-exit exclusion
+affects the root only; later hops are not silently changed to greedy sampling. DFlash2
 differs by producing the whole candidate chain in one masked-block forward. Packed GDN conv-record uses a T=1-reduction, BF16-history SmallT launch at B=2..4; packed
 GDN recurrent overlays ordinary T=1 snapshot arithmetic on scratch SSM so those packed logits
 match width-one decode. Fold still consumes the T=W records.
@@ -493,6 +494,18 @@ lane's current state. The transaction trims rejected KV, commits continuation hi
 DFlash cyclic state, and only then advances the authoritative frontier and publishes output. Near
 context capacity, the Engine falls back to the one-token target path when a complete safe round
 does not fit.
+
+Declared tool constraints intersect the target token domain before sampling on ordinary,
+chain and tree routes. The family frontend owns compilation, transactional grammar matching,
+canonical Qwen LF framing and schema-aware typed publication. The grammar's free-text dispatch excludes
+orphan Qwen closing delimiters and the observed legacy `</invoke>` closer, without applying
+those closing-tag exclusions to reasoning or schema-valid parameter values. The reasoning
+region separately excludes `<tool_call>`; closing reasoning normally licenses the actual
+call grammar, rather than promoting reasoning text into calls. Per-node masks use the actual
+verification parent relation, not chain depth. Draft proposals never advance grammar state;
+only the accepted output transaction does. The runtime owns bounded repeated-reasoning/duplicate-call recovery
+and full-state re-prefill, as specified in the concurrent inference architecture. Neither
+grammar constraints nor loop recovery authorize execution of a generated tool.
 
 ## 10. Vision preprocessing
 

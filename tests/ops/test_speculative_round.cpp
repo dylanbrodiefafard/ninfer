@@ -2560,7 +2560,7 @@ int p_less_chain_column_local_support_case(int physical_rows, int token_domain,
     return failures;
 }
 
-int p_less_tree_later_hops_greedy_not_membership(int physical_rows, int token_domain,
+int p_less_tree_later_hops_sample_target(int physical_rows, int token_domain,
                                                  const char* label) {
     constexpr int kWidth = 4;
     const std::vector<std::int32_t> parent{-1, 0, 1, 1};
@@ -2571,10 +2571,6 @@ int p_less_tree_later_hops_greedy_not_membership(int physical_rows, int token_do
     survivors[2] = {19};
     survivors[3] = {19};
     auto logits_f = peaked_p_less_per_column_logits(physical_rows, token_domain, survivors);
-    const std::size_t col1 = static_cast<std::size_t>(physical_rows);
-    logits_f[col1 + 3]     = 21.0f;
-    logits_f[col1 + 11]    = 20.0f;
-    round_to_bf16(logits_f);
     std::vector<std::uint16_t> logits_bits(logits_f.size());
     for (std::size_t i = 0; i < logits_f.size(); ++i) { logits_bits[i] = f32_to_bf16(logits_f[i]); }
 
@@ -2583,7 +2579,8 @@ int p_less_tree_later_hops_greedy_not_membership(int physical_rows, int token_do
     config.p_less                         = 1;
     constexpr std::int32_t initial_length = 40;
     int failures                          = 0;
-    for (unsigned long long seed = 1; seed <= 8ull; ++seed) {
+    int second = 0;
+    for (unsigned long long seed = 1; seed <= 64ull; ++seed) {
         config.seed    = seed;
         const auto got = run_tree_accept(logits_bits, physical_rows, kWidth, parent, verify_ids, 3,
                                          kWidth, initial_length, token_domain, config, nullptr);
@@ -2595,17 +2592,21 @@ int p_less_tree_later_hops_greedy_not_membership(int physical_rows, int token_do
                       << seed << '\n';
             ++failures;
         }
-        if (got.accepted != 1 || got.licensed[1] != 3) {
-            std::cerr << label << ": later hop walked a non-argmax child, accepted=" << got.accepted
-                      << " licensed[1]=" << got.licensed[1] << " seed=" << seed << '\n';
-            ++failures;
-        }
+        second += got.licensed[1] == 11;
+    }
+    // Independent FP64 support oracle plus symmetry: the two equal represented
+    // logits have probability 1/2 each. A greedy later hop has zero second draws.
+    const auto support = p_less_support_oracle(logits_f, physical_rows, 1, token_domain, config);
+    if (support != std::vector<int>{3, 11} || second < 16 || second > 48) {
+        std::cerr << label << ": later-hop distribution differs from equiprobable target: "
+                  << second << "/64 second-token draws\n";
+        ++failures;
     }
     return failures;
 }
 
-int p_less_chain_later_hops_greedy_not_leviathan(int physical_rows, int token_domain,
-                                                 const char* label) {
+int p_less_chain_later_hops_sample_target(int physical_rows, int token_domain,
+                                         const char* label, bool bonus = false) {
     constexpr int k = 5;
     std::vector<std::int32_t> drafts(static_cast<std::size_t>(k), 11);
     drafts[0] = 7;
@@ -2613,11 +2614,12 @@ int p_less_chain_later_hops_greedy_not_leviathan(int physical_rows, int token_do
     survivors[0] = {7};
     survivors[1] = {3, 11};
     for (int col = 2; col <= k; ++col) { survivors[static_cast<std::size_t>(col)] = {3, 11}; }
+    if (bonus) {
+        std::fill(drafts.begin(), drafts.end(), 7);
+        for (int col = 0; col < k; ++col) { survivors[col] = {7}; }
+    }
+    const int sampled_column = bonus ? k : 1;
     auto logits_f = peaked_p_less_per_column_logits(physical_rows, token_domain, survivors);
-    const std::size_t col1 = static_cast<std::size_t>(physical_rows);
-    logits_f[col1 + 3]     = 21.0f;
-    logits_f[col1 + 11]    = 20.0f;
-    round_to_bf16(logits_f);
     std::vector<std::uint16_t> logits_bits(logits_f.size());
     for (std::size_t i = 0; i < logits_f.size(); ++i) { logits_bits[i] = f32_to_bf16(logits_f[i]); }
 
@@ -2626,7 +2628,8 @@ int p_less_chain_later_hops_greedy_not_leviathan(int physical_rows, int token_do
     config.p_less                         = 1;
     constexpr std::int32_t initial_length = 40;
     int failures                          = 0;
-    for (unsigned long long seed = 1; seed <= 8ull; ++seed) {
+    int second = 0;
+    for (unsigned long long seed = 1; seed <= 64ull; ++seed) {
         config.seed    = seed;
         const auto got = run_chain_accept(logits_bits, physical_rows, drafts, initial_length,
                                          token_domain, config, nullptr, nullptr);
@@ -2637,12 +2640,16 @@ int p_less_chain_later_hops_greedy_not_leviathan(int physical_rows, int token_do
                       << seed << '\n';
             ++failures;
         }
-        if (got.accepted != 1 || got.licensed[1] != 3) {
-            std::cerr << label << ": later hop Leviathan-accepted a non-argmax draft, accepted="
-                      << got.accepted << " licensed[1]=" << got.licensed[1] << " seed=" << seed
-                      << '\n';
-            ++failures;
-        }
+        second += got.licensed[sampled_column] == 11;
+    }
+    // Independent FP64 support oracle plus symmetry: the two equal represented
+    // logits have probability 1/2 each. A greedy later hop has zero second draws.
+    const auto support = p_less_support_oracle(logits_f, physical_rows, sampled_column,
+                                              token_domain, config);
+    if (support != std::vector<int>{3, 11} || second < 16 || second > 48) {
+        std::cerr << label << ": later-hop distribution differs from equiprobable target: "
+                  << second << "/64 second-token draws\n";
+        ++failures;
     }
     return failures;
 }
@@ -2795,6 +2802,49 @@ int remap_case(int token_count) {
     return failures;
 }
 
+int column_eligibility_cases(int domain, int physical) {
+    const int stride = (domain + 31) / 32 + 3;
+    std::vector<std::uint32_t> masks(5 * stride, 0);
+    const std::vector<int> allowed{22, 31, 44, 41, 55};
+    for (int col = 0; col < 5; ++col) {
+        masks[col * stride + allowed[col] / 32] |= 1u << (allowed[col] % 32);
+        masks[col * stride] |= 1u << 8; // explicitly suppressed despite grammar eligibility
+    }
+    DeviceBuffer device_masks = to_device(masks);
+    std::vector<std::int32_t> counts(domain, 0);
+    int failures = 0;
+    for (int p_less : {0, 1}) {
+        ops::SamplingConfig cfg{};
+        cfg.temperature = 2;
+        cfg.p_less = p_less;
+        cfg.seed = 42;
+        cfg.allowed_token_words = static_cast<const std::uint32_t*>(device_masks.p);
+        cfg.allowed_token_column_stride = stride;
+        cfg.suppressed_token_count = 1;
+        cfg.suppressed_tokens[0] = 8;
+        const std::string label = "column eligibility V=" + std::to_string(domain) +
+                                  " p_less=" + std::to_string(p_less);
+        // The independent expected law is a singleton after intersecting eligibility
+        // and explicit suppression. A much larger forbidden logit must have no mass.
+        const auto chain_logits = peaked_column_logits(physical, 3, {0, 0, 0});
+        const std::vector<std::int32_t> drafts{22, 31};
+        failures += execute_accept_case(label + " chain", {0, 0, 0}, chain_logits,
+            physical, drafts, 40, domain, cfg, counts, accept_state_oracle(drafts, 2, 44, 40));
+        const std::vector<std::int32_t> invalid_drafts{22, 8};
+        failures += execute_accept_case(label + " correction", {0, 0, 0}, chain_logits,
+            physical, invalid_drafts, 40, domain, cfg, counts,
+            accept_state_oracle(invalid_drafts, 1, 31, 40));
+        // Traversal 0 -> 2 -> 4: selecting a mask by depth instead of node is wrong.
+        failures += execute_tree_case(label + " tree", domain, physical, 5,
+            {-1, 0, 0, 1, 2}, {7, 11, 22, 33, 44}, {0, 0, 0, 0, 0},
+            peaked_column_logits(physical, 5, {0, 0, 0, 0, 0}), 4, 5, cfg, counts,
+            {22, 44, 55, 0, 0}, 2, 4, {0, 2, 4, 0, 0});
+    }
+    failures += verify_exact("eligibility masks unchanged",
+        from_device<std::uint32_t>(device_masks, masks.size()), masks);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -2804,6 +2854,9 @@ int main() {
     }
 
     int failures = 0;
+    failures += column_eligibility_cases(64, 64);
+    failures += column_eligibility_cases(4096, 4096);
+    failures += column_eligibility_cases(248077, 248320);
     const std::size_t k15 =
         ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 15, 15, 1, 1);
     if (k15 == 0 || k15 != ops::sampling_workspace_capacity_bytes(257, 16, 16) ||
@@ -2945,14 +2998,18 @@ int main() {
         2048, 2048, 32ull, "p-less chain samples each verify column's support V=2048");
     failures += p_less_chain_column_local_support_case(
         248320, 248077, 4ull, "DFlash2 p-less chain samples each verify column's support");
-    failures += p_less_tree_later_hops_greedy_not_membership(
-        64, 64, "p-less tree later hops greedy V=64");
-    failures += p_less_tree_later_hops_greedy_not_membership(
-        2048, 2048, "p-less tree later hops greedy V=2048");
-    failures += p_less_chain_later_hops_greedy_not_leviathan(
-        64, 64, "p-less chain later hops greedy V=64");
-    failures += p_less_chain_later_hops_greedy_not_leviathan(
-        2048, 2048, "p-less chain later hops greedy V=2048");
+    failures += p_less_tree_later_hops_sample_target(
+        64, 64, "p-less tree later-hop target distribution V=64");
+    failures += p_less_tree_later_hops_sample_target(
+        248320, 248077, "p-less tree later-hop target distribution real vocabulary");
+    failures += p_less_chain_later_hops_sample_target(
+        64, 64, "p-less chain later-hop target distribution V=64");
+    failures += p_less_chain_later_hops_sample_target(
+        248320, 248077, "p-less chain later-hop target distribution real vocabulary");
+    failures += p_less_chain_later_hops_sample_target(
+        64, 64, "p-less bonus target distribution V=64", true);
+    failures += p_less_chain_later_hops_sample_target(
+        248320, 248077, "p-less bonus target distribution real vocabulary", true);
     failures += p_less_tree_dirty_workspace_replay_case(
         2048, 2048, "p-less tree W=12 dirty-workspace replay V=2048");
     failures += p_less_tree_dirty_workspace_replay_case(

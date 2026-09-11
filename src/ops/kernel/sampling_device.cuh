@@ -113,11 +113,20 @@ __device__ __forceinline__ bool sampling_p_less_active(const SamplingConfig& cfg
 }
 
 __device__ __forceinline__ bool sampling_token_suppressed(int v, const SamplingConfig& c) {
+    if (c.allowed_token_words &&
+        !(c.allowed_token_words[v >> 5] & (std::uint32_t{1} << (v & 31)))) { return true; }
     const int count = min(c.suppressed_token_count, SamplingConfig::kMaximumSuppressedTokens);
     for (int i = 0; i < count; ++i) {
         if (c.suppressed_tokens[i] == v) { return true; }
     }
     return false;
+}
+
+__device__ __forceinline__ SamplingConfig sampling_column_config(SamplingConfig cfg, int col) {
+    if (cfg.allowed_token_words) {
+        cfg.allowed_token_words += static_cast<std::int64_t>(col) * cfg.allowed_token_column_stride;
+    }
+    return cfg;
 }
 
 __device__ __forceinline__ bool sampling_p_less_in_domain(int v, std::int32_t vocab,
@@ -616,7 +625,9 @@ __device__ inline SamplingPLessMoments sampling_p_less_merge_moments(
     const float m                 = sampling_key_float(best);
     float local_s                 = 0.0f;
     float local_q                 = 0.0f;
-    if (threadIdx.x < partial_count) {
+    // An entirely masked tile has no maximum (key == 0) and contributes zero
+    // mass. Do not decode its sentinel as a float and form 0 * exp(NaN).
+    if (threadIdx.x < partial_count && key != 0ull) {
         const float scale = __expf((sampling_key_float(key) - m) * inv_temp);
         local_s           = sums.first * scale;
         local_q           = sums.second * scale * scale;

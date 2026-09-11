@@ -152,6 +152,9 @@ struct EngineOptions {
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     bool use_cuda_graph = true;
+    // Diagnostic baseline: disable repetition exclusions and internal regeneration,
+    // without disabling tool grammar or changing the requested sampling law.
+    bool generation_recovery = true;
     LoadProgress load_progress;
 };
 
@@ -410,11 +413,13 @@ struct PromptInput {
 };
 
 enum class RequestErrorKind : std::uint8_t {
+    InvalidToolSchema,
     ContextLengthExceeded,
     MediaBudgetExceeded,
     Overloaded,
     QueueTimeout,
     Unavailable,
+    RecoveryExhausted,
 };
 
 class RequestError final : public std::invalid_argument {
@@ -452,10 +457,28 @@ enum class OutputDelivery : std::uint8_t {
     Streaming,
 };
 
+enum class RecoveryEventKind : std::uint8_t {
+    CycleExclusion, RetryTriggered, RetryStarted, RetryPrefillComplete, Finished, Exhausted,
+};
+
+// Host-only diagnostics, never model output. Delivered by wait() on its caller thread,
+// including for TerminalOnly requests. Counts are cumulative across internal retries.
+struct RecoveryEvent {
+    RecoveryEventKind kind = RecoveryEventKind::CycleExclusion;
+    std::string cause;
+    std::uint32_t attempts = 0;
+    std::uint32_t cycle_exclusions = 0;
+    std::uint32_t discarded_tool_calls = 0;
+    std::uint32_t discarded_reasoning_tokens = 0;
+    std::size_t generated_tokens = 0;
+    std::uint32_t remaining_tokens = 0;
+};
+
 class OutputSink {
 public:
     virtual ~OutputSink()                   = default;
     virtual void publish(OutputDelta delta) = 0;
+    virtual void recovery_event(const RecoveryEvent&) {}
 };
 
 class CancellationView {
@@ -514,11 +537,28 @@ enum class PrefixReuseSource : std::uint8_t {
     HostDisk,
 };
 
+struct GenerationRecoveryStats {
+    std::uint32_t attempts = 0;
+    std::uint32_t discarded_tool_calls = 0;
+    // Generated reasoning omitted from internal retry context, not retracted
+    // from the published response or removed from completion-token usage.
+    std::uint32_t discarded_reasoning_tokens = 0;
+    std::uint32_t prefill_samples = 0;
+    std::uint64_t prefill_tokens = 0;
+    double prepare_seconds = 0.0;
+    double prefill_seconds = 0.0;
+};
+
 struct GenerationResult {
     PromptSummary prompt;
     std::vector<TokenId> generated_token_ids;
     std::string content;
     std::string reasoning;
+    // Complete, schema-validated calls. Tool markup is not streamed as content.
+    std::vector<ToolCall> tool_calls;
+    // Diagnostic names only when tools were not declared; never executable.
+    std::vector<std::string> undeclared_tool_call_names;
+    GenerationRecoveryStats recovery;
     std::uint32_t reasoning_tokens     = 0;
     FinishReason finish_reason         = FinishReason::None;
     std::uint32_t reused_prompt_tokens = 0;

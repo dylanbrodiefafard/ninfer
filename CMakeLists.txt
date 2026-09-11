@@ -83,6 +83,7 @@ endif()
 find_package(CUDAToolkit REQUIRED)
 find_package(PkgConfig REQUIRED)
 find_package(Threads REQUIRED)
+include(cmake/xgrammar.cmake)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
   libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)
 pkg_check_modules(ZSTD REQUIRED libzstd)

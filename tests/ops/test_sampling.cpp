@@ -47,7 +47,9 @@ bool same_config(const ops::SamplingConfig& a, const ops::SamplingConfig& b) {
            a.suppressed_token_count == b.suppressed_token_count &&
            std::equal(std::begin(a.suppressed_tokens), std::end(a.suppressed_tokens),
                       std::begin(b.suppressed_tokens)) &&
-           a.typical_exclude == b.typical_exclude;
+           a.typical_exclude == b.typical_exclude &&
+           a.allowed_token_words == b.allowed_token_words &&
+           a.allowed_token_column_stride == b.allowed_token_column_stride;
 }
 
 std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
@@ -1220,6 +1222,71 @@ int p_less_first_order_slack_contract() {
     return failures;
 }
 
+int eligibility_masks(int domain, int physical) {
+    const int words = (domain + 31) / 32;
+    std::vector<std::uint32_t> masks(3 * words, 0);
+    const std::vector<int> expected{31, 32, domain - 1};
+    std::vector<float> logits(3 * physical, -20);
+    for (int row = 0; row < 3; ++row) {
+        masks[row * words + expected[row] / 32] |= 1u << (expected[row] % 32);
+        masks[row * words] |= 1u << 8;
+        logits[row * physical] = 100;
+        logits[row * physical + 8] = 90;
+        for (int v = domain; v < physical; ++v) { logits[row * physical + v] = 200; }
+        if (domain % 32) { masks[(row + 1) * words - 1] |= ~0u << (domain % 32); }
+    }
+    auto device_masks = to_device(masks);
+    std::vector<ops::SamplingConfig> configs(3);
+    for (int row = 0; row < 3; ++row) {
+        auto& cfg = configs[row];
+        cfg.temperature = row == 2 ? 0 : 2;
+        cfg.p_less = row == 0;
+        cfg.allowed_token_words = static_cast<const std::uint32_t*>(device_masks.p) + row * words;
+        cfg.suppressed_token_count = 1;
+        cfg.suppressed_tokens[0] = 8;
+    }
+    const auto result = run_batch(logits, physical, domain, configs, {17, 18, 19},
+                                  ops::kSamplePurposeDecode);
+    int failures = result.integrity_failures;
+    failures += verify_exact("mixed-mode eligibility masks", result.tokens, expected);
+    failures += verify_exact("sample masks unchanged",
+        from_device<std::uint32_t>(device_masks, masks.size()), masks);
+    return failures;
+}
+
+int masked_p_less_distribution(int domain, int physical) {
+    std::vector<std::uint32_t> mask((domain + 31) / 32, 0);
+    mask[0] = 1u << 31;
+    mask[(domain - 1) / 32] |= 1u << ((domain - 1) % 32);
+    auto device_mask = to_device(mask);
+    std::vector<float> logits(8 * physical, 0);
+    for (int row = 0; row < 8; ++row) { logits[row * physical] = 100; }
+    int left = 0, failures = 0;
+    for (int group = 0; group < 8; ++group) {
+        std::vector<ops::SamplingConfig> configs(8);
+        for (int row = 0; row < 8; ++row) {
+            configs[row].p_less = 1;
+            configs[row].temperature = 2;
+            configs[row].seed = group * 8 + row;
+            configs[row].allowed_token_words = static_cast<const std::uint32_t*>(device_mask.p);
+        }
+        const auto result = run_batch(logits, physical, domain, configs,
+            std::vector<int>(8, 19), ops::kSamplePurposeDecode);
+        failures += result.integrity_failures;
+        for (int token : result.tokens) {
+            left += token == 31;
+            failures += token != 31 && token != domain - 1;
+        }
+    }
+    // Independent law: only two equal represented logits are eligible, hence
+    // p=(1/2,1/2), collision=1/2, and both remain in the p-less support.
+    if (left < 16 || left > 48) {
+        std::cerr << "masked p-less collapsed a two-atom distribution: " << left << "/64\n";
+        ++failures;
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -1229,6 +1296,11 @@ int main() {
     }
 
     int failures            = 0;
+    failures += eligibility_masks(64, 64);
+    failures += eligibility_masks(1000, 1024);
+    failures += eligibility_masks(248077, 248320);
+    failures += masked_p_less_distribution(64, 64);
+    failures += masked_p_less_distribution(248077, 248320);
     const std::size_t at_16 = ops::sampling_workspace_capacity_bytes(257, 16, 16);
     if (ops::sampling_workspace_capacity_bytes(256, 1, 16) != 0 || at_16 == 0 ||
         ops::sampling_workspace_capacity_bytes(257, 17, 17) != 0 ||

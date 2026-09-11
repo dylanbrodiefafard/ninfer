@@ -10,6 +10,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         cmake \
+        git \
         libavcodec-dev \
         libavformat-dev \
         libavutil-dev \
@@ -17,6 +18,7 @@ RUN apt-get update \
         libswscale-dev \
         libzstd-dev \
         ninja-build \
+        patch \
         pkg-config \
         python3 \
     && rm -rf /var/lib/apt/lists/* \

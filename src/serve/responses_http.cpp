@@ -245,7 +245,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     if (!request.stream) {
         try {
             const GenerationOutcome outcome =
-                service_->run(prepared, nullptr, [&req] { return disconnected(req); });
+                service_->run(prepared, log_context.id, nullptr, [&req] { return disconnected(req); });
             const ResponsesRuntimeValues runtime = runtime_values(prepared, &outcome);
             BuiltResponse response = make_response_object(id, created, request, runtime, outcome);
             if (request.store) {
@@ -302,7 +302,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                            (sink.is_writable && !sink.is_writable());
                 };
 
-                const GenerationOutcome outcome = service_->run(stream->prepared, &output);
+                const GenerationOutcome outcome = service_->run(stream->prepared, stream->log_context.id, &output);
                 ResponsesStreamFinish finished  = stream->encoder->finish(outcome);
                 if (stream->request.store) {
                     StoredResponse stored;

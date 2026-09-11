@@ -201,6 +201,10 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
              : 0ULL);
     base->summary.service_work_quanta =
         projected_service_work(base->summary, 0, prefill_chunk, cold_prefill_splits);
+    if (prompt.generation_recovery && base->sampling.p_less) {
+        base->summary.service_work_quanta += qwen3_6::GenerationRecoveryContext::maximum_attempts *
+            (schedule::prefill_chunk_count(reserved_context_tokens, prefill_chunk) + 2ULL);
+    }
     return RequestBasePlan(std::move(base));
 }
 
@@ -357,6 +361,12 @@ void ProgramImplCore::finish_request_plan(RequestPlanImpl& plan, const ResidentS
              : 0ULL);
     plan.summary.service_work_quanta =
         projected_service_work(plan.summary, plan.reuse_base, prefill_chunk, prefill_splits);
+    if (prompt.generation_recovery && plan.sampling.p_less) {
+        plan.summary.service_work_quanta += qwen3_6::GenerationRecoveryContext::maximum_attempts *
+            (schedule::prefill_chunk_count(plan.summary.prompt_tokens +
+                (plan.summary.effective_output_tokens == 0 ? 0U :
+                 plan.summary.effective_output_tokens - 1U), prefill_chunk) + 2ULL);
+    }
 }
 
 RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,

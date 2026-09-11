@@ -113,6 +113,16 @@ ninfer_add_test(ninfer_gdn_replay_records_test
   SOURCES test_gdn_replay_records.cpp
   LIBRARIES ninfer_core)
 # Family frontend and one opt-in real-artifact prefix/MTP integration test.
+ninfer_add_test(ninfer_qwen3_6_generation_recovery_test
+  SOURCES targets/qwen3_6/test_generation_recovery.cpp
+  LIBRARIES ninfer_engine)
+target_include_directories(ninfer_qwen3_6_generation_recovery_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+ninfer_add_test(ninfer_qwen3_6_tool_grammar_test
+  SOURCES targets/qwen3_6/test_tool_grammar.cpp
+  LIBRARIES ninfer_engine ninfer_tool_grammar)
+target_include_directories(ninfer_qwen3_6_tool_grammar_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 ninfer_add_test(ninfer_qwen3_6_frontend_test
   SOURCES targets/qwen3_6/test_frontend.cpp
   NEEDS_SOURCE_DIR
@@ -233,9 +243,6 @@ ninfer_add_test(ninfer_response_store_test
   LIBRARIES ninfer_serve)
 ninfer_add_test(ninfer_anthropic_schema_test
   SOURCES test_anthropic_schema.cpp
-  LIBRARIES ninfer_serve)
-ninfer_add_test(ninfer_tool_call_parser_test
-  SOURCES test_tool_call_parser.cpp
   LIBRARIES ninfer_serve)
 ninfer_add_test(ninfer_serve_options_test
   SOURCES test_serve_options.cpp

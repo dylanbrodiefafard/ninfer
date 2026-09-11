@@ -133,6 +133,51 @@ Backfill 只改变 waiting request 的 admission order。它不取得 active req
 资源，不产生 partial admission，不抢占已经 admitted 的 request，也不建立第二套 decode priority。所有
 backfilled decode-ready requests 仍进入同一个 maximal compact batch。
 
+### 2.10 Constrained calls and bounded recovery
+
+The Qwen frontend owns compiled tool schemas, transactional grammar state and typed
+completed calls. Program owns planner-accounted device masks and pinned host exchange
+storage. Ordinary sampling uses one mask per compact row; speculative verification uses
+one mask per row and actual chain/tree node. CUDA Graph host nodes fork grammar state
+after draft IDs/parents have arrived on the host, then upload masks for target sampling.
+Proposal sampling does not advance the grammar. Only the accepted publication transaction
+advances committed grammar; callback failures are surfaced before publication.
+
+Runtime may withhold a completed repeated call, or pause persistent thinking after a
+committed decode round, and rebuild that request on its existing
+lane. This is neither preemption nor another admission. The conservative family detector
+requires unchanged associated results and repeated reasoning in text-only history.
+Reasoning-only retries require three non-overlapping occurrences of the same exact 256-token
+passage within the current generated attempt. A rolling hash locates candidates, which
+must pass exact token comparison; only disjoint occurrences increment the count. Different
+separations are allowed, so changing a loop's period does not hide persistent repetition.
+Repeated passage coverage must also contain at least 4,096 distinct redundant tokens;
+the incremental interval union counts overlapping windows only once. This is evidence
+of repeated work, not a generated-reasoning length limit.
+The state resets on retry and cannot use original prompt tokens or another attempt.
+There is no reasoning length limit. Runtime enables recovery for p-less, non-raw text-only
+thinking input; reasoning retries additionally require positive temperature. The family
+retains owning original input, removes historical and failed generated reasoning on repair,
+and supplies an explicitly labeled system notice without inventing a call/result/user turn.
+Planning reserves two additional cold prefills up to the original context entitlement
+(consumed completion space can accommodate the notice). A repair must fit the original
+resource commitment and preserve the
+remaining output budget; otherwise recovery fails explicitly for that request.
+
+At the committed round boundary the retry leaves the decode-ready set. With no other prefill
+owner or conflicting copy hold, the executor clears the old lane's complete KV/recurrent/
+speculative state and performs a fresh prefill without prefix reuse or checkpoint capture.
+It never attempts an arbitrary KV truncation with stale GDN state. Retry queue entries are
+bounded by admitted slots and checked against current lane ownership. Other decode-ready
+requests retain the usual maximal-batch semantics outside the exclusive retry prefill.
+
+Calls remain unpublished until recovery accepts the terminal result. Already streamed prose
+and reasoning cannot be retracted. All generated attempts consume the original token budget;
+additional prefill tokens/time are reported separately, without changing original prompt
+usage. At most two repair attempts are allowed. Exhaustion is a request error, not EOS
+injection, release of a known repeated call, an engine shutdown, or a promise of useful
+progress. Cancellation uses the normal boundary-owned lane cleanup.
+
 ---
 
 ## 3. Overall architecture
@@ -199,7 +244,7 @@ Blocking `Engine::generate` 可以保留为 product facade，但其语义是提�
 request 完成，而不是在 caller thread 内运行完整 generation loop。一个 Engine-owned GPU worker 执行全局
 boundary loop；并发 callers 等待各自的 owning result，以及 streaming request 的 output queue。Delivery
 intent 在 queue membership 前固定：两种模式都由 GPU worker 追加 committed output 到 owning result，只有
-`Streaming` 模式写 per-round output events；`TerminalOnly` 模式直到 completion 才唤醒 consumer。GPU
+`Streaming` 模式写 per-round output events；`TerminalOnly` 仅在 completion 或 recovery diagnostic 时唤醒 consumer。GPU
 worker 不调用 network write 或可能阻塞的 `OutputSink`。
 
 ---
@@ -1401,15 +1446,18 @@ commit 前截断 effective committed extent，model state 和 output 只提交�
 Ingress 为 request 建立 owning record，并在 queue membership 前固定 `OutputDelivery`；有效 output bound
 在 admission 时确定。每个 boundary 把 committed tokens 追加到该 record，因此 ordinary 或 multi-token
 speculative round 都不依赖 network progress 才能 commit。`Streaming` 同时把该 round 的 compact deltas
-写入 request-owned event queue 并至多唤醒 consumer 一次；`TerminalOnly` 不建立 per-round events，也不在
-terminal publication 前唤醒 consumer。
+写入 request-owned event queue 并至多唤醒 consumer 一次；`TerminalOnly` 不建立 per-round output events。
+Both delivery modes can enqueue sparse, owning `RecoveryEvent` diagnostics and wake the consumer
+before completion. `wait()` dispatches them through `OutputSink::recovery_event` on the caller
+thread, never through model-output deltas. Cycle-exclusion notices use power-of-two count
+cadence; retry transitions and terminal totals are always emitted when recovery was involved.
 
 Model completion 时，GPU Executor 终结 owning result record，释放 request 的 slot 和 unused reservation，
 并释放 sequence state 或按 §6.4 把带有 target-declared reusable checkpoints 的 state 转移给
 retained-prefix cache。上述 GPU
 resource 被复用后，response path 仍可继续读取 owning record。
 
-Committed output 始终写入 request-owned result storage；只有 streaming deltas 进入 event storage，由等待
+Committed output 始终写入 request-owned result storage；streaming deltas 和 recovery diagnostics 进入独立 event queues，由等待
 该 request 的 caller thread 取出。Network write、protocol serialization 和 `OutputSink` callback 不在 GPU
 Executor 上运行。Caller 消费缓慢不会阻塞 GPU boundary loop；积压仍受该 request 的 finite output bound
 限制。Request lifetime capacity 在 response consumer 释放 owning record 前继续计费，因此 model slot 已

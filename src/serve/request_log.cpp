@@ -411,6 +411,29 @@ std::string format_request_start(const RequestLogContext& context) {
     return out.str();
 }
 
+std::string format_recovery_event(std::uint64_t request_id, const ninfer::RecoveryEvent& event) {
+    const char* stage = "unknown";
+    switch (event.kind) {
+    case ninfer::RecoveryEventKind::CycleExclusion: stage = "cycle_exclusion"; break;
+    case ninfer::RecoveryEventKind::RetryTriggered: stage = "retry_triggered"; break;
+    case ninfer::RecoveryEventKind::RetryStarted: stage = "retry_started"; break;
+    case ninfer::RecoveryEventKind::RetryPrefillComplete: stage = "retry_prefill_complete"; break;
+    case ninfer::RecoveryEventKind::Finished: stage = "finished"; break;
+    case ninfer::RecoveryEventKind::Exhausted: stage = "exhausted"; break;
+    }
+    std::ostringstream out;
+    out << "[req " << request_id << "] recovery event=" << stage
+        << " cause=" << event.cause << " attempts=" << event.attempts
+        << " cycle_exclusions=" << event.cycle_exclusions
+        << " discarded_tool_calls=" << event.discarded_tool_calls
+        << " discarded_reasoning_tokens=" << event.discarded_reasoning_tokens
+        << " gen=" << event.generated_tokens << " remaining=" << event.remaining_tokens;
+    if (event.kind == ninfer::RecoveryEventKind::CycleExclusion) {
+        out << " action=exclude_one_root_token log_cadence=powers_of_two";
+    }
+    return out.str();
+}
+
 std::string format_request_rejected(const RequestRejectionLogContext& context) {
     std::ostringstream out;
     out << "[req " << context.id << "] rejected phase=prepare protocol=" << context.protocol << ' '
@@ -428,7 +451,7 @@ std::string format_request_done(const RequestLogContext& context,
     const double ttft_ms             = metrics.ttft_seconds * 1000.0;
     // Same token bases as usage.prompt_tokens_details.ninfer.{prefill,decode}.
     const double decode_tokens =
-        static_cast<double>(decode_eval_tokens(outcome.completion_tokens));
+        static_cast<double>(decode_eval_tokens(outcome.completion_tokens, metrics.recovery.prefill_samples));
     const double computed_prefill_tokens = static_cast<double>(prefill_eval_tokens(
         outcome.prompt_tokens, static_cast<int>(metrics.prefix_cache_hit_tokens)));
 

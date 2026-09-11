@@ -6,7 +6,10 @@ target_sources(ninfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/processor.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/resources.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/tokenizer.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/tool_grammar.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/generation_recovery.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/prefix_identity.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/tool_masks.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/kv_ram_cache.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/kv_disk_cache.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/state/decoder_state.cpp
@@ -17,3 +20,4 @@ target_sources(ninfer_engine PRIVATE
 
 target_include_directories(ninfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/export)
+target_link_libraries(ninfer_engine PRIVATE ninfer_tool_grammar)

@@ -115,7 +115,7 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
          added(14, "   \n"), added(15, "answer"),
          added(16, "<tool_"), added(17, "call>"), added(18, "<function=f>"),
          added(19, "</function>"), added(20, "</tool_call>"), added(21, "<tool_call>"),
-         added(22, "preface"),
+         added(22, "preface"), added(23, "call"), added(24, "a <"),
          added(30, "user\n"), added(31, "assistant\n"), added(32, "\n"),
          added(248045, "<|im_start|>", true), added(248046, "<|im_end|>", true),
          added(248053, "<|vision_start|>", true), added(248054, "<|vision_end|>", true),
@@ -1160,6 +1160,17 @@ int test_reasoning_split(const Frontend& frontend) {
     auto prompt                         = frontend.prepare(std::move(input));
     auto session                        = frontend.make_output_session(prompt, {});
     int failures = check(session.in_reasoning(), "thinking output session did not start open");
+    failures += check(session.reasoning_cycle_exclusion_allowed(1) &&
+                          !session.reasoning_cycle_exclusion_allowed(248069) &&
+                          !session.reasoning_cycle_exclusion_allowed(6) &&
+                          !session.reasoning_cycle_exclusion_allowed(3),
+                      "reasoning recovery could suppress a stop or reasoning close prefix");
+    auto split_session = frontend.make_output_session(prompt, {});
+    (void)split_session.preview(std::array<ninfer::TokenId, 1>{3}, 4,
+                                ninfer::FinishReason::OutputLimit);
+    (void)split_session.commit_preview();
+    failures += check(!split_session.reasoning_cycle_exclusion_allowed(4),
+                      "reasoning recovery could suppress a split-token terminator");
     auto raw_session =
         frontend.make_output_session(prompt, {}, ninfer::OutputOptions{.raw = true});
     failures += check(!raw_session.in_reasoning(), "raw output session entered reasoning state");
@@ -1176,6 +1187,8 @@ int test_reasoning_split(const Frontend& frontend) {
                       "reasoning token usage did not count accepted reasoning tokens exactly");
     failures += check(!session.in_reasoning(),
                       "thinking output session remained open after the close marker");
+    failures += check(!session.reasoning_cycle_exclusion_allowed(1),
+                      "reasoning recovery remained eligible in answer content");
 
     ninfer::ChatMessage direct_message;
     direct_message.role = ninfer::ChatRole::User;
@@ -1609,6 +1622,139 @@ int run_encode_bench() {
     return 0;
 }
 
+int test_declared_tool_publication() {
+    auto owned = resources();
+    auto tokenizer = nlohmann::json::parse(owned.tokenizer_json);
+    auto config = nlohmann::json::parse(owned.tokenizer_config_json);
+    // This component tokenizer must encode the rendered tool declaration, not
+    // just the small output-token fragments used by the other decoder tests.
+    for (int c = 32; c < 127; ++c) {
+        if (c == 'x') { continue; }
+        auto token = added(1000 + c, std::string(1, static_cast<char>(c)));
+        tokenizer["added_tokens"].push_back(token);
+        token.erase("id");
+        config["added_tokens_decoder"][std::to_string(1000 + c)] = std::move(token);
+    }
+    owned.tokenizer_json = tokenizer.dump();
+    owned.tokenizer_config_json = config.dump();
+    const Frontend frontend = FrontendFactory::create_component(owned);
+    ninfer::PromptInput input;
+    ninfer::ChatMessage user;
+    user.role = ninfer::ChatRole::User;
+    user.parts.push_back(ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x"});
+    input.messages.push_back(std::move(user));
+    input.options.enable_thinking = false;
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{},"additionalProperties":false}}})");
+    auto prompt = frontend.prepare(std::move(input));
+    auto output = frontend.make_output_session(prompt, {});
+    int failures = check(output.has_tool_grammar(), "declared tools did not attach a grammar");
+    const std::vector<ninfer::TokenId> tokens{22, 16, 17, 32, 18, 32, 32, 19, 32, 20};
+    std::string visible;
+    for (auto token : tokens) {
+        (void)output.preview(std::span<const ninfer::TokenId>(&token, 1), 100,
+                             ninfer::FinishReason::OutputLimit);
+        output.discard_preview();
+        failures += check(output.tool_calls().empty(), "discard published a completed tool");
+        (void)output.preview(std::span<const ninfer::TokenId>(&token, 1), 100,
+                             ninfer::FinishReason::OutputLimit);
+        for (const auto& delta : output.commit_preview()) { visible += delta.text; }
+    }
+    failures += check(visible == "preface", "tool markup leaked into streamed content");
+    failures += check(output.tool_calls().size() == 1 && output.tool_calls()[0].name == "f" &&
+                          output.tool_calls()[0].arguments_json == "{}",
+                      "complete declared tool was not decoded once");
+    const std::array<ninfer::TokenId, 1> eos{6};
+    const auto decision = output.preview(eos, 100, ninfer::FinishReason::OutputLimit);
+    failures += check(decision.finish_reason == ninfer::FinishReason::StopToken,
+                      "complete declared tool did not terminate normally");
+    for (const auto& delta : output.commit_preview()) { visible += delta.text; }
+    failures += check(visible == "preface" && output.tool_calls().size() == 1,
+                      "terminal publication repeated a tool or leaked markup");
+
+    auto interrupted = frontend.make_output_session(prompt, {});
+    (void)interrupted.preview(std::array<ninfer::TokenId, 3>{16, 17, 32}, 3,
+                              ninfer::FinishReason::OutputLimit);
+    failures += check(interrupted.commit_preview().empty() && interrupted.tool_calls().empty(),
+                      "output budget published a partial declared tool");
+    for (bool between_rounds : {false, true}) {
+        auto partial = frontend.make_output_session(prompt, {});
+        std::string partial_visible;
+        (void)partial.preview(std::array<ninfer::TokenId, 1>{22}, 100,
+                              ninfer::FinishReason::OutputLimit);
+        for (const auto& delta : partial.commit_preview()) {
+            partial_visible += delta.text;
+        }
+        (void)partial.preview(std::array<ninfer::TokenId, 2>{16, 23}, between_rounds ? 100 : 2,
+                              ninfer::FinishReason::OutputLimit);
+        for (const auto& delta : partial.commit_preview()) { partial_visible += delta.text; }
+        if (between_rounds) {
+            (void)partial.preview_terminal(ninfer::FinishReason::Cancelled);
+            for (const auto& delta : partial.commit_preview()) { partial_visible += delta.text; }
+        }
+        failures += check(partial_visible == "preface" && partial.tool_calls().empty(),
+                          "terminal output leaked a confirmed partial tool trigger");
+    }
+    auto prose = frontend.make_output_session(prompt, {});
+    (void)prose.preview(std::array<ninfer::TokenId, 1>{24}, 1, ninfer::FinishReason::OutputLimit);
+    std::string prose_visible;
+    for (const auto& delta : prose.commit_preview()) { prose_visible += delta.text; }
+    failures += check(prose_visible == "a <", "terminal output swallowed ambiguous ordinary prose");
+    ninfer::StopPolicy opener_stop;
+    opener_stop.strings = {{.text = ">"}};
+    auto stopped_opener = frontend.make_output_session(prompt, opener_stop);
+    const auto opener_decision = stopped_opener.preview(std::array<ninfer::TokenId, 2>{16, 17},
+                                                        100, ninfer::FinishReason::OutputLimit);
+    failures += check(opener_decision.finish_reason == ninfer::FinishReason::StopString &&
+                          stopped_opener.commit_preview().empty() && stopped_opener.tool_calls().empty(),
+                      "caller stop leaked a confirmed partial tool trigger");
+    ninfer::StopPolicy after_call_stop;
+    after_call_stop.strings = {{.text = "preface"}};
+    auto stopped_call = frontend.make_output_session(prompt, after_call_stop);
+    for (auto token : std::span(tokens).subspan(1)) {
+        (void)stopped_call.preview(std::span<const ninfer::TokenId>(&token, 1), 100,
+                                   ninfer::FinishReason::OutputLimit);
+        (void)stopped_call.commit_preview();
+    }
+    const auto call_decision = stopped_call.preview(std::array<ninfer::TokenId, 1>{22}, 100,
+                                                     ninfer::FinishReason::OutputLimit);
+    failures += check(call_decision.finish_reason == ninfer::FinishReason::StopString &&
+                          stopped_call.commit_preview().empty() && stopped_call.tool_calls().size() == 1,
+                      "caller stop lost a preceding complete tool call");
+    const std::string literal = "<tool_call>\n</invoke>\n</parameter>\n</function>\n</tool_call>";
+    ninfer::PromptInput embedded_input;
+    ninfer::ChatMessage embedded_user;
+    embedded_user.role = ninfer::ChatRole::User;
+    embedded_user.parts.push_back(ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x"});
+    embedded_input.messages.push_back(std::move(embedded_user));
+    embedded_input.options.enable_thinking = false;
+    embedded_input.options.tool_jsons.push_back(nlohmann::json{
+        {"type", "function"}, {"function", {{"name", "f"}, {"parameters", {
+            {"type", "object"}, {"properties", {{"value", {{"const", literal}}}}},
+            {"required", {"value"}}, {"additionalProperties", false}}}}}}.dump());
+    auto embedded_prompt = frontend.prepare(std::move(embedded_input));
+    auto embedded_output = frontend.make_output_session(embedded_prompt, {});
+    const auto embedded_text = "<tool_call>\n<function=f>\n<parameter=value>\n" + literal +
+                               "\n</parameter>\n</function>\n</tool_call>";
+    for (const unsigned char c : embedded_text) {
+        const ninfer::TokenId token = c == '\n' ? 32 : c == 'x' ? 0 : 1000 + c;
+        (void)embedded_output.preview(std::span<const ninfer::TokenId>(&token, 1), 1000,
+                                      ninfer::FinishReason::OutputLimit);
+        failures += check(embedded_output.commit_preview().empty(), "literal tool close leaked as prose");
+    }
+    failures += check(embedded_output.tool_calls().size() == 1 &&
+                          nlohmann::json::parse(embedded_output.tool_calls()[0].arguments_json)["value"] == literal,
+                      "streamed XML-looking string was lost or split into another call");
+    failures += check(ninfer::targets::qwen3_6::unconstrained_tool_call_names(
+                          "prefix<tool_call><function=f><parameter=x>true</parameter>"
+                          "</function></tool_call>", 64) == std::vector<std::string>{"f"},
+                      "undeclared complete envelope lost its diagnostic name");
+    failures += check(ninfer::targets::qwen3_6::unconstrained_tool_call_names(
+                          "<tool_call><function=f></function></tool_call", 64).empty(),
+                      "malformed envelope produced an undeclared-tool diagnostic");
+    return failures;
+}
+
 int main() {
     if (std::getenv("NINFER_BENCH_ENCODE") != nullptr) { return run_encode_bench(); }
     const FrontendResources owned = resources();
@@ -1632,5 +1778,6 @@ int main() {
     failures += test_structured_model_stop_eligibility(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_disabled_vision();
+    failures += test_declared_tool_publication();
     return failures == 0 ? 0 : 1;
 }

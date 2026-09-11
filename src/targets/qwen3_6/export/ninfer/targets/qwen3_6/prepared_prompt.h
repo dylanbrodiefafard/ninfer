@@ -11,6 +11,8 @@
 
 namespace ninfer::targets::qwen3_6 {
 
+struct ToolGrammarData;
+
 enum class PromptModality : std::uint8_t {
     Image = 1,
     Video = 2,
@@ -75,6 +77,8 @@ struct PreparedPromptData {
     PromptIdentity identity;
     bool starts_in_reasoning = false;
     bool tool_output_enabled = false;
+    std::shared_ptr<const ToolGrammarData> tool_grammar;
+    std::shared_ptr<const GenerationRecoveryContext> generation_recovery;
     PrepareStats prepare;
 
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;
