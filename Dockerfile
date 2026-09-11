@@ -3,6 +3,7 @@
 # The `build` stage is also the developer builder image (`ninfer-builder`):
 #   docker build --target build --tag local/ninfer-builder:5090 .
 # Start it with ./scripts/dev-setup.sh and run tests with ./scripts/run-unit-tests.sh.
+# Incremental source deploy into a runtime image: ./scripts/hot-patch.sh
 
 FROM nvidia/cuda:13.1.2-devel-ubuntu24.04 AS build
 

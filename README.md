@@ -179,6 +179,24 @@ docker run --rm \
   --max-new 256
 ```
 
+After that runtime image exists, source-only edits can skip a full `docker build`.
+`./scripts/hot-patch.sh` incrementally rebuilds `ninfer` and `ninfer-serve` in the
+developer builder and writes them into the image, and into a container named
+`ninfer` if one exists. A running container is restarted; a stopped container is
+left stopped. Dockerfile or base-image changes still need a full rebuild.
+
+```bash
+./scripts/hot-patch.sh                 # patch image; restart ninfer if it is running
+./scripts/hot-patch.sh --no-restart    # patch image/container, do not restart
+./scripts/hot-patch.sh --image-only    # patch the image only
+./scripts/hot-patch.sh --export-only   # write out/hot-patch/ (same image, another host)
+```
+
+The image tag defaults to the `ninfer` container's image when that container
+exists, otherwise `ninfer:local`. Set `NINFER_IMAGE` and `NINFER_CONTAINER` when
+the local tag or name differs. The previous image is kept as
+`<tag>-rollback`.
+
 ## Download a model
 
 Use the Hugging Face CLI to download the supported artifact:
