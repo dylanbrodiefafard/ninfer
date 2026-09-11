@@ -14,21 +14,23 @@ namespace ninfer::runtime {
 // last 2p generated token ids are a Hamming-near square. The continuation is x[n-p]. Exact
 // identity is Hamming 0 and still wins as the least p.
 //
-// Allowed substitutions are 2p/p_max (integer divide), so p < 256 is exact. The traces that
-// needed fuzz were ~500-token squares with one whitespace substitution — not 32-token
+// Allowed substitutions are 2p/512 (integer divide), so p < 256 is exact. The traces that
+// needed fuzz were long squares with occasional whitespace substitutions — not 32-token
 // near-repeats. A floor of 1 at p_min would treat "same 32-token template, one slot
-// different" as a cycle; that is a common thinking pattern, not an attractor.
+// different" as a cycle; that is a common thinking pattern, not an attractor. The Hamming
+// scale is independent of p_max so extending the observable cycle length does not change the
+// already-qualified decision boundary for shorter periods.
 // Cost: early-out after budget+1 mismatches; worst case sum_{p=p_min}^{p_max} p compares.
 inline constexpr std::size_t kTypicalCyclePeriodMin = 32;
-inline constexpr std::size_t kTypicalCyclePeriodMax = 512;
-
+inline constexpr std::size_t kTypicalCyclePeriodMax = 2048;
+inline constexpr std::size_t kTypicalCycleHammingScale = 512;
 struct TypicalCycle {
     std::size_t period     = 0;
     TokenId continuation = -1;
 };
 
 [[nodiscard]] inline std::size_t typical_cycle_hamming_max(std::size_t p) {
-    return (2 * p) / kTypicalCyclePeriodMax;
+    return (2 * p) / kTypicalCycleHammingScale;
 }
 
 // Hamming distance of generated[n-2p, n-p) vs generated[n-p, n). Aborts as soon as

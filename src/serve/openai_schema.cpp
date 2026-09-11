@@ -607,6 +607,17 @@ Json usage_to_json(const CompletionUsage& usage, const CompletionTimings* timing
                      {"ms", json_decimal3(timings->predicted_ms)},
                      {"tok_s", json_decimal3(timings->predicted_per_second)},
                      {"ms_per_token", json_decimal3(timings->predicted_per_token_ms)}}}};
+    if (timings->recovery.discarded_tool_calls != 0 ||
+        timings->recovery.discarded_reasoning_tokens != 0) {
+        const auto& recovery = timings->recovery;
+        ninfer["recovery"] = {{"attempts", recovery.attempts},
+                              {"discarded_tool_calls", recovery.discarded_tool_calls},
+                              {"discarded_reasoning_tokens", recovery.discarded_reasoning_tokens},
+                              {"prefill_tokens", recovery.prefill_tokens},
+                              {"prefill_samples", recovery.prefill_samples},
+                              {"prepare_ms", json_decimal3(recovery.prepare_seconds * 1000.0)},
+                              {"prefill_ms", json_decimal3(recovery.prefill_seconds * 1000.0)}};
+    }
     if (timings->kv_ram_capacity_bytes != 0) {
         // Host KV RAM tier: live engine-wide gauges at request end, this request's
         // D2H/H2D copy time, and engine-lifetime cumulative counters.
@@ -652,8 +663,10 @@ CompletionTimings make_completion_timings(int prompt_tokens, int completion_toke
                                            double prefill_seconds, double decode_seconds,
                                            int draft_n, int draft_n_accepted,
                                            double prefill_tail_tok_s,
-                                           double prefill_tail_window_s, int prompt_reused) {
+                                           double prefill_tail_window_s, int prompt_reused,
+                                           const ninfer::GenerationRecoveryStats& recovery) {
     CompletionTimings out;
+    out.recovery = recovery;
     out.prompt_n            = prompt_tokens;
     out.prompt_reused_n     = std::max(0, std::min(prompt_reused, prompt_tokens));
     out.prompt_ms           = prefill_seconds * 1000.0;
@@ -669,7 +682,7 @@ CompletionTimings make_completion_timings(int prompt_tokens, int completion_toke
     out.prefill_tail_tok_s    = prefill_tail_tok_s;
     out.prefill_tail_window_s = prefill_tail_window_s;
     // First completion token is sampled during prefill; decode.ms is later rounds only.
-    const int decode_tokens = decode_eval_tokens(completion_tokens);
+    const int decode_tokens = decode_eval_tokens(completion_tokens, recovery.prefill_samples);
     out.predicted_n  = decode_tokens;
     out.predicted_ms = decode_seconds * 1000.0;
     out.predicted_per_token_ms =

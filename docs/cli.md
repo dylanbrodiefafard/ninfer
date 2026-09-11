@@ -100,6 +100,12 @@ Message content may be a string or an ordered array containing:
 history may include `reasoning_content` and `tool_calls`; a tool result uses role `tool` and
 `tool_call_id`.
 
+Current `tools` declarations enable Engine-owned constrained tool generation. Complete,
+schema-validated calls are returned separately from content; CLI prints them as a
+`{"tool_calls":[...]}` JSON object after streamed text. An interrupted tool envelope is
+not printed as a partial executable call. Raw output remains raw token text. The schema
+subset and unsupported tool-choice modes are described in `docs/serving.md`.
+
 See [`examples/cli/`](../examples/cli/) for committed text, image, video, mixed-media, thinking,
 long-decode, and long-context inputs.
 
@@ -207,15 +213,47 @@ temperature and seed, ignores top-p, top-k, min-p, and presence/frequency penalt
 one-time warning on stderr. Ignored parameters must still satisfy their normal input ranges.
 `--no-p-less-sampling` opts into the registered production sampler. Combined with `--greedy`,
 p-less remains exact argmax. During thinking, p-less also exits a generated token-id
-square: the least period p in [32, 512] such that the last 2p generated ids match with
+square: the least period p in [32, 2048] such that the last 2p generated ids match with
 Hamming distance at most 2p/512 (so p<256 is exact identity). The continuation is excluded
 from the already-computed typical set V (renormalized V without that atom, or the in-domain
 runner-up when V is that singleton). This is not a `suppressed_tokens` member and does not
-rebuild L. There is no CLI flag. P-less membership is `p_v ≥ L·exp(-2ε/T)` with
+rebuild L. It does not detect duplicate tool calls across requests and does not alter tool-call
+content. There is no CLI flag. P-less membership is `p_v ≥ L·exp(-2ε/T)` with
 `ε = 1/16` (first-order softmax perturbation of the logits); L is the unperturbed collision
 probability. Under MTP or DFlash2,
-p-less applies at hop 0 (chain Leviathan with one-hot draft `q`). Later hops and the bonus after
-a full accept are greedy packed-column argmax.
+p-less applies at every hop (chain Leviathan with one-hot draft `q`) and to the bonus after a full
+accept. The cycle exclusion applies only to the first hop's next-token decision; later hops use
+their unmodified p-less candidate sets. Temperature zero remains greedy at every hop.
+The reasoning terminator (including split-token forms) and model stop tokens are never
+cycle exclusions. This policy does not impose a maximum reasoning length.
+
+With declared tools, the answer's free-text grammar excludes orphan `</invoke>`,
+`</parameter>`, `</function>`, and `</tool_call>` strings outside valid call envelopes.
+Actual call framing and literal XML inside schema-valid arguments remain allowed.
+Reasoning excludes `<tool_call>` so a real call must follow `</think>`; ordinary reasoning
+and tools-off/raw output remain allowed. This is a sampling-domain constraint,
+not response-text deletion or an automatic retry.
+
+With current declared tools, Engine separately withholds suspected duplicate-tool loops
+using repeated reasoning, identical calls and unchanged associated results. It can rebuild
+the internal context and retry at most twice, within the original output budget and resource
+reservation. Rejected calls are not printed or executed; already printed reasoning/prose is
+not retracted. Exhaustion is an explicit request error, not forced EOS or an engine shutdown.
+For text-only thinking requests, persistent reasoning can also trigger an internal retry:
+three non-overlapping occurrences of the same exact 256-token reasoning passage must
+appear in the current generated attempt, and repeated passages must cover at least 4,096
+distinct redundant tokens. Overlapping windows count those tokens only once. This is a
+repetition-evidence threshold, not a 4,096-token reasoning limit. The occurrences need not
+have a fixed separation,
+so changing words elsewhere in a multi-paragraph loop does not hide the repeated passage.
+Hashes locate candidates; exact token comparison confirms them. Two copies alone do not
+trigger a retry. Long reasoning without that repetition is not limited. The failed
+generated reasoning and closed historical reasoning are omitted from
+the internal retry context; original user content and actual tool results are preserved,
+and an explicitly labeled engine system notice asks for concrete progress. No call or
+tool result is invented. Reasoning and duplicate-tool recovery share the two-retry budget.
+Raw output and media inputs do not use these internal retries. See the serving reference
+for the detector's conservative scope and recovery usage fields.
 
 Repeat `--stop-token-id`, `--stop`, or `--reasoning-stop` to add stop conditions. Use
 `--raw-output` to expose the frontend's raw output stream and `--print-token-ids` to include

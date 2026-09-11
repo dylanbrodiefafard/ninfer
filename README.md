@@ -110,6 +110,7 @@ NInfer currently requires:
 - NVIDIA driver support for CUDA 13.1 and the CUDA Toolkit 13.1 or newer;
 - CMake 3.28 or newer and a C++20-capable host compiler;
 - `pkg-config`;
+- Git and `patch` for the pinned CPU tool-grammar dependency and Qwen format patch;
 - FFmpeg development libraries: `libavformat >= 60`, `libavcodec >= 60`,
   `libavutil >= 58`, and `libswscale >= 7`;
 - `libcurl >= 7.85`;
@@ -117,6 +118,8 @@ NInfer currently requires:
 
 The build rejects CUDA architectures other than `120a`. There is no install target or packaged
 binary distribution; NInfer is run from its source build tree.
+Configuration fetches the pinned XGrammar C++ sources and dlpack headers. Only CPU
+grammar compilation/matching is linked; NInfer retains its own GPU sampling and inference.
 
 ## Build
 

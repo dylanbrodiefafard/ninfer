@@ -232,6 +232,15 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.sampling_config = add_tensor(
         builder, DType::I32, {config_words, static_cast<std::int32_t>(plan.max_concurrency)},
         "sampling config");
+    const auto tool_width = static_cast<std::int32_t>(
+        std::max({1U, plan.draft_window + 1U, plan.dflash_verify_width}));
+    out.tool_token_masks = add_tensor(
+        builder, DType::I32,
+        {(TextConfig::token_domain + 31) / 32, tool_width,
+         static_cast<std::int32_t>(plan.max_concurrency)}, "tool grammar token masks");
+    out.tool_sampling_config = add_tensor(
+        builder, DType::I32, {config_words, static_cast<std::int32_t>(plan.max_concurrency)},
+        "tool grammar target sampling config");
     out.tail_hidden = add_tensor(
         builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(plan.max_concurrency)},
         "tail hidden");

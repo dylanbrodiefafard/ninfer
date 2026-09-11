@@ -62,6 +62,10 @@ int main(int argc, char** argv) {
         }
 
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, "loading model...");
+        if (!options.generation_recovery) {
+            ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Warning,
+                "generation recovery disabled: no cycle exclusions or internal retries; tool grammar remains enabled");
+        }
         auto load_progress_options        = ninfer::product::stderr_load_progress_options();
         load_progress_options.line_prefix = [] {
             return ninfer::serve::current_console_log_prefix(ninfer::serve::ConsoleLogLevel::Info);

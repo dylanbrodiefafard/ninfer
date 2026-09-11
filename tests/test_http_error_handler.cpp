@@ -24,11 +24,23 @@ int main() {
     ServeOptions options;
     options.max_request_bytes = 1234;
 
+    const auto tool_schema = ninfer::serve::request_error_to_api_error(ninfer::RequestError(
+        ninfer::RequestErrorKind::InvalidToolSchema, "unsupported tool schema assertion: not"));
+    failures += check(tool_schema.status == 400 && tool_schema.type == "invalid_request_error" &&
+                          tool_schema.code == "invalid_tool_schema" && tool_schema.param == "tools" &&
+                          tool_schema.message == "unsupported tool schema assertion: not",
+                      "tool schema rejection lost its HTTP classification or diagnostic");
+
     const ninfer::serve::ApiError media_budget = ninfer::serve::request_error_to_api_error(
         ninfer::RequestError(ninfer::RequestErrorKind::MediaBudgetExceeded,
                              "vision tokens exceed processor budget"));
     failures += check(media_budget.status == 400 && media_budget.code == "media_budget_exceeded",
                       "media resource rejection did not map to HTTP 400");
+    const auto exhausted = ninfer::serve::request_error_to_api_error(ninfer::RequestError(
+        ninfer::RequestErrorKind::RecoveryExhausted, "bounded recovery exhausted"));
+    failures += check(exhausted.status == 500 && exhausted.type == "server_error" &&
+                          exhausted.code == "generation_recovery_exhausted" && exhausted.param.empty(),
+                      "recovery exhaustion lost its explicit request-local error");
     const ninfer::serve::ApiError context_limit = ninfer::serve::request_error_to_api_error(
         ninfer::RequestError(ninfer::RequestErrorKind::ContextLengthExceeded,
                              "prepared prompt has 200 tokens, exceeding Engine max_context 128"));

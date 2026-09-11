@@ -383,9 +383,9 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__
     const int tid = static_cast<int>(threadIdx.x);
     if (b >= batch) { return; }
     const SamplingConfig cfg = configs[b];
-    // P-less temperature parameterizes the target distribution, not the draft
-    // scores. Adaptive chain at the product T=2 softmax would otherwise flatten
-    // the 16-way proposal while Leviathan still sees that q.
+    // The p-less route deliberately uses deterministic proposals. Verification
+    // must therefore use point-mass q, not a softmax over this shortlist. This
+    // does not make later target positions greedy: they still use target p-less.
     const float temperature =
         (force_greedy || cfg.p_less != 0) ? 0.0f : cfg.temperature;
     const unsigned long long seed  = cfg.seed ^ seed_xor;

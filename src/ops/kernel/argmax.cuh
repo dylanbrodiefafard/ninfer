@@ -27,8 +27,14 @@ __device__ __forceinline__ bool argmax_better(float value, std::int32_t index, f
 }
 
 __device__ __forceinline__ bool argmax_token_suppressed(std::int32_t token,
-                                                        const SamplingConfig* config) {
+                                                        const SamplingConfig* config,
+                                                        std::int32_t column) {
     if (config == nullptr) { return false; }
+    if (config->allowed_token_words) {
+        const auto* words = config->allowed_token_words +
+            static_cast<std::int64_t>(column) * config->allowed_token_column_stride;
+        if (!(words[token >> 5] & (std::uint32_t{1} << (token & 31)))) { return true; }
+    }
     const int count = min(config->suppressed_token_count,
                           SamplingConfig::kMaximumSuppressedTokens);
     for (int i = 0; i < count; ++i) {
@@ -79,7 +85,7 @@ __launch_bounds__(kArgmaxBlock) __global__
     float best_value        = -CUDART_INF_F;
     std::int32_t best_index = INT32_MAX;
     for (std::int32_t v = static_cast<std::int32_t>(threadIdx.x); v < valid_rows; v += blockDim.x) {
-        if (argmax_token_suppressed(v, config)) { continue; }
+        if (argmax_token_suppressed(v, config, config ? t % columns_per_config : 0)) { continue; }
         const float value = __bfloat162float(logits[base + v]);
         if (argmax_better(value, v, best_value, best_index)) {
             best_value = value;
@@ -127,7 +133,9 @@ __launch_bounds__(kArgmaxBlock) __global__
 #pragma unroll
     for (int item = 0; item < kArgmaxItemsPerThread; ++item) {
         const std::int32_t v = tile_start + threadIdx.x + item * blockDim.x;
-        if (v < valid_rows && !argmax_token_suppressed(v, config)) {
+        if (v < valid_rows &&
+            !argmax_token_suppressed(v, config,
+                                    config ? (column_offset + t) % columns_per_config : 0)) {
             const float value = __bfloat162float(logits[base + v]);
             if (argmax_better(value, v, best_value, best_index)) {
                 best_value = value;

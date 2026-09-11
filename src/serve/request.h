@@ -56,8 +56,8 @@ struct CompletionUsage {
 
 // Prefill emits the first generated token (counted in prefill.ms / TTFT). Decode
 // rates use the remaining completion tokens so tok_s = tokens / (ms/1000).
-[[nodiscard]] inline int decode_eval_tokens(int completion_tokens) {
-    return std::max(0, completion_tokens - 1);
+[[nodiscard]] inline int decode_eval_tokens(int completion_tokens, int recovery_prefill_samples = 0) {
+    return std::max(0, completion_tokens - 1 - recovery_prefill_samples);
 }
 
 // Prompt tokens actually computed this request (excludes the reused prefix).
@@ -68,6 +68,7 @@ struct CompletionUsage {
 
 // llama.cpp-compatible timing block for Open WebUI / LiteLLM info bubbles.
 struct CompletionTimings {
+    ninfer::GenerationRecoveryStats recovery;
     int prompt_n                = 0;
     // Prefix tokens served from prefix reuse (no recompute). Prefill rates below are
     // computed over the non-reused suffix only, so cached prefixes do not inflate them.

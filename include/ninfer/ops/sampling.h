@@ -55,6 +55,14 @@ struct SamplingConfig {
     // Cycle-exit continuation, or -1. Not a suppressed_tokens member: V and L are
     // computed on the eligible domain as usual. Greedy (temperature<=0) ignores it.
     std::int32_t typical_exclude = -1;
+    // Optional caller-owned device eligibility bitset, one bit per vocabulary token.
+    // Null means unrestricted. One means allowed, intersected with suppressed_tokens.
+    // sample() reads column zero. Speculative consumers select the verification
+    // column (tree node, not acceptance depth); stride is in uint32 words, with
+    // zero broadcasting one mask. Every reachable column must retain an eligible
+    // token. Storage stays live through the complete sampling/accept invocation.
+    const std::uint32_t* allowed_token_words = nullptr;
+    std::int32_t allowed_token_column_stride = 0;
 };
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive
@@ -73,12 +81,14 @@ struct SamplingConfig {
  *
  * For row b with configs[b].temperature<=0:
  *
- *   out[b] = min argmax_v float(logits[v,b]) over v not listed in the first
- *   suppressed_token_count entries of suppressed_tokens.
+ *   out[b] = min argmax_v float(logits[v,b]) over v allowed by the optional
+ *   eligibility bitset and not listed in the first suppressed_token_count
+ *   entries of suppressed_tokens.
  *
  * Penalties, filters, RNG, and token_counts updates are skipped for that row. With positive
  * temperature and configs[b].p_less!=0, let z_v=float(logits[v,b]) over v in [0,token_domain)
- * that are not listed in the first suppressed_token_count entries of suppressed_tokens
+ * allowed by the optional eligibility bitset and not listed in the first
+ * suppressed_token_count entries of suppressed_tokens
  * (penalties, top_k, top_p, and min_p are ignored). Let p=softmax(z/temperature) over that
  * eligible domain, L=sum_v p_v^2, and V={v: p_v >= L·exp(-2ε/T)} with
  * ε=kPLessLogitPerturbation (non-empty: the eligible mode is always admitted).

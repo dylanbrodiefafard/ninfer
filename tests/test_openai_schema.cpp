@@ -5,7 +5,6 @@
 
 #include "serve/openai_schema.h"
 #include "serve/request.h"
-#include "serve/tool_call_parser.h"
 #include "serve/translate.h"
 
 #include <nlohmann/json.hpp>
@@ -796,6 +795,29 @@ int test_response_serialization() {
     failures += check(decode_eval_tokens(0) == 0 && decode_eval_tokens(1) == 0 &&
                           decode_eval_tokens(2) == 1,
                       "decode_eval_tokens is max(0, n-1)");
+    ninfer::GenerationRecoveryStats recovery{.attempts = 1, .discarded_tool_calls = 1,
+        .prefill_samples = 1, .prefill_tokens = 7, .prepare_seconds = 0.1, .prefill_seconds = 0.2};
+    auto recovered = make_completion_timings(10, 8, 0.25, 1.0, 0, 0, 0, 0, 0, recovery);
+    const auto recovered_response = Json::parse(make_chat_completion_response(
+        "recovered", "m", 111, "done", "", "stop", CompletionUsage{10, 8}, &recovered));
+    const auto& recovery_details = recovered_response.at("usage").at("prompt_tokens_details").at("ninfer");
+    failures += check(recovered.predicted_n == 6 && recovery_details.at("decode").at("tokens") == 6,
+                      "recovery prefill samples were counted as decode tokens");
+    failures += check(recovered_response.at("usage").at("completion_tokens") == 8 &&
+                          recovery_details.at("recovery").at("prefill_tokens") == 7 &&
+                          recovery_details.at("recovery").at("prefill_ms") == 200.0,
+                      "recovery work was hidden or changed the completion ledger");
+    recovery.discarded_tool_calls = 0;
+    recovery.discarded_reasoning_tokens = 5;
+    recovered = make_completion_timings(10, 8, 0.25, 1.0, 0, 0, 0, 0, 0, recovery);
+    const auto reasoning_recovered = Json::parse(make_chat_completion_response(
+        "reasoning-recovered", "m", 111, "done", "visible earlier reasoning", "stop",
+        CompletionUsage{10, 8}, &recovered));
+    failures += check(reasoning_recovered.at("usage").at("prompt_tokens") == 10 &&
+                          reasoning_recovered.at("usage").at("completion_tokens") == 8 &&
+                          reasoning_recovered.at("usage").at("prompt_tokens_details").at("ninfer")
+                              .at("recovery").at("discarded_reasoning_tokens") == 5,
+                      "reasoning-only recovery lost accounting without a discarded tool");
     failures += check(prefill_eval_tokens(10, 6) == 4 && prefill_eval_tokens(4, 6) == 0,
                       "prefill_eval_tokens clamps reused to the prompt");
     CompletionTimings one_token = make_completion_timings(10, 1, 0.25, 1.0);
@@ -1194,8 +1216,8 @@ int run_sse_bench() {
 
 // Open WebUI chat fb0d11ba (2026-08-30): reasoning closed, then this answer text was
 // stored as output_text with no function_call item. Same model had executed
-// fetch_url as a native tool_call minutes earlier. GenerationService only parses
-// Qwen markup when the request uses_tools() or has tool history.
+// fetch_url as a native tool_call minutes earlier. The protocol adapter receives
+// typed calls from Engine only when current declarations enabled tool generation.
 int test_owui_youtube_fetch_url_logged_turn() {
     const std::string content =
         "I'll look up what that video is about so I can summarize it for you.\n\n"
@@ -1252,24 +1274,17 @@ int test_owui_youtube_fetch_url_logged_turn() {
         default_limits());
     failures += check(with_tools.uses_tools(), "logged request with fetch_url is tool-capable");
 
-    const ParsedToolCallOutput parsed = parse_qwen_tool_call_output(content, 64);
-    failures += check(parsed.is_tool_call_response, "logged xml parses when tools are on");
-    failures += check(parsed.content ==
-                          "I'll look up what that video is about so I can summarize it for you.",
-                      "tools-on content is the spoken prefix only");
-    failures += check(parsed.tool_calls.size() == 1 && parsed.tool_calls[0].name == "fetch_url",
-                      "tools-on tool name is fetch_url");
-    const Json args = Json::parse(parsed.tool_calls[0].arguments_json);
-    failures += check(args.at("url") == "https://www.youtube.com/watch?v=7cEdPWh9hqU",
-                      "tools-on url argument");
+    const std::string spoken =
+        "I'll look up what that video is about so I can summarize it for you.";
+    const std::vector<ToolCall> calls{{.id = "call_fixture_0", .name = "fetch_url",
+        .arguments_json = R"({"url":"https://www.youtube.com/watch?v=7cEdPWh9hqU"})"}};
 
     const Json native = Json::parse(make_chat_completion_tool_response(
-        "chatcmpl-owui", "angel-gpt27b-5090", 1788077000, parsed.content, reasoning,
-        parsed.tool_calls, usage));
+        "chatcmpl-owui", "angel-gpt27b-5090", 1788077000, spoken, reasoning, calls, usage));
     const Json& native_message = native.at("choices").at(0).at("message");
     failures += check(native.at("choices").at(0).at("finish_reason") == "tool_calls",
                       "tools-on finish_reason is tool_calls");
-    failures += check(native_message.at("content") == parsed.content,
+    failures += check(native_message.at("content") == spoken,
                       "tools-on serialized content has no xml");
     failures += check(native_message.at("content").get<std::string>().find("<tool_call>") ==
                           std::string::npos,
@@ -1280,11 +1295,6 @@ int test_owui_youtube_fetch_url_logged_turn() {
                           "fetch_url",
                       "tools-on wire tool name");
 
-    ToolCallStreamFilter filtered;
-    std::string streamed_with_tools = filtered.feed(content);
-    streamed_with_tools += filtered.finish(true);
-    failures += check(streamed_with_tools == parsed.content,
-                      "tools-on stream holds the xml out of chat");
     return failures;
 }
 

@@ -68,12 +68,11 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
  *   selector_ids/selector_q is the one-hot draft convention: accept iff u < p_i(d) and the
  *   residual excludes d. Greedy mode ignores q. When configs[b].p_less is set, p is the p-less
  *   distribution from sampling.h rather than the top-k/top-p/min-p truncation, and selector q is
- *   ignored (one-hot at the drafted token, same as MTP): p-less temperature is not a draft
- *   softmax, and a 16-way q at that T would make Leviathan accept almost every top-16 copy. Hop 0
- *   is that Leviathan test on the cycle-exit restriction p' of sampling.h (V without a typical
- *   exclude, or Dirac on the runner-up when V is that singleton); every later hop, and the bonus
- *   after a full accept, is greedy
- *   (accept the draft iff it equals the packed-column argmax, else emit that argmax). A hop-0
+ *   ignored (one-hot at the realized drafted token, same as MTP). Every hop applies that
+ *   Leviathan test to its own target p-less distribution, and the bonus samples its own column.
+ *   Only hop 0 applies the cycle-exit restriction p' of sampling.h (V without a typical exclude,
+ *   or Dirac on the runner-up when V is that singleton); typical_exclude is cleared for later
+ *   hops because it describes one next-token decision, not a sequence-wide token ban. A
  *   p-less residual whose mass is numerically zero draws from p' rather than re-emitting the
  *   rejected draft. If admitted p' mass is zero, or a residual inverse-CDF with positive mass does
  *   not land on a survivor, the correction is the cycle-exit fallback (runner-up when V is the
@@ -92,6 +91,12 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
  *
  * Numeric:
  *   Sampling filtering, penalties, normalization, and RNG semantics are those of sampling.h.
+ *   Each verification column uses its own allowed_token_words slice, including
+ *   correction and bonus draws. Tree masks are indexed by node, not traversal depth.
+ *   The caller supplies masks for the corresponding verified token histories;
+ *   unreachable nodes need not constrain a different history. Every evaluated
+ *   column must have at least one eligible token after explicit suppression.
+ *   Greedy target_tokens must already be selected using these same masks.
  *
  * Effects:
  *   For each row, let A be the accepted draft count and L=A+1. licensed_tokens[0:A,b] receives
@@ -121,17 +126,16 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
  * Greedy: from packed column 0, walk to the unique child whose token equals the target argmax;
  * otherwise emit that argmax as the correction. Sampling with p_less==0: at node u sample x from
  * the truncated target distribution; if x is a child of u, accept and continue, else emit x as
- * correction (SpecInfer membership). When configs[b].p_less is set, hop 0 is that membership
- * draw from the cycle-exit restriction of p-less(p_LLM); every later hop walks only the
- * packed-column argmax (greedy
- * correction if that argmax is not a child). Walks at most current_extents[b] accepted hops
+ * correction (SpecInfer membership). When configs[b].p_less is set, every visited node draws
+ * from its own target p-less distribution using that membership rule. Only hop 0 applies the
+ * cycle-exit restriction; later hops clear typical_exclude. Walks at most current_extents[b] accepted hops
  * (same budget as chain verify). fold_path lists packed columns of the processed path including
  * the root; accepted_column is the last processed packed index (hidden selector).
  * licensed_tokens are time-ordered accepted child ids plus the correction. accepted is the
  * accepted draft count. Sampling increments configs[b].token_counts for each produced token when
  * that pointer is non-null; greedy does not. Large-vocabulary sampling uses the same
  * partial/group pipeline as chain accept, with a parent-walk penalty overlay at each packed
- * column, then the hop-0 membership / later-hop greedy walk over the stored p-less moments.
+ * column, then a membership walk over the stored p-less moments.
  *
  * verify_ids/parent_index/fold_path/licensed_tokens are I32 [W,B]. target_tokens is I32 [W,B].
  * logits is BF16 [physical_rows,W,B]. current_extents/valid_columns and the other vectors are

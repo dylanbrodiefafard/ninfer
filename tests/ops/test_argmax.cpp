@@ -137,6 +137,40 @@ int run_suppressed_case(std::int32_t physical_rows, std::int32_t valid_rows,
     return failures;
 }
 
+int column_masks(int physical, int domain) {
+    constexpr int width = 6, batch = 2;
+    const int stride = (domain + 31) / 32 + 1;
+    std::vector<std::uint32_t> masks(batch * width * stride, 0);
+    std::vector<std::uint16_t> logits(batch * width * physical, f32_to_bf16(0));
+    std::vector<std::int32_t> expected;
+    for (int col = 0; col < batch * width; ++col) {
+        const int token = domain - 1 - col;
+        expected.push_back(token);
+        masks[col * stride + token / 32] |= 1u << (token % 32);
+        masks[col * stride] |= 1u << 8;
+        logits[col * physical] = f32_to_bf16(100);
+        logits[col * physical + 8] = f32_to_bf16(90);
+    }
+    auto device_masks = to_device(masks);
+    std::vector<ops::SamplingConfig> configs(batch);
+    for (int row = 0; row < batch; ++row) {
+        configs[row].allowed_token_words = static_cast<const std::uint32_t*>(device_masks.p) +
+                                            row * width * stride;
+        configs[row].allowed_token_column_stride = stride;
+        configs[row].suppressed_token_count = 1;
+        configs[row].suppressed_tokens[0] = 8;
+    }
+    auto device_logits = to_device(logits);
+    auto device_configs = to_device(configs);
+    auto device_output = to_device(std::vector<std::int32_t>(batch * width, -1));
+    Tensor x(device_logits.p, DType::BF16, {physical, batch * width});
+    Tensor y(device_output.p, DType::I32, {batch * width});
+    ops::argmax(x, y, domain, static_cast<const ops::SamplingConfig*>(device_configs.p), width, nullptr);
+    cuda_synchronize();
+    return verify_exact("argmax per-node masks and row isolation",
+        from_device<std::int32_t>(device_output, expected.size()), expected);
+}
+
 } // namespace
 
 int main() {
@@ -146,6 +180,8 @@ int main() {
     }
 
     int failures = 0;
+    failures += column_masks(1024, 1000);
+    failures += column_masks(248320, 248077);
     failures += run_case(248320, 248077, 1);
     failures += run_case(248320, 248077, 6);
     failures += run_case(248320, 248077, 15);

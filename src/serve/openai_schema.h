@@ -34,7 +34,8 @@ std::optional<bool> parse_openai_enable_thinking(const nlohmann::json& body);
                                                          int draft_n_accepted = 0,
                                                          double prefill_tail_tok_s = 0.0,
                                                          double prefill_tail_window_s = 0.0,
-                                                         int prompt_reused = 0);
+                                                         int prompt_reused = 0,
+                                                         const ninfer::GenerationRecoveryStats& recovery = {});
 
 // Non-streaming chat completion response body (JSON string). When `reasoning` is
 // non-empty it is attached as `message.reasoning_content` (the DeepSeek/vLLM-style

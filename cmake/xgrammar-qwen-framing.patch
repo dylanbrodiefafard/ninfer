@@ -1,0 +1,85 @@
+--- a/json_schema_converter_ext.cc
++++ b/json_schema_converter_ext.cc
+@@ -6,6 +6,7 @@
+ #include "json_schema_converter_ext.h"
+ 
+ #include <unordered_map>
++#include <map>
+ 
+ #include "json_schema_converter.h"
+ #include "regex_converter.h"
+@@ -118,7 +119,46 @@
+     const std::vector<ObjectSpec::Property>& properties, const std::string& rule_name
+ ) {
+   if (nested_object_level_ <= 1) {
+-    return GetKeyPattern();
++    // An additional-property transition must not bypass the named property's
++    // value schema or re-admit an already used named key. Qwen keys are raw
++    // identifiers here, so the JSON quoted-key exclusion cannot be reused.
++    constexpr std::string_view first = "ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
++    const std::string alphabet = "0123456789" + std::string(first);
++    struct Node { std::map<char, size_t> edges; bool terminal = false; };
++    std::vector<Node> trie(1);
++    for (const auto& prop : properties) {
++      if (prop.name.empty() || first.find(prop.name[0]) == std::string_view::npos ||
++          prop.name.find_first_not_of(alphabet) != std::string::npos) { continue; }
++      size_t node = 0;
++      for (char c : prop.name) {
++        auto it = trie[node].edges.find(c);
++        if (it == trie[node].edges.end()) {
++          const size_t next = trie.size();
++          trie[node].edges.emplace(c, next);
++          trie.emplace_back();
++          node = next;
++        } else { node = it->second; }
++      }
++      trie[node].terminal = true;
++    }
++    auto build = [&](auto&& self, size_t node) -> std::string {
++      std::string body;
++      auto choice = [&](const std::string& value) {
++        if (!body.empty()) { body += " | "; }
++        body += value;
++      };
++      if (node != 0 && !trie[node].terminal) { choice("\"\""); }
++      std::string other;
++      for (char c : (node == 0 ? std::string(first) : alphabet)) {
++        if (!trie[node].edges.count(c)) { other += c; }
++      }
++      if (!other.empty()) { choice("[" + other + "] [a-zA-Z0-9_]*"); }
++      for (const auto& [c, next] : trie[node].edges) {
++        choice("\"" + std::string(1, c) + "\" " + self(self, next));
++      }
++      return ebnf_script_creator_.AddRule(rule_name + "_other_key_" + std::to_string(node), body);
++    };
++    return build(build, 0);
+   }
+   return JSONSchemaConverter::GetKeyPatternExcluding(properties, rule_name);
+ }
+@@ -239,6 +279,15 @@
+     const std::string& key, const std::string& value_rule, const std::string& rule_name, int64_t idx
+ ) {
+   if (nested_object_level_ <= 1) {
++    // Qwen's artifact template puts exactly one LF on each side of the value.
++    // Make those framing bytes explicit instead of admitting arbitrary outer
++    // whitespace that a downstream parser would have to guess or strip.
++    if (xml_wrapper_.key_wrapper_prefix == "<parameter=") {
++      return picojson::value(
++          xml_wrapper_.key_wrapper_prefix + key + xml_wrapper_.key_wrapper_suffix + "\n").serialize() +
++          " " + value_rule + " \"\\n" +
++          xml_wrapper_.parameter_suffix + "\"";
++    }
+     std::string whitespace = GetWhitespacePattern();
+     // xml_string already accepts whitespace. Adding whitespace repetitions around it preserves the
+     // language but creates one Earley state for every possible split with the string body.
+@@ -262,6 +311,10 @@
+     const std::string& rule_name_suffix
+ ) {
+   if (nested_object_level_ <= 1) {
++    if (xml_wrapper_.key_wrapper_prefix == "<parameter=") {
++      return "\"<parameter=\" " + key_pattern + " \">\\n\" " + value_rule +
++          " \"\\n</parameter>\"";
++    }
+     std::string whitespace = GetWhitespacePattern();
+     std::string formatted_value =
+         value_rule == kXMLString ? value_rule : whitespace + " " + value_rule + " " + whitespace;

@@ -96,6 +96,7 @@ RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
 
 // Compact console records retained for operator visibility.
 std::string format_request_start(const RequestLogContext& context);
+std::string format_recovery_event(std::uint64_t request_id, const ninfer::RecoveryEvent& event);
 std::string format_request_rejected(const RequestRejectionLogContext& context);
 std::string format_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
 std::string format_ignored_qwen_tool_call_markup(const RequestLogContext& context,

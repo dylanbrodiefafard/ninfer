@@ -107,7 +107,7 @@ std::string serve_usage_text(const char* argv0) {
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--kv-ram-capacity off|N] "
            "[--kv-disk-capacity off|N] [--kv-disk-location PATH] [--kv-disk-compress off|zstd] "
-           "[--max-concurrency N] "
+           "[--max-concurrency N] [--no-generation-recovery] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
            "[--max-request-mib N] [--request-log-jsonl FILE] "
@@ -211,6 +211,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--kv-disk-compress") {
             options.kv_disk_compress =
                 parse_kv_disk_compress(require_value("--kv-disk-compress"));
+        } else if (arg == "--no-generation-recovery") {
+            options.generation_recovery = false;
         } else if (arg == "--max-concurrency") {
             options.max_concurrency = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));

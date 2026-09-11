@@ -78,8 +78,9 @@ The endpoint supports:
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`;
 - function tools, tool choices, assistant tool-call history, and tool-result messages.
-  Qwen `<tool_call>` markup becomes `tool_calls` only when the request includes tools and
-  `tool_choice` is not `none`, or the conversation already has tool-call history. Markup on a
+  Engine-owned constrained generation produces `tool_calls` only when the request includes
+  current tool declarations and `tool_choice` is not `none`. Tool history alone does not
+  authorize a new function. Markup on a
   tools-off request stays in `content` and ninfer-serve logs a warning.
 - the top-level `reasoning_effort` field;
 - the `enable_thinking` extension;
@@ -337,15 +338,136 @@ Responses function definitions are flat rather than Chat Completions' nested `fu
 }
 ```
 
-NInfer renders these definitions in the Qwen prompt and parses model output into separate
-`function_call` output Items. Parsing runs only when the request includes tools and `tool_choice`
-is not `none`, or the conversation already has tool-call history. If the model emits Qwen
+NInfer renders these definitions in the Qwen prompt. The Engine constrains Qwen tool envelopes
+and supported argument schemas during ordinary and speculative target sampling, validates
+completed calls, and returns typed values for separate `function_call` output Items. This runs
+only when the request includes current tools and `tool_choice` is not `none`. If the model emits Qwen
 `<tool_call>` markup on a tools-off request, NInfer leaves it in the answer text and logs a
-warning; it does not invent a structured tool call. Each parsed output has a protocol Item `id`
+warning; it does not invent a structured tool call. Each completed output has a protocol Item `id`
 (`fc_...`) and a distinct `call_id` (`call_...`). The client executes the function and sends a
-`function_call_output` Item in a later request. NInfer does not execute functions or enforce JSON
-Schema through constrained decoding, so `strict:true`, `tool_choice:required`, named tool choice,
+`function_call_output` Item in a later request. NInfer does not execute functions. Its schema
+subset supports scalar/container types, properties/required/additionalProperties, array bounds,
+numeric bounds, string patterns/length bounds, enums/constants, local references, and supported
+`anyOf` forms. A string `pattern` combined with `minLength` or `maxLength` is not
+supported: the compiler would otherwise ignore the length bound. Unsupported assertions
+or assertion combinations are rejected during preparation
+rather than silently ignored, with HTTP 400, `code: invalid_tool_schema`, and
+`param: tools` on the OpenAI error surface. Malformed schemas, patterns and unresolved
+references use the same classification and retain the compiler diagnostic.
+This is not full JSON Schema or OpenAI strict-tool parity:
+`strict:true`, `tool_choice:required`, named tool choice,
 hosted tools, MCP tools, and custom free-form tools are rejected.
+
+Qwen argument framing uses exactly one LF before and after each parameter value.
+Declared arguments may appear in any order, independently of the order of
+`properties` in the supplied schema or its HTTP JSON normalization. The grammar
+tracks which named keys have been emitted: it cannot close before the required
+keys are present, repeat a named key, or bypass a named value's constraints through
+`additionalProperties`. Property-count bounds still apply. Nested schema-defined
+JSON objects use the same order-independent rules, including through local
+references and supported alternatives. Completed-call validation rejects duplicate
+keys (including in nested JSON values); arbitrary additional key names are checked
+for duplication during this final validation, not by the finite named-key grammar.
+In nested JSON, an escaped alias of a declared key can also pass the library's
+additional-key grammar; final validation decodes the key before checking its
+value and uniqueness, and never publishes a call that fails those checks.
+These rules apply on ordinary and every speculative target position, with grammar
+state committed only for published tokens. They do not shorten reasoning, force an
+end-of-turn after a call, or change sampling/recovery settings.
+Only those framing bytes are removed; indentation, trailing newlines and literal
+XML-looking text inside a string are preserved. For schemas admitting both a raw
+string and a JSON value, the lossless raw-string interpretation is preferred when
+the complete argument object satisfies the schema.
+
+With declared tools, the free-text region after reasoning reserves the protocol prefixes
+`</invoke`, `</parameter`, `</function`, `</tool_call`, `<invoke`, `<parameter`, and
+`<function`. The prefix `<tool_call` must continue into a canonical declared call.
+These prefixes cannot be sampled as orphan prose before, between, or after calls;
+omitting `>` or appending whitespace/`= null` does not evade the constraint.
+Legitimate Qwen call frames and these literal strings inside schema-valid tool arguments
+remain allowed. The restriction
+is part of the grammar domain on ordinary and speculative target positions, not a
+post-response text scrubber or a recovery retry. While reasoning is open, `<tool_call`
+is also excluded: a real call must follow `</think>` rather than being rehearsed inside
+reasoning. Natural-language reasoning, XML tags outside these reserved prefixes,
+inter-call prose, and tools-off/raw output remain
+allowed. The engine never promotes reasoning markup into executable calls. Literal discussion of these reserved delimiters in
+tool-enabled answer prose must use an escaped representation rather than the exact strings.
+Likewise, literal discussion of the tool opener inside reasoning must escape that opener.
+
+For default p-less sampling, Engine can withhold an unproductive repeated call and
+retry internally before publishing it. The detector requires two consecutive previous
+single-call rounds with the same parsed arguments, unchanged associated text results,
+and an identical 64-word reasoning passage; the new proposal must repeat the call and
+reasoning as well. Different results, changed arguments, an intervening user turn,
+media, or ordinary short polling do not meet that evidence. This conservative detector
+does not recognize every multi-tool cycle or infer arbitrary external state changes.
+
+Recovery preserves real conversation content/results, removes closed assistant reasoning
+from the internal retry prompt, and adds feedback explicitly stating that the rejected
+proposal was not executed. It permits at most two retries within the original completion
+token budget and resource reservation. It neither executes tools nor forces EOS. Already
+streamed reasoning/prose remains visible; rejected calls are never published. A novel valid
+call is not a guarantee that the model has made useful progress.
+
+Text-only p-less thinking requests can also retry persistent generated reasoning before
+a tool call exists. Three non-overlapping occurrences of an identical 256-token reasoning
+passage must appear within the current generated attempt. Their separation may differ;
+this catches multi-paragraph loops whose periods change after a one-token intervention.
+In addition, repeated passages must cover at least 4,096 distinct redundant tokens;
+overlapping windows cannot count the same tokens twice. This conservative threshold
+allows shorter loops to escape naturally without an expensive full-context retry.
+It does not cap reasoning at 4,096 tokens.
+Hashes only locate candidates; exact generated-token comparison proves the match. Prompt
+tokens and previous attempts cannot supply occurrences. Two copies alone do not trigger
+a retry. It is not a reasoning-length
+timeout. The retry discards the failed attempt's reasoning from its internal context,
+removes closed historical reasoning, preserves the original task and completed tool results,
+and appends an explicitly labeled engine system notice. It creates no assistant tool call,
+tool result, or user message. Already streamed reasoning remains visible, separated from
+the retry by a blank line, and charged to
+completion usage. Both recovery causes share the same maximum of two retries. Requests
+with media, raw output, disabled thinking, or non-p-less sampling do not use reasoning retries.
+Temperature-zero generation does not trigger the reasoning detector.
+
+Explicit caller string/token stops and cancellation terminate without a recovery retry.
+A natural model end-of-turn can still expose a confirmed duplicate call and trigger recovery.
+
+If a confirmed repeat cannot be recovered within those bounds, the request fails with
+`generation_recovery_exhausted` (`server_error`, HTTP 500 before streaming headers, or
+the protocol's stream error after headers). The engine remains available. When recovery
+occurs, vendor usage at `prompt_tokens_details.ninfer.recovery` reports attempts,
+discarded calls, `discarded_reasoning_tokens` (omitted internally, not retracted), additional
+prefill tokens/samples, and preparation/prefill milliseconds.
+Completion usage includes tokens spent on discarded attempts; original prompt usage is
+unchanged. Raw output does not use internal recovery.
+
+For an unintervened diagnostic baseline, launch with `--no-generation-recovery`.
+This startup-only option disables both repetition-driven token exclusions and internal
+reasoning/duplicate-tool retries for every request. It leaves tool grammar, p-less sampling
+at all speculative target positions, and ordinary stopping/cancellation/budgets unchanged.
+Omit the flag to restore the default enabled policy. Disabled recovery can allow a loop
+to consume the entire output budget; it is not recommended as a general cure for loops.
+The startup log explicitly records when recovery is disabled.
+
+Wire captures remain accurate with recovery enabled, but streamed reasoning can contain
+multiple attempts. Correlate them with the server's request-scoped recovery logs. A missing
+`prompt_tokens_details.ninfer.recovery` object does not establish zero cycle exclusions:
+that object reports discarded-generation retries, whereas cycle exclusions are logged.
+
+The server emits live `[req N] recovery` console records for streaming and non-streaming
+requests on all three HTTP surfaces. `retry_triggered` identifies `repeated_reasoning` or
+`duplicate_tool_call`; `retry_started` marks the cold-context rebuild, and
+`retry_prefill_complete` marks its completion. `exhausted` is a warning before the request
+error. `finished` reports the terminal outcome (including cancellation or output limits),
+not a claim that the task succeeded. Records include started attempt count,
+cumulative discarded reasoning/tool counts, generated tokens and remaining output budget.
+`cycle_exclusion` means one root-token exclusion was armed for sampling, not that a retry
+occurred or that it changed the counterfactual draw. To bound traffic these records appear
+at counts 1, 2, 4, 8, ...; terminal recovery records include the exact cumulative count.
+These diagnostics contain no prompt, reasoning, tool arguments, or token text, and never
+enter HTTP model-output chunks. Tool grammar is continuously enforced rather than a
+recovery trigger; its normal operation does not emit recovery events.
 
 ### Response object and usage
 
@@ -402,7 +524,9 @@ Function arguments use `response.function_call_arguments.delta` and `.done`. IDs
 and content indices remain stable, and concatenated deltas equal the terminal Item. Responses SSE
 does not emit the Chat Completions `[DONE]` sentinel. With tools enabled, ordinary answer text still
 streams immediately; only an ambiguous `<tool_call>` suffix or the structured tool region is held.
-Malformed tool markup is flushed back as ordinary text without losing bytes.
+An interrupted declared-tool envelope (caller stop, cancellation, or output budget) is not
+published as a call or flushed into prose. Already completed calls are kept separate from text.
+Long reasoning is not by itself a loop or a reason to truncate output.
 
 ### Local response state and resources
 
@@ -574,8 +698,9 @@ top-k, min-p, and presence/frequency penalties from both process flags and reque
 logs a one-time warning. Ignored request fields must still satisfy their normal input ranges before
 sampler resolution.
 `--no-p-less-sampling` opts into the registered production sampler. Combined with `--greedy`,
-p-less remains exact argmax. Under MTP or DFlash2, p-less applies at hop 0 (chain Leviathan with
-one-hot draft `q`); later hops and the bonus are greedy. There is
+p-less remains exact argmax. Under MTP or DFlash2, p-less applies at every hop (chain Leviathan with
+one-hot draft `q`) and to the bonus. A thinking-cycle exclusion affects only the next token,
+not later hops in the same speculative round. There is
 no OpenAI or Anthropic schema field for this mode.
 
 Run `./build/apps/ninfer-serve --help` for the exact option contract.

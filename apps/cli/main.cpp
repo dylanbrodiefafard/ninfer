@@ -4,6 +4,7 @@
 #include "product/prompt_input/prompt_input.h"
 
 #include "ninfer/engine.h"
+#include <nlohmann/json.hpp>
 
 #include <chrono>
 #include <cstdint>
@@ -236,12 +237,18 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_stage("generate", "vision", result.timings.vision_seconds);
     print_stage("generate", "text prefill", result.timings.prefill_seconds);
     print_stage("generate", "decode", result.timings.decode_seconds);
+    if (result.recovery.attempts != 0) {
+        print_stage("recovery", "prepare", result.recovery.prepare_seconds);
+        print_stage("recovery", "text prefill", result.recovery.prefill_seconds);
+        print_metric("recovery attempts", std::to_string(result.recovery.attempts));
+    }
     print_stage("generate", "total", result.timings.total_seconds);
 
     const std::size_t generated = result.generated_token_ids.size();
-    const std::size_t decoded   = generated == 0 ? 0 : generated - 1;
+    const std::size_t prefill_samples = 1 + result.recovery.prefill_samples;
+    const std::size_t decoded = generated > prefill_samples ? generated - prefill_samples : 0;
     const double model_seconds  = result.timings.vision_seconds + result.timings.prefill_seconds +
-                                 result.timings.decode_seconds;
+                                 result.timings.decode_seconds + result.recovery.prefill_seconds;
     print_metric("sampling", format_sampling(sampling));
     print_metric("finish reason", format_finish(result.finish_reason));
     print_metric("prompt tokens", std::to_string(result.prompt.prompt_tokens));
@@ -409,6 +416,15 @@ int main(int argc, char** argv) {
         const ninfer::ResolvedSamplingParameters sampling = generation.resolved_sampling();
         const ninfer::GenerationResult result             = generation.wait(&sink);
         sink.finish_streams();
+        if (!result.tool_calls.empty()) {
+            auto calls = nlohmann::ordered_json::array();
+            for (const auto& call : result.tool_calls) {
+                calls.push_back({{"id", call.id}, {"type", "function"},
+                                 {"function", {{"name", call.name},
+                                               {"arguments", call.arguments_json}}}});
+            }
+            std::cout << nlohmann::ordered_json{{"tool_calls", std::move(calls)}}.dump() << '\n';
+        }
 
         if (cli.print_token_ids) {
             std::cerr << std::left << std::setw(12) << "tokens" << std::setw(26) << "generated ids";

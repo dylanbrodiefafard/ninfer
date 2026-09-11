@@ -163,6 +163,12 @@ int main() {
 
     const ServeOptions prepended =
         parse({"ninfer-serve", "model.ninfer", "--system-prepend", "Stay terse."});
+    failures += check(prepended.generation_recovery,
+                      "generation recovery must default to enabled");
+    const ServeOptions no_recovery =
+        parse({"ninfer-serve", "model.ninfer", "--no-generation-recovery"});
+    failures += check(!no_recovery.generation_recovery,
+                      "--no-generation-recovery did not disable recovery");
     failures += check(prepended.system_prepend == "Stay terse.",
                       "--system-prepend did not store the provided text");
 

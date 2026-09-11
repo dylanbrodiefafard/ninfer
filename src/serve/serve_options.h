@@ -21,6 +21,7 @@ inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
 
 struct ServeOptions {
     bool help_requested = false;
+    bool generation_recovery = true;
     std::string artifact_path;
     std::string host = "127.0.0.1";
     int port         = 8080;

@@ -95,6 +95,10 @@ void arm_typical_exclude(RequestControl& request, const SequenceState& sequence)
         sequence.ledger.data() + request.prompt_tokens,
         sequence.ledger.size() - request.prompt_tokens);
     request.sampling_host.typical_exclude = ninfer::runtime::typical_exclude_token(generated);
+    if (request.output &&
+        !request.output->reasoning_cycle_exclusion_allowed(request.sampling_host.typical_exclude)) {
+        request.sampling_host.typical_exclude = -1;
+    }
 }
 
 void trim_speculative_stats_to_commit(RequestControl& request, const PendingCandidate& pending,
@@ -372,6 +376,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     prefill_hidden                  = plan.persistent.prefill_hidden.bind(backing);
     token_counts                    = plan.persistent.token_counts.bind(backing);
     sampling_config                 = plan.persistent.sampling_config.bind(backing);
+    tool_masks = std::make_unique<qwen3_6::ToolMaskExchange>(
+        plan.persistent.tool_token_masks.bind(backing),
+        plan.persistent.tool_sampling_config.bind(backing));
     tail_hidden_store               = plan.persistent.tail_hidden.bind(backing);
     rewrite_checkpoint_hidden_store = plan.persistent.rewrite_checkpoint_hidden.bind(backing);
     if (plan.persistent.staging_hidden) {
@@ -626,7 +633,8 @@ runtime::AdmissionResources ProgramImplCore::admission_capacity() const noexcept
 runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lane,
                                                                PreparedPromptData&& prompt,
                                                                RequestPlan&& plan,
-                                                               runtime::TransientRegion transient) {
+                                                               runtime::TransientRegion transient,
+                                                               const qwen3_6::OutputSession* output) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     SequenceState& sequence = sequences[lane];
     RequestControl& request = requests[lane];
@@ -864,6 +872,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 ? prompt_tokens
                 : 0U;
         materialize_sequence_kv(sequence, prompt_tokens, backend_materialized);
+        request.output = output;
         install_sampling(sequence, request, request_plan.sampling);
         sequence.rope_delta = prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
@@ -2476,6 +2485,7 @@ ProgramImplCore::restored_context_checkpoint_tokens_lane(std::uint32_t lane) con
 }
 
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
+    request.output = nullptr;
     if (staging_.occupied && staging_.lane == sequence.lane) { unoccupy_staging(); }
     request.prefill.reset();
     sequence.kv.reset();
@@ -2910,7 +2920,7 @@ void ProgramImplCore::prepare_graphs() {
             captured_ks.empty() ? draft_window : captured_ks.back();
         schedule::MtpBatchContext mtp_state{
             execution_core(),  decoder->text_kv, *decoder->mtp_cache(), *io.mtp_decode,
-            *mtp_host_ingress, *mtp_host_egress, tail_hidden_store};
+            *mtp_host_ingress, *mtp_host_egress, tail_hidden_store, tool_masks.get()};
         const auto warm_profiles = mtp_graph_profiles(capacity, warm_k);
         const GraphExecutionProfile code_warm = warm_profiles.front();
         prepare_representative(code_warm.min, 1);
@@ -2967,7 +2977,7 @@ void ProgramImplCore::prepare_graphs() {
         const std::uint32_t warm_w = dflash_captured_verify_width(warm_k, dflash_verify_width);
         schedule::DFlashBatchContext dflash_state{
             execution_core(),     decoder->text_kv,    *dflash,          *io.dflash_decode,
-            *dflash_host_ingress, *dflash_host_egress, tail_hidden_store};
+            *dflash_host_ingress, *dflash_host_egress, tail_hidden_store, tool_masks.get()};
         const auto batch_one_profiles = dflash_graph_profiles(capacity, warm_k, 1, warm_w);
         const GraphExecutionProfile code_warm = batch_one_profiles.front();
         const ops::GqaExecutionEnvelope code_warm_target{
@@ -3094,10 +3104,26 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
                            request.sampling_host.frequency_penalty != 0.0F;
     request.sampling_host.token_counts =
         penalties ? static_cast<std::int32_t*>(counts.data) : nullptr;
+    const std::array<const qwen3_6::OutputSession*, 1> outputs{request.output};
+    const std::array<ops::SamplingConfig, 1> configs{request.sampling_host};
+    tool_masks->bind(outputs, configs);
+    // The prefill owner is exclusive. Root storage can be shared with later
+    // compact rounds; request sampling itself keeps no compact-row pointer.
+    request.prefill_sampling_host = tool_masks->root(0, device.stream);
     Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1);
-    CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.sampling_host,
-                               sizeof(request.sampling_host), cudaMemcpyHostToDevice,
+    CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.prefill_sampling_host,
+                               sizeof(request.prefill_sampling_host), cudaMemcpyHostToDevice,
                                device.stream));
+}
+
+void ProgramImplCore::bind_tool_mask_batch(std::span<const std::uint32_t> lanes) {
+    std::array<const qwen3_6::OutputSession*, kMaximumConcurrency> outputs{};
+    std::array<ops::SamplingConfig, kMaximumConcurrency> configs{};
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        outputs[row] = requests[lanes[row]].output;
+        configs[row] = requests[lanes[row]].sampling_host;
+    }
+    tool_masks->bind({outputs.data(), lanes.size()}, {configs.data(), lanes.size()});
 }
 
 void ProgramImplCore::copy_tail(SequenceState& sequence, const Tensor& source) {
@@ -3495,6 +3521,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
 runtime::BatchedGeneratedRound
 ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                                        std::span<const runtime::RoundBudget> budgets) {
+    std::array<bool, kMaximumConcurrency> cycle_exclusions{};
     if (speculative_backend != SpeculativeBackend::None) {
         throw std::logic_error("ordinary batch execution requires the ordinary backend");
     }
@@ -3538,6 +3565,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             SequenceState& sequence            = sequences[lanes[row]];
             RequestControl& request            = requests[lanes[row]];
             arm_typical_exclude(request, sequence);
+            cycle_exclusions[row] = request.sampling_host.typical_exclude >= 0;
             const std::uint32_t frontier       = sequence.execution_frontier;
             ordinary_host_ingress->tokens[row] = sequence.ledger.back();
             ordinary_host_ingress->cache_positions[row] =
@@ -3550,6 +3578,10 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             materialize_sequence_kv(sequence, frontier + 1, 0);
         }
 
+        bind_tool_mask_batch(lanes);
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            ordinary_host_ingress->sampling[row] = tool_masks->root(row, device.stream);
+        }
         schedule::OrdinaryBatchContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
@@ -3586,7 +3618,8 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         }
         return runtime::BatchedGeneratedRound{
             .tokens = std::span<const TokenId>(ordinary_host_egress->sampled_tokens.data(),
-                                               lanes.size())};
+                                               lanes.size()),
+            .cycle_exclusions = cycle_exclusions};
     } catch (...) {
         try {
             device.synchronize_all();
@@ -3601,6 +3634,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
 runtime::BatchedGeneratedRound
 ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                   std::span<const runtime::RoundBudget> budgets) {
+    std::array<bool, kMaximumConcurrency> cycle_exclusions{};
     if (speculative_backend != SpeculativeBackend::Mtp || !io.mtp_decode ||
         decoder->mtp_cache() == nullptr) {
         throw std::logic_error("MTP batch execution requires the MTP backend");
@@ -3700,6 +3734,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             SequenceState& sequence           = sequences[lanes[row]];
             RequestControl& request           = requests[lanes[row]];
             arm_typical_exclude(request, sequence);
+            cycle_exclusions[row] = request.sampling_host.typical_exclude >= 0;
             const std::uint32_t frontier      = sequence.execution_frontier;
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1
@@ -3741,13 +3776,15 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                  *io.mtp_decode,
                                                  *mtp_host_ingress,
                                                  *mtp_host_egress,
-                                                 tail_hidden_store};
+                                                 tail_hidden_store, tool_masks.get()};
 
+        bind_tool_mask_batch(lanes);
         mark_workspace_usage(workspace_plan.mtp_round);
         const auto started = Clock::now();
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                    batch_k, envelopes, executable);
         const double seconds = synchronize_round_seconds(device, started);
+        tool_masks->rethrow_error();
         // Fallback (extent 0) is not a k-draft round; do not fit T(batch_k) from it.
         if (adaptive_draft && realized_extent > 0) {
             qwen3_6::adaptive_observe_round_time(adaptive_t_by_batch[batch_idx], batch_k,
@@ -3868,7 +3905,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                    lanes.size() * width),
             .row_counts = std::span<const std::int32_t>(mtp_host_egress->licensed_counts.data(),
                                                         lanes.size()),
-            .row_stride = width};
+            .row_stride = width,
+            .cycle_exclusions = cycle_exclusions};
     } catch (...) {
         try {
             device.synchronize_all();
@@ -3883,6 +3921,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 runtime::BatchedGeneratedRound
 ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                      std::span<const runtime::RoundBudget> budgets) {
+    std::array<bool, kMaximumConcurrency> cycle_exclusions{};
     if (speculative_backend != SpeculativeBackend::DFlash || !io.dflash_decode || !dflash) {
         throw std::logic_error("DFlash batch execution requires the DFlash backend");
     }
@@ -3997,6 +4036,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             SequenceState& sequence           = sequences[lanes[row]];
             RequestControl& request           = requests[lanes[row]];
             arm_typical_exclude(request, sequence);
+            cycle_exclusions[row] = request.sampling_host.typical_exclude >= 0;
             const std::uint32_t frontier      = sequence.execution_frontier;
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1U
@@ -4034,14 +4074,16 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                     *io.dflash_decode,
                                                     *dflash_host_ingress,
                                                     *dflash_host_egress,
-                                                    tail_hidden_store};
+                                                    tail_hidden_store, tool_masks.get()};
 
+        bind_tool_mask_batch(lanes);
         mark_workspace_usage(workspace_plan.dflash_round);
         const auto started = Clock::now();
         schedule::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                       batch_k, live_w, envelopes, target_envelope,
                                       !use_cuda_graph, executable);
         const double seconds = synchronize_round_seconds(device, started);
+        tool_masks->rethrow_error();
         // Fallback (extent 0) is not a k-draft round; do not fit T(batch_k) from it.
         if (adaptive_draft && realized_extent > 0) {
             qwen3_6::adaptive_observe_round_time(adaptive_t_by_batch[batch_idx], batch_k,
@@ -4182,7 +4224,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                    lanes.size() * width),
             .row_counts = std::span<const std::int32_t>(dflash_host_egress->licensed_counts.data(),
                                                         lanes.size()),
-            .row_stride = width};
+            .row_stride = width,
+            .cycle_exclusions = cycle_exclusions};
     } catch (...) {
         try {
             device.synchronize_all();

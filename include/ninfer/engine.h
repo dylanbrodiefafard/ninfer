@@ -77,7 +77,8 @@ public:
     [[nodiscard]] ModelSamplingDefaults sampling_defaults() const;
 
     // Establishes queue membership synchronously. Delivery intent is fixed before queue
-    // membership; terminal-only requests do not publish per-round OutputDelta events. Destroying
+    // membership; terminal-only requests do not publish per-round OutputDelta events,
+    // but may use an OutputSink for host-only recovery diagnostics. Destroying
     // an unconsumed handle cancels its request; wait() owns result consumption and may run
     // independently from GPU execution.
     [[nodiscard]] GenerationHandle
