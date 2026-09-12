@@ -13,6 +13,15 @@
 
 namespace ninfer::ops {
 
+// FP8 single-parent domain: FP8_E4M3FN_ROW_BF16S RowScale [16384,5120], ordered
+// [Q(2048),K(2048),V(6144),Z(6144)], exact BF16 row multipliers. Projection admits
+// A16Only/AllowA8 at every positive T. Snapshot and record admit B=1..4, record
+// W=2..16, snapshot W>=1 (B>1 requires W<=16). Both retain A16 for W<=16;
+// long B=1 AllowA8 snapshot may quantize activations privately. Record preserves
+// the optional tree-parent operand in fused and materialized routes. Complete
+// FP64 projection/convolution/SiLU and represented persistent state form the oracle;
+// private activation quantization and reduction choices do not enter that oracle.
+
 /**
  * Op: gdn_input_proj
  *
@@ -114,9 +123,12 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  *
  * Numeric:
  *   The oracle exact-decodes packed weights and evaluates projection, convolution, SiLU, z, and
- *   every snapshot value naively in FP64 from represented inputs. BF16 query/key/value/z and
- *   snapshots are promoted and compared directly with those ideal values; their final storage
- *   rounding belongs to the Op's named A16 criterion, not the oracle. Former unfused projection
+ *   every snapshot value naively in FP64 from represented inputs. After each valid column,
+ *   the new history entry is rounded to BF16 before it participates in the next column's
+ *   convolution: this is a persistent-state boundary, not private projection staging.
+ *   BF16 query/key/value/z are promoted and compared with ideal FP64 outputs under the
+ *   named A16 criterion; snapshots are compared with the represented BF16 history.
+ *   Former unfused projection
  *   tensors are not observable cast boundaries; production routes use their natural private
  *   accumulator and staging precision. This two-parent Q4/Q5 form does not quantize activation;
  *   the single-parent policy-bearing form below defines its own permitted compute profiles.
@@ -127,7 +139,7 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  *   prefix. The caller reserves disjoint complete [base,base+W) intervals, prevents one row from
  *   overwriting another row's initial slot, and may overlap a row's own initial slot with its
  *   destination after that initial history has been loaded. Other slots are unchanged. Newly
- *   projected convolution channels remain private to the call while published snapshots are BF16.
+ *   projected convolution channels remain private until entering the BF16 history transition.
  */
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
                                   const Weight& value_z_weight, const Tensor& conv_weight,
@@ -218,8 +230,10 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                                 const Tensor* parent_index = nullptr);
 
 /**
- * Single-parent record-producing form. Registered parents are W8G32_F16S [12288,2048] and NVFP4
- * [16384,5120]. W8 admits A16Only. NVFP4 admits A16Only and AllowA4.
+ * Single-parent record-producing form. Registered parents are W8G32_F16S [12288,2048], NVFP4
+ * and FP8_E4M3FN_ROW_BF16S [16384,5120]. W8 admits A16Only. NVFP4 admits A16Only and AllowA4.
+ * FP8 admits A16Only/AllowA8 but uses qualified A16 arithmetic throughout W=2..16.
+ * FP8 batches preserve the C=1 panel reduction and fused/materialized convolution profile.
  */
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,
                                 const Tensor& conv_weight, const Tensor& conv_states,

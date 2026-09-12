@@ -36,6 +36,7 @@ QTYPES = {
     "w8": {"group": 32, "bytes_per_group": 34, "pad_k": 128},
     "nvfp4": {"group": 16, "bytes_per_group": 9, "pad_k": 0},
     "bf16": {"group": 1, "bytes_per_group": 2, "pad_k": 0},
+    "fp8": {"group": 1, "bytes_per_group": 1, "pad_k": 0},
 }
 
 PRESETS = {
@@ -199,13 +200,13 @@ def add_problem_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--n", type=int)
     parser.add_argument("--k", type=int)
     parser.add_argument("--t", type=int)
-    parser.add_argument("--qtype", default=None, help="q4|q5|q6|w8|nvfp4|bf16")
-    parser.add_argument("--policy", default="a16", choices=["a16", "a4"])
+    parser.add_argument("--qtype", default=None, help="q4|q5|q6|w8|nvfp4|bf16|fp8")
+    parser.add_argument("--policy", default="a16", choices=["a16", "a8", "a4"])
     parser.add_argument("--phase", choices=["prefill", "decode", "mixed"])
     parser.add_argument("--idea", help="idea class to gate; see --list-ideas")
     parser.add_argument("--measured-us", type=float, help="current public-Op median µs")
     parser.add_argument("--mma-json", help="profiles/kdev/mma_issue.json from `kdev mma`")
-    parser.add_argument("--mma-per-s", type=float, help="override NVFP4 MMA/s from the issue probe")
+    parser.add_argument("--mma-per-s", type=float, help="override matching arithmetic atom MMA/s from the issue probe")
     parser.add_argument("--needs-tmem", action="store_true")
     parser.add_argument("--needs-tcgen05", action="store_true")
     parser.add_argument("--cluster", type=int, default=1)
@@ -237,7 +238,8 @@ def analyze_from_args(args) -> dict:
         label = ""
     if args.t is None:
         raise ValueError("--t is required")
-    mma_rate = args.mma_per_s if args.mma_per_s is not None else _load_mma_rate(args.mma_json)
+    atom = fp8_compute_atom(n,k,args.t,args.policy) if qtype == 'fp8' else 'nvfp4'
+    mma_rate = args.mma_per_s if args.mma_per_s is not None else _load_mma_rate(args.mma_json, atom)
     card = analyze(
         n, k, args.t, qtype,
         policy=args.policy, phase=args.phase, idea=args.idea,
@@ -260,12 +262,29 @@ def weight_bytes(n: int, k: int, qtype: str) -> int:
     spec = QTYPES[qtype]
     if qtype == "bf16":
         return 2 * n * k
+    if qtype == "fp8":
+        return n*k + 2*n
     if qtype == "nvfp4":
         # Production NVFP4 packing: N%128==0, K%64==0, no K-pad. Code + UE4M3 scales.
         return n * k * spec["bytes_per_group"] // spec["group"]
     padded_k = _align_up(k, spec["pad_k"])
     groups = n * padded_k // spec["group"]
     return groups * spec["bytes_per_group"]
+
+
+def fp8_compute_atom(n: int, k: int, t: int, policy: str) -> str:
+    """Public pure-Linear route; fused Ops have their own measured crossover."""
+    if policy not in ('a16','a8'):
+        raise ValueError('FP8 bound supports a16 or a8')
+    if policy == 'a16' or n == 248320:
+        return 'bf16'
+    if (n,k)==(34816,5120):
+        return 'fp8' if t==1 or t>=5 else 'bf16'
+    threshold={(14336,5120):12,(16384,5120):11,
+               (5120,6144):25,(5120,17408):25}.get((n,k))
+    if threshold is None:
+        raise ValueError('unregistered FP8 Linear geometry')
+    return 'fp8' if t>=threshold else 'bf16'
 
 
 def activation_bytes(n: int, k: int, t: int) -> int:
@@ -294,7 +313,7 @@ def infer_phase(t: int) -> str:
     return "mixed"
 
 
-def _load_mma_rate(path: str | None) -> float | None:
+def _load_mma_rate(path: str | None, atom: str = 'nvfp4') -> float | None:
     if path is None:
         default = os.path.join(os.getcwd(), "profiles", "kdev", "mma_issue.json")
         path = default if os.path.isfile(default) else None
@@ -302,7 +321,7 @@ def _load_mma_rate(path: str | None) -> float | None:
         return None
     with open(path) as handle:
         payload = json.load(handle)
-    nvfp4 = payload.get("nvfp4") or {}
+    nvfp4 = payload.get(atom) or {}
     rate = nvfp4.get("mma_per_s")
     return float(rate) if rate else None
 
@@ -394,7 +413,7 @@ def classify_idea(idea: str, bound: str, t: int, phase: str) -> dict:
         return {
             "name": idea,
             "verdict": "allow",
-            "reason": "Compute-bound. Search these as parameters inside the existing SM120 NVFP4 family.",
+            "reason": "Compute-bound. Search these as parameters inside the existing SM120 kernel family.",
         }
     if idea in {"occupancy", "more_smem", "split_k", "new_family"}:
         return {
@@ -435,8 +454,16 @@ def analyze(
     flops = useful_flops(n, k, t)
     ai = flops / bytes_
     t_mem_us = (bytes_ / (SUSTAINED_READ_GB_S * 1e9)) * 1e6
-    t_comp_us = (flops / (DENSE_FP4_TFLOP_S * 1e12)) * 1e6
+    # FP8 qualification requires its measured instruction roof; never borrow
+    # the calibrated NVFP4 rate for an instruction with a different K extent.
+    if qtype == 'fp8' and (policy not in ('a8','a16') or not mma_per_s or mma_per_s <= 0):
+        raise ValueError('FP8 requires a16/a8 and matching kdev mma calibration (or --mma-per-s)')
     atom = NVFP4_MMA if qtype == "nvfp4" else (BF16_MMA if qtype == "bf16" else S8_MMA)
+    if qtype == 'fp8':
+        atom = (16,8,32) if fp8_compute_atom(n,k,t,policy)=='fp8' else BF16_MMA
+    compute_tflops = (mma_per_s * 2 * atom[0]*atom[1]*atom[2] / 1e12
+                      if qtype == 'fp8' else DENSE_FP4_TFLOP_S)
+    t_comp_us = flops / (compute_tflops * 1e6)
     count = mma_count(n, k, t, atom)
     t_issue_us = None
     if mma_per_s and mma_per_s > 0:
@@ -473,7 +500,7 @@ def analyze(
     next_step = (
         "Do not write CUDA. Attack bytes or raise T per weight pass (aggregate_T / weight_replay)."
         if bound == "DRAM"
-        else "Stay in the SM120 NVFP4 family. Autotune tile/TMA/pipeline; do not invent a new MMA ISA."
+        else "Stay in the current SM120 kernel family. Autotune tile/TMA/pipeline; do not invent a new MMA ISA."
     )
     if idea_card and idea_card["verdict"] == "refuse":
         next_step = f"REFUSE this idea. {idea_card['reason']}"
@@ -484,7 +511,7 @@ def analyze(
     if measured_us is not None and floor_us > 0:
         measured_pct = 100.0 * floor_us / measured_us
 
-    denom = (2 * n * k / (DENSE_FP4_TFLOP_S * 1e12)) - (2 * (n + k) / (SUSTAINED_READ_GB_S * 1e9))
+    denom = (2 * n * k / (compute_tflops * 1e12)) - (2 * (n + k) / (SUSTAINED_READ_GB_S * 1e9))
     ridge_t = (w_bytes / (SUSTAINED_READ_GB_S * 1e9) / denom) if denom > 0 else None
 
     return {
@@ -496,7 +523,7 @@ def analyze(
         "model_bytes": bytes_,
         "useful_flops": flops,
         "ai_flop_per_byte": ai,
-        "ridge_flop_per_byte": RIDGE_FLOP_PER_BYTE,
+        "ridge_flop_per_byte": compute_tflops * 1000 / SUSTAINED_READ_GB_S,
         "ridge_t": ridge_t,
         "t_mem_us": t_mem_us,
         "t_comp_us": t_comp_us,
@@ -564,6 +591,10 @@ def _self_test() -> int:
     # NVFP4 9/16 bytes, attn-in.
     check("nvfp4-weight", weight_bytes(14336, 5120, "nvfp4") == 14336 * 5120 * 9 // 16,
           str(weight_bytes(14336, 5120, "nvfp4")))
+    check("fp8-weight", weight_bytes(14336,5120,"fp8")==14336*5120+2*14336)
+    fp8=analyze(14336,5120,1024,'fp8',policy='a8',mma_per_s=1e10)
+    check('fp8-atom',fp8['mma_atom']==dict(m=16,n=8,k=32))
+    check('fp8-roof',abs(fp8['t_comp_us']-useful_flops(14336,5120,1024)/81.92e6)<1e-8)
     d1 = analyze(14336, 5120, 1, "nvfp4")
     check("t1-dram", d1["bound"] == "DRAM", d1["bound"])
     d1024 = analyze(14336, 5120, 1024, "nvfp4")

@@ -184,9 +184,9 @@ int run(const std::filesystem::path& artifact_path, const std::filesystem::path&
         ninfer::product::prompt_from_messages(messages_path, false, true);
     ninfer::DeviceContext device(0);
     ninfer::artifact::Reader reader(artifact_path);
-    const WeightsProfile profile =
-        ninfer::targets::qwen3_6_27b::Package::resolve_weights(reader.identity());
     ninfer::artifact::Binder binder(reader);
+    const WeightsProfile profile =
+        ninfer::targets::qwen3_6_27b::Package::resolve_weights(reader.identity(), binder);
     ArtifactLoadPlan load = ninfer::targets::qwen3_6_27b::detail::bind_artifact(
         binder, profile, {.vision = true});
     ninfer::artifact::MaterializedArtifact materialized =

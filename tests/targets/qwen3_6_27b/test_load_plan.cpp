@@ -45,11 +45,11 @@ bool valid_divisors(const WeightPlan& weight) {
 
 int verify_groupwise(const std::filesystem::path& path) {
     ninfer::artifact::Reader reader(path);
-    if (Package::resolve_weights(reader.identity()) != WeightsProfile::GroupwiseInt) {
+    ninfer::artifact::Binder binder(reader);
+    if (Package::resolve_weights(reader.identity(), binder) != WeightsProfile::GroupwiseInt) {
         std::cerr << "groupwise identity resolved to the wrong profile\n";
         return 1;
     }
-    ninfer::artifact::Binder binder(reader);
     const ArtifactLoadPlan plan =
         bind_artifact(binder, WeightsProfile::GroupwiseInt, all_features());
     if (plan.materialization.object_count != 1124 ||
@@ -86,11 +86,11 @@ int verify_groupwise(const std::filesystem::path& path) {
 
 int verify_nvfp4(const std::filesystem::path& path) {
     ninfer::artifact::Reader reader(path);
-    if (Package::resolve_weights(reader.identity()) != WeightsProfile::Nvfp4) {
+    ninfer::artifact::Binder binder(reader);
+    if (Package::resolve_weights(reader.identity(), binder) != WeightsProfile::Nvfp4) {
         std::cerr << "NVFP4 identity resolved to the wrong profile\n";
         return 1;
     }
-    ninfer::artifact::Binder binder(reader);
     const ArtifactLoadPlan plan = bind_artifact(binder, WeightsProfile::Nvfp4, all_features());
     if (plan.materialization.object_count != 1307 ||
         plan.materialization.device_objects.size() != 1054 ||
@@ -160,9 +160,11 @@ int verify_nvfp4(const std::filesystem::path& path) {
     return 0;
 }
 
-int verify_rejection() {
+int verify_rejection(const std::filesystem::path& path) {
+    ninfer::artifact::Reader reader(path);
+    ninfer::artifact::Binder binder(reader);
     try {
-        (void)Package::resolve_weights({"qwen3.6-27b", "unknown"});
+        (void)Package::resolve_weights({"qwen3.6-27b", "unknown"}, binder);
     } catch (const std::runtime_error& error) {
         const std::string message = error.what();
         if (message.find("qwen3.6-27b/unknown") != std::string::npos) { return 0; }
@@ -193,9 +195,53 @@ int verify_profile_mismatch_rejection() {
     return 1;
 }
 
+int verify_selective(const std::filesystem::path& path) {
+    ninfer::artifact::Reader reader(path);
+    ninfer::artifact::Binder binder(reader);
+    if (Package::resolve_weights(reader.identity(), binder) != WeightsProfile::SelectiveFp8Nvfp4) {
+        throw std::runtime_error("selective FP8 profile was not identified");
+    }
+    const auto plan = bind_artifact(binder, WeightsProfile::SelectiveFp8Nvfp4, all_features());
+    if (plan.bindings.token_embedding.format != NumericFormat::W8G32_F16S ||
+        plan.bindings.output_head.format != NumericFormat::W8G32_F16S) {
+        throw std::runtime_error("selective FP8 changed vocabulary storage");
+    }
+    int fp8 = 0;
+    for (std::size_t i = 0; i < plan.bindings.text_layers.size(); ++i) {
+        const auto& layer = plan.bindings.text_layers[i];
+        const auto count = [&](const WeightPlan& w) {
+            if (w.format == NumericFormat::FP8_E4M3FN_ROW_BF16S) ++fp8;
+            if (w.format == NumericFormat::NVFP4 && !valid_divisors(w)) {
+                throw std::runtime_error("selective profile lost NVFP4 divisor");
+            }
+        };
+        count(layer.mlp.gate_up); count(layer.mlp.down);
+        if (layer.is_full_attention) {
+            const auto& input = std::get<FusedAttentionProjectionPlan>(layer.attention.projection).query_key_gate_value;
+            count(input); count(layer.attention.output);
+            if ((i <= 23 && input.format != NumericFormat::BF16) ||
+                (i <= 7 && layer.attention.output.format != NumericFormat::BF16)) {
+                throw std::runtime_error("selective profile changed protected attention weight");
+            }
+        } else {
+            count(std::get<FusedGdnInputProjectionPlan>(layer.gdn.input_projection).query_key_value_z);
+            count(layer.gdn.output);
+            if (i == 4 && layer.gdn.output.format != NumericFormat::BF16) {
+                throw std::runtime_error("selective profile changed protected GDN weight");
+            }
+        }
+    }
+    if (fp8 == 0) throw std::runtime_error("selective profile contains no FP8 matrices");
+    std::cout << "selective FP8 binding verified: " << fp8 << " matrices\n";
+    return 0;
+}
+
 } // namespace
 
 int main() {
+    if (const char* selected = std::getenv("NINFER_SELECTIVE_FP8_WEIGHTS")) {
+        return verify_selective(selected);
+    }
     const std::filesystem::path groupwise =
         artifact_path("NINFER_QWEN3_6_27B_WEIGHTS", "qwen3_6_27b.ninfer");
     const std::filesystem::path nvfp4 =
@@ -205,7 +251,7 @@ int main() {
                   << " nvfp4=" << nvfp4 << '\n';
         return 77;
     }
-    if (const int result = verify_rejection(); result != 0) { return result; }
+    if (const int result = verify_rejection(groupwise); result != 0) { return result; }
     if (const int result = verify_profile_mismatch_rejection(); result != 0) { return result; }
     if (const int result = verify_groupwise(groupwise); result != 0) { return result; }
     if (const int result = verify_nvfp4(nvfp4); result != 0) { return result; }

@@ -17,6 +17,27 @@
 
 namespace ninfer::test::input_projection {
 
+inline double round_persistent_bf16(double value) {
+    // Pick the nearest represented BF16 directly in FP64, avoiding a private
+    // FP32 double-rounding boundary in the mathematical state oracle.
+    const std::uint16_t center = f32_to_bf16(static_cast<float>(value));
+    std::uint16_t best = center;
+    double distance = std::abs(value - static_cast<double>(bf16_to_f32(center)));
+    for (int delta = -2; delta <= 2; ++delta) {
+        const int candidate = static_cast<int>(center) + delta;
+        if (candidate < 0 || candidate > 65535) { continue; }
+        const auto bits = static_cast<std::uint16_t>(candidate);
+        const double represented = bf16_to_f32(bits);
+        if (!std::isfinite(represented)) { continue; }
+        const double next = std::abs(value - represented);
+        if (next < distance || (next == distance && !(bits & 1U) && (best & 1U))) {
+            best = bits;
+            distance = next;
+        }
+    }
+    return bf16_to_f32(best);
+}
+
 inline std::vector<std::int32_t> sampled_rows(std::int32_t rows, std::int32_t sample_count = 7) {
     if (rows <= 0 || sample_count <= 0) {
         throw std::invalid_argument("sampled_rows requires positive extents");

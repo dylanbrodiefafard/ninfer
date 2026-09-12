@@ -18,6 +18,73 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## Selective FP8 328 MiB qualification (2026-09-11)
+
+The eight-matrix recipe and CPU reproduction command are documented in
+`docs/maintainer/qwen3.8-27b-artifact.md`. It preserves the original BF16 protections,
+W8 endpoints, NVFP4 GDN matrices and draft. The additional payload is approximately
+328 MiB, not the total artifact size (19,934,025,728 bytes with the tested DFlash draft).
+
+Retained matched WikiText measurement: 8,192 fixed input IDs, first 4,096 unscored,
+4,095 teacher-forced targets, prefill chunk 4,096, dense NVFP4 KV, no speculation:
+
+| weight recipe | WikiText PPL |
+|---|---:|
+| original NVFP4 | 7.254364 |
+| selective 61 MiB | 7.217649 |
+| selective 285 MiB | 7.181243 |
+| selective 328 MiB | 7.184892 |
+| publisher mixed FP8/NVFP4 | 7.095132 |
+
+These are corpus-specific measurements, not an overall quality score. Do not mix
+them with earlier chunk512 results (~6.5–6.7). Coding PPL is lower because the token
+distribution differs; absolute PPL values cannot be compared across corpora.
+
+The coding selection used separate fixed selection and reserved windows. For the
+328 MiB recipe, two NInfer selection windows scored 1.744490 and 1.625217; reserved
+XGrammar C++ and Transformers Python windows scored 1.676018 and 2.088383. Corresponding
+base scores were 1.767637, 1.654772, 1.676165 and 2.095829; publisher mixed scores were
+1.744090, 1.624042, 1.666637 and 2.050691. The larger publisher profile is better on
+the reserved pair, but adds approximately 3,022 MiB rather than 328 MiB.
+
+Expanded frozen validation subsequently scored 36 files across six projects
+(147,420 targets). The 328 MiB recipe's equal-project/file NLL aggregation gives
+PPL 1.661752. Adding MLP down40 gives 1.660320; adding GDN output36 gives 1.662353;
+adding both gives 1.661147. All paired baseline bootstrap intervals include zero,
+including the corrected comparisons and whole-project bootstrap. These additions
+are not established upgrades. Across-file PPL SD for the 328 MiB model is 0.451107;
+that describes corpus heterogeneity, not seed noise or uncertainty in a paired
+difference. The selected recipe is a practical memory/quality tradeoff, not a
+proof of globally optimal layer allocation or absence of reasoning loops.
+
+RTX 5090 / CUDA 13.1 Engine throughput, graphs and NVFP4 KV, one warmup and three
+measured repeats, fixed benchmark corpus:
+
+| workload | original NVFP4 tok/s | 328 MiB tok/s |
+|---|---:|---:|
+| C2 pp4096 aggregate | 11,827.52 | 11,467.78 |
+| C2 DFlash5 pp4096+tg256 aggregate decode | 381.33 | 373.63 |
+| C1 target-only tg256 | 84.83 | 83.15 |
+
+The DFlash corpus gives 97% acceptance for both models; these rates do not predict
+difficult coding-chat throughput. This measures a roughly 2–3% cost, not an FP8
+speedup. All raw reports retain commands, per-repeat values and standard deviations
+under `out/fp8-328-release/`; the older PPL reports and per-token losses remain under
+`out/selective-fp8-{campaign,coding,remaining,validation}/` in the qualification checkout.
+Redundant experiment model binaries were removed, not their measurement evidence.
+
+Beyond synthetic Op oracles, 88 real-weight fused projection/residual/SwiGLU checks
+used captured BF16 inputs and independent FP64 formulas without emulating private
+activation quantization. All passed their unchanged precision-profile criteria;
+64 output rows were sampled with full-output finite scans. Real DFlash C4 isolation,
+adaptive drafting, RAM restoration and vision/XAttention integration also passed.
+P-less likelihood, C2/C1 identity, eager mixed-frontier and turn-checkpoint reuse
+during peer decode passed with the retained artifact. The full C++ suite passed
+103 tests with two expected artifact-dependent skips; converter/codec Python tests
+passed six cases.
+These finite checks do not clear the separately recorded NVFP4 private-query
+attention error or imply exact equality between sparse and dense attention.
+
 ## V4 SSD page-spill qualification
 
 The 2026-09-02 page-only qualification used an RTX 5090, CUDA 13.1, the local ZFS mirror, NVFP4

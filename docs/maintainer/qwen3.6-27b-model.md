@@ -17,6 +17,10 @@ MTP, and Vision shape. It is a dense multimodal model with three runtime compone
 
 Qwen3.8-27B NVFP4 may additionally bind an optional DFlash2 companion when `dflash/` objects are
 present. Qwen3.6-27B files do not.
+The Qwen3.8 mixed FP8/NVFP4 storage inventory and its qualified projection
+profiles are defined in `qwen3.8-27b-artifact.md`. It uses this same family
+runtime, state semantics and frontend; storage selection does not introduce a
+second model execution schedule or sampling implementation.
 
 The implementation is fixed to this checkpoint shape. A different layer count, hidden size, head
 layout, or Vision tower is a different model implementation rather than a runtime configuration.

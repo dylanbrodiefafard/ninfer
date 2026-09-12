@@ -1,4 +1,6 @@
 #include "ninfer/ops/attn_input_proj.h"
+#include "core/device.h"
+#include "core/decode_graph.h"
 
 #include "ops/direct_bf16_weight.h"
 #include "ops/input_projection_test_common.h"
@@ -571,6 +573,117 @@ int run_w8_companion() {
     return failures;
 }
 
+constexpr ReductionCriterion kFp8AttnInputProjA16Tolerance{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
+constexpr ReductionCriterion kAttnInputProjA8Tolerance{0.04, 1.0 / 256.0, 0.06};
+int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* gate_value,
+                               int tokens, ops::LinearPolicy policy, bool replay = false) {
+    constexpr int hidden = 5120, qrows = 6144, kvrows = 1024;
+    const bool dual      = gate_value != nullptr;
+    auto activation      = make_bf16_activation(hidden, tokens, 101U + tokens);
+    auto activation_bits = bf16_bits(activation);
+    DeviceBuffer input   = to_device(activation_bits);
+    GuardedBf16Tensor query(qrows, tokens), gate(qrows, tokens), key(kvrows, tokens),
+        value(kvrows, tokens);
+    Tensor x(input.p, DType::BF16, {hidden, tokens}), q = query.tensor(), g = gate.tensor(),
+                                                      k = key.tensor(), v = value.tensor();
+    const auto capacity =
+        dual ? 0
+             : ops::attn_input_proj_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S, 14336,
+                                                             hidden, policy, tokens, tokens);
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
+    DeviceArena workspace(DeviceSpan{scratch.data(), std::max<std::size_t>(capacity, 1)});
+    DeviceContext device;
+    const auto launch = [&] {
+        if (dual)
+            ops::attn_input_proj(x, parent.view(), gate_value->view(), q, g, k, v, device.stream);
+        else if (policy == ops::LinearPolicy::A16Only && (tokens % 2))
+            ops::attn_input_proj(x, parent.view(), q, g, k, v, device.stream);
+        else
+            ops::attn_input_proj(x, parent.view(), q, g, k, v, policy, workspace, device.stream);
+    };
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable graph;
+    cuda_synchronize();
+    if (replay) {
+        definition.capture(device.stream, launch);
+        graph.instantiate(definition);
+    }
+    int failures = 0;
+    for (int phase = 0; phase < (replay ? 2 : 1); ++phase) {
+        if (phase) {
+            for (auto& v : activation) v = -v;
+            activation_bits = bf16_bits(activation);
+            input.copy_from_host(activation_bits.data(), input.bytes);
+        }
+        scratch.fill(phase ? 0xa5 : 0x5a);
+        cuda_synchronize();
+        for (Tensor* out : {&q, &g, &k, &v})
+            CUDA_CHECK(cudaMemsetAsync(out->data, 0xff, std::size_t(out->ne[0]) * tokens * 2,
+                                       device.stream));
+        if (replay)
+            graph.launch(device.stream);
+        else
+            launch();
+        cuda_synchronize(device.stream);
+        const bool a8            = policy == ops::LinearPolicy::AllowA8;
+        const auto criterion     = dual ? kAttnInputProjA16Tolerance
+                                   : a8 ? kAttnInputProjA8Tolerance
+                                        : kFp8AttnInputProjA16Tolerance;
+        const int sample_count   = (a8 || replay) ? 31 : 7;
+        const std::string suffix = std::string(dual ? " Q4/Q5" : " FP8") +
+                                   (a8 ? " allow-a8" : " a16") + " T=" + std::to_string(tokens) +
+                                   " phase=" + std::to_string(phase);
+        failures += verify_output("attn q" + suffix, query, parent.host, 0, qrows, activation,
+                                  hidden, tokens, criterion, sample_count);
+        failures += verify_output("attn k" + suffix, key, parent.host, qrows, kvrows, activation,
+                                  hidden, tokens, criterion, sample_count);
+        failures += verify_output("attn gate" + suffix, gate, dual ? gate_value->host : parent.host,
+                                  dual ? 0 : 7168, qrows, activation, hidden, tokens, criterion,
+                                  sample_count);
+        failures += verify_output("attn value" + suffix, value,
+                                  dual ? gate_value->host : parent.host, dual ? 6144 : 13312,
+                                  kvrows, activation, hidden, tokens, criterion, sample_count);
+        failures += verify_preserved("attn input" + suffix, input, activation_bits);
+        failures += scratch.verify_guards(suffix);
+        if (workspace.used() != 0 || workspace.peak_used() > capacity) {
+            std::cerr << "attention projection workspace exceeds query or leaks a scope\n";
+            ++failures;
+        }
+    }
+    failures += parent.verify_preserved("attn parent");
+    if (dual) failures += gate_value->verify_preserved("attn gate/value");
+    return failures;
+}
+
+int run_fp8_target() {
+    constexpr std::int32_t kHidden = 5120;
+    constexpr std::int32_t kRows   = 14336;
+    DevicePackedWeight parent(
+        quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, 349U));
+
+    int failures = 0;
+    for (auto policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8}) {
+        std::size_t peak = 0;
+        for (int t = 1; t <= 128; ++t) {
+            peak = std::max(peak, ops::attn_input_proj_workspace_capacity_bytes(
+                                      QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, policy, t, t));
+            failures += run_target_projection_case(parent, nullptr, t, policy);
+        }
+        const auto interval = ops::attn_input_proj_workspace_capacity_bytes(
+            QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, policy, 1, 128);
+        if (interval != peak || (policy == ops::LinearPolicy::A16Only && interval != 0)) {
+            std::cerr << "FP8 attention projection workspace interval mismatch\n";
+            ++failures;
+        }
+        for (int t : {129, 144, 145, 160, 161, 192, 193, 256, 257, 1024})
+            failures += run_target_projection_case(parent, nullptr, t, policy);
+        for (int t : {1,  4,  5,  6,  8,  9,  16,  24,  25,  32,  33,  34,
+                      64, 65, 80, 81, 96, 97, 128, 129, 144, 145, 160, 161})
+            failures += run_target_projection_case(parent, nullptr, t, policy, true);
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -580,6 +693,7 @@ int main() {
     }
 
     int failures = 0;
+    failures += run_fp8_target();
     failures += run_q4_q5();
     failures += run_bf16_target();
     failures += run_nvfp4_target();

@@ -471,7 +471,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         disk.max_context         = capacity;
         disk.ram                 = kv_ram_cache_ ? &*kv_ram_cache_ : nullptr;
         disk.fingerprint         = qwen3_6::detail::make_disk_fingerprint(
-            plan.model_id, plan.weights_id, kv_cache, speculative_backend, text_pool, backend_pool,
+            plan.model_id, plan.weights_id, plan.artifact_file_identity, kv_cache,
+            speculative_backend, text_pool, backend_pool,
             &decoder->linear_attention, dflash ? &dflash->local : nullptr);
         disk.text_pool           = &text_pool;
         disk.backend_pool        = backend_pool;

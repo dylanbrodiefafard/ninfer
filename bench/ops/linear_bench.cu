@@ -226,6 +226,8 @@ const char* qtype_name(QType qtype) {
         return "BF16";
     case QType::NVFP4:
         return "NVFP4";
+    case QType::FP8_E4M3FN_ROW_BF16S:
+        return "FP8";
     default:
         break;
     }
@@ -235,6 +237,7 @@ const char* qtype_name(QType qtype) {
 const char* policy_name(LinearPolicy policy) {
     if (policy == LinearPolicy::A16Only) { return "A16"; }
     if (policy == LinearPolicy::AllowA4) { return "A4"; }
+    if (policy == LinearPolicy::AllowA8) { return "A8"; }
     throw std::invalid_argument("unsupported Linear benchmark policy");
 }
 
@@ -246,6 +249,7 @@ QType parse_qtype(std::string_view text) {
     if (value == "w8" || value == "w8g32" || value == "w8g32_f16s") { return QType::W8G32_F16S; }
     if (value == "bf16" || value == "bf16_ctrl") { return QType::BF16_CTRL; }
     if (value == "nvfp4") { return QType::NVFP4; }
+    if (value == "fp8") { return QType::FP8_E4M3FN_ROW_BF16S; }
     throw std::invalid_argument("unknown qtype: " + std::string(text));
 }
 
@@ -253,7 +257,8 @@ LinearPolicy parse_policy(std::string_view text) {
     const std::string value = lower(text);
     if (value == "a16" || value == "a16only") { return LinearPolicy::A16Only; }
     if (value == "a4" || value == "allowa4") { return LinearPolicy::AllowA4; }
-    throw std::invalid_argument("Linear benchmark policy must be a16 or a4");
+    if (value == "a8") { return LinearPolicy::AllowA8; }
+    throw std::invalid_argument("Linear benchmark policy must be a16, a8 or a4");
 }
 
 std::uint64_t parse_u64(std::string_view text, const char* label) {
@@ -312,11 +317,11 @@ void usage(const char* argv0) {
     std::fprintf(
         stderr,
         "Usage:\n"
-        "  %s --qtype Q4|Q5|Q6|W8|BF16|NVFP4 --n N --k K --t T [options]\n"
-        "  %s --qtype Q4|Q5|Q6|W8|BF16|NVFP4 --n N --k K --sweep START:END[:STEP] [options]\n"
+        "  %s --qtype Q4|Q5|Q6|W8|BF16|NVFP4|FP8 --n N --k K --t T [options]\n"
+        "  %s --qtype Q4|Q5|Q6|W8|BF16|NVFP4|FP8 --n N --k K --sweep START:END[:STEP] [options]\n"
         "  %s --suite qwen3_6_27b|qwen3_6_35b_a3b|all [options]\n\n"
         "Options:\n"
-        "  --policy a16|a4    Activation-compute policy (default a16).\n"
+        "  --policy a16|a8|a4 Activation-compute policy (default a16).\n"
         "  --profile          Capture exactly one post-warmup public Linear call.\n"
         "  --warmup N         Warmup calls per point (default %d).\n"
         "  --repeat N         Measured cold-cache samples per point (default %d).\n"
@@ -484,6 +489,36 @@ std::vector<PointGroup> group_points(const std::vector<BenchPoint>& points) {
 }
 
 LinearBenchWeight make_weight(QType qtype, std::int32_t n, std::int32_t k) {
+    if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        const auto codes = checked_mul(n, k, "FP8 codes");
+        const auto scales = align_up(codes, 256);
+        const auto bytes = checked_add(scales, 2ULL * n, "FP8 payload");
+        LinearBenchWeight result{DeviceBuffer(bytes), {}, codes + 2ULL * n};
+        CUDA_CHECK(cudaMemset(result.storage.p, 0x38, codes));
+        bench::detail::fill_f16_kernel<<<bench::detail::launch_grid(n), 256>>>(
+            reinterpret_cast<std::uint16_t*>(static_cast<std::uint8_t*>(result.storage.p) + scales),
+            n, 0x3b80);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        auto& w = result.weight;
+        w.qtype = qtype;
+        w.layout = QuantLayout::RowScale;
+        w.scale_dtype = DType::BF16;
+        w.payload = w.qdata = result.storage.p;
+        w.payload_bytes = bytes;
+        w.scales = static_cast<std::uint8_t*>(result.storage.p) + scales;
+        w.group_size = w.group = k;
+        w.ndim = 2;
+        w.shape[0] = w.padded_shape[0] = n;
+        w.shape[1] = w.padded_shape[1] = k;
+        w.n = n;
+        w.k = k;
+        w.scale_ne[0] = n;
+        w.scale_nb[0] = 2;
+        for (int i = 1; i < 4; ++i) { w.scale_ne[i] = 1; w.scale_nb[i] = 2LL * n; }
+        for (int i = 2; i < 4; ++i) { w.shape[i] = w.padded_shape[i] = 1; }
+        return result;
+    }
     if (qtype == QType::BF16_CTRL) {
         bench::DirectBf16Weight direct  = bench::make_direct_bf16_weight(n, k);
         const std::uint64_t model_bytes = direct.model_weight_bytes();

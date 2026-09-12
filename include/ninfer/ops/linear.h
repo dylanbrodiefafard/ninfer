@@ -56,7 +56,10 @@ enum class LinearPolicy : std::uint8_t {
  *
  * @par Supported execution domain
  * Registered execution uses RowSplit Q4G64_F16S, Q5G64_F16S, Q6G64_F16S, or W8G32_F16S weights
- * with FP16 scales, block-scaled NVFP4 weights, plus registered contiguous BF16_CTRL problems.
+ * with FP16 scales, block-scaled NVFP4 weights, row-scaled FP8_E4M3FN_ROW_BF16S weights,
+ * plus registered contiguous BF16_CTRL problems. FP8 shapes are [14336,5120], [16384,5120],
+ * [34816,5120], [248320,5120], [5120,6144], and [5120,17408], at every positive T.
+ * Their represented values are signed E4M3FN codes times exact BF16 row multipliers.
  * Each format owns a finite registry of exact physical weight problems and selects its kernel
  * internally; a valid encoding and alignment do not imply arbitrary N/K support. The current
  * NVFP4 problems `[N,K]` in `{[14336,5120], [16384,5120], [34816,5120],
@@ -87,6 +90,8 @@ enum class LinearPolicy : std::uint8_t {
  * LinearPolicy::A16Only and LinearPolicy::AllowA8. NVFP4 admits A16Only and AllowA4; AllowA4
  * permits the private resolver to select either a qualified A16 route or activation quantization
  * to NVFP4 at every positive T. The selected route depends only on the registered problem and T.
+ * FP8 admits A16Only and AllowA8. Its vocabulary projection always uses A16 and also accepts
+ * AllowA4 without enabling A4. FP8 packed sequences retain independent per-sequence routes.
  * Callers that pack B independent sequences as `T = sequence_width * B` must use
  * `linear_packed_sequences`, which preserves the C=1 route by default and owns explicitly
  * qualified aggregate exceptions.

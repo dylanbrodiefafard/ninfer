@@ -46,6 +46,8 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  *   - Q4G64_F16S weight [34816,5120], x [5120,T], out [17408,T];
  *   - W8G32_F16S weight [12288,2048], x [2048,T], out [6144,T];
  *   - NVFP4 BlockScaleK16M128x4 weight [34816,5120], x [5120,T], out [17408,T].
+ *   - FP8_E4M3FN_ROW_BF16S RowScale [34816,5120], x [5120,T], out [17408,T].
+ *     FP8 has exact BF16 row multipliers and admits A16Only or AllowA8 for every positive T.
  *   Inputs and output are contiguous BF16. Q4/W8 scales are FP16; NVFP4 scales are E4M3FN.
  *
  * Numeric:

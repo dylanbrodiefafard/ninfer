@@ -87,7 +87,7 @@ int verify_valid_record_equal(std::string_view label,
     return 0;
 }
 
-int verify_nvfp4_record_oracle(
+int verify_record_oracle(
     std::string_view label, const quantized_weight::PackedWeight& parent,
     const std::vector<float>& activation, const std::vector<std::uint16_t>& conv_weight,
     const std::vector<std::uint16_t>& state, const std::vector<std::int32_t>& initial_slots,
@@ -95,7 +95,8 @@ int verify_nvfp4_record_oracle(
     const std::vector<std::int32_t>& parent_indices, const GuardedBf16Tensor& query,
     const GuardedBf16Tensor& key, const GuardedBf16Tensor& value, const GuardedBf16Tensor& z,
     const GuardedBf16Tensor& record, std::int32_t hidden, std::int32_t value_rows,
-    std::int32_t width, std::int32_t batch) {
+    std::int32_t width, std::int32_t batch,
+    ReductionCriterion criterion = kNvfp4RecordA16Tolerance) {
     const std::int32_t channels = kQueryRows + kKeyRows + value_rows;
     const std::int32_t z_rows   = parent.weight.n - channels;
     const std::vector<double> query_values = query.values();
@@ -167,7 +168,7 @@ int verify_nvfp4_record_oracle(
                                       global_row]);
                     record_expected.push_back(projected);
                     const double saved_projection =
-                        bf16_to_f32(f32_to_bf16(static_cast<float>(projected)));
+                        round_persistent_bf16(projected);
                     const std::array<double, 3> next{history[1], history[2], saved_projection};
                     saved[static_cast<std::size_t>(token)] = next;
                     if (parent_indices.empty()) { sequential = next; }
@@ -175,11 +176,11 @@ int verify_nvfp4_record_oracle(
             }
         }
         failures += compare(std::string(label) + " FP64 " + std::string(group_label), actual,
-                            expected, kNvfp4RecordA16Tolerance);
+                            expected, criterion);
         if (convolved) {
             failures += compare(std::string(label) + " FP64 record " +
                                     std::string(group_label),
-                                record_actual, record_expected, kNvfp4RecordA16Tolerance);
+                                record_actual, record_expected, criterion);
         }
     };
     verify_group("query", 0, kQueryRows, query_values, true);
@@ -933,7 +934,7 @@ int run_nvfp4_tree_chain_matches_sequential_fused() {
     return failures;
 }
 
-int run_nvfp4_batched_matches_serial_fused() {
+int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
     // A multi-request record kernel must preserve each sequence's T=1 GEMV reduction and
     // BF16-history/FP32-convolution path. Independent B=1 launches are the exact arithmetic
     // reference; the decoded-weight FP64 oracle below independently checks the public formula.
@@ -944,10 +945,12 @@ int run_nvfp4_batched_matches_serial_fused() {
     constexpr std::int32_t kRows      = 16384;
 
     quantized_weight::PatternedWeightOptions options;
-    options.weight_scale_divisor = 0.125F;
-    options.input_scale_divisor  = 3.5F;
+    if (qtype == QType::NVFP4) {
+        options.weight_scale_divisor = 0.125F;
+        options.input_scale_divisor = 3.5F;
+    }
     DevicePackedWeight parent(
-        quantized_weight::make_patterned_weight(QType::NVFP4, kRows, kHidden, 2001U, options));
+        quantized_weight::make_patterned_weight(qtype, kRows, kHidden, 2001U, options));
 
     const auto run_shape = [&](std::int32_t width, std::int32_t batch,
                                std::vector<std::int32_t> valid_columns,
@@ -1029,13 +1032,13 @@ int run_nvfp4_batched_matches_serial_fused() {
         Tensor lr(legacy_record.data(), DType::BF16, {kChannels, width, batch});
 
         const std::size_t rec_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-            QType::NVFP4, kRows, kHidden, ops::LinearPolicy::AllowA4, batch, width, width);
+            qtype, kRows, kHidden, policy, batch, width, width);
         WorkspaceArena batched_ws(std::max<std::size_t>(256, rec_bytes));
         ops::gdn_input_proj_conv_record(x, parent.view(), conv, batched_state_view, valid, initial,
-                                        br, bq, bk, bv, bz, ops::LinearPolicy::AllowA4, batched_ws,
+                                        br, bq, bk, bv, bz, policy, batched_ws,
                                         nullptr,
                                         parent_indices.empty() ? nullptr : &parent_index);
-        if (width == 4 || width == 5 || width == 6) {
+        if (qtype == QType::NVFP4 && (width == 4 || width == 5 || width == 6)) {
             ops::detail::nvfp4_gdn_record_t1_fused_launch(
                 x, parent.view(), conv, legacy_state_view, valid, initial, lr, lq, lk, lv, lz,
                 nullptr, parent_indices.empty() ? nullptr
@@ -1043,7 +1046,7 @@ int run_nvfp4_batched_matches_serial_fused() {
                                                       parent_index.data));
         }
         const std::size_t serial_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-            QType::NVFP4, kRows, kHidden, ops::LinearPolicy::AllowA4, 1, width, width);
+            qtype, kRows, kHidden, policy, 1, width, width);
         WorkspaceArena serial_ws(std::max<std::size_t>(256, serial_bytes));
         for (std::int32_t batch_row = 0; batch_row < batch; ++batch_row) {
             Tensor valid_b;
@@ -1061,12 +1064,14 @@ int run_nvfp4_batched_matches_serial_fused() {
             Tensor zb = sz.slice(2, batch_row, 1);
             ops::gdn_input_proj_conv_record(
                 x.slice(2, batch_row, 1), parent.view(), conv, serial_state_view, valid_b,
-                initial.slice(0, batch_row, 1), rb, qb, kb, vb, zb, ops::LinearPolicy::AllowA4,
+                initial.slice(0, batch_row, 1), rb, qb, kb, vb, zb, policy,
                 serial_ws, nullptr, parent_indices.empty() ? nullptr : &parent_b);
         }
         cuda_synchronize();
 
-        const std::string label = "NVFP4 batched vs serial B=" + std::to_string(batch) +
+        const std::string label = std::string(qtype == QType::NVFP4 ? "NVFP4" : "FP8") +
+                                  " batched vs serial B=" + std::to_string(batch) +
+                                  " policy=" + std::to_string(static_cast<int>(policy)) +
                                   " W=" + std::to_string(width) +
                                   (parent_indices.empty() ? " sequential" : " tree");
         int failures = 0;
@@ -1083,11 +1088,20 @@ int run_nvfp4_batched_matches_serial_fused() {
                                      valid_columns);
         failures += verify_zero_tail(label + " value", batched_v.bits(), kValueRows, width,
                                      batch, valid_columns);
-        failures += verify_nvfp4_record_oracle(
+        const ReductionCriterion criterion = qtype == QType::NVFP4
+            ? kNvfp4RecordA16Tolerance
+            : ReductionCriterion{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
+        failures += verify_record_oracle(
             label, parent.host, activation, conv_weight_bits, state_before, initial_slots,
             valid_columns, parent_indices, batched_q, batched_k, batched_v, batched_z,
-            batched_record, kHidden, kValueRows, width, batch);
-        if (width == 4 || width == 5 || width == 6) {
+            batched_record, kHidden, kValueRows, width, batch, criterion);
+        if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+            failures += verify_record_oracle(
+                label + " serial", parent.host, activation, conv_weight_bits, state_before,
+                initial_slots, valid_columns, parent_indices, serial_q, serial_k, serial_v,
+                serial_z, serial_record, kHidden, kValueRows, width, batch, criterion);
+        }
+        if (qtype == QType::NVFP4 && (width == 4 || width == 5 || width == 6)) {
             failures += verify_equal(label + " legacy T1 query", batched_q.bits(), legacy_q.bits());
             failures += verify_equal(label + " legacy T1 key", batched_k.bits(), legacy_k.bits());
             failures += verify_equal(label + " legacy T1 value", batched_v.bits(), legacy_v.bits());
@@ -1166,7 +1180,20 @@ int run_nvfp4_batched_matches_serial_fused() {
     failures += run_shape(5, 4, {5, 4, 3, 2},
                           {-1, 0, 0, 1, 1, -1, 0, 1, 1, 3, -1, 0, 0, 2, 2, -1, 0, 1, 2, 3},
                           2081U);
-    failures += parent.verify_preserved("NVFP4 batched vs serial parent weight");
+    if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        for (int width : {3, 7, 8, 9, 10, 11, 16}) {
+            for (int batch : {1, 2, 3, 4}) {
+                std::vector<int> valid(batch, width);
+                valid.back() = width - 1;
+                std::vector<int> tree(width * batch);
+                for (int b = 0; b < batch; ++b)
+                    for (int t = 0; t < width; ++t)
+                        tree[b * width + t] = t == 0 ? -1 : (t - 1) / 2;
+                failures += run_shape(width, batch, valid, tree, 2200U + width * 4 + batch);
+            }
+        }
+    }
+    failures += parent.verify_preserved("batched record parent weight");
     return failures;
 }
 
@@ -1227,7 +1254,11 @@ int main() {
     failures += run_nvfp4_tree_column0_matches_decode();
     failures += run_nvfp4_compose_chain_matches_snapshot();
     failures += run_nvfp4_tree_chain_matches_sequential_fused();
-    failures += run_nvfp4_batched_matches_serial_fused();
+    failures += run_batched_record_qualification(QType::NVFP4, ops::LinearPolicy::AllowA4);
+    failures += run_batched_record_qualification(QType::FP8_E4M3FN_ROW_BF16S,
+                                                 ops::LinearPolicy::A16Only);
+    failures += run_batched_record_qualification(QType::FP8_E4M3FN_ROW_BF16S,
+                                                 ops::LinearPolicy::AllowA8);
     failures += verify_nvfp4_grouped_workspace_interval();
     failures += verify_nvfp4_b1_grouped_workspace_interval();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_record\n";

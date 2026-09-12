@@ -103,6 +103,11 @@ def _fmt_flops(n: int) -> str:
 def _matching_roof(card: dict) -> str:
     if card["bound"] == "DRAM":
         return "1674.5 GB/s sustained read"
+    if card["problem"]["qtype"] == "fp8":
+        problem = card["problem"]
+        atom = bound.fp8_compute_atom(problem["n"], problem["k"], problem["t"], problem["policy"])
+        rate = card["useful_flops"] / (card["t_comp_us"] * 1e6)
+        return f"measured {atom.upper()} MMA roof ({rate:.3f} TFLOP/s; padded issue count included)"
     t_issue = card.get("t_issue_us")
     t_comp = card["t_comp_us"]
     if t_issue is not None and t_issue >= t_comp:
@@ -251,7 +256,7 @@ def render_filled(card: dict) -> str:
         )
     else:
         lines.append(
-            "6. Family Stay in the current SM120 NVFP4 family. "
+            "6. Family Stay in the current SM120 kernel family. "
             "Search tile/TMA/pipeline; do not invent a new MMA ISA."
         )
     lines.append(f"7. Layer2 {layer2['bench']}")
@@ -422,6 +427,15 @@ def _self_test() -> int:
     check("t1024-go", status_of(allow) == "go", status_of(allow))
     check("t1024-policy", "--policy a4" in text_go)
     check("t1024-pct", "floor/measured=" in text_go)
+
+    for policy, atom, rate in (("a8", "FP8", 523.98702592), ("a16", "BF16", 261.8960128)):
+        fp8 = bound.analyze(34816, 5120, 4096, "fp8", policy=policy,
+                            mma_per_s=rate * 1e12 / (8192 if policy == "a8" else 4096),
+                            measured_us=6000, idea="tile_shape")
+        roof = _matching_roof(fp8)
+        check("fp8-matching-roof-" + policy,
+              f"measured {atom} MMA roof ({rate:.3f} TFLOP/s" in roof and "dense FP4" not in roof,
+              roof)
 
     baseline = bound.analyze(14336, 5120, 1024, "nvfp4", idea="tile_shape")
     check("no-us-measure", status_of(baseline) == "measure", status_of(baseline))
